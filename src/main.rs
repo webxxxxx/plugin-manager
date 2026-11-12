@@ -7,6 +7,8 @@ mod log;
 mod mcp;
 mod package;
 mod paths;
+mod plugin;
+mod plugin_cli;
 mod registry;
 mod rpc;
 mod slot;
@@ -25,6 +27,7 @@ fn main() {
 
     let code = match name {
         "svc" => svc::run(std::env::args().skip(1).collect()),
+        "plugin" => plugin_cli::run(std::env::args().skip(1).collect()),
         "mcp" => mcp::run_stdio(),
         _ => svcd_run(std::env::args().skip(1).collect()),
     };

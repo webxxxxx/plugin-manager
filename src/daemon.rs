@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
@@ -10,8 +11,10 @@ use serde_json::{json, Value};
 use crate::channel;
 use crate::definition;
 use crate::log;
+use crate::package;
 use crate::paths;
-use crate::registry::{Registry, Service, State, RESERVED_ID};
+use crate::plugin::{self, Strategy};
+use crate::registry::{Kind, Registry, Service, State, RESERVED_ID};
 use crate::rpc;
 use crate::slot::Slot;
 use crate::status::Status;
@@ -33,9 +36,26 @@ pub fn run() -> i32 {
     }
     log::svcd("svcd starting");
 
-    let loaded = definition::load_services(&paths::services_dir());
+    let mut loaded = definition::load_services(&paths::services_dir());
     for issue in &loaded.issues {
         log::svcd(&format!("svcd: warning: {}", issue));
+    }
+
+    let (plugins, warnings) = plugin::scan();
+    for warning in warnings {
+        log::svcd(&format!("svcd: plugin: {}", warning));
+    }
+    for service in plugins {
+        if loaded.registry.get(&service.id).is_some() {
+            log::svcd(&format!(
+                "svcd: plugin {} conflicts with an existing service; skipped",
+                service.id
+            ));
+            continue;
+        }
+        if let Err(error) = loaded.registry.insert(service) {
+            log::svcd(&format!("svcd: plugin: {}", error));
+        }
     }
 
     let token = match channel::ensure_token(&config) {
@@ -262,6 +282,14 @@ impl Daemon {
                 Ok(service_id) => status_response(id, -32005, self.set_enabled(&service_id, false)),
                 Err(response) => response,
             },
+            "plugin.install" => match self.install_plugin(&request) {
+                Ok(status) => rpc::ok(id, status_json(status)),
+                Err(error) => rpc::err(id, -32006, &error),
+            },
+            "plugin.uninstall" => match self.uninstall_plugin(&request) {
+                Ok(()) => rpc::ok(id, json!({ "ok": true })),
+                Err(error) => rpc::err(id, -32007, &error),
+            },
             _ => rpc::err(id, -32601, "method not found"),
         }
     }
@@ -295,6 +323,15 @@ impl Daemon {
         }
         if id == RESERVED_ID {
             return Ok(self.status_for_id(id).expect("builtin"));
+        }
+        if let Some(exec) = self
+            .registry
+            .get(id)
+            .and_then(|service| service.exec.clone())
+        {
+            if let Some(slot) = self.slots.get_mut(id) {
+                slot.set_exec(exec);
+            }
         }
 
         let layers = start_layers(&self.registry, &[id.to_string()])?;
@@ -368,6 +405,114 @@ impl Daemon {
         }
     }
 
+    fn install_plugin(&mut self, request: &rpc::Request) -> Result<Status, String> {
+        let path = request
+            .params
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "plugin.install requires path".to_string())?;
+        let strategy = match Strategy::parse(
+            request
+                .params
+                .get("strategy")
+                .and_then(Value::as_str)
+                .unwrap_or("keep-old"),
+        ) {
+            Some(strategy) => strategy,
+            None => return Err("unknown strategy".into()),
+        };
+
+        let package = package::verify_package(Path::new(path))?;
+        let id = package.manifest.name.clone();
+        if let Some(existing) = self.registry.get(&id) {
+            if existing.kind != Kind::Plugin {
+                return Err(format!("id is a core service: {}", id));
+            }
+        }
+
+        let running = |slots: &BTreeMap<String, Slot>| {
+            slots
+                .get(&id)
+                .map(|slot| !matches!(slot.machine.state, State::Stopped | State::Failed))
+                .unwrap_or(false)
+        };
+        if running(&self.slots) && strategy == Strategy::Replace {
+            self.stop_service(&id)?;
+        }
+        let still_running = running(&self.slots);
+        let service = match plugin::install_package(&package, strategy) {
+            Ok(service) => service,
+            Err(error) if strategy == Strategy::KeepOld && is_no_space(&error) => {
+                if still_running {
+                    return Err(format!(
+                        "not enough space for keep-old; stop the plugin and retry with replace: {}",
+                        error
+                    ));
+                }
+                log::svcd(&format!(
+                    "svcd: plugin {}: keep-old ran out of space; falling back to replace",
+                    id
+                ));
+                plugin::install_package(&package, Strategy::Replace)?
+            }
+            Err(error) => return Err(error),
+        };
+        if !still_running {
+            self.slots.remove(&id);
+            if let Some(exec) = service.exec.clone() {
+                self.slots
+                    .insert(id.clone(), Slot::new(id.clone(), exec, service.enabled));
+            }
+        }
+        self.registry.remove(&id);
+        self.registry.insert(service)?;
+        log::svcd(&format!(
+            "svcd: plugin {} {} installed ({})",
+            id,
+            package.manifest.version,
+            if still_running {
+                "running; next start uses"
+            } else {
+                "now"
+            }
+        ));
+        self.status_for_id(&id)
+            .ok_or_else(|| format!("unknown plugin: {}", id))
+    }
+
+    fn uninstall_plugin(&mut self, request: &rpc::Request) -> Result<(), String> {
+        let id = request
+            .params
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "plugin.uninstall requires id".to_string())?;
+        let purge = request
+            .params
+            .get("purge")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let service = self
+            .registry
+            .get(id)
+            .ok_or_else(|| format!("unknown plugin: {}", id))?;
+        if service.kind != Kind::Plugin {
+            return Err(format!("not a plugin: {}", id));
+        }
+        let running = self
+            .slots
+            .get(id)
+            .map(|slot| !matches!(slot.machine.state, State::Stopped | State::Failed))
+            .unwrap_or(false);
+        if running {
+            self.stop_service(id)?;
+        }
+        plugin::uninstall(id, purge)?;
+        self.slots.remove(id);
+        self.registry.remove(id);
+        log::svcd(&format!("svcd: plugin {} uninstalled", id));
+        Ok(())
+    }
+
     fn set_enabled(&mut self, id: &str, enabled: bool) -> Result<Status, String> {
         if self.registry.get(id).is_none() {
             return Err(format!("unknown service: {}", id));
@@ -375,19 +520,28 @@ impl Daemon {
         if id == RESERVED_ID {
             return Err("the built-in svc service cannot be enabled or disabled".into());
         }
-        let marker = paths::services_dir().join(format!("{}.disabled", id));
-        if enabled {
-            if marker.exists() {
-                fs::remove_file(&marker)
-                    .map_err(|error| format!("cannot remove {}: {}", marker.display(), error))?;
-            }
-        } else {
+        let kind = self
+            .registry
+            .get(id)
+            .map(|service| service.kind)
+            .ok_or_else(|| format!("unknown service: {}", id))?;
+        let (marker, create) = match kind {
+            Kind::Plugin => (plugin::plugin_dir(id).join("enabled"), enabled),
+            Kind::Core => (
+                paths::services_dir().join(format!("{}.disabled", id)),
+                !enabled,
+            ),
+        };
+        if create {
             if let Some(parent) = marker.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|error| format!("cannot create {}: {}", parent.display(), error))?;
             }
             fs::write(&marker, b"")
                 .map_err(|error| format!("cannot write {}: {}", marker.display(), error))?;
+        } else if marker.exists() {
+            fs::remove_file(&marker)
+                .map_err(|error| format!("cannot remove {}: {}", marker.display(), error))?;
         }
         if let Some(service) = self.registry.get_mut(id) {
             service.enabled = enabled;
@@ -593,6 +747,13 @@ fn walk_dependencies(registry: &Registry, ids: &[String]) -> (BTreeSet<String>, 
 
 fn missing_dependencies(registry: &Registry, id: &str) -> Vec<String> {
     walk_dependencies(registry, &[id.to_string()]).1
+}
+
+fn is_no_space(error: &str) -> bool {
+    error.contains("os error 28")
+        || error.contains("os error 112")
+        || error.contains("No space left")
+        || error.contains("not enough space")
 }
 
 #[cfg(test)]
