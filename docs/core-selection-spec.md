@@ -30,6 +30,7 @@
 - 退避：曾在 Running ≥ 10s → 清零 + 立即重启；否则 1/2/4/8/16/30s；连续 5 次进 `Failed`，只有显式 start 复位。
 - 就绪：默认 probe-on-spawn（发首个协议请求，首个合法响应 = Ready），`exec.ready = "exec"` 可跳过；start 超时 30s。
 - 停止：SIGTERM（进程组）→ 10s → SIGKILL → 5s → 记 unkillable；全局关机预算 30s，unit 侧 `TimeoutStopSec=40`。Windows：控制帧 + 关 stdin → 等 → TerminateProcess。
+- **已知边界（2026-11-13，测试发现）**：svcd 被异常杀死（kill -9 / TerminateProcess）时，读 stdin 的插件与 notify 服务随管道 EOF 退出；不读 stdin 的脚本服务（`ready=Exec`）会成为孤儿。svcd 重启后按 enabled 重新拉起，不与上次运行的实例对账，因此同一服务可能出现两个实例；v1 未做孤儿回收。修复方向：Windows Job Object（kill-on-close）/ Unix `prctl(PR_SET_PDEATHSIG)`，或启动时按 pidfile + 进程启动时间对账。
 - 依赖：按层拓扑，同层并行、层间串行；依赖失败不级联停，只摘能力并拒绝新的 start；依赖恢复不自动拉起之前被挡住的依赖者。
 - 环：安装与加载都拒绝，带环路径。
 
