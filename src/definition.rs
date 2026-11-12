@@ -74,7 +74,13 @@ pub fn load_services(services_dir: &Path) -> Loaded {
             .and_then(|name| name.to_str())
             .map(str::to_string);
         match load_one(&path) {
-            Ok(service) => {
+            Ok(mut service) => {
+                if services_dir
+                    .join(format!("{}.disabled", service.id))
+                    .exists()
+                {
+                    service.enabled = false;
+                }
                 let id = service.id.clone();
                 match registry.insert(service) {
                     Ok(()) => {
@@ -349,6 +355,12 @@ mod tests {
             )
             .expect("write definition");
         }
+
+        fn disable(&self, id: &str) {
+            fs::create_dir_all(self.services_dir()).expect("create services.d");
+            fs::write(self.services_dir().join(format!("{}.disabled", id)), "")
+                .expect("write disabled marker");
+        }
     }
 
     impl Drop for TempDir {
@@ -424,6 +436,18 @@ mod tests {
         assert!(loaded.issues.is_empty());
         assert_eq!(loaded.registry.values().count(), 1);
         assert!(loaded.registry.get(RESERVED_ID).is_some());
+    }
+
+    #[test]
+    fn a_disabled_marker_turns_off_enabled() {
+        let dir = TempDir::new();
+        dir.write("demo", definition("demo"));
+        dir.disable("demo");
+
+        let loaded = load_services(&dir.services_dir());
+
+        let demo = loaded.registry.get("demo").expect("demo");
+        assert!(!demo.enabled);
     }
 
     #[test]

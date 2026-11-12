@@ -80,6 +80,7 @@
 - 文件 root 所有、0640；启动时读取，改定义后重启 svcd 生效（v1 不做热加载）。
 - 不接受 `.spk` 专属字段：`platform` / `files` / `hooks` / `config` / `ui` 出现即定义非法；其他未知字段忽略。
 - `id` 不能是 `svc`（保留给内置 core），且不能与 plugin id 冲突；冲突时 plugin 安装拒绝、core 定义加载拒绝。
+- `<config>/services.d/<id>.disabled` 存在时该 core 服务 `enabled=false`：开机不自启、崩溃后不按退避自动重启；`svc enable/disable` 维护这个 sidecar，显式 `svc start` 仍然可用。
 - `capabilities[].name` 规则同 plugin：服务内唯一，`svc.` 禁用；声明了 capabilities 就必须能应答 `tools/call`，否则用 `ready: exec` 只当普通进程。
 - `<config>` 指平台配置目录（Linux `/etc/svcd`、macOS `/Library/Application Support/svcd/config`、Windows `%ProgramData%\svcd\config`）；`SVCD_CONFIG_DIR` 可覆盖，供测试与非 root 开发使用。
 - core 与 plugin 走同一监督器、同一 stdio NDJSON、同一依赖图、同一日志 / 状态；`svc list/status/start/stop/logs` 对两者一致；`install/uninstall/import/export/editconfig` 只对 plugin。
@@ -315,7 +316,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - 工具链：ubuntu-24.04 上用 cargo-zigbuild（pin `=0.24.1`）+ Zig（`0.17.1`）出三架构 musl；Windows/macOS 原生 runner；唯一高风险环是 armv7+musl 的 zig 链接。
 - 计量：multicall 单二进制，strip 后、未压缩、十进制字节；硬链接算一次；编译进二进制的资源算；安装的 unit/config 与插件不算。
 - 门禁：嵌入式 **≤ 2,000,000 B**、桌面 **≤ 30,000,000 B** 超限 fail；基线 +2% warning；`tools/measure_size.py` + `.github/workflows/size.yml` + `ci/size-baseline.json`。
-- 实测基线（2026-11-12 本机）：musl x86_64 `746,320 B`；Windows x86_64 `569,344 B`；macOS / Linux gnu 待 CI 首跑。
+- 实测基线（2026-11-12 本机）：musl x86_64 `750,416 B`；Windows x86_64 `572,928 B`；macOS / Linux gnu 待 CI 首跑。
 - **30MB 只约束核心二进制**；安装包不计门禁，只记录体积（见 §13-C2）。
 
 ## 8. 桌面交付

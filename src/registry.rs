@@ -156,6 +156,10 @@ impl Registry {
         self.services.get(id)
     }
 
+    pub fn get_mut(&mut self, id: &str) -> Option<&mut Service> {
+        self.services.get_mut(id)
+    }
+
     pub fn values(&self) -> impl Iterator<Item = &Service> {
         self.services.values()
     }

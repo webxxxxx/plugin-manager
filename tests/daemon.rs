@@ -154,8 +154,12 @@ impl Sandbox {
     }
 
     fn start_when_ready(&self, id: &str) -> Output {
+        self.run_when_ready(&["start", id])
+    }
+
+    fn run_when_ready(&self, args: &[&str]) -> Output {
         for _ in 0..200 {
-            let output = self.run_svc(&["start", id]);
+            let output = self.run_svc(args);
             if output.status.code() != Some(2) {
                 return output;
             }
@@ -305,6 +309,62 @@ fn start_pulls_dependencies_before_the_service() {
     );
     assert_eq!(sandbox.status("base")["summary"]["state"], "running");
     assert_eq!(sandbox.status("app")["summary"]["state"], "running");
+}
+
+#[test]
+fn enable_disable_round_trip_and_boot_skip() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_service("demo", &[], Script::Ready);
+    sandbox.start_daemon();
+
+    assert_eq!(
+        sandbox.start_when_ready("demo").status.code(),
+        Some(0),
+        "boot/start failed: {}",
+        sandbox.daemon_log()
+    );
+
+    let disabled = sandbox.run_when_ready(&["disable", "demo"]);
+    assert_eq!(
+        disabled.status.code(),
+        Some(0),
+        "disable failed: {}",
+        String::from_utf8_lossy(&disabled.stderr)
+    );
+    let status = sandbox.status("demo");
+    assert_eq!(status["summary"]["enabled"], false);
+    assert_eq!(status["summary"]["state"], "running");
+
+    assert_eq!(sandbox.stop("demo").status.code(), Some(0));
+    let restarted = sandbox.run_svc(&["start", "demo"]);
+    assert_eq!(
+        restarted.status.code(),
+        Some(0),
+        "explicit start of disabled service failed: {}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    assert_eq!(sandbox.status("demo")["summary"]["enabled"], false);
+    assert_eq!(sandbox.stop("demo").status.code(), Some(0));
+
+    sandbox.shutdown();
+    sandbox.start_daemon();
+    let _ = sandbox.run_when_ready(&["disable", "demo"]);
+    let status = sandbox.status("demo");
+    assert_eq!(status["summary"]["enabled"], false);
+    assert_eq!(
+        status["summary"]["state"], "stopped",
+        "disabled service should not boot: {}",
+        status
+    );
+
+    let enabled = sandbox.run_when_ready(&["enable", "demo"]);
+    assert_eq!(
+        enabled.status.code(),
+        Some(0),
+        "enable failed: {}",
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+    assert_eq!(sandbox.status("demo")["summary"]["enabled"], true);
 }
 
 #[test]
