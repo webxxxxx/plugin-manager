@@ -224,21 +224,17 @@ fn raw_request(
     raw_request_with(address, method, path, content_type, body, &[])
 }
 
-fn raw_request_with(
+fn request_head(
     address: &str,
     method: &str,
     path: &str,
     content_type: &str,
-    body: &[u8],
+    content_length: usize,
     extra_headers: &[(&str, &str)],
-) -> RawResponse {
-    let mut stream = TcpStream::connect(address).expect("connect");
+) -> String {
     let mut request = format!(
         "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        method,
-        path,
-        address,
-        body.len()
+        method, path, address, content_length
     );
     if !content_type.is_empty() {
         request.push_str(&format!("Content-Type: {}\r\n", content_type));
@@ -247,8 +243,10 @@ fn raw_request_with(
         request.push_str(&format!("{}: {}\r\n", name, value));
     }
     request.push_str("\r\n");
-    stream.write_all(request.as_bytes()).expect("write headers");
-    stream.write_all(body).expect("write body");
+    request
+}
+
+fn read_raw_response(stream: &mut TcpStream) -> RawResponse {
     let mut response = Vec::new();
     stream.read_to_end(&mut response).expect("read response");
     let split = response
@@ -273,6 +271,73 @@ fn raw_request_with(
         body: response[split + 4..].to_vec(),
         headers,
     }
+}
+
+fn raw_request_with(
+    address: &str,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+    extra_headers: &[(&str, &str)],
+) -> RawResponse {
+    raw_request_paced(
+        address,
+        method,
+        path,
+        content_type,
+        body,
+        extra_headers,
+        None,
+    )
+}
+
+/// Send the request headers, pause, then send the body. A server that reads
+/// the body from a non-blocking accepted socket sees `WouldBlock` during the
+/// pause instead of waiting for the rest of the request.
+fn raw_request_split_body(
+    address: &str,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+    header_to_body: Duration,
+) -> RawResponse {
+    raw_request_paced(
+        address,
+        method,
+        path,
+        content_type,
+        body,
+        &[],
+        Some(header_to_body),
+    )
+}
+
+fn raw_request_paced(
+    address: &str,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+    extra_headers: &[(&str, &str)],
+    header_to_body: Option<Duration>,
+) -> RawResponse {
+    let mut stream = TcpStream::connect(address).expect("connect");
+    let request = request_head(
+        address,
+        method,
+        path,
+        content_type,
+        body.len(),
+        extra_headers,
+    );
+    stream.write_all(request.as_bytes()).expect("write headers");
+    if let Some(pause) = header_to_body {
+        std::thread::sleep(pause);
+    }
+    stream.write_all(body).expect("write body");
+    read_raw_response(&mut stream)
 }
 
 fn json_body(response: &RawResponse) -> Value {
@@ -508,6 +573,30 @@ fn web_plugin_bundle(key: &SigningKey, id: &str, ui: bool) -> Vec<u8> {
 }
 
 /// A running daemon with the demo web-UI plugin installed.
+/// Start a daemon and install the `demo` plugin (with a config template)
+/// under a fresh trust key. Returns the sandbox and its HTTP address.
+fn daemon_with_demo_plugin(key_byte: u8) -> (Sandbox, String) {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[key_byte; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let package = plugin_bundle(&key, "demo", "1.0.0", Some(b"good template\n"), true);
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let installed = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(installed.status, 200, "{}", installed.body);
+    (sandbox, address)
+}
+
 fn web_ui_sandbox(key_byte: u8) -> (Sandbox, String) {
     let mut sandbox = Sandbox::new();
     let key = SigningKey::from_bytes(&[key_byte; 32]);
@@ -756,26 +845,7 @@ fn plugin_dir(sandbox: &Sandbox, id: &str) -> PathBuf {
 
 #[test]
 fn config_endpoints_read_write_reset_and_reject_bad_checks() {
-    let mut sandbox = Sandbox::new();
-    let key = SigningKey::from_bytes(&[31u8; 32]);
-    fs::write(
-        sandbox.trust.join("test.pub"),
-        pem_from_public(&key.verifying_key().to_bytes()),
-    )
-    .expect("trust key");
-    let package = plugin_bundle(&key, "demo", "1.0.0", Some(b"good template\n"), true);
-    sandbox.start_daemon();
-    let address = sandbox.wait_for_http();
-
-    let installed = request(
-        &address,
-        "POST",
-        "/api/v1/plugins",
-        "application/octet-stream",
-        &package,
-    );
-    assert_eq!(installed.status, 200, "{}", installed.body);
-
+    let (sandbox, address) = daemon_with_demo_plugin(31);
     let directory = plugin_dir(&sandbox, "demo");
     let active = directory.join("config");
     assert_eq!(fs::read(&active).expect("config"), b"good template\n");
@@ -849,6 +919,49 @@ fn config_endpoints_read_write_reset_and_reject_bad_checks() {
         413,
         "{}",
         String::from_utf8_lossy(&large.body)
+    );
+}
+
+#[test]
+fn a_large_body_sent_after_its_headers_is_read_to_completion() {
+    let (_sandbox, address) = daemon_with_demo_plugin(32);
+
+    // A small body split from its headers binds the assertion to the socket
+    // behaviour: the broken non-blocking socket answered 400 "cannot read
+    // request body" instead of waiting. The 300ms pause is deliberately
+    // generous; the in-process daemon parses the headers in microseconds, so
+    // it is already inside the body read when the rest arrives.
+    let small = raw_request_split_body(
+        &address,
+        "POST",
+        "/api/v1/import?config_id=demo",
+        "text/plain",
+        b"good config\n",
+        Duration::from_millis(300),
+    );
+    assert_eq!(
+        small.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&small.body)
+    );
+
+    // The oversized body must be rejected by the config cap, not by a read
+    // error. This is the ticket's 1 MiB + 1 case.
+    let too_large = vec![b'x'; 1024 * 1024 + 1];
+    let response = raw_request_split_body(
+        &address,
+        "POST",
+        "/api/v1/import?config_id=demo",
+        "text/plain",
+        &too_large,
+        Duration::from_millis(300),
+    );
+    assert_eq!(
+        response.status,
+        413,
+        "{}",
+        String::from_utf8_lossy(&response.body)
     );
 }
 
