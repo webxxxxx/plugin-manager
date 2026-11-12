@@ -13,8 +13,8 @@ const OUT = join(ROOT, 'samples', 'out');
 const KEY = join(ROOT, 'samples', 'keys', 'sample-2026.key');
 const KEY_ID = 'sample-2026';
 
-const src = JSON.parse(readFileSync(join(SRC, 'manifest.src.json'), 'utf8'));
-if (src.files) throw new Error('manifest.src.json must not contain files (the packer computes them)');
+const src = JSON.parse(readFileSync(join(SRC, 'manifest.json'), 'utf8'));
+if (src.files) throw new Error('manifest.json must not contain files (the packer computes them)');
 
 function stable(v) {
   if (Array.isArray(v)) return '[' + v.map(stable).join(',') + ']';
@@ -66,7 +66,7 @@ const signature = { alg: 'ed25519', keyId: KEY_ID, sig: sig };
 const signatureBytes = Buffer.from(JSON.stringify(signature) + '\n', 'utf8');
 
 const platform = String(src.platform || '');
-if (!/^[a-z0-9_]+(-[a-z0-9_]+){2,3}$/.test(platform)) throw new Error('manifest.src.json needs a target-triple platform');
+if (!/^[a-z0-9_]+(-[a-z0-9_]+){2,3}$/.test(platform)) throw new Error('manifest.json needs a target-triple platform');
 const arch = platform.split('-')[0];
 const head = name + '-' + src.version + '-' + arch;
 const stage = join(OUT, head);

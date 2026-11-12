@@ -59,6 +59,7 @@ enum Command {
         no_config: bool,
         force: bool,
     },
+    Bundle(crate::bundle::Options),
 }
 
 pub fn run(args: Vec<String>) -> i32 {
@@ -93,6 +94,7 @@ pub fn run(args: Vec<String>) -> i32 {
             no_config,
             force,
         } => import(&path, config_id.as_deref(), no_config, force),
+        Command::Bundle(options) => bundle_command(options),
     }
 }
 
@@ -255,6 +257,112 @@ fn parse(args: &[String]) -> Result<Command, ()> {
                 config_id,
                 no_config,
                 force,
+            })
+            .ok_or(())
+        }
+        "bundle" => {
+            let mut dir = None;
+            let mut out = None;
+            let mut key = None;
+            let mut key_id = None;
+            let mut id = None;
+            let mut version = None;
+            let mut exec = None;
+            let mut desc = None;
+            let mut index = 1;
+            while index < args.len() {
+                let arg = &args[index];
+                match arg.as_str() {
+                    "-o" | "--out" => {
+                        index += 1;
+                        out = Some(PathBuf::from(args.get(index).ok_or(())?));
+                    }
+                    "--key" => {
+                        index += 1;
+                        key = Some(PathBuf::from(args.get(index).ok_or(())?));
+                    }
+                    "--key-id" => {
+                        index += 1;
+                        key_id = Some(args.get(index).ok_or(())?.clone());
+                    }
+                    "--id" => {
+                        index += 1;
+                        id = Some(args.get(index).ok_or(())?.clone());
+                    }
+                    "--version" => {
+                        index += 1;
+                        version = Some(args.get(index).ok_or(())?.clone());
+                    }
+                    "--exec" => {
+                        index += 1;
+                        exec = Some(args.get(index).ok_or(())?.clone());
+                    }
+                    "--desc" => {
+                        index += 1;
+                        desc = Some(args.get(index).ok_or(())?.clone());
+                    }
+                    _ if arg.starts_with("--out=") => {
+                        out = Some(PathBuf::from(
+                            arg.strip_prefix("--out=").expect("matched prefix"),
+                        ));
+                    }
+                    _ if arg.starts_with("--key-id=") => {
+                        key_id = Some(
+                            arg.strip_prefix("--key-id=")
+                                .expect("matched prefix")
+                                .to_string(),
+                        );
+                    }
+                    _ if arg.starts_with("--key=") => {
+                        key = Some(PathBuf::from(
+                            arg.strip_prefix("--key=").expect("matched prefix"),
+                        ));
+                    }
+                    _ if arg.starts_with("--id=") => {
+                        id = Some(
+                            arg.strip_prefix("--id=")
+                                .expect("matched prefix")
+                                .to_string(),
+                        );
+                    }
+                    _ if arg.starts_with("--version=") => {
+                        version = Some(
+                            arg.strip_prefix("--version=")
+                                .expect("matched prefix")
+                                .to_string(),
+                        );
+                    }
+                    _ if arg.starts_with("--exec=") => {
+                        exec = Some(
+                            arg.strip_prefix("--exec=")
+                                .expect("matched prefix")
+                                .to_string(),
+                        );
+                    }
+                    _ if arg.starts_with("--desc=") => {
+                        desc = Some(
+                            arg.strip_prefix("--desc=")
+                                .expect("matched prefix")
+                                .to_string(),
+                        );
+                    }
+                    _ if arg.starts_with('-') => return Err(()),
+                    _ if dir.is_none() => dir = Some(PathBuf::from(arg)),
+                    _ => return Err(()),
+                }
+                index += 1;
+            }
+            dir.map(|dir| {
+                Command::Bundle(crate::bundle::Options {
+                    dir,
+                    out,
+                    key,
+                    key_id,
+                    id,
+                    version,
+                    exec,
+                    desc,
+                })
             })
             .ok_or(())
         }
@@ -526,6 +634,19 @@ fn import(path: &Path, config_id: Option<&str>, no_config: bool, force: bool) ->
     }
 }
 
+fn bundle_command(options: crate::bundle::Options) -> i32 {
+    match crate::bundle::bundle(&options) {
+        Ok(path) => {
+            println!("{}", path.display());
+            EXIT_OK
+        }
+        Err(error) => {
+            eprintln!("plugin: {}", error);
+            EXIT_SERVICE_ERROR
+        }
+    }
+}
+
 fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
     fs::write(path, data).map_err(|error| format!("write {}: {}", path.display(), error))?;
     #[cfg(unix)]
@@ -592,6 +713,9 @@ fn usage() {
     eprintln!("       plugin editconfig <id> [--print|--file <path>|--reset]");
     eprintln!("       plugin export <id> [--config-only] [--out <path>]");
     eprintln!("       plugin import <file> [--config <id>] [--no-config] [--force]");
+    eprintln!(
+        "       plugin bundle <dir> --key <pem> [-o <out>] [--id <id>] [--version <semver>] [--exec <path>] [--desc <text>] [--key-id <id>]"
+    );
 }
 
 #[cfg(test)]
@@ -664,5 +788,37 @@ mod tests {
             }
         );
         assert!(parse(&args(&["editconfig", "demo", "--print", "--reset"])).is_err());
+        assert_eq!(
+            parse(&args(&[
+                "bundle",
+                "samples/demo",
+                "--key",
+                "key.pem",
+                "-o",
+                "out.spk",
+                "--id",
+                "demo",
+                "--version",
+                "1.2.3",
+                "--exec",
+                "payload/bin/demo",
+                "--desc",
+                "demo plugin",
+                "--key-id",
+                "test"
+            ]))
+            .expect("bundle"),
+            Command::Bundle(crate::bundle::Options {
+                dir: PathBuf::from("samples/demo"),
+                out: Some(PathBuf::from("out.spk")),
+                key: Some(PathBuf::from("key.pem")),
+                key_id: Some("test".into()),
+                id: Some("demo".into()),
+                version: Some("1.2.3".into()),
+                exec: Some("payload/bin/demo".into()),
+                desc: Some("demo plugin".into())
+            })
+        );
+        assert!(parse(&args(&["bundle", "a", "b"])).is_err());
     }
 }
