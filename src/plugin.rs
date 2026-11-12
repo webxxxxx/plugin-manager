@@ -338,6 +338,34 @@ pub fn active_config(id: &str) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+/// Where an installed plugin's declared web UI lives on disk.
+#[derive(Clone, Debug)]
+pub struct WebAssets {
+    /// `payload/web/` inside the current version directory.
+    pub root: PathBuf,
+    /// Entry file relative to `root`; defaults to `index.html`.
+    pub entry: String,
+}
+
+/// Resolve the web UI declared by `manifest.ui`.
+///
+/// Only `web` and `gui` UIs are browser-loadable (the desktop WebView loads the
+/// same files); `headerless` and unknown types have no UI to serve. The entry is
+/// relative to `payload/web/` and defaults to `index.html`.
+pub fn web_assets(id: &str) -> Option<WebAssets> {
+    let version = current_version(id)?;
+    let version_dir = plugin_dir(id).join(version);
+    let manifest = read_manifest(&version_dir).ok()?;
+    let ui = manifest.ui.as_ref()?;
+    if ui.kind != "web" && ui.kind != "gui" {
+        return None;
+    }
+    Some(WebAssets {
+        root: version_dir.join("payload/web"),
+        entry: ui.entry.clone().unwrap_or_else(|| "index.html".to_string()),
+    })
+}
+
 pub fn config_template(id: &str) -> Option<(Vec<u8>, package::Manifest)> {
     let version = current_version(id)?;
     let version_dir = plugin_dir(id).join(version);
