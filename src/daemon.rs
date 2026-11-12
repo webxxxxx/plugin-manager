@@ -298,6 +298,9 @@ impl Daemon {
                 rpc::ok(id, json!({"ok": true}))
             }
             "registry.tools" | "tools/list" => rpc::ok(id, json!({ "tools": self.tool_list() })),
+            "registry.version" => {
+                rpc::ok(id, json!({ "version": tool_version(&self.tool_list()) }))
+            }
             "svc.list" => rpc::ok(id, json!({"services": self.statuses()})),
             "svc.status" => match param_id(&request) {
                 Ok(service_id) => match self.status_for_id(&service_id) {
@@ -932,6 +935,17 @@ fn status_response(
 
 fn status_json(status: Status) -> Value {
     serde_json::to_value(status).unwrap_or(Value::Null)
+}
+
+fn tool_version(tools: &[Value]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    serde_json::to_string(tools)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
 }
 
 fn send(reply: &Sender<String>, response: rpc::Response) {

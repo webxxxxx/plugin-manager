@@ -17,6 +17,10 @@ pub struct Request {
 pub struct Error {
     pub code: i32,
     pub message: String,
+    /// Optional structured error payload, e.g. the supported versions for
+    /// -32022 (UnsupportedProtocolVersion).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,6 +52,14 @@ pub fn ok(id: Option<Value>, result: Value) -> Response {
 }
 
 pub fn err(id: Option<Value>, code: i32, message: &str) -> Response {
+    error(id, code, message, None)
+}
+
+pub fn err_data(id: Option<Value>, code: i32, message: &str, data: Value) -> Response {
+    error(id, code, message, Some(data))
+}
+
+fn error(id: Option<Value>, code: i32, message: &str, data: Option<Value>) -> Response {
     Response {
         jsonrpc: "2.0".into(),
         id,
@@ -55,6 +67,7 @@ pub fn err(id: Option<Value>, code: i32, message: &str) -> Response {
         error: Some(Error {
             code,
             message: message.to_string(),
+            data,
         }),
     }
 }

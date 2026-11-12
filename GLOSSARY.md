@@ -44,6 +44,10 @@ _Avoid_: 工具、方法、action
 一个服务在 MCP 工具面上的可见能力集合；死的只有 start，活的加上 manifest 能力。
 _Avoid_: 工具列表、API
 
+**Era（协议代）**:
+MCP 客户端与服务器使用的协议形态：modern 用 `2026-07-28` 的每请求 `_meta`，legacy 用 `initialize` 握手（`2025-11-25` 及以前），dual-era 两者都支持。
+_Avoid_: 版本（具体版本号是日期；Era 是协议形态）
+
 **启动（Start）**:
 让一个死服务进入 ready 的准入动作；死服务在可调用面上唯一暴露的能力。
 _Avoid_: 拉起、boot、run

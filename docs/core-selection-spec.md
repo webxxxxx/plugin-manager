@@ -207,11 +207,12 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - 每个客户端一个桥进程；桥不拉起 svcd，连不上 stderr 报错 + exit 1；多个桥并发连同一个 svcd。
 - dual-era：首个请求是 `initialize` → legacy；否则 modern（按 `_meta` 校验）。modern `2026-07-28`；legacy 支持 `2025-11-25` / `2025-06-18` / `2025-03-26`。
 - modern：`server/discover`（MUST）；每请求校验 `_meta.protocolVersion` + `clientCapabilities`；result 带 `resultType:"complete"`；`tools/list` 带 `ttlMs:1000`、`cacheScope:"private"`，`listChanged:false`。
-- legacy：本地回 `initialize`；`capabilities.tools.listChanged:true`；桥每 1s 轮询 registry 版本，变了发 `notifications/tools/list_changed`。
+- legacy：本地回 `initialize`；`capabilities.tools.listChanged:true`；桥每 1s 轮询 `registry.version`，变了发 `notifications/tools/list_changed`。
 - 错误映射：未知工具 / 参数不合法 / 缺 `_meta` → JSON-RPC error；已知但当前不可调用 → `isError:true` + 先 `<id>.start`；崩溃/超时/插件 error → `isError:true`；协议违规 → `isError:true` 并按崩溃处理；桥连不上 svcd → 在途调用 `isError:true` 后 exit 1。
 - `inputSchema` 原样透传，聚合层**不做 JSON Schema 校验**（显式偏离，插件自己校验）；`svc.*` schema 由聚合层写死。
 - 工具名 `<serviceId>.<cap>`，按名稳定排序；死 plugin 只出 `<id>.start`。
 - `tools/list` / `tools/call` 只聚合 plugin 能力；core 不出现在工具面。`svc.*` 是管理工具，不是 core 的能力。
+- **实现状态（2026-11-12，#32）**：`mcp` stdio 桥已实现 dual-era：首个请求 `initialize` → legacy，否则 modern；modern `server/discover`、每请求 `_meta` 校验（缺字段 `-32602`，版本不符 `-32022` + `data.supported`）、所有成功 result 带 `resultType:"complete"`、`tools/list` 带 `ttlMs:1000` / `cacheScope:"private"`、结果附 `_meta.serverInfo`；legacy `initialize` / `ping` / `notifications/initialized`、1s 轮询 `registry.version`（工具列表的稳定哈希）并在变化时发 `notifications/tools/list_changed`。桥不拉起 svcd，连不上 stderr + exit 1；每个客户端一个桥进程，多个桥并发连同一个 svcd。
 
 ### 3.3 HTTP UI
 
@@ -496,7 +497,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 | [#29](https://github.com/webxxxxx/plugin-manager/issues/29) | 前台监督 core 服务 | #28 | 已实现：proc/wait、事件循环、定时器、UDS/命名管道管理通道；stderr 继承，日志归 #35 |
 | [#30](https://github.com/webxxxxx/plugin-manager/issues/30) | 安装/运行 .spk（含 `plugin` 入口） | #28 #29 | 验签/`files[]`/解包/布局/插件扫描/`plugin` 入口已实现；hooks 拒绝，`install -` / downgrade / prune 未做 |
 | [#31](https://github.com/webxxxxx/plugin-manager/issues/31) | 插件 IPC 与工具面 | #30 | 已实现：NDJSON 分帧（1 MiB）、id 路由、64 在途、30s 取消、`registry.tools` / `registry.call`；崩溃摘能力并失败在途调用；128 排队未做 |
-| [#32](https://github.com/webxxxxx/plugin-manager/issues/32) | `mcp` 桥 dual-era | #31 | 只有 echo 循环 |
+| [#32](https://github.com/webxxxxx/plugin-manager/issues/32) | `mcp` 桥 dual-era | #31 | 已实现：modern `server/discover`/`_meta`/缓存字段；legacy `initialize`/`ping`/`list_changed` 轮询；连不上 svcd exit 1 |
 | [#33](https://github.com/webxxxxx/plugin-manager/issues/33) | Web UI 反代 | #30 #31 | 已实现：静态资源、base 注入、ETag/304、SPA fallback、`/rpc` 桥；Range/WS/SSE 不做 |
 | [#34](https://github.com/webxxxxx/plugin-manager/issues/34) | 配置流 | #30 | 模板/活动副本/`config.new`/`editconfig`/`configCheck`/`.spkb` 导入导出已实现；HTTP 端点归 #39 |
 | [#35](https://github.com/webxxxxx/plugin-manager/issues/35) | 日志与 `svc logs` | #29 | 无 |
