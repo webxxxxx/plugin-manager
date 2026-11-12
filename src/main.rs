@@ -2,6 +2,7 @@ mod channel;
 mod daemon;
 mod definition;
 mod http;
+mod install;
 mod log;
 mod mcp;
 mod package;
@@ -31,13 +32,25 @@ fn main() {
 }
 
 fn svcd_run(args: Vec<String>) -> i32 {
-    match args.as_slice() {
-        [command, flag] if command == "run" && flag == "--foreground" => daemon::run(),
-        [command] if command == "shutdown" => daemon::shutdown(),
+    match args.first().map(String::as_str) {
+        Some("run") if args.len() == 2 && args[1] == "--foreground" => daemon::run(),
+        Some("shutdown") if args.len() == 1 => daemon::shutdown(),
+        Some("install-service") => install::install_service(&args[1..]),
+        Some("uninstall-service") => install::uninstall_service(&args[1..]),
         _ => {
-            eprintln!("usage: svcd run --foreground");
-            eprintln!("       svcd shutdown");
+            usage();
             64
         }
     }
+}
+
+fn usage() {
+    eprintln!("usage: svcd run --foreground");
+    eprintln!("       svcd shutdown");
+    eprintln!(
+        "       svcd install-service [--target systemd|launchd|scm|busybox|procd] [--dry-run]"
+    );
+    eprintln!(
+        "       svcd uninstall-service [--target systemd|launchd|scm|busybox|procd] [--purge] [--dry-run]"
+    );
 }
