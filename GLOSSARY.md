@@ -24,12 +24,16 @@ _Avoid_: 服务管理器进程、supervisor daemon
 与服务管理器交互的 CLI，也是核心服务的能力命名空间（`svc.list`、`svc.describe` 等）。
 _Avoid_: svcd CLI、管理客户端
 
+**plugin**:
+只管理插件的 CLI；动词与 `svc` 同源，但作用域限定在 `kind=plugin`，另加 `install / uninstall / editconfig / export / import`。
+_Avoid_: 插件管理器、PluginManager（那是已退役的进程）
+
 **mcp**:
 multicall 二进制的 MCP 桥入口名；把 MCP 客户端接到常驻 svcd。
 _Avoid_: MCP server、stdio server
 
 **multicall 二进制**:
-一个可执行文件，按 argv[0]/子命令分派出 `svcd`、`svc`、`mcp` 三个入口。
+一个可执行文件，按 argv[0]/子命令分派出 `svcd`、`svc`、`plugin`、`mcp` 四个入口。
 _Avoid_: 多合一程序、fat binary
 
 **能力（Capability）**:

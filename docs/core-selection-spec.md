@@ -7,14 +7,14 @@
 
 ## 0. 一句话
 
-一个 Rust 写的 multicall 二进制，链接出 `svcd`（守护进程）/ `svc`（CLI）/ `mcp`（MCP 桥）三个入口；插件是 `.spk` 包，由 svcd 以 root / System 身份监督；核心层不链 TLS、不打包 WebView 引擎，嵌入式 ≤ 2,000,000 B、桌面 ≤ 30,000,000 B（均指核心二进制）。
+一个 Rust 写的 multicall 二进制，链接出 `svcd`（守护进程）/ `svc`（服务 CLI）/ `plugin`（插件 CLI）/ `mcp`（MCP 桥）四个入口；插件是 `.spk` 包，由 svcd 以 root / System 身份监督；核心层不链 TLS、不打包 WebView 引擎，嵌入式 ≤ 2,000,000 B、桌面 ≤ 30,000,000 B（均指核心二进制）。
 
 ## 1. 系统模型
 
 ### 1.1 交付物
 
-- **一个 crate、一个二进制、argv[0] 派发**；安装时建 `svcd` / `svc` / `mcp` 三个硬链接，失败降级 symlink，再降级 copy 并告警。
-- 桌面另有 `svc ui` 子命令作为 GUI 入口（不新增第四个入口名）。
+- **一个 crate、一个二进制、argv[0] 派发**；安装时建 `svcd` / `svc` / `plugin` / `mcp` 四个硬链接，失败降级 symlink，再降级 copy 并告警。
+- 桌面另有 `svc ui` 子命令作为 GUI 入口，不单独占入口名。
 - **PluginManager 不再存在**：不是进程、不是服务、不是保留名。插件管理是 svcd 的内部功能。
 - `svcd run --foreground` 供服务管理器拉起；`svcd install-service / uninstall-service` 向宿主注册自身（systemd / launchd / SCM / BusyBox inittab / procd 五份计划）。
 
@@ -253,7 +253,8 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 ### 5.1 入口
 
 - `svcd`：守护进程；`svcd run --foreground`、`svcd install-service / uninstall-service`。
-- `svc`：CLI；`list / status / start / stop / install / uninstall / import / export / editconfig / logs / lan / version`。
+- `svc`：服务 CLI，接受任意服务 id（core 或 plugin）：`list / status / start / stop / enable / disable / logs / lan / version`。
+- `plugin`：插件 CLI，**只接受 `kind=plugin` 的 id**；动词与 `svc` 同源，另加 `install / uninstall / editconfig / export / import`。传 core 服务 id 报错「不是插件」。
 - `mcp`：stdio MCP 桥，每个客户端一个进程。
 - `svc ui`：桌面 GUI 入口，客户端；关窗不退 svcd。
 
