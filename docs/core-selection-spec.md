@@ -53,7 +53,7 @@
 
 | | core 服务 | plugin |
 | --- | --- | --- |
-| 来源 | 管理员在 `<config>/services.d/*.json` 声明的脚本 / 可执行文件；`svc` 是内置 core | `.spk` 包，经 `svc install` |
+| 来源 | 管理员在 `<config>/services.d/*.json` 或 `services.d/<id>.sh|bat|cmd|ps1` 声明的脚本 / 可执行文件；`svc` 是内置 core | `.spk` 包，经 `svc install` |
 | 信任 | 无包签名；root 所有的定义文件 + 本机管理员 | Ed25519 manifest 签名 + `files[]` + `trust.d` |
 | 安装/升级 | 由 OS 包管理器 / 管理员管文件；svcd 不安装、不升级 | `svc install`（升级同）/ `uninstall` |
 | 配置 | 脚本/bin 自己管；svcd 不提供 `config` / `editconfig` / `export` | `config` / `configCheck` / `editconfig` / `.spkb` |
@@ -90,6 +90,29 @@
 - `<config>` 指平台配置目录（Linux `/etc/svcd`、macOS `/Library/Application Support/svcd/config`、Windows `%ProgramData%\svcd\config`）；`SVCD_CONFIG_DIR` 可覆盖，供测试与非 root 开发使用。
 - `<logs>` 指平台日志目录（Linux `/var/log/svcd`、macOS `/Library/Logs/svcd`、Windows `%ProgramData%\svcd\logs`）；`SVCD_LOG_DIR` 可覆盖，供测试与非 root 开发使用。
 - core 与 plugin 走同一监督器、同一 stdio NDJSON、同一依赖图、同一日志 / 状态；`svc list/status/start/stop/logs` 对两者一致；`install/uninstall/import/export/editconfig` 只对 plugin。
+
+### 1.7 脚本服务（drop-in）
+
+`<config>/services.d/` 里同时接受**不写 JSON 的脚本服务**：
+
+- Unix：`<id>.sh`；Windows：`<id>.bat` / `<id>.cmd` / `<id>.ps1`。
+- 文件名即服务 id（必须符合 `[a-z0-9][a-z0-9_-]{0,63}`）；`.disabled` sidecar 同样生效。
+- 脚本第一个参数是 `start|stop|status`，同时注入 `SVCD_ACTION`；脚本内部可以用函数 / label 实现，入口做 3 行分发。
+- `start` 必须前台运行（可申请资源后 `exec` 真正的进程），不得 daemonize；`stop` 在 SIGTERM 前释放资源；`status` exit 0 = healthy。
+- svcd 把脚本合成为 core 服务：`exec.ready = Exec`，`lifecycle.start/stop/status` 指向同一脚本；默认 `version = 1.0.0`，无 dependencies / capabilities / config。
+- 同 id 的 JSON 定义优先；脚本跳过并告警。脚本必须非 symlink；Unix 还要求 exec 位；改脚本后重启 svcd 生效（v1 不做热加载）。
+- `.ps1` 在 Windows 通过 `powershell -NoProfile -ExecutionPolicy Bypass -File <script> <action>` 调用。
+
+```sh
+#!/bin/sh
+start()  { exec /usr/local/bin/real-service; }
+stop()   { ...; }
+status() { ...; }
+action="${1:-$SVCD_ACTION}"
+case "$action" in start|stop|status) "$action" ;; *) exit 64 ;; esac
+```
+
+`svc list/status/start/stop`、日志、退避、依赖图与 JSON core 相同；`svc status` 的 `details.probe` 来自 `status`。
 
 ## 2. .spk 包格式
 
@@ -440,7 +463,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 | C13 | **基线缺口** | 尺寸基线只有 musl x86_64 与 Windows x86_64；macOS arm64 / x86_64、Linux gnu 没有首跑数据 | #16 | CI 首跑后补 `ci/size-baseline.json` |
 | C14 | **语义澄清** | #15 说 `[auto]` 由 svcd 推断；#22 说 `[auto]` = enabled。两者可兼容，但文档要写死 | #15、#22 | 以 §5.2 为准：`[auto]` = svcd 推断的开机自启，不是插件自报，也不是重启策略 |
 | C15 | **命名冲突（已解）** | 票面默认「包根目录 `config` 文件」，但 #13 的包里 `config/` 是目录，不能同名共存 | #13、#20 | 默认改为 `config/config`；显式字段可指向任意 `files[]` 内普通文件 |
-| C16 | **已澄清（服务模型根）** | 原服务模型只写 kind core/plugin，没定义 core 怎么来；core 容易被误当成 .spk 的一种 | #9、#13、#14 | **已定（2026-11-12）**：core = `services.d/*.json` 的启动脚本/可执行文件；plugin = 标准 `.spk`；两者共用监督/依赖/日志，但能力面只归 plugin；core 用 start/stop/status 生命周期钩子，install/config/export 只对 plugin（§1.6）。 |
+| C16 | **已澄清（服务模型根）** | 原服务模型只写 kind core/plugin，没定义 core 怎么来；core 容易被误当成 .spk 的一种 | #9、#13、#14 | **已定（2026-11-12）**：core = `services.d/*.json` 或 `services.d/<id>.sh|bat|cmd|ps1` 的脚本/可执行文件；plugin = 标准 `.spk`；两者共用监督/依赖/日志，但能力面只归 plugin；core 用 start/stop/status 生命周期钩子，install/config/export 只对 plugin（§1.6 / §1.7）。 |
 
 ### 仍未处理
 
@@ -459,6 +482,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - 2026-11-12：C1 `platform` only、删除 `arch`，`schema: 1` 重写；C2 推迟；C3 增加 `POST /mcp`；C4 增加 `/api/v1` 管理 API（覆盖全部 `svc` 命令）；C5 明确 v1 不支持 TLS。
 - 2026-11-12（补）：core/plugin 边界——core = `services.d/*.json` 的启动脚本/可执行文件，plugin = 标准 `.spk`；install/config/export 只对 plugin。
 - 2026-11-12（补）：core 退出工具面——定义不再接受 `capabilities`；新增可选 `lifecycle.start/stop/status`，`svc start/stop/status` 调用钩子；`details` 增加 `probe`。
+- 2026-11-12（补）：脚本服务 drop-in——`services.d/<id>.sh|bat|cmd|ps1`，`start/stop/status` 参数入口；同 id JSON 优先；`.ps1` 走 ExecutionPolicy Bypass。
 
 ## 16. 实施票（2026-11-12 拆出）
 

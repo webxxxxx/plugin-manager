@@ -91,6 +91,8 @@ pub fn load_services(services_dir: &Path) -> Loaded {
         }
     }
 
+    load_scripts(services_dir, &mut registry, &mut issues, &sources);
+
     // A cycle is rejected at load, as the spec requires, but only the services
     // that participate in it are dropped. Removing each cycle terminates.
     while let Some(cycle) = registry.find_cycle() {
@@ -109,6 +111,157 @@ pub fn load_services(services_dir: &Path) -> Loaded {
     }
 
     Loaded { registry, issues }
+}
+
+/// Drop-in scripts live next to the JSON definitions: `<id>.sh` on Unix;
+/// `<id>.bat`, `<id>.cmd` or `<id>.ps1` on Windows. The script receives the
+/// action as its first argument and is treated as a supervised core service.
+fn load_scripts(
+    dir: &Path,
+    registry: &mut Registry,
+    issues: &mut Vec<LoadIssue>,
+    sources: &BTreeMap<String, Option<String>>,
+) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            issues.push(LoadIssue {
+                file: None,
+                id: String::new(),
+                reason: format!("cannot read scripts: {}", error),
+            });
+            return;
+        }
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| script_extension(&extension.to_ascii_lowercase()))
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+
+    for path in files {
+        let file = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string);
+        let fail = |id: &str, reason: String| LoadIssue {
+            file: file.clone(),
+            id: id.to_string(),
+            reason,
+        };
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                issues.push(fail("", format!("cannot read script: {}", error)));
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            let stem = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            issues.push(fail(&stem, "script must not be a symlink".into()));
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        let id = match path.file_stem().and_then(|stem| stem.to_str()) {
+            Some(stem) => stem.to_string(),
+            None => continue,
+        };
+        if id == RESERVED_ID {
+            issues.push(fail(&id, format!("id \"{}\" is reserved", RESERVED_ID)));
+            continue;
+        }
+        if !valid_name(&id) {
+            issues.push(fail(
+                &id,
+                format!(
+                    "id \"{}\" is invalid; expected [a-z0-9][a-z0-9_-]{{0,63}}",
+                    id
+                ),
+            ));
+            continue;
+        }
+        if let Some(source) = sources.get(&id).and_then(|file| file.clone()) {
+            issues.push(fail(
+                &id,
+                format!("id already defined by services.d/{}", source),
+            ));
+            continue;
+        }
+        if registry.get(&id).is_some() {
+            issues.push(fail(&id, "id already defined by another service".into()));
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                issues.push(fail(&id, "script must be executable".into()));
+                continue;
+            }
+        }
+
+        let path_text = path.to_string_lossy().to_string();
+        let hook = |action: &str, timeout_ms: u64| Hook {
+            path: path_text.clone(),
+            args: vec![action.to_string()],
+            env: BTreeMap::new(),
+            timeout_ms,
+        };
+        let enabled = !dir.join(format!("{}.disabled", id)).exists();
+        let service = Service {
+            id: id.clone(),
+            kind: Kind::Core,
+            version: "1.0.0".into(),
+            desc: format!("script service: {}", file.clone().unwrap_or_default()),
+            deps: Vec::new(),
+            caps: Vec::new(),
+            exec: Some(Exec {
+                path: path_text.clone(),
+                args: vec!["start".into()],
+                env: BTreeMap::new(),
+                ready: Ready::Exec,
+            }),
+            lifecycle: Some(Lifecycle {
+                start: Some(hook("start", 30_000)),
+                stop: Some(hook("stop", 10_000)),
+                status: Some(hook("status", 5_000)),
+            }),
+            enabled,
+            state: State::Stopped,
+            pid: None,
+            since: None,
+            ready_since: None,
+            next_at: None,
+            failures: 0,
+            last_exit: None,
+            config: None,
+        };
+        if let Err(reason) = registry.insert(service) {
+            issues.push(fail(&id, reason));
+        }
+    }
+}
+
+fn script_extension(extension: &str) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(extension, "bat" | "cmd" | "ps1")
+    }
+    #[cfg(not(windows))]
+    {
+        extension == "sh"
+    }
 }
 
 fn load_one(path: &Path) -> Result<Service, LoadIssue> {
@@ -347,9 +500,9 @@ fn convert_hook(
             .extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.to_ascii_lowercase());
-        if !matches!(extension.as_deref(), Some("exe" | "cmd" | "bat")) {
+        if !matches!(extension.as_deref(), Some("exe" | "cmd" | "bat" | "ps1")) {
             return Err(format!(
-                "lifecycle path must end with .exe, .cmd or .bat on Windows: \"{}\"",
+                "lifecycle path must end with .exe, .cmd, .bat or .ps1 on Windows: \"{}\"",
                 definition.path
             ));
         }
@@ -418,6 +571,18 @@ mod tests {
             fs::write(self.services_dir().join(format!("{}.disabled", id)), "")
                 .expect("write disabled marker");
         }
+
+        fn write_script(&self, name: &str, body: &str) {
+            fs::create_dir_all(self.services_dir()).expect("create services.d");
+            let path = self.services_dir().join(name);
+            fs::write(&path, body).expect("write script");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                    .expect("chmod script");
+            }
+        }
     }
 
     impl Drop for TempDir {
@@ -431,6 +596,14 @@ mod tests {
             r"C:\Windows\System32\cmd.exe".to_string()
         } else {
             "/bin/sh".to_string()
+        }
+    }
+
+    fn script_name(id: &str) -> String {
+        if cfg!(windows) {
+            format!("{}.cmd", id)
+        } else {
+            format!("{}.sh", id)
         }
     }
 
@@ -731,5 +904,124 @@ mod tests {
             .collect();
         assert_eq!(cycle_issues.len(), 2);
         assert!(cycle_issues[0].reason.contains("a -> b -> a"));
+    }
+
+    #[test]
+    fn loads_a_drop_in_script_as_a_core_service() {
+        let dir = TempDir::new();
+        dir.write_script(&script_name("demo"), "");
+
+        let loaded = load_services(&dir.services_dir());
+
+        assert!(loaded.issues.is_empty(), "issues: {:?}", loaded.issues);
+        let demo = loaded.registry.get("demo").expect("demo");
+        assert_eq!(demo.kind, Kind::Core);
+        assert!(demo.caps.is_empty());
+        assert_eq!(demo.version, "1.0.0");
+        assert!(demo.enabled);
+        let exec = demo.exec.as_ref().expect("exec");
+        assert_eq!(exec.ready, Ready::Exec);
+        assert_eq!(exec.args, ["start"]);
+        let lifecycle = demo.lifecycle.as_ref().expect("lifecycle");
+        assert_eq!(lifecycle.start.as_ref().expect("start").args, ["start"]);
+        assert_eq!(lifecycle.stop.as_ref().expect("stop").args, ["stop"]);
+        assert_eq!(lifecycle.status.as_ref().expect("status").args, ["status"]);
+        assert_eq!(lifecycle.start.as_ref().expect("start").timeout_ms, 30_000);
+        assert_eq!(lifecycle.stop.as_ref().expect("stop").timeout_ms, 10_000);
+        assert_eq!(lifecycle.status.as_ref().expect("status").timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn a_disabled_marker_turns_off_a_script() {
+        let dir = TempDir::new();
+        dir.write_script(&script_name("demo"), "");
+        dir.disable("demo");
+
+        let loaded = load_services(&dir.services_dir());
+
+        assert!(!loaded.registry.get("demo").expect("demo").enabled);
+    }
+
+    #[test]
+    fn a_json_definition_wins_over_a_script_with_the_same_id() {
+        let dir = TempDir::new();
+        dir.write("demo", definition("demo"));
+        dir.write_script(&script_name("demo"), "");
+
+        let loaded = load_services(&dir.services_dir());
+
+        let demo = loaded.registry.get("demo").expect("demo");
+        assert!(demo.lifecycle.is_none());
+        assert!(
+            loaded
+                .issues
+                .iter()
+                .any(|issue| issue.reason.contains("already defined")),
+            "issues: {:?}",
+            loaded.issues
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_and_reserved_script_ids() {
+        let dir = TempDir::new();
+        dir.write_script(&script_name("bad.name"), "");
+        dir.write_script(&script_name("svc"), "");
+
+        let loaded = load_services(&dir.services_dir());
+
+        assert_eq!(loaded.issues.len(), 2, "issues: {:?}", loaded.issues);
+        assert!(loaded
+            .issues
+            .iter()
+            .any(|issue| issue.reason.contains("invalid")));
+        assert!(loaded
+            .issues
+            .iter()
+            .any(|issue| issue.reason.contains("reserved")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn loads_a_powershell_script() {
+        let dir = TempDir::new();
+        dir.write_script("demo.ps1", "");
+
+        let loaded = load_services(&dir.services_dir());
+
+        assert!(loaded.issues.is_empty(), "issues: {:?}", loaded.issues);
+        assert!(loaded.registry.get("demo").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_non_executable_script() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new();
+        let name = script_name("demo");
+        dir.write_script(&name, "");
+        let path = dir.services_dir().join(&name);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let loaded = load_services(&dir.services_dir());
+
+        assert!(loaded.registry.get("demo").is_none());
+        assert!(loaded.issues[0].reason.contains("executable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_symlinked_script() {
+        let dir = TempDir::new();
+        let target = dir.0.join("target.sh");
+        fs::write(&target, "").expect("target");
+        fs::create_dir_all(dir.services_dir()).expect("services.d");
+        std::os::unix::fs::symlink(&target, dir.services_dir().join("demo.sh")).expect("symlink");
+
+        let loaded = load_services(&dir.services_dir());
+
+        assert!(loaded.registry.get("demo").is_none());
+        assert!(loaded.issues[0].reason.contains("symlink"));
     }
 }

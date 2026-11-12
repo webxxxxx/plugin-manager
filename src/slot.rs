@@ -550,19 +550,43 @@ pub(crate) fn hook_command(id: &str, action: &str, hook: &Hook) -> Command {
 }
 
 fn command_for_parts(path: &str, args: &[String], env: &BTreeMap<String, String>) -> Command {
-    #[cfg(windows)]
-    {
-        let extension = std::path::Path::new(path)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if extension == "cmd" || extension == "bat" {
-            let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
-            let mut command = Command::new(shell);
-            command.arg("/C").arg(path).args(args).envs(env);
+    let extension = std::path::Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if extension == "ps1" {
+        #[cfg(windows)]
+        {
+            let mut command = Command::new("powershell");
+            command
+                .arg("-NoProfile")
+                .arg("-ExecutionPolicy")
+                .arg("Bypass")
+                .arg("-File")
+                .arg(path)
+                .args(args)
+                .envs(env);
             return command;
         }
+        #[cfg(not(windows))]
+        {
+            let mut command = Command::new("pwsh");
+            command
+                .arg("-NoProfile")
+                .arg("-File")
+                .arg(path)
+                .args(args)
+                .envs(env);
+            return command;
+        }
+    }
+    #[cfg(windows)]
+    if extension == "cmd" || extension == "bat" {
+        let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
+        let mut command = Command::new(shell);
+        command.arg("/C").arg(path).args(args).envs(env);
+        return command;
     }
     let mut command = Command::new(path);
     command.args(args).envs(env);
