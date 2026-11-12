@@ -442,3 +442,28 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 
 - 2026-11-12：C1 `platform` only、删除 `arch`，`schema: 1` 重写；C2 推迟；C3 增加 `POST /mcp`；C4 增加 `/api/v1` 管理 API（覆盖全部 `svc` 命令）；C5 明确 v1 不支持 TLS。
 - 2026-11-12（补）：core/plugin 边界——core = `services.d/*.json` 的启动脚本/可执行文件，plugin = 标准 `.spk`；install/config/export 只对 plugin。
+
+## 16. 实施票（2026-11-12 拆出）
+
+由本规格拆成 **16 张 tracer bullet**，全部 `ready-for-agent`，阻塞边用 GitHub 原生依赖表示，frontier 起点只有 [#28](https://github.com/webxxxxx/plugin-manager/issues/28)。
+
+| 票 | 交付 | 阻塞于 | 骨架现状（尺寸夹具） |
+| --- | --- | --- | --- |
+| [#28](https://github.com/webxxxxx/plugin-manager/issues/28) | 注册表与 status | — | 类型 + 拓扑已有；缺 `services.d` 扫描、status payload、CLI 接线 |
+| [#29](https://github.com/webxxxxx/plugin-manager/issues/29) | 前台监督 core 服务 | #28 | 6 态纯核已有；缺 proc/wait、事件循环、定时器、stderr 捕获 |
+| [#30](https://github.com/webxxxxx/plugin-manager/issues/30) | 安装/运行 .spk（含 `plugin` 入口） | #28 #29 | manifest 解析 + ustar 头已有；缺验签、`files[]` 校验、解包、布局、插件扫描、第四入口 |
+| [#31](https://github.com/webxxxxx/plugin-manager/issues/31) | 插件 IPC 与工具面 | #30 | 编解码 + 工具投影已有；缺分帧读写、id 路由、流控、取消 |
+| [#32](https://github.com/webxxxxx/plugin-manager/issues/32) | `mcp` 桥 dual-era | #31 | 只有 echo 循环 |
+| [#33](https://github.com/webxxxxx/plugin-manager/issues/33) | Web UI 反代 | #30 #31 | HTTP 原语已有；缺监听器、路由、静态服务 |
+| [#34](https://github.com/webxxxxx/plugin-manager/issues/34) | 配置流 | #30 | manifest 还缺 `config`/`configCheck`；其余全缺 |
+| [#35](https://github.com/webxxxxx/plugin-manager/issues/35) | 日志与 `svc logs` | #29 | 无 |
+| [#36](https://github.com/webxxxxx/plugin-manager/issues/36) | 安装为系统服务 | #29 | 无 |
+| [#37](https://github.com/webxxxxx/plugin-manager/issues/37) | HTTP 管理 API | #29 #30 | 无 |
+| [#38](https://github.com/webxxxxx/plugin-manager/issues/38) | LAN 鉴权与会话 | #37 | 无 |
+| [#39](https://github.com/webxxxxx/plugin-manager/issues/39) | HTTP 配置/导入导出/日志 | #34 #35 #37 | 无 |
+| [#40](https://github.com/webxxxxx/plugin-manager/issues/40) | HTTP `/mcp` | #32 #38 | 无 |
+| [#41](https://github.com/webxxxxx/plugin-manager/issues/41) | 桌面 `svc ui` | #33 #37 | 无 |
+| [#42](https://github.com/webxxxxx/plugin-manager/issues/42) | 发行包与签名 | #41 | 无 |
+| [#43](https://github.com/webxxxxx/plugin-manager/issues/43) | 嵌入式发行 | #29 #33 | 无 |
+
+**骨架实际覆盖的范围**（`src/`，568 行，`Cargo.toml` 标注为 size fixture）：6 态状态机、注册表类型与拓扑、manifest 解析、ustar 头解析、JSON-RPC 编解码、工具面投影、HTTP 原语、argv 派发（三入口）。**没有任何一条端到端路径是通的**——没有真实进程、真实文件、真实 IPC 连接。
