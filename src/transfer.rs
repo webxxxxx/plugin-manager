@@ -44,6 +44,7 @@ pub fn import(
     config_id: Option<&str>,
     no_config: bool,
     force: bool,
+    require_root: bool,
 ) -> Result<Outcome, Error> {
     if data.len() as u64 > MAX_IMPORT {
         return Err(Error::Failed("import exceeds 512 MiB".into()));
@@ -51,7 +52,12 @@ pub fn import(
     let entries = package::read_tar(data).ok();
     let first = entries.as_ref().and_then(|entries| entries.first());
     match first.map(|entry| entry.path.as_str()) {
-        Some("backup.json") => import_backup(entries.as_ref().expect("entries"), no_config, force),
+        Some("backup.json") => import_backup(
+            entries.as_ref().expect("entries"),
+            no_config,
+            force,
+            require_root,
+        ),
         Some("manifest.json") => {
             let status = install_bytes(data, "spk").map_err(Error::Failed)?;
             Ok(Outcome {
@@ -64,7 +70,7 @@ pub fn import(
             let Some(id) = config_id else {
                 return Err(Error::Usage("raw config requires --config <id>".into()));
             };
-            apply_config(id, data)?;
+            apply_config(id, data, require_root)?;
             Ok(Outcome {
                 status: None,
                 config: Some(id.to_string()),
@@ -78,6 +84,7 @@ fn import_backup(
     entries: &[package::TarEntry],
     no_config: bool,
     force: bool,
+    require_root: bool,
 ) -> Result<Outcome, Error> {
     let backup = entries
         .iter()
@@ -137,12 +144,12 @@ fn import_backup(
 
     let config = entries.iter().find(|entry| entry.path == "config");
     let with_config = !no_config && config.is_some();
-    if with_config {
+    if with_config && require_root {
         plugin::root_required().map_err(Error::Failed)?;
     }
     let status = install_bytes(&spk.data, "spkb").map_err(Error::Failed)?;
     let config = if let Some(config) = config.filter(|_| with_config) {
-        apply_config(&backup.id, &config.data)?;
+        apply_config(&backup.id, &config.data, require_root)?;
         Some(backup.id.clone())
     } else {
         None
@@ -154,8 +161,10 @@ fn import_backup(
     })
 }
 
-fn apply_config(id: &str, data: &[u8]) -> Result<(), Error> {
-    plugin::root_required().map_err(Error::Failed)?;
+fn apply_config(id: &str, data: &[u8], require_root: bool) -> Result<(), Error> {
+    if require_root {
+        plugin::root_required().map_err(Error::Failed)?;
+    }
     if !package::valid_name(id) || plugin::current_version(id).is_none() {
         return Err(Error::Failed(format!("unknown plugin: {}", id)));
     }
@@ -198,7 +207,7 @@ mod tests {
 
     #[test]
     fn raw_config_without_an_id_is_a_usage_error() {
-        match import(b"plain text", None, false, false) {
+        match import(b"plain text", None, false, false, true) {
             Err(Error::Usage(message)) => assert!(message.contains("--config"), "{message}"),
             other => panic!("expected a usage error, got {:?}", other),
         }

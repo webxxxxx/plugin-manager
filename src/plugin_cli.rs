@@ -501,7 +501,7 @@ fn import(path: &Path, config_id: Option<&str>, no_config: bool, force: bool) ->
             return EXIT_SERVICE_ERROR;
         }
     };
-    match transfer::import(&data, config_id, no_config, force) {
+    match transfer::import(&data, config_id, no_config, force, true) {
         Ok(outcome) => {
             for warning in &outcome.warnings {
                 eprintln!("plugin: warning: {}", warning);

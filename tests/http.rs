@@ -576,6 +576,15 @@ fn plugin_upload_list_and_delete() {
         .expect("plugin service");
     assert_eq!(plugin["kind"], "plugin");
 
+    let disabled = request(&address, "POST", "/api/v1/services/demo/disable", "", b"");
+    assert_eq!(disabled.status, 200, "{}", disabled.body);
+    assert_eq!(disabled.body["summary"]["enabled"], false);
+    let enabled = request(&address, "POST", "/api/v1/services/demo/enable", "", b"");
+    assert_eq!(enabled.status, 200, "{}", enabled.body);
+    assert_eq!(enabled.body["summary"]["enabled"], true);
+    let core_toggle = request(&address, "POST", "/api/v1/services/svc/disable", "", b"");
+    assert_eq!(core_toggle.status, 409, "{}", core_toggle.body);
+
     let deleted = request(&address, "DELETE", "/api/v1/plugins/demo", "", b"");
     assert_eq!(deleted.status, 200, "{}", deleted.body);
 
@@ -711,6 +720,35 @@ fn config_endpoints_read_write_reset_and_reject_bad_checks() {
     assert_eq!(
         fs::read(directory.join("config.last-good")).expect("last-good"),
         b"good config\n"
+    );
+
+    let bad_import = raw_request(
+        &address,
+        "POST",
+        "/api/v1/import?config_id=demo",
+        "text/plain",
+        b"bad config\n",
+    );
+    assert_eq!(
+        bad_import.status,
+        409,
+        "{}",
+        String::from_utf8_lossy(&bad_import.body)
+    );
+
+    let too_large = vec![b'x'; 1024 * 1024 + 1];
+    let large = raw_request(
+        &address,
+        "POST",
+        "/api/v1/import?config_id=demo",
+        "text/plain",
+        &too_large,
+    );
+    assert_eq!(
+        large.status,
+        413,
+        "{}",
+        String::from_utf8_lossy(&large.body)
     );
 }
 
@@ -857,6 +895,16 @@ fn export_import_and_logs() {
     assert_eq!(too_many.status, 400);
     let no_log = raw_request(&address, "GET", "/api/v1/logs/plain", "", b"");
     assert_eq!(no_log.status, 404);
+
+    let big = "x".repeat(1024 * 1024 + 100);
+    fs::write(sandbox.logs.join("demo.log"), &big).expect("write big log");
+    let capped = raw_request(&address, "GET", "/api/v1/logs/demo?lines=200", "", b"");
+    assert_eq!(capped.status, 200);
+    assert!(
+        capped.body.len() <= 1024 * 1024,
+        "log response was {} bytes",
+        capped.body.len()
+    );
 }
 
 #[test]
@@ -899,6 +947,27 @@ fn config_endpoints_are_plugin_only_and_enforce_methods() {
         String::from_utf8_lossy(&import_core.body)
     );
 
+    let key = SigningKey::from_bytes(&[33u8; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let core_package = plugin_bundle(&key, "demo", "1.0.0", None, false);
+    let core_import = raw_request(
+        &address,
+        "POST",
+        "/api/v1/import",
+        "application/octet-stream",
+        &core_package,
+    );
+    assert_eq!(
+        core_import.status,
+        404,
+        "{}",
+        String::from_utf8_lossy(&core_import.body)
+    );
+
     let reset_get = raw_request(&address, "GET", "/api/v1/config/demo/reset", "", b"");
     assert_eq!(reset_get.status, 405);
     assert_eq!(raw_header_values(&reset_get, "allow"), vec!["POST"]);
@@ -913,6 +982,32 @@ fn config_endpoints_are_plugin_only_and_enforce_methods() {
 
     let import_get = raw_request(&address, "GET", "/api/v1/import", "", b"");
     assert_eq!(import_get.status, 405);
+}
+
+#[test]
+fn serves_the_embedded_console() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let page = raw_request(&address, "GET", "/", "", b"");
+    assert_eq!(page.status, 200);
+    assert_eq!(
+        raw_header_values(&page, "content-type"),
+        vec!["text/html; charset=utf-8"]
+    );
+    let html = String::from_utf8_lossy(&page.body);
+    assert!(html.contains("id=\"rows\""), "console table missing");
+    assert!(
+        html.contains("/api/v1/services"),
+        "console does not call the management API"
+    );
+    let index = raw_request(&address, "GET", "/index.html", "", b"");
+    assert_eq!(index.status, 200);
+
+    let post = raw_request(&address, "POST", "/", "", b"");
+    assert_eq!(post.status, 405);
+    assert_eq!(raw_header_values(&post, "allow"), vec!["GET"]);
 }
 
 #[test]
@@ -934,6 +1029,9 @@ fn lan_auth_bearer_cookie_csrf_rotate_and_disable() {
     let token = token_line(&enabled);
     assert!(sandbox.config.join("lan-token").is_file());
     assert!(sandbox.config.join("lan.json").is_file());
+
+    let page = raw_request(&address, "GET", "/", "", b"");
+    assert_eq!(page.status, 200, "console must load before login");
 
     let denied = request(&address, "GET", "/api/v1/services", "", b"");
     assert_eq!(denied.status, 401);

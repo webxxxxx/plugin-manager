@@ -29,7 +29,9 @@ use crate::transfer;
 const DEFAULT_PORT: u16 = 8787;
 const MAX_BODY: u64 = 512 * 1024 * 1024;
 const MAX_JSON_BODY: u64 = 1024 * 1024;
+const MAX_LOG_BODY: usize = 1024 * 1024;
 const MAX_HEADER: usize = 64 * 1024;
+const UI: &str = include_str!("web/index.html");
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -230,6 +232,12 @@ fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u
     }
     if path == "/logout" && request.method == "POST" {
         return logout(request, lan);
+    }
+    if path == "/" || path == "/index.html" {
+        if request.method != "GET" {
+            return method_not_allowed("GET");
+        }
+        return ui_page();
     }
 
     let auth = match lan.lock() {
@@ -452,6 +460,18 @@ fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<
                 Err(response) => response,
             }
         }
+        ("POST", ["api", "v1", "services", id, "enable"]) => {
+            match rpc(config, "svc.enable", json!({ "id": decode(id) })) {
+                Ok(status) => summary(status),
+                Err(response) => response,
+            }
+        }
+        ("POST", ["api", "v1", "services", id, "disable"]) => {
+            match rpc(config, "svc.disable", json!({ "id": decode(id) })) {
+                Ok(status) => summary(status),
+                Err(response) => response,
+            }
+        }
         ("POST", ["api", "v1", "plugins"]) => install_plugin(config, request, query),
         ("DELETE", ["api", "v1", "plugins", id]) => {
             let purge = query_bool(query, "purge").unwrap_or(false);
@@ -641,7 +661,9 @@ fn import_plugin(request: &HttpRequest, query: &str) -> Vec<u8> {
     let no_config = query_bool(query, "no_config").unwrap_or(false);
     let force = query_bool(query, "force").unwrap_or(false);
     let _guard = config_lock();
-    match transfer::import(&request.body, config_id.as_deref(), no_config, force) {
+    // The HTTP surface is already authorised by the LAN token / loopback
+    // policy; do not re-check the daemon's OS privilege here (the CLI does).
+    match transfer::import(&request.body, config_id.as_deref(), no_config, force, false) {
         Ok(outcome) => {
             let mut body = json!({
                 "ok": true,
@@ -660,7 +682,7 @@ fn import_plugin(request: &HttpRequest, query: &str) -> Vec<u8> {
             ok(body)
         }
         Err(transfer::Error::Usage(message)) => error(400, "bad_request", &message),
-        Err(transfer::Error::Failed(message)) => map_error(&message),
+        Err(transfer::Error::Failed(message)) => import_error(&message),
     }
 }
 
@@ -683,12 +705,44 @@ fn logs(config: &Path, id: &str, query: &str) -> Vec<u8> {
     };
     let path = paths::logs_dir().join(format!("{}.log", id));
     match log::tail(&path, lines) {
-        Ok(text) => http::response(200, "text/plain; charset=utf-8", text.as_bytes()),
+        Ok(text) => http::response(200, "text/plain; charset=utf-8", cap_log(text).as_bytes()),
         Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {
             error(404, "not_found", &format!("no log for {}", id))
         }
         Err(cause) => error(500, "internal", &format!("cannot read log: {}", cause)),
     }
+}
+
+fn ui_page() -> Vec<u8> {
+    http::response_with_headers(
+        200,
+        "text/html; charset=utf-8",
+        &[
+            ("Cache-Control".to_string(), "no-store".to_string()),
+            ("X-Content-Type-Options".to_string(), "nosniff".to_string()),
+        ],
+        UI.as_bytes(),
+    )
+}
+
+fn cap_log(mut text: String) -> String {
+    if text.len() <= MAX_LOG_BODY {
+        return text;
+    }
+    let mut start = text.len() - MAX_LOG_BODY;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    if let Some(newline) = text[start..].find('\n') {
+        // Keep complete lines when possible; a single line longer than the
+        // budget keeps its tail rather than becoming empty.
+        let candidate = start + newline + 1;
+        if candidate < text.len() {
+            start = candidate;
+        }
+    }
+    text.drain(..start);
+    text
 }
 
 fn method_not_allowed(allow: &str) -> Vec<u8> {
@@ -716,6 +770,38 @@ fn download(filename: &str, data: &[u8]) -> Vec<u8> {
         )],
         data,
     )
+}
+
+fn import_error(message: &str) -> Vec<u8> {
+    let lower = message.to_ascii_lowercase();
+    let status = if lower.contains("core service") || lower.contains("unknown plugin") {
+        404
+    } else if lower.contains("root / administrator") {
+        403
+    } else if lower.contains("already installed")
+        || lower.contains("conflict")
+        || lower.contains("configcheck")
+    {
+        409
+    } else if lower.contains("exceeds 1 mib") {
+        413
+    } else if lower.contains("signature")
+        || lower.contains("platform")
+        || lower.contains("protocol")
+        || lower.contains("unsafe")
+        || lower.contains("setuid")
+        || lower.contains("hooks")
+        || lower.contains("invalid")
+        || lower.contains("not declared")
+        || lower.contains("missing")
+        || lower.contains("does not match")
+        || lower.contains("unsupported")
+    {
+        400
+    } else {
+        500
+    };
+    error(status, code_for(status), message)
 }
 
 fn config_error(message: &str) -> Vec<u8> {
@@ -753,7 +839,6 @@ fn map_error(message: &str) -> Vec<u8> {
         || lower.contains("core service")
         || lower.contains("conflict")
         || lower.contains("cannot be enabled")
-        || lower.contains("already installed")
     {
         409
     } else if lower.contains("signature")
@@ -765,8 +850,6 @@ fn map_error(message: &str) -> Vec<u8> {
         || lower.contains("invalid")
         || lower.contains("not declared")
         || lower.contains("missing")
-        || lower.contains("does not match")
-        || lower.contains("unsupported")
     {
         400
     } else {
@@ -778,6 +861,7 @@ fn map_error(message: &str) -> Vec<u8> {
 fn code_for(status: u16) -> &'static str {
     match status {
         400 => "bad_request",
+        403 => "forbidden",
         404 => "not_found",
         409 => "conflict",
         413 => "payload_too_large",
