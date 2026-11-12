@@ -91,8 +91,7 @@ fn definition(id: &str) -> Value {
         "desc": "demo service",
         "protocol": 1,
         "exec": { "path": absolute_exec(), "args": [], "ready": "exec" },
-        "dependencies": [],
-        "capabilities": [{ "name": "status", "desc": "status", "inputSchema": {"type": "object"} }]
+        "dependencies": []
     })
 }
 

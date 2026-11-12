@@ -4,8 +4,6 @@ use serde::{Deserialize, Serialize};
 
 /// The built-in core service id; reserved against `services.d` definitions.
 pub const RESERVED_ID: &str = "svc";
-/// Capability names in this namespace belong to the core, not to a service.
-pub const RESERVED_CAP_PREFIX: &str = "svc.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -71,6 +69,28 @@ pub struct Exec {
     pub ready: Ready,
 }
 
+/// One lifecycle hook for a core service. `timeout_ms` is only used by stop
+/// and status; the start command is supervised under the normal start timeout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hook {
+    pub path: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub timeout_ms: u64,
+}
+
+/// Optional start/stop/status commands declared by a core definition.
+///
+/// `start` replaces `exec` as the supervised foreground process; `stop` runs
+/// before the normal polite stop sequence; `status` is a probe run by
+/// `svc status`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Lifecycle {
+    pub start: Option<Hook>,
+    pub stop: Option<Hook>,
+    pub status: Option<Hook>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Service {
     pub id: String,
@@ -85,6 +105,8 @@ pub struct Service {
     pub caps: Vec<String>,
     /// Used by the supervisor when it spawns a core service.
     pub exec: Option<Exec>,
+    /// Optional lifecycle commands; plugins never have these.
+    pub lifecycle: Option<Lifecycle>,
     /// Boot-start flag (`[auto]` in `svc list`); not the crash-restart policy.
     pub enabled: bool,
     pub state: State,
@@ -107,8 +129,9 @@ impl Service {
             version: env!("CARGO_PKG_VERSION").into(),
             desc: "core service management".into(),
             deps: Vec::new(),
-            caps: vec!["list".into(), "describe".into()],
+            caps: Vec::new(),
             exec: None,
+            lifecycle: None,
             enabled: true,
             state: State::Running,
             pid: None,

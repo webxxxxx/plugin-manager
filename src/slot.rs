@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -8,7 +9,7 @@ use serde_json::{json, Value};
 
 use crate::log::{self, LogSink};
 use crate::paths;
-use crate::registry::{Exec, Ready, State};
+use crate::registry::{Exec, Hook, Lifecycle, Ready, State};
 use crate::rpc;
 use crate::supervisor::{self, Action, Event, Machine};
 
@@ -18,27 +19,38 @@ pub(crate) struct Slot {
     id: String,
     pub(crate) machine: Machine,
     exec: Exec,
+    lifecycle: Option<Lifecycle>,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     lines: Option<Receiver<String>>,
     start_deadline: Option<u64>,
     stop_deadline: Option<u64>,
     kill_deadline: Option<u64>,
+    stop_hook: Option<HookRun>,
+    stop_hook_started: bool,
     ping_id: u64,
 }
 
+struct HookRun {
+    child: Child,
+    deadline: u64,
+}
+
 impl Slot {
-    pub(crate) fn new(id: String, exec: Exec, enabled: bool) -> Self {
+    pub(crate) fn new(id: String, exec: Exec, lifecycle: Option<Lifecycle>, enabled: bool) -> Self {
         Slot {
             id,
             machine: Machine::new(enabled),
             exec,
+            lifecycle,
             child: None,
             stdin: None,
             lines: None,
             start_deadline: None,
             stop_deadline: None,
             kill_deadline: None,
+            stop_hook: None,
+            stop_hook_started: false,
             ping_id: 1,
         }
     }
@@ -47,9 +59,22 @@ impl Slot {
         self.exec = exec;
     }
 
+    pub(crate) fn set_lifecycle(&mut self, lifecycle: Option<Lifecycle>) {
+        self.lifecycle = lifecycle;
+    }
+
+    /// Start the stop hook before the state machine begins stopping. The hook
+    /// runs in the background; `SignalPolite` waits for it (or its timeout)
+    /// before touching the supervised process.
+    pub(crate) fn request_stop(&mut self, now: u64) {
+        self.ensure_stop_hook(now);
+        self.apply(Event::Stop, now);
+    }
+
     pub(crate) fn pump(&mut self, now: u64) {
         self.drain_lines(now);
         self.check_exit(now);
+        self.check_stop_hook(now);
         self.check_timers(now);
     }
 
@@ -61,27 +86,35 @@ impl Slot {
     fn run_actions(&mut self, actions: Vec<Action>, now: u64) {
         for action in actions {
             match action {
-                Action::Spawn => match self.spawn() {
-                    Ok(pid) => {
-                        let actions = self.machine.step(Event::Spawned { pid }, now);
-                        self.run_actions(actions, now);
-                        if self.exec.ready == Ready::Exec {
-                            let actions = self.machine.step(Event::Ready { pid }, now);
+                Action::Spawn => {
+                    self.abort_stop_hook();
+                    self.stop_hook_started = false;
+                    match self.spawn() {
+                        Ok(pid) => {
+                            let actions = self.machine.step(Event::Spawned { pid }, now);
                             self.run_actions(actions, now);
-                        } else {
-                            self.send_ping();
+                            if self.exec.ready == Ready::Exec {
+                                let actions = self.machine.step(Event::Ready { pid }, now);
+                                self.run_actions(actions, now);
+                            } else {
+                                self.send_ping();
+                            }
+                        }
+                        Err(error) => {
+                            log::svcd(&format!("svcd: {}: spawn failed: {}", self.id, error));
+                            let actions = self.machine.step(Event::SpawnFailed, now);
+                            self.run_actions(actions, now);
                         }
                     }
-                    Err(error) => {
-                        log::svcd(&format!("svcd: {}: spawn failed: {}", self.id, error));
-                        let actions = self.machine.step(Event::SpawnFailed, now);
-                        self.run_actions(actions, now);
-                    }
-                },
+                }
                 Action::ArmStart => {
                     self.start_deadline = Some(now.saturating_add(supervisor::START_TIMEOUT_MS));
                 }
-                Action::SignalPolite => self.signal_polite(),
+                Action::SignalPolite => {
+                    if !self.ensure_stop_hook(now) {
+                        self.signal_polite();
+                    }
+                }
                 Action::SignalForce => self.signal_force(),
                 Action::ArmStop => {
                     self.stop_deadline = Some(now.saturating_add(supervisor::STOP_TIMEOUT_MS));
@@ -91,13 +124,23 @@ impl Slot {
                 }
                 Action::ArmBackoff { .. } => {}
                 Action::Publish | Action::Withdraw => {}
-                Action::GiveUp => self.give_up(),
+                Action::GiveUp => {
+                    self.abort_stop_hook();
+                    self.give_up();
+                }
             }
         }
     }
 
     fn spawn(&mut self) -> Result<u32, String> {
-        let mut command = command_for(&self.exec);
+        let start = self
+            .lifecycle
+            .as_ref()
+            .and_then(|lifecycle| lifecycle.start.as_ref());
+        let mut command = match start {
+            Some(hook) => hook_command(&self.id, "start", hook),
+            None => command_for(&self.exec),
+        };
         match self.exec.ready {
             Ready::Notify => {
                 command
@@ -337,6 +380,102 @@ impl Slot {
         }
     }
 
+    fn ensure_stop_hook(&mut self, now: u64) -> bool {
+        if self.stop_hook.is_some() {
+            return true;
+        }
+        if self.stop_hook_started {
+            return false;
+        }
+        self.stop_hook_started = true;
+        let Some(hook) = self
+            .lifecycle
+            .as_ref()
+            .and_then(|lifecycle| lifecycle.stop.as_ref())
+        else {
+            return false;
+        };
+        let mut command = hook_command(&self.id, "stop", hook);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        match command.spawn() {
+            Ok(mut child) => {
+                let log = LogSink::open(&paths::logs_dir(), &self.id)
+                    .ok()
+                    .map(|sink| Arc::new(Mutex::new(sink)));
+                if let Some(stderr) = child.stderr.take() {
+                    let log = log.clone();
+                    let id = self.id.clone();
+                    let _ = thread::Builder::new()
+                        .name(format!("svcd-{}-stop-stderr", id))
+                        .spawn(move || {
+                            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                                log_line(&log, &line);
+                            }
+                        });
+                }
+                log::svcd(&format!(
+                    "svcd: {}: stop hook started ({})",
+                    self.id, hook.path
+                ));
+                self.stop_hook = Some(HookRun {
+                    child,
+                    deadline: now.saturating_add(hook.timeout_ms),
+                });
+                true
+            }
+            Err(error) => {
+                log::svcd(&format!(
+                    "svcd: {}: stop hook spawn failed: {}",
+                    self.id, error
+                ));
+                false
+            }
+        }
+    }
+
+    fn check_stop_hook(&mut self, now: u64) {
+        let Some(run) = self.stop_hook.as_mut() else {
+            return;
+        };
+        let deadline = run.deadline;
+        let outcome = match run.child.try_wait() {
+            Ok(Some(status)) => Some(Ok(status)),
+            Ok(None) if now >= deadline => {
+                let _ = run.child.kill();
+                let _ = run.child.wait();
+                Some(Err("timed out"))
+            }
+            _ => None,
+        };
+        let Some(outcome) = outcome else {
+            return;
+        };
+        self.stop_hook = None;
+        match outcome {
+            Ok(status) => log::svcd(&format!("svcd: {}: stop hook exited {}", self.id, status)),
+            Err(reason) => log::svcd(&format!("svcd: {}: stop hook {}", self.id, reason)),
+        }
+        if self.machine.state == State::Stopping {
+            self.signal_polite();
+        }
+    }
+
+    fn abort_stop_hook(&mut self) {
+        if let Some(mut run) = self.stop_hook.take() {
+            let _ = run.child.kill();
+            let _ = run.child.wait();
+            log::svcd(&format!("svcd: {}: stop hook aborted", self.id));
+        }
+    }
+
     fn signal_polite(&mut self) {
         if let Some(stdin) = self.stdin.as_mut() {
             let line = rpc::notification("svcd.shutdown", json!({}));
@@ -355,6 +494,7 @@ impl Slot {
     }
 
     pub(crate) fn signal_force(&mut self) {
+        self.abort_stop_hook();
         #[cfg(windows)]
         {
             if let Some(child) = self.child.as_mut() {
@@ -395,9 +535,24 @@ impl Slot {
 }
 
 fn command_for(exec: &Exec) -> Command {
+    command_for_parts(&exec.path, &exec.args, &exec.env)
+}
+
+pub(crate) fn hook_command(id: &str, action: &str, hook: &Hook) -> Command {
+    let mut command = command_for_parts(&hook.path, &hook.args, &hook.env);
+    command
+        .env("SVCD_SERVICE_ID", id)
+        .env("SVCD_ACTION", action)
+        .env("SVCD_DATA_DIR", paths::data_dir())
+        .env("SVCD_CONFIG_DIR", paths::config_dir())
+        .env("SVCD_LOG_DIR", paths::logs_dir());
+    command
+}
+
+fn command_for_parts(path: &str, args: &[String], env: &BTreeMap<String, String>) -> Command {
     #[cfg(windows)]
     {
-        let extension = std::path::Path::new(&exec.path)
+        let extension = std::path::Path::new(path)
             .extension()
             .and_then(|extension| extension.to_str())
             .unwrap_or("")
@@ -405,16 +560,12 @@ fn command_for(exec: &Exec) -> Command {
         if extension == "cmd" || extension == "bat" {
             let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
             let mut command = Command::new(shell);
-            command
-                .arg("/C")
-                .arg(&exec.path)
-                .args(&exec.args)
-                .envs(&exec.env);
+            command.arg("/C").arg(path).args(args).envs(env);
             return command;
         }
     }
-    let mut command = Command::new(&exec.path);
-    command.args(&exec.args).envs(&exec.env);
+    let mut command = Command::new(path);
+    command.args(args).envs(env);
     command
 }
 

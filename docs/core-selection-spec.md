@@ -19,7 +19,7 @@
 - `svcd run --foreground` 供服务管理器拉起；`svcd install-service / uninstall-service` 向宿主注册自身（systemd / launchd / SCM / BusyBox inittab / procd 五份计划）。
 ### 1.2 服务与能力面
 
-- 每个服务有 id、kind（core / plugin）、生命周期、依赖与能力面。注册表 = 内置 `svc` + `services.d/*.json` 的 core + `<data>/plugins/*/current` 的 plugin；没有第二份清单。core 与 plugin 的来源、信任、安装方式见 §1.6。
+- 每个服务有 id、kind（core / plugin）、生命周期、依赖与能力面。注册表 = 内置 `svc` + `services.d/*.json` 的 core + `<data>/plugins/*/current` 的 plugin；没有第二份清单。core 与 plugin 的来源、信任、安装方式见 §1.6。**能力面只归 plugin**：core 是生命周期单元，不参与 `tools/call`。
 - `svc list` 与 MCP 的 `tools/list` **同源**：死的服务只暴露 `<id>.start`；活的才把 manifest 声明的能力放进工具面。
 - `start` 同步到 ready；插件崩溃即摘能力，不自动启动（只有 enabled 的开机启动会重试）。
 - `svc.` 命名空间保留给核心能力；插件能力对外是 `<serviceId>.<cap>`。
@@ -58,7 +58,7 @@
 | 安装/升级 | 由 OS 包管理器 / 管理员管文件；svcd 不安装、不升级 | `svc install`（升级同）/ `uninstall` |
 | 配置 | 脚本/bin 自己管；svcd 不提供 `config` / `editconfig` / `export` | `config` / `configCheck` / `editconfig` / `.spkb` |
 | hooks | 无 | post-install / pre-remove |
-| UI | 无 `ui`；只出能力面 | `ui` + `/plugin-ui/{id}` |
+| UI | 无 `ui`、无能力面 | `ui` + `/plugin-ui/{id}` |
 | 注册表 | 启动时扫 `services.d/*.json` + 内置 `svc` | 扫 `<data>/plugins/*/current` |
 
 `services.d/<id>.json`：
@@ -72,16 +72,21 @@
   "protocol": 1,
   "exec": { "path": "/usr/local/bin/my-core", "args": [], "env": {}, "ready": "notify" },
   "dependencies": [],
-  "capabilities": [{ "name": "status", "desc": "…", "inputSchema": {} }]
+  "lifecycle": {
+    "start":  { "path": "/usr/local/bin/my-core", "args": ["start"],  "timeout": 30 },
+    "stop":   { "path": "/usr/local/bin/my-core", "args": ["stop"],   "timeout": 10 },
+    "status": { "path": "/usr/local/bin/my-core", "args": ["status"], "timeout": 5 }
+  }
 }
 ```
 
 - `exec.path` 必须是绝对路径；Unix 可以是 shebang 脚本，Windows 是 `.exe` / `.cmd` / `.bat`；`ready` 同 plugin（默认 `notify`，脚本不讲话就用 `exec`）。
+- `lifecycle` 全部可选；`start` 存在时它就是被监督的前台进程（替换 `exec`，`ready` 仍按 `exec.ready`；不讲话的脚本把 `exec.ready` 设为 `exec`），不得自行 daemonize；`stop` 在 SIGTERM 之前运行用于释放资源，超时/非零只记日志后继续停止序列；`status` 由 `svc status` 按需探测，exit 0 = healthy，非零 = unhealthy。钩子 `path` 必须绝对，环境继承 daemon 并附加 `SVCD_SERVICE_ID` / `SVCD_ACTION` / `SVCD_DATA_DIR` / `SVCD_CONFIG_DIR` / `SVCD_LOG_DIR`。
 - 文件 root 所有、0640；启动时读取，改定义后重启 svcd 生效（v1 不做热加载）。
 - 不接受 `.spk` 专属字段：`platform` / `files` / `hooks` / `config` / `ui` 出现即定义非法；其他未知字段忽略。
 - `id` 不能是 `svc`（保留给内置 core），且不能与 plugin id 冲突；冲突时 plugin 安装拒绝、core 定义加载拒绝。
 - `<config>/services.d/<id>.disabled` 存在时该 core 服务 `enabled=false`：开机不自启、崩溃后不按退避自动重启；`svc enable/disable` 维护这个 sidecar，显式 `svc start` 仍然可用。
-- `capabilities[].name` 规则同 plugin：服务内唯一，`svc.` 禁用；声明了 capabilities 就必须能应答 `tools/call`，否则用 `ready: exec` 只当普通进程。
+- **core 不接受 `capabilities`**：core 是生命周期单元，不参与 `tools/call`；定义里出现该字段即拒绝加载。能力面只属于 plugin。
 - `<config>` 指平台配置目录（Linux `/etc/svcd`、macOS `/Library/Application Support/svcd/config`、Windows `%ProgramData%\svcd\config`）；`SVCD_CONFIG_DIR` 可覆盖，供测试与非 root 开发使用。
 - `<logs>` 指平台日志目录（Linux `/var/log/svcd`、macOS `/Library/Logs/svcd`、Windows `%ProgramData%\svcd\logs`）；`SVCD_LOG_DIR` 可覆盖，供测试与非 root 开发使用。
 - core 与 plugin 走同一监督器、同一 stdio NDJSON、同一依赖图、同一日志 / 状态；`svc list/status/start/stop/logs` 对两者一致；`install/uninstall/import/export/editconfig` 只对 plugin。
@@ -181,7 +186,8 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - legacy：本地回 `initialize`；`capabilities.tools.listChanged:true`；桥每 1s 轮询 registry 版本，变了发 `notifications/tools/list_changed`。
 - 错误映射：未知工具 / 参数不合法 / 缺 `_meta` → JSON-RPC error；已知但当前不可调用 → `isError:true` + 先 `<id>.start`；崩溃/超时/插件 error → `isError:true`；协议违规 → `isError:true` 并按崩溃处理；桥连不上 svcd → 在途调用 `isError:true` 后 exit 1。
 - `inputSchema` 原样透传，聚合层**不做 JSON Schema 校验**（显式偏离，插件自己校验）；`svc.*` schema 由聚合层写死。
-- 工具名 `<serviceId>.<cap>`，按名稳定排序；死服务只出 `<id>.start`。
+- 工具名 `<serviceId>.<cap>`，按名稳定排序；死 plugin 只出 `<id>.start`。
+- `tools/list` / `tools/call` 只聚合 plugin 能力；core 不出现在工具面。`svc.*` 是管理工具，不是 core 的能力。
 
 ### 3.3 HTTP UI
 
@@ -270,7 +276,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 ### 5.2 status
 
 - `summary`：id、kind、state、enabled、pid、since、version。
-- `details`：dependencies[]、last_exit、next_at、ready_since、failures、config。
+- `details`：dependencies[]、last_exit、next_at、ready_since、failures、config、probe（仅 `svc status` 探测 core 的 status 钩子时出现）。
 - `svc list` 列：`ID  KIND  STATE  AUTO  PID  VERSION`；AUTO 显示 `[auto]` 或 `-`。
 - `svc status <id>`：逐字段块；`--json` 原样输出 `{summary, details}`。
 - `[auto]` 只映射 `enabled`（开机启动）；崩溃重启策略放 details 的 `restart`（如 `on-failure`），不用 `[auto]`。
@@ -434,7 +440,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 | C13 | **基线缺口** | 尺寸基线只有 musl x86_64 与 Windows x86_64；macOS arm64 / x86_64、Linux gnu 没有首跑数据 | #16 | CI 首跑后补 `ci/size-baseline.json` |
 | C14 | **语义澄清** | #15 说 `[auto]` 由 svcd 推断；#22 说 `[auto]` = enabled。两者可兼容，但文档要写死 | #15、#22 | 以 §5.2 为准：`[auto]` = svcd 推断的开机自启，不是插件自报，也不是重启策略 |
 | C15 | **命名冲突（已解）** | 票面默认「包根目录 `config` 文件」，但 #13 的包里 `config/` 是目录，不能同名共存 | #13、#20 | 默认改为 `config/config`；显式字段可指向任意 `files[]` 内普通文件 |
-| C16 | **已澄清（服务模型根）** | 原服务模型只写 kind core/plugin，没定义 core 怎么来；core 容易被误当成 .spk 的一种 | #9、#13、#14 | **已定（2026-11-12）**：core = `services.d/*.json` 的启动脚本/可执行文件；plugin = 标准 `.spk`；两者共用监督/依赖/能力面/日志，install/config/export 只对 plugin（§1.6）。 |
+| C16 | **已澄清（服务模型根）** | 原服务模型只写 kind core/plugin，没定义 core 怎么来；core 容易被误当成 .spk 的一种 | #9、#13、#14 | **已定（2026-11-12）**：core = `services.d/*.json` 的启动脚本/可执行文件；plugin = 标准 `.spk`；两者共用监督/依赖/日志，但能力面只归 plugin；core 用 start/stop/status 生命周期钩子，install/config/export 只对 plugin（§1.6）。 |
 
 ### 仍未处理
 
@@ -452,6 +458,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 
 - 2026-11-12：C1 `platform` only、删除 `arch`，`schema: 1` 重写；C2 推迟；C3 增加 `POST /mcp`；C4 增加 `/api/v1` 管理 API（覆盖全部 `svc` 命令）；C5 明确 v1 不支持 TLS。
 - 2026-11-12（补）：core/plugin 边界——core = `services.d/*.json` 的启动脚本/可执行文件，plugin = 标准 `.spk`；install/config/export 只对 plugin。
+- 2026-11-12（补）：core 退出工具面——定义不再接受 `capabilities`；新增可选 `lifecycle.start/stop/status`，`svc start/stop/status` 调用钩子；`details` 增加 `probe`。
 
 ## 16. 实施票（2026-11-12 拆出）
 

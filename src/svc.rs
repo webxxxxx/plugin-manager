@@ -238,8 +238,11 @@ fn live_list() -> Option<Vec<Status>> {
 }
 
 fn show_status(id: &str, json: bool) -> i32 {
-    if let Ok(response) = channel::request(&paths::config_dir(), "svc.status", json!({ "id": id }))
-    {
+    if let Ok(response) = channel::request(
+        &paths::config_dir(),
+        "svc.status",
+        json!({ "id": id, "probe": true }),
+    ) {
         return match response {
             rpc::Response {
                 error: Some(error), ..

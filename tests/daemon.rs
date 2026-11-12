@@ -79,8 +79,7 @@ impl Sandbox {
             "desc": "test service",
             "protocol": 1,
             "exec": exec,
-            "dependencies": dependencies,
-            "capabilities": []
+            "dependencies": dependencies
         });
         fs::write(
             self.config.join("services.d").join(format!("{}.json", id)),
@@ -147,6 +146,88 @@ impl Sandbox {
                 .expect("chmod crash-after-ready script");
             path
         }
+    }
+
+    fn write_lifecycle_hook(&self, name: &str, _marker: &Path, keep_running: bool) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let path = self.root.join(format!("{}.cmd", name));
+            let mut lines: Vec<String> = vec!["@echo off".into()];
+            if keep_running {
+                lines.push("setlocal".into());
+            }
+            lines.push(format!(r#"echo {}>>"%SVCD_TEST_MARKER%""#, name));
+            if keep_running {
+                lines.push(":loop".into());
+                lines.push(r#"set "line=""#.into());
+                lines.push("set /p line=".into());
+                lines.push("if errorlevel 1 goto end".into());
+                lines.push(r#"echo {"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#.into());
+                lines.push("goto loop".into());
+                lines.push(":end".into());
+                lines.push("endlocal".into());
+            } else {
+                lines.push("exit /b 0".into());
+            }
+            fs::write(&path, lines.join("\r\n") + "\r\n").expect("write lifecycle hook");
+            path
+        }
+        #[cfg(unix)]
+        {
+            let path = self.root.join(format!("{}.sh", name));
+            let mut lines: Vec<String> = vec!["#!/bin/sh".into()];
+            lines.push(format!(r#"echo {} >> "$SVCD_TEST_MARKER""#, name));
+            if keep_running {
+                lines.push("while IFS= read -r line; do".into());
+                lines.push(r#"  printf '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n'"#.into());
+                lines.push("done".into());
+            } else {
+                lines.push("exit 0".into());
+            }
+            fs::write(&path, lines.join("\n") + "\n").expect("write lifecycle hook");
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                .expect("chmod lifecycle hook");
+            path
+        }
+    }
+
+    fn write_lifecycle_service(
+        &self,
+        id: &str,
+        exec: &Path,
+        start: &Path,
+        stop: &Path,
+        status: &Path,
+        marker: &Path,
+    ) {
+        let hook = |path: &Path| {
+            json!({
+                "path": path.to_string_lossy(),
+                "args": [],
+                "env": { "SVCD_TEST_MARKER": marker.to_string_lossy() }
+            })
+        };
+        let mut stop_hook = hook(stop);
+        stop_hook["timeout"] = json!(5);
+        let definition = json!({
+            "schema": 1,
+            "id": id,
+            "version": "1.0.0",
+            "desc": "lifecycle test",
+            "protocol": 1,
+            "exec": { "path": exec.to_string_lossy(), "args": [], "ready": "notify" },
+            "lifecycle": {
+                "start": hook(start),
+                "stop": stop_hook,
+                "status": hook(status)
+            }
+        });
+        fs::write(
+            self.config.join("services.d").join(format!("{}.json", id)),
+            serde_json::to_vec_pretty(&definition).expect("serialize definition"),
+        )
+        .expect("write lifecycle definition");
     }
 
     fn start_daemon(&mut self) {
@@ -487,4 +568,61 @@ fn a_crashing_service_enters_backoff() {
         );
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+#[test]
+fn core_lifecycle_hooks_run_for_start_stop_and_status() {
+    let mut sandbox = Sandbox::new();
+    let marker = sandbox.root.join("marker.txt");
+    let exec = sandbox.write_lifecycle_hook("exec", &marker, true);
+    let start = sandbox.write_lifecycle_hook("start", &marker, true);
+    let stop = sandbox.write_lifecycle_hook("stop", &marker, false);
+    let status = sandbox.write_lifecycle_hook("status", &marker, false);
+    sandbox.write_lifecycle_service("demo", &exec, &start, &stop, &status, &marker);
+    sandbox.start_daemon();
+
+    let started = sandbox.start_when_ready("demo");
+    assert_eq!(
+        started.status.code(),
+        Some(0),
+        "start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let text = fs::read_to_string(&marker).expect("marker");
+    assert!(text.contains("start"), "start hook did not run: {text}");
+    assert!(
+        !text.contains("exec"),
+        "exec ran instead of the start hook: {text}"
+    );
+
+    let stopped = sandbox.stop("demo");
+    assert_eq!(
+        stopped.status.code(),
+        Some(0),
+        "stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let text = fs::read_to_string(&marker).expect("marker");
+    assert!(text.contains("stop"), "stop hook did not run: {text}");
+
+    let status_output = sandbox.run_svc(&["status", "demo", "--json"]);
+    assert_eq!(
+        status_output.status.code(),
+        Some(0),
+        "status failed: {}",
+        String::from_utf8_lossy(&status_output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&status_output.stdout).expect("status json");
+    assert_eq!(value["details"]["probe"], "ok");
+    let text = fs::read_to_string(&marker).expect("marker");
+    assert!(text.contains("status"), "status hook did not run: {text}");
+
+    assert_eq!(sandbox.start_when_ready("demo").status.code(), Some(0));
+    assert_eq!(sandbox.stop("demo").status.code(), Some(0));
+    let text = fs::read_to_string(&marker).expect("marker");
+    assert_eq!(
+        text.lines().filter(|line| *line == "stop").count(),
+        2,
+        "stop hook must run again after a restart: {text}"
+    );
 }
