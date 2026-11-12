@@ -35,8 +35,14 @@ pub fn response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
         200 => "OK",
         304 => "Not Modified",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
+        413 => "Payload Too Large",
+        500 => "Internal Server Error",
+        504 => "Gateway Timeout",
         _ => "Error",
     };
     let mut out = Vec::with_capacity(128 + body.len());
