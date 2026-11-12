@@ -118,6 +118,86 @@ pub struct FileData {
     pub mode: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct TarEntry {
+    pub path: String,
+    pub data: Vec<u8>,
+    #[allow(dead_code)]
+    pub mode: u32,
+}
+
+pub fn read_tar(bytes: &[u8]) -> Result<Vec<TarEntry>, String> {
+    let mut tar = Tar::new(bytes);
+    let mut entries = Vec::new();
+    while let Some(header) = tar.next()? {
+        if header.kind == b'5' {
+            continue;
+        }
+        let data = header
+            .data
+            .ok_or_else(|| format!("{} must be a regular file", header.path))?;
+        entries.push(TarEntry {
+            path: header.path,
+            data: data.to_vec(),
+            mode: header.mode & 0o777,
+        });
+    }
+    Ok(entries)
+}
+
+pub fn write_tar(entries: &[(&str, &[u8], u32)]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    for (path, data, mode) in entries {
+        check_path(path)?;
+        if path.len() > 100 {
+            return Err(format!("tar path is too long: {}", path));
+        }
+        let mut header = [0u8; 512];
+        header[..path.len()].copy_from_slice(path.as_bytes());
+        let mode = format!("{:07o}", mode);
+        header[100..100 + mode.len()].copy_from_slice(mode.as_bytes());
+        let size = format!("{:011o}", data.len());
+        header[124..124 + size.len()].copy_from_slice(size.as_bytes());
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        out.extend_from_slice(&header);
+        out.extend_from_slice(data);
+        out.extend(std::iter::repeat_n(0, padding(data.len())));
+    }
+    out.extend(std::iter::repeat_n(0, 1024));
+    Ok(out)
+}
+
+/// Rebuild a signed `.spk` from an installed version directory. The original
+/// `manifest.json` bytes and `signature.json` are kept verbatim.
+pub fn installed_spk(version_dir: &Path) -> Result<Vec<u8>, String> {
+    let manifest_bytes = fs::read(version_dir.join("manifest.json"))
+        .map_err(|error| format!("read manifest: {}", error))?;
+    let manifest = parse_manifest(&manifest_bytes)?;
+    let signature = fs::read(version_dir.join("signature.json"))
+        .map_err(|error| format!("read signature: {}", error))?;
+    let mut files = manifest.files.clone();
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut owned: Vec<(String, Vec<u8>, u32)> = Vec::new();
+    for file in files {
+        let data = fs::read(version_dir.join(&file.path))
+            .map_err(|error| format!("read {}: {}", file.path, error))?;
+        if data.len() as u64 != file.size || hex_sha256(&data) != file.sha256 {
+            return Err(format!("installed file is corrupt: {}", file.path));
+        }
+        owned.push((file.path, data, file.mode & 0o777));
+    }
+    let mut entries: Vec<(&str, &[u8], u32)> = vec![
+        ("manifest.json", &manifest_bytes, 0o644),
+        ("signature.json", &signature, 0o644),
+    ];
+    for (path, data, mode) in &owned {
+        entries.push((path.as_str(), data.as_slice(), *mode));
+    }
+    write_tar(&entries)
+}
+
 #[derive(Debug)]
 pub struct Package {
     pub manifest: Manifest,
@@ -300,6 +380,10 @@ fn check_manifest_paths(manifest: &Manifest) -> Result<(), String> {
                 "configCheck.path is not in files[]: {}",
                 check.path
             ));
+        }
+        let config = manifest.config.as_deref().unwrap_or("config/config");
+        if !manifest.files.iter().any(|file| file.path == config) {
+            return Err("configCheck is declared but config is missing".into());
         }
     }
     if let Some(ui) = &manifest.ui {

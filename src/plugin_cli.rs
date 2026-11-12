@@ -3,12 +3,16 @@
 //! `svc` stays the generic service CLI; `plugin` refuses core ids for
 //! status/start/stop and adds install/uninstall.
 
-use std::path::PathBuf;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
 use crate::channel;
+use crate::package;
 use crate::paths;
+use crate::plugin;
 use crate::registry::Kind;
 use crate::status::{self, Status};
 
@@ -20,11 +24,41 @@ const EXIT_USAGE: i32 = 64;
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     List,
-    Status { id: String, json: bool },
-    Start { id: String },
-    Stop { id: String },
-    Install { path: PathBuf, strategy: String },
-    Uninstall { id: String, purge: bool },
+    Status {
+        id: String,
+        json: bool,
+    },
+    Start {
+        id: String,
+    },
+    Stop {
+        id: String,
+    },
+    Install {
+        path: PathBuf,
+        strategy: String,
+    },
+    Uninstall {
+        id: String,
+        purge: bool,
+    },
+    EditConfig {
+        id: String,
+        print: bool,
+        file: Option<PathBuf>,
+        reset: bool,
+    },
+    Export {
+        id: String,
+        config_only: bool,
+        out: Option<PathBuf>,
+    },
+    Import {
+        path: PathBuf,
+        config_id: Option<String>,
+        no_config: bool,
+        force: bool,
+    },
 }
 
 pub fn run(args: Vec<String>) -> i32 {
@@ -42,6 +76,23 @@ pub fn run(args: Vec<String>) -> i32 {
         Command::Stop { id } => lifecycle("stop", &id),
         Command::Install { path, strategy } => install(&path, &strategy),
         Command::Uninstall { id, purge } => uninstall(&id, purge),
+        Command::EditConfig {
+            id,
+            print,
+            file,
+            reset,
+        } => edit_config(&id, print, file.as_deref(), reset),
+        Command::Export {
+            id,
+            config_only,
+            out,
+        } => export(&id, config_only, out.as_deref()),
+        Command::Import {
+            path,
+            config_id,
+            no_config,
+            force,
+        } => import(&path, config_id.as_deref(), no_config, force),
     }
 }
 
@@ -113,6 +164,99 @@ fn parse(args: &[String]) -> Result<Command, ()> {
                 }
             }
             id.map(|id| Command::Uninstall { id, purge }).ok_or(())
+        }
+        "editconfig" => {
+            let mut id = None;
+            let mut print = false;
+            let mut file = None;
+            let mut reset = false;
+            let mut index = 1;
+            while index < args.len() {
+                let arg = &args[index];
+                if arg == "--print" {
+                    print = true;
+                } else if arg == "--reset" {
+                    reset = true;
+                } else if arg == "--file" {
+                    index += 1;
+                    file = Some(PathBuf::from(args.get(index).ok_or(())?));
+                } else if arg.starts_with('-') || id.is_some() {
+                    return Err(());
+                } else {
+                    id = Some(arg.clone());
+                }
+                index += 1;
+            }
+            if print && (file.is_some() || reset) || file.is_some() && reset {
+                return Err(());
+            }
+            id.map(|id| Command::EditConfig {
+                id,
+                print,
+                file,
+                reset,
+            })
+            .ok_or(())
+        }
+        "export" => {
+            let mut id = None;
+            let mut config_only = false;
+            let mut out = None;
+            let mut index = 1;
+            while index < args.len() {
+                let arg = &args[index];
+                if arg == "--config-only" {
+                    config_only = true;
+                } else if arg == "--out" {
+                    index += 1;
+                    out = Some(PathBuf::from(args.get(index).ok_or(())?));
+                } else if let Some(value) = arg.strip_prefix("--out=") {
+                    out = Some(PathBuf::from(value));
+                } else if arg.starts_with('-') || id.is_some() {
+                    return Err(());
+                } else {
+                    id = Some(arg.clone());
+                }
+                index += 1;
+            }
+            id.map(|id| Command::Export {
+                id,
+                config_only,
+                out,
+            })
+            .ok_or(())
+        }
+        "import" => {
+            let mut path = None;
+            let mut config_id = None;
+            let mut no_config = false;
+            let mut force = false;
+            let mut index = 1;
+            while index < args.len() {
+                let arg = &args[index];
+                if arg == "--no-config" {
+                    no_config = true;
+                } else if arg == "--force" {
+                    force = true;
+                } else if arg == "--config" {
+                    index += 1;
+                    config_id = Some(args.get(index).ok_or(())?.clone());
+                } else if let Some(value) = arg.strip_prefix("--config=") {
+                    config_id = Some(value.to_string());
+                } else if arg.starts_with('-') || path.is_some() {
+                    return Err(());
+                } else {
+                    path = Some(PathBuf::from(arg));
+                }
+                index += 1;
+            }
+            path.map(|path| Command::Import {
+                path,
+                config_id,
+                no_config,
+                force,
+            })
+            .ok_or(())
         }
         _ => Err(()),
     }
@@ -215,6 +359,332 @@ fn uninstall(id: &str, purge: bool) -> i32 {
     }
 }
 
+fn edit_config(id: &str, print: bool, file: Option<&Path>, reset: bool) -> i32 {
+    if print {
+        let Some(path) = plugin::active_config(id) else {
+            eprintln!("plugin: {} has no config", id);
+            return EXIT_SERVICE_ERROR;
+        };
+        return match fs::read(&path) {
+            Ok(data) => {
+                let _ = std::io::stdout().write_all(&data);
+                EXIT_OK
+            }
+            Err(error) => {
+                eprintln!("plugin: read {}: {}", path.display(), error);
+                EXIT_SERVICE_ERROR
+            }
+        };
+    }
+    if let Err(error) = plugin::root_required() {
+        eprintln!("plugin: {}", error);
+        return EXIT_SERVICE_ERROR;
+    }
+    let _lock = match plugin::lock_config(id) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("plugin: {}", error);
+            return EXIT_SERVICE_ERROR;
+        }
+    };
+
+    let candidate = if reset {
+        match plugin::config_template(id) {
+            Some((data, _)) => data,
+            None => {
+                eprintln!("plugin: {} has no config template", id);
+                return EXIT_SERVICE_ERROR;
+            }
+        }
+    } else if let Some(file) = file {
+        match read_config(file) {
+            Ok(data) => data,
+            Err(error) => {
+                eprintln!("plugin: {}", error);
+                return EXIT_SERVICE_ERROR;
+            }
+        }
+    } else {
+        match edit_with_editor(id) {
+            Ok(data) => data,
+            Err(error) => {
+                eprintln!("plugin: {}", error);
+                return EXIT_SERVICE_ERROR;
+            }
+        }
+    };
+
+    match plugin::replace_config(id, &candidate, true) {
+        Ok(()) => {
+            println!("config updated; restart the plugin to apply");
+            EXIT_OK
+        }
+        Err(error) => {
+            eprintln!("plugin: {}", error);
+            EXIT_SERVICE_ERROR
+        }
+    }
+}
+
+fn read_config(path: &Path) -> Result<Vec<u8>, String> {
+    let data = fs::read(path).map_err(|error| format!("read {}: {}", path.display(), error))?;
+    if data.len() > 1024 * 1024 {
+        return Err("config exceeds 1 MiB".into());
+    }
+    Ok(data)
+}
+
+fn edit_with_editor(id: &str) -> Result<Vec<u8>, String> {
+    let initial = plugin::active_config(id)
+        .map(|path| fs::read(&path))
+        .transpose()
+        .map_err(|error| format!("read config: {}", error))?
+        .or_else(|| plugin::config_template(id).map(|(data, _)| data))
+        .ok_or_else(|| format!("plugin {} has no config", id))?;
+    let directory = plugin::plugin_dir(id);
+    let temporary = directory.join(format!("config.edit.{}", std::process::id()));
+    plugin::write_config(&temporary, &initial)?;
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().ok_or_else(|| "EDITOR is empty".to_string())?;
+    let status = std::process::Command::new(program)
+        .args(parts)
+        .arg(&temporary)
+        .status()
+        .map_err(|error| format!("run editor {}: {}", program, error))?;
+    if !status.success() {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("editor exited with {}", status));
+    }
+    let data = fs::read(&temporary).map_err(|error| format!("read editor result: {}", error))?;
+    let _ = fs::remove_file(&temporary);
+    if data.len() > 1024 * 1024 {
+        return Err("config exceeds 1 MiB".into());
+    }
+    Ok(data)
+}
+
+fn export(id: &str, config_only: bool, out: Option<&Path>) -> i32 {
+    let (version, data, extension) = if config_only {
+        match plugin::export_config(id) {
+            Ok((version, data)) => (version, data, "config"),
+            Err(error) => {
+                eprintln!("plugin: {}", error);
+                return EXIT_SERVICE_ERROR;
+            }
+        }
+    } else {
+        match plugin::export_spkb(id) {
+            Ok((version, data)) => (version, data, "spkb"),
+            Err(error) => {
+                eprintln!("plugin: {}", error);
+                return EXIT_SERVICE_ERROR;
+            }
+        }
+    };
+    let path = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(format!("{}-{}.{}", id, version, extension)));
+    if let Err(error) = write_private(&path, &data) {
+        eprintln!("plugin: {}", error);
+        return EXIT_SERVICE_ERROR;
+    }
+    println!("{}", path.display());
+    EXIT_OK
+}
+
+fn import(path: &Path, config_id: Option<&str>, no_config: bool, force: bool) -> i32 {
+    let data = match fs::read(path) {
+        Ok(data) => data,
+        Err(error) => {
+            eprintln!("plugin: read {}: {}", path.display(), error);
+            return EXIT_SERVICE_ERROR;
+        }
+    };
+    if data.len() as u64 > 512 * 1024 * 1024 {
+        eprintln!("plugin: import exceeds 512 MiB");
+        return EXIT_SERVICE_ERROR;
+    }
+
+    let entries = package::read_tar(&data).ok();
+    let first = entries.as_ref().and_then(|entries| entries.first());
+    match first.map(|entry| entry.path.as_str()) {
+        Some("backup.json") => import_backup(entries.as_ref().expect("entries"), no_config, force),
+        Some("manifest.json") => match install_spk_bytes(&data) {
+            Ok(status) => print_status(status, false),
+            Err(code) => code,
+        },
+        _ => {
+            let Some(id) = config_id else {
+                eprintln!("plugin: raw config requires --config <id>");
+                return EXIT_USAGE;
+            };
+            if let Err(error) = plugin::root_required() {
+                eprintln!("plugin: {}", error);
+                return EXIT_SERVICE_ERROR;
+            }
+            match plugin::replace_config(id, &data, true) {
+                Ok(()) => {
+                    println!("config imported for {}; restart to apply", id);
+                    EXIT_OK
+                }
+                Err(error) => {
+                    eprintln!("plugin: {}", error);
+                    EXIT_SERVICE_ERROR
+                }
+            }
+        }
+    }
+}
+
+fn import_backup(entries: &[package::TarEntry], no_config: bool, force: bool) -> i32 {
+    let backup = match entries.iter().find(|entry| entry.path == "backup.json") {
+        Some(entry) => entry,
+        None => {
+            eprintln!("plugin: backup.json is missing");
+            return EXIT_SERVICE_ERROR;
+        }
+    };
+    let backup: plugin::Backup = match serde_json::from_slice(&backup.data) {
+        Ok(backup) => backup,
+        Err(error) => {
+            eprintln!("plugin: invalid backup.json: {}", error);
+            return EXIT_SERVICE_ERROR;
+        }
+    };
+    if backup.schema != 1 {
+        eprintln!("plugin: unsupported backup schema {}", backup.schema);
+        return EXIT_SERVICE_ERROR;
+    }
+    let spk = match entries.iter().find(|entry| entry.path == "plugin.spk") {
+        Some(entry) => entry,
+        None => {
+            eprintln!("plugin: plugin.spk is missing");
+            return EXIT_SERVICE_ERROR;
+        }
+    };
+    let package = match package::verify_bytes(&spk.data) {
+        Ok(package) => package,
+        Err(error) => {
+            eprintln!("plugin: {}", error);
+            return EXIT_SERVICE_ERROR;
+        }
+    };
+    if package.manifest.name != backup.id {
+        eprintln!(
+            "plugin: backup id {} does not match package id {}",
+            backup.id, package.manifest.name
+        );
+        return EXIT_SERVICE_ERROR;
+    }
+    if package.manifest.version != backup.version {
+        eprintln!(
+            "plugin: backup version {} does not match package version {}",
+            backup.version, package.manifest.version
+        );
+        return EXIT_SERVICE_ERROR;
+    }
+    if let Some(expected) = &backup.config_sha256 {
+        let config = entries.iter().find(|entry| entry.path == "config");
+        match config {
+            Some(config) if &package::hex_sha256(&config.data) == expected => {}
+            Some(_) => {
+                eprintln!("plugin: backup config hash does not match");
+                return EXIT_SERVICE_ERROR;
+            }
+            None => {
+                eprintln!("plugin: backup declares a config hash but config is missing");
+                return EXIT_SERVICE_ERROR;
+            }
+        }
+    }
+
+    if let Some(current) = plugin::current_version(&backup.id) {
+        if current != backup.version {
+            eprintln!(
+                "plugin: warning: installed {} is {}, importing {}",
+                backup.id, current, backup.version
+            );
+        } else if !force {
+            eprintln!(
+                "plugin: {} {} is already installed; use --force",
+                backup.id, backup.version
+            );
+            return EXIT_SERVICE_ERROR;
+        }
+    }
+
+    if !no_config {
+        let config = entries.iter().find(|entry| entry.path == "config");
+        if config.is_some() {
+            if let Err(error) = plugin::root_required() {
+                eprintln!("plugin: {}", error);
+                return EXIT_SERVICE_ERROR;
+            }
+        }
+    }
+
+    let status = match install_spk_bytes(&spk.data) {
+        Ok(status) => status,
+        Err(code) => return code,
+    };
+    if !no_config {
+        if let Some(config) = entries.iter().find(|entry| entry.path == "config") {
+            if let Err(error) = plugin::replace_config(&backup.id, &config.data, true) {
+                eprintln!("plugin: {}", error);
+                return EXIT_SERVICE_ERROR;
+            }
+        }
+    }
+    print_status(status, false)
+}
+
+fn install_spk_bytes(bytes: &[u8]) -> Result<Status, i32> {
+    let directory = paths::config_dir().join("tmp");
+    let _ = fs::create_dir_all(&directory);
+    let path = directory.join(format!("import-{}.spk", std::process::id()));
+    if let Err(error) = fs::write(&path, bytes) {
+        eprintln!("plugin: write temp package: {}", error);
+        return Err(EXIT_SERVICE_ERROR);
+    }
+    let response = channel::request(
+        &paths::config_dir(),
+        "plugin.install",
+        json!({ "path": path.to_string_lossy(), "strategy": "keep-old" }),
+    );
+    let _ = fs::remove_file(&path);
+    match response {
+        Ok(response) => match response.error {
+            Some(error) => {
+                eprintln!("plugin: {}", error.message);
+                Err(EXIT_SERVICE_ERROR)
+            }
+            None => match response.result {
+                Some(result) => serde_json::from_value(result).map_err(|error| {
+                    eprintln!("plugin: invalid status: {}", error);
+                    EXIT_SERVICE_ERROR
+                }),
+                None => {
+                    eprintln!("plugin: empty install response");
+                    Err(EXIT_SERVICE_ERROR)
+                }
+            },
+        },
+        Err(error) => Err(unreachable(&error)),
+    }
+}
+
+fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
+    fs::write(path, data).map_err(|error| format!("write {}: {}", path.display(), error))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("chmod {}: {}", path.display(), error))?;
+    }
+    Ok(())
+}
+
 fn fetch_status(id: &str) -> Result<Status, i32> {
     request("svc.status", json!({ "id": id }))
 }
@@ -267,6 +737,9 @@ fn usage() {
     eprintln!("       plugin start|stop <id>");
     eprintln!("       plugin install <file.spk> [--strategy keep-old|replace]");
     eprintln!("       plugin uninstall <id> [--purge]");
+    eprintln!("       plugin editconfig <id> [--print|--file <path>|--reset]");
+    eprintln!("       plugin export <id> [--config-only] [--out <path>]");
+    eprintln!("       plugin import <file> [--config <id>] [--no-config] [--force]");
 }
 
 #[cfg(test)]
@@ -304,5 +777,40 @@ mod tests {
         assert!(parse(&args(&["install", "demo.spk", "--strategy", "nope"])).is_err());
         assert!(parse(&args(&["status"])).is_err());
         assert!(parse(&args(&["list", "extra"])).is_err());
+        assert_eq!(
+            parse(&args(&["editconfig", "demo", "--print"])).expect("editconfig"),
+            Command::EditConfig {
+                id: "demo".into(),
+                print: true,
+                file: None,
+                reset: false
+            }
+        );
+        assert_eq!(
+            parse(&args(&["export", "demo", "--config-only", "--out", "x"])).expect("export"),
+            Command::Export {
+                id: "demo".into(),
+                config_only: true,
+                out: Some(PathBuf::from("x"))
+            }
+        );
+        assert_eq!(
+            parse(&args(&[
+                "import",
+                "x.spkb",
+                "--config",
+                "demo",
+                "--no-config",
+                "--force"
+            ]))
+            .expect("import"),
+            Command::Import {
+                path: PathBuf::from("x.spkb"),
+                config_id: Some("demo".into()),
+                no_config: true,
+                force: true
+            }
+        );
+        assert!(parse(&args(&["editconfig", "demo", "--print", "--reset"])).is_err());
     }
 }

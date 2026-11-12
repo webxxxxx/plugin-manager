@@ -288,6 +288,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
   - `import <file>`：tar 首条目 `backup.json` → `.spkb`；`manifest.json` → `.spk`；其它 → 裸配置，必须 `--config <id>`。id 不符拒绝；版本不同警告；`--no-config` 跳过；`--force` 只跳过同版本检查，不跳签名。
 - 配置上限 1 MiB；插件私有格式（JSON/TOML/YAML/ini 都行），svcd 不解析、不做 schema、不做升级字段合并；无 `configCheck` 时只保留 last-good。
 - 权限：写（install / editconfig / import / uninstall）要 root；只读（status / logs / `editconfig --print` / `export`）组可用；配置明文，不加密（见 §13-C5）。
+- **实现状态（2026-11-12，#34）**：安装复制模板 / `config.template.sha256` / 模板变化写 `config.new`；`editconfig`（`--print/--file/--reset`、`$EDITOR`、`configCheck` 10s、last-good、flock）；`export`（config-only / `.spkb`）与 `import`（`.spkb` / `.spk` / 裸配置自动识别）已实现。HTTP config/export/import 端点归 #39；hooks 仍拒绝。
 
 ### 5.4 logs
 
@@ -320,7 +321,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - 工具链：ubuntu-24.04 上用 cargo-zigbuild（pin `=0.24.1`）+ Zig（`0.17.1`）出三架构 musl；Windows/macOS 原生 runner；唯一高风险环是 armv7+musl 的 zig 链接。
 - 计量：multicall 单二进制，strip 后、未压缩、十进制字节；硬链接算一次；编译进二进制的资源算；安装的 unit/config 与插件不算。
 - 门禁：嵌入式 **≤ 2,000,000 B**、桌面 **≤ 30,000,000 B** 超限 fail；基线 +2% warning；`tools/measure_size.py` + `.github/workflows/size.yml` + `ci/size-baseline.json`。
-- 实测基线（2026-11-12 本机）：musl x86_64 `1,041,328 B`；Windows x86_64 `834,048 B`；macOS / Linux gnu 待 CI 首跑。
+- 实测基线（2026-11-12 本机）：musl x86_64 `1,086,384 B`；Windows x86_64 `869,376 B`；macOS / Linux gnu 待 CI 首跑。
 - **30MB 只约束核心二进制**；安装包不计门禁，只记录体积（见 §13-C2）。
 
 ## 8. 桌面交付
@@ -461,7 +462,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 | [#31](https://github.com/webxxxxx/plugin-manager/issues/31) | 插件 IPC 与工具面 | #30 | 编解码 + 工具投影已有；缺分帧读写、id 路由、流控、取消 |
 | [#32](https://github.com/webxxxxx/plugin-manager/issues/32) | `mcp` 桥 dual-era | #31 | 只有 echo 循环 |
 | [#33](https://github.com/webxxxxx/plugin-manager/issues/33) | Web UI 反代 | #30 #31 | HTTP 原语已有；缺监听器、路由、静态服务 |
-| [#34](https://github.com/webxxxxx/plugin-manager/issues/34) | 配置流 | #30 | manifest 还缺 `config`/`configCheck`；其余全缺 |
+| [#34](https://github.com/webxxxxx/plugin-manager/issues/34) | 配置流 | #30 | 模板/活动副本/`config.new`/`editconfig`/`configCheck`/`.spkb` 导入导出已实现；HTTP 端点归 #39 |
 | [#35](https://github.com/webxxxxx/plugin-manager/issues/35) | 日志与 `svc logs` | #29 | 无 |
 | [#36](https://github.com/webxxxxx/plugin-manager/issues/36) | 安装为系统服务 | #29 | 无 |
 | [#37](https://github.com/webxxxxx/plugin-manager/issues/37) | HTTP 管理 API | #29 #30 | 服务/插件/版本端点已实现；loopback、无 auth；#38/#39 待补 |

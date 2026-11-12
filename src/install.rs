@@ -956,12 +956,12 @@ fn run_command(argv: &[String], allow_codes: Option<&[i32]>) -> Result<(), Strin
 }
 
 #[cfg(unix)]
-fn is_privileged() -> bool {
+pub(crate) fn is_privileged() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
 #[cfg(windows)]
-fn is_privileged() -> bool {
+pub(crate) fn is_privileged() -> bool {
     use std::mem::size_of;
     use std::ptr::null_mut;
 
@@ -991,7 +991,7 @@ fn is_privileged() -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn is_privileged() -> bool {
+pub(crate) fn is_privileged() -> bool {
     false
 }
 
