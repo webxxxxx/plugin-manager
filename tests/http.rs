@@ -1,9 +1,10 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -22,6 +23,7 @@ struct Sandbox {
     trust: PathBuf,
     svcd: PathBuf,
     svc: PathBuf,
+    mcp: PathBuf,
     daemon: Option<Child>,
     daemon_stderr: PathBuf,
 }
@@ -50,13 +52,14 @@ impl Sandbox {
         let binary = env!("CARGO_BIN_EXE_svcd");
         let svcd = root.join(if cfg!(windows) { "svcd.exe" } else { "svcd" });
         let svc = root.join(if cfg!(windows) { "svc.exe" } else { "svc" });
-        fs::copy(binary, &svcd).expect("copy svcd");
-        fs::copy(binary, &svc).expect("copy svc");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&svcd, fs::Permissions::from_mode(0o755)).expect("chmod");
-            fs::set_permissions(&svc, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let mcp = root.join(if cfg!(windows) { "mcp.exe" } else { "mcp" });
+        for path in [&svcd, &svc, &mcp] {
+            fs::copy(binary, path).expect("copy multicall");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
+            }
         }
 
         Sandbox {
@@ -68,6 +71,7 @@ impl Sandbox {
             trust,
             svcd,
             svc,
+            mcp,
             daemon: None,
         }
     }
@@ -80,6 +84,45 @@ impl Sandbox {
             .env("SVCD_TRUST_DIR", &self.trust)
             .env("SVCD_HTTP_PORT", "0")
             .env("SVCD_TEST_UNPRIVILEGED", "1");
+    }
+
+    /// Send one modern JSON-RPC request to a fresh `mcp` stdio bridge and
+    /// return its first response line. One bridge per client matches the
+    /// production process model.
+    fn mcp_stdio(&self, request: Value) -> Value {
+        let mut command = Command::new(&self.mcp);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        self.env(&mut command);
+        let mut child = command.spawn().expect("spawn mcp bridge");
+        let mut stdin = child.stdin.take().expect("mcp stdin");
+        writeln!(
+            stdin,
+            "{}",
+            serde_json::to_string(&request).expect("serialize mcp request")
+        )
+        .expect("write mcp request");
+        stdin.flush().expect("flush mcp request");
+        let stdout = child.stdout.take().expect("mcp stdout");
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let _ = sender.send(line);
+        });
+        let line = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| {
+                let _ = child.kill();
+                panic!("mcp bridge did not answer: {}", self.daemon_log())
+            });
+        let _ = child.kill();
+        let _ = child.wait();
+        serde_json::from_str(&line)
+            .unwrap_or_else(|error| panic!("invalid mcp line {line:?}: {error}"))
     }
 
     fn run_svc(&self, args: &[&str]) -> std::process::Output {
@@ -372,6 +415,61 @@ fn cookie_value(response: &Response, name: &str) -> Option<String> {
         })
 }
 
+fn modern_meta() -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+    })
+}
+
+/// One modern MCP request over Streamable HTTP. `name` mirrors
+/// `params.name` into `Mcp-Name` for tools/call.
+fn mcp_request(
+    address: &str,
+    token: &str,
+    method: &str,
+    params: Value,
+    name: Option<&str>,
+) -> Response {
+    let mut params = params;
+    if !params.is_object() {
+        params = json!({});
+    }
+    params["_meta"] = modern_meta();
+    let body = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    }))
+    .expect("serialize mcp request");
+    let mut headers = vec![
+        ("Authorization".to_string(), format!("Bearer {}", token)),
+        ("MCP-Protocol-Version".to_string(), "2026-07-28".to_string()),
+        ("Mcp-Method".to_string(), method.to_string()),
+    ];
+    if let Some(name) = name {
+        headers.push(("Mcp-Name".to_string(), name.to_string()));
+    }
+    let headers: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    request_with(address, "POST", "/mcp", "application/json", &body, &headers)
+}
+
+fn tool_names(tools: &Value) -> Vec<String> {
+    tools
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn target() -> &'static str {
     if cfg!(all(windows, target_arch = "x86_64")) {
         "x86_64-pc-windows-msvc"
@@ -542,6 +640,11 @@ fn web_plugin_bundle(key: &SigningKey, id: &str, ui: bool) -> Vec<u8> {
     let mut files: Vec<(String, Vec<u8>, u32)> = vec![
         (exec_path.clone(), data, 0o755),
         (
+            "config/config".to_string(),
+            b"initial config\n".to_vec(),
+            0o644,
+        ),
+        (
             "payload/web/index.html".to_string(),
             b"<!doctype html>\n<html><head><title>demo ui</title></head><body>plugin page</body></html>"
                 .to_vec(),
@@ -566,13 +669,13 @@ fn web_plugin_bundle(key: &SigningKey, id: &str, ui: bool) -> Vec<u8> {
             {"name": "status", "desc": "sample status", "inputSchema": {"type": "object"}}
         ],
     });
+    manifest["config"] = json!("config/config");
     if ui {
         manifest["ui"] = json!({"type": "web", "entry": "index.html"});
     }
     signed_package(key, manifest, &files)
 }
 
-/// A running daemon with the demo web-UI plugin installed.
 /// Start a daemon and install the `demo` plugin (with a config template)
 /// under a fresh trust key. Returns the sandbox and its HTTP address.
 fn daemon_with_demo_plugin(key_byte: u8) -> (Sandbox, String) {
@@ -597,6 +700,7 @@ fn daemon_with_demo_plugin(key_byte: u8) -> (Sandbox, String) {
     (sandbox, address)
 }
 
+/// A running daemon with the demo web-UI plugin installed.
 fn web_ui_sandbox(key_byte: u8) -> (Sandbox, String) {
     let mut sandbox = Sandbox::new();
     let key = SigningKey::from_bytes(&[key_byte; 32]);
@@ -1721,4 +1825,150 @@ fn plugin_web_ui_requires_a_session_when_lan_is_enabled() {
         ],
     );
     assert_eq!(foreign.status, 403);
+}
+
+/// One installed plugin, exercised end to end across every surface this phase
+/// built: HTTP install -> start -> MCP (Streamable HTTP and the stdio bridge
+/// agree) -> config/reset -> Web UI -> logs -> stop shrinks the tool surface ->
+/// uninstall removes it everywhere.
+#[test]
+fn phase_end_to_end_install_start_mcp_config_logs_and_uninstall() {
+    let (sandbox, address) = web_ui_sandbox(34);
+    let token = token_line(&sandbox.run_svc(&["lan", "token", "rotate"]));
+
+    let started = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
+    assert_eq!(started.status, 200, "{}", started.body);
+    assert_eq!(started.body["summary"]["state"], "running");
+
+    // The CLI reports the same state the HTTP API just returned.
+    let cli = sandbox.run_svc(&["status", "demo", "--json"]);
+    assert_eq!(
+        cli.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_status: Value = serde_json::from_slice(&cli.stdout).expect("svc status json");
+    assert_eq!(cli_status["summary"]["state"], "running");
+
+    // Streamable HTTP: a live plugin exposes start + its manifest capability.
+    let listed = mcp_request(&address, &token, "tools/list", json!({}), None);
+    assert_eq!(listed.status, 200, "{}", listed.body);
+    let http_tools = tool_names(&listed.body["result"]["tools"]);
+    assert!(
+        http_tools.contains(&"demo.status".to_string()),
+        "{http_tools:?}"
+    );
+    assert!(
+        http_tools.contains(&"demo.start".to_string()),
+        "{http_tools:?}"
+    );
+
+    let called = mcp_request(
+        &address,
+        &token,
+        "tools/call",
+        json!({"name": "demo.status", "arguments": {}}),
+        Some("demo.status"),
+    );
+    assert_eq!(called.status, 200, "{}", called.body);
+    assert_eq!(called.body["result"]["isError"], false, "{}", called.body);
+    assert_eq!(called.body["result"]["content"][0]["text"], "pong");
+
+    // The stdio bridge must expose exactly the same surface and result.
+    let stdio_listed = sandbox.mcp_stdio(json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/list",
+        "params": {"_meta": modern_meta()},
+    }));
+    assert_eq!(
+        tool_names(&stdio_listed["result"]["tools"]),
+        http_tools,
+        "{stdio_listed}"
+    );
+    let stdio_called = sandbox.mcp_stdio(json!({
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "tools/call",
+        "params": {
+            "name": "demo.status",
+            "arguments": {},
+            "_meta": modern_meta(),
+        },
+    }));
+    assert_eq!(stdio_called["result"]["isError"], false, "{stdio_called}");
+    assert_eq!(stdio_called["result"]["content"][0]["text"], "pong");
+
+    // Config belongs to the same installed version.
+    let config = raw_request(&address, "GET", "/api/v1/config/demo", "", b"");
+    assert_eq!(config.status, 200);
+    assert_eq!(config.body, b"initial config\n");
+    let updated = raw_request(
+        &address,
+        "PUT",
+        "/api/v1/config/demo",
+        "text/plain",
+        b"updated\n",
+    );
+    assert_eq!(
+        updated.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&updated.body)
+    );
+    let config = raw_request(&address, "GET", "/api/v1/config/demo", "", b"");
+    assert_eq!(config.body, b"updated\n");
+    let reset = raw_request(&address, "POST", "/api/v1/config/demo/reset", "", b"");
+    assert_eq!(reset.status, 200);
+    let config = raw_request(&address, "GET", "/api/v1/config/demo", "", b"");
+    assert_eq!(config.body, b"initial config\n");
+
+    // Web UI and logs are served from the same installation.
+    let ui = raw_request(&address, "GET", "/plugin-ui/demo/", "", b"");
+    assert_eq!(ui.status, 200);
+    assert!(String::from_utf8_lossy(&ui.body).contains("<base href=\"/plugin-ui/demo/\">"));
+    let logs = raw_request(&address, "GET", "/api/v1/logs/demo?lines=10", "", b"");
+    assert_eq!(logs.status, 200, "{}", String::from_utf8_lossy(&logs.body));
+
+    // A stopped plugin only exposes start, on both transports.
+    let stopped = request(&address, "POST", "/api/v1/services/demo/stop", "", b"");
+    assert_eq!(stopped.status, 200, "{}", stopped.body);
+    let listed = mcp_request(&address, &token, "tools/list", json!({}), None);
+    assert_eq!(
+        tool_names(&listed.body["result"]["tools"]),
+        vec!["demo.start"]
+    );
+    let stdio_listed = sandbox.mcp_stdio(json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/list",
+        "params": {"_meta": modern_meta()},
+    }));
+    assert_eq!(
+        tool_names(&stdio_listed["result"]["tools"]),
+        vec!["demo.start"]
+    );
+
+    // Uninstall removes the service from every surface.
+    let deleted = request(&address, "DELETE", "/api/v1/plugins/demo", "", b"");
+    assert_eq!(deleted.status, 200, "{}", deleted.body);
+    let list = sandbox.run_svc(&["list"]);
+    assert!(
+        !String::from_utf8_lossy(&list.stdout)
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("demo")),
+        "{}",
+        String::from_utf8_lossy(&list.stdout)
+    );
+    let listed = mcp_request(&address, &token, "tools/list", json!({}), None);
+    assert_eq!(listed.status, 200);
+    assert!(tool_names(&listed.body["result"]["tools"]).is_empty());
+    let stdio_listed = sandbox.mcp_stdio(json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/list",
+        "params": {"_meta": modern_meta()},
+    }));
+    assert!(tool_names(&stdio_listed["result"]["tools"]).is_empty());
 }
