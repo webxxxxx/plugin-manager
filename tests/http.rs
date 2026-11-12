@@ -2335,3 +2335,14 @@ fn plugin_ui_sse_replays_after_last_event_id() {
         "expected an event after {last_id}, got {replayed_id}: {replayed}"
     );
 }
+
+#[test]
+fn plugin_ui_websocket_rejects_oversized_messages_with_1009() {
+    let (_sandbox, address) = daemon_with_web_event_plugin(55);
+    let (mut ws, status, head) = ws_handshake(&address, "/plugin-ui/demo/ws", &[]);
+    assert_eq!(status, 101, "{head}");
+    ws_send(&mut ws, 0x1, &vec![b'x'; 1024 * 1024 + 1]);
+    let (opcode, payload) = ws_read(&mut ws);
+    assert_eq!(opcode, 0x8);
+    assert_eq!(u16::from_be_bytes([payload[0], payload[1]]), 1009);
+}
