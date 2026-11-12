@@ -220,6 +220,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - `{id}` 必须是合法路径段；SPA fallback 只对 `Accept: text/html`；HTML 注入 `<base href="/plugin-ui/{id}/">`，资源必须相对路径；v1 不做响应体重写。
 - MIME 按扩展名；ETag = mtime+size；`no-cache` + 304；v1 不做 Range / WebSocket / SSE。
 - 监听默认 loopback；LAN 需显式开启。**插件不自起 HTTP**；触发重考虑的条件：真实插件需要 WebSocket/SSE 或依赖绝对路径的后端，届时单开票。
+- **实现状态（2026-11-12，#33）**：`GET /plugin-ui/{id}/…` 从 `<data>/plugins/<id>/<version>/payload/web/` 提供静态资源（MIME 按扩展名、`Cache-Control: no-cache`、ETag=mtime+size、`If-None-Match` → 304，`X-Content-Type-Options: nosniff`）；HTML 在 doctype 后注入 `<base href="/plugin-ui/{id}/">`；SPA fallback 只对 `Accept: text/html`，缺失的脚本/样式仍是 404；`{id}` 必须通过 `package::valid_name`，路径逐段解码后拒绝 `.`/`..`/反斜杠/NUL，并对 canonicalize 后的路径做根目录越界检查。`manifest.ui.type` 只接受 `web`/`gui`（`headerless` 或无 `ui` 即 404）。`POST /plugin-ui/{id}/rpc` 只桥 `tools/call`：`params.name` 带不带 `<id>.` 前缀均可，转发为 `registry.call` 并把页面 id 回显；`-32700/-32600/-32601/-32602` 在本地返回，插件未运行是 `result.isError:true`（同一信封）。LAN 开启时 `/plugin-ui/*` 要求会话（`svcd_session` cookie 或 Bearer；默认 loopback 无需鉴权；#4 的「静态资源公开」已被 #24/#38 的会话模型取代）；`/rpc` 校验同源 `Origin`，cookie 调用必须带 `Origin`，但不额外要求 `X-Svcd-Csrf`（同源 Origin + SameSite=Strict 承担 CSRF/DNS rebinding）；`/plugin-ui/{id}`（无斜杠）在鉴权后 308 到带斜杠形式。v1 不做 Range / WebSocket / SSE。
 
 ### 3.4 HTTP MCP 入口
 
@@ -263,7 +264,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - 默认只绑 `127.0.0.1`；`svc lan enable --bind 0.0.0.0` 才开 LAN。
 - 首次开启生成 32 字节随机管理员 token（**等价 root / Administrator**），打印一次并写 `<config>/lan-token` 0600；`svc lan token rotate` 轮换；无用户体系、无注册。
 - 登录：`POST /login` 带 token → 设两个 cookie：`svcd_session`（Path=`/plugin-ui/`）与 `svcd_api`（Path=`/api/v1/`），均 HttpOnly、SameSite=Strict、Max-Age=86400、无 Secure（无 TLS）；滑动续期 24h；`POST /logout` 清两个。同一 token 也可直接作为 `Authorization: Bearer` 访问 `/mcp` 与 `/api/v1/*`。
-- `/plugin-ui/*` 与 `/rpc` 都要求会话；`/rpc` 保留 Origin 校验；只接受同源 Origin/Host，拒绝 CORS；SameSite=Strict + 自定义头防 CSRF/DNS rebinding。
+- LAN 开启时 `/plugin-ui/*` 与 `/rpc` 都要求会话（默认 loopback 无需鉴权）；`/plugin-ui/{id}`（无斜杠）在鉴权后 308 到带斜杠形式，保证 path-scoped cookie 生效；`/rpc` 保留 Origin 校验：只接受同源 Origin/Host、拒绝 CORS，cookie 调用必须带同源 `Origin`，但不要求 `X-Svcd-Csrf`（SameSite=Strict + 同源 Origin 承担 CSRF/DNS rebinding）；`/api/v1` 的 cookie 写仍要求 `X-Svcd-Csrf`。
 - 登录失败固定 1s 延迟，连续 10 次锁 5 分钟（内存）。
 - **v1 不支持 TLS**：核心不终止、不生成证书；要 HTTPS 就在前面放反代。明文 token 过 LAN 的风险写进文档；默认关闭 LAN 是安全默认。
 - 单用户 / 单角色；多用户、角色不做；HTTP 管理 API 见 §3.5。
@@ -497,7 +498,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 | [#30](https://github.com/webxxxxx/plugin-manager/issues/30) | 安装/运行 .spk（含 `plugin` 入口） | #28 #29 | 验签/`files[]`/解包/布局/插件扫描/`plugin` 入口已实现；hooks 拒绝，`install -` / downgrade / prune 未做 |
 | [#31](https://github.com/webxxxxx/plugin-manager/issues/31) | 插件 IPC 与工具面 | #30 | 已实现：NDJSON 分帧（1 MiB）、id 路由、64 在途、30s 取消、`registry.tools` / `registry.call`；崩溃摘能力并失败在途调用；128 排队未做 |
 | [#32](https://github.com/webxxxxx/plugin-manager/issues/32) | `mcp` 桥 dual-era | #31 | 已实现：modern `server/discover`/`_meta`/缓存字段；legacy `initialize`/`ping`/`list_changed` 轮询；连不上 svcd exit 1 |
-| [#33](https://github.com/webxxxxx/plugin-manager/issues/33) | Web UI 反代 | #30 #31 | HTTP 原语已有；缺监听器、路由、静态服务 |
+| [#33](https://github.com/webxxxxx/plugin-manager/issues/33) | Web UI 反代 | #30 #31 | 已实现：静态资源、base 注入、ETag/304、SPA fallback、`/rpc` 桥；Range/WS/SSE 不做 |
 | [#34](https://github.com/webxxxxx/plugin-manager/issues/34) | 配置流 | #30 | 模板/活动副本/`config.new`/`editconfig`/`configCheck`/`.spkb` 导入导出已实现；HTTP 端点归 #39 |
 | [#35](https://github.com/webxxxxx/plugin-manager/issues/35) | 日志与 `svc logs` | #29 | 无 |
 | [#36](https://github.com/webxxxxx/plugin-manager/issues/36) | 安装为系统服务 | #29 | 无 |

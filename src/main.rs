@@ -20,6 +20,7 @@ mod status;
 mod supervisor;
 mod svc;
 mod transfer;
+mod webui;
 
 fn main() {
     let arg0 = std::env::args().next().unwrap_or_default();

@@ -69,7 +69,6 @@ pub struct Capability {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Ui {
     #[serde(rename = "type")]
-    #[allow(dead_code)]
     pub kind: String,
     pub entry: Option<String>,
 }

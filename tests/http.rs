@@ -383,17 +383,6 @@ fn plugin_bundle(
     };
     files.sort_by(|left, right| left.0.cmp(&right.0));
 
-    let entries: Vec<Value> = files
-        .iter()
-        .map(|(path, data, mode)| {
-            json!({
-                "path": path,
-                "size": data.len(),
-                "sha256": hex_sha256(data),
-                "mode": mode
-            })
-        })
-        .collect();
     let mut manifest = json!({
         "schema": 1,
         "name": id,
@@ -402,7 +391,6 @@ fn plugin_bundle(
         "platform": target(),
         "protocol": 1,
         "exec": {"path": exec_path, "args": [], "ready": "notify"},
-        "files": entries
     });
     if config.is_some() {
         manifest["config"] = json!("config/config");
@@ -410,6 +398,25 @@ fn plugin_bundle(
     if let Some(path) = check_path {
         manifest["configCheck"] = json!({"path": path});
     }
+    signed_package(key, manifest, &files)
+}
+
+/// Attach \`files[]\`, sign the manifest and wrap everything in the ustar layout
+/// the installer verifies. Shared by the plain and web-UI fixtures.
+fn signed_package(
+    key: &SigningKey,
+    mut manifest: Value,
+    files: &[(String, Vec<u8>, u32)],
+) -> Vec<u8> {
+    manifest["files"] = json!(files
+        .iter()
+        .map(|(path, data, mode)| json!({
+            "path": path,
+            "size": data.len(),
+            "sha256": hex_sha256(data),
+            "mode": mode
+        }))
+        .collect::<Vec<Value>>());
     let manifest = serde_json::to_vec(&manifest).expect("manifest");
     let signature =
         json!({"alg":"ed25519","keyId":"test","sig":BASE64.encode(key.sign(&manifest).to_bytes())});
@@ -421,13 +428,106 @@ fn plugin_bundle(
     tar.extend_from_slice(&header("signature.json", signature.len(), 0o644));
     tar.extend_from_slice(&signature);
     tar.extend(std::iter::repeat_n(0, padding(signature.len())));
-    for (path, data, mode) in &files {
+    for (path, data, mode) in files {
         tar.extend_from_slice(&header(path, data.len(), *mode));
         tar.extend_from_slice(data);
         tar.extend(std::iter::repeat_n(0, padding(data.len())));
     }
     tar.extend(std::iter::repeat_n(0, 1024));
     tar
+}
+
+/// A plugin-side NDJSON agent that answers \`svcd.ping\` and \`tools/call\` with a
+/// real tool result, echoing the request id. The sh variant extracts the id with
+/// sed; the PowerShell variant uses a regex.
+fn web_agent() -> (&'static str, Vec<u8>) {
+    if cfg!(windows) {
+        (
+            "agent.ps1",
+            br#"$ErrorActionPreference = 'Stop'
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+  $id = 1
+  if ($line -match '"id"\s*:\s*(\d+)') { $id = [int]$Matches[1] }
+  [Console]::Out.WriteLine('{"jsonrpc":"2.0","id":' + $id + ',"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}')
+  [Console]::Out.Flush()
+}
+"#
+            .to_vec(),
+        )
+    } else {
+        (
+            "agent.sh",
+            br#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  if [ -z "$id" ]; then id=1; fi
+  printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}\n' "$id"
+done
+"#
+            .to_vec(),
+        )
+    }
+}
+
+/// A plugin with \`payload/web/\` assets and one declared capability. \`ui\`
+/// controls whether \`manifest.ui\` declares a browser UI at all.
+fn web_plugin_bundle(key: &SigningKey, id: &str, ui: bool) -> Vec<u8> {
+    let (name, data) = web_agent();
+    let exec_path = format!("payload/bin/{}", name);
+    let mut files: Vec<(String, Vec<u8>, u32)> = vec![
+        (exec_path.clone(), data, 0o755),
+        (
+            "payload/web/index.html".to_string(),
+            b"<!doctype html>\n<html><head><title>demo ui</title></head><body>plugin page</body></html>"
+                .to_vec(),
+            0o644,
+        ),
+        (
+            "payload/web/app.js".to_string(),
+            b"export const answer = 42;\n".to_vec(),
+            0o644,
+        ),
+    ];
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut manifest = json!({
+        "schema": 1,
+        "name": id,
+        "version": "1.0.0",
+        "desc": "web ui plugin",
+        "platform": target(),
+        "protocol": 1,
+        "exec": {"path": exec_path, "args": [], "ready": "notify"},
+        "capabilities": [
+            {"name": "status", "desc": "sample status", "inputSchema": {"type": "object"}}
+        ],
+    });
+    if ui {
+        manifest["ui"] = json!({"type": "web", "entry": "index.html"});
+    }
+    signed_package(key, manifest, &files)
+}
+
+/// A running daemon with the demo web-UI plugin installed.
+fn web_ui_sandbox(key_byte: u8) -> (Sandbox, String) {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[key_byte; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let package = web_plugin_bundle(&key, "demo", true);
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let installed = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(installed.status, 200, "{}", installed.body);
+    (sandbox, address)
 }
 
 fn tar_names(bytes: &[u8]) -> Vec<String> {
@@ -1182,4 +1282,330 @@ fn lan_auth_bearer_cookie_csrf_rotate_and_disable() {
     assert_eq!(disabled.status.code(), Some(0));
     let open_again = request(&address, "GET", "/api/v1/services", "", b"");
     assert_eq!(open_again.status, 200);
+}
+#[test]
+fn plugin_web_ui_serves_assets_with_base_and_etag() {
+    let (_sandbox, address) = web_ui_sandbox(41);
+    let key = SigningKey::from_bytes(&[41u8; 32]);
+    let plain = web_plugin_bundle(&key, "plain", false);
+    let installed = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &plain,
+    );
+    assert_eq!(installed.status, 200, "{}", installed.body);
+    assert_eq!(installed.body["id"], "plain");
+
+    let page = raw_request(&address, "GET", "/plugin-ui/demo/", "", b"");
+    assert_eq!(page.status, 200, "{}", String::from_utf8_lossy(&page.body));
+    assert_eq!(
+        raw_header_values(&page, "content-type"),
+        vec!["text/html; charset=utf-8"]
+    );
+    assert_eq!(raw_header_values(&page, "cache-control"), vec!["no-cache"]);
+    assert_eq!(raw_header_values(&page, "vary"), vec!["Accept"]);
+    assert_eq!(
+        raw_header_values(&page, "x-content-type-options"),
+        vec!["nosniff"]
+    );
+    let html = String::from_utf8_lossy(&page.body);
+    assert!(
+        html.starts_with("<!doctype html>\n<base href=\"/plugin-ui/demo/\">\n"),
+        "{html}"
+    );
+    assert!(html.contains("plugin page"), "{html}");
+
+    let etags = raw_header_values(&page, "etag");
+    assert_eq!(etags.len(), 1, "{:?}", page.headers);
+    let etag = etags[0].to_string();
+    let revalidated = raw_request_with(
+        &address,
+        "GET",
+        "/plugin-ui/demo/",
+        "",
+        b"",
+        &[("If-None-Match", etag.as_str())],
+    );
+    assert_eq!(revalidated.status, 304);
+    assert!(revalidated.body.is_empty());
+    assert_eq!(raw_header_values(&revalidated, "etag"), vec![etag.as_str()]);
+
+    let script = raw_request(&address, "GET", "/plugin-ui/demo/app.js", "", b"");
+    assert_eq!(script.status, 200);
+    assert_eq!(
+        raw_header_values(&script, "content-type"),
+        vec!["text/javascript"]
+    );
+    assert_eq!(script.body, b"export const answer = 42;\n");
+
+    // The canonical URL has a trailing slash so the /plugin-ui/ session cookie
+    // is actually sent by browsers when LAN auth is on.
+    let no_slash = raw_request(&address, "GET", "/plugin-ui/demo", "", b"");
+    assert_eq!(no_slash.status, 308);
+    assert_eq!(
+        raw_header_values(&no_slash, "location"),
+        vec!["/plugin-ui/demo/"]
+    );
+
+    // SPA fallback only for HTML navigations; a missing asset stays a 404.
+    let missing_asset = raw_request(&address, "GET", "/plugin-ui/demo/missing.js", "", b"");
+    assert_eq!(missing_asset.status, 404);
+    let spa = raw_request_with(
+        &address,
+        "GET",
+        "/plugin-ui/demo/settings/tunnel",
+        "",
+        b"",
+        &[("Accept", "text/html")],
+    );
+    assert_eq!(spa.status, 200);
+    assert!(String::from_utf8_lossy(&spa.body).contains("plugin page"));
+
+    for path in [
+        "/plugin-ui/demo/%2e%2e/secret",
+        "/plugin-ui/demo/../secret",
+        "/plugin-ui/..%2fsecret",
+        "/plugin-ui/Demo/",
+        "/plugin-ui/missing/",
+    ] {
+        let denied = raw_request(&address, "GET", path, "", b"");
+        assert_eq!(denied.status, 404, "{path}");
+        // A rejected path is not a client-side route: an HTML navigation must
+        // not turn traversal into the SPA entry.
+        let denied_html =
+            raw_request_with(&address, "GET", path, "", b"", &[("Accept", "text/html")]);
+        assert_eq!(denied_html.status, 404, "{path} with Accept: text/html");
+    }
+
+    // A plugin without manifest.ui has no route even if payload/web exists.
+    let no_ui = raw_request(&address, "GET", "/plugin-ui/plain/", "", b"");
+    assert_eq!(no_ui.status, 404);
+
+    let post = raw_request(&address, "POST", "/plugin-ui/demo/", "", b"");
+    assert_eq!(post.status, 405);
+    assert_eq!(raw_header_values(&post, "allow"), vec!["GET"]);
+}
+
+fn rpc_body(id: u64, name: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {"name": name, "arguments": {}}
+    }))
+    .expect("rpc body")
+}
+
+#[test]
+fn plugin_web_ui_rpc_bridges_tools_call() {
+    let (_sandbox, address) = web_ui_sandbox(42);
+
+    let started = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
+    assert_eq!(started.status, 200, "{}", started.body);
+
+    let call = request(
+        &address,
+        "POST",
+        "/plugin-ui/demo/rpc",
+        "application/json",
+        &rpc_body(7, "status"),
+    );
+    assert_eq!(call.status, 200, "{}", call.body);
+    assert_eq!(call.body["jsonrpc"], "2.0");
+    assert_eq!(call.body["id"], 7);
+    assert_eq!(call.body["result"]["content"][0]["text"], "pong");
+    assert_eq!(call.body["result"]["isError"], false);
+
+    // A fully qualified capability name is accepted too.
+    let prefixed = request(
+        &address,
+        "POST",
+        "/plugin-ui/demo/rpc",
+        "application/json",
+        &rpc_body(8, "demo.status"),
+    );
+    assert_eq!(prefixed.body["id"], 8);
+    assert_eq!(prefixed.body["result"]["content"][0]["text"], "pong");
+
+    // Same-origin Origin is accepted; a foreign one is rejected.
+    let origin = format!("http://{}", address);
+    let body = rpc_body(9, "status");
+    let same_origin = request_with(
+        &address,
+        "POST",
+        "/plugin-ui/demo/rpc",
+        "application/json",
+        &body,
+        &[("Origin", origin.as_str())],
+    );
+    assert_eq!(same_origin.status, 200, "{}", same_origin.body);
+    let cross_origin = request_with(
+        &address,
+        "POST",
+        "/plugin-ui/demo/rpc",
+        "application/json",
+        &body,
+        &[("Origin", "http://evil.example")],
+    );
+    assert_eq!(cross_origin.status, 403);
+
+    let unsupported = request(
+        &address,
+        "POST",
+        "/plugin-ui/demo/rpc",
+        "application/json",
+        br#"{"jsonrpc":"2.0","id":10,"method":"svcd.ping"}"#,
+    );
+    assert_eq!(unsupported.status, 200);
+    assert_eq!(unsupported.body["id"], 10);
+    assert_eq!(unsupported.body["error"]["code"], -32601);
+
+    let malformed = raw_request(
+        &address,
+        "POST",
+        "/plugin-ui/demo/rpc",
+        "application/json",
+        b"{",
+    );
+    assert_eq!(malformed.status, 200);
+    assert_eq!(json_body(&malformed)["error"]["code"], -32700);
+
+    let unknown = request(
+        &address,
+        "POST",
+        "/plugin-ui/demo/rpc",
+        "application/json",
+        &rpc_body(11, "nope"),
+    );
+    assert_eq!(unknown.body["id"], 11);
+    assert_eq!(unknown.body["error"]["code"], -32602);
+
+    let get = raw_request(&address, "GET", "/plugin-ui/demo/rpc", "", b"");
+    assert_eq!(get.status, 405);
+    assert_eq!(raw_header_values(&get, "allow"), vec!["POST"]);
+
+    // A stopped plugin is a tool error inside a successful JSON-RPC envelope.
+    let stopped = request(&address, "POST", "/api/v1/services/demo/stop", "", b"");
+    assert_eq!(stopped.status, 200, "{}", stopped.body);
+    let call = request(
+        &address,
+        "POST",
+        "/plugin-ui/demo/rpc",
+        "application/json",
+        &rpc_body(12, "status"),
+    );
+    assert_eq!(call.status, 200, "{}", call.body);
+    assert_eq!(call.body["id"], 12);
+    assert_eq!(call.body["result"]["isError"], true);
+    assert!(
+        call.body["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not running"),
+        "{}",
+        call.body
+    );
+}
+
+#[test]
+fn plugin_web_ui_requires_a_session_when_lan_is_enabled() {
+    let (sandbox, address) = web_ui_sandbox(43);
+
+    let enabled = sandbox.run_svc(&["lan", "enable", "--bind", "0.0.0.0"]);
+    assert_eq!(
+        enabled.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+    let token = token_line(&enabled);
+    let bearer = format!("Bearer {}", token);
+
+    let body = rpc_body(21, "status");
+    let page = raw_request(&address, "GET", "/plugin-ui/demo/", "", b"");
+    assert_eq!(page.status, 401);
+    let anonymous = raw_request(
+        &address,
+        "POST",
+        "/plugin-ui/demo/rpc",
+        "application/json",
+        &body,
+    );
+    assert_eq!(anonymous.status, 401);
+    // The 308 canonicalisation runs after auth, so a slashless URL is just
+    // another unauthenticated /plugin-ui/* request when LAN is enabled.
+    let canonical = raw_request(&address, "GET", "/plugin-ui/demo", "", b"");
+    assert_eq!(canonical.status, 401);
+
+    let started = request_with(
+        &address,
+        "POST",
+        "/api/v1/services/demo/start",
+        "",
+        b"",
+        &[("Authorization", bearer.as_str())],
+    );
+    assert_eq!(started.status, 200, "{}", started.body);
+
+    let login = request_with(
+        &address,
+        "POST",
+        "/login",
+        "application/json",
+        serde_json::to_string(&json!({"token": token}))
+            .expect("login body")
+            .as_bytes(),
+        &[],
+    );
+    assert_eq!(login.status, 200, "{}", login.body);
+    let session = cookie_value(&login, "svcd_session").expect("svcd_session cookie");
+    let cookie = format!("svcd_session={}", session);
+
+    let page = raw_request_with(
+        &address,
+        "GET",
+        "/plugin-ui/demo/",
+        "",
+        b"",
+        &[("Cookie", cookie.as_str())],
+    );
+    assert_eq!(page.status, 200, "{}", String::from_utf8_lossy(&page.body));
+
+    let origin = format!("http://{}", address);
+    let call = request_with(
+        &address,
+        "POST",
+        "/plugin-ui/demo/rpc",
+        "application/json",
+        &body,
+        &[("Cookie", cookie.as_str()), ("Origin", origin.as_str())],
+    );
+    assert_eq!(call.status, 200, "{}", call.body);
+    assert_eq!(call.body["id"], 21);
+    assert_eq!(call.body["result"]["content"][0]["text"], "pong");
+
+    // Cookie-authenticated /rpc still needs a same-origin Origin (CSRF guard).
+    let no_origin = raw_request_with(
+        &address,
+        "POST",
+        "/plugin-ui/demo/rpc",
+        "application/json",
+        &body,
+        &[("Cookie", cookie.as_str())],
+    );
+    assert_eq!(no_origin.status, 403);
+    let foreign = raw_request_with(
+        &address,
+        "POST",
+        "/plugin-ui/demo/rpc",
+        "application/json",
+        &body,
+        &[
+            ("Cookie", cookie.as_str()),
+            ("Origin", "http://evil.example"),
+        ],
+    );
+    assert_eq!(foreign.status, 403);
 }

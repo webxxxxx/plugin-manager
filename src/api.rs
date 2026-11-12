@@ -24,7 +24,9 @@ use crate::log;
 use crate::package;
 use crate::paths;
 use crate::plugin;
+use crate::rpc;
 use crate::transfer;
+use crate::webui;
 
 const DEFAULT_PORT: u16 = 8787;
 const MAX_BODY: u64 = 512 * 1024 * 1024;
@@ -240,6 +242,7 @@ fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u
         return ui_page();
     }
 
+    let ui = ui_path(path);
     let auth = match lan.lock() {
         Ok(mut state) => match state.authenticate(&request.headers) {
             Ok(auth) => auth,
@@ -247,14 +250,209 @@ fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u
         },
         Err(_) => return error(500, "internal", "LAN state unavailable"),
     };
-    if auth == AuthKind::Cookie && is_write(&request.method) && !csrf_ok(request) {
+    // `/plugin-ui/{id}/rpc` keeps the same-origin Origin check instead of the
+    // management API's custom CSRF header, so a plugin's own page can call it
+    // with a plain `fetch` (see `ui_rpc`).
+    if auth == AuthKind::Cookie
+        && is_write(&request.method)
+        && !ui.as_ref().map(|route| route.sub == "rpc").unwrap_or(false)
+        && !csrf_ok(request)
+    {
         return error(
             403,
             "forbidden",
             "cookie writes require Origin and X-Svcd-Csrf",
         );
     }
+    if let Some(ui) = ui {
+        // A slashless URL never carries the `/plugin-ui/` session cookie, so
+        // browsers would stall at 401. Redirect after auth: the session check
+        // stays authoritative and only reachable pages redirect.
+        if request.method == "GET" && ui.slashless && package::valid_name(ui.id) {
+            if plugin::web_assets(ui.id).is_some() {
+                return http::response_with_headers(
+                    308,
+                    "text/plain; charset=utf-8",
+                    &[("Location".to_string(), format!("/plugin-ui/{}/", ui.id))],
+                    b"",
+                );
+            }
+        }
+        return plugin_ui(config, request, &ui, auth);
+    }
     route(config, request, lan)
+}
+
+/// One parsed `/plugin-ui/...` path.
+struct UiPath<'a> {
+    /// The plugin id segment (still unvalidated).
+    id: &'a str,
+    /// Everything after `/plugin-ui/{id}/`; empty for the plugin root.
+    sub: &'a str,
+    /// True for `/plugin-ui/{id}` without the trailing slash.
+    slashless: bool,
+}
+
+fn ui_path(path: &str) -> Option<UiPath<'_>> {
+    let rest = path.strip_prefix("/plugin-ui/")?;
+    Some(match rest.split_once('/') {
+        Some((id, sub)) => UiPath {
+            id,
+            sub,
+            slashless: false,
+        },
+        None => UiPath {
+            id: rest,
+            sub: "",
+            slashless: true,
+        },
+    })
+}
+
+/// Serve `/plugin-ui/{id}/...`: the plugin's package-local web assets plus
+/// the `/rpc` JSON-RPC bridge. A plugin never runs an HTTP listener of its own.
+fn plugin_ui(config: &Path, request: &HttpRequest, ui: &UiPath<'_>, auth: AuthKind) -> Vec<u8> {
+    if !package::valid_name(ui.id) {
+        return error(404, "not_found", "unknown plugin UI");
+    }
+    let Some(assets) = plugin::web_assets(ui.id) else {
+        return error(404, "not_found", &format!("plugin {} has no web UI", ui.id));
+    };
+    if ui.sub == "rpc" {
+        return ui_rpc(config, request, ui.id, auth);
+    }
+    serve_ui(request, &assets, ui.id, ui.sub)
+}
+
+fn serve_ui(request: &HttpRequest, assets: &plugin::WebAssets, id: &str, sub: &str) -> Vec<u8> {
+    if request.method != "GET" {
+        return method_not_allowed("GET");
+    }
+    let Some(relative) = webui::relative_path(sub, &assets.entry) else {
+        return error(404, "not_found", "not found");
+    };
+    if let Some((path, metadata)) = web_file(&assets.root, &relative) {
+        return serve_web_file(request, &path, &metadata, id);
+    }
+    // SPA fallback: only an HTML navigation falls back to the entry. A missing
+    // script must stay a 404 so the browser reports it instead of running HTML.
+    if wants_html(request) {
+        if let Some((path, metadata)) = web_file(&assets.root, &assets.entry) {
+            return serve_web_file(request, &path, &metadata, id);
+        }
+    }
+    error(404, "not_found", "not found")
+}
+
+/// Resolve a relative path under the web root and make sure it stays inside it
+/// (the installer rejects symlinks, but this is cheap defence in depth).
+fn web_file(root: &Path, relative: &str) -> Option<(PathBuf, fs::Metadata)> {
+    let mut path = root.to_path_buf();
+    for segment in relative.split('/') {
+        path.push(segment);
+    }
+    let root = root.canonicalize().ok()?;
+    let path = path.canonicalize().ok()?;
+    if !path.starts_with(&root) {
+        return None;
+    }
+    let metadata = fs::metadata(&path).ok()?;
+    metadata.is_file().then_some((path, metadata))
+}
+
+fn serve_web_file(
+    request: &HttpRequest,
+    path: &Path,
+    metadata: &fs::Metadata,
+    id: &str,
+) -> Vec<u8> {
+    let mime = http::content_type(&path.to_string_lossy());
+    let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+    let etag = webui::etag(modified, metadata.len());
+    let headers = web_headers(&etag);
+    if webui::not_modified(request_header(request, "if-none-match"), &etag) {
+        return http::response_with_headers(304, mime, &headers, b"");
+    }
+    let data = match fs::read(path) {
+        Ok(data) => data,
+        Err(cause) => return error(500, "internal", &format!("read UI asset: {}", cause)),
+    };
+    let body = if mime.starts_with("text/html") {
+        webui::inject_base(&data, id)
+    } else {
+        data
+    };
+    http::response_with_headers(200, mime, &headers, &body)
+}
+
+fn web_headers(etag: &str) -> Vec<(String, String)> {
+    vec![
+        ("ETag".to_string(), etag.to_string()),
+        ("Cache-Control".to_string(), "no-cache".to_string()),
+        ("Vary".to_string(), "Accept".to_string()),
+        ("X-Content-Type-Options".to_string(), "nosniff".to_string()),
+    ]
+}
+
+fn wants_html(request: &HttpRequest) -> bool {
+    request_header(request, "accept")
+        .map(|value| value.to_ascii_lowercase().contains("text/html"))
+        .unwrap_or(false)
+}
+
+fn ui_rpc(config: &Path, request: &HttpRequest, id: &str, auth: AuthKind) -> Vec<u8> {
+    if request.method != "POST" {
+        return method_not_allowed("POST");
+    }
+    if !same_origin(request) {
+        return error(403, "forbidden", "cross-origin calls are not allowed");
+    }
+    if auth == AuthKind::Cookie && request_header(request, "origin").is_none() {
+        return error(
+            403,
+            "forbidden",
+            "Origin is required for cookie-authenticated calls",
+        );
+    }
+    let response = match webui::bridge_request(id, &request.body) {
+        webui::Bridge::Reject(response) => response,
+        webui::Bridge::Forward {
+            id: client_id,
+            name,
+            arguments,
+        } => match channel::request(
+            config,
+            "registry.call",
+            json!({ "name": name, "arguments": arguments }),
+        ) {
+            Ok(mut response) => {
+                // The local channel always uses id 1; the page gets its own id.
+                response.id = client_id;
+                response
+            }
+            Err(cause) => rpc::err(client_id, -32603, &format!("svcd unreachable: {}", cause)),
+        },
+    };
+    http::response(200, "application/json", rpc::to_line(&response).as_bytes())
+}
+
+/// Browsers send `Origin` on cross-origin (and same-origin POST) requests. A
+/// mismatched origin is CSRF or DNS rebinding; an absent origin is allowed on
+/// the unauthenticated loopback surface but never with a session cookie.
+fn same_origin(request: &HttpRequest) -> bool {
+    let Some(origin) = request_header(request, "origin") else {
+        return true;
+    };
+    let host = request_header(request, "host").unwrap_or("");
+    if host.is_empty() {
+        return false;
+    }
+    let origin = origin.trim();
+    origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+        .map(|origin_host| origin_host.eq_ignore_ascii_case(host))
+        .unwrap_or(false)
 }
 
 fn login(request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u8> {
