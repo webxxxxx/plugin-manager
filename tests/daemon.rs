@@ -1419,17 +1419,20 @@ fn builtin_svc_stays_running_and_ignores_start_stop() {
 }
 
 /// Current behaviour under an abrupt svcd death, pinned as a characterization
-/// test: the script service (ready = Exec, never reads stdin) outlives its
-/// supervisor and the restarted daemon starts a second instance instead of
-/// reaping or adopting the orphan. The plugin agent exits on stdin EOF.
+/// test: notify services (core JSON and plugin, which read stdin) exit on EOF;
+/// the drop-in script (ready = Exec, never reads stdin) outlives its supervisor,
+/// and the restarted daemon starts a second instance instead of reaping or
+/// adopting the orphan.
 #[test]
 fn abrupt_svcd_exit_orphans_script_children_and_restart_duplicates_them() {
     let mut sandbox = Sandbox::new();
+    sandbox.write_core_json("core");
     sandbox.write_stop_script("script");
     let package = sandbox.write_plugin_package("plug");
     sandbox.start_daemon();
     sandbox.install_plugin("plug", &package);
 
+    let core_pid = sandbox.running_pid("core") as u64;
     let script_pid = sandbox.running_pid("script") as u64;
     let plugin_pid = sandbox.running_pid("plug") as u64;
 
@@ -1439,14 +1442,15 @@ fn abrupt_svcd_exit_orphans_script_children_and_restart_duplicates_them() {
         pid_alive(script_pid as u32)
     });
     wait_until(
-        "plugin agent to exit on stdin EOF",
+        "notify services to exit on stdin EOF",
         Duration::from_secs(10),
-        || !pid_alive(plugin_pid as u32),
+        || !pid_alive(core_pid as u32) && !pid_alive(plugin_pid as u32),
     );
 
     sandbox.start_daemon();
     let new_script = sandbox.wait_for_restart("script", script_pid, Duration::from_secs(15));
     let new_script_pid = new_script["summary"]["pid"].as_u64().expect("pid");
+    sandbox.wait_for_restart("core", core_pid, Duration::from_secs(15));
     sandbox.wait_for_restart("plug", plugin_pid, Duration::from_secs(15));
     assert_ne!(new_script_pid, script_pid);
     assert!(
@@ -1459,5 +1463,6 @@ fn abrupt_svcd_exit_orphans_script_children_and_restart_duplicates_them() {
     // tracked it. Clean up explicitly either way.
     sandbox.stop_service("script");
     kill_pid(script_pid as u32);
+    sandbox.stop_service("core");
     sandbox.stop_service("plug");
 }
