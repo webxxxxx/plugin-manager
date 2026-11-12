@@ -51,14 +51,37 @@ pub fn run() -> i32 {
         log::svcd(&format!("svcd: cannot bind control channel: {}", error));
         return 1;
     }
+    notify_systemd("READY=1");
 
     let mut daemon = Daemon::new(loaded.registry, token, rx);
     install_shutdown_signal();
     daemon.start_enabled();
     daemon.event_loop();
+    notify_systemd("STOPPING=1");
     channel::remove_socket(&config);
     0
 }
+
+/// systemd's `Type=notify` expects READY=1 once the management channel can
+/// accept commands; services may still be starting. No-op without the
+/// environment variable and on non-Unix hosts.
+#[cfg(unix)]
+fn notify_systemd(state: &str) {
+    use std::os::unix::net::UnixDatagram;
+
+    let Some(socket_path) = std::env::var_os("NOTIFY_SOCKET") else {
+        return;
+    };
+    if socket_path.is_empty() {
+        return;
+    }
+    if let Ok(socket) = UnixDatagram::unbound() {
+        let _ = socket.send_to(state.as_bytes(), socket_path);
+    }
+}
+
+#[cfg(not(unix))]
+fn notify_systemd(_state: &str) {}
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
