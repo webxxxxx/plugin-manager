@@ -8,7 +8,7 @@
 
 ```
 samples/wireguard/
-  manifest.src.json          # 作者字段；files[] 由打包器计算
+  manifest.json              # 作者字段；files[] 由打包器计算（#50 起 plugin bundle 也读它）
   payload/bin/wg-agent       # python3 的 NDJSON agent（样张，不是真 WireGuard）
   payload/web/index.html     # 经 /plugin-ui/wireguard/rpc 调能力的示例 UI
   config/wg.json             # 配置模板（首次安装复制到配置目录）

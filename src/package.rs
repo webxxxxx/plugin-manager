@@ -5,7 +5,7 @@
 //! sha256, mode), then the tar entries. `install` can therefore keep the old
 //! version intact until the new tree is complete.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -18,8 +18,8 @@ use sha2::{Digest, Sha256};
 
 use crate::paths;
 
-const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_FILES: usize = 4096;
+pub(crate) const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_FILES: usize = 4096;
 
 /// Exact target triple the package was built for.
 pub fn target() -> &'static str {
@@ -161,6 +161,12 @@ pub fn write_tar(entries: &[(&str, &[u8], u32)]) -> Result<Vec<u8>, String> {
         header[156] = b'0';
         header[257..263].copy_from_slice(b"ustar\0");
         header[263..265].copy_from_slice(b"00");
+        for byte in &mut header[148..156] {
+            *byte = b' ';
+        }
+        let checksum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+        let checksum = format!("{:06o}\0 ", checksum);
+        header[148..156].copy_from_slice(checksum.as_bytes());
         out.extend_from_slice(&header);
         out.extend_from_slice(data);
         out.extend(std::iter::repeat_n(0, padding(data.len())));
@@ -355,6 +361,67 @@ pub fn verify_bytes(bytes: &[u8]) -> Result<Package, String> {
     })
 }
 
+/// Validate every cross-reference a manifest makes, including the hook and
+/// capability rules the install path enforces separately. The bundler calls
+/// this before writing so authoring mistakes fail early.
+pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
+    if manifest.files.is_empty() {
+        return Err("package has no payload files".into());
+    }
+    check_manifest_paths(manifest)?;
+    for (name, path) in [
+        (
+            "postInstall",
+            manifest
+                .hooks
+                .as_ref()
+                .and_then(|hooks| hooks.post_install.as_deref()),
+        ),
+        (
+            "preRemove",
+            manifest
+                .hooks
+                .as_ref()
+                .and_then(|hooks| hooks.pre_remove.as_deref()),
+        ),
+    ] {
+        let Some(path) = path else { continue };
+        check_path(path)?;
+        if !path.starts_with("hooks/") {
+            return Err(format!("{} must be under hooks/: {}", name, path));
+        }
+        if !manifest.files.iter().any(|file| file.path == path) {
+            return Err(format!("{} is not in files[]: {}", name, path));
+        }
+    }
+    if let Some(ui) = &manifest.ui {
+        if ui.kind == "web" {
+            let entry = ui.entry.as_deref().unwrap_or("index.html");
+            let path = format!("payload/web/{}", entry);
+            check_path(&path)?;
+            if !manifest.files.iter().any(|file| file.path == path) {
+                return Err(format!("ui entry is not in files[]: {}", path));
+            }
+        }
+    }
+    let mut names = BTreeSet::new();
+    for capability in &manifest.capabilities {
+        if capability.name.is_empty() {
+            return Err("capability name must not be empty".into());
+        }
+        if capability.name.starts_with("svc.") {
+            return Err(format!(
+                "capability may not use the svc. prefix: {}",
+                capability.name
+            ));
+        }
+        if !names.insert(&capability.name) {
+            return Err(format!("duplicate capability: {}", capability.name));
+        }
+    }
+    Ok(())
+}
+
 fn check_manifest_paths(manifest: &Manifest) -> Result<(), String> {
     check_path(&manifest.exec.path)?;
     if !manifest
@@ -476,7 +543,7 @@ pub fn valid_name(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
-fn valid_key_id(s: &str) -> bool {
+pub fn valid_key_id(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && s.chars()
@@ -486,15 +553,18 @@ fn valid_key_id(s: &str) -> bool {
 }
 
 fn check_version(value: &str) -> Result<(), String> {
-    let parts: Vec<&str> = value.split('.').collect();
-    if parts.len() != 3
-        || parts
-            .iter()
-            .any(|part| part.is_empty() || !part.chars().all(|c| c.is_ascii_digit()))
-    {
+    if !valid_version(value) {
         return Err(format!("version is not semver: {}", value));
     }
     Ok(())
+}
+
+pub fn valid_version(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
 }
 
 pub fn check_path(p: &str) -> Result<(), String> {

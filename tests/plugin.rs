@@ -108,6 +108,13 @@ impl Sandbox {
         self.run(&self.plugin, args)
     }
 
+    fn run_plugin_in(&self, directory: &Path, args: &[&str]) -> Output {
+        let mut command = Command::new(&self.plugin);
+        command.args(args).current_dir(directory);
+        self.env(&mut command);
+        command.output().expect("run plugin entry")
+    }
+
     fn run_svc(&self, args: &[&str]) -> Output {
         self.run(&self.svc, args)
     }
@@ -330,6 +337,23 @@ fn hex_sha256(bytes: &[u8]) -> String {
         let _ = write!(out, "{:02x}", byte);
     }
     out
+}
+
+fn pem_from_private(key: &SigningKey) -> Vec<u8> {
+    const PREFIX: [u8; 16] = [
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
+        0x20,
+    ];
+    let mut der = PREFIX.to_vec();
+    der.extend_from_slice(&key.to_bytes());
+    let body = BASE64.encode(der);
+    let mut pem = String::from("-----BEGIN PRIVATE KEY-----\n");
+    for chunk in body.as_bytes().chunks(48) {
+        pem.push_str(std::str::from_utf8(chunk).expect("base64"));
+        pem.push('\n');
+    }
+    pem.push_str("-----END PRIVATE KEY-----\n");
+    pem.into_bytes()
 }
 
 fn pem_from_public(key: &[u8; 32]) -> Vec<u8> {
@@ -672,4 +696,145 @@ fn config_flow_copies_prints_exports_and_preserves_on_upgrade() {
 
     let spk = sandbox.run_plugin(&["import", v1.to_str().expect("utf8"), "--force"]);
     assert_eq!(spk.status.code(), Some(0), "{}", stderr(&spk));
+}
+
+#[test]
+fn bundles_a_directory_into_a_working_signed_package() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[15u8; 32]);
+    sandbox.write_key(&key);
+    let source = sandbox.root.join("demo");
+    let (script_name, data) = script();
+    let exec = source.join("payload/bin").join(script_name);
+    fs::create_dir_all(exec.parent().expect("exec parent")).expect("source");
+    fs::write(&exec, &data).expect("exec");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&exec, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    let key_path = sandbox.root.join("bundle.key");
+    fs::write(&key_path, pem_from_private(&key)).expect("key");
+
+    let output = sandbox.run_plugin_in(
+        &sandbox.root,
+        &[
+            "bundle",
+            "demo",
+            "--key",
+            key_path.to_str().expect("key path"),
+            "--key-id",
+            "test",
+            "--version",
+            "1.0.0",
+            "--desc",
+            "bundled demo",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let arch = target().split('-').next().expect("arch");
+    let package_name = format!("demo-1.0.0-{}.spk", arch);
+    let package = sandbox.root.join(&package_name);
+    assert!(package.is_file(), "missing {}", package.display());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(&package_name),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    let installed = sandbox.run_plugin(&["install", package.to_str().expect("package")]);
+    assert_eq!(installed.status.code(), Some(0), "{}", stderr(&installed));
+    assert!(sandbox
+        .data
+        .join("plugins")
+        .join("demo")
+        .join("1.0.0")
+        .join("payload/bin")
+        .join(script_name)
+        .is_file());
+}
+
+#[test]
+fn bundle_refuses_missing_keys_ambiguous_execs_and_symlinks() {
+    let sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[16u8; 32]);
+    let key_path = sandbox.root.join("bundle.key");
+    fs::write(&key_path, pem_from_private(&key)).expect("key");
+    let source = sandbox.root.join("demo");
+    let (name, data) = script();
+    let exec = source.join("payload/bin").join(name);
+    fs::create_dir_all(exec.parent().expect("exec parent")).expect("source");
+    fs::write(&exec, &data).expect("exec");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&exec, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    let out = sandbox.root.join("out.spk");
+
+    let no_key = sandbox.run_plugin(&[
+        "bundle",
+        source.to_str().expect("source"),
+        "-o",
+        out.to_str().expect("out"),
+        "--id",
+        "demo",
+    ]);
+    assert_eq!(no_key.status.code(), Some(1), "{}", stderr(&no_key));
+    assert!(stderr(&no_key).contains("--key"), "{}", stderr(&no_key));
+    assert!(!out.exists());
+
+    let second = if cfg!(windows) {
+        source.join("payload/bin/other.cmd")
+    } else {
+        source.join("payload/bin/other")
+    };
+    fs::write(&second, b"other").expect("second exec");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&second, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    let ambiguous = sandbox.run_plugin(&[
+        "bundle",
+        source.to_str().expect("source"),
+        "--key",
+        key_path.to_str().expect("key"),
+        "-o",
+        out.to_str().expect("out"),
+        "--id",
+        "demo",
+    ]);
+    assert_eq!(ambiguous.status.code(), Some(1), "{}", stderr(&ambiguous));
+    assert!(
+        stderr(&ambiguous).contains("multiple executable candidates"),
+        "{}",
+        stderr(&ambiguous)
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let link = source.join("payload/bin/alias");
+        let _ = fs::remove_file(&link);
+        symlink(&exec, &link).expect("symlink");
+        let output = sandbox.run_plugin(&[
+            "bundle",
+            source.to_str().expect("source"),
+            "--key",
+            key_path.to_str().expect("key"),
+            "-o",
+            out.to_str().expect("out"),
+            "--id",
+            "demo",
+        ]);
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert!(
+            stderr(&output).contains("symbolic links are not allowed"),
+            "{}",
+            stderr(&output)
+        );
+    }
 }
