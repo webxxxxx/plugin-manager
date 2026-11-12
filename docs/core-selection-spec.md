@@ -159,6 +159,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 ### 3.1 控制通道
 
 - 一套 **JSON-RPC 2.0 + NDJSON** 信封跑三条链路：插件 stdio、`svc`/`mcp` 的 UDS / 命名管道、UI 的 `POST /plugin-ui/{id}/rpc`。这三条是控制面；HTTP 的 `/mcp` 与 `/api/v1` 是另外两个面（§3.4 / §3.5），不复用 NDJSON 分帧。
+- `svc`/`svcd` 的本地管理通道用 UDS（Unix）/命名管道（Windows）上的 NDJSON；启动时生成 `<config>/svcd.token`（0640），请求携带该 token。Unix socket 0660；Windows 管道 ACL 仍是默认值，C8 的组授权细化随该边界实现补齐。
 - 帧：UTF-8、LF、禁内嵌换行与 BOM；Windows 二进制模式；单帧上限 1 MiB，超限 = 协议违规，按崩溃路径杀进程。
 - 流控：每插件在途 64、排队 128；超出 `-32000 busy`；单请求默认 30s，超时先发 `notifications/cancelled` 再回错；id 用 svcd 侧单调 u64。
 - 插件 → svcd 只允许响应与通知，不允许发请求（v1 不做双向 RPC）；stdout 只走协议帧，stderr 是行式日志；stdout EOF = 退出。
@@ -314,7 +315,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - 工具链：ubuntu-24.04 上用 cargo-zigbuild（pin `=0.24.1`）+ Zig（`0.17.1`）出三架构 musl；Windows/macOS 原生 runner；唯一高风险环是 armv7+musl 的 zig 链接。
 - 计量：multicall 单二进制，strip 后、未压缩、十进制字节；硬链接算一次；编译进二进制的资源算；安装的 unit/config 与插件不算。
 - 门禁：嵌入式 **≤ 2,000,000 B**、桌面 **≤ 30,000,000 B** 超限 fail；基线 +2% warning；`tools/measure_size.py` + `.github/workflows/size.yml` + `ci/size-baseline.json`。
-- 实测基线（2026-11-12 本机）：musl x86_64 `602,848 B`；Windows x86_64 `420,864 B`；macOS / Linux gnu 待 CI 首跑。
+- 实测基线（2026-11-12 本机）：musl x86_64 `746,320 B`；Windows x86_64 `569,344 B`；macOS / Linux gnu 待 CI 首跑。
 - **30MB 只约束核心二进制**；安装包不计门禁，只记录体积（见 §13-C2）。
 
 ## 8. 桌面交付
@@ -449,8 +450,8 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 
 | 票 | 交付 | 阻塞于 | 骨架现状（尺寸夹具） |
 | --- | --- | --- | --- |
-| [#28](https://github.com/webxxxxx/plugin-manager/issues/28) | 注册表与 status | — | 类型 + 拓扑已有；缺 `services.d` 扫描、status payload、CLI 接线 |
-| [#29](https://github.com/webxxxxx/plugin-manager/issues/29) | 前台监督 core 服务 | #28 | 6 态纯核已有；缺 proc/wait、事件循环、定时器、stderr 捕获 |
+| [#28](https://github.com/webxxxxx/plugin-manager/issues/28) | 注册表与 status | — | 已实现：services.d 扫描、status payload、CLI 接线 |
+| [#29](https://github.com/webxxxxx/plugin-manager/issues/29) | 前台监督 core 服务 | #28 | 已实现：proc/wait、事件循环、定时器、UDS/命名管道管理通道；stderr 继承，日志归 #35 |
 | [#30](https://github.com/webxxxxx/plugin-manager/issues/30) | 安装/运行 .spk（含 `plugin` 入口） | #28 #29 | manifest 解析 + ustar 头已有；缺验签、`files[]` 校验、解包、布局、插件扫描、第四入口 |
 | [#31](https://github.com/webxxxxx/plugin-manager/issues/31) | 插件 IPC 与工具面 | #30 | 编解码 + 工具投影已有；缺分帧读写、id 路由、流控、取消 |
 | [#32](https://github.com/webxxxxx/plugin-manager/issues/32) | `mcp` 桥 dual-era | #31 | 只有 echo 循环 |
@@ -466,4 +467,4 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 | [#42](https://github.com/webxxxxx/plugin-manager/issues/42) | 发行包与签名 | #41 | 无 |
 | [#43](https://github.com/webxxxxx/plugin-manager/issues/43) | 嵌入式发行 | #29 #33 | 无 |
 
-**骨架实际覆盖的范围**（`src/`，568 行，`Cargo.toml` 标注为 size fixture）：6 态状态机、注册表类型与拓扑、manifest 解析、ustar 头解析、JSON-RPC 编解码、工具面投影、HTTP 原语、argv 派发（三入口）。**没有任何一条端到端路径是通的**——没有真实进程、真实文件、真实 IPC 连接。
+**已打通的端到端路径**：`services.d/*.json` → `svcd run --foreground` → 真实进程（spawn / 就绪探针 / 退避 / stop）→ `svc list/status/start/stop` 经 UDS（Unix）/命名管道（Windows）。其余行的服务安装、插件、MCP、HTTP 面仍是骨架。

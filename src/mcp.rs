@@ -1,6 +1,8 @@
 use crate::registry::Registry;
 use serde_json::{json, Value};
 
+/// MCP tool projection; wired by the bridge in #32.
+#[allow(dead_code)]
 pub fn tools(reg: &Registry) -> Vec<Value> {
     let mut out = Vec::new();
     for svc in reg.values() {

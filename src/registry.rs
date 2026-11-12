@@ -1,13 +1,13 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The built-in core service id; reserved against `services.d` definitions.
 pub const RESERVED_ID: &str = "svc";
 /// Capability names in this namespace belong to the core, not to a service.
 pub const RESERVED_CAP_PREFIX: &str = "svc.";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Core,
@@ -25,7 +25,7 @@ impl Kind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum State {
     #[default]
@@ -50,6 +50,7 @@ impl State {
     }
 
     /// Only a fully running service publishes its capability surface.
+    #[allow(dead_code)]
     pub fn is_live(self) -> bool {
         matches!(self, State::Running)
     }
@@ -79,9 +80,10 @@ pub struct Service {
     #[allow(dead_code)]
     pub desc: String,
     pub deps: Vec<String>,
-    pub caps: Vec<String>,
-    /// Consumed by the supervisor when it spawns a core service (#29).
+    /// Read by the MCP tool projection once the bridge lands (#32).
     #[allow(dead_code)]
+    pub caps: Vec<String>,
+    /// Used by the supervisor when it spawns a core service.
     pub exec: Option<Exec>,
     /// Boot-start flag (`[auto]` in `svc list`); not the crash-restart policy.
     pub enabled: bool,
@@ -156,54 +158,6 @@ impl Registry {
 
     pub fn values(&self) -> impl Iterator<Item = &Service> {
         self.services.values()
-    }
-
-    pub fn len(&self) -> usize {
-        self.services.len()
-    }
-
-    /// Dependency order. Dependencies that are not in the registry are external
-    /// and do not block load; a cycle is an error. Ties are ordered by id.
-    pub fn topo(&self) -> Result<Vec<String>, String> {
-        let mut indegree: BTreeMap<String, usize> = self
-            .services
-            .keys()
-            .map(|id| (id.clone(), 0usize))
-            .collect();
-        for service in self.services.values() {
-            for dep in &service.deps {
-                if self.services.contains_key(dep) {
-                    *indegree.get_mut(&service.id).expect("known service") += 1;
-                }
-            }
-        }
-
-        let mut ready: BTreeSet<String> = indegree
-            .iter()
-            .filter(|(_, count)| **count == 0)
-            .map(|(id, _)| id.clone())
-            .collect();
-        let mut order = Vec::with_capacity(self.services.len());
-        while let Some(id) = ready.pop_first() {
-            order.push(id.clone());
-            let mut unlocked = Vec::new();
-            for service in self.services.values() {
-                if service.deps.contains(&id) {
-                    let count = indegree.get_mut(&service.id).expect("known service");
-                    *count -= 1;
-                    if *count == 0 {
-                        unlocked.push(service.id.clone());
-                    }
-                }
-            }
-            for id in unlocked {
-                ready.insert(id);
-            }
-        }
-        if order.len() != self.services.len() {
-            return Err("dependency cycle".into());
-        }
-        Ok(order)
     }
 
     /// One cycle path (without the repeated head), used to reject definitions at
@@ -292,44 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn topo_puts_dependencies_before_dependents() {
-        let mut registry = Registry::new();
-        registry
-            .insert(Service {
-                id: "b".into(),
-                ..Service::builtin_svc()
-            })
-            .expect("insert b");
-        registry
-            .insert(Service {
-                id: "a".into(),
-                deps: vec!["b".into()],
-                ..Service::builtin_svc()
-            })
-            .expect("insert a");
-
-        assert_eq!(
-            registry.topo().expect("no cycle"),
-            vec!["b".to_string(), "a".to_string()]
-        );
-    }
-
-    #[test]
-    fn topo_ignores_dependencies_outside_the_registry() {
-        let mut registry = Registry::new();
-        registry
-            .insert(Service {
-                id: "a".into(),
-                deps: vec!["not-installed".into()],
-                ..Service::builtin_svc()
-            })
-            .expect("insert a");
-
-        assert_eq!(registry.topo().expect("no cycle"), vec!["a".to_string()]);
-    }
-
-    #[test]
-    fn find_cycle_reports_a_path_and_topo_rejects_it() {
+    fn find_cycle_reports_a_path() {
         let mut registry = Registry::new();
         registry
             .insert(Service {
@@ -348,7 +265,6 @@ mod tests {
 
         let cycle = registry.find_cycle().expect("cycle");
         assert_eq!(cycle, vec!["a".to_string(), "b".to_string()]);
-        assert!(registry.topo().is_err());
     }
 
     #[test]

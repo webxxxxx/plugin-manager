@@ -1,3 +1,6 @@
+//! HTTP primitives; the UI reverse proxy lands in #33.
+#![allow(dead_code)]
+
 pub struct Request<'a> {
     pub method: &'a str,
     pub path: &'a str,

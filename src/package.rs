@@ -1,3 +1,7 @@
+//! .spk manifest and ustar parsing. The installer and signature checks land in
+//! #30; the parser types stay in place for that work.
+#![allow(dead_code)]
+
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -79,15 +83,21 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, String> {
 pub fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
-        && s.chars().next().map(|c| c.is_ascii_lowercase() || c.is_ascii_digit()).unwrap_or(false)
-        && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        && s.chars()
+            .next()
+            .map(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            .unwrap_or(false)
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
 pub fn check_path(p: &str) -> Result<(), String> {
     if p.starts_with('/') || p.contains('\\') {
         return Err(format!("unsafe path: {}", p));
     }
-    if p.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..") {
+    if p.split('/')
+        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
         return Err(format!("unsafe path: {}", p));
     }
     Ok(())

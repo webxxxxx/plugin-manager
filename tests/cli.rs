@@ -184,6 +184,7 @@ fn status_json_is_exactly_summary_and_details() {
     assert_eq!(details["failures"], 0);
     assert!(details["config"].is_null());
     assert!(details["restart"].is_null());
+    assert_eq!(details["unkillable"], false);
 }
 
 #[test]

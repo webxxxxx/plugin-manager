@@ -51,3 +51,11 @@ _Avoid_: 拉起、boot、run
 **注册表（Registry）**:
 svcd 持有的唯一服务清单；`svc list` 与 MCP 工具面都从它投影。
 _Avoid_: 服务表、清单、catalog
+
+**状态机核（Machine）**:
+6 态纯核；只接收带 pid 的事件、产出动作，不碰进程、时钟或 IO。由监督槽执行动作。
+_Avoid_: supervisor、状态机（不带「核」）
+
+**监督槽（Slot）**:
+一个被监督服务的运行时载体：状态机核 + 子进程 + stdio 管线 + 定时器。
+_Avoid_: 实例、worker
