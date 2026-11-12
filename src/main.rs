@@ -14,6 +14,7 @@ mod package;
 mod paths;
 mod plugin;
 mod plugin_cli;
+mod proc;
 mod registry;
 mod rpc;
 mod slot;

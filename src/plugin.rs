@@ -410,6 +410,7 @@ pub fn config_check(id: &str, candidate: &Path) -> Result<(), String> {
     let mut child = command
         .spawn()
         .map_err(|error| format!("spawn configCheck: {}", error))?;
+    let _ = crate::proc::assign(&child);
     let started = Instant::now();
     loop {
         match child.try_wait() {

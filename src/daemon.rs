@@ -42,6 +42,12 @@ pub fn run() -> i32 {
         eprintln!("svcd: cannot open log directory: {}", error);
     }
     log::svcd("svcd starting");
+    if let Err(error) = crate::proc::init() {
+        log::svcd(&format!(
+            "svcd: parent-death protection unavailable: {}",
+            error
+        ));
+    }
 
     let mut loaded = definition::load_services(&paths::services_dir());
     for issue in &loaded.issues {
@@ -966,6 +972,7 @@ fn run_status_hook(id: &str, hook: &Hook) -> String {
         Ok(child) => child,
         Err(error) => return format!("spawn failed: {}", error),
     };
+    let _ = crate::proc::assign(&child);
     let started = Instant::now();
     loop {
         match child.try_wait() {

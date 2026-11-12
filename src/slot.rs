@@ -247,6 +247,12 @@ impl Slot {
         }
 
         let mut child = command.spawn().map_err(|error| error.to_string())?;
+        if let Err(error) = crate::proc::assign(&child) {
+            log::svcd(&format!(
+                "svcd: {}: parent-death protection: {}",
+                self.id, error
+            ));
+        }
         let pid = child.id();
         let log = match LogSink::open(&paths::logs_dir(), &self.id) {
             Ok(sink) => Some(Arc::new(Mutex::new(sink))),
@@ -640,6 +646,7 @@ impl Slot {
         }
         match command.spawn() {
             Ok(mut child) => {
+                let _ = crate::proc::assign(&child);
                 let log = LogSink::open(&paths::logs_dir(), &self.id)
                     .ok()
                     .map(|sink| Arc::new(Mutex::new(sink)));
@@ -800,6 +807,7 @@ fn command_for_parts(path: &str, args: &[String], env: &BTreeMap<String, String>
                 .arg(path)
                 .args(args)
                 .envs(env);
+            crate::proc::configure(&mut command);
             return command;
         }
         #[cfg(not(windows))]
@@ -811,6 +819,7 @@ fn command_for_parts(path: &str, args: &[String], env: &BTreeMap<String, String>
                 .arg(path)
                 .args(args)
                 .envs(env);
+            crate::proc::configure(&mut command);
             return command;
         }
     }
@@ -819,10 +828,12 @@ fn command_for_parts(path: &str, args: &[String], env: &BTreeMap<String, String>
         let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
         let mut command = Command::new(shell);
         command.arg("/C").arg(path).args(args).envs(env);
+        crate::proc::configure(&mut command);
         return command;
     }
     let mut command = Command::new(path);
     command.args(args).envs(env);
+    crate::proc::configure(&mut command);
     command
 }
 

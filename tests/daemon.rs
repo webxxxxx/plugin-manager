@@ -830,8 +830,8 @@ fn pid_alive(pid: u32) -> bool {
     {
         Command::new("kill")
             .args(["-0", &pid.to_string()])
-            .status()
-            .map(|status| status.success())
+            .output()
+            .map(|output| output.status.success())
             .unwrap_or(false)
     }
 }
@@ -845,7 +845,7 @@ fn kill_pid(pid: u32) {
     }
     #[cfg(unix)]
     {
-        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
     }
 }
 
@@ -1418,13 +1418,12 @@ fn builtin_svc_stays_running_and_ignores_start_stop() {
     assert_eq!(sandbox.status("svc")["summary"]["state"], "running");
 }
 
-/// Current behaviour under an abrupt svcd death, pinned as a characterization
-/// test: notify services (core JSON and plugin, which read stdin) exit on EOF;
-/// the drop-in script (ready = Exec, never reads stdin) outlives its supervisor,
-/// and the restarted daemon starts a second instance instead of reaping or
-/// adopting the orphan.
+/// An abrupt svcd death must take its supervised processes with it: the OS
+/// parent-death protection (Windows job object / Linux PDEATHSIG) reaps every
+/// child, so the restarted daemon starts exactly one instance per service and
+/// never meets a leftover from the previous run.
 #[test]
-fn abrupt_svcd_exit_orphans_script_children_and_restart_duplicates_them() {
+fn abrupt_svcd_exit_reaps_children_and_restart_starts_one_instance() {
     let mut sandbox = Sandbox::new();
     sandbox.write_core_json("core");
     sandbox.write_stop_script("script");
@@ -1438,31 +1437,35 @@ fn abrupt_svcd_exit_orphans_script_children_and_restart_duplicates_them() {
 
     sandbox.force_kill_daemon();
 
-    wait_until("script orphan", Duration::from_secs(5), || {
-        pid_alive(script_pid as u32)
-    });
     wait_until(
-        "notify services to exit on stdin EOF",
+        "all children to die with svcd",
         Duration::from_secs(10),
-        || !pid_alive(core_pid as u32) && !pid_alive(plugin_pid as u32),
+        || {
+            !pid_alive(core_pid as u32)
+                && !pid_alive(script_pid as u32)
+                && !pid_alive(plugin_pid as u32)
+        },
     );
 
     sandbox.start_daemon();
-    let new_script = sandbox.wait_for_restart("script", script_pid, Duration::from_secs(15));
-    let new_script_pid = new_script["summary"]["pid"].as_u64().expect("pid");
-    sandbox.wait_for_restart("core", core_pid, Duration::from_secs(15));
-    sandbox.wait_for_restart("plug", plugin_pid, Duration::from_secs(15));
-    assert_ne!(new_script_pid, script_pid);
-    assert!(
-        pid_alive(script_pid as u32),
-        "KNOWN GAP: the pre-crash instance survived the restart"
-    );
+    for (id, old_pid) in [
+        ("core", core_pid),
+        ("script", script_pid),
+        ("plug", plugin_pid),
+    ] {
+        let status = sandbox.wait_for_restart(id, old_pid, Duration::from_secs(15));
+        assert!(
+            status["summary"]["pid"].as_u64().unwrap_or(0) > 0,
+            "{status}"
+        );
+        assert!(
+            !pid_alive(old_pid as u32),
+            "{}: the pre-crash instance is still alive",
+            id
+        );
+    }
 
-    // The fixture's stop sidecar is shared by both instances, so the new
-    // instance's stop action also ends the orphan; the daemon itself never
-    // tracked it. Clean up explicitly either way.
-    sandbox.stop_service("script");
-    kill_pid(script_pid as u32);
     sandbox.stop_service("core");
+    sandbox.stop_service("script");
     sandbox.stop_service("plug");
 }
