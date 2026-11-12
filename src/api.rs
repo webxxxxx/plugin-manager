@@ -338,18 +338,21 @@ fn handle_stream(
         return true;
     }
 
-    let (receiver, subscription) = match uichannel::bus().subscribe(ui.id) {
-        Ok(subscription) => subscription,
-        Err(_) => {
-            let _ = stream.write_all(&error(
-                429,
-                "too_many_subscribers",
-                "too many UI subscribers for this plugin",
-            ));
-            return true;
-        }
-    };
-    let _ = uichannel::serve_sse(stream, receiver);
+    let last_event_id =
+        request_header(request, "last-event-id").and_then(|value| value.trim().parse::<u64>().ok());
+    let (receiver, subscription, replay) =
+        match uichannel::bus().subscribe_from(ui.id, last_event_id) {
+            Ok(subscription) => subscription,
+            Err(_) => {
+                let _ = stream.write_all(&error(
+                    429,
+                    "too_many_subscribers",
+                    "too many UI subscribers for this plugin",
+                ));
+                return true;
+            }
+        };
+    let _ = uichannel::serve_sse(stream, receiver, replay);
     drop(subscription);
     true
 }
