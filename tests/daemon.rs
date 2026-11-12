@@ -230,6 +230,68 @@ impl Sandbox {
         .expect("write lifecycle definition");
     }
 
+    fn write_script_service(&self, id: &str) -> PathBuf {
+        let directory = self.config.join("services.d");
+        fs::create_dir_all(&directory).expect("services.d");
+        #[cfg(windows)]
+        {
+            let path = directory.join(format!("{}.cmd", id));
+            let lines: Vec<&str> = vec![
+                "@echo off",
+                "setlocal",
+                r#"set "action=%~1""#,
+                r#"if "%action%"=="" set "action=%SVCD_ACTION%""#,
+                r#"if /I "%action%"=="start" goto start"#,
+                r#"if /I "%action%"=="stop" goto stop"#,
+                r#"if /I "%action%"=="status" goto status"#,
+                "exit /b 64",
+                ":start",
+                r#"echo start>>"%~dp0marker.txt""#,
+                ":loop",
+                "ping -n 2 127.0.0.1 >nul",
+                "goto loop",
+                ":stop",
+                r#"echo stop>>"%~dp0marker.txt""#,
+                "exit /b 0",
+                ":status",
+                r#"echo status>>"%~dp0marker.txt""#,
+                "exit /b 0",
+            ];
+            fs::write(&path, lines.join("\r\n") + "\r\n").expect("write script service");
+            path
+        }
+        #[cfg(unix)]
+        {
+            let path = directory.join(format!("{}.sh", id));
+            let lines: Vec<&str> = vec![
+                "#!/bin/sh",
+                "start() {",
+                r#"  dir=$(dirname "$0")"#,
+                r#"  echo start >> "$dir/marker.txt""#,
+                "  while :; do sleep 1; done",
+                "}",
+                "stop() {",
+                r#"  dir=$(dirname "$0")"#,
+                r#"  echo stop >> "$dir/marker.txt""#,
+                "}",
+                "status() {",
+                r#"  dir=$(dirname "$0")"#,
+                r#"  echo status >> "$dir/marker.txt""#,
+                "}",
+                r#"action="${1:-$SVCD_ACTION}""#,
+                r#"case "$action" in"#,
+                r#"  start|stop|status) "$action" ;;"#,
+                "  *) exit 64 ;;",
+                "esac",
+            ];
+            fs::write(&path, lines.join("\n") + "\n").expect("write script service");
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                .expect("chmod script service");
+            path
+        }
+    }
+
     fn start_daemon(&mut self) {
         let stderr = fs::File::create(&self.daemon_stderr).expect("create daemon log");
         let child = Command::new(&self.svcd)
@@ -624,5 +686,67 @@ fn core_lifecycle_hooks_run_for_start_stop_and_status() {
         text.lines().filter(|line| *line == "stop").count(),
         2,
         "stop hook must run again after a restart: {text}"
+    );
+}
+
+#[test]
+fn a_drop_in_script_is_discovered_and_supervised() {
+    let mut sandbox = Sandbox::new();
+    let script = sandbox.write_script_service("demo");
+    assert!(script.is_file());
+    sandbox.start_daemon();
+
+    let list = sandbox.run_svc(&["list"]);
+    assert!(
+        String::from_utf8_lossy(&list.stdout)
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("demo")),
+        "script service missing from list: {}",
+        String::from_utf8_lossy(&list.stdout)
+    );
+
+    let started = sandbox.start_when_ready("demo");
+    assert_eq!(
+        started.status.code(),
+        Some(0),
+        "start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let marker = sandbox.config.join("services.d").join("marker.txt");
+    assert!(
+        fs::read_to_string(&marker)
+            .expect("marker")
+            .contains("start"),
+        "start action did not run"
+    );
+
+    let stopped = sandbox.stop("demo");
+    assert_eq!(
+        stopped.status.code(),
+        Some(0),
+        "stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(
+        fs::read_to_string(&marker)
+            .expect("marker")
+            .contains("stop"),
+        "stop action did not run"
+    );
+
+    let status = sandbox.run_svc(&["status", "demo", "--json"]);
+    assert_eq!(
+        status.status.code(),
+        Some(0),
+        "status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let value: Value = serde_json::from_slice(&status.stdout).expect("status json");
+    assert_eq!(value["details"]["probe"], "ok");
+    assert!(
+        fs::read_to_string(&marker)
+            .expect("marker")
+            .contains("status"),
+        "status action did not run"
     );
 }
