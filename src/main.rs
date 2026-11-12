@@ -4,6 +4,7 @@ mod daemon;
 mod definition;
 mod http;
 mod install;
+mod lan;
 mod log;
 mod mcp;
 mod package;

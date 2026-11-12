@@ -1,14 +1,17 @@
-//! Minimal `/api/v1` HTTP management API.
+//! Minimal `/api/v1` HTTP management API and LAN authentication.
 //!
-//! v1 binds loopback only and has no TLS; LAN bind and bearer/cookie auth land
-//! in #38. Every request is translated into the same daemon RPC the CLI uses,
-//! so the HTTP surface never owns a second copy of service state.
+//! The listener starts on loopback; `svc lan enable` can rebind it to a LAN
+//! address and turns on bearer/cookie auth. Every request is translated into the
+//! same daemon RPC the CLI uses, so the HTTP surface never owns a second copy of
+//! service state.
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -16,6 +19,7 @@ use serde_json::{json, Value};
 
 use crate::channel;
 use crate::http;
+use crate::lan::{self, AuthKind, Lan, LanStatus};
 use crate::log;
 use crate::package;
 use crate::paths;
@@ -27,33 +31,174 @@ const MAX_HEADER: usize = 64 * 1024;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
-pub fn spawn(config: PathBuf) -> std::io::Result<()> {
+pub struct Api {
+    config: PathBuf,
+    port: u16,
+    lan: Arc<Mutex<Lan>>,
+    commands: Sender<Command>,
+}
+
+enum Command {
+    Rebind {
+        addr: SocketAddr,
+        reply: Sender<Result<(), String>>,
+    },
+}
+
+pub fn spawn(config: PathBuf) -> std::io::Result<Arc<Api>> {
     let port = std::env::var("SVCD_HTTP_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(DEFAULT_PORT);
-    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    let state = Lan::load(&config);
+    let bind = if state.enabled {
+        state.bind
+    } else {
+        "127.0.0.1".parse().expect("loopback")
+    };
+    let listener = TcpListener::bind((bind, port))?;
+    listener.set_nonblocking(true)?;
     let local = listener.local_addr()?;
     let port_file = config.join("http.port");
     fs::write(&port_file, format!("127.0.0.1:{}", local.port())).map_err(|error| {
         std::io::Error::other(format!("write {}: {}", port_file.display(), error))
     })?;
-    log::svcd(&format!("svcd: HTTP API on 127.0.0.1:{}", local.port()));
+    log::svcd(&format!(
+        "svcd: HTTP API on {}:{}",
+        local.ip(),
+        local.port()
+    ));
 
+    let lan = Arc::new(Mutex::new(state));
+    let (commands, receiver) = mpsc::channel();
+    let api = Arc::new(Api {
+        config: config.clone(),
+        port: local.port(),
+        lan: lan.clone(),
+        commands,
+    });
     thread::Builder::new()
         .name("svcd-http".into())
-        .spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let config = config.clone();
-                let _ = thread::Builder::new()
-                    .name("svcd-http-conn".into())
-                    .spawn(move || handle(stream, config));
-            }
-        })?;
-    Ok(())
+        .spawn(move || listener_loop(listener, local, receiver, lan, config))?;
+    Ok(api)
 }
 
-fn handle(mut stream: TcpStream, config: PathBuf) {
+impl Api {
+    pub fn enable(&self, bind: IpAddr) -> Result<(LanStatus, Option<String>), String> {
+        let mut state = self.lan.lock().map_err(|_| "LAN state poisoned")?;
+        let previous = (state.enabled, state.bind);
+        let token = state.enable(bind);
+        if bind != previous.1 {
+            if let Err(error) = self.rebind(SocketAddr::new(bind, self.port)) {
+                state.enabled = previous.0;
+                state.bind = previous.1;
+                return Err(error);
+            }
+        }
+        if let Err(error) = state.save(&self.config) {
+            state.enabled = previous.0;
+            state.bind = previous.1;
+            return Err(error);
+        }
+        Ok((state.status(), token))
+    }
+
+    pub fn disable(&self) -> Result<LanStatus, String> {
+        let mut state = self.lan.lock().map_err(|_| "LAN state poisoned")?;
+        let previous = (state.enabled, state.bind);
+        state.disable();
+        if let Err(error) = self.rebind(SocketAddr::new(state.bind, self.port)) {
+            state.enabled = previous.0;
+            state.bind = previous.1;
+            return Err(error);
+        }
+        if let Err(error) = state.save(&self.config) {
+            state.enabled = previous.0;
+            state.bind = previous.1;
+            return Err(error);
+        }
+        Ok(state.status())
+    }
+
+    pub fn rotate(&self) -> Result<String, String> {
+        let mut state = self.lan.lock().map_err(|_| "LAN state poisoned")?;
+        let token = state.rotate();
+        state.save(&self.config)?;
+        Ok(token)
+    }
+
+    pub fn status(&self) -> Result<LanStatus, String> {
+        let state = self.lan.lock().map_err(|_| "LAN state poisoned")?;
+        Ok(state.status())
+    }
+
+    fn rebind(&self, addr: SocketAddr) -> Result<(), String> {
+        let (reply, receiver) = mpsc::channel();
+        self.commands
+            .send(Command::Rebind { addr, reply })
+            .map_err(|_| "HTTP listener is not running".to_string())?;
+        receiver
+            .recv_timeout(Duration::from_secs(3))
+            .map_err(|_| "HTTP rebind timed out".to_string())?
+    }
+}
+
+fn listener_loop(
+    listener: TcpListener,
+    addr: SocketAddr,
+    receiver: Receiver<Command>,
+    lan: Arc<Mutex<Lan>>,
+    config: PathBuf,
+) {
+    let mut listener = Some(listener);
+    let mut addr = addr;
+    loop {
+        while let Ok(Command::Rebind {
+            addr: new_addr,
+            reply,
+        }) = receiver.try_recv()
+        {
+            drop(listener.take());
+            match bind_listener(new_addr) {
+                Ok(new_listener) => {
+                    listener = Some(new_listener);
+                    addr = new_addr;
+                    let _ = reply.send(Ok(()));
+                }
+                Err(error) => {
+                    if let Ok(old_listener) = bind_listener(addr) {
+                        listener = Some(old_listener);
+                    }
+                    let _ = reply.send(Err(error.to_string()));
+                }
+            }
+        }
+        if let Some(current) = listener.as_ref() {
+            loop {
+                match current.accept() {
+                    Ok((stream, _)) => {
+                        let lan = lan.clone();
+                        let config = config.clone();
+                        let _ = thread::Builder::new()
+                            .name("svcd-http-conn".into())
+                            .spawn(move || handle(stream, config, lan));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    let listener = TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+fn handle(mut stream: TcpStream, config: PathBuf, lan: Arc<Mutex<Lan>>) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
     let request = match read_request(&mut stream) {
         Ok(request) => request,
@@ -62,8 +207,91 @@ fn handle(mut stream: TcpStream, config: PathBuf) {
             return;
         }
     };
-    let response = route(&config, &request);
+    let response = respond(&config, &request, &lan);
     let _ = stream.write_all(&response);
+}
+
+fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u8> {
+    let path = request
+        .path
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(request.path.as_str());
+    if path == "/login" && request.method == "POST" {
+        return login(request, lan);
+    }
+    if path == "/logout" && request.method == "POST" {
+        return logout(request, lan);
+    }
+
+    let auth = match lan.lock() {
+        Ok(mut state) => match state.authenticate(&request.headers) {
+            Ok(auth) => auth,
+            Err(()) => return error(401, "unauthorized", "authentication required"),
+        },
+        Err(_) => return error(500, "internal", "LAN state unavailable"),
+    };
+    if auth == AuthKind::Cookie && is_write(&request.method) && !csrf_ok(request) {
+        return error(
+            403,
+            "forbidden",
+            "cookie writes require Origin and X-Svcd-Csrf",
+        );
+    }
+    route(config, request, lan)
+}
+
+fn login(request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u8> {
+    let token = request_header(request, "authorization")
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .map(str::to_string)
+        .or_else(|| {
+            serde_json::from_slice::<Value>(&request.body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("token")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+        });
+    let Some(token) = token else {
+        return error(401, "unauthorized", "invalid token");
+    };
+    let session = match lan.lock() {
+        Ok(mut state) => match state.login(&token) {
+            Ok(session) => session,
+            Err(message) => return error(401, "unauthorized", &message),
+        },
+        Err(_) => return error(500, "internal", "LAN state unavailable"),
+    };
+    let body = serde_json::to_vec(&json!({ "ok": true })).unwrap_or_default();
+    http::response_with_headers(
+        200,
+        "application/json",
+        &lan::cookie_headers(&session),
+        &body,
+    )
+}
+
+fn logout(request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u8> {
+    if let Ok(mut state) = lan.lock() {
+        state.logout(&request.headers);
+    }
+    let body = serde_json::to_vec(&json!({ "ok": true })).unwrap_or_default();
+    http::response_with_headers(200, "application/json", &lan::clear_cookie_headers(), &body)
+}
+
+fn is_write(method: &str) -> bool {
+    matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
+}
+
+fn csrf_ok(request: &HttpRequest) -> bool {
+    let host = request_header(request, "host").unwrap_or("");
+    let origin = request_header(request, "origin").unwrap_or("");
+    let csrf = request_header(request, "x-svcd-csrf").unwrap_or("");
+    !host.is_empty() && origin == format!("http://{}", host) && csrf == "1"
 }
 
 struct HttpRequest {
@@ -137,6 +365,14 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, Vec<u8>> {
     })
 }
 
+fn request_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
+    request
+        .headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
 fn header<'a>(request: &'a http::Request<'_>, name: &str) -> Option<&'a str> {
     request
         .headers
@@ -149,7 +385,7 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-fn route(config: &std::path::Path, request: &HttpRequest) -> Vec<u8> {
+fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<Lan>>) -> Vec<u8> {
     let (path, query) = request
         .path
         .split_once('?')
@@ -165,6 +401,14 @@ fn route(config: &std::path::Path, request: &HttpRequest) -> Vec<u8> {
             "protocol": 1,
             "platform": package::target(),
         })),
+        ("GET", ["api", "v1", "lan"]) => match lan_state.lock() {
+            Ok(state) => ok(json!({
+                "enabled": state.enabled,
+                "bind": state.bind.to_string(),
+                "tokenSet": state.token().is_some(),
+            })),
+            Err(_) => error(500, "internal", "LAN state unavailable"),
+        },
         ("GET", ["api", "v1", "services"]) => match rpc(config, "svc.list", json!({})) {
             Ok(value) => {
                 let services = value

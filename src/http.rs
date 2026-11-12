@@ -31,6 +31,15 @@ pub fn parse(buf: &[u8]) -> Option<Request<'_>> {
 }
 
 pub fn response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
+    response_with_headers(status, content_type, &[], body)
+}
+
+pub fn response_with_headers(
+    status: u16,
+    content_type: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Vec<u8> {
     let reason = match status {
         200 => "OK",
         304 => "Not Modified",
@@ -41,6 +50,7 @@ pub fn response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
         405 => "Method Not Allowed",
         409 => "Conflict",
         413 => "Payload Too Large",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
         504 => "Gateway Timeout",
         _ => "Error",
@@ -48,7 +58,7 @@ pub fn response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(128 + body.len());
     out.extend_from_slice(
         format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
             status,
             reason,
             content_type,
@@ -56,6 +66,10 @@ pub fn response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
         )
         .as_bytes(),
     );
+    for (name, value) in headers {
+        out.extend_from_slice(format!("{}: {}\r\n", name, value).as_bytes());
+    }
+    out.extend_from_slice(b"\r\n");
     out.extend_from_slice(body);
     out
 }

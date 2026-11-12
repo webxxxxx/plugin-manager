@@ -1,16 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
 
-use crate::api;
+use crate::api::{self, Api};
 use crate::channel;
 use crate::definition;
+use crate::lan::LanStatus;
 use crate::log;
 use crate::package;
 use crate::paths;
@@ -72,12 +75,16 @@ pub fn run() -> i32 {
         log::svcd(&format!("svcd: cannot bind control channel: {}", error));
         return 1;
     }
-    if let Err(error) = api::spawn(config.clone()) {
-        log::svcd(&format!("svcd: HTTP API disabled: {}", error));
-    }
+    let api = match api::spawn(config.clone()) {
+        Ok(api) => Some(api),
+        Err(error) => {
+            log::svcd(&format!("svcd: HTTP API disabled: {}", error));
+            None
+        }
+    };
     notify_systemd("READY=1");
 
-    let mut daemon = Daemon::new(loaded.registry, token, rx);
+    let mut daemon = Daemon::new(loaded.registry, token, rx, api);
     install_shutdown_signal();
     daemon.start_enabled();
     daemon.event_loop();
@@ -155,6 +162,7 @@ struct Daemon {
     registry: Registry,
     token: String,
     rx: Receiver<channel::PendingCall>,
+    api: Option<Arc<Api>>,
     slots: BTreeMap<String, Slot>,
     shutdown: bool,
     started: Instant,
@@ -162,7 +170,12 @@ struct Daemon {
 }
 
 impl Daemon {
-    fn new(registry: Registry, token: String, rx: Receiver<channel::PendingCall>) -> Self {
+    fn new(
+        registry: Registry,
+        token: String,
+        rx: Receiver<channel::PendingCall>,
+        api: Option<Arc<Api>>,
+    ) -> Self {
         let mut slots = BTreeMap::new();
         for service in registry.values() {
             if service.id == RESERVED_ID {
@@ -179,6 +192,7 @@ impl Daemon {
             registry,
             token,
             rx,
+            api,
             slots,
             shutdown: false,
             started: Instant::now(),
@@ -294,8 +308,62 @@ impl Daemon {
                 Ok(()) => rpc::ok(id, json!({ "ok": true })),
                 Err(error) => rpc::err(id, -32007, &error),
             },
+            "lan.status" => match self.lan_status() {
+                Ok(status) => rpc::ok(id, lan_json(&status, None)),
+                Err(error) => rpc::err(id, -32008, &error),
+            },
+            "lan.enable" => {
+                let bind = request
+                    .params
+                    .get("bind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("0.0.0.0");
+                match bind.parse::<IpAddr>() {
+                    Ok(bind) => match self.lan_enable(bind) {
+                        Ok((status, token)) => rpc::ok(id, lan_json(&status, token.as_deref())),
+                        Err(error) => rpc::err(id, -32008, &error),
+                    },
+                    Err(_) => rpc::err(id, -32008, "invalid bind address"),
+                }
+            }
+            "lan.disable" => match self.lan_disable() {
+                Ok(status) => rpc::ok(id, lan_json(&status, None)),
+                Err(error) => rpc::err(id, -32008, &error),
+            },
+            "lan.token.rotate" => match self.lan_rotate() {
+                Ok(token) => rpc::ok(id, json!({ "token": token })),
+                Err(error) => rpc::err(id, -32008, &error),
+            },
             _ => rpc::err(id, -32601, "method not found"),
         }
+    }
+
+    fn lan_status(&self) -> Result<LanStatus, String> {
+        self.api
+            .as_ref()
+            .ok_or_else(|| "HTTP API is not running".to_string())?
+            .status()
+    }
+
+    fn lan_enable(&self, bind: IpAddr) -> Result<(LanStatus, Option<String>), String> {
+        self.api
+            .as_ref()
+            .ok_or_else(|| "HTTP API is not running".to_string())?
+            .enable(bind)
+    }
+
+    fn lan_disable(&self) -> Result<LanStatus, String> {
+        self.api
+            .as_ref()
+            .ok_or_else(|| "HTTP API is not running".to_string())?
+            .disable()
+    }
+
+    fn lan_rotate(&self) -> Result<String, String> {
+        self.api
+            .as_ref()
+            .ok_or_else(|| "HTTP API is not running".to_string())?
+            .rotate()
     }
 
     fn statuses(&self) -> Vec<Status> {
@@ -749,6 +817,15 @@ fn walk_dependencies(registry: &Registry, ids: &[String]) -> (BTreeSet<String>, 
     (closure, missing.into_iter().collect())
 }
 
+fn lan_json(status: &LanStatus, token: Option<&str>) -> Value {
+    json!({
+        "enabled": status.enabled,
+        "bind": status.bind.to_string(),
+        "tokenSet": status.token_set,
+        "token": token,
+    })
+}
+
 fn missing_dependencies(registry: &Registry, id: &str) -> Vec<String> {
     walk_dependencies(registry, &[id.to_string()]).1
 }
@@ -863,7 +940,7 @@ mod tests {
     fn start_refuses_a_failed_dependency() {
         let registry = registry(vec![service("app", &["base"]), service("base", &[])]);
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(registry, "token".into(), receiver);
+        let mut daemon = Daemon::new(registry, "token".into(), receiver, None);
         daemon.slots.get_mut("base").expect("base").machine.state = State::Failed;
 
         let error = daemon.start_service("app").expect_err("failed dependency");
