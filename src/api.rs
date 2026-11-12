@@ -202,7 +202,10 @@ fn listener_loop(
                 }
             }
         }
-        thread::sleep(Duration::from_millis(20));
+        // Keep the rebind command responsive without a 20ms latency floor on
+        // every new connection. The listener is non-blocking; polling at 1ms is
+        // cheap and keeps the accept path ready for the next request.
+        thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -214,10 +217,9 @@ fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
 
 fn handle(mut stream: TcpStream, config: PathBuf, lan: Arc<Mutex<Lan>>) {
     // Windows accepted sockets inherit the listener's non-blocking mode
-    // (Unix ones do not). One connection reads one request and writes one
-    // response; that loop expects blocking reads, so flip the socket back
-    // before installing the read timeout. Otherwise a body that has not
-    // arrived yet becomes a WouldBlock "read" error.
+    // (Unix ones do not). Requests are read with blocking reads, so flip the
+    // socket back before installing the read timeout. Otherwise a body that has
+    // not arrived yet becomes a WouldBlock "read" error.
     if let Err(error) = stream.set_nonblocking(false) {
         log::svcd(&format!(
             "svcd: HTTP connection: cannot switch to blocking mode: {}",
@@ -225,18 +227,66 @@ fn handle(mut stream: TcpStream, config: PathBuf, lan: Arc<Mutex<Lan>>) {
         ));
     }
     let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
-    let request = match read_request(&mut stream) {
-        Ok(request) => request,
-        Err(response) => {
-            let _ = stream.write_all(&response);
+    let mut first = true;
+    loop {
+        let request = match read_request(&mut stream) {
+            Ok(request) => request,
+            Err(response) => {
+                // An idle keep-alive connection times out or closes; do not
+                // manufacture a 400 response for a request that never arrived.
+                if first {
+                    let _ = stream.write_all(&response);
+                }
+                return;
+            }
+        };
+        first = false;
+        if handle_stream(&mut stream, &config, &request, &lan) {
             return;
         }
-    };
-    if handle_stream(&mut stream, &config, &request, &lan) {
-        return;
+        let keep_alive = wants_keep_alive(&request);
+        let mut response = respond(&config, &request, &lan);
+        if keep_alive {
+            response = keep_alive_response(response);
+        }
+        if stream.write_all(&response).is_err() {
+            return;
+        }
+        if !keep_alive {
+            return;
+        }
     }
-    let response = respond(&config, &request, &lan);
-    let _ = stream.write_all(&response);
+}
+
+/// HTTP/1.1 defaults to keep-alive unless the client opts out; HTTP/1.0 is the
+/// opposite unless the client opts in. Pipelining is not supported: the next
+/// request is read after the previous response is written.
+fn wants_keep_alive(request: &HttpRequest) -> bool {
+    let connection = request_header(request, "connection")
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let close = connection.split(',').any(|token| token.trim() == "close");
+    if close {
+        return false;
+    }
+    if request.version.eq_ignore_ascii_case("HTTP/1.0") {
+        return connection
+            .split(',')
+            .any(|token| token.trim() == "keep-alive");
+    }
+    true
+}
+
+fn keep_alive_response(mut response: Vec<u8>) -> Vec<u8> {
+    const CLOSE: &[u8] = b"Connection: close\r\n";
+    const KEEP: &[u8] = b"Connection: keep-alive\r\n";
+    if let Some(position) = response
+        .windows(CLOSE.len())
+        .position(|window| window == CLOSE)
+    {
+        response.splice(position..position + CLOSE.len(), KEEP.iter().copied());
+    }
+    response
 }
 
 /// Serve the two streaming UI endpoints before the buffered router. Returns
@@ -653,6 +703,7 @@ fn csrf_ok(request: &HttpRequest) -> bool {
 struct HttpRequest {
     method: String,
     path: String,
+    version: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
@@ -678,6 +729,12 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, Vec<u8>> {
 
     let request = http::parse(&buffer[..header_end + 4])
         .ok_or_else(|| error(400, "bad_request", "malformed request line"))?;
+    let version = std::str::from_utf8(&buffer[..header_end])
+        .ok()
+        .and_then(|head| head.lines().next())
+        .and_then(|line| line.split_whitespace().nth(2))
+        .unwrap_or("HTTP/1.1")
+        .to_string();
     let content_length = header(&request, "content-length")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
@@ -714,6 +771,7 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, Vec<u8>> {
     Ok(HttpRequest {
         method: request.method.to_string(),
         path: request.path.to_string(),
+        version,
         headers: request
             .headers
             .iter()
