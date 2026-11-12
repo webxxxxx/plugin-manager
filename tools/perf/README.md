@@ -32,21 +32,23 @@ start so `/mcp` works without root; LAN stays disabled.
 
 ## Coverage
 
-- HTTP: JSON/headers/length, 405 Allow, malformed request, chunked request
-  rejection, `Connection: close`
+- HTTP: JSON/headers/length, keep-alive, 405 Allow, malformed request, chunked
+  request rejection
 - MCP: modern `server/discover` / `tools/list` / `tools/call`, Bearer 401/403,
   missing `_meta`, and the official SDK over the stdio bridge
 - WebSocket: tools/call + notification, ping/pong/close, fragmentation,
   cross-origin 403, oversized close 1009
 - SSE: EventSource delivery and `Last-Event-ID` replay
-- Performance: HTTP/MCP list/call at concurrency 1/8/32, WS at 1/8/32
-  connections, SSE event throughput, 10s mixed workload, CPU/RSS sampling
+- Performance: HTTP/MCP list/call at concurrency 1/8/32 with a keep-alive agent,
+  WS at 1/8/32 connections, SSE event throughput, 10s mixed workload, CPU/RSS
+  sampling
 
 ## Notes
 
 - On Windows, CPU/RSS sampling uses PowerShell `Get-Process`; on other platforms
   the resource block is reported as unavailable.
 - The Python fixture adds interpreter and JSON overhead to MCP/WS/SSE calls.
-- HTTP uses `Connection: close`; each HTTP/MCP measurement includes TCP setup.
+- Compatibility HTTP checks use one-shot connections; performance workers use
+  HTTP/1.1 keep-alive, so their numbers include connection reuse.
 - Numbers are machine-specific and intended for relative comparison and
   bottleneck discovery, not as production capacity claims.

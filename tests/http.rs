@@ -316,6 +316,40 @@ fn read_raw_response(stream: &mut TcpStream) -> RawResponse {
     }
 }
 
+fn read_one_response(stream: &mut TcpStream) -> RawResponse {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).expect("response head");
+        head.push(byte[0]);
+    }
+    let text = String::from_utf8_lossy(&head);
+    let mut lines = text.lines();
+    let status = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .expect("status");
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_string(), value.trim().to_string()))
+        })
+        .collect();
+    let length = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body).expect("response body");
+    RawResponse {
+        status,
+        body,
+        headers,
+    }
+}
+
 fn raw_request_with(
     address: &str,
     method: &str,
@@ -2345,4 +2379,33 @@ fn plugin_ui_websocket_rejects_oversized_messages_with_1009() {
     let (opcode, payload) = ws_read(&mut ws);
     assert_eq!(opcode, 0x8);
     assert_eq!(u16::from_be_bytes([payload[0], payload[1]]), 1009);
+}
+
+#[test]
+fn http_keep_alive_serves_two_requests_on_one_connection() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let mut stream = TcpStream::connect(&address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+
+    let first = format!(
+        "GET /api/v1/services HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\n\r\n",
+        address
+    );
+    stream.write_all(first.as_bytes()).expect("first request");
+    let first = read_one_response(&mut stream);
+    assert_eq!(first.status, 200);
+    assert_eq!(raw_header_values(&first, "connection"), vec!["keep-alive"]);
+
+    let second = format!(
+        "GET /api/v1/services HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        address
+    );
+    stream.write_all(second.as_bytes()).expect("second request");
+    let second = read_one_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert_eq!(raw_header_values(&second, "connection"), vec!["close"]);
 }

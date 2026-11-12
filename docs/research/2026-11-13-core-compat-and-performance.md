@@ -4,6 +4,7 @@
 > 票：[#77](https://github.com/webxxxxx/plugin-manager/issues/77)
 > 脚本：`tools/perf/run.mjs`（Node，非 CI）
 > 原始数据：`target/perf-results.json` 与 `target/perf-report.md`（target 不入库）
+> 本报告保留优化前基线，并在下方记录 #79 的优化后复测。
 
 ## 环境
 
@@ -12,7 +13,7 @@
 | OS | Windows 11（10.0.26200），x86_64 |
 | CPU | 12th Gen Intel Core i7-1260P，12 核 / 16 逻辑处理器 |
 | 内存 | 16 GiB |
-| 构建 | `cargo build --release`，svcd `1,132,544 B` |
+| 构建 | `cargo build --release`，svcd `1,134,592 B` |
 | 客户端 | Node v20.11.1；`ws` 8.23.0；`eventsource` 2.0.2；MCP SDK 1.32.2 |
 | 插件 | Python 3.10 NDJSON echo agent（含 Python 编解码/调度开销） |
 | 网络 | 127.0.0.1，HTTP 无 TLS，端口由 daemon 动态分配 |
@@ -29,11 +30,12 @@
 
 所有数字是本机单次 release 运行；不是生产压测，也未覆盖 TLS、真实网络、多机或长时间 soak。
 
-## 兼容性结果：18/18 通过
+## 兼容性结果：19/19 通过（优化后）
 
 | 检查 | 结果 | 观察 |
 | --- | --- | --- |
 | HTTP `GET /api/v1/services` | PASS | 200、JSON、Content-Length 匹配、`Connection: close` |
+| HTTP keep-alive 同连接两次请求 | PASS | 两个 200，响应 `Connection: keep-alive` |
 | HTTP 405 | PASS | 带 `Allow: GET` 与 JSON error |
 | HTTP 畸形请求 | PASS | 400 |
 | HTTP `Transfer-Encoding: chunked` 请求体 | PASS | 4xx 拒绝 |
@@ -54,11 +56,11 @@
 ### 兼容性边界
 
 - `/mcp` 是 **modern-only（2026-07-28）**；官方 SDK 1.32.2 的 Streamable HTTP 客户端面向较早的 session/SSE 语义，未作为 HTTP 客户端通过；它的 **stdio legacy 桥**已验证通过。HTTP modern 面用脚本内的协议客户端逐项验证。
-- HTTP 明确拒绝 chunked 请求体、每个响应 `Connection: close`；不支持 keep-alive、TLS、HTTP/2。
+- HTTP 明确拒绝 chunked 请求体；支持 HTTP/1.1 keep-alive 与显式 `Connection: close`；不支持 TLS、HTTP/2、pipelining。
 - WebSocket 只支持文本帧、无压缩、无子协议；二进制帧 close 1003，超大消息 close 1009。
 - SSE 是 server→UI；上行仍走 `POST /rpc`。
 
-## 分项性能
+## 分项性能（优化前基线）
 
 ### 启动与安装
 
@@ -125,23 +127,45 @@
 | daemon | 0.00 → 34.69 | 6,377,472 → 8,679,424 |
 | plugin | 0.00 → 0.00（Python 子进程未单独计入） | 7,675,904 → 7,630,848 |
 
-daemon 在 10s 混合负载内消耗约 34.7 秒 CPU（约 3.5 个逻辑核，峰值的 22% 左右），RSS 峰值约 8.7 MiB；没有错误。
+daemon 在 10s 混合负载内消耗约 34.7 秒 CPU（约 3.5 个逻辑核，峰值的 22% 左右），RSS 峰值约 8.7 MB；没有错误。
 
-## 结论与瓶颈
+## 优化后复测（#79）
+
+已实施的三个改动：
+
+- `src/api.rs`：accept 轮询 20ms → 1ms。
+- `src/daemon.rs`：事件循环 50ms → 1ms；Windows 下 `timeBeginPeriod(1)`，避免 1ms 睡眠被系统 15.6ms 定时器粒度放大。
+- HTTP/1.1 keep-alive：`/api/v1` 与 `/mcp` 在同一连接顺序处理多个请求；`Connection: close` 仍可显式关闭；WS/SSE 仍独占连接。
+
+| 场景 | 优化前 | 优化后 |
+| --- | ---: | ---: |
+| HTTP c1 RPS / p50 | 47.9 / 20.9ms | **2,343.5 / 0.42ms** |
+| HTTP c32 RPS / p95 | 895 / 81.4ms | **4,255 / 24.8ms** |
+| MCP list c32 RPS | 919.7 | **3,697.9** |
+| MCP call c1 RPS / p50 | 14.4 / 65.0ms | **565.6 / 1.66ms** |
+| WS 1 连接 RPS / p50 | 15.7 / 64.2ms | **350.9 / 3.08ms** |
+| WS 8 连接 RPS | 819.7 | **2,489.8** |
+| SSE 事件/秒 | 14.6 | **209.7** |
+| 10s 混合 RPS | 607.8 | **3,407.7** |
+| 兼容性 | 18/18 | **19/19** |
+| daemon RSS（混合后） | 8.7 MB | 9.8 MB |
+
+高并发下的 p99 仍是长尾（HTTP c32 124ms、MCP call c32 147ms、WS 32 连接 57ms），主要来自 thread-per-connection 的调度和突发连接；下一步再评估连接池/线程池。
+
+## 优化前瓶颈
 
 1. **单连接 HTTP 延迟被 20ms 的 accept 轮询限制。** `src/api.rs` 的 listener loop 在每次 accept 尝试后 `sleep(20ms)`，单请求 p50 稳定在约 20.9ms，单连接只有约 48 RPS。并发高时内核 backlog 暂时吸收连接，RPS 能到约 900，但 p95 上升到 80ms 左右。
 2. **插件调用的 50ms 事件循环进一步抬高延迟。** `src/daemon.rs` 的 event loop 用 `recv_timeout(50ms)`；MCP tools/call、WS tools/call、SSE 触发都经过它，单次 p50 约 65ms（20ms accept + 最多 50ms 轮询）。并发高时 WS 因为长连接不复用 accept 成本，8 连接就能到约 820 RPS。
 3. **SSE 的 14.6 事件/秒是逐次 POST 造成的，不是 SSE 本身。** 每个事件都要走一次新的 HTTP 连接 + 50ms daemon 轮询；持续推送场景应使用插件的定时通知，而不是每次请求触发。
 4. **MCP modern 协议面工作正常；官方 SDK 的 HTTP 客户端时代不匹配，stdio legacy 兼容良好。**
-5. **资源占用很小**：daemon RSS 约 8.7 MiB，Python 插件约 7.6 MiB；二进制 1.13 MB（Windows）/1.36 MB（musl），仍在门禁内。
+5. **资源占用很小**：daemon RSS 约 8.7 MB，Python 插件约 7.6 MB；二进制 1.13 MB（Windows）/1.36 MB（musl），仍在门禁内。
 
-## 建议
+## 已实施与后续
 
-- **P0**：把 `src/api.rs` 的 accept 循环从「非阻塞 accept + 20ms sleep」改成阻塞 accept + rebind 唤醒通道（或 poll），单连接 HTTP/MCP 延迟目标 < 2ms。
-- **P0**：把 `src/daemon.rs` 的 50ms 轮询改成更短 tick 或 condvar/eventfd；插件调用 p50 目标 < 5ms。
-- **P1**：为 HTTP 管理 API 与 `/mcp` 加 keep-alive；当前每请求 TCP 建连会放大延迟。
-- **P1**：性能基线使用 native 插件（Rust/C）+ mock 上游，把 Python 开销与核心开销分开；本次数字已够做相对比较，不适合作为绝对上限。
-- **P2**：性能脚本保留为非 CI 工具；如果要防回归，另建 nightly 或专门 runner，不要塞进普通 `cargo test`。
+- **已实施 P0/P0/P1**：accept 1ms 轮询、daemon 1ms tick + Windows timer resolution、HTTP keep-alive。
+- **后续 P1**：性能基线使用 native 插件（Rust/C）+ mock 上游，把 Python 开销与核心开销分开；本次数字已够做相对比较，不适合作为绝对上限。
+- **后续 P2**：评估 p99 长尾（连接池/线程池/accept burst）；如果要防回归，另建 nightly 或专门 runner，不要塞进普通 `cargo test`。
+- **不属于本票**：TLS、HTTP/2、pipelining、WS 压缩。
 
 ## 复现
 
@@ -154,3 +178,10 @@ node tools/perf/run.mjs --all
 ```
 
 报告与 JSON 写到 `target/perf-report.md`、`target/perf-results.json`。
+
+## 备注
+
+- 优化前的单次测量默认 `Connection: close`；优化后的 HTTP/MCP 性能使用 keep-alive，兼容性用例保留 one-shot 检查。
+- MCP Streamable HTTP 是 modern-only（2026-07-28），每次 POST 一个 JSON 响应。
+- Python 插件给 MCP/WS/SSE 调用路径增加了 JSON 编解码和解释器调度开销。
+- 数字来自一台 Windows 机器，不是生产压测；Windows timer resolution 是进程/系统级设置，功耗敏感场景需重新评估。

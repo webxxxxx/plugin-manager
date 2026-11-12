@@ -95,6 +95,8 @@ pub fn run() -> i32 {
 
     let mut daemon = Daemon::new(loaded.registry, token, rx, api);
     install_shutdown_signal();
+    #[cfg(windows)]
+    let _timer = TimerResolution::acquire();
     daemon.start_enabled();
     daemon.event_loop();
     notify_systemd("STOPPING=1");
@@ -122,6 +124,31 @@ fn notify_systemd(state: &str) {
 
 #[cfg(not(unix))]
 fn notify_systemd(_state: &str) {}
+
+#[cfg(windows)]
+struct TimerResolution;
+
+#[cfg(windows)]
+impl TimerResolution {
+    fn acquire() -> Self {
+        // Windows rounds short sleeps up to the 15.6ms system timer by
+        // default. The daemon's 1ms tick and the HTTP accept poll need a finer
+        // granularity to keep control-plane latency low.
+        unsafe {
+            windows_sys::Win32::Media::timeBeginPeriod(1);
+        }
+        TimerResolution
+    }
+}
+
+#[cfg(windows)]
+impl Drop for TimerResolution {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Media::timeEndPeriod(1);
+        }
+    }
+}
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -257,7 +284,7 @@ impl Daemon {
             if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
                 self.shutdown = true;
             }
-            match self.rx.recv_timeout(Duration::from_millis(50)) {
+            match self.rx.recv_timeout(Duration::from_millis(1)) {
                 Ok(incoming) => self.handle(incoming),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,

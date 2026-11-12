@@ -30,6 +30,7 @@ const SVCD = path.join(ROOT, 'target', 'release', 'svcd' + EXE);
 const KEY = path.join(ROOT, 'samples', 'keys', 'sample-2026.key');
 const PUB = path.join(ROOT, 'samples', 'keys', 'sample-2026.pub');
 const KEY_ID = 'sample-2026';
+const KEEP_ALIVE_AGENT = new http.Agent({ keepAlive: true, maxSockets: 128 });
 
 function log(message) {
   console.log('[perf] ' + message);
@@ -58,10 +59,15 @@ function ensureKey() {
   assert.ok(existsSync(KEY), 'missing sample key: ' + KEY);
 }
 
-function httpRequest(address, method, urlPath, headers, body, timeoutMs) {
+function httpRequest(address, method, urlPath, headers, body, timeoutMs, keepAlive) {
   return new Promise(function (resolve, reject) {
     const url = new URL('http://' + address);
-    const mergedHeaders = Object.assign({ Connection: 'close' }, headers || {});
+    const mergedHeaders = Object.assign({}, headers || {});
+    if (!keepAlive) {
+      mergedHeaders.Connection = 'close';
+    } else if (!mergedHeaders.Connection) {
+      mergedHeaders.Connection = 'keep-alive';
+    }
     if (body && mergedHeaders['Content-Length'] === undefined && mergedHeaders['content-length'] === undefined) {
       mergedHeaders['Content-Length'] = Buffer.byteLength(body);
     }
@@ -71,6 +77,7 @@ function httpRequest(address, method, urlPath, headers, body, timeoutMs) {
       method: method,
       path: urlPath,
       headers: mergedHeaders,
+      agent: keepAlive ? KEEP_ALIVE_AGENT : false,
     };
     const request = http.request(options, function (response) {
       const chunks = [];
@@ -269,10 +276,10 @@ function mcpPayload(method, params, id, name) {
   return { request: request, headers: headers };
 }
 
-async function mcpPost(daemon, token, method, params, id, name) {
+async function mcpPost(daemon, token, method, params, id, name, keepAlive) {
   const payload = mcpPayload(method, params, id, name);
   payload.headers.Authorization = 'Bearer ' + token;
-  const response = await httpRequest(daemon.address, 'POST', '/mcp', payload.headers, JSON.stringify(payload.request), 10000);
+  const response = await httpRequest(daemon.address, 'POST', '/mcp', payload.headers, JSON.stringify(payload.request), 10000, keepAlive);
   return { status: response.status, json: parseJson(response) };
 }
 
@@ -410,6 +417,17 @@ async function runCompat(daemon, token) {
     const body = parseJson(response);
     assert.ok(Array.isArray(body.services));
     return body.services.length + ' services';
+  });
+
+
+  await check('HTTP keep-alive serves two requests on one connection', async function () {
+    const first = await httpRequest(daemon.address, 'GET', '/api/v1/services', {}, null, 5000, true);
+    assert.equal(first.status, 200);
+    assert.equal(String(first.headers.connection).toLowerCase(), 'keep-alive');
+    const second = await httpRequest(daemon.address, 'GET', '/api/v1/services', {}, null, 5000, true);
+    assert.equal(second.status, 200);
+    assert.equal(String(second.headers.connection).toLowerCase(), 'keep-alive');
+    return 'two responses on one keep-alive connection';
   });
 
   await check('HTTP 405 carries Allow and JSON error', async function () {
@@ -619,7 +637,7 @@ async function benchHttp(daemon, pathName, total, concurrency) {
       if (index >= total) return;
       const begin = performance.now();
       try {
-        const response = await httpRequest(daemon.address, 'GET', pathName, {}, null, 10000);
+        const response = await httpRequest(daemon.address, 'GET', pathName, {}, null, 10000, true);
         if (response.status !== 200) errors++;
       } catch (_) {
         errors++;
@@ -644,7 +662,7 @@ async function benchMcp(daemon, token, method, name, total, concurrency) {
       const begin = performance.now();
       try {
         const params = method === 'tools/call' ? { name: name, arguments: {} } : {};
-        const response = await mcpPost(daemon, token, method, params, 1000 + index, method === 'tools/call' ? name : null);
+        const response = await mcpPost(daemon, token, method, params, 1000 + index, method === 'tools/call' ? name : null, true);
         if (response.status !== 200 || !response.json.result) errors++;
       } catch (_) {
         errors++;
@@ -726,7 +744,7 @@ async function benchMixed(daemon, token, durationSeconds) {
     while (Date.now() < end) {
       const begin = performance.now();
       try {
-        const response = await httpRequest(daemon.address, 'GET', '/api/v1/services', {}, null, 10000);
+        const response = await httpRequest(daemon.address, 'GET', '/api/v1/services', {}, null, 10000, true);
         if (response.status !== 200) errors++; else ops.http++;
       } catch (_) { errors++; }
       latencies.http.push(performance.now() - begin);
@@ -737,7 +755,7 @@ async function benchMixed(daemon, token, durationSeconds) {
     while (Date.now() < end) {
       const begin = performance.now();
       try {
-        const response = await mcpPost(daemon, token, 'tools/list', {}, id++, null);
+        const response = await mcpPost(daemon, token, 'tools/list', {}, id++, null, true);
         if (response.status !== 200 || !response.json.result) errors++; else ops.mcp++;
       } catch (_) { errors++; }
       latencies.mcp.push(performance.now() - begin);
@@ -921,7 +939,7 @@ function renderReport(results) {
   }
   lines.push('## Notes');
   lines.push('');
-  lines.push('- HTTP responses use Connection: close; each measurement includes TCP setup.');
+  lines.push('- Compatibility HTTP checks use one-shot connections; performance HTTP/MCP workers use HTTP/1.1 keep-alive.');
   lines.push('- MCP Streamable HTTP is modern-only (2026-07-28), one JSON response per POST.');
   lines.push('- The Python plugin adds JSON encode/decode and interpreter scheduling overhead to MCP/WS/SSE call paths.');
   lines.push('- Numbers are from one Windows machine, not a production benchmark.');
@@ -1009,6 +1027,7 @@ async function main() {
     }
   } finally {
     await stopDaemon(daemon);
+    KEEP_ALIVE_AGENT.destroy();
   }
 }
 
