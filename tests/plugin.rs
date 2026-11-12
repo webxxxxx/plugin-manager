@@ -221,9 +221,13 @@ fn script() -> (&'static str, Vec<u8>) {
 }
 
 fn package(key: &SigningKey, version: &str) -> Vec<u8> {
+    package_config(key, version, b"{}")
+}
+
+fn package_config(key: &SigningKey, version: &str, config: &[u8]) -> Vec<u8> {
     let (name, data) = script();
     let path = format!("payload/bin/{}", name);
-    let config = b"{}".to_vec();
+    let config = config.to_vec();
     let files = vec![
         json!({
             "path": path,
@@ -292,6 +296,30 @@ fn padding(size: usize) -> usize {
     } else {
         512 - remainder
     }
+}
+
+fn tar_names(bytes: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut offset = 0;
+    while offset + 512 <= bytes.len() {
+        let header = &bytes[offset..offset + 512];
+        if header.iter().all(|byte| *byte == 0) {
+            break;
+        }
+        let end = header[..100]
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(100);
+        names.push(String::from_utf8_lossy(&header[..end]).to_string());
+        let size = std::str::from_utf8(&header[124..135])
+            .ok()
+            .and_then(|value| {
+                usize::from_str_radix(value.trim_matches(char::from(0)).trim(), 8).ok()
+            })
+            .unwrap_or(0);
+        offset += 512 + size + padding(size);
+    }
+    names
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -575,4 +603,73 @@ fn running_upgrade_keeps_old_until_restart_and_replace_stops_first() {
     assert!(!plugin.join("1.0.0").is_dir());
     let stopped = sandbox.run_plugin(&["status", "demo", "--json"]);
     assert_eq!(json(&stopped)["summary"]["state"], "stopped");
+}
+
+#[test]
+fn config_flow_copies_prints_exports_and_preserves_on_upgrade() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[14u8; 32]);
+    sandbox.write_key(&key);
+    let v1 = sandbox.write_package("demo-1.0.0.spk", &package_config(&key, "1.0.0", b"one"));
+    let v2 = sandbox.write_package("demo-1.1.0.spk", &package_config(&key, "1.1.0", b"two"));
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    assert_eq!(
+        sandbox
+            .run_plugin(&["install", v1.to_str().expect("utf8")])
+            .status
+            .code(),
+        Some(0)
+    );
+    let plugin = sandbox.data.join("plugins").join("demo");
+    assert_eq!(fs::read(plugin.join("config")).expect("config"), b"one");
+
+    let printed = sandbox.run_plugin(&["editconfig", "demo", "--print"]);
+    assert_eq!(printed.status.code(), Some(0), "{}", stderr(&printed));
+    assert_eq!(&printed.stdout, b"one");
+
+    let config_out = sandbox.root.join("demo.config");
+    let exported = sandbox.run_plugin(&[
+        "export",
+        "demo",
+        "--config-only",
+        "--out",
+        config_out.to_str().expect("utf8"),
+    ]);
+    assert_eq!(exported.status.code(), Some(0), "{}", stderr(&exported));
+    assert_eq!(fs::read(&config_out).expect("config export"), b"one");
+
+    let full_out = sandbox.root.join("demo.spkb");
+    let full = sandbox.run_plugin(&["export", "demo", "--out", full_out.to_str().expect("utf8")]);
+    assert_eq!(full.status.code(), Some(0), "{}", stderr(&full));
+    let names = tar_names(&fs::read(&full_out).expect("spkb"));
+    assert_eq!(names.first().map(String::as_str), Some("backup.json"));
+    assert!(names.iter().any(|name| name == "plugin.spk"), "{names:?}");
+    assert!(names.iter().any(|name| name == "config"), "{names:?}");
+
+    assert_eq!(
+        sandbox
+            .run_plugin(&["install", v2.to_str().expect("utf8")])
+            .status
+            .code(),
+        Some(0)
+    );
+    assert_eq!(fs::read(plugin.join("config")).expect("config"), b"one");
+    assert_eq!(
+        fs::read(plugin.join("config.new")).expect("config.new"),
+        b"two"
+    );
+
+    let imported = sandbox.run_plugin(&["import", full_out.to_str().expect("utf8"), "--no-config"]);
+    assert_eq!(imported.status.code(), Some(0), "{}", stderr(&imported));
+    assert_eq!(
+        fs::read_to_string(plugin.join("current")).expect("current"),
+        "1.0.0"
+    );
+
+    let core = sandbox.run_plugin(&["export", "svc"]);
+    assert_eq!(core.status.code(), Some(1));
+
+    let spk = sandbox.run_plugin(&["import", v1.to_str().expect("utf8"), "--force"]);
+    assert_eq!(spk.status.code(), Some(0), "{}", stderr(&spk));
 }
