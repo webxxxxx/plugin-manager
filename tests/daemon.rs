@@ -2,18 +2,25 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
+use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 struct Sandbox {
     root: PathBuf,
     config: PathBuf,
+    data: PathBuf,
     logs: PathBuf,
+    trust: PathBuf,
     svcd: PathBuf,
     svc: PathBuf,
+    plugin: PathBuf,
     daemon: Option<Child>,
     daemon_stderr: PathBuf,
 }
@@ -31,24 +38,28 @@ impl Sandbox {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let config = root.join("config");
+        let data = root.join("data");
         let logs = root.join("logs");
+        let trust = config.join("trust.d");
         fs::create_dir_all(config.join("services.d")).expect("create sandbox");
+        fs::create_dir_all(&data).expect("create data");
         fs::create_dir_all(&logs).expect("create logs");
+        fs::create_dir_all(&trust).expect("create trust.d");
 
         let binary = env!("CARGO_BIN_EXE_svcd");
-        let (svcd_name, svc_name) = if cfg!(windows) {
-            ("svcd.exe", "svc.exe")
+        let (svcd_name, svc_name, plugin_name) = if cfg!(windows) {
+            ("svcd.exe", "svc.exe", "plugin.exe")
         } else {
-            ("svcd", "svc")
+            ("svcd", "svc", "plugin")
         };
         let svcd = root.join(svcd_name);
         let svc = root.join(svc_name);
-        fs::copy(binary, &svcd).expect("copy svcd");
-        fs::copy(binary, &svc).expect("copy svc");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for path in [&svcd, &svc] {
+        let plugin = root.join(plugin_name);
+        for path in [&svcd, &svc, &plugin] {
+            fs::copy(binary, path).expect("copy multicall");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(path, fs::Permissions::from_mode(0o755))
                     .expect("chmod multicall");
             }
@@ -58,9 +69,12 @@ impl Sandbox {
             daemon_stderr: root.join("daemon.stderr"),
             root,
             config,
+            data,
             logs,
+            trust,
             svcd,
             svc,
+            plugin,
             daemon: None,
         }
     }
@@ -292,36 +306,54 @@ impl Sandbox {
         }
     }
 
+    fn env(&self, command: &mut Command) {
+        command
+            .env("SVCD_CONFIG_DIR", &self.config)
+            .env("SVCD_DATA_DIR", &self.data)
+            .env("SVCD_LOG_DIR", &self.logs)
+            .env("SVCD_TRUST_DIR", &self.trust)
+            .env("SVCD_TEST_UNPRIVILEGED", "1");
+    }
+
     fn start_daemon(&mut self) {
         let stderr = fs::File::create(&self.daemon_stderr).expect("create daemon log");
-        let child = Command::new(&self.svcd)
+        let mut command = Command::new(&self.svcd);
+        command
             .args(["run", "--foreground"])
-            .env("SVCD_CONFIG_DIR", &self.config)
-            .env("SVCD_LOG_DIR", &self.logs)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .expect("spawn daemon");
-        self.daemon = Some(child);
+            .stderr(Stdio::from(stderr));
+        self.env(&mut command);
+        self.daemon = Some(command.spawn().expect("spawn daemon"));
     }
 
     fn run_svc(&self, args: &[&str]) -> Output {
-        Command::new(&self.svc)
-            .args(args)
-            .env("SVCD_CONFIG_DIR", &self.config)
-            .env("SVCD_LOG_DIR", &self.logs)
-            .output()
-            .expect("run svc")
+        let mut command = Command::new(&self.svc);
+        command.args(args);
+        self.env(&mut command);
+        command.output().expect("run svc")
     }
 
     fn run_svcd(&self, args: &[&str]) -> Output {
-        Command::new(&self.svcd)
-            .args(args)
-            .env("SVCD_CONFIG_DIR", &self.config)
-            .env("SVCD_LOG_DIR", &self.logs)
-            .output()
-            .expect("run svcd")
+        let mut command = Command::new(&self.svcd);
+        command.args(args);
+        self.env(&mut command);
+        command.output().expect("run svcd")
+    }
+
+    fn run_plugin(&self, args: &[&str]) -> Output {
+        let mut command = Command::new(&self.plugin);
+        command.args(args);
+        self.env(&mut command);
+        command.output().expect("run plugin")
+    }
+
+    /// Kill the daemon without a shutdown RPC, as an OS crash or kill -9 would.
+    fn force_kill_daemon(&mut self) {
+        if let Some(mut child) = self.daemon.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     fn start_when_ready(&self, id: &str) -> Output {
@@ -753,4 +785,679 @@ fn a_drop_in_script_is_discovered_and_supervised() {
     let value: Value = serde_json::from_slice(&status.stdout).expect("status json");
     assert_eq!(value["details"]["probe"], "ok");
     wait_for_marker(&marker, "status");
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle matrix fixtures: all three service sources, crash control and PIDs.
+// ---------------------------------------------------------------------------
+
+fn target() -> &'static str {
+    if cfg!(all(windows, target_arch = "x86_64")) {
+        "x86_64-pc-windows-msvc"
+    } else if cfg!(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "musl"
+    )) {
+        "x86_64-unknown-linux-musl"
+    } else if cfg!(all(
+        target_os = "linux",
+        target_arch = "aarch64",
+        target_env = "musl"
+    )) {
+        "aarch64-unknown-linux-musl"
+    } else if cfg!(all(
+        target_os = "linux",
+        target_arch = "arm",
+        target_env = "musl"
+    )) {
+        "armv7-unknown-linux-musleabihf"
+    } else {
+        "x86_64-unknown-linux-gnu"
+    }
+}
+
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let output = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/NH", "/FO", "CSV"])
+            .output()
+            .expect("tasklist");
+        String::from_utf8_lossy(&output.stdout).contains(&format!("\"{}\"", pid))
+    }
+    #[cfg(unix)]
+    {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+}
+
+fn kill_pid(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output();
+    }
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    }
+}
+
+fn wait_until(label: &str, timeout: Duration, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if condition() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {label}");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Build a signed .spk. Kept local so the lifecycle tests own their plugin fixture.
+fn signed_package(
+    key: &SigningKey,
+    mut manifest: Value,
+    files: &[(String, Vec<u8>, u32)],
+) -> Vec<u8> {
+    manifest["files"] = json!(files
+        .iter()
+        .map(|(path, data, mode)| json!({
+            "path": path,
+            "size": data.len(),
+            "sha256": hex_sha256(data),
+            "mode": mode
+        }))
+        .collect::<Vec<Value>>());
+    let manifest = serde_json::to_vec(&manifest).expect("manifest");
+    let signature =
+        json!({"alg":"ed25519","keyId":"test","sig":BASE64.encode(key.sign(&manifest).to_bytes())});
+    let signature = serde_json::to_vec(&signature).expect("signature");
+    let mut tar = Vec::new();
+    tar.extend_from_slice(&header("manifest.json", manifest.len(), 0o644));
+    tar.extend_from_slice(&manifest);
+    tar.extend(std::iter::repeat_n(0, padding(manifest.len())));
+    tar.extend_from_slice(&header("signature.json", signature.len(), 0o644));
+    tar.extend_from_slice(&signature);
+    tar.extend(std::iter::repeat_n(0, padding(signature.len())));
+    for (path, data, mode) in files {
+        tar.extend_from_slice(&header(path, data.len(), *mode));
+        tar.extend_from_slice(data);
+        tar.extend(std::iter::repeat_n(0, padding(data.len())));
+    }
+    tar.extend(std::iter::repeat_n(0, 1024));
+    tar
+}
+
+fn header(path: &str, size: usize, mode: u32) -> [u8; 512] {
+    let mut header = [0u8; 512];
+    header[..path.len()].copy_from_slice(path.as_bytes());
+    let mode = format!("{:07o}", mode);
+    header[100..100 + mode.len()].copy_from_slice(mode.as_bytes());
+    let size = format!("{:011o}", size);
+    header[124..124 + size.len()].copy_from_slice(size.as_bytes());
+    header[156] = b'0';
+    header[257..263].copy_from_slice(b"ustar\0");
+    header[263..265].copy_from_slice(b"00");
+    header
+}
+
+fn padding(size: usize) -> usize {
+    let remainder = size % 512;
+    if remainder == 0 {
+        0
+    } else {
+        512 - remainder
+    }
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{:02x}", byte);
+    }
+    out
+}
+
+fn pem_from_public(key: &[u8; 32]) -> Vec<u8> {
+    const PREFIX: [u8; 12] = [
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+    let mut der = PREFIX.to_vec();
+    der.extend_from_slice(key);
+    let body = BASE64.encode(der);
+    let mut pem = String::from("-----BEGIN PUBLIC KEY-----\n");
+    for chunk in body.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(chunk).expect("base64"));
+        pem.push('\n');
+    }
+    pem.push_str("-----END PUBLIC KEY-----\n");
+    pem.into_bytes()
+}
+
+impl Sandbox {
+    /// A notify-mode agent: answers every stdin frame with its request id and
+    /// exits on stdin EOF (the polite-stop path). Used for core JSON and plugin.
+    fn write_agent(&self) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let path = self.root.join("agent.ps1");
+            let script = r#"$ErrorActionPreference = 'Stop'
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+  if ($line -notmatch '"id"\s*:\s*(\d+)') { continue }
+  $requestId = [int]$Matches[1]
+  [Console]::Out.WriteLine('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"ok":true}}')
+  [Console]::Out.Flush()
+}
+"#;
+            fs::write(&path, script).expect("write agent");
+            path
+        }
+        #[cfg(unix)]
+        {
+            let path = self.root.join("agent.sh");
+            let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  if [ -z "$id" ]; then continue; fi
+  printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+done
+"#;
+            fs::write(&path, script).expect("write agent");
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod agent");
+            path
+        }
+    }
+
+    /// A core service declared as services.d/<id>.json (ready = notify).
+    fn write_core_json(&self, id: &str) {
+        let agent = self.write_agent();
+        #[cfg(windows)]
+        let exec = json!({
+            "path": r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", agent.to_string_lossy()],
+            "ready": "notify"
+        });
+        #[cfg(unix)]
+        let exec = json!({
+            "path": "/bin/sh",
+            "args": [agent.to_string_lossy()],
+            "ready": "notify"
+        });
+        let definition = json!({
+            "schema": 1,
+            "id": id,
+            "version": "1.0.0",
+            "desc": "lifecycle core",
+            "protocol": 1,
+            "exec": exec
+        });
+        fs::write(
+            self.config.join("services.d").join(format!("{}.json", id)),
+            serde_json::to_vec_pretty(&definition).expect("definition"),
+        )
+        .expect("write definition");
+    }
+
+    /// A drop-in script service that ignores stdin (ready = Exec) and exits when
+    /// its stop action writes a sidecar file, so stops are fast on Windows too.
+    fn write_stop_script(&self, id: &str) {
+        #[cfg(windows)]
+        {
+            let path = self.config.join("services.d").join(format!("{}.ps1", id));
+            let script = r#"param([string]$Action = $env:SVCD_ACTION)
+$name = [IO.Path]::GetFileNameWithoutExtension($PSCommandPath)
+$stopFile = Join-Path $PSScriptRoot ($name + '.stop')
+switch ($Action) {
+  'start' {
+    Remove-Item $stopFile -Force -ErrorAction SilentlyContinue
+    while (-not (Test-Path $stopFile)) { Start-Sleep -Milliseconds 100 }
+    Remove-Item $stopFile -Force -ErrorAction SilentlyContinue
+  }
+  'stop' { Set-Content -Path $stopFile -Value 'stop' }
+  'status' { exit 0 }
+  default { exit 64 }
+}
+"#;
+            fs::write(&path, script).expect("write script service");
+        }
+        #[cfg(unix)]
+        {
+            let path = self.config.join("services.d").join(format!("{}.sh", id));
+            let script = r#"#!/bin/sh
+dir=$(dirname "$0")
+name=$(basename "$0" .sh)
+stopfile="$dir/$name.stop"
+action="$1"
+if [ -z "$action" ]; then action="$SVCD_ACTION"; fi
+case "$action" in
+  start)
+    rm -f "$stopfile"
+    while [ ! -f "$stopfile" ]; do sleep 0.1; done
+    rm -f "$stopfile"
+    ;;
+  stop) : > "$stopfile" ;;
+  status) exit 0 ;;
+  *) exit 64 ;;
+esac
+"#;
+            fs::write(&path, script).expect("write script service");
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod script");
+        }
+    }
+
+    /// Write the trust root and a signed plugin .spk; returns the package path.
+    fn write_plugin_package(&self, id: &str) -> PathBuf {
+        let key = SigningKey::from_bytes(&[0x5au8; 32]);
+        fs::write(
+            self.trust.join("test.pub"),
+            pem_from_public(&key.verifying_key().to_bytes()),
+        )
+        .expect("trust key");
+        let agent = self.write_agent();
+        let exec_path = if cfg!(windows) {
+            "payload/bin/agent.ps1".to_string()
+        } else {
+            "payload/bin/agent.sh".to_string()
+        };
+        let agent_bytes = fs::read(&agent).expect("read agent");
+        let files = vec![(exec_path.clone(), agent_bytes, 0o755)];
+        let manifest = json!({
+            "schema": 1,
+            "name": id,
+            "version": "1.0.0",
+            "desc": "lifecycle plugin",
+            "platform": target(),
+            "protocol": 1,
+            "exec": {"path": exec_path, "args": [], "ready": "notify"},
+            "capabilities": [
+                {"name": "echo", "desc": "echo", "inputSchema": {"type": "object"}}
+            ]
+        });
+        let package = signed_package(&key, manifest, &files);
+        let path = self.root.join(format!("{}.spk", id));
+        fs::write(&path, package).expect("write spk");
+        path
+    }
+
+    /// Install a package through the daemon (the plugin multicall entry).
+    fn install_plugin(&self, id: &str, package: &Path) {
+        let output =
+            self.run_when_ready_plugin(&["install", package.to_str().expect("package path")]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "install {}: {}",
+            id,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn run_when_ready_plugin(&self, args: &[&str]) -> Output {
+        for _ in 0..200 {
+            let output = self.run_plugin(args);
+            if output.status.code() != Some(2) {
+                return output;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("daemon never became reachable; log:\n{}", self.daemon_log());
+    }
+
+    fn wait_for_state(&self, id: &str, expected: &str, timeout: Duration) -> Value {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let status = self.status(id);
+            if status["summary"]["state"].as_str() == Some(expected) {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} never reached {}: {}",
+                id,
+                expected,
+                status
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn start_service(&self, id: &str) -> Value {
+        let output = self.start_when_ready(id);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "start {}: {}",
+            id,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        self.wait_for_state(id, "running", Duration::from_secs(10))
+    }
+
+    fn stop_service(&self, id: &str) -> Value {
+        let output = self.stop(id);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stop {}: {}",
+            id,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        self.wait_for_state(id, "stopped", Duration::from_secs(15))
+    }
+
+    fn wait_for_restart(&self, id: &str, old_pid: u64, timeout: Duration) -> Value {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let status = self.status(id);
+            let pid = status["summary"]["pid"].as_u64().unwrap_or(0);
+            if status["summary"]["state"].as_str() == Some("running") && pid != old_pid && pid > 0 {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} did not restart after pid {}: {}",
+                id,
+                old_pid,
+                status
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn running_pid(&self, id: &str) -> u32 {
+        let status = self.start_service(id);
+        status["summary"]["pid"].as_u64().expect("pid") as u32
+    }
+}
+
+// ---------------------------------------------------------------------------
+// State matrix, crash restart and svcd crash coverage.
+// ---------------------------------------------------------------------------
+
+fn assert_state_matrix(sandbox: &Sandbox, id: &str, kind: &str, boot_started: bool) {
+    let running = if boot_started {
+        // Enabled services are started by the daemon at boot.
+        sandbox.wait_for_state(id, "running", Duration::from_secs(15))
+    } else {
+        let initial = sandbox.status(id);
+        assert_eq!(initial["summary"]["state"], "stopped", "{initial}");
+        assert!(initial["summary"]["pid"].is_null(), "{initial}");
+        sandbox.start_service(id)
+    };
+    let pid = running["summary"]["pid"].as_u64().expect("pid");
+    assert!(pid > 0);
+    assert_eq!(running["summary"]["kind"], kind, "{running}");
+    assert_eq!(running["summary"]["enabled"], true, "{running}");
+    assert_eq!(running["details"]["restart"], "on-failure", "{running}");
+    assert_eq!(running["details"]["failures"], 0, "{running}");
+    assert_eq!(running["summary"]["state"], "running");
+
+    // Start is idempotent while running: same pid, still one instance.
+    let again = sandbox.start_when_ready(id);
+    assert_eq!(again.status.code(), Some(0));
+    let same = sandbox.status(id);
+    assert_eq!(same["summary"]["state"], "running");
+    assert_eq!(same["summary"]["pid"].as_u64(), Some(pid));
+
+    // Stop is synchronous, idempotent, and reaps the process.
+    let stopped = sandbox.stop_service(id);
+    assert!(stopped["summary"]["pid"].is_null(), "{stopped}");
+    assert!(!pid_alive(pid as u32), "stopped pid {pid} is still alive");
+    assert_eq!(sandbox.stop(id).status.code(), Some(0));
+    assert_eq!(sandbox.status(id)["summary"]["state"], "stopped");
+
+    // Explicit start works from Stopped.
+    let restarted = sandbox.start_service(id);
+    assert_eq!(restarted["summary"]["state"], "running");
+
+    // disable flips the boot/crash-restart flag but keeps the process running.
+    assert_eq!(
+        sandbox.run_when_ready(&["disable", id]).status.code(),
+        Some(0)
+    );
+    assert_eq!(sandbox.status(id)["summary"]["enabled"], false);
+    assert_eq!(sandbox.status(id)["summary"]["state"], "running");
+    sandbox.stop_service(id);
+
+    // A disabled service can still be started explicitly.
+    sandbox.start_service(id);
+    assert_eq!(sandbox.status(id)["summary"]["enabled"], false);
+    sandbox.stop_service(id);
+    assert_eq!(
+        sandbox.run_when_ready(&["enable", id]).status.code(),
+        Some(0)
+    );
+    assert_eq!(sandbox.status(id)["summary"]["enabled"], true);
+}
+
+fn assert_crash_restart(sandbox: &Sandbox, id: &str) {
+    let running = sandbox.start_service(id);
+    let pid = running["summary"]["pid"].as_u64().expect("pid");
+
+    kill_pid(pid as u32);
+    let backoff = sandbox.wait_for_state(id, "backoff", Duration::from_secs(5));
+    assert!(
+        backoff["details"]["failures"].as_u64().unwrap_or(0) >= 1,
+        "{backoff}"
+    );
+    assert!(!backoff["details"]["next_at"].is_null(), "{backoff}");
+
+    let restarted = sandbox.wait_for_restart(id, pid, Duration::from_secs(15));
+    assert_ne!(restarted["summary"]["pid"].as_u64(), Some(pid));
+    assert_eq!(restarted["summary"]["state"], "running");
+    sandbox.stop_service(id);
+}
+
+#[test]
+fn state_matrix_for_core_json_service() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_core_json("core");
+    sandbox.start_daemon();
+    assert_state_matrix(&sandbox, "core", "core", true);
+}
+
+#[test]
+fn state_matrix_for_script_service() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_stop_script("script");
+    sandbox.start_daemon();
+    assert_state_matrix(&sandbox, "script", "core", true);
+}
+
+#[test]
+fn state_matrix_for_plugin_service() {
+    let mut sandbox = Sandbox::new();
+    let package = sandbox.write_plugin_package("plug");
+    sandbox.start_daemon();
+    sandbox.install_plugin("plug", &package);
+    assert_state_matrix(&sandbox, "plug", "plugin", false);
+}
+
+#[test]
+fn crash_restart_for_core_json_service() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_core_json("core");
+    sandbox.start_daemon();
+    assert_crash_restart(&sandbox, "core");
+}
+
+#[test]
+fn crash_restart_for_script_service() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_stop_script("script");
+    sandbox.start_daemon();
+    assert_crash_restart(&sandbox, "script");
+}
+
+#[test]
+fn crash_restart_for_plugin_service() {
+    let mut sandbox = Sandbox::new();
+    let package = sandbox.write_plugin_package("plug");
+    sandbox.start_daemon();
+    sandbox.install_plugin("plug", &package);
+    assert_crash_restart(&sandbox, "plug");
+}
+
+#[test]
+fn five_quick_crashes_enter_failed_and_explicit_start_resets() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_core_json("crashy");
+    sandbox.start_daemon();
+
+    let mut pid = sandbox.running_pid("crashy") as u64;
+    for attempt in 1..=5 {
+        kill_pid(pid as u32);
+        if attempt < 5 {
+            let restarted = sandbox.wait_for_restart("crashy", pid, Duration::from_secs(20));
+            pid = restarted["summary"]["pid"].as_u64().expect("pid");
+        }
+    }
+
+    let failed = sandbox.wait_for_state("crashy", "failed", Duration::from_secs(25));
+    assert_eq!(failed["details"]["failures"], 5, "{failed}");
+    assert!(failed["summary"]["pid"].is_null(), "{failed}");
+
+    // Only an explicit start leaves Failed.
+    let running = sandbox.start_service("crashy");
+    assert_eq!(running["details"]["failures"], 0, "{running}");
+    sandbox.stop_service("crashy");
+}
+
+#[test]
+fn a_disabled_service_crashes_to_stopped_without_restart() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_core_json("off");
+    sandbox.start_daemon();
+    assert_eq!(
+        sandbox.run_when_ready(&["disable", "off"]).status.code(),
+        Some(0)
+    );
+
+    let pid = sandbox.running_pid("off") as u64;
+    kill_pid(pid as u32);
+    let backoff = sandbox.wait_for_state("off", "backoff", Duration::from_secs(5));
+    assert!(
+        backoff["details"]["failures"].as_u64().unwrap_or(0) >= 1,
+        "{backoff}"
+    );
+
+    let stopped = sandbox.wait_for_state("off", "stopped", Duration::from_secs(10));
+    assert!(stopped["summary"]["pid"].is_null(), "{stopped}");
+    assert!(!pid_alive(pid as u32));
+}
+
+#[test]
+fn graceful_svcd_restart_boots_enabled_services_and_skips_disabled() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_core_json("core");
+    sandbox.write_stop_script("script");
+    sandbox.write_core_json("off");
+    fs::write(sandbox.config.join("services.d").join("off.disabled"), b"")
+        .expect("disabled marker");
+
+    sandbox.start_daemon();
+    let package = sandbox.write_plugin_package("plug");
+    sandbox.install_plugin("plug", &package);
+
+    let mut pids = Vec::new();
+    for id in ["core", "script", "plug"] {
+        pids.push(sandbox.running_pid(id) as u64);
+    }
+
+    sandbox.shutdown();
+    for pid in &pids {
+        wait_until(
+            &format!("pid {} to exit", pid),
+            Duration::from_secs(10),
+            || !pid_alive(*pid as u32),
+        );
+    }
+
+    sandbox.start_daemon();
+    for id in ["core", "script", "plug"] {
+        let status = sandbox.wait_for_state(id, "running", Duration::from_secs(15));
+        assert!(
+            status["summary"]["pid"].as_u64().unwrap_or(0) > 0,
+            "{status}"
+        );
+    }
+    let off = sandbox.status("off");
+    assert_eq!(off["summary"]["state"], "stopped", "{off}");
+    assert_eq!(off["summary"]["enabled"], false, "{off}");
+}
+
+#[test]
+fn builtin_svc_stays_running_and_ignores_start_stop() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+
+    let status = sandbox.status("svc");
+    assert_eq!(status["summary"]["state"], "running", "{status}");
+    assert_eq!(status["summary"]["kind"], "core", "{status}");
+    assert_eq!(status["summary"]["enabled"], true, "{status}");
+
+    assert_eq!(
+        sandbox.run_when_ready(&["start", "svc"]).status.code(),
+        Some(0)
+    );
+    assert_eq!(
+        sandbox.run_when_ready(&["stop", "svc"]).status.code(),
+        Some(0)
+    );
+    assert_eq!(sandbox.status("svc")["summary"]["state"], "running");
+}
+
+/// Current behaviour under an abrupt svcd death, pinned as a characterization
+/// test: the script service (ready = Exec, never reads stdin) outlives its
+/// supervisor and the restarted daemon starts a second instance instead of
+/// reaping or adopting the orphan. The plugin agent exits on stdin EOF.
+#[test]
+fn abrupt_svcd_exit_orphans_script_children_and_restart_duplicates_them() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_stop_script("script");
+    let package = sandbox.write_plugin_package("plug");
+    sandbox.start_daemon();
+    sandbox.install_plugin("plug", &package);
+
+    let script_pid = sandbox.running_pid("script") as u64;
+    let plugin_pid = sandbox.running_pid("plug") as u64;
+
+    sandbox.force_kill_daemon();
+
+    wait_until("script orphan", Duration::from_secs(5), || {
+        pid_alive(script_pid as u32)
+    });
+    wait_until(
+        "plugin agent to exit on stdin EOF",
+        Duration::from_secs(10),
+        || !pid_alive(plugin_pid as u32),
+    );
+
+    sandbox.start_daemon();
+    let new_script = sandbox.wait_for_restart("script", script_pid, Duration::from_secs(15));
+    let new_script_pid = new_script["summary"]["pid"].as_u64().expect("pid");
+    sandbox.wait_for_restart("plug", plugin_pid, Duration::from_secs(15));
+    assert_ne!(new_script_pid, script_pid);
+    assert!(
+        pid_alive(script_pid as u32),
+        "KNOWN GAP: the pre-crash instance survived the restart"
+    );
+
+    // The fixture's stop sidecar is shared by both instances, so the new
+    // instance's stop action also ends the orphan; the daemon itself never
+    // tracked it. Clean up explicitly either way.
+    sandbox.stop_service("script");
+    kill_pid(script_pid as u32);
+    sandbox.stop_service("plug");
 }
