@@ -186,14 +186,10 @@ done
     }
 
     fn wait_for_daemon(&self) {
-        for _ in 0..300 {
-            let output = self.run_svc(&["list"]);
-            if output.status.code() != Some(2) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        panic!("daemon never became reachable: {}", self.daemon_log());
+        // `svc list` falls back to local definitions and exits 0 without a
+        // daemon, so it cannot detect readiness. The control channel binds
+        // before the HTTP API and the API writes `http.port`; wait for that.
+        let _ = self.wait_for_http();
     }
 
     fn wait_for_http(&self) -> String {

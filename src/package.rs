@@ -883,7 +883,8 @@ mod tests {
     #[test]
     fn rejects_a_platform_mismatch() {
         let key = setup();
-        let bytes = package_for(&key, "x86_64-unknown-linux-gnu");
+        let mismatched = format!("{}-mismatch", target());
+        let bytes = package_for(&key, &mismatched);
         let error = verify_bytes(&bytes).expect_err("platform");
         assert!(error.contains("platform mismatch"), "{error}");
     }

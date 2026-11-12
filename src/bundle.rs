@@ -626,7 +626,7 @@ mod tests {
         path
     }
 
-    fn options(dir: &Path, out: &Path, key: &Path) -> Options {
+    fn bundle_options(dir: &Path, out: &Path, key: &Path) -> Options {
         Options {
             dir: dir.to_path_buf(),
             out: Some(out.to_path_buf()),
@@ -683,7 +683,7 @@ mod tests {
         let key = SigningKey::from_bytes(&[21u8; 32]);
         let key_path = key_file(&work, 21);
         let out = work.path().join("out.spk");
-        let mut options = options(source.path(), &out, &key_path);
+        let mut options = bundle_options(source.path(), &out, &key_path);
         options.id = Some("demo".into());
         options.version = Some("1.2.3".into());
         options.desc = Some("demo plugin".into());
@@ -777,7 +777,7 @@ mod tests {
         write(&source, "hooks/post-install", b"hook", 0o755);
         let key_path = key_file(&work, 22);
         let out = work.path().join("out.spk");
-        let mut options = options(&source, &out, &key_path);
+        let mut options = bundle_options(&source, &out, &key_path);
         options.id = Some("renamed".into());
 
         bundle(&options).expect("bundle");
@@ -810,7 +810,7 @@ mod tests {
         };
         write(source.path(), exec_path, b"tool", 0o755);
         let out = work.path().join("out.spk");
-        let mut options = options(source.path(), &out, &work.path().join("missing.pem"));
+        let mut options = bundle_options(source.path(), &out, &work.path().join("missing.pem"));
         options.id = Some("demo".into());
         options.key = None;
 
@@ -832,14 +832,14 @@ mod tests {
         };
         write(source.path(), one, b"one", 0o755);
         write(source.path(), two, b"two", 0o755);
-        let mut ambiguous = options(source.path(), &work.path().join("a.spk"), &key_path);
+        let mut ambiguous = bundle_options(source.path(), &work.path().join("a.spk"), &key_path);
         ambiguous.id = Some("ambiguous".into());
         let error = bundle(&ambiguous).expect_err("ambiguous");
         assert!(error.contains("multiple executable candidates"), "{error}");
 
         let source = TempDir::new();
         write(source.path(), "README.md", b"readme", 0o644);
-        let mut missing = options(source.path(), &work.path().join("b.spk"), &key_path);
+        let mut missing = bundle_options(source.path(), &work.path().join("b.spk"), &key_path);
         missing.id = Some("missing".into());
         let error = bundle(&missing).expect_err("missing exec");
         assert!(error.contains("cannot determine exec.path"), "{error}");
@@ -876,7 +876,7 @@ mod tests {
         .expect("manifest");
         let key_path = key_file(&work, 24);
         let out = work.path().join("out.spk");
-        let mut options = options(source.path(), &out, &key_path);
+        let mut options = bundle_options(source.path(), &out, &key_path);
         options.id = Some("fresh".into());
         options.version = Some("2.0.0".into());
         options.desc = Some("fresh desc".into());
@@ -915,7 +915,7 @@ mod tests {
         write(source.path(), "payload/bin/tool", b"tool", 0o755);
         let key_path = key_file(&work, 26);
         let out = work.path().join("out.spk");
-        let mut options = options(source.path(), &out, &key_path);
+        let mut options = bundle_options(source.path(), &out, &key_path);
         options.id = Some("demo".into());
         options.exec = Some("payload/bin/missing".into());
         let error = bundle(&options).expect_err("missing exec");
@@ -952,7 +952,7 @@ mod tests {
         .expect("manifest");
         let key_path = key_file(&work, 27);
         let out = work.path().join("out.spk");
-        let error = bundle(&options(source.path(), &out, &key_path)).expect_err("hook");
+        let error = bundle(&bundle_options(source.path(), &out, &key_path)).expect_err("hook");
         assert!(error.contains("postInstall is not in files[]"), "{error}");
     }
 
@@ -968,7 +968,7 @@ mod tests {
         write(source.path(), exec_path, b"tool", 0o755);
         let key_path = key_file(&work, 32);
         let out = source.path().join("inside.spk");
-        let mut options = options(source.path(), &out, &key_path);
+        let mut options = bundle_options(source.path(), &out, &key_path);
         options.id = Some("demo".into());
         let error = bundle(&options).expect_err("output inside");
         assert!(error.contains("outside the bundle directory"), "{error}");
@@ -987,7 +987,7 @@ mod tests {
         let key_path = source.path().join("signing.key");
         fs::write(&key_path, pem_from_private(&[31u8; 32])).expect("key");
         let out = source.path().join("out.spk");
-        let mut options = options(source.path(), &out, &key_path);
+        let mut options = bundle_options(source.path(), &out, &key_path);
         options.id = Some("demo".into());
         let error = bundle(&options).expect_err("key inside bundle");
         assert!(error.contains("inside the bundle directory"), "{error}");
@@ -1002,7 +1002,7 @@ mod tests {
         write(source.path(), "payload/bin/tool", b"tool", 0o644);
         let key_path = key_file(&work, 33);
         let out = work.path().join("a.spk");
-        let mut options = options(source.path(), &out, &key_path);
+        let mut options = bundle_options(source.path(), &out, &key_path);
         options.id = Some("demo".into());
         options.exec = Some("payload/bin/tool".into());
         let error = bundle(&options).expect_err("non-executable");
@@ -1022,7 +1022,7 @@ mod tests {
         .expect("hard link");
         let key_path = key_file(&work, 34);
         let out = work.path().join("a.spk");
-        let mut options = options(source.path(), &out, &key_path);
+        let mut options = bundle_options(source.path(), &out, &key_path);
         options.id = Some("demo".into());
         let error = bundle(&options).expect_err("hard link");
         assert!(error.contains("hard links are not allowed"), "{error}");
@@ -1040,7 +1040,7 @@ mod tests {
         write(source.path(), "payload/bin/tool", b"tool", 0o755);
         fs::create_dir_all(source.path().join("payload/web")).expect("web");
         symlink("payload/bin/tool", source.path().join("payload/web/alias")).expect("symlink");
-        let mut options = options(source.path(), &work.path().join("a.spk"), &key_path);
+        let mut options = bundle_options(source.path(), &work.path().join("a.spk"), &key_path);
         options.id = Some("symlink".into());
         let error = bundle(&options).expect_err("symlink");
         assert!(error.contains("symbolic links are not allowed"), "{error}");
@@ -1052,9 +1052,10 @@ mod tests {
             source.path().join("payload/bin/copy"),
         )
         .expect("hard link");
-        let mut options = options(source.path(), &work.path().join("b.spk"), &key_path);
-        options.id = Some("hardlink".into());
-        let error = bundle(&options).expect_err("hard link");
+        let mut hard_link_options =
+            bundle_options(source.path(), &work.path().join("b.spk"), &key_path);
+        hard_link_options.id = Some("hardlink".into());
+        let error = bundle(&hard_link_options).expect_err("hard link");
         assert!(error.contains("hard links are not allowed"), "{error}");
     }
 
@@ -1072,7 +1073,7 @@ mod tests {
         )
         .expect("setuid");
         let key_path = key_file(&work, 29);
-        let mut options = options(source.path(), &work.path().join("a.spk"), &key_path);
+        let mut options = bundle_options(source.path(), &work.path().join("a.spk"), &key_path);
         options.id = Some("setuid".into());
         let error = bundle(&options).expect_err("setuid");
         assert!(error.contains("setuid"), "{error}");
@@ -1094,7 +1095,7 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         let key_path = key_file(&work, 30);
-        let mut options = options(source.path(), &work.path().join("a.spk"), &key_path);
+        let mut options = bundle_options(source.path(), &work.path().join("a.spk"), &key_path);
         options.id = Some("sparse".into());
         let error = bundle(&options).expect_err("sparse");
         assert!(error.contains("sparse files are not allowed"), "{error}");

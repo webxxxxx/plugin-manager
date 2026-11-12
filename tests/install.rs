@@ -39,6 +39,7 @@ impl Sandbox {
             .args(args)
             .env("SVCD_CONFIG_DIR", self.config_dir())
             .env("SVCD_DATA_DIR", self.data_dir())
+            .env("SVCD_LOG_DIR", self.root.join("logs"))
             .env("SVCD_TEST_UNPRIVILEGED", "1")
             .output()
             .expect("run svcd")
@@ -317,6 +318,7 @@ fn self_install_copies_aliases_and_uninstalls_without_touching_the_host() {
         .arg("list")
         .env("SVCD_CONFIG_DIR", sandbox.config_dir())
         .env("SVCD_DATA_DIR", sandbox.data_dir())
+        .env("SVCD_LOG_DIR", sandbox.root.join("logs"))
         .output()
         .expect("run installed svc");
     assert_eq!(listed.status.code(), Some(0), "{}", stderr(&listed));
