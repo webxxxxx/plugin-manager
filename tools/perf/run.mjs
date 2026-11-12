@@ -804,6 +804,132 @@ async function benchMixed(daemon, token, durationSeconds) {
   };
 }
 
+function sleep(ms) {
+  return new Promise(function (resolve) { setTimeout(resolve, ms); });
+}
+
+// Sum WorkingSet/CPU over the daemon process tree (plugin wrappers, Python
+// children and their conhost helpers included). Windows-only; returns null
+// elsewhere.
+function processTree(pid) {
+  if (!pid || !WIN) return null;
+  const lines = [
+    '$ErrorActionPreference = "SilentlyContinue"',
+    '$root = ' + pid,
+    '$all = Get-CimInstance Win32_Process',
+    '$ids = New-Object System.Collections.Generic.HashSet[int]',
+    '[void]$ids.Add([int]$root)',
+    '$front = @([int]$root)',
+    'while ($front.Count -gt 0) {',
+    '  $next = @()',
+    '  foreach ($process in $all) {',
+    '    $parent = [int]$process.ParentProcessId',
+    '    $child = [int]$process.ProcessId',
+    '    if ($ids.Contains($parent) -and -not $ids.Contains($child)) { [void]$ids.Add($child); $next += $child }',
+    '  }',
+    '  $front = $next',
+    '}',
+    '$idList = @($ids)',
+    '$procs = @(Get-Process -Id $idList -ErrorAction SilentlyContinue)',
+    '$working = ($procs | Measure-Object WorkingSet64 -Sum).Sum',
+    '$private = ($procs | Measure-Object PrivateMemorySize64 -Sum).Sum',
+    '$cpu = ($procs | Measure-Object CPU -Sum).Sum',
+    '[pscustomobject]@{ count = $procs.Count; working_set = [int64]$working; private = [int64]$private; cpu = [double]$cpu } | ConvertTo-Json -Compress',
+  ];
+  try {
+    const output = execFileSync('powershell', ['-NoProfile', '-Command', lines.join('\n')], { encoding: 'utf8', windowsHide: true });
+    return JSON.parse(output);
+  } catch (_) {
+    return null;
+  }
+}
+
+function mb(bytes) {
+  return bytes / (1024 * 1024);
+}
+
+async function measureScale() {
+  const counts = [0, 5, 10, 30];
+  const results = [];
+  const pluginCli = ensureAlias('plugin');
+  for (const count of counts) {
+    const root = path.join(ROOT, 'target', 'scale-run-' + Date.now() + '-' + count);
+    mkdirSync(root, { recursive: true });
+    log('scale: starting ' + count + ' plugin(s) in ' + root);
+    const daemon = await startDaemon(root);
+    try {
+      const fixture = writeFixture(root);
+      const packages = [];
+      for (let index = 0; index < count; index++) {
+        const id = 'p' + index;
+        const spk = path.join(root, id + '.spk');
+        runSync(pluginCli, ['bundle', fixture, '--id', id, '--key', KEY, '--key-id', KEY_ID, '-o', spk], daemon.env);
+        packages.push({ id: id, bytes: readFileSync(spk) });
+      }
+      const startAll = performance.now();
+      for (const item of packages) {
+        const installed = await httpRequest(daemon.address, 'POST', '/api/v1/plugins', { 'content-type': 'application/octet-stream' }, item.bytes, 15000);
+        assert.equal(installed.status, 200, installed.body.toString());
+        const started = await httpRequest(daemon.address, 'POST', '/api/v1/services/' + item.id + '/start', { 'content-length': '0' }, null, 20000);
+        assert.equal(started.status, 200, started.body.toString());
+      }
+      const startAllMs = performance.now() - startAll;
+      await sleep(2000);
+      const before = processTree(daemon.child.pid);
+      await sleep(5000);
+      const after = processTree(daemon.child.pid);
+      const cpuSeconds = before && after ? Math.max(0, after.cpu - before.cpu) : 0;
+      const cpuPercent = cpuSeconds / 5 * 100;
+      results.push({
+        plugins: count,
+        root: root,
+        processes: after ? after.count : 0,
+        total_rss_bytes: after ? after.working_set : 0,
+        total_private_bytes: after ? after.private : 0,
+        cpu_seconds_5s: cpuSeconds,
+        cpu_percent_one_core: cpuPercent,
+        cpu_percent_machine: cpuPercent / os.cpus().length,
+        start_all_ms: startAllMs,
+      });
+      log('scale: ' + count + ' plugins, RSS=' + mb(after ? after.working_set : 0).toFixed(1) + ' MB, idle CPU=' + cpuPercent.toFixed(2) + '%');
+    } finally {
+      await stopDaemon(daemon);
+    }
+  }
+  const baseline = results.length > 0 ? results[0].total_rss_bytes : 0;
+  for (const item of results) {
+    item.plugin_rss_bytes = Math.max(0, item.total_rss_bytes - baseline);
+    item.per_plugin_rss_bytes = item.plugins > 0 ? item.plugin_rss_bytes / item.plugins : 0;
+  }
+  return results;
+}
+
+function renderScaleReport(results) {
+  const lines = [];
+  lines.push('# Plugin scale resource report');
+  lines.push('');
+  lines.push('Generated: ' + new Date().toISOString());
+  lines.push('');
+  lines.push('- OS: ' + os.type() + ' ' + os.release());
+  lines.push('- CPU: ' + os.cpus()[0].model + ' x' + os.cpus().length);
+  lines.push('- Plugin: Python NDJSON echo agent (idle)');
+  lines.push('- Window: 5s idle sample after 2s settle; process tree includes daemon, cmd/launcher, Python and conhost.');
+  lines.push('');
+  lines.push('| Plugins | Processes | Total RSS MB | Plugin RSS MB | Per plugin MB | Idle CPU % (one core) | Start all ms |');
+  lines.push('| ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
+  for (const item of results) {
+    lines.push('| ' + item.plugins + ' | ' + item.processes + ' | ' + mb(item.total_rss_bytes).toFixed(2) + ' | ' + mb(item.plugin_rss_bytes).toFixed(2) + ' | ' + mb(item.per_plugin_rss_bytes).toFixed(2) + ' | ' + item.cpu_percent_one_core.toFixed(2) + ' | ' + item.start_all_ms.toFixed(0) + ' |');
+  }
+  lines.push('');
+  lines.push('## Notes');
+  lines.push('');
+  lines.push('- Plugin RSS is measured as total tree RSS minus the 0-plugin daemon baseline.');
+  lines.push('- CPU is the process-tree CPU seconds delta over 5s, normalized to one core.');
+  lines.push('- Python plugin overhead and Windows process wrappers are included; values are not a production capacity claim.');
+  lines.push('');
+  return lines.join('\n');
+}
+
 async function runPerf(daemon, token, resources) {
   const perf = {};
   perf.http = {};
@@ -960,10 +1086,11 @@ function environmentInfo() {
 
 async function main() {
   const args = process.argv.slice(2);
+  const scaleOnly = args.includes('--scale');
   const compatOnly = args.includes('--compat');
   const perfOnly = args.includes('--perf');
-  const runCompatMode = compatOnly || (!compatOnly && !perfOnly);
-  const runPerfMode = perfOnly || (!compatOnly && !perfOnly);
+  const runCompatMode = compatOnly || (!scaleOnly && !compatOnly && !perfOnly);
+  const runPerfMode = perfOnly || (!scaleOnly && !compatOnly && !perfOnly);
   const outIndex = args.indexOf('--out');
   const outPath = outIndex >= 0 ? path.resolve(args[outIndex + 1]) : path.join(ROOT, 'target', 'perf-results.json');
   const reportPath = path.join(ROOT, 'target', 'perf-report.md');
@@ -972,6 +1099,16 @@ async function main() {
   ensureAlias('plugin');
   ensureAlias('svc');
   ensureAlias('mcp');
+  if (scaleOnly) {
+    const results = await measureScale();
+    const scalePath = path.join(ROOT, 'target', 'scale-results.json');
+    const scaleReport = path.join(ROOT, 'target', 'scale-report.md');
+    writeFileSync(scalePath, JSON.stringify({ generated_at: new Date().toISOString(), environment: environmentInfo(), results: results }, null, 2) + '\n');
+    writeFileSync(scaleReport, renderScaleReport(results));
+    log('scale results ' + scalePath);
+    log('scale report ' + scaleReport);
+    return;
+  }
   const root = path.join(ROOT, 'target', 'perf-run-' + Date.now());
   mkdirSync(root, { recursive: true });
   log('workdir ' + root);
