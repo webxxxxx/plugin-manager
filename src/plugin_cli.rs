@@ -10,11 +10,11 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use crate::channel;
-use crate::package;
 use crate::paths;
 use crate::plugin;
 use crate::registry::Kind;
 use crate::status::{self, Status};
+use crate::transfer;
 
 const EXIT_OK: i32 = 0;
 const EXIT_SERVICE_ERROR: i32 = 1;
@@ -501,176 +501,28 @@ fn import(path: &Path, config_id: Option<&str>, no_config: bool, force: bool) ->
             return EXIT_SERVICE_ERROR;
         }
     };
-    if data.len() as u64 > 512 * 1024 * 1024 {
-        eprintln!("plugin: import exceeds 512 MiB");
-        return EXIT_SERVICE_ERROR;
-    }
-
-    let entries = package::read_tar(&data).ok();
-    let first = entries.as_ref().and_then(|entries| entries.first());
-    match first.map(|entry| entry.path.as_str()) {
-        Some("backup.json") => import_backup(entries.as_ref().expect("entries"), no_config, force),
-        Some("manifest.json") => match install_spk_bytes(&data) {
-            Ok(status) => print_status(status, false),
-            Err(code) => code,
-        },
-        _ => {
-            let Some(id) = config_id else {
-                eprintln!("plugin: raw config requires --config <id>");
-                return EXIT_USAGE;
-            };
-            if let Err(error) = plugin::root_required() {
-                eprintln!("plugin: {}", error);
-                return EXIT_SERVICE_ERROR;
+    match transfer::import(&data, config_id, no_config, force, true) {
+        Ok(outcome) => {
+            for warning in &outcome.warnings {
+                eprintln!("plugin: warning: {}", warning);
             }
-            match plugin::replace_config(id, &data, true) {
-                Ok(()) => {
-                    println!("config imported for {}; restart to apply", id);
-                    EXIT_OK
-                }
-                Err(error) => {
-                    eprintln!("plugin: {}", error);
-                    EXIT_SERVICE_ERROR
-                }
+            if let Some(status) = outcome.status {
+                print_status(status, false)
+            } else if let Some(id) = outcome.config {
+                println!("config imported for {}; restart to apply", id);
+                EXIT_OK
+            } else {
+                EXIT_OK
             }
         }
-    }
-}
-
-fn import_backup(entries: &[package::TarEntry], no_config: bool, force: bool) -> i32 {
-    let backup = match entries.iter().find(|entry| entry.path == "backup.json") {
-        Some(entry) => entry,
-        None => {
-            eprintln!("plugin: backup.json is missing");
-            return EXIT_SERVICE_ERROR;
+        Err(transfer::Error::Usage(message)) => {
+            eprintln!("plugin: {}", message);
+            EXIT_USAGE
         }
-    };
-    let backup: plugin::Backup = match serde_json::from_slice(&backup.data) {
-        Ok(backup) => backup,
-        Err(error) => {
-            eprintln!("plugin: invalid backup.json: {}", error);
-            return EXIT_SERVICE_ERROR;
+        Err(transfer::Error::Failed(message)) => {
+            eprintln!("plugin: {}", message);
+            EXIT_SERVICE_ERROR
         }
-    };
-    if backup.schema != 1 {
-        eprintln!("plugin: unsupported backup schema {}", backup.schema);
-        return EXIT_SERVICE_ERROR;
-    }
-    let spk = match entries.iter().find(|entry| entry.path == "plugin.spk") {
-        Some(entry) => entry,
-        None => {
-            eprintln!("plugin: plugin.spk is missing");
-            return EXIT_SERVICE_ERROR;
-        }
-    };
-    let package = match package::verify_bytes(&spk.data) {
-        Ok(package) => package,
-        Err(error) => {
-            eprintln!("plugin: {}", error);
-            return EXIT_SERVICE_ERROR;
-        }
-    };
-    if package.manifest.name != backup.id {
-        eprintln!(
-            "plugin: backup id {} does not match package id {}",
-            backup.id, package.manifest.name
-        );
-        return EXIT_SERVICE_ERROR;
-    }
-    if package.manifest.version != backup.version {
-        eprintln!(
-            "plugin: backup version {} does not match package version {}",
-            backup.version, package.manifest.version
-        );
-        return EXIT_SERVICE_ERROR;
-    }
-    if let Some(expected) = &backup.config_sha256 {
-        let config = entries.iter().find(|entry| entry.path == "config");
-        match config {
-            Some(config) if &package::hex_sha256(&config.data) == expected => {}
-            Some(_) => {
-                eprintln!("plugin: backup config hash does not match");
-                return EXIT_SERVICE_ERROR;
-            }
-            None => {
-                eprintln!("plugin: backup declares a config hash but config is missing");
-                return EXIT_SERVICE_ERROR;
-            }
-        }
-    }
-
-    if let Some(current) = plugin::current_version(&backup.id) {
-        if current != backup.version {
-            eprintln!(
-                "plugin: warning: installed {} is {}, importing {}",
-                backup.id, current, backup.version
-            );
-        } else if !force {
-            eprintln!(
-                "plugin: {} {} is already installed; use --force",
-                backup.id, backup.version
-            );
-            return EXIT_SERVICE_ERROR;
-        }
-    }
-
-    if !no_config {
-        let config = entries.iter().find(|entry| entry.path == "config");
-        if config.is_some() {
-            if let Err(error) = plugin::root_required() {
-                eprintln!("plugin: {}", error);
-                return EXIT_SERVICE_ERROR;
-            }
-        }
-    }
-
-    let status = match install_spk_bytes(&spk.data) {
-        Ok(status) => status,
-        Err(code) => return code,
-    };
-    if !no_config {
-        if let Some(config) = entries.iter().find(|entry| entry.path == "config") {
-            if let Err(error) = plugin::replace_config(&backup.id, &config.data, true) {
-                eprintln!("plugin: {}", error);
-                return EXIT_SERVICE_ERROR;
-            }
-        }
-    }
-    print_status(status, false)
-}
-
-fn install_spk_bytes(bytes: &[u8]) -> Result<Status, i32> {
-    let directory = paths::config_dir().join("tmp");
-    let _ = fs::create_dir_all(&directory);
-    let path = directory.join(format!("import-{}.spk", std::process::id()));
-    if let Err(error) = fs::write(&path, bytes) {
-        eprintln!("plugin: write temp package: {}", error);
-        return Err(EXIT_SERVICE_ERROR);
-    }
-    let response = channel::request(
-        &paths::config_dir(),
-        "plugin.install",
-        json!({ "path": path.to_string_lossy(), "strategy": "keep-old" }),
-    );
-    let _ = fs::remove_file(&path);
-    match response {
-        Ok(response) => match response.error {
-            Some(error) => {
-                eprintln!("plugin: {}", error.message);
-                Err(EXIT_SERVICE_ERROR)
-            }
-            None => match response.result {
-                Some(result) => serde_json::from_value(result).map_err(|error| {
-                    eprintln!("plugin: invalid status: {}", error);
-                    EXIT_SERVICE_ERROR
-                }),
-                None => {
-                    eprintln!("plugin: empty install response");
-                    Err(EXIT_SERVICE_ERROR)
-                }
-            },
-        },
-        Err(error) => Err(unreachable(&error)),
     }
 }
 

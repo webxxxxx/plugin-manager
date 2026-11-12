@@ -187,6 +187,12 @@ struct Response {
     headers: Vec<(String, String)>,
 }
 
+struct RawResponse {
+    status: u16,
+    body: Vec<u8>,
+    headers: Vec<(String, String)>,
+}
+
 fn request(address: &str, method: &str, path: &str, content_type: &str, body: &[u8]) -> Response {
     request_with(address, method, path, content_type, body, &[])
 }
@@ -199,6 +205,33 @@ fn request_with(
     body: &[u8],
     extra_headers: &[(&str, &str)],
 ) -> Response {
+    let raw = raw_request_with(address, method, path, content_type, body, extra_headers);
+    let body = serde_json::from_slice(&raw.body).expect("json body");
+    Response {
+        status: raw.status,
+        body,
+        headers: raw.headers,
+    }
+}
+
+fn raw_request(
+    address: &str,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+) -> RawResponse {
+    raw_request_with(address, method, path, content_type, body, &[])
+}
+
+fn raw_request_with(
+    address: &str,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+    extra_headers: &[(&str, &str)],
+) -> RawResponse {
     let mut stream = TcpStream::connect(address).expect("connect");
     let mut request = format!(
         "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -235,15 +268,27 @@ fn request_with(
             Some((name.trim().to_string(), value.trim().to_string()))
         })
         .collect();
-    let body = serde_json::from_slice(&response[split + 4..]).expect("json body");
-    Response {
+    RawResponse {
         status,
-        body,
+        body: response[split + 4..].to_vec(),
         headers,
     }
 }
 
+fn json_body(response: &RawResponse) -> Value {
+    serde_json::from_slice(&response.body).expect("json body")
+}
+
 fn header_values<'a>(response: &'a Response, name: &str) -> Vec<&'a str> {
+    response
+        .headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+        .collect()
+}
+
+fn raw_header_values<'a>(response: &'a RawResponse, name: &str) -> Vec<&'a str> {
     response
         .headers
         .iter()
@@ -288,8 +333,8 @@ fn target() -> &'static str {
     }
 }
 
-fn plugin_package(key: &SigningKey) -> Vec<u8> {
-    let (name, data) = if cfg!(windows) {
+fn script() -> (&'static str, Vec<u8>) {
+    if cfg!(windows) {
         (
             "agent.cmd",
             b"@echo off\r\n:loop\r\nset \"line=\"\r\nset /p line=\r\nif errorlevel 1 goto end\r\necho {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\r\ngoto loop\r\n:end\r\n".to_vec(),
@@ -299,18 +344,72 @@ fn plugin_package(key: &SigningKey) -> Vec<u8> {
             "agent.sh",
             b"#!/bin/sh\nwhile IFS= read -r line; do\n  printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\\n'\ndone\n".to_vec(),
         )
+    }
+}
+
+fn plugin_package(key: &SigningKey) -> Vec<u8> {
+    plugin_bundle(key, "demo", "1.0.0", None, false)
+}
+
+fn plugin_bundle(
+    key: &SigningKey,
+    id: &str,
+    version: &str,
+    config: Option<&[u8]>,
+    check: bool,
+) -> Vec<u8> {
+    let (name, data) = script();
+    let exec_path = format!("payload/bin/{}", name);
+    let mut files: Vec<(String, Vec<u8>, u32)> = vec![(exec_path.clone(), data, 0o755)];
+    if let Some(config) = config {
+        files.push(("config/config".to_string(), config.to_vec(), 0o644));
+    }
+    let check_path = if check {
+        let (path, body) = if cfg!(windows) {
+            (
+                "check/check.cmd",
+                b"@echo off\r\nfindstr /C:\"good\" \"%SVCD_CONFIG%\" >nul\r\nexit /b %errorlevel%\r\n".to_vec(),
+            )
+        } else {
+            (
+                "check/check.sh",
+                b"#!/bin/sh\ngrep -q good \"$SVCD_CONFIG\"\n".to_vec(),
+            )
+        };
+        files.push((path.to_string(), body, 0o755));
+        Some(path)
+    } else {
+        None
     };
-    let path = format!("payload/bin/{}", name);
-    let manifest = json!({
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let entries: Vec<Value> = files
+        .iter()
+        .map(|(path, data, mode)| {
+            json!({
+                "path": path,
+                "size": data.len(),
+                "sha256": hex_sha256(data),
+                "mode": mode
+            })
+        })
+        .collect();
+    let mut manifest = json!({
         "schema": 1,
-        "name": "demo",
-        "version": "1.0.0",
+        "name": id,
+        "version": version,
         "desc": "http plugin",
         "platform": target(),
         "protocol": 1,
-        "exec": {"path": path, "args": [], "ready": "notify"},
-        "files": [{"path": path, "size": data.len(), "sha256": hex_sha256(&data), "mode": 0o755}]
+        "exec": {"path": exec_path, "args": [], "ready": "notify"},
+        "files": entries
     });
+    if config.is_some() {
+        manifest["config"] = json!("config/config");
+    }
+    if let Some(path) = check_path {
+        manifest["configCheck"] = json!({"path": path});
+    }
     let manifest = serde_json::to_vec(&manifest).expect("manifest");
     let signature =
         json!({"alg":"ed25519","keyId":"test","sig":BASE64.encode(key.sign(&manifest).to_bytes())});
@@ -322,11 +421,37 @@ fn plugin_package(key: &SigningKey) -> Vec<u8> {
     tar.extend_from_slice(&header("signature.json", signature.len(), 0o644));
     tar.extend_from_slice(&signature);
     tar.extend(std::iter::repeat_n(0, padding(signature.len())));
-    tar.extend_from_slice(&header(&path, data.len(), 0o755));
-    tar.extend_from_slice(&data);
-    tar.extend(std::iter::repeat_n(0, padding(data.len())));
+    for (path, data, mode) in &files {
+        tar.extend_from_slice(&header(path, data.len(), *mode));
+        tar.extend_from_slice(data);
+        tar.extend(std::iter::repeat_n(0, padding(data.len())));
+    }
     tar.extend(std::iter::repeat_n(0, 1024));
     tar
+}
+
+fn tar_names(bytes: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut offset = 0;
+    while offset + 512 <= bytes.len() {
+        let header = &bytes[offset..offset + 512];
+        if header.iter().all(|byte| *byte == 0) {
+            break;
+        }
+        let end = header[..100]
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(100);
+        names.push(String::from_utf8_lossy(&header[..end]).to_string());
+        let size = std::str::from_utf8(&header[124..135])
+            .ok()
+            .and_then(|value| {
+                usize::from_str_radix(value.trim_matches(char::from(0)).trim(), 8).ok()
+            })
+            .unwrap_or(0);
+        offset += 512 + size + padding(size);
+    }
+    names
 }
 
 fn header(path: &str, size: usize, mode: u32) -> [u8; 512] {
@@ -451,6 +576,15 @@ fn plugin_upload_list_and_delete() {
         .expect("plugin service");
     assert_eq!(plugin["kind"], "plugin");
 
+    let disabled = request(&address, "POST", "/api/v1/services/demo/disable", "", b"");
+    assert_eq!(disabled.status, 200, "{}", disabled.body);
+    assert_eq!(disabled.body["summary"]["enabled"], false);
+    let enabled = request(&address, "POST", "/api/v1/services/demo/enable", "", b"");
+    assert_eq!(enabled.status, 200, "{}", enabled.body);
+    assert_eq!(enabled.body["summary"]["enabled"], true);
+    let core_toggle = request(&address, "POST", "/api/v1/services/svc/disable", "", b"");
+    assert_eq!(core_toggle.status, 409, "{}", core_toggle.body);
+
     let deleted = request(&address, "DELETE", "/api/v1/plugins/demo", "", b"");
     assert_eq!(deleted.status, 200, "{}", deleted.body);
 
@@ -516,6 +650,366 @@ fn token_line(output: &std::process::Output) -> String {
         .unwrap_or_else(|| panic!("no token in output: {}", text))
 }
 
+fn plugin_dir(sandbox: &Sandbox, id: &str) -> PathBuf {
+    sandbox.data.join("plugins").join(id)
+}
+
+#[test]
+fn config_endpoints_read_write_reset_and_reject_bad_checks() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[31u8; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let package = plugin_bundle(&key, "demo", "1.0.0", Some(b"good template\n"), true);
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let installed = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(installed.status, 200, "{}", installed.body);
+
+    let directory = plugin_dir(&sandbox, "demo");
+    let active = directory.join("config");
+    assert_eq!(fs::read(&active).expect("config"), b"good template\n");
+
+    let read = raw_request(&address, "GET", "/api/v1/config/demo", "", b"");
+    assert_eq!(read.status, 200);
+    assert_eq!(read.body, b"good template\n");
+    assert_eq!(raw_header_values(&read, "content-type"), vec!["text/plain"]);
+
+    let good = raw_request(
+        &address,
+        "PUT",
+        "/api/v1/config/demo",
+        "text/plain",
+        b"good config\n",
+    );
+    assert_eq!(good.status, 200, "{}", String::from_utf8_lossy(&good.body));
+    assert_eq!(fs::read(&active).expect("config"), b"good config\n");
+    assert_eq!(
+        fs::read(directory.join("config.last-good")).expect("last-good"),
+        b"good template\n"
+    );
+
+    let bad = raw_request(
+        &address,
+        "PUT",
+        "/api/v1/config/demo",
+        "text/plain",
+        b"bad config\n",
+    );
+    assert_eq!(bad.status, 409, "{}", String::from_utf8_lossy(&bad.body));
+    assert_eq!(fs::read(&active).expect("config"), b"good config\n");
+
+    let reset = raw_request(&address, "POST", "/api/v1/config/demo/reset", "", b"");
+    assert_eq!(
+        reset.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&reset.body)
+    );
+    assert_eq!(fs::read(&active).expect("config"), b"good template\n");
+    assert_eq!(
+        fs::read(directory.join("config.last-good")).expect("last-good"),
+        b"good config\n"
+    );
+
+    let bad_import = raw_request(
+        &address,
+        "POST",
+        "/api/v1/import?config_id=demo",
+        "text/plain",
+        b"bad config\n",
+    );
+    assert_eq!(
+        bad_import.status,
+        409,
+        "{}",
+        String::from_utf8_lossy(&bad_import.body)
+    );
+
+    let too_large = vec![b'x'; 1024 * 1024 + 1];
+    let large = raw_request(
+        &address,
+        "POST",
+        "/api/v1/import?config_id=demo",
+        "text/plain",
+        &too_large,
+    );
+    assert_eq!(
+        large.status,
+        413,
+        "{}",
+        String::from_utf8_lossy(&large.body)
+    );
+}
+
+#[test]
+fn export_import_and_logs() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[32u8; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let package = plugin_bundle(&key, "demo", "1.0.0", Some(b"good template\n"), false);
+    let plain = plugin_bundle(&key, "plain", "1.0.0", None, false);
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    assert_eq!(
+        request(
+            &address,
+            "POST",
+            "/api/v1/plugins",
+            "application/octet-stream",
+            &package
+        )
+        .status,
+        200
+    );
+    assert_eq!(
+        request(
+            &address,
+            "POST",
+            "/api/v1/plugins",
+            "application/octet-stream",
+            &plain
+        )
+        .status,
+        200
+    );
+
+    let directory = plugin_dir(&sandbox, "demo");
+    let active = directory.join("config");
+
+    let spkb = raw_request(&address, "GET", "/api/v1/export/demo", "", b"");
+    assert_eq!(spkb.status, 200, "{}", String::from_utf8_lossy(&spkb.body));
+    assert_eq!(
+        raw_header_values(&spkb, "content-type"),
+        vec!["application/octet-stream"]
+    );
+    assert!(raw_header_values(&spkb, "content-disposition")[0].contains("demo-1.0.0.spkb"));
+    let names = tar_names(&spkb.body);
+    assert_eq!(names.first().map(String::as_str), Some("backup.json"));
+    assert!(names.iter().any(|name| name == "plugin.spk"), "{names:?}");
+    assert!(names.iter().any(|name| name == "config"), "{names:?}");
+
+    let config_export = raw_request(&address, "GET", "/api/v1/export/demo/config", "", b"");
+    assert_eq!(config_export.status, 200);
+    assert_eq!(config_export.body, b"good template\n");
+
+    let raw_import = raw_request(
+        &address,
+        "POST",
+        "/api/v1/import?config_id=demo",
+        "text/plain",
+        b"imported good\n",
+    );
+    assert_eq!(
+        raw_import.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&raw_import.body)
+    );
+    assert_eq!(json_body(&raw_import)["configApplied"], true);
+    assert_eq!(fs::read(&active).expect("config"), b"imported good\n");
+
+    let missing_id = raw_request(&address, "POST", "/api/v1/import", "text/plain", b"no id\n");
+    assert_eq!(missing_id.status, 400);
+
+    let backup_import = raw_request(
+        &address,
+        "POST",
+        "/api/v1/import?force=true",
+        "application/octet-stream",
+        &spkb.body,
+    );
+    assert_eq!(
+        backup_import.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&backup_import.body)
+    );
+    let backup_body = json_body(&backup_import);
+    assert_eq!(backup_body["id"], "demo");
+    assert_eq!(backup_body["configApplied"], true);
+    assert_eq!(fs::read(&active).expect("config"), b"good template\n");
+
+    let spk_import = raw_request(
+        &address,
+        "POST",
+        "/api/v1/import?force=true",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(
+        spk_import.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&spk_import.body)
+    );
+    assert_eq!(json_body(&spk_import)["id"], "demo");
+
+    let mut bad = package.clone();
+    let needle = b"\"demo\"";
+    let position = bad
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .expect("name");
+    bad[position + 1] = b'D';
+    let bad_import = raw_request(
+        &address,
+        "POST",
+        "/api/v1/import",
+        "application/octet-stream",
+        &bad,
+    );
+    assert_eq!(
+        bad_import.status,
+        400,
+        "{}",
+        String::from_utf8_lossy(&bad_import.body)
+    );
+
+    let no_config = raw_request(&address, "GET", "/api/v1/config/plain", "", b"");
+    assert_eq!(no_config.status, 404);
+
+    fs::write(sandbox.logs.join("demo.log"), "one\ntwo\nthree\n").expect("write log");
+    let tail = raw_request(&address, "GET", "/api/v1/logs/demo?lines=2", "", b"");
+    assert_eq!(tail.status, 200);
+    assert_eq!(tail.body, b"two\nthree\n");
+    assert_eq!(
+        raw_header_values(&tail, "content-type"),
+        vec!["text/plain; charset=utf-8"]
+    );
+    let too_many = raw_request(&address, "GET", "/api/v1/logs/demo?lines=2001", "", b"");
+    assert_eq!(too_many.status, 400);
+    let no_log = raw_request(&address, "GET", "/api/v1/logs/plain", "", b"");
+    assert_eq!(no_log.status, 404);
+
+    let big = "x".repeat(1024 * 1024 + 100);
+    fs::write(sandbox.logs.join("demo.log"), &big).expect("write big log");
+    let capped = raw_request(&address, "GET", "/api/v1/logs/demo?lines=200", "", b"");
+    assert_eq!(capped.status, 200);
+    assert!(
+        capped.body.len() <= 1024 * 1024,
+        "log response was {} bytes",
+        capped.body.len()
+    );
+}
+
+#[test]
+fn config_endpoints_are_plugin_only_and_enforce_methods() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_core();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    for (method, path) in [
+        ("GET", "/api/v1/config/demo"),
+        ("PUT", "/api/v1/config/demo"),
+        ("POST", "/api/v1/config/demo/reset"),
+        ("GET", "/api/v1/export/demo"),
+        ("GET", "/api/v1/export/demo/config"),
+        ("GET", "/api/v1/logs/demo"),
+    ] {
+        let response = raw_request(&address, method, path, "", b"");
+        assert_eq!(
+            response.status,
+            404,
+            "{} {} -> {}",
+            method,
+            path,
+            String::from_utf8_lossy(&response.body)
+        );
+    }
+
+    let import_core = raw_request(
+        &address,
+        "POST",
+        "/api/v1/import?config_id=demo",
+        "text/plain",
+        b"good\n",
+    );
+    assert_eq!(
+        import_core.status,
+        404,
+        "{}",
+        String::from_utf8_lossy(&import_core.body)
+    );
+
+    let key = SigningKey::from_bytes(&[33u8; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let core_package = plugin_bundle(&key, "demo", "1.0.0", None, false);
+    let core_import = raw_request(
+        &address,
+        "POST",
+        "/api/v1/import",
+        "application/octet-stream",
+        &core_package,
+    );
+    assert_eq!(
+        core_import.status,
+        404,
+        "{}",
+        String::from_utf8_lossy(&core_import.body)
+    );
+
+    let reset_get = raw_request(&address, "GET", "/api/v1/config/demo/reset", "", b"");
+    assert_eq!(reset_get.status, 405);
+    assert_eq!(raw_header_values(&reset_get, "allow"), vec!["POST"]);
+
+    let config_post = raw_request(&address, "POST", "/api/v1/config/demo", "", b"");
+    assert_eq!(config_post.status, 405);
+    assert_eq!(raw_header_values(&config_post, "allow"), vec!["GET, PUT"]);
+
+    let export_post = raw_request(&address, "POST", "/api/v1/export/demo", "", b"");
+    assert_eq!(export_post.status, 405);
+    assert_eq!(raw_header_values(&export_post, "allow"), vec!["GET"]);
+
+    let import_get = raw_request(&address, "GET", "/api/v1/import", "", b"");
+    assert_eq!(import_get.status, 405);
+}
+
+#[test]
+fn serves_the_embedded_console() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let page = raw_request(&address, "GET", "/", "", b"");
+    assert_eq!(page.status, 200);
+    assert_eq!(
+        raw_header_values(&page, "content-type"),
+        vec!["text/html; charset=utf-8"]
+    );
+    let html = String::from_utf8_lossy(&page.body);
+    assert!(html.contains("id=\"rows\""), "console table missing");
+    assert!(
+        html.contains("/api/v1/services"),
+        "console does not call the management API"
+    );
+    let index = raw_request(&address, "GET", "/index.html", "", b"");
+    assert_eq!(index.status, 200);
+
+    let post = raw_request(&address, "POST", "/", "", b"");
+    assert_eq!(post.status, 405);
+    assert_eq!(raw_header_values(&post, "allow"), vec!["GET"]);
+}
+
 #[test]
 fn lan_auth_bearer_cookie_csrf_rotate_and_disable() {
     let mut sandbox = Sandbox::new();
@@ -535,6 +1029,9 @@ fn lan_auth_bearer_cookie_csrf_rotate_and_disable() {
     let token = token_line(&enabled);
     assert!(sandbox.config.join("lan-token").is_file());
     assert!(sandbox.config.join("lan.json").is_file());
+
+    let page = raw_request(&address, "GET", "/", "", b"");
+    assert_eq!(page.status, 200, "console must load before login");
 
     let denied = request(&address, "GET", "/api/v1/services", "", b"");
     assert_eq!(denied.status, 401);
