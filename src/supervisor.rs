@@ -1,12 +1,4 @@
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum State {
-    Stopped,
-    Starting,
-    Running,
-    Stopping,
-    Backoff,
-    Failed,
-}
+pub use crate::registry::State;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {

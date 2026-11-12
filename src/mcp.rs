@@ -1,15 +1,15 @@
-use crate::registry::{Registry, State};
+use crate::registry::Registry;
 use serde_json::{json, Value};
 
 pub fn tools(reg: &Registry) -> Vec<Value> {
     let mut out = Vec::new();
-    for svc in reg.services.values() {
+    for svc in reg.values() {
         out.push(json!({
             "name": format!("{}.start", svc.id),
             "description": format!("Start service {}", svc.id),
             "inputSchema": {"type": "object", "properties": {}}
         }));
-        if matches!(svc.state, State::Live) {
+        if svc.state.is_live() {
             for cap in &svc.caps {
                 out.push(json!({
                     "name": format!("{}.{}", svc.id, cap),
