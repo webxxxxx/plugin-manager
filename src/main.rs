@@ -1,17 +1,20 @@
+mod definition;
 mod http;
 mod mcp;
 mod package;
+mod paths;
 mod registry;
 mod rpc;
+mod status;
 mod supervisor;
 mod svc;
 
-use registry::{Kind, Registry, Service, State};
-
 fn main() {
     let arg0 = std::env::args().next().unwrap_or_default();
+    // Installed entries are hardlinks/symlinks named `svc`, `plugin`, `mcp`
+    // (and `.exe` variants on Windows); dispatch on the stem, not the suffix.
     let name = std::path::Path::new(&arg0)
-        .file_name()
+        .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("svcd");
 
@@ -24,23 +27,13 @@ fn main() {
 }
 
 fn svcd_run() -> i32 {
-    // The skeleton exercises every layer so the linker keeps it. The bytes are
-    // the point, not the behaviour: this is the size-gate fixture.
-    let mut reg = Registry::new();
-    reg.upsert(Service {
-        id: "svc".into(),
-        kind: Kind::Core,
-        state: State::Live,
-        deps: vec![],
-        caps: vec!["list".into(), "describe".into()],
-    });
-    reg.upsert(Service {
-        id: "wireguard".into(),
-        kind: Kind::Plugin,
-        state: State::Dead,
-        deps: vec!["svc".into()],
-        caps: vec!["status".into(), "up".into()],
-    });
+    // The skeleton exercises every layer so the linker keeps it. The registry is
+    // real now: built-in `svc` plus services.d, the same view `svc list` uses.
+    let loaded = definition::load_services(&paths::services_dir());
+    for issue in &loaded.issues {
+        eprintln!("svcd: warning: {}", issue);
+    }
+    let reg = loaded.registry;
 
     let order = reg.topo().unwrap_or_default();
     let mut proc = supervisor::Service::new();
@@ -56,7 +49,8 @@ fn svcd_run() -> i32 {
     let tools = mcp::tools(&reg);
 
     println!(
-        "order={:?} actions={:?} line={} http={:?} manifest={:?} tools={}",
+        "services={} order={:?} actions={:?} line={} http={:?} manifest={:?} tools={}",
+        reg.len(),
         order,
         actions,
         line,
