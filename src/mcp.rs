@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-const MODERN_VERSION: &str = "2026-07-28";
+pub const MODERN_VERSION: &str = "2026-07-28";
 const LEGACY_VERSIONS: [&str; 3] = ["2025-11-25", "2025-06-18", "2025-03-26"];
 const SERVER_NAME: &str = "svcd";
 const TTL_MS: u64 = 1000;
@@ -168,6 +168,46 @@ enum Outcome {
     Exit(i32),
 }
 
+/// What a modern (2026-07-28) request produced. `Unreachable` still carries a
+/// reply for the client, but the control channel is gone: the stdio bridge
+/// sends it and exits 1; HTTP sends the same JSON-RPC envelope and stays up.
+pub enum Served {
+    Respond(rpc::Response),
+    Unreachable(rpc::Response),
+}
+
+impl Served {
+    fn new(response: rpc::Response, fatal: bool) -> Self {
+        if fatal {
+            Served::Unreachable(response)
+        } else {
+            Served::Respond(response)
+        }
+    }
+}
+
+/// Serve one modern request. The stdio bridge and the HTTP transport both call
+/// this, so tool visibility, `_meta` validation and error mapping cannot drift
+/// between the two surfaces.
+pub fn serve_modern(config: &Path, request: &rpc::Request) -> Served {
+    let id = request.id.clone();
+    if let Err(response) = validate_meta(id.clone(), &request.params) {
+        return Served::Respond(response);
+    }
+    match request.method.as_str() {
+        "server/discover" => Served::Respond(discover(id)),
+        "tools/list" => {
+            let (response, fatal) = tools_list(config, id, Era::Modern);
+            Served::new(response, fatal)
+        }
+        "tools/call" => {
+            let (response, fatal) = tools_call(config, id, Era::Modern, &request.params);
+            Served::new(response, fatal)
+        }
+        _ => Served::Respond(rpc::err(id, -32601, "method not found")),
+    }
+}
+
 struct Bridge {
     config: PathBuf,
     era: Option<Era>,
@@ -206,7 +246,10 @@ impl Bridge {
             });
         }
         let (response, exit) = match self.era.expect("era was just selected") {
-            Era::Modern => self.handle_modern(&request),
+            Era::Modern => match serve_modern(&self.config, &request) {
+                Served::Respond(response) => (response, false),
+                Served::Unreachable(response) => (response, true),
+            },
             Era::Legacy => self.handle_legacy(&request),
         };
         if let Err(error) = write_response(stdout, &response) {
@@ -220,92 +263,81 @@ impl Bridge {
         }
     }
 
-    fn handle_modern(&self, request: &rpc::Request) -> (rpc::Response, bool) {
-        let id = request.id.clone();
-        if let Err(response) = validate_meta(id.clone(), &request.params) {
-            return (response, false);
-        }
-        match request.method.as_str() {
-            "server/discover" => (discover(id), false),
-            "tools/list" => self.tools_list(id, Era::Modern),
-            "tools/call" => self.tools_call(id, Era::Modern, &request.params),
-            _ => (rpc::err(id, -32601, "method not found"), false),
-        }
-    }
-
     fn handle_legacy(&mut self, request: &rpc::Request) -> (rpc::Response, bool) {
         let id = request.id.clone();
         match request.method.as_str() {
             "initialize" => (self.initialize(id, &request.params), false),
             "ping" => (rpc::ok(id, json!({})), false),
-            "tools/list" => self.tools_list(id, Era::Legacy),
-            "tools/call" => self.tools_call(id, Era::Legacy, &request.params),
+            "tools/list" => tools_list(&self.config, id, Era::Legacy),
+            "tools/call" => tools_call(&self.config, id, Era::Legacy, &request.params),
             _ => (rpc::err(id, -32601, "method not found"), false),
         }
     }
+}
 
-    fn tools_list(&self, id: Option<Value>, era: Era) -> (rpc::Response, bool) {
-        match channel::request(&self.config, "registry.tools", json!({})) {
-            Ok(response) => {
-                if let Some(error) = response.error {
-                    return (error_response(id, error), false);
-                }
-                let tools = tools_from_result(response.result);
-                let mut result = json!({ "tools": tools });
-                if era == Era::Modern {
-                    result["resultType"] = json!("complete");
-                    result["ttlMs"] = json!(TTL_MS);
-                    result["cacheScope"] = json!("private");
-                    result["_meta"] = server_meta();
-                }
-                (rpc::ok(id, result), false)
+fn tools_list(config: &Path, id: Option<Value>, era: Era) -> (rpc::Response, bool) {
+    match channel::request(config, "registry.tools", json!({})) {
+        Ok(response) => {
+            if let Some(error) = response.error {
+                return (error_response(id, error), false);
             }
-            Err(error) => {
-                eprintln!("mcp: svcd unreachable: {}", error);
-                (
-                    rpc::err(id, -32603, &format!("svcd unreachable: {}", error)),
-                    true,
-                )
+            let tools = tools_from_result(response.result);
+            let mut result = json!({ "tools": tools });
+            if era == Era::Modern {
+                result["resultType"] = json!("complete");
+                result["ttlMs"] = json!(TTL_MS);
+                result["cacheScope"] = json!("private");
+                result["_meta"] = server_meta();
             }
+            (rpc::ok(id, result), false)
+        }
+        Err(error) => {
+            eprintln!("mcp: svcd unreachable: {}", error);
+            (
+                rpc::err(id, -32603, &format!("svcd unreachable: {}", error)),
+                true,
+            )
         }
     }
+}
 
-    fn tools_call(&self, id: Option<Value>, era: Era, params: &Value) -> (rpc::Response, bool) {
-        let Some(name) = params.get("name").and_then(Value::as_str) else {
-            return (
-                rpc::err(id, -32602, "tools/call requires params.name"),
-                false,
-            );
-        };
-        let arguments = params
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        let request = json!({ "name": name, "arguments": arguments });
-        match channel::request(&self.config, "registry.call", request) {
-            Ok(response) => {
-                if let Some(error) = response.error {
-                    return (error_response(id, error), false);
-                }
-                let mut result = tool_result_object(response.result.unwrap_or_else(|| json!({})));
-                if era == Era::Modern {
-                    result["resultType"] = json!("complete");
-                    result["_meta"] = server_meta();
-                }
-                (rpc::ok(id, result), false)
+fn tools_call(config: &Path, id: Option<Value>, era: Era, params: &Value) -> (rpc::Response, bool) {
+    let Some(name) = params.get("name").and_then(Value::as_str) else {
+        return (
+            rpc::err(id, -32602, "tools/call requires params.name"),
+            false,
+        );
+    };
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let request = json!({ "name": name, "arguments": arguments });
+    match channel::request(config, "registry.call", request) {
+        Ok(response) => {
+            if let Some(error) = response.error {
+                return (error_response(id, error), false);
             }
-            Err(error) => {
-                eprintln!("mcp: svcd unreachable: {}", error);
-                let mut result = tool_error_result(&format!("svcd unreachable: {}", error));
-                if era == Era::Modern {
-                    result["resultType"] = json!("complete");
-                    result["_meta"] = server_meta();
-                }
-                (rpc::ok(id, result), true)
+            let mut result = tool_result_object(response.result.unwrap_or_else(|| json!({})));
+            if era == Era::Modern {
+                result["resultType"] = json!("complete");
+                result["_meta"] = server_meta();
             }
+            (rpc::ok(id, result), false)
+        }
+        Err(error) => {
+            eprintln!("mcp: svcd unreachable: {}", error);
+            let mut result = tool_error_result(&format!("svcd unreachable: {}", error));
+            if era == Era::Modern {
+                result["resultType"] = json!("complete");
+                result["_meta"] = server_meta();
+            }
+            (rpc::ok(id, result), true)
         }
     }
+}
 
+impl Bridge {
     /// Answer the legacy handshake and take a baseline of the tool list so a
     /// change immediately after initialize is still notified by the poller.
     fn initialize(&mut self, id: Option<Value>, params: &Value) -> rpc::Response {
@@ -353,7 +385,7 @@ fn tool_result_object(result: Value) -> Value {
     }
 }
 
-fn validate_meta(id: Option<Value>, params: &Value) -> Result<(), rpc::Response> {
+pub(crate) fn validate_meta(id: Option<Value>, params: &Value) -> Result<(), rpc::Response> {
     let Some(meta) = params.get("_meta").and_then(Value::as_object) else {
         return Err(rpc::err(id, -32602, "missing _meta"));
     };
