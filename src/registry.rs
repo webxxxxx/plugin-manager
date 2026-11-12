@@ -79,6 +79,17 @@ pub struct Hook {
     pub timeout_ms: u64,
 }
 
+/// A capability advertised by a plugin manifest.
+///
+/// The aggregation layer passes `input_schema` through without validating it;
+/// the plugin owns the schema.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Capability {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
 /// Optional start/stop/status commands declared by a core definition.
 ///
 /// `start` replaces `exec` as the supervised foreground process; `stop` runs
@@ -100,9 +111,8 @@ pub struct Service {
     #[allow(dead_code)]
     pub desc: String,
     pub deps: Vec<String>,
-    /// Read by the MCP tool projection once the bridge lands (#32).
-    #[allow(dead_code)]
-    pub caps: Vec<String>,
+    /// Only plugins declare capabilities; core services are lifecycle units.
+    pub caps: Vec<Capability>,
     /// Used by the supervisor when it spawns a core service.
     pub exec: Option<Exec>,
     /// Optional lifecycle commands; plugins never have these.

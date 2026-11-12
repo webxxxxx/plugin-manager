@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -16,13 +16,14 @@ use crate::channel;
 use crate::definition;
 use crate::lan::LanStatus;
 use crate::log;
+use crate::mcp;
 use crate::package;
 use crate::paths;
 use crate::plugin::{self, Strategy};
 use crate::registry::{Hook, Kind, Registry, Service, State, RESERVED_ID};
 use crate::rpc;
 use crate::slot::hook_command;
-use crate::slot::Slot;
+use crate::slot::{CallError, Slot};
 use crate::status::Status;
 use crate::supervisor::{self, Event};
 
@@ -184,15 +185,14 @@ impl Daemon {
                 continue;
             }
             if let Some(exec) = service.exec.clone() {
-                slots.insert(
+                let mut slot = Slot::new(
                     service.id.clone(),
-                    Slot::new(
-                        service.id.clone(),
-                        exec,
-                        service.lifecycle.clone(),
-                        service.enabled,
-                    ),
+                    exec,
+                    service.lifecycle.clone(),
+                    service.enabled,
                 );
+                slot.set_protocol_only(service.kind == Kind::Plugin);
+                slots.insert(service.id.clone(), slot);
             }
         }
         Daemon {
@@ -265,11 +265,25 @@ impl Daemon {
     }
 
     fn handle(&mut self, incoming: channel::PendingCall) {
-        let response = match rpc::parse(&incoming.line) {
-            Ok(request) => self.dispatch(request),
-            Err(response) => response,
+        let request = match rpc::parse(&incoming.line) {
+            Ok(request) => request,
+            Err(response) => {
+                let _ = incoming.reply.send(rpc::to_line(&response));
+                return;
+            }
         };
-        let _ = incoming.reply.send(rpc::to_line(&response));
+        if request.auth.as_deref() != Some(self.token.as_str()) {
+            let response = rpc::err(request.id, -32000, "unauthorized");
+            let _ = incoming.reply.send(rpc::to_line(&response));
+            return;
+        }
+        match request.method.as_str() {
+            "registry.call" | "tools/call" => self.handle_tool_call(request, incoming.reply),
+            _ => {
+                let response = self.dispatch(request);
+                let _ = incoming.reply.send(rpc::to_line(&response));
+            }
+        }
     }
 
     fn dispatch(&mut self, request: rpc::Request) -> rpc::Response {
@@ -283,6 +297,7 @@ impl Daemon {
                 self.shutdown = true;
                 rpc::ok(id, json!({"ok": true}))
             }
+            "registry.tools" | "tools/list" => rpc::ok(id, json!({ "tools": self.tool_list() })),
             "svc.list" => rpc::ok(id, json!({"services": self.statuses()})),
             "svc.status" => match param_id(&request) {
                 Ok(service_id) => match self.status_for_id(&service_id) {
@@ -394,6 +409,135 @@ impl Daemon {
         self.registry
             .get(id)
             .map(|service| self.status_for(service))
+    }
+
+    /// The MCP projection asks the daemon rather than the registry because the
+    /// registry snapshot does not track the supervised process.
+    fn is_live(&self, id: &str) -> bool {
+        self.slots
+            .get(id)
+            .map(|slot| slot.machine.state == State::Running)
+            .unwrap_or(false)
+    }
+
+    fn tool_list(&self) -> Vec<Value> {
+        mcp::tools(&self.registry, |id| self.is_live(id))
+    }
+
+    /// Handle tools/call. Plugin calls are deferred: the plugin response arrives
+    /// on the slot pump, so the control connection stays open without blocking
+    /// the daemon's event loop. A start tool is synchronous because starting is
+    /// defined as synchronous in the service contract.
+    fn handle_tool_call(&mut self, request: rpc::Request, reply: Sender<String>) {
+        let id = request.id.clone();
+        let name = request
+            .params
+            .get("name")
+            .or_else(|| request.params.get("tool"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let Some(name) = name else {
+            send(
+                &reply,
+                rpc::err(id, -32602, "tools/call requires params.name"),
+            );
+            return;
+        };
+        let arguments = match request.params.get("arguments") {
+            None | Some(Value::Null) => json!({}),
+            Some(value) if value.is_object() => value.clone(),
+            Some(_) => {
+                send(
+                    &reply,
+                    rpc::err(id, -32602, "tools/call arguments must be an object"),
+                );
+                return;
+            }
+        };
+
+        // Only a known plugin's <id>.start is the lifecycle tool. A capability
+        // named "foo.start" falls through to the capability lookup below.
+        let start_id = name.strip_suffix(".start").filter(|service_id| {
+            self.registry
+                .get(service_id)
+                .map(|service| service.kind == Kind::Plugin)
+                .unwrap_or(false)
+        });
+        if let Some(service_id) = start_id {
+            let response = match self.start_service(service_id) {
+                Ok(status) => mcp::tool_result(id, status_json(status).to_string(), false),
+                Err(error) => mcp::tool_error(id, &error),
+            };
+            send(&reply, response);
+            return;
+        }
+
+        let Some((service_id, capability)) = name.split_once('.') else {
+            send(&reply, unknown_tool(&id, &name));
+            return;
+        };
+        let Some(service) = self.registry.get(service_id) else {
+            send(&reply, unknown_tool(&id, &name));
+            return;
+        };
+        if service.kind != Kind::Plugin || !service.caps.iter().any(|cap| cap.name == capability) {
+            send(&reply, unknown_tool(&id, &name));
+            return;
+        }
+
+        let now = self.now_ms();
+        let Some(slot) = self.slots.get_mut(service_id) else {
+            send(
+                &reply,
+                mcp::tool_result(id, format!("plugin {} has no runtime", service_id), true),
+            );
+            return;
+        };
+        match slot.request_capability(capability, arguments, id.clone(), now, reply.clone()) {
+            Ok(()) => {}
+            Err(CallError::Busy) => {
+                send(
+                    &reply,
+                    rpc::err(id, -32000, "busy: too many in-flight tool calls"),
+                );
+            }
+            Err(CallError::NotLive) => {
+                send(
+                    &reply,
+                    mcp::tool_result(
+                        id,
+                        format!(
+                            "plugin {} is not running; call {}.start first",
+                            service_id, service_id
+                        ),
+                        true,
+                    ),
+                );
+            }
+            Err(CallError::TooLarge) => {
+                // The caller's arguments are too large for the transport. The
+                // plugin did nothing wrong, so this is a params error rather
+                // than a plugin protocol violation.
+                send(
+                    &reply,
+                    rpc::err(
+                        id,
+                        -32602,
+                        "tools/call request exceeds the 1 MiB frame limit",
+                    ),
+                );
+            }
+            Err(CallError::Write(error)) => {
+                send(
+                    &reply,
+                    mcp::tool_result(
+                        id,
+                        format!("cannot write to plugin {}: {}", service_id, error),
+                        true,
+                    ),
+                );
+            }
+        }
     }
 
     /// Run the optional status hook. This is only called when the caller asks
@@ -565,10 +709,10 @@ impl Daemon {
         if !still_running {
             self.slots.remove(&id);
             if let Some(exec) = service.exec.clone() {
-                self.slots.insert(
-                    id.clone(),
-                    Slot::new(id.clone(), exec, service.lifecycle.clone(), service.enabled),
-                );
+                let mut slot =
+                    Slot::new(id.clone(), exec, service.lifecycle.clone(), service.enabled);
+                slot.set_protocol_only(true);
+                self.slots.insert(id.clone(), slot);
             }
         }
         self.registry.remove(&id);
@@ -790,6 +934,14 @@ fn status_json(status: Status) -> Value {
     serde_json::to_value(status).unwrap_or(Value::Null)
 }
 
+fn send(reply: &Sender<String>, response: rpc::Response) {
+    let _ = reply.send(rpc::to_line(&response));
+}
+
+fn unknown_tool(id: &Option<Value>, name: &str) -> rpc::Response {
+    rpc::err(id.clone(), -32602, &format!("unknown tool: {}", name))
+}
+
 fn run_status_hook(id: &str, hook: &Hook) -> String {
     let mut command = hook_command(id, "status", hook);
     command
@@ -904,7 +1056,23 @@ fn is_no_space(error: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{Exec, Kind, Ready, Service};
+    use crate::registry::{Capability, Exec, Kind, Ready, Service};
+
+    fn capability(name: &str) -> Capability {
+        Capability {
+            name: name.into(),
+            description: format!("{} description", name),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    fn plugin(id: &str, caps: &[&str]) -> Service {
+        Service {
+            kind: Kind::Plugin,
+            caps: caps.iter().map(|cap| capability(cap)).collect(),
+            ..service(id, &[])
+        }
+    }
 
     fn service(id: &str, deps: &[&str]) -> Service {
         Service {
@@ -999,6 +1167,275 @@ mod tests {
             missing_dependencies(&registry, "app"),
             vec!["missing".to_string()]
         );
+    }
+
+    fn tool_agent(root: &Path) -> Exec {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let script = root.join("agent.sh");
+            std::fs::write(
+                &script,
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *svcd.ping*) printf '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n' ;;
+    *'"name":"echo"'*) printf '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}\n' ;;
+    *'"name":"fail"'*) printf '{"jsonrpc":"2.0","id":3,"error":{"code":-32000,"message":"boom"}}\n' ;;
+    *'"name":"hang"'*) ;;
+    *'"name":"crash"'*) exit 0 ;;
+  esac
+done
+"#,
+            )
+            .expect("script");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+            Exec {
+                path: "/bin/sh".into(),
+                args: vec![script.to_string_lossy().to_string()],
+                env: Default::default(),
+                ready: Ready::Notify,
+            }
+        }
+        #[cfg(windows)]
+        {
+            let script = root.join("agent.ps1");
+            std::fs::write(
+                &script,
+                r#"$reader = [Console]::In
+while ($null -ne ($line = $reader.ReadLine())) {
+  $msg = $line | ConvertFrom-Json
+  if ($msg.method -eq 'svcd.ping') {
+    [Console]::Out.WriteLine('{"jsonrpc":"2.0","id":' + $msg.id + ',"result":{"ok":true}}')
+    [Console]::Out.Flush()
+    continue
+  }
+  if ($msg.method -eq 'tools/call') {
+    $name = $msg.params.name
+    if ($name -eq 'crash') { exit 0 }
+    if ($name -eq 'hang') { continue }
+    if ($name -eq 'echo') {
+      $out = '{"jsonrpc":"2.0","id":' + $msg.id + ',"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}'
+    } elseif ($name -eq 'fail') {
+      $out = '{"jsonrpc":"2.0","id":' + $msg.id + ',"error":{"code":-32000,"message":"boom"}}'
+    } else {
+      continue
+    }
+    [Console]::Out.WriteLine($out)
+    [Console]::Out.Flush()
+  }
+}
+"#,
+            )
+            .expect("script");
+            let powershell = std::env::var_os("SystemRoot")
+                .map(|root| Path::new(&root).join("System32/WindowsPowerShell/v1.0/powershell.exe"))
+                .filter(|path| path.is_file())
+                .unwrap_or_else(|| std::path::PathBuf::from("powershell.exe"));
+            Exec {
+                path: powershell.to_string_lossy().to_string(),
+                args: vec![
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-ExecutionPolicy".into(),
+                    "Bypass".into(),
+                    "-File".into(),
+                    script.to_string_lossy().to_string(),
+                ],
+                env: Default::default(),
+                ready: Ready::Notify,
+            }
+        }
+    }
+
+    fn send(daemon: &mut Daemon, method: &str, params: Value) -> Receiver<String> {
+        let line = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+            "auth": "token",
+        }))
+        .expect("request");
+        let (sender, receiver) = mpsc::channel();
+        daemon.handle(channel::PendingCall {
+            line,
+            reply: sender,
+        });
+        receiver
+    }
+
+    fn wait(daemon: &mut Daemon, receiver: &Receiver<String>) -> rpc::Response {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(line) = receiver.try_recv() {
+                return serde_json::from_str(&line).expect("response json");
+            }
+            daemon.pump();
+            assert!(Instant::now() < deadline, "no response");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_live_plugin_routes_tool_calls_and_fails_them_on_a_crash() {
+        let nanos = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("svcd-tools-unit-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir_all(root.join("logs")).expect("logs");
+        std::env::set_var("SVCD_LOG_DIR", root.join("logs"));
+
+        let plugin = Service {
+            id: "plug".into(),
+            kind: Kind::Plugin,
+            version: "1.0.0".into(),
+            desc: "tools".into(),
+            deps: Vec::new(),
+            caps: vec![
+                capability("echo"),
+                capability("fail"),
+                capability("hang"),
+                capability("crash"),
+            ],
+            exec: Some(tool_agent(&root)),
+            lifecycle: None,
+            enabled: true,
+            state: State::Stopped,
+            pid: None,
+            since: None,
+            ready_since: None,
+            next_at: None,
+            failures: 0,
+            last_exit: None,
+            config: None,
+        };
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(registry(vec![plugin]), "token".into(), receiver, None);
+        daemon.start_service("plug").expect("start");
+        assert!(daemon.is_live("plug"));
+
+        let echo = send(
+            &mut daemon,
+            "tools/call",
+            json!({"name": "plug.echo", "arguments": {}}),
+        );
+        let response = wait(&mut daemon, &echo);
+        assert_eq!(
+            response.result.expect("echo result")["content"][0]["text"],
+            "pong"
+        );
+
+        let fail = send(&mut daemon, "tools/call", json!({"name": "plug.fail"}));
+        let result = wait(&mut daemon, &fail).result.expect("failure result");
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["content"][0]["text"], "boom");
+
+        let hung = send(&mut daemon, "tools/call", json!({"name": "plug.hang"}));
+        let _crashed = send(&mut daemon, "tools/call", json!({"name": "plug.crash"}));
+        let result = wait(&mut daemon, &hung).result.expect("crash result");
+        assert_eq!(result["isError"], true);
+        assert!(!daemon.is_live("plug"));
+
+        let tools = daemon.tool_list();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "plug.start");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tool_projection_follows_the_live_state() {
+        let registry = registry(vec![plugin("plug", &["echo"])]);
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(registry, "token".into(), receiver, None);
+
+        let tools = daemon.tool_list();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "plug.start");
+
+        daemon.slots.get_mut("plug").expect("slot").machine.state = State::Running;
+        let tools = daemon.tool_list();
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["plug.echo", "plug.start"]);
+
+        daemon.slots.get_mut("plug").expect("slot").machine.state = State::Backoff;
+        assert_eq!(daemon.tool_list().len(), 1);
+    }
+
+    #[test]
+    fn tools_list_and_unknown_tool_use_the_documented_codes() {
+        let registry = registry(vec![plugin("plug", &["echo"])]);
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(registry, "token".into(), receiver, None);
+
+        let listed = send(&mut daemon, "tools/list", json!({}));
+        let listed = wait(&mut daemon, &listed);
+        assert_eq!(
+            listed.result.expect("result")["tools"]
+                .as_array()
+                .expect("array")
+                .len(),
+            1
+        );
+
+        let unknown = send(&mut daemon, "tools/call", json!({"name": "plug.nope"}));
+        let unknown = wait(&mut daemon, &unknown);
+        assert_eq!(unknown.error.expect("error").code, -32602);
+
+        let missing = send(&mut daemon, "tools/call", json!({}));
+        let missing = wait(&mut daemon, &missing);
+        assert_eq!(missing.error.expect("error").code, -32602);
+    }
+
+    #[test]
+    fn a_known_tool_on_a_dead_plugin_is_a_tool_error() {
+        let registry = registry(vec![plugin("plug", &["echo"])]);
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(registry, "token".into(), receiver, None);
+
+        let response = send(&mut daemon, "tools/call", json!({"name": "plug.echo"}));
+        let response = wait(&mut daemon, &response);
+        let result = response.result.expect("tool result");
+        assert_eq!(result["isError"], true);
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .expect("text")
+            .contains("plug.start"));
+    }
+
+    #[test]
+    fn a_capability_ending_in_start_is_not_shadowed_by_the_lifecycle_tool() {
+        let registry = registry(vec![plugin("plug", &["foo.start"])]);
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(registry, "token".into(), receiver, None);
+
+        let response = send(&mut daemon, "tools/call", json!({"name": "plug.foo.start"}));
+        let response = wait(&mut daemon, &response);
+
+        let result = response.result.expect("tool result");
+        assert_eq!(result["isError"], true);
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .expect("text")
+            .contains("plug.start"));
+    }
+
+    #[test]
+    fn core_services_are_not_tools() {
+        let registry = registry(vec![service("core", &[])]);
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(registry, "token".into(), receiver, None);
+
+        let response = send(&mut daemon, "tools/call", json!({"name": "core.start"}));
+        let response = wait(&mut daemon, &response);
+        assert_eq!(response.error.expect("error").code, -32602);
     }
 
     #[test]

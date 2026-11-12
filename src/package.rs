@@ -61,10 +61,8 @@ pub struct Exec {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Capability {
     pub name: String,
-    #[allow(dead_code)]
     pub desc: String,
     #[serde(rename = "inputSchema")]
-    #[allow(dead_code)]
     pub input_schema: serde_json::Value,
 }
 
@@ -415,6 +413,9 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
                 capability.name
             ));
         }
+        if capability.name == "start" {
+            return Err("capability name \"start\" is reserved for the lifecycle tool".into());
+        }
         if !names.insert(&capability.name) {
             return Err(format!("duplicate capability: {}", capability.name));
         }
@@ -744,7 +745,7 @@ pub fn pem_from_public(key: &[u8; 32]) -> Vec<u8> {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::sync::OnceLock;
 
     static TRUST: OnceLock<tempdir::TempDir> = OnceLock::new();
@@ -911,6 +912,21 @@ mod tests {
         let bytes = package_from(&key, "test", &manifest, &[("../escape", data, 0o755)]);
         let error = verify_bytes(&bytes).expect_err("unsafe path");
         assert!(error.contains("unsafe path"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_capability_named_start() {
+        let (bytes, _files) = manifest(target());
+        let mut value: Value = serde_json::from_slice(&bytes).expect("manifest");
+        value["capabilities"] = json!([
+            {"name": "start", "desc": "reserved", "inputSchema": {"type": "object"}}
+        ]);
+        let manifest = serde_json::to_vec(&value).expect("manifest");
+        let manifest = parse_manifest(&manifest).expect("parse");
+
+        let error = validate_manifest(&manifest).expect_err("reserved capability");
+
+        assert!(error.contains("reserved"), "{error}");
     }
 
     #[test]
