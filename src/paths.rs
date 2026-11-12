@@ -15,6 +15,16 @@ pub fn services_dir() -> PathBuf {
     config_dir().join("services.d")
 }
 
+/// The platform log directory. `SVCD_LOG_DIR` overrides it for tests and
+/// non-root development; production paths are `/var/log/svcd`,
+/// `/Library/Logs/svcd` and `%ProgramData%\svcd\logs`.
+pub fn logs_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("SVCD_LOG_DIR") {
+        return PathBuf::from(dir);
+    }
+    platform_logs_dir()
+}
+
 #[cfg(target_os = "windows")]
 fn platform_config_dir() -> PathBuf {
     let base = std::env::var_os("ProgramData")
@@ -31,4 +41,22 @@ fn platform_config_dir() -> PathBuf {
 #[cfg(all(unix, not(target_os = "macos")))]
 fn platform_config_dir() -> PathBuf {
     PathBuf::from("/etc/svcd")
+}
+
+#[cfg(target_os = "windows")]
+fn platform_logs_dir() -> PathBuf {
+    let base = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    base.join("svcd").join("logs")
+}
+
+#[cfg(target_os = "macos")]
+fn platform_logs_dir() -> PathBuf {
+    PathBuf::from("/Library/Logs/svcd")
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn platform_logs_dir() -> PathBuf {
+    PathBuf::from("/var/log/svcd")
 }

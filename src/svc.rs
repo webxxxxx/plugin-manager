@@ -1,3 +1,7 @@
+use std::io::Write;
+use std::path::Path;
+use std::time::Duration;
+
 use serde_json::{json, Value};
 
 use crate::channel;
@@ -20,7 +24,6 @@ enum DaemonVerb {
     Stop,
     Enable,
     Disable,
-    Logs,
 }
 
 impl DaemonVerb {
@@ -30,7 +33,6 @@ impl DaemonVerb {
             DaemonVerb::Stop => "stop",
             DaemonVerb::Enable => "enable",
             DaemonVerb::Disable => "disable",
-            DaemonVerb::Logs => "logs",
         }
     }
 }
@@ -38,8 +40,19 @@ impl DaemonVerb {
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     List,
-    Status { id: String, json: bool },
-    Daemon { verb: DaemonVerb, id: String },
+    Status {
+        id: String,
+        json: bool,
+    },
+    Daemon {
+        verb: DaemonVerb,
+        id: String,
+    },
+    Logs {
+        id: String,
+        follow: bool,
+        lines: usize,
+    },
 }
 
 pub fn run(args: Vec<String>) -> i32 {
@@ -55,6 +68,7 @@ pub fn run(args: Vec<String>) -> i32 {
         Command::List => list(),
         Command::Status { id, json } => show_status(&id, json),
         Command::Daemon { verb, id } => daemon_command(verb, &id),
+        Command::Logs { id, follow, lines } => show_logs(&id, follow, lines),
     }
 }
 
@@ -85,7 +99,7 @@ fn parse(args: &[String]) -> Result<Command, ()> {
             }
             id.map(|id| Command::Status { id, json }).ok_or(())
         }
-        "start" | "stop" | "enable" | "disable" | "logs" => {
+        "start" | "stop" | "enable" | "disable" => {
             if args.len() != 2 || args[1].starts_with('-') {
                 return Err(());
             }
@@ -94,7 +108,6 @@ fn parse(args: &[String]) -> Result<Command, ()> {
                 "stop" => DaemonVerb::Stop,
                 "enable" => DaemonVerb::Enable,
                 "disable" => DaemonVerb::Disable,
-                "logs" => DaemonVerb::Logs,
                 _ => unreachable!("matched daemon command"),
             };
             Ok(Command::Daemon {
@@ -102,8 +115,43 @@ fn parse(args: &[String]) -> Result<Command, ()> {
                 id: args[1].clone(),
             })
         }
+        "logs" => parse_logs(&args[1..]),
         _ => Err(()),
     }
+}
+
+fn parse_logs(args: &[String]) -> Result<Command, ()> {
+    let mut id = None;
+    let mut follow = false;
+    let mut lines = 200usize;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--follow" {
+            follow = true;
+        } else if arg == "--lines" {
+            index += 1;
+            let value = args.get(index).ok_or(())?;
+            lines = parse_lines(value)?;
+        } else if let Some(value) = arg.strip_prefix("--lines=") {
+            lines = parse_lines(value)?;
+        } else if arg.starts_with('-') || id.is_some() {
+            return Err(());
+        } else {
+            id = Some(arg.clone());
+        }
+        index += 1;
+    }
+    let id = id.ok_or(())?;
+    Ok(Command::Logs { id, follow, lines })
+}
+
+fn parse_lines(value: &str) -> Result<usize, ()> {
+    let lines = value.parse::<usize>().map_err(|_| ())?;
+    if lines > 2000 {
+        return Err(());
+    }
+    Ok(lines)
 }
 
 fn list() -> i32 {
@@ -177,43 +225,87 @@ fn show_status(id: &str, json: bool) -> i32 {
 }
 
 fn daemon_command(verb: DaemonVerb, id: &str) -> i32 {
-    match verb {
-        DaemonVerb::Start | DaemonVerb::Stop | DaemonVerb::Enable | DaemonVerb::Disable => {
-            let method = match verb {
-                DaemonVerb::Start => "svc.start",
-                DaemonVerb::Stop => "svc.stop",
-                DaemonVerb::Enable => "svc.enable",
-                DaemonVerb::Disable => "svc.disable",
-                DaemonVerb::Logs => unreachable!("matched lifecycle verb"),
-            };
-            match channel::request(&paths::config_dir(), method, json!({ "id": id })) {
-                Ok(response) => match response.error {
-                    Some(error) => {
-                        eprintln!("svc: {}", error.message);
-                        EXIT_SERVICE_ERROR
-                    }
-                    None => match response.result {
-                        Some(result) => print_status_value(result, false),
-                        None => {
-                            eprintln!("svc: empty {} response", verb.as_str());
-                            EXIT_SERVICE_ERROR
-                        }
-                    },
-                },
-                Err(error) => {
-                    eprintln!("svc: svcd unreachable: {}", error);
-                    EXIT_DAEMON_UNREACHABLE
+    let method = match verb {
+        DaemonVerb::Start => "svc.start",
+        DaemonVerb::Stop => "svc.stop",
+        DaemonVerb::Enable => "svc.enable",
+        DaemonVerb::Disable => "svc.disable",
+    };
+    match channel::request(&paths::config_dir(), method, json!({ "id": id })) {
+        Ok(response) => match response.error {
+            Some(error) => {
+                eprintln!("svc: {}", error.message);
+                EXIT_SERVICE_ERROR
+            }
+            None => match response.result {
+                Some(result) => print_status_value(result, false),
+                None => {
+                    eprintln!("svc: empty {} response", verb.as_str());
+                    EXIT_SERVICE_ERROR
+                }
+            },
+        },
+        Err(error) => {
+            eprintln!("svc: svcd unreachable: {}", error);
+            EXIT_DAEMON_UNREACHABLE
+        }
+    }
+}
+
+fn show_logs(id: &str, follow: bool, lines: usize) -> i32 {
+    let path = if id == "svcd" {
+        paths::logs_dir().join("svcd.log")
+    } else {
+        paths::logs_dir().join(format!("{}.log", id))
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("svc: no log for {}", id);
+            return EXIT_NOT_FOUND;
+        }
+        Err(error) => {
+            eprintln!("svc: cannot read {}: {}", path.display(), error);
+            return EXIT_SERVICE_ERROR;
+        }
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let tail = text
+        .lines()
+        .rev()
+        .take(lines)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev();
+    for line in tail {
+        println!("{}", line);
+    }
+    if follow {
+        follow_log(&path, bytes.len() as u64);
+    }
+    EXIT_OK
+}
+
+fn follow_log(path: &Path, mut offset: u64) -> ! {
+    use std::io::{Read, Seek, SeekFrom};
+
+    loop {
+        if let Ok(metadata) = std::fs::metadata(path) {
+            if metadata.len() < offset {
+                offset = 0;
+            }
+        }
+        if let Ok(mut file) = std::fs::File::open(path) {
+            if file.seek(SeekFrom::Start(offset)).is_ok() {
+                let mut buffer = String::new();
+                if file.read_to_string(&mut buffer).is_ok() && !buffer.is_empty() {
+                    print!("{}", buffer);
+                    let _ = std::io::stdout().flush();
+                    offset = offset.saturating_add(buffer.len() as u64);
                 }
             }
         }
-        DaemonVerb::Logs => {
-            if channel::request(&paths::config_dir(), "svcd.ping", json!({})).is_ok() {
-                eprintln!("svc: {} is not implemented yet", verb.as_str());
-                EXIT_SERVICE_ERROR
-            } else {
-                daemon_unreachable(verb.as_str(), id)
-            }
-        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -243,15 +335,11 @@ fn print_status(status: Status, json: bool) -> i32 {
 }
 
 // Only the verbs not implemented by #29 reach this helper.
-fn daemon_unreachable(verb: &str, id: &str) -> i32 {
-    eprintln!("svc: svcd unreachable: cannot {} {}", verb, id);
-    EXIT_DAEMON_UNREACHABLE
-}
-
 fn usage() {
     eprintln!("usage: svc list");
     eprintln!("       svc status [--json] <id>");
-    eprintln!("       svc <start|stop|enable|disable|logs> <id>");
+    eprintln!("       svc <start|stop|enable|disable> <id>");
+    eprintln!("       svc logs <id> [--follow] [--lines N]");
 }
 
 #[cfg(test)]
@@ -314,6 +402,37 @@ mod tests {
         assert!(parse(&args(&["start"])).is_err());
         assert!(parse(&args(&["stop", "demo", "extra"])).is_err());
         assert!(parse(&args(&["logs", "--follow"])).is_err());
+    }
+
+    #[test]
+    fn parses_logs_with_flags_and_a_default_tail() {
+        assert_eq!(
+            parse(&args(&["logs", "demo"])).expect("logs"),
+            Command::Logs {
+                id: "demo".into(),
+                follow: false,
+                lines: 200
+            }
+        );
+        assert_eq!(
+            parse(&args(&["logs", "--follow", "demo", "--lines", "5"])).expect("logs"),
+            Command::Logs {
+                id: "demo".into(),
+                follow: true,
+                lines: 5
+            }
+        );
+        assert_eq!(
+            parse(&args(&["logs", "demo", "--lines=7"])).expect("logs"),
+            Command::Logs {
+                id: "demo".into(),
+                follow: false,
+                lines: 7
+            }
+        );
+        assert!(parse(&args(&["logs"])).is_err());
+        assert!(parse(&args(&["logs", "demo", "--lines", "nope"])).is_err());
+        assert!(parse(&args(&["logs", "demo", "--lines", "2001"])).is_err());
     }
 
     #[test]
