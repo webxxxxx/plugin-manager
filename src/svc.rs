@@ -178,11 +178,13 @@ fn show_status(id: &str, json: bool) -> i32 {
 
 fn daemon_command(verb: DaemonVerb, id: &str) -> i32 {
     match verb {
-        DaemonVerb::Start | DaemonVerb::Stop => {
+        DaemonVerb::Start | DaemonVerb::Stop | DaemonVerb::Enable | DaemonVerb::Disable => {
             let method = match verb {
                 DaemonVerb::Start => "svc.start",
                 DaemonVerb::Stop => "svc.stop",
-                _ => unreachable!("matched lifecycle verb"),
+                DaemonVerb::Enable => "svc.enable",
+                DaemonVerb::Disable => "svc.disable",
+                DaemonVerb::Logs => unreachable!("matched lifecycle verb"),
             };
             match channel::request(&paths::config_dir(), method, json!({ "id": id })) {
                 Ok(response) => match response.error {
@@ -204,7 +206,7 @@ fn daemon_command(verb: DaemonVerb, id: &str) -> i32 {
                 }
             }
         }
-        DaemonVerb::Enable | DaemonVerb::Disable | DaemonVerb::Logs => {
+        DaemonVerb::Logs => {
             if channel::request(&paths::config_dir(), "svcd.ping", json!({})).is_ok() {
                 eprintln!("svc: {} is not implemented yet", verb.as_str());
                 EXIT_SERVICE_ERROR

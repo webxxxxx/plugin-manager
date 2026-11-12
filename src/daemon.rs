@@ -225,6 +225,14 @@ impl Daemon {
                 Ok(service_id) => status_response(id, -32004, self.stop_service(&service_id)),
                 Err(response) => response,
             },
+            "svc.enable" => match param_id(&request) {
+                Ok(service_id) => status_response(id, -32005, self.set_enabled(&service_id, true)),
+                Err(response) => response,
+            },
+            "svc.disable" => match param_id(&request) {
+                Ok(service_id) => status_response(id, -32005, self.set_enabled(&service_id, false)),
+                Err(response) => response,
+            },
             _ => rpc::err(id, -32601, "method not found"),
         }
     }
@@ -329,6 +337,37 @@ impl Daemon {
             }
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    fn set_enabled(&mut self, id: &str, enabled: bool) -> Result<Status, String> {
+        if self.registry.get(id).is_none() {
+            return Err(format!("unknown service: {}", id));
+        }
+        if id == RESERVED_ID {
+            return Err("the built-in svc service cannot be enabled or disabled".into());
+        }
+        let marker = paths::services_dir().join(format!("{}.disabled", id));
+        if enabled {
+            if marker.exists() {
+                fs::remove_file(&marker)
+                    .map_err(|error| format!("cannot remove {}: {}", marker.display(), error))?;
+            }
+        } else {
+            if let Some(parent) = marker.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("cannot create {}: {}", parent.display(), error))?;
+            }
+            fs::write(&marker, b"")
+                .map_err(|error| format!("cannot write {}: {}", marker.display(), error))?;
+        }
+        if let Some(service) = self.registry.get_mut(id) {
+            service.enabled = enabled;
+        }
+        if let Some(slot) = self.slots.get_mut(id) {
+            slot.machine.enabled = enabled;
+        }
+        self.status_for_id(id)
+            .ok_or_else(|| format!("unknown service: {}", id))
     }
 
     fn stop_service(&mut self, id: &str) -> Result<Status, String> {
