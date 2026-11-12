@@ -8,17 +8,20 @@ pub struct Request {
     pub method: String,
     #[serde(default)]
     pub params: Value,
+    /// Local management channel token; plugin stdio never sets it.
+    #[serde(default)]
+    pub auth: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Error {
     pub code: i32,
     pub message: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Response {
-    pub jsonrpc: &'static str,
+    pub jsonrpc: String,
     pub id: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
@@ -27,12 +30,17 @@ pub struct Response {
 }
 
 pub fn parse(line: &str) -> Result<Request, Response> {
-    serde_json::from_str::<Request>(line).map_err(|e| err(None, -32700, &e.to_string()))
+    let request =
+        serde_json::from_str::<Request>(line).map_err(|e| err(None, -32700, &e.to_string()))?;
+    if request.jsonrpc != "2.0" {
+        return Err(err(request.id, -32600, "jsonrpc must be 2.0"));
+    }
+    Ok(request)
 }
 
 pub fn ok(id: Option<Value>, result: Value) -> Response {
     Response {
-        jsonrpc: "2.0",
+        jsonrpc: "2.0".into(),
         id,
         result: Some(result),
         error: None,
@@ -41,7 +49,7 @@ pub fn ok(id: Option<Value>, result: Value) -> Response {
 
 pub fn err(id: Option<Value>, code: i32, message: &str) -> Response {
     Response {
-        jsonrpc: "2.0",
+        jsonrpc: "2.0".into(),
         id,
         result: None,
         error: Some(Error {
@@ -51,6 +59,17 @@ pub fn err(id: Option<Value>, code: i32, message: &str) -> Response {
     }
 }
 
+pub fn notification(method: &str, params: Value) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+    })
+    .to_string()
+}
+
 pub fn to_line(r: &Response) -> String {
-    serde_json::to_string(r).unwrap_or_else(|_| "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"encode\"}}".to_string())
+    serde_json::to_string(r).unwrap_or_else(|_| {
+        "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"encode\"}}".to_string()
+    })
 }

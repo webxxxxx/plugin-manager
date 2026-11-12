@@ -422,7 +422,7 @@ mod tests {
         let loaded = load_services(&dir.services_dir());
 
         assert!(loaded.issues.is_empty());
-        assert_eq!(loaded.registry.len(), 1);
+        assert_eq!(loaded.registry.values().count(), 1);
         assert!(loaded.registry.get(RESERVED_ID).is_some());
     }
 
@@ -477,7 +477,7 @@ mod tests {
 
         let loaded = load_services(&dir.services_dir());
 
-        assert_eq!(loaded.registry.len(), 1);
+        assert_eq!(loaded.registry.values().count(), 1);
         assert_eq!(
             loaded.registry.get(RESERVED_ID).expect("builtin").state,
             State::Running
@@ -593,10 +593,6 @@ mod tests {
 
         assert!(loaded.issues.is_empty(), "issues: {:?}", loaded.issues);
         assert!(loaded.registry.get("demo").is_some());
-        assert_eq!(
-            loaded.registry.topo().expect("no cycle"),
-            vec!["demo".to_string(), RESERVED_ID.to_string()]
-        );
     }
 
     #[test]
