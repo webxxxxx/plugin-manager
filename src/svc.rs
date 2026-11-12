@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 use crate::channel;
 use crate::definition;
+use crate::log;
 use crate::paths;
 use crate::rpc;
 use crate::status::{self, Status};
@@ -392,8 +393,8 @@ fn show_logs(id: &str, follow: bool, lines: usize) -> i32 {
     } else {
         paths::logs_dir().join(format!("{}.log", id))
     };
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
+    let tail = match log::tail(&path, lines) {
+        Ok(tail) => tail,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             eprintln!("svc: no log for {}", id);
             return EXIT_NOT_FOUND;
@@ -403,19 +404,10 @@ fn show_logs(id: &str, follow: bool, lines: usize) -> i32 {
             return EXIT_SERVICE_ERROR;
         }
     };
-    let text = String::from_utf8_lossy(&bytes);
-    let tail = text
-        .lines()
-        .rev()
-        .take(lines)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev();
-    for line in tail {
-        println!("{}", line);
-    }
+    print!("{}", tail);
     if follow {
-        follow_log(&path, bytes.len() as u64);
+        let offset = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        follow_log(&path, offset);
     }
     EXIT_OK
 }

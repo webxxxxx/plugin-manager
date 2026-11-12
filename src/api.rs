@@ -23,6 +23,8 @@ use crate::lan::{self, AuthKind, Lan, LanStatus};
 use crate::log;
 use crate::package;
 use crate::paths;
+use crate::plugin;
+use crate::transfer;
 
 const DEFAULT_PORT: u16 = 8787;
 const MAX_BODY: u64 = 512 * 1024 * 1024;
@@ -30,6 +32,12 @@ const MAX_JSON_BODY: u64 = 1024 * 1024;
 const MAX_HEADER: usize = 64 * 1024;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+/// Serialise config writes inside this process. The on-disk `config.lock`
+/// covers other processes on Unix; this mutex also covers Windows, where
+/// `flock` is a no-op, and keeps two HTTP threads from sharing the same
+/// `config.tmp.<pid>` path.
+static CONFIG_WRITES: Mutex<()> = Mutex::new(());
 
 pub struct Api {
     config: PathBuf,
@@ -332,7 +340,9 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, Vec<u8>> {
             "chunked bodies are not supported",
         ));
     }
-    let limit = if request.path.starts_with("/api/v1/plugins") {
+    let limit = if request.path.starts_with("/api/v1/plugins")
+        || request.path.starts_with("/api/v1/import")
+    {
         MAX_BODY
     } else {
         MAX_JSON_BODY
@@ -454,6 +464,19 @@ fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<
                 Err(response) => response,
             }
         }
+        ("POST", ["api", "v1", "config", id, "reset"]) => reset_config(config, &decode(id)),
+        (_, ["api", "v1", "config", _, "reset"]) => method_not_allowed("POST"),
+        ("GET", ["api", "v1", "config", id]) => get_config(config, &decode(id)),
+        ("PUT", ["api", "v1", "config", id]) => put_config(config, &decode(id), request),
+        (_, ["api", "v1", "config", _]) => method_not_allowed("GET, PUT"),
+        ("GET", ["api", "v1", "export", id, "config"]) => export_config(config, &decode(id)),
+        (_, ["api", "v1", "export", _, "config"]) => method_not_allowed("GET"),
+        ("GET", ["api", "v1", "export", id]) => export_spkb(config, &decode(id)),
+        (_, ["api", "v1", "export", _]) => method_not_allowed("GET"),
+        ("POST", ["api", "v1", "import"]) => import_plugin(request, query),
+        (_, ["api", "v1", "import"]) => method_not_allowed("POST"),
+        ("GET", ["api", "v1", "logs", id]) => logs(config, &decode(id), query),
+        (_, ["api", "v1", "logs", _]) => method_not_allowed("GET"),
         _ => error(404, "not_found", "unknown endpoint"),
     }
 }
@@ -520,6 +543,195 @@ fn install_plugin(config: &std::path::Path, request: &HttpRequest, query: &str) 
     }
 }
 
+fn require_plugin(config: &Path, id: &str) -> Result<(), Vec<u8>> {
+    if !package::valid_name(id) {
+        return Err(error(404, "not_found", &format!("unknown plugin: {}", id)));
+    }
+    let status = rpc(config, "svc.status", json!({ "id": id }))?;
+    let kind = status
+        .pointer("/summary/kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if kind == "plugin" {
+        Ok(())
+    } else {
+        Err(error(404, "not_found", &format!("not a plugin: {}", id)))
+    }
+}
+
+fn config_lock() -> std::sync::MutexGuard<'static, ()> {
+    CONFIG_WRITES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn get_config(config: &Path, id: &str) -> Vec<u8> {
+    if let Err(response) = require_plugin(config, id) {
+        return response;
+    }
+    let Some(path) = plugin::active_config(id) else {
+        return error(404, "not_found", &format!("plugin {} has no config", id));
+    };
+    match fs::read(&path) {
+        Ok(data) => http::response(200, "text/plain", &data),
+        Err(cause) => error(500, "internal", &format!("read config: {}", cause)),
+    }
+}
+
+fn put_config(config: &Path, id: &str, request: &HttpRequest) -> Vec<u8> {
+    if let Err(response) = require_plugin(config, id) {
+        return response;
+    }
+    let _guard = config_lock();
+    let _lock = match plugin::lock_config(id) {
+        Ok(lock) => lock,
+        Err(message) => return error(500, "internal", &message),
+    };
+    match plugin::replace_config(id, &request.body, true) {
+        Ok(()) => ok(json!({ "ok": true })),
+        Err(message) => config_error(&message),
+    }
+}
+
+fn reset_config(config: &Path, id: &str) -> Vec<u8> {
+    if let Err(response) = require_plugin(config, id) {
+        return response;
+    }
+    let Some((template, _)) = plugin::config_template(id) else {
+        return error(
+            404,
+            "not_found",
+            &format!("plugin {} has no config template", id),
+        );
+    };
+    let _guard = config_lock();
+    let _lock = match plugin::lock_config(id) {
+        Ok(lock) => lock,
+        Err(message) => return error(500, "internal", &message),
+    };
+    match plugin::replace_config(id, &template, true) {
+        Ok(()) => ok(json!({ "ok": true })),
+        Err(message) => config_error(&message),
+    }
+}
+
+fn export_spkb(config: &Path, id: &str) -> Vec<u8> {
+    if let Err(response) = require_plugin(config, id) {
+        return response;
+    }
+    match plugin::export_spkb(id) {
+        Ok((version, data)) => download(&format!("{}-{}.spkb", id, version), &data),
+        Err(message) => error(500, "internal", &message),
+    }
+}
+
+fn export_config(config: &Path, id: &str) -> Vec<u8> {
+    if let Err(response) = require_plugin(config, id) {
+        return response;
+    }
+    match plugin::export_config(id) {
+        Ok((version, data)) => download(&format!("{}-{}.config", id, version), &data),
+        Err(message) if message.contains("has no config") => error(404, "not_found", &message),
+        Err(message) => error(500, "internal", &message),
+    }
+}
+
+fn import_plugin(request: &HttpRequest, query: &str) -> Vec<u8> {
+    let config_id = query_value(query, "config_id");
+    let no_config = query_bool(query, "no_config").unwrap_or(false);
+    let force = query_bool(query, "force").unwrap_or(false);
+    let _guard = config_lock();
+    match transfer::import(&request.body, config_id.as_deref(), no_config, force) {
+        Ok(outcome) => {
+            let mut body = json!({
+                "ok": true,
+                "configApplied": outcome.config.is_some(),
+            });
+            if let Some(status) = outcome.status {
+                body["id"] = json!(status.summary.id);
+                body["version"] = json!(status.summary.version);
+                body["state"] = json!(status.summary.state);
+            } else if let Some(id) = outcome.config.clone() {
+                body["id"] = json!(id);
+            }
+            if !outcome.warnings.is_empty() {
+                body["warnings"] = json!(outcome.warnings);
+            }
+            ok(body)
+        }
+        Err(transfer::Error::Usage(message)) => error(400, "bad_request", &message),
+        Err(transfer::Error::Failed(message)) => map_error(&message),
+    }
+}
+
+fn logs(config: &Path, id: &str, query: &str) -> Vec<u8> {
+    if let Err(response) = require_plugin(config, id) {
+        return response;
+    }
+    let lines = match query_value(query, "lines") {
+        None => 200,
+        Some(value) => match value.parse::<usize>() {
+            Ok(lines) if lines <= 2000 => lines,
+            _ => {
+                return error(
+                    400,
+                    "bad_request",
+                    "lines must be an integer between 0 and 2000",
+                )
+            }
+        },
+    };
+    let path = paths::logs_dir().join(format!("{}.log", id));
+    match log::tail(&path, lines) {
+        Ok(text) => http::response(200, "text/plain; charset=utf-8", text.as_bytes()),
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {
+            error(404, "not_found", &format!("no log for {}", id))
+        }
+        Err(cause) => error(500, "internal", &format!("cannot read log: {}", cause)),
+    }
+}
+
+fn method_not_allowed(allow: &str) -> Vec<u8> {
+    let body = json!({
+        "error": {
+            "code": "method_not_allowed",
+            "message": format!("method not allowed; use {}", allow),
+        }
+    });
+    http::response_with_headers(
+        405,
+        "application/json",
+        &[("Allow".to_string(), allow.to_string())],
+        &serde_json::to_vec(&body).unwrap_or_default(),
+    )
+}
+
+fn download(filename: &str, data: &[u8]) -> Vec<u8> {
+    http::response_with_headers(
+        200,
+        "application/octet-stream",
+        &[(
+            "Content-Disposition".to_string(),
+            format!("attachment; filename=\"{}\"", filename),
+        )],
+        data,
+    )
+}
+
+fn config_error(message: &str) -> Vec<u8> {
+    let lower = message.to_ascii_lowercase();
+    let status = if lower.contains("unknown plugin") {
+        404
+    } else if lower.contains("exceeds 1 mib") {
+        413
+    } else if lower.contains("configcheck") {
+        409
+    } else {
+        500
+    };
+    error(status, code_for(status), message)
+}
+
 fn rpc(config: &std::path::Path, method: &str, params: Value) -> Result<Value, Vec<u8>> {
     let response = channel::request(config, method, params)
         .map_err(|cause| error(500, "internal", &format!("svcd unreachable: {}", cause)))?;
@@ -541,6 +753,7 @@ fn map_error(message: &str) -> Vec<u8> {
         || lower.contains("core service")
         || lower.contains("conflict")
         || lower.contains("cannot be enabled")
+        || lower.contains("already installed")
     {
         409
     } else if lower.contains("signature")
@@ -552,6 +765,8 @@ fn map_error(message: &str) -> Vec<u8> {
         || lower.contains("invalid")
         || lower.contains("not declared")
         || lower.contains("missing")
+        || lower.contains("does not match")
+        || lower.contains("unsupported")
     {
         400
     } else {

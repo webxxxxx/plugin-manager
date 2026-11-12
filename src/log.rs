@@ -121,6 +121,23 @@ pub fn svcd(text: &str) {
     }
 }
 
+/// Return the last `lines` lines of `path`, each terminated by a newline.
+///
+/// Both `svc logs` and `GET /api/v1/logs/{id}` project the file this way, so a
+/// tail is defined once instead of being re-implemented by each caller.
+pub fn tail(path: &Path, lines: usize) -> io::Result<String> {
+    let bytes = fs::read(path)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut tail: Vec<&str> = text.lines().rev().take(lines).collect();
+    tail.reverse();
+    let mut out = String::new();
+    for line in tail {
+        out.push_str(line);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +180,17 @@ mod tests {
 
         let text = fs::read_to_string(dir.0.join("demo.log")).expect("read");
         assert_eq!(text, "hello\nworld\n");
+    }
+
+    #[test]
+    fn tail_returns_the_requested_lines_with_newlines() {
+        let dir = TempDir::new();
+        let path = dir.0.join("demo.log");
+        fs::write(&path, "one\ntwo\nthree\n").expect("write log");
+
+        assert_eq!(tail(&path, 2).expect("tail"), "two\nthree\n");
+        assert_eq!(tail(&path, 0).expect("tail"), "");
+        assert!(tail(&dir.0.join("missing.log"), 2).is_err());
     }
 
     #[test]

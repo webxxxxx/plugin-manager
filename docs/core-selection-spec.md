@@ -223,7 +223,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - **LAN token 等价于 root / Administrator**：install、uninstall、import、editconfig 都通过它授权。默认 LAN 关闭、无 TLS；只用于可信网络（见 §6 / §13-C5）。
 - 语义映射 `svc.*`，与 CLI 同源；不写第二套状态。错误：`{error:{code,message}}`，400 / 401 / 403 / 404 / 409 / 413 / 500；start/stop 幂等。
 - 上传大小：`.spk` / `.spkb` 512 MiB（与解包上限一致）；配置 1 MiB；日志响应 1 MiB。
-- **实现状态（2026-11-12，#37 / #38）**：已实现 `GET /services`、`GET /services/{id}`、`POST start/stop`、`GET /version`、`POST /plugins`、`DELETE /plugins/{id}`；默认绑定 `127.0.0.1:8787`（`SVCD_HTTP_PORT` 覆盖，`0` 为临时端口并写 `<config>/http.port`），**无 TLS**；`svc lan enable` 可切到 LAN 并要求 Bearer/cookie 认证（#38）。import/export/config/logs 归 #39。
+- **实现状态（2026-11-12，#37 / #38 / #39）**：已实现 `GET /services`、`GET /services/{id}`、`POST start/stop`、`GET /version`、`POST /plugins`、`DELETE /plugins/{id}`；默认绑定 `127.0.0.1:8787`（`SVCD_HTTP_PORT` 覆盖，`0` 为临时端口并写 `<config>/http.port`），**无 TLS**；`svc lan enable` 可切到 LAN 并要求 Bearer/cookie 认证（#38）。#39 补齐 `GET/PUT /config/{id}`、`POST /config/{id}/reset`、`GET /export/{id}` 与 `/export/{id}/config`、`POST /import`（自动识别）、`GET /logs/{id}?lines=N`（默认 200、上限 2000、不提供 follow）；这些端点只接受 plugin id，core 服务返回 404，方法不符返回 405。
 
 ### 3.6 LAN 鉴权与会话
 
@@ -289,7 +289,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
   - `import <file>`：tar 首条目 `backup.json` → `.spkb`；`manifest.json` → `.spk`；其它 → 裸配置，必须 `--config <id>`。id 不符拒绝；版本不同警告；`--no-config` 跳过；`--force` 只跳过同版本检查，不跳签名。
 - 配置上限 1 MiB；插件私有格式（JSON/TOML/YAML/ini 都行），svcd 不解析、不做 schema、不做升级字段合并；无 `configCheck` 时只保留 last-good。
 - 权限：写（install / editconfig / import / uninstall）要 root；只读（status / logs / `editconfig --print` / `export`）组可用；配置明文，不加密（见 §13-C5）。
-- **实现状态（2026-11-12，#34）**：安装复制模板 / `config.template.sha256` / 模板变化写 `config.new`；`editconfig`（`--print/--file/--reset`、`$EDITOR`、`configCheck` 10s、last-good、flock）；`export`（config-only / `.spkb`）与 `import`（`.spkb` / `.spk` / 裸配置自动识别）已实现。HTTP config/export/import 端点归 #39；hooks 仍拒绝。
+- **实现状态（2026-11-12，#34 / #39）**：安装复制模板 / `config.template.sha256` / 模板变化写 `config.new`；`editconfig`（`--print/--file/--reset`、`$EDITOR`、`configCheck` 10s、last-good、flock）；`export`（config-only / `.spkb`）与 `import`（`.spkb` / `.spk` / 裸配置自动识别）已实现。HTTP config/export/import 端点已由 #39 实现（`GET/PUT /config/{id}`、`POST /config/{id}/reset`、`GET /export/{id}` 与 `/export/{id}/config`、`POST /import`）；hooks 仍拒绝。
 
 ### 5.4 logs
 
