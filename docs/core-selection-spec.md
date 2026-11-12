@@ -223,6 +223,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - **LAN token 等价于 root / Administrator**：install、uninstall、import、editconfig 都通过它授权。默认 LAN 关闭、无 TLS；只用于可信网络（见 §6 / §13-C5）。
 - 语义映射 `svc.*`，与 CLI 同源；不写第二套状态。错误：`{error:{code,message}}`，400 / 401 / 403 / 404 / 409 / 413 / 500；start/stop 幂等。
 - 上传大小：`.spk` / `.spkb` 512 MiB（与解包上限一致）；配置 1 MiB；日志响应 1 MiB。
+- **实现状态（2026-11-12，#37）**：已实现 `GET /services`、`GET /services/{id}`、`POST start/stop`、`GET /version`、`POST /plugins`、`DELETE /plugins/{id}`；默认绑定 `127.0.0.1:8787`（`SVCD_HTTP_PORT` 覆盖，`0` 为临时端口并写 `<config>/http.port`），**无 TLS、无认证**；LAN/Bearer/cookie 认证归 #38，import/export/config/logs 归 #39。
 
 ### 3.6 LAN 鉴权与会话
 
@@ -319,7 +320,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - 工具链：ubuntu-24.04 上用 cargo-zigbuild（pin `=0.24.1`）+ Zig（`0.17.1`）出三架构 musl；Windows/macOS 原生 runner；唯一高风险环是 armv7+musl 的 zig 链接。
 - 计量：multicall 单二进制，strip 后、未压缩、十进制字节；硬链接算一次；编译进二进制的资源算；安装的 unit/config 与插件不算。
 - 门禁：嵌入式 **≤ 2,000,000 B**、桌面 **≤ 30,000,000 B** 超限 fail；基线 +2% warning；`tools/measure_size.py` + `.github/workflows/size.yml` + `ci/size-baseline.json`。
-- 实测基线（2026-11-12 本机）：musl x86_64 `992,176 B`；Windows x86_64 `806,912 B`；macOS / Linux gnu 待 CI 首跑。
+- 实测基线（2026-11-12 本机）：musl x86_64 `1,041,328 B`；Windows x86_64 `834,048 B`；macOS / Linux gnu 待 CI 首跑。
 - **30MB 只约束核心二进制**；安装包不计门禁，只记录体积（见 §13-C2）。
 
 ## 8. 桌面交付
@@ -463,7 +464,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 | [#34](https://github.com/webxxxxx/plugin-manager/issues/34) | 配置流 | #30 | manifest 还缺 `config`/`configCheck`；其余全缺 |
 | [#35](https://github.com/webxxxxx/plugin-manager/issues/35) | 日志与 `svc logs` | #29 | 无 |
 | [#36](https://github.com/webxxxxx/plugin-manager/issues/36) | 安装为系统服务 | #29 | 无 |
-| [#37](https://github.com/webxxxxx/plugin-manager/issues/37) | HTTP 管理 API | #29 #30 | 无 |
+| [#37](https://github.com/webxxxxx/plugin-manager/issues/37) | HTTP 管理 API | #29 #30 | 服务/插件/版本端点已实现；loopback、无 auth；#38/#39 待补 |
 | [#38](https://github.com/webxxxxx/plugin-manager/issues/38) | LAN 鉴权与会话 | #37 | 无 |
 | [#39](https://github.com/webxxxxx/plugin-manager/issues/39) | HTTP 配置/导入导出/日志 | #34 #35 #37 | 无 |
 | [#40](https://github.com/webxxxxx/plugin-manager/issues/40) | HTTP `/mcp` | #32 #38 | 无 |

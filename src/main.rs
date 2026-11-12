@@ -1,3 +1,4 @@
+mod api;
 mod channel;
 mod daemon;
 mod definition;

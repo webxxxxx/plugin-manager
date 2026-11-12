@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
 
+use crate::api;
 use crate::channel;
 use crate::definition;
 use crate::log;
@@ -70,6 +71,9 @@ pub fn run() -> i32 {
     if let Err(error) = channel::spawn_server(&config, tx) {
         log::svcd(&format!("svcd: cannot bind control channel: {}", error));
         return 1;
+    }
+    if let Err(error) = api::spawn(config.clone()) {
+        log::svcd(&format!("svcd: HTTP API disabled: {}", error));
     }
     notify_systemd("READY=1");
 
