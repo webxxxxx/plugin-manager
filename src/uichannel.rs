@@ -6,7 +6,7 @@
 //! `POST /plugin-ui/{id}/rpc`. The HTTP layer owns authentication and Origin
 //! checks; this module owns the transports and the bounded fan-out.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::path::Path;
@@ -25,7 +25,9 @@ use crate::rpc;
 use crate::webui;
 
 const MAX_SUBSCRIBERS: usize = 64;
-const QUEUE: usize = 256;
+const QUEUE: usize = 512;
+const HISTORY_EVENTS: usize = 256;
+const HISTORY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MESSAGE: usize = 1024 * 1024;
 const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
 const WS_PING: Duration = Duration::from_secs(30);
@@ -40,9 +42,16 @@ pub struct Event {
 }
 
 pub struct EventBus {
-    inner: Mutex<HashMap<String, Vec<(u64, SyncSender<Event>)>>>,
+    inner: Mutex<HashMap<String, PluginState>>,
     next_seq: AtomicU64,
     next_sub: AtomicU64,
+}
+
+#[derive(Default)]
+struct PluginState {
+    subscribers: Vec<(u64, SyncSender<Event>)>,
+    history: VecDeque<Event>,
+    history_bytes: usize,
 }
 
 pub struct Subscription {
@@ -60,6 +69,15 @@ impl Drop for Subscription {
 #[derive(Debug)]
 pub enum SubscribeError {
     TooMany,
+}
+
+/// What the SSE handler should say before the live stream starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Replay {
+    /// The requested Last-Event-ID had already fallen out of the ring.
+    pub reset: bool,
+    /// How many historical events were queued for this subscription.
+    pub replayed: usize,
 }
 
 static BUS: OnceLock<Arc<EventBus>> = OnceLock::new();
@@ -86,11 +104,54 @@ impl EventBus {
         self: &Arc<Self>,
         plugin: &str,
     ) -> Result<(Receiver<Event>, Subscription), SubscribeError> {
-        let (sender, receiver) = mpsc::sync_channel(QUEUE);
-        let subscription = self.subscribe_with(plugin, sender)?;
+        let (receiver, subscription, _) = self.subscribe_from(plugin, None)?;
         Ok((receiver, subscription))
     }
 
+    /// Register a subscriber and, when last_event_id is present, queue the
+    /// events after it before the live stream. History lookup and registration
+    /// happen under one lock so a publish cannot slip between them.
+    pub fn subscribe_from(
+        self: &Arc<Self>,
+        plugin: &str,
+        last_event_id: Option<u64>,
+    ) -> Result<(Receiver<Event>, Subscription, Replay), SubscribeError> {
+        let (sender, receiver) = mpsc::sync_channel(QUEUE);
+        let id = self.next_sub.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut inner = self.lock();
+        let state = inner.entry(plugin.to_string()).or_default();
+        if state.subscribers.len() >= MAX_SUBSCRIBERS {
+            return Err(SubscribeError::TooMany);
+        }
+
+        let mut replay = Replay::default();
+        if let Some(last) = last_event_id {
+            if let (Some(oldest), Some(newest)) = (state.history.front(), state.history.back()) {
+                replay.reset = last < oldest.seq.saturating_sub(1);
+                if last < newest.seq {
+                    for event in state.history.iter().filter(|event| event.seq > last) {
+                        if sender.try_send(event.clone()).is_err() {
+                            return Err(SubscribeError::TooMany);
+                        }
+                        replay.replayed += 1;
+                    }
+                }
+            }
+        }
+
+        state.subscribers.push((id, sender));
+        Ok((
+            receiver,
+            Subscription {
+                bus: Arc::clone(self),
+                plugin: plugin.to_string(),
+                id,
+            },
+            replay,
+        ))
+    }
+
+    #[allow(dead_code)]
     pub fn subscribe_with(
         self: &Arc<Self>,
         plugin: &str,
@@ -98,11 +159,11 @@ impl EventBus {
     ) -> Result<Subscription, SubscribeError> {
         let id = self.next_sub.fetch_add(1, Ordering::SeqCst) + 1;
         let mut inner = self.lock();
-        let subscribers = inner.entry(plugin.to_string()).or_default();
-        if subscribers.len() >= MAX_SUBSCRIBERS {
+        let state = inner.entry(plugin.to_string()).or_default();
+        if state.subscribers.len() >= MAX_SUBSCRIBERS {
             return Err(SubscribeError::TooMany);
         }
-        subscribers.push((id, sender));
+        state.subscribers.push((id, sender));
         Ok(Subscription {
             bus: Arc::clone(self),
             plugin: plugin.to_string(),
@@ -112,13 +173,13 @@ impl EventBus {
 
     fn unsubscribe(&self, plugin: &str, id: u64) {
         let mut inner = self.lock();
-        let remove = inner
-            .get_mut(plugin)
-            .map(|subscribers| {
-                subscribers.retain(|(subscriber, _)| *subscriber != id);
-                subscribers.is_empty()
-            })
-            .unwrap_or(false);
+        let mut remove = false;
+        if let Some(state) = inner.get_mut(plugin) {
+            state
+                .subscribers
+                .retain(|(subscriber, _)| *subscriber != id);
+            remove = state.subscribers.is_empty() && state.history.is_empty();
+        }
         if remove {
             inner.remove(plugin);
         }
@@ -136,28 +197,40 @@ impl EventBus {
             .to_string(),
         };
         let mut inner = self.lock();
-        let mut remove = false;
-        if let Some(subscribers) = inner.get_mut(plugin) {
-            subscribers.retain(|(_, sender)| match sender.try_send(event.clone()) {
+        let state = inner.entry(plugin.to_string()).or_default();
+        state.history_bytes = state.history_bytes.saturating_add(event.json.len());
+        state.history.push_back(event.clone());
+        while state.history.len() > HISTORY_EVENTS || state.history_bytes > HISTORY_BYTES {
+            let Some(expired) = state.history.pop_front() else {
+                break;
+            };
+            state.history_bytes = state.history_bytes.saturating_sub(expired.json.len());
+        }
+        state
+            .subscribers
+            .retain(|(_, sender)| match sender.try_send(event.clone()) {
                 Ok(()) => true,
                 Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
             });
-            remove = subscribers.is_empty();
-        }
-        if remove {
-            inner.remove(plugin);
-        }
     }
 
     #[allow(dead_code)]
     pub fn subscriber_count(&self, plugin: &str) -> usize {
         self.lock()
             .get(plugin)
-            .map(|subscribers| subscribers.len())
+            .map(|state| state.subscribers.len())
             .unwrap_or(0)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<(u64, SyncSender<Event>)>>> {
+    #[allow(dead_code)]
+    pub fn history_len(&self, plugin: &str) -> usize {
+        self.lock()
+            .get(plugin)
+            .map(|state| state.history.len())
+            .unwrap_or(0)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, PluginState>> {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -172,7 +245,11 @@ impl Default for EventBus {
 
 /// Write one SSE response and stream notifications until the client or the
 /// subscription goes away. The caller has already authenticated the request.
-pub fn serve_sse(stream: &mut TcpStream, receiver: Receiver<Event>) -> io::Result<()> {
+pub fn serve_sse(
+    stream: &mut TcpStream,
+    receiver: Receiver<Event>,
+    replay: Replay,
+) -> io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_write_timeout(Some(SSE_HEARTBEAT + Duration::from_secs(5)))?;
     stream.write_all(
@@ -183,6 +260,15 @@ pub fn serve_sse(stream: &mut TcpStream, receiver: Receiver<Event>) -> io::Resul
           X-Accel-Buffering: no\r\n\
           Transfer-Encoding: chunked\r\n\r\n",
     )?;
+    if replay.reset
+        && write_chunk(
+            stream,
+            b"event: reset\ndata: {\"reason\":\"replay-unavailable\"}\n\n",
+        )
+        .is_err()
+    {
+        return Ok(());
+    }
     loop {
         match receiver.recv_timeout(SSE_HEARTBEAT) {
             Ok(event) => {
@@ -676,6 +762,50 @@ mod tests {
     }
 
     #[test]
+    fn event_bus_replays_after_last_event_id() {
+        let bus = Arc::new(EventBus::new());
+        bus.publish("replay", "notifications/message", &json!({"data": "one"}));
+        bus.publish("replay", "notifications/message", &json!({"data": "two"}));
+        bus.publish("replay", "notifications/message", &json!({"data": "three"}));
+        let (receiver, subscription, replay) =
+            bus.subscribe_from("replay", Some(1)).expect("subscribe");
+        assert!(!replay.reset);
+        assert_eq!(replay.replayed, 2);
+        let first = receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("first replay");
+        let second = receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("second replay");
+        assert_eq!((first.seq, second.seq), (2, 3));
+
+        bus.publish("replay", "notifications/message", &json!({"data": "four"}));
+        let live = receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("live");
+        assert_eq!(live.seq, 4);
+        drop(subscription);
+    }
+
+    #[test]
+    fn event_bus_marks_a_gap_when_last_event_id_falls_out() {
+        let bus = Arc::new(EventBus::new());
+        for index in 0..(HISTORY_EVENTS + 5) {
+            bus.publish("gap", "notifications/message", &json!({"n": index}));
+        }
+        assert_eq!(bus.history_len("gap"), HISTORY_EVENTS);
+        let (receiver, subscription, replay) =
+            bus.subscribe_from("gap", Some(1)).expect("subscribe");
+        assert!(replay.reset);
+        assert_eq!(replay.replayed, HISTORY_EVENTS);
+        let first = receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("replay");
+        assert_eq!(first.seq, 6);
+        drop(subscription);
+    }
+
+    #[test]
     fn masked_client_frames_round_trip() {
         let payload = b"{\"jsonrpc\":\"2.0\"}";
         let mask = [1u8, 2, 3, 4];
@@ -763,7 +893,7 @@ mod tests {
         let address = listener.local_addr().expect("addr");
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
-            serve_sse(&mut stream, receiver).expect("serve sse");
+            serve_sse(&mut stream, receiver, Replay::default()).expect("serve sse");
         });
 
         let mut client = TcpStream::connect(address).expect("connect");
@@ -785,6 +915,43 @@ mod tests {
             String::from_utf8_lossy(&seen)
         );
         drop(subscription);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn sse_transport_writes_the_replay_reset_marker() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
+        let address = listener.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            serve_sse(
+                &mut stream,
+                receiver,
+                Replay {
+                    reset: true,
+                    replayed: 0,
+                },
+            )
+            .expect("serve sse");
+        });
+
+        let mut client = TcpStream::connect(address).expect("connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let head = read_head(&mut client);
+        assert!(head.contains("text/event-stream"), "{head}");
+        let mut body = Vec::new();
+        let mut byte = [0u8; 1];
+        while !body
+            .windows(18)
+            .any(|window| window == b"replay-unavailable")
+        {
+            client.read_exact(&mut byte).expect("reset marker");
+            body.push(byte[0]);
+        }
+        drop(sender);
         let _ = server.join();
     }
 

@@ -840,14 +840,22 @@ fn ws_read(stream: &mut TcpStream) -> (u8, Vec<u8>) {
 }
 
 fn sse_connect(address: &str, path: &str) -> TcpStream {
+    sse_connect_with_last_id(address, path, None)
+}
+
+fn sse_connect_with_last_id(address: &str, path: &str, last_id: Option<u64>) -> TcpStream {
     let mut stream = TcpStream::connect(address).expect("sse connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("sse timeout");
-    let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\n\r\n",
+    let mut request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\n",
         path, address
     );
+    if let Some(last_id) = last_id {
+        request.push_str(&format!("Last-Event-ID: {}\r\n", last_id));
+    }
+    request.push_str("\r\n");
     stream.write_all(request.as_bytes()).expect("sse request");
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
@@ -863,6 +871,12 @@ fn sse_connect(address: &str, path: &str) -> TcpStream {
         head
     );
     stream
+}
+
+fn sse_id(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("id: "))
+        .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
 fn sse_wait_for_data(stream: &mut TcpStream, needle: &str) -> String {
@@ -2284,4 +2298,40 @@ fn plugin_ui_streams_require_lan_auth_and_same_origin() {
         ],
     );
     assert_eq!(good.1, 101, "{}", good.2);
+}
+
+#[test]
+fn plugin_ui_sse_replays_after_last_event_id() {
+    let (_sandbox, address) = daemon_with_web_event_plugin(54);
+    let mut first = sse_connect(&address, "/plugin-ui/demo/events");
+    let call = request(
+        &address,
+        "POST",
+        "/plugin-ui/demo/rpc",
+        "application/json",
+        br#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"status","arguments":{}}}"#,
+    );
+    assert_eq!(call.status, 200, "{}", call.body);
+    let event = sse_wait_for_data(&mut first, "pong-event");
+    let last_id = sse_id(&event).expect("event id");
+    drop(first);
+
+    // No SSE subscriber is attached now, so this event survives only in the
+    // replay ring until the next connection asks for it.
+    let second = request(
+        &address,
+        "POST",
+        "/plugin-ui/demo/rpc",
+        "application/json",
+        br#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"status","arguments":{}}}"#,
+    );
+    assert_eq!(second.status, 200, "{}", second.body);
+
+    let mut replay = sse_connect_with_last_id(&address, "/plugin-ui/demo/events", Some(last_id));
+    let replayed = sse_wait_for_data(&mut replay, "pong-event");
+    let replayed_id = sse_id(&replayed).expect("replayed event id");
+    assert!(
+        replayed_id > last_id,
+        "expected an event after {last_id}, got {replayed_id}: {replayed}"
+    );
 }

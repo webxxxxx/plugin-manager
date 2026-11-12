@@ -6,3 +6,6 @@
 
 # 示例构建产物：用 tools/build_spk.mjs 生成，不入库
 /samples/out/
+
+# Python 字节码（samples/realtime 的 agent）
+__pycache__/
