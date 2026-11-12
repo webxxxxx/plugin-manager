@@ -2,7 +2,8 @@
 //!
 //! svcd serves a plugin's `payload/web/` tree under `/plugin-ui/{id}/`. The
 //! plugin never starts its own HTTP listener; `/plugin-ui/{id}/rpc` forwards a
-//! JSON-RPC request to the plugin's stdio channel (see `bridge_request`).
+//! JSON-RPC request to the plugin's stdio channel (see `bridge_request`), and
+//! `uichannel` mirrors the plugin's notifications to SSE/WebSocket clients.
 
 use serde_json::Value;
 

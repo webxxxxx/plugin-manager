@@ -470,6 +470,7 @@ impl Slot {
             ),
         };
         self.log_service(&text);
+        crate::uichannel::publish(&self.id, method, &params.cloned().unwrap_or(Value::Null));
     }
 
     fn complete_pending(&mut self, id: u64, message: &serde_json::Map<String, Value>) {
@@ -876,6 +877,28 @@ mod tests {
             },
         );
         rx
+    }
+
+    #[test]
+    fn notifications_are_mirrored_to_the_ui_bus() {
+        let (receiver, subscription) = crate::uichannel::bus()
+            .subscribe("slot-ui-test")
+            .expect("subscribe");
+        let mut slot = Slot::new("slot-ui-test".into(), exec(), None, true);
+        slot.handle_notification(
+            "notifications/message",
+            Some(&json!({"level": "info", "data": "hello"})),
+        );
+        let event = receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("event");
+        assert!(
+            event.json.contains("notifications/message"),
+            "{}",
+            event.json
+        );
+        assert!(event.json.contains("hello"), "{}", event.json);
+        drop(subscription);
     }
 
     #[test]

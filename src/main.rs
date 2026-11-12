@@ -22,6 +22,7 @@ mod status;
 mod supervisor;
 mod svc;
 mod transfer;
+mod uichannel;
 mod webui;
 
 fn main() {

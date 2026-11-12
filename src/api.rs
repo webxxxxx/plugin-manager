@@ -27,6 +27,7 @@ use crate::paths;
 use crate::plugin;
 use crate::rpc;
 use crate::transfer;
+use crate::uichannel;
 use crate::webui;
 
 const DEFAULT_PORT: u16 = 8787;
@@ -231,8 +232,126 @@ fn handle(mut stream: TcpStream, config: PathBuf, lan: Arc<Mutex<Lan>>) {
             return;
         }
     };
+    if handle_stream(&mut stream, &config, &request, &lan) {
+        return;
+    }
     let response = respond(&config, &request, &lan);
     let _ = stream.write_all(&response);
+}
+
+/// Serve the two streaming UI endpoints before the buffered router. Returns
+/// false when the path is not a UI stream so `respond` keeps its existing
+/// routes and error text.
+fn handle_stream(
+    stream: &mut TcpStream,
+    config: &Path,
+    request: &HttpRequest,
+    lan: &Arc<Mutex<Lan>>,
+) -> bool {
+    let path = request
+        .path
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(request.path.as_str());
+    let Some(ui) = ui_path(path) else {
+        return false;
+    };
+    if ui.sub != "events" && ui.sub != "ws" {
+        return false;
+    }
+    if request.method != "GET" {
+        let _ = stream.write_all(&method_not_allowed("GET"));
+        return true;
+    }
+    let auth = match lan.lock() {
+        Ok(mut state) => match state.authenticate(&request.headers) {
+            Ok(auth) => auth,
+            Err(()) => {
+                let _ = stream.write_all(&error(401, "unauthorized", "authentication required"));
+                return true;
+            }
+        },
+        Err(_) => {
+            let _ = stream.write_all(&error(500, "internal", "LAN state unavailable"));
+            return true;
+        }
+    };
+    if !package::valid_name(ui.id) || plugin::web_assets(ui.id).is_none() {
+        let _ = stream.write_all(&error(404, "not_found", "unknown plugin UI"));
+        return true;
+    }
+
+    let origin = request_header(request, "origin");
+    if origin.is_some() && !http::same_origin(&request.headers) {
+        let _ = stream.write_all(&error(
+            403,
+            "forbidden",
+            "cross-origin calls are not allowed",
+        ));
+        return true;
+    }
+
+    if ui.sub == "ws" {
+        if auth == AuthKind::Cookie && origin.is_none() {
+            let _ = stream.write_all(&error(
+                403,
+                "forbidden",
+                "Origin is required for cookie-authenticated WebSocket calls",
+            ));
+            return true;
+        }
+        let accept = match uichannel::ws_accept(&request.headers) {
+            Ok(accept) => accept,
+            Err(message) => {
+                let response = http::response_with_headers(
+                    426,
+                    "text/plain; charset=utf-8",
+                    &[
+                        ("Upgrade".to_string(), "websocket".to_string()),
+                        ("Sec-WebSocket-Version".to_string(), "13".to_string()),
+                    ],
+                    message.as_bytes(),
+                );
+                let _ = stream.write_all(&response);
+                return true;
+            }
+        };
+        let (receiver, subscription) = match uichannel::bus().subscribe(ui.id) {
+            Ok(subscription) => subscription,
+            Err(_) => {
+                let _ = stream.write_all(&error(
+                    429,
+                    "too_many_subscribers",
+                    "too many UI subscribers for this plugin",
+                ));
+                return true;
+            }
+        };
+        let handshake = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+            accept
+        );
+        if stream.write_all(handshake.as_bytes()).is_err() {
+            return true;
+        }
+        let _ = uichannel::serve_ws(stream, config, ui.id, receiver, subscription);
+        return true;
+    }
+
+    let (receiver, subscription) = match uichannel::bus().subscribe(ui.id) {
+        Ok(subscription) => subscription,
+        Err(_) => {
+            let _ = stream.write_all(&error(
+                429,
+                "too_many_subscribers",
+                "too many UI subscribers for this plugin",
+            ));
+            return true;
+        }
+    };
+    let _ = uichannel::serve_sse(stream, receiver);
+    drop(subscription);
+    true
 }
 
 fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u8> {
@@ -340,8 +459,9 @@ fn ui_path(path: &str) -> Option<UiPath<'_>> {
     })
 }
 
-/// Serve `/plugin-ui/{id}/...`: the plugin's package-local web assets plus
-/// the `/rpc` JSON-RPC bridge. A plugin never runs an HTTP listener of its own.
+/// Serve `/plugin-ui/{id}/...`: the plugin's package-local web assets, the
+/// `/rpc` JSON-RPC bridge, and the SSE/WebSocket realtime streams. A plugin
+/// never runs an HTTP listener of its own.
 fn plugin_ui(config: &Path, request: &HttpRequest, ui: &UiPath<'_>, auth: AuthKind) -> Vec<u8> {
     if !package::valid_name(ui.id) {
         return error(404, "not_found", "unknown plugin UI");
