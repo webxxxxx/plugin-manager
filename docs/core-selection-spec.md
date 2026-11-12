@@ -17,7 +17,6 @@
 - 桌面另有 `svc ui` 子命令作为 GUI 入口，不单独占入口名。
 - **PluginManager 不再存在**：不是进程、不是服务、不是保留名。插件管理是 svcd 的内部功能。
 - `svcd run --foreground` 供服务管理器拉起；`svcd install-service / uninstall-service` 向宿主注册自身（systemd / launchd / SCM / BusyBox inittab / procd 五份计划）。
-
 ### 1.2 服务与能力面
 
 - 每个服务有 id、kind（core / plugin）、生命周期、依赖与能力面。注册表 = 内置 `svc` + `services.d/*.json` 的 core + `<data>/plugins/*/current` 的 plugin；没有第二份清单。core 与 plugin 的来源、信任、安装方式见 §1.6。
@@ -45,6 +44,7 @@
 
 - 五份 `InstallPlan`：systemd（`/etc/systemd/system/svcd.service`，Type=notify、Restart=on-failure、TimeoutStopSec=40）、launchd（`/Library/LaunchDaemons/com.webxxxxx.svcd.plist`，KeepAlive、ThrottleInterval 10）、Windows SCM（`sc create` + failure actions）、BusyBox inittab（`::respawn:`）、procd（`/etc/init.d/svcd`）。
 - 安装需 root / Administrator；幂等（原子替换 + EnsureLine；`sc create` 1073 视为已存在）。
+- `svcd --install [--prefix] [--no-service] [--target]`：复制/硬链 `svcd`、`svc`、`plugin`、`mcp` 到平台默认目录（Unix `/usr/sbin`，Windows `%ProgramFiles%\svcd`），再调用 `install-service --program <安装路径>`；`--uninstall` 逆操作，默认保留 config/data/logs，`--purge` 才清。
 - 卸载默认保留 `<data>` 与配置，`--purge` 才删。
 
 ### 1.6 core 服务与 plugin 的边界
@@ -259,7 +259,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 
 ### 5.1 入口
 
-- `svcd`：守护进程；`svcd run --foreground`、`svcd install-service / uninstall-service`。
+- `svcd`：守护进程；`svcd run --foreground`、`svcd install-service / uninstall-service`、`svcd --install / --uninstall`。
 - `svc`：服务 CLI，接受任意服务 id（core 或 plugin）：`list / status / start / stop / enable / disable / logs / lan / version`。
 - `plugin`：插件 CLI，**只接受 `kind=plugin` 的 id**；动词与 `svc` 同源，另加 `install / uninstall / editconfig / export / import`。传 core 服务 id 报错「不是插件」。
 - `mcp`：stdio MCP 桥，每个客户端一个进程。
@@ -322,7 +322,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - 工具链：ubuntu-24.04 上用 cargo-zigbuild（pin `=0.24.1`）+ Zig（`0.17.1`）出三架构 musl；Windows/macOS 原生 runner；唯一高风险环是 armv7+musl 的 zig 链接。
 - 计量：multicall 单二进制，strip 后、未压缩、十进制字节；硬链接算一次；编译进二进制的资源算；安装的 unit/config 与插件不算。
 - 门禁：嵌入式 **≤ 2,000,000 B**、桌面 **≤ 30,000,000 B** 超限 fail；基线 +2% warning；`tools/measure_size.py` + `.github/workflows/size.yml` + `ci/size-baseline.json`。
-- 实测基线（2026-11-12 本机）：musl x86_64 `1,102,768 B`；Windows x86_64 `901,632 B`；macOS / Linux gnu 待 CI 首跑。
+- 实测基线（2026-11-12 本机）：musl x86_64 `1,119,152 B`；Windows x86_64 `910,848 B`；macOS / Linux gnu 待 CI 首跑。
 - **30MB 只约束核心二进制**；安装包不计门禁，只记录体积（见 §13-C2）。
 
 ## 8. 桌面交付
@@ -473,5 +473,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 | [#41](https://github.com/webxxxxx/plugin-manager/issues/41) | 桌面 `svc ui` | #33 #37 | 无 |
 | [#42](https://github.com/webxxxxx/plugin-manager/issues/42) | 发行包与签名 | #41 | 无 |
 | [#43](https://github.com/webxxxxx/plugin-manager/issues/43) | 嵌入式发行 | #29 #33 | 无 |
+
+> 后续追加：[#57](https://github.com/webxxxxx/plugin-manager/issues/57) `svcd --install / --uninstall` 自安装/卸载（复制四入口 + 调用 install-service；默认保留数据，`--purge` 清理）。
 
 **已打通的端到端路径**：`services.d/*.json` → `svcd run --foreground` → 真实进程（spawn / 就绪探针 / 退避 / stop）→ `svc list/status/start/stop` 经 UDS（Unix）/命名管道（Windows）。其余行的服务安装、插件、MCP、HTTP 面仍是骨架。

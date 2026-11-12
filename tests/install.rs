@@ -39,6 +39,7 @@ impl Sandbox {
             .args(args)
             .env("SVCD_CONFIG_DIR", self.config_dir())
             .env("SVCD_DATA_DIR", self.data_dir())
+            .env("SVCD_TEST_UNPRIVILEGED", "1")
             .output()
             .expect("run svcd")
     }
@@ -269,4 +270,89 @@ fn macos_detection_defaults_to_launchd() {
 
     assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
     assert!(stdout(&output).contains("install-service plan for launchd"));
+}
+
+#[test]
+fn self_install_copies_aliases_and_uninstalls_without_touching_the_host() {
+    let sandbox = Sandbox::new();
+    let prefix = sandbox.root.join("prefix");
+    let prefix_arg = prefix.to_str().expect("utf8");
+
+    let dry = sandbox.run(&[
+        "--install",
+        "--prefix",
+        prefix_arg,
+        "--no-service",
+        "--dry-run",
+    ]);
+    assert_eq!(dry.status.code(), Some(0), "{}", stderr(&dry));
+    assert!(stdout(&dry).contains("aliases:"));
+    assert!(!prefix.exists());
+
+    let service_dry = sandbox.run(&["--install", "--prefix", prefix_arg, "--dry-run"]);
+    assert_eq!(
+        service_dry.status.code(),
+        Some(0),
+        "{}",
+        stderr(&service_dry)
+    );
+    assert!(stdout(&service_dry).contains("service: program"));
+    assert!(!prefix.exists());
+
+    let installed = sandbox.run(&["--install", "--prefix", prefix_arg, "--no-service"]);
+    assert_eq!(installed.status.code(), Some(0), "{}", stderr(&installed));
+    let exe = if cfg!(windows) { "svcd.exe" } else { "svcd" };
+    assert!(prefix.join(exe).is_file());
+    for alias in ["svc", "plugin", "mcp"] {
+        let name = if cfg!(windows) {
+            format!("{}.exe", alias)
+        } else {
+            alias.to_string()
+        };
+        assert!(prefix.join(name).is_file(), "missing alias {}", alias);
+    }
+
+    let svc = prefix.join(if cfg!(windows) { "svc.exe" } else { "svc" });
+    let listed = Command::new(&svc)
+        .arg("list")
+        .env("SVCD_CONFIG_DIR", sandbox.config_dir())
+        .env("SVCD_DATA_DIR", sandbox.data_dir())
+        .output()
+        .expect("run installed svc");
+    assert_eq!(listed.status.code(), Some(0), "{}", stderr(&listed));
+    assert!(stdout(&listed).contains("svc"));
+
+    let removed = sandbox.run(&["--uninstall", "--prefix", prefix_arg, "--no-service"]);
+    assert_eq!(removed.status.code(), Some(0), "{}", stderr(&removed));
+    assert!(!prefix.join(exe).exists());
+    assert!(
+        sandbox.config_dir().exists(),
+        "default uninstall keeps config"
+    );
+
+    let purged = sandbox.run(&[
+        "--uninstall",
+        "--prefix",
+        prefix_arg,
+        "--no-service",
+        "--purge",
+    ]);
+    assert_eq!(purged.status.code(), Some(0), "{}", stderr(&purged));
+    assert!(!sandbox.config_dir().exists());
+    assert!(!sandbox.data_dir().exists());
+}
+
+#[test]
+fn install_service_accepts_a_program_override() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&[
+        "install-service",
+        "--dry-run",
+        "--target",
+        "systemd",
+        "--program",
+        "/opt/svcd",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stdout(&output).contains("/opt/svcd run --foreground"));
 }
