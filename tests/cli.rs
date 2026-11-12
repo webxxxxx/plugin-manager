@@ -26,6 +26,7 @@ impl Sandbox {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&root).expect("create sandbox");
+        fs::create_dir_all(root.join("logs")).expect("create logs");
 
         let binary_name = if cfg!(windows) { "svc.exe" } else { "svc" };
         let binary = root.join(binary_name);
@@ -44,6 +45,10 @@ impl Sandbox {
         self.root.join("config")
     }
 
+    fn logs_dir(&self) -> PathBuf {
+        self.root.join("logs")
+    }
+
     fn write_definition(&self, name: &str, definition: Value) {
         let directory = self.config_dir().join("services.d");
         fs::create_dir_all(&directory).expect("create services.d");
@@ -58,6 +63,7 @@ impl Sandbox {
         Command::new(&self.binary)
             .args(args)
             .env("SVCD_CONFIG_DIR", self.config_dir())
+            .env("SVCD_LOG_DIR", self.logs_dir())
             .output()
             .expect("run svc")
     }
@@ -219,6 +225,8 @@ fn usage_errors_exit_sixty_four() {
         vec!["status", "one", "two"],
         vec!["list", "--json"],
         vec!["describe", "demo"],
+        vec!["logs"],
+        vec!["logs", "demo", "--lines", "nope"],
     ] {
         let output = sandbox.run(&args);
         assert_eq!(
@@ -237,7 +245,7 @@ fn daemon_commands_exit_two_until_the_channel_exists() {
     let sandbox = Sandbox::new();
     sandbox.write_definition("demo", definition("demo"));
 
-    for verb in ["start", "stop", "enable", "disable", "logs"] {
+    for verb in ["start", "stop", "enable", "disable"] {
         let output = sandbox.run(&[verb, "demo"]);
         assert_eq!(
             output.status.code(),
@@ -248,6 +256,31 @@ fn daemon_commands_exit_two_until_the_channel_exists() {
         );
         assert!(stderr(&output).contains("unreachable"));
     }
+}
+
+#[test]
+fn logs_print_the_tail_without_a_daemon() {
+    let sandbox = Sandbox::new();
+    fs::write(sandbox.logs_dir().join("demo.log"), "one\ntwo\nthree\n").expect("write log");
+
+    let output = sandbox.run(&["logs", "demo", "--lines", "2"]);
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "two\nthree\n");
+}
+
+#[test]
+fn logs_read_svcd_log_and_missing_logs_exit_one() {
+    let sandbox = Sandbox::new();
+    fs::write(sandbox.logs_dir().join("svcd.log"), "svcd starting\n").expect("write log");
+
+    let output = sandbox.run(&["logs", "svcd"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "svcd starting\n");
+
+    let missing = sandbox.run(&["logs", "missing"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(stderr(&missing).contains("no log"));
 }
 
 #[test]

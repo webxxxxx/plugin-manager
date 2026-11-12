@@ -2,6 +2,7 @@ mod channel;
 mod daemon;
 mod definition;
 mod http;
+mod log;
 mod mcp;
 mod package;
 mod paths;

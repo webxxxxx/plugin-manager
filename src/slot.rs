@@ -1,10 +1,13 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use serde_json::{json, Value};
 
+use crate::log::{self, LogSink};
+use crate::paths;
 use crate::registry::{Exec, Ready, State};
 use crate::rpc;
 use crate::supervisor::{self, Action, Event, Machine};
@@ -66,7 +69,7 @@ impl Slot {
                         }
                     }
                     Err(error) => {
-                        eprintln!("svcd: {}: spawn failed: {}", self.id, error);
+                        log::svcd(&format!("svcd: {}: spawn failed: {}", self.id, error));
                         let actions = self.machine.step(Event::SpawnFailed, now);
                         self.run_actions(actions, now);
                     }
@@ -97,13 +100,13 @@ impl Slot {
                 command
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::inherit());
+                    .stderr(Stdio::piped());
             }
             Ready::Exec => {
                 command
                     .stdin(Stdio::null())
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit());
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
             }
         }
         #[cfg(unix)]
@@ -114,6 +117,17 @@ impl Slot {
 
         let mut child = command.spawn().map_err(|error| error.to_string())?;
         let pid = child.id();
+        let log = match LogSink::open(&paths::logs_dir(), &self.id) {
+            Ok(sink) => Some(Arc::new(Mutex::new(sink))),
+            Err(error) => {
+                log::svcd(&format!(
+                    "svcd: {}: cannot open service log: {}",
+                    self.id, error
+                ));
+                None
+            }
+        };
+
         if self.exec.ready == Ready::Notify {
             let stdin = child.stdin.take();
             let stdout = match child.stdout.take() {
@@ -124,7 +138,17 @@ impl Slot {
                     return Err("piped stdout is missing".into());
                 }
             };
+            let stderr = match child.stderr.take() {
+                Some(stderr) => stderr,
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("piped stderr is missing".into());
+                }
+            };
+
             let (sender, receiver) = mpsc::channel();
+            let stdout_log = log.clone();
             if let Err(error) = thread::Builder::new()
                 .name(format!("svcd-{}-stdout", self.id))
                 .spawn(move || {
@@ -132,6 +156,7 @@ impl Slot {
                     for line in reader.lines() {
                         match line {
                             Ok(line) => {
+                                log_line(&stdout_log, &line);
                                 if sender.send(line).is_err() {
                                     break;
                                 }
@@ -145,10 +170,76 @@ impl Slot {
                 let _ = child.wait();
                 return Err(error.to_string());
             }
+
+            let stderr_log = log.clone();
+            if let Err(error) = thread::Builder::new()
+                .name(format!("svcd-{}-stderr", self.id))
+                .spawn(move || {
+                    let reader = BufReader::new(stderr);
+                    for line in reader.lines().map_while(Result::ok) {
+                        log_line(&stderr_log, &line);
+                    }
+                })
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.to_string());
+            }
+
             self.stdin = stdin;
             self.lines = Some(receiver);
             self.ping_id = 1;
+        } else {
+            self.stdin = None;
+            let stdout = match child.stdout.take() {
+                Some(stdout) => stdout,
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("piped stdout is missing".into());
+                }
+            };
+            let stderr = match child.stderr.take() {
+                Some(stderr) => stderr,
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("piped stderr is missing".into());
+                }
+            };
+
+            let stdout_log = log.clone();
+            if let Err(error) = thread::Builder::new()
+                .name(format!("svcd-{}-stdout", self.id))
+                .spawn(move || {
+                    let reader = BufReader::new(stdout);
+                    for line in reader.lines().map_while(Result::ok) {
+                        log_line(&stdout_log, &line);
+                    }
+                })
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.to_string());
+            }
+
+            let stderr_log = log.clone();
+            if let Err(error) = thread::Builder::new()
+                .name(format!("svcd-{}-stderr", self.id))
+                .spawn(move || {
+                    let reader = BufReader::new(stderr);
+                    for line in reader.lines().map_while(Result::ok) {
+                        log_line(&stderr_log, &line);
+                    }
+                })
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.to_string());
+            }
+            self.lines = None;
         }
+
         self.child = Some(child);
         Ok(pid)
     }
@@ -279,12 +370,12 @@ impl Slot {
 
     fn give_up(&mut self) {
         if self.machine.unkillable {
-            eprintln!("svcd: {}: unkillable after stop timeout", self.id);
+            log::svcd(&format!("svcd: {}: unkillable after stop timeout", self.id));
         } else {
-            eprintln!(
+            log::svcd(&format!(
                 "svcd: {}: failed after {} consecutive failures",
                 self.id, self.machine.failures
-            );
+            ));
         }
         self.signal_force();
         self.clear_process();
@@ -297,5 +388,13 @@ impl Slot {
         self.start_deadline = None;
         self.stop_deadline = None;
         self.kill_deadline = None;
+    }
+}
+
+fn log_line(log: &Option<Arc<Mutex<LogSink>>>, line: &str) {
+    if let Some(sink) = log {
+        if let Ok(mut sink) = sink.lock() {
+            let _ = sink.line(line);
+        }
     }
 }

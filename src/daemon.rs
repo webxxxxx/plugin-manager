@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 
 use crate::channel;
 use crate::definition;
+use crate::log;
 use crate::paths;
 use crate::registry::{Registry, Service, State, RESERVED_ID};
 use crate::rpc;
@@ -27,22 +28,27 @@ pub fn run() -> i32 {
         return 1;
     }
 
+    if let Err(error) = log::init_svcd(&paths::logs_dir()) {
+        eprintln!("svcd: cannot open log directory: {}", error);
+    }
+    log::svcd("svcd starting");
+
     let loaded = definition::load_services(&paths::services_dir());
     for issue in &loaded.issues {
-        eprintln!("svcd: warning: {}", issue);
+        log::svcd(&format!("svcd: warning: {}", issue));
     }
 
     let token = match channel::ensure_token(&config) {
         Ok(token) => token,
         Err(error) => {
-            eprintln!("svcd: cannot create control token: {}", error);
+            log::svcd(&format!("svcd: cannot create control token: {}", error));
             return 1;
         }
     };
 
     let (tx, rx) = mpsc::channel();
     if let Err(error) = channel::spawn_server(&config, tx) {
-        eprintln!("svcd: cannot bind control channel: {}", error);
+        log::svcd(&format!("svcd: cannot bind control channel: {}", error));
         return 1;
     }
 
@@ -160,14 +166,14 @@ impl Daemon {
         let layers = match start_layers(&self.registry, &eligible) {
             Ok(layers) => layers,
             Err(error) => {
-                eprintln!("svcd: start enabled: {}", error);
+                log::svcd(&format!("svcd: start enabled: {}", error));
                 return;
             }
         };
         for layer in layers {
             let deadline = self.now_ms().saturating_add(supervisor::START_TIMEOUT_MS);
             if let Err(error) = self.start_layer(&layer, deadline) {
-                eprintln!("svcd: start enabled: {}", error);
+                log::svcd(&format!("svcd: start enabled: {}", error));
             }
         }
     }

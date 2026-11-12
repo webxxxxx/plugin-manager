@@ -11,6 +11,7 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Sandbox {
     root: PathBuf,
     config: PathBuf,
+    logs: PathBuf,
     svcd: PathBuf,
     svc: PathBuf,
     daemon: Option<Child>,
@@ -30,7 +31,9 @@ impl Sandbox {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let config = root.join("config");
+        let logs = root.join("logs");
         fs::create_dir_all(config.join("services.d")).expect("create sandbox");
+        fs::create_dir_all(&logs).expect("create logs");
 
         let binary = env!("CARGO_BIN_EXE_svcd");
         let (svcd_name, svc_name) = if cfg!(windows) {
@@ -55,6 +58,7 @@ impl Sandbox {
             daemon_stderr: root.join("daemon.stderr"),
             root,
             config,
+            logs,
             svcd,
             svc,
             daemon: None,
@@ -65,6 +69,7 @@ impl Sandbox {
         let script_path = match script {
             Script::Ready => self.write_ready_script(id),
             Script::CrashAfterReady => self.write_crash_after_ready_script(id),
+            Script::Logging => self.write_logging_script(id),
         };
         let exec = exec_for(&script_path);
         let definition = json!({
@@ -104,6 +109,26 @@ impl Sandbox {
         }
     }
 
+    fn write_logging_script(&self, id: &str) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let path = self.root.join(format!("{}.cmd", id));
+            let script = "@echo off\r\nsetlocal\r\necho hello-stdout\r\necho hello-stderr 1>&2\r\n:loop\r\nset \"line=\"\r\nset /p line=\r\nif errorlevel 1 goto end\r\necho {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\r\ngoto loop\r\n:end\r\nendlocal\r\n";
+            fs::write(&path, script).expect("write logging script");
+            path
+        }
+        #[cfg(unix)]
+        {
+            let path = self.root.join(format!("{}.sh", id));
+            let script = "#!/bin/sh\necho hello-stdout\necho hello-stderr >&2\nwhile IFS= read -r line; do\n  printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\\n'\ndone\n";
+            fs::write(&path, script).expect("write logging script");
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                .expect("chmod logging script");
+            path
+        }
+    }
+
     fn write_crash_after_ready_script(&self, id: &str) -> PathBuf {
         #[cfg(windows)]
         {
@@ -129,6 +154,7 @@ impl Sandbox {
         let child = Command::new(&self.svcd)
             .args(["run", "--foreground"])
             .env("SVCD_CONFIG_DIR", &self.config)
+            .env("SVCD_LOG_DIR", &self.logs)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr))
@@ -141,6 +167,7 @@ impl Sandbox {
         Command::new(&self.svc)
             .args(args)
             .env("SVCD_CONFIG_DIR", &self.config)
+            .env("SVCD_LOG_DIR", &self.logs)
             .output()
             .expect("run svc")
     }
@@ -149,6 +176,7 @@ impl Sandbox {
         Command::new(&self.svcd)
             .args(args)
             .env("SVCD_CONFIG_DIR", &self.config)
+            .env("SVCD_LOG_DIR", &self.logs)
             .output()
             .expect("run svcd")
     }
@@ -218,6 +246,7 @@ impl Drop for Sandbox {
 enum Script {
     Ready,
     CrashAfterReady,
+    Logging,
 }
 
 fn exec_for(script: &Path) -> Value {
@@ -274,6 +303,48 @@ fn daemon_starts_a_ready_service_and_serves_live_status() {
     let status = sandbox.status("demo");
     assert_eq!(status["summary"]["state"], "stopped");
     assert!(status["summary"]["pid"].is_null());
+}
+
+#[test]
+fn service_stdout_and_stderr_are_logged() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_service("demo", &[], Script::Logging);
+    sandbox.start_daemon();
+
+    let started = sandbox.start_when_ready("demo");
+    assert_eq!(
+        started.status.code(),
+        Some(0),
+        "start failed: {}\n{}",
+        String::from_utf8_lossy(&started.stderr),
+        sandbox.daemon_log()
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let output = sandbox.run_svc(&["logs", "demo", "--lines", "20"]);
+        let text = String::from_utf8_lossy(&output.stdout);
+        if text.contains("hello-stdout") && text.contains("hello-stderr") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "service logs did not appear: {}",
+            text
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let svcd = sandbox.run_svc(&["logs", "svcd"]);
+    assert_eq!(svcd.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&svcd.stdout).contains("svcd starting"),
+        "svcd log: {}",
+        String::from_utf8_lossy(&svcd.stdout)
+    );
+
+    let missing = sandbox.run_svc(&["logs", "missing"]);
+    assert_eq!(missing.status.code(), Some(1));
 }
 
 #[test]
