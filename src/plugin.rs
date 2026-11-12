@@ -223,6 +223,7 @@ fn service_from_manifest(
             env: manifest.exec.env.clone(),
             ready,
         }),
+        lifecycle: None,
         enabled,
         state: State::Stopped,
         pid: None,

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::IpAddr;
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Arc;
@@ -18,8 +19,9 @@ use crate::log;
 use crate::package;
 use crate::paths;
 use crate::plugin::{self, Strategy};
-use crate::registry::{Kind, Registry, Service, State, RESERVED_ID};
+use crate::registry::{Hook, Kind, Registry, Service, State, RESERVED_ID};
 use crate::rpc;
+use crate::slot::hook_command;
 use crate::slot::Slot;
 use crate::status::Status;
 use crate::supervisor::{self, Event};
@@ -184,7 +186,12 @@ impl Daemon {
             if let Some(exec) = service.exec.clone() {
                 slots.insert(
                     service.id.clone(),
-                    Slot::new(service.id.clone(), exec, service.enabled),
+                    Slot::new(
+                        service.id.clone(),
+                        exec,
+                        service.lifecycle.clone(),
+                        service.enabled,
+                    ),
                 );
             }
         }
@@ -279,7 +286,17 @@ impl Daemon {
             "svc.list" => rpc::ok(id, json!({"services": self.statuses()})),
             "svc.status" => match param_id(&request) {
                 Ok(service_id) => match self.status_for_id(&service_id) {
-                    Some(status) => rpc::ok(id, status_json(status)),
+                    Some(mut status) => {
+                        if request
+                            .params
+                            .get("probe")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                        {
+                            self.probe_status(&service_id, &mut status);
+                        }
+                        rpc::ok(id, status_json(status))
+                    }
                     None => rpc::err(id, -32001, &format!("unknown service: {}", service_id)),
                 },
                 Err(response) => response,
@@ -379,6 +396,21 @@ impl Daemon {
             .map(|service| self.status_for(service))
     }
 
+    /// Run the optional status hook. This is only called when the caller asks
+    /// for a probe (`svc status`), not by `svc list` or the HTTP projections.
+    fn probe_status(&mut self, id: &str, status: &mut Status) {
+        let Some(hook) = self
+            .registry
+            .get(id)
+            .and_then(|service| service.lifecycle.as_ref())
+            .and_then(|lifecycle| lifecycle.status.as_ref())
+            .cloned()
+        else {
+            return;
+        };
+        status.details.probe = Some(run_status_hook(id, &hook));
+    }
+
     fn status_for(&self, service: &Service) -> Status {
         if service.id == RESERVED_ID {
             return Status::builtin(service);
@@ -396,13 +428,14 @@ impl Daemon {
         if id == RESERVED_ID {
             return Ok(self.status_for_id(id).expect("builtin"));
         }
-        if let Some(exec) = self
-            .registry
-            .get(id)
-            .and_then(|service| service.exec.clone())
-        {
+        if let Some(service) = self.registry.get(id) {
+            let exec = service.exec.clone();
+            let lifecycle = service.lifecycle.clone();
             if let Some(slot) = self.slots.get_mut(id) {
-                slot.set_exec(exec);
+                if let Some(exec) = exec {
+                    slot.set_exec(exec);
+                }
+                slot.set_lifecycle(lifecycle);
             }
         }
 
@@ -532,8 +565,10 @@ impl Daemon {
         if !still_running {
             self.slots.remove(&id);
             if let Some(exec) = service.exec.clone() {
-                self.slots
-                    .insert(id.clone(), Slot::new(id.clone(), exec, service.enabled));
+                self.slots.insert(
+                    id.clone(),
+                    Slot::new(id.clone(), exec, service.lifecycle.clone(), service.enabled),
+                );
             }
         }
         self.registry.remove(&id);
@@ -632,18 +667,19 @@ impl Daemon {
         if id == RESERVED_ID {
             return Ok(self.status_for_id(id).expect("builtin"));
         }
-        let state = self.slots.get(id).map(|slot| slot.machine.state);
-        if matches!(state, None | Some(State::Stopped | State::Failed)) {
+        let Some(state) = self.slots.get(id).map(|slot| slot.machine.state) else {
+            return self
+                .status_for_id(id)
+                .ok_or_else(|| format!("unknown service: {}", id));
+        };
+
+        let now = self.now_ms();
+        self.slots.get_mut(id).expect("slot").request_stop(now);
+        if matches!(state, State::Stopped | State::Failed) {
             return self
                 .status_for_id(id)
                 .ok_or_else(|| format!("unknown service: {}", id));
         }
-
-        let now = self.now_ms();
-        self.slots
-            .get_mut(id)
-            .expect("slot")
-            .apply(Event::Stop, now);
         let deadline = now
             .saturating_add(supervisor::STOP_TIMEOUT_MS)
             .saturating_add(supervisor::KILL_TIMEOUT_MS)
@@ -698,10 +734,7 @@ impl Daemon {
             }
             for id in &active {
                 let now = self.now_ms();
-                self.slots
-                    .get_mut(id)
-                    .expect("slot")
-                    .apply(Event::Stop, now);
+                self.slots.get_mut(id).expect("slot").request_stop(now);
             }
             let deadline = self
                 .now_ms()
@@ -755,6 +788,37 @@ fn status_response(
 
 fn status_json(status: Status) -> Value {
     serde_json::to_value(status).unwrap_or(Value::Null)
+}
+
+fn run_status_hook(id: &str, hook: &Hook) -> String {
+    let mut command = hook_command(id, "status", hook);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return format!("spawn failed: {}", error),
+    };
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    return "ok".into();
+                }
+                return format!("failed ({})", status);
+            }
+            Ok(None) => {}
+            Err(error) => return format!("error: {}", error),
+        }
+        if started.elapsed() >= Duration::from_millis(hook.timeout_ms) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return "timed out".into();
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn param_id(request: &rpc::Request) -> Result<String, rpc::Response> {
@@ -856,6 +920,7 @@ mod tests {
                 env: Default::default(),
                 ready: Ready::Exec,
             }),
+            lifecycle: None,
             enabled: true,
             state: State::Stopped,
             pid: None,

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -7,9 +7,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::package::valid_name;
-use crate::registry::{
-    Exec, Kind, Ready, Registry, Service, State, RESERVED_CAP_PREFIX, RESERVED_ID,
-};
+use crate::registry::{Exec, Hook, Kind, Lifecycle, Ready, Registry, Service, State, RESERVED_ID};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadIssue {
@@ -157,6 +155,12 @@ fn load_one(path: &Path) -> Result<Service, LoadIssue> {
             ),
         ));
     }
+    if object.contains_key("capabilities") {
+        return Err(fail(
+            &id,
+            "core services do not declare capabilities; tools/call is plugin-only".into(),
+        ));
+    }
 
     let definition: CoreDefinition = serde_json::from_value(value)
         .map_err(|error| fail(&id, format!("invalid definition: {}", error)))?;
@@ -176,7 +180,26 @@ struct CoreDefinition {
     #[serde(default)]
     dependencies: Vec<String>,
     #[serde(default)]
-    capabilities: Vec<CapabilityDefinition>,
+    lifecycle: Option<LifecycleDefinition>,
+}
+
+#[derive(Deserialize)]
+struct LifecycleDefinition {
+    start: Option<HookDefinition>,
+    stop: Option<HookDefinition>,
+    status: Option<HookDefinition>,
+}
+
+#[derive(Deserialize)]
+struct HookDefinition {
+    path: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    /// Timeout in seconds; omitted uses the action default.
+    #[serde(default)]
+    timeout: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -188,17 +211,6 @@ struct ExecDefinition {
     env: BTreeMap<String, String>,
     #[serde(default)]
     ready: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct CapabilityDefinition {
-    name: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    desc: String,
-    #[serde(default, rename = "inputSchema")]
-    #[allow(dead_code)]
-    input_schema: Value,
 }
 
 fn validate(definition: CoreDefinition) -> Result<Service, String> {
@@ -265,23 +277,23 @@ fn validate(definition: CoreDefinition) -> Result<Service, String> {
         }
     };
 
-    let mut seen_caps = BTreeSet::new();
-    let mut caps = Vec::with_capacity(definition.capabilities.len());
-    for capability in definition.capabilities {
-        if capability.name.is_empty() {
-            return Err("capability name must not be empty".into());
-        }
-        if capability.name.starts_with(RESERVED_CAP_PREFIX) {
-            return Err(format!(
-                "capability \"{}\" uses the reserved {} namespace",
-                capability.name, RESERVED_CAP_PREFIX
-            ));
-        }
-        if !seen_caps.insert(capability.name.clone()) {
-            return Err(format!("duplicate capability \"{}\"", capability.name));
-        }
-        caps.push(capability.name);
-    }
+    let lifecycle = match definition.lifecycle {
+        Some(lifecycle) => Some(Lifecycle {
+            start: lifecycle
+                .start
+                .map(|hook| convert_hook(hook, 30_000, 300_000))
+                .transpose()?,
+            stop: lifecycle
+                .stop
+                .map(|hook| convert_hook(hook, 10_000, 300_000))
+                .transpose()?,
+            status: lifecycle
+                .status
+                .map(|hook| convert_hook(hook, 5_000, 30_000))
+                .transpose()?,
+        }),
+        None => None,
+    };
 
     for dep in &definition.dependencies {
         if !valid_name(dep) {
@@ -295,13 +307,14 @@ fn validate(definition: CoreDefinition) -> Result<Service, String> {
         version: definition.version,
         desc: definition.desc,
         deps: definition.dependencies,
-        caps,
+        caps: Vec::new(),
         exec: Some(Exec {
             path: definition.exec.path,
             args: definition.exec.args,
             env: definition.exec.env,
             ready,
         }),
+        lifecycle,
         // A definition declared in services.d is boot-start in v1; a marker-based
         // enable/disable override belongs to the lifecycle work (#29).
         enabled: true,
@@ -313,6 +326,50 @@ fn validate(definition: CoreDefinition) -> Result<Service, String> {
         failures: 0,
         last_exit: None,
         config: None,
+    })
+}
+
+fn convert_hook(
+    definition: HookDefinition,
+    default_timeout_ms: u64,
+    max_timeout_ms: u64,
+) -> Result<Hook, String> {
+    let path = Path::new(&definition.path);
+    if !path.is_absolute() {
+        return Err(format!(
+            "lifecycle path must be absolute: \"{}\"",
+            definition.path
+        ));
+    }
+    #[cfg(windows)]
+    {
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase());
+        if !matches!(extension.as_deref(), Some("exe" | "cmd" | "bat")) {
+            return Err(format!(
+                "lifecycle path must end with .exe, .cmd or .bat on Windows: \"{}\"",
+                definition.path
+            ));
+        }
+    }
+    let timeout_ms = match definition.timeout {
+        Some(seconds) if seconds >= 1 && seconds <= max_timeout_ms / 1000 => seconds * 1000,
+        Some(seconds) => {
+            return Err(format!(
+                "lifecycle timeout must be between 1 and {} seconds, got {}",
+                max_timeout_ms / 1000,
+                seconds
+            ))
+        }
+        None => default_timeout_ms,
+    };
+    Ok(Hook {
+        path: definition.path,
+        args: definition.args,
+        env: definition.env,
+        timeout_ms,
     })
 }
 
@@ -385,8 +442,7 @@ mod tests {
             "desc": "demo service",
             "protocol": 1,
             "exec": { "path": absolute_exec(), "args": [], "ready": "exec" },
-            "dependencies": [],
-            "capabilities": [{ "name": "status", "desc": "status", "inputSchema": {"type": "object"} }]
+            "dependencies": []
         })
     }
 
@@ -420,7 +476,7 @@ mod tests {
         assert_eq!(demo.state, State::Stopped);
         assert_eq!(demo.version, "1.0.0");
         assert_eq!(demo.deps, Vec::<String>::new());
-        assert_eq!(demo.caps, vec!["status".to_string()]);
+        assert!(demo.caps.is_empty());
         assert!(demo.enabled);
         assert_eq!(demo.exec.as_ref().expect("exec").ready, Ready::Exec);
         let svc = loaded.registry.get(RESERVED_ID).expect("built-in svc");
@@ -587,23 +643,56 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_or_reserved_capability_names() {
+    fn rejects_core_capabilities() {
         let dir = TempDir::new();
         let mut body = definition("demo");
-        body["capabilities"] = json!([
-            { "name": "status", "desc": "a", "inputSchema": {} },
-            { "name": "status", "desc": "b", "inputSchema": {} }
-        ]);
+        body["capabilities"] = json!([{ "name": "status", "desc": "a", "inputSchema": {} }]);
         dir.write("demo", body);
-        let loaded = load_services(&dir.services_dir());
-        assert!(loaded.issues[0].reason.contains("duplicate capability"));
 
+        let loaded = load_services(&dir.services_dir());
+
+        assert!(loaded.registry.get("demo").is_none());
+        assert!(loaded.issues[0].reason.contains("plugin-only"));
+    }
+
+    #[test]
+    fn parses_lifecycle_hooks_and_defaults_their_timeouts() {
         let dir = TempDir::new();
         let mut body = definition("demo");
-        body["capabilities"] = json!([{ "name": "svc.list", "desc": "a", "inputSchema": {} }]);
+        body["lifecycle"] = json!({
+            "start": { "path": absolute_exec(), "args": ["start"], "timeout": 20 },
+            "stop": { "path": absolute_exec(), "args": ["stop"] },
+            "status": { "path": absolute_exec(), "args": ["status"] }
+        });
         dir.write("demo", body);
+
         let loaded = load_services(&dir.services_dir());
-        assert!(loaded.issues[0].reason.contains("reserved svc."));
+
+        assert!(loaded.issues.is_empty(), "issues: {:?}", loaded.issues);
+        let lifecycle = loaded
+            .registry
+            .get("demo")
+            .expect("demo")
+            .lifecycle
+            .as_ref()
+            .expect("lifecycle");
+        assert_eq!(lifecycle.start.as_ref().expect("start").args, ["start"]);
+        assert_eq!(lifecycle.start.as_ref().expect("start").timeout_ms, 20_000);
+        assert_eq!(lifecycle.stop.as_ref().expect("stop").timeout_ms, 10_000);
+        assert_eq!(lifecycle.status.as_ref().expect("status").timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn rejects_a_relative_lifecycle_path() {
+        let dir = TempDir::new();
+        let mut body = definition("demo");
+        body["lifecycle"] = json!({"stop": {"path": "scripts/stop"}});
+        dir.write("demo", body);
+
+        let loaded = load_services(&dir.services_dir());
+
+        assert!(loaded.registry.get("demo").is_none());
+        assert!(loaded.issues[0].reason.contains("must be absolute"));
     }
 
     #[test]

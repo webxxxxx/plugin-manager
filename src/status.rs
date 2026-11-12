@@ -44,6 +44,9 @@ pub struct Details {
     pub restart: Option<String>,
     /// `true` only when a forced stop ran out of its kill window.
     pub unkillable: bool,
+    /// Result of the optional core status hook; only `svc status` probes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<String>,
 }
 
 impl Status {
@@ -68,6 +71,7 @@ impl Status {
                 config: service.config.clone(),
                 restart: None,
                 unkillable: false,
+                probe: None,
             },
         }
     }
@@ -212,6 +216,9 @@ pub fn text(status: &Status) -> String {
         status.details.restart.as_deref().unwrap_or("-"),
     );
     field(&mut out, "unkillable", status.details.unkillable);
+    if let Some(probe) = &status.details.probe {
+        field(&mut out, "probe", probe);
+    }
     out.trim_end().to_string()
 }
 
@@ -246,6 +253,7 @@ mod tests {
                 env: Default::default(),
                 ready: Ready::Exec,
             }),
+            lifecycle: None,
             enabled: true,
             state: State::Running,
             pid: Some(42),
