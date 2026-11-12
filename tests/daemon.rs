@@ -689,6 +689,25 @@ fn core_lifecycle_hooks_run_for_start_stop_and_status() {
     );
 }
 
+/// A script service uses `exec.ready = Exec`, so `svc start` returns as soon
+/// as the process is spawned: the script's marker appears asynchronously.
+fn wait_for_marker(marker: &Path, needle: &str) {
+    for _ in 0..200 {
+        if fs::read_to_string(marker)
+            .map(|text| text.contains(needle))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!(
+        "marker {} never contained {needle:?}: {:?}",
+        marker.display(),
+        fs::read_to_string(marker)
+    );
+}
+
 #[test]
 fn a_drop_in_script_is_discovered_and_supervised() {
     let mut sandbox = Sandbox::new();
@@ -713,12 +732,7 @@ fn a_drop_in_script_is_discovered_and_supervised() {
         String::from_utf8_lossy(&started.stderr)
     );
     let marker = sandbox.config.join("services.d").join("marker.txt");
-    assert!(
-        fs::read_to_string(&marker)
-            .expect("marker")
-            .contains("start"),
-        "start action did not run"
-    );
+    wait_for_marker(&marker, "start");
 
     let stopped = sandbox.stop("demo");
     assert_eq!(
@@ -727,12 +741,7 @@ fn a_drop_in_script_is_discovered_and_supervised() {
         "stop failed: {}",
         String::from_utf8_lossy(&stopped.stderr)
     );
-    assert!(
-        fs::read_to_string(&marker)
-            .expect("marker")
-            .contains("stop"),
-        "stop action did not run"
-    );
+    wait_for_marker(&marker, "stop");
 
     let status = sandbox.run_svc(&["status", "demo", "--json"]);
     assert_eq!(
@@ -743,10 +752,5 @@ fn a_drop_in_script_is_discovered_and_supervised() {
     );
     let value: Value = serde_json::from_slice(&status.stdout).expect("status json");
     assert_eq!(value["details"]["probe"], "ok");
-    assert!(
-        fs::read_to_string(&marker)
-            .expect("marker")
-            .contains("status"),
-        "status action did not run"
-    );
+    wait_for_marker(&marker, "status");
 }
