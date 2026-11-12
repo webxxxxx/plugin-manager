@@ -676,6 +676,211 @@ fn web_plugin_bundle(key: &SigningKey, id: &str, ui: bool) -> Vec<u8> {
     signed_package(key, manifest, &files)
 }
 
+/// A web UI plugin whose agent emits a notification before every response.
+fn web_event_agent() -> (&'static str, Vec<u8>) {
+    if cfg!(windows) {
+        (
+            "event-agent.ps1",
+            br#"$ErrorActionPreference = 'Stop'
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+  $id = 1
+  if ($line -match '"id"\s*:\s*(\d+)') { $id = [int]$Matches[1] }
+  [Console]::Out.WriteLine('{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"pong-event"}}')
+  [Console]::Out.WriteLine('{"jsonrpc":"2.0","id":' + $id + ',"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}')
+  [Console]::Out.Flush()
+}
+"#
+            .to_vec(),
+        )
+    } else {
+        (
+            "event-agent.sh",
+            br#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  if [ -z "$id" ]; then id=1; fi
+  printf '{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"pong-event"}}\n'
+  printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}\n' "$id"
+done
+"#
+            .to_vec(),
+        )
+    }
+}
+
+fn web_event_plugin_bundle(key: &SigningKey, id: &str) -> Vec<u8> {
+    let (name, data) = web_event_agent();
+    let exec_path = format!("payload/bin/{}", name);
+    let mut files: Vec<(String, Vec<u8>, u32)> = vec![
+        (exec_path.clone(), data, 0o755),
+        (
+            "payload/web/index.html".to_string(),
+            b"<!doctype html>\n<html><body>events</body></html>".to_vec(),
+            0o644,
+        ),
+    ];
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let manifest = json!({
+        "schema": 1,
+        "name": id,
+        "version": "1.0.0",
+        "desc": "event ui plugin",
+        "platform": target(),
+        "protocol": 1,
+        "exec": {"path": exec_path, "args": [], "ready": "notify"},
+        "capabilities": [
+            {"name": "status", "desc": "sample status", "inputSchema": {"type": "object"}}
+        ],
+        "ui": {"type": "web", "entry": "index.html"},
+    });
+    signed_package(key, manifest, &files)
+}
+
+fn daemon_with_web_event_plugin(key_byte: u8) -> (Sandbox, String) {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[key_byte; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let package = web_event_plugin_bundle(&key, "demo");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let installed = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(installed.status, 200, "{}", installed.body);
+    let started = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
+    assert_eq!(started.status, 200, "{}", started.body);
+    (sandbox, address)
+}
+
+fn ws_key() -> String {
+    BASE64.encode([0x42u8; 16])
+}
+
+/// Open a WebSocket handshake and return (stream, status, response head).
+fn ws_handshake(address: &str, path: &str, extra: &[(&str, &str)]) -> (TcpStream, u16, String) {
+    let mut stream = TcpStream::connect(address).expect("ws connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("ws timeout");
+    let key = ws_key();
+    let mut request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n",
+        path, address, key
+    );
+    for (name, value) in extra {
+        request.push_str(&format!("{}: {}\r\n", name, value));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).expect("ws request");
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).expect("ws response head");
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head).to_string();
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .expect("ws status");
+    (stream, status, head)
+}
+
+fn ws_send(stream: &mut TcpStream, opcode: u8, payload: &[u8]) {
+    let mask = [1u8, 2, 3, 4];
+    let mut frame = vec![0x80 | opcode];
+    if payload.len() < 126 {
+        frame.push(0x80 | payload.len() as u8);
+    } else if payload.len() <= u16::MAX as usize {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        frame.push(0x80 | 127);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    frame.extend_from_slice(&mask);
+    frame.extend(
+        payload
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| byte ^ mask[index % 4]),
+    );
+    stream.write_all(&frame).expect("ws frame");
+    stream.flush().expect("ws flush");
+}
+
+fn ws_read(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+    let mut header = [0u8; 2];
+    stream.read_exact(&mut header).expect("ws frame head");
+    let opcode = header[0] & 0x0f;
+    assert_eq!(header[1] & 0x80, 0, "server frames must be unmasked");
+    let mut length = u64::from(header[1] & 0x7f);
+    if length == 126 {
+        let mut extended = [0u8; 2];
+        stream.read_exact(&mut extended).expect("ws length");
+        length = u64::from(u16::from_be_bytes(extended));
+    } else if length == 127 {
+        let mut extended = [0u8; 8];
+        stream.read_exact(&mut extended).expect("ws length");
+        length = u64::from_be_bytes(extended);
+    }
+    let mut payload = vec![0u8; length as usize];
+    stream.read_exact(&mut payload).expect("ws payload");
+    (opcode, payload)
+}
+
+fn sse_connect(address: &str, path: &str) -> TcpStream {
+    let mut stream = TcpStream::connect(address).expect("sse connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("sse timeout");
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\n\r\n",
+        path, address
+    );
+    stream.write_all(request.as_bytes()).expect("sse request");
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).expect("sse response head");
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head);
+    assert!(head.starts_with("HTTP/1.1 200"), "{}", head);
+    assert!(
+        head.to_ascii_lowercase().contains("text/event-stream"),
+        "{}",
+        head
+    );
+    stream
+}
+
+fn sse_wait_for_data(stream: &mut TcpStream, needle: &str) -> String {
+    let mut seen = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        stream.read_exact(&mut byte).expect("sse data");
+        seen.push(byte[0]);
+        if seen.ends_with(b"\n\n") {
+            let text = String::from_utf8_lossy(&seen).to_string();
+            if text.contains(needle) {
+                return text;
+            }
+            seen.clear();
+        }
+    }
+}
+
 /// Start a daemon and install the `demo` plugin (with a config template)
 /// under a fresh trust key. Returns the sandbox and its HTTP address.
 fn daemon_with_demo_plugin(key_byte: u8) -> (Sandbox, String) {
@@ -1971,4 +2176,112 @@ fn phase_end_to_end_install_start_mcp_config_logs_and_uninstall() {
         "params": {"_meta": modern_meta()},
     }));
     assert!(tool_names(&stdio_listed["result"]["tools"]).is_empty());
+}
+
+#[test]
+fn plugin_ui_sse_streams_plugin_notifications() {
+    let (_sandbox, address) = daemon_with_web_event_plugin(51);
+    let mut sse = sse_connect(&address, "/plugin-ui/demo/events");
+    let call = request(
+        &address,
+        "POST",
+        "/plugin-ui/demo/rpc",
+        "application/json",
+        br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"status","arguments":{}}}"#,
+    );
+    assert_eq!(call.status, 200, "{}", call.body);
+    assert_eq!(call.body["result"]["content"][0]["text"], "pong");
+    let event = sse_wait_for_data(&mut sse, "pong-event");
+    assert!(
+        event.contains("\"method\":\"notifications/message\""),
+        "{event}"
+    );
+    assert!(event.contains("id: "), "{event}");
+}
+
+#[test]
+fn plugin_ui_websocket_bridges_calls_notifications_and_control_frames() {
+    let (_sandbox, address) = daemon_with_web_event_plugin(52);
+    let (mut ws, status, head) = ws_handshake(&address, "/plugin-ui/demo/ws", &[]);
+    assert_eq!(status, 101, "{head}");
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/call",
+        "params": { "name": "status", "arguments": {} }
+    });
+    ws_send(&mut ws, 0x1, request.to_string().as_bytes());
+
+    let mut notification = false;
+    let mut response = false;
+    for _ in 0..6 {
+        let (opcode, payload) = ws_read(&mut ws);
+        if opcode != 0x1 {
+            continue;
+        }
+        let value: Value = serde_json::from_slice(&payload).expect("ws json");
+        if value["method"] == "notifications/message" {
+            notification = true;
+        }
+        if value["id"] == 9 && value["result"]["content"][0]["text"] == "pong" {
+            response = true;
+        }
+        if notification && response {
+            break;
+        }
+    }
+    assert!(notification, "notification frame missing");
+    assert!(response, "response frame missing");
+
+    ws_send(&mut ws, 0x9, b"ping");
+    let (opcode, payload) = ws_read(&mut ws);
+    assert_eq!(opcode, 0xA);
+    assert_eq!(payload, b"ping");
+
+    let (mut binary, status, head) = ws_handshake(&address, "/plugin-ui/demo/ws", &[]);
+    assert_eq!(status, 101, "{head}");
+    ws_send(&mut binary, 0x2, b"binary");
+    let (opcode, payload) = ws_read(&mut binary);
+    assert_eq!(opcode, 0x8);
+    assert_eq!(u16::from_be_bytes([payload[0], payload[1]]), 1003);
+}
+
+#[test]
+fn plugin_ui_streams_require_lan_auth_and_same_origin() {
+    let (sandbox, address) = daemon_with_web_event_plugin(53);
+    let enabled = sandbox.run_svc(&["lan", "enable", "--bind", "0.0.0.0"]);
+    assert_eq!(
+        enabled.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+    let token = token_line(&enabled);
+    let bearer = format!("Bearer {}", token);
+
+    let sse = raw_request(&address, "GET", "/plugin-ui/demo/events", "", b"");
+    assert_eq!(sse.status, 401);
+    let (_stream, status, _head) = ws_handshake(&address, "/plugin-ui/demo/ws", &[]);
+    assert_eq!(status, 401);
+
+    let evil = ws_handshake(
+        &address,
+        "/plugin-ui/demo/ws",
+        &[
+            ("Authorization", bearer.as_str()),
+            ("Origin", "http://evil"),
+        ],
+    );
+    assert_eq!(evil.1, 403);
+
+    let origin = format!("http://{}", address);
+    let good = ws_handshake(
+        &address,
+        "/plugin-ui/demo/ws",
+        &[
+            ("Authorization", bearer.as_str()),
+            ("Origin", origin.as_str()),
+        ],
+    );
+    assert_eq!(good.1, 101, "{}", good.2);
 }

@@ -55,6 +55,7 @@ pub fn response_with_headers(
         405 => "Method Not Allowed",
         409 => "Conflict",
         413 => "Payload Too Large",
+        426 => "Upgrade Required",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         504 => "Gateway Timeout",
