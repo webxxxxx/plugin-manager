@@ -37,6 +37,14 @@ impl DaemonVerb {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LanAction {
+    Status,
+    Enable,
+    Disable,
+    Rotate,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     List,
@@ -52,6 +60,10 @@ enum Command {
         id: String,
         follow: bool,
         lines: usize,
+    },
+    Lan {
+        action: LanAction,
+        bind: Option<String>,
     },
 }
 
@@ -69,6 +81,7 @@ pub fn run(args: Vec<String>) -> i32 {
         Command::Status { id, json } => show_status(&id, json),
         Command::Daemon { verb, id } => daemon_command(verb, &id),
         Command::Logs { id, follow, lines } => show_logs(&id, follow, lines),
+        Command::Lan { action, bind } => lan_command(action, bind.as_deref()),
     }
 }
 
@@ -116,6 +129,44 @@ fn parse(args: &[String]) -> Result<Command, ()> {
             })
         }
         "logs" => parse_logs(&args[1..]),
+        "lan" => parse_lan(&args[1..]),
+        _ => Err(()),
+    }
+}
+
+fn parse_lan(args: &[String]) -> Result<Command, ()> {
+    match args {
+        [action] if action == "status" => Ok(Command::Lan {
+            action: LanAction::Status,
+            bind: None,
+        }),
+        [action] if action == "disable" => Ok(Command::Lan {
+            action: LanAction::Disable,
+            bind: None,
+        }),
+        [first, second] if first == "token" && second == "rotate" => Ok(Command::Lan {
+            action: LanAction::Rotate,
+            bind: None,
+        }),
+        [action] if action == "enable" => Ok(Command::Lan {
+            action: LanAction::Enable,
+            bind: None,
+        }),
+        [action, flag, value] if action == "enable" && flag == "--bind" => Ok(Command::Lan {
+            action: LanAction::Enable,
+            bind: Some(value.clone()),
+        }),
+        [action, value] if action == "enable" && value.starts_with("--bind=") => {
+            let bind = value.trim_start_matches("--bind=").to_string();
+            if bind.is_empty() {
+                Err(())
+            } else {
+                Ok(Command::Lan {
+                    action: LanAction::Enable,
+                    bind: Some(bind),
+                })
+            }
+        }
         _ => Err(()),
     }
 }
@@ -252,6 +303,89 @@ fn daemon_command(verb: DaemonVerb, id: &str) -> i32 {
     }
 }
 
+fn lan_command(action: LanAction, bind: Option<&str>) -> i32 {
+    if matches!(
+        action,
+        LanAction::Enable | LanAction::Disable | LanAction::Rotate
+    ) {
+        if let Err(error) = crate::lan::require_root() {
+            eprintln!("svc: {}", error);
+            return EXIT_SERVICE_ERROR;
+        }
+    }
+    let (method, params) = match action {
+        LanAction::Status => ("lan.status", json!({})),
+        LanAction::Enable => ("lan.enable", json!({ "bind": bind.unwrap_or("0.0.0.0") })),
+        LanAction::Disable => ("lan.disable", json!({})),
+        LanAction::Rotate => ("lan.token.rotate", json!({})),
+    };
+    let response = match channel::request(&paths::config_dir(), method, params) {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("svc: svcd unreachable: {}", error);
+            return EXIT_DAEMON_UNREACHABLE;
+        }
+    };
+    if let Some(error) = response.error {
+        eprintln!("svc: {}", error.message);
+        return EXIT_SERVICE_ERROR;
+    }
+    let result = response.result.unwrap_or(Value::Null);
+    match action {
+        LanAction::Status => {
+            println!(
+                "enabled: {}",
+                result
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            );
+            println!(
+                "bind: {}",
+                result.get("bind").and_then(Value::as_str).unwrap_or("-")
+            );
+            println!(
+                "token: {}",
+                if result
+                    .get("tokenSet")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    "set"
+                } else {
+                    "unset"
+                }
+            );
+        }
+        LanAction::Enable | LanAction::Disable => {
+            let enabled = result
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let bind = result.get("bind").and_then(Value::as_str).unwrap_or("-");
+            println!("LAN {}", if enabled { "enabled" } else { "disabled" });
+            println!("bind: {}", bind);
+            if let Some(token) = result.get("token").and_then(Value::as_str) {
+                println!("token: {}", token);
+                eprintln!("warning: this token is equivalent to root; store it securely");
+                eprintln!("warning: it is shown only once; rotate with `svc lan token rotate`");
+            }
+        }
+        LanAction::Rotate => {
+            if let Some(token) = result.get("token").and_then(Value::as_str) {
+                println!("token: {}", token);
+                eprintln!(
+                    "warning: this token is equivalent to root; the old token is now invalid"
+                );
+            } else {
+                eprintln!("svc: empty token response");
+                return EXIT_SERVICE_ERROR;
+            }
+        }
+    }
+    EXIT_OK
+}
+
 fn show_logs(id: &str, follow: bool, lines: usize) -> i32 {
     let path = if id == "svcd" {
         paths::logs_dir().join("svcd.log")
@@ -340,6 +474,7 @@ fn usage() {
     eprintln!("       svc status [--json] <id>");
     eprintln!("       svc <start|stop|enable|disable> <id>");
     eprintln!("       svc logs <id> [--follow] [--lines N]");
+    eprintln!("       svc lan status|enable [--bind <ip>]|disable|token rotate");
 }
 
 #[cfg(test)]
@@ -433,6 +568,33 @@ mod tests {
         assert!(parse(&args(&["logs"])).is_err());
         assert!(parse(&args(&["logs", "demo", "--lines", "nope"])).is_err());
         assert!(parse(&args(&["logs", "demo", "--lines", "2001"])).is_err());
+    }
+
+    #[test]
+    fn parses_lan_commands() {
+        assert_eq!(
+            parse(&args(&["lan", "status"])).expect("lan status"),
+            Command::Lan {
+                action: LanAction::Status,
+                bind: None
+            }
+        );
+        assert_eq!(
+            parse(&args(&["lan", "enable", "--bind", "0.0.0.0"])).expect("lan enable"),
+            Command::Lan {
+                action: LanAction::Enable,
+                bind: Some("0.0.0.0".into())
+            }
+        );
+        assert_eq!(
+            parse(&args(&["lan", "token", "rotate"])).expect("lan rotate"),
+            Command::Lan {
+                action: LanAction::Rotate,
+                bind: None
+            }
+        );
+        assert!(parse(&args(&["lan", "enable", "--bind"])).is_err());
+        assert!(parse(&args(&["lan", "bogus"])).is_err());
     }
 
     #[test]

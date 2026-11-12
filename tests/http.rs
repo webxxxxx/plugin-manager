@@ -21,6 +21,7 @@ struct Sandbox {
     logs: PathBuf,
     trust: PathBuf,
     svcd: PathBuf,
+    svc: PathBuf,
     daemon: Option<Child>,
     daemon_stderr: PathBuf,
 }
@@ -48,11 +49,14 @@ impl Sandbox {
 
         let binary = env!("CARGO_BIN_EXE_svcd");
         let svcd = root.join(if cfg!(windows) { "svcd.exe" } else { "svcd" });
+        let svc = root.join(if cfg!(windows) { "svc.exe" } else { "svc" });
         fs::copy(binary, &svcd).expect("copy svcd");
+        fs::copy(binary, &svc).expect("copy svc");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&svcd, fs::Permissions::from_mode(0o755)).expect("chmod");
+            fs::set_permissions(&svc, fs::Permissions::from_mode(0o755)).expect("chmod");
         }
 
         Sandbox {
@@ -63,6 +67,7 @@ impl Sandbox {
             logs,
             trust,
             svcd,
+            svc,
             daemon: None,
         }
     }
@@ -73,7 +78,15 @@ impl Sandbox {
             .env("SVCD_DATA_DIR", &self.data)
             .env("SVCD_LOG_DIR", &self.logs)
             .env("SVCD_TRUST_DIR", &self.trust)
-            .env("SVCD_HTTP_PORT", "0");
+            .env("SVCD_HTTP_PORT", "0")
+            .env("SVCD_TEST_UNPRIVILEGED", "1");
+    }
+
+    fn run_svc(&self, args: &[&str]) -> std::process::Output {
+        let mut command = Command::new(&self.svc);
+        command.args(args);
+        self.env(&mut command);
+        command.output().expect("run svc")
     }
 
     fn start_daemon(&mut self) {
@@ -171,9 +184,21 @@ impl Drop for Sandbox {
 struct Response {
     status: u16,
     body: Value,
+    headers: Vec<(String, String)>,
 }
 
 fn request(address: &str, method: &str, path: &str, content_type: &str, body: &[u8]) -> Response {
+    request_with(address, method, path, content_type, body, &[])
+}
+
+fn request_with(
+    address: &str,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+    extra_headers: &[(&str, &str)],
+) -> Response {
     let mut stream = TcpStream::connect(address).expect("connect");
     let mut request = format!(
         "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -185,6 +210,9 @@ fn request(address: &str, method: &str, path: &str, content_type: &str, body: &[
     if !content_type.is_empty() {
         request.push_str(&format!("Content-Type: {}\r\n", content_type));
     }
+    for (name, value) in extra_headers {
+        request.push_str(&format!("{}: {}\r\n", name, value));
+    }
     request.push_str("\r\n");
     stream.write_all(request.as_bytes()).expect("write headers");
     stream.write_all(body).expect("write body");
@@ -195,14 +223,43 @@ fn request(address: &str, method: &str, path: &str, content_type: &str, body: &[
         .position(|window| window == b"\r\n\r\n")
         .expect("response headers");
     let head = String::from_utf8_lossy(&response[..split]);
-    let status = head
-        .lines()
+    let mut lines = head.lines();
+    let status = lines
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|value| value.parse::<u16>().ok())
         .expect("status");
+    let headers = lines
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_string(), value.trim().to_string()))
+        })
+        .collect();
     let body = serde_json::from_slice(&response[split + 4..]).expect("json body");
-    Response { status, body }
+    Response {
+        status,
+        body,
+        headers,
+    }
+}
+
+fn header_values<'a>(response: &'a Response, name: &str) -> Vec<&'a str> {
+    response
+        .headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+        .collect()
+}
+
+fn cookie_value(response: &Response, name: &str) -> Option<String> {
+    header_values(response, "set-cookie")
+        .into_iter()
+        .find_map(|value| {
+            let (pair, _) = value.split_once(';')?;
+            let (key, value) = pair.split_once('=')?;
+            (key == name).then(|| value.to_string())
+        })
 }
 
 fn target() -> &'static str {
@@ -446,4 +503,186 @@ fn oversized_upload_is_rejected_before_the_body() {
     stream.read_to_end(&mut response).expect("read response");
     let head = String::from_utf8_lossy(&response);
     assert!(head.starts_with("HTTP/1.1 413"), "{}", head);
+}
+
+fn token_line(output: &std::process::Output) -> String {
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .find_map(|line| {
+            line.strip_prefix("token: ")
+                .map(str::trim)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| panic!("no token in output: {}", text))
+}
+
+#[test]
+fn lan_auth_bearer_cookie_csrf_rotate_and_disable() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let open = request(&address, "GET", "/api/v1/services", "", b"");
+    assert_eq!(open.status, 200);
+
+    let enabled = sandbox.run_svc(&["lan", "enable", "--bind", "0.0.0.0"]);
+    assert_eq!(
+        enabled.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+    let token = token_line(&enabled);
+    assert!(sandbox.config.join("lan-token").is_file());
+    assert!(sandbox.config.join("lan.json").is_file());
+
+    let denied = request(&address, "GET", "/api/v1/services", "", b"");
+    assert_eq!(denied.status, 401);
+    assert_eq!(denied.body["error"]["code"], "unauthorized");
+
+    let bearer = format!("Bearer {}", token);
+    let allowed = request_with(
+        &address,
+        "GET",
+        "/api/v1/services",
+        "",
+        b"",
+        &[("Authorization", bearer.as_str())],
+    );
+    assert_eq!(allowed.status, 200, "{}", allowed.body);
+
+    let login = request_with(
+        &address,
+        "POST",
+        "/login",
+        "application/json",
+        serde_json::to_string(&json!({ "token": token }))
+            .expect("login")
+            .as_bytes(),
+        &[],
+    );
+    assert_eq!(login.status, 200, "{}", login.body);
+    let cookie = cookie_value(&login, "svcd_api").expect("svcd_api cookie");
+    let session = cookie_value(&login, "svcd_session").expect("svcd_session cookie");
+    let cookies = header_values(&login, "set-cookie").join("\n");
+    assert!(cookies.contains("Path=/api/v1/"), "{cookies}");
+    assert!(cookies.contains("Path=/plugin-ui/"), "{cookies}");
+    assert!(cookies.contains("HttpOnly"), "{cookies}");
+    assert!(cookies.contains("SameSite=Strict"), "{cookies}");
+    assert!(cookies.contains("Max-Age=86400"), "{cookies}");
+    assert!(!session.is_empty());
+
+    let api_cookie = format!("svcd_api={}", cookie);
+    let cookie_get = request_with(
+        &address,
+        "GET",
+        "/api/v1/services",
+        "",
+        b"",
+        &[("Cookie", api_cookie.as_str())],
+    );
+    assert_eq!(cookie_get.status, 200);
+
+    let no_csrf = request_with(
+        &address,
+        "POST",
+        "/api/v1/services/svc/stop",
+        "",
+        b"",
+        &[("Cookie", api_cookie.as_str())],
+    );
+    assert_eq!(no_csrf.status, 403);
+
+    let origin = format!("http://{}", address);
+    let csrf = request_with(
+        &address,
+        "POST",
+        "/api/v1/services/svc/stop",
+        "",
+        b"",
+        &[
+            ("Cookie", api_cookie.as_str()),
+            ("Origin", origin.as_str()),
+            ("X-Svcd-Csrf", "1"),
+        ],
+    );
+    assert_eq!(csrf.status, 200, "{}", csrf.body);
+
+    let lan = request_with(
+        &address,
+        "GET",
+        "/api/v1/lan",
+        "",
+        b"",
+        &[("Authorization", bearer.as_str())],
+    );
+    assert_eq!(lan.status, 200);
+    assert_eq!(lan.body["enabled"], true);
+
+    let logout = request_with(
+        &address,
+        "POST",
+        "/logout",
+        "",
+        b"",
+        &[("Cookie", api_cookie.as_str())],
+    );
+    assert_eq!(logout.status, 200);
+    let after_logout = request_with(
+        &address,
+        "GET",
+        "/api/v1/services",
+        "",
+        b"",
+        &[("Cookie", api_cookie.as_str())],
+    );
+    assert_eq!(after_logout.status, 401);
+
+    let rotated = sandbox.run_svc(&["lan", "token", "rotate"]);
+    assert_eq!(rotated.status.code(), Some(0));
+    let new_token = token_line(&rotated);
+    let old_bearer = request_with(
+        &address,
+        "GET",
+        "/api/v1/services",
+        "",
+        b"",
+        &[("Authorization", bearer.as_str())],
+    );
+    assert_eq!(old_bearer.status, 401);
+    let new_bearer = format!("Bearer {}", new_token);
+    let new_allowed = request_with(
+        &address,
+        "GET",
+        "/api/v1/services",
+        "",
+        b"",
+        &[("Authorization", new_bearer.as_str())],
+    );
+    assert_eq!(new_allowed.status, 200);
+
+    let status = sandbox.run_svc(&["lan", "status"]);
+    assert_eq!(status.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("enabled: true"));
+
+    sandbox.shutdown();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let denied_after_restart = request(&address, "GET", "/api/v1/services", "", b"");
+    assert_eq!(denied_after_restart.status, 401);
+    let new_bearer = format!("Bearer {}", new_token);
+    let allowed_after_restart = request_with(
+        &address,
+        "GET",
+        "/api/v1/services",
+        "",
+        b"",
+        &[("Authorization", new_bearer.as_str())],
+    );
+    assert_eq!(allowed_after_restart.status, 200);
+
+    let disabled = sandbox.run_svc(&["lan", "disable"]);
+    assert_eq!(disabled.status.code(), Some(0));
+    let open_again = request(&address, "GET", "/api/v1/services", "", b"");
+    assert_eq!(open_again.status, 200);
 }
