@@ -176,6 +176,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - `tools/list` 不进路由：能力来自 manifest，运行时自报会与注册表分叉。
 - 版本：manifest `protocol: 1`；不匹配安装拒绝、加载再检；无握手；每条消息可带 `_meta` 做诊断，未知 `_meta` 忽略。
 - Windows 稳定版无 UDS，桌面走命名管道；命名管道必须显式设 DACL（不要用默认 Everyone 读）。
+- **实现状态（2026-11-12，#31）**：插件 stdio 的 NDJSON 分帧（1 MiB）、svcd 侧单调 id、每插件 64 在途、30s 超时先发 `notifications/cancelled` 再回工具错误、收帧超限杀进程、stdout EOF 按退出处理、插件 stdout 非协议帧按违规处理、崩溃摘能力并失败在途调用均已实现；svcd 暴露 `registry.tools` / `registry.call`（别名 `tools/list` / `tools/call`），能力描述与 `inputSchema` 从 manifest 透传。**本票未实现 §3.1 的 128 排队**：第 65 个并发调用直接回 `-32000 busy`（票面验收范围），排队留给后续票。
 
 ### 3.2 MCP 聚合
 
@@ -469,7 +470,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 | [#28](https://github.com/webxxxxx/plugin-manager/issues/28) | 注册表与 status | — | 已实现：services.d 扫描、status payload、CLI 接线 |
 | [#29](https://github.com/webxxxxx/plugin-manager/issues/29) | 前台监督 core 服务 | #28 | 已实现：proc/wait、事件循环、定时器、UDS/命名管道管理通道；stderr 继承，日志归 #35 |
 | [#30](https://github.com/webxxxxx/plugin-manager/issues/30) | 安装/运行 .spk（含 `plugin` 入口） | #28 #29 | 验签/`files[]`/解包/布局/插件扫描/`plugin` 入口已实现；hooks 拒绝，`install -` / downgrade / prune 未做 |
-| [#31](https://github.com/webxxxxx/plugin-manager/issues/31) | 插件 IPC 与工具面 | #30 | 编解码 + 工具投影已有；缺分帧读写、id 路由、流控、取消 |
+| [#31](https://github.com/webxxxxx/plugin-manager/issues/31) | 插件 IPC 与工具面 | #30 | 已实现：NDJSON 分帧（1 MiB）、id 路由、64 在途、30s 取消、`registry.tools` / `registry.call`；崩溃摘能力并失败在途调用；128 排队未做 |
 | [#32](https://github.com/webxxxxx/plugin-manager/issues/32) | `mcp` 桥 dual-era | #31 | 只有 echo 循环 |
 | [#33](https://github.com/webxxxxx/plugin-manager/issues/33) | Web UI 反代 | #30 #31 | HTTP 原语已有；缺监听器、路由、静态服务 |
 | [#34](https://github.com/webxxxxx/plugin-manager/issues/34) | 配置流 | #30 | 模板/活动副本/`config.new`/`editconfig`/`configCheck`/`.spkb` 导入导出已实现；HTTP 端点归 #39 |

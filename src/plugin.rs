@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use crate::log;
 use crate::package::{self, Package};
 use crate::paths;
-use crate::registry::{Exec, Kind, Ready, Service, State, RESERVED_ID};
+use crate::registry::{Capability, Exec, Kind, Ready, Service, State, RESERVED_ID};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
@@ -195,15 +195,20 @@ fn service_from_manifest(
         Some("exec") => Ready::Exec,
         Some(other) => return Err(format!("unknown ready mode: {}", other)),
     };
-    let mut caps = Vec::new();
+    let mut caps: Vec<Capability> = Vec::new();
     for capability in &manifest.capabilities {
         if capability.name.is_empty()
             || capability.name.starts_with("svc.")
-            || caps.contains(&capability.name)
+            || capability.name == "start"
+            || caps.iter().any(|cap| cap.name == capability.name)
         {
             return Err(format!("invalid capability name: {}", capability.name));
         }
-        caps.push(capability.name.clone());
+        caps.push(Capability {
+            name: capability.name.clone(),
+            description: capability.desc.clone(),
+            input_schema: capability.input_schema.clone(),
+        });
     }
     let config = {
         let path = plugin_dir(id).join("config");

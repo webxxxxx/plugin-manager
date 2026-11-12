@@ -246,7 +246,7 @@ mod tests {
             version: "1.2.3".into(),
             desc: "demo service".into(),
             deps: vec!["base".into()],
-            caps: vec!["status".into()],
+            caps: Vec::new(),
             exec: Some(crate::registry::Exec {
                 path: "/bin/demo".into(),
                 args: Vec::new(),
