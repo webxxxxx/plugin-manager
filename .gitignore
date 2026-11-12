@@ -9,3 +9,6 @@
 
 # Python 字节码（samples/realtime 的 agent）
 __pycache__/
+
+# Node test harness dependencies
+node_modules/

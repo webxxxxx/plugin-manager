@@ -1,0 +1,11 @@
+{
+  "name": "svcd-perf",
+  "private": true,
+  "type": "module",
+  "description": "Compatibility and performance harness for svcd HTTP, MCP, WebSocket and SSE",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "eventsource": "2.0.2",
+    "ws": "8.23.0"
+  }
+}

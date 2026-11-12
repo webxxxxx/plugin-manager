@@ -437,8 +437,13 @@ fn read_loop(
     loop {
         let frame = match read_frame(stream) {
             Ok(frame) => frame,
-            Err(_) => {
-                let _ = out.send(Outbound::Close(1002, "protocol error".into()));
+            Err(error) => {
+                let (code, reason) = if error.to_string().contains("1 MiB") {
+                    (1009, "message too large")
+                } else {
+                    (1002, "protocol error")
+                };
+                let _ = out.send(Outbound::Close(code, reason.into()));
                 return Ok(());
             }
         };
@@ -571,7 +576,14 @@ fn read_frame<R: Read>(reader: &mut R) -> io::Result<Frame> {
         reader.read_exact(&mut extended)?;
         length = u64::from_be_bytes(extended);
     }
+    let mut mask = [0u8; 4];
+    reader.read_exact(&mut mask)?;
     if length > MAX_MESSAGE as u64 {
+        // Consume enough of the oversized frame for the peer to finish writing
+        // and receive our close frame instead of seeing a TCP reset.
+        let drain = length.min(MAX_MESSAGE as u64 + 1024);
+        let mut limited = reader.take(drain);
+        io::copy(&mut limited, &mut io::sink())?;
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "frame exceeds the 1 MiB limit",
@@ -583,8 +595,6 @@ fn read_frame<R: Read>(reader: &mut R) -> io::Result<Frame> {
             "invalid control frame",
         ));
     }
-    let mut mask = [0u8; 4];
-    reader.read_exact(&mut mask)?;
     let mut payload = vec![0u8; length as usize];
     reader.read_exact(&mut payload)?;
     for (index, byte) in payload.iter_mut().enumerate() {
