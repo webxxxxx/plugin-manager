@@ -43,6 +43,10 @@ impl Slot {
         }
     }
 
+    pub(crate) fn set_exec(&mut self, exec: Exec) {
+        self.exec = exec;
+    }
+
     pub(crate) fn pump(&mut self, now: u64) {
         self.drain_lines(now);
         self.check_exit(now);
@@ -93,8 +97,7 @@ impl Slot {
     }
 
     fn spawn(&mut self) -> Result<u32, String> {
-        let mut command = Command::new(&self.exec.path);
-        command.args(&self.exec.args).envs(&self.exec.env);
+        let mut command = command_for(&self.exec);
         match self.exec.ready {
             Ready::Notify => {
                 command
@@ -389,6 +392,30 @@ impl Slot {
         self.stop_deadline = None;
         self.kill_deadline = None;
     }
+}
+
+fn command_for(exec: &Exec) -> Command {
+    #[cfg(windows)]
+    {
+        let extension = std::path::Path::new(&exec.path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if extension == "cmd" || extension == "bat" {
+            let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
+            let mut command = Command::new(shell);
+            command
+                .arg("/C")
+                .arg(&exec.path)
+                .args(&exec.args)
+                .envs(&exec.env);
+            return command;
+        }
+    }
+    let mut command = Command::new(&exec.path);
+    command.args(&exec.args).envs(&exec.env);
+    command
 }
 
 fn log_line(log: &Option<Arc<Mutex<LogSink>>>, line: &str) {

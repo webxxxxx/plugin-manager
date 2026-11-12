@@ -15,6 +15,19 @@ pub fn services_dir() -> PathBuf {
     config_dir().join("services.d")
 }
 
+/// Installed plugins: `<data>/plugins/<id>/<version>/`.
+pub fn plugins_dir() -> PathBuf {
+    data_dir().join("plugins")
+}
+
+/// Ed25519 trust roots: `<config>/trust.d/<keyId>.pub` (PEM SPKI).
+pub fn trust_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("SVCD_TRUST_DIR") {
+        return PathBuf::from(dir);
+    }
+    config_dir().join("trust.d")
+}
+
 /// The platform log directory. `SVCD_LOG_DIR` overrides it for tests and
 /// non-root development; production paths are `/var/log/svcd`,
 /// `/Library/Logs/svcd` and `%ProgramData%\svcd\logs`.

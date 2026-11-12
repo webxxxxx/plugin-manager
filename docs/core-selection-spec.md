@@ -128,6 +128,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - 包内 `signature.json`：`{"alg":"ed25519","keyId":"...","sig":"base64"}`，签 `manifest.json` 的原样字节；`files[]` 钉每个文件的 sha256/size/mode。
 - 验证顺序：读 manifest → 验签 → 校验 schema / platform / 路径 → 逐文件验 hash 后落盘；清单外条目直接拒；流式、逐文件可验。
 - 信任根：编译期内置 store 公钥 + `/etc/svcd/trust.d/<keyId>.pub`（**PEM SPKI**）；未知 keyId 拒绝；**不提供 `--insecure`**。
+- 当前实现只读取 `<config>/trust.d`（`SVCD_TRUST_DIR` 可覆盖，供测试）；编译期 store 公钥随商城/发布补。
 - 不签整个 tar、不做分离 `.sig`、不只靠商城 TLS。
 
 ### 2.4 安装布局与策略
@@ -150,6 +151,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - post-install 失败 → 回滚 current 并报错；pre-remove 失败 → 记日志但继续卸载。
 - 嵌入式默认拒绝带 hooks 的包（`--allow-hooks` 才放行）；桌面交互安装先列出 hooks 再确认。
 - **hooks 权限 = 安装者权限（root）**；信任只来自签名。
+- 当前安装器**拒绝带 hooks 的包**；hook runner（60s、环境清空、回滚）尚未实现，待后续票。
 
 ### 2.6 config（详见 §5.3）
 
@@ -317,7 +319,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - 工具链：ubuntu-24.04 上用 cargo-zigbuild（pin `=0.24.1`）+ Zig（`0.17.1`）出三架构 musl；Windows/macOS 原生 runner；唯一高风险环是 armv7+musl 的 zig 链接。
 - 计量：multicall 单二进制，strip 后、未压缩、十进制字节；硬链接算一次；编译进二进制的资源算；安装的 unit/config 与插件不算。
 - 门禁：嵌入式 **≤ 2,000,000 B**、桌面 **≤ 30,000,000 B** 超限 fail；基线 +2% warning；`tools/measure_size.py` + `.github/workflows/size.yml` + `ci/size-baseline.json`。
-- 实测基线（2026-11-12 本机）：musl x86_64 `803,728 B`；Windows x86_64 `625,152 B`；macOS / Linux gnu 待 CI 首跑。
+- 实测基线（2026-11-12 本机）：musl x86_64 `992,176 B`；Windows x86_64 `806,912 B`；macOS / Linux gnu 待 CI 首跑。
 - **30MB 只约束核心二进制**；安装包不计门禁，只记录体积（见 §13-C2）。
 
 ## 8. 桌面交付
@@ -454,7 +456,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 | --- | --- | --- | --- |
 | [#28](https://github.com/webxxxxx/plugin-manager/issues/28) | 注册表与 status | — | 已实现：services.d 扫描、status payload、CLI 接线 |
 | [#29](https://github.com/webxxxxx/plugin-manager/issues/29) | 前台监督 core 服务 | #28 | 已实现：proc/wait、事件循环、定时器、UDS/命名管道管理通道；stderr 继承，日志归 #35 |
-| [#30](https://github.com/webxxxxx/plugin-manager/issues/30) | 安装/运行 .spk（含 `plugin` 入口） | #28 #29 | manifest 解析 + ustar 头已有；缺验签、`files[]` 校验、解包、布局、插件扫描、第四入口 |
+| [#30](https://github.com/webxxxxx/plugin-manager/issues/30) | 安装/运行 .spk（含 `plugin` 入口） | #28 #29 | 验签/`files[]`/解包/布局/插件扫描/`plugin` 入口已实现；hooks 拒绝，`install -` / downgrade / prune 未做 |
 | [#31](https://github.com/webxxxxx/plugin-manager/issues/31) | 插件 IPC 与工具面 | #30 | 编解码 + 工具投影已有；缺分帧读写、id 路由、流控、取消 |
 | [#32](https://github.com/webxxxxx/plugin-manager/issues/32) | `mcp` 桥 dual-era | #31 | 只有 echo 循环 |
 | [#33](https://github.com/webxxxxx/plugin-manager/issues/33) | Web UI 反代 | #30 #31 | HTTP 原语已有；缺监听器、路由、静态服务 |
