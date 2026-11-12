@@ -212,6 +212,17 @@ fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
 }
 
 fn handle(mut stream: TcpStream, config: PathBuf, lan: Arc<Mutex<Lan>>) {
+    // Windows accepted sockets inherit the listener's non-blocking mode
+    // (Unix ones do not). One connection reads one request and writes one
+    // response; that loop expects blocking reads, so flip the socket back
+    // before installing the read timeout. Otherwise a body that has not
+    // arrived yet becomes a WouldBlock "read" error.
+    if let Err(error) = stream.set_nonblocking(false) {
+        log::svcd(&format!(
+            "svcd: HTTP connection: cannot switch to blocking mode: {}",
+            error
+        ));
+    }
     let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
     let request = match read_request(&mut stream) {
         Ok(request) => request,
