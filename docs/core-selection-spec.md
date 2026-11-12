@@ -230,6 +230,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - 监听：与 HTTP UI 同一个 listener；默认 loopback，LAN 需显式开启；单请求体上限 1 MiB。
 - legacy 客户端走 `mcp` stdio 桥（§3.2）；HTTP 只做 modern。
 - 工具可见性/错误映射与 §3.2 完全相同；死服务只出 `<id>.start`。
+- **实现状态（2026-11-12，#40）**：`POST /mcp` 已实现 modern-only Streamable HTTP：单请求单 JSON 响应、无 session / 无 SSE，`GET`/`DELETE` 返回 405。逐请求校验 `MCP-Protocol-Version`（必须等于正文 `_meta` 版本）、`Mcp-Method`、`tools/call` 的 `Mcp-Name`（支持 `=?base64?…?=` 哨兵）：头缺失或头/正文值不一致返回 400 + `-32020`；正文缺 `_meta` 字段按核心规范 400 + `-32602`（与 stdio 同一条错误）；未知方法 404 + `-32601`；未实现版本 400 + `-32022`（带 `supported`）；`Origin` 必须同源（否则 403）。`Authorization: Bearer <lan-token>` 必需：缺 token 401（带 `WWW-Authenticate: Bearer`）、token 错 403，cookie 完全不参与；token 未生成时端点保持关闭，`svc lan token rotate` 可在不开 LAN 时生成 token。`server/discover` / `tools/list` / `tools/call` 走与 stdio 桥相同的 `mcp::serve_modern`（`resultType:"complete"`、`ttlMs:1000`、`cacheScope:"private"`、`<id>.start` 可见性、`isError` 映射）；正文上限 1 MiB（超限 413）；通知 POST 返回 202 空体（该修订未定义通知的头要求，故不做镜像校验）；控制通道不可达仍回 JSON-RPC（与 stdio 同映射，不引入 503）；不做 `subscriptions/listen`。
 
 ### 3.5 HTTP 管理 API
 
@@ -268,7 +269,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - 登录失败固定 1s 延迟，连续 10 次锁 5 分钟（内存）。
 - **v1 不支持 TLS**：核心不终止、不生成证书；要 HTTPS 就在前面放反代。明文 token 过 LAN 的风险写进文档；默认关闭 LAN 是安全默认。
 - 单用户 / 单角色；多用户、角色不做；HTTP 管理 API 见 §3.5。
-- **实现状态（2026-11-12，#38）**：默认 loopback；`svc lan enable [--bind]` 生成 32 字节 token（0600，只打印一次）、切 listener 绑定；`POST /login` 下发 `svcd_session`/`svcd_api` cookie；`/api/v1` 收 Bearer 或 cookie，cookie 写要求同源 `Origin` + `X-Svcd-Csrf: 1`；登录失败 1s、10 次锁 5 分钟；`svc lan disable` / `token rotate`。`/mcp` Bearer 面归 #40。
+- **实现状态（2026-11-12，#38）**：默认 loopback；`svc lan enable [--bind]` 生成 32 字节 token（0600，只打印一次）、切 listener 绑定；`POST /login` 下发 `svcd_session`/`svcd_api` cookie；`/api/v1` 收 Bearer 或 cookie，cookie 写要求同源 `Origin` + `X-Svcd-Csrf: 1`；登录失败 1s、10 次锁 5 分钟；`svc lan disable` / `token rotate`。`/mcp` 的 Bearer 面由 #40 实现（见 §3.4）；cookie 不参与 MCP 认证。
 
 ## 4. OSAL 与平台边界
 
@@ -505,11 +506,11 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 | [#37](https://github.com/webxxxxx/plugin-manager/issues/37) | HTTP 管理 API | #29 #30 | 服务/插件/版本端点已实现；loopback、无 auth；#38/#39 待补 |
 | [#38](https://github.com/webxxxxx/plugin-manager/issues/38) | LAN 鉴权与会话 | #37 | token/登录/cookie/CSRF/限速与 listener 重绑已实现；`/mcp` 归 #40 |
 | [#39](https://github.com/webxxxxx/plugin-manager/issues/39) | HTTP 配置/导入导出/日志 | #34 #35 #37 | 无 |
-| [#40](https://github.com/webxxxxx/plugin-manager/issues/40) | HTTP `/mcp` | #32 #38 | 无 |
+| [#40](https://github.com/webxxxxx/plugin-manager/issues/40) | HTTP `/mcp` | #32 #38 | 已实现：modern-only `POST /mcp`、镜像头/Bearer/Origin/1 MiB 校验、与 stdio 共用 `serve_modern`；无 session/SSE |
 | [#41](https://github.com/webxxxxx/plugin-manager/issues/41) | 桌面 `svc ui` | #33 #37 | 无 |
 | [#42](https://github.com/webxxxxx/plugin-manager/issues/42) | 发行包与签名 | #41 | 无 |
 | [#43](https://github.com/webxxxxx/plugin-manager/issues/43) | 嵌入式发行 | #29 #33 | 无 |
 
 > 后续追加：[#57](https://github.com/webxxxxx/plugin-manager/issues/57) `svcd --install / --uninstall` 自安装/卸载（复制四入口 + 调用 install-service；默认保留数据，`--purge` 清理）。
 
-**已打通的端到端路径**：`services.d/*.json` → `svcd run --foreground` → 真实进程（spawn / 就绪探针 / 退避 / stop）→ `svc list/status/start/stop` 经 UDS（Unix）/命名管道（Windows）。其余行的服务安装、插件、MCP、HTTP 面仍是骨架。
+**已打通的端到端路径**：`services.d/*.json` → `svcd run --foreground` → 真实进程（spawn / 就绪探针 / 退避 / stop）→ `svc list/status/start/stop` 经 UDS（Unix）/命名管道（Windows）；插件安装/IPC/工具面、MCP 桥（stdio 与 HTTP）与 HTTP 管理 API 已接通。其余行的系统服务安装、发行、桌面与嵌入式仍是骨架。

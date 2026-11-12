@@ -1,5 +1,8 @@
-//! HTTP primitives; the UI reverse proxy lands in #33.
+//! HTTP primitives shared by the management API, plugin UI and `/mcp`.
+
 #![allow(dead_code)]
+
+use serde_json::json;
 
 pub struct Request<'a> {
     pub method: &'a str,
@@ -42,6 +45,7 @@ pub fn response_with_headers(
 ) -> Vec<u8> {
     let reason = match status {
         200 => "OK",
+        202 => "Accepted",
         304 => "Not Modified",
         308 => "Permanent Redirect",
         400 => "Bad Request",
@@ -73,6 +77,59 @@ pub fn response_with_headers(
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(body);
     out
+}
+
+/// Case-insensitive lookup over the owned header pairs an HTTP request
+/// carries. `http::Request` keeps borrowed pairs, so it has its own lookup.
+pub fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+/// Same-origin check shared by the UI `/rpc` bridge, cookie writes and
+/// `/mcp`. A missing `Origin` is allowed: non-browser clients do not send one
+/// and the cookie surfaces require it explicitly (see `api::csrf_ok`).
+pub fn same_origin(headers: &[(String, String)]) -> bool {
+    let Some(origin) = header(headers, "origin") else {
+        return true;
+    };
+    let host = header(headers, "host").unwrap_or("");
+    if host.is_empty() {
+        return false;
+    }
+    origin
+        .trim()
+        .strip_prefix("http://")
+        .or_else(|| origin.trim().strip_prefix("https://"))
+        .map(|origin_host| origin_host.eq_ignore_ascii_case(host))
+        .unwrap_or(false)
+}
+
+/// The `{"error":{"code","message"}}` envelope every non-MCP HTTP error uses.
+pub fn json_error(status: u16, code: &str, message: &str) -> Vec<u8> {
+    let body = json!({ "error": { "code": code, "message": message } });
+    response(
+        status,
+        "application/json",
+        &serde_json::to_vec(&body).unwrap_or_default(),
+    )
+}
+
+pub fn method_not_allowed(allow: &str) -> Vec<u8> {
+    let body = json!({
+        "error": {
+            "code": "method_not_allowed",
+            "message": format!("method not allowed; use {}", allow),
+        }
+    });
+    response_with_headers(
+        405,
+        "application/json",
+        &[("Allow".to_string(), allow.to_string())],
+        &serde_json::to_vec(&body).unwrap_or_default(),
+    )
 }
 
 /// MIME by file extension. Unknown extensions fall back to

@@ -21,6 +21,7 @@ use crate::channel;
 use crate::http;
 use crate::lan::{self, AuthKind, Lan, LanStatus};
 use crate::log;
+use crate::mcp_http;
 use crate::package;
 use crate::paths;
 use crate::plugin;
@@ -241,6 +242,23 @@ fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u
         }
         return ui_page();
     }
+    if path == "/mcp" {
+        // Bearer-only and outside the cookie/session policy on purpose: the
+        // MCP surface must not share the browser's CSRF model (see #40).
+        let token = match lan.lock() {
+            Ok(state) => state.token().map(str::to_string),
+            Err(_) => return error(500, "internal", "LAN state unavailable"),
+        };
+        return mcp_http::handle(
+            config,
+            &mcp_http::Request {
+                method: &request.method,
+                headers: &request.headers,
+                body: &request.body,
+            },
+            token.as_deref(),
+        );
+    }
 
     let ui = ui_path(path);
     let auth = match lan.lock() {
@@ -440,19 +458,7 @@ fn ui_rpc(config: &Path, request: &HttpRequest, id: &str, auth: AuthKind) -> Vec
 /// mismatched origin is CSRF or DNS rebinding; an absent origin is allowed on
 /// the unauthenticated loopback surface but never with a session cookie.
 fn same_origin(request: &HttpRequest) -> bool {
-    let Some(origin) = request_header(request, "origin") else {
-        return true;
-    };
-    let host = request_header(request, "host").unwrap_or("");
-    if host.is_empty() {
-        return false;
-    }
-    let origin = origin.trim();
-    origin
-        .strip_prefix("http://")
-        .or_else(|| origin.strip_prefix("https://"))
-        .map(|origin_host| origin_host.eq_ignore_ascii_case(host))
-        .unwrap_or(false)
+    http::same_origin(&request.headers)
 }
 
 fn login(request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u8> {
@@ -582,11 +588,7 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, Vec<u8>> {
 }
 
 fn request_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
-    request
-        .headers
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_str())
+    http::header(&request.headers, name)
 }
 
 fn header<'a>(request: &'a http::Request<'_>, name: &str) -> Option<&'a str> {
@@ -944,18 +946,7 @@ fn cap_log(mut text: String) -> String {
 }
 
 fn method_not_allowed(allow: &str) -> Vec<u8> {
-    let body = json!({
-        "error": {
-            "code": "method_not_allowed",
-            "message": format!("method not allowed; use {}", allow),
-        }
-    });
-    http::response_with_headers(
-        405,
-        "application/json",
-        &[("Allow".to_string(), allow.to_string())],
-        &serde_json::to_vec(&body).unwrap_or_default(),
-    )
+    http::method_not_allowed(allow)
 }
 
 fn download(filename: &str, data: &[u8]) -> Vec<u8> {
@@ -1083,12 +1074,7 @@ fn ok(value: Value) -> Vec<u8> {
 }
 
 fn error(status: u16, code: &str, message: &str) -> Vec<u8> {
-    let body = json!({ "error": { "code": code, "message": message } });
-    http::response(
-        status,
-        "application/json",
-        &serde_json::to_vec(&body).unwrap_or_default(),
-    )
+    http::json_error(status, code, message)
 }
 
 fn query_value(query: &str, key: &str) -> Option<String> {

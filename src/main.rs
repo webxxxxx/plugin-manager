@@ -9,6 +9,7 @@ mod ipc;
 mod lan;
 mod log;
 mod mcp;
+mod mcp_http;
 mod package;
 mod paths;
 mod plugin;
