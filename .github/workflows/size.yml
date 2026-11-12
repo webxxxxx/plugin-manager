@@ -1,0 +1,93 @@
+name: size
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  embedded:
+    name: embedded / ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --version 0.24.1 --locked
+      - name: Build
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+      - name: Measure
+        run: |
+          python3 tools/measure_size.py \
+            "target/${{ matrix.target }}/release/svcd" \
+            --target "${{ matrix.target }}" \
+            --limit 2000000 \
+            --baseline ci/size-baseline.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: size-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/svcd
+            size-report.json
+          retention-days: 14
+
+  desktop-windows:
+    name: desktop / x86_64-pc-windows-msvc
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Measure
+        run: python tools/measure_size.py target/release/svcd.exe --target x86_64-pc-windows-msvc --limit 30000000 --baseline ci/size-baseline.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: size-x86_64-pc-windows-msvc
+          path: |
+            target/release/svcd.exe
+            size-report.json
+          retention-days: 14
+
+  desktop-macos:
+    name: desktop / aarch64-apple-darwin (nightly)
+    if: github.event_name == 'schedule'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --target aarch64-apple-darwin
+      - name: Measure
+        run: python3 tools/measure_size.py target/aarch64-apple-darwin/release/svcd --target aarch64-apple-darwin --limit 30000000 --baseline ci/size-baseline.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: size-aarch64-apple-darwin
+          path: |
+            target/aarch64-apple-darwin/release/svcd
+            size-report.json
+          retention-days: 14

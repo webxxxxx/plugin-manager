@@ -1,0 +1,8 @@
+/target
+/size-report.json
+
+# 示例签名密钥：用 tools/gen_sample_key.mjs 生成，不入库
+/samples/keys/
+
+# 示例构建产物：用 tools/build_spk.mjs 生成，不入库
+/samples/out/
