@@ -622,6 +622,7 @@ struct Request {
     target: Option<Target>,
     dry_run: bool,
     purge: bool,
+    program: Option<PathBuf>,
 }
 
 fn set_target(request: &mut Request, value: &str) -> Result<(), String> {
@@ -666,9 +667,21 @@ fn parse_request(action: Action, args: &[String]) -> Result<Request, String> {
                     .ok_or_else(|| "--target requires a value".to_string())?;
                 set_target(&mut request, value)?;
             }
+            "--program" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--program requires a value".to_string())?;
+                request.program = Some(PathBuf::from(value));
+            }
             other => match other.strip_prefix("--target=") {
                 Some(value) => set_target(&mut request, value)?,
-                None => return Err(format!("unexpected argument: {}", other)),
+                None => match other.strip_prefix("--program=") {
+                    Some(value) if !value.is_empty() => {
+                        request.program = Some(PathBuf::from(value));
+                    }
+                    Some(_) => return Err("--program requires a value".into()),
+                    None => return Err(format!("unexpected argument: {}", other)),
+                },
             },
         }
     }
@@ -683,6 +696,283 @@ pub fn uninstall_service(args: &[String]) -> i32 {
     dispatch(Action::Uninstall, args)
 }
 
+#[derive(Default)]
+struct SelfRequest {
+    prefix: Option<PathBuf>,
+    no_service: bool,
+    purge: bool,
+    dry_run: bool,
+    target: Option<Target>,
+}
+
+fn parse_self(args: &[String], uninstall: bool) -> Result<SelfRequest, String> {
+    let mut request = SelfRequest::default();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "--no-service" => request.no_service = true,
+            "--dry-run" => request.dry_run = true,
+            "--purge" if uninstall => request.purge = true,
+            "--purge" => return Err("--purge only applies to --uninstall".into()),
+            "--prefix" => {
+                index += 1;
+                let value = args.get(index).ok_or("--prefix requires a value")?;
+                request.prefix = Some(PathBuf::from(value));
+            }
+            "--target" => {
+                index += 1;
+                let value = args.get(index).ok_or("--target requires a value")?;
+                request.target = Some(Target::parse(value).ok_or("unknown target")?);
+            }
+            other => {
+                if let Some(value) = other.strip_prefix("--prefix=") {
+                    if value.is_empty() {
+                        return Err("--prefix requires a value".into());
+                    }
+                    request.prefix = Some(PathBuf::from(value));
+                } else if let Some(value) = other.strip_prefix("--target=") {
+                    request.target = Some(Target::parse(value).ok_or("unknown target")?);
+                } else {
+                    return Err(format!("unexpected argument: {}", other));
+                }
+            }
+        }
+        index += 1;
+    }
+    Ok(request)
+}
+
+pub fn self_install(args: &[String]) -> i32 {
+    let request = match parse_self(args, false) {
+        Ok(request) => request,
+        Err(message) => {
+            eprintln!("svcd: {}", message);
+            usage_self(false);
+            return EXIT_USAGE;
+        }
+    };
+    let prefix = request
+        .prefix
+        .clone()
+        .unwrap_or_else(default_install_prefix);
+    let target_name = if cfg!(windows) { "svcd.exe" } else { "svcd" };
+    let target = prefix.join(target_name);
+    let current = std::env::current_exe().unwrap_or_else(|_| target.clone());
+    if request.dry_run {
+        println!("install {} -> {}", current.display(), target.display());
+        println!("  aliases: {}", alias_names().join(", "));
+        println!("  config:  {}", paths::config_dir().display());
+        println!("  data:    {}", paths::data_dir().display());
+        println!("  logs:    {}", paths::logs_dir().display());
+        if !request.no_service {
+            println!("  service: program {}", target.display());
+        }
+        return EXIT_OK;
+    }
+    if !is_privileged() {
+        eprintln!("svcd: --install requires root / Administrator");
+        return EXIT_ERROR;
+    }
+
+    if let Err(error) = fs::create_dir_all(&prefix) {
+        eprintln!("svcd: cannot create {}: {}", prefix.display(), error);
+        return EXIT_ERROR;
+    }
+    for dir in [paths::config_dir(), paths::data_dir(), paths::logs_dir()] {
+        if let Err(error) = fs::create_dir_all(&dir) {
+            eprintln!("svcd: cannot create {}: {}", dir.display(), error);
+            return EXIT_ERROR;
+        }
+    }
+
+    if target.exists() && !request.no_service {
+        let mut args = Vec::new();
+        if let Some(target) = request.target {
+            args.push("--target".to_string());
+            args.push(target.as_str().to_string());
+        }
+        let _ = uninstall_service(&args);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+
+    if current != target {
+        if let Err(error) = copy_executable(&current, &target) {
+            eprintln!("svcd: cannot install {}: {}", target.display(), error);
+            return EXIT_ERROR;
+        }
+    }
+    for alias in alias_names() {
+        let path = prefix.join(alias);
+        if let Err(error) = install_alias(&target, &path) {
+            eprintln!("svcd: cannot install {}: {}", path.display(), error);
+            return EXIT_ERROR;
+        }
+    }
+
+    if !request.no_service {
+        let mut args = vec![
+            "--program".to_string(),
+            target.to_string_lossy().to_string(),
+        ];
+        if let Some(target) = request.target {
+            args.push("--target".to_string());
+            args.push(target.as_str().to_string());
+        }
+        let code = install_service(&args);
+        if code != EXIT_OK {
+            eprintln!("svcd: files installed, but service registration failed");
+            return code;
+        }
+    }
+
+    println!("svcd installed: {}", target.display());
+    println!("aliases: {}", alias_names().join(", "));
+    println!("config:  {}", paths::config_dir().display());
+    println!("data:    {}", paths::data_dir().display());
+    println!("logs:    {}", paths::logs_dir().display());
+    if request.no_service {
+        println!("service: not installed (--no-service)");
+    }
+    println!("try: svc list");
+    EXIT_OK
+}
+
+pub fn self_uninstall(args: &[String]) -> i32 {
+    let request = match parse_self(args, true) {
+        Ok(request) => request,
+        Err(message) => {
+            eprintln!("svcd: {}", message);
+            usage_self(true);
+            return EXIT_USAGE;
+        }
+    };
+    let prefix = request
+        .prefix
+        .clone()
+        .unwrap_or_else(default_install_prefix);
+    let target_name = if cfg!(windows) { "svcd.exe" } else { "svcd" };
+    let target = prefix.join(target_name);
+    if request.dry_run {
+        println!("uninstall {}", prefix.display());
+        println!("  remove: {}", target.display());
+        println!("  aliases: {}", alias_names().join(", "));
+        if !request.no_service {
+            println!("  service: remove");
+        }
+        if request.purge {
+            println!(
+                "  purge: {}, {}, {}",
+                paths::config_dir().display(),
+                paths::data_dir().display(),
+                paths::logs_dir().display()
+            );
+        }
+        return EXIT_OK;
+    }
+    if !is_privileged() {
+        eprintln!("svcd: --uninstall requires root / Administrator");
+        return EXIT_ERROR;
+    }
+
+    if !request.no_service {
+        let mut args = Vec::new();
+        if let Some(target) = request.target {
+            args.push("--target".to_string());
+            args.push(target.as_str().to_string());
+        }
+        let _ = uninstall_service(&args);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+
+    let current = std::env::current_exe().ok();
+    for path in std::iter::once(target.clone())
+        .chain(alias_names().into_iter().map(|name| prefix.join(name)))
+    {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                if current.as_ref() == Some(&path) {
+                    println!(
+                        "svcd: {} is running; remove it after exit: {}",
+                        path.display(),
+                        error
+                    );
+                } else {
+                    eprintln!("svcd: cannot remove {}: {}", path.display(), error);
+                }
+            }
+        }
+    }
+
+    if request.purge {
+        for dir in [paths::config_dir(), paths::data_dir(), paths::logs_dir()] {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+    println!("svcd uninstalled from {}", prefix.display());
+    if !request.purge {
+        println!("config/data/logs kept; use --purge to remove");
+    }
+    EXIT_OK
+}
+
+fn default_install_prefix() -> PathBuf {
+    if cfg!(windows) {
+        let base = std::env::var_os("ProgramFiles")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+        base.join("svcd")
+    } else {
+        PathBuf::from("/usr/sbin")
+    }
+}
+
+fn alias_names() -> Vec<&'static str> {
+    if cfg!(windows) {
+        vec!["svc.exe", "plugin.exe", "mcp.exe"]
+    } else {
+        vec!["svc", "plugin", "mcp"]
+    }
+}
+
+fn copy_executable(source: &Path, target: &Path) -> io::Result<()> {
+    fs::copy(source, target)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(target, fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
+fn install_alias(source: &Path, target: &Path) -> io::Result<()> {
+    if target.exists() {
+        fs::remove_file(target)?;
+    }
+    match fs::hard_link(source, target) {
+        Ok(()) => {}
+        Err(_) => copy_executable(source, target)?,
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(target, fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
+fn usage_self(uninstall: bool) {
+    if uninstall {
+        eprintln!("usage: svcd --uninstall [--prefix <dir>] [--no-service] [--purge] [--dry-run]");
+    } else {
+        eprintln!(
+            "usage: svcd --install [--prefix <dir>] [--no-service] [--target <init>] [--dry-run]"
+        );
+    }
+}
+
 fn dispatch(action: Action, args: &[String]) -> i32 {
     let request = match parse_request(action, args) {
         Ok(request) => request,
@@ -694,7 +984,10 @@ fn dispatch(action: Action, args: &[String]) -> i32 {
     };
 
     let target = request.target.unwrap_or_else(|| detect(&Probe::current()));
-    let layout = Layout::current();
+    let mut layout = Layout::current();
+    if let Some(program) = request.program {
+        layout.program = program;
+    }
     let plan = match action {
         Action::Install => install_plan(target, &layout),
         Action::Uninstall => uninstall_plan(target, &layout, request.purge),
@@ -725,10 +1018,10 @@ fn dispatch(action: Action, args: &[String]) -> i32 {
 fn usage(action: Action) {
     match action {
         Action::Install => eprintln!(
-            "usage: svcd install-service [--target systemd|launchd|scm|busybox|procd] [--dry-run]"
+            "usage: svcd install-service [--target systemd|launchd|scm|busybox|procd] [--program <path>] [--dry-run]"
         ),
         Action::Uninstall => eprintln!(
-            "usage: svcd uninstall-service [--target systemd|launchd|scm|busybox|procd] [--purge] [--dry-run]"
+            "usage: svcd uninstall-service [--target systemd|launchd|scm|busybox|procd] [--program <path>] [--purge] [--dry-run]"
         ),
     }
 }
@@ -957,11 +1250,19 @@ fn run_command(argv: &[String], allow_codes: Option<&[i32]>) -> Result<(), Strin
 
 #[cfg(unix)]
 pub(crate) fn is_privileged() -> bool {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SVCD_TEST_UNPRIVILEGED").is_some() {
+        return true;
+    }
     unsafe { libc::geteuid() == 0 }
 }
 
 #[cfg(windows)]
 pub(crate) fn is_privileged() -> bool {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SVCD_TEST_UNPRIVILEGED").is_some() {
+        return true;
+    }
     use std::mem::size_of;
     use std::ptr::null_mut;
 
@@ -1302,6 +1603,7 @@ mod tests {
                 target: Some(Target::Systemd),
                 dry_run: true,
                 purge: false,
+                program: None,
             }
         );
         assert_eq!(
@@ -1314,6 +1616,7 @@ mod tests {
                 target: Some(Target::Procd),
                 dry_run: true,
                 purge: true,
+                program: None,
             }
         );
     }
