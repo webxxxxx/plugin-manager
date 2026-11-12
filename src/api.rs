@@ -297,15 +297,17 @@ fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u
         // A slashless URL never carries the `/plugin-ui/` session cookie, so
         // browsers would stall at 401. Redirect after auth: the session check
         // stays authoritative and only reachable pages redirect.
-        if request.method == "GET" && ui.slashless && package::valid_name(ui.id) {
-            if plugin::web_assets(ui.id).is_some() {
-                return http::response_with_headers(
-                    308,
-                    "text/plain; charset=utf-8",
-                    &[("Location".to_string(), format!("/plugin-ui/{}/", ui.id))],
-                    b"",
-                );
-            }
+        if request.method == "GET"
+            && ui.slashless
+            && package::valid_name(ui.id)
+            && plugin::web_assets(ui.id).is_some()
+        {
+            return http::response_with_headers(
+                308,
+                "text/plain; charset=utf-8",
+                &[("Location".to_string(), format!("/plugin-ui/{}/", ui.id))],
+                b"",
+            );
         }
         return plugin_ui(config, request, &ui, auth);
     }
