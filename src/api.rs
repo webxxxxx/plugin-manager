@@ -1278,6 +1278,8 @@ fn map_error(message: &str) -> Vec<u8> {
     let lower = message.to_ascii_lowercase();
     let status = if lower.contains("timed out") || lower.contains("timeout") {
         504
+    } else if lower.contains("unknown keyid") || lower.contains("trust root") {
+        400
     } else if lower.contains("unknown") || lower.contains("not found") {
         404
     } else if lower.contains("not a plugin")

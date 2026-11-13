@@ -471,8 +471,14 @@ fn verify_signature(manifest: &[u8], signature_bytes: &[u8]) -> Result<(), Strin
         return Err(format!("invalid keyId: {}", sig.key_id));
     }
     let key_path = paths::trust_dir().join(format!("{}.pub", sig.key_id));
-    let pem =
-        fs::read(&key_path).map_err(|error| format!("unknown keyId {}: {}", sig.key_id, error))?;
+    let pem = fs::read(&key_path).map_err(|error| {
+        format!(
+            "unknown keyId {}: {} (trust root path: {})",
+            sig.key_id,
+            error,
+            key_path.display()
+        )
+    })?;
     let key = parse_public_key(&pem)?;
     let signature = BASE64
         .decode(sig.sig.trim())
@@ -896,6 +902,8 @@ mod tests {
         let bytes = package_from(&key, "missing", &manifest, &files);
         let error = verify_bytes(&bytes).expect_err("unknown key");
         assert!(error.contains("unknown keyId"), "{error}");
+        assert!(error.contains("missing.pub"), "{error}");
+        assert!(error.contains("trust root"), "{error}");
     }
 
     #[test]

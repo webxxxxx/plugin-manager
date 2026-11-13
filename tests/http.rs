@@ -1167,6 +1167,32 @@ fn plugin_upload_list_and_delete() {
 }
 
 #[test]
+fn untrusted_upload_returns_bad_request_not_404() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[22u8; 32]);
+    // Deliberately leave the trust directory empty: the package is signed by
+    // `test`, but the installer has no `trust.d/test.pub`.
+    let package = plugin_package(&key);
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let response = request(
+        &address,
+        "POST",
+        "/api/v1/plugins?strategy=replace",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(response.status, 400, "{}", response.body);
+    assert_eq!(response.body["error"]["code"], "bad_request");
+    let message = response.body["error"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(message.contains("unknown keyId test"), "{message}");
+    assert!(message.contains("trust.d"), "{message}");
+}
+
+#[test]
 fn oversized_upload_is_rejected_before_the_body() {
     let mut sandbox = Sandbox::new();
     sandbox.start_daemon();
