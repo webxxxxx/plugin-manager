@@ -1,12 +1,12 @@
-//! LAN state, admin token, sessions and login throttling.
+//! LAN state, password authentication, sessions and login throttling.
 //!
-//! The token is generated with OS randomness and is equivalent to root. The
-//! default state is loopback-only and LAN disabled.
+//! The password hash lives in `auth_passwd` in `svcd.conf`; sessions are random
+//! values held in memory. The default state is loopback-only and LAN disabled.
 
 use std::collections::HashMap;
 use std::fs;
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
@@ -31,7 +31,7 @@ struct LanFile {
 pub struct LanStatus {
     pub enabled: bool,
     pub bind: IpAddr,
-    pub token_set: bool,
+    pub password_set: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,14 +44,14 @@ pub enum AuthKind {
 pub struct Lan {
     pub enabled: bool,
     pub bind: IpAddr,
-    token: Option<String>,
+    password_hash: Option<String>,
     sessions: HashMap<String, Instant>,
     failures: u32,
     locked_until: Option<Instant>,
 }
 
 impl Lan {
-    pub fn load(config: &Path) -> Self {
+    pub fn load(config: &Path, password_hash: Option<String>) -> Self {
         let file = fs::read(config.join("lan.json"))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<LanFile>(&bytes).ok());
@@ -60,20 +60,10 @@ impl Lan {
             .as_ref()
             .and_then(|file| file.bind.parse::<IpAddr>().ok())
             .unwrap_or_else(|| "127.0.0.1".parse().expect("loopback"));
-        let mut token = fs::read_to_string(config.join("lan-token"))
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        if enabled && token.is_none() {
-            token = Some(new_token());
-            if let Some(token) = &token {
-                let _ = write_private(&token_path(config), token.as_bytes());
-            }
-        }
         Lan {
             enabled,
             bind,
-            token,
+            password_hash,
             sessions: HashMap::new(),
             failures: 0,
             locked_until: None,
@@ -84,23 +74,18 @@ impl Lan {
         LanStatus {
             enabled: self.enabled,
             bind: self.bind,
-            token_set: self.token.is_some(),
+            password_set: self.password_hash.is_some(),
         }
     }
 
-    /// Enable LAN. Returns a token only when one was just generated.
-    pub fn enable(&mut self, bind: IpAddr) -> Option<String> {
-        let generated = if self.token.is_none() {
-            Some(new_token())
-        } else {
-            None
-        };
-        if let Some(token) = &generated {
-            self.token = Some(token.clone());
+    /// Enable LAN. A password must be configured first.
+    pub fn enable(&mut self, bind: IpAddr) -> Result<(), String> {
+        if self.password_hash.is_none() {
+            return Err("set a password first: svc auth passwd <password>".into());
         }
         self.enabled = true;
         self.bind = bind;
-        generated
+        Ok(())
     }
 
     pub fn disable(&mut self) {
@@ -108,15 +93,13 @@ impl Lan {
         self.bind = "127.0.0.1".parse().expect("loopback");
     }
 
-    pub fn rotate(&mut self) -> String {
-        let token = new_token();
-        self.token = Some(token.clone());
+    pub fn set_password(&mut self, hash: String) {
+        self.password_hash = Some(hash);
         self.sessions.clear();
-        token
     }
 
-    pub fn token(&self) -> Option<&str> {
-        self.token.as_deref()
+    pub fn password_hash(&self) -> Option<&str> {
+        self.password_hash.as_deref()
     }
 
     pub fn save(&self, config: &Path) -> Result<(), String> {
@@ -125,21 +108,20 @@ impl Lan {
             bind: self.bind.to_string(),
         };
         let json = serde_json::to_vec(&file).map_err(|error| error.to_string())?;
-        write_private(&config.join("lan.json"), &json)?;
-        if let Some(token) = &self.token {
-            write_private(&token_path(config), token.as_bytes())?;
-        }
-        Ok(())
+        write_private(&config.join("lan.json"), &json)
     }
 
     /// `Ok(session)` on success; sleeps 1s on failure and locks after 10.
-    pub fn login(&mut self, token: &str) -> Result<String, String> {
+    pub fn login(&mut self, password: &str) -> Result<String, String> {
         if let Some(until) = self.locked_until {
             if Instant::now() < until {
                 return Err("too many failed logins; try again later".into());
             }
         }
-        if self.token.as_deref() == Some(token) {
+        let Some(hash) = self.password_hash.as_deref() else {
+            return Err("no password configured; run svc auth passwd".into());
+        };
+        if crate::auth::verify_password(password, hash) {
             self.failures = 0;
             self.locked_until = None;
             let session = new_token();
@@ -154,7 +136,7 @@ impl Lan {
             self.locked_until = Some(Instant::now() + LOCK_TIME);
             Err("too many failed logins; locked for 5 minutes".into())
         } else {
-            Err("invalid token".into())
+            Err("invalid password".into())
         }
     }
 
@@ -166,7 +148,12 @@ impl Lan {
             .and_then(|value| value.strip_prefix("Bearer "))
             .map(str::trim)
         {
-            if self.token.as_deref() == Some(bearer) {
+            if self
+                .password_hash
+                .as_deref()
+                .map(|hash| crate::auth::verify_password(bearer, hash))
+                .unwrap_or(false)
+            {
                 return Ok(AuthKind::Bearer);
             }
         }
@@ -194,10 +181,6 @@ impl Lan {
             }
         }
     }
-}
-
-fn token_path(config: &Path) -> PathBuf {
-    config.join("lan-token")
 }
 
 fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
@@ -284,6 +267,6 @@ pub fn require_root() -> Result<(), String> {
     if crate::install::is_privileged() {
         Ok(())
     } else {
-        Err("root / Administrator is required for LAN changes".into())
+        Err("root / Administrator is required for auth changes".into())
     }
 }

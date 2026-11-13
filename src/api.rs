@@ -1,7 +1,7 @@
 //! Minimal `/api/v1` HTTP management API and LAN authentication.
 //!
-//! The listener starts on loopback; `svc lan enable` can rebind it to a LAN
-//! address and turns on bearer/cookie auth. Every request is translated into the
+//! The listener starts on loopback; `svc auth enable` can rebind it to a LAN
+//! address and turns on password/cookie auth. Every request is translated into the
 //! same daemon RPC the CLI uses, so the HTTP surface never owns a second copy of
 //! service state.
 
@@ -73,7 +73,10 @@ pub fn spawn(config: PathBuf) -> std::io::Result<Arc<Api>> {
         .ok()
         .and_then(|settings| settings.http_port);
     let port = resolve_port(std::env::var("SVCD_HTTP_PORT").ok().as_deref(), configured);
-    let state = Lan::load(&config);
+    let password_hash = settings::current()
+        .ok()
+        .and_then(|settings| settings.auth_passwd.clone());
+    let state = Lan::load(&config, password_hash);
     let bind = if state.enabled {
         state.bind
     } else {
@@ -109,10 +112,10 @@ pub fn spawn(config: PathBuf) -> std::io::Result<Arc<Api>> {
 }
 
 impl Api {
-    pub fn enable(&self, bind: IpAddr) -> Result<(LanStatus, Option<String>), String> {
+    pub fn enable(&self, bind: IpAddr) -> Result<LanStatus, String> {
         let mut state = self.lan.lock().map_err(|_| "LAN state poisoned")?;
         let previous = (state.enabled, state.bind);
-        let token = state.enable(bind);
+        state.enable(bind)?;
         if bind != previous.1 {
             if let Err(error) = self.rebind(SocketAddr::new(bind, self.port)) {
                 state.enabled = previous.0;
@@ -125,7 +128,7 @@ impl Api {
             state.bind = previous.1;
             return Err(error);
         }
-        Ok((state.status(), token))
+        Ok(state.status())
     }
 
     pub fn disable(&self) -> Result<LanStatus, String> {
@@ -145,11 +148,10 @@ impl Api {
         Ok(state.status())
     }
 
-    pub fn rotate(&self) -> Result<String, String> {
+    pub fn set_password(&self, hash: String) -> Result<LanStatus, String> {
         let mut state = self.lan.lock().map_err(|_| "LAN state poisoned")?;
-        let token = state.rotate();
-        state.save(&self.config)?;
-        Ok(token)
+        state.set_password(hash);
+        Ok(state.status())
     }
 
     pub fn status(&self) -> Result<LanStatus, String> {
@@ -497,9 +499,9 @@ fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u
     if path == "/mcp" {
         // Bearer-only and outside the cookie/session policy on purpose: the
         // MCP surface must not share the browser's CSRF model (see #40).
-        let token = match lan.lock() {
-            Ok(state) => state.token().map(str::to_string),
-            Err(_) => return error(500, "internal", "LAN state unavailable"),
+        let password_hash = match lan.lock() {
+            Ok(state) => state.password_hash().map(str::to_string),
+            Err(_) => return error(500, "internal", "auth state unavailable"),
         };
         return mcp_http::handle(
             config,
@@ -508,7 +510,7 @@ fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u
                 headers: &request.headers,
                 body: &request.body,
             },
-            token.as_deref(),
+            password_hash.as_deref(),
         );
     }
 
@@ -737,7 +739,7 @@ fn same_origin(request: &HttpRequest) -> bool {
 }
 
 fn login(request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u8> {
-    let token = request_header(request, "authorization")
+    let password = request_header(request, "authorization")
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim)
         .map(str::to_string)
@@ -746,20 +748,21 @@ fn login(request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u8> {
                 .ok()
                 .and_then(|value| {
                     value
-                        .get("token")
+                        .get("password")
+                        .or_else(|| value.get("token"))
                         .and_then(Value::as_str)
                         .map(str::to_string)
                 })
         });
-    let Some(token) = token else {
-        return error(401, "unauthorized", "invalid token");
+    let Some(password) = password else {
+        return error(401, "unauthorized", "password required");
     };
     let session = match lan.lock() {
-        Ok(mut state) => match state.login(&token) {
+        Ok(mut state) => match state.login(&password) {
             Ok(session) => session,
             Err(message) => return error(401, "unauthorized", &message),
         },
-        Err(_) => return error(500, "internal", "LAN state unavailable"),
+        Err(_) => return error(500, "internal", "auth state unavailable"),
     };
     let body = serde_json::to_vec(&json!({ "ok": true })).unwrap_or_default();
     http::response_with_headers(
@@ -902,13 +905,13 @@ fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<
             "protocol": 1,
             "platform": package::target(),
         })),
-        ("GET", ["api", "v1", "lan"]) => match lan_state.lock() {
+        ("GET", ["api", "v1", "auth"]) => match lan_state.lock() {
             Ok(state) => ok(json!({
                 "enabled": state.enabled,
                 "bind": state.bind.to_string(),
-                "tokenSet": state.token().is_some(),
+                "passwordSet": state.password_hash().is_some(),
             })),
-            Err(_) => error(500, "internal", "LAN state unavailable"),
+            Err(_) => error(500, "internal", "auth state unavailable"),
         },
         ("GET", ["api", "v1", "services"]) => match rpc(config, "svc.list", json!({})) {
             Ok(value) => {
@@ -1222,7 +1225,7 @@ fn import_plugin(request: &HttpRequest, query: &str) -> Vec<u8> {
     let no_config = query_bool(query, "no_config").unwrap_or(false);
     let force = query_bool(query, "force").unwrap_or(false);
     let _guard = config_lock();
-    // The HTTP surface is already authorised by the LAN token / loopback
+    // The HTTP surface is already authorised by the password / loopback
     // policy; do not re-check the daemon's OS privilege here (the CLI does).
     match transfer::import(&request.body, config_id.as_deref(), no_config, force, false) {
         Ok(outcome) => {

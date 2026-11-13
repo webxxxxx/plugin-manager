@@ -2,13 +2,19 @@ use std::path::PathBuf;
 
 use crate::settings;
 
-/// The platform configuration directory. `SVCD_CONFIG_DIR` overrides it so tests
-/// and non-root development runs can use an isolated tree; production paths are
-/// `/etc/svcd`, `/Library/Application Support/svcd/config` and
-/// `%ProgramData%\svcd\config`.
+/// The configuration directory: `svcd.conf`, `trust.d`, `lan.json` and the
+/// local control token. `SVCD_CONFIG_DIR` overrides it for tests; otherwise
+/// `config_dir` in the loaded `svcd.conf` wins over the platform default.
+/// Production defaults are `/etc/svcd`, `/Library/Application Support/svcd/config`
+/// and `%USERPROFILE%\.svcd`.
 pub fn config_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("SVCD_CONFIG_DIR") {
         return PathBuf::from(dir);
+    }
+    if let Ok(settings) = settings::current() {
+        if let Some(dir) = &settings.config_dir {
+            return dir.clone();
+        }
     }
     platform_config_dir()
 }
@@ -59,20 +65,21 @@ pub fn data_dir() -> PathBuf {
 }
 
 #[cfg(target_os = "windows")]
-fn platform_config_dir() -> PathBuf {
-    let base = std::env::var_os("ProgramData")
+pub(crate) fn platform_config_dir() -> PathBuf {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-    base.join("svcd").join("config")
+        .unwrap_or_else(|| PathBuf::from(r"C:\Users\Default"));
+    home.join(".svcd")
 }
 
 #[cfg(target_os = "macos")]
-fn platform_config_dir() -> PathBuf {
+pub(crate) fn platform_config_dir() -> PathBuf {
     PathBuf::from("/Library/Application Support/svcd/config")
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn platform_config_dir() -> PathBuf {
+pub(crate) fn platform_config_dir() -> PathBuf {
     PathBuf::from("/etc/svcd")
 }
 

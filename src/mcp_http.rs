@@ -25,16 +25,16 @@ pub struct Request<'a> {
     pub body: &'a [u8],
 }
 
-/// `POST /mcp`. `token` is the configured LAN token; `None` while LAN is
-/// disabled means no Bearer value can match, so the endpoint stays closed.
-pub fn handle(config: &Path, request: &Request<'_>, token: Option<&str>) -> Vec<u8> {
+/// `POST /mcp`. `password_hash` is the configured `auth_passwd`; `None`
+/// means no Bearer value can match, so the endpoint stays closed.
+pub fn handle(config: &Path, request: &Request<'_>, password_hash: Option<&str>) -> Vec<u8> {
     if request.method != "POST" {
         return http::method_not_allowed("POST");
     }
     if !http::same_origin(request.headers) {
         return http::json_error(403, "forbidden", "cross-origin calls are not allowed");
     }
-    if let Err(response) = authorize(request.headers, token) {
+    if let Err(response) = authorize(request.headers, password_hash) {
         return response;
     }
     let headers = request.headers;
@@ -176,20 +176,24 @@ fn decode_mcp_name(value: &str) -> String {
 
 /// Bearer only. Cookies are deliberately not consulted: `/mcp` has no CSRF
 /// surface because a browser never attaches an Authorization header.
-fn authorize(headers: &[(String, String)], token: Option<&str>) -> Result<(), Vec<u8>> {
+fn authorize(headers: &[(String, String)], password_hash: Option<&str>) -> Result<(), Vec<u8>> {
     let Some(value) = http::header(headers, "authorization") else {
-        return Err(unauthorized("Bearer token required"));
+        return Err(unauthorized("Bearer password required"));
     };
     let Some(bearer) = value
         .split_once(' ')
         .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
-        .map(|(_, token)| token.trim())
+        .map(|(_, password)| password.trim())
     else {
         return Err(unauthorized("Bearer authorization is required"));
     };
-    match token {
-        Some(expected) if expected == bearer => Ok(()),
-        _ => Err(http::json_error(403, "forbidden", "invalid bearer token")),
+    match password_hash {
+        Some(hash) if crate::auth::verify_password(bearer, hash) => Ok(()),
+        _ => Err(http::json_error(
+            403,
+            "forbidden",
+            "invalid bearer password",
+        )),
     }
 }
 

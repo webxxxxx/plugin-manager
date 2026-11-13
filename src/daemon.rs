@@ -33,11 +33,21 @@ use crate::supervisor::{self, Event};
 use crate::wake::Wake;
 
 pub fn run(conf: Option<PathBuf>) -> i32 {
-    let config = paths::config_dir();
-    if let Err(error) = fs::create_dir_all(&config) {
+    // The explicit --conf must be loaded before paths::config_dir() so its
+    // config_dir wins and does not get shadowed by the default cache.
+    if let Some(path) = conf.as_deref() {
+        if path.is_file() {
+            if let Err(error) = settings::init_from_path(path) {
+                eprintln!("svcd: invalid config: {}", error);
+                return 1;
+            }
+        }
+    }
+    let initial_config = paths::config_dir();
+    if let Err(error) = fs::create_dir_all(&initial_config) {
         eprintln!(
             "svcd: cannot create config directory {}: {}",
-            config.display(),
+            initial_config.display(),
             error
         );
         return 1;
@@ -59,6 +69,18 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         return 1;
     }
     log::svcd(&format!("svcd: config: {}", config_path.display()));
+    // An explicit --conf may set config_dir to a different directory.
+    let config = paths::config_dir();
+    if config != initial_config {
+        if let Err(error) = fs::create_dir_all(&config) {
+            eprintln!(
+                "svcd: cannot create config directory {}: {}",
+                config.display(),
+                error
+            );
+            return 1;
+        }
+    }
     if let Err(error) = crate::proc::init() {
         log::svcd(&format!(
             "svcd: parent-death protection unavailable: {}",
@@ -396,38 +418,45 @@ impl Daemon {
                 Ok(()) => rpc::ok(id, json!({ "ok": true })),
                 Err(error) => rpc::err(id, -32007, &error),
             },
-            "lan.status" => match self.lan_status() {
-                Ok(status) => rpc::ok(id, lan_json(&status, None)),
+            "auth.status" => match self.auth_status() {
+                Ok(status) => rpc::ok(id, auth_json(&status)),
                 Err(error) => rpc::err(id, -32008, &error),
             },
-            "lan.enable" => {
+            "auth.enable" => {
                 let bind = request
                     .params
                     .get("bind")
                     .and_then(Value::as_str)
                     .unwrap_or("0.0.0.0");
                 match bind.parse::<IpAddr>() {
-                    Ok(bind) => match self.lan_enable(bind) {
-                        Ok((status, token)) => rpc::ok(id, lan_json(&status, token.as_deref())),
+                    Ok(bind) => match self.auth_enable(bind) {
+                        Ok(status) => rpc::ok(id, auth_json(&status)),
                         Err(error) => rpc::err(id, -32008, &error),
                     },
                     Err(_) => rpc::err(id, -32008, "invalid bind address"),
                 }
             }
-            "lan.disable" => match self.lan_disable() {
-                Ok(status) => rpc::ok(id, lan_json(&status, None)),
+            "auth.disable" => match self.auth_disable() {
+                Ok(status) => rpc::ok(id, auth_json(&status)),
                 Err(error) => rpc::err(id, -32008, &error),
             },
-            "lan.token.rotate" => match self.lan_rotate() {
-                Ok(token) => rpc::ok(id, json!({ "token": token })),
-                Err(error) => rpc::err(id, -32008, &error),
-            },
+            "auth.passwd" => {
+                let password = request
+                    .params
+                    .get("password")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                match self.auth_passwd(password) {
+                    Ok(status) => rpc::ok(id, auth_json(&status)),
+                    Err(error) => rpc::err(id, -32008, &error),
+                }
+            }
             _ => rpc::err(id, -32601, "method not found"),
         }
     }
 
     #[cfg(feature = "http")]
-    fn lan_status(&self) -> Result<LanStatus, String> {
+    fn auth_status(&self) -> Result<LanStatus, String> {
         self.api
             .as_ref()
             .ok_or_else(|| "HTTP API is not running".to_string())?
@@ -435,12 +464,12 @@ impl Daemon {
     }
 
     #[cfg(not(feature = "http"))]
-    fn lan_status(&self) -> Result<LanStatus, String> {
+    fn auth_status(&self) -> Result<LanStatus, String> {
         Err("HTTP API is disabled in this build".to_string())
     }
 
     #[cfg(feature = "http")]
-    fn lan_enable(&self, bind: IpAddr) -> Result<(LanStatus, Option<String>), String> {
+    fn auth_enable(&self, bind: IpAddr) -> Result<LanStatus, String> {
         self.api
             .as_ref()
             .ok_or_else(|| "HTTP API is not running".to_string())?
@@ -448,12 +477,12 @@ impl Daemon {
     }
 
     #[cfg(not(feature = "http"))]
-    fn lan_enable(&self, _bind: IpAddr) -> Result<(LanStatus, Option<String>), String> {
+    fn auth_enable(&self, _bind: IpAddr) -> Result<LanStatus, String> {
         Err("HTTP API is disabled in this build".to_string())
     }
 
     #[cfg(feature = "http")]
-    fn lan_disable(&self) -> Result<LanStatus, String> {
+    fn auth_disable(&self) -> Result<LanStatus, String> {
         self.api
             .as_ref()
             .ok_or_else(|| "HTTP API is not running".to_string())?
@@ -461,20 +490,26 @@ impl Daemon {
     }
 
     #[cfg(not(feature = "http"))]
-    fn lan_disable(&self) -> Result<LanStatus, String> {
+    fn auth_disable(&self) -> Result<LanStatus, String> {
         Err("HTTP API is disabled in this build".to_string())
     }
 
     #[cfg(feature = "http")]
-    fn lan_rotate(&self) -> Result<String, String> {
+    fn auth_passwd(&self, password: &str) -> Result<LanStatus, String> {
+        if password.is_empty() {
+            return Err("password must not be empty".into());
+        }
+        let path = settings::path().ok_or_else(|| "svcd.conf path is unavailable".to_string())?;
+        let hash = crate::auth::hash_password(password)?;
+        settings::update_value(path, "auth_passwd", &hash)?;
         self.api
             .as_ref()
             .ok_or_else(|| "HTTP API is not running".to_string())?
-            .rotate()
+            .set_password(hash)
     }
 
     #[cfg(not(feature = "http"))]
-    fn lan_rotate(&self) -> Result<String, String> {
+    fn auth_passwd(&self, _password: &str) -> Result<LanStatus, String> {
         Err("HTTP API is disabled in this build".to_string())
     }
 
@@ -1219,12 +1254,11 @@ fn walk_dependencies(registry: &Registry, ids: &[String]) -> (BTreeSet<String>, 
     (closure, missing.into_iter().collect())
 }
 
-fn lan_json(status: &LanStatus, token: Option<&str>) -> Value {
+fn auth_json(status: &LanStatus) -> Value {
     json!({
         "enabled": status.enabled,
         "bind": status.bind.to_string(),
-        "tokenSet": status.token_set,
-        "token": token,
+        "passwordSet": status.password_set,
     })
 }
 

@@ -1381,15 +1381,19 @@ fn explicit_conf_is_preferred_over_program_and_config() {
 }
 
 #[test]
-fn default_conf_is_created_next_to_the_program() {
+fn default_conf_is_created_in_the_config_dir() {
     let mut sandbox = Sandbox::new();
     sandbox.start_daemon();
     sandbox.wait_for_http();
 
-    let path = sandbox.root.join("svcd.conf");
+    let path = sandbox.config.join("svcd.conf");
     let text = fs::read_to_string(&path).expect("generated svcd.conf");
     assert!(text.contains("http_port = 8787"), "{text}");
     assert!(text.contains("lan_default = false"), "{text}");
+    assert!(
+        text.contains(&format!("config_dir = {}", sandbox.config.display())),
+        "{text}"
+    );
     assert!(
         text.contains(&format!(
             "plugins_dir = {}",
@@ -1568,15 +1572,29 @@ fn oversized_upload_is_rejected_before_the_body() {
     assert!(head.starts_with("HTTP/1.1 413"), "{}", head);
 }
 
-fn token_line(output: &std::process::Output) -> String {
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
-        .find_map(|line| {
-            line.strip_prefix("token: ")
-                .map(str::trim)
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| panic!("no token in output: {}", text))
+const TEST_PASSWORD: &str = "test-password";
+const TEST_PASSWORD_2: &str = "new-test-password";
+
+fn set_password(sandbox: &Sandbox, password: &str) {
+    let changed = sandbox.run_svc(&["auth", "passwd", password]);
+    assert_eq!(
+        changed.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&changed.stderr)
+    );
+}
+
+fn enable_auth(sandbox: &Sandbox) -> String {
+    set_password(sandbox, TEST_PASSWORD);
+    let enabled = sandbox.run_svc(&["auth", "enable", "--bind", "0.0.0.0"]);
+    assert_eq!(
+        enabled.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+    TEST_PASSWORD.to_string()
 }
 
 fn plugin_dir(sandbox: &Sandbox, id: &str) -> PathBuf {
@@ -2025,7 +2043,7 @@ fn serves_the_embedded_console() {
 }
 
 #[test]
-fn lan_auth_bearer_cookie_csrf_rotate_and_disable() {
+fn password_auth_bearer_cookie_csrf_and_disable() {
     let mut sandbox = Sandbox::new();
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
@@ -2033,15 +2051,25 @@ fn lan_auth_bearer_cookie_csrf_rotate_and_disable() {
     let open = request(&address, "GET", "/api/v1/services", "", b"");
     assert_eq!(open.status, 200);
 
-    let enabled = sandbox.run_svc(&["lan", "enable", "--bind", "0.0.0.0"]);
+    let before_password = sandbox.run_svc(&["auth", "enable", "--bind", "0.0.0.0"]);
+    assert_ne!(before_password.status.code(), Some(0));
+
+    let changed = sandbox.run_svc(&["auth", "passwd", TEST_PASSWORD]);
+    assert_eq!(
+        changed.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&changed.stderr)
+    );
+    let enabled = sandbox.run_svc(&["auth", "enable", "--bind", "0.0.0.0"]);
     assert_eq!(
         enabled.status.code(),
         Some(0),
         "{}",
         String::from_utf8_lossy(&enabled.stderr)
     );
-    let token = token_line(&enabled);
-    assert!(sandbox.config.join("lan-token").is_file());
+    let password = TEST_PASSWORD.to_string();
+    assert!(!sandbox.config.join("lan-token").exists());
     assert!(sandbox.config.join("lan.json").is_file());
 
     let page = raw_request(&address, "GET", "/", "", b"");
@@ -2051,7 +2079,7 @@ fn lan_auth_bearer_cookie_csrf_rotate_and_disable() {
     assert_eq!(denied.status, 401);
     assert_eq!(denied.body["error"]["code"], "unauthorized");
 
-    let bearer = format!("Bearer {}", token);
+    let bearer = format!("Bearer {}", password);
     let allowed = request_with(
         &address,
         "GET",
@@ -2067,7 +2095,7 @@ fn lan_auth_bearer_cookie_csrf_rotate_and_disable() {
         "POST",
         "/login",
         "application/json",
-        serde_json::to_string(&json!({ "token": token }))
+        serde_json::to_string(&json!({ "password": password }))
             .expect("login")
             .as_bytes(),
         &[],
@@ -2124,16 +2152,17 @@ fn lan_auth_bearer_cookie_csrf_rotate_and_disable() {
     );
     assert_eq!(csrf.status, 200, "{}", csrf.body);
 
-    let lan = request_with(
+    let auth_status = request_with(
         &address,
         "GET",
-        "/api/v1/lan",
+        "/api/v1/auth",
         "",
         b"",
         &[("Authorization", bearer.as_str())],
     );
-    assert_eq!(lan.status, 200);
-    assert_eq!(lan.body["enabled"], true);
+    assert_eq!(auth_status.status, 200);
+    assert_eq!(auth_status.body["enabled"], true);
+    assert_eq!(auth_status.body["passwordSet"], true);
 
     let logout = request_with(
         &address,
@@ -2154,9 +2183,8 @@ fn lan_auth_bearer_cookie_csrf_rotate_and_disable() {
     );
     assert_eq!(after_logout.status, 401);
 
-    let rotated = sandbox.run_svc(&["lan", "token", "rotate"]);
-    assert_eq!(rotated.status.code(), Some(0));
-    let new_token = token_line(&rotated);
+    let changed = sandbox.run_svc(&["auth", "passwd", TEST_PASSWORD_2]);
+    assert_eq!(changed.status.code(), Some(0));
     let old_bearer = request_with(
         &address,
         "GET",
@@ -2166,7 +2194,7 @@ fn lan_auth_bearer_cookie_csrf_rotate_and_disable() {
         &[("Authorization", bearer.as_str())],
     );
     assert_eq!(old_bearer.status, 401);
-    let new_bearer = format!("Bearer {}", new_token);
+    let new_bearer = format!("Bearer {}", TEST_PASSWORD_2);
     let new_allowed = request_with(
         &address,
         "GET",
@@ -2177,16 +2205,18 @@ fn lan_auth_bearer_cookie_csrf_rotate_and_disable() {
     );
     assert_eq!(new_allowed.status, 200);
 
-    let status = sandbox.run_svc(&["lan", "status"]);
+    let status = sandbox.run_svc(&["auth", "status"]);
     assert_eq!(status.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&status.stdout).contains("enabled: true"));
+    let status_text = String::from_utf8_lossy(&status.stdout);
+    assert!(status_text.contains("enabled: true"), "{status_text}");
+    assert!(status_text.contains("password: set"), "{status_text}");
 
     sandbox.shutdown();
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
     let denied_after_restart = request(&address, "GET", "/api/v1/services", "", b"");
     assert_eq!(denied_after_restart.status, 401);
-    let new_bearer = format!("Bearer {}", new_token);
+    let new_bearer = format!("Bearer {}", TEST_PASSWORD_2);
     let allowed_after_restart = request_with(
         &address,
         "GET",
@@ -2197,7 +2227,7 @@ fn lan_auth_bearer_cookie_csrf_rotate_and_disable() {
     );
     assert_eq!(allowed_after_restart.status, 200);
 
-    let disabled = sandbox.run_svc(&["lan", "disable"]);
+    let disabled = sandbox.run_svc(&["auth", "disable"]);
     assert_eq!(disabled.status.code(), Some(0));
     let open_again = request(&address, "GET", "/api/v1/services", "", b"");
     assert_eq!(open_again.status, 200);
@@ -2445,15 +2475,8 @@ fn plugin_web_ui_rpc_bridges_tools_call() {
 fn plugin_web_ui_requires_a_session_when_lan_is_enabled() {
     let (sandbox, address) = web_ui_sandbox(43);
 
-    let enabled = sandbox.run_svc(&["lan", "enable", "--bind", "0.0.0.0"]);
-    assert_eq!(
-        enabled.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&enabled.stderr)
-    );
-    let token = token_line(&enabled);
-    let bearer = format!("Bearer {}", token);
+    let password = enable_auth(&sandbox);
+    let bearer = format!("Bearer {}", password);
 
     let body = rpc_body(21, "status");
     let page = raw_request(&address, "GET", "/plugin-ui/demo/", "", b"");
@@ -2496,7 +2519,7 @@ fn plugin_web_ui_requires_a_session_when_lan_is_enabled() {
         "POST",
         "/login",
         "application/json",
-        serde_json::to_string(&json!({"token": token}))
+        serde_json::to_string(&json!({"password": password}))
             .expect("login body")
             .as_bytes(),
         &[],
@@ -2580,7 +2603,8 @@ fn plugin_web_ui_requires_a_session_when_lan_is_enabled() {
 #[test]
 fn phase_end_to_end_install_start_mcp_config_logs_and_uninstall() {
     let (sandbox, address) = web_ui_sandbox(34);
-    let token = token_line(&sandbox.run_svc(&["lan", "token", "rotate"]));
+    set_password(&sandbox, TEST_PASSWORD);
+    let token = TEST_PASSWORD.to_string();
 
     let started = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
     assert_eq!(started.status, 200, "{}", started.body);
@@ -2790,15 +2814,8 @@ fn plugin_ui_websocket_bridges_calls_notifications_and_control_frames() {
 #[test]
 fn plugin_ui_streams_require_lan_auth_and_same_origin() {
     let (sandbox, address) = daemon_with_web_event_plugin(53);
-    let enabled = sandbox.run_svc(&["lan", "enable", "--bind", "0.0.0.0"]);
-    assert_eq!(
-        enabled.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&enabled.stderr)
-    );
-    let token = token_line(&enabled);
-    let bearer = format!("Bearer {}", token);
+    let password = enable_auth(&sandbox);
+    let bearer = format!("Bearer {}", password);
 
     let sse = raw_request(&address, "GET", "/plugin-ui/demo/events", "", b"");
     assert_eq!(sse.status, 401);

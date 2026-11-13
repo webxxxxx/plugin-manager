@@ -1,5 +1,6 @@
 #[cfg(feature = "http")]
 mod api;
+mod auth;
 mod bundle;
 mod channel;
 mod daemon;

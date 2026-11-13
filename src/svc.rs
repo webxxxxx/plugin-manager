@@ -38,12 +38,12 @@ impl DaemonVerb {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LanAction {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthAction {
     Status,
     Enable,
     Disable,
-    Rotate,
+    Passwd(String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -69,8 +69,8 @@ enum Command {
         follow: bool,
         lines: usize,
     },
-    Lan {
-        action: LanAction,
+    Auth {
+        action: AuthAction,
         bind: Option<String>,
     },
     Trust {
@@ -92,7 +92,7 @@ pub fn run(args: Vec<String>) -> i32 {
         Command::Status { id, json } => show_status(&id, json),
         Command::Daemon { verb, id } => daemon_command(verb, &id),
         Command::Logs { id, follow, lines } => show_logs(&id, follow, lines),
-        Command::Lan { action, bind } => lan_command(action, bind.as_deref()),
+        Command::Auth { action, bind } => auth_command(action, bind.as_deref()),
         Command::Trust { action } => trust_command(action),
     }
 }
@@ -141,7 +141,7 @@ fn parse(args: &[String]) -> Result<Command, ()> {
             })
         }
         "logs" => parse_logs(&args[1..]),
-        "lan" => parse_lan(&args[1..]),
+        "auth" => parse_auth(&args[1..]),
         "trust" => parse_trust(&args[1..]),
         _ => Err(()),
     }
@@ -161,26 +161,30 @@ fn parse_trust(args: &[String]) -> Result<Command, ()> {
     Ok(Command::Trust { action })
 }
 
-fn parse_lan(args: &[String]) -> Result<Command, ()> {
+fn parse_auth(args: &[String]) -> Result<Command, ()> {
     match args {
-        [action] if action == "status" => Ok(Command::Lan {
-            action: LanAction::Status,
+        [action] if action == "status" => Ok(Command::Auth {
+            action: AuthAction::Status,
             bind: None,
         }),
-        [action] if action == "disable" => Ok(Command::Lan {
-            action: LanAction::Disable,
+        [action] if action == "disable" => Ok(Command::Auth {
+            action: AuthAction::Disable,
             bind: None,
         }),
-        [first, second] if first == "token" && second == "rotate" => Ok(Command::Lan {
-            action: LanAction::Rotate,
+        [action, password]
+            if action == "passwd" && !password.is_empty() && !password.starts_with('-') =>
+        {
+            Ok(Command::Auth {
+                action: AuthAction::Passwd(password.clone()),
+                bind: None,
+            })
+        }
+        [action] if action == "enable" => Ok(Command::Auth {
+            action: AuthAction::Enable,
             bind: None,
         }),
-        [action] if action == "enable" => Ok(Command::Lan {
-            action: LanAction::Enable,
-            bind: None,
-        }),
-        [action, flag, value] if action == "enable" && flag == "--bind" => Ok(Command::Lan {
-            action: LanAction::Enable,
+        [action, flag, value] if action == "enable" && flag == "--bind" => Ok(Command::Auth {
+            action: AuthAction::Enable,
             bind: Some(value.clone()),
         }),
         [action, value] if action == "enable" && value.starts_with("--bind=") => {
@@ -188,8 +192,8 @@ fn parse_lan(args: &[String]) -> Result<Command, ()> {
             if bind.is_empty() {
                 Err(())
             } else {
-                Ok(Command::Lan {
-                    action: LanAction::Enable,
+                Ok(Command::Auth {
+                    action: AuthAction::Enable,
                     bind: Some(bind),
                 })
             }
@@ -333,21 +337,21 @@ fn daemon_command(verb: DaemonVerb, id: &str) -> i32 {
     }
 }
 
-fn lan_command(action: LanAction, bind: Option<&str>) -> i32 {
+fn auth_command(action: AuthAction, bind: Option<&str>) -> i32 {
     if matches!(
-        action,
-        LanAction::Enable | LanAction::Disable | LanAction::Rotate
+        &action,
+        AuthAction::Enable | AuthAction::Disable | AuthAction::Passwd(_)
     ) {
         if let Err(error) = crate::lan::require_root() {
             eprintln!("svc: {}", error);
             return EXIT_SERVICE_ERROR;
         }
     }
-    let (method, params) = match action {
-        LanAction::Status => ("lan.status", json!({})),
-        LanAction::Enable => ("lan.enable", json!({ "bind": bind.unwrap_or("0.0.0.0") })),
-        LanAction::Disable => ("lan.disable", json!({})),
-        LanAction::Rotate => ("lan.token.rotate", json!({})),
+    let (method, params) = match &action {
+        AuthAction::Status => ("auth.status", json!({})),
+        AuthAction::Enable => ("auth.enable", json!({ "bind": bind.unwrap_or("0.0.0.0") })),
+        AuthAction::Disable => ("auth.disable", json!({})),
+        AuthAction::Passwd(password) => ("auth.passwd", json!({ "password": password })),
     };
     let response = match channel::request(&paths::config_dir(), method, params) {
         Ok(response) => response,
@@ -361,56 +365,41 @@ fn lan_command(action: LanAction, bind: Option<&str>) -> i32 {
         return EXIT_SERVICE_ERROR;
     }
     let result = response.result.unwrap_or(Value::Null);
-    match action {
-        LanAction::Status => {
-            println!(
-                "enabled: {}",
-                result
-                    .get("enabled")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-            );
-            println!(
-                "bind: {}",
-                result.get("bind").and_then(Value::as_str).unwrap_or("-")
-            );
-            println!(
-                "token: {}",
-                if result
-                    .get("tokenSet")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
-                    "set"
-                } else {
-                    "unset"
-                }
-            );
-        }
-        LanAction::Enable | LanAction::Disable => {
-            let enabled = result
+    if matches!(&action, AuthAction::Status) {
+        println!(
+            "enabled: {}",
+            result
                 .get("enabled")
                 .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let bind = result.get("bind").and_then(Value::as_str).unwrap_or("-");
+                .unwrap_or(false)
+        );
+        println!(
+            "bind: {}",
+            result.get("bind").and_then(Value::as_str).unwrap_or("-")
+        );
+        println!(
+            "password: {}",
+            if result
+                .get("passwordSet")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                "set"
+            } else {
+                "unset"
+            }
+        );
+    } else {
+        let enabled = result
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let bind = result.get("bind").and_then(Value::as_str).unwrap_or("-");
+        if matches!(&action, AuthAction::Passwd(_)) {
+            println!("password: set");
+        } else {
             println!("LAN {}", if enabled { "enabled" } else { "disabled" });
             println!("bind: {}", bind);
-            if let Some(token) = result.get("token").and_then(Value::as_str) {
-                println!("token: {}", token);
-                eprintln!("warning: this token is equivalent to root; store it securely");
-                eprintln!("warning: it is shown only once; rotate with `svc lan token rotate`");
-            }
-        }
-        LanAction::Rotate => {
-            if let Some(token) = result.get("token").and_then(Value::as_str) {
-                println!("token: {}", token);
-                eprintln!(
-                    "warning: this token is equivalent to root; the old token is now invalid"
-                );
-            } else {
-                eprintln!("svc: empty token response");
-                return EXIT_SERVICE_ERROR;
-            }
         }
     }
     EXIT_OK
@@ -571,7 +560,7 @@ fn usage() {
     eprintln!("       svc status [--json] <id>");
     eprintln!("       svc <start|stop|enable|disable> <id>");
     eprintln!("       svc logs <id> [--follow] [--lines N]");
-    eprintln!("       svc lan status|enable [--bind <ip>]|disable|token rotate");
+    eprintln!("       svc auth status|enable [--bind <ip>]|disable|passwd <password>");
     eprintln!("       svc trust list|add <file.pub>|remove <keyId>");
 }
 
@@ -669,30 +658,32 @@ mod tests {
     }
 
     #[test]
-    fn parses_lan_commands() {
+    fn parses_auth_commands() {
         assert_eq!(
-            parse(&args(&["lan", "status"])).expect("lan status"),
-            Command::Lan {
-                action: LanAction::Status,
+            parse(&args(&["auth", "status"])).expect("auth status"),
+            Command::Auth {
+                action: AuthAction::Status,
                 bind: None
             }
         );
         assert_eq!(
-            parse(&args(&["lan", "enable", "--bind", "0.0.0.0"])).expect("lan enable"),
-            Command::Lan {
-                action: LanAction::Enable,
+            parse(&args(&["auth", "enable", "--bind", "0.0.0.0"])).expect("auth enable"),
+            Command::Auth {
+                action: AuthAction::Enable,
                 bind: Some("0.0.0.0".into())
             }
         );
         assert_eq!(
-            parse(&args(&["lan", "token", "rotate"])).expect("lan rotate"),
-            Command::Lan {
-                action: LanAction::Rotate,
+            parse(&args(&["auth", "passwd", "secret"])).expect("auth passwd"),
+            Command::Auth {
+                action: AuthAction::Passwd("secret".into()),
                 bind: None
             }
         );
-        assert!(parse(&args(&["lan", "enable", "--bind"])).is_err());
-        assert!(parse(&args(&["lan", "bogus"])).is_err());
+        assert!(parse(&args(&["auth", "enable", "--bind"])).is_err());
+        assert!(parse(&args(&["auth", "bogus"])).is_err());
+        assert!(parse(&args(&["lan", "status"])).is_err());
+        assert!(parse(&args(&["auth", "passwd"])).is_err());
     }
 
     #[test]

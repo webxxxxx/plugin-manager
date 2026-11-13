@@ -205,25 +205,17 @@ done
         panic!("HTTP API never became ready: {}", self.daemon_log());
     }
 
-    /// Generate a LAN token without rebinding the listener, so /mcp can be
+    /// Set the auth password without rebinding the listener, so /mcp can be
     /// exercised on the loopback surface.
-    fn rotate_token(&self) -> String {
-        let output = self.run_svc(&["lan", "token", "rotate"]);
+    fn set_password(&self) -> String {
+        let output = self.run_svc(&["auth", "passwd", TEST_PASSWORD]);
         assert_eq!(
             output.status.code(),
             Some(0),
-            "svc lan token rotate failed: {}",
+            "svc auth passwd failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .find_map(|line| line.strip_prefix("token: ").map(str::to_string))
-            .unwrap_or_else(|| {
-                panic!(
-                    "no token in output: {}",
-                    String::from_utf8_lossy(&output.stdout)
-                )
-            })
+        TEST_PASSWORD.to_string()
     }
 
     fn run_svc(&self, args: &[&str]) -> std::process::Output {
@@ -328,8 +320,10 @@ fn target() -> &'static str {
     }
 }
 
-/// Start a daemon with the HTTP surface ready and a LAN token generated
-/// without rebinding the listener. `plugin` starts the demo fixture too.
+const TEST_PASSWORD: &str = "test-password";
+
+/// Start a daemon with the HTTP surface ready and a password set without
+/// rebinding the listener. `plugin` starts the demo fixture too.
 fn http_sandbox(plugin: bool) -> (Sandbox, String, String) {
     let mut sandbox = Sandbox::new();
     sandbox.start_daemon();
@@ -338,7 +332,7 @@ fn http_sandbox(plugin: bool) -> (Sandbox, String, String) {
     if plugin {
         sandbox.start_plugin();
     }
-    let token = sandbox.rotate_token();
+    let token = sandbox.set_password();
     (sandbox, address, token)
 }
 
@@ -871,7 +865,7 @@ fn http_mcp_requires_a_bearer_and_ignores_cookies() {
 
     // A valid management session cookie must not authenticate /mcp: the MCP
     // surface takes Bearer only, so it has no cookie/CSRF surface.
-    let login_body = serde_json::to_vec(&json!({ "token": token })).expect("login body");
+    let login_body = serde_json::to_vec(&json!({ "password": token })).expect("login body");
     let login = http(
         &address,
         "POST",

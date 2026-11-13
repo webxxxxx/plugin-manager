@@ -185,8 +185,8 @@ impl Layout {
 ///
 /// Precedence: the path passed at install/startup, then `<program dir>/svcd.conf`,
 /// then `<config>/svcd.conf` (legacy), then a generated platform-aware default
-/// written next to the program (falling back to the config directory when the
-/// program directory is not writable).
+/// written into the config directory (falling back to the program directory when
+/// the config directory is not writable).
 pub fn ensure_conf(explicit: Option<&Path>) -> Result<PathBuf, String> {
     let layout = Layout::current();
     let program_conf = std::env::current_exe()
@@ -215,6 +215,13 @@ pub fn ensure_conf(explicit: Option<&Path>) -> Result<PathBuf, String> {
 
     let text = default_conf_text(&layout);
     let mut failures = Vec::new();
+    match write_conf(&config_conf, &text) {
+        Ok(()) => {
+            eprintln!("svcd: created config {}", config_conf.display());
+            return Ok(config_conf);
+        }
+        Err(error) => failures.push(format!("{}: {}", config_conf.display(), error)),
+    }
     if let Some(path) = &program_conf {
         match write_conf(path, &text) {
             Ok(()) => {
@@ -224,16 +231,7 @@ pub fn ensure_conf(explicit: Option<&Path>) -> Result<PathBuf, String> {
             Err(error) => failures.push(format!("{}: {}", path.display(), error)),
         }
     }
-    match write_conf(&config_conf, &text) {
-        Ok(()) => {
-            eprintln!("svcd: created config {}", config_conf.display());
-            Ok(config_conf)
-        }
-        Err(error) => {
-            failures.push(format!("{}: {}", config_conf.display(), error));
-            Err(format!("cannot create svcd.conf: {}", failures.join("; ")))
-        }
-    }
+    Err(format!("cannot create svcd.conf: {}", failures.join("; ")))
 }
 
 fn default_conf_text(layout: &Layout) -> String {
@@ -244,8 +242,12 @@ fn default_conf_text(layout: &Layout) -> String {
          # Relative paths resolve against the directory containing this file.\n\
          http_port = 8787\n\
          lan_default = false\n\
+         config_dir = {}\n\
          plugins_dir = {}\n\
-         services_dir = {}\n",
+         services_dir = {}\n\
+         # Set the web/API password with: svc auth passwd <password>\n\
+         # auth_passwd = pbkdf2-sha256$...\n",
+        layout.config_dir.display(),
         plugins.display(),
         services.display()
     )
@@ -954,7 +956,7 @@ pub fn self_install(args: &[String]) -> i32 {
                 paths::config_dir().join("svcd.conf").display()
             );
             if settings.lan_default {
-                println!("  lan:     enabled (0.0.0.0)");
+                println!("  lan:     requested (set a password with `svc auth passwd`)");
             }
         }
         if !request.no_service {
@@ -985,18 +987,19 @@ pub fn self_install(args: &[String]) -> i32 {
             return EXIT_ERROR;
         }
         if settings.lan_default {
-            let mut lan = crate::lan::Lan::load(&paths::config_dir());
-            let token = lan.enable("0.0.0.0".parse().expect("bind"));
-            if let Err(error) = lan.save(&paths::config_dir()) {
-                eprintln!("svcd: cannot enable LAN: {}", error);
-                return EXIT_ERROR;
-            }
-            if let Some(token) = token {
-                println!("LAN token: {}", token);
-                println!(
-                    "LAN token file: {}",
-                    paths::config_dir().join("lan-token").display()
-                );
+            let mut lan = crate::lan::Lan::load(&paths::config_dir(), settings.auth_passwd.clone());
+            match lan.enable("0.0.0.0".parse().expect("bind")) {
+                Ok(()) => {
+                    if let Err(error) = lan.save(&paths::config_dir()) {
+                        eprintln!("svcd: cannot enable LAN: {}", error);
+                        return EXIT_ERROR;
+                    }
+                    println!("LAN enabled on 0.0.0.0");
+                }
+                Err(error) => {
+                    eprintln!("svcd: LAN not enabled: {}", error);
+                    eprintln!("svcd: run `svc auth passwd <password>` then `svc auth enable`");
+                }
             }
         }
     }
@@ -1565,6 +1568,11 @@ mod tests {
         assert!(text.contains("http_port = 8787"), "{text}");
         assert!(text.contains("lan_default = false"), "{text}");
         assert!(
+            text.contains(&format!("config_dir = {}", layout.config_dir.display())),
+            "{text}"
+        );
+        assert!(text.contains("svc auth passwd"), "{text}");
+        assert!(
             text.contains(&format!(
                 "plugins_dir = {}",
                 layout.data_dir.join("plugins").display()
@@ -1605,7 +1613,14 @@ mod tests {
         let text =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/svcd.conf.example"))
                 .expect("svcd.conf.example");
-        for key in ["http_port", "lan_default", "plugins_dir", "services_dir"] {
+        for key in [
+            "http_port",
+            "lan_default",
+            "config_dir",
+            "plugins_dir",
+            "services_dir",
+            "auth_passwd",
+        ] {
             assert!(text.contains(key), "example is missing {key}");
         }
     }

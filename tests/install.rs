@@ -356,7 +356,7 @@ fn self_install_copies_aliases_and_uninstalls_without_touching_the_host() {
 }
 
 #[test]
-fn self_install_copies_svcd_conf_and_can_enable_lan() {
+fn self_install_warns_when_lan_default_has_no_password() {
     let sandbox = Sandbox::new();
     let prefix = sandbox.root.join("prefix");
     let prefix_arg = prefix.to_str().expect("utf8");
@@ -392,19 +392,14 @@ fn self_install_copies_svcd_conf_and_can_enable_lan() {
     ]);
     assert_eq!(installed.status.code(), Some(0), "{}", stderr(&installed));
     assert!(
-        stdout(&installed).contains("LAN token:"),
-        "first LAN enable must print the token once: {}",
-        stdout(&installed)
+        stderr(&installed).contains("LAN not enabled"),
+        "install must refuse to enable LAN without a password: {}",
+        stderr(&installed)
     );
+    assert!(!sandbox.config_dir().join("lan.json").exists());
+    assert!(!sandbox.config_dir().join("lan-token").exists());
     let copied = sandbox.config_dir().join("svcd.conf");
     assert_eq!(fs::read_to_string(&copied).expect("copied conf"), text);
-
-    let lan: serde_json::Value =
-        serde_json::from_slice(&fs::read(sandbox.config_dir().join("lan.json")).expect("lan.json"))
-            .expect("lan json");
-    assert_eq!(lan["enabled"].as_bool(), Some(true));
-    assert_eq!(lan["bind"].as_str(), Some("0.0.0.0"));
-    assert!(sandbox.config_dir().join("lan-token").is_file());
 }
 
 #[test]

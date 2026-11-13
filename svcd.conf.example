@@ -9,11 +9,20 @@
 #   4. a generated default with platform paths
 #
 # Lines are `key = value`; lines starting with `#` are comments.
-# Relative `plugins_dir` / `services_dir` values resolve against the directory
-# containing this file.
+# Relative `config_dir` / `plugins_dir` / `services_dir` values resolve against
+# the directory containing this file.
 
 http_port = 8787
 lan_default = false
+
+# Configuration directory: svcd.conf, trust.d, lan.json and svcd.token.
+# Defaults: /etc/svcd (Linux), /Library/Application Support/svcd/config
+# (macOS), %USERPROFILE%\.svcd (Windows).
+# config_dir = /etc/svcd
+
+# Web/API password hash. Never put the plaintext here; set it with:
+#   svc auth passwd <password>
+# auth_passwd = pbkdf2-sha256$10000$...
 
 # Absolute paths (the generated default uses the platform locations):
 # Linux:
@@ -24,4 +33,4 @@ lan_default = false
 # services_dir = /Library/Application Support/svcd/config/services.d
 # Windows:
 # plugins_dir = C:\ProgramData\svcd\plugins
-# services_dir = C:\ProgramData\svcd\config\services.d
+# services_dir = C:\Users\<user>\.svcd\services.d

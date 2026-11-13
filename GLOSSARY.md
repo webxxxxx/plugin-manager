@@ -41,8 +41,15 @@ _Avoid_: svcd CLI、管理客户端
 _Avoid_: 插件管理器、PluginManager（那是已退役的进程）
 
 **svcd.conf**:
-`<config>` 下的运行时配置文件，由 `svcd --install --conf <file>` 写入；承载 HTTP 端口、LAN 默认开关、plugin 安装位置与 core 服务扫描位置。
+`<config>` 下的运行时配置文件，由 `svcd --install --conf <file>` 写入；承载 HTTP 端口、`config_dir`、`auth_passwd` 哈希、LAN 默认开关、plugin 安装位置与 core 服务扫描位置。
 _Avoid_: settings.json、通用“配置文件”
+
+**auth_passwd**:
+`svcd.conf` 里的 PBKDF2-HMAC-SHA256 口令哈希；明文只经过 `svc auth passwd <password>`，不落盘。网页登录、`/api/v1` 与 `/mcp` 的 Bearer 都用同一密码。
+_Avoid_: lan-token、管理员 token
+
+**config_dir**:
+`svcd.conf` 里的配置目录覆盖项；`svcd.conf`、`trust.d`、`lan.json`、`svcd.token` 都放在这里。默认 Linux `/etc/svcd`、Windows `%USERPROFILE%\.svcd`；`SVCD_CONFIG_DIR` 优先级更高。
 
 **mcp**:
 multicall 二进制的 MCP 桥入口名；把 MCP 客户端接到常驻 svcd。

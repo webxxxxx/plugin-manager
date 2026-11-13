@@ -13,18 +13,21 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 static SETTINGS: OnceLock<Result<Settings, String>> = OnceLock::new();
+static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
     pub http_port: Option<u16>,
     pub lan_default: bool,
+    pub config_dir: Option<PathBuf>,
     pub plugins_dir: Option<PathBuf>,
     pub services_dir: Option<PathBuf>,
+    pub auth_passwd: Option<String>,
 }
 
 /// The settings for this process. Loaded once from the service config (the
-/// program directory first, then `<config>/svcd.conf`) when no service config
-/// was initialized explicitly.
+/// program directory first, then the platform config directory) when no
+/// service config was initialized explicitly.
 pub fn current() -> Result<&'static Settings, String> {
     SETTINGS
         .get_or_init(|| {
@@ -36,10 +39,15 @@ pub fn current() -> Result<&'static Settings, String> {
                     return load_from(&path);
                 }
             }
-            load(&crate::paths::config_dir())
+            load(&crate::paths::platform_config_dir())
         })
         .as_ref()
         .map_err(Clone::clone)
+}
+
+/// The file this process loaded. `svc auth passwd` updates this exact file.
+pub fn path() -> Option<&'static Path> {
+    CONFIG_PATH.get().map(PathBuf::as_path)
 }
 
 /// Load the config file chosen by `install::ensure_conf` into the process cache.
@@ -67,6 +75,7 @@ fn load(config_dir: &Path) -> Result<Settings, String> {
 }
 
 fn load_from(path: &Path) -> Result<Settings, String> {
+    let _ = CONFIG_PATH.set(path.to_path_buf());
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -117,8 +126,10 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
                     }
                 };
             }
+            "config_dir" => settings.config_dir = Some(resolve(base, value)),
             "plugins_dir" => settings.plugins_dir = Some(resolve(base, value)),
             "services_dir" => settings.services_dir = Some(resolve(base, value)),
+            "auth_passwd" => settings.auth_passwd = Some(value.to_string()),
             other => return Err(format!("line {}: unknown key {:?}", index + 1, other)),
         }
     }
@@ -134,6 +145,45 @@ fn resolve(base: &Path, value: &str) -> PathBuf {
     }
 }
 
+/// Replace one key in an existing conf, preserving comments and other keys.
+/// Used by `svc auth passwd` to write `auth_passwd` without a restart.
+pub fn update_value(path: &Path, key: &str, value: &str) -> Result<(), String> {
+    let text =
+        fs::read_to_string(path).map_err(|error| format!("read {}: {}", path.display(), error))?;
+    let mut output = String::with_capacity(text.len() + value.len() + 16);
+    let mut replaced = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let matches_key = !trimmed.starts_with('#')
+            && trimmed
+                .split_once('=')
+                .map(|(left, _)| left.trim() == key)
+                .unwrap_or(false);
+        if matches_key {
+            if !replaced {
+                output.push_str(&format!("{} = {}\n", key, value));
+                replaced = true;
+            }
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    if !replaced {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&format!("{} = {}\n", key, value));
+    }
+    fs::write(path, output).map_err(|error| format!("write {}: {}", path.display(), error))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,12 +191,13 @@ mod tests {
     #[test]
     fn parses_all_keys_and_resolves_relative_paths() {
         let settings = parse(
-            "\u{feff}# svcd runtime\nhttp_port = 8787\nlan_default = yes\nplugins_dir = plugins\nservices_dir = /var/lib/svcd/services.d\n",
+            "\u{feff}# svcd runtime\nhttp_port = 8787\nlan_default = yes\nconfig_dir = /srv/svcd\nplugins_dir = plugins\nservices_dir = /var/lib/svcd/services.d\nauth_passwd = pbkdf2-sha256$10000$c2FsdA$aGFzaA\n",
             Path::new("/etc/svcd"),
         )
         .expect("parse");
         assert_eq!(settings.http_port, Some(8787));
         assert!(settings.lan_default);
+        assert_eq!(settings.config_dir, Some(PathBuf::from("/srv/svcd")));
         assert_eq!(
             settings.plugins_dir,
             Some(PathBuf::from("/etc/svcd/plugins"))
@@ -155,6 +206,36 @@ mod tests {
             settings.services_dir,
             Some(PathBuf::from("/var/lib/svcd/services.d"))
         );
+        assert_eq!(
+            settings.auth_passwd.as_deref(),
+            Some("pbkdf2-sha256$10000$c2FsdA$aGFzaA")
+        );
+    }
+
+    #[test]
+    fn update_value_replaces_or_appends_one_key() {
+        let directory = std::env::temp_dir().join(format!(
+            "svcd-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("temp dir");
+        let path = directory.join("svcd.conf");
+        fs::write(&path, "# keep\nhttp_port = 8787\nauth_passwd = old\n").expect("write conf");
+
+        update_value(&path, "auth_passwd", "new$hash").expect("replace");
+        let text = fs::read_to_string(&path).expect("read");
+        assert_eq!(text, "# keep\nhttp_port = 8787\nauth_passwd = new$hash\n");
+
+        update_value(&path, "lan_default", "true").expect("append");
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(text.contains("auth_passwd = new$hash"));
+        assert!(text.ends_with("lan_default = true\n"), "{text}");
+
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]
