@@ -44,14 +44,17 @@ start so `/mcp` works without root; LAN stays disabled.
 - Performance: HTTP/MCP list/call at concurrency 1/8/32 with a keep-alive agent,
   WS at 1/8/32 connections, SSE event throughput, 10s mixed workload, CPU/RSS
   sampling
-- Scale: fresh daemon per 0/5/10/30 plugin count; process-tree WorkingSet and
-  idle CPU over a 5s window; start-all timing
+- Scale: fresh daemon per 0/5/10/30 plugin count with a minimal cmd/sh script
+  plugin (no Python); daemon and process-tree WorkingSet/CPU over a 5s idle
+  window; start-all timing
 
 ## Notes
 
 - On Windows, CPU/RSS sampling uses PowerShell `Get-Process`; on other platforms
   the resource block is reported as unavailable.
 - The Python fixture adds interpreter and JSON overhead to MCP/WS/SSE calls.
+- `--scale` uses a minimal cmd/sh script plugin so daemon overhead is separated
+  from interpreter overhead.
 - Compatibility HTTP checks use one-shot connections; performance workers use
   HTTP/1.1 keep-alive, so their numbers include connection reuse.
 - Numbers are machine-specific and intended for relative comparison and

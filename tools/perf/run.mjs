@@ -848,6 +848,40 @@ function mb(bytes) {
   return bytes / (1024 * 1024);
 }
 
+function writeScriptFixture(root) {
+  const fixture = path.join(root, 'plugin');
+  mkdirSync(path.join(fixture, 'payload', 'bin'), { recursive: true });
+  const exec = WIN ? 'payload/bin/agent.cmd' : 'payload/bin/agent.sh';
+  if (WIN) {
+    const script = [
+      '@echo off',
+      ':loop',
+      'set "line="',
+      'set /p line=',
+      'if errorlevel 1 goto end',
+      'echo {"jsonrpc":"2.0","id":1,"result":{"ok":true}}',
+      'goto loop',
+      ':end',
+    ].join('\r\n') + '\r\n';
+    writeFileSync(path.join(fixture, exec), script);
+  } else {
+    const script = '#!/bin/sh\nwhile IFS= read -r line; do\n  printf \'{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\\n\'\ndone\n';
+    writeFileSync(path.join(fixture, exec), script);
+    execFileSync('chmod', ['+x', path.join(fixture, exec)]);
+  }
+  const manifest = {
+    schema: 1,
+    name: 'perf',
+    version: '1.0.0',
+    desc: 'minimal script plugin for scale tests',
+    protocol: 1,
+    exec: { path: exec, ready: 'notify' },
+    capabilities: [],
+  };
+  writeFileSync(path.join(fixture, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
+  return fixture;
+}
+
 async function measureScale() {
   const counts = [0, 5, 10, 30];
   const results = [];
@@ -858,7 +892,7 @@ async function measureScale() {
     log('scale: starting ' + count + ' plugin(s) in ' + root);
     const daemon = await startDaemon(root);
     try {
-      const fixture = writeFixture(root);
+      const fixture = writeScriptFixture(root);
       const packages = [];
       for (let index = 0; index < count; index++) {
         const id = 'p' + index;
@@ -875,23 +909,34 @@ async function measureScale() {
       }
       const startAllMs = performance.now() - startAll;
       await sleep(2000);
+      const daemonBefore = processInfo(daemon.child.pid);
       const before = processTree(daemon.child.pid);
       await sleep(5000);
+      const daemonAfter = processInfo(daemon.child.pid);
       const after = processTree(daemon.child.pid);
       const cpuSeconds = before && after ? Math.max(0, after.cpu - before.cpu) : 0;
+      const daemonCpuSeconds = daemonBefore && daemonAfter ? Math.max(0, daemonAfter.CPU - daemonBefore.CPU) : 0;
+      const pluginCpuSeconds = Math.max(0, cpuSeconds - daemonCpuSeconds);
       const cpuPercent = cpuSeconds / 5 * 100;
+      const daemonCpuPercent = daemonCpuSeconds / 5 * 100;
+      const pluginCpuPercent = pluginCpuSeconds / 5 * 100;
+      const daemonRss = daemonAfter ? daemonAfter.WorkingSet64 : 0;
       results.push({
         plugins: count,
         root: root,
         processes: after ? after.count : 0,
+        daemon_rss_bytes: daemonRss,
+        plugin_rss_bytes: Math.max(0, (after ? after.working_set : 0) - daemonRss),
         total_rss_bytes: after ? after.working_set : 0,
         total_private_bytes: after ? after.private : 0,
         cpu_seconds_5s: cpuSeconds,
+        daemon_cpu_percent_one_core: daemonCpuPercent,
+        plugin_cpu_percent_one_core: pluginCpuPercent,
         cpu_percent_one_core: cpuPercent,
         cpu_percent_machine: cpuPercent / os.cpus().length,
         start_all_ms: startAllMs,
       });
-      log('scale: ' + count + ' plugins, RSS=' + mb(after ? after.working_set : 0).toFixed(1) + ' MB, idle CPU=' + cpuPercent.toFixed(2) + '%');
+      log('scale: ' + count + ' plugins, daemon RSS=' + mb(daemonRss).toFixed(1) + ' MB, plugin RSS=' + mb(Math.max(0, (after ? after.working_set : 0) - daemonRss)).toFixed(1) + ' MB, daemon CPU=' + daemonCpuPercent.toFixed(2) + '%');
     } finally {
       await stopDaemon(daemon);
     }
@@ -912,20 +957,20 @@ function renderScaleReport(results) {
   lines.push('');
   lines.push('- OS: ' + os.type() + ' ' + os.release());
   lines.push('- CPU: ' + os.cpus()[0].model + ' x' + os.cpus().length);
-  lines.push('- Plugin: Python NDJSON echo agent (idle)');
-  lines.push('- Window: 5s idle sample after 2s settle; process tree includes daemon, cmd/launcher, Python and conhost.');
+  lines.push('- Plugin: minimal cmd/sh script (no Python)');
+  lines.push('- Window: 5s idle sample after 2s settle; daemon is sampled directly, plugin RSS is total tree minus daemon.');
   lines.push('');
-  lines.push('| Plugins | Processes | Total RSS MB | Plugin RSS MB | Per plugin MB | Idle CPU % (one core) | Start all ms |');
-  lines.push('| ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
+  lines.push('| Plugins | Processes | Daemon RSS MB | Plugin RSS MB | Total RSS MB | Per plugin MB | Daemon CPU % | Plugin CPU % | Total CPU % | Start all ms |');
+  lines.push('| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
   for (const item of results) {
-    lines.push('| ' + item.plugins + ' | ' + item.processes + ' | ' + mb(item.total_rss_bytes).toFixed(2) + ' | ' + mb(item.plugin_rss_bytes).toFixed(2) + ' | ' + mb(item.per_plugin_rss_bytes).toFixed(2) + ' | ' + item.cpu_percent_one_core.toFixed(2) + ' | ' + item.start_all_ms.toFixed(0) + ' |');
+    lines.push('| ' + item.plugins + ' | ' + item.processes + ' | ' + mb(item.daemon_rss_bytes).toFixed(2) + ' | ' + mb(item.plugin_rss_bytes).toFixed(2) + ' | ' + mb(item.total_rss_bytes).toFixed(2) + ' | ' + mb(item.per_plugin_rss_bytes).toFixed(2) + ' | ' + item.daemon_cpu_percent_one_core.toFixed(2) + ' | ' + item.plugin_cpu_percent_one_core.toFixed(2) + ' | ' + item.cpu_percent_one_core.toFixed(2) + ' | ' + item.start_all_ms.toFixed(0) + ' |');
   }
   lines.push('');
   lines.push('## Notes');
   lines.push('');
-  lines.push('- Plugin RSS is measured as total tree RSS minus the 0-plugin daemon baseline.');
+  lines.push('- Daemon RSS/CPU comes from Get-Process by daemon pid; plugin values are the process tree minus the daemon.');
   lines.push('- CPU is the process-tree CPU seconds delta over 5s, normalized to one core.');
-  lines.push('- Python plugin overhead and Windows process wrappers are included; values are not a production capacity claim.');
+  lines.push('- The minimal script has no business logic and is idle; values show daemon overhead and per-plugin process cost, not production capacity.');
   lines.push('');
   return lines.join('\n');
 }
