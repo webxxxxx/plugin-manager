@@ -68,7 +68,7 @@ const manifest = JSON.parse(manifestBytes.toString('utf8'));
 const errors = [];
 function must(cond, msg) { if (!cond) errors.push(msg); }
 
-must(manifest.schema === 1, 'schema must be 1');
+must(manifest.schema === 1 || manifest.schema === 2, 'schema must be 1 or 2');
 must(typeof manifest.name === 'string' && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(manifest.name), 'bad name');
 must(typeof manifest.version === 'string' && /^[0-9]+\.[0-9]+\.[0-9]+/.test(manifest.version), 'bad version');
 must(typeof manifest.platform === 'string' && /^[a-z0-9_]+(-[a-z0-9_]+){2,3}$/.test(manifest.platform), 'bad platform (expected <arch>-<vendor>-<os>-<abi>)');
@@ -89,6 +89,31 @@ for (const f of manifest.files) {
   must(e.mode === f.mode, 'mode mismatch: ' + f.path);
 }
 for (const n of byName.keys()) must(seen.has(n), 'extra file not in manifest: ' + n);
+
+if (manifest.schema === 2) {
+  if (manifest.interpreter !== undefined) {
+    must(
+      manifest.interpreter && typeof manifest.interpreter.name === 'string' && /^[A-Za-z0-9._-]+$/.test(manifest.interpreter.name),
+      'bad interpreter name'
+    );
+    must(
+      manifest.interpreter.version === undefined || typeof manifest.interpreter.version === 'string',
+      'bad interpreter version'
+    );
+  }
+  const lifecycle = manifest.lifecycle || {};
+  for (const action of ['start', 'stop', 'status']) {
+    const hook = lifecycle[action];
+    if (!hook) continue;
+    must(typeof hook.path === 'string' && seen.has(hook.path), 'lifecycle.' + action + ' not in files[]');
+  }
+} else {
+  must(!manifest.interpreter, 'interpreter requires schema 2');
+  must(!manifest.lifecycle, 'lifecycle requires schema 2');
+}
+if (manifest.exec && manifest.exec.ready === 'exec' && (manifest.capabilities || []).length) {
+  errors.push('exec.ready=exec cannot declare capabilities');
+}
 
 const capNames = new Set();
 for (const c of manifest.capabilities || []) {

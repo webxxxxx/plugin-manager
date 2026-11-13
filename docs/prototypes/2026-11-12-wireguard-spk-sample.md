@@ -36,14 +36,21 @@ python tools/demo_rpc.py           # 走一遍 ping/status/up/…/shutdown
 
 ## 结果（实测）
 
-- 包内 5 个文件；manifest 1,491 B；`.spk` 12,800 B（tar 头 + 512 对齐）。
+- 包内 5 个文件；manifest 1,568 B；`.spk` 13,824 B（tar 头 + 512 对齐）。
 - checker：7 个条目（manifest + signature + 5 files），Ed25519 验签 OK，manifest 是 canonical 形式。
+
+## schema 2 更新（2026-11-13）
+
+- manifest 升到 `schema: 2`，新增 `interpreter: {"name":"python3","version":">=3.8"}`：payload 是 Python 脚本，安装时按新规则校验解释器存在与版本，运行时统一由 `python3` 执行。
+- 补上 `config: "config/wg.json"`，让配置模板真正进入配置流；此前只有文件在 `files[]` 里，没有 `config` 字段。
+- `tools/check_spk.mjs` 接受 schema 1/2，并校验 `interpreter` 名字/版本与 `lifecycle` 路径；`tools/build_spk.mjs` 把 lifecycle 路径也算作可执行文件。
+- 样张仍是能力插件（`ready: notify` + capabilities），所以不声明 `lifecycle`；脚本服务的生命周期见 `samples/services.d/`。
 - 协议 demo：`svcd.ping` → `{"ok":true}`；`status` → `tunnel down`；`up` → `peers 1`；`svcd.status` → `{summary, details}`；未知工具 `-32602`；未知方法 `-32601`；`svcd.shutdown` → exit 0。
 
 ## 样张如何映射规格
 
 - **容器**：ustar 头 `mtime=0`、`uid/gid=0`、条目顺序 manifest → signature → 按路径排序的文件；没有压缩。
-- **清单**：`schema/protocol/platform/exec/capabilities/ui/files/hooks` 全部出现；`files[]` 钉住 payload、config 与 hooks 的 sha256/size/mode。
+- **清单**：`schema/protocol/platform/exec/interpreter/config/capabilities/ui/files/hooks` 全部出现；`files[]` 钉住 payload、config 与 hooks 的 sha256/size/mode。
 - **签名**：`signature.json` 签的是 `manifest.json` 的原样字节；checker 先验签再逐文件验 hash。
 - **hooks**：两个脚本都在 `files[]` 里被 hash 钉住；env 只用 `SVCD_*`，cwd 是版本目录。
 - **UI**：`ui.entry=index.html` 解析到 `payload/web/index.html`，页面走 `POST rpc`。

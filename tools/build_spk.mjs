@@ -40,6 +40,9 @@ function walk(dir, base, out) {
 const execSet = new Set();
 execSet.add(src.exec.path);
 for (const k of Object.keys(src.hooks || {})) execSet.add(src.hooks[k]);
+for (const action of Object.keys(src.lifecycle || {})) {
+  if (src.lifecycle[action] && src.lifecycle[action].path) execSet.add(src.lifecycle[action].path);
+}
 
 const all = [];
 for (const d of ['payload', 'config', 'hooks']) {

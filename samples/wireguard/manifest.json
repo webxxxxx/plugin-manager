@@ -1,0 +1,65 @@
+{
+  "capabilities": [
+    {
+      "desc": "Show tunnel and peer status",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "status"
+    },
+    {
+      "desc": "Bring the tunnel up with an interface config",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "config": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "config"
+        ],
+        "type": "object"
+      },
+      "name": "up"
+    },
+    {
+      "desc": "Bring the tunnel down",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "down"
+    }
+  ],
+  "dependencies": [],
+  "desc": "WireGuard tunnel manager (sample package)",
+  "exec": {
+    "args": [
+      "--stdio"
+    ],
+    "path": "payload/bin/wg-agent",
+    "ready": "notify"
+  },
+  "hooks": {
+    "postInstall": "hooks/post-install.sh",
+    "preRemove": "hooks/pre-remove.sh"
+  },
+  "name": "wireguard",
+  "platform": "x86_64-unknown-linux-musl",
+  "protocol": 1,
+  "schema": 2,
+  "ui": {
+    "entry": "index.html",
+    "type": "web"
+  },
+  "version": "1.0.0",
+  "interpreter": {
+    "name": "python3",
+    "version": ">=3.8"
+  },
+  "config": "config/wg.json"
+}
