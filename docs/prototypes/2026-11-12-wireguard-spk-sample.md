@@ -36,7 +36,7 @@ python tools/demo_rpc.py           # 走一遍 ping/status/up/…/shutdown
 
 ## 结果（实测）
 
-- 包内 5 个文件；manifest 1,568 B；`.spk` 13,824 B（tar 头 + 512 对齐）。
+- 包内 5 个文件；manifest 1,568 B；`.spk` 13,312 B（tar 头 + 512 对齐）。
 - checker：7 个条目（manifest + signature + 5 files），Ed25519 验签 OK，manifest 是 canonical 形式。
 
 ## schema 2 更新（2026-11-13）

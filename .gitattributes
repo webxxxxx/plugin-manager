@@ -1,0 +1,9 @@
+# Sample payload scripts run on Unix; keep LF in the working tree so a
+# Windows checkout does not turn a #!/bin/sh hook into "#!/bin/sh\r".
+*.sh text eol=lf
+*.py text eol=lf
+samples/wireguard/payload/bin/wg-agent text eol=lf
+
+# Windows service samples stay CRLF in a Windows checkout.
+*.bat text eol=crlf
+*.cmd text eol=crlf

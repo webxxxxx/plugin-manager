@@ -51,6 +51,18 @@ for (const d of ['payload', 'config', 'hooks']) {
 }
 all.sort(function (a, b) { return a.path < b.path ? -1 : a.path > b.path ? 1 : 0; });
 
+// A shebang hook with CRLF fails to spawn on Unix (the kernel looks for
+// "/bin/sh\r"). Reject it at build time with a readable error.
+const unixTarget = !String(src.platform || '').includes('windows');
+if (unixTarget) {
+  for (const hookPath of Object.values(src.hooks || {})) {
+    const entry = all.find(function (e) { return e.path === hookPath; });
+    if (entry && readFileSync(entry.abs).includes(0x0d)) {
+      throw new Error('hook must use LF line endings: ' + hookPath);
+    }
+  }
+}
+
 const files = all.map(function (e) {
   const data = readFileSync(e.abs);
   return {

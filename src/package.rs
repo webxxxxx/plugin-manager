@@ -433,6 +433,12 @@ fn check_hook_shebangs(manifest: &Manifest, files: &[FileData]) -> Result<(), St
         if !file.data.starts_with(b"#!") {
             return Err(format!("{} must start with a shebang: {}", name, path));
         }
+        if file.data.contains(&b'\r') {
+            return Err(format!(
+                "{} must use LF line endings (the CRLF shebang fails to spawn): {}",
+                name, path
+            ));
+        }
     }
     Ok(())
 }
@@ -1365,6 +1371,23 @@ mod tests {
         .expect_err("shebang");
 
         assert!(error.contains("shebang"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_hook_with_crlf_line_endings() {
+        let key = setup();
+        let (path, _) = hook_file();
+
+        let error = verify_bytes(&hook_package_with_body(
+            &key,
+            &path,
+            0o755,
+            b"#!/bin/sh\r\nexit 0\r\n".to_vec(),
+        ))
+        .expect_err("crlf");
+
+        assert!(error.contains("LF line endings"), "{error}");
     }
 
     #[test]

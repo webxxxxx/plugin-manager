@@ -131,6 +131,10 @@ if (manifest.ui && manifest.ui.type === 'web') {
 for (const k of Object.keys(manifest.hooks || {})) {
   must(manifest.hooks[k].startsWith('hooks/'), 'hook not under hooks/: ' + manifest.hooks[k]);
   must(seen.has(manifest.hooks[k]), 'hook not in files[]: ' + manifest.hooks[k]);
+  const entry = byName.get(manifest.hooks[k]);
+  if (entry && entry.data.subarray(0, 2).toString() === '#!' && entry.data.includes(0x0d)) {
+    errors.push('hook must use LF line endings: ' + manifest.hooks[k]);
+  }
 }
 
 function stable(v) {

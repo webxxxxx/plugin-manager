@@ -326,6 +326,9 @@ fn assemble_manifest(
             if !source.data.starts_with(b"#!") {
                 return Err(format!("hook must start with a shebang: {}", path));
             }
+            if source.data.contains(&b'\r') {
+                return Err(format!("hook must use LF line endings: {}", path));
+            }
         }
     }
     let interpreter_runs_exec = manifest.contains_key("interpreter");
