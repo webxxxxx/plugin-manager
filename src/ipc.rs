@@ -11,6 +11,7 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread;
 
+use crate::threads;
 use crate::wake::Wake;
 
 /// One JSON-RPC message may not exceed this many bytes, excluding the LF.
@@ -111,6 +112,7 @@ pub fn spawn_reader<R: Read + Send + 'static>(
 ) -> io::Result<()> {
     thread::Builder::new()
         .name(name)
+        .stack_size(threads::IO_STACK)
         .spawn(move || {
             let mut reader = io::BufReader::new(stream);
             loop {

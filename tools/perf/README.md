@@ -55,6 +55,16 @@ start so `/mcp` works without root; LAN stays disabled.
 - The Python fixture adds interpreter and JSON overhead to MCP/WS/SSE calls.
 - `--scale` uses a minimal cmd/sh script plugin so daemon overhead is separated
   from interpreter overhead.
+- `scale_cli.py` measures the minimal (`--no-default-features`) daemon through
+  the CLI channel, where no HTTP API exists:
+
+  ```sh
+  python3 tools/perf/scale_cli.py --binary target/release/svcd \
+    --work /tmp/min-scale --plugins 0,5,10,30 \
+    --key samples/keys/sample-2026.key --pub samples/keys/sample-2026.pub
+  ```
+- Minimal build: `cargo build --release --no-default-features`; see
+  `scale_cli.py` for its resource test.
 - In WSL, put the runtime work root on the Linux filesystem, not `/mnt/*`:
   `PERF_WORK_ROOT=/tmp/svcd-perf node tools/perf/run.mjs --scale`.
   Unix control sockets are not supported on the Windows filesystem mount.

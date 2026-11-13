@@ -1,3 +1,4 @@
+#[cfg(feature = "http")]
 mod api;
 mod bundle;
 mod channel;
@@ -6,9 +7,11 @@ mod definition;
 mod http;
 mod install;
 mod ipc;
+#[cfg_attr(not(feature = "http"), allow(dead_code))]
 mod lan;
 mod log;
 mod mcp;
+#[cfg(feature = "http")]
 mod mcp_http;
 mod package;
 mod paths;
@@ -21,9 +24,12 @@ mod slot;
 mod status;
 mod supervisor;
 mod svc;
+mod threads;
 mod transfer;
+#[cfg(feature = "http")]
 mod uichannel;
 mod wake;
+#[cfg(feature = "http")]
 mod webui;
 
 fn main() {

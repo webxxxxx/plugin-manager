@@ -340,6 +340,7 @@ pub fn active_config(id: &str) -> Option<PathBuf> {
 
 /// Where an installed plugin's declared web UI lives on disk.
 #[derive(Clone, Debug)]
+#[cfg(feature = "http")]
 pub struct WebAssets {
     /// `payload/web/` inside the current version directory.
     pub root: PathBuf,
@@ -352,6 +353,7 @@ pub struct WebAssets {
 /// Only `web` and `gui` UIs are browser-loadable (the desktop WebView loads the
 /// same files); `headerless` and unknown types have no UI to serve. The entry is
 /// relative to `payload/web/` and defaults to `index.html`.
+#[cfg(feature = "http")]
 pub fn web_assets(id: &str) -> Option<WebAssets> {
     let version = current_version(id)?;
     let version_dir = plugin_dir(id).join(version);
