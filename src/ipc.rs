@@ -8,7 +8,10 @@
 
 use std::io::{self, BufRead, Read, Write};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::thread;
+
+use crate::wake::Wake;
 
 /// One JSON-RPC message may not exceed this many bytes, excluding the LF.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -104,6 +107,7 @@ pub fn spawn_reader<R: Read + Send + 'static>(
     name: String,
     stream: R,
     sender: Sender<FrameEvent>,
+    wake: Option<Arc<Wake>>,
 ) -> io::Result<()> {
     thread::Builder::new()
         .name(name)
@@ -116,7 +120,13 @@ pub fn spawn_reader<R: Read + Send + 'static>(
                     Err(error) => FrameEvent::Frame(Err(error)),
                 };
                 let done = matches!(event, FrameEvent::Closed | FrameEvent::Frame(Err(_)));
-                if sender.send(event).is_err() || done {
+                if sender.send(event).is_err() {
+                    break;
+                }
+                if let Some(wake) = &wake {
+                    wake.notify();
+                }
+                if done {
                     break;
                 }
             }

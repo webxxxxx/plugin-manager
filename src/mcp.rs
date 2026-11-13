@@ -101,7 +101,7 @@ pub fn run_stdio() -> i32 {
         return 1;
     }
     let (sender, receiver) = mpsc::channel();
-    if let Err(error) = ipc::spawn_reader("mcp-stdin".into(), io::stdin(), sender) {
+    if let Err(error) = ipc::spawn_reader("mcp-stdin".into(), io::stdin(), sender, None) {
         eprintln!("mcp: stdin: {}", error);
         return 1;
     }

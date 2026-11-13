@@ -13,7 +13,7 @@
 | OS | Windows 11（10.0.26200），x86_64 |
 | CPU | 12th Gen Intel Core i7-1260P，12 核 / 16 逻辑处理器 |
 | 内存 | 16 GiB |
-| 构建 | `cargo build --release`，svcd `1,134,592 B` |
+| 构建 | `cargo build --release`，svcd `1,139,200 B` |
 | 客户端 | Node v20.11.1；`ws` 8.23.0；`eventsource` 2.0.2；MCP SDK 1.32.2 |
 | 插件 | Python 3.10 NDJSON echo agent（含 Python 编解码/调度开销） |
 | 网络 | 127.0.0.1，HTTP 无 TLS，端口由 daemon 动态分配 |
@@ -152,24 +152,62 @@ daemon 在 10s 混合负载内消耗约 34.7 秒 CPU（约 3.5 个逻辑核，�
 
 高并发下的 p99 仍是长尾（HTTP c32 124ms、MCP call c32 147ms、WS 32 连接 57ms），主要来自 thread-per-connection 的调度和突发连接；下一步再评估连接池/线程池。
 
+## 事件驱动唤醒（condvar，#83）
+
+把 #79 的 1ms 轮询换成事件唤醒，进一步降低空闲 CPU 和插件调用延迟：
+
+- 新增 `src/wake.rs`：`Mutex<bool>` + `Condvar` 的唤醒闩；控制通道收到请求、插件 stdout 读到帧时 `notify`。
+- daemon 事件循环改为 `try_recv` 排空 + `pump` + `wait_timeout(50ms)`；50ms 只用于 shutdown 和定时器兜底，插件帧到达会立即唤醒。
+- HTTP accept 改为阻塞 `accept`；`rebind` 先入队命令，再用 loopback 探针唤醒旧 listener；不再 1ms 轮询。
+- 删除 Windows `timeBeginPeriod(1)`（不再需要 1ms 睡眠）。
+
+| 场景 | 1ms 轮询 | condvar/event 唤醒 |
+| --- | ---: | ---: |
+| MCP call c1 RPS / p50 | 565.6 / 1.66ms | **2,252.7 / 0.43ms** |
+| WS 1 连接 RPS / p50 | 350.9 / 3.08ms | **2,827.2 / 0.31ms** |
+| SSE 事件/秒 | 209.7 | **712.6** |
+| HTTP c1 RPS / p50 | 2,343.5 / 0.42ms | 2,135.5 / 0.45ms（keep-alive 路径，噪声内） |
+| 10s 混合 RPS | 3,407.7 | **3,605.1** |
+| daemon 空闲 CPU（0/5/10/30 插件） | 8–18% 单核 | **0–0.63% 单核** |
+
+高并发 p99 仍由 thread-per-connection 和突发连接主导；本次优化主要解决空闲轮询和单次插件调用延迟。
+
 ## 0/5/10/30 插件资源占用（#81）
 
 方法：每个插件数使用全新 daemon，安装并启动 N 个**最小 cmd/sh 脚本插件**（无 Python、无业务逻辑），静置 2s 后在 5s 窗口内分别采样 daemon 自身和整个进程树。两次独立运行的 RSS 很稳定；CPU 有轮询/调度波动，表中给两次数值。
 
 | 插件数 | 进程数 | daemon RSS MB | 插件 RSS MB | 总 RSS MB | 每插件 MB | daemon CPU%（单核，两次） | 插件 CPU% | 启动全部 ms（两次） |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1 | 5.67 / 5.66 | 0.00 | 5.67 / 5.66 | 0.00 | 9.06 / 6.56 | 0.00 | 0 / 0 |
-| 5 | 6 | 6.55 / 6.48 | 34.96 / 34.97 | 41.51 / 41.45 | 6.99 / 6.99 | 8.44 / 9.06 | 0.31 / 0.63 | 174 / 177 |
-| 10 | 11 | 6.93 / 6.92 | 69.89 / 69.93 | 76.82 / 76.85 | 6.99 / 6.99 | 8.13 / 12.19 | 0.00 / 0.31 | 349 / 333 |
-| 30 | 31 | 8.13 / 8.19 | 209.66 / 209.65 | 217.79 / 217.84 | 6.99 / 6.99 | 14.06 / 16.56 | 0.00 / 0.00 | 1041 / 1049 |
+| 0 | 1 | 5.49 / 5.48 | 0.00 | 5.49 / 5.48 | 0.00 | 0.00 / 0.00 | 0.00 | 0 / 0 |
+| 5 | 6 | 6.37 / 6.35 | 34.96 / 35.00 | 41.32 / 41.36 | 6.99 / 7.00 | 0.31 / 0.00 | 0.00 / 0.31 | 164 / 190 |
+| 10 | 11 | 6.73 / 6.69 | 69.92 / 69.88 | 76.65 / 76.57 | 6.99 / 6.99 | 0.00 / 0.00 | 0.00 / 0.00 | 342 / 345 |
+| 30 | 31 | 7.90 / 7.86 | 209.58 / 209.68 | 217.48 / 217.54 | 6.99 / 6.99 | 0.31 / 0.63 | 0.00 / 0.00 | 1025 / 1029 |
 
 结论（重点看 daemon）：
 
-- **daemon 自身 RSS 只从 5.7 MB 增到 8.1–8.2 MB**（30 插件）；每插件只增加约 80 KB 的 daemon 状态。
-- **daemon 空闲 CPU 从约 6.6–9.1% 升到 14.1–16.6% 单核**（16 逻辑核约 0.9–1.0% 整机）。这是 #79 的 1ms tick 在 30 个 slot 上每轮 pump 的成本；插件脚本本身 CPU 约 0。
+- **daemon 自身 RSS 从 5.5 MB 增到 7.9 MB**（30 插件）；每插件只增加约 80 KB 的 daemon 状态。
+- **daemon 空闲 CPU 约 0–0.63% 单核**（0/5/10/30 插件，5s 窗口）；事件驱动后不再有固定 1ms tick，空闲基本为 0。
 - 插件进程：每插件 1 个 cmd/sh 进程、约 **7.0 MB RSS**；30 个约 210 MB，总进程数 **N+1**。
 - 30 个插件全部启动约 **1.0s**（约 34–35 ms/插件，含安装）。
 - 若 30 插件是常态且在意空闲 CPU，下一步应把 daemon 的 1ms 轮询改成事件唤醒/按 deadline 计算的下一次 tick，或让 pump 在无 pending 时跳过扫描；这比继续调大轮询间隔更合适。
+
+## 嵌入式内存还能怎么缩
+
+当前优化后基线（Windows、最小脚本插件）：
+
+- daemon 自身 **5.5 MB**（0 插件）→ **7.9 MB**（30 插件）。
+- 每插件脚本进程约 **7.0 MB**；30 个约 210 MB。Windows cmd 不等于嵌入式 Linux 的 /bin/sh。
+
+可继续做的方向（按收益/风险排序）：
+
+1. **线程栈上限（最直接）**：HTTP 连接、channel 连接、插件 stdout/stderr reader 都使用默认线程栈（通常 2 MB 虚拟地址）。给这些线程设 64–128 KB 的显式 stack size，可降低虚拟内存和峰值 RSS，尤其是 30 插件 × 2 reader 线程时；需要回归深层 JSON 解析的栈安全。
+2. **feature-gate**：把 HTTP 管理面、内嵌控制台、插件 Web UI、MCP 做成可选 cargo feature。对嵌入式通常主要省 flash/二进制（musl 1.36 MB），也会少一些静态数据和代码页；不改变空闲堆。
+3. **插件形态**：Linux /bin/sh 脚本约 1 MB 级，比 Windows cmd 小得多；native/in-process 插件可进一步省掉每插件一个进程。当前 7 MB/插件是 Windows 脚本进程的成本，不是 daemon 的成本。
+4. **分配器与缓冲复用**：musl/glibc 下可在导入/上传后 malloc_trim；复用 HTTP/JSON 缓冲，减少峰值。pump 每 50ms 克隆 slot id 列表，可改成不分配或低频；对 RSS 影响小，但能减少碎片。
+5. **构建**：已用 opt-level=z、fat LTO、panic=abort、strip、musl 静态；若目标有 FPU/需求，可试 -C target-feature、--gc-sections，并实测 flash/RSS，不要盲调。
+6. **先测再改**：在目标板用 /proc/self/smaps_rollup 区分代码/堆/栈/共享页；若 daemon RSS 主要来自代码页，feature-gate 更有效；若来自线程栈，先做 stack size。
+
+结论：**能缩，但 daemon 的 5.5 MB 已不大**；嵌入式最值得先做的是线程栈上限 + Linux 脚本/native 插件，其次才是 feature-gate 和分配器。当前 7.9 MB/30 插件主要是 daemon 状态，脚本内存另计。
 
 ## 优化前瓶颈
 
@@ -181,8 +219,9 @@ daemon 在 10s 混合负载内消耗约 34.7 秒 CPU（约 3.5 个逻辑核，�
 
 ## 已实施与后续
 
-- **已实施 P0/P0/P1**：accept 1ms 轮询、daemon 1ms tick + Windows timer resolution、HTTP keep-alive。
-- **后续 P1**：性能基线使用 native 插件（Rust/C）+ mock 上游，把 Python 开销与核心开销分开；本次数字已够做相对比较，不适合作为绝对上限。
+- **已实施 P0/P0/P1**：blocking accept（rebind 探针唤醒）、daemon condvar 唤醒 + 50ms 定时器兜底、HTTP keep-alive。
+- **已实施（#83）**：移除 1ms 轮询和 Windows `timeBeginPeriod`；空闲 CPU 从 8–18% 降到 0–0.63% 单核。
+- **嵌入式内存后续**：线程栈上限、feature-gate HTTP/UI/MCP、native 插件基线；见下节。
 - **后续 P2**：评估 p99 长尾（连接池/线程池/accept burst）；如果要防回归，另建 nightly 或专门 runner，不要塞进普通 `cargo test`。
 - **不属于本票**：TLS、HTTP/2、pipelining、WS 压缩。
 
