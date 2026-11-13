@@ -15,6 +15,11 @@ Actions are detected by name: shell functions (`start()` / `function start`,
 or a `case` branch `start)`), PowerShell `function start`, and cmd labels
 (`:start`, case-insensitive). Comments are ignored.
 
+Every process a script starts stays in that service's process group (Unix) or
+job object (Windows): stopping the service terminates the whole tree, and the
+service stays `running` while any member of that tree is still alive. A missing
+`stop` action therefore means the framework kills the tree for you.
+
 `clock.sh` / `clock.bat` declare only `start` and `status`, so `svc stop`
 terminates them. The file stem is the service id.
 

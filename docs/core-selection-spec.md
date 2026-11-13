@@ -29,7 +29,8 @@
 - 状态机：`Stopped | Starting | Running | Stopping | Backoff | Failed`，事件带 pid，迟到事件按 pid 丢弃。
 - 退避：曾在 Running ≥ 10s → 清零 + 立即重启；否则 1/2/4/8/16/30s；连续 5 次进 `Failed`，只有显式 start 复位。
 - 就绪：默认 probe-on-spawn（发首个协议请求，首个合法响应 = Ready），`exec.ready = "exec"` 可跳过；start 超时 30s。
-- 停止：SIGTERM（进程组）→ 10s → SIGKILL → 5s → 记 unkillable；全局关机预算 30s，unit 侧 `TimeoutStopSec=40`。Windows：控制帧 + 关 stdin → 等 → TerminateProcess。
+- 停止：SIGTERM（进程组）→ 10s → SIGKILL → 5s → 记 unkillable；全局关机预算 30s，unit 侧 `TimeoutStopSec=40`。Windows：控制帧 + 关 stdin → 等 → `TerminateJobObject`（整个服务树）。
+- **服务树即进程组**：Unix 每次 spawn 建独立进程组，Windows 每个服务一个 job object；停止/重启用整组终止。组内任一进程仍存活时服务保持 `Running`，leader 退出不触发重启；整组退出后才按 leader 的退出码进入重启策略。`notify` 类服务的 stdout EOF 仍按控制端点消失处理（立即停止）。
 - **父进程死亡（2026-11-13，测试覆盖）**：svcd 异常退出（kill -9 / TerminateProcess）时子进程随父退出——Windows 用 Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，所有被监督进程加入该 job），Linux 在 child 里 `prctl(PR_SET_PDEATHSIG, SIGTERM)`；重启后按 enabled 重新拉起，不会再与上次运行的实例并存。macOS 没有等价的廉价原语，仍是已知缺口，待后续票。
 - 依赖：按层拓扑，同层并行、层间串行；依赖失败不级联停，只摘能力并拒绝新的 start；依赖恢复不自动拉起之前被挡住的依赖者。
 - 环：安装与加载都拒绝，带环路径。
@@ -104,6 +105,7 @@
 - 声明方式：`.sh` 的 shell 函数（`start()` / `function start`）或 `case` 分支（`start)`）；`.ps1` 的 `function start`；`.bat` / `.cmd` 的 `:start` 标签（大小写不敏感）。注释里的同名不计。
 - 未声明的动作由框架兜底：缺 `start` → `exec.args` 为空，svcd 从头执行脚本；缺 `stop` → 不跑 stop 钩子，直接进入普通停止序列（Unix SIGTERM；Windows 对没有停止钩子的 `exec` 脚本立即结束进程）；缺 `status` → `svc status` 不追加 probe。
 - 已声明的 `start` 必须前台运行（可申请资源后 `exec` 真正的进程），不得 daemonize；`stop` 在 SIGTERM 前释放资源；`status` 是**细节补充**：stdout 作为 `details.probe`（截断到 8 KiB、多行以 `; ` 连接），退出码只追加到文本、不改变服务状态。
+- 脚本派生的后台进程留在同一进程组（Unix）/ job object（Windows），停止时一起终止；组内任一进程存活时服务仍是 `Running`，整组退出才结束。
 - svcd 把脚本合成为 core 服务：`exec.ready = Exec`，`lifecycle` 只为声明了的动作生成钩子；默认 `version = 1.0.0`，无 dependencies / capabilities / config。
 - 同 id 的 JSON 定义优先；脚本跳过并告警。脚本必须非 symlink；Unix 还要求 exec 位；改脚本后重启 svcd 生效（v1 不做热加载）。
 - `.ps1` 在 Windows 通过 `powershell -NoProfile -ExecutionPolicy Bypass -File <script> <action>` 调用。
@@ -506,6 +508,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - 2026-11-12（补）：core 退出工具面——定义不再接受 `capabilities`；新增可选 `lifecycle.start/stop/status`，`svc start/stop/status` 调用钩子；`details` 增加 `probe`。
 - 2026-11-12（补）：脚本服务 drop-in——`services.d/<id>.sh|bat|cmd|ps1`，`start/stop/status` 参数入口；同 id JSON 优先；`.ps1` 走 ExecutionPolicy Bypass。
 - 2026-11-13（补）：脚本动作改为可选——脚本声明哪个动作，svcd 才调用哪个；缺 `start` 从头执行、缺 `stop` 由框架终止进程、`status` 只把 stdout 作为 `details.probe` 的细节补充。
+- 2026-11-13（补）：服务树即进程组——Unix 独立进程组、Windows per-service job object；组内任一进程存活即 `Running`，stop 终止整棵树。
 
 ## 16. 实施票（2026-11-12 拆出）
 

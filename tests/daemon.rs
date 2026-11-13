@@ -307,12 +307,17 @@ impl Sandbox {
     }
 
     fn write_script_body(&self, id: &str, body: &str) -> PathBuf {
+        #[cfg(windows)]
+        let name = format!("{}.cmd", id);
+        #[cfg(unix)]
+        let name = format!("{}.sh", id);
+        self.write_script_as(&name, body)
+    }
+
+    fn write_script_as(&self, name: &str, body: &str) -> PathBuf {
         let directory = self.config.join("services.d");
         fs::create_dir_all(&directory).expect("services.d");
-        #[cfg(windows)]
-        let path = directory.join(format!("{}.cmd", id));
-        #[cfg(unix)]
-        let path = directory.join(format!("{}.sh", id));
+        let path = directory.join(name);
         fs::write(&path, body).expect("write script body");
         #[cfg(unix)]
         {
@@ -934,6 +939,77 @@ fn a_stop_action_still_runs_when_start_is_not_declared() {
     );
     wait_for_marker(&sandbox.config.join("services.d").join("stop.txt"), "stop");
     assert_eq!(sandbox.status("demo")["summary"]["state"], "stopped");
+}
+
+#[test]
+fn a_background_child_keeps_the_service_running_and_stops_with_it() {
+    let mut sandbox = Sandbox::new();
+    #[cfg(windows)]
+    {
+        let body = r#"Remove-Item Alias:start -Force -ErrorAction SilentlyContinue
+function start {
+  $p = Start-Process -WindowStyle Hidden -PassThru -FilePath 'ping' -ArgumentList '-n','60','127.0.0.1'
+  Set-Content -Path (Join-Path $PSScriptRoot 'child.pid') -Value $p.Id
+}
+function status {
+  'child alive'
+}
+$action = $args[0]
+if ($action -eq 'start') { start } elseif ($action -eq 'status') { status }
+"#;
+        sandbox.write_script_as("demo.ps1", body);
+    }
+    #[cfg(unix)]
+    {
+        let body = "#!/bin/sh\nstart() {\n  sleep 60 &\n  echo $! > \"$(dirname \"$0\")/child.pid\"\n}\nstatus() { echo 'child alive'; }\ncase \"$1\" in\n  start) start ;;\n  status) status ;;\n  *) exit 64 ;;\nesac\n";
+        sandbox.write_script_body("demo", body);
+    }
+    sandbox.start_daemon();
+
+    let started = sandbox.start_when_ready("demo");
+    assert_eq!(
+        started.status.code(),
+        Some(0),
+        "start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+
+    let pid_file = sandbox.config.join("services.d").join("child.pid");
+    wait_until("the background child pid", Duration::from_secs(10), || {
+        fs::read_to_string(&pid_file)
+            .map(|text| text.trim().parse::<u32>().is_ok())
+            .unwrap_or(false)
+    });
+    let child_pid: u32 = fs::read_to_string(&pid_file)
+        .expect("child pid file")
+        .trim()
+        .parse()
+        .expect("child pid");
+
+    let leader = sandbox.status("demo")["summary"]["pid"]
+        .as_u64()
+        .expect("leader pid") as u32;
+    wait_until("the script leader to exit", Duration::from_secs(10), || {
+        !pid_alive(leader)
+    });
+
+    let status = sandbox.status("demo");
+    assert_eq!(status["summary"]["state"], "running", "{status}");
+    assert_eq!(status["details"]["probe"], "child alive");
+
+    let stopped = sandbox.stop("demo");
+    assert_eq!(
+        stopped.status.code(),
+        Some(0),
+        "stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert_eq!(sandbox.status("demo")["summary"]["state"], "stopped");
+    wait_until(
+        "the background child to die with the service",
+        Duration::from_secs(10),
+        || !pid_alive(child_pid),
+    );
 }
 
 // ---------------------------------------------------------------------------

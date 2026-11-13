@@ -88,7 +88,7 @@ pub fn run(spec: &Invocation<'_>) -> Result<(), String> {
         }
     };
     #[cfg(windows)]
-    let job = Job::new();
+    let job = crate::proc::Job::new();
     let mut child = command
         .spawn()
         .map_err(|error| format!("spawn {} hook: {}", spec.action, error))?;
@@ -169,79 +169,6 @@ fn kill(child: &mut Child) {
     #[cfg(windows)]
     {
         let _ = child.kill();
-    }
-}
-
-/// Windows has no process groups for a synchronous child. A per-hook job object
-/// with `KILL_ON_JOB_CLOSE` gives the timeout the same "kill the whole tree"
-/// semantics as the Unix process group.
-#[cfg(windows)]
-struct Job(windows_sys::Win32::Foundation::HANDLE);
-
-#[cfg(windows)]
-impl Job {
-    fn new() -> Option<Self> {
-        use std::ffi::c_void;
-        use std::mem::{size_of_val, zeroed};
-
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::JobObjects::{
-            CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        };
-
-        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        if handle.is_null() {
-            return None;
-        }
-        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let ok = unsafe {
-            SetInformationJobObject(
-                handle,
-                JobObjectExtendedLimitInformation,
-                &info as *const _ as *const c_void,
-                size_of_val(&info) as u32,
-            )
-        };
-        if ok == 0 {
-            unsafe { CloseHandle(handle) };
-            return None;
-        }
-        Some(Job(handle))
-    }
-
-    fn assign(&self, child: &Child) {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
-
-        // The daemon's global job already owns the process. Nesting is allowed
-        // on Windows 8+, and failure only means the timeout cannot reap the
-        // grandchildren; the direct child is still killed below.
-        unsafe {
-            AssignProcessToJobObject(self.0, child.as_raw_handle() as _);
-        }
-    }
-
-    fn terminate(&self) {
-        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
-
-        unsafe {
-            TerminateJobObject(self.0, 1);
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for Job {
-    fn drop(&mut self) {
-        use windows_sys::Win32::Foundation::CloseHandle;
-
-        // KILL_ON_JOB_CLOSE also cleans up descendants left behind by a hook
-        // that exited before its children did.
-        unsafe {
-            CloseHandle(self.0);
-        }
     }
 }
 

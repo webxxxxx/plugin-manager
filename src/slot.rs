@@ -45,6 +45,12 @@ pub(crate) struct Slot {
     kill_deadline: Option<u64>,
     stop_hook: Option<HookRun>,
     stop_hook_started: bool,
+    /// The whole service tree on Windows; on Unix the process group is the tree.
+    #[cfg(windows)]
+    job: Option<crate::proc::Job>,
+    /// The leader exited but other group members are still alive; the service
+    /// stays `Running` until the whole group is gone.
+    pending_exit: Option<Option<i32>>,
     ping_id: u64,
 }
 
@@ -88,6 +94,9 @@ impl Slot {
             kill_deadline: None,
             stop_hook: None,
             stop_hook_started: false,
+            #[cfg(windows)]
+            job: None,
+            pending_exit: None,
             ping_id: 1,
         }
     }
@@ -233,6 +242,17 @@ impl Slot {
     }
 
     fn spawn(&mut self) -> Result<u32, String> {
+        self.pending_exit = None;
+        #[cfg(windows)]
+        if self.job.is_none() {
+            self.job = crate::proc::Job::new();
+            if self.job.is_none() {
+                log::svcd(&format!(
+                    "svcd: {}: process job unavailable; stop only terminates the leader",
+                    self.id
+                ));
+            }
+        }
         let start = self
             .lifecycle
             .as_ref()
@@ -267,6 +287,15 @@ impl Slot {
                 "svcd: {}: parent-death protection: {}",
                 self.id, error
             ));
+        }
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            if !job.assign(&child) {
+                log::svcd(&format!(
+                    "svcd: {}: cannot assign the process job; stop only terminates the leader",
+                    self.id
+                ));
+            }
         }
         let pid = child.id();
         let log = match LogSink::open(&paths::logs_dir(), &self.id) {
@@ -587,17 +616,21 @@ impl Slot {
     }
 
     fn check_exit(&mut self, now: u64) {
-        let status = self
-            .child
-            .as_mut()
-            .and_then(|child| match child.try_wait() {
-                Ok(Some(status)) => Some(status),
-                _ => None,
-            });
-        if let Some(status) = status {
+        if let Some(child) = self.child.as_mut() {
+            let status = match child.try_wait() {
+                Ok(Some(status)) => status,
+                _ => return,
+            };
             let pid = self.machine.pid;
-            self.clear_process();
+            self.child = None;
+            if pid.is_some() && self.group_alive() {
+                // The leader is gone but the service tree is not. Keep the
+                // service Running and settle the exit once the group is empty.
+                self.pending_exit = Some(status.code());
+                return;
+            }
             if let Some(pid) = pid {
+                self.clear_process();
                 self.apply(
                     Event::Exited {
                         pid,
@@ -606,6 +639,42 @@ impl Slot {
                     now,
                 );
             }
+            return;
+        }
+        let Some(code) = self.pending_exit else {
+            return;
+        };
+        if self.group_alive() {
+            return;
+        }
+        self.pending_exit = None;
+        if let Some(pid) = self.machine.pid {
+            self.clear_process();
+            self.apply(Event::Exited { pid, code }, now);
+        }
+    }
+
+    /// True while any process of the service (not just the leader) is alive.
+    fn group_alive(&self) -> bool {
+        let Some(pid) = self.machine.pid else {
+            return false;
+        };
+        #[cfg(unix)]
+        {
+            // Signal 0: 0 means a member exists; EPERM means it exists but is
+            // not ours to signal, which still counts as alive.
+            if unsafe { libc::kill(-(pid as i32), 0) } == 0 {
+                return true;
+            }
+            return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        }
+        #[cfg(windows)]
+        {
+            let _ = pid;
+            self.job
+                .as_ref()
+                .map(|job| job.active() > 0)
+                .unwrap_or(false)
         }
     }
 
@@ -670,6 +739,11 @@ impl Slot {
         match command.spawn() {
             Ok(mut child) => {
                 let _ = crate::proc::assign(&child);
+                #[cfg(windows)]
+                if let Some(job) = &self.job {
+                    // The stop action's own children belong to the service tree.
+                    job.assign(&child);
+                }
                 let log = LogSink::open(&paths::logs_dir(), &self.id)
                     .ok()
                     .map(|sink| Arc::new(Mutex::new(sink)));
@@ -772,6 +846,10 @@ impl Slot {
         self.abort_stop_hook();
         #[cfg(windows)]
         {
+            // The leader may already be gone; the job still owns the tree.
+            if let Some(job) = &self.job {
+                job.terminate();
+            }
             if let Some(child) = self.child.as_mut() {
                 let _ = child.kill();
             }
@@ -807,6 +885,7 @@ impl Slot {
         self.start_deadline = None;
         self.stop_deadline = None;
         self.kill_deadline = None;
+        self.pending_exit = None;
     }
 }
 
