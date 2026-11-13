@@ -1,13 +1,17 @@
 # .spk build output
 
-This directory holds the `.spk` packages produced by `tools/build_spk.mjs`
-(and their unpacked staging directories). Generated packages are ignored by
-git; this README is kept.
+This directory is the single output location for generated `.spk` files
+(plus build staging/extract directories, which are ignored by git). Sources
+live under `samples/<name>/`; this README is kept in git, generated packages
+are not.
 
-The sample source lives in `samples/wireguard/` (manifest without `files[]`,
-plus payload/config/hooks). Its manifest is `schema: 2` and declares
-`interpreter: {"name": "python3", "version": ">=3.8"}` because the payload is
-a Python script.
+- `samples/wireguard/` — manifest without `files[]`, payload/config/hooks.
+  It is `schema: 2` and declares
+  `interpreter: {"name": "python3", "version": ">=3.8"}` because the payload
+  is a Python script. The package targets `x86_64-unknown-linux-musl`.
+- `samples/clock/` — a Windows `.cmd` service used by both the core drop-in
+  README and the schema-2 plugin sample. Its `lifecycle.stop` is generated from
+  the script's declared `:stop` action.
 
 ```sh
 node tools/gen_sample_key.mjs          # once; writes samples/keys/sample-2026.*
@@ -15,8 +19,16 @@ node tools/build_spk.mjs wireguard     # writes samples/spk/wireguard-1.0.0-<arc
 node tools/check_spk.mjs samples/spk/wireguard-1.0.0-x86_64.spk
 ```
 
-The sample targets `x86_64-unknown-linux-musl`; the package will be rejected on
-other platforms by the normal platform check.
+Windows clock sample:
+
+```powershell
+plugin bundle samples\clock --from-core --interpreter cmd --interpreter-arg /C `
+  --key samples\keys\sample-2026.key --version 0.1.0 `
+  -o samples\spk\clock-0.1.0-x86_64.spk
+```
+
+The wireguard sample targets `x86_64-unknown-linux-musl`; the package will be
+rejected on other platforms by the normal platform check.
 
 To try a package locally, trust its signing key once (as Administrator):
 
