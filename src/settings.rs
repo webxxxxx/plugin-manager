@@ -23,6 +23,23 @@ pub struct Settings {
     pub plugins_dir: Option<PathBuf>,
     pub services_dir: Option<PathBuf>,
     pub auth_passwd: Option<String>,
+    /// Relocated installation root for hosts whose `/usr` is read-only and
+    /// whose writable tree is limited (SR6110: only `/etc` persists). When
+    /// set, `--install` puts the binary, aliases and `svcd_daemon.sh` here;
+    /// `data` and `logs` default to `<install_dir>/data` and `<install_dir>/logs`.
+    pub install_dir: Option<PathBuf>,
+}
+
+impl Settings {
+    /// Runtime data directory implied by `install_dir`, if that key is set.
+    pub fn install_data_dir(&self) -> Option<PathBuf> {
+        self.install_dir.as_ref().map(|dir| dir.join("data"))
+    }
+
+    /// Runtime log directory implied by `install_dir`, if that key is set.
+    pub fn install_logs_dir(&self) -> Option<PathBuf> {
+        self.install_dir.as_ref().map(|dir| dir.join("logs"))
+    }
 }
 
 /// The settings for this process. Loaded once from the service config (the
@@ -31,6 +48,9 @@ pub struct Settings {
 pub fn current() -> Result<&'static Settings, String> {
     SETTINGS
         .get_or_init(|| {
+            if let Some(dir) = std::env::var_os("SVCD_CONFIG_DIR") {
+                return load(&PathBuf::from(dir));
+            }
             let program_conf = std::env::current_exe()
                 .ok()
                 .and_then(|path| path.parent().map(|parent| parent.join("svcd.conf")));
@@ -129,6 +149,7 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
             "config_dir" => settings.config_dir = Some(resolve(base, value)),
             "plugins_dir" => settings.plugins_dir = Some(resolve(base, value)),
             "services_dir" => settings.services_dir = Some(resolve(base, value)),
+            "install_dir" => settings.install_dir = Some(resolve(base, value)),
             "auth_passwd" => settings.auth_passwd = Some(value.to_string()),
             other => return Err(format!("line {}: unknown key {:?}", index + 1, other)),
         }
@@ -191,7 +212,7 @@ mod tests {
     #[test]
     fn parses_all_keys_and_resolves_relative_paths() {
         let settings = parse(
-            "\u{feff}# svcd runtime\nhttp_port = 8787\nlan_default = yes\nconfig_dir = /srv/svcd\nplugins_dir = plugins\nservices_dir = /var/lib/svcd/services.d\nauth_passwd = pbkdf2-sha256$10000$c2FsdA$aGFzaA\n",
+            "\u{feff}# svcd runtime\nhttp_port = 8787\nlan_default = yes\nconfig_dir = /srv/svcd\nplugins_dir = plugins\nservices_dir = /var/lib/svcd/services.d\ninstall_dir = /etc/sr/svcd\nauth_passwd = pbkdf2-sha256$10000$c2FsdA$aGFzaA\n",
             Path::new("/etc/svcd"),
         )
         .expect("parse");
@@ -206,10 +227,36 @@ mod tests {
             settings.services_dir,
             Some(PathBuf::from("/var/lib/svcd/services.d"))
         );
+        assert_eq!(settings.install_dir, Some(PathBuf::from("/etc/sr/svcd")));
         assert_eq!(
             settings.auth_passwd.as_deref(),
             Some("pbkdf2-sha256$10000$c2FsdA$aGFzaA")
         );
+    }
+
+    #[test]
+    fn relative_install_dir_resolves_against_the_conf_directory() {
+        let settings = parse("install_dir = sr/svcd\n", Path::new("/etc/svcd")).expect("parse");
+        assert_eq!(
+            settings.install_dir,
+            Some(PathBuf::from("/etc/svcd/sr/svcd"))
+        );
+    }
+
+    #[test]
+    fn install_dir_implies_data_and_log_directories() {
+        let settings =
+            parse("install_dir = /etc/sr/svcd\n", Path::new("/etc/svcd")).expect("parse");
+        assert_eq!(
+            settings.install_data_dir(),
+            Some(PathBuf::from("/etc/sr/svcd/data"))
+        );
+        assert_eq!(
+            settings.install_logs_dir(),
+            Some(PathBuf::from("/etc/sr/svcd/logs"))
+        );
+        assert_eq!(Settings::default().install_data_dir(), None);
+        assert_eq!(Settings::default().install_logs_dir(), None);
     }
 
     #[test]

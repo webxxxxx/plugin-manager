@@ -41,7 +41,7 @@ _Avoid_: svcd CLI、管理客户端
 _Avoid_: 插件管理器、PluginManager（那是已退役的进程）
 
 **svcd.conf**:
-`<config>` 下的运行时配置文件，由 `svcd --install --conf <file>` 写入；承载 HTTP 端口、`config_dir`、`auth_passwd` 哈希、LAN 默认开关、plugin 安装位置与 core 服务扫描位置。
+`<config>` 下的运行时配置文件，由 `svcd --install --conf <file>` 写入；承载 HTTP 端口、`config_dir`、`install_dir`、`auth_passwd` 哈希、LAN 默认开关、plugin 安装位置与 core 服务扫描位置。
 _Avoid_: settings.json、通用“配置文件”
 
 **auth_passwd**:
@@ -50,6 +50,10 @@ _Avoid_: lan-token、管理员 token
 
 **config_dir**:
 `svcd.conf` 里的配置目录覆盖项；`svcd.conf`、`trust.d`、`lan.json`、`svcd.token` 都放在这里。默认 Linux `/etc/svcd`、Windows `%USERPROFILE%\.svcd`；`SVCD_CONFIG_DIR` 优先级更高。
+
+**install_dir**:
+`svcd.conf` 里的安装根覆盖项，给 `/usr` 只读、`/var` 不持久（SR6110 只有 `/etc` 持久）的宿主用。指定后 `svcd --install` 把二进制、`svc`/`plugin`/`mcp` 别名和 `svcd_daemon.sh` 启动脚本装到这里，data/logs 默认落到 `<install_dir>/data`、`<install_dir>/logs`，并跳过 init 服务注册；`--prefix` 仍然优先。未指定时走平台默认。
+_Avoid_: 安装前缀（只说命令行 `--prefix`）、数据目录
 
 **mcp**:
 multicall 二进制的 MCP 桥入口名；把 MCP 客户端接到常驻 svcd。

@@ -44,22 +44,34 @@ pub fn trust_dir() -> PathBuf {
 }
 
 /// The platform log directory. `SVCD_LOG_DIR` overrides it for tests and
-/// non-root development; production paths are `/var/log/svcd`,
+/// non-root development; `install_dir` moves it under the installation root
+/// for read-only-rootfs hosts. Production paths are `/var/log/svcd`,
 /// `/Library/Logs/svcd` and `%ProgramData%\svcd\logs`.
 pub fn logs_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("SVCD_LOG_DIR") {
         return PathBuf::from(dir);
     }
+    if let Ok(settings) = settings::current() {
+        if let Some(dir) = settings.install_logs_dir() {
+            return dir;
+        }
+    }
     platform_logs_dir()
 }
 
 /// The platform data directory. `SVCD_DATA_DIR` overrides it so tests and
-/// non-root development runs can use an isolated tree; production paths are
-/// `/var/lib/svcd`, `/Library/Application Support/svcd` and
+/// non-root development runs can use an isolated tree; `install_dir` moves it
+/// under the installation root when `/var` is not persistent. Production paths
+/// are `/var/lib/svcd`, `/Library/Application Support/svcd` and
 /// `%ProgramData%\svcd`.
 pub fn data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("SVCD_DATA_DIR") {
         return PathBuf::from(dir);
+    }
+    if let Ok(settings) = settings::current() {
+        if let Some(dir) = settings.install_data_dir() {
+            return dir;
+        }
     }
     platform_data_dir()
 }

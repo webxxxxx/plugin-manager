@@ -20,6 +20,15 @@ lan_default = false
 # (macOS), %USERPROFILE%\.svcd (Windows).
 # config_dir = /etc/svcd
 
+# Installation root for hosts whose writable tree is limited (for example
+# SR6110, where only /etc/ persists). When set, `svcd --install` puts the
+# binary, the svc/plugin/mcp aliases and a generated `svcd_daemon.sh` launcher
+# there; data and logs default to <install_dir>/data and <install_dir>/logs.
+# `--prefix` on the command line still wins. Service registration is skipped:
+# add the printed `::respawn:<install_dir>/svcd_daemon.sh` line to the firmware
+# /etc/inittab instead. Leave unset to keep the platform defaults.
+# install_dir = /etc/sr/svcd
+
 # Web/API password hash. Never put the plaintext here; set it with:
 #   svc auth passwd <password>
 # auth_passwd = pbkdf2-sha256$10000$...

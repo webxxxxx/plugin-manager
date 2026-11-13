@@ -473,3 +473,207 @@ fn install_service_accepts_a_program_override() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert!(stdout(&output).contains("/opt/svcd run --foreground"));
 }
+
+fn executable_name() -> &'static str {
+    if cfg!(windows) {
+        "svcd.exe"
+    } else {
+        "svcd"
+    }
+}
+
+fn alias_file_names() -> Vec<&'static str> {
+    if cfg!(windows) {
+        vec!["svc.exe", "plugin.exe", "mcp.exe"]
+    } else {
+        vec!["svc", "plugin", "mcp"]
+    }
+}
+
+fn install_dir_conf(sandbox: &Sandbox, install_dir: &std::path::Path) -> PathBuf {
+    let conf = sandbox.root.join("svcd.conf");
+    let text = format!("install_dir = {}\nhttp_port = 0\n", install_dir.display());
+    fs::write(&conf, text).expect("write source conf");
+    conf
+}
+
+#[test]
+fn install_dir_places_the_binary_aliases_and_launcher() {
+    let sandbox = Sandbox::new();
+    let install_dir = sandbox.root.join("persist").join("svcd");
+    let conf = install_dir_conf(&sandbox, &install_dir);
+
+    let output = sandbox.run(&["--install", "--conf", conf.to_str().expect("utf8")]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        install_dir.join(executable_name()).is_file(),
+        "binary missing in {}",
+        install_dir.display()
+    );
+    for alias in alias_file_names() {
+        assert!(install_dir.join(alias).is_file(), "alias {} missing", alias);
+    }
+
+    let launcher = install_dir.join("svcd_daemon.sh");
+    assert!(launcher.is_file(), "launcher missing");
+    let text = fs::read_to_string(&launcher).expect("read launcher");
+    assert!(text.starts_with("#!/bin/sh\n"), "launcher:\n{}", text);
+    assert!(text.contains("SVCD_DATA_DIR"), "launcher:\n{}", text);
+    assert!(text.contains("SVCD_LOG_DIR"), "launcher:\n{}", text);
+    assert!(
+        text.contains(&install_dir.join("data").display().to_string()),
+        "launcher:\n{}",
+        text
+    );
+    assert!(
+        text.contains(&install_dir.join("logs").display().to_string()),
+        "launcher:\n{}",
+        text
+    );
+    assert!(
+        text.contains(&format!(
+            "\"{}\" run --foreground",
+            install_dir.join(executable_name()).display()
+        )),
+        "launcher:\n{}",
+        text
+    );
+    assert!(
+        text.contains(&sandbox.config_dir().join("svcd.conf").display().to_string()),
+        "launcher:\n{}",
+        text
+    );
+
+    let printed = stdout(&output);
+    assert!(printed.contains("launcher:"), "{}", printed);
+    assert!(
+        printed.contains(&format!("::respawn:{}", launcher.display())),
+        "{}",
+        printed
+    );
+    assert!(
+        !printed.contains("service: program"),
+        "install_dir must not register an init service: {}",
+        printed
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&launcher)
+            .expect("launcher metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755, "launcher must be executable");
+    }
+}
+
+#[test]
+fn install_dir_dry_run_reports_the_launcher_without_writing() {
+    let sandbox = Sandbox::new();
+    let install_dir = sandbox.root.join("persist").join("svcd");
+    let conf = install_dir_conf(&sandbox, &install_dir);
+
+    let output = sandbox.run(&[
+        "--install",
+        "--conf",
+        conf.to_str().expect("utf8"),
+        "--dry-run",
+    ]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let printed = stdout(&output);
+    let launcher = install_dir.join("svcd_daemon.sh");
+    assert!(
+        printed.contains(&format!("launcher: {}", launcher.display())),
+        "{}",
+        printed
+    );
+    assert!(
+        printed.contains(&format!("::respawn:{}", launcher.display())),
+        "{}",
+        printed
+    );
+    assert!(
+        printed.contains(&format!("data:    {}", install_dir.join("data").display())),
+        "{}",
+        printed
+    );
+    assert!(
+        !install_dir.exists(),
+        "dry run created {}",
+        install_dir.display()
+    );
+}
+
+#[test]
+fn uninstall_finds_install_dir_and_removes_the_launcher() {
+    let sandbox = Sandbox::new();
+    let install_dir = sandbox.root.join("persist").join("svcd");
+    let conf = install_dir_conf(&sandbox, &install_dir);
+    let installed = sandbox.run(&["--install", "--conf", conf.to_str().expect("utf8")]);
+    assert_eq!(installed.status.code(), Some(0), "{}", stderr(&installed));
+
+    let removed = sandbox.run(&["--uninstall", "--no-service", "--purge"]);
+
+    assert_eq!(removed.status.code(), Some(0), "{}", stderr(&removed));
+    assert!(
+        !install_dir.join(executable_name()).exists(),
+        "binary left behind"
+    );
+    assert!(
+        !install_dir.join("svcd_daemon.sh").exists(),
+        "launcher left behind"
+    );
+    assert!(
+        !install_dir.join("data").exists() && !install_dir.join("logs").exists(),
+        "purge left install_dir data/logs behind"
+    );
+}
+
+#[test]
+fn command_line_prefix_wins_over_install_dir() {
+    let sandbox = Sandbox::new();
+    let install_dir = sandbox.root.join("persist").join("svcd");
+    let prefix = sandbox.root.join("command-line-prefix");
+    let conf = install_dir_conf(&sandbox, &install_dir);
+
+    let output = sandbox.run(&[
+        "--install",
+        "--prefix",
+        prefix.to_str().expect("utf8"),
+        "--conf",
+        conf.to_str().expect("utf8"),
+        "--no-service",
+    ]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(prefix.join(executable_name()).is_file());
+    assert!(prefix.join("svcd_daemon.sh").is_file());
+    assert!(
+        !install_dir.join(executable_name()).exists(),
+        "--prefix must win over install_dir for the binary"
+    );
+}
+
+#[test]
+fn svc_logs_follows_install_dir_from_the_conf() {
+    let sandbox = Sandbox::new();
+    let install_dir = sandbox.root.join("persist").join("svcd");
+    let conf = install_dir_conf(&sandbox, &install_dir);
+    let installed = sandbox.run(&["--install", "--conf", conf.to_str().expect("utf8")]);
+    assert_eq!(installed.status.code(), Some(0), "{}", stderr(&installed));
+
+    let log = install_dir.join("logs").join("svcd.log");
+    fs::write(&log, "hello-from-install-dir\n").expect("seed log");
+
+    let svc = install_dir.join(if cfg!(windows) { "svc.exe" } else { "svc" });
+    let listed = Command::new(&svc)
+        .args(["logs", "svcd"])
+        .env("SVCD_CONFIG_DIR", sandbox.config_dir())
+        .output()
+        .expect("run installed svc");
+    assert_eq!(listed.status.code(), Some(0), "{}", stderr(&listed));
+    assert_eq!(stdout(&listed), "hello-from-install-dir\n");
+}
