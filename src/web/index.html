@@ -82,13 +82,9 @@
       <h1 style="font-size:16px">安装插件</h1>
       <div class="row">
         <input type="file" id="file" accept=".spk">
-        <select id="strategy">
-          <option value="keep-old">保留旧版本</option>
-          <option value="replace">替换旧版本</option>
-        </select>
         <button onclick="install()">上传并安装</button>
         <span class="grow"></span>
-        <span class="muted">只接受签名 .spk</span>
+        <span class="muted">只接受签名 .spk；安装时替换旧版本</span>
       </div>
     </div>
 
@@ -299,9 +295,8 @@ function install() {
   if (BUSY) return;
   const file = $('file').files[0];
   if (!file) { toast('请先选择 .spk 文件', 'err'); return; }
-  const strategy = $('strategy').value;
   lock(true);
-  fetch('/api/v1/plugins?strategy=' + strategy, {
+  fetch('/api/v1/plugins?strategy=replace', {
     method: 'POST',
     headers: authHeaders({ 'Content-Type': 'application/octet-stream' }),
     body: file

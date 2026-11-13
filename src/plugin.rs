@@ -30,6 +30,24 @@ impl Strategy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplacePlan {
+    Fresh,
+    Backup,
+    Reclaim,
+    NoSpace,
+}
+
+fn replace_plan(free: u64, old: Option<u64>, new: u64) -> ReplacePlan {
+    match old {
+        None if free >= new => ReplacePlan::Fresh,
+        None => ReplacePlan::NoSpace,
+        Some(_) if free >= new => ReplacePlan::Backup,
+        Some(old) if free.saturating_add(old) >= new => ReplacePlan::Reclaim,
+        Some(_) => ReplacePlan::NoSpace,
+    }
+}
+
 pub fn install_package(package: &Package, strategy: Strategy) -> Result<Service, String> {
     let id = package.manifest.name.clone();
     if id == RESERVED_ID {
@@ -44,10 +62,134 @@ pub fn install_package(package: &Package, strategy: Strategy) -> Result<Service,
     fs::create_dir_all(&plugin_dir)
         .map_err(|error| format!("create {}: {}", plugin_dir.display(), error))?;
 
-    if strategy == Strategy::Replace {
-        remove_versions(&plugin_dir, None)?;
+    match strategy {
+        Strategy::KeepOld => install_keep_old(package, &id, &plugin_dir, was_installed),
+        Strategy::Replace => install_replace(package, &id, &plugin_dir, was_installed),
+    }
+}
+
+fn install_keep_old(
+    package: &Package,
+    id: &str,
+    plugin_dir: &Path,
+    was_installed: bool,
+) -> Result<Service, String> {
+    let (version_dir, enabled) = write_version(package, plugin_dir, was_installed)?;
+    copy_config(package, plugin_dir)?;
+    service_from_manifest(id, &version_dir, &package.manifest, enabled)
+}
+
+fn install_replace(
+    package: &Package,
+    id: &str,
+    plugin_dir: &Path,
+    was_installed: bool,
+) -> Result<Service, String> {
+    let old_version = current_version(id).filter(|version| plugin_dir.join(version).is_dir());
+    let old_dir = old_version.as_ref().map(|version| plugin_dir.join(version));
+    let old_size = match &old_dir {
+        Some(path) => Some(directory_size(path)?),
+        None => None,
+    };
+    let new_size = package.unpacked_size();
+    let free = free_space(plugin_dir)?;
+    let plan = replace_plan(free, old_size, new_size);
+    if plan == ReplacePlan::NoSpace {
+        return Err(format!(
+            "not enough space to install {} {}: need {} bytes, {} free{}",
+            id,
+            package.manifest.version,
+            new_size,
+            free,
+            old_size
+                .map(|size| format!(", current version uses {size} bytes"))
+                .unwrap_or_default()
+        ));
     }
 
+    let backup = if plan == ReplacePlan::Backup {
+        let old_dir = old_dir.as_ref().expect("backup implies an old version");
+        let old_version = old_version.as_ref().expect("backup implies an old version");
+        let backup = plugin_dir.join(format!(".backup-{}.{}", old_version, std::process::id()));
+        if backup.exists() {
+            fs::remove_dir_all(&backup)
+                .map_err(|error| format!("remove {}: {}", backup.display(), error))?;
+        }
+        fs::rename(old_dir, &backup)
+            .map_err(|error| format!("backup {}: {}", old_dir.display(), error))?;
+        Some(backup)
+    } else {
+        if plan == ReplacePlan::Reclaim {
+            if let Some(old_dir) = &old_dir {
+                fs::remove_dir_all(old_dir)
+                    .map_err(|error| format!("remove {}: {}", old_dir.display(), error))?;
+            }
+            let _ = fs::remove_file(plugin_dir.join("current"));
+        }
+        None
+    };
+
+    let snapshot = ConfigSnapshot::capture(plugin_dir);
+    let enabled_existed = plugin_dir.join("enabled").exists();
+    let result =
+        write_version(package, plugin_dir, was_installed).and_then(|(version_dir, enabled)| {
+            copy_config(package, plugin_dir)?;
+            service_from_manifest(id, &version_dir, &package.manifest, enabled)
+        });
+
+    match result {
+        Ok(service) => {
+            if let Some(backup) = backup {
+                if let Err(error) = fs::remove_dir_all(&backup) {
+                    log::svcd(&format!(
+                        "svcd: plugin {}: installed, but cannot remove backup {}: {}",
+                        id,
+                        backup.display(),
+                        error
+                    ));
+                }
+            }
+            if let Err(error) = remove_versions(plugin_dir, Some(&package.manifest.version)) {
+                log::svcd(&format!(
+                    "svcd: plugin {}: installed, but cannot prune old versions: {}",
+                    id, error
+                ));
+            }
+            Ok(service)
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(plugin_dir.join(&package.manifest.version));
+            if !enabled_existed {
+                let _ = fs::remove_file(plugin_dir.join("enabled"));
+            }
+            snapshot.restore(plugin_dir);
+            if let (Some(backup), Some(old_dir), Some(old_version)) =
+                (&backup, &old_dir, &old_version)
+            {
+                if let Err(restore) = fs::rename(backup, old_dir) {
+                    return Err(format!(
+                        "{} (rollback failed: cannot restore {}: {})",
+                        error,
+                        old_dir.display(),
+                        restore
+                    ));
+                }
+                if let Err(restore) = write_current(plugin_dir, old_version) {
+                    return Err(format!("{} (rollback failed: {})", error, restore));
+                }
+            } else if backup.is_none() {
+                let _ = fs::remove_file(plugin_dir.join("current"));
+            }
+            Err(error)
+        }
+    }
+}
+
+fn write_version(
+    package: &Package,
+    plugin_dir: &Path,
+    was_installed: bool,
+) -> Result<(PathBuf, bool), String> {
     let temp = plugin_dir.join(format!(
         "{}.tmp.{}",
         package.manifest.version,
@@ -57,7 +199,10 @@ pub fn install_package(package: &Package, strategy: Strategy) -> Result<Service,
         fs::remove_dir_all(&temp)
             .map_err(|error| format!("remove {}: {}", temp.display(), error))?;
     }
-    package.write_to(&temp)?;
+    if let Err(error) = package.write_to(&temp) {
+        let _ = fs::remove_dir_all(&temp);
+        return Err(error);
+    }
 
     let version_dir = plugin_dir.join(&package.manifest.version);
     if version_dir.exists() {
@@ -67,7 +212,7 @@ pub fn install_package(package: &Package, strategy: Strategy) -> Result<Service,
     fs::rename(&temp, &version_dir)
         .map_err(|error| format!("rename {}: {}", version_dir.display(), error))?;
 
-    write_current(&plugin_dir, &package.manifest.version)?;
+    write_current(plugin_dir, &package.manifest.version)?;
 
     let enabled_marker = plugin_dir.join("enabled");
     let enabled = if was_installed {
@@ -77,10 +222,111 @@ pub fn install_package(package: &Package, strategy: Strategy) -> Result<Service,
             .map_err(|error| format!("write {}: {}", enabled_marker.display(), error))?;
         true
     };
+    Ok((version_dir, enabled))
+}
 
-    copy_config(package, &plugin_dir)?;
+fn directory_size(path: &Path) -> Result<u64, String> {
+    let mut total = 0u64;
+    let entries =
+        fs::read_dir(path).map_err(|error| format!("read {}: {}", path.display(), error))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read {}: {}", path.display(), error))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|error| format!("stat {}: {}", entry.path().display(), error))?;
+        if metadata.is_dir() {
+            total = total.saturating_add(directory_size(&entry.path())?);
+        } else {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
+}
 
-    service_from_manifest(&id, &version_dir, &package.manifest, enabled)
+fn free_space(path: &Path) -> Result<u64, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| format!("free space: invalid path {}", path.display()))?;
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) } != 0 {
+            return Err(format!(
+                "free space {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0);
+        let mut available = 0u64;
+        let mut total = 0u64;
+        let mut total_free = 0u64;
+        if unsafe {
+            GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut total_free)
+        } == 0
+        {
+            return Err(format!(
+                "free space {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(available)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err("free space is not supported on this platform".into())
+    }
+}
+
+struct ConfigSnapshot {
+    config: Option<Vec<u8>>,
+    template_hash: Option<Vec<u8>>,
+    config_new: Option<Vec<u8>>,
+}
+
+impl ConfigSnapshot {
+    fn capture(plugin_dir: &Path) -> Self {
+        Self {
+            config: fs::read(plugin_dir.join("config")).ok(),
+            template_hash: fs::read(plugin_dir.join("config.template.sha256")).ok(),
+            config_new: fs::read(plugin_dir.join("config.new")).ok(),
+        }
+    }
+
+    fn restore(&self, plugin_dir: &Path) {
+        restore_file(&plugin_dir.join("config"), &self.config, true);
+        restore_file(
+            &plugin_dir.join("config.template.sha256"),
+            &self.template_hash,
+            false,
+        );
+        restore_file(&plugin_dir.join("config.new"), &self.config_new, false);
+    }
+}
+
+fn restore_file(path: &Path, content: &Option<Vec<u8>>, config: bool) {
+    match content {
+        Some(bytes) if config => {
+            let _ = write_config(path, bytes);
+        }
+        Some(bytes) => {
+            let _ = fs::write(path, bytes);
+        }
+        None => {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 pub fn scan() -> (Vec<Service>, Vec<String>) {
@@ -638,6 +884,22 @@ mod tests {
             serde_json::to_vec(&manifest).expect("manifest"),
         )
         .expect("write manifest");
+    }
+
+    #[test]
+    fn replace_plan_decides_from_free_old_and_new_sizes() {
+        // Fresh installs need the whole package to fit.
+        assert_eq!(replace_plan(100, None, 100), ReplacePlan::Fresh);
+        assert_eq!(replace_plan(99, None, 100), ReplacePlan::NoSpace);
+        // A backup is only safe while the new copy also fits next to the old one.
+        assert_eq!(replace_plan(100, Some(80), 100), ReplacePlan::Backup);
+        assert_eq!(replace_plan(150, Some(1), 100), ReplacePlan::Backup);
+        // Reclaiming the old version is the fallback when both copies cannot coexist.
+        assert_eq!(replace_plan(99, Some(80), 100), ReplacePlan::Reclaim);
+        assert_eq!(replace_plan(20, Some(80), 100), ReplacePlan::Reclaim);
+        assert_eq!(replace_plan(19, Some(80), 100), ReplacePlan::NoSpace);
+        assert_eq!(replace_plan(0, Some(100), 100), ReplacePlan::Reclaim);
+        assert_eq!(replace_plan(0, Some(98), 100), ReplacePlan::NoSpace);
     }
 
     #[test]
