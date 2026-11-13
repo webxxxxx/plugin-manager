@@ -144,6 +144,24 @@ impl Sandbox {
         self.daemon = Some(command.spawn().expect("spawn daemon"));
     }
 
+    /// Like `start_daemon`, but leaves the HTTP port to `svcd.conf` instead of
+    /// forcing an ephemeral port through the environment.
+    fn start_daemon_without_http_port(&mut self) {
+        let stderr = fs::File::create(&self.daemon_stderr).expect("daemon stderr");
+        let mut command = Command::new(&self.svcd);
+        command
+            .args(["run", "--foreground"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr))
+            .env("SVCD_CONFIG_DIR", &self.config)
+            .env("SVCD_DATA_DIR", &self.data)
+            .env("SVCD_LOG_DIR", &self.logs)
+            .env("SVCD_TRUST_DIR", &self.trust)
+            .env("SVCD_TEST_UNPRIVILEGED", "1");
+        self.daemon = Some(command.spawn().expect("spawn daemon"));
+    }
+
     fn wait_for_http(&self) -> String {
         for _ in 0..200 {
             if let Ok(address) = fs::read_to_string(self.config.join("http.port")) {
@@ -1164,6 +1182,79 @@ fn plugin_upload_list_and_delete() {
     let wrong_type = request(&address, "POST", "/api/v1/plugins", "text/plain", &package);
     assert_eq!(wrong_type.status, 400);
     assert_eq!(wrong_type.body["error"]["code"], "bad_request");
+}
+
+#[test]
+fn configured_port_and_paths_come_from_svcd_conf() {
+    let mut sandbox = Sandbox::new();
+    let plugins = sandbox.root.join("configured-plugins");
+    let services = sandbox.root.join("configured-services");
+    fs::create_dir_all(&services).expect("configured services");
+    let (exec, args) = if cfg!(windows) {
+        (r"C:\Windows\System32\cmd.exe", json!(["/c", "exit", "0"]))
+    } else {
+        ("/bin/true", json!([]))
+    };
+    fs::write(
+        services.join("custom.json"),
+        serde_json::to_vec(&json!({
+            "schema": 1,
+            "id": "custom",
+            "version": "1.0.0",
+            "desc": "configured core service",
+            "protocol": 1,
+            "exec": {"path": exec, "args": args, "ready": "exec"}
+        }))
+        .expect("core definition"),
+    )
+    .expect("write core definition");
+    fs::write(
+        sandbox.config.join("svcd.conf"),
+        format!(
+            "http_port = 0\nplugins_dir = {}\nservices_dir = {}\n",
+            plugins.display(),
+            services.display()
+        ),
+    )
+    .expect("write svcd.conf");
+
+    let key = SigningKey::from_bytes(&[23u8; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let package = plugin_package(&key);
+
+    sandbox.start_daemon_without_http_port();
+    let address = sandbox.wait_for_http();
+
+    let services_response = request(&address, "GET", "/api/v1/services", "", b"");
+    assert_eq!(services_response.status, 200);
+    let ids: Vec<&str> = services_response.body["services"]
+        .as_array()
+        .expect("services")
+        .iter()
+        .filter_map(|service| service["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"custom"), "{ids:?}");
+
+    let installed = request(
+        &address,
+        "POST",
+        "/api/v1/plugins?strategy=replace",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(installed.status, 200, "{}", installed.body);
+    assert!(
+        plugins.join("demo").join("1.0.0").is_dir(),
+        "plugin did not use plugins_dir"
+    );
+    assert!(
+        !sandbox.data.join("plugins").join("demo").exists(),
+        "plugin used the default data directory"
+    );
 }
 
 #[test]

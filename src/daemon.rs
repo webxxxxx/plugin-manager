@@ -25,6 +25,7 @@ use crate::paths;
 use crate::plugin::{self, Strategy};
 use crate::registry::{Hook, Kind, Registry, Service, State, RESERVED_ID};
 use crate::rpc;
+use crate::settings;
 use crate::slot::hook_command;
 use crate::slot::{CallError, Slot};
 use crate::status::Status;
@@ -37,6 +38,14 @@ pub fn run() -> i32 {
         eprintln!(
             "svcd: cannot create config directory {}: {}",
             config.display(),
+            error
+        );
+        return 1;
+    }
+    if let Err(error) = settings::current() {
+        eprintln!(
+            "svcd: invalid config {}: {}",
+            config.join("svcd.conf").display(),
             error
         );
         return 1;

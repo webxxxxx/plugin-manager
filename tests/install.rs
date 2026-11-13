@@ -201,6 +201,9 @@ fn usage_errors_exit_sixty_four() {
         ],
         &["uninstall-service", "extra"],
         &["uninstall-service", "--purge", "--purge"],
+        &["--uninstall", "--conf", "svcd.conf"],
+        &["--install", "--conf"],
+        &["--install", "--conf", "a", "--conf", "b"],
     ];
 
     for args in cases {
@@ -342,6 +345,91 @@ fn self_install_copies_aliases_and_uninstalls_without_touching_the_host() {
     assert_eq!(purged.status.code(), Some(0), "{}", stderr(&purged));
     assert!(!sandbox.config_dir().exists());
     assert!(!sandbox.data_dir().exists());
+}
+
+#[test]
+fn self_install_copies_svcd_conf_and_can_enable_lan() {
+    let sandbox = Sandbox::new();
+    let prefix = sandbox.root.join("prefix");
+    let prefix_arg = prefix.to_str().expect("utf8");
+    let conf = sandbox.root.join("svcd.conf");
+    let text = format!(
+        "# runtime settings\nhttp_port = 0\nlan_default = true\nplugins_dir = {}\nservices_dir = {}\n",
+        sandbox.root.join("plugins").display(),
+        sandbox.root.join("services").display()
+    );
+    fs::write(&conf, &text).expect("write source conf");
+    let conf_arg = conf.to_str().expect("utf8");
+
+    let dry = sandbox.run(&[
+        "--install",
+        "--prefix",
+        prefix_arg,
+        "--no-service",
+        "--conf",
+        conf_arg,
+        "--dry-run",
+    ]);
+    assert_eq!(dry.status.code(), Some(0), "{}", stderr(&dry));
+    assert!(stdout(&dry).contains("conf:"));
+    assert!(!sandbox.config_dir().exists());
+
+    let installed = sandbox.run(&[
+        "--install",
+        "--prefix",
+        prefix_arg,
+        "--no-service",
+        "--conf",
+        conf_arg,
+    ]);
+    assert_eq!(installed.status.code(), Some(0), "{}", stderr(&installed));
+    let copied = sandbox.config_dir().join("svcd.conf");
+    assert_eq!(fs::read_to_string(&copied).expect("copied conf"), text);
+
+    let lan: serde_json::Value =
+        serde_json::from_slice(&fs::read(sandbox.config_dir().join("lan.json")).expect("lan.json"))
+            .expect("lan json");
+    assert_eq!(lan["enabled"].as_bool(), Some(true));
+    assert_eq!(lan["bind"].as_str(), Some("0.0.0.0"));
+    assert!(sandbox.config_dir().join("lan-token").is_file());
+}
+
+#[test]
+fn invalid_svcd_conf_is_rejected_without_overwriting_the_installed_one() {
+    let sandbox = Sandbox::new();
+    let prefix = sandbox.root.join("prefix");
+    let prefix_arg = prefix.to_str().expect("utf8");
+    let conf = sandbox.root.join("svcd.conf");
+    let conf_arg = conf.to_str().expect("utf8");
+    let good = "http_port = 0\n";
+    fs::write(&conf, good).expect("write good conf");
+
+    let installed = sandbox.run(&[
+        "--install",
+        "--prefix",
+        prefix_arg,
+        "--no-service",
+        "--conf",
+        conf_arg,
+    ]);
+    assert_eq!(installed.status.code(), Some(0), "{}", stderr(&installed));
+
+    fs::write(&conf, "unknown_key = 1\n").expect("write bad conf");
+    let bad = sandbox.run(&[
+        "--install",
+        "--prefix",
+        prefix_arg,
+        "--no-service",
+        "--conf",
+        conf_arg,
+    ]);
+    assert_eq!(bad.status.code(), Some(1), "{}", stderr(&bad));
+    assert!(stderr(&bad).contains("unknown key"), "{}", stderr(&bad));
+    assert_eq!(
+        fs::read_to_string(sandbox.config_dir().join("svcd.conf")).expect("installed conf"),
+        good,
+        "a rejected config must not replace the installed one"
+    );
 }
 
 #[test]

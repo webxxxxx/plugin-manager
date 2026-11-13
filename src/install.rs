@@ -699,6 +699,7 @@ pub fn uninstall_service(args: &[String]) -> i32 {
 #[derive(Default)]
 struct SelfRequest {
     prefix: Option<PathBuf>,
+    conf: Option<PathBuf>,
     no_service: bool,
     purge: bool,
     dry_run: bool,
@@ -720,6 +721,14 @@ fn parse_self(args: &[String], uninstall: bool) -> Result<SelfRequest, String> {
                 let value = args.get(index).ok_or("--prefix requires a value")?;
                 request.prefix = Some(PathBuf::from(value));
             }
+            "--conf" if uninstall => return Err("--conf only applies to --install".into()),
+            "--conf" => {
+                index += 1;
+                let value = args.get(index).ok_or("--conf requires a value")?;
+                if request.conf.replace(PathBuf::from(value)).is_some() {
+                    return Err("--conf specified more than once".into());
+                }
+            }
             "--target" => {
                 index += 1;
                 let value = args.get(index).ok_or("--target requires a value")?;
@@ -731,6 +740,16 @@ fn parse_self(args: &[String], uninstall: bool) -> Result<SelfRequest, String> {
                         return Err("--prefix requires a value".into());
                     }
                     request.prefix = Some(PathBuf::from(value));
+                } else if let Some(value) = other.strip_prefix("--conf=") {
+                    if uninstall {
+                        return Err("--conf only applies to --install".into());
+                    }
+                    if value.is_empty() {
+                        return Err("--conf requires a value".into());
+                    }
+                    if request.conf.replace(PathBuf::from(value)).is_some() {
+                        return Err("--conf specified more than once".into());
+                    }
                 } else if let Some(value) = other.strip_prefix("--target=") {
                     request.target = Some(Target::parse(value).ok_or("unknown target")?);
                 } else {
@@ -752,6 +771,26 @@ pub fn self_install(args: &[String]) -> i32 {
             return EXIT_USAGE;
         }
     };
+    let prepared = match &request.conf {
+        Some(path) => {
+            let text = match fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(error) => {
+                    eprintln!("svcd: cannot read {}: {}", path.display(), error);
+                    return EXIT_ERROR;
+                }
+            };
+            let settings = match crate::settings::parse(&text, &paths::config_dir()) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    eprintln!("svcd: {}: {}", path.display(), error);
+                    return EXIT_ERROR;
+                }
+            };
+            Some((text, settings))
+        }
+        None => None,
+    };
     let prefix = request
         .prefix
         .clone()
@@ -765,6 +804,20 @@ pub fn self_install(args: &[String]) -> i32 {
         println!("  config:  {}", paths::config_dir().display());
         println!("  data:    {}", paths::data_dir().display());
         println!("  logs:    {}", paths::logs_dir().display());
+        if let Some((_, settings)) = &prepared {
+            println!(
+                "  conf:    {} -> {}",
+                request
+                    .conf
+                    .as_ref()
+                    .expect("prepared config has a source")
+                    .display(),
+                paths::config_dir().join("svcd.conf").display()
+            );
+            if settings.lan_default {
+                println!("  lan:     enabled (0.0.0.0)");
+            }
+        }
         if !request.no_service {
             println!("  service: program {}", target.display());
         }
@@ -783,6 +836,22 @@ pub fn self_install(args: &[String]) -> i32 {
         if let Err(error) = fs::create_dir_all(&dir) {
             eprintln!("svcd: cannot create {}: {}", dir.display(), error);
             return EXIT_ERROR;
+        }
+    }
+
+    if let Some((text, settings)) = &prepared {
+        let path = paths::config_dir().join("svcd.conf");
+        if let Err(error) = write_file(&path, text, 0o644) {
+            eprintln!("svcd: cannot write {}: {}", path.display(), error);
+            return EXIT_ERROR;
+        }
+        if settings.lan_default {
+            let mut lan = crate::lan::Lan::load(&paths::config_dir());
+            let _ = lan.enable("0.0.0.0".parse().expect("bind"));
+            if let Err(error) = lan.save(&paths::config_dir()) {
+                eprintln!("svcd: cannot enable LAN: {}", error);
+                return EXIT_ERROR;
+            }
         }
     }
 
@@ -968,7 +1037,7 @@ fn usage_self(uninstall: bool) {
         eprintln!("usage: svcd --uninstall [--prefix <dir>] [--no-service] [--purge] [--dry-run]");
     } else {
         eprintln!(
-            "usage: svcd --install [--prefix <dir>] [--no-service] [--target <init>] [--dry-run]"
+            "usage: svcd --install [--prefix <dir>] [--conf <file>] [--no-service] [--target <init>] [--dry-run]"
         );
     }
 }
