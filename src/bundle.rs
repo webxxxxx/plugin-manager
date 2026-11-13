@@ -426,6 +426,18 @@ fn collect(root: &Path) -> Result<Vec<SourceFile>, String> {
     Ok(sources)
 }
 
+/// Whether `st_blocks` proves that a file is sparse.
+///
+/// Only blocks the filesystem did allocate count as evidence: a zero block
+/// count does not mean "sparse". WSL1's DrvFs keeps small files inside the
+/// inode and network filesystems (9p) do not always report allocations, so a
+/// plain file would look like an all-hole one. The per-file size cap in `walk`
+/// already bounds what a hole can cost.
+#[cfg(unix)]
+fn is_sparse(len: u64, allocated_blocks: u64) -> bool {
+    allocated_blocks > 0 && allocated_blocks.saturating_mul(512) < len
+}
+
 fn walk(root: &Path, directory: &Path, out: &mut Vec<SourceFile>) -> Result<(), String> {
     let mut entries: Vec<fs::DirEntry> = fs::read_dir(directory)
         .map_err(|error| format!("read {}: {}", directory.display(), error))?
@@ -454,6 +466,16 @@ fn walk(root: &Path, directory: &Path, out: &mut Vec<SourceFile>) -> Result<(), 
         if matches!(relative.as_str(), "manifest.json" | "signature.json") {
             continue;
         }
+        // Read at most a package's worth per file. This also rejects sparse
+        // files that declare a huge logical size but hold almost no data,
+        // before `fs::read` would try to materialize them.
+        if metadata.len() > package::MAX_PACKAGE_BYTES {
+            return Err(format!(
+                "file exceeds {} MiB: {}",
+                package::MAX_PACKAGE_BYTES / (1024 * 1024),
+                relative
+            ));
+        }
         #[cfg(windows)]
         {
             let file =
@@ -472,7 +494,7 @@ fn walk(root: &Path, directory: &Path, out: &mut Vec<SourceFile>) -> Result<(), 
             if metadata.nlink() > 1 {
                 return Err(format!("hard links are not allowed: {}", relative));
             }
-            if metadata.len() > 0 && metadata.blocks().saturating_mul(512) < metadata.len() {
+            if is_sparse(metadata.len(), metadata.blocks()) {
                 return Err(format!("sparse files are not allowed: {}", relative));
             }
         }
@@ -1210,15 +1232,33 @@ mod tests {
         assert!(error.contains("setuid"), "{error}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn zero_allocated_blocks_do_not_prove_sparseness() {
+        // WSL1 DrvFs reports no allocated blocks for small files that do hold
+        // data, so an empty block count must not reject them.
+        assert!(!is_sparse(71, 0));
+        assert!(!is_sparse(1 << 20, 0));
+        assert!(is_sparse(1 << 20, 8));
+        assert!(!is_sparse(4096, 8));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn rejects_sparse_files() {
+        use std::io::{Seek, SeekFrom, Write};
+
         let source = TempDir::new();
         let work = TempDir::new();
         let path = source.path().join("payload/bin/tool");
         fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-        let file = fs::File::create(&path).expect("create");
+        let mut file = fs::File::create(&path).expect("create");
         file.set_len(1 << 20).expect("sparse");
+        // Allocate the tail: a file with no allocated blocks at all is also
+        // what WSL1 DrvFs reports for small files, so only a partly allocated
+        // file proves sparseness.
+        file.seek(SeekFrom::End(-8)).expect("seek");
+        file.write_all(b"payload\n").expect("write");
         drop(file);
         #[cfg(unix)]
         {
@@ -1230,6 +1270,22 @@ mod tests {
         options.id = Some("sparse".into());
         let error = bundle(&options).expect_err("sparse");
         assert!(error.contains("sparse files are not allowed"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_file_over_the_package_size_limit() {
+        let source = TempDir::new();
+        let work = TempDir::new();
+        let path = source.path().join("payload/bin/tool");
+        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        let file = fs::File::create(&path).expect("create");
+        file.set_len(package::MAX_PACKAGE_BYTES + 1).expect("huge");
+        drop(file);
+        let key_path = key_file(&work, 31);
+        let mut options = bundle_options(source.path(), &work.path().join("a.spk"), &key_path);
+        options.id = Some("huge".into());
+        let error = bundle(&options).expect_err("huge file");
+        assert!(error.contains("file exceeds"), "{error}");
     }
 
     fn script_service() -> (&'static str, Vec<u8>) {
