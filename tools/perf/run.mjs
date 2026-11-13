@@ -11,7 +11,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, copyFileSync, openSync, closeSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, copyFileSync, openSync, closeSync, chmodSync } from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
@@ -30,7 +30,16 @@ const SVCD = path.join(ROOT, 'target', 'release', 'svcd' + EXE);
 const KEY = path.join(ROOT, 'samples', 'keys', 'sample-2026.key');
 const PUB = path.join(ROOT, 'samples', 'keys', 'sample-2026.pub');
 const KEY_ID = 'sample-2026';
+const WORK_ROOT = process.env.PERF_WORK_ROOT ? path.resolve(process.env.PERF_WORK_ROOT) : path.join(ROOT, 'target');
 const KEEP_ALIVE_AGENT = new http.Agent({ keepAlive: true, maxSockets: 128 });
+const CLK_TCK = (function () {
+  if (WIN) return 100;
+  try {
+    return Number(execFileSync('getconf', ['CLK_TCK'], { encoding: 'utf8' }).trim()) || 100;
+  } catch (_) {
+    return 100;
+  }
+})();
 
 function log(message) {
   console.log('[perf] ' + message);
@@ -49,6 +58,7 @@ function runSync(file, args, env, cwd) {
 function ensureAlias(name) {
   const target = path.join(path.dirname(SVCD), name + EXE);
   copyFileSync(SVCD, target);
+  if (!WIN) chmodSync(target, 0o755);
   return target;
 }
 
@@ -376,8 +386,37 @@ function stats(samples) {
   };
 }
 
+function procStat(pid) {
+  const text = readFileSync('/proc/' + pid + '/stat', 'utf8');
+  const close = text.lastIndexOf(')');
+  const fields = text.slice(close + 2).trim().split(/\s+/);
+  return {
+    ppid: Number(fields[1]),
+    cpu: (Number(fields[11]) + Number(fields[12])) / CLK_TCK,
+  };
+}
+
+function procRss(pid) {
+  const status = readFileSync('/proc/' + pid + '/status', 'utf8');
+  const match = status.match(/^VmRSS:\s+(\d+) kB/m);
+  return match ? Number(match[1]) * 1024 : 0;
+}
+
 function processInfo(pid) {
   if (!pid) return null;
+  if (!WIN) {
+    try {
+      const stat = procStat(pid);
+      return {
+        Id: pid,
+        CPU: stat.cpu,
+        WorkingSet64: procRss(pid),
+        PrivateMemorySize64: procRss(pid),
+      };
+    } catch (_) {
+      return null;
+    }
+  }
   try {
     const script = 'Get-Process -Id ' + pid + ' | Select-Object Id,CPU,WorkingSet64,PrivateMemorySize64 | ConvertTo-Json -Compress';
     const output = execFileSync('powershell', ['-NoProfile', '-Command', script], { encoding: 'utf8', windowsHide: true });
@@ -808,11 +847,45 @@ function sleep(ms) {
   return new Promise(function (resolve) { setTimeout(resolve, ms); });
 }
 
-// Sum WorkingSet/CPU over the daemon process tree (plugin wrappers, Python
-// children and their conhost helpers included). Windows-only; returns null
-// elsewhere.
+// Sum RSS/CPU over the daemon process tree. Windows uses PowerShell; Linux
+// reads /proc (daemon + plugin wrappers/children).
 function processTree(pid) {
-  if (!pid || !WIN) return null;
+  if (!pid) return null;
+  if (!WIN) {
+    try {
+      const entries = readdirSync('/proc').filter(function (name) { return /^\d+$/.test(name); });
+      const table = new Map();
+      for (const entry of entries) {
+        const processId = Number(entry);
+        try {
+          const stat = procStat(processId);
+          table.set(processId, { ppid: stat.ppid, rss: procRss(processId), cpu: stat.cpu });
+        } catch (_) {}
+      }
+      const seen = new Set([pid]);
+      const queue = [pid];
+      while (queue.length > 0) {
+        const parent = queue.shift();
+        for (const [processId, info] of table) {
+          if (info.ppid === parent && !seen.has(processId)) {
+            seen.add(processId);
+            queue.push(processId);
+          }
+        }
+      }
+      let working = 0;
+      let cpu = 0;
+      for (const processId of seen) {
+        const info = table.get(processId);
+        if (!info) continue;
+        working += info.rss;
+        cpu += info.cpu;
+      }
+      return { count: seen.size, working_set: working, private: working, cpu: cpu };
+    } catch (_) {
+      return null;
+    }
+  }
   const lines = [
     '$ErrorActionPreference = "SilentlyContinue"',
     '$root = ' + pid,
@@ -887,7 +960,7 @@ async function measureScale() {
   const results = [];
   const pluginCli = ensureAlias('plugin');
   for (const count of counts) {
-    const root = path.join(ROOT, 'target', 'scale-run-' + Date.now() + '-' + count);
+    const root = path.join(WORK_ROOT, 'scale-run-' + Date.now() + '-' + count);
     mkdirSync(root, { recursive: true });
     log('scale: starting ' + count + ' plugin(s) in ' + root);
     const daemon = await startDaemon(root);
@@ -966,7 +1039,7 @@ function renderScaleReport(results) {
   lines.push('');
   lines.push('## Notes');
   lines.push('');
-  lines.push('- Daemon RSS/CPU comes from Get-Process by daemon pid; plugin values are the process tree minus the daemon.');
+  lines.push('- Daemon RSS/CPU is sampled by pid (Get-Process on Windows, /proc on Linux); plugin values are the process tree minus the daemon.');
   lines.push('- CPU is the process-tree CPU seconds delta over 5s, normalized to one core.');
   lines.push('- The minimal script has no business logic and is idle; values show daemon overhead and per-plugin process cost, not production capacity.');
   lines.push('');
@@ -1152,7 +1225,7 @@ async function main() {
     log('scale report ' + scaleReport);
     return;
   }
-  const root = path.join(ROOT, 'target', 'perf-run-' + Date.now());
+  const root = path.join(WORK_ROOT, 'perf-run-' + Date.now());
   mkdirSync(root, { recursive: true });
   log('workdir ' + root);
   const daemonStart = performance.now();

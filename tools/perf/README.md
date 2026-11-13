@@ -50,11 +50,14 @@ start so `/mcp` works without root; LAN stays disabled.
 
 ## Notes
 
-- On Windows, CPU/RSS sampling uses PowerShell `Get-Process`; on other platforms
-  the resource block is reported as unavailable.
+- On Windows, CPU/RSS sampling uses PowerShell `Get-Process`; on Linux it reads
+  `/proc` (including the plugin process tree).
 - The Python fixture adds interpreter and JSON overhead to MCP/WS/SSE calls.
 - `--scale` uses a minimal cmd/sh script plugin so daemon overhead is separated
   from interpreter overhead.
+- In WSL, put the runtime work root on the Linux filesystem, not `/mnt/*`:
+  `PERF_WORK_ROOT=/tmp/svcd-perf node tools/perf/run.mjs --scale`.
+  Unix control sockets are not supported on the Windows filesystem mount.
 - Compatibility HTTP checks use one-shot connections; performance workers use
   HTTP/1.1 keep-alive, so their numbers include connection reuse.
 - Numbers are machine-specific and intended for relative comparison and
