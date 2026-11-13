@@ -197,6 +197,12 @@ impl Registry {
         self.services.values()
     }
 
+    /// The services svcd supervises. The built-in `svc` is svcd itself, so it is
+    /// not part of the list projection.
+    pub fn managed_values(&self) -> impl Iterator<Item = &Service> {
+        self.values().filter(|service| service.id != RESERVED_ID)
+    }
+
     /// One cycle path (without the repeated head), used to reject definitions at
     /// load and to name the path in the diagnostic.
     pub fn find_cycle(&self) -> Option<Vec<String>> {

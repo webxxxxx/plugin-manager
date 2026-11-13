@@ -216,7 +216,7 @@ fn list() -> i32 {
     for issue in &loaded.issues {
         eprintln!("svc: warning: {}", issue);
     }
-    let statuses: Vec<Status> = loaded.registry.values().map(Status::of).collect();
+    let statuses: Vec<Status> = loaded.registry.managed_values().map(Status::of).collect();
     println!("{}", status::table(&statuses));
     EXIT_OK
 }

@@ -475,7 +475,7 @@ impl Daemon {
 
     fn statuses(&self) -> Vec<Status> {
         self.registry
-            .values()
+            .managed_values()
             .map(|service| self.status_for(service))
             .collect()
     }

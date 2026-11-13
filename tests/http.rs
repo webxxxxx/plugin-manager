@@ -1081,7 +1081,7 @@ fn services_version_start_and_stop() {
         .iter()
         .filter_map(|service| service["id"].as_str())
         .collect();
-    assert!(ids.contains(&"svc"), "{ids:?}");
+    assert!(!ids.contains(&"svc"), "{ids:?}");
     assert!(ids.contains(&"demo"), "{ids:?}\n{}", sandbox.daemon_log());
 
     let status = request(&address, "GET", "/api/v1/services/demo", "", b"");
