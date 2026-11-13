@@ -26,7 +26,7 @@ pub fn current() -> Result<&'static Settings, String> {
         .map_err(Clone::clone)
 }
 
-pub fn load(config_dir: &Path) -> Result<Settings, String> {
+fn load(config_dir: &Path) -> Result<Settings, String> {
     let path = config_dir.join("svcd.conf");
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
@@ -145,5 +145,16 @@ mod tests {
         ] {
             assert!(parse(text, Path::new("/etc/svcd")).is_err(), "{text:?}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_absolute_paths_are_not_joined_again() {
+        let settings =
+            parse("plugins_dir = C:\\svcd\\plugins\n", Path::new("C:\\config")).expect("parse");
+        assert_eq!(
+            settings.plugins_dir,
+            Some(PathBuf::from(r"C:\svcd\plugins"))
+        );
     }
 }

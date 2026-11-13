@@ -62,15 +62,17 @@ enum Command {
     },
 }
 
+fn resolve_port(env: Option<&str>, configured: Option<u16>) -> u16 {
+    env.and_then(|value| value.parse::<u16>().ok())
+        .or(configured)
+        .unwrap_or(DEFAULT_PORT)
+}
+
 pub fn spawn(config: PathBuf) -> std::io::Result<Arc<Api>> {
     let configured = settings::current()
         .ok()
         .and_then(|settings| settings.http_port);
-    let port = std::env::var("SVCD_HTTP_PORT")
-        .ok()
-        .and_then(|value| value.parse::<u16>().ok())
-        .or(configured)
-        .unwrap_or(DEFAULT_PORT);
+    let port = resolve_port(std::env::var("SVCD_HTTP_PORT").ok().as_deref(), configured);
     let state = Lan::load(&config);
     let bind = if state.enabled {
         state.bind
@@ -1376,4 +1378,17 @@ fn decode(value: &str) -> String {
         index += 1;
     }
     String::from_utf8_lossy(&out).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_precedence_is_env_then_config_then_default() {
+        assert_eq!(resolve_port(Some("1234"), Some(5678)), 1234);
+        assert_eq!(resolve_port(Some("not-a-port"), Some(5678)), 5678);
+        assert_eq!(resolve_port(None, Some(5678)), 5678);
+        assert_eq!(resolve_port(None, None), DEFAULT_PORT);
+    }
 }

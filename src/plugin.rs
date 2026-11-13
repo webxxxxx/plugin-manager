@@ -158,29 +158,52 @@ fn install_replace(
             Ok(service)
         }
         Err(error) => {
-            let _ = fs::remove_dir_all(plugin_dir.join(&package.manifest.version));
-            if !enabled_existed {
-                let _ = fs::remove_file(plugin_dir.join("enabled"));
+            let mut rollback = Vec::new();
+            let new_version = plugin_dir.join(&package.manifest.version);
+            if let Err(remove) = fs::remove_dir_all(&new_version) {
+                if remove.kind() != std::io::ErrorKind::NotFound {
+                    rollback.push(format!("remove {}: {}", new_version.display(), remove));
+                }
             }
-            snapshot.restore(plugin_dir);
+            if !enabled_existed {
+                let marker = plugin_dir.join("enabled");
+                if let Err(remove) = fs::remove_file(&marker) {
+                    if remove.kind() != std::io::ErrorKind::NotFound {
+                        rollback.push(format!("remove {}: {}", marker.display(), remove));
+                    }
+                }
+            }
+            rollback.extend(snapshot.restore(plugin_dir));
             if let (Some(backup), Some(old_dir), Some(old_version)) =
                 (&backup, &old_dir, &old_version)
             {
-                if let Err(restore) = fs::rename(backup, old_dir) {
-                    return Err(format!(
-                        "{} (rollback failed: cannot restore {}: {})",
-                        error,
-                        old_dir.display(),
-                        restore
-                    ));
-                }
-                if let Err(restore) = write_current(plugin_dir, old_version) {
-                    return Err(format!("{} (rollback failed: {})", error, restore));
+                match fs::rename(backup, old_dir) {
+                    Ok(()) => {
+                        if let Err(restore) = write_current(plugin_dir, old_version) {
+                            rollback.push(restore);
+                        }
+                    }
+                    Err(restore) => {
+                        rollback.push(format!("restore {}: {}", old_dir.display(), restore));
+                    }
                 }
             } else if backup.is_none() {
-                let _ = fs::remove_file(plugin_dir.join("current"));
+                let current = plugin_dir.join("current");
+                if let Err(remove) = fs::remove_file(&current) {
+                    if remove.kind() != std::io::ErrorKind::NotFound {
+                        rollback.push(format!("remove {}: {}", current.display(), remove));
+                    }
+                }
             }
-            Err(error)
+            if rollback.is_empty() {
+                Err(error)
+            } else {
+                Err(format!(
+                    "{} (rollback incomplete: {})",
+                    error,
+                    rollback.join("; ")
+                ))
+            }
         }
     }
 }
@@ -304,28 +327,36 @@ impl ConfigSnapshot {
         }
     }
 
-    fn restore(&self, plugin_dir: &Path) {
-        restore_file(&plugin_dir.join("config"), &self.config, true);
-        restore_file(
-            &plugin_dir.join("config.template.sha256"),
-            &self.template_hash,
-            false,
-        );
-        restore_file(&plugin_dir.join("config.new"), &self.config_new, false);
+    fn restore(&self, plugin_dir: &Path) -> Vec<String> {
+        let mut errors = Vec::new();
+        for (path, content, config) in [
+            (plugin_dir.join("config"), &self.config, true),
+            (
+                plugin_dir.join("config.template.sha256"),
+                &self.template_hash,
+                false,
+            ),
+            (plugin_dir.join("config.new"), &self.config_new, false),
+        ] {
+            if let Err(error) = restore_file(&path, content, config) {
+                errors.push(error);
+            }
+        }
+        errors
     }
 }
 
-fn restore_file(path: &Path, content: &Option<Vec<u8>>, config: bool) {
+fn restore_file(path: &Path, content: &Option<Vec<u8>>, config: bool) -> Result<(), String> {
     match content {
-        Some(bytes) if config => {
-            let _ = write_config(path, bytes);
-        }
+        Some(bytes) if config => write_config(path, bytes),
         Some(bytes) => {
-            let _ = fs::write(path, bytes);
+            fs::write(path, bytes).map_err(|error| format!("write {}: {}", path.display(), error))
         }
-        None => {
-            let _ = fs::remove_file(path);
-        }
+        None => match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("remove {}: {}", path.display(), error)),
+        },
     }
 }
 

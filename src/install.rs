@@ -847,10 +847,17 @@ pub fn self_install(args: &[String]) -> i32 {
         }
         if settings.lan_default {
             let mut lan = crate::lan::Lan::load(&paths::config_dir());
-            let _ = lan.enable("0.0.0.0".parse().expect("bind"));
+            let token = lan.enable("0.0.0.0".parse().expect("bind"));
             if let Err(error) = lan.save(&paths::config_dir()) {
                 eprintln!("svcd: cannot enable LAN: {}", error);
                 return EXIT_ERROR;
+            }
+            if let Some(token) = token {
+                println!("LAN token: {}", token);
+                println!(
+                    "LAN token file: {}",
+                    paths::config_dir().join("lan-token").display()
+                );
             }
         }
     }

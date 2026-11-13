@@ -28,6 +28,10 @@ _Avoid_: svcd CLI、管理客户端
 只管理插件的 CLI；动词与 `svc` 同源，但作用域限定在 `kind=plugin`，另加 `install / uninstall / editconfig / export / import`。
 _Avoid_: 插件管理器、PluginManager（那是已退役的进程）
 
+**svcd.conf**:
+`<config>` 下的运行时配置文件，由 `svcd --install --conf <file>` 写入；承载 HTTP 端口、LAN 默认开关、plugin 安装位置与 core 服务扫描位置。
+_Avoid_: settings.json、通用“配置文件”
+
 **mcp**:
 multicall 二进制的 MCP 桥入口名；把 MCP 客户端接到常驻 svcd。
 _Avoid_: MCP server、stdio server

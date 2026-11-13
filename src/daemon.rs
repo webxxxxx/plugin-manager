@@ -43,11 +43,7 @@ pub fn run() -> i32 {
         return 1;
     }
     if let Err(error) = settings::current() {
-        eprintln!(
-            "svcd: invalid config {}: {}",
-            config.join("svcd.conf").display(),
-            error
-        );
+        eprintln!("svcd: invalid config: {}", error);
         return 1;
     }
 

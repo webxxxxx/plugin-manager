@@ -383,6 +383,11 @@ fn self_install_copies_svcd_conf_and_can_enable_lan() {
         conf_arg,
     ]);
     assert_eq!(installed.status.code(), Some(0), "{}", stderr(&installed));
+    assert!(
+        stdout(&installed).contains("LAN token:"),
+        "first LAN enable must print the token once: {}",
+        stdout(&installed)
+    );
     let copied = sandbox.config_dir().join("svcd.conf");
     assert_eq!(fs::read_to_string(&copied).expect("copied conf"), text);
 
