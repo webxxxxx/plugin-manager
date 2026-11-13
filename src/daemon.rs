@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -32,7 +32,7 @@ use crate::status::Status;
 use crate::supervisor::{self, Event};
 use crate::wake::Wake;
 
-pub fn run() -> i32 {
+pub fn run(conf: Option<PathBuf>) -> i32 {
     let config = paths::config_dir();
     if let Err(error) = fs::create_dir_all(&config) {
         eprintln!(
@@ -42,15 +42,23 @@ pub fn run() -> i32 {
         );
         return 1;
     }
-    if let Err(error) = settings::current() {
-        eprintln!("svcd: invalid config: {}", error);
-        return 1;
-    }
 
     if let Err(error) = log::init_svcd(&paths::logs_dir()) {
         eprintln!("svcd: cannot open log directory: {}", error);
     }
     log::svcd("svcd starting");
+    let config_path = match crate::install::ensure_conf(conf.as_deref()) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("svcd: {}", error);
+            return 1;
+        }
+    };
+    if let Err(error) = settings::init_from_path(&config_path) {
+        eprintln!("svcd: invalid config: {}", error);
+        return 1;
+    }
+    log::svcd(&format!("svcd: config: {}", config_path.display()));
     if let Err(error) = crate::proc::init() {
         log::svcd(&format!(
             "svcd: parent-death protection unavailable: {}",

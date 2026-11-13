@@ -1,0 +1,27 @@
+# svcd runtime configuration example.
+#
+# Copy this file to the svcd program directory as `svcd.conf`, or pass it to
+# `svcd --install --conf <file>` / `svcd run --foreground --conf <file>`.
+# The service startup order is:
+#   1. the path passed at install/startup (`--conf`)
+#   2. `<program dir>/svcd.conf`
+#   3. `<config dir>/svcd.conf` (legacy)
+#   4. a generated default with platform paths
+#
+# Lines are `key = value`; lines starting with `#` are comments.
+# Relative `plugins_dir` / `services_dir` values resolve against the directory
+# containing this file.
+
+http_port = 8787
+lan_default = false
+
+# Absolute paths (the generated default uses the platform locations):
+# Linux:
+# plugins_dir = /var/lib/svcd/plugins
+# services_dir = /etc/svcd/services.d
+# macOS:
+# plugins_dir = /Library/Application Support/svcd/plugins
+# services_dir = /Library/Application Support/svcd/config/services.d
+# Windows:
+# plugins_dir = C:\ProgramData\svcd\plugins
+# services_dir = C:\ProgramData\svcd\config\services.d

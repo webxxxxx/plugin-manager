@@ -446,6 +446,25 @@ fn invalid_svcd_conf_is_rejected_without_overwriting_the_installed_one() {
 }
 
 #[test]
+fn install_service_plan_passes_conf() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&[
+        "install-service",
+        "--dry-run",
+        "--target",
+        "systemd",
+        "--conf",
+        "/tmp/custom-svcd.conf",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("--conf \"/tmp/custom-svcd.conf\""),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
 fn install_service_accepts_a_program_override() {
     let sandbox = Sandbox::new();
     let output = sandbox.run(&[

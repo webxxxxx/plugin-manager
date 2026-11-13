@@ -47,6 +47,7 @@
 - 安装需 root / Administrator；幂等（原子替换 + EnsureLine；`sc create` 1073 视为已存在）。
 - `svcd --install [--prefix] [--conf <file>] [--no-service] [--target]`：复制/硬链 `svcd`、`svc`、`plugin`、`mcp` 到平台默认目录（Unix `/usr/sbin`，Windows `%ProgramFiles%\svcd`），再调用 `install-service --program <安装路径>`；`--uninstall` 逆操作，默认保留 config/data/logs，`--purge` 才清。
 - `svcd --install --conf <file>`：校验并原子复制到 `<config>/svcd.conf`。键：`http_port`（0 允许临时端口；`SVCD_HTTP_PORT` 仍覆盖）、`lan_default`（true 时写 `<config>/lan.json` 并生成/复用 token）、`plugins_dir`、`services_dir`。相对路径相对 `<config>`；未知键/坏值拒绝且不覆盖已安装配置；`--uninstall` 默认保留，`--purge` 删除。
+- 服务启动配置优先级：`--conf`（`--install --conf` 记录到服务命令行）→ 程序目录 `svcd.conf` → `<config>/svcd.conf`（legacy）→ 生成默认（程序目录；不可写时用 `<config>/svcd.conf`）。默认含 `http_port = 8787`、`lan_default = false` 与平台 plugin/services 路径；模板见根目录 `svcd.conf.example`。
 - 卸载默认保留 `<data>` 与配置，`--purge` 才删。
 
 ### 1.6 core 服务与 plugin 的边界

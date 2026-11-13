@@ -55,7 +55,7 @@ fn main() {
 
 fn svcd_run(args: Vec<String>) -> i32 {
     match args.first().map(String::as_str) {
-        Some("run") if args.len() == 2 && args[1] == "--foreground" => run_foreground(),
+        Some("run") => run_command(&args[1..]),
         Some("shutdown") if args.len() == 1 => daemon::shutdown(),
         Some("--install") | Some("install") => install::self_install(&args[1..]),
         Some("--uninstall") | Some("uninstall") => install::self_uninstall(&args[1..]),
@@ -68,24 +68,65 @@ fn svcd_run(args: Vec<String>) -> i32 {
     }
 }
 
+fn run_command(args: &[String]) -> i32 {
+    let mut foreground = false;
+    let mut conf = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--foreground" => foreground = true,
+            "--conf" => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) if !value.is_empty() => {
+                        conf = Some(std::path::PathBuf::from(value))
+                    }
+                    _ => {
+                        usage();
+                        return 64;
+                    }
+                }
+            }
+            other => {
+                if let Some(value) = other.strip_prefix("--conf=") {
+                    if value.is_empty() {
+                        usage();
+                        return 64;
+                    }
+                    conf = Some(std::path::PathBuf::from(value));
+                } else {
+                    usage();
+                    return 64;
+                }
+            }
+        }
+        index += 1;
+    }
+    if !foreground {
+        usage();
+        return 64;
+    }
+    run_foreground(conf)
+}
+
 /// `svcd run --foreground` serves both a console and the Windows SCM: the SCM
 /// owns the process via its dispatcher, and every other caller falls through to
 /// the plain daemon loop.
-fn run_foreground() -> i32 {
+fn run_foreground(conf: Option<std::path::PathBuf>) -> i32 {
     #[cfg(windows)]
-    if let Some(code) = service_win::run_if_service() {
+    if let Some(code) = service_win::run_if_service(conf.clone()) {
         return code;
     }
-    daemon::run()
+    daemon::run(conf)
 }
 
 fn usage() {
-    eprintln!("usage: svcd run --foreground");
+    eprintln!("usage: svcd run --foreground [--conf <file>]");
     eprintln!("       svcd shutdown");
     eprintln!("       svcd --install [--prefix <dir>] [--conf <file>] [--no-service] [--dry-run]");
     eprintln!("       svcd --uninstall [--prefix <dir>] [--no-service] [--purge] [--dry-run]");
     eprintln!(
-        "       svcd install-service [--target systemd|launchd|scm|busybox|procd] [--dry-run]"
+        "       svcd install-service [--target systemd|launchd|scm|busybox|procd] [--conf <file>] [--dry-run]"
     );
     eprintln!(
         "       svcd uninstall-service [--target systemd|launchd|scm|busybox|procd] [--purge] [--dry-run]"

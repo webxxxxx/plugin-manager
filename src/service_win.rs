@@ -17,8 +17,10 @@
 use std::ffi::c_void;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, Ordering};
+use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -60,13 +62,16 @@ fn service_name() -> String {
     std::env::var("SVCD_TEST_SCM_NAME").unwrap_or_else(|_| SCM_NAME.to_string())
 }
 
+static SERVICE_CONF: OnceLock<Option<PathBuf>> = OnceLock::new();
+
 /// Attach to the SCM and run the daemon there.
 ///
 /// `None` means the process was not started by the SCM (for example
 /// `svcd run --foreground` from a console) and the caller should run the
 /// daemon directly. `Some(code)` is the service exit code after the SCM has
 /// stopped the service.
-pub fn run_if_service() -> Option<i32> {
+pub fn run_if_service(conf: Option<PathBuf>) -> Option<i32> {
+    let _ = SERVICE_CONF.set(conf);
     let mut name = wide(&service_name());
     let table = [
         SERVICE_TABLE_ENTRYW {
@@ -107,7 +112,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
 
     let daemon = thread::Builder::new()
         .name("svcd-daemon".into())
-        .spawn(crate::daemon::run);
+        .spawn(move || crate::daemon::run(SERVICE_CONF.get().cloned().flatten()));
     let daemon = match daemon {
         Ok(daemon) => daemon,
         Err(error) => {

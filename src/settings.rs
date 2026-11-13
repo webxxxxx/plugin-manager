@@ -1,13 +1,18 @@
-//! Runtime settings loaded from `<config>/svcd.conf`.
+//! Runtime settings loaded from the `svcd.conf` chosen by `install`.
 //!
-//! The file is a small `key = value` document written by
-//! `svcd --install --conf <file>` and read at daemon startup. Values pair with
-//! the existing environment overrides: `SVCD_HTTP_PORT` still wins for the HTTP
-//! port, while explicit paths in `svcd.conf` win over the platform defaults.
+//! The file is a small `key = value` document. The install layer resolves
+//! which file to use (explicit install path, program directory, config
+//! directory, or a generated default); this module only parses and caches it.
+//!
+//! Values pair with the existing environment overrides: `SVCD_HTTP_PORT` still
+//! wins for the HTTP port, while explicit paths in `svcd.conf` win over the
+//! platform defaults.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+static SETTINGS: OnceLock<Result<Settings, String>> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
@@ -17,25 +22,60 @@ pub struct Settings {
     pub services_dir: Option<PathBuf>,
 }
 
-/// The settings for this process. Loaded once from `<config>/svcd.conf`.
+/// The settings for this process. Loaded once from the service config (the
+/// program directory first, then `<config>/svcd.conf`) when no service config
+/// was initialized explicitly.
 pub fn current() -> Result<&'static Settings, String> {
-    static SETTINGS: OnceLock<Result<Settings, String>> = OnceLock::new();
     SETTINGS
-        .get_or_init(|| load(&crate::paths::config_dir()))
+        .get_or_init(|| {
+            let program_conf = std::env::current_exe()
+                .ok()
+                .and_then(|path| path.parent().map(|parent| parent.join("svcd.conf")));
+            if let Some(path) = program_conf {
+                if path.is_file() {
+                    return load_from(&path);
+                }
+            }
+            load(&crate::paths::config_dir())
+        })
         .as_ref()
         .map_err(Clone::clone)
 }
 
+/// Load the config file chosen by `install::ensure_conf` into the process cache.
+pub fn init_from_path(path: &Path) -> Result<(), String> {
+    if let Some(existing) = SETTINGS.get() {
+        return existing.as_ref().map(|_| ()).map_err(Clone::clone);
+    }
+    if !path.is_file() {
+        return Err(format!("config not found: {}", path.display()));
+    }
+    match load_from(path) {
+        Ok(settings) => {
+            let _ = SETTINGS.set(Ok(settings));
+            Ok(())
+        }
+        Err(error) => {
+            let _ = SETTINGS.set(Err(error.clone()));
+            Err(error)
+        }
+    }
+}
+
 fn load(config_dir: &Path) -> Result<Settings, String> {
-    let path = config_dir.join("svcd.conf");
-    let text = match fs::read_to_string(&path) {
+    load_from(&config_dir.join("svcd.conf"))
+}
+
+fn load_from(path: &Path) -> Result<Settings, String> {
+    let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(Settings::default())
         }
         Err(error) => return Err(format!("read {}: {}", path.display(), error)),
     };
-    parse(&text, config_dir).map_err(|error| format!("{}: {}", path.display(), error))
+    parse(&text, path.parent().unwrap_or(Path::new(".")))
+        .map_err(|error| format!("{}: {}", path.display(), error))
 }
 
 pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {

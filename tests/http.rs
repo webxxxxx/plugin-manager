@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -144,13 +144,34 @@ impl Sandbox {
         self.daemon = Some(command.spawn().expect("spawn daemon"));
     }
 
-    /// Like `start_daemon`, but leaves the HTTP port to `svcd.conf` instead of
-    /// forcing an ephemeral port through the environment.
+    /// Like `start_daemon`, but leaves the HTTP port to the service config
+    /// instead of forcing an ephemeral port through the environment.
     fn start_daemon_without_http_port(&mut self) {
         let stderr = fs::File::create(&self.daemon_stderr).expect("daemon stderr");
         let mut command = Command::new(&self.svcd);
         command
             .args(["run", "--foreground"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr))
+            .env("SVCD_CONFIG_DIR", &self.config)
+            .env("SVCD_DATA_DIR", &self.data)
+            .env("SVCD_LOG_DIR", &self.logs)
+            .env("SVCD_TRUST_DIR", &self.trust)
+            .env("SVCD_TEST_UNPRIVILEGED", "1");
+        self.daemon = Some(command.spawn().expect("spawn daemon"));
+    }
+
+    fn start_daemon_with_conf(&mut self, conf: &Path) {
+        let stderr = fs::File::create(&self.daemon_stderr).expect("daemon stderr");
+        let mut command = Command::new(&self.svcd);
+        command
+            .args([
+                "run",
+                "--foreground",
+                "--conf",
+                conf.to_str().expect("utf8 config path"),
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr))
@@ -1182,6 +1203,102 @@ fn plugin_upload_list_and_delete() {
     let wrong_type = request(&address, "POST", "/api/v1/plugins", "text/plain", &package);
     assert_eq!(wrong_type.status, 400);
     assert_eq!(wrong_type.body["error"]["code"], "bad_request");
+}
+
+#[test]
+fn explicit_conf_is_preferred_over_program_and_config() {
+    fn write_core(dir: &Path, id: &str) {
+        fs::create_dir_all(dir).expect("core dir");
+        let (exec, args) = if cfg!(windows) {
+            (
+                r"C:\Windows\System32\cmd.exe".to_string(),
+                json!(["/c", "exit", "0"]),
+            )
+        } else {
+            ("/bin/true".to_string(), json!([]))
+        };
+        fs::write(
+            dir.join(format!("{}.json", id)),
+            serde_json::to_vec(&json!({
+                "schema": 1,
+                "id": id,
+                "version": "1.0.0",
+                "desc": "conf precedence service",
+                "protocol": 1,
+                "exec": {"path": exec, "args": args, "ready": "exec"}
+            }))
+            .expect("core definition"),
+        )
+        .expect("write core definition");
+    }
+
+    let mut sandbox = Sandbox::new();
+    let explicit_services = sandbox.root.join("explicit-services");
+    let decoy_services = sandbox.root.join("decoy-services");
+    write_core(&explicit_services, "explicit");
+    write_core(&decoy_services, "decoy");
+
+    let explicit = sandbox.root.join("override.conf");
+    fs::write(
+        &explicit,
+        format!(
+            "http_port = 0\nplugins_dir = {}\nservices_dir = {}\n",
+            sandbox.root.join("explicit-plugins").display(),
+            explicit_services.display()
+        ),
+    )
+    .expect("write explicit conf");
+    fs::write(
+        sandbox.root.join("svcd.conf"),
+        format!(
+            "http_port = 0\nplugins_dir = {}\nservices_dir = {}\n",
+            sandbox.root.join("decoy-plugins").display(),
+            decoy_services.display()
+        ),
+    )
+    .expect("write program-dir decoy conf");
+
+    sandbox.start_daemon_with_conf(&explicit);
+    let address = sandbox.wait_for_http();
+    let services_response = request(&address, "GET", "/api/v1/services", "", b"");
+    assert_eq!(services_response.status, 200);
+    let ids: Vec<&str> = services_response.body["services"]
+        .as_array()
+        .expect("services")
+        .iter()
+        .filter_map(|service| service["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"explicit"), "{ids:?}");
+    assert!(
+        !ids.contains(&"decoy"),
+        "explicit --conf must win over the program-dir config: {ids:?}"
+    );
+}
+
+#[test]
+fn default_conf_is_created_next_to_the_program() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    sandbox.wait_for_http();
+
+    let path = sandbox.root.join("svcd.conf");
+    let text = fs::read_to_string(&path).expect("generated svcd.conf");
+    assert!(text.contains("http_port = 8787"), "{text}");
+    assert!(text.contains("lan_default = false"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "plugins_dir = {}",
+            sandbox.data.join("plugins").display()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "services_dir = {}",
+            sandbox.config.join("services.d").display()
+        )),
+        "{text}"
+    );
 }
 
 #[test]
