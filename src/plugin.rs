@@ -100,123 +100,14 @@ fn install_keep_old(
     plugin_dir: &Path,
     was_installed: bool,
 ) -> Result<Service, String> {
-    let previous = current_version(id);
-    let enabled_existed = plugin_dir.join("enabled").exists();
-    let snapshot = ConfigSnapshot::capture(plugin_dir);
-    // keep-old normally leaves the previous version alone, but a same-version
-    // reinstall overwrites the only copy. Move it aside so a failed
-    // post-install can put it back.
-    let same_version = previous.as_deref() == Some(package.manifest.version.as_str());
-    let same_backup = if same_version {
-        let backup = plugin_dir.join(format!(
-            ".same-{}.{}",
-            package.manifest.version,
-            std::process::id()
-        ));
-        if backup.exists() {
-            fs::remove_dir_all(&backup)
-                .map_err(|error| format!("remove {}: {}", backup.display(), error))?;
-        }
-        let version_dir = plugin_dir.join(&package.manifest.version);
-        fs::rename(&version_dir, &backup)
-            .map_err(|error| format!("backup {}: {}", version_dir.display(), error))?;
-        Some(backup)
-    } else {
-        None
-    };
-    let result = (|| {
-        let (version_dir, enabled) = write_version(package, plugin_dir, was_installed)?;
-        copy_config(package, plugin_dir)?;
-        let service = service_from_manifest(id, &version_dir, &package.manifest, enabled)?;
-        run_post_install(package, id, &version_dir)?;
-        Ok(service)
-    })();
-    match result {
-        Ok(service) => {
-            if let Some(backup) = same_backup {
-                if let Err(error) = fs::remove_dir_all(&backup) {
-                    log::svcd(&format!(
-                        "svcd: plugin {}: installed, but cannot remove {}: {}",
-                        id,
-                        backup.display(),
-                        error
-                    ));
-                }
-            }
-            Ok(service)
-        }
-        Err(error) => Err(rollback_keep_old(
-            package,
-            plugin_dir,
-            &previous,
-            enabled_existed,
-            &snapshot,
-            &same_backup,
-            error,
-        )),
-    }
-}
-
-/// Undo a failed keep-old install: the new version never becomes current.
-fn rollback_keep_old(
-    package: &Package,
-    plugin_dir: &Path,
-    previous: &Option<String>,
-    enabled_existed: bool,
-    snapshot: &ConfigSnapshot,
-    same_backup: &Option<PathBuf>,
-    error: String,
-) -> String {
-    let mut rollback = Vec::new();
-    let new_version = plugin_dir.join(&package.manifest.version);
-    if let Err(remove) = fs::remove_dir_all(&new_version) {
-        if remove.kind() != std::io::ErrorKind::NotFound {
-            rollback.push(format!("remove {}: {}", new_version.display(), remove));
-        }
-    }
-    if !enabled_existed {
-        let marker = plugin_dir.join("enabled");
-        if let Err(remove) = fs::remove_file(&marker) {
-            if remove.kind() != std::io::ErrorKind::NotFound {
-                rollback.push(format!("remove {}: {}", marker.display(), remove));
-            }
-        }
-    }
-    match same_backup {
-        Some(backup) => match fs::rename(backup, &new_version) {
-            Ok(()) => {
-                if let Some(version) = previous {
-                    if let Err(restore) = write_current(plugin_dir, version) {
-                        rollback.push(restore);
-                    }
-                }
-            }
-            Err(restore) => {
-                rollback.push(format!("restore {}: {}", new_version.display(), restore))
-            }
-        },
-        None => match previous {
-            Some(version) if plugin_dir.join(version).is_dir() => {
-                if let Err(restore) = write_current(plugin_dir, version) {
-                    rollback.push(restore);
-                }
-            }
-            _ => {
-                let current = plugin_dir.join("current");
-                if let Err(remove) = fs::remove_file(&current) {
-                    if remove.kind() != std::io::ErrorKind::NotFound {
-                        rollback.push(format!("remove {}: {}", current.display(), remove));
-                    }
-                }
-            }
-        },
-    }
-    rollback.extend(snapshot.restore(plugin_dir));
-    if rollback.is_empty() {
-        error
-    } else {
-        format!("{} (rollback incomplete: {})", error, rollback.join("; "))
-    }
+    // No hook-specific rollback here: keep-old keeps the previous version and
+    // switches `current`, so a failing post-install just reports the error.
+    // A replace install rolls back through its own strategy handling.
+    let (version_dir, enabled) = write_version(package, plugin_dir, was_installed)?;
+    copy_config(package, plugin_dir)?;
+    let service = service_from_manifest(id, &version_dir, &package.manifest, enabled)?;
+    run_post_install(package, id, &version_dir)?;
+    Ok(service)
 }
 
 fn run_post_install(package: &Package, id: &str, version_dir: &Path) -> Result<(), String> {

@@ -180,11 +180,11 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 
 - 只接受 `hooks/` 下的可执行文件（Unix exec 位 + shebang，安装验包时校验；Windows `.exe` / `.cmd` / `.bat`，在执行 hook 时校验）；不解析内联命令。
 - 环境清空后只给 `PATH`、`SVCD_PLUGIN_ID`、`SVCD_PLUGIN_VERSION`、`SVCD_ACTION`、`SVCD_DATA_DIR`、`SVCD_CONFIG_DIR`；Windows 额外给 `SystemRoot` / `WINDIR`（启动 `cmd.exe` 必需）；cwd = 版本目录；stdout/stderr 进 `<logs>/<id>-hooks.log`；60s 超时杀进程组。
-- post-install 失败 → 回滚 current 并报错；pre-remove 失败 → 记日志但继续卸载。
+- post-install 失败 → 报错；是否回滚由安装策略决定：replace 走既有回滚，keep-old 保留新旧两个版本（current 已切到新版本）。pre-remove 失败 → 记日志但继续卸载。
 - 嵌入式构建（`--no-default-features`）默认拒绝带 hooks 的包，`plugin install --allow-hooks` / HTTP `allow_hooks=true` 放行；桌面构建（默认 features）默认放行。
 - 桌面交互安装应先列出 hooks 再确认（`--yes` 跳过）：**尚未实现**——当前 CLI/HTTP 安装默认放行且没有交互确认步骤。
 - **hooks 权限 = 安装者权限（root）**；信任只来自签名。
-- **实现状态**：hook runner 已实现（`src/hook.rs`）：60s 超时、环境清空、Unix 进程组 / Windows 每 hook job 对象杀进程树、`<id>-hooks.log`；keep-old 与 replace 两条安装路径都会在 post-install 失败时回滚，pre-remove 失败只记日志。
+- **实现状态**：hook runner 已实现（`src/hook.rs`）：60s 超时、环境清空、Unix 进程组 / Windows 每 hook job 对象杀进程树、`<id>-hooks.log`；post-install 失败只返回错误，回滚完全由 keep-old / replace 策略处理；pre-remove 失败只记日志。
 
 ### 2.6 config（详见 §5.3）
 
@@ -512,7 +512,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 | --- | --- | --- | --- |
 | [#28](https://github.com/webxxxxx/plugin-manager/issues/28) | 注册表与 status | — | 已实现：services.d 扫描、status payload、CLI 接线 |
 | [#29](https://github.com/webxxxxx/plugin-manager/issues/29) | 前台监督 core 服务 | #28 | 已实现：proc/wait、事件循环、定时器、UDS/命名管道管理通道；stderr 继承，日志归 #35 |
-| [#30](https://github.com/webxxxxx/plugin-manager/issues/30) | 安装/运行 .spk（含 `plugin` 入口） | #28 #29 | 验签/`files[]`/解包/布局/插件扫描/`plugin` 入口已实现；hooks 已实现（60s、环境清空、post-install 回滚）；`install -` / downgrade / prune 未做 |
+| [#30](https://github.com/webxxxxx/plugin-manager/issues/30) | 安装/运行 .spk（含 `plugin` 入口） | #28 #29 | 验签/`files[]`/解包/布局/插件扫描/`plugin` 入口已实现；hooks 已实现（60s、环境清空、post-install 按策略回滚）；`install -` / downgrade / prune 未做 |
 | [#31](https://github.com/webxxxxx/plugin-manager/issues/31) | 插件 IPC 与工具面 | #30 | 已实现：NDJSON 分帧（1 MiB）、id 路由、64 在途、30s 取消、`registry.tools` / `registry.call`；崩溃摘能力并失败在途调用；128 排队未做 |
 | [#32](https://github.com/webxxxxx/plugin-manager/issues/32) | `mcp` 桥 dual-era | #31 | 已实现：modern `server/discover`/`_meta`/缓存字段；legacy `initialize`/`ping`/`list_changed` 轮询；连不上 svcd exit 1 |
 | [#33](https://github.com/webxxxxx/plugin-manager/issues/33) | Web UI 反代 | #30 #31 | 已实现：静态资源、base 注入、ETag/304、SPA fallback、`/rpc` 桥；Range/WS/SSE 不做 |

@@ -1129,7 +1129,7 @@ fn a_failing_post_install_rolls_back_a_replace() {
 }
 
 #[test]
-fn a_failing_post_install_rolls_back_a_keep_old_install() {
+fn a_failing_post_install_gets_no_hook_specific_rollback_from_keep_old() {
     let mut sandbox = Sandbox::new();
     let key = SigningKey::from_bytes(&[23u8; 32]);
     sandbox.write_key(&key);
@@ -1157,16 +1157,15 @@ fn a_failing_post_install_rolls_back_a_keep_old_install() {
     ]);
     assert_eq!(failed.status.code(), Some(1), "{}", stderr(&failed));
 
+    // keep-old keeps both versions and switches current; rollback policy is the
+    // strategy's, not the post-install hook's.
     let plugin = sandbox.data.join("plugins").join("demo");
     assert_eq!(
         fs::read_to_string(plugin.join("current")).expect("current"),
-        "1.0.0"
+        "1.1.0"
     );
     assert!(plugin.join("1.0.0").is_dir());
-    assert!(
-        !plugin.join("1.1.0").exists(),
-        "failed new version was not removed"
-    );
+    assert!(plugin.join("1.1.0").is_dir());
 }
 
 #[test]
