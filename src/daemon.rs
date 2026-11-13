@@ -210,10 +210,7 @@ impl Daemon {
     ) -> Self {
         let wake = Arc::new(Wake::new());
         let mut slots = BTreeMap::new();
-        for service in registry.values() {
-            if service.id == RESERVED_ID {
-                continue;
-            }
+        for service in registry.managed_values() {
             if let Some(exec) = service.exec.clone() {
                 let mut slot = Slot::new(
                     service.id.clone(),
@@ -475,7 +472,7 @@ impl Daemon {
 
     fn statuses(&self) -> Vec<Status> {
         self.registry
-            .values()
+            .managed_values()
             .map(|service| self.status_for(service))
             .collect()
     }

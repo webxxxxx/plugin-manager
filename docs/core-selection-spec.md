@@ -318,6 +318,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - `summary`：id、kind、state、enabled、pid、since、version。
 - `details`：dependencies[]、last_exit、next_at、ready_since、failures、config、probe（仅 `svc status` 探测 core 的 status 钩子时出现）。
 - `svc list` 列：`ID  KIND  STATE  AUTO  PID  VERSION`；AUTO 显示 `[auto]` 或 `-`。
+- `svc list` 只投影受管服务（core + plugin），不含内置 `svc` 自身（svcd 由系统服务管理器拉起，不归自己管）；`svc status svc` 仍可读。
 - `svc status <id>`：逐字段块；`--json` 原样输出 `{summary, details}`。
 - `[auto]` 只映射 `enabled`（开机启动）；崩溃重启策略放 details 的 `restart`（如 `on-failure`），不用 `[auto]`。
 - 退出码：0 成功；1 服务不存在；2 守护进程不可达；64 参数错误。

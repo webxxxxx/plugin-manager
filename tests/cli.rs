@@ -109,8 +109,13 @@ fn line_for<'a>(text: &'a str, id: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no line for {} in:\n{}", id, text))
 }
 
+fn has_row(text: &str, id: &str) -> bool {
+    text.lines()
+        .any(|line| line.split_whitespace().next() == Some(id))
+}
+
 #[test]
-fn list_includes_the_builtin_and_a_core_definition() {
+fn list_hides_the_builtin_and_shows_a_core_definition() {
     let sandbox = Sandbox::new();
     sandbox.write_definition("demo", definition("demo"));
 
@@ -131,9 +136,7 @@ fn list_includes_the_builtin_and_a_core_definition() {
     assert!(demo.contains("[auto]"), "demo row: {}", demo);
     assert!(demo.contains("1.0.0"), "demo row: {}", demo);
 
-    let svc = line_for(&text, "svc");
-    assert!(svc.contains("core"), "svc row: {}", svc);
-    assert!(svc.contains("running"), "svc row: {}", svc);
+    assert!(!has_row(&text, "svc"), "table:\n{}", text);
 }
 
 #[test]
@@ -310,7 +313,7 @@ fn an_spk_only_field_rejects_the_definition_with_a_reason() {
 }
 
 #[test]
-fn the_reserved_svc_id_is_rejected_without_hiding_the_builtin() {
+fn the_reserved_svc_id_is_rejected_and_the_builtin_stays_hidden_from_list() {
     let sandbox = Sandbox::new();
     sandbox.write_definition("svc", definition("svc"));
 
@@ -319,11 +322,8 @@ fn the_reserved_svc_id_is_rejected_without_hiding_the_builtin() {
     assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
     let errors = stderr(&output);
     assert!(errors.contains("reserved"), "stderr:\n{}", errors);
-    let svc_lines = stdout(&output)
-        .lines()
-        .filter(|line| line.split_whitespace().next() == Some("svc"))
-        .count();
-    assert_eq!(svc_lines, 1, "table:\n{}", stdout(&output));
+    let table = stdout(&output);
+    assert!(!has_row(&table, "svc"), "table:\n{}", table);
 
     let status = sandbox.run(&["status", "svc"]);
     assert_eq!(status.status.code(), Some(0));

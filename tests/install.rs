@@ -325,7 +325,15 @@ fn self_install_copies_aliases_and_uninstalls_without_touching_the_host() {
         .output()
         .expect("run installed svc");
     assert_eq!(listed.status.code(), Some(0), "{}", stderr(&listed));
-    assert!(stdout(&listed).contains("svc"));
+    let list_text = stdout(&listed);
+    assert!(list_text.starts_with("ID"), "list:\n{}", list_text);
+    assert!(
+        !list_text
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("svc")),
+        "list:\n{}",
+        list_text
+    );
 
     let removed = sandbox.run(&["--uninstall", "--prefix", prefix_arg, "--no-service"]);
     assert_eq!(removed.status.code(), Some(0), "{}", stderr(&removed));

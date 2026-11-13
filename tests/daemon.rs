@@ -467,6 +467,13 @@ fn daemon_starts_a_ready_service_and_serves_live_status() {
     let listed = String::from_utf8_lossy(&list.stdout);
     assert!(listed.contains("demo"), "list:\n{}", listed);
     assert!(listed.contains("running"), "list:\n{}", listed);
+    assert!(
+        !listed
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("svc")),
+        "list:\n{}",
+        listed
+    );
 
     let stopped = sandbox.stop("demo");
     assert_eq!(
