@@ -101,7 +101,7 @@
         </table>
       </div>
       <p id="empty" class="muted hidden">还没有安装任何插件。</p>
-      <p class="muted" style="margin:8px 0 0">“安装包”是签名时的配置模板；“导出备份”包含当前修改的配置，可直接用上方“上传安装”导入恢复。</p>
+      <p class="muted" style="margin:8px 0 0">“导出”包含当前修改的配置，可直接用上方“上传安装”导入恢复。</p>
     </div>
   </div>
 </div>
@@ -286,6 +286,7 @@ function render(plugins) {
 
     const actions = document.createElement('td');
     const actionRow = document.createElement('div');
+    actionRow.appendChild(button('日志', 'ghost', function () { openLogs(plugin.id); }));
     actionRow.className = 'actions';
     if (plugin.hasUI === true) {
       const open = button('打开', 'ghost', function () { openPluginUI(plugin.id); });
@@ -296,11 +297,10 @@ function render(plugins) {
     if (plugin.hasConfig === true) {
       actionRow.appendChild(button('配置', 'ghost', function () { openConfig(plugin.id); }));
     }
-    actionRow.appendChild(button('日志', 'ghost', function () { openLogs(plugin.id); }));
-    const installer = button('安装包', 'ghost', function () { exportPlugin(plugin.id, 'spk'); });
-    installer.title = '签名安装包：使用包内的配置模板';
-    actionRow.appendChild(installer);
-    const backup = button('导出备份', 'ghost', function () { exportPlugin(plugin.id, 'backup'); });
+    // const installer = button('安装包', 'ghost', function () { exportPlugin(plugin.id, 'spk'); });
+    // installer.title = '签名安装包：使用包内的配置模板';
+    // actionRow.appendChild(installer);
+    const backup = button('导出', 'ghost', function () { exportPlugin(plugin.id, 'backup'); });
     backup.title = '签名安装包 + 当前活动配置（.spkb）';
     actionRow.appendChild(backup);
     actionRow.appendChild(button('删除', 'danger', function () { removePlugin(plugin.id); }));
