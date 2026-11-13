@@ -188,7 +188,7 @@ fn install_bytes(bytes: &[u8], source: &str) -> Result<Status, String> {
     let response = channel::request(
         &paths::config_dir(),
         "plugin.install",
-        json!({ "path": path.to_string_lossy(), "strategy": "keep-old" }),
+        json!({ "path": path.to_string_lossy(), "strategy": "replace" }),
     );
     let _ = fs::remove_file(&path);
     let response = response.map_err(|error| format!("svcd unreachable: {}", error))?;
