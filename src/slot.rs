@@ -13,6 +13,7 @@ use crate::paths;
 use crate::registry::{Exec, Hook, Lifecycle, Ready, State};
 use crate::rpc;
 use crate::supervisor::{self, Action, Event, Machine};
+use crate::threads;
 use crate::wake::Wake;
 
 /// Per-plugin in-flight cap from ticket #31. The full spec also describes a
@@ -307,6 +308,7 @@ impl Slot {
             let stderr_log = log.clone();
             if let Err(error) = thread::Builder::new()
                 .name(format!("svcd-{}-stderr", self.id))
+                .stack_size(threads::IO_STACK)
                 .spawn(move || {
                     let reader = BufReader::new(stderr);
                     for line in reader.lines().map_while(Result::ok) {
@@ -345,6 +347,7 @@ impl Slot {
             let stdout_log = log.clone();
             if let Err(error) = thread::Builder::new()
                 .name(format!("svcd-{}-stdout", self.id))
+                .stack_size(threads::IO_STACK)
                 .spawn(move || {
                     let reader = BufReader::new(stdout);
                     for line in reader.lines().map_while(Result::ok) {
@@ -360,6 +363,7 @@ impl Slot {
             let stderr_log = log.clone();
             if let Err(error) = thread::Builder::new()
                 .name(format!("svcd-{}-stderr", self.id))
+                .stack_size(threads::IO_STACK)
                 .spawn(move || {
                     let reader = BufReader::new(stderr);
                     for line in reader.lines().map_while(Result::ok) {
@@ -480,6 +484,7 @@ impl Slot {
             ),
         };
         self.log_service(&text);
+        #[cfg(feature = "http")]
         crate::uichannel::publish(&self.id, method, &params.cloned().unwrap_or(Value::Null));
     }
 
@@ -666,6 +671,7 @@ impl Slot {
                     let id = self.id.clone();
                     let _ = thread::Builder::new()
                         .name(format!("svcd-{}-stop-stderr", id))
+                        .stack_size(threads::IO_STACK)
                         .spawn(move || {
                             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                                 log_line(&log, &line);

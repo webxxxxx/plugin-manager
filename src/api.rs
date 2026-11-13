@@ -26,6 +26,7 @@ use crate::package;
 use crate::paths;
 use crate::plugin;
 use crate::rpc;
+use crate::threads;
 use crate::transfer;
 use crate::uichannel;
 use crate::webui;
@@ -95,6 +96,7 @@ pub fn spawn(config: PathBuf) -> std::io::Result<Arc<Api>> {
     });
     thread::Builder::new()
         .name("svcd-http".into())
+        .stack_size(threads::IO_STACK)
         .spawn(move || listener_loop(Some(listener), local, receiver, lan, config, current))?;
     Ok(api)
 }
@@ -234,6 +236,7 @@ fn listener_loop(
                 let config = config.clone();
                 let _ = thread::Builder::new()
                     .name("svcd-http-conn".into())
+                    .stack_size(threads::REQUEST_STACK)
                     .spawn(move || handle(stream, config, lan));
             }
             Err(error) => {

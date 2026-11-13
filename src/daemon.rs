@@ -11,7 +11,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
 
+#[cfg(feature = "http")]
 use crate::api::{self, Api};
+#[cfg(not(feature = "http"))]
+type Api = ();
 use crate::channel;
 use crate::definition;
 use crate::lan::LanStatus;
@@ -86,6 +89,7 @@ pub fn run() -> i32 {
         log::svcd(&format!("svcd: cannot bind control channel: {}", error));
         return 1;
     }
+    #[cfg(feature = "http")]
     let api = match api::spawn(config.clone()) {
         Ok(api) => Some(api),
         Err(error) => {
@@ -93,6 +97,8 @@ pub fn run() -> i32 {
             None
         }
     };
+    #[cfg(not(feature = "http"))]
+    let api: Option<Arc<Api>> = None;
     notify_systemd("READY=1");
 
     let mut daemon = Daemon::new(loaded.registry, token, rx, api);
@@ -174,6 +180,7 @@ struct Daemon {
     registry: Registry,
     token: String,
     rx: Receiver<channel::PendingCall>,
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     api: Option<Arc<Api>>,
     wake: Arc<Wake>,
     slots: BTreeMap<String, Slot>,
@@ -402,6 +409,7 @@ impl Daemon {
         }
     }
 
+    #[cfg(feature = "http")]
     fn lan_status(&self) -> Result<LanStatus, String> {
         self.api
             .as_ref()
@@ -409,6 +417,12 @@ impl Daemon {
             .status()
     }
 
+    #[cfg(not(feature = "http"))]
+    fn lan_status(&self) -> Result<LanStatus, String> {
+        Err("HTTP API is disabled in this build".to_string())
+    }
+
+    #[cfg(feature = "http")]
     fn lan_enable(&self, bind: IpAddr) -> Result<(LanStatus, Option<String>), String> {
         self.api
             .as_ref()
@@ -416,6 +430,12 @@ impl Daemon {
             .enable(bind)
     }
 
+    #[cfg(not(feature = "http"))]
+    fn lan_enable(&self, _bind: IpAddr) -> Result<(LanStatus, Option<String>), String> {
+        Err("HTTP API is disabled in this build".to_string())
+    }
+
+    #[cfg(feature = "http")]
     fn lan_disable(&self) -> Result<LanStatus, String> {
         self.api
             .as_ref()
@@ -423,11 +443,22 @@ impl Daemon {
             .disable()
     }
 
+    #[cfg(not(feature = "http"))]
+    fn lan_disable(&self) -> Result<LanStatus, String> {
+        Err("HTTP API is disabled in this build".to_string())
+    }
+
+    #[cfg(feature = "http")]
     fn lan_rotate(&self) -> Result<String, String> {
         self.api
             .as_ref()
             .ok_or_else(|| "HTTP API is not running".to_string())?
             .rotate()
+    }
+
+    #[cfg(not(feature = "http"))]
+    fn lan_rotate(&self) -> Result<String, String> {
+        Err("HTTP API is disabled in this build".to_string())
     }
 
     fn statuses(&self) -> Vec<Status> {

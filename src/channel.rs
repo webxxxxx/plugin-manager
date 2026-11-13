@@ -6,6 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use imp::{Listener, Stream};
 
+use crate::threads;
+
 pub struct PendingCall {
     pub line: String,
     pub reply: Sender<String>,
@@ -84,6 +86,7 @@ pub fn spawn_server(
     let listener = Listener::bind(config)?;
     std::thread::Builder::new()
         .name("svcd-channel".into())
+        .stack_size(threads::IO_STACK)
         .spawn(move || {
             for incoming in listener.incoming() {
                 let stream = match incoming {
@@ -97,6 +100,7 @@ pub fn spawn_server(
                 let wake = wake.clone();
                 let _ = std::thread::Builder::new()
                     .name("svcd-channel-conn".into())
+                    .stack_size(threads::IO_STACK)
                     .spawn(move || serve(stream, tx, wake));
             }
         })

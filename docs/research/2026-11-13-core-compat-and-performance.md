@@ -13,7 +13,7 @@
 | OS | Windows 11（10.0.26200），x86_64 |
 | CPU | 12th Gen Intel Core i7-1260P，12 核 / 16 逻辑处理器 |
 | 内存 | 16 GiB |
-| 构建 | `cargo build --release`，svcd `1,139,200 B` |
+| 构建 | `cargo build --release`，svcd `1,138,176 B` |
 | 客户端 | Node v20.11.1；`ws` 8.23.0；`eventsource` 2.0.2；MCP SDK 1.32.2 |
 | 插件 | Python 3.10 NDJSON echo agent（含 Python 编解码/调度开销） |
 | 网络 | 127.0.0.1，HTTP 无 TLS，端口由 daemon 动态分配 |
@@ -206,6 +206,41 @@ WSL2 Debian（Linux 6.18，8 vCPU，5.9 GB），使用同一 release 的 Linux m
 - 每插件 sh 进程约 **1.65 MB**；30 个约 49 MB；总 51 MB。
 - 30 个启动约 **1.1s**；空闲 daemon CPU **0–0.6% 单核**。
 - 与 Windows 的差异主要来自进程模型：Windows 每插件 cmd 约 7 MB，Linux sh 约 1.65 MB；daemon 也从 5.5 MB 降到 1.0 MB。
+
+## 嵌入式优化实测（#86）
+
+### 线程栈上限（musl/Linux）
+
+给 HTTP/channel/plugin reader/WS worker 设置 128–256 KB 栈后，RSS 基本不变（这些栈本来就只触碰少量页），但虚拟内存/commit 大幅下降：
+
+| 插件数 | 无栈上限 VM | 有栈上限 VM | 无栈上限 RSS | 有栈上限 RSS |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 5.6 MB | **1.8 MB** | 1.28 MB | 1.28 MB |
+| 30 | 127.8 MB | **11.6 MB** | 2.03 MB | 2.03 MB |
+
+30 插件时虚拟内存约 **-91%**；对只有 16/32 MB 地址空间或 commit 限额的嵌入式设备，这比 RSS 更关键。
+
+### feature-gate（`http`）
+
+`--no-default-features` 移除 HTTP 管理 API、内嵌控制台、插件 Web UI、LAN 鉴权和 MCP HTTP；保留 daemon/supervisor、channel、CLI、MCP stdio。
+
+| 指标 | 默认（http） | minimal | 变化 |
+| --- | ---: | ---: | ---: |
+| Windows 二进制 | 1,138,176 B | **998,912 B** | -139,264 B（-12.2%） |
+| musl 二进制 | 1,364,944 B | **1,205,168 B** | -159,776 B（-11.7%） |
+| daemon RSS @0 | 1.28 MB | **1.15 MB** | -0.13 MB |
+| daemon RSS @30 | 2.03 MB | **1.89 MB** | -0.14 MB |
+| daemon VM @0 | 1.8 MB | **1.5 MB** | -0.3 MB |
+| daemon VM @30 | 11.6 MB | **11.3 MB** | -0.3 MB |
+
+结论：feature-gate 主要省 flash/二进制（约 12%）和少量代码页 RSS；插件进程仍占大头（30 个 sh 约 49 MB）。
+
+### 说明
+
+- 以上为 musl 静态二进制；glibc 构建的 VM 会受 malloc arena 影响（实测可达数 GB），嵌入式应优先 musl。
+- 栈/feature 表用 `scale_cli.py`（CLI 安装/启动）测量；与前面 WSL harness 的 HTTP 路径数值（0.99/1.88 MB）有少量差异，只做同方法前后对比。
+- 线程栈上限的收益是虚拟内存/commit，不是 RSS；不要期望它显著降低 `VmRSS`。
+- `tools/perf/scale_cli.py` 可在无 HTTP 的 minimal daemon 上复测（CLI 安装/启动插件）。
 
 ## 嵌入式内存还能怎么缩
 

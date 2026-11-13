@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 
 use crate::channel;
 use crate::rpc;
+use crate::threads;
 use crate::webui;
 
 const MAX_SUBSCRIBERS: usize = 64;
@@ -350,12 +351,14 @@ pub fn serve_ws(
     let writer_stopped = Arc::clone(&stopped);
     let writer = thread::Builder::new()
         .name("svcd-ws-writer".into())
+        .stack_size(threads::IO_STACK)
         .spawn(move || write_loop(&mut writer, out_rx, &writer_stopped))?;
 
     let forward_stopped = Arc::clone(&stopped);
     let forward_tx = out_tx.clone();
     let forwarder = thread::Builder::new()
         .name("svcd-ws-events".into())
+        .stack_size(threads::IO_STACK)
         .spawn(move || {
             for event in receiver {
                 if forward_stopped.load(Ordering::SeqCst) {
