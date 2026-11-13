@@ -101,6 +101,7 @@
         </table>
       </div>
       <p id="empty" class="muted hidden">还没有安装任何插件。</p>
+      <p class="muted" style="margin:8px 0 0">“安装包”是签名时的配置模板；“导出备份”包含当前修改的配置，可用 plugin import 恢复。</p>
     </div>
   </div>
 </div>
@@ -268,11 +269,23 @@ function render(plugins) {
     const actions = document.createElement('td');
     const actionRow = document.createElement('div');
     actionRow.className = 'actions';
+    if (plugin.hasUI === true) {
+      const open = button('打开', 'ghost', function () {
+        window.open('/plugin-ui/' + encodeURIComponent(plugin.id) + '/', '_blank', 'noopener');
+      });
+      open.title = '打开插件 UI';
+      actionRow.appendChild(open);
+    }
     if (plugin.hasConfig === true) {
       actionRow.appendChild(button('配置', 'ghost', function () { openConfig(plugin.id); }));
     }
     actionRow.appendChild(button('日志', 'ghost', function () { openLogs(plugin.id); }));
-    actionRow.appendChild(button('导出', 'ghost', function () { exportPlugin(plugin.id); }));
+    const installer = button('安装包', 'ghost', function () { exportPlugin(plugin.id, 'spk'); });
+    installer.title = '签名安装包：使用包内的配置模板';
+    actionRow.appendChild(installer);
+    const backup = button('导出备份', 'ghost', function () { exportPlugin(plugin.id, 'backup'); });
+    backup.title = '签名安装包 + 当前活动配置（.spkb）';
+    actionRow.appendChild(backup);
     actionRow.appendChild(button('删除', 'danger', function () { removePlugin(plugin.id); }));
     actions.appendChild(actionRow);
     tr.appendChild(actions);
@@ -514,14 +527,18 @@ function showLogsModal(id, text) {
   pre.scrollTop = pre.scrollHeight;
 }
 
-function exportPlugin(id) {
+function exportPlugin(id, kind) {
   if (BUSY) return;
   lock(true);
-  fetch('/api/v1/export/' + encodeURIComponent(id) + '/spk', { headers: authHeaders() }).then(async function (response) {
+  const backup = kind === 'backup';
+  const path = backup
+    ? '/api/v1/export/' + encodeURIComponent(id)
+    : '/api/v1/export/' + encodeURIComponent(id) + '/spk';
+  fetch(path, { headers: authHeaders() }).then(async function (response) {
     if (!response.ok) throw new Error(await errorText(response));
     const blob = await response.blob();
     const disposition = response.headers.get('Content-Disposition') || '';
-    let filename = id + '.spk';
+    let filename = id + (backup ? '.spkb' : '.spk');
     const match = /filename="([^"]+)"/.exec(disposition);
     if (match) filename = match[1];
     const url = URL.createObjectURL(blob);
@@ -532,7 +549,7 @@ function exportPlugin(id) {
     anchor.click();
     anchor.remove();
     setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
-    toast('已导出 ' + filename, 'ok');
+    toast((backup ? '已导出备份（含当前配置） ' : '已导出安装包 ') + filename, 'ok');
   }).catch(function (error) {
     toast('导出失败：' + error.message, 'err');
   }).finally(function () { lock(false); });

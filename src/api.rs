@@ -904,9 +904,16 @@ fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<
                             .pointer("/details/config")
                             .and_then(Value::as_str)
                             .is_some();
+                        let has_ui = status
+                            .get("summary")
+                            .and_then(|summary| summary.get("id"))
+                            .and_then(Value::as_str)
+                            .map(|id| plugin::web_assets(id).is_some())
+                            .unwrap_or(false);
                         let mut summary = status.get("summary").cloned()?;
                         if let Some(object) = summary.as_object_mut() {
                             object.insert("hasConfig".into(), Value::Bool(has_config));
+                            object.insert("hasUI".into(), Value::Bool(has_ui));
                         }
                         Some(summary)
                     })

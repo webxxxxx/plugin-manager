@@ -1799,6 +1799,29 @@ fn export_import_and_logs() {
     assert_eq!(json_body(&raw_import)["configApplied"], true);
     assert_eq!(fs::read(&active).expect("config"), b"imported good\n");
 
+    // A backup taken now must contain the active config, not the template.
+    let active_backup = raw_request(&address, "GET", "/api/v1/export/demo", "", b"");
+    assert_eq!(active_backup.status, 200);
+    let changed = raw_request(
+        &address,
+        "POST",
+        "/api/v1/import?config_id=demo",
+        "text/plain",
+        b"changed\n",
+    );
+    assert_eq!(changed.status, 200);
+    assert_eq!(fs::read(&active).expect("config"), b"changed\n");
+    let restored = raw_request(
+        &address,
+        "POST",
+        "/api/v1/import?force=true",
+        "application/octet-stream",
+        &active_backup.body,
+    );
+    assert_eq!(restored.status, 200);
+    assert_eq!(json_body(&restored)["configApplied"], true);
+    assert_eq!(fs::read(&active).expect("config"), b"imported good\n");
+
     let missing_id = raw_request(&address, "POST", "/api/v1/import", "text/plain", b"no id\n");
     assert_eq!(missing_id.status, 400);
 
@@ -1983,6 +2006,10 @@ fn serves_the_embedded_console() {
         "上传公钥",
         "自动刷新（3s）",
         "hasConfig",
+        "hasUI",
+        "打开",
+        "安装包",
+        "导出备份",
         "purge=true",
         "/spk",
     ] {
@@ -2183,6 +2210,19 @@ fn plugin_web_ui_serves_assets_with_base_and_etag() {
     );
     assert_eq!(installed.status, 200, "{}", installed.body);
     assert_eq!(installed.body["id"], "plain");
+
+    let services = request(&address, "GET", "/api/v1/services", "", b"");
+    let summaries = services.body["services"].as_array().expect("services");
+    let demo = summaries
+        .iter()
+        .find(|service| service["id"] == "demo")
+        .expect("demo");
+    let plain = summaries
+        .iter()
+        .find(|service| service["id"] == "plain")
+        .expect("plain");
+    assert_eq!(demo["hasUI"], true);
+    assert_eq!(plain["hasUI"], false);
 
     let page = raw_request(&address, "GET", "/plugin-ui/demo/", "", b"");
     assert_eq!(page.status, 200, "{}", String::from_utf8_lossy(&page.body));
