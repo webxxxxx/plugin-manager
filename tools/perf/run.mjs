@@ -941,9 +941,7 @@ async function measureScale() {
       await stopDaemon(daemon);
     }
   }
-  const baseline = results.length > 0 ? results[0].total_rss_bytes : 0;
   for (const item of results) {
-    item.plugin_rss_bytes = Math.max(0, item.total_rss_bytes - baseline);
     item.per_plugin_rss_bytes = item.plugins > 0 ? item.plugin_rss_bytes / item.plugins : 0;
   }
   return results;
