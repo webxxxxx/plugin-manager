@@ -230,9 +230,15 @@ jobs:
       - name: Smoke test
         run: |
           & "target\x86_64-pc-windows-msvc\release\svcd.exe" 2>$null
-          if ($LASTEXITCODE -ne 64) {
-            throw "svcd.exe exited $LASTEXITCODE, want 64 (usage)"
+          $code = $LASTEXITCODE
+          Write-Output "svcd.exe exit code: $code"
+          if ($code -ne 64) {
+            Write-Output "::error::svcd.exe exited $code, want 64 (usage)"
+            exit 1
           }
+          # The runner appends `exit $LASTEXITCODE`; end on success explicitly
+          # so the expected usage exit code does not fail the step.
+          exit 0
       - name: Package
         run: |
           python tools/package_release.py `
