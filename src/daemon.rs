@@ -137,7 +137,7 @@ static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 #[cfg(unix)]
 fn install_shutdown_signal() {
     extern "C" fn handle(_: libc::c_int) {
-        SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+        request_shutdown();
     }
     unsafe {
         libc::signal(libc::SIGTERM, handle as *const () as libc::sighandler_t);
@@ -150,13 +150,20 @@ fn install_shutdown_signal() {
     use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 
     unsafe extern "system" fn handle(_: u32) -> i32 {
-        SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+        request_shutdown();
         1
     }
 
     unsafe {
         SetConsoleCtrlHandler(Some(handle), 1);
     }
+}
+
+/// Ask the running daemon to shut down. The event loop checks this flag on
+/// every wake, so callers on any thread (the Windows SCM control handler, for
+/// example) can stop it without touching daemon state.
+pub fn request_shutdown() {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
 }
 
 pub fn shutdown() -> i32 {

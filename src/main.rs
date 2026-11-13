@@ -20,6 +20,8 @@ mod plugin_cli;
 mod proc;
 mod registry;
 mod rpc;
+#[cfg(windows)]
+mod service_win;
 mod slot;
 mod status;
 mod supervisor;
@@ -52,7 +54,7 @@ fn main() {
 
 fn svcd_run(args: Vec<String>) -> i32 {
     match args.first().map(String::as_str) {
-        Some("run") if args.len() == 2 && args[1] == "--foreground" => daemon::run(),
+        Some("run") if args.len() == 2 && args[1] == "--foreground" => run_foreground(),
         Some("shutdown") if args.len() == 1 => daemon::shutdown(),
         Some("--install") | Some("install") => install::self_install(&args[1..]),
         Some("--uninstall") | Some("uninstall") => install::self_uninstall(&args[1..]),
@@ -63,6 +65,17 @@ fn svcd_run(args: Vec<String>) -> i32 {
             64
         }
     }
+}
+
+/// `svcd run --foreground` serves both a console and the Windows SCM: the SCM
+/// owns the process via its dispatcher, and every other caller falls through to
+/// the plain daemon loop.
+fn run_foreground() -> i32 {
+    #[cfg(windows)]
+    if let Some(code) = service_win::run_if_service() {
+        return code;
+    }
+    daemon::run()
 }
 
 fn usage() {
