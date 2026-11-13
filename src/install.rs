@@ -1064,6 +1064,12 @@ pub fn self_install(args: &[String]) -> i32 {
             println!("  service: program {}", target.display());
         } else if !request.no_service {
             println!("  service:  skipped (install_dir set)");
+            if let Some(target) = request.target {
+                println!(
+                    "  note:     --target {} ignored; install_dir owns startup",
+                    target
+                );
+            }
         }
         return EXIT_OK;
     }
@@ -1172,6 +1178,12 @@ pub fn self_install(args: &[String]) -> i32 {
         println!("service: not installed (--no-service)");
     } else if !register_service {
         println!("service: skipped (install_dir set; use the inittab entry above)");
+        if let Some(target) = request.target {
+            println!(
+                "note: --target {} ignored; install_dir owns startup",
+                target
+            );
+        }
     }
     println!("try: svc list");
     EXIT_OK
@@ -1290,14 +1302,27 @@ fn alias_names() -> Vec<&'static str> {
     }
 }
 
+/// Replace the installed binary without ever writing through the live file.
+///
+/// Copy to a temporary sibling and rename it into place: on Unix the running
+/// daemon keeps the old inode, so upgrading an `install_dir` deployment does
+/// not need to stop the service first (a direct overwrite would fail ETXTBSY).
 fn copy_executable(source: &Path, target: &Path) -> io::Result<()> {
-    fs::copy(source, target)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(target, fs::Permissions::from_mode(0o755))?;
+    let temporary = temporary_path(target)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let result = fs::copy(source, &temporary).and_then(|_| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))?;
+        }
+        replace_file(&temporary, target)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))
+    });
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
-    Ok(())
+    result
 }
 
 fn install_alias(source: &Path, target: &Path) -> io::Result<()> {

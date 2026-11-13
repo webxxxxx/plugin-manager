@@ -610,6 +610,29 @@ fn install_dir_dry_run_reports_the_launcher_without_writing() {
 }
 
 #[test]
+fn install_dir_reports_an_ignored_init_target() {
+    let sandbox = Sandbox::new();
+    let install_dir = sandbox.root.join("persist").join("svcd");
+    let conf = install_dir_conf(&sandbox, &install_dir);
+
+    let output = sandbox.run(&[
+        "--install",
+        "--conf",
+        conf.to_str().expect("utf8"),
+        "--target",
+        "systemd",
+        "--dry-run",
+    ]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("--target systemd ignored"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
 fn uninstall_finds_install_dir_and_removes_the_launcher() {
     let sandbox = Sandbox::new();
     let install_dir = sandbox.root.join("persist").join("svcd");
