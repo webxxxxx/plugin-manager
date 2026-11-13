@@ -2010,6 +2010,7 @@ fn serves_the_embedded_console() {
         "打开",
         "安装包",
         "导出备份",
+        ".spkb",
         "purge=true",
         "/spk",
     ] {

@@ -87,9 +87,9 @@
       <div class="row">
         <button onclick="pickInstall()">上传安装</button>
         <span class="grow"></span>
-        <span class="muted">只接受签名 .spk；安装时替换旧版本</span>
+        <span class="muted">接受 .spk 安装包或 .spkb 备份；安装/导入时替换旧版本</span>
       </div>
-      <input type="file" id="file" accept=".spk" class="hidden">
+      <input type="file" id="file" accept=".spk,.spkb" class="hidden">
       <input type="file" id="trustfile" accept=".pub" class="hidden">
     </div>
 
@@ -101,7 +101,7 @@
         </table>
       </div>
       <p id="empty" class="muted hidden">还没有安装任何插件。</p>
-      <p class="muted" style="margin:8px 0 0">“安装包”是签名时的配置模板；“导出备份”包含当前修改的配置，可用 plugin import 恢复。</p>
+      <p class="muted" style="margin:8px 0 0">“安装包”是签名时的配置模板；“导出备份”包含当前修改的配置，可直接用上方“上传安装”导入恢复。</p>
     </div>
   </div>
 </div>
@@ -319,9 +319,10 @@ function act(kind, id) {
 function install() {
   if (BUSY) return;
   const file = $('file').files[0];
-  if (!file) { toast('请先选择 .spk 文件', 'err'); return; }
+  if (!file) { toast('请先选择 .spk 或 .spkb 文件', 'err'); return; }
+  const backup = /\.spkb$/i.test(file.name);
   lock(true);
-  fetch('/api/v1/plugins', {
+  fetch(backup ? '/api/v1/import?force=true' : '/api/v1/plugins', {
     method: 'POST',
     headers: authHeaders({ 'Content-Type': 'application/octet-stream' }),
     body: file
@@ -329,9 +330,13 @@ function install() {
     if (!response.ok) throw new Error(await errorText(response));
     return response.json();
   }).then(function (body) {
-    toast('已安装 ' + body.id + ' ' + body.version, 'ok');
+    if (backup) {
+      toast('已导入备份 ' + body.id + (body.configApplied ? '（含当前配置）' : ''), 'ok');
+    } else {
+      toast('已安装 ' + body.id + ' ' + body.version, 'ok');
+    }
   }).catch(function (error) {
-    toast('安装失败：' + error.message, 'err');
+    toast((backup ? '导入失败：' : '安装失败：') + error.message, 'err');
   }).finally(function () {
     $('file').value = '';
     lock(false);
@@ -413,6 +418,9 @@ function showConfigModal(id, text) {
   hint.textContent = '保存后需要重启插件才生效；校验失败会返回 409 并保留 last-good。';
   const area = document.createElement('textarea');
   area.value = text;
+  const exportHint = document.createElement('p');
+  exportHint.className = 'muted';
+  exportHint.textContent = '这里保存的是活动配置；“安装包”仍使用签名时的模板，带走当前配置请用“导出备份”。';
   const actions = document.createElement('div');
   actions.className = 'row';
   actions.style.justifyContent = 'flex-end';
@@ -438,6 +446,7 @@ function showConfigModal(id, text) {
   panel.appendChild(title);
   panel.appendChild(hint);
   panel.appendChild(area);
+  panel.appendChild(exportHint);
   panel.appendChild(actions);
   modal.appendChild(panel);
   document.body.appendChild(modal);
