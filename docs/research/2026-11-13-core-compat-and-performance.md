@@ -191,12 +191,29 @@ daemon 在 10s 混合负载内消耗约 34.7 秒 CPU（约 3.5 个逻辑核，�
 - 30 个插件全部启动约 **1.0s**（约 34–35 ms/插件，含安装）。
 - 空闲 CPU 已由 #83 的 condvar 唤醒解决；后续若继续压内存，见“嵌入式内存”章节（线程栈上限、feature-gate、Linux sh/native 插件）。
 
+## WSL/Linux 对照（#84）
+
+WSL2 Debian（Linux 6.18，8 vCPU，5.9 GB），使用同一 release 的 Linux musl 二进制、最小 sh 脚本插件；work root 放在 Linux 文件系统（DrvFs 的 /mnt/d 不支持 Unix socket）。
+
+| 插件数 | 进程数 | daemon RSS MB | 插件 RSS MB | 总 RSS MB | 每插件 MB | daemon CPU%（单核） | 启动全部 ms |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 1 | 0.99 | 0.00 | 0.99 | 0.00 | 0.00 | 0 |
+| 5 | 6 | 1.29 | 8.12 | 9.41 | 1.62 | 0.40 | 182 |
+| 10 | 11 | 1.38 | 16.42 | 17.80 | 1.64 | 0.20 | 343 |
+| 30 | 31 | 1.88 | 49.36 | 51.24 | 1.65 | 0.60 | 1069 |
+
+- Linux 下 daemon **0.99 MB → 1.88 MB**（0/30 插件）；每插件只多约 30 KB daemon 状态。
+- 每插件 sh 进程约 **1.65 MB**；30 个约 49 MB；总 51 MB。
+- 30 个启动约 **1.1s**；空闲 daemon CPU **0–0.6% 单核**。
+- 与 Windows 的差异主要来自进程模型：Windows 每插件 cmd 约 7 MB，Linux sh 约 1.65 MB；daemon 也从 5.5 MB 降到 1.0 MB。
+
 ## 嵌入式内存还能怎么缩
 
-当前优化后基线（Windows、最小脚本插件）：
+当前优化后基线：
 
-- daemon 自身 **5.5 MB**（0 插件）→ **7.9 MB**（30 插件）。
-- 每插件脚本进程约 **7.0 MB**；30 个约 210 MB。Windows cmd 不等于嵌入式 Linux 的 /bin/sh。
+- WSL/Linux：daemon **1.0 MB**（0 插件）→ **1.9 MB**（30 插件）；每插件 sh 约 **1.65 MB**；30 个总 **51 MB**。
+- Windows：daemon **5.5 MB**（0）→ **7.9 MB**（30）；每插件 cmd 约 **7.0 MB**；30 个总 **218 MB**。
+- 嵌入式更接近 WSL/Linux 的进程模型；不要用 Windows cmd 的 7 MB/插件估算目标板。
 
 可继续做的方向（按收益/风险排序）：
 
@@ -207,7 +224,7 @@ daemon 在 10s 混合负载内消耗约 34.7 秒 CPU（约 3.5 个逻辑核，�
 5. **构建**：已用 opt-level=z、fat LTO、panic=abort、strip、musl 静态；若目标有 FPU/需求，可试 -C target-feature、--gc-sections，并实测 flash/RSS，不要盲调。
 6. **先测再改**：在目标板用 /proc/self/smaps_rollup 区分代码/堆/栈/共享页；若 daemon RSS 主要来自代码页，feature-gate 更有效；若来自线程栈，先做 stack size。
 
-结论：**能缩，但 daemon 的 5.5 MB 已不大**；嵌入式最值得先做的是线程栈上限 + Linux 脚本/native 插件，其次才是 feature-gate 和分配器。当前 7.9 MB/30 插件主要是 daemon 状态，脚本内存另计。
+结论：**能缩，但 Linux daemon 的 1.9 MB/30 插件已经很小**；嵌入式最值得先做的是线程栈上限 + native/in-process 插件，其次才是 feature-gate 和分配器。当前 51 MB/30 插件里约 49 MB 是 sh 进程，daemon 只占 1.9 MB。若目标板是 64 MB 级，当前模型已可用；16 MB 级则要减少插件数或改 native/in-process。
 
 ## 优化前瓶颈
 
@@ -235,7 +252,13 @@ cargo build --release
 node tools/perf/run.mjs --all
 ```
 
-报告与 JSON 写到 `target/perf-report.md`、`target/perf-results.json`。
+WSL/Linux 下 work root 要放在 Linux 文件系统（`/mnt/d` 不支持 Unix socket）：
+
+```sh
+PERF_WORK_ROOT=/tmp/svcd-perf node tools/perf/run.mjs --scale
+```
+
+报告与 JSON 写到 `target/perf-report.md`、`target/perf-results.json`；规模测试写到 `target/scale-report.md`、`target/scale-results.json`。
 
 ## 备注
 
