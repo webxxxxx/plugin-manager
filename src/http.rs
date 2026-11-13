@@ -46,6 +46,7 @@ pub fn response_with_headers(
     let reason = match status {
         200 => "OK",
         202 => "Accepted",
+        303 => "See Other",
         304 => "Not Modified",
         308 => "Permanent Redirect",
         400 => "Bad Request",

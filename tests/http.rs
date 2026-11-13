@@ -2453,6 +2453,16 @@ fn plugin_web_ui_requires_a_session_when_lan_is_enabled() {
     let body = rpc_body(21, "status");
     let page = raw_request(&address, "GET", "/plugin-ui/demo/", "", b"");
     assert_eq!(page.status, 401);
+    let browsed = raw_request_with(
+        &address,
+        "GET",
+        "/plugin-ui/demo/",
+        "",
+        b"",
+        &[("Accept", "text/html")],
+    );
+    assert_eq!(browsed.status, 303);
+    assert!(raw_header_values(&browsed, "location")[0].contains("/?next=/plugin-ui/demo/"));
     let anonymous = raw_request(
         &address,
         "POST",

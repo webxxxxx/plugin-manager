@@ -109,6 +109,18 @@
 let TOKEN = sessionStorage.getItem('svcd_token') || '';
 let BUSY = false;
 
+function safeReturnTo(value) {
+  if (!value || !value.startsWith('/') || value.startsWith('//')) return null;
+  try {
+    const url = new URL(value, location.origin);
+    if (url.origin !== location.origin) return null;
+    return url.pathname + url.search + url.hash;
+  } catch (_) {
+    return null;
+  }
+}
+const RETURN_TO = safeReturnTo(new URLSearchParams(location.search).get('next'));
+
 function $(id) { return document.getElementById(id); }
 
 function pickInstall() { if (!BUSY) $('file').click(); }
@@ -204,8 +216,28 @@ function showMain() {
   load();
 }
 
+async function refreshSessionThenReturn() {
+  try {
+    const response = await fetch('/login', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: TOKEN })
+    });
+    if (response.ok && RETURN_TO) {
+      location.href = RETURN_TO;
+      return;
+    }
+  } catch (_) {}
+  showLogin();
+}
+
 function boot() {
-  if (TOKEN) { showMain(); return; }
+  if (TOKEN) {
+    if (RETURN_TO) { refreshSessionThenReturn(); return; }
+    showMain();
+    return;
+  }
   fetch('/api/v1/services', { credentials: 'same-origin', headers: authHeaders() }).then(function (response) {
     if (response.status === 401) showLogin();
     else showMain();
@@ -227,6 +259,7 @@ async function login() {
     sessionStorage.setItem('svcd_token', token);
     $('pass').value = '';
     $('loginMsg').textContent = '';
+    if (RETURN_TO) { location.href = RETURN_TO; return; }
     showMain();
   } catch (error) {
     $('loginMsg').textContent = '登录失败：' + error.message;

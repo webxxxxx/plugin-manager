@@ -516,7 +516,27 @@ fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u
     let auth = match lan.lock() {
         Ok(mut state) => match state.authenticate(&request.headers) {
             Ok(auth) => auth,
-            Err(()) => return error(401, "unauthorized", "authentication required"),
+            Err(()) => {
+                // A browser navigation to a plugin UI should land on the
+                // console login instead of raw JSON. API clients keep the 401.
+                if request.method == "GET"
+                    && path.starts_with("/plugin-ui/")
+                    && request_header(request, "accept")
+                        .map(|value| value.contains("text/html"))
+                        .unwrap_or(false)
+                {
+                    return http::response_with_headers(
+                        303,
+                        "text/plain; charset=utf-8",
+                        &[(
+                            "Location".to_string(),
+                            format!("/?next={}", encode_query_value(path)),
+                        )],
+                        b"",
+                    );
+                }
+                return error(401, "unauthorized", "authentication required");
+            }
         },
         Err(_) => return error(500, "internal", "LAN state unavailable"),
     };
@@ -1264,6 +1284,21 @@ fn ui_page() -> Vec<u8> {
         ],
         UI.as_bytes(),
     )
+}
+
+/// Percent-encode a local path for a `next=` query value so `&`, `#` or `%`
+/// in a crafted `/plugin-ui/...` path cannot add query parts or a fragment.
+fn encode_query_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
 }
 
 fn cap_log(mut text: String) -> String {
