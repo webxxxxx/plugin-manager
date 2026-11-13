@@ -517,6 +517,8 @@ fn install_dir_places_the_binary_aliases_and_launcher() {
 
     let launcher = install_dir.join("svcd_daemon.sh");
     assert!(launcher.is_file(), "launcher missing");
+    // The sandbox sets SVCD_DATA_DIR/SVCD_LOG_DIR, but the launcher targets the
+    // clean boot environment, so the config's install_dir must win.
     let text = fs::read_to_string(&launcher).expect("read launcher");
     assert!(text.starts_with("#!/bin/sh\n"), "launcher:\n{}", text);
     assert!(text.contains("SVCD_DATA_DIR"), "launcher:\n{}", text);
@@ -655,6 +657,35 @@ fn command_line_prefix_wins_over_install_dir() {
         !install_dir.join(executable_name()).exists(),
         "--prefix must win over install_dir for the binary"
     );
+}
+
+#[test]
+fn reinstall_without_conf_reuses_the_installed_install_dir() {
+    let sandbox = Sandbox::new();
+    let install_dir = sandbox.root.join("persist").join("svcd");
+    let conf = install_dir_conf(&sandbox, &install_dir);
+    let first = sandbox.run(&[
+        "--install",
+        "--conf",
+        conf.to_str().expect("utf8"),
+        "--no-service",
+    ]);
+    assert_eq!(first.status.code(), Some(0), "{}", stderr(&first));
+
+    let second = sandbox.run(&["--install", "--no-service"]);
+
+    assert_eq!(second.status.code(), Some(0), "{}", stderr(&second));
+    let printed = stdout(&second);
+    assert!(
+        printed.contains(&format!(
+            "svcd installed: {}",
+            install_dir.join(executable_name()).display()
+        )),
+        "{}",
+        printed
+    );
+    assert!(install_dir.join(executable_name()).is_file());
+    assert!(install_dir.join("svcd_daemon.sh").is_file());
 }
 
 #[test]

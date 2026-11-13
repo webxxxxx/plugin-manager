@@ -42,9 +42,9 @@ impl Settings {
     }
 }
 
-/// The settings for this process. Loaded once from the service config (the
-/// program directory first, then the platform config directory) when no
-/// service config was initialized explicitly.
+/// The settings for this process. Loaded once from `SVCD_CONFIG_DIR` when it is
+/// set, otherwise the program directory first and the platform config
+/// directory second. An explicitly initialized service config wins over both.
 pub fn current() -> Result<&'static Settings, String> {
     SETTINGS
         .get_or_init(|| {

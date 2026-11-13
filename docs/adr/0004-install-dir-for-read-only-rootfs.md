@@ -5,8 +5,8 @@ SR6110 的根文件系统里只有 `/etc` 持久：`/usr/sbin` 在 ROM 里写不
 ## Decision
 
 - `svcd.conf` 增加 `install_dir`。相对值相对 `svcd.conf` 所在目录解析，与 `config_dir`/`plugins_dir`/`services_dir` 一致。
-- 指定后，`svcd --install` 以它为安装前缀：二进制与 `svc`/`plugin`/`mcp` 别名装在这里，同时生成 `svcd_daemon.sh`。命令行 `--prefix` 仍然优先于它。
-- `<install_dir>/data` 与 `<install_dir>/logs` 作为 data/logs 的默认值：`paths::data_dir`/`logs_dir` 在 `SVCD_DATA_DIR`/`SVCD_LOG_DIR` 之后、平台默认之前读取它们，所以 daemon 和直接运行的 `svc`（`svc logs` 等）看到同一棵树。
+- 指定后，`svcd --install` 以它为安装根：二进制与 `svc`/`plugin`/`mcp` 别名装在这里，同时生成 `svcd_daemon.sh`。命令行 `--prefix` 仍然优先于它；不带 `--conf` 时沿用已安装的 `<config>/svcd.conf` 里的 `install_dir`，升级不会退回 `/usr/sbin`。
+- `<install_dir>/data` 与 `<install_dir>/logs` 作为 data/logs 的默认值。运行时 `paths::data_dir`/`logs_dir` 的顺序是 `SVCD_DATA_DIR`/`SVCD_LOG_DIR` → `install_dir` → 平台默认，所以 daemon 和直接运行的 `svc`（`svc logs` 等）看到同一棵树。安装器（`--install`/`--uninstall`）按目标 `svcd.conf` 解析并故意忽略当前 shell 的这两个环境变量：它生成并打印的是开机脚本在干净环境里使用的路径。
 - `svcd_daemon.sh` 导出 `PATH`（前缀目录 + 原 PATH）、`SVCD_DATA_DIR`、`SVCD_LOG_DIR`，然后 `exec <install_dir>/svcd run --foreground --conf <config>/svcd.conf`。`exec` 让 BusyBox 的 `::respawn:` 监督 daemon 本身而不是包一层 shell。
 - 指定 `install_dir` 时 `--install` 不再自动注册 init 服务，只打印要随固件刷入的 `::respawn:<install_dir>/svcd_daemon.sh`；`/etc/inittab` 在 ROM 里，安装器改不了也不该报错。
 - `--uninstall` 不接受 `--conf`，因此从已安装的 `svcd.conf` 推断 `install_dir`；`--purge` 一并删除 `<install_dir>/data` 与 `<install_dir>/logs`。
