@@ -2077,7 +2077,12 @@ fn lan_auth_bearer_cookie_csrf_rotate_and_disable() {
     let session = cookie_value(&login, "svcd_session").expect("svcd_session cookie");
     let cookies = header_values(&login, "set-cookie").join("\n");
     assert!(cookies.contains("Path=/api/v1/"), "{cookies}");
-    assert!(cookies.contains("Path=/plugin-ui/"), "{cookies}");
+    let session_header = header_values(&login, "set-cookie")
+        .into_iter()
+        .find(|value| value.starts_with("svcd_session="))
+        .expect("svcd_session header");
+    // The session cookie must be sent to /logout, not only to /plugin-ui/.
+    assert!(session_header.contains("Path=/;"), "{session_header}");
     assert!(cookies.contains("HttpOnly"), "{cookies}");
     assert!(cookies.contains("SameSite=Strict"), "{cookies}");
     assert!(cookies.contains("Max-Age=86400"), "{cookies}");
@@ -2545,6 +2550,27 @@ fn plugin_web_ui_requires_a_session_when_lan_is_enabled() {
         ],
     );
     assert_eq!(foreign.status, 403);
+
+    // Logout must revoke the session server-side, not just clear the console's
+    // local token: a plugin tab that keeps the old cookie must not stay logged in.
+    let logout = request_with(
+        &address,
+        "POST",
+        "/logout",
+        "",
+        b"",
+        &[("Cookie", cookie.as_str())],
+    );
+    assert_eq!(logout.status, 200);
+    let after_logout = raw_request_with(
+        &address,
+        "GET",
+        "/plugin-ui/demo/",
+        "",
+        b"",
+        &[("Cookie", cookie.as_str())],
+    );
+    assert_eq!(after_logout.status, 401);
 }
 
 /// One installed plugin, exercised end to end across every surface this phase

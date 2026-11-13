@@ -243,7 +243,7 @@ pub fn cookie_headers(session: &str) -> Vec<(String, String)> {
         (
             "Set-Cookie".into(),
             format!(
-                "{}={}; Path=/plugin-ui/; HttpOnly; SameSite=Strict; Max-Age=86400",
+                "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400",
                 COOKIE_SESSION, session
             ),
         ),
@@ -262,7 +262,7 @@ pub fn clear_cookie_headers() -> Vec<(String, String)> {
         (
             "Set-Cookie".into(),
             format!(
-                "{}=; Path=/plugin-ui/; HttpOnly; SameSite=Strict; Max-Age=0",
+                "{}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
                 COOKIE_SESSION
             ),
         ),

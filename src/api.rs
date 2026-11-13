@@ -555,9 +555,9 @@ fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u
         );
     }
     if let Some(ui) = ui {
-        // A slashless URL never carries the `/plugin-ui/` session cookie, so
-        // browsers would stall at 401. Redirect after auth: the session check
-        // stays authoritative and only reachable pages redirect.
+        // Canonicalise `/plugin-ui/{id}` to `/plugin-ui/{id}/` after auth so
+        // relative asset URLs resolve against the plugin root; the session
+        // check stays authoritative and only reachable pages redirect.
         if request.method == "GET"
             && ui.slashless
             && package::valid_name(ui.id)

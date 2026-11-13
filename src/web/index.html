@@ -269,7 +269,13 @@ async function login() {
 async function logout() {
   TOKEN = '';
   sessionStorage.removeItem('svcd_token');
-  try { await fetch('/logout', { method: 'POST' }); } catch (_) {}
+  try {
+    await fetch('/logout', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'X-Svcd-Csrf': '1' }
+    });
+  } catch (_) {}
   showLogin();
 }
 
