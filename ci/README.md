@@ -38,3 +38,6 @@ is intended:
       --target x86_64-unknown-linux-musl --limit 2000000
 
 Offline builds work when the crates are cached: add --offline.
+
+Release builds (the platform matrix, archive layout and how to cut a tag):
+see release.md in this directory.

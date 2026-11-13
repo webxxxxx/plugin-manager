@@ -1,5 +1,6 @@
 /target
 /size-report.json
+/dist
 
 # 示例签名密钥：用 tools/gen_sample_key.mjs 生成，不入库
 /samples/keys/

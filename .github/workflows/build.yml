@@ -1,0 +1,312 @@
+name: build
+
+# Builds and packages the release matrix. Runs on its own for pull requests and
+# main, and is called by release.yml on a version tag. Keeping the matrix here
+# means a release always builds exactly what PR CI verified.
+on:
+  workflow_call:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  preflight:
+    name: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read the crate version
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$version" ]; then
+            echo "::error::could not read the version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "crate version: $version"
+      - name: Require the tag to match the crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          expected="v${{ steps.version.outputs.version }}"
+          if [ "$GITHUB_REF_NAME" != "$expected" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match $expected from Cargo.toml"
+            exit 1
+          fi
+
+  linux:
+    name: linux / ${{ matrix.target }}
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Embedded: a single static musl binary, one per architecture. The
+          # aarch64 and armv7 outputs must be ET_EXEC ("statically linked" in
+          # `file`), not static-pie, to match the router firmware format.
+          - target: x86_64-unknown-linux-musl
+            glibc: ""
+            kind: static-any
+            machine: "x86-64"
+            emulator: ""
+          - target: aarch64-unknown-linux-musl
+            glibc: ""
+            kind: static
+            machine: "ARM aarch64"
+            emulator: "qemu-aarch64-static"
+          - target: armv7-unknown-linux-musleabihf
+            glibc: ""
+            kind: static
+            machine: "ARM, EABI5"
+            emulator: "qemu-arm-static"
+          # Desktop: glibc builds for linking the WebView stack later. The
+          # suffix pins the minimum glibc instead of inheriting Zig's default.
+          - target: x86_64-unknown-linux-gnu
+            glibc: "2.35"
+            kind: dynamic
+            machine: "x86-64"
+            emulator: ""
+          - target: aarch64-unknown-linux-gnu
+            glibc: "2.35"
+            kind: dynamic
+            machine: "ARM aarch64"
+            emulator: ""
+    env:
+      TARGET: ${{ matrix.target }}
+      GLIBC: ${{ matrix.glibc }}
+      KIND: ${{ matrix.kind }}
+      MACHINE: ${{ matrix.machine }}
+      EMULATOR: ${{ matrix.emulator }}
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/build
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --version 0.24.1 --locked
+      - name: Build
+        run: |
+          set -euo pipefail
+          zig_target="$TARGET"
+          if [ -n "$GLIBC" ]; then
+            zig_target="$TARGET.$GLIBC"
+          fi
+          cargo zigbuild --locked --release --target "$zig_target"
+      - name: Verify the binary
+        run: |
+          set -euo pipefail
+          binary="target/$TARGET/release/svcd"
+          if [ ! -x "$binary" ]; then
+            # The glibc suffix is part of the target argument, not the output
+            # directory; fall back to a search rather than hard-code the layout.
+            binary="$(find target -type f -name svcd -path '*/release/*' | head -n 1 || true)"
+          fi
+          if [ -z "$binary" ] || [ ! -x "$binary" ]; then
+            echo "::error::no release binary for $TARGET"
+            exit 1
+          fi
+          echo "BINARY=$binary" >> "$GITHUB_ENV"
+          description="$(file "$binary")"
+          echo "$description"
+          case "$KIND" in
+            static)
+              if [[ "$description" != *"statically linked"* ]]; then
+                echo "::error::$TARGET must be a static ET_EXEC binary (router format), not static-pie"
+                exit 1
+              fi
+              ;;
+            static-any)
+              if [[ "$description" != *"statically linked"* && "$description" != *"static-pie linked"* ]]; then
+                echo "::error::$TARGET must be statically linked"
+                exit 1
+              fi
+              ;;
+            dynamic)
+              if [[ "$description" != *"dynamically linked"* ]]; then
+                echo "::error::$TARGET must be dynamically linked"
+                exit 1
+              fi
+              ;;
+          esac
+          if [[ "$description" != *"stripped"* ]]; then
+            echo "::error::$TARGET must be stripped"
+            exit 1
+          fi
+          if [[ "$description" != *"$MACHINE"* ]]; then
+            echo "::error::$TARGET does not match machine $MACHINE: $description"
+            exit 1
+          fi
+          if [ -n "$GLIBC" ]; then
+            required="$(readelf -W --version-info --dyn-syms "$binary" \
+              | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -V | tail -n 1 || true)"
+            if [ -z "$required" ]; then
+              echo "::error::could not read the glibc requirement of $TARGET"
+              exit 1
+            fi
+            highest="$(printf '%s\n%s\n' "$required" "$GLIBC" | sort -V | tail -n 1)"
+            echo "glibc: requires <= $required, floor $GLIBC"
+            if [ "$highest" != "$GLIBC" ]; then
+              echo "::error::$TARGET requires glibc $required, above the $GLIBC floor"
+              exit 1
+            fi
+          fi
+          stat -c '%n: %s B' "$binary"
+      - name: Install qemu-user-static
+        if: matrix.emulator != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user-static
+      - name: Smoke test
+        if: matrix.kind != 'dynamic'
+        run: |
+          set +e
+          if [ -n "$EMULATOR" ]; then
+            "$EMULATOR" -cpu max "$BINARY" >/dev/null 2>&1
+          else
+            "$BINARY" >/dev/null 2>&1
+          fi
+          status=$?
+          set -e
+          if [ "$status" -ne 64 ]; then
+            echo "::error::$TARGET exited $status under ${EMULATOR:-native}, want 64 (usage)"
+            exit 1
+          fi
+      - name: Package
+        run: |
+          set -euo pipefail
+          python3 tools/package_release.py \
+            --binary "$BINARY" \
+            --target "$TARGET" \
+            --version "${{ needs.preflight.outputs.version }}" \
+            --extra LICENSE \
+            --extra svcd.conf.example \
+            --outdir dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: svcd-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: windows / x86_64-pc-windows-msvc
+    needs: preflight
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/build
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-x86_64-pc-windows-msvc
+      - name: Build
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
+      - name: Smoke test
+        run: |
+          & "target\x86_64-pc-windows-msvc\release\svcd.exe" 2>$null
+          if ($LASTEXITCODE -ne 64) {
+            throw "svcd.exe exited $LASTEXITCODE, want 64 (usage)"
+          }
+      - name: Package
+        run: |
+          python tools/package_release.py `
+            --binary "target\x86_64-pc-windows-msvc\release\svcd.exe" `
+            --target x86_64-pc-windows-msvc `
+            --version "${{ needs.preflight.outputs.version }}" `
+            --extra LICENSE `
+            --extra svcd.conf.example `
+            --outdir dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: svcd-x86_64-pc-windows-msvc
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  macos:
+    name: macos / universal2-apple-darwin
+    needs: preflight
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/build
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-universal2-apple-darwin
+      - name: Build arm64
+        run: cargo build --locked --release --target aarch64-apple-darwin
+      - name: Build x86_64
+        run: cargo build --locked --release --target x86_64-apple-darwin
+      - name: Smoke test the native slice
+        run: |
+          set +e
+          ./target/aarch64-apple-darwin/release/svcd >/dev/null 2>&1
+          status=$?
+          set -e
+          if [ "$status" -ne 64 ]; then
+            echo "::error::svcd exited $status, want 64 (usage)"
+            exit 1
+          fi
+      - name: Combine into a universal binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist/stage
+          lipo -create \
+            target/aarch64-apple-darwin/release/svcd \
+            target/x86_64-apple-darwin/release/svcd \
+            -output dist/stage/svcd
+          chmod 755 dist/stage/svcd
+          info="$(lipo -info dist/stage/svcd)"
+          echo "$info"
+          if [[ "$info" != *arm64* || "$info" != *x86_64* ]]; then
+            echo "::error::universal binary is missing an architecture"
+            exit 1
+          fi
+      - name: Package
+        run: |
+          set -euo pipefail
+          python3 tools/package_release.py \
+            --binary dist/stage/svcd \
+            --target universal2-apple-darwin \
+            --version "${{ needs.preflight.outputs.version }}" \
+            --extra LICENSE \
+            --extra svcd.conf.example \
+            --outdir dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: svcd-universal2-apple-darwin
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
