@@ -170,7 +170,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 
 - 版本目录 `<data>/plugins/<id>/<version>/` 保留包内布局；`<id>/current` 是版本号文本、`<id>/enabled` 是标记。
 - **keep-old**（桌面默认）：新版本目录并存 → fsync → rename → 切 `current`；运行中的进程不热切，下次 start 用新版本；保留一份旧版本，`prune` 清非 current 且非运行中的版本。
-- **replace**（嵌入式默认）：验签 + 校验清单（不落盘）→ 停服务 → 删 `current` 指向的旧版本 → 解到 `<version>.tmp.<pid>/` → fsync → rename → 写 `current` → 复制 config 模板 → 跑 post-install。失败删 tmp、不写 current；**replace 没有回滚，回滚 = 重装旧 .spk**。
+- **replace**（嵌入式默认）：验签 + 校验清单（不落盘）→ 停服务 → 检查 plugin 目录空间：`free >= new` 则把旧版原地改名为 `.backup-<version>.<pid>` → 解包 → 写 `current` → 复制 config 模板；成功删备份，失败还原旧版与 `current`；`free < new` 但 `free + old >= new` 则删旧后装新（失败无回滚）；都不够则拒绝。空间按解包后体积计算。
 - 空间不足自动降级为 `replace`；`install -` 只在 `replace` 下允许；降级需 `--allow-downgrade`；运行中的版本永不删；卸载保留 config/state，`--purge` 才清。
 
 ### 2.5 hooks

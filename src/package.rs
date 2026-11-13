@@ -226,6 +226,15 @@ impl Package {
         Ok(())
     }
 
+    /// Total bytes this package writes to disk: declared files plus the two
+    /// package metadata files.
+    pub fn unpacked_size(&self) -> u64 {
+        let files: u64 = self.files.iter().map(|file| file.data.len() as u64).sum();
+        files
+            .saturating_add(self.manifest_bytes.len() as u64)
+            .saturating_add(self.signature_bytes.len() as u64)
+    }
+
     /// The manifest's `config` template, if declared.
     pub fn config_template(&self) -> Option<&FileData> {
         let path = self.manifest.config.as_deref().unwrap_or("config/config");

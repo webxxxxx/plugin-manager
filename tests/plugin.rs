@@ -519,6 +519,61 @@ fn keep_old_and_replace_have_the_documented_layouts() {
 }
 
 #[test]
+fn a_failed_replace_restores_the_old_version() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[17u8; 32]);
+    sandbox.write_key(&key);
+    let v1 = sandbox.write_package("demo-1.0.0.spk", &package_config(&key, "1.0.0", b"one"));
+    let v2 = sandbox.write_package("demo-1.1.0.spk", &package_config(&key, "1.1.0", b"two"));
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    assert_eq!(
+        sandbox
+            .run_plugin(&["install", v1.to_str().expect("utf8")])
+            .status
+            .code(),
+        Some(0)
+    );
+
+    let plugin = sandbox.data.join("plugins").join("demo");
+    let hash = plugin.join("config.template.sha256");
+    assert!(hash.is_file(), "v1 should write the template hash");
+    // Force copy_config to fail after the new version has been written and
+    // current has switched: the hash path now cannot be written as a file.
+    fs::remove_file(&hash).expect("remove hash");
+    fs::create_dir_all(&hash).expect("create hash directory");
+
+    let failed = sandbox.run_plugin(&[
+        "install",
+        v2.to_str().expect("utf8"),
+        "--strategy",
+        "replace",
+    ]);
+    assert_eq!(failed.status.code(), Some(1), "{}", stderr(&failed));
+
+    assert_eq!(
+        fs::read_to_string(plugin.join("current")).expect("current"),
+        "1.0.0"
+    );
+    assert!(
+        plugin.join("1.0.0").is_dir(),
+        "old version was not restored"
+    );
+    assert!(
+        !plugin.join("1.1.0").exists(),
+        "failed new version was not removed"
+    );
+    assert_eq!(fs::read(plugin.join("config")).expect("config"), b"one");
+    assert!(
+        !fs::read_dir(&plugin)
+            .expect("plugin dir")
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(".backup-")),
+        "failed replace left a backup directory"
+    );
+}
+
+#[test]
 fn an_invalid_package_leaves_the_installed_version_alone() {
     let mut sandbox = Sandbox::new();
     let key = SigningKey::from_bytes(&[11u8; 32]);
