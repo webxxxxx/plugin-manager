@@ -981,7 +981,7 @@ fn install_plugin(config: &std::path::Path, request: &HttpRequest, query: &str) 
             "Content-Type must be application/octet-stream",
         );
     }
-    let strategy = query_value(query, "strategy").unwrap_or_else(|| "keep-old".into());
+    let strategy = query_value(query, "strategy").unwrap_or_else(|| "replace".into());
     if strategy != "keep-old" && strategy != "replace" {
         return error(400, "bad_request", "strategy must be keep-old or replace");
     }

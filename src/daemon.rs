@@ -737,7 +737,7 @@ impl Daemon {
                 .params
                 .get("strategy")
                 .and_then(Value::as_str)
-                .unwrap_or("keep-old"),
+                .unwrap_or("replace"),
         ) {
             Some(strategy) => strategy,
             None => return Err("unknown strategy".into()),

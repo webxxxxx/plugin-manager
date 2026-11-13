@@ -296,7 +296,7 @@ function install() {
   const file = $('file').files[0];
   if (!file) { toast('请先选择 .spk 文件', 'err'); return; }
   lock(true);
-  fetch('/api/v1/plugins?strategy=replace', {
+  fetch('/api/v1/plugins', {
     method: 'POST',
     headers: authHeaders({ 'Content-Type': 'application/octet-stream' }),
     body: file

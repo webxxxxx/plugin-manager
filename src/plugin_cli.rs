@@ -131,7 +131,7 @@ fn parse(args: &[String]) -> Result<Command, ()> {
         }
         "install" => {
             let mut path = None;
-            let mut strategy = "keep-old".to_string();
+            let mut strategy = "replace".to_string();
             let mut index = 1;
             while index < args.len() {
                 let arg = &args[index];
@@ -708,7 +708,7 @@ fn usage() {
     eprintln!("usage: plugin list");
     eprintln!("       plugin status [--json] <id>");
     eprintln!("       plugin start|stop <id>");
-    eprintln!("       plugin install <file.spk> [--strategy keep-old|replace]");
+    eprintln!("       plugin install <file.spk> [--strategy keep-old|replace] (default: replace)");
     eprintln!("       plugin uninstall <id> [--purge]");
     eprintln!("       plugin editconfig <id> [--print|--file <path>|--reset]");
     eprintln!("       plugin export <id> [--config-only] [--out <path>]");
@@ -738,6 +738,13 @@ mod tests {
         );
         assert_eq!(
             parse(&args(&["install", "demo.spk", "--strategy", "replace"])).expect("install"),
+            Command::Install {
+                path: PathBuf::from("demo.spk"),
+                strategy: "replace".into()
+            }
+        );
+        assert_eq!(
+            parse(&args(&["install", "demo.spk"])).expect("default install"),
             Command::Install {
                 path: PathBuf::from("demo.spk"),
                 strategy: "replace".into()

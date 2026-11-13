@@ -494,7 +494,12 @@ fn keep_old_and_replace_have_the_documented_layouts() {
     );
     assert_eq!(
         sandbox
-            .run_plugin(&["install", v2.to_str().expect("utf8")])
+            .run_plugin(&[
+                "install",
+                v2.to_str().expect("utf8"),
+                "--strategy",
+                "keep-old"
+            ])
             .status
             .code(),
         Some(0)
@@ -570,6 +575,41 @@ fn a_failed_replace_restores_the_old_version() {
             .flatten()
             .any(|entry| entry.file_name().to_string_lossy().starts_with(".backup-")),
         "failed replace left a backup directory"
+    );
+}
+
+#[test]
+fn default_install_strategy_is_replace() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[24u8; 32]);
+    sandbox.write_key(&key);
+    let v1 = sandbox.write_package("demo-1.0.0.spk", &package(&key, "1.0.0"));
+    let v2 = sandbox.write_package("demo-1.1.0.spk", &package(&key, "1.1.0"));
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    assert_eq!(
+        sandbox
+            .run_plugin(&["install", v1.to_str().expect("utf8")])
+            .status
+            .code(),
+        Some(0)
+    );
+    assert_eq!(
+        sandbox
+            .run_plugin(&["install", v2.to_str().expect("utf8")])
+            .status
+            .code(),
+        Some(0)
+    );
+    let plugin = sandbox.data.join("plugins").join("demo");
+    assert_eq!(
+        fs::read_to_string(plugin.join("current")).expect("current"),
+        "1.1.0"
+    );
+    assert!(plugin.join("1.1.0").is_dir());
+    assert!(
+        !plugin.join("1.0.0").exists(),
+        "the default install must replace the old version"
     );
 }
 
@@ -651,7 +691,12 @@ fn running_upgrade_keeps_old_until_restart_and_replace_stops_first() {
 
     assert_eq!(
         sandbox
-            .run_plugin(&["install", v2.to_str().expect("utf8")])
+            .run_plugin(&[
+                "install",
+                v2.to_str().expect("utf8"),
+                "--strategy",
+                "keep-old"
+            ])
             .status
             .code(),
         Some(0)

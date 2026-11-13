@@ -1185,6 +1185,50 @@ fn plugin_upload_list_and_delete() {
 }
 
 #[test]
+fn default_install_strategy_is_replace() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[25u8; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let v1 = plugin_bundle(&key, "demo", "1.0.0", None, false);
+    let v2 = plugin_bundle(&key, "demo", "1.1.0", None, false);
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let first = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &v1,
+    );
+    assert_eq!(first.status, 200, "{}", first.body);
+    let plugin = sandbox.data.join("plugins").join("demo");
+    assert!(plugin.join("1.0.0").is_dir());
+
+    let second = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &v2,
+    );
+    assert_eq!(second.status, 200, "{}", second.body);
+    assert_eq!(
+        fs::read_to_string(plugin.join("current")).expect("current"),
+        "1.1.0"
+    );
+    assert!(plugin.join("1.1.0").is_dir());
+    assert!(
+        !plugin.join("1.0.0").exists(),
+        "the default API install must replace the old version"
+    );
+}
+
+#[test]
 fn untrusted_upload_returns_bad_request_not_404() {
     let mut sandbox = Sandbox::new();
     let key = SigningKey::from_bytes(&[22u8; 32]);
