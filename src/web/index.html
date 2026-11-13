@@ -114,6 +114,38 @@ function $(id) { return document.getElementById(id); }
 function pickInstall() { if (!BUSY) $('file').click(); }
 function pickTrust() { if (!BUSY) $('trustfile').click(); }
 
+async function openPluginUI(id) {
+  const url = '/plugin-ui/' + encodeURIComponent(id) + '/';
+  if (!TOKEN) {
+    window.open(url, '_blank', 'noopener');
+    return;
+  }
+  // The LAN cookie for /plugin-ui/ may be missing or stale while the API is
+  // still usable via the Bearer token. Re-run login first so the new tab gets
+  // a fresh svcd_session cookie; open the blank tab synchronously to keep the
+  // browser's popup allowance.
+  const win = window.open('about:blank', '_blank');
+  if (!win) { toast('浏览器拦截了弹窗', 'err'); return; }
+  win.opener = null;
+  try {
+    const response = await fetch('/login', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: TOKEN })
+    });
+    if (!response.ok) {
+      win.close();
+      showLogin();
+      return;
+    }
+    win.location.href = url;
+  } catch (error) {
+    win.close();
+    toast('打开失败：' + error.message, 'err');
+  }
+}
+
 function authHeaders(extra) {
   const headers = Object.assign({}, extra || {});
   if (TOKEN) headers['Authorization'] = 'Bearer ' + TOKEN;
@@ -174,7 +206,7 @@ function showMain() {
 
 function boot() {
   if (TOKEN) { showMain(); return; }
-  fetch('/api/v1/services', { headers: authHeaders() }).then(function (response) {
+  fetch('/api/v1/services', { credentials: 'same-origin', headers: authHeaders() }).then(function (response) {
     if (response.status === 401) showLogin();
     else showMain();
   }).catch(function () { showLogin(); });
@@ -186,6 +218,7 @@ async function login() {
   try {
     const response = await fetch('/login', {
       method: 'POST',
+      credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token: token })
     });
@@ -270,10 +303,9 @@ function render(plugins) {
     const actionRow = document.createElement('div');
     actionRow.className = 'actions';
     if (plugin.hasUI === true) {
-      const open = button('打开', 'ghost', function () {
-        window.open('/plugin-ui/' + encodeURIComponent(plugin.id) + '/', '_blank', 'noopener');
-      });
-      open.title = '打开插件 UI';
+      const open = button('打开', 'ghost', function () { openPluginUI(plugin.id); });
+      open.disabled = plugin.state !== 'running';
+      open.title = open.disabled ? '插件未运行，无法打开' : '打开插件 UI';
       actionRow.appendChild(open);
     }
     if (plugin.hasConfig === true) {
