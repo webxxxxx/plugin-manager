@@ -92,6 +92,11 @@ pub fn publish(plugin: &str, method: &str, params: &Value) {
     bus().publish(plugin, method, params);
 }
 
+/// Forget a purged plugin's history and subscribers.
+pub fn forget(plugin: &str) {
+    bus().forget(plugin);
+}
+
 impl EventBus {
     pub fn new() -> Self {
         EventBus {
@@ -184,6 +189,11 @@ impl EventBus {
         if remove {
             inner.remove(plugin);
         }
+    }
+
+    /// Drop a purged plugin's history and subscribers.
+    pub fn forget(&self, plugin: &str) {
+        self.lock().remove(plugin);
     }
 
     pub fn publish(&self, plugin: &str, method: &str, params: &Value) {
@@ -772,6 +782,20 @@ mod tests {
             Err(SubscribeError::TooMany)
         ));
         drop(held);
+    }
+
+    #[test]
+    fn event_bus_forgets_a_purged_plugin() {
+        let bus = Arc::new(EventBus::new());
+        let (_receiver, subscription) = bus.subscribe("demo").expect("subscribe");
+        bus.publish("demo", "notifications/message", &json!({"data": "one"}));
+        assert!(bus.history_len("demo") > 0);
+
+        bus.forget("demo");
+
+        assert_eq!(bus.subscriber_count("demo"), 0);
+        assert_eq!(bus.history_len("demo"), 0);
+        drop(subscription);
     }
 
     #[test]

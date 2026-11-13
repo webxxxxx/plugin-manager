@@ -27,6 +27,8 @@
   .tag.click { cursor:pointer; user-select:none; }
   .tag.click:hover { filter:brightness(0.94); text-decoration:underline; }
   .muted { color:var(--muted); font-size:12px; }
+  label.check { display:flex; align-items:center; gap:4px; font-size:12px; color:var(--muted); white-space:nowrap; }
+  label.check input { margin:0; }
   .hidden { display:none; }
   .tablewrap { width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }
   .tablewrap table { min-width:640px; }
@@ -72,6 +74,7 @@
     <div class="card">
       <div class="row">
         <h1 class="grow" style="margin:0">svcd 控制台</h1>
+        <button class="ghost" onclick="pickTrust()">上传公钥</button>
         <button class="ghost" onclick="load()">刷新</button>
         <button class="ghost" onclick="logout()">退出</button>
       </div>
@@ -81,17 +84,12 @@
     <div class="card">
       <h1 style="font-size:16px">安装插件</h1>
       <div class="row">
-        <input type="file" id="file" accept=".spk">
-        <button onclick="install()">上传并安装</button>
+        <button onclick="pickInstall()">上传安装</button>
         <span class="grow"></span>
         <span class="muted">只接受签名 .spk；安装时替换旧版本</span>
       </div>
-      <div class="row" style="margin-top:8px">
-        <input type="file" id="trustfile" accept=".pub">
-        <button onclick="addTrust()">上传信任公钥</button>
-        <span class="grow"></span>
-        <span class="muted">签名者的 &lt;keyId&gt;.pub，例如 samples/keys/sample-2026.pub；只需一次</span>
-      </div>
+      <input type="file" id="file" accept=".spk" class="hidden">
+      <input type="file" id="trustfile" accept=".pub" class="hidden">
     </div>
 
     <div class="card">
@@ -110,6 +108,9 @@ let TOKEN = sessionStorage.getItem('svcd_token') || '';
 let BUSY = false;
 
 function $(id) { return document.getElementById(id); }
+
+function pickInstall() { if (!BUSY) $('file').click(); }
+function pickTrust() { if (!BUSY) $('trustfile').click(); }
 
 function authHeaders(extra) {
   const headers = Object.assign({}, extra || {});
@@ -265,7 +266,9 @@ function render(plugins) {
 
     const actions = document.createElement('td');
     actions.className = 'actions';
-    actions.appendChild(button('配置', 'ghost', function () { openConfig(plugin.id); }));
+    if (plugin.hasConfig === true) {
+      actions.appendChild(button('配置', 'ghost', function () { openConfig(plugin.id); }));
+    }
     actions.appendChild(button('日志', 'ghost', function () { openLogs(plugin.id); }));
     actions.appendChild(button('导出', 'ghost', function () { exportPlugin(plugin.id); }));
     actions.appendChild(button('删除', 'danger', function () { removePlugin(plugin.id); }));
@@ -311,10 +314,10 @@ function install() {
     return response.json();
   }).then(function (body) {
     toast('已安装 ' + body.id + ' ' + body.version, 'ok');
-    $('file').value = '';
   }).catch(function (error) {
     toast('安装失败：' + error.message, 'err');
   }).finally(function () {
+    $('file').value = '';
     lock(false);
     load();
   });
@@ -339,19 +342,19 @@ function addTrust() {
     return response.json();
   }).then(function (body) {
     toast('已信任 ' + body.keyId, 'ok');
-    $('trustfile').value = '';
   }).catch(function (error) {
     toast('添加信任公钥失败：' + error.message, 'err');
   }).finally(function () {
+    $('trustfile').value = '';
     lock(false);
   });
 }
 
 function removePlugin(id) {
   if (BUSY) return;
-  if (!confirm('确定删除插件 ' + id + '？配置会保留。')) return;
+  if (!confirm('确定删除插件 ' + id + '？将删除版本、配置和日志，且不可恢复。')) return;
   lock(true);
-  fetch('/api/v1/plugins/' + encodeURIComponent(id) + '?purge=false', {
+  fetch('/api/v1/plugins/' + encodeURIComponent(id) + '?purge=true', {
     method: 'DELETE',
     headers: authHeaders()
   }).then(async function (response) {
@@ -445,35 +448,76 @@ function showLogsModal(id, text) {
   modal.className = 'modal';
   const panel = document.createElement('div');
   panel.className = 'panel';
+  const head = document.createElement('div');
+  head.className = 'row';
   const title = document.createElement('h1');
   title.style.fontSize = '16px';
+  title.style.margin = '0';
+  title.style.flex = '1';
   title.textContent = '日志：' + id;
+  const auto = document.createElement('label');
+  auto.className = 'check';
+  const check = document.createElement('input');
+  check.type = 'checkbox';
+  auto.appendChild(check);
+  auto.appendChild(document.createTextNode('自动刷新（3s）'));
+  head.appendChild(title);
+  head.appendChild(auto);
   const hint = document.createElement('p');
   hint.className = 'muted';
-  hint.textContent = '最近 200 行，不提供 follow。';
+  hint.textContent = '最近 200 行。';
   const pre = document.createElement('pre');
   pre.textContent = text;
   const actions = document.createElement('div');
   actions.className = 'row';
   actions.style.justifyContent = 'flex-end';
   actions.style.marginTop = '12px';
-  actions.appendChild(button('关闭', 'ghost', function () { modal.remove(); }));
-  panel.appendChild(title);
+
+  let timer = null;
+  function stop() {
+    if (timer) { clearInterval(timer); timer = null; }
+  }
+  async function refresh() {
+    try {
+      const response = await fetch('/api/v1/logs/' + encodeURIComponent(id) + '?lines=200', { headers: authHeaders() });
+      if (response.status === 401) { stop(); showLogin(); return; }
+      if (response.status === 404) { pre.textContent = '还没有日志'; return; }
+      if (!response.ok) throw new Error(await errorText(response));
+      const next = await response.text();
+      const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+      pre.textContent = next;
+      if (atBottom) pre.scrollTop = pre.scrollHeight;
+    } catch (_) {
+      // Keep the last good snapshot; the next tick retries.
+    }
+  }
+  function close() { stop(); modal.remove(); }
+  check.onchange = function () {
+    stop();
+    if (check.checked) {
+      refresh();
+      timer = setInterval(refresh, 3000);
+    }
+  };
+  modal.onclick = function (event) { if (event.target === modal) close(); };
+  actions.appendChild(button('关闭', 'ghost', close));
+  panel.appendChild(head);
   panel.appendChild(hint);
   panel.appendChild(pre);
   panel.appendChild(actions);
   modal.appendChild(panel);
   document.body.appendChild(modal);
+  pre.scrollTop = pre.scrollHeight;
 }
 
 function exportPlugin(id) {
   if (BUSY) return;
   lock(true);
-  fetch('/api/v1/export/' + encodeURIComponent(id), { headers: authHeaders() }).then(async function (response) {
+  fetch('/api/v1/export/' + encodeURIComponent(id) + '/spk', { headers: authHeaders() }).then(async function (response) {
     if (!response.ok) throw new Error(await errorText(response));
     const blob = await response.blob();
     const disposition = response.headers.get('Content-Disposition') || '';
-    let filename = id + '.spkb';
+    let filename = id + '.spk';
     const match = /filename="([^"]+)"/.exec(disposition);
     if (match) filename = match[1];
     const url = URL.createObjectURL(blob);
@@ -490,6 +534,8 @@ function exportPlugin(id) {
   }).finally(function () { lock(false); });
 }
 
+$('file').addEventListener('change', install);
+$('trustfile').addEventListener('change', addTrust);
 boot();
 </script>
 </body>

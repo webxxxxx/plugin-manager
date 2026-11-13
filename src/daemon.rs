@@ -856,6 +856,11 @@ impl Daemon {
         plugin::uninstall(id, purge)?;
         self.slots.remove(id);
         self.registry.remove(id);
+        if purge {
+            plugin::remove_logs(id);
+            #[cfg(feature = "http")]
+            crate::uichannel::forget(id);
+        }
         log::svcd(&format!("svcd: plugin {} uninstalled", id));
         Ok(())
     }

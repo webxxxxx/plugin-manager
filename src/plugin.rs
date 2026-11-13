@@ -498,6 +498,31 @@ pub fn scan() -> (Vec<Service>, Vec<String>) {
     (services, warnings)
 }
 
+/// Remove the service and install-hook logs for a purged plugin. The slot is
+/// already gone, but its reader threads may still be closing the file on
+/// Windows, so retry briefly instead of leaving rotated logs behind.
+pub fn remove_logs(id: &str) {
+    let directory = paths::logs_dir();
+    let names = [
+        format!("{}.log", id),
+        format!("{}.log.1", id),
+        format!("{}.log.2", id),
+        format!("{}-hooks.log", id),
+        format!("{}-hooks.log.1", id),
+        format!("{}-hooks.log.2", id),
+    ];
+    for name in names {
+        let path = directory.join(name);
+        for _ in 0..10 {
+            match fs::remove_file(&path) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+    }
+}
+
 pub fn uninstall(id: &str, purge: bool) -> Result<(), String> {
     if !package::valid_name(id) || id == RESERVED_ID {
         return Err(format!("unknown plugin: {}", id));

@@ -1206,6 +1206,51 @@ fn plugin_upload_list_and_delete() {
 }
 
 #[test]
+fn purge_delete_removes_the_plugin_tree_and_logs() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[24u8; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let package = plugin_bundle(&key, "demo", "1.0.0", None, false);
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let installed = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(installed.status, 200, "{}", installed.body);
+    let started = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
+    assert_eq!(started.status, 200, "{}", started.body);
+
+    let log = sandbox.logs.join("demo.log");
+    assert!(log.is_file(), "the service log should exist after start");
+
+    let deleted = request(
+        &address,
+        "DELETE",
+        "/api/v1/plugins/demo?purge=true",
+        "",
+        b"",
+    );
+    assert_eq!(deleted.status, 200, "{}", deleted.body);
+    assert!(!plugin_dir(&sandbox, "demo").exists());
+    for _ in 0..40 {
+        if !log.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!log.exists(), "purge must remove the service log");
+}
+
+#[test]
 fn trust_upload_enables_a_signed_install() {
     let mut sandbox = Sandbox::new();
     let key = SigningKey::from_bytes(&[41u8; 32]);
@@ -1696,6 +1741,19 @@ fn export_import_and_logs() {
         200
     );
 
+    let services = request(&address, "GET", "/api/v1/services", "", b"");
+    let summaries = services.body["services"].as_array().expect("services");
+    let demo = summaries
+        .iter()
+        .find(|service| service["id"] == "demo")
+        .expect("demo");
+    let plain = summaries
+        .iter()
+        .find(|service| service["id"] == "plain")
+        .expect("plain");
+    assert_eq!(demo["hasConfig"], true);
+    assert_eq!(plain["hasConfig"], false);
+
     let directory = plugin_dir(&sandbox, "demo");
     let active = directory.join("config");
 
@@ -1710,6 +1768,16 @@ fn export_import_and_logs() {
     assert_eq!(names.first().map(String::as_str), Some("backup.json"));
     assert!(names.iter().any(|name| name == "plugin.spk"), "{names:?}");
     assert!(names.iter().any(|name| name == "config"), "{names:?}");
+
+    let spk = raw_request(&address, "GET", "/api/v1/export/demo/spk", "", b"");
+    assert_eq!(spk.status, 200, "{}", String::from_utf8_lossy(&spk.body));
+    assert!(raw_header_values(&spk, "content-disposition")[0].contains("demo-1.0.0.spk"));
+    let names = tar_names(&spk.body);
+    assert_eq!(names.first().map(String::as_str), Some("manifest.json"));
+    assert!(
+        names.iter().any(|name| name == "signature.json"),
+        "{names:?}"
+    );
 
     let config_export = raw_request(&address, "GET", "/api/v1/export/demo/config", "", b"");
     assert_eq!(config_export.status, 200);
@@ -1910,6 +1978,16 @@ fn serves_the_embedded_console() {
         html.contains("/api/v1/services"),
         "console does not call the management API"
     );
+    for needle in [
+        "上传安装",
+        "上传公钥",
+        "自动刷新（3s）",
+        "hasConfig",
+        "purge=true",
+        "/spk",
+    ] {
+        assert!(html.contains(needle), "console missing {}", needle);
+    }
     let index = raw_request(&address, "GET", "/index.html", "", b"");
     assert_eq!(index.status, 200);
 

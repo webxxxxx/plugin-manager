@@ -899,7 +899,17 @@ fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<
                     .unwrap_or_default();
                 let summaries: Vec<Value> = services
                     .into_iter()
-                    .filter_map(|status| status.get("summary").cloned())
+                    .filter_map(|status| {
+                        let has_config = status
+                            .pointer("/details/config")
+                            .and_then(Value::as_str)
+                            .is_some();
+                        let mut summary = status.get("summary").cloned()?;
+                        if let Some(object) = summary.as_object_mut() {
+                            object.insert("hasConfig".into(), Value::Bool(has_config));
+                        }
+                        Some(summary)
+                    })
                     .collect();
                 ok(json!({ "services": summaries }))
             }
@@ -959,6 +969,8 @@ fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<
         (_, ["api", "v1", "config", _]) => method_not_allowed("GET, PUT"),
         ("GET", ["api", "v1", "export", id, "config"]) => export_config(config, &decode(id)),
         (_, ["api", "v1", "export", _, "config"]) => method_not_allowed("GET"),
+        ("GET", ["api", "v1", "export", id, "spk"]) => export_spk(config, &decode(id)),
+        (_, ["api", "v1", "export", _, "spk"]) => method_not_allowed("GET"),
         ("GET", ["api", "v1", "export", id]) => export_spkb(config, &decode(id)),
         (_, ["api", "v1", "export", _]) => method_not_allowed("GET"),
         ("POST", ["api", "v1", "import"]) => import_plugin(request, query),
@@ -1152,6 +1164,17 @@ fn export_spkb(config: &Path, id: &str) -> Vec<u8> {
     }
     match plugin::export_spkb(id) {
         Ok((version, data)) => download(&format!("{}-{}.spkb", id, version), &data),
+        Err(message) => error(500, "internal", &message),
+    }
+}
+
+/// The installable, signed package reconstructed from the current version.
+fn export_spk(config: &Path, id: &str) -> Vec<u8> {
+    if let Err(response) = require_plugin(config, id) {
+        return response;
+    }
+    match plugin::export_spk(id) {
+        Ok((version, data)) => download(&format!("{}-{}.spk", id, version), &data),
         Err(message) => error(500, "internal", &message),
     }
 }

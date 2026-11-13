@@ -192,7 +192,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 - 版本目录 `<data>/plugins/<id>/<version>/` 保留包内布局；`<id>/current` 是版本号文本、`<id>/enabled` 是标记。
 - **keep-old**（显式 `--strategy keep-old`）：新版本目录并存 → fsync → rename → 切 `current`；运行中的进程不热切，下次 start 用新版本；保留一份旧版本，`prune` 清非 current 且非运行中的版本。
 - **replace**（默认，所有安装入口）：验签 + 校验清单（不落盘）→ 停服务 → 检查 plugin 目录空间：`free >= new` 则把旧版原地改名为 `.backup-<version>.<pid>` → 解包 → 写 `current` → 复制 config 模板；成功删备份，失败还原旧版与 `current`；`free < new` 但 `free + old >= new` 则删旧后装新（失败无回滚）；都不够则拒绝。空间按解包后体积计算。
-- 空间不足自动降级为 `replace`；`install -` 只在 `replace` 下允许；降级需 `--allow-downgrade`；运行中的版本永不删；卸载保留 config/state，`--purge` 才清。
+- 空间不足自动降级为 `replace`；`install -` 只在 `replace` 下允许；降级需 `--allow-downgrade`；运行中的版本永不删；卸载默认保留 config/state，`--purge` 才清（并删除服务/安装钩子日志）。
 - 所有安装入口默认 `replace`；`--strategy keep-old` 显式保留。Web 控制台不提供策略选择。
 
 ### 2.5 hooks
@@ -266,7 +266,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 ### 3.5 HTTP 管理 API
 
 - 前缀 `/api/v1`，JSON only（上传/下载为二进制），无 CORS；**覆盖 `svc` 的全部管理命令**：
-  - `GET /api/v1/services` → `{services:[summary]}`（§5.2 的 summary）
+  - `GET /api/v1/services` → `{services:[summary + hasConfig]}`（§5.2 的 summary；`hasConfig` 是 HTTP 列表附加项，表示活动配置是否存在）
   - `GET /api/v1/services/{id}` → `{summary, details}`
   - `POST /api/v1/services/{id}/start` → 同步到 ready，返回 `{summary}`；超时 504
   - `POST /api/v1/services/{id}/stop` → 返回 `{summary}`
@@ -275,9 +275,10 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
   - `GET /` / `GET /index.html` → 内嵌 Web 控制台（静态 HTML；页面本身不需要认证，API 调用仍走同一鉴权）
   - `POST /api/v1/plugins`：body 为 `.spk` 原始字节（`application/octet-stream`），query `strategy` / `enable` / `allow_hooks`；流式写临时文件，512 MiB 上限；返回 `{id,version,state}`
   - `GET /api/v1/trust` → `{keys:[keyId], directory}`；`POST /api/v1/trust?key_id=<id>`：body 为 PEM SPKI 公钥，写入 `<config>/trust.d/<id>.pub`；`DELETE /api/v1/trust/{keyId}` 撤销
-  - `DELETE /api/v1/plugins/{id}?purge=false`：卸载
+  - `DELETE /api/v1/plugins/{id}?purge=false`：卸载；`purge=true` 删除版本、配置、状态与 `<id>.log` / `<id>-hooks.log`（含轮转），Web 控制台使用 `purge=true`
   - `POST /api/v1/import?config_id=<id>&no_config=false&force=false`：body 为 `.spk` / `.spkb` / 裸配置，自动识别，语义同 CLI
-  - `GET /api/v1/export/{id}`：整包 `.spkb`（`application/octet-stream`）
+  - `GET /api/v1/export/{id}/spk`：从已安装版本重建的可安装、已签名 `.spk`（`application/octet-stream`；Web 控制台“导出”使用它）
+  - `GET /api/v1/export/{id}`：整包 `.spkb` 备份容器（`backup.json` + `plugin.spk` + 配置；供备份/导入）
   - `GET /api/v1/export/{id}/config`：单配置
   - `GET /api/v1/config/{id}`：活动配置原始字节（`text/plain`；无配置 404）
   - `PUT /api/v1/config/{id}`：body 为候选配置；跑 `configCheck`，原子替换，保留 last-good；校验失败 409
@@ -293,7 +294,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 - HTTP/1.1 keep-alive：同一连接顺序处理多个请求；`Connection: close` 显式关闭；不支持 pipelining；每个连接仍占一个线程。
 - **嵌入式构建（#86）**：默认 feature `http`（HTTP 管理 API、内嵌控制台、插件 Web UI、LAN、MCP HTTP）。`cargo build --release --no-default-features` 移除这些，保留 daemon/supervisor、channel、CLI 与 MCP stdio；Windows 二进制约 1.14 MB → 1.00 MB，musl 约 1.36 MB → 1.21 MB。HTTP/channel/plugin reader/WS worker 线程使用 128–256 KB 显式栈（默认约 2 MB）；musl 下 daemon VM @30 插件由约 128 MB 降到约 11.6 MB，RSS 基本不变。
 - **实现状态（2026-11-13，#79/#83）**：HTTP 监听改为阻塞 accept（rebind 用 loopback 探针唤醒并丢弃探针）；daemon 改用 condvar 唤醒控制通道和插件 stdout，事件循环只在 50ms 兜底等待中检查 shutdown/定时器，无 1ms 轮询；`/api/v1` 与 `/mcp` 支持 HTTP/1.1 keep-alive（顺序多请求，`Connection: close` 可关闭），WS/SSE 仍独占连接。性能对比见 `docs/research/2026-11-13-core-compat-and-performance.md`。
-- **实现状态（2026-11-12，#37 / #38 / #39）**：已实现 `GET /services`、`GET /services/{id}`、`POST start/stop`、`GET /version`、`POST /plugins`、`DELETE /plugins/{id}`；默认绑定 `127.0.0.1:8787`（`SVCD_HTTP_PORT` 覆盖，`0` 为临时端口并写 `<config>/http.port`），**无 TLS**；`svc lan enable` 可切到 LAN 并要求 Bearer/cookie 认证（#38）。#39 补齐 `GET/PUT /config/{id}`、`POST /config/{id}/reset`、`GET /export/{id}` 与 `/export/{id}/config`、`POST /import`（自动识别）、`GET /logs/{id}?lines=N`（默认 200、上限 2000、不提供 follow）、`POST /services/{id}/enable|disable`；这些端点只接受 plugin id，core 服务返回 404，方法不符返回 405。`GET /` 提供内嵌控制台（插件列表/安装/启停/自启/配置/日志/导出），页面无需认证即可加载，API 调用仍走同一鉴权。
+- **实现状态（2026-11-12，#37 / #38 / #39）**：已实现 `GET /services`、`GET /services/{id}`、`POST start/stop`、`GET /version`、`POST /plugins`、`DELETE /plugins/{id}`；默认绑定 `127.0.0.1:8787`（`SVCD_HTTP_PORT` 覆盖，`0` 为临时端口并写 `<config>/http.port`），**无 TLS**；`svc lan enable` 可切到 LAN 并要求 Bearer/cookie 认证（#38）。#39 补齐 `GET/PUT /config/{id}`、`POST /config/{id}/reset`、`GET /export/{id}/spk`（可安装 `.spk`）、`GET /export/{id}`（`.spkb` 备份）、`GET /export/{id}/config`、`POST /import`（自动识别）、`GET /logs/{id}?lines=N`（默认 200、上限 2000、不提供 follow）、`POST /services/{id}/enable|disable`；这些端点只接受 plugin id，core 服务返回 404，方法不符返回 405。`GET /` 提供内嵌控制台（插件列表/安装/启停/自启/配置/日志/导出）：上传按钮直接弹文件框，公钥上传在顶栏，无配置的插件不显示“配置”，日志弹框可 3 秒自动刷新，删除走 `purge=true`。页面无需认证即可加载，API 调用仍走同一鉴权。
 
 ### 3.6 LAN 鉴权与会话
 
@@ -337,7 +338,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 
 ### 5.2 status
 
-- `summary`：id、kind、state、enabled、pid、since、version。
+- `summary`：id、kind、state、enabled、pid、since、version；HTTP `GET /api/v1/services` 的投影额外带 `hasConfig`（活动配置是否存在），`svc list` 的 payload 不变。
 - `details`：dependencies[]、last_exit、next_at、ready_since、failures、config、probe（仅 `svc status` 探测 core 的 status 动作时出现，内容为该动作的 stdout/摘要）。
 - `svc list` 列：`ID  KIND  STATE  AUTO  PID  VERSION`；AUTO 显示 `[auto]` 或 `-`。
 - `svc list` 只投影受管服务（core + plugin），不含内置 `svc` 自身（svcd 由系统服务管理器拉起，不归自己管）；`svc status svc` 仍可读。
