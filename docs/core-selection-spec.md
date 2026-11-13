@@ -45,7 +45,8 @@
 
 - 五份 `InstallPlan`：systemd（`/etc/systemd/system/svcd.service`，Type=notify、Restart=on-failure、TimeoutStopSec=40）、launchd（`/Library/LaunchDaemons/com.webxxxxx.svcd.plist`，KeepAlive、ThrottleInterval 10）、Windows SCM（`sc create` + failure actions）、BusyBox inittab（`::respawn:`）、procd（`/etc/init.d/svcd`）。
 - 安装需 root / Administrator；幂等（原子替换 + EnsureLine；`sc create` 1073 视为已存在）。
-- `svcd --install [--prefix] [--no-service] [--target]`：复制/硬链 `svcd`、`svc`、`plugin`、`mcp` 到平台默认目录（Unix `/usr/sbin`，Windows `%ProgramFiles%\svcd`），再调用 `install-service --program <安装路径>`；`--uninstall` 逆操作，默认保留 config/data/logs，`--purge` 才清。
+- `svcd --install [--prefix] [--conf <file>] [--no-service] [--target]`：复制/硬链 `svcd`、`svc`、`plugin`、`mcp` 到平台默认目录（Unix `/usr/sbin`，Windows `%ProgramFiles%\svcd`），再调用 `install-service --program <安装路径>`；`--uninstall` 逆操作，默认保留 config/data/logs，`--purge` 才清。
+- `svcd --install --conf <file>`：校验并原子复制到 `<config>/svcd.conf`。键：`http_port`（0 允许临时端口；`SVCD_HTTP_PORT` 仍覆盖）、`lan_default`（true 时写 `<config>/lan.json` 并生成/复用 token）、`plugins_dir`、`services_dir`。相对路径相对 `<config>`；未知键/坏值拒绝且不覆盖已安装配置；`--uninstall` 默认保留，`--purge` 删除。
 - 卸载默认保留 `<data>` 与配置，`--purge` 才删。
 
 ### 1.6 core 服务与 plugin 的边界
@@ -305,7 +306,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 
 ### 5.1 入口
 
-- `svcd`：守护进程；`svcd run --foreground`、`svcd install-service / uninstall-service`、`svcd --install / --uninstall`。
+- `svcd`：守护进程；`svcd run --foreground`、`svcd install-service / uninstall-service`、`svcd --install [--conf <file>] / --uninstall`。
 - `svc`：服务 CLI，接受任意服务 id（core 或 plugin）：`list / status / start / stop / enable / disable / logs / lan / version`。
 - `plugin`：插件 CLI，**只接受 `kind=plugin` 的 id**；动词与 `svc` 同源，另加 `install / uninstall / editconfig / export / import`。传 core 服务 id 报错「不是插件」。
 - `mcp`：stdio MCP 桥，每个客户端一个进程。

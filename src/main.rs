@@ -22,6 +22,7 @@ mod registry;
 mod rpc;
 #[cfg(windows)]
 mod service_win;
+mod settings;
 mod slot;
 mod status;
 mod supervisor;
@@ -81,7 +82,7 @@ fn run_foreground() -> i32 {
 fn usage() {
     eprintln!("usage: svcd run --foreground");
     eprintln!("       svcd shutdown");
-    eprintln!("       svcd --install [--prefix <dir>] [--no-service] [--dry-run]");
+    eprintln!("       svcd --install [--prefix <dir>] [--conf <file>] [--no-service] [--dry-run]");
     eprintln!("       svcd --uninstall [--prefix <dir>] [--no-service] [--purge] [--dry-run]");
     eprintln!(
         "       svcd install-service [--target systemd|launchd|scm|busybox|procd] [--dry-run]"

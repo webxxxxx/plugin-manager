@@ -26,6 +26,7 @@ use crate::package;
 use crate::paths;
 use crate::plugin;
 use crate::rpc;
+use crate::settings;
 use crate::threads;
 use crate::transfer;
 use crate::uichannel;
@@ -62,9 +63,13 @@ enum Command {
 }
 
 pub fn spawn(config: PathBuf) -> std::io::Result<Arc<Api>> {
+    let configured = settings::current()
+        .ok()
+        .and_then(|settings| settings.http_port);
     let port = std::env::var("SVCD_HTTP_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
+        .or(configured)
         .unwrap_or(DEFAULT_PORT);
     let state = Lan::load(&config);
     let bind = if state.enabled {

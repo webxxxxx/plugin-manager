@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::settings;
+
 /// The platform configuration directory. `SVCD_CONFIG_DIR` overrides it so tests
 /// and non-root development runs can use an isolated tree; production paths are
 /// `/etc/svcd`, `/Library/Application Support/svcd/config` and
@@ -12,12 +14,19 @@ pub fn config_dir() -> PathBuf {
 }
 
 pub fn services_dir() -> PathBuf {
-    config_dir().join("services.d")
+    settings::current()
+        .ok()
+        .and_then(|settings| settings.services_dir.clone())
+        .unwrap_or_else(|| config_dir().join("services.d"))
 }
 
-/// Installed plugins: `<data>/plugins/<id>/<version>/`.
+/// Installed plugins: `<data>/plugins/<id>/<version>/`, or the
+/// `plugins_dir` from `svcd.conf`.
 pub fn plugins_dir() -> PathBuf {
-    data_dir().join("plugins")
+    settings::current()
+        .ok()
+        .and_then(|settings| settings.plugins_dir.clone())
+        .unwrap_or_else(|| data_dir().join("plugins"))
 }
 
 /// Ed25519 trust roots: `<config>/trust.d/<keyId>.pub` (PEM SPKI).
