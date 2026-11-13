@@ -938,3 +938,264 @@ fn bundle_refuses_missing_keys_ambiguous_execs_and_symlinks() {
         );
     }
 }
+
+fn hook_body(kind: &str) -> Vec<u8> {
+    #[cfg(windows)]
+    {
+        format!(
+            "@echo off\r\necho %SVCD_PLUGIN_ID% %SVCD_PLUGIN_VERSION% %SVCD_ACTION%>\"%SVCD_DATA_DIR%\\{kind}.txt\"\r\n"
+        )
+        .into_bytes()
+    }
+    #[cfg(unix)]
+    {
+        format!(
+            "#!/bin/sh\nprintf '%s %s %s\\n' \"$SVCD_PLUGIN_ID\" \"$SVCD_PLUGIN_VERSION\" \"$SVCD_ACTION\" > \"$SVCD_DATA_DIR/{kind}.txt\"\n"
+        )
+        .into_bytes()
+    }
+}
+
+fn failing_hook_body() -> Vec<u8> {
+    #[cfg(windows)]
+    {
+        b"@echo off\r\nexit /b 3\r\n".to_vec()
+    }
+    #[cfg(unix)]
+    {
+        b"#!/bin/sh\nexit 3\n".to_vec()
+    }
+}
+
+fn package_with_hooks(
+    key: &SigningKey,
+    version: &str,
+    post: Option<&[u8]>,
+    pre: Option<&[u8]>,
+) -> Vec<u8> {
+    let (name, exec) = script();
+    let exec_path = format!("payload/bin/{}", name);
+    let config = b"{}".to_vec();
+    let extension = if cfg!(windows) { "cmd" } else { "sh" };
+    let mut files: Vec<(String, Vec<u8>, u32)> = vec![
+        (exec_path.clone(), exec, 0o755),
+        ("config/config".to_string(), config, 0o644),
+    ];
+    let mut hooks = serde_json::Map::new();
+    if let Some(body) = post {
+        let path = format!("hooks/post-install.{}", extension);
+        files.push((path.clone(), body.to_vec(), 0o755));
+        hooks.insert("postInstall".into(), json!(path));
+    }
+    if let Some(body) = pre {
+        let path = format!("hooks/pre-remove.{}", extension);
+        files.push((path.clone(), body.to_vec(), 0o755));
+        hooks.insert("preRemove".into(), json!(path));
+    }
+    let entries: Vec<Value> = files
+        .iter()
+        .map(|(path, data, mode)| {
+            json!({
+                "path": path,
+                "size": data.len(),
+                "sha256": hex_sha256(data),
+                "mode": mode
+            })
+        })
+        .collect();
+    let mut manifest = json!({
+        "schema": 1,
+        "name": "demo",
+        "version": version,
+        "desc": "test plugin",
+        "platform": target(),
+        "protocol": 1,
+        "exec": {"path": exec_path, "args": [], "ready": "notify"},
+        "config": "config/config",
+        "files": entries
+    });
+    if !hooks.is_empty() {
+        manifest["hooks"] = Value::Object(hooks);
+    }
+    let manifest = serde_json::to_vec(&manifest).expect("manifest");
+    let signature =
+        json!({"alg":"ed25519","keyId":"test","sig":BASE64.encode(key.sign(&manifest).to_bytes())});
+    let signature = serde_json::to_vec(&signature).expect("signature");
+    let mut tar = Vec::new();
+    tar.extend_from_slice(&header("manifest.json", manifest.len(), 0o644));
+    tar.extend_from_slice(&manifest);
+    tar.extend(std::iter::repeat_n(0, padding(manifest.len())));
+    tar.extend_from_slice(&header("signature.json", signature.len(), 0o644));
+    tar.extend_from_slice(&signature);
+    tar.extend(std::iter::repeat_n(0, padding(signature.len())));
+    for (path, data, mode) in files {
+        tar.extend_from_slice(&header(&path, data.len(), mode));
+        tar.extend_from_slice(&data);
+        tar.extend(std::iter::repeat_n(0, padding(data.len())));
+    }
+    tar.extend(std::iter::repeat_n(0, 1024));
+    tar
+}
+
+fn read_marker(sandbox: &Sandbox, name: &str) -> String {
+    fs::read_to_string(sandbox.data.join(name)).unwrap_or_else(|error| {
+        panic!(
+            "marker {} was not written: {} (daemon: {})",
+            sandbox.data.join(name).display(),
+            error,
+            sandbox.daemon_log()
+        )
+    })
+}
+
+#[test]
+fn install_and_uninstall_run_the_declared_hooks() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[21u8; 32]);
+    sandbox.write_key(&key);
+    let post = hook_body("post-install");
+    let pre = hook_body("pre-remove");
+    let package = sandbox.write_package(
+        "demo-1.0.0.spk",
+        &package_with_hooks(&key, "1.0.0", Some(&post), Some(&pre)),
+    );
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+
+    let installed = sandbox.run_plugin(&["install", package.to_str().expect("utf8")]);
+    assert_eq!(
+        installed.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&installed)
+    );
+    assert_eq!(
+        read_marker(&sandbox, "post-install.txt").trim(),
+        "demo 1.0.0 post-install"
+    );
+
+    let removed = sandbox.run_plugin(&["uninstall", "demo"]);
+    assert_eq!(
+        removed.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&removed)
+    );
+    assert_eq!(
+        read_marker(&sandbox, "pre-remove.txt").trim(),
+        "demo 1.0.0 pre-remove"
+    );
+}
+
+#[test]
+fn a_failing_post_install_rolls_back_a_replace() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[22u8; 32]);
+    sandbox.write_key(&key);
+    let v1 = sandbox.write_package("demo-1.0.0.spk", &package(&key, "1.0.0"));
+    let failing = failing_hook_body();
+    let v2 = sandbox.write_package(
+        "demo-1.1.0.spk",
+        &package_with_hooks(&key, "1.1.0", Some(&failing), None),
+    );
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    assert_eq!(
+        sandbox
+            .run_plugin(&["install", v1.to_str().expect("utf8")])
+            .status
+            .code(),
+        Some(0)
+    );
+
+    let failed = sandbox.run_plugin(&["install", v2.to_str().expect("utf8")]);
+    assert_eq!(failed.status.code(), Some(1), "{}", stderr(&failed));
+    assert!(
+        stderr(&failed).contains("post-install"),
+        "{}",
+        stderr(&failed)
+    );
+
+    let plugin = sandbox.data.join("plugins").join("demo");
+    assert_eq!(
+        fs::read_to_string(plugin.join("current")).expect("current"),
+        "1.0.0"
+    );
+    assert!(plugin.join("1.0.0").is_dir());
+    assert!(
+        !plugin.join("1.1.0").exists(),
+        "failed new version was not removed"
+    );
+}
+
+#[test]
+fn a_failing_post_install_rolls_back_a_keep_old_install() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[23u8; 32]);
+    sandbox.write_key(&key);
+    let v1 = sandbox.write_package("demo-1.0.0.spk", &package(&key, "1.0.0"));
+    let failing = failing_hook_body();
+    let v2 = sandbox.write_package(
+        "demo-1.1.0.spk",
+        &package_with_hooks(&key, "1.1.0", Some(&failing), None),
+    );
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    assert_eq!(
+        sandbox
+            .run_plugin(&["install", v1.to_str().expect("utf8")])
+            .status
+            .code(),
+        Some(0)
+    );
+
+    let failed = sandbox.run_plugin(&[
+        "install",
+        v2.to_str().expect("utf8"),
+        "--strategy",
+        "keep-old",
+    ]);
+    assert_eq!(failed.status.code(), Some(1), "{}", stderr(&failed));
+
+    let plugin = sandbox.data.join("plugins").join("demo");
+    assert_eq!(
+        fs::read_to_string(plugin.join("current")).expect("current"),
+        "1.0.0"
+    );
+    assert!(plugin.join("1.0.0").is_dir());
+    assert!(
+        !plugin.join("1.1.0").exists(),
+        "failed new version was not removed"
+    );
+}
+
+#[test]
+fn a_failing_pre_remove_hook_does_not_block_uninstall() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[24u8; 32]);
+    sandbox.write_key(&key);
+    let failing = failing_hook_body();
+    let package = sandbox.write_package(
+        "demo-1.0.0.spk",
+        &package_with_hooks(&key, "1.0.0", None, Some(&failing)),
+    );
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    assert_eq!(
+        sandbox
+            .run_plugin(&["install", package.to_str().expect("utf8")])
+            .status
+            .code(),
+        Some(0)
+    );
+
+    let removed = sandbox.run_plugin(&["uninstall", "demo"]);
+
+    assert_eq!(removed.status.code(), Some(0), "{}", stderr(&removed));
+    assert!(!sandbox
+        .data
+        .join("plugins")
+        .join("demo")
+        .join("current")
+        .exists());
+}

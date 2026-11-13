@@ -986,6 +986,7 @@ fn install_plugin(config: &std::path::Path, request: &HttpRequest, query: &str) 
         return error(400, "bad_request", "strategy must be keep-old or replace");
     }
     let enable = query_bool(query, "enable").unwrap_or(true);
+    let allow_hooks = query_bool(query, "allow_hooks").unwrap_or(false);
 
     let temp_dir = paths::config_dir().join("tmp");
     let _ = fs::create_dir_all(&temp_dir);
@@ -1000,7 +1001,11 @@ fn install_plugin(config: &std::path::Path, request: &HttpRequest, query: &str) 
     let result = rpc(
         config,
         "plugin.install",
-        json!({ "path": path.to_string_lossy(), "strategy": strategy }),
+        json!({
+            "path": path.to_string_lossy(),
+            "strategy": strategy,
+            "allowHooks": allow_hooks,
+        }),
     );
     let _ = fs::remove_file(&path);
 

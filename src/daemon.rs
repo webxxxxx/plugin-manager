@@ -750,6 +750,11 @@ impl Daemon {
             Some(strategy) => strategy,
             None => return Err("unknown strategy".into()),
         };
+        let allow_hooks = request
+            .params
+            .get("allowHooks")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         let package = package::verify_package(Path::new(path))?;
         let id = package.manifest.name.clone();
@@ -758,6 +763,9 @@ impl Daemon {
                 return Err(format!("id is a core service: {}", id));
             }
         }
+        // Refuse a hook package before a replace strategy stops the running
+        // version: a policy rejection must not leave the plugin stopped.
+        plugin::ensure_hooks_allowed(&package, allow_hooks)?;
 
         let running = |slots: &BTreeMap<String, Slot>| {
             slots
@@ -769,7 +777,7 @@ impl Daemon {
             self.stop_service(&id)?;
         }
         let still_running = running(&self.slots);
-        let service = match plugin::install_package(&package, strategy) {
+        let service = match plugin::install_package(&package, strategy, allow_hooks) {
             Ok(service) => service,
             Err(error) if strategy == Strategy::KeepOld && is_no_space(&error) => {
                 if still_running {
@@ -782,7 +790,7 @@ impl Daemon {
                     "svcd: plugin {}: keep-old ran out of space; falling back to replace",
                     id
                 ));
-                plugin::install_package(&package, Strategy::Replace)?
+                plugin::install_package(&package, Strategy::Replace, allow_hooks)?
             }
             Err(error) => return Err(error),
         };

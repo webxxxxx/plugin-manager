@@ -4,6 +4,7 @@ mod bundle;
 mod channel;
 mod daemon;
 mod definition;
+mod hook;
 mod http;
 mod install;
 mod ipc;

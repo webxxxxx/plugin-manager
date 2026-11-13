@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use crate::hook;
 use crate::log;
 use crate::package::{self, Package};
 use crate::paths;
@@ -48,11 +49,36 @@ fn replace_plan(free: u64, old: Option<u64>, new: u64) -> ReplacePlan {
     }
 }
 
-pub fn install_package(package: &Package, strategy: Strategy) -> Result<Service, String> {
+/// Hooks run with the installer's privileges: a desktop build (the default
+/// feature set) allows them, an embedded build (`--no-default-features`) only
+/// with the explicit opt-in. `opt_in_hooks` is that escape hatch, so `false`
+/// does not mean "refuse" on desktop.
+fn hooks_allowed(opt_in_hooks: bool) -> bool {
+    opt_in_hooks || cfg!(feature = "http")
+}
+
+/// Reject a hook package before any install side effect (such as stopping the
+/// running version) can happen.
+pub fn ensure_hooks_allowed(package: &Package, opt_in_hooks: bool) -> Result<(), String> {
+    if package::declares_hooks(&package.manifest) && !hooks_allowed(opt_in_hooks) {
+        return Err(format!(
+            "package {} declares hooks; this build requires --allow-hooks",
+            package.manifest.name
+        ));
+    }
+    Ok(())
+}
+
+pub fn install_package(
+    package: &Package,
+    strategy: Strategy,
+    opt_in_hooks: bool,
+) -> Result<Service, String> {
     let id = package.manifest.name.clone();
     if id == RESERVED_ID {
         return Err("the built-in svc id is reserved".into());
     }
+    ensure_hooks_allowed(package, opt_in_hooks)?;
     if paths::services_dir().join(format!("{}.json", id)).exists() {
         return Err(format!("plugin id conflicts with a core service: {}", id));
     }
@@ -74,9 +100,143 @@ fn install_keep_old(
     plugin_dir: &Path,
     was_installed: bool,
 ) -> Result<Service, String> {
-    let (version_dir, enabled) = write_version(package, plugin_dir, was_installed)?;
-    copy_config(package, plugin_dir)?;
-    service_from_manifest(id, &version_dir, &package.manifest, enabled)
+    let previous = current_version(id);
+    let enabled_existed = plugin_dir.join("enabled").exists();
+    let snapshot = ConfigSnapshot::capture(plugin_dir);
+    // keep-old normally leaves the previous version alone, but a same-version
+    // reinstall overwrites the only copy. Move it aside so a failed
+    // post-install can put it back.
+    let same_version = previous.as_deref() == Some(package.manifest.version.as_str());
+    let same_backup = if same_version {
+        let backup = plugin_dir.join(format!(
+            ".same-{}.{}",
+            package.manifest.version,
+            std::process::id()
+        ));
+        if backup.exists() {
+            fs::remove_dir_all(&backup)
+                .map_err(|error| format!("remove {}: {}", backup.display(), error))?;
+        }
+        let version_dir = plugin_dir.join(&package.manifest.version);
+        fs::rename(&version_dir, &backup)
+            .map_err(|error| format!("backup {}: {}", version_dir.display(), error))?;
+        Some(backup)
+    } else {
+        None
+    };
+    let result = (|| {
+        let (version_dir, enabled) = write_version(package, plugin_dir, was_installed)?;
+        copy_config(package, plugin_dir)?;
+        let service = service_from_manifest(id, &version_dir, &package.manifest, enabled)?;
+        run_post_install(package, id, &version_dir)?;
+        Ok(service)
+    })();
+    match result {
+        Ok(service) => {
+            if let Some(backup) = same_backup {
+                if let Err(error) = fs::remove_dir_all(&backup) {
+                    log::svcd(&format!(
+                        "svcd: plugin {}: installed, but cannot remove {}: {}",
+                        id,
+                        backup.display(),
+                        error
+                    ));
+                }
+            }
+            Ok(service)
+        }
+        Err(error) => Err(rollback_keep_old(
+            package,
+            plugin_dir,
+            &previous,
+            enabled_existed,
+            &snapshot,
+            &same_backup,
+            error,
+        )),
+    }
+}
+
+/// Undo a failed keep-old install: the new version never becomes current.
+fn rollback_keep_old(
+    package: &Package,
+    plugin_dir: &Path,
+    previous: &Option<String>,
+    enabled_existed: bool,
+    snapshot: &ConfigSnapshot,
+    same_backup: &Option<PathBuf>,
+    error: String,
+) -> String {
+    let mut rollback = Vec::new();
+    let new_version = plugin_dir.join(&package.manifest.version);
+    if let Err(remove) = fs::remove_dir_all(&new_version) {
+        if remove.kind() != std::io::ErrorKind::NotFound {
+            rollback.push(format!("remove {}: {}", new_version.display(), remove));
+        }
+    }
+    if !enabled_existed {
+        let marker = plugin_dir.join("enabled");
+        if let Err(remove) = fs::remove_file(&marker) {
+            if remove.kind() != std::io::ErrorKind::NotFound {
+                rollback.push(format!("remove {}: {}", marker.display(), remove));
+            }
+        }
+    }
+    match same_backup {
+        Some(backup) => match fs::rename(backup, &new_version) {
+            Ok(()) => {
+                if let Some(version) = previous {
+                    if let Err(restore) = write_current(plugin_dir, version) {
+                        rollback.push(restore);
+                    }
+                }
+            }
+            Err(restore) => {
+                rollback.push(format!("restore {}: {}", new_version.display(), restore))
+            }
+        },
+        None => match previous {
+            Some(version) if plugin_dir.join(version).is_dir() => {
+                if let Err(restore) = write_current(plugin_dir, version) {
+                    rollback.push(restore);
+                }
+            }
+            _ => {
+                let current = plugin_dir.join("current");
+                if let Err(remove) = fs::remove_file(&current) {
+                    if remove.kind() != std::io::ErrorKind::NotFound {
+                        rollback.push(format!("remove {}: {}", current.display(), remove));
+                    }
+                }
+            }
+        },
+    }
+    rollback.extend(snapshot.restore(plugin_dir));
+    if rollback.is_empty() {
+        error
+    } else {
+        format!("{} (rollback incomplete: {})", error, rollback.join("; "))
+    }
+}
+
+fn run_post_install(package: &Package, id: &str, version_dir: &Path) -> Result<(), String> {
+    let Some(path) = package
+        .manifest
+        .hooks
+        .as_ref()
+        .and_then(|hooks| hooks.post_install.as_deref())
+    else {
+        return Ok(());
+    };
+    hook::run(&hook::Invocation {
+        id,
+        version: &package.manifest.version,
+        action: "post-install",
+        version_dir,
+        path,
+        timeout_ms: hook::TIMEOUT_MS,
+    })
+    .map_err(|error| format!("post-install hook failed: {}", error))
 }
 
 fn install_replace(
@@ -134,7 +294,9 @@ fn install_replace(
     let result =
         write_version(package, plugin_dir, was_installed).and_then(|(version_dir, enabled)| {
             copy_config(package, plugin_dir)?;
-            service_from_manifest(id, &version_dir, &package.manifest, enabled)
+            let service = service_from_manifest(id, &version_dir, &package.manifest, enabled)?;
+            run_post_install(package, id, &version_dir)?;
+            Ok(service)
         });
 
     match result {
@@ -412,6 +574,7 @@ pub fn uninstall(id: &str, purge: bool) -> Result<(), String> {
     if !directory.is_dir() {
         return Err(format!("unknown plugin: {}", id));
     }
+    run_pre_remove(id);
     if purge {
         fs::remove_dir_all(&directory)
             .map_err(|error| format!("remove {}: {}", directory.display(), error))?;
@@ -428,6 +591,46 @@ pub fn uninstall(id: &str, purge: bool) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// A failing pre-remove hook must not block uninstall; the spec only requires a
+/// log line so a broken package can still be removed.
+fn run_pre_remove(id: &str) {
+    let Some(version) = current_version(id) else {
+        return;
+    };
+    let version_dir = plugin_dir(id).join(&version);
+    let manifest = match read_manifest(&version_dir) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            log::svcd(&format!(
+                "svcd: plugin {}: skipped pre-remove hook: {}",
+                id, error
+            ));
+            return;
+        }
+    };
+    let Some(path) = manifest
+        .hooks
+        .as_ref()
+        .and_then(|hooks| hooks.pre_remove.as_deref())
+    else {
+        return;
+    };
+    let result = hook::run(&hook::Invocation {
+        id,
+        version: &version,
+        action: "pre-remove",
+        version_dir: &version_dir,
+        path,
+        timeout_ms: hook::TIMEOUT_MS,
+    });
+    if let Err(error) = result {
+        log::svcd(&format!(
+            "svcd: plugin {}: pre-remove hook failed; continuing uninstall: {}",
+            id, error
+        ));
+    }
 }
 
 pub fn plugin_dir(id: &str) -> PathBuf {
@@ -915,6 +1118,12 @@ mod tests {
             serde_json::to_vec(&manifest).expect("manifest"),
         )
         .expect("write manifest");
+    }
+
+    #[test]
+    fn hooks_are_allowed_by_default_only_with_the_http_feature() {
+        assert!(hooks_allowed(true));
+        assert_eq!(hooks_allowed(false), cfg!(feature = "http"));
     }
 
     #[test]

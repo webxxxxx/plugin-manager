@@ -37,6 +37,7 @@ enum Command {
     Install {
         path: PathBuf,
         strategy: String,
+        allow_hooks: bool,
     },
     Uninstall {
         id: String,
@@ -75,7 +76,11 @@ pub fn run(args: Vec<String>) -> i32 {
         Command::Status { id, json } => status_command(&id, json),
         Command::Start { id } => lifecycle("start", &id),
         Command::Stop { id } => lifecycle("stop", &id),
-        Command::Install { path, strategy } => install(&path, &strategy),
+        Command::Install {
+            path,
+            strategy,
+            allow_hooks,
+        } => install(&path, &strategy, allow_hooks),
         Command::Uninstall { id, purge } => uninstall(&id, purge),
         Command::EditConfig {
             id,
@@ -132,6 +137,7 @@ fn parse(args: &[String]) -> Result<Command, ()> {
         "install" => {
             let mut path = None;
             let mut strategy = "replace".to_string();
+            let mut allow_hooks = false;
             let mut index = 1;
             while index < args.len() {
                 let arg = &args[index];
@@ -140,6 +146,8 @@ fn parse(args: &[String]) -> Result<Command, ()> {
                     strategy = args.get(index).ok_or(())?.clone();
                 } else if let Some(value) = arg.strip_prefix("--strategy=") {
                     strategy = value.to_string();
+                } else if arg == "--allow-hooks" {
+                    allow_hooks = true;
                 } else if arg.starts_with('-') || path.is_some() {
                     return Err(());
                 } else {
@@ -150,8 +158,12 @@ fn parse(args: &[String]) -> Result<Command, ()> {
             if strategy != "keep-old" && strategy != "replace" {
                 return Err(());
             }
-            path.map(|path| Command::Install { path, strategy })
-                .ok_or(())
+            path.map(|path| Command::Install {
+                path,
+                strategy,
+                allow_hooks,
+            })
+            .ok_or(())
         }
         "uninstall" => {
             let mut id = None;
@@ -430,7 +442,7 @@ fn lifecycle(verb: &str, id: &str) -> i32 {
     }
 }
 
-fn install(path: &PathBuf, strategy: &str) -> i32 {
+fn install(path: &PathBuf, strategy: &str, allow_hooks: bool) -> i32 {
     let path = match std::fs::canonicalize(path) {
         Ok(path) => path,
         Err(error) => {
@@ -440,7 +452,11 @@ fn install(path: &PathBuf, strategy: &str) -> i32 {
     };
     match request(
         "plugin.install",
-        json!({ "path": path.to_string_lossy(), "strategy": strategy }),
+        json!({
+            "path": path.to_string_lossy(),
+            "strategy": strategy,
+            "allowHooks": allow_hooks,
+        }),
     ) {
         Ok(status) => print_status(status, false),
         Err(code) => code,
@@ -708,7 +724,7 @@ fn usage() {
     eprintln!("usage: plugin list");
     eprintln!("       plugin status [--json] <id>");
     eprintln!("       plugin start|stop <id>");
-    eprintln!("       plugin install <file.spk> [--strategy keep-old|replace] (default: replace)");
+    eprintln!("       plugin install <file.spk> [--strategy keep-old|replace] [--allow-hooks] (default: replace)");
     eprintln!("       plugin uninstall <id> [--purge]");
     eprintln!("       plugin editconfig <id> [--print|--file <path>|--reset]");
     eprintln!("       plugin export <id> [--config-only] [--out <path>]");
@@ -740,14 +756,24 @@ mod tests {
             parse(&args(&["install", "demo.spk", "--strategy", "replace"])).expect("install"),
             Command::Install {
                 path: PathBuf::from("demo.spk"),
-                strategy: "replace".into()
+                strategy: "replace".into(),
+                allow_hooks: false
             }
         );
         assert_eq!(
             parse(&args(&["install", "demo.spk"])).expect("default install"),
             Command::Install {
                 path: PathBuf::from("demo.spk"),
-                strategy: "replace".into()
+                strategy: "replace".into(),
+                allow_hooks: false
+            }
+        );
+        assert_eq!(
+            parse(&args(&["install", "demo.spk", "--allow-hooks"])).expect("hooks install"),
+            Command::Install {
+                path: PathBuf::from("demo.spk"),
+                strategy: "replace".into(),
+                allow_hooks: true
             }
         );
         assert_eq!(

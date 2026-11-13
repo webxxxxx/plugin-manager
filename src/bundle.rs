@@ -228,6 +228,14 @@ fn assemble_manifest(
                 .collect()
         })
         .unwrap_or_default();
+    #[cfg(unix)]
+    for path in &hook_paths {
+        if let Some(source) = sources.iter().find(|source| &source.path == path) {
+            if !source.data.starts_with(b"#!") {
+                return Err(format!("hook must start with a shebang: {}", path));
+            }
+        }
+    }
     for source in sources.iter_mut() {
         source.mode = effective_mode(&source.path, source.mode, &exec_path, &hook_paths)?;
     }
@@ -774,7 +782,7 @@ mod tests {
         let exec_path = format!("payload/bin/{}", exec_name);
         write(&source, &exec_path, b"tool", 0o755);
         write(&source, "README.md", b"readme", 0o644);
-        write(&source, "hooks/post-install", b"hook", 0o755);
+        write(&source, "hooks/post-install", b"#!/bin/sh\n", 0o755);
         let key_path = key_file(&work, 22);
         let out = work.path().join("out.spk");
         let mut options = bundle_options(&source, &out, &key_path);

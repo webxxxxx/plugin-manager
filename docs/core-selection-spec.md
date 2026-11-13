@@ -178,12 +178,13 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 
 ### 2.5 hooks
 
-- 只接受 `hooks/` 下的可执行文件（Unix exec 位 + shebang；Windows `.exe` / `.cmd` / `.bat`）；不解析内联命令。
-- 环境清空后只给 `PATH`、`SVCD_PLUGIN_ID`、`SVCD_PLUGIN_VERSION`、`SVCD_ACTION`、`SVCD_DATA_DIR`、`SVCD_CONFIG_DIR`；cwd = 版本目录；stdout/stderr 进日志；60s 超时杀进程组。
+- 只接受 `hooks/` 下的可执行文件（Unix exec 位 + shebang，安装验包时校验；Windows `.exe` / `.cmd` / `.bat`，在执行 hook 时校验）；不解析内联命令。
+- 环境清空后只给 `PATH`、`SVCD_PLUGIN_ID`、`SVCD_PLUGIN_VERSION`、`SVCD_ACTION`、`SVCD_DATA_DIR`、`SVCD_CONFIG_DIR`；Windows 额外给 `SystemRoot` / `WINDIR`（启动 `cmd.exe` 必需）；cwd = 版本目录；stdout/stderr 进 `<logs>/<id>-hooks.log`；60s 超时杀进程组。
 - post-install 失败 → 回滚 current 并报错；pre-remove 失败 → 记日志但继续卸载。
-- 嵌入式默认拒绝带 hooks 的包（`--allow-hooks` 才放行）；桌面交互安装先列出 hooks 再确认。
+- 嵌入式构建（`--no-default-features`）默认拒绝带 hooks 的包，`plugin install --allow-hooks` / HTTP `allow_hooks=true` 放行；桌面构建（默认 features）默认放行。
+- 桌面交互安装应先列出 hooks 再确认（`--yes` 跳过）：**尚未实现**——当前 CLI/HTTP 安装默认放行且没有交互确认步骤。
 - **hooks 权限 = 安装者权限（root）**；信任只来自签名。
-- 当前安装器**拒绝带 hooks 的包**；hook runner（60s、环境清空、回滚）尚未实现，待后续票。
+- **实现状态**：hook runner 已实现（`src/hook.rs`）：60s 超时、环境清空、Unix 进程组 / Windows 每 hook job 对象杀进程树、`<id>-hooks.log`；keep-old 与 replace 两条安装路径都会在 post-install 失败时回滚，pre-remove 失败只记日志。
 
 ### 2.6 config（详见 §5.3）
 
@@ -339,7 +340,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
   - `import <file>`：tar 首条目 `backup.json` → `.spkb`；`manifest.json` → `.spk`；其它 → 裸配置，必须 `--config <id>`。id 不符拒绝；版本不同警告；`--no-config` 跳过；`--force` 只跳过同版本检查，不跳签名。
 - 配置上限 1 MiB；插件私有格式（JSON/TOML/YAML/ini 都行），svcd 不解析、不做 schema、不做升级字段合并；无 `configCheck` 时只保留 last-good。
 - 权限：写（install / editconfig / import / uninstall）要 root；只读（status / logs / `editconfig --print` / `export`）组可用；配置明文，不加密（见 §13-C5）。
-- **实现状态（2026-11-12，#34 / #39）**：安装复制模板 / `config.template.sha256` / 模板变化写 `config.new`；`editconfig`（`--print/--file/--reset`、`$EDITOR`、`configCheck` 10s、last-good、flock）；`export`（config-only / `.spkb`）与 `import`（`.spkb` / `.spk` / 裸配置自动识别）已实现。HTTP config/export/import 端点已由 #39 实现（`GET/PUT /config/{id}`、`POST /config/{id}/reset`、`GET /export/{id}` 与 `/export/{id}/config`、`POST /import`）；hooks 仍拒绝。
+- **实现状态（2026-11-12，#34 / #39）**：安装复制模板 / `config.template.sha256` / 模板变化写 `config.new`；`editconfig`（`--print/--file/--reset`、`$EDITOR`、`configCheck` 10s、last-good、flock）；`export`（config-only / `.spkb`）与 `import`（`.spkb` / `.spk` / 裸配置自动识别）已实现。HTTP config/export/import 端点已由 #39 实现（`GET/PUT /config/{id}`、`POST /config/{id}/reset`、`GET /export/{id}` 与 `/export/{id}/config`、`POST /import`）；hooks 由 hook runner 执行（post-install 失败回滚，pre-remove 失败不阻塞卸载）。
 
 ### 5.4 logs
 
@@ -511,7 +512,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 | --- | --- | --- | --- |
 | [#28](https://github.com/webxxxxx/plugin-manager/issues/28) | 注册表与 status | — | 已实现：services.d 扫描、status payload、CLI 接线 |
 | [#29](https://github.com/webxxxxx/plugin-manager/issues/29) | 前台监督 core 服务 | #28 | 已实现：proc/wait、事件循环、定时器、UDS/命名管道管理通道；stderr 继承，日志归 #35 |
-| [#30](https://github.com/webxxxxx/plugin-manager/issues/30) | 安装/运行 .spk（含 `plugin` 入口） | #28 #29 | 验签/`files[]`/解包/布局/插件扫描/`plugin` 入口已实现；hooks 拒绝，`install -` / downgrade / prune 未做 |
+| [#30](https://github.com/webxxxxx/plugin-manager/issues/30) | 安装/运行 .spk（含 `plugin` 入口） | #28 #29 | 验签/`files[]`/解包/布局/插件扫描/`plugin` 入口已实现；hooks 已实现（60s、环境清空、post-install 回滚）；`install -` / downgrade / prune 未做 |
 | [#31](https://github.com/webxxxxx/plugin-manager/issues/31) | 插件 IPC 与工具面 | #30 | 已实现：NDJSON 分帧（1 MiB）、id 路由、64 在途、30s 取消、`registry.tools` / `registry.call`；崩溃摘能力并失败在途调用；128 排队未做 |
 | [#32](https://github.com/webxxxxx/plugin-manager/issues/32) | `mcp` 桥 dual-era | #31 | 已实现：modern `server/discover`/`_meta`/缓存字段；legacy `initialize`/`ping`/`list_changed` 轮询；连不上 svcd exit 1 |
 | [#33](https://github.com/webxxxxx/plugin-manager/issues/33) | Web UI 反代 | #30 #31 | 已实现：静态资源、base 注入、ETag/304、SPA fallback、`/rpc` 桥；Range/WS/SSE 不做 |

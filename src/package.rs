@@ -84,10 +84,8 @@ pub struct FileEntry {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Hooks {
     #[serde(rename = "postInstall")]
-    #[allow(dead_code)]
     pub post_install: Option<String>,
     #[serde(rename = "preRemove")]
-    #[allow(dead_code)]
     pub pre_remove: Option<String>,
 }
 
@@ -287,10 +285,6 @@ pub fn verify_bytes(bytes: &[u8]) -> Result<Package, String> {
             target()
         ));
     }
-    if manifest.hooks.is_some() {
-        return Err("hooks are not supported yet".into());
-    }
-
     let mut declared = BTreeMap::new();
     for entry in &manifest.files {
         check_path(&entry.path)?;
@@ -309,6 +303,7 @@ pub fn verify_bytes(bytes: &[u8]) -> Result<Package, String> {
     }
 
     check_manifest_paths(&manifest)?;
+    check_hooks(&manifest)?;
 
     let mut files = Vec::new();
     let mut seen = BTreeMap::new();
@@ -358,6 +353,8 @@ pub fn verify_bytes(bytes: &[u8]) -> Result<Package, String> {
     if files.is_empty() {
         return Err("package has no payload files".into());
     }
+    #[cfg(unix)]
+    check_hook_shebangs(&manifest, &files)?;
 
     Ok(Package {
         manifest,
@@ -367,14 +364,10 @@ pub fn verify_bytes(bytes: &[u8]) -> Result<Package, String> {
     })
 }
 
-/// Validate every cross-reference a manifest makes, including the hook and
-/// capability rules the install path enforces separately. The bundler calls
-/// this before writing so authoring mistakes fail early.
-pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
-    if manifest.files.is_empty() {
-        return Err("package has no payload files".into());
-    }
-    check_manifest_paths(manifest)?;
+/// The install-time half of the "executable hook" rule: the Unix exec bit comes
+/// from the manifest, the shebang has to be read from the extracted file.
+#[cfg(unix)]
+fn check_hook_shebangs(manifest: &Manifest, files: &[FileData]) -> Result<(), String> {
     for (name, path) in [
         (
             "postInstall",
@@ -392,14 +385,25 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
         ),
     ] {
         let Some(path) = path else { continue };
-        check_path(path)?;
-        if !path.starts_with("hooks/") {
-            return Err(format!("{} must be under hooks/: {}", name, path));
-        }
-        if !manifest.files.iter().any(|file| file.path == path) {
-            return Err(format!("{} is not in files[]: {}", name, path));
+        let Some(file) = files.iter().find(|file| file.path == path) else {
+            continue;
+        };
+        if !file.data.starts_with(b"#!") {
+            return Err(format!("{} must start with a shebang: {}", name, path));
         }
     }
+    Ok(())
+}
+
+/// Validate every cross-reference a manifest makes, including the hook and
+/// capability rules the install path enforces separately. The bundler calls
+/// this before writing so authoring mistakes fail early.
+pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
+    if manifest.files.is_empty() {
+        return Err("package has no payload files".into());
+    }
+    check_manifest_paths(manifest)?;
+    check_hooks(manifest)?;
     if let Some(ui) = &manifest.ui {
         if ui.kind == "web" {
             let entry = ui.entry.as_deref().unwrap_or("index.html");
@@ -427,6 +431,66 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
         if !names.insert(&capability.name) {
             return Err(format!("duplicate capability: {}", capability.name));
         }
+    }
+    Ok(())
+}
+
+/// `true` when the manifest actually names at least one hook; an empty
+/// `"hooks": {}` object is not an install-time hook package.
+pub fn declares_hooks(manifest: &Manifest) -> bool {
+    manifest
+        .hooks
+        .as_ref()
+        .map(|hooks| hooks.post_install.is_some() || hooks.pre_remove.is_some())
+        .unwrap_or(false)
+}
+
+/// Hooks are package-signed executables under `hooks/`; the manifest path is
+/// resolved inside the installed version directory at run time.
+fn check_hooks(manifest: &Manifest) -> Result<(), String> {
+    for (name, path) in [
+        (
+            "postInstall",
+            manifest
+                .hooks
+                .as_ref()
+                .and_then(|hooks| hooks.post_install.as_deref()),
+        ),
+        (
+            "preRemove",
+            manifest
+                .hooks
+                .as_ref()
+                .and_then(|hooks| hooks.pre_remove.as_deref()),
+        ),
+    ] {
+        let Some(path) = path else { continue };
+        check_path(path)?;
+        if !path.starts_with("hooks/") {
+            return Err(format!("{} must be under hooks/: {}", name, path));
+        }
+        let file = manifest
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .ok_or_else(|| format!("{} is not in files[]: {}", name, path))?;
+        check_hook_executable(name, path, file.mode)?;
+    }
+    Ok(())
+}
+
+fn check_hook_executable(name: &str, path: &str, mode: u32) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        if mode & 0o111 == 0 {
+            return Err(format!("{} must be executable: {}", name, path));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows has no exec bit; the hook runner rejects a file that is not
+        // .exe/.cmd/.bat when it actually runs it.
+        let _ = (name, path, mode);
     }
     Ok(())
 }
@@ -988,26 +1052,117 @@ mod tests {
         assert!(error.contains("protocol"), "{error}");
     }
 
-    #[test]
-    fn rejects_hooks_until_the_hook_runner_lands() {
-        let key = setup();
-        let data = b"payload".to_vec();
+    fn hook_file() -> (String, Vec<u8>) {
+        #[cfg(windows)]
+        {
+            (
+                "hooks/post-install.cmd".to_string(),
+                b"@echo off\r\nexit /b 0\r\n".to_vec(),
+            )
+        }
+        #[cfg(unix)]
+        {
+            (
+                "hooks/post-install".to_string(),
+                b"#!/bin/sh\nexit 0\n".to_vec(),
+            )
+        }
+    }
+
+    fn hook_package(key: &SigningKey, hook_path: &str, hook_mode: u32) -> Vec<u8> {
+        let hook = if cfg!(unix) {
+            b"#!/bin/sh\nexit 0\n".to_vec()
+        } else {
+            b"@echo off\r\nexit /b 0\r\n".to_vec()
+        };
+        hook_package_with_body(key, hook_path, hook_mode, hook)
+    }
+
+    fn hook_package_with_body(
+        key: &SigningKey,
+        hook_path: &str,
+        hook_mode: u32,
+        hook: Vec<u8>,
+    ) -> Vec<u8> {
+        let exec = b"hello".to_vec();
+        let files = [
+            ("payload/bin/demo", exec, 0o755),
+            (hook_path, hook, hook_mode),
+        ];
+        let entries: Vec<serde_json::Value> = files
+            .iter()
+            .map(|(path, data, mode)| {
+                json!({
+                    "path": path,
+                    "size": data.len(),
+                    "sha256": hex_sha256(data),
+                    "mode": mode
+                })
+            })
+            .collect();
         let value = json!({
             "schema": 1, "name": "demo", "version": "1.0.0", "desc": "demo",
             "platform": target(), "protocol": 1,
             "exec": {"path": "payload/bin/demo"},
-            "hooks": {"postInstall": "hooks/post-install.sh"},
-            "files": [{"path": "payload/bin/demo", "size": data.len(), "sha256": hex_sha256(&data), "mode": 0o755}]
+            "hooks": {"postInstall": hook_path},
+            "files": entries
         });
         let manifest = serde_json::to_vec(&value).expect("manifest");
-        let bytes = package_from(
-            &key,
-            "test",
-            &manifest,
-            &[("payload/bin/demo", data, 0o755)],
+        package_from(key, "test", &manifest, &files)
+    }
+
+    #[test]
+    fn verifies_a_package_that_declares_hooks() {
+        let key = setup();
+        let (path, _) = hook_file();
+
+        let package = verify_bytes(&hook_package(&key, &path, 0o755)).expect("hooks package");
+
+        assert_eq!(
+            package
+                .manifest
+                .hooks
+                .as_ref()
+                .and_then(|hooks| hooks.post_install.as_deref()),
+            Some(path.as_str())
         );
-        let error = verify_bytes(&bytes).expect_err("hooks");
-        assert!(error.contains("hooks"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_hook_without_the_executable_bit() {
+        let key = setup();
+        let (path, _) = hook_file();
+
+        let error = verify_bytes(&hook_package(&key, &path, 0o644)).expect_err("mode");
+
+        assert!(error.contains("must be executable"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_hook_without_a_shebang() {
+        let key = setup();
+        let (path, _) = hook_file();
+
+        let error = verify_bytes(&hook_package_with_body(
+            &key,
+            &path,
+            0o755,
+            b"exit 0\n".to_vec(),
+        ))
+        .expect_err("shebang");
+
+        assert!(error.contains("shebang"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_hook_outside_the_hooks_directory() {
+        let key = setup();
+
+        let error = verify_bytes(&hook_package(&key, "payload/hook", 0o755)).expect_err("path");
+
+        assert!(error.contains("must be under hooks/"), "{error}");
     }
 
     #[test]
