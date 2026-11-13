@@ -1206,6 +1206,66 @@ fn plugin_upload_list_and_delete() {
 }
 
 #[test]
+fn trust_upload_enables_a_signed_install() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[41u8; 32]);
+    let package = plugin_package(&key);
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    // Without a trust root the upload is rejected with an actionable error.
+    let untrusted = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(untrusted.status, 400, "{}", untrusted.body);
+    assert!(
+        untrusted.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("svc trust add"),
+        "{}",
+        untrusted.body
+    );
+
+    let pem = pem_from_public(&key.verifying_key().to_bytes());
+    let added = request(
+        &address,
+        "POST",
+        "/api/v1/trust?key_id=test",
+        "application/octet-stream",
+        &pem,
+    );
+    assert_eq!(added.status, 200, "{}", added.body);
+    assert_eq!(added.body["keyId"], "test");
+    assert!(sandbox.trust.join("test.pub").is_file());
+
+    let listed = request(&address, "GET", "/api/v1/trust", "", b"");
+    assert_eq!(listed.status, 200);
+    assert!(listed.body["keys"]
+        .as_array()
+        .expect("keys")
+        .iter()
+        .any(|key| key == "test"));
+
+    let installed = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(installed.status, 200, "{}", installed.body);
+
+    let removed = request(&address, "DELETE", "/api/v1/trust/test", "", b"");
+    assert_eq!(removed.status, 200, "{}", removed.body);
+    assert!(!sandbox.trust.join("test.pub").exists());
+}
+
+#[test]
 fn explicit_conf_is_preferred_over_program_and_config() {
     fn write_core(dir: &Path, id: &str) {
         fs::create_dir_all(dir).expect("core dir");

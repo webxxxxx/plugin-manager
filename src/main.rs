@@ -30,6 +30,7 @@ mod supervisor;
 mod svc;
 mod threads;
 mod transfer;
+mod trust;
 #[cfg(feature = "http")]
 mod uichannel;
 mod wake;

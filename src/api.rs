@@ -936,6 +936,11 @@ fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<
             }
         }
         ("POST", ["api", "v1", "plugins"]) => install_plugin(config, request, query),
+        ("GET", ["api", "v1", "trust"]) => trust_list(),
+        ("POST", ["api", "v1", "trust"]) => trust_add(request, query),
+        ("DELETE", ["api", "v1", "trust", key]) => trust_remove(&decode(key)),
+        (_, ["api", "v1", "trust"]) => method_not_allowed("GET, POST"),
+        (_, ["api", "v1", "trust", _]) => method_not_allowed("DELETE"),
         ("DELETE", ["api", "v1", "plugins", id]) => {
             let purge = query_bool(query, "purge").unwrap_or(false);
             match rpc(
@@ -961,6 +966,44 @@ fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<
         ("GET", ["api", "v1", "logs", id]) => logs(config, &decode(id), query),
         (_, ["api", "v1", "logs", _]) => method_not_allowed("GET"),
         _ => error(404, "not_found", "unknown endpoint"),
+    }
+}
+
+fn trust_list() -> Vec<u8> {
+    match crate::trust::keys() {
+        Ok(keys) => ok(json!({
+            "keys": keys,
+            "directory": paths::trust_dir().to_string_lossy(),
+        })),
+        Err(cause) => error(500, "internal", &cause),
+    }
+}
+
+fn trust_add(request: &HttpRequest, query: &str) -> Vec<u8> {
+    let Some(key_id) = query_value(query, "key_id") else {
+        return error(400, "bad_request", "key_id is required");
+    };
+    if request.body.is_empty() {
+        return error(400, "bad_request", "empty public key");
+    }
+    match crate::trust::add(&key_id, &request.body) {
+        Ok(path) => ok(json!({
+            "keyId": key_id,
+            "path": path.to_string_lossy(),
+        })),
+        Err(error) => map_error(&error),
+    }
+}
+
+fn trust_remove(key_id: &str) -> Vec<u8> {
+    match crate::trust::remove(key_id) {
+        Ok(true) => ok(json!({ "keyId": key_id, "removed": true })),
+        Ok(false) => error(
+            404,
+            "not_found",
+            &format!("unknown trusted key: {}", key_id),
+        ),
+        Err(error) => map_error(&error),
     }
 }
 
@@ -1309,6 +1352,7 @@ fn map_error(message: &str) -> Vec<u8> {
         || lower.contains("invalid")
         || lower.contains("not declared")
         || lower.contains("missing")
+        || lower.contains("public key")
     {
         400
     } else {

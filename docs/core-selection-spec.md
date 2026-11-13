@@ -162,8 +162,9 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 
 - 包内 `signature.json`：`{"alg":"ed25519","keyId":"...","sig":"base64"}`，签 `manifest.json` 的原样字节；`files[]` 钉每个文件的 sha256/size/mode。
 - 验证顺序：读 manifest → 验签 → 校验 schema / platform / 路径 → 逐文件验 hash 后落盘；清单外条目直接拒；流式、逐文件可验。
-- 信任根：编译期内置 store 公钥 + `/etc/svcd/trust.d/<keyId>.pub`（**PEM SPKI**）；未知 keyId 拒绝；**不提供 `--insecure`**。
-- 当前实现只读取 `<config>/trust.d`（`SVCD_TRUST_DIR` 可覆盖，供测试）；编译期 store 公钥随商城/发布补。
+- 信任根：`<config>/trust.d/<keyId>.pub`（**PEM SPKI**）；未知 keyId 拒绝；**不提供 `--insecure`**。
+- 信任根只能由管理员显式添加：`svc trust list|add <file.pub>|remove <keyId>`，或 Web 控制台的 `POST /api/v1/trust?key_id=<id>` 上传；包内永不携带自己的信任根（自签自证没有意义）。
+- 当前没有编译期 store 公钥，商城/发布接入时内置；`SVCD_TRUST_DIR` 可覆盖 trust.d，供测试与非 root 开发。
 - 不签整个 tar、不做分离 `.sig`、不只靠商城 TLS。
 
 ### 2.4 安装布局与策略
@@ -259,6 +260,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
   - `GET /api/v1/version` → `{version, protocol, platform}`
   - `GET /` / `GET /index.html` → 内嵌 Web 控制台（静态 HTML；页面本身不需要认证，API 调用仍走同一鉴权）
   - `POST /api/v1/plugins`：body 为 `.spk` 原始字节（`application/octet-stream`），query `strategy` / `enable` / `allow_hooks`；流式写临时文件，512 MiB 上限；返回 `{id,version,state}`
+  - `GET /api/v1/trust` → `{keys:[keyId], directory}`；`POST /api/v1/trust?key_id=<id>`：body 为 PEM SPKI 公钥，写入 `<config>/trust.d/<id>.pub`；`DELETE /api/v1/trust/{keyId}` 撤销
   - `DELETE /api/v1/plugins/{id}?purge=false`：卸载
   - `POST /api/v1/import?config_id=<id>&no_config=false&force=false`：body 为 `.spk` / `.spkb` / 裸配置，自动识别，语义同 CLI
   - `GET /api/v1/export/{id}`：整包 `.spkb`（`application/octet-stream`）
@@ -509,6 +511,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - 2026-11-12（补）：脚本服务 drop-in——`services.d/<id>.sh|bat|cmd|ps1`，`start/stop/status` 参数入口；同 id JSON 优先；`.ps1` 走 ExecutionPolicy Bypass。
 - 2026-11-13（补）：脚本动作改为可选——脚本声明哪个动作，svcd 才调用哪个；缺 `start` 从头执行、缺 `stop` 由框架终止进程、`status` 只把 stdout 作为 `details.probe` 的细节补充。
 - 2026-11-13（补）：服务树即进程组——Unix 独立进程组、Windows per-service job object；组内任一进程存活即 `Running`，stop 终止整棵树。
+- 2026-11-13（补）：信任根可管理——`svc trust list|add|remove`、`GET/POST/DELETE /api/v1/trust`、Web 控制台上传 `.pub`；包内不携带信任根，编译期 store 公钥仍未内置。
 
 ## 16. 实施票（2026-11-12 拆出）
 

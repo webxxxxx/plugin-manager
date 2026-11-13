@@ -546,7 +546,7 @@ fn verify_signature(manifest: &[u8], signature_bytes: &[u8]) -> Result<(), Strin
     let key_path = paths::trust_dir().join(format!("{}.pub", sig.key_id));
     let pem = fs::read(&key_path).map_err(|error| {
         format!(
-            "unknown keyId {}: {} (trust root path: {})",
+            "unknown keyId {}: {} (trust root path: {}; add it with `svc trust add <file.pub>` or upload it in the web console)",
             sig.key_id,
             error,
             key_path.display()
@@ -559,6 +559,11 @@ fn verify_signature(manifest: &[u8], signature_bytes: &[u8]) -> Result<(), Strin
     let signature = Signature::from_slice(&signature).map_err(|error| error.to_string())?;
     key.verify_strict(manifest, &signature)
         .map_err(|_| "manifest signature is invalid".to_string())
+}
+
+/// Validate a PEM SPKI Ed25519 public key without installing it.
+pub fn validate_public_key(pem: &[u8]) -> Result<(), String> {
+    parse_public_key(pem).map(|_| ())
 }
 
 fn parse_public_key(pem: &[u8]) -> Result<VerifyingKey, String> {

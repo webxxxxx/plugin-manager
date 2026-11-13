@@ -86,6 +86,12 @@
         <span class="grow"></span>
         <span class="muted">只接受签名 .spk；安装时替换旧版本</span>
       </div>
+      <div class="row" style="margin-top:8px">
+        <input type="file" id="trustfile" accept=".pub">
+        <button onclick="addTrust()">上传信任公钥</button>
+        <span class="grow"></span>
+        <span class="muted">签名者的 &lt;keyId&gt;.pub，例如 samples/keys/sample-2026.pub；只需一次</span>
+      </div>
     </div>
 
     <div class="card">
@@ -311,6 +317,33 @@ function install() {
   }).finally(function () {
     lock(false);
     load();
+  });
+}
+
+function addTrust() {
+  if (BUSY) return;
+  const file = $('trustfile').files[0];
+  if (!file) { toast('请先选择 .pub 文件', 'err'); return; }
+  const keyId = file.name.replace(/\.pub$/i, '');
+  if (!/^[A-Za-z0-9._-]+$/.test(keyId) || keyId === '.' || keyId === '..') {
+    toast('文件名必须是 <keyId>.pub', 'err');
+    return;
+  }
+  lock(true);
+  fetch('/api/v1/trust?key_id=' + encodeURIComponent(keyId), {
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/octet-stream' }),
+    body: file
+  }).then(async function (response) {
+    if (!response.ok) throw new Error(await errorText(response));
+    return response.json();
+  }).then(function (body) {
+    toast('已信任 ' + body.keyId, 'ok');
+    $('trustfile').value = '';
+  }).catch(function (error) {
+    toast('添加信任公钥失败：' + error.message, 'err');
+  }).finally(function () {
+    lock(false);
   });
 }
 

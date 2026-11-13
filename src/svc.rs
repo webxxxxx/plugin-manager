@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -47,6 +47,13 @@ enum LanAction {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+enum TrustAction {
+    List,
+    Add(PathBuf),
+    Remove(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum Command {
     List,
     Status {
@@ -66,6 +73,9 @@ enum Command {
         action: LanAction,
         bind: Option<String>,
     },
+    Trust {
+        action: TrustAction,
+    },
 }
 
 pub fn run(args: Vec<String>) -> i32 {
@@ -83,6 +93,7 @@ pub fn run(args: Vec<String>) -> i32 {
         Command::Daemon { verb, id } => daemon_command(verb, &id),
         Command::Logs { id, follow, lines } => show_logs(&id, follow, lines),
         Command::Lan { action, bind } => lan_command(action, bind.as_deref()),
+        Command::Trust { action } => trust_command(action),
     }
 }
 
@@ -131,8 +142,23 @@ fn parse(args: &[String]) -> Result<Command, ()> {
         }
         "logs" => parse_logs(&args[1..]),
         "lan" => parse_lan(&args[1..]),
+        "trust" => parse_trust(&args[1..]),
         _ => Err(()),
     }
+}
+
+fn parse_trust(args: &[String]) -> Result<Command, ()> {
+    let action = match args {
+        [action] if action == "list" => TrustAction::List,
+        [action, path] if action == "add" && !path.starts_with('-') => {
+            TrustAction::Add(PathBuf::from(path))
+        }
+        [action, id] if action == "remove" && !id.starts_with('-') => {
+            TrustAction::Remove(id.clone())
+        }
+        _ => return Err(()),
+    };
+    Ok(Command::Trust { action })
 }
 
 fn parse_lan(args: &[String]) -> Result<Command, ()> {
@@ -390,6 +416,82 @@ fn lan_command(action: LanAction, bind: Option<&str>) -> i32 {
     EXIT_OK
 }
 
+fn trust_command(action: TrustAction) -> i32 {
+    match action {
+        TrustAction::List => match crate::trust::keys() {
+            Ok(keys) if keys.is_empty() => {
+                println!("no trusted keys in {}", paths::trust_dir().display());
+                EXIT_OK
+            }
+            Ok(keys) => {
+                for key in keys {
+                    println!("{}", key);
+                }
+                EXIT_OK
+            }
+            Err(error) => {
+                eprintln!("svc: {}", error);
+                EXIT_SERVICE_ERROR
+            }
+        },
+        TrustAction::Add(path) => {
+            if let Err(error) = require_root_for_trust() {
+                eprintln!("svc: {}", error);
+                return EXIT_SERVICE_ERROR;
+            }
+            let pem = match std::fs::read(&path) {
+                Ok(pem) => pem,
+                Err(error) => {
+                    eprintln!("svc: cannot read {}: {}", path.display(), error);
+                    return EXIT_SERVICE_ERROR;
+                }
+            };
+            let key_id = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default();
+            match crate::trust::add(key_id, &pem) {
+                Ok(target) => {
+                    println!("trusted {} ({})", key_id, target.display());
+                    EXIT_OK
+                }
+                Err(error) => {
+                    eprintln!("svc: {}", error);
+                    EXIT_SERVICE_ERROR
+                }
+            }
+        }
+        TrustAction::Remove(key_id) => {
+            if let Err(error) = require_root_for_trust() {
+                eprintln!("svc: {}", error);
+                return EXIT_SERVICE_ERROR;
+            }
+            match crate::trust::remove(&key_id) {
+                Ok(true) => {
+                    println!("removed {}", key_id);
+                    EXIT_OK
+                }
+                Ok(false) => {
+                    eprintln!("svc: unknown trusted key: {}", key_id);
+                    EXIT_NOT_FOUND
+                }
+                Err(error) => {
+                    eprintln!("svc: {}", error);
+                    EXIT_SERVICE_ERROR
+                }
+            }
+        }
+    }
+}
+
+fn require_root_for_trust() -> Result<(), String> {
+    if crate::install::is_privileged() {
+        Ok(())
+    } else {
+        Err("root / Administrator is required to change trust roots".into())
+    }
+}
+
 fn show_logs(id: &str, follow: bool, lines: usize) -> i32 {
     let path = if id == "svcd" {
         paths::logs_dir().join("svcd.log")
@@ -470,6 +572,7 @@ fn usage() {
     eprintln!("       svc <start|stop|enable|disable> <id>");
     eprintln!("       svc logs <id> [--follow] [--lines N]");
     eprintln!("       svc lan status|enable [--bind <ip>]|disable|token rotate");
+    eprintln!("       svc trust list|add <file.pub>|remove <keyId>");
 }
 
 #[cfg(test)]
@@ -590,6 +693,32 @@ mod tests {
         );
         assert!(parse(&args(&["lan", "enable", "--bind"])).is_err());
         assert!(parse(&args(&["lan", "bogus"])).is_err());
+    }
+
+    #[test]
+    fn parses_trust_commands() {
+        assert_eq!(
+            parse(&args(&["trust", "list"])).expect("trust list"),
+            Command::Trust {
+                action: TrustAction::List
+            }
+        );
+        assert_eq!(
+            parse(&args(&["trust", "add", "sample-2026.pub"])).expect("trust add"),
+            Command::Trust {
+                action: TrustAction::Add(PathBuf::from("sample-2026.pub"))
+            }
+        );
+        assert_eq!(
+            parse(&args(&["trust", "remove", "sample-2026"])).expect("trust remove"),
+            Command::Trust {
+                action: TrustAction::Remove("sample-2026".into())
+            }
+        );
+        assert!(parse(&args(&["trust"])).is_err());
+        assert!(parse(&args(&["trust", "add"])).is_err());
+        assert!(parse(&args(&["trust", "add", "--key-id"])).is_err());
+        assert!(parse(&args(&["trust", "bogus"])).is_err());
     }
 
     #[test]

@@ -64,6 +64,7 @@ impl Sandbox {
             .args(args)
             .env("SVCD_CONFIG_DIR", self.config_dir())
             .env("SVCD_LOG_DIR", self.logs_dir())
+            .env("SVCD_TEST_UNPRIVILEGED", "1")
             .output()
             .expect("run svc")
     }
@@ -369,4 +370,49 @@ fn a_relative_exec_path_is_rejected_with_a_readable_reason() {
     let errors = stderr(&output);
     assert!(errors.contains("bad.json"), "stderr:\n{}", errors);
     assert!(errors.contains("absolute"), "stderr:\n{}", errors);
+}
+
+#[test]
+fn trust_add_list_and_remove_manage_the_trust_store() {
+    let sandbox = Sandbox::new();
+    let public_key = sandbox.root.join("sample-2026.pub");
+    fs::write(&public_key, include_str!("../samples/keys/sample-2026.pub"))
+        .expect("write public key");
+
+    let added = sandbox.run(&["trust", "add", public_key.to_str().expect("utf8")]);
+    assert_eq!(added.status.code(), Some(0), "stderr: {}", stderr(&added));
+    assert!(stdout(&added).contains("sample-2026"));
+    let stored = sandbox.config_dir().join("trust.d").join("sample-2026.pub");
+    assert!(stored.is_file());
+
+    let listed = sandbox.run(&["trust", "list"]);
+    assert_eq!(listed.status.code(), Some(0), "stderr: {}", stderr(&listed));
+    assert!(stdout(&listed).contains("sample-2026"));
+
+    let removed = sandbox.run(&["trust", "remove", "sample-2026"]);
+    assert_eq!(
+        removed.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&removed)
+    );
+    assert!(!stored.exists());
+
+    let missing = sandbox.run(&["trust", "remove", "sample-2026"]);
+    assert_eq!(missing.status.code(), Some(1));
+
+    let bad = sandbox.root.join("bad.pub");
+    fs::write(&bad, "not a public key").expect("bad key");
+    let rejected = sandbox.run(&["trust", "add", bad.to_str().expect("utf8")]);
+    assert_eq!(
+        rejected.status.code(),
+        Some(1),
+        "stdout: {}",
+        stdout(&rejected)
+    );
+    assert!(!sandbox
+        .config_dir()
+        .join("trust.d")
+        .join("bad.pub")
+        .exists());
 }
