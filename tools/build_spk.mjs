@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const name = process.argv[2] || 'wireguard';
 const SRC = join(ROOT, 'samples', name);
-const OUT = join(ROOT, 'samples', 'out');
+const OUT = join(ROOT, 'samples', 'spk');
 const KEY = join(ROOT, 'samples', 'keys', 'sample-2026.key');
 const KEY_ID = 'sample-2026';
 

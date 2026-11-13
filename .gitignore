@@ -4,7 +4,11 @@
 # 示例签名密钥：用 tools/gen_sample_key.mjs 生成，不入库
 /samples/keys/
 
-# 示例构建产物：用 tools/build_spk.mjs 生成，不入库
+# 示例 .spk 与打包暂存：用 tools/build_spk.mjs 生成，不入库
+/samples/spk/*
+!/samples/spk/README.md
+
+# 旧输出目录（兼容）
 /samples/out/
 
 # Python 字节码（samples/realtime 的 agent）
