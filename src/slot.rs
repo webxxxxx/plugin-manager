@@ -203,7 +203,14 @@ impl Slot {
                     self.start_deadline = Some(now.saturating_add(supervisor::START_TIMEOUT_MS));
                 }
                 Action::SignalPolite => {
-                    if !self.ensure_stop_hook(now) {
+                    let has_stop_hook = self
+                        .lifecycle
+                        .as_ref()
+                        .and_then(|lifecycle| lifecycle.stop.as_ref())
+                        .is_some();
+                    if !has_stop_hook {
+                        self.stop_without_hook();
+                    } else if !self.ensure_stop_hook(now) {
                         self.signal_polite();
                     }
                 }
@@ -747,6 +754,18 @@ impl Slot {
                 }
             }
         }
+    }
+
+    /// No `stop` action was declared. Unix already has SIGTERM as the polite
+    /// signal; Windows has no signal for an exec-ready script, so kill directly
+    /// instead of burning the whole stop window waiting for nothing.
+    fn stop_without_hook(&mut self) {
+        #[cfg(windows)]
+        if !self.protocol_only && self.stdin.is_none() {
+            self.signal_force();
+            return;
+        }
+        self.signal_polite();
     }
 
     pub(crate) fn signal_force(&mut self) {

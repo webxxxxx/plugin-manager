@@ -44,7 +44,9 @@ pub struct Details {
     pub restart: Option<String>,
     /// `true` only when a forced stop ran out of its kill window.
     pub unkillable: bool,
-    /// Result of the optional core status hook; only `svc status` probes it.
+    /// Supplementary detail from the optional core status action; only
+    /// `svc status` probes it, and its exit code never changes the service
+    /// state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe: Option<String>,
 }

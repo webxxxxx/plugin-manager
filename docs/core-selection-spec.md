@@ -84,7 +84,7 @@
 ```
 
 - `exec.path` 必须是绝对路径；Unix 可以是 shebang 脚本，Windows 是 `.exe` / `.cmd` / `.bat`；`ready` 同 plugin（默认 `notify`，脚本不讲话就用 `exec`）。
-- `lifecycle` 全部可选；`start` 存在时它就是被监督的前台进程（替换 `exec`，`ready` 仍按 `exec.ready`；不讲话的脚本把 `exec.ready` 设为 `exec`），不得自行 daemonize；`stop` 在 SIGTERM 之前运行用于释放资源，超时/非零只记日志后继续停止序列；`status` 由 `svc status` 按需探测，exit 0 = healthy，非零 = unhealthy。钩子 `path` 必须绝对，环境继承 daemon 并附加 `SVCD_SERVICE_ID` / `SVCD_ACTION` / `SVCD_DATA_DIR` / `SVCD_CONFIG_DIR` / `SVCD_LOG_DIR`。
+- `lifecycle` 全部可选；`start` 存在时它就是被监督的前台进程（替换 `exec`，`ready` 仍按 `exec.ready`；不讲话的脚本把 `exec.ready` 设为 `exec`），不得自行 daemonize；`stop` 在 SIGTERM 之前运行用于释放资源，超时/非零只记日志后继续停止序列；`status` 由 `svc status` 按需探测，stdout 作为 `details.probe` 的细节补充，退出码不改变服务状态。钩子 `path` 必须绝对，环境继承 daemon 并附加 `SVCD_SERVICE_ID` / `SVCD_ACTION` / `SVCD_DATA_DIR` / `SVCD_CONFIG_DIR` / `SVCD_LOG_DIR`。
 - 文件 root 所有、0640；启动时读取，改定义后重启 svcd 生效（v1 不做热加载）。
 - 不接受 `.spk` 专属字段：`platform` / `files` / `hooks` / `config` / `ui` 出现即定义非法；其他未知字段忽略。
 - `id` 不能是 `svc`（保留给内置 core），且不能与 plugin id 冲突；冲突时 plugin 安装拒绝、core 定义加载拒绝。
@@ -100,9 +100,11 @@
 
 - Unix：`<id>.sh`；Windows：`<id>.bat` / `<id>.cmd` / `<id>.ps1`。
 - 文件名即服务 id（必须符合 `[a-z0-9][a-z0-9_-]{0,63}`）；`.disabled` sidecar 同样生效。
-- 脚本第一个参数是 `start|stop|status`，同时注入 `SVCD_ACTION`；脚本内部可以用函数 / label 实现，入口做 3 行分发。
-- `start` 必须前台运行（可申请资源后 `exec` 真正的进程），不得 daemonize；`stop` 在 SIGTERM 前释放资源；`status` exit 0 = healthy。
-- svcd 把脚本合成为 core 服务：`exec.ready = Exec`，`lifecycle.start/stop/status` 指向同一脚本；默认 `version = 1.0.0`，无 dependencies / capabilities / config。
+- 脚本第一个参数是 `start|stop|status`，同时注入 `SVCD_ACTION`；**每个动作都是可选的**，脚本声明哪个，svcd 才调用哪个。
+- 声明方式：`.sh` 的 shell 函数（`start()` / `function start`）或 `case` 分支（`start)`）；`.ps1` 的 `function start`；`.bat` / `.cmd` 的 `:start` 标签（大小写不敏感）。注释里的同名不计。
+- 未声明的动作由框架兜底：缺 `start` → `exec.args` 为空，svcd 从头执行脚本；缺 `stop` → 不跑 stop 钩子，直接进入普通停止序列（Unix SIGTERM；Windows 对没有停止钩子的 `exec` 脚本立即结束进程）；缺 `status` → `svc status` 不追加 probe。
+- 已声明的 `start` 必须前台运行（可申请资源后 `exec` 真正的进程），不得 daemonize；`stop` 在 SIGTERM 前释放资源；`status` 是**细节补充**：stdout 作为 `details.probe`（截断到 8 KiB、多行以 `; ` 连接），退出码只追加到文本、不改变服务状态。
+- svcd 把脚本合成为 core 服务：`exec.ready = Exec`，`lifecycle` 只为声明了的动作生成钩子；默认 `version = 1.0.0`，无 dependencies / capabilities / config。
 - 同 id 的 JSON 定义优先；脚本跳过并告警。脚本必须非 symlink；Unix 还要求 exec 位；改脚本后重启 svcd 生效（v1 不做热加载）。
 - `.ps1` 在 Windows 通过 `powershell -NoProfile -ExecutionPolicy Bypass -File <script> <action>` 调用。
 
@@ -115,7 +117,7 @@ action="${1:-$SVCD_ACTION}"
 case "$action" in start|stop|status) "$action" ;; *) exit 64 ;; esac
 ```
 
-`svc list/status/start/stop`、日志、退避、依赖图与 JSON core 相同；`svc status` 的 `details.probe` 来自 `status`。
+上面的例子声明了全部三个动作；只写 `start` 时，`stop` 由框架终止进程、`status` 不产生 probe。`svc list/status/start/stop`、日志、退避、依赖图与 JSON core 相同；`svc status` 的 `details.probe` 来自 `status` 动作的 stdout。
 
 ## 2. .spk 包格式
 
@@ -318,7 +320,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 ### 5.2 status
 
 - `summary`：id、kind、state、enabled、pid、since、version。
-- `details`：dependencies[]、last_exit、next_at、ready_since、failures、config、probe（仅 `svc status` 探测 core 的 status 钩子时出现）。
+- `details`：dependencies[]、last_exit、next_at、ready_since、failures、config、probe（仅 `svc status` 探测 core 的 status 动作时出现，内容为该动作的 stdout/摘要）。
 - `svc list` 列：`ID  KIND  STATE  AUTO  PID  VERSION`；AUTO 显示 `[auto]` 或 `-`。
 - `svc list` 只投影受管服务（core + plugin），不含内置 `svc` 自身（svcd 由系统服务管理器拉起，不归自己管）；`svc status svc` 仍可读。
 - `svc status <id>`：逐字段块；`--json` 原样输出 `{summary, details}`。
@@ -503,6 +505,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - 2026-11-12（补）：core/plugin 边界——core = `services.d/*.json` 的启动脚本/可执行文件，plugin = 标准 `.spk`；install/config/export 只对 plugin。
 - 2026-11-12（补）：core 退出工具面——定义不再接受 `capabilities`；新增可选 `lifecycle.start/stop/status`，`svc start/stop/status` 调用钩子；`details` 增加 `probe`。
 - 2026-11-12（补）：脚本服务 drop-in——`services.d/<id>.sh|bat|cmd|ps1`，`start/stop/status` 参数入口；同 id JSON 优先；`.ps1` 走 ExecutionPolicy Bypass。
+- 2026-11-13（补）：脚本动作改为可选——脚本声明哪个动作，svcd 才调用哪个；缺 `start` 从头执行、缺 `stop` 由框架终止进程、`status` 只把 stdout 作为 `details.probe` 的细节补充。
 
 ## 16. 实施票（2026-11-12 拆出）
 

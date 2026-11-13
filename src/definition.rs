@@ -211,12 +211,35 @@ fn load_scripts(
             }
         }
 
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let contents = match fs::read(&path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                issues.push(fail(&id, format!("cannot read script: {}", error)));
+                continue;
+            }
+        };
+        let declarations = declared_actions(&String::from_utf8_lossy(&contents), &extension);
+
         let path_text = path.to_string_lossy().to_string();
         let hook = |action: &str, timeout_ms: u64| Hook {
             path: path_text.clone(),
             args: vec![action.to_string()],
             env: BTreeMap::new(),
             timeout_ms,
+        };
+        let lifecycle = if declarations.start || declarations.stop || declarations.status {
+            Some(Lifecycle {
+                start: declarations.start.then(|| hook("start", 30_000)),
+                stop: declarations.stop.then(|| hook("stop", 10_000)),
+                status: declarations.status.then(|| hook("status", 5_000)),
+            })
+        } else {
+            None
         };
         let enabled = !dir.join(format!("{}.disabled", id)).exists();
         let service = Service {
@@ -228,15 +251,17 @@ fn load_scripts(
             caps: Vec::new(),
             exec: Some(Exec {
                 path: path_text.clone(),
-                args: vec!["start".into()],
+                // Only an implemented start is called with the action argument;
+                // otherwise svcd executes the script from the top.
+                args: if declarations.start {
+                    vec!["start".into()]
+                } else {
+                    Vec::new()
+                },
                 env: BTreeMap::new(),
                 ready: Ready::Exec,
             }),
-            lifecycle: Some(Lifecycle {
-                start: Some(hook("start", 30_000)),
-                stop: Some(hook("stop", 10_000)),
-                status: Some(hook("status", 5_000)),
-            }),
+            lifecycle,
             enabled,
             state: State::Stopped,
             pid: None,
@@ -261,6 +286,92 @@ fn script_extension(extension: &str) -> bool {
     #[cfg(not(windows))]
     {
         extension == "sh"
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DeclaredActions {
+    start: bool,
+    stop: bool,
+    status: bool,
+}
+
+impl DeclaredActions {
+    fn declare(&mut self, action: &str) {
+        match action {
+            "start" => self.start = true,
+            "stop" => self.stop = true,
+            "status" => self.status = true,
+            _ => {}
+        }
+    }
+}
+
+const ACTIONS: [&str; 3] = ["start", "stop", "status"];
+
+/// A drop-in script declares an action by naming a shell function, a PowerShell
+/// function, a cmd label, or a shell `case` branch. Undeclared actions get the
+/// framework fallback: start executes the script from the top, stop terminates
+/// the process, status adds no detail.
+fn declared_actions(text: &str, extension: &str) -> DeclaredActions {
+    let mut actions = DeclaredActions::default();
+    for raw in text.lines() {
+        let line = raw.trim_start();
+        if line.is_empty() || is_comment(line) {
+            continue;
+        }
+        for action in ACTIONS {
+            if marks_action(line, action, extension) {
+                actions.declare(action);
+            }
+        }
+    }
+    actions
+}
+
+fn is_comment(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    line.starts_with('#') || lower.starts_with("rem ") || lower.starts_with("rem\t")
+}
+
+fn marks_action(line: &str, action: &str, extension: &str) -> bool {
+    match extension {
+        "bat" | "cmd" => {
+            let lower = line.to_ascii_lowercase();
+            let Some(rest) = lower.strip_prefix(&format!(":{}", action)) else {
+                return false;
+            };
+            rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace)
+        }
+        "ps1" => {
+            let lower = line.to_ascii_lowercase();
+            let Some(rest) = lower.strip_prefix("function ") else {
+                return false;
+            };
+            let Some(after) = rest.trim_start().strip_prefix(action) else {
+                return false;
+            };
+            let after = after.trim_start();
+            after.starts_with('{') || after.starts_with('(') || after.is_empty()
+        }
+        _ => {
+            let (candidates, keyword) = match line.strip_prefix("function ") {
+                Some(rest) => (rest.trim_start(), true),
+                None => (line, false),
+            };
+            if let Some(after) = candidates.strip_prefix(action) {
+                let after = after.trim_start();
+                if after.starts_with('(')
+                    || (keyword && (after.starts_with('{') || after.is_empty()))
+                {
+                    return true;
+                }
+            }
+            // `case "$1" in start) ...` style dispatchers.
+            line.strip_prefix(action)
+                .map(|after| after.trim_start().starts_with(')'))
+                .unwrap_or(false)
+        }
     }
 }
 
@@ -607,6 +718,28 @@ mod tests {
         }
     }
 
+    fn all_actions_body() -> &'static str {
+        #[cfg(windows)]
+        {
+            "@echo off\r\n:start\r\n:stop\r\n:status\r\n"
+        }
+        #[cfg(not(windows))]
+        {
+            "start() { :; }\nstop() { :; }\nstatus() { :; }\n"
+        }
+    }
+
+    fn start_only_body() -> &'static str {
+        #[cfg(windows)]
+        {
+            "@echo off\r\n:start\r\n"
+        }
+        #[cfg(not(windows))]
+        {
+            "start() { :; }\n"
+        }
+    }
+
     fn definition(id: &str) -> Value {
         json!({
             "schema": 1,
@@ -909,7 +1042,7 @@ mod tests {
     #[test]
     fn loads_a_drop_in_script_as_a_core_service() {
         let dir = TempDir::new();
-        dir.write_script(&script_name("demo"), "");
+        dir.write_script(&script_name("demo"), all_actions_body());
 
         let loaded = load_services(&dir.services_dir());
 
@@ -929,6 +1062,70 @@ mod tests {
         assert_eq!(lifecycle.start.as_ref().expect("start").timeout_ms, 30_000);
         assert_eq!(lifecycle.stop.as_ref().expect("stop").timeout_ms, 10_000);
         assert_eq!(lifecycle.status.as_ref().expect("status").timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn a_script_without_actions_runs_from_the_top() {
+        let dir = TempDir::new();
+        dir.write_script(&script_name("demo"), "#!/bin/sh\r\n");
+
+        let loaded = load_services(&dir.services_dir());
+
+        assert!(loaded.issues.is_empty(), "issues: {:?}", loaded.issues);
+        let demo = loaded.registry.get("demo").expect("demo");
+        let exec = demo.exec.as_ref().expect("exec");
+        assert!(exec.args.is_empty(), "exec args: {:?}", exec.args);
+        assert!(demo.lifecycle.is_none());
+    }
+
+    #[test]
+    fn only_declared_actions_become_lifecycle_hooks() {
+        let dir = TempDir::new();
+        dir.write_script(&script_name("demo"), start_only_body());
+
+        let loaded = load_services(&dir.services_dir());
+
+        let demo = loaded.registry.get("demo").expect("demo");
+        assert_eq!(demo.exec.as_ref().expect("exec").args, ["start"]);
+        let lifecycle = demo.lifecycle.as_ref().expect("lifecycle");
+        assert!(lifecycle.start.is_some());
+        assert!(lifecycle.stop.is_none());
+        assert!(lifecycle.status.is_none());
+    }
+
+    #[test]
+    fn actions_in_comments_are_not_declared() {
+        let dir = TempDir::new();
+        #[cfg(windows)]
+        let body = "@echo off\r\nrem :start\r\n:: :stop\r\n";
+        #[cfg(not(windows))]
+        let body = "#!/bin/sh\n# start() { :; }\n# stop() { :; }\n# status() { :; }\n";
+        dir.write_script(&script_name("demo"), body);
+
+        let loaded = load_services(&dir.services_dir());
+
+        let demo = loaded.registry.get("demo").expect("demo");
+        assert!(demo.exec.as_ref().expect("exec").args.is_empty());
+        assert!(demo.lifecycle.is_none(), "{:?}", demo.lifecycle);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_case_branch_declares_a_shell_action() {
+        let dir = TempDir::new();
+        dir.write_script(
+            &script_name("demo"),
+            "#!/bin/sh\ncase \"$1\" in\n  start)\n    :;;\n  status)\n    :;;\nesac\n",
+        );
+
+        let loaded = load_services(&dir.services_dir());
+
+        let demo = loaded.registry.get("demo").expect("demo");
+        assert_eq!(demo.exec.as_ref().expect("exec").args, ["start"]);
+        let lifecycle = demo.lifecycle.as_ref().expect("lifecycle");
+        assert!(lifecycle.start.is_some());
+        assert!(lifecycle.status.is_some());
+        assert!(lifecycle.stop.is_none());
     }
 
     #[test]
@@ -985,12 +1182,17 @@ mod tests {
     #[test]
     fn loads_a_powershell_script() {
         let dir = TempDir::new();
-        dir.write_script("demo.ps1", "");
+        dir.write_script("demo.ps1", "function Start { }\r\nfunction Stop { }\r\n");
 
         let loaded = load_services(&dir.services_dir());
 
         assert!(loaded.issues.is_empty(), "issues: {:?}", loaded.issues);
-        assert!(loaded.registry.get("demo").is_some());
+        let demo = loaded.registry.get("demo").expect("demo");
+        assert_eq!(demo.exec.as_ref().expect("exec").args, ["start"]);
+        let lifecycle = demo.lifecycle.as_ref().expect("lifecycle");
+        assert!(lifecycle.start.is_some());
+        assert!(lifecycle.stop.is_some());
+        assert!(lifecycle.status.is_none());
     }
 
     #[cfg(unix)]

@@ -1042,35 +1042,108 @@ fn unknown_tool(id: &Option<Value>, name: &str) -> rpc::Response {
     rpc::err(id.clone(), -32602, &format!("unknown tool: {}", name))
 }
 
+/// The status action is a detail supplement, not a health gate: its stdout
+/// becomes the `probe` text (capped), and a non-zero exit only appends the
+/// status word. Capture goes through a temp file so a hook that leaves a child
+/// holding stdout cannot block the daemon's event loop.
 fn run_status_hook(id: &str, hook: &Hook) -> String {
+    let output_path = status_output_path(id);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = match options.open(&output_path) {
+        Ok(file) => file,
+        Err(error) => return format!("cannot create status output: {}", error),
+    };
     let mut command = hook_command(id, "status", hook);
     command
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::from(file))
         .stderr(Stdio::null());
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(error) => return format!("spawn failed: {}", error),
+        Err(error) => {
+            let _ = fs::remove_file(&output_path);
+            return format!("spawn failed: {}", error);
+        }
     };
     let _ = crate::proc::assign(&child);
     let started = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                if status.success() {
-                    return "ok".into();
-                }
-                return format!("failed ({})", status);
+                let output = read_status_output(&output_path);
+                let _ = fs::remove_file(&output_path);
+                return status_detail(&output, Some(status));
             }
             Ok(None) => {}
-            Err(error) => return format!("error: {}", error),
+            Err(error) => {
+                let output = read_status_output(&output_path);
+                let _ = fs::remove_file(&output_path);
+                let detail = status_detail(&output, None);
+                return format!("{} (error: {})", detail, error);
+            }
         }
         if started.elapsed() >= Duration::from_millis(hook.timeout_ms) {
             let _ = child.kill();
             let _ = child.wait();
-            return "timed out".into();
+            let output = read_status_output(&output_path);
+            let _ = fs::remove_file(&output_path);
+            let detail = status_detail(&output, None);
+            return if detail.is_empty() {
+                "timed out".into()
+            } else {
+                format!("{} (timed out)", detail)
+            };
         }
         thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn status_output_path(id: &str) -> PathBuf {
+    let directory = paths::config_dir().join("tmp");
+    let _ = fs::create_dir_all(&directory);
+    let nanos = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    directory.join(format!(
+        "status-{}-{}-{}.out",
+        id,
+        std::process::id(),
+        nanos
+    ))
+}
+
+fn read_status_output(path: &Path) -> String {
+    use std::io::Read;
+
+    let Ok(file) = fs::File::open(path) else {
+        return String::new();
+    };
+    let mut bytes = Vec::new();
+    let _ = file.take(8 * 1024).read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
+fn status_detail(output: &str, status: Option<std::process::ExitStatus>) -> String {
+    let text = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    match (text.is_empty(), status) {
+        (true, Some(status)) if status.success() => "ok".into(),
+        (true, Some(status)) => format!("failed ({})", status),
+        (true, None) => String::new(),
+        (false, Some(status)) if status.success() => text,
+        (false, Some(status)) => format!("{} ({})", text, status),
+        (false, None) => text,
     }
 }
 

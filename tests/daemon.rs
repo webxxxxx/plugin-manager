@@ -306,6 +306,22 @@ impl Sandbox {
         }
     }
 
+    fn write_script_body(&self, id: &str, body: &str) -> PathBuf {
+        let directory = self.config.join("services.d");
+        fs::create_dir_all(&directory).expect("services.d");
+        #[cfg(windows)]
+        let path = directory.join(format!("{}.cmd", id));
+        #[cfg(unix)]
+        let path = directory.join(format!("{}.sh", id));
+        fs::write(&path, body).expect("write script body");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod script");
+        }
+        path
+    }
+
     fn env(&self, command: &mut Command) {
         command
             .env("SVCD_CONFIG_DIR", &self.config)
@@ -792,6 +808,132 @@ fn a_drop_in_script_is_discovered_and_supervised() {
     let value: Value = serde_json::from_slice(&status.stdout).expect("status json");
     assert_eq!(value["details"]["probe"], "ok");
     wait_for_marker(&marker, "status");
+}
+
+#[test]
+fn a_script_without_actions_runs_from_the_top() {
+    let mut sandbox = Sandbox::new();
+    #[cfg(windows)]
+    let body = "@echo off\r\necho top>>\"%~dp0top.txt\"\r\n:loop\r\nping -n 2 127.0.0.1 >nul\r\ngoto loop\r\n";
+    #[cfg(unix)]
+    let body = "#!/bin/sh\necho top >> \"$(dirname \"$0\")/top.txt\"\nwhile :; do sleep 1; done\n";
+    sandbox.write_script_body("demo", body);
+    sandbox.start_daemon();
+
+    let started = sandbox.start_when_ready("demo");
+    assert_eq!(
+        started.status.code(),
+        Some(0),
+        "start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let marker = sandbox.config.join("services.d").join("top.txt");
+    wait_for_marker(&marker, "top");
+
+    let status = sandbox.status("demo");
+    assert!(status["details"]["probe"].is_null(), "{status}");
+
+    let stopped = sandbox.stop("demo");
+    assert_eq!(
+        stopped.status.code(),
+        Some(0),
+        "stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert_eq!(sandbox.status("demo")["summary"]["state"], "stopped");
+}
+
+#[test]
+fn a_start_only_script_is_stopped_by_killing_it() {
+    let mut sandbox = Sandbox::new();
+    #[cfg(windows)]
+    let body = "@echo off\r\nif /I \"%1\"==\"start\" goto start\r\nexit /b 64\r\n:start\r\necho start>>\"%~dp0start.txt\"\r\n:loop\r\nping -n 2 127.0.0.1 >nul\r\ngoto loop\r\n";
+    #[cfg(unix)]
+    let body = "#!/bin/sh\ncase \"$1\" in\n  start)\n    echo start >> \"$(dirname \"$0\")/start.txt\"\n    while :; do sleep 1; done\n    ;;\n  *) exit 64 ;;\nesac\n";
+    sandbox.write_script_body("demo", body);
+    sandbox.start_daemon();
+
+    let started = sandbox.start_when_ready("demo");
+    assert_eq!(
+        started.status.code(),
+        Some(0),
+        "start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let marker = sandbox.config.join("services.d").join("start.txt");
+    wait_for_marker(&marker, "start");
+
+    let began = Instant::now();
+    let stopped = sandbox.stop("demo");
+
+    assert_eq!(
+        stopped.status.code(),
+        Some(0),
+        "stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert_eq!(sandbox.status("demo")["summary"]["state"], "stopped");
+    assert!(
+        began.elapsed() < Duration::from_secs(8),
+        "a script without a stop action took {:?} to stop",
+        began.elapsed()
+    );
+    assert!(!sandbox.config.join("services.d").join("stop.txt").exists());
+}
+
+#[test]
+fn status_output_becomes_supplementary_detail() {
+    let mut sandbox = Sandbox::new();
+    #[cfg(windows)]
+    let body = "@echo off\r\nif /I \"%1\"==\"start\" goto start\r\nif /I \"%1\"==\"status\" goto status\r\nexit /b 64\r\n:start\r\n:loop\r\nping -n 2 127.0.0.1 >nul\r\ngoto loop\r\n:status\r\necho clock detail\r\nexit /b 0\r\n";
+    #[cfg(unix)]
+    let body = "#!/bin/sh\ncase \"$1\" in\n  start)\n    while :; do sleep 1; done\n    ;;\n  status)\n    echo clock detail\n    ;;\n  *) exit 64 ;;\nesac\n";
+    sandbox.write_script_body("demo", body);
+    sandbox.start_daemon();
+
+    let started = sandbox.start_when_ready("demo");
+    assert_eq!(
+        started.status.code(),
+        Some(0),
+        "start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+
+    let status = sandbox.status("demo");
+
+    assert_eq!(status["details"]["probe"], "clock detail");
+}
+
+#[test]
+fn a_stop_action_still_runs_when_start_is_not_declared() {
+    let mut sandbox = Sandbox::new();
+    #[cfg(windows)]
+    let body = "@echo off\r\nif /I \"%1\"==\"stop\" goto stop\r\necho top>>\"%~dp0top.txt\"\r\n:loop\r\nping -n 2 127.0.0.1 >nul\r\ngoto loop\r\n:stop\r\necho stop>>\"%~dp0stop.txt\"\r\nexit /b 0\r\n";
+    #[cfg(unix)]
+    let body = "#!/bin/sh\ncase \"$1\" in\n  stop)\n    echo stop >> \"$(dirname \"$0\")/stop.txt\"\n    ;;\n  *)\n    echo top >> \"$(dirname \"$0\")/top.txt\"\n    while :; do sleep 1; done\n    ;;\nesac\n";
+    sandbox.write_script_body("demo", body);
+    sandbox.start_daemon();
+
+    let started = sandbox.start_when_ready("demo");
+    assert_eq!(
+        started.status.code(),
+        Some(0),
+        "start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let top = sandbox.config.join("services.d").join("top.txt");
+    wait_for_marker(&top, "top");
+
+    let stopped = sandbox.stop("demo");
+
+    assert_eq!(
+        stopped.status.code(),
+        Some(0),
+        "stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    wait_for_marker(&sandbox.config.join("services.d").join("stop.txt"), "stop");
+    assert_eq!(sandbox.status("demo")["summary"]["state"], "stopped");
 }
 
 // ---------------------------------------------------------------------------
