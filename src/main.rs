@@ -23,6 +23,7 @@ mod supervisor;
 mod svc;
 mod transfer;
 mod uichannel;
+mod wake;
 mod webui;
 
 fn main() {

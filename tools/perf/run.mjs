@@ -804,6 +804,175 @@ async function benchMixed(daemon, token, durationSeconds) {
   };
 }
 
+function sleep(ms) {
+  return new Promise(function (resolve) { setTimeout(resolve, ms); });
+}
+
+// Sum WorkingSet/CPU over the daemon process tree (plugin wrappers, Python
+// children and their conhost helpers included). Windows-only; returns null
+// elsewhere.
+function processTree(pid) {
+  if (!pid || !WIN) return null;
+  const lines = [
+    '$ErrorActionPreference = "SilentlyContinue"',
+    '$root = ' + pid,
+    '$all = Get-CimInstance Win32_Process',
+    '$ids = New-Object System.Collections.Generic.HashSet[int]',
+    '[void]$ids.Add([int]$root)',
+    '$front = @([int]$root)',
+    'while ($front.Count -gt 0) {',
+    '  $next = @()',
+    '  foreach ($process in $all) {',
+    '    $parent = [int]$process.ParentProcessId',
+    '    $child = [int]$process.ProcessId',
+    '    if ($ids.Contains($parent) -and -not $ids.Contains($child)) { [void]$ids.Add($child); $next += $child }',
+    '  }',
+    '  $front = $next',
+    '}',
+    '$idList = @($ids)',
+    '$procs = @(Get-Process -Id $idList -ErrorAction SilentlyContinue)',
+    '$working = ($procs | Measure-Object WorkingSet64 -Sum).Sum',
+    '$private = ($procs | Measure-Object PrivateMemorySize64 -Sum).Sum',
+    '$cpu = ($procs | Measure-Object CPU -Sum).Sum',
+    '[pscustomobject]@{ count = $procs.Count; working_set = [int64]$working; private = [int64]$private; cpu = [double]$cpu } | ConvertTo-Json -Compress',
+  ];
+  try {
+    const output = execFileSync('powershell', ['-NoProfile', '-Command', lines.join('\n')], { encoding: 'utf8', windowsHide: true });
+    return JSON.parse(output);
+  } catch (_) {
+    return null;
+  }
+}
+
+function mb(bytes) {
+  return bytes / (1024 * 1024);
+}
+
+function writeScriptFixture(root) {
+  const fixture = path.join(root, 'plugin');
+  mkdirSync(path.join(fixture, 'payload', 'bin'), { recursive: true });
+  const exec = WIN ? 'payload/bin/agent.cmd' : 'payload/bin/agent.sh';
+  if (WIN) {
+    const script = [
+      '@echo off',
+      ':loop',
+      'set "line="',
+      'set /p line=',
+      'if errorlevel 1 goto end',
+      'echo {"jsonrpc":"2.0","id":1,"result":{"ok":true}}',
+      'goto loop',
+      ':end',
+    ].join('\r\n') + '\r\n';
+    writeFileSync(path.join(fixture, exec), script);
+  } else {
+    const script = '#!/bin/sh\nwhile IFS= read -r line; do\n  printf \'{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\\n\'\ndone\n';
+    writeFileSync(path.join(fixture, exec), script);
+    execFileSync('chmod', ['+x', path.join(fixture, exec)]);
+  }
+  const manifest = {
+    schema: 1,
+    name: 'perf',
+    version: '1.0.0',
+    desc: 'minimal script plugin for scale tests',
+    protocol: 1,
+    exec: { path: exec, ready: 'notify' },
+    capabilities: [],
+  };
+  writeFileSync(path.join(fixture, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
+  return fixture;
+}
+
+async function measureScale() {
+  const counts = [0, 5, 10, 30];
+  const results = [];
+  const pluginCli = ensureAlias('plugin');
+  for (const count of counts) {
+    const root = path.join(ROOT, 'target', 'scale-run-' + Date.now() + '-' + count);
+    mkdirSync(root, { recursive: true });
+    log('scale: starting ' + count + ' plugin(s) in ' + root);
+    const daemon = await startDaemon(root);
+    try {
+      const fixture = writeScriptFixture(root);
+      const packages = [];
+      for (let index = 0; index < count; index++) {
+        const id = 'p' + index;
+        const spk = path.join(root, id + '.spk');
+        runSync(pluginCli, ['bundle', fixture, '--id', id, '--key', KEY, '--key-id', KEY_ID, '-o', spk], daemon.env);
+        packages.push({ id: id, bytes: readFileSync(spk) });
+      }
+      const startAll = performance.now();
+      for (const item of packages) {
+        const installed = await httpRequest(daemon.address, 'POST', '/api/v1/plugins', { 'content-type': 'application/octet-stream' }, item.bytes, 15000);
+        assert.equal(installed.status, 200, installed.body.toString());
+        const started = await httpRequest(daemon.address, 'POST', '/api/v1/services/' + item.id + '/start', { 'content-length': '0' }, null, 20000);
+        assert.equal(started.status, 200, started.body.toString());
+      }
+      const startAllMs = performance.now() - startAll;
+      await sleep(2000);
+      const daemonBefore = processInfo(daemon.child.pid);
+      const before = processTree(daemon.child.pid);
+      await sleep(5000);
+      const daemonAfter = processInfo(daemon.child.pid);
+      const after = processTree(daemon.child.pid);
+      const cpuSeconds = before && after ? Math.max(0, after.cpu - before.cpu) : 0;
+      const daemonCpuSeconds = daemonBefore && daemonAfter ? Math.max(0, daemonAfter.CPU - daemonBefore.CPU) : 0;
+      const pluginCpuSeconds = Math.max(0, cpuSeconds - daemonCpuSeconds);
+      const cpuPercent = cpuSeconds / 5 * 100;
+      const daemonCpuPercent = daemonCpuSeconds / 5 * 100;
+      const pluginCpuPercent = pluginCpuSeconds / 5 * 100;
+      const daemonRss = daemonAfter ? daemonAfter.WorkingSet64 : 0;
+      results.push({
+        plugins: count,
+        root: root,
+        processes: after ? after.count : 0,
+        daemon_rss_bytes: daemonRss,
+        plugin_rss_bytes: Math.max(0, (after ? after.working_set : 0) - daemonRss),
+        total_rss_bytes: after ? after.working_set : 0,
+        total_private_bytes: after ? after.private : 0,
+        cpu_seconds_5s: cpuSeconds,
+        daemon_cpu_percent_one_core: daemonCpuPercent,
+        plugin_cpu_percent_one_core: pluginCpuPercent,
+        cpu_percent_one_core: cpuPercent,
+        cpu_percent_machine: cpuPercent / os.cpus().length,
+        start_all_ms: startAllMs,
+      });
+      log('scale: ' + count + ' plugins, daemon RSS=' + mb(daemonRss).toFixed(1) + ' MB, plugin RSS=' + mb(Math.max(0, (after ? after.working_set : 0) - daemonRss)).toFixed(1) + ' MB, daemon CPU=' + daemonCpuPercent.toFixed(2) + '%');
+    } finally {
+      await stopDaemon(daemon);
+    }
+  }
+  for (const item of results) {
+    item.per_plugin_rss_bytes = item.plugins > 0 ? item.plugin_rss_bytes / item.plugins : 0;
+  }
+  return results;
+}
+
+function renderScaleReport(results) {
+  const lines = [];
+  lines.push('# Plugin scale resource report');
+  lines.push('');
+  lines.push('Generated: ' + new Date().toISOString());
+  lines.push('');
+  lines.push('- OS: ' + os.type() + ' ' + os.release());
+  lines.push('- CPU: ' + os.cpus()[0].model + ' x' + os.cpus().length);
+  lines.push('- Plugin: minimal cmd/sh script (no Python)');
+  lines.push('- Window: 5s idle sample after 2s settle; daemon is sampled directly, plugin RSS is total tree minus daemon.');
+  lines.push('');
+  lines.push('| Plugins | Processes | Daemon RSS MB | Plugin RSS MB | Total RSS MB | Per plugin MB | Daemon CPU % | Plugin CPU % | Total CPU % | Start all ms |');
+  lines.push('| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
+  for (const item of results) {
+    lines.push('| ' + item.plugins + ' | ' + item.processes + ' | ' + mb(item.daemon_rss_bytes).toFixed(2) + ' | ' + mb(item.plugin_rss_bytes).toFixed(2) + ' | ' + mb(item.total_rss_bytes).toFixed(2) + ' | ' + mb(item.per_plugin_rss_bytes).toFixed(2) + ' | ' + item.daemon_cpu_percent_one_core.toFixed(2) + ' | ' + item.plugin_cpu_percent_one_core.toFixed(2) + ' | ' + item.cpu_percent_one_core.toFixed(2) + ' | ' + item.start_all_ms.toFixed(0) + ' |');
+  }
+  lines.push('');
+  lines.push('## Notes');
+  lines.push('');
+  lines.push('- Daemon RSS/CPU comes from Get-Process by daemon pid; plugin values are the process tree minus the daemon.');
+  lines.push('- CPU is the process-tree CPU seconds delta over 5s, normalized to one core.');
+  lines.push('- The minimal script has no business logic and is idle; values show daemon overhead and per-plugin process cost, not production capacity.');
+  lines.push('');
+  return lines.join('\n');
+}
+
 async function runPerf(daemon, token, resources) {
   const perf = {};
   perf.http = {};
@@ -960,10 +1129,11 @@ function environmentInfo() {
 
 async function main() {
   const args = process.argv.slice(2);
+  const scaleOnly = args.includes('--scale');
   const compatOnly = args.includes('--compat');
   const perfOnly = args.includes('--perf');
-  const runCompatMode = compatOnly || (!compatOnly && !perfOnly);
-  const runPerfMode = perfOnly || (!compatOnly && !perfOnly);
+  const runCompatMode = compatOnly || (!scaleOnly && !compatOnly && !perfOnly);
+  const runPerfMode = perfOnly || (!scaleOnly && !compatOnly && !perfOnly);
   const outIndex = args.indexOf('--out');
   const outPath = outIndex >= 0 ? path.resolve(args[outIndex + 1]) : path.join(ROOT, 'target', 'perf-results.json');
   const reportPath = path.join(ROOT, 'target', 'perf-report.md');
@@ -972,6 +1142,16 @@ async function main() {
   ensureAlias('plugin');
   ensureAlias('svc');
   ensureAlias('mcp');
+  if (scaleOnly) {
+    const results = await measureScale();
+    const scalePath = path.join(ROOT, 'target', 'scale-results.json');
+    const scaleReport = path.join(ROOT, 'target', 'scale-report.md');
+    writeFileSync(scalePath, JSON.stringify({ generated_at: new Date().toISOString(), environment: environmentInfo(), results: results }, null, 2) + '\n');
+    writeFileSync(scaleReport, renderScaleReport(results));
+    log('scale results ' + scalePath);
+    log('scale report ' + scaleReport);
+    return;
+  }
   const root = path.join(ROOT, 'target', 'perf-run-' + Date.now());
   mkdirSync(root, { recursive: true });
   log('workdir ' + root);

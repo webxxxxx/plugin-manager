@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -26,6 +26,7 @@ use crate::slot::hook_command;
 use crate::slot::{CallError, Slot};
 use crate::status::Status;
 use crate::supervisor::{self, Event};
+use crate::wake::Wake;
 
 pub fn run() -> i32 {
     let config = paths::config_dir();
@@ -80,7 +81,8 @@ pub fn run() -> i32 {
     };
 
     let (tx, rx) = mpsc::channel();
-    if let Err(error) = channel::spawn_server(&config, tx) {
+    let wake = Arc::new(Wake::new());
+    if let Err(error) = channel::spawn_server(&config, tx, wake.clone()) {
         log::svcd(&format!("svcd: cannot bind control channel: {}", error));
         return 1;
     }
@@ -94,9 +96,8 @@ pub fn run() -> i32 {
     notify_systemd("READY=1");
 
     let mut daemon = Daemon::new(loaded.registry, token, rx, api);
+    daemon.set_wake(wake);
     install_shutdown_signal();
-    #[cfg(windows)]
-    let _timer = TimerResolution::acquire();
     daemon.start_enabled();
     daemon.event_loop();
     notify_systemd("STOPPING=1");
@@ -124,31 +125,6 @@ fn notify_systemd(state: &str) {
 
 #[cfg(not(unix))]
 fn notify_systemd(_state: &str) {}
-
-#[cfg(windows)]
-struct TimerResolution;
-
-#[cfg(windows)]
-impl TimerResolution {
-    fn acquire() -> Self {
-        // Windows rounds short sleeps up to the 15.6ms system timer by
-        // default. The daemon's 1ms tick and the HTTP accept poll need a finer
-        // granularity to keep control-plane latency low.
-        unsafe {
-            windows_sys::Win32::Media::timeBeginPeriod(1);
-        }
-        TimerResolution
-    }
-}
-
-#[cfg(windows)]
-impl Drop for TimerResolution {
-    fn drop(&mut self) {
-        unsafe {
-            windows_sys::Win32::Media::timeEndPeriod(1);
-        }
-    }
-}
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -199,6 +175,7 @@ struct Daemon {
     token: String,
     rx: Receiver<channel::PendingCall>,
     api: Option<Arc<Api>>,
+    wake: Arc<Wake>,
     slots: BTreeMap<String, Slot>,
     shutdown: bool,
     started: Instant,
@@ -212,6 +189,7 @@ impl Daemon {
         rx: Receiver<channel::PendingCall>,
         api: Option<Arc<Api>>,
     ) -> Self {
+        let wake = Arc::new(Wake::new());
         let mut slots = BTreeMap::new();
         for service in registry.values() {
             if service.id == RESERVED_ID {
@@ -225,6 +203,7 @@ impl Daemon {
                     service.enabled,
                 );
                 slot.set_protocol_only(service.kind == Kind::Plugin);
+                slot.set_wake(wake.clone());
                 slots.insert(service.id.clone(), slot);
             }
         }
@@ -233,6 +212,7 @@ impl Daemon {
             token,
             rx,
             api,
+            wake,
             slots,
             shutdown: false,
             started: Instant::now(),
@@ -242,6 +222,13 @@ impl Daemon {
 
     fn now_ms(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
+    }
+
+    fn set_wake(&mut self, wake: Arc<Wake>) {
+        self.wake = wake.clone();
+        for slot in self.slots.values_mut() {
+            slot.set_wake(wake.clone());
+        }
     }
 
     fn start_enabled(&mut self) {
@@ -281,18 +268,27 @@ impl Daemon {
 
     fn event_loop(&mut self) {
         loop {
+            let mut disconnected = false;
+            loop {
+                match self.rx.try_recv() {
+                    Ok(incoming) => self.handle(incoming),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+            self.pump();
             if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
                 self.shutdown = true;
             }
-            match self.rx.recv_timeout(Duration::from_millis(1)) {
-                Ok(incoming) => self.handle(incoming),
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
-            }
-            self.pump();
-            if self.shutdown {
+            if self.shutdown || disconnected {
                 break;
             }
+            // Management requests and plugin stdout wake this immediately;
+            // the bounded wait is only for shutdown and timer deadlines.
+            self.wake.wait_timeout(Duration::from_millis(50));
         }
         self.stop_all();
     }
@@ -748,6 +744,7 @@ impl Daemon {
                 let mut slot =
                     Slot::new(id.clone(), exec, service.lifecycle.clone(), service.enabled);
                 slot.set_protocol_only(true);
+                slot.set_wake(self.wake.clone());
                 self.slots.insert(id.clone(), slot);
             }
         }

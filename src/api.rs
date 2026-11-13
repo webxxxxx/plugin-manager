@@ -7,7 +7,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -50,6 +50,7 @@ pub struct Api {
     port: u16,
     lan: Arc<Mutex<Lan>>,
     commands: Sender<Command>,
+    current: Arc<Mutex<SocketAddr>>,
 }
 
 enum Command {
@@ -71,7 +72,6 @@ pub fn spawn(config: PathBuf) -> std::io::Result<Arc<Api>> {
         "127.0.0.1".parse().expect("loopback")
     };
     let listener = TcpListener::bind((bind, port))?;
-    listener.set_nonblocking(true)?;
     let local = listener.local_addr()?;
     let port_file = config.join("http.port");
     fs::write(&port_file, format!("127.0.0.1:{}", local.port())).map_err(|error| {
@@ -85,15 +85,17 @@ pub fn spawn(config: PathBuf) -> std::io::Result<Arc<Api>> {
 
     let lan = Arc::new(Mutex::new(state));
     let (commands, receiver) = mpsc::channel();
+    let current = Arc::new(Mutex::new(local));
     let api = Arc::new(Api {
         config: config.clone(),
         port: local.port(),
         lan: lan.clone(),
         commands,
+        current: current.clone(),
     });
     thread::Builder::new()
         .name("svcd-http".into())
-        .spawn(move || listener_loop(listener, local, receiver, lan, config))?;
+        .spawn(move || listener_loop(Some(listener), local, receiver, lan, config, current))?;
     Ok(api)
 }
 
@@ -147,72 +149,129 @@ impl Api {
     }
 
     fn rebind(&self, addr: SocketAddr) -> Result<(), String> {
+        let current = *self
+            .current
+            .lock()
+            .map_err(|_| "HTTP listener state poisoned")?;
         let (reply, receiver) = mpsc::channel();
         self.commands
             .send(Command::Rebind { addr, reply })
             .map_err(|_| "HTTP listener is not running".to_string())?;
+        // A blocking accept needs a connection to return from accept so the
+        // loop can observe the queued command and rebind. The loop drops this
+        // probe before dispatching a normal request.
+        wake_listener(current);
         receiver
             .recv_timeout(Duration::from_secs(3))
             .map_err(|_| "HTTP rebind timed out".to_string())?
     }
 }
 
+fn wake_listener(current: SocketAddr) {
+    let target = if current.ip().is_unspecified() {
+        match current {
+            SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), current.port()),
+            SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), current.port()),
+        }
+    } else {
+        current
+    };
+    let _ = TcpStream::connect_timeout(&target, Duration::from_millis(500));
+}
+
 fn listener_loop(
-    listener: TcpListener,
-    addr: SocketAddr,
+    mut listener: Option<TcpListener>,
+    mut addr: SocketAddr,
     receiver: Receiver<Command>,
     lan: Arc<Mutex<Lan>>,
     config: PathBuf,
+    current: Arc<Mutex<SocketAddr>>,
 ) {
-    let mut listener = Some(listener);
-    let mut addr = addr;
     loop {
+        // Handle commands before blocking in accept. Commands that arrive
+        // while blocked are woken by a loopback probe from Api::rebind.
         while let Ok(Command::Rebind {
             addr: new_addr,
             reply,
         }) = receiver.try_recv()
         {
-            drop(listener.take());
-            match bind_listener(new_addr) {
-                Ok(new_listener) => {
-                    listener = Some(new_listener);
-                    addr = new_addr;
-                    let _ = reply.send(Ok(()));
+            apply_rebind(&mut listener, &mut addr, new_addr, reply, &current);
+        }
+        let Some(active) = listener.as_ref() else {
+            match receiver.recv() {
+                Ok(Command::Rebind {
+                    addr: new_addr,
+                    reply,
+                }) => {
+                    apply_rebind(&mut listener, &mut addr, new_addr, reply, &current);
                 }
-                Err(error) => {
-                    if let Ok(old_listener) = bind_listener(addr) {
-                        listener = Some(old_listener);
+                Err(_) => return,
+            }
+            continue;
+        };
+        let accepted = active.accept();
+        match accepted {
+            Ok((stream, _)) => {
+                // The accepted socket may be the probe that woke us for a
+                // pending rebind. Commands are queued before the probe is
+                // connected, so try_recv sees them here.
+                let mut pending = Vec::new();
+                while let Ok(command) = receiver.try_recv() {
+                    pending.push(command);
+                }
+                if !pending.is_empty() {
+                    drop(stream);
+                    for Command::Rebind {
+                        addr: new_addr,
+                        reply,
+                    } in pending
+                    {
+                        apply_rebind(&mut listener, &mut addr, new_addr, reply, &current);
                     }
-                    let _ = reply.send(Err(error.to_string()));
+                    continue;
                 }
+                let lan = lan.clone();
+                let config = config.clone();
+                let _ = thread::Builder::new()
+                    .name("svcd-http-conn".into())
+                    .spawn(move || handle(stream, config, lan));
+            }
+            Err(error) => {
+                log::svcd(&format!("svcd: HTTP accept failed: {}", error));
+                listener = None;
             }
         }
-        if let Some(current) = listener.as_ref() {
-            loop {
-                match current.accept() {
-                    Ok((stream, _)) => {
-                        let lan = lan.clone();
-                        let config = config.clone();
-                        let _ = thread::Builder::new()
-                            .name("svcd-http-conn".into())
-                            .spawn(move || handle(stream, config, lan));
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
-                }
+    }
+}
+
+fn apply_rebind(
+    listener: &mut Option<TcpListener>,
+    addr: &mut SocketAddr,
+    new_addr: SocketAddr,
+    reply: Sender<Result<(), String>>,
+    current: &Arc<Mutex<SocketAddr>>,
+) {
+    *listener = None;
+    match bind_listener(new_addr) {
+        Ok(new_listener) => {
+            *listener = Some(new_listener);
+            *addr = new_addr;
+            if let Ok(mut active) = current.lock() {
+                *active = new_addr;
             }
+            let _ = reply.send(Ok(()));
         }
-        // Keep the rebind command responsive without a 20ms latency floor on
-        // every new connection. The listener is non-blocking; polling at 1ms is
-        // cheap and keeps the accept path ready for the next request.
-        thread::sleep(Duration::from_millis(1));
+        Err(error) => {
+            if let Ok(old_listener) = bind_listener(*addr) {
+                *listener = Some(old_listener);
+            }
+            let _ = reply.send(Err(error.to_string()));
+        }
     }
 }
 
 fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
-    let listener = TcpListener::bind(addr)?;
-    listener.set_nonblocking(true)?;
-    Ok(listener)
+    TcpListener::bind(addr)
 }
 
 fn handle(mut stream: TcpStream, config: PathBuf, lan: Arc<Mutex<Lan>>) {

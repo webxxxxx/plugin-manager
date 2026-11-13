@@ -76,7 +76,11 @@ fn random_token() -> String {
 /// Bind the local control channel and serve one request per connection in a
 /// background thread. Each request carries a reply channel; the daemon answers
 /// on its own loop.
-pub fn spawn_server(config: &Path, tx: Sender<PendingCall>) -> io::Result<()> {
+pub fn spawn_server(
+    config: &Path,
+    tx: Sender<PendingCall>,
+    wake: std::sync::Arc<crate::wake::Wake>,
+) -> io::Result<()> {
     let listener = Listener::bind(config)?;
     std::thread::Builder::new()
         .name("svcd-channel".into())
@@ -90,15 +94,16 @@ pub fn spawn_server(config: &Path, tx: Sender<PendingCall>) -> io::Result<()> {
                     }
                 };
                 let tx = tx.clone();
+                let wake = wake.clone();
                 let _ = std::thread::Builder::new()
                     .name("svcd-channel-conn".into())
-                    .spawn(move || serve(stream, tx));
+                    .spawn(move || serve(stream, tx, wake));
             }
         })
         .map(|_| ())
 }
 
-fn serve(stream: Stream, tx: Sender<PendingCall>) {
+fn serve(stream: Stream, tx: Sender<PendingCall>, wake: std::sync::Arc<crate::wake::Wake>) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     match reader.read_line(&mut line) {
@@ -115,6 +120,7 @@ fn serve(stream: Stream, tx: Sender<PendingCall>) {
     {
         return;
     }
+    wake.notify();
     if let Ok(response) = reply_rx.recv() {
         let _ = reader.get_mut().write_all(response.as_bytes());
         let _ = reader.get_mut().flush();

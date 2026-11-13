@@ -13,6 +13,7 @@ use crate::paths;
 use crate::registry::{Exec, Hook, Lifecycle, Ready, State};
 use crate::rpc;
 use crate::supervisor::{self, Action, Event, Machine};
+use crate::wake::Wake;
 
 /// Per-plugin in-flight cap from ticket #31. The full spec also describes a
 /// 128-slot queue behind this cap; the ticket scopes this tracer bullet to the
@@ -31,6 +32,7 @@ pub(crate) struct Slot {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     frames: Option<Receiver<FrameEvent>>,
+    wake: Option<Arc<Wake>>,
     log: Option<Arc<Mutex<LogSink>>>,
     /// Plugins must keep stdout protocol-only; core scripts may still print
     /// human-readable output, which is logged for diagnosis.
@@ -75,6 +77,7 @@ impl Slot {
             child: None,
             stdin: None,
             frames: None,
+            wake: None,
             log: None,
             protocol_only: false,
             pending: BTreeMap::new(),
@@ -98,6 +101,10 @@ impl Slot {
 
     pub(crate) fn set_protocol_only(&mut self, protocol_only: bool) {
         self.protocol_only = protocol_only;
+    }
+
+    pub(crate) fn set_wake(&mut self, wake: Arc<Wake>) {
+        self.wake = Some(wake);
     }
 
     /// Start the stop hook before the state machine begins stopping. The hook
@@ -286,9 +293,12 @@ impl Slot {
             };
 
             let (sender, receiver) = mpsc::channel();
-            if let Err(error) =
-                ipc::spawn_reader(format!("svcd-{}-stdout", self.id), stdout, sender)
-            {
+            if let Err(error) = ipc::spawn_reader(
+                format!("svcd-{}-stdout", self.id),
+                stdout,
+                sender,
+                self.wake.clone(),
+            ) {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(error.to_string());

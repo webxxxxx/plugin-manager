@@ -267,7 +267,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - 语义映射 `svc.*`，与 CLI 同源；不写第二套状态。错误：`{error:{code,message}}`，400 / 401 / 403 / 404 / 409 / 413 / 500；start/stop 幂等。
 - 上传大小：`.spk` / `.spkb` 512 MiB（与解包上限一致）；配置 1 MiB；日志响应 1 MiB。
 - HTTP/1.1 keep-alive：同一连接顺序处理多个请求；`Connection: close` 显式关闭；不支持 pipelining；每个连接仍占一个线程。
-- **实现状态（2026-11-13，#79）**：HTTP 监听 accept 轮询 20ms → 1ms；daemon 事件循环 50ms → 1ms，并在 Windows 用 `timeBeginPeriod(1)` 避免 15.6ms 定时器粒度；`/api/v1` 与 `/mcp` 支持 HTTP/1.1 keep-alive（顺序多请求，`Connection: close` 可关闭），WS/SSE 仍独占连接。性能对比见 `docs/research/2026-11-13-core-compat-and-performance.md`。
+- **实现状态（2026-11-13，#79/#83）**：HTTP 监听改为阻塞 accept（rebind 用 loopback 探针唤醒并丢弃探针）；daemon 改用 condvar 唤醒控制通道和插件 stdout，事件循环只在 50ms 兜底等待中检查 shutdown/定时器，无 1ms 轮询；`/api/v1` 与 `/mcp` 支持 HTTP/1.1 keep-alive（顺序多请求，`Connection: close` 可关闭），WS/SSE 仍独占连接。性能对比见 `docs/research/2026-11-13-core-compat-and-performance.md`。
 - **实现状态（2026-11-12，#37 / #38 / #39）**：已实现 `GET /services`、`GET /services/{id}`、`POST start/stop`、`GET /version`、`POST /plugins`、`DELETE /plugins/{id}`；默认绑定 `127.0.0.1:8787`（`SVCD_HTTP_PORT` 覆盖，`0` 为临时端口并写 `<config>/http.port`），**无 TLS**；`svc lan enable` 可切到 LAN 并要求 Bearer/cookie 认证（#38）。#39 补齐 `GET/PUT /config/{id}`、`POST /config/{id}/reset`、`GET /export/{id}` 与 `/export/{id}/config`、`POST /import`（自动识别）、`GET /logs/{id}?lines=N`（默认 200、上限 2000、不提供 follow）、`POST /services/{id}/enable|disable`；这些端点只接受 plugin id，core 服务返回 404，方法不符返回 405。`GET /` 提供内嵌控制台（插件列表/安装/启停/自启/配置/日志/导出），页面无需认证即可加载，API 调用仍走同一鉴权。
 
 ### 3.6 LAN 鉴权与会话
