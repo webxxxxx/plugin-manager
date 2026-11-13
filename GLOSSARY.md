@@ -8,6 +8,10 @@
 受 svcd 监督、可被启停与调用的单元；有 id、kind（core/plugin）、状态、依赖与能力面。
 _Avoid_: 进程（进程只是它的运行载体）、插件（插件是服务的一种）
 
+**受管服务（Managed service）**:
+受 svcd 监督、由它启停与重启的 core 或 plugin；svcd 自身（内置 `svc`）不在其列。
+_Avoid_: 内置服务、系统服务
+
 **Core 服务（Core service）**:
 不经 .spk、不走插件安装流程的服务；管理员用启动脚本或可执行文件在 `services.d/*.json` 声明，由 svcd 监督。信任来自 root 所有的定义文件与本机管理员。
 _Avoid_: 内置插件、系统插件、core plugin
