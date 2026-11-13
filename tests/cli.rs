@@ -372,12 +372,17 @@ fn a_relative_exec_path_is_rejected_with_a_readable_reason() {
     assert!(errors.contains("absolute"), "stderr:\n{}", errors);
 }
 
+/// Test-only Ed25519 public key. `samples/keys/` is generated locally by
+/// `tools/gen_sample_key.mjs` and never committed, so tests must not read it.
+const SAMPLE_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\n\
+MCowBQYDK2VwAyEAOLVjY8cVextWNtjO6wCg0g25/7mN+wRpMkd597CV3Nk=\n\
+-----END PUBLIC KEY-----\n";
+
 #[test]
 fn trust_add_list_and_remove_manage_the_trust_store() {
     let sandbox = Sandbox::new();
     let public_key = sandbox.root.join("sample-2026.pub");
-    fs::write(&public_key, include_str!("../samples/keys/sample-2026.pub"))
-        .expect("write public key");
+    fs::write(&public_key, SAMPLE_PUBLIC_KEY).expect("write public key");
 
     let added = sandbox.run(&["trust", "add", public_key.to_str().expect("utf8")]);
     assert_eq!(added.status.code(), Some(0), "stderr: {}", stderr(&added));
