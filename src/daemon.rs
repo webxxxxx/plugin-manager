@@ -763,9 +763,11 @@ impl Daemon {
                 return Err(format!("id is a core service: {}", id));
             }
         }
-        // Refuse a hook package before a replace strategy stops the running
-        // version: a policy rejection must not leave the plugin stopped.
+        // Refuse a hook package or an unresolvable interpreter before a replace
+        // strategy stops the running version: a policy rejection must not leave
+        // the plugin stopped.
         plugin::ensure_hooks_allowed(&package, allow_hooks)?;
+        let host_interpreter = plugin::prepare(&package)?;
 
         let running = |slots: &BTreeMap<String, Slot>| {
             slots
@@ -777,7 +779,12 @@ impl Daemon {
             self.stop_service(&id)?;
         }
         let still_running = running(&self.slots);
-        let service = match plugin::install_package(&package, strategy, allow_hooks) {
+        let service = match plugin::install_package(
+            &package,
+            strategy,
+            allow_hooks,
+            host_interpreter.clone(),
+        ) {
             Ok(service) => service,
             Err(error) if strategy == Strategy::KeepOld && is_no_space(&error) => {
                 if still_running {
@@ -790,7 +797,7 @@ impl Daemon {
                     "svcd: plugin {}: keep-old ran out of space; falling back to replace",
                     id
                 ));
-                plugin::install_package(&package, Strategy::Replace, allow_hooks)?
+                plugin::install_package(&package, Strategy::Replace, allow_hooks, host_interpreter)?
             }
             Err(error) => return Err(error),
         };
@@ -1261,6 +1268,7 @@ mod tests {
                 args: Vec::new(),
                 env: Default::default(),
                 ready: Ready::Exec,
+                interpreter: None,
             }),
             lifecycle: None,
             enabled: true,
@@ -1370,6 +1378,7 @@ done
                 args: vec![script.to_string_lossy().to_string()],
                 env: Default::default(),
                 ready: Ready::Notify,
+                interpreter: None,
             }
         }
         #[cfg(windows)]
@@ -1419,6 +1428,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
                 ],
                 env: Default::default(),
                 ready: Ready::Notify,
+                interpreter: None,
             }
         }
     }

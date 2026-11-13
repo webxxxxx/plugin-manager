@@ -57,7 +57,29 @@ The configuration directory depends on the platform and on `svcd.conf`'s
 The service id must match `[a-z0-9][a-z0-9_-]{0,63}`; use the file name
 (`clock.sh` / `clock.bat` -> `clock`).
 
-## Plugin packages
+## Package a drop-in script as a `.spk`
 
-See `../spk/` for the `.spk` build output directory and its README for the sample
-package.
+The same script can ship as a signed plugin without changing it. `--from-core`
+reads the declared `start/stop/status` actions and writes a schema-2 manifest;
+`--interpreter` is required because the payload is a script.
+
+Windows:
+
+```powershell
+plugin bundle samples\services.d --exec clock.bat --from-core `
+  --interpreter cmd --interpreter-arg /C `
+  --key samples\keys\sample-2026.key --id clock --desc "clock service" `
+  -o samples\spk\clock.spk
+```
+
+Linux/macOS:
+
+```sh
+plugin bundle samples/services.d --exec clock.sh --from-core --interpreter sh \
+  --key samples/keys/sample-2026.key --id clock --desc "clock service" \
+  -o samples/spk/clock.spk
+```
+
+Then trust `samples/keys/sample-2026.pub` once and install the package with
+`plugin install`. See [../spk/README.md](../spk/README.md) for the key and
+install steps.

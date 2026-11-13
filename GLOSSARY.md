@@ -17,8 +17,16 @@ _Avoid_: 内置服务、系统服务
 _Avoid_: 内置插件、系统插件、core plugin
 
 **插件（Plugin）**:
-从 .spk 安装、`kind=plugin` 的服务；能力由 manifest 声明。
+从 .spk 安装、`kind=plugin` 的服务；能力由 manifest 声明，schema 2 起也可声明生命周期动作。
 _Avoid_: PluginManager、PM（已退役）
+
+**脚本插件（Script plugin）**:
+payload 是脚本、由 manifest 的 `interpreter` 声明宿主解释器、并可用 `lifecycle` 声明 start/stop/status 的插件；执行路径与 core 脚本共用，来源与信任仍是 .spk。
+_Avoid_: core plugin、系统插件
+
+**解释器（Interpreter）**:
+脚本插件依赖的宿主程序；manifest 只写 PATH 上的裸名、可选参数与可选版本约束。安装时解析为绝对路径并校验版本；守护进程重启扫描时只重新解析路径、不重复探测版本，运行时用解析出的绝对路径。
+_Avoid_: runtime、引擎
 
 **svcd**:
 唯一的守护进程与进程监督者；也是 multicall 二进制的守护进程入口名。

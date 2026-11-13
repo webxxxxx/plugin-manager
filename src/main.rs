@@ -7,6 +7,7 @@ mod definition;
 mod hook;
 mod http;
 mod install;
+mod interpreter;
 mod ipc;
 #[cfg_attr(not(feature = "http"), allow(dead_code))]
 mod lan;
@@ -21,6 +22,7 @@ mod plugin_cli;
 mod proc;
 mod registry;
 mod rpc;
+mod script;
 #[cfg(windows)]
 mod service_win;
 mod settings;

@@ -281,6 +281,10 @@ fn parse(args: &[String]) -> Result<Command, ()> {
             let mut version = None;
             let mut exec = None;
             let mut desc = None;
+            let mut from_core = false;
+            let mut interpreter = None;
+            let mut interpreter_version = None;
+            let mut interpreter_args = Vec::new();
             let mut index = 1;
             while index < args.len() {
                 let arg = &args[index];
@@ -312,6 +316,19 @@ fn parse(args: &[String]) -> Result<Command, ()> {
                     "--desc" => {
                         index += 1;
                         desc = Some(args.get(index).ok_or(())?.clone());
+                    }
+                    "--from-core" => from_core = true,
+                    "--interpreter" => {
+                        index += 1;
+                        interpreter = Some(args.get(index).ok_or(())?.clone());
+                    }
+                    "--interpreter-version" => {
+                        index += 1;
+                        interpreter_version = Some(args.get(index).ok_or(())?.clone());
+                    }
+                    "--interpreter-arg" => {
+                        index += 1;
+                        interpreter_args.push(args.get(index).ok_or(())?.clone());
                     }
                     _ if arg.starts_with("--out=") => {
                         out = Some(PathBuf::from(
@@ -358,6 +375,27 @@ fn parse(args: &[String]) -> Result<Command, ()> {
                                 .to_string(),
                         );
                     }
+                    _ if arg.starts_with("--interpreter=") => {
+                        interpreter = Some(
+                            arg.strip_prefix("--interpreter=")
+                                .expect("matched prefix")
+                                .to_string(),
+                        );
+                    }
+                    _ if arg.starts_with("--interpreter-version=") => {
+                        interpreter_version = Some(
+                            arg.strip_prefix("--interpreter-version=")
+                                .expect("matched prefix")
+                                .to_string(),
+                        );
+                    }
+                    _ if arg.starts_with("--interpreter-arg=") => {
+                        interpreter_args.push(
+                            arg.strip_prefix("--interpreter-arg=")
+                                .expect("matched prefix")
+                                .to_string(),
+                        );
+                    }
                     _ if arg.starts_with('-') => return Err(()),
                     _ if dir.is_none() => dir = Some(PathBuf::from(arg)),
                     _ => return Err(()),
@@ -374,6 +412,10 @@ fn parse(args: &[String]) -> Result<Command, ()> {
                     version,
                     exec,
                     desc,
+                    from_core,
+                    interpreter,
+                    interpreter_version,
+                    interpreter_args,
                 })
             })
             .ok_or(())
@@ -415,7 +457,7 @@ fn list() -> i32 {
 }
 
 fn status_command(id: &str, json: bool) -> i32 {
-    let status = match fetch_status(id) {
+    let status = match fetch_status(id, true) {
         Ok(status) => status,
         Err(code) => return code,
     };
@@ -427,7 +469,7 @@ fn status_command(id: &str, json: bool) -> i32 {
 }
 
 fn lifecycle(verb: &str, id: &str) -> i32 {
-    let status = match fetch_status(id) {
+    let status = match fetch_status(id, false) {
         Ok(status) => status,
         Err(code) => return code,
     };
@@ -674,8 +716,14 @@ fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn fetch_status(id: &str) -> Result<Status, i32> {
-    request("svc.status", json!({ "id": id }))
+fn fetch_status(id: &str, probe: bool) -> Result<Status, i32> {
+    // Match `svc status`: a plugin lifecycle `status` action runs only for the
+    // status command, not as a side effect of start/stop.
+    let mut params = json!({ "id": id });
+    if probe {
+        params["probe"] = json!(true);
+    }
+    request("svc.status", params)
 }
 
 fn request(method: &str, params: Value) -> Result<Status, i32> {
@@ -730,7 +778,7 @@ fn usage() {
     eprintln!("       plugin export <id> [--config-only] [--out <path>]");
     eprintln!("       plugin import <file> [--config <id>] [--no-config] [--force]");
     eprintln!(
-        "       plugin bundle <dir> --key <pem> [-o <out>] [--id <id>] [--version <semver>] [--exec <path>] [--desc <text>] [--key-id <id>]"
+        "       plugin bundle <dir> --key <pem> [-o <out>] [--id <id>] [--version <semver>] [--exec <path>] [--desc <text>] [--key-id <id>] [--from-core] [--interpreter <name>] [--interpreter-version <constraint>] [--interpreter-arg <arg>]"
     );
 }
 
@@ -849,7 +897,40 @@ mod tests {
                 id: Some("demo".into()),
                 version: Some("1.2.3".into()),
                 exec: Some("payload/bin/demo".into()),
-                desc: Some("demo plugin".into())
+                desc: Some("demo plugin".into()),
+                from_core: false,
+                interpreter: None,
+                interpreter_version: None,
+                interpreter_args: Vec::new()
+            })
+        );
+        assert_eq!(
+            parse(&args(&[
+                "bundle",
+                "samples/demo",
+                "--key",
+                "key.pem",
+                "--from-core",
+                "--interpreter",
+                "sh",
+                "--interpreter-version",
+                ">=5",
+                "--interpreter-arg=-e"
+            ]))
+            .expect("script bundle"),
+            Command::Bundle(crate::bundle::Options {
+                dir: PathBuf::from("samples/demo"),
+                out: None,
+                key: Some(PathBuf::from("key.pem")),
+                key_id: None,
+                id: None,
+                version: None,
+                exec: None,
+                desc: None,
+                from_core: true,
+                interpreter: Some("sh".into()),
+                interpreter_version: Some(">=5".into()),
+                interpreter_args: vec!["-e".into()]
             })
         );
         assert!(parse(&args(&["bundle", "a", "b"])).is_err());

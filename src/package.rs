@@ -35,6 +35,12 @@ pub struct Manifest {
     pub platform: String,
     pub protocol: u32,
     pub exec: Exec,
+    /// Host interpreter for script payloads; absent for native executables.
+    #[serde(default)]
+    pub interpreter: Option<Interpreter>,
+    /// Optional start/stop/status actions supervised like a core service.
+    #[serde(default)]
+    pub lifecycle: Option<Lifecycle>,
     #[serde(default)]
     pub dependencies: Vec<String>,
     #[serde(default)]
@@ -56,6 +62,36 @@ pub struct Exec {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub ready: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Interpreter {
+    pub name: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Numeric constraint such as `>=3.10,<4`; absent/empty means presence only.
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+/// Plugin lifecycle actions, mirroring a core definition.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Lifecycle {
+    pub start: Option<Hook>,
+    pub stop: Option<Hook>,
+    pub status: Option<Hook>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Hook {
+    pub path: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Timeout in seconds; omitted uses the action default.
+    #[serde(default)]
+    pub timeout: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -278,6 +314,7 @@ pub fn verify_bytes(bytes: &[u8]) -> Result<Package, String> {
     verify_signature(&manifest_bytes, &signature_bytes)?;
 
     let manifest = parse_manifest(&manifest_bytes)?;
+    validate_manifest(&manifest)?;
     if manifest.platform != target() {
         return Err(format!(
             "platform mismatch: package {}, host {}",
@@ -355,6 +392,11 @@ pub fn verify_bytes(bytes: &[u8]) -> Result<Package, String> {
     }
     #[cfg(unix)]
     check_hook_shebangs(&manifest, &files)?;
+    let borrowed: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|file| (file.path.as_str(), file.data.as_slice()))
+        .collect();
+    validate_script_payload(&manifest, &borrowed)?;
 
     Ok(Package {
         manifest,
@@ -399,11 +441,16 @@ fn check_hook_shebangs(manifest: &Manifest, files: &[FileData]) -> Result<(), St
 /// capability rules the install path enforces separately. The bundler calls
 /// this before writing so authoring mistakes fail early.
 pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
+    check_schema(manifest)?;
+    check_ready(manifest)?;
+    check_capabilities_with_exec(manifest)?;
     if manifest.files.is_empty() {
         return Err("package has no payload files".into());
     }
     check_manifest_paths(manifest)?;
     check_hooks(manifest)?;
+    check_lifecycle(manifest)?;
+    check_interpreter(manifest)?;
     if let Some(ui) = &manifest.ui {
         if ui.kind == "web" {
             let entry = ui.entry.as_deref().unwrap_or("index.html");
@@ -431,6 +478,167 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
         if !names.insert(&capability.name) {
             return Err(format!("duplicate capability: {}", capability.name));
         }
+    }
+    Ok(())
+}
+
+/// True when the payload bytes are a native executable (ELF, Mach-O or PE).
+/// Anything else is treated as a script and needs a declared interpreter.
+pub fn is_native_binary(bytes: &[u8]) -> bool {
+    const MAGICS: [&[u8]; 10] = [
+        b"\x7fELF",
+        b"\xfe\xed\xfa\xce",
+        b"\xfe\xed\xfa\xcf",
+        b"\xce\xfa\xed\xfe",
+        b"\xcf\xfa\xed\xfe",
+        b"\xca\xfe\xba\xbe",
+        b"\xbe\xba\xfe\xca",
+        b"\xca\xfe\xba\xbf",
+        b"\xbf\xba\xfe\xca",
+        b"MZ",
+    ];
+    MAGICS.iter().any(|magic| bytes.starts_with(magic))
+}
+
+/// Schema-2 packages must name a host interpreter for every script payload and
+/// must not carry a dangling interpreter declaration for a native-only payload.
+pub fn validate_script_payload(manifest: &Manifest, files: &[(&str, &[u8])]) -> Result<(), String> {
+    if manifest.schema < 2 {
+        return Ok(());
+    }
+    let mut executables = vec![manifest.exec.path.as_str()];
+    if let Some(lifecycle) = &manifest.lifecycle {
+        for hook in [&lifecycle.start, &lifecycle.stop, &lifecycle.status]
+            .into_iter()
+            .flatten()
+        {
+            executables.push(hook.path.as_str());
+        }
+    }
+    let mut scripts = Vec::new();
+    for path in executables {
+        let Some((_, data)) = files.iter().find(|(candidate, _)| *candidate == path) else {
+            // A missing payload file is reported by the declaration checks.
+            continue;
+        };
+        if !is_native_binary(data) {
+            scripts.push(path.to_string());
+        }
+    }
+    if !scripts.is_empty() && manifest.interpreter.is_none() {
+        return Err(format!(
+            "script payload {} requires an interpreter declaration",
+            scripts.join(", ")
+        ));
+    }
+    if scripts.is_empty() && manifest.interpreter.is_some() {
+        return Err("interpreter is declared but the payload has no script to run".into());
+    }
+    Ok(())
+}
+
+fn check_schema(manifest: &Manifest) -> Result<(), String> {
+    match manifest.schema {
+        1 | 2 => {}
+        other => return Err(format!("unsupported schema {}", other)),
+    }
+    if manifest.schema == 1 && (manifest.interpreter.is_some() || manifest.lifecycle.is_some()) {
+        return Err(
+            "lifecycle and interpreter require schema 2; old daemons would silently ignore them"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn check_ready(manifest: &Manifest) -> Result<(), String> {
+    match manifest.exec.ready.as_deref() {
+        None | Some("notify") | Some("exec") => Ok(()),
+        Some(other) => Err(format!(
+            "exec.ready {:?} is invalid; expected notify or exec",
+            other
+        )),
+    }
+}
+
+/// A capabilities list requires a protocol channel, which an exec-ready process
+/// does not have (stdin is closed).
+fn check_capabilities_with_exec(manifest: &Manifest) -> Result<(), String> {
+    if !manifest.capabilities.is_empty() && manifest.exec.ready.as_deref() == Some("exec") {
+        return Err(
+            "exec.ready=exec cannot declare capabilities: the plugin has no protocol channel"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn check_lifecycle(manifest: &Manifest) -> Result<(), String> {
+    let Some(lifecycle) = &manifest.lifecycle else {
+        return Ok(());
+    };
+    let mut declared = false;
+    for (name, hook, max_seconds) in [
+        ("start", lifecycle.start.as_ref(), 300u64),
+        ("stop", lifecycle.stop.as_ref(), 300u64),
+        ("status", lifecycle.status.as_ref(), 30u64),
+    ] {
+        let Some(hook) = hook else {
+            continue;
+        };
+        declared = true;
+        check_path(&hook.path)?;
+        if !manifest.files.iter().any(|file| file.path == hook.path) {
+            return Err(format!(
+                "lifecycle.{} is not in files[]: {}",
+                name, hook.path
+            ));
+        }
+        if let Some(timeout) = hook.timeout {
+            if timeout == 0 || timeout > max_seconds {
+                return Err(format!(
+                    "lifecycle.{}.timeout must be between 1 and {} seconds",
+                    name, max_seconds
+                ));
+            }
+        }
+        for argument in &hook.args {
+            check_argument("lifecycle", name, argument)?;
+        }
+        for (key, value) in &hook.env {
+            check_argument("lifecycle", name, key)?;
+            check_argument("lifecycle", name, value)?;
+        }
+    }
+    if !declared {
+        return Err("lifecycle declares no start, stop or status action".into());
+    }
+    Ok(())
+}
+
+fn check_interpreter(manifest: &Manifest) -> Result<(), String> {
+    let Some(interpreter) = &manifest.interpreter else {
+        return Ok(());
+    };
+    if !crate::interpreter::valid_name(&interpreter.name) {
+        return Err(format!(
+            "interpreter.name {:?} is not a bare name (no paths or spaces)",
+            interpreter.name
+        ));
+    }
+    if let Some(version) = &interpreter.version {
+        crate::interpreter::validate_constraint(version)
+            .map_err(|error| format!("interpreter.version: {}", error))?;
+    }
+    for argument in &interpreter.args {
+        check_argument("interpreter", &interpreter.name, argument)?;
+    }
+    Ok(())
+}
+
+fn check_argument(section: &str, name: &str, value: &str) -> Result<(), String> {
+    if value.contains('\0') {
+        return Err(format!("{} {} contains a NUL byte", section, name));
     }
     Ok(())
 }
@@ -600,9 +808,7 @@ fn parse_public_key(pem: &[u8]) -> Result<VerifyingKey, String> {
 
 pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, String> {
     let m: Manifest = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    if m.schema != 1 {
-        return Err(format!("unsupported schema {}", m.schema));
-    }
+    check_schema(&m)?;
     if m.protocol != 1 {
         return Err(format!("unsupported protocol {}", m.protocol));
     }
@@ -1192,6 +1398,216 @@ mod tests {
         let bytes = package_from(&key, "test", &manifest, &files);
         let error = verify_bytes(&bytes).expect_err("missing");
         assert!(error.contains("missing files"), "{error} {}", missing.0);
+    }
+
+    fn script_manifest(schema: u32) -> (Vec<u8>, TestFiles) {
+        let files: TestFiles = vec![("payload/bin/clock.sh", b"#!/bin/sh\n".to_vec(), 0o755)];
+        let entries: Vec<Value> = files
+            .iter()
+            .map(|(path, data, mode)| {
+                json!({"path": path, "size": data.len(), "sha256": hex_sha256(data), "mode": mode})
+            })
+            .collect();
+        let value = json!({
+            "schema": schema,
+            "name": "clock",
+            "version": "1.0.0",
+            "desc": "clock service",
+            "platform": target(),
+            "protocol": 1,
+            "exec": {"path": "payload/bin/clock.sh", "ready": "exec"},
+            "interpreter": {"name": "sh"},
+            "lifecycle": {
+                "start": {"path": "payload/bin/clock.sh", "args": ["start"]},
+                "stop": {"path": "payload/bin/clock.sh", "args": ["stop"]},
+                "status": {"path": "payload/bin/clock.sh", "args": ["status"], "timeout": 5}
+            },
+            "files": entries
+        });
+        (serde_json::to_vec(&value).expect("manifest"), files)
+    }
+
+    #[test]
+    fn rejects_lifecycle_or_interpreter_under_schema_one() {
+        let (bytes, _) = script_manifest(1);
+        let error = parse_manifest(&bytes).expect_err("schema gate");
+        assert!(error.contains("schema 2"), "{error}");
+    }
+
+    #[test]
+    fn accepts_lifecycle_and_interpreter_under_schema_two() {
+        let (bytes, _) = script_manifest(2);
+        let manifest = parse_manifest(&bytes).expect("parse");
+        validate_manifest(&manifest).expect("validate");
+        assert_eq!(
+            manifest
+                .interpreter
+                .as_ref()
+                .map(|interpreter| interpreter.name.as_str()),
+            Some("sh")
+        );
+        let lifecycle = manifest.lifecycle.as_ref().expect("lifecycle");
+        assert_eq!(
+            lifecycle.start.as_ref().expect("start").args,
+            ["start".to_string()]
+        );
+        assert_eq!(lifecycle.status.as_ref().expect("status").timeout, Some(5));
+    }
+
+    #[test]
+    fn rejects_a_lifecycle_path_outside_files_and_bad_timeouts() {
+        let value = |path: &str, timeout: Option<u64>| {
+            let files = vec![json!({
+                "path": "payload/bin/clock.sh",
+                "size": 10,
+                "sha256": "00",
+                "mode": 0o755
+            })];
+            json!({
+                "schema": 2, "name": "clock", "version": "1.0.0", "desc": "clock",
+                "platform": target(), "protocol": 1,
+                "exec": {"path": "payload/bin/clock.sh", "ready": "exec"},
+                "interpreter": {"name": "sh"},
+                "lifecycle": {"stop": {
+                    "path": path,
+                    "timeout": timeout
+                }},
+                "files": files
+            })
+        };
+        let bytes = serde_json::to_vec(&value("missing/stop.sh", None)).expect("json");
+        let error = validate_manifest(&parse_manifest(&bytes).expect("parse")).expect_err("path");
+        assert!(error.contains("not in files[]"), "{error}");
+
+        let bytes = serde_json::to_vec(&value("payload/bin/clock.sh", Some(0))).expect("json");
+        let error = validate_manifest(&parse_manifest(&bytes).expect("parse")).expect_err("zero");
+        assert!(error.contains("between 1 and"), "{error}");
+
+        let bytes = serde_json::to_vec(&value("payload/bin/clock.sh", Some(301))).expect("json");
+        let error =
+            validate_manifest(&parse_manifest(&bytes).expect("parse")).expect_err("too long");
+        assert!(error.contains("between 1 and"), "{error}");
+    }
+
+    #[test]
+    fn rejects_capabilities_on_an_exec_ready_plugin() {
+        let (bytes, _) = script_manifest(2);
+        let mut value: Value = serde_json::from_slice(&bytes).expect("json");
+        value["capabilities"] = json!([{
+            "name": "status", "desc": "status", "inputSchema": {}
+        }]);
+        let bytes = serde_json::to_vec(&value).expect("json");
+        let error = validate_manifest(&parse_manifest(&bytes).expect("parse"))
+            .expect_err("capabilities need a channel");
+        assert!(error.contains("no protocol channel"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_bad_interpreter_name_or_constraint() {
+        let (bytes, _) = script_manifest(2);
+        let mut value: Value = serde_json::from_slice(&bytes).expect("json");
+        value["interpreter"]["name"] = json!("py -3");
+        let bytes = serde_json::to_vec(&value).expect("json");
+        let error =
+            validate_manifest(&parse_manifest(&bytes).expect("parse")).expect_err("bad name");
+        assert!(error.contains("bare name"), "{error}");
+
+        let mut value: Value = serde_json::from_slice(&script_manifest(2).0).expect("json");
+        value["interpreter"]["version"] = json!("3.10");
+        let bytes = serde_json::to_vec(&value).expect("json");
+        let error =
+            validate_manifest(&parse_manifest(&bytes).expect("parse")).expect_err("bad constraint");
+        assert!(error.contains("version"), "{error}");
+        assert!(error.contains("must start with"), "{error}");
+    }
+
+    #[test]
+    fn verify_bytes_enforces_the_schema_two_gate() {
+        let key = setup();
+        let (manifest, files) = script_manifest(1);
+        let bytes = package_from(&key, "test", &manifest, &files);
+        let error = verify_bytes(&bytes).expect_err("schema one");
+        assert!(error.contains("schema 2"), "{error}");
+    }
+
+    #[test]
+    fn schema_two_scripts_require_an_interpreter() {
+        let key = setup();
+        let (manifest, files) = script_manifest(2);
+        let mut value: Value = serde_json::from_slice(&manifest).expect("json");
+        value.as_object_mut().expect("object").remove("interpreter");
+        let manifest = serde_json::to_vec(&value).expect("json");
+        let error = verify_bytes(&package_from(&key, "test", &manifest, &files))
+            .expect_err("missing interpreter");
+        assert!(error.contains("requires an interpreter"), "{error}");
+    }
+
+    #[test]
+    fn a_dangling_interpreter_on_a_native_payload_is_rejected() {
+        let key = setup();
+        let files: TestFiles = vec![("payload/bin/demo", b"\x7fELFdemo".to_vec(), 0o755)];
+        let entries: Vec<Value> = files
+            .iter()
+            .map(|(path, data, mode)| {
+                json!({"path": path, "size": data.len(), "sha256": hex_sha256(data), "mode": mode})
+            })
+            .collect();
+        let value = json!({
+            "schema": 2,
+            "name": "native",
+            "version": "1.0.0",
+            "desc": "native",
+            "platform": target(),
+            "protocol": 1,
+            "exec": {"path": "payload/bin/demo", "ready": "notify"},
+            "interpreter": {"name": "sh"},
+            "files": entries
+        });
+        let manifest = serde_json::to_vec(&value).expect("manifest");
+        let error = verify_bytes(&package_from(&key, "test", &manifest, &files))
+            .expect_err("dangling interpreter");
+        assert!(error.contains("no script"), "{error}");
+    }
+
+    #[test]
+    fn schema_one_scripts_keep_the_legacy_direct_exec_path() {
+        let key = setup();
+        let files: TestFiles = vec![("payload/bin/demo", b"#!/bin/sh\n".to_vec(), 0o755)];
+        let entries: Vec<Value> = files
+            .iter()
+            .map(|(path, data, mode)| {
+                json!({"path": path, "size": data.len(), "sha256": hex_sha256(data), "mode": mode})
+            })
+            .collect();
+        let value = json!({
+            "schema": 1,
+            "name": "legacy",
+            "version": "1.0.0",
+            "desc": "legacy",
+            "platform": target(),
+            "protocol": 1,
+            "exec": {"path": "payload/bin/demo"},
+            "files": entries
+        });
+        let manifest = serde_json::to_vec(&value).expect("manifest");
+        verify_bytes(&package_from(&key, "test", &manifest, &files)).expect("legacy package");
+    }
+
+    #[test]
+    fn verifies_a_schema_two_script_package() {
+        let key = setup();
+        let (manifest, files) = script_manifest(2);
+        let package =
+            verify_bytes(&package_from(&key, "test", &manifest, &files)).expect("script package");
+        assert_eq!(
+            package
+                .manifest
+                .lifecycle
+                .as_ref()
+                .and_then(|lifecycle| lifecycle.start.as_ref())
+                .map(|hook| hook.path.as_str()),
+            Some("payload/bin/clock.sh")
+        );
     }
 }
 

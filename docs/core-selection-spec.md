@@ -53,7 +53,7 @@
 
 ### 1.6 core 服务与 plugin 的边界
 
-**core 服务是「直接声明的启动脚本或可执行文件」；plugin 是「标准 .spk 包」。两者是不同来源，不是同一包格式的两种模式。**
+**core 服务是「直接声明的启动脚本或可执行文件」；plugin 是「标准 .spk 包」。两者是不同来源，不是同一包格式的两种模式。** 执行路径是共用的：schema 2 的 plugin 可以声明与 core 同形的 `lifecycle`，由同一个监督器跑 `start/stop/status`；区别仍在来源、信任与安装/配置 verbs，而不是「谁能有生命周期」。
 
 | | core 服务 | plugin |
 | --- | --- | --- |
@@ -61,6 +61,7 @@
 | 信任 | 无包签名；root 所有的定义文件 + 本机管理员 | Ed25519 manifest 签名 + `files[]` + `trust.d` |
 | 安装/升级 | 由 OS 包管理器 / 管理员管文件；svcd 不安装、不升级 | `svc install`（升级同）/ `uninstall` |
 | 配置 | 脚本/bin 自己管；svcd 不提供 `config` / `editconfig` / `export` | `config` / `configCheck` / `editconfig` / `.spkb` |
+| 生命周期 | `start/stop/status`（JSON 定义或 drop-in 脚本） | schema 2 manifest 可声明同形 `lifecycle`；执行路径共用 |
 | hooks | 无 | post-install / pre-remove |
 | UI | 无 `ui`、无能力面 | `ui` + `/plugin-ui/{id}` |
 | 注册表 | 启动时扫 `services.d/*.json` + 内置 `svc` | 扫 `<data>/plugins/*/current` |
@@ -121,6 +122,17 @@ case "$action" in start|stop|status) "$action" ;; *) exit 64 ;; esac
 
 上面的例子声明了全部三个动作；只写 `start` 时，`stop` 由框架终止进程、`status` 不产生 probe。`svc list/status/start/stop`、日志、退避、依赖图与 JSON core 相同；`svc status` 的 `details.probe` 来自 `status` 动作的 stdout。
 
+### 1.8 脚本插件（core 脚本转 .spk）
+
+core drop-in 脚本可以原样放进 `.spk` 变成 plugin：脚本不改，补 manifest。转换后执行路径与 §1.7 相同，但来源与信任换成签名包，并额外获得版本、热安装/卸载、config/export 与 Web UI。
+
+- manifest 用 `schema: 2`，`exec.ready: "exec"`，按脚本声明写 `lifecycle.start/stop/status`（路径是包内相对路径，且必须在 `files[]`）。
+- payload 不是 native 可执行文件（ELF / Mach-O / PE）时必须声明 `interpreter`：`{name, args?, version?}`。`name` 是 PATH 上的裸名；`version` 是数字约束，**为空/省略只校验存在**，不执行版本探测。Windows 上只解析 `.exe` / `.com`，不接受 `.cmd` / `.bat` shim。
+- 安装时解析解释器到绝对路径并校验版本，失败不落盘；扫描时只重新解析路径。运行时统一 `interp + args + [script] + action_args`，`exec` 与 lifecycle 共用同一结果。Windows 没有 SIGTERM 的 polite 路径，`stop` 钩子结束后直接终止进程树。
+- 脚本插件通常 `capabilities: []`，MCP 面只剩 `<id>.start`；会讲 MCP 的脚本可以 `ready: "notify"` 并声明能力。
+- `plugin bundle --from-core --interpreter <name>` 会按脚本声明的 `start/stop/status` 自动生成 lifecycle；lifecycle 指向的其它脚本也要一起进 `files[]`。`hooks` / `config` / `ui` 仍按插件规则。
+- `schema: 2` 是兼容门禁：老 daemon 在验包阶段拒绝，避免静默忽略 `lifecycle` / `interpreter`。
+
 ## 2. .spk 包格式
 
 **.spk 只承载 plugin；core 服务不是 .spk（见 §1.6）。**
@@ -134,19 +146,21 @@ case "$action" in start|stop|status) "$action" ;; *) exit 64 ;; esac
 
 ### 2.2 manifest
 
-JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
+JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，见 §1.8）。字段：
 
 | 字段 | 类型 | 必需 | 语义 |
 | --- | --- | --- | --- |
-| `schema` | int | 是 | 1；v1 重写后只认 `platform`，不认 `arch`；未知主版本拒绝 |
+| `schema` | int | 是 | 1 或 2；2 增加 `lifecycle` / `interpreter`；未知主版本拒绝；老 daemon 拒绝 2 |
 | `name` | string | 是 | 服务 id：`[a-z0-9][a-z0-9_-]{0,63}` |
 | `version` | string | 是 | semver |
 | `desc` | string | 是 | 一句话 |
 | `platform` | string | 是 | 规范目标三元组，如 `x86_64-unknown-linux-musl`；设备与 `TARGET` 字符串精确相等，安装 + 加载双检 |
 | `protocol` | int | 是 | 1；不匹配安装拒绝、加载再检 |
 | `exec` | object | 是 | `{path, args?, env?, ready?}`；`ready` 默认 `notify`，可 `exec` |
+| `interpreter` | object | 否 | schema 2：`{name, args?, version?}`；脚本 payload 必需，版本可空（只校验存在） |
+| `lifecycle` | object | 否 | schema 2：`{start?, stop?, status?}`，路径包内相对且在 `files[]` |
 | `dependencies` | [string] | 否 | 服务 id 列表，**无版本约束** |
-| `capabilities` | array | 否 | `{name, desc, inputSchema}`；name 插件内唯一，`svc.` 禁用 |
+| `capabilities` | array | 否 | `{name, desc, inputSchema}`；name 插件内唯一，`svc.` 禁用；只允许 `ready=notify` |
 | `ui` | object | 否 | `{type: web / gui / headerless, entry?}`；`entry` 相对 `payload/web/`，默认 `index.html` |
 | `files` | array | 是 | 除两个清单外的全部文件：`{path, size, sha256, mode}` |
 | `hooks` | object | 否 | `{postInstall?, preRemove?}`，指向 `hooks/` 内可执行 |
@@ -422,7 +436,8 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - `platform` 精确匹配；Rosetta 与 Windows ARM64 的 x64 模拟留作后续放宽，不默认开。
 - `protocol: 1` 精确匹配；主版本内加法兼容；未知方法 `-32601`，未知字段忽略。
 - `config` / `configCheck` 为加法字段；旧 svcd 忽略它们（版本偏斜，文档写明）。
-- `arch` 不是合法字段：v1 的 `schema: 1` 已重写为只含 `platform`；不提供 arch 兼容层。若已有外部包，再 bump `schema: 2`。
+- `arch` 不是合法字段：v1 的 `schema: 1` 已重写为只含 `platform`；不提供 arch 兼容层。
+- `schema: 2` 只增加 `lifecycle` / `interpreter`；老 daemon 在验包阶段拒绝 2，避免静默忽略导致脚本以错误参数启动。schema 1 的旧包行为不变。
 - 插件升级：默认 `replace` 采用 §2.4 的「空间检查 → 备份/还原或删旧」语义；显式 `--strategy keep-old` 走原子并存；活动配置在版本目录外，先删旧版本不会丢。
 
 ## 12. 票与笔记索引
@@ -489,7 +504,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 | C13 | **基线缺口** | 尺寸基线只有 musl x86_64 与 Windows x86_64；macOS arm64 / x86_64、Linux gnu 没有首跑数据 | #16 | CI 首跑后补 `ci/size-baseline.json` |
 | C14 | **语义澄清** | #15 说 `[auto]` 由 svcd 推断；#22 说 `[auto]` = enabled。两者可兼容，但文档要写死 | #15、#22 | 以 §5.2 为准：`[auto]` = svcd 推断的开机自启，不是插件自报，也不是重启策略 |
 | C15 | **命名冲突（已解）** | 票面默认「包根目录 `config` 文件」，但 #13 的包里 `config/` 是目录，不能同名共存 | #13、#20 | 默认改为 `config/config`；显式字段可指向任意 `files[]` 内普通文件 |
-| C16 | **已澄清（服务模型根）** | 原服务模型只写 kind core/plugin，没定义 core 怎么来；core 容易被误当成 .spk 的一种 | #9、#13、#14 | **已定（2026-11-12）**：core = `services.d/*.json` 或 `services.d/<id>.sh|bat|cmd|ps1` 的脚本/可执行文件；plugin = 标准 `.spk`；两者共用监督/依赖/日志，但能力面只归 plugin；core 用 start/stop/status 生命周期钩子，install/config/export 只对 plugin（§1.6 / §1.7）。 |
+| C16 | **已澄清（服务模型根）** | 原服务模型只写 kind core/plugin，没定义 core 怎么来；core 容易被误当成 .spk 的一种 | #9、#13、#14 | **已定（2026-11-12）**：core = `services.d/*.json` 或 `services.d/<id>.sh|bat|cmd|ps1` 的脚本/可执行文件；plugin = 标准 `.spk`；两者共用监督/依赖/日志，但能力面只归 plugin；install/config/export 只对 plugin（§1.6 / §1.7）。**2026-11-13 补充**：schema 2 的 plugin 也可声明 `lifecycle`，复用 core 的 start/stop/status 执行路径；来源与信任边界不变（§1.8）。 |
 
 ### 仍未处理
 
@@ -512,6 +527,7 @@ JSON，`schema: 1`（v1 重写为只含 `platform`，见 §13-C1）。字段：
 - 2026-11-13（补）：脚本动作改为可选——脚本声明哪个动作，svcd 才调用哪个；缺 `start` 从头执行、缺 `stop` 由框架终止进程、`status` 只把 stdout 作为 `details.probe` 的细节补充。
 - 2026-11-13（补）：服务树即进程组——Unix 独立进程组、Windows per-service job object；组内任一进程存活即 `Running`，stop 终止整棵树。
 - 2026-11-13（补）：信任根可管理——`svc trust list|add|remove`、`GET/POST/DELETE /api/v1/trust`、Web 控制台上传 `.pub`；包内不携带信任根，编译期 store 公钥仍未内置。
+- 2026-11-13（补）：脚本插件——`schema: 2` 增加 `lifecycle` / `interpreter`；脚本 payload 必须声明解释器（版本可空），安装时解析并校验，运行时统一经解释器执行；core drop-in 脚本可原样加 manifest 转成 plugin；`plugin bundle --from-core` 自动生成 lifecycle；老 daemon 拒绝 schema 2。
 
 ## 16. 实施票（2026-11-12 拆出）
 

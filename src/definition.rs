@@ -139,7 +139,9 @@ fn load_scripts(
         .filter(|path| {
             path.extension()
                 .and_then(|extension| extension.to_str())
-                .map(|extension| script_extension(&extension.to_ascii_lowercase()))
+                .map(|extension| {
+                    crate::script::extension_supported(&extension.to_ascii_lowercase())
+                })
                 .unwrap_or(false)
         })
         .collect();
@@ -223,7 +225,8 @@ fn load_scripts(
                 continue;
             }
         };
-        let declarations = declared_actions(&String::from_utf8_lossy(&contents), &extension);
+        let declarations =
+            crate::script::declared_actions(&String::from_utf8_lossy(&contents), &extension);
 
         let path_text = path.to_string_lossy().to_string();
         let hook = |action: &str, timeout_ms: u64| Hook {
@@ -231,6 +234,7 @@ fn load_scripts(
             args: vec![action.to_string()],
             env: BTreeMap::new(),
             timeout_ms,
+            interpreter: None,
         };
         let lifecycle = if declarations.start || declarations.stop || declarations.status {
             Some(Lifecycle {
@@ -260,6 +264,7 @@ fn load_scripts(
                 },
                 env: BTreeMap::new(),
                 ready: Ready::Exec,
+                interpreter: None,
             }),
             lifecycle,
             enabled,
@@ -274,103 +279,6 @@ fn load_scripts(
         };
         if let Err(reason) = registry.insert(service) {
             issues.push(fail(&id, reason));
-        }
-    }
-}
-
-fn script_extension(extension: &str) -> bool {
-    #[cfg(windows)]
-    {
-        matches!(extension, "bat" | "cmd" | "ps1")
-    }
-    #[cfg(not(windows))]
-    {
-        extension == "sh"
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct DeclaredActions {
-    start: bool,
-    stop: bool,
-    status: bool,
-}
-
-impl DeclaredActions {
-    fn declare(&mut self, action: &str) {
-        match action {
-            "start" => self.start = true,
-            "stop" => self.stop = true,
-            "status" => self.status = true,
-            _ => {}
-        }
-    }
-}
-
-const ACTIONS: [&str; 3] = ["start", "stop", "status"];
-
-/// A drop-in script declares an action by naming a shell function, a PowerShell
-/// function, a cmd label, or a shell `case` branch. Undeclared actions get the
-/// framework fallback: start executes the script from the top, stop terminates
-/// the process, status adds no detail.
-fn declared_actions(text: &str, extension: &str) -> DeclaredActions {
-    let mut actions = DeclaredActions::default();
-    for raw in text.lines() {
-        let line = raw.trim_start();
-        if line.is_empty() || is_comment(line) {
-            continue;
-        }
-        for action in ACTIONS {
-            if marks_action(line, action, extension) {
-                actions.declare(action);
-            }
-        }
-    }
-    actions
-}
-
-fn is_comment(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    line.starts_with('#') || lower.starts_with("rem ") || lower.starts_with("rem\t")
-}
-
-fn marks_action(line: &str, action: &str, extension: &str) -> bool {
-    match extension {
-        "bat" | "cmd" => {
-            let lower = line.to_ascii_lowercase();
-            let Some(rest) = lower.strip_prefix(&format!(":{}", action)) else {
-                return false;
-            };
-            rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace)
-        }
-        "ps1" => {
-            let lower = line.to_ascii_lowercase();
-            let Some(rest) = lower.strip_prefix("function ") else {
-                return false;
-            };
-            let Some(after) = rest.trim_start().strip_prefix(action) else {
-                return false;
-            };
-            let after = after.trim_start();
-            after.starts_with('{') || after.starts_with('(') || after.is_empty()
-        }
-        _ => {
-            let (candidates, keyword) = match line.strip_prefix("function ") {
-                Some(rest) => (rest.trim_start(), true),
-                None => (line, false),
-            };
-            if let Some(after) = candidates.strip_prefix(action) {
-                let after = after.trim_start();
-                if after.starts_with('(')
-                    || (keyword && (after.starts_with('{') || after.is_empty()))
-                {
-                    return true;
-                }
-            }
-            // `case "$1" in start) ...` style dispatchers.
-            line.strip_prefix(action)
-                .map(|after| after.trim_start().starts_with(')'))
-                .unwrap_or(false)
         }
     }
 }
@@ -545,15 +453,33 @@ fn validate(definition: CoreDefinition) -> Result<Service, String> {
         Some(lifecycle) => Some(Lifecycle {
             start: lifecycle
                 .start
-                .map(|hook| convert_hook(hook, 30_000, 300_000))
+                .map(|hook| {
+                    convert_hook(
+                        hook,
+                        crate::registry::HOOK_START_TIMEOUT_MS,
+                        crate::registry::HOOK_TIMEOUT_MAX_MS,
+                    )
+                })
                 .transpose()?,
             stop: lifecycle
                 .stop
-                .map(|hook| convert_hook(hook, 10_000, 300_000))
+                .map(|hook| {
+                    convert_hook(
+                        hook,
+                        crate::registry::HOOK_STOP_TIMEOUT_MS,
+                        crate::registry::HOOK_TIMEOUT_MAX_MS,
+                    )
+                })
                 .transpose()?,
             status: lifecycle
                 .status
-                .map(|hook| convert_hook(hook, 5_000, 30_000))
+                .map(|hook| {
+                    convert_hook(
+                        hook,
+                        crate::registry::HOOK_STATUS_TIMEOUT_MS,
+                        crate::registry::HOOK_STATUS_TIMEOUT_MAX_MS,
+                    )
+                })
                 .transpose()?,
         }),
         None => None,
@@ -577,6 +503,7 @@ fn validate(definition: CoreDefinition) -> Result<Service, String> {
             args: definition.exec.args,
             env: definition.exec.env,
             ready,
+            interpreter: None,
         }),
         lifecycle,
         // A definition declared in services.d is boot-start in v1; a marker-based
@@ -634,6 +561,7 @@ fn convert_hook(
         args: definition.args,
         env: definition.env,
         timeout_ms,
+        interpreter: None,
     })
 }
 

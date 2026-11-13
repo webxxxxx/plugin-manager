@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use crate::ipc::{self, FrameError, FrameEvent};
 use crate::log::{self, LogSink};
 use crate::paths;
-use crate::registry::{Exec, Hook, Lifecycle, Ready, State};
+use crate::registry::{Exec, Hook, Interpreter, Lifecycle, Ready, State};
 use crate::rpc;
 use crate::supervisor::{self, Action, Event, Machine};
 use crate::threads;
@@ -802,6 +802,14 @@ impl Slot {
             Err(reason) => log::svcd(&format!("svcd: {}: stop hook {}", self.id, reason)),
         }
         if self.machine.state == State::Stopping {
+            // Windows has no polite signal for an exec-ready service. Once the
+            // stop hook (the only graceful path) is done, terminate the tree
+            // instead of burning the whole stop window and force-killing anyway.
+            #[cfg(windows)]
+            if self.stdin.is_none() {
+                self.signal_force();
+                return;
+            }
             self.signal_polite();
         }
     }
@@ -835,7 +843,7 @@ impl Slot {
     /// instead of burning the whole stop window waiting for nothing.
     fn stop_without_hook(&mut self) {
         #[cfg(windows)]
-        if !self.protocol_only && self.stdin.is_none() {
+        if self.stdin.is_none() {
             self.signal_force();
             return;
         }
@@ -890,17 +898,46 @@ impl Slot {
 }
 
 fn command_for(exec: &Exec) -> Command {
-    command_for_parts(&exec.path, &exec.args, &exec.env)
+    match &exec.interpreter {
+        Some(interpreter) => {
+            command_for_interpreter(interpreter, &exec.path, &exec.args, &exec.env)
+        }
+        None => command_for_parts(&exec.path, &exec.args, &exec.env),
+    }
 }
 
 pub(crate) fn hook_command(id: &str, action: &str, hook: &Hook) -> Command {
-    let mut command = command_for_parts(&hook.path, &hook.args, &hook.env);
+    let mut command = match &hook.interpreter {
+        Some(interpreter) => {
+            command_for_interpreter(interpreter, &hook.path, &hook.args, &hook.env)
+        }
+        None => command_for_parts(&hook.path, &hook.args, &hook.env),
+    };
     command
         .env("SVCD_SERVICE_ID", id)
         .env("SVCD_ACTION", action)
         .env("SVCD_DATA_DIR", paths::data_dir())
         .env("SVCD_CONFIG_DIR", paths::config_dir())
         .env("SVCD_LOG_DIR", paths::logs_dir());
+    command
+}
+
+/// A script payload is not executable on its own in every layout: the manifest
+/// resolved an interpreter at install time, so the supervisor runs
+/// `interp [interp args] script [action args]`.
+fn command_for_interpreter(
+    interpreter: &Interpreter,
+    script: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+) -> Command {
+    let mut command = Command::new(&interpreter.path);
+    command
+        .args(&interpreter.args)
+        .arg(script)
+        .args(args)
+        .envs(env);
+    crate::proc::configure(&mut command);
     command
 }
 
@@ -972,6 +1009,7 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             ready: Ready::Notify,
+            interpreter: None,
         }
     }
 
@@ -991,6 +1029,58 @@ mod tests {
             },
         );
         rx
+    }
+
+    #[test]
+    fn an_interpreter_wraps_the_script_and_its_arguments() {
+        let exec = Exec {
+            path: "clock.sh".into(),
+            args: vec!["start".into()],
+            env: BTreeMap::new(),
+            ready: Ready::Exec,
+            interpreter: Some(Interpreter {
+                path: "/usr/bin/sh".into(),
+                args: vec!["-e".into()],
+            }),
+        };
+
+        let command = command_for(&exec);
+        let args: Vec<String> = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().to_string())
+            .collect();
+
+        assert_eq!(command.get_program().to_string_lossy(), "/usr/bin/sh");
+        assert_eq!(args, vec!["-e", "clock.sh", "start"]);
+    }
+
+    #[test]
+    fn a_hook_with_an_interpreter_keeps_the_action_environment() {
+        let hook = Hook {
+            path: "actions.sh".into(),
+            args: vec!["stop".into()],
+            env: BTreeMap::new(),
+            timeout_ms: 1_000,
+            interpreter: Some(Interpreter {
+                path: "/usr/bin/bash".into(),
+                args: Vec::new(),
+            }),
+        };
+
+        let command = hook_command("demo", "stop", &hook);
+        let args: Vec<String> = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().to_string())
+            .collect();
+
+        assert_eq!(command.get_program().to_string_lossy(), "/usr/bin/bash");
+        assert_eq!(args, vec!["actions.sh", "stop"]);
+        assert!(command.get_envs().any(|(key, value)| {
+            key.to_string_lossy() == "SVCD_ACTION"
+                && value
+                    .map(|value| value.to_string_lossy() == "stop")
+                    .unwrap_or(false)
+        }));
     }
 
     #[test]
@@ -1137,6 +1227,7 @@ done
             args: vec![script.to_string_lossy().to_string()],
             env: BTreeMap::new(),
             ready: Ready::Notify,
+            interpreter: None,
         };
         let mut slot = Slot::new("demo".into(), exec, None, true);
         slot.set_protocol_only(true);

@@ -27,6 +27,12 @@ pub struct Options {
     pub version: Option<String>,
     pub exec: Option<String>,
     pub desc: Option<String>,
+    /// Emit schema-2 lifecycle actions from the exec script's declarations.
+    pub from_core: bool,
+    /// Host interpreter required by a script payload.
+    pub interpreter: Option<String>,
+    pub interpreter_version: Option<String>,
+    pub interpreter_args: Vec<String>,
 }
 
 struct SourceFile {
@@ -188,13 +194,99 @@ fn assemble_manifest(
         Some(value) => normalize_exec(value)?,
         None => match declared_exec {
             Some(path) => path,
-            None => detect_exec(sources)?,
+            None => detect_exec(sources, options.from_core || options.interpreter.is_some())?,
         },
     };
     if !sources.iter().any(|source| source.path == exec_path) {
         return Err(format!("exec.path is not in files[]: {}", exec_path));
     }
     package::check_path(&exec_path)?;
+
+    if options.from_core {
+        let source = sources
+            .iter()
+            .find(|source| source.path == exec_path)
+            .expect("exec membership checked above");
+        if package::is_native_binary(&source.data) {
+            return Err("--from-core needs a script payload, but exec is a native binary".into());
+        }
+        if manifest.contains_key("capabilities") {
+            return Err("--from-core packages cannot declare capabilities".into());
+        }
+        let extension = std::path::Path::new(&exec_path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let actions =
+            crate::script::declared_actions(&String::from_utf8_lossy(&source.data), &extension);
+        if actions.any() {
+            let mut lifecycle = Map::new();
+            if actions.start {
+                lifecycle.insert(
+                    "start".into(),
+                    serde_json::json!({"path": exec_path, "args": ["start"]}),
+                );
+            }
+            if actions.stop {
+                lifecycle.insert(
+                    "stop".into(),
+                    serde_json::json!({"path": exec_path, "args": ["stop"]}),
+                );
+            }
+            if actions.status {
+                lifecycle.insert(
+                    "status".into(),
+                    serde_json::json!({"path": exec_path, "args": ["status"]}),
+                );
+            }
+            manifest.insert("lifecycle".into(), Value::Object(lifecycle));
+        } else {
+            manifest.remove("lifecycle");
+        }
+        let mut exec = manifest
+            .get("exec")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        exec.insert("ready".into(), Value::String("exec".into()));
+        manifest.insert("exec".into(), Value::Object(exec));
+    }
+
+    if options.interpreter_version.is_some() && options.interpreter.is_none() {
+        return Err("--interpreter-version requires --interpreter".into());
+    }
+    if !options.interpreter_args.is_empty() && options.interpreter.is_none() {
+        return Err("--interpreter-arg requires --interpreter".into());
+    }
+    if let Some(name) = &options.interpreter {
+        let mut interpreter = manifest
+            .get("interpreter")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        interpreter.insert("name".into(), Value::String(name.clone()));
+        if let Some(version) = &options.interpreter_version {
+            interpreter.insert("version".into(), Value::String(version.clone()));
+        }
+        if !options.interpreter_args.is_empty() {
+            interpreter.insert(
+                "args".into(),
+                Value::Array(
+                    options
+                        .interpreter_args
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        manifest.insert("interpreter".into(), Value::Object(interpreter));
+    }
+    if options.from_core && !manifest.contains_key("interpreter") {
+        return Err("--from-core with a script payload requires --interpreter <name>".into());
+    }
 
     if !manifest.contains_key("hooks") {
         let mut hooks = Map::new();
@@ -236,8 +328,15 @@ fn assemble_manifest(
             }
         }
     }
+    let interpreter_runs_exec = manifest.contains_key("interpreter");
     for source in sources.iter_mut() {
-        source.mode = effective_mode(&source.path, source.mode, &exec_path, &hook_paths)?;
+        source.mode = effective_mode(
+            &source.path,
+            source.mode,
+            &exec_path,
+            &hook_paths,
+            interpreter_runs_exec,
+        )?;
     }
 
     let mut files = Vec::with_capacity(sources.len());
@@ -250,7 +349,11 @@ fn assemble_manifest(
         }));
     }
 
-    manifest.entry("schema").or_insert_with(|| Value::from(1));
+    if manifest.contains_key("lifecycle") || manifest.contains_key("interpreter") {
+        manifest.insert("schema".into(), Value::from(2));
+    } else {
+        manifest.entry("schema").or_insert_with(|| Value::from(1));
+    }
     manifest.entry("protocol").or_insert_with(|| Value::from(1));
     manifest.insert("name".into(), Value::String(name));
     manifest.insert("version".into(), Value::String(version));
@@ -284,6 +387,11 @@ fn assemble_manifest(
         .map_err(|error| format!("serialize manifest: {}", error))?;
     let parsed = package::parse_manifest(&manifest_bytes)?;
     package::validate_manifest(&parsed)?;
+    let borrowed: Vec<(&str, &[u8])> = sources
+        .iter()
+        .map(|source| (source.path.as_str(), source.data.as_slice()))
+        .collect();
+    package::validate_script_payload(&parsed, &borrowed)?;
     Ok((manifest_bytes, parsed))
 }
 
@@ -447,13 +555,21 @@ fn effective_mode(
     raw: u32,
     exec: &str,
     hooks: &BTreeSet<String>,
+    interpreter_runs_exec: bool,
 ) -> Result<u32, String> {
     #[cfg(not(unix))]
     let _ = raw;
+    #[cfg(not(unix))]
+    let _ = interpreter_runs_exec;
     let wants_executable_mode = path == exec || hooks.contains(path);
     if wants_executable_mode {
         #[cfg(unix)]
         {
+            // Hooks are executed directly even when the service payload is run
+            // through an interpreter, so only the exec path may relax the bit.
+            if path == exec && interpreter_runs_exec && !hooks.contains(path) {
+                return Ok(if raw & 0o111 == 0 { 0o755 } else { raw });
+            }
             if raw & 0o111 == 0 {
                 return Err(format!("{} is not executable", path));
             }
@@ -481,10 +597,12 @@ fn normalize_exec(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
-fn detect_exec(sources: &[SourceFile]) -> Result<String, String> {
+fn detect_exec(sources: &[SourceFile], accept_scripts: bool) -> Result<String, String> {
     let mut candidates: Vec<String> = sources
         .iter()
-        .filter(|source| is_exec_candidate_location(&source.path) && looks_executable(source))
+        .filter(|source| {
+            is_exec_candidate_location(&source.path) && looks_executable(source, accept_scripts)
+        })
         .map(|source| source.path.clone())
         .collect();
     candidates.sort();
@@ -506,20 +624,22 @@ fn is_exec_candidate_location(path: &str) -> bool {
     }
 }
 
-fn looks_executable(source: &SourceFile) -> bool {
+fn looks_executable(source: &SourceFile, accept_scripts: bool) -> bool {
     #[cfg(unix)]
     {
         source.mode & 0o111 != 0
+            || (accept_scripts && crate::script::looks_like_script(&source.path, &source.data))
     }
     #[cfg(not(unix))]
     {
-        match source.path.rsplit_once('.').map(|(_, extension)| extension) {
+        let native = match source.path.rsplit_once('.').map(|(_, extension)| extension) {
             Some(extension) => matches!(
                 extension.to_ascii_lowercase().as_str(),
                 "exe" | "cmd" | "bat" | "com"
             ),
             None => false,
-        }
+        };
+        native || (accept_scripts && crate::script::looks_like_script(&source.path, &source.data))
     }
 }
 
@@ -872,7 +992,7 @@ mod tests {
             "desc": "old",
             "platform": "x86_64-unknown-linux-musl",
             "protocol": 1,
-            "exec": {"path": "payload/bin/agent", "args": ["--stdio"], "ready": "exec"},
+            "exec": {"path": "payload/bin/agent", "args": ["--stdio"], "ready": "notify"},
             "capabilities": [{"name": "status", "desc": "status", "inputSchema": {"type": "object"}}],
             "ui": {"type": "web", "entry": "index.html"},
             "files": [{"path": "stale", "size": 1, "sha256": "00", "mode": 420}]
@@ -897,7 +1017,7 @@ mod tests {
         assert_eq!(manifest.desc, "fresh desc");
         assert_eq!(manifest.platform, package::target());
         assert_eq!(manifest.exec.args, vec!["--stdio".to_string()]);
-        assert_eq!(manifest.exec.ready.as_deref(), Some("exec"));
+        assert_eq!(manifest.exec.ready.as_deref(), Some("notify"));
         assert_eq!(manifest.capabilities.len(), 1);
         assert_eq!(manifest.files.len(), 3);
         assert!(manifest.files.iter().all(|file| file.path != "stale"));
@@ -1107,5 +1227,150 @@ mod tests {
         options.id = Some("sparse".into());
         let error = bundle(&options).expect_err("sparse");
         assert!(error.contains("sparse files are not allowed"), "{error}");
+    }
+
+    fn script_service() -> (&'static str, Vec<u8>) {
+        if cfg!(windows) {
+            (
+                "payload/bin/clock.cmd",
+                b"@echo off\r\n:start\r\n:stop\r\n:status\r\n".to_vec(),
+            )
+        } else {
+            (
+                "payload/bin/clock.sh",
+                b"#!/bin/sh\nstart() { :; }\nstop() { :; }\nstatus() { :; }\n".to_vec(),
+            )
+        }
+    }
+
+    fn script_options(source: &Path, out: &Path, key: &Path, exec: &str) -> Options {
+        let mut options = bundle_options(source, out, key);
+        options.id = Some("clock".into());
+        options.exec = Some(exec.into());
+        options.from_core = true;
+        options.interpreter = Some(if cfg!(windows) {
+            "cmd".into()
+        } else {
+            "sh".into()
+        });
+        if cfg!(windows) {
+            options.interpreter_args = vec!["/C".into()];
+        }
+        options
+    }
+
+    #[test]
+    fn from_core_emits_lifecycle_and_schema_two() {
+        let source = TempDir::new();
+        let work = TempDir::new();
+        let (exec_path, body) = script_service();
+        // The interpreter runs the script, so the source does not need +x.
+        write(source.path(), exec_path, &body, 0o644);
+        let key_path = key_file(&work, 40);
+        let out = work.path().join("clock.spk");
+        let options = script_options(source.path(), &out, &key_path, exec_path);
+
+        bundle(&options).expect("bundle");
+        let entries = entries(&fs::read(&out).expect("read"));
+        let manifest = package::parse_manifest(&entries[0].data).expect("manifest");
+
+        assert_eq!(manifest.schema, 2);
+        assert_eq!(manifest.exec.ready.as_deref(), Some("exec"));
+        assert_eq!(
+            manifest.interpreter.as_ref().expect("interpreter").name,
+            if cfg!(windows) { "cmd" } else { "sh" }
+        );
+        let lifecycle = manifest.lifecycle.as_ref().expect("lifecycle");
+        assert_eq!(lifecycle.start.as_ref().expect("start").args, ["start"]);
+        assert_eq!(lifecycle.stop.as_ref().expect("stop").args, ["stop"]);
+        assert_eq!(lifecycle.status.as_ref().expect("status").args, ["status"]);
+        let exec = manifest
+            .files
+            .iter()
+            .find(|file| file.path == exec_path)
+            .expect("exec file");
+        assert_eq!(exec.mode, 0o755);
+    }
+
+    #[test]
+    fn detects_a_script_without_an_exec_bit_when_an_interpreter_is_declared() {
+        let source = TempDir::new();
+        let work = TempDir::new();
+        write(
+            source.path(),
+            "payload/bin/service.py",
+            b"print('hi')\n",
+            0o644,
+        );
+        let key_path = key_file(&work, 44);
+        let out = work.path().join("script.spk");
+        let mut options = bundle_options(source.path(), &out, &key_path);
+        options.id = Some("scripty".into());
+        options.from_core = true;
+        options.interpreter = Some("python3".into());
+
+        bundle(&options).expect("bundle");
+        let entries = entries(&fs::read(&out).expect("read"));
+        let manifest = package::parse_manifest(&entries[0].data).expect("manifest");
+
+        assert_eq!(manifest.exec.path, "payload/bin/service.py");
+        assert_eq!(manifest.schema, 2);
+        assert!(manifest.lifecycle.is_none());
+        assert_eq!(
+            manifest
+                .interpreter
+                .as_ref()
+                .map(|interpreter| interpreter.name.as_str()),
+            Some("python3")
+        );
+    }
+
+    #[test]
+    fn from_core_requires_an_interpreter_for_a_script() {
+        let source = TempDir::new();
+        let work = TempDir::new();
+        let (exec_path, body) = script_service();
+        write(source.path(), exec_path, &body, 0o644);
+        let key_path = key_file(&work, 41);
+        let out = work.path().join("clock.spk");
+        let mut options = script_options(source.path(), &out, &key_path, exec_path);
+        options.interpreter = None;
+        options.interpreter_args.clear();
+
+        let error = bundle(&options).expect_err("missing interpreter");
+
+        assert!(error.contains("--interpreter"), "{error}");
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn from_core_rejects_a_native_payload() {
+        let source = TempDir::new();
+        let work = TempDir::new();
+        write(source.path(), "payload/bin/tool", b"\x7fELFdemo", 0o755);
+        let key_path = key_file(&work, 42);
+        let out = work.path().join("native.spk");
+        let options = script_options(source.path(), &out, &key_path, "payload/bin/tool");
+
+        let error = bundle(&options).expect_err("native payload");
+
+        assert!(error.contains("native binary"), "{error}");
+    }
+
+    #[test]
+    fn an_interpreter_on_a_native_payload_is_rejected() {
+        let source = TempDir::new();
+        let work = TempDir::new();
+        write(source.path(), "payload/bin/tool", b"\x7fELFdemo", 0o755);
+        let key_path = key_file(&work, 43);
+        let out = work.path().join("native.spk");
+        let mut options = bundle_options(source.path(), &out, &key_path);
+        options.id = Some("native".into());
+        options.exec = Some("payload/bin/tool".into());
+        options.interpreter = Some("sh".into());
+
+        let error = bundle(&options).expect_err("no script payload");
+
+        assert!(error.contains("no script"), "{error}");
     }
 }

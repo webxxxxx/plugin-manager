@@ -61,12 +61,32 @@ pub enum Ready {
     Exec,
 }
 
+/// Default and maximum budgets for a lifecycle action. The start action is
+/// supervised under the state machine's start timeout; its own `timeout` is
+/// kept for parity with a core definition and is not armed separately.
+pub const HOOK_START_TIMEOUT_MS: u64 = 30_000;
+pub const HOOK_STOP_TIMEOUT_MS: u64 = 10_000;
+pub const HOOK_STATUS_TIMEOUT_MS: u64 = 5_000;
+pub const HOOK_TIMEOUT_MAX_MS: u64 = 300_000;
+pub const HOOK_STATUS_TIMEOUT_MAX_MS: u64 = 30_000;
+
+/// A resolved host interpreter. `path` is absolute and was validated when the
+/// plugin was installed, so the supervisor runs the same binary that passed the
+/// version check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Interpreter {
+    pub path: String,
+    pub args: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Exec {
     pub path: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub ready: Ready,
+    /// Present when `path` is a script the daemon must run through an interpreter.
+    pub interpreter: Option<Interpreter>,
 }
 
 /// One lifecycle hook for a core service. `timeout_ms` is only used by stop
@@ -77,6 +97,8 @@ pub struct Hook {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub timeout_ms: u64,
+    /// Present when `path` is a script the daemon must run through an interpreter.
+    pub interpreter: Option<Interpreter>,
 }
 
 /// A capability advertised by a plugin manifest.
@@ -90,7 +112,8 @@ pub struct Capability {
     pub input_schema: serde_json::Value,
 }
 
-/// Optional start/stop/status commands declared by a core definition.
+/// Optional start/stop/status commands declared by a service definition or an
+/// `.spk` manifest.
 ///
 /// `start` replaces `exec` as the supervised foreground process; `stop` runs
 /// before the normal polite stop sequence; `status` is a probe run by
@@ -113,9 +136,9 @@ pub struct Service {
     pub deps: Vec<String>,
     /// Only plugins declare capabilities; core services are lifecycle units.
     pub caps: Vec<Capability>,
-    /// Used by the supervisor when it spawns a core service.
+    /// Used by the supervisor when it spawns a service (core or plugin).
     pub exec: Option<Exec>,
-    /// Optional lifecycle commands; plugins never have these.
+    /// Optional lifecycle commands; core definitions and schema-2 plugins use them.
     pub lifecycle: Option<Lifecycle>,
     /// Boot-start flag (`[auto]` in `svc list`); not the crash-restart policy.
     pub enabled: bool,

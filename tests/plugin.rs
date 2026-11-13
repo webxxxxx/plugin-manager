@@ -283,6 +283,76 @@ fn package_config(key: &SigningKey, version: &str, config: &[u8]) -> Vec<u8> {
     tar
 }
 
+fn package_with_manifest(
+    key: &SigningKey,
+    manifest: &Value,
+    files: &[(&str, &[u8], u32)],
+) -> Vec<u8> {
+    let manifest = serde_json::to_vec(manifest).expect("manifest");
+    let signature =
+        json!({"alg":"ed25519","keyId":"test","sig":BASE64.encode(key.sign(&manifest).to_bytes())});
+    let signature = serde_json::to_vec(&signature).expect("signature");
+    let mut tar = Vec::new();
+    tar.extend_from_slice(&header("manifest.json", manifest.len(), 0o644));
+    tar.extend_from_slice(&manifest);
+    tar.extend(std::iter::repeat_n(0, padding(manifest.len())));
+    tar.extend_from_slice(&header("signature.json", signature.len(), 0o644));
+    tar.extend_from_slice(&signature);
+    tar.extend(std::iter::repeat_n(0, padding(signature.len())));
+    for (path, data, mode) in files {
+        tar.extend_from_slice(&header(path, data.len(), *mode));
+        tar.extend_from_slice(data);
+        tar.extend(std::iter::repeat_n(0, padding(data.len())));
+    }
+    tar.extend(std::iter::repeat_n(0, 1024));
+    tar
+}
+
+fn clock_script() -> (&'static str, Vec<u8>) {
+    if cfg!(windows) {
+        (
+            "payload/bin/clock.cmd",
+            b"@echo off\r\nif /I \"%~1\"==\"stop\" (\r\n  echo stopped>\"%SVCD_DATA_DIR%\\clock.stopped\"\r\n  exit /b 0\r\n)\r\nif /I \"%~1\"==\"status\" (\r\n  echo clock ok\r\n  exit /b 0\r\n)\r\n:loop\r\nping -n 2 127.0.0.1 >nul\r\ngoto loop\r\n"
+                .to_vec(),
+        )
+    } else {
+        (
+            "payload/bin/clock.sh",
+            b"#!/bin/sh\ncase \"$1\" in\n  stop)\n    echo stopped > \"$SVCD_DATA_DIR/clock.stopped\"\n    ;;\n  status)\n    echo clock ok\n    ;;\n  *)\n    while :; do sleep 1; done\n    ;;\nesac\n"
+                .to_vec(),
+        )
+    }
+}
+
+fn clock_manifest(exec: &str, data: &[u8]) -> Value {
+    let interpreter = if cfg!(windows) {
+        json!({"name": "cmd", "args": ["/C"]})
+    } else {
+        json!({"name": "sh"})
+    };
+    json!({
+        "schema": 2,
+        "name": "clock",
+        "version": "1.0.0",
+        "desc": "clock service",
+        "platform": target(),
+        "protocol": 1,
+        "exec": {"path": exec, "ready": "exec"},
+        "interpreter": interpreter,
+        "lifecycle": {
+            "start": {"path": exec, "args": ["start"]},
+            "stop": {"path": exec, "args": ["stop"]},
+            "status": {"path": exec, "args": ["status"]}
+        },
+        "files": [{
+            "path": exec,
+            "size": data.len(),
+            "sha256": hex_sha256(data),
+            "mode": 0o755
+        }]
+    })
+}
+
 fn header(path: &str, size: usize, mode: u32) -> [u8; 512] {
     let mut header = [0u8; 512];
     header[..path.len()].copy_from_slice(path.as_bytes());
@@ -1166,6 +1236,117 @@ fn a_failing_post_install_gets_no_hook_specific_rollback_from_keep_old() {
     );
     assert!(plugin.join("1.0.0").is_dir());
     assert!(plugin.join("1.1.0").is_dir());
+}
+
+#[test]
+fn installs_and_supervises_a_script_service_with_lifecycle() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[25u8; 32]);
+    sandbox.write_key(&key);
+    let (exec, data) = clock_script();
+    let manifest = clock_manifest(exec, &data);
+    let bytes = package_with_manifest(&key, &manifest, &[(exec, &data, 0o755)]);
+    let package = sandbox.write_package("clock-1.0.0.spk", &bytes);
+
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+
+    let installed = sandbox.run_plugin(&["install", package.to_str().expect("package")]);
+    assert_eq!(installed.status.code(), Some(0), "{}", stderr(&installed));
+
+    let started = sandbox.run_plugin(&["start", "clock"]);
+    assert_eq!(started.status.code(), Some(0), "{}", stderr(&started));
+
+    let status = sandbox.run_plugin(&["status", "--json", "clock"]);
+    assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
+    let value: Value = serde_json::from_slice(&status.stdout).expect("status json");
+    assert_eq!(value["summary"]["state"], "running", "{value}");
+    assert!(
+        value["details"]["probe"]
+            .as_str()
+            .unwrap_or("")
+            .contains("clock ok"),
+        "{value}"
+    );
+
+    let stopped = sandbox.run_plugin(&["stop", "clock"]);
+    assert_eq!(stopped.status.code(), Some(0), "{}", stderr(&stopped));
+    assert!(
+        sandbox.data.join("clock.stopped").is_file(),
+        "stop action did not run: {}",
+        sandbox.daemon_log()
+    );
+}
+
+#[test]
+fn install_rejects_a_missing_interpreter() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[26u8; 32]);
+    sandbox.write_key(&key);
+    let (exec, data) = clock_script();
+    let mut manifest = clock_manifest(exec, &data);
+    manifest["interpreter"] = json!({"name": "svcd-no-such-interpreter"});
+    let bytes = package_with_manifest(&key, &manifest, &[(exec, &data, 0o755)]);
+    let package = sandbox.write_package("clock-1.0.0.spk", &bytes);
+
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+
+    let installed = sandbox.run_plugin(&["install", package.to_str().expect("package")]);
+
+    assert_ne!(installed.status.code(), Some(0), "{}", stderr(&installed));
+    assert!(
+        stderr(&installed).contains("not found"),
+        "{}",
+        stderr(&installed)
+    );
+    assert!(!sandbox.data.join("plugins/clock/current").exists());
+}
+
+#[test]
+fn a_missing_interpreter_on_upgrade_leaves_the_old_version_running() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[27u8; 32]);
+    sandbox.write_key(&key);
+    let (exec, data) = clock_script();
+    let mut manifest = clock_manifest(exec, &data);
+    manifest["version"] = json!("1.0.0");
+    let first = sandbox.write_package(
+        "clock-1.0.0.spk",
+        &package_with_manifest(&key, &manifest, &[(exec, &data, 0o755)]),
+    );
+
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    assert_eq!(
+        sandbox
+            .run_plugin(&["install", first.to_str().expect("package")])
+            .status
+            .code(),
+        Some(0)
+    );
+    assert_eq!(
+        sandbox.run_plugin(&["start", "clock"]).status.code(),
+        Some(0)
+    );
+
+    let mut broken = clock_manifest(exec, &data);
+    broken["version"] = json!("1.1.0");
+    broken["interpreter"] = json!({"name": "svcd-no-such-interpreter"});
+    let second = sandbox.write_package(
+        "clock-1.1.0.spk",
+        &package_with_manifest(&key, &broken, &[(exec, &data, 0o755)]),
+    );
+
+    let failed = sandbox.run_plugin(&["install", second.to_str().expect("package")]);
+    assert_ne!(failed.status.code(), Some(0), "{}", stderr(&failed));
+    assert!(stderr(&failed).contains("not found"), "{}", stderr(&failed));
+
+    let status = sandbox.run_plugin(&["status", "--json", "clock"]);
+    assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
+    let value: Value = serde_json::from_slice(&status.stdout).expect("status json");
+    assert_eq!(value["summary"]["state"], "running", "{value}");
+    assert_eq!(value["summary"]["version"], "1.0.0", "{value}");
 }
 
 #[test]

@@ -10,10 +10,13 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::hook;
+use crate::interpreter;
 use crate::log;
 use crate::package::{self, Package};
 use crate::paths;
-use crate::registry::{Capability, Exec, Kind, Ready, Service, State, RESERVED_ID};
+use crate::registry::{
+    Capability, Exec, Hook, Interpreter, Kind, Lifecycle, Ready, Service, State, RESERVED_ID,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
@@ -69,10 +72,26 @@ pub fn ensure_hooks_allowed(package: &Package, opt_in_hooks: bool) -> Result<(),
     Ok(())
 }
 
+/// Validate everything that can fail before the plugin tree is touched and
+/// resolve the host interpreter. The daemon runs this before stopping a running
+/// version, so a bad package or missing interpreter cannot leave the old
+/// version stopped.
+pub fn prepare(package: &Package) -> Result<Option<Interpreter>, String> {
+    package::validate_manifest(&package.manifest)?;
+    let files: Vec<(&str, &[u8])> = package
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file.data.as_slice()))
+        .collect();
+    package::validate_script_payload(&package.manifest, &files)?;
+    resolve_interpreter(&package.manifest, interpreter::check)
+}
+
 pub fn install_package(
     package: &Package,
     strategy: Strategy,
     opt_in_hooks: bool,
+    host_interpreter: Option<Interpreter>,
 ) -> Result<Service, String> {
     let id = package.manifest.name.clone();
     if id == RESERVED_ID {
@@ -89,8 +108,20 @@ pub fn install_package(
         .map_err(|error| format!("create {}: {}", plugin_dir.display(), error))?;
 
     match strategy {
-        Strategy::KeepOld => install_keep_old(package, &id, &plugin_dir, was_installed),
-        Strategy::Replace => install_replace(package, &id, &plugin_dir, was_installed),
+        Strategy::KeepOld => install_keep_old(
+            package,
+            &id,
+            &plugin_dir,
+            was_installed,
+            host_interpreter.as_ref(),
+        ),
+        Strategy::Replace => install_replace(
+            package,
+            &id,
+            &plugin_dir,
+            was_installed,
+            host_interpreter.as_ref(),
+        ),
     }
 }
 
@@ -99,13 +130,14 @@ fn install_keep_old(
     id: &str,
     plugin_dir: &Path,
     was_installed: bool,
+    interpreter: Option<&Interpreter>,
 ) -> Result<Service, String> {
     // No hook-specific rollback here: keep-old keeps the previous version and
     // switches `current`, so a failing post-install just reports the error.
     // A replace install rolls back through its own strategy handling.
     let (version_dir, enabled) = write_version(package, plugin_dir, was_installed)?;
     copy_config(package, plugin_dir)?;
-    let service = service_from_manifest(id, &version_dir, &package.manifest, enabled)?;
+    let service = service_from_manifest(id, &version_dir, &package.manifest, enabled, interpreter)?;
     run_post_install(package, id, &version_dir)?;
     Ok(service)
 }
@@ -135,6 +167,7 @@ fn install_replace(
     id: &str,
     plugin_dir: &Path,
     was_installed: bool,
+    interpreter: Option<&Interpreter>,
 ) -> Result<Service, String> {
     let old_version = current_version(id).filter(|version| plugin_dir.join(version).is_dir());
     let old_dir = old_version.as_ref().map(|version| plugin_dir.join(version));
@@ -185,7 +218,8 @@ fn install_replace(
     let result =
         write_version(package, plugin_dir, was_installed).and_then(|(version_dir, enabled)| {
             copy_config(package, plugin_dir)?;
-            let service = service_from_manifest(id, &version_dir, &package.manifest, enabled)?;
+            let service =
+                service_from_manifest(id, &version_dir, &package.manifest, enabled, interpreter)?;
             run_post_install(package, id, &version_dir)?;
             Ok(service)
         });
@@ -449,7 +483,14 @@ pub fn scan() -> (Vec<Service>, Vec<String>) {
             }
         };
         let enabled = directory.join("enabled").exists();
-        match service_from_manifest(&id, &version_dir, &manifest, enabled) {
+        let interpreter = match resolve_interpreter(&manifest, interpreter::lookup) {
+            Ok(interpreter) => interpreter,
+            Err(error) => {
+                warnings.push(format!("{}: {}", id, error));
+                continue;
+            }
+        };
+        match service_from_manifest(&id, &version_dir, &manifest, enabled, interpreter.as_ref()) {
             Ok(service) => services.push(service),
             Err(error) => warnings.push(format!("{}: {}", id, error)),
         }
@@ -548,6 +589,7 @@ fn service_from_manifest(
     version_dir: &Path,
     manifest: &package::Manifest,
     enabled: bool,
+    interpreter: Option<&Interpreter>,
 ) -> Result<Service, String> {
     if manifest.platform != package::target() {
         return Err(format!(
@@ -581,6 +623,64 @@ fn service_from_manifest(
             input_schema: capability.input_schema.clone(),
         });
     }
+    if ready == Ready::Exec && !caps.is_empty() {
+        return Err("exec.ready=exec cannot declare capabilities: no protocol channel".into());
+    }
+
+    let schema_two = manifest.schema >= 2;
+    let exec_is_script = !is_native_file(&exec_path)?;
+    let mut any_script = exec_is_script;
+    if schema_two && exec_is_script && interpreter.is_none() {
+        return Err(format!(
+            "plugin {} runs a script but the manifest declares no interpreter",
+            id
+        ));
+    }
+
+    let lifecycle = match &manifest.lifecycle {
+        None => None,
+        Some(lifecycle) => {
+            let start = convert_lifecycle_hook(
+                "start",
+                version_dir,
+                lifecycle.start.as_ref(),
+                crate::registry::HOOK_START_TIMEOUT_MS,
+                crate::registry::HOOK_TIMEOUT_MAX_MS,
+                interpreter,
+                &mut any_script,
+            )?;
+            let stop = convert_lifecycle_hook(
+                "stop",
+                version_dir,
+                lifecycle.stop.as_ref(),
+                crate::registry::HOOK_STOP_TIMEOUT_MS,
+                crate::registry::HOOK_TIMEOUT_MAX_MS,
+                interpreter,
+                &mut any_script,
+            )?;
+            let status = convert_lifecycle_hook(
+                "status",
+                version_dir,
+                lifecycle.status.as_ref(),
+                crate::registry::HOOK_STATUS_TIMEOUT_MS,
+                crate::registry::HOOK_STATUS_TIMEOUT_MAX_MS,
+                interpreter,
+                &mut any_script,
+            )?;
+            Some(Lifecycle {
+                start,
+                stop,
+                status,
+            })
+        }
+    };
+    if schema_two && !any_script && interpreter.is_some() {
+        return Err(format!(
+            "plugin {} declares an interpreter but has no script payload",
+            id
+        ));
+    }
+
     let config = {
         let path = plugin_dir(id).join("config");
         path.is_file().then(|| path.to_string_lossy().to_string())
@@ -598,8 +698,13 @@ fn service_from_manifest(
             args: manifest.exec.args.clone(),
             env: manifest.exec.env.clone(),
             ready,
+            interpreter: if schema_two && exec_is_script {
+                interpreter.cloned()
+            } else {
+                None
+            },
         }),
-        lifecycle: None,
+        lifecycle,
         enabled,
         state: State::Stopped,
         pid: None,
@@ -610,6 +715,87 @@ fn service_from_manifest(
         last_exit: None,
         config,
     })
+}
+
+fn convert_lifecycle_hook(
+    name: &str,
+    version_dir: &Path,
+    hook: Option<&package::Hook>,
+    default_timeout_ms: u64,
+    max_timeout_ms: u64,
+    interpreter: Option<&Interpreter>,
+    any_script: &mut bool,
+) -> Result<Option<Hook>, String> {
+    let Some(hook) = hook else {
+        return Ok(None);
+    };
+    let path = version_dir.join(&hook.path);
+    if !path.is_file() {
+        return Err(format!("lifecycle.{} is missing: {}", name, path.display()));
+    }
+    let is_script = !is_native_file(&path)?;
+    if is_script {
+        *any_script = true;
+        if interpreter.is_none() {
+            return Err(format!(
+                "lifecycle.{} is a script but the manifest declares no interpreter",
+                name
+            ));
+        }
+    }
+    let timeout_ms = match hook.timeout {
+        Some(seconds) if seconds >= 1 && seconds <= max_timeout_ms / 1000 => seconds * 1000,
+        Some(seconds) => {
+            return Err(format!(
+                "lifecycle.{} timeout must be between 1 and {} seconds, got {}",
+                name,
+                max_timeout_ms / 1000,
+                seconds
+            ))
+        }
+        None => default_timeout_ms,
+    };
+    Ok(Some(Hook {
+        path: path.to_string_lossy().to_string(),
+        args: hook.args.clone(),
+        env: hook.env.clone(),
+        timeout_ms,
+        interpreter: if is_script {
+            interpreter.cloned()
+        } else {
+            None
+        },
+    }))
+}
+
+/// Read only the header: installed payloads can be large native binaries.
+fn is_native_file(path: &Path) -> Result<bool, String> {
+    use std::io::Read;
+    let mut file =
+        fs::File::open(path).map_err(|error| format!("read {}: {}", path.display(), error))?;
+    let mut head = [0u8; 8];
+    let read = file
+        .read(&mut head)
+        .map_err(|error| format!("read {}: {}", path.display(), error))?;
+    Ok(package::is_native_binary(&head[..read]))
+}
+
+fn resolve_interpreter(
+    manifest: &package::Manifest,
+    resolve: fn(&interpreter::Spec) -> Result<interpreter::Resolved, String>,
+) -> Result<Option<Interpreter>, String> {
+    let Some(spec) = manifest.interpreter.as_ref().map(|spec| interpreter::Spec {
+        name: spec.name.clone(),
+        args: spec.args.clone(),
+        version: spec.version.clone(),
+    }) else {
+        return Ok(None);
+    };
+    let resolved = resolve(&spec)?;
+    Ok(Some(Interpreter {
+        path: resolved.path.to_string_lossy().to_string(),
+        args: resolved.args,
+    }))
 }
 
 fn read_manifest(version_dir: &Path) -> Result<package::Manifest, String> {
@@ -1056,5 +1242,131 @@ mod tests {
             std::fs::read(active_config("checked").expect("active")).expect("read"),
             b"good config"
         );
+    }
+
+    fn script_manifest(
+        id: &str,
+        exec: &str,
+        data: &[u8],
+        interpreter: Option<serde_json::Value>,
+        lifecycle: Option<serde_json::Value>,
+    ) -> (std::path::PathBuf, package::Manifest) {
+        let version_dir = root().join("data/plugins").join(id).join("1.0.0");
+        let exec_path = version_dir.join(exec);
+        std::fs::create_dir_all(exec_path.parent().expect("parent")).expect("script dir");
+        std::fs::write(&exec_path, data).expect("script");
+        let mut value = serde_json::json!({
+            "schema": 2,
+            "name": id,
+            "version": "1.0.0",
+            "desc": "script test",
+            "platform": package::target(),
+            "protocol": 1,
+            "exec": {"path": exec, "ready": "exec"},
+            "files": []
+        });
+        if let Some(interpreter) = interpreter {
+            value["interpreter"] = interpreter;
+        }
+        if let Some(lifecycle) = lifecycle {
+            value["lifecycle"] = lifecycle;
+        }
+        let bytes = serde_json::to_vec(&value).expect("manifest");
+        let manifest = package::parse_manifest(&bytes).expect("parse");
+        (version_dir, manifest)
+    }
+
+    #[test]
+    fn maps_a_schema_two_script_lifecycle_and_interpreter() {
+        let host = Interpreter {
+            path: "/bin/sh".into(),
+            args: Vec::new(),
+        };
+        let (version_dir, manifest) = script_manifest(
+            "scripted",
+            "payload/actions.sh",
+            b"#!/bin/sh\n",
+            Some(serde_json::json!({"name": "sh"})),
+            Some(serde_json::json!({
+                "start": {"path": "payload/actions.sh", "args": ["start"]},
+                "stop": {"path": "payload/actions.sh", "args": ["stop"]},
+                "status": {"path": "payload/actions.sh", "args": ["status"]}
+            })),
+        );
+
+        let service = service_from_manifest("scripted", &version_dir, &manifest, true, Some(&host))
+            .expect("service");
+
+        let exec = service.exec.as_ref().expect("exec");
+        assert_eq!(exec.ready, Ready::Exec);
+        assert_eq!(
+            exec.interpreter.as_ref().map(|i| i.path.as_str()),
+            Some("/bin/sh")
+        );
+        let lifecycle = service.lifecycle.as_ref().expect("lifecycle");
+        let start = lifecycle.start.as_ref().expect("start");
+        assert_eq!(start.args, ["start".to_string()]);
+        assert_eq!(start.timeout_ms, 30_000);
+        assert_eq!(
+            start.interpreter.as_ref().map(|i| i.path.as_str()),
+            Some("/bin/sh")
+        );
+        assert!(std::path::Path::new(&start.path).is_absolute());
+        assert_eq!(
+            std::path::Path::new(&start.path)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("actions.sh")
+        );
+        assert_eq!(lifecycle.stop.as_ref().expect("stop").timeout_ms, 10_000);
+        assert_eq!(lifecycle.status.as_ref().expect("status").timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn a_schema_two_script_requires_an_interpreter() {
+        let (version_dir, manifest) = script_manifest(
+            "no-interpreter",
+            "payload/actions.sh",
+            b"#!/bin/sh\n",
+            None,
+            None,
+        );
+
+        let error = service_from_manifest("no-interpreter", &version_dir, &manifest, true, None)
+            .expect_err("missing interpreter");
+
+        assert!(error.contains("declares no interpreter"), "{error}");
+    }
+
+    #[test]
+    fn a_native_schema_two_payload_runs_directly() {
+        let (version_dir, manifest) =
+            script_manifest("native", "payload/bin/tool", b"\x7fELFdemo", None, None);
+
+        let service =
+            service_from_manifest("native", &version_dir, &manifest, true, None).expect("service");
+
+        assert!(service.exec.as_ref().expect("exec").interpreter.is_none());
+        assert!(service.lifecycle.is_none());
+    }
+
+    #[test]
+    fn a_dangling_interpreter_on_a_native_payload_is_rejected() {
+        let host = Interpreter {
+            path: "/bin/sh".into(),
+            args: Vec::new(),
+        };
+        let (version_dir, manifest) = script_manifest(
+            "dangling",
+            "payload/bin/tool",
+            b"\x7fELFdemo",
+            Some(serde_json::json!({"name": "sh"})),
+            None,
+        );
+
+        let error = service_from_manifest("dangling", &version_dir, &manifest, true, Some(&host))
+            .expect_err("no script payload");
+
+        assert!(error.contains("no script payload"), "{error}");
     }
 }

@@ -254,6 +254,7 @@ mod tests {
                 args: Vec::new(),
                 env: Default::default(),
                 ready: Ready::Exec,
+                interpreter: None,
             }),
             lifecycle: None,
             enabled: true,
