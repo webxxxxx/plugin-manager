@@ -23,7 +23,7 @@ const LAUNCHD_PLIST: &str = "/Library/LaunchDaemons/com.webxxxxx.svcd.plist";
 const INITTAB: &str = "/etc/inittab";
 const PROCD_SCRIPT: &str = "/etc/init.d/svcd";
 pub(crate) const SCM_NAME: &str = "svcd";
-const SCM_DISPLAY_NAME: &str = "svcd core supervisor";
+const SCM_DISPLAY_NAME: &str = "svcd";
 
 /// A host init system that can own `svcd`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
