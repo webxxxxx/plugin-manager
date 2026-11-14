@@ -72,6 +72,8 @@ temp_cleanup_interval_secs = 300
 
 `SVCD_TEMP_DIR` 环境变量优先于 `svcd.conf` 的 `temp_dir`，主要用于测试和隔离运行。
 
+> 升级提示：旧版本默认目录是 `<data>/blobs`，改名为 `<data>/temp` 后旧文件不会自动迁移。需要保留旧 blob 时，可以手工把目录改名为 `temp`，或在 `svcd.conf` 里把 `temp_dir` 指回旧目录（插件环境变量仍会变成 `SVCD_TEMP_DIR`）。
+
 ## 4. 参数：`$blob`
 
 工具调用参数里可以放：
