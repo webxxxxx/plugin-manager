@@ -10,10 +10,9 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -22,7 +21,6 @@ use serde_json::{json, Value};
 
 use crate::channel;
 use crate::rpc;
-use crate::threads;
 use crate::webui;
 
 const MAX_SUBSCRIBERS: usize = 64;
@@ -354,116 +352,47 @@ pub fn serve_ws(
     receiver: Receiver<Event>,
     subscription: Subscription,
 ) -> io::Result<()> {
-    stream.set_read_timeout(None)?;
-    let mut writer = stream.try_clone()?;
-    let (out_tx, out_rx) = mpsc::sync_channel::<Outbound>(QUEUE);
-    let stopped = Arc::new(AtomicBool::new(false));
-    let writer_stopped = Arc::clone(&stopped);
-    let writer = thread::Builder::new()
-        .name("svcd-ws-writer".into())
-        .stack_size(threads::IO_STACK)
-        .spawn(move || write_loop(&mut writer, out_rx, &writer_stopped))?;
-
-    let forward_stopped = Arc::clone(&stopped);
-    let forward_tx = out_tx.clone();
-    let forwarder = thread::Builder::new()
-        .name("svcd-ws-events".into())
-        .stack_size(threads::IO_STACK)
-        .spawn(move || {
-            for event in receiver {
-                if forward_stopped.load(Ordering::SeqCst) {
-                    break;
-                }
-                if forward_tx.send(Outbound::Text(event.json)).is_err() {
-                    break;
-                }
-            }
-        })?;
-
-    let result = read_loop(stream, config, plugin, &out_tx);
-    stopped.store(true, Ordering::SeqCst);
-    drop(out_tx);
-    drop(subscription);
-    let _ = forwarder.join();
-    let _ = writer.join();
-    let _ = stream.shutdown(Shutdown::Both);
-    result
-}
-
-#[derive(Debug)]
-enum Outbound {
-    Text(String),
-    Pong(Vec<u8>),
-    Close(u16, String),
-}
-
-fn write_loop(
-    stream: &mut TcpStream,
-    receiver: Receiver<Outbound>,
-    stopped: &AtomicBool,
-) -> io::Result<()> {
-    let mut last_ping = Instant::now();
-    loop {
-        match receiver.recv_timeout(Duration::from_secs(1)) {
-            Ok(Outbound::Text(text)) => {
-                if write_frame(stream, 0x1, text.as_bytes()).is_err() {
-                    break;
-                }
-            }
-            Ok(Outbound::Pong(payload)) => {
-                if write_frame(stream, 0xA, &payload).is_err() {
-                    break;
-                }
-            }
-            Ok(Outbound::Close(code, reason)) => {
-                let mut payload = code.to_be_bytes().to_vec();
-                payload.extend_from_slice(reason.as_bytes());
-                let _ = write_frame(stream, 0x8, &payload);
-                break;
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                if stopped.load(Ordering::SeqCst) {
-                    break;
-                }
-                if last_ping.elapsed() >= WS_PING {
-                    if write_frame(stream, 0x9, b"").is_err() {
-                        break;
-                    }
-                    last_ping = Instant::now();
-                }
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    let _ = stream.shutdown(Shutdown::Both);
-    Ok(())
-}
-
-fn read_loop(
-    stream: &mut TcpStream,
-    config: &Path,
-    plugin: &str,
-    out: &SyncSender<Outbound>,
-) -> io::Result<()> {
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
     let mut fragment = Vec::new();
     let mut fragment_opcode: Option<u8> = None;
+    let mut last_ping = Instant::now();
     loop {
+        while let Ok(event) = receiver.try_recv() {
+            if write_frame(stream, 0x1, event.json.as_bytes()).is_err() {
+                drop(subscription);
+                let _ = stream.shutdown(Shutdown::Both);
+                return Ok(());
+            }
+        }
+        if last_ping.elapsed() >= WS_PING {
+            if write_frame(stream, 0x9, b"").is_err() {
+                break;
+            }
+            last_ping = Instant::now();
+        }
         let frame = match read_frame(stream) {
             Ok(frame) => frame,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
             Err(error) => {
                 let (code, reason) = if error.to_string().contains("1 MiB") {
                     (1009, "message too large")
                 } else {
                     (1002, "protocol error")
                 };
-                let _ = out.send(Outbound::Close(code, reason.into()));
-                return Ok(());
+                let _ = close_frame(stream, code, reason);
+                break;
             }
         };
         if frame.opcode >= 0x8 {
             if !frame.fin || frame.payload.len() > 125 {
-                let _ = out.send(Outbound::Close(1002, "invalid control frame".into()));
-                return Ok(());
+                let _ = close_frame(stream, 1002, "invalid control frame");
+                break;
             }
             match frame.opcode {
                 0x8 => {
@@ -472,18 +401,18 @@ fn read_loop(
                     } else {
                         1000
                     };
-                    let _ = out.send(Outbound::Close(code, String::new()));
-                    return Ok(());
+                    let _ = close_frame(stream, code, "");
+                    break;
                 }
                 0x9 => {
-                    if out.send(Outbound::Pong(frame.payload)).is_err() {
-                        return Ok(());
+                    if write_frame(stream, 0xA, &frame.payload).is_err() {
+                        break;
                     }
                 }
                 0xA => {}
                 _ => {
-                    let _ = out.send(Outbound::Close(1002, "unknown control frame".into()));
-                    return Ok(());
+                    let _ = close_frame(stream, 1002, "unknown control frame");
+                    break;
                 }
             }
             continue;
@@ -492,47 +421,57 @@ fn read_loop(
         match frame.opcode {
             0x1 | 0x2 => {
                 if frame.opcode == 0x2 {
-                    let _ = out.send(Outbound::Close(1003, "text frames only".into()));
-                    return Ok(());
+                    let _ = close_frame(stream, 1003, "text frames only");
+                    break;
                 }
                 if fragment_opcode.is_some() {
-                    let _ = out.send(Outbound::Close(1002, "interleaved data frame".into()));
-                    return Ok(());
+                    let _ = close_frame(stream, 1002, "interleaved data frame");
+                    break;
                 }
                 if !frame.fin {
                     fragment = frame.payload;
                     fragment_opcode = Some(0x1);
-                } else if !handle_text(config, plugin, &frame.payload, out) {
-                    return Ok(());
+                } else if !handle_text(stream, config, plugin, &frame.payload) {
+                    break;
                 }
             }
             0x0 => {
                 if fragment_opcode.is_none() {
-                    let _ = out.send(Outbound::Close(1002, "unexpected continuation".into()));
-                    return Ok(());
+                    let _ = close_frame(stream, 1002, "unexpected continuation");
+                    break;
                 }
                 fragment.extend_from_slice(&frame.payload);
                 if fragment.len() > MAX_MESSAGE {
-                    let _ = out.send(Outbound::Close(1009, "message too large".into()));
-                    return Ok(());
+                    let _ = close_frame(stream, 1009, "message too large");
+                    break;
                 }
                 if frame.fin {
                     let payload = std::mem::take(&mut fragment);
                     fragment_opcode = None;
-                    if !handle_text(config, plugin, &payload, out) {
-                        return Ok(());
+                    if !handle_text(stream, config, plugin, &payload) {
+                        break;
                     }
                 }
             }
             _ => {
-                let _ = out.send(Outbound::Close(1002, "unknown data frame".into()));
-                return Ok(());
+                let _ = close_frame(stream, 1002, "unknown data frame");
+                break;
             }
         }
     }
+    drop(subscription);
+    let _ = stream.shutdown(Shutdown::Both);
+    Ok(())
 }
 
-fn handle_text(config: &Path, plugin: &str, payload: &[u8], out: &SyncSender<Outbound>) -> bool {
+fn close_frame(stream: &mut TcpStream, code: u16, reason: &str) -> io::Result<()> {
+    let mut payload = code.to_be_bytes().to_vec();
+    payload.extend_from_slice(reason.as_bytes());
+    let _ = write_frame(stream, 0x8, &payload);
+    Ok(())
+}
+
+fn handle_text(stream: &mut TcpStream, config: &Path, plugin: &str, payload: &[u8]) -> bool {
     let response = match webui::bridge_request(plugin, payload) {
         webui::Bridge::Reject(response) => response,
         webui::Bridge::Forward {
@@ -551,7 +490,7 @@ fn handle_text(config: &Path, plugin: &str, payload: &[u8], out: &SyncSender<Out
             Err(cause) => rpc::err(id, -32603, &format!("svcd unreachable: {}", cause)),
         },
     };
-    out.send(Outbound::Text(rpc::to_line(&response))).is_ok()
+    write_frame(stream, 0x1, rpc::to_line(&response).as_bytes()).is_ok()
 }
 
 #[derive(Debug)]
@@ -720,6 +659,7 @@ fn sha1(data: &[u8]) -> [u8; 20] {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::thread;
 
     fn hex(bytes: &[u8]) -> String {
         let mut out = String::new();
