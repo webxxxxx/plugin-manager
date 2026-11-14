@@ -69,6 +69,8 @@ svcd stop
 
 `--uninstall` 会先停止用户 daemon，再删除二进制，并同步从 Windows 用户 PATH / Linux shell 配置中移除安装目录；如果 `svc`/`plugin`/`mcp` 进程仍占用文件，会给出 warning 并继续，关闭对应进程后再次执行即可。
 
+在 Windows 上从已安装的 `svcd.exe` 执行卸载时，会启动一个临时 helper 进程：当前进程退出后，helper 再删除被占用的 `svcd.exe`。因此命令会先返回，稍等片刻再看安装目录是否清空。
+
 Windows 安装会把 `<data>\\bin` 追加到当前用户的 `HKCU\\Environment\\Path`，并广播环境变更；**新开一个终端**即可直接使用 `svcd` / `svc` / `plugin` / `mcp`。已有终端仍使用旧 PATH，需要重新打开或执行：
 
 ```powershell

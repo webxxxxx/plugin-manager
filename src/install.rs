@@ -1936,6 +1936,75 @@ fn remove_file_retry(path: &Path) -> std::io::Result<()> {
         .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "cannot remove file")))
 }
 
+#[cfg(windows)]
+pub(crate) fn wait_for_process(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const INFINITE: u32 = 0xFFFF_FFFF;
+    let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+    if !handle.is_null() {
+        unsafe {
+            WaitForSingleObject(handle, INFINITE);
+            CloseHandle(handle);
+        }
+    } else {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+#[cfg(windows)]
+fn self_uninstall_current(request: &SelfRequest) -> bool {
+    if std::env::var_os("SVCD_UNINSTALL_HELPER").is_some() {
+        return false;
+    }
+    let Some(current) = std::env::current_exe().ok() else {
+        return false;
+    };
+    let data = std::env::var_os("SVCD_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(paths::data_dir);
+    let root = request.prefix.clone().unwrap_or_else(|| data.join("bin"));
+    let current = current.to_string_lossy().to_ascii_lowercase();
+    let root = root.to_string_lossy().to_ascii_lowercase();
+    current.starts_with(&root)
+}
+
+#[cfg(windows)]
+fn spawn_uninstall_helper(args: &[String]) -> i32 {
+    let current = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("svcd: current executable: {}", error);
+            return EXIT_ERROR;
+        }
+    };
+    let helper = std::env::temp_dir().join(format!("svcd-uninstall-{}.exe", std::process::id()));
+    if let Err(error) = fs::copy(&current, &helper) {
+        eprintln!("svcd: cannot create uninstall helper: {}", error);
+        return EXIT_ERROR;
+    }
+    let mut command = std::process::Command::new(&helper);
+    command
+        .arg("--uninstall")
+        .args(args)
+        .env("SVCD_UNINSTALL_HELPER", "1")
+        .env("SVCD_UNINSTALL_PARENT", std::process::id().to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    match command.spawn() {
+        Ok(_) => {
+            println!("uninstall continues in the background; the install directory will be removed after this process exits");
+            EXIT_OK
+        }
+        Err(error) => {
+            eprintln!("svcd: cannot start uninstall helper: {}", error);
+            EXIT_ERROR
+        }
+    }
+}
+
 fn self_uninstall_user(request: SelfRequest) -> i32 {
     let data = std::env::var_os("SVCD_DATA_DIR")
         .map(PathBuf::from)
@@ -2021,6 +2090,10 @@ pub fn self_uninstall(args: &[String]) -> i32 {
             return EXIT_USAGE;
         }
     };
+    #[cfg(windows)]
+    if crate::paths::user_mode() && !request.dry_run && self_uninstall_current(&request) {
+        return spawn_uninstall_helper(args);
+    }
     if crate::paths::user_mode() {
         return self_uninstall_user(request);
     }

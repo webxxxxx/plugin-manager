@@ -49,6 +49,13 @@ mod wake;
 mod webui;
 
 fn main() {
+    #[cfg(windows)]
+    if let Some(pid) = std::env::var("SVCD_UNINSTALL_PARENT")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+    {
+        install::wait_for_process(pid);
+    }
     let arg0 = std::env::args().next().unwrap_or_default();
     // Installed entries are hardlinks/symlinks named `svc`, `plugin`, `mcp`
     // (and `.exe` variants on Windows); dispatch on the stem, not the suffix.
