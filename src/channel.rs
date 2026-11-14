@@ -209,11 +209,20 @@ fn serve(stream: Stream, tx: Sender<PendingCall>, wake: std::sync::Arc<crate::wa
             return;
         }
         wake.notify();
-        let Ok(response) = reply_rx.recv() else {
-            return;
-        };
-        if ipc::write_frame_limit(reader.get_mut(), &response, ipc::LOCAL_FRAME_MAX).is_err() {
-            return;
+        loop {
+            let Ok(response) = reply_rx.recv() else {
+                return;
+            };
+            let final_frame = serde_json::from_str::<serde_json::Value>(&response)
+                .ok()
+                .and_then(|value| value.get("id").cloned())
+                .is_some();
+            if ipc::write_frame_limit(reader.get_mut(), &response, ipc::LOCAL_FRAME_MAX).is_err() {
+                return;
+            }
+            if final_frame {
+                break;
+            }
         }
     }
 }
@@ -253,6 +262,21 @@ pub fn request(
     method: &str,
     params: serde_json::Value,
 ) -> io::Result<crate::rpc::Response> {
+    request_stream(config, method, params, |_| {})
+}
+
+/// A request whose handler may emit JSON-RPC notifications before the final
+/// response. Notifications are delivered to `on_notification`; reading stops at
+/// the response with an `id`.
+pub fn request_stream<F>(
+    config: &Path,
+    method: &str,
+    params: serde_json::Value,
+    mut on_notification: F,
+) -> io::Result<crate::rpc::Response>
+where
+    F: FnMut(&str),
+{
     let token = read_token(config)?;
     let mut stream = acquire(config)?;
     let line = serde_json::json!({
@@ -266,12 +290,20 @@ pub fn request(
     ipc::write_frame_limit(&mut stream, &line, ipc::LOCAL_FRAME_MAX)?;
 
     let mut reader = BufReader::new(stream);
-    let response = ipc::read_frame_limit(&mut reader, ipc::LOCAL_FRAME_MAX)?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "empty response frame"))?;
-    let response = serde_json::from_str(&response)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    release(config, reader.into_inner());
-    Ok(response)
+    loop {
+        let line = ipc::read_frame_limit(&mut reader, ipc::LOCAL_FRAME_MAX)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "empty response frame"))?;
+        let value: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if value.get("method").is_some() && value.get("id").is_none() {
+            on_notification(&line);
+            continue;
+        }
+        let response = serde_json::from_value(value)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        release(config, reader.into_inner());
+        return Ok(response);
+    }
 }
 
 pub fn remove_socket(config: &Path) {

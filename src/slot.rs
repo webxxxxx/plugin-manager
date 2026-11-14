@@ -71,6 +71,7 @@ struct PendingCall {
     external_id: Option<Value>,
     capability: String,
     deadline: u64,
+    progress_token: Option<Value>,
     reply: crate::channel::Reply,
 }
 
@@ -165,6 +166,7 @@ impl Slot {
         arguments: Value,
         external_id: Option<Value>,
         now: u64,
+        progress_token: Option<Value>,
         reply: crate::channel::Reply,
     ) -> Result<(), CallError> {
         if self.machine.state != State::Running {
@@ -175,11 +177,15 @@ impl Slot {
         }
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
+        let mut params = json!({ "name": capability, "arguments": arguments });
+        if let Some(token) = &progress_token {
+            params["_meta"] = json!({ "progressToken": token });
+        }
         let frame = json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "tools/call",
-            "params": { "name": capability, "arguments": arguments },
+            "params": params,
         })
         .to_string();
         if frame.len() > ipc::CALL_FRAME_MAX {
@@ -194,6 +200,7 @@ impl Slot {
                 external_id,
                 capability: capability.to_string(),
                 deadline: now.saturating_add(CALL_TIMEOUT_MS),
+                progress_token,
                 reply,
             },
         );
@@ -558,6 +565,23 @@ impl Slot {
     }
 
     fn handle_notification(&mut self, method: &str, params: Option<&Value>) {
+        if method == "notifications/progress" {
+            if let Some(token) = params.and_then(|params| params.get("progressToken")) {
+                let line = json!({
+                    "jsonrpc": "2.0",
+                    "method": method,
+                    "params": params.cloned().unwrap_or(Value::Null),
+                })
+                .to_string();
+                for pending in self
+                    .pending
+                    .values()
+                    .filter(|pending| pending.progress_token.as_ref() == Some(token))
+                {
+                    pending.reply.send(line.clone());
+                }
+            }
+        }
         let text = match method {
             "notifications/message" => params
                 .and_then(|params| params.get("data"))
@@ -1124,6 +1148,7 @@ mod tests {
                 external_id: Some(json!(100 + id)),
                 capability: "echo".into(),
                 deadline,
+                progress_token: None,
                 reply: crate::channel::Reply::plain(tx),
             },
         );
@@ -1218,6 +1243,7 @@ mod tests {
             json!({}),
             Some(json!(500)),
             0,
+            None,
             crate::channel::Reply::plain(tx),
         );
 
@@ -1349,8 +1375,15 @@ done
         }
 
         let (tx, rx) = mpsc::channel();
-        slot.request_capability("echo", json!({}), Some(json!(100)), elapsed(&started), tx)
-            .expect("echo call");
+        slot.request_capability(
+            "echo",
+            json!({}),
+            Some(json!(100)),
+            elapsed(&started),
+            None,
+            crate::channel::Reply::plain(tx),
+        )
+        .expect("echo call");
         let response = wait_response(&mut slot, &rx, &started);
         assert_eq!(
             response.result.expect("echo result")["content"][0]["text"],
@@ -1358,8 +1391,15 @@ done
         );
 
         let (tx, rx) = mpsc::channel();
-        slot.request_capability("fail", json!({}), Some(json!(101)), elapsed(&started), tx)
-            .expect("fail call");
+        slot.request_capability(
+            "fail",
+            json!({}),
+            Some(json!(101)),
+            elapsed(&started),
+            None,
+            crate::channel::Reply::plain(tx),
+        )
+        .expect("fail call");
         let result = wait_response(&mut slot, &rx, &started)
             .result
             .expect("failure result");
@@ -1367,15 +1407,23 @@ done
         assert_eq!(result["content"][0]["text"], "boom");
 
         let (tx, rx) = mpsc::channel();
-        slot.request_capability("hang", json!({}), Some(json!(102)), elapsed(&started), tx)
-            .expect("hang call");
+        slot.request_capability(
+            "hang",
+            json!({}),
+            Some(json!(102)),
+            elapsed(&started),
+            None,
+            crate::channel::Reply::plain(tx),
+        )
+        .expect("hang call");
         let (crash_tx, _crash_rx) = mpsc::channel();
         let _ = slot.request_capability(
             "crash",
             json!({}),
             Some(json!(103)),
             elapsed(&started),
-            crash_tx,
+            None,
+            crate::channel::Reply::plain(crash_tx),
         );
 
         let result = wait_response(&mut slot, &rx, &started)

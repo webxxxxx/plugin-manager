@@ -177,10 +177,20 @@ impl Served {
     }
 }
 
-/// Serve one modern request. The stdio bridge and the HTTP transport both call
-/// this, so tool visibility, `_meta` validation and error mapping cannot drift
-/// between the two surfaces.
+/// Serve one modern request without a progress sink (HTTP).
 pub fn serve_modern(config: &Path, request: &rpc::Request) -> Served {
+    serve_modern_with(config, request, None)
+}
+
+/// Serve one modern request. The stdio bridge passes its stdout as a progress
+/// sink so plugin `notifications/progress` frames reach the MCP client while
+/// the request is still in flight. HTTP has no streaming response and passes
+/// `None`, but still drains the notifications.
+pub fn serve_modern_with(
+    config: &Path,
+    request: &rpc::Request,
+    progress: Option<&mut dyn Write>,
+) -> Served {
     let id = request.id.clone();
     if let Err(response) = validate_meta(id.clone(), &request.params) {
         return Served::Respond(response);
@@ -192,7 +202,7 @@ pub fn serve_modern(config: &Path, request: &rpc::Request) -> Served {
             Served::new(response, fatal)
         }
         "tools/call" => {
-            let (response, fatal) = tools_call(config, id, Era::Modern, &request.params);
+            let (response, fatal) = tools_call(config, id, Era::Modern, &request.params, progress);
             Served::new(response, fatal)
         }
         _ => Served::Respond(rpc::err(id, -32601, "method not found")),
@@ -237,11 +247,11 @@ impl Bridge {
             });
         }
         let (response, exit) = match self.era.expect("era was just selected") {
-            Era::Modern => match serve_modern(&self.config, &request) {
+            Era::Modern => match serve_modern_with(&self.config, &request, Some(stdout)) {
                 Served::Respond(response) => (response, false),
                 Served::Unreachable(response) => (response, true),
             },
-            Era::Legacy => self.handle_legacy(&request),
+            Era::Legacy => self.handle_legacy(&request, stdout),
         };
         if let Err(error) = write_response(stdout, &response) {
             eprintln!("mcp: stdout: {}", error);
@@ -254,13 +264,19 @@ impl Bridge {
         }
     }
 
-    fn handle_legacy(&mut self, request: &rpc::Request) -> (rpc::Response, bool) {
+    fn handle_legacy(
+        &mut self,
+        request: &rpc::Request,
+        stdout: &mut impl Write,
+    ) -> (rpc::Response, bool) {
         let id = request.id.clone();
         match request.method.as_str() {
             "initialize" => (self.initialize(id, &request.params), false),
             "ping" => (rpc::ok(id, json!({})), false),
             "tools/list" => tools_list(&self.config, id, Era::Legacy, &request.params),
-            "tools/call" => tools_call(&self.config, id, Era::Legacy, &request.params),
+            "tools/call" => {
+                tools_call(&self.config, id, Era::Legacy, &request.params, Some(stdout))
+            }
             _ => (rpc::err(id, -32601, "method not found"), false),
         }
     }
@@ -307,7 +323,13 @@ fn tools_list(config: &Path, id: Option<Value>, era: Era, params: &Value) -> (rp
     }
 }
 
-fn tools_call(config: &Path, id: Option<Value>, era: Era, params: &Value) -> (rpc::Response, bool) {
+fn tools_call(
+    config: &Path,
+    id: Option<Value>,
+    era: Era,
+    params: &Value,
+    progress: Option<&mut dyn Write>,
+) -> (rpc::Response, bool) {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return (
             rpc::err(id, -32602, "tools/call requires params.name"),
@@ -318,8 +340,23 @@ fn tools_call(config: &Path, id: Option<Value>, era: Era, params: &Value) -> (rp
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let request = json!({ "name": name, "arguments": arguments });
-    match channel::request(config, "registry.call", request) {
+    let progress_token = params
+        .get("_meta")
+        .and_then(|meta| meta.get("progressToken"))
+        .cloned();
+    let mut request = json!({ "name": name, "arguments": arguments });
+    if let Some(token) = progress_token {
+        request["progressToken"] = token;
+    }
+    let mut progress = progress;
+    let response = channel::request_stream(config, "registry.call", request, |line| {
+        if let Some(out) = progress.as_deref_mut() {
+            let _ = out.write_all(line.as_bytes());
+            let _ = out.write_all(b"\n");
+            let _ = out.flush();
+        }
+    });
+    match response {
         Ok(response) => {
             if let Some(error) = response.error {
                 return (error_response(id, error), false);

@@ -116,6 +116,13 @@ while ($null -ne ($line = $reader.ReadLine())) {
       $out = '{"jsonrpc":"2.0","id":' + $msg.id + ',"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}'
     } elseif ($name -eq 'fail') {
       $out = '{"jsonrpc":"2.0","id":' + $msg.id + ',"error":{"code":-32000,"message":"boom"}}'
+    } elseif ($name -eq 'progress') {
+      $token = $msg.params._meta.progressToken
+      if ($null -ne $token) {
+        [Console]::Out.WriteLine('{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1,"progressToken":"' + $token + '"}}')
+        [Console]::Out.Flush()
+      }
+      $out = '{"jsonrpc":"2.0","id":' + $msg.id + ',"result":{"content":[{"type":"text","text":"done"}],"isError":false}}'
     } else {
       continue
     }
@@ -140,6 +147,13 @@ while IFS= read -r line; do
     *svcd.ping*) printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id" ;;
     *'"name":"echo"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}\n' "$id" ;;
     *'"name":"fail"'*) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"boom"}}\n' "$id" ;;
+    *'"name":"progress"'*)
+      token=$(printf '%s' "$line" | grep -o '"progressToken":"[^"]*"' | head -n1 | cut -d'"' -f4)
+      if [ -n "$token" ]; then
+        printf '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1,"progressToken":"%s"}}\n' "$token"
+      fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"done"}],"isError":false}}\n' "$id"
+      ;;
   esac
 done
 "#,
@@ -162,7 +176,8 @@ done
             "exec": {"path": exec, "args": [], "ready": "notify"},
             "capabilities": [
                 {"name": "echo", "desc": "Echo", "inputSchema": {"type": "object"}},
-                {"name": "fail", "desc": "Fail", "inputSchema": {"type": "object"}}
+                {"name": "fail", "desc": "Fail", "inputSchema": {"type": "object"}},
+                {"name": "progress", "desc": "Progress", "inputSchema": {"type": "object"}}
             ],
             "files": []
         });
@@ -725,6 +740,51 @@ fn modern_bridge_discovers_lists_and_calls_tools() {
         bad_version["error"]["data"]["supported"],
         json!(["2026-07-28"])
     );
+}
+
+#[test]
+fn tools_call_forwards_plugin_progress() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    sandbox.start_plugin();
+    let mut mcp = sandbox.spawn_mcp("progress");
+
+    mcp.request(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1"}
+        }),
+    );
+    mcp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "demo.progress",
+            "arguments": {},
+            "_meta": {"progressToken": "t1"}
+        }
+    }));
+
+    let mut saw_progress = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let value = mcp.recv(deadline.saturating_duration_since(Instant::now()));
+        if value.get("method") == Some(&json!("notifications/progress")) {
+            assert_eq!(value["params"]["progressToken"], "t1");
+            assert_eq!(value["params"]["progress"], 1);
+            saw_progress = true;
+            continue;
+        }
+        assert_eq!(value.get("id"), Some(&json!(2)), "{value}");
+        assert_eq!(value["result"]["content"][0]["text"], "done");
+        break;
+    }
+    assert!(saw_progress, "plugin progress was not forwarded");
 }
 
 #[test]

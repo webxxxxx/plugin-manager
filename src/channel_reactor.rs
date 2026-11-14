@@ -264,11 +264,22 @@ fn drain_notifications(
         return false;
     }
     for connection in connections.values_mut() {
-        if let Some(receiver) = &connection.pending {
-            if let Ok(response) = receiver.try_recv() {
+        let Some(receiver) = &connection.pending else {
+            continue;
+        };
+        let mut frames = Vec::new();
+        while let Ok(frame) = receiver.try_recv() {
+            frames.push(frame);
+        }
+        for frame in frames {
+            let final_frame = serde_json::from_str::<serde_json::Value>(&frame)
+                .ok()
+                .and_then(|value| value.get("id").cloned())
+                .is_some();
+            connection.out.extend_from_slice(frame.as_bytes());
+            connection.out.push(b'\n');
+            if final_frame {
                 connection.pending = None;
-                connection.out = response.into_bytes();
-                connection.out.push(b'\n');
             }
         }
     }

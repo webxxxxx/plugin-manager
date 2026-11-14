@@ -590,7 +590,8 @@ daemon threads=163
 - **已实现（Unix）**：SSE 进入 reactor 状态机（订阅、replay、heartbeat、chunked 写出都不再占连接线程）；WebSocket 也进入 reactor 状态机（握手、帧解析、事件转发、分片重组、`tools/call` 交给 worker）。Unix 上普通 HTTP / SSE / WS 都不再占每连接线程。
 - **已实现（Unix）**：本地管理 UDS 进入独立 poll reactor；每个连接只是 fd/状态，不再每连接一线程。80 插件、全 reactor 下 daemon 为 **8 线程**（daemon + 插件 reactor + 管理 reactor + HTTP reactor + 4 worker）。
 - **已实现**：插件把大结果写入 `SVCD_BLOB_DIR/incoming/`，返回 `$blobPath`；宿主校验路径、流式哈希并落成内容寻址 blob，MCP 结果替换为 `resource_link` + `structuredContent.$blob`。
-- **尚未实现**：MCP progress/job、逐 token 流式结果、以及大结果在 MCP stdio 上的端到端流式传输。
+- **已实现**：MCP `tools/call` 的 progress 透传。客户端在 `_meta.progressToken` 给出 token，宿主把它带给插件；插件发 `notifications/progress` 时，管理通道可以多帧返回，stdio 桥在等待最终响应期间把进度写给客户端。Windows 的线程通道同样支持多帧。
+- **尚未实现**：job 化长任务、逐 token 结果流（当前 progress 是通知，不是结果分块）。
 
 ## 附录 B：相关代码位置
 

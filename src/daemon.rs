@@ -682,6 +682,7 @@ impl Daemon {
             );
             return;
         }
+        let progress_token = request.params.get("progressToken").cloned();
         let now = self.now_ms();
         let Some(slot) = self.slots.get_mut(service_id) else {
             send(
@@ -690,7 +691,14 @@ impl Daemon {
             );
             return;
         };
-        match slot.request_capability(capability, arguments, id.clone(), now, reply.clone()) {
+        match slot.request_capability(
+            capability,
+            arguments,
+            id.clone(),
+            now,
+            progress_token,
+            reply.clone(),
+        ) {
             Ok(()) => {}
             Err(CallError::Busy) => {
                 send(
