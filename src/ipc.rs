@@ -7,7 +7,7 @@
 //! avoid silently rewriting bytes.
 
 use std::io::{self, BufRead, Read, Write};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::thread;
 
@@ -114,6 +114,71 @@ pub fn read_frame_limit<R: BufRead + ?Sized>(
     }
 }
 
+/// Read one protocol-v2 frame: a 4-byte big-endian length followed by exactly
+/// that many UTF-8 bytes. A clean EOF before the length prefix is `Ok(None)`.
+pub fn read_length_frame_limit<R: Read + ?Sized>(
+    reader: &mut R,
+    max: usize,
+) -> Result<Option<String>, FrameError> {
+    let mut header = [0u8; 4];
+    let mut filled = 0;
+    while filled < header.len() {
+        match reader.read(&mut header[filled..]) {
+            Ok(0) if filled == 0 => return Ok(None),
+            Ok(0) => {
+                return Err(FrameError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unterminated length prefix",
+                )))
+            }
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(FrameError::Io(error)),
+        }
+    }
+    let length = u32::from_be_bytes(header) as usize;
+    if length > max {
+        return Err(FrameError::TooLarge { max });
+    }
+    let mut bytes = vec![0u8; length];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        match reader.read(&mut bytes[filled..]) {
+            Ok(0) => {
+                return Err(FrameError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unterminated frame payload",
+                )))
+            }
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(FrameError::Io(error)),
+        }
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| FrameError::InvalidUtf8)
+}
+
+/// Write one protocol-v2 frame.
+pub fn write_length_frame_limit<W: Write + ?Sized>(
+    writer: &mut W,
+    frame: &str,
+    max: usize,
+) -> io::Result<()> {
+    if frame.len() > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("frame exceeds the {} byte limit", max),
+        ));
+    }
+    let length = u32::try_from(frame.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame is too large"))?;
+    writer.write_all(&length.to_be_bytes())?;
+    writer.write_all(frame.as_bytes())?;
+    writer.flush()
+}
+
 /// Write one LF-terminated frame. Callers pass serialized JSON, so an embedded
 /// newline would mean the contract was broken before this point.
 pub fn write_frame<W: Write + ?Sized>(writer: &mut W, frame: &str) -> io::Result<()> {
@@ -156,7 +221,7 @@ pub enum FrameEvent {
 pub fn spawn_reader<R: Read + Send + 'static>(
     name: String,
     stream: R,
-    sender: Sender<FrameEvent>,
+    sender: SyncSender<FrameEvent>,
     wake: Option<Arc<Wake>>,
 ) -> io::Result<()> {
     spawn_reader_limit(name, stream, sender, wake, MAX_FRAME_BYTES)
@@ -164,10 +229,12 @@ pub fn spawn_reader<R: Read + Send + 'static>(
 
 /// Spawn a frame reader with an explicit transport limit. Plugins use the
 /// inline call limit; the MCP bridge uses the same limit for its stdout.
+/// The sender is bounded, so a slow consumer applies backpressure to the
+/// reader thread instead of growing an unbounded queue.
 pub fn spawn_reader_limit<R: Read + Send + 'static>(
     name: String,
     stream: R,
-    sender: Sender<FrameEvent>,
+    sender: SyncSender<FrameEvent>,
     wake: Option<Arc<Wake>>,
     max: usize,
 ) -> io::Result<()> {
@@ -178,6 +245,40 @@ pub fn spawn_reader_limit<R: Read + Send + 'static>(
             let mut reader = io::BufReader::new(stream);
             loop {
                 let event = match read_frame_limit(&mut reader, max) {
+                    Ok(Some(line)) => FrameEvent::Frame(Ok(line)),
+                    Ok(None) => FrameEvent::Closed,
+                    Err(error) => FrameEvent::Frame(Err(error)),
+                };
+                let done = matches!(event, FrameEvent::Closed | FrameEvent::Frame(Err(_)));
+                if sender.send(event).is_err() {
+                    break;
+                }
+                if let Some(wake) = &wake {
+                    wake.notify();
+                }
+                if done {
+                    break;
+                }
+            }
+        })
+        .map(|_| ())
+}
+
+/// Protocol-v2 reader: 4-byte length prefix instead of LF framing.
+pub fn spawn_length_reader_limit<R: Read + Send + 'static>(
+    name: String,
+    stream: R,
+    sender: SyncSender<FrameEvent>,
+    wake: Option<Arc<Wake>>,
+    max: usize,
+) -> io::Result<()> {
+    thread::Builder::new()
+        .name(name)
+        .stack_size(threads::IO_STACK)
+        .spawn(move || {
+            let mut reader = io::BufReader::new(stream);
+            loop {
+                let event = match read_length_frame_limit(&mut reader, max) {
                     Ok(Some(line)) => FrameEvent::Frame(Ok(line)),
                     Ok(None) => FrameEvent::Closed,
                     Err(error) => FrameEvent::Frame(Err(error)),
@@ -297,6 +398,25 @@ mod tests {
         assert!(matches!(
             read_frame(&mut BufReader::new(b"{\"id\":1}".as_slice())),
             Err(FrameError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn length_frames_round_trip_and_enforce_the_limit() {
+        let mut output = Vec::new();
+        write_length_frame_limit(&mut output, "{\"id\":1}", 64).expect("write");
+        assert_eq!(&output[..4], &(8u32).to_be_bytes());
+        let mut input = output.as_slice();
+        assert_eq!(
+            read_length_frame_limit(&mut input, 64).expect("read"),
+            Some("{\"id\":1}".to_string())
+        );
+
+        let mut oversized = Vec::new();
+        write_length_frame_limit(&mut oversized, "0123456789", 64).expect("write");
+        assert!(matches!(
+            read_length_frame_limit(&mut oversized.as_slice(), 9),
+            Err(FrameError::TooLarge { max: 9 })
         ));
     }
 

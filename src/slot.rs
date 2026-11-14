@@ -10,6 +10,8 @@ use serde_json::{json, Value};
 use crate::ipc::{self, FrameError, FrameEvent};
 use crate::log::{self, LogSink};
 use crate::paths;
+#[cfg(unix)]
+use crate::reactor::Framing;
 use crate::registry::{Exec, Hook, Interpreter, Lifecycle, Ready, State};
 use crate::rpc;
 use crate::supervisor::{self, Action, Event, Machine};
@@ -22,6 +24,9 @@ use crate::wake::Wake;
 pub(crate) const MAX_IN_FLIGHT: usize = 64;
 /// A single tool call may not stay in flight longer than this.
 pub(crate) const CALL_TIMEOUT_MS: u64 = 30_000;
+/// Bounded per-plugin stdout queue. A full queue pauses that plugin's reader
+/// instead of growing memory without bound.
+pub(crate) const FRAME_QUEUE: usize = 256;
 
 /// One supervised service: the pure state machine plus the OS handles and
 /// deadlines the machine's actions drive.
@@ -29,6 +34,7 @@ pub(crate) struct Slot {
     id: String,
     pub(crate) machine: Machine,
     exec: Exec,
+    protocol: u32,
     lifecycle: Option<Lifecycle>,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
@@ -82,6 +88,7 @@ impl Slot {
             id,
             machine: Machine::new(enabled),
             exec,
+            protocol: 1,
             lifecycle,
             child: None,
             stdin: None,
@@ -111,6 +118,10 @@ impl Slot {
 
     pub(crate) fn set_lifecycle(&mut self, lifecycle: Option<Lifecycle>) {
         self.lifecycle = lifecycle;
+    }
+
+    pub(crate) fn set_protocol(&mut self, protocol: u32) {
+        self.protocol = protocol;
     }
 
     pub(crate) fn set_protocol_only(&mut self, protocol_only: bool) {
@@ -174,10 +185,7 @@ impl Slot {
         if frame.len() > ipc::CALL_FRAME_MAX {
             return Err(CallError::TooLarge);
         }
-        let Some(stdin) = self.stdin.as_mut() else {
-            return Err(CallError::NotLive);
-        };
-        if let Err(error) = ipc::write_frame_limit(stdin, &frame, ipc::CALL_FRAME_MAX) {
+        if let Err(error) = self.write_json_frame(&frame, ipc::CALL_FRAME_MAX) {
             return Err(CallError::Write(error.to_string()));
         }
         self.pending.insert(
@@ -270,6 +278,7 @@ impl Slot {
             Some(hook) => hook_command(&self.id, "start", hook),
             None => command_for(&self.exec),
         };
+        command.env("SVCD_BLOB_DIR", crate::blob::dir());
         match self.exec.ready {
             Ready::Notify => {
                 command
@@ -338,9 +347,14 @@ impl Slot {
                 }
             };
 
-            let (sender, receiver) = mpsc::channel();
+            let (sender, receiver) = mpsc::sync_channel(FRAME_QUEUE);
             #[cfg(unix)]
             if let Some(reactor) = self.reactor.clone() {
+                let framing = if self.protocol >= 2 {
+                    Framing::Length
+                } else {
+                    Framing::Lines
+                };
                 if let Err(error) = reactor.register(
                     self.id.clone(),
                     stdout,
@@ -349,6 +363,7 @@ impl Slot {
                     self.wake.clone(),
                     log.clone(),
                     ipc::CALL_FRAME_MAX,
+                    framing,
                 ) {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -356,6 +371,7 @@ impl Slot {
                 }
             } else if let Err(error) = spawn_thread_readers(
                 &self.id,
+                self.protocol,
                 stdout,
                 stderr,
                 log.clone(),
@@ -369,6 +385,7 @@ impl Slot {
             #[cfg(not(unix))]
             if let Err(error) = spawn_thread_readers(
                 &self.id,
+                self.protocol,
                 stdout,
                 stderr,
                 log.clone(),
@@ -445,15 +462,28 @@ impl Slot {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         self.ping_id = id;
-        if let Some(stdin) = self.stdin.as_mut() {
-            let line = json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": "svcd.ping",
-                "params": {},
-            })
-            .to_string();
-            let _ = ipc::write_frame_limit(stdin, &line, ipc::CONTROL_FRAME_MAX);
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "svcd.ping",
+            "params": {},
+        })
+        .to_string();
+        let _ = self.write_json_frame(&line, ipc::CONTROL_FRAME_MAX);
+    }
+
+    fn write_json_frame(&mut self, frame: &str, max: usize) -> std::io::Result<()> {
+        let protocol = self.protocol;
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "plugin stdin is closed",
+            ));
+        };
+        if protocol >= 2 {
+            ipc::write_length_frame_limit(stdin, frame, max)
+        } else {
+            ipc::write_frame_limit(stdin, frame, max)
         }
     }
 
@@ -606,10 +636,8 @@ impl Slot {
     }
 
     fn write_notification(&mut self, method: &str, params: Value) {
-        if let Some(stdin) = self.stdin.as_mut() {
-            let frame = rpc::notification(method, params);
-            let _ = ipc::write_frame_limit(stdin, &frame, ipc::CONTROL_FRAME_MAX);
-        }
+        let frame = rpc::notification(method, params);
+        let _ = self.write_json_frame(&frame, ipc::CONTROL_FRAME_MAX);
     }
 
     /// stdout EOF means the plugin can no longer answer. Treat it as an exit:
@@ -846,10 +874,8 @@ impl Slot {
     }
 
     fn signal_polite(&mut self) {
-        if let Some(stdin) = self.stdin.as_mut() {
-            let line = rpc::notification("svcd.shutdown", json!({}));
-            let _ = ipc::write_frame_limit(stdin, &line, ipc::CONTROL_FRAME_MAX);
-        }
+        let line = rpc::notification("svcd.shutdown", json!({}));
+        let _ = self.write_json_frame(&line, ipc::CONTROL_FRAME_MAX);
         self.stdin = None;
         #[cfg(unix)]
         {
@@ -1027,19 +1053,30 @@ fn log_line(log: &Option<Arc<Mutex<LogSink>>>, line: &str) {
 /// Fallback used on Windows and whenever the reactor is unavailable.
 fn spawn_thread_readers(
     id: &str,
+    protocol: u32,
     stdout: ChildStdout,
     stderr: ChildStderr,
     log: Option<Arc<Mutex<LogSink>>>,
-    sender: mpsc::Sender<FrameEvent>,
+    sender: mpsc::SyncSender<FrameEvent>,
     wake: Option<Arc<Wake>>,
 ) -> std::io::Result<()> {
-    ipc::spawn_reader_limit(
-        format!("svcd-{}-stdout", id),
-        stdout,
-        sender,
-        wake,
-        ipc::CALL_FRAME_MAX,
-    )?;
+    if protocol >= 2 {
+        ipc::spawn_length_reader_limit(
+            format!("svcd-{}-stdout", id),
+            stdout,
+            sender,
+            wake,
+            ipc::CALL_FRAME_MAX,
+        )?;
+    } else {
+        ipc::spawn_reader_limit(
+            format!("svcd-{}-stdout", id),
+            stdout,
+            sender,
+            wake,
+            ipc::CALL_FRAME_MAX,
+        )?;
+    }
     let stderr_log = log;
     thread::Builder::new()
         .name(format!("svcd-{}-stderr", id))

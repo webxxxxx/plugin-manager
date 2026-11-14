@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::process::{ChildStderr, ChildStdout};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -36,11 +36,18 @@ enum Command {
     Shutdown,
 }
 
+#[derive(Clone, Copy)]
+pub enum Framing {
+    Lines,
+    Length,
+}
+
 enum SourceKind {
     Frames {
-        sender: Sender<FrameEvent>,
+        sender: SyncSender<FrameEvent>,
         max: usize,
         wake: Option<Arc<Wake>>,
+        framing: Framing,
     },
     Log,
 }
@@ -50,6 +57,7 @@ struct Source {
     file: File,
     kind: SourceKind,
     buffer: Vec<u8>,
+    blocked: bool,
     log: Option<Arc<Mutex<LogSink>>>,
 }
 
@@ -73,16 +81,23 @@ impl Reactor {
         id: String,
         stdout: ChildStdout,
         stderr: Option<ChildStderr>,
-        sender: Sender<FrameEvent>,
+        sender: SyncSender<FrameEvent>,
         wake: Option<Arc<Wake>>,
         log: Option<Arc<Mutex<LogSink>>>,
         max: usize,
+        framing: Framing,
     ) -> io::Result<()> {
         let mut sources = vec![Source {
             key: id.clone(),
             file: file(stdout),
-            kind: SourceKind::Frames { sender, max, wake },
+            kind: SourceKind::Frames {
+                sender,
+                max,
+                wake,
+                framing,
+            },
             buffer: Vec::new(),
+            blocked: false,
             log: log.clone(),
         }];
         if let Some(stderr) = stderr {
@@ -91,6 +106,7 @@ impl Reactor {
                 file: file(stderr),
                 kind: SourceKind::Log,
                 buffer: Vec::new(),
+                blocked: false,
                 log,
             });
         }
@@ -149,16 +165,35 @@ fn run(rx: Receiver<Command>) {
             return;
         }
 
+        // A full per-plugin queue pauses that plugin's reader, not the whole
+        // reactor. Retry blocked sources before waiting for more I/O.
+        let mut dead = Vec::new();
+        for (index, source) in sources.iter_mut().enumerate() {
+            if source.blocked {
+                source.blocked = false;
+                if !drain_lines(source) {
+                    dead.push(index);
+                }
+            }
+        }
+        for index in dead.into_iter().rev() {
+            sources.remove(index);
+        }
+        let blocked_any = sources.iter().any(|source| source.blocked);
         let mut fds: Vec<libc::pollfd> = sources
             .iter()
             .map(|source| libc::pollfd {
-                fd: AsRawFd::as_raw_fd(&source.file),
+                fd: if source.blocked {
+                    -1
+                } else {
+                    AsRawFd::as_raw_fd(&source.file)
+                },
                 events: libc::POLLIN,
                 revents: 0,
             })
             .collect();
-        let ready =
-            unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, POLL_TIMEOUT_MS) };
+        let timeout = if blocked_any { 10 } else { POLL_TIMEOUT_MS };
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if ready < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -173,6 +208,10 @@ fn run(rx: Receiver<Command>) {
 
         let mut index = 0;
         while index < sources.len() {
+            if sources[index].blocked {
+                index += 1;
+                continue;
+            }
             let revents = fds[index].revents;
             if revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
                 index += 1;
@@ -197,7 +236,7 @@ fn read_source(source: &mut Source) -> bool {
     match source.file.read(&mut chunk) {
         Ok(0) => {
             if let SourceKind::Frames { sender, .. } = &source.kind {
-                let _ = sender.send(FrameEvent::Closed);
+                let _ = sender.try_send(FrameEvent::Closed);
             }
             false
         }
@@ -208,7 +247,7 @@ fn read_source(source: &mut Source) -> bool {
         Err(error) if error.kind() == io::ErrorKind::Interrupted => true,
         Err(error) => {
             if let SourceKind::Frames { sender, .. } = &source.kind {
-                let _ = sender.send(FrameEvent::Frame(Err(FrameError::Io(error))));
+                let _ = sender.try_send(FrameEvent::Frame(Err(FrameError::Io(error))));
             }
             false
         }
@@ -216,6 +255,11 @@ fn read_source(source: &mut Source) -> bool {
 }
 
 fn drain_lines(source: &mut Source) -> bool {
+    if let SourceKind::Frames { framing, .. } = &source.kind {
+        if matches!(framing, Framing::Length) {
+            return drain_length_frames(source);
+        }
+    }
     loop {
         let Some(position) = source.buffer.iter().position(|byte| *byte == b'\n') else {
             let max = match &source.kind {
@@ -224,35 +268,101 @@ fn drain_lines(source: &mut Source) -> bool {
             };
             if source.buffer.len() > max {
                 if let SourceKind::Frames { sender, .. } = &source.kind {
-                    let _ = sender.send(FrameEvent::Frame(Err(FrameError::TooLarge { max })));
+                    let _ = sender.try_send(FrameEvent::Frame(Err(FrameError::TooLarge { max })));
                 }
                 return false;
             }
             return true;
         };
-        let line: Vec<u8> = source.buffer.drain(..=position).collect();
-        let line = &line[..line.len().saturating_sub(1)];
         match &source.kind {
-            SourceKind::Frames { sender, max, wake } => {
+            SourceKind::Frames {
+                sender, max, wake, ..
+            } => {
+                let line = &source.buffer[..position];
                 if line.len() > *max {
-                    let _ = sender.send(FrameEvent::Frame(Err(FrameError::TooLarge { max: *max })));
+                    let _ =
+                        sender.try_send(FrameEvent::Frame(Err(FrameError::TooLarge { max: *max })));
                     return false;
                 }
-                let text = match String::from_utf8(line.to_vec()) {
-                    Ok(text) => text,
+                let text = match std::str::from_utf8(line) {
+                    Ok(text) => text.to_string(),
                     Err(_) => {
-                        let _ = sender.send(FrameEvent::Frame(Err(FrameError::InvalidUtf8)));
+                        let _ = sender.try_send(FrameEvent::Frame(Err(FrameError::InvalidUtf8)));
                         return false;
                     }
                 };
-                if sender.send(FrameEvent::Frame(Ok(text))).is_err() {
-                    return false;
+                match sender.try_send(FrameEvent::Frame(Ok(text))) {
+                    Ok(()) => {
+                        source.buffer.drain(..=position);
+                        if let Some(wake) = wake {
+                            wake.notify();
+                        }
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        // Keep the line in the buffer; the receiver will drain
+                        // it and the reactor retries this source.
+                        source.blocked = true;
+                        return true;
+                    }
+                    Err(TrySendError::Disconnected(_)) => return false,
                 }
+            }
+            SourceKind::Log => {
+                let line: Vec<u8> = source.buffer.drain(..=position).collect();
+                let line = &line[..line.len().saturating_sub(1)];
+                log_line(&source.log, &String::from_utf8_lossy(line));
+            }
+        }
+    }
+}
+
+fn drain_length_frames(source: &mut Source) -> bool {
+    loop {
+        if source.buffer.len() < 4 {
+            return true;
+        }
+        let length = u32::from_be_bytes([
+            source.buffer[0],
+            source.buffer[1],
+            source.buffer[2],
+            source.buffer[3],
+        ]) as usize;
+        let SourceKind::Frames {
+            sender, max, wake, ..
+        } = &source.kind
+        else {
+            return false;
+        };
+        if length > *max {
+            let _ = sender.try_send(FrameEvent::Frame(Err(FrameError::TooLarge { max: *max })));
+            return false;
+        }
+        if source.buffer.len() < 4 + length {
+            if source.buffer.len() > *max + 4 {
+                let _ = sender.try_send(FrameEvent::Frame(Err(FrameError::TooLarge { max: *max })));
+                return false;
+            }
+            return true;
+        }
+        let text = match std::str::from_utf8(&source.buffer[4..4 + length]) {
+            Ok(text) => text.to_string(),
+            Err(_) => {
+                let _ = sender.try_send(FrameEvent::Frame(Err(FrameError::InvalidUtf8)));
+                return false;
+            }
+        };
+        match sender.try_send(FrameEvent::Frame(Ok(text))) {
+            Ok(()) => {
+                source.buffer.drain(..4 + length);
                 if let Some(wake) = wake {
                     wake.notify();
                 }
             }
-            SourceKind::Log => log_line(&source.log, &String::from_utf8_lossy(line)),
+            Err(TrySendError::Full(_)) => {
+                source.blocked = true;
+                return true;
+            }
+            Err(TrySendError::Disconnected(_)) => return false,
         }
     }
 }

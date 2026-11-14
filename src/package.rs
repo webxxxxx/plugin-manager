@@ -815,7 +815,7 @@ fn parse_public_key(pem: &[u8]) -> Result<VerifyingKey, String> {
 pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, String> {
     let m: Manifest = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
     check_schema(&m)?;
-    if m.protocol != 1 {
+    if !matches!(m.protocol, 1 | 2) {
         return Err(format!("unsupported protocol {}", m.protocol));
     }
     if !valid_name(&m.name) {
@@ -1254,7 +1254,7 @@ mod tests {
         let data = b"payload".to_vec();
         let value = json!({
             "schema": 1, "name": "demo", "version": "1.0.0", "desc": "demo",
-            "platform": target(), "protocol": 2,
+            "platform": target(), "protocol": 3,
             "exec": {"path": "payload/bin/demo"},
             "files": [{"path": "payload/bin/demo", "size": data.len(), "sha256": hex_sha256(&data), "mode": 0o755}]
         });
@@ -1267,6 +1267,26 @@ mod tests {
         );
         let error = verify_bytes(&bytes).expect_err("protocol");
         assert!(error.contains("protocol"), "{error}");
+    }
+
+    #[test]
+    fn accepts_length_prefixed_protocol_two() {
+        let key = setup();
+        let data = b"payload".to_vec();
+        let value = json!({
+            "schema": 1, "name": "demo", "version": "1.0.0", "desc": "demo",
+            "platform": target(), "protocol": 2,
+            "exec": {"path": "payload/bin/demo"},
+            "files": [{"path": "payload/bin/demo", "size": data.len(), "sha256": hex_sha256(&data), "mode": 0o755}]
+        });
+        let manifest = serde_json::to_vec(&value).expect("manifest");
+        let bytes = package_from(
+            &key,
+            "test",
+            &manifest,
+            &[("payload/bin/demo", data, 0o755)],
+        );
+        verify_bytes(&bytes).expect("protocol 2 package");
     }
 
     fn hook_file() -> (String, Vec<u8>) {

@@ -579,6 +579,15 @@ install+start 80 total_ms=3778
 daemon threads=163
 ```
 
+## 附录 C：2026-11-14 后续实现进展
+
+- **已实现**：MCP `tools/list` cursor 分页（`src/catalog.rs`）、按消息类型拆分的帧上限、本地管理通道有界帧、管理连接复用池。
+- **已实现**：Unix 插件 stdout/stderr reactor；80 个插件复测 daemon 线程从 163 降到 4（见 2.2.1）。
+- **已实现**：插件每连接/每插件的 frame 队列改为有界 `sync_channel`；reactor 在队列满时暂停该插件读取。
+- **已实现**：manifest `protocol: 2` 的 4 字节长度前缀帧；已用 Python 长度帧插件在 WSL 端到端验证 `initialize` / `tools/list` / `tools/call`。
+- **已实现**：内容寻址 blob store、`POST/GET /api/v1/blobs`、工具参数中的 `$blob` 解析为受控路径（`SVCD_BLOB_DIR`）。
+- **尚未实现**：HTTP/SSE/WS 的 reactor（仍是 thread-per-connection）、工具结果 blob/streaming、MCP progress/job、以及大结果/长任务的端到端通道。
+
 ## 附录 B：相关代码位置
 
 - 工具投影：`src/mcp.rs:24-53`、`:278-302`

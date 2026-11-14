@@ -1129,6 +1129,32 @@ fn services_version_start_and_stop() {
 }
 
 #[test]
+fn blobs_upload_and_download_round_trip() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let put = raw_request(
+        &address,
+        "POST",
+        "/api/v1/blobs",
+        "application/octet-stream",
+        b"blob body",
+    );
+    assert_eq!(put.status, 200, "{:?}", put.body);
+    let meta = json_body(&put);
+    let id = meta["id"].as_str().expect("blob id").to_string();
+    assert_eq!(meta["size"], 9);
+
+    let get = raw_request(&address, "GET", &format!("/api/v1/blobs/{id}"), "", b"");
+    assert_eq!(get.status, 200);
+    assert_eq!(get.body, b"blob body");
+
+    let missing = raw_request(&address, "GET", "/api/v1/blobs/sha256:deadbeef", "", b"");
+    assert_eq!(missing.status, 404);
+}
+
+#[test]
 fn plugin_upload_list_and_delete() {
     let mut sandbox = Sandbox::new();
     let key = SigningKey::from_bytes(&[21u8; 32]);

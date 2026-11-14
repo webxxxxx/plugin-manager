@@ -839,6 +839,7 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, Vec<u8>> {
     }
     let limit = if request.path.starts_with("/api/v1/plugins")
         || request.path.starts_with("/api/v1/import")
+        || request.path.starts_with("/api/v1/blobs")
     {
         MAX_BODY
     } else {
@@ -976,6 +977,10 @@ fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<
             }
         }
         ("POST", ["api", "v1", "plugins"]) => install_plugin(config, request, query),
+        ("POST", ["api", "v1", "blobs"]) => blob_put(request),
+        ("GET", ["api", "v1", "blobs", id]) => blob_get(&decode(id)),
+        (_, ["api", "v1", "blobs"]) => method_not_allowed("POST"),
+        (_, ["api", "v1", "blobs", _]) => method_not_allowed("GET"),
         ("GET", ["api", "v1", "trust"]) => trust_list(),
         ("POST", ["api", "v1", "trust"]) => trust_add(request, query),
         ("DELETE", ["api", "v1", "trust", key]) => trust_remove(&decode(key)),
@@ -1008,6 +1013,26 @@ fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<
         ("GET", ["api", "v1", "logs", id]) => logs(config, &decode(id), query),
         (_, ["api", "v1", "logs", _]) => method_not_allowed("GET"),
         _ => error(404, "not_found", "unknown endpoint"),
+    }
+}
+
+fn blob_put(request: &HttpRequest) -> Vec<u8> {
+    if request.body.is_empty() {
+        return error(400, "bad_request", "empty blob body");
+    }
+    match crate::blob::put(&request.body) {
+        Ok(meta) => ok(json!({
+            "id": meta.id,
+            "size": meta.size,
+        })),
+        Err(message) => map_error(&message),
+    }
+}
+
+fn blob_get(id: &str) -> Vec<u8> {
+    match crate::blob::read(id) {
+        Ok(bytes) => http::response(200, crate::blob::content_type(), &bytes),
+        Err(message) => error(404, "not_found", &message),
     }
 }
 

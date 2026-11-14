@@ -246,6 +246,7 @@ mod tests {
             id: "demo".into(),
             kind: Kind::Core,
             version: "1.2.3".into(),
+            protocol: 1,
             desc: "demo service".into(),
             deps: vec!["base".into()],
             caps: Vec::new(),

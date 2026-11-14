@@ -715,6 +715,7 @@ fn service_from_manifest(
         id: id.to_string(),
         kind: Kind::Plugin,
         version: manifest.version.clone(),
+        protocol: manifest.protocol,
         desc: manifest.desc.clone(),
         deps: manifest.dependencies.clone(),
         caps,

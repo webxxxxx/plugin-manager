@@ -91,7 +91,7 @@ pub fn run_stdio() -> i32 {
         eprintln!("mcp: {}", error);
         return 1;
     }
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::sync_channel(256);
     if let Err(error) = ipc::spawn_reader("mcp-stdin".into(), io::stdin(), sender, None) {
         eprintln!("mcp: stdin: {}", error);
         return 1;
@@ -502,6 +502,7 @@ mod tests {
             id: id.into(),
             kind,
             version: "1.0.0".into(),
+            protocol: 1,
             desc: "test".into(),
             deps: Vec::new(),
             caps: caps.iter().map(|cap| capability(cap)).collect(),

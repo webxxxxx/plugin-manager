@@ -130,6 +130,8 @@ pub struct Service {
     pub id: String,
     pub kind: Kind,
     pub version: String,
+    /// Plugin protocol version: 1 = LF-delimited NDJSON, 2 = length-prefixed.
+    pub protocol: u32,
     /// Kept from the definition; the status payload does not expose it yet.
     #[allow(dead_code)]
     pub desc: String,
@@ -160,6 +162,7 @@ impl Service {
             id: RESERVED_ID.into(),
             kind: Kind::Core,
             version: env!("CARGO_PKG_VERSION").into(),
+            protocol: 1,
             desc: "core service management".into(),
             deps: Vec::new(),
             caps: Vec::new(),

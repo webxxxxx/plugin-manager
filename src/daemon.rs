@@ -269,6 +269,7 @@ impl Daemon {
                     service.lifecycle.clone(),
                     service.enabled,
                 );
+                slot.set_protocol(service.protocol);
                 slot.set_protocol_only(service.kind == Kind::Plugin);
                 slot.set_wake(wake.clone());
                 slots.insert(service.id.clone(), slot);
@@ -673,6 +674,14 @@ impl Daemon {
             return;
         }
 
+        let mut arguments = arguments;
+        if let Err(message) = crate::blob::resolve_args(&mut arguments) {
+            send(
+                &reply,
+                mcp::tool_error(id, &format!("cannot resolve blob argument: {}", message)),
+            );
+            return;
+        }
         let now = self.now_ms();
         let Some(slot) = self.slots.get_mut(service_id) else {
             send(
@@ -914,6 +923,7 @@ impl Daemon {
             if let Some(exec) = service.exec.clone() {
                 let mut slot =
                     Slot::new(id.clone(), exec, service.lifecycle.clone(), service.enabled);
+                slot.set_protocol(service.protocol);
                 slot.set_protocol_only(true);
                 slot.set_wake(self.wake.clone());
                 #[cfg(unix)]
@@ -1373,6 +1383,7 @@ mod tests {
             id: id.into(),
             kind: Kind::Core,
             version: "1.0.0".into(),
+            protocol: 1,
             desc: "test".into(),
             deps: deps.iter().map(|dep| dep.to_string()).collect(),
             caps: Vec::new(),
@@ -1590,6 +1601,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             id: "plug".into(),
             kind: Kind::Plugin,
             version: "1.0.0".into(),
+            protocol: 1,
             desc: "tools".into(),
             deps: Vec::new(),
             caps: vec![
