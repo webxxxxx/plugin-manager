@@ -107,6 +107,19 @@ MCP 客户端 / 工具门户 / svc / plugin CLI / 浏览器
 - HTTP 连接、SSE/WS 仍然是 thread-per-connection；本表只覆盖插件 stdio 与管理连接池，不覆盖 HTTP/WS 的线程上限。
 - 持久管理连接池只把“每次请求新建连接”降为“每个客户端复用连接”，并发连接上限仍未做成 reactor 级固定。
 
+### 2.2.2 全 reactor 规模回归（2026-11-14）
+
+在 Unix 全 reactor（插件、管理 UDS、HTTP、SSE、WS）落地后，用 release 构建复测：
+
+| 场景 | 结果 |
+|---|---|
+| 80 个插件、空闲 | daemon **8 线程** |
+| 80 插件 + 500 条管理 UDS 连接 | 峰值 **8 线程** |
+| 0 插件 + 1000 个并发 HTTP 请求 | 峰值 **8 线程** |
+| 单个插件 UI + 64 条 WebSocket 连接（`MAX_SUBSCRIBERS` 上限） | 峰值 **8 线程** |
+
+结论：Unix 上线程数不随插件数、管理连接数、HTTP 连接数或 WS 连接数增长；Windows 仍使用线程 fallback。
+
 注意事项：
 
 - 这是**合成压力夹具**，schema 是刻意放大的；真实插件可能更小，也可能更大（例如带完整 JSON Schema、枚举、长描述的工具）。
