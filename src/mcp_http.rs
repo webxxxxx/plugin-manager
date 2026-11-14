@@ -78,6 +78,87 @@ pub fn handle(config: &Path, request: &Request<'_>, password_hash: Option<&str>)
     reply(status, response)
 }
 
+/// A `tools/call` that should be answered with an SSE stream because the
+/// client asked for `text/event-stream` and supplied a progress token.
+pub struct StreamingCall {
+    pub id: Option<Value>,
+    pub name: String,
+    pub arguments: Value,
+    pub progress_token: Value,
+}
+
+/// Validate the same transport contract as `handle`, then decide whether this
+/// request should stream. `Ok(None)` means the caller should use the normal
+/// one-JSON response path.
+pub fn prepare_streaming(
+    request: &Request<'_>,
+    password_hash: Option<&str>,
+) -> Result<Option<StreamingCall>, Vec<u8>> {
+    if request.method != "POST" {
+        return Ok(None);
+    }
+    if !http::same_origin(request.headers) {
+        return Err(http::json_error(
+            403,
+            "forbidden",
+            "cross-origin calls are not allowed",
+        ));
+    }
+    if let Err(response) = authorize(request.headers, password_hash) {
+        return Err(response);
+    }
+    let accept = http::header(request.headers, "accept").unwrap_or("");
+    if !accept.to_ascii_lowercase().contains("text/event-stream") {
+        return Ok(None);
+    }
+    let Ok(text) = std::str::from_utf8(request.body) else {
+        return Err(reply(400, rpc::err(None, -32700, "parse error")));
+    };
+    let parsed = match rpc::parse(text) {
+        Ok(parsed) => parsed,
+        Err(response) => return Err(reply(400, response)),
+    };
+    if parsed.id.is_none() {
+        return Ok(None);
+    }
+    if let Err(response) = validate_headers(request.headers, &parsed) {
+        return Err(reply(400, response));
+    }
+    if parsed.method != "tools/call" {
+        return Ok(None);
+    }
+    let Some(progress_token) = parsed
+        .params
+        .get("_meta")
+        .and_then(|meta| meta.get("progressToken"))
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let Some(name) = parsed
+        .params
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return Err(reply(
+            400,
+            rpc::err(parsed.id, -32602, "tools/call requires params.name"),
+        ));
+    };
+    let arguments = parsed
+        .params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    Ok(Some(StreamingCall {
+        id: parsed.id,
+        name,
+        arguments,
+        progress_token,
+    }))
+}
+
 fn reply(status: u16, response: rpc::Response) -> Vec<u8> {
     http::response(
         status,

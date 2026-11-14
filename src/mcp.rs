@@ -510,6 +510,18 @@ fn legacy_initialize(id: Option<Value>, params: &Value) -> rpc::Response {
     )
 }
 
+/// Finish one modern `tools/call` result after a streaming transport has
+/// already forwarded progress notifications.
+pub fn finish_modern_tool_call(id: Option<Value>, response: rpc::Response) -> rpc::Response {
+    if let Some(error) = response.error {
+        return error_response(id, error);
+    }
+    let mut result = tool_result_object(response.result.unwrap_or_else(|| json!({})));
+    result["resultType"] = json!("complete");
+    result["_meta"] = server_meta();
+    rpc::ok(id, result)
+}
+
 fn write_response(stdout: &mut impl Write, response: &rpc::Response) -> io::Result<()> {
     ipc::write_frame(stdout, &rpc::to_line(response))
 }

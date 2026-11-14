@@ -456,6 +456,25 @@ fn raw_request_paced(
     read_raw_response(&mut stream)
 }
 
+fn decode_chunked(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    loop {
+        let Some(line_end) = rest.windows(2).position(|window| window == b"\r\n") else {
+            break;
+        };
+        let size_text = String::from_utf8_lossy(&rest[..line_end]);
+        let size = usize::from_str_radix(size_text.trim(), 16).unwrap_or(0);
+        rest = &rest[line_end + 2..];
+        if size == 0 {
+            break;
+        }
+        out.extend_from_slice(&rest[..size.min(rest.len())]);
+        rest = &rest[(size + 2).min(rest.len())..];
+    }
+    out
+}
+
 fn json_body(response: &RawResponse) -> Value {
     serde_json::from_slice(&response.body).expect("json body")
 }
@@ -758,6 +777,11 @@ fn web_event_agent() -> (&'static str, Vec<u8>) {
 while ($null -ne ($line = [Console]::In.ReadLine())) {
   $id = 1
   if ($line -match '"id"\s*:\s*(\d+)') { $id = [int]$Matches[1] }
+  $token = $null
+  if ($line -match '"progressToken"\s*:\s*"([^"]+)"') { $token = $Matches[1] }
+  if ($null -ne $token) {
+    [Console]::Out.WriteLine('{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1,"progressToken":"' + $token + '"}}')
+  }
   [Console]::Out.WriteLine('{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"pong-event"}}')
   [Console]::Out.WriteLine('{"jsonrpc":"2.0","id":' + $id + ',"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}')
   [Console]::Out.Flush()
@@ -772,6 +796,10 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
 while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   if [ -z "$id" ]; then id=1; fi
+  token=$(printf '%s\n' "$line" | sed -n 's/.*"progressToken":"\([^"]*\)".*/\1/p')
+  if [ -n "$token" ]; then
+    printf '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1,"progressToken":"%s"}}\n' "$token"
+  fi
   printf '{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"pong-event"}}\n'
   printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}\n' "$id"
 done
@@ -1577,6 +1605,60 @@ fn configured_port_and_paths_come_from_svcd_conf() {
         !sandbox.data.join("plugins").join("demo").exists(),
         "plugin used the default data directory"
     );
+}
+
+#[test]
+fn http_mcp_streams_progress_for_tools_call() {
+    let (sandbox, address) = daemon_with_web_event_plugin(61);
+    set_password(&sandbox, TEST_PASSWORD);
+
+    let body = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": {
+            "name": "demo.status",
+            "arguments": {},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "progressToken": "t1"
+            }
+        }
+    }))
+    .expect("body");
+
+    let mut stream = TcpStream::connect(&address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: demo.status\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        address,
+        TEST_PASSWORD,
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).expect("write head");
+    stream.write_all(&body).expect("write body");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("read response");
+
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("headers");
+    let head = String::from_utf8_lossy(&response[..split]);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("content-type: text/event-stream"),
+        "{head}"
+    );
+    let text = String::from_utf8_lossy(&decode_chunked(&response[split + 4..])).to_string();
+    assert!(text.contains("notifications/progress"), "{text}");
+    assert!(text.contains("\"progressToken\":\"t1\""), "{text}");
+    assert!(text.contains("\"id\":7"), "{text}");
+    assert!(text.contains("pong"), "{text}");
 }
 
 #[test]

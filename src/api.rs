@@ -9,6 +9,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -32,6 +34,7 @@ use crate::channel;
 use crate::http;
 use crate::lan::{self, AuthKind, Lan, LanStatus};
 use crate::log;
+use crate::mcp;
 use crate::mcp_http;
 use crate::package;
 use crate::paths;
@@ -260,6 +263,23 @@ struct SseState {
 }
 
 #[cfg(unix)]
+const MAX_MCP_STREAMS: usize = 64;
+#[cfg(unix)]
+static MCP_STREAMS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(unix)]
+enum McpSseEvent {
+    Frame(String),
+    Final(String),
+}
+
+#[cfg(unix)]
+struct McpSseState {
+    receiver: Receiver<McpSseEvent>,
+    done: bool,
+}
+
+#[cfg(unix)]
 struct WsState {
     receiver: Receiver<uichannel::Event>,
     _subscription: uichannel::Subscription,
@@ -281,6 +301,7 @@ enum ConnState {
     Writing,
     Sse(SseState),
     Ws(WsState),
+    McpSse(McpSseState),
 }
 
 #[cfg(unix)]
@@ -401,6 +422,7 @@ fn reactor_loop(
                 ConnState::Writing => events |= libc::POLLOUT,
                 ConnState::Sse(_) => events |= libc::POLLIN,
                 ConnState::Ws(_) => events |= libc::POLLIN,
+                ConnState::McpSse(_) => events |= libc::POLLIN,
                 ConnState::Processing => {}
             }
             if connection.out_at < connection.out.len() {
@@ -489,6 +511,38 @@ fn reactor_loop(
                                 Ok(None) => break,
                                 Ok(Some((request, used))) => {
                                     connection.buffer.drain(..used);
+                                    let path = request
+                                        .path
+                                        .split_once('?')
+                                        .map(|(path, _)| path)
+                                        .unwrap_or(request.path.as_str());
+                                    if path == "/mcp" {
+                                        let password_hash = lan.lock().ok().and_then(|state| {
+                                            state.password_hash().map(str::to_string)
+                                        });
+                                        let prepared = mcp_http::prepare_streaming(
+                                            &mcp_http::Request {
+                                                method: &request.method,
+                                                headers: &request.headers,
+                                                body: &request.body,
+                                            },
+                                            password_hash.as_deref(),
+                                        );
+                                        match prepared {
+                                            Ok(Some(call)) => {
+                                                start_mcp_sse(connection, call, config.clone());
+                                                break;
+                                            }
+                                            Ok(None) => {}
+                                            Err(response) => {
+                                                connection.out = response;
+                                                connection.out_at = 0;
+                                                connection.keep_alive = false;
+                                                connection.state = ConnState::Writing;
+                                                break;
+                                            }
+                                        }
+                                    }
                                     if let Some(kind) = ui_stream_kind(&request.path) {
                                         if kind == "events" {
                                             match prepare_sse(&request, &lan) {
@@ -557,6 +611,52 @@ fn reactor_loop(
             let Some(connection) = connections.get_mut(&id) else {
                 continue;
             };
+            if matches!(connection.state, ConnState::McpSse(_)) {
+                if revents & libc::POLLIN != 0 {
+                    let mut discard = [0u8; 512];
+                    match connection.stream.read(&mut discard) {
+                        Ok(0) => {
+                            connections.remove(&id);
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(_) => {
+                            connections.remove(&id);
+                            continue;
+                        }
+                    }
+                }
+                fill_mcp_sse(connection);
+                if connection.out_at < connection.out.len() {
+                    match connection
+                        .stream
+                        .write(&connection.out[connection.out_at..])
+                    {
+                        Ok(0) => {
+                            connections.remove(&id);
+                            continue;
+                        }
+                        Ok(written) => {
+                            connection.out_at += written;
+                            if connection.out_at >= connection.out.len() {
+                                connection.out.clear();
+                                connection.out_at = 0;
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(_) => {
+                            connections.remove(&id);
+                            continue;
+                        }
+                    }
+                }
+                let done = matches!(&connection.state, ConnState::McpSse(state) if state.done);
+                if done && connection.out.is_empty() {
+                    connections.remove(&id);
+                }
+                continue;
+            }
             if matches!(connection.state, ConnState::Ws(_)) {
                 let readable = revents & libc::POLLIN != 0;
                 if !drive_ws(connection, id, &queue, readable) {
@@ -821,6 +921,79 @@ fn fill_sse(connection: &mut Connection) {
     if state.heartbeat.elapsed() >= Duration::from_secs(15) {
         push_sse_chunk(&mut connection.out, b": ping\n\n");
         state.heartbeat = Instant::now();
+    }
+}
+
+#[cfg(unix)]
+fn start_mcp_sse(connection: &mut Connection, call: mcp_http::StreamingCall, config: PathBuf) {
+    if MCP_STREAMS.fetch_add(1, Ordering::SeqCst) >= MAX_MCP_STREAMS {
+        MCP_STREAMS.fetch_sub(1, Ordering::SeqCst);
+        connection.out = http::json_error(429, "too_many_streams", "too many streaming MCP calls");
+        connection.out_at = 0;
+        connection.keep_alive = false;
+        connection.state = ConnState::Writing;
+        return;
+    }
+    connection.out.clear();
+    connection.out.extend_from_slice(
+        b"HTTP/1.1 200 OK\r\n\
+          Content-Type: text/event-stream\r\n\
+          Cache-Control: no-cache\r\n\
+          Connection: keep-alive\r\n\
+          Transfer-Encoding: chunked\r\n\r\n",
+    );
+    connection.out_at = 0;
+    connection.keep_alive = true;
+    let (tx, rx) = mpsc::channel();
+    connection.state = ConnState::McpSse(McpSseState {
+        receiver: rx,
+        done: false,
+    });
+    let _ = thread::Builder::new()
+        .name("svcd-mcp-stream".into())
+        .stack_size(threads::REQUEST_STACK)
+        .spawn(move || {
+            let request = json!({
+                "name": call.name,
+                "arguments": call.arguments,
+                "progressToken": call.progress_token,
+            });
+            let response =
+                match channel::request_stream(&config, "registry.call", request, |notification| {
+                    let _ = tx.send(McpSseEvent::Frame(notification.to_string()));
+                }) {
+                    Ok(response) => mcp::finish_modern_tool_call(call.id, response),
+                    Err(error) => {
+                        rpc::err(call.id, -32603, &format!("svcd unreachable: {}", error))
+                    }
+                };
+            let _ = tx.send(McpSseEvent::Final(rpc::to_line(&response)));
+            MCP_STREAMS.fetch_sub(1, Ordering::SeqCst);
+        });
+}
+
+#[cfg(unix)]
+fn fill_mcp_sse(connection: &mut Connection) {
+    let ConnState::McpSse(state) = &mut connection.state else {
+        return;
+    };
+    while let Ok(event) = state.receiver.try_recv() {
+        match event {
+            McpSseEvent::Frame(line) => {
+                push_sse_chunk(
+                    &mut connection.out,
+                    format!("event: message\ndata: {}\n\n", line).as_bytes(),
+                );
+            }
+            McpSseEvent::Final(line) => {
+                push_sse_chunk(
+                    &mut connection.out,
+                    format!("event: message\ndata: {}\n\n", line).as_bytes(),
+                );
+                connection.out.extend_from_slice(b"0\r\n\r\n");
+                state.done = true;
+            }
+        }
     }
 }
 
@@ -1479,6 +1652,35 @@ fn handle(mut stream: TcpStream, config: PathBuf, lan: Arc<Mutex<Lan>>) {
             }
         };
         first = false;
+        let path = request
+            .path
+            .split_once('?')
+            .map(|(path, _)| path)
+            .unwrap_or(request.path.as_str());
+        if path == "/mcp" {
+            let password_hash = lan
+                .lock()
+                .ok()
+                .and_then(|state| state.password_hash().map(str::to_string));
+            match mcp_http::prepare_streaming(
+                &mcp_http::Request {
+                    method: &request.method,
+                    headers: &request.headers,
+                    body: &request.body,
+                },
+                password_hash.as_deref(),
+            ) {
+                Ok(Some(call)) => {
+                    let _ = serve_mcp_sse(&mut stream, call, &config);
+                    return;
+                }
+                Ok(None) => {}
+                Err(response) => {
+                    let _ = stream.write_all(&response);
+                    return;
+                }
+            }
+        }
         if handle_stream(&mut stream, &config, &request, &lan) {
             return;
         }
@@ -1494,6 +1696,55 @@ fn handle(mut stream: TcpStream, config: PathBuf, lan: Arc<Mutex<Lan>>) {
             return;
         }
     }
+}
+
+#[cfg(not(unix))]
+fn serve_mcp_sse(
+    stream: &mut TcpStream,
+    call: mcp_http::StreamingCall,
+    config: &Path,
+) -> std::io::Result<()> {
+    stream.write_all(
+        b"HTTP/1.1 200 OK\r\n\
+          Content-Type: text/event-stream\r\n\
+          Cache-Control: no-cache\r\n\
+          Connection: close\r\n\
+          Transfer-Encoding: chunked\r\n\r\n",
+    )?;
+    let mut write_error = None;
+    let response = channel::request_stream(
+        config,
+        "registry.call",
+        json!({
+            "name": call.name,
+            "arguments": call.arguments,
+            "progressToken": call.progress_token,
+        }),
+        |notification| {
+            if write_error.is_none() && write_sse_line(stream, notification).is_err() {
+                write_error = Some(());
+            }
+        },
+    );
+    let response = match response {
+        Ok(response) => mcp::finish_modern_tool_call(call.id, response),
+        Err(error) => rpc::err(call.id, -32603, &format!("svcd unreachable: {}", error)),
+    };
+    if write_error.is_none() {
+        let _ = write_sse_line(stream, &rpc::to_line(&response));
+    }
+    let _ = stream.write_all(b"0\r\n\r\n");
+    let _ = stream.flush();
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_sse_line(stream: &mut TcpStream, line: &str) -> std::io::Result<()> {
+    let payload = format!("event: message\ndata: {}\n\n", line);
+    stream.write_all(format!("{:x}\r\n", payload.len()).as_bytes())?;
+    stream.write_all(payload.as_bytes())?;
+    stream.write_all(b"\r\n")?;
+    stream.flush()
 }
 
 /// HTTP/1.1 defaults to keep-alive unless the client opts out; HTTP/1.0 is the

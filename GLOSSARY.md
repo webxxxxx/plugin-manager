@@ -67,6 +67,10 @@ _Avoid_: MCP server、stdio server
 一个可执行文件，按 argv[0]/子命令分派出 `svcd`、`svc`、`plugin`、`mcp` 四个入口。
 _Avoid_: 多合一程序、fat binary
 
+**Blob**:
+内容寻址的大对象；参数用 `$blob` 引用，结果用 `$blobPath` 交给宿主落盘，控制帧不携带内容。详见 `docs/plugin-blob.md`。
+_Avoid_: 文件缓存、附件
+
 **能力（Capability）**:
 服务拥有的一项可调用操作；在 MCP 工具面上以 `<serviceId>.<capability>` 暴露。
 _Avoid_: 工具、方法、action
