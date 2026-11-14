@@ -63,6 +63,15 @@ start so `/mcp` works without root; LAN stays disabled.
     --work /tmp/min-scale --plugins 0,5,10,30 \
     --key samples/keys/sample-2026.key --pub samples/keys/sample-2026.pub
   ```
+- `reactor_scale.py` is the Unix reactor regression: 20 shell `.spk` plugins,
+  100 concurrent operations per plugin across HTTP/SSE/WS/MCP, with daemon
+  thread sampling:
+
+  ```sh
+  python3 tools/perf/reactor_scale.py \
+    --binary target/release/svcd --work /tmp/svcd-reactor-20 \
+    --plugins 20 --concurrency 100
+  ```
 - Minimal build: `cargo build --release --no-default-features`; see
   `scale_cli.py` for its resource test.
 - In WSL, put the runtime work root on the Linux filesystem, not `/mnt/*`:
