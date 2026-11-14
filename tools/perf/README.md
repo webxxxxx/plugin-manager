@@ -90,6 +90,14 @@ start so `/mcp` works without root; LAN stays disabled.
     --binary target/release/svcd --work /tmp/svcd-reactor-soak \
     --plugins 20 --threads 1000 --duration 180
   ```
+
+- `memory_by_plugins.py` reports idle daemon RSS/VM/threads/processes for
+  several plugin counts:
+
+  ```sh
+  python3 tools/perf/memory_by_plugins.py \
+    --binary target/release/svcd --counts 0,3,10
+  ```
 - Minimal build: `cargo build --release --no-default-features`; see
   `scale_cli.py` for its resource test.
 - In WSL, put the runtime work root on the Linux filesystem, not `/mnt/*`:
