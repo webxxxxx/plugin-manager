@@ -586,7 +586,8 @@ daemon threads=163
 - **已实现**：插件每连接/每插件的 frame 队列改为有界 `sync_channel`；reactor 在队列满时暂停该插件读取。
 - **已实现**：manifest `protocol: 2` 的 4 字节长度前缀帧；已用 Python 长度帧插件在 WSL 端到端验证 `initialize` / `tools/list` / `tools/call`。
 - **已实现**：内容寻址 blob store、`POST/GET /api/v1/blobs`、工具参数中的 `$blob` 解析为受控路径（`SVCD_BLOB_DIR`）。
-- **尚未实现**：HTTP/SSE/WS 的 reactor（仍是 thread-per-connection）、工具结果 blob/streaming、MCP progress/job、以及大结果/长任务的端到端通道。
+- **已实现（Unix）**：HTTP 监听器/普通请求进入 poll reactor，阻塞 handler 由 4 个固定 worker 执行；普通 HTTP 连接不再各自创建线程。SSE/WS 暂时从 reactor 交给独立的 stream 线程（全局上限 256），因此 WS/SSE 仍是 thread-per-connection，下一步要把它们也状态机化。
+- **尚未实现**：SSE/WS reactor、工具结果 blob/streaming、MCP progress/job、以及大结果/长任务的端到端通道。
 
 ## 附录 B：相关代码位置
 

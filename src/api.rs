@@ -15,6 +15,17 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::collections::{HashMap, VecDeque};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use std::sync::atomic::AtomicUsize;
+#[cfg(unix)]
+use std::sync::Condvar;
+
 use serde_json::{json, Value};
 
 use crate::channel;
@@ -104,6 +115,12 @@ pub fn spawn(config: PathBuf) -> std::io::Result<Arc<Api>> {
         commands,
         current: current.clone(),
     });
+    #[cfg(unix)]
+    thread::Builder::new()
+        .name("svcd-http-reactor".into())
+        .stack_size(threads::IO_STACK)
+        .spawn(move || reactor_loop(Some(listener), local, receiver, lan, config, current))?;
+    #[cfg(not(unix))]
     thread::Builder::new()
         .name("svcd-http".into())
         .stack_size(threads::IO_STACK)
@@ -188,6 +205,449 @@ fn wake_listener(current: SocketAddr) {
         current
     };
     let _ = TcpStream::connect_timeout(&target, Duration::from_millis(500));
+}
+
+#[cfg(unix)]
+const MAX_STREAM_CONNECTIONS: usize = 256;
+
+#[cfg(unix)]
+static STREAM_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(unix)]
+struct HttpJob {
+    connection: u64,
+    request: HttpRequest,
+    keep_alive: bool,
+}
+
+#[cfg(unix)]
+struct JobQueue {
+    queue: Mutex<VecDeque<HttpJob>>,
+    ready: Condvar,
+}
+
+#[cfg(unix)]
+struct JobResult {
+    connection: u64,
+    response: Vec<u8>,
+    keep_alive: bool,
+}
+
+#[cfg(unix)]
+enum ConnState {
+    Reading,
+    Processing,
+    Writing,
+}
+
+#[cfg(unix)]
+struct Connection {
+    stream: TcpStream,
+    buffer: Vec<u8>,
+    out: Vec<u8>,
+    out_at: usize,
+    state: ConnState,
+    keep_alive: bool,
+}
+
+#[cfg(unix)]
+fn reactor_loop(
+    mut listener: Option<TcpListener>,
+    mut address: SocketAddr,
+    commands: Receiver<Command>,
+    lan: Arc<Mutex<Lan>>,
+    config: PathBuf,
+    current: Arc<Mutex<SocketAddr>>,
+) {
+    if let Some(active) = &listener {
+        let _ = active.set_nonblocking(true);
+    }
+    let (results_tx, results_rx) = mpsc::channel();
+    let (mut notify_rx, notify_tx) = match UnixStream::pair() {
+        Ok((rx, tx)) => (rx, tx),
+        Err(error) => {
+            log::svcd(&format!("svcd: HTTP reactor notifier failed: {}", error));
+            return;
+        }
+    };
+    let _ = notify_rx.set_nonblocking(true);
+    let _ = notify_tx.set_nonblocking(true);
+
+    let queue = Arc::new(JobQueue {
+        queue: Mutex::new(VecDeque::new()),
+        ready: Condvar::new(),
+    });
+    for _ in 0..4 {
+        let queue = queue.clone();
+        let config = config.clone();
+        let lan = lan.clone();
+        let results = results_tx.clone();
+        let notify = notify_tx.try_clone().ok();
+        let _ = thread::Builder::new()
+            .name("svcd-http-worker".into())
+            .stack_size(threads::REQUEST_STACK)
+            .spawn(move || http_worker(queue, config, lan, results, notify));
+    }
+
+    let mut connections: HashMap<u64, Connection> = HashMap::new();
+    let mut next_id: u64 = 1;
+    loop {
+        while let Ok(Command::Rebind {
+            addr: new_addr,
+            reply,
+        }) = commands.try_recv()
+        {
+            apply_rebind(&mut listener, &mut address, new_addr, reply, &current);
+            if let Some(active) = &listener {
+                let _ = active.set_nonblocking(true);
+            }
+        }
+        while let Ok(result) = results_rx.try_recv() {
+            if let Some(connection) = connections.get_mut(&result.connection) {
+                connection.out = result.response;
+                connection.out_at = 0;
+                connection.keep_alive = result.keep_alive;
+                connection.state = ConnState::Writing;
+            }
+        }
+
+        let mut descriptors: Vec<libc::pollfd> = Vec::with_capacity(connections.len() + 2);
+        let mut keys: Vec<u64> = Vec::with_capacity(connections.len() + 2);
+        descriptors.push(libc::pollfd {
+            fd: -1,
+            events: 0,
+            revents: 0,
+        });
+        keys.push(0);
+        descriptors.push(libc::pollfd {
+            fd: notify_rx.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        keys.push(1);
+        if let Some(active) = &listener {
+            descriptors[0].fd = active.as_raw_fd();
+            descriptors[0].events = libc::POLLIN;
+        }
+        for (id, connection) in &connections {
+            let mut events = 0;
+            match connection.state {
+                ConnState::Reading => events |= libc::POLLIN,
+                ConnState::Writing => events |= libc::POLLOUT,
+                ConnState::Processing => {}
+            }
+            if connection.out_at < connection.out.len() {
+                events |= libc::POLLOUT;
+            }
+            descriptors.push(libc::pollfd {
+                fd: connection.stream.as_raw_fd(),
+                events,
+                revents: 0,
+            });
+            keys.push(*id);
+        }
+
+        let ready = unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as libc::nfds_t,
+                100,
+            )
+        };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                log::svcd(&format!("svcd: HTTP reactor poll failed: {}", error));
+            }
+            continue;
+        }
+        if descriptors[1].revents & libc::POLLIN != 0 {
+            let mut drain = [0u8; 64];
+            while notify_rx.read(&mut drain).is_ok() {}
+        }
+
+        if descriptors[0].fd >= 0 && descriptors[0].revents & libc::POLLIN != 0 {
+            // A rebind probe may be the connection that woke accept; commands
+            // were already drained, so just accept the real backlog.
+            if let Some(active) = &listener {
+                loop {
+                    match active.accept() {
+                        Ok((stream, _)) => {
+                            let _ = stream.set_nonblocking(true);
+                            let id = next_id;
+                            next_id = next_id.saturating_add(1);
+                            connections.insert(
+                                id,
+                                Connection {
+                                    stream,
+                                    buffer: Vec::new(),
+                                    out: Vec::new(),
+                                    out_at: 0,
+                                    state: ConnState::Reading,
+                                    keep_alive: false,
+                                },
+                            );
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) => {
+                            log::svcd(&format!("svcd: HTTP accept failed: {}", error));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut handoffs: Vec<(TcpStream, HttpRequest)> = Vec::new();
+        for index in 2..descriptors.len() {
+            let id = keys[index];
+            let Some(connection) = connections.get_mut(&id) else {
+                continue;
+            };
+            let revents = descriptors[index].revents;
+            if revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+                connections.remove(&id);
+                continue;
+            }
+            if revents & libc::POLLIN != 0 && matches!(connection.state, ConnState::Reading) {
+                let mut chunk = [0u8; 8 * 1024];
+                match connection.stream.read(&mut chunk) {
+                    Ok(0) => {
+                        connections.remove(&id);
+                        continue;
+                    }
+                    Ok(read) => {
+                        connection.buffer.extend_from_slice(&chunk[..read]);
+                        loop {
+                            match parse_buffered_request(&connection.buffer) {
+                                Ok(None) => break,
+                                Ok(Some((request, used))) => {
+                                    connection.buffer.drain(..used);
+                                    if is_ui_stream(&request.path) {
+                                        let stream = connection.stream.try_clone();
+                                        if let Ok(stream) = stream {
+                                            handoffs.push((stream, request));
+                                        }
+                                        connections.remove(&id);
+                                        break;
+                                    }
+                                    let keep_alive = wants_keep_alive(&request);
+                                    queue.push(HttpJob {
+                                        connection: id,
+                                        request,
+                                        keep_alive,
+                                    });
+                                    connection.state = ConnState::Processing;
+                                    break;
+                                }
+                                Err(response) => {
+                                    connection.out = response;
+                                    connection.out_at = 0;
+                                    connection.keep_alive = false;
+                                    connection.state = ConnState::Writing;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => {
+                        connections.remove(&id);
+                        continue;
+                    }
+                }
+            }
+            let Some(connection) = connections.get_mut(&id) else {
+                continue;
+            };
+            if revents & libc::POLLOUT != 0 || connection.out_at < connection.out.len() {
+                match connection
+                    .stream
+                    .write(&connection.out[connection.out_at..])
+                {
+                    Ok(0) => {
+                        connections.remove(&id);
+                        continue;
+                    }
+                    Ok(written) => {
+                        connection.out_at += written;
+                        if connection.out_at >= connection.out.len() {
+                            connection.out.clear();
+                            connection.out_at = 0;
+                            if connection.keep_alive {
+                                connection.state = ConnState::Reading;
+                            } else {
+                                connections.remove(&id);
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => {
+                        connections.remove(&id);
+                    }
+                }
+            }
+        }
+
+        for (stream, request) in handoffs {
+            if STREAM_CONNECTIONS.fetch_add(1, Ordering::SeqCst) >= MAX_STREAM_CONNECTIONS {
+                STREAM_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+                let mut stream = stream;
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.write_all(&error(
+                    429,
+                    "too_many_streams",
+                    "too many stream connections",
+                ));
+                continue;
+            }
+            let config = config.clone();
+            let lan = lan.clone();
+            let _ = thread::Builder::new()
+                .name("svcd-http-stream".into())
+                .stack_size(threads::REQUEST_STACK)
+                .spawn(move || {
+                    let mut stream = stream;
+                    let _ = stream.set_nonblocking(false);
+                    let _ = handle_stream(&mut stream, &config, &request, &lan);
+                    STREAM_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+                });
+        }
+    }
+}
+
+#[cfg(unix)]
+impl JobQueue {
+    fn push(&self, job: HttpJob) {
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.push_back(job);
+            self.ready.notify_one();
+        }
+    }
+
+    fn pop(&self) -> HttpJob {
+        let mut queue = self.queue.lock().unwrap_or_else(|error| error.into_inner());
+        loop {
+            if let Some(job) = queue.pop_front() {
+                return job;
+            }
+            queue = self
+                .ready
+                .wait(queue)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn http_worker(
+    queue: Arc<JobQueue>,
+    config: PathBuf,
+    lan: Arc<Mutex<Lan>>,
+    results: Sender<JobResult>,
+    notify: Option<UnixStream>,
+) {
+    loop {
+        let job = queue.pop();
+        let mut response = respond(&config, &job.request, &lan);
+        if job.keep_alive {
+            response = keep_alive_response(response);
+        }
+        if results
+            .send(JobResult {
+                connection: job.connection,
+                response,
+                keep_alive: job.keep_alive,
+            })
+            .is_err()
+        {
+            return;
+        }
+        if let Some(notify) = &notify {
+            let _ = (&*notify).write(&[1]);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn is_ui_stream(path: &str) -> bool {
+    let path = path.split_once('?').map(|(path, _)| path).unwrap_or(path);
+    let Some(rest) = path.strip_prefix("/plugin-ui/") else {
+        return false;
+    };
+    let Some((_, sub)) = rest.split_once('/') else {
+        return false;
+    };
+    sub == "events" || sub == "ws"
+}
+
+#[cfg(unix)]
+fn parse_buffered_request(buffer: &[u8]) -> Result<Option<(HttpRequest, usize)>, Vec<u8>> {
+    let Some(header_end) = find_header_end(buffer) else {
+        if buffer.len() > MAX_HEADER {
+            return Err(error(400, "bad_request", "request headers are too large"));
+        }
+        return Ok(None);
+    };
+    if header_end > MAX_HEADER {
+        return Err(error(400, "bad_request", "request headers are too large"));
+    }
+    let request = http::parse(&buffer[..header_end + 4])
+        .ok_or_else(|| error(400, "bad_request", "malformed request line"))?;
+    let version = std::str::from_utf8(&buffer[..header_end])
+        .ok()
+        .and_then(|head| head.lines().next())
+        .and_then(|line| line.split_whitespace().nth(2))
+        .unwrap_or("HTTP/1.1")
+        .to_string();
+    let content_length = request
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    if request
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"))
+    {
+        return Err(error(
+            400,
+            "bad_request",
+            "chunked bodies are not supported",
+        ));
+    }
+    let limit = if request.path.starts_with("/api/v1/plugins")
+        || request.path.starts_with("/api/v1/import")
+        || request.path.starts_with("/api/v1/blobs")
+    {
+        MAX_BODY
+    } else {
+        MAX_JSON_BODY
+    };
+    if content_length > limit {
+        return Err(error(413, "payload_too_large", "request body is too large"));
+    }
+    let body_start = header_end + 4;
+    let total = body_start.saturating_add(content_length as usize);
+    if buffer.len() < total {
+        return Ok(None);
+    }
+    let body = buffer[body_start..total].to_vec();
+    Ok(Some((
+        HttpRequest {
+            method: request.method.to_string(),
+            path: request.path.to_string(),
+            version,
+            headers: request
+                .headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            body,
+        },
+        total,
+    )))
 }
 
 fn listener_loop(
