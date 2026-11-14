@@ -2,6 +2,7 @@
 mod api;
 mod auth;
 mod bundle;
+mod catalog;
 mod channel;
 mod daemon;
 mod definition;
@@ -21,6 +22,8 @@ mod paths;
 mod plugin;
 mod plugin_cli;
 mod proc;
+#[cfg(unix)]
+mod reactor;
 mod registry;
 mod rpc;
 mod script;

@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use crate::api::{self, Api};
 #[cfg(not(feature = "http"))]
 type Api = ();
+use crate::catalog;
 use crate::channel;
 use crate::definition;
 use crate::lan::LanStatus;
@@ -23,6 +24,8 @@ use crate::mcp;
 use crate::package;
 use crate::paths;
 use crate::plugin::{self, Strategy};
+#[cfg(unix)]
+use crate::reactor::Reactor;
 use crate::registry::{Hook, Kind, Registry, Service, State, RESERVED_ID};
 use crate::rpc;
 use crate::settings;
@@ -138,6 +141,20 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
 
     let mut daemon = Daemon::new(loaded.registry, token, rx, api);
     daemon.set_wake(wake);
+    #[cfg(unix)]
+    {
+        let reactor = match Reactor::start() {
+            Ok(reactor) => Some(reactor),
+            Err(error) => {
+                log::svcd(&format!(
+                    "svcd: reactor unavailable; using per-plugin reader threads: {}",
+                    error
+                ));
+                None
+            }
+        };
+        daemon.set_reactor(reactor);
+    }
     install_shutdown_signal();
     daemon.start_enabled();
     daemon.event_loop();
@@ -229,6 +246,10 @@ struct Daemon {
     shutdown: bool,
     started: Instant,
     epoch_at_start: SystemTime,
+    catalog_version: u64,
+    catalog_cache: Option<(u64, Vec<Value>)>,
+    #[cfg(unix)]
+    reactor: Option<Arc<Reactor>>,
 }
 
 impl Daemon {
@@ -263,6 +284,10 @@ impl Daemon {
             shutdown: false,
             started: Instant::now(),
             epoch_at_start: SystemTime::now(),
+            catalog_version: 1,
+            catalog_cache: None,
+            #[cfg(unix)]
+            reactor: None,
         }
     }
 
@@ -274,6 +299,14 @@ impl Daemon {
         self.wake = wake.clone();
         for slot in self.slots.values_mut() {
             slot.set_wake(wake.clone());
+        }
+    }
+
+    #[cfg(unix)]
+    fn set_reactor(&mut self, reactor: Option<Arc<Reactor>>) {
+        self.reactor = reactor.clone();
+        for slot in self.slots.values_mut() {
+            slot.set_reactor(reactor.clone());
         }
     }
 
@@ -372,10 +405,11 @@ impl Daemon {
                 self.shutdown = true;
                 rpc::ok(id, json!({"ok": true}))
             }
-            "registry.tools" | "tools/list" => rpc::ok(id, json!({ "tools": self.tool_list() })),
-            "registry.version" => {
-                rpc::ok(id, json!({ "version": tool_version(&self.tool_list()) }))
-            }
+            "registry.tools" | "tools/list" => match self.tools_page(&request.params) {
+                Ok(value) => rpc::ok(id, value),
+                Err(message) => rpc::err(id, -32602, &message),
+            },
+            "registry.version" => rpc::ok(id, json!({ "version": self.catalog_version })),
             "svc.list" => rpc::ok(id, json!({"services": self.statuses()})),
             "svc.status" => match param_id(&request) {
                 Ok(service_id) => match self.status_for_id(&service_id) {
@@ -537,6 +571,45 @@ impl Daemon {
 
     fn tool_list(&self) -> Vec<Value> {
         mcp::tools(&self.registry, |id| self.is_live(id))
+    }
+
+    /// Invalidate the cached tool projection. The cache is keyed by the
+    /// catalog version so a page is always cut from one stable snapshot.
+    fn bump_catalog(&mut self) {
+        self.catalog_version = self.catalog_version.wrapping_add(1);
+        self.catalog_cache = None;
+    }
+
+    fn tool_list_cached(&mut self) -> &[Value] {
+        let fresh = self
+            .catalog_cache
+            .as_ref()
+            .map(|(version, _)| *version == self.catalog_version)
+            .unwrap_or(false);
+        if !fresh {
+            let tools = self.tool_list();
+            self.catalog_cache = Some((self.catalog_version, tools));
+        }
+        &self
+            .catalog_cache
+            .as_ref()
+            .expect("catalog cache was just populated")
+            .1
+    }
+
+    fn tools_page(&mut self, params: &Value) -> Result<Value, String> {
+        let cursor = params.get("cursor").and_then(Value::as_str);
+        let limit = params
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|value| value.min(usize::MAX as u64) as usize);
+        let version = self.catalog_version;
+        let page = catalog::page(self.tool_list_cached(), version, cursor, limit)?;
+        let mut result = json!({ "tools": page.tools });
+        if let Some(cursor) = page.next_cursor {
+            result["nextCursor"] = json!(cursor);
+        }
+        Ok(result)
     }
 
     /// Handle tools/call. Plugin calls are deferred: the plugin response arrives
@@ -843,11 +916,14 @@ impl Daemon {
                     Slot::new(id.clone(), exec, service.lifecycle.clone(), service.enabled);
                 slot.set_protocol_only(true);
                 slot.set_wake(self.wake.clone());
+                #[cfg(unix)]
+                slot.set_reactor(self.reactor.clone());
                 self.slots.insert(id.clone(), slot);
             }
         }
         self.registry.remove(&id);
         self.registry.insert(service)?;
+        self.bump_catalog();
         log::svcd(&format!(
             "svcd: plugin {} {} installed ({})",
             id,
@@ -891,6 +967,7 @@ impl Daemon {
         plugin::uninstall(id, purge)?;
         self.slots.remove(id);
         self.registry.remove(id);
+        self.bump_catalog();
         if purge {
             plugin::remove_logs(id);
             #[cfg(feature = "http")]
@@ -983,10 +1060,18 @@ impl Daemon {
     fn pump(&mut self) {
         let now = self.now_ms();
         let ids: Vec<String> = self.slots.keys().cloned().collect();
+        let mut changed = false;
         for id in ids {
             let mut slot = self.slots.remove(&id).expect("slot");
+            let before = slot.machine.state;
             slot.pump(now);
+            if slot.machine.state != before {
+                changed = true;
+            }
             self.slots.insert(id, slot);
+        }
+        if changed {
+            self.bump_catalog();
         }
     }
 
@@ -1068,17 +1153,6 @@ fn status_response(
 
 fn status_json(status: Status) -> Value {
     serde_json::to_value(status).unwrap_or(Value::Null)
-}
-
-fn tool_version(tools: &[Value]) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    serde_json::to_string(tools)
-        .unwrap_or_default()
-        .hash(&mut hasher);
-    hasher.finish()
 }
 
 fn send(reply: &Sender<String>, response: rpc::Response) {
@@ -1590,6 +1664,74 @@ while ($null -ne ($line = $reader.ReadLine())) {
 
         daemon.slots.get_mut("plug").expect("slot").machine.state = State::Backoff;
         assert_eq!(daemon.tool_list().len(), 1);
+    }
+
+    #[test]
+    fn an_eighty_plugin_catalog_is_returned_in_bounded_pages() {
+        let services: Vec<Service> = (0..80)
+            .map(|index| {
+                let mut service = plugin(&format!("p{index}"), &[]);
+                service.caps = (0..20)
+                    .map(|cap| capability(&format!("cap{cap}")))
+                    .collect();
+                service
+            })
+            .collect();
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(registry(services), "token".into(), receiver, None);
+        for slot in daemon.slots.values_mut() {
+            slot.machine.state = State::Running;
+        }
+
+        let mut cursor = None;
+        let mut total = 0usize;
+        loop {
+            let params = match &cursor {
+                Some(cursor) => json!({"limit": 100, "cursor": cursor}),
+                None => json!({"limit": 100}),
+            };
+            let page = daemon.tools_page(&params).expect("page");
+            let tools = page["tools"].as_array().expect("tools");
+            assert!(!tools.is_empty());
+            assert!(
+                serde_json::to_vec(tools).expect("serialize").len() <= crate::ipc::CATALOG_PAGE_MAX
+            );
+            total += tools.len();
+            cursor = page["nextCursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(total, 80 * 21);
+    }
+
+    #[test]
+    fn tool_pages_are_stable_and_reject_stale_cursors() {
+        let registry = registry(vec![
+            plugin("a", &["x"]),
+            plugin("b", &["y"]),
+            plugin("c", &["z"]),
+        ]);
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(registry, "token".into(), receiver, None);
+
+        let first = daemon.tools_page(&json!({"limit": 2})).expect("first page");
+        assert_eq!(first["tools"].as_array().expect("tools").len(), 2);
+        let cursor = first["nextCursor"]
+            .as_str()
+            .expect("next cursor")
+            .to_string();
+
+        let second = daemon
+            .tools_page(&json!({"limit": 2, "cursor": cursor}))
+            .expect("second page");
+        assert_eq!(second["tools"].as_array().expect("tools").len(), 1);
+        assert!(second.get("nextCursor").is_none());
+
+        let stale = daemon
+            .tools_page(&json!({"limit": 2, "cursor": "bm90LWEtY3Vyc29y"}))
+            .expect_err("invalid cursor");
+        assert!(stale.contains("cursor"), "{stale}");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -34,6 +34,8 @@ pub(crate) struct Slot {
     stdin: Option<ChildStdin>,
     frames: Option<Receiver<FrameEvent>>,
     wake: Option<Arc<Wake>>,
+    #[cfg(unix)]
+    reactor: Option<Arc<crate::reactor::Reactor>>,
     log: Option<Arc<Mutex<LogSink>>>,
     /// Plugins must keep stdout protocol-only; core scripts may still print
     /// human-readable output, which is logged for diagnosis.
@@ -85,6 +87,8 @@ impl Slot {
             stdin: None,
             frames: None,
             wake: None,
+            #[cfg(unix)]
+            reactor: None,
             log: None,
             protocol_only: false,
             pending: BTreeMap::new(),
@@ -115,6 +119,11 @@ impl Slot {
 
     pub(crate) fn set_wake(&mut self, wake: Arc<Wake>) {
         self.wake = Some(wake);
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn set_reactor(&mut self, reactor: Option<Arc<crate::reactor::Reactor>>) {
+        self.reactor = reactor;
     }
 
     /// Start the stop hook before the state machine begins stopping. The hook
@@ -162,13 +171,13 @@ impl Slot {
             "params": { "name": capability, "arguments": arguments },
         })
         .to_string();
-        if frame.len() > ipc::MAX_FRAME_BYTES {
+        if frame.len() > ipc::CALL_FRAME_MAX {
             return Err(CallError::TooLarge);
         }
         let Some(stdin) = self.stdin.as_mut() else {
             return Err(CallError::NotLive);
         };
-        if let Err(error) = ipc::write_frame(stdin, &frame) {
+        if let Err(error) = ipc::write_frame_limit(stdin, &frame, ipc::CALL_FRAME_MAX) {
             return Err(CallError::Write(error.to_string()));
         }
         self.pending.insert(
@@ -330,9 +339,26 @@ impl Slot {
             };
 
             let (sender, receiver) = mpsc::channel();
-            if let Err(error) = ipc::spawn_reader(
-                format!("svcd-{}-stdout", self.id),
+            #[cfg(unix)]
+            if let Some(reactor) = self.reactor.clone() {
+                if let Err(error) = reactor.register(
+                    self.id.clone(),
+                    stdout,
+                    Some(stderr),
+                    sender,
+                    self.wake.clone(),
+                    log.clone(),
+                    ipc::CALL_FRAME_MAX,
+                ) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error.to_string());
+                }
+            } else if let Err(error) = spawn_thread_readers(
+                &self.id,
                 stdout,
+                stderr,
+                log.clone(),
                 sender,
                 self.wake.clone(),
             ) {
@@ -340,18 +366,15 @@ impl Slot {
                 let _ = child.wait();
                 return Err(error.to_string());
             }
-
-            let stderr_log = log.clone();
-            if let Err(error) = thread::Builder::new()
-                .name(format!("svcd-{}-stderr", self.id))
-                .stack_size(threads::IO_STACK)
-                .spawn(move || {
-                    let reader = BufReader::new(stderr);
-                    for line in reader.lines().map_while(Result::ok) {
-                        log_line(&stderr_log, &line);
-                    }
-                })
-            {
+            #[cfg(not(unix))]
+            if let Err(error) = spawn_thread_readers(
+                &self.id,
+                stdout,
+                stderr,
+                log.clone(),
+                sender,
+                self.wake.clone(),
+            ) {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(error.to_string());
@@ -430,7 +453,7 @@ impl Slot {
                 "params": {},
             })
             .to_string();
-            let _ = ipc::write_frame(stdin, &line);
+            let _ = ipc::write_frame_limit(stdin, &line, ipc::CONTROL_FRAME_MAX);
         }
     }
 
@@ -444,8 +467,8 @@ impl Slot {
         for event in events {
             match event {
                 FrameEvent::Frame(Ok(line)) => self.handle_frame(&line, now),
-                FrameEvent::Frame(Err(FrameError::TooLarge)) => {
-                    self.protocol_violation("frame exceeds 1 MiB");
+                FrameEvent::Frame(Err(FrameError::TooLarge { max })) => {
+                    self.protocol_violation(&format!("frame exceeds {} bytes", max));
                     break;
                 }
                 FrameEvent::Frame(Err(FrameError::InvalidUtf8)) => {
@@ -585,7 +608,7 @@ impl Slot {
     fn write_notification(&mut self, method: &str, params: Value) {
         if let Some(stdin) = self.stdin.as_mut() {
             let frame = rpc::notification(method, params);
-            let _ = ipc::write_frame(stdin, &frame);
+            let _ = ipc::write_frame_limit(stdin, &frame, ipc::CONTROL_FRAME_MAX);
         }
     }
 
@@ -825,7 +848,7 @@ impl Slot {
     fn signal_polite(&mut self) {
         if let Some(stdin) = self.stdin.as_mut() {
             let line = rpc::notification("svcd.shutdown", json!({}));
-            let _ = ipc::write_frame(stdin, &line);
+            let _ = ipc::write_frame_limit(stdin, &line, ipc::CONTROL_FRAME_MAX);
         }
         self.stdin = None;
         #[cfg(unix)]
@@ -887,6 +910,10 @@ impl Slot {
 
     fn clear_process(&mut self) {
         self.fail_pending("service exited");
+        #[cfg(unix)]
+        if let Some(reactor) = &self.reactor {
+            reactor.unregister(&self.id);
+        }
         self.child = None;
         self.stdin = None;
         self.frames = None;
@@ -995,6 +1022,35 @@ fn log_line(log: &Option<Arc<Mutex<LogSink>>>, line: &str) {
             let _ = sink.line(line);
         }
     }
+}
+
+/// Fallback used on Windows and whenever the reactor is unavailable.
+fn spawn_thread_readers(
+    id: &str,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    log: Option<Arc<Mutex<LogSink>>>,
+    sender: mpsc::Sender<FrameEvent>,
+    wake: Option<Arc<Wake>>,
+) -> std::io::Result<()> {
+    ipc::spawn_reader_limit(
+        format!("svcd-{}-stdout", id),
+        stdout,
+        sender,
+        wake,
+        ipc::CALL_FRAME_MAX,
+    )?;
+    let stderr_log = log;
+    thread::Builder::new()
+        .name(format!("svcd-{}-stderr", id))
+        .stack_size(threads::IO_STACK)
+        .spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                log_line(&stderr_log, &line);
+            }
+        })?;
+    Ok(())
 }
 
 #[cfg(test)]

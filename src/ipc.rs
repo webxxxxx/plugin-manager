@@ -14,14 +14,28 @@ use std::thread;
 use crate::threads;
 use crate::wake::Wake;
 
-/// One JSON-RPC message may not exceed this many bytes, excluding the LF.
-pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+/// One control-plane JSON-RPC message (ping, status, cancel) may not exceed
+/// this many bytes. Keeping it small makes accidental bulk data visible at the
+/// protocol boundary instead of letting one message pin a large buffer.
+pub const CONTROL_FRAME_MAX: usize = 256 * 1024;
+/// One inline tool-call request/response may not exceed this many bytes.
+/// Larger tool payloads belong in the blob data plane, not in a control frame.
+pub const CALL_FRAME_MAX: usize = 1024 * 1024;
+/// One catalog page. Pages are intentionally smaller than a call frame so a
+/// page is never the reason the MCP bridge hits its output limit.
+pub const CATALOG_PAGE_MAX: usize = 256 * 1024;
+/// The legacy/local management channel carries small JSON-RPC envelopes.
+pub const LOCAL_FRAME_MAX: usize = 1024 * 1024;
+/// Backwards-compatible default for call sites that have not chosen a class.
+pub const MAX_FRAME_BYTES: usize = CALL_FRAME_MAX;
 
 #[derive(Debug)]
 pub enum FrameError {
     Io(io::Error),
-    /// The peer produced a frame larger than MAX_FRAME_BYTES.
-    TooLarge,
+    /// The peer produced a frame larger than the limit for this transport.
+    TooLarge {
+        max: usize,
+    },
     /// The peer produced bytes that are not valid UTF-8.
     InvalidUtf8,
 }
@@ -30,15 +44,41 @@ impl std::fmt::Display for FrameError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FrameError::Io(error) => write!(formatter, "{}", error),
-            FrameError::TooLarge => write!(formatter, "frame exceeds {} bytes", MAX_FRAME_BYTES),
+            FrameError::TooLarge { max } => write!(formatter, "frame exceeds {} bytes", max),
             FrameError::InvalidUtf8 => write!(formatter, "frame is not valid UTF-8"),
+        }
+    }
+}
+
+impl From<FrameError> for io::Error {
+    fn from(error: FrameError) -> Self {
+        match error {
+            FrameError::Io(error) => error,
+            FrameError::TooLarge { max } => io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("frame exceeds {} bytes", max),
+            ),
+            FrameError::InvalidUtf8 => {
+                io::Error::new(io::ErrorKind::InvalidData, "frame is not valid UTF-8")
+            }
         }
     }
 }
 
 /// Read exactly one LF-terminated frame. The returned string excludes the LF
 /// but keeps every other byte, including a trailing CR.
+#[allow(dead_code)]
 pub fn read_frame<R: BufRead + ?Sized>(reader: &mut R) -> Result<Option<String>, FrameError> {
+    read_frame_limit(reader, MAX_FRAME_BYTES)
+}
+
+/// Read one frame with an explicit transport limit. The buffer never grows
+/// beyond `max` bytes; an oversized peer is reported without consuming the
+/// rest of the stream.
+pub fn read_frame_limit<R: BufRead + ?Sized>(
+    reader: &mut R,
+    max: usize,
+) -> Result<Option<String>, FrameError> {
     let mut bytes = Vec::new();
     loop {
         let available = match reader.fill_buf() {
@@ -56,8 +96,8 @@ pub fn read_frame<R: BufRead + ?Sized>(reader: &mut R) -> Result<Option<String>,
             )));
         }
         if let Some(position) = available.iter().position(|byte| *byte == b'\n') {
-            if bytes.len() + position > MAX_FRAME_BYTES {
-                return Err(FrameError::TooLarge);
+            if bytes.len() + position > max {
+                return Err(FrameError::TooLarge { max });
             }
             bytes.extend_from_slice(&available[..position]);
             reader.consume(position + 1);
@@ -65,8 +105,8 @@ pub fn read_frame<R: BufRead + ?Sized>(reader: &mut R) -> Result<Option<String>,
                 .map(Some)
                 .map_err(|_| FrameError::InvalidUtf8);
         }
-        if bytes.len() + available.len() > MAX_FRAME_BYTES {
-            return Err(FrameError::TooLarge);
+        if bytes.len() + available.len() > max {
+            return Err(FrameError::TooLarge { max });
         }
         let length = available.len();
         bytes.extend_from_slice(available);
@@ -77,10 +117,19 @@ pub fn read_frame<R: BufRead + ?Sized>(reader: &mut R) -> Result<Option<String>,
 /// Write one LF-terminated frame. Callers pass serialized JSON, so an embedded
 /// newline would mean the contract was broken before this point.
 pub fn write_frame<W: Write + ?Sized>(writer: &mut W, frame: &str) -> io::Result<()> {
-    if frame.len() > MAX_FRAME_BYTES {
+    write_frame_limit(writer, frame, MAX_FRAME_BYTES)
+}
+
+/// Write one frame with an explicit transport limit.
+pub fn write_frame_limit<W: Write + ?Sized>(
+    writer: &mut W,
+    frame: &str,
+    max: usize,
+) -> io::Result<()> {
+    if frame.len() > max {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "frame exceeds the 1 MiB limit",
+            format!("frame exceeds the {} byte limit", max),
         ));
     }
     if frame.contains('\n') {
@@ -110,13 +159,25 @@ pub fn spawn_reader<R: Read + Send + 'static>(
     sender: Sender<FrameEvent>,
     wake: Option<Arc<Wake>>,
 ) -> io::Result<()> {
+    spawn_reader_limit(name, stream, sender, wake, MAX_FRAME_BYTES)
+}
+
+/// Spawn a frame reader with an explicit transport limit. Plugins use the
+/// inline call limit; the MCP bridge uses the same limit for its stdout.
+pub fn spawn_reader_limit<R: Read + Send + 'static>(
+    name: String,
+    stream: R,
+    sender: Sender<FrameEvent>,
+    wake: Option<Arc<Wake>>,
+    max: usize,
+) -> io::Result<()> {
     thread::Builder::new()
         .name(name)
         .stack_size(threads::IO_STACK)
         .spawn(move || {
             let mut reader = io::BufReader::new(stream);
             loop {
-                let event = match read_frame(&mut reader) {
+                let event = match read_frame_limit(&mut reader, max) {
                     Ok(Some(line)) => FrameEvent::Frame(Ok(line)),
                     Ok(None) => FrameEvent::Closed,
                     Err(error) => FrameEvent::Frame(Err(error)),
@@ -201,8 +262,26 @@ mod tests {
 
         assert!(matches!(
             read_frame(&mut BufReader::new(input.as_slice())),
-            Err(FrameError::TooLarge)
+            Err(FrameError::TooLarge {
+                max: MAX_FRAME_BYTES
+            })
         ));
+    }
+
+    #[test]
+    fn an_explicit_limit_is_enforced_for_reads_and_writes() {
+        let mut input = b"0123456789\n".to_vec();
+        assert!(matches!(
+            read_frame_limit(&mut BufReader::new(input.as_slice()), 10),
+            Ok(Some(frame)) if frame == "0123456789"
+        ));
+        input.truncate(10);
+        assert!(matches!(
+            read_frame_limit(&mut BufReader::new(input.as_slice()), 9),
+            Err(FrameError::TooLarge { max: 9 })
+        ));
+        assert!(write_frame_limit(&mut Vec::new(), "0123456789", 10).is_ok());
+        assert!(write_frame_limit(&mut Vec::new(), "0123456789", 9).is_err());
     }
 
     #[test]

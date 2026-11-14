@@ -1,11 +1,13 @@
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use imp::{Listener, Stream};
 
+use crate::ipc;
+use crate::rpc;
 use crate::threads;
 
 pub struct PendingCall {
@@ -109,11 +111,19 @@ pub fn spawn_server(
 
 fn serve(stream: Stream, tx: Sender<PendingCall>, wake: std::sync::Arc<crate::wake::Wake>) {
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    match reader.read_line(&mut line) {
-        Ok(0) | Err(_) => return,
-        Ok(_) => {}
-    }
+    let line = match ipc::read_frame_limit(&mut reader, ipc::LOCAL_FRAME_MAX) {
+        Ok(Some(line)) => line,
+        Ok(None) => return,
+        Err(error) => {
+            let response = rpc::err(None, -32700, &format!("invalid frame: {}", error));
+            let _ = ipc::write_frame_limit(
+                reader.get_mut(),
+                &rpc::to_line(&response),
+                ipc::LOCAL_FRAME_MAX,
+            );
+            return;
+        }
+    };
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     if tx
         .send(PendingCall {
@@ -126,8 +136,7 @@ fn serve(stream: Stream, tx: Sender<PendingCall>, wake: std::sync::Arc<crate::wa
     }
     wake.notify();
     if let Ok(response) = reply_rx.recv() {
-        let _ = reader.get_mut().write_all(response.as_bytes());
-        let _ = reader.get_mut().flush();
+        let _ = ipc::write_frame_limit(reader.get_mut(), &response, ipc::LOCAL_FRAME_MAX);
     }
 }
 
@@ -151,13 +160,11 @@ pub fn request(
         "auth": token,
     })
     .to_string();
-    stream.write_all(line.as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
+    ipc::write_frame_limit(&mut stream, &line, ipc::LOCAL_FRAME_MAX)?;
 
     let mut reader = BufReader::new(stream);
-    let mut response = String::new();
-    reader.read_line(&mut response)?;
+    let response = ipc::read_frame_limit(&mut reader, ipc::LOCAL_FRAME_MAX)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "empty response frame"))?;
     serde_json::from_str(&response)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }

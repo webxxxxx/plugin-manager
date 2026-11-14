@@ -74,15 +74,6 @@ fn tool_error_result(message: &str) -> Value {
     result_value(message.to_string(), true)
 }
 
-fn tools_from_result(result: Option<Value>) -> Vec<Value> {
-    result
-        .unwrap_or_else(|| json!({}))
-        .get("tools")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-}
-
 fn error_response(id: Option<Value>, error: rpc::Error) -> rpc::Response {
     rpc::Response {
         jsonrpc: "2.0".into(),
@@ -197,7 +188,7 @@ pub fn serve_modern(config: &Path, request: &rpc::Request) -> Served {
     match request.method.as_str() {
         "server/discover" => Served::Respond(discover(id)),
         "tools/list" => {
-            let (response, fatal) = tools_list(config, id, Era::Modern);
+            let (response, fatal) = tools_list(config, id, Era::Modern, &request.params);
             Served::new(response, fatal)
         }
         "tools/call" => {
@@ -268,21 +259,36 @@ impl Bridge {
         match request.method.as_str() {
             "initialize" => (self.initialize(id, &request.params), false),
             "ping" => (rpc::ok(id, json!({})), false),
-            "tools/list" => tools_list(&self.config, id, Era::Legacy),
+            "tools/list" => tools_list(&self.config, id, Era::Legacy, &request.params),
             "tools/call" => tools_call(&self.config, id, Era::Legacy, &request.params),
             _ => (rpc::err(id, -32601, "method not found"), false),
         }
     }
 }
 
-fn tools_list(config: &Path, id: Option<Value>, era: Era) -> (rpc::Response, bool) {
-    match channel::request(config, "registry.tools", json!({})) {
+fn tools_list(config: &Path, id: Option<Value>, era: Era, params: &Value) -> (rpc::Response, bool) {
+    let mut request = json!({});
+    if let Some(cursor) = params.get("cursor").and_then(Value::as_str) {
+        request["cursor"] = json!(cursor);
+    }
+    if let Some(limit) = params.get("limit").and_then(Value::as_u64) {
+        request["limit"] = json!(limit);
+    }
+    match channel::request(config, "registry.tools", request) {
         Ok(response) => {
             if let Some(error) = response.error {
                 return (error_response(id, error), false);
             }
-            let tools = tools_from_result(response.result);
+            let result_value = response.result.unwrap_or_else(|| json!({}));
+            let tools = result_value
+                .get("tools")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             let mut result = json!({ "tools": tools });
+            if let Some(next_cursor) = result_value.get("nextCursor") {
+                result["nextCursor"] = next_cursor.clone();
+            }
             if era == Era::Modern {
                 result["resultType"] = json!("complete");
                 result["ttlMs"] = json!(TTL_MS);

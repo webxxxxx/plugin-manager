@@ -844,6 +844,41 @@ fn multiple_bridges_can_share_one_svcd() {
 }
 
 #[test]
+fn modern_bridge_paginates_tools_with_a_stable_cursor() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    sandbox.start_plugin();
+    let mut mcp = sandbox.spawn_mcp("paged");
+
+    let first = mcp.request(1, "tools/list", modern_params(json!({"limit": 1})));
+    let first_result = first.get("result").expect("first result");
+    let first_names = tool_names(&first_result["tools"]);
+    assert_eq!(first_names.len(), 1);
+    let cursor = first_result["nextCursor"]
+        .as_str()
+        .expect("next cursor")
+        .to_string();
+
+    let second = mcp.request(
+        2,
+        "tools/list",
+        modern_params(json!({"limit": 1, "cursor": cursor})),
+    );
+    let second_result = second.get("result").expect("second result");
+    let second_names = tool_names(&second_result["tools"]);
+    assert_eq!(second_names.len(), 1);
+    assert_ne!(first_names, second_names);
+
+    let bad = mcp.request(
+        3,
+        "tools/list",
+        modern_params(json!({"limit": 1, "cursor": "bm90LWEtY3Vyc29y"})),
+    );
+    assert_eq!(bad["error"]["code"], -32602);
+}
+
+#[test]
 fn http_mcp_requires_a_bearer_and_ignores_cookies() {
     let (_sandbox, address, token) = http_sandbox(true);
 
