@@ -67,13 +67,15 @@ svcd stop
 `--install`、`--uninstall` 会按当前用户自动判断，不需要 `svcd user install`。  
 `--prefix`、`--conf`/`--config`、`--manual`、`--no-service`、`--dry-run` 都保留；`--target` 在 user mode 下接受但忽略（不会注册系统服务）。
 
+`--uninstall` 会先停止用户 daemon，再删除二进制；如果 `svc`/`plugin`/`mcp` 进程仍占用文件，会给出 warning 并继续，关闭对应进程后再次执行即可。
+
 Windows 安装会把 `<data>\\bin` 追加到当前用户的 `HKCU\\Environment\\Path`，并广播环境变更；**新开一个终端**即可直接使用 `svcd` / `svc` / `plugin` / `mcp`。已有终端仍使用旧 PATH，需要重新打开或执行：
 
 ```powershell
 $env:Path = "$env:LOCALAPPDATA\svcd\bin;$env:Path"
 ```
 
-Linux/macOS 安装会打印 `<data>/bin` 路径；如果该目录不在 PATH，需要把它加入 shell 配置（例如 `~/.profile`）。
+Linux/macOS 安装会把同一个目录写进 shell 配置（`.profile`，以及存在的 `.bashrc` / `.zshrc`）；重新打开 shell 或 source 对应文件后即可直接使用。
 
 `svcd user start|stop|status|install` 仍保留为兼容别名，分别对应顶层 `svcd start|stop|status|--install`。
 
@@ -107,7 +109,7 @@ Copy-Item .\svcd.exe "$env:LOCALAPPDATA\Temp\svcd.exe" -Force
 svcd run --foreground
 ```
 
-`start` 使用当前可执行文件，日志写到用户日志目录；默认 HTTP 端口是 `0`（临时端口），避免每个用户抢 `8787`。
+`start` 使用当前可执行文件，日志写到用户日志目录；默认 HTTP 端口与 root 一致，是 `8787`。多个用户同时运行时要各自在 `svcd.conf` 里改成不同端口，否则会冲突。
 
 ## 安装插件
 

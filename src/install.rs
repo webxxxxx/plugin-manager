@@ -213,11 +213,7 @@ pub fn ensure_conf(explicit: Option<&Path>) -> Result<PathBuf, String> {
         return Ok(config_conf);
     }
 
-    let mut text = default_conf_text(&layout);
-    if crate::paths::user_mode() {
-        // One daemon per user: don't let every profile contend for 8787.
-        text = text.replace("http_port = 8787", "http_port = 0");
-    }
+    let text = default_conf_text(&layout);
     let mut failures = Vec::new();
     match write_conf(&config_conf, &text) {
         Ok(()) => {
@@ -1524,6 +1520,59 @@ fn add_user_path(dir: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
+#[cfg(unix)]
+fn add_user_path(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is not set".to_string())?;
+    let escaped = dir
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`");
+    let block = format!(
+        "# svcd user path\n\
+         if [ -d \"{}\" ]; then\n\
+           case \":$PATH:\" in\n\
+             *\":{}\"*) ;;\n\
+             *) export PATH=\"{}:$PATH\" ;;\n\
+           esac\n\
+         fi\n",
+        escaped, escaped, escaped
+    );
+    let mut files = Vec::new();
+    for name in [".profile", ".bashrc", ".zshrc"] {
+        let path = home.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let text = fs::read_to_string(&path)
+            .map_err(|error| format!("read {}: {}", path.display(), error))?;
+        if text.contains(&format!("# svcd user path\n")) && text.contains(&escaped) {
+            files.push(path);
+            continue;
+        }
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .map_err(|error| format!("open {}: {}", path.display(), error))?;
+        use std::io::Write;
+        file.write_all(b"\n")
+            .and_then(|_| file.write_all(block.as_bytes()))
+            .map_err(|error| format!("write {}: {}", path.display(), error))?;
+        files.push(path);
+    }
+    if files.is_empty() {
+        let path = home.join(".profile");
+        fs::write(&path, format!("\n{}", block))
+            .map_err(|error| format!("write {}: {}", path.display(), error))?;
+        files.push(path);
+    }
+    Ok(files)
+}
+
 fn self_install_user(request: SelfRequest) -> i32 {
     let runtime = RuntimeDirs {
         config: std::env::var_os("SVCD_CONFIG_DIR")
@@ -1593,6 +1642,8 @@ fn self_install_user(request: SelfRequest) -> i32 {
             "  path:    add {} to HKCU\\Environment\\Path",
             install_root.display()
         );
+        #[cfg(unix)]
+        println!("  path:    add {} to shell profile", install_root.display());
         if request.no_service {
             println!("  service: not installed (--no-service)");
         } else {
@@ -1621,14 +1672,31 @@ fn self_install_user(request: SelfRequest) -> i32 {
             eprintln!("svcd: cannot write {}: {}", runtime.conf().display(), error);
             return EXIT_ERROR;
         }
-    } else if !runtime.conf().is_file() {
+    } else if runtime.conf().is_file() {
+        // Older user-mode installs used port 0; keep the user and root modes
+        // behaviorally aligned unless the user supplied an explicit config.
+        if let Ok(text) = fs::read_to_string(runtime.conf()) {
+            if text.lines().any(|line| line.trim() == "http_port = 0") {
+                let updated = text.replace("http_port = 0", "http_port = 8787");
+                if let Err(error) = write_file(&runtime.conf(), &updated, 0o644) {
+                    eprintln!(
+                        "svcd: cannot update {}: {}",
+                        runtime.conf().display(),
+                        error
+                    );
+                    return EXIT_ERROR;
+                }
+                println!("port: changed user default from 0 to 8787");
+            }
+        }
+    } else {
         let layout = Layout {
             program: target.clone(),
             data_dir: runtime.data.clone(),
             config_dir: runtime.config.clone(),
             conf: None,
         };
-        let text = default_conf_text(&layout).replace("http_port = 8787", "http_port = 0");
+        let text = default_conf_text(&layout);
         if let Err(error) = write_conf(&runtime.conf(), &text) {
             eprintln!("svcd: cannot write {}: {}", runtime.conf().display(), error);
             return EXIT_ERROR;
@@ -1656,6 +1724,17 @@ fn self_install_user(request: SelfRequest) -> i32 {
             install_root.display()
         ),
         Err(error) => eprintln!("svcd: could not update the user PATH: {}", error),
+    }
+    #[cfg(unix)]
+    match add_user_path(&install_root) {
+        Ok(files) => {
+            let names: Vec<String> = files
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
+            println!("path: updated {}", names.join(", "));
+        }
+        Err(error) => eprintln!("svcd: could not update the shell PATH: {}", error),
     }
     if let Some(launcher) = &launcher {
         if let Err(error) = write_file(launcher, &daemon_launcher(&target, &runtime), 0o755) {
@@ -1698,14 +1777,25 @@ fn self_uninstall_user(request: SelfRequest) -> i32 {
         }
         return EXIT_OK;
     }
+    // The installed aliases can be hard links to the running daemon binary.
+    // Stop the user daemon first so Windows can release the shared file.
+    let _ = crate::daemon::shutdown();
+    std::thread::sleep(std::time::Duration::from_millis(500));
     for name in std::iter::once(target_name).chain(alias_names()) {
         let path = install_root.join(name);
-        if path.exists() {
-            if let Err(error) = fs::remove_file(&path) {
-                eprintln!("svcd: cannot remove {}: {}", path.display(), error);
-                return EXIT_ERROR;
+        if !path.exists() {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => println!("removed {}", path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                eprintln!(
+                    "svcd: warning: cannot remove {}: {} (close any running svc/plugin/mcp process)",
+                    path.display(),
+                    error
+                );
             }
-            println!("removed {}", path.display());
         }
     }
     let launcher = install_root.join(launcher_name());
