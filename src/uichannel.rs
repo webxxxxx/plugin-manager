@@ -1,3 +1,4 @@
+#![cfg_attr(all(unix, not(test)), allow(dead_code))]
 //! UI ↔ plugin realtime channel: process-local event bus, SSE and WebSocket.
 //!
 //! Plugin stdout stays a JSON-RPC NDJSON control channel. A plugin's

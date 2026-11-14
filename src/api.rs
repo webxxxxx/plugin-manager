@@ -24,8 +24,6 @@ use std::os::unix::io::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 #[cfg(unix)]
-use std::sync::atomic::AtomicUsize;
-#[cfg(unix)]
 use std::sync::Condvar;
 
 use serde_json::{json, Value};
@@ -210,12 +208,6 @@ fn wake_listener(current: SocketAddr) {
 }
 
 #[cfg(unix)]
-const MAX_STREAM_CONNECTIONS: usize = 256;
-
-#[cfg(unix)]
-static STREAM_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(unix)]
 struct HttpJob {
     connection: u64,
     request: HttpRequest,
@@ -223,8 +215,21 @@ struct HttpJob {
 }
 
 #[cfg(unix)]
+struct WsJob {
+    connection: u64,
+    plugin: String,
+    payload: Vec<u8>,
+}
+
+#[cfg(unix)]
+enum Work {
+    Http(HttpJob),
+    Ws(WsJob),
+}
+
+#[cfg(unix)]
 struct JobQueue {
-    queue: Mutex<VecDeque<HttpJob>>,
+    queue: Mutex<VecDeque<Work>>,
     ready: Condvar,
 }
 
@@ -236,10 +241,37 @@ struct JobResult {
 }
 
 #[cfg(unix)]
+struct WsResult {
+    connection: u64,
+    text: String,
+}
+
+#[cfg(unix)]
+enum WorkResult {
+    Http(JobResult),
+    Ws(WsResult),
+}
+
+#[cfg(unix)]
 struct SseState {
     receiver: Receiver<uichannel::Event>,
     _subscription: uichannel::Subscription,
     heartbeat: Instant,
+}
+
+#[cfg(unix)]
+struct WsState {
+    receiver: Receiver<uichannel::Event>,
+    _subscription: uichannel::Subscription,
+    plugin: String,
+    buffer: Vec<u8>,
+    fragment: Vec<u8>,
+    fragment_opcode: Option<u8>,
+    pending: bool,
+    queued: VecDeque<Vec<u8>>,
+    heartbeat: Instant,
+    discard: usize,
+    close_after: Option<(u16, String)>,
 }
 
 #[cfg(unix)]
@@ -248,6 +280,7 @@ enum ConnState {
     Processing,
     Writing,
     Sse(SseState),
+    Ws(WsState),
 }
 
 #[cfg(unix)]
@@ -313,11 +346,33 @@ fn reactor_loop(
             }
         }
         while let Ok(result) = results_rx.try_recv() {
-            if let Some(connection) = connections.get_mut(&result.connection) {
-                connection.out = result.response;
-                connection.out_at = 0;
-                connection.keep_alive = result.keep_alive;
-                connection.state = ConnState::Writing;
+            match result {
+                WorkResult::Http(result) => {
+                    if let Some(connection) = connections.get_mut(&result.connection) {
+                        connection.out = result.response;
+                        connection.out_at = 0;
+                        connection.keep_alive = result.keep_alive;
+                        connection.state = ConnState::Writing;
+                    }
+                }
+                WorkResult::Ws(result) => {
+                    if let Some(connection) = connections.get_mut(&result.connection) {
+                        if matches!(&connection.state, ConnState::Ws(_)) {
+                            push_ws_text(&mut connection.out, &result.text);
+                            if let ConnState::Ws(state) = &mut connection.state {
+                                state.pending = false;
+                                if let Some(payload) = state.queued.pop_front() {
+                                    state.pending = true;
+                                    queue.push(Work::Ws(WsJob {
+                                        connection: result.connection,
+                                        plugin: state.plugin.clone(),
+                                        payload,
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -345,6 +400,7 @@ fn reactor_loop(
                 ConnState::Reading => events |= libc::POLLIN,
                 ConnState::Writing => events |= libc::POLLOUT,
                 ConnState::Sse(_) => events |= libc::POLLIN,
+                ConnState::Ws(_) => events |= libc::POLLIN,
                 ConnState::Processing => {}
             }
             if connection.out_at < connection.out.len() {
@@ -409,7 +465,6 @@ fn reactor_loop(
             }
         }
 
-        let mut handoffs: Vec<(TcpStream, HttpRequest)> = Vec::new();
         for index in 2..descriptors.len() {
             let id = keys[index];
             let Some(connection) = connections.get_mut(&id) else {
@@ -454,19 +509,31 @@ fn reactor_loop(
                                             }
                                             break;
                                         }
-                                        let stream = connection.stream.try_clone();
-                                        if let Ok(stream) = stream {
-                                            handoffs.push((stream, request));
+                                        match prepare_ws(&request, &lan) {
+                                            Ok((plugin, accept, receiver, subscription)) => {
+                                                start_ws(
+                                                    connection,
+                                                    plugin,
+                                                    accept,
+                                                    receiver,
+                                                    subscription,
+                                                );
+                                            }
+                                            Err(response) => {
+                                                connection.out = response;
+                                                connection.out_at = 0;
+                                                connection.keep_alive = false;
+                                                connection.state = ConnState::Writing;
+                                            }
                                         }
-                                        connections.remove(&id);
                                         break;
                                     }
                                     let keep_alive = wants_keep_alive(&request);
-                                    queue.push(HttpJob {
+                                    queue.push(Work::Http(HttpJob {
                                         connection: id,
                                         request,
                                         keep_alive,
-                                    });
+                                    }));
                                     connection.state = ConnState::Processing;
                                     break;
                                 }
@@ -490,6 +557,13 @@ fn reactor_loop(
             let Some(connection) = connections.get_mut(&id) else {
                 continue;
             };
+            if matches!(connection.state, ConnState::Ws(_)) {
+                let readable = revents & libc::POLLIN != 0;
+                if !drive_ws(connection, id, &queue, readable) {
+                    connections.remove(&id);
+                }
+                continue;
+            }
             if matches!(connection.state, ConnState::Sse(_)) {
                 if revents & libc::POLLIN != 0 {
                     let mut discard = [0u8; 512];
@@ -560,44 +634,19 @@ fn reactor_loop(
                 }
             }
         }
-
-        for (stream, request) in handoffs {
-            if STREAM_CONNECTIONS.fetch_add(1, Ordering::SeqCst) >= MAX_STREAM_CONNECTIONS {
-                STREAM_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
-                let mut stream = stream;
-                let _ = stream.set_nonblocking(false);
-                let _ = stream.write_all(&error(
-                    429,
-                    "too_many_streams",
-                    "too many stream connections",
-                ));
-                continue;
-            }
-            let config = config.clone();
-            let lan = lan.clone();
-            let _ = thread::Builder::new()
-                .name("svcd-http-stream".into())
-                .stack_size(threads::REQUEST_STACK)
-                .spawn(move || {
-                    let mut stream = stream;
-                    let _ = stream.set_nonblocking(false);
-                    let _ = handle_stream(&mut stream, &config, &request, &lan);
-                    STREAM_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
-                });
-        }
     }
 }
 
 #[cfg(unix)]
 impl JobQueue {
-    fn push(&self, job: HttpJob) {
+    fn push(&self, work: Work) {
         if let Ok(mut queue) = self.queue.lock() {
-            queue.push_back(job);
+            queue.push_back(work);
             self.ready.notify_one();
         }
     }
 
-    fn pop(&self) -> HttpJob {
+    fn pop(&self) -> Work {
         let mut queue = self.queue.lock().unwrap_or_else(|error| error.into_inner());
         loop {
             if let Some(job) = queue.pop_front() {
@@ -616,23 +665,48 @@ fn http_worker(
     queue: Arc<JobQueue>,
     config: PathBuf,
     lan: Arc<Mutex<Lan>>,
-    results: Sender<JobResult>,
+    results: Sender<WorkResult>,
     notify: Option<UnixStream>,
 ) {
     loop {
-        let job = queue.pop();
-        let mut response = respond(&config, &job.request, &lan);
-        if job.keep_alive {
-            response = keep_alive_response(response);
-        }
-        if results
-            .send(JobResult {
-                connection: job.connection,
-                response,
-                keep_alive: job.keep_alive,
-            })
-            .is_err()
-        {
+        let result = match queue.pop() {
+            Work::Http(job) => {
+                let mut response = respond(&config, &job.request, &lan);
+                if job.keep_alive {
+                    response = keep_alive_response(response);
+                }
+                WorkResult::Http(JobResult {
+                    connection: job.connection,
+                    response,
+                    keep_alive: job.keep_alive,
+                })
+            }
+            Work::Ws(job) => {
+                let response = match webui::bridge_request(&job.plugin, &job.payload) {
+                    webui::Bridge::Reject(response) => response,
+                    webui::Bridge::Forward {
+                        id,
+                        name,
+                        arguments,
+                    } => match channel::request(
+                        &config,
+                        "registry.call",
+                        json!({ "name": name, "arguments": arguments }),
+                    ) {
+                        Ok(mut response) => {
+                            response.id = id;
+                            response
+                        }
+                        Err(cause) => rpc::err(id, -32603, &format!("svcd unreachable: {}", cause)),
+                    },
+                };
+                WorkResult::Ws(WsResult {
+                    connection: job.connection,
+                    text: rpc::to_line(&response),
+                })
+            }
+        };
+        if results.send(result).is_err() {
             return;
         }
         if let Some(notify) = &notify {
@@ -755,6 +829,461 @@ fn push_sse_chunk(out: &mut Vec<u8>, data: &[u8]) {
     out.extend_from_slice(format!("{:x}\r\n", data.len()).as_bytes());
     out.extend_from_slice(data);
     out.extend_from_slice(b"\r\n");
+}
+
+#[cfg(unix)]
+fn prepare_ws(
+    request: &HttpRequest,
+    lan: &Arc<Mutex<Lan>>,
+) -> Result<
+    (
+        String,
+        String,
+        Receiver<uichannel::Event>,
+        uichannel::Subscription,
+    ),
+    Vec<u8>,
+> {
+    let path = request
+        .path
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(request.path.as_str());
+    let ui = ui_path(path).ok_or_else(|| error(404, "not_found", "unknown plugin UI"))?;
+    if ui.sub != "ws" {
+        return Err(error(404, "not_found", "unknown plugin UI"));
+    }
+    if request.method != "GET" {
+        return Err(method_not_allowed("GET"));
+    }
+    let auth = if let Ok(mut state) = lan.lock() {
+        state
+            .authenticate(&request.headers)
+            .map_err(|_| error(401, "unauthorized", "authentication required"))?
+    } else {
+        return Err(error(500, "internal", "LAN state unavailable"));
+    };
+    if !package::valid_name(ui.id) || plugin::web_assets(ui.id).is_none() {
+        return Err(error(404, "not_found", "unknown plugin UI"));
+    }
+    let origin = request_header(request, "origin");
+    if origin.is_some() && !http::same_origin(&request.headers) {
+        return Err(error(
+            403,
+            "forbidden",
+            "cross-origin calls are not allowed",
+        ));
+    }
+    if auth == AuthKind::Cookie && origin.is_none() {
+        return Err(error(
+            403,
+            "forbidden",
+            "Origin is required for cookie-authenticated WebSocket calls",
+        ));
+    }
+    let accept = uichannel::ws_accept(&request.headers).map_err(|message| {
+        http::response_with_headers(
+            426,
+            "text/plain; charset=utf-8",
+            &[
+                ("Upgrade".to_string(), "websocket".to_string()),
+                ("Sec-WebSocket-Version".to_string(), "13".to_string()),
+            ],
+            message.as_bytes(),
+        )
+    })?;
+    let (receiver, subscription) = uichannel::bus().subscribe(ui.id).map_err(|_| {
+        error(
+            429,
+            "too_many_subscribers",
+            "too many UI subscribers for this plugin",
+        )
+    })?;
+    Ok((ui.id.to_string(), accept, receiver, subscription))
+}
+
+#[cfg(unix)]
+fn start_ws(
+    connection: &mut Connection,
+    plugin: String,
+    accept: String,
+    receiver: Receiver<uichannel::Event>,
+    subscription: uichannel::Subscription,
+) {
+    connection.out.clear();
+    connection.out.extend_from_slice(
+        format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+            accept
+        )
+        .as_bytes(),
+    );
+    connection.out_at = 0;
+    connection.keep_alive = true;
+    connection.state = ConnState::Ws(WsState {
+        receiver,
+        _subscription: subscription,
+        plugin,
+        buffer: Vec::new(),
+        fragment: Vec::new(),
+        fragment_opcode: None,
+        pending: false,
+        queued: VecDeque::new(),
+        heartbeat: Instant::now(),
+        discard: 0,
+        close_after: None,
+    });
+}
+
+#[cfg(unix)]
+fn fill_ws(connection: &mut Connection) {
+    let ConnState::Ws(state) = &mut connection.state else {
+        return;
+    };
+    while let Ok(event) = state.receiver.try_recv() {
+        push_ws_text(&mut connection.out, &event.json);
+    }
+    if state.heartbeat.elapsed() >= Duration::from_secs(30) {
+        push_ws_frame(&mut connection.out, 0x9, b"");
+        state.heartbeat = Instant::now();
+    }
+}
+
+#[cfg(unix)]
+fn push_ws_text(out: &mut Vec<u8>, text: &str) {
+    push_ws_frame(out, 0x1, text.as_bytes());
+}
+
+#[cfg(unix)]
+fn push_ws_frame(out: &mut Vec<u8>, opcode: u8, payload: &[u8]) {
+    out.push(0x80 | opcode);
+    if payload.len() < 126 {
+        out.push(payload.len() as u8);
+    } else if payload.len() <= u16::MAX as usize {
+        out.push(126);
+        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        out.push(127);
+        out.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    out.extend_from_slice(payload);
+}
+
+#[cfg(unix)]
+fn drive_ws(connection: &mut Connection, id: u64, queue: &Arc<JobQueue>, readable: bool) -> bool {
+    {
+        let ConnState::Ws(state) = &mut connection.state else {
+            return false;
+        };
+        if state.discard > 0 {
+            if !readable {
+                return true;
+            }
+            let mut discard = [0u8; 8 * 1024];
+            match connection.stream.read(&mut discard) {
+                Ok(0) => return false,
+                Ok(read) => {
+                    state.discard = state.discard.saturating_sub(read);
+                    if state.discard > 0 {
+                        return true;
+                    }
+                    if let Some((code, reason)) = state.close_after.take() {
+                        push_ws_frame(&mut connection.out, 0x8, &close_payload(code, &reason));
+                        let _ = flush_ws_out(connection);
+                    }
+                    return false;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return true,
+                Err(_) => return false,
+            }
+        }
+    }
+    if readable {
+        let mut chunk = [0u8; 8 * 1024];
+        match connection.stream.read(&mut chunk) {
+            Ok(0) => return false,
+            Ok(read) => {
+                let ConnState::Ws(state) = &mut connection.state else {
+                    return false;
+                };
+                state.buffer.extend_from_slice(&chunk[..read]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => return false,
+        }
+    }
+
+    loop {
+        let parsed = {
+            let ConnState::Ws(state) = &mut connection.state else {
+                return false;
+            };
+            parse_ws_frame(&state.buffer)
+        };
+        match parsed {
+            Ok(None) => break,
+            Ok(Some((frame, used))) => {
+                let ConnState::Ws(state) = &mut connection.state else {
+                    return false;
+                };
+                state.buffer.drain(..used);
+                if !handle_ws_frame(connection, &frame, id, queue) {
+                    let _ = flush_ws_out(connection);
+                    return false;
+                }
+            }
+            Err(WsParseError::TooLarge { total }) => {
+                let ConnState::Ws(state) = &mut connection.state else {
+                    return false;
+                };
+                let buffered = state.buffer.len();
+                state.buffer.clear();
+                state.discard = total.saturating_sub(buffered);
+                state.close_after = Some((1009, "message too large".into()));
+                if state.discard == 0 {
+                    push_ws_frame(
+                        &mut connection.out,
+                        0x8,
+                        &close_payload(1009, "message too large"),
+                    );
+                    let _ = flush_ws_out(connection);
+                    return false;
+                }
+                return true;
+            }
+            Err(WsParseError::Protocol(reason)) => {
+                push_ws_frame(&mut connection.out, 0x8, &close_payload(1002, reason));
+                let _ = flush_ws_out(connection);
+                return false;
+            }
+        }
+    }
+    fill_ws(connection);
+    flush_ws_out(connection)
+}
+
+#[cfg(unix)]
+fn handle_ws_frame(
+    connection: &mut Connection,
+    frame: &WsFrame,
+    id: u64,
+    queue: &Arc<JobQueue>,
+) -> bool {
+    if frame.opcode >= 0x8 {
+        match frame.opcode {
+            0x8 => {
+                let code = if frame.payload.len() >= 2 {
+                    u16::from_be_bytes([frame.payload[0], frame.payload[1]])
+                } else {
+                    1000
+                };
+                push_ws_frame(&mut connection.out, 0x8, &close_payload(code, ""));
+                return false;
+            }
+            0x9 => {
+                push_ws_frame(&mut connection.out, 0xA, &frame.payload);
+                return true;
+            }
+            0xA => return true,
+            _ => {
+                push_ws_frame(
+                    &mut connection.out,
+                    0x8,
+                    &close_payload(1002, "unknown control frame"),
+                );
+                return false;
+            }
+        }
+    }
+    match frame.opcode {
+        0x1 | 0x2 => {
+            if frame.opcode == 0x2 {
+                push_ws_frame(
+                    &mut connection.out,
+                    0x8,
+                    &close_payload(1003, "text frames only"),
+                );
+                return false;
+            }
+            let ConnState::Ws(state) = &mut connection.state else {
+                return false;
+            };
+            if state.fragment_opcode.is_some() {
+                push_ws_frame(
+                    &mut connection.out,
+                    0x8,
+                    &close_payload(1002, "interleaved data frame"),
+                );
+                return false;
+            }
+            if !frame.fin {
+                state.fragment = frame.payload.clone();
+                state.fragment_opcode = Some(0x1);
+                return true;
+            }
+            queue_ws_payload(connection, id, queue, &frame.payload);
+            true
+        }
+        0x0 => {
+            let ConnState::Ws(state) = &mut connection.state else {
+                return false;
+            };
+            if state.fragment_opcode.is_none() {
+                push_ws_frame(
+                    &mut connection.out,
+                    0x8,
+                    &close_payload(1002, "unexpected continuation"),
+                );
+                return false;
+            }
+            state.fragment.extend_from_slice(&frame.payload);
+            if state.fragment.len() > 1024 * 1024 {
+                push_ws_frame(
+                    &mut connection.out,
+                    0x8,
+                    &close_payload(1009, "message too large"),
+                );
+                return false;
+            }
+            if frame.fin {
+                let payload = std::mem::take(&mut state.fragment);
+                state.fragment_opcode = None;
+                queue_ws_payload(connection, id, queue, &payload);
+            }
+            true
+        }
+        _ => {
+            push_ws_frame(
+                &mut connection.out,
+                0x8,
+                &close_payload(1002, "unknown data frame"),
+            );
+            false
+        }
+    }
+}
+
+#[cfg(unix)]
+fn queue_ws_payload(connection: &mut Connection, id: u64, queue: &Arc<JobQueue>, payload: &[u8]) {
+    let ConnState::Ws(state) = &mut connection.state else {
+        return;
+    };
+    if state.pending {
+        state.queued.push_back(payload.to_vec());
+        return;
+    }
+    state.pending = true;
+    queue.push(Work::Ws(WsJob {
+        connection: id,
+        plugin: state.plugin.clone(),
+        payload: payload.to_vec(),
+    }));
+}
+
+#[cfg(unix)]
+fn close_payload(code: u16, reason: &str) -> Vec<u8> {
+    let mut payload = code.to_be_bytes().to_vec();
+    payload.extend_from_slice(reason.as_bytes());
+    payload
+}
+
+#[cfg(unix)]
+fn flush_ws_out(connection: &mut Connection) -> bool {
+    if connection.out_at >= connection.out.len() {
+        connection.out.clear();
+        connection.out_at = 0;
+        return true;
+    }
+    match connection
+        .stream
+        .write(&connection.out[connection.out_at..])
+    {
+        Ok(0) => false,
+        Ok(written) => {
+            connection.out_at += written;
+            if connection.out_at >= connection.out.len() {
+                connection.out.clear();
+                connection.out_at = 0;
+            }
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
+        Err(_) => false,
+    }
+}
+
+#[cfg(unix)]
+struct WsFrame {
+    fin: bool,
+    opcode: u8,
+    payload: Vec<u8>,
+}
+
+#[cfg(unix)]
+enum WsParseError {
+    Protocol(&'static str),
+    TooLarge { total: usize },
+}
+
+#[cfg(unix)]
+fn parse_ws_frame(buffer: &[u8]) -> Result<Option<(WsFrame, usize)>, WsParseError> {
+    if buffer.len() < 2 {
+        return Ok(None);
+    }
+    let fin = buffer[0] & 0x80 != 0;
+    let opcode = buffer[0] & 0x0F;
+    if buffer[0] & 0x70 != 0 {
+        return Err(WsParseError::Protocol("reserved frame bits"));
+    }
+    if buffer[1] & 0x80 == 0 {
+        return Err(WsParseError::Protocol("client frames must be masked"));
+    }
+    let mut length = u64::from(buffer[1] & 0x7F);
+    let mut at = 2;
+    if length == 126 {
+        if buffer.len() < at + 2 {
+            return Ok(None);
+        }
+        length = u64::from(u16::from_be_bytes([buffer[at], buffer[at + 1]]));
+        at += 2;
+    } else if length == 127 {
+        if buffer.len() < at + 8 {
+            return Ok(None);
+        }
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&buffer[at..at + 8]);
+        length = u64::from_be_bytes(bytes);
+        at += 8;
+    }
+    if length > 1024 * 1024 {
+        return Err(WsParseError::TooLarge {
+            total: at + 4 + length as usize,
+        });
+    }
+    if opcode >= 0x8 && (!fin || length > 125) {
+        return Err(WsParseError::Protocol("invalid control frame"));
+    }
+    if buffer.len() < at + 4 {
+        return Ok(None);
+    }
+    let mask = [buffer[at], buffer[at + 1], buffer[at + 2], buffer[at + 3]];
+    at += 4;
+    let total = at + length as usize;
+    if buffer.len() < total {
+        return Ok(None);
+    }
+    let mut payload = buffer[at..total].to_vec();
+    for (index, byte) in payload.iter_mut().enumerate() {
+        *byte ^= mask[index % 4];
+    }
+    Ok(Some((
+        WsFrame {
+            fin,
+            opcode,
+            payload,
+        },
+        total,
+    )))
 }
 
 #[cfg(unix)]
@@ -1001,6 +1530,7 @@ fn keep_alive_response(mut response: Vec<u8>) -> Vec<u8> {
 /// Serve the two streaming UI endpoints before the buffered router. Returns
 /// false when the path is not a UI stream so `respond` keeps its existing
 /// routes and error text.
+#[cfg(not(unix))]
 fn handle_stream(
     stream: &mut TcpStream,
     config: &Path,

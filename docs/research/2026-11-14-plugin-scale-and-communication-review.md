@@ -587,8 +587,8 @@ daemon threads=163
 - **已实现**：manifest `protocol: 2` 的 4 字节长度前缀帧；已用 Python 长度帧插件在 WSL 端到端验证 `initialize` / `tools/list` / `tools/call`。
 - **已实现**：内容寻址 blob store、`POST/GET /api/v1/blobs`、工具参数中的 `$blob` 解析为受控路径（`SVCD_BLOB_DIR`）。
 - **已实现（Unix）**：HTTP 监听器/普通请求进入 poll reactor，阻塞 handler 由 4 个固定 worker 执行；普通 HTTP 连接不再各自创建线程。实测 400 并发 HTTP 请求时 daemon 峰值 25 线程、回落到 4。
-- **已实现（Unix）**：SSE 进入 reactor 状态机（订阅、replay、heartbeat、chunked 写出都不再占连接线程）；WebSocket 从每连接 3 线程降为 1 线程，但仍是独立 stream 线程，全局上限 256。
-- **尚未实现**：WebSocket 进入 reactor 状态机、工具结果 blob/streaming、MCP progress/job、以及大结果/长任务的端到端通道。
+- **已实现（Unix）**：SSE 进入 reactor 状态机（订阅、replay、heartbeat、chunked 写出都不再占连接线程）；WebSocket 也进入 reactor 状态机（握手、帧解析、事件转发、分片重组、`tools/call` 交给 worker）。Unix 上普通 HTTP / SSE / WS 都不再占每连接线程。
+- **尚未实现**：本地管理 UDS 进入 reactor（目前仍是每连接线程 + 连接池）、工具结果 blob/streaming、MCP progress/job、以及大结果/长任务的端到端通道。
 
 ## 附录 B：相关代码位置
 
