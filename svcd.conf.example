@@ -20,15 +20,14 @@ lan_default = false
 # (macOS), %USERPROFILE%\.svcd (Windows).
 # config_dir = /etc/svcd
 
-# Installation root for hosts whose writable tree is limited (for example
-# SR6110, where only /etc/ persists). When set, `svcd --install` puts the
-# binary, the svc/plugin/mcp aliases and a generated `svcd_daemon.sh` launcher
-# there; data and logs default to <install_dir>/data and <install_dir>/logs.
-# `--prefix` on the command line still wins. Service registration is skipped;
-# add the printed `::respawn:<install_dir>/svcd_daemon.sh` line to the firmware
-# /etc/inittab instead. Changing this value requires re-running
-# `svcd --install --conf` so the launcher exports the new paths.
-# Leave unset to keep the platform defaults.
+# Installation root, recorded by `svcd --install --prefix <dir>` and also
+# honored when written by hand: reinstalls without `--prefix`, the data/logs
+# defaults (<install_dir>/data, <install_dir>/logs) and `--uninstall` all use
+# it. `--prefix` still wins over it. On read-only-rootfs hosts (for example
+# SR6110) install with `svcd --install --manual` to skip init registration and
+# generate `svcd_daemon.sh` (Unix) or `svcd_daemon.bat` (Windows).
+# Changing this value directly moves data/logs; it does not regenerate a
+# launcher that was already written by `--manual`.
 # install_dir = /etc/sr/svcd
 
 # Web/API password hash. Never put the plaintext here; set it with:

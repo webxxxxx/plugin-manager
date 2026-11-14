@@ -52,8 +52,12 @@ _Avoid_: lan-token、管理员 token
 `svcd.conf` 里的配置目录覆盖项；`svcd.conf`、`trust.d`、`lan.json`、`svcd.token` 都放在这里。默认 Linux `/etc/svcd`、Windows `%USERPROFILE%\.svcd`；`SVCD_CONFIG_DIR` 优先级更高。
 
 **install_dir**:
-`svcd.conf` 里的安装根覆盖项，给 `/usr` 只读、`/var` 不持久（SR6110 只有 `/etc` 持久）的宿主用。指定后 `svcd --install` 把二进制、`svc`/`plugin`/`mcp` 别名和 `svcd_daemon.sh` 启动脚本装到这里，data/logs 默认落到 `<install_dir>/data`、`<install_dir>/logs`，并跳过 init 服务注册；`--prefix` 仍然优先。未指定时走平台默认。
-_Avoid_: 安装前缀（只说命令行 `--prefix`）、数据目录
+`svcd.conf` 里记录的安装根：`svcd --install --prefix <dir>` 会把 `<dir>` 写回这里；之后不带 `--prefix` 的重装、运行时 data/logs 的默认值（`<install_dir>/data`、`<install_dir>/logs`）和 `--uninstall` 的清理都以它为准。手工写在 conf 里也有效，`--prefix` 优先于它；未记录时走平台默认。
+_Avoid_: 安装前缀（那是命令行 `--prefix`）、数据目录
+
+**manual 安装**:
+`svcd --install --manual`：不注册 init 服务，按宿主系统生成 `svcd_daemon.sh`（Unix）或 `svcd_daemon.bat`（Windows），脚本导出 `PATH`、`SVCD_DATA_DIR`、`SVCD_LOG_DIR` 后启动 svcd；启动接入与手动运行时的环境变量由用户负责。
+_Avoid_: 无服务模式（那是 `--no-service`）
 
 **mcp**:
 multicall 二进制的 MCP 桥入口名；把 MCP 客户端接到常驻 svcd。

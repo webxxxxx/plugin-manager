@@ -128,7 +128,7 @@ fn run_foreground(conf: Option<std::path::PathBuf>) -> i32 {
 fn usage() {
     eprintln!("usage: svcd run --foreground [--conf <file>]");
     eprintln!("       svcd shutdown");
-    eprintln!("       svcd --install [--prefix <dir>] [--conf <file>] [--no-service] [--dry-run]");
+    eprintln!("       svcd --install [--prefix <dir>] [--conf <file>] [--manual] [--no-service] [--dry-run]");
     eprintln!("       svcd --uninstall [--prefix <dir>] [--no-service] [--purge] [--dry-run]");
     eprintln!(
         "       svcd install-service [--target systemd|launchd|scm|busybox|procd] [--conf <file>] [--dry-run]"
