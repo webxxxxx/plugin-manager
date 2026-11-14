@@ -69,6 +69,30 @@ svcd stop
 
 `svcd user start|stop|status|install` 仍保留为兼容别名，分别对应顶层 `svcd start|stop|status|--install`。
 
+### Windows：从低完整性目录运行时安装失败
+
+如果 `svcd.exe --install` 报：
+
+```text
+cannot create C:\Users\<user>\AppData\Local\svcd\bin: 拒绝访问 (os error 5)
+```
+
+先检查二进制是否带了低完整性标签：
+
+```powershell
+icacls .\svcd.exe | findstr Mandatory
+```
+
+出现 `Mandatory Label\Low Mandatory Level` 时，进程会以低完整性运行，不能写普通的用户目录。把二进制复制到普通用户目录后再安装：
+
+```powershell
+Copy-Item .\svcd.exe "$env:LOCALAPPDATA\Temp\svcd.exe" -Force
+& "$env:LOCALAPPDATA\Temp\svcd.exe" --install --no-service
+```
+
+安装后的 `%LOCALAPPDATA%\svcd\bin\svc.exe` 可以正常使用。  
+不要直接从沙箱/低完整性构建目录运行安装器。
+
 调试时也可以前台运行：
 
 ```bash

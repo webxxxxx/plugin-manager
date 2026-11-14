@@ -1485,6 +1485,11 @@ fn self_install_user(request: SelfRequest) -> i32 {
     for dir in [&install_root, &runtime.config, &runtime.data, &runtime.logs] {
         if let Err(error) = fs::create_dir_all(dir) {
             eprintln!("svcd: cannot create {}: {}", dir.display(), error);
+            if cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied {
+                eprintln!(
+                    "svcd: hint: if this binary runs from a low-integrity/sandboxed folder, copy it to a normal user directory such as %LOCALAPPDATA%\\Temp and rerun --install"
+                );
+            }
             return EXIT_ERROR;
         }
     }
