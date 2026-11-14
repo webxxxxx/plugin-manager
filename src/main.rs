@@ -89,7 +89,7 @@ fn run_command(args: &[String]) -> i32 {
     while index < args.len() {
         match args[index].as_str() {
             "--foreground" => foreground = true,
-            "--conf" => {
+            "--conf" | "--config" => {
                 index += 1;
                 match args.get(index) {
                     Some(value) if !value.is_empty() => {
@@ -102,7 +102,10 @@ fn run_command(args: &[String]) -> i32 {
                 }
             }
             other => {
-                if let Some(value) = other.strip_prefix("--conf=") {
+                if let Some(value) = other
+                    .strip_prefix("--conf=")
+                    .or_else(|| other.strip_prefix("--config="))
+                {
                     if value.is_empty() {
                         usage();
                         return 64;
@@ -156,7 +159,7 @@ fn user_usage() {
     eprintln!("       svcd user stop");
     eprintln!("       svcd user status");
     eprintln!("       svcd user install");
-    eprintln!("       svcd user run --foreground [--conf <file>]");
+    eprintln!("       svcd user run --foreground [--conf|--config <file>]");
 }
 
 fn user_running() -> bool {
@@ -269,59 +272,14 @@ fn user_status() -> i32 {
 }
 
 fn user_install() -> i32 {
-    if !crate::paths::user_mode() {
-        eprintln!("svcd: user install must run as the target user");
-        return 1;
-    }
-    let executable = match std::env::current_exe() {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("svcd: current executable: {}", error);
-            return 1;
-        }
-    };
-    let bin = crate::paths::user_data_dir().join("bin");
-    if let Err(error) = std::fs::create_dir_all(&bin) {
-        eprintln!("svcd: create {}: {}", bin.display(), error);
-        return 1;
-    }
-    let extension = if cfg!(windows) { ".exe" } else { "" };
-    let mut installed = Vec::new();
-    for name in ["svcd", "svc", "plugin", "mcp"] {
-        let target = bin.join(format!("{}{}", name, extension));
-        if target.canonicalize().ok() == executable.canonicalize().ok() {
-            installed.push(target);
-            continue;
-        }
-        if let Err(error) = std::fs::copy(&executable, &target) {
-            eprintln!("svcd: install {}: {}", target.display(), error);
-            return 1;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755));
-        }
-        installed.push(target);
-    }
-    let config = crate::paths::config_dir();
-    if let Err(error) = std::fs::create_dir_all(&config) {
-        eprintln!("svcd: create {}: {}", config.display(), error);
-        return 1;
-    }
-    println!("installed user binaries:");
-    for path in installed {
-        println!("  {}", path.display());
-    }
-    println!("add {} to PATH, then run: svcd user start", bin.display());
-    0
+    crate::install::self_install(&[])
 }
 
 fn usage() {
-    eprintln!("usage: svcd run --foreground [--conf <file>]");
+    eprintln!("usage: svcd run --foreground [--conf|--config <file>]");
     eprintln!("       svcd user start|stop|status|install|run --foreground");
     eprintln!("       svcd shutdown");
-    eprintln!("       svcd --install [--prefix <dir>] [--conf <file>] [--manual] [--no-service] [--dry-run]");
+    eprintln!("       svcd --install [--prefix <dir>] [--conf|--config <file>] [--manual] [--no-service] [--dry-run]");
     eprintln!("       svcd --uninstall [--prefix <dir>] [--no-service] [--purge] [--dry-run]");
     eprintln!(
         "       svcd install-service [--target systemd|launchd|scm|busybox|procd] [--conf <file>] [--dry-run]"

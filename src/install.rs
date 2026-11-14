@@ -981,8 +981,10 @@ fn parse_self(args: &[String], uninstall: bool) -> Result<SelfRequest, String> {
                 let value = args.get(index).ok_or("--prefix requires a value")?;
                 request.prefix = Some(PathBuf::from(value));
             }
-            "--conf" if uninstall => return Err("--conf only applies to --install".into()),
-            "--conf" => {
+            "--conf" | "--config" if uninstall => {
+                return Err("--conf/--config only applies to --install".into())
+            }
+            "--conf" | "--config" => {
                 index += 1;
                 let value = args.get(index).ok_or("--conf requires a value")?;
                 if request.conf.replace(PathBuf::from(value)).is_some() {
@@ -1000,9 +1002,12 @@ fn parse_self(args: &[String], uninstall: bool) -> Result<SelfRequest, String> {
                         return Err("--prefix requires a value".into());
                     }
                     request.prefix = Some(PathBuf::from(value));
-                } else if let Some(value) = other.strip_prefix("--conf=") {
+                } else if let Some(value) = other
+                    .strip_prefix("--conf=")
+                    .or_else(|| other.strip_prefix("--config="))
+                {
                     if uninstall {
-                        return Err("--conf only applies to --install".into());
+                        return Err("--conf/--config only applies to --install".into());
                     }
                     if value.is_empty() {
                         return Err("--conf requires a value".into());
@@ -1031,6 +1036,9 @@ pub fn self_install(args: &[String]) -> i32 {
             return EXIT_USAGE;
         }
     };
+    if crate::paths::user_mode() {
+        return self_install_user(request);
+    }
     let prepared = match &request.conf {
         Some(path) => {
             let text = match fs::read_to_string(path) {
@@ -1290,6 +1298,195 @@ pub fn self_install(args: &[String]) -> i32 {
     EXIT_OK
 }
 
+/// Mode 1 installation: install into the current user's data directory and
+/// never touch system service managers. The same `--prefix`, `--conf`,
+/// `--manual`, `--no-service` and `--dry-run` flags are accepted.
+fn self_install_user(request: SelfRequest) -> i32 {
+    let runtime = RuntimeDirs {
+        config: std::env::var_os("SVCD_CONFIG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(paths::config_dir),
+        data: std::env::var_os("SVCD_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(paths::data_dir),
+        logs: std::env::var_os("SVCD_LOG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(paths::logs_dir),
+    };
+    let install_root = request
+        .prefix
+        .clone()
+        .unwrap_or_else(|| runtime.data.join("bin"));
+    let install_root = if install_root.is_absolute() {
+        install_root
+    } else {
+        std::path::absolute(&install_root).unwrap_or(install_root)
+    };
+    let target_name = if cfg!(windows) { "svcd.exe" } else { "svcd" };
+    let target = install_root.join(target_name);
+    let current = std::env::current_exe().unwrap_or_else(|_| target.clone());
+    let launcher = request.manual.then(|| install_root.join(launcher_name()));
+
+    let prepared = match &request.conf {
+        Some(path) => match fs::read_to_string(path) {
+            Ok(text) => {
+                let base = path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| runtime.config.clone());
+                if let Err(error) = crate::settings::parse(&text, &base) {
+                    eprintln!("svcd: {}: {}", path.display(), error);
+                    return EXIT_ERROR;
+                }
+                Some(text)
+            }
+            Err(error) => {
+                eprintln!("svcd: cannot read {}: {}", path.display(), error);
+                return EXIT_ERROR;
+            }
+        },
+        None => None,
+    };
+
+    if request.dry_run {
+        println!("user mode install (no system service)");
+        println!("install {} -> {}", current.display(), target.display());
+        println!("  aliases: {}", alias_names().join(", "));
+        println!("  config:  {}", runtime.config.display());
+        println!("  data:    {}", runtime.data.display());
+        println!("  logs:    {}", runtime.logs.display());
+        if let Some(path) = &request.conf {
+            println!(
+                "  conf:    {} -> {}",
+                path.display(),
+                runtime.conf().display()
+            );
+        }
+        if let Some(launcher) = &launcher {
+            println!("  launcher: {}", launcher.display());
+        }
+        if request.no_service {
+            println!("  service: not installed (--no-service)");
+        } else {
+            println!("  service: skipped (user mode; use svcd user start or systemd --user)");
+        }
+        if let Some(target) = request.target {
+            println!("  note: --target {} ignored in user mode", target);
+        }
+        return EXIT_OK;
+    }
+
+    for dir in [&install_root, &runtime.config, &runtime.data, &runtime.logs] {
+        if let Err(error) = fs::create_dir_all(dir) {
+            eprintln!("svcd: cannot create {}: {}", dir.display(), error);
+            return EXIT_ERROR;
+        }
+    }
+
+    if let Some(text) = prepared {
+        if let Err(error) = write_file(&runtime.conf(), &text, 0o644) {
+            eprintln!("svcd: cannot write {}: {}", runtime.conf().display(), error);
+            return EXIT_ERROR;
+        }
+    } else if !runtime.conf().is_file() {
+        let layout = Layout {
+            program: target.clone(),
+            data_dir: runtime.data.clone(),
+            config_dir: runtime.config.clone(),
+            conf: None,
+        };
+        let text = default_conf_text(&layout).replace("http_port = 8787", "http_port = 0");
+        if let Err(error) = write_conf(&runtime.conf(), &text) {
+            eprintln!("svcd: cannot write {}: {}", runtime.conf().display(), error);
+            return EXIT_ERROR;
+        }
+    }
+
+    if current != target {
+        if let Err(error) = copy_executable(&current, &target) {
+            eprintln!("svcd: cannot install {}: {}", target.display(), error);
+            return EXIT_ERROR;
+        }
+    }
+    for alias in alias_names() {
+        let path = install_root.join(alias);
+        if let Err(error) = install_alias(&target, &path) {
+            eprintln!("svcd: cannot install {}: {}", path.display(), error);
+            return EXIT_ERROR;
+        }
+    }
+    if let Some(launcher) = &launcher {
+        if let Err(error) = write_file(launcher, &daemon_launcher(&target, &runtime), 0o755) {
+            eprintln!("svcd: cannot write {}: {}", launcher.display(), error);
+            return EXIT_ERROR;
+        }
+    }
+
+    println!("svcd installed (user mode): {}", target.display());
+    println!("aliases: {}", alias_names().join(", "));
+    println!("config:  {}", runtime.config.display());
+    println!("data:    {}", runtime.data.display());
+    println!("logs:    {}", runtime.logs.display());
+    if let Some(launcher) = &launcher {
+        println!("launcher: {}", launcher.display());
+    }
+    if request.no_service {
+        println!("service: not installed (--no-service)");
+    } else {
+        println!("service: skipped (user mode; use `svcd user start` or systemd --user)");
+    }
+    if let Some(target) = request.target {
+        println!("note: --target {} ignored in user mode", target);
+    }
+    println!("try: {}", install_root.join(alias_names()[0]).display());
+    EXIT_OK
+}
+
+fn self_uninstall_user(request: SelfRequest) -> i32 {
+    let data = std::env::var_os("SVCD_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(paths::data_dir);
+    let install_root = request.prefix.clone().unwrap_or_else(|| data.join("bin"));
+    let target_name = if cfg!(windows) { "svcd.exe" } else { "svcd" };
+    let target = install_root.join(target_name);
+    if request.dry_run {
+        println!("uninstall user mode: {}", target.display());
+        if request.purge {
+            println!("purge config/data/logs");
+        }
+        return EXIT_OK;
+    }
+    for name in std::iter::once(target_name).chain(alias_names()) {
+        let path = install_root.join(name);
+        if path.exists() {
+            if let Err(error) = fs::remove_file(&path) {
+                eprintln!("svcd: cannot remove {}: {}", path.display(), error);
+                return EXIT_ERROR;
+            }
+            println!("removed {}", path.display());
+        }
+    }
+    let launcher = install_root.join(launcher_name());
+    let _ = fs::remove_file(launcher);
+    if request.purge {
+        for dir in [
+            std::env::var_os("SVCD_CONFIG_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(paths::config_dir),
+            data,
+            std::env::var_os("SVCD_LOG_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(paths::logs_dir),
+        ] {
+            if dir.exists() {
+                let _ = fs::remove_dir_all(&dir);
+                println!("removed {}", dir.display());
+            }
+        }
+    }
+    EXIT_OK
+}
+
 pub fn self_uninstall(args: &[String]) -> i32 {
     let request = match parse_self(args, true) {
         Ok(request) => request,
@@ -1299,6 +1496,9 @@ pub fn self_uninstall(args: &[String]) -> i32 {
             return EXIT_USAGE;
         }
     };
+    if crate::paths::user_mode() {
+        return self_uninstall_user(request);
+    }
     let installed = installed_conf_settings();
     let install_root = request
         .prefix
@@ -1447,7 +1647,7 @@ fn usage_self(uninstall: bool) {
         eprintln!("usage: svcd --uninstall [--prefix <dir>] [--no-service] [--purge] [--dry-run]");
     } else {
         eprintln!(
-            "usage: svcd --install [--prefix <dir>] [--conf <file>] [--manual] [--no-service] [--target <init>] [--dry-run]"
+            "usage: svcd --install [--prefix <dir>] [--conf|--config <file>] [--manual] [--no-service] [--target <init>] [--dry-run]"
         );
         eprintln!(
             "       --prefix is recorded as install_dir; --manual skips init registration and writes svcd_daemon.sh/.bat"

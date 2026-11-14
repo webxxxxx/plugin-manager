@@ -45,8 +45,11 @@ Windows：
 在非 root 账户下：
 
 ```bash
-# 1. 把 svcd/svc/plugin/mcp 安装到用户目录
-svcd user install
+# 1. 和 root 安装参数一致，但自动装到当前用户目录
+svcd --install --no-service
+# 也可以用：
+# svcd install --manual
+# svcd install --prefix ~/apps/svcd --config ./svcd.conf
 
 # 2. 加到 PATH
 export PATH="$HOME/.local/share/svcd/bin:$PATH"
@@ -60,6 +63,11 @@ svcd user status
 # 5. 停止
 svcd user stop
 ```
+
+`--install`、`--uninstall` 会按当前用户自动判断，不需要 `svcd user install`。  
+`--prefix`、`--conf`/`--config`、`--manual`、`--no-service`、`--dry-run` 都保留；`--target` 在 user mode 下接受但忽略（不会注册系统服务）。
+
+`svcd user install` 仍保留为兼容别名，等价于 `svcd --install`。
 
 调试时也可以前台运行：
 
@@ -91,7 +99,7 @@ svc list
 
 ## 自动启动（可选）
 
-当前 `user install` 只安装二进制，不注册开机自启。Linux 可用 systemd user unit：
+当前用户安装只安装二进制/别名，不注册开机自启。Linux 可用 systemd user unit：
 
 ```ini
 # ~/.config/systemd/user/svcd.service
