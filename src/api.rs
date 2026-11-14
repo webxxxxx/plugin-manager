@@ -14,6 +14,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 #[cfg(unix)]
 use std::collections::{HashMap, VecDeque};
@@ -234,10 +236,18 @@ struct JobResult {
 }
 
 #[cfg(unix)]
+struct SseState {
+    receiver: Receiver<uichannel::Event>,
+    _subscription: uichannel::Subscription,
+    heartbeat: Instant,
+}
+
+#[cfg(unix)]
 enum ConnState {
     Reading,
     Processing,
     Writing,
+    Sse(SseState),
 }
 
 #[cfg(unix)]
@@ -334,6 +344,7 @@ fn reactor_loop(
             match connection.state {
                 ConnState::Reading => events |= libc::POLLIN,
                 ConnState::Writing => events |= libc::POLLOUT,
+                ConnState::Sse(_) => events |= libc::POLLIN,
                 ConnState::Processing => {}
             }
             if connection.out_at < connection.out.len() {
@@ -423,7 +434,26 @@ fn reactor_loop(
                                 Ok(None) => break,
                                 Ok(Some((request, used))) => {
                                     connection.buffer.drain(..used);
-                                    if is_ui_stream(&request.path) {
+                                    if let Some(kind) = ui_stream_kind(&request.path) {
+                                        if kind == "events" {
+                                            match prepare_sse(&request, &lan) {
+                                                Ok((receiver, subscription, replay)) => {
+                                                    start_sse(
+                                                        connection,
+                                                        receiver,
+                                                        subscription,
+                                                        replay,
+                                                    );
+                                                }
+                                                Err(response) => {
+                                                    connection.out = response;
+                                                    connection.out_at = 0;
+                                                    connection.keep_alive = false;
+                                                    connection.state = ConnState::Writing;
+                                                }
+                                            }
+                                            break;
+                                        }
                                         let stream = connection.stream.try_clone();
                                         if let Ok(stream) = stream {
                                             handoffs.push((stream, request));
@@ -460,6 +490,48 @@ fn reactor_loop(
             let Some(connection) = connections.get_mut(&id) else {
                 continue;
             };
+            if matches!(connection.state, ConnState::Sse(_)) {
+                if revents & libc::POLLIN != 0 {
+                    let mut discard = [0u8; 512];
+                    match connection.stream.read(&mut discard) {
+                        Ok(0) => {
+                            connections.remove(&id);
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(_) => {
+                            connections.remove(&id);
+                            continue;
+                        }
+                    }
+                }
+                fill_sse(connection);
+                if connection.out_at < connection.out.len() {
+                    match connection
+                        .stream
+                        .write(&connection.out[connection.out_at..])
+                    {
+                        Ok(0) => {
+                            connections.remove(&id);
+                            continue;
+                        }
+                        Ok(written) => {
+                            connection.out_at += written;
+                            if connection.out_at >= connection.out.len() {
+                                connection.out.clear();
+                                connection.out_at = 0;
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(_) => {
+                            connections.remove(&id);
+                            continue;
+                        }
+                    }
+                }
+                continue;
+            }
             if revents & libc::POLLOUT != 0 || connection.out_at < connection.out.len() {
                 match connection
                     .stream
@@ -570,15 +642,119 @@ fn http_worker(
 }
 
 #[cfg(unix)]
-fn is_ui_stream(path: &str) -> bool {
+fn ui_stream_kind(path: &str) -> Option<&'static str> {
     let path = path.split_once('?').map(|(path, _)| path).unwrap_or(path);
-    let Some(rest) = path.strip_prefix("/plugin-ui/") else {
-        return false;
+    let rest = path.strip_prefix("/plugin-ui/")?;
+    let (_, sub) = rest.split_once('/')?;
+    match sub {
+        "events" => Some("events"),
+        "ws" => Some("ws"),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn prepare_sse(
+    request: &HttpRequest,
+    lan: &Arc<Mutex<Lan>>,
+) -> Result<
+    (
+        Receiver<uichannel::Event>,
+        uichannel::Subscription,
+        uichannel::Replay,
+    ),
+    Vec<u8>,
+> {
+    let path = request
+        .path
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(request.path.as_str());
+    let ui = ui_path(path).ok_or_else(|| error(404, "not_found", "unknown plugin UI"))?;
+    if request.method != "GET" {
+        return Err(method_not_allowed("GET"));
+    }
+    if let Ok(mut state) = lan.lock() {
+        if state.authenticate(&request.headers).is_err() {
+            return Err(error(401, "unauthorized", "authentication required"));
+        }
+    } else {
+        return Err(error(500, "internal", "LAN state unavailable"));
+    }
+    if !package::valid_name(ui.id) || plugin::web_assets(ui.id).is_none() {
+        return Err(error(404, "not_found", "unknown plugin UI"));
+    }
+    if request_header(request, "origin").is_some() && !http::same_origin(&request.headers) {
+        return Err(error(
+            403,
+            "forbidden",
+            "cross-origin calls are not allowed",
+        ));
+    }
+    let last_event_id =
+        request_header(request, "last-event-id").and_then(|value| value.trim().parse::<u64>().ok());
+    let (receiver, subscription, replay) = uichannel::bus()
+        .subscribe_from(ui.id, last_event_id)
+        .map_err(|_| {
+            error(
+                429,
+                "too_many_subscribers",
+                "too many UI subscribers for this plugin",
+            )
+        })?;
+    Ok((receiver, subscription, replay))
+}
+
+#[cfg(unix)]
+fn start_sse(
+    connection: &mut Connection,
+    receiver: Receiver<uichannel::Event>,
+    subscription: uichannel::Subscription,
+    replay: uichannel::Replay,
+) {
+    connection.out.clear();
+    connection.out.extend_from_slice(
+        b"HTTP/1.1 200 OK\r\n\
+          Content-Type: text/event-stream\r\n\
+          Cache-Control: no-cache\r\n\
+          Connection: keep-alive\r\n\
+          X-Accel-Buffering: no\r\n\
+          Transfer-Encoding: chunked\r\n\r\n",
+    );
+    if replay.reset {
+        push_sse_chunk(
+            &mut connection.out,
+            b"event: reset\ndata: {\"reason\":\"replay-unavailable\"}\n\n",
+        );
+    }
+    connection.out_at = 0;
+    connection.keep_alive = true;
+    connection.state = ConnState::Sse(SseState {
+        receiver,
+        _subscription: subscription,
+        heartbeat: Instant::now(),
+    });
+}
+
+#[cfg(unix)]
+fn fill_sse(connection: &mut Connection) {
+    let ConnState::Sse(state) = &mut connection.state else {
+        return;
     };
-    let Some((_, sub)) = rest.split_once('/') else {
-        return false;
-    };
-    sub == "events" || sub == "ws"
+    while let Ok(event) = state.receiver.try_recv() {
+        push_sse_chunk(&mut connection.out, uichannel::sse_event(&event).as_bytes());
+    }
+    if state.heartbeat.elapsed() >= Duration::from_secs(15) {
+        push_sse_chunk(&mut connection.out, b": ping\n\n");
+        state.heartbeat = Instant::now();
+    }
+}
+
+#[cfg(unix)]
+fn push_sse_chunk(out: &mut Vec<u8>, data: &[u8]) {
+    out.extend_from_slice(format!("{:x}\r\n", data.len()).as_bytes());
+    out.extend_from_slice(data);
+    out.extend_from_slice(b"\r\n");
 }
 
 #[cfg(unix)]
