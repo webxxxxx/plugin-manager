@@ -337,7 +337,8 @@ mod tests {
             let root =
                 std::env::temp_dir().join(format!("svcd-blob-{}-{}", std::process::id(), nanos));
             std::env::set_var("SVCD_DATA_DIR", &root);
-            std::fs::create_dir_all(&root).expect("blob root");
+            std::env::set_var("SVCD_TEMP_DIR", root.join("temp"));
+            std::fs::create_dir_all(root.join("temp")).expect("blob root");
             root
         })
     }

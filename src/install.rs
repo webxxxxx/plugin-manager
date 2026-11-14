@@ -1407,6 +1407,123 @@ pub fn self_install(args: &[String]) -> i32 {
 /// Mode 1 installation: install into the current user's data directory and
 /// never touch system service managers. The same `--prefix`, `--conf`,
 /// `--manual`, `--no-service` and `--dry-run` flags are accepted.
+#[cfg(windows)]
+fn add_user_path(dir: &Path) -> Result<bool, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
+        KEY_READ, KEY_SET_VALUE, REG_EXPAND_SZ,
+    };
+
+    fn wide(value: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(value)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let subkey = wide("Environment");
+    let value_name = wide("Path");
+    let mut key: HKEY = std::ptr::null_mut();
+    let opened = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            KEY_READ | KEY_SET_VALUE,
+            &mut key,
+        )
+    };
+    if opened != 0 {
+        return Err(format!("open HKCU\\Environment: code {}", opened));
+    }
+    let mut kind = 0u32;
+    let mut size = 0u32;
+    let queried = unsafe {
+        RegQueryValueExW(
+            key,
+            value_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut kind,
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    let mut current = Vec::new();
+    if queried == 0 && size > 0 {
+        current.resize(size as usize, 0u8);
+        let mut read_kind = 0u32;
+        let mut read_size = size;
+        let read = unsafe {
+            RegQueryValueExW(
+                key,
+                value_name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut read_kind,
+                current.as_mut_ptr(),
+                &mut read_size,
+            )
+        };
+        if read != 0 {
+            unsafe { RegCloseKey(key) };
+            return Err(format!("read HKCU\\Environment\\Path: code {}", read));
+        }
+        current.truncate(read_size as usize);
+    }
+    let existing = String::from_utf16_lossy(
+        &current
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .take_while(|unit| *unit != 0)
+            .collect::<Vec<_>>(),
+    );
+    let directory = dir.display().to_string();
+    let already = existing
+        .split(';')
+        .any(|entry| entry.trim().eq_ignore_ascii_case(&directory));
+    if already {
+        unsafe { RegCloseKey(key) };
+        return Ok(false);
+    }
+    let updated = if existing.trim().is_empty() {
+        directory
+    } else {
+        format!("{};{}", existing.trim_end_matches(';'), directory)
+    };
+    let encoded: Vec<u16> = updated.encode_utf16().chain(std::iter::once(0)).collect();
+    let bytes: Vec<u8> = encoded.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+    let written = unsafe {
+        RegSetValueExW(
+            key,
+            value_name.as_ptr(),
+            0,
+            REG_EXPAND_SZ,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+        )
+    };
+    unsafe { RegCloseKey(key) };
+    if written != 0 {
+        return Err(format!("write HKCU\\Environment\\Path: code {}", written));
+    }
+    unsafe {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+        };
+        let parameter = wide("Environment");
+        SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            parameter.as_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            1000,
+            std::ptr::null_mut(),
+        );
+    }
+    Ok(true)
+}
+
 fn self_install_user(request: SelfRequest) -> i32 {
     let runtime = RuntimeDirs {
         config: std::env::var_os("SVCD_CONFIG_DIR")
@@ -1471,6 +1588,11 @@ fn self_install_user(request: SelfRequest) -> i32 {
         if let Some(launcher) = &launcher {
             println!("  launcher: {}", launcher.display());
         }
+        #[cfg(windows)]
+        println!(
+            "  path:    add {} to HKCU\\Environment\\Path",
+            install_root.display()
+        );
         if request.no_service {
             println!("  service: not installed (--no-service)");
         } else {
@@ -1525,6 +1647,15 @@ fn self_install_user(request: SelfRequest) -> i32 {
             eprintln!("svcd: cannot install {}: {}", path.display(), error);
             return EXIT_ERROR;
         }
+    }
+    #[cfg(windows)]
+    match add_user_path(&install_root) {
+        Ok(true) => println!("path: added {} to the user PATH", install_root.display()),
+        Ok(false) => println!(
+            "path: {} is already in the user PATH",
+            install_root.display()
+        ),
+        Err(error) => eprintln!("svcd: could not update the user PATH: {}", error),
     }
     if let Some(launcher) = &launcher {
         if let Err(error) = write_file(launcher, &daemon_launcher(&target, &runtime), 0o755) {

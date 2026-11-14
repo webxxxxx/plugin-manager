@@ -67,6 +67,14 @@ svcd stop
 `--install`、`--uninstall` 会按当前用户自动判断，不需要 `svcd user install`。  
 `--prefix`、`--conf`/`--config`、`--manual`、`--no-service`、`--dry-run` 都保留；`--target` 在 user mode 下接受但忽略（不会注册系统服务）。
 
+Windows 安装会把 `<data>\\bin` 追加到当前用户的 `HKCU\\Environment\\Path`，并广播环境变更；**新开一个终端**即可直接使用 `svcd` / `svc` / `plugin` / `mcp`。已有终端仍使用旧 PATH，需要重新打开或执行：
+
+```powershell
+$env:Path = "$env:LOCALAPPDATA\svcd\bin;$env:Path"
+```
+
+Linux/macOS 安装会打印 `<data>/bin` 路径；如果该目录不在 PATH，需要把它加入 shell 配置（例如 `~/.profile`）。
+
 `svcd user start|stop|status|install` 仍保留为兼容别名，分别对应顶层 `svcd start|stop|status|--install`。
 
 ### Windows：从低完整性目录运行时安装失败
