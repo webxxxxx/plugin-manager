@@ -589,7 +589,8 @@ daemon threads=163
 - **已实现（Unix）**：HTTP 监听器/普通请求进入 poll reactor，阻塞 handler 由 4 个固定 worker 执行；普通 HTTP 连接不再各自创建线程。实测 400 并发 HTTP 请求时 daemon 峰值 25 线程、回落到 4。
 - **已实现（Unix）**：SSE 进入 reactor 状态机（订阅、replay、heartbeat、chunked 写出都不再占连接线程）；WebSocket 也进入 reactor 状态机（握手、帧解析、事件转发、分片重组、`tools/call` 交给 worker）。Unix 上普通 HTTP / SSE / WS 都不再占每连接线程。
 - **已实现（Unix）**：本地管理 UDS 进入独立 poll reactor；每个连接只是 fd/状态，不再每连接一线程。80 插件、全 reactor 下 daemon 为 **8 线程**（daemon + 插件 reactor + 管理 reactor + HTTP reactor + 4 worker）。
-- **尚未实现**：工具结果 blob/streaming、MCP progress/job、以及大结果/长任务的端到端通道。
+- **已实现**：插件把大结果写入 `SVCD_BLOB_DIR/incoming/`，返回 `$blobPath`；宿主校验路径、流式哈希并落成内容寻址 blob，MCP 结果替换为 `resource_link` + `structuredContent.$blob`。
+- **尚未实现**：MCP progress/job、逐 token 流式结果、以及大结果在 MCP stdio 上的端到端流式传输。
 
 ## 附录 B：相关代码位置
 
