@@ -67,7 +67,7 @@ svcd stop
 `--install`、`--uninstall` 会按当前用户自动判断，不需要 `svcd user install`。  
 `--prefix`、`--conf`/`--config`、`--manual`、`--no-service`、`--dry-run` 都保留；`--target` 在 user mode 下接受但忽略（不会注册系统服务）。
 
-`--uninstall` 会先停止用户 daemon，再删除二进制；如果 `svc`/`plugin`/`mcp` 进程仍占用文件，会给出 warning 并继续，关闭对应进程后再次执行即可。
+`--uninstall` 会先停止用户 daemon，再删除二进制，并同步从 Windows 用户 PATH / Linux shell 配置中移除安装目录；如果 `svc`/`plugin`/`mcp` 进程仍占用文件，会给出 warning 并继续，关闭对应进程后再次执行即可。
 
 Windows 安装会把 `<data>\\bin` 追加到当前用户的 `HKCU\\Environment\\Path`，并广播环境变更；**新开一个终端**即可直接使用 `svcd` / `svc` / `plugin` / `mcp`。已有终端仍使用旧 PATH，需要重新打开或执行：
 
