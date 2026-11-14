@@ -1876,6 +1876,16 @@ fn self_install_user(request: SelfRequest) -> i32 {
         }
     }
     #[cfg(windows)]
+    {
+        let uninstaller = install_root.join("uninstall.exe");
+        if current != uninstaller {
+            if let Err(error) = copy_executable(&target, &uninstaller) {
+                eprintln!("svcd: cannot install {}: {}", uninstaller.display(), error);
+                return EXIT_ERROR;
+            }
+        }
+    }
+    #[cfg(windows)]
     match add_user_path(&install_root) {
         Ok(true) => println!("path: added {} to the user PATH", install_root.display()),
         Ok(false) => println!(
@@ -1971,6 +1981,99 @@ fn self_uninstall_current(request: &SelfRequest) -> bool {
 }
 
 #[cfg(windows)]
+fn uninstaller_path(request: &SelfRequest) -> PathBuf {
+    let data = std::env::var_os("SVCD_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(paths::data_dir);
+    request
+        .prefix
+        .clone()
+        .unwrap_or_else(|| data.join("bin"))
+        .join("uninstall.exe")
+}
+
+#[cfg(windows)]
+fn current_is_uninstaller(request: &SelfRequest) -> bool {
+    std::env::current_exe()
+        .ok()
+        .map(|path| {
+            path.to_string_lossy()
+                .eq_ignore_ascii_case(uninstaller_path(request).to_string_lossy().as_ref())
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn spawn_dedicated_uninstaller(request: &SelfRequest, args: &[String]) -> Option<i32> {
+    let uninstaller = uninstaller_path(request);
+    if !uninstaller.is_file() || current_is_uninstaller(request) {
+        return None;
+    }
+    let mut command = std::process::Command::new(&uninstaller);
+    command
+        .arg("--uninstall")
+        .args(args)
+        .env("SVCD_UNINSTALL_HELPER", "1")
+        .env("SVCD_UNINSTALL_PARENT", std::process::id().to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    match command.spawn() {
+        Ok(_) => {
+            println!(
+                "uninstall continues in the background with {}",
+                uninstaller.display()
+            );
+            Some(EXIT_OK)
+        }
+        Err(error) => {
+            eprintln!("svcd: cannot start uninstaller: {}", error);
+            Some(EXIT_ERROR)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn schedule_delete_on_reboot(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        MoveFileExW(wide.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT);
+    }
+}
+
+#[cfg(windows)]
+fn cleanup_current_uninstaller() {
+    if std::env::var_os("SVCD_UNINSTALL_HELPER").is_none() {
+        return;
+    }
+    let Ok(current) = std::env::current_exe() else {
+        return;
+    };
+    // Best-effort immediate cleanup; if the process is still mapped, register
+    // the file for deletion on the next reboot.
+    schedule_delete_on_reboot(&current);
+    let script = format!(
+        "ping -n 2 127.0.0.1 >nul & del /f /q \"{}\"",
+        current.display()
+    );
+    let mut command = std::process::Command::new("cmd");
+    command
+        .args(["/C", &script])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(0x0000_0008); // DETACHED_PROCESS
+    let _ = command.spawn();
+}
+
+#[cfg(windows)]
 fn spawn_uninstall_helper(args: &[String]) -> i32 {
     let current = match std::env::current_exe() {
         Ok(path) => path,
@@ -2040,6 +2143,20 @@ fn self_uninstall_user(request: SelfRequest) -> i32 {
         }
     }
     #[cfg(windows)]
+    {
+        let uninstaller = uninstaller_path(&request);
+        if uninstaller.is_file() && !current_is_uninstaller(&request) {
+            match remove_file_retry(&uninstaller) {
+                Ok(()) => println!("removed {}", uninstaller.display()),
+                Err(error) => eprintln!(
+                    "svcd: warning: cannot remove {}: {}",
+                    uninstaller.display(),
+                    error
+                ),
+            }
+        }
+    }
+    #[cfg(windows)]
     match remove_user_path(&install_root) {
         Ok(true) => println!(
             "path: removed {} from the user PATH",
@@ -2078,6 +2195,8 @@ fn self_uninstall_user(request: SelfRequest) -> i32 {
             }
         }
     }
+    #[cfg(windows)]
+    cleanup_current_uninstaller();
     EXIT_OK
 }
 
@@ -2091,7 +2210,14 @@ pub fn self_uninstall(args: &[String]) -> i32 {
         }
     };
     #[cfg(windows)]
-    if crate::paths::user_mode() && !request.dry_run && self_uninstall_current(&request) {
+    if crate::paths::user_mode()
+        && !request.dry_run
+        && self_uninstall_current(&request)
+        && !current_is_uninstaller(&request)
+    {
+        if let Some(code) = spawn_dedicated_uninstaller(&request, args) {
+            return code;
+        }
         return spawn_uninstall_helper(args);
     }
     if crate::paths::user_mode() {
