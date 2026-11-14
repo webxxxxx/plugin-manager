@@ -74,6 +74,9 @@ fn svcd_run(args: Vec<String>) -> i32 {
         Some("--uninstall") | Some("uninstall") => install::self_uninstall(&args[1..]),
         Some("install-service") => install::install_service(&args[1..]),
         Some("uninstall-service") => install::uninstall_service(&args[1..]),
+        Some("start") => start_command(),
+        Some("stop") => stop_command(),
+        Some("status") => status_command(),
         Some("user") => user_command(&args[1..]),
         _ => {
             usage();
@@ -135,6 +138,30 @@ fn run_foreground(conf: Option<std::path::PathBuf>) -> i32 {
         return code;
     }
     daemon::run(conf)
+}
+
+fn start_command() -> i32 {
+    if crate::paths::user_mode() {
+        user_start()
+    } else {
+        crate::install::service_start()
+    }
+}
+
+fn stop_command() -> i32 {
+    if crate::paths::user_mode() {
+        crate::daemon::shutdown()
+    } else {
+        crate::install::service_stop()
+    }
+}
+
+fn status_command() -> i32 {
+    if crate::paths::user_mode() {
+        user_status()
+    } else {
+        crate::install::service_status()
+    }
 }
 
 fn user_command(args: &[String]) -> i32 {
@@ -277,8 +304,9 @@ fn user_install() -> i32 {
 
 fn usage() {
     eprintln!("usage: svcd run --foreground [--conf|--config <file>]");
-    eprintln!("       svcd user start|stop|status|install|run --foreground");
+    eprintln!("       svcd start|stop|status");
     eprintln!("       svcd shutdown");
+    eprintln!("       svcd user start|stop|status|install|run --foreground   (legacy aliases)");
     eprintln!("       svcd --install [--prefix <dir>] [--conf|--config <file>] [--manual] [--no-service] [--dry-run]");
     eprintln!("       svcd --uninstall [--prefix <dir>] [--no-service] [--purge] [--dry-run]");
     eprintln!(

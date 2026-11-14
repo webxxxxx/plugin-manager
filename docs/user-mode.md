@@ -55,27 +55,27 @@ svcd --install --no-service
 export PATH="$HOME/.local/share/svcd/bin:$PATH"
 
 # 3. 启动后台 daemon
-svcd user start
+svcd start
 
 # 4. 查看状态
-svcd user status
+svcd status
 
 # 5. 停止
-svcd user stop
+svcd stop
 ```
 
 `--install`、`--uninstall` 会按当前用户自动判断，不需要 `svcd user install`。  
 `--prefix`、`--conf`/`--config`、`--manual`、`--no-service`、`--dry-run` 都保留；`--target` 在 user mode 下接受但忽略（不会注册系统服务）。
 
-`svcd user install` 仍保留为兼容别名，等价于 `svcd --install`。
+`svcd user start|stop|status|install` 仍保留为兼容别名，分别对应顶层 `svcd start|stop|status|--install`。
 
 调试时也可以前台运行：
 
 ```bash
-svcd user run --foreground
+svcd run --foreground
 ```
 
-`user start` 使用当前可执行文件，日志写到用户日志目录；默认 HTTP 端口是 `0`（临时端口），避免每个用户抢 `8787`。
+`start` 使用当前可执行文件，日志写到用户日志目录；默认 HTTP 端口是 `0`（临时端口），避免每个用户抢 `8787`。
 
 ## 安装插件
 
