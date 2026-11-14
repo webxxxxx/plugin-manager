@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use imp::{Listener, Stream};
@@ -111,32 +113,62 @@ pub fn spawn_server(
 
 fn serve(stream: Stream, tx: Sender<PendingCall>, wake: std::sync::Arc<crate::wake::Wake>) {
     let mut reader = BufReader::new(stream);
-    let line = match ipc::read_frame_limit(&mut reader, ipc::LOCAL_FRAME_MAX) {
-        Ok(Some(line)) => line,
-        Ok(None) => return,
-        Err(error) => {
-            let response = rpc::err(None, -32700, &format!("invalid frame: {}", error));
-            let _ = ipc::write_frame_limit(
-                reader.get_mut(),
-                &rpc::to_line(&response),
-                ipc::LOCAL_FRAME_MAX,
-            );
+    loop {
+        let line = match ipc::read_frame_limit(&mut reader, ipc::LOCAL_FRAME_MAX) {
+            Ok(Some(line)) => line,
+            Ok(None) => return,
+            Err(error) => {
+                let response = rpc::err(None, -32700, &format!("invalid frame: {}", error));
+                let _ = ipc::write_frame_limit(
+                    reader.get_mut(),
+                    &rpc::to_line(&response),
+                    ipc::LOCAL_FRAME_MAX,
+                );
+                return;
+            }
+        };
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        if tx
+            .send(PendingCall {
+                line,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
             return;
         }
-    };
-    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-    if tx
-        .send(PendingCall {
-            line,
-            reply: reply_tx,
-        })
-        .is_err()
-    {
-        return;
+        wake.notify();
+        let Ok(response) = reply_rx.recv() else {
+            return;
+        };
+        if ipc::write_frame_limit(reader.get_mut(), &response, ipc::LOCAL_FRAME_MAX).is_err() {
+            return;
+        }
     }
-    wake.notify();
-    if let Ok(response) = reply_rx.recv() {
-        let _ = ipc::write_frame_limit(reader.get_mut(), &response, ipc::LOCAL_FRAME_MAX);
+}
+
+const POOL_MAX: usize = 8;
+
+fn pool() -> &'static Mutex<HashMap<PathBuf, Vec<Stream>>> {
+    static POOL: OnceLock<Mutex<HashMap<PathBuf, Vec<Stream>>>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn acquire(config: &Path) -> io::Result<Stream> {
+    if let Ok(mut pool) = pool().lock() {
+        if let Some(stream) = pool.get_mut(config).and_then(Vec::pop) {
+            return Ok(stream);
+        }
+    }
+    connect(config)
+}
+
+fn release(config: &Path, stream: Stream) {
+    if let Ok(mut pool) = pool().lock() {
+        let connections = pool.entry(config.to_path_buf()).or_default();
+        if connections.len() < POOL_MAX {
+            connections.push(stream);
+        }
     }
 }
 
@@ -151,7 +183,7 @@ pub fn request(
     params: serde_json::Value,
 ) -> io::Result<crate::rpc::Response> {
     let token = read_token(config)?;
-    let mut stream = connect(config)?;
+    let mut stream = acquire(config)?;
     let line = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -165,8 +197,10 @@ pub fn request(
     let mut reader = BufReader::new(stream);
     let response = ipc::read_frame_limit(&mut reader, ipc::LOCAL_FRAME_MAX)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "empty response frame"))?;
-    serde_json::from_str(&response)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    let response = serde_json::from_str(&response)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    release(config, reader.into_inner());
+    Ok(response)
 }
 
 pub fn remove_socket(config: &Path) {

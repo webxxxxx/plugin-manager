@@ -91,6 +91,22 @@ MCP 客户端 / 工具门户 / svc / plugin CLI / 浏览器
 | 80（安装+启动总耗时） | 3.778 s | 80 个最简 shell 插件，含 bundle/install/start |
 | 80（daemon 线程数） | 163 | 约 2×N + 3：每插件 stdout/stderr 两条 reader |
 
+### 2.2.1 实现后复测：80 插件 4 线程
+
+在 Unix reactor（插件 stdout/stderr 统一由一个 poll 线程读取）+ 持久管理连接池落地后，用同一台 WSL2 Debian、80 个最简 shell 插件（`ready=notify`、无能力）复测：
+
+| 指标 | reactor 前（同机 glibc） | reactor 后 |
+|---|---:|---:|
+| daemon 线程数 @80 | 163（约 2N + 3） | **4** |
+| daemon 虚拟内存 @80 | 约 4.06 GB | **约 267 MB** |
+| daemon RSS @80 | 约 6.2 MB | **约 3.5 MB** |
+
+线程数下降来自：每个插件不再有 stdout/stderr 两条 reader 线程，统一进一个 poll 线程。虚拟内存下降主要来自 glibc 的 per-thread arena 与线程栈减少。注意：
+
+- 这是 glibc 构建；musl 的数字会更低，不能直接与嵌入式绝对值比较。
+- HTTP 连接、SSE/WS 仍然是 thread-per-connection；本表只覆盖插件 stdio 与管理连接池，不覆盖 HTTP/WS 的线程上限。
+- 持久管理连接池只把“每次请求新建连接”降为“每个客户端复用连接”，并发连接上限仍未做成 reactor 级固定。
+
 注意事项：
 
 - 这是**合成压力夹具**，schema 是刻意放大的；真实插件可能更小，也可能更大（例如带完整 JSON Schema、枚举、长描述的工具）。
