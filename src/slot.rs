@@ -278,7 +278,9 @@ impl Slot {
             Some(hook) => hook_command(&self.id, "start", hook),
             None => command_for(&self.exec),
         };
-        command.env("SVCD_BLOB_DIR", crate::blob::dir());
+        let blob_dir = crate::blob::dir();
+        let _ = std::fs::create_dir_all(crate::blob::incoming_dir());
+        command.env("SVCD_BLOB_DIR", &blob_dir);
         match self.exec.ready {
             Ready::Notify => {
                 command
@@ -592,7 +594,11 @@ impl Slot {
                 .unwrap_or("plugin call failed");
             crate::mcp::tool_error(pending.external_id, text)
         } else if let Some(result) = message.get("result") {
-            rpc::ok(pending.external_id, result.clone())
+            let mut result = result.clone();
+            match crate::blob::materialize_result(&mut result) {
+                Ok(()) => rpc::ok(pending.external_id, result),
+                Err(message) => crate::mcp::tool_error(pending.external_id, &message),
+            }
         } else {
             crate::mcp::tool_error(
                 pending.external_id,

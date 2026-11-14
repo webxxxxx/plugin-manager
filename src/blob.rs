@@ -6,8 +6,8 @@
 //! uploaded and downloaded through the management API.
 
 use std::fs;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -25,6 +25,10 @@ pub struct Meta {
 
 pub fn dir() -> PathBuf {
     paths::data_dir().join("blobs")
+}
+
+pub fn incoming_dir() -> PathBuf {
+    dir().join("incoming")
 }
 
 pub fn put(bytes: &[u8]) -> Result<Meta, String> {
@@ -65,6 +69,101 @@ pub fn read(id: &str) -> Result<Vec<u8>, String> {
 
 pub fn path(id: &str) -> Result<PathBuf, String> {
     blob_path(id)
+}
+
+/// Import a file a plugin wrote into `SVCD_BLOB_DIR` and replace a
+/// `$blobPath` result with an MCP resource link plus structured blob metadata.
+pub fn materialize_result(result: &mut Value) -> Result<(), String> {
+    let Some(path) = result.get("$blobPath").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let path = PathBuf::from(path);
+    let meta = import_file(&path)?;
+    let name = result.get("name").and_then(Value::as_str).unwrap_or("blob");
+    let mime = result
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .unwrap_or("application/octet-stream");
+    *result = json!({
+        "content": [
+            {"type": "text", "text": format!("blob {}", meta.id)},
+            {
+                "type": "resource_link",
+                "uri": format!("svcd://blob/{}", meta.id),
+                "name": name,
+                "mimeType": mime
+            }
+        ],
+        "structuredContent": {
+            "$blob": meta.id,
+            "size": meta.size
+        },
+        "isError": false
+    });
+    Ok(())
+}
+
+fn import_file(source: &Path) -> Result<Meta, String> {
+    let directory = dir();
+    let incoming = incoming_dir();
+    fs::create_dir_all(&incoming)
+        .map_err(|error| format!("create {}: {}", incoming.display(), error))?;
+    let source = source
+        .canonicalize()
+        .map_err(|error| format!("open {}: {}", source.display(), error))?;
+    let incoming = incoming
+        .canonicalize()
+        .map_err(|error| format!("open {}: {}", incoming.display(), error))?;
+    if !source.starts_with(&incoming) {
+        return Err("blob path is outside the incoming directory".into());
+    }
+    let metadata =
+        fs::metadata(&source).map_err(|error| format!("stat {}: {}", source.display(), error))?;
+    if metadata.len() > MAX_BLOB_BYTES {
+        return Err("blob is too large".into());
+    }
+    let mut file =
+        fs::File::open(&source).map_err(|error| format!("open {}: {}", source.display(), error))?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = directory.join(format!(".incoming-{}-{}", std::process::id(), nanos));
+    let mut output =
+        fs::File::create(&temp).map_err(|error| format!("create {}: {}", temp.display(), error))?;
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut chunk)
+            .map_err(|error| format!("read {}: {}", source.display(), error))?;
+        if read == 0 {
+            break;
+        }
+        size = size.saturating_add(read as u64);
+        if size > MAX_BLOB_BYTES {
+            let _ = fs::remove_file(&temp);
+            return Err("blob is too large".into());
+        }
+        hasher.update(&chunk[..read]);
+        output
+            .write_all(&chunk[..read])
+            .map_err(|error| format!("write {}: {}", temp.display(), error))?;
+    }
+    output
+        .sync_all()
+        .map_err(|error| format!("sync {}: {}", temp.display(), error))?;
+    let id = format!("sha256:{}", hex(&hasher.finalize()));
+    let destination = blob_path(&id)?;
+    if destination.is_file() {
+        let _ = fs::remove_file(&temp);
+    } else {
+        fs::rename(&temp, &destination)
+            .map_err(|error| format!("rename {}: {}", destination.display(), error))?;
+    }
+    let _ = fs::remove_file(&source);
+    Ok(Meta { id, size })
 }
 
 pub fn meta(id: &str) -> Result<Meta, String> {
@@ -168,6 +267,32 @@ mod tests {
         for id in ["", "sha256:", "sha256:xyz", "../x", "sha256:../x"] {
             assert!(read(id).is_err(), "{id}");
         }
+    }
+
+    #[test]
+    fn a_plugin_blob_result_becomes_a_resource_link() {
+        let _ = root();
+        let incoming = incoming_dir();
+        std::fs::create_dir_all(&incoming).expect("incoming");
+        let source = incoming.join("report.txt");
+        std::fs::write(&source, b"result body").expect("result");
+        let mut result = json!({
+            "$blobPath": source.to_string_lossy(),
+            "name": "report.txt",
+            "mimeType": "text/plain"
+        });
+        materialize_result(&mut result).expect("materialize");
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["content"][1]["type"], "resource_link");
+        assert!(result["structuredContent"]["$blob"]
+            .as_str()
+            .expect("blob id")
+            .starts_with("sha256:"));
+        assert!(!source.exists());
+        let id = result["structuredContent"]["$blob"]
+            .as_str()
+            .expect("blob id");
+        assert_eq!(read(id).expect("read"), b"result body");
     }
 
     #[test]
