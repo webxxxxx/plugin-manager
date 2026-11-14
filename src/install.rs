@@ -1922,6 +1922,20 @@ fn self_install_user(request: SelfRequest) -> i32 {
     EXIT_OK
 }
 
+fn remove_file_retry(path: &Path) -> std::io::Result<()> {
+    let mut last = None;
+    for _ in 0..20 {
+        match fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => last = Some(error),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(last
+        .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "cannot remove file")))
+}
+
 fn self_uninstall_user(request: SelfRequest) -> i32 {
     let data = std::env::var_os("SVCD_DATA_DIR")
         .map(PathBuf::from)
@@ -1938,16 +1952,15 @@ fn self_uninstall_user(request: SelfRequest) -> i32 {
     }
     // The installed aliases can be hard links to the running daemon binary.
     // Stop the user daemon first so Windows can release the shared file.
-    let _ = crate::daemon::shutdown();
+    let _ = crate::daemon::shutdown_quiet();
     std::thread::sleep(std::time::Duration::from_millis(500));
     for name in std::iter::once(target_name).chain(alias_names()) {
         let path = install_root.join(name);
         if !path.exists() {
             continue;
         }
-        match fs::remove_file(&path) {
+        match remove_file_retry(&path) {
             Ok(()) => println!("removed {}", path.display()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 eprintln!(
                     "svcd: warning: cannot remove {}: {} (close any running svc/plugin/mcp process)",
@@ -2139,19 +2152,25 @@ fn copy_executable(source: &Path, target: &Path) -> io::Result<()> {
 }
 
 fn install_alias(source: &Path, target: &Path) -> io::Result<()> {
-    if target.exists() {
-        fs::remove_file(target)?;
-    }
-    match fs::hard_link(source, target) {
-        Ok(()) => {}
-        Err(_) => copy_executable(source, target)?,
-    }
-    #[cfg(unix)]
+    // Windows cannot unlink the last hard link while the daemon is running.
+    // Copies keep aliases removable independently of the running executable.
+    #[cfg(windows)]
     {
+        return copy_executable(source, target);
+    }
+    #[cfg(not(windows))]
+    {
+        if target.exists() {
+            fs::remove_file(target)?;
+        }
+        match fs::hard_link(source, target) {
+            Ok(()) => {}
+            Err(_) => copy_executable(source, target)?,
+        }
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(target, fs::Permissions::from_mode(0o755))?;
+        Ok(())
     }
-    Ok(())
 }
 
 fn usage_self(uninstall: bool) {

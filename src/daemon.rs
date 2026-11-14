@@ -220,17 +220,30 @@ pub fn request_shutdown() {
 }
 
 pub fn shutdown() -> i32 {
+    shutdown_inner(true)
+}
+
+/// Stop without printing "unreachable" when the daemon already exited.
+pub fn shutdown_quiet() -> i32 {
+    shutdown_inner(false)
+}
+
+fn shutdown_inner(verbose: bool) -> i32 {
     let config = paths::config_dir();
     match channel::request(&config, "svcd.shutdown", json!({})) {
         Ok(response) => match response.error {
             Some(error) => {
-                eprintln!("svcd: {}", error.message);
+                if verbose {
+                    eprintln!("svcd: {}", error.message);
+                }
                 1
             }
             None => 0,
         },
         Err(error) => {
-            eprintln!("svcd: svcd unreachable: {}", error);
+            if verbose {
+                eprintln!("svcd: svcd unreachable: {}", error);
+            }
             2
         }
     }
