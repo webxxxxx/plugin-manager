@@ -213,7 +213,11 @@ pub fn ensure_conf(explicit: Option<&Path>) -> Result<PathBuf, String> {
         return Ok(config_conf);
     }
 
-    let text = default_conf_text(&layout);
+    let mut text = default_conf_text(&layout);
+    if crate::paths::user_mode() {
+        // One daemon per user: don't let every profile contend for 8787.
+        text = text.replace("http_port = 8787", "http_port = 0");
+    }
     let mut failures = Vec::new();
     match write_conf(&config_conf, &text) {
         Ok(()) => {

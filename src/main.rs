@@ -74,6 +74,7 @@ fn svcd_run(args: Vec<String>) -> i32 {
         Some("--uninstall") | Some("uninstall") => install::self_uninstall(&args[1..]),
         Some("install-service") => install::install_service(&args[1..]),
         Some("uninstall-service") => install::uninstall_service(&args[1..]),
+        Some("user") => user_command(&args[1..]),
         _ => {
             usage();
             64
@@ -133,8 +134,192 @@ fn run_foreground(conf: Option<std::path::PathBuf>) -> i32 {
     daemon::run(conf)
 }
 
+fn user_command(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("start") => user_start(),
+        Some("stop") => crate::daemon::shutdown(),
+        Some("status") => user_status(),
+        Some("install") => user_install(),
+        Some("run") => {
+            std::env::set_var("SVCD_USER", "1");
+            run_command(&args[1..])
+        }
+        _ => {
+            user_usage();
+            64
+        }
+    }
+}
+
+fn user_usage() {
+    eprintln!("usage: svcd user start");
+    eprintln!("       svcd user stop");
+    eprintln!("       svcd user status");
+    eprintln!("       svcd user install");
+    eprintln!("       svcd user run --foreground [--conf <file>]");
+}
+
+fn user_running() -> bool {
+    crate::channel::request(
+        &crate::paths::config_dir(),
+        "svc.list",
+        serde_json::json!({}),
+    )
+    .is_ok()
+}
+
+fn user_start() -> i32 {
+    if !crate::paths::user_mode() {
+        eprintln!(
+            "svcd: user mode is only available to non-root users; set SVCD_USER=1 to force it"
+        );
+        return 1;
+    }
+    if user_running() {
+        println!("svcd user daemon is already running");
+        return 0;
+    }
+    let config = crate::paths::config_dir();
+    let logs = crate::paths::logs_dir();
+    if let Err(error) = std::fs::create_dir_all(&config) {
+        eprintln!("svcd: create {}: {}", config.display(), error);
+        return 1;
+    }
+    if let Err(error) = std::fs::create_dir_all(&logs) {
+        eprintln!("svcd: create {}: {}", logs.display(), error);
+        return 1;
+    }
+    let executable = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("svcd: current executable: {}", error);
+            return 1;
+        }
+    };
+    let log_path = logs.join("svcd.log");
+    let stdout = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("svcd: open {}: {}", log_path.display(), error);
+            return 1;
+        }
+    };
+    let stderr = match stdout.try_clone() {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("svcd: clone log handle: {}", error);
+            return 1;
+        }
+    };
+    let mut command = std::process::Command::new(&executable);
+    command
+        .args(["run", "--foreground"])
+        .env("SVCD_USER", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(stdout))
+        .stderr(std::process::Stdio::from(stderr));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    match command.spawn() {
+        Ok(child) => {
+            println!("svcd user daemon started (pid {})", child.id());
+            println!("config: {}", config.display());
+            println!("logs:   {}", log_path.display());
+            0
+        }
+        Err(error) => {
+            eprintln!("svcd: start user daemon: {}", error);
+            1
+        }
+    }
+}
+
+fn user_status() -> i32 {
+    println!("mode:   user");
+    println!("config: {}", crate::paths::config_dir().display());
+    println!("data:   {}", crate::paths::data_dir().display());
+    println!("logs:   {}", crate::paths::logs_dir().display());
+    if user_running() {
+        println!("state:  running");
+        0
+    } else {
+        println!("state:  stopped");
+        1
+    }
+}
+
+fn user_install() -> i32 {
+    if !crate::paths::user_mode() {
+        eprintln!("svcd: user install must run as the target user");
+        return 1;
+    }
+    let executable = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("svcd: current executable: {}", error);
+            return 1;
+        }
+    };
+    let bin = crate::paths::user_data_dir().join("bin");
+    if let Err(error) = std::fs::create_dir_all(&bin) {
+        eprintln!("svcd: create {}: {}", bin.display(), error);
+        return 1;
+    }
+    let extension = if cfg!(windows) { ".exe" } else { "" };
+    let mut installed = Vec::new();
+    for name in ["svcd", "svc", "plugin", "mcp"] {
+        let target = bin.join(format!("{}{}", name, extension));
+        if target.canonicalize().ok() == executable.canonicalize().ok() {
+            installed.push(target);
+            continue;
+        }
+        if let Err(error) = std::fs::copy(&executable, &target) {
+            eprintln!("svcd: install {}: {}", target.display(), error);
+            return 1;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755));
+        }
+        installed.push(target);
+    }
+    let config = crate::paths::config_dir();
+    if let Err(error) = std::fs::create_dir_all(&config) {
+        eprintln!("svcd: create {}: {}", config.display(), error);
+        return 1;
+    }
+    println!("installed user binaries:");
+    for path in installed {
+        println!("  {}", path.display());
+    }
+    println!("add {} to PATH, then run: svcd user start", bin.display());
+    0
+}
+
 fn usage() {
     eprintln!("usage: svcd run --foreground [--conf <file>]");
+    eprintln!("       svcd user start|stop|status|install|run --foreground");
     eprintln!("       svcd shutdown");
     eprintln!("       svcd --install [--prefix <dir>] [--conf <file>] [--manual] [--no-service] [--dry-run]");
     eprintln!("       svcd --uninstall [--prefix <dir>] [--no-service] [--purge] [--dry-run]");

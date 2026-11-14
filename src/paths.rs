@@ -2,11 +2,98 @@ use std::path::PathBuf;
 
 use crate::settings;
 
+/// Mode 1: a non-root process uses its own profile. Root (or an explicit
+/// `SVCD_USER=0`) keeps the system-wide profile.
+pub fn user_mode() -> bool {
+    match std::env::var("SVCD_USER").ok().as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => !crate::install::is_privileged(),
+    }
+}
+
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from)
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+}
+
+#[cfg(not(windows))]
+fn xdg_dir(variable: &str, fallback: &str) -> PathBuf {
+    if let Some(dir) = std::env::var_os(variable) {
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join("svcd");
+        }
+    }
+    home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(fallback)
+        .join("svcd")
+}
+
+pub fn user_config_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(dir) = std::env::var_os("APPDATA") {
+            return PathBuf::from(dir).join("svcd");
+        }
+        home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".svcd")
+    }
+    #[cfg(not(windows))]
+    {
+        xdg_dir("XDG_CONFIG_HOME", ".config")
+    }
+}
+
+pub fn user_data_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(dir).join("svcd");
+        }
+        home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".svcd")
+    }
+    #[cfg(not(windows))]
+    {
+        xdg_dir("XDG_DATA_HOME", ".local/share")
+    }
+}
+
+pub fn user_logs_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        user_data_dir().join("logs")
+    }
+    #[cfg(not(windows))]
+    {
+        xdg_dir("XDG_STATE_HOME", ".local/state").join("logs")
+    }
+}
+
+pub(crate) fn default_config_dir() -> PathBuf {
+    if user_mode() {
+        user_config_dir()
+    } else {
+        platform_config_dir()
+    }
+}
+
 /// The configuration directory: `svcd.conf`, `trust.d`, `lan.json` and the
 /// local control token. `SVCD_CONFIG_DIR` overrides it for tests; otherwise
 /// `config_dir` in the loaded `svcd.conf` wins over the platform default.
 /// Production defaults are `/etc/svcd`, `/Library/Application Support/svcd/config`
-/// and `%USERPROFILE%\.svcd`.
+/// and `%USERPROFILE%\.svcd`; a non-root process defaults to its user profile.
 pub fn config_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("SVCD_CONFIG_DIR") {
         return PathBuf::from(dir);
@@ -16,7 +103,7 @@ pub fn config_dir() -> PathBuf {
             return dir.clone();
         }
     }
-    platform_config_dir()
+    default_config_dir()
 }
 
 pub fn services_dir() -> PathBuf {
@@ -70,6 +157,9 @@ pub fn logs_dir() -> PathBuf {
             return dir;
         }
     }
+    if user_mode() {
+        return user_logs_dir();
+    }
     platform_logs_dir()
 }
 
@@ -86,6 +176,9 @@ pub fn data_dir() -> PathBuf {
         if let Some(dir) = settings.install_data_dir() {
             return dir;
         }
+    }
+    if user_mode() {
+        return user_data_dir();
     }
     platform_data_dir()
 }

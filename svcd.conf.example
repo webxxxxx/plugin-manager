@@ -9,6 +9,8 @@
 #   4. a generated default with platform paths
 #
 # Lines are `key = value`; lines starting with `#` are comments.
+# Non-root processes default to user mode (config under ~/.config/svcd on
+# Linux); this example is primarily for the root/system service.
 # Relative `config_dir` / `plugins_dir` / `services_dir` / `temp_dir` values
 # resolve against the directory containing this file.
 

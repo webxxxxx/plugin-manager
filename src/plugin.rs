@@ -1073,7 +1073,7 @@ pub fn replace_config(id: &str, candidate: &[u8], check: bool) -> Result<(), Str
 }
 
 pub fn root_required() -> Result<(), String> {
-    if crate::install::is_privileged() {
+    if crate::install::is_privileged() || crate::paths::user_mode() {
         Ok(())
     } else {
         Err("root / Administrator is required".into())

@@ -474,7 +474,7 @@ fn trust_command(action: TrustAction) -> i32 {
 }
 
 fn require_root_for_trust() -> Result<(), String> {
-    if crate::install::is_privileged() {
+    if crate::install::is_privileged() || crate::paths::user_mode() {
         Ok(())
     } else {
         Err("root / Administrator is required to change trust roots".into())
