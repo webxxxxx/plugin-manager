@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ws-panel · svcd WebSocket smoke test</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0f16;
+    --panel: #121924;
+    --line: #243044;
+    --text: #dce6f2;
+    --muted: #7f92a8;
+    --ok: #46e08a;
+    --bad: #ff7b7b;
+    --warn: #ffc861;
+    --accent: #63a4ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 28px;
+    font: 14px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: radial-gradient(1200px 600px at 10% -10%, #16304d 0%, var(--bg) 55%);
+    color: var(--text); min-height: 100vh;
+  }
+  header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  h1 { margin: 0; font-size: 22px; letter-spacing: .2px; }
+  .sub { margin: 4px 0 0; color: var(--muted); max-width: 720px; }
+  .badge { display: inline-flex; align-items: center; gap: 8px; padding: 8px 14px; border-radius: 999px; border: 1px solid var(--line); background: #0e1420; font-weight: 600; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--warn); box-shadow: 0 0 0 0 rgba(255,200,97,.5); }
+  .badge.ok .dot { background: var(--ok); animation: pulse 1.2s infinite; }
+  .badge.bad .dot { background: var(--bad); }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(70,224,138,.55); } 70% { box-shadow: 0 0 0 10px rgba(70,224,138,0); } 100% { box-shadow: 0 0 0 0 rgba(70,224,138,0); } }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin: 22px 0; }
+  .card { border: 1px solid var(--line); border-radius: 12px; background: linear-gradient(180deg, #141c28, #101722); padding: 12px 14px; }
+  .card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+  .card .value { font: 600 20px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; margin-top: 4px; }
+  .card .value.ok { color: var(--ok); }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+  input[type=text] {
+    flex: 1 1 240px; min-width: 200px; padding: 9px 12px; border-radius: 8px;
+    border: 1px solid var(--line); background: #0b111b; color: var(--text); font: inherit;
+  }
+  input[type=text]:focus { outline: none; border-color: var(--accent); }
+  button {
+    border: 1px solid var(--line); border-radius: 8px; background: #182233; color: var(--text);
+    padding: 9px 13px; font: 600 13px/1 inherit; cursor: pointer;
+  }
+  button:hover { background: #223049; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #061222; }
+  button.primary:hover { filter: brightness(1.08); }
+  button.danger { color: var(--bad); }
+  .panel { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; }
+  .panel-head { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+  #log { list-style: none; margin: 0; padding: 8px 0; height: 380px; overflow: auto; font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #log li { padding: 5px 14px; border-left: 3px solid transparent; white-space: pre-wrap; word-break: break-word; }
+  #log li .when { color: #5f7186; margin-right: 8px; }
+  #log li.out { border-left-color: var(--accent); }
+  #log li.in { border-left-color: var(--ok); }
+  #log li.sys { border-left-color: var(--warn); color: var(--muted); }
+  #log li.err { border-left-color: var(--bad); color: var(--bad); }
+  #log li.emit { background: rgba(99,164,255,.12); }
+  code { background: #0b111b; border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; }
+  footer { margin-top: 10px; color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>ws-panel <span style="color:var(--muted);font-weight:400">/ WebSocket smoke test</span></h1>
+    <p class="sub">
+      svcd bridges <code>/plugin-ui/ws-panel/ws</code> to the plugin process. The plugin pushes a
+      notification every second; buttons below send <code>tools/call</code> frames over the same socket.
+    </p>
+  </div>
+  <div id="badge" class="badge"><span class="dot"></span><span id="state">connecting…</span></div>
+</header>
+
+<div class="stats">
+  <div class="card"><div class="label">Events received</div><div id="events" class="value">0</div></div>
+  <div class="card"><div class="label">Last tick</div><div id="last-tick" class="value">—</div></div>
+  <div class="card"><div class="label">Round trip</div><div id="rtt" class="value">—</div></div>
+  <div class="card"><div class="label">Plugin status</div><div id="plugin-status" class="value" style="font-size:13px">—</div></div>
+</div>
+
+<div class="toolbar">
+  <input id="text" type="text" value="hello over WebSocket" aria-label="notification text">
+  <button id="emit" class="primary">Emit notification</button>
+  <button id="status">Call status</button>
+  <button id="disconnect" class="danger">Disconnect</button>
+  <button id="reconnect">Reconnect</button>
+</div>
+
+<div class="panel">
+  <div class="panel-head"><span>live frames</span><span id="count">0</span></div>
+  <ul id="log"></ul>
+</div>
+<footer>endpoint <code id="endpoint"></code> · notifications are server → UI, calls are UI → plugin over the same socket</footer>
+
+<script>
+(function () {
+  "use strict";
+  var parts = location.pathname.split("/").filter(Boolean);
+  var pluginId = parts[1] || "ws-panel";
+  var scheme = location.protocol === "https:" ? "wss" : "ws";
+  var endpoint = scheme + "://" + location.host + "/plugin-ui/" + pluginId + "/ws";
+  document.getElementById("endpoint").textContent = endpoint;
+
+  var log = document.getElementById("log");
+  var badge = document.getElementById("badge");
+  var stateEl = document.getElementById("state");
+  var eventsEl = document.getElementById("events");
+  var tickEl = document.getElementById("last-tick");
+  var rttEl = document.getElementById("rtt");
+  var statusEl = document.getElementById("plugin-status");
+  var countEl = document.getElementById("count");
+  var textEl = document.getElementById("text");
+
+  var socket = null;
+  var timer = null;
+  var manual = false;
+  var nextId = 1;
+  var events = 0;
+  var sent = {};
+
+  function setState(text, kind) {
+    stateEl.textContent = text;
+    badge.className = "badge" + (kind ? " " + kind : "");
+  }
+
+  function stamp() {
+    return new Date().toISOString().slice(11, 19);
+  }
+
+  function append(kind, text) {
+    var li = document.createElement("li");
+    li.className = kind;
+    var when = document.createElement("span");
+    when.className = "when";
+    when.textContent = stamp();
+    li.appendChild(when);
+    li.appendChild(document.createTextNode(text));
+    log.appendChild(li);
+    while (log.children.length > 200) log.removeChild(log.firstChild);
+    log.scrollTop = log.scrollHeight;
+    countEl.textContent = String(events);
+  }
+
+  function dispatch(name, args) {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      append("err", "socket is not open; cannot call " + name);
+      return;
+    }
+    var id = nextId++;
+    sent[id] = performance.now();
+    var frame = {
+      jsonrpc: "2.0",
+      id: id,
+      method: "tools/call",
+      params: { name: name, arguments: args || {} }
+    };
+    socket.send(JSON.stringify(frame));
+    append("out", "→ " + name + " " + JSON.stringify(args || {}));
+  }
+
+  function showResult(id, message) {
+    var elapsed = sent[id] === undefined ? null : performance.now() - sent[id];
+    if (elapsed !== null) {
+      rttEl.textContent = elapsed.toFixed(0) + " ms";
+      rttEl.className = "value ok";
+      delete sent[id];
+    }
+    var text = "";
+    try {
+      text = message.result.content[0].text;
+    } catch (error) {
+      text = JSON.stringify(message);
+    }
+    append("in", "← id=" + id + " " + text);
+    if (text.charAt(0) === "{") {
+      try {
+        var parsed = JSON.parse(text);
+        if (parsed.service) statusEl.textContent = parsed.service + " · tick " + parsed.tick;
+      } catch (ignored) {}
+    }
+  }
+
+  function onNotification(message) {
+    events += 1;
+    eventsEl.textContent = String(events);
+    var data = message.params && message.params.data ? message.params.data : message.params;
+    var text = typeof data === "string" ? data : JSON.stringify(data);
+    if (data && data.kind === "tick") {
+      tickEl.textContent = "tick " + data.tick;
+      append("in", "← tick " + data.tick + " (uptime " + data.uptime_s + "s)");
+    } else if (data && data.kind === "emit") {
+      append("emit", "← emit " + JSON.stringify(data.text));
+      flash();
+    } else {
+      append("in", "← " + message.method + " " + text);
+    }
+  }
+
+  function flash() {
+    document.body.animate(
+      [{ background: "rgba(99,164,255,.10)" }, { background: "transparent" }],
+      { duration: 500 }
+    );
+  }
+
+  function connect() {
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (socket) {
+      socket.onclose = null;
+      socket.close();
+    }
+    setState("connecting…");
+    append("sys", "opening " + endpoint);
+    socket = new WebSocket(endpoint);
+    socket.onopen = function () {
+      manual = false;
+      setState("connected", "ok");
+      append("sys", "WebSocket open; calling status");
+      dispatch("status", {});
+    };
+    socket.onmessage = function (event) {
+      var message;
+      try {
+        message = JSON.parse(event.data);
+      } catch (error) {
+        append("in", "← " + event.data);
+        return;
+      }
+      if (message.method) onNotification(message);
+      else if (message.id !== undefined) showResult(message.id, message);
+    };
+    socket.onerror = function () {
+      append("err", "WebSocket error");
+    };
+    socket.onclose = function (event) {
+      setState("closed (" + event.code + ")", "bad");
+      append("sys", "closed code=" + event.code + " clean=" + event.wasClean);
+      if (!manual) timer = setTimeout(connect, 1500);
+    };
+  }
+
+  document.getElementById("emit").onclick = function () {
+    dispatch("emit", { text: textEl.value });
+  };
+  document.getElementById("status").onclick = function () {
+    dispatch("status", {});
+  };
+  document.getElementById("disconnect").onclick = function () {
+    manual = true;
+    append("sys", "manual disconnect");
+    if (socket) socket.close();
+  };
+  document.getElementById("reconnect").onclick = function () {
+    manual = false;
+    connect();
+  };
+
+  connect();
+})();
+</script>
+</body>
+</html>

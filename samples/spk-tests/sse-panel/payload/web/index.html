@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sse-panel · svcd SSE smoke test</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0f16;
+    --panel: #121924;
+    --line: #243044;
+    --text: #dce6f2;
+    --muted: #7f92a8;
+    --ok: #46e08a;
+    --bad: #ff7b7b;
+    --warn: #ffc861;
+    --accent: #b48cff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 28px;
+    font: 14px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: radial-gradient(1200px 600px at 90% -10%, #2b1f4d 0%, var(--bg) 55%);
+    color: var(--text); min-height: 100vh;
+  }
+  header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  h1 { margin: 0; font-size: 22px; letter-spacing: .2px; }
+  .sub { margin: 4px 0 0; color: var(--muted); max-width: 760px; }
+  .badge { display: inline-flex; align-items: center; gap: 8px; padding: 8px 14px; border-radius: 999px; border: 1px solid var(--line); background: #0e1420; font-weight: 600; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--warn); }
+  .badge.ok .dot { background: var(--ok); animation: pulse 1.4s infinite; }
+  .badge.bad .dot { background: var(--bad); }
+  .badge.replay .dot { background: var(--accent); }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(70,224,138,.55); } 70% { box-shadow: 0 0 0 10px rgba(70,224,138,0); } 100% { box-shadow: 0 0 0 0 rgba(70,224,138,0); } }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 22px 0; }
+  .card { border: 1px solid var(--line); border-radius: 12px; background: linear-gradient(180deg, #171526, #101722); padding: 12px 14px; }
+  .card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+  .card .value { font: 600 20px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; margin-top: 4px; }
+  .card .value.ok { color: var(--ok); }
+  .card .value.replay { color: var(--accent); }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+  input[type=text] {
+    flex: 1 1 240px; min-width: 200px; padding: 9px 12px; border-radius: 8px;
+    border: 1px solid var(--line); background: #0b111b; color: var(--text); font: inherit;
+  }
+  input[type=text]:focus { outline: none; border-color: var(--accent); }
+  button {
+    border: 1px solid var(--line); border-radius: 8px; background: #1a2130; color: var(--text);
+    padding: 9px 13px; font: 600 13px/1 inherit; cursor: pointer;
+  }
+  button:hover { background: #26304a; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #150a2b; }
+  button.primary:hover { filter: brightness(1.08); }
+  button.danger { color: var(--bad); }
+  .banner {
+    display: none; margin: 0 0 12px; padding: 10px 14px; border-radius: 10px;
+    border: 1px solid #4b3a7a; background: rgba(180,140,255,.12); color: #d9c9ff;
+  }
+  .banner.show { display: block; }
+  .panel { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; }
+  .panel-head { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+  #log { list-style: none; margin: 0; padding: 8px 0; height: 400px; overflow: auto; font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #log li { padding: 5px 14px; border-left: 3px solid transparent; white-space: pre-wrap; word-break: break-word; }
+  #log li .when { color: #5f7186; margin-right: 8px; }
+  #log li .id { display: inline-block; min-width: 46px; color: #8f7ad6; margin-right: 8px; }
+  #log li.in { border-left-color: var(--ok); }
+  #log li.replay { border-left-color: var(--accent); background: rgba(180,140,255,.09); }
+  #log li.sys { border-left-color: var(--warn); color: var(--muted); }
+  #log li.err { border-left-color: var(--bad); color: var(--bad); }
+  #log li.out { border-left-color: #63a4ff; }
+  code { background: #0b111b; border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; }
+  footer { margin-top: 10px; color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>sse-panel <span style="color:var(--muted);font-weight:400">/ SSE smoke test</span></h1>
+    <p class="sub">
+      <code>EventSource</code> receives <code>/plugin-ui/sse-panel/events</code>; uplink calls use
+      <code>POST /plugin-ui/sse-panel/rpc</code>. Disconnect, let events accumulate, then replay with
+      <code>Last-Event-ID</code> to see the daemon's bounded history recover the gap.
+    </p>
+  </div>
+  <div id="badge" class="badge"><span class="dot"></span><span id="state">connecting…</span></div>
+</header>
+
+<div class="stats">
+  <div class="card"><div class="label">Events received</div><div id="events" class="value">0</div></div>
+  <div class="card"><div class="label">Last event id</div><div id="last-id" class="value">—</div></div>
+  <div class="card"><div class="label">Replayed</div><div id="replayed" class="value">0</div></div>
+  <div class="card"><div class="label">Plugin status</div><div id="plugin-status" class="value" style="font-size:13px">—</div></div>
+</div>
+
+<div id="banner" class="banner"></div>
+
+<div class="toolbar">
+  <input id="text" type="text" value="hello over SSE" aria-label="notification text">
+  <button id="emit" class="primary">Emit notification</button>
+  <button id="burst">Burst 5</button>
+  <button id="status">Call status</button>
+  <button id="disconnect" class="danger">Disconnect</button>
+  <button id="replay">Replay missed (Last-Event-ID)</button>
+  <button id="live">Back to EventSource</button>
+</div>
+
+<div class="panel">
+  <div class="panel-head"><span id="mode">EventSource · live</span><span id="count">0</span></div>
+  <ul id="log"></ul>
+</div>
+<footer>endpoint <code id="endpoint"></code></footer>
+
+<script>
+(function () {
+  "use strict";
+  var parts = location.pathname.split("/").filter(Boolean);
+  var pluginId = parts[1] || "sse-panel";
+  var endpoint = location.origin + "/plugin-ui/" + pluginId + "/events";
+  document.getElementById("endpoint").textContent = endpoint;
+
+  var log = document.getElementById("log");
+  var badge = document.getElementById("badge");
+  var stateEl = document.getElementById("state");
+  var eventsEl = document.getElementById("events");
+  var lastIdEl = document.getElementById("last-id");
+  var replayedEl = document.getElementById("replayed");
+  var statusEl = document.getElementById("plugin-status");
+  var countEl = document.getElementById("count");
+  var modeEl = document.getElementById("mode");
+  var banner = document.getElementById("banner");
+  var textEl = document.getElementById("text");
+
+  var source = null;
+  var controller = null;
+  var events = 0;
+  var lastId = null;
+  var checkpoint = null;
+  var replaying = false;
+  var replayed = 0;
+  var nextId = 1;
+
+  function stamp() { return new Date().toISOString().slice(11, 19); }
+
+  function setState(text, kind) {
+    stateEl.textContent = text;
+    badge.className = "badge" + (kind ? " " + kind : "");
+  }
+
+  function append(kind, id, text) {
+    var li = document.createElement("li");
+    li.className = kind;
+    var when = document.createElement("span");
+    when.className = "when";
+    when.textContent = stamp();
+    li.appendChild(when);
+    if (id !== null && id !== undefined) {
+      var badgeEl = document.createElement("span");
+      badgeEl.className = "id";
+      badgeEl.textContent = "#" + id;
+      li.appendChild(badgeEl);
+    }
+    li.appendChild(document.createTextNode(text));
+    log.appendChild(li);
+    while (log.children.length > 250) log.removeChild(log.firstChild);
+    log.scrollTop = log.scrollHeight;
+    countEl.textContent = String(events);
+  }
+
+  function noteEvent(id, payload, kindHint) {
+    events += 1;
+    eventsEl.textContent = String(events);
+    if (id !== null && id !== undefined) {
+      lastId = id;
+      lastIdEl.textContent = String(id);
+    }
+    var replayedNow = replaying;
+    if (replayedNow) {
+      replayed += 1;
+      replayedEl.textContent = String(replayed);
+      replayedEl.className = "value replay";
+    }
+    var data = payload && payload.params ? payload.params.data : payload;
+    var kind = replayedNow ? "replay" : "in";
+    var prefix = replayedNow ? "REPLAY " : "";
+    if (data && data.kind === "tick") {
+      append(kind, id, prefix + "tick " + data.tick + " (uptime " + data.uptime_s + "s)");
+    } else if (data && data.kind === "emit") {
+      append(kind, id, prefix + "emit " + JSON.stringify(data.text));
+    } else {
+      append(kind, id, prefix + String(kindHint || "message") + " " + JSON.stringify(payload));
+    }
+  }
+
+  function parseBlock(block) {
+    if (!block || block.charAt(0) === ":") return;
+    var lines = block.split("\n");
+    var id = null;
+    var name = "message";
+    var data = [];
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+      if (line.indexOf("id:") === 0) id = Number(line.slice(3).trim());
+      else if (line.indexOf("event:") === 0) name = line.slice(6).trim();
+      else if (line.indexOf("data:") === 0) data.push(line.slice(5).trim());
+    }
+    if (!data.length) return;
+    var payload;
+    try { payload = JSON.parse(data.join("\n")); } catch (error) { payload = data.join("\n"); }
+    if (name === "reset") {
+      banner.className = "banner show";
+      banner.textContent = "reset: the requested Last-Event-ID fell out of the replay window";
+      append("err", null, "reset " + JSON.stringify(payload));
+      return;
+    }
+    noteEvent(id, payload, name);
+  }
+
+  function closeStreams() {
+    if (source) { source.close(); source = null; }
+    if (controller) { controller.abort(); controller = null; }
+  }
+
+  function connectSource() {
+    closeStreams();
+    replaying = false;
+    setState("EventSource · connecting…");
+    modeEl.textContent = "EventSource · live";
+    source = new EventSource("events");
+    source.onopen = function () { setState("EventSource · live", "ok"); };
+    source.onerror = function () { setState("EventSource · reconnecting…", "bad"); };
+    source.addEventListener("message", function (event) {
+      var payload;
+      try { payload = JSON.parse(event.data); } catch (error) { payload = event.data; }
+      noteEvent(Number(event.lastEventId), payload, "message");
+    });
+    source.addEventListener("reset", function (event) {
+      banner.className = "banner show";
+      banner.textContent = "reset: " + event.data;
+    });
+  }
+
+  async function replayViaFetch() {
+    closeStreams();
+    var resumeFrom = checkpoint !== null ? checkpoint : lastId;
+    if (resumeFrom === null) {
+      append("err", null, "no checkpoint yet; wait for one event first");
+      return;
+    }
+    replaying = true;
+    replayed = 0;
+    replayedEl.textContent = "0";
+    banner.className = "banner show";
+    banner.textContent = "opening a fetch SSE stream with Last-Event-ID: " + resumeFrom + " …";
+    setState("fetch SSE · replay from #" + resumeFrom, "replay");
+    modeEl.textContent = "fetch + Last-Event-ID · replaying";
+    append("sys", null, "requesting events with Last-Event-ID: " + resumeFrom);
+    controller = new AbortController();
+    try {
+      var response = await fetch("events", {
+        headers: { "Last-Event-ID": String(resumeFrom) },
+        signal: controller.signal
+      });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      var reader = response.body.getReader();
+      var decoder = new TextDecoder();
+      var buffer = "";
+      setTimeout(function () {
+        if (!replaying) return;
+        replaying = false;
+        setState("fetch SSE · live", "ok");
+        modeEl.textContent = "fetch + Last-Event-ID · live";
+        banner.textContent = "replayed " + replayed + " missed event(s) after Last-Event-ID " + resumeFrom;
+        append("sys", null, "replay finished: " + replayed + " event(s) recovered");
+      }, 1200);
+      while (true) {
+        var chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, { stream: true });
+        var index;
+        while ((index = buffer.indexOf("\n\n")) >= 0) {
+          parseBlock(buffer.slice(0, index));
+          buffer = buffer.slice(index + 2);
+        }
+      }
+      setState("fetch SSE · closed", "bad");
+    } catch (error) {
+      if (error.name !== "AbortError") {
+        setState("fetch SSE · error", "bad");
+        append("err", null, "fetch SSE failed: " + error);
+      }
+    }
+  }
+
+  async function call(name, args) {
+    var id = nextId++;
+    append("out", null, "→ tools/call " + name + " " + JSON.stringify(args || {}));
+    try {
+      var response = await fetch("rpc", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: id,
+          method: "tools/call",
+          params: { name: name, arguments: args || {} }
+        })
+      });
+      var message = await response.json();
+      var text = message.result && message.result.content ? message.result.content[0].text : JSON.stringify(message);
+      append("in", null, "← " + text);
+      return text;
+    } catch (error) {
+      append("err", null, "rpc failed: " + error);
+      return null;
+    }
+  }
+
+  document.getElementById("emit").onclick = function () {
+    call("emit", { text: textEl.value });
+  };
+  document.getElementById("burst").onclick = function () {
+    for (var i = 1; i <= 5; i++) call("emit", { text: "burst " + i });
+  };
+  document.getElementById("status").onclick = async function () {
+    var text = await call("status", {});
+    if (!text) return;
+    try {
+      var parsed = JSON.parse(text);
+      statusEl.textContent = parsed.service + " · tick " + parsed.tick;
+    } catch (ignored) {}
+  };
+  document.getElementById("disconnect").onclick = function () {
+    checkpoint = lastId;
+    closeStreams();
+    replaying = false;
+    setState("disconnected", "bad");
+    modeEl.textContent = "disconnected";
+    append("sys", null, "closed; checkpoint Last-Event-ID = " + checkpoint);
+    banner.className = "banner show";
+    banner.textContent = "disconnected at event #" + checkpoint + " — emit or wait, then replay";
+  };
+  document.getElementById("replay").onclick = function () {
+    replayViaFetch();
+  };
+  document.getElementById("live").onclick = function () {
+    banner.className = "banner";
+    connectSource();
+  };
+
+  connectSource();
+})();
+</script>
+</body>
+</html>

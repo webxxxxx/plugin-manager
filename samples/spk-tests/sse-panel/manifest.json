@@ -1,0 +1,48 @@
+{
+  "schema": 2,
+  "protocol": 1,
+  "name": "sse-panel",
+  "version": "1.0.0",
+  "platform": "x86_64-unknown-linux-gnu",
+  "desc": "SSE smoke test: EventSource downlink with Last-Event-ID replay",
+  "exec": {
+    "path": "payload/bin/agent.py",
+    "ready": "notify"
+  },
+  "interpreter": {
+    "name": "python3",
+    "version": ">=3.8"
+  },
+  "capabilities": [
+    {
+      "name": "status",
+      "desc": "Report the tick counter and uptime",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "emit",
+      "desc": "Publish one custom notification for the SSE stream",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Text carried by the notification"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "ui": {
+    "type": "web",
+    "entry": "index.html"
+  }
+}

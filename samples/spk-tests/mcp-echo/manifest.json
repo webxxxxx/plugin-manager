@@ -1,0 +1,64 @@
+{
+  "schema": 2,
+  "protocol": 1,
+  "name": "mcp-echo",
+  "version": "1.0.0",
+  "platform": "x86_64-unknown-linux-gnu",
+  "desc": "MCP smoke test: echo/add/status capabilities exposed as MCP tools",
+  "exec": {
+    "path": "payload/bin/agent.py",
+    "ready": "notify"
+  },
+  "interpreter": {
+    "name": "python3",
+    "version": ">=3.8"
+  },
+  "capabilities": [
+    {
+      "name": "echo",
+      "desc": "Echo one string back, prefixed with the service id",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Text to echo"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "add",
+      "desc": "Add two numbers and return the sum as text",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "type": "number"
+          },
+          "b": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "a",
+          "b"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "status",
+      "desc": "Report pid, uptime and how many tool calls this process served",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    }
+  ]
+}

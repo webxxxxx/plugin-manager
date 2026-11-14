@@ -1,0 +1,30 @@
+{
+  "schema": 2,
+  "protocol": 1,
+  "name": "dep-app",
+  "version": "1.0.0",
+  "platform": "x86_64-unknown-linux-gnu",
+  "desc": "Dependency smoke test: starts only after dep-base is installed and running",
+  "exec": {
+    "path": "payload/bin/agent.py",
+    "ready": "notify"
+  },
+  "interpreter": {
+    "name": "python3",
+    "version": ">=3.8"
+  },
+  "dependencies": [
+    "dep-base"
+  ],
+  "capabilities": [
+    {
+      "name": "report",
+      "desc": "Report which dependency svcd started before this service",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    }
+  ]
+}

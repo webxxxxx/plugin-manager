@@ -36,3 +36,11 @@ jobs:
       - name: Check minimal build without HTTP
         if: matrix.os == 'ubuntu-latest'
         run: cargo check --no-default-features
+      - name: Build for the sample .spk smoke test
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo build
+      - name: Sample .spk smoke (dependencies, MCP, WebSocket, SSE)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          node tools/gen_sample_key.mjs
+          python3 tools/spk_smoke.py --binary target/debug/svcd

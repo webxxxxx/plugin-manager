@@ -1,0 +1,27 @@
+{
+  "schema": 2,
+  "protocol": 1,
+  "name": "dep-base",
+  "version": "1.0.0",
+  "platform": "x86_64-unknown-linux-gnu",
+  "desc": "Dependency smoke test: the base service dep-app depends on",
+  "exec": {
+    "path": "payload/bin/agent.py",
+    "ready": "notify"
+  },
+  "interpreter": {
+    "name": "python3",
+    "version": ">=3.8"
+  },
+  "capabilities": [
+    {
+      "name": "whoami",
+      "desc": "Report the identity of this base service",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    }
+  ]
+}

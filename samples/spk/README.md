@@ -42,4 +42,20 @@ revokes one. The trust root is deliberately never inside the `.spk`.
 
 Then install the `.spk` through `plugin install` or the web console.
 
+## WSL smoke packages
+
+`samples/spk-tests/` holds five packages that exercise dependencies, MCP,
+WebSocket and SSE on WSL. Build them with a Linux `plugin bundle` so the
+manifest `platform` matches the daemon that will install them:
+
+```sh
+CARGO_TARGET_DIR=/tmp/svcd-target cargo build
+python3 tools/spk_smoke.py --binary /tmp/svcd-target/debug/svcd
+```
+
+The harness writes `dep-base-*.spk`, `dep-app-*.spk`, `mcp-echo-*.spk`,
+`ws-panel-*.spk` and `sse-panel-*.spk` here, installs them into a throwaway
+tree, runs the checks and prints the web UI URLs. Use `--serve` to keep them
+running for the browser; see `samples/spk-tests/README.md`.
+
 The legacy `samples/out/` directory is kept ignored for older builds.

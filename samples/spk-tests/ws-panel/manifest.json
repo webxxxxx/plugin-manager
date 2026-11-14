@@ -1,0 +1,48 @@
+{
+  "schema": 2,
+  "protocol": 1,
+  "name": "ws-panel",
+  "version": "1.0.0",
+  "platform": "x86_64-unknown-linux-gnu",
+  "desc": "WebSocket smoke test: bidirectional UI with one notification per second",
+  "exec": {
+    "path": "payload/bin/agent.py",
+    "ready": "notify"
+  },
+  "interpreter": {
+    "name": "python3",
+    "version": ">=3.8"
+  },
+  "capabilities": [
+    {
+      "name": "status",
+      "desc": "Report the tick counter and uptime",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "emit",
+      "desc": "Broadcast one custom notification to every connected UI",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Text carried by the notification"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "ui": {
+    "type": "web",
+    "entry": "index.html"
+  }
+}
