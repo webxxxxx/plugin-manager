@@ -8,12 +8,13 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::paths;
+use crate::settings;
 
 pub const MAX_BLOB_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -24,7 +25,7 @@ pub struct Meta {
 }
 
 pub fn dir() -> PathBuf {
-    paths::data_dir().join("blobs")
+    paths::temp_dir()
 }
 
 pub fn incoming_dir() -> PathBuf {
@@ -64,14 +65,103 @@ pub fn put(bytes: &[u8]) -> Result<Meta, String> {
 
 pub fn read(id: &str) -> Result<Vec<u8>, String> {
     let path = blob_path(id)?;
+    touch(&path);
     fs::read(&path).map_err(|error| format!("read {}: {}", path.display(), error))
 }
 
 pub fn path(id: &str) -> Result<PathBuf, String> {
-    blob_path(id)
+    let path = blob_path(id)?;
+    touch(&path);
+    Ok(path)
 }
 
-/// Import a file a plugin wrote into `SVCD_BLOB_DIR` and replace a
+/// Remove temp files older than `retention`. This includes content-addressed
+/// blobs and stale `incoming/` files. Active reads/argument resolution touch
+/// the mtime first, so a file that is being used is not immediately eligible.
+pub fn cleanup(retention: Duration) -> std::io::Result<usize> {
+    let root = dir();
+    if !root.is_dir() {
+        return Ok(0);
+    }
+    let cutoff = SystemTime::now()
+        .checked_sub(retention)
+        .unwrap_or(UNIX_EPOCH);
+    let mut removed = 0;
+    cleanup_dir(&root, &root, cutoff, &mut removed)?;
+    Ok(removed)
+}
+
+fn cleanup_dir(
+    root: &Path,
+    directory: &Path,
+    cutoff: SystemTime,
+    removed: &mut usize,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            cleanup_dir(root, &path, cutoff, removed)?;
+            if path != root
+                && path
+                    .file_name()
+                    .map(|name| name != "incoming")
+                    .unwrap_or(false)
+            {
+                let _ = fs::remove_dir(&path);
+            }
+            continue;
+        }
+        if !file_type.is_file() && !file_type.is_symlink() {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH);
+        if modified <= cutoff {
+            if fs::remove_file(&path).is_ok() {
+                *removed += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Start one background cleanup thread. `temp_cleanup_interval_secs = 0`
+/// disables it.
+pub fn spawn_cleanup() {
+    let Ok(settings) = settings::current() else {
+        return;
+    };
+    let retention = settings.temp_retention();
+    let interval = settings.temp_cleanup_interval();
+    if interval.is_zero() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("svcd-temp-cleanup".into())
+        .stack_size(128 * 1024)
+        .spawn(move || loop {
+            match cleanup(retention) {
+                Ok(0) => {}
+                Ok(removed) => {
+                    crate::log::svcd(&format!("svcd: temp cleanup removed {} file(s)", removed))
+                }
+                Err(error) => crate::log::svcd(&format!("svcd: temp cleanup failed: {}", error)),
+            }
+            std::thread::sleep(interval);
+        });
+}
+
+fn touch(path: &Path) {
+    if let Ok(file) = fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_times(fs::FileTimes::new().set_modified(SystemTime::now()));
+    }
+}
+
+/// Import a file a plugin wrote into `SVCD_TEMP_DIR` and replace a
 /// `$blobPath` result with an MCP resource link plus structured blob metadata.
 pub fn materialize_result(result: &mut Value) -> Result<(), String> {
     let Some(path) = result.get("$blobPath").and_then(Value::as_str) else {
@@ -296,6 +386,30 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_removes_old_files_and_keeps_fresh_ones() {
+        let _ = root();
+        let incoming = incoming_dir();
+        std::fs::create_dir_all(&incoming).expect("incoming");
+        let old = incoming.join("old.bin");
+        let fresh = incoming.join("fresh.bin");
+        std::fs::write(&old, b"old").expect("old");
+        std::fs::write(&fresh, b"fresh").expect("fresh");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&old)
+            .expect("open old");
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(SystemTime::now() - Duration::from_secs(3 * 60 * 60)),
+        )
+        .expect("old mtime");
+        let removed = cleanup(Duration::from_secs(2 * 60 * 60)).expect("cleanup");
+        assert!(removed >= 1, "removed {removed}");
+        assert!(!old.exists());
+        assert!(fresh.exists());
+    }
+
+    #[test]
     fn blob_refs_are_resolved_to_paths_in_arguments() {
         let _ = root();
         let meta = put(b"file body").expect("put");
@@ -304,6 +418,6 @@ mod tests {
         let input = &args["input"];
         assert_eq!(input["$blob"], meta.id);
         assert_eq!(input["size"], 9);
-        assert!(input["path"].as_str().expect("path").contains("blobs"));
+        assert!(input["path"].as_str().expect("path").contains("temp"));
     }
 }

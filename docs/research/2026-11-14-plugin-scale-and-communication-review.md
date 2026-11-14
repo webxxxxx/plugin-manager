@@ -598,14 +598,16 @@ daemon threads=163
 - **已实现**：Unix 插件 stdout/stderr reactor；80 个插件复测 daemon 线程从 163 降到 4（见 2.2.1）。
 - **已实现**：插件每连接/每插件的 frame 队列改为有界 `sync_channel`；reactor 在队列满时暂停该插件读取。
 - **已实现**：manifest `protocol: 2` 的 4 字节长度前缀帧；已用 Python 长度帧插件在 WSL 端到端验证 `initialize` / `tools/list` / `tools/call`。
-- **已实现**：内容寻址 blob store、`POST/GET /api/v1/blobs`、工具参数中的 `$blob` 解析为受控路径（`SVCD_BLOB_DIR`）。
+- **已实现**：内容寻址 blob store、`POST/GET /api/v1/blobs`、工具参数中的 `$blob` 解析为受控路径（`SVCD_TEMP_DIR`）。
 - **已实现（Unix）**：HTTP 监听器/普通请求进入 poll reactor，阻塞 handler 由 4 个固定 worker 执行；普通 HTTP 连接不再各自创建线程。实测 400 并发 HTTP 请求时 daemon 峰值 25 线程、回落到 4。
 - **已实现（Unix）**：SSE 进入 reactor 状态机（订阅、replay、heartbeat、chunked 写出都不再占连接线程）；WebSocket 也进入 reactor 状态机（握手、帧解析、事件转发、分片重组、`tools/call` 交给 worker）。Unix 上普通 HTTP / SSE / WS 都不再占每连接线程。
 - **已实现（Unix）**：本地管理 UDS 进入独立 poll reactor；每个连接只是 fd/状态，不再每连接一线程。80 插件、全 reactor 下 daemon 为 **8 线程**（daemon + 插件 reactor + 管理 reactor + HTTP reactor + 4 worker）。
-- **已实现**：插件把大结果写入 `SVCD_BLOB_DIR/incoming/`，返回 `$blobPath`；宿主校验路径、流式哈希并落成内容寻址 blob，MCP 结果替换为 `resource_link` + `structuredContent.$blob`。
+- **已实现**：插件把大结果写入 `SVCD_TEMP_DIR/incoming/`，返回 `$blobPath`；宿主校验路径、流式哈希并落成内容寻址 blob，MCP 结果替换为 `resource_link` + `structuredContent.$blob`。
 - **已实现**：MCP `tools/call` 的 progress 透传。客户端在 `_meta.progressToken` 给出 token，宿主把它带给插件；插件发 `notifications/progress` 时，管理通道可以多帧返回，stdio 桥在等待最终响应期间把进度写给客户端。Windows 的线程通道同样支持多帧。
 - **已实现**：HTTP MCP progress。`POST /mcp` 在 `Accept: text/event-stream` 且 `tools/call` 带 progressToken 时返回 SSE：progress 事件在前，最终 JSON-RPC response 在后；Unix reactor 和 Windows fallback 都支持。
-- **已实现**：插件 blob 约定文档（`$blob` / `$blobPath` / `SVCD_BLOB_DIR`），见 `docs/plugin-blob.md`。
+- **已实现（Unix）**：管理客户端 reactor。HTTP MCP streaming 的上游管理连接由一个 poll 线程多路复用，不再每个流一个阻塞线程；每流一个 fd + 有界队列。
+- **已实现**：`SVCD_TEMP_DIR`（原 `SVCD_BLOB_DIR`）与后台清理线程；默认 2 小时 TTL、5 分钟扫描，`temp_dir` / `temp_retention_secs` / `temp_cleanup_interval_secs` 可在 `svcd.conf` 配置。
+- **已实现**：插件 blob 约定文档（`$blob` / `$blobPath` / `SVCD_TEMP_DIR`），见 `docs/plugin-blob.md`。
 - **尚未实现**：job 化长任务、逐 token 结果流（当前 progress 是通知，不是结果分块）。
 
 ## 附录 B：相关代码位置

@@ -1,4 +1,4 @@
-# 插件大对象：`$blob`、`$blobPath` 与 `SVCD_BLOB_DIR`
+# 插件大对象：`$blob`、`$blobPath` 与 `SVCD_TEMP_DIR`
 
 > 面向插件作者和工具门户开发者。目标：让超过 1 MiB 的参数/结果不进入 JSON-RPC 控制帧，同时保持鉴权、路径边界和可审计性。
 
@@ -13,7 +13,7 @@
 svcd 提供内容寻址的 blob store：
 
 - 参数：客户端/门户上传 blob，工具参数只携带 `{"$blob":"sha256:<hex>"}`；
-- 结果：插件把文件写到 `SVCD_BLOB_DIR/incoming/`，返回 `$blobPath`，宿主落成 blob 并返回 MCP `resource_link`。
+- 结果：插件把文件写到 `SVCD_TEMP_DIR/incoming/`，返回 `$blobPath`，宿主落成 blob 并返回 MCP `resource_link`。
 
 控制帧里始终只有小 JSON。
 
@@ -21,19 +21,19 @@ svcd 提供内容寻址的 blob store：
 
 | 名称 | 含义 |
 |---|---|
-| `SVCD_BLOB_DIR` | 宿主通过环境变量传给插件的 blob 根目录 |
-| `<SVCD_BLOB_DIR>/sha256-...` | 已落盘的内容寻址 blob（文件名是十六进制摘要） |
-| `<SVCD_BLOB_DIR>/incoming/` | 插件写结果的暂存目录；宿主校验后移入 blob store |
+| `SVCD_TEMP_DIR` | 宿主通过环境变量传给插件的临时根目录 |
+| `<SVCD_TEMP_DIR>/sha256-...` | 已落盘的内容寻址 blob（文件名是十六进制摘要） |
+| `<SVCD_TEMP_DIR>/incoming/` | 插件写结果的暂存目录；宿主校验后移入 blob store |
 | `sha256:<hex>` | blob id（64 位小写十六进制） |
 
 路径示例（Linux）：
 
 ```text
-/var/lib/svcd/blobs/incoming/report-7f3a.txt
-/var/lib/svcd/blobs/9f2c...e1
+/var/lib/svcd/temp/incoming/report-7f3a.txt
+/var/lib/svcd/temp/9f2c...e1
 ```
 
-Windows 使用对应的数据目录；插件应始终使用宿主注入的 `SVCD_BLOB_DIR`，不要硬编码。
+Windows 使用对应的数据目录；插件应始终使用宿主注入的 `SVCD_TEMP_DIR`，不要硬编码。
 
 ## 3. 上传：给工具参数准备 blob
 
@@ -57,7 +57,20 @@ Authorization: Bearer <password-or-session>
 GET /api/v1/blobs/sha256:9f2c...e1
 ```
 
-需要与管理 API 相同的鉴权。单 blob 上限 **512 MiB**；没有公开的 GC/过期接口，当前需要运维按保留策略清理。
+需要与管理 API 相同的鉴权。单 blob 上限 **512 MiB**。
+
+宿主有一个后台清理线程：默认删除 `temp_dir` 下 **超过 2 小时**未访问的文件，每 5 分钟扫描一次。配置项：
+
+```ini
+# 不写时默认 <data>/temp
+temp_dir = /var/tmp/svcd
+# 默认 7200 秒（2 小时）
+temp_retention_secs = 7200
+# 默认 300 秒；设为 0 可完全关闭清理
+temp_cleanup_interval_secs = 300
+```
+
+`SVCD_TEMP_DIR` 环境变量优先于 `svcd.conf` 的 `temp_dir`，主要用于测试和隔离运行。
 
 ## 4. 参数：`$blob`
 
@@ -75,7 +88,7 @@ GET /api/v1/blobs/sha256:9f2c...e1
 ```json
 {
   "$blob": "sha256:9f2c...e1",
-  "path": "/var/lib/svcd/blobs/9f2c...e1",
+  "path": "/var/lib/svcd/temp/9f2c...e1",
   "size": 10485760
 }
 ```
@@ -85,7 +98,7 @@ GET /api/v1/blobs/sha256:9f2c...e1
 1. 读取 `arguments.<字段>.path`；
 2. 把它当**只读文件**打开；
 3. 需要流式处理时按文件读，不要整个读进内存；
-4. 不要假设这个路径会长期存在（当前没有 TTL，但未来可能变化）。
+4. 不要假设这个路径会长期存在：宿主默认按 2 小时 TTL 清理，长时间读取需要业务方重新解析参数或提高 `temp_retention_secs`。
 
 缺失/非法 blob 会让宿主在调用插件前返回工具错误。
 
@@ -93,12 +106,12 @@ GET /api/v1/blobs/sha256:9f2c...e1
 
 插件生成大结果时：
 
-1. 写入 `SVCD_BLOB_DIR/incoming/` 下的唯一文件名；
+1. 写入 `SVCD_TEMP_DIR/incoming/` 下的唯一文件名；
 2. 返回一个**小对象**：
 
 ```json
 {
-  "$blobPath": "/var/lib/svcd/blobs/incoming/report-7f3a.txt",
+  "$blobPath": "/var/lib/svcd/temp/incoming/report-7f3a.txt",
   "name": "report.txt",
   "mimeType": "text/plain"
 }
@@ -144,7 +157,7 @@ MCP 客户端/门户可以用 `structuredContent.$blob` 或 `resource_link` 中�
 | `$blob` id 不存在 | 宿主在调用插件前返回工具错误 |
 | `$blobPath` 不在 `incoming/` | 宿主返回工具错误，不落盘 |
 | 结果文件超过 512 MiB | 宿主返回工具错误，删除临时文件（尽力） |
-| 写入后哈希失败/IO 错误 | 工具错误；incoming 文件可能残留，需要清理 |
+| 写入后哈希失败/IO 错误 | 工具错误；残留文件由后台清理线程按 TTL 删除 |
 | 客户端上传超过 512 MiB | HTTP 413 |
 | 客户端没有 blob 权限 | HTTP 401/403 |
 
@@ -155,7 +168,7 @@ MCP 客户端/门户可以用 `structuredContent.$blob` 或 `resource_link` 中�
 ```python
 import json, os, sys, uuid
 
-blob_dir = os.environ["SVCD_BLOB_DIR"]
+temp_dir = os.environ["SVCD_TEMP_DIR"]
 
 for line in sys.stdin:
     msg = json.loads(line)
@@ -169,7 +182,7 @@ for line in sys.stdin:
     input_path = args.get("input", {}).get("path")
 
     # 大结果先写 incoming，再返回引用。
-    incoming = os.path.join(blob_dir, "incoming")
+    incoming = os.path.join(temp_dir, "incoming")
     os.makedirs(incoming, exist_ok=True)
     name = f"result-{uuid.uuid4().hex}.bin"
     path = os.path.join(incoming, name)
@@ -194,7 +207,7 @@ for line in sys.stdin:
 - 插件返回的 `$blobPath` 会被 canonicalize 并限制在 `incoming/` 内；不要尝试 `..`、符号链接或指向其他目录。
 - blob store 不是租户隔离的完整方案；多租户部署需要在网关/门户层做 blob 访问授权。
 - 不要把密钥、token 写进 blob 文件名或内容；blob 内容不加密。
-- 当前没有自动 GC；请按业务保留策略清理 `blobs/` 与 `incoming/`。
+- 后台清理线程默认删除超过 2 小时的文件；仍在使用的 blob 在解析/读取时会被 touch，避免刚被引用就被删。长于 TTL 的持续读取仍需要业务方自行保活或提高 `temp_retention_secs`。
 
 ## 9. 与协议版本的关系
 
@@ -206,5 +219,5 @@ for line in sys.stdin:
 
 - `src/blob.rs`：存储、id 校验、路径解析、结果物化。
 - `src/api.rs`：`POST/GET /api/v1/blobs`。
-- `src/slot.rs`：注入 `SVCD_BLOB_DIR`，解析 `$blob`，物化 `$blobPath`。
+- `src/slot.rs`：注入 `SVCD_TEMP_DIR`，解析 `$blob`，物化 `$blobPath`。
 - `src/mcp.rs`：结果包装与 resource link。

@@ -6,6 +6,8 @@ mod bundle;
 mod catalog;
 mod channel;
 #[cfg(unix)]
+mod channel_client_reactor;
+#[cfg(unix)]
 mod channel_reactor;
 mod daemon;
 mod definition;

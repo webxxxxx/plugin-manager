@@ -287,7 +287,7 @@ impl Slot {
         };
         let blob_dir = crate::blob::dir();
         let _ = std::fs::create_dir_all(crate::blob::incoming_dir());
-        command.env("SVCD_BLOB_DIR", &blob_dir);
+        command.env("SVCD_TEMP_DIR", &blob_dir);
         match self.exec.ready {
             Ready::Notify => {
                 command

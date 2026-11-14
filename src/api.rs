@@ -5,6 +5,8 @@
 //! same daemon RPC the CLI uses, so the HTTP surface never owns a second copy of
 //! service state.
 
+#[cfg(unix)]
+use crate::channel_client_reactor::{ClientReactor, Event as ClientEvent};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
@@ -268,14 +270,10 @@ const MAX_MCP_STREAMS: usize = 64;
 static MCP_STREAMS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(unix)]
-enum McpSseEvent {
-    Frame(String),
-    Final(String),
-}
-
-#[cfg(unix)]
 struct McpSseState {
-    receiver: Receiver<McpSseEvent>,
+    receiver: Receiver<ClientEvent>,
+    id: Option<Value>,
+    stream: u64,
     done: bool,
 }
 
@@ -326,6 +324,7 @@ fn reactor_loop(
     if let Some(active) = &listener {
         let _ = active.set_nonblocking(true);
     }
+    let client = ClientReactor::start().ok();
     let (results_tx, results_rx) = mpsc::channel();
     let (mut notify_rx, notify_tx) = match UnixStream::pair() {
         Ok((rx, tx)) => (rx, tx),
@@ -494,6 +493,7 @@ fn reactor_loop(
             };
             let revents = descriptors[index].revents;
             if revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+                release_mcp_stream(connection, client.as_deref());
                 connections.remove(&id);
                 continue;
             }
@@ -530,7 +530,23 @@ fn reactor_loop(
                                         );
                                         match prepared {
                                             Ok(Some(call)) => {
-                                                start_mcp_sse(connection, call, config.clone());
+                                                if let Some(client) = &client {
+                                                    start_mcp_sse(
+                                                        connection,
+                                                        call,
+                                                        config.clone(),
+                                                        client,
+                                                    );
+                                                } else {
+                                                    connection.out = http::json_error(
+                                                        500,
+                                                        "stream_unavailable",
+                                                        "management client reactor is unavailable",
+                                                    );
+                                                    connection.out_at = 0;
+                                                    connection.keep_alive = false;
+                                                    connection.state = ConnState::Writing;
+                                                }
                                                 break;
                                             }
                                             Ok(None) => {}
@@ -616,12 +632,14 @@ fn reactor_loop(
                     let mut discard = [0u8; 512];
                     match connection.stream.read(&mut discard) {
                         Ok(0) => {
+                            release_mcp_stream(connection, client.as_deref());
                             connections.remove(&id);
                             continue;
                         }
                         Ok(_) => {}
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(_) => {
+                            release_mcp_stream(connection, client.as_deref());
                             connections.remove(&id);
                             continue;
                         }
@@ -634,6 +652,7 @@ fn reactor_loop(
                         .write(&connection.out[connection.out_at..])
                     {
                         Ok(0) => {
+                            release_mcp_stream(connection, client.as_deref());
                             connections.remove(&id);
                             continue;
                         }
@@ -646,6 +665,7 @@ fn reactor_loop(
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(_) => {
+                            release_mcp_stream(connection, client.as_deref());
                             connections.remove(&id);
                             continue;
                         }
@@ -925,7 +945,12 @@ fn fill_sse(connection: &mut Connection) {
 }
 
 #[cfg(unix)]
-fn start_mcp_sse(connection: &mut Connection, call: mcp_http::StreamingCall, config: PathBuf) {
+fn start_mcp_sse(
+    connection: &mut Connection,
+    call: mcp_http::StreamingCall,
+    config: PathBuf,
+    client: &Arc<ClientReactor>,
+) {
     if MCP_STREAMS.fetch_add(1, Ordering::SeqCst) >= MAX_MCP_STREAMS {
         MCP_STREAMS.fetch_sub(1, Ordering::SeqCst);
         connection.out = http::json_error(429, "too_many_streams", "too many streaming MCP calls");
@@ -934,6 +959,27 @@ fn start_mcp_sse(connection: &mut Connection, call: mcp_http::StreamingCall, con
         connection.state = ConnState::Writing;
         return;
     }
+    let (tx, rx) = mpsc::sync_channel(64);
+    let request = json!({
+        "name": call.name,
+        "arguments": call.arguments,
+        "progressToken": call.progress_token,
+    });
+    let stream = match client.open(&config, "registry.call", request, tx) {
+        Ok(stream) => stream,
+        Err(error) => {
+            MCP_STREAMS.fetch_sub(1, Ordering::SeqCst);
+            connection.out = http::json_error(
+                500,
+                "stream_start_failed",
+                &format!("cannot start streaming call: {}", error),
+            );
+            connection.out_at = 0;
+            connection.keep_alive = false;
+            connection.state = ConnState::Writing;
+            return;
+        }
+    };
     connection.out.clear();
     connection.out.extend_from_slice(
         b"HTTP/1.1 200 OK\r\n\
@@ -944,32 +990,12 @@ fn start_mcp_sse(connection: &mut Connection, call: mcp_http::StreamingCall, con
     );
     connection.out_at = 0;
     connection.keep_alive = true;
-    let (tx, rx) = mpsc::channel();
     connection.state = ConnState::McpSse(McpSseState {
         receiver: rx,
+        id: call.id,
+        stream,
         done: false,
     });
-    let _ = thread::Builder::new()
-        .name("svcd-mcp-stream".into())
-        .stack_size(threads::REQUEST_STACK)
-        .spawn(move || {
-            let request = json!({
-                "name": call.name,
-                "arguments": call.arguments,
-                "progressToken": call.progress_token,
-            });
-            let response =
-                match channel::request_stream(&config, "registry.call", request, |notification| {
-                    let _ = tx.send(McpSseEvent::Frame(notification.to_string()));
-                }) {
-                    Ok(response) => mcp::finish_modern_tool_call(call.id, response),
-                    Err(error) => {
-                        rpc::err(call.id, -32603, &format!("svcd unreachable: {}", error))
-                    }
-                };
-            let _ = tx.send(McpSseEvent::Final(rpc::to_line(&response)));
-            MCP_STREAMS.fetch_sub(1, Ordering::SeqCst);
-        });
 }
 
 #[cfg(unix)]
@@ -979,20 +1005,52 @@ fn fill_mcp_sse(connection: &mut Connection) {
     };
     while let Ok(event) = state.receiver.try_recv() {
         match event {
-            McpSseEvent::Frame(line) => {
+            ClientEvent::Frame(line) => {
                 push_sse_chunk(
                     &mut connection.out,
                     format!("event: message\ndata: {}\n\n", line).as_bytes(),
                 );
             }
-            McpSseEvent::Final(line) => {
+            ClientEvent::Final(line) => {
+                let response = serde_json::from_str::<rpc::Response>(&line).unwrap_or_else(|_| {
+                    rpc::err(
+                        state.id.clone(),
+                        -32603,
+                        "invalid response from management channel",
+                    )
+                });
+                let response = mcp::finish_modern_tool_call(state.id.clone(), response);
                 push_sse_chunk(
                     &mut connection.out,
-                    format!("event: message\ndata: {}\n\n", line).as_bytes(),
+                    format!("event: message\ndata: {}\n\n", rpc::to_line(&response)).as_bytes(),
                 );
                 connection.out.extend_from_slice(b"0\r\n\r\n");
                 state.done = true;
+                MCP_STREAMS.fetch_sub(1, Ordering::SeqCst);
             }
+            ClientEvent::Error(message) => {
+                let response = rpc::err(state.id.clone(), -32603, &message);
+                let response = mcp::finish_modern_tool_call(state.id.clone(), response);
+                push_sse_chunk(
+                    &mut connection.out,
+                    format!("event: message\ndata: {}\n\n", rpc::to_line(&response)).as_bytes(),
+                );
+                connection.out.extend_from_slice(b"0\r\n\r\n");
+                state.done = true;
+                MCP_STREAMS.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn release_mcp_stream(connection: &Connection, client: Option<&ClientReactor>) {
+    if let ConnState::McpSse(state) = &connection.state {
+        if !state.done {
+            if let Some(client) = client {
+                client.cancel(state.stream);
+            }
+            MCP_STREAMS.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }

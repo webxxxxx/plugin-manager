@@ -245,11 +245,15 @@ fn default_conf_text(layout: &Layout) -> String {
          config_dir = {}\n\
          plugins_dir = {}\n\
          services_dir = {}\n\
+         temp_dir = {}\n\
+         temp_retention_secs = 7200\n\
+         temp_cleanup_interval_secs = 300\n\
          # Set the web/API password with: svc auth passwd <password>\n\
          # auth_passwd = pbkdf2-sha256$...\n",
         layout.config_dir.display(),
         plugins.display(),
-        services.display()
+        services.display(),
+        layout.data_dir.join("temp").display()
     )
 }
 
@@ -1838,6 +1842,15 @@ mod tests {
             )),
             "{text}"
         );
+        assert!(
+            text.contains(&format!(
+                "temp_dir = {}",
+                layout.data_dir.join("temp").display()
+            )),
+            "{text}"
+        );
+        assert!(text.contains("temp_retention_secs = 7200"), "{text}");
+        assert!(text.contains("temp_cleanup_interval_secs = 300"), "{text}");
     }
 
     #[test]
@@ -1871,6 +1884,9 @@ mod tests {
             "config_dir",
             "plugins_dir",
             "services_dir",
+            "temp_dir",
+            "temp_retention_secs",
+            "temp_cleanup_interval_secs",
             "auth_passwd",
         ] {
             assert!(text.contains(key), "example is missing {key}");

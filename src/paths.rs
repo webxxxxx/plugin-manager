@@ -26,6 +26,20 @@ pub fn services_dir() -> PathBuf {
         .unwrap_or_else(|| config_dir().join("services.d"))
 }
 
+/// Transient plugin data. `SVCD_TEMP_DIR` overrides it for tests/plugins;
+/// `temp_dir` in `svcd.conf` wins over the default `<data>/temp`.
+pub fn temp_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("SVCD_TEMP_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Ok(settings) = settings::current() {
+        if let Some(dir) = &settings.temp_dir {
+            return dir.clone();
+        }
+    }
+    data_dir().join("temp")
+}
+
 /// Installed plugins: `<data>/plugins/<id>/<version>/`, or the
 /// `plugins_dir` from `svcd.conf`.
 pub fn plugins_dir() -> PathBuf {

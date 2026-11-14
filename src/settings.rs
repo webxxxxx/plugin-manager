@@ -23,6 +23,13 @@ pub struct Settings {
     pub plugins_dir: Option<PathBuf>,
     pub services_dir: Option<PathBuf>,
     pub auth_passwd: Option<String>,
+    /// Root for transient plugin data (`SVCD_TEMP_DIR`). Defaults to
+    /// `<data>/temp`.
+    pub temp_dir: Option<PathBuf>,
+    /// Files under `temp_dir` older than this are removed. Default: 2 hours.
+    pub temp_retention_secs: Option<u64>,
+    /// How often the cleanup thread scans `temp_dir`. `0` disables cleanup.
+    pub temp_cleanup_interval_secs: Option<u64>,
     /// Relocated installation root for hosts whose `/usr` is read-only and
     /// whose writable tree is limited (SR6110: only `/etc` persists). When
     /// set, `--install` puts the binary, aliases and `svcd_daemon.sh` here;
@@ -39,6 +46,14 @@ impl Settings {
     /// Runtime log directory implied by `install_dir`, if that key is set.
     pub fn install_logs_dir(&self) -> Option<PathBuf> {
         self.install_dir.as_ref().map(|dir| dir.join("logs"))
+    }
+
+    pub fn temp_retention(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.temp_retention_secs.unwrap_or(2 * 60 * 60))
+    }
+
+    pub fn temp_cleanup_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.temp_cleanup_interval_secs.unwrap_or(5 * 60))
     }
 }
 
@@ -151,6 +166,32 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
             "services_dir" => settings.services_dir = Some(resolve(base, value)),
             "install_dir" => settings.install_dir = Some(resolve(base, value)),
             "auth_passwd" => settings.auth_passwd = Some(value.to_string()),
+            "temp_dir" => settings.temp_dir = Some(resolve(base, value)),
+            "temp_retention_secs" => {
+                let seconds = value.parse::<u64>().map_err(|_| {
+                    format!(
+                        "line {}: invalid temp_retention_secs {:?}",
+                        index + 1,
+                        value
+                    )
+                })?;
+                if seconds == 0 {
+                    return Err(format!(
+                        "line {}: temp_retention_secs must be greater than zero",
+                        index + 1
+                    ));
+                }
+                settings.temp_retention_secs = Some(seconds);
+            }
+            "temp_cleanup_interval_secs" => {
+                settings.temp_cleanup_interval_secs = Some(value.parse::<u64>().map_err(|_| {
+                    format!(
+                        "line {}: invalid temp_cleanup_interval_secs {:?}",
+                        index + 1,
+                        value
+                    )
+                })?);
+            }
             other => return Err(format!("line {}: unknown key {:?}", index + 1, other)),
         }
     }
@@ -212,7 +253,7 @@ mod tests {
     #[test]
     fn parses_all_keys_and_resolves_relative_paths() {
         let settings = parse(
-            "\u{feff}# svcd runtime\nhttp_port = 8787\nlan_default = yes\nconfig_dir = /srv/svcd\nplugins_dir = plugins\nservices_dir = /var/lib/svcd/services.d\ninstall_dir = /etc/sr/svcd\nauth_passwd = pbkdf2-sha256$10000$c2FsdA$aGFzaA\n",
+            "\u{feff}# svcd runtime\nhttp_port = 8787\nlan_default = yes\nconfig_dir = /srv/svcd\nplugins_dir = plugins\nservices_dir = /var/lib/svcd/services.d\ninstall_dir = /etc/sr/svcd\nauth_passwd = pbkdf2-sha256$10000$c2FsdA$aGFzaA\ntemp_dir = /var/tmp/svcd\ntemp_retention_secs = 3600\ntemp_cleanup_interval_secs = 60\n",
             Path::new("/etc/svcd"),
         )
         .expect("parse");
@@ -232,6 +273,18 @@ mod tests {
             settings.auth_passwd.as_deref(),
             Some("pbkdf2-sha256$10000$c2FsdA$aGFzaA")
         );
+        assert_eq!(settings.temp_dir, Some(PathBuf::from("/var/tmp/svcd")));
+        assert_eq!(settings.temp_retention_secs, Some(3600));
+        assert_eq!(settings.temp_cleanup_interval_secs, Some(60));
+        assert_eq!(settings.temp_retention().as_secs(), 3600);
+        assert_eq!(settings.temp_cleanup_interval().as_secs(), 60);
+    }
+
+    #[test]
+    fn temp_defaults_are_two_hours_and_five_minutes() {
+        let settings = Settings::default();
+        assert_eq!(settings.temp_retention().as_secs(), 2 * 60 * 60);
+        assert_eq!(settings.temp_cleanup_interval().as_secs(), 5 * 60);
     }
 
     #[test]

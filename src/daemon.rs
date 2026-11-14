@@ -84,6 +84,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
             return 1;
         }
     }
+    crate::blob::spawn_cleanup();
     if let Err(error) = crate::proc::init() {
         log::svcd(&format!(
             "svcd: parent-death protection unavailable: {}",

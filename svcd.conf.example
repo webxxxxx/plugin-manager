@@ -9,8 +9,8 @@
 #   4. a generated default with platform paths
 #
 # Lines are `key = value`; lines starting with `#` are comments.
-# Relative `config_dir` / `plugins_dir` / `services_dir` values resolve against
-# the directory containing this file.
+# Relative `config_dir` / `plugins_dir` / `services_dir` / `temp_dir` values
+# resolve against the directory containing this file.
 
 http_port = 8787
 lan_default = false
@@ -33,6 +33,13 @@ lan_default = false
 # Web/API password hash. Never put the plaintext here; set it with:
 #   svc auth passwd <password>
 # auth_passwd = pbkdf2-sha256$10000$...
+
+# Transient plugin data (blob arguments/results). Default: <data>/temp.
+# Files older than temp_retention_secs are deleted; 0 disables the cleanup
+# thread entirely. Defaults: retention 7200s (2h), scan every 300s.
+# temp_dir = /var/tmp/svcd
+# temp_retention_secs = 7200
+# temp_cleanup_interval_secs = 300
 
 # Absolute paths (the generated default uses the platform locations):
 # Linux:
