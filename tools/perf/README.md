@@ -72,6 +72,15 @@ start so `/mcp` works without root; LAN stays disabled.
     --binary target/release/svcd --work /tmp/svcd-reactor-20 \
     --plugins 20 --concurrency 100
   ```
+
+- `reactor_scale_threads.py` is the same workload with 1000 real client
+  threads and daemon CPU/RSS/VM/thread/process sampling:
+
+  ```sh
+  python3 tools/perf/reactor_scale_threads.py \
+    --binary target/release/svcd --work /tmp/svcd-reactor-1000 \
+    --plugins 20 --threads 1000
+  ```
 - Minimal build: `cargo build --release --no-default-features`; see
   `scale_cli.py` for its resource test.
 - In WSL, put the runtime work root on the Linux filesystem, not `/mnt/*`:
