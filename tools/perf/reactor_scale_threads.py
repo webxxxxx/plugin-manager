@@ -143,27 +143,65 @@ class Metrics:
             "max_processes": processes,
         }
 
+    def current(self):
+        rss, vm, threads, processes = self._read()
+        return {
+            "rss_kb": rss,
+            "vm_kb": vm,
+            "threads": threads,
+            "processes": processes,
+        }
+
     def stop(self):
         self.stop_event.set()
         self.thread.join(timeout=1)
 
 
-def http_get(address, path, headers=None):
-    host, port = address.rsplit(":", 1)
+_CONNECTIONS = threading.local()
+
+
+def _connection(address):
     import http.client
-    conn = http.client.HTTPConnection(host, int(port), timeout=60)
-    try:
-        conn.request("GET", path, headers=headers or {"Connection": "close"})
-        response = conn.getresponse()
-        response.read()
-        return response.status
-    finally:
-        conn.close()
+    host, port = address.rsplit(":", 1)
+    key = f"conn:{address}"
+    conn = getattr(_CONNECTIONS, key, None)
+    if conn is None:
+        conn = http.client.HTTPConnection(host, int(port), timeout=60)
+        setattr(_CONNECTIONS, key, conn)
+    return conn
+
+
+def _request(address, method, path, body, headers):
+    import http.client
+    last_error = None
+    for attempt in range(2):
+        conn = _connection(address)
+        try:
+            conn.request(method, path, body=body, headers=headers)
+            response = conn.getresponse()
+            payload = response.read()
+            if response.will_close:
+                conn.close()
+                setattr(_CONNECTIONS, f"conn:{address}", None)
+            return response.status, payload
+        except (ConnectionResetError, BrokenPipeError, http.client.HTTPException,
+                OSError) as error:
+            last_error = error
+            conn.close()
+            setattr(_CONNECTIONS, f"conn:{address}", None)
+            if attempt == 1:
+                raise
+    raise last_error
+
+
+def http_get(address, path, headers=None):
+    status, _ = _request(
+        address, "GET", path, None, headers or {"Accept": "text/html"}
+    )
+    return status
 
 
 def http_mcp(address, plugin, index):
-    import http.client
-    host, port = address.rsplit(":", 1)
     body = json.dumps({
         "jsonrpc": "2.0", "id": index, "method": "tools/call",
         "params": {
@@ -174,28 +212,21 @@ def http_mcp(address, plugin, index):
             },
         },
     }).encode()
-    conn = http.client.HTTPConnection(host, int(port), timeout=60)
-    try:
-        conn.request(
-            "POST", "/mcp", body,
-            {
-                "Authorization": f"Bearer {PASSWORD}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "MCP-Protocol-Version": "2026-07-28",
-                "Mcp-Method": "tools/call",
-                "Mcp-Name": f"{plugin}.echo",
-                "Connection": "close",
-            },
-        )
-        response = conn.getresponse()
-        payload = response.read()
-        if response.status != 200:
-            return response.status, False
-        value = json.loads(payload)
-        return 200, "result" in value and not value["result"].get("isError", False)
-    finally:
-        conn.close()
+    status, payload = _request(
+        address, "POST", "/mcp", body,
+        {
+            "Authorization": f"Bearer {PASSWORD}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "MCP-Protocol-Version": "2026-07-28",
+            "Mcp-Method": "tools/call",
+            "Mcp-Name": f"{plugin}.echo",
+        },
+    )
+    if status != 200:
+        return status, False
+    value = json.loads(payload)
+    return 200, "result" in value and not value["result"].get("isError", False)
 
 
 def read_headers(sock):
