@@ -68,6 +68,14 @@ fn main() {
         "svc" => svc::run(std::env::args().skip(1).collect()),
         "plugin" => plugin_cli::run(std::env::args().skip(1).collect()),
         "mcp" => mcp::run_stdio(),
+        "uninstall" => {
+            let mut args: Vec<String> = std::env::args().skip(1).collect();
+            if args.first().map(String::as_str) != Some("--uninstall") {
+                args.insert(0, "--uninstall".into());
+            }
+            // The first element is the dispatch word, not part of the flags.
+            install::self_uninstall(&args[1..])
+        }
         _ => svcd_run(std::env::args().skip(1).collect()),
     };
     std::process::exit(code);
