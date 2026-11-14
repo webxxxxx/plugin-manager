@@ -6,15 +6,61 @@ use std::sync::mpsc::Sender;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub use imp::{Listener, Stream};
+#[cfg(not(unix))]
+pub use imp::Listener;
+pub use imp::Stream;
 
 use crate::ipc;
+#[cfg(not(unix))]
 use crate::rpc;
+#[cfg(not(unix))]
 use crate::threads;
 
 pub struct PendingCall {
     pub line: String,
-    pub reply: Sender<String>,
+    pub reply: Reply,
+}
+
+/// A response handle for one management request. The daemon sends the serialized
+/// response on the channel; a reactor-backed server also gets a byte on a
+/// notifier pipe so it can wake immediately instead of polling.
+#[derive(Clone)]
+pub struct Reply {
+    sender: Sender<String>,
+    #[cfg(unix)]
+    notify: Option<std::sync::Arc<std::os::unix::net::UnixStream>>,
+}
+
+impl Reply {
+    #[allow(dead_code)]
+    pub fn plain(sender: Sender<String>) -> Self {
+        Reply {
+            sender,
+            #[cfg(unix)]
+            notify: None,
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn with_notify(
+        sender: Sender<String>,
+        notify: std::sync::Arc<std::os::unix::net::UnixStream>,
+    ) -> Self {
+        Reply {
+            sender,
+            notify: Some(notify),
+        }
+    }
+
+    pub fn send(&self, response: String) {
+        if self.sender.send(response).is_ok() {
+            #[cfg(unix)]
+            if let Some(notify) = &self.notify {
+                use std::io::Write;
+                let _ = (&**notify).write(&[1]);
+            }
+        }
+    }
 }
 
 pub fn token_path(config: &Path) -> PathBuf {
@@ -79,9 +125,33 @@ fn random_token() -> String {
     token
 }
 
-/// Bind the local control channel and serve one request per connection in a
-/// background thread. Each request carries a reply channel; the daemon answers
-/// on its own loop.
+/// Bind the local control channel. Unix serves all connections from one poll
+/// reactor; Windows keeps the thread-per-connection fallback.
+#[cfg(unix)]
+pub fn spawn_server(
+    config: &Path,
+    tx: Sender<PendingCall>,
+    wake: std::sync::Arc<crate::wake::Wake>,
+) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    let path = config.join("svcd.sock");
+    if path.exists() {
+        if UnixStream::connect(&path).is_ok() {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "svcd control socket is already in use",
+            ));
+        }
+        let _ = fs::remove_file(&path);
+    }
+    let listener = UnixListener::bind(&path)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o660))?;
+    crate::channel_reactor::spawn(listener, tx, wake)
+}
+
+#[cfg(not(unix))]
 pub fn spawn_server(
     config: &Path,
     tx: Sender<PendingCall>,
@@ -111,6 +181,7 @@ pub fn spawn_server(
         .map(|_| ())
 }
 
+#[cfg(not(unix))]
 fn serve(stream: Stream, tx: Sender<PendingCall>, wake: std::sync::Arc<crate::wake::Wake>) {
     let mut reader = BufReader::new(stream);
     loop {
@@ -131,7 +202,7 @@ fn serve(stream: Stream, tx: Sender<PendingCall>, wake: std::sync::Arc<crate::wa
         if tx
             .send(PendingCall {
                 line,
-                reply: reply_tx,
+                reply: Reply::plain(reply_tx),
             })
             .is_err()
         {
@@ -221,10 +292,12 @@ mod imp {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::Path;
 
+    #[allow(dead_code)]
     pub struct Listener(UnixListener);
 
     pub struct Stream(UnixStream);
 
+    #[allow(dead_code)]
     impl Listener {
         pub fn bind(config: &Path) -> io::Result<Self> {
             let path = config.join("svcd.sock");

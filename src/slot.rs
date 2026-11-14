@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -71,7 +71,7 @@ struct PendingCall {
     external_id: Option<Value>,
     capability: String,
     deadline: u64,
-    reply: Sender<String>,
+    reply: crate::channel::Reply,
 }
 
 #[derive(Debug)]
@@ -165,7 +165,7 @@ impl Slot {
         arguments: Value,
         external_id: Option<Value>,
         now: u64,
-        reply: Sender<String>,
+        reply: crate::channel::Reply,
     ) -> Result<(), CallError> {
         if self.machine.state != State::Running {
             return Err(CallError::NotLive);
@@ -599,7 +599,7 @@ impl Slot {
                 "plugin returned neither result nor error",
             )
         };
-        let _ = pending.reply.send(rpc::to_line(&response));
+        pending.reply.send(rpc::to_line(&response));
     }
 
     fn expire_pending(&mut self, now: u64) {
@@ -623,7 +623,7 @@ impl Slot {
             ));
             let response =
                 crate::mcp::tool_error(pending.external_id, "tools/call timed out after 30s");
-            let _ = pending.reply.send(rpc::to_line(&response));
+            pending.reply.send(rpc::to_line(&response));
         }
     }
 
@@ -631,7 +631,7 @@ impl Slot {
         let pending = std::mem::take(&mut self.pending);
         for (_, call) in pending {
             let response = crate::mcp::tool_error(call.external_id, reason);
-            let _ = call.reply.send(rpc::to_line(&response));
+            call.reply.send(rpc::to_line(&response));
         }
     }
 
@@ -1118,7 +1118,7 @@ mod tests {
                 external_id: Some(json!(100 + id)),
                 capability: "echo".into(),
                 deadline,
-                reply: tx,
+                reply: crate::channel::Reply::plain(tx),
             },
         );
         rx
@@ -1207,7 +1207,13 @@ mod tests {
         }
         let (tx, _rx) = mpsc::channel();
 
-        let result = slot.request_capability("echo", json!({}), Some(json!(500)), 0, tx);
+        let result = slot.request_capability(
+            "echo",
+            json!({}),
+            Some(json!(500)),
+            0,
+            crate::channel::Reply::plain(tx),
+        );
 
         assert!(matches!(result, Err(CallError::Busy)));
     }

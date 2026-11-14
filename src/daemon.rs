@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -617,7 +617,7 @@ impl Daemon {
     /// on the slot pump, so the control connection stays open without blocking
     /// the daemon's event loop. A start tool is synchronous because starting is
     /// defined as synchronous in the service contract.
-    fn handle_tool_call(&mut self, request: rpc::Request, reply: Sender<String>) {
+    fn handle_tool_call(&mut self, request: rpc::Request, reply: crate::channel::Reply) {
         let id = request.id.clone();
         let name = request
             .params
@@ -1165,8 +1165,8 @@ fn status_json(status: Status) -> Value {
     serde_json::to_value(status).unwrap_or(Value::Null)
 }
 
-fn send(reply: &Sender<String>, response: rpc::Response) {
-    let _ = reply.send(rpc::to_line(&response));
+fn send(reply: &crate::channel::Reply, response: rpc::Response) {
+    reply.send(rpc::to_line(&response));
 }
 
 fn unknown_tool(id: &Option<Value>, name: &str) -> rpc::Response {
@@ -1569,7 +1569,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
         let (sender, receiver) = mpsc::channel();
         daemon.handle(channel::PendingCall {
             line,
-            reply: sender,
+            reply: crate::channel::Reply::plain(sender),
         });
         receiver
     }
