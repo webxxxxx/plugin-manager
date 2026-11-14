@@ -650,6 +650,7 @@ fn parse_buffered_request(buffer: &[u8]) -> Result<Option<(HttpRequest, usize)>,
     )))
 }
 
+#[cfg(not(unix))]
 fn listener_loop(
     mut listener: Option<TcpListener>,
     mut addr: SocketAddr,
@@ -746,6 +747,7 @@ fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     TcpListener::bind(addr)
 }
 
+#[cfg(not(unix))]
 fn handle(mut stream: TcpStream, config: PathBuf, lan: Arc<Mutex<Lan>>) {
     // Windows accepted sockets inherit the listener's non-blocking mode
     // (Unix ones do not). Requests are read with blocking reads, so flip the
@@ -1260,6 +1262,7 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
+#[cfg(not(unix))]
 fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, Vec<u8>> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -1338,6 +1341,7 @@ fn request_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
     http::header(&request.headers, name)
 }
 
+#[cfg(not(unix))]
 fn header<'a>(request: &'a http::Request<'_>, name: &str) -> Option<&'a str> {
     request
         .headers
