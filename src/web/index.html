@@ -125,8 +125,17 @@ function $(id) { return document.getElementById(id); }
 function pickInstall() { if (!BUSY) $('file').click(); }
 function pickTrust() { if (!BUSY) $('trustfile').click(); }
 
-function openPluginUI(id) {
-  window.open('/plugin-ui/' + encodeURIComponent(id) + '/', '_blank', 'noopener');
+async function openPluginUI(id) {
+  if (BUSY) return;
+  lock(true);
+  try {
+    const body = await api('/api/v1/plugins/' + encodeURIComponent(id) + '/ui-token', { method: 'POST' });
+    window.open(body.url, '_blank', 'noopener');
+  } catch (error) {
+    toast('打开失败：' + error.message, 'err');
+  } finally {
+    lock(false);
+  }
 }
 
 function authHeaders(extra) {

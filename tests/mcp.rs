@@ -79,7 +79,7 @@ impl Sandbox {
             .env("SVCD_CONFIG_DIR", &self.config)
             .env("SVCD_DATA_DIR", &self.data)
             .env("SVCD_LOG_DIR", &self.logs)
-            .env("SVCD_HTTP_PORT", "0")
+            .env("SVCD_BIND", "127.0.0.1:0")
             .env("SVCD_BOOT_SCAN_WAIT_MS", "0")
             .env("SVCD_RESCAN_INTERVAL_MS", "0")
             .env("SVCD_TEST_UNPRIVILEGED", "1");

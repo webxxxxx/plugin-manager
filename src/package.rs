@@ -1,9 +1,10 @@
 //! `.spk` manifest, ustar parsing, signature verification and file extraction.
 //!
 //! A package is verified completely before anything is written to the plugin
-//! tree: the manifest signature first, then the declared `files[]` (size,
-//! sha256, mode), then the tar entries. `install` can therefore keep the old
-//! version intact until the new tree is complete.
+//! tree: the manifest signature first (unless the operator explicitly opted
+//! into an insecure install), then the declared `files[]` (size, sha256, mode),
+//! then the tar entries. `install` can therefore keep the old version intact
+//! until the new tree is complete.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -25,6 +26,17 @@ pub(crate) const MAX_FILES: usize = 4096;
 pub const MAX_SCHEMA: u32 = 3;
 /// Highest plugin protocol version this daemon understands.
 pub const MAX_PROTOCOL: u32 = 2;
+
+/// Whether a `.spk` must carry a valid manifest signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureCheck {
+    /// Normal installs: `signature.json` must be the second entry and verify
+    /// against a key in `trust.d`.
+    Required,
+    /// Host-level insecure mode: a package without `signature.json` is
+    /// accepted, and a signature that is present is not verified.
+    AllowUnsigned,
+}
 
 /// Exact target triple the package was built for.
 pub fn target() -> &'static str {
@@ -217,12 +229,24 @@ pub fn write_tar(entries: &[(&str, &[u8], u32)]) -> Result<Vec<u8>, String> {
 
 /// Rebuild a signed `.spk` from an installed version directory. The original
 /// `manifest.json` bytes and `signature.json` are kept verbatim.
+///
+/// A plugin installed with `allow_insecure_install` has no `signature.json`;
+/// exporting it as a signed package is impossible, so that case is reported
+/// explicitly.
 pub fn installed_spk(version_dir: &Path) -> Result<Vec<u8>, String> {
     let manifest_bytes = fs::read(version_dir.join("manifest.json"))
         .map_err(|error| format!("read manifest: {}", error))?;
     let manifest = parse_manifest(&manifest_bytes)?;
-    let signature = fs::read(version_dir.join("signature.json"))
-        .map_err(|error| format!("read signature: {}", error))?;
+    let signature = match fs::read(version_dir.join("signature.json")) {
+        Ok(signature) => signature,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(
+                "installed package has no signature (installed insecurely); reinstall a signed package to export it"
+                    .into(),
+            )
+        }
+        Err(error) => return Err(format!("read signature: {}", error)),
+    };
     let mut files = manifest.files.clone();
     files.sort_by(|left, right| left.path.cmp(&right.path));
     let mut owned: Vec<(String, Vec<u8>, u32)> = Vec::new();
@@ -257,7 +281,11 @@ impl Package {
         fs::create_dir_all(root)
             .map_err(|error| format!("create {}: {}", root.display(), error))?;
         write_one(&root.join("manifest.json"), &self.manifest_bytes, 0o644)?;
-        write_one(&root.join("signature.json"), &self.signature_bytes, 0o644)?;
+        // An insecure install may have arrived without a signature; keep the
+        // version directory honest instead of writing an empty signature file.
+        if !self.signature_bytes.is_empty() {
+            write_one(&root.join("signature.json"), &self.signature_bytes, 0o644)?;
+        }
         for file in &self.files {
             let path = root.join(&file.path);
             if let Some(parent) = path.parent() {
@@ -283,9 +311,21 @@ impl Package {
         let path = self.manifest.config.as_deref().unwrap_or("config/config");
         self.files.iter().find(|file| file.path == path)
     }
+
+    /// The `keyId` from `signature.json`, if the package carries one. A package
+    /// accepted by the insecure fallback still reports its (untrusted) key.
+    pub fn signature_key_id(&self) -> Option<String> {
+        serde_json::from_slice::<SignatureFile>(&self.signature_bytes)
+            .ok()
+            .map(|signature| signature.key_id)
+    }
 }
 
 pub fn verify_package(path: &Path) -> Result<Package, String> {
+    verify_package_with(path, SignatureCheck::Required)
+}
+
+pub fn verify_package_with(path: &Path, check: SignatureCheck) -> Result<Package, String> {
     let bytes = fs::read(path).map_err(|error| format!("read {}: {}", path.display(), error))?;
     if bytes.len() as u64 > MAX_PACKAGE_BYTES {
         return Err(format!(
@@ -293,10 +333,14 @@ pub fn verify_package(path: &Path) -> Result<Package, String> {
             MAX_PACKAGE_BYTES / (1024 * 1024)
         ));
     }
-    verify_bytes(&bytes)
+    verify_bytes_with(&bytes, check)
 }
 
 pub fn verify_bytes(bytes: &[u8]) -> Result<Package, String> {
+    verify_bytes_with(bytes, SignatureCheck::Required)
+}
+
+pub fn verify_bytes_with(bytes: &[u8], check: SignatureCheck) -> Result<Package, String> {
     let mut tar = Tar::new(bytes);
 
     let manifest_header = tar
@@ -310,17 +354,30 @@ pub fn verify_bytes(bytes: &[u8]) -> Result<Package, String> {
         .ok_or_else(|| "manifest.json must be a regular file".to_string())?
         .to_vec();
 
-    let signature_header = tar
-        .next()?
-        .ok_or_else(|| "signature.json is missing".to_string())?;
-    if signature_header.path != "signature.json" {
-        return Err("signature.json must be the second entry".into());
+    let mut signature_bytes = Vec::new();
+    let mut first_file = None;
+    match tar.next()? {
+        Some(header) if header.path == "signature.json" => {
+            let data = header
+                .data
+                .ok_or_else(|| "signature.json must be a regular file".to_string())?;
+            if check == SignatureCheck::Required {
+                verify_signature(&manifest_bytes, data)?;
+            }
+            signature_bytes = data.to_vec();
+        }
+        Some(_) if check == SignatureCheck::Required => {
+            return Err("signature.json must be the second entry".into());
+        }
+        // Insecure installs accept a package whose second entry is already a
+        // payload file; it stays in the archive and is validated like any
+        // other `files[]` entry below.
+        Some(header) => first_file = Some(header),
+        None if check == SignatureCheck::Required => {
+            return Err("signature.json is missing".into());
+        }
+        None => {}
     }
-    let signature_bytes = signature_header
-        .data
-        .ok_or_else(|| "signature.json must be a regular file".to_string())?
-        .to_vec();
-    verify_signature(&manifest_bytes, &signature_bytes)?;
 
     let manifest = parse_manifest(&manifest_bytes)?;
     validate_manifest(&manifest)?;
@@ -353,8 +410,14 @@ pub fn verify_bytes(bytes: &[u8]) -> Result<Package, String> {
 
     let mut files = Vec::new();
     let mut seen = BTreeMap::new();
+    let mut headers = Vec::new();
+    if let Some(header) = first_file {
+        headers.push(header);
+    }
     for header in tar {
-        let header = header?;
+        headers.push(header?);
+    }
+    for header in headers {
         if header.kind == b'5' {
             continue;
         }
@@ -413,6 +476,41 @@ pub fn verify_bytes(bytes: &[u8]) -> Result<Package, String> {
         signature_bytes,
         files,
     })
+}
+
+/// Verify a package under the host-level insecure policy: strict verification
+/// first, and only when it fails (and `allow_insecure` is true) retry with the
+/// signature check skipped. The bool is true when the signature was verified;
+/// false means the insecure fallback accepted the package.
+pub fn verify_package_with_fallback(
+    path: &Path,
+    allow_insecure: bool,
+) -> Result<(Package, bool), String> {
+    if !allow_insecure {
+        return verify_package(path).map(|package| (package, true));
+    }
+    match verify_package(path) {
+        Ok(package) => Ok((package, true)),
+        Err(_) => {
+            verify_package_with(path, SignatureCheck::AllowUnsigned).map(|package| (package, false))
+        }
+    }
+}
+
+/// Byte-slice counterpart of [`verify_package_with_fallback`].
+pub fn verify_bytes_with_fallback(
+    bytes: &[u8],
+    allow_insecure: bool,
+) -> Result<(Package, bool), String> {
+    if !allow_insecure {
+        return verify_bytes(bytes).map(|package| (package, true));
+    }
+    match verify_bytes(bytes) {
+        Ok(package) => Ok((package, true)),
+        Err(_) => {
+            verify_bytes_with(bytes, SignatureCheck::AllowUnsigned).map(|package| (package, false))
+        }
+    }
 }
 
 /// The install-time half of the "executable hook" rule: the Unix exec bit comes
@@ -1182,6 +1280,14 @@ mod tests {
         package_for(key, target())
     }
 
+    fn unsigned_package_from(manifest: &[u8], files: &[(&str, Vec<u8>, u32)]) -> Vec<u8> {
+        let mut entries: Vec<(&str, &[u8], u32)> = vec![("manifest.json", manifest, 0o644)];
+        for (path, data, mode) in files {
+            entries.push((*path, data.as_slice(), *mode));
+        }
+        write_tar(&entries).expect("unsigned tar")
+    }
+
     fn header(path: &str, size: usize, mode: u32) -> [u8; 512] {
         let mut header = [0u8; 512];
         header[..path.len()].copy_from_slice(path.as_bytes());
@@ -1207,6 +1313,38 @@ mod tests {
             std::fs::read(root.path().join("payload/bin/demo")).expect("read"),
             b"hello"
         );
+    }
+
+    #[test]
+    fn unsigned_packages_need_the_insecure_switch() {
+        let (manifest, files) = manifest(target());
+        let bytes = unsigned_package_from(&manifest, &files);
+
+        let error = verify_bytes(&bytes).expect_err("strict mode");
+        assert!(error.contains("signature.json"), "{error}");
+        let package =
+            verify_bytes_with(&bytes, SignatureCheck::AllowUnsigned).expect("insecure mode");
+        assert!(package.signature_bytes.is_empty());
+        let (fallback, verified) =
+            verify_bytes_with_fallback(&bytes, true).expect("insecure fallback");
+        assert!(!verified);
+        assert!(fallback.signature_bytes.is_empty());
+        assert!(verify_bytes_with_fallback(&bytes, false).is_err());
+
+        let root = tempdir::TempDir::new();
+        package.write_to(root.path()).expect("write");
+        assert!(!root.path().join("signature.json").exists());
+        let error = installed_spk(root.path()).expect_err("export");
+        assert!(error.contains("no signature"), "{error}");
+    }
+
+    #[test]
+    fn the_insecure_fallback_still_verifies_a_signed_package() {
+        let key = setup();
+        let (package, verified) =
+            verify_bytes_with_fallback(&package(&key), true).expect("signed package");
+        assert!(verified);
+        assert!(!package.signature_bytes.is_empty());
     }
 
     #[test]

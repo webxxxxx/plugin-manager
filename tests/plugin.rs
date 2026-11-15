@@ -904,8 +904,9 @@ fn bundles_a_directory_into_a_working_signed_package() {
         ],
     );
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    let arch = target().split('-').next().expect("arch");
-    let package_name = format!("demo-1.0.0-{}.spk", arch);
+    // The default artifact name carries the entire target triple, not just the
+    // arch: x86_64 is shared by the musl and gnu packages.
+    let package_name = format!("demo-1.0.0-{}.spk", target());
     let package = sandbox.root.join(&package_name);
     assert!(package.is_file(), "missing {}", package.display());
     assert!(
@@ -926,6 +927,127 @@ fn bundles_a_directory_into_a_working_signed_package() {
         .join("payload/bin")
         .join(script_name)
         .is_file());
+}
+
+#[test]
+fn verify_reports_a_signed_package_without_installing_it() {
+    let sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[17u8; 32]);
+    sandbox.write_key(&key);
+    let bytes = package(&key, "1.0.0");
+    let package = sandbox.write_package("demo-1.0.0.spk", &bytes);
+
+    let output = sandbox.run_plugin(&["verify", package.to_str().expect("package"), "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let value: Value = serde_json::from_slice(&output.stdout).expect("verify json");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["file"], "demo-1.0.0.spk");
+    assert_eq!(value["name"], "demo");
+    assert_eq!(value["version"], "1.0.0");
+    assert_eq!(value["platform"], target());
+    assert_eq!(value["schema"], 1u64);
+    assert_eq!(value["size"], bytes.len() as u64);
+    assert_eq!(value["sha256"], hex_sha256(&bytes));
+    assert_eq!(value["capabilities"], json!([]));
+    assert_eq!(value["compat"], Value::Null);
+    assert_eq!(value["signature"]["state"], "valid");
+    assert_eq!(value["signature"]["keyId"], "test");
+    assert_eq!(value["files"], 2u64);
+    assert!(
+        !sandbox.data.join("plugins").join("demo").exists(),
+        "verify must not install the package"
+    );
+}
+
+#[test]
+fn verify_reports_capabilities_and_compat() {
+    let sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[19u8; 32]);
+    sandbox.write_key(&key);
+    fs::write(sandbox.config.join("compat.conf"), "device = sr6110\n").expect("marker");
+
+    let (name, data) = script();
+    let path = format!("payload/bin/{}", name);
+    let files = [(path.as_str(), data.as_slice(), 0o755u32)];
+    let interpreter = if cfg!(windows) {
+        json!({"name": "cmd", "args": ["/C"]})
+    } else {
+        json!({"name": "sh"})
+    };
+    let manifest = json!({
+        "schema": 3,
+        "name": "caps",
+        "version": "1.0.0",
+        "desc": "capability package",
+        "platform": target(),
+        "protocol": 1,
+        "exec": {"path": path.clone(), "args": [], "ready": "notify"},
+        "interpreter": interpreter,
+        "capabilities": [
+            {"name": "status", "desc": "status", "inputSchema": {"type": "object"}},
+            {"name": "up", "desc": "up", "inputSchema": {"type": "object"}}
+        ],
+        "compat": {"devices": ["sr6110"]},
+        "files": [{
+            "path": path,
+            "size": data.len(),
+            "sha256": hex_sha256(&data),
+            "mode": 0o755
+        }]
+    });
+    let bytes = package_with_manifest(&key, &manifest, &files);
+    let package = sandbox.write_package("caps-1.0.0.spk", &bytes);
+
+    let output = sandbox.run_plugin(&["verify", package.to_str().expect("package"), "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let value: Value = serde_json::from_slice(&output.stdout).expect("verify json");
+    assert_eq!(value["capabilities"], json!(["status", "up"]));
+    assert_eq!(value["compat"], json!(["sr6110"]));
+    assert_eq!(value["schema"], 3u64);
+}
+
+#[test]
+fn verify_rejects_unknown_keys_and_tampered_manifests() {
+    let sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[18u8; 32]);
+    let mut bytes = package(&key, "1.0.0");
+    let package = sandbox.write_package("demo-1.0.0.spk", &bytes);
+
+    let unknown = sandbox.run_plugin(&["verify", package.to_str().expect("package"), "--json"]);
+    assert_eq!(unknown.status.code(), Some(1), "{}", stderr(&unknown));
+    let value: Value = serde_json::from_slice(&unknown.stdout).expect("verify failure json");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["file"], "demo-1.0.0.spk");
+    assert!(
+        value["error"]
+            .as_str()
+            .expect("error string")
+            .contains("unknown keyId test"),
+        "{value}"
+    );
+
+    sandbox.write_key(&key);
+    // A valid JSON edit with the wrong bytes: the manifest signature no longer
+    // matches, even though the package still parses.
+    let marker = b"test plugin";
+    let offset = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("manifest desc");
+    bytes[offset] = b'u';
+    let tampered = sandbox.write_package("tampered-1.0.0.spk", &bytes);
+    let output = sandbox.run_plugin(&["verify", tampered.to_str().expect("package"), "--json"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let value: Value = serde_json::from_slice(&output.stdout).expect("verify failure json");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["file"], "tampered-1.0.0.spk");
+    assert!(
+        value["error"]
+            .as_str()
+            .expect("error string")
+            .contains("signature is invalid"),
+        "{value}"
+    );
 }
 
 #[test]

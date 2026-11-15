@@ -1,20 +1,22 @@
-//! Minimal `/api/v1` HTTP management API and LAN authentication.
+//! Minimal `/api/v1` HTTP management API and authentication.
 //!
-//! The listener starts on loopback; `svc auth enable` can rebind it to a LAN
-//! address and turns on password/cookie auth. Every request is translated into the
-//! same daemon RPC the CLI uses, so the HTTP surface never owns a second copy of
-//! service state.
+//! `bind` in `svcd.conf` chooses the listener address. A non-loopback bind
+//! requires `auth_passwd`; without it the daemon falls back to loopback so the
+//! operator can still run `svc auth passwd`. Every request is translated into
+//! the same daemon RPC the CLI uses, so the HTTP surface never owns a second
+//! copy of service state.
 
 #[cfg(unix)]
 use crate::channel_client_reactor::{ClientReactor, Event as ClientEvent};
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+#[cfg(unix)]
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -48,7 +50,6 @@ use crate::transfer;
 use crate::uichannel;
 use crate::webui;
 
-const DEFAULT_PORT: u16 = 8787;
 const MAX_BODY: u64 = 512 * 1024 * 1024;
 const MAX_JSON_BODY: u64 = 1024 * 1024;
 const MAX_LOG_BODY: usize = 1024 * 1024;
@@ -64,112 +65,68 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 static CONFIG_WRITES: Mutex<()> = Mutex::new(());
 
 pub struct Api {
-    config: PathBuf,
-    port: u16,
     lan: Arc<Mutex<Lan>>,
-    commands: Sender<Command>,
-    current: Arc<Mutex<SocketAddr>>,
 }
 
-enum Command {
-    Rebind {
-        addr: SocketAddr,
-        reply: Sender<Result<(), String>>,
-    },
+fn default_bind() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 8787))
 }
 
-fn resolve_port(env: Option<&str>, configured: Option<u16>) -> u16 {
-    env.and_then(|value| value.parse::<u16>().ok())
+fn resolve_bind(env: Option<&str>, configured: Option<SocketAddr>) -> SocketAddr {
+    env.and_then(|value| value.parse::<SocketAddr>().ok())
         .or(configured)
-        .unwrap_or(DEFAULT_PORT)
+        .unwrap_or_else(default_bind)
 }
 
 pub fn spawn(config: PathBuf) -> std::io::Result<Arc<Api>> {
-    let configured = settings::current()
-        .ok()
-        .and_then(|settings| settings.http_port);
-    let port = resolve_port(std::env::var("SVCD_HTTP_PORT").ok().as_deref(), configured);
+    let configured = settings::current().ok().and_then(|settings| settings.bind);
+    let requested = resolve_bind(std::env::var("SVCD_BIND").ok().as_deref(), configured);
     let password_hash = settings::current()
         .ok()
         .and_then(|settings| settings.auth_passwd.clone());
-    let state = Lan::load(&config, password_hash);
-    let bind = if state.enabled {
-        state.bind
-    } else {
-        "127.0.0.1".parse().expect("loopback")
-    };
-    let listener = TcpListener::bind((bind, port))?;
+
+    // A LAN bind without a password would expose an unauthenticated API. Keep
+    // the daemon reachable on loopback so the operator can still run
+    // `svc auth passwd`, then restart to pick up the requested bind.
+    let mut bind = requested;
+    if !requested.ip().is_loopback() && password_hash.is_none() {
+        log::svcd(&format!(
+            "svcd: bind {} requires auth_passwd; falling back to 127.0.0.1:{}",
+            requested,
+            requested.port()
+        ));
+        bind = SocketAddr::from(([127, 0, 0, 1], requested.port()));
+    }
+    let require_auth = !bind.ip().is_loopback();
+    let mut state = Lan::new(bind, requested, require_auth, password_hash);
+    let listener = TcpListener::bind(bind)?;
     let local = listener.local_addr()?;
+    state.bind = local;
     let port_file = config.join("http.port");
     fs::write(&port_file, format!("127.0.0.1:{}", local.port())).map_err(|error| {
         std::io::Error::other(format!("write {}: {}", port_file.display(), error))
     })?;
     log::svcd(&format!(
-        "svcd: HTTP API on {}:{}",
-        local.ip(),
-        local.port()
+        "svcd: HTTP API on {} (auth required: {})",
+        local, require_auth
     ));
 
     let lan = Arc::new(Mutex::new(state));
-    let (commands, receiver) = mpsc::channel();
-    let current = Arc::new(Mutex::new(local));
-    let api = Arc::new(Api {
-        config: config.clone(),
-        port: local.port(),
-        lan: lan.clone(),
-        commands,
-        current: current.clone(),
-    });
+    let api = Arc::new(Api { lan: lan.clone() });
     #[cfg(unix)]
     thread::Builder::new()
         .name("svcd-http-reactor".into())
         .stack_size(threads::IO_STACK)
-        .spawn(move || reactor_loop(Some(listener), local, receiver, lan, config, current))?;
+        .spawn(move || reactor_loop(Some(listener), lan, config))?;
     #[cfg(not(unix))]
     thread::Builder::new()
         .name("svcd-http".into())
         .stack_size(threads::IO_STACK)
-        .spawn(move || listener_loop(Some(listener), local, receiver, lan, config, current))?;
+        .spawn(move || listener_loop(Some(listener), lan, config))?;
     Ok(api)
 }
 
 impl Api {
-    pub fn enable(&self, bind: IpAddr) -> Result<LanStatus, String> {
-        let mut state = self.lan.lock().map_err(|_| "LAN state poisoned")?;
-        let previous = (state.enabled, state.bind);
-        state.enable(bind)?;
-        if bind != previous.1 {
-            if let Err(error) = self.rebind(SocketAddr::new(bind, self.port)) {
-                state.enabled = previous.0;
-                state.bind = previous.1;
-                return Err(error);
-            }
-        }
-        if let Err(error) = state.save(&self.config) {
-            state.enabled = previous.0;
-            state.bind = previous.1;
-            return Err(error);
-        }
-        Ok(state.status())
-    }
-
-    pub fn disable(&self) -> Result<LanStatus, String> {
-        let mut state = self.lan.lock().map_err(|_| "LAN state poisoned")?;
-        let previous = (state.enabled, state.bind);
-        state.disable();
-        if let Err(error) = self.rebind(SocketAddr::new(state.bind, self.port)) {
-            state.enabled = previous.0;
-            state.bind = previous.1;
-            return Err(error);
-        }
-        if let Err(error) = state.save(&self.config) {
-            state.enabled = previous.0;
-            state.bind = previous.1;
-            return Err(error);
-        }
-        Ok(state.status())
-    }
-
     pub fn set_password(&self, hash: String) -> Result<LanStatus, String> {
         let mut state = self.lan.lock().map_err(|_| "LAN state poisoned")?;
         state.set_password(hash);
@@ -180,36 +137,6 @@ impl Api {
         let state = self.lan.lock().map_err(|_| "LAN state poisoned")?;
         Ok(state.status())
     }
-
-    fn rebind(&self, addr: SocketAddr) -> Result<(), String> {
-        let current = *self
-            .current
-            .lock()
-            .map_err(|_| "HTTP listener state poisoned")?;
-        let (reply, receiver) = mpsc::channel();
-        self.commands
-            .send(Command::Rebind { addr, reply })
-            .map_err(|_| "HTTP listener is not running".to_string())?;
-        // A blocking accept needs a connection to return from accept so the
-        // loop can observe the queued command and rebind. The loop drops this
-        // probe before dispatching a normal request.
-        wake_listener(current);
-        receiver
-            .recv_timeout(Duration::from_secs(3))
-            .map_err(|_| "HTTP rebind timed out".to_string())?
-    }
-}
-
-fn wake_listener(current: SocketAddr) {
-    let target = if current.ip().is_unspecified() {
-        match current {
-            SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), current.port()),
-            SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), current.port()),
-        }
-    } else {
-        current
-    };
-    let _ = TcpStream::connect_timeout(&target, Duration::from_millis(500));
 }
 
 #[cfg(unix)]
@@ -313,14 +240,7 @@ struct Connection {
 }
 
 #[cfg(unix)]
-fn reactor_loop(
-    mut listener: Option<TcpListener>,
-    mut address: SocketAddr,
-    commands: Receiver<Command>,
-    lan: Arc<Mutex<Lan>>,
-    config: PathBuf,
-    current: Arc<Mutex<SocketAddr>>,
-) {
+fn reactor_loop(mut listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config: PathBuf) {
     if let Some(active) = &listener {
         let _ = active.set_nonblocking(true);
     }
@@ -355,16 +275,6 @@ fn reactor_loop(
     let mut connections: HashMap<u64, Connection> = HashMap::new();
     let mut next_id: u64 = 1;
     loop {
-        while let Ok(Command::Rebind {
-            addr: new_addr,
-            reply,
-        }) = commands.try_recv()
-        {
-            apply_rebind(&mut listener, &mut address, new_addr, reply, &current);
-            if let Some(active) = &listener {
-                let _ = active.set_nonblocking(true);
-            }
-        }
         while let Ok(result) = results_rx.try_recv() {
             match result {
                 WorkResult::Http(result) => {
@@ -838,9 +748,8 @@ fn http_worker(
 #[cfg(unix)]
 fn ui_stream_kind(path: &str) -> Option<&'static str> {
     let path = path.split_once('?').map(|(path, _)| path).unwrap_or(path);
-    let rest = path.strip_prefix("/plugin-ui/")?;
-    let (_, sub) = rest.split_once('/')?;
-    match sub {
+    let ui = ui_path(path)?;
+    match ui.sub {
         "events" => Some("events"),
         "ws" => Some("ws"),
         _ => None,
@@ -877,6 +786,13 @@ fn prepare_sse(
     }
     if !package::valid_name(ui.id) || plugin::web_assets(ui.id).is_none() {
         return Err(error(404, "not_found", "unknown plugin UI"));
+    }
+    if !token_valid(lan, ui.token, ui.id) {
+        return Err(error(
+            401,
+            "unauthorized",
+            "invalid or expired plugin token",
+        ));
     }
     if request_header(request, "origin").is_some() && !http::same_origin(&request.headers) {
         return Err(error(
@@ -1096,6 +1012,13 @@ fn prepare_ws(
     };
     if !package::valid_name(ui.id) || plugin::web_assets(ui.id).is_none() {
         return Err(error(404, "not_found", "unknown plugin UI"));
+    }
+    if !token_valid(lan, ui.token, ui.id) {
+        return Err(error(
+            401,
+            "unauthorized",
+            "invalid or expired plugin token",
+        ));
     }
     let origin = request_header(request, "origin");
     if origin.is_some() && !http::same_origin(&request.headers) {
@@ -1587,57 +1510,13 @@ fn parse_buffered_request(buffer: &[u8]) -> Result<Option<(HttpRequest, usize)>,
 }
 
 #[cfg(not(unix))]
-fn listener_loop(
-    mut listener: Option<TcpListener>,
-    mut addr: SocketAddr,
-    receiver: Receiver<Command>,
-    lan: Arc<Mutex<Lan>>,
-    config: PathBuf,
-    current: Arc<Mutex<SocketAddr>>,
-) {
+fn listener_loop(listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config: PathBuf) {
+    let Some(active) = listener.as_ref() else {
+        return;
+    };
     loop {
-        // Handle commands before blocking in accept. Commands that arrive
-        // while blocked are woken by a loopback probe from Api::rebind.
-        while let Ok(Command::Rebind {
-            addr: new_addr,
-            reply,
-        }) = receiver.try_recv()
-        {
-            apply_rebind(&mut listener, &mut addr, new_addr, reply, &current);
-        }
-        let Some(active) = listener.as_ref() else {
-            match receiver.recv() {
-                Ok(Command::Rebind {
-                    addr: new_addr,
-                    reply,
-                }) => {
-                    apply_rebind(&mut listener, &mut addr, new_addr, reply, &current);
-                }
-                Err(_) => return,
-            }
-            continue;
-        };
-        let accepted = active.accept();
-        match accepted {
+        match active.accept() {
             Ok((stream, _)) => {
-                // The accepted socket may be the probe that woke us for a
-                // pending rebind. Commands are queued before the probe is
-                // connected, so try_recv sees them here.
-                let mut pending = Vec::new();
-                while let Ok(command) = receiver.try_recv() {
-                    pending.push(command);
-                }
-                if !pending.is_empty() {
-                    drop(stream);
-                    for Command::Rebind {
-                        addr: new_addr,
-                        reply,
-                    } in pending
-                    {
-                        apply_rebind(&mut listener, &mut addr, new_addr, reply, &current);
-                    }
-                    continue;
-                }
                 let lan = lan.clone();
                 let config = config.clone();
                 let _ = thread::Builder::new()
@@ -1647,40 +1526,10 @@ fn listener_loop(
             }
             Err(error) => {
                 log::svcd(&format!("svcd: HTTP accept failed: {}", error));
-                listener = None;
+                return;
             }
         }
     }
-}
-
-fn apply_rebind(
-    listener: &mut Option<TcpListener>,
-    addr: &mut SocketAddr,
-    new_addr: SocketAddr,
-    reply: Sender<Result<(), String>>,
-    current: &Arc<Mutex<SocketAddr>>,
-) {
-    *listener = None;
-    match bind_listener(new_addr) {
-        Ok(new_listener) => {
-            *listener = Some(new_listener);
-            *addr = new_addr;
-            if let Ok(mut active) = current.lock() {
-                *active = new_addr;
-            }
-            let _ = reply.send(Ok(()));
-        }
-        Err(error) => {
-            if let Ok(old_listener) = bind_listener(*addr) {
-                *listener = Some(old_listener);
-            }
-            let _ = reply.send(Err(error.to_string()));
-        }
-    }
-}
-
-fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
-    TcpListener::bind(addr)
 }
 
 #[cfg(not(unix))]
@@ -1878,6 +1727,14 @@ fn handle_stream(
         let _ = stream.write_all(&error(404, "not_found", "unknown plugin UI"));
         return true;
     }
+    if !token_valid(lan, ui.token, ui.id) {
+        let _ = stream.write_all(&error(
+            401,
+            "unauthorized",
+            "invalid or expired plugin token",
+        ));
+        return true;
+    }
 
     let origin = request_header(request, "origin");
     if origin.is_some() && !http::same_origin(&request.headers) {
@@ -2042,61 +1899,97 @@ fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u
             && package::valid_name(ui.id)
             && plugin::web_assets(ui.id).is_some()
         {
+            let location = if ui.token.is_empty() {
+                format!("/plugin-ui/{}/", ui.id)
+            } else {
+                format!("/plugin-ui/{}/{}/", ui.id, ui.token)
+            };
             return http::response_with_headers(
                 308,
                 "text/plain; charset=utf-8",
-                &[("Location".to_string(), format!("/plugin-ui/{}/", ui.id))],
+                &[("Location".to_string(), location)],
                 b"",
             );
         }
-        return plugin_ui(config, request, &ui, auth);
+        return plugin_ui(config, request, &ui, auth, lan);
     }
     route(config, request, lan)
 }
 
-/// One parsed `/plugin-ui/...` path.
+/// One parsed `/plugin-ui/{id}/{token}/...` path.
 struct UiPath<'a> {
     /// The plugin id segment (still unvalidated).
     id: &'a str,
-    /// Everything after `/plugin-ui/{id}/`; empty for the plugin root.
+    /// The per-plugin UI token.
+    token: &'a str,
+    /// Everything after the token; empty for the plugin root.
     sub: &'a str,
-    /// True for `/plugin-ui/{id}` without the trailing slash.
+    /// True for `/plugin-ui/{id}` or `/plugin-ui/{id}/{token}` without the
+    /// trailing slash.
     slashless: bool,
 }
 
 fn ui_path(path: &str) -> Option<UiPath<'_>> {
     let rest = path.strip_prefix("/plugin-ui/")?;
-    Some(match rest.split_once('/') {
-        Some((id, sub)) => UiPath {
+    let (id, after, root_slash) = match rest.split_once('/') {
+        Some((id, after)) => (id, after, true),
+        None => (rest, "", false),
+    };
+    if after.is_empty() && root_slash {
+        return Some(UiPath {
             id,
-            sub,
-            slashless: false,
-        },
-        None => UiPath {
-            id: rest,
+            token: "",
             sub: "",
-            slashless: true,
-        },
+            slashless: false,
+        });
+    }
+    let (token, sub, slashless) = match after.split_once('/') {
+        Some((token, sub)) => (token, sub, false),
+        None => (after, "", true),
+    };
+    Some(UiPath {
+        id,
+        token,
+        sub,
+        slashless,
     })
 }
 
-/// Serve `/plugin-ui/{id}/...`: the plugin's package-local web assets, the
-/// `/rpc` JSON-RPC bridge, and the SSE/WebSocket realtime streams. A plugin
-/// never runs an HTTP listener of its own.
-fn plugin_ui(config: &Path, request: &HttpRequest, ui: &UiPath<'_>, auth: AuthKind) -> Vec<u8> {
+/// Serve `/plugin-ui/{id}/{token}/...`: the plugin's package-local web assets,
+/// the `/rpc` JSON-RPC bridge, and the SSE/WebSocket realtime streams. A plugin
+/// never runs an HTTP listener of its own, and the token must belong to this
+/// plugin id.
+fn plugin_ui(
+    config: &Path,
+    request: &HttpRequest,
+    ui: &UiPath<'_>,
+    auth: AuthKind,
+    lan: &Arc<Mutex<Lan>>,
+) -> Vec<u8> {
     if !package::valid_name(ui.id) {
         return error(404, "not_found", "unknown plugin UI");
     }
     let Some(assets) = plugin::web_assets(ui.id) else {
         return error(404, "not_found", &format!("plugin {} has no web UI", ui.id));
     };
+    if !token_valid(lan, ui.token, ui.id) {
+        return error(401, "unauthorized", "invalid or expired plugin token");
+    }
     if ui.sub == "rpc" {
         return ui_rpc(config, request, ui.id, auth);
     }
-    serve_ui(request, &assets, ui.id, ui.sub)
+    let base = format!("/plugin-ui/{}/{}/", ui.id, ui.token);
+    serve_ui(request, &assets, ui.sub, &base)
 }
 
-fn serve_ui(request: &HttpRequest, assets: &plugin::WebAssets, id: &str, sub: &str) -> Vec<u8> {
+fn token_valid(lan: &Arc<Mutex<Lan>>, token: &str, plugin: &str) -> bool {
+    match lan.lock() {
+        Ok(mut state) => state.validate_plugin_token(token, plugin),
+        Err(_) => false,
+    }
+}
+
+fn serve_ui(request: &HttpRequest, assets: &plugin::WebAssets, sub: &str, base: &str) -> Vec<u8> {
     if request.method != "GET" {
         return method_not_allowed("GET");
     }
@@ -2104,13 +1997,13 @@ fn serve_ui(request: &HttpRequest, assets: &plugin::WebAssets, id: &str, sub: &s
         return error(404, "not_found", "not found");
     };
     if let Some((path, metadata)) = web_file(&assets.root, &relative) {
-        return serve_web_file(request, &path, &metadata, id);
+        return serve_web_file(request, &path, &metadata, base);
     }
     // SPA fallback: only an HTML navigation falls back to the entry. A missing
     // script must stay a 404 so the browser reports it instead of running HTML.
     if wants_html(request) {
         if let Some((path, metadata)) = web_file(&assets.root, &assets.entry) {
-            return serve_web_file(request, &path, &metadata, id);
+            return serve_web_file(request, &path, &metadata, base);
         }
     }
     error(404, "not_found", "not found")
@@ -2136,7 +2029,7 @@ fn serve_web_file(
     request: &HttpRequest,
     path: &Path,
     metadata: &fs::Metadata,
-    id: &str,
+    base: &str,
 ) -> Vec<u8> {
     let mime = http::content_type(&path.to_string_lossy());
     let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
@@ -2150,7 +2043,7 @@ fn serve_web_file(
         Err(cause) => return error(500, "internal", &format!("read UI asset: {}", cause)),
     };
     let body = if mime.starts_with("text/html") {
-        webui::inject_base(&data, id)
+        webui::inject_base(&data, base)
     } else {
         data
     };
@@ -2163,6 +2056,7 @@ fn web_headers(etag: &str) -> Vec<(String, String)> {
         ("Cache-Control".to_string(), "no-cache".to_string()),
         ("Vary".to_string(), "Accept".to_string()),
         ("X-Content-Type-Options".to_string(), "nosniff".to_string()),
+        ("Referrer-Policy".to_string(), "no-referrer".to_string()),
     ]
 }
 
@@ -2390,8 +2284,9 @@ fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<
         }
         ("GET", ["api", "v1", "auth"]) => match lan_state.lock() {
             Ok(state) => ok(json!({
-                "enabled": state.enabled,
                 "bind": state.bind.to_string(),
+                "requestedBind": state.requested_bind.to_string(),
+                "authRequired": state.require_auth,
                 "passwordSet": state.password_hash().is_some(),
             })),
             Err(_) => error(500, "internal", "auth state unavailable"),
@@ -2458,6 +2353,10 @@ fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<
                 Err(response) => response,
             }
         }
+        ("POST", ["api", "v1", "plugins", id, "ui-token"]) => {
+            plugin_ui_token(&decode(id), lan_state)
+        }
+        (_, ["api", "v1", "plugins", _, "ui-token"]) => method_not_allowed("POST"),
         ("POST", ["api", "v1", "plugins"]) => install_plugin(config, request, query),
         ("POST", ["api", "v1", "blobs"]) => blob_put(request),
         ("GET", ["api", "v1", "blobs", id]) => blob_get(&decode(id)),
@@ -2554,6 +2453,24 @@ fn trust_remove(key_id: &str) -> Vec<u8> {
         ),
         Err(error) => map_error(&error),
     }
+}
+
+fn plugin_ui_token(id: &str, lan_state: &Arc<Mutex<Lan>>) -> Vec<u8> {
+    if !package::valid_name(id) {
+        return error(404, "not_found", &format!("unknown plugin UI: {}", id));
+    }
+    if plugin::web_assets(id).is_none() {
+        return error(404, "not_found", &format!("plugin {} has no web UI", id));
+    }
+    let token = match lan_state.lock() {
+        Ok(mut state) => state.issue_plugin_token(id),
+        Err(_) => return error(500, "internal", "auth state unavailable"),
+    };
+    ok(json!({
+        "token": token,
+        "url": format!("/plugin-ui/{}/{}/", id, token),
+        "expiresIn": lan::plugin_token_ttl_secs(),
+    }))
 }
 
 fn install_plugin(config: &std::path::Path, request: &HttpRequest, query: &str) -> Vec<u8> {
@@ -3009,10 +2926,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn port_precedence_is_env_then_config_then_default() {
-        assert_eq!(resolve_port(Some("1234"), Some(5678)), 1234);
-        assert_eq!(resolve_port(Some("not-a-port"), Some(5678)), 5678);
-        assert_eq!(resolve_port(None, Some(5678)), 5678);
-        assert_eq!(resolve_port(None, None), DEFAULT_PORT);
+    fn bind_precedence_is_env_then_config_then_default() {
+        let a: SocketAddr = "127.0.0.1:1234".parse().expect("addr");
+        let b: SocketAddr = "0.0.0.0:5678".parse().expect("addr");
+        assert_eq!(resolve_bind(Some("127.0.0.1:1234"), Some(b)), a);
+        assert_eq!(resolve_bind(Some("not-an-addr"), Some(b)), b);
+        assert_eq!(resolve_bind(None, Some(b)), b);
+        assert_eq!(resolve_bind(None, None), default_bind());
     }
 }

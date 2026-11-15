@@ -422,8 +422,8 @@ foreach ($p in $plugins) {
     if ($p.url) { $manifest["url"] = $p.url }
     Write-Lf (Join-Path $dir "manifest.json") ($manifest | ConvertTo-Json -Depth 8)
 
-    $localOut = Join-Path $STAGE ("out\{0}-1.0.0-aarch64.spk" -f $p.id)
-    $outFile = Join-Path $OUT ("{0}-1.0.0-aarch64.spk" -f $p.id)
+    $localOut = Join-Path $STAGE ("out\{0}-1.0.0-aarch64-unknown-linux-musl.spk" -f $p.id)
+    $outFile = Join-Path $OUT ("{0}-1.0.0-aarch64-unknown-linux-musl.spk" -f $p.id)
     New-Item -ItemType Directory -Force (Split-Path $localOut) | Out-Null
     & $PLUGIN bundle $dir --key $KEY --id $p.id --version 1.0.0 --desc $p.desc --exec $entry --interpreter sh --compat sr6110 --platform aarch64-unknown-linux-musl -o $localOut
     if ($LASTEXITCODE -ne 0) { throw "bundle failed for $($p.id)" }

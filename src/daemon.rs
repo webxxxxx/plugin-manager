@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -779,24 +778,6 @@ impl Daemon {
                 Ok(status) => rpc::ok(id, auth_json(&status)),
                 Err(error) => rpc::err(id, -32008, &error),
             },
-            "auth.enable" => {
-                let bind = request
-                    .params
-                    .get("bind")
-                    .and_then(Value::as_str)
-                    .unwrap_or("0.0.0.0");
-                match bind.parse::<IpAddr>() {
-                    Ok(bind) => match self.auth_enable(bind) {
-                        Ok(status) => rpc::ok(id, auth_json(&status)),
-                        Err(error) => rpc::err(id, -32008, &error),
-                    },
-                    Err(_) => rpc::err(id, -32008, "invalid bind address"),
-                }
-            }
-            "auth.disable" => match self.auth_disable() {
-                Ok(status) => rpc::ok(id, auth_json(&status)),
-                Err(error) => rpc::err(id, -32008, &error),
-            },
             "auth.passwd" => {
                 let password = request
                     .params
@@ -822,32 +803,6 @@ impl Daemon {
 
     #[cfg(not(feature = "http"))]
     fn auth_status(&self) -> Result<LanStatus, String> {
-        Err("HTTP API is disabled in this build".to_string())
-    }
-
-    #[cfg(feature = "http")]
-    fn auth_enable(&self, bind: IpAddr) -> Result<LanStatus, String> {
-        self.api
-            .as_ref()
-            .ok_or_else(|| "HTTP API is not running".to_string())?
-            .enable(bind)
-    }
-
-    #[cfg(not(feature = "http"))]
-    fn auth_enable(&self, _bind: IpAddr) -> Result<LanStatus, String> {
-        Err("HTTP API is disabled in this build".to_string())
-    }
-
-    #[cfg(feature = "http")]
-    fn auth_disable(&self) -> Result<LanStatus, String> {
-        self.api
-            .as_ref()
-            .ok_or_else(|| "HTTP API is not running".to_string())?
-            .disable()
-    }
-
-    #[cfg(not(feature = "http"))]
-    fn auth_disable(&self) -> Result<LanStatus, String> {
         Err("HTTP API is disabled in this build".to_string())
     }
 
@@ -1409,33 +1364,26 @@ impl Daemon {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-        let package = package::verify_package(Path::new(path))?;
+        // Everything that can reject the package runs before anything is
+        // stopped or written: a bad package must leave the installed version
+        // untouched. `plugin::verify` is the same preflight `plugin verify`
+        // exposes, so the two answers cannot drift apart.
+        let verified = plugin::verify(
+            Path::new(path),
+            settings::allow_insecure_install(),
+            allow_hooks,
+        )?;
+        let plugin::Verified {
+            package,
+            signature_verified,
+            interpreter: host_interpreter,
+        } = verified;
         let id = package.manifest.name.clone();
         if let Some(existing) = self.registry.get(&id) {
             if existing.kind != Kind::Plugin {
                 return Err(format!("id is a core service: {}", id));
             }
         }
-        // Device compatibility is checked before anything is stopped or
-        // written: a wrong package must leave the installed version untouched.
-        let devices = package
-            .manifest
-            .compat
-            .as_ref()
-            .map(|spec| spec.devices.clone())
-            .unwrap_or_default();
-        if let Some(reason) = compat::verdict_reason(compat::evaluate(
-            package::target(),
-            &devices,
-            &compat::detect(),
-        )) {
-            return Err(reason);
-        }
-        // Refuse a hook package or an unresolvable interpreter before a replace
-        // strategy stops the running version: a policy rejection must not leave
-        // the plugin stopped.
-        plugin::ensure_hooks_allowed(&package, allow_hooks)?;
-        let host_interpreter = plugin::prepare(&package)?;
 
         let running = |slots: &BTreeMap<String, Slot>| {
             slots
@@ -1487,13 +1435,18 @@ impl Daemon {
         self.registry.insert(service)?;
         self.bump_catalog();
         log::svcd(&format!(
-            "svcd: plugin {} {} installed ({})",
+            "svcd: plugin {} {} installed ({}){}",
             id,
             package.manifest.version,
             if still_running {
                 "running; next start uses"
             } else {
                 "now"
+            },
+            if signature_verified {
+                ""
+            } else {
+                "; signature was NOT verified (allow_insecure_install)"
             }
         ));
         self.status_for_id(&id)
@@ -1909,8 +1862,9 @@ fn walk_dependencies(registry: &Registry, ids: &[String]) -> (BTreeSet<String>, 
 
 fn auth_json(status: &LanStatus) -> Value {
     json!({
-        "enabled": status.enabled,
         "bind": status.bind.to_string(),
+        "requestedBind": status.requested_bind.to_string(),
+        "authRequired": status.require_auth,
         "passwordSet": status.password_set,
     })
 }

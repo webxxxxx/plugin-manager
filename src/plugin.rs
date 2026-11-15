@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use crate::compat;
 use crate::hook;
 use crate::interpreter;
 use crate::log;
@@ -86,6 +87,65 @@ pub fn prepare(package: &Package) -> Result<Option<Interpreter>, String> {
         .collect();
     package::validate_script_payload(&package.manifest, &files)?;
     resolve_interpreter(&package.manifest, interpreter::check)
+}
+
+/// A package that passed every install-time check, plus the host state the
+/// install will use. Produced by [`verify`].
+pub struct Verified {
+    pub package: Package,
+    /// False when the insecure fallback accepted a package whose signature was
+    /// missing or untrusted; the caller must log that fact on install.
+    pub signature_verified: bool,
+    pub interpreter: Option<Interpreter>,
+}
+
+/// Run every check an install performs before it touches the plugin tree:
+/// package signature and file hashes, host compatibility, hook policy and the
+/// interpreter lookup. It has no side effects, so `plugin verify` can run it on
+/// a package that is not installed, and the daemon calls the same function
+/// before stopping a running version.
+pub fn verify(path: &Path, allow_insecure: bool, opt_in_hooks: bool) -> Result<Verified, String> {
+    let (package, signature_verified) =
+        package::verify_package_with_fallback(path, allow_insecure)?;
+    verify_package(package, signature_verified, opt_in_hooks)
+}
+
+/// Byte-slice counterpart of [`verify`], for callers that already hold the
+/// package bytes (and want to hash them without reading the file twice).
+pub fn verify_bytes(
+    bytes: &[u8],
+    allow_insecure: bool,
+    opt_in_hooks: bool,
+) -> Result<Verified, String> {
+    let (package, signature_verified) = package::verify_bytes_with_fallback(bytes, allow_insecure)?;
+    verify_package(package, signature_verified, opt_in_hooks)
+}
+
+fn verify_package(
+    package: Package,
+    signature_verified: bool,
+    opt_in_hooks: bool,
+) -> Result<Verified, String> {
+    let devices = package
+        .manifest
+        .compat
+        .as_ref()
+        .map(|spec| spec.devices.clone())
+        .unwrap_or_default();
+    if let Some(reason) = compat::verdict_reason(compat::evaluate(
+        package::target(),
+        &devices,
+        &compat::detect(),
+    )) {
+        return Err(reason);
+    }
+    ensure_hooks_allowed(&package, opt_in_hooks)?;
+    let interpreter = prepare(&package)?;
+    Ok(Verified {
+        package,
+        signature_verified,
+        interpreter,
+    })
 }
 
 pub fn install_package(

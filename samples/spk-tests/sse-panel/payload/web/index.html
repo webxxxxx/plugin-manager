@@ -114,9 +114,7 @@
 <script>
 (function () {
   "use strict";
-  var parts = location.pathname.split("/").filter(Boolean);
-  var pluginId = parts[1] || "sse-panel";
-  var endpoint = location.origin + "/plugin-ui/" + pluginId + "/events";
+  var endpoint = new URL("events", location.href).href;
   document.getElementById("endpoint").textContent = endpoint;
 
   var log = document.getElementById("log");

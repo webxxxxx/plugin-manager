@@ -115,7 +115,7 @@ def main():
         "SVCD_DATA_DIR": str(data),
         "SVCD_LOG_DIR": str(logs),
         "SVCD_TRUST_DIR": str(trust),
-        "SVCD_HTTP_PORT": "0",
+        "SVCD_BIND": "127.0.0.1:0",
     })
 
     fixture = work / "plugin"

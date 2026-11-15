@@ -89,9 +89,9 @@ pub(crate) fn default_config_dir() -> PathBuf {
     }
 }
 
-/// The configuration directory: `svcd.conf`, `trust.d`, `lan.json` and the
-/// local control token. `SVCD_CONFIG_DIR` overrides it for tests; otherwise
-/// `config_dir` in the loaded `svcd.conf` wins over the platform default.
+/// The configuration directory: `svcd.conf`, `trust.d` and the local control
+/// token. `SVCD_CONFIG_DIR` overrides it for tests; otherwise `config_dir` in
+/// the loaded `svcd.conf` wins over the platform default.
 /// Production defaults are `/etc/svcd`, `/Library/Application Support/svcd/config`
 /// and `%USERPROFILE%\.svcd`; a non-root process defaults to its user profile.
 pub fn config_dir() -> PathBuf {

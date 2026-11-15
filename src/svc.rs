@@ -43,8 +43,6 @@ impl DaemonVerb {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AuthAction {
     Status,
-    Enable,
-    Disable,
     Passwd(String),
 }
 
@@ -81,7 +79,6 @@ enum Command {
     },
     Auth {
         action: AuthAction,
-        bind: Option<String>,
     },
     Trust {
         action: TrustAction,
@@ -105,7 +102,7 @@ pub fn run(args: Vec<String>) -> i32 {
         Command::Compat { json } => compat_show(json),
         Command::CompatInit { device, dry_run } => compat_init(&device, dry_run),
         Command::Logs { id, follow, lines } => show_logs(&id, follow, lines),
-        Command::Auth { action, bind } => auth_command(action, bind.as_deref()),
+        Command::Auth { action } => auth_command(action),
         Command::Trust { action } => trust_command(action),
     }
 }
@@ -181,38 +178,13 @@ fn parse_auth(args: &[String]) -> Result<Command, ()> {
     match args {
         [action] if action == "status" => Ok(Command::Auth {
             action: AuthAction::Status,
-            bind: None,
-        }),
-        [action] if action == "disable" => Ok(Command::Auth {
-            action: AuthAction::Disable,
-            bind: None,
         }),
         [action, password]
             if action == "passwd" && !password.is_empty() && !password.starts_with('-') =>
         {
             Ok(Command::Auth {
                 action: AuthAction::Passwd(password.clone()),
-                bind: None,
             })
-        }
-        [action] if action == "enable" => Ok(Command::Auth {
-            action: AuthAction::Enable,
-            bind: None,
-        }),
-        [action, flag, value] if action == "enable" && flag == "--bind" => Ok(Command::Auth {
-            action: AuthAction::Enable,
-            bind: Some(value.clone()),
-        }),
-        [action, value] if action == "enable" && value.starts_with("--bind=") => {
-            let bind = value.trim_start_matches("--bind=").to_string();
-            if bind.is_empty() {
-                Err(())
-            } else {
-                Ok(Command::Auth {
-                    action: AuthAction::Enable,
-                    bind: Some(bind),
-                })
-            }
         }
         _ => Err(()),
     }
@@ -493,11 +465,8 @@ fn compat_init(device: &str, dry_run: bool) -> i32 {
     compat_show(false)
 }
 
-fn auth_command(action: AuthAction, bind: Option<&str>) -> i32 {
-    if matches!(
-        &action,
-        AuthAction::Enable | AuthAction::Disable | AuthAction::Passwd(_)
-    ) {
+fn auth_command(action: AuthAction) -> i32 {
+    if matches!(&action, AuthAction::Passwd(_)) {
         if let Err(error) = crate::lan::require_root() {
             eprintln!("svc: {}", error);
             return EXIT_SERVICE_ERROR;
@@ -505,8 +474,6 @@ fn auth_command(action: AuthAction, bind: Option<&str>) -> i32 {
     }
     let (method, params) = match &action {
         AuthAction::Status => ("auth.status", json!({})),
-        AuthAction::Enable => ("auth.enable", json!({ "bind": bind.unwrap_or("0.0.0.0") })),
-        AuthAction::Disable => ("auth.disable", json!({})),
         AuthAction::Passwd(password) => ("auth.passwd", json!({ "password": password })),
     };
     let response = match channel::request(&paths::config_dir(), method, params) {
@@ -523,15 +490,22 @@ fn auth_command(action: AuthAction, bind: Option<&str>) -> i32 {
     let result = response.result.unwrap_or(Value::Null);
     if matches!(&action, AuthAction::Status) {
         println!(
-            "enabled: {}",
-            result
-                .get("enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        );
-        println!(
             "bind: {}",
             result.get("bind").and_then(Value::as_str).unwrap_or("-")
+        );
+        println!(
+            "requested: {}",
+            result
+                .get("requestedBind")
+                .and_then(Value::as_str)
+                .unwrap_or("-")
+        );
+        println!(
+            "auth required: {}",
+            result
+                .get("authRequired")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
         );
         println!(
             "password: {}",
@@ -546,17 +520,11 @@ fn auth_command(action: AuthAction, bind: Option<&str>) -> i32 {
             }
         );
     } else {
-        let enabled = result
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let bind = result.get("bind").and_then(Value::as_str).unwrap_or("-");
-        if matches!(&action, AuthAction::Passwd(_)) {
-            println!("password: set");
-        } else {
-            println!("LAN {}", if enabled { "enabled" } else { "disabled" });
-            println!("bind: {}", bind);
-        }
+        println!("password: set");
+        println!(
+            "bind: {}",
+            result.get("bind").and_then(Value::as_str).unwrap_or("-")
+        );
     }
     EXIT_OK
 }
@@ -719,7 +687,7 @@ fn usage() {
     eprintln!("       svc compat [--json]");
     eprintln!("       svc compat init --device <id> [--dry-run]");
     eprintln!("       svc logs <id> [--follow] [--lines N]");
-    eprintln!("       svc auth status|enable [--bind <ip>]|disable|passwd <password>");
+    eprintln!("       svc auth status|passwd <password>");
     eprintln!("       svc trust list|add <file.pub>|remove <keyId>");
 }
 
@@ -865,22 +833,13 @@ mod tests {
         assert_eq!(
             parse(&args(&["auth", "status"])).expect("auth status"),
             Command::Auth {
-                action: AuthAction::Status,
-                bind: None
-            }
-        );
-        assert_eq!(
-            parse(&args(&["auth", "enable", "--bind", "0.0.0.0"])).expect("auth enable"),
-            Command::Auth {
-                action: AuthAction::Enable,
-                bind: Some("0.0.0.0".into())
+                action: AuthAction::Status
             }
         );
         assert_eq!(
             parse(&args(&["auth", "passwd", "secret"])).expect("auth passwd"),
             Command::Auth {
-                action: AuthAction::Passwd("secret".into()),
-                bind: None
+                action: AuthAction::Passwd("secret".into())
             }
         );
         assert!(parse(&args(&["auth", "enable", "--bind"])).is_err());

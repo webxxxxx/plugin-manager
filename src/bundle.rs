@@ -1,5 +1,9 @@
 //! `plugin bundle`: pack a local directory into a signed, canonical `.spk`.
 //!
+//! The artifact defaults to `<name>-<version>-<platform>.spk`: the whole target
+//! triple, because the architecture prefix alone cannot distinguish musl from
+//! gnu (or other ABIs sharing an arch).
+//!
 //! The directory is the source of truth for `files[]`: every regular file is
 //! hashed, sized and mode-checked here, then the manifest is serialized with
 //! sorted keys and no trailing newline before it is signed. An optional
@@ -62,7 +66,7 @@ pub fn bundle(options: &Options) -> Result<PathBuf, String> {
         return Err("the signing key must not be inside the bundle directory".into());
     }
     if let Some(platform) = &options.platform {
-        if !platform.contains('-') || platform.chars().any(char::is_whitespace) {
+        if !valid_platform(platform) {
             return Err(format!("invalid target triple: {:?}", platform));
         }
     }
@@ -89,14 +93,14 @@ pub fn bundle(options: &Options) -> Result<PathBuf, String> {
     let (manifest_bytes, parsed) =
         assemble_manifest(&dir, &mut sources, skeleton.unwrap_or_default(), options)?;
 
-    let arch = parsed
-        .platform
-        .split('-')
-        .next()
-        .filter(|arch| !arch.is_empty())
-        .unwrap_or("unknown");
+    // The filename carries the whole target triple: `x86_64` alone is shared by
+    // the musl and gnu packages, so an arch-only name cannot identify which
+    // host may install the file.
     let path = options.out.clone().unwrap_or_else(|| {
-        PathBuf::from(format!("{}-{}-{}.spk", parsed.name, parsed.version, arch))
+        PathBuf::from(format!(
+            "{}-{}-{}.spk",
+            parsed.name, parsed.version, parsed.platform
+        ))
     });
     let absolute = absolute_output(&path)?;
     if absolute.starts_with(&dir) {
@@ -676,6 +680,21 @@ fn effective_mode(
     }
 }
 
+/// Whether `platform` is a target triple that is also safe to put in a file
+/// name. It matches the shape `tools/check_spk.mjs` accepts (three or four
+/// `[a-z0-9_]+` components) and keeps path separators and whitespace out of the
+/// default output name.
+fn valid_platform(platform: &str) -> bool {
+    let parts: Vec<&str> = platform.split('-').collect();
+    (3..=4).contains(&parts.len())
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        })
+}
+
 fn normalize_exec(value: &str) -> Result<String, String> {
     let value = value.strip_prefix("./").unwrap_or(value);
     package::check_path(value)?;
@@ -1231,6 +1250,26 @@ mod tests {
         let out = work.path().join("out.spk");
         let error = bundle(&bundle_options(source.path(), &out, &key_path)).expect_err("hook");
         assert!(error.contains("postInstall is not in files[]"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_platform_that_is_not_a_target_triple() {
+        let source = TempDir::new();
+        let work = TempDir::new();
+        write(source.path(), "payload/bin/tool", b"tool", 0o755);
+        let key_path = key_file(&work, 30);
+        let mut options = bundle_options(source.path(), &work.path().join("a.spk"), &key_path);
+        options.id = Some("demo".into());
+        for platform in [
+            "x86_64",
+            "x86_64/unknown/linux-musl",
+            "x86_64-unknown-linux/../musl",
+            "x86_64 unknown linux",
+        ] {
+            options.platform = Some(platform.into());
+            let error = bundle(&options).expect_err("invalid platform");
+            assert!(error.contains("invalid target triple"), "{error}");
+        }
     }
 
     #[test]

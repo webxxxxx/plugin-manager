@@ -47,8 +47,8 @@
 - 五份 `InstallPlan`：systemd（`/etc/systemd/system/svcd.service`，Type=notify、Restart=on-failure、TimeoutStopSec=40）、launchd（`/Library/LaunchDaemons/com.webxxxxx.svcd.plist`，KeepAlive、ThrottleInterval 10）、Windows SCM（`sc create` + failure actions）、BusyBox inittab（`::respawn:`）、procd（`/etc/init.d/svcd`）。
 - 安装需 root / Administrator；幂等（原子替换 + EnsureLine；`sc create` 1073 视为已存在）。
 - `svcd --install [--prefix] [--conf <file>] [--no-service] [--target]`：复制/硬链 `svcd`、`svc`、`plugin`、`mcp` 到平台默认目录（Unix `/usr/sbin`，Windows `%ProgramFiles%\svcd`），再调用 `install-service --program <安装路径>`；`--uninstall` 逆操作，默认保留 config/data/logs，`--purge` 才清。
-- `svcd --install --conf <file>`：校验并原子复制到 `<config>/svcd.conf`。键：`http_port`（0 允许临时端口；`SVCD_HTTP_PORT` 仍覆盖）、`lan_default`（true 时写 `<config>/lan.json`；未设置 `auth_passwd` 时不启用并提示先执行 `svc auth passwd`）、`config_dir`、`plugins_dir`、`services_dir`、`auth_passwd`。相对路径相对 `<config>`；未知键/坏值拒绝且不覆盖已安装配置；`--uninstall` 默认保留，`--purge` 删除。
-- 服务启动配置优先级：`--conf`（`--install --conf` 记录到服务命令行）→ 程序目录 `svcd.conf` → `<config>/svcd.conf`（legacy）→ 生成默认（`<config>/svcd.conf`；不可写时程序目录）。默认含 `http_port = 8787`、`lan_default = false`、`config_dir` 与平台 plugin/services 路径；`auth_passwd` 由 `svc auth passwd` 写入。模板见根目录 `svcd.conf.example`。
+- `svcd --install --conf <file>`：校验并原子复制到 `<config>/svcd.conf`。键：`bind`（默认 `127.0.0.1:8787`；非 loopback 需要 `auth_passwd`，缺失时降级 loopback；`SVCD_BIND` 覆盖）、`allow_insecure_install`（默认 false；开启后验签失败时降级接受未签名包，没有逐次开关）、`config_dir`、`plugins_dir`、`services_dir`、`auth_passwd`。相对路径相对 `<config>`；未知键/坏值拒绝且不覆盖已安装配置；`--uninstall` 默认保留，`--purge` 删除。
+- 服务启动配置优先级：`--conf`（`--install --conf` 记录到服务命令行）→ 程序目录 `svcd.conf` → `<config>/svcd.conf`（legacy）→ 生成默认（`<config>/svcd.conf`；不可写时程序目录）。默认含 `bind = 127.0.0.1:8787`、`allow_insecure_install = false`、`config_dir` 与平台 plugin/services 路径；`auth_passwd` 由 `svc auth passwd` 写入。模板见根目录 `svcd.conf.example`。
 - 卸载默认保留 `<data>` 与配置，`--purge` 才删。
 
 ### 1.6 core 服务与 plugin 的边界
@@ -92,7 +92,7 @@
 - `id` 不能是 `svc`（保留给内置 core），且不能与 plugin id 冲突；冲突时 plugin 安装拒绝、core 定义加载拒绝。
 - `<config>/services.d/<id>.disabled` 存在时该 core 服务 `enabled=false`：开机不自启、崩溃后不按退避自动重启；`svc enable/disable` 维护这个 sidecar，显式 `svc start` 仍然可用。
 - **core 不接受 `capabilities`**：core 是生命周期单元，不参与 `tools/call`；定义里出现该字段即拒绝加载。能力面只属于 plugin。
-- `<config>` 指平台配置目录（Linux `/etc/svcd`、macOS `/Library/Application Support/svcd/config`、Windows `%USERPROFILE%\.svcd`）；`svcd.conf` 的 `config_dir` 可覆盖，`SVCD_CONFIG_DIR` 再覆盖，供测试与非 root 开发使用。`svcd.conf`、`trust.d`、`lan.json`、`svcd.token` 都在这个目录。
+- `<config>` 指平台配置目录（Linux `/etc/svcd`、macOS `/Library/Application Support/svcd/config`、Windows `%USERPROFILE%\.svcd`）；`svcd.conf` 的 `config_dir` 可覆盖，`SVCD_CONFIG_DIR` 再覆盖，供测试与非 root 开发使用。`svcd.conf`、`trust.d` 和 `svcd.token` 都在这个目录。
 - `<logs>` 指平台日志目录（Linux `/var/log/svcd`、macOS `/Library/Logs/svcd`、Windows `%ProgramData%\svcd\logs`）；`SVCD_LOG_DIR` 可覆盖，供测试与非 root 开发使用。
 - core 与 plugin 走同一监督器、同一 stdio NDJSON、同一依赖图、同一日志 / 状态；`svc list/status/start/stop/logs` 对两者一致；`install/uninstall/import/export/editconfig` 只对 plugin。
 
@@ -167,7 +167,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 | `config` | string | 否 | 配置模板在包内的相对路径，默认 `config/config`；必须在 `files[]` |
 | `configCheck` | object | 否 | `{path, args?}`；校验命令，path 在 `files[]`、可执行；声明 check 却没有 config → 安装失败 |
 
-- 文件名仍是 `<name>-<version>-<arch>.spk`，`arch = platform.split('-')[0]`。
+- 文件名是 `<name>-<version>-<platform>.spk`，带**完整目标三元组**（只写 arch 无法区分 musl 与 gnu）；`platform` 字段本身仍不带 `arch` 字段（见 §11）。
 - **canonical manifest**：打包器必须产出「排序键 + 紧凑 + 无尾换行 + 无 BOM」的 `manifest.json`；签名覆盖原样字节。
 - 未知字段忽略；未知 `schema` 主版本拒绝；主版本内加法兼容。
 - `arch` 不是合法字段；v1 不提供 `arch` 兼容层（见 §11）。
@@ -176,7 +176,8 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 
 - 包内 `signature.json`：`{"alg":"ed25519","keyId":"...","sig":"base64"}`，签 `manifest.json` 的原样字节；`files[]` 钉每个文件的 sha256/size/mode。
 - 验证顺序：读 manifest → 验签 → 校验 schema / platform / 路径 → 逐文件验 hash 后落盘；清单外条目直接拒；流式、逐文件可验。
-- 信任根：`<config>/trust.d/<keyId>.pub`（**PEM SPKI**）；未知 keyId 拒绝；**不提供 `--insecure`**。
+- `plugin verify <file.spk> [--json]` 只跑安装前的同一段校验（含 compat / hooks / 解释器），不落盘；`plugin install` 调用同一个函数，避免两套判断分叉。`--json` 输出 `{ok, file, name, version, platform, schema, size, sha256, capabilities, compat, signature:{state,keyId}, files}`，失败时 `{ok:false, file, error}`。
+- 信任根：`<config>/trust.d/<keyId>.pub`（**PEM SPKI**）；未知 keyId 默认拒绝。未签名安装只由 `svcd.conf` 的 `allow_insecure_install` 控制：开启后安装路径先严格验签，失败才降级接受缺 `signature.json` 或未信任 key 的包，并在日志中标注未验签；CLI/HTTP/Web 都没有逐次 insecure 参数或勾选项。
 - 信任根只能由管理员显式添加：`svc trust list|add <file.pub>|remove <keyId>`，或 Web 控制台的 `POST /api/v1/trust?key_id=<id>` 上传；包内永不携带自己的信任根（自签自证没有意义）。
 - 当前没有编译期 store 公钥，商城/发布接入时内置；`SVCD_TRUST_DIR` 可覆盖 trust.d，供测试与非 root 开发。
 - 不签整个 tar、不做分离 `.sig`、不只靠商城 TLS。
@@ -214,7 +215,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 
 ### 3.1 控制通道
 
-- 一套 **JSON-RPC 2.0 + NDJSON** 信封跑三条链路：插件 stdio、`svc`/`mcp` 的 UDS / 命名管道、UI 的 `POST /plugin-ui/{id}/rpc`。这三条是控制面；HTTP 的 `/mcp` 与 `/api/v1` 是另外两个面（§3.4 / §3.5），不复用 NDJSON 分帧。
+- 一套 **JSON-RPC 2.0 + NDJSON** 信封跑三条链路：插件 stdio、`svc`/`mcp` 的 UDS / 命名管道、UI 的 `POST /plugin-ui/{id}/{token}/rpc`。这三条是控制面；HTTP 的 `/mcp` 与 `/api/v1` 是另外两个面（§3.4 / §3.5），不复用 NDJSON 分帧。
 - `svc`/`svcd` 的本地管理通道用 UDS（Unix）/命名管道（Windows）上的 NDJSON；启动时生成 `<config>/svcd.token`（0640），请求携带该 token。Unix socket 0660；Windows 管道 ACL 仍是默认值，C8 的组授权细化随该边界实现补齐。
 - 帧：UTF-8、LF、禁内嵌换行与 BOM；Windows 二进制模式；单帧上限 1 MiB，超限 = 协议违规，按崩溃路径杀进程。
 - 流控：每插件在途 64、排队 128；超出 `-32000 busy`；单请求默认 30s，超时先发 `notifications/cancelled` 再回错；id 用 svcd 侧单调 u64。
@@ -240,18 +241,18 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 
 ### 3.3 HTTP UI
 
-- `/plugin-ui/{id}/…` 映射包内 `payload/web/`；`/plugin-ui/{id}/rpc` 是 POST JSON-RPC，转给该插件的 stdio 通道——同一信封，没有第二套协议。
-- `{id}` 必须是合法路径段；SPA fallback 只对 `Accept: text/html`；HTML 注入 `<base href="/plugin-ui/{id}/">`，资源必须相对路径；v1 不做响应体重写。
+- `/plugin-ui/{id}/{token}/…` 映射包内 `payload/web/`；`/plugin-ui/{id}/{token}/rpc` 是 POST JSON-RPC，转给该插件的 stdio 通道——同一信封，没有第二套协议。
+- `{id}` 必须是合法路径段，`{token}` 必须绑定该 id；SPA fallback 只对 `Accept: text/html`；HTML 注入 `<base href="/plugin-ui/{id}/{token}/">`，资源必须相对路径；v1 不做响应体重写。
 - MIME 按扩展名；ETag = mtime+size；`no-cache` + 304；v1 不做 Range。
 - 实时通道（2026-11-13 起，#73）：
-  - `GET /plugin-ui/{id}/ws`：RFC 6455 WebSocket，只收文本帧；客户端发 `tools/call`（与 `/rpc` 同一语义），插件 `notifications/*` 广播回同一连接；1 MiB 消息上限、ping/pong/close、无压缩/子协议。
-  - `GET /plugin-ui/{id}/events`：SSE，`text/event-stream`；插件 `notifications/*` 以 `event: message` / `data: <json>` / `id: <seq>` 下发，15s 心跳；上行仍走 `POST /rpc`——SSE 单向 + POST 合起来才是双向。
+  - `GET /plugin-ui/{id}/{token}/ws`：RFC 6455 WebSocket，只收文本帧；客户端发 `tools/call`（与 `/rpc` 同一语义），插件 `notifications/*` 广播回同一连接；1 MiB 消息上限、ping/pong/close、无压缩/子协议。
+  - `GET /plugin-ui/{id}/{token}/events`：SSE，`text/event-stream`；插件 `notifications/*` 以 `event: message` / `data: <json>` / `id: <seq>` 下发，15s 心跳；上行仍走 `POST /rpc`——SSE 单向 + POST 合起来才是双向。
   - 事件源是插件 stdout 的 `notifications/*`（`notifications/message` 为主）；按插件广播，每插件最多 64 个订阅者、有界队列，慢客户端断开，不阻塞插件 stdout。
   - 每插件保留 256 条 / 2 MiB 的事件环；SSE 重连带 `Last-Event-ID` 时先补发 `seq > last` 的事件，再进入实时流。请求的 id 已早于环窗口时先发 `event: reset` + `data: {"reason":"replay-unavailable"}`，UI 应调 `tools/call` 重新拉状态；无/非法 `Last-Event-ID` 只进实时流。
-  - 两条流复用 `/plugin-ui` 鉴权与同源 `Origin` 检查：LAN 未登录 401、跨源 403；WS 的 cookie 调用必须带 `Origin`。
-- 监听默认 loopback；LAN 需显式开启。**插件不自起 HTTP**；外连外部 WS/SSE 仍由插件进程自己负责，核心只做 UI 侧通道。
-- **实现状态（2026-11-13，#73/#75）**：SSE/WS 两条 UI 流已接入。`GET /plugin-ui/{id}/events` 走 chunked `text/event-stream`，事件来自 `Slot::handle_notification` 发布的进程内 EventBus；每插件保留 256 条 / 2 MiB 事件环，`Last-Event-ID` 重连先补发缺失事件，越界先发 `event: reset`。`GET /plugin-ui/{id}/ws` 完成 RFC 6455 握手/掩码/帧编解码，客户端文本帧只接受 `tools/call`，响应与插件 `notifications/*` 走同一连接；1 MiB 上限、ping/pong/close、64 订阅者/插件。两条流复用 LAN cookie/Bearer 与同源 Origin；WS cookie 必须带 Origin。可运行示例：`samples/realtime/`（README 含 bundle/install/打开 UI 的命令）。测试覆盖 SHA-1 accept-key、帧编解码、EventBus 回放/淘汰、SSE/WS TCP 传输、SSE 重连和真实 daemon 集成。
-- **实现状态（2026-11-12，#33）**：`GET /plugin-ui/{id}/…` 从 `<data>/plugins/<id>/<version>/payload/web/` 提供静态资源（MIME 按扩展名、`Cache-Control: no-cache`、ETag=mtime+size、`If-None-Match` → 304，`X-Content-Type-Options: nosniff`）；HTML 在 doctype 后注入 `<base href="/plugin-ui/{id}/">`；SPA fallback 只对 `Accept: text/html`，缺失的脚本/样式仍是 404；`{id}` 必须通过 `package::valid_name`，路径逐段解码后拒绝 `.`/`..`/反斜杠/NUL，并对 canonicalize 后的路径做根目录越界检查。`manifest.ui.type` 只接受 `web`/`gui`（`headerless` 或无 `ui` 即 404）。`POST /plugin-ui/{id}/rpc` 只桥 `tools/call`：`params.name` 带不带 `<id>.` 前缀均可，转发为 `registry.call` 并把页面 id 回显；`-32700/-32600/-32601/-32602` 在本地返回，插件未运行是 `result.isError:true`（同一信封）。LAN 开启时 `/plugin-ui/*` 要求会话（`svcd_session` cookie 或 Bearer；默认 loopback 无需鉴权；#4 的「静态资源公开」已被 #24/#38 的会话模型取代）；`/rpc` 校验同源 `Origin`，cookie 调用必须带 `Origin`，但不额外要求 `X-Svcd-Csrf`（同源 Origin + SameSite=Strict 承担 CSRF/DNS rebinding）；`/plugin-ui/{id}`（无斜杠）在鉴权后 308 到带斜杠形式。v1 不做 Range；WebSocket/SSE 见上方 #73/#75 实现状态。
+  - 两条流复用 `/plugin-ui` 鉴权、per-plugin token 与同源 `Origin` 检查：LAN 未登录 401、token 不匹配 401、跨源 403；WS 的 cookie 调用必须带 `Origin`。
+- `bind` 默认 loopback；LAN 需在 `svcd.conf` 显式改 `bind`。**插件不自起 HTTP**；外连外部 WS/SSE 仍由插件进程自己负责，核心只做 UI 侧通道。
+- **实现状态（2026-11-15）**：SSE/WS 两条 UI 流仍按插件广播；URL 为 `/plugin-ui/{id}/{token}/events` 与 `/plugin-ui/{id}/{token}/ws`，token 绑定 plugin id。`GET /plugin-ui/{id}/{token}/events` 走 chunked `text/event-stream`，事件来自 `Slot::handle_notification` 发布的进程内 EventBus；每插件保留 256 条 / 2 MiB 事件环，`Last-Event-ID` 重连先补发缺失事件，越界先发 `event: reset`。`GET /plugin-ui/{id}/{token}/ws` 完成 RFC 6455 握手/掩码/帧编解码，客户端文本帧只接受 `tools/call`，响应与插件 `notifications/*` 走同一连接；1 MiB 上限、ping/pong/close、64 订阅者/插件。两条流复用 session/Bearer、per-plugin token 与同源 Origin；WS cookie 必须带 Origin。
+- **实现状态（2026-11-15）**：`GET /plugin-ui/{id}/{token}/…` 从 `<data>/plugins/<id>/<version>/payload/web/` 提供静态资源（MIME 按扩展名、`Cache-Control: no-cache`、ETag=mtime+size、`If-None-Match` → 304、`X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`）；HTML 在 doctype 后注入 `<base href="/plugin-ui/{id}/{token}/">`；SPA fallback 只对 `Accept: text/html`，缺失的脚本/样式仍是 404；`{id}` 必须通过 `package::valid_name`，`{token}` 必须绑定该 id，路径逐段解码后拒绝 `.`/`..`/反斜杠/NUL，并对 canonicalize 后的路径做根目录越界检查。`manifest.ui.type` 只接受 `web`/`gui`（`headerless` 或无 `ui` 即 404）。`POST /plugin-ui/{id}/{token}/rpc` 只桥 `tools/call`：`params.name` 带不带 `<id>.` 前缀均可，转发为 `registry.call` 并把页面 id 回显；`-32700/-32600/-32601/-32602` 在本地返回，插件未运行是 `result.isError:true`（同一信封）。LAN 开启时 `/plugin-ui/*` 要求会话；token 不对或缺失 401。`/rpc` 校验同源 `Origin`，cookie 调用必须带 `Origin`，但不额外要求 `X-Svcd-Csrf`（同源 Origin + SameSite=Strict 承担 CSRF/DNS rebinding）；`/plugin-ui/{id}/{token}`（无斜杠）在鉴权后 308 到带斜杠形式。v1 不做 Range；WebSocket/SSE 见上方实现状态。
 
 ### 3.4 HTTP MCP 入口
 
@@ -274,6 +275,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
   - `GET /api/v1/version` → `{version, protocol, platform}`
   - `GET /` / `GET /index.html` → 内嵌 Web 控制台（静态 HTML；页面本身不需要认证，API 调用仍走同一鉴权）
   - `POST /api/v1/plugins`：body 为 `.spk` 原始字节（`application/octet-stream`），query `strategy` / `enable` / `allow_hooks`；流式写临时文件，512 MiB 上限；返回 `{id,version,state}`
+  - `POST /api/v1/plugins/{id}/ui-token`：签发 1 小时、绑定该 plugin id 的 UI token；返回 `{token,url,expiresIn}`，`url` 形如 `/plugin-ui/{id}/{token}/`
   - `GET /api/v1/trust` → `{keys:[keyId], directory}`；`POST /api/v1/trust?key_id=<id>`：body 为 PEM SPKI 公钥，写入 `<config>/trust.d/<id>.pub`；`DELETE /api/v1/trust/{keyId}` 撤销
   - `DELETE /api/v1/plugins/{id}?purge=false`：卸载；`purge=true` 删除版本、配置、状态与 `<id>.log` / `<id>-hooks.log`（含轮转），Web 控制台使用 `purge=true`
   - `POST /api/v1/import?config_id=<id>&no_config=false&force=false`：body 为 `.spk` / `.spkb` / 裸配置，自动识别，语义同 CLI
@@ -284,7 +286,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
   - `PUT /api/v1/config/{id}`：body 为候选配置；跑 `configCheck`，原子替换，保留 last-good；校验失败 409
   - `POST /api/v1/config/{id}/reset`：模板覆盖
   - `GET /api/v1/logs/{id}?lines=200`：返回文本尾部；`lines` 上限 2000；不提供 follow / SSE
-  - `GET /api/v1/auth`：`{enabled,bind,passwordSet}`
+  - `GET /api/v1/auth`：`{bind,requestedBind,authRequired,passwordSet}`
   - `POST /api/v1/auth/enable`（body `{bind}`）/ `POST /api/v1/auth/disable`
 - `plugins` / `export` / `config` / `import` 端点只对 plugin；core 服务不能经 HTTP 安装、卸载、导出或编辑配置；`GET /services` 两者都返回。
 - 认证：`Authorization: Bearer <password>`，或登录时下发的 `svcd_api` cookie（Path=`/api/v1/`）；cookie 的写请求必须带同源 `Origin` + `X-Svcd-Csrf: 1`。
@@ -293,20 +295,20 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 - 上传大小：`.spk` / `.spkb` 512 MiB（与解包上限一致）；配置 1 MiB；日志响应 1 MiB。
 - HTTP/1.1 keep-alive：同一连接顺序处理多个请求；`Connection: close` 显式关闭；不支持 pipelining；每个连接仍占一个线程。
 - **嵌入式构建（#86）**：默认 feature `http`（HTTP 管理 API、内嵌控制台、插件 Web UI、LAN、MCP HTTP）。`cargo build --release --no-default-features` 移除这些，保留 daemon/supervisor、channel、CLI 与 MCP stdio；Windows 二进制约 1.14 MB → 1.00 MB，musl 约 1.36 MB → 1.21 MB。HTTP/channel/plugin reader/WS worker 线程使用 128–256 KB 显式栈（默认约 2 MB）；musl 下 daemon VM @30 插件由约 128 MB 降到约 11.6 MB，RSS 基本不变。
-- **实现状态（2026-11-13，#79/#83）**：HTTP 监听改为阻塞 accept（rebind 用 loopback 探针唤醒并丢弃探针）；daemon 改用 condvar 唤醒控制通道和插件 stdout，事件循环只在 50ms 兜底等待中检查 shutdown/定时器，无 1ms 轮询；`/api/v1` 与 `/mcp` 支持 HTTP/1.1 keep-alive（顺序多请求，`Connection: close` 可关闭），WS/SSE 仍独占连接。性能对比见 `docs/research/2026-11-13-core-compat-and-performance.md`。
-- **实现状态（2026-11-12，#37 / #38 / #39）**：已实现 `GET /services`、`GET /services/{id}`、`POST start/stop`、`GET /version`、`POST /plugins`、`DELETE /plugins/{id}`；默认绑定 `127.0.0.1:8787`（`SVCD_HTTP_PORT` 覆盖，`0` 为临时端口并写 `<config>/http.port`），**无 TLS**；`svc auth enable` 可切到 LAN 并要求 Bearer 密码/cookie 认证（#38）。#39 补齐 `GET/PUT /config/{id}`、`POST /config/{id}/reset`、`GET /export/{id}/spk`（可安装 `.spk`）、`GET /export/{id}`（`.spkb` 备份）、`GET /export/{id}/config`、`POST /import`（自动识别）、`GET /logs/{id}?lines=N`（默认 200、上限 2000、不提供 follow）、`POST /services/{id}/enable|disable`；这些端点只接受 plugin id，core 服务返回 404，方法不符返回 405。`GET /` 提供内嵌控制台（插件列表/安装/启停/自启/打开/配置/日志/导出）：上传按钮直接弹文件框，公钥上传在顶栏，无配置的插件不显示“配置”，有 web/gui UI 的插件显示“打开”，日志弹框可 3 秒自动刷新，删除走 `purge=true`。“安装包”导出 `/export/{id}/spk`（签名包，使用包内配置模板）；“导出备份”导出 `/export/{id}` 的 `.spkb`（签名包 + 当前活动配置），可直接在“上传安装”里选择 `.spkb` 走 `POST /import` 恢复。页面无需认证即可加载，API 调用仍走同一鉴权。
+- **实现状态（2026-11-13，#79/#83）**：HTTP 监听改为阻塞 accept；daemon 改用 condvar 唤醒控制通道和插件 stdout，事件循环只在 50ms 兜底等待中检查 shutdown/定时器，无 1ms 轮询；`/api/v1` 与 `/mcp` 支持 HTTP/1.1 keep-alive（顺序多请求，`Connection: close` 可关闭），WS/SSE 仍独占连接。性能对比见 `docs/research/2026-11-13-core-compat-and-performance.md`。
+- **实现状态（2026-11-12，#37 / #38 / #39）**：已实现 `GET /services`、`GET /services/{id}`、`POST start/stop`、`GET /version`、`POST /plugins`、`DELETE /plugins/{id}`；`bind` 默认 `127.0.0.1:8787`（`SVCD_BIND` 覆盖；`0` 端口写 `<config>/http.port`），非 loopback 需要密码 cookie/Bearer，**无 TLS**；`svc auth enable/disable` 已删除，认证由 `bind` 推导。#39 补齐 `GET/PUT /config/{id}`、`POST /config/{id}/reset`、`GET /export/{id}/spk`（可安装 `.spk`）、`GET /export/{id}`（`.spkb` 备份）、`GET /export/{id}/config`、`POST /import`（自动识别）、`GET /logs/{id}?lines=N`（默认 200、上限 2000、不提供 follow）、`POST /services/{id}/enable|disable`；这些端点只接受 plugin id，core 服务返回 404，方法不符返回 405。`GET /` 提供内嵌控制台（插件列表/安装/启停/自启/打开/配置/日志/导出）：上传按钮直接弹文件框，公钥上传在顶栏，无配置的插件不显示“配置”，有 web/gui UI 的插件显示“打开”，日志弹框可 3 秒自动刷新，删除走 `purge=true`。“安装包”导出 `/export/{id}/spk`（签名包，使用包内配置模板）；“导出备份”导出 `/export/{id}` 的 `.spkb`（签名包 + 当前活动配置），可直接在“上传安装”里选择 `.spkb` 走 `POST /import` 恢复。页面无需认证即可加载，API 调用仍走同一鉴权。
 
 ### 3.6 LAN 鉴权与会话
 
-- 默认只绑 `127.0.0.1`；`svc auth enable --bind 0.0.0.0` 才开 LAN。
+- 默认只绑 `127.0.0.1:8787`；要开 LAN 改 `bind = 0.0.0.0:8787` 并重启。非 loopback 没有 `auth_passwd` 时 daemon 降级 loopback 并报错。
 - 密码通过 `svc auth passwd <plaintext>` 设置，明文不进配置文件；daemon 用 PBKDF2-HMAC-SHA256（随机盐，`pbkdf2-sha256$<iterations>$<salt>$<hash>`）写入 `svcd.conf` 的 `auth_passwd`，并立即清空已有会话。密码（**等价 root / Administrator**）只用于登录与 Bearer；无用户体系、无注册。
-- `svc auth enable` 在未设置 `auth_passwd` 时直接失败，提示先执行 `svc auth passwd`；token rotate 已移除。
+- `svc auth status` 显示 requested/effective bind、`authRequired` 和 `passwordSet`；`svc auth enable/disable` 已删除。
 - 登录：`POST /login` 带 `{password}` → 设两个 cookie：`svcd_session`（Path=`/`）与 `svcd_api`（Path=`/api/v1/`），均 HttpOnly、SameSite=Strict、Max-Age=86400、无 Secure（无 TLS）；滑动续期 24h；`POST /logout` 清两个并撤销服务端会话。同一密码也可直接作为 `Authorization: Bearer` 访问 `/mcp` 与 `/api/v1/*`。
-- LAN 开启时 `/plugin-ui/*` 与 `/rpc` 都要求会话（默认 loopback 无需鉴权）；`/plugin-ui/{id}`（无斜杠）在鉴权后 308 到带斜杠形式；`/rpc` 保留 Origin 校验：只接受同源 Origin/Host、拒绝 CORS，cookie 调用必须带同源 `Origin`，但不要求 `X-Svcd-Csrf`（SameSite=Strict + 同源 Origin 承担 CSRF/DNS rebinding）；`/api/v1` 的 cookie 写仍要求 `X-Svcd-Csrf`。
+- LAN 开启时 `/plugin-ui/*` 与 `/rpc` 都要求会话；插件 UI 另外要求 per-plugin token（路径 `/plugin-ui/{id}/{token}/`，见 §3.5）；`/rpc` 保留 Origin 校验：只接受同源 Origin/Host、拒绝 CORS，cookie 调用必须带同源 `Origin`，但不要求 `X-Svcd-Csrf`（SameSite=Strict + 同源 Origin 承担 CSRF/DNS rebinding）；`/api/v1` 的 cookie 写仍要求 `X-Svcd-Csrf`。
 - 登录失败固定 1s 延迟，连续 10 次锁 5 分钟（内存）。
 - **v1 不支持 TLS**：核心不终止、不生成证书；要 HTTPS 就在前面放反代。明文密码过 LAN 的风险写进文档；默认关闭 LAN 是安全默认。
 - 单用户 / 单角色；多用户、角色不做；HTTP 管理 API 见 §3.5。
-- **实现状态（2026-11-13）**：默认 loopback；`svc auth passwd <password>` 写 `auth_passwd` 哈希并热更新，`svc auth enable [--bind]` 要求密码已设置；`POST /login` 下发 `svcd_session`（Path=`/`）/`svcd_api` 两个 cookie；`/api/v1` 收 Bearer 密码或 cookie，cookie 写要求同源 `Origin` + `X-Svcd-Csrf: 1`；`POST /logout` 撤销服务端会话；登录失败 1s、10 次锁 5 分钟；`svc auth disable`。`/mcp` 的 Bearer 面由 #40 实现（见 §3.4）；cookie 不参与 MCP 认证。
+- **实现状态（2026-11-15）**：`bind` 决定监听与认证（loopback 免密，非 loopback 必须有 `auth_passwd`）；`svc auth passwd` 写 `auth_passwd` 哈希并热更新，`svc auth status` 只读；`POST /login` 下发 `svcd_session`（Path=`/`）/`svcd_api` 两个 cookie；`/api/v1` 收 Bearer 密码或 cookie，cookie 写要求同源 `Origin` + `X-Svcd-Csrf: 1`；`POST /logout` 撤销服务端会话；登录失败 1s、10 次锁 5 分钟。`/mcp` 的 Bearer 面由 #40 实现（见 §3.4）；cookie 不参与 MCP 认证。
 
 ## 4. OSAL 与平台边界
 
@@ -358,7 +360,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 - `editconfig <id>`：要 root；flock `<id>/config.lock`；临时文件 → `$EDITOR`（fallback `vi`）→ 可选 `configCheck`（10s，候选路径，`SVCD_CONFIG`）→ fsync + 原子 rename，旧文件存 `config.last-good`；支持 `--print` / `--file` / `--reset`；不自动重启，打印「restart to apply」。
 - 导出/导入：
   - `export --config-only`：原样活动副本，默认 `<id>-<version>.config`，0600。
-  - `export`：`.spkb` 备份容器（ustar）：`backup.json`（首条目）`{schema:1,id,version,exportedAt,configSha256}` + `plugin.spk`（从已安装版本重建的签名包）+ `config`；容器不签名，导入验内层签名。
+  - `export`：`.spkb` 备份容器（ustar）：`backup.json`（首条目）`{schema:1,id,version,exportedAt,configSha256}` + `plugin.spk`（从已安装版本重建的签名包）+ `config`；容器不签名，导入验内层签名（`allow_insecure_install` 开启时允许内层未签名/未验签）。
   - `import <file>`：tar 首条目 `backup.json` → `.spkb`；`manifest.json` → `.spk`；其它 → 裸配置，必须 `--config <id>`。id 不符拒绝；版本不同警告；`--no-config` 跳过；`--force` 只跳过同版本检查，不跳签名。
 - 配置上限 1 MiB；插件私有格式（JSON/TOML/YAML/ini 都行），svcd 不解析、不做 schema、不做升级字段合并；无 `configCheck` 时只保留 last-good。
 - 权限：写（install / editconfig / import / uninstall）要 root；只读（status / logs / `editconfig --print` / `export`）组可用；配置明文，不加密（见 §13-C5）。

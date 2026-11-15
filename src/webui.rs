@@ -130,14 +130,14 @@ pub fn not_modified(if_none_match: Option<&str>, etag: &str) -> bool {
     })
 }
 
-/// Insert `<base href="/plugin-ui/{id}/">` so a plugin's relative assets and
-/// `fetch('rpc')` resolve under its own prefix.
+/// Insert `<base href="{base}">` so a plugin's relative assets and
+/// `fetch('rpc')` resolve under its own (token-bearing) prefix.
 ///
 /// The tag goes right after a leading doctype (inserting before it would drop
 /// the document into quirks mode); without one it goes at the very start. A
 /// doctype-lookalike in later content is not considered.
-pub fn inject_base(html: &[u8], id: &str) -> Vec<u8> {
-    let tag = format!("<base href=\"/plugin-ui/{}/\">", id);
+pub fn inject_base(html: &[u8], base: &str) -> Vec<u8> {
+    let tag = format!("<base href=\"{}\">", base);
     let at = doctype_end(html).unwrap_or(0);
     let mut out = Vec::with_capacity(html.len() + tag.len() + 2);
     out.extend_from_slice(&html[..at]);
@@ -295,8 +295,8 @@ mod tests {
     #[test]
     fn injects_base_after_the_doctype_so_quirks_mode_is_not_triggered() {
         let html = b"<!DOCTYPE html>\n<html><head><title>x</title></head><body></body></html>";
-        let out = String::from_utf8(inject_base(html, "demo")).expect("utf8");
-        let prefix = "<!DOCTYPE html>\n<base href=\"/plugin-ui/demo/\">\n";
+        let out = String::from_utf8(inject_base(html, "/plugin-ui/demo/tok/")).expect("utf8");
+        let prefix = "<!DOCTYPE html>\n<base href=\"/plugin-ui/demo/tok/\">\n";
         assert!(out.starts_with(prefix), "{out}");
         assert!(
             out.ends_with("<html><head><title>x</title></head><body></body></html>"),
@@ -306,10 +306,13 @@ mod tests {
 
     #[test]
     fn injects_base_at_the_start_when_there_is_no_doctype() {
-        let out =
-            String::from_utf8(inject_base(b"<html><body>hi</body></html>", "demo")).expect("utf8");
+        let out = String::from_utf8(inject_base(
+            b"<html><body>hi</body></html>",
+            "/plugin-ui/demo/tok/",
+        ))
+        .expect("utf8");
         assert!(
-            out.starts_with("<base href=\"/plugin-ui/demo/\">\n<html>"),
+            out.starts_with("<base href=\"/plugin-ui/demo/tok/\">\n<html>"),
             "{out}"
         );
     }
@@ -318,7 +321,7 @@ mod tests {
     fn a_doctype_lookalike_in_content_is_not_mistaken_for_the_doctype() {
         let out = String::from_utf8(inject_base(
             b"<html><!-- <!doctype html> --></html>",
-            "demo",
+            "/plugin-ui/demo/tok/",
         ))
         .expect("utf8");
         assert!(out.starts_with("<base "), "{out}");

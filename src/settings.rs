@@ -4,11 +4,11 @@
 //! which file to use (explicit install path, program directory, config
 //! directory, or a generated default); this module only parses and caches it.
 //!
-//! Values pair with the existing environment overrides: `SVCD_HTTP_PORT` still
-//! wins for the HTTP port, while explicit paths in `svcd.conf` win over the
-//! platform defaults.
+//! `SVCD_BIND` overrides the `bind` key for tests and ad-hoc runs; explicit
+//! paths in `svcd.conf` win over the platform defaults.
 
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -17,8 +17,8 @@ static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
-    pub http_port: Option<u16>,
-    pub lan_default: bool,
+    /// HTTP listener address. Default: `127.0.0.1:8787`.
+    pub bind: Option<SocketAddr>,
     pub config_dir: Option<PathBuf>,
     pub plugins_dir: Option<PathBuf>,
     pub services_dir: Option<PathBuf>,
@@ -35,6 +35,9 @@ pub struct Settings {
     /// set, `--install` puts the binary, aliases and `svcd_daemon.sh` here;
     /// `data` and `logs` default to `<install_dir>/data` and `<install_dir>/logs`.
     pub install_dir: Option<PathBuf>,
+    /// Allow installs to fall back to accepting a package whose signature
+    /// cannot be verified. Default `false`: unsigned packages are rejected.
+    pub allow_insecure_install: bool,
 }
 
 impl Settings {
@@ -83,6 +86,14 @@ pub fn current() -> Result<&'static Settings, String> {
 /// The file this process loaded. `svc auth passwd` updates this exact file.
 pub fn path() -> Option<&'static Path> {
     CONFIG_PATH.get().map(PathBuf::as_path)
+}
+
+/// Whether the operator enabled unsigned installs in `svcd.conf`. This is the
+/// only switch: CLI, HTTP and the console have no per-install insecure option.
+pub fn allow_insecure_install() -> bool {
+    current()
+        .map(|settings| settings.allow_insecure_install)
+        .unwrap_or(false)
 }
 
 /// Load the config file chosen by `install::ensure_conf` into the process cache.
@@ -142,24 +153,21 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
             return Err(format!("line {}: empty value for {}", index + 1, key));
         }
         match key {
-            "http_port" => {
-                settings.http_port =
-                    Some(value.parse::<u16>().map_err(|_| {
-                        format!("line {}: invalid http_port {:?}", index + 1, value)
-                    })?);
+            "bind" => {
+                settings.bind = Some(
+                    value
+                        .parse::<SocketAddr>()
+                        .map_err(|_| format!("line {}: invalid bind {:?}", index + 1, value))?,
+                );
             }
-            "lan_default" => {
-                settings.lan_default = match value.to_ascii_lowercase().as_str() {
-                    "true" | "1" | "on" | "yes" => true,
-                    "false" | "0" | "off" | "no" => false,
-                    _ => {
-                        return Err(format!(
-                            "line {}: invalid lan_default {:?}",
-                            index + 1,
-                            value
-                        ))
-                    }
-                };
+            "allow_insecure_install" => {
+                settings.allow_insecure_install = parse_bool(value).ok_or_else(|| {
+                    format!(
+                        "line {}: invalid allow_insecure_install {:?}",
+                        index + 1,
+                        value
+                    )
+                })?;
             }
             "config_dir" => settings.config_dir = Some(resolve(base, value)),
             "plugins_dir" => settings.plugins_dir = Some(resolve(base, value)),
@@ -204,6 +212,14 @@ fn resolve(base: &Path, value: &str) -> PathBuf {
         path
     } else {
         base.join(path)
+    }
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "on" | "yes" => Some(true),
+        "false" | "0" | "off" | "no" => Some(false),
+        _ => None,
     }
 }
 
@@ -253,12 +269,15 @@ mod tests {
     #[test]
     fn parses_all_keys_and_resolves_relative_paths() {
         let settings = parse(
-            "\u{feff}# svcd runtime\nhttp_port = 8787\nlan_default = yes\nconfig_dir = /srv/svcd\nplugins_dir = plugins\nservices_dir = /var/lib/svcd/services.d\ninstall_dir = /etc/sr/svcd\nauth_passwd = pbkdf2-sha256$10000$c2FsdA$aGFzaA\ntemp_dir = /var/tmp/svcd\ntemp_retention_secs = 3600\ntemp_cleanup_interval_secs = 60\n",
+            "\u{feff}# svcd runtime\nbind = 0.0.0.0:8787\nallow_insecure_install = on\nconfig_dir = /srv/svcd\nplugins_dir = plugins\nservices_dir = /var/lib/svcd/services.d\ninstall_dir = /etc/sr/svcd\nauth_passwd = pbkdf2-sha256$10000$c2FsdA$aGFzaA\ntemp_dir = /var/tmp/svcd\ntemp_retention_secs = 3600\ntemp_cleanup_interval_secs = 60\n",
             Path::new("/etc/svcd"),
         )
         .expect("parse");
-        assert_eq!(settings.http_port, Some(8787));
-        assert!(settings.lan_default);
+        assert_eq!(
+            settings.bind,
+            Some("0.0.0.0:8787".parse::<SocketAddr>().expect("bind"))
+        );
+        assert!(settings.allow_insecure_install);
         assert_eq!(settings.config_dir, Some(PathBuf::from("/srv/svcd")));
         assert_eq!(
             settings.plugins_dir,
@@ -283,11 +302,15 @@ mod tests {
     #[test]
     fn blank_lines_and_duplicate_keys_are_tolerated() {
         let settings = parse(
-            "http_port = 8787\n\n   \n# comment\nhttp_port = 9090\n",
+            "bind = 127.0.0.1:1\n\n   \n# comment\nbind = 127.0.0.1:2\n",
             Path::new("/etc/svcd"),
         )
         .expect("parse");
-        assert_eq!(settings.http_port, Some(9090), "the last declaration wins");
+        assert_eq!(
+            settings.bind,
+            Some("127.0.0.1:2".parse::<SocketAddr>().expect("bind")),
+            "the last declaration wins"
+        );
     }
 
     #[test]
@@ -295,13 +318,16 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("svcd-settings-{}", std::process::id()));
         fs::create_dir_all(&directory).expect("temp dir");
         let path = directory.join("svcd.conf");
-        fs::write(&path, "http_port = 1\n\nhttp_port = 2\nlan_default = yes\n")
-            .expect("write conf");
-        update_value(&path, "http_port", "3").expect("update");
+        fs::write(
+            &path,
+            "bind = 127.0.0.1:1\n\nbind = 127.0.0.1:2\nallow_insecure_install = yes\n",
+        )
+        .expect("write conf");
+        update_value(&path, "bind", "127.0.0.1:3").expect("update");
         let text = fs::read_to_string(&path).expect("read conf");
-        assert_eq!(text.matches("http_port").count(), 1, "{text}");
-        assert!(text.contains("http_port = 3"), "{text}");
-        assert!(text.contains("lan_default = yes"), "{text}");
+        assert_eq!(text.matches("bind").count(), 1, "{text}");
+        assert!(text.contains("bind = 127.0.0.1:3"), "{text}");
+        assert!(text.contains("allow_insecure_install = yes"), "{text}");
         let _ = fs::remove_dir_all(&directory);
     }
 
@@ -310,6 +336,7 @@ mod tests {
         let settings = Settings::default();
         assert_eq!(settings.temp_retention().as_secs(), 2 * 60 * 60);
         assert_eq!(settings.temp_cleanup_interval().as_secs(), 5 * 60);
+        assert!(!settings.allow_insecure_install);
     }
 
     #[test]
@@ -349,16 +376,19 @@ mod tests {
         ));
         fs::create_dir_all(&directory).expect("temp dir");
         let path = directory.join("svcd.conf");
-        fs::write(&path, "# keep\nhttp_port = 8787\nauth_passwd = old\n").expect("write conf");
+        fs::write(&path, "# keep\nbind = 127.0.0.1:8787\nauth_passwd = old\n").expect("write conf");
 
         update_value(&path, "auth_passwd", "new$hash").expect("replace");
         let text = fs::read_to_string(&path).expect("read");
-        assert_eq!(text, "# keep\nhttp_port = 8787\nauth_passwd = new$hash\n");
+        assert_eq!(
+            text,
+            "# keep\nbind = 127.0.0.1:8787\nauth_passwd = new$hash\n"
+        );
 
-        update_value(&path, "lan_default", "true").expect("append");
+        update_value(&path, "bind", "0.0.0.0:8787").expect("append");
         let text = fs::read_to_string(&path).expect("read");
         assert!(text.contains("auth_passwd = new$hash"));
-        assert!(text.ends_with("lan_default = true\n"), "{text}");
+        assert!(text.contains("bind = 0.0.0.0:8787"), "{text}");
 
         let _ = fs::remove_dir_all(&directory);
     }
@@ -366,27 +396,37 @@ mod tests {
     #[test]
     fn false_spellings_are_false() {
         for value in ["false", "0", "off", "no", "FALSE"] {
-            let settings =
-                parse(&format!("lan_default = {value}\n"), Path::new("/etc/svcd")).expect("parse");
-            assert!(!settings.lan_default, "{value}");
+            let settings = parse(
+                &format!("allow_insecure_install = {value}\n"),
+                Path::new("/etc/svcd"),
+            )
+            .expect("parse");
+            assert!(!settings.allow_insecure_install, "{value}");
         }
     }
 
     #[test]
     fn comments_and_blank_lines_are_ignored() {
-        let settings =
-            parse("\n# comment\n   \nhttp_port=0\n", Path::new("/etc/svcd")).expect("parse");
-        assert_eq!(settings.http_port, Some(0));
+        let settings = parse(
+            "\n# comment\n   \nbind = 127.0.0.1:0\n",
+            Path::new("/etc/svcd"),
+        )
+        .expect("parse");
+        assert_eq!(
+            settings.bind,
+            Some("127.0.0.1:0".parse::<SocketAddr>().expect("bind"))
+        );
     }
 
     #[test]
     fn rejects_unknown_keys_and_bad_values() {
         for text in [
             "unknown = 1\n",
-            "http_port = 70000\n",
-            "http_port = nope\n",
-            "lan_default = maybe\n",
-            "http_port 8787\n",
+            "bind = 70000\n",
+            "bind = nope\n",
+            "bind = 127.0.0.1\n",
+            "allow_insecure_install = maybe\n",
+            "bind 127.0.0.1:8787\n",
             "= 1\n",
         ] {
             assert!(parse(text, Path::new("/etc/svcd")).is_err(), "{text:?}");

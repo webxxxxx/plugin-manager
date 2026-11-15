@@ -121,7 +121,7 @@ def setup(root, binary, key, pub):
         + base64.urlsafe_b64encode(digest).decode().rstrip("=")
     )
     (root / "config" / "svcd.conf").write_text(
-        f"http_port = 0\nauth_passwd = {encoded}\n"
+        f"bind = 127.0.0.1:0\nauth_passwd = {encoded}\n"
     )
     env = os.environ.copy()
     env.update({
@@ -129,7 +129,7 @@ def setup(root, binary, key, pub):
         "SVCD_DATA_DIR": str(root / "data"),
         "SVCD_LOG_DIR": str(root / "logs"),
         "SVCD_TRUST_DIR": str(root / "config" / "trust.d"),
-        "SVCD_HTTP_PORT": "0",
+        "SVCD_BIND": "127.0.0.1:0",
         "SVCD_TEST_UNPRIVILEGED": "1",
     })
     return env

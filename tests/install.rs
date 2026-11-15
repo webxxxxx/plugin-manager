@@ -357,13 +357,13 @@ fn self_install_copies_aliases_and_uninstalls_without_touching_the_host() {
 }
 
 #[test]
-fn self_install_warns_when_lan_default_has_no_password() {
+fn self_install_accepts_bind_in_conf() {
     let sandbox = Sandbox::new();
     let prefix = sandbox.root.join("prefix");
     let prefix_arg = prefix.to_str().expect("utf8");
     let conf = sandbox.root.join("svcd.conf");
     let text = format!(
-        "# runtime settings\nhttp_port = 0\nlan_default = true\nplugins_dir = {}\nservices_dir = {}\n",
+        "# runtime settings\nbind = 127.0.0.1:0\nplugins_dir = {}\nservices_dir = {}\n",
         sandbox.root.join("plugins").display(),
         sandbox.root.join("services").display()
     );
@@ -392,11 +392,6 @@ fn self_install_warns_when_lan_default_has_no_password() {
         conf_arg,
     ]);
     assert_eq!(installed.status.code(), Some(0), "{}", stderr(&installed));
-    assert!(
-        stderr(&installed).contains("LAN not enabled"),
-        "install must refuse to enable LAN without a password: {}",
-        stderr(&installed)
-    );
     assert!(!sandbox.config_dir().join("lan.json").exists());
     assert!(!sandbox.config_dir().join("lan-token").exists());
     let copied = sandbox.config_dir().join("svcd.conf");
@@ -414,7 +409,7 @@ fn invalid_svcd_conf_is_rejected_without_overwriting_the_installed_one() {
     let prefix_arg = prefix.to_str().expect("utf8");
     let conf = sandbox.root.join("svcd.conf");
     let conf_arg = conf.to_str().expect("utf8");
-    let good = "http_port = 0\n";
+    let good = "bind = 127.0.0.1:0\n";
     fs::write(&conf, good).expect("write good conf");
 
     let installed = sandbox.run(&[
@@ -512,7 +507,10 @@ fn launcher_name() -> &'static str {
 
 fn install_dir_conf(sandbox: &Sandbox, install_dir: &std::path::Path) -> PathBuf {
     let conf = sandbox.root.join("svcd.conf");
-    let text = format!("install_dir = {}\nhttp_port = 0\n", install_dir.display());
+    let text = format!(
+        "install_dir = {}\nbind = 127.0.0.1:0\n",
+        install_dir.display()
+    );
     fs::write(&conf, text).expect("write source conf");
     conf
 }

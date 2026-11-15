@@ -14,6 +14,7 @@ use crate::channel;
 use crate::package;
 use crate::paths;
 use crate::plugin;
+use crate::settings;
 use crate::status::Status;
 
 const MAX_IMPORT: u64 = 512 * 1024 * 1024;
@@ -102,7 +103,9 @@ fn import_backup(
         .iter()
         .find(|entry| entry.path == "plugin.spk")
         .ok_or_else(|| Error::Failed("plugin.spk is missing".into()))?;
-    let package = package::verify_bytes(&spk.data).map_err(Error::Failed)?;
+    let (package, _) =
+        package::verify_bytes_with_fallback(&spk.data, settings::allow_insecure_install())
+            .map_err(Error::Failed)?;
     if package.manifest.name != backup.id {
         return Err(Error::Failed(format!(
             "backup id {} does not match package id {}",

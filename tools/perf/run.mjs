@@ -141,7 +141,7 @@ async function startDaemon(root) {
     SVCD_DATA_DIR: path.join(root, 'data'),
     SVCD_LOG_DIR: path.join(root, 'logs'),
     SVCD_TRUST_DIR: path.join(root, 'config', 'trust.d'),
-    SVCD_HTTP_PORT: '0',
+    SVCD_BIND: '127.0.0.1:0',
     SVCD_TEST_UNPRIVILEGED: '1',
   });
   mkdirSync(env.SVCD_CONFIG_DIR, { recursive: true });

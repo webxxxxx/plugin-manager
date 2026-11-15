@@ -82,8 +82,9 @@ const signatureBytes = Buffer.from(JSON.stringify(signature) + '\n', 'utf8');
 
 const platform = String(src.platform || '');
 if (!/^[a-z0-9_]+(-[a-z0-9_]+){2,3}$/.test(platform)) throw new Error('manifest.json needs a target-triple platform');
-const arch = platform.split('-')[0];
-const head = name + '-' + src.version + '-' + arch;
+// The archive name carries the whole target triple: the arch prefix alone
+// cannot distinguish musl from gnu.
+const head = name + '-' + src.version + '-' + platform;
 const stage = join(OUT, head);
 rmSync(stage, { recursive: true, force: true });
 mkdirSync(stage, { recursive: true });

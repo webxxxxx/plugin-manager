@@ -1,19 +1,20 @@
-//! LAN state, password authentication, sessions and login throttling.
+//! Password authentication, sessions, login throttling and plugin UI tokens.
 //!
-//! The password hash lives in `auth_passwd` in `svcd.conf`; sessions are random
-//! values held in memory. The default state is loopback-only and LAN disabled.
+//! `bind` chooses the listener and also decides whether authentication is
+//! required: loopback is open, a non-loopback bind requires `auth_passwd`.
+//! Sessions are random values held in memory. Plugin UI tokens are short-lived,
+//! bound to one plugin id, and travel in the plugin URL path.
 
 use std::collections::HashMap;
-use std::fs;
-use std::net::IpAddr;
-use std::path::Path;
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use base64::Engine;
-use serde::{Deserialize, Serialize};
 
 const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const PLUGIN_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
+const MAX_PLUGIN_TOKENS: usize = 256;
 const FAILURE_DELAY: Duration = Duration::from_secs(1);
 const MAX_FAILURES: u32 = 10;
 const LOCK_TIME: Duration = Duration::from_secs(5 * 60);
@@ -21,16 +22,11 @@ const LOCK_TIME: Duration = Duration::from_secs(5 * 60);
 pub const COOKIE_SESSION: &str = "svcd_session";
 pub const COOKIE_API: &str = "svcd_api";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LanFile {
-    enabled: bool,
-    bind: String,
-}
-
 #[derive(Debug, Clone)]
 pub struct LanStatus {
-    pub enabled: bool,
-    pub bind: IpAddr,
+    pub bind: SocketAddr,
+    pub requested_bind: SocketAddr,
+    pub require_auth: bool,
     pub password_set: bool,
 }
 
@@ -41,30 +37,36 @@ pub enum AuthKind {
     Cookie,
 }
 
+struct PluginToken {
+    plugin: String,
+    expires: Instant,
+}
+
 pub struct Lan {
-    pub enabled: bool,
-    pub bind: IpAddr,
+    pub bind: SocketAddr,
+    pub requested_bind: SocketAddr,
+    pub require_auth: bool,
     password_hash: Option<String>,
     sessions: HashMap<String, Instant>,
+    plugin_tokens: HashMap<String, PluginToken>,
     failures: u32,
     locked_until: Option<Instant>,
 }
 
 impl Lan {
-    pub fn load(config: &Path, password_hash: Option<String>) -> Self {
-        let file = fs::read(config.join("lan.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<LanFile>(&bytes).ok());
-        let enabled = file.as_ref().map(|file| file.enabled).unwrap_or(false);
-        let bind = file
-            .as_ref()
-            .and_then(|file| file.bind.parse::<IpAddr>().ok())
-            .unwrap_or_else(|| "127.0.0.1".parse().expect("loopback"));
+    pub fn new(
+        bind: SocketAddr,
+        requested_bind: SocketAddr,
+        require_auth: bool,
+        password_hash: Option<String>,
+    ) -> Self {
         Lan {
-            enabled,
             bind,
+            requested_bind,
+            require_auth,
             password_hash,
             sessions: HashMap::new(),
+            plugin_tokens: HashMap::new(),
             failures: 0,
             locked_until: None,
         }
@@ -72,25 +74,11 @@ impl Lan {
 
     pub fn status(&self) -> LanStatus {
         LanStatus {
-            enabled: self.enabled,
             bind: self.bind,
+            requested_bind: self.requested_bind,
+            require_auth: self.require_auth,
             password_set: self.password_hash.is_some(),
         }
-    }
-
-    /// Enable LAN. A password must be configured first.
-    pub fn enable(&mut self, bind: IpAddr) -> Result<(), String> {
-        if self.password_hash.is_none() {
-            return Err("set a password first: svc auth passwd <password>".into());
-        }
-        self.enabled = true;
-        self.bind = bind;
-        Ok(())
-    }
-
-    pub fn disable(&mut self) {
-        self.enabled = false;
-        self.bind = "127.0.0.1".parse().expect("loopback");
     }
 
     pub fn set_password(&mut self, hash: String) {
@@ -100,15 +88,6 @@ impl Lan {
 
     pub fn password_hash(&self) -> Option<&str> {
         self.password_hash.as_deref()
-    }
-
-    pub fn save(&self, config: &Path) -> Result<(), String> {
-        let file = LanFile {
-            enabled: self.enabled,
-            bind: self.bind.to_string(),
-        };
-        let json = serde_json::to_vec(&file).map_err(|error| error.to_string())?;
-        write_private(&config.join("lan.json"), &json)
     }
 
     /// `Ok(session)` on success; sleeps 1s on failure and locks after 10.
@@ -141,7 +120,7 @@ impl Lan {
     }
 
     pub fn authenticate(&mut self, headers: &[(String, String)]) -> Result<AuthKind, ()> {
-        if !self.enabled {
+        if !self.require_auth {
             return Ok(AuthKind::None);
         }
         if let Some(bearer) = header(headers, "authorization")
@@ -181,20 +160,55 @@ impl Lan {
             }
         }
     }
-}
 
-fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
-    fs::write(path, data).map_err(|error| format!("write {}: {}", path.display(), error))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .map_err(|error| format!("chmod {}: {}", path.display(), error))?;
+    /// Mint a one-hour token for one plugin's UI. The token is part of the
+    /// plugin URL; it is not a cookie, so another plugin cannot be handed it
+    /// by the browser just because the request URL belongs to that plugin.
+    pub fn issue_plugin_token(&mut self, plugin: &str) -> String {
+        let now = Instant::now();
+        self.plugin_tokens.retain(|_, token| token.expires > now);
+        if self.plugin_tokens.len() >= MAX_PLUGIN_TOKENS {
+            if let Some(oldest) = self
+                .plugin_tokens
+                .iter()
+                .min_by_key(|(_, token)| token.expires)
+                .map(|(key, _)| key.clone())
+            {
+                self.plugin_tokens.remove(&oldest);
+            }
+        }
+        let token = new_token();
+        self.plugin_tokens.insert(
+            token.clone(),
+            PluginToken {
+                plugin: plugin.to_string(),
+                expires: now + PLUGIN_TOKEN_TTL,
+            },
+        );
+        token
     }
-    Ok(())
+
+    /// A token is valid only for the plugin it was minted for.
+    pub fn validate_plugin_token(&mut self, token: &str, plugin: &str) -> bool {
+        let Some(entry) = self.plugin_tokens.get(token) else {
+            return false;
+        };
+        if entry.plugin != plugin {
+            return false;
+        }
+        if entry.expires <= Instant::now() {
+            self.plugin_tokens.remove(token);
+            return false;
+        }
+        true
+    }
 }
 
-fn new_token() -> String {
+pub fn plugin_token_ttl_secs() -> u64 {
+    PLUGIN_TOKEN_TTL.as_secs()
+}
+
+pub(crate) fn new_token() -> String {
     let mut bytes = [0u8; 32];
     if getrandom::getrandom(&mut bytes).is_err() {
         // Fall back to a time-derived token only if the OS source is unavailable.

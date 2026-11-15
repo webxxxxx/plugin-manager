@@ -14,10 +14,18 @@
 # Relative `config_dir` / `plugins_dir` / `services_dir` / `temp_dir` values
 # resolve against the directory containing this file.
 
-http_port = 8787
-lan_default = false
+# HTTP listener. The default is loopback-only. A non-loopback bind (for
+# example 0.0.0.0:8787) requires auth_passwd; without it svcd falls back to
+# 127.0.0.1 so you can still run `svc auth passwd` and restart.
+bind = 127.0.0.1:8787
 
-# Configuration directory: svcd.conf, trust.d, lan.json and svcd.token.
+# Unsigned plugin installs. Default false: an unsigned package is rejected as a
+# signature failure. Set this to true only on a host whose operator accepts
+# unsigned packages; installs then verify normally first and fall back to
+# accepting an unsigned package. There is no per-install flag or console option.
+# allow_insecure_install = false
+
+# Configuration directory: svcd.conf, trust.d and svcd.token.
 # Defaults: /etc/svcd (Linux), /Library/Application Support/svcd/config
 # (macOS), %USERPROFILE%\.svcd (Windows).
 # config_dir = /etc/svcd

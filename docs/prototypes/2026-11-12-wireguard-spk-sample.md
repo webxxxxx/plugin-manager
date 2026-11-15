@@ -16,8 +16,8 @@ samples/wireguard/
   hooks/pre-remove.sh
 samples/keys/sample-2026.key # 测试私钥（仅样张）
 samples/keys/sample-2026.pub
-samples/spk/wireguard-1.0.0-x86_64.spk
-samples/spk/wireguard-1.0.0-x86_64/    # 打包暂存（= 解包后的包布局）
+samples/spk/wireguard-1.0.0-x86_64-unknown-linux-musl.spk
+samples/spk/wireguard-1.0.0-x86_64-unknown-linux-musl/    # 打包暂存（= 解包后的包布局）
 samples/spk/install-preview/           # checker 的解包预览
 tools/gen_sample_key.mjs
 tools/build_spk.mjs
@@ -30,7 +30,7 @@ tools/demo_rpc.py
 ```sh
 node tools/gen_sample_key.mjs      # 只跑一次；--force 轮换
 node tools/build_spk.mjs           # 产出 .spk + 暂存目录
-node tools/check_spk.mjs samples/spk/wireguard-1.0.0-x86_64.spk --extract samples/spk/install-preview
+node tools/check_spk.mjs samples/spk/wireguard-1.0.0-x86_64-unknown-linux-musl.spk --extract samples/spk/install-preview
 python tools/demo_rpc.py           # 走一遍 ping/status/up/…/shutdown
 ```
 

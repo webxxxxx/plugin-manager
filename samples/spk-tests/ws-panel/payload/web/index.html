@@ -101,10 +101,7 @@
 <script>
 (function () {
   "use strict";
-  var parts = location.pathname.split("/").filter(Boolean);
-  var pluginId = parts[1] || "ws-panel";
-  var scheme = location.protocol === "https:" ? "wss" : "ws";
-  var endpoint = scheme + "://" + location.host + "/plugin-ui/" + pluginId + "/ws";
+  var endpoint = new URL("ws", location.href).href.replace(/^http/, "ws");
   document.getElementById("endpoint").textContent = endpoint;
 
   var log = document.getElementById("log");

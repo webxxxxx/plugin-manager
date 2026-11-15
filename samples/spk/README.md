@@ -15,8 +15,8 @@ are not.
 
 ```sh
 node tools/gen_sample_key.mjs          # once; writes samples/keys/sample-2026.*
-node tools/build_spk.mjs wireguard     # writes samples/spk/wireguard-1.0.0-<arch>.spk
-node tools/check_spk.mjs samples/spk/wireguard-1.0.0-x86_64.spk
+node tools/build_spk.mjs wireguard     # writes samples/spk/wireguard-1.0.0-<target-triple>.spk
+node tools/check_spk.mjs samples/spk/wireguard-1.0.0-x86_64-unknown-linux-musl.spk
 ```
 
 Windows clock sample:
@@ -24,7 +24,7 @@ Windows clock sample:
 ```powershell
 plugin bundle samples\clock --from-core --interpreter cmd --interpreter-arg /C `
   --key samples\keys\sample-2026.key --version 0.1.0 `
-  -o samples\spk\clock-0.1.0-x86_64.spk
+  -o samples\spk\clock-0.1.0-x86_64-pc-windows-msvc.spk
 ```
 
 The wireguard sample targets `x86_64-unknown-linux-musl`; the package will be

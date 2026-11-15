@@ -20,6 +20,10 @@ _Avoid_: 内置插件、系统插件、core plugin
 从 .spk 安装、`kind=plugin` 的服务；能力由 manifest 声明，schema 2 起也可声明生命周期动作。
 _Avoid_: PluginManager、PM（已退役）
 
+**未签名安装（Insecure install）**:
+只由 `svcd.conf` 的 `allow_insecure_install` 控制的安装模式，默认关闭。开启后普通安装先严格验签，验签失败才降级接受未签名或未信任 key 的包；CLI/HTTP/Web 都没有逐次 `--insecure` 开关或勾选项。`files[]` 哈希与平台/hooks 校验不放宽；日志标注未验签，这样装的版本不能导出为签名 `.spk`。
+_Avoid_: 信任安装、跳过校验（默认路径不跳过）
+
 **脚本插件（Script plugin）**:
 payload 是脚本、由 manifest 的 `interpreter` 声明宿主解释器、并可用 `lifecycle` 声明 start/stop/status 的插件；执行路径与 core 脚本共用，来源与信任仍是 .spk。
 _Avoid_: core plugin、系统插件
@@ -49,7 +53,7 @@ _Avoid_: settings.json、通用“配置文件”
 _Avoid_: lan-token、管理员 token
 
 **config_dir**:
-`svcd.conf` 里的配置目录覆盖项；`svcd.conf`、`trust.d`、`lan.json`、`svcd.token` 都放在这里。默认 Linux `/etc/svcd`、Windows `%USERPROFILE%\.svcd`；`SVCD_CONFIG_DIR` 优先级更高。
+`svcd.conf` 里的配置目录覆盖项；`svcd.conf`、`trust.d`、`svcd.token` 都放在这里。默认 Linux `/etc/svcd`、Windows `%USERPROFILE%\.svcd`；`SVCD_CONFIG_DIR` 优先级更高。
 
 **install_dir**:
 `svcd.conf` 里记录的安装根：`svcd --install --prefix <dir>` 会把 `<dir>` 写回这里；之后不带 `--prefix` 的重装、运行时 data/logs 的默认值（`<install_dir>/data`、`<install_dir>/logs`）和 `--uninstall` 的清理都以它为准。手工写在 conf 里也有效，`--prefix` 优先于它；未记录时走平台默认。

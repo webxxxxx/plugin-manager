@@ -82,10 +82,19 @@ impl Sandbox {
             .env("SVCD_DATA_DIR", &self.data)
             .env("SVCD_LOG_DIR", &self.logs)
             .env("SVCD_TRUST_DIR", &self.trust)
-            .env("SVCD_HTTP_PORT", "0")
+            .env("SVCD_BIND", "127.0.0.1:0")
             .env("SVCD_BOOT_SCAN_WAIT_MS", "0")
             .env("SVCD_RESCAN_INTERVAL_MS", "0")
             .env("SVCD_TEST_UNPRIVILEGED", "1");
+    }
+
+    /// Opt this sandbox's daemon into unsigned installs via `svcd.conf`.
+    fn allow_insecure_install(&self) {
+        fs::write(
+            self.config.join("svcd.conf"),
+            "allow_insecure_install = true\n",
+        )
+        .expect("write svcd.conf");
     }
 
     /// Send one modern JSON-RPC request to a fresh `mcp` stdio bridge and
@@ -135,6 +144,10 @@ impl Sandbox {
     }
 
     fn start_daemon(&mut self) {
+        self.start_daemon_with_bind("127.0.0.1:0");
+    }
+
+    fn start_daemon_with_bind(&mut self, bind: &str) {
         let stderr = fs::File::create(&self.daemon_stderr).expect("daemon stderr");
         let mut command = Command::new(&self.svcd);
         command
@@ -143,11 +156,12 @@ impl Sandbox {
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr));
         self.env(&mut command);
+        command.env("SVCD_BIND", bind);
         self.daemon = Some(command.spawn().expect("spawn daemon"));
     }
 
-    /// Like `start_daemon`, but leaves the HTTP port to the service config
-    /// instead of forcing an ephemeral port through the environment.
+    /// Like `start_daemon`, but leaves the bind address to the config instead
+    /// of forcing an ephemeral port through the environment.
     fn start_daemon_without_http_port(&mut self) {
         let stderr = fs::File::create(&self.daemon_stderr).expect("daemon stderr");
         let mut command = Command::new(&self.svcd);
@@ -619,6 +633,22 @@ fn plugin_bundle(
     config: Option<&[u8]>,
     check: bool,
 ) -> Vec<u8> {
+    let (manifest, files) = plugin_parts(id, version, config, check);
+    signed_package(key, manifest, &files)
+}
+
+/// Same payload as `plugin_bundle`, but without the `signature.json` entry.
+fn unsigned_plugin_bundle(id: &str) -> Vec<u8> {
+    let (manifest, files) = plugin_parts(id, "1.0.0", None, false);
+    unsigned_package(manifest, &files)
+}
+
+fn plugin_parts(
+    id: &str,
+    version: &str,
+    config: Option<&[u8]>,
+    check: bool,
+) -> (Value, Vec<(String, Vec<u8>, u32)>) {
     let (name, data) = script();
     let exec_path = format!("payload/bin/{}", name);
     let mut files: Vec<(String, Vec<u8>, u32)> = vec![(exec_path.clone(), data, 0o755)];
@@ -659,16 +689,10 @@ fn plugin_bundle(
     if let Some(path) = check_path {
         manifest["configCheck"] = json!({"path": path});
     }
-    signed_package(key, manifest, &files)
+    (manifest, files)
 }
 
-/// Attach \`files[]\`, sign the manifest and wrap everything in the ustar layout
-/// the installer verifies. Shared by the plain and web-UI fixtures.
-fn signed_package(
-    key: &SigningKey,
-    mut manifest: Value,
-    files: &[(String, Vec<u8>, u32)],
-) -> Vec<u8> {
+fn attach_files(mut manifest: Value, files: &[(String, Vec<u8>, u32)]) -> Vec<u8> {
     manifest["files"] = json!(files
         .iter()
         .map(|(path, data, mode)| json!({
@@ -678,7 +702,13 @@ fn signed_package(
             "mode": mode
         }))
         .collect::<Vec<Value>>());
-    let manifest = serde_json::to_vec(&manifest).expect("manifest");
+    serde_json::to_vec(&manifest).expect("manifest")
+}
+
+/// Attach \`files[]\`, sign the manifest and wrap everything in the ustar layout
+/// the installer verifies. Shared by the plain and web-UI fixtures.
+fn signed_package(key: &SigningKey, manifest: Value, files: &[(String, Vec<u8>, u32)]) -> Vec<u8> {
+    let manifest = attach_files(manifest, files);
     let signature =
         json!({"alg":"ed25519","keyId":"test","sig":BASE64.encode(key.sign(&manifest).to_bytes())});
     let signature = serde_json::to_vec(&signature).expect("signature");
@@ -691,6 +721,41 @@ fn signed_package(
     tar.extend(std::iter::repeat_n(0, padding(signature.len())));
     for (path, data, mode) in files {
         tar.extend_from_slice(&header(path, data.len(), *mode));
+        tar.extend_from_slice(data);
+        tar.extend(std::iter::repeat_n(0, padding(data.len())));
+    }
+    tar.extend(std::iter::repeat_n(0, 1024));
+    tar
+}
+
+/// A package with no `signature.json` entry at all; only the insecure install
+/// path accepts it.
+fn unsigned_package(manifest: Value, files: &[(String, Vec<u8>, u32)]) -> Vec<u8> {
+    let manifest = attach_files(manifest, files);
+    let mut tar = Vec::new();
+    tar.extend_from_slice(&header("manifest.json", manifest.len(), 0o644));
+    tar.extend_from_slice(&manifest);
+    tar.extend(std::iter::repeat_n(0, padding(manifest.len())));
+    for (path, data, mode) in files {
+        tar.extend_from_slice(&header(path, data.len(), *mode));
+        tar.extend_from_slice(data);
+        tar.extend(std::iter::repeat_n(0, padding(data.len())));
+    }
+    tar.extend(std::iter::repeat_n(0, 1024));
+    tar
+}
+
+/// A `.spkb` backup wrapping an unsigned inner package.
+fn unsigned_backup(id: &str) -> Vec<u8> {
+    let spk = unsigned_plugin_bundle(id);
+    let backup =
+        serde_json::to_vec(&json!({"schema": 1, "id": id, "version": "1.0.0"})).expect("backup");
+    let mut tar = Vec::new();
+    for (path, data, mode) in [
+        ("backup.json", backup.as_slice(), 0o644u32),
+        ("plugin.spk", spk.as_slice(), 0o644u32),
+    ] {
+        tar.extend_from_slice(&header(path, data.len(), mode));
         tar.extend_from_slice(data);
         tar.extend(std::iter::repeat_n(0, padding(data.len())));
     }
@@ -1429,7 +1494,7 @@ fn explicit_conf_is_preferred_over_program_and_config() {
     fs::write(
         &explicit,
         format!(
-            "http_port = 0\nplugins_dir = {}\nservices_dir = {}\n",
+            "bind = 127.0.0.1:0\nplugins_dir = {}\nservices_dir = {}\n",
             sandbox.root.join("explicit-plugins").display(),
             explicit_services.display()
         ),
@@ -1438,7 +1503,7 @@ fn explicit_conf_is_preferred_over_program_and_config() {
     fs::write(
         sandbox.root.join("svcd.conf"),
         format!(
-            "http_port = 0\nplugins_dir = {}\nservices_dir = {}\n",
+            "bind = 127.0.0.1:0\nplugins_dir = {}\nservices_dir = {}\n",
             sandbox.root.join("decoy-plugins").display(),
             decoy_services.display()
         ),
@@ -1470,8 +1535,8 @@ fn default_conf_is_created_in_the_config_dir() {
 
     let path = sandbox.config.join("svcd.conf");
     let text = fs::read_to_string(&path).expect("generated svcd.conf");
-    assert!(text.contains("http_port = 8787"), "{text}");
-    assert!(text.contains("lan_default = false"), "{text}");
+    assert!(text.contains("bind = 127.0.0.1:8787"), "{text}");
+    assert!(text.contains("allow_insecure_install = false"), "{text}");
     assert!(
         text.contains(&format!("config_dir = {}", sandbox.config.display())),
         "{text}"
@@ -1563,6 +1628,124 @@ fn untrusted_upload_returns_bad_request_not_404() {
 }
 
 #[test]
+fn unsigned_install_requires_the_conf_switch() {
+    let mut sandbox = Sandbox::new();
+    let package = unsigned_plugin_bundle("demo");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let rejected = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(rejected.status, 400, "{}", rejected.body);
+    let message = rejected.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.contains("signature.json"), "{message}");
+}
+
+#[test]
+fn unsigned_install_is_accepted_when_the_conf_switch_is_on() {
+    let mut sandbox = Sandbox::new();
+    let package = unsigned_plugin_bundle("demo");
+    sandbox.allow_insecure_install();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let installed = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(installed.status, 200, "{}", installed.body);
+    assert_eq!(installed.body["id"], "demo");
+    assert_eq!(installed.body["version"], "1.0.0");
+    let version_dir = sandbox.data.join("plugins").join("demo").join("1.0.0");
+    assert!(version_dir.join("manifest.json").is_file());
+    assert!(
+        !version_dir.join("signature.json").exists(),
+        "an insecure install must not invent a signature file"
+    );
+
+    // The version directory has no signature, so it cannot be exported as a
+    // signed .spk; the error must say why instead of failing on a missing file.
+    let exported = request(&address, "GET", "/api/v1/export/demo/spk", "", b"");
+    assert_eq!(exported.status, 500, "{}", exported.body);
+    let message = exported.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.contains("no signature"), "{message}");
+}
+
+#[test]
+fn insecure_install_accepts_an_unknown_signing_key() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[42u8; 32]);
+    // Deliberately leave the trust directory empty: `test` is not a trust root.
+    let package = plugin_package(&key);
+    sandbox.allow_insecure_install();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let installed = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(installed.status, 200, "{}", installed.body);
+    assert_eq!(installed.body["id"], "demo");
+}
+
+#[test]
+fn unsigned_import_requires_the_conf_switch() {
+    let mut sandbox = Sandbox::new();
+    let backup = unsigned_backup("demo");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let rejected = request(
+        &address,
+        "POST",
+        "/api/v1/import?force=true",
+        "application/octet-stream",
+        &backup,
+    );
+    assert_eq!(rejected.status, 400, "{}", rejected.body);
+    let message = rejected.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.contains("signature.json"), "{message}");
+}
+
+#[test]
+fn unsigned_import_is_accepted_when_the_conf_switch_is_on() {
+    let mut sandbox = Sandbox::new();
+    let backup = unsigned_backup("demo");
+    sandbox.allow_insecure_install();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let imported = request(
+        &address,
+        "POST",
+        "/api/v1/import?force=true",
+        "application/octet-stream",
+        &backup,
+    );
+    assert_eq!(imported.status, 200, "{}", imported.body);
+    assert_eq!(imported.body["id"], "demo");
+    assert_eq!(imported.body["version"], "1.0.0");
+}
+
+#[test]
 fn configured_port_and_paths_come_from_svcd_conf() {
     let mut sandbox = Sandbox::new();
     let plugins = sandbox.root.join("configured-plugins");
@@ -1589,7 +1772,7 @@ fn configured_port_and_paths_come_from_svcd_conf() {
     fs::write(
         sandbox.config.join("svcd.conf"),
         format!(
-            "http_port = 0\nplugins_dir = {}\nservices_dir = {}\n",
+            "bind = 127.0.0.1:0\nplugins_dir = {}\nservices_dir = {}\n",
             plugins.display(),
             services.display()
         ),
@@ -1721,16 +1904,12 @@ fn set_password(sandbox: &Sandbox, password: &str) {
     );
 }
 
-fn enable_auth(sandbox: &Sandbox) -> String {
+fn enable_auth(sandbox: &mut Sandbox) -> (String, String) {
     set_password(sandbox, TEST_PASSWORD);
-    let enabled = sandbox.run_svc(&["auth", "enable", "--bind", "0.0.0.0"]);
-    assert_eq!(
-        enabled.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&enabled.stderr)
-    );
-    TEST_PASSWORD.to_string()
+    sandbox.shutdown();
+    sandbox.start_daemon_with_bind("0.0.0.0:0");
+    let address = sandbox.wait_for_http();
+    (address, TEST_PASSWORD.to_string())
 }
 
 fn plugin_dir(sandbox: &Sandbox, id: &str) -> PathBuf {
@@ -2152,6 +2331,10 @@ fn serves_the_embedded_console() {
     let html = String::from_utf8_lossy(&page.body);
     assert!(html.contains("id=\"rows\""), "console table missing");
     assert!(
+        !html.contains("允许安装未签名包"),
+        "unsigned install is controlled by svcd.conf, not a console checkbox"
+    );
+    assert!(
         html.contains("/api/v1/services"),
         "console does not call the management API"
     );
@@ -2179,7 +2362,22 @@ fn serves_the_embedded_console() {
 }
 
 #[test]
-fn password_auth_bearer_cookie_csrf_and_disable() {
+fn lan_bind_without_password_falls_back_to_loopback() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon_with_bind("0.0.0.0:0");
+    let address = sandbox.wait_for_http();
+
+    let open = request(&address, "GET", "/api/v1/services", "", b"");
+    assert_eq!(open.status, 200);
+    let status = sandbox.run_svc(&["auth", "status"]);
+    assert_eq!(status.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&status.stdout);
+    assert!(text.contains("requested: 0.0.0.0:0"), "{text}");
+    assert!(text.contains("auth required: false"), "{text}");
+}
+
+#[test]
+fn password_auth_bearer_cookie_csrf() {
     let mut sandbox = Sandbox::new();
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
@@ -2197,16 +2395,14 @@ fn password_auth_bearer_cookie_csrf_and_disable() {
         "{}",
         String::from_utf8_lossy(&changed.stderr)
     );
-    let enabled = sandbox.run_svc(&["auth", "enable", "--bind", "0.0.0.0"]);
-    assert_eq!(
-        enabled.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&enabled.stderr)
-    );
+    // auth is derived from bind, so restart with a LAN bind after the password
+    // exists. No `auth enable` step is involved anymore.
+    sandbox.shutdown();
+    sandbox.start_daemon_with_bind("0.0.0.0:0");
+    let address = sandbox.wait_for_http();
     let password = TEST_PASSWORD.to_string();
     assert!(!sandbox.config.join("lan-token").exists());
-    assert!(sandbox.config.join("lan.json").is_file());
+    assert!(!sandbox.config.join("lan.json").exists());
 
     let page = raw_request(&address, "GET", "/", "", b"");
     assert_eq!(page.status, 200, "console must load before login");
@@ -2297,8 +2493,16 @@ fn password_auth_bearer_cookie_csrf_and_disable() {
         &[("Authorization", bearer.as_str())],
     );
     assert_eq!(auth_status.status, 200);
-    assert_eq!(auth_status.body["enabled"], true);
+    assert_eq!(auth_status.body["authRequired"], true);
     assert_eq!(auth_status.body["passwordSet"], true);
+    assert!(
+        auth_status.body["bind"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("0.0.0.0:"),
+        "{}",
+        auth_status.body
+    );
 
     let logout = request_with(
         &address,
@@ -2344,11 +2548,11 @@ fn password_auth_bearer_cookie_csrf_and_disable() {
     let status = sandbox.run_svc(&["auth", "status"]);
     assert_eq!(status.status.code(), Some(0));
     let status_text = String::from_utf8_lossy(&status.stdout);
-    assert!(status_text.contains("enabled: true"), "{status_text}");
+    assert!(status_text.contains("auth required: true"), "{status_text}");
     assert!(status_text.contains("password: set"), "{status_text}");
 
     sandbox.shutdown();
-    sandbox.start_daemon();
+    sandbox.start_daemon_with_bind("0.0.0.0:0");
     let address = sandbox.wait_for_http();
     let denied_after_restart = request(&address, "GET", "/api/v1/services", "", b"");
     assert_eq!(denied_after_restart.status, 401);
@@ -2362,11 +2566,6 @@ fn password_auth_bearer_cookie_csrf_and_disable() {
         &[("Authorization", new_bearer.as_str())],
     );
     assert_eq!(allowed_after_restart.status, 200);
-
-    let disabled = sandbox.run_svc(&["auth", "disable"]);
-    assert_eq!(disabled.status.code(), Some(0));
-    let open_again = request(&address, "GET", "/api/v1/services", "", b"");
-    assert_eq!(open_again.status, 200);
 }
 #[test]
 fn plugin_web_ui_serves_assets_with_base_and_etag() {
@@ -2396,7 +2595,9 @@ fn plugin_web_ui_serves_assets_with_base_and_etag() {
     assert_eq!(demo["hasUI"], true);
     assert_eq!(plain["hasUI"], false);
 
-    let page = raw_request(&address, "GET", "/plugin-ui/demo/", "", b"");
+    let base = plugin_ui_base(&address, "demo");
+
+    let page = raw_request(&address, "GET", &base, "", b"");
     assert_eq!(page.status, 200, "{}", String::from_utf8_lossy(&page.body));
     assert_eq!(
         raw_header_values(&page, "content-type"),
@@ -2410,7 +2611,7 @@ fn plugin_web_ui_serves_assets_with_base_and_etag() {
     );
     let html = String::from_utf8_lossy(&page.body);
     assert!(
-        html.starts_with("<!doctype html>\n<base href=\"/plugin-ui/demo/\">\n"),
+        html.starts_with(&format!("<!doctype html>\n<base href=\"{}\">\n", base)),
         "{html}"
     );
     assert!(html.contains("plugin page"), "{html}");
@@ -2421,7 +2622,7 @@ fn plugin_web_ui_serves_assets_with_base_and_etag() {
     let revalidated = raw_request_with(
         &address,
         "GET",
-        "/plugin-ui/demo/",
+        &base,
         "",
         b"",
         &[("If-None-Match", etag.as_str())],
@@ -2430,7 +2631,7 @@ fn plugin_web_ui_serves_assets_with_base_and_etag() {
     assert!(revalidated.body.is_empty());
     assert_eq!(raw_header_values(&revalidated, "etag"), vec![etag.as_str()]);
 
-    let script = raw_request(&address, "GET", "/plugin-ui/demo/app.js", "", b"");
+    let script = raw_request(&address, "GET", &format!("{}app.js", base), "", b"");
     assert_eq!(script.status, 200);
     assert_eq!(
         raw_header_values(&script, "content-type"),
@@ -2438,22 +2639,21 @@ fn plugin_web_ui_serves_assets_with_base_and_etag() {
     );
     assert_eq!(script.body, b"export const answer = 42;\n");
 
-    // The canonical URL has a trailing slash so the /plugin-ui/ session cookie
-    // is actually sent by browsers when LAN auth is on.
-    let no_slash = raw_request(&address, "GET", "/plugin-ui/demo", "", b"");
+    // The canonical URL has a trailing slash so relative assets resolve.
+    let no_slash = raw_request(&address, "GET", base.trim_end_matches('/'), "", b"");
     assert_eq!(no_slash.status, 308);
     assert_eq!(
         raw_header_values(&no_slash, "location"),
-        vec!["/plugin-ui/demo/"]
+        vec![base.as_str()]
     );
 
     // SPA fallback only for HTML navigations; a missing asset stays a 404.
-    let missing_asset = raw_request(&address, "GET", "/plugin-ui/demo/missing.js", "", b"");
+    let missing_asset = raw_request(&address, "GET", &format!("{}missing.js", base), "", b"");
     assert_eq!(missing_asset.status, 404);
     let spa = raw_request_with(
         &address,
         "GET",
-        "/plugin-ui/demo/settings/tunnel",
+        &format!("{}settings/tunnel", base),
         "",
         b"",
         &[("Accept", "text/html")],
@@ -2461,13 +2661,7 @@ fn plugin_web_ui_serves_assets_with_base_and_etag() {
     assert_eq!(spa.status, 200);
     assert!(String::from_utf8_lossy(&spa.body).contains("plugin page"));
 
-    for path in [
-        "/plugin-ui/demo/%2e%2e/secret",
-        "/plugin-ui/demo/../secret",
-        "/plugin-ui/..%2fsecret",
-        "/plugin-ui/Demo/",
-        "/plugin-ui/missing/",
-    ] {
+    for path in ["/plugin-ui/Demo/", "/plugin-ui/missing/"] {
         let denied = raw_request(&address, "GET", path, "", b"");
         assert_eq!(denied.status, 404, "{path}");
         // A rejected path is not a client-side route: an HTML navigation must
@@ -2477,13 +2671,62 @@ fn plugin_web_ui_serves_assets_with_base_and_etag() {
         assert_eq!(denied_html.status, 404, "{path} with Accept: text/html");
     }
 
+    // A missing token is refused even for an installed UI.
+    let no_token = raw_request(&address, "GET", "/plugin-ui/demo/", "", b"");
+    assert_eq!(no_token.status, 401);
+
     // A plugin without manifest.ui has no route even if payload/web exists.
     let no_ui = raw_request(&address, "GET", "/plugin-ui/plain/", "", b"");
     assert_eq!(no_ui.status, 404);
 
-    let post = raw_request(&address, "POST", "/plugin-ui/demo/", "", b"");
+    let post = raw_request(&address, "POST", &base, "", b"");
     assert_eq!(post.status, 405);
     assert_eq!(raw_header_values(&post, "allow"), vec!["GET"]);
+}
+
+fn plugin_ui_base(address: &str, id: &str) -> String {
+    plugin_ui_base_with(address, id, &[])
+}
+
+fn plugin_ui_base_with(address: &str, id: &str, headers: &[(&str, &str)]) -> String {
+    let response = request_with(
+        address,
+        "POST",
+        &format!("/api/v1/plugins/{}/ui-token", id),
+        "",
+        b"",
+        headers,
+    );
+    assert_eq!(response.status, 200, "{}", response.body);
+    response.body["url"]
+        .as_str()
+        .expect("plugin ui url")
+        .to_string()
+}
+
+#[test]
+fn plugin_ui_token_is_bound_to_its_plugin() {
+    let (_sandbox, address) = web_ui_sandbox(44);
+    let key = SigningKey::from_bytes(&[44u8; 32]);
+    let other = web_plugin_bundle(&key, "other", true);
+    let installed = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &other,
+    );
+    assert_eq!(installed.status, 200, "{}", installed.body);
+
+    let demo_base = plugin_ui_base(&address, "demo");
+    let own = plugin_ui_base(&address, "other");
+    let page = raw_request(&address, "GET", &own, "", b"");
+    assert_eq!(page.status, 200);
+
+    // The demo token must not unlock the other plugin's UI.
+    let cross = demo_base.replacen("/plugin-ui/demo/", "/plugin-ui/other/", 1);
+    let denied = raw_request(&address, "GET", &cross, "", b"");
+    assert_eq!(denied.status, 401);
 }
 
 fn rpc_body(id: u64, name: &str) -> Vec<u8> {
@@ -2499,6 +2742,7 @@ fn rpc_body(id: u64, name: &str) -> Vec<u8> {
 #[test]
 fn plugin_web_ui_rpc_bridges_tools_call() {
     let (_sandbox, address) = web_ui_sandbox(42);
+    let base = plugin_ui_base(&address, "demo");
 
     let started = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
     assert_eq!(started.status, 200, "{}", started.body);
@@ -2506,7 +2750,7 @@ fn plugin_web_ui_rpc_bridges_tools_call() {
     let call = request(
         &address,
         "POST",
-        "/plugin-ui/demo/rpc",
+        &format!("{}rpc", base),
         "application/json",
         &rpc_body(7, "status"),
     );
@@ -2520,7 +2764,7 @@ fn plugin_web_ui_rpc_bridges_tools_call() {
     let prefixed = request(
         &address,
         "POST",
-        "/plugin-ui/demo/rpc",
+        &format!("{}rpc", base),
         "application/json",
         &rpc_body(8, "demo.status"),
     );
@@ -2533,7 +2777,7 @@ fn plugin_web_ui_rpc_bridges_tools_call() {
     let same_origin = request_with(
         &address,
         "POST",
-        "/plugin-ui/demo/rpc",
+        &format!("{}rpc", base),
         "application/json",
         &body,
         &[("Origin", origin.as_str())],
@@ -2542,7 +2786,7 @@ fn plugin_web_ui_rpc_bridges_tools_call() {
     let cross_origin = request_with(
         &address,
         "POST",
-        "/plugin-ui/demo/rpc",
+        &format!("{}rpc", base),
         "application/json",
         &body,
         &[("Origin", "http://evil.example")],
@@ -2552,7 +2796,7 @@ fn plugin_web_ui_rpc_bridges_tools_call() {
     let unsupported = request(
         &address,
         "POST",
-        "/plugin-ui/demo/rpc",
+        &format!("{}rpc", base),
         "application/json",
         br#"{"jsonrpc":"2.0","id":10,"method":"svcd.ping"}"#,
     );
@@ -2563,7 +2807,7 @@ fn plugin_web_ui_rpc_bridges_tools_call() {
     let malformed = raw_request(
         &address,
         "POST",
-        "/plugin-ui/demo/rpc",
+        &format!("{}rpc", base),
         "application/json",
         b"{",
     );
@@ -2573,14 +2817,14 @@ fn plugin_web_ui_rpc_bridges_tools_call() {
     let unknown = request(
         &address,
         "POST",
-        "/plugin-ui/demo/rpc",
+        &format!("{}rpc", base),
         "application/json",
         &rpc_body(11, "nope"),
     );
     assert_eq!(unknown.body["id"], 11);
     assert_eq!(unknown.body["error"]["code"], -32602);
 
-    let get = raw_request(&address, "GET", "/plugin-ui/demo/rpc", "", b"");
+    let get = raw_request(&address, "GET", &format!("{}rpc", base), "", b"");
     assert_eq!(get.status, 405);
     assert_eq!(raw_header_values(&get, "allow"), vec!["POST"]);
 
@@ -2590,7 +2834,7 @@ fn plugin_web_ui_rpc_bridges_tools_call() {
     let call = request(
         &address,
         "POST",
-        "/plugin-ui/demo/rpc",
+        &format!("{}rpc", base),
         "application/json",
         &rpc_body(12, "status"),
     );
@@ -2609,28 +2853,22 @@ fn plugin_web_ui_rpc_bridges_tools_call() {
 
 #[test]
 fn plugin_web_ui_requires_a_session_when_lan_is_enabled() {
-    let (sandbox, address) = web_ui_sandbox(43);
+    let (mut sandbox, _) = web_ui_sandbox(43);
 
-    let password = enable_auth(&sandbox);
+    let (address, password) = enable_auth(&mut sandbox);
     let bearer = format!("Bearer {}", password);
+    let base = plugin_ui_base_with(&address, "demo", &[("Authorization", bearer.as_str())]);
 
     let body = rpc_body(21, "status");
-    let page = raw_request(&address, "GET", "/plugin-ui/demo/", "", b"");
+    let page = raw_request(&address, "GET", &base, "", b"");
     assert_eq!(page.status, 401);
-    let browsed = raw_request_with(
-        &address,
-        "GET",
-        "/plugin-ui/demo/",
-        "",
-        b"",
-        &[("Accept", "text/html")],
-    );
+    let browsed = raw_request_with(&address, "GET", &base, "", b"", &[("Accept", "text/html")]);
     assert_eq!(browsed.status, 303);
-    assert!(raw_header_values(&browsed, "location")[0].contains("/?next=/plugin-ui/demo/"));
+    assert!(raw_header_values(&browsed, "location")[0].contains(&format!("/?next={}", base)));
     let anonymous = raw_request(
         &address,
         "POST",
-        "/plugin-ui/demo/rpc",
+        &format!("{}rpc", base),
         "application/json",
         &body,
     );
@@ -2667,7 +2905,7 @@ fn plugin_web_ui_requires_a_session_when_lan_is_enabled() {
     let page = raw_request_with(
         &address,
         "GET",
-        "/plugin-ui/demo/",
+        &base,
         "",
         b"",
         &[("Cookie", cookie.as_str())],
@@ -2678,7 +2916,7 @@ fn plugin_web_ui_requires_a_session_when_lan_is_enabled() {
     let call = request_with(
         &address,
         "POST",
-        "/plugin-ui/demo/rpc",
+        &format!("{}rpc", base),
         "application/json",
         &body,
         &[("Cookie", cookie.as_str()), ("Origin", origin.as_str())],
@@ -2691,7 +2929,7 @@ fn plugin_web_ui_requires_a_session_when_lan_is_enabled() {
     let no_origin = raw_request_with(
         &address,
         "POST",
-        "/plugin-ui/demo/rpc",
+        &format!("{}rpc", base),
         "application/json",
         &body,
         &[("Cookie", cookie.as_str())],
@@ -2700,7 +2938,7 @@ fn plugin_web_ui_requires_a_session_when_lan_is_enabled() {
     let foreign = raw_request_with(
         &address,
         "POST",
-        "/plugin-ui/demo/rpc",
+        &format!("{}rpc", base),
         "application/json",
         &body,
         &[
@@ -2724,7 +2962,7 @@ fn plugin_web_ui_requires_a_session_when_lan_is_enabled() {
     let after_logout = raw_request_with(
         &address,
         "GET",
-        "/plugin-ui/demo/",
+        &base,
         "",
         b"",
         &[("Cookie", cookie.as_str())],
@@ -2741,6 +2979,7 @@ fn phase_end_to_end_install_start_mcp_config_logs_and_uninstall() {
     let (sandbox, address) = web_ui_sandbox(34);
     set_password(&sandbox, TEST_PASSWORD);
     let token = TEST_PASSWORD.to_string();
+    let base = plugin_ui_base(&address, "demo");
 
     let started = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
     assert_eq!(started.status, 200, "{}", started.body);
@@ -2831,9 +3070,9 @@ fn phase_end_to_end_install_start_mcp_config_logs_and_uninstall() {
     assert_eq!(config.body, b"initial config\n");
 
     // Web UI and logs are served from the same installation.
-    let ui = raw_request(&address, "GET", "/plugin-ui/demo/", "", b"");
+    let ui = raw_request(&address, "GET", &base, "", b"");
     assert_eq!(ui.status, 200);
-    assert!(String::from_utf8_lossy(&ui.body).contains("<base href=\"/plugin-ui/demo/\">"));
+    assert!(String::from_utf8_lossy(&ui.body).contains(&format!("<base href=\"{}\">", base)));
     let logs = raw_request(&address, "GET", "/api/v1/logs/demo?lines=10", "", b"");
     assert_eq!(logs.status, 200, "{}", String::from_utf8_lossy(&logs.body));
 
@@ -2882,11 +3121,12 @@ fn phase_end_to_end_install_start_mcp_config_logs_and_uninstall() {
 #[test]
 fn plugin_ui_sse_streams_plugin_notifications() {
     let (_sandbox, address) = daemon_with_web_event_plugin(51);
-    let mut sse = sse_connect(&address, "/plugin-ui/demo/events");
+    let base = plugin_ui_base(&address, "demo");
+    let mut sse = sse_connect(&address, &format!("{}events", base));
     let call = request(
         &address,
         "POST",
-        "/plugin-ui/demo/rpc",
+        &format!("{}rpc", base),
         "application/json",
         br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"status","arguments":{}}}"#,
     );
@@ -2903,7 +3143,8 @@ fn plugin_ui_sse_streams_plugin_notifications() {
 #[test]
 fn plugin_ui_websocket_bridges_calls_notifications_and_control_frames() {
     let (_sandbox, address) = daemon_with_web_event_plugin(52);
-    let (mut ws, status, head) = ws_handshake(&address, "/plugin-ui/demo/ws", &[]);
+    let base = plugin_ui_base(&address, "demo");
+    let (mut ws, status, head) = ws_handshake(&address, &format!("{}ws", base), &[]);
     assert_eq!(status, 101, "{head}");
     let request = json!({
         "jsonrpc": "2.0",
@@ -2939,7 +3180,7 @@ fn plugin_ui_websocket_bridges_calls_notifications_and_control_frames() {
     assert_eq!(opcode, 0xA);
     assert_eq!(payload, b"ping");
 
-    let (mut binary, status, head) = ws_handshake(&address, "/plugin-ui/demo/ws", &[]);
+    let (mut binary, status, head) = ws_handshake(&address, &format!("{}ws", base), &[]);
     assert_eq!(status, 101, "{head}");
     ws_send(&mut binary, 0x2, b"binary");
     let (opcode, payload) = ws_read(&mut binary);
@@ -2949,18 +3190,19 @@ fn plugin_ui_websocket_bridges_calls_notifications_and_control_frames() {
 
 #[test]
 fn plugin_ui_streams_require_lan_auth_and_same_origin() {
-    let (sandbox, address) = daemon_with_web_event_plugin(53);
-    let password = enable_auth(&sandbox);
+    let (mut sandbox, _) = daemon_with_web_event_plugin(53);
+    let (address, password) = enable_auth(&mut sandbox);
     let bearer = format!("Bearer {}", password);
+    let base = plugin_ui_base_with(&address, "demo", &[("Authorization", bearer.as_str())]);
 
-    let sse = raw_request(&address, "GET", "/plugin-ui/demo/events", "", b"");
+    let sse = raw_request(&address, "GET", &format!("{}events", base), "", b"");
     assert_eq!(sse.status, 401);
-    let (_stream, status, _head) = ws_handshake(&address, "/plugin-ui/demo/ws", &[]);
+    let (_stream, status, _head) = ws_handshake(&address, &format!("{}ws", base), &[]);
     assert_eq!(status, 401);
 
     let evil = ws_handshake(
         &address,
-        "/plugin-ui/demo/ws",
+        &format!("{}ws", base),
         &[
             ("Authorization", bearer.as_str()),
             ("Origin", "http://evil"),
@@ -2971,7 +3213,7 @@ fn plugin_ui_streams_require_lan_auth_and_same_origin() {
     let origin = format!("http://{}", address);
     let good = ws_handshake(
         &address,
-        "/plugin-ui/demo/ws",
+        &format!("{}ws", base),
         &[
             ("Authorization", bearer.as_str()),
             ("Origin", origin.as_str()),
@@ -2983,11 +3225,12 @@ fn plugin_ui_streams_require_lan_auth_and_same_origin() {
 #[test]
 fn plugin_ui_sse_replays_after_last_event_id() {
     let (_sandbox, address) = daemon_with_web_event_plugin(54);
-    let mut first = sse_connect(&address, "/plugin-ui/demo/events");
+    let base = plugin_ui_base(&address, "demo");
+    let mut first = sse_connect(&address, &format!("{}events", base));
     let call = request(
         &address,
         "POST",
-        "/plugin-ui/demo/rpc",
+        &format!("{}rpc", base),
         "application/json",
         br#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"status","arguments":{}}}"#,
     );
@@ -3001,13 +3244,13 @@ fn plugin_ui_sse_replays_after_last_event_id() {
     let second = request(
         &address,
         "POST",
-        "/plugin-ui/demo/rpc",
+        &format!("{}rpc", base),
         "application/json",
         br#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"status","arguments":{}}}"#,
     );
     assert_eq!(second.status, 200, "{}", second.body);
 
-    let mut replay = sse_connect_with_last_id(&address, "/plugin-ui/demo/events", Some(last_id));
+    let mut replay = sse_connect_with_last_id(&address, &format!("{}events", base), Some(last_id));
     let replayed = sse_wait_for_data(&mut replay, "pong-event");
     let replayed_id = sse_id(&replayed).expect("replayed event id");
     assert!(
@@ -3019,7 +3262,8 @@ fn plugin_ui_sse_replays_after_last_event_id() {
 #[test]
 fn plugin_ui_websocket_rejects_oversized_messages_with_1009() {
     let (_sandbox, address) = daemon_with_web_event_plugin(55);
-    let (mut ws, status, head) = ws_handshake(&address, "/plugin-ui/demo/ws", &[]);
+    let base = plugin_ui_base(&address, "demo");
+    let (mut ws, status, head) = ws_handshake(&address, &format!("{}ws", base), &[]);
     assert_eq!(status, 101, "{head}");
     ws_send(&mut ws, 0x1, &vec![b'x'; 1024 * 1024 + 1]);
     let (opcode, payload) = ws_read(&mut ws);
