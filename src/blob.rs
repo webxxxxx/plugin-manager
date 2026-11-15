@@ -8,8 +8,14 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(any(feature = "http", test))]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "http")]
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "http")]
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -17,6 +23,19 @@ use crate::paths;
 use crate::settings;
 
 pub const MAX_BLOB_BYTES: u64 = 512 * 1024 * 1024;
+/// A file bundle is made of parts; the existing blob cap is the per-part cap.
+#[cfg(any(feature = "http", test))]
+pub const MAX_FILE_PART_BYTES: u64 = MAX_BLOB_BYTES;
+/// Safety net for one logical file; the benchmark ISO is 1.59 GiB.
+#[cfg(feature = "http")]
+pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+#[cfg(feature = "http")]
+pub const MAX_PART_NUMBER: u32 = 10_000;
+
+#[cfg(any(feature = "http", test))]
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
+#[cfg(feature = "http")]
+static SESSION_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Meta {
@@ -32,47 +51,600 @@ pub fn incoming_dir() -> PathBuf {
     dir().join("incoming")
 }
 
-pub fn put(bytes: &[u8]) -> Result<Meta, String> {
-    if bytes.len() as u64 > MAX_BLOB_BYTES {
-        return Err("blob is too large".into());
-    }
-    let digest = Sha256::digest(bytes);
-    let id = format!("sha256:{}", hex(&digest));
-    let directory = dir();
-    fs::create_dir_all(&directory)
-        .map_err(|error| format!("create {}: {}", directory.display(), error))?;
-    let path = blob_path(&id)?;
-    if !path.is_file() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let temp = directory.join(format!(".tmp-{}-{}", std::process::id(), nanos));
-        let mut file = fs::File::create(&temp)
-            .map_err(|error| format!("create {}: {}", temp.display(), error))?;
-        file.write_all(bytes)
-            .map_err(|error| format!("write {}: {}", temp.display(), error))?;
-        file.sync_all()
-            .map_err(|error| format!("sync {}: {}", temp.display(), error))?;
-        fs::rename(&temp, &path)
-            .map_err(|error| format!("rename {}: {}", path.display(), error))?;
-    }
-    Ok(Meta {
-        id,
-        size: bytes.len() as u64,
-    })
+/// A streaming write into the content-addressed store. Bytes are hashed while
+/// they land in a temp file, so a large upload never has to fit in memory.
+#[cfg(any(feature = "http", test))]
+pub struct Upload {
+    file: fs::File,
+    hasher: Sha256,
+    temp: PathBuf,
+    size: u64,
+    committed: bool,
 }
 
+#[cfg(any(feature = "http", test))]
+impl Upload {
+    pub fn begin() -> Result<Upload, String> {
+        let directory = dir();
+        fs::create_dir_all(&directory)
+            .map_err(|error| format!("create {}: {}", directory.display(), error))?;
+        let temp = directory.join(format!(".upload-{}-{}", std::process::id(), next_temp()));
+        let file = fs::File::create(&temp)
+            .map_err(|error| format!("create {}: {}", temp.display(), error))?;
+        Ok(Upload {
+            file,
+            hasher: Sha256::new(),
+            temp,
+            size: 0,
+            committed: false,
+        })
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let size = self.size.saturating_add(bytes.len() as u64);
+        if size > MAX_FILE_PART_BYTES {
+            return Err("blob is too large".into());
+        }
+        self.file
+            .write_all(bytes)
+            .map_err(|error| format!("write {}: {}", self.temp.display(), error))?;
+        self.hasher.update(bytes);
+        self.size = size;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<Meta, String> {
+        self.file
+            .sync_all()
+            .map_err(|error| format!("sync {}: {}", self.temp.display(), error))?;
+        let digest = std::mem::replace(&mut self.hasher, Sha256::new()).finalize();
+        let id = format!("sha256:{}", hex(&digest));
+        let destination = blob_path(&id)?;
+        if destination.is_file() {
+            let _ = fs::remove_file(&self.temp);
+        } else if let Err(error) = fs::rename(&self.temp, &destination) {
+            // A concurrent upload may have won the race; both writers produced
+            // the same content, so only the loser's temp file remains.
+            if destination.is_file() {
+                let _ = fs::remove_file(&self.temp);
+            } else {
+                return Err(format!("rename {}: {}", destination.display(), error));
+            }
+        }
+        self.committed = true;
+        Ok(Meta {
+            id,
+            size: self.size,
+        })
+    }
+}
+
+#[cfg(any(feature = "http", test))]
+impl Drop for Upload {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.temp);
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn put(bytes: &[u8]) -> Result<Meta, String> {
+    let mut upload = Upload::begin()?;
+    upload.write(bytes)?;
+    upload.finish()
+}
+
+#[cfg(test)]
 pub fn read(id: &str) -> Result<Vec<u8>, String> {
     let path = blob_path(id)?;
     touch(&path);
     fs::read(&path).map_err(|error| format!("read {}: {}", path.display(), error))
 }
 
+pub fn locate(id: &str) -> Result<PathBuf, String> {
+    blob_path(id)
+}
+
 pub fn path(id: &str) -> Result<PathBuf, String> {
-    let path = blob_path(id)?;
+    let path = locate(id)?;
     touch(&path);
     Ok(path)
+}
+
+/// One committed part of a resumable upload session.
+#[cfg(feature = "http")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartInfo {
+    pub number: u32,
+    pub size: u64,
+    pub etag: String,
+}
+
+#[cfg(feature = "http")]
+pub fn uploads_dir() -> PathBuf {
+    dir().join("uploads")
+}
+
+#[cfg(feature = "http")]
+pub fn valid_upload_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(feature = "http")]
+pub fn upload_dir(id: &str) -> Result<PathBuf, String> {
+    if !valid_upload_id(id) {
+        return Err("invalid upload id".into());
+    }
+    Ok(uploads_dir().join(id))
+}
+
+/// Start a resumable upload session. The marker file keeps the directory from
+/// being pruned as "empty" until the normal temp retention expires.
+#[cfg(feature = "http")]
+pub fn create_upload() -> Result<String, String> {
+    let id = random_id()?;
+    let directory = upload_dir(&id)?;
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("create {}: {}", directory.display(), error))?;
+    fs::write(directory.join("session"), b"")
+        .map_err(|error| format!("write session marker: {}", error))?;
+    Ok(id)
+}
+
+#[cfg(feature = "http")]
+pub fn upload_parts(id: &str) -> Result<Vec<PartInfo>, String> {
+    let directory = upload_dir(id)?;
+    if !directory.is_dir() {
+        return Err("unknown upload".into());
+    }
+    let mut parts = Vec::new();
+    for entry in fs::read_dir(&directory)
+        .map_err(|error| format!("read {}: {}", directory.display(), error))?
+    {
+        let entry = entry.map_err(|error| format!("read {}: {}", directory.display(), error))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(digits) = name.strip_prefix("part-") else {
+            continue;
+        };
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(number) = digits.parse::<u32>() else {
+            continue;
+        };
+        if number == 0 || number > MAX_PART_NUMBER {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .map_err(|error| format!("stat {}: {}", name, error))?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let etag = fs::read_to_string(directory.join(format!("part-{}.etag", number)))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        parts.push(PartInfo {
+            number,
+            size: metadata.len(),
+            etag,
+        });
+    }
+    parts.sort_by_key(|part| part.number);
+    Ok(parts)
+}
+
+/// Streaming writer for one part of a resumable upload. Uploading the same
+/// part number again replaces it, which makes retries idempotent.
+#[cfg(feature = "http")]
+pub struct PartWriter {
+    file: fs::File,
+    hasher: Sha256,
+    temp: PathBuf,
+    part: PathBuf,
+    etag_path: PathBuf,
+    number: u32,
+    size: u64,
+    committed: bool,
+}
+
+#[cfg(feature = "http")]
+impl PartWriter {
+    pub fn begin(upload_id: &str, number: u32) -> Result<PartWriter, String> {
+        if number == 0 || number > MAX_PART_NUMBER {
+            return Err("part number must be between 1 and 10000".into());
+        }
+        let directory = upload_dir(upload_id)?;
+        if !directory.is_dir() {
+            return Err("unknown upload".into());
+        }
+        // Keep the whole session alive even when an early part is older than
+        // the retention window by the time the upload finishes.
+        touch(&directory.join("session"));
+        let temp = directory.join(format!(".part-{}-{}.tmp", number, next_temp()));
+        let file = fs::File::create(&temp)
+            .map_err(|error| format!("create {}: {}", temp.display(), error))?;
+        Ok(PartWriter {
+            file,
+            hasher: Sha256::new(),
+            part: directory.join(format!("part-{}", number)),
+            etag_path: directory.join(format!("part-{}.etag", number)),
+            temp,
+            number,
+            size: 0,
+            committed: false,
+        })
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let size = self.size.saturating_add(bytes.len() as u64);
+        if size > MAX_FILE_PART_BYTES {
+            return Err("blob is too large".into());
+        }
+        self.file
+            .write_all(bytes)
+            .map_err(|error| format!("write {}: {}", self.temp.display(), error))?;
+        self.hasher.update(bytes);
+        self.size = size;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<PartInfo, String> {
+        self.file
+            .sync_all()
+            .map_err(|error| format!("sync {}: {}", self.temp.display(), error))?;
+        let etag = format!(
+            "sha256:{}",
+            hex(&std::mem::replace(&mut self.hasher, Sha256::new()).finalize())
+        );
+        replace_file(&self.temp, &self.part)?;
+        let temp_etag = self.etag_path.with_file_name(format!(
+            ".part-{}-etag-{}.tmp",
+            self.number,
+            next_temp()
+        ));
+        fs::write(&temp_etag, etag.as_bytes())
+            .map_err(|error| format!("write {}: {}", temp_etag.display(), error))?;
+        replace_file(&temp_etag, &self.etag_path)?;
+        self.committed = true;
+        Ok(PartInfo {
+            number: self.number,
+            size: self.size,
+            etag,
+        })
+    }
+}
+
+#[cfg(feature = "http")]
+impl Drop for PartWriter {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.temp);
+        }
+    }
+}
+
+/// Concatenate the selected parts in ascending order into one content-addressed
+/// blob. `None` selects every part that exists; an explicit list must be
+/// strictly increasing and may omit parts. The session is removed on success.
+#[cfg(feature = "http")]
+pub fn complete_upload(
+    id: &str,
+    requested: Option<Vec<(u32, Option<String>)>>,
+) -> Result<Meta, String> {
+    let _guard = SESSION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let directory = upload_dir(id)?;
+    if !directory.is_dir() {
+        return Err("unknown upload".into());
+    }
+    let available = upload_parts(id)?;
+    let selected = select_parts(&available, requested)?;
+    if selected.is_empty() {
+        return Err("no parts uploaded".into());
+    }
+    let mut upload = Upload::begin()?;
+    let mut buffer = [0u8; 64 * 1024];
+    for part in selected {
+        let path = directory.join(format!("part-{}", part.number));
+        let mut file =
+            fs::File::open(&path).map_err(|error| format!("open {}: {}", path.display(), error))?;
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|error| format!("read {}: {}", path.display(), error))?;
+            if read == 0 {
+                break;
+            }
+            upload.write(&buffer[..read])?;
+        }
+    }
+    let meta = upload.finish()?;
+    let _ = fs::remove_dir_all(&directory);
+    Ok(meta)
+}
+
+#[cfg(feature = "http")]
+fn select_parts(
+    available: &[PartInfo],
+    requested: Option<Vec<(u32, Option<String>)>>,
+) -> Result<Vec<PartInfo>, String> {
+    let Some(list) = requested else {
+        return Ok(available.to_vec());
+    };
+    if list.is_empty() {
+        return Err("parts is empty".into());
+    }
+    let mut selected = Vec::new();
+    let mut previous = 0u32;
+    for (number, etag) in list {
+        if number == 0 || number > MAX_PART_NUMBER {
+            return Err("part number must be between 1 and 10000".into());
+        }
+        if number <= previous {
+            return Err("parts must be strictly increasing".into());
+        }
+        let Some(part) = available.iter().find(|part| part.number == number) else {
+            return Err(format!("part {} is missing", number));
+        };
+        if let Some(etag) = etag {
+            if normalize_etag(&etag) != normalize_etag(&part.etag) {
+                return Err(format!("part {} etag does not match", number));
+            }
+        }
+        selected.push(part.clone());
+        previous = number;
+    }
+    Ok(selected)
+}
+
+/// One part entry in a file manifest.
+#[cfg(feature = "http")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilePart {
+    pub number: u32,
+    pub size: u64,
+    pub sha256: String,
+}
+
+/// On-disk manifest for a logical file. The file itself is the ordered list of
+/// part files; it is never concatenated into a second copy.
+#[cfg(feature = "http")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileManifest {
+    pub schema: u32,
+    pub id: String,
+    pub size: u64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "default_mime")]
+    #[serde(rename = "mimeType")]
+    pub mime_type: String,
+    pub parts: Vec<FilePart>,
+}
+
+#[cfg(feature = "http")]
+fn default_mime() -> String {
+    "application/octet-stream".to_string()
+}
+
+#[cfg(feature = "http")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileMeta {
+    pub id: String,
+    pub size: u64,
+    pub name: String,
+    pub mime_type: String,
+}
+
+#[cfg(feature = "http")]
+pub fn files_dir() -> PathBuf {
+    dir().join("files")
+}
+
+#[cfg(feature = "http")]
+pub fn file_dir(id: &str) -> Result<PathBuf, String> {
+    Ok(files_dir().join(id_hex(id)?))
+}
+
+#[cfg(feature = "http")]
+pub fn file_manifest(id: &str) -> Result<(PathBuf, FileManifest), String> {
+    let directory = file_dir(id)?;
+    let path = directory.join("manifest.json");
+    let bytes = fs::read(&path).map_err(|error| format!("read {}: {}", path.display(), error))?;
+    let manifest: FileManifest = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse {}: {}", path.display(), error))?;
+    if manifest.id != id {
+        return Err(format!("manifest id mismatch for {}", id));
+    }
+    let size: u64 = manifest.parts.iter().map(|part| part.size).sum();
+    if size != manifest.size {
+        return Err(format!("manifest size mismatch for {}", id));
+    }
+    Ok((directory, manifest))
+}
+
+#[cfg(feature = "http")]
+pub fn file_meta(id: &str) -> Result<FileMeta, String> {
+    let (_, manifest) = file_manifest(id)?;
+    Ok(FileMeta {
+        id: manifest.id,
+        size: manifest.size,
+        name: manifest.name,
+        mime_type: manifest.mime_type,
+    })
+}
+
+/// Turn a completed part session into a logical file. Unlike `complete_upload`
+/// this does not write a second copy: it hashes the parts in place and renames
+/// the session directory into the file store.
+#[cfg(feature = "http")]
+pub fn complete_file(
+    upload_id: &str,
+    requested: Option<Vec<(u32, Option<String>)>>,
+    name: Option<String>,
+    mime_type: Option<String>,
+) -> Result<FileMeta, String> {
+    let directory = upload_dir(upload_id)?;
+    if !directory.is_dir() {
+        return Err("unknown upload".into());
+    }
+    let available = upload_parts(upload_id)?;
+    let selected = select_parts(&available, requested)?;
+    if selected.is_empty() {
+        return Err("no parts uploaded".into());
+    }
+    let declared: u64 = selected.iter().map(|part| part.size).sum();
+    if declared > MAX_FILE_BYTES {
+        return Err("file is too large".into());
+    }
+
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    for part in &selected {
+        let path = directory.join(format!("part-{}", part.number));
+        let mut file =
+            fs::File::open(&path).map_err(|error| format!("open {}: {}", path.display(), error))?;
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|error| format!("read {}: {}", path.display(), error))?;
+            if read == 0 {
+                break;
+            }
+            size = size.saturating_add(read as u64);
+            if size > MAX_FILE_BYTES {
+                return Err("file is too large".into());
+            }
+            hasher.update(&buffer[..read]);
+        }
+    }
+    if size != declared {
+        return Err("part sizes changed while completing the file".into());
+    }
+
+    let id = format!("sha256:{}", hex(&hasher.finalize()));
+    let destination = file_dir(&id)?;
+    // Hash outside the global session lock: five concurrent 1.6 GiB files must
+    // not serialise their whole-file hashing behind one mutex.
+    let _guard = SESSION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if destination.is_dir() {
+        let _ = fs::remove_dir_all(&directory);
+        return file_meta(&id);
+    }
+
+    let manifest = FileManifest {
+        schema: 1,
+        id: id.clone(),
+        size,
+        name: name.unwrap_or_else(|| "file".into()),
+        mime_type: mime_type.unwrap_or_else(default_mime),
+        parts: selected
+            .iter()
+            .map(|part| FilePart {
+                number: part.number,
+                size: part.size,
+                sha256: part.etag.clone(),
+            })
+            .collect(),
+    };
+    let manifest_path = directory.join("manifest.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).unwrap_or_default(),
+    )
+    .map_err(|error| format!("write {}: {}", manifest_path.display(), error))?;
+    let _ = fs::remove_file(directory.join("session"));
+
+    fs::create_dir_all(files_dir())
+        .map_err(|error| format!("create {}: {}", files_dir().display(), error))?;
+    match fs::rename(&directory, &destination) {
+        Ok(()) => {}
+        Err(_error) if destination.is_dir() => {
+            let _ = fs::remove_dir_all(&directory);
+            return file_meta(&id);
+        }
+        Err(error) => return Err(format!("rename {}: {}", destination.display(), error)),
+    }
+    Ok(FileMeta {
+        id,
+        size,
+        name: manifest.name,
+        mime_type: manifest.mime_type,
+    })
+}
+
+#[cfg(feature = "http")]
+pub fn abort_upload(id: &str) -> Result<(), String> {
+    let _guard = SESSION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let directory = upload_dir(id)?;
+    if !directory.is_dir() {
+        return Err("unknown upload".into());
+    }
+    fs::remove_dir_all(&directory)
+        .map_err(|error| format!("remove {}: {}", directory.display(), error))
+}
+
+#[cfg(feature = "http")]
+fn normalize_etag(value: &str) -> String {
+    let value = value.trim();
+    let value = value.strip_prefix("W/").unwrap_or(value);
+    value.trim().trim_matches('"').to_string()
+}
+
+#[cfg(feature = "http")]
+fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // `MoveFileEx` without replace semantics fails on Windows when the
+        // destination exists; part uploads intentionally replace old parts.
+        let _ = fs::remove_file(destination);
+    }
+    fs::rename(source, destination)
+        .map_err(|error| format!("rename {}: {}", destination.display(), error))
+}
+
+#[cfg(any(feature = "http", test))]
+fn next_temp() -> u64 {
+    NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(feature = "http")]
+fn random_id() -> Result<String, String> {
+    let mut bytes = [0u8; 16];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        // Time-derived fallback if the OS source is unavailable.
+        return Ok(format!(
+            "{:032x}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+    }
+    Ok(hex(&bytes))
 }
 
 /// Remove temp files older than `retention`. This includes content-addressed
@@ -97,6 +669,30 @@ fn cleanup_dir(
     cutoff: SystemTime,
     removed: &mut usize,
 ) -> std::io::Result<()> {
+    // A file bundle or an in-progress part session is one unit: its marker is
+    // the TTL clock, not each individual part. This keeps a long upload or a
+    // file that is still referenced from losing some of its parts.
+    let managed = directory
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .map(|name| name == "uploads" || name == "files")
+        .unwrap_or(false);
+    if managed {
+        let marker = ["manifest.json", "session"]
+            .into_iter()
+            .map(|name| directory.join(name))
+            .find(|path| path.is_file());
+        if let Some(marker) = marker {
+            let modified = fs::metadata(&marker)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(UNIX_EPOCH);
+            if modified <= cutoff && fs::remove_dir_all(directory).is_ok() {
+                *removed += 1;
+            }
+            return Ok(());
+        }
+    }
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
@@ -155,7 +751,7 @@ pub fn spawn_cleanup() {
         });
 }
 
-fn touch(path: &Path) {
+pub(crate) fn touch(path: &Path) {
     if let Ok(file) = fs::OpenOptions::new().write(true).open(path) {
         let _ = file.set_times(fs::FileTimes::new().set_modified(SystemTime::now()));
     }
@@ -283,6 +879,21 @@ pub fn resolve_args(value: &mut Value) -> Result<(), String> {
                 });
                 return Ok(());
             }
+            #[cfg(feature = "http")]
+            if let Some(Value::String(id)) = map.get("$file") {
+                let meta = file_meta(id)?;
+                let directory = file_dir(id)?;
+                let manifest = directory.join("manifest.json");
+                *value = json!({
+                    "$file": id,
+                    "dir": directory.to_string_lossy(),
+                    "manifest": manifest.to_string_lossy(),
+                    "size": meta.size,
+                    "name": meta.name,
+                    "mimeType": meta.mime_type,
+                });
+                return Ok(());
+            }
             for child in map.values_mut() {
                 resolve_args(child)?;
             }
@@ -297,14 +908,18 @@ pub fn resolve_args(value: &mut Value) -> Result<(), String> {
     Ok(())
 }
 
-fn blob_path(id: &str) -> Result<PathBuf, String> {
+fn id_hex(id: &str) -> Result<&str, String> {
     let Some(hex) = id.strip_prefix("sha256:") else {
         return Err("invalid blob id".into());
     };
     if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("invalid blob id".into());
     }
-    Ok(dir().join(hex))
+    Ok(hex)
+}
+
+fn blob_path(id: &str) -> Result<PathBuf, String> {
+    Ok(dir().join(id_hex(id)?))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -314,10 +929,6 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(text, "{:02x}", byte);
     }
     text
-}
-
-pub fn content_type() -> &'static str {
-    "application/octet-stream"
 }
 
 #[cfg(test)]
@@ -420,5 +1031,66 @@ mod tests {
         assert_eq!(input["$blob"], meta.id);
         assert_eq!(input["size"], 9);
         assert!(input["path"].as_str().expect("path").contains("temp"));
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn cleanup_removes_a_stale_file_bundle_as_one_unit() {
+        let _ = root();
+        let upload = create_upload().expect("file upload");
+        let mut writer = PartWriter::begin(&upload, 1).expect("part writer");
+        writer.write(b"hello").expect("part write");
+        writer.finish().expect("part finish");
+        let meta = complete_file(&upload, None, None, None).expect("complete file");
+        let directory = file_dir(&meta.id).expect("file dir");
+        let manifest = directory.join("manifest.json");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&manifest)
+            .expect("open manifest");
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(SystemTime::now() - Duration::from_secs(3 * 60 * 60)),
+        )
+        .expect("old manifest mtime");
+        let removed = cleanup(Duration::from_secs(2 * 60 * 60)).expect("cleanup");
+        assert!(removed >= 1);
+        assert!(!directory.exists());
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn file_bundles_resolve_to_a_manifest_and_size() {
+        let _ = root();
+        let upload = create_upload().expect("file upload");
+        for (number, bytes) in [(1u32, b"hello ".as_slice()), (2u32, b"world!")] {
+            let mut writer = PartWriter::begin(&upload, number).expect("part writer");
+            writer.write(bytes).expect("part write");
+            writer.finish().expect("part finish");
+        }
+        let meta = complete_file(
+            &upload,
+            None,
+            Some("hello.txt".to_string()),
+            Some("text/plain".to_string()),
+        )
+        .expect("complete file");
+        assert_eq!(meta.size, 12);
+        assert_eq!(
+            meta.id,
+            format!("sha256:{}", hex(&Sha256::digest(b"hello world!")))
+        );
+
+        let mut args = json!({"input": {"$file": meta.id}});
+        resolve_args(&mut args).expect("resolve file");
+        let input = &args["input"];
+        assert_eq!(input["size"], 12);
+        assert_eq!(input["name"], "hello.txt");
+        assert_eq!(input["mimeType"], "text/plain");
+        assert!(input["manifest"]
+            .as_str()
+            .expect("manifest")
+            .ends_with("manifest.json"));
+        assert!(file_dir(&meta.id).expect("file dir").is_dir());
     }
 }

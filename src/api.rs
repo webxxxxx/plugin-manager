@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -34,6 +34,7 @@ use std::sync::Condvar;
 
 use serde_json::{json, Value};
 
+use crate::blob_http;
 use crate::channel;
 use crate::http;
 use crate::lan::{self, AuthKind, Lan, LanStatus};
@@ -52,9 +53,27 @@ use crate::webui;
 
 const MAX_BODY: u64 = 512 * 1024 * 1024;
 const MAX_JSON_BODY: u64 = 1024 * 1024;
+const MAX_COMPLETE_BODY: u64 = 8 * 1024 * 1024;
 const MAX_LOG_BODY: usize = 1024 * 1024;
 const MAX_HEADER: usize = 64 * 1024;
 const UI: &str = include_str!("web/index.html");
+
+/// Buffered-body limit for the routes that still go through the ordinary
+/// router. Blob uploads/downloads are streamed before this is consulted.
+fn body_limit(path: &str) -> u64 {
+    let path = path.split_once('?').map(|(path, _)| path).unwrap_or(path);
+    if path.starts_with("/api/v1/plugins") || path.starts_with("/api/v1/import") {
+        MAX_BODY
+    } else if path.trim_end_matches('/').ends_with("/complete")
+        && (path.starts_with("/api/v1/blobs/uploads/")
+            || path.starts_with("/api/v1/file/uploads/")
+            || path.starts_with("/api/v1/files/uploads/"))
+    {
+        MAX_COMPLETE_BODY
+    } else {
+        MAX_JSON_BODY
+    }
+}
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -237,6 +256,27 @@ struct Connection {
     out_at: usize,
     state: ConnState,
     keep_alive: bool,
+    /// A request whose head has been parsed and whose body is still arriving.
+    /// Keeping the framing state on the connection avoids re-parsing and
+    /// re-scanning body bytes as they trickle in.
+    pending: Option<PendingRequest>,
+}
+
+#[cfg(unix)]
+struct PendingRequest {
+    method: String,
+    path: String,
+    version: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    framing: PendingFraming,
+}
+
+#[cfg(unix)]
+enum PendingFraming {
+    None,
+    Length(u64),
+    Chunked(http::ChunkedDecoder),
 }
 
 #[cfg(unix)]
@@ -383,6 +423,7 @@ fn reactor_loop(mut listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config:
                                     out_at: 0,
                                     state: ConnState::Reading,
                                     keep_alive: false,
+                                    pending: None,
                                 },
                             );
                         }
@@ -416,11 +457,25 @@ fn reactor_loop(mut listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config:
                     }
                     Ok(read) => {
                         connection.buffer.extend_from_slice(&chunk[..read]);
+                        if let Some((stream, head, initial, route)) = blob_takeover(connection) {
+                            connection.state = ConnState::Processing;
+                            connections.remove(&id);
+                            let lan = lan.clone();
+                            let _ = thread::Builder::new()
+                                .name("svcd-blob-http".into())
+                                .stack_size(threads::REQUEST_STACK)
+                                .spawn(move || {
+                                    let mut stream = stream;
+                                    let _ = stream.set_nonblocking(false);
+                                    let _ =
+                                        blob_http::serve(&mut stream, &head, &initial, &lan, route);
+                                });
+                            continue;
+                        }
                         loop {
-                            match parse_buffered_request(&connection.buffer) {
+                            match advance_request(connection) {
                                 Ok(None) => break,
-                                Ok(Some((request, used))) => {
-                                    connection.buffer.drain(..used);
+                                Ok(Some(request)) => {
                                     let path = request
                                         .path
                                         .split_once('?')
@@ -1441,72 +1496,106 @@ fn parse_ws_frame(buffer: &[u8]) -> Result<Option<(WsFrame, usize)>, WsParseErro
 }
 
 #[cfg(unix)]
-fn parse_buffered_request(buffer: &[u8]) -> Result<Option<(HttpRequest, usize)>, Vec<u8>> {
-    let Some(header_end) = find_header_end(buffer) else {
-        if buffer.len() > MAX_HEADER {
+fn blob_takeover(
+    connection: &mut Connection,
+) -> Option<(TcpStream, http::Head, Vec<u8>, crate::blob_http::Route)> {
+    if connection.pending.is_some() {
+        return None;
+    }
+    let header_end = http::header_end(&connection.buffer)?;
+    if header_end > MAX_HEADER {
+        return None;
+    }
+    let (head, body_start) = http::parse_head(&connection.buffer[..header_end + 4])?;
+    let route = blob_http::route(&head)?;
+    let stream = connection.stream.try_clone().ok()?;
+    let initial = connection.buffer[body_start..].to_vec();
+    Some((stream, head, initial, route))
+}
+
+#[cfg(unix)]
+fn advance_request(connection: &mut Connection) -> Result<Option<HttpRequest>, Vec<u8>> {
+    if connection.pending.is_none() {
+        let Some(header_end) = http::header_end(&connection.buffer) else {
+            if connection.buffer.len() > MAX_HEADER {
+                return Err(error(400, "bad_request", "request headers are too large"));
+            }
+            return Ok(None);
+        };
+        if header_end > MAX_HEADER {
             return Err(error(400, "bad_request", "request headers are too large"));
         }
+        let Some((head, body_start)) = http::parse_head(&connection.buffer[..header_end + 4])
+        else {
+            return Err(error(400, "bad_request", "malformed request line"));
+        };
+        let framing =
+            http::framing(&head.headers).map_err(|message| error(400, "bad_request", &message))?;
+        let limit = body_limit(&head.path);
+        if let http::Framing::Length(length) = framing {
+            if length > limit {
+                return Err(error(413, "payload_too_large", "request body is too large"));
+            }
+        }
+        let buffer = std::mem::take(&mut connection.buffer);
+        connection.buffer = buffer[body_start..].to_vec();
+        connection.pending = Some(PendingRequest {
+            method: head.method,
+            path: head.path,
+            version: head.version,
+            headers: head.headers,
+            body: Vec::new(),
+            framing: match framing {
+                http::Framing::None | http::Framing::Length(0) => PendingFraming::None,
+                http::Framing::Length(length) => PendingFraming::Length(length),
+                http::Framing::Chunked => PendingFraming::Chunked(http::ChunkedDecoder::new(limit)),
+            },
+        });
+    }
+
+    let mut ready = false;
+    if let Some(pending) = connection.pending.as_mut() {
+        match &mut pending.framing {
+            PendingFraming::None => ready = true,
+            PendingFraming::Length(remaining) => {
+                let take = std::cmp::min(*remaining, connection.buffer.len() as u64) as usize;
+                if take > 0 {
+                    pending.body.extend_from_slice(&connection.buffer[..take]);
+                    connection.buffer.drain(..take);
+                    *remaining -= take as u64;
+                }
+                ready = *remaining == 0;
+            }
+            PendingFraming::Chunked(decoder) => {
+                let input = std::mem::take(&mut connection.buffer);
+                decoder
+                    .feed(&input, &mut |chunk| {
+                        pending.body.extend_from_slice(chunk);
+                        Ok(())
+                    })
+                    .map_err(|message| {
+                        let status = if message.contains("too large") {
+                            413
+                        } else {
+                            400
+                        };
+                        error(status, code_for(status), &message)
+                    })?;
+                ready = decoder.is_done();
+            }
+        }
+    }
+    if !ready {
         return Ok(None);
-    };
-    if header_end > MAX_HEADER {
-        return Err(error(400, "bad_request", "request headers are too large"));
     }
-    let request = http::parse(&buffer[..header_end + 4])
-        .ok_or_else(|| error(400, "bad_request", "malformed request line"))?;
-    let version = std::str::from_utf8(&buffer[..header_end])
-        .ok()
-        .and_then(|head| head.lines().next())
-        .and_then(|line| line.split_whitespace().nth(2))
-        .unwrap_or("HTTP/1.1")
-        .to_string();
-    let content_length = request
-        .headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.parse::<u64>().ok())
-        .unwrap_or(0);
-    if request
-        .headers
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"))
-    {
-        return Err(error(
-            400,
-            "bad_request",
-            "chunked bodies are not supported",
-        ));
-    }
-    let limit = if request.path.starts_with("/api/v1/plugins")
-        || request.path.starts_with("/api/v1/import")
-        || request.path.starts_with("/api/v1/blobs")
-    {
-        MAX_BODY
-    } else {
-        MAX_JSON_BODY
-    };
-    if content_length > limit {
-        return Err(error(413, "payload_too_large", "request body is too large"));
-    }
-    let body_start = header_end + 4;
-    let total = body_start.saturating_add(content_length as usize);
-    if buffer.len() < total {
-        return Ok(None);
-    }
-    let body = buffer[body_start..total].to_vec();
-    Ok(Some((
-        HttpRequest {
-            method: request.method.to_string(),
-            path: request.path.to_string(),
-            version,
-            headers: request
-                .headers
-                .iter()
-                .map(|(name, value)| (name.to_string(), value.to_string()))
-                .collect(),
-            body,
-        },
-        total,
-    )))
+    let pending = connection.pending.take().expect("pending request");
+    Ok(Some(HttpRequest {
+        method: pending.method,
+        path: pending.path,
+        version: pending.version,
+        headers: pending.headers,
+        body: pending.body,
+    }))
 }
 
 #[cfg(not(unix))]
@@ -1547,14 +1636,25 @@ fn handle(mut stream: TcpStream, config: PathBuf, lan: Arc<Mutex<Lan>>) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
     let mut first = true;
     loop {
-        let request = match read_request(&mut stream) {
-            Ok(request) => request,
+        let (head, initial) = match read_head(&mut stream) {
+            Ok(head) => head,
             Err(response) => {
                 // An idle keep-alive connection times out or closes; do not
                 // manufacture a 400 response for a request that never arrived.
                 if first {
                     let _ = stream.write_all(&response);
                 }
+                return;
+            }
+        };
+        if let Some(route) = blob_http::route(&head) {
+            let _ = blob_http::serve(&mut stream, &head, &initial, &lan, route);
+            return;
+        }
+        let request = match read_body(&mut stream, head, &initial) {
+            Ok(request) => request,
+            Err(response) => {
+                let _ = stream.write_all(&response);
                 return;
             }
         };
@@ -2172,10 +2272,10 @@ struct HttpRequest {
 }
 
 #[cfg(not(unix))]
-fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, Vec<u8>> {
+fn read_head(stream: &mut TcpStream) -> Result<(http::Head, Vec<u8>), Vec<u8>> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
-    let header_end = loop {
+    loop {
         if buffer.len() > MAX_HEADER {
             return Err(error(400, "bad_request", "header is too large"));
         }
@@ -2186,62 +2286,55 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, Vec<u8>> {
             return Err(error(400, "bad_request", "empty request"));
         }
         buffer.extend_from_slice(&chunk[..read]);
-        if let Some(position) = find_header_end(&buffer) {
-            break position;
+        if let Some(position) = http::header_end(&buffer) {
+            if position > MAX_HEADER {
+                return Err(error(400, "bad_request", "header is too large"));
+            }
+            let Some((head, body_start)) = http::parse_head(&buffer[..position + 4]) else {
+                return Err(error(400, "bad_request", "malformed request line"));
+            };
+            return Ok((head, buffer[body_start..].to_vec()));
         }
-    };
-
-    let request = http::parse(&buffer[..header_end + 4])
-        .ok_or_else(|| error(400, "bad_request", "malformed request line"))?;
-    let version = std::str::from_utf8(&buffer[..header_end])
-        .ok()
-        .and_then(|head| head.lines().next())
-        .and_then(|line| line.split_whitespace().nth(2))
-        .unwrap_or("HTTP/1.1")
-        .to_string();
-    let content_length = header(&request, "content-length")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
-    if header(&request, "transfer-encoding").is_some() {
-        return Err(error(
-            400,
-            "bad_request",
-            "chunked bodies are not supported",
-        ));
     }
-    let limit = if request.path.starts_with("/api/v1/plugins")
-        || request.path.starts_with("/api/v1/import")
-        || request.path.starts_with("/api/v1/blobs")
+}
+
+#[cfg(not(unix))]
+fn read_body(
+    stream: &mut TcpStream,
+    head: http::Head,
+    initial: &[u8],
+) -> Result<HttpRequest, Vec<u8>> {
+    let framing =
+        http::framing(&head.headers).map_err(|message| error(400, "bad_request", &message))?;
+    let limit = body_limit(&head.path);
+    if let http::Framing::Length(length) = framing {
+        if length > limit {
+            return Err(error(413, "payload_too_large", "request body is too large"));
+        }
+    }
+    if !matches!(framing, http::Framing::None)
+        && head.version.eq_ignore_ascii_case("HTTP/1.1")
+        && http::header(&head.headers, "expect")
+            .map(|value| value.eq_ignore_ascii_case("100-continue"))
+            .unwrap_or(false)
     {
-        MAX_BODY
-    } else {
-        MAX_JSON_BODY
-    };
-    if content_length > limit {
-        return Err(error(413, "payload_too_large", "request body is too large"));
+        stream
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .map_err(|_| error(400, "bad_request", "cannot write response"))?;
     }
-
-    let mut body = buffer[header_end + 4..].to_vec();
-    while (body.len() as u64) < content_length {
-        let read = stream
-            .read(&mut chunk)
-            .map_err(|_| error(400, "bad_request", "cannot read request body"))?;
-        if read == 0 {
-            return Err(error(400, "bad_request", "truncated request body"));
-        }
-        body.extend_from_slice(&chunk[..read]);
-    }
-    body.truncate(content_length as usize);
-
+    let body = http::collect_body(stream, framing, limit, initial).map_err(|message| {
+        let status = if message.contains("too large") {
+            413
+        } else {
+            400
+        };
+        error(status, code_for(status), &message)
+    })?;
     Ok(HttpRequest {
-        method: request.method.to_string(),
-        path: request.path.to_string(),
-        version,
-        headers: request
-            .headers
-            .iter()
-            .map(|(name, value)| (name.to_string(), value.to_string()))
-            .collect(),
+        method: head.method,
+        path: head.path,
+        version: head.version,
+        headers: head.headers,
         body,
     })
 }
@@ -2250,25 +2343,15 @@ fn request_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
     http::header(&request.headers, name)
 }
 
-#[cfg(not(unix))]
-fn header<'a>(request: &'a http::Request<'_>, name: &str) -> Option<&'a str> {
-    request
-        .headers
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| *value)
-}
-
-fn find_header_end(bytes: &[u8]) -> Option<usize> {
-    bytes.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
 fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<Lan>>) -> Vec<u8> {
     let (path, query) = request
         .path
         .split_once('?')
         .unwrap_or((request.path.as_str(), ""));
-    let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+    let mut parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+    if parts.get(2) == Some(&"files") {
+        parts[2] = "file";
+    }
     if parts.len() < 3 || parts[0] != "api" || parts[1] != "v1" {
         return error(404, "not_found", "unknown endpoint");
     }
@@ -2358,10 +2441,32 @@ fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<
         }
         (_, ["api", "v1", "plugins", _, "ui-token"]) => method_not_allowed("POST"),
         ("POST", ["api", "v1", "plugins"]) => install_plugin(config, request, query),
-        ("POST", ["api", "v1", "blobs"]) => blob_put(request),
-        ("GET", ["api", "v1", "blobs", id]) => blob_get(&decode(id)),
+        ("POST", ["api", "v1", "blobs", "uploads"]) => blob_http::create_upload(),
+        ("GET", ["api", "v1", "blobs", "uploads", id]) => blob_http::upload_status(&decode(id)),
+        ("POST", ["api", "v1", "blobs", "uploads", id, "complete"]) => {
+            blob_http::complete_upload(&decode(id), &request.body)
+        }
+        ("DELETE", ["api", "v1", "blobs", "uploads", id]) => blob_http::abort_upload(&decode(id)),
         (_, ["api", "v1", "blobs"]) => method_not_allowed("POST"),
+        (_, ["api", "v1", "blobs", "uploads"]) => method_not_allowed("POST"),
+        (_, ["api", "v1", "blobs", "uploads", _]) => method_not_allowed("GET, DELETE"),
+        (_, ["api", "v1", "blobs", "uploads", _, "complete"]) => method_not_allowed("POST"),
+        (_, ["api", "v1", "blobs", "uploads", _, "parts", _]) => method_not_allowed("PUT"),
         (_, ["api", "v1", "blobs", _]) => method_not_allowed("GET"),
+        ("POST", ["api", "v1", "file", "uploads"]) => blob_http::file_upload_create(),
+        ("GET", ["api", "v1", "file", "uploads", id]) => blob_http::file_upload_status(&decode(id)),
+        ("POST", ["api", "v1", "file", "uploads", id, "complete"]) => {
+            blob_http::file_upload_complete(&decode(id), &request.body)
+        }
+        ("DELETE", ["api", "v1", "file", "uploads", id]) => {
+            blob_http::file_upload_abort(&decode(id))
+        }
+        (_, ["api", "v1", "file"]) => method_not_allowed("POST"),
+        (_, ["api", "v1", "file", "uploads"]) => method_not_allowed("POST"),
+        (_, ["api", "v1", "file", "uploads", _]) => method_not_allowed("GET, DELETE"),
+        (_, ["api", "v1", "file", "uploads", _, "complete"]) => method_not_allowed("POST"),
+        (_, ["api", "v1", "file", "uploads", _, "parts", _]) => method_not_allowed("PUT"),
+        (_, ["api", "v1", "file", _]) => method_not_allowed("GET"),
         ("GET", ["api", "v1", "trust"]) => trust_list(),
         ("POST", ["api", "v1", "trust"]) => trust_add(request, query),
         ("DELETE", ["api", "v1", "trust", key]) => trust_remove(&decode(key)),
@@ -2394,26 +2499,6 @@ fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<
         ("GET", ["api", "v1", "logs", id]) => logs(config, &decode(id), query),
         (_, ["api", "v1", "logs", _]) => method_not_allowed("GET"),
         _ => error(404, "not_found", "unknown endpoint"),
-    }
-}
-
-fn blob_put(request: &HttpRequest) -> Vec<u8> {
-    if request.body.is_empty() {
-        return error(400, "bad_request", "empty blob body");
-    }
-    match crate::blob::put(&request.body) {
-        Ok(meta) => ok(json!({
-            "id": meta.id,
-            "size": meta.size,
-        })),
-        Err(message) => map_error(&message),
-    }
-}
-
-fn blob_get(id: &str) -> Vec<u8> {
-    match crate::blob::read(id) {
-        Ok(bytes) => http::response(200, crate::blob::content_type(), &bytes),
-        Err(message) => error(404, "not_found", &message),
     }
 }
 
@@ -2899,26 +2984,7 @@ fn query_bool(query: &str, key: &str) -> Option<bool> {
 }
 
 fn decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            let hex = &value[index + 1..index + 3];
-            if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                out.push(byte);
-                index += 3;
-                continue;
-            }
-        }
-        if bytes[index] == b'+' {
-            out.push(b' ');
-        } else {
-            out.push(bytes[index]);
-        }
-        index += 1;
-    }
-    String::from_utf8_lossy(&out).to_string()
+    http::percent_decode(value, true)
 }
 
 #[cfg(test)]

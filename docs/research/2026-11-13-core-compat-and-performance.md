@@ -57,6 +57,8 @@
 
 - `/mcp` 是 **modern-only（2026-07-28）**；官方 SDK 1.32.2 的 Streamable HTTP 客户端面向较早的 session/SSE 语义，未作为 HTTP 客户端通过；它的 **stdio legacy 桥**已验证通过。HTTP modern 面用脚本内的协议客户端逐项验证。
 - HTTP 明确拒绝 chunked 请求体；支持 HTTP/1.1 keep-alive 与显式 `Connection: close`；不支持 TLS、HTTP/2、pipelining。
+
+> 注（2026-11-15）：`Transfer-Encoding: chunked` 请求体现已支持（blob 上传流式落盘，普通管理 API 在内存中解码）；blob 接口另支持 Range/ETag/条件请求与断点续传分片。上表与本节保留当时的测量结果，最新语义以 `docs/plugin-blob.md` 为准。
 - WebSocket 只支持文本帧、无压缩、无子协议；二进制帧 close 1003，超大消息 close 1009。
 - SSE 是 server→UI；上行仍走 `POST /rpc`。
 

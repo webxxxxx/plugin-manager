@@ -476,6 +476,54 @@ fn raw_request_paced(
     read_raw_response(&mut stream)
 }
 
+/// Send one request with `Transfer-Encoding: chunked`, deliberately split into
+/// small chunks so the decoder sees chunk boundaries in different reads.
+fn raw_request_chunked(
+    address: &str,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+    extra_headers: &[(&str, &str)],
+) -> RawResponse {
+    let mut stream = TcpStream::connect(address).expect("connect");
+    let mut head = format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n",
+        method, path, address
+    );
+    if !content_type.is_empty() {
+        head.push_str(&format!("Content-Type: {}\r\n", content_type));
+    }
+    for (name, value) in extra_headers {
+        head.push_str(&format!("{}: {}\r\n", name, value));
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).expect("write head");
+    for chunk in body.chunks(7) {
+        stream
+            .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+            .expect("chunk size");
+        stream.write_all(chunk).expect("chunk body");
+        stream.write_all(b"\r\n").expect("chunk terminator");
+    }
+    stream.write_all(b"0\r\n\r\n").expect("last chunk");
+    read_raw_response(&mut stream)
+}
+
+fn multipart_body(boundary: &str, filename: &str, content: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\nContent-Type: application/octet-stream\r\n\r\n",
+            boundary, filename
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(content);
+    body.extend_from_slice(format!("\r\n--{}--\r\n", boundary).as_bytes());
+    body
+}
+
 fn decode_chunked(body: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut rest = body;
@@ -1273,6 +1321,572 @@ fn blobs_upload_and_download_round_trip() {
 
     let missing = raw_request(&address, "GET", "/api/v1/blobs/sha256:deadbeef", "", b"");
     assert_eq!(missing.status, 404);
+}
+
+#[test]
+fn blob_upload_accepts_chunked_and_multipart_bodies() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let body = b"chunked blob body";
+    let chunked = raw_request_chunked(
+        &address,
+        "POST",
+        "/api/v1/blobs",
+        "application/octet-stream",
+        body,
+        &[],
+    );
+    assert_eq!(chunked.status, 200, "{:?}", chunked.body);
+    let meta = json_body(&chunked);
+    let expected = format!("sha256:{}", hex_sha256(body));
+    assert_eq!(meta["id"], expected);
+    assert_eq!(meta["size"], body.len());
+    assert_eq!(
+        raw_header_values(&chunked, "etag"),
+        vec![format!("\"{}\"", expected).as_str()]
+    );
+
+    let boundary = "svcd-test-boundary";
+    let multipart = multipart_body(boundary, "payload.bin", b"multipart blob body");
+    let response = raw_request(
+        &address,
+        "POST",
+        "/api/v1/blobs",
+        &format!("multipart/form-data; boundary={}", boundary),
+        &multipart,
+    );
+    assert_eq!(response.status, 200, "{:?}", response.body);
+    let meta = json_body(&response);
+    let id = meta["id"].as_str().expect("blob id");
+    let download = raw_request(&address, "GET", &format!("/api/v1/blobs/{}", id), "", b"");
+    assert_eq!(download.status, 200);
+    assert_eq!(download.body, b"multipart blob body");
+
+    // The same multipart body also works when the outer request is chunked.
+    let chunked_multipart = raw_request_chunked(
+        &address,
+        "POST",
+        "/api/v1/blobs",
+        &format!("multipart/form-data; boundary={}", boundary),
+        &multipart,
+        &[],
+    );
+    assert_eq!(
+        chunked_multipart.status, 200,
+        "{:?}",
+        chunked_multipart.body
+    );
+    let id = json_body(&chunked_multipart)["id"]
+        .as_str()
+        .expect("blob id")
+        .to_string();
+    assert_eq!(id, meta["id"].as_str().expect("blob id"));
+}
+
+#[test]
+fn file_bundle_upload_download_and_cross_part_range() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let created = request(&address, "POST", "/api/v1/file/uploads", "", b"");
+    assert_eq!(created.status, 200, "{}", created.body);
+    let upload_id = created.body["uploadId"]
+        .as_str()
+        .expect("upload id")
+        .to_string();
+
+    let first = request(
+        &address,
+        "PUT",
+        &format!("/api/v1/file/uploads/{}/parts/1", upload_id),
+        "application/octet-stream",
+        b"hello ",
+    );
+    assert_eq!(first.status, 200, "{}", first.body);
+    let first_etag = first.body["etag"].as_str().expect("part etag").to_string();
+
+    let second = raw_request_chunked(
+        &address,
+        "PUT",
+        &format!("/api/v1/file/uploads/{}/parts/2", upload_id),
+        "application/octet-stream",
+        b"world",
+        &[],
+    );
+    assert_eq!(second.status, 200, "{:?}", second.body);
+    let second_etag = json_body(&second)["etag"]
+        .as_str()
+        .expect("part etag")
+        .to_string();
+
+    let third = request(
+        &address,
+        "PUT",
+        &format!("/api/v1/files/uploads/{}/parts/3", upload_id),
+        "application/octet-stream",
+        b"!",
+    );
+    assert_eq!(third.status, 200, "{}", third.body);
+    let third_etag = third.body["etag"].as_str().expect("part etag").to_string();
+
+    let complete = request(
+        &address,
+        "POST",
+        &format!("/api/v1/file/uploads/{}/complete", upload_id),
+        "application/json",
+        serde_json::to_string(&json!({
+            "name": "greeting.txt",
+            "mimeType": "text/plain",
+            "parts": [
+                {"partNumber": 1, "etag": first_etag},
+                {"partNumber": 2, "etag": second_etag},
+                {"partNumber": 3, "etag": third_etag},
+            ]
+        }))
+        .expect("complete body")
+        .as_bytes(),
+    );
+    assert_eq!(complete.status, 200, "{}", complete.body);
+    let id = complete.body["id"].as_str().expect("file id").to_string();
+    assert_eq!(complete.body["size"], 12);
+    assert_eq!(id, format!("sha256:{}", hex_sha256(b"hello world!")));
+
+    let download = raw_request(&address, "GET", &format!("/api/v1/file/{}", id), "", b"");
+    assert_eq!(download.status, 200);
+    assert_eq!(download.body, b"hello world!");
+    assert_eq!(
+        raw_header_values(&download, "content-type"),
+        vec!["text/plain"]
+    );
+    assert_eq!(
+        raw_header_values(&download, "etag"),
+        vec![format!("\"{}\"", id).as_str()]
+    );
+    assert_eq!(
+        raw_header_values(&download, "content-disposition"),
+        vec!["attachment; filename=\"greeting.txt\""]
+    );
+
+    let range = raw_request_with(
+        &address,
+        "GET",
+        &format!("/api/v1/files/{}", id),
+        "",
+        b"",
+        &[("Range", "bytes=4-8")],
+    );
+    assert_eq!(range.status, 206);
+    assert_eq!(range.body, b"o wor");
+    assert_eq!(
+        raw_header_values(&range, "content-range"),
+        vec!["bytes 4-8/12"]
+    );
+
+    let head = raw_request(&address, "HEAD", &format!("/api/v1/file/{}", id), "", b"");
+    assert_eq!(head.status, 200);
+    assert!(head.body.is_empty());
+    assert_eq!(raw_header_values(&head, "content-length"), vec!["12"]);
+
+    // A second session with the same content reuses the content-addressed file.
+    let created = request(&address, "POST", "/api/v1/files/uploads", "", b"");
+    let duplicate_id = created.body["uploadId"]
+        .as_str()
+        .expect("upload id")
+        .to_string();
+    for (number, content) in [
+        (1, b"hello ".as_slice()),
+        (2, b"world".as_slice()),
+        (3, b"!".as_slice()),
+    ] {
+        let part = request(
+            &address,
+            "PUT",
+            &format!("/api/v1/files/uploads/{}/parts/{}", duplicate_id, number),
+            "application/octet-stream",
+            content,
+        );
+        assert_eq!(part.status, 200, "{}", part.body);
+    }
+    let duplicate = request(
+        &address,
+        "POST",
+        &format!("/api/v1/files/uploads/{}/complete", duplicate_id),
+        "application/json",
+        b"{\"parts\":[{\"partNumber\":1},{\"partNumber\":2},{\"partNumber\":3}]}",
+    );
+    assert_eq!(duplicate.status, 200, "{}", duplicate.body);
+    assert_eq!(duplicate.body["id"].as_str(), Some(id.as_str()));
+}
+
+#[test]
+fn blob_download_supports_range_etag_and_conditionals() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let put = raw_request(
+        &address,
+        "POST",
+        "/api/v1/blobs",
+        "application/octet-stream",
+        b"0123456789",
+    );
+    assert_eq!(put.status, 200, "{:?}", put.body);
+    let id = json_body(&put)["id"].as_str().expect("blob id").to_string();
+    let path = format!("/api/v1/blobs/{}", id);
+
+    let full = raw_request(&address, "GET", &path, "", b"");
+    assert_eq!(full.status, 200);
+    assert_eq!(full.body, b"0123456789");
+    let etag = raw_header_values(&full, "etag")
+        .into_iter()
+        .next()
+        .expect("etag")
+        .to_string();
+    assert_eq!(etag, format!("\"{}\"", id));
+    assert_eq!(raw_header_values(&full, "accept-ranges"), vec!["bytes"]);
+    assert!(!raw_header_values(&full, "last-modified").is_empty());
+
+    let range = raw_request_with(&address, "GET", &path, "", b"", &[("Range", "bytes=2-5")]);
+    assert_eq!(range.status, 206);
+    assert_eq!(range.body, b"2345");
+    assert_eq!(
+        raw_header_values(&range, "content-range"),
+        vec!["bytes 2-5/10"]
+    );
+
+    let suffix = raw_request_with(&address, "GET", &path, "", b"", &[("Range", "bytes=-3")]);
+    assert_eq!(suffix.status, 206);
+    assert_eq!(suffix.body, b"789");
+
+    let open = raw_request_with(&address, "GET", &path, "", b"", &[("Range", "bytes=7-")]);
+    assert_eq!(open.status, 206);
+    assert_eq!(open.body, b"789");
+
+    let unsatisfiable =
+        raw_request_with(&address, "GET", &path, "", b"", &[("Range", "bytes=99-")]);
+    assert_eq!(unsatisfiable.status, 416);
+    assert_eq!(
+        raw_header_values(&unsatisfiable, "content-range"),
+        vec!["bytes */10"]
+    );
+
+    let not_modified =
+        raw_request_with(&address, "GET", &path, "", b"", &[("If-None-Match", &etag)]);
+    assert_eq!(not_modified.status, 304);
+    assert!(not_modified.body.is_empty());
+
+    let future = raw_request_with(
+        &address,
+        "GET",
+        &path,
+        "",
+        b"",
+        &[("If-Modified-Since", "Sun, 15 Nov 2099 00:00:00 GMT")],
+    );
+    assert_eq!(future.status, 304);
+
+    let unmodified = raw_request_with(
+        &address,
+        "GET",
+        &path,
+        "",
+        b"",
+        &[("If-Unmodified-Since", "Thu, 01 Jan 1970 00:00:00 GMT")],
+    );
+    assert_eq!(unmodified.status, 412);
+
+    let failed = raw_request_with(
+        &address,
+        "GET",
+        &path,
+        "",
+        b"",
+        &[("If-Match", "\"sha256:deadbeef\"")],
+    );
+    assert_eq!(failed.status, 412);
+
+    let stale_range = raw_request_with(
+        &address,
+        "GET",
+        &path,
+        "",
+        b"",
+        &[("Range", "bytes=2-5"), ("If-Range", "\"sha256:deadbeef\"")],
+    );
+    assert_eq!(stale_range.status, 200);
+    assert_eq!(stale_range.body, b"0123456789");
+
+    let fresh_range = raw_request_with(
+        &address,
+        "GET",
+        &path,
+        "",
+        b"",
+        &[("Range", "bytes=2-5"), ("If-Range", &etag)],
+    );
+    assert_eq!(fresh_range.status, 206);
+    assert_eq!(fresh_range.body, b"2345");
+
+    let head = raw_request(&address, "HEAD", &path, "", b"");
+    assert_eq!(head.status, 200);
+    assert!(head.body.is_empty());
+    assert_eq!(raw_header_values(&head, "content-length"), vec!["10"]);
+
+    let head_unsatisfiable =
+        raw_request_with(&address, "HEAD", &path, "", b"", &[("Range", "bytes=99-")]);
+    assert_eq!(head_unsatisfiable.status, 416);
+    assert!(head_unsatisfiable.body.is_empty());
+
+    let missing = raw_request(&address, "HEAD", "/api/v1/blobs/sha256:deadbeef", "", b"");
+    assert_eq!(missing.status, 404);
+    assert!(missing.body.is_empty());
+}
+
+#[test]
+fn chunked_bodies_work_for_management_json_routes() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let key = SigningKey::from_bytes(&[31u8; 32]);
+    let pem = pem_from_public(&key.verifying_key().to_bytes());
+    let chunked = raw_request_chunked(
+        &address,
+        "POST",
+        "/api/v1/trust?key_id=chunked-key",
+        "application/octet-stream",
+        &pem,
+        &[],
+    );
+    assert_eq!(chunked.status, 200, "{:?}", chunked.body);
+
+    let listed = request(&address, "GET", "/api/v1/trust", "", b"");
+    assert_eq!(listed.status, 200, "{}", listed.body);
+    assert!(listed.body["keys"]
+        .as_array()
+        .expect("keys")
+        .iter()
+        .any(|key| key == "chunked-key"));
+}
+
+#[test]
+fn blob_upload_honours_expect_100_continue() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let body = b"continue body";
+    let mut stream = TcpStream::connect(&address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let head = format!(
+        "POST /api/v1/blobs HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nExpect: 100-continue\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        address,
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).expect("write head");
+    let mut interim = Vec::new();
+    let mut byte = [0u8; 1];
+    while !interim.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).expect("100 continue");
+        interim.push(byte[0]);
+    }
+    assert!(
+        String::from_utf8_lossy(&interim).starts_with("HTTP/1.1 100"),
+        "{:?}",
+        String::from_utf8_lossy(&interim)
+    );
+    stream.write_all(body).expect("write body");
+    let response = read_raw_response(&mut stream);
+    assert_eq!(response.status, 200, "{:?}", response.body);
+}
+
+#[test]
+fn blob_resumable_upload_supports_parts_retries_and_parallel_uploads() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let created = request(&address, "POST", "/api/v1/blobs/uploads", "", b"");
+    assert_eq!(created.status, 200, "{}", created.body);
+    let upload_id = created.body["uploadId"]
+        .as_str()
+        .expect("upload id")
+        .to_string();
+
+    let first = raw_request_chunked(
+        &address,
+        "PUT",
+        &format!("/api/v1/blobs/uploads/{}/parts/1", upload_id),
+        "application/octet-stream",
+        b"hello ",
+        &[],
+    );
+    assert_eq!(first.status, 200, "{:?}", first.body);
+    let first_etag = json_body(&first)["etag"]
+        .as_str()
+        .expect("part etag")
+        .to_string();
+
+    let second = request(
+        &address,
+        "PUT",
+        &format!("/api/v1/blobs/uploads/{}/parts/2", upload_id),
+        "application/octet-stream",
+        b"world",
+    );
+    assert_eq!(second.status, 200, "{}", second.body);
+    let second_etag = second.body["etag"].as_str().expect("part etag").to_string();
+
+    let status = request(
+        &address,
+        "GET",
+        &format!("/api/v1/blobs/uploads/{}", upload_id),
+        "",
+        b"",
+    );
+    assert_eq!(status.status, 200, "{}", status.body);
+    assert_eq!(status.body["totalSize"], 11);
+    assert_eq!(status.body["parts"].as_array().expect("parts").len(), 2);
+
+    // Re-uploading the same part number replaces it.
+    let replaced = request(
+        &address,
+        "PUT",
+        &format!("/api/v1/blobs/uploads/{}/parts/2", upload_id),
+        "application/octet-stream",
+        b"there",
+    );
+    assert_eq!(replaced.status, 200, "{}", replaced.body);
+    let replaced_etag = replaced.body["etag"]
+        .as_str()
+        .expect("part etag")
+        .to_string();
+    let status = request(
+        &address,
+        "GET",
+        &format!("/api/v1/blobs/uploads/{}", upload_id),
+        "",
+        b"",
+    );
+    assert_eq!(status.body["totalSize"], 11);
+
+    // Replace it back so the assembled content is predictable.
+    let restored = request(
+        &address,
+        "PUT",
+        &format!("/api/v1/blobs/uploads/{}/parts/2", upload_id),
+        "application/octet-stream",
+        b"world",
+    );
+    assert_eq!(restored.status, 200, "{}", restored.body);
+    let restored_etag = restored.body["etag"]
+        .as_str()
+        .expect("part etag")
+        .to_string();
+    assert_eq!(restored_etag, second_etag);
+    assert_ne!(replaced_etag, second_etag);
+
+    let complete = request(
+        &address,
+        "POST",
+        &format!("/api/v1/blobs/uploads/{}/complete", upload_id),
+        "application/json",
+        serde_json::to_string(&json!({
+            "parts": [
+                {"partNumber": 1, "etag": first_etag},
+                {"partNumber": 2, "etag": restored_etag},
+            ]
+        }))
+        .expect("complete body")
+        .as_bytes(),
+    );
+    assert_eq!(complete.status, 200, "{}", complete.body);
+    let id = complete.body["id"].as_str().expect("blob id");
+    let expected = format!("sha256:{}", hex_sha256(b"hello world"));
+    assert_eq!(id, expected);
+    let download = raw_request(&address, "GET", &format!("/api/v1/blobs/{}", id), "", b"");
+    assert_eq!(download.status, 200);
+    assert_eq!(download.body, b"hello world");
+
+    let after = request(
+        &address,
+        "GET",
+        &format!("/api/v1/blobs/uploads/{}", upload_id),
+        "",
+        b"",
+    );
+    assert_eq!(after.status, 404, "{}", after.body);
+
+    // Two independent upload sessions can write parts concurrently.
+    let parallel = request(&address, "POST", "/api/v1/blobs/uploads", "", b"");
+    let parallel_id = parallel.body["uploadId"]
+        .as_str()
+        .expect("upload id")
+        .to_string();
+    let left = {
+        let address = address.clone();
+        let id = parallel_id.clone();
+        std::thread::spawn(move || {
+            raw_request(
+                &address,
+                "PUT",
+                &format!("/api/v1/blobs/uploads/{}/parts/1", id),
+                "application/octet-stream",
+                b"left-",
+            )
+        })
+    };
+    let right = {
+        let address = address.clone();
+        let id = parallel_id.clone();
+        std::thread::spawn(move || {
+            raw_request(
+                &address,
+                "PUT",
+                &format!("/api/v1/blobs/uploads/{}/parts/2", id),
+                "application/octet-stream",
+                b"right",
+            )
+        })
+    };
+    assert_eq!(left.join().expect("left").status, 200);
+    assert_eq!(right.join().expect("right").status, 200);
+    let complete = request(
+        &address,
+        "POST",
+        &format!("/api/v1/blobs/uploads/{}/complete", parallel_id),
+        "",
+        b"",
+    );
+    assert_eq!(complete.status, 200, "{}", complete.body);
+    let id = complete.body["id"].as_str().expect("blob id");
+    let download = raw_request(&address, "GET", &format!("/api/v1/blobs/{}", id), "", b"");
+    assert_eq!(download.body, b"left-right");
+
+    let aborted = request(&address, "POST", "/api/v1/blobs/uploads", "", b"");
+    let abort_id = aborted.body["uploadId"].as_str().expect("upload id");
+    let deleted = request(
+        &address,
+        "DELETE",
+        &format!("/api/v1/blobs/uploads/{}", abort_id),
+        "",
+        b"",
+    );
+    assert_eq!(deleted.status, 200, "{}", deleted.body);
+    let gone = request(
+        &address,
+        "GET",
+        &format!("/api/v1/blobs/uploads/{}", abort_id),
+        "",
+        b"",
+    );
+    assert_eq!(gone.status, 404);
 }
 
 #[test]

@@ -59,45 +59,220 @@ GET /api/v1/blobs/sha256:9f2c...e1
 
 需要与管理 API 相同的鉴权。单 blob 上限 **512 MiB**。
 
-### HTTP 上传/下载限制
+### HTTP 上传
 
-当前接口是一次性整体传输，不是分块或可恢复上传：
+`POST /api/v1/blobs` 接受以下主流写法，上传内容边读边写 `temp_dir`，同时增量计算 SHA-256，daemon 内存不随文件大小增长：
 
-- `POST /api/v1/blobs` 必须带 `Content-Length`；
-- **不支持** `Transfer-Encoding: chunked` 请求体；
-- 不支持 multipart，请求体就是原始字节；
-- 不支持断点续传、分片上传、并行上传；
-- 上传失败后需要重新上传完整 body；
-- 上传 body 会先在 daemon 内存中聚合，最大 512 MiB，因此大文件上传会占用相近的 daemon 内存；
-- `GET /api/v1/blobs/{id}` 会把整个 blob 读入内存后返回，**不支持 Range/断点下载**；
-- 下载响应是 `application/octet-stream`，没有 ETag/条件请求；
-- 鉴权失败返回 401/403；body 超过 512 MiB 返回 413；id 不存在返回 404。
+- 原始字节：`Content-Type: application/octet-stream`（默认；其它非 multipart 类型也按原始字节处理）；
+- 浏览器表单：`Content-Type: multipart/form-data; boundary=...`，取第一个带 `filename=` 的文件字段；
+- 长度：`Content-Length` 或 `Transfer-Encoding: chunked` 均可；
+- `Expect: 100-continue`：HTTP/1.1 客户端可以在发送大 body 前等待 `100 Continue`；
+- 单 blob 上限 **512 MiB**；超过返回 413（`Content-Length` 在读取前判断，chunked 在读取过程中判断）；
+- daemon 同时最多处理 **64** 个 blob 上传/下载流，超出返回 429。
 
-因此：
+上传成功返回 200：
 
-- 几十 MB 的文件可以直接走这个接口；
-- 接近 512 MiB 的文件要预留足够内存，并避免并发上传/下载多个大文件；
-- 插件内部读取 `$blob` 的 `path` 时应当流式处理，不要假设 HTTP 层是流式的。
-
-上传示例（PowerShell）：
-
-```powershell
-$headers = @{ Authorization = "Bearer <password>" }
-$body = [IO.File]::ReadAllBytes(".\video.mp4")
-Invoke-RestMethod -Method Post `
-  -Uri "http://127.0.0.1:8787/api/v1/blobs" `
-  -Headers $headers `
-  -ContentType "application/octet-stream" `
-  -Body $body
+```json
+{"id":"sha256:9f2c...e1","size":10485760}
 ```
 
-下载示例：
+响应带 `ETag: "sha256:9f2c...e1"` 与 `Location: /api/v1/blobs/sha256:9f2c...e1`。
 
-```powershell
-Invoke-WebRequest `
-  -Uri "http://127.0.0.1:8787/api/v1/blobs/sha256:<hex>" `
-  -Headers @{ Authorization = "Bearer <password>" } `
-  -OutFile ".\video.mp4"
+### HTTP 下载
+
+`GET /api/v1/blobs/{id}` 从磁盘分块流式返回；`HEAD` 只返回头。响应头：
+
+- `Content-Type: application/octet-stream`
+- `Content-Length`
+- `Accept-Ranges: bytes`
+- `ETag: "sha256:<hex>"`（强校验器；内容寻址，内容不变 id 不变）
+- `Last-Modified`
+- `Cache-Control: no-cache`
+
+#### Range 与条件请求
+
+- `Range: bytes=start-end`、`bytes=start-`、`bytes=-suffix` → 206 + `Content-Range: bytes start-end/total`；
+- 支持单段 Range；多段 Range 按整段 200 返回（不生成 `multipart/byteranges`）；
+- 不可满足的 Range → 416 + `Content-Range: bytes */total`；
+- `If-None-Match` / `If-Modified-Since` 命中 → 304；
+- `If-Match` / `If-Unmodified-Since` 不命中 → 412；
+- `If-Range` 的校验器不匹配时忽略 Range，返回 200 整段。
+
+### 断点续传 / 分片上传 / 并行上传
+
+一次整体上传适合几十 MB 到 512 MiB 的文件；需要断点续传、重传失败分片或并行上传时，使用 S3 风格的 part 会话（JSON 变体）。所有分片先落在 `temp_dir/uploads/<uploadId>/`，`complete` 时按顺序拼装并计算最终 SHA-256。
+
+1. 创建会话：
+
+```http
+POST /api/v1/blobs/uploads
+Authorization: Bearer <password-or-session>
+```
+
+```json
+{"uploadId":"<32 hex>","partsUrl":"/api/v1/blobs/uploads/<uploadId>/parts"}
+```
+
+2. 上传一个分片（`partNumber` 1..10000）：
+
+```http
+PUT /api/v1/blobs/uploads/<uploadId>/parts/1
+Content-Type: application/octet-stream
+Content-Length: 67108864
+```
+
+分片 body 同样支持 `Transfer-Encoding: chunked`。返回：
+
+```json
+{"partNumber":1,"size":67108864,"etag":"sha256:..."}
+```
+
+同一个 `partNumber` 可以重复 PUT，后一次覆盖前一次，因此失败分片直接重传即可；不同 `partNumber` 可以并行上传。
+
+3. 查询已完成分片（断点续传入口）：
+
+```http
+GET /api/v1/blobs/uploads/<uploadId>
+```
+
+```json
+{"uploadId":"...","totalSize":134217728,"parts":[{"partNumber":1,"size":67108864,"etag":"sha256:..."}]}
+```
+
+4. 完成拼装：
+
+```http
+POST /api/v1/blobs/uploads/<uploadId>/complete
+Content-Type: application/json
+
+{"parts":[{"partNumber":1,"etag":"sha256:..."},{"partNumber":2,"etag":"sha256:..."}]}
+```
+
+`parts` 必须按 `partNumber` 严格递增；`etag` 可省略，但建议带上以便服务端校验。body 为空时按现存全部分片升序拼装。成功返回与整体上传相同的 `{"id":"sha256:...","size":...}`，并删除会话。未列出的分片会被丢弃。
+
+5. 中止会话：
+
+```http
+DELETE /api/v1/blobs/uploads/<uploadId>
+```
+
+会话和分片遵循 `temp_dir` 的 TTL（默认 2 小时，每 5 分钟扫描）。空会话有标记文件，不会被当作空目录立即删除；超过 TTL 未活动仍会被清理。
+
+### 大文件：`/api/v1/file` 文件包
+
+单 blob 上限仍是 **512 MiB**；更大的文件不再塞进一个 blob，而是做成「文件包」：多个 part + 一个 manifest，文件 id 是整个文件的 SHA-256。每个 part 仍受 512 MiB 限制，`complete` 只校验并哈希 part，不会把 part 再复制成一个大文件。
+
+```text
+POST   /api/v1/file/uploads                    创建文件上传会话
+PUT    /api/v1/file/uploads/{id}/parts/{n}     上传 part（≤ max_file_part_bytes = 512 MiB）
+GET    /api/v1/file/uploads/{id}               查询已完成 part
+POST   /api/v1/file/uploads/{id}/complete      校验/哈希并提交为文件包
+DELETE /api/v1/file/uploads/{id}               中止
+
+GET    /api/v1/file/{sha256:...}               流式下载，支持 Range/HEAD/条件请求
+HEAD   /api/v1/file/{sha256:...}
+```
+
+`complete` 的 body（`parts` 可省略，表示全部现存 part 按序）：
+
+```json
+{
+  "name": "proxmox-ve_9.2-1.iso",
+  "mimeType": "application/x-iso9660-image",
+  "parts": [
+    {"partNumber": 1, "etag": "sha256:..."},
+    {"partNumber": 2, "etag": "sha256:..."}
+  ]
+}
+```
+
+返回：
+
+```json
+{"id":"sha256:4e88...","size":1706178560,"name":"...","mimeType":"..."}
+```
+
+文件包存放在 `temp_dir/files/<sha256>/`：`manifest.json` + `part-00001` 等。文件 id 是整文件 SHA-256；同样的内容重复提交会复用已有文件包（整文件级去重）。当前 `max_file_bytes` 为 16 GiB，part 数上限 10000；清理按 `manifest.json` 的 mtime 整体删除，下载会 touch manifest。
+
+#### 工具参数里的 `$file`
+
+大文件不要用 `$blob`（它表示单个 blob）。工具调用可以传：
+
+```json
+{
+  "input": {"$file": "sha256:4e88..."}
+}
+```
+
+宿主解析为：
+
+```json
+{
+  "$file": "sha256:4e88...",
+  "dir": "/var/lib/svcd/temp/files/4e88...",
+  "manifest": "/var/lib/svcd/temp/files/4e88.../manifest.json",
+  "size": 1706178560,
+  "name": "proxmox-ve_9.2-1.iso",
+  "mimeType": "application/x-iso9660-image"
+}
+```
+
+插件读取 `manifest.json` 的 `parts`，按 `partNumber` 顺序读 `part-<n>` 文件；不愿读目录的插件也可以直接走 `GET /api/v1/file/{id}` 流式下载。`$blob` 的旧语义完全不变。
+
+### 示例（curl）
+
+整体上传（原始字节）：
+
+```bash
+curl -X POST --data-binary @video.mp4 \
+  -H "Authorization: Bearer <password>" \
+  -H "Content-Type: application/octet-stream" \
+  http://127.0.0.1:8787/api/v1/blobs
+```
+
+chunked 上传：
+
+```bash
+curl -X POST --http1.1 -H "Transfer-Encoding: chunked" \
+  -H "Authorization: Bearer <password>" \
+  --data-binary @video.mp4 \
+  http://127.0.0.1:8787/api/v1/blobs
+```
+
+表单上传：
+
+```bash
+curl -F "file=@video.mp4" \
+  -H "Authorization: Bearer <password>" \
+  http://127.0.0.1:8787/api/v1/blobs
+```
+
+分段下载：
+
+```bash
+curl -H "Authorization: Bearer <password>" \
+  -H "Range: bytes=0-1048575" \
+  -o first-mib.bin \
+  http://127.0.0.1:8787/api/v1/blobs/sha256:<hex>
+```
+
+断点续传（示意）：
+
+```bash
+TOKEN=<password>
+UPLOAD=$(curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8787/api/v1/blobs/uploads | jq -r .uploadId)
+split -b 64m video.mp4 part-
+curl -X PUT --data-binary @part-aa \
+  -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8787/api/v1/blobs/uploads/$UPLOAD/parts/1
+# 失败/中断后查询已完成分片：
+curl -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8787/api/v1/blobs/uploads/$UPLOAD
+# 完成：
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"parts":[{"partNumber":1,"etag":"sha256:<part1-etag>"}]}' \
+  http://127.0.0.1:8787/api/v1/blobs/uploads/$UPLOAD/complete
 ```
 
 宿主有一个后台清理线程：默认删除 `temp_dir` 下 **超过 2 小时**未访问的文件，每 5 分钟扫描一次。配置项：
@@ -201,8 +376,17 @@ MCP 客户端/门户可以用 `structuredContent.$blob` 或 `resource_link` 中�
 | `$blobPath` 不在 `incoming/` | 宿主返回工具错误，不落盘 |
 | 结果文件超过 512 MiB | 宿主返回工具错误，删除临时文件（尽力） |
 | 写入后哈希失败/IO 错误 | 工具错误；残留文件由后台清理线程按 TTL 删除 |
-| 客户端上传超过 512 MiB | HTTP 413 |
+| 客户端上传超过 512 MiB | HTTP 413（chunked 在读取中判断并删除临时文件） |
+| 文件包某个 part 超过 512 MiB | HTTP 413（`max_file_part_bytes`） |
+| 文件包总大小超过 16 GiB | HTTP 413（`max_file_bytes`） |
 | 客户端没有 blob 权限 | HTTP 401/403 |
+| 下载 Range 不可满足 | HTTP 416 + `Content-Range: bytes */total` |
+| 条件请求 `If-Match` / `If-Unmodified-Since` 不满足 | HTTP 412 |
+| 条件请求 `If-None-Match` / `If-Modified-Since` 命中 | HTTP 304 |
+| 未知 blob id / uploadId | HTTP 404 |
+| 非法 uploadId / partNumber | HTTP 400 |
+| 同时带 `Content-Length` 与 `Transfer-Encoding` | HTTP 400 |
+| 并发 blob 流超过 64 | HTTP 429 |
 
 插件应把 `$blobPath` 失败视为普通工具错误返回给调用者，不要伪造一个不存在的 blob id。
 
@@ -260,7 +444,9 @@ for line in sys.stdin:
 
 ## 10. 相关代码
 
-- `src/blob.rs`：存储、id 校验、路径解析、结果物化。
-- `src/api.rs`：`POST/GET /api/v1/blobs`。
+- `src/blob.rs`：存储、id 校验、路径解析、流式写入、分片会话、文件包 manifest/哈希与结果物化。
+- `src/blob_http.rs`：`/api/v1/blobs` 与 `/api/v1/file` 的流式上传/下载、Range/ETag/条件请求、multipart 与分片路由。
+- `src/http.rs`：请求头解析、`Content-Length`/chunked framing、共享的 body 流式复制、HTTP 日期。
+- `src/api.rs`：`POST/GET /api/v1/blobs` 路由、鉴权与普通管理 API。
 - `src/slot.rs`：注入 `SVCD_TEMP_DIR`，解析 `$blob`，物化 `$blobPath`。
 - `src/mcp.rs`：结果包装与 resource link。
