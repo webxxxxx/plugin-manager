@@ -336,6 +336,7 @@ fn parse(args: &[String]) -> Result<Command, ()> {
             let mut interpreter_args = Vec::new();
             let mut compat = Vec::new();
             let mut platform = None;
+            let mut unsigned = false;
             let mut index = 1;
             while index < args.len() {
                 let arg = &args[index];
@@ -348,6 +349,7 @@ fn parse(args: &[String]) -> Result<Command, ()> {
                         index += 1;
                         key = Some(PathBuf::from(args.get(index).ok_or(())?));
                     }
+                    "--unsigned" => unsigned = true,
                     "--key-id" => {
                         index += 1;
                         key_id = Some(args.get(index).ok_or(())?.clone());
@@ -499,6 +501,7 @@ fn parse(args: &[String]) -> Result<Command, ()> {
                     interpreter_args,
                     compat,
                     platform,
+                    unsigned,
                 })
             })
             .ok_or(())
@@ -1022,7 +1025,7 @@ fn usage() {
     eprintln!("       plugin export <id> [--config-only] [--out <path>]");
     eprintln!("       plugin import <file> [--config <id>] [--no-config] [--force]");
     eprintln!(
-        "       plugin bundle <dir> --key <pem> [-o <out>] [--id <id>] [--version <semver>] [--exec <path>] [--desc <text>] [--key-id <id>] [--from-core] [--interpreter <name>] [--interpreter-version <constraint>] [--interpreter-arg <arg>] [--compat <device[,device...]>] [--platform <triple>]"
+        "       plugin bundle <dir> --key <pem> [-o <out>] [--id <id>] [--version <semver>] [--exec <path>] [--desc <text>] [--key-id <id>] [--from-core] [--interpreter <name>] [--interpreter-version <constraint>] [--interpreter-arg <arg>] [--compat <device[,device...]>] [--platform <triple>] [--unsigned]"
     );
 }
 
@@ -1057,6 +1060,14 @@ mod tests {
         );
         assert!(parse(&args(&["bundle", "src", "--compat"])).is_err());
         assert!(parse(&args(&["bundle", "src", "--platform"])).is_err());
+        assert_eq!(
+            parse(&args(&["bundle", "src", "--unsigned"])).expect("unsigned bundle"),
+            Command::Bundle(crate::bundle::Options {
+                dir: PathBuf::from("src"),
+                unsigned: true,
+                ..Default::default()
+            })
+        );
     }
 
     #[test]
@@ -1215,7 +1226,8 @@ mod tests {
                 interpreter_version: None,
                 interpreter_args: Vec::new(),
                 compat: Vec::new(),
-                platform: None
+                platform: None,
+                unsigned: false
             })
         );
         assert_eq!(
@@ -1246,7 +1258,8 @@ mod tests {
                 interpreter_version: Some(">=5".into()),
                 interpreter_args: vec!["-e".into()],
                 compat: Vec::new(),
-                platform: None
+                platform: None,
+                unsigned: false
             })
         );
         assert!(parse(&args(&["bundle", "a", "b"])).is_err());

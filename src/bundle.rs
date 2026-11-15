@@ -42,6 +42,10 @@ pub struct Options {
     /// Target triple written into the manifest. Defaults to the host triple;
     /// cross-packaging for a device (`aarch64-unknown-linux-musl`) sets it.
     pub platform: Option<String>,
+    /// Produce an unsigned package. Local development only: it installs on a
+    /// host with `allow_insecure_install`, and `plugin verify` reports the
+    /// signature as `missing`.
+    pub unsigned: bool,
 }
 
 struct SourceFile {
@@ -51,20 +55,31 @@ struct SourceFile {
 }
 
 pub fn bundle(options: &Options) -> Result<PathBuf, String> {
-    let key_path = options.key.as_deref().ok_or_else(|| {
-        "bundle requires --key <ed25519-private.pem>; refusing to produce an unsigned package"
-            .to_string()
-    })?;
-    let key_path = fs::canonicalize(key_path)
-        .map_err(|error| format!("read key {}: {}", key_path.display(), error))?;
     let dir = fs::canonicalize(&options.dir)
         .map_err(|error| format!("cannot read {}: {}", options.dir.display(), error))?;
     if !dir.is_dir() {
         return Err(format!("not a directory: {}", dir.display()));
     }
-    if key_path.starts_with(&dir) {
-        return Err("the signing key must not be inside the bundle directory".into());
+    if options.unsigned && (options.key.is_some() || options.key_id.is_some()) {
+        return Err("--unsigned cannot be combined with --key or --key-id".into());
     }
+    let key_path = match (options.key.as_deref(), options.unsigned) {
+        (_, true) => None,
+        (Some(key), false) => {
+            let key = fs::canonicalize(key)
+                .map_err(|error| format!("read key {}: {}", key.display(), error))?;
+            if key.starts_with(&dir) {
+                return Err("the signing key must not be inside the bundle directory".into());
+            }
+            Some(key)
+        }
+        (None, false) => {
+            return Err(
+                "bundle requires --key <ed25519-private.pem> (or --unsigned for local builds)"
+                    .to_string(),
+            )
+        }
+    };
     if let Some(platform) = &options.platform {
         if !valid_platform(platform) {
             return Err(format!("invalid target triple: {:?}", platform));
@@ -107,27 +122,34 @@ pub fn bundle(options: &Options) -> Result<PathBuf, String> {
         return Err("package output must be outside the bundle directory".into());
     }
 
-    let key_id = match &options.key_id {
-        Some(key_id) => key_id.clone(),
-        None => default_key_id(&key_path)?,
+    let signature_bytes = match &key_path {
+        None => None,
+        Some(key_path) => {
+            let key_id = match &options.key_id {
+                Some(key_id) => key_id.clone(),
+                None => default_key_id(key_path)?,
+            };
+            if !package::valid_key_id(&key_id) {
+                return Err(format!("invalid keyId: {} (pass --key-id)", key_id));
+            }
+            let signing_key = read_private_key(key_path)?;
+            let signature = signing_key.sign(&manifest_bytes);
+            let signature = serde_json::json!({
+                "alg": "ed25519",
+                "keyId": key_id,
+                "sig": BASE64.encode(signature.to_bytes()),
+            });
+            Some(
+                serde_json::to_vec(&signature)
+                    .map_err(|error| format!("serialize signature: {}", error))?,
+            )
+        }
     };
-    if !package::valid_key_id(&key_id) {
-        return Err(format!("invalid keyId: {} (pass --key-id)", key_id));
-    }
-    let signing_key = read_private_key(&key_path)?;
-    let signature = signing_key.sign(&manifest_bytes);
-    let signature = serde_json::json!({
-        "alg": "ed25519",
-        "keyId": key_id,
-        "sig": BASE64.encode(signature.to_bytes()),
-    });
-    let signature_bytes = serde_json::to_vec(&signature)
-        .map_err(|error| format!("serialize signature: {}", error))?;
 
-    let mut entries: Vec<(&str, &[u8], u32)> = vec![
-        ("manifest.json", &manifest_bytes, 0o644),
-        ("signature.json", &signature_bytes, 0o644),
-    ];
+    let mut entries: Vec<(&str, &[u8], u32)> = vec![("manifest.json", &manifest_bytes, 0o644)];
+    if let Some(signature_bytes) = &signature_bytes {
+        entries.push(("signature.json", signature_bytes.as_slice(), 0o644));
+    }
     for source in &sources {
         entries.push((source.path.as_str(), source.data.as_slice(), source.mode));
     }
@@ -1113,6 +1135,41 @@ mod tests {
         let error = bundle(&options).expect_err("missing key");
         assert!(error.contains("--key"), "{error}");
         assert!(!out.exists());
+    }
+
+    #[test]
+    fn unsigned_packages_carry_no_signature_and_need_the_insecure_switch() {
+        let source = TempDir::new();
+        let work = TempDir::new();
+        let exec_path = if cfg!(windows) {
+            "payload/bin/tool.cmd"
+        } else {
+            "payload/bin/tool"
+        };
+        write(source.path(), exec_path, b"tool", 0o755);
+
+        let out = work.path().join("unsigned.spk");
+        let options = Options {
+            dir: source.path().to_path_buf(),
+            out: Some(out.clone()),
+            id: Some("demo".into()),
+            unsigned: true,
+            ..Options::default()
+        };
+        let path = bundle(&options).expect("unsigned bundle");
+        let bytes = fs::read(&path).expect("read");
+        let parsed = entries(&bytes);
+        let names: Vec<&str> = parsed.iter().map(|entry| entry.path.as_str()).collect();
+        assert_eq!(names, ["manifest.json", exec_path]);
+
+        let inspection = package::inspect_bytes_with(&bytes, None).expect("inspect");
+        assert_eq!(inspection.signature.state, "missing");
+
+        // A strict install refuses it; only the host-level switch accepts it,
+        // which is exactly the local-development contract of `--unsigned`.
+        assert!(package::verify_bytes(&bytes).is_err());
+        package::verify_bytes_with(&bytes, package::SignatureCheck::AllowUnsigned)
+            .expect("insecure acceptance");
     }
 
     #[test]
