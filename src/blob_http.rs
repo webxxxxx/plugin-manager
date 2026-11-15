@@ -25,6 +25,10 @@ use crate::lan::{AuthKind, Lan};
 const MAX_STREAMS: usize = 64;
 const MULTIPART_OVERHEAD: u64 = 8 * 1024 * 1024;
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
+/// Below this size the explicit read/write loop is cheaper than a syscall that
+/// asks the kernel to set up a file transfer.
+const ZEROCOPY_MIN_BYTES: u64 = 64 * 1024;
+const MAPPED_UPLOAD_MIN_BYTES: u64 = 1024 * 1024;
 
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
@@ -186,6 +190,26 @@ fn upload(stream: &mut TcpStream, head: &http::Head, initial: &[u8]) -> io::Resu
     }
     expect_continue(stream, head)?;
 
+    if multipart.is_none()
+        && crate::zerocopy::mapped_upload_enabled()
+        && matches!(framing, http::Framing::Length(_))
+    {
+        if let http::Framing::Length(length) = framing {
+            if length >= MAPPED_UPLOAD_MIN_BYTES {
+                match blob::Upload::begin_mapped(length) {
+                    Ok(Some(mut upload)) => {
+                        return match upload.write_from(stream, initial) {
+                            Ok(()) => finish_upload(stream, upload),
+                            Err(message) => write_body_error(stream, &message),
+                        };
+                    }
+                    Ok(None) => {}
+                    Err(message) => return write_error(stream, 500, "internal", &message),
+                }
+            }
+        }
+    }
+
     let mut upload = match blob::Upload::begin() {
         Ok(upload) => upload,
         Err(message) => return write_error(stream, 500, "internal", &message),
@@ -218,25 +242,29 @@ fn upload(stream: &mut TcpStream, head: &http::Head, initial: &[u8]) -> io::Resu
     };
     match result {
         Ok(()) if upload.size() == 0 => write_error(stream, 400, "bad_request", "empty blob body"),
-        Ok(()) => match upload.finish() {
-            Ok(meta) => {
-                let body = serde_json::to_vec(&json!({"id": meta.id, "size": meta.size}))
-                    .unwrap_or_default();
-                let headers = vec![
-                    ("ETag".to_string(), format!("\"{}\"", meta.id)),
-                    ("Location".to_string(), format!("/api/v1/blobs/{}", meta.id)),
-                    ("Cache-Control".to_string(), "no-store".to_string()),
-                ];
-                stream.write_all(&http::response_with_headers(
-                    200,
-                    "application/json",
-                    &headers,
-                    &body,
-                ))
-            }
-            Err(message) => write_error(stream, 500, "internal", &message),
-        },
+        Ok(()) => finish_upload(stream, upload),
         Err(message) => write_body_error(stream, &message),
+    }
+}
+
+fn finish_upload(stream: &mut TcpStream, upload: blob::Upload) -> io::Result<()> {
+    match upload.finish() {
+        Ok(meta) => {
+            let body =
+                serde_json::to_vec(&json!({"id": meta.id, "size": meta.size})).unwrap_or_default();
+            let headers = vec![
+                ("ETag".to_string(), format!("\"{}\"", meta.id)),
+                ("Location".to_string(), format!("/api/v1/blobs/{}", meta.id)),
+                ("Cache-Control".to_string(), "no-store".to_string()),
+            ];
+            stream.write_all(&http::response_with_headers(
+                200,
+                "application/json",
+                &headers,
+                &body,
+            ))
+        }
+        Err(message) => write_error(stream, 500, "internal", &message),
     }
 }
 
@@ -278,6 +306,27 @@ fn upload_part(
     }
     expect_continue(stream, head)?;
 
+    // A known Content-Length can be preallocated and written through a windowed
+    // mapping: socket bytes land in page cache without an intermediate user
+    // buffer. The ordinary writer remains the fallback for filesystems that
+    // cannot reserve blocks, chunked bodies, and small parts.
+    if crate::zerocopy::mapped_upload_enabled() {
+        if let http::Framing::Length(length) = framing {
+            if length >= MAPPED_UPLOAD_MIN_BYTES {
+                match blob::PartWriter::begin_mapped(upload_id, part, length) {
+                    Ok(Some(mut writer)) => {
+                        return match writer.write_from(stream, initial) {
+                            Ok(()) => finish_part(stream, writer),
+                            Err(message) => write_body_error(stream, &message),
+                        };
+                    }
+                    Ok(None) => {}
+                    Err(message) => return write_error(stream, 500, "internal", &message),
+                }
+            }
+        }
+    }
+
     let mut writer = match blob::PartWriter::begin(upload_id, part) {
         Ok(writer) => writer,
         Err(message) => {
@@ -303,25 +352,29 @@ fn upload_part(
     };
     match copied {
         Ok(_) if writer.size() == 0 => write_error(stream, 400, "bad_request", "empty part body"),
-        Ok(_) => match writer.finish() {
-            Ok(info) => {
-                let body = serde_json::to_vec(&json!({
-                    "partNumber": info.number,
-                    "size": info.size,
-                    "etag": info.etag,
-                }))
-                .unwrap_or_default();
-                let headers = vec![("ETag".to_string(), format!("\"{}\"", info.etag))];
-                stream.write_all(&http::response_with_headers(
-                    200,
-                    "application/json",
-                    &headers,
-                    &body,
-                ))
-            }
-            Err(message) => write_error(stream, 500, "internal", &message),
-        },
+        Ok(_) => finish_part(stream, writer),
         Err(message) => write_body_error(stream, &message),
+    }
+}
+
+fn finish_part(stream: &mut TcpStream, writer: blob::PartWriter) -> io::Result<()> {
+    match writer.finish() {
+        Ok(info) => {
+            let body = serde_json::to_vec(&json!({
+                "partNumber": info.number,
+                "size": info.size,
+                "etag": info.etag,
+            }))
+            .unwrap_or_default();
+            let headers = vec![("ETag".to_string(), format!("\"{}\"", info.etag))];
+            stream.write_all(&http::response_with_headers(
+                200,
+                "application/json",
+                &headers,
+                &body,
+            ))
+        }
+        Err(message) => write_error(stream, 500, "internal", &message),
     }
 }
 
@@ -503,6 +556,13 @@ fn download(
     let Some(file) = file.as_mut() else {
         return stream.flush();
     };
+    if length >= ZEROCOPY_MIN_BYTES {
+        match crate::zerocopy::send_file_range(file, stream, start, length) {
+            Ok(true) => return stream.flush(),
+            Ok(false) => {}
+            Err(error) => return Err(error),
+        }
+    }
     if start > 0 {
         file.seek(SeekFrom::Start(start))?;
     }
@@ -639,7 +699,23 @@ fn stream_file_range(
         }
         let path = directory.join(format!("part-{}", part.number));
         let mut file = File::open(&path)?;
-        file.seek(SeekFrom::Start(local_start))?;
+        if want >= ZEROCOPY_MIN_BYTES {
+            match crate::zerocopy::send_file_range(&mut file, stream, local_start, want) {
+                Ok(true) => {
+                    remaining = remaining.saturating_sub(want);
+                    if remaining == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                Ok(false) => {
+                    file.seek(SeekFrom::Start(local_start))?;
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            file.seek(SeekFrom::Start(local_start))?;
+        }
         let mut take = want;
         while take > 0 {
             let request = std::cmp::min(buffer.len() as u64, take) as usize;
@@ -882,6 +958,7 @@ enum MpState {
     Preamble,
     Headers,
     Body,
+    Boundary,
 }
 
 impl MultipartParser {
@@ -903,7 +980,40 @@ impl MultipartParser {
         if self.done {
             return Ok(());
         }
+        // The common case is a large file body with no partial line in the
+        // parser buffer: hand the chunk straight to the upload writer instead
+        // of copying the whole 64 KiB into `self.buffer` first.
+        if matches!(self.state, MpState::Body) && self.buffer.is_empty() {
+            return self.push_body_direct(chunk, upload);
+        }
         self.buffer.extend_from_slice(chunk);
+        self.advance(upload)
+    }
+
+    fn push_body_direct(&mut self, chunk: &[u8], upload: &mut blob::Upload) -> Result<(), String> {
+        let mut delimiter = Vec::with_capacity(self.boundary.len() + 2);
+        delimiter.extend_from_slice(b"\r\n");
+        delimiter.extend_from_slice(&self.boundary);
+        if let Some(position) = find(chunk, &delimiter) {
+            if self.capturing {
+                upload.write(&chunk[..position])?;
+                self.capturing = false;
+            }
+            let rest = &chunk[position + delimiter.len()..];
+            self.buffer.extend_from_slice(rest);
+            self.state = MpState::Boundary;
+            return self.advance(upload);
+        }
+        let keep = keep_boundary_tail(chunk, &delimiter);
+        let take = chunk.len() - keep;
+        if self.capturing {
+            upload.write(&chunk[..take])?;
+        }
+        self.buffer.extend_from_slice(&chunk[take..]);
+        Ok(())
+    }
+
+    fn advance(&mut self, upload: &mut blob::Upload) -> Result<(), String> {
         loop {
             match self.state {
                 MpState::Preamble => {
@@ -938,9 +1048,9 @@ impl MultipartParser {
                     delimiter.extend_from_slice(b"\r\n");
                     delimiter.extend_from_slice(&self.boundary);
                     let Some(position) = find(&self.buffer, &delimiter) else {
-                        let keep = delimiter.len();
-                        if self.buffer.len() > keep {
-                            let take = self.buffer.len() - keep;
+                        let keep = keep_boundary_tail(&self.buffer, &delimiter);
+                        let take = self.buffer.len() - keep;
+                        if take > 0 {
                             if self.capturing {
                                 upload.write(&self.buffer[..take])?;
                             }
@@ -948,14 +1058,17 @@ impl MultipartParser {
                         }
                         return Ok(());
                     };
-                    if self.buffer.len() < position + delimiter.len() + 2 {
-                        return Ok(());
-                    }
                     if self.capturing {
                         upload.write(&self.buffer[..position])?;
                         self.capturing = false;
                     }
                     self.buffer.drain(..position + delimiter.len());
+                    self.state = MpState::Boundary;
+                }
+                MpState::Boundary => {
+                    if self.buffer.len() < 2 {
+                        return Ok(());
+                    }
                     if self.buffer[..2] == *b"--" {
                         self.done = true;
                         self.buffer.clear();
@@ -964,9 +1077,9 @@ impl MultipartParser {
                     if self.buffer[..2] == *b"\r\n" {
                         self.buffer.drain(..2);
                         self.state = MpState::Headers;
-                    } else {
-                        return Err("invalid multipart boundary".into());
+                        continue;
                     }
+                    return Err("invalid multipart boundary".into());
                 }
             }
         }
@@ -997,6 +1110,18 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+/// How many trailing bytes might be the beginning of `delimiter`? Keeping only
+/// that suffix lets the next push process almost the whole chunk directly.
+fn keep_boundary_tail(data: &[u8], delimiter: &[u8]) -> usize {
+    let max = std::cmp::min(data.len(), delimiter.len().saturating_sub(1));
+    for length in (1..=max).rev() {
+        if data[data.len() - length..] == delimiter[..length] {
+            return length;
+        }
+    }
+    0
 }
 
 // -- Session metadata endpoints (ordinary buffered JSON) --------------------

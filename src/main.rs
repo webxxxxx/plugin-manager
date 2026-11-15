@@ -51,6 +51,8 @@ mod uichannel;
 mod wake;
 #[cfg(feature = "http")]
 mod webui;
+#[cfg(feature = "http")]
+mod zerocopy;
 
 fn main() {
     #[cfg(windows)]

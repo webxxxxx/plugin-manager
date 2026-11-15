@@ -1647,6 +1647,118 @@ fn blob_download_supports_range_etag_and_conditionals() {
 }
 
 #[test]
+fn file_part_mapped_upload_round_trip() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let created = request(&address, "POST", "/api/v1/file/uploads", "", b"");
+    let upload_id = created.body["uploadId"]
+        .as_str()
+        .expect("upload id")
+        .to_string();
+    let content = vec![0x5a; 2 * 1024 * 1024];
+    let part = raw_request(
+        &address,
+        "PUT",
+        &format!("/api/v1/file/uploads/{}/parts/1", upload_id),
+        "application/octet-stream",
+        &content,
+    );
+    assert_eq!(part.status, 200, "{:?}", part.body);
+    let etag = json_body(&part)["etag"]
+        .as_str()
+        .expect("part etag")
+        .to_string();
+    let complete = request(
+        &address,
+        "POST",
+        &format!("/api/v1/file/uploads/{}/complete", upload_id),
+        "application/json",
+        serde_json::to_string(&json!({"parts": [{"partNumber": 1, "etag": etag}]}))
+            .expect("complete body")
+            .as_bytes(),
+    );
+    assert_eq!(complete.status, 200, "{}", complete.body);
+    let id = complete.body["id"].as_str().expect("file id");
+    let expected = format!("sha256:{}", hex_sha256(&content));
+    assert_eq!(id, expected);
+    let download = raw_request(&address, "GET", &format!("/api/v1/file/{}", id), "", b"");
+    assert_eq!(download.status, 200);
+    assert_eq!(download.body.len(), content.len());
+    assert_eq!(download.body, content);
+}
+
+#[test]
+fn blob_mapped_upload_and_multipart_complete_round_trip() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let direct = vec![0x33; 2 * 1024 * 1024];
+    let put = raw_request(
+        &address,
+        "POST",
+        "/api/v1/blobs",
+        "application/octet-stream",
+        &direct,
+    );
+    assert_eq!(put.status, 200, "{:?}", put.body);
+    let direct_id = format!("sha256:{}", hex_sha256(&direct));
+    assert_eq!(json_body(&put)["id"].as_str(), Some(direct_id.as_str()));
+    let ranged = raw_request_with(
+        &address,
+        "GET",
+        &format!("/api/v1/blobs/{}", direct_id),
+        "",
+        b"",
+        &[("Range", "bytes=1048576-2097151")],
+    );
+    assert_eq!(ranged.status, 206);
+    assert_eq!(ranged.body, direct[1024 * 1024..2 * 1024 * 1024]);
+
+    let created = request(&address, "POST", "/api/v1/blobs/uploads", "", b"");
+    let upload_id = created.body["uploadId"]
+        .as_str()
+        .expect("upload id")
+        .to_string();
+    let first = vec![0x11; 2 * 1024 * 1024];
+    let second = vec![0x22; 2 * 1024 * 1024];
+    for (number, content) in [(1, first.as_slice()), (2, second.as_slice())] {
+        let part = raw_request(
+            &address,
+            "PUT",
+            &format!("/api/v1/blobs/uploads/{}/parts/{}", upload_id, number),
+            "application/octet-stream",
+            content,
+        );
+        assert_eq!(part.status, 200, "{:?}", part.body);
+    }
+    let complete = request(
+        &address,
+        "POST",
+        &format!("/api/v1/blobs/uploads/{}/complete", upload_id),
+        "application/json",
+        b"{\"parts\":[{\"partNumber\":1},{\"partNumber\":2}]}",
+    );
+    assert_eq!(complete.status, 200, "{}", complete.body);
+    let mut expected = first.clone();
+    expected.extend_from_slice(&second);
+    let expected_id = format!("sha256:{}", hex_sha256(&expected));
+    assert_eq!(complete.body["id"].as_str(), Some(expected_id.as_str()));
+
+    let downloaded = raw_request(
+        &address,
+        "GET",
+        &format!("/api/v1/blobs/{}", expected_id),
+        "",
+        b"",
+    );
+    assert_eq!(downloaded.status, 200);
+    assert_eq!(downloaded.body, expected);
+}
+
+#[test]
 fn chunked_bodies_work_for_management_json_routes() {
     let mut sandbox = Sandbox::new();
     sandbox.start_daemon();

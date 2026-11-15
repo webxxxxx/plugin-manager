@@ -114,7 +114,10 @@ pub fn framing(headers: &[(String, String)]) -> Result<Framing, String> {
 /// accumulating the whole body.
 pub struct ChunkedDecoder {
     state: ChunkState,
+    /// Only a partial size line or trailer line lives here; chunk data is
+    /// passed straight from the caller's input slice to the sink.
     buffer: Vec<u8>,
+    pending_cr: bool,
     remaining: u64,
     total: u64,
     max: u64,
@@ -134,6 +137,7 @@ impl ChunkedDecoder {
         ChunkedDecoder {
             state: ChunkState::Size,
             buffer: Vec::new(),
+            pending_cr: false,
             remaining: 0,
             total: 0,
             max,
@@ -148,89 +152,149 @@ impl ChunkedDecoder {
         self.total
     }
 
-    pub fn feed<F>(&mut self, input: &[u8], sink: &mut F) -> Result<(), String>
+    pub fn feed<F>(&mut self, mut input: &[u8], sink: &mut F) -> Result<(), String>
     where
         F: FnMut(&[u8]) -> Result<(), String> + ?Sized,
     {
-        if self.state == ChunkState::Done {
-            return Ok(());
-        }
-        self.buffer.extend_from_slice(input);
         loop {
             match self.state {
                 ChunkState::Size => {
-                    let Some(position) = find_crlf(&self.buffer) else {
-                        if self.buffer.len() > 8 * 1024 {
+                    if let Some(position) = find_crlf(&self.buffer) {
+                        let line = self.buffer[..position].to_vec();
+                        self.buffer.drain(..position + 2);
+                        self.apply_size(&line)?;
+                        continue;
+                    }
+                    if input.is_empty() {
+                        return Ok(());
+                    }
+                    if self.buffer.last() == Some(&b'\r') && input.first() == Some(&b'\n') {
+                        self.buffer.push(b'\n');
+                        input = &input[1..];
+                        let line = std::mem::take(&mut self.buffer);
+                        self.apply_size(&line)?;
+                        continue;
+                    }
+                    if let Some(position) = find_crlf(input) {
+                        if self.buffer.len() + position > 8 * 1024 {
                             return Err("invalid chunk size line".into());
                         }
-                        return Ok(());
-                    };
-                    let line = self.buffer[..position].to_vec();
-                    self.buffer.drain(..position + 2);
-                    let size_text = line.split(|byte| *byte == b';').next().unwrap_or(&line);
-                    let size_text = std::str::from_utf8(size_text)
-                        .map_err(|_| "invalid chunk size".to_string())?
-                        .trim();
-                    if size_text.is_empty() || size_text.len() > 16 {
-                        return Err("invalid chunk size".into());
+                        self.buffer.extend_from_slice(&input[..position]);
+                        input = &input[position + 2..];
+                        let line = std::mem::take(&mut self.buffer);
+                        self.apply_size(&line)?;
+                        continue;
                     }
-                    let size = u64::from_str_radix(size_text, 16)
-                        .map_err(|_| "invalid chunk size".to_string())?;
-                    if size == 0 {
-                        self.state = ChunkState::Trailer;
-                    } else {
-                        self.remaining = size;
-                        self.state = ChunkState::Data;
+                    if self.buffer.len() + input.len() > 8 * 1024 {
+                        return Err("invalid chunk size line".into());
                     }
+                    self.buffer.extend_from_slice(input);
+                    return Ok(());
                 }
                 ChunkState::Data => {
-                    if self.buffer.is_empty() {
+                    if input.is_empty() {
                         return Ok(());
                     }
-                    let take = std::cmp::min(self.buffer.len() as u64, self.remaining) as usize;
+                    let take = std::cmp::min(input.len() as u64, self.remaining) as usize;
                     if self.total.saturating_add(take as u64) > self.max {
                         return Err("request body is too large".into());
                     }
-                    sink(&self.buffer[..take])?;
-                    self.buffer.drain(..take);
+                    sink(&input[..take])?;
                     self.total += take as u64;
                     self.remaining -= take as u64;
+                    input = &input[take..];
                     if self.remaining == 0 {
                         self.state = ChunkState::DataCrlf;
                     }
                 }
                 ChunkState::DataCrlf => {
-                    if self.buffer.is_empty() {
-                        return Ok(());
-                    }
-                    if self.buffer.len() == 1 && self.buffer[0] == b'\r' {
-                        return Ok(());
-                    }
-                    if self.buffer.len() >= 2 && self.buffer[..2] == *b"\r\n" {
-                        self.buffer.drain(..2);
+                    if self.pending_cr {
+                        if input.is_empty() {
+                            return Ok(());
+                        }
+                        if input[0] != b'\n' {
+                            return Err("invalid chunk terminator".into());
+                        }
+                        input = &input[1..];
+                        self.pending_cr = false;
                         self.state = ChunkState::Size;
                         continue;
                     }
-                    return Err("invalid chunk terminator".into());
-                }
-                ChunkState::Trailer => {
-                    let Some(position) = find_crlf(&self.buffer) else {
-                        if self.buffer.len() > 8 * 1024 {
-                            return Err("chunked trailer is too large".into());
-                        }
-                        return Ok(());
-                    };
-                    let empty = position == 0;
-                    self.buffer.drain(..position + 2);
-                    if empty {
-                        self.state = ChunkState::Done;
-                        self.buffer.clear();
+                    if input.is_empty() {
                         return Ok(());
                     }
+                    if input[0] != b'\r' {
+                        return Err("invalid chunk terminator".into());
+                    }
+                    if input.len() == 1 {
+                        self.pending_cr = true;
+                        return Ok(());
+                    }
+                    if input[1] != b'\n' {
+                        return Err("invalid chunk terminator".into());
+                    }
+                    input = &input[2..];
+                    self.state = ChunkState::Size;
+                }
+                ChunkState::Trailer => {
+                    if let Some(position) = find_crlf(&self.buffer) {
+                        let empty = position == 0;
+                        self.buffer.drain(..position + 2);
+                        if empty {
+                            self.state = ChunkState::Done;
+                            self.buffer.clear();
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    if input.is_empty() {
+                        return Ok(());
+                    }
+                    if self.buffer.last() == Some(&b'\r') && input.first() == Some(&b'\n') {
+                        self.buffer.push(b'\n');
+                        input = &input[1..];
+                        continue;
+                    }
+                    if let Some(position) = find_crlf(input) {
+                        let empty = self.buffer.is_empty() && position == 0;
+                        self.buffer.extend_from_slice(&input[..position]);
+                        input = &input[position + 2..];
+                        if empty {
+                            self.state = ChunkState::Done;
+                            self.buffer.clear();
+                            return Ok(());
+                        }
+                        self.buffer.clear();
+                        continue;
+                    }
+                    if self.buffer.len() + input.len() > 8 * 1024 {
+                        return Err("chunked trailer is too large".into());
+                    }
+                    self.buffer.extend_from_slice(input);
+                    return Ok(());
                 }
                 ChunkState::Done => return Ok(()),
             }
         }
+    }
+
+    fn apply_size(&mut self, line: &[u8]) -> Result<(), String> {
+        let size_text = line.split(|byte| *byte == b';').next().unwrap_or(line);
+        let size_text = std::str::from_utf8(size_text)
+            .map_err(|_| "invalid chunk size".to_string())?
+            .trim();
+        if size_text.is_empty() || size_text.len() > 16 {
+            return Err("invalid chunk size".into());
+        }
+        let size =
+            u64::from_str_radix(size_text, 16).map_err(|_| "invalid chunk size".to_string())?;
+        if size == 0 {
+            self.state = ChunkState::Trailer;
+        } else {
+            self.remaining = size;
+            self.state = ChunkState::Data;
+        }
+        Ok(())
     }
 }
 

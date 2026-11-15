@@ -6,7 +6,9 @@
 //! uploaded and downloaded through the management API.
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(any(feature = "http", test))]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(any(feature = "http", test))]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "http")]
+use memmap2::MmapOptions;
 #[cfg(feature = "http")]
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -59,6 +63,7 @@ pub struct Upload {
     hasher: Sha256,
     temp: PathBuf,
     size: u64,
+    mapped_length: Option<u64>,
     committed: bool,
 }
 
@@ -76,15 +81,55 @@ impl Upload {
             hasher: Sha256::new(),
             temp,
             size: 0,
+            mapped_length: None,
             committed: false,
         })
+    }
+
+    /// Preallocate a whole blob and write it through a windowed writable
+    /// mapping. `Ok(None)` means the filesystem cannot reserve blocks and the
+    /// caller should use the streaming writer.
+    #[cfg(feature = "http")]
+    pub fn begin_mapped(length: u64) -> Result<Option<Upload>, String> {
+        if length == 0 || length > MAX_BLOB_BYTES {
+            return Ok(None);
+        }
+        let directory = dir();
+        fs::create_dir_all(&directory)
+            .map_err(|error| format!("create {}: {}", directory.display(), error))?;
+        let temp = directory.join(format!(".upload-{}-{}", std::process::id(), next_temp()));
+        let Some(file) = open_mapped(&temp, length)? else {
+            let _ = fs::remove_file(&temp);
+            return Ok(None);
+        };
+        Ok(Some(Upload {
+            file,
+            hasher: Sha256::new(),
+            temp,
+            size: 0,
+            mapped_length: Some(length),
+            committed: false,
+        }))
     }
 
     pub fn size(&self) -> u64 {
         self.size
     }
 
+    #[cfg(feature = "http")]
+    pub fn write_from<R: Read>(&mut self, reader: &mut R, initial: &[u8]) -> Result<(), String> {
+        let length = self
+            .mapped_length
+            .ok_or_else(|| "upload is not mapped".to_string())?;
+        self.hasher = write_mapped(&self.file, &self.temp, length, reader, initial)?;
+        self.size = length;
+        Ok(())
+    }
+
     pub fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        if self.mapped_length.is_some() {
+            return Err("mapped upload cannot use write".into());
+        }
         let size = self.size.saturating_add(bytes.len() as u64);
         if size > MAX_FILE_PART_BYTES {
             return Err("blob is too large".into());
@@ -98,6 +143,11 @@ impl Upload {
     }
 
     pub fn finish(mut self) -> Result<Meta, String> {
+        if let Some(length) = self.mapped_length {
+            if self.size != length {
+                return Err("mapped upload is incomplete".into());
+            }
+        }
         self.file
             .sync_all()
             .map_err(|error| format!("sync {}: {}", self.temp.display(), error))?;
@@ -257,6 +307,7 @@ pub struct PartWriter {
     etag_path: PathBuf,
     number: u32,
     size: u64,
+    mapped_length: Option<u64>,
     committed: bool,
 }
 
@@ -284,15 +335,68 @@ impl PartWriter {
             temp,
             number,
             size: 0,
+            mapped_length: None,
             committed: false,
         })
+    }
+
+    /// Preallocate a part and write it through a windowed writable mapping.
+    /// `Ok(None)` means this filesystem cannot reserve the blocks, so the
+    /// caller must use the ordinary streaming writer.
+    pub fn begin_mapped(
+        upload_id: &str,
+        number: u32,
+        length: u64,
+    ) -> Result<Option<PartWriter>, String> {
+        if number == 0 || number > MAX_PART_NUMBER {
+            return Err("part number must be between 1 and 10000".into());
+        }
+        if length == 0 || length > MAX_FILE_PART_BYTES {
+            return Ok(None);
+        }
+        let directory = upload_dir(upload_id)?;
+        if !directory.is_dir() {
+            return Err("unknown upload".into());
+        }
+        touch(&directory.join("session"));
+        let temp = directory.join(format!(".part-{}-{}.tmp", number, next_temp()));
+        let Some(file) = open_mapped(&temp, length)? else {
+            let _ = fs::remove_file(&temp);
+            return Ok(None);
+        };
+        Ok(Some(PartWriter {
+            file,
+            hasher: Sha256::new(),
+            part: directory.join(format!("part-{}", number)),
+            etag_path: directory.join(format!("part-{}.etag", number)),
+            temp,
+            number,
+            size: 0,
+            mapped_length: Some(length),
+            committed: false,
+        }))
     }
 
     pub fn size(&self) -> u64 {
         self.size
     }
 
+    /// Read exactly the preallocated length into a sequence of writable
+    /// mappings. This avoids copying socket bytes through a user buffer on the
+    /// way to the page cache; hashing reads the same mapped pages.
+    pub fn write_from<R: Read>(&mut self, reader: &mut R, initial: &[u8]) -> Result<(), String> {
+        let length = self
+            .mapped_length
+            .ok_or_else(|| "part writer is not mapped".to_string())?;
+        self.hasher = write_mapped(&self.file, &self.temp, length, reader, initial)?;
+        self.size = length;
+        Ok(())
+    }
+
     pub fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        if self.mapped_length.is_some() {
+            return Err("mapped part writer cannot use write".into());
+        }
         let size = self.size.saturating_add(bytes.len() as u64);
         if size > MAX_FILE_PART_BYTES {
             return Err("blob is too large".into());
@@ -306,6 +410,11 @@ impl PartWriter {
     }
 
     pub fn finish(mut self) -> Result<PartInfo, String> {
+        if let Some(length) = self.mapped_length {
+            if self.size != length {
+                return Err("mapped part is incomplete".into());
+            }
+        }
         self.file
             .sync_all()
             .map_err(|error| format!("sync {}: {}", self.temp.display(), error))?;
@@ -360,6 +469,19 @@ pub fn complete_upload(
     if selected.is_empty() {
         return Err("no parts uploaded".into());
     }
+    let total: u64 = selected.iter().map(|part| part.size).sum();
+    if total > MAX_BLOB_BYTES {
+        return Err("blob is too large".into());
+    }
+    if total >= MAPPED_UPLOAD_MIN && crate::zerocopy::mapped_upload_enabled() {
+        if let Ok(Some(mut upload)) = Upload::begin_mapped(total) {
+            let mut reader = PartReader::new(&directory, &selected);
+            upload.write_from(&mut reader, &[])?;
+            let meta = upload.finish()?;
+            let _ = fs::remove_dir_all(&directory);
+            return Ok(meta);
+        }
+    }
     let mut upload = Upload::begin()?;
     let mut buffer = [0u8; 64 * 1024];
     for part in selected {
@@ -379,6 +501,68 @@ pub fn complete_upload(
     let meta = upload.finish()?;
     let _ = fs::remove_dir_all(&directory);
     Ok(meta)
+}
+
+#[cfg(feature = "http")]
+const MAPPED_UPLOAD_MIN: u64 = 1024 * 1024;
+
+#[cfg(feature = "http")]
+struct PartReader {
+    parts: Vec<(PathBuf, u64)>,
+    index: usize,
+    file: Option<fs::File>,
+    remaining: u64,
+}
+
+#[cfg(feature = "http")]
+impl PartReader {
+    fn new(directory: &Path, parts: &[PartInfo]) -> PartReader {
+        PartReader {
+            parts: parts
+                .iter()
+                .map(|part| (directory.join(format!("part-{}", part.number)), part.size))
+                .collect(),
+            index: 0,
+            file: None,
+            remaining: 0,
+        }
+    }
+}
+
+#[cfg(feature = "http")]
+impl Read for PartReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if self.file.is_none() {
+                if self.index >= self.parts.len() {
+                    return Ok(0);
+                }
+                let (path, size) = &self.parts[self.index];
+                self.file = Some(fs::File::open(path)?);
+                self.remaining = *size;
+                self.index += 1;
+                continue;
+            }
+            if self.remaining == 0 {
+                self.file = None;
+                continue;
+            }
+            let file = self.file.as_mut().expect("part reader file");
+            let want = std::cmp::min(buffer.len() as u64, self.remaining) as usize;
+            let read = file.read(&mut buffer[..want])?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "part reader reached EOF",
+                ));
+            }
+            self.remaining -= read as u64;
+            return Ok(read);
+        }
+    }
 }
 
 #[cfg(feature = "http")]
@@ -518,24 +702,22 @@ pub fn complete_file(
 
     let mut hasher = Sha256::new();
     let mut size = 0u64;
-    let mut buffer = [0u8; 64 * 1024];
     for part in &selected {
         let path = directory.join(format!("part-{}", part.number));
-        let mut file =
+        let file =
             fs::File::open(&path).map_err(|error| format!("open {}: {}", path.display(), error))?;
-        loop {
-            let read = file
-                .read(&mut buffer)
-                .map_err(|error| format!("read {}: {}", path.display(), error))?;
-            if read == 0 {
-                break;
-            }
-            size = size.saturating_add(read as u64);
-            if size > MAX_FILE_BYTES {
-                return Err("file is too large".into());
-            }
-            hasher.update(&buffer[..read]);
+        let actual = file
+            .metadata()
+            .map_err(|error| format!("stat {}: {}", path.display(), error))?
+            .len();
+        if actual != part.size {
+            return Err("part sizes changed while completing the file".into());
         }
+        size = size.saturating_add(actual);
+        if size > MAX_FILE_BYTES {
+            return Err("file is too large".into());
+        }
+        update_hash_mapped(&mut hasher, &file, &path, actual)?;
     }
     if size != declared {
         return Err("part sizes changed while completing the file".into());
@@ -629,6 +811,147 @@ fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
 #[cfg(any(feature = "http", test))]
 fn next_temp() -> u64 {
     NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(feature = "http")]
+fn open_mapped(path: &Path, length: u64) -> Result<Option<fs::File>, String> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|error| format!("create {}: {}", path.display(), error))?;
+    file.set_len(length)
+        .map_err(|error| format!("size {}: {}", path.display(), error))?;
+    match crate::zerocopy::preallocate(&file, length) {
+        Ok(true) => Ok(Some(file)),
+        _ => Ok(None),
+    }
+}
+
+#[cfg(feature = "http")]
+fn write_mapped<R: Read>(
+    file: &fs::File,
+    temp: &Path,
+    length: u64,
+    reader: &mut R,
+    initial: &[u8],
+) -> Result<Sha256, String> {
+    const WINDOW: u64 = 8 * 1024 * 1024;
+    let mut hasher = Sha256::new();
+    let mut offset = 0u64;
+    let mut initial_at = 0usize;
+    while offset < length {
+        let window = std::cmp::min(WINDOW, length - offset);
+        let mut map = unsafe {
+            MmapOptions::new()
+                .offset(offset)
+                .len(window as usize)
+                .map_mut(file)
+        }
+        .map_err(|error| format!("map {}: {}", temp.display(), error))?;
+        let mut at = 0usize;
+        if initial_at < initial.len() {
+            let take = std::cmp::min(initial.len() - initial_at, window as usize);
+            map[..take].copy_from_slice(&initial[initial_at..initial_at + take]);
+            initial_at += take;
+            at = take;
+        }
+        while at < window as usize {
+            let read = reader
+                .read(&mut map[at..])
+                .map_err(|error| format!("read request body: {}", error))?;
+            if read == 0 {
+                return Err("truncated request body".into());
+            }
+            at += read;
+        }
+        hasher.update(&map[..]);
+        offset += window;
+    }
+    Ok(hasher)
+}
+
+#[cfg(feature = "http")]
+fn update_hash_mapped(
+    hasher: &mut Sha256,
+    file: &fs::File,
+    path: &Path,
+    length: u64,
+) -> Result<(), String> {
+    // Mapped pages count toward the process working set while hashing. Five
+    // concurrent completions with 8 MiB windows pushed daemon RSS to ~40 MiB;
+    // 2 MiB keeps that overhead around 10 MiB.
+    const WINDOW: u64 = 2 * 1024 * 1024;
+    let mut offset = 0u64;
+    while offset < length {
+        let window = std::cmp::min(WINDOW, length - offset);
+        match unsafe {
+            MmapOptions::new()
+                .offset(offset)
+                .len(window as usize)
+                .map(file)
+        } {
+            Ok(map) => {
+                hasher.update(&map[..]);
+            }
+            Err(_) => {
+                // Some filesystems reject mappings; keep the old read path for
+                // this window rather than failing the result.
+                let mut fallback = fs::File::open(path)
+                    .map_err(|error| format!("open {}: {}", path.display(), error))?;
+                use std::io::Seek;
+                fallback
+                    .seek(std::io::SeekFrom::Start(offset))
+                    .map_err(|error| format!("seek {}: {}", path.display(), error))?;
+                let mut buffer = [0u8; 64 * 1024];
+                let mut remaining = window;
+                while remaining > 0 {
+                    let want = std::cmp::min(buffer.len() as u64, remaining) as usize;
+                    let read = fallback
+                        .read(&mut buffer[..want])
+                        .map_err(|error| format!("read {}: {}", path.display(), error))?;
+                    if read == 0 {
+                        return Err(format!("{} is truncated", path.display()));
+                    }
+                    hasher.update(&buffer[..read]);
+                    remaining -= read as u64;
+                }
+            }
+        }
+        offset += window;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "http"))]
+fn update_hash_mapped(
+    hasher: &mut Sha256,
+    file: &fs::File,
+    path: &Path,
+    length: u64,
+) -> Result<(), String> {
+    use std::io::Seek;
+    let mut file = file
+        .try_clone()
+        .map_err(|error| format!("open {}: {}", path.display(), error))?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|error| format!("seek {}: {}", path.display(), error))?;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut remaining = length;
+    while remaining > 0 {
+        let want = std::cmp::min(buffer.len() as u64, remaining) as usize;
+        let read = file
+            .read(&mut buffer[..want])
+            .map_err(|error| format!("read {}: {}", path.display(), error))?;
+        if read == 0 {
+            return Err(format!("{} is truncated", path.display()));
+        }
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "http")]
@@ -790,7 +1113,6 @@ pub fn materialize_result(result: &mut Value) -> Result<(), String> {
 }
 
 fn import_file(source: &Path) -> Result<Meta, String> {
-    let directory = dir();
     let incoming = incoming_dir();
     fs::create_dir_all(&incoming)
         .map_err(|error| format!("create {}: {}", incoming.display(), error))?;
@@ -808,47 +1130,45 @@ fn import_file(source: &Path) -> Result<Meta, String> {
     if metadata.len() > MAX_BLOB_BYTES {
         return Err("blob is too large".into());
     }
-    let mut file =
+
+    // Hash in place. The source already lives under temp_dir, so a same-volume
+    // rename is enough to publish it; there is no reason to copy the bytes into
+    // a second temp file.
+    let file =
         fs::File::open(&source).map_err(|error| format!("open {}: {}", source.display(), error))?;
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let temp = directory.join(format!(".incoming-{}-{}", std::process::id(), nanos));
-    let mut output =
-        fs::File::create(&temp).map_err(|error| format!("create {}: {}", temp.display(), error))?;
+    let size = metadata.len();
     let mut hasher = Sha256::new();
-    let mut size = 0u64;
-    let mut chunk = [0u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut chunk)
-            .map_err(|error| format!("read {}: {}", source.display(), error))?;
-        if read == 0 {
-            break;
-        }
-        size = size.saturating_add(read as u64);
-        if size > MAX_BLOB_BYTES {
-            let _ = fs::remove_file(&temp);
-            return Err("blob is too large".into());
-        }
-        hasher.update(&chunk[..read]);
-        output
-            .write_all(&chunk[..read])
-            .map_err(|error| format!("write {}: {}", temp.display(), error))?;
+    update_hash_mapped(&mut hasher, &file, &source, size)?;
+    drop(file);
+    let after = fs::metadata(&source)
+        .map_err(|error| format!("stat {}: {}", source.display(), error))?
+        .len();
+    if after != size {
+        return Err("incoming file changed while being imported".into());
     }
-    output
-        .sync_all()
-        .map_err(|error| format!("sync {}: {}", temp.display(), error))?;
+
     let id = format!("sha256:{}", hex(&hasher.finalize()));
     let destination = blob_path(&id)?;
     if destination.is_file() {
-        let _ = fs::remove_file(&temp);
-    } else {
-        fs::rename(&temp, &destination)
-            .map_err(|error| format!("rename {}: {}", destination.display(), error))?;
+        let _ = fs::remove_file(&source);
+        return Ok(Meta { id, size });
     }
-    let _ = fs::remove_file(&source);
+    let directory = dir();
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("create {}: {}", directory.display(), error))?;
+    match fs::rename(&source, &destination) {
+        Ok(()) => {}
+        Err(_error) if destination.is_file() => {
+            let _ = fs::remove_file(&source);
+        }
+        Err(_error) => {
+            // Cross-volume or a transient Windows sharing failure: fall back to
+            // one copy, preserving the old behaviour.
+            fs::copy(&source, &destination)
+                .map_err(|error| format!("copy {}: {}", destination.display(), error))?;
+            let _ = fs::remove_file(&source);
+        }
+    }
     Ok(Meta { id, size })
 }
 
