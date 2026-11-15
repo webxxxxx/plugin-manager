@@ -1647,7 +1647,7 @@ fn blob_download_supports_range_etag_and_conditionals() {
 }
 
 #[test]
-fn file_part_mapped_upload_round_trip() {
+fn file_part_2mib_upload_round_trip() {
     let mut sandbox = Sandbox::new();
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
@@ -1690,7 +1690,7 @@ fn file_part_mapped_upload_round_trip() {
 }
 
 #[test]
-fn blob_mapped_upload_and_multipart_complete_round_trip() {
+fn blob_2mib_upload_and_multipart_complete_round_trip() {
     let mut sandbox = Sandbox::new();
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();

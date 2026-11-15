@@ -223,15 +223,14 @@ HEAD   /api/v1/file/{sha256:...}
 
 当前实现会在平台支持时尽量把数据留在内核/页缓存里，所有路径都有普通读写的 fallback：
 
-- **上传（已知 `Content-Length`、≥1 MiB）**：可选 `SVCD_ZEROCOPY_UPLOAD=1` 时预分配文件，按 8 MiB 窗口做可写 `mmap`，把 socket body 直接读进映射页；默认关闭，因为 Windows/loopback 基准里页错误和预分配成本高于省下的 memcpy。普通写入路径用于 chunked、multipart、小 part，以及文件系统无法预留块的情况。
+- **上传**：仍走普通读/写。评估过预分配 + `mmap` 窗口，在 Windows/loopback 基准里页错误、预分配和刷新成本高于省下的 memcpy，且映射页会抬高 RSS，因此没有启用。
 - **chunked / multipart 解码**：分块数据直接以输入切片交给 sink，只缓存不完整的大小行/边界尾部，不再把整个 chunk 复制进解析器 buffer。
 - **下载（≥64 KiB）**：Linux 用 `sendfile`，Windows 用 `TransmitFile`，由内核把文件页送到 socket；文件包按 part 逐段发送，Range 用 part 内偏移。小块和平台不支持时回退到 64 KiB 读/写。基准里 daemon CPU 从约 4.4 核降到约 0，但 Windows loopback 墙钟略慢，属于用吞吐换 CPU 的取舍。
 - **`$blobPath` 结果导入**：在 `incoming/` 原地算 SHA-256，然后 `rename` 到 blob store；不再复制出第二份文件。
-- **文件包/`import_file` 哈希**：按 2 MiB 只读 `mmap` 窗口喂给 SHA-256，避免页缓存到用户 buffer 的拷贝；窗口小是为了不让映射页把 daemon RSS 抬高。映射失败时回退到读。
+- **文件包/`import_file` 哈希**：仍按 64 KiB 顺序读。只读 `mmap` 窗口能省一次拷贝，但实测会把并发完成的 daemon RSS 从 8.6 MiB 抬高到 15 MiB 以上，收益不值得，因此没有启用。
 
 这些优化的边界：
 
-- 上传映射依赖文件系统能预留块（Linux `posix_fallocate`、Windows `FileAllocationInfo`）；不能预留时自动回退到普通写入。
 - `sendfile`/`TransmitFile` 只适用于明文 socket；将来加 TLS 后需要回退到读/写。
 - 小块仍然走读/写，避免零拷贝 API 的固定开销。
 - 建议插件作者对只读扫描/哈希使用 `mmap`，对转发文件使用 `sendfile`/`copy_file_range`，不要把大文件整体读进内存。
@@ -463,7 +462,7 @@ for line in sys.stdin:
 
 - `src/blob.rs`：存储、id 校验、路径解析、流式写入、分片会话、文件包 manifest/哈希与结果物化。
 - `src/blob_http.rs`：`/api/v1/blobs` 与 `/api/v1/file` 的流式上传/下载、Range/ETag/条件请求、multipart 与分片路由。
-- `src/zerocopy.rs`：`sendfile`/`TransmitFile`、预分配与平台 fallback。
+- `src/zerocopy.rs`：下载 `sendfile`/`TransmitFile` 与平台 fallback。
 - `src/http.rs`：请求头解析、`Content-Length`/chunked framing、共享的 body 流式复制、HTTP 日期。
 - `src/api.rs`：`POST/GET /api/v1/blobs` 路由、鉴权与普通管理 API。
 - `src/slot.rs`：注入 `SVCD_TEMP_DIR`，解析 `$blob`，物化 `$blobPath`。

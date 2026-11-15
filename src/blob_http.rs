@@ -28,7 +28,6 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 /// Below this size the explicit read/write loop is cheaper than a syscall that
 /// asks the kernel to set up a file transfer.
 const ZEROCOPY_MIN_BYTES: u64 = 64 * 1024;
-const MAPPED_UPLOAD_MIN_BYTES: u64 = 1024 * 1024;
 
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
@@ -190,26 +189,6 @@ fn upload(stream: &mut TcpStream, head: &http::Head, initial: &[u8]) -> io::Resu
     }
     expect_continue(stream, head)?;
 
-    if multipart.is_none()
-        && crate::zerocopy::mapped_upload_enabled()
-        && matches!(framing, http::Framing::Length(_))
-    {
-        if let http::Framing::Length(length) = framing {
-            if length >= MAPPED_UPLOAD_MIN_BYTES {
-                match blob::Upload::begin_mapped(length) {
-                    Ok(Some(mut upload)) => {
-                        return match upload.write_from(stream, initial) {
-                            Ok(()) => finish_upload(stream, upload),
-                            Err(message) => write_body_error(stream, &message),
-                        };
-                    }
-                    Ok(None) => {}
-                    Err(message) => return write_error(stream, 500, "internal", &message),
-                }
-            }
-        }
-    }
-
     let mut upload = match blob::Upload::begin() {
         Ok(upload) => upload,
         Err(message) => return write_error(stream, 500, "internal", &message),
@@ -305,27 +284,6 @@ fn upload_part(
         _ => {}
     }
     expect_continue(stream, head)?;
-
-    // A known Content-Length can be preallocated and written through a windowed
-    // mapping: socket bytes land in page cache without an intermediate user
-    // buffer. The ordinary writer remains the fallback for filesystems that
-    // cannot reserve blocks, chunked bodies, and small parts.
-    if crate::zerocopy::mapped_upload_enabled() {
-        if let http::Framing::Length(length) = framing {
-            if length >= MAPPED_UPLOAD_MIN_BYTES {
-                match blob::PartWriter::begin_mapped(upload_id, part, length) {
-                    Ok(Some(mut writer)) => {
-                        return match writer.write_from(stream, initial) {
-                            Ok(()) => finish_part(stream, writer),
-                            Err(message) => write_body_error(stream, &message),
-                        };
-                    }
-                    Ok(None) => {}
-                    Err(message) => return write_error(stream, 500, "internal", &message),
-                }
-            }
-        }
-    }
 
     let mut writer = match blob::PartWriter::begin(upload_id, part) {
         Ok(writer) => writer,

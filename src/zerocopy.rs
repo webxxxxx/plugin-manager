@@ -40,58 +40,6 @@ pub fn send_file_range(
     }
 }
 
-/// Windowed mapped uploads are opt-in. The Windows/loopback benchmark showed
-/// them slower than buffered writes because page faults and preallocation cost
-/// more than the saved memcpy; keep the path for experimentation on other
-/// storage/hardware.
-pub fn mapped_upload_enabled() -> bool {
-    std::env::var("SVCD_ZEROCOPY_UPLOAD")
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
-/// Reserve disk blocks for a file before mapping it writable. Returning
-/// `Ok(false)` means the platform/filesystem cannot promise that, so callers
-/// must fall back to ordinary writes instead of risking SIGBUS/disk-full while
-/// touching mapped pages.
-pub fn preallocate(file: &File, length: u64) -> io::Result<bool> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd;
-        let result = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, length as libc::off_t) };
-        if result == 0 {
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::mem::size_of;
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FileAllocationInfo, SetFileInformationByHandle, FILE_ALLOCATION_INFO,
-        };
-        let info = FILE_ALLOCATION_INFO {
-            AllocationSize: length as i64,
-        };
-        let result = unsafe {
-            SetFileInformationByHandle(
-                file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
-                FileAllocationInfo,
-                &info as *const FILE_ALLOCATION_INFO as *const core::ffi::c_void,
-                size_of::<FILE_ALLOCATION_INFO>() as u32,
-            )
-        };
-        Ok(result != 0)
-    }
-    #[cfg(not(any(target_os = "linux", windows)))]
-    {
-        let _ = (file, length);
-        Ok(false)
-    }
-}
-
 #[cfg(target_os = "linux")]
 fn linux_sendfile(
     file: &mut File,
