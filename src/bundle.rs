@@ -665,7 +665,13 @@ fn effective_mode(
         }
         #[cfg(not(unix))]
         {
-            Ok(0o644)
+            // Cross-packaging from Windows: the source tree has no exec bits.
+            // Everything under payload/bin/ is a program by convention.
+            Ok(if path.starts_with("payload/bin/") {
+                0o755
+            } else {
+                0o644
+            })
         }
     }
 }
@@ -902,6 +908,36 @@ mod tests {
             manifest.compat.expect("compat").devices,
             ["sr6110".to_string()]
         );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn cross_packaging_marks_files_under_bin_executable() {
+        let source = TempDir::new();
+        let work = TempDir::new();
+        write(source.path(), "payload/bin/agent", b"\x7fELF", 0o644);
+        write(source.path(), "payload/bin/helper.dat", b"data", 0o644);
+        write(source.path(), "config/config", b"{}", 0o644);
+        let key = SigningKey::from_bytes(&[41u8; 32]);
+        let key_path = key_file(&work, 41);
+        let out = work.path().join("bins.spk");
+        let mut options = bundle_options(source.path(), &out, &key_path);
+        options.id = Some("bins".into());
+        options.exec = Some("payload/bin/agent".into());
+        bundle(&options).expect("bundle");
+
+        let bytes = fs::read(out).expect("read package");
+        let manifest = package::parse_manifest(&entries(&bytes)[0].data).expect("manifest");
+        let mode = |path: &str| {
+            manifest
+                .files
+                .iter()
+                .find(|file| file.path == path)
+                .unwrap_or_else(|| panic!("missing {}", path))
+                .mode
+        };
+        assert_eq!(mode("payload/bin/helper.dat"), 0o755);
+        assert_eq!(mode("config/config"), 0o644);
     }
 
     #[test]
