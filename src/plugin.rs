@@ -101,23 +101,11 @@ pub struct Verified {
 
 /// Run every check an install performs before it touches the plugin tree:
 /// package signature and file hashes, host compatibility, hook policy and the
-/// interpreter lookup. It has no side effects, so `plugin verify` can run it on
-/// a package that is not installed, and the daemon calls the same function
-/// before stopping a running version.
+/// interpreter lookup. It has no side effects, so the daemon can run it before
+/// stopping a running version.
 pub fn verify(path: &Path, allow_insecure: bool, opt_in_hooks: bool) -> Result<Verified, String> {
     let (package, signature_verified) =
         package::verify_package_with_fallback(path, allow_insecure)?;
-    verify_package(package, signature_verified, opt_in_hooks)
-}
-
-/// Byte-slice counterpart of [`verify`], for callers that already hold the
-/// package bytes (and want to hash them without reading the file twice).
-pub fn verify_bytes(
-    bytes: &[u8],
-    allow_insecure: bool,
-    opt_in_hooks: bool,
-) -> Result<Verified, String> {
-    let (package, signature_verified) = package::verify_bytes_with_fallback(bytes, allow_insecure)?;
     verify_package(package, signature_verified, opt_in_hooks)
 }
 

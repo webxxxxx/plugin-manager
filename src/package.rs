@@ -276,6 +276,28 @@ pub struct Package {
     pub files: Vec<FileData>,
 }
 
+/// What `signature.json` says about the package itself. Trust is a separate
+/// host fact, so a signature whose key is unknown is reported as `unknown-key`
+/// rather than `valid`: claiming validity without having verified anything is
+/// exactly the hole a CI gate would fall into. The caller decides what to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignatureInfo {
+    /// `valid`, `unknown-key`, `missing`, or `unverified` (malformed signatures
+    /// are errors).
+    pub state: &'static str,
+    pub key_id: Option<String>,
+    pub trusted: bool,
+}
+
+/// A package that passed its own integrity checks. Host-dependent facts are
+/// deliberately absent: the caller compares `platform`/`compat` with its own
+/// host state.
+#[derive(Debug)]
+pub struct Inspection {
+    pub package: Package,
+    pub signature: SignatureInfo,
+}
+
 impl Package {
     pub fn write_to(&self, root: &Path) -> Result<(), String> {
         fs::create_dir_all(root)
@@ -311,14 +333,6 @@ impl Package {
         let path = self.manifest.config.as_deref().unwrap_or("config/config");
         self.files.iter().find(|file| file.path == path)
     }
-
-    /// The `keyId` from `signature.json`, if the package carries one. A package
-    /// accepted by the insecure fallback still reports its (untrusted) key.
-    pub fn signature_key_id(&self) -> Option<String> {
-        serde_json::from_slice::<SignatureFile>(&self.signature_bytes)
-            .ok()
-            .map(|signature| signature.key_id)
-    }
 }
 
 pub fn verify_package(path: &Path) -> Result<Package, String> {
@@ -341,6 +355,41 @@ pub fn verify_bytes(bytes: &[u8]) -> Result<Package, String> {
 }
 
 pub fn verify_bytes_with(bytes: &[u8], check: SignatureCheck) -> Result<Package, String> {
+    let mode = match check {
+        SignatureCheck::Required => SignatureMode::Required,
+        SignatureCheck::AllowUnsigned => SignatureMode::AllowUnsigned,
+    };
+    verify_bytes_mode(bytes, mode, None).map(|(package, _)| package)
+}
+
+/// Verify a package's own integrity without consulting host policy: no
+/// platform match, no trust decision, no interpreter. The result carries the
+/// signature facts so the caller can decide whether to trust them.
+///
+/// `public_key` may be an explicit PEM: a CI runner has no `trust.d`, so this
+/// is how it checks the release signature without pretending the key is
+/// trusted. `trusted` still reports whether the key happens to be in `trust.d`.
+pub fn inspect_bytes_with(bytes: &[u8], public_key: Option<&[u8]>) -> Result<Inspection, String> {
+    let explicit = match public_key {
+        Some(pem) => Some(parse_public_key(pem)?),
+        None => None,
+    };
+    let (package, signature) = verify_bytes_mode(bytes, SignatureMode::Inspect, explicit.as_ref())?;
+    Ok(Inspection { package, signature })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignatureMode {
+    Required,
+    AllowUnsigned,
+    Inspect,
+}
+
+fn verify_bytes_mode(
+    bytes: &[u8],
+    mode: SignatureMode,
+    explicit: Option<&VerifyingKey>,
+) -> Result<(Package, SignatureInfo), String> {
     let mut tar = Tar::new(bytes);
 
     let manifest_header = tar
@@ -355,25 +404,28 @@ pub fn verify_bytes_with(bytes: &[u8], check: SignatureCheck) -> Result<Package,
         .to_vec();
 
     let mut signature_bytes = Vec::new();
+    let mut signature = SignatureInfo {
+        state: "missing",
+        key_id: None,
+        trusted: false,
+    };
     let mut first_file = None;
     match tar.next()? {
         Some(header) if header.path == "signature.json" => {
             let data = header
                 .data
                 .ok_or_else(|| "signature.json must be a regular file".to_string())?;
-            if check == SignatureCheck::Required {
-                verify_signature(&manifest_bytes, data)?;
-            }
+            signature = check_signature(&manifest_bytes, data, mode, explicit)?;
             signature_bytes = data.to_vec();
         }
-        Some(_) if check == SignatureCheck::Required => {
+        Some(_) if mode == SignatureMode::Required => {
             return Err("signature.json must be the second entry".into());
         }
-        // Insecure installs accept a package whose second entry is already a
-        // payload file; it stays in the archive and is validated like any
-        // other `files[]` entry below.
+        // Insecure installs and inspection accept a package whose second entry
+        // is already a payload file; it stays in the archive and is validated
+        // like any other `files[]` entry below.
         Some(header) => first_file = Some(header),
-        None if check == SignatureCheck::Required => {
+        None if mode == SignatureMode::Required => {
             return Err("signature.json is missing".into());
         }
         None => {}
@@ -381,7 +433,10 @@ pub fn verify_bytes_with(bytes: &[u8], check: SignatureCheck) -> Result<Package,
 
     let manifest = parse_manifest(&manifest_bytes)?;
     validate_manifest(&manifest)?;
-    if manifest.platform != target() {
+    // Inspection deliberately skips the host-platform gate: a package built
+    // for another target is still a well-formed package, and the caller gets
+    // `host.matchesHost` as a fact.
+    if mode != SignatureMode::Inspect && manifest.platform != target() {
         return Err(format!(
             "platform mismatch: package {}, host {}",
             manifest.platform,
@@ -470,12 +525,15 @@ pub fn verify_bytes_with(bytes: &[u8], check: SignatureCheck) -> Result<Package,
         .collect();
     validate_script_payload(&manifest, &borrowed)?;
 
-    Ok(Package {
-        manifest,
-        manifest_bytes,
-        signature_bytes,
-        files,
-    })
+    Ok((
+        Package {
+            manifest,
+            manifest_bytes,
+            signature_bytes,
+            files,
+        },
+        signature,
+    ))
 }
 
 /// Verify a package under the host-level insecure policy: strict verification
@@ -905,7 +963,21 @@ fn check_manifest_paths(manifest: &Manifest) -> Result<(), String> {
     Ok(())
 }
 
-fn verify_signature(manifest: &[u8], signature_bytes: &[u8]) -> Result<(), String> {
+fn check_signature(
+    manifest: &[u8],
+    signature_bytes: &[u8],
+    mode: SignatureMode,
+    explicit: Option<&VerifyingKey>,
+) -> Result<SignatureInfo, String> {
+    if mode == SignatureMode::AllowUnsigned {
+        // Insecure installs skip signature verification entirely. The bytes
+        // are still kept in the installed tree; they are simply not trusted.
+        return Ok(SignatureInfo {
+            state: "unverified",
+            key_id: None,
+            trusted: false,
+        });
+    }
     let sig: SignatureFile =
         serde_json::from_slice(signature_bytes).map_err(|error| format!("signature: {}", error))?;
     if sig.alg != "ed25519" {
@@ -915,21 +987,59 @@ fn verify_signature(manifest: &[u8], signature_bytes: &[u8]) -> Result<(), Strin
         return Err(format!("invalid keyId: {}", sig.key_id));
     }
     let key_path = paths::trust_dir().join(format!("{}.pub", sig.key_id));
-    let pem = fs::read(&key_path).map_err(|error| {
-        format!(
-            "unknown keyId {}: {} (trust root path: {}; add it with `svc trust add <file.pub>` or upload it in the web console)",
-            sig.key_id,
-            error,
-            key_path.display()
-        )
-    })?;
-    let key = parse_public_key(&pem)?;
+    if mode == SignatureMode::Required {
+        let pem = fs::read(&key_path)
+            .map_err(|error| unknown_key_error(&sig.key_id, &key_path, error))?;
+        let key = parse_public_key(&pem)?;
+        verify_signature_with(manifest, &sig, &key)?;
+        return Ok(SignatureInfo {
+            state: "valid",
+            key_id: Some(sig.key_id),
+            trusted: true,
+        });
+    }
+    // Inspection: verify with whichever key is available, and never claim
+    // `valid` when nothing was actually checked. On a host without the key in
+    // `trust.d` (a CI runner) that is `unknown-key`; `--pubkey` lets the caller
+    // supply the key explicitly instead of faking a trust root.
+    let trusted_key = fs::read(&key_path)
+        .ok()
+        .and_then(|pem| parse_public_key(&pem).ok());
+    if let Some(key) = explicit.or(trusted_key.as_ref()) {
+        verify_signature_with(manifest, &sig, key)?;
+        return Ok(SignatureInfo {
+            state: "valid",
+            key_id: Some(sig.key_id),
+            trusted: trusted_key.is_some(),
+        });
+    }
+    Ok(SignatureInfo {
+        state: "unknown-key",
+        key_id: Some(sig.key_id),
+        trusted: false,
+    })
+}
+
+fn verify_signature_with(
+    manifest: &[u8],
+    sig: &SignatureFile,
+    key: &VerifyingKey,
+) -> Result<(), String> {
     let signature = BASE64
         .decode(sig.sig.trim())
         .map_err(|error| format!("signature base64: {}", error))?;
     let signature = Signature::from_slice(&signature).map_err(|error| error.to_string())?;
     key.verify_strict(manifest, &signature)
         .map_err(|_| "manifest signature is invalid".to_string())
+}
+
+fn unknown_key_error(key_id: &str, key_path: &Path, error: std::io::Error) -> String {
+    format!(
+        "unknown keyId {}: {} (trust root path: {}; add it with `svc trust add <file.pub>` or upload it in the web console)",
+        key_id,
+        error,
+        key_path.display()
+    )
 }
 
 /// Validate a PEM SPKI Ed25519 public key without installing it.

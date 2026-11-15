@@ -17,3 +17,6 @@ __pycache__/
 
 # Node test harness dependencies
 node_modules/
+
+# 代码索引（本地工具产物）
+.codegraph/

@@ -215,6 +215,14 @@ fn target() -> &'static str {
     }
 }
 
+fn other_target() -> &'static str {
+    if target() == "aarch64-unknown-linux-musl" {
+        "x86_64-unknown-linux-musl"
+    } else {
+        "aarch64-unknown-linux-musl"
+    }
+}
+
 fn script() -> (&'static str, Vec<u8>) {
     if cfg!(windows) {
         (
@@ -952,6 +960,10 @@ fn verify_reports_a_signed_package_without_installing_it() {
     assert_eq!(value["compat"], Value::Null);
     assert_eq!(value["signature"]["state"], "valid");
     assert_eq!(value["signature"]["keyId"], "test");
+    assert_eq!(value["signature"]["trusted"], true);
+    assert_eq!(value["host"]["matchesHost"], true);
+    assert_eq!(value["host"]["device"], Value::Null);
+    assert_eq!(value["host"]["interpreter"], Value::Null);
     assert_eq!(value["files"], 2u64);
     assert!(
         !sandbox.data.join("plugins").join("demo").exists(),
@@ -1004,27 +1016,31 @@ fn verify_reports_capabilities_and_compat() {
     assert_eq!(value["capabilities"], json!(["status", "up"]));
     assert_eq!(value["compat"], json!(["sr6110"]));
     assert_eq!(value["schema"], 3u64);
+    assert_eq!(value["signature"]["trusted"], true);
+    assert_eq!(value["host"]["matchesHost"], true);
+    assert_eq!(value["host"]["device"], "sr6110");
+    assert!(
+        value["host"]["interpreter"].as_str().is_some(),
+        "declared interpreter should resolve: {value}"
+    );
 }
 
 #[test]
-fn verify_rejects_unknown_keys_and_tampered_manifests() {
+fn verify_separates_untrusted_keys_from_a_tampered_package() {
     let sandbox = Sandbox::new();
     let key = SigningKey::from_bytes(&[18u8; 32]);
     let mut bytes = package(&key, "1.0.0");
     let package = sandbox.write_package("demo-1.0.0.spk", &bytes);
 
     let unknown = sandbox.run_plugin(&["verify", package.to_str().expect("package"), "--json"]);
-    assert_eq!(unknown.status.code(), Some(1), "{}", stderr(&unknown));
-    let value: Value = serde_json::from_slice(&unknown.stdout).expect("verify failure json");
-    assert_eq!(value["ok"], false);
-    assert_eq!(value["file"], "demo-1.0.0.spk");
-    assert!(
-        value["error"]
-            .as_str()
-            .expect("error string")
-            .contains("unknown keyId test"),
-        "{value}"
-    );
+    assert_eq!(unknown.status.code(), Some(0), "{}", stderr(&unknown));
+    let value: Value = serde_json::from_slice(&unknown.stdout).expect("verify json");
+    assert_eq!(value["ok"], true);
+    // No key in trust.d means nothing was verified; claiming `valid` here would
+    // let a gate publish a package whose signature was never checked.
+    assert_eq!(value["signature"]["state"], "unknown-key");
+    assert_eq!(value["signature"]["keyId"], "test");
+    assert_eq!(value["signature"]["trusted"], false);
 
     sandbox.write_key(&key);
     // A valid JSON edit with the wrong bytes: the manifest signature no longer
@@ -1048,6 +1064,92 @@ fn verify_rejects_unknown_keys_and_tampered_manifests() {
             .contains("signature is invalid"),
         "{value}"
     );
+}
+
+#[test]
+fn verify_checks_the_signature_against_an_explicit_public_key() {
+    let sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[23u8; 32]);
+    let mut bytes = package(&key, "1.0.0");
+    let package = sandbox.write_package("demo-1.0.0.spk", &bytes);
+    let pubkey = sandbox.root.join("explicit.pub");
+    fs::write(&pubkey, pem_from_public(&key.verifying_key().to_bytes())).expect("write pubkey");
+
+    // The key is not in trust.d, so `trusted` stays false — but supplying it
+    // lets verify check the cryptography instead of giving up.
+    let output = sandbox.run_plugin(&[
+        "verify",
+        package.to_str().expect("package"),
+        "--json",
+        "--pubkey",
+        pubkey.to_str().expect("pubkey"),
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let value: Value = serde_json::from_slice(&output.stdout).expect("verify json");
+    assert_eq!(value["signature"]["state"], "valid");
+    assert_eq!(value["signature"]["trusted"], false);
+
+    // With the key supplied, a tampered manifest is a hard failure rather than
+    // an unknown-key shrug.
+    let marker = b"test plugin";
+    let offset = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("manifest desc");
+    bytes[offset] = b'u';
+    let tampered = sandbox.write_package("tampered-1.0.0.spk", &bytes);
+    let output = sandbox.run_plugin(&[
+        "verify",
+        tampered.to_str().expect("package"),
+        "--json",
+        "--pubkey",
+        pubkey.to_str().expect("pubkey"),
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let value: Value = serde_json::from_slice(&output.stdout).expect("verify failure json");
+    assert!(
+        value["error"]
+            .as_str()
+            .expect("error string")
+            .contains("signature is invalid"),
+        "{value}"
+    );
+}
+
+#[test]
+fn verify_reports_a_foreign_platform_as_a_host_fact() {
+    let sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[20u8; 32]);
+    sandbox.write_key(&key);
+
+    let (name, data) = script();
+    let path = format!("payload/bin/{}", name);
+    let files = [(path.as_str(), data.as_slice(), 0o755u32)];
+    let manifest = json!({
+        "schema": 1,
+        "name": "foreign",
+        "version": "1.0.0",
+        "desc": "other platform",
+        "platform": other_target(),
+        "protocol": 1,
+        "exec": {"path": path.clone(), "args": [], "ready": "notify"},
+        "files": [{
+            "path": path,
+            "size": data.len(),
+            "sha256": hex_sha256(&data),
+            "mode": 0o755
+        }]
+    });
+    let bytes = package_with_manifest(&key, &manifest, &files);
+    let package = sandbox.write_package("foreign-1.0.0.spk", &bytes);
+
+    let output = sandbox.run_plugin(&["verify", package.to_str().expect("package"), "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let value: Value = serde_json::from_slice(&output.stdout).expect("verify json");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["platform"], other_target());
+    assert_eq!(value["signature"]["trusted"], true);
+    assert_eq!(value["host"]["matchesHost"], false);
 }
 
 #[test]

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use crate::channel;
+use crate::compat;
 use crate::package;
 use crate::paths;
 use crate::plugin;
@@ -52,7 +53,10 @@ enum Command {
     Verify {
         path: PathBuf,
         json: bool,
-        allow_hooks: bool,
+        /// Check the signature against this PEM even when the key is not in
+        /// `trust.d`. CI has no trust root; this is how it checks the release
+        /// signature without pretending the key is trusted.
+        pubkey: Option<PathBuf>,
     },
     Uninstall {
         id: String,
@@ -99,11 +103,7 @@ pub fn run(args: Vec<String>) -> i32 {
             strategy,
             allow_hooks,
         } => install(&path, &strategy, allow_hooks),
-        Command::Verify {
-            path,
-            json,
-            allow_hooks,
-        } => verify(&path, json, allow_hooks),
+        Command::Verify { path, json, pubkey } => verify(&path, json, pubkey.as_deref()),
         Command::Uninstall { id, purge } => uninstall(&id, purge),
         Command::EditConfig {
             id,
@@ -193,24 +193,26 @@ fn parse(args: &[String]) -> Result<Command, ()> {
         "verify" => {
             let mut path = None;
             let mut json = false;
-            let mut allow_hooks = false;
-            for arg in &args[1..] {
+            let mut pubkey = None;
+            let mut index = 1;
+            while index < args.len() {
+                let arg = &args[index];
                 if arg == "--json" {
                     json = true;
-                } else if arg == "--allow-hooks" {
-                    allow_hooks = true;
+                } else if arg == "--pubkey" {
+                    index += 1;
+                    pubkey = Some(PathBuf::from(args.get(index).ok_or(())?));
+                } else if let Some(value) = arg.strip_prefix("--pubkey=") {
+                    pubkey = Some(PathBuf::from(value));
                 } else if arg.starts_with('-') || path.is_some() {
                     return Err(());
                 } else {
                     path = Some(PathBuf::from(arg));
                 }
+                index += 1;
             }
-            path.map(|path| Command::Verify {
-                path,
-                json,
-                allow_hooks,
-            })
-            .ok_or(())
+            path.map(|path| Command::Verify { path, json, pubkey })
+                .ok_or(())
         }
         "uninstall" => {
             let mut id = None;
@@ -590,7 +592,7 @@ fn install(path: &PathBuf, strategy: &str, allow_hooks: bool) -> i32 {
     }
 }
 
-fn verify(path: &Path, json: bool, allow_hooks: bool) -> i32 {
+fn verify(path: &Path, json: bool, pubkey: Option<&Path>) -> i32 {
     let file = file_name(path);
     if let Ok(metadata) = fs::metadata(path) {
         if metadata.len() > package::MAX_PACKAGE_BYTES {
@@ -614,16 +616,26 @@ fn verify(path: &Path, json: bool, allow_hooks: bool) -> i32 {
             )
         }
     };
-    let verified = match plugin::verify_bytes(
-        &bytes,
-        crate::settings::allow_insecure_install(),
-        allow_hooks,
-    ) {
-        Ok(verified) => verified,
+    let explicit_key = match pubkey {
+        Some(key_path) => match fs::read(key_path) {
+            Ok(pem) => Some(pem),
+            Err(error) => {
+                return verify_failure(
+                    &file,
+                    &format!("cannot read {}: {}", key_path.display(), error),
+                    json,
+                )
+            }
+        },
+        None => None,
+    };
+    let inspection = match package::inspect_bytes_with(&bytes, explicit_key.as_deref()) {
+        Ok(inspection) => inspection,
         Err(error) => return verify_failure(&file, &error, json),
     };
+    let host = verify_host(&inspection);
     if json {
-        return match serde_json::to_string_pretty(&verify_json(&file, &bytes, &verified)) {
+        return match serde_json::to_string_pretty(&verify_json(&file, &bytes, &inspection, &host)) {
             Ok(text) => {
                 println!("{}", text);
                 EXIT_OK
@@ -634,22 +646,44 @@ fn verify(path: &Path, json: bool, allow_hooks: bool) -> i32 {
             }
         };
     }
-    let manifest = &verified.package.manifest;
+    let manifest = &inspection.package.manifest;
     println!("{} {}", manifest.name, manifest.version);
-    println!("platform: {}", manifest.platform);
+    println!(
+        "platform: {} (host match: {})",
+        manifest.platform,
+        if host.matches_host { "yes" } else { "no" }
+    );
     println!("files: {}", manifest.files.len());
-    let signature = if verified.signature_verified {
-        match verified.package.signature_key_id() {
-            Some(key_id) => format!("verified (keyId {})", key_id),
-            None => "verified".to_string(),
-        }
-    } else if verified.package.signature_bytes.is_empty() {
-        "missing".to_string()
-    } else {
-        "not verified".to_string()
-    };
-    println!("signature: {}", signature);
+    let key_id = inspection.signature.key_id.as_deref().unwrap_or("-");
+    println!(
+        "signature: {} (keyId: {}, trusted: {})",
+        inspection.signature.state, key_id, inspection.signature.trusted
+    );
+    if let Some(device) = &host.device {
+        println!("device: {}", device);
+    }
+    if let Some(interpreter) = &host.interpreter {
+        println!("interpreter: {}", interpreter);
+    }
     EXIT_OK
+}
+
+struct VerifyHost {
+    matches_host: bool,
+    device: Option<String>,
+    interpreter: Option<String>,
+}
+
+fn verify_host(inspection: &package::Inspection) -> VerifyHost {
+    let host = compat::detect();
+    VerifyHost {
+        matches_host: inspection.package.manifest.platform == host.platform,
+        device: host.device,
+        interpreter: crate::plugin::prepare(&inspection.package)
+            .ok()
+            .flatten()
+            .map(|interpreter| interpreter.path),
+    }
 }
 
 fn verify_failure(file: &str, error: &str, json: bool) -> i32 {
@@ -665,19 +699,19 @@ fn verify_failure(file: &str, error: &str, json: bool) -> i32 {
     EXIT_SERVICE_ERROR
 }
 
-fn verify_json(file: &str, bytes: &[u8], verified: &plugin::Verified) -> Value {
-    let manifest = &verified.package.manifest;
+fn verify_json(
+    file: &str,
+    bytes: &[u8],
+    inspection: &package::Inspection,
+    host: &VerifyHost,
+) -> Value {
+    let manifest = &inspection.package.manifest;
     let mut signature = json!({
-        "state": if verified.signature_verified {
-            "valid"
-        } else if verified.package.signature_bytes.is_empty() {
-            "missing"
-        } else {
-            "unverified"
-        }
+        "state": inspection.signature.state,
+        "trusted": inspection.signature.trusted,
     });
-    if let Some(key_id) = verified.package.signature_key_id() {
-        signature["keyId"] = Value::String(key_id);
+    if let Some(key_id) = &inspection.signature.key_id {
+        signature["keyId"] = Value::String(key_id.clone());
     }
     json!({
         "ok": true,
@@ -698,6 +732,11 @@ fn verify_json(file: &str, bytes: &[u8], verified: &plugin::Verified) -> Value {
             None => Value::Null,
         },
         "signature": signature,
+        "host": {
+            "matchesHost": host.matches_host,
+            "device": host.device,
+            "interpreter": host.interpreter,
+        },
         "files": manifest.files.len(),
     })
 }
@@ -977,7 +1016,7 @@ fn usage() {
     eprintln!("       plugin start|stop|restart <id>");
     eprintln!("       plugin enable|disable <id>");
     eprintln!("       plugin install <file.spk> [--strategy keep-old|replace] [--allow-hooks] (default: replace)");
-    eprintln!("       plugin verify <file.spk> [--json] [--allow-hooks]");
+    eprintln!("       plugin verify <file.spk> [--json] [--pubkey <pem>]");
     eprintln!("       plugin uninstall <id> [--purge]");
     eprintln!("       plugin editconfig <id> [--print|--file <path>|--reset]");
     eprintln!("       plugin export <id> [--config-only] [--out <path>]");
@@ -1070,19 +1109,11 @@ mod tests {
             }
         );
         assert_eq!(
-            parse(&args(&["verify", "demo.spk", "--allow-hooks"])).expect("verify"),
-            Command::Verify {
-                path: PathBuf::from("demo.spk"),
-                json: false,
-                allow_hooks: true
-            }
-        );
-        assert_eq!(
             parse(&args(&["verify", "demo.spk"])).expect("verify defaults"),
             Command::Verify {
                 path: PathBuf::from("demo.spk"),
                 json: false,
-                allow_hooks: false
+                pubkey: None
             }
         );
         assert_eq!(
@@ -1090,9 +1121,19 @@ mod tests {
             Command::Verify {
                 path: PathBuf::from("demo.spk"),
                 json: true,
-                allow_hooks: false
+                pubkey: None
             }
         );
+        assert_eq!(
+            parse(&args(&["verify", "demo.spk", "--pubkey", "release.pub"]))
+                .expect("verify explicit key"),
+            Command::Verify {
+                path: PathBuf::from("demo.spk"),
+                json: false,
+                pubkey: Some(PathBuf::from("release.pub"))
+            }
+        );
+        assert!(parse(&args(&["verify", "demo.spk", "--allow-hooks"])).is_err());
         assert!(parse(&args(&["verify"])).is_err());
         assert!(parse(&args(&["verify", "one.spk", "two.spk"])).is_err());
         assert_eq!(

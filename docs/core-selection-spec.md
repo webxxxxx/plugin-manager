@@ -176,7 +176,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 
 - 包内 `signature.json`：`{"alg":"ed25519","keyId":"...","sig":"base64"}`，签 `manifest.json` 的原样字节；`files[]` 钉每个文件的 sha256/size/mode。
 - 验证顺序：读 manifest → 验签 → 校验 schema / platform / 路径 → 逐文件验 hash 后落盘；清单外条目直接拒；流式、逐文件可验。
-- `plugin verify <file.spk> [--json]` 只跑安装前的同一段校验（含 compat / hooks / 解释器），不落盘；`plugin install` 调用同一个函数，避免两套判断分叉。`--json` 输出 `{ok, file, name, version, platform, schema, size, sha256, capabilities, compat, signature:{state,keyId}, files}`，失败时 `{ok:false, file, error}`。
+- `plugin verify <file.spk> [--json]` 只做包自身校验（清单 / 文件哈希 / 签名结构；不要求平台匹配、不要求 key 在 trust.d、不解析解释器），不落盘。`--json` 输出 `{ok, file, name, version, platform, schema, size, sha256, capabilities, compat, signature:{state,keyId,trusted}, host:{matchesHost,device,interpreter}, files}`；`ok` 只表示包自身完整，`signature.trusted` 与 `host.*` 是交给调用方判断的事实。`install` 仍走 `plugin::verify` 的严格策略，二者不共用“是否可安装”的结论。
 - 信任根：`<config>/trust.d/<keyId>.pub`（**PEM SPKI**）；未知 keyId 默认拒绝。未签名安装只由 `svcd.conf` 的 `allow_insecure_install` 控制：开启后安装路径先严格验签，失败才降级接受缺 `signature.json` 或未信任 key 的包，并在日志中标注未验签；CLI/HTTP/Web 都没有逐次 insecure 参数或勾选项。
 - 信任根只能由管理员显式添加：`svc trust list|add <file.pub>|remove <keyId>`，或 Web 控制台的 `POST /api/v1/trust?key_id=<id>` 上传；包内永不携带自己的信任根（自签自证没有意义）。
 - 当前没有编译期 store 公钥，商城/发布接入时内置；`SVCD_TRUST_DIR` 可覆盖 trust.d，供测试与非 root 开发。
