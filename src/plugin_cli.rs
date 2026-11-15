@@ -34,6 +34,15 @@ enum Command {
     Stop {
         id: String,
     },
+    Restart {
+        id: String,
+    },
+    Enable {
+        id: String,
+    },
+    Disable {
+        id: String,
+    },
     Install {
         path: PathBuf,
         strategy: String,
@@ -76,6 +85,9 @@ pub fn run(args: Vec<String>) -> i32 {
         Command::Status { id, json } => status_command(&id, json),
         Command::Start { id } => lifecycle("start", &id),
         Command::Stop { id } => lifecycle("stop", &id),
+        Command::Restart { id } => lifecycle("restart", &id),
+        Command::Enable { id } => lifecycle("enable", &id),
+        Command::Disable { id } => lifecycle("disable", &id),
         Command::Install {
             path,
             strategy,
@@ -123,15 +135,17 @@ fn parse(args: &[String]) -> Result<Command, ()> {
             }
             id.map(|id| Command::Status { id, json }).ok_or(())
         }
-        "start" | "stop" => {
+        "start" | "stop" | "restart" | "enable" | "disable" => {
             if args.len() != 2 || args[1].starts_with('-') {
                 return Err(());
             }
             let id = args[1].clone();
-            if command == "start" {
-                Ok(Command::Start { id })
-            } else {
-                Ok(Command::Stop { id })
+            match command {
+                "start" => Ok(Command::Start { id }),
+                "stop" => Ok(Command::Stop { id }),
+                "restart" => Ok(Command::Restart { id }),
+                "enable" => Ok(Command::Enable { id }),
+                _ => Ok(Command::Disable { id }),
             }
         }
         "install" => {
@@ -285,6 +299,7 @@ fn parse(args: &[String]) -> Result<Command, ()> {
             let mut interpreter = None;
             let mut interpreter_version = None;
             let mut interpreter_args = Vec::new();
+            let mut compat = Vec::new();
             let mut index = 1;
             while index < args.len() {
                 let arg = &args[index];
@@ -329,6 +344,16 @@ fn parse(args: &[String]) -> Result<Command, ()> {
                     "--interpreter-arg" => {
                         index += 1;
                         interpreter_args.push(args.get(index).ok_or(())?.clone());
+                    }
+                    "--compat" => {
+                        index += 1;
+                        compat.extend(
+                            args.get(index)
+                                .ok_or(())?
+                                .split(',')
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string),
+                        );
                     }
                     _ if arg.starts_with("--out=") => {
                         out = Some(PathBuf::from(
@@ -396,6 +421,15 @@ fn parse(args: &[String]) -> Result<Command, ()> {
                                 .to_string(),
                         );
                     }
+                    _ if arg.starts_with("--compat=") => {
+                        compat.extend(
+                            arg.strip_prefix("--compat=")
+                                .expect("matched prefix")
+                                .split(',')
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string),
+                        );
+                    }
                     _ if arg.starts_with('-') => return Err(()),
                     _ if dir.is_none() => dir = Some(PathBuf::from(arg)),
                     _ => return Err(()),
@@ -416,6 +450,7 @@ fn parse(args: &[String]) -> Result<Command, ()> {
                     interpreter,
                     interpreter_version,
                     interpreter_args,
+                    compat,
                 })
             })
             .ok_or(())
@@ -771,14 +806,15 @@ fn unreachable(error: &std::io::Error) -> i32 {
 fn usage() {
     eprintln!("usage: plugin list");
     eprintln!("       plugin status [--json] <id>");
-    eprintln!("       plugin start|stop <id>");
+    eprintln!("       plugin start|stop|restart <id>");
+    eprintln!("       plugin enable|disable <id>");
     eprintln!("       plugin install <file.spk> [--strategy keep-old|replace] [--allow-hooks] (default: replace)");
     eprintln!("       plugin uninstall <id> [--purge]");
     eprintln!("       plugin editconfig <id> [--print|--file <path>|--reset]");
     eprintln!("       plugin export <id> [--config-only] [--out <path>]");
     eprintln!("       plugin import <file> [--config <id>] [--no-config] [--force]");
     eprintln!(
-        "       plugin bundle <dir> --key <pem> [-o <out>] [--id <id>] [--version <semver>] [--exec <path>] [--desc <text>] [--key-id <id>] [--from-core] [--interpreter <name>] [--interpreter-version <constraint>] [--interpreter-arg <arg>]"
+        "       plugin bundle <dir> --key <pem> [-o <out>] [--id <id>] [--version <semver>] [--exec <path>] [--desc <text>] [--key-id <id>] [--from-core] [--interpreter <name>] [--interpreter-version <constraint>] [--interpreter-arg <arg>] [--compat <device[,device...]>]"
     );
 }
 
@@ -808,6 +844,21 @@ mod tests {
                 allow_hooks: false
             }
         );
+        assert_eq!(
+            parse(&args(&["enable", "demo"])).expect("enable"),
+            Command::Enable { id: "demo".into() }
+        );
+        assert_eq!(
+            parse(&args(&["disable", "demo"])).expect("disable"),
+            Command::Disable { id: "demo".into() }
+        );
+        assert_eq!(
+            parse(&args(&["restart", "demo"])).expect("restart"),
+            Command::Restart { id: "demo".into() }
+        );
+        assert!(parse(&args(&["enable"])).is_err());
+        assert!(parse(&args(&["restart"])).is_err());
+        assert!(parse(&args(&["disable", "one", "two"])).is_err());
         assert_eq!(
             parse(&args(&["install", "demo.spk"])).expect("default install"),
             Command::Install {
@@ -901,7 +952,8 @@ mod tests {
                 from_core: false,
                 interpreter: None,
                 interpreter_version: None,
-                interpreter_args: Vec::new()
+                interpreter_args: Vec::new(),
+                compat: Vec::new()
             })
         );
         assert_eq!(
@@ -930,7 +982,8 @@ mod tests {
                 from_core: true,
                 interpreter: Some("sh".into()),
                 interpreter_version: Some(">=5".into()),
-                interpreter_args: vec!["-e".into()]
+                interpreter_args: vec!["-e".into()],
+                compat: Vec::new()
             })
         );
         assert!(parse(&args(&["bundle", "a", "b"])).is_err());

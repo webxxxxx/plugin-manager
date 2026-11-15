@@ -5,6 +5,8 @@
 //! shell function, PowerShell function, cmd label or shell `case` branch counts
 //! as an action. Comments are ignored.
 
+use crate::registry::Restart;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Actions {
     pub start: bool,
@@ -97,6 +99,48 @@ fn is_comment(line: &str) -> bool {
     line.starts_with('#') || lower.starts_with("rem ") || lower.starts_with("rem\t")
 }
 
+/// The crash-restart policy a shell service declares in its own body,
+/// mirroring `svc`'s script convention. `TYPE=oneshot` wins over `RESTART=`
+/// and means "never restart". Anything else keeps the on-failure default.
+pub fn declared_restart(text: &str, extension: &str) -> Restart {
+    if extension != "sh" {
+        return Restart::OnFailure;
+    }
+    let mut oneshot = false;
+    let mut parsed = None;
+    for raw in text.lines() {
+        let line = raw.trim_start();
+        if line.is_empty() || is_comment(line) {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        if let Some(value) = line.strip_prefix("TYPE=") {
+            if value.trim().trim_matches('"').trim_matches('\'') == "oneshot" {
+                oneshot = true;
+            }
+        }
+        if let Some(value) = line.strip_prefix("RESTART=") {
+            let value = value
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches('"')
+                .trim_matches('\'');
+            parsed = match value {
+                "always" => Some(Restart::Always),
+                "never" => Some(Restart::Never),
+                "on-failure" => Some(Restart::OnFailure),
+                _ => parsed,
+            };
+        }
+    }
+    if oneshot {
+        Restart::Never
+    } else {
+        parsed.unwrap_or_default()
+    }
+}
+
 fn marks_action(line: &str, action: &str, extension: &str) -> bool {
     match extension {
         "bat" | "cmd" => {
@@ -183,5 +227,47 @@ mod tests {
     fn unsupported_languages_declare_nothing() {
         let actions = declared_actions("def start():\n    pass\n", "py");
         assert!(!actions.any(), "{:?}", actions);
+    }
+
+    #[test]
+    fn a_shell_script_declares_its_restart_policy() {
+        use crate::registry::Restart;
+
+        assert_eq!(
+            declared_restart("#!/bin/sh\nRESTART=never\nstart() { :; }\n", "sh"),
+            Restart::Never
+        );
+        assert_eq!(
+            declared_restart("#!/bin/sh\nRESTART=always\n", "sh"),
+            Restart::Always
+        );
+        assert_eq!(
+            declared_restart("#!/bin/sh\nRESTART=on-failure\nRESTART=never\n", "sh"),
+            Restart::Never,
+            "the last declaration wins"
+        );
+        assert_eq!(
+            declared_restart("#!/bin/sh\nTYPE=oneshot\nRESTART=always\n", "sh"),
+            Restart::Never,
+            "TYPE=oneshot wins over RESTART="
+        );
+        assert_eq!(
+            declared_restart("#!/bin/sh\nexport RESTART=never\n", "sh"),
+            Restart::Never
+        );
+        assert_eq!(
+            declared_restart("#!/bin/sh\n# RESTART=never\n", "sh"),
+            Restart::OnFailure,
+            "comments are ignored"
+        );
+        assert_eq!(
+            declared_restart("#!/bin/sh\nRESTART=bogus\n", "sh"),
+            Restart::OnFailure
+        );
+        assert_eq!(
+            declared_restart("RESTART=never\n", "cmd"),
+            Restart::OnFailure,
+            "only shell scripts carry the policy"
+        );
     }
 }

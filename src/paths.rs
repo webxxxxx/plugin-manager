@@ -127,8 +127,18 @@ pub fn temp_dir() -> PathBuf {
     data_dir().join("temp")
 }
 
-/// Installed plugins: `<data>/plugins/<id>/<version>/`, or the
-/// `plugins_dir` from `svcd.conf`.
+/// Per-service runtime records (`<data>/run/<id>.json`) that let a restarted
+/// daemon reconnect to the processes that survived it. `SVCD_RUN_DIR` overrides
+/// it for tests.
+pub fn run_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("SVCD_RUN_DIR") {
+        return PathBuf::from(dir);
+    }
+    data_dir().join("run")
+}
+
+/// Installed plugins: `<data>/plugins/<id>/<version>/`, or `plugins_dir` from
+/// `svcd.conf` when configured.
 pub fn plugins_dir() -> PathBuf {
     settings::current()
         .ok()

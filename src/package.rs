@@ -16,10 +16,15 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::compat::CompatSpec;
 use crate::paths;
 
 pub(crate) const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const MAX_FILES: usize = 4096;
+/// Highest manifest schema this daemon understands.
+pub const MAX_SCHEMA: u32 = 3;
+/// Highest plugin protocol version this daemon understands.
+pub const MAX_PROTOCOL: u32 = 2;
 
 /// Exact target triple the package was built for.
 pub fn target() -> &'static str {
@@ -52,6 +57,10 @@ pub struct Manifest {
     pub config: Option<String>,
     #[serde(rename = "configCheck")]
     pub config_check: Option<ConfigCheck>,
+    /// Device compatibility list (schema 3). Absent means universal for this
+    /// platform; present means the host id must be listed.
+    #[serde(default)]
+    pub compat: Option<CompatSpec>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -450,6 +459,7 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
     check_schema(manifest)?;
     check_ready(manifest)?;
     check_capabilities_with_exec(manifest)?;
+    check_compat(manifest)?;
     if manifest.files.is_empty() {
         return Err("package has no payload files".into());
     }
@@ -544,15 +554,64 @@ pub fn validate_script_payload(manifest: &Manifest, files: &[(&str, &[u8])]) -> 
 }
 
 fn check_schema(manifest: &Manifest) -> Result<(), String> {
-    match manifest.schema {
-        1 | 2 => {}
-        other => return Err(format!("unsupported schema {}", other)),
+    if manifest.schema == 0 || manifest.schema > MAX_SCHEMA {
+        return Err(format!(
+            "unsupported schema {} (max {})",
+            manifest.schema, MAX_SCHEMA
+        ));
     }
     if manifest.schema == 1 && (manifest.interpreter.is_some() || manifest.lifecycle.is_some()) {
         return Err(
             "lifecycle and interpreter require schema 2; old daemons would silently ignore them"
                 .into(),
         );
+    }
+    if manifest.schema < 3 && manifest.compat.is_some() {
+        return Err(
+            "compat requires schema 3; old daemons would ignore the device list and install a \
+             package that does not run here"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn check_compat(manifest: &Manifest) -> Result<(), String> {
+    let kernel_module = manifest
+        .files
+        .iter()
+        .any(|file| file.path.to_ascii_lowercase().ends_with(".ko"));
+    match &manifest.compat {
+        Some(spec) => {
+            if spec.devices.is_empty() {
+                return Err(
+                    "compat.devices must not be empty; omit compat for a universal package".into(),
+                );
+            }
+            if spec.devices.len() > 64 {
+                return Err("compat.devices lists more than 64 ids".into());
+            }
+            let mut seen = BTreeSet::new();
+            for device in &spec.devices {
+                crate::compat::validate_device_id(device)
+                    .map_err(|error| format!("compat.devices: {}", error))?;
+                if !seen.insert(device) {
+                    return Err(format!("duplicate compat device id: {}", device));
+                }
+            }
+        }
+        None => {
+            if kernel_module {
+                return Err(
+                    "the package contains a kernel module (.ko) but declares no compat.devices; \
+                     kernel modules only run on the device generation they were built for"
+                        .into(),
+                );
+            }
+        }
+    }
+    if kernel_module && manifest.schema < 3 {
+        return Err("kernel modules require schema 3 so old daemons reject them".into());
     }
     Ok(())
 }
@@ -815,7 +874,7 @@ fn parse_public_key(pem: &[u8]) -> Result<VerifyingKey, String> {
 pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, String> {
     let m: Manifest = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
     check_schema(&m)?;
-    if !matches!(m.protocol, 1 | 2) {
+    if m.protocol == 0 || m.protocol > MAX_PROTOCOL {
         return Err(format!("unsupported protocol {}", m.protocol));
     }
     if !valid_name(&m.name) {
@@ -1183,6 +1242,113 @@ mod tests {
         let bytes = package_for(&key, &mismatched);
         let error = verify_bytes(&bytes).expect_err("platform");
         assert!(error.contains("platform mismatch"), "{error}");
+    }
+
+    fn compat_manifest_value(
+        schema: u32,
+        compat: Option<serde_json::Value>,
+        extra_file: Option<&str>,
+    ) -> serde_json::Value {
+        let mut files = vec![
+            json!({"path": "payload/bin/demo", "size": 5, "sha256": hex_sha256(b"hello"), "mode": 0o755}),
+            json!({"path": "config/config", "size": 2, "sha256": hex_sha256(b"{}"), "mode": 0o644}),
+        ];
+        if let Some(path) = extra_file {
+            files.push(json!({"path": path, "size": 1, "sha256": hex_sha256(b"k"), "mode": 0o644}));
+        }
+        let mut value = json!({
+            "schema": schema,
+            "name": "demo",
+            "version": "1.0.0",
+            "desc": "demo",
+            "platform": target(),
+            "protocol": 1,
+            "exec": {"path": "payload/bin/demo"},
+            "files": files,
+            "config": "config/config"
+        });
+        if let Some(compat) = compat {
+            value["compat"] = compat;
+        }
+        value
+    }
+
+    fn parse_and_validate(value: serde_json::Value) -> Result<Manifest, String> {
+        let bytes = serde_json::to_vec(&value).expect("manifest");
+        let manifest = parse_manifest(&bytes)?;
+        validate_manifest(&manifest)?;
+        Ok(manifest)
+    }
+
+    #[test]
+    fn schema_three_accepts_a_device_list() {
+        let manifest = parse_and_validate(compat_manifest_value(
+            3,
+            Some(json!({"devices": ["sr6110", "sr1010-v1"]})),
+            None,
+        ))
+        .expect("compat manifest");
+        assert_eq!(
+            manifest.compat.as_ref().expect("compat").devices,
+            ["sr6110", "sr1010-v1"]
+        );
+    }
+
+    #[test]
+    fn compat_requires_schema_three() {
+        let error = parse_and_validate(compat_manifest_value(
+            2,
+            Some(json!({"devices": ["sr6110"]})),
+            None,
+        ))
+        .expect_err("schema gate");
+        assert!(error.contains("compat requires schema 3"), "{error}");
+    }
+
+    #[test]
+    fn a_device_list_must_be_non_empty_and_unique() {
+        let empty =
+            parse_and_validate(compat_manifest_value(3, Some(json!({"devices": []})), None))
+                .expect_err("empty");
+        assert!(empty.contains("must not be empty"), "{empty}");
+
+        let duplicate = parse_and_validate(compat_manifest_value(
+            3,
+            Some(json!({"devices": ["sr6110", "sr6110"]})),
+            None,
+        ))
+        .expect_err("duplicate");
+        assert!(duplicate.contains("duplicate"), "{duplicate}");
+
+        let invalid = parse_and_validate(compat_manifest_value(
+            3,
+            Some(json!({"devices": ["SR6110"]})),
+            None,
+        ))
+        .expect_err("invalid");
+        assert!(invalid.contains("device id"), "{invalid}");
+    }
+
+    #[test]
+    fn a_kernel_module_requires_a_device_list() {
+        let error = parse_and_validate(compat_manifest_value(3, None, Some("payload/driver.ko")))
+            .expect_err("kernel module without compat");
+        assert!(error.contains("kernel module"), "{error}");
+
+        let ok = parse_and_validate(compat_manifest_value(
+            3,
+            Some(json!({"devices": ["sr6110"]})),
+            Some("payload/driver.ko"),
+        ))
+        .expect("kernel module with compat");
+        assert!(ok.compat.is_some());
+    }
+
+    #[test]
+    fn a_kernel_module_cannot_use_an_old_schema() {
+        let error = parse_and_validate(compat_manifest_value(2, None, Some("payload/driver.ko")))
+            .expect_err("old schema kernel module");
+        assert!(error.contains("kernel module"), "{error}");
     }
 
     #[test]

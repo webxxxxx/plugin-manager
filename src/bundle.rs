@@ -33,6 +33,8 @@ pub struct Options {
     pub interpreter: Option<String>,
     pub interpreter_version: Option<String>,
     pub interpreter_args: Vec<String>,
+    /// Device compatibility ids (`--compat sr6110`); empty means universal.
+    pub compat: Vec<String>,
 }
 
 struct SourceFile {
@@ -352,11 +354,50 @@ fn assemble_manifest(
         }));
     }
 
-    if manifest.contains_key("lifecycle") || manifest.contains_key("interpreter") {
-        manifest.insert("schema".into(), Value::from(2));
-    } else {
-        manifest.entry("schema").or_insert_with(|| Value::from(1));
+    // Device compatibility: CLI wins; an authored manifest may still provide it.
+    if !options.compat.is_empty() {
+        let mut seen = BTreeSet::new();
+        let mut devices = Vec::new();
+        for device in &options.compat {
+            crate::compat::validate_device_id(device)
+                .map_err(|error| format!("--compat {}: {}", device, error))?;
+            if seen.insert(device.clone()) {
+                devices.push(device.clone());
+            }
+        }
+        manifest.insert("compat".into(), serde_json::json!({ "devices": devices }));
     }
+    let has_kernel_module = sources
+        .iter()
+        .any(|source| source.path.to_ascii_lowercase().ends_with(".ko"));
+    let declared_compat = manifest
+        .get("compat")
+        .and_then(|value| value.get("devices"))
+        .and_then(Value::as_array)
+        .map(|items| !items.is_empty())
+        .unwrap_or(false);
+    if has_kernel_module && !declared_compat {
+        return Err(
+            "the payload contains a kernel module (.ko); pass --compat <device> so it is only \
+             installed on the matching firmware generation"
+                .into(),
+        );
+    }
+
+    let needs_three = declared_compat || has_kernel_module;
+    let needs_two = manifest.contains_key("lifecycle") || manifest.contains_key("interpreter");
+    let computed_schema = if needs_three {
+        3
+    } else if needs_two {
+        2
+    } else {
+        1
+    };
+    let authored_schema = manifest.get("schema").and_then(Value::as_u64).unwrap_or(0) as u32;
+    manifest.insert(
+        "schema".into(),
+        Value::from(computed_schema.max(authored_schema)),
+    );
     manifest.entry("protocol").or_insert_with(|| Value::from(1));
     manifest.insert("name".into(), Value::String(name));
     manifest.insert("version".into(), Value::String(version));
@@ -814,6 +855,38 @@ mod tests {
                 .expect("octal size");
             offset += 512 + size + (512 - size % 512) % 512;
         }
+    }
+
+    #[test]
+    fn a_kernel_module_requires_and_records_the_device_list() {
+        let source = TempDir::new();
+        let work = TempDir::new();
+        let exec_path = if cfg!(windows) {
+            "payload/bin/agent.exe"
+        } else {
+            "payload/bin/agent"
+        };
+        // Native magic keeps the script-payload rules out of the way.
+        write(source.path(), exec_path, b"\x7fELF", 0o755);
+        write(source.path(), "payload/driver.ko", b"\x7fELF", 0o644);
+        let _key = SigningKey::from_bytes(&[31u8; 32]);
+        let key_path = key_file(&work, 31);
+        let out = work.path().join("out.spk");
+        let mut options = bundle_options(source.path(), &out, &key_path);
+
+        let error = bundle(&options).expect_err("kernel module without compat");
+        assert!(error.contains("--compat"), "{error}");
+
+        options.compat = vec!["sr6110".into()];
+        let path = bundle(&options).expect("bundle with compat");
+        let bytes = fs::read(path).expect("read package");
+        let entries = entries(&bytes);
+        let manifest = package::parse_manifest(&entries[0].data).expect("manifest");
+        assert_eq!(manifest.schema, 3);
+        assert_eq!(
+            manifest.compat.expect("compat").devices,
+            ["sr6110".to_string()]
+        );
     }
 
     #[test]

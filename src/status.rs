@@ -89,11 +89,7 @@ impl Status {
         status.details.next_at = epoch_secs_opt(epoch_at_start, machine.next_at_ms);
         status.details.ready_since = epoch_secs_opt(epoch_at_start, machine.ready_since_ms);
         status.details.failures = machine.failures;
-        status.details.restart = Some(if machine.enabled {
-            "on-failure".into()
-        } else {
-            "no".into()
-        });
+        status.details.restart = Some(machine.restart.as_str().into());
         status.details.unkillable = machine.unkillable;
         status
     }
@@ -105,7 +101,7 @@ impl Status {
         status.summary.enabled = true;
         status.summary.pid = None;
         status.summary.since = None;
-        status.details.restart = Some("no".into());
+        status.details.restart = Some(service.restart.as_str().into());
         status
     }
 }
@@ -259,6 +255,9 @@ mod tests {
             }),
             lifecycle: None,
             enabled: true,
+            restart: crate::registry::Restart::OnFailure,
+            remain_after_exit: false,
+            compat: None,
             state: State::Running,
             pid: Some(42),
             since: Some(1_700_000_000),
@@ -334,7 +333,7 @@ mod tests {
         use crate::supervisor::Machine;
 
         let service = demo();
-        let mut machine = Machine::new(true);
+        let mut machine = Machine::new(crate::registry::Restart::OnFailure);
         machine.state = State::Backoff;
         machine.pid = None;
         machine.since_ms = 1_700_000_000_000;

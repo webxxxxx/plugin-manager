@@ -12,7 +12,7 @@ use crate::log::{self, LogSink};
 use crate::paths;
 #[cfg(unix)]
 use crate::reactor::Framing;
-use crate::registry::{Exec, Hook, Interpreter, Lifecycle, Ready, State};
+use crate::registry::{Exec, Hook, Interpreter, Lifecycle, Ready, Restart, State};
 use crate::rpc;
 use crate::supervisor::{self, Action, Event, Machine};
 use crate::threads;
@@ -53,6 +53,11 @@ pub(crate) struct Slot {
     kill_deadline: Option<u64>,
     stop_hook: Option<HookRun>,
     stop_hook_started: bool,
+    /// The backoff elapsed while the pre-retry stop hook was still running;
+    /// spawn as soon as it finishes.
+    backoff_pending: bool,
+    /// A stable crash is running the stop action; spawn when it finishes.
+    cleanup_then_spawn: bool,
     /// The whole service tree on Windows; on Unix the process group is the tree.
     #[cfg(windows)]
     job: Option<crate::proc::Job>,
@@ -60,6 +65,9 @@ pub(crate) struct Slot {
     /// stays `Running` until the whole group is gone.
     pending_exit: Option<Option<i32>>,
     ping_id: u64,
+    /// This slot was rebuilt from a runtime record after a daemon restart, so
+    /// there is no `Child` handle: liveness is polled through the process group.
+    adopted: bool,
 }
 
 struct HookRun {
@@ -84,10 +92,15 @@ pub(crate) enum CallError {
 }
 
 impl Slot {
-    pub(crate) fn new(id: String, exec: Exec, lifecycle: Option<Lifecycle>, enabled: bool) -> Self {
+    pub(crate) fn new(
+        id: String,
+        exec: Exec,
+        lifecycle: Option<Lifecycle>,
+        restart: Restart,
+    ) -> Self {
         Slot {
             id,
-            machine: Machine::new(enabled),
+            machine: Machine::new(restart),
             exec,
             protocol: 1,
             lifecycle,
@@ -110,6 +123,9 @@ impl Slot {
             job: None,
             pending_exit: None,
             ping_id: 1,
+            adopted: false,
+            backoff_pending: false,
+            cleanup_then_spawn: false,
         }
     }
 
@@ -121,8 +137,78 @@ impl Slot {
         self.lifecycle = lifecycle;
     }
 
+    pub(crate) fn set_restart(&mut self, restart: Restart) {
+        self.machine.restart = restart;
+    }
+
+    pub(crate) fn set_remain_after_exit(&mut self, remain_after_exit: bool) {
+        self.machine.remain_after_exit = remain_after_exit;
+    }
+
+    /// Reconnect to a *finished* one-shot: the effect is still there, but there
+    /// is no process to validate or adopt. The record only restores the
+    /// reported state (so an svcd restart does not re-run the work).
+    pub(crate) fn adopt_finished(&mut self, since_ms: u64, last_exit: Option<i32>) {
+        self.machine.state = State::Running;
+        self.machine.pid = None;
+        self.machine.since_ms = since_ms;
+        self.machine.ready_since_ms = None;
+        self.machine.next_at_ms = None;
+        self.machine.last_exit = last_exit;
+        self.adopted = false;
+        log::svcd(&format!(
+            "svcd: {}: restored finished one-shot state (no pid)",
+            self.id
+        ));
+    }
+
+    /// Reconnect this slot to a process that outlived the previous daemon.
+    /// `state` is what the record said: a live `running`/`starting` process is
+    /// adopted as Running. A record that was `stopping` is adopted the same way
+    /// and the caller then runs a normal stop, so the stop action is not lost.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn adopt(
+        &mut self,
+        pid: u32,
+        state: State,
+        since_ms: u64,
+        ready_since_ms: Option<u64>,
+        failures: u32,
+        last_exit: Option<i32>,
+        now: u64,
+    ) {
+        let _ = now;
+        self.machine.pid = Some(pid);
+        self.machine.failures = failures;
+        self.machine.last_exit = last_exit;
+        self.machine.ready_since_ms = ready_since_ms;
+        self.adopted = true;
+        match state {
+            State::Running | State::Starting | State::Stopping => {
+                self.machine.state = State::Running;
+                self.machine.since_ms = since_ms;
+                log::svcd(&format!("svcd: {}: adopted pid {}", self.id, pid));
+            }
+            _ => {
+                self.machine.pid = None;
+                self.adopted = false;
+                self.machine.state = State::Stopped;
+            }
+        }
+    }
+
     pub(crate) fn set_protocol(&mut self, protocol: u32) {
         self.protocol = protocol;
+    }
+
+    /// Seed the state for a service that was already unhealthy at scan time
+    /// (for example a plugin whose compat check failed). No process is attached.
+    pub(crate) fn set_initial_state(&mut self, state: State) {
+        if state == State::Failed {
+            self.machine.state = State::Failed;
+            self.machine.pid = None;
+            self.adopted = false;
+        }
     }
 
     pub(crate) fn set_protocol_only(&mut self, protocol_only: bool) {
@@ -144,6 +230,14 @@ impl Slot {
     pub(crate) fn request_stop(&mut self, now: u64) {
         self.ensure_stop_hook(now);
         self.apply(Event::Stop, now);
+        // A finished one-shot has no process; without a stop hook there is
+        // nothing left to wait for.
+        if self.machine.state == State::Stopping
+            && self.machine.pid.is_none()
+            && self.stop_hook.is_none()
+        {
+            self.apply(Event::StopSettled, now);
+        }
     }
 
     pub(crate) fn pump(&mut self, now: u64) {
@@ -213,6 +307,8 @@ impl Slot {
                 Action::Spawn => {
                     self.abort_stop_hook();
                     self.stop_hook_started = false;
+                    self.backoff_pending = false;
+                    self.cleanup_then_spawn = false;
                     self.fail_pending("service is restarting");
                     match self.spawn() {
                         Ok(pid) => {
@@ -254,7 +350,21 @@ impl Slot {
                 Action::ArmKill => {
                     self.kill_deadline = Some(now.saturating_add(supervisor::KILL_TIMEOUT_MS));
                 }
-                Action::ArmBackoff { .. } => {}
+                // A service that failed may have created half its resources:
+                // run the stop action before the next attempt, like the shell
+                // `svcd` worker does (`run_stop` before the retry sleep).
+                Action::ArmBackoff { .. } => {
+                    self.ensure_stop_hook(now);
+                }
+                // A stable service that just crashed also gets its stop action
+                // before the replacement starts.
+                Action::Cleanup => {
+                    if self.ensure_stop_hook(now) {
+                        self.cleanup_then_spawn = true;
+                    } else {
+                        self.apply(Event::RestartReady, now);
+                    }
+                }
                 Action::Publish => {}
                 Action::Withdraw => self.fail_pending("service is not available"),
                 Action::GiveUp => {
@@ -282,7 +392,7 @@ impl Slot {
             .as_ref()
             .and_then(|lifecycle| lifecycle.start.as_ref());
         let mut command = match start {
-            Some(hook) => hook_command(&self.id, "start", hook),
+            Some(hook) => service_hook_command(&self.id, "start", hook),
             None => command_for(&self.exec),
         };
         let blob_dir = crate::blob::dir();
@@ -464,6 +574,7 @@ impl Slot {
         }
 
         self.child = Some(child);
+        self.adopted = false;
         Ok(pid)
     }
 
@@ -697,6 +808,19 @@ impl Slot {
     }
 
     fn check_exit(&mut self, now: u64) {
+        if self.adopted {
+            let Some(pid) = self.machine.pid else {
+                self.adopted = false;
+                return;
+            };
+            if self.group_alive() {
+                return;
+            }
+            // An adopted process is not our child, so there is no exit status.
+            self.clear_process();
+            self.apply(Event::Exited { pid, code: None }, now);
+            return;
+        }
         if let Some(child) = self.child.as_mut() {
             let status = match child.try_wait() {
                 Ok(Some(status)) => status,
@@ -786,7 +910,13 @@ impl Slot {
         if self.machine.state == State::Backoff {
             if let Some(next_at) = self.machine.next_at_ms {
                 if now >= next_at {
-                    self.apply(Event::BackoffElapsed, now);
+                    // Wait for the pre-retry stop hook so the next attempt
+                    // starts from a clean slate.
+                    if self.stop_hook.is_some() {
+                        self.backoff_pending = true;
+                    } else {
+                        self.apply(Event::BackoffElapsed, now);
+                    }
                 }
             }
         }
@@ -882,7 +1012,15 @@ impl Slot {
             Ok(status) => log::svcd(&format!("svcd: {}: stop hook exited {}", self.id, status)),
             Err(reason) => log::svcd(&format!("svcd: {}: stop hook {}", self.id, reason)),
         }
+        // A stop preempted the pending restart: finish the stop, not the spawn.
         if self.machine.state == State::Stopping {
+            self.cleanup_then_spawn = false;
+            // A finished one-shot has no process to signal: the hook finishing
+            // is the whole stop.
+            if self.machine.pid.is_none() {
+                self.apply(Event::StopSettled, now);
+                return;
+            }
             // Windows has no polite signal for an exec-ready service. Once the
             // stop hook (the only graceful path) is done, terminate the tree
             // instead of burning the whole stop window and force-killing anyway.
@@ -892,6 +1030,18 @@ impl Slot {
                 return;
             }
             self.signal_polite();
+            return;
+        }
+        // A stable crash was cleaning up before its replacement.
+        if self.cleanup_then_spawn {
+            self.cleanup_then_spawn = false;
+            self.apply(Event::RestartReady, now);
+            return;
+        }
+        // A retry was waiting for this cleanup: start the next attempt now.
+        if self.machine.state == State::Backoff && self.backoff_pending {
+            self.backoff_pending = false;
+            self.apply(Event::BackoffElapsed, now);
         }
     }
 
@@ -971,6 +1121,8 @@ impl Slot {
             reactor.unregister(&self.id);
         }
         self.child = None;
+        self.adopted = false;
+        self.cleanup_then_spawn = false;
         self.stdin = None;
         self.frames = None;
         self.start_deadline = None;
@@ -983,18 +1135,32 @@ impl Slot {
 fn command_for(exec: &Exec) -> Command {
     match &exec.interpreter {
         Some(interpreter) => {
-            command_for_interpreter(interpreter, &exec.path, &exec.args, &exec.env)
+            command_for_interpreter(interpreter, &exec.path, &exec.args, &exec.env, false)
         }
-        None => command_for_parts(&exec.path, &exec.args, &exec.env),
+        None => command_for_parts(&exec.path, &exec.args, &exec.env, false),
     }
 }
 
 pub(crate) fn hook_command(id: &str, action: &str, hook: &Hook) -> Command {
+    build_action_command(id, action, hook, true)
+}
+
+/// A `lifecycle.start` action *is* the supervised foreground process, so it is
+/// adoptable after a daemon restart just like `exec`.
+pub(crate) fn service_hook_command(id: &str, action: &str, hook: &Hook) -> Command {
+    build_action_command(id, action, hook, false)
+}
+
+fn build_action_command(id: &str, action: &str, hook: &Hook, hook_lifetime: bool) -> Command {
     let mut command = match &hook.interpreter {
-        Some(interpreter) => {
-            command_for_interpreter(interpreter, &hook.path, &hook.args, &hook.env)
-        }
-        None => command_for_parts(&hook.path, &hook.args, &hook.env),
+        Some(interpreter) => command_for_interpreter(
+            interpreter,
+            &hook.path,
+            &hook.args,
+            &hook.env,
+            hook_lifetime,
+        ),
+        None => command_for_parts(&hook.path, &hook.args, &hook.env, hook_lifetime),
     };
     command
         .env("SVCD_SERVICE_ID", id)
@@ -1013,6 +1179,7 @@ fn command_for_interpreter(
     script: &str,
     args: &[String],
     env: &BTreeMap<String, String>,
+    hook: bool,
 ) -> Command {
     let mut command = Command::new(&interpreter.path);
     command
@@ -1020,11 +1187,15 @@ fn command_for_interpreter(
         .arg(script)
         .args(args)
         .envs(env);
-    crate::proc::configure(&mut command);
-    command
+    configure(command, hook)
 }
 
-fn command_for_parts(path: &str, args: &[String], env: &BTreeMap<String, String>) -> Command {
+fn command_for_parts(
+    path: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    hook: bool,
+) -> Command {
     let extension = std::path::Path::new(path)
         .extension()
         .and_then(|extension| extension.to_str())
@@ -1042,8 +1213,7 @@ fn command_for_parts(path: &str, args: &[String], env: &BTreeMap<String, String>
                 .arg(path)
                 .args(args)
                 .envs(env);
-            crate::proc::configure(&mut command);
-            return command;
+            return configure(command, hook);
         }
         #[cfg(not(windows))]
         {
@@ -1054,8 +1224,7 @@ fn command_for_parts(path: &str, args: &[String], env: &BTreeMap<String, String>
                 .arg(path)
                 .args(args)
                 .envs(env);
-            crate::proc::configure(&mut command);
-            return command;
+            return configure(command, hook);
         }
     }
     #[cfg(windows)]
@@ -1063,12 +1232,20 @@ fn command_for_parts(path: &str, args: &[String], env: &BTreeMap<String, String>
         let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
         let mut command = Command::new(shell);
         command.arg("/C").arg(path).args(args).envs(env);
-        crate::proc::configure(&mut command);
-        return command;
+        return configure(command, hook);
     }
     let mut command = Command::new(path);
     command.args(args).envs(env);
-    crate::proc::configure(&mut command);
+    configure(command, hook)
+}
+
+/// Services are adoptable after a daemon restart, hooks are not.
+fn configure(mut command: Command, hook: bool) -> Command {
+    if hook {
+        crate::proc::configure_hook(&mut command);
+    } else {
+        crate::proc::configure_service(&mut command);
+    }
     command
 }
 
@@ -1137,7 +1314,7 @@ mod tests {
     }
 
     fn slot() -> Slot {
-        Slot::new("demo".into(), exec(), None, true)
+        Slot::new("demo".into(), exec(), None, Restart::OnFailure)
     }
 
     fn queue(slot: &mut Slot, id: u64, deadline: u64) -> Receiver<String> {
@@ -1212,7 +1389,7 @@ mod tests {
         let (receiver, subscription) = crate::uichannel::bus()
             .subscribe("slot-ui-test")
             .expect("subscribe");
-        let mut slot = Slot::new("slot-ui-test".into(), exec(), None, true);
+        let mut slot = Slot::new("slot-ui-test".into(), exec(), None, Restart::OnFailure);
         slot.handle_notification(
             "notifications/message",
             Some(&json!({"level": "info", "data": "hello"})),
@@ -1360,7 +1537,7 @@ done
             ready: Ready::Notify,
             interpreter: None,
         };
-        let mut slot = Slot::new("demo".into(), exec, None, true);
+        let mut slot = Slot::new("demo".into(), exec, None, Restart::OnFailure);
         slot.set_protocol_only(true);
         let started = Instant::now();
         slot.apply(Event::Start, 0);

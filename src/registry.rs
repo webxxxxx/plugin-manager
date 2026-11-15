@@ -35,6 +35,30 @@ pub enum State {
     Failed,
 }
 
+/// Crash-restart policy. `enabled` only decides whether a service starts at
+/// boot; this decides what happens after it exits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Restart {
+    /// Restart after any exit, including a clean one.
+    Always,
+    /// Restart only after a failed exit (non-zero code or signal).
+    #[default]
+    OnFailure,
+    /// Never restart; a clean or failed exit both stop the service.
+    Never,
+}
+
+impl Restart {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Restart::Always => "always",
+            Restart::OnFailure => "on-failure",
+            Restart::Never => "never",
+        }
+    }
+}
+
 impl State {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -144,6 +168,14 @@ pub struct Service {
     pub lifecycle: Option<Lifecycle>,
     /// Boot-start flag (`[auto]` in `svc list`); not the crash-restart policy.
     pub enabled: bool,
+    /// Crash-restart policy; independent of the boot flag.
+    pub restart: Restart,
+    /// A one-shot service: a *successful* exit means "the work is done", so it
+    /// stays `Running` with no pid (systemd's `RemainAfterExit`). `svc start`
+    /// runs it again and `svc stop` only runs the stop action.
+    pub remain_after_exit: bool,
+    /// Device compatibility list (schema-3 plugins); `None` means universal.
+    pub compat: Option<crate::compat::CompatSpec>,
     pub state: State,
     pub pid: Option<u32>,
     pub since: Option<u64>,
@@ -169,6 +201,9 @@ impl Service {
             exec: None,
             lifecycle: None,
             enabled: true,
+            restart: Restart::Never,
+            remain_after_exit: false,
+            compat: None,
             state: State::Running,
             pid: None,
             since: None,

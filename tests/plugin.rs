@@ -82,7 +82,9 @@ impl Sandbox {
             .env("SVCD_CONFIG_DIR", &self.config)
             .env("SVCD_DATA_DIR", &self.data)
             .env("SVCD_LOG_DIR", &self.logs)
-            .env("SVCD_TRUST_DIR", &self.trust);
+            .env("SVCD_TRUST_DIR", &self.trust)
+            .env("SVCD_BOOT_SCAN_WAIT_MS", "0")
+            .env("SVCD_RESCAN_INTERVAL_MS", "0");
     }
 
     fn start_daemon(&mut self) {

@@ -9,6 +9,7 @@ mod channel;
 mod channel_client_reactor;
 #[cfg(unix)]
 mod channel_reactor;
+mod compat;
 mod daemon;
 mod definition;
 mod hook;
@@ -31,6 +32,7 @@ mod proc;
 mod reactor;
 mod registry;
 mod rpc;
+mod runtime;
 mod script;
 #[cfg(windows)]
 mod service_win;

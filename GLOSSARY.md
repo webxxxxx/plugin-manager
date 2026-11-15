@@ -102,3 +102,27 @@ _Avoid_: supervisor、状态机（不带「核」）
 **监督槽（Slot）**:
 一个被监督服务的运行时载体：状态机核 + 子进程 + stdio 管线 + 定时器。
 _Avoid_: 实例、worker
+
+**重启策略（restart）**:
+服务退出后怎么办的声明：`always`（任何退出都重启）、`on-failure`（仅失败退出重启，默认）、`never`（不重启，退出即 stopped）。它和 `enabled`（开机是否启动）是两个独立维度。
+_Avoid_: 自启、enabled、看护策略
+
+**运行态记录（Runtime record）**:
+`<data>/run/<id>.json`：一个服务上一次已知的状态、pid 与 pid starttime。写入时带 boot id，用于 daemon 重启后校验并接管存活进程；不是第二份状态真相，接管后仍以监督槽为准。
+_Avoid_: 状态文件、pidfile、快照
+
+**接管（Adoption）**:
+新 daemon 通过运行态记录确认「进程是上一代的、还活着、没被 pid 复用」之后直接接回监督，而不是重启它。Windows 上由 Job Object 随 daemon 终止进程树，因此只接管「完成态」（无进程）；已经跑完的一次性服务在所有平台都从记录恢复，不重跑。
+_Avoid_: 恢复、重启、重连
+
+**一次性服务（One-shot / RemainAfterExit）**:
+启动动作成功退出后效果仍然存在的服务（建隧道、挂载）。成功退出后保持 `running`、`pid` 为空；`svc start` 重跑，`svc stop` 只跑停止动作。core JSON 用 `remain_after_exit` 显式声明；drop-in shell 脚本在 `restart != always` 时沿用 shell 约定。
+_Avoid_: 守护脚本、短命服务
+
+**兼容标识（device / compat）**:
+设备侧 `<config>/compat.conf` 里的单一 `device = <id>`（如 `sr6110`、`sr6110-v2`）；id 标识「内核/固件兼容代」，不是型号。插件在 schema 3 的 manifest 用 `compat.devices` 列出支持的 id：不写即通用，写了必须精确命中。含 `.ko` 的包必须声明。
+_Avoid_: 设备型号、arch、ABI 版本号、白名单
+
+**reload（`svc reload`）**:
+重新扫描 `services.d` 与插件目录并对账：新增的定义按 `enabled` 启动，删除的定义停掉并遗忘，修改的定义在下次 start 生效。daemon 也会每隔 `SVCD_RESCAN_INTERVAL_MS`（默认 5s）比对目录指纹自动做同一件事；`svc reload` 是手动立即触发。它不是 restart，不碰运行中的进程。
+_Avoid_: refresh、rescan（作为用户命令时）

@@ -23,6 +23,7 @@ pub const EXIT_USAGE: i32 = 64;
 enum DaemonVerb {
     Start,
     Stop,
+    Restart,
     Enable,
     Disable,
 }
@@ -32,6 +33,7 @@ impl DaemonVerb {
         match self {
             DaemonVerb::Start => "start",
             DaemonVerb::Stop => "stop",
+            DaemonVerb::Restart => "restart",
             DaemonVerb::Enable => "enable",
             DaemonVerb::Disable => "disable",
         }
@@ -64,6 +66,14 @@ enum Command {
         verb: DaemonVerb,
         id: String,
     },
+    Reload,
+    Compat {
+        json: bool,
+    },
+    CompatInit {
+        device: String,
+        dry_run: bool,
+    },
     Logs {
         id: String,
         follow: bool,
@@ -91,6 +101,9 @@ pub fn run(args: Vec<String>) -> i32 {
         Command::List => list(),
         Command::Status { id, json } => show_status(&id, json),
         Command::Daemon { verb, id } => daemon_command(verb, &id),
+        Command::Reload => reload(),
+        Command::Compat { json } => compat_show(json),
+        Command::CompatInit { device, dry_run } => compat_init(&device, dry_run),
         Command::Logs { id, follow, lines } => show_logs(&id, follow, lines),
         Command::Auth { action, bind } => auth_command(action, bind.as_deref()),
         Command::Trust { action } => trust_command(action),
@@ -124,13 +137,14 @@ fn parse(args: &[String]) -> Result<Command, ()> {
             }
             id.map(|id| Command::Status { id, json }).ok_or(())
         }
-        "start" | "stop" | "enable" | "disable" => {
+        "start" | "stop" | "restart" | "enable" | "disable" => {
             if args.len() != 2 || args[1].starts_with('-') {
                 return Err(());
             }
             let verb = match command {
                 "start" => DaemonVerb::Start,
                 "stop" => DaemonVerb::Stop,
+                "restart" => DaemonVerb::Restart,
                 "enable" => DaemonVerb::Enable,
                 "disable" => DaemonVerb::Disable,
                 _ => unreachable!("matched daemon command"),
@@ -141,6 +155,8 @@ fn parse(args: &[String]) -> Result<Command, ()> {
             })
         }
         "logs" => parse_logs(&args[1..]),
+        "compat" => parse_compat(&args[1..]),
+        "reload" if args.len() == 1 => Ok(Command::Reload),
         "auth" => parse_auth(&args[1..]),
         "trust" => parse_trust(&args[1..]),
         _ => Err(()),
@@ -200,6 +216,49 @@ fn parse_auth(args: &[String]) -> Result<Command, ()> {
         }
         _ => Err(()),
     }
+}
+
+fn parse_compat(args: &[String]) -> Result<Command, ()> {
+    let Some(first) = args.first().map(String::as_str) else {
+        return Ok(Command::Compat { json: false });
+    };
+    if first == "--json" {
+        return if args.len() == 1 {
+            Ok(Command::Compat { json: true })
+        } else {
+            Err(())
+        };
+    }
+    if first != "init" {
+        return Err(());
+    }
+    let mut device = None;
+    let mut dry_run = false;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--device" => {
+                index += 1;
+                let value = args.get(index).ok_or(())?;
+                device = Some(value.clone());
+            }
+            "--dry-run" => dry_run = true,
+            other => {
+                if let Some(value) = other.strip_prefix("--device=") {
+                    if value.is_empty() {
+                        return Err(());
+                    }
+                    device = Some(value.to_string());
+                } else {
+                    return Err(());
+                }
+            }
+        }
+        index += 1;
+    }
+    device
+        .map(|device| Command::CompatInit { device, dry_run })
+        .ok_or(())
 }
 
 fn parse_logs(args: &[String]) -> Result<Command, ()> {
@@ -313,6 +372,7 @@ fn daemon_command(verb: DaemonVerb, id: &str) -> i32 {
     let method = match verb {
         DaemonVerb::Start => "svc.start",
         DaemonVerb::Stop => "svc.stop",
+        DaemonVerb::Restart => "svc.restart",
         DaemonVerb::Enable => "svc.enable",
         DaemonVerb::Disable => "svc.disable",
     };
@@ -335,6 +395,102 @@ fn daemon_command(verb: DaemonVerb, id: &str) -> i32 {
             EXIT_DAEMON_UNREACHABLE
         }
     }
+}
+
+fn reload() -> i32 {
+    let response = match channel::request(&paths::config_dir(), "svc.reload", json!({})) {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("svc: svcd unreachable: {}", error);
+            return EXIT_DAEMON_UNREACHABLE;
+        }
+    };
+    if let Some(error) = response.error {
+        eprintln!("svc: {}", error.message);
+        return EXIT_SERVICE_ERROR;
+    }
+    let result = response.result.unwrap_or(Value::Null);
+    let ids = |key: &str| {
+        result
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default()
+    };
+    for (key, label) in [
+        ("added", "added"),
+        ("removed", "removed"),
+        ("updated", "updated"),
+    ] {
+        let list = ids(key);
+        if !list.is_empty() {
+            println!("{}: {}", label, list);
+        }
+    }
+    if ids("added").is_empty() && ids("removed").is_empty() && ids("updated").is_empty() {
+        println!("reloaded: no changes");
+    }
+    EXIT_OK
+}
+
+fn compat_show(json: bool) -> i32 {
+    let facts = crate::compat::detect();
+    if json {
+        match serde_json::to_string_pretty(&facts) {
+            Ok(text) => println!("{}", text),
+            Err(error) => {
+                eprintln!("svc: cannot encode compat facts: {}", error);
+                return EXIT_SERVICE_ERROR;
+            }
+        }
+        return EXIT_OK;
+    }
+    println!("platform:      {}", facts.platform);
+    match (&facts.device, &facts.device_source) {
+        (Some(device), Some(source)) => println!("device:        {} ({})", device, source),
+        _ => println!("device:        - (not provisioned)"),
+    }
+    println!(
+        "kernel:        {}",
+        facts.kernel_release.as_deref().unwrap_or("-")
+    );
+    println!("svcd:          {}", facts.svcd_version);
+    println!("schema_max:    {}", facts.schema_max);
+    println!("protocol_max:  {}", facts.protocol_max);
+    println!("marker:        {}", facts.marker_path);
+    for warning in &facts.warnings {
+        eprintln!("svc: warning: {}", warning);
+    }
+    EXIT_OK
+}
+
+fn compat_init(device: &str, dry_run: bool) -> i32 {
+    if let Err(error) = crate::plugin::root_required() {
+        eprintln!("svc: {}", error);
+        return EXIT_SERVICE_ERROR;
+    }
+    if let Err(error) = crate::compat::validate_device_id(device) {
+        eprintln!("svc: {}", error);
+        return EXIT_SERVICE_ERROR;
+    }
+    let path = crate::compat::marker_path();
+    if dry_run {
+        println!("would write {}:", path.display());
+        println!("device = {}", device);
+        return EXIT_OK;
+    }
+    if let Err(error) = crate::compat::write_device(&path, device) {
+        eprintln!("svc: {}", error);
+        return EXIT_SERVICE_ERROR;
+    }
+    println!("wrote {} (device = {})", path.display(), device);
+    compat_show(false)
 }
 
 fn auth_command(action: AuthAction, bind: Option<&str>) -> i32 {
@@ -558,7 +714,10 @@ fn print_status(status: Status, json: bool) -> i32 {
 fn usage() {
     eprintln!("usage: svc list");
     eprintln!("       svc status [--json] <id>");
-    eprintln!("       svc <start|stop|enable|disable> <id>");
+    eprintln!("       svc <start|stop|restart|enable|disable> <id>");
+    eprintln!("       svc reload");
+    eprintln!("       svc compat [--json]");
+    eprintln!("       svc compat init --device <id> [--dry-run]");
     eprintln!("       svc logs <id> [--follow] [--lines N]");
     eprintln!("       svc auth status|enable [--bind <ip>]|disable|passwd <password>");
     eprintln!("       svc trust list|add <file.pub>|remove <keyId>");
@@ -621,9 +780,53 @@ mod tests {
                 id: "demo".into()
             }
         );
+        assert_eq!(
+            parse(&args(&["restart", "demo"])).expect("restart"),
+            Command::Daemon {
+                verb: DaemonVerb::Restart,
+                id: "demo".into()
+            }
+        );
         assert!(parse(&args(&["start"])).is_err());
+        assert!(parse(&args(&["restart"])).is_err());
         assert!(parse(&args(&["stop", "demo", "extra"])).is_err());
         assert!(parse(&args(&["logs", "--follow"])).is_err());
+    }
+
+    #[test]
+    fn parses_reload_and_rejects_extra_arguments() {
+        assert_eq!(parse(&args(&["reload"])).expect("reload"), Command::Reload);
+        assert!(parse(&args(&["reload", "--force"])).is_err());
+    }
+
+    #[test]
+    fn parses_compat_and_rejects_unknown_forms() {
+        assert_eq!(
+            parse(&args(&["compat"])).expect("compat"),
+            Command::Compat { json: false }
+        );
+        assert_eq!(
+            parse(&args(&["compat", "--json"])).expect("compat json"),
+            Command::Compat { json: true }
+        );
+        assert_eq!(
+            parse(&args(&["compat", "init", "--device", "sr6110"])).expect("init"),
+            Command::CompatInit {
+                device: "sr6110".into(),
+                dry_run: false
+            }
+        );
+        assert_eq!(
+            parse(&args(&["compat", "init", "--device=sr6110", "--dry-run"])).expect("init"),
+            Command::CompatInit {
+                device: "sr6110".into(),
+                dry_run: true
+            }
+        );
+        assert!(parse(&args(&["compat", "init"])).is_err());
+        assert!(parse(&args(&["compat", "--json", "init"])).is_err());
+        assert!(parse(&args(&["compat", "init", "--device"])).is_err());
+        assert!(parse(&args(&["compat", "bogus"])).is_err());
     }
 
     #[test]

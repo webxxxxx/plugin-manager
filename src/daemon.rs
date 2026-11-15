@@ -17,6 +17,7 @@ use crate::api::{self, Api};
 type Api = ();
 use crate::catalog;
 use crate::channel;
+use crate::compat;
 use crate::definition;
 use crate::lan::LanStatus;
 use crate::log;
@@ -28,6 +29,7 @@ use crate::plugin::{self, Strategy};
 use crate::reactor::Reactor;
 use crate::registry::{Hook, Kind, Registry, Service, State, RESERVED_ID};
 use crate::rpc;
+use crate::runtime::{self, Record};
 use crate::settings;
 use crate::slot::hook_command;
 use crate::slot::{CallError, Slot};
@@ -91,6 +93,8 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
             error
         ));
     }
+
+    wait_for_services_dir(&paths::services_dir());
 
     let mut loaded = definition::load_services(&paths::services_dir());
     for issue in &loaded.issues {
@@ -156,6 +160,8 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         };
         daemon.set_reactor(reactor);
     }
+    daemon.adopt_runtime();
+    daemon.sweep_runtime_records();
     install_shutdown_signal();
     daemon.start_enabled();
     daemon.event_loop();
@@ -185,7 +191,78 @@ fn notify_systemd(state: &str) {
 #[cfg(not(unix))]
 fn notify_systemd(_state: &str) {}
 
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+/// Name + mtime + size of every entry in `services.d`. Cheap enough to poll;
+/// any create/delete/edit changes it and triggers a reconcile.
+fn services_fingerprint(directory: &Path) -> Vec<(String, u64, u64)> {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut fingerprint: Vec<(String, u64, u64)> = entries
+        .flatten()
+        .map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let (mtime, size) = entry
+                .metadata()
+                .ok()
+                .map(|metadata| {
+                    let mtime = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_nanos() as u64)
+                        .unwrap_or(0);
+                    (mtime, metadata.len())
+                })
+                .unwrap_or((0, 0));
+            (name, mtime, size)
+        })
+        .collect();
+    fingerprint.sort();
+    fingerprint
+}
+
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// The service directory lives on the overlay on read-only-rootfs hosts, so it
+/// can appear a few seconds after inittab starts svcd. Wait for it instead of
+/// scanning an empty tree once and never looking again; `svc reload` covers the
+/// rest. `SVCD_BOOT_SCAN_WAIT_MS=0` disables the wait (tests, desktop).
+fn wait_for_services_dir(dir: &Path) {
+    let budget: u64 = std::env::var("SVCD_BOOT_SCAN_WAIT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(10_000);
+    if dir.is_dir() {
+        return;
+    }
+    let started = Instant::now();
+    loop {
+        if dir.is_dir() {
+            log::svcd(&format!(
+                "svcd: service directory appeared after {}ms: {}",
+                started.elapsed().as_millis(),
+                dir.display()
+            ));
+            return;
+        }
+        if started.elapsed().as_millis() as u64 >= budget {
+            log::svcd(&format!(
+                "svcd: service directory still missing after {}ms: {} (use `svc reload`)",
+                started.elapsed().as_millis(),
+                dir.display()
+            ));
+            return;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
 
 #[cfg(unix)]
 fn install_shutdown_signal() {
@@ -262,6 +339,15 @@ struct Daemon {
     epoch_at_start: SystemTime,
     catalog_version: u64,
     catalog_cache: Option<(u64, Vec<Value>)>,
+    /// Last record written per service: state, pid, failures. Only a change
+    /// here triggers a disk write.
+    persisted: BTreeMap<String, (State, Option<u32>, u32)>,
+    /// Boot identity captured once; every runtime record carries it.
+    boot_id: Option<String>,
+    /// Cheap fingerprint of `services.d`; a change triggers a reconcile.
+    services_fingerprint: Vec<(String, u64, u64)>,
+    rescan_interval_ms: u64,
+    next_rescan_ms: u64,
     #[cfg(unix)]
     reactor: Option<Arc<Reactor>>,
 }
@@ -274,6 +360,10 @@ impl Daemon {
         api: Option<Arc<Api>>,
     ) -> Self {
         let wake = Arc::new(Wake::new());
+        let rescan_interval_ms: u64 = std::env::var("SVCD_RESCAN_INTERVAL_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(5_000);
         let mut slots = BTreeMap::new();
         for service in registry.managed_values() {
             if let Some(exec) = service.exec.clone() {
@@ -281,10 +371,12 @@ impl Daemon {
                     service.id.clone(),
                     exec,
                     service.lifecycle.clone(),
-                    service.enabled,
+                    service.restart,
                 );
                 slot.set_protocol(service.protocol);
                 slot.set_protocol_only(service.kind == Kind::Plugin);
+                slot.set_remain_after_exit(service.remain_after_exit);
+                slot.set_initial_state(service.state);
                 slot.set_wake(wake.clone());
                 slots.insert(service.id.clone(), slot);
             }
@@ -301,6 +393,11 @@ impl Daemon {
             epoch_at_start: SystemTime::now(),
             catalog_version: 1,
             catalog_cache: None,
+            persisted: BTreeMap::new(),
+            boot_id: crate::proc::boot_id(),
+            services_fingerprint: services_fingerprint(&paths::services_dir()),
+            rescan_interval_ms,
+            next_rescan_ms: rescan_interval_ms,
             #[cfg(unix)]
             reactor: None,
         }
@@ -308,6 +405,191 @@ impl Daemon {
 
     fn now_ms(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
+    }
+
+    /// Convert a monotonic supervisor timestamp to epoch seconds.
+    fn epoch_of(&self, ms: u64) -> u64 {
+        let now = self.now_ms();
+        let now_epoch = now_epoch_secs();
+        now_epoch.saturating_sub(now.saturating_sub(ms) / 1000)
+    }
+
+    /// The inverse of [`epoch_of`]: epoch seconds back to a monotonic stamp.
+    fn ms_of(&self, epoch: u64) -> u64 {
+        let now = self.now_ms();
+        let now_epoch = now_epoch_secs();
+        now.saturating_sub(now_epoch.saturating_sub(epoch).saturating_mul(1000))
+    }
+
+    /// Reconnect to processes that survived a previous daemon. A record is only
+    /// trusted when its boot id matches, the pid is alive and the pid's start
+    /// time still matches (a reused pid fails this check). On Windows the job
+    /// objects kill the tree with the daemon, so there is nothing to adopt.
+    fn adopt_runtime(&mut self) {
+        let boot = self.boot_id.clone().or_else(crate::proc::boot_id);
+        let now = self.now_ms();
+        for id in self.slots.keys().cloned().collect::<Vec<_>>() {
+            let Some(record) = runtime::load(&id) else {
+                continue;
+            };
+            if !runtime::same_boot(&record, boot.as_deref()) {
+                log::svcd(&format!(
+                    "svcd: {}: discarding runtime record from another boot",
+                    id
+                ));
+                runtime::remove(&id);
+                continue;
+            }
+            let Some(pid) = record.pid else {
+                // A finished one-shot has no pid but its effect survives: keep
+                // reporting running instead of re-running the work on restart.
+                // This works on every platform because no process is involved.
+                let keep = record.state == State::Running
+                    && self
+                        .slots
+                        .get(&id)
+                        .map(|slot| slot.machine.remain_after_exit)
+                        .unwrap_or(false);
+                if keep {
+                    let since = self.ms_of(record.since.unwrap_or_else(now_epoch_secs));
+                    let last_exit = record.last_exit;
+                    let failures = record.failures;
+                    if let Some(slot) = self.slots.get_mut(&id) {
+                        slot.adopt_finished(since, last_exit);
+                    }
+                    self.persisted
+                        .insert(id.clone(), (State::Running, None, failures));
+                } else {
+                    runtime::remove(&id);
+                }
+                continue;
+            };
+            // Windows has no process to adopt: the job object took the tree
+            // down with the daemon. Records are only cleaned up there.
+            if cfg!(windows) {
+                runtime::remove(&id);
+                continue;
+            }
+            if !crate::proc::alive(pid) {
+                runtime::remove(&id);
+                continue;
+            }
+            if let (Some(expected), Some(actual)) = (record.starttime, crate::proc::start_time(pid))
+            {
+                if expected != actual {
+                    log::svcd(&format!(
+                        "svcd: {}: pid {} was reused (starttime {} != {}); not adopting",
+                        id, pid, actual, expected
+                    ));
+                    runtime::remove(&id);
+                    continue;
+                }
+            }
+            let since = self.ms_of(record.since.unwrap_or_else(now_epoch_secs));
+            let ready = record.ready_since.map(|epoch| self.ms_of(epoch));
+            let failures = record.failures;
+            let last_exit = record.last_exit;
+            let state = record.state;
+            let was_stopping = state == State::Stopping;
+            if let Some(slot) = self.slots.get_mut(&id) {
+                slot.adopt(pid, state, since, ready, failures, last_exit, now);
+                if was_stopping {
+                    // Finish the interrupted stop the same way a live stop
+                    // does: stop action first, then signals and the kill
+                    // window. Otherwise the service's cleanup would be lost.
+                    slot.request_stop(now);
+                }
+                let adopted = slot.machine.state;
+                let adopted_pid = slot.machine.pid;
+                self.persisted
+                    .insert(id.clone(), (adopted, adopted_pid, failures));
+            }
+        }
+    }
+
+    /// Remove runtime records that no longer have a definition. `reload` and
+    /// the daemon's own removal paths clean records for services they know
+    /// about; a definition deleted while the daemon was down leaves an orphan
+    /// that nothing else would ever visit.
+    fn sweep_runtime_records(&mut self) {
+        let directory = paths::run_dir();
+        let Ok(entries) = fs::read_dir(&directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            if self.registry.get(id).is_none() {
+                // A definition deleted while the daemon was down: take its
+                // process group down too (validated by pid + starttime), then
+                // forget the record.
+                if let Some(record) = runtime::load(id) {
+                    if let Some(pid) = record.pid {
+                        let fresh = crate::proc::alive(pid)
+                            && match (record.starttime, crate::proc::start_time(pid)) {
+                                (Some(expected), Some(actual)) => expected == actual,
+                                _ => true,
+                            };
+                        if fresh {
+                            crate::proc::terminate_group(pid);
+                        }
+                    }
+                }
+                runtime::remove(id);
+                self.persisted.remove(id);
+                log::svcd(&format!("svcd: dropped orphan runtime record {}", id));
+            }
+        }
+    }
+
+    /// Write the runtime record of every service whose (state, pid, failures)
+    /// tuple changed since the last write. Stopped/failed services with no pid
+    /// need no record: there is nothing to reconnect.
+    fn persist_states(&mut self) {
+        let boot = self.boot_id.clone();
+        for id in self.slots.keys().cloned().collect::<Vec<_>>() {
+            let (state, pid, failures) = {
+                let machine = &self.slots[&id].machine;
+                (machine.state, machine.pid, machine.failures)
+            };
+            if self.persisted.get(&id) == Some(&(state, pid, failures)) {
+                continue;
+            }
+            if pid.is_none() && matches!(state, State::Stopped | State::Failed) {
+                runtime::remove(&id);
+                self.persisted.remove(&id);
+                continue;
+            }
+            let (since, ready_since, last_exit) = {
+                let machine = &self.slots[&id].machine;
+                (
+                    self.epoch_of(machine.since_ms),
+                    machine.ready_since_ms.map(|ms| self.epoch_of(ms)),
+                    machine.last_exit,
+                )
+            };
+            let record = Record {
+                boot: boot.clone(),
+                state,
+                pid,
+                starttime: pid.and_then(crate::proc::start_time),
+                since: Some(since),
+                ready_since,
+                failures,
+                last_exit,
+            };
+            match runtime::save(&id, &record) {
+                Ok(()) => {
+                    self.persisted.insert(id, (state, pid, failures));
+                }
+                Err(error) => log::svcd(&format!("svcd: {}: cannot persist state: {}", id, error)),
+            }
+        }
     }
 
     fn set_wake(&mut self, wake: Arc<Wake>) {
@@ -328,7 +610,17 @@ impl Daemon {
     fn start_enabled(&mut self) {
         let mut eligible = Vec::new();
         for id in self.slots.keys().cloned().collect::<Vec<_>>() {
-            if !self.slots[&id].machine.enabled {
+            let enabled = self
+                .registry
+                .get(&id)
+                .map(|service| service.enabled)
+                .unwrap_or(false);
+            if !enabled {
+                continue;
+            }
+            // A reload must not resurrect services the operator stopped or
+            // bring a Failed service back behind their back.
+            if self.slots[&id].machine.state != State::Stopped {
                 continue;
             }
             let missing = missing_dependencies(&self.registry, &id);
@@ -374,6 +666,10 @@ impl Daemon {
                 }
             }
             self.pump();
+            if self.rescan_interval_ms > 0 && self.now_ms() >= self.next_rescan_ms {
+                self.next_rescan_ms = self.now_ms().saturating_add(self.rescan_interval_ms);
+                self.rescan_if_changed();
+            }
             if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
                 self.shutdown = true;
             }
@@ -416,6 +712,10 @@ impl Daemon {
         let id = request.id.clone();
         match request.method.as_str() {
             "svcd.ping" => rpc::ok(id, json!({"ok": true})),
+            "svcd.compat" => rpc::ok(
+                id,
+                serde_json::to_value(compat::detect()).unwrap_or(Value::Null),
+            ),
             "svcd.shutdown" => {
                 self.shutdown = true;
                 rpc::ok(id, json!({"ok": true}))
@@ -458,6 +758,14 @@ impl Daemon {
             "svc.disable" => match param_id(&request) {
                 Ok(service_id) => status_response(id, -32005, self.set_enabled(&service_id, false)),
                 Err(response) => response,
+            },
+            "svc.restart" => match param_id(&request) {
+                Ok(service_id) => status_response(id, -32010, self.restart_service(&service_id)),
+                Err(response) => response,
+            },
+            "svc.reload" | "svcd.reload" => match self.reload() {
+                Ok(summary) => rpc::ok(id, summary),
+                Err(error) => rpc::err(id, -32009, &error),
             },
             "plugin.install" => match self.install_plugin(&request) {
                 Ok(status) => rpc::ok(id, status_json(status)),
@@ -784,6 +1092,179 @@ impl Daemon {
         }
     }
 
+    /// Re-scan `services.d` plus the plugin store and reconcile the registry.
+    /// Running services keep running (a changed exec applies at the next start);
+    /// definitions that disappeared are stopped and forgotten. This is the
+    /// recovery path for a late overlay mount, and the operator's way to pick
+    /// up a hand-edited definition without restarting the daemon.
+    /// Reconcile when `services.d` changed since the last scan: a definition
+    /// dropped in while the daemon runs starts (if enabled), a deleted one is
+    /// stopped and forgotten. This mirrors the shell `svcd` poll loop.
+    fn rescan_if_changed(&mut self) {
+        let fingerprint = services_fingerprint(&paths::services_dir());
+        if fingerprint == self.services_fingerprint {
+            return;
+        }
+        self.services_fingerprint = fingerprint;
+        match self.reconcile_definitions() {
+            Ok(summary) => {
+                let changed = ["added", "removed", "updated"].iter().any(|key| {
+                    summary
+                        .get(key)
+                        .and_then(Value::as_array)
+                        .map(|items| !items.is_empty())
+                        .unwrap_or(false)
+                });
+                if changed {
+                    log::svcd(&format!("svcd: rescan: {}", summary));
+                }
+            }
+            Err(error) => log::svcd(&format!("svcd: rescan failed: {}", error)),
+        }
+    }
+
+    fn reload(&mut self) -> Result<Value, String> {
+        let summary = self.reconcile_definitions()?;
+        self.services_fingerprint = services_fingerprint(&paths::services_dir());
+        Ok(summary)
+    }
+
+    /// Re-scan `services.d` plus the plugin store and reconcile the registry.
+    /// Running services keep running (a changed exec applies at the next start);
+    /// definitions that disappeared are stopped and forgotten. Shared by
+    /// `svc reload`, the periodic rescan, and boot recovery.
+    fn reconcile_definitions(&mut self) -> Result<Value, String> {
+        let loaded = definition::load_services(&paths::services_dir());
+        for issue in &loaded.issues {
+            log::svcd(&format!("svcd: reload: warning: {}", issue));
+        }
+        let mut desired: BTreeMap<String, Service> = loaded
+            .registry
+            .managed_values()
+            .cloned()
+            .map(|service| (service.id.clone(), service))
+            .collect();
+        let (plugins, warnings) = plugin::scan();
+        for warning in warnings {
+            log::svcd(&format!("svcd: reload: plugin: {}", warning));
+        }
+        for service in plugins {
+            // A core definition with the same id wins, and an installed plugin
+            // is already authoritative in the registry (install updates it).
+            if desired.contains_key(&service.id) || self.registry.get(&service.id).is_some() {
+                continue;
+            }
+            desired.insert(service.id.clone(), service);
+        }
+
+        let mut removed = Vec::new();
+        let stale: Vec<String> = self
+            .registry
+            .managed_values()
+            .map(|service| service.id.clone())
+            .filter(|id| !desired.contains_key(id))
+            .collect();
+        for id in stale {
+            let active = self
+                .slots
+                .get(&id)
+                .map(|slot| {
+                    matches!(
+                        slot.machine.state,
+                        State::Starting | State::Running | State::Stopping | State::Backoff
+                    )
+                })
+                .unwrap_or(false);
+            if active {
+                let _ = self.stop_service(&id);
+            }
+            self.slots.remove(&id);
+            self.registry.remove(&id);
+            runtime::remove(&id);
+            self.persisted.remove(&id);
+            log::svcd(&format!("svcd: reload: removed {}", id));
+            removed.push(id);
+        }
+
+        let mut added = Vec::new();
+        let mut updated = Vec::new();
+        for (id, service) in desired {
+            match self.registry.get(&id).cloned() {
+                None => {
+                    let exec = service.exec.clone();
+                    let lifecycle = service.lifecycle.clone();
+                    let restart = service.restart;
+                    let protocol = service.protocol;
+                    let plugin_only = service.kind == Kind::Plugin;
+                    let remain_after_exit = service.remain_after_exit;
+                    if let Some(exec) = exec {
+                        let mut slot = Slot::new(id.clone(), exec, lifecycle, restart);
+                        slot.set_protocol(protocol);
+                        slot.set_protocol_only(plugin_only);
+                        slot.set_remain_after_exit(remain_after_exit);
+                        slot.set_wake(self.wake.clone());
+                        #[cfg(unix)]
+                        slot.set_reactor(self.reactor.clone());
+                        self.slots.insert(id.clone(), slot);
+                    }
+                    self.registry.insert(service)?;
+                    log::svcd(&format!("svcd: reload: added {}", id));
+                    added.push(id);
+                }
+                Some(old) => {
+                    // Plugins are managed through install/uninstall RPCs; scanning
+                    // their store must not overwrite live install state.
+                    if old.kind == Kind::Plugin && service.kind == Kind::Plugin {
+                        continue;
+                    }
+                    let mut next = service;
+                    next.state = old.state;
+                    next.pid = old.pid;
+                    next.since = old.since;
+                    next.ready_since = old.ready_since;
+                    next.next_at = old.next_at;
+                    next.failures = old.failures;
+                    next.last_exit = old.last_exit;
+                    let exec = next.exec.clone();
+                    let lifecycle = next.lifecycle.clone();
+                    let restart = next.restart;
+                    let remain_after_exit = next.remain_after_exit;
+                    let protocol = next.protocol;
+                    *self.registry.get_mut(&id).expect("service is present") = next;
+                    if let Some(slot) = self.slots.get_mut(&id) {
+                        if let Some(exec) = exec {
+                            slot.set_exec(exec);
+                        }
+                        slot.set_lifecycle(lifecycle);
+                        slot.set_restart(restart);
+                        slot.set_remain_after_exit(remain_after_exit);
+                        slot.set_protocol(protocol);
+                    }
+                    log::svcd(&format!("svcd: reload: updated {}", id));
+                    updated.push(id);
+                }
+            }
+        }
+
+        // Only definitions that appeared *now* are started: a reload must not
+        // resurrect services the operator stopped, nor retry Failed ones.
+        for id in &added {
+            let enabled = self
+                .registry
+                .get(id)
+                .map(|service| service.enabled)
+                .unwrap_or(false);
+            if enabled {
+                if let Err(error) = self.start_service(id) {
+                    log::svcd(&format!("svcd: reload: cannot start {}: {}", id, error));
+                }
+            }
+        }
+        self.sweep_runtime_records();
+        self.bump_catalog();
+        Ok(json!({ "added": added, "removed": removed, "updated": updated }))
+    }
+
     fn start_service(&mut self, id: &str) -> Result<Status, String> {
         if self.registry.get(id).is_none() {
             return Err(format!("unknown service: {}", id));
@@ -791,14 +1272,47 @@ impl Daemon {
         if id == RESERVED_ID {
             return Ok(self.status_for_id(id).expect("builtin"));
         }
+        // A restricted package must never start on a host it does not support,
+        // even if the marker changed after it was installed.
+        if let Some(service) = self.registry.get(id) {
+            let devices = service
+                .compat
+                .as_ref()
+                .map(|spec| spec.devices.clone())
+                .unwrap_or_default();
+            if let Some(reason) = compat::verdict_reason(compat::evaluate(
+                package::target(),
+                &devices,
+                &compat::detect(),
+            )) {
+                return Err(format!("{}: {}", id, reason));
+            }
+        }
         if let Some(service) = self.registry.get(id) {
             let exec = service.exec.clone();
             let lifecycle = service.lifecycle.clone();
+            let restart = service.restart;
+            let remain_after_exit = service.remain_after_exit;
             if let Some(slot) = self.slots.get_mut(id) {
                 if let Some(exec) = exec {
                     slot.set_exec(exec);
                 }
                 slot.set_lifecycle(lifecycle);
+                slot.set_restart(restart);
+                slot.set_remain_after_exit(remain_after_exit);
+            }
+        }
+
+        // A finished one-shot is `Running` with no pid. An explicit start must
+        // run it again, while a dependency in the same state stays satisfied
+        // (start_layer skips Running services).
+        let now = self.now_ms();
+        if let Some(slot) = self.slots.get_mut(id) {
+            if slot.machine.state == State::Running
+                && slot.machine.pid.is_none()
+                && slot.machine.remain_after_exit
+            {
+                slot.apply(Event::Start, now);
             }
         }
 
@@ -902,6 +1416,21 @@ impl Daemon {
                 return Err(format!("id is a core service: {}", id));
             }
         }
+        // Device compatibility is checked before anything is stopped or
+        // written: a wrong package must leave the installed version untouched.
+        let devices = package
+            .manifest
+            .compat
+            .as_ref()
+            .map(|spec| spec.devices.clone())
+            .unwrap_or_default();
+        if let Some(reason) = compat::verdict_reason(compat::evaluate(
+            package::target(),
+            &devices,
+            &compat::detect(),
+        )) {
+            return Err(reason);
+        }
         // Refuse a hook package or an unresolvable interpreter before a replace
         // strategy stops the running version: a policy rejection must not leave
         // the plugin stopped.
@@ -944,9 +1473,10 @@ impl Daemon {
             self.slots.remove(&id);
             if let Some(exec) = service.exec.clone() {
                 let mut slot =
-                    Slot::new(id.clone(), exec, service.lifecycle.clone(), service.enabled);
+                    Slot::new(id.clone(), exec, service.lifecycle.clone(), service.restart);
                 slot.set_protocol(service.protocol);
                 slot.set_protocol_only(true);
+                slot.set_remain_after_exit(service.remain_after_exit);
                 slot.set_wake(self.wake.clone());
                 #[cfg(unix)]
                 slot.set_reactor(self.reactor.clone());
@@ -999,6 +1529,8 @@ impl Daemon {
         plugin::uninstall(id, purge)?;
         self.slots.remove(id);
         self.registry.remove(id);
+        runtime::remove(id);
+        self.persisted.remove(id);
         self.bump_catalog();
         if purge {
             plugin::remove_logs(id);
@@ -1042,11 +1574,25 @@ impl Daemon {
         if let Some(service) = self.registry.get_mut(id) {
             service.enabled = enabled;
         }
-        if let Some(slot) = self.slots.get_mut(id) {
-            slot.machine.enabled = enabled;
-        }
+        // `disable` changes the boot flag only. The crash-restart policy is a
+        // separate service property and must not be turned off behind the
+        // operator's back.
         self.status_for_id(id)
             .ok_or_else(|| format!("unknown service: {}", id))
+    }
+
+    /// `svc restart` = stop then start, on one RPC so no other caller can slip
+    /// in between. A finished one-shot is stopped (settles immediately) and
+    /// then runs again.
+    fn restart_service(&mut self, id: &str) -> Result<Status, String> {
+        if self.registry.get(id).is_none() {
+            return Err(format!("unknown service: {}", id));
+        }
+        if id == RESERVED_ID {
+            return Ok(self.status_for_id(id).expect("builtin"));
+        }
+        self.stop_service(id)?;
+        self.start_service(id)
     }
 
     fn stop_service(&mut self, id: &str) -> Result<Status, String> {
@@ -1105,6 +1651,7 @@ impl Daemon {
         if changed {
             self.bump_catalog();
         }
+        self.persist_states();
     }
 
     fn stop_all(&mut self) {
@@ -1418,6 +1965,9 @@ mod tests {
             }),
             lifecycle: None,
             enabled: true,
+            restart: crate::registry::Restart::OnFailure,
+            remain_after_exit: false,
+            compat: None,
             state: State::Stopped,
             pid: None,
             since: None,
@@ -1635,6 +2185,9 @@ while ($null -ne ($line = $reader.ReadLine())) {
             exec: Some(tool_agent(&root)),
             lifecycle: None,
             enabled: true,
+            restart: crate::registry::Restart::OnFailure,
+            remain_after_exit: false,
+            compat: None,
             state: State::Stopped,
             pid: None,
             since: None,

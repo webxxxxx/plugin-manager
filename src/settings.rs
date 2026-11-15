@@ -281,6 +281,31 @@ mod tests {
     }
 
     #[test]
+    fn blank_lines_and_duplicate_keys_are_tolerated() {
+        let settings = parse(
+            "http_port = 8787\n\n   \n# comment\nhttp_port = 9090\n",
+            Path::new("/etc/svcd"),
+        )
+        .expect("parse");
+        assert_eq!(settings.http_port, Some(9090), "the last declaration wins");
+    }
+
+    #[test]
+    fn update_value_collapses_duplicate_keys() {
+        let directory = std::env::temp_dir().join(format!("svcd-settings-{}", std::process::id()));
+        fs::create_dir_all(&directory).expect("temp dir");
+        let path = directory.join("svcd.conf");
+        fs::write(&path, "http_port = 1\n\nhttp_port = 2\nlan_default = yes\n")
+            .expect("write conf");
+        update_value(&path, "http_port", "3").expect("update");
+        let text = fs::read_to_string(&path).expect("read conf");
+        assert_eq!(text.matches("http_port").count(), 1, "{text}");
+        assert!(text.contains("http_port = 3"), "{text}");
+        assert!(text.contains("lan_default = yes"), "{text}");
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
     fn temp_defaults_are_two_hours_and_five_minutes() {
         let settings = Settings::default();
         assert_eq!(settings.temp_retention().as_secs(), 2 * 60 * 60);

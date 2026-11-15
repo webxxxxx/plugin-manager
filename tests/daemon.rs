@@ -333,10 +333,17 @@ impl Sandbox {
             .env("SVCD_DATA_DIR", &self.data)
             .env("SVCD_LOG_DIR", &self.logs)
             .env("SVCD_TRUST_DIR", &self.trust)
-            .env("SVCD_TEST_UNPRIVILEGED", "1");
+            .env("SVCD_TEST_UNPRIVILEGED", "1")
+            // Tests drive definitions explicitly; the periodic rescan is opt-in
+            // per test via `start_daemon_with_env`.
+            .env("SVCD_RESCAN_INTERVAL_MS", "0");
     }
 
     fn start_daemon(&mut self) {
+        self.start_daemon_with_env(&[]);
+    }
+
+    fn start_daemon_with_env(&mut self, extra: &[(&str, &str)]) {
         let stderr = fs::File::create(&self.daemon_stderr).expect("create daemon log");
         let mut command = Command::new(&self.svcd);
         command
@@ -345,6 +352,9 @@ impl Sandbox {
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr));
         self.env(&mut command);
+        for (key, value) in extra {
+            command.env(key, value);
+        }
         self.daemon = Some(command.spawn().expect("spawn daemon"));
     }
 
@@ -1233,6 +1243,121 @@ done
         .expect("write definition");
     }
 
+    /// Add or replace the `restart` policy of an already written definition.
+    fn set_restart(&self, id: &str, policy: &str) {
+        let path = self.config.join("services.d").join(format!("{}.json", id));
+        let mut value: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read definition")).expect("json");
+        value["restart"] = json!(policy);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&value).expect("definition"),
+        )
+        .expect("write definition");
+    }
+
+    /// A one-shot service: a process that exits 0 immediately, kept `running`
+    /// with no pid (RemainAfterExit).
+    fn write_one_shot(&self, id: &str) {
+        let (path, args) = if cfg!(windows) {
+            (r"C:\Windows\System32\cmd.exe", json!(["/c", "exit", "0"]))
+        } else {
+            ("/bin/true", json!([]))
+        };
+        let definition = json!({
+            "schema": 1,
+            "id": id,
+            "version": "1.0.0",
+            "desc": "one shot",
+            "protocol": 1,
+            "exec": {"path": path, "args": args, "ready": "exec"},
+            "restart": "never",
+            "remain_after_exit": true
+        });
+        fs::write(
+            self.config.join("services.d").join(format!("{}.json", id)),
+            serde_json::to_vec_pretty(&definition).expect("definition"),
+        )
+        .expect("write definition");
+    }
+
+    /// A stop/cleanup action that records that it ran.
+    fn write_hook_script(&self, name: &str, marker: &Path) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let path = self.root.join(format!("{}.cmd", name));
+            fs::write(
+                &path,
+                format!("@echo off\r\necho stop>>\"{}\"\r\n", marker.display()),
+            )
+            .expect("write hook script");
+            path
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.root.join(format!("{}.sh", name));
+            fs::write(
+                &path,
+                format!("#!/bin/sh\necho stop >> \"{}\"\n", marker.display()),
+            )
+            .expect("write hook script");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                .expect("chmod hook script");
+            path
+        }
+    }
+
+    /// Provision the host compatibility id the way `svc compat init` does.
+    fn write_device_marker(&self, device: &str) {
+        fs::write(
+            self.config.join("compat.conf"),
+            format!("device = {}\n", device),
+        )
+        .expect("write compat marker");
+    }
+
+    /// A schema-3 plugin restricted to the given device ids.
+    fn write_compat_package(&self, id: &str, devices: &[&str]) -> PathBuf {
+        let key = SigningKey::from_bytes(&[0x5au8; 32]);
+        fs::write(
+            self.trust.join("test.pub"),
+            pem_from_public(&key.verifying_key().to_bytes()),
+        )
+        .expect("trust key");
+        let agent = self.write_agent();
+        let exec_path = if cfg!(windows) {
+            "payload/bin/agent.ps1".to_string()
+        } else {
+            "payload/bin/agent.sh".to_string()
+        };
+        let agent_bytes = fs::read(&agent).expect("read agent");
+        let files = vec![(exec_path.clone(), agent_bytes, 0o755)];
+        let interpreter = if cfg!(windows) {
+            json!({"name": "powershell", "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]})
+        } else {
+            json!({"name": "sh"})
+        };
+        let manifest = json!({
+            "schema": 3,
+            "name": id,
+            "version": "1.0.0",
+            "desc": "device restricted plugin",
+            "platform": target(),
+            "protocol": 1,
+            "compat": {"devices": devices},
+            "exec": {"path": exec_path, "args": [], "ready": "notify"},
+            "interpreter": interpreter,
+            "capabilities": [
+                {"name": "echo", "desc": "echo", "inputSchema": {"type": "object"}}
+            ]
+        });
+        let package = signed_package(&key, manifest, &files);
+        let path = self.root.join(format!("{}.spk", id));
+        fs::write(&path, package).expect("write spk");
+        path
+    }
+
     /// A drop-in script service that ignores stdin (ready = Exec) and exits when
     /// its stop action writes a sidecar file, so stops are fast on Windows too.
     fn write_stop_script(&self, id: &str) {
@@ -1506,6 +1631,15 @@ fn state_matrix_for_plugin_service() {
     let package = sandbox.write_plugin_package("plug");
     sandbox.start_daemon();
     sandbox.install_plugin("plug", &package);
+    // A fresh install is disabled; opt in to autostart so the matrix matches
+    // the enabled core services (the install default has its own test).
+    assert_eq!(
+        sandbox
+            .run_when_ready_plugin(&["enable", "plug"])
+            .status
+            .code(),
+        Some(0)
+    );
     assert_state_matrix(&sandbox, "plug", "plugin", false);
 }
 
@@ -1560,7 +1694,7 @@ fn five_quick_crashes_enter_failed_and_explicit_start_resets() {
 }
 
 #[test]
-fn a_disabled_service_crashes_to_stopped_without_restart() {
+fn disable_keeps_the_crash_restart_policy() {
     let mut sandbox = Sandbox::new();
     sandbox.write_core_json("off");
     sandbox.start_daemon();
@@ -1577,8 +1711,28 @@ fn a_disabled_service_crashes_to_stopped_without_restart() {
         "{backoff}"
     );
 
-    let stopped = sandbox.wait_for_state("off", "stopped", Duration::from_secs(10));
+    // enabled only gates the boot start; the default on-failure policy still
+    // brings the process back.
+    let restarted = sandbox.wait_for_restart("off", pid, Duration::from_secs(20));
+    assert_eq!(restarted["summary"]["enabled"], false, "{restarted}");
+    sandbox.stop_service("off");
+}
+
+#[test]
+fn a_never_policy_service_stops_without_restarting() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_core_json("once");
+    sandbox.set_restart("once", "never");
+    sandbox.start_daemon();
+
+    let running = sandbox.wait_for_state("once", "running", Duration::from_secs(15));
+    assert_eq!(running["details"]["restart"], "never", "{running}");
+    let pid = running["summary"]["pid"].as_u64().expect("pid");
+    kill_pid(pid as u32);
+
+    let stopped = sandbox.wait_for_state("once", "stopped", Duration::from_secs(10));
     assert!(stopped["summary"]["pid"].is_null(), "{stopped}");
+    assert_eq!(stopped["details"]["failures"], 0, "{stopped}");
     assert!(!pid_alive(pid as u32));
 }
 
@@ -1594,6 +1748,14 @@ fn graceful_svcd_restart_boots_enabled_services_and_skips_disabled() {
     sandbox.start_daemon();
     let package = sandbox.write_plugin_package("plug");
     sandbox.install_plugin("plug", &package);
+    // Fresh installs are disabled; boot-start requires the opt-in.
+    assert_eq!(
+        sandbox
+            .run_when_ready_plugin(&["enable", "plug"])
+            .status
+            .code(),
+        Some(0)
+    );
 
     let mut pids = Vec::new();
     for id in ["core", "script", "plug"] {
@@ -1643,10 +1805,765 @@ fn builtin_svc_stays_running_and_ignores_start_stop() {
     assert_eq!(sandbox.status("svc")["summary"]["state"], "running");
 }
 
-/// An abrupt svcd death must take its supervised processes with it: the OS
-/// parent-death protection (Windows job object / Linux PDEATHSIG) reaps every
-/// child, so the restarted daemon starts exactly one instance per service and
-/// never meets a leftover from the previous run.
+#[test]
+fn an_install_for_another_device_is_rejected() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_device_marker("sr6110");
+    let package = sandbox.write_compat_package("plug", &["sr1010"]);
+    sandbox.start_daemon();
+
+    let output = sandbox.run_when_ready_plugin(&["install", package.to_str().expect("path")]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("requires device"), "{stderr}");
+
+    let list = sandbox.run_when_ready_plugin(&["list"]);
+    assert!(
+        !String::from_utf8_lossy(&list.stdout).contains("plug"),
+        "rejected package leaked into the list"
+    );
+}
+
+#[test]
+fn an_install_for_this_device_is_accepted() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_device_marker("sr6110");
+    let package = sandbox.write_compat_package("plug", &["sr6110", "sr1010-v1"]);
+    sandbox.start_daemon();
+    sandbox.install_plugin("plug", &package);
+
+    let status = sandbox.status("plug");
+    assert_eq!(status["summary"]["kind"], "plugin", "{status}");
+    assert_eq!(status["summary"]["enabled"], false, "{status}");
+}
+
+#[test]
+fn a_universal_package_installs_without_a_marker() {
+    let mut sandbox = Sandbox::new();
+    let package = sandbox.write_plugin_package("plug");
+    sandbox.start_daemon();
+    sandbox.install_plugin("plug", &package);
+    assert_eq!(sandbox.status("plug")["summary"]["kind"], "plugin");
+}
+
+#[test]
+fn a_marker_change_marks_an_installed_plugin_failed() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_device_marker("sr6110");
+    let package = sandbox.write_compat_package("plug", &["sr6110"]);
+    sandbox.start_daemon();
+    sandbox.install_plugin("plug", &package);
+    sandbox.shutdown();
+
+    // The firmware changes generation under the same installation.
+    sandbox.write_device_marker("sr1010");
+    sandbox.start_daemon();
+
+    let status = sandbox.status("plug");
+    assert_eq!(status["summary"]["state"], "failed", "{status}");
+    assert!(status["summary"]["pid"].is_null(), "{status}");
+
+    let started = sandbox.run_when_ready(&["start", "plug"]);
+    assert_eq!(started.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&started.stderr).contains("requires device"),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+}
+
+#[test]
+fn a_fresh_plugin_install_is_disabled_until_enabled() {
+    let mut sandbox = Sandbox::new();
+    let package = sandbox.write_plugin_package("plug");
+    sandbox.start_daemon();
+    sandbox.install_plugin("plug", &package);
+
+    let status = sandbox.status("plug");
+    assert_eq!(status["summary"]["enabled"], false, "{status}");
+    assert_eq!(status["summary"]["state"], "stopped", "{status}");
+
+    // `plugin enable` flips the boot flag without starting the process.
+    let enabled = sandbox.run_when_ready_plugin(&["enable", "plug"]);
+    assert_eq!(
+        enabled.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+    let status = sandbox.status("plug");
+    assert_eq!(status["summary"]["enabled"], true, "{status}");
+    assert_eq!(status["summary"]["state"], "stopped", "{status}");
+
+    let disabled = sandbox.run_when_ready_plugin(&["disable", "plug"]);
+    assert_eq!(
+        disabled.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&disabled.stderr)
+    );
+    assert_eq!(sandbox.status("plug")["summary"]["enabled"], false);
+
+    // The plugin entry refuses core services.
+    sandbox.write_core_json("core");
+    assert_eq!(
+        sandbox
+            .run_when_ready_plugin(&["enable", "core"])
+            .status
+            .code(),
+        Some(1)
+    );
+}
+
+#[test]
+fn reload_picks_up_definitions_written_after_boot() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    // Wait for the boot scan to finish before adding the definition.
+    sandbox.run_when_ready(&["list"]);
+    sandbox.write_core_json("late");
+
+    let output = sandbox.run_when_ready(&["reload"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("added: late"), "reload output: {}", text);
+
+    let status = sandbox.wait_for_state("late", "running", Duration::from_secs(15));
+    assert_eq!(status["summary"]["enabled"], true, "{status}");
+    sandbox.stop_service("late");
+}
+
+#[test]
+fn reload_stops_and_forgets_a_deleted_definition() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_core_json("gone");
+    sandbox.start_daemon();
+    let pid = sandbox.running_pid("gone");
+
+    fs::remove_file(sandbox.config.join("services.d").join("gone.json"))
+        .expect("remove definition");
+    let output = sandbox.run_when_ready(&["reload"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("removed: gone"), "reload output: {}", text);
+
+    wait_until(
+        "the removed service to exit",
+        Duration::from_secs(15),
+        || !pid_alive(pid),
+    );
+    let status = sandbox.run_when_ready(&["status", "gone"]);
+    assert_eq!(status.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&status.stderr).contains("unknown service"));
+}
+
+#[test]
+fn reload_without_changes_reports_nothing_to_do() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+
+    let output = sandbox.run_when_ready(&["reload"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("no changes"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn a_one_shot_service_stays_running_after_it_finishes() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_one_shot("once");
+    sandbox.start_daemon();
+
+    // Boot starts it. Once the process exits 0 the service stays running with
+    // no pid instead of flipping to stopped.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = sandbox.status("once");
+        if status["summary"]["state"] == "running"
+            && status["summary"]["pid"].is_null()
+            && status["details"]["last_exit"] == json!(0)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "one-shot never settled into running/pid-null: {}",
+            status
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // Starting again is allowed and returns to the same finished state.
+    let again = sandbox.start_when_ready("once");
+    assert_eq!(
+        again.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = sandbox.status("once");
+        if status["summary"]["state"] == "running" && status["summary"]["pid"].is_null() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the re-run never settled into running/pid-null: {}",
+            status
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // Stop only runs the stop action (none here) and settles immediately.
+    let stopped = sandbox.stop_service("once");
+    assert_eq!(stopped["summary"]["state"], "stopped", "{stopped}");
+    assert!(stopped["summary"]["pid"].is_null(), "{stopped}");
+    assert_ne!(stopped["summary"]["state"], "failed");
+}
+
+#[test]
+fn a_finished_one_shot_dependency_is_not_rerun() {
+    let mut sandbox = Sandbox::new();
+    let marker = sandbox.config.join("services.d").join("once-marker.txt");
+    #[cfg(windows)]
+    let body = "@echo off\r\necho once>>\"%~dp0once-marker.txt\"\r\n";
+    #[cfg(unix)]
+    let body = "#!/bin/sh\necho once >> \"$(dirname \"$0\")/once-marker.txt\"\n";
+    sandbox.write_script_body("once", body);
+    sandbox.write_service("app", &["once"], Script::Ready);
+
+    sandbox.start_daemon();
+    let status = sandbox.wait_for_state("once", "running", Duration::from_secs(15));
+    assert!(status["summary"]["pid"].is_null(), "{status}");
+    sandbox.wait_for_state("app", "running", Duration::from_secs(15));
+    wait_until(
+        "the one-shot body to run once",
+        Duration::from_secs(5),
+        || {
+            fs::read_to_string(&marker)
+                .map(|text| text.lines().count() == 1)
+                .unwrap_or(false)
+        },
+    );
+
+    // Starting the dependent again must not re-execute the finished one-shot.
+    sandbox.stop_service("app");
+    sandbox.start_service("app");
+    std::thread::sleep(Duration::from_millis(200));
+    let runs = fs::read_to_string(&marker).expect("marker").lines().count();
+    assert_eq!(runs, 1, "the one-shot dependency ran again");
+    sandbox.stop_service("app");
+}
+
+#[test]
+fn restart_reruns_a_finished_one_shot() {
+    let mut sandbox = Sandbox::new();
+    let marker = sandbox.config.join("services.d").join("once-marker.txt");
+    #[cfg(windows)]
+    let body = "@echo off\r\necho once>>\"%~dp0once-marker.txt\"\r\n";
+    #[cfg(unix)]
+    let body = "#!/bin/sh\necho once >> \"$(dirname \"$0\")/once-marker.txt\"\n";
+    sandbox.write_script_body("once", body);
+
+    sandbox.start_daemon();
+    wait_until("the first run", Duration::from_secs(15), || {
+        let output = sandbox.run_svc(&["status", "once", "--json"]);
+        if output.status.code() != Some(0) {
+            return false;
+        }
+        let settled = serde_json::from_slice::<Value>(&output.stdout)
+            .map(|value| value["summary"]["pid"].is_null())
+            .unwrap_or(false);
+        settled
+            && fs::read_to_string(&marker)
+                .map(|text| text.lines().count() == 1)
+                .unwrap_or(false)
+    });
+
+    let output = sandbox.run_when_ready(&["restart", "once"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_until("the re-run", Duration::from_secs(15), || {
+        let output = sandbox.run_svc(&["status", "once", "--json"]);
+        if output.status.code() != Some(0) {
+            return false;
+        }
+        let settled = serde_json::from_slice::<Value>(&output.stdout)
+            .map(|value| value["summary"]["pid"].is_null())
+            .unwrap_or(false);
+        settled
+            && fs::read_to_string(&marker)
+                .map(|text| text.lines().count() == 2)
+                .unwrap_or(false)
+    });
+    let status = sandbox.status("once");
+    assert_eq!(status["summary"]["state"], "running", "{status}");
+    assert!(status["summary"]["pid"].is_null(), "{status}");
+}
+
+#[test]
+fn a_finished_one_shot_is_not_rerun_after_a_daemon_restart() {
+    let mut sandbox = Sandbox::new();
+    let marker = sandbox.config.join("services.d").join("once-marker.txt");
+    #[cfg(windows)]
+    let body = "@echo off\r\necho once>>\"%~dp0once-marker.txt\"\r\n";
+    #[cfg(unix)]
+    let body = "#!/bin/sh\necho once >> \"$(dirname \"$0\")/once-marker.txt\"\n";
+    sandbox.write_script_body("once", body);
+
+    sandbox.start_daemon();
+    let record = sandbox.data.join("run").join("once.json");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = sandbox.status("once");
+        let recorded_done = fs::read_to_string(&record)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .map(|value| value["state"] == "running" && value["pid"].is_null())
+            .unwrap_or(false);
+        if status["summary"]["state"] == "running"
+            && status["summary"]["pid"].is_null()
+            && recorded_done
+            && fs::read_to_string(&marker)
+                .map(|text| text.lines().count() == 1)
+                .unwrap_or(false)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "one-shot never finished: {}",
+            status
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    sandbox.force_kill_daemon();
+    sandbox.start_daemon();
+    sandbox.run_when_ready(&["list"]);
+
+    let status = sandbox.wait_for_state("once", "running", Duration::from_secs(10));
+    assert!(status["summary"]["pid"].is_null(), "{status}");
+    std::thread::sleep(Duration::from_millis(200));
+    let runs = fs::read_to_string(&marker).expect("marker").lines().count();
+    assert_eq!(runs, 1, "the finished one-shot was executed again");
+}
+
+#[test]
+fn stopping_a_finished_one_shot_runs_its_stop_action() {
+    let mut sandbox = Sandbox::new();
+    let marker = sandbox.root.join("once-stop.txt");
+    #[cfg(windows)]
+    let hook = sandbox.root.join("once-stop.cmd");
+    #[cfg(unix)]
+    let hook = sandbox.root.join("once-stop.sh");
+    #[cfg(windows)]
+    fs::write(&hook, "@echo off\r\necho stop>>\"%~dp0once-stop.txt\"\r\n").expect("stop hook");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(
+            &hook,
+            format!("#!/bin/sh\necho stop >> \"{}\"\n", marker.display()),
+        )
+        .expect("stop hook");
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod stop hook");
+    }
+    let (path, args) = if cfg!(windows) {
+        (r"C:\Windows\System32\cmd.exe", json!(["/c", "exit", "0"]))
+    } else {
+        ("/bin/true", json!([]))
+    };
+    let definition = json!({
+        "schema": 1,
+        "id": "once",
+        "version": "1.0.0",
+        "desc": "one shot with cleanup",
+        "protocol": 1,
+        "exec": {"path": path, "args": args, "ready": "exec"},
+        "restart": "never",
+        "remain_after_exit": true,
+        "lifecycle": {"stop": {"path": hook.to_string_lossy(), "args": []}}
+    });
+    fs::write(
+        sandbox.config.join("services.d").join("once.json"),
+        serde_json::to_vec_pretty(&definition).expect("definition"),
+    )
+    .expect("write definition");
+
+    sandbox.start_daemon();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = sandbox.status("once");
+        if status["summary"]["state"] == "running" && status["summary"]["pid"].is_null() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "one-shot never finished: {}",
+            status
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let stopped = sandbox.stop_service("once");
+    assert_eq!(stopped["summary"]["state"], "stopped", "{stopped}");
+    wait_until("the stop action", Duration::from_secs(10), || {
+        fs::read_to_string(&marker)
+            .map(|text| text.contains("stop"))
+            .unwrap_or(false)
+    });
+}
+
+#[test]
+fn a_runtime_record_for_a_deleted_definition_is_dropped_on_start() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_core_json("orphan");
+    sandbox.start_daemon();
+    sandbox.running_pid("orphan");
+
+    let record = sandbox.data.join("run").join("orphan.json");
+    wait_until("the runtime record", Duration::from_secs(10), || {
+        record.is_file()
+    });
+
+    sandbox.force_kill_daemon();
+    fs::remove_file(sandbox.config.join("services.d").join("orphan.json"))
+        .expect("remove definition");
+
+    sandbox.start_daemon();
+    sandbox.run_when_ready(&["list"]);
+    wait_until(
+        "the orphan record to be dropped",
+        Duration::from_secs(10),
+        || !record.exists(),
+    );
+}
+
+/// A service that ran long enough to be considered stable still gets its stop
+/// action before the replacement starts (shell parity), instead of a bare respawn.
+#[test]
+fn a_stable_crash_runs_the_stop_action_before_restarting() {
+    let mut sandbox = Sandbox::new();
+    let marker = sandbox.root.join("stable-stop.txt");
+    let hook = sandbox.write_hook_script("stable-stop", &marker);
+    sandbox.write_core_json("stable");
+    let path = sandbox.config.join("services.d").join("stable.json");
+    let mut value: Value =
+        serde_json::from_slice(&fs::read(&path).expect("definition")).expect("json");
+    value["lifecycle"] = json!({"stop": {"path": hook.to_string_lossy(), "args": []}});
+    fs::write(&path, serde_json::to_vec_pretty(&value).expect("json")).expect("write definition");
+
+    sandbox.start_daemon();
+    let first = sandbox.running_pid("stable");
+    // Cross the 10s stability window so the crash takes the Cleanup path.
+    std::thread::sleep(Duration::from_secs(11));
+    kill_pid(first);
+
+    wait_until(
+        "the stop action before the respawn",
+        Duration::from_secs(10),
+        || {
+            fs::read_to_string(&marker)
+                .map(|text| text.contains("stop"))
+                .unwrap_or(false)
+        },
+    );
+    let restarted = sandbox.wait_for_restart("stable", first as u64, Duration::from_secs(15));
+    assert_ne!(restarted["summary"]["pid"].as_u64(), Some(first as u64));
+    sandbox.stop_service("stable");
+}
+
+#[test]
+fn restart_runs_stop_then_start_and_changes_the_pid() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_core_json("core");
+    sandbox.start_daemon();
+    let first = sandbox.running_pid("core");
+
+    let output = sandbox.run_when_ready(&["restart", "core"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let status = sandbox.wait_for_state("core", "running", Duration::from_secs(15));
+    let second = status["summary"]["pid"].as_u64().expect("pid") as u32;
+    assert_ne!(first, second, "restart kept the same pid");
+    assert!(!pid_alive(first), "the old process survived restart");
+    sandbox.stop_service("core");
+}
+
+/// A failed attempt may have created half its resources; the stop action must
+/// run before the retry (shell `svcd` does `run_stop` before the retry sleep).
+#[test]
+fn a_failed_attempt_runs_the_stop_action_before_retrying() {
+    let mut sandbox = Sandbox::new();
+    let marker = sandbox.root.join("fail-stop.txt");
+    let hook = sandbox.write_hook_script("fail-stop", &marker);
+    let exec = sandbox.write_crash_after_ready_script("failer");
+    let definition = json!({
+        "schema": 1,
+        "id": "failer",
+        "version": "1.0.0",
+        "desc": "crashes after ready",
+        "protocol": 1,
+        "exec": exec_for(&exec),
+        "restart": "on-failure",
+        "lifecycle": {"stop": {"path": hook.to_string_lossy(), "args": []}}
+    });
+    fs::write(
+        sandbox.config.join("services.d").join("failer.json"),
+        serde_json::to_vec_pretty(&definition).expect("definition"),
+    )
+    .expect("write definition");
+
+    sandbox.start_daemon();
+    wait_until("the retry cleanup", Duration::from_secs(15), || {
+        fs::read_to_string(&marker)
+            .map(|text| text.contains("stop"))
+            .unwrap_or(false)
+    });
+}
+
+/// A record caught in `stopping` is finished with the service's stop action,
+/// not just force-killed.
+#[cfg(unix)]
+#[test]
+fn a_stopping_record_is_finished_with_the_stop_action() {
+    use std::os::unix::process::CommandExt;
+
+    let mut sandbox = Sandbox::new();
+    let marker = sandbox.root.join("half-stop.txt");
+    let hook = sandbox.write_hook_script("half-stop", &marker);
+    let definition = json!({
+        "schema": 1,
+        "id": "half",
+        "version": "1.0.0",
+        "desc": "interrupted stop",
+        "protocol": 1,
+        "exec": {"path": "/bin/true", "args": [], "ready": "exec"},
+        "restart": "never",
+        "lifecycle": {"stop": {"path": hook.to_string_lossy(), "args": []}}
+    });
+    fs::write(
+        sandbox.config.join("services.d").join("half.json"),
+        serde_json::to_vec_pretty(&definition).expect("definition"),
+    )
+    .expect("write definition");
+    fs::write(sandbox.config.join("services.d").join("half.disabled"), b"")
+        .expect("disable at boot");
+
+    let mut child = Command::new("sleep")
+        .arg("300")
+        .process_group(0)
+        .spawn()
+        .expect("spawn leftover");
+    let pid = child.id();
+    let starttime: u64 = {
+        let stat = fs::read_to_string(format!("/proc/{}/stat", pid)).expect("stat");
+        stat.split_once(") ")
+            .expect("stat format")
+            .1
+            .split_whitespace()
+            .nth(19)
+            .expect("starttime")
+            .parse()
+            .expect("starttime integer")
+    };
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .expect("boot id")
+        .trim()
+        .to_string();
+    let run_dir = sandbox.data.join("run");
+    fs::create_dir_all(&run_dir).expect("run dir");
+    fs::write(
+        run_dir.join("half.json"),
+        serde_json::to_vec(&json!({
+            "boot": boot,
+            "state": "stopping",
+            "pid": pid,
+            "starttime": starttime,
+            "since": 1u64,
+        }))
+        .expect("record"),
+    )
+    .expect("write record");
+
+    sandbox.start_daemon();
+    wait_until(
+        "the stop action for the interrupted stop",
+        Duration::from_secs(15),
+        || {
+            fs::read_to_string(&marker)
+                .map(|text| text.contains("stop"))
+                .unwrap_or(false)
+        },
+    );
+    wait_until(
+        "the leftover process to go away",
+        Duration::from_secs(10),
+        || !pid_alive(pid),
+    );
+    let _ = child.wait();
+}
+
+#[test]
+fn a_definition_added_while_running_is_picked_up_without_reload() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon_with_env(&[("SVCD_RESCAN_INTERVAL_MS", "50")]);
+    sandbox.run_when_ready(&["list"]);
+
+    sandbox.write_core_json("late");
+    wait_until(
+        "the new definition to start",
+        Duration::from_secs(15),
+        || {
+            let output = sandbox.run_svc(&["status", "late", "--json"]);
+            if output.status.code() != Some(0) {
+                return false;
+            }
+            serde_json::from_slice::<Value>(&output.stdout)
+                .map(|value| value["summary"]["state"] == "running")
+                .unwrap_or(false)
+        },
+    );
+    let status = sandbox.status("late");
+    assert_eq!(status["summary"]["enabled"], true, "{status}");
+    sandbox.stop_service("late");
+}
+
+#[test]
+fn a_definition_deleted_while_running_is_stopped_without_reload() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_core_json("gone");
+    sandbox.start_daemon_with_env(&[("SVCD_RESCAN_INTERVAL_MS", "50")]);
+    let pid = sandbox.running_pid("gone");
+
+    fs::remove_file(sandbox.config.join("services.d").join("gone.json"))
+        .expect("remove definition");
+    wait_until(
+        "the removed service to disappear",
+        Duration::from_secs(15),
+        || sandbox.run_svc(&["status", "gone"]).status.code() == Some(1) && !pid_alive(pid),
+    );
+}
+
+#[test]
+fn a_graceful_shutdown_runs_the_stop_action() {
+    let mut sandbox = Sandbox::new();
+    let marker = sandbox.root.join("shutdown-stop.txt");
+    let hook = sandbox.write_hook_script("shutdown-stop", &marker);
+    sandbox.write_core_json("script");
+    let path = sandbox.config.join("services.d").join("script.json");
+    let mut value: Value =
+        serde_json::from_slice(&fs::read(&path).expect("definition")).expect("json");
+    value["lifecycle"] = json!({"stop": {"path": hook.to_string_lossy(), "args": []}});
+    fs::write(&path, serde_json::to_vec_pretty(&value).expect("json")).expect("write definition");
+
+    sandbox.start_daemon();
+    sandbox.running_pid("script");
+    sandbox.shutdown();
+
+    wait_until("the shutdown cleanup", Duration::from_secs(10), || {
+        fs::read_to_string(&marker)
+            .map(|text| text.contains("stop"))
+            .unwrap_or(false)
+    });
+}
+
+#[test]
+fn a_finished_one_shot_is_rerun_after_a_graceful_restart() {
+    let mut sandbox = Sandbox::new();
+    let marker = sandbox.config.join("services.d").join("once-marker.txt");
+    #[cfg(windows)]
+    let body = "@echo off\r\necho once>>\"%~dp0once-marker.txt\"\r\n";
+    #[cfg(unix)]
+    let body = "#!/bin/sh\necho once >> \"$(dirname \"$0\")/once-marker.txt\"\n";
+    sandbox.write_script_body("once", body);
+
+    sandbox.start_daemon();
+    wait_until("the one-shot to run", Duration::from_secs(15), || {
+        fs::read_to_string(&marker)
+            .map(|text| text.lines().count() >= 1)
+            .unwrap_or(false)
+    });
+    sandbox.shutdown();
+    sandbox.start_daemon();
+    wait_until(
+        "the one-shot to run again after restart",
+        Duration::from_secs(15),
+        || {
+            fs::read_to_string(&marker)
+                .map(|text| text.lines().count() >= 2)
+                .unwrap_or(false)
+        },
+    );
+}
+
+#[test]
+fn a_second_daemon_refuses_to_start() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    sandbox.run_when_ready(&["list"]);
+
+    let mut command = Command::new(&sandbox.svcd);
+    command
+        .args(["run", "--foreground"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    sandbox.env(&mut command);
+    let mut second = command.spawn().expect("spawn second daemon");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = second.try_wait().expect("try_wait") {
+            assert_eq!(
+                status.code(),
+                Some(1),
+                "second daemon should refuse to start"
+            );
+            return;
+        }
+        assert!(Instant::now() < deadline, "the second daemon did not exit");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// On Windows the daemon-wide job object (`KILL_ON_JOB_CLOSE`) reaps every
+/// child when svcd dies, so the restarted daemon starts exactly one fresh
+/// instance per service. Unix deliberately does the opposite and adopts the
+/// survivors; `a_restarted_daemon_adopts_an_exec_ready_service` covers that.
+#[cfg(windows)]
 #[test]
 fn abrupt_svcd_exit_reaps_children_and_restart_starts_one_instance() {
     let mut sandbox = Sandbox::new();
@@ -1655,6 +2572,13 @@ fn abrupt_svcd_exit_reaps_children_and_restart_starts_one_instance() {
     let package = sandbox.write_plugin_package("plug");
     sandbox.start_daemon();
     sandbox.install_plugin("plug", &package);
+    assert_eq!(
+        sandbox
+            .run_when_ready_plugin(&["enable", "plug"])
+            .status
+            .code(),
+        Some(0)
+    );
 
     let core_pid = sandbox.running_pid("core") as u64;
     let script_pid = sandbox.running_pid("script") as u64;
@@ -1693,4 +2617,70 @@ fn abrupt_svcd_exit_reaps_children_and_restart_starts_one_instance() {
     sandbox.stop_service("core");
     sandbox.stop_service("script");
     sandbox.stop_service("plug");
+}
+
+/// Unix keeps the supervised tree alive when svcd is killed and the next daemon
+/// reconnects to it from the runtime record: same pid, no duplicate instance.
+#[cfg(unix)]
+#[test]
+fn a_restarted_daemon_adopts_an_exec_ready_service() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_stop_script("script");
+    sandbox.start_daemon();
+    let pid = sandbox.running_pid("script");
+
+    sandbox.force_kill_daemon();
+    wait_until(
+        "the service to survive svcd",
+        Duration::from_secs(10),
+        || pid_alive(pid),
+    );
+
+    sandbox.start_daemon();
+    let status = sandbox.wait_for_state("script", "running", Duration::from_secs(15));
+    assert_eq!(
+        status["summary"]["pid"].as_u64(),
+        Some(pid as u64),
+        "the restarted daemon should adopt pid {}: {}",
+        pid,
+        status
+    );
+    assert_eq!(status["details"]["failures"], 0, "{status}");
+    sandbox.stop_service("script");
+}
+
+/// A record from another boot must never be adopted: pid numbers restart and a
+/// stale starttime could match an unrelated process.
+#[cfg(unix)]
+#[test]
+fn a_runtime_record_from_another_boot_is_ignored() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_stop_script("script");
+    sandbox.start_daemon();
+    let pid = sandbox.running_pid("script");
+    sandbox.shutdown();
+
+    // Leave a record as if the previous daemon had written it before a reboot.
+    let run_dir = sandbox.data.join("run");
+    fs::create_dir_all(&run_dir).expect("run dir");
+    fs::write(
+        run_dir.join("script.json"),
+        serde_json::to_vec(&json!({
+            "boot": "an-older-boot",
+            "state": "running",
+            "pid": pid,
+        }))
+        .expect("json"),
+    )
+    .expect("rewrite record");
+
+    sandbox.start_daemon();
+    let status = sandbox.wait_for_state("script", "running", Duration::from_secs(15));
+    assert_ne!(
+        status["summary"]["pid"].as_u64(),
+        Some(pid as u64),
+        "a record from another boot must not be adopted: {}",
+        status
+    );
+    sandbox.stop_service("script");
 }

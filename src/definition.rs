@@ -7,7 +7,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::package::valid_name;
-use crate::registry::{Exec, Hook, Kind, Lifecycle, Ready, Registry, Service, State, RESERVED_ID};
+use crate::registry::{
+    Exec, Hook, Kind, Lifecycle, Ready, Registry, Restart, Service, State, RESERVED_ID,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadIssue {
@@ -227,6 +229,11 @@ fn load_scripts(
         };
         let declarations =
             crate::script::declared_actions(&String::from_utf8_lossy(&contents), &extension);
+        let restart =
+            crate::script::declared_restart(&String::from_utf8_lossy(&contents), &extension);
+        // Shell convention: anything that is not `RESTART=always` treats a
+        // clean exit as "done" and keeps reporting running (RemainAfterExit).
+        let remain_after_exit = restart != Restart::Always;
 
         let path_text = path.to_string_lossy().to_string();
         let hook = |action: &str, timeout_ms: u64| Hook {
@@ -269,6 +276,9 @@ fn load_scripts(
             }),
             lifecycle,
             enabled,
+            restart,
+            remain_after_exit,
+            compat: None,
             state: State::Stopped,
             pid: None,
             since: None,
@@ -354,6 +364,14 @@ struct CoreDefinition {
     dependencies: Vec<String>,
     #[serde(default)]
     lifecycle: Option<LifecycleDefinition>,
+    /// Crash-restart policy; `enabled` (the `.disabled` marker) stays the boot
+    /// flag. Omitted keeps the historical on-failure behaviour.
+    #[serde(default)]
+    restart: Option<Restart>,
+    /// Keep `running` after a clean exit (one-shot service). Core JSON services
+    /// must opt in; drop-in shell scripts inherit the shell convention.
+    #[serde(default)]
+    remain_after_exit: bool,
 }
 
 #[derive(Deserialize)]
@@ -511,6 +529,9 @@ fn validate(definition: CoreDefinition) -> Result<Service, String> {
         // A definition declared in services.d is boot-start in v1; a marker-based
         // enable/disable override belongs to the lifecycle work (#29).
         enabled: true,
+        restart: definition.restart.unwrap_or_default(),
+        remain_after_exit: definition.remain_after_exit,
+        compat: None,
         state: State::Stopped,
         pid: None,
         since: None,
@@ -967,6 +988,86 @@ mod tests {
             .collect();
         assert_eq!(cycle_issues.len(), 2);
         assert!(cycle_issues[0].reason.contains("a -> b -> a"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_script_declares_its_restart_policy() {
+        let dir = TempDir::new();
+        dir.write_script(
+            &script_name("oneshot"),
+            "#!/bin/sh\nTYPE=oneshot\nstart() { :; }\n",
+        );
+        dir.write_script(
+            &script_name("always"),
+            "#!/bin/sh\nRESTART=always\nstart() { :; }\n",
+        );
+
+        let loaded = load_services(&dir.services_dir());
+
+        assert!(loaded.issues.is_empty(), "issues: {:?}", loaded.issues);
+        assert_eq!(
+            loaded.registry.get("oneshot").expect("oneshot").restart,
+            Restart::Never
+        );
+        assert!(
+            loaded
+                .registry
+                .get("oneshot")
+                .expect("oneshot")
+                .remain_after_exit,
+            "a shell service that is not RESTART=always keeps running after a clean exit"
+        );
+        assert_eq!(
+            loaded.registry.get("always").expect("always").restart,
+            Restart::Always
+        );
+        assert!(
+            !loaded
+                .registry
+                .get("always")
+                .expect("always")
+                .remain_after_exit
+        );
+    }
+
+    #[test]
+    fn a_json_definition_defaults_to_on_failure_and_honours_restart() {
+        let dir = TempDir::new();
+        dir.write("plain", definition("plain"));
+        let mut never = definition("never");
+        never["restart"] = serde_json::json!("never");
+        dir.write("never", never);
+        let mut one_shot = definition("one-shot");
+        one_shot["remain_after_exit"] = serde_json::json!(true);
+        dir.write("one-shot", one_shot);
+
+        let loaded = load_services(&dir.services_dir());
+
+        assert!(loaded.issues.is_empty(), "issues: {:?}", loaded.issues);
+        assert_eq!(
+            loaded.registry.get("plain").expect("plain").restart,
+            Restart::OnFailure
+        );
+        assert!(
+            !loaded
+                .registry
+                .get("plain")
+                .expect("plain")
+                .remain_after_exit,
+            "core JSON services must opt in explicitly"
+        );
+        assert_eq!(
+            loaded.registry.get("never").expect("never").restart,
+            Restart::Never
+        );
+        assert!(
+            loaded
+                .registry
+                .get("one-shot")
+                .expect("one-shot")
+                .remain_after_exit
+        );
     }
 
     #[test]

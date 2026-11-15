@@ -15,7 +15,8 @@ use crate::log;
 use crate::package::{self, Package};
 use crate::paths;
 use crate::registry::{
-    Capability, Exec, Hook, Interpreter, Kind, Lifecycle, Ready, Service, State, RESERVED_ID,
+    Capability, Exec, Hook, Interpreter, Kind, Lifecycle, Ready, Restart, Service, State,
+    RESERVED_ID,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,12 +326,13 @@ fn write_version(
     write_current(plugin_dir, &package.manifest.version)?;
 
     let enabled_marker = plugin_dir.join("enabled");
+    // A fresh install starts disabled: installing a package must not silently
+    // arm an autostart. The operator turns it on with `svc enable <id>` (or
+    // `plugin enable <id>`); an upgrade keeps whatever the marker already says.
     let enabled = if was_installed {
         enabled_marker.exists()
     } else {
-        fs::write(&enabled_marker, b"")
-            .map_err(|error| format!("write {}: {}", enabled_marker.display(), error))?;
-        true
+        false
     };
     Ok((version_dir, enabled))
 }
@@ -449,6 +451,7 @@ fn restore_file(path: &Path, content: &Option<Vec<u8>>, config: bool) -> Result<
 
 pub fn scan() -> (Vec<Service>, Vec<String>) {
     let root = paths::plugins_dir();
+    let host = crate::compat::detect();
     let mut services = Vec::new();
     let mut warnings = Vec::new();
     let entries = match fs::read_dir(&root) {
@@ -491,7 +494,23 @@ pub fn scan() -> (Vec<Service>, Vec<String>) {
             }
         };
         match service_from_manifest(&id, &version_dir, &manifest, enabled, interpreter.as_ref()) {
-            Ok(service) => services.push(service),
+            Ok(mut service) => {
+                let devices = service
+                    .compat
+                    .as_ref()
+                    .map(|spec| spec.devices.clone())
+                    .unwrap_or_default();
+                match crate::compat::evaluate(package::target(), &devices, &host) {
+                    crate::compat::Verdict::Compatible => services.push(service),
+                    verdict => {
+                        let reason = crate::compat::verdict_reason(verdict)
+                            .unwrap_or_else(|| "compat".into());
+                        warnings.push(format!("{}: {}", id, reason));
+                        service.state = State::Failed;
+                        services.push(service);
+                    }
+                }
+            }
             Err(error) => warnings.push(format!("{}: {}", id, error)),
         }
     }
@@ -732,6 +751,11 @@ fn service_from_manifest(
         }),
         lifecycle,
         enabled,
+        // The manifest has no policy field yet; plugins keep the historical
+        // on-failure behaviour and stop at Failed after the retry budget.
+        restart: Restart::OnFailure,
+        remain_after_exit: false,
+        compat: manifest.compat.clone(),
         state: State::Stopped,
         pid: None,
         since: None,

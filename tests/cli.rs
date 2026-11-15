@@ -248,7 +248,7 @@ fn daemon_commands_exit_two_until_the_channel_exists() {
     let sandbox = Sandbox::new();
     sandbox.write_definition("demo", definition("demo"));
 
-    for verb in ["start", "stop", "enable", "disable"] {
+    for verb in ["start", "stop", "restart", "enable", "disable"] {
         let output = sandbox.run(&[verb, "demo"]);
         assert_eq!(
             output.status.code(),
@@ -377,6 +377,34 @@ fn a_relative_exec_path_is_rejected_with_a_readable_reason() {
 const SAMPLE_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\n\
 MCowBQYDK2VwAyEAOLVjY8cVextWNtjO6wCg0g25/7mN+wRpMkd597CV3Nk=\n\
 -----END PUBLIC KEY-----\n";
+
+#[test]
+fn compat_reports_and_provisions_the_device_id() {
+    let sandbox = Sandbox::new();
+
+    let output = sandbox.run(&["compat"]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("platform:"), "compat:\n{}", text);
+    assert!(text.contains("device:        -"), "compat:\n{}", text);
+
+    let json = sandbox.run(&["compat", "--json"]);
+    assert_eq!(json.status.code(), Some(0));
+    let value: Value = serde_json::from_str(&stdout(&json)).expect("compat json");
+    assert_eq!(value["schema_max"], 3);
+    assert!(value["device"].is_null(), "{value}");
+
+    let init = sandbox.run(&["compat", "init", "--device", "sr6110"]);
+    assert_eq!(init.status.code(), Some(0), "stderr: {}", stderr(&init));
+    assert!(sandbox.config_dir().join("compat.conf").is_file());
+
+    let text = stdout(&sandbox.run(&["compat"]));
+    assert!(text.contains("sr6110"), "compat:\n{}", text);
+
+    let bad = sandbox.run(&["compat", "init", "--device", "SR6110"]);
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(stderr(&bad).contains("device id"), "{}", stderr(&bad));
+}
 
 #[test]
 fn trust_add_list_and_remove_manage_the_trust_store() {

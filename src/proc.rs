@@ -86,6 +86,82 @@ mod imp {
 
 pub use imp::{assign, init};
 
+/// Start time of `pid` in clock ticks since boot, as `/proc/<pid>/stat` field
+/// 22. Together with the boot id it is the pid-reuse guard for adoption.
+pub fn start_time(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+        let rest = stat.split_once(") ")?.1;
+        rest.split_whitespace().nth(19)?.parse().ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Identity of the current boot. A record written before a reboot must never be
+/// used for adoption: pid numbers restart from scratch and only look valid.
+pub fn boot_id() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// True while `pid` exists and is signalable (EPERM still counts: not ours to
+/// signal, but alive).
+pub fn alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    unsafe {
+        if libc::kill(pid as i32, 0) == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Terminate a service process group that outlived its record/definition.
+/// Best effort: the caller has already validated pid + starttime. Unix signals
+/// the whole group; on Windows the job object already took the tree down.
+pub fn terminate_group(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGTERM);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+}
+
+/// Arm a *service* process. Unlike hooks, supervised processes are adopted
+/// after a daemon restart instead of being killed with their parent: the next
+/// daemon reads their runtime record, validates pid + starttime and reconnects.
+pub fn configure_service(command: &mut Command) {
+    let _ = command;
+}
+
+/// Arm a short-lived hook. Hooks are never adopted, so parent death kills them
+/// outright (Linux) exactly like the daemon-wide job object on Windows.
+pub fn configure_hook(command: &mut Command) {
+    configure(command)
+}
+
 /// A per-service Windows job object: the whole process tree of one service.
 ///
 /// `KILL_ON_JOB_CLOSE` gives every service the same parent-death behaviour as

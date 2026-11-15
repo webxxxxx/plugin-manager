@@ -2385,6 +2385,9 @@ fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<
             "protocol": 1,
             "platform": package::target(),
         })),
+        ("GET", ["api", "v1", "compat"]) => {
+            ok(serde_json::to_value(crate::compat::detect()).unwrap_or(Value::Null))
+        }
         ("GET", ["api", "v1", "auth"]) => match lan_state.lock() {
             Ok(state) => ok(json!({
                 "enabled": state.enabled,

@@ -83,6 +83,8 @@ impl Sandbox {
             .env("SVCD_LOG_DIR", &self.logs)
             .env("SVCD_TRUST_DIR", &self.trust)
             .env("SVCD_HTTP_PORT", "0")
+            .env("SVCD_BOOT_SCAN_WAIT_MS", "0")
+            .env("SVCD_RESCAN_INTERVAL_MS", "0")
             .env("SVCD_TEST_UNPRIVILEGED", "1");
     }
 
@@ -158,7 +160,9 @@ impl Sandbox {
             .env("SVCD_DATA_DIR", &self.data)
             .env("SVCD_LOG_DIR", &self.logs)
             .env("SVCD_TRUST_DIR", &self.trust)
-            .env("SVCD_TEST_UNPRIVILEGED", "1");
+            .env("SVCD_TEST_UNPRIVILEGED", "1")
+            .env("SVCD_RESCAN_INTERVAL_MS", "0")
+            .env("SVCD_BOOT_SCAN_WAIT_MS", "0");
         self.daemon = Some(command.spawn().expect("spawn daemon"));
     }
 
@@ -179,7 +183,9 @@ impl Sandbox {
             .env("SVCD_DATA_DIR", &self.data)
             .env("SVCD_LOG_DIR", &self.logs)
             .env("SVCD_TRUST_DIR", &self.trust)
-            .env("SVCD_TEST_UNPRIVILEGED", "1");
+            .env("SVCD_TEST_UNPRIVILEGED", "1")
+            .env("SVCD_RESCAN_INTERVAL_MS", "0")
+            .env("SVCD_BOOT_SCAN_WAIT_MS", "0");
         self.daemon = Some(command.spawn().expect("spawn daemon"));
     }
 
@@ -1113,6 +1119,28 @@ fn pem_from_public(key: &[u8; 32]) -> Vec<u8> {
     }
     pem.push_str("-----END PUBLIC KEY-----\n");
     pem.into_bytes()
+}
+
+#[test]
+fn compat_endpoint_reports_the_host_facts() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let response = request(&address, "GET", "/api/v1/compat", "", b"");
+    assert_eq!(response.status, 200);
+    assert!(response.body["platform"].is_string(), "{}", response.body);
+    assert!(response.body["device"].is_null(), "{}", response.body);
+    assert!(
+        response.body["marker_path"].is_string(),
+        "{}",
+        response.body
+    );
+
+    fs::write(sandbox.config.join("compat.conf"), "device = sr6110\n").expect("marker");
+    let response = request(&address, "GET", "/api/v1/compat", "", b"");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body["device"], "sr6110", "{}", response.body);
 }
 
 #[test]
