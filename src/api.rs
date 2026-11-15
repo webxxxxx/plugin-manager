@@ -34,6 +34,7 @@ use std::sync::Condvar;
 
 use serde_json::{json, Value};
 
+use crate::blob;
 use crate::blob_http;
 use crate::channel;
 use crate::http;
@@ -2441,25 +2442,35 @@ fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<
         }
         (_, ["api", "v1", "plugins", _, "ui-token"]) => method_not_allowed("POST"),
         ("POST", ["api", "v1", "plugins"]) => install_plugin(config, request, query),
-        ("POST", ["api", "v1", "blobs", "uploads"]) => blob_http::create_upload(),
-        ("GET", ["api", "v1", "blobs", "uploads", id]) => blob_http::upload_status(&decode(id)),
+        ("POST", ["api", "v1", "blobs", "uploads"]) => {
+            blob_http::create_upload(blob::UploadKind::Blob)
+        }
+        ("GET", ["api", "v1", "blobs", "uploads", id]) => {
+            blob_http::upload_status(blob::UploadKind::Blob, &decode(id))
+        }
         ("POST", ["api", "v1", "blobs", "uploads", id, "complete"]) => {
             blob_http::complete_upload(&decode(id), &request.body)
         }
-        ("DELETE", ["api", "v1", "blobs", "uploads", id]) => blob_http::abort_upload(&decode(id)),
+        ("DELETE", ["api", "v1", "blobs", "uploads", id]) => {
+            blob_http::abort_upload(blob::UploadKind::Blob, &decode(id))
+        }
         (_, ["api", "v1", "blobs"]) => method_not_allowed("POST"),
         (_, ["api", "v1", "blobs", "uploads"]) => method_not_allowed("POST"),
         (_, ["api", "v1", "blobs", "uploads", _]) => method_not_allowed("GET, DELETE"),
         (_, ["api", "v1", "blobs", "uploads", _, "complete"]) => method_not_allowed("POST"),
         (_, ["api", "v1", "blobs", "uploads", _, "parts", _]) => method_not_allowed("PUT"),
         (_, ["api", "v1", "blobs", _]) => method_not_allowed("GET"),
-        ("POST", ["api", "v1", "file", "uploads"]) => blob_http::file_upload_create(),
-        ("GET", ["api", "v1", "file", "uploads", id]) => blob_http::file_upload_status(&decode(id)),
+        ("POST", ["api", "v1", "file", "uploads"]) => {
+            blob_http::create_upload(blob::UploadKind::File)
+        }
+        ("GET", ["api", "v1", "file", "uploads", id]) => {
+            blob_http::upload_status(blob::UploadKind::File, &decode(id))
+        }
         ("POST", ["api", "v1", "file", "uploads", id, "complete"]) => {
             blob_http::file_upload_complete(&decode(id), &request.body)
         }
         ("DELETE", ["api", "v1", "file", "uploads", id]) => {
-            blob_http::file_upload_abort(&decode(id))
+            blob_http::abort_upload(blob::UploadKind::File, &decode(id))
         }
         (_, ["api", "v1", "file"]) => method_not_allowed("POST"),
         (_, ["api", "v1", "file", "uploads"]) => method_not_allowed("POST"),

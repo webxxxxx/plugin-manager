@@ -102,6 +102,8 @@ GET /api/v1/blobs/sha256:9f2c...e1
 
 一次整体上传适合几十 MB 到 512 MiB 的文件；需要断点续传、重传失败分片或并行上传时，使用 S3 风格的 part 会话（JSON 变体）。所有分片先落在 `temp_dir/uploads/<uploadId>/`，`complete` 时按顺序拼装并计算最终 SHA-256。
 
+会话在创建时记录类型：`/api/v1/blobs/uploads` 创建的是 **blob 会话**，只能用 blob 的 part/status/complete/abort；`/api/v1/file/uploads` 创建的是 **file 会话**，只能用 file 侧接口。用错一侧返回 `409 Conflict`，不会误把文件包拼成 blob 或反过来。
+
 1. 创建会话：
 
 ```http
@@ -172,6 +174,8 @@ DELETE /api/v1/file/uploads/{id}               中止
 GET    /api/v1/file/{sha256:...}               流式下载，支持 Range/HEAD/条件请求
 HEAD   /api/v1/file/{sha256:...}
 ```
+
+`/api/v1/file/uploads` 创建的是 **file 会话**；它的 part/status/complete/abort 只能走 `/api/v1/file/...`。拿同一个 id 去 `/api/v1/blobs/uploads/...` 的 part/status/complete/abort 会返回 `409 Conflict`，反过来也一样。
 
 `complete` 的 body（`parts` 可省略，表示全部现存 part 按序）：
 
@@ -400,6 +404,7 @@ MCP 客户端/门户可以用 `structuredContent.$blob` 或 `resource_link` 中�
 | 条件请求 `If-Match` / `If-Unmodified-Since` 不满足 | HTTP 412 |
 | 条件请求 `If-None-Match` / `If-Modified-Since` 命中 | HTTP 304 |
 | 未知 blob id / uploadId | HTTP 404 |
+| 会话类型与接口不匹配（blob/file 混用） | HTTP 409 |
 | 非法 uploadId / partNumber | HTTP 400 |
 | 同时带 `Content-Length` 与 `Transfer-Encoding` | HTTP 400 |
 | 并发 blob 流超过 64 | HTTP 429 |

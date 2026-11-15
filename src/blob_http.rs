@@ -34,9 +34,19 @@ static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 /// Which streaming route a request head selects.
 pub enum Route {
     Upload,
-    Part { upload: String, part: u32 },
-    Download { id: String, head_only: bool },
-    FileDownload { id: String, head_only: bool },
+    Part {
+        upload: String,
+        part: u32,
+        kind: blob::UploadKind,
+    },
+    Download {
+        id: String,
+        head_only: bool,
+    },
+    FileDownload {
+        id: String,
+        head_only: bool,
+    },
 }
 
 /// Select only the routes that need streaming. Session metadata (status,
@@ -53,10 +63,15 @@ pub fn route(head: &http::Head) -> Option<Route> {
     }
     match (head.method.as_str(), parts.as_slice()) {
         ("POST", ["api", "v1", "blobs"]) => Some(Route::Upload),
-        ("PUT", ["api", "v1", "blobs", "uploads", upload, "parts", part])
-        | ("PUT", ["api", "v1", "file", "uploads", upload, "parts", part]) => Some(Route::Part {
+        ("PUT", ["api", "v1", "blobs", "uploads", upload, "parts", part]) => Some(Route::Part {
             upload: http::percent_decode(upload, false),
             part: part.parse::<u32>().unwrap_or(0),
+            kind: blob::UploadKind::Blob,
+        }),
+        ("PUT", ["api", "v1", "file", "uploads", upload, "parts", part]) => Some(Route::Part {
+            upload: http::percent_decode(upload, false),
+            part: part.parse::<u32>().unwrap_or(0),
+            kind: blob::UploadKind::File,
         }),
         ("GET", ["api", "v1", "blobs", id]) | ("HEAD", ["api", "v1", "blobs", id]) => {
             Some(Route::Download {
@@ -122,7 +137,9 @@ pub fn serve(
 
     match route {
         Route::Upload => upload(stream, head, initial),
-        Route::Part { upload, part } => upload_part(stream, head, initial, &upload, part),
+        Route::Part { upload, part, kind } => {
+            upload_part(stream, head, initial, &upload, part, kind)
+        }
         Route::Download { id, head_only } => download(stream, head, &id, head_only),
         Route::FileDownload { id, head_only } => file_download(stream, head, &id, head_only),
     }
@@ -253,6 +270,7 @@ fn upload_part(
     initial: &[u8],
     upload_id: &str,
     part: u32,
+    kind: blob::UploadKind,
 ) -> io::Result<()> {
     if !blob::valid_upload_id(upload_id) {
         return write_error(stream, 400, "bad_request", "invalid upload id");
@@ -285,11 +303,13 @@ fn upload_part(
     }
     expect_continue(stream, head)?;
 
-    let mut writer = match blob::PartWriter::begin(upload_id, part) {
+    let mut writer = match blob::PartWriter::begin(upload_id, part, kind) {
         Ok(writer) => writer,
         Err(message) => {
             let status = if message.contains("unknown upload") {
                 404
+            } else if message.contains("kind mismatch") || message.contains("kind") {
+                409
             } else if message.contains("part number") || message.contains("invalid") {
                 400
             } else {
@@ -869,6 +889,7 @@ fn code_for(status: u16) -> &'static str {
     match status {
         400 => "bad_request",
         404 => "not_found",
+        409 => "conflict",
         413 => "payload_too_large",
         500 => "internal",
         _ => "error",
@@ -1086,12 +1107,16 @@ fn keep_boundary_tail(data: &[u8], delimiter: &[u8]) -> usize {
 
 // -- Logical file session endpoints (ordinary buffered JSON) ----------------
 
-pub fn file_upload_create() -> Vec<u8> {
-    match blob::create_upload() {
+pub fn create_upload(kind: blob::UploadKind) -> Vec<u8> {
+    match blob::create_upload(kind) {
         Ok(id) => {
+            let prefix = match kind {
+                blob::UploadKind::Blob => "blobs",
+                blob::UploadKind::File => "file",
+            };
             let body = serde_json::to_vec(&json!({
                 "uploadId": id,
-                "partsUrl": format!("/api/v1/file/uploads/{}/parts", id),
+                "partsUrl": format!("/api/v1/{}/uploads/{}/parts", prefix, id),
             }))
             .unwrap_or_default();
             http::response_with_headers(
@@ -1099,7 +1124,7 @@ pub fn file_upload_create() -> Vec<u8> {
                 "application/json",
                 &[(
                     "Location".to_string(),
-                    format!("/api/v1/file/uploads/{}", id),
+                    format!("/api/v1/{}/uploads/{}", prefix, id),
                 )],
                 &body,
             )
@@ -1108,11 +1133,11 @@ pub fn file_upload_create() -> Vec<u8> {
     }
 }
 
-pub fn file_upload_status(id: &str) -> Vec<u8> {
+pub fn upload_status(kind: blob::UploadKind, id: &str) -> Vec<u8> {
     if !blob::valid_upload_id(id) {
         return http::json_error(400, "bad_request", "invalid upload id");
     }
-    match blob::upload_parts(id) {
+    match blob::upload_parts(id, kind) {
         Ok(parts) => {
             let total: u64 = parts.iter().map(|part| part.size).sum();
             let parts: Vec<Value> = parts
@@ -1136,6 +1161,9 @@ pub fn file_upload_status(id: &str) -> Vec<u8> {
         Err(message) if message.contains("unknown upload") => {
             http::json_error(404, "not_found", &message)
         }
+        Err(message) if message.contains("kind mismatch") || message.contains("kind") => {
+            http::json_error(409, "conflict", &message)
+        }
         Err(message) => http::json_error(500, "internal", &message),
     }
 }
@@ -1143,6 +1171,9 @@ pub fn file_upload_status(id: &str) -> Vec<u8> {
 pub fn file_upload_complete(id: &str, body: &[u8]) -> Vec<u8> {
     if !blob::valid_upload_id(id) {
         return http::json_error(400, "bad_request", "invalid upload id");
+    }
+    if let Some(response) = kind_rejection(id, blob::UploadKind::File) {
+        return response;
     }
     let mut requested = None;
     let mut name = None;
@@ -1231,6 +1262,9 @@ pub fn file_upload_complete(id: &str, body: &[u8]) -> Vec<u8> {
         Err(message) if message.contains("unknown upload") => {
             http::json_error(404, "not_found", &message)
         }
+        Err(message) if message.contains("kind mismatch") || message.contains("kind") => {
+            http::json_error(409, "conflict", &message)
+        }
         Err(message) if message.contains("too large") => {
             http::json_error(413, "payload_too_large", &message)
         }
@@ -1246,11 +1280,11 @@ pub fn file_upload_complete(id: &str, body: &[u8]) -> Vec<u8> {
     }
 }
 
-pub fn file_upload_abort(id: &str) -> Vec<u8> {
+pub fn abort_upload(kind: blob::UploadKind, id: &str) -> Vec<u8> {
     if !blob::valid_upload_id(id) {
         return http::json_error(400, "bad_request", "invalid upload id");
     }
-    match blob::abort_upload(id) {
+    match blob::abort_upload(id, kind) {
         Ok(()) => http::response(
             200,
             "application/json",
@@ -1259,67 +1293,32 @@ pub fn file_upload_abort(id: &str) -> Vec<u8> {
         Err(message) if message.contains("unknown upload") => {
             http::json_error(404, "not_found", &message)
         }
-        Err(message) => http::json_error(500, "internal", &message),
-    }
-}
-
-pub fn create_upload() -> Vec<u8> {
-    match blob::create_upload() {
-        Ok(id) => {
-            let body = serde_json::to_vec(&json!({
-                "uploadId": id,
-                "partsUrl": format!("/api/v1/blobs/uploads/{}/parts", id),
-            }))
-            .unwrap_or_default();
-            http::response_with_headers(
-                200,
-                "application/json",
-                &[(
-                    "Location".to_string(),
-                    format!("/api/v1/blobs/uploads/{}", id),
-                )],
-                &body,
-            )
+        Err(message) if message.contains("kind mismatch") || message.contains("kind") => {
+            http::json_error(409, "conflict", &message)
         }
         Err(message) => http::json_error(500, "internal", &message),
     }
 }
 
-pub fn upload_status(id: &str) -> Vec<u8> {
-    if !blob::valid_upload_id(id) {
-        return http::json_error(400, "bad_request", "invalid upload id");
-    }
-    match blob::upload_parts(id) {
-        Ok(parts) => {
-            let total: u64 = parts.iter().map(|part| part.size).sum();
-            let parts: Vec<Value> = parts
-                .iter()
-                .map(|part| {
-                    json!({
-                        "partNumber": part.number,
-                        "size": part.size,
-                        "etag": part.etag,
-                    })
-                })
-                .collect();
-            let body = serde_json::to_vec(&json!({
-                "uploadId": id,
-                "parts": parts,
-                "totalSize": total,
-            }))
-            .unwrap_or_default();
-            http::response(200, "application/json", &body)
-        }
+fn kind_rejection(id: &str, kind: blob::UploadKind) -> Option<Vec<u8>> {
+    match blob::require_upload_kind(id, kind) {
+        Ok(()) => None,
         Err(message) if message.contains("unknown upload") => {
-            http::json_error(404, "not_found", &message)
+            Some(http::json_error(404, "not_found", &message))
         }
-        Err(message) => http::json_error(500, "internal", &message),
+        Err(message) if message.contains("kind") => {
+            Some(http::json_error(409, "conflict", &message))
+        }
+        Err(message) => Some(http::json_error(500, "internal", &message)),
     }
 }
 
 pub fn complete_upload(id: &str, body: &[u8]) -> Vec<u8> {
     if !blob::valid_upload_id(id) {
         return http::json_error(400, "bad_request", "invalid upload id");
+    }
+    if let Some(response) = kind_rejection(id, blob::UploadKind::Blob) {
+        return response;
     }
     let requested = if body.is_empty() {
         None
@@ -1361,6 +1360,9 @@ pub fn complete_upload(id: &str, body: &[u8]) -> Vec<u8> {
         Err(message) if message.contains("unknown upload") => {
             http::json_error(404, "not_found", &message)
         }
+        Err(message) if message.contains("kind mismatch") || message.contains("kind") => {
+            http::json_error(409, "conflict", &message)
+        }
         Err(message) if message.contains("too large") => {
             http::json_error(413, "payload_too_large", &message)
         }
@@ -1370,23 +1372,6 @@ pub fn complete_upload(id: &str, body: &[u8]) -> Vec<u8> {
                 || message.contains("empty") =>
         {
             http::json_error(400, "bad_request", &message)
-        }
-        Err(message) => http::json_error(500, "internal", &message),
-    }
-}
-
-pub fn abort_upload(id: &str) -> Vec<u8> {
-    if !blob::valid_upload_id(id) {
-        return http::json_error(400, "bad_request", "invalid upload id");
-    }
-    match blob::abort_upload(id) {
-        Ok(()) => http::response(
-            200,
-            "application/json",
-            &serde_json::to_vec(&json!({"ok": true})).unwrap_or_default(),
-        ),
-        Err(message) if message.contains("unknown upload") => {
-            http::json_error(404, "not_found", &message)
         }
         Err(message) => http::json_error(500, "internal", &message),
     }

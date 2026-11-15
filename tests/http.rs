@@ -1759,6 +1759,117 @@ fn blob_2mib_upload_and_multipart_complete_round_trip() {
 }
 
 #[test]
+fn upload_sessions_reject_cross_kind_requests() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let file_created = request(&address, "POST", "/api/v1/file/uploads", "", b"");
+    assert_eq!(file_created.status, 200);
+    let file_id = file_created.body["uploadId"]
+        .as_str()
+        .expect("file upload id")
+        .to_string();
+
+    let blob_status = request(
+        &address,
+        "GET",
+        &format!("/api/v1/blobs/uploads/{}", file_id),
+        "",
+        b"",
+    );
+    assert_eq!(blob_status.status, 409, "{:?}", blob_status.body);
+    let blob_abort = request(
+        &address,
+        "DELETE",
+        &format!("/api/v1/blobs/uploads/{}", file_id),
+        "",
+        b"",
+    );
+    assert_eq!(blob_abort.status, 409, "{:?}", blob_abort.body);
+    let blob_complete = request(
+        &address,
+        "POST",
+        &format!("/api/v1/blobs/uploads/{}/complete", file_id),
+        "application/json",
+        b"",
+    );
+    assert_eq!(blob_complete.status, 409, "{:?}", blob_complete.body);
+    let file_status = request(
+        &address,
+        "GET",
+        &format!("/api/v1/file/uploads/{}", file_id),
+        "",
+        b"",
+    );
+    assert_eq!(file_status.status, 200);
+
+    let file_part = raw_request(
+        &address,
+        "PUT",
+        &format!("/api/v1/file/uploads/{}/parts/1", file_id),
+        "application/octet-stream",
+        b"file",
+    );
+    assert_eq!(file_part.status, 200);
+    let file_complete = request(
+        &address,
+        "POST",
+        &format!("/api/v1/file/uploads/{}/complete", file_id),
+        "application/json",
+        b"",
+    );
+    assert_eq!(file_complete.status, 200, "{}", file_complete.body);
+
+    let blob_created = request(&address, "POST", "/api/v1/blobs/uploads", "", b"");
+    assert_eq!(blob_created.status, 200);
+    let blob_id = blob_created.body["uploadId"]
+        .as_str()
+        .expect("blob upload id")
+        .to_string();
+    let file_status = request(
+        &address,
+        "GET",
+        &format!("/api/v1/file/uploads/{}", blob_id),
+        "",
+        b"",
+    );
+    assert_eq!(file_status.status, 409, "{:?}", file_status.body);
+    let file_abort = request(
+        &address,
+        "DELETE",
+        &format!("/api/v1/file/uploads/{}", blob_id),
+        "",
+        b"",
+    );
+    assert_eq!(file_abort.status, 409, "{:?}", file_abort.body);
+    let file_complete = request(
+        &address,
+        "POST",
+        &format!("/api/v1/file/uploads/{}/complete", blob_id),
+        "application/json",
+        b"",
+    );
+    assert_eq!(file_complete.status, 409, "{:?}", file_complete.body);
+    let blob_part = raw_request(
+        &address,
+        "PUT",
+        &format!("/api/v1/blobs/uploads/{}/parts/1", blob_id),
+        "application/octet-stream",
+        b"blob",
+    );
+    assert_eq!(blob_part.status, 200);
+    let blob_complete = request(
+        &address,
+        "POST",
+        &format!("/api/v1/blobs/uploads/{}/complete", blob_id),
+        "application/json",
+        b"{\"parts\":[{\"partNumber\":1}]}",
+    );
+    assert_eq!(blob_complete.status, 200, "{}", blob_complete.body);
+}
+
+#[test]
 fn chunked_bodies_work_for_management_json_routes() {
     let mut sandbox = Sandbox::new();
     sandbox.start_daemon();

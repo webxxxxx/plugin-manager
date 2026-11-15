@@ -167,6 +167,26 @@ pub struct PartInfo {
     pub etag: String,
 }
 
+/// A part session is created for exactly one commit mode. Blob sessions are
+/// concatenated into one content-addressed blob; file sessions are published as
+/// a manifest-backed file bundle.
+#[cfg(feature = "http")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadKind {
+    Blob,
+    File,
+}
+
+#[cfg(feature = "http")]
+impl UploadKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UploadKind::Blob => "blob",
+            UploadKind::File => "file",
+        }
+    }
+}
+
 #[cfg(feature = "http")]
 pub fn uploads_dir() -> PathBuf {
     dir().join("uploads")
@@ -189,20 +209,47 @@ pub fn upload_dir(id: &str) -> Result<PathBuf, String> {
 }
 
 /// Start a resumable upload session. The marker file keeps the directory from
-/// being pruned as "empty" until the normal temp retention expires.
+/// being pruned as "empty" until the normal temp retention expires, and records
+/// the commit mode so the other API cannot consume it.
 #[cfg(feature = "http")]
-pub fn create_upload() -> Result<String, String> {
+pub fn create_upload(kind: UploadKind) -> Result<String, String> {
     let id = random_id()?;
     let directory = upload_dir(&id)?;
     fs::create_dir_all(&directory)
         .map_err(|error| format!("create {}: {}", directory.display(), error))?;
-    fs::write(directory.join("session"), b"")
+    fs::write(directory.join("session"), kind.as_str().as_bytes())
         .map_err(|error| format!("write session marker: {}", error))?;
     Ok(id)
 }
 
 #[cfg(feature = "http")]
-pub fn upload_parts(id: &str) -> Result<Vec<PartInfo>, String> {
+fn read_upload_kind(id: &str) -> Result<UploadKind, String> {
+    let directory = upload_dir(id)?;
+    if !directory.is_dir() {
+        return Err("unknown upload".into());
+    }
+    let marker = fs::read_to_string(directory.join("session")).unwrap_or_default();
+    match marker.trim() {
+        "blob" => Ok(UploadKind::Blob),
+        "file" => Ok(UploadKind::File),
+        // Sessions created before kind markers existed were blob sessions.
+        "" => Ok(UploadKind::Blob),
+        _ => Err("unknown upload kind".into()),
+    }
+}
+
+#[cfg(feature = "http")]
+pub fn require_upload_kind(id: &str, expected: UploadKind) -> Result<(), String> {
+    let actual = read_upload_kind(id)?;
+    if actual != expected {
+        return Err("upload kind mismatch".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "http")]
+pub fn upload_parts(id: &str, kind: UploadKind) -> Result<Vec<PartInfo>, String> {
+    require_upload_kind(id, kind)?;
     let directory = upload_dir(id)?;
     if !directory.is_dir() {
         return Err("unknown upload".into());
@@ -264,10 +311,11 @@ pub struct PartWriter {
 
 #[cfg(feature = "http")]
 impl PartWriter {
-    pub fn begin(upload_id: &str, number: u32) -> Result<PartWriter, String> {
+    pub fn begin(upload_id: &str, number: u32, kind: UploadKind) -> Result<PartWriter, String> {
         if number == 0 || number > MAX_PART_NUMBER {
             return Err("part number must be between 1 and 10000".into());
         }
+        require_upload_kind(upload_id, kind)?;
         let directory = upload_dir(upload_id)?;
         if !directory.is_dir() {
             return Err("unknown upload".into());
@@ -357,7 +405,7 @@ pub fn complete_upload(
     if !directory.is_dir() {
         return Err("unknown upload".into());
     }
-    let available = upload_parts(id)?;
+    let available = upload_parts(id, UploadKind::Blob)?;
     let selected = select_parts(&available, requested)?;
     if selected.is_empty() {
         return Err("no parts uploaded".into());
@@ -512,7 +560,7 @@ pub fn complete_file(
     if !directory.is_dir() {
         return Err("unknown upload".into());
     }
-    let available = upload_parts(upload_id)?;
+    let available = upload_parts(upload_id, UploadKind::File)?;
     let selected = select_parts(&available, requested)?;
     if selected.is_empty() {
         return Err("no parts uploaded".into());
@@ -608,7 +656,8 @@ pub fn complete_file(
 }
 
 #[cfg(feature = "http")]
-pub fn abort_upload(id: &str) -> Result<(), String> {
+pub fn abort_upload(id: &str, kind: UploadKind) -> Result<(), String> {
+    require_upload_kind(id, kind)?;
     let _guard = SESSION_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1058,10 +1107,23 @@ mod tests {
 
     #[cfg(feature = "http")]
     #[test]
+    fn part_writer_refuses_a_cross_kind_session() {
+        let _ = root();
+        let upload = create_upload(UploadKind::File).expect("file upload");
+        let error = match PartWriter::begin(&upload, 1, UploadKind::Blob) {
+            Ok(_) => panic!("blob part accepted a file session"),
+            Err(error) => error,
+        };
+        assert!(error.contains("kind mismatch"), "{error}");
+        abort_upload(&upload, UploadKind::File).expect("abort file session");
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
     fn cleanup_removes_a_stale_file_bundle_as_one_unit() {
         let _ = root();
-        let upload = create_upload().expect("file upload");
-        let mut writer = PartWriter::begin(&upload, 1).expect("part writer");
+        let upload = create_upload(UploadKind::File).expect("file upload");
+        let mut writer = PartWriter::begin(&upload, 1, UploadKind::File).expect("part writer");
         writer.write(b"hello").expect("part write");
         writer.finish().expect("part finish");
         let meta = complete_file(&upload, None, None, None).expect("complete file");
@@ -1085,9 +1147,10 @@ mod tests {
     #[test]
     fn file_bundles_resolve_to_a_manifest_and_size() {
         let _ = root();
-        let upload = create_upload().expect("file upload");
+        let upload = create_upload(UploadKind::File).expect("file upload");
         for (number, bytes) in [(1u32, b"hello ".as_slice()), (2u32, b"world!")] {
-            let mut writer = PartWriter::begin(&upload, number).expect("part writer");
+            let mut writer =
+                PartWriter::begin(&upload, number, UploadKind::File).expect("part writer");
             writer.write(bytes).expect("part write");
             writer.finish().expect("part finish");
         }
