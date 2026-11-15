@@ -68,7 +68,7 @@ const manifest = JSON.parse(manifestBytes.toString('utf8'));
 const errors = [];
 function must(cond, msg) { if (!cond) errors.push(msg); }
 
-must(manifest.schema === 1 || manifest.schema === 2, 'schema must be 1 or 2');
+must([1, 2, 3].includes(manifest.schema), 'schema must be 1, 2 or 3');
 must(typeof manifest.name === 'string' && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(manifest.name), 'bad name');
 must(typeof manifest.version === 'string' && /^[0-9]+\.[0-9]+\.[0-9]+/.test(manifest.version), 'bad version');
 must(typeof manifest.platform === 'string' && /^[a-z0-9_]+(-[a-z0-9_]+){2,3}$/.test(manifest.platform), 'bad platform (expected <arch>-<vendor>-<os>-<abi>)');
@@ -90,7 +90,7 @@ for (const f of manifest.files) {
 }
 for (const n of byName.keys()) must(seen.has(n), 'extra file not in manifest: ' + n);
 
-if (manifest.schema === 2) {
+if (manifest.schema >= 2) {
   if (manifest.interpreter !== undefined) {
     must(
       manifest.interpreter && typeof manifest.interpreter.name === 'string' && /^[A-Za-z0-9._-]+$/.test(manifest.interpreter.name),
@@ -110,6 +110,25 @@ if (manifest.schema === 2) {
 } else {
   must(!manifest.interpreter, 'interpreter requires schema 2');
   must(!manifest.lifecycle, 'lifecycle requires schema 2');
+}
+const kernelModule = [...seen].some(function (p) { return /\.ko$/i.test(p); });
+if (manifest.compat !== undefined) {
+  must(manifest.schema === 3, 'compat requires schema 3');
+  const devices = manifest.compat && manifest.compat.devices;
+  must(Array.isArray(devices) && devices.length > 0, 'compat.devices must be a non-empty array');
+  if (Array.isArray(devices)) {
+    must(devices.length <= 64, 'compat.devices lists more than 64 ids');
+    const unique = new Set(devices);
+    must(unique.size === devices.length, 'duplicate compat device id');
+    for (const d of devices) {
+      must(typeof d === 'string' && /^[a-z0-9][a-z0-9._-]{0,63}$/.test(d), 'bad compat device id: ' + d);
+    }
+  }
+}
+if (kernelModule) {
+  must(manifest.schema === 3, 'kernel modules require schema 3');
+  must(manifest.compat && Array.isArray(manifest.compat.devices) && manifest.compat.devices.length > 0,
+    'kernel modules require compat.devices');
 }
 if (manifest.exec && manifest.exec.ready === 'exec' && (manifest.capabilities || []).length) {
   errors.push('exec.ready=exec cannot declare capabilities');

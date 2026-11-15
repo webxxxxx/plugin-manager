@@ -35,6 +35,9 @@ pub struct Options {
     pub interpreter_args: Vec<String>,
     /// Device compatibility ids (`--compat sr6110`); empty means universal.
     pub compat: Vec<String>,
+    /// Target triple written into the manifest. Defaults to the host triple;
+    /// cross-packaging for a device (`aarch64-unknown-linux-musl`) sets it.
+    pub platform: Option<String>,
 }
 
 struct SourceFile {
@@ -57,6 +60,11 @@ pub fn bundle(options: &Options) -> Result<PathBuf, String> {
     }
     if key_path.starts_with(&dir) {
         return Err("the signing key must not be inside the bundle directory".into());
+    }
+    if let Some(platform) = &options.platform {
+        if !platform.contains('-') || platform.chars().any(char::is_whitespace) {
+            return Err(format!("invalid target triple: {:?}", platform));
+        }
     }
 
     let mut sources = collect(&dir)?;
@@ -404,7 +412,12 @@ fn assemble_manifest(
     manifest.insert("desc".into(), Value::String(desc));
     manifest.insert(
         "platform".into(),
-        Value::String(package::target().to_string()),
+        Value::String(
+            options
+                .platform
+                .clone()
+                .unwrap_or_else(|| package::target().to_string()),
+        ),
     );
     let mut exec = manifest
         .get("exec")
@@ -878,11 +891,13 @@ mod tests {
         assert!(error.contains("--compat"), "{error}");
 
         options.compat = vec!["sr6110".into()];
+        options.platform = Some("aarch64-unknown-linux-musl".into());
         let path = bundle(&options).expect("bundle with compat");
         let bytes = fs::read(path).expect("read package");
         let entries = entries(&bytes);
         let manifest = package::parse_manifest(&entries[0].data).expect("manifest");
         assert_eq!(manifest.schema, 3);
+        assert_eq!(manifest.platform, "aarch64-unknown-linux-musl");
         assert_eq!(
             manifest.compat.expect("compat").devices,
             ["sr6110".to_string()]

@@ -300,6 +300,7 @@ fn parse(args: &[String]) -> Result<Command, ()> {
             let mut interpreter_version = None;
             let mut interpreter_args = Vec::new();
             let mut compat = Vec::new();
+            let mut platform = None;
             let mut index = 1;
             while index < args.len() {
                 let arg = &args[index];
@@ -354,6 +355,10 @@ fn parse(args: &[String]) -> Result<Command, ()> {
                                 .filter(|value| !value.is_empty())
                                 .map(str::to_string),
                         );
+                    }
+                    "--platform" => {
+                        index += 1;
+                        platform = Some(args.get(index).ok_or(())?.clone());
                     }
                     _ if arg.starts_with("--out=") => {
                         out = Some(PathBuf::from(
@@ -430,6 +435,13 @@ fn parse(args: &[String]) -> Result<Command, ()> {
                                 .map(str::to_string),
                         );
                     }
+                    _ if arg.starts_with("--platform=") => {
+                        platform = Some(
+                            arg.strip_prefix("--platform=")
+                                .expect("matched prefix")
+                                .to_string(),
+                        );
+                    }
                     _ if arg.starts_with('-') => return Err(()),
                     _ if dir.is_none() => dir = Some(PathBuf::from(arg)),
                     _ => return Err(()),
@@ -451,6 +463,7 @@ fn parse(args: &[String]) -> Result<Command, ()> {
                     interpreter_version,
                     interpreter_args,
                     compat,
+                    platform,
                 })
             })
             .ok_or(())
@@ -814,7 +827,7 @@ fn usage() {
     eprintln!("       plugin export <id> [--config-only] [--out <path>]");
     eprintln!("       plugin import <file> [--config <id>] [--no-config] [--force]");
     eprintln!(
-        "       plugin bundle <dir> --key <pem> [-o <out>] [--id <id>] [--version <semver>] [--exec <path>] [--desc <text>] [--key-id <id>] [--from-core] [--interpreter <name>] [--interpreter-version <constraint>] [--interpreter-arg <arg>] [--compat <device[,device...]>]"
+        "       plugin bundle <dir> --key <pem> [-o <out>] [--id <id>] [--version <semver>] [--exec <path>] [--desc <text>] [--key-id <id>] [--from-core] [--interpreter <name>] [--interpreter-version <constraint>] [--interpreter-arg <arg>] [--compat <device[,device...]>] [--platform <triple>]"
     );
 }
 
@@ -824,6 +837,31 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_bundle_compat_and_platform() {
+        assert_eq!(
+            parse(&args(&[
+                "bundle",
+                "src",
+                "--key",
+                "key.pem",
+                "--compat",
+                "sr6110,sr1010",
+                "--platform=aarch64-unknown-linux-musl"
+            ]))
+            .expect("bundle"),
+            Command::Bundle(crate::bundle::Options {
+                dir: PathBuf::from("src"),
+                key: Some(PathBuf::from("key.pem")),
+                compat: vec!["sr6110".into(), "sr1010".into()],
+                platform: Some("aarch64-unknown-linux-musl".into()),
+                ..Default::default()
+            })
+        );
+        assert!(parse(&args(&["bundle", "src", "--compat"])).is_err());
+        assert!(parse(&args(&["bundle", "src", "--platform"])).is_err());
     }
 
     #[test]
@@ -953,7 +991,8 @@ mod tests {
                 interpreter: None,
                 interpreter_version: None,
                 interpreter_args: Vec::new(),
-                compat: Vec::new()
+                compat: Vec::new(),
+                platform: None
             })
         );
         assert_eq!(
@@ -983,7 +1022,8 @@ mod tests {
                 interpreter: Some("sh".into()),
                 interpreter_version: Some(">=5".into()),
                 interpreter_args: vec!["-e".into()],
-                compat: Vec::new()
+                compat: Vec::new(),
+                platform: None
             })
         );
         assert!(parse(&args(&["bundle", "a", "b"])).is_err());
