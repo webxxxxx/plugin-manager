@@ -5,6 +5,7 @@
 //! is a version text file and `enabled` is a marker.
 
 use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -65,10 +66,17 @@ fn hooks_allowed(opt_in_hooks: bool) -> bool {
 /// Reject a hook package before any install side effect (such as stopping the
 /// running version) can happen.
 pub fn ensure_hooks_allowed(package: &Package, opt_in_hooks: bool) -> Result<(), String> {
-    if package::declares_hooks(&package.manifest) && !hooks_allowed(opt_in_hooks) {
+    ensure_hooks_allowed_manifest(&package.manifest, opt_in_hooks)
+}
+
+pub fn ensure_hooks_allowed_manifest(
+    manifest: &package::Manifest,
+    opt_in_hooks: bool,
+) -> Result<(), String> {
+    if package::declares_hooks(manifest) && !hooks_allowed(opt_in_hooks) {
         return Err(format!(
             "package {} declares hooks; this build requires --allow-hooks",
-            package.manifest.name
+            manifest.name
         ));
     }
     Ok(())
@@ -134,6 +142,272 @@ fn verify_package(
         signature_verified,
         interpreter,
     })
+}
+
+/// Preflight a package that has already been streamed into a staging directory.
+/// This mirrors [`verify_package`] but never holds the payload in memory.
+pub fn prepare_staged(
+    staged: &package::StagedPackage,
+    opt_in_hooks: bool,
+) -> Result<Option<Interpreter>, String> {
+    package::validate_manifest(&staged.manifest)?;
+    ensure_hooks_allowed_manifest(&staged.manifest, opt_in_hooks)?;
+    package::validate_staged_payload(&staged.manifest, &staged.root)?;
+    resolve_interpreter(&staged.manifest, interpreter::check)
+}
+
+/// Commit a streamed package. The caller must run [`prepare_staged`] first and
+/// must stop the running version before calling this for `Replace`.
+pub fn install_staged(
+    staged: package::StagedPackage,
+    strategy: Strategy,
+    opt_in_hooks: bool,
+    host_interpreter: Option<Interpreter>,
+) -> Result<Service, String> {
+    let id = staged.manifest.name.clone();
+    if id == RESERVED_ID {
+        return Err("the built-in svc id is reserved".into());
+    }
+    if !package::valid_name(&id) {
+        return Err(format!("invalid plugin id: {}", id));
+    }
+    ensure_hooks_allowed_manifest(&staged.manifest, opt_in_hooks)?;
+    if paths::services_dir().join(format!("{}.json", id)).exists() {
+        return Err(format!("plugin id conflicts with a core service: {}", id));
+    }
+
+    let plugin_dir = plugin_dir(&id);
+    let was_installed = current_version(&id).is_some();
+    fs::create_dir_all(&plugin_dir)
+        .map_err(|error| format!("create {}: {}", plugin_dir.display(), error))?;
+
+    match strategy {
+        Strategy::KeepOld => install_keep_old_staged(
+            staged,
+            &id,
+            &plugin_dir,
+            was_installed,
+            host_interpreter.as_ref(),
+        ),
+        Strategy::Replace => install_replace_staged(
+            staged,
+            &id,
+            &plugin_dir,
+            was_installed,
+            host_interpreter.as_ref(),
+        ),
+    }
+}
+
+fn install_keep_old_staged(
+    staged: package::StagedPackage,
+    id: &str,
+    plugin_dir: &Path,
+    was_installed: bool,
+    interpreter: Option<&Interpreter>,
+) -> Result<Service, String> {
+    let manifest = staged.manifest.clone();
+    let (version_dir, enabled) = commit_staged(staged, plugin_dir, was_installed)?;
+    copy_config_staged(&manifest, plugin_dir, &version_dir)?;
+    let service = service_from_manifest(id, &version_dir, &manifest, enabled, interpreter)?;
+    run_post_install_manifest(&manifest, id, &version_dir)?;
+    Ok(service)
+}
+
+fn install_replace_staged(
+    staged: package::StagedPackage,
+    id: &str,
+    plugin_dir: &Path,
+    was_installed: bool,
+    interpreter: Option<&Interpreter>,
+) -> Result<Service, String> {
+    let manifest = staged.manifest.clone();
+    let old_version = current_version(id).filter(|version| plugin_dir.join(version).is_dir());
+    let old_dir = old_version.as_ref().map(|version| plugin_dir.join(version));
+    let backup = old_version
+        .as_ref()
+        .map(|version| plugin_dir.join(format!(".backup-{}.{}", version, std::process::id())));
+    if let (Some(old_dir), Some(backup)) = (&old_dir, &backup) {
+        if backup.exists() {
+            fs::remove_dir_all(backup)
+                .map_err(|error| format!("remove {}: {}", backup.display(), error))?;
+        }
+        fs::rename(old_dir, backup)
+            .map_err(|error| format!("backup {}: {}", old_dir.display(), error))?;
+    }
+    let enabled_existed = plugin_dir.join("enabled").exists();
+    let result = (|| {
+        let (version_dir, enabled) = commit_staged(staged, plugin_dir, was_installed)?;
+        copy_config_staged(&manifest, plugin_dir, &version_dir)?;
+        let service = service_from_manifest(id, &version_dir, &manifest, enabled, interpreter)?;
+        run_post_install_manifest(&manifest, id, &version_dir)?;
+        Ok(service)
+    })();
+    match result {
+        Ok(service) => {
+            if let Some(backup) = backup {
+                let _ = fs::remove_dir_all(backup);
+            }
+            let _ = remove_versions(plugin_dir, Some(&manifest.version));
+            Ok(service)
+        }
+        Err(error) => {
+            let new_version = plugin_dir.join(&manifest.version);
+            let _ = fs::remove_dir_all(&new_version);
+            if !enabled_existed {
+                let _ = fs::remove_file(plugin_dir.join("enabled"));
+            }
+            if let (Some(backup), Some(old_dir), Some(old_version)) =
+                (&backup, &old_dir, &old_version)
+            {
+                let _ = fs::rename(backup, old_dir);
+                let _ = write_current(plugin_dir, old_version);
+            }
+            Err(error)
+        }
+    }
+}
+
+fn commit_staged(
+    staged: package::StagedPackage,
+    plugin_dir: &Path,
+    was_installed: bool,
+) -> Result<(PathBuf, bool), String> {
+    let staging_root = plugin_dir.parent().unwrap_or(plugin_dir);
+    if !staged.root.starts_with(staging_root)
+        && !fs::canonicalize(staging_root)
+            .map(|path| staged.root.starts_with(path))
+            .unwrap_or(false)
+    {
+        return Err("staging directory is outside the plugin tree".into());
+    }
+    let version_dir = plugin_dir.join(&staged.manifest.version);
+    if version_dir.exists() {
+        fs::remove_dir_all(&version_dir)
+            .map_err(|error| format!("remove {}: {}", version_dir.display(), error))?;
+    }
+    fs::rename(&staged.root, &version_dir).map_err(|error| {
+        format!(
+            "rename {} -> {}: {}",
+            staged.root.display(),
+            version_dir.display(),
+            error
+        )
+    })?;
+    write_current(plugin_dir, &staged.manifest.version)?;
+    let enabled_marker = plugin_dir.join("enabled");
+    let enabled = if was_installed {
+        enabled_marker.exists()
+    } else {
+        false
+    };
+    Ok((version_dir, enabled))
+}
+
+fn copy_config_staged(
+    manifest: &package::Manifest,
+    plugin_dir: &Path,
+    version_dir: &Path,
+) -> Result<(), String> {
+    let template_path = manifest.config.as_deref().unwrap_or("config/config");
+    let template_path = version_dir.join(template_path);
+    let template = match fs::read(&template_path) {
+        Ok(data) => data,
+        Err(_) => return Ok(()),
+    };
+    let target = plugin_dir.join("config");
+    let hash_path = plugin_dir.join("config.template.sha256");
+    let hash = package::hex_sha256(&template);
+    if !target.exists() {
+        write_config(&target, &template)?;
+        write_hash(&hash_path, &hash)?;
+        return Ok(());
+    }
+    let stored = fs::read_to_string(&hash_path)
+        .ok()
+        .map(|value| value.trim().to_string());
+    match stored {
+        None => write_hash(&hash_path, &hash)?,
+        Some(stored) if stored != hash => {
+            write_config(&plugin_dir.join("config.new"), &template)?;
+            write_hash(&hash_path, &hash)?;
+            log::svcd(&format!(
+                "svcd: plugin {}: template changed; wrote config.new",
+                manifest.name
+            ));
+        }
+        Some(_) => {}
+    }
+    Ok(())
+}
+
+fn run_post_install_manifest(
+    manifest: &package::Manifest,
+    id: &str,
+    version_dir: &Path,
+) -> Result<(), String> {
+    let Some(path) = manifest
+        .hooks
+        .as_ref()
+        .and_then(|hooks| hooks.post_install.as_deref())
+    else {
+        return Ok(());
+    };
+    hook::run(&hook::Invocation {
+        id,
+        version: &manifest.version,
+        action: "post-install",
+        version_dir,
+        path,
+        timeout_ms: hook::TIMEOUT_MS,
+    })
+    .map_err(|error| format!("post-install hook failed: {}", error))
+}
+
+/// Remove stale staging directories. Called once at daemon startup.
+pub fn cleanup_staging() {
+    let Ok(root) = fs::read_dir(paths::plugins_dir()) else {
+        return;
+    };
+    for entry in root.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(".staging-") {
+            let _ = fs::remove_dir_all(entry.path());
+            continue;
+        }
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Ok(children) = fs::read_dir(entry.path()) else {
+            continue;
+        };
+        for child in children.flatten() {
+            let name = child.file_name();
+            if name.to_string_lossy().starts_with(".staging-") {
+                let _ = fs::remove_dir_all(child.path());
+            }
+        }
+    }
+}
+
+/// Allocate a unique staging directory under the plugin's own tree so the
+/// final commit is a same-filesystem rename.
+#[allow(dead_code)]
+pub fn staging_dir(id: &str) -> Result<PathBuf, String> {
+    if !package::valid_name(id) {
+        return Err(format!("invalid plugin id: {}", id));
+    }
+    let directory = plugin_dir(id);
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("create {}: {}", directory.display(), error))?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    Ok(directory.join(format!(".staging-{}-{}", std::process::id(), nanos)))
 }
 
 pub fn install_package(
@@ -1200,6 +1474,72 @@ pub fn export_spkb(id: &str) -> Result<(String, Vec<u8>), String> {
         entries.push(("config", config, 0o600));
     }
     Ok((version, package::write_tar(&entries)?))
+}
+
+/// Stream the installed package as a `.spk` without a temporary archive.
+pub fn export_spk_stream<W: Write>(id: &str, out: &mut W) -> Result<String, String> {
+    let version = current_version(id).ok_or_else(|| format!("unknown plugin: {}", id))?;
+    package::write_installed_spk(&plugin_dir(id).join(&version), out)?;
+    Ok(version)
+}
+
+pub fn export_spk_size(id: &str) -> Result<u64, String> {
+    let version = current_version(id).ok_or_else(|| format!("unknown plugin: {}", id))?;
+    package::installed_spk_size(&plugin_dir(id).join(&version))
+}
+
+pub fn export_spkb_size(id: &str) -> Result<u64, String> {
+    let version = current_version(id).ok_or_else(|| format!("unknown plugin: {}", id))?;
+    let version_dir = plugin_dir(id).join(&version);
+    let config = active_config(id)
+        .map(|path| fs::read(path).map_err(|error| format!("read config: {}", error)))
+        .transpose()?;
+    let backup = backup_json(id, &version, config.as_deref());
+    let mut total = package::tar_entry_size(backup.len() as u64);
+    total = total.saturating_add(package::tar_entry_size(package::installed_spk_size(
+        &version_dir,
+    )?));
+    if let Some(config) = &config {
+        total = total.saturating_add(package::tar_entry_size(config.len() as u64));
+    }
+    Ok(total.saturating_add(1024))
+}
+
+fn backup_json(id: &str, version: &str, config: Option<&[u8]>) -> Vec<u8> {
+    let exported_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    serde_json::to_vec(&serde_json::json!({
+        "schema": 1,
+        "id": id,
+        "version": version,
+        "exportedAt": exported_at,
+        "configSha256": config.map(package::hex_sha256),
+    }))
+    .unwrap_or_default()
+}
+
+/// Stream a `.spkb` backup. The inner `.spk` size is computed from the
+/// manifest, so the outer tar header can be written before the nested stream.
+pub fn export_spkb_stream<W: Write>(id: &str, out: &mut W) -> Result<String, String> {
+    let version = current_version(id).ok_or_else(|| format!("unknown plugin: {}", id))?;
+    let version_dir = plugin_dir(id).join(&version);
+    let config = active_config(id)
+        .map(|path| fs::read(path).map_err(|error| format!("read config: {}", error)))
+        .transpose()?;
+    let backup = backup_json(id, &version, config.as_deref());
+    package::write_tar_entry(out, "backup.json", &backup, 0o644)?;
+    let inner_size = package::installed_spk_size(&version_dir)?;
+    package::write_tar_header(out, "plugin.spk", inner_size, 0o644)?;
+    package::write_installed_spk(&version_dir, out)?;
+    package::write_tar_padding(out, inner_size)?;
+    if let Some(config) = &config {
+        package::write_tar_entry(out, "config", config, 0o600)?;
+    }
+    out.write_all(&[0u8; 1024])
+        .map_err(|error| format!("write export trailer: {}", error))?;
+    Ok(version)
 }
 
 fn remove_versions(directory: &Path, keep: Option<&str>) -> Result<(), String> {

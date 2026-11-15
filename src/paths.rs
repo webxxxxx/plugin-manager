@@ -163,6 +163,9 @@ pub fn logs_dir() -> PathBuf {
         return PathBuf::from(dir);
     }
     if let Ok(settings) = settings::current() {
+        if let Some(dir) = &settings.logs_dir {
+            return dir.clone();
+        }
         if let Some(dir) = settings.install_logs_dir() {
             return dir;
         }

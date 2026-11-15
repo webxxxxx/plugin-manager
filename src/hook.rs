@@ -148,7 +148,7 @@ where
     let Some(stream) = stream else { return };
     let _ = thread::Builder::new()
         .name(name)
-        .stack_size(threads::IO_STACK)
+        .stack_size(threads::io_stack())
         .spawn(move || {
             for line in BufReader::new(stream).lines().map_while(Result::ok) {
                 if let Some(log) = &log {

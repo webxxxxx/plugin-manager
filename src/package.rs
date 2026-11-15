@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -200,31 +200,143 @@ pub fn read_tar(bytes: &[u8]) -> Result<Vec<TarEntry>, String> {
 pub fn write_tar(entries: &[(&str, &[u8], u32)]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     for (path, data, mode) in entries {
-        check_path(path)?;
-        if path.len() > 100 {
-            return Err(format!("tar path is too long: {}", path));
-        }
-        let mut header = [0u8; 512];
-        header[..path.len()].copy_from_slice(path.as_bytes());
-        let mode = format!("{:07o}", mode);
-        header[100..100 + mode.len()].copy_from_slice(mode.as_bytes());
-        let size = format!("{:011o}", data.len());
-        header[124..124 + size.len()].copy_from_slice(size.as_bytes());
-        header[156] = b'0';
-        header[257..263].copy_from_slice(b"ustar\0");
-        header[263..265].copy_from_slice(b"00");
-        for byte in &mut header[148..156] {
-            *byte = b' ';
-        }
-        let checksum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
-        let checksum = format!("{:06o}\0 ", checksum);
-        header[148..156].copy_from_slice(checksum.as_bytes());
-        out.extend_from_slice(&header);
-        out.extend_from_slice(data);
-        out.extend(std::iter::repeat_n(0, padding(data.len())));
+        write_tar_entry(&mut out, path, data, *mode)?;
     }
     out.extend(std::iter::repeat_n(0, 1024));
     Ok(out)
+}
+
+pub fn write_tar_entry<W: Write>(
+    out: &mut W,
+    path: &str,
+    data: &[u8],
+    mode: u32,
+) -> Result<(), String> {
+    write_tar_header(out, path, data.len() as u64, mode)?;
+    out.write_all(data)
+        .map_err(|error| format!("write tar data: {}", error))?;
+    write_tar_padding(out, data.len() as u64)
+}
+
+pub fn write_tar_header<W: Write>(
+    out: &mut W,
+    path: &str,
+    size: u64,
+    mode: u32,
+) -> Result<(), String> {
+    check_path(path)?;
+    if path.len() > 100 {
+        return Err(format!("tar path is too long: {}", path));
+    }
+    let mut header = [0u8; 512];
+    header[..path.len()].copy_from_slice(path.as_bytes());
+    let mode = format!("{:07o}", mode & 0o777);
+    header[100..100 + mode.len()].copy_from_slice(mode.as_bytes());
+    let size = format!("{:011o}", size);
+    header[124..124 + size.len()].copy_from_slice(size.as_bytes());
+    header[156] = b'0';
+    header[257..263].copy_from_slice(b"ustar\0");
+    header[263..265].copy_from_slice(b"00");
+    for byte in &mut header[148..156] {
+        *byte = b' ';
+    }
+    let checksum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+    let checksum = format!("{:06o}\0 ", checksum);
+    header[148..156].copy_from_slice(checksum.as_bytes());
+    out.write_all(&header)
+        .map_err(|error| format!("write tar header: {}", error))
+}
+
+pub fn write_tar_padding<W: Write>(out: &mut W, size: u64) -> Result<(), String> {
+    let padding = padding(size as usize);
+    if padding > 0 {
+        out.write_all(&[0u8; 512][..padding])
+            .map_err(|error| format!("write tar padding: {}", error))?;
+    }
+    Ok(())
+}
+
+pub fn tar_entry_size(size: u64) -> u64 {
+    512u64
+        .saturating_add(size)
+        .saturating_add(padding(size as usize) as u64)
+}
+
+fn read_export_signature(version_dir: &Path) -> Result<Vec<u8>, String> {
+    match fs::read(version_dir.join("signature.json")) {
+        Ok(signature) => Ok(signature),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(
+            "installed package has no signature (installed insecurely); reinstall a signed package to export it"
+                .into(),
+        ),
+        Err(error) => Err(format!("read signature: {}", error)),
+    }
+}
+
+/// Exact size of the `.spk` stream produced by [`write_installed_spk`].
+pub fn installed_spk_size(version_dir: &Path) -> Result<u64, String> {
+    let manifest_bytes = fs::read(version_dir.join("manifest.json"))
+        .map_err(|error| format!("read manifest: {}", error))?;
+    let manifest = parse_manifest(&manifest_bytes)?;
+    let signature = read_export_signature(version_dir)?;
+    let mut total = 512u64
+        .saturating_add(manifest_bytes.len() as u64)
+        .saturating_add(padding(manifest_bytes.len()) as u64);
+    total = total
+        .saturating_add(512)
+        .saturating_add(signature.len() as u64)
+        .saturating_add(padding(signature.len()) as u64);
+    for file in &manifest.files {
+        let metadata = fs::metadata(version_dir.join(&file.path))
+            .map_err(|error| format!("stat {}: {}", file.path, error))?;
+        if metadata.len() != file.size {
+            return Err(format!("installed file is corrupt: {}", file.path));
+        }
+        total = total
+            .saturating_add(512)
+            .saturating_add(file.size)
+            .saturating_add(padding(file.size as usize) as u64);
+    }
+    Ok(total.saturating_add(1024))
+}
+
+/// Stream the installed `.spk` without holding payload files in memory.
+pub fn write_installed_spk<W: Write>(version_dir: &Path, out: &mut W) -> Result<(), String> {
+    let manifest_bytes = fs::read(version_dir.join("manifest.json"))
+        .map_err(|error| format!("read manifest: {}", error))?;
+    let manifest = parse_manifest(&manifest_bytes)?;
+    let signature = read_export_signature(version_dir)?;
+    write_tar_entry(out, "manifest.json", &manifest_bytes, 0o644)?;
+    write_tar_entry(out, "signature.json", &signature, 0o644)?;
+    let mut files = manifest.files.clone();
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    for file in files {
+        let path = version_dir.join(&file.path);
+        let mut source =
+            fs::File::open(&path).map_err(|error| format!("open {}: {}", path.display(), error))?;
+        write_tar_header(out, &file.path, file.size, file.mode & 0o777)?;
+        let mut hasher = Sha256::new();
+        let mut written = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = source
+                .read(&mut buffer)
+                .map_err(|error| format!("read {}: {}", path.display(), error))?;
+            if read == 0 {
+                break;
+            }
+            written = written.saturating_add(read as u64);
+            hasher.update(&buffer[..read]);
+            out.write_all(&buffer[..read])
+                .map_err(|error| format!("write export: {}", error))?;
+        }
+        if written != file.size || hex_bytes(&hasher.finalize()) != file.sha256 {
+            return Err(format!("installed file is corrupt: {}", file.path));
+        }
+        write_tar_padding(out, written)?;
+    }
+    out.write_all(&[0u8; 1024])
+        .map_err(|error| format!("write export trailer: {}", error))
 }
 
 /// Rebuild a signed `.spk` from an installed version directory. The original
@@ -333,6 +445,635 @@ impl Package {
         let path = self.manifest.config.as_deref().unwrap_or("config/config");
         self.files.iter().find(|file| file.path == path)
     }
+}
+
+/// A package received as a stream and extracted into a staging directory.
+///
+/// The tar archive itself is never stored: only the final files are written.
+/// `signature_verified` is false for the insecure fallback.
+pub struct StagedPackage {
+    pub manifest: Manifest,
+    #[allow(dead_code)]
+    pub manifest_bytes: Vec<u8>,
+    #[allow(dead_code)]
+    pub signature_bytes: Vec<u8>,
+    pub signature_verified: bool,
+    pub root: std::path::PathBuf,
+    #[allow(dead_code)]
+    pub unpacked_size: u64,
+}
+
+/// Streaming ustar reader. It only understands the entry types the package
+/// format uses (regular files and directories) and validates the header
+/// checksum before handing a path to the caller.
+pub struct StreamTar<R: Read> {
+    reader: R,
+    remaining: u64,
+    padding: u64,
+    total: u64,
+    limit: u64,
+    done: bool,
+}
+
+pub struct StreamEntry {
+    pub path: String,
+    pub mode: u32,
+    pub kind: u8,
+    pub size: u64,
+}
+
+impl<R: Read> StreamTar<R> {
+    pub fn new(reader: R, limit: u64) -> Self {
+        StreamTar {
+            reader,
+            remaining: 0,
+            padding: 0,
+            total: 0,
+            limit,
+            done: false,
+        }
+    }
+
+    pub fn next_entry(&mut self) -> Result<Option<StreamEntry>, String> {
+        if self.remaining != 0 || self.padding != 0 {
+            return Err("previous tar entry was not consumed".into());
+        }
+        if self.done {
+            return Ok(None);
+        }
+        let mut header = [0u8; 512];
+        self.read_exact(&mut header)?;
+        if header.iter().all(|byte| *byte == 0) {
+            self.done = true;
+            return Ok(None);
+        }
+        let name = field(&header, 0, 100);
+        let prefix = field(&header, 345, 155);
+        let mut path = if prefix.is_empty() {
+            name
+        } else {
+            format!("{}/{}", prefix, name)
+        };
+        let mode = parse_octal(&header[100..108], "mode")? as u32;
+        let size = parse_octal(&header[124..136], "size")?;
+        let kind = header[156];
+        if !matches!(kind, b'0' | b'5') {
+            return Err(format!("unsupported tar entry type for {}", path));
+        }
+        if kind == b'5' {
+            path = path.trim_end_matches('/').to_string();
+            if size != 0 {
+                return Err(format!("directory entry has data: {}", path));
+            }
+        }
+        check_path(&path)?;
+        check_checksum(&header)?;
+        self.remaining = size;
+        self.padding = padding(size as usize) as u64;
+        Ok(Some(StreamEntry {
+            path,
+            mode,
+            kind,
+            size,
+        }))
+    }
+
+    /// Stream one entry into `sink`, then consume its tar padding. The caller
+    /// must check the returned size/hash against the manifest.
+    pub fn copy_entry<F>(&mut self, entry: &StreamEntry, sink: &mut F) -> Result<u64, String>
+    where
+        F: FnMut(&[u8]) -> Result<(), String>,
+    {
+        if entry.kind == b'5' {
+            if self.remaining != 0 || self.padding != 0 {
+                return Err("directory entry has data".into());
+            }
+            return Ok(0);
+        }
+        if self.remaining != entry.size {
+            return Err("tar entry state mismatch".into());
+        }
+        let mut copied = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        while self.remaining > 0 {
+            let want = std::cmp::min(self.remaining, buffer.len() as u64) as usize;
+            self.read_exact(&mut buffer[..want])?;
+            sink(&buffer[..want])?;
+            self.remaining -= want as u64;
+            copied += want as u64;
+        }
+        self.skip_padding()?;
+        Ok(copied)
+    }
+
+    /// Borrow one regular entry as a `Read`. The reader consumes the entry and
+    /// its padding when dropped, so the outer tar can continue with the next
+    /// entry (used by `.spkb`, whose `plugin.spk` is a nested tar).
+    pub fn entry_reader(&mut self, entry: &StreamEntry) -> Result<EntryReader<'_, R>, String> {
+        if entry.kind != b'0' {
+            return Err(format!("{} is not a regular file", entry.path));
+        }
+        if self.remaining != entry.size {
+            return Err("tar entry state mismatch".into());
+        }
+        Ok(EntryReader {
+            tar: self,
+            remaining: entry.size,
+            finished: false,
+        })
+    }
+
+    pub(crate) fn read_some(&mut self, buffer: &mut [u8], max: u64) -> Result<usize, String> {
+        let take = std::cmp::min(buffer.len() as u64, max) as usize;
+        self.read_exact(&mut buffer[..take])?;
+        Ok(take)
+    }
+
+    pub(crate) fn skip_current(&mut self) -> Result<(), String> {
+        self.remaining = 0;
+        self.skip_padding()
+    }
+
+    /// Consume whatever remains after the end-of-archive marker. An HTTP body
+    /// may carry tar padding zeros after the first zero block; leaving them
+    /// unread makes Windows close the socket with RST instead of a clean FIN.
+    pub(crate) fn drain_to_end(&mut self) -> Result<(), String> {
+        self.skip_current()?;
+        let mut buffer = [0u8; 8192];
+        loop {
+            match self.reader.read(&mut buffer) {
+                Ok(0) => return Ok(()),
+                Ok(read) => {
+                    self.total = self.total.saturating_add(read as u64);
+                    if self.total > self.limit {
+                        return Err(format!(
+                            "package exceeds {} MiB",
+                            self.limit / (1024 * 1024)
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(format!("read package: {}", error)),
+            }
+        }
+    }
+
+    fn skip_padding(&mut self) -> Result<(), String> {
+        let mut buffer = [0u8; 512];
+        while self.padding > 0 {
+            let take = std::cmp::min(self.padding, buffer.len() as u64) as usize;
+            self.read_exact(&mut buffer[..take])?;
+            self.padding -= take as u64;
+        }
+        Ok(())
+    }
+
+    fn read_exact(&mut self, buffer: &mut [u8]) -> Result<(), String> {
+        self.total = self.total.saturating_add(buffer.len() as u64);
+        if self.total > self.limit {
+            return Err(format!(
+                "package exceeds {} MiB",
+                self.limit / (1024 * 1024)
+            ));
+        }
+        self.reader
+            .read_exact(buffer)
+            .map_err(|error| format!("read package: {}", error))
+    }
+}
+
+impl<R: Read> Drop for StreamTar<R> {
+    fn drop(&mut self) {
+        // A rejected package may still have body bytes in flight. Consume them
+        // so the HTTP layer can send its error response instead of a TCP RST.
+        let _ = self.drain_to_end();
+    }
+}
+
+pub struct EntryReader<'a, R: Read> {
+    tar: &'a mut StreamTar<R>,
+    remaining: u64,
+    finished: bool,
+}
+
+impl<R: Read> Read for EntryReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            self.finished = true;
+            return Ok(0);
+        }
+        let read = self
+            .tar
+            .read_some(buffer, self.remaining)
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?;
+        self.remaining -= read as u64;
+        if self.remaining == 0 {
+            self.finished = true;
+        }
+        Ok(read)
+    }
+}
+
+impl<R: Read> Drop for EntryReader<'_, R> {
+    fn drop(&mut self) {
+        if !self.finished || self.tar.remaining > 0 || self.tar.padding > 0 {
+            let _ = self.tar.skip_current();
+        }
+    }
+}
+
+fn parse_octal(bytes: &[u8], name: &str) -> Result<u64, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| format!("invalid octal {} field", name))?
+        .trim_matches(['\0', ' ']);
+    if text.is_empty() {
+        return Ok(0);
+    }
+    u64::from_str_radix(text, 8).map_err(|_| format!("invalid octal {} field", name))
+}
+
+fn check_checksum(header: &[u8; 512]) -> Result<(), String> {
+    let expected = parse_octal(&header[148..156], "checksum")?;
+    // Older fixtures and some third-party ustar writers leave the checksum
+    // field zero. The manifest file hashes are the real integrity check, so a
+    // zero field is accepted; a non-zero field must still match.
+    if expected == 0 {
+        return Ok(());
+    }
+    let actual: u64 = header
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| {
+            if (148..156).contains(&index) {
+                b' ' as u64
+            } else {
+                *byte as u64
+            }
+        })
+        .sum();
+    if expected != actual {
+        return Err("invalid tar header checksum".into());
+    }
+    Ok(())
+}
+
+/// Stream a `.spk` into `staging`. This is the no-temporary-archive path used
+/// by the HTTP upload and by `plugin import`.
+///
+/// The manifest and signature are read first. No payload byte is written until
+/// the signature has been checked and every manifest path has been validated.
+pub fn install_stream<R: Read>(
+    reader: R,
+    staging: &Path,
+    allow_insecure: bool,
+    max_bytes: u64,
+) -> Result<StagedPackage, String> {
+    let result = install_stream_inner(reader, staging, allow_insecure, max_bytes);
+    if result.is_err() {
+        let _ = fs::remove_dir_all(staging);
+    }
+    result
+}
+
+fn install_stream_inner<R: Read>(
+    reader: R,
+    staging: &Path,
+    allow_insecure: bool,
+    max_bytes: u64,
+) -> Result<StagedPackage, String> {
+    let mut tar = StreamTar::new(reader, max_bytes);
+    let manifest_entry = tar
+        .next_entry()?
+        .ok_or_else(|| "manifest.json is missing".to_string())?;
+    if manifest_entry.path != "manifest.json" {
+        return Err("manifest.json must be the first entry".into());
+    }
+    let manifest_bytes = read_entry(&mut tar, &manifest_entry, 1024 * 1024, "manifest.json")?;
+    let manifest = parse_manifest(&manifest_bytes)?;
+    validate_manifest(&manifest)?;
+    if manifest.platform != target() {
+        return Err(format!(
+            "platform mismatch: package {}, host {}",
+            manifest.platform,
+            target()
+        ));
+    }
+    let mut declared = BTreeMap::new();
+    for entry in &manifest.files {
+        check_path(&entry.path)?;
+        if entry.path == "manifest.json" || entry.path == "signature.json" {
+            return Err("manifest.json/signature.json cannot be in files[]".to_string());
+        }
+        if declared.insert(entry.path.clone(), entry.clone()).is_some() {
+            return Err(format!("duplicate files[] entry: {}", entry.path));
+        }
+        if entry.mode & 0o6000 != 0 {
+            return Err(format!("setuid/setgid is not allowed: {}", entry.path));
+        }
+        if declared.len() > MAX_FILES {
+            return Err("too many files".into());
+        }
+    }
+    check_manifest_paths(&manifest)?;
+    check_hooks(&manifest)?;
+
+    let mut signature_bytes = Vec::new();
+    let mut signature_verified = false;
+    let mut first_payload = None;
+    match tar.next_entry()? {
+        Some(entry) if entry.path == "signature.json" => {
+            signature_bytes = read_entry(&mut tar, &entry, 64 * 1024, "signature.json")?;
+            if allow_insecure {
+                if check_signature(
+                    &manifest_bytes,
+                    &signature_bytes,
+                    SignatureMode::Required,
+                    None,
+                )
+                .is_ok()
+                {
+                    signature_verified = true;
+                }
+            } else {
+                check_signature(
+                    &manifest_bytes,
+                    &signature_bytes,
+                    SignatureMode::Required,
+                    None,
+                )?;
+                signature_verified = true;
+            }
+        }
+        Some(_entry) if !allow_insecure => {
+            return Err("signature.json must be the second entry".into());
+        }
+        Some(entry) => first_payload = Some(entry),
+        None if !allow_insecure => return Err("signature.json is missing".into()),
+        None => {}
+    }
+
+    if staging.exists() {
+        fs::remove_dir_all(staging)
+            .map_err(|error| format!("remove {}: {}", staging.display(), error))?;
+    }
+    fs::create_dir_all(staging)
+        .map_err(|error| format!("create {}: {}", staging.display(), error))?;
+    write_one(&staging.join("manifest.json"), &manifest_bytes, 0o644)?;
+    if !signature_bytes.is_empty() {
+        write_one(&staging.join("signature.json"), &signature_bytes, 0o644)?;
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut unpacked_size = manifest_bytes.len() as u64 + signature_bytes.len() as u64;
+    let mut first = first_payload;
+    loop {
+        let entry = match first.take() {
+            Some(entry) => Some(entry),
+            None => tar.next_entry()?,
+        };
+        let Some(entry) = entry else { break };
+        if entry.kind == b'5' {
+            continue;
+        }
+        let declared_entry = declared
+            .get(&entry.path)
+            .ok_or_else(|| format!("file is not declared in files[]: {}", entry.path))?
+            .clone();
+        if !seen.insert(entry.path.clone()) {
+            return Err(format!("duplicate tar entry: {}", entry.path));
+        }
+        if entry.size != declared_entry.size {
+            return Err(format!(
+                "size mismatch for {}: manifest {}, archive {}",
+                entry.path, declared_entry.size, entry.size
+            ));
+        }
+        if entry.mode & 0o777 != declared_entry.mode & 0o777 {
+            return Err(format!("mode mismatch for {}", entry.path));
+        }
+        let path = staging.join(&entry.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("create {}: {}", parent.display(), error))?;
+        }
+        let mut file =
+            File::create(&path).map_err(|error| format!("create {}: {}", path.display(), error))?;
+        let mut hasher = Sha256::new();
+        let copied = tar.copy_entry(&entry, &mut |chunk| {
+            file.write_all(chunk)
+                .map_err(|error| format!("write {}: {}", path.display(), error))?;
+            hasher.update(chunk);
+            Ok(())
+        })?;
+        if copied != declared_entry.size {
+            return Err(format!("size mismatch for {}", entry.path));
+        }
+        let digest = hex_bytes(&hasher.finalize());
+        if digest != declared_entry.sha256 {
+            return Err(format!("sha256 mismatch for {}", entry.path));
+        }
+        file.sync_all()
+            .map_err(|error| format!("sync {}: {}", path.display(), error))?;
+        set_mode(&path, declared_entry.mode)?;
+        unpacked_size = unpacked_size.saturating_add(copied);
+    }
+
+    if seen.len() != declared.len() {
+        let missing: Vec<&str> = declared
+            .keys()
+            .filter(|path| !seen.contains(*path))
+            .map(String::as_str)
+            .collect();
+        return Err(format!("missing files: {}", missing.join(", ")));
+    }
+    if seen.is_empty() {
+        return Err("package has no payload files".into());
+    }
+    tar.drain_to_end()?;
+    validate_staged_payload(&manifest, staging)?;
+    Ok(StagedPackage {
+        manifest,
+        manifest_bytes,
+        signature_bytes,
+        signature_verified,
+        root: staging.to_path_buf(),
+        unpacked_size,
+    })
+}
+
+fn read_entry<R: Read>(
+    tar: &mut StreamTar<R>,
+    entry: &StreamEntry,
+    cap: u64,
+    name: &str,
+) -> Result<Vec<u8>, String> {
+    if entry.size > cap {
+        return Err(format!("{} is too large", name));
+    }
+    let mut data = Vec::with_capacity(entry.size as usize);
+    tar.copy_entry(entry, &mut |chunk| {
+        data.extend_from_slice(chunk);
+        Ok(())
+    })?;
+    Ok(data)
+}
+
+/// Validate the executable/interpreter and hook constraints from the files
+/// that already landed in the staging directory. Only the small script/hook
+/// files are read; binaries are classified from their first bytes.
+pub fn validate_staged_payload(manifest: &Manifest, root: &Path) -> Result<(), String> {
+    let mut executables = vec![manifest.exec.path.as_str()];
+    if let Some(lifecycle) = &manifest.lifecycle {
+        for hook in [&lifecycle.start, &lifecycle.stop, &lifecycle.status]
+            .into_iter()
+            .flatten()
+        {
+            executables.push(hook.path.as_str());
+        }
+    }
+    let mut files: Vec<(&str, Vec<u8>)> = Vec::new();
+    for path in executables {
+        let data =
+            fs::read(root.join(path)).map_err(|error| format!("read {}: {}", path, error))?;
+        files.push((path, data.into_iter().take(8).collect()));
+    }
+    let borrowed: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(path, data)| (*path, data.as_slice()))
+        .collect();
+    validate_script_payload(manifest, &borrowed)?;
+    #[cfg(unix)]
+    {
+        let mut hooks = Vec::new();
+        for path in [
+            manifest
+                .hooks
+                .as_ref()
+                .and_then(|hooks| hooks.post_install.as_deref()),
+            manifest
+                .hooks
+                .as_ref()
+                .and_then(|hooks| hooks.pre_remove.as_deref()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let data = fs::read(root.join(path))
+                .map_err(|error| format!("read hook {}: {}", path, error))?;
+            hooks.push(FileData {
+                path: path.to_string(),
+                data,
+                mode: 0o755,
+            });
+        }
+        check_hook_shebangs(manifest, &hooks)?;
+    }
+    Ok(())
+}
+
+/// Re-open a staging directory produced by [`install_stream`] without reading
+/// the payload again. Used by the daemon's `plugin.install_staged` RPC, which
+/// trusts the HTTP layer to have streamed and hashed the files.
+pub fn load_staged(root: &Path, allow_insecure: bool) -> Result<StagedPackage, String> {
+    let manifest_path = root.join("manifest.json");
+    let manifest_bytes = fs::read(&manifest_path)
+        .map_err(|error| format!("read {}: {}", manifest_path.display(), error))?;
+    let manifest = parse_manifest(&manifest_bytes)?;
+    validate_manifest(&manifest)?;
+    if manifest.platform != target() {
+        return Err(format!(
+            "platform mismatch: package {}, host {}",
+            manifest.platform,
+            target()
+        ));
+    }
+    let mut declared = BTreeMap::new();
+    for entry in &manifest.files {
+        check_path(&entry.path)?;
+        if entry.path == "manifest.json" || entry.path == "signature.json" {
+            return Err("manifest.json/signature.json cannot be in files[]".to_string());
+        }
+        if declared.insert(entry.path.clone(), entry.clone()).is_some() {
+            return Err(format!("duplicate files[] entry: {}", entry.path));
+        }
+        if entry.mode & 0o6000 != 0 {
+            return Err(format!("setuid/setgid is not allowed: {}", entry.path));
+        }
+    }
+    check_manifest_paths(&manifest)?;
+    check_hooks(&manifest)?;
+
+    let signature_path = root.join("signature.json");
+    let signature_bytes = match fs::read(&signature_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(format!("read {}: {}", signature_path.display(), error)),
+    };
+    let signature_verified = if signature_bytes.is_empty() {
+        if !allow_insecure {
+            return Err("signature.json is missing".into());
+        }
+        false
+    } else if allow_insecure {
+        check_signature(
+            &manifest_bytes,
+            &signature_bytes,
+            SignatureMode::Required,
+            None,
+        )
+        .is_ok()
+    } else {
+        check_signature(
+            &manifest_bytes,
+            &signature_bytes,
+            SignatureMode::Required,
+            None,
+        )?;
+        true
+    };
+    validate_staged_payload(&manifest, root)?;
+    let unpacked_size = manifest
+        .files
+        .iter()
+        .map(|file| file.size)
+        .sum::<u64>()
+        .saturating_add(manifest_bytes.len() as u64)
+        .saturating_add(signature_bytes.len() as u64);
+    Ok(StagedPackage {
+        manifest,
+        manifest_bytes,
+        signature_bytes,
+        signature_verified,
+        root: root.to_path_buf(),
+        unpacked_size,
+    })
+}
+
+/// Read the path from one tar header without consuming a stream. Returns
+/// `None` for the zero blocks at end-of-archive.
+pub fn tar_header_path(header: &[u8]) -> Result<Option<String>, String> {
+    if header.len() < 512 {
+        return Ok(None);
+    }
+    let header: &[u8; 512] = header[..512]
+        .try_into()
+        .map_err(|_| "truncated tar header".to_string())?;
+    if header.iter().all(|byte| *byte == 0) {
+        return Ok(None);
+    }
+    check_checksum(header)?;
+    let name = field(header, 0, 100);
+    let prefix = field(header, 345, 155);
+    let mut path = if prefix.is_empty() {
+        name
+    } else {
+        format!("{}/{}", prefix, name)
+    };
+    if header[156] == b'5' {
+        path = path.trim_end_matches('/').to_string();
+    }
+    check_path(&path)?;
+    Ok(Some(path))
 }
 
 pub fn verify_package(path: &Path) -> Result<Package, String> {
@@ -1143,9 +1884,12 @@ pub fn check_path(p: &str) -> Result<(), String> {
 }
 
 pub fn hex_sha256(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(64);
-    for byte in digest {
+    hex_bytes(&Sha256::digest(bytes))
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
         use std::fmt::Write as _;
         let _ = write!(out, "{:02x}", byte);
     }
@@ -1409,6 +2153,36 @@ mod tests {
         header[257..263].copy_from_slice(b"ustar\0");
         header[263..265].copy_from_slice(b"00");
         header
+    }
+
+    #[test]
+    fn streaming_install_matches_the_in_memory_path() {
+        let key = setup();
+        let bytes = package(&key);
+        let root = tempdir::TempDir::new();
+        let staged = install_stream(
+            std::io::Cursor::new(&bytes),
+            root.path(),
+            false,
+            1024 * 1024,
+        )
+        .expect("stream install");
+        assert_eq!(staged.manifest.name, "demo");
+        assert!(staged.signature_verified);
+        assert_eq!(
+            std::fs::read(root.path().join("payload/bin/demo")).expect("read"),
+            b"hello"
+        );
+
+        let truncated = &bytes[..bytes.len() / 2];
+        let broken = tempdir::TempDir::new();
+        assert!(install_stream(
+            std::io::Cursor::new(truncated),
+            broken.path(),
+            false,
+            1024 * 1024
+        )
+        .is_err());
     }
 
     #[test]

@@ -248,6 +248,28 @@ fn default_conf_text(layout: &Layout) -> String {
          temp_dir = {}\n\
          temp_retention_secs = 7200\n\
          temp_cleanup_interval_secs = 300\n\
+         # Optional resource limits. MEM_LEVEL (low|middle|high, default high)\n\
+         # supplies the built-in defaults. Values below are comments only;\n\
+         # uncomment to override. low / middle / high defaults:\n\
+         # logs_dir = /var/log/svcd\n\
+         # log_max_bytes = 65536 / 65536 / 65536\n\
+         # log_rotations = 3 / 3 / 3\n\
+         # log_to_file = on\n\
+         # request_stack_bytes = 131072 / 196608 / 262144\n\
+         # io_stack_bytes = 65536 / 98304 / 131072\n\
+         # max_body_bytes = 8388608 / 67108864 / 536870912\n\
+         # max_json_body_bytes = 65536 / 262144 / 1048576\n\
+         # max_complete_body_bytes = 131072 / 1048576 / 8388608\n\
+         # max_header_bytes = 8192 / 16384 / 65536\n\
+         # max_streams = 8 / 16 / 64\n\
+         # stream_buffer_bytes = 16384 / 32768 / 65536\n\
+         # max_connections = 32 / 128 / 512\n\
+         # max_connections_per_ip = 8 / 32 / 64\n\
+         # max_subscriptions = 4 / 16 / 64\n\
+         # max_subscribers_per_plugin = 4 / 16 / 64\n\
+         # http_idle_timeout_secs = 30 / 60 / 120\n\
+         # max_package_bytes = 8388608 / 67108864 / 536870912\n\
+         # transfer_timeout_secs = 120 / 120 / 120\n\
          # Set the web/API password with: svc auth passwd <password>\n\
          # auth_passwd = pbkdf2-sha256$...\n",
         layout.config_dir.display(),
@@ -2787,6 +2809,18 @@ mod tests {
             "temp_dir",
             "temp_retention_secs",
             "temp_cleanup_interval_secs",
+            "logs_dir",
+            "log_max_bytes",
+            "log_rotations",
+            "log_to_file",
+            "request_stack_bytes",
+            "io_stack_bytes",
+            "max_connections",
+            "max_connections_per_ip",
+            "max_subscriptions",
+            "max_subscribers_per_plugin",
+            "http_idle_timeout_secs",
+            "max_package_bytes",
             "auth_passwd",
         ] {
             assert!(text.contains(key), "example is missing {key}");

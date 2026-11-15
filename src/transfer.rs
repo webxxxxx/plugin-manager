@@ -164,7 +164,7 @@ fn import_backup(
     })
 }
 
-fn apply_config(id: &str, data: &[u8], require_root: bool) -> Result<(), Error> {
+pub(crate) fn apply_config(id: &str, data: &[u8], require_root: bool) -> Result<(), Error> {
     if require_root {
         plugin::root_required().map_err(Error::Failed)?;
     }

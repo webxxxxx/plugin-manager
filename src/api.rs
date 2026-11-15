@@ -10,6 +10,8 @@
 use crate::channel_client_reactor::{ClientReactor, Event as ClientEvent};
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::net::IpAddr;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
@@ -52,27 +54,23 @@ use crate::transfer;
 use crate::uichannel;
 use crate::webui;
 
-const MAX_BODY: u64 = 512 * 1024 * 1024;
-const MAX_JSON_BODY: u64 = 1024 * 1024;
-const MAX_COMPLETE_BODY: u64 = 8 * 1024 * 1024;
-const MAX_LOG_BODY: usize = 1024 * 1024;
-const MAX_HEADER: usize = 64 * 1024;
 const UI: &str = include_str!("web/index.html");
 
 /// Buffered-body limit for the routes that still go through the ordinary
 /// router. Blob uploads/downloads are streamed before this is consulted.
 fn body_limit(path: &str) -> u64 {
+    let limits = crate::limits::current();
     let path = path.split_once('?').map(|(path, _)| path).unwrap_or(path);
     if path.starts_with("/api/v1/plugins") || path.starts_with("/api/v1/import") {
-        MAX_BODY
+        limits.max_body
     } else if path.trim_end_matches('/').ends_with("/complete")
         && (path.starts_with("/api/v1/blobs/uploads/")
             || path.starts_with("/api/v1/file/uploads/")
             || path.starts_with("/api/v1/files/uploads/"))
     {
-        MAX_COMPLETE_BODY
+        limits.max_complete_body
     } else {
-        MAX_JSON_BODY
+        limits.max_json_body
     }
 }
 
@@ -136,12 +134,12 @@ pub fn spawn(config: PathBuf) -> std::io::Result<Arc<Api>> {
     #[cfg(unix)]
     thread::Builder::new()
         .name("svcd-http-reactor".into())
-        .stack_size(threads::IO_STACK)
+        .stack_size(threads::io_stack())
         .spawn(move || reactor_loop(Some(listener), lan, config))?;
     #[cfg(not(unix))]
     thread::Builder::new()
         .name("svcd-http".into())
-        .stack_size(threads::IO_STACK)
+        .stack_size(threads::io_stack())
         .spawn(move || listener_loop(Some(listener), lan, config))?;
     Ok(api)
 }
@@ -252,6 +250,8 @@ enum ConnState {
 #[cfg(unix)]
 struct Connection {
     stream: TcpStream,
+    peer: IpAddr,
+    last_active: Instant,
     buffer: Vec<u8>,
     out: Vec<u8>,
     out_at: usize,
@@ -309,13 +309,27 @@ fn reactor_loop(mut listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config:
         let notify = notify_tx.try_clone().ok();
         let _ = thread::Builder::new()
             .name("svcd-http-worker".into())
-            .stack_size(threads::REQUEST_STACK)
+            .stack_size(threads::request_stack())
             .spawn(move || http_worker(queue, config, lan, results, notify));
     }
 
     let mut connections: HashMap<u64, Connection> = HashMap::new();
     let mut next_id: u64 = 1;
+    let limits = crate::limits::current();
     loop {
+        // Close idle keep-alive connections before building the poll set. SSE,
+        // WS, MCP SSE and worker-owned requests are not idle: their own
+        // heartbeats/timeouts decide when they end.
+        let now = Instant::now();
+        connections.retain(|_, connection| {
+            if matches!(connection.state, ConnState::Reading | ConnState::Writing)
+                && now.saturating_duration_since(connection.last_active) > limits.idle_timeout
+            {
+                false
+            } else {
+                true
+            }
+        });
         while let Ok(result) = results_rx.try_recv() {
             match result {
                 WorkResult::Http(result) => {
@@ -411,7 +425,23 @@ fn reactor_loop(mut listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config:
             if let Some(active) = &listener {
                 loop {
                     match active.accept() {
-                        Ok((stream, _)) => {
+                        Ok((stream, peer)) => {
+                            let ip = peer.ip();
+                            let per_ip = connections
+                                .values()
+                                .filter(|connection| connection.peer == ip)
+                                .count();
+                            if connections.len() >= limits.max_connections
+                                || per_ip >= limits.max_connections_per_ip
+                            {
+                                let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+                                let _ = (&stream).write_all(
+                                    b"HTTP/1.1 503 Service Unavailable\r\n\
+                                      Content-Length: 0\r\n\
+                                      Connection: close\r\n\r\n",
+                                );
+                                continue;
+                            }
                             let _ = stream.set_nonblocking(true);
                             let id = next_id;
                             next_id = next_id.saturating_add(1);
@@ -419,6 +449,8 @@ fn reactor_loop(mut listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config:
                                 id,
                                 Connection {
                                     stream,
+                                    peer: ip,
+                                    last_active: Instant::now(),
                                     buffer: Vec::new(),
                                     out: Vec::new(),
                                     out_at: 0,
@@ -457,14 +489,96 @@ fn reactor_loop(mut listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config:
                         continue;
                     }
                     Ok(read) => {
+                        connection.last_active = Instant::now();
                         connection.buffer.extend_from_slice(&chunk[..read]);
+                        if let Some((stream, head)) = ui_takeover(connection) {
+                            connection.state = ConnState::Processing;
+                            connections.remove(&id);
+                            let lan = lan.clone();
+                            let _ = thread::Builder::new()
+                                .name("svcd-ui-http".into())
+                                .stack_size(threads::transfer_stack())
+                                .spawn(move || {
+                                    let mut stream = stream;
+                                    let _ = stream.set_nonblocking(false);
+                                    crate::ui_http::serve(&mut stream, &head, &lan);
+                                });
+                            continue;
+                        }
+                        if let Some((stream, head, route)) = export_takeover(connection) {
+                            connection.state = ConnState::Processing;
+                            connections.remove(&id);
+                            let lan = lan.clone();
+                            let config = config.clone();
+                            let _ = thread::Builder::new()
+                                .name("svcd-export-http".into())
+                                .stack_size(threads::transfer_stack())
+                                .spawn(move || {
+                                    let mut stream = stream;
+                                    let _ = stream.set_nonblocking(false);
+                                    crate::export_http::serve(
+                                        &mut stream,
+                                        &head,
+                                        &lan,
+                                        &config,
+                                        route,
+                                    );
+                                });
+                            continue;
+                        }
+                        if let Some((stream, head, initial)) = import_takeover(connection) {
+                            connection.state = ConnState::Processing;
+                            connections.remove(&id);
+                            let lan = lan.clone();
+                            let config = config.clone();
+                            let limits = crate::limits::current();
+                            let _ = thread::Builder::new()
+                                .name("svcd-import-http".into())
+                                .stack_size(threads::transfer_stack())
+                                .spawn(move || {
+                                    let mut stream = stream;
+                                    let _ = stream.set_nonblocking(false);
+                                    crate::install_http::serve_import(
+                                        &mut stream,
+                                        &head,
+                                        &initial,
+                                        &lan,
+                                        &config,
+                                        limits,
+                                    );
+                                });
+                            continue;
+                        }
+                        if let Some((stream, head, initial)) = install_takeover(connection) {
+                            connection.state = ConnState::Processing;
+                            connections.remove(&id);
+                            let lan = lan.clone();
+                            let config = config.clone();
+                            let limits = crate::limits::current();
+                            let _ = thread::Builder::new()
+                                .name("svcd-install-http".into())
+                                .stack_size(threads::transfer_stack())
+                                .spawn(move || {
+                                    let mut stream = stream;
+                                    let _ = stream.set_nonblocking(false);
+                                    crate::install_http::serve(
+                                        &mut stream,
+                                        &head,
+                                        &initial,
+                                        &lan,
+                                        &config,
+                                        limits,
+                                    );
+                                });
+                            continue;
+                        }
                         if let Some((stream, head, initial, route)) = blob_takeover(connection) {
                             connection.state = ConnState::Processing;
                             connections.remove(&id);
                             let lan = lan.clone();
                             let _ = thread::Builder::new()
                                 .name("svcd-blob-http".into())
-                                .stack_size(threads::REQUEST_STACK)
+                                .stack_size(threads::transfer_stack())
                                 .spawn(move || {
                                     let mut stream = stream;
                                     let _ = stream.set_nonblocking(false);
@@ -624,6 +738,7 @@ fn reactor_loop(mut listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config:
                         }
                         Ok(written) => {
                             connection.out_at += written;
+                            connection.last_active = Instant::now();
                             if connection.out_at >= connection.out.len() {
                                 connection.out.clear();
                                 connection.out_at = 0;
@@ -678,6 +793,7 @@ fn reactor_loop(mut listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config:
                         }
                         Ok(written) => {
                             connection.out_at += written;
+                            connection.last_active = Instant::now();
                             if connection.out_at >= connection.out.len() {
                                 connection.out.clear();
                                 connection.out_at = 0;
@@ -703,6 +819,7 @@ fn reactor_loop(mut listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config:
                     }
                     Ok(written) => {
                         connection.out_at += written;
+                        connection.last_active = Instant::now();
                         if connection.out_at >= connection.out.len() {
                             connection.out.clear();
                             connection.out_at = 0;
@@ -1411,6 +1528,7 @@ fn flush_ws_out(connection: &mut Connection) -> bool {
         Ok(0) => false,
         Ok(written) => {
             connection.out_at += written;
+            connection.last_active = Instant::now();
             if connection.out_at >= connection.out.len() {
                 connection.out.clear();
                 connection.out_at = 0;
@@ -1497,6 +1615,74 @@ fn parse_ws_frame(buffer: &[u8]) -> Result<Option<(WsFrame, usize)>, WsParseErro
 }
 
 #[cfg(unix)]
+fn ui_takeover(connection: &mut Connection) -> Option<(TcpStream, http::Head)> {
+    if connection.pending.is_some() {
+        return None;
+    }
+    let header_end = http::header_end(&connection.buffer)?;
+    if header_end > crate::limits::current().max_header {
+        return None;
+    }
+    let (head, _) = http::parse_head(&connection.buffer[..header_end + 4])?;
+    crate::ui_http::route(&head)?;
+    let stream = connection.stream.try_clone().ok()?;
+    Some((stream, head))
+}
+
+#[cfg(unix)]
+fn export_takeover(
+    connection: &mut Connection,
+) -> Option<(TcpStream, http::Head, crate::export_http::Route)> {
+    if connection.pending.is_some() {
+        return None;
+    }
+    let header_end = http::header_end(&connection.buffer)?;
+    if header_end > crate::limits::current().max_header {
+        return None;
+    }
+    let (head, _) = http::parse_head(&connection.buffer[..header_end + 4])?;
+    let route = crate::export_http::route(&head)?;
+    let stream = connection.stream.try_clone().ok()?;
+    Some((stream, head, route))
+}
+
+#[cfg(unix)]
+fn import_takeover(connection: &mut Connection) -> Option<(TcpStream, http::Head, Vec<u8>)> {
+    if connection.pending.is_some() {
+        return None;
+    }
+    let header_end = http::header_end(&connection.buffer)?;
+    if header_end > crate::limits::current().max_header {
+        return None;
+    }
+    let (head, body_start) = http::parse_head(&connection.buffer[..header_end + 4])?;
+    if !crate::install_http::import_route(&head) {
+        return None;
+    }
+    let stream = connection.stream.try_clone().ok()?;
+    let initial = connection.buffer[body_start..].to_vec();
+    Some((stream, head, initial))
+}
+
+#[cfg(unix)]
+fn install_takeover(connection: &mut Connection) -> Option<(TcpStream, http::Head, Vec<u8>)> {
+    if connection.pending.is_some() {
+        return None;
+    }
+    let header_end = http::header_end(&connection.buffer)?;
+    if header_end > crate::limits::current().max_header {
+        return None;
+    }
+    let (head, body_start) = http::parse_head(&connection.buffer[..header_end + 4])?;
+    if !crate::install_http::route(&head) {
+        return None;
+    }
+    let stream = connection.stream.try_clone().ok()?;
+    let initial = connection.buffer[body_start..].to_vec();
+    Some((stream, head, initial))
+}
+
+#[cfg(unix)]
 fn blob_takeover(
     connection: &mut Connection,
 ) -> Option<(TcpStream, http::Head, Vec<u8>, crate::blob_http::Route)> {
@@ -1504,7 +1690,7 @@ fn blob_takeover(
         return None;
     }
     let header_end = http::header_end(&connection.buffer)?;
-    if header_end > MAX_HEADER {
+    if header_end > crate::limits::current().max_header {
         return None;
     }
     let (head, body_start) = http::parse_head(&connection.buffer[..header_end + 4])?;
@@ -1518,12 +1704,12 @@ fn blob_takeover(
 fn advance_request(connection: &mut Connection) -> Result<Option<HttpRequest>, Vec<u8>> {
     if connection.pending.is_none() {
         let Some(header_end) = http::header_end(&connection.buffer) else {
-            if connection.buffer.len() > MAX_HEADER {
+            if connection.buffer.len() > crate::limits::current().max_header {
                 return Err(error(400, "bad_request", "request headers are too large"));
             }
             return Ok(None);
         };
-        if header_end > MAX_HEADER {
+        if header_end > crate::limits::current().max_header {
             return Err(error(400, "bad_request", "request headers are too large"));
         }
         let Some((head, body_start)) = http::parse_head(&connection.buffer[..header_end + 4])
@@ -1611,7 +1797,7 @@ fn listener_loop(listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config: Pa
                 let config = config.clone();
                 let _ = thread::Builder::new()
                     .name("svcd-http-conn".into())
-                    .stack_size(threads::REQUEST_STACK)
+                    .stack_size(threads::transfer_stack())
                     .spawn(move || handle(stream, config, lan));
             }
             Err(error) => {
@@ -1648,6 +1834,36 @@ fn handle(mut stream: TcpStream, config: PathBuf, lan: Arc<Mutex<Lan>>) {
                 return;
             }
         };
+        if crate::ui_http::route(&head).is_some() {
+            crate::ui_http::serve(&mut stream, &head, &lan);
+            return;
+        }
+        if let Some(route) = crate::export_http::route(&head) {
+            crate::export_http::serve(&mut stream, &head, &lan, &config, route);
+            return;
+        }
+        if crate::install_http::import_route(&head) {
+            crate::install_http::serve_import(
+                &mut stream,
+                &head,
+                &initial,
+                &lan,
+                &config,
+                crate::limits::current(),
+            );
+            return;
+        }
+        if crate::install_http::route(&head) {
+            crate::install_http::serve(
+                &mut stream,
+                &head,
+                &initial,
+                &lan,
+                &config,
+                crate::limits::current(),
+            );
+            return;
+        }
         if let Some(route) = blob_http::route(&head) {
             let _ = blob_http::serve(&mut stream, &head, &initial, &lan, route);
             return;
@@ -2018,19 +2234,19 @@ fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u
 }
 
 /// One parsed `/plugin-ui/{id}/{token}/...` path.
-struct UiPath<'a> {
+pub(crate) struct UiPath<'a> {
     /// The plugin id segment (still unvalidated).
-    id: &'a str,
+    pub(crate) id: &'a str,
     /// The per-plugin UI token.
-    token: &'a str,
+    pub(crate) token: &'a str,
     /// Everything after the token; empty for the plugin root.
-    sub: &'a str,
+    pub(crate) sub: &'a str,
     /// True for `/plugin-ui/{id}` or `/plugin-ui/{id}/{token}` without the
     /// trailing slash.
-    slashless: bool,
+    pub(crate) slashless: bool,
 }
 
-fn ui_path(path: &str) -> Option<UiPath<'_>> {
+pub(crate) fn ui_path(path: &str) -> Option<UiPath<'_>> {
     let rest = path.strip_prefix("/plugin-ui/")?;
     let (id, after, root_slash) = match rest.split_once('/') {
         Some((id, after)) => (id, after, true),
@@ -2083,7 +2299,7 @@ fn plugin_ui(
     serve_ui(request, &assets, ui.sub, &base)
 }
 
-fn token_valid(lan: &Arc<Mutex<Lan>>, token: &str, plugin: &str) -> bool {
+pub(crate) fn token_valid(lan: &Arc<Mutex<Lan>>, token: &str, plugin: &str) -> bool {
     match lan.lock() {
         Ok(mut state) => state.validate_plugin_token(token, plugin),
         Err(_) => false,
@@ -2112,7 +2328,7 @@ fn serve_ui(request: &HttpRequest, assets: &plugin::WebAssets, sub: &str, base: 
 
 /// Resolve a relative path under the web root and make sure it stays inside it
 /// (the installer rejects symlinks, but this is cheap defence in depth).
-fn web_file(root: &Path, relative: &str) -> Option<(PathBuf, fs::Metadata)> {
+pub(crate) fn web_file(root: &Path, relative: &str) -> Option<(PathBuf, fs::Metadata)> {
     let mut path = root.to_path_buf();
     for segment in relative.split('/') {
         path.push(segment);
@@ -2151,7 +2367,7 @@ fn serve_web_file(
     http::response_with_headers(200, mime, &headers, &body)
 }
 
-fn web_headers(etag: &str) -> Vec<(String, String)> {
+pub(crate) fn web_headers(etag: &str) -> Vec<(String, String)> {
     vec![
         ("ETag".to_string(), etag.to_string()),
         ("Cache-Control".to_string(), "no-cache".to_string()),
@@ -2277,7 +2493,7 @@ fn read_head(stream: &mut TcpStream) -> Result<(http::Head, Vec<u8>), Vec<u8>> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
-        if buffer.len() > MAX_HEADER {
+        if buffer.len() > crate::limits::current().max_header {
             return Err(error(400, "bad_request", "header is too large"));
         }
         let read = stream
@@ -2288,7 +2504,7 @@ fn read_head(stream: &mut TcpStream) -> Result<(http::Head, Vec<u8>), Vec<u8>> {
         }
         buffer.extend_from_slice(&chunk[..read]);
         if let Some(position) = http::header_end(&buffer) {
-            if position > MAX_HEADER {
+            if position > crate::limits::current().max_header {
                 return Err(error(400, "bad_request", "header is too large"));
             }
             let Some((head, body_start)) = http::parse_head(&buffer[..position + 4]) else {
@@ -2636,7 +2852,7 @@ fn install_plugin(config: &std::path::Path, request: &HttpRequest, query: &str) 
     }
 }
 
-fn require_plugin(config: &Path, id: &str) -> Result<(), Vec<u8>> {
+pub(crate) fn require_plugin(config: &Path, id: &str) -> Result<(), Vec<u8>> {
     if !package::valid_name(id) {
         return Err(error(404, "not_found", &format!("unknown plugin: {}", id)));
     }
@@ -2811,7 +3027,7 @@ fn ui_page() -> Vec<u8> {
 
 /// Percent-encode a local path for a `next=` query value so `&`, `#` or `%`
 /// in a crafted `/plugin-ui/...` path cannot add query parts or a fragment.
-fn encode_query_value(value: &str) -> String {
+pub(crate) fn encode_query_value(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
@@ -2825,10 +3041,10 @@ fn encode_query_value(value: &str) -> String {
 }
 
 fn cap_log(mut text: String) -> String {
-    if text.len() <= MAX_LOG_BODY {
+    if text.len() <= crate::limits::current().log_max_bytes as usize {
         return text;
     }
-    let mut start = text.len() - MAX_LOG_BODY;
+    let mut start = text.len() - crate::limits::current().log_max_bytes as usize;
     while start < text.len() && !text.is_char_boundary(start) {
         start += 1;
     }
@@ -2906,7 +3122,7 @@ fn config_error(message: &str) -> Vec<u8> {
     error(status, code_for(status), message)
 }
 
-fn rpc(config: &std::path::Path, method: &str, params: Value) -> Result<Value, Vec<u8>> {
+pub(crate) fn rpc(config: &std::path::Path, method: &str, params: Value) -> Result<Value, Vec<u8>> {
     let response = channel::request(config, method, params)
         .map_err(|cause| error(500, "internal", &format!("svcd unreachable: {}", cause)))?;
     if let Some(error) = response.error {
@@ -2917,14 +3133,20 @@ fn rpc(config: &std::path::Path, method: &str, params: Value) -> Result<Value, V
         .ok_or_else(|| error(500, "internal", "empty daemon response"))
 }
 
-fn map_error(message: &str) -> Vec<u8> {
+pub(crate) fn map_error(message: &str) -> Vec<u8> {
     let lower = message.to_ascii_lowercase();
     let status = if lower.contains("timed out") || lower.contains("timeout") {
         504
+    } else if lower.contains("exceeds") || lower.contains("too large") {
+        413
     } else if lower.contains("unknown keyid") || lower.contains("trust root") {
         400
+    } else if lower.contains("id is a core service") {
+        404
     } else if lower.contains("unknown") || lower.contains("not found") {
         404
+    } else if lower.contains("configcheck") {
+        409
     } else if lower.contains("not a plugin")
         || lower.contains("core service")
         || lower.contains("conflict")

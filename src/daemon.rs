@@ -57,10 +57,6 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         return 1;
     }
 
-    if let Err(error) = log::init_svcd(&paths::logs_dir()) {
-        eprintln!("svcd: cannot open log directory: {}", error);
-    }
-    log::svcd("svcd starting");
     let config_path = match crate::install::ensure_conf(conf.as_deref()) {
         Ok(path) => path,
         Err(error) => {
@@ -72,6 +68,10 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         eprintln!("svcd: invalid config: {}", error);
         return 1;
     }
+    if let Err(error) = log::init_svcd(&paths::logs_dir()) {
+        eprintln!("svcd: cannot open log directory: {}", error);
+    }
+    log::svcd("svcd starting");
     log::svcd(&format!("svcd: config: {}", config_path.display()));
     // An explicit --conf may set config_dir to a different directory.
     let config = paths::config_dir();
@@ -86,6 +86,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         }
     }
     crate::blob::spawn_cleanup();
+    crate::plugin::cleanup_staging();
     if let Err(error) = crate::proc::init() {
         log::svcd(&format!(
             "svcd: parent-death protection unavailable: {}",
@@ -770,6 +771,10 @@ impl Daemon {
                 Ok(status) => rpc::ok(id, status_json(status)),
                 Err(error) => rpc::err(id, -32006, &error),
             },
+            "plugin.install_staged" => match self.install_staged(&request) {
+                Ok(status) => rpc::ok(id, status_json(status)),
+                Err(error) => rpc::err(id, -32006, &error),
+            },
             "plugin.uninstall" => match self.uninstall_plugin(&request) {
                 Ok(()) => rpc::ok(id, json!({ "ok": true })),
                 Err(error) => rpc::err(id, -32007, &error),
@@ -1438,6 +1443,111 @@ impl Daemon {
             "svcd: plugin {} {} installed ({}){}",
             id,
             package.manifest.version,
+            if still_running {
+                "running; next start uses"
+            } else {
+                "now"
+            },
+            if signature_verified {
+                ""
+            } else {
+                "; signature was NOT verified (allow_insecure_install)"
+            }
+        ));
+        self.status_for_id(&id)
+            .ok_or_else(|| format!("unknown plugin: {}", id))
+    }
+
+    fn install_staged(&mut self, request: &rpc::Request) -> Result<Status, String> {
+        let path = request
+            .params
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "plugin.install_staged requires path".to_string())?;
+        let strategy = match Strategy::parse(
+            request
+                .params
+                .get("strategy")
+                .and_then(Value::as_str)
+                .unwrap_or("replace"),
+        ) {
+            Some(strategy) => strategy,
+            None => return Err("unknown strategy".into()),
+        };
+        let allow_hooks = request
+            .params
+            .get("allowHooks")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let staging = Path::new(path)
+            .canonicalize()
+            .map_err(|error| format!("staging path {}: {}", path, error))?;
+        let plugins = paths::plugins_dir()
+            .canonicalize()
+            .map_err(|error| format!("plugins dir: {}", error))?;
+        if !staging.starts_with(&plugins)
+            || !staging
+                .file_name()
+                .map(|name| name.to_string_lossy().starts_with(".staging-"))
+                .unwrap_or(false)
+        {
+            return Err("staging path is outside the plugin staging area".into());
+        }
+
+        let staged = package::load_staged(&staging, settings::allow_insecure_install())?;
+        let id = staged.manifest.name.clone();
+        let version = staged.manifest.version.clone();
+        if let Some(requested) = request.params.get("id").and_then(Value::as_str) {
+            if requested != id {
+                return Err("staged id does not match the request".into());
+            }
+        }
+        if let Some(requested) = request.params.get("version").and_then(Value::as_str) {
+            if requested != version {
+                return Err("staged version does not match the request".into());
+            }
+        }
+        if let Some(existing) = self.registry.get(&id) {
+            if existing.kind != Kind::Plugin {
+                return Err(format!("id is a core service: {}", id));
+            }
+        }
+        let host_interpreter = plugin::prepare_staged(&staged, allow_hooks)?;
+        let signature_verified = staged.signature_verified;
+
+        let running = |slots: &BTreeMap<String, Slot>| {
+            slots
+                .get(&id)
+                .map(|slot| !matches!(slot.machine.state, State::Stopped | State::Failed))
+                .unwrap_or(false)
+        };
+        if running(&self.slots) && strategy == Strategy::Replace {
+            self.stop_service(&id)?;
+        }
+        let still_running = running(&self.slots);
+        let service = plugin::install_staged(staged, strategy, allow_hooks, host_interpreter)?;
+        if !still_running {
+            self.slots.remove(&id);
+            if let Some(exec) = service.exec.clone() {
+                let mut slot =
+                    Slot::new(id.clone(), exec, service.lifecycle.clone(), service.restart);
+                slot.set_protocol(service.protocol);
+                slot.set_protocol_only(true);
+                slot.set_remain_after_exit(service.remain_after_exit);
+                slot.set_wake(self.wake.clone());
+                #[cfg(unix)]
+                slot.set_reactor(self.reactor.clone());
+                self.slots.insert(id.clone(), slot);
+            }
+        }
+        self.registry.remove(&id);
+        self.registry.insert(service)?;
+        self.bump_catalog();
+        log::svcd(&format!(
+            "svcd: plugin {} {} installed ({}){}",
+            id,
+            version,
             if still_running {
                 "running; next start uses"
             } else {

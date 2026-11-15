@@ -542,7 +542,7 @@ impl Slot {
             let stdout_log = log.clone();
             if let Err(error) = thread::Builder::new()
                 .name(format!("svcd-{}-stdout", self.id))
-                .stack_size(threads::IO_STACK)
+                .stack_size(threads::io_stack())
                 .spawn(move || {
                     let reader = BufReader::new(stdout);
                     for line in reader.lines().map_while(Result::ok) {
@@ -558,7 +558,7 @@ impl Slot {
             let stderr_log = log.clone();
             if let Err(error) = thread::Builder::new()
                 .name(format!("svcd-{}-stderr", self.id))
-                .stack_size(threads::IO_STACK)
+                .stack_size(threads::io_stack())
                 .spawn(move || {
                     let reader = BufReader::new(stderr);
                     for line in reader.lines().map_while(Result::ok) {
@@ -963,7 +963,7 @@ impl Slot {
                     let id = self.id.clone();
                     let _ = thread::Builder::new()
                         .name(format!("svcd-{}-stop-stderr", id))
-                        .stack_size(threads::IO_STACK)
+                        .stack_size(threads::io_stack())
                         .spawn(move || {
                             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                                 log_line(&log, &line);
@@ -1287,7 +1287,7 @@ fn spawn_thread_readers(
     let stderr_log = log;
     thread::Builder::new()
         .name(format!("svcd-{}-stderr", id))
-        .stack_size(threads::IO_STACK)
+        .stack_size(threads::io_stack())
         .spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines().map_while(Result::ok) {

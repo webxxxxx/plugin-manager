@@ -24,7 +24,6 @@ use crate::channel;
 use crate::rpc;
 use crate::webui;
 
-const MAX_SUBSCRIBERS: usize = 64;
 const QUEUE: usize = 512;
 const HISTORY_EVENTS: usize = 256;
 const HISTORY_BYTES: usize = 2 * 1024 * 1024;
@@ -45,6 +44,9 @@ pub struct EventBus {
     inner: Mutex<HashMap<String, PluginState>>,
     next_seq: AtomicU64,
     next_sub: AtomicU64,
+    max_subscribers_per_plugin: usize,
+    max_subscriptions: usize,
+    total_subscribers: AtomicU64,
 }
 
 #[derive(Default)]
@@ -98,10 +100,14 @@ pub fn forget(plugin: &str) {
 
 impl EventBus {
     pub fn new() -> Self {
+        let limits = crate::limits::current();
         EventBus {
             inner: Mutex::new(HashMap::new()),
             next_seq: AtomicU64::new(0),
             next_sub: AtomicU64::new(0),
+            max_subscribers_per_plugin: limits.max_subscribers_per_plugin,
+            max_subscriptions: limits.max_subscriptions,
+            total_subscribers: AtomicU64::new(0),
         }
     }
 
@@ -123,9 +129,11 @@ impl EventBus {
     ) -> Result<(Receiver<Event>, Subscription, Replay), SubscribeError> {
         let (sender, receiver) = mpsc::sync_channel(QUEUE);
         let id = self.next_sub.fetch_add(1, Ordering::SeqCst) + 1;
+        self.reserve_subscriber()?;
         let mut inner = self.lock();
         let state = inner.entry(plugin.to_string()).or_default();
-        if state.subscribers.len() >= MAX_SUBSCRIBERS {
+        if state.subscribers.len() >= self.max_subscribers_per_plugin {
+            self.release_subscriber();
             return Err(SubscribeError::TooMany);
         }
 
@@ -136,6 +144,7 @@ impl EventBus {
                 if last < newest.seq {
                     for event in state.history.iter().filter(|event| event.seq > last) {
                         if sender.try_send(event.clone()).is_err() {
+                            self.release_subscriber();
                             return Err(SubscribeError::TooMany);
                         }
                         replay.replayed += 1;
@@ -163,9 +172,11 @@ impl EventBus {
         sender: SyncSender<Event>,
     ) -> Result<Subscription, SubscribeError> {
         let id = self.next_sub.fetch_add(1, Ordering::SeqCst) + 1;
+        self.reserve_subscriber()?;
         let mut inner = self.lock();
         let state = inner.entry(plugin.to_string()).or_default();
-        if state.subscribers.len() >= MAX_SUBSCRIBERS {
+        if state.subscribers.len() >= self.max_subscribers_per_plugin {
+            self.release_subscriber();
             return Err(SubscribeError::TooMany);
         }
         state.subscribers.push((id, sender));
@@ -176,23 +187,74 @@ impl EventBus {
         })
     }
 
+    fn reserve_subscriber(&self) -> Result<(), SubscribeError> {
+        let max = self.max_subscriptions;
+        let mut current = self.total_subscribers.load(Ordering::SeqCst);
+        loop {
+            if current as usize >= max {
+                return Err(SubscribeError::TooMany);
+            }
+            match self.total_subscribers.compare_exchange(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release_subscriber(&self) {
+        let mut current = self.total_subscribers.load(Ordering::SeqCst);
+        loop {
+            if current == 0 {
+                return;
+            }
+            match self.total_subscribers.compare_exchange(
+                current,
+                current - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
     fn unsubscribe(&self, plugin: &str, id: u64) {
         let mut inner = self.lock();
         let mut remove = false;
+        let mut removed = false;
         if let Some(state) = inner.get_mut(plugin) {
+            let before = state.subscribers.len();
             state
                 .subscribers
                 .retain(|(subscriber, _)| *subscriber != id);
+            removed = state.subscribers.len() != before;
             remove = state.subscribers.is_empty() && state.history.is_empty();
         }
         if remove {
             inner.remove(plugin);
         }
+        drop(inner);
+        if removed {
+            self.release_subscriber();
+        }
     }
 
     /// Drop a purged plugin's history and subscribers.
     pub fn forget(&self, plugin: &str) {
-        self.lock().remove(plugin);
+        let removed = self
+            .lock()
+            .remove(plugin)
+            .map(|state| state.subscribers.len())
+            .unwrap_or(0);
+        for _ in 0..removed {
+            self.release_subscriber();
+        }
     }
 
     pub fn publish(&self, plugin: &str, method: &str, params: &Value) {
@@ -708,7 +770,7 @@ mod tests {
         assert_eq!(bus.subscriber_count("demo"), 0);
 
         let mut held = Vec::new();
-        for index in 0..MAX_SUBSCRIBERS {
+        for index in 0..bus.max_subscribers_per_plugin {
             let (sender, receiver) = mpsc::sync_channel(1);
             drop(receiver);
             held.push(

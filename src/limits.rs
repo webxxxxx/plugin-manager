@@ -1,0 +1,292 @@
+//! Compile-time memory profile plus runtime overrides.
+//!
+//! `MEM_LEVEL` (see `build.rs`) picks the defaults and the hard ceilings for
+//! buffers and thread stacks. `svcd.conf` may lower them per host; values are
+//! clamped to a safe range so a typo cannot turn a 50 MB router into a swap
+//! storm.
+
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use crate::settings;
+
+#[allow(dead_code)]
+#[cfg(mem_low)]
+pub const LEVEL: &str = "low";
+#[allow(dead_code)]
+#[cfg(mem_middle)]
+pub const LEVEL: &str = "middle";
+#[allow(dead_code)]
+#[cfg(mem_high)]
+pub const LEVEL: &str = "high";
+
+#[cfg(mem_low)]
+mod defaults {
+    pub const MAX_BODY: u64 = 8 * 1024 * 1024;
+    pub const MAX_JSON_BODY: u64 = 64 * 1024;
+    pub const MAX_COMPLETE_BODY: u64 = 128 * 1024;
+    pub const MAX_HEADER: usize = 8 * 1024;
+    pub const MAX_STREAMS: usize = 8;
+    pub const STREAM_BUFFER: usize = 16 * 1024;
+    pub const MAX_REQUEST_STACK: usize = 128 * 1024;
+    pub const MAX_IO_STACK: usize = 64 * 1024;
+    pub const MAX_CONNECTIONS: usize = 32;
+    pub const MAX_CONNECTIONS_PER_IP: usize = 8;
+    pub const MAX_SUBSCRIPTIONS: usize = 4;
+    pub const MAX_SUBSCRIBERS_PER_PLUGIN: usize = 4;
+    pub const IDLE_TIMEOUT_SECS: u64 = 30;
+    pub const LOG_MAX_BYTES: u64 = 64 * 1024;
+    pub const LOG_ROTATIONS: usize = 3;
+    pub const MAX_PACKAGE_BYTES: u64 = 8 * 1024 * 1024;
+}
+
+#[cfg(mem_middle)]
+mod defaults {
+    pub const MAX_BODY: u64 = 64 * 1024 * 1024;
+    pub const MAX_JSON_BODY: u64 = 256 * 1024;
+    pub const MAX_COMPLETE_BODY: u64 = 1024 * 1024;
+    pub const MAX_HEADER: usize = 16 * 1024;
+    pub const MAX_STREAMS: usize = 16;
+    pub const STREAM_BUFFER: usize = 32 * 1024;
+    pub const MAX_REQUEST_STACK: usize = 192 * 1024;
+    pub const MAX_IO_STACK: usize = 96 * 1024;
+    pub const MAX_CONNECTIONS: usize = 128;
+    pub const MAX_CONNECTIONS_PER_IP: usize = 32;
+    pub const MAX_SUBSCRIPTIONS: usize = 16;
+    pub const MAX_SUBSCRIBERS_PER_PLUGIN: usize = 16;
+    pub const IDLE_TIMEOUT_SECS: u64 = 60;
+    pub const LOG_MAX_BYTES: u64 = 64 * 1024;
+    pub const LOG_ROTATIONS: usize = 3;
+    pub const MAX_PACKAGE_BYTES: u64 = 64 * 1024 * 1024;
+}
+
+#[cfg(mem_high)]
+mod defaults {
+    pub const MAX_BODY: u64 = 512 * 1024 * 1024;
+    pub const MAX_JSON_BODY: u64 = 1024 * 1024;
+    pub const MAX_COMPLETE_BODY: u64 = 8 * 1024 * 1024;
+    pub const MAX_HEADER: usize = 64 * 1024;
+    pub const MAX_STREAMS: usize = 64;
+    pub const STREAM_BUFFER: usize = 64 * 1024;
+    pub const MAX_REQUEST_STACK: usize = 256 * 1024;
+    pub const MAX_IO_STACK: usize = 128 * 1024;
+    pub const MAX_CONNECTIONS: usize = 512;
+    pub const MAX_CONNECTIONS_PER_IP: usize = 64;
+    pub const MAX_SUBSCRIPTIONS: usize = 64;
+    pub const MAX_SUBSCRIBERS_PER_PLUGIN: usize = 64;
+    pub const IDLE_TIMEOUT_SECS: u64 = 120;
+    pub const LOG_MAX_BYTES: u64 = 64 * 1024;
+    pub const LOG_ROTATIONS: usize = 3;
+    pub const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
+}
+
+pub use defaults::{
+    MAX_BODY, MAX_COMPLETE_BODY, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_IP, MAX_HEADER, MAX_IO_STACK,
+    MAX_JSON_BODY, MAX_PACKAGE_BYTES, MAX_REQUEST_STACK, MAX_STREAMS, MAX_SUBSCRIBERS_PER_PLUGIN,
+    MAX_SUBSCRIPTIONS, STREAM_BUFFER,
+};
+
+/// Runtime view of the limits. `svcd.conf` may lower (or, within a sane range,
+/// raise) the compile-time defaults.
+#[derive(Debug, Clone)]
+pub struct Limits {
+    pub request_stack_bytes: usize,
+    pub io_stack_bytes: usize,
+    pub max_body: u64,
+    pub max_json_body: u64,
+    pub max_complete_body: u64,
+    pub max_header: usize,
+    pub max_streams: usize,
+    pub stream_buffer: usize,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub max_connections: usize,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub max_connections_per_ip: usize,
+    pub max_subscriptions: usize,
+    pub max_subscribers_per_plugin: usize,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub idle_timeout: Duration,
+    pub log_max_bytes: u64,
+    pub log_rotations: usize,
+    pub log_to_file: bool,
+    pub max_package_bytes: u64,
+    pub transfer_timeout: Duration,
+}
+
+impl Limits {
+    fn from_settings(settings: SettingsView<'_>) -> Limits {
+        Limits {
+            request_stack_bytes: clamp_usize(
+                settings.request_stack_bytes,
+                MAX_REQUEST_STACK,
+                64 * 1024,
+                8 * 1024 * 1024,
+            ),
+            io_stack_bytes: clamp_usize(
+                settings.io_stack_bytes,
+                MAX_IO_STACK,
+                32 * 1024,
+                4 * 1024 * 1024,
+            ),
+            max_body: clamp_u64(
+                settings.max_body_bytes,
+                MAX_BODY,
+                64 * 1024,
+                1024 * 1024 * 1024,
+            ),
+            max_json_body: clamp_u64(
+                settings.max_json_body_bytes,
+                MAX_JSON_BODY,
+                4 * 1024,
+                64 * 1024 * 1024,
+            ),
+            max_complete_body: clamp_u64(
+                settings.max_complete_body_bytes,
+                MAX_COMPLETE_BODY,
+                16 * 1024,
+                128 * 1024 * 1024,
+            ),
+            max_header: clamp_usize(settings.max_header_bytes, MAX_HEADER, 1024, 1024 * 1024),
+            max_streams: clamp_usize(settings.max_streams, MAX_STREAMS, 1, 1024),
+            stream_buffer: clamp_usize(
+                settings.stream_buffer_bytes,
+                STREAM_BUFFER,
+                4 * 1024,
+                1024 * 1024,
+            ),
+            max_connections: clamp_usize(settings.max_connections, MAX_CONNECTIONS, 1, 4096),
+            max_connections_per_ip: clamp_usize(
+                settings.max_connections_per_ip,
+                MAX_CONNECTIONS_PER_IP,
+                1,
+                1024,
+            ),
+            max_subscriptions: clamp_usize(settings.max_subscriptions, MAX_SUBSCRIPTIONS, 0, 4096),
+            max_subscribers_per_plugin: clamp_usize(
+                settings.max_subscribers_per_plugin,
+                MAX_SUBSCRIBERS_PER_PLUGIN,
+                0,
+                1024,
+            ),
+            idle_timeout: Duration::from_secs(
+                settings
+                    .idle_timeout_secs
+                    .unwrap_or(defaults::IDLE_TIMEOUT_SECS),
+            ),
+            log_max_bytes: clamp_u64(
+                settings.log_max_bytes,
+                defaults::LOG_MAX_BYTES,
+                4 * 1024,
+                16 * 1024 * 1024,
+            ),
+            log_rotations: clamp_usize(settings.log_rotations, defaults::LOG_ROTATIONS, 1, 10),
+            log_to_file: settings.log_to_file.unwrap_or(true),
+            max_package_bytes: clamp_u64(
+                settings.max_package_bytes,
+                MAX_PACKAGE_BYTES,
+                1024 * 1024,
+                1024 * 1024 * 1024,
+            ),
+            transfer_timeout: Duration::from_secs(
+                settings
+                    .transfer_timeout_secs
+                    .unwrap_or(120)
+                    .clamp(10, 3600),
+            ),
+        }
+    }
+}
+
+struct SettingsView<'a> {
+    request_stack_bytes: Option<usize>,
+    io_stack_bytes: Option<usize>,
+    max_body_bytes: Option<u64>,
+    max_json_body_bytes: Option<u64>,
+    max_complete_body_bytes: Option<u64>,
+    max_header_bytes: Option<usize>,
+    max_streams: Option<usize>,
+    stream_buffer_bytes: Option<usize>,
+    max_connections: Option<usize>,
+    max_connections_per_ip: Option<usize>,
+    max_subscriptions: Option<usize>,
+    max_subscribers_per_plugin: Option<usize>,
+    idle_timeout_secs: Option<u64>,
+    log_max_bytes: Option<u64>,
+    log_rotations: Option<usize>,
+    log_to_file: Option<bool>,
+    max_package_bytes: Option<u64>,
+    transfer_timeout_secs: Option<u64>,
+    #[allow(dead_code)]
+    marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> SettingsView<'a> {
+    fn from(settings: &'a settings::Settings) -> Self {
+        SettingsView {
+            request_stack_bytes: settings.request_stack_bytes,
+            io_stack_bytes: settings.io_stack_bytes,
+            max_body_bytes: settings.max_body_bytes,
+            max_json_body_bytes: settings.max_json_body_bytes,
+            max_complete_body_bytes: settings.max_complete_body_bytes,
+            max_header_bytes: settings.max_header_bytes,
+            max_streams: settings.max_streams,
+            stream_buffer_bytes: settings.stream_buffer_bytes,
+            max_connections: settings.max_connections,
+            max_connections_per_ip: settings.max_connections_per_ip,
+            max_subscriptions: settings.max_subscriptions,
+            max_subscribers_per_plugin: settings.max_subscribers_per_plugin,
+            idle_timeout_secs: settings.http_idle_timeout_secs,
+            log_max_bytes: settings.log_max_bytes,
+            log_rotations: settings.log_rotations,
+            log_to_file: settings.log_to_file,
+            max_package_bytes: settings.max_package_bytes,
+            transfer_timeout_secs: settings.transfer_timeout_secs,
+            marker: std::marker::PhantomData,
+        }
+    }
+}
+
+fn clamp_usize(value: Option<usize>, default: usize, min: usize, max: usize) -> usize {
+    value.unwrap_or(default).clamp(min, max)
+}
+
+fn clamp_u64(value: Option<u64>, default: u64, min: u64, max: u64) -> u64 {
+    value.unwrap_or(default).clamp(min, max)
+}
+
+static LIMITS: OnceLock<Limits> = OnceLock::new();
+
+/// The daemon-wide limits. The first call loads `svcd.conf`; later calls reuse
+/// the same values, so changing the file requires a restart.
+pub fn current() -> &'static Limits {
+    LIMITS.get_or_init(|| match settings::current() {
+        Ok(settings) => Limits::from_settings(SettingsView::from(settings)),
+        Err(_) => Limits::from_settings(SettingsView::from(&settings::Settings::default())),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_match_the_selected_level() {
+        let limits = Limits::from_settings(SettingsView::from(&settings::Settings::default()));
+        assert!(limits.request_stack_bytes >= 64 * 1024);
+        assert!(limits.io_stack_bytes >= 32 * 1024);
+        assert!(limits.max_streams <= MAX_STREAMS);
+        assert!(limits.log_max_bytes <= 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_typo_cannot_go_below_the_floor() {
+        let mut settings = settings::Settings::default();
+        settings.max_streams = Some(0);
+        settings.request_stack_bytes = Some(1);
+        settings.io_stack_bytes = Some(1);
+        let limits = Limits::from_settings(SettingsView::from(&settings));
+        assert_eq!(limits.max_streams, 1);
+        assert_eq!(limits.request_stack_bytes, 64 * 1024);
+        assert_eq!(limits.io_stack_bytes, 32 * 1024);
+    }
+}

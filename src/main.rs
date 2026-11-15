@@ -14,13 +14,18 @@ mod channel_reactor;
 mod compat;
 mod daemon;
 mod definition;
+#[cfg(feature = "http")]
+mod export_http;
 mod hook;
 mod http;
 mod install;
+#[cfg(feature = "http")]
+mod install_http;
 mod interpreter;
 mod ipc;
 #[cfg_attr(not(feature = "http"), allow(dead_code))]
 mod lan;
+mod limits;
 mod log;
 mod mcp;
 #[cfg(feature = "http")]
@@ -46,6 +51,8 @@ mod svc;
 mod threads;
 mod transfer;
 mod trust;
+#[cfg(feature = "http")]
+mod ui_http;
 #[cfg(feature = "http")]
 mod uichannel;
 mod wake;

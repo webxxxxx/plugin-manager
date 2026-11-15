@@ -35,7 +35,7 @@ pub fn spawn(listener: UnixListener, tx: Sender<PendingCall>, wake: Arc<Wake>) -
     let notify = Arc::new(notify_tx);
     thread::Builder::new()
         .name("svcd-channel-reactor".into())
-        .stack_size(threads::IO_STACK)
+        .stack_size(threads::io_stack())
         .spawn(move || run(listener, tx, wake, notify, notify_rx))
         .map(|_| ())
 }

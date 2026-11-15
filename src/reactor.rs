@@ -66,7 +66,7 @@ impl Reactor {
         let (tx, rx) = mpsc::channel();
         let join = thread::Builder::new()
             .name("svcd-reactor".into())
-            .stack_size(threads::IO_STACK)
+            .stack_size(threads::io_stack())
             .spawn(move || run(rx))?;
         Ok(Arc::new(Reactor {
             tx,

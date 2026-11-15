@@ -22,9 +22,7 @@ use crate::blob;
 use crate::http;
 use crate::lan::{AuthKind, Lan};
 
-const MAX_STREAMS: usize = 64;
 const MULTIPART_OVERHEAD: u64 = 8 * 1024 * 1024;
-const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 /// Below this size the explicit read/write loop is cheaper than a syscall that
 /// asks the kernel to set up a file transfer.
 const ZEROCOPY_MIN_BYTES: u64 = 64 * 1024;
@@ -98,8 +96,8 @@ pub fn serve(
     lan: &Arc<Mutex<Lan>>,
     route: Route,
 ) -> io::Result<()> {
-    let _ = stream.set_read_timeout(Some(TRANSFER_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(TRANSFER_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(crate::limits::current().transfer_timeout));
+    let _ = stream.set_write_timeout(Some(crate::limits::current().transfer_timeout));
     let Some(_active) = ActiveGuard::acquire() else {
         return write_error_resp(
             stream,
@@ -149,7 +147,7 @@ struct ActiveGuard;
 
 impl ActiveGuard {
     fn acquire() -> Option<ActiveGuard> {
-        if ACTIVE.fetch_add(1, Ordering::SeqCst) >= MAX_STREAMS {
+        if ACTIVE.fetch_add(1, Ordering::SeqCst) >= crate::limits::current().max_streams {
             ACTIVE.fetch_sub(1, Ordering::SeqCst);
             None
         } else {
@@ -545,7 +543,7 @@ fn download(
         file.seek(SeekFrom::Start(start))?;
     }
     let mut remaining = length;
-    let mut buffer = vec![0u8; 64 * 1024];
+    let mut buffer = vec![0u8; crate::limits::current().stream_buffer];
     while remaining > 0 {
         let want = std::cmp::min(buffer.len() as u64, remaining) as usize;
         let read = file.read(&mut buffer[..want])?;
@@ -658,7 +656,7 @@ fn stream_file_range(
     let end = start.saturating_add(length);
     let mut offset = 0u64;
     let mut remaining = length;
-    let mut buffer = vec![0u8; 64 * 1024];
+    let mut buffer = vec![0u8; crate::limits::current().stream_buffer];
     for part in &manifest.parts {
         let part_start = offset;
         let part_end = offset.saturating_add(part.size);

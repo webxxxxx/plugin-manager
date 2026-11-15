@@ -51,6 +51,52 @@ bind = 127.0.0.1:8787
 # temp_retention_secs = 7200
 # temp_cleanup_interval_secs = 300
 
+# Logs. `logs_dir` defaults to install_dir/logs or the platform log directory.
+# `log_max_bytes` is the rotation threshold for one file; `log_rotations` is
+# how many old files are kept. `log_to_file = off` keeps stderr/syslog only.
+#
+# Compile-time MEM_LEVEL supplies the defaults (high is the default):
+#   key                    low        middle      high
+#   log_max_bytes          65536      65536       65536
+#   log_rotations          3          3           3
+#   request_stack_bytes    131072     196608      262144
+#   io_stack_bytes         65536      98304       131072
+#   max_body_bytes         8388608    67108864    536870912
+#   max_json_body_bytes    65536      262144      1048576
+#   max_complete_body_bytes 131072    1048576     8388608
+#   max_header_bytes       8192       16384       65536
+#   max_streams            8          16          64
+#   stream_buffer_bytes    16384      32768       65536
+#   max_connections        32         128         512
+#   max_connections_per_ip 8          32          64
+#   max_subscriptions      4          16          64
+#   max_subscribers_per_plugin 4      16          64
+#   http_idle_timeout_secs 30         60          120
+#   max_package_bytes      8388608    67108864    536870912
+#   transfer_timeout_secs  120        120         120
+#
+# Explicit values below override the MEM_LEVEL defaults. They are clamped to a
+# safe range; changing them requires a daemon restart.
+# logs_dir = /var/log/svcd
+# log_max_bytes = 65536
+# log_rotations = 3
+# log_to_file = on
+# request_stack_bytes = 131072
+# io_stack_bytes = 65536
+# max_body_bytes = 8388608
+# max_json_body_bytes = 65536
+# max_complete_body_bytes = 131072
+# max_header_bytes = 8192
+# max_streams = 8
+# stream_buffer_bytes = 16384
+# max_connections = 32
+# max_connections_per_ip = 8
+# max_subscriptions = 4
+# max_subscribers_per_plugin = 4
+# http_idle_timeout_secs = 30
+# max_package_bytes = 8388608
+# transfer_timeout_secs = 120
+
 # Absolute paths (the generated default uses the platform locations):
 # Linux:
 # plugins_dir = /var/lib/svcd/plugins

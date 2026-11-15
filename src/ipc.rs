@@ -240,7 +240,7 @@ pub fn spawn_reader_limit<R: Read + Send + 'static>(
 ) -> io::Result<()> {
     thread::Builder::new()
         .name(name)
-        .stack_size(threads::IO_STACK)
+        .stack_size(threads::io_stack())
         .spawn(move || {
             let mut reader = io::BufReader::new(stream);
             loop {
@@ -274,7 +274,7 @@ pub fn spawn_length_reader_limit<R: Read + Send + 'static>(
 ) -> io::Result<()> {
     thread::Builder::new()
         .name(name)
-        .stack_size(threads::IO_STACK)
+        .stack_size(threads::io_stack())
         .spawn(move || {
             let mut reader = io::BufReader::new(stream);
             loop {

@@ -30,6 +30,33 @@ pub struct Settings {
     pub temp_retention_secs: Option<u64>,
     /// How often the cleanup thread scans `temp_dir`. `0` disables cleanup.
     pub temp_cleanup_interval_secs: Option<u64>,
+    /// Per-service log directory. Empty/absent uses the platform or
+    /// `install_dir/logs` default.
+    pub logs_dir: Option<PathBuf>,
+    /// Rotation threshold for one log file. Default is chosen by `MEM_LEVEL`.
+    pub log_max_bytes: Option<u64>,
+    /// Number of rotated files to keep (1 = only the current file).
+    pub log_rotations: Option<usize>,
+    /// `false` keeps logs on stderr/syslog only. Default: true.
+    pub log_to_file: Option<bool>,
+    /// Explicit thread stack sizes. `MEM_LEVEL` supplies the defaults.
+    pub request_stack_bytes: Option<usize>,
+    pub io_stack_bytes: Option<usize>,
+    /// Runtime overrides/caps for the HTTP surface. All values are bytes or
+    /// counts; `limits` clamps them to a safe range.
+    pub max_body_bytes: Option<u64>,
+    pub max_json_body_bytes: Option<u64>,
+    pub max_complete_body_bytes: Option<u64>,
+    pub max_header_bytes: Option<usize>,
+    pub max_streams: Option<usize>,
+    pub stream_buffer_bytes: Option<usize>,
+    pub max_connections: Option<usize>,
+    pub max_connections_per_ip: Option<usize>,
+    pub max_subscriptions: Option<usize>,
+    pub max_subscribers_per_plugin: Option<usize>,
+    pub http_idle_timeout_secs: Option<u64>,
+    pub max_package_bytes: Option<u64>,
+    pub transfer_timeout_secs: Option<u64>,
     /// Relocated installation root for hosts whose `/usr` is read-only and
     /// whose writable tree is limited (SR6110: only `/etc` persists). When
     /// set, `--install` puts the binary, aliases and `svcd_daemon.sh` here;
@@ -200,6 +227,68 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
                     )
                 })?);
             }
+            "logs_dir" => settings.logs_dir = Some(resolve(base, value)),
+            "log_max_bytes" => {
+                settings.log_max_bytes = Some(parse_u64(value, "log_max_bytes", index)?)
+            }
+            "log_rotations" => {
+                settings.log_rotations = Some(parse_usize(value, "log_rotations", index)?)
+            }
+            "log_to_file" => {
+                settings.log_to_file = Some(parse_bool(value).ok_or_else(|| {
+                    format!("line {}: invalid log_to_file {:?}", index + 1, value)
+                })?)
+            }
+            "request_stack_bytes" => {
+                settings.request_stack_bytes =
+                    Some(parse_usize(value, "request_stack_bytes", index)?)
+            }
+            "io_stack_bytes" => {
+                settings.io_stack_bytes = Some(parse_usize(value, "io_stack_bytes", index)?)
+            }
+            "max_body_bytes" => {
+                settings.max_body_bytes = Some(parse_u64(value, "max_body_bytes", index)?)
+            }
+            "max_json_body_bytes" => {
+                settings.max_json_body_bytes = Some(parse_u64(value, "max_json_body_bytes", index)?)
+            }
+            "max_complete_body_bytes" => {
+                settings.max_complete_body_bytes =
+                    Some(parse_u64(value, "max_complete_body_bytes", index)?)
+            }
+            "max_header_bytes" => {
+                settings.max_header_bytes = Some(parse_usize(value, "max_header_bytes", index)?)
+            }
+            "max_streams" => settings.max_streams = Some(parse_usize(value, "max_streams", index)?),
+            "stream_buffer_bytes" => {
+                settings.stream_buffer_bytes =
+                    Some(parse_usize(value, "stream_buffer_bytes", index)?)
+            }
+            "max_connections" => {
+                settings.max_connections = Some(parse_usize(value, "max_connections", index)?)
+            }
+            "max_connections_per_ip" => {
+                settings.max_connections_per_ip =
+                    Some(parse_usize(value, "max_connections_per_ip", index)?)
+            }
+            "max_subscriptions" => {
+                settings.max_subscriptions = Some(parse_usize(value, "max_subscriptions", index)?)
+            }
+            "max_subscribers_per_plugin" => {
+                settings.max_subscribers_per_plugin =
+                    Some(parse_usize(value, "max_subscribers_per_plugin", index)?)
+            }
+            "http_idle_timeout_secs" => {
+                settings.http_idle_timeout_secs =
+                    Some(parse_u64(value, "http_idle_timeout_secs", index)?)
+            }
+            "max_package_bytes" => {
+                settings.max_package_bytes = Some(parse_u64(value, "max_package_bytes", index)?)
+            }
+            "transfer_timeout_secs" => {
+                settings.transfer_timeout_secs =
+                    Some(parse_u64(value, "transfer_timeout_secs", index)?)
+            }
             other => return Err(format!("line {}: unknown key {:?}", index + 1, other)),
         }
     }
@@ -221,6 +310,18 @@ fn parse_bool(value: &str) -> Option<bool> {
         "false" | "0" | "off" | "no" => Some(false),
         _ => None,
     }
+}
+
+fn parse_u64(value: &str, key: &str, index: usize) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("line {}: invalid {} {:?}", index + 1, key, value))
+}
+
+fn parse_usize(value: &str, key: &str, index: usize) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .map_err(|_| format!("line {}: invalid {} {:?}", index + 1, key, value))
 }
 
 /// Replace one key in an existing conf, preserving comments and other keys.
@@ -329,6 +430,52 @@ mod tests {
         assert!(text.contains("bind = 127.0.0.1:3"), "{text}");
         assert!(text.contains("allow_insecure_install = yes"), "{text}");
         let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn parses_runtime_limit_and_log_keys() {
+        let settings = parse(
+            "logs_dir = logs\n\
+             log_max_bytes = 65536\n\
+             log_rotations = 2\n\
+             log_to_file = off\n\
+             request_stack_bytes = 131072\n\
+             io_stack_bytes = 65536\n\
+             max_connections = 32\n\
+             max_connections_per_ip = 8\n\
+             max_subscriptions = 4\n\
+             max_subscribers_per_plugin = 4\n\
+             http_idle_timeout_secs = 30\n\
+             max_body_bytes = 8388608\n\
+             max_json_body_bytes = 65536\n\
+             max_complete_body_bytes = 131072\n\
+             max_header_bytes = 8192\n\
+             max_streams = 8\n\
+             stream_buffer_bytes = 16384\n\
+             max_package_bytes = 8388608\n\
+             transfer_timeout_secs = 120\n",
+            Path::new("/etc/svcd"),
+        )
+        .expect("parse");
+        assert_eq!(settings.logs_dir, Some(PathBuf::from("/etc/svcd/logs")));
+        assert_eq!(settings.log_max_bytes, Some(65536));
+        assert_eq!(settings.log_rotations, Some(2));
+        assert_eq!(settings.log_to_file, Some(false));
+        assert_eq!(settings.request_stack_bytes, Some(131072));
+        assert_eq!(settings.io_stack_bytes, Some(65536));
+        assert_eq!(settings.max_connections, Some(32));
+        assert_eq!(settings.max_connections_per_ip, Some(8));
+        assert_eq!(settings.max_subscriptions, Some(4));
+        assert_eq!(settings.max_subscribers_per_plugin, Some(4));
+        assert_eq!(settings.http_idle_timeout_secs, Some(30));
+        assert_eq!(settings.max_body_bytes, Some(8 * 1024 * 1024));
+        assert_eq!(settings.max_json_body_bytes, Some(65536));
+        assert_eq!(settings.max_complete_body_bytes, Some(131072));
+        assert_eq!(settings.max_header_bytes, Some(8192));
+        assert_eq!(settings.max_streams, Some(8));
+        assert_eq!(settings.stream_buffer_bytes, Some(16384));
+        assert_eq!(settings.max_package_bytes, Some(8 * 1024 * 1024));
+        assert_eq!(settings.transfer_timeout_secs, Some(120));
     }
 
     #[test]

@@ -1,36 +1,83 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
-/// Rotation limit: 1 MiB per file, `.log` + `.log.1` + `.log.2`.
-pub const LIMIT: u64 = 1024 * 1024;
+use crate::limits;
+
+/// Rotation threshold used when a caller does not have a configured limit
+/// (unit tests and the generated sample defaults).
+#[cfg(test)]
+pub const DEFAULT_LIMIT: u64 = 64 * 1024;
 
 pub struct LogSink {
     path: PathBuf,
     file: Option<File>,
     size: u64,
+    limit: u64,
+    rotations: usize,
+    enabled: bool,
 }
 
 impl LogSink {
+    /// Open a sink using `svcd.conf` (or `MEM_LEVEL` defaults).
     pub fn open(dir: &Path, id: &str) -> io::Result<Self> {
+        let limits = limits::current();
+        Self::open_with(
+            dir,
+            id,
+            limits.log_max_bytes,
+            limits.log_rotations,
+            limits.log_to_file,
+        )
+    }
+
+    pub fn open_with(
+        dir: &Path,
+        id: &str,
+        limit: u64,
+        rotations: usize,
+        enabled: bool,
+    ) -> io::Result<Self> {
+        if !enabled {
+            return Ok(LogSink {
+                path: dir.join(format!("{}.log", id)),
+                file: None,
+                size: 0,
+                limit,
+                rotations,
+                enabled: false,
+            });
+        }
         fs::create_dir_all(dir)?;
         let path = dir.join(format!("{}.log", id));
-        let file = open_append(&path)?;
-        let size = file.metadata()?.len();
-        Ok(LogSink {
+        let mut sink = LogSink {
             path,
-            file: Some(file),
-            size,
-        })
+            file: None,
+            size: 0,
+            limit,
+            rotations: rotations.max(1),
+            enabled: true,
+        };
+        let existing = fs::metadata(&sink.path).map(|meta| meta.len()).unwrap_or(0);
+        if existing > sink.limit {
+            sink.rotate()?;
+        }
+        sink.file = Some(open_append(&sink.path)?);
+        sink.size = fs::metadata(&sink.path).map(|meta| meta.len()).unwrap_or(0);
+        Ok(sink)
     }
 
     pub fn line(&mut self, line: &str) -> io::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
         let mut bytes = line.as_bytes().to_vec();
         if !bytes.ends_with(b"\n") {
             bytes.push(b'\n');
         }
-        if self.size.saturating_add(bytes.len() as u64) > LIMIT {
+        if self.size.saturating_add(bytes.len() as u64) > self.limit {
             self.rotate()?;
         }
         if let Some(file) = self.file.as_mut() {
@@ -44,21 +91,35 @@ impl LogSink {
     fn rotate(&mut self) -> io::Result<()> {
         self.file.take();
         let newest = self.path.clone();
-        let one = newest.with_extension("log.1");
-        let two = newest.with_extension("log.2");
-        match fs::remove_file(&two) {
+        if self.rotations <= 1 {
+            let _ = fs::remove_file(&newest);
+            self.file = Some(open_append(&newest)?);
+            self.size = 0;
+            return Ok(());
+        }
+        let oldest = rotated(&newest, self.rotations - 1);
+        match fs::remove_file(&oldest) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        if one.exists() {
-            fs::rename(&one, &two)?;
+        for number in (1..self.rotations - 1).rev() {
+            let from = rotated(&newest, number);
+            if from.exists() {
+                fs::rename(from, rotated(&newest, number + 1))?;
+            }
         }
-        fs::rename(&newest, &one)?;
+        if newest.exists() {
+            fs::rename(&newest, rotated(&newest, 1))?;
+        }
         self.file = Some(open_append(&newest)?);
         self.size = 0;
         Ok(())
     }
+}
+
+fn rotated(path: &Path, number: usize) -> PathBuf {
+    PathBuf::from(format!("{}.{}", path.display(), number))
 }
 
 fn open_append(path: &Path) -> io::Result<File> {
@@ -124,14 +185,36 @@ pub fn svcd(text: &str) {
 /// Return the last `lines` lines of `path`, each terminated by a newline.
 ///
 /// Both `svc logs` and `GET /api/v1/logs/{id}` project the file this way, so a
-/// tail is defined once instead of being re-implemented by each caller.
+/// tail is defined once instead of being re-implemented by each caller. The
+/// file is read backwards in chunks; a 64 KiB log is never copied wholesale.
 pub fn tail(path: &Path, lines: usize) -> io::Result<String> {
-    let bytes = fs::read(path)?;
-    let text = String::from_utf8_lossy(&bytes);
-    let mut tail: Vec<&str> = text.lines().rev().take(lines).collect();
-    tail.reverse();
+    if lines == 0 {
+        return Ok(String::new());
+    }
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    if length == 0 {
+        return Ok(String::new());
+    }
+    let mut buffer = Vec::new();
+    let mut position = length;
+    let mut newlines = 0usize;
+    const CHUNK: u64 = 4096;
+    while position > 0 && newlines <= lines {
+        let start = position.saturating_sub(CHUNK);
+        file.seek(SeekFrom::Start(start))?;
+        let mut chunk = vec![0u8; (position - start) as usize];
+        file.read_exact(&mut chunk)?;
+        newlines += chunk.iter().filter(|byte| **byte == b'\n').count();
+        chunk.extend_from_slice(&buffer);
+        buffer = chunk;
+        position = start;
+    }
+    let text = String::from_utf8_lossy(&buffer);
+    let mut selected: Vec<&str> = text.lines().rev().take(lines).collect();
+    selected.reverse();
     let mut out = String::new();
-    for line in tail {
+    for line in selected {
         out.push_str(line);
         out.push('\n');
     }
@@ -174,7 +257,7 @@ mod tests {
     #[test]
     fn writes_a_line_with_a_newline() {
         let dir = TempDir::new();
-        let mut sink = LogSink::open(&dir.0, "demo").expect("open");
+        let mut sink = LogSink::open_with(&dir.0, "demo", DEFAULT_LIMIT, 3, true).expect("open");
         sink.line("hello").expect("write");
         sink.line("world").expect("write");
 
@@ -194,10 +277,11 @@ mod tests {
     }
 
     #[test]
-    fn rotates_at_one_mib_and_keeps_two_old_files() {
+    fn rotates_at_the_configured_limit_and_keeps_the_configured_number() {
         let dir = TempDir::new();
-        let mut sink = LogSink::open(&dir.0, "demo").expect("open");
-        let chunk = "x".repeat(600 * 1024);
+        let limit = 1024;
+        let mut sink = LogSink::open_with(&dir.0, "demo", limit, 3, true).expect("open");
+        let chunk = "x".repeat(600);
 
         for _ in 0..4 {
             sink.line(&chunk).expect("write");
@@ -209,7 +293,15 @@ mod tests {
         assert!(!dir.0.join("demo.log.3").is_file());
         let current = fs::metadata(dir.0.join("demo.log")).expect("meta").len();
         assert!(current > 0);
-        assert!(current <= LIMIT);
+        assert!(current <= limit);
+    }
+
+    #[test]
+    fn disabled_sink_writes_nothing() {
+        let dir = TempDir::new();
+        let mut sink = LogSink::open_with(&dir.0, "demo", DEFAULT_LIMIT, 3, false).expect("open");
+        sink.line("hello").expect("write");
+        assert!(!dir.0.join("demo.log").exists());
     }
 
     #[cfg(unix)]
@@ -218,7 +310,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = TempDir::new();
-        let mut sink = LogSink::open(&dir.0, "demo").expect("open");
+        let mut sink = LogSink::open_with(&dir.0, "demo", DEFAULT_LIMIT, 3, true).expect("open");
         sink.line("hello").expect("write");
 
         let mode = fs::metadata(dir.0.join("demo.log"))
