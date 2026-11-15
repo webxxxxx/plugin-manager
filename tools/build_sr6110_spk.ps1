@@ -64,15 +64,19 @@ PATH="$BIN:/kmodule/bin:/bin:/sbin:/usr/bin:/usr/sbin"
 $meow = $meow.Replace(
     "MEOW_BIN=/etc/sr/bin/meow`nMEOW_CFG=/etc/sr/meow/config.yaml`nMEOW_FW=/etc/sr/sh/meow-fw.sh",
     "MEOW_BIN=`$BIN/meow`nMEOW_CFG=`${MEOW_HOME:-`$ROOT/config/meow}/config.yaml`nMEOW_FW=`$BIN/meow-fw.sh")
-$meow = $meow.Replace("LOG=/var/log/meow.log", 'LOG=${MEOW_LOG:-/var/log/meow.log}')
+$meow = $meow.Replace("LOG=/var/log/meow.log`n", "")
 $meow = $meow.Replace("RUN=/var/run/meow", 'RUN=${MEOW_RUN:-/var/run/meow}')
+$meow = $meow.Replace('log() { echo "$(date ''+%F %T'') [meow] $*" >> "$LOG" 2>/dev/null; }', 'log() { echo "$(date ''+%F %T'') [meow] $*" >&2; }')
+$meow = $meow.Replace('mkdir -p "$RUN" "$(dirname "$LOG")" 2>/dev/null', 'mkdir -p "$RUN" 2>/dev/null')
 $meow = $meow.Replace(
     "    if [ -f /etc/sr/meow/fix-rules.sh ]; then`n        MEOW_CONF=`"`$MEOW_CFG`" sh /etc/sr/meow/fix-rules.sh >>`"`$LOG`" 2>&1 \",
-    "    if [ -f `"`$BIN/fix-rules.sh`" ]; then`n        MEOW_CONF=`"`$MEOW_CFG`" sh `"`$BIN/fix-rules.sh`" >>`"`$LOG`" 2>&1 \")
+    "    if [ -f `"`$BIN/fix-rules.sh`" ]; then`n        MEOW_CONF=`"`$MEOW_CFG`" sh `"`$BIN/fix-rules.sh`" >&2 \")
 $meow = $meow.Replace(
     '    "$MEOW_BIN" -d "$_dir" -f "$MEOW_CFG" >>"$LOG" 2>&1 &',
-    '    ( cd "$_dir" && exec "$MEOW_BIN" -d "$_dir" -f "$MEOW_CFG" ) >>"$LOG" 2>&1 &')
-$meow = $meow.Replace('"$MEOW_FW" up', 'sh "$MEOW_FW" up').Replace('"$MEOW_FW" down', 'sh "$MEOW_FW" down')
+    '    ( cd "$_dir" && exec "$MEOW_BIN" -d "$_dir" -f "$MEOW_CFG" ) 1>&2 &')
+$meow = $meow.Replace(' >>"$LOG" 2>&1', '').Replace('>>"$LOG" 2>&1', '')
+$meow = $meow.Replace('meow exited before listening (see $LOG)', 'meow exited before listening')
+$meow = $meow.Replace('"$MEOW_FW" up', 'sh "$MEOW_FW" up >&2').Replace('"$MEOW_FW" down', 'sh "$MEOW_FW" down >&2')
 $meow = $meow.Replace('/etc/sr/firewall.d/', 'the firmware firewall rules')
 $meow = $meow.Replace('/etc/sr/sh/meow-fw.sh', 'meow-fw.sh')
 $meow = $meow.Replace('/etc/sr/sr.conf', 'the firmware config')
@@ -95,6 +99,8 @@ $fw = $fw.Replace('/etc/sr/autostart/20-meow', 'the plugin entry')
 $fw = $fw.Replace('/etc/sr/meow/config.yaml', 'the plugin config')
 $fw = $fw.Replace('/etc/sr/firewall.d', 'the firmware firewall rules')
 $fw = $fw.Replace('/etc/sr/sr.conf', 'the firmware config')
+$fw = $fw.Replace("LOG=/var/log/meow.log`n", "")
+$fw = $fw.Replace('log() { echo "$(date ''+%F %T'') [meow-fw] $*" >> "$LOG" 2>/dev/null; }', 'log() { echo "$(date ''+%F %T'') [meow-fw] $*" >&2; }')
 Write-Lf "$dir\payload\bin\meow-fw.sh" $fw
 Assert-NoAbsolute "$dir\payload\bin\meow-fw.sh"
 
@@ -151,9 +157,8 @@ CONF=${NAS_CONF:-$ROOT/config/nas.conf}
 PATH="$BIN:/kmodule/bin:/bin:/sbin:/usr/bin:/usr/sbin"
 export PATH
 MNT=${NAS_MNT:-/var/nas}
-LOG=${NAS_LOG:-/var/log/nas.log}
 
-log() { echo "$(date '+%F %T') [nas] $*" >> "$LOG" 2>/dev/null; }
+log() { echo "$(date '+%F %T') [nas] $*" >&2; }
 mounted() { mount 2>/dev/null | grep -q " on $MNT "; }
 
 start() {
@@ -161,7 +166,7 @@ start() {
         log "already mounted at $MNT"
     else
         log "mounting $MNT ..."
-        CONF="$CONF" sh "$BIN/mount-sshfs.sh" || { log "mount failed"; return 1; }
+        CONF="$CONF" sh "$BIN/mount-sshfs.sh" >&2 || { log "mount failed"; return 1; }
     fi
     # Keep the plugin alive while the mount exists; sshfs exits when the NAS
     # goes away, and the supervisor restarts this entry.
@@ -270,18 +275,18 @@ TOOLDIR=$BIN
 '@.TrimEnd("`n"))
 $wg = $wg.Replace(
     "    /etc/sr/sh/wg-start.sh",
-    '    CONF="$CONF" WG_DIR="$WGDIR" sh "$BIN/wg-start.sh"')
+    '    CONF="$CONF" WG_DIR="$WGDIR" sh "$BIN/wg-start.sh" >&2')
 $wg = $wg.Replace("pkill -f 'wg-lan-fix.sh'", 'pkill -f "$BIN/wg-lan-fix.sh"')
 $wg = $wg.Replace(
 @"
 start() {
-    CONF=`"`$CONF`" WG_DIR=`"`$WGDIR`" sh `"`$BIN/wg-start.sh`"
+    CONF=`"`$CONF`" WG_DIR=`"`$WGDIR`" sh `"`$BIN/wg-start.sh`" >&2
     return `$?
 }
 "@,
 @"
 start() {
-    CONF=`"`$CONF`" WG_DIR=`"`$WGDIR`" sh `"`$BIN/wg-start.sh`" || return `$?
+    CONF=`"`$CONF`" WG_DIR=`"`$WGDIR`" sh `"`$BIN/wg-start.sh`" >&2 || return `$?
     # Keep the plugin running while the tunnel exists; stop removes wg0.
     while ip link show wg0 >/dev/null 2>&1; do sleep 30; done
     return 1
@@ -317,7 +322,6 @@ LOG=/var/wg-start.log
 '@.TrimEnd("`n"),
     @'
 TOOLDIR=$BIN
-LOG=${WG_LOG:-/var/log/wg-start.log}
 '@.TrimEnd("`n"))
 $wgs = $wgs.Replace(
     @'
@@ -338,6 +342,8 @@ $wgs = $wgs.Replace("    [ -x /etc/sr/bin/wg-tool ] && TOOLDIR=/etc/sr/bin`n", "
 $wgs = $wgs.Replace('（v2 的 /etc/sr/wg/wg.conf 里配的 WG_LAN_IF）', '(wg.conf 里配的 WG_LAN_IF)')
 $wgs = $wgs.Replace('pgrep -f "wg-lan-fix.sh"', 'pgrep -f "$BIN/wg-lan-fix.sh"')
 $wgs = $wgs.Replace('setsid /etc/sr/sh/wg-lan-fix.sh', 'setsid sh "$BIN/wg-lan-fix.sh"')
+$wgs = $wgs.Replace('setsid sh "$BIN/wg-lan-fix.sh" >/dev/null 2>&1 &', 'setsid sh "$BIN/wg-lan-fix.sh" >&2 &')
+$wgs = $wgs.Replace('log() { echo "$(date ''+%H:%M:%S'') $*" >> "$LOG"; }', 'log() { echo "$(date ''+%H:%M:%S'') $*" >&2; }')
 Write-Lf "$dir\payload\bin\wg-start.sh" $wgs
 Assert-NoAbsolute "$dir\payload\bin\wg-start.sh"
 
@@ -355,7 +361,8 @@ ROOT=$(dirname "$BIN")
 CONF=${CONF:-$ROOT/config/wg.conf}
 [ -f "$CONF" ] && . "$CONF"
 '@.TrimEnd("`n"))
-$wgf = $wgf.Replace('LOG=/var/run/sr/wg-arp-sync.log', 'LOG=${WG_LOG_DIR:-/var/run/sr}/wg-arp-sync.log')
+$wgf = $wgf.Replace("LOG=/var/run/sr/wg-arp-sync.log`n", "")
+$wgf = $wgf.Replace('log() { echo "$(date ''+%H:%M:%S'') $*" >> "$LOG"; }', 'log() { echo "$(date ''+%H:%M:%S'') $*" >&2; }')
 $wgf = $wgf.Replace(
     @'
 wg_tool() {
@@ -371,7 +378,7 @@ wg_tool() {
     return 1
 }
 '@.TrimEnd("`n"))
-$wgf = $wgf.Replace('mkdir -p /var/run/sr 2>/dev/null', 'mkdir -p "$(dirname "$LOG")" 2>/dev/null')
+$wgf = $wgf.Replace("mkdir -p /var/run/sr 2>/dev/null`n", "")
 Write-Lf "$dir\payload\bin\wg-lan-fix.sh" $wgf
 Assert-NoAbsolute "$dir\payload\bin\wg-lan-fix.sh"
 
