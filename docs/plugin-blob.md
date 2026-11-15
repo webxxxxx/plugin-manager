@@ -59,6 +59,47 @@ GET /api/v1/blobs/sha256:9f2c...e1
 
 需要与管理 API 相同的鉴权。单 blob 上限 **512 MiB**。
 
+### HTTP 上传/下载限制
+
+当前接口是一次性整体传输，不是分块或可恢复上传：
+
+- `POST /api/v1/blobs` 必须带 `Content-Length`；
+- **不支持** `Transfer-Encoding: chunked` 请求体；
+- 不支持 multipart，请求体就是原始字节；
+- 不支持断点续传、分片上传、并行上传；
+- 上传失败后需要重新上传完整 body；
+- 上传 body 会先在 daemon 内存中聚合，最大 512 MiB，因此大文件上传会占用相近的 daemon 内存；
+- `GET /api/v1/blobs/{id}` 会把整个 blob 读入内存后返回，**不支持 Range/断点下载**；
+- 下载响应是 `application/octet-stream`，没有 ETag/条件请求；
+- 鉴权失败返回 401/403；body 超过 512 MiB 返回 413；id 不存在返回 404。
+
+因此：
+
+- 几十 MB 的文件可以直接走这个接口；
+- 接近 512 MiB 的文件要预留足够内存，并避免并发上传/下载多个大文件；
+- 插件内部读取 `$blob` 的 `path` 时应当流式处理，不要假设 HTTP 层是流式的。
+
+上传示例（PowerShell）：
+
+```powershell
+$headers = @{ Authorization = "Bearer <password>" }
+$body = [IO.File]::ReadAllBytes(".\video.mp4")
+Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:8787/api/v1/blobs" `
+  -Headers $headers `
+  -ContentType "application/octet-stream" `
+  -Body $body
+```
+
+下载示例：
+
+```powershell
+Invoke-WebRequest `
+  -Uri "http://127.0.0.1:8787/api/v1/blobs/sha256:<hex>" `
+  -Headers @{ Authorization = "Bearer <password>" } `
+  -OutFile ".\video.mp4"
+```
+
 宿主有一个后台清理线程：默认删除 `temp_dir` 下 **超过 2 小时**未访问的文件，每 5 分钟扫描一次。配置项：
 
 ```ini
