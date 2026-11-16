@@ -81,6 +81,8 @@ MCP 不是 W3C，不要用 WPT 套；官方 SDK + 规范逐条向量就是这一
 
 每条探针都归属一个 `svcd.conf` 键，失败时打印该键、原始请求、响应和 daemon 输出。
 
+Windows 走每连接线程回退，但上面的连接数、每 IP 与 idle 探针在两端断言同一结果：回退在 accept 后、起线程前准入，线程数上限由 `max_connections` 约束，不是四线程拓扑。
+
 ## 5. 性能测试
 
 `tools/perf` 已经是完整的兼容 + 性能 harness，但**不在 CI**：

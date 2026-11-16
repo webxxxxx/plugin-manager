@@ -24,4 +24,5 @@ Accepted。细化 [ADR-0012](0012-protocol-is-server-plus-face.md)；切片见 #
 - 服务器可以替换（Unix poll reactor、Windows 线程回退、将来的 IOCP），face 与端点测试不变。
 - `StreamHandler` 出现后，ADR-0012 原来说的「交出连接」只表示「交出一个 sans-IO 状态机」，不再表示连接所有权转移；连接始终归服务器。
 - 迁移期会有两条路径并存；legacy 路径是临时的，#125 删除。
+- 本 spec 的「两条循环 + 两条阻塞线程，默认 4 条」是 Unix 的默认拓扑。Windows 本轮保留每连接一条线程的回退：它执行 `max_connections` / `max_connections_per_ip` / `http_idle_timeout_secs`，线程上限由 `max_connections` 约束，但不承诺 4 条线程；IOCP 留给 S3/S6。
 - 完成槽封住后迟到的完成只能记日志，不能写回一个已经结束的请求；这消除 use-after-response 的竞态。

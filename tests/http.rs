@@ -4371,16 +4371,6 @@ fn http_keep_alive_serves_version_through_the_face() {
 
 const MIN_CONFIG_PASSWORD: &str = "min-config-password";
 
-/// The Unix reactor enforces a daemon-wide connection cap and the configured
-/// idle timeout. The Windows listener accepts one thread per connection and
-/// hard-codes a 60 s read timeout, so max_connections /
-/// max_connections_per_ip / http_idle_timeout_secs have no effect there yet
-/// (found by this regression; tracked as #110).
-#[cfg(unix)]
-const CONNECTION_ENFORCEMENT: bool = true;
-#[cfg(not(unix))]
-const CONNECTION_ENFORCEMENT: bool = false;
-
 /// Every runtime limit svcd.conf accepts, at the parser's raw minimum.
 const MINIMAL_LIMITS: &[(&str, &str)] = &[
     ("request_stack_bytes", "1"),
@@ -5101,10 +5091,11 @@ fn run_min_config_phase(phase: &str, streams: bool) {
     }
     assert_daemon_alive(&mut sandbox, phase);
 
-    // Concurrent connections: on Unix the floor admits one connection and
-    // refuses the second with 503 at accept time; the usable config admits
-    // two. Without connection enforcement (Windows) both are simply answered.
-    // The refused socket is never written to, so its 503 is not lost to the
+    // Concurrent connections: the floor admits one connection and refuses the
+    // second with 503 at accept time; the usable config admits two. Both
+    // engines enforce this: the Unix reactor counts its connection table, the
+    // Windows fallback admits before it spawns the per-connection thread. The
+    // second socket is refused without a request, so its 503 is not lost to the
     // abortive close a pending request would cause.
     let mut admitted = TcpStream::connect(&address).expect("admitted connection");
     let mut extra = TcpStream::connect(&address).expect("second connection");
@@ -5118,7 +5109,7 @@ fn run_min_config_phase(phase: &str, streams: bool) {
         "GET /api/v1/services HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
         address
     );
-    if streams || !CONNECTION_ENFORCEMENT {
+    if streams {
         for (name, stream) in [("first", &mut admitted), ("second", &mut extra)] {
             stream
                 .write_all(concurrent.as_bytes())
@@ -5188,10 +5179,9 @@ fn run_min_config_phase(phase: &str, streams: bool) {
         }
     }
 
-    // http_idle_timeout_secs clamps to 1 s: on Unix the reactor's idle sweep
-    // closes a keep-alive connection instead of idling for the compile-time
-    // default (30/60/120 s). The Windows listener hard-codes a 60 s read
-    // timeout, so the key has no effect there.
+    // http_idle_timeout_secs clamps to 1 s: the Unix reactor's idle sweep and
+    // the Windows fallback's per-socket read timeout both close a keep-alive
+    // connection instead of idling for the compile-time default (30/60/120 s).
     let mut idle = TcpStream::connect(&address).expect("idle connection");
     idle.set_read_timeout(Some(Duration::from_millis(500)))
         .expect("timeout");
@@ -5216,7 +5206,7 @@ fn run_min_config_phase(phase: &str, streams: bool) {
     let opened = Instant::now();
     let mut closed = false;
     let mut sink = [0u8; 128];
-    while CONNECTION_ENFORCEMENT && opened.elapsed() < Duration::from_secs(8) {
+    while opened.elapsed() < Duration::from_secs(8) {
         match idle.read(&mut sink) {
             Ok(0) => {
                 closed = true;
@@ -5232,7 +5222,7 @@ fn run_min_config_phase(phase: &str, streams: bool) {
             }
         }
     }
-    if CONNECTION_ENFORCEMENT && !closed {
+    if !closed {
         regression_failure(
             &mut sandbox,
             "http_idle_timeout_secs",

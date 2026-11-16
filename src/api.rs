@@ -23,8 +23,9 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
 
+use std::collections::HashMap;
 #[cfg(unix)]
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 #[cfg(unix)]
@@ -2259,21 +2260,123 @@ fn advance_request(connection: &mut Connection) -> Result<Option<HttpRequest>, V
     }))
 }
 
+/// Admission bookkeeping for the Windows thread-per-connection fallback.
+///
+/// The Unix reactor bounds its connection table directly. The fallback has no
+/// such table: each accepted socket becomes a thread, so both caps have to be
+/// applied *before* that thread exists. One `ConnectionLease` is exactly one
+/// admitted connection and exactly one connection thread; dropping the lease
+/// when the handler returns releases the global and the per-IP slot together.
+///
+/// Compiled in test builds on every platform so the policy can be tested
+/// without a socket.
+#[cfg(any(not(unix), test))]
+struct Admission {
+    max_connections: usize,
+    max_connections_per_ip: usize,
+    active: usize,
+    per_ip: HashMap<IpAddr, usize>,
+}
+
+#[cfg(any(not(unix), test))]
+struct ConnectionLease {
+    admission: Arc<Mutex<Admission>>,
+    peer: IpAddr,
+}
+
+#[cfg(any(not(unix), test))]
+impl Admission {
+    fn new(max_connections: usize, max_connections_per_ip: usize) -> Self {
+        Self {
+            max_connections,
+            max_connections_per_ip,
+            active: 0,
+            per_ip: HashMap::new(),
+        }
+    }
+
+    /// Reserve one connection slot for `peer`, or return `None` when either
+    /// cap is already reached. A rejected connection must not consume a slot.
+    fn admit(admission: &Arc<Mutex<Admission>>, peer: IpAddr) -> Option<ConnectionLease> {
+        let mut state = admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.active >= state.max_connections {
+            return None;
+        }
+        let per_ip = state.per_ip.get(&peer).copied().unwrap_or(0);
+        if per_ip >= state.max_connections_per_ip {
+            return None;
+        }
+        state.active += 1;
+        *state.per_ip.entry(peer).or_insert(0) += 1;
+        Some(ConnectionLease {
+            admission: Arc::clone(admission),
+            peer,
+        })
+    }
+}
+
+#[cfg(any(not(unix), test))]
+impl Drop for ConnectionLease {
+    fn drop(&mut self) {
+        let mut state = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active = state.active.saturating_sub(1);
+        let remove = match state.per_ip.get_mut(&self.peer) {
+            Some(count) => {
+                *count = count.saturating_sub(1);
+                *count == 0
+            }
+            None => false,
+        };
+        if remove {
+            state.per_ip.remove(&self.peer);
+        }
+    }
+}
+
 #[cfg(not(unix))]
 fn listener_loop(listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config: PathBuf) {
     let Some(active) = listener.as_ref() else {
         return;
     };
+    // Like the Unix reactor, snapshot the restart-time limits once. Changing
+    // them in svcd.conf requires a daemon restart.
+    let limits = crate::limits::current();
+    let admission = Arc::new(Mutex::new(Admission::new(
+        limits.max_connections,
+        limits.max_connections_per_ip,
+    )));
+    let idle_timeout = limits.idle_timeout;
     loop {
         match active.accept() {
             Ok((stream, peer)) => {
                 let ip = peer.ip();
+                // Admit before spawning: a refused connection must not create
+                // a thread, and an admitted one stays accounted for until its
+                // handler returns and drops the lease.
+                let Some(lease) = Admission::admit(&admission, ip) else {
+                    reject_connection(stream);
+                    continue;
+                };
                 let lan = lan.clone();
                 let config = config.clone();
-                let _ = thread::Builder::new()
+                let spawned = thread::Builder::new()
                     .name("svcd-http-conn".into())
                     .stack_size(threads::transfer_stack())
-                    .spawn(move || handle(stream, ip, config, lan));
+                    .spawn(move || {
+                        let _lease = lease;
+                        handle(stream, ip, config, lan, idle_timeout);
+                    });
+                if let Err(error) = spawned {
+                    // The failed spawn drops the closure, and with it the
+                    // lease, so the slot is released even though no handler
+                    // ever ran.
+                    log::svcd(&format!("svcd: HTTP connection thread failed: {}", error));
+                }
             }
             Err(error) => {
                 log::svcd(&format!("svcd: HTTP accept failed: {}", error));
@@ -2283,8 +2386,27 @@ fn listener_loop(listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config: Pa
     }
 }
 
+/// Refuse one accepted connection with the same busy response the Unix reactor
+/// sends, instead of starting a thread that would exceed the connection cap.
 #[cfg(not(unix))]
-fn handle(mut stream: TcpStream, peer: IpAddr, config: PathBuf, lan: Arc<Mutex<Lan>>) {
+fn reject_connection(mut stream: TcpStream) {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+    let _ = stream.write_all(
+        b"HTTP/1.1 503 Service Unavailable\r\n\
+          Content-Length: 0\r\n\
+          Connection: close\r\n\r\n",
+    );
+}
+
+#[cfg(not(unix))]
+fn handle(
+    mut stream: TcpStream,
+    peer: IpAddr,
+    config: PathBuf,
+    lan: Arc<Mutex<Lan>>,
+    idle_timeout: Duration,
+) {
     // Windows accepted sockets inherit the listener's non-blocking mode
     // (Unix ones do not). Requests are read with blocking reads, so flip the
     // socket back before installing the read timeout. Otherwise a body that has
@@ -2295,7 +2417,11 @@ fn handle(mut stream: TcpStream, peer: IpAddr, config: PathBuf, lan: Arc<Mutex<L
             error
         ));
     }
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
+    // The configured `http_idle_timeout_secs` replaces the old hard-coded
+    // 60 s. It closes a socket that is waiting for request bytes, both on the
+    // first request and between keep-alive requests. Transfer and takeover
+    // handlers below install their own transfer timeout as needed.
+    let _ = stream.set_read_timeout(Some(idle_timeout));
     let mut first = true;
     loop {
         let (head, initial) = match read_head(&mut stream) {
@@ -3794,5 +3920,46 @@ mod tests {
         assert_eq!(resolve_bind(Some("not-an-addr"), Some(b)), b);
         assert_eq!(resolve_bind(None, Some(b)), b);
         assert_eq!(resolve_bind(None, None), default_bind());
+    }
+
+    /// The Windows fallback ties one admitted connection to one thread, so the
+    /// admission lease is the thread cap. Prove both caps reject without
+    /// consuming a slot and that dropping a lease frees the global and per-IP
+    /// counts.
+    #[test]
+    fn admission_enforces_global_and_per_ip_caps_and_releases() {
+        let admission = Arc::new(Mutex::new(Admission::new(2, 1)));
+
+        let first = admit(&admission, "10.0.0.1");
+        assert!(first.is_some(), "first connection is admitted");
+        assert!(
+            admit(&admission, "10.0.0.1").is_none(),
+            "the second connection from one IP hits max_connections_per_ip"
+        );
+        let second = admit(&admission, "10.0.0.2");
+        assert!(second.is_some(), "a different IP still fits the global cap");
+        assert!(
+            admit(&admission, "10.0.0.3").is_none(),
+            "a third connection hits max_connections"
+        );
+        assert_eq!(active(&admission), 2, "rejections do not consume slots");
+
+        drop(first);
+        assert_eq!(active(&admission), 1, "the lease drop frees one slot");
+        assert!(
+            admit(&admission, "10.0.0.1").is_some(),
+            "the per-IP slot is reusable after the lease is dropped"
+        );
+    }
+
+    fn admit(admission: &Arc<Mutex<Admission>>, peer: &str) -> Option<ConnectionLease> {
+        Admission::admit(admission, peer.parse().expect("peer ip"))
+    }
+
+    fn active(admission: &Arc<Mutex<Admission>>) -> usize {
+        admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active
     }
 }
