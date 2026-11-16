@@ -2383,7 +2383,7 @@ while IFS= read -r line; do
     *'"name":"hang"'*) ;;
     *'"name":"crash"'*) exit 0 ;;
     *'"name":"progress"'*)
-      token=$(printf '%s' "$line" | sed -n 's/.*"progressToken":"\([^"]*\)".*/\1/p')
+      token=$(printf '%s' "$line" | sed -n 's/.*"_meta":{"progressToken":"\([^"]*\)"}.*/\1/p')
       if [ -n "$token" ]; then
         printf '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1,"progressToken":"%s"}}\n' "$token"
       fi
@@ -2525,9 +2525,13 @@ while ($null -ne ($line = $reader.ReadLine())) {
             if let Ok(line) = receiver.try_recv() {
                 let value: Value = serde_json::from_str(&line).expect("response json");
                 // Progress notifications share the caller's channel; skip
-                // them until the final JSON-RPC response arrives.
-                if value.get("method").is_some() {
-                    continue;
+                // them until the final JSON-RPC response arrives. Any other
+                // notification is unexpected and must fail the test.
+                if let Some(method) = value.get("method").and_then(Value::as_str) {
+                    if method == "notifications/progress" {
+                        continue;
+                    }
+                    panic!("unexpected notification {method}: {value}");
                 }
                 return serde_json::from_value(value).expect("response");
             }
@@ -2625,7 +2629,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
     }
 
     #[test]
-    fn a_process_service_forwards_progress_and_reaps_its_child_on_stop() {
+    fn an_exec_core_service_forwards_progress_and_cleans_up_its_child() {
         let nanos = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -2635,15 +2639,17 @@ while ($null -ne ($line = $reader.ReadLine())) {
         std::fs::create_dir_all(root.join("logs")).expect("logs");
         std::env::set_var("SVCD_LOG_DIR", root.join("logs"));
 
-        let process = tool_service("proc", Kind::Core, &["progress"], &root);
+        let process = tool_service("proc", Kind::Core, &["progress", "fail"], &root);
         let (_sender, receiver) = mpsc::channel();
         let mut daemon = Daemon::new(registry(vec![process]), "token".into(), receiver, None);
         daemon.start_service("proc").expect("start");
         assert!(daemon.is_live("proc"));
-        assert!(
-            daemon.slots["proc"].machine.pid.is_some(),
-            "the process must be owned by its slot"
-        );
+        let pid = daemon
+            .status_for_id("proc")
+            .expect("status")
+            .summary
+            .pid
+            .expect("the slot owns a child pid");
 
         let call = send(
             &mut daemon,
@@ -2665,12 +2671,24 @@ while ($null -ne ($line = $reader.ReadLine())) {
             "done"
         );
 
+        // The same tools/call seam must project a process failure as a tool
+        // error, not only a successful value.
+        let failed = send(&mut daemon, "tools/call", json!({"name": "proc.fail"}));
+        let result = wait(&mut daemon, &failed).result.expect("failure result");
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["content"][0]["text"], "boom");
+
         daemon.stop_service("proc").expect("stop");
-        assert_eq!(daemon.slots["proc"].machine.state, State::Stopped);
+        let status = daemon.status_for_id("proc").expect("status");
+        assert_eq!(status.summary.state, State::Stopped);
+        assert!(status.summary.pid.is_none());
+        #[cfg(unix)]
         assert!(
-            daemon.slots["proc"].machine.pid.is_none(),
-            "the slot must reap the process on stop"
+            !crate::proc::alive(pid),
+            "the child process is still alive after stop"
         );
+        #[cfg(not(unix))]
+        let _ = pid;
 
         let _ = std::fs::remove_dir_all(&root);
     }

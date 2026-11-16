@@ -141,7 +141,7 @@ stateDiagram-v2
 
 完整决定见 [ADR-0013](adr/0013-service-contract-interface.md)；复合服务的 v1 边界（root 定义、0 或 1 个能力、单机执行、加载期校验）见 [ADR-0014](adr/0014-composite-service-v1-boundary.md)。
 
-槽是所有 `exec` 服务的默认载体：`exec` 存在即由监督槽唯一拥有，调用点在每次 `tools/call` 构造 `SlotWire`。`ImplRef` 只用于 daemon 不拥有的载体（内置 `svc`；未来的复合/远程）；因此没有 `tag=process` —— process 不是第二种载体，只是槽里的一个进程。
+槽是所有 `exec` 服务的默认载体：`exec` 存在即由监督槽唯一拥有，调用点在每次能力调用（builtin 与 start/stop 工具除外）构造 `SlotWire`。`ImplRef` 只用于槽之外的载体（内置 `svc`；未来的复合/远程）；因此没有 `tag=process` —— process 不是第二种载体，只是槽里的一个进程。见 [ADR-0015](adr/0015-exec-services-default-to-slot.md)。
 
 ### 4.2 一次 `tools/call` 的路径
 
@@ -289,7 +289,7 @@ src/
 
 | # | seam | 两侧 | 今天几个 adapter | 状态 |
 |---|---|---|---|---|
-| **S1** | **服务契约** | 内核 ↔ 四种运行实现 | 2（本机进程、内置）→ 未来 4 | **接口已定**（ADR-0013）；待从 `slot`/`package`/`registry` 抽出 |
+| **S1** | **服务契约** | 内核 ↔ 四种运行实现 | 1 个显式 adapter（内置）+ 槽（exec）→ 未来 4 | **接口已定**（ADR-0013/0015）；待从 `slot`/`package`/`registry` 抽出 |
 | S2 | 调用传输 | 内核 ↔ 载体 | 1（本机 stdio） | 暂不开，但信封必须先定 |
 | S3 | 线格式实现 | 线格式 ↔ 平台 | 2（unix poll / windows 线程） | 未开，`cfg(unix)` 散在业务文件里 |
 | S4 | 请求交接 | 服务器 ↔ 对外面 | 6+（两种结果：响应 / 交出连接） | 未开，现在是 5 个硬编码钩子 |
