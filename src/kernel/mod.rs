@@ -8,6 +8,6 @@ pub mod contract;
 pub mod failure;
 
 #[cfg(test)]
-mod conformance;
+pub(crate) mod conformance;
 #[cfg(test)]
 mod memory;

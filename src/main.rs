@@ -4,6 +4,7 @@ mod auth;
 mod blob;
 #[cfg(feature = "http")]
 mod blob_http;
+mod builtin_adapter;
 mod bundle;
 mod catalog;
 mod channel;
@@ -36,6 +37,7 @@ mod paths;
 mod plugin;
 mod plugin_cli;
 mod proc;
+mod process_adapter;
 mod rawhub;
 #[cfg(unix)]
 mod reactor;

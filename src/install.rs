@@ -270,6 +270,8 @@ fn default_conf_text(layout: &Layout) -> String {
          # http_idle_timeout_secs = 30 / 60 / 120\n\
          # max_package_bytes = 8388608 / 67108864 / 536870912\n\
          # transfer_timeout_secs = 120 / 120 / 120\n\
+         # default_timeout = 30000 / 30000 / 30000\n\
+         # max_timeout = 300000 / 300000 / 300000\n\
          # ws_max_message_bytes = 1048576 / 1048576 / 1048576\n\
          # ws_inflight_bytes = 2097152 / 8388608 / 67108864\n\
          # ws_inflight_requests = 4 / 16 / 64\n\

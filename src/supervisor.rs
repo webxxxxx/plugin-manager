@@ -1,5 +1,6 @@
 pub use crate::registry::State;
 
+use crate::kernel::contract::{Health, Settled};
 use crate::registry::Restart;
 
 /// Full §1.3 schedule. `MAX_FAILURES = 5` means one crash loop enters `Failed`
@@ -81,6 +82,8 @@ pub struct Machine {
     pub remain_after_exit: bool,
     /// A start timed out, so the following exit is a failed start, not a user stop.
     fail_after_stop: bool,
+    /// 最近一次调用失败留下的降级原因；Ready 时清空。
+    degraded: Option<String>,
 }
 
 impl Machine {
@@ -97,7 +100,24 @@ impl Machine {
             restart,
             remain_after_exit: false,
             fail_after_stop: false,
+            degraded: None,
         }
+    }
+
+    pub fn mark_degraded(&mut self, reason: impl Into<String>) {
+        self.degraded = Some(reason.into());
+    }
+
+    pub fn health(&self) -> Health {
+        let state = match self.state {
+            State::Starting => Settled::Live,
+            State::Running => match &self.degraded {
+                Some(reason) => Settled::Degraded(reason.clone()),
+                None => Settled::Ready,
+            },
+            _ => Settled::Stopped,
+        };
+        Health::from_settled(state)
     }
 
     pub fn step(&mut self, event: Event, now_ms: u64) -> Vec<Action> {
@@ -122,6 +142,7 @@ impl Machine {
                 self.next_at_ms = None;
                 self.unkillable = false;
                 self.fail_after_stop = false;
+                self.degraded = None;
                 self.state = S::Starting;
                 self.since_ms = now_ms;
                 out.push(Spawn);
@@ -141,6 +162,7 @@ impl Machine {
             E::Ready { pid } => {
                 if self.state == S::Starting && self.pid == Some(pid) {
                     self.state = S::Running;
+                    self.degraded = None;
                     self.ready_since_ms = Some(now_ms);
                     self.since_ms = now_ms;
                     out.push(Publish);
@@ -163,7 +185,9 @@ impl Machine {
                         // A clean exit is a stop, not a failure: `on-failure`
                         // and `never` both end at Stopped. `always` keeps
                         // restarting, with the same stable-run reset as a crash.
-                        let successful = code == Some(0);
+                        // A clean exit from a degraded service is still a
+                        // failure: health, not just the exit code, decides.
+                        let successful = code == Some(0) && self.health().is_ready();
                         let restart = match self.restart {
                             Restart::Always => true,
                             Restart::OnFailure => !successful,
@@ -783,5 +807,40 @@ mod tests {
         assert_eq!(machine.failures, 0);
         assert!(!machine.unkillable);
         assert_eq!(actions, vec![Action::Spawn, Action::ArmStart]);
+    }
+
+    #[test]
+    fn a_degraded_service_restarts_after_a_clean_exit() {
+        let mut machine = Machine::new(Restart::OnFailure);
+        start(&mut machine, 3, 0);
+        ready(&mut machine, 3, 10);
+        machine.mark_degraded("last call failed");
+
+        assert!(machine.health().is_alive());
+        assert!(machine.health().is_usable());
+        assert!(!machine.health().is_ready());
+
+        let actions = machine.step(
+            Event::Exited {
+                pid: 3,
+                code: Some(0),
+            },
+            20,
+        );
+
+        assert_eq!(machine.state, State::Backoff);
+        assert_eq!(machine.failures, 1);
+        assert!(actions.contains(&Action::ArmBackoff { delay_ms: 1_000 }));
+    }
+
+    #[test]
+    fn ready_clears_degradation() {
+        let mut machine = Machine::new(Restart::OnFailure);
+        start(&mut machine, 3, 0);
+        machine.mark_degraded("last call failed");
+        ready(&mut machine, 3, 10);
+
+        assert!(machine.health().is_ready());
+        assert_eq!(machine.health().state(), &Settled::Ready);
     }
 }

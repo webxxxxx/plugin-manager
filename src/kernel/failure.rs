@@ -46,6 +46,11 @@ impl Class {
         Class::MissingDependency,
     ];
 
+    /// 从稳定名字反查类别；只给协议/投影解析用，不用来从 `detail` 猜类别。
+    pub fn from_str(name: &str) -> Option<Class> {
+        Class::ALL.into_iter().find(|class| class.as_str() == name)
+    }
+
     /// 稳定的名字：日志与投影用。改名字等于改契约。
     pub fn as_str(self) -> &'static str {
         match self {

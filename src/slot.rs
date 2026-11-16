@@ -8,6 +8,8 @@ use std::thread;
 use serde_json::{json, Value};
 
 use crate::ipc::{self, FrameError, FrameEvent};
+use crate::kernel::contract::{Contract, Invocation, ProgressToken};
+use crate::kernel::failure::{Class, Failure, Rejection, Retry};
 use crate::log::{self, LogSink};
 use crate::paths;
 #[cfg(unix)]
@@ -22,8 +24,8 @@ use crate::wake::Wake;
 /// 128-slot queue behind this cap; the ticket scopes this tracer bullet to the
 /// in-flight cap, so a 65th concurrent call is rejected as busy instead.
 pub(crate) const MAX_IN_FLIGHT: usize = 64;
-/// A single tool call may not stay in flight longer than this.
-pub(crate) const CALL_TIMEOUT_MS: u64 = 30_000;
+/// 默认调用超时；生产装配点用 `default_timeout` / `max_timeout` 覆盖它。
+pub(crate) const DEFAULT_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Bounded per-plugin stdout queue. A full queue pauses that plugin's reader
 /// instead of growing memory without bound.
 pub(crate) const FRAME_QUEUE: usize = 256;
@@ -69,6 +71,14 @@ pub(crate) struct Slot {
     /// This slot was rebuilt from a runtime record after a daemon restart, so
     /// there is no `Child` handle: liveness is polled through the process group.
     adopted: bool,
+    /// Optional contract used to validate capabilities and inline limits.
+    contract: Option<Contract>,
+    /// Default timeout for a call that does not carry its own.
+    call_timeout: std::time::Duration,
+    /// Face-side projection of a completed call; `None` gives a neutral envelope.
+    project: Option<Arc<dyn Fn(Option<Value>, Result<Value, Failure>) -> String + Send + Sync>>,
+    /// Face-side projection of a plugin notification (progress/logging).
+    notify_sink: Option<Arc<dyn Fn(&str, &Value) + Send + Sync>>,
 }
 
 struct HookRun {
@@ -80,16 +90,14 @@ struct PendingCall {
     external_id: Option<Value>,
     capability: String,
     deadline: u64,
-    progress_token: Option<Value>,
+    progress_token: Option<String>,
     reply: crate::channel::Reply,
 }
 
 #[derive(Debug)]
 pub(crate) enum CallError {
-    NotLive,
-    Busy,
-    TooLarge,
-    Write(String),
+    Rejected(Rejection),
+    Failed(Failure),
 }
 
 impl Slot {
@@ -128,7 +136,33 @@ impl Slot {
             adopted: false,
             backoff_pending: false,
             cleanup_then_spawn: false,
+            contract: None,
+            call_timeout: DEFAULT_CALL_TIMEOUT,
+            project: None,
+            notify_sink: None,
         }
+    }
+
+    pub(crate) fn set_contract(&mut self, contract: Contract) {
+        self.contract = Some(contract);
+    }
+
+    pub(crate) fn set_call_timeout(&mut self, timeout: std::time::Duration) {
+        self.call_timeout = timeout;
+    }
+
+    pub(crate) fn set_projector(
+        &mut self,
+        project: Arc<dyn Fn(Option<Value>, Result<Value, Failure>) -> String + Send + Sync>,
+    ) {
+        self.project = Some(project);
+    }
+
+    pub(crate) fn set_notifier(
+        &mut self,
+        notify: Arc<dyn Fn(&str, &Value) + Send + Sync>,
+    ) {
+        self.notify_sink = Some(notify);
     }
 
     pub(crate) fn set_exec(&mut self, exec: Exec) {
@@ -269,17 +303,72 @@ impl Slot {
         progress_token: Option<Value>,
         reply: crate::channel::Reply,
     ) -> Result<(), CallError> {
+        let mut invocation = Invocation::new(capability, arguments, self.call_timeout);
+        invocation.progress = progress_token.and_then(|token| match token {
+            Value::String(token) => Some(ProgressToken::new(token)),
+            Value::Number(token) => Some(ProgressToken::new(token.to_string())),
+            _ => None,
+        });
+        self.request_invocation(invocation, external_id, now, reply)
+    }
+
+    /// Contract-aware call entry: validation, inline limit, timeout ceiling and
+    /// failure classification all go through `kernel`.
+    pub(crate) fn request_invocation(
+        &mut self,
+        invocation: Invocation,
+        external_id: Option<Value>,
+        now: u64,
+        reply: crate::channel::Reply,
+    ) -> Result<(), CallError> {
+        if let Some(contract) = &self.contract {
+            if contract.capability(&invocation.capability).is_none() {
+                return Err(CallError::Rejected(Rejection::UnknownCapability {
+                    capability: invocation.capability.as_str().to_string(),
+                }));
+            }
+            if crate::kernel::contract::inline_len(&invocation.arguments)
+                > contract.limits.max_inline
+            {
+                return Err(CallError::Rejected(Rejection::BadArguments {
+                    detail: "arguments exceed the contract inline limit".into(),
+                }));
+            }
+        }
+        if invocation.timeout.is_zero() {
+            return Err(CallError::Rejected(Rejection::BadArguments {
+                detail: "timeout must be greater than zero".into(),
+            }));
+        }
         if self.machine.state != State::Running {
-            return Err(CallError::NotLive);
+            return Err(CallError::Failed(Failure::new(
+                Class::NotRunning,
+                Retry::After(std::time::Duration::from_secs(1)),
+                format!(
+                    "plugin {} is not running; call {}.start first",
+                    self.id, self.id
+                ),
+            )));
         }
         if self.pending.len() >= MAX_IN_FLIGHT {
-            return Err(CallError::Busy);
+            return Err(CallError::Failed(Failure::new(
+                Class::Busy,
+                Retry::After(std::time::Duration::from_millis(100)),
+                "too many in-flight tool calls",
+            )));
         }
+        let timeout = match &self.contract {
+            Some(contract) => invocation.timeout.min(contract.limits.max_timeout),
+            None => invocation.timeout,
+        };
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
-        let mut params = json!({ "name": capability, "arguments": arguments });
-        if let Some(token) = &progress_token {
-            params["_meta"] = json!({ "progressToken": token });
+        let mut params = json!({
+            "name": invocation.capability.as_str(),
+            "arguments": invocation.arguments,
+        });
+        if let Some(token) = &invocation.progress {
+            params["_meta"] = json!({ "progressToken": token.as_str() });
         }
         let frame = json!({
             "jsonrpc": "2.0",
@@ -289,18 +378,25 @@ impl Slot {
         })
         .to_string();
         if frame.len() > ipc::CALL_FRAME_MAX {
-            return Err(CallError::TooLarge);
+            return Err(CallError::Rejected(Rejection::BadArguments {
+                detail: "tools/call request exceeds the 1 MiB frame limit".into(),
+            }));
         }
         if let Err(error) = self.write_json_frame(&frame, ipc::CALL_FRAME_MAX) {
-            return Err(CallError::Write(error.to_string()));
+            return Err(CallError::Failed(Failure::new(
+                Class::WriteFailed,
+                Retry::Never,
+                format!("cannot write to plugin: {error}"),
+            )));
         }
+        let deadline = now.saturating_add(timeout.as_millis().min(u64::MAX as u128) as u64);
         self.pending.insert(
             id,
             PendingCall {
                 external_id,
-                capability: capability.to_string(),
-                deadline: now.saturating_add(CALL_TIMEOUT_MS),
-                progress_token,
+                capability: invocation.capability.as_str().to_string(),
+                deadline,
+                progress_token: invocation.progress.as_ref().map(|token| token.as_str().to_string()),
                 reply,
             },
         );
@@ -701,7 +797,10 @@ impl Slot {
 
     fn handle_notification(&mut self, method: &str, params: Option<&Value>) {
         if method == "notifications/progress" {
-            if let Some(token) = params.and_then(|params| params.get("progressToken")) {
+            if let Some(token) = params
+                .and_then(|params| params.get("progressToken"))
+                .and_then(Value::as_str)
+            {
                 let line = json!({
                     "jsonrpc": "2.0",
                     "method": method,
@@ -711,7 +810,7 @@ impl Slot {
                 for pending in self
                     .pending
                     .values()
-                    .filter(|pending| pending.progress_token.as_ref() == Some(token))
+                    .filter(|pending| pending.progress_token.as_deref() == Some(token))
                 {
                     pending.reply.send(line.clone());
                 }
@@ -734,8 +833,9 @@ impl Slot {
             ),
         };
         self.log_service(&text);
-        #[cfg(feature = "http")]
-        crate::uichannel::publish(&self.id, method, &params.cloned().unwrap_or(Value::Null));
+        if let Some(notify) = &self.notify_sink {
+            notify(method, &params.cloned().unwrap_or(Value::Null));
+        }
     }
 
     fn complete_pending(&mut self, id: u64, message: &serde_json::Map<String, Value>) {
@@ -746,25 +846,58 @@ impl Slot {
             ));
             return;
         };
-        let response = if let Some(error) = message.get("error") {
+        let outcome = if let Some(error) = message.get("error") {
             let text = error
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("plugin call failed");
-            crate::mcp::tool_error(pending.external_id, text)
+            let class = error
+                .pointer("/data/class")
+                .and_then(Value::as_str)
+                .and_then(Class::from_str)
+                .unwrap_or(Class::ImplementationError);
+            Err(Failure::new(class, class.default_retry(), text))
         } else if let Some(result) = message.get("result") {
             let mut result = result.clone();
             match crate::blob::materialize_result(&mut result) {
-                Ok(()) => rpc::ok(pending.external_id, result),
-                Err(message) => crate::mcp::tool_error(pending.external_id, &message),
+                Ok(()) => Ok(result),
+                Err(message) => Err(Failure::new(
+                    Class::ImplementationError,
+                    Retry::Never,
+                    message,
+                )),
             }
         } else {
-            crate::mcp::tool_error(
-                pending.external_id,
+            Err(Failure::new(
+                Class::ImplementationError,
+                Retry::Never,
                 "plugin returned neither result nor error",
-            )
+            ))
         };
-        pending.reply.send(rpc::to_line(&response));
+        self.mark_degraded(&outcome);
+        let line = self.project(pending.external_id, outcome);
+        pending.reply.send(line);
+    }
+
+    fn project(&self, external_id: Option<Value>, outcome: Result<Value, Failure>) -> String {
+        if let Some(project) = &self.project {
+            return project(external_id, outcome);
+        }
+        match outcome {
+            Ok(value) => rpc::to_line(&rpc::ok(external_id, value)),
+            Err(failure) => rpc::to_line(&rpc::err(external_id, -32000, &failure.detail)),
+        }
+    }
+
+    fn mark_degraded(&mut self, outcome: &Result<Value, Failure>) {
+        if let Err(failure) = outcome {
+            if matches!(
+                failure.class,
+                Class::ImplementationError | Class::Timeout | Class::WriteFailed
+            ) {
+                self.machine.mark_degraded(failure.detail.clone());
+            }
+        }
     }
 
     fn expire_pending(&mut self, now: u64) {
@@ -786,17 +919,29 @@ impl Slot {
                 "svcd: {}: tools/call {} timed out",
                 self.id, pending.capability
             ));
-            let response =
-                crate::mcp::tool_error(pending.external_id, "tools/call timed out after 30s");
-            pending.reply.send(rpc::to_line(&response));
+            let failure = Failure::new(
+                Class::Timeout,
+                Retry::After(std::time::Duration::from_secs(1)),
+                "tools/call timed out",
+            );
+            let outcome = Err(failure);
+            self.mark_degraded(&outcome);
+            let line = self.project(pending.external_id, outcome);
+            pending.reply.send(line);
         }
     }
 
     fn fail_pending(&mut self, reason: &str) {
         let pending = std::mem::take(&mut self.pending);
         for (_, call) in pending {
-            let response = crate::mcp::tool_error(call.external_id, reason);
-            call.reply.send(rpc::to_line(&response));
+            let failure = Failure::new(
+                Class::NotRunning,
+                Retry::After(std::time::Duration::from_secs(1)),
+                reason,
+            );
+            self.machine.mark_degraded(reason.to_string());
+            let line = self.project(call.external_id, Err(failure));
+            call.reply.send(line);
         }
     }
 
@@ -1369,8 +1514,31 @@ mod tests {
         }
     }
 
+    fn test_projector(
+        external_id: Option<Value>,
+        outcome: Result<Value, Failure>,
+    ) -> String {
+        match outcome {
+            Ok(value) => rpc::to_line(&rpc::ok(external_id, value)),
+            Err(failure) => json!({
+                "jsonrpc": "2.0",
+                "id": external_id,
+                "result": {
+                    "content": [{ "type": "text", "text": failure.detail }],
+                    "isError": true,
+                },
+            })
+            .to_string(),
+        }
+    }
+
+    fn with_projector(mut slot: Slot) -> Slot {
+        slot.set_projector(Arc::new(test_projector));
+        slot
+    }
+
     fn slot() -> Slot {
-        Slot::new("demo".into(), exec(), None, Restart::OnFailure)
+        with_projector(Slot::new("demo".into(), exec(), None, Restart::OnFailure))
     }
 
     fn queue(slot: &mut Slot, id: u64, deadline: u64) -> Receiver<String> {
@@ -1441,25 +1609,26 @@ mod tests {
     }
 
     #[test]
-    fn notifications_are_mirrored_to_the_ui_bus() {
-        let (receiver, subscription) = crate::uichannel::bus()
-            .subscribe("slot-ui-test")
-            .expect("subscribe");
-        let mut slot = Slot::new("slot-ui-test".into(), exec(), None, Restart::OnFailure);
+    fn notifications_are_forwarded_to_the_face_sink() {
+        let (tx, rx) = mpsc::channel();
+        let mut slot = with_projector(Slot::new(
+            "slot-ui-test".into(),
+            exec(),
+            None,
+            Restart::OnFailure,
+        ));
+        slot.set_notifier(Arc::new(move |method: &str, params: &Value| {
+            let _ = tx.send((method.to_string(), params.clone()));
+        }));
         slot.handle_notification(
             "notifications/message",
             Some(&json!({"level": "info", "data": "hello"})),
         );
-        let event = receiver
+        let (method, params) = rx
             .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("event");
-        assert!(
-            event.json.contains("notifications/message"),
-            "{}",
-            event.json
-        );
-        assert!(event.json.contains("hello"), "{}", event.json);
-        drop(subscription);
+            .expect("notification");
+        assert_eq!(method, "notifications/message");
+        assert_eq!(params["data"], "hello");
     }
 
     #[test]
@@ -1480,7 +1649,10 @@ mod tests {
             crate::channel::Reply::plain(tx),
         );
 
-        assert!(matches!(result, Err(CallError::Busy)));
+        assert!(matches!(
+            result,
+            Err(CallError::Failed(failure)) if failure.class == Class::Busy
+        ));
     }
 
     #[test]
@@ -1593,7 +1765,7 @@ done
             ready: Ready::Notify,
             interpreter: None,
         };
-        let mut slot = Slot::new("demo".into(), exec, None, Restart::OnFailure);
+        let mut slot = with_projector(Slot::new("demo".into(), exec, None, Restart::OnFailure));
         slot.set_protocol_only(true);
         let started = Instant::now();
         slot.apply(Event::Start, 0);

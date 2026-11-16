@@ -127,6 +127,10 @@ pub struct Limits {
     pub log_to_file: bool,
     pub max_package_bytes: u64,
     pub transfer_timeout: Duration,
+    /// 默认调用超时；契约的 `default_timeout` 从这里来。
+    pub default_timeout: Duration,
+    /// 调用超时的上限；契约的 `max_timeout` 从这里来。
+    pub max_timeout: Duration,
     pub ws_max_message_bytes: usize,
     #[cfg_attr(not(unix), allow(dead_code))]
     pub ws_inflight_bytes: usize,
@@ -219,6 +223,24 @@ impl Limits {
                     .unwrap_or(120)
                     .clamp(10, 3600),
             ),
+            default_timeout: Duration::from_millis(
+                settings
+                    .default_timeout_ms
+                    .unwrap_or(30_000)
+                    .clamp(100, 300_000),
+            ),
+            max_timeout: {
+                let default = settings
+                    .default_timeout_ms
+                    .unwrap_or(30_000)
+                    .clamp(100, 300_000);
+                Duration::from_millis(
+                    settings
+                        .max_timeout_ms
+                        .unwrap_or(300_000)
+                        .clamp(default, 600_000),
+                )
+            },
             ws_max_message_bytes: clamp_usize(
                 settings.ws_max_message_bytes,
                 defaults::WS_MAX_MESSAGE,
@@ -274,6 +296,8 @@ struct SettingsView<'a> {
     log_to_file: Option<bool>,
     max_package_bytes: Option<u64>,
     transfer_timeout_secs: Option<u64>,
+    default_timeout_ms: Option<u64>,
+    max_timeout_ms: Option<u64>,
     ws_max_message_bytes: Option<usize>,
     ws_inflight_bytes: Option<usize>,
     ws_inflight_requests: Option<usize>,
@@ -306,6 +330,8 @@ impl<'a> SettingsView<'a> {
             log_to_file: settings.log_to_file,
             max_package_bytes: settings.max_package_bytes,
             transfer_timeout_secs: settings.transfer_timeout_secs,
+            default_timeout_ms: settings.default_timeout_ms,
+            max_timeout_ms: settings.max_timeout_ms,
             ws_max_message_bytes: settings.ws_max_message_bytes,
             ws_inflight_bytes: settings.ws_inflight_bytes,
             ws_inflight_requests: settings.ws_inflight_requests,

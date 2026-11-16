@@ -18,6 +18,11 @@ use crate::catalog;
 use crate::channel;
 use crate::compat;
 use crate::definition;
+use crate::kernel::contract::{
+    Capability as KernelCapability, CapabilityName, Contract, Effect, Invocation, Limits as KernelLimits,
+    Obligations, ProgressToken, ServiceId,
+};
+use crate::kernel::failure::{Class, Failure, Rejection};
 use crate::lan::LanStatus;
 use crate::log;
 use crate::mcp;
@@ -421,6 +426,7 @@ impl Daemon {
                 slot.set_remain_after_exit(service.remain_after_exit);
                 slot.set_initial_state(service.state);
                 slot.set_wake(wake.clone());
+                configure_slot(&mut slot, &service);
                 slots.insert(service.id.clone(), slot);
             }
         }
@@ -1015,7 +1021,13 @@ impl Daemon {
             );
             return;
         }
-        let progress_token = request.params.get("progressToken").cloned();
+        let progress_token = request.params.get("progressToken").and_then(|token| {
+            match token {
+                Value::String(token) => Some(ProgressToken::new(token.clone())),
+                Value::Number(token) => Some(ProgressToken::new(token.to_string())),
+                _ => None,
+            }
+        });
         let now = self.now_ms();
         let Some(slot) = self.slots.get_mut(service_id) else {
             send(
@@ -1024,56 +1036,22 @@ impl Daemon {
             );
             return;
         };
-        match slot.request_capability(
+        let mut invocation = Invocation::new(
             capability,
             arguments,
-            id.clone(),
-            now,
-            progress_token,
-            reply.clone(),
-        ) {
+            crate::limits::current().default_timeout,
+        );
+        invocation.progress = progress_token;
+        match slot.request_invocation(invocation, id.clone(), now, reply.clone()) {
             Ok(()) => {}
-            Err(CallError::Busy) => {
-                send(
-                    &reply,
-                    rpc::err(id, -32000, "busy: too many in-flight tool calls"),
-                );
+            Err(CallError::Rejected(Rejection::UnknownCapability { .. })) => {
+                send(&reply, unknown_tool(&id, &name));
             }
-            Err(CallError::NotLive) => {
-                send(
-                    &reply,
-                    mcp::tool_result(
-                        id,
-                        format!(
-                            "plugin {} is not running; call {}.start first",
-                            service_id, service_id
-                        ),
-                        true,
-                    ),
-                );
+            Err(CallError::Rejected(Rejection::BadArguments { detail })) => {
+                send(&reply, rpc::err(id, -32602, &detail));
             }
-            Err(CallError::TooLarge) => {
-                // The caller's arguments are too large for the transport. The
-                // plugin did nothing wrong, so this is a params error rather
-                // than a plugin protocol violation.
-                send(
-                    &reply,
-                    rpc::err(
-                        id,
-                        -32602,
-                        "tools/call request exceeds the 1 MiB frame limit",
-                    ),
-                );
-            }
-            Err(CallError::Write(error)) => {
-                send(
-                    &reply,
-                    mcp::tool_result(
-                        id,
-                        format!("cannot write to plugin {}: {}", service_id, error),
-                        true,
-                    ),
-                );
+            Err(CallError::Failed(failure)) => {
+                send(&reply, project_slot_response(id, Err(failure)));
             }
         }
     }
@@ -1217,6 +1195,7 @@ impl Daemon {
                         #[cfg(unix)]
                         slot.set_reactor(self.reactor.clone());
                         slot.set_raw_hub(Some(self.raw_hub.clone()));
+                        configure_slot(&mut slot, &service);
                         self.slots.insert(id.clone(), slot);
                     }
                     self.registry.insert(service)?;
@@ -1849,6 +1828,79 @@ fn status_response(
 
 fn status_json(status: Status) -> Value {
     serde_json::to_value(status).unwrap_or(Value::Null)
+}
+
+/// Face-side projection of a completed slot call. The slot only emits a
+/// `Result<Value, Failure>`; MCP codes/strings live here.
+fn project_slot_response(external_id: Option<Value>, outcome: Result<Value, Failure>) -> rpc::Response {
+    match outcome {
+        Ok(value) => rpc::ok(external_id, value),
+        Err(failure) => match failure.class {
+            Class::Busy => rpc::err(
+                external_id,
+                -32000,
+                "busy: too many in-flight tool calls",
+            ),
+            Class::FrameTooLarge => rpc::err(
+                external_id,
+                -32602,
+                "tools/call request exceeds the 1 MiB frame limit",
+            ),
+            Class::NotRunning | Class::WriteFailed => {
+                mcp::tool_result(external_id, failure.detail, true)
+            }
+            _ => mcp::tool_error(external_id, &failure.detail),
+        },
+    }
+}
+
+fn project_slot_outcome(external_id: Option<Value>, outcome: Result<Value, Failure>) -> String {
+    rpc::to_line(&project_slot_response(external_id, outcome))
+}
+
+fn slot_contract(service: &Service) -> Contract {
+    let limits = crate::limits::current();
+    let surface = service
+        .caps
+        .iter()
+        .map(|capability| KernelCapability {
+            name: CapabilityName::new(capability.name.clone()),
+            desc: capability.description.clone(),
+            input_schema: Some(capability.input_schema.clone()),
+            effect: Effect::Write,
+            idempotent: false,
+        })
+        .collect();
+    Contract::new(
+        ServiceId::new(service.id.clone()),
+        service.version.clone(),
+        surface,
+        Obligations::default(),
+        Class::ALL.to_vec(),
+        KernelLimits {
+            max_inline: 1024 * 1024,
+            max_in_flight: crate::slot::MAX_IN_FLIGHT,
+            default_timeout: limits.default_timeout,
+            max_timeout: limits.max_timeout,
+        },
+    )
+}
+
+/// Give a slot its contract and the face-side projections. The slot itself no
+/// longer knows MCP or the UI bus.
+fn configure_slot(slot: &mut Slot, service: &Service) {
+    slot.set_contract(slot_contract(service));
+    slot.set_call_timeout(crate::limits::current().default_timeout);
+    slot.set_projector(Arc::new(project_slot_outcome));
+    let id = service.id.clone();
+    slot.set_notifier(Arc::new(move |method, params| {
+        #[cfg(feature = "http")]
+        crate::uichannel::publish(&id, method, params);
+        #[cfg(not(feature = "http"))]
+        {
+            let _ = (method, params);
+        }
+    }));
 }
 
 fn send(reply: &crate::channel::Reply, response: rpc::Response) {

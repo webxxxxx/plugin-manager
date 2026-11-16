@@ -57,6 +57,10 @@ pub struct Settings {
     pub http_idle_timeout_secs: Option<u64>,
     pub max_package_bytes: Option<u64>,
     pub transfer_timeout_secs: Option<u64>,
+    /// 默认调用超时（毫秒）；0/缺失时由 limits 取默认值。
+    pub default_timeout_ms: Option<u64>,
+    /// 调用超时上限（毫秒）；必须 >= default_timeout。
+    pub max_timeout_ms: Option<u64>,
     pub ws_max_message_bytes: Option<usize>,
     pub ws_inflight_bytes: Option<usize>,
     pub ws_inflight_requests: Option<usize>,
@@ -296,6 +300,13 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
                 settings.transfer_timeout_secs =
                     Some(parse_u64(value, "transfer_timeout_secs", index)?)
             }
+            "default_timeout" => {
+                settings.default_timeout_ms =
+                    Some(parse_u64(value, "default_timeout", index)?)
+            }
+            "max_timeout" => {
+                settings.max_timeout_ms = Some(parse_u64(value, "max_timeout", index)?)
+            }
             "ws_max_message_bytes" => {
                 settings.ws_max_message_bytes =
                     Some(parse_usize(value, "ws_max_message_bytes", index)?)
@@ -486,7 +497,9 @@ mod tests {
              max_streams = 8\n\
              stream_buffer_bytes = 16384\n\
              max_package_bytes = 8388608\n\
-             transfer_timeout_secs = 120\n",
+             transfer_timeout_secs = 120\n\
+             default_timeout = 45000\n\
+             max_timeout = 450000\n",
             Path::new("/etc/svcd"),
         )
         .expect("parse");
@@ -509,6 +522,8 @@ mod tests {
         assert_eq!(settings.stream_buffer_bytes, Some(16384));
         assert_eq!(settings.max_package_bytes, Some(8 * 1024 * 1024));
         assert_eq!(settings.transfer_timeout_secs, Some(120));
+        assert_eq!(settings.default_timeout_ms, Some(45_000));
+        assert_eq!(settings.max_timeout_ms, Some(450_000));
     }
 
     #[test]

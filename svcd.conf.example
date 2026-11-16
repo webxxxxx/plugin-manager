@@ -74,6 +74,8 @@ bind = 127.0.0.1:8787
 #   http_idle_timeout_secs 30         60          120
 #   max_package_bytes      8388608    67108864    536870912
 #   transfer_timeout_secs  120        120         120
+#   default_timeout        30000      30000       30000
+#   max_timeout            300000     300000      300000
 #   ws_max_message_bytes   1048576    1048576     1048576
 #   ws_inflight_bytes      2097152    8388608     67108864
 #   ws_inflight_requests   4          16          64
@@ -115,6 +117,10 @@ bind = 127.0.0.1:8787
 # http_idle_timeout_secs = 30
 # max_package_bytes = 8388608
 # transfer_timeout_secs = 120
+# Call timeout in milliseconds: default_timeout is the per-call budget,
+# max_timeout is the hard ceiling the kernel clamps to.
+# default_timeout = 30000
+# max_timeout = 300000
 # ws_max_message_bytes = 1048576
 # ws_inflight_bytes = 2097152
 # ws_inflight_requests = 4

@@ -52,6 +52,8 @@
 
     "blob": { "concept": "storage", "layer": "domain", "note": "目标在 platform/storage" },
 
+    "process_adapter": { "concept": "supervise/process", "layer": "domain" },
+    "builtin_adapter": { "concept": "supervise/builtin", "layer": "domain" },
     "install": { "concept": "selfinstall/execute", "layer": "domain" },
     "service_win": { "concept": "selfinstall/service_win", "layer": "domain" },
 
