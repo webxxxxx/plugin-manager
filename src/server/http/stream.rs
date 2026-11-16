@@ -52,9 +52,10 @@ pub enum StreamAction {
     /// The S4 slice after this one wires the pool (#116).
     #[allow(dead_code)] // #116 submits the first blocking job.
     SubmitBlocking(BlockingJob),
-    /// Send this file on the server's socket once the output buffer drains.
-    /// The handler gives up the file handle; the server performs the send.
-    /// A file send is terminal: the server closes after the last byte.
+    /// Send this file range on the server's socket once the output buffer
+    /// drains. The handler gives up the file handle; the server performs the
+    /// send and then delivers `Writable` again, so a multi-part response can
+    /// ask for the next range and a finished response returns `Close`.
     SendFile(FileSend),
     /// Finish the response and close the connection.
     #[cfg_attr(not(unix), allow(dead_code))] // the fallback ignores the reason.

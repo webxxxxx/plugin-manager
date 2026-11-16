@@ -12,7 +12,7 @@ use crate::server::http::driver::{StreamAdmission, StreamDriver};
 use crate::server::http::engine::{self, HttpRequest, LegacyBridge, PreRequest, Table};
 use crate::server::http::{
     complete_blocking, dispatch_inline, BlockingPool, BodyPolicy, Busy, CancelToken,
-    CompletionSlot, Dispatch, Exchange, Face, JobOutcome,
+    CompletionSlot, Dispatch, Exchange, Face, JobOutcome, StreamHandler,
 };
 
 /// One queued or running blocking request. The server owns the completion slot
@@ -620,40 +620,7 @@ impl ServerHandler {
         // buffer; the loop must not try to parse them again.
         let initial = connection.buffer.split_off(body_start);
         connection.buffer.clear();
-        connection.keep_alive = false;
-
-        let mut driver = match StreamDriver::admit(handler, crate::limits::current().max_streams) {
-            StreamAdmission::Admitted(driver) => driver,
-            StreamAdmission::Busy => {
-                write_response(connection, stream_busy(), false);
-                return Some(PreRequest::Handled);
-            }
-        };
-        let primed = driver.prime(
-            &mut connection.stream,
-            &mut connection.out,
-            &mut connection.out_at,
-            &mut connection.last_active,
-        );
-        connection.state = ConnState::Stream(driver);
-        if !primed {
-            finish_stream(connection);
-            return Some(PreRequest::Handled);
-        }
-        if !initial.is_empty() {
-            let keep = {
-                let Connection {
-                    state, out, out_at, ..
-                } = connection;
-                match state {
-                    ConnState::Stream(driver) => driver.on_data(&initial, out, out_at),
-                    _ => true,
-                }
-            };
-            if !keep {
-                finish_stream(connection);
-            }
-        }
+        attach_stream(connection, handler, &initial);
         Some(PreRequest::Handled)
     }
 
@@ -690,20 +657,34 @@ impl ServerHandler {
 
         match prepared.route.dispatch {
             Dispatch::Inline => {
-                let response = super::render_exchange(dispatch_inline(
-                    self.face.as_ref(),
-                    &prepared.route,
-                    prepared.request,
-                ));
-                write_response(
-                    connection,
-                    if keep_alive {
-                        keep_alive_response(response)
-                    } else {
-                        response
-                    },
-                    keep_alive,
-                );
+                match dispatch_inline(self.face.as_ref(), &prepared.route, prepared.request) {
+                    Ok(Exchange::Response(response)) => {
+                        let response = if keep_alive {
+                            keep_alive_response(response.into_bytes())
+                        } else {
+                            response.into_bytes()
+                        };
+                        write_response(connection, response, keep_alive);
+                    }
+                    Ok(Exchange::Stream(handler)) => {
+                        // A streamed response is not a keep-alive response: its
+                        // handler may own a file range and the wire head says
+                        // `Connection: close`.
+                        attach_stream(connection, handler, &[]);
+                    }
+                    Err(cause) => {
+                        let response = http::json_error(500, "internal", &cause.message());
+                        write_response(
+                            connection,
+                            if keep_alive {
+                                keep_alive_response(response)
+                            } else {
+                                response
+                            },
+                            keep_alive,
+                        );
+                    }
+                }
             }
             Dispatch::Blocking => {
                 let endpoint = format!("{} {}", request.method, request.path);
@@ -739,6 +720,49 @@ impl ServerHandler {
             }
         }
         true
+    }
+}
+
+/// Attach a face-produced stream handler under `max_streams`. On Busy the
+/// connection gets the shared 503 before any handler bytes are written.
+fn attach_stream(connection: &mut Connection, handler: Box<dyn StreamHandler>, initial: &[u8]) {
+    connection.keep_alive = false;
+    let mut driver = match StreamDriver::admit(handler, crate::limits::current().max_streams) {
+        StreamAdmission::Admitted(driver) => driver,
+        StreamAdmission::Busy => {
+            write_response(
+                connection,
+                crate::server::http::stream_busy_response(),
+                false,
+            );
+            return;
+        }
+    };
+    let primed = driver.prime(
+        &mut connection.stream,
+        &mut connection.out,
+        &mut connection.out_at,
+        &mut connection.last_active,
+    );
+    connection.state = ConnState::Stream(driver);
+    if !primed {
+        finish_stream(connection);
+        return;
+    }
+    if initial.is_empty() {
+        return;
+    }
+    let keep = {
+        let Connection {
+            state, out, out_at, ..
+        } = connection;
+        match state {
+            ConnState::Stream(driver) => driver.on_data(initial, out, out_at),
+            _ => true,
+        }
+    };
+    if !keep {
+        finish_stream(connection);
     }
 }
 
@@ -798,16 +822,6 @@ fn stream_tick(connection: &mut Connection, now: Instant) -> bool {
         return true;
     };
     driver.on_tick(now, stream, out, out_at, last_active)
-}
-
-fn stream_busy() -> Vec<u8> {
-    let body = json!({ "error": { "code": "busy", "message": "stream cap reached" } });
-    http::response_with_headers(
-        503,
-        "application/json",
-        &[("Retry-After".to_string(), "1".to_string())],
-        &serde_json::to_vec(&body).unwrap_or_default(),
-    )
 }
 
 fn write_response(connection: &mut Connection, response: Vec<u8>, keep_alive: bool) {

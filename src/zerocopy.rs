@@ -1,9 +1,10 @@
 //! Kernel-assisted transfers where the platform provides them.
 //!
-//! Downloads currently send file bytes through a user buffer. `sendfile`
-//! (Linux) and `TransmitFile` (Windows) let the kernel move file pages to the
-//! socket instead. Callers keep the read/write path as a fallback so embedded
-//! targets and unusual sockets still work.
+//! The Unix server loop uses `try_send_file_range` after a stream handler asks
+//! for a file send; the Windows thread fallback uses the blocking
+//! `send_file_range`. Callers keep a read/write path for platforms without an
+//! incremental kernel call, so embedded targets and unusual sockets still
+//! work.
 
 use std::fs::File;
 use std::io;
@@ -11,11 +12,10 @@ use std::io;
 use std::io::{Seek, SeekFrom};
 use std::net::TcpStream;
 
-/// Send exactly `length` bytes from `file` at `offset` to `stream`.
-///
-/// `Ok(true)` means the platform transferred the whole range without a user
-/// buffer. `Ok(false)` means this platform/API is unavailable and the caller
-/// should fall back to `read` + `write`.
+/// Blockingly send exactly `length` bytes from `file` at `offset` to
+/// `stream`. Only the Windows per-connection fallback uses this; the Unix loop
+/// must never block and uses `try_send_file_range` instead.
+#[cfg(windows)]
 pub fn send_file_range(
     file: &mut File,
     stream: &mut TcpStream,
@@ -25,19 +25,7 @@ pub fn send_file_range(
     if length == 0 {
         return Ok(true);
     }
-    #[cfg(target_os = "linux")]
-    {
-        linux_sendfile(file, stream, offset, length)
-    }
-    #[cfg(windows)]
-    {
-        windows_transmit_file(file, stream, offset, length)
-    }
-    #[cfg(not(any(target_os = "linux", windows)))]
-    {
-        let _ = (file, stream, offset, length);
-        Ok(false)
-    }
+    windows_transmit_file(file, stream, offset, length)
 }
 
 /// One step of a non-blocking kernel file send.
@@ -114,40 +102,6 @@ fn linux_try_sendfile(
     } else {
         Ok(FileSendProgress::Sent(sent))
     }
-}
-
-#[cfg(target_os = "linux")]
-fn linux_sendfile(
-    file: &mut File,
-    stream: &mut TcpStream,
-    offset: u64,
-    length: u64,
-) -> io::Result<bool> {
-    use std::os::fd::AsRawFd;
-
-    let mut position = offset as libc::off_t;
-    let mut remaining = length;
-    while remaining > 0 {
-        // Linux caps one sendfile call at 0x7ffff000 bytes.
-        let chunk = std::cmp::min(remaining, 0x7fff_f000) as usize;
-        let sent =
-            unsafe { libc::sendfile(stream.as_raw_fd(), file.as_raw_fd(), &mut position, chunk) };
-        if sent < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        if sent == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "sendfile reached EOF before the requested range",
-            ));
-        }
-        remaining -= sent as u64;
-    }
-    Ok(true)
 }
 
 #[cfg(windows)]

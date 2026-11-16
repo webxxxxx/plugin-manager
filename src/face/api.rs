@@ -24,6 +24,8 @@ use crate::server::http::{
 
 const UI: &str = include_str!("../web/index.html");
 
+use super::blob;
+
 /// The management API face.
 pub struct ApiFace {
     config: PathBuf,
@@ -560,6 +562,11 @@ fn project_service(status: &Value) -> Option<Value> {
 
 impl Face for ApiFace {
     fn route(&self, method: &str, path: &str) -> Option<Route> {
+        if blob::download_target(method, path).is_some() {
+            // A download has no request body, but its result is a stream
+            // handler: the route must say so, or the dispatch check rejects it.
+            return Some(Route::inline(BodyPolicy::Streamed));
+        }
         let body = body_policy(method, path);
         if is_login(method, path) || is_logout(method, path) || is_console(path) {
             return Some(route_with(body, dispatch_for(method, path)).public());
@@ -571,6 +578,12 @@ impl Face for ApiFace {
     }
 
     fn handle(&self, request: Request, done: Completion) {
+        if let Some(target) = blob::download_target(&request.method, &request.path) {
+            done.complete(Exchange::Stream(Box::new(blob::DownloadStream::open(
+                &request, target,
+            ))));
+            return;
+        }
         let response = if is_login(&request.method, &request.path) {
             self.login(&request)
         } else if is_logout(&request.method, &request.path) {
@@ -689,15 +702,25 @@ mod tests {
     }
 
     #[test]
-    fn transfer_and_stream_paths_stay_on_the_legacy_bridge() {
+    fn downloads_use_the_stream_face_and_uploads_stay_legacy() {
         let face = face();
+        for (method, path) in [
+            ("GET", "/api/v1/blobs/abc"),
+            ("HEAD", "/api/v1/file/abc"),
+        ] {
+            let route = face
+                .route(method, path)
+                .unwrap_or_else(|| panic!("{method} {path} must be a face route"));
+            assert!(
+                matches!(route.body, BodyPolicy::Streamed),
+                "{method} {path} must be a streamed download"
+            );
+        }
         for (method, path) in [
             ("POST", "/api/v1/plugins"),
             ("POST", "/api/v1/import"),
             ("POST", "/api/v1/blobs/uploads"),
-            ("GET", "/api/v1/blobs/abc"),
             ("PUT", "/api/v1/blobs/uploads/abc/parts/1"),
-            ("GET", "/api/v1/file/abc"),
             ("POST", "/api/v1/file/uploads"),
             ("GET", "/api/v1/export/demo"),
             ("GET", "/api/v1/export/demo/spk"),
@@ -825,6 +848,36 @@ mod tests {
             error,
             crate::server::http::DispatchError::UnsupportedDispatch(Dispatch::Blocking)
         );
+    }
+
+    #[test]
+    fn blob_downloads_are_inline_streamed_routes() {
+        let face = face();
+        for (method, path) in [
+            ("GET", "/api/v1/blobs/sha256:abc"),
+            ("HEAD", "/api/v1/file/sha256:abc"),
+            ("GET", "/api/v1/files/sha256:abc"),
+        ] {
+            let route = face.route(method, path).expect("download route");
+            assert_eq!(route.dispatch, Dispatch::Inline);
+            assert_eq!(route.body, BodyPolicy::Streamed);
+        }
+        assert!(face.route("POST", "/api/v1/blobs/sha256:abc").is_none());
+        assert!(face.route("GET", "/api/v1/blobs").is_none());
+        assert!(face
+            .route("PUT", "/api/v1/blobs/uploads/x/parts/1")
+            .is_none());
+        assert!(face.route("GET", "/api/v1/file/uploads/x").is_none());
+    }
+
+    #[test]
+    fn a_download_route_returns_a_stream_even_when_the_blob_is_missing() {
+        let face = face();
+        let path = "/api/v1/blobs/sha256:deadbeef";
+        let route = face.route("GET", path).expect("download route");
+        let exchange = dispatch_inline(&face, &route, request("GET", path))
+            .expect("a missing blob is a streamed 404, not a dispatch error");
+        assert!(matches!(exchange, Exchange::Stream(_)));
     }
 
     #[test]

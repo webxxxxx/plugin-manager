@@ -7,4 +7,5 @@
 //! page here.
 
 pub mod api;
+pub mod blob;
 pub mod plugin_ui;

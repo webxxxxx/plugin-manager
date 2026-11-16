@@ -6,79 +6,15 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::limits;
 use crate::log;
 
+use super::budget::{Busy, StreamBudget, StreamPermit};
 use super::stream::{
-    CloseReason, FileSend, OutBuffer, StreamAction, StreamClass, StreamEvent, StreamHandler,
-    StreamStep,
+    CloseReason, FileSend, OutBuffer, StreamAction, StreamEvent, StreamHandler, StreamStep,
 };
-
-static ACTIVE_STREAMS: AtomicUsize = AtomicUsize::new(0);
-
-/// Why a stream was refused before its headers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Busy;
-
-/// A `max_streams` slot held by one long-lived stream. One-shot responses do
-/// not acquire one, so a page's static assets never trip the long-lived cap.
-pub struct StreamPermit {
-    active: &'static AtomicUsize,
-}
-
-impl Drop for StreamPermit {
-    fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-/// The shared admission counter behind `max_streams`.
-pub struct StreamBudget {
-    active: &'static AtomicUsize,
-}
-
-impl StreamBudget {
-    pub fn global() -> StreamBudget {
-        StreamBudget {
-            active: &ACTIVE_STREAMS,
-        }
-    }
-
-    #[cfg(test)]
-    fn for_counter(active: &'static AtomicUsize) -> StreamBudget {
-        StreamBudget { active }
-    }
-
-    /// `Ok(None)` for an exempt one-shot response; `Err(Busy)` when the cap
-    /// is already reached.
-    pub fn acquire(&self, class: StreamClass, limit: usize) -> Result<Option<StreamPermit>, Busy> {
-        if class == StreamClass::OneShot {
-            return Ok(None);
-        }
-        let mut current = self.active.load(Ordering::Acquire);
-        loop {
-            if current >= limit {
-                return Err(Busy);
-            }
-            match self.active.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Ok(Some(StreamPermit {
-                        active: self.active,
-                    }))
-                }
-                Err(actual) => current = actual,
-            }
-        }
-    }
-}
 
 pub enum StreamAdmission {
     Admitted(StreamDriver),
@@ -262,9 +198,11 @@ impl StreamDriver {
                 ));
             }
             StreamAction::SendFile(send) => {
+                // The server sends this range after the output buffer drains,
+                // then delivers `Writable` again. A handler with more ranges
+                // (a file bundle is many parts) can queue the next one; one
+                // with nothing left returns `Close`.
                 self.file = Some(send);
-                // A file send is the last thing this response does.
-                self.closing = Some(CloseReason::Completed);
             }
             StreamAction::Close(reason) => {
                 self.closing = Some(reason);
@@ -390,7 +328,7 @@ fn read_file_chunk(send: &mut FileSend, out: &mut Vec<u8>, limit: usize) -> std:
             out.truncate(base);
             Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                "UI asset ended before its advertised length",
+                "file send ended before its advertised length",
             ))
         }
         Ok(read) => {
@@ -405,24 +343,44 @@ fn read_file_chunk(send: &mut FileSend, out: &mut Vec<u8>, limit: usize) -> std:
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    use std::fs::{self, File};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn a_one_shot_response_never_consumes_the_long_lived_cap() {
-        COUNTER.store(0, Ordering::SeqCst);
-        let budget = StreamBudget::for_counter(&COUNTER);
-        let held = budget
-            .acquire(StreamClass::LongLived, 1)
-            .expect("the first long-lived stream fits")
-            .expect("a long-lived stream holds a slot");
-        assert!(budget.acquire(StreamClass::LongLived, 1).is_err());
-        assert!(matches!(budget.acquire(StreamClass::OneShot, 1), Ok(None)));
-        drop(held);
-        assert!(budget.acquire(StreamClass::LongLived, 1).is_ok());
+    fn a_file_chunk_never_grows_past_the_stream_buffer() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "svcd-driver-chunk-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::write(&path, [7u8; 64]).expect("write test file");
+        let mut send = FileSend {
+            file: File::open(&path).expect("open test file"),
+            offset: 0,
+            length: 64,
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            read_file_chunk(&mut send, &mut out, 16).expect("first chunk"),
+            16
+        );
+        assert_eq!(out.len(), 16);
+        assert_eq!(
+            read_file_chunk(&mut send, &mut out, 16).expect("full buffer"),
+            0
+        );
+        assert_eq!(
+            out.len(),
+            16,
+            "a full output buffer stops the read at the high-water mark"
+        );
+        let _ = fs::remove_file(&path);
     }
 }

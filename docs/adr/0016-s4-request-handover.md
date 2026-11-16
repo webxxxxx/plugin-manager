@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted。细化 [ADR-0012](0012-protocol-is-server-plus-face.md)；切片见 #113，server-loop 已由 #114 接管 HTTP listener / 连接，#115 落地 sans-IO stream handler 并让插件 UI 静态资源穿过它，#116 接线阻塞池与首个 `Blocking` 路由，#117 把剩余管理 JSON、login/logout 与控制台页移入 face，后续迁移见 #118–#125。
+Accepted。细化 [ADR-0012](0012-protocol-is-server-plus-face.md)；切片见 #113，server-loop 已由 #114 接管 HTTP listener / 连接，#115 落地 sans-IO stream handler 并让插件 UI 静态资源穿过它，#116 接线阻塞池与首个 `Blocking` 路由，#117 把剩余管理 JSON、login/logout 与控制台页移入 face，#118 让 blob/file 下载穿过 stream handler，后续迁移见 #119–#125。
 
 ## Decision
 
@@ -21,15 +21,16 @@ Accepted。细化 [ADR-0012](0012-protocol-is-server-plus-face.md)；切片见 #
 - **管理面共用阻塞池的背压（#117）。** 除 `/api/v1/version` 和控制台页外，管理路由（含 `compat`、404/405 分支）都是 `Blocking`，与 `svc.*` 共用默认 2 条 worker；两个慢 RPC 会让后续管理请求按同一 503 + `Retry-After: 1` 失败，这是有意的可见背压，不新增线程。`/mcp`、插件 UI rpc 和传输 takeover 仍走 legacy 路径，直到 #118–#123。
 - **请求体策略仍是「带着」而不是「提前用」**：server-loop 在 `pre_request` 里先给插件 UI 路由和 legacy takeover 检查原始 head（上传/安装/导出仍能流式接手），其余请求仍按旧上限收完 body 再交给 face。把其余 face 的 route 决策移到读 body 之前仍待后续切片（#118–#125）。
 - **#115 的第一个 `Streamed` 路由是插件 UI 静态资源**：`PluginUiFace` 在 `pre_request` 里认领 `GET /plugin-ui/{id}/{token}/...`（`rpc` / `events` / `ws` / `raw` 仍走自己的路径），server 解析一次 principal 后把请求交给 face；face 返回 `PluginUiStream`，`server/http/driver.rs` 持有输出缓冲、transfer deadline、`max_streams` 槽与文件发送。HTML 只用 4 KiB 前缀定位 doctype，其余部分与其它资源一样通过 `SendFile` 走内核 `sendfile`（Linux）或 `TransmitFile`（Windows 线程回退的阻塞驱动），所以 server-loop 不读整页、一次页面加载也不为每个资源起线。鉴权失败仍由 server 呈现：浏览器导航得到 303 登录跳转，API 客户端得到 401。
-- **一次性静态资源不占 `max_streams`**：handler 用 `StreamClass::OneShot` 声明这一点；长连接/传输 handler 默认 `LongLived`。`server/http/driver.rs` 的 `StreamBudget` 在 attach 时为 `LongLived` 占一个 `max_streams` 槽（满时 503 + `Retry-After: 1`），`OneShot` 完全不进计数；#118 起的传输 handler 复用同一预算，静态资源保持豁免。
+- **一次性静态资源不占 `max_streams`**：handler 用 `StreamClass::OneShot` 声明这一点；长连接/传输 handler 默认 `LongLived`。`server/http/budget.rs` 的 `StreamBudget` 在 attach 时为 `LongLived` 占一个 `max_streams` 槽（满时 503 + `Retry-After: 1`），`OneShot` 完全不进计数；#118 起由 stream driver 驱动的传输 handler 复用同一预算，仍走 takeover 的 blob 上传保留自己的计数，等 #119 迁移后并入，静态资源保持豁免。
 - **#115 的 Windows 回退仍是每连接一线程**：`server/http/fallback.rs` 在连接线程上驱动同一个 handler，socket 与超时都在 server 层；页面加载不会额外产生 per-asset 线程，但也不承诺 Unix 的四线程目标。
+- **#118 的 blob/file 下载是 sans-IO handler**：`face/blob.rs` 的 `DownloadStream` 保留旧的 Range、ETag、`If-*`、`If-Range`、HEAD 与 404/412/416 线路字节；单文件下载把 body 交给 server 做一次 `SendFile`，逻辑文件（多分片）按分片顺序多次 `SendFile`。为此 `SendFile` 不再是终态：server 发完一个 range 后再次投递 `Writable`，handler 可以请求下一段或 `Close`。下载以 `StreamClass::LongLived` 占 `max_streams`；预算移到 `server/http/budget.rs`，Unix driver 与 Windows fallback 共用；仍走 takeover 的 blob 上传在 #119 前保留自己的计数器。Unix 不再为下载克隆 socket 或起 `svcd-blob-http` 线程；Windows 回退在同一连接线程上驱动 handler。
 
 ## Consequences
 
 - face 的测试不再需要 socket：内存 `Request` + `CompletionSlot` 就能断言响应、恰好一次、缺失完成和二次完成。
 - 服务器可以替换（Unix poll reactor、Windows 线程回退、将来的 IOCP），face 与端点测试不变。
 - `StreamHandler` 出现后，ADR-0012 原来说的「交出连接」只表示「交出一个 sans-IO 状态机」，不再表示连接所有权转移；连接始终归服务器。
-- 迁移期会有两条路径并存；legacy bridge 是临时的，#125 删除。HTTP 队列有界（64），阻塞池队列也有界（64），满时 503；池关闭时排队任务以 `Dropped` 回报（server loop 若还在运行会回 503），运行中的任务让它跑完并把结果写入已封的槽后丢弃。WS 任务由连接数与流内限额约束。插件 UI takeover 已在 #115 删除；export/import/install/blob 四个 takeover 仍是迁移期每请求一线程（既有行为，随 #118–#122 删除），不计入这里的队列；连接在 handover 期间移出 loop 的表，`max_connections` 对这段窗口不再生效。这是 #114 之前就有的迁移缺口，不在本切片改变语义。
+- 迁移期会有两条路径并存；legacy bridge 是临时的，#125 删除。HTTP 队列有界（64），阻塞池队列也有界（64），满时 503；池关闭时排队任务以 `Dropped` 回报（server loop 若还在运行会回 503），运行中的任务让它跑完并把结果写入已封的槽后丢弃。WS 任务由连接数与流内限额约束。插件 UI takeover 已在 #115 删除；blob 下载 takeover 已在 #118 删除（blob 上传仍留到 #119）；export/import/install 三个 takeover 与 blob 上传仍是迁移期每请求一线程（既有行为，随 #119–#122 删除），不计入这里的队列；连接在 handover 期间移出 loop 的表，`max_connections` 对这段窗口不再生效。这是 #114 之前就有的迁移缺口，不在本切片改变语义。
 - 本 spec 的最终线程目标（#126 合并插件 stdio 反应器后：「两条循环 + 两条阻塞线程，默认 4 条」）是 Unix 的默认拓扑。Windows 本轮保留每连接一条线程的回退：它执行 `max_connections` / `max_connections_per_ip` / `http_idle_timeout_secs`，线程上限由 `max_connections` 约束，但不承诺 4 条线程；IOCP 留给 S3/S6。
 - 完成槽封住后迟到的完成只能记日志，不能写回一个已经结束的请求；这消除 use-after-response 的竞态。
 - `Blocking` 任务在派发前检查 cancellation token；`svc.list` 的 control-channel 往返本身没有可中断 deadline，连接断开后结果会被丢弃，但一个卡死的 daemon 仍会占住一个 worker。给 job 加自身 deadline 留在后续切片；阻塞池的队列上限保证不会因此无限增长。
