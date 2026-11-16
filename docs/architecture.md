@@ -141,6 +141,8 @@ stateDiagram-v2
 
 完整决定见 [ADR-0013](adr/0013-service-contract-interface.md)；复合服务的 v1 边界（root 定义、0 或 1 个能力、单机执行、加载期校验）见 [ADR-0014](adr/0014-composite-service-v1-boundary.md)。
 
+槽是所有 `exec` 服务的默认载体：`exec` 存在即由监督槽唯一拥有，调用点在每次 `tools/call` 构造 `SlotWire`。`ImplRef` 只用于 daemon 不拥有的载体（内置 `svc`；未来的复合/远程）；因此没有 `tag=process` —— process 不是第二种载体，只是槽里的一个进程。
+
 ### 4.2 一次 `tools/call` 的路径
 
 ```mermaid

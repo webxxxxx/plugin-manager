@@ -2375,12 +2375,20 @@ mod tests {
                 &script,
                 r#"#!/bin/sh
 while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -n1 | cut -d: -f2)
   case "$line" in
-    *svcd.ping*) printf '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n' ;;
-    *'"name":"echo"'*) printf '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}\n' ;;
-    *'"name":"fail"'*) printf '{"jsonrpc":"2.0","id":3,"error":{"code":-32000,"message":"boom"}}\n' ;;
+    *svcd.ping*) printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id" ;;
+    *'"name":"echo"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}\n' "$id" ;;
+    *'"name":"fail"'*) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"boom"}}\n' "$id" ;;
     *'"name":"hang"'*) ;;
     *'"name":"crash"'*) exit 0 ;;
+    *'"name":"progress"'*)
+      token=$(printf '%s' "$line" | sed -n 's/.*"progressToken":"\([^"]*\)".*/\1/p')
+      if [ -n "$token" ]; then
+        printf '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1,"progressToken":"%s"}}\n' "$token"
+      fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"done"}],"isError":false}}\n' "$id"
+      ;;
   esac
 done
 "#,
@@ -2417,6 +2425,13 @@ while ($null -ne ($line = $reader.ReadLine())) {
       $out = '{"jsonrpc":"2.0","id":' + $msg.id + ',"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}'
     } elseif ($name -eq 'fail') {
       $out = '{"jsonrpc":"2.0","id":' + $msg.id + ',"error":{"code":-32000,"message":"boom"}}'
+    } elseif ($name -eq 'progress') {
+      $token = $msg.params._meta.progressToken
+      if ($null -ne $token) {
+        [Console]::Out.WriteLine('{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1,"progressToken":"' + $token + '"}}')
+        [Console]::Out.Flush()
+      }
+      $out = '{"jsonrpc":"2.0","id":' + $msg.id + ',"result":{"content":[{"type":"text","text":"done"}],"isError":false}}'
     } else {
       continue
     }
@@ -2492,11 +2507,29 @@ while ($null -ne ($line = $reader.ReadLine())) {
         receiver
     }
 
+    fn next_line(daemon: &mut Daemon, receiver: &Receiver<String>) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(line) = receiver.try_recv() {
+                return serde_json::from_str(&line).expect("line json");
+            }
+            daemon.pump();
+            assert!(Instant::now() < deadline, "no line");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn wait(daemon: &mut Daemon, receiver: &Receiver<String>) -> rpc::Response {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Ok(line) = receiver.try_recv() {
-                return serde_json::from_str(&line).expect("response json");
+                let value: Value = serde_json::from_str(&line).expect("response json");
+                // Progress notifications share the caller's channel; skip
+                // them until the final JSON-RPC response arrives.
+                if value.get("method").is_some() {
+                    continue;
+                }
+                return serde_json::from_value(value).expect("response");
             }
             daemon.pump();
             assert!(Instant::now() < deadline, "no response");
@@ -2586,6 +2619,57 @@ while ($null -ne ($line = $reader.ReadLine())) {
         assert_eq!(
             response.result.expect("echo result")["content"][0]["text"],
             "pong"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_process_service_forwards_progress_and_reaps_its_child_on_stop() {
+        let nanos = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("svcd-tools-unit-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir_all(root.join("logs")).expect("logs");
+        std::env::set_var("SVCD_LOG_DIR", root.join("logs"));
+
+        let process = tool_service("proc", Kind::Core, &["progress"], &root);
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(registry(vec![process]), "token".into(), receiver, None);
+        daemon.start_service("proc").expect("start");
+        assert!(daemon.is_live("proc"));
+        assert!(
+            daemon.slots["proc"].machine.pid.is_some(),
+            "the process must be owned by its slot"
+        );
+
+        let call = send(
+            &mut daemon,
+            "tools/call",
+            json!({
+                "name": "proc.progress",
+                "arguments": {},
+                "progressToken": "t1"
+            }),
+        );
+        let notification = next_line(&mut daemon, &call);
+        assert_eq!(notification["method"], "notifications/progress");
+        assert_eq!(notification["params"]["progressToken"], "t1");
+        assert_eq!(notification["params"]["progress"], 1);
+
+        let response = wait(&mut daemon, &call);
+        assert_eq!(
+            response.result.expect("progress result")["content"][0]["text"],
+            "done"
+        );
+
+        daemon.stop_service("proc").expect("stop");
+        assert_eq!(daemon.slots["proc"].machine.state, State::Stopped);
+        assert!(
+            daemon.slots["proc"].machine.pid.is_none(),
+            "the slot must reap the process on stop"
         );
 
         let _ = std::fs::remove_dir_all(&root);
