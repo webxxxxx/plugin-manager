@@ -643,9 +643,7 @@ mod tests {
         stream.pending_id = Some(json!(7));
         let mut out = Vec::new();
         stream.on_event(
-            StreamEvent::BlockingDone(BlockingOutcome::Failed(
-                "the blocking queue is full".into(),
-            )),
+            StreamEvent::BlockingDone(BlockingOutcome::Failed("the blocking queue is full".into())),
             &mut OutBuffer::new(&mut out, 4096),
         );
         let (_, frames) = server_frames(&out);
@@ -666,8 +664,7 @@ mod tests {
     fn coalesced_calls_are_all_parsed_with_the_first_submitted() {
         let (_bus, mut stream) = harness();
         let _ = drive(&mut stream, 4096);
-        let first =
-            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"status"}}"#;
+        let first = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"status"}}"#;
         let second =
             br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"status"}}"#;
         let mut both = client_frame(0x1, first);

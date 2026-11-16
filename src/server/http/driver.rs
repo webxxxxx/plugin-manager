@@ -626,9 +626,11 @@ mod tests {
     impl StreamHandler for JobHandler {
         fn on_event(&mut self, event: StreamEvent<'_>, out: &mut OutBuffer<'_>) -> StreamStep {
             match event {
-                StreamEvent::Data(_) => StreamStep::wait(StreamAction::SubmitBlocking(Box::new(
-                    || BlockingOutcome::Ok(b"done".to_vec()),
-                ))),
+                StreamEvent::Data(_) => {
+                    StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|| {
+                        BlockingOutcome::Ok(b"done".to_vec())
+                    })))
+                }
                 StreamEvent::BlockingDone(BlockingOutcome::Ok(bytes)) => {
                     out.write(&bytes);
                     StreamStep::wait(StreamAction::Close(CloseReason::Completed))
@@ -665,8 +667,14 @@ mod tests {
             &mut out_at
         ));
         assert_eq!(out, b"done");
-        assert!(driver.closing.is_some(), "the handler closed after the result");
-        assert!(driver.wants_read(), "the completed job releases the read gate");
+        assert!(
+            driver.closing.is_some(),
+            "the handler closed after the result"
+        );
+        assert!(
+            driver.wants_read(),
+            "the completed job releases the read gate"
+        );
     }
 
     fn job_result(job: BlockingJob) -> Vec<u8> {
@@ -682,11 +690,7 @@ mod tests {
             calls: u8,
         }
         impl StreamHandler for TwoJobs {
-            fn on_event(
-                &mut self,
-                event: StreamEvent<'_>,
-                out: &mut OutBuffer<'_>,
-            ) -> StreamStep {
+            fn on_event(&mut self, event: StreamEvent<'_>, out: &mut OutBuffer<'_>) -> StreamStep {
                 match event {
                     StreamEvent::Data(_) => {
                         StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|| {
@@ -720,7 +724,11 @@ mod tests {
         let mut out_at = 0;
         driver.on_data(b"x", &mut out, &mut out_at);
         let first = driver.take_job().expect("first job");
-        driver.on_blocking_done(BlockingOutcome::Ok(job_result(first)), &mut out, &mut out_at);
+        driver.on_blocking_done(
+            BlockingOutcome::Ok(job_result(first)),
+            &mut out,
+            &mut out_at,
+        );
         let second = driver
             .take_job()
             .expect("a WebSocket may queue the next call after a response");

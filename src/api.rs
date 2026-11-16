@@ -194,7 +194,10 @@ enum WorkResult {
     Http(JobResult),
     /// One blocking-pool job ended; the server loop takes its completion slot
     /// by connection id, or drops it when the connection is gone.
-    BlockingDone { key: u64, outcome: JobOutcome },
+    BlockingDone {
+        key: u64,
+        outcome: JobOutcome,
+    },
     /// A stream handler's blocking job produced a value. The handler receives
     /// it before the pool's own completion frees the key.
     StreamJobDone {
@@ -485,10 +488,7 @@ fn listener_loop(listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config: Pa
 /// fallback owns the socket and the shared max_streams slot; a Busy result is
 /// rendered before any handler bytes are written.
 #[cfg(not(unix))]
-fn drive_fallback(
-    stream: &mut TcpStream,
-    handler: Box<dyn crate::server::http::StreamHandler>,
-) {
+fn drive_fallback(stream: &mut TcpStream, handler: Box<dyn crate::server::http::StreamHandler>) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_write_timeout(Some(crate::limits::current().transfer_timeout));
     if crate::server::http::fallback::drive(stream, handler).is_err() {
