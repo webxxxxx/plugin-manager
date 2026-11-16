@@ -256,12 +256,6 @@ pub fn write_tar_padding<W: Write>(out: &mut W, size: u64) -> Result<(), String>
     Ok(())
 }
 
-pub fn tar_entry_size(size: u64) -> u64 {
-    512u64
-        .saturating_add(size)
-        .saturating_add(padding(size as usize) as u64)
-}
-
 pub(crate) fn read_export_signature(version_dir: &Path) -> Result<Vec<u8>, String> {
     match fs::read(version_dir.join("signature.json")) {
         Ok(signature) => Ok(signature),
@@ -271,33 +265,6 @@ pub(crate) fn read_export_signature(version_dir: &Path) -> Result<Vec<u8>, Strin
         ),
         Err(error) => Err(format!("read signature: {}", error)),
     }
-}
-
-/// Exact size of the `.spk` stream produced by [`write_installed_spk`].
-pub fn installed_spk_size(version_dir: &Path) -> Result<u64, String> {
-    let manifest_bytes = fs::read(version_dir.join("manifest.json"))
-        .map_err(|error| format!("read manifest: {}", error))?;
-    let manifest = parse_manifest(&manifest_bytes)?;
-    let signature = read_export_signature(version_dir)?;
-    let mut total = 512u64
-        .saturating_add(manifest_bytes.len() as u64)
-        .saturating_add(padding(manifest_bytes.len()) as u64);
-    total = total
-        .saturating_add(512)
-        .saturating_add(signature.len() as u64)
-        .saturating_add(padding(signature.len()) as u64);
-    for file in &manifest.files {
-        let metadata = fs::metadata(version_dir.join(&file.path))
-            .map_err(|error| format!("stat {}: {}", file.path, error))?;
-        if metadata.len() != file.size {
-            return Err(format!("installed file is corrupt: {}", file.path));
-        }
-        total = total
-            .saturating_add(512)
-            .saturating_add(file.size)
-            .saturating_add(padding(file.size as usize) as u64);
-    }
-    Ok(total.saturating_add(1024))
 }
 
 /// Stream the installed `.spk` without holding payload files in memory.
@@ -346,38 +313,9 @@ pub fn write_installed_spk<W: Write>(version_dir: &Path, out: &mut W) -> Result<
 /// exporting it as a signed package is impossible, so that case is reported
 /// explicitly.
 pub fn installed_spk(version_dir: &Path) -> Result<Vec<u8>, String> {
-    let manifest_bytes = fs::read(version_dir.join("manifest.json"))
-        .map_err(|error| format!("read manifest: {}", error))?;
-    let manifest = parse_manifest(&manifest_bytes)?;
-    let signature = match fs::read(version_dir.join("signature.json")) {
-        Ok(signature) => signature,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(
-                "installed package has no signature (installed insecurely); reinstall a signed package to export it"
-                    .into(),
-            )
-        }
-        Err(error) => return Err(format!("read signature: {}", error)),
-    };
-    let mut files = manifest.files.clone();
-    files.sort_by(|left, right| left.path.cmp(&right.path));
-    let mut owned: Vec<(String, Vec<u8>, u32)> = Vec::new();
-    for file in files {
-        let data = fs::read(version_dir.join(&file.path))
-            .map_err(|error| format!("read {}: {}", file.path, error))?;
-        if data.len() as u64 != file.size || hex_sha256(&data) != file.sha256 {
-            return Err(format!("installed file is corrupt: {}", file.path));
-        }
-        owned.push((file.path, data, file.mode & 0o777));
-    }
-    let mut entries: Vec<(&str, &[u8], u32)> = vec![
-        ("manifest.json", &manifest_bytes, 0o644),
-        ("signature.json", &signature, 0o644),
-    ];
-    for (path, data, mode) in &owned {
-        entries.push((path.as_str(), data.as_slice(), *mode));
-    }
-    write_tar(&entries)
+    let mut bytes = Vec::new();
+    write_installed_spk(version_dir, &mut bytes)?;
+    Ok(bytes)
 }
 
 #[derive(Debug)]
