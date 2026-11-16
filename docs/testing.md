@@ -126,7 +126,7 @@ node tools/perf/run.mjs --scale
 
 线程预算回归（Linux 补充）：`cargo test --test http unix_idle_thread_count_has_no_per_request_or_per_stream_threads -- --exact`。它读 `/proc/<pid>/status` 的 `Threads:`，断言默认 S4 布局的空载基线为 10 条 daemon 线程；16 个 keep-alive 连接与 8 个 SSE 流不得各增加一条线程。改变拓扑的切片（如 #125）要同步更新 `IDLE_DAEMON_THREADS`。
 
-legacy bridge 的队列有界由 `cargo test --bin svcd the_legacy_bridge_queue_is_bounded` 覆盖：上限 64，满时拒绝而不是增长。
+legacy bridge 的 HTTP 队列有界由 `cargo test --bin svcd the_legacy_bridge_queue_is_bounded` 覆盖：上限 64，满时拒绝而不是增长；`api::legacy::tests::a_full_bridge_answers_503_with_retry_after` 覆盖满队列的 503 + `Retry-After: 1` 响应。WS 任务不占这 64 槽，由连接数与 `ws_inflight_requests` / `ws_inflight_bytes` 约束。
 
 ## 7. CI 落点
 

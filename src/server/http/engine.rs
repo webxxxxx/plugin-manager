@@ -20,9 +20,6 @@ use crate::http;
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 
-#[cfg(unix)]
-use libc;
-
 /// The busy response for a connection refused by the loop. Both engines send
 /// the same bytes so a client sees one status on every host.
 pub const BUSY_CONNECTION_RESPONSE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\
@@ -73,7 +70,6 @@ pub struct Connection<S> {
 }
 
 #[cfg(unix)]
-#[cfg(unix)]
 impl<S> Connection<S> {
     /// Flush the connection's output buffer. Returns false when the peer is
     /// gone. Responses and stream frames both use this one write path.
@@ -115,15 +111,17 @@ pub enum PreRequest {
 }
 
 /// The temporary legacy bridge. It owns the endpoint state machine and the
-/// bounded worker queue; the loop owns the connection and the buffers.
+/// bounded worker queue; the loop owns the connection and the buffers. The
+/// trait disappears with the bridge in #125, so it is not a product seam.
 #[cfg(unix)]
-pub trait Handler {
+pub trait LegacyBridge {
     type State;
 
     fn new_state(&mut self, id: u64, peer: IpAddr) -> Self::State;
     fn on_accept(&mut self, connection: &mut Connection<Self::State>);
     /// True when the state machine is waiting for an HTTP request head/body.
     fn reads_request(&self, connection: &Connection<Self::State>) -> bool;
+    fn body_limit(&self, path: &str) -> u64;
     fn pre_request(&mut self, connection: &mut Connection<Self::State>) -> PreRequest;
     fn on_request(&mut self, connection: &mut Connection<Self::State>, request: HttpRequest);
     fn on_error(&mut self, connection: &mut Connection<Self::State>, response: Vec<u8>);
@@ -133,6 +131,12 @@ pub trait Handler {
     fn interest(&self, connection: &Connection<Self::State>) -> i16;
     fn is_idle(&self, connection: &Connection<Self::State>, now: Instant, idle: Duration) -> bool;
     fn on_close(&mut self, connection: &mut Connection<Self::State>);
+
+    /// The loop is about to drop a connection after `POLLERR` / `POLLHUP`.
+    /// Legacy handlers use this for protocol-specific diagnostics.
+    fn on_poll_error(&mut self, connection: &mut Connection<Self::State>, _revents: i16) {
+        let _ = connection;
+    }
 
     /// The legacy worker wakes the loop through this fd; the loop only uses it
     /// to leave poll early, the handler drains it in `on_tick`.
@@ -144,7 +148,7 @@ pub trait Handler {
 #[cfg(unix)]
 pub fn run<S, H>(listener: TcpListener, handler: &mut H, limits: &crate::limits::Limits)
 where
-    H: Handler<State = S>,
+    H: LegacyBridge<State = S>,
 {
     let _ = listener.set_nonblocking(true);
     let mut connections: Table<S> = HashMap::new();
@@ -173,13 +177,10 @@ where
             revents: 0,
         });
         keys.push(0);
+        let wake = handler.wake_fd();
         descriptors.push(libc::pollfd {
-            fd: handler.wake_fd().unwrap_or(-1),
-            events: if handler.wake_fd().is_some() {
-                libc::POLLIN
-            } else {
-                0
-            },
+            fd: wake.unwrap_or(-1),
+            events: if wake.is_some() { libc::POLLIN } else { 0 },
             revents: 0,
         });
         keys.push(1);
@@ -262,6 +263,7 @@ where
             let revents = descriptors[index].revents;
             if revents & (libc::POLLERR | libc::POLLHUP) != 0 {
                 if let Some(mut connection) = connections.remove(&id) {
+                    handler.on_poll_error(&mut connection, revents);
                     handler.on_close(&mut connection);
                 }
                 continue;
@@ -280,19 +282,19 @@ where
                             connection.last_active = Instant::now();
                             connection.buffer.extend_from_slice(&chunk[..read]);
                             match handler.pre_request(connection) {
-                                PreRequest::Continue => loop {
-                                    match advance_request(connection) {
-                                        Ok(None) => break,
+                                PreRequest::Continue => {
+                                    match advance_request(connection, |path| {
+                                        handler.body_limit(path)
+                                    }) {
+                                        Ok(None) => {}
                                         Ok(Some(request)) => {
                                             handler.on_request(connection, request);
-                                            break;
                                         }
                                         Err(response) => {
                                             handler.on_error(connection, response);
-                                            break;
                                         }
                                     }
-                                },
+                                }
                                 PreRequest::Close => {
                                     if let Some(mut connection) = connections.remove(&id) {
                                         handler.on_close(&mut connection);
@@ -337,26 +339,11 @@ fn reject_connection(mut stream: TcpStream) {
     let _ = std::io::Write::write_all(&mut stream, BUSY_CONNECTION_RESPONSE);
 }
 
-/// Buffered-body limit for the routes that still go through the ordinary
-/// router. Blob uploads/downloads are streamed before this is consulted.
-pub fn body_limit(path: &str) -> u64 {
-    let limits = crate::limits::current();
-    let path = path.split_once('?').map(|(path, _)| path).unwrap_or(path);
-    if path.starts_with("/api/v1/plugins") || path.starts_with("/api/v1/import") {
-        limits.max_body
-    } else if path.trim_end_matches('/').ends_with("/complete")
-        && (path.starts_with("/api/v1/blobs/uploads/")
-            || path.starts_with("/api/v1/file/uploads/")
-            || path.starts_with("/api/v1/files/uploads/"))
-    {
-        limits.max_complete_body
-    } else {
-        limits.max_json_body
-    }
-}
-
 #[cfg(unix)]
-pub fn advance_request<S>(connection: &mut Connection<S>) -> Result<Option<HttpRequest>, Vec<u8>> {
+pub fn advance_request<S>(
+    connection: &mut Connection<S>,
+    body_limit: impl Fn(&str) -> u64,
+) -> Result<Option<HttpRequest>, Vec<u8>> {
     if connection.pending.is_none() {
         let Some(header_end) = http::header_end(&connection.buffer) else {
             if connection.buffer.len() > crate::limits::current().max_header {

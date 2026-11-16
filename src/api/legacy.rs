@@ -7,13 +7,16 @@
 
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use crate::server::http::engine::{self, Handler, HttpRequest, PreRequest, Table};
+use crate::server::http::engine::{self, HttpRequest, LegacyBridge, PreRequest, Table};
 
+// Temporary bridge: this module is the only consumer of these legacy `api`
+// helpers and disappears with them in #125. Keeping `super::*` here makes the
+// ownership move mechanical; add explicit imports only if this module survives.
 use super::*;
 
 /// Maximum legacy jobs waiting for the four HTTP workers. A full queue is a
 /// visible 503, not an unbounded allocation.
-const LEGACY_QUEUE_LIMIT: usize = 64;
+pub(super) const LEGACY_QUEUE_LIMIT: usize = 64;
 
 pub(crate) fn start(
     listener: TcpListener,
@@ -78,7 +81,7 @@ struct ServerHandler {
     notify: UnixStream,
 }
 
-impl Handler for ServerHandler {
+impl LegacyBridge for ServerHandler {
     type State = ConnState;
 
     fn new_state(&mut self, _id: u64, _peer: IpAddr) -> ConnState {
@@ -86,6 +89,10 @@ impl Handler for ServerHandler {
     }
 
     fn on_accept(&mut self, _connection: &mut Connection) {}
+
+    fn body_limit(&self, path: &str) -> u64 {
+        super::body_limit(path)
+    }
 
     fn reads_request(&self, connection: &Connection) -> bool {
         matches!(connection.state, ConnState::Reading)
@@ -170,10 +177,7 @@ impl Handler for ServerHandler {
     fn on_request(&mut self, connection: &mut Connection, request: HttpRequest) {
         let keep_alive = wants_keep_alive(&request);
         if let Some(response) = serve_face(&request, connection.peer, &self.lan, keep_alive) {
-            connection.out = response;
-            connection.out_at = 0;
-            connection.keep_alive = keep_alive;
-            connection.state = ConnState::Writing;
+            write_response(connection, response, keep_alive);
             return;
         }
         let path = request
@@ -200,23 +204,21 @@ impl Handler for ServerHandler {
                     if let Some(client) = &self.client {
                         start_mcp_sse(connection, call, self.config.clone(), client);
                     } else {
-                        connection.out = http::json_error(
-                            500,
-                            "stream_unavailable",
-                            "management client reactor is unavailable",
+                        write_response(
+                            connection,
+                            http::json_error(
+                                500,
+                                "stream_unavailable",
+                                "management client reactor is unavailable",
+                            ),
+                            false,
                         );
-                        connection.out_at = 0;
-                        connection.keep_alive = false;
-                        connection.state = ConnState::Writing;
                     }
                     return;
                 }
                 Ok(None) => {}
                 Err(response) => {
-                    connection.out = response;
-                    connection.out_at = 0;
-                    connection.keep_alive = false;
-                    connection.state = ConnState::Writing;
+                    write_response(connection, response, false);
                     return;
                 }
             }
@@ -228,10 +230,7 @@ impl Handler for ServerHandler {
                         start_sse(connection, receiver, subscription, replay);
                     }
                     Err(response) => {
-                        connection.out = response;
-                        connection.out_at = 0;
-                        connection.keep_alive = false;
-                        connection.state = ConnState::Writing;
+                        write_response(connection, response, false);
                     }
                 }
                 return;
@@ -242,10 +241,7 @@ impl Handler for ServerHandler {
                         start_raw_ws(connection, accept, subscription);
                     }
                     Err(response) => {
-                        connection.out = response;
-                        connection.out_at = 0;
-                        connection.keep_alive = false;
-                        connection.state = ConnState::Writing;
+                        write_response(connection, response, false);
                     }
                 }
                 return;
@@ -255,10 +251,7 @@ impl Handler for ServerHandler {
                     start_ws(connection, plugin, accept, receiver, subscription);
                 }
                 Err(response) => {
-                    connection.out = response;
-                    connection.out_at = 0;
-                    connection.keep_alive = false;
-                    connection.state = ConnState::Writing;
+                    write_response(connection, response, false);
                 }
             }
             return;
@@ -269,20 +262,14 @@ impl Handler for ServerHandler {
             keep_alive,
         });
         if self.queue.try_push(job).is_err() {
-            connection.out = bridge_busy();
-            connection.out_at = 0;
-            connection.keep_alive = false;
-            connection.state = ConnState::Writing;
+            write_response(connection, bridge_busy(), false);
         } else {
             connection.state = ConnState::Processing;
         }
     }
 
     fn on_error(&mut self, connection: &mut Connection, response: Vec<u8>) {
-        connection.out = response;
-        connection.out_at = 0;
-        connection.keep_alive = false;
-        connection.state = ConnState::Writing;
+        write_response(connection, response, false);
     }
 
     fn on_readable(&mut self, connection: &mut Connection) -> bool {
@@ -361,10 +348,7 @@ impl Handler for ServerHandler {
             match result {
                 WorkResult::Http(result) => {
                     if let Some(connection) = connections.get_mut(&result.connection) {
-                        connection.out = result.response;
-                        connection.out_at = 0;
-                        connection.keep_alive = result.keep_alive;
-                        connection.state = ConnState::Writing;
+                        write_response(connection, result.response, result.keep_alive);
                     }
                 }
                 WorkResult::Ws(result) => {
@@ -377,20 +361,11 @@ impl Handler for ServerHandler {
                                     state.pending = true;
                                     state.queued_bytes =
                                         state.queued_bytes.saturating_sub(payload.len());
-                                    let job = Work::Ws(WsJob {
+                                    self.queue.push(Work::Ws(WsJob {
                                         connection: result.connection,
                                         plugin: state.plugin.clone(),
                                         payload,
-                                    });
-                                    if self.queue.try_push(job).is_err() {
-                                        push_ws_frame(
-                                            &mut connection.out,
-                                            0x8,
-                                            &close_payload(1013, "busy"),
-                                        );
-                                        connection.keep_alive = false;
-                                        connection.state = ConnState::Writing;
-                                    }
+                                    }));
                                 }
                             }
                         }
@@ -487,23 +462,47 @@ impl Handler for ServerHandler {
         release_mcp_stream(connection, self.client.as_deref());
     }
 
+    fn on_poll_error(&mut self, connection: &mut Connection, revents: i16) {
+        if let ConnState::RawWs(state) = &connection.state {
+            raw_ws_log(state, &format!("poll flags {:#x}", revents));
+        }
+    }
+
     fn wake_fd(&self) -> Option<RawFd> {
         Some(self.notify.as_raw_fd())
     }
 }
 
+fn write_response(connection: &mut Connection, response: Vec<u8>, keep_alive: bool) {
+    connection.out = response;
+    connection.out_at = 0;
+    connection.keep_alive = keep_alive;
+    connection.state = ConnState::Writing;
+}
+
 fn bridge_busy() -> Vec<u8> {
-    let body = serde_json::to_vec(&json!({
-        "error": {
-            "code": "busy",
-            "message": "legacy request queue is full",
-        }
-    }))
-    .unwrap_or_default();
+    const BODY: &[u8] = br#"{"error":{"code":"busy","message":"legacy request queue is full"}}"#;
     http::response_with_headers(
         503,
         "application/json",
         &[("Retry-After".to_string(), "1".to_string())],
-        &body,
+        BODY,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_bridge_answers_503_with_retry_after() {
+        let response = bridge_busy();
+        let text = String::from_utf8_lossy(&response);
+        assert!(
+            text.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "{text}"
+        );
+        assert!(text.contains("Retry-After: 1"), "{text}");
+        assert!(text.contains("legacy request queue is full"), "{text}");
+    }
 }

@@ -289,7 +289,7 @@ src/
 | **S1** | **服务契约** | 内核 ↔ 四种运行实现 | 1 个显式 adapter（内置）+ 槽（exec）→ 未来 4 | **接口已定**（ADR-0013/0015）；待从 `slot`/`package`/`registry` 抽出 |
 | S2 | 调用传输 | 内核 ↔ 载体 | 1（本机 stdio） | 暂不开，但信封必须先定 |
 | S3 | 线格式实现 | 线格式 ↔ 平台 | 2（unix poll / windows 线程） | 未开，`cfg(unix)` 散在业务文件里 |
-| S4 | 请求交接 | 服务器 ↔ 对外面 | 6+（两种结果：内存响应 / sans-IO stream handler） | **接口已定**（ADR-0016；#113 契约）；**server-loop 已接管 Unix listener / 连接 / pending 表（#114）**，legacy bridge 有界（64）；其余端点迁移中 |
+| S4 | 请求交接 | 服务器 ↔ 对外面 | 6+（两种结果：内存响应 / sans-IO stream handler） | **接口已定**（ADR-0016；#113 契约）；**server-loop 已接管 Unix listener / 连接 / pending 表（#114）**，legacy bridge 的 HTTP 队列有界（64）；其余端点迁移中 |
 | S5 | 失败投影 | 领域 ↔ 对外面 | 3（HTTP / CLI / MCP） | 未开，靠字符串匹配 |
 | S6 | 进程与管道 | 监督 ↔ 平台 | 2（unix / windows job） | 未开 |
 | S7 | 配置来源 | 所有模块 ↔ 配置 | 1 生产 + 测试 | 未开，全局 OnceLock |

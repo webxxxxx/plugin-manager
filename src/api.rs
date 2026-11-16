@@ -54,6 +54,24 @@ use crate::webui;
 
 const UI: &str = include_str!("web/index.html");
 
+/// Buffered-body limit for the routes that still go through the ordinary
+/// router. Blob uploads/downloads are streamed before this is consulted.
+fn body_limit(path: &str) -> u64 {
+    let limits = crate::limits::current();
+    let path = path.split_once('?').map(|(path, _)| path).unwrap_or(path);
+    if path.starts_with("/api/v1/plugins") || path.starts_with("/api/v1/import") {
+        limits.max_body
+    } else if path.trim_end_matches('/').ends_with("/complete")
+        && (path.starts_with("/api/v1/blobs/uploads/")
+            || path.starts_with("/api/v1/file/uploads/")
+            || path.starts_with("/api/v1/files/uploads/"))
+    {
+        limits.max_complete_body
+    } else {
+        limits.max_json_body
+    }
+}
+
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// Serialise config writes inside this process. The on-disk `config.lock`
@@ -270,6 +288,16 @@ impl JobQueue {
         queue.push_back(work);
         self.ready.notify_one();
         Ok(())
+    }
+
+    /// WebSocket jobs are bounded by the connection cap and the per-stream
+    /// `ws_inflight_requests` / `ws_inflight_bytes` limits, so they do not
+    /// consume the HTTP bridge's 64-slot budget.
+    fn push(&self, work: Work) {
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.push_back(work);
+            self.ready.notify_one();
+        }
     }
 
     fn pop(&self) -> Work {
@@ -1273,16 +1301,11 @@ fn queue_ws_payload(connection: &mut Connection, id: u64, queue: &Arc<JobQueue>,
         return;
     }
     state.pending = true;
-    let job = Work::Ws(WsJob {
+    queue.push(Work::Ws(WsJob {
         connection: id,
         plugin: state.plugin.clone(),
         payload: payload.to_vec(),
-    });
-    if queue.try_push(job).is_err() {
-        state.pending = false;
-        push_ws_frame(&mut connection.out, 0x8, &close_payload(1013, "busy"));
-        state.close_after = Some((1013, "busy".into()));
-    }
+    }));
 }
 
 #[cfg(unix)]
@@ -2444,7 +2467,7 @@ fn read_body(
 ) -> Result<HttpRequest, Vec<u8>> {
     let framing =
         http::framing(&head.headers).map_err(|message| error(400, "bad_request", &message))?;
-    let limit = engine::body_limit(&head.path);
+    let limit = body_limit(&head.path);
     if let http::Framing::Length(length) = framing {
         if length > limit {
             return Err(error(413, "payload_too_large", "request body is too large"));
@@ -3153,10 +3176,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_legacy_bridge_queue_is_bounded() {
+        assert_eq!(legacy::LEGACY_QUEUE_LIMIT, 64);
         let queue = JobQueue {
             queue: Mutex::new(VecDeque::new()),
             ready: Condvar::new(),
-            limit: 2,
+            limit: legacy::LEGACY_QUEUE_LIMIT,
         };
         let job = || {
             Work::Ws(WsJob {
@@ -3165,15 +3189,16 @@ mod tests {
                 payload: Vec::new(),
             })
         };
-        assert!(queue.try_push(job()).is_ok());
-        assert!(queue.try_push(job()).is_ok());
+        for _ in 0..legacy::LEGACY_QUEUE_LIMIT {
+            assert!(queue.try_push(job()).is_ok());
+        }
         assert!(
             queue.try_push(job()).is_err(),
             "a full bridge rejects the job instead of growing the queue"
         );
         assert_eq!(
             queue.queue.lock().expect("queue").len(),
-            2,
+            legacy::LEGACY_QUEUE_LIMIT,
             "the rejected job must not be queued"
         );
     }
