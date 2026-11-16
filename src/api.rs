@@ -2292,7 +2292,7 @@ fn same_origin(request: &HttpRequest) -> bool {
 
 
 pub(crate) fn is_write(method: &str) -> bool {
-    matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
+    http::is_write_method(method)
 }
 
 fn csrf_ok(request: &HttpRequest) -> bool {
@@ -2300,10 +2300,7 @@ fn csrf_ok(request: &HttpRequest) -> bool {
 }
 
 pub(crate) fn csrf_ok_headers(headers: &[(String, String)]) -> bool {
-    let host = http::header(headers, "host").unwrap_or("");
-    let origin = http::header(headers, "origin").unwrap_or("");
-    let csrf = http::header(headers, "x-svcd-csrf").unwrap_or("");
-    !host.is_empty() && origin == format!("http://{}", host) && csrf == "1"
+    http::csrf_ok(headers)
 }
 
 /// Why no complete request head arrived. A timeout or EOF is a closed
