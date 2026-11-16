@@ -6,6 +6,7 @@
 //! A browser loading one page therefore costs one connection, not one thread
 //! per asset, and a one-shot asset never consumes `max_streams`.
 
+use crate::face::plugin_streams::{self, StreamContext};
 use crate::http;
 use crate::lan::Lan;
 use crate::package;
@@ -17,6 +18,7 @@ use crate::server::http::{
 use crate::webui;
 use std::fs;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// One parsed `/plugin-ui/{id}/{token}/...` path.
@@ -62,26 +64,45 @@ fn path_only(path: &str) -> &str {
     path.split_once('?').map(|(path, _)| path).unwrap_or(path)
 }
 
-/// The face for a plugin's static UI assets.
+/// SSE and WebSocket clients are not browser navigations: an unauthenticated
+/// request gets a 401, never the console login redirect.
+fn is_realtime(path: &str) -> bool {
+    ui_path(path)
+        .map(|ui| matches!(ui.sub, "events" | "ws" | "raw"))
+        .unwrap_or(false)
+}
+
+/// The face for everything under `/plugin-ui`: static assets, SSE, the page
+/// WebSocket and the protocol-3 raw WebSocket.
 pub struct PluginUiFace {
     lan: Arc<Mutex<Lan>>,
+    /// The realtime routes need the config path for the control-channel bridge
+    /// and the raw hub.
+    streams: Arc<StreamContext>,
 }
 
 impl PluginUiFace {
-    pub fn new(lan: Arc<Mutex<Lan>>) -> PluginUiFace {
-        PluginUiFace { lan }
+    pub fn with_streams(
+        lan: Arc<Mutex<Lan>>,
+        config: PathBuf,
+        raw_hub: Option<Arc<crate::rawhub::RawHub>>,
+    ) -> PluginUiFace {
+        PluginUiFace {
+            lan,
+            streams: Arc::new(StreamContext { config, raw_hub }),
+        }
     }
 
     /// The route decision, usable before the server has resolved a principal.
-    /// A GET for an asset path is a `Streamed` route: the body (if any) is
-    /// consumed through stream events, and the success result is a stream
-    /// handler. `/rpc`, `events`, `ws` and `raw` stay on their own paths.
+    /// Every realtime substream and every static asset is a `Streamed` route:
+    /// the body (if any) is consumed through stream events, and the success
+    /// result is a stream handler. `/rpc` stays on the buffered router.
     pub fn route_for(method: &str, path: &str) -> Option<Route> {
         if method != "GET" {
             return None;
         }
         let ui = ui_path(path_only(path))?;
-        if ui.slashless || matches!(ui.sub, "rpc" | "events" | "ws" | "raw") {
+        if ui.slashless || ui.sub == "rpc" {
             return None;
         }
         Some(Route::inline(BodyPolicy::Streamed))
@@ -97,9 +118,11 @@ impl PluginUiFace {
         head: &http::Head,
         peer: IpAddr,
         lan: &Arc<Mutex<Lan>>,
+        config: PathBuf,
+        raw_hub: Option<Arc<crate::rawhub::RawHub>>,
     ) -> Result<Exchange, Vec<u8>> {
         let Some(route) = PluginUiFace::route_for(&head.method, &head.path) else {
-            return Err(http::json_error(404, "not_found", "not a plugin UI asset"));
+            return Err(http::json_error(404, "not_found", "not a plugin UI path"));
         };
         let principal = match lan.lock() {
             Ok(mut state) => state.authenticate(&head.headers),
@@ -107,7 +130,16 @@ impl PluginUiFace {
         };
         let principal = match principal {
             Ok(principal) => principal,
-            Err(_) => return Err(unauthenticated(&head.headers, path_only(&head.path))),
+            Err(_) => {
+                if is_realtime(path_only(&head.path)) {
+                    return Err(http::json_error(
+                        401,
+                        "unauthorized",
+                        "authentication required",
+                    ));
+                }
+                return Err(unauthenticated(&head.headers, path_only(&head.path)));
+            }
         };
         let request = Request {
             method: head.method.clone(),
@@ -117,7 +149,7 @@ impl PluginUiFace {
             principal,
             body: Vec::new(),
         };
-        let face = PluginUiFace::new(lan.clone());
+        let face = PluginUiFace::with_streams(lan.clone(), config, raw_hub);
         dispatch_inline(&face, &route, request)
             .map_err(|error| http::json_error(500, "internal", &error.message()))
     }
@@ -125,26 +157,43 @@ impl PluginUiFace {
     /// Endpoint policy: a valid plugin id with a web UI, and a token minted for
     /// that same plugin. Failures are response streams too, because a
     /// `Streamed` route may not complete with a memory response.
-    fn open(&self, request: &Request) -> PluginUiStream {
+    fn open(&self, request: &Request) -> Box<dyn StreamHandler> {
         let path = request.path_only();
         let Some(ui) = ui_path(path) else {
-            return PluginUiStream::error(404, "not_found", "unknown plugin UI");
+            return Box::new(PluginUiStream::error(404, "not_found", "unknown plugin UI"));
         };
+        match ui.sub {
+            "events" => {
+                return plugin_streams::open_sse(&ui, request, &self.lan, &self.streams);
+            }
+            "ws" => return plugin_streams::open_ws(&ui, request, &self.lan, &self.streams),
+            "raw" => return plugin_streams::open_raw(&ui, request, &self.lan, &self.streams),
+            _ => {}
+        }
         if !package::valid_name(ui.id) {
-            return PluginUiStream::error(404, "not_found", "unknown plugin UI");
+            return Box::new(PluginUiStream::error(404, "not_found", "unknown plugin UI"));
         }
         let Some(assets) = plugin::web_assets(ui.id) else {
-            return PluginUiStream::error(
+            return Box::new(PluginUiStream::error(
                 404,
                 "not_found",
                 &format!("plugin {} has no web UI", ui.id),
-            );
+            ));
         };
         if !crate::lan::plugin_token_valid(&self.lan, ui.token, ui.id) {
-            return PluginUiStream::error(401, "unauthorized", "invalid or expired plugin token");
+            return Box::new(PluginUiStream::error(
+                401,
+                "unauthorized",
+                "invalid or expired plugin token",
+            ));
         }
         let base = format!("/plugin-ui/{}/{}/", ui.id, ui.token);
-        PluginUiStream::asset(&request.headers, ui.sub, &assets, &base)
+        Box::new(PluginUiStream::asset(
+            &request.headers,
+            ui.sub,
+            &assets,
+            &base,
+        ))
     }
 }
 
@@ -154,7 +203,7 @@ impl Face for PluginUiFace {
     }
 
     fn handle(&self, request: Request, done: Completion) {
-        done.complete(Exchange::Stream(Box::new(self.open(&request))));
+        done.complete(Exchange::Stream(self.open(&request)));
     }
 }
 
@@ -197,7 +246,7 @@ enum Body {
 }
 
 impl PluginUiStream {
-    fn response(bytes: Vec<u8>) -> PluginUiStream {
+    pub(crate) fn response(bytes: Vec<u8>) -> PluginUiStream {
         PluginUiStream {
             body: Body::Bytes { bytes, sent: 0 },
         }
@@ -472,17 +521,20 @@ mod tests {
     }
 
     #[test]
-    fn only_static_asset_gets_are_claimed() {
+    fn only_plugin_ui_gets_are_claimed() {
         assert!(PluginUiFace::route_for("GET", "/plugin-ui/demo/tok/").is_some());
         assert!(PluginUiFace::route_for("GET", "/plugin-ui/demo/tok/app.js?x=1").is_some());
         assert!(PluginUiFace::route_for("GET", "/plugin-ui/Demo/tok/deep/page").is_some());
         assert!(PluginUiFace::route_for("POST", "/plugin-ui/demo/tok/").is_none());
         assert!(PluginUiFace::route_for("GET", "/plugin-ui/demo").is_none());
-        for sub in ["rpc", "events", "ws", "raw"] {
-            assert!(
-                PluginUiFace::route_for("GET", &format!("/plugin-ui/demo/tok/{}", sub)).is_none(),
-                "{sub} has its own path"
-            );
+        assert!(
+            PluginUiFace::route_for("GET", "/plugin-ui/demo/tok/rpc").is_none(),
+            "/rpc stays on the buffered router"
+        );
+        for sub in ["events", "ws", "raw"] {
+            let route = PluginUiFace::route_for("GET", &format!("/plugin-ui/demo/tok/{}", sub))
+                .unwrap_or_else(|| panic!("{sub} is a streamed route"));
+            assert_eq!(route.body, BodyPolicy::Streamed, "{sub}");
         }
         let route = PluginUiFace::route_for("GET", "/plugin-ui/demo/tok/app.js").expect("route");
         assert_eq!(route.body, BodyPolicy::Streamed);

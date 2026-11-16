@@ -3,6 +3,8 @@ use std::fs;
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
+#[cfg(not(unix))]
+use std::sync::mpsc::SyncSender;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,7 +22,7 @@ use crate::threads;
 /// channel owns this shape; the MCP session consumes it. Only the Unix
 /// reactor produces it today, so Windows sees the type unused.
 #[derive(Debug)]
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(any(not(unix), not(feature = "http")), allow(dead_code))]
 pub enum ProgressEvent {
     /// A progress notification line (a JSON-RPC message without an id).
     Frame(String),
@@ -29,6 +31,11 @@ pub enum ProgressEvent {
     /// The outbound stream could not be opened or read.
     Error(String),
 }
+
+/// Bound on queued management requests between the server loop and the
+/// supervisor loop. A full queue is a visible error, not memory growth; each
+/// control connection has at most one request in flight.
+pub const PENDING_QUEUE_LIMIT: usize = 256;
 
 pub struct PendingCall {
     pub line: String,
@@ -139,14 +146,10 @@ fn random_token() -> String {
     token
 }
 
-/// Bind the local control channel. Unix serves all connections from one poll
-/// reactor; Windows keeps the thread-per-connection fallback.
+/// Bind the local control channel. Unix hands the listener to the server loop;
+/// Windows keeps the thread-per-connection fallback.
 #[cfg(unix)]
-pub fn spawn_server(
-    config: &Path,
-    tx: Sender<PendingCall>,
-    wake: std::sync::Arc<crate::wake::Wake>,
-) -> io::Result<()> {
+pub fn bind_server(config: &Path) -> io::Result<std::os::unix::net::UnixListener> {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::{UnixListener, UnixStream};
 
@@ -162,13 +165,13 @@ pub fn spawn_server(
     }
     let listener = UnixListener::bind(&path)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o660))?;
-    crate::channel_reactor::spawn(listener, tx, wake)
+    Ok(listener)
 }
 
 #[cfg(not(unix))]
 pub fn spawn_server(
     config: &Path,
-    tx: Sender<PendingCall>,
+    tx: SyncSender<PendingCall>,
     wake: std::sync::Arc<crate::wake::Wake>,
 ) -> io::Result<()> {
     let listener = Listener::bind(config)?;
@@ -196,7 +199,7 @@ pub fn spawn_server(
 }
 
 #[cfg(not(unix))]
-fn serve(stream: Stream, tx: Sender<PendingCall>, wake: std::sync::Arc<crate::wake::Wake>) {
+fn serve(stream: Stream, tx: SyncSender<PendingCall>, wake: std::sync::Arc<crate::wake::Wake>) {
     let mut reader = BufReader::new(stream);
     loop {
         let line = match ipc::read_frame_limit(&mut reader, ipc::LOCAL_FRAME_MAX) {

@@ -23,13 +23,11 @@ pub enum StreamEvent<'a> {
     /// The server drained the output buffer and can accept more.
     Writable,
     /// The server's deadline or poll tick fired.
-    #[allow(dead_code)] // handlers that only close on a tick ignore the instant.
     Tick(Instant),
     /// A blocking job submitted by this handler finished.
     BlockingDone(BlockingOutcome),
     /// The connection is gone. The handler must release its resources; no
     /// action can be delivered.
-    #[cfg_attr(not(unix), allow(dead_code))] // the blocking fallback just drops.
     Closed(CloseReason),
 }
 
@@ -46,6 +44,8 @@ pub enum StreamAction {
     /// Output is pending; let the socket drain before asking again.
     NeedWrite,
     /// Run this on the blocking pool; resume through `BlockingDone`.
+    /// The server keeps the connection and the output buffer while the job
+    /// runs; the handler gets no socket and no connection handle.
     SubmitBlocking(BlockingJob),
     /// Send this file range on the server's socket once the output buffer
     /// drains. The handler gives up the file handle; the server performs the
@@ -62,11 +62,10 @@ pub enum StreamAction {
 /// involved.
 pub type BlockingJob = Box<dyn FnOnce() -> BlockingOutcome + Send + 'static>;
 
-/// The outcome of a blocking job. A job that needs a value stores it in its
-/// shared state; the stream event only carries pass/fail.
+/// The value a blocking job returns.
 #[derive(Debug)]
 pub enum BlockingOutcome {
-    Ok,
+    Ok(Vec<u8>),
     Failed(String),
 }
 
@@ -111,7 +110,6 @@ impl StreamStep {
     /// Ask the server to wake the handler earlier than its next tick. The
     /// server keeps its own no-progress bound, so a handler that keeps asking
     /// for wakeups still closes when a stalled transfer reaches that bound.
-    #[allow(dead_code)] // #122 SSE heartbeats ask for a shorter wakeup.
     pub fn within(mut self, deadline: Instant) -> StreamStep {
         self.deadline = Some(deadline);
         self

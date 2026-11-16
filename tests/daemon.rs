@@ -1,4 +1,5 @@
 use std::fs;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2115,8 +2116,21 @@ fn a_finished_one_shot_dependency_is_not_rerun() {
     sandbox.write_service("app", &["once"], Script::Ready);
 
     sandbox.start_daemon();
-    let status = sandbox.wait_for_state("once", "running", Duration::from_secs(15));
-    assert!(status["summary"]["pid"].is_null(), "{status}");
+    // The one-shot may be observed in its brief Running-with-pid window right
+    // after spawn; the point of this test is that it settles to
+    // running/pid-null exactly once before the dependent app starts.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = sandbox.status("once");
+        if status["summary"]["state"] == "running" && status["summary"]["pid"].is_null() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the one-shot never settled to running/pid-null: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
     sandbox.wait_for_state("app", "running", Duration::from_secs(15));
     wait_until(
         "the one-shot body to run once",
@@ -2741,4 +2755,18 @@ fn a_runtime_record_from_another_boot_is_ignored() {
         status
     );
     sandbox.stop_service("script");
+}
+
+/// An HTTP bind failure must disable only HTTP. The control channel owns the
+/// server loop now, so the CLI keeps working on the same daemon.
+#[test]
+fn a_busy_http_port_keeps_the_control_channel_alive() {
+    let occupied = TcpListener::bind("127.0.0.1:0").expect("occupy a port");
+    let port = occupied.local_addr().expect("occupied port").port();
+    let bind = format!("127.0.0.1:{}", port);
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon_with_env(&[("SVCD_BIND", bind.as_str())]);
+    // reload has no offline fallback; answering it proves the control loop is up.
+    sandbox.wait_for_daemon();
+    sandbox.shutdown();
 }

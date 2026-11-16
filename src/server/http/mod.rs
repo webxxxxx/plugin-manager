@@ -9,11 +9,12 @@ pub mod dispatch;
 #[cfg(all(unix, feature = "http"))]
 pub mod driver;
 pub mod engine;
-#[cfg_attr(not(unix), allow(dead_code))]
-pub mod pool;
 #[cfg(all(not(unix), feature = "http"))]
 pub mod fallback;
+#[cfg_attr(not(unix), allow(dead_code))]
+pub mod pool;
 pub mod stream;
+pub mod wire;
 
 // The S4 contract is deliberately available to the minimal build (parent spec
 // #112) even when no HTTP endpoint is compiled in. Re-exports are allowed to

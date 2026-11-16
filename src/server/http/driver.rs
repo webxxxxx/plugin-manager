@@ -36,11 +36,16 @@ pub struct StreamDriver {
     file: Option<FileSend>,
     /// The handler asked to finish; flush the output buffer, then close.
     closing: Option<CloseReason>,
-    /// A blocking job the handler wants the server loop to submit.
-    pending_job: Option<BlockingJob>,
-    /// A job is queued or running on the blocking pool. No socket reads and no
-    /// handler events run until its completion arrives.
-    blocking: bool,
+    /// A blocking job the handler submitted, waiting for the server loop to
+    /// accept it. While it is set, or while it runs, the handler gets no other
+    /// event: the connection is not making protocol progress.
+    job: Option<BlockingJob>,
+    /// The server loop took the job; resume on BlockingDone.
+    awaiting: bool,
+    /// The handler still has output queued, so the server must not read more
+    /// client bytes until the socket drains. This is the per-connection
+    /// backpressure point for a slow reader.
+    blocked_on_write: bool,
     /// When the handler last paused for a blocking job. A queued or running
     /// job that makes no progress for the transfer timeout closes the stream.
     paused: Option<Instant>,
@@ -79,8 +84,9 @@ impl StreamDriver {
             wakeup: deadline,
             file: None,
             closing: None,
-            pending_job: None,
-            blocking: false,
+            job: None,
+            awaiting: false,
+            blocked_on_write: false,
             paused: None,
             _permit: permit,
         }
@@ -90,39 +96,35 @@ impl StreamDriver {
         self.file.is_some()
     }
 
-    /// Whether the server may read more request-body bytes. A pending or
-    /// running blocking job pauses input; the staged upload therefore applies
-    /// backpressure to the socket instead of growing a queue.
+    /// Whether the server may read more client bytes. A handler that asked to
+    /// write first, or that has a job in flight, must not see new input yet.
     pub fn wants_read(&self) -> bool {
-        self.pending_job.is_none() && !self.blocking
+        !self.blocked_on_write && self.job.is_none() && !self.awaiting
     }
 
-    /// Take the job the handler just submitted, for the server loop to hand to
-    /// the blocking pool.
-    pub fn take_blocking_job(&mut self) -> Option<BlockingJob> {
-        self.pending_job.take()
+    /// The handler asked the server to run a job. The server takes it exactly
+    /// once and calls on_blocking_done when it finishes.
+    pub fn take_job(&mut self) -> Option<BlockingJob> {
+        let job = self.job.take();
+        if job.is_some() {
+            self.awaiting = true;
+            self.paused.get_or_insert_with(Instant::now);
+        }
+        job
     }
 
-    /// Put a job back after the pool refused it. The connection stays paused
-    /// and retries on the next tick.
-    pub fn restore_blocking_job(&mut self, job: BlockingJob) {
-        self.pending_job = Some(job);
-    }
-
-    /// Mark the taken job as queued/running. The next event is its completion.
-    pub fn begin_blocking(&mut self) {
-        self.blocking = true;
-        self.paused.get_or_insert_with(Instant::now);
-    }
-
-    /// Deliver a blocking job's result and let the handler decide what is next.
+    /// Deliver the outcome of the one in-flight job. A duplicate outcome after
+    /// a disconnect is ignored.
     pub fn on_blocking_done(
         &mut self,
         outcome: BlockingOutcome,
         out: &mut Vec<u8>,
         out_at: &mut usize,
     ) -> bool {
-        self.blocking = false;
+        if !self.awaiting {
+            return true;
+        }
+        self.awaiting = false;
         self.paused = None;
         self.touch();
         self.on_event(StreamEvent::BlockingDone(outcome), out, out_at)
@@ -145,6 +147,9 @@ impl StreamDriver {
         if data.is_empty() {
             return true;
         }
+        if self.job.is_some() || self.awaiting {
+            return true;
+        }
         self.touch();
         self.on_event(StreamEvent::Data(data), out, out_at)
     }
@@ -156,7 +161,7 @@ impl StreamDriver {
         out_at: &mut usize,
         last_active: &mut Instant,
     ) -> bool {
-        if !self.wants_read() {
+        if !self.wants_read() || *out_at < out.len() {
             return true;
         }
         let mut chunk = [0u8; 8 * 1024];
@@ -183,10 +188,19 @@ impl StreamDriver {
     ) -> bool {
         loop {
             let before = *out_at;
-            if !flush(stream, out, out_at, last_active) {
-                return false;
-            }
-            if *out_at > before {
+            let wrote = match flush(stream, out, out_at, last_active) {
+                FlushOutcome::Drained(wrote) => wrote,
+                FlushOutcome::Blocked => *out_at > before,
+                FlushOutcome::Closed => {
+                    self.closing = Some(CloseReason::PeerClosed);
+                    return false;
+                }
+                FlushOutcome::Failed => {
+                    self.closing = Some(CloseReason::Failed("socket write failed".into()));
+                    return false;
+                }
+            };
+            if wrote {
                 self.touch();
             }
             if *out_at < out.len() {
@@ -208,10 +222,7 @@ impl StreamDriver {
             if self.closing.is_some() {
                 return false;
             }
-            if self.blocking || self.pending_job.is_some() {
-                // The handler is paused until its blocking job is submitted
-                // and completes; do not deliver a Writable that could submit a
-                // second job.
+            if self.job.is_some() || self.awaiting {
                 return true;
             }
             if !self.on_event(StreamEvent::Writable, out, out_at) {
@@ -231,7 +242,7 @@ impl StreamDriver {
         out_at: &mut usize,
         last_active: &mut Instant,
     ) -> bool {
-        if self.blocking || self.pending_job.is_some() {
+        if self.job.is_some() || self.awaiting {
             // A queued/running job may take longer than one poll tick, but it
             // must still make progress within the transfer timeout. This is
             // the bound that stops a queue-full retry from pinning the slot.
@@ -249,6 +260,9 @@ impl StreamDriver {
         }
         if !self.on_event(StreamEvent::Tick(now), out, out_at) {
             return false;
+        }
+        if self.job.is_some() || self.awaiting {
+            return true;
         }
         if now < self.deadline {
             return true;
@@ -289,12 +303,25 @@ impl StreamDriver {
             }
         }
         match step.action {
-            StreamAction::Continue | StreamAction::NeedRead | StreamAction::NeedWrite => {}
+            StreamAction::Continue | StreamAction::NeedRead => {
+                self.blocked_on_write = false;
+            }
+            StreamAction::NeedWrite => {
+                self.blocked_on_write = true;
+            }
             StreamAction::SubmitBlocking(job) => {
-                self.pending_job = Some(job);
-                self.paused.get_or_insert_with(Instant::now);
+                self.blocked_on_write = false;
+                if self.job.is_some() || self.awaiting {
+                    self.closing = Some(CloseReason::Failed(
+                        "a stream handler submitted a second blocking job".into(),
+                    ));
+                } else {
+                    self.job = Some(job);
+                    self.paused.get_or_insert_with(Instant::now);
+                }
             }
             StreamAction::SendFile(send) => {
+                self.blocked_on_write = false;
                 // The server sends this range after the output buffer drains,
                 // then delivers `Writable` again. A handler with more ranges
                 // (a file bundle is many parts) can queue the next one; one
@@ -302,10 +329,11 @@ impl StreamDriver {
                 self.file = Some(send);
             }
             StreamAction::Close(reason) => {
+                self.blocked_on_write = false;
                 self.closing = Some(reason);
             }
         }
-        if self.pending_job.is_none() && !self.blocking {
+        if self.job.is_none() && !self.awaiting {
             self.paused = None;
         }
         !(self.closing.is_some() && self.file.is_none() && *out_at >= out_len)
@@ -385,30 +413,44 @@ impl Drop for StreamDriver {
     }
 }
 
+enum FlushOutcome {
+    /// Everything in the buffer is on the wire. The bool says whether any
+    /// bytes were written (progress resets the no-progress bound).
+    Drained(bool),
+    /// The socket is full; the buffer is partially written.
+    Blocked,
+    /// The peer closed the connection.
+    Closed,
+    /// The socket reported a write error.
+    Failed,
+}
+
 fn flush(
     stream: &mut TcpStream,
     out: &mut Vec<u8>,
     out_at: &mut usize,
     last_active: &mut Instant,
-) -> bool {
+) -> FlushOutcome {
     if *out_at >= out.len() {
         out.clear();
         *out_at = 0;
-        return true;
+        return FlushOutcome::Drained(false);
     }
     match std::io::Write::write(stream, &out[*out_at..]) {
-        Ok(0) => false,
+        Ok(0) => FlushOutcome::Closed,
         Ok(written) => {
             *out_at += written;
             *last_active = Instant::now();
             if *out_at >= out.len() {
                 out.clear();
                 *out_at = 0;
+                FlushOutcome::Drained(true)
+            } else {
+                FlushOutcome::Blocked
             }
-            true
         }
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
-        Err(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => FlushOutcome::Blocked,
+        Err(_) => FlushOutcome::Failed,
     }
 }
 
@@ -600,20 +642,134 @@ mod tests {
         );
     }
 
-    /// A handler that asks the pool for one job and resumes on its completion.
-    struct SubmitOnce {
-        submitted: bool,
-    }
+    struct JobHandler;
 
-    impl StreamHandler for SubmitOnce {
-        fn on_event(&mut self, event: StreamEvent<'_>, _out: &mut OutBuffer<'_>) -> StreamStep {
+    impl StreamHandler for JobHandler {
+        fn on_event(&mut self, event: StreamEvent<'_>, out: &mut OutBuffer<'_>) -> StreamStep {
             match event {
-                StreamEvent::Data(_) if !self.submitted => {
-                    self.submitted = true;
+                StreamEvent::Data(_) => {
                     StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|| {
-                        BlockingOutcome::Ok
+                        BlockingOutcome::Ok(b"done".to_vec())
                     })))
                 }
+                StreamEvent::BlockingDone(BlockingOutcome::Ok(bytes)) => {
+                    out.write(&bytes);
+                    StreamStep::wait(StreamAction::Close(CloseReason::Completed))
+                }
+                StreamEvent::BlockingDone(BlockingOutcome::Failed(message)) => {
+                    out.write(message.as_bytes());
+                    StreamStep::wait(StreamAction::Close(CloseReason::Failed(message)))
+                }
+                _ => StreamStep::wait(StreamAction::NeedRead),
+            }
+        }
+    }
+
+    #[test]
+    fn a_submitted_job_is_taken_once_and_resumed_with_its_outcome() {
+        let StreamAdmission::Admitted(mut driver) = StreamDriver::admit(Box::new(JobHandler), 8)
+        else {
+            panic!("the stream fits the cap");
+        };
+        let mut out = Vec::new();
+        let mut out_at = 0;
+        assert!(driver.on_data(b"request", &mut out, &mut out_at));
+        assert!(!driver.wants_read(), "a submitted job pauses reads");
+        let job = driver.take_job().expect("the handler submitted one job");
+        assert!(driver.take_job().is_none(), "a job is taken once");
+        assert!(
+            driver.on_data(b"more", &mut out, &mut out_at),
+            "input is not delivered while the job runs"
+        );
+        assert!(out.is_empty(), "the handler saw no second event");
+        assert!(driver.on_blocking_done(
+            BlockingOutcome::Ok(job_result(job)),
+            &mut out,
+            &mut out_at
+        ));
+        assert_eq!(out, b"done");
+        assert!(
+            driver.closing.is_some(),
+            "the handler closed after the result"
+        );
+        assert!(
+            driver.wants_read(),
+            "the completed job releases the read gate"
+        );
+    }
+
+    fn job_result(job: BlockingJob) -> Vec<u8> {
+        match job() {
+            BlockingOutcome::Ok(bytes) => bytes,
+            BlockingOutcome::Failed(message) => panic!("unexpected failure: {message}"),
+        }
+    }
+
+    #[test]
+    fn a_handler_may_submit_a_follow_up_job_after_a_completion() {
+        struct TwoJobs {
+            calls: u8,
+        }
+        impl StreamHandler for TwoJobs {
+            fn on_event(&mut self, event: StreamEvent<'_>, out: &mut OutBuffer<'_>) -> StreamStep {
+                match event {
+                    StreamEvent::Data(_) => {
+                        StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|| {
+                            BlockingOutcome::Ok(b"one".to_vec())
+                        })))
+                    }
+                    StreamEvent::BlockingDone(BlockingOutcome::Ok(bytes)) => {
+                        self.calls += 1;
+                        out.write(&bytes);
+                        if self.calls == 1 {
+                            StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|| {
+                                BlockingOutcome::Ok(b"two".to_vec())
+                            })))
+                        } else {
+                            StreamStep::wait(StreamAction::Close(CloseReason::Completed))
+                        }
+                    }
+                    StreamEvent::BlockingDone(BlockingOutcome::Failed(message)) => {
+                        StreamStep::wait(StreamAction::Close(CloseReason::Failed(message)))
+                    }
+                    _ => StreamStep::wait(StreamAction::Continue),
+                }
+            }
+        }
+        let StreamAdmission::Admitted(mut driver) =
+            StreamDriver::admit(Box::new(TwoJobs { calls: 0 }), 8)
+        else {
+            panic!("the stream fits the cap");
+        };
+        let mut out = Vec::new();
+        let mut out_at = 0;
+        driver.on_data(b"x", &mut out, &mut out_at);
+        let first = driver.take_job().expect("first job");
+        driver.on_blocking_done(
+            BlockingOutcome::Ok(job_result(first)),
+            &mut out,
+            &mut out_at,
+        );
+        let second = driver
+            .take_job()
+            .expect("a WebSocket may queue the next call after a response");
+        driver.on_blocking_done(
+            BlockingOutcome::Ok(job_result(second)),
+            &mut out,
+            &mut out_at,
+        );
+        assert_eq!(out, b"onetwo");
+        assert!(driver.closing.is_some());
+    }
+
+    struct PauseOnce;
+
+    impl StreamHandler for PauseOnce {
+        fn on_event(&mut self, event: StreamEvent<'_>, _out: &mut OutBuffer<'_>) -> StreamStep {
+            match event {
+                StreamEvent::Data(_) => StreamStep::wait(StreamAction::SubmitBlocking(Box::new(
+                    || BlockingOutcome::Ok(Vec::new()),
+                ))),
                 StreamEvent::BlockingDone(_) => StreamStep::wait(StreamAction::NeedRead),
                 _ => StreamStep::wait(StreamAction::Continue),
             }
@@ -621,49 +777,28 @@ mod tests {
     }
 
     #[test]
-    fn a_blocking_job_pauses_input_until_its_completion() {
-        let mut driver = match StreamDriver::admit(Box::new(SubmitOnce { submitted: false }), 1) {
-            StreamAdmission::Admitted(driver) => driver,
-            StreamAdmission::Busy => panic!("the budget admits the handler"),
-        };
-        let mut out = Vec::new();
-        let mut out_at = 0;
-        assert!(driver.on_data(b"body", &mut out, &mut out_at));
-        assert!(
-            !driver.wants_read(),
-            "a submitted job pauses body reads until it finishes"
-        );
-        let job = driver
-            .take_blocking_job()
-            .expect("the handler submitted one job");
-        driver.begin_blocking();
-        assert!(!driver.wants_read(), "a running job keeps input paused");
-        drop(job);
-        assert!(driver.on_blocking_done(BlockingOutcome::Ok, &mut out, &mut out_at));
-        assert!(
-            driver.wants_read(),
-            "the completed job lets the handler request the next body chunk"
-        );
-    }
-
-    #[test]
     fn a_paused_job_still_closes_at_the_transfer_bound() {
-        let mut driver = match StreamDriver::admit(Box::new(SubmitOnce { submitted: false }), 1) {
-            StreamAdmission::Admitted(driver) => driver,
-            StreamAdmission::Busy => panic!("the budget admits the handler"),
+        let StreamAdmission::Admitted(mut driver) =
+            StreamDriver::admit(Box::new(PauseOnce), 1)
+        else {
+            panic!("the stream fits the cap");
         };
         let mut out = Vec::new();
         let mut out_at = 0;
         assert!(driver.on_data(b"body", &mut out, &mut out_at));
-        let _job = driver
-            .take_blocking_job()
-            .expect("the handler submitted one job");
-        // The job was not submitted to a pool: it is a paused state, not a
-        // running job. It still cannot pin the stream forever.
+        let job = driver.take_job().expect("the handler submitted one job");
+        drop(job);
         let mut stream = socket();
         let mut last_active = Instant::now();
         let beyond = Instant::now() + limits::current().transfer_timeout + Duration::from_secs(1);
-        assert!(!driver.on_tick(beyond, &mut stream, &mut out, &mut out_at, &mut last_active));
+        assert!(!driver.on_tick(
+            beyond,
+            &mut stream,
+            &mut out,
+            &mut out_at,
+            &mut last_active
+        ));
         assert_eq!(driver.closing, Some(CloseReason::TimedOut));
     }
+
 }

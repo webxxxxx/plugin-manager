@@ -1112,6 +1112,34 @@ fn sse_connect_with_last_id(address: &str, path: &str, last_id: Option<u64>) -> 
     stream
 }
 
+/// Open an SSE request and return its status without waiting for the stream
+/// to end. Used when a long-lived response may be refused or accepted.
+fn sse_probe(address: &str, path: &str) -> (u16, TcpStream) {
+    let mut stream = TcpStream::connect(address).expect("sse connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("sse timeout");
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\n\r\n",
+        path, address
+    );
+    stream.write_all(request.as_bytes()).expect("sse request");
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).expect("sse response head");
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head);
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .expect("sse status");
+    (status, stream)
+}
+
 fn sse_id(text: &str) -> Option<u64> {
     text.lines()
         .find_map(|line| line.strip_prefix("id: "))
@@ -3990,6 +4018,72 @@ fn plugin_web_ui_serves_assets_with_base_and_etag() {
 }
 
 #[test]
+fn a_slow_realtime_client_does_not_block_other_requests() {
+    let (_sandbox, address) = daemon_with_web_event_plugin(60);
+    let base = plugin_ui_base(&address, "demo");
+    let (mut ws, status, head) = ws_handshake(&address, &format!("{}ws", base), &[]);
+    assert_eq!(status, 101, "{head}");
+
+    // A 512 KiB binary message is echoed back. The test never reads the echo,
+    // so the server's socket buffer fills and this connection is backpressured.
+    ws_send(&mut ws, 0x2, &vec![0x41; 512 * 1024]);
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Other connections must still be served while that reader is stalled.
+    for _ in 0..4 {
+        let response = request(&address, "GET", "/api/v1/version", "", b"");
+        assert_eq!(response.status, 200, "{}", response.body);
+    }
+}
+
+#[test]
+fn plugin_ui_realtime_streams_consume_the_long_lived_stream_cap() {
+    // One SSE stream fills max_streams. A second long-lived stream is refused
+    // before its headers; a one-shot asset is still exempt; closing the stream
+    // releases the slot.
+    let (_sandbox, address) = web_ui_sandbox_with_conf(58, "max_streams = 1\n");
+    let base = plugin_ui_base(&address, "demo");
+    let events = format!("{}events", base);
+    let ws = format!("{}ws", base);
+
+    let first = sse_connect(&address, &events);
+    let second = raw_request(&address, "GET", &events, "", b"");
+    assert_eq!(
+        second.status,
+        503,
+        "{}",
+        String::from_utf8_lossy(&second.body)
+    );
+    assert!(String::from_utf8_lossy(&second.body).contains("busy"));
+    assert_eq!(raw_header_values(&second, "retry-after"), vec!["1"]);
+
+    let (_stream, status, head) = ws_handshake(&address, &ws, &[]);
+    assert_eq!(status, 503, "{head}");
+
+    // A page load is many one-shot responses; it must not trip the cap.
+    let page = raw_request(&address, "GET", &base, "", b"");
+    assert_eq!(page.status, 200);
+
+    drop(first);
+    let mut released = false;
+    for _ in 0..100 {
+        // A successful SSE response never ends, so probe the head instead of
+        // reading to EOF.
+        let (status, stream) = sse_probe(&address, &events);
+        drop(stream);
+        if status == 200 {
+            released = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        released,
+        "closing the SSE stream must release its max_streams slot"
+    );
+}
+
+#[test]
 fn plugin_ui_assets_do_not_consume_the_long_lived_stream_cap() {
     // One long-lived stream is the whole cap; a browser page still loads all
     // of its assets because one-shot responses are exempt from max_streams.
@@ -4809,12 +4903,14 @@ fn an_idle_connection_is_closed_without_a_response() {
 // so neither may add a thread each.
 // ---------------------------------------------------------------------------
 
-/// The default S4 topology before the control/plugin reactor merges
-/// (#124/#126). #116 added the two blocking-pool workers; the legacy HTTP
-/// workers and takeovers stay until #117/#125. Update this pin in the slice
-/// that changes the baseline.
+/// The default S4 topology after the control-channel merge (#124). #116 added
+/// the two blocking-pool workers; #124 moved the control listener and the
+/// outbound management client onto the server loop, removing the two reactor
+/// threads (12 -> 10). The legacy HTTP workers and takeovers stay until
+/// #117/#125; #126 merges the plugin reactor and reaches 4-5. Update this pin
+/// in the slice that changes the baseline.
 #[cfg(target_os = "linux")]
-const IDLE_DAEMON_THREADS: usize = 12;
+const IDLE_DAEMON_THREADS: usize = 10;
 
 #[cfg(target_os = "linux")]
 fn daemon_threads(pid: u32) -> usize {
@@ -4824,6 +4920,18 @@ fn daemon_threads(pid: u32) -> usize {
         .find_map(|line| line.strip_prefix("Threads:"))
         .and_then(|value| value.trim().parse().ok())
         .expect("daemon status has a Threads line")
+}
+
+#[cfg(target_os = "linux")]
+fn daemon_thread_names(pid: u32) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(format!("/proc/{}/task", pid))
+        .expect("daemon tasks")
+        .flatten()
+        .filter_map(|entry| fs::read_to_string(entry.path().join("comm")).ok())
+        .map(|name| name.trim().to_string())
+        .collect();
+    names.sort();
+    names
 }
 
 #[cfg(target_os = "linux")]
@@ -4874,6 +4982,21 @@ fn unix_idle_thread_count_has_no_per_request_or_per_stream_threads() {
     assert_eq!(
         idle, IDLE_DAEMON_THREADS,
         "idle daemon uses {idle} threads; the default S4 baseline is {IDLE_DAEMON_THREADS}, so this is a thread-budget regression"
+    );
+    let names = daemon_thread_names(pid);
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.starts_with("svcd-channel-r") || name.starts_with("svcd-channel-c")),
+        "the control and channel-client reactor threads are gone: {names:?}"
+    );
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| name.starts_with("svcd-server-loo"))
+            .count(),
+        1,
+        "the control channel runs on the one server loop: {names:?}"
     );
 
     let mut connections = Vec::new();
@@ -6427,4 +6550,142 @@ fn http_mcp_stream_disconnect_releases_the_budget() {
         released,
         "a disconnected MCP client must release the max_streams slot"
     );
+}
+
+/// The server loop owns the control channel now. A shutdown request must still
+/// receive its reply: the loop drains queued control replies and flushes them
+/// before the process exits.
+#[cfg(unix)]
+#[test]
+fn control_shutdown_reply_is_flushed_before_exit() {
+    use std::os::unix::net::UnixStream;
+
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let _address = sandbox.wait_for_http();
+    let token = fs::read_to_string(sandbox.config.join("svcd.token"))
+        .expect("control token")
+        .trim()
+        .to_string();
+    let mut stream =
+        UnixStream::connect(sandbox.config.join("svcd.sock")).expect("control connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let request = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"svcd.shutdown\",\"params\":{{}},\"auth\":\"{}\"}}\n",
+        token
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("write shutdown request");
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("shutdown reply");
+    let response: Value = serde_json::from_str(line.trim()).expect("shutdown reply json");
+    assert_eq!(response["id"], 7, "{line}");
+    assert!(response.get("error").is_none(), "{line}");
+
+    if let Some(mut child) = sandbox.daemon.take() {
+        let mut exited = false;
+        for _ in 0..300 {
+            if child.try_wait().expect("daemon wait").is_some() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(exited, "daemon did not exit after the shutdown reply");
+    }
+}
+
+/// The control channel still checks its token after moving into the server
+/// loop: a wrong token gets the same -32000 unauthorized reply.
+#[cfg(unix)]
+#[test]
+fn control_channel_rejects_an_unknown_token() {
+    use std::os::unix::net::UnixStream;
+
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let _address = sandbox.wait_for_http();
+    let mut stream =
+        UnixStream::connect(sandbox.config.join("svcd.sock")).expect("control connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let request = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"svcd.ping\",\"params\":{},\"auth\":\"not-the-token\"}\n";
+    stream
+        .write_all(request.as_bytes())
+        .expect("write ping request");
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("ping reply");
+    let response: Value = serde_json::from_str(line.trim()).expect("ping reply json");
+    assert_eq!(response["id"], 3, "{line}");
+    assert_eq!(response["error"]["code"], -32000, "{line}");
+    assert_eq!(response["error"]["message"], "unauthorized", "{line}");
+}
+
+/// When the management channel cannot be reached, the MCP stream still starts
+/// with 200 + an SSE -32603, matching the old reactor's wire behaviour.
+#[cfg(unix)]
+#[test]
+fn http_mcp_stream_reports_an_unreachable_channel_as_an_sse_error() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    set_password(&sandbox, TEST_PASSWORD);
+    fs::remove_file(sandbox.config.join("svcd.sock")).expect("remove control socket");
+
+    let body = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 12,
+        "method": "tools/call",
+        "params": {
+            "name": "demo.status",
+            "arguments": {},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "progressToken": "t1"
+            }
+        }
+    }))
+    .expect("body");
+    let mut stream = TcpStream::connect(&address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: demo.status\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        address,
+        TEST_PASSWORD,
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).expect("write head");
+    stream.write_all(&body).expect("write body");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("read response");
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("headers");
+    let head = String::from_utf8_lossy(&response[..split]);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("content-type: text/event-stream"),
+        "{head}"
+    );
+    let text = String::from_utf8_lossy(&decode_chunked(&response[split + 4..])).to_string();
+    assert!(text.contains("\"code\":-32603"), "{text}");
+    assert!(text.contains("svcd unreachable"), "{text}");
+
+    // The control socket is gone, so stop the daemon directly; Drop would
+    // otherwise wait for the unreachable shutdown RPC.
+    if let Some(mut child) = sandbox.daemon.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }

@@ -8,28 +8,17 @@
 //! checks; this module owns the transports and the bounded fan-out.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpStream};
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde_json::{json, Value};
 
-use crate::channel;
-use crate::rpc;
-use crate::webui;
-
 const QUEUE: usize = 512;
 const HISTORY_EVENTS: usize = 256;
 const HISTORY_BYTES: usize = 2 * 1024 * 1024;
-const MAX_MESSAGE: usize = 1024 * 1024;
-const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
-const WS_PING: Duration = Duration::from_secs(30);
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 /// One notification delivered to UI subscribers. `seq` is monotonic across the
@@ -315,64 +304,11 @@ impl Default for EventBus {
     }
 }
 
-/// Write one SSE response and stream notifications until the client or the
-/// subscription goes away. The caller has already authenticated the request.
-pub fn serve_sse(
-    stream: &mut TcpStream,
-    receiver: Receiver<Event>,
-    replay: Replay,
-) -> io::Result<()> {
-    stream.set_nodelay(true)?;
-    stream.set_write_timeout(Some(SSE_HEARTBEAT + Duration::from_secs(5)))?;
-    stream.write_all(
-        b"HTTP/1.1 200 OK\r\n\
-          Content-Type: text/event-stream\r\n\
-          Cache-Control: no-cache\r\n\
-          Connection: keep-alive\r\n\
-          X-Accel-Buffering: no\r\n\
-          Transfer-Encoding: chunked\r\n\r\n",
-    )?;
-    if replay.reset
-        && write_chunk(
-            stream,
-            b"event: reset\ndata: {\"reason\":\"replay-unavailable\"}\n\n",
-        )
-        .is_err()
-    {
-        return Ok(());
-    }
-    loop {
-        match receiver.recv_timeout(SSE_HEARTBEAT) {
-            Ok(event) => {
-                if write_chunk(stream, sse_event(&event).as_bytes()).is_err() {
-                    return Ok(());
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                if write_chunk(stream, b": ping\n\n").is_err() {
-                    return Ok(());
-                }
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                let _ = stream.write_all(b"0\r\n\r\n");
-                return Ok(());
-            }
-        }
-    }
-}
-
 pub fn sse_event(event: &Event) -> String {
     format!(
         "id: {}\nevent: message\ndata: {}\n\n",
         event.seq, event.json
     )
-}
-
-fn write_chunk(stream: &mut TcpStream, data: &[u8]) -> io::Result<()> {
-    write!(stream, "{:x}\r\n", data.len())?;
-    stream.write_all(data)?;
-    stream.write_all(b"\r\n")?;
-    stream.flush()
 }
 
 /// Validate the RFC 6455 opening handshake and return the value for
@@ -404,271 +340,6 @@ pub fn ws_accept(headers: &[(String, String)]) -> Result<String, &'static str> {
 
 pub fn accept_key(key: &str) -> String {
     BASE64.encode(sha1(format!("{}{}", key, WS_GUID).as_bytes()))
-}
-
-/// Read client frames from `stream` and write responses/notifications until
-/// either side closes. `subscription` removes the bus subscriber on return.
-pub fn serve_ws(
-    stream: &mut TcpStream,
-    config: &Path,
-    plugin: &str,
-    receiver: Receiver<Event>,
-    subscription: Subscription,
-) -> io::Result<()> {
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-    let mut fragment = Vec::new();
-    let mut fragment_opcode: Option<u8> = None;
-    let mut last_ping = Instant::now();
-    loop {
-        while let Ok(event) = receiver.try_recv() {
-            if write_frame(stream, 0x1, event.json.as_bytes()).is_err() {
-                drop(subscription);
-                let _ = stream.shutdown(Shutdown::Both);
-                return Ok(());
-            }
-        }
-        if last_ping.elapsed() >= WS_PING {
-            if write_frame(stream, 0x9, b"").is_err() {
-                break;
-            }
-            last_ping = Instant::now();
-        }
-        let frame = match read_frame(stream) {
-            Ok(frame) => frame,
-            Err(error)
-                if error.kind() == io::ErrorKind::WouldBlock
-                    || error.kind() == io::ErrorKind::TimedOut =>
-            {
-                continue;
-            }
-            Err(error) => {
-                let (code, reason) = if error.to_string().contains("1 MiB") {
-                    (1009, "message too large")
-                } else {
-                    (1002, "protocol error")
-                };
-                let _ = close_frame(stream, code, reason);
-                break;
-            }
-        };
-        if frame.opcode >= 0x8 {
-            if !frame.fin || frame.payload.len() > 125 {
-                let _ = close_frame(stream, 1002, "invalid control frame");
-                break;
-            }
-            match frame.opcode {
-                0x8 => {
-                    let code = if frame.payload.len() >= 2 {
-                        u16::from_be_bytes([frame.payload[0], frame.payload[1]])
-                    } else {
-                        1000
-                    };
-                    let _ = close_frame(stream, code, "");
-                    break;
-                }
-                0x9 => {
-                    if write_frame(stream, 0xA, &frame.payload).is_err() {
-                        break;
-                    }
-                }
-                0xA => {}
-                _ => {
-                    let _ = close_frame(stream, 1002, "unknown control frame");
-                    break;
-                }
-            }
-            continue;
-        }
-
-        match frame.opcode {
-            0x1 | 0x2 => {
-                let limits = crate::limits::current();
-                if frame.opcode == 0x2 {
-                    if !limits.ws_raw_enabled {
-                        let _ = close_frame(stream, 1003, "binary frames are disabled");
-                        break;
-                    }
-                    if frame.payload.len() > limits.ws_raw_max_bytes {
-                        let _ = close_frame(stream, 1009, "raw message too large");
-                        break;
-                    }
-                    if fragment_opcode.is_some() {
-                        let _ = close_frame(stream, 1002, "interleaved data frame");
-                        break;
-                    }
-                    if !frame.fin {
-                        fragment = frame.payload;
-                        fragment_opcode = Some(0x2);
-                    } else if write_frame(stream, 0x2, &frame.payload).is_err() {
-                        break;
-                    }
-                    continue;
-                }
-                if frame.payload.len() > limits.ws_max_message_bytes {
-                    let _ = close_frame(stream, 1009, "message too large");
-                    break;
-                }
-                if fragment_opcode.is_some() {
-                    let _ = close_frame(stream, 1002, "interleaved data frame");
-                    break;
-                }
-                if !frame.fin {
-                    fragment = frame.payload;
-                    fragment_opcode = Some(0x1);
-                } else if !handle_text(stream, config, plugin, &frame.payload) {
-                    break;
-                }
-            }
-            0x0 => {
-                if fragment_opcode.is_none() {
-                    let _ = close_frame(stream, 1002, "unexpected continuation");
-                    break;
-                }
-                fragment.extend_from_slice(&frame.payload);
-                let raw = fragment_opcode == Some(0x2);
-                let limit = if raw {
-                    crate::limits::current().ws_raw_max_bytes
-                } else {
-                    crate::limits::current().ws_max_message_bytes
-                };
-                if fragment.len() > limit {
-                    let _ = close_frame(stream, 1009, "message too large");
-                    break;
-                }
-                if frame.fin {
-                    let payload = std::mem::take(&mut fragment);
-                    fragment_opcode = None;
-                    if raw {
-                        if write_frame(stream, 0x2, &payload).is_err() {
-                            break;
-                        }
-                    } else if !handle_text(stream, config, plugin, &payload) {
-                        break;
-                    }
-                }
-            }
-            _ => {
-                let _ = close_frame(stream, 1002, "unknown data frame");
-                break;
-            }
-        }
-    }
-    drop(subscription);
-    let _ = stream.shutdown(Shutdown::Both);
-    Ok(())
-}
-
-fn close_frame(stream: &mut TcpStream, code: u16, reason: &str) -> io::Result<()> {
-    let mut payload = code.to_be_bytes().to_vec();
-    payload.extend_from_slice(reason.as_bytes());
-    let _ = write_frame(stream, 0x8, &payload);
-    Ok(())
-}
-
-fn handle_text(stream: &mut TcpStream, config: &Path, plugin: &str, payload: &[u8]) -> bool {
-    let response = match webui::bridge_request(plugin, payload) {
-        webui::Bridge::Reject(response) => response,
-        webui::Bridge::Forward {
-            id,
-            name,
-            arguments,
-        } => match channel::request(
-            config,
-            "registry.call",
-            json!({ "name": name, "arguments": arguments }),
-        ) {
-            Ok(mut response) => {
-                response.id = id;
-                response
-            }
-            Err(cause) => rpc::err(id, -32603, &format!("svcd unreachable: {}", cause)),
-        },
-    };
-    write_frame(stream, 0x1, rpc::to_line(&response).as_bytes()).is_ok()
-}
-
-#[derive(Debug)]
-struct Frame {
-    fin: bool,
-    opcode: u8,
-    payload: Vec<u8>,
-}
-
-fn read_frame<R: Read>(reader: &mut R) -> io::Result<Frame> {
-    let mut header = [0u8; 2];
-    reader.read_exact(&mut header)?;
-    let fin = header[0] & 0x80 != 0;
-    let opcode = header[0] & 0x0F;
-    if header[0] & 0x70 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "reserved frame bits are not supported",
-        ));
-    }
-    let masked = header[1] & 0x80 != 0;
-    if !masked {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "client frames must be masked",
-        ));
-    }
-    let mut length = u64::from(header[1] & 0x7F);
-    if length == 126 {
-        let mut extended = [0u8; 2];
-        reader.read_exact(&mut extended)?;
-        length = u64::from(u16::from_be_bytes(extended));
-    } else if length == 127 {
-        let mut extended = [0u8; 8];
-        reader.read_exact(&mut extended)?;
-        length = u64::from_be_bytes(extended);
-    }
-    let mut mask = [0u8; 4];
-    reader.read_exact(&mut mask)?;
-    if length > MAX_MESSAGE as u64 {
-        // Consume enough of the oversized frame for the peer to finish writing
-        // and receive our close frame instead of seeing a TCP reset.
-        let drain = length.min(MAX_MESSAGE as u64 + 1024);
-        let mut limited = reader.take(drain);
-        io::copy(&mut limited, &mut io::sink())?;
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame exceeds the 1 MiB limit",
-        ));
-    }
-    if opcode >= 0x8 && (!fin || length > 125) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid control frame",
-        ));
-    }
-    let mut payload = vec![0u8; length as usize];
-    reader.read_exact(&mut payload)?;
-    for (index, byte) in payload.iter_mut().enumerate() {
-        *byte ^= mask[index % 4];
-    }
-    Ok(Frame {
-        fin,
-        opcode,
-        payload,
-    })
-}
-
-fn write_frame<W: Write>(writer: &mut W, opcode: u8, payload: &[u8]) -> io::Result<()> {
-    let mut header = Vec::with_capacity(10);
-    header.push(0x80 | opcode);
-    if payload.len() < 126 {
-        header.push(payload.len() as u8);
-    } else if payload.len() <= u16::MAX as usize {
-        header.push(126);
-        header.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    } else {
-        header.push(127);
-        header.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-    }
-    writer.write_all(&header)?;
-    writer.write_all(payload)?;
-    writer.flush()
 }
 
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -753,8 +424,6 @@ fn sha1(data: &[u8]) -> [u8; 20] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
-    use std::thread;
 
     fn hex(bytes: &[u8]) -> String {
         let mut out = String::new();
@@ -794,7 +463,7 @@ mod tests {
         let (receiver, subscription) = bus.subscribe("demo").expect("subscribe");
         bus.publish("demo", "notifications/message", &json!({"data": "one"}));
         let event = receiver
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(std::time::Duration::from_secs(1))
             .expect("event");
         assert!(event.json.contains("notifications/message"));
         assert!(event.json.contains("one"));
@@ -878,30 +547,6 @@ mod tests {
     }
 
     #[test]
-    fn masked_client_frames_round_trip() {
-        let payload = b"{\"jsonrpc\":\"2.0\"}";
-        let mask = [1u8, 2, 3, 4];
-        let mut bytes = vec![0x81, 0x80 | payload.len() as u8];
-        bytes.extend_from_slice(&mask);
-        bytes.extend(
-            payload
-                .iter()
-                .enumerate()
-                .map(|(index, byte)| byte ^ mask[index % 4]),
-        );
-        let mut cursor = Cursor::new(bytes);
-        let frame = read_frame(&mut cursor).expect("frame");
-        assert!(frame.fin);
-        assert_eq!(frame.opcode, 0x1);
-        assert_eq!(frame.payload, payload);
-
-        let mut output = Vec::new();
-        write_frame(&mut output, 0x1, payload).expect("write");
-        assert_eq!(&output[..2], &[0x81, payload.len() as u8]);
-        assert_eq!(&output[2..], payload);
-    }
-
-    #[test]
     fn sse_events_have_id_event_and_data() {
         let text = sse_event(&Event {
             seq: 7,
@@ -911,158 +556,6 @@ mod tests {
             text,
             "id: 7\nevent: message\ndata: {\"jsonrpc\":\"2.0\"}\n\n"
         );
-    }
-
-    fn read_head(stream: &mut TcpStream) -> String {
-        let mut head = Vec::new();
-        let mut byte = [0u8; 1];
-        while !head.ends_with(b"\r\n\r\n") {
-            stream.read_exact(&mut byte).expect("response head");
-            head.push(byte[0]);
-        }
-        String::from_utf8_lossy(&head).to_string()
-    }
-
-    fn client_send(stream: &mut TcpStream, opcode: u8, payload: &[u8]) {
-        let mask = [5u8, 6, 7, 8];
-        let mut frame = vec![0x80 | opcode];
-        if payload.len() < 126 {
-            frame.push(0x80 | payload.len() as u8);
-        } else {
-            frame.push(0x80 | 126);
-            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        }
-        frame.extend_from_slice(&mask);
-        frame.extend(
-            payload
-                .iter()
-                .enumerate()
-                .map(|(index, byte)| byte ^ mask[index % 4]),
-        );
-        stream.write_all(&frame).expect("client frame");
-    }
-
-    fn client_read(stream: &mut TcpStream) -> (u8, Vec<u8>) {
-        let mut header = [0u8; 2];
-        stream.read_exact(&mut header).expect("server head");
-        let opcode = header[0] & 0x0f;
-        let mut length = u64::from(header[1] & 0x7f);
-        if length == 126 {
-            let mut extended = [0u8; 2];
-            stream.read_exact(&mut extended).expect("server length");
-            length = u64::from(u16::from_be_bytes(extended));
-        }
-        let mut payload = vec![0u8; length as usize];
-        stream.read_exact(&mut payload).expect("server payload");
-        (opcode, payload)
-    }
-
-    #[test]
-    fn sse_transport_streams_events_over_tcp() {
-        let bus = Arc::new(EventBus::new());
-        let (receiver, subscription) = bus.subscribe("demo").expect("subscribe");
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
-        let address = listener.local_addr().expect("addr");
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            serve_sse(&mut stream, receiver, Replay::default()).expect("serve sse");
-        });
-
-        let mut client = TcpStream::connect(address).expect("connect");
-        client
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("timeout");
-        let head = read_head(&mut client);
-        assert!(head.contains("text/event-stream"), "{head}");
-        bus.publish("demo", "notifications/message", &json!({"data": "hello"}));
-        let mut seen = Vec::new();
-        let mut byte = [0u8; 1];
-        while !seen.windows(5).any(|window| window == b"hello") {
-            client.read_exact(&mut byte).expect("sse body");
-            seen.push(byte[0]);
-        }
-        assert!(
-            String::from_utf8_lossy(&seen).contains("data:"),
-            "{}",
-            String::from_utf8_lossy(&seen)
-        );
-        drop(subscription);
-        let _ = server.join();
-    }
-
-    #[test]
-    fn sse_transport_writes_the_replay_reset_marker() {
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
-        let address = listener.local_addr().expect("addr");
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            serve_sse(
-                &mut stream,
-                receiver,
-                Replay {
-                    reset: true,
-                    replayed: 0,
-                },
-            )
-            .expect("serve sse");
-        });
-
-        let mut client = TcpStream::connect(address).expect("connect");
-        client
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("timeout");
-        let head = read_head(&mut client);
-        assert!(head.contains("text/event-stream"), "{head}");
-        let mut body = Vec::new();
-        let mut byte = [0u8; 1];
-        while !body
-            .windows(18)
-            .any(|window| window == b"replay-unavailable")
-        {
-            client.read_exact(&mut byte).expect("reset marker");
-            body.push(byte[0]);
-        }
-        drop(sender);
-        let _ = server.join();
-    }
-
-    #[test]
-    fn websocket_transport_writes_events_and_control_frames() {
-        let bus = Arc::new(EventBus::new());
-        let (receiver, subscription) = bus.subscribe("demo").expect("subscribe");
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
-        let address = listener.local_addr().expect("addr");
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            stream
-                .write_all(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
-                .expect("handshake");
-            serve_ws(&mut stream, Path::new("."), "demo", receiver, subscription)
-                .expect("serve ws");
-        });
-
-        let mut client = TcpStream::connect(address).expect("connect");
-        client
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("timeout");
-        let head = read_head(&mut client);
-        assert!(head.contains("101"), "{head}");
-
-        bus.publish("demo", "notifications/message", &json!({"data": "hello"}));
-        let (opcode, payload) = client_read(&mut client);
-        assert_eq!(opcode, 0x1);
-        assert!(String::from_utf8_lossy(&payload).contains("hello"));
-
-        client_send(&mut client, 0x9, b"ping");
-        let (opcode, payload) = client_read(&mut client);
-        assert_eq!(opcode, 0xA);
-        assert_eq!(payload, b"ping");
-
-        client_send(&mut client, 0x8, &[0x03, 0xE8]);
-        let (opcode, _) = client_read(&mut client);
-        assert_eq!(opcode, 0x8);
-        let _ = server.join();
     }
 
     #[test]

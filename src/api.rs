@@ -7,8 +7,6 @@
 //! in `face/api.rs` (#117); this module keeps the control-channel adapter and
 //! the streaming takeovers owned by #118–#121.
 
-#[cfg(unix)]
-use crate::channel_client_reactor::ClientReactor;
 #[cfg(any(not(unix), test))]
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -50,7 +48,6 @@ use crate::server::http::JobOutcome;
 use crate::settings;
 use crate::threads;
 use crate::transfer;
-use crate::uichannel;
 use crate::webui;
 
 /// Buffered-body limit for the routes that still go through the ordinary
@@ -75,6 +72,9 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 pub struct Api {
     lan: Arc<Mutex<Lan>>,
+    /// Stops the server loop and drains its control connections on shutdown.
+    #[cfg(unix)]
+    loop_handle: crate::server::control::handle::LoopHandle,
 }
 
 fn default_bind() -> SocketAddr {
@@ -87,7 +87,14 @@ fn resolve_bind(env: Option<&str>, configured: Option<SocketAddr>) -> SocketAddr
         .unwrap_or_else(default_bind)
 }
 
-pub fn spawn(config: PathBuf, raw_hub: Arc<crate::rawhub::RawHub>) -> std::io::Result<Arc<Api>> {
+#[cfg(unix)]
+pub fn spawn(
+    config: PathBuf,
+    raw_hub: Arc<crate::rawhub::RawHub>,
+    control: std::os::unix::net::UnixListener,
+    pending: mpsc::SyncSender<crate::channel::PendingCall>,
+    wake: Arc<crate::wake::Wake>,
+) -> std::io::Result<Arc<Api>> {
     let configured = settings::current().ok().and_then(|settings| settings.bind);
     let requested = resolve_bind(std::env::var("SVCD_BIND").ok().as_deref(), configured);
     let password_hash = settings::current()
@@ -97,6 +104,69 @@ pub fn spawn(config: PathBuf, raw_hub: Arc<crate::rawhub::RawHub>) -> std::io::R
     // A LAN bind without a password would expose an unauthenticated API. Keep
     // the daemon reachable on loopback so the operator can still run
     // `svc auth passwd`, then restart to pick up the requested bind.
+    let mut bind = requested;
+    if !requested.ip().is_loopback() && password_hash.is_none() {
+        log::svcd(&format!(
+            "svcd: bind {} requires auth_passwd; falling back to 127.0.0.1:{}",
+            requested,
+            requested.port()
+        ));
+        bind = SocketAddr::from(([127, 0, 0, 1], requested.port()));
+    }
+    let require_auth = !bind.ip().is_loopback();
+    let mut state = Lan::new(bind, requested, require_auth, password_hash);
+    // The control channel is the server's lifeline now, so an HTTP bind
+    // failure disables only HTTP; the loop still serves the CLI.
+    let listener = match TcpListener::bind(bind) {
+        Ok(listener) => match listener.local_addr() {
+            Ok(local) => {
+                state.bind = local;
+                let port_file = config.join("http.port");
+                if let Err(error) = fs::write(&port_file, format!("127.0.0.1:{}", local.port())) {
+                    log::svcd(&format!(
+                        "svcd: cannot write {}: {}",
+                        port_file.display(),
+                        error
+                    ));
+                }
+                log::svcd(&format!(
+                    "svcd: HTTP API on {} (auth required: {})",
+                    local, require_auth
+                ));
+                Some(listener)
+            }
+            Err(error) => {
+                log::svcd(&format!("svcd: HTTP API disabled: {}", error));
+                None
+            }
+        },
+        Err(error) => {
+            log::svcd(&format!("svcd: HTTP API disabled: {}", error));
+            None
+        }
+    };
+
+    let lan = Arc::new(Mutex::new(state));
+    let loop_handle = legacy::start(
+        listener,
+        control,
+        pending,
+        wake,
+        lan.clone(),
+        config,
+        raw_hub,
+    )?;
+    Ok(Arc::new(Api { lan, loop_handle }))
+}
+
+#[cfg(not(unix))]
+pub fn spawn(config: PathBuf, raw_hub: Arc<crate::rawhub::RawHub>) -> std::io::Result<Arc<Api>> {
+    let configured = settings::current().ok().and_then(|settings| settings.bind);
+    let requested = resolve_bind(std::env::var("SVCD_BIND").ok().as_deref(), configured);
+    let password_hash = settings::current()
+        .ok()
+        .and_then(|settings| settings.auth_passwd.clone());
+
     let mut bind = requested;
     if !requested.ip().is_loopback() && password_hash.is_none() {
         log::svcd(&format!(
@@ -122,21 +192,11 @@ pub fn spawn(config: PathBuf, raw_hub: Arc<crate::rawhub::RawHub>) -> std::io::R
 
     let lan = Arc::new(Mutex::new(state));
     let api = Arc::new(Api { lan: lan.clone() });
-    // The reactor parses request heads and prepares the takeover routes (plugin
-    // UI streams load the plugin manifest), which is the same class of work
-    // transfer_stack exists for. io_stack (32 KiB floor) and request_stack
-    // (64 KiB floor) both overflowed there under a minimal svcd.conf and
-    // aborted the whole daemon (#108).
-    #[cfg(unix)]
-    legacy::start(listener, lan, config, raw_hub)?;
-    #[cfg(not(unix))]
-    {
-        let _ = raw_hub;
-        thread::Builder::new()
-            .name("svcd-http".into())
-            .stack_size(threads::io_stack())
-            .spawn(move || listener_loop(Some(listener), lan, config))?;
-    }
+    let _ = raw_hub;
+    thread::Builder::new()
+        .name("svcd-http".into())
+        .stack_size(threads::io_stack())
+        .spawn(move || listener_loop(Some(listener), lan, config))?;
     Ok(api)
 }
 
@@ -151,6 +211,13 @@ impl Api {
         let state = self.lan.lock().map_err(|_| "LAN state poisoned")?;
         Ok(state.status())
     }
+
+    /// Stop the server loop after the supervisor loop returned. On Unix this
+    /// drains queued control replies and flushes them before the process exits.
+    pub fn shutdown(&self) {
+        #[cfg(unix)]
+        self.loop_handle.shutdown();
+    }
 }
 
 #[cfg(unix)]
@@ -161,16 +228,8 @@ struct HttpJob {
 }
 
 #[cfg(unix)]
-struct WsJob {
-    connection: u64,
-    plugin: String,
-    payload: Vec<u8>,
-}
-
-#[cfg(unix)]
 enum Work {
     Http(HttpJob),
-    Ws(WsJob),
 }
 
 #[cfg(unix)]
@@ -190,56 +249,20 @@ struct JobResult {
 }
 
 #[cfg(unix)]
-struct WsResult {
-    connection: u64,
-    text: String,
-}
-
-#[cfg(unix)]
 enum WorkResult {
     Http(JobResult),
-    Ws(WsResult),
     /// One blocking-pool job ended; the server loop takes its completion slot
     /// by connection id, or drops it when the connection is gone.
-    BlockingDone { key: u64, outcome: JobOutcome },
-}
-
-#[cfg(unix)]
-struct SseState {
-    receiver: Receiver<uichannel::Event>,
-    _subscription: uichannel::Subscription,
-    heartbeat: Instant,
-}
-
-#[cfg(unix)]
-struct WsState {
-    receiver: Receiver<uichannel::Event>,
-    _subscription: uichannel::Subscription,
-    plugin: String,
-    buffer: Vec<u8>,
-    fragment: Vec<u8>,
-    fragment_opcode: Option<u8>,
-    pending: bool,
-    queued: VecDeque<Vec<u8>>,
-    queued_bytes: usize,
-    heartbeat: Instant,
-    discard: usize,
-    close_after: Option<(u16, String)>,
-}
-
-#[cfg(unix)]
-struct RawWsState {
-    subscription: crate::rawhub::RawSubscription,
-    buffer: Vec<u8>,
-    fragment: Vec<u8>,
-    fragment_opcode: Option<u8>,
-    heartbeat: Instant,
-    /// Diagnostics: bytes read from the socket and bytes consumed by the
-    /// frame parser. A mismatch between `bytes_read` and
-    /// `bytes_parsed + buffer.len()` means the parser lost its place.
-    bytes_read: u64,
-    bytes_parsed: u64,
-    frames: u64,
+    BlockingDone {
+        key: u64,
+        outcome: JobOutcome,
+    },
+    /// A stream handler's blocking job produced a value. The handler receives
+    /// it before the pool's own completion frees the key.
+    StreamJobDone {
+        connection: u64,
+        outcome: crate::server::http::BlockingOutcome,
+    },
 }
 
 #[cfg(unix)]
@@ -247,9 +270,6 @@ enum ConnState {
     Reading,
     Processing,
     Writing,
-    Sse(SseState),
-    Ws(WsState),
-    RawWs(RawWsState),
     /// A sans-IO handler plus the server-side deadline, file send and
     /// `max_streams` slot (see `server::http::driver`).
     Stream(crate::server::http::driver::StreamDriver),
@@ -273,16 +293,6 @@ impl JobQueue {
         queue.push_back(work);
         self.ready.notify_one();
         Ok(())
-    }
-
-    /// WebSocket jobs are bounded by the connection cap and the per-stream
-    /// `ws_inflight_requests` / `ws_inflight_bytes` limits, so they do not
-    /// consume the HTTP bridge's 64-slot budget.
-    fn push(&self, work: Work) {
-        if let Ok(mut queue) = self.queue.lock() {
-            queue.push_back(work);
-            self.ready.notify_one();
-        }
     }
 
     fn pop(&self) -> Work {
@@ -320,30 +330,6 @@ fn http_worker(
                     keep_alive: job.keep_alive,
                 })
             }
-            Work::Ws(job) => {
-                let response = match webui::bridge_request(&job.plugin, &job.payload) {
-                    webui::Bridge::Reject(response) => response,
-                    webui::Bridge::Forward {
-                        id,
-                        name,
-                        arguments,
-                    } => match channel::request(
-                        &config,
-                        "registry.call",
-                        json!({ "name": name, "arguments": arguments }),
-                    ) {
-                        Ok(mut response) => {
-                            response.id = id;
-                            response
-                        }
-                        Err(cause) => rpc::err(id, -32603, &format!("svcd unreachable: {}", cause)),
-                    },
-                };
-                WorkResult::Ws(WsResult {
-                    connection: job.connection,
-                    text: rpc::to_line(&response),
-                })
-            }
         };
         if results.send(result).is_err() {
             return;
@@ -352,967 +338,6 @@ fn http_worker(
             let _ = (&*notify).write(&[1]);
         }
     }
-}
-
-#[cfg(unix)]
-fn ui_stream_kind(path: &str) -> Option<&'static str> {
-    let path = path.split_once('?').map(|(path, _)| path).unwrap_or(path);
-    let ui = ui_path(path)?;
-    match ui.sub {
-        "events" => Some("events"),
-        "ws" => Some("ws"),
-        "raw" => Some("raw"),
-        _ => None,
-    }
-}
-
-#[cfg(unix)]
-fn prepare_sse(
-    request: &HttpRequest,
-    lan: &Arc<Mutex<Lan>>,
-) -> Result<
-    (
-        Receiver<uichannel::Event>,
-        uichannel::Subscription,
-        uichannel::Replay,
-    ),
-    Vec<u8>,
-> {
-    let path = request
-        .path
-        .split_once('?')
-        .map(|(path, _)| path)
-        .unwrap_or(request.path.as_str());
-    let ui = ui_path(path).ok_or_else(|| error(404, "not_found", "unknown plugin UI"))?;
-    if request.method != "GET" {
-        return Err(method_not_allowed("GET"));
-    }
-    if let Ok(mut state) = lan.lock() {
-        if state.authenticate(&request.headers).is_err() {
-            return Err(error(401, "unauthorized", "authentication required"));
-        }
-    } else {
-        return Err(error(500, "internal", "LAN state unavailable"));
-    }
-    if !package::valid_name(ui.id) || plugin::web_assets(ui.id).is_none() {
-        return Err(error(404, "not_found", "unknown plugin UI"));
-    }
-    if !token_valid(lan, ui.token, ui.id) {
-        return Err(error(
-            401,
-            "unauthorized",
-            "invalid or expired plugin token",
-        ));
-    }
-    if request_header(request, "origin").is_some() && !http::same_origin(&request.headers) {
-        return Err(error(
-            403,
-            "forbidden",
-            "cross-origin calls are not allowed",
-        ));
-    }
-    let last_event_id =
-        request_header(request, "last-event-id").and_then(|value| value.trim().parse::<u64>().ok());
-    let (receiver, subscription, replay) = uichannel::bus()
-        .subscribe_from(ui.id, last_event_id)
-        .map_err(|_| {
-            error(
-                429,
-                "too_many_subscribers",
-                "too many UI subscribers for this plugin",
-            )
-        })?;
-    Ok((receiver, subscription, replay))
-}
-
-#[cfg(unix)]
-fn start_sse(
-    connection: &mut Connection,
-    receiver: Receiver<uichannel::Event>,
-    subscription: uichannel::Subscription,
-    replay: uichannel::Replay,
-) {
-    connection.out.clear();
-    connection.out.extend_from_slice(
-        b"HTTP/1.1 200 OK\r\n\
-          Content-Type: text/event-stream\r\n\
-          Cache-Control: no-cache\r\n\
-          Connection: keep-alive\r\n\
-          X-Accel-Buffering: no\r\n\
-          Transfer-Encoding: chunked\r\n\r\n",
-    );
-    if replay.reset {
-        push_sse_chunk(
-            &mut connection.out,
-            b"event: reset\ndata: {\"reason\":\"replay-unavailable\"}\n\n",
-        );
-    }
-    connection.out_at = 0;
-    connection.keep_alive = true;
-    connection.state = ConnState::Sse(SseState {
-        receiver,
-        _subscription: subscription,
-        heartbeat: Instant::now(),
-    });
-}
-
-#[cfg(unix)]
-fn fill_sse(connection: &mut Connection) {
-    let ConnState::Sse(state) = &mut connection.state else {
-        return;
-    };
-    while let Ok(event) = state.receiver.try_recv() {
-        push_sse_chunk(&mut connection.out, uichannel::sse_event(&event).as_bytes());
-    }
-    if state.heartbeat.elapsed() >= Duration::from_secs(15) {
-        push_sse_chunk(&mut connection.out, b": ping\n\n");
-        state.heartbeat = Instant::now();
-    }
-}
-
-#[cfg(unix)]
-fn push_sse_chunk(out: &mut Vec<u8>, data: &[u8]) {
-    out.extend_from_slice(format!("{:x}\r\n", data.len()).as_bytes());
-    out.extend_from_slice(data);
-    out.extend_from_slice(b"\r\n");
-}
-
-#[cfg(unix)]
-fn prepare_ws(
-    request: &HttpRequest,
-    lan: &Arc<Mutex<Lan>>,
-) -> Result<
-    (
-        String,
-        String,
-        Receiver<uichannel::Event>,
-        uichannel::Subscription,
-    ),
-    Vec<u8>,
-> {
-    let path = request
-        .path
-        .split_once('?')
-        .map(|(path, _)| path)
-        .unwrap_or(request.path.as_str());
-    let ui = ui_path(path).ok_or_else(|| error(404, "not_found", "unknown plugin UI"))?;
-    if ui.sub != "ws" {
-        return Err(error(404, "not_found", "unknown plugin UI"));
-    }
-    if request.method != "GET" {
-        return Err(method_not_allowed("GET"));
-    }
-    let auth = if let Ok(mut state) = lan.lock() {
-        state
-            .authenticate(&request.headers)
-            .map_err(|_| error(401, "unauthorized", "authentication required"))?
-    } else {
-        return Err(error(500, "internal", "LAN state unavailable"));
-    };
-    if !package::valid_name(ui.id) || plugin::web_assets(ui.id).is_none() {
-        return Err(error(404, "not_found", "unknown plugin UI"));
-    }
-    if !token_valid(lan, ui.token, ui.id) {
-        return Err(error(
-            401,
-            "unauthorized",
-            "invalid or expired plugin token",
-        ));
-    }
-    let origin = request_header(request, "origin");
-    if origin.is_some() && !http::same_origin(&request.headers) {
-        return Err(error(
-            403,
-            "forbidden",
-            "cross-origin calls are not allowed",
-        ));
-    }
-    if auth == AuthKind::Cookie && origin.is_none() {
-        return Err(error(
-            403,
-            "forbidden",
-            "Origin is required for cookie-authenticated WebSocket calls",
-        ));
-    }
-    let accept = uichannel::ws_accept(&request.headers).map_err(|message| {
-        http::response_with_headers(
-            426,
-            "text/plain; charset=utf-8",
-            &[
-                ("Upgrade".to_string(), "websocket".to_string()),
-                ("Sec-WebSocket-Version".to_string(), "13".to_string()),
-            ],
-            message.as_bytes(),
-        )
-    })?;
-    let (receiver, subscription) = uichannel::bus().subscribe(ui.id).map_err(|_| {
-        error(
-            429,
-            "too_many_subscribers",
-            "too many UI subscribers for this plugin",
-        )
-    })?;
-    Ok((ui.id.to_string(), accept, receiver, subscription))
-}
-
-#[cfg(unix)]
-fn prepare_raw_ws(
-    request: &HttpRequest,
-    lan: &Arc<Mutex<Lan>>,
-    raw_hub: &Arc<crate::rawhub::RawHub>,
-) -> Result<(String, String, crate::rawhub::RawSubscription), Vec<u8>> {
-    let path = request
-        .path
-        .split_once('?')
-        .map(|(path, _)| path)
-        .unwrap_or(request.path.as_str());
-    let ui = ui_path(path).ok_or_else(|| error(404, "not_found", "unknown plugin UI"))?;
-    if ui.sub != "raw" {
-        return Err(error(404, "not_found", "unknown plugin UI"));
-    }
-    if request.method != "GET" {
-        return Err(method_not_allowed("GET"));
-    }
-    let auth = if let Ok(mut state) = lan.lock() {
-        state
-            .authenticate(&request.headers)
-            .map_err(|_| error(401, "unauthorized", "authentication required"))?
-    } else {
-        return Err(error(500, "internal", "LAN state unavailable"));
-    };
-    if !package::valid_name(ui.id) {
-        return Err(error(404, "not_found", "unknown plugin UI"));
-    }
-    if !crate::limits::current().ws_raw_enabled {
-        return Err(error(403, "forbidden", "raw transport is disabled"));
-    }
-    if !token_valid(lan, ui.token, ui.id) {
-        return Err(error(
-            401,
-            "unauthorized",
-            "invalid or expired plugin token",
-        ));
-    }
-    let origin = request_header(request, "origin");
-    if origin.is_some() && !http::same_origin(&request.headers) {
-        return Err(error(
-            403,
-            "forbidden",
-            "cross-origin calls are not allowed",
-        ));
-    }
-    if auth == AuthKind::Cookie && origin.is_none() {
-        return Err(error(
-            403,
-            "forbidden",
-            "Origin is required for cookie-authenticated calls",
-        ));
-    }
-    let accept = uichannel::ws_accept(&request.headers).map_err(|message| {
-        http::response_with_headers(
-            426,
-            "text/plain; charset=utf-8",
-            &[
-                ("Upgrade".to_string(), "websocket".to_string()),
-                ("Sec-WebSocket-Version".to_string(), "13".to_string()),
-            ],
-            message.as_bytes(),
-        )
-    })?;
-    let subscription = raw_hub.subscribe(ui.id).map_err(|message| {
-        error(
-            503,
-            "raw_unavailable",
-            &format!("raw transport unavailable: {}", message),
-        )
-    })?;
-    Ok((ui.id.to_string(), accept, subscription))
-}
-
-#[cfg(unix)]
-fn start_raw_ws(
-    connection: &mut Connection,
-    accept: String,
-    subscription: crate::rawhub::RawSubscription,
-) {
-    connection.out.extend_from_slice(
-        format!(
-            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
-            accept
-        )
-        .as_bytes(),
-    );
-    connection.out_at = 0;
-    connection.keep_alive = false;
-    connection.state = ConnState::RawWs(RawWsState {
-        subscription,
-        buffer: Vec::new(),
-        fragment: Vec::new(),
-        fragment_opcode: None,
-        heartbeat: Instant::now(),
-        bytes_read: 0,
-        bytes_parsed: 0,
-        frames: 0,
-    });
-}
-
-#[cfg(unix)]
-fn start_ws(
-    connection: &mut Connection,
-    plugin: String,
-    accept: String,
-    receiver: Receiver<uichannel::Event>,
-    subscription: uichannel::Subscription,
-) {
-    connection.out.clear();
-    connection.out.extend_from_slice(
-        format!(
-            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
-            accept
-        )
-        .as_bytes(),
-    );
-    connection.out_at = 0;
-    connection.keep_alive = true;
-    connection.state = ConnState::Ws(WsState {
-        receiver,
-        _subscription: subscription,
-        plugin,
-        buffer: Vec::new(),
-        fragment: Vec::new(),
-        fragment_opcode: None,
-        pending: false,
-        queued: VecDeque::new(),
-        queued_bytes: 0,
-        heartbeat: Instant::now(),
-        discard: 0,
-        close_after: None,
-    });
-}
-
-#[cfg(unix)]
-fn fill_ws(connection: &mut Connection) {
-    let ConnState::Ws(state) = &mut connection.state else {
-        return;
-    };
-    while let Ok(event) = state.receiver.try_recv() {
-        push_ws_text(&mut connection.out, &event.json);
-    }
-    if state.heartbeat.elapsed() >= Duration::from_secs(30) {
-        push_ws_frame(&mut connection.out, 0x9, b"");
-        state.heartbeat = Instant::now();
-    }
-}
-
-#[cfg(unix)]
-fn raw_ws_log(state: &RawWsState, reason: &str) {
-    log::svcd(&format!(
-        "svcd: raw ws closed: plugin={} stream={} reason={}",
-        state.subscription.plugin(),
-        state.subscription.stream(),
-        reason
-    ));
-}
-
-#[cfg(unix)]
-fn push_ws_text(out: &mut Vec<u8>, text: &str) {
-    push_ws_frame(out, 0x1, text.as_bytes());
-}
-
-#[cfg(unix)]
-fn push_ws_frame(out: &mut Vec<u8>, opcode: u8, payload: &[u8]) {
-    out.push(0x80 | opcode);
-    if payload.len() < 126 {
-        out.push(payload.len() as u8);
-    } else if payload.len() <= u16::MAX as usize {
-        out.push(126);
-        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    } else {
-        out.push(127);
-        out.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-    }
-    out.extend_from_slice(payload);
-}
-
-#[cfg(unix)]
-fn drive_ws(connection: &mut Connection, id: u64, queue: &Arc<JobQueue>, readable: bool) -> bool {
-    {
-        let ConnState::Ws(state) = &mut connection.state else {
-            return false;
-        };
-        if state.discard > 0 {
-            if !readable {
-                return true;
-            }
-            let mut discard = [0u8; 8 * 1024];
-            match connection.stream.read(&mut discard) {
-                Ok(0) => return false,
-                Ok(read) => {
-                    state.discard = state.discard.saturating_sub(read);
-                    if state.discard > 0 {
-                        return true;
-                    }
-                    if let Some((code, reason)) = state.close_after.take() {
-                        push_ws_frame(&mut connection.out, 0x8, &close_payload(code, &reason));
-                        let _ = flush_ws_out(connection);
-                    }
-                    return false;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return true,
-                Err(_) => return false,
-            }
-        }
-    }
-    if readable {
-        let mut chunk = [0u8; 8 * 1024];
-        match connection.stream.read(&mut chunk) {
-            Ok(0) => return false,
-            Ok(read) => {
-                let ConnState::Ws(state) = &mut connection.state else {
-                    return false;
-                };
-                state.buffer.extend_from_slice(&chunk[..read]);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => return false,
-        }
-    }
-
-    let frame_limit = {
-        let limits = crate::limits::current();
-        limits.ws_max_message_bytes.max(limits.ws_raw_max_bytes)
-    };
-    loop {
-        let parsed = {
-            let ConnState::Ws(state) = &mut connection.state else {
-                return false;
-            };
-            parse_ws_frame(&state.buffer, frame_limit)
-        };
-        match parsed {
-            Ok(None) => break,
-            Ok(Some((frame, used))) => {
-                let ConnState::Ws(state) = &mut connection.state else {
-                    return false;
-                };
-                state.buffer.drain(..used);
-                if state.buffer.is_empty() {
-                    let shrink = crate::limits::current().ws_buffer_shrink_bytes;
-                    if state.buffer.capacity() > shrink {
-                        state.buffer.shrink_to(shrink);
-                    }
-                }
-                if !handle_ws_frame(connection, &frame, id, queue) {
-                    // /ws never defers a close: close_and_flush is raw-only.
-                    let _ = flush_ws_out(connection);
-                    return false;
-                }
-            }
-            Err(WsParseError::TooLarge { total }) => {
-                let ConnState::Ws(state) = &mut connection.state else {
-                    return false;
-                };
-                let buffered = state.buffer.len();
-                state.buffer.clear();
-                state.discard = total.saturating_sub(buffered);
-                state.close_after = Some((1009, "message too large".into()));
-                if state.discard == 0 {
-                    push_ws_frame(
-                        &mut connection.out,
-                        0x8,
-                        &close_payload(1009, "message too large"),
-                    );
-                    let _ = flush_ws_out(connection);
-                    return false;
-                }
-                return true;
-            }
-            Err(WsParseError::Protocol(reason)) => {
-                push_ws_frame(&mut connection.out, 0x8, &close_payload(1002, reason));
-                let _ = flush_ws_out(connection);
-                return false;
-            }
-        }
-    }
-    fill_ws(connection);
-    flush_ws_out(connection)
-}
-
-#[cfg(unix)]
-fn drive_raw_ws(
-    connection: &mut Connection,
-    id: u64,
-    queue: &Arc<JobQueue>,
-    readable: bool,
-    raw_hub: &Arc<crate::rawhub::RawHub>,
-) -> bool {
-    if readable {
-        let mut chunk = [0u8; 8 * 1024];
-        match connection.stream.read(&mut chunk) {
-            // A normal UI disconnect is not a failure: no log line.
-            Ok(0) => return false,
-            Ok(read) => {
-                let ConnState::RawWs(state) = &mut connection.state else {
-                    return false;
-                };
-                state.bytes_read += read as u64;
-                state.buffer.extend_from_slice(&chunk[..read]);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) => {
-                if let ConnState::RawWs(state) = &connection.state {
-                    raw_ws_log(state, &format!("read error: {}", error));
-                }
-                return false;
-            }
-        }
-    }
-    let frame_limit = crate::limits::current().ws_raw_max_bytes;
-    loop {
-        let parsed = {
-            let ConnState::RawWs(state) = &mut connection.state else {
-                return false;
-            };
-            parse_ws_frame(&state.buffer, frame_limit)
-        };
-        match parsed {
-            Ok(None) => break,
-            Ok(Some((frame, used))) => {
-                let ConnState::RawWs(state) = &mut connection.state else {
-                    return false;
-                };
-                state.bytes_parsed += used as u64;
-                state.frames += 1;
-                state.buffer.drain(..used);
-                if state.buffer.is_empty() {
-                    let shrink = crate::limits::current().ws_buffer_shrink_bytes;
-                    if state.buffer.capacity() > shrink {
-                        state.buffer.shrink_to(shrink);
-                    }
-                }
-                if !handle_ws_frame(connection, &frame, id, queue) {
-                    if matches!(connection.state, ConnState::Writing) {
-                        // A close frame is queued; the writer path finishes it.
-                        return true;
-                    }
-                    let _ = flush_ws_out(connection);
-                    return false;
-                }
-            }
-            Err(WsParseError::TooLarge { .. }) => {
-                return close_and_flush(connection, 1009, "message too large");
-            }
-            Err(WsParseError::Protocol(reason)) => {
-                if let ConnState::RawWs(state) = &connection.state {
-                    let head: Vec<String> = state
-                        .buffer
-                        .iter()
-                        .take(24)
-                        .map(|byte| format!("{:02x}", byte))
-                        .collect();
-                    raw_ws_log(
-                        state,
-                        &format!(
-                            "protocol error: {} buffer={} read={} parsed={} frames={} head={}",
-                            reason,
-                            state.buffer.len(),
-                            state.bytes_read,
-                            state.bytes_parsed,
-                            state.frames,
-                            head.join(" ")
-                        ),
-                    );
-                }
-                return close_and_flush(connection, 1002, reason);
-            }
-        }
-    }
-    let flushed = flush_ws_out(connection);
-    if !flushed {
-        if let ConnState::RawWs(state) = &connection.state {
-            raw_ws_log(state, "websocket write failed");
-            raw_hub.note_transport_failure(
-                crate::rawhub::RawFailure::WsWriteError,
-                state.subscription.plugin(),
-            );
-        }
-    }
-    flushed
-}
-
-#[cfg(unix)]
-fn close_ws(connection: &mut Connection, code: u16, reason: &str) -> bool {
-    if matches!(connection.state, ConnState::RawWs(_)) {
-        return close_and_flush(connection, code, reason);
-    }
-    push_ws_frame(&mut connection.out, 0x8, &close_payload(code, reason));
-    false
-}
-
-#[cfg(unix)]
-fn handle_ws_frame(
-    connection: &mut Connection,
-    frame: &WsFrame,
-    id: u64,
-    queue: &Arc<JobQueue>,
-) -> bool {
-    if frame.opcode >= 0x8 {
-        match frame.opcode {
-            0x8 => {
-                let code = if frame.payload.len() >= 2 {
-                    u16::from_be_bytes([frame.payload[0], frame.payload[1]])
-                } else {
-                    1000
-                };
-                return close_ws(connection, code, "");
-            }
-            0x9 => {
-                push_ws_frame(&mut connection.out, 0xA, &frame.payload);
-                return true;
-            }
-            0xA => return true,
-            _ => {
-                return close_ws(connection, 1002, "unknown control frame");
-            }
-        }
-    }
-    if matches!(connection.state, ConnState::RawWs(_)) {
-        let limits = crate::limits::current();
-        match frame.opcode {
-            0x2 => {
-                if frame.payload.len() > limits.ws_raw_max_bytes {
-                    return close_and_flush(connection, 1009, "raw message too large");
-                }
-                let ConnState::RawWs(state) = &mut connection.state else {
-                    return false;
-                };
-                if state.fragment_opcode.is_some() {
-                    return close_and_flush(connection, 1002, "interleaved data frame");
-                }
-                if !frame.fin {
-                    state.fragment = frame.payload.clone();
-                    state.fragment_opcode = Some(0x2);
-                    return true;
-                }
-                if let Err(error) = state.subscription.send(&frame.payload) {
-                    raw_ws_log(state, &format!("send rejected: {}", error));
-                    return close_and_flush(connection, 1013, &error);
-                }
-                return true;
-            }
-            0x1 => {
-                if let ConnState::RawWs(state) = &connection.state {
-                    raw_ws_log(state, "text frame on a binary-only transport");
-                }
-                return close_and_flush(
-                    connection,
-                    1003,
-                    "raw transport accepts binary frames only",
-                );
-            }
-            0x0 => {
-                let ConnState::RawWs(state) = &mut connection.state else {
-                    return false;
-                };
-                if state.fragment_opcode != Some(0x2) {
-                    return close_and_flush(connection, 1002, "unexpected continuation");
-                }
-                state.fragment.extend_from_slice(&frame.payload);
-                if state.fragment.len() > limits.ws_raw_max_bytes {
-                    return close_and_flush(connection, 1009, "raw message too large");
-                }
-                if frame.fin {
-                    let payload = std::mem::take(&mut state.fragment);
-                    state.fragment_opcode = None;
-                    if let Err(error) = state.subscription.send(&payload) {
-                        raw_ws_log(state, &format!("send rejected: {}", error));
-                        return close_and_flush(connection, 1013, &error);
-                    }
-                }
-                return true;
-            }
-            _ => {
-                return close_and_flush(connection, 1002, "unknown raw frame");
-            }
-        }
-    }
-    match frame.opcode {
-        0x1 | 0x2 => {
-            let limits = crate::limits::current();
-            if frame.opcode == 0x2 {
-                if !limits.ws_raw_enabled {
-                    push_ws_frame(
-                        &mut connection.out,
-                        0x8,
-                        &close_payload(1003, "binary frames are disabled"),
-                    );
-                    return false;
-                }
-                if frame.payload.len() > limits.ws_raw_max_bytes {
-                    push_ws_frame(
-                        &mut connection.out,
-                        0x8,
-                        &close_payload(1009, "raw message too large"),
-                    );
-                    return false;
-                }
-                let ConnState::Ws(state) = &mut connection.state else {
-                    return false;
-                };
-                if state.fragment_opcode.is_some() {
-                    push_ws_frame(
-                        &mut connection.out,
-                        0x8,
-                        &close_payload(1002, "interleaved data frame"),
-                    );
-                    return false;
-                }
-                if !frame.fin {
-                    state.fragment = frame.payload.clone();
-                    state.fragment_opcode = Some(0x2);
-                    return true;
-                }
-                push_ws_frame(&mut connection.out, 0x2, &frame.payload);
-                return true;
-            }
-            if frame.payload.len() > limits.ws_max_message_bytes {
-                push_ws_frame(
-                    &mut connection.out,
-                    0x8,
-                    &close_payload(1009, "message too large"),
-                );
-                return false;
-            }
-            let ConnState::Ws(state) = &mut connection.state else {
-                return false;
-            };
-            if state.fragment_opcode.is_some() {
-                push_ws_frame(
-                    &mut connection.out,
-                    0x8,
-                    &close_payload(1002, "interleaved data frame"),
-                );
-                return false;
-            }
-            if !frame.fin {
-                state.fragment = frame.payload.clone();
-                state.fragment_opcode = Some(0x1);
-                return true;
-            }
-            queue_ws_payload(connection, id, queue, &frame.payload);
-            true
-        }
-        0x0 => {
-            let ConnState::Ws(state) = &mut connection.state else {
-                return false;
-            };
-            if state.fragment_opcode.is_none() {
-                push_ws_frame(
-                    &mut connection.out,
-                    0x8,
-                    &close_payload(1002, "unexpected continuation"),
-                );
-                return false;
-            }
-            state.fragment.extend_from_slice(&frame.payload);
-            let raw = state.fragment_opcode == Some(0x2);
-            let limit = if raw {
-                crate::limits::current().ws_raw_max_bytes
-            } else {
-                crate::limits::current().ws_max_message_bytes
-            };
-            if state.fragment.len() > limit {
-                push_ws_frame(
-                    &mut connection.out,
-                    0x8,
-                    &close_payload(1009, "message too large"),
-                );
-                return false;
-            }
-            if frame.fin {
-                let payload = std::mem::take(&mut state.fragment);
-                state.fragment_opcode = None;
-                if raw {
-                    push_ws_frame(&mut connection.out, 0x2, &payload);
-                } else {
-                    queue_ws_payload(connection, id, queue, &payload);
-                }
-            }
-            true
-        }
-        _ => {
-            push_ws_frame(
-                &mut connection.out,
-                0x8,
-                &close_payload(1002, "unknown data frame"),
-            );
-            false
-        }
-    }
-}
-
-#[cfg(unix)]
-fn queue_ws_payload(connection: &mut Connection, id: u64, queue: &Arc<JobQueue>, payload: &[u8]) {
-    let limits = crate::limits::current();
-    let ConnState::Ws(state) = &mut connection.state else {
-        return;
-    };
-    if state.pending
-        && (state.queued.len() >= limits.ws_inflight_requests
-            || state.queued_bytes.saturating_add(payload.len()) > limits.ws_inflight_bytes)
-    {
-        push_ws_frame(
-            &mut connection.out,
-            0x8,
-            &close_payload(1013, "too many in-flight requests"),
-        );
-        state.close_after = Some((1013, "too many in-flight requests".into()));
-        return;
-    }
-    if state.pending {
-        state.queued_bytes = state.queued_bytes.saturating_add(payload.len());
-        state.queued.push_back(payload.to_vec());
-        return;
-    }
-    state.pending = true;
-    queue.push(Work::Ws(WsJob {
-        connection: id,
-        plugin: state.plugin.clone(),
-        payload: payload.to_vec(),
-    }));
-}
-
-#[cfg(unix)]
-fn close_payload(code: u16, reason: &str) -> Vec<u8> {
-    let mut payload = code.to_be_bytes().to_vec();
-    payload.extend_from_slice(reason.as_bytes());
-    payload
-}
-
-#[cfg(unix)]
-fn flush_ws_out(connection: &mut Connection) -> bool {
-    if connection.out_at >= connection.out.len() {
-        connection.out.clear();
-        connection.out_at = 0;
-        let shrink = crate::limits::current().ws_buffer_shrink_bytes;
-        if connection.out.capacity() > shrink {
-            connection.out.shrink_to(shrink);
-        }
-        return true;
-    }
-    match connection
-        .stream
-        .write(&connection.out[connection.out_at..])
-    {
-        Ok(0) => false,
-        Ok(written) => {
-            connection.out_at += written;
-            connection.last_active = Instant::now();
-            if connection.out_at >= connection.out.len() {
-                connection.out.clear();
-                connection.out_at = 0;
-                let shrink = crate::limits::current().ws_buffer_shrink_bytes;
-                if connection.out.capacity() > shrink {
-                    connection.out.shrink_to(shrink);
-                }
-            }
-            true
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
-        Err(_) => false,
-    }
-}
-
-/// Queue a WebSocket close frame and keep the connection alive until the frame
-/// is actually written. Dropping a raw connection with bytes still buffered
-/// makes the client see a bare EOF instead of the close reason.
-///
-/// Returns true when the caller must keep the connection (the close is still
-/// in flight), false when it can be dropped now.
-#[cfg(unix)]
-fn close_and_flush(connection: &mut Connection, code: u16, reason: &str) -> bool {
-    push_ws_frame(&mut connection.out, 0x8, &close_payload(code, reason));
-    connection.keep_alive = false;
-    let _ = flush_ws_out(connection);
-    if connection.out_at >= connection.out.len() {
-        return false;
-    }
-    connection.state = ConnState::Writing;
-    true
-}
-
-#[cfg(unix)]
-struct WsFrame {
-    fin: bool,
-    opcode: u8,
-    payload: Vec<u8>,
-}
-
-#[cfg(unix)]
-enum WsParseError {
-    Protocol(&'static str),
-    TooLarge { total: usize },
-}
-
-#[cfg(unix)]
-fn parse_ws_frame(buffer: &[u8], max: usize) -> Result<Option<(WsFrame, usize)>, WsParseError> {
-    if buffer.len() < 2 {
-        return Ok(None);
-    }
-    let fin = buffer[0] & 0x80 != 0;
-    let opcode = buffer[0] & 0x0F;
-    if buffer[0] & 0x70 != 0 {
-        return Err(WsParseError::Protocol("reserved frame bits"));
-    }
-    if buffer[1] & 0x80 == 0 {
-        return Err(WsParseError::Protocol("client frames must be masked"));
-    }
-    let mut length = u64::from(buffer[1] & 0x7F);
-    let mut at = 2;
-    if length == 126 {
-        if buffer.len() < at + 2 {
-            return Ok(None);
-        }
-        length = u64::from(u16::from_be_bytes([buffer[at], buffer[at + 1]]));
-        at += 2;
-    } else if length == 127 {
-        if buffer.len() < at + 8 {
-            return Ok(None);
-        }
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&buffer[at..at + 8]);
-        length = u64::from_be_bytes(bytes);
-        at += 8;
-    }
-    if length > max as u64 {
-        return Err(WsParseError::TooLarge {
-            total: at + 4 + length as usize,
-        });
-    }
-    if opcode >= 0x8 && (!fin || length > 125) {
-        return Err(WsParseError::Protocol("invalid control frame"));
-    }
-    if buffer.len() < at + 4 {
-        return Ok(None);
-    }
-    let mask = [buffer[at], buffer[at + 1], buffer[at + 2], buffer[at + 3]];
-    at += 4;
-    let total = at + length as usize;
-    if buffer.len() < total {
-        return Ok(None);
-    }
-    let mut payload = buffer[at..total].to_vec();
-    for (index, byte) in payload.iter_mut().enumerate() {
-        *byte ^= mask[index % 4];
-    }
-    Ok(Some((
-        WsFrame {
-            fin,
-            opcode,
-            payload,
-        },
-        total,
-    )))
 }
 
 #[cfg(unix)]
@@ -1504,10 +529,7 @@ fn listener_loop(listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config: Pa
 /// fallback owns the socket and the shared max_streams slot; a Busy result is
 /// rendered before any handler bytes are written.
 #[cfg(not(unix))]
-fn drive_fallback(
-    stream: &mut TcpStream,
-    handler: Box<dyn crate::server::http::StreamHandler>,
-) {
+fn drive_fallback(stream: &mut TcpStream, handler: Box<dyn crate::server::http::StreamHandler>) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_write_timeout(Some(crate::limits::current().transfer_timeout));
     if crate::server::http::fallback::drive(stream, handler, &[]).is_err() {
@@ -1519,10 +541,16 @@ fn drive_fallback(
 /// resolves the endpoint policy; the server layer's fallback driver owns the
 /// socket and the handler's events.
 #[cfg(not(unix))]
-fn serve_plugin_ui(stream: &mut TcpStream, head: &http::Head, peer: IpAddr, lan: &Arc<Mutex<Lan>>) {
+fn serve_plugin_ui(
+    stream: &mut TcpStream,
+    head: &http::Head,
+    peer: IpAddr,
+    lan: &Arc<Mutex<Lan>>,
+    config: PathBuf,
+) {
     use crate::server::http::Exchange;
 
-    match crate::face::plugin_ui::PluginUiFace::exchange(head, peer, lan) {
+    match crate::face::plugin_ui::PluginUiFace::exchange(head, peer, lan, config, None) {
         Err(response) => {
             let _ = stream.write_all(&response);
         }
@@ -1652,7 +680,7 @@ fn handle(
             }
         };
         if crate::face::plugin_ui::PluginUiFace::route_for(&head.method, &head.path).is_some() {
-            serve_plugin_ui(&mut stream, &head, peer, &lan);
+            serve_plugin_ui(&mut stream, &head, peer, &lan, config.clone());
             return;
         }
         if crate::face::blob::download_target(&head.method, &head.path).is_some() {
@@ -1735,9 +763,6 @@ fn handle(
                 }
             }
         }
-        if handle_stream(&mut stream, &config, &request, &lan) {
-            return;
-        }
         let mut response = respond(&config, &request, &lan);
         if keep_alive {
             response = keep_alive_response(response);
@@ -1793,9 +818,7 @@ fn serve_mcp_sse(
         },
     );
     let response = match response {
-        Ok(response) => {
-            crate::server::mcp::result::finish_modern_tool_call(call.id, response)
-        }
+        Ok(response) => crate::server::mcp::result::finish_modern_tool_call(call.id, response),
         Err(error) => rpc::err(call.id, -32603, &format!("svcd unreachable: {}", error)),
     };
     if write_error.is_none() {
@@ -1922,154 +945,6 @@ fn serve_face(
         response = keep_alive_response(response);
     }
     Some(response)
-}
-
-/// Serve the two streaming UI endpoints before the buffered router. Returns
-/// false when the path is not a UI stream so `respond` keeps its existing
-/// routes and error text.
-#[cfg(not(unix))]
-fn handle_stream(
-    stream: &mut TcpStream,
-    config: &Path,
-    request: &HttpRequest,
-    lan: &Arc<Mutex<Lan>>,
-) -> bool {
-    let path = request
-        .path
-        .split_once('?')
-        .map(|(path, _)| path)
-        .unwrap_or(request.path.as_str());
-    let Some(ui) = ui_path(path) else {
-        return false;
-    };
-    if ui.sub != "events" && ui.sub != "ws" && ui.sub != "raw" {
-        return false;
-    }
-    if request.method != "GET" {
-        let _ = stream.write_all(&method_not_allowed("GET"));
-        return true;
-    }
-    let auth = match lan.lock() {
-        Ok(mut state) => match state.authenticate(&request.headers) {
-            Ok(auth) => auth,
-            Err(()) => {
-                let _ = stream.write_all(&error(401, "unauthorized", "authentication required"));
-                return true;
-            }
-        },
-        Err(_) => {
-            let _ = stream.write_all(&error(500, "internal", "LAN state unavailable"));
-            return true;
-        }
-    };
-    if !package::valid_name(ui.id) {
-        let _ = stream.write_all(&error(404, "not_found", "unknown plugin UI"));
-        return true;
-    }
-    if !token_valid(lan, ui.token, ui.id) {
-        let _ = stream.write_all(&error(
-            401,
-            "unauthorized",
-            "invalid or expired plugin token",
-        ));
-        return true;
-    }
-
-    let origin = request_header(request, "origin");
-    if origin.is_some() && !http::same_origin(&request.headers) {
-        let _ = stream.write_all(&error(
-            403,
-            "forbidden",
-            "cross-origin calls are not allowed",
-        ));
-        return true;
-    }
-
-    // Raw is checked before the web-asset lookup on purpose: a protocol-3
-    // plugin may be headless, and "unsupported transport" must not turn into
-    // "unknown plugin UI".
-    if ui.sub == "raw" {
-        if !crate::limits::current().ws_raw_enabled {
-            let _ = stream.write_all(&error(403, "forbidden", "raw transport is disabled"));
-            return true;
-        }
-        let _ = stream.write_all(&error(
-            501,
-            "not_supported",
-            "raw transport is not supported on this platform",
-        ));
-        return true;
-    }
-
-    if plugin::web_assets(ui.id).is_none() {
-        let _ = stream.write_all(&error(404, "not_found", "unknown plugin UI"));
-        return true;
-    }
-
-    if ui.sub == "ws" {
-        if auth == AuthKind::Cookie && origin.is_none() {
-            let _ = stream.write_all(&error(
-                403,
-                "forbidden",
-                "Origin is required for cookie-authenticated WebSocket calls",
-            ));
-            return true;
-        }
-        let accept = match uichannel::ws_accept(&request.headers) {
-            Ok(accept) => accept,
-            Err(message) => {
-                let response = http::response_with_headers(
-                    426,
-                    "text/plain; charset=utf-8",
-                    &[
-                        ("Upgrade".to_string(), "websocket".to_string()),
-                        ("Sec-WebSocket-Version".to_string(), "13".to_string()),
-                    ],
-                    message.as_bytes(),
-                );
-                let _ = stream.write_all(&response);
-                return true;
-            }
-        };
-        let (receiver, subscription) = match uichannel::bus().subscribe(ui.id) {
-            Ok(subscription) => subscription,
-            Err(_) => {
-                let _ = stream.write_all(&error(
-                    429,
-                    "too_many_subscribers",
-                    "too many UI subscribers for this plugin",
-                ));
-                return true;
-            }
-        };
-        let handshake = format!(
-            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
-            accept
-        );
-        if stream.write_all(handshake.as_bytes()).is_err() {
-            return true;
-        }
-        let _ = uichannel::serve_ws(stream, config, ui.id, receiver, subscription);
-        return true;
-    }
-
-    let last_event_id =
-        request_header(request, "last-event-id").and_then(|value| value.trim().parse::<u64>().ok());
-    let (receiver, subscription, replay) =
-        match uichannel::bus().subscribe_from(ui.id, last_event_id) {
-            Ok(subscription) => subscription,
-            Err(_) => {
-                let _ = stream.write_all(&error(
-                    429,
-                    "too_many_subscribers",
-                    "too many UI subscribers for this plugin",
-                ));
-                return true;
-            }
-        };
-    let _ = uichannel::serve_sse(stream, receiver, replay);
-    drop(subscription);
-    true
 }
 
 /// Serve the paths that still own their protocol: MCP, plugin UI rpc/static
@@ -2289,8 +1164,6 @@ fn same_origin(request: &HttpRequest) -> bool {
     http::same_origin(&request.headers)
 }
 
-
-
 pub(crate) fn is_write(method: &str) -> bool {
     http::is_write_method(method)
 }
@@ -2461,10 +1334,6 @@ fn route(config: &std::path::Path, request: &HttpRequest) -> Vec<u8> {
     }
 }
 
-
-
-
-
 fn install_plugin(config: &std::path::Path, request: &HttpRequest, query: &str) -> Vec<u8> {
     if request.body.is_empty() {
         return error(400, "bad_request", "empty .spk body");
@@ -2533,7 +1402,8 @@ fn install_plugin(config: &std::path::Path, request: &HttpRequest, query: &str) 
 }
 
 pub(crate) fn require_plugin(config: &Path, id: &str) -> Result<(), Vec<u8>> {
-    require_plugin_result(config, id).map_err(|(status, code, message)| error(status, code, &message))
+    require_plugin_result(config, id)
+        .map_err(|(status, code, message)| error(status, code, &message))
 }
 
 pub(crate) fn require_plugin_result(
@@ -2555,9 +1425,6 @@ pub(crate) fn require_plugin_result(
     }
 }
 
-
-
-
 fn export_spkb(config: &Path, id: &str) -> Vec<u8> {
     if let Err(response) = require_plugin(config, id) {
         return response;
@@ -2578,7 +1445,6 @@ fn export_spk(config: &Path, id: &str) -> Vec<u8> {
         Err(message) => error(500, "internal", &message),
     }
 }
-
 
 fn import_plugin(request: &HttpRequest, query: &str) -> Vec<u8> {
     let config_id = query_value(query, "config_id");
@@ -2609,8 +1475,6 @@ fn import_plugin(request: &HttpRequest, query: &str) -> Vec<u8> {
         Err(transfer::Error::Failed(message)) => import_error(&message),
     }
 }
-
-
 
 fn method_not_allowed(allow: &str) -> Vec<u8> {
     http::method_not_allowed(allow)
@@ -2758,7 +1622,6 @@ fn code_for(status: u16) -> &'static str {
     }
 }
 
-
 fn ok(value: Value) -> Vec<u8> {
     http::response(
         200,
@@ -2849,10 +1712,16 @@ mod tests {
             limit: legacy::LEGACY_QUEUE_LIMIT,
         };
         let job = || {
-            Work::Ws(WsJob {
+            Work::Http(HttpJob {
                 connection: 1,
-                plugin: "demo".to_string(),
-                payload: Vec::new(),
+                request: HttpRequest {
+                    method: "GET".into(),
+                    path: "/api/v1/version".into(),
+                    version: "HTTP/1.1".into(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                },
+                keep_alive: false,
             })
         };
         for _ in 0..legacy::LEGACY_QUEUE_LIMIT {

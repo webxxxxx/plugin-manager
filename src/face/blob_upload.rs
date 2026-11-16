@@ -267,11 +267,17 @@ impl BlobUploadStream {
         out: &mut OutBuffer<'_>,
     ) -> StreamStep {
         match outcome {
+            BlockingOutcome::Failed(message) if message.contains("blocking queue is full") => {
+                // The pool refused the chunk before a final response: use the
+                // same 503 busy contract as a stream cap.
+                self.respond(crate::server::http::stream_busy_response());
+                self.on_writable(out)
+            }
             BlockingOutcome::Failed(message) => {
                 self.respond(status_response(&message));
                 self.on_writable(out)
             }
-            BlockingOutcome::Ok => {
+            BlockingOutcome::Ok(_) => {
                 let finished = self
                     .state
                     .lock()
@@ -327,7 +333,7 @@ impl StreamHandler for BlobUploadStream {
 fn run_chunk(state: &Arc<Mutex<UploadState>>, chunk: Vec<u8>) -> BlockingOutcome {
     let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
     match state.feed(&chunk) {
-        Ok(()) => BlockingOutcome::Ok,
+        Ok(()) => BlockingOutcome::Ok(Vec::new()),
         Err(message) => BlockingOutcome::Failed(message),
     }
 }

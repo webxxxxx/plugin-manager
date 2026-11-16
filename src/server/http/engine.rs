@@ -147,18 +147,41 @@ pub trait LegacyBridge {
     fn wake_fd(&self) -> Option<RawFd> {
         None
     }
+
+    /// Append the server-loop's extra poll sources (the control listener,
+    /// control connections, outbound management streams). The handler keeps
+    /// the same order for `on_extra_ready`; indices are stable for one pass.
+    fn prepare_extra(&mut self, _out: &mut Vec<(RawFd, i16)>) {}
+
+    /// One extra source became ready. `index` is the offset in the vector
+    /// `prepare_extra` filled for this pass.
+    fn on_extra_ready(&mut self, _index: usize, _revents: i16) {}
+
+    /// The composition root asked the loop to flush and return.
+    fn should_stop(&self) -> bool {
+        false
+    }
+
+    /// Final drain before the loop returns. No further tick runs.
+    fn on_stop(&mut self) {}
 }
 
 #[cfg(unix)]
-pub fn run<S, H>(listener: TcpListener, handler: &mut H, limits: &crate::limits::Limits)
+pub fn run<S, H>(listener: Option<TcpListener>, handler: &mut H, limits: &crate::limits::Limits)
 where
     H: LegacyBridge<State = S>,
 {
-    let _ = listener.set_nonblocking(true);
+    if let Some(listener) = &listener {
+        let _ = listener.set_nonblocking(true);
+    }
     let mut connections: Table<S> = HashMap::new();
     let mut next_id: u64 = 1;
 
     loop {
+        if handler.should_stop() {
+            handler.on_stop();
+            return;
+        }
         let now = Instant::now();
         let expired: Vec<u64> = connections
             .iter()
@@ -176,8 +199,11 @@ where
         let mut descriptors = Vec::with_capacity(connections.len() + 2);
         let mut keys = Vec::with_capacity(connections.len() + 2);
         descriptors.push(libc::pollfd {
-            fd: listener.as_raw_fd(),
-            events: libc::POLLIN,
+            fd: listener
+                .as_ref()
+                .map(|listener| listener.as_raw_fd())
+                .unwrap_or(-1),
+            events: if listener.is_some() { libc::POLLIN } else { 0 },
             revents: 0,
         });
         keys.push(0);
@@ -201,6 +227,18 @@ where
             keys.push(*id);
         }
 
+        let connection_end = descriptors.len();
+        let mut extra_fds: Vec<(RawFd, i16)> = Vec::new();
+        handler.prepare_extra(&mut extra_fds);
+        let extra_start = descriptors.len();
+        for (fd, events) in &extra_fds {
+            descriptors.push(libc::pollfd {
+                fd: *fd,
+                events: *events,
+                revents: 0,
+            });
+        }
+
         let ready = unsafe {
             libc::poll(
                 descriptors.as_mut_ptr(),
@@ -221,45 +259,50 @@ where
         }
 
         if descriptors[0].revents & libc::POLLIN != 0 {
-            loop {
-                match listener.accept() {
-                    Ok((stream, peer)) => {
-                        let ip = peer.ip();
-                        let per_ip = connections.values().filter(|c| c.peer == ip).count();
-                        if connections.len() >= limits.max_connections
-                            || per_ip >= limits.max_connections_per_ip
-                        {
-                            reject_connection(stream);
-                            continue;
+            if let Some(listener) = &listener {
+                loop {
+                    match listener.accept() {
+                        Ok((stream, peer)) => {
+                            let ip = peer.ip();
+                            let per_ip = connections.values().filter(|c| c.peer == ip).count();
+                            if connections.len() >= limits.max_connections
+                                || per_ip >= limits.max_connections_per_ip
+                            {
+                                reject_connection(stream);
+                                continue;
+                            }
+                            let _ = stream.set_nonblocking(true);
+                            let id = next_id;
+                            next_id = next_id.saturating_add(1);
+                            let mut connection = Connection {
+                                id,
+                                stream,
+                                peer: ip,
+                                last_active: Instant::now(),
+                                buffer: Vec::new(),
+                                out: Vec::new(),
+                                out_at: 0,
+                                keep_alive: false,
+                                pending: None,
+                                state: handler.new_state(id, ip),
+                            };
+                            handler.on_accept(&mut connection);
+                            connections.insert(id, connection);
                         }
-                        let _ = stream.set_nonblocking(true);
-                        let id = next_id;
-                        next_id = next_id.saturating_add(1);
-                        let mut connection = Connection {
-                            id,
-                            stream,
-                            peer: ip,
-                            last_active: Instant::now(),
-                            buffer: Vec::new(),
-                            out: Vec::new(),
-                            out_at: 0,
-                            keep_alive: false,
-                            pending: None,
-                            state: handler.new_state(id, ip),
-                        };
-                        handler.on_accept(&mut connection);
-                        connections.insert(id, connection);
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(error) => {
-                        crate::log::svcd(&format!("svcd: server loop accept failed: {}", error));
-                        break;
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) => {
+                            crate::log::svcd(&format!(
+                                "svcd: server loop accept failed: {}",
+                                error
+                            ));
+                            break;
+                        }
                     }
                 }
             }
         }
 
-        for index in 2..descriptors.len() {
+        for index in 2..connection_end {
             let id = keys[index];
             let Some(connection) = connections.get_mut(&id) else {
                 continue;
@@ -332,6 +375,13 @@ where
                         handler.on_close(&mut connection);
                     }
                 }
+            }
+        }
+
+        for offset in 0..extra_fds.len() {
+            let revents = descriptors[extra_start + offset].revents;
+            if revents != 0 {
+                handler.on_extra_ready(offset, revents);
             }
         }
     }
