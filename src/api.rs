@@ -1,10 +1,11 @@
-//! Minimal `/api/v1` HTTP management API and authentication.
+//! Runtime assembly, authentication, and the transfer/MCP paths that are not
+//! yet faces.
 //!
 //! `bind` in `svcd.conf` chooses the listener address. A non-loopback bind
 //! requires `auth_passwd`; without it the daemon falls back to loopback so the
-//! operator can still run `svc auth passwd`. Every request is translated into
-//! the same daemon RPC the CLI uses, so the HTTP surface never owns a second
-//! copy of service state.
+//! operator can still run `svc auth passwd`. Management JSON projections live
+//! in `face/api.rs` (#117); this module keeps the control-channel adapter and
+//! the streaming takeovers owned by #118–#121.
 
 #[cfg(unix)]
 use crate::channel_client_reactor::{ClientReactor, Event as ClientEvent};
@@ -55,11 +56,9 @@ use crate::transfer;
 use crate::uichannel;
 use crate::webui;
 
-const UI: &str = include_str!("web/index.html");
-
 /// Buffered-body limit for the routes that still go through the ordinary
 /// router. Blob uploads/downloads are streamed before this is consulted.
-fn body_limit(path: &str) -> u64 {
+pub(crate) fn body_limit(path: &str) -> u64 {
     let limits = crate::limits::current();
     let path = path.split_once('?').map(|(path, _)| path).unwrap_or(path);
     if path.starts_with("/api/v1/plugins") || path.starts_with("/api/v1/import") {
@@ -1711,7 +1710,7 @@ fn handle(
     // longer transfer is expected.
     let _ = stream.set_read_timeout(Some(idle_timeout));
     let _ = stream.set_write_timeout(Some(idle_timeout));
-    let face = crate::face::api::ApiFace::new(config.clone());
+    let face = crate::face::api::ApiFace::new(config.clone(), lan.clone());
     loop {
         let (head, initial) = match read_head(&mut stream) {
             Ok(head) => head,
@@ -1887,13 +1886,19 @@ fn prepare_face_request(
         return Ok(None);
     };
     // Authentication still runs per request here. Moving the principal to
-    // connection setup belongs to the server-loop slice (#114).
-    let principal = match lan.lock() {
-        Ok(mut state) => match state.authenticate(&request.headers) {
-            Ok(principal) => principal,
-            Err(()) => return Err(error(401, "unauthorized", "authentication required")),
-        },
-        Err(_) => return Err(error(500, "internal", "LAN state unavailable")),
+    // connection setup belongs to the server-loop slice (#114). A public route
+    // (login, logout, console page) must run before a session exists; the face
+    // owns that route's endpoint policy.
+    let principal = if route.public {
+        AuthKind::None
+    } else {
+        match lan.lock() {
+            Ok(mut state) => match state.authenticate(&request.headers) {
+                Ok(principal) => principal,
+                Err(()) => return Err(error(401, "unauthorized", "authentication required")),
+            },
+            Err(_) => return Err(error(500, "internal", "LAN state unavailable")),
+        }
     };
     let body = match body_for(route.body, &request.body) {
         Ok(body) => body,
@@ -2117,24 +2122,14 @@ fn handle_stream(
     true
 }
 
+/// Serve the paths that still own their protocol: MCP, plugin UI rpc/static
+/// assets, and the transfer fallbacks the face deliberately leaves alone.
 fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u8> {
     let path = request
         .path
         .split_once('?')
         .map(|(path, _)| path)
         .unwrap_or(request.path.as_str());
-    if path == "/login" && request.method == "POST" {
-        return login(request, lan);
-    }
-    if path == "/logout" && request.method == "POST" {
-        return logout(request, lan);
-    }
-    if path == "/" || path == "/index.html" {
-        if request.method != "GET" {
-            return method_not_allowed("GET");
-        }
-        return ui_page();
-    }
     if path == "/mcp" {
         // Bearer-only and outside the cookie/session policy on purpose: the
         // MCP surface must not share the browser's CSRF model (see #40).
@@ -2218,7 +2213,7 @@ fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u
         }
         return plugin_ui(config, request, &ui, auth, lan);
     }
-    route(config, request, lan)
+    route(config, request)
 }
 
 /// Serve `/plugin-ui/{id}/{token}/...`: the plugin's package-local web assets,
@@ -2344,57 +2339,20 @@ fn same_origin(request: &HttpRequest) -> bool {
     http::same_origin(&request.headers)
 }
 
-fn login(request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u8> {
-    let password = request_header(request, "authorization")
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim)
-        .map(str::to_string)
-        .or_else(|| {
-            serde_json::from_slice::<Value>(&request.body)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("password")
-                        .or_else(|| value.get("token"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-        });
-    let Some(password) = password else {
-        return error(401, "unauthorized", "password required");
-    };
-    let session = match lan.lock() {
-        Ok(mut state) => match state.login(&password) {
-            Ok(session) => session,
-            Err(message) => return error(401, "unauthorized", &message),
-        },
-        Err(_) => return error(500, "internal", "auth state unavailable"),
-    };
-    let body = serde_json::to_vec(&json!({ "ok": true })).unwrap_or_default();
-    http::response_with_headers(
-        200,
-        "application/json",
-        &lan::cookie_headers(&session),
-        &body,
-    )
-}
 
-fn logout(request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u8> {
-    if let Ok(mut state) = lan.lock() {
-        state.logout(&request.headers);
-    }
-    let body = serde_json::to_vec(&json!({ "ok": true })).unwrap_or_default();
-    http::response_with_headers(200, "application/json", &lan::clear_cookie_headers(), &body)
-}
 
-fn is_write(method: &str) -> bool {
+pub(crate) fn is_write(method: &str) -> bool {
     matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
 }
 
 fn csrf_ok(request: &HttpRequest) -> bool {
-    let host = request_header(request, "host").unwrap_or("");
-    let origin = request_header(request, "origin").unwrap_or("");
-    let csrf = request_header(request, "x-svcd-csrf").unwrap_or("");
+    csrf_ok_headers(&request.headers)
+}
+
+pub(crate) fn csrf_ok_headers(headers: &[(String, String)]) -> bool {
+    let host = http::header(headers, "host").unwrap_or("");
+    let origin = http::header(headers, "origin").unwrap_or("");
+    let csrf = http::header(headers, "x-svcd-csrf").unwrap_or("");
     !host.is_empty() && origin == format!("http://{}", host) && csrf == "1"
 }
 
@@ -2492,7 +2450,10 @@ fn request_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
     http::header(&request.headers, name)
 }
 
-fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<Lan>>) -> Vec<u8> {
+/// The only buffered routes left on the legacy worker are the transfer
+/// endpoints owned by #118–#121; every management route is claimed by
+/// `ApiFace` before this function runs.
+fn route(config: &std::path::Path, request: &HttpRequest) -> Vec<u8> {
     let (path, query) = request
         .path
         .split_once('?')
@@ -2506,52 +2467,6 @@ fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<
     }
 
     match (request.method.as_str(), parts.as_slice()) {
-        ("GET", ["api", "v1", "compat"]) => {
-            ok(serde_json::to_value(crate::compat::detect()).unwrap_or(Value::Null))
-        }
-        ("GET", ["api", "v1", "auth"]) => match lan_state.lock() {
-            Ok(state) => ok(json!({
-                "bind": state.bind.to_string(),
-                "requestedBind": state.requested_bind.to_string(),
-                "authRequired": state.require_auth,
-                "passwordSet": state.password_hash().is_some(),
-            })),
-            Err(_) => error(500, "internal", "auth state unavailable"),
-        },
-        ("GET", ["api", "v1", "services", id]) => {
-            match rpc(config, "svc.status", json!({ "id": decode(id) })) {
-                Ok(status) => ok(status),
-                Err(response) => response,
-            }
-        }
-        ("POST", ["api", "v1", "services", id, "start"]) => {
-            match rpc(config, "svc.start", json!({ "id": decode(id) })) {
-                Ok(status) => summary(status),
-                Err(response) => response,
-            }
-        }
-        ("POST", ["api", "v1", "services", id, "stop"]) => {
-            match rpc(config, "svc.stop", json!({ "id": decode(id) })) {
-                Ok(status) => summary(status),
-                Err(response) => response,
-            }
-        }
-        ("POST", ["api", "v1", "services", id, "enable"]) => {
-            match rpc(config, "svc.enable", json!({ "id": decode(id) })) {
-                Ok(status) => summary(status),
-                Err(response) => response,
-            }
-        }
-        ("POST", ["api", "v1", "services", id, "disable"]) => {
-            match rpc(config, "svc.disable", json!({ "id": decode(id) })) {
-                Ok(status) => summary(status),
-                Err(response) => response,
-            }
-        }
-        ("POST", ["api", "v1", "plugins", id, "ui-token"]) => {
-            plugin_ui_token(&decode(id), lan_state)
-        }
-        (_, ["api", "v1", "plugins", _, "ui-token"]) => method_not_allowed("POST"),
         ("POST", ["api", "v1", "plugins"]) => install_plugin(config, request, query),
         ("POST", ["api", "v1", "blobs", "uploads"]) => {
             blob_http::create_upload(blob::UploadKind::Blob)
@@ -2589,96 +2504,19 @@ fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<
         (_, ["api", "v1", "file", "uploads", _, "complete"]) => method_not_allowed("POST"),
         (_, ["api", "v1", "file", "uploads", _, "parts", _]) => method_not_allowed("PUT"),
         (_, ["api", "v1", "file", _]) => method_not_allowed("GET"),
-        ("GET", ["api", "v1", "trust"]) => trust_list(),
-        ("POST", ["api", "v1", "trust"]) => trust_add(request, query),
-        ("DELETE", ["api", "v1", "trust", key]) => trust_remove(&decode(key)),
-        (_, ["api", "v1", "trust"]) => method_not_allowed("GET, POST"),
-        (_, ["api", "v1", "trust", _]) => method_not_allowed("DELETE"),
-        ("DELETE", ["api", "v1", "plugins", id]) => {
-            let purge = query_bool(query, "purge").unwrap_or(false);
-            match rpc(
-                config,
-                "plugin.uninstall",
-                json!({ "id": decode(id), "purge": purge }),
-            ) {
-                Ok(_) => ok(json!({ "ok": true })),
-                Err(response) => response,
-            }
-        }
-        ("POST", ["api", "v1", "config", id, "reset"]) => reset_config(config, &decode(id)),
-        (_, ["api", "v1", "config", _, "reset"]) => method_not_allowed("POST"),
-        ("GET", ["api", "v1", "config", id]) => get_config(config, &decode(id)),
-        ("PUT", ["api", "v1", "config", id]) => put_config(config, &decode(id), request),
-        (_, ["api", "v1", "config", _]) => method_not_allowed("GET, PUT"),
-        ("GET", ["api", "v1", "export", id, "config"]) => export_config(config, &decode(id)),
-        (_, ["api", "v1", "export", _, "config"]) => method_not_allowed("GET"),
         ("GET", ["api", "v1", "export", id, "spk"]) => export_spk(config, &decode(id)),
         (_, ["api", "v1", "export", _, "spk"]) => method_not_allowed("GET"),
         ("GET", ["api", "v1", "export", id]) => export_spkb(config, &decode(id)),
         (_, ["api", "v1", "export", _]) => method_not_allowed("GET"),
         ("POST", ["api", "v1", "import"]) => import_plugin(request, query),
         (_, ["api", "v1", "import"]) => method_not_allowed("POST"),
-        ("GET", ["api", "v1", "logs", id]) => logs(config, &decode(id), query),
-        (_, ["api", "v1", "logs", _]) => method_not_allowed("GET"),
         _ => error(404, "not_found", "unknown endpoint"),
     }
 }
 
-fn trust_list() -> Vec<u8> {
-    match crate::trust::keys() {
-        Ok(keys) => ok(json!({
-            "keys": keys,
-            "directory": paths::trust_dir().to_string_lossy(),
-        })),
-        Err(cause) => error(500, "internal", &cause),
-    }
-}
 
-fn trust_add(request: &HttpRequest, query: &str) -> Vec<u8> {
-    let Some(key_id) = query_value(query, "key_id") else {
-        return error(400, "bad_request", "key_id is required");
-    };
-    if request.body.is_empty() {
-        return error(400, "bad_request", "empty public key");
-    }
-    match crate::trust::add(&key_id, &request.body) {
-        Ok(path) => ok(json!({
-            "keyId": key_id,
-            "path": path.to_string_lossy(),
-        })),
-        Err(error) => map_error(&error),
-    }
-}
 
-fn trust_remove(key_id: &str) -> Vec<u8> {
-    match crate::trust::remove(key_id) {
-        Ok(true) => ok(json!({ "keyId": key_id, "removed": true })),
-        Ok(false) => error(
-            404,
-            "not_found",
-            &format!("unknown trusted key: {}", key_id),
-        ),
-        Err(error) => map_error(&error),
-    }
-}
 
-fn plugin_ui_token(id: &str, lan_state: &Arc<Mutex<Lan>>) -> Vec<u8> {
-    if !package::valid_name(id) {
-        return error(404, "not_found", &format!("unknown plugin UI: {}", id));
-    }
-    if plugin::web_assets(id).is_none() {
-        return error(404, "not_found", &format!("plugin {} has no web UI", id));
-    }
-    let token = match lan_state.lock() {
-        Ok(mut state) => state.issue_plugin_token(id),
-        Err(_) => return error(500, "internal", "auth state unavailable"),
-    };
-    ok(json!({
-        "token": token,
-        "url": format!("/plugin-ui/{}/{}/", id, token),
-        "expiresIn": lan::plugin_token_ttl_secs(),
-    }))
-}
 
 fn install_plugin(config: &std::path::Path, request: &HttpRequest, query: &str) -> Vec<u8> {
     if request.body.is_empty() {
@@ -2748,10 +2586,17 @@ fn install_plugin(config: &std::path::Path, request: &HttpRequest, query: &str) 
 }
 
 pub(crate) fn require_plugin(config: &Path, id: &str) -> Result<(), Vec<u8>> {
+    require_plugin_result(config, id).map_err(|(status, code, message)| error(status, code, &message))
+}
+
+pub(crate) fn require_plugin_result(
+    config: &Path,
+    id: &str,
+) -> Result<(), (u16, &'static str, String)> {
     if !package::valid_name(id) {
-        return Err(error(404, "not_found", &format!("unknown plugin: {}", id)));
+        return Err((404, "not_found", format!("unknown plugin: {}", id)));
     }
-    let status = rpc(config, "svc.status", json!({ "id": id }))?;
+    let status = rpc_result(config, "svc.status", json!({ "id": id }))?;
     let kind = status
         .pointer("/summary/kind")
         .and_then(Value::as_str)
@@ -2759,65 +2604,18 @@ pub(crate) fn require_plugin(config: &Path, id: &str) -> Result<(), Vec<u8>> {
     if kind == "plugin" {
         Ok(())
     } else {
-        Err(error(404, "not_found", &format!("not a plugin: {}", id)))
+        Err((404, "not_found", format!("not a plugin: {}", id)))
     }
 }
 
-fn config_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn config_lock() -> std::sync::MutexGuard<'static, ()> {
     CONFIG_WRITES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn get_config(config: &Path, id: &str) -> Vec<u8> {
-    if let Err(response) = require_plugin(config, id) {
-        return response;
-    }
-    let Some(path) = plugin::active_config(id) else {
-        return error(404, "not_found", &format!("plugin {} has no config", id));
-    };
-    match fs::read(&path) {
-        Ok(data) => http::response(200, "text/plain", &data),
-        Err(cause) => error(500, "internal", &format!("read config: {}", cause)),
-    }
-}
 
-fn put_config(config: &Path, id: &str, request: &HttpRequest) -> Vec<u8> {
-    if let Err(response) = require_plugin(config, id) {
-        return response;
-    }
-    let _guard = config_lock();
-    let _lock = match plugin::lock_config(id) {
-        Ok(lock) => lock,
-        Err(message) => return error(500, "internal", &message),
-    };
-    match plugin::replace_config(id, &request.body, true) {
-        Ok(()) => ok(json!({ "ok": true })),
-        Err(message) => config_error(&message),
-    }
-}
 
-fn reset_config(config: &Path, id: &str) -> Vec<u8> {
-    if let Err(response) = require_plugin(config, id) {
-        return response;
-    }
-    let Some((template, _)) = plugin::config_template(id) else {
-        return error(
-            404,
-            "not_found",
-            &format!("plugin {} has no config template", id),
-        );
-    };
-    let _guard = config_lock();
-    let _lock = match plugin::lock_config(id) {
-        Ok(lock) => lock,
-        Err(message) => return error(500, "internal", &message),
-    };
-    match plugin::replace_config(id, &template, true) {
-        Ok(()) => ok(json!({ "ok": true })),
-        Err(message) => config_error(&message),
-    }
-}
 
 fn export_spkb(config: &Path, id: &str) -> Vec<u8> {
     if let Err(response) = require_plugin(config, id) {
@@ -2840,16 +2638,6 @@ fn export_spk(config: &Path, id: &str) -> Vec<u8> {
     }
 }
 
-fn export_config(config: &Path, id: &str) -> Vec<u8> {
-    if let Err(response) = require_plugin(config, id) {
-        return response;
-    }
-    match plugin::export_config(id) {
-        Ok((version, data)) => download(&format!("{}-{}.config", id, version), &data),
-        Err(message) if message.contains("has no config") => error(404, "not_found", &message),
-        Err(message) => error(500, "internal", &message),
-    }
-}
 
 fn import_plugin(request: &HttpRequest, query: &str) -> Vec<u8> {
     let config_id = query_value(query, "config_id");
@@ -2881,46 +2669,9 @@ fn import_plugin(request: &HttpRequest, query: &str) -> Vec<u8> {
     }
 }
 
-fn logs(config: &Path, id: &str, query: &str) -> Vec<u8> {
-    if let Err(response) = require_plugin(config, id) {
-        return response;
-    }
-    let lines = match query_value(query, "lines") {
-        None => 200,
-        Some(value) => match value.parse::<usize>() {
-            Ok(lines) if lines <= 2000 => lines,
-            _ => {
-                return error(
-                    400,
-                    "bad_request",
-                    "lines must be an integer between 0 and 2000",
-                )
-            }
-        },
-    };
-    let path = paths::logs_dir().join(format!("{}.log", id));
-    match log::tail(&path, lines) {
-        Ok(text) => http::response(200, "text/plain; charset=utf-8", cap_log(text).as_bytes()),
-        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {
-            error(404, "not_found", &format!("no log for {}", id))
-        }
-        Err(cause) => error(500, "internal", &format!("cannot read log: {}", cause)),
-    }
-}
 
-fn ui_page() -> Vec<u8> {
-    http::response_with_headers(
-        200,
-        "text/html; charset=utf-8",
-        &[
-            ("Cache-Control".to_string(), "no-store".to_string()),
-            ("X-Content-Type-Options".to_string(), "nosniff".to_string()),
-        ],
-        UI.as_bytes(),
-    )
-}
 
-fn cap_log(mut text: String) -> String {
+pub(crate) fn cap_log(mut text: String) -> String {
     if text.len() <= crate::limits::current().log_max_bytes as usize {
         return text;
     }
@@ -2957,6 +2708,11 @@ fn download(filename: &str, data: &[u8]) -> Vec<u8> {
 }
 
 fn import_error(message: &str) -> Vec<u8> {
+    let (status, code, message) = import_error_status(message);
+    error(status, code, &message)
+}
+
+pub(crate) fn import_error_status(message: &str) -> (u16, &'static str, String) {
     let lower = message.to_ascii_lowercase();
     let status = if lower.contains("core service") || lower.contains("unknown plugin") {
         404
@@ -2985,10 +2741,10 @@ fn import_error(message: &str) -> Vec<u8> {
     } else {
         500
     };
-    error(status, code_for(status), message)
+    (status, code_for(status), message.to_string())
 }
 
-fn config_error(message: &str) -> Vec<u8> {
+pub(crate) fn config_error_status(message: &str) -> (u16, &'static str, String) {
     let lower = message.to_ascii_lowercase();
     let status = if lower.contains("unknown plugin") {
         404
@@ -2999,7 +2755,7 @@ fn config_error(message: &str) -> Vec<u8> {
     } else {
         500
     };
-    error(status, code_for(status), message)
+    (status, code_for(status), message.to_string())
 }
 
 /// A daemon RPC failure: status, error code and message. The caller renders
@@ -3028,8 +2784,13 @@ pub(crate) fn rpc(config: &std::path::Path, method: &str, params: Value) -> Resu
 }
 
 pub(crate) fn map_error(message: &str) -> Vec<u8> {
+    let (status, code, message) = map_error_status(message);
+    error(status, code, &message)
+}
+
+pub(crate) fn map_error_status(message: &str) -> (u16, &'static str, String) {
     let status = status_for_error(message);
-    error(status, code_for(status), message)
+    (status, code_for(status), message.to_string())
 }
 
 fn status_for_error(message: &str) -> u16 {
@@ -3081,11 +2842,6 @@ fn code_for(status: u16) -> &'static str {
     }
 }
 
-fn summary(status: Value) -> Vec<u8> {
-    ok(json!({
-        "summary": status.get("summary").cloned().unwrap_or(Value::Null)
-    }))
-}
 
 fn ok(value: Value) -> Vec<u8> {
     http::response(
@@ -3099,7 +2855,7 @@ fn error(status: u16, code: &str, message: &str) -> Vec<u8> {
     http::json_error(status, code, message)
 }
 
-fn query_value(query: &str, key: &str) -> Option<String> {
+pub(crate) fn query_value(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (name, value) = pair.split_once('=')?;
         if name == key {
@@ -3110,11 +2866,11 @@ fn query_value(query: &str, key: &str) -> Option<String> {
     })
 }
 
-fn query_bool(query: &str, key: &str) -> Option<bool> {
+pub(crate) fn query_bool(query: &str, key: &str) -> Option<bool> {
     query_value(query, key).map(|value| value == "true" || value == "1")
 }
 
-fn decode(value: &str) -> String {
+pub(crate) fn decode(value: &str) -> String {
     http::percent_decode(value, true)
 }
 

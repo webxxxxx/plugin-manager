@@ -43,7 +43,7 @@ pub(crate) fn start(
     let _ = notify_rx.set_nonblocking(true);
     let _ = notify_tx.set_nonblocking(true);
 
-    let face: Arc<dyn Face> = Arc::new(crate::face::api::ApiFace::new(config.clone()));
+    let face: Arc<dyn Face> = Arc::new(crate::face::api::ApiFace::new(config.clone(), lan.clone()));
     // The pool belongs to the server loop, not to one request or the temporary
     // bridge. Starting it before the loop means a thread-spawn failure fails
     // HTTP startup instead of silently disabling every route after start().
@@ -809,7 +809,6 @@ fn stream_busy() -> Vec<u8> {
         &serde_json::to_vec(&body).unwrap_or_default(),
     )
 }
-
 
 fn write_response(connection: &mut Connection, response: Vec<u8>, keep_alive: bool) {
     connection.out = response;
