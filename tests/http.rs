@@ -4346,6 +4346,45 @@ fn http_keep_alive_serves_version_through_the_face() {
     assert_eq!(raw_header_values(&second, "connection"), vec!["close"]);
 }
 
+/// An idle connection that has not sent a request must be closed silently
+/// after `http_idle_timeout_secs`; it must not receive a 400 the client never
+/// asked for. Both engines close the socket, so the assertion is the same.
+#[test]
+fn an_idle_connection_is_closed_without_a_response() {
+    let mut sandbox = Sandbox::new();
+    fs::write(
+        sandbox.config.join("svcd.conf"),
+        "http_idle_timeout_secs = 1\n",
+    )
+    .expect("write svcd.conf");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let mut idle = TcpStream::connect(&address).expect("idle connection");
+    idle.set_read_timeout(Some(Duration::from_secs(8)))
+        .expect("timeout");
+    let mut sink = [0u8; 64];
+    loop {
+        match idle.read(&mut sink) {
+            Ok(0) => break,
+            Ok(read) => panic!(
+                "an idle connection must be closed, not answered: {:?}",
+                String::from_utf8_lossy(&sink[..read])
+            ),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                panic!("the daemon did not close an idle connection within 8 s")
+            }
+            // A reset from the server's close is still a close, not a response.
+            Err(_) => break,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // S4 thread-budget regression (Linux only).
 //
@@ -5230,11 +5269,7 @@ fn run_min_config_phase(phase: &str, streams: bool) {
             if status != 200 {
                 regression_failure(
                     &mut sandbox,
-                    if streams {
-                        "max_connections / max_connections_per_ip"
-                    } else {
-                        "max_connections"
-                    },
+                    "max_connections / max_connections_per_ip",
                     &format!("{name} concurrent connection"),
                     "status 200",
                     &format!("status {status}"),
