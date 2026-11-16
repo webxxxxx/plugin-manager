@@ -5,6 +5,7 @@
 //   1. 层方向：调用者的层 rank 必须 >= 被调用者；反向即违规。
 //   2. 循环依赖：模块图必须是 DAG；报告强连通分量，并给出一条具体短环。
 //   3. 文件名后缀：协议名只该在 server/ 出现一次（_http / _handler / _manager / utils）。
+//   4. 映射卫生：映射里的模块必须在 src/ 存在；src/ 的顶层模块必须已映射。
 //
 // 用法：
 //   node tools/dep-lint.mjs              人读输出；有违规退出码 1
@@ -293,7 +294,7 @@ function suffixViolations(sources, map) {
   return { errors, warnings };
 }
 
-function report({ map, modules, sources, edges, unknown, layers, cycles, suffixes }) {
+function report({ map, modules, sources, edges, unknown, stale, layers, cycles, suffixes }) {
   const lines = [];
   lines.push("dep-lint · 观测基线（只读，不改代码）");
   lines.push(`模块 ${sources.length} 个源文件，引用边 ${edges.length} 条，映射 ${modules.size} 项`);
@@ -307,6 +308,7 @@ function report({ map, modules, sources, edges, unknown, layers, cycles, suffixe
         .join(" · "),
   );
   if (unknown.length > 0) lines.push(`⚠ 未映射的文件：${unknown.join(", ")}`);
+  if (stale.length > 0) lines.push(`⚠ 映射里不存在的模块：${stale.join(", ")}`);
 
   const pairs = new Map();
   for (const item of layers) {
@@ -347,23 +349,33 @@ function report({ map, modules, sources, edges, unknown, layers, cycles, suffixe
     lines.push(`  警告（不计入失败）：${suffixes.warnings.map((item) => item.file).join(", ")}`);
   }
 
-  const total = layers.length + cycles.length + suffixes.errors.length;
   lines.push("");
-  lines.push(`合计 ${total} 条违规（层方向 ${layers.length} · 循环分量 ${cycles.length} · 后缀 ${suffixes.errors.length}）`);
+  lines.push(`[V4] 模块映射：映射缺失或过期（${stale.length + unknown.length}）`);
+  for (const name of stale) lines.push(`  ${name}  映射里有，src/ 里没有`);
+  for (const file of unknown) lines.push(`  ${file}  src/ 里有，映射里没有`);
+  if (stale.length + unknown.length === 0) lines.push("  （无）");
+
+  const total = layers.length + cycles.length + suffixes.errors.length + stale.length + unknown.length;
+  lines.push("");
+  lines.push(
+    `合计 ${total} 条违规（层方向 ${layers.length} · 循环分量 ${cycles.length} · 后缀 ${suffixes.errors.length} · 映射 ${stale.length + unknown.length}）`,
+  );
   return { text: lines.join("\n"), total };
 }
 
 const args = parseArgs(process.argv.slice(2));
 const { map, rank, modules } = loadMap(args.map);
 const { sources, edges, unknown } = scanSources(args.src, modules);
+const mapped = new Set(sources.map((source) => source.module));
+const stale = [...modules.keys()].filter((name) => !mapped.has(name)).sort();
 const nodes = [...new Set(sources.map((source) => source.module))];
 const layers = layerViolations(edges, modules, rank);
 const cycles = cycleViolations(nodes, edges);
 const suffixes = suffixViolations(sources, map);
-const { text, total } = report({ map, modules, sources, edges, unknown, layers, cycles, suffixes });
+const { text, total } = report({ map, modules, sources, edges, unknown, stale, layers, cycles, suffixes });
 
 if (args.json) {
-  console.log(JSON.stringify({ total, layers, cycles, suffixes, unknown, files: sources.length, edges: edges.length }, null, 2));
+  console.log(JSON.stringify({ total, layers, cycles, suffixes, unknown, stale, files: sources.length, edges: edges.length }, null, 2));
 } else {
   console.log(text);
 }
