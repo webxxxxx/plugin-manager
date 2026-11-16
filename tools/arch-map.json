@@ -1,0 +1,77 @@
+{
+  "//": "当前 src/*.rs 到目标架构的映射。对应 docs/architecture.md §5 目录与 §11 文件落点。文件搬家时同步改这里，否则基线会失真。",
+  "//layers": "rank 越大越靠上；调用者的 rank 必须 >= 被调用者，反向即违规。",
+  "layers": [
+    { "name": "platform", "rank": 0 },
+    { "name": "wire", "rank": 1 },
+    { "name": "kernel", "rank": 2 },
+    { "name": "domain", "rank": 3 },
+    { "name": "server", "rank": 4 },
+    { "name": "face", "rank": 5 },
+    { "name": "cli", "rank": 5 },
+    { "name": "compose", "rank": 6 }
+  ],
+  "suffixErrors": ["_http", "_handler", "_manager", "utils"],
+  "suffixWarnings": ["_reactor", "_client", "_server"],
+  "modules": {
+    "paths": { "concept": "platform/paths", "layer": "platform" },
+    "log": { "concept": "platform/log", "layer": "platform" },
+    "settings": { "concept": "platform/config", "layer": "platform" },
+    "limits": { "concept": "platform/config", "layer": "platform" },
+    "threads": { "concept": "platform/host", "layer": "platform" },
+    "wake": { "concept": "platform/host", "layer": "platform" },
+    "proc": { "concept": "platform/host", "layer": "platform" },
+    "zerocopy": { "concept": "platform/host", "layer": "platform" },
+    "compat": { "concept": "platform/compat", "layer": "platform" },
+    "auth": { "concept": "platform/auth", "layer": "platform" },
+
+    "ipc": { "concept": "wire/message", "layer": "wire" },
+    "rpc": { "concept": "wire/message", "layer": "wire" },
+    "reactor": { "concept": "wire/contract", "layer": "wire" },
+    "rawhub": { "concept": "wire/contract", "layer": "wire" },
+    "channel": { "concept": "wire/control", "layer": "wire", "note": "控制面客户端与服务端混在一个文件" },
+    "channel_reactor": { "concept": "wire/control", "layer": "wire" },
+    "channel_client_reactor": { "concept": "wire/control", "layer": "wire" },
+
+    "package": { "concept": "manage/format", "layer": "domain" },
+    "bundle": { "concept": "manage/ops", "layer": "domain" },
+    "trust": { "concept": "manage/check", "layer": "domain" },
+    "interpreter": { "concept": "manage/check", "layer": "domain" },
+    "plugin": { "concept": "manage/layout", "layer": "domain", "note": "布局+扫描+能力声明混在一起" },
+    "transfer": { "concept": "manage/ops", "layer": "domain", "note": "导入语义，现横跨四个模块" },
+
+    "registry": { "concept": "supervise/registry", "layer": "domain", "note": "目标在 kernel/registry" },
+    "definition": { "concept": "supervise/definition", "layer": "domain" },
+    "supervisor": { "concept": "supervise/state", "layer": "domain" },
+    "slot": { "concept": "supervise/slot", "layer": "domain", "note": "还含契约调用与 raw 注册" },
+    "runtime": { "concept": "supervise/record", "layer": "domain" },
+    "hook": { "concept": "supervise/hook", "layer": "domain" },
+    "script": { "concept": "supervise/hook", "layer": "domain" },
+
+    "blob": { "concept": "storage", "layer": "domain", "note": "目标在 platform/storage" },
+
+    "install": { "concept": "selfinstall/execute", "layer": "domain" },
+    "service_win": { "concept": "selfinstall/service_win", "layer": "domain" },
+
+    "http": { "concept": "server/http/model", "layer": "server" },
+    "mcp_http": { "concept": "server/mcp/transport", "layer": "server" },
+    "lan": { "concept": "server/auth", "layer": "server" },
+
+    "api": { "concept": "face/api", "layer": "face", "note": "还含 HTTP 引擎与 WS 帧机，要拆" },
+    "mcp": { "concept": "face/mcp_tools", "layer": "face" },
+    "catalog": { "concept": "face/mcp_tools", "layer": "face" },
+    "webui": { "concept": "face/plugin_ui", "layer": "face" },
+    "ui_http": { "concept": "face/plugin_ui", "layer": "face" },
+    "uichannel": { "concept": "face/plugin_ui", "layer": "face" },
+    "blob_http": { "concept": "face/blob", "layer": "face" },
+    "install_http": { "concept": "face/install", "layer": "face" },
+    "export_http": { "concept": "face/export", "layer": "face" },
+
+    "svc": { "concept": "cli/svc", "layer": "cli" },
+    "plugin_cli": { "concept": "cli/plugin", "layer": "cli" },
+    "status": { "concept": "cli/status", "layer": "cli" },
+
+    "main": { "concept": "compose", "layer": "compose" },
+    "daemon": { "concept": "compose", "layer": "compose" }
+  }
+}
