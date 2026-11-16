@@ -25,10 +25,11 @@ pub enum StreamAdmission {
 /// One attached handler plus everything the connection needs to drive it.
 pub struct StreamDriver {
     handler: Box<dyn StreamHandler>,
-    /// The server's no-progress upper bound.
+    /// The server's no-progress upper bound. Only real output progress moves
+    /// it; a handler-requested wakeup never replaces it.
     deadline: Instant,
-    /// The next tick, which a handler may move earlier (poll for bus events,
-    /// heartbeats). It can never move past `deadline`.
+    /// The next tick. A handler may move it earlier (poll for upstream
+    /// events, heartbeat), but never past `deadline`.
     wakeup: Instant,
     /// A server-side file send requested by the handler, after the output
     /// buffer drains.
@@ -52,13 +53,29 @@ pub struct StreamDriver {
 impl StreamDriver {
     /// Admit a handler under `max_streams`. A one-shot response is exempt.
     pub fn admit(handler: Box<dyn StreamHandler>, max_streams: usize) -> StreamAdmission {
-        let class = handler.stream_class();
-        let permit = match StreamBudget::global().acquire(class, max_streams) {
-            Ok(permit) => permit,
-            Err(Busy) => return StreamAdmission::Busy,
-        };
+        match StreamBudget::global().acquire(handler.stream_class(), max_streams) {
+            Ok(permit) => StreamAdmission::Admitted(StreamDriver::new(handler, permit)),
+            Err(Busy) => StreamAdmission::Busy,
+        }
+    }
+
+    /// Admit a handler whose budget slot was reserved before a side effect.
+    /// A streaming `tools/call` opens the outbound management call only after
+    /// the slot is known to fit, so a full cap refuses the request without
+    /// starting the plugin call. The permit is released when the driver drops.
+    pub fn admit_reserved(
+        handler: Box<dyn StreamHandler>,
+        permit: Option<super::budget::StreamPermit>,
+    ) -> StreamDriver {
+        StreamDriver::new(handler, permit)
+    }
+
+    fn new(
+        handler: Box<dyn StreamHandler>,
+        permit: Option<super::budget::StreamPermit>,
+    ) -> StreamDriver {
         let deadline = Instant::now() + limits::current().transfer_timeout;
-        StreamAdmission::Admitted(StreamDriver {
+        StreamDriver {
             handler,
             deadline,
             wakeup: deadline,
@@ -68,7 +85,7 @@ impl StreamDriver {
             awaiting: false,
             blocked_on_write: false,
             _permit: permit,
-        })
+        }
     }
 
     pub fn has_file(&self) -> bool {
@@ -164,10 +181,19 @@ impl StreamDriver {
     ) -> bool {
         loop {
             let before = *out_at;
-            if !flush(stream, out, out_at, last_active) {
-                return false;
-            }
-            if *out_at > before {
+            let wrote = match flush(stream, out, out_at, last_active) {
+                FlushOutcome::Drained(wrote) => wrote,
+                FlushOutcome::Blocked => *out_at > before,
+                FlushOutcome::Closed => {
+                    self.closing = Some(CloseReason::PeerClosed);
+                    return false;
+                }
+                FlushOutcome::Failed => {
+                    self.closing = Some(CloseReason::Failed("socket write failed".into()));
+                    return false;
+                }
+            };
+            if wrote {
                 self.touch();
             }
             if *out_at < out.len() {
@@ -221,7 +247,7 @@ impl StreamDriver {
         if self.job.is_some() || self.awaiting {
             return true;
         }
-        if now < self.deadline && self.wakeup > now {
+        if now < self.deadline {
             return true;
         }
         self.closing = Some(CloseReason::TimedOut);
@@ -250,6 +276,9 @@ impl StreamDriver {
             self.touch();
         }
         if let Some(requested) = step.deadline {
+            // A short protocol wakeup schedules a tick; it does not postpone
+            // the server's no-progress bound, and a full output buffer still
+            // closes the connection when that bound expires.
             self.wakeup = requested.min(self.deadline);
             let now = Instant::now();
             if self.wakeup < now {
@@ -275,9 +304,11 @@ impl StreamDriver {
             }
             StreamAction::SendFile(send) => {
                 self.blocked_on_write = false;
+                // The server sends this range after the output buffer drains,
+                // then delivers `Writable` again. A handler with more ranges
+                // (a file bundle is many parts) can queue the next one; one
+                // with nothing left returns `Close`.
                 self.file = Some(send);
-                // A file send is the last thing this response does.
-                self.closing = Some(CloseReason::Completed);
             }
             StreamAction::Close(reason) => {
                 self.blocked_on_write = false;
@@ -361,30 +392,44 @@ impl Drop for StreamDriver {
     }
 }
 
+enum FlushOutcome {
+    /// Everything in the buffer is on the wire. The bool says whether any
+    /// bytes were written (progress resets the no-progress bound).
+    Drained(bool),
+    /// The socket is full; the buffer is partially written.
+    Blocked,
+    /// The peer closed the connection.
+    Closed,
+    /// The socket reported a write error.
+    Failed,
+}
+
 fn flush(
     stream: &mut TcpStream,
     out: &mut Vec<u8>,
     out_at: &mut usize,
     last_active: &mut Instant,
-) -> bool {
+) -> FlushOutcome {
     if *out_at >= out.len() {
         out.clear();
         *out_at = 0;
-        return true;
+        return FlushOutcome::Drained(false);
     }
     match std::io::Write::write(stream, &out[*out_at..]) {
-        Ok(0) => false,
+        Ok(0) => FlushOutcome::Closed,
         Ok(written) => {
             *out_at += written;
             *last_active = Instant::now();
             if *out_at >= out.len() {
                 out.clear();
                 *out_at = 0;
+                FlushOutcome::Drained(true)
+            } else {
+                FlushOutcome::Blocked
             }
-            true
         }
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
-        Err(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => FlushOutcome::Blocked,
+        Err(_) => FlushOutcome::Failed,
     }
 }
 
@@ -404,7 +449,7 @@ fn read_file_chunk(send: &mut FileSend, out: &mut Vec<u8>, limit: usize) -> std:
             out.truncate(base);
             Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                "UI asset ended before its advertised length",
+                "file send ended before its advertised length",
             ))
         }
         Ok(read) => {
@@ -419,21 +464,171 @@ fn read_file_chunk(send: &mut FileSend, out: &mut Vec<u8>, limit: usize) -> std:
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{self, File};
+    use std::net::TcpListener;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn a_file_chunk_never_grows_past_the_stream_buffer() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "svcd-driver-chunk-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::write(&path, [7u8; 64]).expect("write test file");
+        let mut send = FileSend {
+            file: File::open(&path).expect("open test file"),
+            offset: 0,
+            length: 64,
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            read_file_chunk(&mut send, &mut out, 16).expect("first chunk"),
+            16
+        );
+        assert_eq!(out.len(), 16);
+        assert_eq!(
+            read_file_chunk(&mut send, &mut out, 16).expect("full buffer"),
+            0
+        );
+        assert_eq!(
+            out.len(),
+            16,
+            "a full output buffer stops the read at the high-water mark"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A handler that only waits for the next poll tick and never writes.
+    /// This is the shape of an SSE handler between upstream progress events.
+    struct IdleWaiter {
+        ticks: usize,
+        wait: Duration,
+    }
+
+    impl StreamHandler for IdleWaiter {
+        fn on_event(&mut self, event: StreamEvent<'_>, _out: &mut OutBuffer<'_>) -> StreamStep {
+            match event {
+                StreamEvent::Tick(now) => {
+                    self.ticks += 1;
+                    StreamStep::wait(StreamAction::NeedRead).within(now + self.wait)
+                }
+                StreamEvent::Writable => {
+                    _out.write(b"x");
+                    StreamStep::wait(StreamAction::NeedWrite).within(Instant::now() + self.wait)
+                }
+                StreamEvent::Closed(_) => {
+                    StreamStep::wait(StreamAction::Close(CloseReason::PeerClosed))
+                }
+                _ => StreamStep::wait(StreamAction::Continue),
+            }
+        }
+    }
+
+    /// A connected socket pair. The handler never reads or writes it in these
+    /// tests; the driver only needs a real socket for its write path.
+    fn socket() -> TcpStream {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        TcpStream::connect(address).expect("connect")
+    }
+
+    fn driver(wait: Duration) -> StreamDriver {
+        match StreamDriver::admit(Box::new(IdleWaiter { ticks: 0, wait }), usize::MAX) {
+            StreamAdmission::Admitted(driver) => driver,
+            StreamAdmission::Busy => panic!("an unlimited budget admits the handler"),
+        }
+    }
+
+    #[test]
+    fn a_short_wakeup_ticks_the_handler_without_shortening_the_bound() {
+        let mut driver = driver(Duration::from_millis(100));
+        let mut stream = socket();
+        let mut out = Vec::new();
+        let mut out_at = 0;
+        let mut last_active = Instant::now();
+
+        // The first writable event asks for a short poll wakeup.
+        assert!(driver.on_writable(&mut stream, &mut out, &mut out_at, &mut last_active));
+        let bound = driver.deadline;
+        assert!(
+            driver.wakeup < bound,
+            "the handler asked for a shorter wakeup"
+        );
+        out.clear();
+        out_at = 0;
+
+        assert!(driver.on_tick(
+            driver.wakeup + Duration::from_millis(1),
+            &mut stream,
+            &mut out,
+            &mut out_at,
+            &mut last_active,
+        ));
+        assert_eq!(
+            driver.deadline, bound,
+            "a poll tick must not replace the server's no-progress bound"
+        );
+    }
+
+    #[test]
+    fn an_idle_handler_still_closes_at_the_no_progress_bound() {
+        let mut driver = driver(Duration::from_millis(100));
+        let bound = driver.deadline;
+        let mut stream = socket();
+        let mut out = Vec::new();
+        let mut out_at = 0;
+        let mut last_active = Instant::now();
+
+        assert!(
+            !driver.on_tick(
+                bound + Duration::from_millis(1),
+                &mut stream,
+                &mut out,
+                &mut out_at,
+                &mut last_active,
+            ),
+            "the handler cannot extend the bound by asking for a tick"
+        );
+        assert_eq!(driver.closing, Some(CloseReason::TimedOut));
+    }
+
+    #[test]
+    fn output_progress_resets_the_bound_and_the_wakeup() {
+        let mut driver = driver(Duration::from_millis(100));
+        let bound = driver.deadline;
+        let mut stream = socket();
+        let mut out = Vec::new();
+        let mut out_at = 0;
+        let mut last_active = Instant::now();
+
+        assert!(driver.on_writable(&mut stream, &mut out, &mut out_at, &mut last_active));
+        assert!(!out.is_empty(), "the handler wrote a byte");
+        assert!(
+            driver.deadline > bound,
+            "writing progress must push the no-progress bound forward"
+        );
+        assert!(
+            driver.wakeup < driver.deadline,
+            "the handler's short wakeup stays earlier than the bound"
+        );
+    }
 
     struct JobHandler;
 
     impl StreamHandler for JobHandler {
         fn on_event(&mut self, event: StreamEvent<'_>, out: &mut OutBuffer<'_>) -> StreamStep {
             match event {
-                StreamEvent::Data(_) => {
-                    StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|| {
-                        BlockingOutcome::Ok(b"done".to_vec())
-                    })))
-                }
+                StreamEvent::Data(_) => StreamStep::wait(StreamAction::SubmitBlocking(Box::new(
+                    || BlockingOutcome::Ok(b"done".to_vec()),
+                ))),
                 StreamEvent::BlockingDone(BlockingOutcome::Ok(bytes)) => {
                     out.write(&bytes);
                     StreamStep::wait(StreamAction::Close(CloseReason::Completed))
@@ -456,6 +651,7 @@ mod tests {
         let mut out = Vec::new();
         let mut out_at = 0;
         assert!(driver.on_data(b"request", &mut out, &mut out_at));
+        assert!(!driver.wants_read(), "a submitted job pauses reads");
         let job = driver.take_job().expect("the handler submitted one job");
         assert!(driver.take_job().is_none(), "a job is taken once");
         assert!(
@@ -469,10 +665,8 @@ mod tests {
             &mut out_at
         ));
         assert_eq!(out, b"done");
-        assert!(
-            driver.closing.is_some(),
-            "the handler closed after the result"
-        );
+        assert!(driver.closing.is_some(), "the handler closed after the result");
+        assert!(driver.wants_read(), "the completed job releases the read gate");
     }
 
     fn job_result(job: BlockingJob) -> Vec<u8> {
@@ -488,7 +682,11 @@ mod tests {
             calls: u8,
         }
         impl StreamHandler for TwoJobs {
-            fn on_event(&mut self, event: StreamEvent<'_>, out: &mut OutBuffer<'_>) -> StreamStep {
+            fn on_event(
+                &mut self,
+                event: StreamEvent<'_>,
+                out: &mut OutBuffer<'_>,
+            ) -> StreamStep {
                 match event {
                     StreamEvent::Data(_) => {
                         StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|| {
@@ -522,11 +720,7 @@ mod tests {
         let mut out_at = 0;
         driver.on_data(b"x", &mut out, &mut out_at);
         let first = driver.take_job().expect("first job");
-        driver.on_blocking_done(
-            BlockingOutcome::Ok(job_result(first)),
-            &mut out,
-            &mut out_at,
-        );
+        driver.on_blocking_done(BlockingOutcome::Ok(job_result(first)), &mut out, &mut out_at);
         let second = driver
             .take_job()
             .expect("a WebSocket may queue the next call after a response");

@@ -7,7 +7,7 @@
 //! copy of service state.
 
 #[cfg(unix)]
-use crate::channel_client_reactor::{ClientReactor, Event as ClientEvent};
+use crate::channel_client_reactor::ClientReactor;
 #[cfg(any(not(unix), test))]
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -18,8 +18,6 @@ use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -40,6 +38,7 @@ use crate::face::plugin_ui::{ui_path, UiPath};
 use crate::http;
 use crate::lan::{self, AuthKind, Lan, LanStatus};
 use crate::log;
+#[cfg(not(unix))]
 use crate::mcp;
 use crate::mcp_http;
 use crate::package;
@@ -195,10 +194,7 @@ enum WorkResult {
     Http(JobResult),
     /// One blocking-pool job ended; the server loop takes its completion slot
     /// by connection id, or drops it when the connection is gone.
-    BlockingDone {
-        key: u64,
-        outcome: JobOutcome,
-    },
+    BlockingDone { key: u64, outcome: JobOutcome },
     /// A stream handler's blocking job produced a value. The handler receives
     /// it before the pool's own completion frees the key.
     StreamJobDone {
@@ -208,24 +204,10 @@ enum WorkResult {
 }
 
 #[cfg(unix)]
-const MAX_MCP_STREAMS: usize = 64;
-#[cfg(unix)]
-static MCP_STREAMS: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(unix)]
-struct McpSseState {
-    receiver: Receiver<ClientEvent>,
-    id: Option<Value>,
-    stream: u64,
-    done: bool,
-}
-
-#[cfg(unix)]
 enum ConnState {
     Reading,
     Processing,
     Writing,
-    McpSse(McpSseState),
     /// A sans-IO handler plus the server-side deadline, file send and
     /// `max_streams` slot (see `server::http::driver`).
     Stream(crate::server::http::driver::StreamDriver),
@@ -294,124 +276,6 @@ fn http_worker(
             let _ = (&*notify).write(&[1]);
         }
     }
-}
-
-#[cfg(unix)]
-fn start_mcp_sse(
-    connection: &mut Connection,
-    call: mcp_http::StreamingCall,
-    config: PathBuf,
-    client: &Arc<ClientReactor>,
-) {
-    if MCP_STREAMS.fetch_add(1, Ordering::SeqCst) >= MAX_MCP_STREAMS {
-        MCP_STREAMS.fetch_sub(1, Ordering::SeqCst);
-        connection.out = http::json_error(429, "too_many_streams", "too many streaming MCP calls");
-        connection.out_at = 0;
-        connection.keep_alive = false;
-        connection.state = ConnState::Writing;
-        return;
-    }
-    let (tx, rx) = mpsc::sync_channel(64);
-    let request = json!({
-        "name": call.name,
-        "arguments": call.arguments,
-        "progressToken": call.progress_token,
-    });
-    let stream = match client.open(&config, "registry.call", request, tx) {
-        Ok(stream) => stream,
-        Err(error) => {
-            MCP_STREAMS.fetch_sub(1, Ordering::SeqCst);
-            connection.out = http::json_error(
-                500,
-                "stream_start_failed",
-                &format!("cannot start streaming call: {}", error),
-            );
-            connection.out_at = 0;
-            connection.keep_alive = false;
-            connection.state = ConnState::Writing;
-            return;
-        }
-    };
-    connection.out.clear();
-    connection.out.extend_from_slice(
-        b"HTTP/1.1 200 OK\r\n\
-          Content-Type: text/event-stream\r\n\
-          Cache-Control: no-cache\r\n\
-          Connection: keep-alive\r\n\
-          Transfer-Encoding: chunked\r\n\r\n",
-    );
-    connection.out_at = 0;
-    connection.keep_alive = true;
-    connection.state = ConnState::McpSse(McpSseState {
-        receiver: rx,
-        id: call.id,
-        stream,
-        done: false,
-    });
-}
-
-#[cfg(unix)]
-fn fill_mcp_sse(connection: &mut Connection) {
-    let ConnState::McpSse(state) = &mut connection.state else {
-        return;
-    };
-    while let Ok(event) = state.receiver.try_recv() {
-        match event {
-            ClientEvent::Frame(line) => {
-                push_sse_chunk(
-                    &mut connection.out,
-                    format!("event: message\ndata: {}\n\n", line).as_bytes(),
-                );
-            }
-            ClientEvent::Final(line) => {
-                let response = serde_json::from_str::<rpc::Response>(&line).unwrap_or_else(|_| {
-                    rpc::err(
-                        state.id.clone(),
-                        -32603,
-                        "invalid response from management channel",
-                    )
-                });
-                let response = mcp::finish_modern_tool_call(state.id.clone(), response);
-                push_sse_chunk(
-                    &mut connection.out,
-                    format!("event: message\ndata: {}\n\n", rpc::to_line(&response)).as_bytes(),
-                );
-                connection.out.extend_from_slice(b"0\r\n\r\n");
-                state.done = true;
-                MCP_STREAMS.fetch_sub(1, Ordering::SeqCst);
-            }
-            ClientEvent::Error(message) => {
-                let response = rpc::err(state.id.clone(), -32603, &message);
-                let response = mcp::finish_modern_tool_call(state.id.clone(), response);
-                push_sse_chunk(
-                    &mut connection.out,
-                    format!("event: message\ndata: {}\n\n", rpc::to_line(&response)).as_bytes(),
-                );
-                connection.out.extend_from_slice(b"0\r\n\r\n");
-                state.done = true;
-                MCP_STREAMS.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-fn release_mcp_stream(connection: &Connection, client: Option<&ClientReactor>) {
-    if let ConnState::McpSse(state) = &connection.state {
-        if !state.done {
-            if let Some(client) = client {
-                client.cancel(state.stream);
-            }
-            MCP_STREAMS.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-}
-
-#[cfg(unix)]
-fn push_sse_chunk(out: &mut Vec<u8>, data: &[u8]) {
-    out.extend_from_slice(format!("{:x}\r\n", data.len()).as_bytes());
-    out.extend_from_slice(data);
-    out.extend_from_slice(b"\r\n");
 }
 
 #[cfg(unix)]
@@ -617,6 +481,21 @@ fn listener_loop(listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config: Pa
     }
 }
 
+/// Drive a face-produced stream on the Windows connection thread. The
+/// fallback owns the socket and the shared max_streams slot; a Busy result is
+/// rendered before any handler bytes are written.
+#[cfg(not(unix))]
+fn drive_fallback(
+    stream: &mut TcpStream,
+    handler: Box<dyn crate::server::http::StreamHandler>,
+) {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_write_timeout(Some(crate::limits::current().transfer_timeout));
+    if crate::server::http::fallback::drive(stream, handler).is_err() {
+        let _ = stream.write_all(&crate::server::http::stream_busy_response());
+    }
+}
+
 /// Run one plugin UI request on the Windows connection thread. The face
 /// resolves the endpoint policy; the server layer's fallback driver owns the
 /// socket and the handler's events.
@@ -637,12 +516,48 @@ fn serve_plugin_ui(
         Ok(Exchange::Response(response)) => {
             let _ = stream.write_all(&response.into_bytes());
         }
-        Ok(Exchange::Stream(handler)) => {
-            let _ = stream.set_nonblocking(false);
-            let _ = stream.set_write_timeout(Some(crate::limits::current().transfer_timeout));
-            if crate::server::http::fallback::drive(stream, handler).is_err() {
-                let _ = stream.write_all(&crate::server::http::stream_busy_response());
-            }
+        Ok(Exchange::Stream(handler)) => drive_fallback(stream, handler),
+    }
+}
+
+/// Run one blob/file download through the face and the Windows fallback
+/// driver. The handler owns no connection; the fallback owns the socket and
+/// the shared `max_streams` slot.
+#[cfg(not(unix))]
+fn serve_blob_download(
+    stream: &mut TcpStream,
+    head: &http::Head,
+    peer: IpAddr,
+    face: &crate::face::api::ApiFace,
+    lan: &Arc<Mutex<Lan>>,
+) {
+    use crate::server::http::{dispatch_inline, Exchange};
+
+    let request = HttpRequest {
+        method: head.method.clone(),
+        path: head.path.clone(),
+        version: head.version.clone(),
+        headers: head.headers.clone(),
+        body: Vec::new(),
+    };
+    let prepared = match prepare_face_request(face, &request, peer, lan) {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => {
+            let _ = stream.write_all(&http::json_error(404, "not_found", "not a download route"));
+            return;
+        }
+        Err(response) => {
+            let _ = stream.write_all(&response);
+            return;
+        }
+    };
+    match dispatch_inline(face, &prepared.route, prepared.request) {
+        Ok(Exchange::Response(response)) => {
+            let _ = stream.write_all(&response.into_bytes());
+        }
+        Ok(Exchange::Stream(handler)) => drive_fallback(stream, handler),
+        Err(cause) => {
+            let _ = stream.write_all(&http::json_error(500, "internal", &cause.message()));
         }
     }
 }
@@ -695,6 +610,10 @@ fn handle(
         };
         if crate::face::plugin_ui::PluginUiFace::route_for(&head.method, &head.path).is_some() {
             serve_plugin_ui(&mut stream, &head, peer, &lan, config.clone());
+            return;
+        }
+        if crate::face::blob::download_target(&head.method, &head.path).is_some() {
+            serve_blob_download(&mut stream, &head, peer, &face, &lan);
             return;
         }
         if let Some(route) = crate::export_http::route(&head) {
@@ -792,6 +711,19 @@ fn serve_mcp_sse(
     call: mcp_http::StreamingCall,
     config: &Path,
 ) -> std::io::Result<()> {
+    // The Windows fallback has no stream driver, but the long-lived budget is
+    // still server policy: reserve it before the head and before the plugin
+    // call starts. The permit lives until this blocking response ends.
+    let _permit = match crate::server::http::budget::StreamBudget::global().acquire(
+        crate::server::http::StreamClass::LongLived,
+        crate::limits::current().max_streams,
+    ) {
+        Ok(permit) => permit,
+        Err(_) => {
+            stream.write_all(&crate::server::http::stream_busy_response())?;
+            return Ok(());
+        }
+    };
     stream.write_all(
         b"HTTP/1.1 200 OK\r\n\
           Content-Type: text/event-stream\r\n\

@@ -11,6 +11,8 @@ use serde_json::{json, Value};
 
 use crate::server::http::{BodyPolicy, Completion, Exchange, Face, Request, Response, Route};
 
+use super::blob;
+
 /// The management API face.
 pub struct ApiFace {
     config: PathBuf,
@@ -85,12 +87,22 @@ impl Face for ApiFace {
             Some(Route::inline(BodyPolicy::Empty))
         } else if is_services(method, path) {
             Some(Route::blocking(BodyPolicy::Empty))
+        } else if blob::download_target(method, path).is_some() {
+            // A download has no request body, but its result is a stream
+            // handler: the route must say so, or the dispatch check rejects it.
+            Some(Route::inline(BodyPolicy::Streamed))
         } else {
             None
         }
     }
 
     fn handle(&self, request: Request, done: Completion) {
+        if let Some(target) = blob::download_target(&request.method, &request.path) {
+            done.complete(Exchange::Stream(Box::new(blob::DownloadStream::open(
+                &request, target,
+            ))));
+            return;
+        }
         let response = if is_version(&request.method, request.path_only()) {
             Response::json(
                 200,
@@ -189,6 +201,36 @@ mod tests {
             error,
             DispatchError::UnsupportedDispatch(Dispatch::Blocking)
         );
+    }
+
+    #[test]
+    fn blob_downloads_are_inline_streamed_routes() {
+        let face = face();
+        for (method, path) in [
+            ("GET", "/api/v1/blobs/sha256:abc"),
+            ("HEAD", "/api/v1/file/sha256:abc"),
+            ("GET", "/api/v1/files/sha256:abc"),
+        ] {
+            let route = face.route(method, path).expect("download route");
+            assert_eq!(route.dispatch, Dispatch::Inline);
+            assert_eq!(route.body, BodyPolicy::Streamed);
+        }
+        assert!(face.route("POST", "/api/v1/blobs/sha256:abc").is_none());
+        assert!(face.route("GET", "/api/v1/blobs").is_none());
+        assert!(face
+            .route("PUT", "/api/v1/blobs/uploads/x/parts/1")
+            .is_none());
+        assert!(face.route("GET", "/api/v1/file/uploads/x").is_none());
+    }
+
+    #[test]
+    fn a_download_route_returns_a_stream_even_when_the_blob_is_missing() {
+        let face = face();
+        let path = "/api/v1/blobs/sha256:deadbeef";
+        let route = face.route("GET", path).expect("download route");
+        let exchange = dispatch_inline(&face, &route, request("GET", path))
+            .expect("a missing blob is a streamed 404, not a dispatch error");
+        assert!(matches!(exchange, Exchange::Stream(_)));
     }
 
     #[test]

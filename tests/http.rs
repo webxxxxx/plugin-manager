@@ -381,25 +381,7 @@ fn read_raw_response(stream: &mut TcpStream) -> RawResponse {
 }
 
 fn read_one_response(stream: &mut TcpStream) -> RawResponse {
-    let mut head = Vec::new();
-    let mut byte = [0u8; 1];
-    while !head.ends_with(b"\r\n\r\n") {
-        stream.read_exact(&mut byte).expect("response head");
-        head.push(byte[0]);
-    }
-    let text = String::from_utf8_lossy(&head);
-    let mut lines = text.lines();
-    let status = lines
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|value| value.parse::<u16>().ok())
-        .expect("status");
-    let headers: Vec<(String, String)> = lines
-        .filter_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            Some((name.trim().to_string(), value.trim().to_string()))
-        })
-        .collect();
+    let (status, headers) = read_response_head(stream);
     let length = headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
@@ -923,6 +905,9 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
   if ($line -match '"id"\s*:\s*(\d+)') { $id = [int]$Matches[1] }
   $token = $null
   if ($line -match '"_meta"\s*:\s*\{[^}]*"progressToken"\s*:\s*"([^"]+)"') { $token = $Matches[1] }
+  if ($line -match '"name"\s*:\s*"slow"') {
+    Start-Sleep -Seconds 2
+  }
   if ($null -ne $token) {
     [Console]::Out.WriteLine('{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1,"progressToken":"' + $token + '"}}')
   }
@@ -941,6 +926,9 @@ while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   if [ -z "$id" ]; then id=1; fi
   meta=$(printf '%s\n' "$line" | sed -n 's/.*"_meta":{\([^}]*\)}.*/\1/p')
+  case "$line" in
+    *'"name":"slow"'*) sleep 2 ;;
+  esac
   token=$(printf '%s\n' "$meta" | sed -n 's/.*"progressToken":"\([^"]*\)".*/\1/p')
   if [ -n "$token" ]; then
     printf '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1,"progressToken":"%s"}}\n' "$token"
@@ -975,7 +963,8 @@ fn web_event_plugin_bundle(key: &SigningKey, id: &str) -> Vec<u8> {
         "protocol": 1,
         "exec": {"path": exec_path, "args": [], "ready": "notify"},
         "capabilities": [
-            {"name": "status", "desc": "sample status", "inputSchema": {"type": "object"}}
+            {"name": "status", "desc": "sample status", "inputSchema": {"type": "object"}},
+            {"name": "slow", "desc": "slow status", "inputSchema": {"type": "object"}}
         ],
         "ui": {"type": "web", "entry": "index.html"},
     });
@@ -1786,6 +1775,145 @@ fn blob_download_supports_range_etag_and_conditionals() {
     let missing = raw_request(&address, "HEAD", "/api/v1/blobs/sha256:deadbeef", "", b"");
     assert_eq!(missing.status, 404);
     assert!(missing.body.is_empty());
+}
+
+fn read_response_head(stream: &mut TcpStream) -> (u16, Vec<(String, String)>) {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).expect("response head");
+        head.push(byte[0]);
+    }
+    let text = String::from_utf8_lossy(&head);
+    let mut lines = text.lines();
+    let status = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .expect("status");
+    let headers = lines
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_string(), value.trim().to_string()))
+        })
+        .collect();
+    (status, headers)
+}
+
+/// A stalled download must hold one long-lived max_streams slot, keep the
+/// server loop free, and release the slot when the client disconnects. Both
+/// ends of the connection stay on the server loop; the client simply stops
+/// reading after the head.
+fn assert_slow_download_holds_the_cap(address: &str, path: &str, content: &[u8]) {
+    let mut stalled = TcpStream::connect(address).expect("stalled connect");
+    stalled
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("stalled timeout");
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        path, address
+    );
+    stalled
+        .write_all(request.as_bytes())
+        .expect("stalled request");
+    let (status, _) = read_response_head(&mut stalled);
+    assert_eq!(status, 200);
+
+    // The loop still answers an ordinary request while the transfer is stalled.
+    let version = raw_request(address, "GET", "/api/v1/version", "", b"");
+    assert_eq!(version.status, 200, "a slow reader must not block the loop");
+
+    // The stalled transfer owns the only long-lived slot.
+    let busy = raw_request(address, "GET", path, "", b"");
+    assert_eq!(busy.status, 503, "{:?}", busy.body);
+    assert_eq!(
+        raw_header_values(&busy, "retry-after"),
+        vec!["1"],
+        "the busy response keeps the stable Retry-After contract"
+    );
+    assert_eq!(json_body(&busy)["error"]["code"], "busy");
+
+    // Releasing the stalled connection releases the slot.
+    drop(stalled);
+    let mut released = None;
+    for _ in 0..200 {
+        let response = raw_request(address, "GET", path, "", b"");
+        if response.status == 200 {
+            released = Some(response);
+            break;
+        }
+        assert_eq!(response.status, 503, "{:?}", response.body);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let released = released.expect("the stream cap must be released after a disconnect");
+    assert_eq!(released.body.len(), content.len());
+    assert_eq!(released.body, content);
+}
+
+/// Larger than any plausible loopback socket buffer, so the transfer is still
+/// in progress while the client refuses to read.
+fn large_download_body() -> Vec<u8> {
+    vec![0x5a; 32 * 1024 * 1024]
+}
+
+#[test]
+fn a_slow_blob_reader_drops_the_stream_cap_and_leaves_the_loop_free() {
+    let mut sandbox = Sandbox::new();
+    sandbox.allow_insecure_install_with("max_streams = 1\n");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let content = large_download_body();
+    let put = raw_request(
+        &address,
+        "POST",
+        "/api/v1/blobs",
+        "application/octet-stream",
+        &content,
+    );
+    assert_eq!(put.status, 200, "{:?}", put.body);
+    let id = json_body(&put)["id"].as_str().expect("blob id").to_string();
+    assert_slow_download_holds_the_cap(&address, &format!("/api/v1/blobs/{}", id), &content);
+}
+
+#[test]
+fn a_slow_file_bundle_reader_drops_the_stream_cap_and_leaves_the_loop_free() {
+    let mut sandbox = Sandbox::new();
+    sandbox.allow_insecure_install_with("max_streams = 1\n");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let created = request(&address, "POST", "/api/v1/file/uploads", "", b"");
+    assert_eq!(created.status, 200, "{}", created.body);
+    let upload_id = created.body["uploadId"]
+        .as_str()
+        .expect("upload id")
+        .to_string();
+    let first = vec![0x11; 16 * 1024 * 1024];
+    let second = vec![0x22; 16 * 1024 * 1024];
+    for (number, part) in [(1, first.as_slice()), (2, second.as_slice())] {
+        let response = raw_request(
+            &address,
+            "PUT",
+            &format!("/api/v1/file/uploads/{}/parts/{}", upload_id, number),
+            "application/octet-stream",
+            part,
+        );
+        assert_eq!(response.status, 200, "{:?}", response.body);
+    }
+    let complete = request(
+        &address,
+        "POST",
+        &format!("/api/v1/file/uploads/{}/complete", upload_id),
+        "application/json",
+        b"{\"parts\":[{\"partNumber\":1},{\"partNumber\":2}]}",
+    );
+    assert_eq!(complete.status, 200, "{}", complete.body);
+    let id = complete.body["id"].as_str().expect("file id");
+    let mut content = first;
+    content.extend_from_slice(&second);
+    assert_eq!(complete.body["size"], content.len() as u64);
+    assert_slow_download_holds_the_cap(&address, &format!("/api/v1/file/{}", id), &content);
 }
 
 #[test]
@@ -2845,9 +2973,15 @@ fn http_mcp_streams_progress_for_tools_call() {
         "{head}"
     );
     let text = String::from_utf8_lossy(&decode_chunked(&response[split + 4..])).to_string();
-    assert!(text.contains("notifications/progress"), "{text}");
+    let progress = text
+        .find("notifications/progress")
+        .expect("a progress event before the result");
+    let final_at = text.find("\"id\":7").expect("the final response");
+    assert!(
+        progress < final_at,
+        "progress must arrive before the final result: {text}"
+    );
     assert!(text.contains("\"progressToken\":\"t1\""), "{text}");
-    assert!(text.contains("\"id\":7"), "{text}");
     assert!(text.contains("pong"), "{text}");
 }
 
@@ -3690,6 +3824,25 @@ fn plugin_web_ui_serves_assets_with_base_and_etag() {
     let post = raw_request(&address, "POST", &base, "", b"");
     assert_eq!(post.status, 405);
     assert_eq!(raw_header_values(&post, "allow"), vec!["GET"]);
+}
+
+#[test]
+fn a_slow_realtime_client_does_not_block_other_requests() {
+    let (_sandbox, address) = daemon_with_web_event_plugin(60);
+    let base = plugin_ui_base(&address, "demo");
+    let (mut ws, status, head) = ws_handshake(&address, &format!("{}ws", base), &[]);
+    assert_eq!(status, 101, "{head}");
+
+    // A 512 KiB binary message is echoed back. The test never reads the echo,
+    // so the server's socket buffer fills and this connection is backpressured.
+    ws_send(&mut ws, 0x2, &vec![0x41; 512 * 1024]);
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Other connections must still be served while that reader is stalled.
+    for _ in 0..4 {
+        let response = request(&address, "GET", "/api/v1/version", "", b"");
+        assert_eq!(response.status, 200, "{}", response.body);
+    }
 }
 
 #[test]
@@ -4679,6 +4832,53 @@ fn unix_idle_thread_count_has_no_per_request_or_per_stream_threads() {
         idle,
         "closing connections and streams must leave no daemon threads behind"
     );
+}
+
+/// A blob download used to take the connection out of the loop and spawn a
+/// `svcd-blob-http` thread. It is a stream handler now, so a stalled download
+/// must not change the daemon thread count.
+#[cfg(target_os = "linux")]
+#[test]
+fn unix_blob_download_has_no_takeover_thread() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let pid = sandbox.daemon.as_ref().expect("running daemon").id();
+
+    // The takeovers that remain (uploads) are transient; wait for the idle
+    // count after the upload has closed its connection.
+    let content = vec![0x5a; 32 * 1024 * 1024];
+    let put = raw_request(
+        &address,
+        "POST",
+        "/api/v1/blobs",
+        "application/octet-stream",
+        &content,
+    );
+    assert_eq!(put.status, 200, "{:?}", put.body);
+    let id = json_body(&put)["id"].as_str().expect("blob id").to_string();
+    let idle = stable_thread_count(pid);
+
+    let mut stalled = TcpStream::connect(&address).expect("stalled connect");
+    stalled
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("stalled timeout");
+    let request = format!(
+        "GET /api/v1/blobs/{} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        id, address
+    );
+    stalled
+        .write_all(request.as_bytes())
+        .expect("stalled request");
+    let (status, _) = read_response_head(&mut stalled);
+    assert_eq!(status, 200);
+
+    assert_eq!(
+        stable_thread_count(pid),
+        idle,
+        "a blob download must not add a takeover thread"
+    );
+    drop(stalled);
 }
 
 // ---------------------------------------------------------------------------
@@ -5959,4 +6159,173 @@ fn run_min_config_phase(phase: &str, streams: bool) {
             &port_after,
         );
     }
+}
+
+/// Open one streaming `tools/call` and return the connection. The caller reads
+/// the response head first, so a 503 keeps its status without waiting for SSE.
+fn mcp_stream_request(address: &str, id: u64, name: &str) -> TcpStream {
+    let body = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": name,
+            "arguments": {},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "progressToken": "t1"
+            }
+        }
+    }))
+    .expect("body");
+    let mut stream = TcpStream::connect(address).expect("mcp connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        address,
+        TEST_PASSWORD,
+        name,
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).expect("write head");
+    stream.write_all(&body).expect("write body");
+    stream
+}
+
+/// A streaming MCP call is a long-lived stream: it draws from the same
+/// `max_streams` budget as downloads, and a full budget refuses it with the
+/// stable 503 before the plugin call starts.
+#[test]
+fn http_mcp_stream_consumes_the_long_lived_max_streams_budget() {
+    let mut sandbox = Sandbox::new();
+    sandbox.allow_insecure_install_with("max_streams = 1\n");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    set_password(&sandbox, TEST_PASSWORD);
+
+    // Hold the only long-lived slot with a stalled download.
+    let content = large_download_body();
+    let put = raw_request(
+        &address,
+        "POST",
+        "/api/v1/blobs",
+        "application/octet-stream",
+        &content,
+    );
+    assert_eq!(put.status, 200, "{:?}", put.body);
+    let id = json_body(&put)["id"].as_str().expect("blob id").to_string();
+    let mut stalled = TcpStream::connect(&address).expect("stalled connect");
+    stalled
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    stalled
+        .write_all(
+            format!(
+                "GET /api/v1/blobs/{} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                id, address
+            )
+            .as_bytes(),
+        )
+        .expect("stalled request");
+    assert_eq!(read_response_head(&mut stalled).0, 200);
+
+    let mut busy = mcp_stream_request(&address, 8, "demo.status");
+    let (status, headers) = read_response_head(&mut busy);
+    assert_eq!(status, 503, "a full stream budget refuses MCP SSE");
+    assert_eq!(
+        headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+            .map(|(_, value)| value.as_str()),
+        Some("1"),
+        "the busy response keeps the stable Retry-After contract"
+    );
+    drop(busy);
+
+    // Releasing the stalled reader releases the slot for the same call.
+    drop(stalled);
+    let mut accepted = None;
+    for _ in 0..200 {
+        let mut candidate = mcp_stream_request(&address, 9, "demo.status");
+        let (status, headers) = read_response_head(&mut candidate);
+        if status == 200 {
+            accepted = Some((candidate, headers));
+            break;
+        }
+        assert_eq!(status, 503, "only the busy status is retried");
+        drop(candidate);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (mut stream, headers) = accepted.expect("the MCP stream fits after the release");
+    assert!(
+        headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type") && value.contains("text/event-stream")
+        }),
+        "{headers:?}"
+    );
+    let mut body = Vec::new();
+    stream.read_to_end(&mut body).expect("read the SSE body");
+    let text = String::from_utf8_lossy(&decode_chunked(&body)).to_string();
+    assert!(
+        text.contains("\"id\":9"),
+        "the stream ends with a result: {text}"
+    );
+}
+
+/// A disconnected streaming MCP call must release its long-lived slot: with
+/// `max_streams = 1`, a second streaming call can start as soon as the first
+/// client goes away, even while the plugin call is still running. The Windows
+/// fallback cannot cancel the in-flight call, so this is a server-loop test.
+#[cfg(unix)]
+#[test]
+fn http_mcp_stream_disconnect_releases_the_budget() {
+    let mut sandbox = Sandbox::new();
+    sandbox.allow_insecure_install_with("max_streams = 1\n");
+    let key = SigningKey::from_bytes(&[62u8; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let package = web_event_plugin_bundle(&key, "demo");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let installed = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(installed.status, 200, "{}", installed.body);
+    let started = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
+    assert_eq!(started.status, 200, "{}", started.body);
+    set_password(&sandbox, TEST_PASSWORD);
+
+    // The plugin sleeps for two seconds, so the stream is still open when we
+    // drop the client after its head.
+    let mut slow = mcp_stream_request(&address, 11, "demo.slow");
+    assert_eq!(read_response_head(&mut slow).0, 200);
+    drop(slow);
+
+    let mut released = false;
+    for _ in 0..300 {
+        let mut candidate = mcp_stream_request(&address, 12, "demo.status");
+        let (status, _) = read_response_head(&mut candidate);
+        if status == 200 {
+            released = true;
+            drop(candidate);
+            break;
+        }
+        assert_eq!(status, 503, "only the busy status is retried");
+        drop(candidate);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        released,
+        "a disconnected MCP client must release the max_streams slot"
+    );
 }

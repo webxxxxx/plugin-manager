@@ -62,8 +62,22 @@ fn drive_loop(stream: &mut TcpStream, handler: &mut dyn StreamHandler) -> Result
                 return Ok(());
             }
             StreamAction::SendFile(send) => {
+                if send.length == 0 {
+                    // Same guard as the Unix driver: an empty range makes no
+                    // progress, so ask for the next action instead of spinning.
+                    step = handler.on_event(
+                        StreamEvent::Writable,
+                        &mut OutBuffer::new(&mut out, limit),
+                    );
+                    continue;
+                }
                 send_blocking(stream, send);
-                return Ok(());
+                // The handler may have another range (a file bundle) or may
+                // close on the next `Writable`.
+                step = handler.on_event(
+                    StreamEvent::Writable,
+                    &mut OutBuffer::new(&mut out, limit),
+                );
             }
             // This thread is dedicated to one connection, so a "blocking" job
             // is just work that happens to take time. It never runs on a

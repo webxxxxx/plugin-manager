@@ -23,6 +23,10 @@ Transfer-Encoding: chunked\r\n\r\n";
 const RESET: &[u8] = b"event: reset\ndata: {\"reason\":\"replay-unavailable\"}\n\n";
 const PING: &[u8] = b": ping\n\n";
 const HEARTBEAT: Duration = Duration::from_secs(15);
+/// Longest decimal chunk-size line plus the two CRLF pairs.
+const CHUNK_OVERHEAD: usize = 10 + 4;
+/// Keep this much room before pulling another bus event.
+const MIN_FREE: usize = 32;
 /// The server-loop poll cadence the legacy reactor used for bus events. A
 /// handler asks for this wakeup so a published event is not held until the
 /// heartbeat.
@@ -68,6 +72,11 @@ impl SseStream {
         }
     }
 
+    fn set_pending(&mut self, bytes: Vec<u8>) {
+        self.pending = bytes;
+        self.pending_at = 0;
+    }
+
     fn step(&self, now: Instant) -> StreamStep {
         // NeedRead lets the Windows fallback block on the socket (and notice a
         // disconnect) while it wakes every POLL interval. The Unix loop watches
@@ -95,12 +104,12 @@ impl SseStream {
             }
             if self.replay.reset {
                 self.replay.reset = false;
-                self.pending = RESET.to_vec();
+                self.set_pending(RESET.to_vec());
                 continue;
             }
             match self.receiver.try_recv() {
                 Ok(event) => {
-                    self.pending = crate::uichannel::sse_event(&event).into_bytes();
+                    self.set_pending(crate::uichannel::sse_event(&event).into_bytes());
                     continue;
                 }
                 Err(TryRecvError::Empty) => {}
@@ -110,12 +119,12 @@ impl SseStream {
             }
             if self.heartbeat.elapsed() >= HEARTBEAT {
                 self.heartbeat = now;
-                self.pending = PING.to_vec();
+                self.set_pending(PING.to_vec());
                 continue;
             }
             break;
         }
-        if out.remaining() < 32 {
+        if out.remaining() < MIN_FREE {
             return StreamStep::wait(StreamAction::NeedWrite).within(self.deadline(now));
         }
         self.step(now)
@@ -124,13 +133,15 @@ impl SseStream {
     /// Write the next chunk of `pending`. Returns true when the whole event
     /// has been handed to the output buffer.
     fn flush_chunk(&mut self, out: &mut OutBuffer<'_>) -> bool {
+        if self.pending_at >= self.pending.len() {
+            return true;
+        }
         let remaining = self.pending.len() - self.pending_at;
         // "len\r\n" + payload + "\r\n"
-        let overhead = 10 + 4;
-        if out.remaining() <= overhead {
+        if out.remaining() <= CHUNK_OVERHEAD {
             return false;
         }
-        let take = remaining.min(out.remaining() - overhead);
+        let take = remaining.min(out.remaining() - CHUNK_OVERHEAD);
         if take == 0 {
             return false;
         }
@@ -148,9 +159,14 @@ impl StreamHandler for SseStream {
         match event {
             StreamEvent::Writable => self.on_writable(out),
             StreamEvent::Tick(now) => {
-                if now.saturating_duration_since(self.heartbeat) >= HEARTBEAT {
+                // Never replace an event that is only partly on the wire; the
+                // chunk framing would restart mid-payload and the byte count
+                // would underflow. The heartbeat waits for the next idle tick.
+                if self.pending.is_empty()
+                    && now.saturating_duration_since(self.heartbeat) >= HEARTBEAT
+                {
                     self.heartbeat = now;
-                    self.pending = PING.to_vec();
+                    self.set_pending(PING.to_vec());
                 }
                 // A tick is also the server's wakeup for a handler with no
                 // socket event: write the heartbeat and drain the bus.
@@ -276,6 +292,37 @@ mod tests {
             &json!({"data": "x".repeat(200)}),
         );
         let mut all = Vec::new();
+        for _ in 0..200 {
+            let mut out = Vec::new();
+            stream.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, 32));
+            all.extend_from_slice(&out);
+        }
+        let body = String::from_utf8(dechunk(&all)).expect("utf8");
+        assert_eq!(body.matches('x').count(), 200, "{body}");
+        assert!(body.ends_with("\n\n"), "{body}");
+    }
+
+    #[test]
+    fn a_tick_does_not_replace_a_partially_written_event() {
+        let (bus, mut stream) = harness();
+        bus.publish(
+            "demo",
+            "notifications/message",
+            &json!({"data": "x".repeat(200)}),
+        );
+        let mut all = Vec::new();
+        // The first write leaves the event partly on the wire.
+        let mut out = Vec::new();
+        stream.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, 32));
+        all.extend_from_slice(&out);
+        // A heartbeat tick arrives before the event is complete. It must not
+        // replace the pending bytes (that used to underflow the chunk length).
+        let mut out = Vec::new();
+        stream.on_event(
+            StreamEvent::Tick(Instant::now() + HEARTBEAT + Duration::from_secs(1)),
+            &mut OutBuffer::new(&mut out, 32),
+        );
+        all.extend_from_slice(&out);
         for _ in 0..200 {
             let mut out = Vec::new();
             stream.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, 32));

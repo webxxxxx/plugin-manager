@@ -207,7 +207,7 @@ impl RawWsStream {
             break;
         }
         if self.frames.is_empty() {
-            self.step(StreamAction::Continue, now)
+            self.step(StreamAction::NeedRead, now)
         } else {
             self.step(StreamAction::NeedWrite, now)
         }

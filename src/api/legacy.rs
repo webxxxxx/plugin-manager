@@ -8,12 +8,15 @@
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::{AsRawFd, RawFd};
 
+use crate::server::http::budget::StreamPermit;
 use crate::server::http::driver::{StreamAdmission, StreamDriver};
 use crate::server::http::engine::{self, HttpRequest, LegacyBridge, PreRequest, Table};
+use crate::server::http::StreamClass;
 use crate::server::http::{
     complete_blocking, dispatch_inline, BlockingOutcome, BlockingPool, BodyPolicy, Busy,
-    CancelToken, CompletionSlot, Dispatch, Exchange, Face, JobOutcome,
+    CancelToken, CompletionSlot, Dispatch, Exchange, Face, JobOutcome, StreamHandler,
 };
+use crate::server::mcp::progress::{McpSseStream, PROGRESS_QUEUE};
 
 /// One queued or running blocking request. The server owns the completion slot
 /// and the connection; the pool only reports that the job finished.
@@ -238,9 +241,7 @@ impl LegacyBridge for ServerHandler {
             );
             match prepared {
                 Ok(Some(call)) => {
-                    if let Some(client) = &self.client {
-                        start_mcp_sse(connection, call, self.config.clone(), client);
-                    } else {
+                    let Some(client) = &self.client else {
                         write_response(
                             connection,
                             http::json_error(
@@ -250,6 +251,53 @@ impl LegacyBridge for ServerHandler {
                             ),
                             false,
                         );
+                        return;
+                    };
+                    // Reserve the long-lived slot before starting the plugin
+                    // call: a full budget must refuse the request without a
+                    // side effect on the service.
+                    let permit = match crate::server::http::budget::StreamBudget::global()
+                        .acquire(StreamClass::LongLived, crate::limits::current().max_streams)
+                    {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            write_response(
+                                connection,
+                                crate::server::http::stream_busy_response(),
+                                false,
+                            );
+                            return;
+                        }
+                    };
+                    let (sender, receiver) = mpsc::sync_channel(PROGRESS_QUEUE);
+                    let request = json!({
+                        "name": call.name,
+                        "arguments": call.arguments,
+                        "progressToken": call.progress_token,
+                    });
+                    match client.open(&self.config, "registry.call", request, sender) {
+                        Ok(stream) => {
+                            let cancel_client = client.clone();
+                            let handler = McpSseStream::new(
+                                receiver,
+                                call.id,
+                                stream,
+                                Box::new(move |id| cancel_client.cancel(id)),
+                            );
+                            // The stream handler draws from the shared
+                            // `max_streams` budget; a full budget is the
+                            // standard 503 before any SSE bytes.
+                            attach_stream_reserved(connection, Box::new(handler), &[], permit);
+                        }
+                        Err(error) => write_response(
+                            connection,
+                            http::json_error(
+                                500,
+                                "stream_start_failed",
+                                &format!("cannot start streaming call: {}", error),
+                            ),
+                            false,
+                        ),
                     }
                     return;
                 }
@@ -284,20 +332,7 @@ impl LegacyBridge for ServerHandler {
             }
             return keep;
         }
-        match &connection.state {
-            ConnState::McpSse(_) => {
-                let mut discard = [0u8; 512];
-                match connection.stream.read(&mut discard) {
-                    Ok(0) => return false,
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(_) => return false,
-                }
-                fill_mcp_sse(connection);
-                true
-            }
-            _ => true,
-        }
+        true
     }
 
     fn on_writable(&mut self, connection: &mut Connection) -> bool {
@@ -308,16 +343,8 @@ impl LegacyBridge for ServerHandler {
             }
             return keep;
         }
-        match &connection.state {
-            ConnState::McpSse(_) => {
-                fill_mcp_sse(connection);
-                if !connection.write_out() {
-                    return false;
-                }
-                let done = matches!(&connection.state, ConnState::McpSse(state) if state.done);
-                !(done && connection.out.is_empty())
-            }
-            _ => {
+        {
+            {
                 if !connection.write_out() {
                     return false;
                 }
@@ -440,19 +467,12 @@ impl LegacyBridge for ServerHandler {
                 }
             }
         }
-
-        for connection in connections.values_mut() {
-            if let ConnState::McpSse(_) = &connection.state {
-                fill_mcp_sse(connection);
-            }
-        }
     }
 
     fn interest(&self, connection: &Connection) -> i16 {
         let mut events = match &connection.state {
             ConnState::Reading => libc::POLLIN,
             ConnState::Writing => libc::POLLOUT,
-            ConnState::McpSse(_) => libc::POLLIN,
             ConnState::Stream(driver) => {
                 if driver.wants_read() {
                     libc::POLLIN
@@ -488,7 +508,6 @@ impl LegacyBridge for ServerHandler {
             self.stream_job_keys.remove(&key);
             self.blocking.cancel(key);
         }
-        release_mcp_stream(connection, self.client.as_deref());
     }
 
     fn wake_fd(&self) -> Option<RawFd> {
@@ -590,44 +609,7 @@ impl ServerHandler {
         // buffer; the loop must not try to parse them again.
         let initial = connection.buffer.split_off(body_start);
         connection.buffer.clear();
-        connection.keep_alive = false;
-
-        let mut driver = match StreamDriver::admit(handler, crate::limits::current().max_streams) {
-            StreamAdmission::Admitted(driver) => driver,
-            StreamAdmission::Busy => {
-                write_response(
-                    connection,
-                    crate::server::http::stream_busy_response(),
-                    false,
-                );
-                return Some(PreRequest::Handled);
-            }
-        };
-        let primed = driver.prime(
-            &mut connection.stream,
-            &mut connection.out,
-            &mut connection.out_at,
-            &mut connection.last_active,
-        );
-        connection.state = ConnState::Stream(driver);
-        if !primed {
-            finish_stream(connection);
-            return Some(PreRequest::Handled);
-        }
-        if !initial.is_empty() {
-            let keep = {
-                let Connection {
-                    state, out, out_at, ..
-                } = connection;
-                match state {
-                    ConnState::Stream(driver) => driver.on_data(&initial, out, out_at),
-                    _ => true,
-                }
-            };
-            if !keep {
-                finish_stream(connection);
-            }
-        }
+        attach_stream(connection, handler, &initial);
         // A WebSocket client may have sent its first frames with the opening
         // handshake; the handler can submit a blocking job from those bytes.
         self.service_stream_job(connection);
@@ -667,20 +649,35 @@ impl ServerHandler {
 
         match prepared.route.dispatch {
             Dispatch::Inline => {
-                let response = super::render_exchange(dispatch_inline(
-                    self.face.as_ref(),
-                    &prepared.route,
-                    prepared.request,
-                ));
-                write_response(
-                    connection,
-                    if keep_alive {
-                        keep_alive_response(response)
-                    } else {
-                        response
-                    },
-                    keep_alive,
-                );
+                match dispatch_inline(self.face.as_ref(), &prepared.route, prepared.request) {
+                    Ok(Exchange::Response(response)) => {
+                        let response = if keep_alive {
+                            keep_alive_response(response.into_bytes())
+                        } else {
+                            response.into_bytes()
+                        };
+                        write_response(connection, response, keep_alive);
+                    }
+                    Ok(Exchange::Stream(handler)) => {
+                        // A streamed response is not a keep-alive response: its
+                        // handler may own a file range and the wire head says
+                        // `Connection: close`.
+                        attach_stream(connection, handler, &[]);
+                        self.service_stream_job(connection);
+                    }
+                    Err(cause) => {
+                        let response = http::json_error(500, "internal", &cause.message());
+                        write_response(
+                            connection,
+                            if keep_alive {
+                                keep_alive_response(response)
+                            } else {
+                                response
+                            },
+                            keep_alive,
+                        );
+                    }
+                }
             }
             Dispatch::Blocking => {
                 let endpoint = format!("{} {}", request.method, request.path);
@@ -716,6 +713,72 @@ impl ServerHandler {
             }
         }
         true
+    }
+}
+
+/// Attach a face-produced stream handler under `max_streams`. On Busy the
+/// connection gets the shared 503 before any handler bytes are written.
+fn attach_stream(connection: &mut Connection, handler: Box<dyn StreamHandler>, initial: &[u8]) {
+    attach_stream_with(connection, handler, initial, None);
+}
+
+/// Attach a handler whose budget slot was reserved before a side effect (the
+/// outbound streaming call was already opened).
+fn attach_stream_reserved(
+    connection: &mut Connection,
+    handler: Box<dyn StreamHandler>,
+    initial: &[u8],
+    permit: Option<StreamPermit>,
+) {
+    attach_stream_with(connection, handler, initial, permit);
+}
+
+fn attach_stream_with(
+    connection: &mut Connection,
+    handler: Box<dyn StreamHandler>,
+    initial: &[u8],
+    reserved: Option<StreamPermit>,
+) {
+    connection.keep_alive = false;
+    let mut driver = match reserved {
+        Some(permit) => StreamDriver::admit_reserved(handler, Some(permit)),
+        None => match StreamDriver::admit(handler, crate::limits::current().max_streams) {
+            StreamAdmission::Admitted(driver) => driver,
+            StreamAdmission::Busy => {
+                write_response(
+                    connection,
+                    crate::server::http::stream_busy_response(),
+                    false,
+                );
+                return;
+            }
+        },
+    };
+    let primed = driver.prime(
+        &mut connection.stream,
+        &mut connection.out,
+        &mut connection.out_at,
+        &mut connection.last_active,
+    );
+    connection.state = ConnState::Stream(driver);
+    if !primed {
+        finish_stream(connection);
+        return;
+    }
+    if initial.is_empty() {
+        return;
+    }
+    let keep = {
+        let Connection {
+            state, out, out_at, ..
+        } = connection;
+        match state {
+            ConnState::Stream(driver) => driver.on_data(initial, out, out_at),
+            _ => true,
+        }
+    };
+    if !keep {
+        finish_stream(connection);
     }
 }
 

@@ -47,9 +47,10 @@ pub enum StreamAction {
     /// The server keeps the connection and the output buffer while the job
     /// runs; the handler gets no socket and no connection handle.
     SubmitBlocking(BlockingJob),
-    /// Send this file on the server's socket once the output buffer drains.
-    /// The handler gives up the file handle; the server performs the send.
-    /// A file send is terminal: the server closes after the last byte.
+    /// Send this file range on the server's socket once the output buffer
+    /// drains. The handler gives up the file handle; the server performs the
+    /// send and then delivers `Writable` again, so a multi-part response can
+    /// ask for the next range and a finished response returns `Close`.
     SendFile(FileSend),
     /// Finish the response and close the connection.
     #[cfg_attr(not(unix), allow(dead_code))] // the fallback ignores the reason.

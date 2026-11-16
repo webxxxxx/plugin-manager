@@ -1,20 +1,17 @@
-//! Streaming HTTP surface for `/api/v1/blobs`.
+//! Streaming HTTP surface for blob uploads.
 //!
 //! A blob upload is written straight to a temp file while its SHA-256 is
-//! computed, and a download is streamed in chunks. This keeps daemon memory
-//! independent of file size and is also where `Range`, `ETag` and conditional
-//! requests live. Resumable uploads use a small S3-style part session:
+//! computed. This keeps daemon memory independent of file size. The download
+//! side, including `Range`, `ETag` and conditional requests, moved to
+//! `face::blob` (#118). Resumable uploads use a small S3-style part session:
 //! `POST /uploads` creates it, `PUT /uploads/{id}/parts/{n}` writes one part
 //! (retry by re-uploading the same number), and `POST .../complete` assembles
 //! the selected parts into one content-addressed blob.
 
-use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 use std::net::TcpStream;
-use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
@@ -23,13 +20,12 @@ use crate::http;
 use crate::lan::{AuthKind, Lan};
 
 const MULTIPART_OVERHEAD: u64 = 8 * 1024 * 1024;
-/// Below this size the explicit read/write loop is cheaper than a syscall that
-/// asks the kernel to set up a file transfer.
-const ZEROCOPY_MIN_BYTES: u64 = 64 * 1024;
 
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
-/// Which streaming route a request head selects.
+/// Which streaming upload route a request head selects. Downloads are a
+/// sans-IO face handler now (`face::blob`); session metadata (status, complete,
+/// abort) stays on the ordinary buffered router.
 pub enum Route {
     Upload,
     Part {
@@ -37,18 +33,10 @@ pub enum Route {
         part: u32,
         kind: blob::UploadKind,
     },
-    Download {
-        id: String,
-        head_only: bool,
-    },
-    FileDownload {
-        id: String,
-        head_only: bool,
-    },
 }
 
-/// Select only the routes that need streaming. Session metadata (status,
-/// complete, abort) stays on the ordinary buffered router.
+/// Select only the upload routes that still need the blocking takeover. #119
+/// moves them to stream handlers and deletes this module's socket path.
 pub fn route(head: &http::Head) -> Option<Route> {
     let path = head
         .path
@@ -71,18 +59,6 @@ pub fn route(head: &http::Head) -> Option<Route> {
             part: part.parse::<u32>().unwrap_or(0),
             kind: blob::UploadKind::File,
         }),
-        ("GET", ["api", "v1", "blobs", id]) | ("HEAD", ["api", "v1", "blobs", id]) => {
-            Some(Route::Download {
-                id: http::percent_decode(id, false),
-                head_only: head.method == "HEAD",
-            })
-        }
-        ("GET", ["api", "v1", "file", id]) | ("HEAD", ["api", "v1", "file", id]) => {
-            Some(Route::FileDownload {
-                id: http::percent_decode(id, false),
-                head_only: head.method == "HEAD",
-            })
-        }
         _ => None,
     }
 }
@@ -138,8 +114,6 @@ pub fn serve(
         Route::Part { upload, part, kind } => {
             upload_part(stream, head, initial, &upload, part, kind)
         }
-        Route::Download { id, head_only } => download(stream, head, &id, head_only),
-        Route::FileDownload { id, head_only } => file_download(stream, head, &id, head_only),
     }
 }
 
@@ -354,450 +328,6 @@ fn finish_part(stream: &mut TcpStream, writer: blob::PartWriter) -> io::Result<(
     }
 }
 
-enum DownloadDecision {
-    NotModified,
-    PreconditionFailed,
-    Unsatisfiable,
-    Full,
-    Range(u64, u64),
-}
-
-/// Evaluate the RFC 9110 preconditions and `Range`/`If-Range` for a GET/HEAD.
-fn decide_download(
-    head: &http::Head,
-    id: &str,
-    modified: SystemTime,
-    total: u64,
-) -> DownloadDecision {
-    if let Some(value) = request_header(head, "if-match") {
-        if !etag_matches(value, id, true) {
-            return DownloadDecision::PreconditionFailed;
-        }
-    } else if let Some(date) =
-        request_header(head, "if-unmodified-since").and_then(http::parse_http_date)
-    {
-        if modified > date + Duration::from_secs(1) {
-            return DownloadDecision::PreconditionFailed;
-        }
-    }
-    if let Some(value) = request_header(head, "if-none-match") {
-        if etag_matches(value, id, false) {
-            return DownloadDecision::NotModified;
-        }
-    } else if let Some(date) =
-        request_header(head, "if-modified-since").and_then(http::parse_http_date)
-    {
-        if modified <= date + Duration::from_secs(1) {
-            return DownloadDecision::NotModified;
-        }
-    }
-    if let Some(value) = request_header(head, "range") {
-        let allow = match request_header(head, "if-range") {
-            None => true,
-            Some(if_range) => match http::parse_http_date(if_range) {
-                Some(date) => modified <= date + Duration::from_secs(1),
-                None => etag_matches(if_range, id, true),
-            },
-        };
-        if allow {
-            match parse_range(value, total) {
-                RangeResult::None => {}
-                RangeResult::Range(start, end) => return DownloadDecision::Range(start, end),
-                RangeResult::Unsatisfiable => return DownloadDecision::Unsatisfiable,
-            }
-        }
-    }
-    DownloadDecision::Full
-}
-
-fn write_range_error(
-    stream: &mut TcpStream,
-    head_only: bool,
-    headers: &[(String, String)],
-    total: u64,
-) -> io::Result<()> {
-    let body = serde_json::to_vec(&json!({
-        "error": {
-            "code": "range_not_satisfiable",
-            "message": "range is not satisfiable",
-        }
-    }))
-    .unwrap_or_default();
-    let mut headers = headers.to_vec();
-    headers.push(("Content-Range".to_string(), format!("bytes */{}", total)));
-    if head_only {
-        stream.write_all(&http::response_head(
-            416,
-            "application/json",
-            &headers,
-            body.len() as u64,
-        ))
-    } else {
-        stream.write_all(&http::response_with_headers(
-            416,
-            "application/json",
-            &headers,
-            &body,
-        ))
-    }
-}
-
-fn download(
-    stream: &mut TcpStream,
-    head: &http::Head,
-    id: &str,
-    head_only: bool,
-) -> io::Result<()> {
-    let path = match blob::locate(id) {
-        Ok(path) => path,
-        Err(_) => return write_not_found(stream, head_only),
-    };
-    let metadata = match fs::metadata(&path) {
-        Ok(metadata) if metadata.is_file() => metadata,
-        _ => return write_not_found(stream, head_only),
-    };
-    let total = metadata.len();
-    let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
-    // Refresh the temp-cleanup clock after taking the stable metadata snapshot:
-    // `Last-Modified` should describe the blob, not this particular read.
-    blob::touch(&path);
-    let quoted = format!("\"{}\"", id);
-    let base_headers = vec![
-        ("ETag".to_string(), quoted.clone()),
-        ("Last-Modified".to_string(), http::http_date(modified)),
-        ("Accept-Ranges".to_string(), "bytes".to_string()),
-        ("Cache-Control".to_string(), "no-cache".to_string()),
-        ("X-Content-Type-Options".to_string(), "nosniff".to_string()),
-    ];
-
-    let mut range = None;
-    match decide_download(head, id, modified, total) {
-        DownloadDecision::NotModified => {
-            return stream.write_all(&http::response_with_headers(
-                304,
-                "application/octet-stream",
-                &base_headers,
-                b"",
-            ))
-        }
-        DownloadDecision::PreconditionFailed => {
-            return write_conditional_error(
-                stream,
-                head_only,
-                412,
-                "precondition_failed",
-                "precondition failed",
-            )
-        }
-        DownloadDecision::Unsatisfiable => {
-            return write_range_error(stream, head_only, &base_headers, total)
-        }
-        DownloadDecision::Full => {}
-        DownloadDecision::Range(start, end) => range = Some((start, end)),
-    }
-
-    let (status, start, length, extra) = match range {
-        Some((start, end)) => (
-            206,
-            start,
-            end - start + 1,
-            vec![(
-                "Content-Range".to_string(),
-                format!("bytes {}-{}/{}", start, end, total),
-            )],
-        ),
-        None => (200, 0, total, Vec::new()),
-    };
-    // Open before writing the response head: if cleanup raced us, a 404 is
-    // still possible instead of a truncated 200.
-    let mut file = if head_only {
-        None
-    } else {
-        match File::open(&path) {
-            Ok(file) => Some(file),
-            Err(_) => return write_not_found(stream, false),
-        }
-    };
-    let mut headers = base_headers;
-    headers.extend(extra);
-    stream.write_all(&http::response_head(
-        status,
-        "application/octet-stream",
-        &headers,
-        length,
-    ))?;
-    if head_only {
-        return stream.flush();
-    }
-    let Some(file) = file.as_mut() else {
-        return stream.flush();
-    };
-    if length >= ZEROCOPY_MIN_BYTES {
-        match crate::zerocopy::send_file_range(file, stream, start, length) {
-            Ok(true) => return stream.flush(),
-            Ok(false) => {}
-            Err(error) => return Err(error),
-        }
-    }
-    if start > 0 {
-        file.seek(SeekFrom::Start(start))?;
-    }
-    let mut remaining = length;
-    let mut buffer = vec![0u8; crate::limits::current().stream_buffer];
-    while remaining > 0 {
-        let want = std::cmp::min(buffer.len() as u64, remaining) as usize;
-        let read = file.read(&mut buffer[..want])?;
-        if read == 0 {
-            break;
-        }
-        stream.write_all(&buffer[..read])?;
-        remaining -= read as u64;
-    }
-    stream.flush()
-}
-
-fn file_download(
-    stream: &mut TcpStream,
-    head: &http::Head,
-    id: &str,
-    head_only: bool,
-) -> io::Result<()> {
-    let (directory, manifest) = match blob::file_manifest(id) {
-        Ok(file) => file,
-        Err(_) => return write_not_found(stream, head_only),
-    };
-    let manifest_path = directory.join("manifest.json");
-    let modified = fs::metadata(&manifest_path)
-        .and_then(|metadata| metadata.modified())
-        .unwrap_or(UNIX_EPOCH);
-    blob::touch(&manifest_path);
-    let total = manifest.size;
-    let content_type = if manifest.mime_type.is_empty() {
-        "application/octet-stream"
-    } else {
-        manifest.mime_type.as_str()
-    };
-    let quoted = format!("\"{}\"", manifest.id);
-    let mut base_headers = vec![
-        ("ETag".to_string(), quoted),
-        ("Last-Modified".to_string(), http::http_date(modified)),
-        ("Accept-Ranges".to_string(), "bytes".to_string()),
-        ("Cache-Control".to_string(), "no-cache".to_string()),
-        ("X-Content-Type-Options".to_string(), "nosniff".to_string()),
-    ];
-    if !manifest.name.is_empty() {
-        base_headers.push((
-            "Content-Disposition".to_string(),
-            format!(
-                "attachment; filename=\"{}\"",
-                sanitize_filename(&manifest.name)
-            ),
-        ));
-    }
-
-    let mut range = None;
-    match decide_download(head, id, modified, total) {
-        DownloadDecision::NotModified => {
-            return stream.write_all(&http::response_with_headers(
-                304,
-                content_type,
-                &base_headers,
-                b"",
-            ))
-        }
-        DownloadDecision::PreconditionFailed => {
-            return write_conditional_error(
-                stream,
-                head_only,
-                412,
-                "precondition_failed",
-                "precondition failed",
-            )
-        }
-        DownloadDecision::Unsatisfiable => {
-            return write_range_error(stream, head_only, &base_headers, total)
-        }
-        DownloadDecision::Full => {}
-        DownloadDecision::Range(start, end) => range = Some((start, end)),
-    }
-
-    let (status, start, length, extra) = match range {
-        Some((start, end)) => (
-            206,
-            start,
-            end - start + 1,
-            vec![(
-                "Content-Range".to_string(),
-                format!("bytes {}-{}/{}", start, end, total),
-            )],
-        ),
-        None => (200, 0, total, Vec::new()),
-    };
-    base_headers.extend(extra);
-    stream.write_all(&http::response_head(
-        status,
-        content_type,
-        &base_headers,
-        length,
-    ))?;
-    if head_only {
-        return stream.flush();
-    }
-    stream_file_range(stream, &directory, &manifest, start, length)
-}
-
-fn stream_file_range(
-    stream: &mut TcpStream,
-    directory: &Path,
-    manifest: &blob::FileManifest,
-    start: u64,
-    length: u64,
-) -> io::Result<()> {
-    let end = start.saturating_add(length);
-    let mut offset = 0u64;
-    let mut remaining = length;
-    let mut buffer = vec![0u8; crate::limits::current().stream_buffer];
-    for part in &manifest.parts {
-        let part_start = offset;
-        let part_end = offset.saturating_add(part.size);
-        offset = part_end;
-        if part_end <= start {
-            continue;
-        }
-        if part_start >= end {
-            break;
-        }
-        let local_start = start.saturating_sub(part_start);
-        let local_end = std::cmp::min(end, part_end) - part_start;
-        let want = local_end.saturating_sub(local_start);
-        if want == 0 {
-            continue;
-        }
-        let path = directory.join(format!("part-{}", part.number));
-        let mut file = File::open(&path)?;
-        if want >= ZEROCOPY_MIN_BYTES {
-            match crate::zerocopy::send_file_range(&mut file, stream, local_start, want) {
-                Ok(true) => {
-                    remaining = remaining.saturating_sub(want);
-                    if remaining == 0 {
-                        break;
-                    }
-                    continue;
-                }
-                Ok(false) => {
-                    file.seek(SeekFrom::Start(local_start))?;
-                }
-                Err(error) => return Err(error),
-            }
-        } else {
-            file.seek(SeekFrom::Start(local_start))?;
-        }
-        let mut take = want;
-        while take > 0 {
-            let request = std::cmp::min(buffer.len() as u64, take) as usize;
-            let read = file.read(&mut buffer[..request])?;
-            if read == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!("part {} is truncated", part.number),
-                ));
-            }
-            stream.write_all(&buffer[..read])?;
-            take -= read as u64;
-        }
-        remaining = remaining.saturating_sub(want);
-        if remaining == 0 {
-            break;
-        }
-    }
-    if remaining != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "file bundle is missing bytes",
-        ));
-    }
-    stream.flush()
-}
-
-fn sanitize_filename(name: &str) -> String {
-    name.chars()
-        .filter(|character| !character.is_control() && *character != '"')
-        .take(200)
-        .collect()
-}
-
-enum RangeResult {
-    None,
-    Range(u64, u64),
-    Unsatisfiable,
-}
-
-fn parse_range(value: &str, total: u64) -> RangeResult {
-    let value = value.trim();
-    let Some(rest) = value.strip_prefix("bytes=") else {
-        return RangeResult::None;
-    };
-    let specs: Vec<&str> = rest
-        .split(',')
-        .map(str::trim)
-        .filter(|spec| !spec.is_empty())
-        .collect();
-    // Multiple ranges are legal HTTP but not useful for opaque blobs; ignore
-    // the header and return the full representation.
-    if specs.len() != 1 {
-        return RangeResult::None;
-    }
-    let Some((first, last)) = specs[0].split_once('-') else {
-        return RangeResult::None;
-    };
-    if first.is_empty() {
-        let Ok(suffix) = last.parse::<u64>() else {
-            return RangeResult::None;
-        };
-        if suffix == 0 || total == 0 {
-            return RangeResult::Unsatisfiable;
-        }
-        let start = total.saturating_sub(suffix);
-        return RangeResult::Range(start, total - 1);
-    }
-    let Ok(start) = first.parse::<u64>() else {
-        return RangeResult::None;
-    };
-    if start >= total {
-        return RangeResult::Unsatisfiable;
-    }
-    let end = if last.is_empty() {
-        total - 1
-    } else {
-        match last.parse::<u64>() {
-            Ok(end) => end.min(total - 1),
-            Err(_) => return RangeResult::None,
-        }
-    };
-    if end < start {
-        return RangeResult::Unsatisfiable;
-    }
-    RangeResult::Range(start, end)
-}
-
-fn etag_matches(header: &str, etag: &str, strong: bool) -> bool {
-    for candidate in header.split(',') {
-        let candidate = candidate.trim();
-        if candidate == "*" {
-            return true;
-        }
-        let weak = candidate.starts_with("W/");
-        if strong && weak {
-            continue;
-        }
-        let value = candidate.strip_prefix("W/").unwrap_or(candidate);
-        if value.trim().trim_matches('"') == etag {
-            return true;
-        }
-    }
-    false
-}
-
 fn request_header<'a>(head: &'a http::Head, name: &str) -> Option<&'a str> {
     http::header(&head.headers, name)
 }
@@ -826,33 +356,6 @@ fn write_error_resp(
     message: &str,
 ) -> io::Result<()> {
     if head.method == "HEAD" {
-        let body = serde_json::to_vec(&json!({
-            "error": {"code": code, "message": message}
-        }))
-        .unwrap_or_default();
-        stream.write_all(&http::response_head(
-            status,
-            "application/json",
-            &[],
-            body.len() as u64,
-        ))
-    } else {
-        write_error(stream, status, code, message)
-    }
-}
-
-fn write_not_found(stream: &mut TcpStream, head_only: bool) -> io::Result<()> {
-    write_conditional_error(stream, head_only, 404, "not_found", "blob not found")
-}
-
-fn write_conditional_error(
-    stream: &mut TcpStream,
-    head_only: bool,
-    status: u16,
-    code: &str,
-    message: &str,
-) -> io::Result<()> {
-    if head_only {
         let body = serde_json::to_vec(&json!({
             "error": {"code": code, "message": message}
         }))
@@ -1380,53 +883,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn range_parser_handles_common_forms() {
-        assert!(matches!(
-            parse_range("bytes=2-5", 10),
-            RangeResult::Range(2, 5)
-        ));
-        assert!(matches!(
-            parse_range("bytes=2-", 10),
-            RangeResult::Range(2, 9)
-        ));
-        assert!(matches!(
-            parse_range("bytes=-3", 10),
-            RangeResult::Range(7, 9)
-        ));
-        assert!(matches!(
-            parse_range("bytes=8-99", 10),
-            RangeResult::Range(8, 9)
-        ));
-        assert!(matches!(
-            parse_range("bytes=10-", 10),
-            RangeResult::Unsatisfiable
-        ));
-        assert!(matches!(
-            parse_range("bytes=5-2", 10),
-            RangeResult::Unsatisfiable
-        ));
-        assert!(matches!(parse_range("items=0-1", 10), RangeResult::None));
-        assert!(matches!(
-            parse_range("bytes=0-1,4-5", 10),
-            RangeResult::None
-        ));
-    }
-
-    #[test]
-    fn etag_matching_respects_weak_and_strong_comparison() {
-        assert!(etag_matches("\"sha256:abc\"", "sha256:abc", true));
-        assert!(etag_matches("W/\"sha256:abc\"", "sha256:abc", false));
-        assert!(!etag_matches("W/\"sha256:abc\"", "sha256:abc", true));
-        assert!(etag_matches("*", "sha256:abc", true));
-        assert!(etag_matches(
-            "\"other\", \"sha256:abc\"",
-            "sha256:abc",
-            true
-        ));
-        assert!(!etag_matches("\"other\"", "sha256:abc", true));
-    }
-
-    #[test]
     fn multipart_boundary_is_parsed_from_content_type() {
         assert_eq!(
             multipart_boundary("multipart/form-data; boundary=abc123").expect("boundary"),
@@ -1441,5 +897,41 @@ mod tests {
             None
         );
         assert!(multipart_boundary("multipart/form-data").is_err());
+    }
+
+    fn head(method: &str, path: &str) -> http::Head {
+        http::Head {
+            method: method.to_string(),
+            path: path.to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn downloads_never_enter_the_upload_takeover() {
+        // The face owns downloads now; the takeover route table must not claim
+        // a GET/HEAD. This is also the cross-platform proof that no
+        // `svcd-blob-http` thread can be spawned for a download.
+        for (method, path) in [
+            ("GET", "/api/v1/blobs/sha256:abc"),
+            ("HEAD", "/api/v1/blobs/sha256:abc"),
+            ("GET", "/api/v1/file/sha256:abc"),
+            ("GET", "/api/v1/files/sha256:abc"),
+            ("HEAD", "/api/v1/file/sha256:abc?x=1"),
+        ] {
+            assert!(
+                route(&head(method, path)).is_none(),
+                "{method} {path} must not use the upload takeover"
+            );
+        }
+        assert!(matches!(
+            route(&head("POST", "/api/v1/blobs")),
+            Some(Route::Upload)
+        ));
+        assert!(matches!(
+            route(&head("PUT", "/api/v1/blobs/uploads/u/parts/1")),
+            Some(Route::Part { .. })
+        ));
     }
 }

@@ -2,6 +2,7 @@
 //!
 //! See `docs/adr/0016-s4-request-handover.md`.
 
+#[cfg(feature = "http")]
 pub mod budget;
 pub mod contract;
 pub mod dispatch;
@@ -33,8 +34,8 @@ pub use stream::{
     StreamEvent, StreamHandler, StreamStep,
 };
 
-/// The busy response for a stream refused before its headers. The Unix driver
-/// and the thread fallback send the same stable envelope.
+/// The busy response for a stream refused before its headers. Both engines send
+/// the same stable envelope so a client cannot tell which one refused it.
 #[cfg(feature = "http")]
 pub fn stream_busy_response() -> Vec<u8> {
     let body = serde_json::json!({

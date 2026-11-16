@@ -77,8 +77,8 @@ fn is_realtime(path: &str) -> bool {
 pub struct PluginUiFace {
     lan: Arc<Mutex<Lan>>,
     /// The realtime routes need the config path for the control-channel bridge
-    /// and the raw hub. Asset-only constructions (unit tests) leave it `None`.
-    streams: Option<Arc<StreamContext>>,
+    /// and the raw hub.
+    streams: Arc<StreamContext>,
 }
 
 impl PluginUiFace {
@@ -89,7 +89,7 @@ impl PluginUiFace {
     ) -> PluginUiFace {
         PluginUiFace {
             lan,
-            streams: Some(Arc::new(StreamContext { config, raw_hub })),
+            streams: Arc::new(StreamContext { config, raw_hub }),
         }
     }
 
@@ -162,21 +162,13 @@ impl PluginUiFace {
         let Some(ui) = ui_path(path) else {
             return Box::new(PluginUiStream::error(404, "not_found", "unknown plugin UI"));
         };
-        if let Some(streams) = &self.streams {
-            match ui.sub {
-                "events" => {
-                    return plugin_streams::open_sse(&ui, request, &self.lan, streams);
-                }
-                "ws" => return plugin_streams::open_ws(&ui, request, &self.lan, streams),
-                "raw" => return plugin_streams::open_raw(&ui, request, &self.lan, streams),
-                _ => {}
+        match ui.sub {
+            "events" => {
+                return plugin_streams::open_sse(&ui, request, &self.lan, &self.streams);
             }
-        } else if matches!(ui.sub, "events" | "ws" | "raw") {
-            return Box::new(PluginUiStream::error(
-                500,
-                "internal",
-                "realtime stream support is not assembled",
-            ));
+            "ws" => return plugin_streams::open_ws(&ui, request, &self.lan, &self.streams),
+            "raw" => return plugin_streams::open_raw(&ui, request, &self.lan, &self.streams),
+            _ => {}
         }
         if !package::valid_name(ui.id) {
             return Box::new(PluginUiStream::error(404, "not_found", "unknown plugin UI"));

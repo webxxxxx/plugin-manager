@@ -1003,27 +1003,34 @@ fn hex(bytes: &[u8]) -> String {
     text
 }
 
+/// One writable content-store root for every unit test that touches blobs.
+/// Shared so the face download tests and the blob tests do not race by
+/// pointing `SVCD_TEMP_DIR` at two different trees.
+#[cfg(test)]
+pub(crate) fn test_temp_dir() -> &'static Path {
+    use std::sync::OnceLock;
+
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("svcd-blob-{}-{}", std::process::id(), nanos));
+        std::env::set_var("SVCD_DATA_DIR", &root);
+        std::env::set_var("SVCD_TEMP_DIR", root.join("temp"));
+        std::fs::create_dir_all(root.join("temp")).expect("blob root");
+        root
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
-    use std::sync::OnceLock;
-
-    static ROOT: OnceLock<PathBuf> = OnceLock::new();
 
     fn root() -> &'static Path {
-        ROOT.get_or_init(|| {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let root =
-                std::env::temp_dir().join(format!("svcd-blob-{}-{}", std::process::id(), nanos));
-            std::env::set_var("SVCD_DATA_DIR", &root);
-            std::env::set_var("SVCD_TEMP_DIR", root.join("temp"));
-            std::fs::create_dir_all(root.join("temp")).expect("blob root");
-            root
-        })
+        test_temp_dir()
     }
 
     #[test]

@@ -1,4 +1,10 @@
-//! The shared `max_streams` admission counter.
+//! The shared `max_streams` admission counter for stream-handler transfers.
+//!
+//! Long-lived stream handlers (downloads today; uploads, SSE and WebSocket as
+//! they migrate) draw from one budget; one-shot static assets are exempt. The
+//! Unix server loop uses it via `driver::StreamDriver`, the Windows thread
+//! fallback via `fallback::drive`. The still-legacy blob upload takeover keeps
+//! its own counter until #119.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -71,12 +77,14 @@ impl StreamBudget {
 mod tests {
     use super::*;
 
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    // One counter per test: the tests run in parallel and a shared store(0)
+    // would race a permit drop in the other test.
+    static ONE_SHOT_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    static RELEASE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn a_one_shot_response_never_consumes_the_long_lived_cap() {
-        COUNTER.store(0, Ordering::SeqCst);
-        let budget = StreamBudget::for_counter(&COUNTER);
+        let budget = StreamBudget::for_counter(&ONE_SHOT_COUNTER);
         let held = budget
             .acquire(StreamClass::LongLived, 1)
             .expect("the first long-lived stream fits")
@@ -85,12 +93,12 @@ mod tests {
         assert!(matches!(budget.acquire(StreamClass::OneShot, 1), Ok(None)));
         drop(held);
         assert!(budget.acquire(StreamClass::LongLived, 1).is_ok());
+        assert_eq!(ONE_SHOT_COUNTER.load(Ordering::SeqCst), 0);
     }
 
     #[test]
     fn a_long_lived_permit_is_released_exactly_once() {
-        COUNTER.store(0, Ordering::SeqCst);
-        let budget = StreamBudget::for_counter(&COUNTER);
+        let budget = StreamBudget::for_counter(&RELEASE_COUNTER);
         let first = budget
             .acquire(StreamClass::LongLived, 2)
             .expect("fits")
@@ -106,8 +114,8 @@ mod tests {
             .expect("a released slot is reusable")
             .expect("holds a slot");
         drop(second);
-        assert_eq!(COUNTER.load(Ordering::SeqCst), 1);
+        assert_eq!(RELEASE_COUNTER.load(Ordering::SeqCst), 1);
         drop(third);
-        assert_eq!(COUNTER.load(Ordering::SeqCst), 0);
+        assert_eq!(RELEASE_COUNTER.load(Ordering::SeqCst), 0);
     }
 }

@@ -274,8 +274,17 @@ impl WsStream {
                             self.buffer.shrink_to(shrink);
                         }
                     }
-                    job = self.handle_frame(&frame);
-                    if job.is_some() {
+                    // Keep parsing the rest of this read. A second text frame
+                    // is queued behind the first call, and control frames must
+                    // still be answered while a call is in flight.
+                    if let Some(next) = self.handle_frame(&frame) {
+                        if job.is_some() {
+                            self.queue_close(1013, "too many in-flight requests");
+                            break;
+                        }
+                        job = Some(next);
+                    }
+                    if self.closing {
                         break;
                     }
                 }
@@ -624,6 +633,57 @@ mod tests {
         let response: Value = serde_json::from_slice(&frames[0].1).expect("json");
         assert_eq!(response["id"], 7);
         assert_eq!(response["error"]["code"], -32603);
+    }
+
+    #[test]
+    fn a_full_blocking_queue_becomes_a_jsonrpc_error_on_the_page() {
+        let (_bus, mut stream) = harness();
+        let _ = drive(&mut stream, 4096);
+        stream.call_in_flight = true;
+        stream.pending_id = Some(json!(7));
+        let mut out = Vec::new();
+        stream.on_event(
+            StreamEvent::BlockingDone(BlockingOutcome::Failed(
+                "the blocking queue is full".into(),
+            )),
+            &mut OutBuffer::new(&mut out, 4096),
+        );
+        let (_, frames) = server_frames(&out);
+        assert_eq!(frames.len(), 1);
+        let response: Value = serde_json::from_slice(&frames[0].1).expect("json");
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["error"]["code"], -32603);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("blocking queue is full"),
+            "{response}"
+        );
+    }
+
+    #[test]
+    fn coalesced_calls_are_all_parsed_with_the_first_submitted() {
+        let (_bus, mut stream) = harness();
+        let _ = drive(&mut stream, 4096);
+        let first =
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"status"}}"#;
+        let second =
+            br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"status"}}"#;
+        let mut both = client_frame(0x1, first);
+        both.extend(client_frame(0x1, second));
+        let mut out = Vec::new();
+        let step = stream.on_event(
+            StreamEvent::Data(&both),
+            &mut OutBuffer::new(&mut out, 4096),
+        );
+        assert!(matches!(step.action, StreamAction::SubmitBlocking(_)));
+        assert!(
+            stream.buffer.is_empty(),
+            "the whole read must be parsed before the driver awaits the job"
+        );
+        assert_eq!(stream.queued.len(), 1, "the second call is queued");
+        assert!(stream.call_in_flight);
     }
 
     #[test]
