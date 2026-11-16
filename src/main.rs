@@ -60,6 +60,7 @@ mod ui_http;
 #[cfg(feature = "http")]
 mod uichannel;
 mod wake;
+mod worker_pool;
 #[cfg(feature = "http")]
 mod webui;
 #[cfg(feature = "http")]

@@ -19,10 +19,10 @@ use crate::channel;
 use crate::compat;
 use crate::definition;
 use crate::kernel::contract::{
-    Capability as KernelCapability, CapabilityName, Contract, Effect, Invocation, Limits as KernelLimits,
-    Obligations, ProgressToken, ServiceId,
+    Capability as KernelCapability, CapabilityName, Contract, Effect, Instance, Invocation,
+    Limits as KernelLimits, Obligations, ProgressToken, Reply, ServiceId,
 };
-use crate::kernel::failure::{Class, Failure, Rejection};
+use crate::kernel::failure::{Class, Failure, Rejection, Retry};
 use crate::lan::LanStatus;
 use crate::log;
 use crate::mcp;
@@ -36,7 +36,7 @@ use crate::rpc;
 use crate::runtime::{self, Record};
 use crate::settings;
 use crate::slot::hook_command;
-use crate::slot::{CallError, Slot};
+use crate::slot::{Slot, SlotWire};
 use crate::status::Status;
 use crate::supervisor::{self, Event};
 use crate::wake::Wake;
@@ -359,6 +359,8 @@ struct Daemon {
     api: Option<Arc<Api>>,
     wake: Arc<Wake>,
     slots: BTreeMap<String, Slot>,
+    /// Blocking calls run here; the event loop stays free to pump slots.
+    workers: crate::worker_pool::WorkerPool,
     shutdown: bool,
     started: Instant,
     epoch_at_start: SystemTime,
@@ -437,6 +439,10 @@ impl Daemon {
             api,
             wake,
             slots,
+            workers: crate::worker_pool::WorkerPool::new(
+                if cfg!(test) { 2 } else { 8 },
+                256,
+            ),
             shutdown: false,
             started: Instant::now(),
             epoch_at_start: SystemTime::now(),
@@ -1028,7 +1034,6 @@ impl Daemon {
                 _ => None,
             }
         });
-        let now = self.now_ms();
         let Some(slot) = self.slots.get_mut(service_id) else {
             send(
                 &reply,
@@ -1042,17 +1047,36 @@ impl Daemon {
             crate::limits::current().default_timeout,
         );
         invocation.progress = progress_token;
-        match slot.request_invocation(invocation, id.clone(), now, reply.clone()) {
-            Ok(()) => {}
-            Err(CallError::Rejected(Rejection::UnknownCapability { .. })) => {
-                send(&reply, unknown_tool(&id, &name));
-            }
-            Err(CallError::Rejected(Rejection::BadArguments { detail })) => {
-                send(&reply, rpc::err(id, -32602, &detail));
-            }
-            Err(CallError::Failed(failure)) => {
-                send(&reply, project_slot_response(id, Err(failure)));
-            }
+        let handle = slot.handle();
+        let contract = slot_contract(service);
+        let client = reply.clone();
+        let worker_reply = reply.clone();
+        let external_id = id.clone();
+        let job = move || {
+            let mut instance = match Instance::new(contract, Box::new(SlotWire::new(handle, Some(client)))) {
+                Ok(instance) => instance,
+                Err(error) => {
+                    let failure = Failure::new(Class::ImplementationError, Retry::Never, error);
+                    let _ = worker_reply.send(project_slot_outcome(external_id, Err(failure)));
+                    return;
+                }
+            };
+            let outcome = match instance.call(invocation) {
+                Ok(Reply::Value(value)) => Ok(value),
+                Ok(Reply::Stream(_)) => Err(Failure::new(
+                    Class::ImplementationError,
+                    Retry::Never,
+                    "stream replies are not wired through SlotWire",
+                )),
+                Err(error) => Err(kernel_call_failure(error)),
+            };
+            let _ = worker_reply.send(project_slot_outcome(external_id, outcome));
+        };
+        if self.workers.execute(Box::new(job)).is_err() {
+            send(
+                &reply,
+                rpc::err(id, -32000, "busy: call worker queue is full"),
+            );
         }
     }
 
@@ -1856,6 +1880,22 @@ fn project_slot_response(external_id: Option<Value>, outcome: Result<Value, Fail
 
 fn project_slot_outcome(external_id: Option<Value>, outcome: Result<Value, Failure>) -> String {
     rpc::to_line(&project_slot_response(external_id, outcome))
+}
+
+fn kernel_call_failure(error: crate::kernel::failure::CallError) -> Failure {
+    match error {
+        crate::kernel::failure::CallError::Failed(failure) => failure,
+        crate::kernel::failure::CallError::Rejected(Rejection::BadArguments { detail }) => {
+            Failure::new(Class::FrameTooLarge, Retry::Never, detail)
+        }
+        crate::kernel::failure::CallError::Rejected(Rejection::UnknownCapability { capability }) => {
+            Failure::new(
+                Class::ImplementationError,
+                Retry::Never,
+                format!("unknown capability {capability}"),
+            )
+        }
+    }
 }
 
 fn slot_contract(service: &Service) -> Contract {

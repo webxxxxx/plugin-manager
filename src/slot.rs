@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -8,7 +9,9 @@ use std::thread;
 use serde_json::{json, Value};
 
 use crate::ipc::{self, FrameError, FrameEvent};
-use crate::kernel::contract::{Contract, Invocation, ProgressToken};
+use crate::kernel::contract::{
+    Contract, Control, Invocation, ProgressToken, Reply, Settled, Wire,
+};
 use crate::kernel::failure::{Class, Failure, Rejection, Retry};
 use crate::log::{self, LogSink};
 use crate::paths;
@@ -79,6 +82,116 @@ pub(crate) struct Slot {
     project: Option<Arc<dyn Fn(Option<Value>, Result<Value, Failure>) -> String + Send + Sync>>,
     /// Face-side projection of a plugin notification (progress/logging).
     notify_sink: Option<Arc<dyn Fn(&str, &Value) + Send + Sync>>,
+    /// Requests from blocking call workers, drained on the event loop.
+    request_tx: mpsc::Sender<SlotRequest>,
+    request_rx: Receiver<SlotRequest>,
+    /// Coarse health snapshot for `SlotHandle::probe`.
+    health: Arc<AtomicU8>,
+}
+
+/// A blocking-side handle to one slot. Workers submit an `Invocation` and wait;
+/// the daemon event loop owns the process and completes the request.
+#[derive(Clone)]
+pub(crate) struct SlotHandle {
+    requests: mpsc::Sender<SlotRequest>,
+    wake: Option<Arc<Wake>>,
+    health: Arc<AtomicU8>,
+}
+
+struct SlotRequest {
+    invocation: Invocation,
+    /// Progress still goes straight to the caller's channel; the final response
+    /// goes through `reply`.
+    client: Option<crate::channel::Reply>,
+    reply: mpsc::Sender<Result<Value, Failure>>,
+}
+
+enum CallSink {
+    Client(crate::channel::Reply),
+    Worker(mpsc::Sender<Result<Value, Failure>>),
+}
+
+impl SlotHandle {
+    /// Submit a blocking call. The event loop drains the request on its next
+    /// pump and sends the result through the returned receiver.
+    pub(crate) fn submit(
+        &self,
+        invocation: Invocation,
+        client: Option<crate::channel::Reply>,
+    ) -> Result<Receiver<Result<Value, Failure>>, Failure> {
+        let (reply, receiver) = mpsc::channel();
+        self.requests
+            .send(SlotRequest {
+                invocation,
+                client,
+                reply,
+            })
+            .map_err(|_| {
+                Failure::new(
+                    Class::NotRunning,
+                    Retry::After(std::time::Duration::from_secs(1)),
+                    "service runtime is gone",
+                )
+            })?;
+        if let Some(wake) = &self.wake {
+            wake.notify();
+        }
+        Ok(receiver)
+    }
+
+    pub(crate) fn probe(&self) -> Settled {
+        match self.health.load(Ordering::SeqCst) {
+            1 => Settled::Live,
+            2 => Settled::Ready,
+            3 => Settled::Degraded("degraded".into()),
+            _ => Settled::Stopped,
+        }
+    }
+}
+
+/// The `Wire` used by blocking workers. It never touches the process; it submits
+/// to the event loop and waits, so the daemon itself stays non-blocking.
+pub(crate) struct SlotWire {
+    handle: SlotHandle,
+    client: Option<crate::channel::Reply>,
+}
+
+impl SlotWire {
+    pub(crate) fn new(handle: SlotHandle, client: Option<crate::channel::Reply>) -> SlotWire {
+        SlotWire { handle, client }
+    }
+}
+
+impl Wire for SlotWire {
+    fn call(&mut self, invocation: Invocation) -> Result<Reply, Failure> {
+        let timeout = invocation.timeout;
+        let receiver = self.handle.submit(invocation, self.client.clone())?;
+        match receiver.recv_timeout(timeout.saturating_add(std::time::Duration::from_secs(1))) {
+            Ok(Ok(value)) => Ok(Reply::Value(value)),
+            Ok(Err(failure)) => Err(failure),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(Failure::new(
+                Class::Timeout,
+                Retry::After(std::time::Duration::from_secs(1)),
+                "call timed out in the worker",
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(Failure::new(
+                Class::NotRunning,
+                Retry::After(std::time::Duration::from_secs(1)),
+                "service runtime stopped before replying",
+            )),
+        }
+    }
+
+    fn lifecycle(&mut self, control: Control) -> Result<Settled, Failure> {
+        match control {
+            Control::Probe => Ok(self.handle.probe()),
+            _ => Err(Failure::new(
+                Class::ImplementationError,
+                Retry::Never,
+                "slot lifecycle must go through the daemon",
+            )),
+        }
+    }
 }
 
 struct HookRun {
@@ -91,13 +204,31 @@ struct PendingCall {
     capability: String,
     deadline: u64,
     progress_token: Option<String>,
-    reply: crate::channel::Reply,
+    /// Progress notifications go here while the call is in flight.
+    client: Option<crate::channel::Reply>,
+    /// Final result: projected for the legacy channel path, or handed to a
+    /// blocking worker.
+    sink: CallSink,
 }
 
 #[derive(Debug)]
 pub(crate) enum CallError {
     Rejected(Rejection),
     Failed(Failure),
+}
+
+pub(crate) fn call_error_failure(error: CallError) -> Failure {
+    match error {
+        CallError::Failed(failure) => failure,
+        CallError::Rejected(Rejection::BadArguments { detail }) => {
+            Failure::new(Class::FrameTooLarge, Retry::Never, detail)
+        }
+        CallError::Rejected(Rejection::UnknownCapability { capability }) => Failure::new(
+            Class::ImplementationError,
+            Retry::Never,
+            format!("unknown capability {capability}"),
+        ),
+    }
 }
 
 impl Slot {
@@ -107,6 +238,7 @@ impl Slot {
         lifecycle: Option<Lifecycle>,
         restart: Restart,
     ) -> Self {
+        let (request_tx, request_rx) = mpsc::channel();
         Slot {
             id,
             machine: Machine::new(restart),
@@ -140,6 +272,17 @@ impl Slot {
             call_timeout: DEFAULT_CALL_TIMEOUT,
             project: None,
             notify_sink: None,
+            request_tx,
+            request_rx,
+            health: Arc::new(AtomicU8::new(0)),
+        }
+    }
+
+    pub(crate) fn handle(&self) -> SlotHandle {
+        SlotHandle {
+            requests: self.request_tx.clone(),
+            wake: self.wake.clone(),
+            health: self.health.clone(),
         }
     }
 
@@ -281,10 +424,38 @@ impl Slot {
     }
 
     pub(crate) fn pump(&mut self, now: u64) {
+        self.drain_requests(now);
         self.drain_frames(now);
         self.check_exit(now);
         self.check_stop_hook(now);
         self.check_timers(now);
+        self.sync_health();
+    }
+
+    fn drain_requests(&mut self, now: u64) {
+        while let Ok(request) = self.request_rx.try_recv() {
+            let worker = request.reply.clone();
+            let outcome = self.request_invocation_sink(
+                request.invocation,
+                None,
+                now,
+                request.client,
+                CallSink::Worker(request.reply),
+            );
+            if let Err(error) = outcome {
+                let _ = worker.send(Err(call_error_failure(error)));
+            }
+        }
+    }
+
+    fn sync_health(&self) {
+        let code = match self.machine.health().state() {
+            Settled::Live => 1,
+            Settled::Ready => 2,
+            Settled::Degraded(_) => 3,
+            Settled::Stopped => 0,
+        };
+        self.health.store(code, Ordering::SeqCst);
     }
 
     pub(crate) fn apply(&mut self, event: Event, now: u64) {
@@ -320,6 +491,24 @@ impl Slot {
         external_id: Option<Value>,
         now: u64,
         reply: crate::channel::Reply,
+    ) -> Result<(), CallError> {
+        let client = Some(reply.clone());
+        self.request_invocation_sink(
+            invocation,
+            external_id,
+            now,
+            client,
+            CallSink::Client(reply),
+        )
+    }
+
+    fn request_invocation_sink(
+        &mut self,
+        invocation: Invocation,
+        external_id: Option<Value>,
+        now: u64,
+        client: Option<crate::channel::Reply>,
+        sink: CallSink,
     ) -> Result<(), CallError> {
         if let Some(contract) = &self.contract {
             if contract.capability(&invocation.capability).is_none() {
@@ -397,7 +586,8 @@ impl Slot {
                 capability: invocation.capability.as_str().to_string(),
                 deadline,
                 progress_token: invocation.progress.as_ref().map(|token| token.as_str().to_string()),
-                reply,
+                client,
+                sink,
             },
         );
         Ok(())
@@ -812,7 +1002,9 @@ impl Slot {
                     .values()
                     .filter(|pending| pending.progress_token.as_deref() == Some(token))
                 {
-                    pending.reply.send(line.clone());
+                    if let Some(client) = &pending.client {
+                        client.send(line.clone());
+                    }
                 }
             }
         }
@@ -875,8 +1067,19 @@ impl Slot {
             ))
         };
         self.mark_degraded(&outcome);
-        let line = self.project(pending.external_id, outcome);
-        pending.reply.send(line);
+        self.finish_pending(pending, outcome);
+    }
+
+    fn finish_pending(&self, pending: PendingCall, outcome: Result<Value, Failure>) {
+        match pending.sink {
+            CallSink::Client(reply) => {
+                let line = self.project(pending.external_id, outcome);
+                reply.send(line);
+            }
+            CallSink::Worker(reply) => {
+                let _ = reply.send(outcome);
+            }
+        }
     }
 
     fn project(&self, external_id: Option<Value>, outcome: Result<Value, Failure>) -> String {
@@ -926,8 +1129,7 @@ impl Slot {
             );
             let outcome = Err(failure);
             self.mark_degraded(&outcome);
-            let line = self.project(pending.external_id, outcome);
-            pending.reply.send(line);
+            self.finish_pending(pending, outcome);
         }
     }
 
@@ -940,8 +1142,7 @@ impl Slot {
                 reason,
             );
             self.machine.mark_degraded(reason.to_string());
-            let line = self.project(call.external_id, Err(failure));
-            call.reply.send(line);
+            self.finish_pending(call, Err(failure));
         }
     }
 
@@ -1550,7 +1751,8 @@ mod tests {
                 capability: "echo".into(),
                 deadline,
                 progress_token: None,
-                reply: crate::channel::Reply::plain(tx),
+                client: Some(crate::channel::Reply::plain(tx.clone())),
+                sink: CallSink::Client(crate::channel::Reply::plain(tx)),
             },
         );
         rx

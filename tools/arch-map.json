@@ -19,6 +19,7 @@
     "settings": { "concept": "platform/config", "layer": "platform" },
     "limits": { "concept": "platform/config", "layer": "platform" },
     "threads": { "concept": "platform/host", "layer": "platform" },
+    "worker_pool": { "concept": "platform/host", "layer": "platform" },
     "wake": { "concept": "platform/host", "layer": "platform" },
     "proc": { "concept": "platform/host", "layer": "platform" },
     "zerocopy": { "concept": "platform/host", "layer": "platform" },
