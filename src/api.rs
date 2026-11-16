@@ -8,14 +8,13 @@
 
 #[cfg(unix)]
 use crate::channel_client_reactor::{ClientReactor, Event as ClientEvent};
+#[cfg(any(not(unix), test))]
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -46,6 +45,7 @@ use crate::package;
 use crate::paths;
 use crate::plugin;
 use crate::rpc;
+use crate::server::http::engine::{self, keep_alive_response, wants_keep_alive, HttpRequest};
 use crate::settings;
 use crate::threads;
 use crate::transfer;
@@ -53,30 +53,6 @@ use crate::uichannel;
 use crate::webui;
 
 const UI: &str = include_str!("web/index.html");
-
-/// The busy response for a connection refused by either admission path. Both
-/// engines send the same bytes so a client sees one status on every host.
-const BUSY_CONNECTION_RESPONSE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\
-    Content-Length: 0\r\n\
-    Connection: close\r\n\r\n";
-
-/// Buffered-body limit for the routes that still go through the ordinary
-/// router. Blob uploads/downloads are streamed before this is consulted.
-fn body_limit(path: &str) -> u64 {
-    let limits = crate::limits::current();
-    let path = path.split_once('?').map(|(path, _)| path).unwrap_or(path);
-    if path.starts_with("/api/v1/plugins") || path.starts_with("/api/v1/import") {
-        limits.max_body
-    } else if path.trim_end_matches('/').ends_with("/complete")
-        && (path.starts_with("/api/v1/blobs/uploads/")
-            || path.starts_with("/api/v1/file/uploads/")
-            || path.starts_with("/api/v1/files/uploads/"))
-    {
-        limits.max_complete_body
-    } else {
-        limits.max_json_body
-    }
-}
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -141,10 +117,7 @@ pub fn spawn(config: PathBuf, raw_hub: Arc<crate::rawhub::RawHub>) -> std::io::R
     // (64 KiB floor) both overflowed there under a minimal svcd.conf and
     // aborted the whole daemon (#108).
     #[cfg(unix)]
-    thread::Builder::new()
-        .name("svcd-http-reactor".into())
-        .stack_size(threads::transfer_stack())
-        .spawn(move || reactor_loop(Some(listener), lan, config, raw_hub))?;
+    legacy::start(listener, lan, config, raw_hub)?;
     #[cfg(not(unix))]
     {
         let _ = raw_hub;
@@ -193,6 +166,9 @@ enum Work {
 struct JobQueue {
     queue: Mutex<VecDeque<Work>>,
     ready: Condvar,
+    /// Maximum queued legacy jobs. The legacy bridge answers 503 instead of
+    /// growing without bound.
+    limit: usize,
 }
 
 #[cfg(unix)]
@@ -277,676 +253,23 @@ enum ConnState {
 }
 
 #[cfg(unix)]
-struct Connection {
-    stream: TcpStream,
-    peer: IpAddr,
-    last_active: Instant,
-    buffer: Vec<u8>,
-    out: Vec<u8>,
-    out_at: usize,
-    state: ConnState,
-    keep_alive: bool,
-    /// A request whose head has been parsed and whose body is still arriving.
-    /// Keeping the framing state on the connection avoids re-parsing and
-    /// re-scanning body bytes as they trickle in.
-    pending: Option<PendingRequest>,
-}
+type Connection = engine::Connection<ConnState>;
 
 #[cfg(unix)]
-struct PendingRequest {
-    method: String,
-    path: String,
-    version: String,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-    framing: PendingFraming,
-}
-
-#[cfg(unix)]
-enum PendingFraming {
-    None,
-    Length(u64),
-    Chunked(http::ChunkedDecoder),
-}
-
-#[cfg(unix)]
-fn reactor_loop(
-    mut listener: Option<TcpListener>,
-    lan: Arc<Mutex<Lan>>,
-    config: PathBuf,
-    raw_hub: Arc<crate::rawhub::RawHub>,
-) {
-    if let Some(active) = &listener {
-        let _ = active.set_nonblocking(true);
-    }
-    let client = ClientReactor::start().ok();
-    let (results_tx, results_rx) = mpsc::channel();
-    let (mut notify_rx, notify_tx) = match UnixStream::pair() {
-        Ok((rx, tx)) => (rx, tx),
-        Err(error) => {
-            log::svcd(&format!("svcd: HTTP reactor notifier failed: {}", error));
-            return;
-        }
-    };
-    let _ = notify_rx.set_nonblocking(true);
-    let _ = notify_tx.set_nonblocking(true);
-
-    let queue = Arc::new(JobQueue {
-        queue: Mutex::new(VecDeque::new()),
-        ready: Condvar::new(),
-    });
-    for _ in 0..4 {
-        let queue = queue.clone();
-        let config = config.clone();
-        let lan = lan.clone();
-        let results = results_tx.clone();
-        let notify = notify_tx.try_clone().ok();
-        let _ = thread::Builder::new()
-            .name("svcd-http-worker".into())
-            .stack_size(threads::request_stack())
-            .spawn(move || http_worker(queue, config, lan, results, notify));
-    }
-
-    let mut connections: HashMap<u64, Connection> = HashMap::new();
-    let mut next_id: u64 = 1;
-    let limits = crate::limits::current();
-    loop {
-        // Close idle keep-alive connections before building the poll set. SSE,
-        // WS, MCP SSE and worker-owned requests are not idle: their own
-        // heartbeats/timeouts decide when they end.
-        let now = Instant::now();
-        connections.retain(|_, connection| {
-            if matches!(connection.state, ConnState::Reading | ConnState::Writing)
-                && now.saturating_duration_since(connection.last_active) > limits.idle_timeout
-            {
-                false
-            } else {
-                true
-            }
-        });
-        while let Ok(result) = results_rx.try_recv() {
-            match result {
-                WorkResult::Http(result) => {
-                    if let Some(connection) = connections.get_mut(&result.connection) {
-                        connection.out = result.response;
-                        connection.out_at = 0;
-                        connection.keep_alive = result.keep_alive;
-                        connection.state = ConnState::Writing;
-                    }
-                }
-                WorkResult::Ws(result) => {
-                    if let Some(connection) = connections.get_mut(&result.connection) {
-                        if matches!(&connection.state, ConnState::Ws(_)) {
-                            push_ws_text(&mut connection.out, &result.text);
-                            if let ConnState::Ws(state) = &mut connection.state {
-                                state.pending = false;
-                                if let Some(payload) = state.queued.pop_front() {
-                                    state.pending = true;
-                                    state.queued_bytes =
-                                        state.queued_bytes.saturating_sub(payload.len());
-                                    queue.push(Work::Ws(WsJob {
-                                        connection: result.connection,
-                                        plugin: state.plugin.clone(),
-                                        payload,
-                                    }));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        for connection in connections.values_mut() {
-            let ConnState::RawWs(state) = &mut connection.state else {
-                continue;
-            };
-            let mut closed = None;
-            loop {
-                match state.subscription.try_recv() {
-                    Ok(crate::rawhub::RawEvent::Frame(payload)) => {
-                        push_ws_frame(&mut connection.out, 0x2, &payload);
-                    }
-                    Ok(crate::rawhub::RawEvent::Closed) => {
-                        closed = Some("raw closed");
-                        break;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        closed = Some("raw channel closed");
-                        break;
-                    }
-                }
-            }
-            if let Some(reason) = closed {
-                raw_ws_log(state, reason);
-                push_ws_frame(&mut connection.out, 0x8, &close_payload(1000, "raw closed"));
-                connection.keep_alive = false;
-                connection.state = ConnState::Writing;
-                continue;
-            }
-            if state.heartbeat.elapsed() >= Duration::from_secs(30) {
-                push_ws_frame(&mut connection.out, 0x9, b"");
-                state.heartbeat = Instant::now();
-            }
-        }
-
-        let mut descriptors: Vec<libc::pollfd> = Vec::with_capacity(connections.len() + 2);
-        let mut keys: Vec<u64> = Vec::with_capacity(connections.len() + 2);
-        descriptors.push(libc::pollfd {
-            fd: -1,
-            events: 0,
-            revents: 0,
-        });
-        keys.push(0);
-        descriptors.push(libc::pollfd {
-            fd: notify_rx.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        });
-        keys.push(1);
-        if let Some(active) = &listener {
-            descriptors[0].fd = active.as_raw_fd();
-            descriptors[0].events = libc::POLLIN;
-        }
-        for (id, connection) in &connections {
-            let mut events = 0;
-            match connection.state {
-                ConnState::Reading => events |= libc::POLLIN,
-                ConnState::Writing => events |= libc::POLLOUT,
-                ConnState::Sse(_) => events |= libc::POLLIN,
-                ConnState::Ws(_) => events |= libc::POLLIN,
-                ConnState::RawWs(_) => events |= libc::POLLIN,
-                ConnState::McpSse(_) => events |= libc::POLLIN,
-                ConnState::Processing => {}
-            }
-            if connection.out_at < connection.out.len() {
-                events |= libc::POLLOUT;
-            }
-            descriptors.push(libc::pollfd {
-                fd: connection.stream.as_raw_fd(),
-                events,
-                revents: 0,
-            });
-            keys.push(*id);
-        }
-
-        let ready = unsafe {
-            libc::poll(
-                descriptors.as_mut_ptr(),
-                descriptors.len() as libc::nfds_t,
-                100,
-            )
-        };
-        if ready < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
-                log::svcd(&format!("svcd: HTTP reactor poll failed: {}", error));
-            }
-            continue;
-        }
-        if descriptors[1].revents & libc::POLLIN != 0 {
-            let mut drain = [0u8; 64];
-            while notify_rx.read(&mut drain).is_ok() {}
-        }
-
-        if descriptors[0].fd >= 0 && descriptors[0].revents & libc::POLLIN != 0 {
-            // A rebind probe may be the connection that woke accept; commands
-            // were already drained, so just accept the real backlog.
-            if let Some(active) = &listener {
-                loop {
-                    match active.accept() {
-                        Ok((stream, peer)) => {
-                            let ip = peer.ip();
-                            let per_ip = connections
-                                .values()
-                                .filter(|connection| connection.peer == ip)
-                                .count();
-                            if connections.len() >= limits.max_connections
-                                || per_ip >= limits.max_connections_per_ip
-                            {
-                                let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
-                                let _ = (&stream).write_all(BUSY_CONNECTION_RESPONSE);
-                                continue;
-                            }
-                            let _ = stream.set_nonblocking(true);
-                            let id = next_id;
-                            next_id = next_id.saturating_add(1);
-                            connections.insert(
-                                id,
-                                Connection {
-                                    stream,
-                                    peer: ip,
-                                    last_active: Instant::now(),
-                                    buffer: Vec::new(),
-                                    out: Vec::new(),
-                                    out_at: 0,
-                                    state: ConnState::Reading,
-                                    keep_alive: false,
-                                    pending: None,
-                                },
-                            );
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(error) => {
-                            log::svcd(&format!("svcd: HTTP accept failed: {}", error));
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        for index in 2..descriptors.len() {
-            let id = keys[index];
-            let Some(connection) = connections.get_mut(&id) else {
-                continue;
-            };
-            let revents = descriptors[index].revents;
-            if revents & (libc::POLLERR | libc::POLLHUP) != 0 {
-                if let ConnState::RawWs(state) = &connection.state {
-                    raw_ws_log(state, &format!("poll flags {:#x}", revents));
-                }
-                release_mcp_stream(connection, client.as_deref());
-                connections.remove(&id);
-                continue;
-            }
-            if revents & libc::POLLIN != 0 && matches!(connection.state, ConnState::Reading) {
-                let mut chunk = [0u8; 8 * 1024];
-                match connection.stream.read(&mut chunk) {
-                    Ok(0) => {
-                        connections.remove(&id);
-                        continue;
-                    }
-                    Ok(read) => {
-                        connection.last_active = Instant::now();
-                        connection.buffer.extend_from_slice(&chunk[..read]);
-                        if let Some((stream, head)) = ui_takeover(connection) {
-                            connection.state = ConnState::Processing;
-                            connections.remove(&id);
-                            let lan = lan.clone();
-                            let _ = thread::Builder::new()
-                                .name("svcd-ui-http".into())
-                                .stack_size(threads::transfer_stack())
-                                .spawn(move || {
-                                    let mut stream = stream;
-                                    let _ = stream.set_nonblocking(false);
-                                    crate::ui_http::serve(&mut stream, &head, &lan);
-                                });
-                            continue;
-                        }
-                        if let Some((stream, head, route)) = export_takeover(connection) {
-                            connection.state = ConnState::Processing;
-                            connections.remove(&id);
-                            let lan = lan.clone();
-                            let config = config.clone();
-                            let _ = thread::Builder::new()
-                                .name("svcd-export-http".into())
-                                .stack_size(threads::transfer_stack())
-                                .spawn(move || {
-                                    let mut stream = stream;
-                                    let _ = stream.set_nonblocking(false);
-                                    crate::export_http::serve(
-                                        &mut stream,
-                                        &head,
-                                        &lan,
-                                        &config,
-                                        route,
-                                    );
-                                });
-                            continue;
-                        }
-                        if let Some((stream, head, initial)) = import_takeover(connection) {
-                            connection.state = ConnState::Processing;
-                            connections.remove(&id);
-                            let lan = lan.clone();
-                            let config = config.clone();
-                            let limits = crate::limits::current();
-                            let _ = thread::Builder::new()
-                                .name("svcd-import-http".into())
-                                .stack_size(threads::transfer_stack())
-                                .spawn(move || {
-                                    let mut stream = stream;
-                                    let _ = stream.set_nonblocking(false);
-                                    crate::install_http::serve_import(
-                                        &mut stream,
-                                        &head,
-                                        &initial,
-                                        &lan,
-                                        &config,
-                                        limits,
-                                    );
-                                });
-                            continue;
-                        }
-                        if let Some((stream, head, initial)) = install_takeover(connection) {
-                            connection.state = ConnState::Processing;
-                            connections.remove(&id);
-                            let lan = lan.clone();
-                            let config = config.clone();
-                            let limits = crate::limits::current();
-                            let _ = thread::Builder::new()
-                                .name("svcd-install-http".into())
-                                .stack_size(threads::transfer_stack())
-                                .spawn(move || {
-                                    let mut stream = stream;
-                                    let _ = stream.set_nonblocking(false);
-                                    crate::install_http::serve(
-                                        &mut stream,
-                                        &head,
-                                        &initial,
-                                        &lan,
-                                        &config,
-                                        limits,
-                                    );
-                                });
-                            continue;
-                        }
-                        if let Some((stream, head, initial, route)) = blob_takeover(connection) {
-                            connection.state = ConnState::Processing;
-                            connections.remove(&id);
-                            let lan = lan.clone();
-                            let _ = thread::Builder::new()
-                                .name("svcd-blob-http".into())
-                                .stack_size(threads::transfer_stack())
-                                .spawn(move || {
-                                    let mut stream = stream;
-                                    let _ = stream.set_nonblocking(false);
-                                    let _ =
-                                        blob_http::serve(&mut stream, &head, &initial, &lan, route);
-                                });
-                            continue;
-                        }
-                        loop {
-                            match advance_request(connection) {
-                                Ok(None) => break,
-                                Ok(Some(request)) => {
-                                    let keep_alive = wants_keep_alive(&request);
-                                    if let Some(response) =
-                                        serve_face(&request, connection.peer, &lan, keep_alive)
-                                    {
-                                        connection.out = response;
-                                        connection.out_at = 0;
-                                        connection.keep_alive = keep_alive;
-                                        connection.state = ConnState::Writing;
-                                        break;
-                                    }
-                                    let path = request
-                                        .path
-                                        .split_once('?')
-                                        .map(|(path, _)| path)
-                                        .unwrap_or(request.path.as_str());
-                                    if path == "/mcp" {
-                                        let password_hash = lan.lock().ok().and_then(|state| {
-                                            state.password_hash().map(str::to_string)
-                                        });
-                                        let prepared = mcp_http::prepare_streaming(
-                                            &mcp_http::Request {
-                                                method: &request.method,
-                                                headers: &request.headers,
-                                                body: &request.body,
-                                            },
-                                            password_hash.as_deref(),
-                                        );
-                                        match prepared {
-                                            Ok(Some(call)) => {
-                                                if let Some(client) = &client {
-                                                    start_mcp_sse(
-                                                        connection,
-                                                        call,
-                                                        config.clone(),
-                                                        client,
-                                                    );
-                                                } else {
-                                                    connection.out = http::json_error(
-                                                        500,
-                                                        "stream_unavailable",
-                                                        "management client reactor is unavailable",
-                                                    );
-                                                    connection.out_at = 0;
-                                                    connection.keep_alive = false;
-                                                    connection.state = ConnState::Writing;
-                                                }
-                                                break;
-                                            }
-                                            Ok(None) => {}
-                                            Err(response) => {
-                                                connection.out = response;
-                                                connection.out_at = 0;
-                                                connection.keep_alive = false;
-                                                connection.state = ConnState::Writing;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if let Some(kind) = ui_stream_kind(&request.path) {
-                                        if kind == "events" {
-                                            match prepare_sse(&request, &lan) {
-                                                Ok((receiver, subscription, replay)) => {
-                                                    start_sse(
-                                                        connection,
-                                                        receiver,
-                                                        subscription,
-                                                        replay,
-                                                    );
-                                                }
-                                                Err(response) => {
-                                                    connection.out = response;
-                                                    connection.out_at = 0;
-                                                    connection.keep_alive = false;
-                                                    connection.state = ConnState::Writing;
-                                                }
-                                            }
-                                            break;
-                                        }
-                                        if kind == "raw" {
-                                            match prepare_raw_ws(&request, &lan, &raw_hub) {
-                                                Ok((_plugin, accept, subscription)) => {
-                                                    start_raw_ws(connection, accept, subscription);
-                                                }
-                                                Err(response) => {
-                                                    connection.out = response;
-                                                    connection.out_at = 0;
-                                                    connection.keep_alive = false;
-                                                    connection.state = ConnState::Writing;
-                                                }
-                                            }
-                                            break;
-                                        }
-                                        match prepare_ws(&request, &lan) {
-                                            Ok((plugin, accept, receiver, subscription)) => {
-                                                start_ws(
-                                                    connection,
-                                                    plugin,
-                                                    accept,
-                                                    receiver,
-                                                    subscription,
-                                                );
-                                            }
-                                            Err(response) => {
-                                                connection.out = response;
-                                                connection.out_at = 0;
-                                                connection.keep_alive = false;
-                                                connection.state = ConnState::Writing;
-                                            }
-                                        }
-                                        break;
-                                    }
-                                    queue.push(Work::Http(HttpJob {
-                                        connection: id,
-                                        request,
-                                        keep_alive,
-                                    }));
-                                    connection.state = ConnState::Processing;
-                                    break;
-                                }
-                                Err(response) => {
-                                    connection.out = response;
-                                    connection.out_at = 0;
-                                    connection.keep_alive = false;
-                                    connection.state = ConnState::Writing;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(_) => {
-                        connections.remove(&id);
-                        continue;
-                    }
-                }
-            }
-            let Some(connection) = connections.get_mut(&id) else {
-                continue;
-            };
-            if matches!(connection.state, ConnState::McpSse(_)) {
-                if revents & libc::POLLIN != 0 {
-                    let mut discard = [0u8; 512];
-                    match connection.stream.read(&mut discard) {
-                        Ok(0) => {
-                            release_mcp_stream(connection, client.as_deref());
-                            connections.remove(&id);
-                            continue;
-                        }
-                        Ok(_) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(_) => {
-                            release_mcp_stream(connection, client.as_deref());
-                            connections.remove(&id);
-                            continue;
-                        }
-                    }
-                }
-                fill_mcp_sse(connection);
-                if connection.out_at < connection.out.len() {
-                    match connection
-                        .stream
-                        .write(&connection.out[connection.out_at..])
-                    {
-                        Ok(0) => {
-                            release_mcp_stream(connection, client.as_deref());
-                            connections.remove(&id);
-                            continue;
-                        }
-                        Ok(written) => {
-                            connection.out_at += written;
-                            connection.last_active = Instant::now();
-                            if connection.out_at >= connection.out.len() {
-                                connection.out.clear();
-                                connection.out_at = 0;
-                            }
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(_) => {
-                            release_mcp_stream(connection, client.as_deref());
-                            connections.remove(&id);
-                            continue;
-                        }
-                    }
-                }
-                let done = matches!(&connection.state, ConnState::McpSse(state) if state.done);
-                if done && connection.out.is_empty() {
-                    connections.remove(&id);
-                }
-                continue;
-            }
-            if matches!(connection.state, ConnState::Ws(_)) {
-                let readable = revents & libc::POLLIN != 0;
-                if !drive_ws(connection, id, &queue, readable) {
-                    connections.remove(&id);
-                }
-                continue;
-            }
-            if matches!(connection.state, ConnState::RawWs(_)) {
-                let readable = revents & libc::POLLIN != 0;
-                if !drive_raw_ws(connection, id, &queue, readable, &raw_hub) {
-                    connections.remove(&id);
-                }
-                continue;
-            }
-            if matches!(connection.state, ConnState::Sse(_)) {
-                if revents & libc::POLLIN != 0 {
-                    let mut discard = [0u8; 512];
-                    match connection.stream.read(&mut discard) {
-                        Ok(0) => {
-                            connections.remove(&id);
-                            continue;
-                        }
-                        Ok(_) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(_) => {
-                            connections.remove(&id);
-                            continue;
-                        }
-                    }
-                }
-                fill_sse(connection);
-                if connection.out_at < connection.out.len() {
-                    match connection
-                        .stream
-                        .write(&connection.out[connection.out_at..])
-                    {
-                        Ok(0) => {
-                            connections.remove(&id);
-                            continue;
-                        }
-                        Ok(written) => {
-                            connection.out_at += written;
-                            connection.last_active = Instant::now();
-                            if connection.out_at >= connection.out.len() {
-                                connection.out.clear();
-                                connection.out_at = 0;
-                            }
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(_) => {
-                            connections.remove(&id);
-                            continue;
-                        }
-                    }
-                }
-                continue;
-            }
-            if revents & libc::POLLOUT != 0 || connection.out_at < connection.out.len() {
-                match connection
-                    .stream
-                    .write(&connection.out[connection.out_at..])
-                {
-                    Ok(0) => {
-                        connections.remove(&id);
-                        continue;
-                    }
-                    Ok(written) => {
-                        connection.out_at += written;
-                        connection.last_active = Instant::now();
-                        if connection.out_at >= connection.out.len() {
-                            connection.out.clear();
-                            connection.out_at = 0;
-                            if connection.keep_alive {
-                                connection.state = ConnState::Reading;
-                            } else {
-                                connections.remove(&id);
-                            }
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(_) => {
-                        connections.remove(&id);
-                    }
-                }
-            }
-        }
-    }
-}
+mod legacy;
 
 #[cfg(unix)]
 impl JobQueue {
-    fn push(&self, work: Work) {
-        if let Ok(mut queue) = self.queue.lock() {
-            queue.push_back(work);
-            self.ready.notify_one();
+    /// Queue one legacy job, or hand it back when the bridge is full. The
+    /// queue never grows past `limit` and never spawns a temporary worker.
+    fn try_push(&self, work: Work) -> Result<(), Work> {
+        let mut queue = self.queue.lock().unwrap_or_else(|error| error.into_inner());
+        if queue.len() >= self.limit {
+            return Err(work);
         }
+        queue.push_back(work);
+        self.ready.notify_one();
+        Ok(())
     }
 
     fn pop(&self) -> Work {
@@ -1950,11 +1273,16 @@ fn queue_ws_payload(connection: &mut Connection, id: u64, queue: &Arc<JobQueue>,
         return;
     }
     state.pending = true;
-    queue.push(Work::Ws(WsJob {
+    let job = Work::Ws(WsJob {
         connection: id,
         plugin: state.plugin.clone(),
         payload: payload.to_vec(),
-    }));
+    });
+    if queue.try_push(job).is_err() {
+        state.pending = false;
+        push_ws_frame(&mut connection.out, 0x8, &close_payload(1013, "busy"));
+        state.close_after = Some((1013, "busy".into()));
+    }
 }
 
 #[cfg(unix)]
@@ -2176,91 +1504,6 @@ fn blob_takeover(
     Some((stream, head, initial, route))
 }
 
-#[cfg(unix)]
-fn advance_request(connection: &mut Connection) -> Result<Option<HttpRequest>, Vec<u8>> {
-    if connection.pending.is_none() {
-        let Some(header_end) = http::header_end(&connection.buffer) else {
-            if connection.buffer.len() > crate::limits::current().max_header {
-                return Err(error(400, "bad_request", "request headers are too large"));
-            }
-            return Ok(None);
-        };
-        if header_end > crate::limits::current().max_header {
-            return Err(error(400, "bad_request", "request headers are too large"));
-        }
-        let Some((head, body_start)) = http::parse_head(&connection.buffer[..header_end + 4])
-        else {
-            return Err(error(400, "bad_request", "malformed request line"));
-        };
-        let framing =
-            http::framing(&head.headers).map_err(|message| error(400, "bad_request", &message))?;
-        let limit = body_limit(&head.path);
-        if let http::Framing::Length(length) = framing {
-            if length > limit {
-                return Err(error(413, "payload_too_large", "request body is too large"));
-            }
-        }
-        let buffer = std::mem::take(&mut connection.buffer);
-        connection.buffer = buffer[body_start..].to_vec();
-        connection.pending = Some(PendingRequest {
-            method: head.method,
-            path: head.path,
-            version: head.version,
-            headers: head.headers,
-            body: Vec::new(),
-            framing: match framing {
-                http::Framing::None | http::Framing::Length(0) => PendingFraming::None,
-                http::Framing::Length(length) => PendingFraming::Length(length),
-                http::Framing::Chunked => PendingFraming::Chunked(http::ChunkedDecoder::new(limit)),
-            },
-        });
-    }
-
-    let mut ready = false;
-    if let Some(pending) = connection.pending.as_mut() {
-        match &mut pending.framing {
-            PendingFraming::None => ready = true,
-            PendingFraming::Length(remaining) => {
-                let take = std::cmp::min(*remaining, connection.buffer.len() as u64) as usize;
-                if take > 0 {
-                    pending.body.extend_from_slice(&connection.buffer[..take]);
-                    connection.buffer.drain(..take);
-                    *remaining -= take as u64;
-                }
-                ready = *remaining == 0;
-            }
-            PendingFraming::Chunked(decoder) => {
-                let input = std::mem::take(&mut connection.buffer);
-                decoder
-                    .feed(&input, &mut |chunk| {
-                        pending.body.extend_from_slice(chunk);
-                        Ok(())
-                    })
-                    .map_err(|message| {
-                        let status = if message.contains("too large") {
-                            413
-                        } else {
-                            400
-                        };
-                        error(status, code_for(status), &message)
-                    })?;
-                ready = decoder.is_done();
-            }
-        }
-    }
-    if !ready {
-        return Ok(None);
-    }
-    let pending = connection.pending.take().expect("pending request");
-    Ok(Some(HttpRequest {
-        method: pending.method,
-        path: pending.path,
-        version: pending.version,
-        headers: pending.headers,
-        body: pending.body,
-    }))
-}
-
 /// Admission bookkeeping for the Windows thread-per-connection fallback.
 ///
 /// The Unix reactor bounds its connection table directly. The fallback has no
@@ -2399,7 +1642,7 @@ fn listener_loop(listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config: Pa
 fn reject_connection(mut stream: TcpStream) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
-    let _ = stream.write_all(BUSY_CONNECTION_RESPONSE);
+    let _ = stream.write_all(engine::BUSY_CONNECTION_RESPONSE);
 }
 
 #[cfg(not(unix))]
@@ -2581,37 +1824,6 @@ fn write_sse_line(stream: &mut TcpStream, line: &str) -> std::io::Result<()> {
     stream.write_all(payload.as_bytes())?;
     stream.write_all(b"\r\n")?;
     stream.flush()
-}
-
-/// HTTP/1.1 defaults to keep-alive unless the client opts out; HTTP/1.0 is the
-/// opposite unless the client opts in. Pipelining is not supported: the next
-/// request is read after the previous response is written.
-fn wants_keep_alive(request: &HttpRequest) -> bool {
-    let connection = request_header(request, "connection")
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let close = connection.split(',').any(|token| token.trim() == "close");
-    if close {
-        return false;
-    }
-    if request.version.eq_ignore_ascii_case("HTTP/1.0") {
-        return connection
-            .split(',')
-            .any(|token| token.trim() == "keep-alive");
-    }
-    true
-}
-
-fn keep_alive_response(mut response: Vec<u8>) -> Vec<u8> {
-    const CLOSE: &[u8] = b"Connection: close\r\n";
-    const KEEP: &[u8] = b"Connection: keep-alive\r\n";
-    if let Some(position) = response
-        .windows(CLOSE.len())
-        .position(|window| window == CLOSE)
-    {
-        response.splice(position..position + CLOSE.len(), KEEP.iter().copied());
-    }
-    response
 }
 
 /// Ask the S4 face whether it owns this request, and serve it from the server
@@ -3175,14 +2387,6 @@ fn csrf_ok(request: &HttpRequest) -> bool {
     !host.is_empty() && origin == format!("http://{}", host) && csrf == "1"
 }
 
-struct HttpRequest {
-    method: String,
-    path: String,
-    version: String,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
-
 /// Why no complete request head arrived. A timeout or EOF is a closed
 /// connection, not a malformed request: answering it with a 400 would be a
 /// response the client never asked for and the Unix reactor does not send one.
@@ -3240,7 +2444,7 @@ fn read_body(
 ) -> Result<HttpRequest, Vec<u8>> {
     let framing =
         http::framing(&head.headers).map_err(|message| error(400, "bad_request", &message))?;
-    let limit = body_limit(&head.path);
+    let limit = engine::body_limit(&head.path);
     if let http::Framing::Length(length) = framing {
         if length > limit {
             return Err(error(413, "payload_too_large", "request body is too large"));
@@ -3944,6 +3148,34 @@ mod tests {
         assert_eq!(resolve_bind(Some("not-an-addr"), Some(b)), b);
         assert_eq!(resolve_bind(None, Some(b)), b);
         assert_eq!(resolve_bind(None, None), default_bind());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_legacy_bridge_queue_is_bounded() {
+        let queue = JobQueue {
+            queue: Mutex::new(VecDeque::new()),
+            ready: Condvar::new(),
+            limit: 2,
+        };
+        let job = || {
+            Work::Ws(WsJob {
+                connection: 1,
+                plugin: "demo".to_string(),
+                payload: Vec::new(),
+            })
+        };
+        assert!(queue.try_push(job()).is_ok());
+        assert!(queue.try_push(job()).is_ok());
+        assert!(
+            queue.try_push(job()).is_err(),
+            "a full bridge rejects the job instead of growing the queue"
+        );
+        assert_eq!(
+            queue.queue.lock().expect("queue").len(),
+            2,
+            "the rejected job must not be queued"
+        );
     }
 
     /// The Windows fallback ties one admitted connection to one thread, so the

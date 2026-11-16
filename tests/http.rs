@@ -4394,8 +4394,8 @@ fn an_idle_connection_is_closed_without_a_response() {
 // and SSE streams are driven by the reactor, so neither may add a thread each.
 // ---------------------------------------------------------------------------
 
-/// The default S4 topology before the server-loop migration (#114/#125).
-/// Update this pin in the slice that deliberately changes the baseline.
+/// The default S4 topology before the control/plugin reactor merges
+/// (#124/#126). Update this pin in the slice that changes the baseline.
 #[cfg(target_os = "linux")]
 const IDLE_DAEMON_THREADS: usize = 10;
 

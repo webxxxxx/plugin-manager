@@ -124,7 +124,9 @@ node tools/perf/run.mjs --perf
 node tools/perf/run.mjs --scale
 ```
 
-线程预算回归（Linux 补充）：`cargo test --test http unix_idle_thread_count_has_no_per_request_or_per_stream_threads -- --exact`。它读 `/proc/<pid>/status` 的 `Threads:`，断言默认 S4 布局的空载基线为 10 条 daemon 线程；16 个 keep-alive 连接与 8 个 SSE 流不得各增加一条线程。改变拓扑的切片（#114/#125）要同步更新 `IDLE_DAEMON_THREADS`。
+线程预算回归（Linux 补充）：`cargo test --test http unix_idle_thread_count_has_no_per_request_or_per_stream_threads -- --exact`。它读 `/proc/<pid>/status` 的 `Threads:`，断言默认 S4 布局的空载基线为 10 条 daemon 线程；16 个 keep-alive 连接与 8 个 SSE 流不得各增加一条线程。改变拓扑的切片（如 #125）要同步更新 `IDLE_DAEMON_THREADS`。
+
+legacy bridge 的队列有界由 `cargo test --bin svcd the_legacy_bridge_queue_is_bounded` 覆盖：上限 64，满时拒绝而不是增长。
 
 ## 7. CI 落点
 

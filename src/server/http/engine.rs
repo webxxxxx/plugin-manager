@@ -1,0 +1,496 @@
+//! The HTTP server loop: it owns the listener, the accepted sockets, the
+//! request buffers and the pending-request table. The legacy bridge implements
+//! the per-connection state machine until the remaining endpoints move to the
+//! face (#115-#125); the loop itself never knows an endpoint.
+//!
+//! The loop is Unix-only for now. Windows keeps the per-connection thread
+//! fallback (ADR-0016); moving that to IOCP belongs to S3/S6.
+
+#[cfg(unix)]
+use std::collections::HashMap;
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::net::{IpAddr, TcpListener, TcpStream};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+
+use crate::http;
+
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, RawFd};
+
+#[cfg(unix)]
+use libc;
+
+/// The busy response for a connection refused by the loop. Both engines send
+/// the same bytes so a client sees one status on every host.
+pub const BUSY_CONNECTION_RESPONSE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\
+    Content-Length: 0\r\n\
+    Connection: close\r\n\r\n";
+
+/// An owned request head plus a complete buffered body.
+#[derive(Debug)]
+pub struct HttpRequest {
+    pub method: String,
+    pub path: String,
+    pub version: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+#[cfg(unix)]
+pub struct PendingRequest {
+    method: String,
+    path: String,
+    version: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    framing: PendingFraming,
+}
+
+#[cfg(unix)]
+pub enum PendingFraming {
+    None,
+    Length(u64),
+    Chunked(http::ChunkedDecoder),
+}
+
+/// One accepted connection. The loop owns the socket and the two buffers; the
+/// handler owns only the protocol state `S`.
+#[cfg(unix)]
+pub struct Connection<S> {
+    pub id: u64,
+    pub stream: TcpStream,
+    pub peer: IpAddr,
+    pub last_active: Instant,
+    pub buffer: Vec<u8>,
+    pub out: Vec<u8>,
+    pub out_at: usize,
+    pub keep_alive: bool,
+    pub pending: Option<PendingRequest>,
+    pub state: S,
+}
+
+#[cfg(unix)]
+#[cfg(unix)]
+impl<S> Connection<S> {
+    /// Flush the connection's output buffer. Returns false when the peer is
+    /// gone. Responses and stream frames both use this one write path.
+    pub fn write_out(&mut self) -> bool {
+        if self.out_at >= self.out.len() {
+            self.out.clear();
+            self.out_at = 0;
+            return true;
+        }
+        match self.stream.write(&self.out[self.out_at..]) {
+            Ok(0) => false,
+            Ok(written) => {
+                self.out_at += written;
+                self.last_active = Instant::now();
+                if self.out_at >= self.out.len() {
+                    self.out.clear();
+                    self.out_at = 0;
+                }
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
+            Err(_) => false,
+        }
+    }
+}
+
+#[cfg(unix)]
+pub type Table<S> = HashMap<u64, Connection<S>>;
+
+/// What a handler wants the loop to do after it inspected the request head but
+/// before the body is read. Legacy takeover endpoints need this window.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreRequest {
+    /// Not a legacy takeover; let the loop parse and buffer the request.
+    Continue,
+    /// The handler cloned/took the connection; remove the loop's handle.
+    Close,
+}
+
+/// The temporary legacy bridge. It owns the endpoint state machine and the
+/// bounded worker queue; the loop owns the connection and the buffers.
+#[cfg(unix)]
+pub trait Handler {
+    type State;
+
+    fn new_state(&mut self, id: u64, peer: IpAddr) -> Self::State;
+    fn on_accept(&mut self, connection: &mut Connection<Self::State>);
+    /// True when the state machine is waiting for an HTTP request head/body.
+    fn reads_request(&self, connection: &Connection<Self::State>) -> bool;
+    fn pre_request(&mut self, connection: &mut Connection<Self::State>) -> PreRequest;
+    fn on_request(&mut self, connection: &mut Connection<Self::State>, request: HttpRequest);
+    fn on_error(&mut self, connection: &mut Connection<Self::State>, response: Vec<u8>);
+    fn on_readable(&mut self, connection: &mut Connection<Self::State>) -> bool;
+    fn on_writable(&mut self, connection: &mut Connection<Self::State>) -> bool;
+    fn on_tick(&mut self, table: &mut Table<Self::State>);
+    fn interest(&self, connection: &Connection<Self::State>) -> i16;
+    fn is_idle(&self, connection: &Connection<Self::State>, now: Instant, idle: Duration) -> bool;
+    fn on_close(&mut self, connection: &mut Connection<Self::State>);
+
+    /// The legacy worker wakes the loop through this fd; the loop only uses it
+    /// to leave poll early, the handler drains it in `on_tick`.
+    fn wake_fd(&self) -> Option<RawFd> {
+        None
+    }
+}
+
+#[cfg(unix)]
+pub fn run<S, H>(listener: TcpListener, handler: &mut H, limits: &crate::limits::Limits)
+where
+    H: Handler<State = S>,
+{
+    let _ = listener.set_nonblocking(true);
+    let mut connections: Table<S> = HashMap::new();
+    let mut next_id: u64 = 1;
+
+    loop {
+        let now = Instant::now();
+        let expired: Vec<u64> = connections
+            .iter()
+            .filter(|(_, connection)| handler.is_idle(connection, now, limits.idle_timeout))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            if let Some(mut connection) = connections.remove(&id) {
+                handler.on_close(&mut connection);
+            }
+        }
+
+        handler.on_tick(&mut connections);
+
+        let mut descriptors = Vec::with_capacity(connections.len() + 2);
+        let mut keys = Vec::with_capacity(connections.len() + 2);
+        descriptors.push(libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        keys.push(0);
+        descriptors.push(libc::pollfd {
+            fd: handler.wake_fd().unwrap_or(-1),
+            events: if handler.wake_fd().is_some() {
+                libc::POLLIN
+            } else {
+                0
+            },
+            revents: 0,
+        });
+        keys.push(1);
+        for (id, connection) in &connections {
+            let mut events = handler.interest(connection);
+            if connection.out_at < connection.out.len() {
+                events |= libc::POLLOUT;
+            }
+            descriptors.push(libc::pollfd {
+                fd: connection.stream.as_raw_fd(),
+                events,
+                revents: 0,
+            });
+            keys.push(*id);
+        }
+
+        let ready = unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as libc::nfds_t,
+                100,
+            )
+        };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                crate::log::svcd(&format!("svcd: server loop poll failed: {}", error));
+            }
+            continue;
+        }
+        if descriptors[1].revents & libc::POLLIN != 0 {
+            // The handler drains the wake fd in on_tick; poll just returned early.
+            handler.on_tick(&mut connections);
+        }
+
+        if descriptors[0].revents & libc::POLLIN != 0 {
+            loop {
+                match listener.accept() {
+                    Ok((stream, peer)) => {
+                        let ip = peer.ip();
+                        let per_ip = connections.values().filter(|c| c.peer == ip).count();
+                        if connections.len() >= limits.max_connections
+                            || per_ip >= limits.max_connections_per_ip
+                        {
+                            reject_connection(stream);
+                            continue;
+                        }
+                        let _ = stream.set_nonblocking(true);
+                        let id = next_id;
+                        next_id = next_id.saturating_add(1);
+                        let mut connection = Connection {
+                            id,
+                            stream,
+                            peer: ip,
+                            last_active: Instant::now(),
+                            buffer: Vec::new(),
+                            out: Vec::new(),
+                            out_at: 0,
+                            keep_alive: false,
+                            pending: None,
+                            state: handler.new_state(id, ip),
+                        };
+                        handler.on_accept(&mut connection);
+                        connections.insert(id, connection);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => {
+                        crate::log::svcd(&format!("svcd: server loop accept failed: {}", error));
+                        break;
+                    }
+                }
+            }
+        }
+
+        for index in 2..descriptors.len() {
+            let id = keys[index];
+            let Some(connection) = connections.get_mut(&id) else {
+                continue;
+            };
+            let revents = descriptors[index].revents;
+            if revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+                if let Some(mut connection) = connections.remove(&id) {
+                    handler.on_close(&mut connection);
+                }
+                continue;
+            }
+            if revents & libc::POLLIN != 0 {
+                if handler.reads_request(connection) {
+                    let mut chunk = [0u8; 8 * 1024];
+                    match connection.stream.read(&mut chunk) {
+                        Ok(0) => {
+                            if let Some(mut connection) = connections.remove(&id) {
+                                handler.on_close(&mut connection);
+                            }
+                            continue;
+                        }
+                        Ok(read) => {
+                            connection.last_active = Instant::now();
+                            connection.buffer.extend_from_slice(&chunk[..read]);
+                            match handler.pre_request(connection) {
+                                PreRequest::Continue => loop {
+                                    match advance_request(connection) {
+                                        Ok(None) => break,
+                                        Ok(Some(request)) => {
+                                            handler.on_request(connection, request);
+                                            break;
+                                        }
+                                        Err(response) => {
+                                            handler.on_error(connection, response);
+                                            break;
+                                        }
+                                    }
+                                },
+                                PreRequest::Close => {
+                                    if let Some(mut connection) = connections.remove(&id) {
+                                        handler.on_close(&mut connection);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(_) => {
+                            if let Some(mut connection) = connections.remove(&id) {
+                                handler.on_close(&mut connection);
+                            }
+                            continue;
+                        }
+                    }
+                } else if !handler.on_readable(connection) {
+                    if let Some(mut connection) = connections.remove(&id) {
+                        handler.on_close(&mut connection);
+                    }
+                    continue;
+                }
+            }
+            let Some(connection) = connections.get_mut(&id) else {
+                continue;
+            };
+            if revents & libc::POLLOUT != 0 || connection.out_at < connection.out.len() {
+                if !handler.on_writable(connection) {
+                    if let Some(mut connection) = connections.remove(&id) {
+                        handler.on_close(&mut connection);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn reject_connection(mut stream: TcpStream) {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+    let _ = std::io::Write::write_all(&mut stream, BUSY_CONNECTION_RESPONSE);
+}
+
+/// Buffered-body limit for the routes that still go through the ordinary
+/// router. Blob uploads/downloads are streamed before this is consulted.
+pub fn body_limit(path: &str) -> u64 {
+    let limits = crate::limits::current();
+    let path = path.split_once('?').map(|(path, _)| path).unwrap_or(path);
+    if path.starts_with("/api/v1/plugins") || path.starts_with("/api/v1/import") {
+        limits.max_body
+    } else if path.trim_end_matches('/').ends_with("/complete")
+        && (path.starts_with("/api/v1/blobs/uploads/")
+            || path.starts_with("/api/v1/file/uploads/")
+            || path.starts_with("/api/v1/files/uploads/"))
+    {
+        limits.max_complete_body
+    } else {
+        limits.max_json_body
+    }
+}
+
+#[cfg(unix)]
+pub fn advance_request<S>(connection: &mut Connection<S>) -> Result<Option<HttpRequest>, Vec<u8>> {
+    if connection.pending.is_none() {
+        let Some(header_end) = http::header_end(&connection.buffer) else {
+            if connection.buffer.len() > crate::limits::current().max_header {
+                return Err(crate::http::json_error(
+                    400,
+                    "bad_request",
+                    "request headers are too large",
+                ));
+            }
+            return Ok(None);
+        };
+        if header_end > crate::limits::current().max_header {
+            return Err(crate::http::json_error(
+                400,
+                "bad_request",
+                "request headers are too large",
+            ));
+        }
+        let Some((head, body_start)) = http::parse_head(&connection.buffer[..header_end + 4])
+        else {
+            return Err(crate::http::json_error(
+                400,
+                "bad_request",
+                "malformed request line",
+            ));
+        };
+        let framing = http::framing(&head.headers)
+            .map_err(|message| crate::http::json_error(400, "bad_request", &message))?;
+        let limit = body_limit(&head.path);
+        if let http::Framing::Length(length) = framing {
+            if length > limit {
+                return Err(crate::http::json_error(
+                    413,
+                    "payload_too_large",
+                    "request body is too large",
+                ));
+            }
+        }
+        let buffer = std::mem::take(&mut connection.buffer);
+        connection.buffer = buffer[body_start..].to_vec();
+        connection.pending = Some(PendingRequest {
+            method: head.method,
+            path: head.path,
+            version: head.version,
+            headers: head.headers,
+            body: Vec::new(),
+            framing: match framing {
+                http::Framing::None | http::Framing::Length(0) => PendingFraming::None,
+                http::Framing::Length(length) => PendingFraming::Length(length),
+                http::Framing::Chunked => PendingFraming::Chunked(http::ChunkedDecoder::new(limit)),
+            },
+        });
+    }
+
+    let mut ready = false;
+    if let Some(pending) = connection.pending.as_mut() {
+        match &mut pending.framing {
+            PendingFraming::None => ready = true,
+            PendingFraming::Length(remaining) => {
+                let take = std::cmp::min(*remaining, connection.buffer.len() as u64) as usize;
+                if take > 0 {
+                    pending.body.extend_from_slice(&connection.buffer[..take]);
+                    connection.buffer.drain(..take);
+                    *remaining -= take as u64;
+                }
+                ready = *remaining == 0;
+            }
+            PendingFraming::Chunked(decoder) => {
+                let input = std::mem::take(&mut connection.buffer);
+                decoder
+                    .feed(&input, &mut |chunk| {
+                        pending.body.extend_from_slice(chunk);
+                        Ok(())
+                    })
+                    .map_err(|message| {
+                        let status = if message.contains("too large") {
+                            413
+                        } else {
+                            400
+                        };
+                        crate::http::json_error(
+                            status,
+                            if status == 413 {
+                                "payload_too_large"
+                            } else {
+                                "bad_request"
+                            },
+                            &message,
+                        )
+                    })?;
+                ready = decoder.is_done();
+            }
+        }
+    }
+    if !ready {
+        return Ok(None);
+    }
+    let pending = connection.pending.take().expect("pending request");
+    Ok(Some(HttpRequest {
+        method: pending.method,
+        path: pending.path,
+        version: pending.version,
+        headers: pending.headers,
+        body: pending.body,
+    }))
+}
+
+/// HTTP/1.1 defaults to keep-alive unless the client opts out; HTTP/1.0 is the
+/// opposite unless the client opts in. Pipelining is not supported: the next
+/// request is read after the previous response is written.
+pub fn wants_keep_alive(request: &HttpRequest) -> bool {
+    let connection = http::header(&request.headers, "connection")
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let close = connection.split(',').any(|token| token.trim() == "close");
+    if close {
+        return false;
+    }
+    if request.version.eq_ignore_ascii_case("HTTP/1.0") {
+        return connection
+            .split(',')
+            .any(|token| token.trim() == "keep-alive");
+    }
+    true
+}
+
+pub fn keep_alive_response(mut response: Vec<u8>) -> Vec<u8> {
+    const CLOSE: &[u8] = b"Connection: close\r\n";
+    const KEEP: &[u8] = b"Connection: keep-alive\r\n";
+    if let Some(position) = response
+        .windows(CLOSE.len())
+        .position(|window| window == CLOSE)
+    {
+        response.splice(position..position + CLOSE.len(), KEEP.iter().copied());
+    }
+    response
+}

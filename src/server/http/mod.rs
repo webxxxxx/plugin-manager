@@ -4,6 +4,7 @@
 
 pub mod contract;
 pub mod dispatch;
+pub mod engine;
 
 #[cfg_attr(not(feature = "http"), allow(unused_imports))]
 pub use contract::{
