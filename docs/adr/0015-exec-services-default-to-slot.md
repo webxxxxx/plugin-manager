@@ -8,7 +8,8 @@ Accepted。细化 [ADR-0013](0013-service-contract-interface.md)。
 
 - 一个服务只要声明了 `exec`，它的运行时资源就由监督槽（`Slot`）唯一拥有；`tools/call` 在调用点构造 `SlotWire(handle, client)`，不经过 `Launchers`。
 - `ImplRef{tag, binding}` 只用于槽之外的载体：内置 `svc`（`tag=builtin`），以及未来的复合/远程。没有 `tag=process`；process 不是第二种载体，只是槽里的一个进程。
-- 本决策要求 `exec` 与 `impl_ref` 互斥：前者选槽，后者选 launcher；两者都没有的服务不可调用。装配点尚未强制这条不变式，见 #109。
+- `SlotWire` 只拥有调用面：`Ensure` / `Quiesce` 以 `implementation_error`/`never` 拒绝，`Probe` 读槽的粗粒度健康；生命周期动作由 daemon 执行，不经 Wire。
+- 本决策要求 `exec` 与 `impl_ref` 互斥：前者选槽，后者选 launcher；两者都没有的服务不可调用。装配点在注册表边界强制这条不变式（`Service::carrier`，`Registry::insert` 与 `Registry::replace`，见 #109）：加载器把拒绝转成 `LoadIssue`，安装以错误返回，reload 记日志跳过。
 
 ## Considered Options
 
@@ -18,6 +19,6 @@ Accepted。细化 [ADR-0013](0013-service-contract-interface.md)。
 
 ## Consequences
 
-- 删除了 `ProcessLauncher` / `ProcessWire` / `ProcessSpec`；process adapter 的 conformance 覆盖随之消失。`SlotWire` 尚未接入 `assert_conforming`，目前由 daemon/slot 的行为测试覆盖，补齐一致性断言的缺口见 #109。未来真需要无状态进程载体时再加回。
+- 删除了 `ProcessLauncher` / `ProcessWire` / `ProcessSpec`；process adapter 的 conformance 覆盖随之消失。一致性断言按**入口**划分（#109）：`SlotWire` 过调用面那一套（声明的失败类别不被掩掉、取消后不得返回 `Ok`），生命周期那一套换成委托断言（必须以 `implementation_error`/`never` 拒绝 Ensure / Quiesce，Probe 仍作答）；槽自己的生命周期行为仍由 slot / daemon 测试覆盖。未来真需要无状态进程载体时再加回。
 - 新增运行载体仍只加一个 adapter 与一个 tag；但「槽之外」的载体才走 `Launchers`，`exec` 是槽的内建默认。
 - `ImplRef` 不进入外部 `services.d` / `.spk` schema；等复合/远程有真实调用方再引入。

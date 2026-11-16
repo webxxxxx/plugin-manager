@@ -192,7 +192,54 @@ pub struct Service {
     pub config: Option<String>,
 }
 
+/// The runtime carrier of a service: exactly one owner of its runtime
+/// resources (ADR-0015).
+///
+/// A service is either slot-backed (`exec`, the supervised process) or
+/// launcher-backed (`impl_ref`, a registered tag such as `builtin`). A service
+/// with neither is still supervised and listed but cannot be called; that shape
+/// is legal, a service with both is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Carrier {
+    /// The supervised slot owns the process (`exec`).
+    Slot,
+    /// A launcher owns the implementation (`impl_ref.tag`).
+    Launcher,
+    /// No callable carrier; only supervision applies.
+    None,
+}
+
+/// Why a service has no single runtime carrier. The only illegal shape today is
+/// both carriers at once; keep it typed so the rule is testable on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CarrierError {
+    /// `exec` and `impl_ref` are both set: two owners for one service.
+    Conflict,
+}
+
+impl std::fmt::Display for CarrierError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CarrierError::Conflict => write!(
+                formatter,
+                "declares both exec and impl_ref; a service is either slot-backed or launcher-backed"
+            ),
+        }
+    }
+}
+
 impl Service {
+    /// ADR-0015's invariant: `exec` and `impl_ref` are mutually exclusive.
+    /// Both empty is allowed (the service is supervised but not callable).
+    pub fn carrier(&self) -> Result<Carrier, CarrierError> {
+        match (self.exec.is_some(), self.impl_ref.is_some()) {
+            (true, false) => Ok(Carrier::Slot),
+            (false, true) => Ok(Carrier::Launcher),
+            (false, false) => Ok(Carrier::None),
+            (true, true) => Err(CarrierError::Conflict),
+        }
+    }
+
     /// The in-process `svc` service. It is always running and never enters the
     /// supervisor state machine.
     pub fn builtin_svc() -> Service {
@@ -255,12 +302,33 @@ impl Registry {
         registry
     }
 
+    /// The only door for a new service. Everything that can produce a Service
+    /// (definitions, drop-in scripts, plugins, the builtin) comes through here,
+    /// so the carrier invariant is enforced once and cannot be bypassed by a new
+    /// loader.
     pub fn insert(&mut self, service: Service) -> Result<(), String> {
         if self.services.contains_key(&service.id) {
             return Err(format!("duplicate service id \"{}\"", service.id));
         }
+        self.check_carrier(&service)?;
         self.services.insert(service.id.clone(), service);
         Ok(())
+    }
+
+    /// Replace an existing service with the same validation as insert. The
+    /// registry is left untouched when the replacement is rejected, so a reload
+    /// can log and skip instead of dropping a live service.
+    pub fn replace(&mut self, service: Service) -> Result<(), String> {
+        self.check_carrier(&service)?;
+        self.services.insert(service.id.clone(), service);
+        Ok(())
+    }
+
+    fn check_carrier(&self, service: &Service) -> Result<(), String> {
+        service
+            .carrier()
+            .map(|_| ())
+            .map_err(|error| format!("service \"{}\" {}", service.id, error))
     }
 
     pub fn remove(&mut self, id: &str) -> Option<Service> {
@@ -271,6 +339,9 @@ impl Registry {
         self.services.get(id)
     }
 
+    /// Mutable access for flags that are not part of the carrier invariant
+    /// (`enabled`, live state). Replacing a whole service goes through
+    /// `replace` so the invariant still holds.
     pub fn get_mut(&mut self, id: &str) -> Option<&mut Service> {
         self.services.get_mut(id)
     }
@@ -417,5 +488,102 @@ mod tests {
             .expect_err("duplicate id");
 
         assert!(error.contains("duplicate service id"));
+    }
+
+    fn slot_backed(id: &str) -> Service {
+        Service {
+            id: id.into(),
+            impl_ref: None,
+            exec: Some(Exec {
+                path: "/bin/true".into(),
+                args: Vec::new(),
+                env: Default::default(),
+                ready: Ready::Exec,
+                interpreter: None,
+            }),
+            ..Service::builtin_svc()
+        }
+    }
+
+    fn launcher_backed(id: &str) -> Service {
+        Service {
+            id: id.into(),
+            exec: None,
+            impl_ref: Some(crate::kernel::contract::ImplRef {
+                tag: "builtin".into(),
+                binding: json!({}),
+            }),
+            ..Service::builtin_svc()
+        }
+    }
+
+    fn two_owners(id: &str) -> Service {
+        Service {
+            exec: Some(Exec {
+                path: "/bin/true".into(),
+                args: Vec::new(),
+                env: Default::default(),
+                ready: Ready::Exec,
+                interpreter: None,
+            }),
+            ..launcher_backed(id)
+        }
+    }
+
+    #[test]
+    fn every_carrier_shape_is_single_except_two_owners() {
+        assert_eq!(slot_backed("core").carrier(), Ok(Carrier::Slot));
+        assert_eq!(launcher_backed("built").carrier(), Ok(Carrier::Launcher));
+
+        let neither = Service {
+            exec: None,
+            impl_ref: None,
+            ..Service::builtin_svc()
+        };
+        assert_eq!(
+            neither.carrier(),
+            Ok(Carrier::None),
+            "a service with neither carrier is legal but not callable"
+        );
+
+        assert_eq!(two_owners("bad").carrier(), Err(CarrierError::Conflict));
+    }
+
+    #[test]
+    fn a_service_with_two_carriers_is_rejected_and_not_stored() {
+        let mut registry = Registry::new();
+        let error = registry
+            .insert(two_owners("bad"))
+            .expect_err("both carriers must be rejected");
+        assert!(error.contains("both exec and impl_ref"), "{error}");
+        assert!(registry.get("bad").is_none());
+    }
+
+    #[test]
+    fn replace_rejects_a_conflict_and_keeps_the_previous_service() {
+        let mut registry = Registry::new();
+        registry.insert(slot_backed("demo")).expect("slot-backed");
+
+        let error = registry
+            .replace(two_owners("demo"))
+            .expect_err("both carriers must be rejected");
+        assert!(error.contains("both exec and impl_ref"), "{error}");
+        assert_eq!(
+            registry.get("demo").map(Service::carrier),
+            Some(Ok(Carrier::Slot)),
+            "a rejected replacement must leave the old service untouched"
+        );
+    }
+
+    #[test]
+    fn the_builtin_core_and_launcher_shapes_are_still_accepted() {
+        let mut registry = Registry::with_builtin();
+        registry.insert(slot_backed("core")).expect("core");
+        registry.insert(launcher_backed("built")).expect("launcher");
+        assert!(registry.get("svc").is_some());
+        assert_eq!(
+            registry.get("core").map(Service::carrier),
+            Some(Ok(Carrier::Slot))
+        );
     }
 }

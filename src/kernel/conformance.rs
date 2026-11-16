@@ -1,8 +1,19 @@
-//! 一致性断言：**任何** adapter 都要过同一套检查。
+//! 一致性断言：**任何** adapter 都要过它所在入口的那套检查。
 //!
-//! 接口是三个纯函数：`check` 返回违规清单（空 = 通过），`assert_conforming` 是
-//! 给它包一层 panic 的便利函数。返回清单而不是直接 panic，是为了让「故意说谎的
-//! adapter 必须被抓到」这件事本身可以被测试，而不是靠 `catch_unwind`。
+//! 套件按**入口**划分，不按适配器划分（#109）：
+//!
+//! - [`check_call`]：调用面。内核拒绝（未知能力 / 内联上限 / 零超时）、声明的失败
+//!   类别原样表达、取消后不得返回 Ok、内联边界恰好通过。
+//! - [`check_lifecycle`]：适配器**自己拥有**生命周期时，Ensure / Quiesce / Probe 的断言。
+//! - [`check_delegated_lifecycle`]：适配器把生命周期交给别人（例如监督槽，ADR-0015）时，
+//!   必须以 `implementation_error` + `never` 拒绝 Ensure / Quiesce，Probe 仍要作答。
+//!
+//! [`assert_conforming`] 是「两个入口都自己拥有」的适配器的总入口；只拥有调用面的
+//! 适配器用 [`assert_call_conforming`] + [`assert_delegates_lifecycle`] 组合。
+//!
+//! 接口是纯函数：`check*` 返回违规清单（空 = 通过），`assert_*` 只是包一层 panic。
+//! 返回清单而不是直接 panic，是为了让「故意说谎的 adapter 必须被抓到」这件事本身
+//! 可以被测试，而不是靠 `catch_unwind`。
 //!
 //! `make` 造正常实例，`make_failing` 按类别造「返回该类失败」的实例；后者让
 //! 「8 类失败可表达」成为可断言的事实，而不是样例契约里的一个列表。
@@ -17,7 +28,7 @@ use super::contract::{
     inline_len, Capability, CapabilityName, Contract, Control, Effect, Health, ImplRef, Instance,
     Invocation, Launchers, Limits, Obligations, ServiceId, Settled,
 };
-use super::failure::{CallError, Class, Failure, Rejection};
+use super::failure::{CallError, Class, Failure, Rejection, Retry};
 
 /// 给 conformance 用的样例契约：一个只读且幂等的能力。
 pub fn sample_contract(limits: Limits) -> Contract {
@@ -37,25 +48,88 @@ pub fn sample_contract(limits: Limits) -> Contract {
     )
 }
 
-/// 逐项检查一个 adapter。每次检查都用 `make` 新建实例，避免状态互相污染。
+/// 逐项检查一个「两个入口都自己拥有」的 adapter。
 pub fn check(
     contract: &Contract,
     make: impl Fn() -> Instance,
     make_failing: impl Fn(Class) -> Instance,
 ) -> Vec<String> {
-    let mut violations = Vec::new();
-
-    if let Err(error) = contract.validate() {
-        violations.push(format!("contract is invalid: {error}"));
-    }
-    let Some(first) = contract
-        .surface()
-        .first()
-        .map(|capability| capability.name.as_str().to_string())
-    else {
+    let mut violations = check_contract(contract);
+    let Some(first) = first_capability(contract) else {
         violations.push("contract has no capability to exercise".into());
         return violations;
     };
+    violations.extend(call_violations(contract, &first, &make, &make_failing));
+    violations.extend(lifecycle_violations(&make));
+    violations
+}
+
+/// 只检查调用面：给「生命周期由别人拥有」的 adapter（例如槽的 `SlotWire`）。
+pub fn check_call(
+    contract: &Contract,
+    make: impl Fn() -> Instance,
+    make_failing: impl Fn(Class) -> Instance,
+) -> Vec<String> {
+    let mut violations = check_contract(contract);
+    let Some(first) = first_capability(contract) else {
+        violations.push("contract has no capability to exercise".into());
+        return violations;
+    };
+    violations.extend(call_violations(contract, &first, &make, &make_failing));
+    violations
+}
+
+/// 检查适配器自己拥有的生命周期入口。
+pub fn check_lifecycle(contract: &Contract, make: impl Fn() -> Instance) -> Vec<String> {
+    let mut violations = check_contract(contract);
+    violations.extend(lifecycle_violations(&make));
+    violations
+}
+
+/// 检查「生命周期委托给别人」的 adapter：Ensure / Quiesce 必须被明确拒绝
+/// （`implementation_error` + `never`，不能邀请重试），Probe 仍必须作答。
+pub fn check_delegated_lifecycle(contract: &Contract, make: impl Fn() -> Instance) -> Vec<String> {
+    let mut violations = check_contract(contract);
+    violations.extend(delegated_violations(&make));
+    violations
+}
+
+fn first_capability(contract: &Contract) -> Option<String> {
+    contract
+        .surface()
+        .first()
+        .map(|capability| capability.name.as_str().to_string())
+}
+
+fn check_contract(contract: &Contract) -> Vec<String> {
+    let mut violations = Vec::new();
+    if let Err(error) = contract.validate() {
+        violations.push(format!("contract is invalid: {error}"));
+    }
+    // 能力面稳定：契约校验之后，排序与唯一性必须仍然成立。
+    let names: Vec<&str> = contract
+        .surface()
+        .iter()
+        .map(|capability| capability.name.as_str())
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted != names {
+        violations.push("surface is not sorted and unique".into());
+    }
+    violations
+}
+
+/// 调用面：每次检查都用 `make` 新建实例，避免状态互相污染。
+fn call_violations(
+    contract: &Contract,
+    first: &str,
+    make: &impl Fn() -> Instance,
+    make_failing: &impl Fn(Class) -> Instance,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    let first = first.to_string();
 
     // 1. 未知能力必须在进实现之前被拒。
     {
@@ -140,6 +214,13 @@ pub fn check(
         }
     }
 
+    violations
+}
+
+/// 生命周期入口：适配器自己拥有它时的断言。
+fn lifecycle_violations(make: &impl Fn() -> Instance) -> Vec<String> {
+    let mut violations = Vec::new();
+
     // 5. 生命周期：Ensure 之后 Probe 不得是 Stopped；Quiesce 之后必须是 Stopped。
     {
         let mut instance = make();
@@ -167,19 +248,30 @@ pub fn check(
         }
     }
 
-    // 6. 能力面稳定：契约校验之后，排序与唯一性必须仍然成立。
-    {
-        let names: Vec<&str> = contract
-            .surface()
-            .iter()
-            .map(|capability| capability.name.as_str())
-            .collect();
-        let mut sorted = names.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        if sorted != names {
-            violations.push("surface is not sorted and unique".into());
+    violations
+}
+
+/// 委托入口：适配器不拥有生命周期时，必须拒绝而不是假装做到。
+fn delegated_violations(make: &impl Fn() -> Instance) -> Vec<String> {
+    let mut violations = Vec::new();
+
+    for (control, name) in [(Control::Ensure, "Ensure"), (Control::Quiesce, "Quiesce")] {
+        let mut instance = make();
+        match instance.lifecycle(control) {
+            Err(CallError::Failed(failure))
+                if failure.class == Class::ImplementationError
+                    && failure.retry == Retry::Never => {}
+            other => violations.push(format!(
+                "a delegating adapter must reject {name} with implementation_error/never: {other:?}"
+            )),
         }
+    }
+
+    let mut instance = make();
+    if let Err(failure) = instance.lifecycle(Control::Probe) {
+        violations.push(format!(
+            "a delegating adapter must still answer Probe: {failure:?}"
+        ));
     }
 
     violations
@@ -194,6 +286,26 @@ pub fn assert_conforming(
     assert!(
         violations.is_empty(),
         "adapter is not conforming: {violations:#?}"
+    );
+}
+
+pub fn assert_call_conforming(
+    contract: &Contract,
+    make: impl Fn() -> Instance,
+    make_failing: impl Fn(Class) -> Instance,
+) {
+    let violations = check_call(contract, make, make_failing);
+    assert!(
+        violations.is_empty(),
+        "adapter call surface is not conforming: {violations:#?}"
+    );
+}
+
+pub fn assert_delegates_lifecycle(contract: &Contract, make: impl Fn() -> Instance) {
+    let violations = check_delegated_lifecycle(contract, make);
+    assert!(
+        violations.is_empty(),
+        "adapter does not delegate lifecycle correctly: {violations:#?}"
     );
 }
 

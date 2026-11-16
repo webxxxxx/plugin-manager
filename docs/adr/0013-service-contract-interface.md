@@ -15,7 +15,7 @@
 - **死亡与超时按判定时刻的客观状态归类**：进程已死 → `NotRunning`；进程仍活且到点 → `Timeout`。超时由**内核**计时，默认与上限来自配置（`default_timeout` / `max_timeout`），全局常量 `CALL_TIMEOUT_MS` 退役。
 - **就绪前做一次 `Probe`**：超时或实现不认这个 id，记为「未就绪」，继续等到 `start_deadline` 再判启动失败；契约只暴露**服务级**健康，不暴露逐能力状态。
 - **内联上限 1 MiB**，大内容只传 `$blob` 引用；三种线格式（NDJSON 行帧 / 4 字节长度帧 / raw 8 字节帧）**不进契约**。raw 是 UI↔插件直通，不属于本契约。
-- **每个 adapter 必须通过同一套一致性断言**：8 类失败、1 MiB 边界、取消顺序、健康三态、能力面稳定。
+- **每个 adapter 必须通过它所在入口的一致性断言**：8 类失败、1 MiB 边界、取消顺序、能力面稳定属于调用面；健康三态与 `Ensure` / `Quiesce` 属于生命周期入口——自己拥有它的 adapter 直接断言，把生命周期委托出去的 adapter（槽，见 [ADR-0015](0015-exec-services-default-to-slot.md)）必须明确拒绝而不是假装做到。
 
 ## Consequences
 

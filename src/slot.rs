@@ -162,8 +162,44 @@ impl SlotWire {
     }
 }
 
+/// Test-only handle: answers submitted calls with `respond` on its own thread.
+/// The thread ends when the handle is dropped, so the conformance suite can build
+/// a fresh handle per assertion. It exercises the real `SlotWire` plumbing
+/// (submit / reply channel / timeout) without spawning a supervised process; the
+/// event loop's own behaviour stays covered by the slot tests below.
+#[cfg(test)]
+impl SlotHandle {
+    pub(crate) fn scripted(
+        respond: impl Fn(&Invocation) -> Result<Value, Failure> + Send + 'static,
+    ) -> SlotHandle {
+        let (requests, receiver) = mpsc::channel::<SlotRequest>();
+        thread::spawn(move || {
+            for request in receiver {
+                let outcome = respond(&request.invocation);
+                let _ = request.reply.send(outcome);
+            }
+        });
+        SlotHandle {
+            requests,
+            wake: None,
+            // Ready: a delegating adapter must still answer Probe.
+            health: Arc::new(AtomicU8::new(2)),
+        }
+    }
+}
+
 impl Wire for SlotWire {
     fn call(&mut self, invocation: Invocation) -> Result<Reply, Failure> {
+        // 内核对「取消后不得返回 Ok」的承诺必须在这一层兑现：submit 之后就没有
+        // 取消通道了（事件循环的 deadline 只覆盖超时），一个已取消的调用一旦进槽
+        // 就会被真正执行，还可能以 Ok 回到调用方。
+        if invocation.cancel.is_cancelled() {
+            return Err(Failure::new(
+                Class::Cancelled,
+                Retry::Never,
+                "call was cancelled before it reached the service",
+            ));
+        }
         let timeout = invocation.timeout;
         let receiver = self.handle.submit(invocation, self.client.clone())?;
         match receiver.recv_timeout(timeout.saturating_add(std::time::Duration::from_secs(1))) {
@@ -2065,6 +2101,104 @@ done
             }
             assert!(started.elapsed() < Duration::from_secs(5), "no response");
             std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The conformance suite lives in the kernel, so the slot-backed adapter's
+    /// conformance test lives here: a domain module may reference the kernel,
+    /// the reverse edge would be a layering violation (tools/dep-lint.mjs).
+    fn conforming_wire(
+        respond: impl Fn(&Invocation) -> Result<Value, Failure> + Send + 'static,
+    ) -> crate::kernel::contract::Instance {
+        let contract = crate::kernel::conformance::sample_contract(
+            crate::kernel::contract::Limits::default(),
+        );
+        crate::kernel::contract::Instance::new(
+            contract,
+            Box::new(SlotWire::new(SlotHandle::scripted(respond), None)),
+        )
+        .expect("valid contract")
+    }
+
+    #[test]
+    fn the_slot_wire_conforms_on_the_call_surface_and_delegates_lifecycle() {
+        let contract = crate::kernel::conformance::sample_contract(
+            crate::kernel::contract::Limits::default(),
+        );
+        crate::kernel::conformance::assert_call_conforming(
+            &contract,
+            || conforming_wire(|_| Ok(json!({"ok": true}))),
+            |class| {
+                conforming_wire(move |_| {
+                    Err(Failure::new(class, Retry::Never, "injected failure"))
+                })
+            },
+        );
+        crate::kernel::conformance::assert_delegates_lifecycle(&contract, || {
+            conforming_wire(|_| Ok(json!({})))
+        });
+    }
+
+    #[test]
+    fn the_slot_wire_cannot_pass_the_owned_lifecycle_suite() {
+        // 钉住「为什么套件要按入口拆」：槽的生命周期属于 daemon（ADR-0015），
+        // SlotWire 只能拒绝 Ensure / Quiesce，所以它永远过不了生命周期那一套。
+        let contract = crate::kernel::conformance::sample_contract(
+            crate::kernel::contract::Limits::default(),
+        );
+        let violations = crate::kernel::conformance::check(
+            &contract,
+            || conforming_wire(|_| Ok(json!({}))),
+            |_| conforming_wire(|_| Ok(json!({}))),
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("Ensure")),
+            "the slot wire must fail the owned lifecycle suite: {violations:#?}"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_call_never_reaches_the_slot() {
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = seen.clone();
+        let mut wire = SlotWire::new(
+            SlotHandle::scripted(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"ok": true}))
+            }),
+            None,
+        );
+
+        let invocation =
+            Invocation::new("echo", json!({}), std::time::Duration::from_secs(1));
+        invocation.cancel.cancel();
+        match wire.call(invocation) {
+            Err(failure) => assert_eq!(failure.class, Class::Cancelled),
+            Ok(reply) => panic!("a cancelled call must not return Ok: {reply:?}"),
+        }
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            0,
+            "the slot must not see a call that was already cancelled"
+        );
+    }
+
+    #[test]
+    fn a_handle_that_never_replies_times_out_in_the_worker() {
+        let mut wire = SlotWire::new(
+            SlotHandle::scripted(|_| loop {
+                std::thread::park();
+            }),
+            None,
+        );
+
+        let invocation =
+            Invocation::new("echo", json!({}), std::time::Duration::from_millis(1));
+        match wire.call(invocation) {
+            Err(failure) => assert_eq!(failure.class, Class::Timeout),
+            Ok(reply) => panic!("a silent slot must not report success: {reply:?}"),
         }
     }
 }

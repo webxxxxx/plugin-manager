@@ -1268,6 +1268,35 @@ impl Daemon {
             removed.push(id);
         }
 
+        let (added, updated) = self.apply_definitions(desired);
+
+        // Only definitions that appeared *now* are started: a reload must not
+        // resurrect services the operator stopped, nor retry Failed ones.
+        for id in &added {
+            let enabled = self
+                .registry
+                .get(id)
+                .map(|service| service.enabled)
+                .unwrap_or(false);
+            if enabled {
+                if let Err(error) = self.start_service(id) {
+                    log::svcd(&format!("svcd: reload: cannot start {}: {}", id, error));
+                }
+            }
+        }
+        self.sweep_runtime_records();
+        self.bump_catalog();
+        Ok(json!({ "added": added, "removed": removed, "updated": updated }))
+    }
+
+    /// One reconcile pass over the desired definitions: register new services and
+    /// update existing ones. A service rejected by the registry (ADR-0015's
+    /// carrier invariant) is logged and skipped; the live service and its slot
+    /// stay exactly as they were.
+    fn apply_definitions(
+        &mut self,
+        desired: BTreeMap<String, Service>,
+    ) -> (Vec<String>, Vec<String>) {
         let mut added = Vec::new();
         let mut updated = Vec::new();
         for (id, service) in desired {
@@ -1291,7 +1320,13 @@ impl Daemon {
                         configure_slot(&mut slot, &service);
                         self.slots.insert(id.clone(), slot);
                     }
-                    self.registry.insert(service)?;
+                    // A rejected service must not leave a slot with no registry
+                    // entry: undo the cheap insert.
+                    if let Err(reason) = self.registry.insert(service) {
+                        self.slots.remove(&id);
+                        log::svcd(&format!("svcd: reload: rejecting {}: {}", id, reason));
+                        continue;
+                    }
                     log::svcd(&format!("svcd: reload: added {}", id));
                     added.push(id);
                 }
@@ -1314,7 +1349,13 @@ impl Daemon {
                     let restart = next.restart;
                     let remain_after_exit = next.remain_after_exit;
                     let protocol = next.protocol;
-                    *self.registry.get_mut(&id).expect("service is present") = next;
+                    // Go through the registry door so the carrier invariant is
+                    // enforced here too; a rejected definition keeps the live
+                    // service and its slot untouched.
+                    if let Err(reason) = self.registry.replace(next) {
+                        log::svcd(&format!("svcd: reload: rejecting {}: {}", id, reason));
+                        continue;
+                    }
                     if let Some(slot) = self.slots.get_mut(&id) {
                         if let Some(exec) = exec {
                             slot.set_exec(exec);
@@ -1329,24 +1370,7 @@ impl Daemon {
                 }
             }
         }
-
-        // Only definitions that appeared *now* are started: a reload must not
-        // resurrect services the operator stopped, nor retry Failed ones.
-        for id in &added {
-            let enabled = self
-                .registry
-                .get(id)
-                .map(|service| service.enabled)
-                .unwrap_or(false);
-            if enabled {
-                if let Err(error) = self.start_service(id) {
-                    log::svcd(&format!("svcd: reload: cannot start {}: {}", id, error));
-                }
-            }
-        }
-        self.sweep_runtime_records();
-        self.bump_catalog();
-        Ok(json!({ "added": added, "removed": removed, "updated": updated }))
+        (added, updated)
     }
 
     fn start_service(&mut self, id: &str) -> Result<Status, String> {
@@ -1546,6 +1570,12 @@ impl Daemon {
             }
             Err(error) => return Err(error),
         };
+        // The package is already on disk, but registration can still be refused
+        // (ADR-0015's carrier invariant). Check before touching the running slot
+        // so a refusal leaves the live service untouched.
+        if let Err(error) = service.carrier() {
+            return Err(format!("plugin {}: {}", id, error));
+        }
         if !still_running {
             self.slots.remove(&id);
             if let Some(exec) = service.exec.clone() {
@@ -1561,8 +1591,7 @@ impl Daemon {
                 self.slots.insert(id.clone(), slot);
             }
         }
-        self.registry.remove(&id);
-        self.registry.insert(service)?;
+        self.registry.replace(service)?;
         self.bump_catalog();
         log::svcd(&format!(
             "svcd: plugin {} {} installed ({}){}",
@@ -1652,6 +1681,9 @@ impl Daemon {
         }
         let still_running = running(&self.slots);
         let service = plugin::install_staged(staged, strategy, allow_hooks, host_interpreter)?;
+        if let Err(error) = service.carrier() {
+            return Err(format!("plugin {}: {}", id, error));
+        }
         if !still_running {
             self.slots.remove(&id);
             if let Some(exec) = service.exec.clone() {
@@ -1667,8 +1699,7 @@ impl Daemon {
                 self.slots.insert(id.clone(), slot);
             }
         }
-        self.registry.remove(&id);
-        self.registry.insert(service)?;
+        self.registry.replace(service)?;
         self.bump_catalog();
         log::svcd(&format!(
             "svcd: plugin {} {} installed ({}){}",
@@ -2871,6 +2902,84 @@ while ($null -ne ($line = $reader.ReadLine())) {
         let error = daemon.start_service("app").expect_err("failed dependency");
 
         assert!(error.contains("dependency base is failed"), "{}", error);
+    }
+
+    fn two_owners(id: &str) -> Service {
+        Service {
+            impl_ref: Some(crate::kernel::contract::ImplRef {
+                tag: "builtin".into(),
+                binding: json!({}),
+            }),
+            ..service(id, &[])
+        }
+    }
+
+    #[test]
+    fn a_reload_rejects_two_owners_and_leaves_the_live_service_and_slot_alone() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(
+            registry(vec![service("live", &[])]),
+            "token".into(),
+            receiver,
+            None,
+        );
+
+        let mut desired = BTreeMap::new();
+        desired.insert("bad".to_string(), two_owners("bad"));
+        let mut conflicting_live = two_owners("live");
+        conflicting_live.version = "9.9.9".into();
+        desired.insert("live".to_string(), conflicting_live);
+
+        let (added, updated) = daemon.apply_definitions(desired);
+
+        assert!(
+            added.is_empty(),
+            "a rejected new service must not be reported as added"
+        );
+        assert!(
+            updated.is_empty(),
+            "a rejected update must not be reported as updated"
+        );
+        assert!(daemon.registry.get("bad").is_none());
+        assert!(
+            !daemon.slots.contains_key("bad"),
+            "a rejected new service must not leave a slot behind"
+        );
+        let live = daemon.registry.get("live").expect("live service");
+        assert_eq!(
+            live.version, "1.0.0",
+            "a rejected update must not reach the registry"
+        );
+        assert_eq!(live.carrier(), Ok(crate::registry::Carrier::Slot));
+        assert!(
+            daemon.slots.contains_key("live"),
+            "the live slot must survive a rejected update"
+        );
+    }
+
+    #[test]
+    fn the_assembly_point_keeps_one_carrier_per_service() {
+        let mut registry = Registry::with_builtin();
+        registry.insert(service("core", &[])).expect("core");
+        let (_sender, receiver) = mpsc::channel();
+        let daemon = Daemon::new(registry, "token".into(), receiver, None);
+
+        assert!(
+            daemon.slots.contains_key("core"),
+            "an exec service is owned by the supervised slot"
+        );
+        assert!(
+            !daemon.slots.contains_key("svc"),
+            "the builtin is launcher-backed and must never get a slot"
+        );
+        assert_eq!(
+            daemon.registry.get("svc").map(Service::carrier),
+            Some(Ok(crate::registry::Carrier::Launcher))
+        );
+        assert_eq!(
+            daemon.registry.get("core").map(Service::carrier),
+            Some(Ok(crate::registry::Carrier::Slot))
+        );
     }
 
     #[test]
