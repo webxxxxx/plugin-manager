@@ -75,6 +75,12 @@ svcd 是一个**服务的运行时**：把定义或 `.spk` 变成服务，让服
 - **递归免费**：复合服务里可以再放复合服务。
 - **远程对编排透明**：编排只认契约，不知道背后是本机还是远程。
 
+### 4.1 接口形状（ADR-0013）
+
+契约是一个**值**（`Contract`）+ **两个入口**（`call`、`lifecycle(Ensure|Quiesce|Probe)`），实现由 `ImplRef{tag}` 交给装配点注册的 adapter——所以新增运行载体只加一个 adapter，不改内核。能力面显式声明并带 `effect` / `idempotent`；失败是 `{class, retry: Now|Never|After(t), detail}`，`detail` 不可被上层解析；死亡与超时按**判定时刻的客观状态**归类。
+
+完整决定见 [ADR-0013](adr/0013-service-contract-interface.md)；复合服务的 v1 边界（root 定义、0 或 1 个能力、单机执行、加载期校验）见 [ADR-0014](adr/0014-composite-service-v1-boundary.md)。
+
 ## 5. 目录
 
 ```
@@ -190,7 +196,7 @@ src/
 
 | # | seam | 两侧 | 今天几个 adapter | 状态 |
 |---|---|---|---|---|
-| **S1** | **服务契约** | 内核 ↔ 四种运行实现 | 2（本机进程、内置）→ 未来 4 | 未开，契约藏在 `slot`/`package`/`registry` |
+| **S1** | **服务契约** | 内核 ↔ 四种运行实现 | 2（本机进程、内置）→ 未来 4 | **接口已定**（ADR-0013）；待从 `slot`/`package`/`registry` 抽出 |
 | S2 | 调用传输 | 内核 ↔ 载体 | 1（本机 stdio） | 暂不开，但信封必须先定 |
 | S3 | 线格式实现 | 线格式 ↔ 平台 | 2（unix poll / windows 线程） | 未开，`cfg(unix)` 散在业务文件里 |
 | S4 | 请求交接 | 服务器 ↔ 对外面 | 6+（两种结果：响应 / 交出连接） | 未开，现在是 5 个硬编码钩子 |
@@ -255,7 +261,7 @@ src/
 |---|---|---|
 | 0 | `tools/dep-lint` 只观察，先报出当前所有违规 | 得到基线红线清单 |
 | 1 | 砍向上边：`is_privileged`→platform、`target()`→platform、`MAX_SCHEMA`/`MAX_PROTOCOL`→kernel、`Restart`/`Status`→kernel、`definition→registry` 归位 | lint 少 6 条红线，测试全绿 |
-| 2 | 契约从 `slot`/`package`/`registry` 抽出（S1 + S5 失败类别） | 编排可以用 fake 契约开始写 |
+| 2 | 契约从 `slot`/`package`/`registry` 抽出（S1 + S5 失败类别，形状见 ADR-0013） | 编排可以用 fake 契约开始写 |
 | 3 | 抽 `server/http` + `server/mcp` + 请求交接（S4） | `api.rs` 降到 1500 行以下 |
 | 4 | 线格式与进程（S3 / S6） | Windows 支持变成「加一个 adapter」 |
 | 5 | 配置与时钟（S7 / S8） | 模块级测试不再起 daemon |
