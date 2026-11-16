@@ -8,10 +8,6 @@ mod builtin_adapter;
 mod bundle;
 mod catalog;
 mod channel;
-#[cfg(unix)]
-mod channel_client_reactor;
-#[cfg(unix)]
-mod channel_reactor;
 mod compat;
 mod daemon;
 mod definition;

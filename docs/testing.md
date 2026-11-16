@@ -124,7 +124,7 @@ node tools/perf/run.mjs --perf
 node tools/perf/run.mjs --scale
 ```
 
-线程预算回归（Linux 补充）：`cargo test --test http unix_idle_thread_count_has_no_per_request_or_per_stream_threads -- --exact`。它读 `/proc/<pid>/status` 的 `Threads:`，断言默认 S4 布局的空载基线为 12 条 daemon 线程（#116 的 2 条阻塞线程 + 迁移期 legacy 路径）；16 个 keep-alive 连接与 8 个 SSE 流不得各增加一条线程。改变拓扑的切片（如 #125）要同步更新 `IDLE_DAEMON_THREADS`。
+线程预算回归（Linux 补充）：`cargo test --test http unix_idle_thread_count_has_no_per_request_or_per_stream_threads -- --exact`。它读 `/proc/<pid>/status` 的 `Threads:`，断言默认 S4 布局的空载基线为 10 条 daemon 线程（#116 的 2 条阻塞线程 + 迁移期 legacy 路径；#124 删除控制通道与出站客户端两条 reactor）；16 个 keep-alive 连接与 8 个 SSE 流不得各增加一条线程。改变拓扑的切片（如 #125）要同步更新 `IDLE_DAEMON_THREADS`。同一测试还读 `/proc/<pid>/task/*/comm`，断言 `svcd-channel-reactor` / `svcd-channel-client` 不再存在、`svcd-server-loop` 恰好一条；`control_shutdown_reply_is_flushed_before_exit` 在原始控制 socket 上断言 shutdown 回包在进程退出前到达。
 
 MCP SSE 的 handler 由 `cargo test --bin svcd server::mcp::progress` 覆盖：SSE 头 / chunk 编码、progress 先于 final、-32603 映射、小输出缓冲的分片、断开时取消恰好一次，以及「输出被堵住时不得延长 no-progress 上限」。Unix 上还有 `server::http::driver` 的 wakeup 测试：短 poll wakeup 只提前 tick，不能替换传输 deadline。集成回归是 `cargo test --test http http_mcp_streams_progress_for_tools_call`（顺序断言）与 `http_mcp_stream_consumes_the_long_lived_max_streams_budget`（`max_streams = 1` 时 503 + `Retry-After`，释放后同一调用得到 200 SSE）；Unix 另有 `http_mcp_stream_disconnect_releases_the_budget`（断开的慢调用立即释放槽；Windows 回退没有可取消的 in-flight call，不断言这一条）。
 

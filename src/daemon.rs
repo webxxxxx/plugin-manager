@@ -133,7 +133,18 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
 
     let (tx, rx) = mpsc::channel();
     let wake = Arc::new(Wake::new());
-    if let Err(error) = channel::spawn_server(&config, tx, wake.clone()) {
+    // The server loop owns the control listener on Unix; Windows keeps its
+    // thread-per-connection fallback.
+    #[cfg(unix)]
+    let control = match channel::bind_server(&config) {
+        Ok(listener) => listener,
+        Err(error) => {
+            log::svcd(&format!("svcd: cannot bind control channel: {}", error));
+            return 1;
+        }
+    };
+    #[cfg(not(unix))]
+    if let Err(error) = channel::spawn_server(&config, tx.clone(), wake.clone()) {
         log::svcd(&format!("svcd: cannot bind control channel: {}", error));
         return 1;
     }
@@ -144,7 +155,23 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         crate::limits::current().ws_inflight_requests,
         crate::limits::current().ws_raw_queue,
     );
-    #[cfg(feature = "http")]
+    #[cfg(all(unix, feature = "http"))]
+    let api = match api::spawn(
+        config.clone(),
+        raw_hub.clone(),
+        control,
+        tx.clone(),
+        wake.clone(),
+    ) {
+        Ok(api) => Some(api),
+        Err(error) => {
+            // The server loop now owns the control channel; failing to start
+            // it is fatal, not an HTTP-only degradation.
+            log::svcd(&format!("svcd: cannot start server loop: {}", error));
+            return 1;
+        }
+    };
+    #[cfg(all(not(unix), feature = "http"))]
     let api = match api::spawn(config.clone(), raw_hub.clone()) {
         Ok(api) => Some(api),
         Err(error) => {
@@ -152,6 +179,15 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
             None
         }
     };
+    #[cfg(all(unix, not(feature = "http")))]
+    let control_loop =
+        match crate::server::control::spawn_control_only(control, tx.clone(), wake.clone()) {
+            Ok(handle) => handle,
+            Err(error) => {
+                log::svcd(&format!("svcd: cannot start server loop: {}", error));
+                return 1;
+            }
+        };
     #[cfg(not(feature = "http"))]
     let raw_hub = crate::rawhub::RawHub::new(
         crate::limits::current().ws_raw_max_bytes,
@@ -163,7 +199,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     let api: Option<Arc<Api>> = None;
     notify_systemd("READY=1");
 
-    let mut daemon = Daemon::new_with_raw(loaded.registry, token, rx, api, raw_hub.clone());
+    let mut daemon = Daemon::new_with_raw(loaded.registry, token, rx, api.clone(), raw_hub.clone());
     daemon.set_raw_hub(raw_hub.clone());
     daemon.set_wake(wake);
     #[cfg(unix)]
@@ -188,6 +224,15 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     install_shutdown_signal();
     daemon.start_enabled();
     daemon.event_loop();
+    // The supervisor loop has returned and no reply can arrive after this
+    // point. The server loop drains queued control replies before the process
+    // exits, so the shutdown response is not lost.
+    #[cfg(feature = "http")]
+    if let Some(api) = &api {
+        api.shutdown();
+    }
+    #[cfg(all(unix, not(feature = "http")))]
+    control_loop.shutdown();
     #[cfg(feature = "http")]
     log::svcd(&format!("svcd: raw stats: {}", raw_hub.stats.summary()));
     notify_systemd("STOPPING=1");
@@ -1054,13 +1099,14 @@ impl Daemon {
             );
             return;
         }
-        let progress_token = request.params.get("progressToken").and_then(|token| {
-            match token {
+        let progress_token = request
+            .params
+            .get("progressToken")
+            .and_then(|token| match token {
                 Value::String(token) => Some(ProgressToken::new(token.clone())),
                 Value::Number(token) => Some(ProgressToken::new(token.to_string())),
                 _ => None,
-            }
-        });
+            });
         let mut invocation = Invocation::new(
             capability,
             arguments,
@@ -1947,15 +1993,14 @@ fn status_json(status: Status) -> Value {
 
 /// Face-side projection of a completed slot call. The slot only emits a
 /// `Result<Value, Failure>`; MCP codes/strings live here.
-fn project_slot_response(external_id: Option<Value>, outcome: Result<Value, Failure>) -> rpc::Response {
+fn project_slot_response(
+    external_id: Option<Value>,
+    outcome: Result<Value, Failure>,
+) -> rpc::Response {
     match outcome {
         Ok(value) => rpc::ok(external_id, value),
         Err(failure) => match failure.class {
-            Class::Busy => rpc::err(
-                external_id,
-                -32000,
-                "busy: too many in-flight tool calls",
-            ),
+            Class::Busy => rpc::err(external_id, -32000, "busy: too many in-flight tool calls"),
             Class::FrameTooLarge => rpc::err(
                 external_id,
                 -32602,

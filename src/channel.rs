@@ -20,7 +20,7 @@ use crate::threads;
 /// channel owns this shape; the MCP session consumes it. Only the Unix
 /// reactor produces it today, so Windows sees the type unused.
 #[derive(Debug)]
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(any(not(unix), not(feature = "http")), allow(dead_code))]
 pub enum ProgressEvent {
     /// A progress notification line (a JSON-RPC message without an id).
     Frame(String),
@@ -139,14 +139,10 @@ fn random_token() -> String {
     token
 }
 
-/// Bind the local control channel. Unix serves all connections from one poll
-/// reactor; Windows keeps the thread-per-connection fallback.
+/// Bind the local control channel. Unix hands the listener to the server loop;
+/// Windows keeps the thread-per-connection fallback.
 #[cfg(unix)]
-pub fn spawn_server(
-    config: &Path,
-    tx: Sender<PendingCall>,
-    wake: std::sync::Arc<crate::wake::Wake>,
-) -> io::Result<()> {
+pub fn bind_server(config: &Path) -> io::Result<std::os::unix::net::UnixListener> {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::{UnixListener, UnixStream};
 
@@ -162,7 +158,7 @@ pub fn spawn_server(
     }
     let listener = UnixListener::bind(&path)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o660))?;
-    crate::channel_reactor::spawn(listener, tx, wake)
+    Ok(listener)
 }
 
 #[cfg(not(unix))]

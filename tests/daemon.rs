@@ -2115,8 +2115,21 @@ fn a_finished_one_shot_dependency_is_not_rerun() {
     sandbox.write_service("app", &["once"], Script::Ready);
 
     sandbox.start_daemon();
-    let status = sandbox.wait_for_state("once", "running", Duration::from_secs(15));
-    assert!(status["summary"]["pid"].is_null(), "{status}");
+    // The one-shot may be observed in its brief Running-with-pid window right
+    // after spawn; the point of this test is that it settles to
+    // running/pid-null exactly once before the dependent app starts.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = sandbox.status("once");
+        if status["summary"]["state"] == "running" && status["summary"]["pid"].is_null() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the one-shot never settled to running/pid-null: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
     sandbox.wait_for_state("app", "running", Duration::from_secs(15));
     wait_until(
         "the one-shot body to run once",

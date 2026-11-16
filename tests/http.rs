@@ -4712,12 +4712,14 @@ fn an_idle_connection_is_closed_without_a_response() {
 // so neither may add a thread each.
 // ---------------------------------------------------------------------------
 
-/// The default S4 topology before the control/plugin reactor merges
-/// (#124/#126). #116 added the two blocking-pool workers; the legacy HTTP
-/// workers and takeovers stay until #117/#125. Update this pin in the slice
-/// that changes the baseline.
+/// The default S4 topology after the control-channel merge (#124). #116 added
+/// the two blocking-pool workers; #124 moved the control listener and the
+/// outbound management client onto the server loop, removing the two reactor
+/// threads (12 -> 10). The legacy HTTP workers and takeovers stay until
+/// #117/#125; #126 merges the plugin reactor and reaches 4-5. Update this pin
+/// in the slice that changes the baseline.
 #[cfg(target_os = "linux")]
-const IDLE_DAEMON_THREADS: usize = 12;
+const IDLE_DAEMON_THREADS: usize = 10;
 
 #[cfg(target_os = "linux")]
 fn daemon_threads(pid: u32) -> usize {
@@ -4727,6 +4729,18 @@ fn daemon_threads(pid: u32) -> usize {
         .find_map(|line| line.strip_prefix("Threads:"))
         .and_then(|value| value.trim().parse().ok())
         .expect("daemon status has a Threads line")
+}
+
+#[cfg(target_os = "linux")]
+fn daemon_thread_names(pid: u32) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(format!("/proc/{}/task", pid))
+        .expect("daemon tasks")
+        .flatten()
+        .filter_map(|entry| fs::read_to_string(entry.path().join("comm")).ok())
+        .map(|name| name.trim().to_string())
+        .collect();
+    names.sort();
+    names
 }
 
 #[cfg(target_os = "linux")]
@@ -4777,6 +4791,21 @@ fn unix_idle_thread_count_has_no_per_request_or_per_stream_threads() {
     assert_eq!(
         idle, IDLE_DAEMON_THREADS,
         "idle daemon uses {idle} threads; the default S4 baseline is {IDLE_DAEMON_THREADS}, so this is a thread-budget regression"
+    );
+    let names = daemon_thread_names(pid);
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.starts_with("svcd-channel-r") || name.starts_with("svcd-channel-c")),
+        "the control and channel-client reactor threads are gone: {names:?}"
+    );
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| name.starts_with("svcd-server-loo"))
+            .count(),
+        1,
+        "the control channel runs on the one server loop: {names:?}"
     );
 
     let mut connections = Vec::new();
@@ -6330,4 +6359,79 @@ fn http_mcp_stream_disconnect_releases_the_budget() {
         released,
         "a disconnected MCP client must release the max_streams slot"
     );
+}
+
+/// The server loop owns the control channel now. A shutdown request must still
+/// receive its reply: the loop drains queued control replies and flushes them
+/// before the process exits.
+#[cfg(unix)]
+#[test]
+fn control_shutdown_reply_is_flushed_before_exit() {
+    use std::os::unix::net::UnixStream;
+
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let _address = sandbox.wait_for_http();
+    let token = fs::read_to_string(sandbox.config.join("svcd.token"))
+        .expect("control token")
+        .trim()
+        .to_string();
+    let mut stream =
+        UnixStream::connect(sandbox.config.join("svcd.sock")).expect("control connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let request = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"svcd.shutdown\",\"params\":{{}},\"auth\":\"{}\"}}\n",
+        token
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("write shutdown request");
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("shutdown reply");
+    let response: Value = serde_json::from_str(line.trim()).expect("shutdown reply json");
+    assert_eq!(response["id"], 7, "{line}");
+    assert!(response.get("error").is_none(), "{line}");
+
+    if let Some(mut child) = sandbox.daemon.take() {
+        let mut exited = false;
+        for _ in 0..300 {
+            if child.try_wait().expect("daemon wait").is_some() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(exited, "daemon did not exit after the shutdown reply");
+    }
+}
+
+/// The control channel still checks its token after moving into the server
+/// loop: a wrong token gets the same -32000 unauthorized reply.
+#[cfg(unix)]
+#[test]
+fn control_channel_rejects_an_unknown_token() {
+    use std::os::unix::net::UnixStream;
+
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let _address = sandbox.wait_for_http();
+    let mut stream =
+        UnixStream::connect(sandbox.config.join("svcd.sock")).expect("control connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let request = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"svcd.ping\",\"params\":{},\"auth\":\"not-the-token\"}\n";
+    stream
+        .write_all(request.as_bytes())
+        .expect("write ping request");
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("ping reply");
+    let response: Value = serde_json::from_str(line.trim()).expect("ping reply json");
+    assert_eq!(response["id"], 3, "{line}");
+    assert_eq!(response["error"]["code"], -32000, "{line}");
+    assert_eq!(response["error"]["message"], "unauthorized", "{line}");
 }

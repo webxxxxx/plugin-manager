@@ -32,8 +32,6 @@
     "reactor": { "concept": "wire/contract", "layer": "wire" },
     "rawhub": { "concept": "wire/contract", "layer": "wire" },
     "channel": { "concept": "wire/control", "layer": "wire", "note": "控制面客户端与服务端混在一个文件" },
-    "channel_reactor": { "concept": "wire/control", "layer": "wire" },
-    "channel_client_reactor": { "concept": "wire/control", "layer": "wire" },
 
     "package": { "concept": "manage/format", "layer": "domain" },
     "bundle": { "concept": "manage/ops", "layer": "domain" },

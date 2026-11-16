@@ -290,7 +290,7 @@ src/
 | **S1** | **服务契约** | 内核 ↔ 四种运行实现 | 1 个显式 adapter（内置）+ 槽（exec）→ 未来 4 | **接口已定**（ADR-0013/0015）；待从 `slot`/`package`/`registry` 抽出 |
 | S2 | 调用传输 | 内核 ↔ 载体 | 1（本机 stdio） | 暂不开，但信封必须先定 |
 | S3 | 线格式实现 | 线格式 ↔ 平台 | 2（unix poll / windows 线程） | 未开，`cfg(unix)` 散在业务文件里 |
-| S4 | 请求交接 | 服务器 ↔ 对外面 | 6+（两种结果：内存响应 / sans-IO stream handler） | **接口已定**（ADR-0016；#113 契约）；**server-loop 已接管 Unix listener / 连接 / pending 表（#114）**；**stream handler 事件/动作面与插件 UI 静态资源已接入（#115）**，`server/http/driver.rs` 管 deadline/文件发送/`max_streams`，静态资源走 `SendFile` 且不占 `max_streams`；**阻塞池已接线（#116）**：固定 `blocking_threads`（默认 2，clamp 2..8），队列有界 64，每连接最多一个任务，满队列/重复任务 503 + `Retry-After`，首个 `Blocking` 路由是 `/api/v1/services`；**剩余管理 JSON / login / 控制台已走 face（#117）**，除 version/console 外共用 2 条阻塞 worker（饱和时 503 + `Retry-After`），public route 跳过 transport auth，CSRF 与 plugin-token 留在 face；**blob/file 下载已走 stream handler（#118）**：Range/条件请求线路不变，多分片按 `SendFile` 续传，下载占共享 `max_streams` 预算且 Unix 不再有下载 takeover 线程；**MCP SSE 进度流已走 stream handler（#123）**：`POST /mcp` 的 header/bearer 校验不变，进度事件先于最终结果，`McpSseStream` 占共享 `max_streams`（满时 503 + `Retry-After`，不启动插件调用），旧 `ConnState::McpSse` 与独立 64/429 计数已删除；blob/file 上传、export spk/spkb、import/install 仍 takeover（#119–#121）；插件 UI 的 SSE / WS / raw 已走 stream handler（#122） |
+| S4 | 请求交接 | 服务器 ↔ 对外面 | 6+（两种结果：内存响应 / sans-IO stream handler） | **接口已定**（ADR-0016；#113 契约）；**server-loop 已接管 Unix listener / 连接 / pending 表（#114）**；**stream handler 事件/动作面与插件 UI 静态资源已接入（#115）**，`server/http/driver.rs` 管 deadline/文件发送/`max_streams`，静态资源走 `SendFile` 且不占 `max_streams`；**阻塞池已接线（#116）**：固定 `blocking_threads`（默认 2，clamp 2..8），队列有界 64，每连接最多一个任务，满队列/重复任务 503 + `Retry-After`，首个 `Blocking` 路由是 `/api/v1/services`；**剩余管理 JSON / login / 控制台已走 face（#117）**，除 version/console 外共用 2 条阻塞 worker（饱和时 503 + `Retry-After`），public route 跳过 transport auth，CSRF 与 plugin-token 留在 face；**blob/file 下载已走 stream handler（#118）**：Range/条件请求线路不变，多分片按 `SendFile` 续传，下载占共享 `max_streams` 预算且 Unix 不再有下载 takeover 线程；**控制通道与出站管理流已并入 server-loop（#124）**：CLI 连接、outbound streaming client 与 HTTP/流共用一个 poll 集，`server::control` 拥有 listener/连接/进度 socket，两条 reactor 线程删除，默认空载 12→10；shutdown 由 daemon 停 loop 后排空 control 回包；**MCP SSE 进度流已走 stream handler（#123）**：`POST /mcp` 的 header/bearer 校验不变，进度事件先于最终结果，`McpSseStream` 占共享 `max_streams`（满时 503 + `Retry-After`，不启动插件调用），旧 `ConnState::McpSse` 与独立 64/429 计数已删除；blob/file 上传、export spk/spkb、import/install 仍 takeover（#119–#121）；插件 UI 的 SSE / WS / raw 已走 stream handler（#122） |
 | S5 | 失败投影 | 领域 ↔ 对外面 | 3（HTTP / CLI / MCP） | 未开，靠字符串匹配 |
 | S6 | 进程与管道 | 监督 ↔ 平台 | 2（unix / windows job） | 未开 |
 | S7 | 配置来源 | 所有模块 ↔ 配置 | 1 生产 + 测试 | 未开，全局 OnceLock |
@@ -299,7 +299,7 @@ src/
 
 开 seam 的顺序：**S1（含 S5 失败类别）→ S4 → S3 → S6 → S7/S8**。S9 随时可做，S2 等集群真正开始再开。
 
-S4 的最终线程预算（#126 合并插件 stdio 反应器后：两条循环 + 两条阻塞线程，默认 4 条）是 **Unix 的默认拓扑**。迁移期不是 4 条：legacy HTTP worker（4 条）和 takeover 仍在，阻塞池在 #116 加 2 条，所以默认从 10 升到 12；#117/#125 删除 legacy 路径后才回到 4 条目标。Windows 本轮保留每连接一条线程的回退，`max_connections` 是它的线程上限；Windows 不承诺 4 条线程，IOCP 留给 S3/S6。该回退仍执行 `max_connections` / `max_connections_per_ip` / `http_idle_timeout_secs`。
+S4 的最终线程预算（#126 合并插件 stdio 反应器后：两条循环 + 两条阻塞线程，默认 4 条）是 **Unix 的默认拓扑**。迁移期不是 4 条：legacy HTTP worker（4 条）和 takeover 仍在，阻塞池在 #116 加 2 条，所以默认 12 条；#124 把控制 listener 与出站客户端并入 server-loop、删掉两条 reactor 后为 10 条；#125 删除 legacy 路径后为 5 条，**#126 合并插件 stdio 反应器后回到 4 条**。Windows 本轮保留每连接一条线程的回退，`max_connections` 是它的线程上限；Windows 不承诺 4 条线程，IOCP 留给 S3/S6。该回退仍执行 `max_connections` / `max_connections_per_ip` / `http_idle_timeout_secs`。
 
 ## 9. 新文件放哪：三个问题
 

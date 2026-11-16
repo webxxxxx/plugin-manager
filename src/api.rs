@@ -7,8 +7,6 @@
 //! in `face/api.rs` (#117); this module keeps the control-channel adapter and
 //! the streaming takeovers owned by #118–#121.
 
-#[cfg(unix)]
-use crate::channel_client_reactor::ClientReactor;
 #[cfg(any(not(unix), test))]
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -74,6 +72,9 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 pub struct Api {
     lan: Arc<Mutex<Lan>>,
+    /// Stops the server loop and drains its control connections on shutdown.
+    #[cfg(unix)]
+    loop_handle: crate::server::control::handle::LoopHandle,
 }
 
 fn default_bind() -> SocketAddr {
@@ -86,7 +87,14 @@ fn resolve_bind(env: Option<&str>, configured: Option<SocketAddr>) -> SocketAddr
         .unwrap_or_else(default_bind)
 }
 
-pub fn spawn(config: PathBuf, raw_hub: Arc<crate::rawhub::RawHub>) -> std::io::Result<Arc<Api>> {
+#[cfg(unix)]
+pub fn spawn(
+    config: PathBuf,
+    raw_hub: Arc<crate::rawhub::RawHub>,
+    control: std::os::unix::net::UnixListener,
+    pending: mpsc::Sender<crate::channel::PendingCall>,
+    wake: Arc<crate::wake::Wake>,
+) -> std::io::Result<Arc<Api>> {
     let configured = settings::current().ok().and_then(|settings| settings.bind);
     let requested = resolve_bind(std::env::var("SVCD_BIND").ok().as_deref(), configured);
     let password_hash = settings::current()
@@ -96,6 +104,60 @@ pub fn spawn(config: PathBuf, raw_hub: Arc<crate::rawhub::RawHub>) -> std::io::R
     // A LAN bind without a password would expose an unauthenticated API. Keep
     // the daemon reachable on loopback so the operator can still run
     // `svc auth passwd`, then restart to pick up the requested bind.
+    let mut bind = requested;
+    if !requested.ip().is_loopback() && password_hash.is_none() {
+        log::svcd(&format!(
+            "svcd: bind {} requires auth_passwd; falling back to 127.0.0.1:{}",
+            requested,
+            requested.port()
+        ));
+        bind = SocketAddr::from(([127, 0, 0, 1], requested.port()));
+    }
+    let require_auth = !bind.ip().is_loopback();
+    let mut state = Lan::new(bind, requested, require_auth, password_hash);
+    // The control channel is the server's lifeline now, so an HTTP bind
+    // failure disables only HTTP; the loop still serves the CLI.
+    let listener = match TcpListener::bind(bind) {
+        Ok(listener) => {
+            let local = listener.local_addr()?;
+            state.bind = local;
+            let port_file = config.join("http.port");
+            fs::write(&port_file, format!("127.0.0.1:{}", local.port())).map_err(|error| {
+                std::io::Error::other(format!("write {}: {}", port_file.display(), error))
+            })?;
+            log::svcd(&format!(
+                "svcd: HTTP API on {} (auth required: {})",
+                local, require_auth
+            ));
+            Some(listener)
+        }
+        Err(error) => {
+            log::svcd(&format!("svcd: HTTP API disabled: {}", error));
+            None
+        }
+    };
+
+    let lan = Arc::new(Mutex::new(state));
+    let loop_handle = legacy::start(
+        listener,
+        control,
+        pending,
+        wake,
+        lan.clone(),
+        config,
+        raw_hub,
+    )?;
+    Ok(Arc::new(Api { lan, loop_handle }))
+}
+
+#[cfg(not(unix))]
+pub fn spawn(config: PathBuf, raw_hub: Arc<crate::rawhub::RawHub>) -> std::io::Result<Arc<Api>> {
+    let configured = settings::current().ok().and_then(|settings| settings.bind);
+    let requested = resolve_bind(std::env::var("SVCD_BIND").ok().as_deref(), configured);
+    let password_hash = settings::current()
+        .ok()
+        .and_then(|settings| settings.auth_passwd.clone());
+
     let mut bind = requested;
     if !requested.ip().is_loopback() && password_hash.is_none() {
         log::svcd(&format!(
@@ -121,21 +183,11 @@ pub fn spawn(config: PathBuf, raw_hub: Arc<crate::rawhub::RawHub>) -> std::io::R
 
     let lan = Arc::new(Mutex::new(state));
     let api = Arc::new(Api { lan: lan.clone() });
-    // The reactor parses request heads and prepares the takeover routes (plugin
-    // UI streams load the plugin manifest), which is the same class of work
-    // transfer_stack exists for. io_stack (32 KiB floor) and request_stack
-    // (64 KiB floor) both overflowed there under a minimal svcd.conf and
-    // aborted the whole daemon (#108).
-    #[cfg(unix)]
-    legacy::start(listener, lan, config, raw_hub)?;
-    #[cfg(not(unix))]
-    {
-        let _ = raw_hub;
-        thread::Builder::new()
-            .name("svcd-http".into())
-            .stack_size(threads::io_stack())
-            .spawn(move || listener_loop(Some(listener), lan, config))?;
-    }
+    let _ = raw_hub;
+    thread::Builder::new()
+        .name("svcd-http".into())
+        .stack_size(threads::io_stack())
+        .spawn(move || listener_loop(Some(listener), lan, config))?;
     Ok(api)
 }
 
@@ -149,6 +201,13 @@ impl Api {
     pub fn status(&self) -> Result<LanStatus, String> {
         let state = self.lan.lock().map_err(|_| "LAN state poisoned")?;
         Ok(state.status())
+    }
+
+    /// Stop the server loop after the supervisor loop returned. On Unix this
+    /// drains queued control replies and flushes them before the process exits.
+    pub fn shutdown(&self) {
+        #[cfg(unix)]
+        self.loop_handle.shutdown();
     }
 }
 

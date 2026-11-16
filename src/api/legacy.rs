@@ -7,7 +7,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::net::UnixListener;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::channel::PendingCall;
+use crate::server::control::client::StreamingClient;
+use crate::server::control::handle::LoopHandle;
+use crate::server::control::listener::{ControlServer, Source};
 use crate::server::http::budget::StreamPermit;
 use crate::server::http::driver::{StreamAdmission, StreamDriver};
 use crate::server::http::engine::{self, HttpRequest, LegacyBridge, PreRequest, Table};
@@ -17,6 +23,7 @@ use crate::server::http::{
     CancelToken, CompletionSlot, Dispatch, Exchange, Face, JobOutcome, StreamHandler,
 };
 use crate::server::mcp::progress::{McpSseStream, PROGRESS_QUEUE_SLOTS};
+use crate::wake::Wake;
 
 /// One queued or running blocking request. The server owns the completion slot
 /// and the connection; the pool only reports that the job finished.
@@ -36,15 +43,22 @@ use super::*;
 pub(super) const LEGACY_QUEUE_LIMIT: usize = 64;
 
 pub(crate) fn start(
-    listener: TcpListener,
+    http: Option<TcpListener>,
+    control: UnixListener,
+    pending: mpsc::Sender<PendingCall>,
+    wake: Arc<Wake>,
     lan: Arc<Mutex<Lan>>,
     config: PathBuf,
     raw_hub: Arc<crate::rawhub::RawHub>,
-) -> std::io::Result<()> {
+) -> std::io::Result<LoopHandle> {
     let (results_tx, results_rx) = mpsc::channel();
     let (notify_rx, notify_tx) = UnixStream::pair()?;
     let _ = notify_rx.set_nonblocking(true);
     let _ = notify_tx.set_nonblocking(true);
+    let notify_tx = Arc::new(notify_tx);
+    let loop_handle = LoopHandle::new(notify_tx.clone());
+    let stop = loop_handle.stop_flag();
+    let control = ControlServer::new(control, pending, wake, notify_tx.clone())?;
 
     let face: Arc<dyn Face> = Arc::new(crate::face::api::ApiFace::new(config.clone(), lan.clone()));
     // The pool belongs to the server loop, not to one request or the temporary
@@ -63,11 +77,10 @@ pub(crate) fn start(
         )?
     };
 
-    thread::Builder::new()
+    let join = thread::Builder::new()
         .name("svcd-server-loop".into())
         .stack_size(threads::transfer_stack())
         .spawn(move || {
-            let client = ClientReactor::start().ok();
             let queue = Arc::new(JobQueue {
                 queue: Mutex::new(VecDeque::new()),
                 ready: Condvar::new(),
@@ -89,7 +102,10 @@ pub(crate) fn start(
                 lan,
                 config,
                 raw_hub,
-                client,
+                control,
+                client: StreamingClient::new(),
+                extra_keys: Vec::new(),
+                stop,
                 queue,
                 results: results_rx,
                 results_tx: results_tx.clone(),
@@ -101,16 +117,27 @@ pub(crate) fn start(
                 stream_job_keys: HashSet::new(),
                 next_stream_job: 1 << 32,
             };
-            engine::run(listener, &mut handler, crate::limits::current());
+            engine::run(http, &mut handler, crate::limits::current());
         })?;
-    Ok(())
+    loop_handle.set_join(join);
+    Ok(loop_handle)
+}
+
+/// One extra poll source in the order the engine dispatched it.
+#[derive(Clone, Copy)]
+enum ExtraSource {
+    Control(Source),
+    Client(u64),
 }
 
 struct ServerHandler {
     lan: Arc<Mutex<Lan>>,
     config: PathBuf,
     raw_hub: Arc<crate::rawhub::RawHub>,
-    client: Option<Arc<ClientReactor>>,
+    control: ControlServer,
+    client: StreamingClient,
+    extra_keys: Vec<ExtraSource>,
+    stop: Arc<AtomicBool>,
     queue: Arc<JobQueue>,
     results: Receiver<WorkResult>,
     /// A sender kept for stream-handler blocking jobs; their result is
@@ -241,18 +268,6 @@ impl LegacyBridge for ServerHandler {
             );
             match prepared {
                 Ok(Some(call)) => {
-                    let Some(client) = &self.client else {
-                        write_response(
-                            connection,
-                            http::json_error(
-                                500,
-                                "stream_unavailable",
-                                "management client reactor is unavailable",
-                            ),
-                            false,
-                        );
-                        return;
-                    };
                     // Reserve the long-lived slot before starting the plugin
                     // call: a full budget must refuse the request without a
                     // side effect on the service.
@@ -272,14 +287,17 @@ impl LegacyBridge for ServerHandler {
                         "arguments": call.arguments,
                         "progressToken": call.progress_token,
                     });
-                    match client.open(&self.config, "registry.call", request, sender) {
+                    match self
+                        .client
+                        .open(&self.config, "registry.call", request, sender)
+                    {
                         Ok(stream) => {
-                            let cancel_client = client.clone();
+                            let cancel = self.client.canceller();
                             let handler = McpSseStream::new(
                                 receiver,
                                 call.id,
                                 stream,
-                                Box::new(move |id| cancel_client.cancel(id)),
+                                Box::new(move |id| cancel.cancel(id)),
                             );
                             // The slot reserved above becomes the driver's
                             // `max_streams` permit.
@@ -361,6 +379,12 @@ impl LegacyBridge for ServerHandler {
     fn on_tick(&mut self, connections: &mut Table<ConnState>) {
         let mut drain = [0u8; 64];
         while self.notify.read(&mut drain).is_ok() {}
+        // The same wake pipe carries blocking-pool completions, control
+        // replies, and outbound progress retries.
+        self.control.drain_replies();
+        self.control.flush();
+        self.client.drain_cancels();
+        self.client.tick();
 
         while let Ok(result) = self.results.try_recv() {
             match result {
@@ -508,6 +532,37 @@ impl LegacyBridge for ServerHandler {
 
     fn wake_fd(&self) -> Option<RawFd> {
         Some(self.notify.as_raw_fd())
+    }
+
+    fn prepare_extra(&mut self, out: &mut Vec<(RawFd, i16)>) {
+        self.extra_keys.clear();
+        let mut control_keys = Vec::new();
+        self.control.poll_sources(out, &mut control_keys);
+        for key in control_keys {
+            self.extra_keys.push(ExtraSource::Control(key));
+        }
+        let mut client_keys = Vec::new();
+        self.client.poll_sources(out, &mut client_keys);
+        for id in client_keys {
+            self.extra_keys.push(ExtraSource::Client(id));
+        }
+    }
+
+    fn on_extra_ready(&mut self, index: usize, revents: i16) {
+        match self.extra_keys.get(index).copied() {
+            Some(ExtraSource::Control(source)) => self.control.ready(source, revents),
+            Some(ExtraSource::Client(id)) => self.client.ready(id, revents),
+            None => {}
+        }
+    }
+
+    fn should_stop(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    fn on_stop(&mut self) {
+        self.control.drain_for_shutdown();
+        self.client.close();
     }
 }
 
