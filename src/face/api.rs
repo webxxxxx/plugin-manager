@@ -121,7 +121,7 @@ impl ApiFace {
         if let Err(response) = self.require_plugin(id) {
             return response;
         }
-        let _guard = crate::api::config_lock();
+        let _guard = plugin::config_lock();
         let _lock = match plugin::lock_config(id) {
             Ok(lock) => lock,
             Err(message) => return error_response(500, "internal", &message),
@@ -143,7 +143,7 @@ impl ApiFace {
                 &format!("plugin {} has no config template", id),
             );
         };
-        let _guard = crate::api::config_lock();
+        let _guard = plugin::config_lock();
         let _lock = match plugin::lock_config(id) {
             Ok(lock) => lock,
             Err(message) => return error_response(500, "internal", &message),
@@ -159,7 +159,10 @@ impl ApiFace {
             return response;
         }
         match plugin::export_config(id) {
-            Ok((version, data)) => download_response(&format!("{}-{}.config", id, version), &data),
+            Ok((version, data)) => download_response(
+                &format!("{}-{}.config", safe_filename(id), safe_filename(&version)),
+                &data,
+            ),
             Err(message) if message.contains("has no config") => {
                 error_response(404, "not_found", &message)
             }
@@ -233,7 +236,7 @@ impl ApiFace {
             Ok(text) => Response::new(
                 200,
                 "text/plain; charset=utf-8",
-                crate::api::cap_log(text).into_bytes(),
+                cap_log(text).into_bytes(),
             ),
             Err(cause) if cause.kind() == io::ErrorKind::NotFound => {
                 error_response(404, "not_found", &format!("no log for {}", id))
@@ -376,10 +379,6 @@ fn is_version(method: &str, path: &str) -> bool {
     method == "GET" && path_only(path).trim_matches('/') == "api/v1/version"
 }
 
-fn is_auth(method: &str, path: &str) -> bool {
-    method == "GET" && path_only(path).trim_matches('/') == "api/v1/auth"
-}
-
 fn is_login(method: &str, path: &str) -> bool {
     method == "POST" && path_only(path) == "/login"
 }
@@ -440,11 +439,7 @@ fn body_policy(method: &str, path: &str) -> BodyPolicy {
 }
 
 fn dispatch_for(method: &str, path: &str) -> Dispatch {
-    if is_version(method, path)
-        || is_auth(method, path)
-        || is_logout(method, path)
-        || is_console(path)
-    {
+    if is_version(method, path) || is_console(path) {
         Dispatch::Inline
     } else {
         Dispatch::Blocking
@@ -460,6 +455,26 @@ fn route_with(body: BodyPolicy, dispatch: Dispatch) -> Route {
 
 fn decode(value: &str) -> String {
     http::percent_decode(value, true)
+}
+
+fn cap_log(mut text: String) -> String {
+    if text.len() <= crate::limits::current().log_max_bytes as usize {
+        return text;
+    }
+    let mut start = text.len() - crate::limits::current().log_max_bytes as usize;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    if let Some(newline) = text[start..].find('\n') {
+        // Keep complete lines when possible; a single line longer than the
+        // budget keeps its tail rather than becoming empty.
+        let candidate = start + newline + 1;
+        if candidate < text.len() {
+            start = candidate;
+        }
+    }
+    text.drain(..start);
+    text
 }
 
 fn error_response(status: u16, code: &str, message: &str) -> Response {
@@ -507,10 +522,21 @@ fn summary_response(status: Value) -> Response {
 }
 
 fn download_response(filename: &str, data: &[u8]) -> Response {
-    Response::new(200, "application/octet-stream", data).with_header(
-        "Content-Disposition",
-        format!("attachment; filename=\"{}\"", filename),
-    )
+    Response::new(200, "application/octet-stream", data)
+        .with_header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .with_header("Cache-Control", "no-store")
+}
+
+fn safe_filename(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+        })
+        .collect()
 }
 
 fn project_service(status: &Value) -> Option<Value> {
@@ -591,6 +617,15 @@ mod tests {
         ApiFace::new(".", lan())
     }
 
+    fn face_with_password() -> ApiFace {
+        let bind = "127.0.0.1:0".parse().expect("bind");
+        let hash = crate::auth::hash_password("secret").expect("hash");
+        ApiFace::new(
+            ".",
+            Arc::new(Mutex::new(Lan::new(bind, bind, true, Some(hash)))),
+        )
+    }
+
     fn request(method: &str, path: &str) -> Request {
         Request {
             method: method.to_string(),
@@ -612,7 +647,7 @@ mod tests {
 
         let logout = face.route("POST", "/logout").expect("logout route");
         assert!(logout.public);
-        assert_eq!(logout.dispatch, Dispatch::Inline);
+        assert_eq!(logout.dispatch, Dispatch::Blocking);
         assert_eq!(logout.body, BodyPolicy::Empty);
 
         for path in ["/", "/index.html"] {
@@ -623,7 +658,7 @@ mod tests {
 
         let auth = face.route("GET", "/api/v1/auth").expect("auth route");
         assert!(!auth.public);
-        assert_eq!(auth.dispatch, Dispatch::Inline);
+        assert_eq!(auth.dispatch, Dispatch::Blocking);
 
         for (method, path) in [
             ("GET", "/api/v1/compat"),
@@ -700,6 +735,65 @@ mod tests {
             panic!("the face must answer");
         };
         assert_eq!(response.status, 400);
+    }
+
+    #[test]
+    fn login_is_public_and_sets_a_session_cookie() {
+        let face = face_with_password();
+        let mut req = request("POST", "/login");
+        req.body = br#"{"password":"secret"}"#.to_vec();
+        let (slot, done) = CompletionSlot::new("POST /login");
+        face.handle(req, done);
+        let Some(Exchange::Response(response)) = slot.take() else {
+            panic!("login must answer");
+        };
+        assert_eq!(response.status, 200);
+        assert!(
+            response.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("set-cookie")
+                    && value.contains(lan::COOKIE_SESSION)
+                    && value.contains("Max-Age=86400")
+            }),
+            "login must set the session cookie: {:?}",
+            response.headers
+        );
+        assert!(slot.take().is_none(), "the completion is exactly once");
+    }
+
+    #[test]
+    fn logout_is_public_and_clears_the_cookie() {
+        let face = face_with_password();
+        let req = request("POST", "/logout");
+        let (slot, done) = CompletionSlot::new("POST /logout");
+        face.handle(req, done);
+        let Some(Exchange::Response(response)) = slot.take() else {
+            panic!("logout must answer");
+        };
+        assert_eq!(response.status, 200);
+        assert!(
+            response.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("set-cookie")
+                    && value.contains(lan::COOKIE_SESSION)
+                    && value.contains("Max-Age=0")
+            }),
+            "logout must clear the session cookie"
+        );
+    }
+
+    #[test]
+    fn console_page_is_public_html() {
+        let face = face();
+        let (slot, done) = CompletionSlot::new("GET /");
+        face.handle(request("GET", "/"), done);
+        let Some(Exchange::Response(response)) = slot.take() else {
+            panic!("the console must answer");
+        };
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "text/html; charset=utf-8");
+        assert!(
+            String::from_utf8_lossy(&response.body).contains("id=\"rows\""),
+            "the console table is missing"
+        );
     }
 
     #[test]

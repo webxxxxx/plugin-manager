@@ -58,7 +58,7 @@ use crate::webui;
 
 /// Buffered-body limit for the routes that still go through the ordinary
 /// router. Blob uploads/downloads are streamed before this is consulted.
-pub(crate) fn body_limit(path: &str) -> u64 {
+fn body_limit(path: &str) -> u64 {
     let limits = crate::limits::current();
     let path = path.split_once('?').map(|(path, _)| path).unwrap_or(path);
     if path.starts_with("/api/v1/plugins") || path.starts_with("/api/v1/import") {
@@ -75,12 +75,6 @@ pub(crate) fn body_limit(path: &str) -> u64 {
 }
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-
-/// Serialise config writes inside this process. The on-disk `config.lock`
-/// covers other processes on Unix; this mutex also covers Windows, where
-/// `flock` is a no-op, and keeps two HTTP threads from sharing the same
-/// `config.tmp.<pid>` path.
-static CONFIG_WRITES: Mutex<()> = Mutex::new(());
 
 pub struct Api {
     lan: Arc<Mutex<Lan>>,
@@ -2608,12 +2602,6 @@ pub(crate) fn require_plugin_result(
     }
 }
 
-pub(crate) fn config_lock() -> std::sync::MutexGuard<'static, ()> {
-    CONFIG_WRITES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 
 
 
@@ -2643,7 +2631,7 @@ fn import_plugin(request: &HttpRequest, query: &str) -> Vec<u8> {
     let config_id = query_value(query, "config_id");
     let no_config = query_bool(query, "no_config").unwrap_or(false);
     let force = query_bool(query, "force").unwrap_or(false);
-    let _guard = config_lock();
+    let _guard = plugin::config_lock();
     // The HTTP surface is already authorised by the password / loopback
     // policy; do not re-check the daemon's OS privilege here (the CLI does).
     match transfer::import(&request.body, config_id.as_deref(), no_config, force, false) {
@@ -2671,26 +2659,6 @@ fn import_plugin(request: &HttpRequest, query: &str) -> Vec<u8> {
 
 
 
-pub(crate) fn cap_log(mut text: String) -> String {
-    if text.len() <= crate::limits::current().log_max_bytes as usize {
-        return text;
-    }
-    let mut start = text.len() - crate::limits::current().log_max_bytes as usize;
-    while start < text.len() && !text.is_char_boundary(start) {
-        start += 1;
-    }
-    if let Some(newline) = text[start..].find('\n') {
-        // Keep complete lines when possible; a single line longer than the
-        // budget keeps its tail rather than becoming empty.
-        let candidate = start + newline + 1;
-        if candidate < text.len() {
-            start = candidate;
-        }
-    }
-    text.drain(..start);
-    text
-}
-
 fn method_not_allowed(allow: &str) -> Vec<u8> {
     http::method_not_allowed(allow)
 }
@@ -2708,11 +2676,6 @@ fn download(filename: &str, data: &[u8]) -> Vec<u8> {
 }
 
 fn import_error(message: &str) -> Vec<u8> {
-    let (status, code, message) = import_error_status(message);
-    error(status, code, &message)
-}
-
-pub(crate) fn import_error_status(message: &str) -> (u16, &'static str, String) {
     let lower = message.to_ascii_lowercase();
     let status = if lower.contains("core service") || lower.contains("unknown plugin") {
         404
@@ -2741,7 +2704,7 @@ pub(crate) fn import_error_status(message: &str) -> (u16, &'static str, String) 
     } else {
         500
     };
-    (status, code_for(status), message.to_string())
+    error(status, code_for(status), message)
 }
 
 pub(crate) fn config_error_status(message: &str) -> (u16, &'static str, String) {
@@ -2870,13 +2833,48 @@ pub(crate) fn query_bool(query: &str, key: &str) -> Option<bool> {
     query_value(query, key).map(|value| value == "true" || value == "1")
 }
 
-pub(crate) fn decode(value: &str) -> String {
+fn decode(value: &str) -> String {
     http::percent_decode(value, true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_public_face_route_skips_transport_auth() {
+        use crate::server::http::Face;
+
+        let bind = "127.0.0.1:0".parse().expect("bind");
+        let lan = Arc::new(Mutex::new(Lan::new(bind, bind, true, Some("hash".into()))));
+        let face = crate::face::api::ApiFace::new(".", lan.clone());
+        let peer = "127.0.0.1".parse().expect("peer");
+
+        assert!(face.route("POST", "/login").expect("route").public);
+        let login = HttpRequest {
+            method: "POST".into(),
+            path: "/login".into(),
+            version: "HTTP/1.1".into(),
+            headers: Vec::new(),
+            body: b"{}".to_vec(),
+        };
+        let prepared = prepare_face_request(&face, &login, peer, &lan)
+            .expect("a public route must not fail authentication")
+            .expect("the face claims login");
+        assert_eq!(prepared.request.principal, AuthKind::None);
+
+        let protected = HttpRequest {
+            method: "GET".into(),
+            path: "/api/v1/auth".into(),
+            version: "HTTP/1.1".into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        assert!(
+            prepare_face_request(&face, &protected, peer, &lan).is_err(),
+            "a protected route still requires a principal"
+        );
+    }
 
     #[test]
     fn bind_precedence_is_env_then_config_then_default() {
