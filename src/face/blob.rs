@@ -873,6 +873,35 @@ mod tests {
     }
 
     #[test]
+    fn a_large_download_hands_the_body_to_the_server_instead_of_buffering_it() {
+        let id = blob_of(&vec![0x5a; 1024 * 1024]);
+        let path = format!("/api/v1/blobs/{}", id);
+        let mut handler = open("GET", &path, &[]);
+        let mut out = Vec::new();
+        let mut sends = 0;
+        let mut head_bytes = 0;
+        for _ in 0..100 {
+            let step = handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, 1024));
+            assert!(out.len() <= 1024, "the output buffer stays bounded");
+            head_bytes += out.len();
+            out.clear();
+            match step.action {
+                StreamAction::SendFile(send) => {
+                    assert_eq!(send.length, 1024 * 1024);
+                    sends += 1;
+                }
+                StreamAction::Close(_) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(sends, 1, "the whole body is one server-side file send");
+        assert!(
+            head_bytes < 4096,
+            "only the head is buffered, not the 1 MiB body: {head_bytes}"
+        );
+    }
+
+    #[test]
     fn a_missing_blob_is_a_streamed_404() {
         let (bytes, reason) = drive(open("GET", "/api/v1/blobs/sha256:deadbeef", &[]), 4096);
         assert_eq!(reason, CloseReason::Completed);

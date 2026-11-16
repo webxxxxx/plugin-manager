@@ -68,7 +68,7 @@ GET /api/v1/blobs/sha256:9f2c...e1
 - 长度：`Content-Length` 或 `Transfer-Encoding: chunked` 均可；
 - `Expect: 100-continue`：HTTP/1.1 客户端可以在发送大 body 前等待 `100 Continue`；
 - 单 blob 上限 **512 MiB**；超过返回 413（`Content-Length` 在读取前判断，chunked 在读取过程中判断）；
-- daemon 同时最多处理 **64** 个 blob 上传/下载流，超出返回 429。
+- daemon 同时最多处理 **64** 个 blob 上传流，超出返回 429（上传 takeover 的旧计数，直到 #119 并入统一预算）；下载走 stream handler 的 `max_streams` 预算，超出返回 503 `{"error":{"code":"busy"}}` + `Retry-After: 1`。
 
 上传成功返回 200：
 
@@ -80,7 +80,7 @@ GET /api/v1/blobs/sha256:9f2c...e1
 
 ### HTTP 下载
 
-`GET /api/v1/blobs/{id}` 从磁盘分块流式返回；`HEAD` 只返回头。响应头：
+`GET /api/v1/blobs/{id}` 经 sans-IO stream handler 从磁盘流式返回（优先内核 sendfile，否则受 stream buffer 限制的分块读写）；`HEAD` 只返回头。响应头：
 
 - `Content-Type: application/octet-stream`
 - `Content-Length`
@@ -407,7 +407,8 @@ MCP 客户端/门户可以用 `structuredContent.$blob` 或 `resource_link` 中�
 | 会话类型与接口不匹配（blob/file 混用） | HTTP 409 |
 | 非法 uploadId / partNumber | HTTP 400 |
 | 同时带 `Content-Length` 与 `Transfer-Encoding` | HTTP 400 |
-| 并发 blob 流超过 64 | HTTP 429 |
+| 并发 blob 上传流超过 64 | HTTP 429（上传 takeover，直到 #119 并入统一预算） |
+| 并发下载超过 `max_streams` | HTTP 503 `busy` + `Retry-After: 1` |
 
 插件应把 `$blobPath` 失败视为普通工具错误返回给调用者，不要伪造一个不存在的 blob id。
 
