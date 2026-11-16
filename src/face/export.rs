@@ -2,30 +2,31 @@
 //!
 //! The response body is the same tar the legacy takeover produced: the same
 //! entry order, tar headers, padding and trailer. What changed is who produces
-//! it. The handler builds a plan of small byte segments and server-side file
-//! sends; the server writes the bytes through the bounded output buffer and the
-//! kernel file-send path. No archive is buffered whole, no temporary file is
-//! written, and no thread is created per export.
+//! it. The archive layout lives in `package` (the format) and `plugin` (the
+//! plugin layout), which hand over a plan of byte parts and payload files. This
+//! face only projects that plan onto the response: it writes the small parts
+//! into the bounded output buffer and asks the server to send each payload
+//! file. No archive is buffered whole, no temporary file is written, and no
+//! thread is created per export.
 //!
-//! One deliberate difference from the legacy writer: it re-hashed every payload
-//! file while copying it and aborted on a mismatch. The bytes now go from disk
-//! to the socket inside the kernel, so the handler never sees them. The plan
-//! still rejects a missing or truncated payload before the headers go out, and
-//! the install path verifies `files[].sha256` again on import (#120).
+//! The plan is built on the first writable event, after the server admitted the
+//! stream, so a request refused with 503 busy never pays for it.
+//!
+//! One deliberate difference from the byte-verifying writer the CLI still uses
+//! (`TarPlan::write_verified`): a streamed export hands each payload straight
+//! to the kernel, so the handler never hashes those bytes. The plan still
+//! rejects a missing or truncated payload before the headers go out, and the
+//! install path verifies `files[].sha256` again on import (#120).
 
-use std::collections::VecDeque;
-use std::fs::{self, File};
-use std::path::{Path, PathBuf};
+use std::fs::File;
 
 use crate::http;
-use crate::package;
+use crate::package::{self, TarPart, TarPlan};
 use crate::plugin;
 use crate::server::http::{
     CloseReason, FileSend, OutBuffer, StreamAction, StreamClass, StreamEvent, StreamHandler,
     StreamStep,
 };
-
-const TRAILER: usize = 1024;
 
 /// One recognized export. The ids are already percent-decoded.
 pub enum ExportTarget {
@@ -60,104 +61,139 @@ pub fn export_target(method: &str, path: &str) -> Option<ExportTarget> {
     }
 }
 
-/// One piece of the response body. Small protocol pieces are bytes; payload
-/// files stay on disk and are handed to the server as a file send.
-enum Segment {
-    Bytes(Vec<u8>),
-    File {
-        path: PathBuf,
-        offset: u64,
-        length: u64,
-    },
-}
-
-/// A complete response: the head, then the body in order.
-struct Plan {
-    head: Vec<u8>,
-    segments: VecDeque<Segment>,
-}
-
-/// One export as a sans-IO state machine.
+/// One export being streamed.
+///
+/// The plan is built on the first writable event, after the server admitted
+/// the stream, so a request refused with 503 busy never pays for it.
 pub struct ExportStream {
+    pending: Option<Pending>,
     head: Vec<u8>,
     head_sent: usize,
-    segments: VecDeque<Segment>,
-    /// How much of the current byte segment is already written. Reset when the
-    /// segment is finished.
+    plan: TarPlan,
+    index: usize,
+    /// How much of the current byte part is already written.
     at: usize,
+}
+
+struct Pending {
+    target: ExportTarget,
+    version: String,
 }
 
 impl ExportStream {
     pub fn open(target: ExportTarget) -> ExportStream {
         let id = target.id();
-        // Validate before touching the filesystem: `plugin_dir` joins the id.
+        // Validate before touching the filesystem: plugin_dir joins the id.
         let version = if package::valid_name(id) {
             plugin::current_version(id)
         } else {
             None
         };
-        let Some(version) = version else {
-            return ExportStream::response(http::json_error(
+        match version {
+            Some(version) => ExportStream {
+                pending: Some(Pending { target, version }),
+                head: Vec::new(),
+                head_sent: 0,
+                plan: TarPlan::new(),
+                index: 0,
+                at: 0,
+            },
+            None => ExportStream::response(http::json_error(
                 404,
                 "not_found",
                 &format!("unknown plugin: {}", id),
-            ));
-        };
-        ExportStream::from_plan(plan_for(&target, &version))
-    }
-
-    fn from_plan(plan: Result<Plan, String>) -> ExportStream {
-        match plan {
-            Ok(plan) => ExportStream {
-                head: plan.head,
-                head_sent: 0,
-                segments: plan.segments,
-                at: 0,
-            },
-            // The route is streamed, so even a failure is a stream response.
-            Err(message) => ExportStream::response(http::json_error(500, "internal", &message)),
+            )),
         }
     }
 
+    /// A complete response that is not an archive. The route is streamed, so
+    /// even a failure is a stream response.
     fn response(head: Vec<u8>) -> ExportStream {
         ExportStream {
+            pending: None,
             head,
             head_sent: 0,
-            segments: VecDeque::new(),
+            plan: TarPlan::new(),
+            index: 0,
             at: 0,
         }
     }
 
+    /// Stream an already-built plan. Production builds its plan lazily in
+    /// ExportStream::begin; this constructor is the test seam.
+    #[cfg(test)]
+    fn planned(filename: &str, plan: Result<TarPlan, String>) -> ExportStream {
+        match plan {
+            Ok(plan) => ExportStream {
+                pending: None,
+                head: download_head(filename, plan.size()),
+                head_sent: 0,
+                plan,
+                index: 0,
+                at: 0,
+            },
+            Err(message) => ExportStream::response(http::json_error(500, "internal", &message)),
+        }
+    }
+
+    /// Build the archive plan now that the stream holds a budget slot.
+    fn begin(&mut self) {
+        let Some(Pending { target, version }) = self.pending.take() else {
+            return;
+        };
+        let id = target.id().to_string();
+        let version_dir = plugin::plugin_dir(&id).join(&version);
+        let extension = match &target {
+            ExportTarget::Spk { .. } => "spk",
+            ExportTarget::Spkb { .. } => "spkb",
+        };
+        let filename = format!(
+            "{}-{}.{}",
+            super::api::safe_filename(&id),
+            super::api::safe_filename(&version),
+            extension
+        );
+        let plan = match target {
+            ExportTarget::Spk { .. } => package::plan_installed_spk(&version_dir),
+            ExportTarget::Spkb { .. } => match active_config(&id) {
+                Ok(config) => {
+                    plugin::plan_export_spkb(&id, &version, &version_dir, config.as_deref())
+                }
+                Err(message) => Err(message),
+            },
+        };
+        let (head, plan) = match plan {
+            Ok(plan) => (download_head(&filename, plan.size()), plan),
+            Err(message) => (http::json_error(500, "internal", &message), TarPlan::new()),
+        };
+        self.head = head;
+        self.head_sent = 0;
+        self.plan = plan;
+        self.index = 0;
+        self.at = 0;
+    }
+
     fn on_writable(&mut self, out: &mut OutBuffer<'_>) -> StreamStep {
+        self.begin();
         loop {
             if self.head_sent < self.head.len() {
-                let take = (self.head.len() - self.head_sent).min(out.remaining());
-                out.write(&self.head[self.head_sent..self.head_sent + take]);
-                self.head_sent += take;
-                if self.head_sent < self.head.len() {
+                if !drain(out, &self.head, &mut self.head_sent) {
                     return StreamStep::wait(StreamAction::NeedWrite);
                 }
             }
-            let Some(segment) = self.segments.pop_front() else {
+            let Some(part) = self.plan.parts().get(self.index) else {
                 return StreamStep::wait(StreamAction::Close(CloseReason::Completed));
             };
-            match segment {
-                Segment::Bytes(data) => {
-                    let take = (data.len() - self.at).min(out.remaining());
-                    out.write(&data[self.at..self.at + take]);
-                    self.at += take;
-                    if self.at < data.len() {
-                        self.segments.push_front(Segment::Bytes(data));
+            match part {
+                TarPart::Bytes(data) => {
+                    if !drain(out, data, &mut self.at) {
                         return StreamStep::wait(StreamAction::NeedWrite);
                     }
+                    self.index += 1;
                     self.at = 0;
                 }
-                Segment::File {
-                    path,
-                    offset,
-                    length,
-                } => {
-                    let file = match File::open(&path) {
+                TarPart::File { path, length, .. } => {
+                    let file = match File::open(path) {
                         Ok(file) => file,
                         Err(error) => {
                             return StreamStep::wait(StreamAction::Close(CloseReason::Failed(
@@ -165,10 +201,12 @@ impl ExportStream {
                             )))
                         }
                     };
+                    self.index += 1;
+                    self.at = 0;
                     return StreamStep::wait(StreamAction::SendFile(FileSend {
                         file,
-                        offset,
-                        length,
+                        offset: 0,
+                        length: *length,
                     }));
                 }
             }
@@ -182,11 +220,14 @@ impl StreamHandler for ExportStream {
             StreamEvent::Writable => self.on_writable(out),
             StreamEvent::Tick(_) => StreamStep::wait(StreamAction::Close(CloseReason::TimedOut)),
             StreamEvent::Closed(reason) => {
-                // A disconnect drops the remaining plan, so no file handle or
-                // body segment outlives the connection.
-                self.segments.clear();
+                // A disconnect drops the pending work and the plan, so no file
+                // handle or buffered piece outlives the connection.
+                self.pending = None;
+                self.plan = TarPlan::new();
                 self.head.clear();
                 self.head_sent = 0;
+                self.index = 0;
+                self.at = 0;
                 StreamStep::wait(StreamAction::Close(reason))
             }
             // An export has no request body and submits no blocking job.
@@ -201,156 +242,27 @@ impl StreamHandler for ExportStream {
     }
 }
 
-fn plan_for(target: &ExportTarget, version: &str) -> Result<Plan, String> {
-    let id = target.id();
-    let version_dir = plugin::plugin_dir(id).join(version);
-    match target {
-        ExportTarget::Spk { .. } => plan_spk(id, version, &version_dir),
-        ExportTarget::Spkb { .. } => {
-            let config = match plugin::active_config(id) {
-                Some(path) => {
-                    Some(fs::read(&path).map_err(|error| format!("read config: {}", error))?)
-                }
-                None => None,
-            };
-            plan_spkb(id, version, &version_dir, config.as_deref())
-        }
+/// The active config of a .spkb backup; a plugin without one exports without
+/// the config entry.
+fn active_config(id: &str) -> Result<Option<Vec<u8>>, String> {
+    match plugin::active_config(id) {
+        Some(path) => Ok(Some(
+            std::fs::read(&path).map_err(|error| format!("read config: {}", error))?,
+        )),
+        None => Ok(None),
     }
 }
 
-/// The installable, signed `.spk` rebuilt from the installed version directory.
-fn plan_spk(id: &str, version: &str, version_dir: &Path) -> Result<Plan, String> {
-    let (segments, size) = spk_segments(version_dir)?;
-    Ok(Plan {
-        head: download_head(id, version, "spk", size),
-        segments,
-    })
+/// Append the not-yet-written tail of source, advancing at. Returns whether all
+/// of it fit: a full output buffer makes this false.
+fn drain(out: &mut OutBuffer<'_>, source: &[u8], at: &mut usize) -> bool {
+    let take = (source.len() - *at).min(out.remaining());
+    out.write(&source[*at..*at + take]);
+    *at += take;
+    *at == source.len()
 }
 
-/// The `.spkb` backup: `backup.json`, the nested `.spk` entry, the active
-/// config when there is one, then the tar trailer.
-fn plan_spkb(
-    id: &str,
-    version: &str,
-    version_dir: &Path,
-    config: Option<&[u8]>,
-) -> Result<Plan, String> {
-    let mut segments = VecDeque::new();
-    let mut size = 0u64;
-
-    let backup = plugin::backup_json(id, version, config);
-    push(
-        &mut segments,
-        &mut size,
-        Segment::Bytes(tar_entry("backup.json", &backup, 0o644)?),
-    );
-
-    // The nested package is a tar stream of its own. Its headers, payload file
-    // sends and padding are the bytes of the outer `plugin.spk` entry.
-    let (inner, inner_size) = spk_segments(version_dir)?;
-    push(
-        &mut segments,
-        &mut size,
-        Segment::Bytes(tar_header("plugin.spk", inner_size, 0o644)?),
-    );
-    for part in inner {
-        push(&mut segments, &mut size, part);
-    }
-    push(
-        &mut segments,
-        &mut size,
-        Segment::Bytes(tar_padding(inner_size)?),
-    );
-
-    if let Some(config) = config {
-        push(
-            &mut segments,
-            &mut size,
-            Segment::Bytes(tar_entry("config", config, 0o600)?),
-        );
-    }
-
-    push(&mut segments, &mut size, Segment::Bytes(vec![0u8; TRAILER]));
-    Ok(Plan {
-        head: download_head(id, version, "spkb", size),
-        segments,
-    })
-}
-
-/// The body of an installed `.spk`: the verbatim manifest and signature, then
-/// each payload file in manifest order. Payload bytes are never read here.
-fn spk_segments(version_dir: &Path) -> Result<(VecDeque<Segment>, u64), String> {
-    let manifest_bytes = fs::read(version_dir.join("manifest.json"))
-        .map_err(|error| format!("read manifest: {}", error))?;
-    let manifest = package::parse_manifest(&manifest_bytes)?;
-    let signature = package::read_export_signature(version_dir)?;
-    let mut segments = VecDeque::new();
-    let mut size = 0u64;
-    push(
-        &mut segments,
-        &mut size,
-        Segment::Bytes(tar_entry("manifest.json", &manifest_bytes, 0o644)?),
-    );
-    push(
-        &mut segments,
-        &mut size,
-        Segment::Bytes(tar_entry("signature.json", &signature, 0o644)?),
-    );
-    let mut files = manifest.files.clone();
-    files.sort_by(|left, right| left.path.cmp(&right.path));
-    for file in files {
-        let path = version_dir.join(&file.path);
-        // `parse_manifest` validated the path; the size check is what keeps a
-        // truncated install from advertising a Content-Length it cannot send.
-        let metadata =
-            fs::metadata(&path).map_err(|error| format!("stat {}: {}", file.path, error))?;
-        if metadata.len() != file.size {
-            return Err(format!("installed file is corrupt: {}", file.path));
-        }
-        push(
-            &mut segments,
-            &mut size,
-            Segment::Bytes(tar_header(&file.path, file.size, file.mode & 0o777)?),
-        );
-        if file.size > 0 {
-            push(
-                &mut segments,
-                &mut size,
-                Segment::File {
-                    path,
-                    offset: 0,
-                    length: file.size,
-                },
-            );
-        }
-        push(
-            &mut segments,
-            &mut size,
-            Segment::Bytes(tar_padding(file.size)?),
-        );
-    }
-    push(&mut segments, &mut size, Segment::Bytes(vec![0u8; TRAILER]));
-    Ok((segments, size))
-}
-
-/// Account one segment. The running size is the response's Content-Length, so
-/// every segment must be counted exactly once.
-fn push(segments: &mut VecDeque<Segment>, size: &mut u64, part: Segment) {
-    let bytes = match &part {
-        Segment::Bytes(data) => data.len() as u64,
-        Segment::File { length, .. } => *length,
-    };
-    *size = size.saturating_add(bytes);
-    segments.push_back(part);
-}
-
-fn download_head(id: &str, version: &str, extension: &str, size: u64) -> Vec<u8> {
-    let filename = format!(
-        "{}-{}.{}",
-        super::api::safe_filename(id),
-        super::api::safe_filename(version),
-        extension
-    );
+fn download_head(filename: &str, size: u64) -> Vec<u8> {
     http::response_head(
         200,
         "application/octet-stream",
@@ -365,28 +277,13 @@ fn download_head(id: &str, version: &str, extension: &str, size: u64) -> Vec<u8>
     )
 }
 
-fn tar_entry(path: &str, data: &[u8], mode: u32) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(512 + data.len());
-    package::write_tar_entry(&mut out, path, data, mode)?;
-    Ok(out)
-}
-
-fn tar_header(path: &str, size: u64, mode: u32) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(512);
-    package::write_tar_header(&mut out, path, size, mode)?;
-    Ok(out)
-}
-
-fn tar_padding(size: u64) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(512);
-    package::write_tar_padding(&mut out, size)?;
-    Ok(out)
-}
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+    use std::fs;
     use std::io::{Read, Seek, SeekFrom};
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -506,12 +403,57 @@ mod tests {
         serde_json::from_slice(body(bytes)).expect("json error body")
     }
 
+    /// The same archive composed through the pre-existing write_tar helper:
+    /// an expectation independent of the plan's own part list.
+    fn reference_spk(version_dir: &Path) -> Vec<u8> {
+        let manifest = fs::read(version_dir.join("manifest.json")).expect("manifest");
+        let signature = fs::read(version_dir.join("signature.json")).expect("signature");
+        let parsed: Value = serde_json::from_slice(&manifest).expect("manifest json");
+        let mut files: Vec<(String, u32)> = parsed["files"]
+            .as_array()
+            .expect("manifest files")
+            .iter()
+            .map(|file| {
+                (
+                    file["path"].as_str().expect("path").to_string(),
+                    file["mode"].as_u64().expect("mode") as u32,
+                )
+            })
+            .collect();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        let payloads: Vec<(String, Vec<u8>, u32)> = files
+            .into_iter()
+            .map(|(path, mode)| {
+                let data = fs::read(version_dir.join(&path)).expect("payload");
+                (path, data, mode & 0o777)
+            })
+            .collect();
+        let mut entries: Vec<(&str, &[u8], u32)> = vec![
+            ("manifest.json", &manifest, 0o644),
+            ("signature.json", &signature, 0o644),
+        ];
+        for (path, data, mode) in &payloads {
+            entries.push((path.as_str(), data.as_slice(), *mode));
+        }
+        package::write_tar(&entries).expect("reference tar")
+    }
+
     fn spk(version_dir: &Path, name: &str) -> ExportStream {
-        ExportStream::from_plan(plan_spk(name, "1.0.0", version_dir))
+        ExportStream::planned(
+            &format!("{}-1.0.0.spk", name),
+            package::plan_installed_spk(version_dir),
+        )
+    }
+
+    fn spkb(version_dir: &Path, name: &str, config: Option<&[u8]>) -> ExportStream {
+        ExportStream::planned(
+            &format!("{}-1.0.0.spkb", name),
+            plugin::plan_export_spkb(name, "1.0.0", version_dir, config),
+        )
     }
 
     #[test]
-    fn the_spk_body_is_the_legacy_archive_byte_for_byte() {
+    fn the_spk_body_matches_the_reference_archive_byte_for_byte() {
         let version_dir = installed(
             "demo",
             &[
@@ -520,8 +462,7 @@ mod tests {
                 ("payload/empty", b"", 0o644),
             ],
         );
-        let mut expected = Vec::new();
-        package::write_installed_spk(&version_dir, &mut expected).expect("legacy writer");
+        let expected = reference_spk(&version_dir);
 
         let (bytes, reason) = drive(spk(&version_dir, "demo"), 128);
         assert_eq!(reason, CloseReason::Completed);
@@ -547,10 +488,7 @@ mod tests {
     fn the_spkb_body_is_backup_the_nested_spk_and_the_active_config() {
         let version_dir = installed("demo", &[("payload/run.sh", b"#!/bin/sh\n", 0o755)]);
         let config = b"good template\n";
-        let (bytes, reason) = drive(
-            ExportStream::from_plan(plan_spkb("demo", "1.0.0", &version_dir, Some(config))),
-            64,
-        );
+        let (bytes, reason) = drive(spkb(&version_dir, "demo", Some(config)), 64);
         assert_eq!(reason, CloseReason::Completed);
         let head = text(&bytes);
         assert!(head.contains("filename=\"demo-1.0.0.spkb\""), "{head}");
@@ -567,10 +505,9 @@ mod tests {
         assert_eq!(backup["configSha256"], package::hex_sha256(config));
         assert!(backup["exportedAt"].as_u64().is_some());
 
-        let mut nested = Vec::new();
-        package::write_installed_spk(&version_dir, &mut nested).expect("nested spk");
         assert_eq!(
-            entries[1].data, nested,
+            entries[1].data,
+            reference_spk(&version_dir),
             "the plugin.spk entry is the signed package of the current version"
         );
         assert_eq!(entries[2].data, config);
@@ -580,10 +517,7 @@ mod tests {
     #[test]
     fn a_plugin_without_an_active_config_exports_without_a_config_entry() {
         let version_dir = installed("demo", &[("payload/run.sh", b"#!/bin/sh\n", 0o755)]);
-        let (bytes, _) = drive(
-            ExportStream::from_plan(plan_spkb("demo", "1.0.0", &version_dir, None)),
-            512,
-        );
+        let (bytes, _) = drive(spkb(&version_dir, "demo", None), 512);
         let entries = package::read_tar(body(&bytes)).expect("tar");
         let names: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
         assert_eq!(names, ["backup.json", "plugin.spk"]);
@@ -727,7 +661,8 @@ mod tests {
             StreamEvent::Closed(CloseReason::PeerClosed),
             &mut OutBuffer::new(&mut discarded, 0),
         );
-        assert!(handler.segments.is_empty());
+        assert!(handler.pending.is_none());
+        assert_eq!(handler.plan.size(), 0);
         assert!(handler.head.is_empty());
         assert!(matches!(
             step.action,

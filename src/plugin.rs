@@ -1461,32 +1461,46 @@ pub fn export_spk(id: &str) -> Result<(String, Vec<u8>), String> {
     Ok((version, bytes))
 }
 
+/// The .spkb layout: backup.json, the nested .spk entry, the active config
+/// when there is one, and the tar trailer.
+///
+/// Shared by the CLI export and the HTTP stream; the nested package is itself
+/// a plan, so both callers describe the archive the same way.
+pub fn plan_export_spkb(
+    id: &str,
+    version: &str,
+    version_dir: &Path,
+    config: Option<&[u8]>,
+) -> Result<package::TarPlan, String> {
+    let mut plan = package::TarPlan::new();
+    let backup = backup_json(id, version, config);
+    plan.push_bytes(package::tar_entry_bytes("backup.json", &backup, 0o644)?);
+    let inner = package::plan_installed_spk(version_dir)?;
+    let inner_size = inner.size();
+    plan.push_bytes(package::tar_header_bytes("plugin.spk", inner_size, 0o644)?);
+    plan.append(inner);
+    plan.push_bytes(package::tar_padding_bytes(inner_size)?);
+    if let Some(config) = config {
+        plan.push_bytes(package::tar_entry_bytes("config", config, 0o600)?);
+    }
+    plan.push_bytes(vec![0u8; package::TAR_TRAILER]);
+    Ok(plan)
+}
+
 pub fn export_spkb(id: &str) -> Result<(String, Vec<u8>), String> {
     let version = current_version(id).ok_or_else(|| format!("unknown plugin: {}", id))?;
-    let spec = export_spk(id)?.1;
     let config = active_config(id)
         .map(|path| fs::read(path).map_err(|error| format!("read config: {}", error)))
         .transpose()?;
-    let exported_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let backup = serde_json::json!({
-        "schema": 1,
-        "id": id,
-        "version": version,
-        "exportedAt": exported_at,
-        "configSha256": config.as_ref().map(|data| package::hex_sha256(data)),
-    });
-    let backup = serde_json::to_vec(&backup).map_err(|error| error.to_string())?;
-    let mut entries: Vec<(&str, &[u8], u32)> = vec![
-        ("backup.json", &backup, 0o644),
-        ("plugin.spk", &spec, 0o644),
-    ];
-    if let Some(config) = &config {
-        entries.push(("config", config, 0o600));
-    }
-    Ok((version, package::write_tar(&entries)?))
+    let plan = plan_export_spkb(
+        id,
+        &version,
+        &plugin_dir(id).join(&version),
+        config.as_deref(),
+    )?;
+    let mut bytes = Vec::new();
+    plan.write_verified(&mut bytes)?;
+    Ok((version, bytes))
 }
 
 pub(crate) fn backup_json(id: &str, version: &str, config: Option<&[u8]>) -> Vec<u8> {

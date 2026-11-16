@@ -3656,6 +3656,12 @@ fn password_auth_bearer_cookie_csrf() {
     assert_eq!(denied_version.status, 401);
     assert_eq!(denied_version.body["error"]["code"], "unauthorized");
 
+    // An export is a streamed face route now, but it is not a public route:
+    // authentication still happens before any archive work.
+    let denied_export = request(&address, "GET", "/api/v1/export/demo", "", b"");
+    assert_eq!(denied_export.status, 401);
+    assert_eq!(denied_export.body["error"]["code"], "unauthorized");
+
     let bearer = format!("Bearer {}", password);
     let allowed = request_with(
         &address,
