@@ -402,6 +402,23 @@ impl Sandbox {
         panic!("daemon never became reachable; log:\n{}", self.daemon_log());
     }
 
+    /// Wait until the daemon answers over the control channel.
+    ///
+    /// `svc list` and `svc status` fall back to the on-disk definitions when
+    /// the daemon is down, so they answer *successfully* before it is ready and
+    /// are useless as readiness probes. `svc reload` has no offline path: it
+    /// exits EXIT_DAEMON_UNREACHABLE until the daemon accepts, and answering it
+    /// also proves the boot scan finished (the RPC is handled by the same loop).
+    fn wait_for_daemon(&self) {
+        let output = self.run_when_ready(&["reload"]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "reload: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn status(&self, id: &str) -> Value {
         let output = self.run_svc(&["status", id, "--json"]);
         assert_eq!(
@@ -1061,7 +1078,21 @@ fn pid_alive(pid: u32) -> bool {
             .expect("tasklist");
         String::from_utf8_lossy(&output.stdout).contains(&format!("\"{}\"", pid))
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    {
+        // kill -0 also succeeds for a zombie: the process has exited and only
+        // awaits reaping. An adopted pid is reaped by whoever spawned it, not
+        // by the daemon under test, so "gone" must mean "not running" (#111).
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", pid)) else {
+            return false;
+        };
+        let Some((_, rest)) = stat.rsplit_once(") ") else {
+            return false;
+        };
+        let state = rest.chars().next().unwrap_or('X');
+        state != 'Z' && state != 'X'
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         Command::new("kill")
             .args(["-0", &pid.to_string()])
@@ -1857,12 +1888,16 @@ fn a_marker_change_marks_an_installed_plugin_failed() {
     sandbox.write_device_marker("sr6110");
     let package = sandbox.write_compat_package("plug", &["sr6110"]);
     sandbox.start_daemon();
+    sandbox.wait_for_daemon();
     sandbox.install_plugin("plug", &package);
     sandbox.shutdown();
 
     // The firmware changes generation under the same installation.
     sandbox.write_device_marker("sr1010");
     sandbox.start_daemon();
+    // The reload probe also proves a reload does not prune the plugin from the
+    // registry: the status below would say "unknown service" if it did.
+    sandbox.wait_for_daemon();
 
     let status = sandbox.status("plug");
     assert_eq!(status["summary"]["state"], "failed", "{status}");
@@ -1920,12 +1955,35 @@ fn a_fresh_plugin_install_is_disabled_until_enabled() {
     );
 }
 
+/// A reload reconciles `services.d` and the plugin store. Carrying the
+/// scanned plugins into `desired` is what keeps the stale sweep from
+/// unregistering every installed plugin on each reload.
+#[test]
+fn reload_keeps_an_installed_plugin_registered() {
+    let mut sandbox = Sandbox::new();
+    let package = sandbox.write_plugin_package("plug");
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    sandbox.install_plugin("plug", &package);
+
+    let output = sandbox.run_when_ready(&["reload"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status = sandbox.status("plug");
+    assert_eq!(status["summary"]["state"], "stopped", "{status}");
+}
+
 #[test]
 fn reload_picks_up_definitions_written_after_boot() {
     let mut sandbox = Sandbox::new();
     sandbox.start_daemon();
-    // Wait for the boot scan to finish before adding the definition.
-    sandbox.run_when_ready(&["list"]);
+    // Wait for the boot scan to finish before adding the definition. A
+    // `svc list` probe would answer from disk before the daemon is ready.
+    sandbox.wait_for_daemon();
     sandbox.write_core_json("late");
 
     let output = sandbox.run_when_ready(&["reload"]);
@@ -2168,7 +2226,7 @@ fn a_finished_one_shot_is_not_rerun_after_a_daemon_restart() {
 
     sandbox.force_kill_daemon();
     sandbox.start_daemon();
-    sandbox.run_when_ready(&["list"]);
+    sandbox.wait_for_daemon();
 
     let status = sandbox.wait_for_state("once", "running", Duration::from_secs(10));
     assert!(status["summary"]["pid"].is_null(), "{status}");
@@ -2259,7 +2317,7 @@ fn a_runtime_record_for_a_deleted_definition_is_dropped_on_start() {
         .expect("remove definition");
 
     sandbox.start_daemon();
-    sandbox.run_when_ready(&["list"]);
+    sandbox.wait_for_daemon();
     wait_until(
         "the orphan record to be dropped",
         Duration::from_secs(10),
@@ -2441,7 +2499,7 @@ fn a_stopping_record_is_finished_with_the_stop_action() {
 fn a_definition_added_while_running_is_picked_up_without_reload() {
     let mut sandbox = Sandbox::new();
     sandbox.start_daemon_with_env(&[("SVCD_RESCAN_INTERVAL_MS", "50")]);
-    sandbox.run_when_ready(&["list"]);
+    sandbox.wait_for_daemon();
 
     sandbox.write_core_json("late");
     wait_until(
@@ -2534,7 +2592,7 @@ fn a_finished_one_shot_is_rerun_after_a_graceful_restart() {
 fn a_second_daemon_refuses_to_start() {
     let mut sandbox = Sandbox::new();
     sandbox.start_daemon();
-    sandbox.run_when_ready(&["list"]);
+    sandbox.wait_for_daemon();
 
     let mut command = Command::new(&sandbox.svcd);
     command

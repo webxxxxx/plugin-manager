@@ -1265,10 +1265,25 @@ impl Slot {
         {
             // Signal 0: 0 means a member exists; EPERM means it exists but is
             // not ours to signal, which still counts as alive.
-            if unsafe { libc::kill(-(pid as i32), 0) } == 0 {
+            let member = unsafe { libc::kill(-(pid as i32), 0) } == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            if !member {
+                return false;
+            }
+            // A running leader is the group. Only when the leader is already a
+            // zombie (an adopted process we cannot reap) does the group need a
+            // per-member state scan, which keeps the fast path a single kill(2).
+            if crate::proc::alive(pid) {
                 return true;
             }
-            return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            #[cfg(target_os = "linux")]
+            {
+                return crate::proc::group_alive(pid);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return true;
+            }
         }
         #[cfg(windows)]
         {

@@ -1231,9 +1231,13 @@ impl Daemon {
             log::svcd(&format!("svcd: reload: plugin: {}", warning));
         }
         for service in plugins {
-            // A core definition with the same id wins, and an installed plugin
-            // is already authoritative in the registry (install updates it).
-            if desired.contains_key(&service.id) || self.registry.get(&service.id).is_some() {
+            // A core definition with the same id wins. An installed plugin is
+            // authoritative in the registry (install/uninstall update it), but
+            // it must still land in `desired`: otherwise the stale sweep below
+            // unregisters every installed plugin on each reload. The update
+            // branch in `apply_definitions` already skips plugin-over-plugin
+            // overwrites, so carrying the scanned snapshot is safe.
+            if desired.contains_key(&service.id) {
                 continue;
             }
             desired.insert(service.id.clone(), service);

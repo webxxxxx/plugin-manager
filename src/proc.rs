@@ -118,21 +118,80 @@ pub fn boot_id() -> Option<String> {
     }
 }
 
+/// The process state field of `/proc/<pid>/stat`: `R`, `S`, `D`, `Z`, ...
+#[cfg(target_os = "linux")]
+fn process_state(pid: u32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // "pid (comm) state ..." — comm may itself contain ") ", so split at the
+    // last one; the numeric fields that follow never contain a parenthesis.
+    stat.rsplit_once(") ")?.1.chars().next()
+}
+
 /// True while `pid` exists and is signalable (EPERM still counts: not ours to
 /// signal, but alive).
+///
+/// A zombie answers signal 0 but has already exited and only awaits reaping.
+/// An adopted process (not our child) can never be reaped by us, so counting a
+/// zombie as alive made the supervisor report it as unkillable forever (#111).
 pub fn alive(pid: u32) -> bool {
     #[cfg(unix)]
-    unsafe {
-        if libc::kill(pid as i32, 0) == 0 {
-            return true;
+    {
+        let signalable = unsafe { libc::kill(pid as i32, 0) == 0 }
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        if !signalable {
+            return false;
         }
-        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        #[cfg(target_os = "linux")]
+        {
+            return process_state(pid)
+                .map(|state| state != 'Z' && state != 'X')
+                .unwrap_or(true);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
+        }
     }
     #[cfg(not(unix))]
     {
         let _ = pid;
         false
     }
+}
+
+/// True while a member of process group `pgid` is still *running*. Zombies are
+/// excluded for the same reason as in [`alive`]; the caller decides whether the
+/// extra `/proc` scan is worth it (see `Slot::group_alive`).
+#[cfg(target_os = "linux")]
+pub fn group_alive(pgid: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.parse::<u32>().is_err() {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some((_, rest)) = stat.rsplit_once(") ") else {
+            continue;
+        };
+        let mut fields = rest.split_whitespace();
+        let state = fields.next().unwrap_or("");
+        let _parent = fields.next();
+        let Some(group) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        if group == pgid && state != "Z" && state != "X" {
+            return true;
+        }
+    }
+    false
 }
 
 /// Terminate a service process group that outlived its record/definition.
