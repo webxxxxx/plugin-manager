@@ -1078,20 +1078,12 @@ impl Daemon {
                     return;
                 }
             };
-            let external_id = id.clone();
-            let done_reply = reply.clone();
-            let done: ReplySink = Box::new(move |outcome| {
-                let outcome = match outcome {
-                    Ok(Reply::Value(value)) => Ok(value),
-                    Ok(Reply::Stream(_)) => Err(Failure::new(
-                        Class::ImplementationError,
-                        Retry::Never,
-                        "stream replies are not supported by the builtin adapter",
-                    )),
-                    Err(failure) => Err(failure),
-                };
-                let _ = done_reply.send(project_builtin_outcome(external_id, outcome));
-            });
+            let done = projected_done(
+                reply.clone(),
+                id.clone(),
+                "stream replies are not supported by the builtin adapter",
+                project_builtin_outcome,
+            );
             if let Err(rejection) = instance.call(invocation, done) {
                 reply.send(project_builtin_outcome(
                     id,
@@ -1121,20 +1113,12 @@ impl Daemon {
                 return;
             }
         };
-        let external_id = id.clone();
-        let done_reply = reply.clone();
-        let done: ReplySink = Box::new(move |outcome| {
-            let outcome = match outcome {
-                Ok(Reply::Value(value)) => Ok(value),
-                Ok(Reply::Stream(_)) => Err(Failure::new(
-                    Class::ImplementationError,
-                    Retry::Never,
-                    "stream replies are not wired through SlotWire",
-                )),
-                Err(failure) => Err(failure),
-            };
-            let _ = done_reply.send(project_slot_outcome(external_id, outcome));
-        });
+        let done = projected_done(
+            reply.clone(),
+            id.clone(),
+            "stream replies are not wired through SlotWire",
+            project_slot_outcome,
+        );
         if let Err(rejection) = instance.call(invocation, done) {
             reply.send(project_slot_outcome(id, Err(rejection_failure(rejection))));
         }
@@ -1987,6 +1971,28 @@ fn project_slot_response(external_id: Option<Value>, outcome: Result<Value, Fail
 
 fn project_slot_outcome(external_id: Option<Value>, outcome: Result<Value, Failure>) -> String {
     rpc::to_line(&project_slot_response(external_id, outcome))
+}
+
+/// Build the completion sink for one tools/call: a stream reply is an
+/// implementation error, and the final value/failure is projected by the face.
+fn projected_done(
+    reply: crate::channel::Reply,
+    external_id: Option<Value>,
+    stream_error: &'static str,
+    project: fn(Option<Value>, Result<Value, Failure>) -> String,
+) -> ReplySink {
+    Box::new(move |outcome| {
+        let outcome = match outcome {
+            Ok(Reply::Value(value)) => Ok(value),
+            Ok(Reply::Stream(_)) => Err(Failure::new(
+                Class::ImplementationError,
+                Retry::Never,
+                stream_error,
+            )),
+            Err(failure) => Err(failure),
+        };
+        let _ = reply.send(project(external_id, outcome));
+    })
 }
 
 fn rejection_failure(rejection: Rejection) -> Failure {

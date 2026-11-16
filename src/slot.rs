@@ -27,6 +27,9 @@ use crate::wake::Wake;
 /// 128-slot queue behind this cap; the ticket scopes this tracer bullet to the
 /// in-flight cap, so a 65th concurrent call is rejected as busy instead.
 pub(crate) const MAX_IN_FLIGHT: usize = 64;
+/// Bounded hand-off from a caller's thread to the slot event loop. A full queue
+/// is backpressure ('Busy'), not unbounded memory growth.
+pub(crate) const CALL_QUEUE: usize = 256;
 /// 默认调用超时；生产装配点用 `default_timeout` / `max_timeout` 覆盖它。
 pub(crate) const DEFAULT_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Bounded per-plugin stdout queue. A full queue pauses that plugin's reader
@@ -82,18 +85,34 @@ pub(crate) struct Slot {
     project: Option<Arc<dyn Fn(Option<Value>, Result<Value, Failure>) -> String + Send + Sync>>,
     /// Face-side projection of a plugin notification (progress/logging).
     notify_sink: Option<Arc<dyn Fn(&str, &Value) + Send + Sync>>,
-    /// Requests from blocking call workers, drained on the event loop.
-    request_tx: mpsc::Sender<SlotRequest>,
+    /// Requests submitted by callers, drained on the event loop.
+    request_tx: mpsc::SyncSender<SlotRequest>,
     request_rx: Receiver<SlotRequest>,
     /// Coarse health snapshot for `SlotHandle::probe`.
     health: Arc<AtomicU8>,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        // Dropping the slot means no event loop will ever answer its pending
+        // calls. Complete both the in-flight and still-queued ones here instead
+        // of dropping the 'FnOnce' sinks and leaving callers waiting forever.
+        self.fail_pending("service runtime stopped");
+        while let Ok(request) = self.request_rx.try_recv() {
+            (request.done)(Err(Failure::new(
+                Class::NotRunning,
+                Retry::After(std::time::Duration::from_secs(1)),
+                "service runtime stopped",
+            )));
+        }
+    }
 }
 
 /// A handle to one slot. Submitting never waits: the slot event loop owns the
 /// process and calls `done` when the call finishes.
 #[derive(Clone)]
 pub(crate) struct SlotHandle {
-    requests: mpsc::Sender<SlotRequest>,
+    requests: mpsc::SyncSender<SlotRequest>,
     wake: Option<Arc<Wake>>,
     health: Arc<AtomicU8>,
 }
@@ -110,9 +129,6 @@ enum CallSink {
     #[cfg(test)]
     Client(crate::channel::Reply),
     Completion(ReplySink),
-    /// Replaced out of a local sink before a successful insert; only exists so a
-    /// validation error can return the `FnOnce` sink to its caller.
-    Empty,
 }
 
 impl SlotHandle {
@@ -129,19 +145,30 @@ impl SlotHandle {
             client,
             done,
         };
-        if let Err(error) = self.requests.send(request) {
-            let request = error.0;
-            let failure = Failure::new(
-                Class::NotRunning,
-                Retry::After(std::time::Duration::from_secs(1)),
-                "service runtime is gone",
-            );
-            return Err((failure, request.done));
+        match self.requests.try_send(request) {
+            Ok(()) => {
+                if let Some(wake) = &self.wake {
+                    wake.notify();
+                }
+                Ok(())
+            }
+            Err(mpsc::TrySendError::Full(request)) => Err((
+                Failure::new(
+                    Class::Busy,
+                    Retry::After(std::time::Duration::from_millis(100)),
+                    "too many queued calls",
+                ),
+                request.done,
+            )),
+            Err(mpsc::TrySendError::Disconnected(request)) => Err((
+                Failure::new(
+                    Class::NotRunning,
+                    Retry::After(std::time::Duration::from_secs(1)),
+                    "service runtime is gone",
+                ),
+                request.done,
+            )),
         }
-        if let Some(wake) = &self.wake {
-            wake.notify();
-        }
-        Ok(())
     }
 
     pub(crate) fn probe(&self) -> Settled {
@@ -177,7 +204,7 @@ impl SlotHandle {
     pub(crate) fn scripted(
         respond: impl Fn(&Invocation) -> Result<Value, Failure> + Send + 'static,
     ) -> SlotHandle {
-        let (requests, receiver) = mpsc::channel::<SlotRequest>();
+        let (requests, receiver) = mpsc::sync_channel::<SlotRequest>(CALL_QUEUE);
         thread::spawn(move || {
             for request in receiver {
                 let outcome = respond(&request.invocation);
@@ -236,8 +263,8 @@ struct PendingCall {
     progress_token: Option<String>,
     /// Progress notifications go here while the call is in flight.
     client: Option<crate::channel::Reply>,
-    /// Final result: projected for the legacy channel path, or handed to a
-    /// blocking worker.
+    /// Final result: projected for the legacy channel path, or delivered to the
+    /// caller's completion sink.
     sink: CallSink,
 }
 
@@ -268,7 +295,7 @@ impl Slot {
         lifecycle: Option<Lifecycle>,
         restart: Restart,
     ) -> Self {
-        let (request_tx, request_rx) = mpsc::channel();
+        let (request_tx, request_rx) = mpsc::sync_channel(CALL_QUEUE);
         Slot {
             id,
             machine: Machine::new(restart),
@@ -464,7 +491,7 @@ impl Slot {
 
     fn drain_requests(&mut self, now: u64) {
         while let Ok(request) = self.request_rx.try_recv() {
-            let mut sink = CallSink::Completion(request.done);
+            let mut sink = Some(CallSink::Completion(request.done));
             if let Err(error) = self.request_invocation_sink(
                 request.invocation,
                 None,
@@ -472,7 +499,9 @@ impl Slot {
                 request.client,
                 &mut sink,
             ) {
-                self.finish_sink(None, sink, Err(call_error_failure(error)));
+                if let Some(sink) = sink.take() {
+                    self.finish_sink(None, sink, Err(call_error_failure(error)));
+                }
             }
         }
     }
@@ -524,7 +553,7 @@ impl Slot {
         reply: crate::channel::Reply,
     ) -> Result<(), CallError> {
         let client = Some(reply.clone());
-        let mut sink = CallSink::Client(reply);
+        let mut sink = Some(CallSink::Client(reply));
         self.request_invocation_sink(invocation, external_id, now, client, &mut sink)
     }
 
@@ -534,7 +563,7 @@ impl Slot {
         external_id: Option<Value>,
         now: u64,
         client: Option<crate::channel::Reply>,
-        sink: &mut CallSink,
+        sink: &mut Option<CallSink>,
     ) -> Result<(), CallError> {
         if let Some(contract) = &self.contract {
             if contract.capability(&invocation.capability).is_none() {
@@ -613,7 +642,7 @@ impl Slot {
                 deadline,
                 progress_token: invocation.progress.as_ref().map(|token| token.as_str().to_string()),
                 client,
-                sink: std::mem::replace(sink, CallSink::Empty),
+                sink: sink.take().expect("call sink must be present"),
             },
         );
         Ok(())
@@ -1091,22 +1120,22 @@ impl Slot {
         self.finish_sink(pending.external_id, pending.sink, outcome);
     }
 
+    #[cfg_attr(not(test), allow(unused_variables))]
     fn finish_sink(
         &self,
-        _external_id: Option<Value>,
+        external_id: Option<Value>,
         sink: CallSink,
         outcome: Result<Value, Failure>,
     ) {
         match sink {
             #[cfg(test)]
             CallSink::Client(reply) => {
-                let line = self.project(_external_id, outcome);
+                let line = self.project(external_id, outcome);
                 reply.send(line);
             }
             CallSink::Completion(done) => {
                 done(outcome.map(Reply::Value));
             }
-            CallSink::Empty => {}
         }
     }
 
@@ -1910,6 +1939,80 @@ mod tests {
             result,
             Err(CallError::Failed(failure)) if failure.class == Class::Busy
         ));
+    }
+
+    #[test]
+    fn a_full_call_queue_reports_busy() {
+        let slot = slot();
+        let handle = slot.handle();
+        for _ in 0..CALL_QUEUE {
+            handle
+                .submit(
+                    Invocation::new("echo", json!({}), Duration::from_secs(1)),
+                    None,
+                    Box::new(|_: Result<Reply, Failure>| {}),
+                )
+                .unwrap_or_else(|_| panic!("the queue must accept a call"));
+        }
+        let (failure, _done) = match handle.submit(
+            Invocation::new("echo", json!({}), Duration::from_secs(1)),
+            None,
+            Box::new(|_: Result<Reply, Failure>| {}),
+        ) {
+            Ok(()) => panic!("a full queue must report backpressure"),
+            Err(pair) => pair,
+        };
+        assert_eq!(failure.class, Class::Busy);
+    }
+
+    #[test]
+    fn a_timed_out_completion_sink_is_called() {
+        let mut slot = slot();
+        slot.machine.state = State::Running;
+        let (tx, rx) = mpsc::channel();
+        slot.pending.insert(
+            7,
+            PendingCall {
+                external_id: Some(json!(107)),
+                capability: "echo".into(),
+                deadline: 10,
+                progress_token: None,
+                client: None,
+                sink: CallSink::Completion(Box::new(move |outcome| {
+                    let _ = tx.send(outcome);
+                })),
+            },
+        );
+
+        slot.expire_pending(10);
+
+        match rx.try_recv().expect("completion") {
+            Err(failure) => assert_eq!(failure.class, Class::Timeout),
+            Ok(reply) => panic!("a timed out call must fail, got {reply:?}"),
+        }
+    }
+
+    #[test]
+    fn dropping_a_slot_fails_a_queued_call() {
+        let slot = slot();
+        let handle = slot.handle();
+        let (tx, rx) = mpsc::channel();
+        handle
+            .submit(
+                Invocation::new("echo", json!({}), Duration::from_secs(1)),
+                None,
+                Box::new(move |outcome| {
+                    let _ = tx.send(outcome);
+                }),
+            )
+            .unwrap_or_else(|_| panic!("the queue must accept a call"));
+
+        drop(slot);
+
+        match rx.try_recv().expect("completion") {
+            Err(failure) => assert_eq!(failure.class, Class::NotRunning),
+            Ok(reply) => panic!("a dropped slot must not report success: {reply:?}"),
+        }
     }
 
     #[test]

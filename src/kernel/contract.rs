@@ -431,18 +431,10 @@ impl Instance {
             Ok(Ok(reply)) => Ok(reply),
             Ok(Err(failure)) => Err(CallError::Failed(failure)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                Err(CallError::Failed(Failure::new(
-                    Class::Timeout,
-                    Retry::After(Duration::from_secs(1)),
-                    "test call timed out",
-                )))
+                panic!("adapter did not call the completion sink before the test deadline")
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                Err(CallError::Failed(Failure::new(
-                    Class::NotRunning,
-                    Retry::After(Duration::from_secs(1)),
-                    "test call sink disconnected",
-                )))
+                panic!("adapter dropped the completion sink without calling it")
             }
         }
     }

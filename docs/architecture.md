@@ -383,7 +383,7 @@ flowchart LR
     S5 --> S6["6 目录纯搬家"]
     S6 --> DONE["目标树"]
 
-    NOW["当前：0–2 完成<br/>S1 已回调化"]:::current
+    NOW["当前：0–2 部分完成<br/>S1 已回调化"]:::current
     NOW -.->|下一步| S3
 
     classDef current fill:#ffe08a,stroke:#b8860b,stroke-width:3px,color:#000
