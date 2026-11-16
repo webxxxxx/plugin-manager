@@ -16,6 +16,20 @@ use crate::rpc;
 #[cfg(not(unix))]
 use crate::threads;
 
+/// One message from an outbound streaming management call. The control
+/// channel owns this shape; the MCP session consumes it. Only the Unix
+/// reactor produces it today, so Windows sees the type unused.
+#[derive(Debug)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub enum ProgressEvent {
+    /// A progress notification line (a JSON-RPC message without an id).
+    Frame(String),
+    /// The final JSON-RPC response line.
+    Final(String),
+    /// The outbound stream could not be opened or read.
+    Error(String),
+}
+
 pub struct PendingCall {
     pub line: String,
     pub reply: Reply,

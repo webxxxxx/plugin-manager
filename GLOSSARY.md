@@ -108,8 +108,8 @@ MCP 客户端与服务器使用的协议形态：modern 用 `2026-07-28` 的每�
 _Avoid_: 版本（具体版本号是日期；Era 是协议形态）
 
 **Streamable HTTP**:
-MCP 的 HTTP 传输：单个 `POST /mcp` 端点，每个请求独立、无 session；v1 只返回 JSON，不开 SSE。
-_Avoid_: HTTP MCP server、SSE 传输（v1 没有 SSE）
+MCP 的 HTTP 传输：单个 `POST /mcp` 端点，每个请求独立、无 session；普通请求返回一个 JSON，带 progress token 的 `tools/call` 用 SSE 逐条返回进度，最终结果仍是同一流里的最后一条 message。
+_Avoid_: HTTP MCP server、SSE 传输（SSE 只属于流式 `tools/call`，不是整个传输）
 
 **启动（Start）**:
 让一个死服务进入 ready 的准入动作；死服务在可调用面上唯一暴露的能力。

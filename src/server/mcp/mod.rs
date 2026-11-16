@@ -5,3 +5,4 @@
 
 #[cfg_attr(not(all(feature = "http", unix)), allow(dead_code))]
 pub mod progress;
+pub mod result;

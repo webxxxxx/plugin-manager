@@ -11,22 +11,24 @@
 //! arrive, then the final JSON-RPC response, then the terminating chunk. The
 //! receiver is the reactor's bounded queue (64 events), so a slow client
 //! backpressures the upstream socket instead of growing a handler-side queue;
-//! at most one unflushed event is held here.
+//! at most one unflushed event is held here, and the reactor refuses frames
+//! larger than its IPC frame limit, so that event is bounded.
 
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::mcp;
+use crate::channel::ProgressEvent;
 use crate::rpc;
 use crate::server::http::{
     CloseReason, OutBuffer, StreamAction, StreamClass, StreamEvent, StreamHandler, StreamStep,
 };
+use crate::server::mcp::result::finish_modern_tool_call;
 
 /// The bound on progress events between the reactor and one stream. The old
-/// `start_mcp_sse` used the same 64-slot channel.
-pub const PROGRESS_QUEUE: usize = 64;
+/// `start_mcp_sse` used the same 64-slot channel; the count did not change.
+pub const PROGRESS_QUEUE_SLOTS: usize = 64;
 
 /// The legacy poll cadence of the server loop. Waiting for the next event
 /// schedules a tick this far ahead instead of waiting for the transfer bound.
@@ -38,19 +40,6 @@ Cache-Control: no-cache\r\n\
 Connection: keep-alive\r\n\
 Transfer-Encoding: chunked\r\n\r\n";
 const END: &[u8] = b"0\r\n\r\n";
-
-/// One message from the outbound management stream behind a streaming
-/// `tools/call`. It is platform-neutral so the state machine can be tested
-/// without a reactor, a socket or a real clock.
-#[derive(Debug)]
-pub enum ProgressEvent {
-    /// A progress notification line (a JSON-RPC message without an id).
-    Frame(String),
-    /// The final JSON-RPC response line.
-    Final(String),
-    /// The outbound stream could not be opened or read.
-    Error(String),
-}
 
 /// Cancel one outbound streaming call. The server loop uses the reactor; a
 /// unit test uses a recording closure.
@@ -101,8 +90,20 @@ impl McpSseStream {
 
     fn cancel_upstream(&mut self) {
         if self.final_seen {
-            // The reactor removes a stream when its final frame was delivered;
-            // there is nothing left to cancel.
+            return;
+        }
+        // The final frame may already be queued but not written yet: the
+        // reactor removes the stream when it delivers that frame, so
+        // cancelling it would target an id that is already gone. Drain only
+        // to find out; the queued progress frames are moot once the client
+        // disconnected.
+        while let Ok(event) = self.receiver.try_recv() {
+            if matches!(event, ProgressEvent::Final(_)) {
+                self.final_seen = true;
+                break;
+            }
+        }
+        if self.final_seen {
             return;
         }
         if let Some(cancel) = self.cancel.take() {
@@ -232,7 +233,7 @@ fn sse_chunk(line: &str) -> Vec<u8> {
 }
 
 fn final_chunk(id: Option<Value>, response: rpc::Response) -> Vec<u8> {
-    let response = mcp::finish_modern_tool_call(id, response);
+    let response = finish_modern_tool_call(id, response);
     let mut bytes = sse_chunk(&rpc::to_line(&response));
     bytes.extend_from_slice(END);
     bytes
@@ -485,6 +486,26 @@ mod tests {
             *h.cancels.lock().expect("cancels"),
             vec![42],
             "a drop after the close must not cancel twice"
+        );
+    }
+
+    #[test]
+    fn a_final_frame_waiting_in_the_queue_is_not_cancelled() {
+        let mut h = harness();
+        h.sender
+            .send(ProgressEvent::Final(final_line("pong")))
+            .expect("final");
+        let step = h.stream.on_event(
+            StreamEvent::Closed(CloseReason::PeerClosed),
+            &mut OutBuffer::new(&mut Vec::new(), 0),
+        );
+        assert!(matches!(
+            step.action,
+            StreamAction::Close(CloseReason::PeerClosed)
+        ));
+        assert!(
+            h.cancels.lock().expect("cancels").is_empty(),
+            "a queued final means the reactor already finished the call"
         );
     }
 

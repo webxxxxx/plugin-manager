@@ -18,8 +18,8 @@ use std::thread;
 use serde_json::Value;
 
 use crate::channel;
+use crate::channel::ProgressEvent;
 use crate::ipc;
-use crate::server::mcp::progress::ProgressEvent;
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
@@ -326,5 +326,51 @@ fn drain_connection(connection: &mut Connection) -> bool {
             }
             Err(TrySendError::Disconnected(_)) => return false,
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reactor must not drop or reorder progress when the consumer queue is
+    /// full: it keeps one pending event and stops reading the upstream socket
+    /// (that is the backpressure). The next pass delivers the held event.
+    #[test]
+    fn a_full_progress_queue_holds_the_event_instead_of_dropping_it() {
+        let (stream, _writer) = UnixStream::pair().expect("pair");
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut connection = Connection {
+            stream,
+            buffer: Vec::new(),
+            sender,
+            blocked: false,
+            pending: None,
+        };
+        connection.buffer = concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\n",
+        )
+        .as_bytes()
+        .to_vec();
+
+        assert!(drain_connection(&mut connection));
+        assert!(
+            connection.blocked,
+            "a full queue stops the reactor from reading more frames"
+        );
+        assert!(
+            matches!(connection.pending, Some(ProgressEvent::Frame(_))),
+            "the frame that did not fit is held, not dropped"
+        );
+
+        let first = receiver.try_recv().expect("first frame");
+        assert!(matches!(first, ProgressEvent::Frame(line) if line.contains("progress")));
+
+        // The reactor clears blocked before retrying on the next pass.
+        connection.blocked = false;
+        assert!(drain_connection(&mut connection));
+        let second = receiver.try_recv().expect("the held frame is retried");
+        assert!(matches!(second, ProgressEvent::Frame(line) if line.contains("message")));
+        assert!(connection.pending.is_none());
     }
 }

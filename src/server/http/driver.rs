@@ -54,9 +54,9 @@ impl StreamDriver {
     /// starting the plugin call. The permit is released when the driver drops.
     pub fn admit_reserved(
         handler: Box<dyn StreamHandler>,
-        permit: Option<super::budget::StreamPermit>,
+        permit: super::budget::StreamPermit,
     ) -> StreamDriver {
-        StreamDriver::new(handler, permit)
+        StreamDriver::new(handler, Some(permit))
     }
 
     fn new(
