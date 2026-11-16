@@ -1888,6 +1888,185 @@ fn a_slow_file_bundle_reader_drops_the_stream_cap_and_leaves_the_loop_free() {
     assert_slow_download_holds_the_cap(&address, &format!("/api/v1/file/{}", id), &content);
 }
 
+fn has_staging(dir: &Path) -> bool {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(".upload-") || name.starts_with(".part-") {
+                return true;
+            }
+            if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                stack.push(entry.path());
+            }
+        }
+    }
+    false
+}
+
+fn wait_for_staging(dir: &Path) {
+    for _ in 0..300 {
+        if has_staging(dir) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("upload staging file did not appear under {}", dir.display());
+}
+
+fn wait_for_no_staging(dir: &Path) {
+    for _ in 0..300 {
+        if !has_staging(dir) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!(
+        "upload staging file was not removed under {}",
+        dir.display()
+    );
+}
+
+/// Open an upload and send only the head plus a first chunk. The server has a
+/// valid content-length but the body is deliberately left unfinished.
+fn start_stalled_upload(
+    address: &str,
+    method: &str,
+    path: &str,
+    declared: usize,
+    initial: &[u8],
+) -> TcpStream {
+    let mut stream = TcpStream::connect(address).expect("stalled upload connect");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("stalled upload write timeout");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("stalled upload read timeout");
+    let head = format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+        method, path, address, declared
+    );
+    stream.write_all(head.as_bytes()).expect("upload head");
+    stream.write_all(initial).expect("upload initial body");
+    stream
+}
+
+fn second_upload_status(address: &str) -> (u16, Vec<(String, String)>) {
+    let mut stream = TcpStream::connect(address).expect("second upload connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("second upload timeout");
+    let head = format!(
+        "POST /api/v1/blobs HTTP/1.1\r\nHost: {}\r\nContent-Length: 1\r\nConnection: close\r\n\r\n",
+        address
+    );
+    stream
+        .write_all(head.as_bytes())
+        .expect("second upload head");
+    read_response_head(&mut stream)
+}
+
+/// A stalled upload holds one long-lived max_streams slot, keeps the loop
+/// serving other requests, and releases its staging file on disconnect.
+#[test]
+fn a_slow_upload_holds_the_stream_cap_and_leaves_no_staging_file() {
+    let mut sandbox = Sandbox::new();
+    sandbox.allow_insecure_install_with("max_streams = 1\n");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let temp = sandbox.data.join("temp");
+
+    let initial = vec![0x5a; 64 * 1024];
+    let stalled = start_stalled_upload(
+        &address,
+        "POST",
+        "/api/v1/blobs",
+        32 * 1024 * 1024,
+        &initial,
+    );
+    wait_for_staging(&temp);
+
+    let version = raw_request(&address, "GET", "/api/v1/version", "", b"");
+    assert_eq!(version.status, 200, "an upload must not block the loop");
+
+    let (status, headers) = second_upload_status(&address);
+    assert_eq!(status, 503, "the stalled upload owns the only stream slot");
+    assert!(
+        headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("retry-after") && value == "1"),
+        "busy upload keeps Retry-After: 1: {:?}",
+        headers
+    );
+
+    drop(stalled);
+    wait_for_no_staging(&temp);
+
+    let put = raw_request(
+        &address,
+        "POST",
+        "/api/v1/blobs",
+        "application/octet-stream",
+        b"after release",
+    );
+    assert_eq!(put.status, 200, "{:?}", put.body);
+}
+
+#[test]
+fn a_disconnected_part_upload_removes_its_staging_file() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let created = request(&address, "POST", "/api/v1/blobs/uploads", "", b"");
+    assert_eq!(created.status, 200, "{}", created.body);
+    let upload_id = created.body["uploadId"]
+        .as_str()
+        .expect("upload id")
+        .to_string();
+    let path = format!("/api/v1/blobs/uploads/{}/parts/1", upload_id);
+    let temp = sandbox.data.join("temp");
+
+    let initial = vec![0x5a; 64 * 1024];
+    let stalled = start_stalled_upload(&address, "PUT", &path, 32 * 1024 * 1024, &initial);
+    wait_for_staging(&temp);
+    drop(stalled);
+    wait_for_no_staging(&temp);
+}
+
+/// The upload used to take the connection out of the loop and spawn a
+/// `svcd-blob-http` thread. It is a stream handler now, so a stalled upload must
+/// not add a daemon thread.
+#[cfg(target_os = "linux")]
+#[test]
+fn unix_upload_has_no_takeover_thread() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let pid = sandbox.daemon.as_ref().expect("running daemon").id();
+    let idle = stable_thread_count(pid);
+
+    let initial = vec![0x5a; 64 * 1024];
+    let stalled = start_stalled_upload(
+        &address,
+        "POST",
+        "/api/v1/blobs",
+        32 * 1024 * 1024,
+        &initial,
+    );
+    wait_for_staging(&sandbox.data.join("temp"));
+
+    assert_eq!(
+        stable_thread_count(pid),
+        idle,
+        "a blob upload must not add a takeover thread"
+    );
+    drop(stalled);
+}
+
 #[test]
 fn file_part_2mib_upload_round_trip() {
     let mut sandbox = Sandbox::new();
@@ -3569,6 +3748,18 @@ fn password_auth_bearer_cookie_csrf() {
         &[("Cookie", api_cookie.as_str())],
     );
     assert_eq!(no_csrf.status, 403);
+
+    // The blob upload face applies the same cookie-write CSRF policy as the
+    // buffered management routes.
+    let blob_no_csrf = raw_request_with(
+        &address,
+        "POST",
+        "/api/v1/blobs",
+        "application/octet-stream",
+        b"blob body",
+        &[("Cookie", api_cookie.as_str())],
+    );
+    assert_eq!(blob_no_csrf.status, 403);
 
     let origin = format!("http://{}", address);
     let csrf = request_with(

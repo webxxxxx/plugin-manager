@@ -5,16 +5,17 @@
 //! worker/takeover path alive until #115-#125 move them to the face. The queue
 //! is bounded; a full queue answers 503 instead of growing without limit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::io::{AsRawFd, RawFd};
 
 use crate::server::http::budget::StreamPermit;
 use crate::server::http::driver::{StreamAdmission, StreamDriver};
 use crate::server::http::engine::{self, HttpRequest, LegacyBridge, PreRequest, Table};
+use crate::server::http::pool::PoolJob;
 use crate::server::http::StreamClass;
 use crate::server::http::{
-    complete_blocking, dispatch_inline, BlockingPool, BodyPolicy, Busy, CancelToken,
-    CompletionSlot, Dispatch, Exchange, Face, JobOutcome, StreamHandler,
+    complete_blocking, dispatch_inline, BlockingJob, BlockingOutcome, BlockingPool, BodyPolicy,
+    Busy, CancelToken, CompletionSlot, Dispatch, Exchange, Face, JobOutcome, StreamHandler,
 };
 use crate::server::mcp::progress::{McpSseStream, PROGRESS_QUEUE_SLOTS};
 
@@ -96,6 +97,8 @@ pub(crate) fn start(
                 face,
                 blocking,
                 blocking_pending: HashMap::new(),
+                stream_jobs: HashMap::new(),
+                stream_job_deferred: HashSet::new(),
             };
             engine::run(listener, &mut handler, crate::limits::current());
         })?;
@@ -113,6 +116,12 @@ struct ServerHandler {
     face: Arc<dyn Face>,
     blocking: BlockingPool,
     blocking_pending: HashMap<u64, PendingBlocking>,
+    /// One in-flight blocking job per stream connection (an upload chunk or a
+    /// finalize). Completion resumes the handler; disconnect cancels it.
+    stream_jobs: HashMap<u64, mpsc::Receiver<BlockingOutcome>>,
+    /// Connections already logged as paused by a full blocking queue; cleared
+    /// when the job is accepted or the connection closes.
+    stream_job_deferred: HashSet<u64>,
 }
 
 impl LegacyBridge for ServerHandler {
@@ -184,17 +193,8 @@ impl LegacyBridge for ServerHandler {
                 });
             return PreRequest::Close;
         }
-        if let Some((stream, head, initial, route)) = blob_takeover(connection) {
-            let lan = self.lan.clone();
-            let _ = thread::Builder::new()
-                .name("svcd-blob-http".into())
-                .stack_size(threads::transfer_stack())
-                .spawn(move || {
-                    let mut stream = stream;
-                    let _ = stream.set_nonblocking(false);
-                    let _ = blob_http::serve(&mut stream, &head, &initial, &lan, route);
-                });
-            return PreRequest::Close;
+        if let Some(outcome) = self.blob_upload_stream(connection) {
+            return outcome;
         }
         PreRequest::Continue
     }
@@ -268,6 +268,7 @@ impl LegacyBridge for ServerHandler {
                             // The slot reserved above becomes the driver's
                             // `max_streams` permit.
                             attach_stream(connection, Box::new(handler), &[], Some(permit));
+                            self.submit_stream_job(connection);
                         }
                         Err(error) => write_response(
                             connection,
@@ -339,7 +340,11 @@ impl LegacyBridge for ServerHandler {
 
     fn on_readable(&mut self, connection: &mut Connection) -> bool {
         if matches!(&connection.state, ConnState::Stream(_)) {
-            return stream_readable(connection);
+            let keep = stream_readable(connection);
+            if keep {
+                self.submit_stream_job(connection);
+            }
+            return keep;
         }
         match &connection.state {
             ConnState::Sse(_) => {
@@ -363,7 +368,11 @@ impl LegacyBridge for ServerHandler {
 
     fn on_writable(&mut self, connection: &mut Connection) -> bool {
         if matches!(&connection.state, ConnState::Stream(_)) {
-            return stream_writable(connection);
+            let keep = stream_writable(connection);
+            if keep {
+                self.submit_stream_job(connection);
+            }
+            return keep;
         }
         match &connection.state {
             ConnState::Ws(_) => drive_ws(connection, connection.id, &self.queue, false),
@@ -424,6 +433,46 @@ impl LegacyBridge for ServerHandler {
                     }
                 }
                 WorkResult::BlockingDone { key, outcome } => {
+                    if let Some(receiver) = self.stream_jobs.remove(&key) {
+                        // Finished must carry a result; a cancelled/dropped
+                        // job means the connection or daemon is going away,
+                        // so close it rather than inventing a handler failure.
+                        let blocking_outcome = match outcome {
+                            JobOutcome::Finished => {
+                                Some(receiver.try_recv().unwrap_or_else(|_| {
+                                    BlockingOutcome::Failed(
+                                        "stream job finished without a result".into(),
+                                    )
+                                }))
+                            }
+                            JobOutcome::Cancelled | JobOutcome::Dropped => None,
+                        };
+                        let Some(blocking_outcome) = blocking_outcome else {
+                            if let Some(mut connection) = connections.remove(&key) {
+                                self.on_close(&mut connection);
+                            }
+                            continue;
+                        };
+                        if let Some(connection) = connections.get_mut(&key) {
+                            let keep = {
+                                let Connection {
+                                    state, out, out_at, ..
+                                } = connection;
+                                match state {
+                                    ConnState::Stream(driver) => {
+                                        driver.on_blocking_done(blocking_outcome, out, out_at)
+                                    }
+                                    _ => true,
+                                }
+                            };
+                            if keep {
+                                self.submit_stream_job(connection);
+                            } else if let Some(mut connection) = connections.remove(&key) {
+                                self.on_close(&mut connection);
+                            }
+                        }
+                        continue;
+                    }
                     let Some(pending) = self.blocking_pending.remove(&key) else {
                         // Cancel/drop outcomes are expected after a disconnect:
                         // on_close already sealed and removed the slot. A
@@ -537,7 +586,13 @@ impl LegacyBridge for ServerHandler {
             .collect();
         for id in stream_ids {
             let keep = match connections.get_mut(&id) {
-                Some(connection) => stream_tick(connection, now),
+                Some(connection) => {
+                    let keep = stream_tick(connection, now);
+                    if keep {
+                        self.submit_stream_job(connection);
+                    }
+                    keep
+                }
                 None => true,
             };
             if !keep {
@@ -561,7 +616,8 @@ impl LegacyBridge for ServerHandler {
             ConnState::Sse(_) => libc::POLLIN,
             ConnState::Ws(_) => libc::POLLIN,
             ConnState::RawWs(_) => libc::POLLIN,
-            ConnState::Stream(_) => libc::POLLIN,
+            ConnState::Stream(_) if stream_wants_read(connection) => libc::POLLIN,
+            ConnState::Stream(_) => 0,
             ConnState::Processing => 0,
         };
         if connection.out_at < connection.out.len() || stream_has_file(connection) {
@@ -578,13 +634,17 @@ impl LegacyBridge for ServerHandler {
     fn on_close(&mut self, connection: &mut Connection) {
         // Replacing or dropping ConnState::Stream drops the driver, which
         // delivers the handler's `Closed` event.
+        self.stream_jobs.remove(&connection.id);
+        self.stream_job_deferred.remove(&connection.id);
         if let Some(pending) = self.blocking_pending.remove(&connection.id) {
             // Seal the slot first: a job that finishes after this point writes
             // into a sealed slot and is ignored. Then free a queued slot or
             // flip a running job's cancellation token.
             pending.slot.take();
-            self.blocking.cancel(connection.id);
         }
+        // A queued stream job is dropped; a running one sees the token and
+        // drops its result. Either way the connection key is released.
+        self.blocking.cancel(connection.id);
     }
 
     fn on_poll_error(&mut self, connection: &mut Connection, revents: i16) {
@@ -599,10 +659,80 @@ impl LegacyBridge for ServerHandler {
 }
 
 impl ServerHandler {
+    /// Claim a blob/file upload before its body is buffered, resolve auth and
+    /// endpoint policy once, then attach the sans-IO upload handler. Any
+    /// already-read body bytes are delivered as the first data event.
+    fn blob_upload_stream(&mut self, connection: &mut Connection) -> Option<PreRequest> {
+        if connection.pending.is_some() {
+            return None;
+        }
+        let header_end = http::header_end(&connection.buffer)?;
+        if header_end > crate::limits::current().max_header {
+            return None;
+        }
+        let (head, body_start) = http::parse_head(&connection.buffer[..header_end + 4])?;
+        crate::face::blob_upload::upload_target(&head)?;
+        let exchange = match crate::face::blob_upload::exchange(&head, &self.lan) {
+            Ok(exchange) => exchange,
+            Err(response) => {
+                write_response(connection, response, false);
+                return Some(PreRequest::Handled);
+            }
+        };
+        let Exchange::Stream(handler) = exchange else {
+            write_response(
+                connection,
+                http::json_error(
+                    500,
+                    "internal",
+                    "a streamed upload route returned a memory response",
+                ),
+                false,
+            );
+            return Some(PreRequest::Handled);
+        };
+        let initial = connection.buffer.split_off(body_start);
+        connection.buffer.clear();
+        attach_stream(connection, handler, &initial, None);
+        self.submit_stream_job(connection);
+        Some(PreRequest::Handled)
+    }
+
+    /// Hand one pending stream job to the blocking pool. A full queue keeps
+    /// the job in the driver and retries on the next tick, so an upload chunk
+    /// is never lost; input stays paused while the job is pending or running.
+    fn submit_stream_job(&mut self, connection: &mut Connection) {
+        let Some(job) = take_stream_job(connection) else {
+            return;
+        };
+        match submit_stream_job_to(&self.blocking, &mut self.stream_jobs, connection.id, job) {
+            Ok(()) => {
+                self.stream_job_deferred.remove(&connection.id);
+                mark_stream_blocking(connection);
+            }
+            Err((busy, job)) => {
+                // Queue full or already in flight: keep the job in the driver.
+                // A later tick retries; input stays paused. The pause is bounded
+                // by the driver's transfer deadline. Log it once per connection
+                // so a saturated pool is visible rather than silent.
+                restore_stream_job(connection, job);
+                if busy != Busy::Closed && self.stream_job_deferred.insert(connection.id) {
+                    log::svcd(&format!(
+                        "svcd: upload paused: blocking pool queue is full (connection {})",
+                        connection.id
+                    ));
+                }
+                if busy == Busy::Closed {
+                    log::svcd("svcd: stream job deferred: blocking pool is closing");
+                }
+            }
+        }
+    }
+
     /// The plugin UI asset path: decide the route before the body is read,
     /// resolve the principal once, then attach the sans-IO handler to the
     /// connection. Returns \`None\` when this request is not a static asset.
-    fn plugin_ui_stream(&self, connection: &mut Connection) -> Option<PreRequest> {
+    fn plugin_ui_stream(&mut self, connection: &mut Connection) -> Option<PreRequest> {
         if connection.pending.is_some() {
             return None;
         }
@@ -642,6 +772,7 @@ impl ServerHandler {
         let initial = connection.buffer.split_off(body_start);
         connection.buffer.clear();
         attach_stream(connection, handler, &initial, None);
+        self.submit_stream_job(connection);
         Some(PreRequest::Handled)
     }
 
@@ -692,6 +823,7 @@ impl ServerHandler {
                         // handler may own a file range and the wire head says
                         // `Connection: close`.
                         attach_stream(connection, handler, &[], None);
+                        self.submit_stream_job(connection);
                     }
                     Err(cause) => {
                         let response = http::json_error(500, "internal", &cause.message());
@@ -806,8 +938,78 @@ fn finish_stream(connection: &mut Connection) {
     connection.state = ConnState::Writing;
 }
 
+type StreamJobs = HashMap<u64, mpsc::Receiver<BlockingOutcome>>;
+
+/// Queue one stream job, handing it back when the pool refuses it. The caller
+/// keeps it in the driver and retries; a refused chunk is never dropped.
+fn submit_stream_job_to(
+    pool: &BlockingPool,
+    jobs: &mut StreamJobs,
+    key: u64,
+    job: BlockingJob,
+) -> Result<(), (Busy, BlockingJob)> {
+    let cell = Arc::new(Mutex::new(Some(job)));
+    let job_cell = cell.clone();
+    let (sender, receiver) = mpsc::channel();
+    let work: PoolJob = Box::new(move |cancel| {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let Some(job) = job_cell
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        else {
+            return;
+        };
+        let outcome = job();
+        let _ = sender.send(outcome);
+    });
+    match pool.try_submit_boxed(key, work) {
+        Ok(()) => {
+            jobs.insert(key, receiver);
+            Ok(())
+        }
+        Err((busy, work)) => {
+            drop(work);
+            let job = cell
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+                .expect("a refused job is still in its cell");
+            Err((busy, job))
+        }
+    }
+}
+
 fn stream_has_file(connection: &Connection) -> bool {
     matches!(&connection.state, ConnState::Stream(driver) if driver.has_file())
+}
+
+fn stream_wants_read(connection: &Connection) -> bool {
+    match &connection.state {
+        ConnState::Stream(driver) => driver.wants_read(),
+        _ => true,
+    }
+}
+
+fn take_stream_job(connection: &mut Connection) -> Option<BlockingJob> {
+    match &mut connection.state {
+        ConnState::Stream(driver) => driver.take_blocking_job(),
+        _ => None,
+    }
+}
+
+fn restore_stream_job(connection: &mut Connection, job: BlockingJob) {
+    if let ConnState::Stream(driver) = &mut connection.state {
+        driver.restore_blocking_job(job);
+    }
+}
+
+fn mark_stream_blocking(connection: &mut Connection) {
+    if let ConnState::Stream(driver) = &mut connection.state {
+        driver.begin_blocking();
+    }
 }
 
 fn stream_readable(connection: &mut Connection) -> bool {
@@ -971,5 +1173,55 @@ mod tests {
         );
         assert!(text.contains("Retry-After: 1"), "{text}");
         assert!(text.contains("legacy request queue is full"), "{text}");
+    }
+
+    #[test]
+    fn a_full_stream_queue_hands_the_job_back_and_a_retry_runs_it() {
+        use std::time::Duration;
+
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let pool = BlockingPool::start(1, 1, move |key, outcome| {
+            let _ = finished_tx.send((key, outcome));
+        })
+        .expect("pool");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        pool.try_submit(1, move |_| {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+        })
+        .expect("worker job");
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker started");
+        pool.try_submit(2, |_| {}).expect("queue is full");
+
+        let mut jobs: StreamJobs = HashMap::new();
+        let job: BlockingJob = Box::new(|| BlockingOutcome::Ok);
+        let (busy, job) = submit_stream_job_to(&pool, &mut jobs, 3, job)
+            .expect_err("a full queue refuses the chunk");
+        assert_eq!(busy, Busy::QueueFull);
+        assert!(jobs.is_empty(), "a refused job holds no completion slot");
+
+        release_tx.send(()).expect("release worker");
+        for _ in 0..2 {
+            finished_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("queued jobs finish");
+        }
+        if submit_stream_job_to(&pool, &mut jobs, 3, job).is_err() {
+            panic!("the queue has room after the worker drains");
+        }
+        let outcome = jobs
+            .remove(&3)
+            .expect("retry installed a completion slot")
+            .recv_timeout(Duration::from_secs(5))
+            .expect("retried job result");
+        assert!(matches!(outcome, BlockingOutcome::Ok));
+        let (key, result) = finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("retried job completion");
+        assert_eq!(key, 3);
+        assert_eq!(result, JobOutcome::Finished);
     }
 }

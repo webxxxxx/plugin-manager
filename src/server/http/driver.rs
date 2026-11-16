@@ -13,7 +13,8 @@ use crate::log;
 
 use super::budget::{Busy, StreamBudget, StreamPermit};
 use super::stream::{
-    CloseReason, FileSend, OutBuffer, StreamAction, StreamEvent, StreamHandler, StreamStep,
+    BlockingJob, BlockingOutcome, CloseReason, FileSend, OutBuffer, StreamAction, StreamEvent,
+    StreamHandler, StreamStep,
 };
 
 pub enum StreamAdmission {
@@ -35,6 +36,14 @@ pub struct StreamDriver {
     file: Option<FileSend>,
     /// The handler asked to finish; flush the output buffer, then close.
     closing: Option<CloseReason>,
+    /// A blocking job the handler wants the server loop to submit.
+    pending_job: Option<BlockingJob>,
+    /// A job is queued or running on the blocking pool. No socket reads and no
+    /// handler events run until its completion arrives.
+    blocking: bool,
+    /// When the handler last paused for a blocking job. A queued or running
+    /// job that makes no progress for the transfer timeout closes the stream.
+    paused: Option<Instant>,
     /// Held for long-lived streams, absent for one-shot responses.
     _permit: Option<StreamPermit>,
 }
@@ -70,12 +79,53 @@ impl StreamDriver {
             wakeup: deadline,
             file: None,
             closing: None,
+            pending_job: None,
+            blocking: false,
+            paused: None,
             _permit: permit,
         }
     }
 
     pub fn has_file(&self) -> bool {
         self.file.is_some()
+    }
+
+    /// Whether the server may read more request-body bytes. A pending or
+    /// running blocking job pauses input; the staged upload therefore applies
+    /// backpressure to the socket instead of growing a queue.
+    pub fn wants_read(&self) -> bool {
+        self.pending_job.is_none() && !self.blocking
+    }
+
+    /// Take the job the handler just submitted, for the server loop to hand to
+    /// the blocking pool.
+    pub fn take_blocking_job(&mut self) -> Option<BlockingJob> {
+        self.pending_job.take()
+    }
+
+    /// Put a job back after the pool refused it. The connection stays paused
+    /// and retries on the next tick.
+    pub fn restore_blocking_job(&mut self, job: BlockingJob) {
+        self.pending_job = Some(job);
+    }
+
+    /// Mark the taken job as queued/running. The next event is its completion.
+    pub fn begin_blocking(&mut self) {
+        self.blocking = true;
+        self.paused.get_or_insert_with(Instant::now);
+    }
+
+    /// Deliver a blocking job's result and let the handler decide what is next.
+    pub fn on_blocking_done(
+        &mut self,
+        outcome: BlockingOutcome,
+        out: &mut Vec<u8>,
+        out_at: &mut usize,
+    ) -> bool {
+        self.blocking = false;
+        self.paused = None;
+        self.touch();
+        self.on_event(StreamEvent::BlockingDone(outcome), out, out_at)
     }
 
     /// Emit the first response bytes. The engine only calls `on_writable`
@@ -106,6 +156,9 @@ impl StreamDriver {
         out_at: &mut usize,
         last_active: &mut Instant,
     ) -> bool {
+        if !self.wants_read() {
+            return true;
+        }
         let mut chunk = [0u8; 8 * 1024];
         match stream.read(&mut chunk) {
             Ok(0) => false,
@@ -155,6 +208,12 @@ impl StreamDriver {
             if self.closing.is_some() {
                 return false;
             }
+            if self.blocking || self.pending_job.is_some() {
+                // The handler is paused until its blocking job is submitted
+                // and completes; do not deliver a Writable that could submit a
+                // second job.
+                return true;
+            }
             if !self.on_event(StreamEvent::Writable, out, out_at) {
                 return false;
             }
@@ -172,6 +231,19 @@ impl StreamDriver {
         out_at: &mut usize,
         last_active: &mut Instant,
     ) -> bool {
+        if self.blocking || self.pending_job.is_some() {
+            // A queued/running job may take longer than one poll tick, but it
+            // must still make progress within the transfer timeout. This is
+            // the bound that stops a queue-full retry from pinning the slot.
+            if let Some(paused) = self.paused {
+                if now.saturating_duration_since(paused) >= limits::current().transfer_timeout {
+                    self.closing = Some(CloseReason::TimedOut);
+                    let _ = flush(stream, out, out_at, last_active);
+                    return false;
+                }
+            }
+            return true;
+        }
         if now < self.wakeup {
             return true;
         }
@@ -218,12 +290,9 @@ impl StreamDriver {
         }
         match step.action {
             StreamAction::Continue | StreamAction::NeedRead | StreamAction::NeedWrite => {}
-            // This slice has no blocking pool. The next server-loop slice
-            // (#116) hands this to it instead of closing the response.
-            StreamAction::SubmitBlocking(_) => {
-                self.closing = Some(CloseReason::Failed(
-                    "stream handlers cannot submit blocking jobs in this slice".into(),
-                ));
+            StreamAction::SubmitBlocking(job) => {
+                self.pending_job = Some(job);
+                self.paused.get_or_insert_with(Instant::now);
             }
             StreamAction::SendFile(send) => {
                 // The server sends this range after the output buffer drains,
@@ -235,6 +304,9 @@ impl StreamDriver {
             StreamAction::Close(reason) => {
                 self.closing = Some(reason);
             }
+        }
+        if self.pending_job.is_none() && !self.blocking {
+            self.paused = None;
         }
         !(self.closing.is_some() && self.file.is_none() && *out_at >= out_len)
     }
@@ -526,5 +598,72 @@ mod tests {
             driver.wakeup < driver.deadline,
             "the handler's short wakeup stays earlier than the bound"
         );
+    }
+
+    /// A handler that asks the pool for one job and resumes on its completion.
+    struct SubmitOnce {
+        submitted: bool,
+    }
+
+    impl StreamHandler for SubmitOnce {
+        fn on_event(&mut self, event: StreamEvent<'_>, _out: &mut OutBuffer<'_>) -> StreamStep {
+            match event {
+                StreamEvent::Data(_) if !self.submitted => {
+                    self.submitted = true;
+                    StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|| {
+                        BlockingOutcome::Ok
+                    })))
+                }
+                StreamEvent::BlockingDone(_) => StreamStep::wait(StreamAction::NeedRead),
+                _ => StreamStep::wait(StreamAction::Continue),
+            }
+        }
+    }
+
+    #[test]
+    fn a_blocking_job_pauses_input_until_its_completion() {
+        let mut driver = match StreamDriver::admit(Box::new(SubmitOnce { submitted: false }), 1) {
+            StreamAdmission::Admitted(driver) => driver,
+            StreamAdmission::Busy => panic!("the budget admits the handler"),
+        };
+        let mut out = Vec::new();
+        let mut out_at = 0;
+        assert!(driver.on_data(b"body", &mut out, &mut out_at));
+        assert!(
+            !driver.wants_read(),
+            "a submitted job pauses body reads until it finishes"
+        );
+        let job = driver
+            .take_blocking_job()
+            .expect("the handler submitted one job");
+        driver.begin_blocking();
+        assert!(!driver.wants_read(), "a running job keeps input paused");
+        drop(job);
+        assert!(driver.on_blocking_done(BlockingOutcome::Ok, &mut out, &mut out_at));
+        assert!(
+            driver.wants_read(),
+            "the completed job lets the handler request the next body chunk"
+        );
+    }
+
+    #[test]
+    fn a_paused_job_still_closes_at_the_transfer_bound() {
+        let mut driver = match StreamDriver::admit(Box::new(SubmitOnce { submitted: false }), 1) {
+            StreamAdmission::Admitted(driver) => driver,
+            StreamAdmission::Busy => panic!("the budget admits the handler"),
+        };
+        let mut out = Vec::new();
+        let mut out_at = 0;
+        assert!(driver.on_data(b"body", &mut out, &mut out_at));
+        let _job = driver
+            .take_blocking_job()
+            .expect("the handler submitted one job");
+        // The job was not submitted to a pool: it is a paused state, not a
+        // running job. It still cannot pin the stream forever.
+        let mut stream = socket();
+        let mut last_active = Instant::now();
+        let beyond = Instant::now() + limits::current().transfer_timeout + Duration::from_secs(1);
+        assert!(!driver.on_tick(beyond, &mut stream, &mut out, &mut out_at, &mut last_active));
+        assert_eq!(driver.closing, Some(CloseReason::TimedOut));
     }
 }

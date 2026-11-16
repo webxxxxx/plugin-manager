@@ -19,7 +19,6 @@ use std::time::Instant;
 #[derive(Debug)]
 pub enum StreamEvent<'a> {
     /// Connection or request-body bytes. A caller may split them anywhere.
-    #[allow(dead_code)] // #121 delivers upload bodies as data events.
     Data(&'a [u8]),
     /// The server drained the output buffer and can accept more.
     Writable,
@@ -27,7 +26,6 @@ pub enum StreamEvent<'a> {
     #[allow(dead_code)] // handlers that only close on a tick ignore the instant.
     Tick(Instant),
     /// A blocking job submitted by this handler finished.
-    #[allow(dead_code)] // #116/#118 resume through this event.
     BlockingDone(BlockingOutcome),
     /// The connection is gone. The handler must release its resources; no
     /// action can be delivered.
@@ -44,13 +42,10 @@ pub enum StreamAction {
     /// Nothing pending; wait for the next event the server already watches.
     Continue,
     /// The handler wants body bytes; keep reading the connection.
-    #[allow(dead_code)] // #121 upload handlers ask for body bytes.
     NeedRead,
     /// Output is pending; let the socket drain before asking again.
     NeedWrite,
     /// Run this on the blocking pool; resume through `BlockingDone`.
-    /// The S4 slice after this one wires the pool (#116).
-    #[allow(dead_code)] // #116 submits the first blocking job.
     SubmitBlocking(BlockingJob),
     /// Send this file range on the server's socket once the output buffer
     /// drains. The handler gives up the file handle; the server performs the
@@ -62,16 +57,16 @@ pub enum StreamAction {
     Close(CloseReason),
 }
 
-/// Work the handler wants the blocking pool to run. The pool returns the value
-/// through `StreamEvent::BlockingDone`; no connection handle is involved.
-#[allow(dead_code)] // #116 submits the first blocking job.
+/// Work the handler wants the blocking pool to run. The pool returns the
+/// outcome through `StreamEvent::BlockingDone`; no connection handle is
+/// involved.
 pub type BlockingJob = Box<dyn FnOnce() -> BlockingOutcome + Send + 'static>;
 
-/// The value a blocking job returns.
-#[allow(dead_code)] // #116 submits the first blocking job.
+/// The outcome of a blocking job. A job that needs a value stores it in its
+/// shared state; the stream event only carries pass/fail.
 #[derive(Debug)]
 pub enum BlockingOutcome {
-    Ok(Vec<u8>),
+    Ok,
     Failed(String),
 }
 
