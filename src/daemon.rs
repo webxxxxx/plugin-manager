@@ -2383,11 +2383,14 @@ while IFS= read -r line; do
     *'"name":"hang"'*) ;;
     *'"name":"crash"'*) exit 0 ;;
     *'"name":"progress"'*)
-      token=$(printf '%s' "$line" | sed -n 's/.*"_meta":{"progressToken":"\([^"]*\)"}.*/\1/p')
-      if [ -n "$token" ]; then
+      meta=$(printf '%s' "$line" | sed -n 's/.*"_meta":{\([^}]*\)}.*/\1/p')
+      token=$(printf '%s' "$meta" | sed -n 's/.*"progressToken":"\([^"]*\)".*/\1/p')
+      if [ -z "$token" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"progressToken must be under _meta"}}\n' "$id"
+      else
         printf '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1,"progressToken":"%s"}}\n' "$token"
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"done"}],"isError":false}}\n' "$id"
       fi
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"done"}],"isError":false}}\n' "$id"
       ;;
   esac
 done
@@ -2541,6 +2544,13 @@ while ($null -ne ($line = $reader.ReadLine())) {
         }
     }
 
+    fn assert_tool_error(daemon: &mut Daemon, name: &str, expected: &str) {
+        let call = send(daemon, "tools/call", json!({"name": name}));
+        let result = wait(daemon, &call).result.expect("failure result");
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["content"][0]["text"], expected);
+    }
+
     #[test]
     fn a_live_plugin_routes_tool_calls_and_fails_them_on_a_crash() {
         let nanos = SystemTime::now()
@@ -2574,10 +2584,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             "pong"
         );
 
-        let fail = send(&mut daemon, "tools/call", json!({"name": "plug.fail"}));
-        let result = wait(&mut daemon, &fail).result.expect("failure result");
-        assert_eq!(result["isError"], true);
-        assert_eq!(result["content"][0]["text"], "boom");
+        assert_tool_error(&mut daemon, "plug.fail", "boom");
 
         let hung = send(&mut daemon, "tools/call", json!({"name": "plug.hang"}));
         let _crashed = send(&mut daemon, "tools/call", json!({"name": "plug.crash"}));
@@ -2628,6 +2635,9 @@ while ($null -ne ($line = $reader.ReadLine())) {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Covers progress forwarding, failure projection, and child cleanup
+    // through the same tools/call seam. Timeout/cancellation live in slot.rs:
+    // tools/call has no per-call timeout or cancel entry.
     #[test]
     fn an_exec_core_service_forwards_progress_and_cleans_up_its_child() {
         let nanos = SystemTime::now()
@@ -2639,9 +2649,9 @@ while ($null -ne ($line = $reader.ReadLine())) {
         std::fs::create_dir_all(root.join("logs")).expect("logs");
         std::env::set_var("SVCD_LOG_DIR", root.join("logs"));
 
-        let process = tool_service("proc", Kind::Core, &["progress", "fail"], &root);
+        let service = tool_service("proc", Kind::Core, &["progress", "fail"], &root);
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(registry(vec![process]), "token".into(), receiver, None);
+        let mut daemon = Daemon::new(registry(vec![service]), "token".into(), receiver, None);
         daemon.start_service("proc").expect("start");
         assert!(daemon.is_live("proc"));
         let pid = daemon
@@ -2671,12 +2681,9 @@ while ($null -ne ($line = $reader.ReadLine())) {
             "done"
         );
 
-        // The same tools/call seam must project a process failure as a tool
-        // error, not only a successful value.
-        let failed = send(&mut daemon, "tools/call", json!({"name": "proc.fail"}));
-        let result = wait(&mut daemon, &failed).result.expect("failure result");
-        assert_eq!(result["isError"], true);
-        assert_eq!(result["content"][0]["text"], "boom");
+        // The same tools/call seam must project a capability failure as a
+        // tool error, not only a successful value.
+        assert_tool_error(&mut daemon, "proc.fail", "boom");
 
         daemon.stop_service("proc").expect("stop");
         let status = daemon.status_for_id("proc").expect("status");
@@ -2687,6 +2694,8 @@ while ($null -ne ($line = $reader.ReadLine())) {
             !crate::proc::alive(pid),
             "the child process is still alive after stop"
         );
+        // Windows has no portable liveness probe here; the per-service Job
+        // Object terminates the tree, and status.pid is the observable seam.
         #[cfg(not(unix))]
         let _ = pid;
 

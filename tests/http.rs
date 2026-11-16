@@ -902,7 +902,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
   $id = 1
   if ($line -match '"id"\s*:\s*(\d+)') { $id = [int]$Matches[1] }
   $token = $null
-  if ($line -match '"progressToken"\s*:\s*"([^"]+)"') { $token = $Matches[1] }
+  if ($line -match '"_meta"\s*:\s*\{[^}]*"progressToken"\s*:\s*"([^"]+)"') { $token = $Matches[1] }
   if ($null -ne $token) {
     [Console]::Out.WriteLine('{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1,"progressToken":"' + $token + '"}}')
   }
@@ -920,7 +920,8 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
 while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   if [ -z "$id" ]; then id=1; fi
-  token=$(printf '%s\n' "$line" | sed -n 's/.*"progressToken":"\([^"]*\)".*/\1/p')
+  meta=$(printf '%s\n' "$line" | sed -n 's/.*"_meta":{\([^}]*\)}.*/\1/p')
+  token=$(printf '%s\n' "$meta" | sed -n 's/.*"progressToken":"\([^"]*\)".*/\1/p')
   if [ -n "$token" ]; then
     printf '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1,"progressToken":"%s"}}\n' "$token"
   fi
