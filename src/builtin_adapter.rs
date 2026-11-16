@@ -46,16 +46,17 @@ impl BuiltinWire {
         self
     }
 
-    fn value(&self, capability: &str) -> Value {
+    fn value(&self, capability: &str) -> Result<Value, Failure> {
         match capability {
-            "version" => json!({ "version": env!("CARGO_PKG_VERSION") }),
-            "describe" => json!({
-                "id": "svc",
-                "version": env!("CARGO_PKG_VERSION"),
-                "kind": "core",
-            }),
-            "health" => json!({ "state": "ready" }),
-            _ => json!({ "ok": true }),
+            "version" => Ok(json!({ "version": env!("CARGO_PKG_VERSION") })),
+            "health" => Ok(json!({ "state": "ready" })),
+            // The shared conformance fixture contract declares `status`.
+            "status" => Ok(json!({ "ok": true })),
+            _ => Err(Failure::new(
+                crate::kernel::failure::Class::ImplementationError,
+                crate::kernel::failure::Retry::Never,
+                format!("builtin has no implementation for {capability}"),
+            )),
         }
     }
 }
@@ -89,7 +90,7 @@ impl Wire for BuiltinWire {
                 "builtin service is stopped",
             ));
         }
-        Ok(Reply::Value(self.value(invocation.capability.as_str())))
+        Ok(Reply::Value(self.value(invocation.capability.as_str())?))
     }
 
     fn lifecycle(&mut self, control: Control) -> Result<Settled, Failure> {
@@ -199,6 +200,37 @@ mod tests {
         {
             Reply::Value(value) => assert_eq!(value["state"], "ready"),
             other => panic!("expected a value reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_declared_but_unimplemented_capability_is_an_implementation_error() {
+        let capability = Capability {
+            name: CapabilityName::new("missing"),
+            desc: String::new(),
+            input_schema: None,
+            effect: Effect::Read,
+            idempotent: true,
+        };
+        let contract = Contract::new(
+            ServiceId::new("svc"),
+            "1.0.0",
+            vec![capability],
+            Obligations::default(),
+            Class::ALL.to_vec(),
+            Limits::default(),
+        );
+        let mut instance = Instance::new(contract.clone(), Box::new(BuiltinWire::new(contract)))
+            .expect("valid contract");
+        match instance.call(Invocation::new(
+            "missing",
+            json!({}),
+            std::time::Duration::from_secs(1),
+        )) {
+            Err(crate::kernel::failure::CallError::Failed(failure)) => {
+                assert_eq!(failure.class, Class::ImplementationError)
+            }
+            other => panic!("expected a classified failure, got {other:?}"),
         }
     }
 

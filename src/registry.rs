@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::kernel::contract::ImplRef;
+
 /// The built-in core service id; reserved against `services.d` definitions.
 pub const RESERVED_ID: &str = "svc";
 
@@ -163,6 +165,9 @@ pub struct Service {
     pub deps: Vec<String>,
     /// Only plugins declare capabilities; core services are lifecycle units.
     pub caps: Vec<Capability>,
+    /// The runtime carrier selected by the assembly point. `None` keeps the
+    /// supervised-slot path; the builtin `svc` names `tag=builtin`.
+    pub impl_ref: Option<ImplRef>,
     /// Used by the supervisor when it spawns a service (core or plugin).
     pub exec: Option<Exec>,
     /// Optional lifecycle commands; core definitions and schema-2 plugins use them.
@@ -210,6 +215,10 @@ impl Service {
                     input_schema: json!({"type": "object", "properties": {}}),
                 },
             ],
+            impl_ref: Some(ImplRef {
+                tag: "builtin".into(),
+                binding: json!({}),
+            }),
             exec: None,
             lifecycle: None,
             enabled: true,

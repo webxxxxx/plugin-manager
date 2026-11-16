@@ -261,6 +261,7 @@ fn load_scripts(
             desc: format!("script service: {}", file.clone().unwrap_or_default()),
             deps: Vec::new(),
             caps: Vec::new(),
+            impl_ref: None,
             exec: Some(Exec {
                 path: path_text.clone(),
                 // Only an implemented start is called with the action argument;
@@ -518,6 +519,7 @@ fn validate(definition: CoreDefinition) -> Result<Service, String> {
         desc: definition.desc,
         deps: definition.dependencies,
         caps: Vec::new(),
+        impl_ref: None,
         exec: Some(Exec {
             path: definition.exec.path,
             args: definition.exec.args,

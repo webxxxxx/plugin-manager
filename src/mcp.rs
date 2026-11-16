@@ -33,14 +33,15 @@ where
         .values()
         .filter(|svc| svc.kind == Kind::Plugin || !svc.caps.is_empty())
     {
-        if svc.kind == Kind::Plugin {
+        let live = is_live(&svc.id);
+        if svc.kind == Kind::Plugin || !live {
             out.push(json!({
                 "name": format!("{}.start", svc.id),
-                "description": format!("Start plugin {}", svc.id),
+                "description": format!("Start service {}", svc.id),
                 "inputSchema": {"type": "object", "properties": {}}
             }));
         }
-        if is_live(&svc.id) {
+        if live {
             for cap in &svc.caps {
                 let description = if cap.description.is_empty() {
                     format!("{} on {}", cap.name, svc.id)
@@ -562,6 +563,7 @@ mod tests {
             desc: "test".into(),
             deps: Vec::new(),
             caps: caps.iter().map(|cap| capability(cap)).collect(),
+            impl_ref: None,
             exec: Some(Exec {
                 path: "/bin/true".into(),
                 args: Vec::new(),
@@ -635,6 +637,18 @@ mod tests {
             names,
             vec!["svc.health".to_string(), "svc.version".to_string()]
         );
+    }
+
+    #[test]
+    fn a_dead_core_with_capabilities_only_exposes_start() {
+        let mut registry = Registry::new();
+        registry
+            .insert(service("core", Kind::Core, &["status"]))
+            .expect("core");
+
+        let names = names(&tools(&registry, |_| false));
+
+        assert_eq!(names, vec!["core.start".to_string()]);
     }
 
     #[test]

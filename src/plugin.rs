@@ -1060,6 +1060,7 @@ fn service_from_manifest(
         desc: manifest.desc.clone(),
         deps: manifest.dependencies.clone(),
         caps,
+        impl_ref: None,
         exec: Some(Exec {
             path: exec_path.to_string_lossy().to_string(),
             args: manifest.exec.args.clone(),

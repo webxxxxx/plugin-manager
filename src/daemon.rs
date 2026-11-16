@@ -19,9 +19,8 @@ use crate::channel;
 use crate::compat;
 use crate::definition;
 use crate::kernel::contract::{
-    Capability as KernelCapability, CapabilityName, Contract, Effect, HealthCheck, ImplRef,
-    Instance, Invocation, Launchers, LifecycleObligation, Limits as KernelLimits, Obligations,
-    ProgressToken, Reply, ServiceId,
+    Capability as KernelCapability, CapabilityName, Contract, Effect, Instance, Invocation,
+    Launchers, Limits as KernelLimits, Obligations, ProgressToken, Reply, ServiceId,
 };
 use crate::kernel::failure::{Class, Failure, Rejection, Retry};
 use crate::lan::LanStatus;
@@ -916,13 +915,16 @@ impl Daemon {
     /// The MCP projection asks the daemon rather than the registry because the
     /// registry snapshot does not track the supervised process.
     fn is_live(&self, id: &str) -> bool {
-        if id == RESERVED_ID {
-            // The builtin `svc` has no slot; its registry state is the truth.
-            return self
-                .registry
-                .get(id)
-                .map(|service| service.state == State::Running)
-                .unwrap_or(false);
+        if let Some(service) = self.registry.get(id) {
+            if service
+                .impl_ref
+                .as_ref()
+                .map(|spec| spec.tag.as_str() == "builtin")
+                .unwrap_or(false)
+            {
+                // The builtin `svc` has no slot; its registry state is the truth.
+                return service.state == State::Running;
+            }
         }
         self.slots
             .get(id)
@@ -1009,7 +1011,7 @@ impl Daemon {
         let start_id = name.strip_suffix(".start").filter(|service_id| {
             self.registry
                 .get(service_id)
-                .map(|service| service.kind == Kind::Plugin)
+                .map(|service| service.kind == Kind::Plugin || !service.caps.is_empty())
                 .unwrap_or(false)
         });
         if let Some(service_id) = start_id {
@@ -1032,10 +1034,20 @@ impl Daemon {
         // A service is callable when its contract declares the capability and
         // the assembly point knows how to reach it. `svc` is builtin and has no
         // supervised process; everything else keeps the SlotWire path.
-        let builtin = impl_for(service);
+        let builtin = service.impl_ref.clone();
         let known = service.caps.iter().any(|cap| cap.name == capability);
-        if !known || (builtin.is_none() && service.kind != Kind::Plugin) {
+        let callable = builtin.is_some()
+            || service.kind == Kind::Plugin
+            || self.slots.contains_key(service_id);
+        if !known || !callable {
             send(&reply, unknown_tool(&id, &name));
+            return;
+        }
+        if builtin.is_some() && !self.is_live(service_id) {
+            send(
+                &reply,
+                mcp::tool_result(id, format!("service {} is not running", service_id), true),
+            );
             return;
         }
 
@@ -1100,7 +1112,7 @@ impl Daemon {
         let Some(slot) = self.slots.get_mut(service_id) else {
             send(
                 &reply,
-                mcp::tool_result(id, format!("plugin {} has no runtime", service_id), true),
+                mcp::tool_result(id, format!("service {} has no runtime", service_id), true),
             );
             return;
         };
@@ -1964,68 +1976,48 @@ fn project_builtin_outcome(external_id: Option<Value>, outcome: Result<Value, Fa
     }
 }
 
-/// The builtin `svc` is the only service the assembly point selects today.
-/// Keeping the selection here (rather than in the `.spk`/`services.d` schema)
-/// leaves the external formats unchanged until composite/remote need a tag.
-fn impl_for(service: &Service) -> Option<ImplRef> {
-    if service.id == RESERVED_ID {
-        return Some(ImplRef {
-            tag: "builtin".into(),
-            binding: json!({ "service": service.id }),
-        });
+fn contract_limits() -> KernelLimits {
+    let limits = crate::limits::current();
+    KernelLimits {
+        max_inline: 1024 * 1024,
+        max_in_flight: crate::slot::MAX_IN_FLIGHT,
+        default_timeout: limits.default_timeout,
+        max_timeout: limits.max_timeout,
     }
-    None
 }
 
-fn builtin_contract(service: &Service) -> Contract {
-    let limits = crate::limits::current();
-    let surface = service
+fn contract_surface(service: &Service, effect: Effect, idempotent: bool) -> Vec<KernelCapability> {
+    service
         .caps
         .iter()
         .map(|capability| KernelCapability {
             name: CapabilityName::new(capability.name.clone()),
             desc: capability.description.clone(),
             input_schema: Some(capability.input_schema.clone()),
-            // The builtin surface is version/health today: reading it is
-            // idempotent and has no side effects.
-            effect: Effect::Read,
-            idempotent: true,
+            effect,
+            idempotent,
         })
-        .collect();
+        .collect()
+}
+
+fn builtin_contract(service: &Service) -> Contract {
+    // A builtin has no process, and the supervisor does not drive its
+    // lifecycle: each call gets a fresh view. Keep the default obligations
+    // rather than claiming hooks or probes that never run.
     Contract::new(
         ServiceId::new(service.id.clone()),
         service.version.clone(),
-        surface,
-        Obligations {
-            health: HealthCheck::Status,
-            lifecycle: LifecycleObligation::Hooks,
-            one_shot: false,
-        },
+        contract_surface(service, Effect::Read, true),
+        Obligations::default(),
         Class::ALL.to_vec(),
-        KernelLimits {
-            max_inline: 1024 * 1024,
-            max_in_flight: crate::slot::MAX_IN_FLIGHT,
-            default_timeout: limits.default_timeout,
-            max_timeout: limits.max_timeout,
-        },
+        contract_limits(),
     )
 }
 
 fn slot_contract(service: &Service) -> Contract {
-    let limits = crate::limits::current();
-    let surface = service
-        .caps
-        .iter()
-        .map(|capability| KernelCapability {
-            name: CapabilityName::new(capability.name.clone()),
-            desc: capability.description.clone(),
-            input_schema: Some(capability.input_schema.clone()),
-            // The plugin manifest does not declare effect/idempotence yet;
-            // Write + non-idempotent is the conservative projection.
-            effect: Effect::Write,
-            idempotent: false,
-        })
-        .collect();
+    // The plugin manifest does not declare effect/idempotence yet; Write +
+    // non-idempotent is the conservative projection.
+    let surface = contract_surface(service, Effect::Write, false);
     // Cancelled is caller-driven only; a plugin that returns it is already
     // normalized to ImplementationError before it reaches the contract.
     let failures = Class::ALL
@@ -2038,12 +2030,7 @@ fn slot_contract(service: &Service) -> Contract {
         surface,
         Obligations::default(),
         failures,
-        KernelLimits {
-            max_inline: 1024 * 1024,
-            max_in_flight: crate::slot::MAX_IN_FLIGHT,
-            default_timeout: limits.default_timeout,
-            max_timeout: limits.max_timeout,
-        },
+        contract_limits(),
     )
 }
 
@@ -2287,6 +2274,7 @@ mod tests {
             desc: "test".into(),
             deps: deps.iter().map(|dep| dep.to_string()).collect(),
             caps: Vec::new(),
+            impl_ref: None,
             exec: Some(Exec {
                 path: "/bin/true".into(),
                 args: Vec::new(),
@@ -2460,6 +2448,33 @@ while ($null -ne ($line = $reader.ReadLine())) {
         }
     }
 
+    fn tool_service(id: &str, kind: Kind, caps: &[&str], root: &Path) -> Service {
+        Service {
+            id: id.into(),
+            kind,
+            version: "1.0.0".into(),
+            protocol: 1,
+            desc: "tools".into(),
+            deps: Vec::new(),
+            caps: caps.iter().map(|cap| capability(cap)).collect(),
+            impl_ref: None,
+            exec: Some(tool_agent(root)),
+            lifecycle: None,
+            enabled: true,
+            restart: crate::registry::Restart::OnFailure,
+            remain_after_exit: false,
+            compat: None,
+            state: State::Stopped,
+            pid: None,
+            since: None,
+            ready_since: None,
+            next_at: None,
+            failures: 0,
+            last_exit: None,
+            config: None,
+        }
+    }
+
     fn send(daemon: &mut Daemon, method: &str, params: Value) -> Receiver<String> {
         let line = serde_json::to_string(&json!({
             "jsonrpc": "2.0",
@@ -2500,34 +2515,12 @@ while ($null -ne ($line = $reader.ReadLine())) {
         std::fs::create_dir_all(root.join("logs")).expect("logs");
         std::env::set_var("SVCD_LOG_DIR", root.join("logs"));
 
-        let plugin = Service {
-            id: "plug".into(),
-            kind: Kind::Plugin,
-            version: "1.0.0".into(),
-            protocol: 1,
-            desc: "tools".into(),
-            deps: Vec::new(),
-            caps: vec![
-                capability("echo"),
-                capability("fail"),
-                capability("hang"),
-                capability("crash"),
-            ],
-            exec: Some(tool_agent(&root)),
-            lifecycle: None,
-            enabled: true,
-            restart: crate::registry::Restart::OnFailure,
-            remain_after_exit: false,
-            compat: None,
-            state: State::Stopped,
-            pid: None,
-            since: None,
-            ready_since: None,
-            next_at: None,
-            failures: 0,
-            last_exit: None,
-            config: None,
-        };
+        let plugin = tool_service(
+            "plug",
+            Kind::Plugin,
+            &["echo", "fail", "hang", "crash"],
+            &root,
+        );
         let (_sender, receiver) = mpsc::channel();
         let mut daemon = Daemon::new(registry(vec![plugin]), "token".into(), receiver, None);
         daemon.start_service("plug").expect("start");
@@ -2558,6 +2551,42 @@ while ($null -ne ($line = $reader.ReadLine())) {
         let tools = daemon.tool_list();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "plug.start");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_core_service_with_capabilities_is_callable_through_the_slot_path() {
+        let nanos = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("svcd-tools-unit-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir_all(root.join("logs")).expect("logs");
+        std::env::set_var("SVCD_LOG_DIR", root.join("logs"));
+
+        let core = tool_service("core", Kind::Core, &["echo"], &root);
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(registry(vec![core]), "token".into(), receiver, None);
+        daemon.start_service("core").expect("start");
+        assert!(daemon.is_live("core"));
+
+        let tools = daemon.tool_list();
+        assert!(
+            tools.iter().any(|tool| tool["name"] == "core.echo"),
+            "{tools:?}"
+        );
+        let echo = send(
+            &mut daemon,
+            "tools/call",
+            json!({"name": "core.echo", "arguments": {}}),
+        );
+        let response = wait(&mut daemon, &echo);
+        assert_eq!(
+            response.result.expect("echo result")["content"][0]["text"],
+            "pong"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2773,5 +2802,21 @@ while ($null -ne ($line = $reader.ReadLine())) {
         let text = result["content"][0]["text"].as_str().expect("health text");
         let value: Value = serde_json::from_str(text).expect("health json");
         assert_eq!(value["state"], "ready");
+    }
+
+    #[test]
+    fn the_builtin_outcome_projects_values_and_failures() {
+        let ok = project_builtin_outcome(Some(json!(1)), Ok(json!({"version": "1.2.3"})));
+        let response: rpc::Response = serde_json::from_str(&ok).expect("ok json");
+        let result = response.result.expect("result");
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["content"][0]["text"], "{\"version\":\"1.2.3\"}");
+
+        let failed = project_builtin_outcome(
+            Some(json!(2)),
+            Err(Failure::new(Class::Busy, Retry::Never, "busy")),
+        );
+        let response: rpc::Response = serde_json::from_str(&failed).expect("error json");
+        assert_eq!(response.error.expect("error").code, -32000);
     }
 }

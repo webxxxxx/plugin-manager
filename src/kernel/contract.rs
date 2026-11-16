@@ -435,7 +435,7 @@ pub enum LaunchError {
 impl LaunchError {
     /// A launch is assembly, not a call: an unregistered tag is an
     /// implementation error, while a registered launcher keeps its own class.
-    pub fn into_failure(self) -> Failure {
+    pub(crate) fn into_failure(self) -> Failure {
         match self {
             LaunchError::UnknownTag(tag) => Failure::new(
                 Class::ImplementationError,
