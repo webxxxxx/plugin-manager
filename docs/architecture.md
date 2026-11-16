@@ -30,6 +30,41 @@ svcd 是一个**服务的运行时**：把定义或 `.spk` 变成服务，让服
 2. **越往下越稳定**：路径解析十年不变，编排语法一定会改。所以依赖只能从上往下。
 3. **L4 只有一行**：命令行、网页、MCP 都从这一层进。加一种协议只动 L4 和 L5。
 
+### 1.1 依赖方向
+
+```mermaid
+flowchart TB
+    compose["装配点 L6<br/>daemon.rs / main.rs"]
+
+    subgraph L5["L5 对外面"]
+        face["face"]
+        cli["cli"]
+    end
+
+    server["L4 服务器<br/>control · http · mcp · auth"]
+    domain["L3 领域<br/>manage · supervise · orchestrate · cluster"]
+    kernel["L2 内核<br/>契约 · 目录 · 调用 · 失败 · 投影"]
+    wire["L1 线格式<br/>消息 · 契约线 · 控制线 · WS"]
+    platform["L0 平台<br/>路径 · 日志 · 配置 · 进程/线程 · 存储"]
+
+    compose --> face
+    compose --> cli
+    compose --> server
+    face --> server
+    cli --> server
+    face -.->|允许跨层向下| domain
+    cli -.->|允许跨层向下| domain
+    server --> domain
+    domain --> kernel
+    domain --> wire
+    domain --> platform
+    kernel --> wire
+    kernel --> platform
+    wire --> platform
+```
+
+图里只画**允许的依赖方向**，实际边是它的子集；任何向上的边都是 `dep-lint` 违规。跨层向下（虚线）允许，不要求逐层经过。
+
 ## 2. 六层：知道什么，不知道什么
 
 | 层 | 知道 | **不知道**（更重要） |
@@ -56,6 +91,31 @@ svcd 是一个**服务的运行时**：把定义或 `.spk` 变成服务，让服
 
 `storage` 不是动词，也不是一个领域：它是这四件事共用的**调用基础设施**——大参数不进帧、只传引用（`$blob`），真正的字节存在平台层的内容存储里。见第 5、6 节。
 
+### 3.1 监督状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> Stopped
+    Stopped --> Starting: Start / Spawn
+    Failed --> Starting: Start
+    Backoff --> Starting: BackoffElapsed
+    Backoff --> Stopped: Stop
+    Starting --> Running: Ready
+    Starting --> Backoff: SpawnFailed / 未就绪退出（可重试）
+    Starting --> Failed: 同上且达到失败上限
+    Starting --> Stopping: StartTimeout
+    Running --> Stopping: Stop
+    Running --> Backoff: 崩溃且可重试
+    Running --> Failed: 崩溃且达到失败上限
+    Running --> Stopped: clean exit（on-failure / never）
+    Running --> Running: clean exit + remain_after_exit
+    Stopping --> Stopping: StopTimeout（升级为强杀）
+    Stopping --> Stopped: StopSettled
+    Stopping --> Failed: KillTimeout
+```
+
+`Failed` 不是终点：显式 `Start` 仍可重新进入 `Starting`。daemon 重启后的接管直接把状态恢复到 `Running`，不是上面任何一条事件边。
+
 ## 4. 契约：全系统唯一的连接点
 
 **服务契约** = 一个服务对外承诺的东西：能力面、调用信封、生命周期义务、健康语义、它可能给出的失败类别。
@@ -80,6 +140,37 @@ svcd 是一个**服务的运行时**：把定义或 `.spk` 变成服务，让服
 契约是一个**值**（`Contract`）+ **两个入口**（`call`、`lifecycle(Ensure|Quiesce|Probe)`），实现由 `ImplRef{tag}` 交给装配点注册的 adapter——所以新增运行载体只加一个 adapter，不改内核。能力面显式声明并带 `effect` / `idempotent`；失败是 `{class, retry: Now|Never|After(t), detail}`，`detail` 不可被上层解析；死亡与超时按**判定时刻的客观状态**归类。
 
 完整决定见 [ADR-0013](adr/0013-service-contract-interface.md)；复合服务的 v1 边界（root 定义、0 或 1 个能力、单机执行、加载期校验）见 [ADR-0014](adr/0014-composite-service-v1-boundary.md)。
+
+### 4.2 一次 `tools/call` 的路径
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as MCP 客户端
+    participant D as Daemon
+    participant W as WorkerPool
+    participant I as Instance
+    participant SW as SlotWire
+    participant S as Slot
+    participant P as 插件进程
+
+    C->>D: tools/call
+    D->>W: submit(job)
+    W->>I: call(Invocation)
+    I->>SW: Wire::call
+    SW->>S: SlotHandle::submit
+    S->>P: tools/call 帧
+    P-->>S: notifications/progress
+    S-->>C: progress（原通道）
+    P-->>S: final response
+    S-->>SW: result
+    SW-->>I: Reply / Failure
+    I-->>W: Reply / CallError
+    W-->>D: outcome
+    D-->>C: tools/call result
+```
+
+worker 阻塞在 `SlotWire`，事件循环继续 `pump` slot，所以慢插件不会阻塞 daemon。progress 走原客户端通道，最终结果走 worker 通道；图中最后一行由 worker 的 reply 写出。
 
 ## 5. 目录
 
@@ -224,6 +315,22 @@ src/
    类型解析 → model/   纯判定 → check/   流程 → ops/
 ```
 
+```mermaid
+flowchart TD
+    N["新文件"] --> Q1{"说协议，还是做事？"}
+    Q1 -->|说协议| Q2{"字节还是会话？"}
+    Q2 -->|字节| W["wire/"]
+    Q2 -->|会话| S["server/"]
+    Q1 -->|做事| Q3{"公共规则、某载体，还是技术资源？"}
+    Q3 -->|公共规则| K["kernel/"]
+    Q3 -->|某载体| Q4{"类型解析、纯判定，还是流程？"}
+    Q4 -->|类型解析| M["model/"]
+    Q4 -->|纯判定| C["check/"]
+    Q4 -->|流程| O["ops/"]
+    Q3 -->|技术资源| P["platform/"]
+    Q3 -.->|宿主领域特例| SI["selfinstall/"]
+```
+
 对外面额外一条：**`face/` 与 `cli/` 只做「URL 或命令 → 能力」的翻译，不写流程**；有流程就回第 2 问。
 
 ## 10. 扩展剧本
@@ -266,6 +373,22 @@ src/
 | 4 | 线格式与进程（S3 / S6） | Windows 支持变成「加一个 adapter」 |
 | 5 | 配置与时钟（S7 / S8） | 模块级测试不再起 daemon |
 | 6 | 目录按本文件重排（纯搬家） | 编译与测试全绿 |
+
+```mermaid
+flowchart LR
+    S0["0 dep-lint 基线"] --> S1["1 砍向上边"]
+    S1 --> S2["2 契约抽取"]
+    S2 --> S3["3 server/http + server/mcp"]
+    S3 --> S4["4 wire + process"]
+    S4 --> S5["5 配置 + 时钟"]
+    S5 --> S6["6 目录纯搬家"]
+    S6 --> DONE["目标树"]
+
+    NOW["当前：0–2 部分完成<br/>#103 后"]:::current
+    NOW -.->|下一步| S3
+
+    classDef current fill:#ffe08a,stroke:#b8860b,stroke-width:3px,color:#000
+```
 
 ## 13. 不做什么
 
