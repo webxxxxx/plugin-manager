@@ -8,6 +8,9 @@
 
 #[cfg(unix)]
 use crate::channel_client_reactor::{ClientReactor, Event as ClientEvent};
+use std::collections::HashMap;
+#[cfg(unix)]
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
@@ -22,10 +25,6 @@ use std::thread;
 use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
-
-use std::collections::HashMap;
-#[cfg(unix)]
-use std::collections::VecDeque;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 #[cfg(unix)]

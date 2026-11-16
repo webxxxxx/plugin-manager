@@ -85,8 +85,8 @@ bind = 127.0.0.1:8787
 #   ws_raw_queue           16         64          128
 #
 # On Windows the HTTP listener keeps one thread per admitted connection, so
-# max_connections is also the connection-thread cap; the Unix four-thread
-# default budget does not apply there.
+# max_connections is also the connection-thread cap; the final Unix
+# four-thread default budget does not apply there.
 #
 # `ws_raw_*` control the protocol-3 raw transport
 # (`/plugin-ui/{id}/{token}/raw`): a plugin that declares `protocol: 3`

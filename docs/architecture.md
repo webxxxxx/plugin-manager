@@ -298,7 +298,7 @@ src/
 
 开 seam 的顺序：**S1（含 S5 失败类别）→ S4 → S3 → S6 → S7/S8**。S9 随时可做，S2 等集群真正开始再开。
 
-S4 的线程预算（两条循环 + 两条阻塞线程，默认 4 条）是 **Unix 的默认拓扑**。Windows 本轮保留每连接一条线程的回退，`max_connections` 是它的线程上限；Windows 不承诺 4 条线程，IOCP 留给 S3/S6。该回退仍执行 `max_connections` / `max_connections_per_ip` / `http_idle_timeout_secs`。
+S4 的最终线程预算（#126 合并插件 stdio 反应器后：两条循环 + 两条阻塞线程，默认 4 条）是 **Unix 的默认拓扑**。Windows 本轮保留每连接一条线程的回退，`max_connections` 是它的线程上限；Windows 不承诺 4 条线程，IOCP 留给 S3/S6。该回退仍执行 `max_connections` / `max_connections_per_ip` / `http_idle_timeout_secs`。
 
 ## 9. 新文件放哪：三个问题
 

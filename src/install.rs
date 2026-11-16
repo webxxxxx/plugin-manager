@@ -265,9 +265,6 @@ fn default_conf_text(layout: &Layout) -> String {
          # stream_buffer_bytes = 16384 / 32768 / 65536\n\
          # max_connections = 32 / 128 / 512\n\
          # max_connections_per_ip = 8 / 32 / 64\n\
-         # On Windows the HTTP fallback keeps one thread per admitted\n\
-         # connection, so max_connections is its thread cap; the Unix\n\
-         # four-thread default budget does not apply there.\n\
          # max_subscriptions = 4 / 16 / 64\n\
          # max_subscribers_per_plugin = 4 / 16 / 64\n\
          # http_idle_timeout_secs = 30 / 60 / 120\n\
@@ -284,6 +281,9 @@ fn default_conf_text(layout: &Layout) -> String {
          # ws_raw_queue = 16 / 64 / 128\n\
          # ws_raw_* gate the protocol-3 raw transport; on Windows /raw answers\n\
          # 501 not_supported. See svcd.conf.example for the full semantics.\n\
+         # On Windows the HTTP fallback keeps one thread per admitted\n\
+         # connection, so max_connections is its thread cap; the final Unix\n\
+         # four-thread default budget does not apply there.\n\
          # Set the web/API password with: svc auth passwd <password>\n\
          # auth_passwd = pbkdf2-sha256$...\n",
         layout.config_dir.display(),
