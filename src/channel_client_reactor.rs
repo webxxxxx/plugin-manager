@@ -19,14 +19,9 @@ use serde_json::Value;
 
 use crate::channel;
 use crate::ipc;
+use crate::server::mcp::progress::ProgressEvent;
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
-
-pub enum Event {
-    Frame(String),
-    Final(String),
-    Error(String),
-}
 
 pub struct ClientReactor {
     tx: Sender<Command>,
@@ -40,7 +35,7 @@ enum Command {
         config: std::path::PathBuf,
         method: String,
         params: Value,
-        sender: SyncSender<Event>,
+        sender: SyncSender<ProgressEvent>,
     },
     Cancel(u64),
     Shutdown,
@@ -49,9 +44,9 @@ enum Command {
 struct Connection {
     stream: UnixStream,
     buffer: Vec<u8>,
-    sender: SyncSender<Event>,
+    sender: SyncSender<ProgressEvent>,
     blocked: bool,
-    pending: Option<Event>,
+    pending: Option<ProgressEvent>,
 }
 
 impl ClientReactor {
@@ -76,7 +71,7 @@ impl ClientReactor {
         config: &Path,
         method: &str,
         params: Value,
-        sender: SyncSender<Event>,
+        sender: SyncSender<ProgressEvent>,
     ) -> io::Result<u64> {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         self.tx
@@ -237,19 +232,19 @@ fn open_connection(
     config: &Path,
     method: &str,
     params: Value,
-    sender: SyncSender<Event>,
+    sender: SyncSender<ProgressEvent>,
 ) -> Option<Connection> {
     let token = match channel::read_token(config) {
         Ok(token) => token,
         Err(error) => {
-            let _ = sender.try_send(Event::Error(format!("svcd unreachable: {}", error)));
+            let _ = sender.try_send(ProgressEvent::Error(format!("svcd unreachable: {}", error)));
             return None;
         }
     };
     let mut stream = match UnixStream::connect(config.join("svcd.sock")) {
         Ok(stream) => stream,
         Err(error) => {
-            let _ = sender.try_send(Event::Error(format!("svcd unreachable: {}", error)));
+            let _ = sender.try_send(ProgressEvent::Error(format!("svcd unreachable: {}", error)));
             return None;
         }
     };
@@ -262,7 +257,9 @@ fn open_connection(
     })
     .to_string();
     if ipc::write_frame_limit(&mut stream, &line, ipc::LOCAL_FRAME_MAX).is_err() {
-        let _ = sender.try_send(Event::Error("cannot write management request".into()));
+        let _ = sender.try_send(ProgressEvent::Error(
+            "cannot write management request".into(),
+        ));
         return None;
     }
     let _ = stream.set_nonblocking(true);
@@ -278,7 +275,7 @@ fn open_connection(
 fn drain_connection(connection: &mut Connection) -> bool {
     loop {
         if let Some(event) = connection.pending.take() {
-            let is_final = matches!(event, Event::Final(_));
+            let is_final = matches!(event, ProgressEvent::Final(_));
             match connection.sender.try_send(event) {
                 Ok(()) if is_final => return false,
                 Ok(()) => {}
@@ -292,17 +289,17 @@ fn drain_connection(connection: &mut Connection) -> bool {
         }
         let Some(position) = connection.buffer.iter().position(|byte| *byte == b'\n') else {
             if connection.buffer.len() > ipc::LOCAL_FRAME_MAX {
-                let _ = connection
-                    .sender
-                    .try_send(Event::Error("management frame exceeds local limit".into()));
+                let _ = connection.sender.try_send(ProgressEvent::Error(
+                    "management frame exceeds local limit".into(),
+                ));
                 return false;
             }
             return true;
         };
         if position > ipc::LOCAL_FRAME_MAX {
-            let _ = connection
-                .sender
-                .try_send(Event::Error("management frame exceeds local limit".into()));
+            let _ = connection.sender.try_send(ProgressEvent::Error(
+                "management frame exceeds local limit".into(),
+            ));
             return false;
         }
         let line: Vec<u8> = connection.buffer.drain(..=position).collect();
@@ -312,9 +309,9 @@ fn drain_connection(connection: &mut Connection) -> bool {
             .and_then(|value| value.get("id").cloned())
             .is_some();
         let event = if final_frame {
-            Event::Final(line)
+            ProgressEvent::Final(line)
         } else {
-            Event::Frame(line)
+            ProgressEvent::Frame(line)
         };
         match connection.sender.try_send(event) {
             Ok(()) => {

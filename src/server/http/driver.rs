@@ -24,8 +24,12 @@ pub enum StreamAdmission {
 /// One attached handler plus everything the connection needs to drive it.
 pub struct StreamDriver {
     handler: Box<dyn StreamHandler>,
-    /// The server's no-progress deadline, possibly shortened by the handler.
+    /// The server's no-progress upper bound. Only real output progress moves
+    /// it; a handler-requested wakeup never replaces it.
     deadline: Instant,
+    /// The next tick. A handler may move it earlier (poll for upstream
+    /// events, heartbeat), but never past `deadline`.
+    wakeup: Instant,
     /// A server-side file send requested by the handler, after the output
     /// buffer drains.
     file: Option<FileSend>,
@@ -38,18 +42,36 @@ pub struct StreamDriver {
 impl StreamDriver {
     /// Admit a handler under `max_streams`. A one-shot response is exempt.
     pub fn admit(handler: Box<dyn StreamHandler>, max_streams: usize) -> StreamAdmission {
-        let class = handler.stream_class();
-        let permit = match StreamBudget::global().acquire(class, max_streams) {
-            Ok(permit) => permit,
-            Err(Busy) => return StreamAdmission::Busy,
-        };
-        StreamAdmission::Admitted(StreamDriver {
+        match StreamBudget::global().acquire(handler.stream_class(), max_streams) {
+            Ok(permit) => StreamAdmission::Admitted(StreamDriver::new(handler, permit)),
+            Err(Busy) => StreamAdmission::Busy,
+        }
+    }
+
+    /// Admit a handler whose budget slot was reserved before a side effect.
+    /// A streaming `tools/call` opens the outbound management call only after
+    /// the slot is known to fit, so a full cap refuses the request without
+    /// starting the plugin call. The permit is released when the driver drops.
+    pub fn admit_reserved(
+        handler: Box<dyn StreamHandler>,
+        permit: Option<super::budget::StreamPermit>,
+    ) -> StreamDriver {
+        StreamDriver::new(handler, permit)
+    }
+
+    fn new(
+        handler: Box<dyn StreamHandler>,
+        permit: Option<super::budget::StreamPermit>,
+    ) -> StreamDriver {
+        let deadline = Instant::now() + limits::current().transfer_timeout;
+        StreamDriver {
             handler,
-            deadline: Instant::now() + limits::current().transfer_timeout,
+            deadline,
+            wakeup: deadline,
             file: None,
             closing: None,
             _permit: permit,
-        })
+        }
     }
 
     pub fn has_file(&self) -> bool {
@@ -150,7 +172,7 @@ impl StreamDriver {
         out_at: &mut usize,
         last_active: &mut Instant,
     ) -> bool {
-        if now < self.deadline {
+        if now < self.wakeup {
             return true;
         }
         if !self.on_event(StreamEvent::Tick(now), out, out_at) {
@@ -167,6 +189,7 @@ impl StreamDriver {
 
     fn touch(&mut self) {
         self.deadline = Instant::now() + limits::current().transfer_timeout;
+        self.wakeup = self.deadline;
     }
 
     fn on_event(&mut self, event: StreamEvent<'_>, out: &mut Vec<u8>, out_at: &mut usize) -> bool {
@@ -184,8 +207,13 @@ impl StreamDriver {
             self.touch();
         }
         if let Some(requested) = step.deadline {
-            if requested < self.deadline {
-                self.deadline = requested;
+            // A short protocol wakeup schedules a tick; it does not postpone
+            // the server's no-progress bound, and a full output buffer still
+            // closes the connection when that bound expires.
+            self.wakeup = requested.min(self.deadline);
+            let now = Instant::now();
+            if self.wakeup < now {
+                self.wakeup = now;
             }
         }
         match step.action {
@@ -347,7 +375,8 @@ fn read_file_chunk(send: &mut FileSend, out: &mut Vec<u8>, limit: usize) -> std:
 mod tests {
     use super::*;
     use std::fs::{self, File};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::net::TcpListener;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn a_file_chunk_never_grows_past_the_stream_buffer() {
@@ -382,5 +411,120 @@ mod tests {
             "a full output buffer stops the read at the high-water mark"
         );
         let _ = fs::remove_file(&path);
+    }
+
+    /// A handler that only waits for the next poll tick and never writes.
+    /// This is the shape of an SSE handler between upstream progress events.
+    struct IdleWaiter {
+        ticks: usize,
+        wait: Duration,
+    }
+
+    impl StreamHandler for IdleWaiter {
+        fn on_event(&mut self, event: StreamEvent<'_>, _out: &mut OutBuffer<'_>) -> StreamStep {
+            match event {
+                StreamEvent::Tick(now) => {
+                    self.ticks += 1;
+                    StreamStep::wait(StreamAction::NeedRead).within(now + self.wait)
+                }
+                StreamEvent::Writable => {
+                    _out.write(b"x");
+                    StreamStep::wait(StreamAction::NeedWrite).within(Instant::now() + self.wait)
+                }
+                StreamEvent::Closed(_) => {
+                    StreamStep::wait(StreamAction::Close(CloseReason::PeerClosed))
+                }
+                _ => StreamStep::wait(StreamAction::Continue),
+            }
+        }
+    }
+
+    /// A connected socket pair. The handler never reads or writes it in these
+    /// tests; the driver only needs a real socket for its write path.
+    fn socket() -> TcpStream {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        TcpStream::connect(address).expect("connect")
+    }
+
+    fn driver(wait: Duration) -> StreamDriver {
+        match StreamDriver::admit(Box::new(IdleWaiter { ticks: 0, wait }), usize::MAX) {
+            StreamAdmission::Admitted(driver) => driver,
+            StreamAdmission::Busy => panic!("an unlimited budget admits the handler"),
+        }
+    }
+
+    #[test]
+    fn a_short_wakeup_ticks_the_handler_without_shortening_the_bound() {
+        let mut driver = driver(Duration::from_millis(100));
+        let mut stream = socket();
+        let mut out = Vec::new();
+        let mut out_at = 0;
+        let mut last_active = Instant::now();
+
+        // The first writable event asks for a short poll wakeup.
+        assert!(driver.on_writable(&mut stream, &mut out, &mut out_at, &mut last_active));
+        let bound = driver.deadline;
+        assert!(
+            driver.wakeup < bound,
+            "the handler asked for a shorter wakeup"
+        );
+        out.clear();
+        out_at = 0;
+
+        assert!(driver.on_tick(
+            driver.wakeup + Duration::from_millis(1),
+            &mut stream,
+            &mut out,
+            &mut out_at,
+            &mut last_active,
+        ));
+        assert_eq!(
+            driver.deadline, bound,
+            "a poll tick must not replace the server's no-progress bound"
+        );
+    }
+
+    #[test]
+    fn an_idle_handler_still_closes_at_the_no_progress_bound() {
+        let mut driver = driver(Duration::from_millis(100));
+        let bound = driver.deadline;
+        let mut stream = socket();
+        let mut out = Vec::new();
+        let mut out_at = 0;
+        let mut last_active = Instant::now();
+
+        assert!(
+            !driver.on_tick(
+                bound + Duration::from_millis(1),
+                &mut stream,
+                &mut out,
+                &mut out_at,
+                &mut last_active,
+            ),
+            "the handler cannot extend the bound by asking for a tick"
+        );
+        assert_eq!(driver.closing, Some(CloseReason::TimedOut));
+    }
+
+    #[test]
+    fn output_progress_resets_the_bound_and_the_wakeup() {
+        let mut driver = driver(Duration::from_millis(100));
+        let bound = driver.deadline;
+        let mut stream = socket();
+        let mut out = Vec::new();
+        let mut out_at = 0;
+        let mut last_active = Instant::now();
+
+        assert!(driver.on_writable(&mut stream, &mut out, &mut out_at, &mut last_active));
+        assert!(!out.is_empty(), "the handler wrote a byte");
+        assert!(
+            driver.deadline > bound,
+            "writing progress must push the no-progress bound forward"
+        );
+        assert!(
+            driver.wakeup < driver.deadline,
+            "the handler's short wakeup stays earlier than the bound"
+        );
     }
 }
