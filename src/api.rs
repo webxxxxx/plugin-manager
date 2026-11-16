@@ -131,10 +131,15 @@ pub fn spawn(config: PathBuf, raw_hub: Arc<crate::rawhub::RawHub>) -> std::io::R
 
     let lan = Arc::new(Mutex::new(state));
     let api = Arc::new(Api { lan: lan.clone() });
+    // The reactor parses request heads and prepares the takeover routes (plugin
+    // UI streams load the plugin manifest), which is the same class of work
+    // transfer_stack exists for. io_stack (32 KiB floor) and request_stack
+    // (64 KiB floor) both overflowed there under a minimal svcd.conf and
+    // aborted the whole daemon (#108).
     #[cfg(unix)]
     thread::Builder::new()
         .name("svcd-http-reactor".into())
-        .stack_size(threads::io_stack())
+        .stack_size(threads::transfer_stack())
         .spawn(move || reactor_loop(Some(listener), lan, config, raw_hub))?;
     #[cfg(not(unix))]
     {

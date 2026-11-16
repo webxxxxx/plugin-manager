@@ -1588,6 +1588,12 @@ impl Daemon {
                 #[cfg(unix)]
                 slot.set_reactor(self.reactor.clone());
                 slot.set_raw_hub(Some(self.raw_hub.clone()));
+                // A slot created by a runtime install needs the same contract,
+                // projector, call budget and notification sink the boot path
+                // gives it. Without this the plugin answers calls but its
+                // notifications never reach the UI bus, and default_timeout is
+                // not applied to its calls.
+                configure_slot(&mut slot, &service);
                 self.slots.insert(id.clone(), slot);
             }
         }
@@ -1696,6 +1702,12 @@ impl Daemon {
                 #[cfg(unix)]
                 slot.set_reactor(self.reactor.clone());
                 slot.set_raw_hub(Some(self.raw_hub.clone()));
+                // A slot created by a runtime install needs the same contract,
+                // projector, call budget and notification sink the boot path
+                // gives it. Without this the plugin answers calls but its
+                // notifications never reach the UI bus, and default_timeout is
+                // not applied to its calls.
+                configure_slot(&mut slot, &service);
                 self.slots.insert(id.clone(), slot);
             }
         }

@@ -64,5 +64,7 @@ jobs:
           key: mem-${{ matrix.level }}
       - name: Limits tests under ${{ matrix.level }}
         run: cargo test --bin svcd limits::tests -- --test-threads=1
+      - name: Minimal svcd.conf keeps the daemon alive (#108)
+        run: cargo test --test http minimal_svcd_conf -- --test-threads=1
       - name: Check the profile compiles
         run: cargo check --bin svcd

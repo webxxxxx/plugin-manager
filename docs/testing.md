@@ -74,7 +74,12 @@ MCP 不是 W3C，不要用 WPT 套；官方 SDK + 规范逐条向量就是这一
 
 已覆盖的坑：`max_streams=0`、`request_stack_bytes=1`、`io_stack_bytes=1`、`idle_timeout=0`、`u64::MAX` 超时。
 
-还缺一条**运行时崩溃回归**：用「全部取最小值」的 `svcd.conf` 启动 daemon，依次打 HTTP / MCP / WebSocket / SSE，断言返回 4xx/413 而不是进程退出。这条比纯 `Limits` 单测更接近用户报的「设置过小崩溃」。
+第 4 条已经落地：`tests/http.rs::minimal_svcd_conf_keeps_the_daemon_alive` 用两份 `svcd.conf` 驱动真实 daemon，比纯 `Limits` 单测更接近用户报的「设置过小崩溃」。
+
+- **floor**：每个键都取解析器接受的最小值（0/1）。断言夹取真的到了运行期（超长 header 400、超 body 413、零订阅 429、超连接 503），进程不退出、不 panic、不重启。
+- **usable**：同样的下限，只把「0 等于关掉功能」的键抬到最小可用值（连接 2、订阅 1、`default_timeout` 1000 ms），让 HTTP / MCP / WebSocket / SSE 各完成一次真实往返：WS ping/pong 与 1009、SSE 投递与 `Last-Event-ID` 重连、`/mcp` 的 `tools/list`/`tools/call` 与 stdio bridge 的 `initialize`。
+
+每条探针都归属一个 `svcd.conf` 键，失败时打印该键、原始请求、响应和 daemon 输出。
 
 ## 5. 性能测试
 
@@ -102,6 +107,10 @@ cargo test
 MEM_LEVEL=low cargo test --bin svcd limits::tests -- --test-threads=1
 MEM_LEVEL=middle cargo test --bin svcd limits::tests -- --test-threads=1
 MEM_LEVEL=high cargo test --bin svcd limits::tests -- --test-threads=1
+
+# 运行时崩溃回归（#108，MEM_LEVEL 各跑一次）
+cargo test --test http minimal_svcd_conf -- --test-threads=1
+MEM_LEVEL=low CARGO_TARGET_DIR=target/mem-low cargo test --test http minimal_svcd_conf -- --test-threads=1
 
 # L2（需要 release 二进制 + tools/perf 依赖）
 cargo build --release

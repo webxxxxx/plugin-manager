@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -4297,4 +4297,1297 @@ fn http_keep_alive_serves_two_requests_on_one_connection() {
     let second = read_one_response(&mut stream);
     assert_eq!(second.status, 200);
     assert_eq!(raw_header_values(&second, "connection"), vec!["close"]);
+}
+
+// ---------------------------------------------------------------------------
+// #108: a live daemon must survive the smallest svcd.conf the parser takes.
+//
+// limits::tests proves the clamp arithmetic for these keys; this proves the
+// running daemon actually uses the clamped values and stays up while each
+// surface is exercised. Two configs share one entry point because the raw floor
+// of a few keys is a *disabled* feature rather than a smaller one:
+//
+//   floor  - every key at the smallest value the parser accepts (0 where zero
+//            is meaningful, 1 elsewhere). Every surface must answer with a
+//            defined status (413 / 400-or-431 / 429 / 503) instead of dying.
+//   usable - the same floors except the keys whose raw floor cannot carry one
+//            live stream plus the request that feeds it:
+//            max_connections / max_connections_per_ip 1 -> 2,
+//            max_subscriptions / max_subscribers_per_plugin 0 -> 1,
+//            default_timeout 0 -> 1000 ms, because a plugin round trip has to
+//            finish inside the call budget before a stream can emit anything.
+//            Every buffer and stack size stays at the floor.
+//
+// Each probe names the svcd.conf key it stresses; a failure prints that key,
+// the exact request, the response and the daemon's own output.
+// ---------------------------------------------------------------------------
+
+const MIN_CONFIG_PASSWORD: &str = "min-config-password";
+
+/// The Unix reactor enforces a daemon-wide connection cap and the configured
+/// idle timeout. The Windows listener accepts one thread per connection and
+/// hard-codes a 60 s read timeout, so max_connections /
+/// max_connections_per_ip / http_idle_timeout_secs have no effect there yet
+/// (found by this regression; tracked as #110).
+#[cfg(unix)]
+const CONNECTION_ENFORCEMENT: bool = true;
+#[cfg(not(unix))]
+const CONNECTION_ENFORCEMENT: bool = false;
+
+/// Every runtime limit svcd.conf accepts, at the parser's raw minimum.
+const MINIMAL_LIMITS: &[(&str, &str)] = &[
+    ("request_stack_bytes", "1"),
+    ("io_stack_bytes", "1"),
+    ("max_body_bytes", "1"),
+    ("max_json_body_bytes", "1"),
+    ("max_complete_body_bytes", "1"),
+    ("max_header_bytes", "1"),
+    ("max_streams", "0"),
+    ("stream_buffer_bytes", "1"),
+    ("max_connections", "1"),
+    ("max_connections_per_ip", "1"),
+    ("max_subscriptions", "0"),
+    ("max_subscribers_per_plugin", "0"),
+    ("http_idle_timeout_secs", "0"),
+    ("log_max_bytes", "1"),
+    ("log_rotations", "0"),
+    ("max_package_bytes", "1"),
+    ("transfer_timeout_secs", "0"),
+    ("default_timeout", "0"),
+    ("max_timeout", "0"),
+    ("ws_max_message_bytes", "1"),
+    ("ws_inflight_bytes", "1"),
+    ("ws_inflight_requests", "0"),
+    ("ws_buffer_shrink_bytes", "1"),
+    ("ws_raw_max_bytes", "1"),
+    ("ws_raw_queue", "0"),
+];
+
+const NO_OVERRIDES: &[(&str, &str)] = &[];
+
+const USABLE_OVERRIDES: &[(&str, &str)] = &[
+    ("max_connections", "2"),
+    ("max_connections_per_ip", "2"),
+    ("max_subscriptions", "1"),
+    ("max_subscribers_per_plugin", "1"),
+    ("default_timeout", "1000"),
+];
+
+fn override_for<'a>(overrides: &'a [(&str, &str)], key: &str) -> Option<&'a str> {
+    overrides
+        .iter()
+        .find(|(name, _)| *name == key)
+        .map(|(_, value)| *value)
+}
+
+fn minimal_conf(overrides: &[(&str, &str)]) -> String {
+    let mut conf =
+        String::from("# #108: every limit at its raw minimum; a live daemon must survive it.\n");
+    for &(key, floor) in MINIMAL_LIMITS {
+        let value = override_for(overrides, key).unwrap_or(floor);
+        conf.push_str(&format!("{} = {}\n", key, value));
+    }
+    conf
+}
+
+/// A raw HTTP exchange that reports a dead socket instead of panicking, so a
+/// failed probe can still name the svcd.conf key and the request it sent.
+struct Exchange {
+    status: u16,
+    head: String,
+    body: Vec<u8>,
+    error: Option<String>,
+}
+
+impl Exchange {
+    fn describe(&self) -> String {
+        match &self.error {
+            Some(error) => format!("no HTTP response: {error}"),
+            None => {
+                let body = String::from_utf8_lossy(&self.body);
+                let body: String = body.chars().take(400).collect();
+                format!("status {}\n{}body: {}", self.status, self.head, body)
+            }
+        }
+    }
+
+    fn json(&self) -> Option<Value> {
+        serde_json::from_slice(&self.body).ok()
+    }
+}
+
+fn parse_exchange(raw: &[u8]) -> Exchange {
+    let Some(split) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return Exchange {
+            status: 0,
+            head: String::new(),
+            body: Vec::new(),
+            error: Some(format!(
+                "incomplete response {:?}",
+                String::from_utf8_lossy(raw)
+            )),
+        };
+    };
+    let head = String::from_utf8_lossy(&raw[..split]).to_string();
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(0);
+    Exchange {
+        status,
+        head,
+        body: raw[split + 4..].to_vec(),
+        error: None,
+    }
+}
+
+/// Write one request and read the response status line first, then the
+/// declared body. A server that rejects an oversized request may answer and
+/// close while the rest of that request is still in flight, which turns the
+/// close into a reset; a client that only calls read_to_end can lose the
+/// already-written status line to it. The status line is what the regression
+/// asserts, so read it before any reset can matter.
+fn exchange(address: &str, head: &str, body: &[u8]) -> Exchange {
+    let mut stream = match TcpStream::connect(address) {
+        Ok(stream) => stream,
+        Err(error) => {
+            return Exchange {
+                status: 0,
+                head: String::new(),
+                body: Vec::new(),
+                error: Some(format!("connect {address}: {error}")),
+            }
+        }
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    if let Err(error) = stream
+        .write_all(head.as_bytes())
+        .and_then(|()| stream.write_all(body))
+        .and_then(|()| stream.flush())
+    {
+        return Exchange {
+            status: 0,
+            head: String::new(),
+            body: Vec::new(),
+            error: Some(format!("write: {error}")),
+        };
+    }
+
+    let mut raw = Vec::new();
+    let mut failure = None;
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => {
+                if raw.is_empty() {
+                    failure = Some("connection closed before a response head".to_string());
+                }
+                break;
+            }
+            Ok(_) => {
+                raw.push(byte[0]);
+                if raw.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+                if raw.len() > 64 * 1024 {
+                    failure = Some("response head is too large".to_string());
+                    break;
+                }
+            }
+            Err(error) => {
+                if raw.is_empty() {
+                    failure = Some(format!("read head: {error}"));
+                }
+                break;
+            }
+        }
+    }
+    if failure.is_none() && !raw.is_empty() {
+        let text = String::from_utf8_lossy(&raw).to_string();
+        let length = text.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if !name.eq_ignore_ascii_case("content-length") {
+                return None;
+            }
+            value.trim().parse::<usize>().ok()
+        });
+        if let Some(length) = length {
+            let mut declared = vec![0u8; length.min(1024 * 1024)];
+            let mut filled = 0;
+            while filled < declared.len() {
+                match stream.read(&mut declared[filled..]) {
+                    Ok(0) => break,
+                    Ok(read) => filled += read,
+                    // A reset after the head must not hide the status line.
+                    Err(_) => break,
+                }
+            }
+            raw.extend_from_slice(&declared[..filled]);
+        }
+    }
+    // Every probe sends Connection: close, so draining to EOF guarantees the
+    // server already dropped this connection and freed its (one) admission
+    // slot before the next probe connects. A reset here is irrelevant: the
+    // status line is already captured.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut sink = [0u8; 512];
+    while let Ok(read) = stream.read(&mut sink) {
+        if read == 0 {
+            break;
+        }
+    }
+
+    let mut exchange = parse_exchange(&raw);
+    exchange.error = exchange.error.or(failure);
+    if exchange.error.is_some() {
+        exchange.error = Some(format!(
+            "{} (received {} bytes)",
+            exchange.error.unwrap_or_default(),
+            raw.len()
+        ));
+    }
+    exchange
+}
+
+fn read_status_line(stream: &mut TcpStream) -> Result<u16, String> {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        if head.len() > 8192 {
+            return Err("response head is too long".to_string());
+        }
+        match stream.read(&mut byte) {
+            Ok(0) => return Err("connection closed before a status line".to_string()),
+            Ok(_) => {}
+            Err(error) => return Err(format!("read: {error}")),
+        }
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&head).to_string();
+    text.lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| format!("bad status line {:?}", text))
+}
+
+fn tail_text(text: &str, lines: usize) -> String {
+    let all: Vec<&str> = text.lines().collect();
+    all[all.len().saturating_sub(lines)..].join("\n")
+}
+
+fn daemon_state(sandbox: &mut Sandbox) -> String {
+    match sandbox.daemon.as_mut() {
+        None => "no daemon handle".to_string(),
+        Some(child) => match child.try_wait() {
+            Ok(None) => format!("running (pid {})", child.id()),
+            Ok(Some(status)) => format!("EXITED ({status})"),
+            Err(error) => format!("try_wait failed: {error}"),
+        },
+    }
+}
+
+fn regression_failure(
+    sandbox: &mut Sandbox,
+    key: &str,
+    request: &str,
+    expected: &str,
+    actual: &str,
+) -> ! {
+    let state = daemon_state(sandbox);
+    let stderr = tail_text(&sandbox.daemon_log(), 40);
+    panic!(
+        "minimal-config regression failed\n  svcd.conf key: {key}\n  request: {request}\n  expected: {expected}\n  actual: {actual}\n  daemon: {state}\n  daemon stderr (tail):\n{stderr}"
+    )
+}
+
+fn expect_status(
+    sandbox: &mut Sandbox,
+    key: &str,
+    request: &str,
+    allowed: &[u16],
+    response: &Exchange,
+) {
+    if response.error.is_none() && allowed.contains(&response.status) {
+        return;
+    }
+    regression_failure(
+        sandbox,
+        key,
+        request,
+        &format!("status in {allowed:?}"),
+        &response.describe(),
+    );
+}
+
+fn expect_error_code(
+    sandbox: &mut Sandbox,
+    key: &str,
+    request: &str,
+    code: &str,
+    response: &Exchange,
+) {
+    if String::from_utf8_lossy(&response.body).contains(code) {
+        return;
+    }
+    regression_failure(
+        sandbox,
+        key,
+        request,
+        &format!("an error with code {:?}", code),
+        &response.describe(),
+    );
+}
+
+fn expect_status_code(
+    sandbox: &mut Sandbox,
+    key: &str,
+    request: &str,
+    allowed: &[u16],
+    status: u16,
+    head: &str,
+) {
+    if allowed.contains(&status) {
+        return;
+    }
+    regression_failure(
+        sandbox,
+        key,
+        request,
+        &format!("status in {allowed:?}"),
+        &format!("status {status}\n{head}"),
+    );
+}
+
+fn assert_daemon_alive(sandbox: &mut Sandbox, phase: &str) {
+    let state = daemon_state(sandbox);
+    if !state.starts_with("running") {
+        regression_failure(
+            sandbox,
+            "liveness",
+            &format!("daemon of the {phase} config"),
+            "the process still running",
+            &state,
+        );
+    }
+    let mut panics: Vec<String> = Vec::new();
+    if let Some(line) = sandbox
+        .daemon_log()
+        .lines()
+        .find(|line| line.contains("panicked"))
+    {
+        panics.push(format!("stderr: {line}"));
+    }
+    if let Ok(entries) = fs::read_dir(&sandbox.logs) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Ok(text) = fs::read_to_string(&path) {
+                if let Some(line) = text.lines().find(|line| line.contains("panicked")) {
+                    panics.push(format!("{}: {line}", path.display()));
+                }
+            }
+        }
+    }
+    if !panics.is_empty() {
+        regression_failure(
+            sandbox,
+            "liveness",
+            &format!("daemon of the {phase} config"),
+            "no panicked marker in stderr or the log files",
+            &panics.join("\n"),
+        );
+    }
+}
+
+/// One MCP request over the Streamable HTTP binding.
+fn mcp_min_exchange(
+    address: &str,
+    password: &str,
+    method: &str,
+    params: Value,
+    name: Option<&str>,
+) -> Exchange {
+    let mut params = params;
+    if !params.is_object() {
+        params = json!({});
+    }
+    params["_meta"] = modern_meta();
+    let body = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    }))
+    .expect("serialize mcp request");
+    let mut head = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: {}\r\n",
+        address, password, method
+    );
+    if let Some(name) = name {
+        head.push_str(&format!("Mcp-Name: {}\r\n", name));
+    }
+    head.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    ));
+    exchange(address, &head, &body)
+}
+
+/// Read SSE events until one contains `needle`, reporting what arrived
+/// instead of panicking, so a failure can name the config key and the stream.
+fn sse_next_event(
+    stream: &mut TcpStream,
+    needle: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let _ = stream.set_read_timeout(Some(timeout));
+    let mut seen = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => {
+                return Err(format!(
+                    "stream closed before an event containing {:?}; saw {:?}",
+                    needle,
+                    String::from_utf8_lossy(&seen)
+                ))
+            }
+            Ok(_) => {
+                seen.push(byte[0]);
+                if seen.ends_with(b"\n\n") {
+                    let text = String::from_utf8_lossy(&seen).to_string();
+                    if text.contains(needle) {
+                        return Ok(text);
+                    }
+                    seen.clear();
+                }
+            }
+            Err(error) => {
+                return Err(format!(
+                    "read: {error}; saw {:?}",
+                    String::from_utf8_lossy(&seen)
+                ))
+            }
+        }
+    }
+}
+
+/// Open an SSE stream, retrying the 429 a previous subscriber can cause while
+/// the reactor has not noticed its EOF yet.
+fn sse_open_retrying(address: &str, path: &str, last_id: Option<u64>) -> Result<TcpStream, String> {
+    let mut last = String::new();
+    for _ in 0..80 {
+        let mut stream =
+            TcpStream::connect(address).map_err(|error| format!("connect: {error}"))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|error| format!("timeout: {error}"))?;
+        let mut request = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\n",
+            path, address
+        );
+        if let Some(last_id) = last_id {
+            request.push_str(&format!("Last-Event-ID: {}\r\n", last_id));
+        }
+        request.push_str("\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|error| format!("write: {error}"))?;
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream
+                .read_exact(&mut byte)
+                .map_err(|error| format!("read head: {error}"))?;
+            head.push(byte[0]);
+        }
+        let text = String::from_utf8_lossy(&head).to_string();
+        let status = text
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(0);
+        if status == 200 {
+            return Ok(stream);
+        }
+        if status != 429 {
+            return Err(format!("status {status}: {text}"));
+        }
+        last = text;
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!(
+        "the previous subscriber was never released: {last}"
+    ))
+}
+
+#[test]
+fn minimal_svcd_conf_keeps_the_daemon_alive() {
+    run_min_config_phase("floor", false);
+    run_min_config_phase("usable", true);
+}
+
+fn run_min_config_phase(phase: &str, streams: bool) {
+    let overrides = if streams {
+        USABLE_OVERRIDES
+    } else {
+        NO_OVERRIDES
+    };
+    let mut sandbox = Sandbox::new();
+    fs::write(sandbox.config.join("svcd.conf"), minimal_conf(overrides)).expect("write svcd.conf");
+
+    let key = SigningKey::from_bytes(&[0x6d; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let package = web_event_plugin_bundle(&key, "demo");
+
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let port_before = fs::read_to_string(sandbox.config.join("http.port")).expect("http.port");
+
+    // wait_for_http drops a bare TCP connection. With max_connections = 1 the
+    // reactor can still count it when the first real request lands, so retry
+    // that one handshake instead of racing the clean-up.
+    let mut admitted = false;
+    let mut last = String::from("no attempt");
+    let warmup = format!(
+        "GET /api/v1/services HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        address
+    );
+    for _ in 0..80 {
+        let probe = exchange(&address, &warmup, b"");
+        if probe.status == 200 {
+            admitted = true;
+            break;
+        }
+        last = match &probe.error {
+            Some(error) => error.clone(),
+            None => format!("status {}", probe.status),
+        };
+        if probe.status != 503 && probe.error.is_none() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    if !admitted {
+        regression_failure(
+            &mut sandbox,
+            "max_connections",
+            "GET /api/v1/services (the first admitted request)",
+            "status 200 within 2 s",
+            &last,
+        );
+    }
+
+    // /mcp always authenticates with the configured password.
+    set_password(&sandbox, MIN_CONFIG_PASSWORD);
+
+    // One installed plugin, so the plugin-UI surfaces (WS/SSE) exist at all.
+    let installed = exchange(
+        &address,
+        &request_head(
+            &address,
+            "POST",
+            "/api/v1/plugins",
+            "application/octet-stream",
+            package.len(),
+            &[],
+        ),
+        &package,
+    );
+    expect_status(
+        &mut sandbox,
+        "max_package_bytes",
+        "POST /api/v1/plugins (signed demo package)",
+        &[200],
+        &installed,
+    );
+    let started = exchange(
+        &address,
+        &request_head(&address, "POST", "/api/v1/services/demo/start", "", 0, &[]),
+        b"",
+    );
+    expect_status(
+        &mut sandbox,
+        "max_connections",
+        "POST /api/v1/services/demo/start",
+        &[200],
+        &started,
+    );
+
+    // max_package_bytes clamps to 1 MiB. Package installs are a streaming
+    // takeover, so the gate is this key (not max_body_bytes, which only bounds
+    // the non-tar import body): an over-size Content-Length is refused before a
+    // single body byte is read. The compile-time defaults are 8/64/512 MiB.
+    let over_package = exchange(
+        &address,
+        &request_head(
+            &address,
+            "POST",
+            "/api/v1/plugins",
+            "application/octet-stream",
+            1024 * 1024 + 1,
+            &[],
+        ),
+        b"",
+    );
+    expect_status(
+        &mut sandbox,
+        "max_package_bytes",
+        "POST /api/v1/plugins with Content-Length: 1048577 and no body",
+        &[413],
+        &over_package,
+    );
+    expect_error_code(
+        &mut sandbox,
+        "max_package_bytes",
+        "POST /api/v1/plugins with Content-Length: 1048577 and no body",
+        "payload_too_large",
+        &over_package,
+    );
+
+    // max_json_body_bytes clamps to 4 KiB on the ordinary JSON routes.
+    let over_json = exchange(
+        &address,
+        &request_head(
+            &address,
+            "POST",
+            "/api/v1/services/demo/start",
+            "application/json",
+            4 * 1024 + 1,
+            &[],
+        ),
+        b"",
+    );
+    expect_status(
+        &mut sandbox,
+        "max_json_body_bytes",
+        "POST /api/v1/services/demo/start with Content-Length: 4097 and no body",
+        &[413],
+        &over_json,
+    );
+
+    // max_header_bytes clamps to 1 KiB: a request just under the clamp parses...
+    let pad = "a".repeat(700);
+    let under_header = exchange(
+        &address,
+        &request_head(
+            &address,
+            "GET",
+            "/api/v1/services",
+            "",
+            0,
+            &[("X-Pad", pad.as_str())],
+        ),
+        b"",
+    );
+    expect_status(
+        &mut sandbox,
+        "max_header_bytes",
+        "GET /api/v1/services with a ~800-byte header block",
+        &[200],
+        &under_header,
+    );
+
+    // ...and one just over it is refused. The whole request fits in one read,
+    // so nothing is left unread and the status line survives the close.
+    // 8/16/64 KiB (the compile-time defaults) would accept ~1.1 KiB, so this is
+    // the clamp in action. RFC 9110 asks for 431; the current code answers 400,
+    // and #106 owns that conformance change.
+    let just_over = "a".repeat(1000);
+    let over_header = exchange(
+        &address,
+        &request_head(
+            &address,
+            "GET",
+            "/api/v1/services",
+            "",
+            0,
+            &[("X-Pad", just_over.as_str())],
+        ),
+        b"",
+    );
+    expect_status(
+        &mut sandbox,
+        "max_header_bytes",
+        "GET /api/v1/services with a ~1.1 KiB header block (clamp is 1024)",
+        &[400, 431],
+        &over_header,
+    );
+
+    // A much larger header block is the abortive-close case: the daemon answers
+    // and closes while the request is still arriving, so the reset can discard
+    // the status line before the client reads it (Windows keeps 1 byte of it).
+    // The regression only requires that the daemon survives this input; the
+    // status code is pinned by the probe above and #106 owns the RFC 9110
+    // 431/graceful-close conformance.
+    let big = "a".repeat(4 * 1024);
+    let huge_header = exchange(
+        &address,
+        &request_head(
+            &address,
+            "GET",
+            "/api/v1/services",
+            "",
+            0,
+            &[("X-Pad", big.as_str())],
+        ),
+        b"",
+    );
+    if huge_header.status != 0 && !matches!(huge_header.status, 400 | 431) {
+        regression_failure(
+            &mut sandbox,
+            "max_header_bytes",
+            "GET /api/v1/services with a 4 KiB header block",
+            "an aborted connection or a 400/431 status",
+            &huge_header.describe(),
+        );
+    }
+    assert_daemon_alive(&mut sandbox, phase);
+
+    // Concurrent connections: on Unix the floor admits one connection and
+    // refuses the second with 503 at accept time; the usable config admits
+    // two. Without connection enforcement (Windows) both are simply answered.
+    // The refused socket is never written to, so its 503 is not lost to the
+    // abortive close a pending request would cause.
+    let mut admitted = TcpStream::connect(&address).expect("admitted connection");
+    let mut extra = TcpStream::connect(&address).expect("second connection");
+    for stream in [&admitted, &extra] {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    let concurrent = format!(
+        "GET /api/v1/services HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        address
+    );
+    if streams || !CONNECTION_ENFORCEMENT {
+        for (name, stream) in [("first", &mut admitted), ("second", &mut extra)] {
+            stream
+                .write_all(concurrent.as_bytes())
+                .expect("concurrent request");
+            let status = read_status_line(stream).unwrap_or_else(|error| {
+                regression_failure(
+                    &mut sandbox,
+                    "max_connections",
+                    &format!("{name} concurrent connection"),
+                    "status 200",
+                    &error,
+                )
+            });
+            if status != 200 {
+                regression_failure(
+                    &mut sandbox,
+                    if streams {
+                        "max_connections / max_connections_per_ip"
+                    } else {
+                        "max_connections"
+                    },
+                    &format!("{name} concurrent connection"),
+                    "status 200",
+                    &format!("status {status}"),
+                );
+            }
+        }
+    } else {
+        let refused = read_status_line(&mut extra).unwrap_or_else(|error| {
+            regression_failure(
+                &mut sandbox,
+                "max_connections",
+                "second concurrent connection (refused at accept, no request sent)",
+                "a 503 status line",
+                &error,
+            )
+        });
+        if refused != 503 {
+            regression_failure(
+                &mut sandbox,
+                "max_connections",
+                "second concurrent connection (refused at accept, no request sent)",
+                "status 503",
+                &format!("status {refused}"),
+            );
+        }
+        admitted
+            .write_all(concurrent.as_bytes())
+            .expect("admitted request");
+        let served = read_status_line(&mut admitted).unwrap_or_else(|error| {
+            regression_failure(
+                &mut sandbox,
+                "max_connections",
+                "first (admitted) concurrent connection",
+                "status 200",
+                &error,
+            )
+        });
+        if served != 200 {
+            regression_failure(
+                &mut sandbox,
+                "max_connections",
+                "first (admitted) concurrent connection",
+                "status 200",
+                &format!("status {served}"),
+            );
+        }
+    }
+
+    // http_idle_timeout_secs clamps to 1 s: on Unix the reactor's idle sweep
+    // closes a keep-alive connection instead of idling for the compile-time
+    // default (30/60/120 s). The Windows listener hard-codes a 60 s read
+    // timeout, so the key has no effect there.
+    let mut idle = TcpStream::connect(&address).expect("idle connection");
+    idle.set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("timeout");
+    idle.write_all(
+        format!(
+            "GET /api/v1/services HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\n\r\n",
+            address
+        )
+        .as_bytes(),
+    )
+    .expect("keep-alive request");
+    let kept = read_one_response(&mut idle);
+    if kept.status != 200 {
+        regression_failure(
+            &mut sandbox,
+            "http_idle_timeout_secs",
+            "keep-alive GET /api/v1/services",
+            "status 200 on the keep-alive connection",
+            &format!("status {}", kept.status),
+        );
+    }
+    let opened = Instant::now();
+    let mut closed = false;
+    let mut sink = [0u8; 128];
+    while CONNECTION_ENFORCEMENT && opened.elapsed() < Duration::from_secs(8) {
+        match idle.read(&mut sink) {
+            Ok(0) => {
+                closed = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => {
+                closed = true;
+                break;
+            }
+        }
+    }
+    if CONNECTION_ENFORCEMENT && !closed {
+        regression_failure(
+            &mut sandbox,
+            "http_idle_timeout_secs",
+            "keep-alive GET /api/v1/services left idle",
+            "the daemon closes an idle connection within ~1 s",
+            "still open after 8 s",
+        );
+    }
+
+    // MCP over Streamable HTTP: tools/list and tools/call. The modern binding
+    // has no initialize handshake, so that method must answer 404 -32601
+    // rather than drop the connection.
+    let listed = mcp_min_exchange(&address, MIN_CONFIG_PASSWORD, "tools/list", json!({}), None);
+    expect_status(
+        &mut sandbox,
+        "max_json_body_bytes",
+        "POST /mcp tools/list",
+        &[200],
+        &listed,
+    );
+    let listed = listed.json().unwrap_or_else(|| {
+        regression_failure(
+            &mut sandbox,
+            "max_json_body_bytes",
+            "POST /mcp tools/list",
+            "a JSON-RPC response",
+            &listed.describe(),
+        )
+    });
+    let names = tool_names(&listed["result"]["tools"]);
+    if !names.contains(&"svc.health".to_string()) {
+        regression_failure(
+            &mut sandbox,
+            "max_json_body_bytes",
+            "POST /mcp tools/list",
+            "svc.health in result.tools",
+            &format!("tools {names:?}"),
+        );
+    }
+
+    let called = mcp_min_exchange(
+        &address,
+        MIN_CONFIG_PASSWORD,
+        "tools/call",
+        json!({"name": "svc.health", "arguments": {}}),
+        Some("svc.health"),
+    );
+    expect_status(
+        &mut sandbox,
+        "default_timeout",
+        "POST /mcp tools/call svc.health (100 ms budget at the floor)",
+        &[200],
+        &called,
+    );
+    let called = called.json().unwrap_or_else(|| {
+        regression_failure(
+            &mut sandbox,
+            "default_timeout",
+            "POST /mcp tools/call svc.health",
+            "a JSON-RPC response",
+            &called.describe(),
+        )
+    });
+    if called["result"].is_null() || called["result"]["isError"] == json!(true) {
+        regression_failure(
+            &mut sandbox,
+            "default_timeout",
+            "POST /mcp tools/call svc.health (100 ms budget at the floor)",
+            "a successful result",
+            &called.to_string(),
+        );
+    }
+
+    let initialize = mcp_min_exchange(&address, MIN_CONFIG_PASSWORD, "initialize", json!({}), None);
+    expect_status(
+        &mut sandbox,
+        "max_json_body_bytes",
+        "POST /mcp initialize (not spoken on the modern binding)",
+        &[404],
+        &initialize,
+    );
+
+    // The stdio bridge still speaks the legacy handshake; it reaches the same
+    // daemon over the control channel, not over HTTP.
+    let bridged = sandbox.mcp_stdio(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "min-config", "version": "1"}
+        }
+    }));
+    if bridged["result"]["serverInfo"]["name"] != json!("svcd") {
+        regression_failure(
+            &mut sandbox,
+            "default_timeout",
+            "stdio bridge initialize",
+            "result.serverInfo.name = svcd",
+            &bridged.to_string(),
+        );
+    }
+    let bridged_list = sandbox.mcp_stdio(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list",
+        "params": {"_meta": modern_meta()}
+    }));
+    let bridged_names = tool_names(&bridged_list["result"]["tools"]);
+    if !bridged_names.contains(&"svc.health".to_string()) {
+        regression_failure(
+            &mut sandbox,
+            "default_timeout",
+            "stdio bridge tools/list",
+            "svc.health in result.tools",
+            &format!("tools {bridged_names:?}"),
+        );
+    }
+
+    let base = plugin_ui_base(&address, "demo");
+    let ws_path = format!("{}ws", base);
+    let events_path = format!("{}events", base);
+
+    if streams {
+        let (mut ws, status, head) = ws_handshake(&address, &ws_path, &[]);
+        expect_status_code(
+            &mut sandbox,
+            "max_subscribers_per_plugin",
+            "GET <base>ws (Upgrade: websocket)",
+            &[101],
+            status,
+            &head,
+        );
+        let call = json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {"name": "status", "arguments": {}}
+        });
+        ws_send(&mut ws, 0x1, call.to_string().as_bytes());
+        let mut answered = false;
+        for _ in 0..8 {
+            let (opcode, payload) = ws_read(&mut ws);
+            if opcode != 0x1 {
+                continue;
+            }
+            let Ok(value) = serde_json::from_slice::<Value>(&payload) else {
+                continue;
+            };
+            if value["id"] == json!(21) && value["result"]["content"][0]["text"] == json!("pong") {
+                answered = true;
+                break;
+            }
+        }
+        if !answered {
+            regression_failure(
+                &mut sandbox,
+                "max_subscribers_per_plugin",
+                "WebSocket tools/call status",
+                "a JSON-RPC result frame with id 21",
+                "no matching frame",
+            );
+        }
+
+        // The plugin's own notification for the previous call is still queued,
+        // so skip text frames until the pong arrives.
+        ws_send(&mut ws, 0x9, b"min-config");
+        let mut pong = None;
+        for _ in 0..8 {
+            let (opcode, payload) = ws_read(&mut ws);
+            if opcode == 0xA {
+                pong = Some(payload);
+                break;
+            }
+        }
+        if pong.as_deref() != Some(b"min-config".as_ref()) {
+            regression_failure(
+                &mut sandbox,
+                "max_subscribers_per_plugin",
+                "WebSocket ping frame",
+                "a pong frame echoing the payload",
+                &format!("pong {pong:?}"),
+            );
+        }
+
+        // ws_max_message_bytes clamps to 1 KiB: a larger message is closed with
+        // 1009 instead of growing the buffer or dropping the socket silently.
+        ws_send(&mut ws, 0x1, &vec![b'x'; 2048]);
+        let mut close = None;
+        for _ in 0..8 {
+            let (opcode, payload) = ws_read(&mut ws);
+            if opcode == 0x8 {
+                close = Some(payload);
+                break;
+            }
+        }
+        let code = close
+            .as_ref()
+            .and_then(|payload| payload.get(0..2))
+            .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+            .unwrap_or(0);
+        if code != 1009 {
+            regression_failure(
+                &mut sandbox,
+                "ws_max_message_bytes",
+                "WebSocket text frame of 2048 bytes (clamp is 1024)",
+                "a close frame with code 1009",
+                &format!("close {close:?}"),
+            );
+        }
+        drop(ws);
+
+        // SSE: connect, receive one event, then reconnect with Last-Event-ID and
+        // receive the event published while no subscriber was attached.
+        // Retry a 429 here too: the WS probe's subscription is released by the
+        // server a poll cycle after its socket closes, and the usable config
+        // allows exactly one subscriber.
+        let mut sse = sse_open_retrying(&address, &events_path, None).unwrap_or_else(|error| {
+            regression_failure(
+                &mut sandbox,
+                "max_subscribers_per_plugin",
+                "GET <base>events (SSE)",
+                "status 200 within 2 s",
+                &error,
+            )
+        });
+        let rpc_path = format!("{}rpc", base);
+        let call = br#"{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"status","arguments":{}}}"#;
+        let answered = exchange(
+            &address,
+            &request_head(
+                &address,
+                "POST",
+                &rpc_path,
+                "application/json",
+                call.len(),
+                &[],
+            ),
+            call,
+        );
+        expect_status(
+            &mut sandbox,
+            "max_connections_per_ip",
+            "POST <base>rpc while the SSE stream holds the other connection",
+            &[200],
+            &answered,
+        );
+        if !String::from_utf8_lossy(&answered.body).contains("pong") {
+            regression_failure(
+                &mut sandbox,
+                "default_timeout",
+                "POST <base>rpc tools/call status (plugin round trip)",
+                "a result containing pong",
+                &answered.describe(),
+            );
+        }
+        let event = sse_next_event(&mut sse, "pong-event", Duration::from_secs(5)).unwrap_or_else(
+            |error| {
+                regression_failure(
+                    &mut sandbox,
+                    "max_subscribers_per_plugin",
+                    "GET <base>events (SSE) after one tools/call",
+                    "a notifications/message event",
+                    &error,
+                )
+            },
+        );
+        if !event.contains("notifications/message") {
+            regression_failure(
+                &mut sandbox,
+                "max_subscribers_per_plugin",
+                "GET <base>events (SSE)",
+                "a notifications/message event",
+                &event,
+            );
+        }
+        let last_id = sse_id(&event).unwrap_or_else(|| {
+            regression_failure(
+                &mut sandbox,
+                "max_subscribers_per_plugin",
+                "GET <base>events (SSE)",
+                "an id line on the event",
+                &event,
+            )
+        });
+        drop(sse);
+
+        let later = br#"{"jsonrpc":"2.0","id":32,"method":"tools/call","params":{"name":"status","arguments":{}}}"#;
+        let published = exchange(
+            &address,
+            &request_head(
+                &address,
+                "POST",
+                &rpc_path,
+                "application/json",
+                later.len(),
+                &[],
+            ),
+            later,
+        );
+        expect_status(
+            &mut sandbox,
+            "max_connections_per_ip",
+            "POST <base>rpc with no SSE subscriber attached",
+            &[200],
+            &published,
+        );
+
+        let mut replay =
+            sse_open_retrying(&address, &events_path, Some(last_id)).unwrap_or_else(|error| {
+                regression_failure(
+                    &mut sandbox,
+                    "max_subscribers_per_plugin",
+                    "GET <base>events with Last-Event-ID",
+                    "status 200 within 2 s",
+                    &error,
+                )
+            });
+        let replayed = sse_next_event(&mut replay, "pong-event", Duration::from_secs(5))
+            .unwrap_or_else(|error| {
+                regression_failure(
+                    &mut sandbox,
+                    "max_subscribers_per_plugin",
+                    "GET <base>events with Last-Event-ID",
+                    "the replayed event within 5 s",
+                    &error,
+                )
+            });
+        let replayed_id = sse_id(&replayed).unwrap_or_else(|| {
+            regression_failure(
+                &mut sandbox,
+                "max_subscribers_per_plugin",
+                "GET <base>events with Last-Event-ID",
+                "an id line on the replayed event",
+                &replayed,
+            )
+        });
+        if replayed_id <= last_id {
+            regression_failure(
+                &mut sandbox,
+                "max_subscribers_per_plugin",
+                "GET <base>events with Last-Event-ID",
+                &format!("a replayed event after id {last_id}"),
+                &format!("replayed id {replayed_id}: {replayed}"),
+            );
+        }
+        drop(replay);
+    } else {
+        // The floor disables UI subscribers outright: 0 is a feature switch,
+        // and both stream surfaces must say so instead of dropping the socket.
+        let upgrade = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            ws_path,
+            address,
+            ws_key()
+        );
+        let handshake = exchange(&address, &upgrade, b"");
+        expect_status(
+            &mut sandbox,
+            "max_subscribers_per_plugin",
+            "GET <base>ws (Upgrade: websocket, zero subscribers allowed)",
+            &[429],
+            &handshake,
+        );
+        let events = exchange(
+            &address,
+            &request_head(
+                &address,
+                "GET",
+                &events_path,
+                "",
+                0,
+                &[("Accept", "text/event-stream")],
+            ),
+            b"",
+        );
+        expect_status(
+            &mut sandbox,
+            "max_subscribers_per_plugin",
+            "GET <base>events (SSE, zero subscribers allowed)",
+            &[429],
+            &events,
+        );
+        expect_error_code(
+            &mut sandbox,
+            "max_subscribers_per_plugin",
+            "GET <base>events (SSE, zero subscribers allowed)",
+            "too_many_subscribers",
+            &events,
+        );
+    }
+
+    assert_daemon_alive(&mut sandbox, phase);
+    let port_after = fs::read_to_string(sandbox.config.join("http.port")).expect("http.port");
+    if port_after != port_before {
+        regression_failure(
+            &mut sandbox,
+            "liveness",
+            &format!("http.port of the {phase} config"),
+            &format!("{port_before:?} (the daemon must not restart)"),
+            &port_after,
+        );
+    }
 }
