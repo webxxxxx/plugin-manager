@@ -423,23 +423,6 @@ pub fn plan_installed_spk(version_dir: &Path) -> Result<TarPlan, String> {
     Ok(plan)
 }
 
-/// Stream the installed .spk without holding payload files in memory.
-pub fn write_installed_spk<W: Write>(version_dir: &Path, out: &mut W) -> Result<(), String> {
-    plan_installed_spk(version_dir)?.write_verified(out)
-}
-
-/// Rebuild a signed `.spk` from an installed version directory. The original
-/// `manifest.json` bytes and `signature.json` are kept verbatim.
-///
-/// A plugin installed with `allow_insecure_install` has no `signature.json`;
-/// exporting it as a signed package is impossible, so that case is reported
-/// explicitly.
-pub fn installed_spk(version_dir: &Path) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
-    write_installed_spk(version_dir, &mut bytes)?;
-    Ok(bytes)
-}
-
 #[derive(Debug)]
 pub struct Package {
     pub manifest: Manifest,

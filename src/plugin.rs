@@ -1455,12 +1455,6 @@ pub fn export_config(id: &str) -> Result<(String, Vec<u8>), String> {
     Ok((version, data))
 }
 
-pub fn export_spk(id: &str) -> Result<(String, Vec<u8>), String> {
-    let version = current_version(id).ok_or_else(|| format!("unknown plugin: {}", id))?;
-    let bytes = package::installed_spk(&plugin_dir(id).join(&version))?;
-    Ok((version, bytes))
-}
-
 /// The .spkb layout: backup.json, the nested .spk entry, the active config
 /// when there is one, and the tar trailer.
 ///
