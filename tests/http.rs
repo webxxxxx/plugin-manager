@@ -6435,3 +6435,66 @@ fn control_channel_rejects_an_unknown_token() {
     assert_eq!(response["error"]["code"], -32000, "{line}");
     assert_eq!(response["error"]["message"], "unauthorized", "{line}");
 }
+
+/// When the management channel cannot be reached, the MCP stream still starts
+/// with 200 + an SSE -32603, matching the old reactor's wire behaviour.
+#[cfg(unix)]
+#[test]
+fn http_mcp_stream_reports_an_unreachable_channel_as_an_sse_error() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    set_password(&sandbox, TEST_PASSWORD);
+    fs::remove_file(sandbox.config.join("svcd.sock")).expect("remove control socket");
+
+    let body = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 12,
+        "method": "tools/call",
+        "params": {
+            "name": "demo.status",
+            "arguments": {},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "progressToken": "t1"
+            }
+        }
+    }))
+    .expect("body");
+    let mut stream = TcpStream::connect(&address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: demo.status\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        address,
+        TEST_PASSWORD,
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).expect("write head");
+    stream.write_all(&body).expect("write body");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("read response");
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("headers");
+    let head = String::from_utf8_lossy(&response[..split]);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("content-type: text/event-stream"),
+        "{head}"
+    );
+    let text = String::from_utf8_lossy(&decode_chunked(&response[split + 4..])).to_string();
+    assert!(text.contains("\"code\":-32603"), "{text}");
+    assert!(text.contains("svcd unreachable"), "{text}");
+
+    // The control socket is gone, so stop the daemon directly; Drop would
+    // otherwise wait for the unreachable shutdown RPC.
+    if let Some(mut child) = sandbox.daemon.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}

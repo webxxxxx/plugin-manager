@@ -92,7 +92,7 @@ pub fn spawn(
     config: PathBuf,
     raw_hub: Arc<crate::rawhub::RawHub>,
     control: std::os::unix::net::UnixListener,
-    pending: mpsc::Sender<crate::channel::PendingCall>,
+    pending: mpsc::SyncSender<crate::channel::PendingCall>,
     wake: Arc<crate::wake::Wake>,
 ) -> std::io::Result<Arc<Api>> {
     let configured = settings::current().ok().and_then(|settings| settings.bind);
@@ -118,19 +118,28 @@ pub fn spawn(
     // The control channel is the server's lifeline now, so an HTTP bind
     // failure disables only HTTP; the loop still serves the CLI.
     let listener = match TcpListener::bind(bind) {
-        Ok(listener) => {
-            let local = listener.local_addr()?;
-            state.bind = local;
-            let port_file = config.join("http.port");
-            fs::write(&port_file, format!("127.0.0.1:{}", local.port())).map_err(|error| {
-                std::io::Error::other(format!("write {}: {}", port_file.display(), error))
-            })?;
-            log::svcd(&format!(
-                "svcd: HTTP API on {} (auth required: {})",
-                local, require_auth
-            ));
-            Some(listener)
-        }
+        Ok(listener) => match listener.local_addr() {
+            Ok(local) => {
+                state.bind = local;
+                let port_file = config.join("http.port");
+                if let Err(error) = fs::write(&port_file, format!("127.0.0.1:{}", local.port())) {
+                    log::svcd(&format!(
+                        "svcd: cannot write {}: {}",
+                        port_file.display(),
+                        error
+                    ));
+                }
+                log::svcd(&format!(
+                    "svcd: HTTP API on {} (auth required: {})",
+                    local, require_auth
+                ));
+                Some(listener)
+            }
+            Err(error) => {
+                log::svcd(&format!("svcd: HTTP API disabled: {}", error));
+                None
+            }
+        },
         Err(error) => {
             log::svcd(&format!("svcd: HTTP API disabled: {}", error));
             None

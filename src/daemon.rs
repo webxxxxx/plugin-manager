@@ -131,7 +131,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         }
     };
 
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(channel::PENDING_QUEUE_LIMIT);
     let wake = Arc::new(Wake::new());
     // The server loop owns the control listener on Unix; Windows keeps its
     // thread-per-connection fallback.

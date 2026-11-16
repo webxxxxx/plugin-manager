@@ -3,6 +3,8 @@ use std::fs;
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
+#[cfg(not(unix))]
+use std::sync::mpsc::SyncSender;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,6 +31,11 @@ pub enum ProgressEvent {
     /// The outbound stream could not be opened or read.
     Error(String),
 }
+
+/// Bound on queued management requests between the server loop and the
+/// supervisor loop. A full queue is a visible error, not memory growth; each
+/// control connection has at most one request in flight.
+pub const PENDING_QUEUE_LIMIT: usize = 256;
 
 pub struct PendingCall {
     pub line: String,
@@ -164,7 +171,7 @@ pub fn bind_server(config: &Path) -> io::Result<std::os::unix::net::UnixListener
 #[cfg(not(unix))]
 pub fn spawn_server(
     config: &Path,
-    tx: Sender<PendingCall>,
+    tx: SyncSender<PendingCall>,
     wake: std::sync::Arc<crate::wake::Wake>,
 ) -> io::Result<()> {
     let listener = Listener::bind(config)?;
@@ -192,7 +199,7 @@ pub fn spawn_server(
 }
 
 #[cfg(not(unix))]
-fn serve(stream: Stream, tx: Sender<PendingCall>, wake: std::sync::Arc<crate::wake::Wake>) {
+fn serve(stream: Stream, tx: SyncSender<PendingCall>, wake: std::sync::Arc<crate::wake::Wake>) {
     let mut reader = BufReader::new(stream);
     loop {
         let line = match ipc::read_frame_limit(&mut reader, ipc::LOCAL_FRAME_MAX) {

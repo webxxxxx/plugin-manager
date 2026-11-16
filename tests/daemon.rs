@@ -1,4 +1,5 @@
 use std::fs;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2754,4 +2755,18 @@ fn a_runtime_record_from_another_boot_is_ignored() {
         status
     );
     sandbox.stop_service("script");
+}
+
+/// An HTTP bind failure must disable only HTTP. The control channel owns the
+/// server loop now, so the CLI keeps working on the same daemon.
+#[test]
+fn a_busy_http_port_keeps_the_control_channel_alive() {
+    let occupied = TcpListener::bind("127.0.0.1:0").expect("occupy a port");
+    let port = occupied.local_addr().expect("occupied port").port();
+    let bind = format!("127.0.0.1:{}", port);
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon_with_env(&[("SVCD_BIND", bind.as_str())]);
+    // reload has no offline fallback; answering it proves the control loop is up.
+    sandbox.wait_for_daemon();
+    sandbox.shutdown();
 }

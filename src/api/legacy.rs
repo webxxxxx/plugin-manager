@@ -45,7 +45,7 @@ pub(super) const LEGACY_QUEUE_LIMIT: usize = 64;
 pub(crate) fn start(
     http: Option<TcpListener>,
     control: UnixListener,
-    pending: mpsc::Sender<PendingCall>,
+    pending: mpsc::SyncSender<PendingCall>,
     wake: Arc<Wake>,
     lan: Arc<Mutex<Lan>>,
     config: PathBuf,

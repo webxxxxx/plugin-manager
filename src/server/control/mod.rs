@@ -17,7 +17,7 @@ pub mod listener;
 use std::os::unix::io::RawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::thread;
 
@@ -32,11 +32,12 @@ use self::listener::{ControlServer, Source};
 #[cfg_attr(feature = "http", allow(dead_code))]
 pub fn spawn_control_only(
     listener: UnixListener,
-    tx: Sender<PendingCall>,
+    tx: SyncSender<PendingCall>,
     wake: Arc<Wake>,
 ) -> std::io::Result<LoopHandle> {
     let (notify_rx, notify_tx) = UnixStream::pair()?;
     notify_rx.set_nonblocking(true)?;
+    notify_tx.set_nonblocking(true)?;
     let notify_tx = Arc::new(notify_tx);
     let handle = LoopHandle::new(notify_tx.clone());
     let stop = handle.stop_flag();
@@ -122,5 +123,57 @@ impl LegacyBridge for ControlOnly {
     }
     fn on_stop(&mut self) {
         self.control.drain_for_shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rpc;
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// The minimal build runs the same loop without an HTTP listener. A CLI
+    /// request must still be answered and the loop must stop on the handle.
+    #[test]
+    fn the_control_only_loop_answers_a_request_and_stops() {
+        let root = std::env::temp_dir().join(format!(
+            "svcd-control-only-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("root");
+        let path = root.join("svcd.sock");
+        let listener = UnixListener::bind(&path).expect("listener");
+        let (tx, rx) = mpsc::sync_channel::<PendingCall>(8);
+        std::thread::spawn(move || {
+            for call in rx {
+                let value: serde_json::Value = serde_json::from_str(&call.line).expect("request");
+                let id = value.get("id").cloned();
+                let _ = call.reply.send(rpc::to_line(&rpc::ok(
+                    id,
+                    serde_json::json!({ "ok": true }),
+                )));
+            }
+        });
+        let handle = spawn_control_only(listener, tx, Arc::new(Wake::new())).expect("loop");
+
+        let mut stream = UnixStream::connect(&path).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("timeout");
+        stream
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"svcd.ping\"}\n")
+            .expect("write");
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).expect("reply");
+        let value: serde_json::Value = serde_json::from_str(line.trim()).expect("reply");
+        assert_eq!(value["id"], 5, "{line}");
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

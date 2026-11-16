@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,7 +38,7 @@ pub struct ControlServer {
     listener: UnixListener,
     connections: HashMap<u64, Connection>,
     next_id: u64,
-    tx: Sender<PendingCall>,
+    tx: SyncSender<PendingCall>,
     wake: Arc<Wake>,
     /// Shared with `Reply::with_notify`: the supervisor writes one byte after
     /// it queues a reply so the server loop can write it immediately.
@@ -48,7 +48,7 @@ pub struct ControlServer {
 impl ControlServer {
     pub fn new(
         listener: UnixListener,
-        tx: Sender<PendingCall>,
+        tx: SyncSender<PendingCall>,
         wake: Arc<Wake>,
         notify: Arc<UnixStream>,
     ) -> io::Result<ControlServer> {
@@ -160,14 +160,27 @@ impl ControlServer {
     /// buffer. Called from the server loop tick (the shared wake pipe fired, or
     /// the 100 ms poll expired).
     pub fn drain_replies(&mut self) {
-        for connection in self.connections.values_mut() {
-            let Some(receiver) = &connection.pending else {
+        let mut dead = Vec::new();
+        for (id, connection) in self.connections.iter_mut() {
+            let Some(receiver) = connection.pending.take() else {
                 continue;
             };
             let mut frames = Vec::new();
-            while let Ok(frame) = receiver.try_recv() {
-                frames.push(frame);
+            let mut disconnected = false;
+            loop {
+                match receiver.try_recv() {
+                    Ok(frame) => frames.push(frame),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        // The supervisor dropped the reply without a final
+                        // frame (shutdown or a crashed loop). Close the client
+                        // instead of leaving it waiting forever.
+                        disconnected = true;
+                        break;
+                    }
+                }
             }
+            let mut final_frame_seen = false;
             for frame in frames {
                 let final_frame = serde_json::from_str::<serde_json::Value>(&frame)
                     .ok()
@@ -176,9 +189,19 @@ impl ControlServer {
                 connection.out.extend_from_slice(frame.as_bytes());
                 connection.out.push(b'\n');
                 if final_frame {
-                    connection.pending = None;
+                    final_frame_seen = true;
                 }
             }
+            if final_frame_seen {
+                // The reply is queued in the output buffer; flush writes it.
+            } else if disconnected {
+                dead.push(*id);
+            } else {
+                connection.pending = Some(receiver);
+            }
+        }
+        for id in dead {
+            self.connections.remove(&id);
         }
     }
 
@@ -212,7 +235,7 @@ impl ControlServer {
 
 fn drain_requests(
     connection: &mut Connection,
-    tx: &Sender<PendingCall>,
+    tx: &SyncSender<PendingCall>,
     wake: &Arc<Wake>,
     notify: Arc<UnixStream>,
 ) -> bool {
@@ -244,14 +267,25 @@ fn drain_requests(
         let line: Vec<u8> = connection.buffer.drain(..=position).collect();
         let line = String::from_utf8_lossy(&line[..line.len().saturating_sub(1)]).to_string();
         let (sender, receiver) = mpsc::channel();
-        if tx
-            .send(PendingCall {
-                line,
-                reply: Reply::with_notify(sender, notify),
-            })
-            .is_err()
-        {
-            return false;
+        match tx.try_send(PendingCall {
+            line,
+            reply: Reply::with_notify(sender, notify),
+        }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                // Bounded backpressure: answer this connection with a visible
+                // error and close it instead of growing the supervisor queue.
+                connection.out = rpc::to_line(&rpc::err(
+                    None,
+                    -32000,
+                    "control queue is full; retry later",
+                ))
+                .into_bytes();
+                connection.out.push(b'\n');
+                connection.close_after_write = true;
+                return true;
+            }
+            Err(TrySendError::Disconnected(_)) => return false,
         }
         wake.notify();
         connection.pending = Some(receiver);
@@ -313,7 +347,7 @@ mod tests {
         let listener = UnixListener::bind(&path).expect("listener");
         let (notify_tx, _notify_rx) = UnixStream::pair().expect("notify");
         let notify_tx = Arc::new(notify_tx);
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel::<PendingCall>(8);
         let mut server =
             ControlServer::new(listener, tx, Arc::new(Wake::new()), notify_tx).expect("server");
         let supervisor = std::thread::spawn(move || {
@@ -390,5 +424,125 @@ mod tests {
         drop(server);
         let _ = supervisor.join();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The shutdown path must flush a reply that was queued but never reached
+    /// a normal writable/tick pass. This is exactly the last shutdown response.
+    #[test]
+    fn shutdown_drains_a_reply_that_was_queued_but_not_flushed() {
+        let root = std::env::temp_dir().join(format!(
+            "svcd-control-drain-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("root");
+        let path = root.join("svcd.sock");
+        let listener = UnixListener::bind(&path).expect("listener");
+        let (notify_tx, _notify_rx) = UnixStream::pair().expect("notify");
+        let notify_tx = Arc::new(notify_tx);
+        let (tx, rx) = mpsc::sync_channel::<PendingCall>(8);
+        let mut server =
+            ControlServer::new(listener, tx, Arc::new(Wake::new()), notify_tx).expect("server");
+        let (queued_tx, queued_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for call in rx {
+                let value: serde_json::Value = serde_json::from_str(&call.line).expect("request");
+                let id = value.get("id").cloned();
+                let _ = call.reply.send(rpc::to_line(&rpc::ok(
+                    id,
+                    serde_json::json!({ "ok": true }),
+                )));
+                let _ = queued_tx.send(());
+            }
+        });
+
+        let client = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let mut stream = UnixStream::connect(&path).expect("connect");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .expect("timeout");
+                stream
+                    .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"svcd.shutdown\"}\n")
+                    .expect("write");
+                let mut line = String::new();
+                BufReader::new(stream)
+                    .read_line(&mut line)
+                    .expect("drained reply");
+                line
+            })
+        };
+
+        // Accept and read the request, but deliberately never call
+        // drain_replies/flush: the reply stays in the pending receiver.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut queued = false;
+        while !queued && Instant::now() < deadline {
+            if queued_rx.try_recv().is_ok() {
+                queued = true;
+                break;
+            }
+            let mut fds = Vec::new();
+            let mut keys = Vec::new();
+            server.poll_sources(&mut fds, &mut keys);
+            let mut descriptors: Vec<libc::pollfd> = fds
+                .iter()
+                .map(|(fd, events)| libc::pollfd {
+                    fd: *fd,
+                    events: *events,
+                    revents: 0,
+                })
+                .collect();
+            unsafe {
+                libc::poll(
+                    descriptors.as_mut_ptr(),
+                    descriptors.len() as libc::nfds_t,
+                    50,
+                )
+            };
+            for (index, key) in keys.iter().enumerate() {
+                if descriptors[index].revents != 0 {
+                    server.ready(*key, descriptors[index].revents);
+                }
+            }
+        }
+        assert!(queued, "the supervisor queued the reply");
+        server.drain_for_shutdown();
+        let line = client.join().expect("client");
+        let value: serde_json::Value = serde_json::from_str(line.trim()).expect("reply");
+        assert_eq!(value["id"], 9, "{line}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A full supervisor queue must answer this connection with a visible
+    /// error and close it, never grow the queue.
+    #[test]
+    fn a_full_control_queue_answers_an_error_instead_of_growing() {
+        let (stream, _peer) = UnixStream::pair().expect("pair");
+        let (tx, _rx) = mpsc::sync_channel(0);
+        let (_notify_tx, notify_rx) = UnixStream::pair().expect("notify");
+        let notify = Arc::new(notify_rx);
+        let mut connection = Connection {
+            stream,
+            buffer: b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"svcd.ping\"}\n".to_vec(),
+            out: Vec::new(),
+            out_at: 0,
+            pending: None,
+            close_after_write: false,
+        };
+        assert!(drain_requests(
+            &mut connection,
+            &tx,
+            &Arc::new(Wake::new()),
+            notify
+        ));
+        assert!(connection.close_after_write);
+        let text = String::from_utf8_lossy(&connection.out);
+        assert!(text.contains("control queue is full"), "{text}");
+        assert!(text.ends_with('\n'), "{text}");
     }
 }
