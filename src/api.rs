@@ -54,6 +54,12 @@ use crate::webui;
 
 const UI: &str = include_str!("web/index.html");
 
+/// The busy response for a connection refused by either admission path. Both
+/// engines send the same bytes so a client sees one status on every host.
+const BUSY_CONNECTION_RESPONSE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\
+    Content-Length: 0\r\n\
+    Connection: close\r\n\r\n";
+
 /// Buffered-body limit for the routes that still go through the ordinary
 /// router. Blob uploads/downloads are streamed before this is consulted.
 fn body_limit(path: &str) -> u64 {
@@ -500,11 +506,7 @@ fn reactor_loop(
                                 || per_ip >= limits.max_connections_per_ip
                             {
                                 let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
-                                let _ = (&stream).write_all(
-                                    b"HTTP/1.1 503 Service Unavailable\r\n\
-                                      Content-Length: 0\r\n\
-                                      Connection: close\r\n\r\n",
-                                );
+                                let _ = (&stream).write_all(BUSY_CONNECTION_RESPONSE);
                                 continue;
                             }
                             let _ = stream.set_nonblocking(true);
@@ -2294,12 +2296,19 @@ impl Admission {
         }
     }
 
+    fn lock(admission: &Arc<Mutex<Admission>>) -> std::sync::MutexGuard<'_, Admission> {
+        admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[cfg(any(not(unix), test))]
+impl ConnectionLease {
     /// Reserve one connection slot for `peer`, or return `None` when either
     /// cap is already reached. A rejected connection must not consume a slot.
-    fn admit(admission: &Arc<Mutex<Admission>>, peer: IpAddr) -> Option<ConnectionLease> {
-        let mut state = admission
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fn acquire(admission: &Arc<Mutex<Admission>>, peer: IpAddr) -> Option<ConnectionLease> {
+        let mut state = Admission::lock(admission);
         if state.active >= state.max_connections {
             return None;
         }
@@ -2319,13 +2328,12 @@ impl Admission {
 #[cfg(any(not(unix), test))]
 impl Drop for ConnectionLease {
     fn drop(&mut self) {
-        let mut state = self
-            .admission
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = Admission::lock(&self.admission);
+        debug_assert!(state.active > 0, "connection lease dropped without a slot");
         state.active = state.active.saturating_sub(1);
         let remove = match state.per_ip.get_mut(&self.peer) {
             Some(count) => {
+                debug_assert!(*count > 0, "connection lease dropped without a per-IP slot");
                 *count = count.saturating_sub(1);
                 *count == 0
             }
@@ -2357,7 +2365,7 @@ fn listener_loop(listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config: Pa
                 // Admit before spawning: a refused connection must not create
                 // a thread, and an admitted one stays accounted for until its
                 // handler returns and drops the lease.
-                let Some(lease) = Admission::admit(&admission, ip) else {
+                let Some(lease) = ConnectionLease::acquire(&admission, ip) else {
                     reject_connection(stream);
                     continue;
                 };
@@ -2391,11 +2399,7 @@ fn listener_loop(listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config: Pa
 fn reject_connection(mut stream: TcpStream) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
-    let _ = stream.write_all(
-        b"HTTP/1.1 503 Service Unavailable\r\n\
-          Content-Length: 0\r\n\
-          Connection: close\r\n\r\n",
-    );
+    let _ = stream.write_all(BUSY_CONNECTION_RESPONSE);
 }
 
 #[cfg(not(unix))]
@@ -2417,20 +2421,20 @@ fn handle(
         ));
     }
     // The configured `http_idle_timeout_secs` replaces the old hard-coded
-    // 60 s. It closes a socket that is waiting for request bytes, both on the
-    // first request and between keep-alive requests. Transfer and takeover
-    // handlers below install their own transfer timeout as needed.
+    // 60 s. It covers any wait for request bytes: the first request, the gap
+    // between keep-alive requests, and a stalled request body. That matches the
+    // Unix reactor's idle sweep. The same deadline bounds a blocking write, so
+    // a client that stops reading cannot pin this connection thread forever;
+    // takeover handlers below install their own transfer timeout where a
+    // longer transfer is expected.
     let _ = stream.set_read_timeout(Some(idle_timeout));
-    let mut first = true;
+    let _ = stream.set_write_timeout(Some(idle_timeout));
     loop {
         let (head, initial) = match read_head(&mut stream) {
             Ok(head) => head,
-            Err(response) => {
-                // An idle keep-alive connection times out or closes; do not
-                // manufacture a 400 response for a request that never arrived.
-                if first {
-                    let _ = stream.write_all(&response);
-                }
+            Err(HeadFailure::Closed) => return,
+            Err(HeadFailure::Response(response)) => {
+                let _ = stream.write_all(&response);
                 return;
             }
         };
@@ -2475,7 +2479,6 @@ fn handle(
                 return;
             }
         };
-        first = false;
         let keep_alive = wants_keep_alive(&request);
         if let Some(response) = serve_face(&request, peer, &lan, keep_alive) {
             if stream.write_all(&response).is_err() {
@@ -3180,27 +3183,49 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
+/// Why no complete request head arrived. A timeout or EOF is a closed
+/// connection, not a malformed request: answering it with a 400 would be a
+/// response the client never asked for and the Unix reactor does not send one.
 #[cfg(not(unix))]
-fn read_head(stream: &mut TcpStream) -> Result<(http::Head, Vec<u8>), Vec<u8>> {
+enum HeadFailure {
+    Closed,
+    Response(Vec<u8>),
+}
+
+#[cfg(not(unix))]
+fn read_head(stream: &mut TcpStream) -> Result<(http::Head, Vec<u8>), HeadFailure> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
         if buffer.len() > crate::limits::current().max_header {
-            return Err(error(400, "bad_request", "header is too large"));
+            return Err(HeadFailure::Response(error(
+                400,
+                "bad_request",
+                "header is too large",
+            )));
         }
-        let read = stream
-            .read(&mut chunk)
-            .map_err(|_| error(400, "bad_request", "cannot read request"))?;
+        let read = match stream.read(&mut chunk) {
+            Ok(read) => read,
+            Err(_) => return Err(HeadFailure::Closed),
+        };
         if read == 0 {
-            return Err(error(400, "bad_request", "empty request"));
+            return Err(HeadFailure::Closed);
         }
         buffer.extend_from_slice(&chunk[..read]);
         if let Some(position) = http::header_end(&buffer) {
             if position > crate::limits::current().max_header {
-                return Err(error(400, "bad_request", "header is too large"));
+                return Err(HeadFailure::Response(error(
+                    400,
+                    "bad_request",
+                    "header is too large",
+                )));
             }
             let Some((head, body_start)) = http::parse_head(&buffer[..position + 4]) else {
-                return Err(error(400, "bad_request", "malformed request line"));
+                return Err(HeadFailure::Response(error(
+                    400,
+                    "bad_request",
+                    "malformed request line",
+                )));
             };
             return Ok((head, buffer[body_start..].to_vec()));
         }
@@ -3952,13 +3977,10 @@ mod tests {
     }
 
     fn admit(admission: &Arc<Mutex<Admission>>, peer: &str) -> Option<ConnectionLease> {
-        Admission::admit(admission, peer.parse().expect("peer ip"))
+        ConnectionLease::acquire(admission, peer.parse().expect("peer ip"))
     }
 
     fn active(admission: &Arc<Mutex<Admission>>) -> usize {
-        admission
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .active
+        Admission::lock(admission).active
     }
 }
