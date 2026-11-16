@@ -2,16 +2,18 @@
 //!
 //! See `docs/adr/0016-s4-request-handover.md`.
 
+pub mod budget;
 pub mod contract;
 pub mod dispatch;
 #[cfg(all(unix, feature = "http"))]
 pub mod driver;
 pub mod engine;
-#[cfg_attr(not(unix), allow(dead_code))]
-pub mod pool;
 #[cfg(all(not(unix), feature = "http"))]
 pub mod fallback;
+#[cfg_attr(not(unix), allow(dead_code))]
+pub mod pool;
 pub mod stream;
+pub mod wire;
 
 // The S4 contract is deliberately available to the minimal build (parent spec
 // #112) even when no HTTP endpoint is compiled in. Re-exports are allowed to
@@ -30,3 +32,18 @@ pub use stream::{
     BlockingJob, BlockingOutcome, CloseReason, FileSend, OutBuffer, StreamAction, StreamClass,
     StreamEvent, StreamHandler, StreamStep,
 };
+
+/// The busy response for a stream refused before its headers. The Unix driver
+/// and the thread fallback send the same stable envelope.
+#[cfg(feature = "http")]
+pub fn stream_busy_response() -> Vec<u8> {
+    let body = serde_json::json!({
+        "error": { "code": "busy", "message": "stream cap reached" }
+    });
+    crate::http::response_with_headers(
+        503,
+        "application/json",
+        &[("Retry-After".to_string(), "1".to_string())],
+        &serde_json::to_vec(&body).unwrap_or_default(),
+    )
+}

@@ -5,14 +5,14 @@
 //! worker/takeover path alive until #115-#125 move them to the face. The queue
 //! is bounded; a full queue answers 503 instead of growing without limit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::io::{AsRawFd, RawFd};
 
 use crate::server::http::driver::{StreamAdmission, StreamDriver};
 use crate::server::http::engine::{self, HttpRequest, LegacyBridge, PreRequest, Table};
 use crate::server::http::{
-    complete_blocking, dispatch_inline, BlockingPool, BodyPolicy, Busy, CancelToken,
-    CompletionSlot, Dispatch, Exchange, Face, JobOutcome,
+    complete_blocking, dispatch_inline, BlockingOutcome, BlockingPool, BodyPolicy, Busy,
+    CancelToken, CompletionSlot, Dispatch, Exchange, Face, JobOutcome,
 };
 
 /// One queued or running blocking request. The server owns the completion slot
@@ -89,10 +89,14 @@ pub(crate) fn start(
                 client,
                 queue,
                 results: results_rx,
+                results_tx: results_tx.clone(),
                 notify: notify_rx,
                 face,
                 blocking,
                 blocking_pending: HashMap::new(),
+                stream_jobs: HashMap::new(),
+                stream_job_keys: HashSet::new(),
+                next_stream_job: 1 << 32,
             };
             engine::run(listener, &mut handler, crate::limits::current());
         })?;
@@ -106,10 +110,22 @@ struct ServerHandler {
     client: Option<Arc<ClientReactor>>,
     queue: Arc<JobQueue>,
     results: Receiver<WorkResult>,
+    /// A sender kept for stream-handler blocking jobs; their result is
+    /// delivered to the handler, not to a completion slot.
+    results_tx: Sender<WorkResult>,
     notify: UnixStream,
     face: Arc<dyn Face>,
     blocking: BlockingPool,
     blocking_pending: HashMap<u64, PendingBlocking>,
+    /// Connection -> the unique pool key of its in-flight stream job. Stream
+    /// jobs do not use the connection id as their key: the handler can submit
+    /// the next job from `StreamJobDone` before the worker clears the previous
+    /// key in the pool.
+    stream_jobs: HashMap<u64, u64>,
+    /// Keys that belong to stream jobs, so a `BlockingDone` is not mistaken
+    /// for a lost face completion.
+    stream_job_keys: HashSet<u64>,
+    next_stream_job: u64,
 }
 
 impl LegacyBridge for ServerHandler {
@@ -244,39 +260,6 @@ impl LegacyBridge for ServerHandler {
                 }
             }
         }
-        if let Some(kind) = ui_stream_kind(&request.path) {
-            if kind == "events" {
-                match prepare_sse(&request, &self.lan) {
-                    Ok((receiver, subscription, replay)) => {
-                        start_sse(connection, receiver, subscription, replay);
-                    }
-                    Err(response) => {
-                        write_response(connection, response, false);
-                    }
-                }
-                return;
-            }
-            if kind == "raw" {
-                match prepare_raw_ws(&request, &self.lan, &self.raw_hub) {
-                    Ok((_plugin, accept, subscription)) => {
-                        start_raw_ws(connection, accept, subscription);
-                    }
-                    Err(response) => {
-                        write_response(connection, response, false);
-                    }
-                }
-                return;
-            }
-            match prepare_ws(&request, &self.lan) {
-                Ok((plugin, accept, receiver, subscription)) => {
-                    start_ws(connection, plugin, accept, receiver, subscription);
-                }
-                Err(response) => {
-                    write_response(connection, response, false);
-                }
-            }
-            return;
-        }
         let job = Work::Http(HttpJob {
             connection: connection.id,
             request,
@@ -295,7 +278,11 @@ impl LegacyBridge for ServerHandler {
 
     fn on_readable(&mut self, connection: &mut Connection) -> bool {
         if matches!(&connection.state, ConnState::Stream(_)) {
-            return stream_readable(connection);
+            let keep = stream_readable(connection);
+            if keep {
+                self.service_stream_job(connection);
+            }
+            return keep;
         }
         match &connection.state {
             ConnState::McpSse(_) => {
@@ -309,28 +296,17 @@ impl LegacyBridge for ServerHandler {
                 fill_mcp_sse(connection);
                 true
             }
-            ConnState::Sse(_) => {
-                let mut discard = [0u8; 512];
-                match connection.stream.read(&mut discard) {
-                    Ok(0) => return false,
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(_) => return false,
-                }
-                fill_sse(connection);
-                true
-            }
-            ConnState::Ws(_) => drive_ws(connection, connection.id, &self.queue, true),
-            ConnState::RawWs(_) => {
-                drive_raw_ws(connection, connection.id, &self.queue, true, &self.raw_hub)
-            }
             _ => true,
         }
     }
 
     fn on_writable(&mut self, connection: &mut Connection) -> bool {
         if matches!(&connection.state, ConnState::Stream(_)) {
-            return stream_writable(connection);
+            let keep = stream_writable(connection);
+            if keep {
+                self.service_stream_job(connection);
+            }
+            return keep;
         }
         match &connection.state {
             ConnState::McpSse(_) => {
@@ -340,14 +316,6 @@ impl LegacyBridge for ServerHandler {
                 }
                 let done = matches!(&connection.state, ConnState::McpSse(state) if state.done);
                 !(done && connection.out.is_empty())
-            }
-            ConnState::Ws(_) => drive_ws(connection, connection.id, &self.queue, false),
-            ConnState::RawWs(_) => {
-                drive_raw_ws(connection, connection.id, &self.queue, false, &self.raw_hub)
-            }
-            ConnState::Sse(_) => {
-                fill_sse(connection);
-                connection.write_out()
             }
             _ => {
                 if !connection.write_out() {
@@ -378,33 +346,16 @@ impl LegacyBridge for ServerHandler {
                         write_response(connection, result.response, result.keep_alive);
                     }
                 }
-                WorkResult::Ws(result) => {
-                    if let Some(connection) = connections.get_mut(&result.connection) {
-                        if matches!(&connection.state, ConnState::Ws(_)) {
-                            push_ws_text(&mut connection.out, &result.text);
-                            if let ConnState::Ws(state) = &mut connection.state {
-                                state.pending = false;
-                                if let Some(payload) = state.queued.pop_front() {
-                                    state.pending = true;
-                                    state.queued_bytes =
-                                        state.queued_bytes.saturating_sub(payload.len());
-                                    self.queue.push(Work::Ws(WsJob {
-                                        connection: result.connection,
-                                        plugin: state.plugin.clone(),
-                                        payload,
-                                    }));
-                                }
-                            }
-                        }
-                    }
-                }
                 WorkResult::BlockingDone { key, outcome } => {
                     let Some(pending) = self.blocking_pending.remove(&key) else {
-                        // Cancel/drop outcomes are expected after a disconnect:
-                        // on_close already sealed and removed the slot. A
-                        // Finished outcome with no pending entry would mean the
-                        // loop lost its bookkeeping.
-                        if outcome == JobOutcome::Finished && connections.contains_key(&key) {
+                        // A stream handler's job reports its value through
+                        // `StreamJobDone` first; this outcome only cleans the
+                        // pool slot. Cancel/drop outcomes are expected after a
+                        // disconnect too. Anything else lost its bookkeeping.
+                        if !self.stream_job_keys.remove(&key)
+                            && outcome == JobOutcome::Finished
+                            && connections.contains_key(&key)
+                        {
                             log::svcd(&format!(
                                 "svcd: blocking completion for connection {} lost its slot",
                                 key
@@ -431,6 +382,22 @@ impl LegacyBridge for ServerHandler {
                     };
                     write_response(connection, response, keep_alive);
                 }
+                WorkResult::StreamJobDone {
+                    connection: id,
+                    outcome,
+                } => {
+                    let keep = match connections.get_mut(&id) {
+                        Some(connection) => deliver_stream_outcome(connection, outcome),
+                        None => false,
+                    };
+                    if keep {
+                        if let Some(connection) = connections.get_mut(&id) {
+                            self.service_stream_job(connection);
+                        }
+                    } else if let Some(mut connection) = connections.remove(&id) {
+                        self.on_close(&mut connection);
+                    }
+                }
             }
         }
 
@@ -450,60 +417,6 @@ impl LegacyBridge for ServerHandler {
             }
         }
 
-        for connection in connections.values_mut() {
-            let ConnState::RawWs(state) = &mut connection.state else {
-                continue;
-            };
-            let mut closed = None;
-            loop {
-                match state.subscription.try_recv() {
-                    Ok(crate::rawhub::RawEvent::Frame(payload)) => {
-                        push_ws_frame(&mut connection.out, 0x2, &payload);
-                    }
-                    Ok(crate::rawhub::RawEvent::Closed) => {
-                        closed = Some("raw closed");
-                        break;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        closed = Some("raw channel closed");
-                        break;
-                    }
-                }
-            }
-            if let Some(reason) = closed {
-                raw_ws_log(state, reason);
-                push_ws_frame(&mut connection.out, 0x8, &close_payload(1000, "raw closed"));
-                connection.keep_alive = false;
-                connection.state = ConnState::Writing;
-                continue;
-            }
-            if state.heartbeat.elapsed() >= Duration::from_secs(30) {
-                push_ws_frame(&mut connection.out, 0x9, b"");
-                state.heartbeat = Instant::now();
-            }
-        }
-
-        let queue = self.queue.clone();
-        let raw_hub = self.raw_hub.clone();
-        let ids: Vec<u64> = connections.keys().copied().collect();
-        for id in ids {
-            let keep = if let Some(connection) = connections.get_mut(&id) {
-                match &connection.state {
-                    ConnState::Ws(_) => drive_ws(connection, id, &queue, false),
-                    ConnState::RawWs(_) => drive_raw_ws(connection, id, &queue, false, &raw_hub),
-                    _ => true,
-                }
-            } else {
-                true
-            };
-            if !keep {
-                if let Some(connection) = connections.remove(&id) {
-                    release_mcp_stream(&connection, self.client.as_deref());
-                }
-            }
-        }
-
         let now = Instant::now();
         let stream_ids: Vec<u64> = connections
             .iter()
@@ -512,7 +425,13 @@ impl LegacyBridge for ServerHandler {
             .collect();
         for id in stream_ids {
             let keep = match connections.get_mut(&id) {
-                Some(connection) => stream_tick(connection, now),
+                Some(connection) => {
+                    let keep = stream_tick(connection, now);
+                    if keep {
+                        self.service_stream_job(connection);
+                    }
+                    keep
+                }
                 None => true,
             };
             if !keep {
@@ -523,23 +442,24 @@ impl LegacyBridge for ServerHandler {
         }
 
         for connection in connections.values_mut() {
-            match &connection.state {
-                ConnState::Sse(_) => fill_sse(connection),
-                ConnState::McpSse(_) => fill_mcp_sse(connection),
-                _ => {}
+            if let ConnState::McpSse(_) = &connection.state {
+                fill_mcp_sse(connection);
             }
         }
     }
 
     fn interest(&self, connection: &Connection) -> i16 {
-        let mut events = match connection.state {
+        let mut events = match &connection.state {
             ConnState::Reading => libc::POLLIN,
             ConnState::Writing => libc::POLLOUT,
-            ConnState::Sse(_) => libc::POLLIN,
-            ConnState::Ws(_) => libc::POLLIN,
-            ConnState::RawWs(_) => libc::POLLIN,
             ConnState::McpSse(_) => libc::POLLIN,
-            ConnState::Stream(_) => libc::POLLIN,
+            ConnState::Stream(driver) => {
+                if driver.wants_read() {
+                    libc::POLLIN
+                } else {
+                    0
+                }
+            }
             ConnState::Processing => 0,
         };
         if connection.out_at < connection.out.len() || stream_has_file(connection) {
@@ -562,14 +482,13 @@ impl LegacyBridge for ServerHandler {
             // flip a running job's cancellation token.
             pending.slot.take();
             self.blocking.cancel(connection.id);
+        } else if let Some(key) = self.stream_jobs.remove(&connection.id) {
+            // Same contract for a stream job: the connection is gone, so a
+            // queued job is dropped and a running one learns it was cancelled.
+            self.stream_job_keys.remove(&key);
+            self.blocking.cancel(key);
         }
         release_mcp_stream(connection, self.client.as_deref());
-    }
-
-    fn on_poll_error(&mut self, connection: &mut Connection, revents: i16) {
-        if let ConnState::RawWs(state) = &connection.state {
-            raw_ws_log(state, &format!("poll flags {:#x}", revents));
-        }
     }
 
     fn wake_fd(&self) -> Option<RawFd> {
@@ -578,10 +497,57 @@ impl LegacyBridge for ServerHandler {
 }
 
 impl ServerHandler {
-    /// The plugin UI asset path: decide the route before the body is read,
-    /// resolve the principal once, then attach the sans-IO handler to the
-    /// connection. Returns \`None\` when this request is not a static asset.
-    fn plugin_ui_stream(&self, connection: &mut Connection) -> Option<PreRequest> {
+    /// Hand the stream handler's one pending job to the blocking pool. The
+    /// job's value comes back as `StreamJobDone`; the pool's own completion
+    /// only frees the key. A full queue is reported to the handler, which can
+    /// answer with a protocol error instead of dropping the connection.
+    fn service_stream_job(&mut self, connection: &mut Connection) {
+        let id = connection.id;
+        let job = match &mut connection.state {
+            ConnState::Stream(driver) => driver.take_job(),
+            _ => return,
+        };
+        let Some(job) = job else {
+            return;
+        };
+        let key = self.next_stream_job;
+        self.next_stream_job = self.next_stream_job.wrapping_add(1).max(1 << 32);
+        let results = self.results_tx.clone();
+        let notify = self.notify.try_clone().ok();
+        let submitted = self.blocking.try_submit(key, move |cancel| {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let outcome = job();
+            let _ = results.send(WorkResult::StreamJobDone {
+                connection: id,
+                outcome,
+            });
+            if let Some(notify) = &notify {
+                let _ = (&*notify).write(&[1]);
+            }
+        });
+        match submitted {
+            Ok(()) => {
+                self.stream_jobs.insert(id, key);
+                self.stream_job_keys.insert(key);
+            }
+            Err(_) => {
+                if let ConnState::Stream(driver) = &mut connection.state {
+                    driver.on_blocking_done(
+                        BlockingOutcome::Failed("the blocking queue is full".into()),
+                        &mut connection.out,
+                        &mut connection.out_at,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The plugin UI path: decide the route before the body is read, resolve
+    /// the principal once, then attach the sans-IO handler to the connection.
+    /// Returns \`None\` when this request is not a plugin UI route.
+    fn plugin_ui_stream(&mut self, connection: &mut Connection) -> Option<PreRequest> {
         if connection.pending.is_some() {
             return None;
         }
@@ -594,15 +560,19 @@ impl ServerHandler {
         // navigation gets the login redirect; the face applies the endpoint
         // policy after the server resolved the principal.
         crate::face::plugin_ui::PluginUiFace::route_for(&head.method, &head.path)?;
-        let exchange =
-            match crate::face::plugin_ui::PluginUiFace::exchange(&head, connection.peer, &self.lan)
-            {
-                Ok(exchange) => exchange,
-                Err(response) => {
-                    write_response(connection, response, false);
-                    return Some(PreRequest::Handled);
-                }
-            };
+        let exchange = match crate::face::plugin_ui::PluginUiFace::exchange(
+            &head,
+            connection.peer,
+            &self.lan,
+            self.config.clone(),
+            Some(self.raw_hub.clone()),
+        ) {
+            Ok(exchange) => exchange,
+            Err(response) => {
+                write_response(connection, response, false);
+                return Some(PreRequest::Handled);
+            }
+        };
         let Exchange::Stream(handler) = exchange else {
             write_response(
                 connection,
@@ -625,7 +595,11 @@ impl ServerHandler {
         let mut driver = match StreamDriver::admit(handler, crate::limits::current().max_streams) {
             StreamAdmission::Admitted(driver) => driver,
             StreamAdmission::Busy => {
-                write_response(connection, stream_busy(), false);
+                write_response(
+                    connection,
+                    crate::server::http::stream_busy_response(),
+                    false,
+                );
                 return Some(PreRequest::Handled);
             }
         };
@@ -654,6 +628,9 @@ impl ServerHandler {
                 finish_stream(connection);
             }
         }
+        // A WebSocket client may have sent its first frames with the opening
+        // handshake; the handler can submit a blocking job from those bytes.
+        self.service_stream_job(connection);
         Some(PreRequest::Handled)
     }
 
@@ -785,6 +762,17 @@ fn stream_writable(connection: &mut Connection) -> bool {
     driver.on_writable(stream, out, out_at, last_active)
 }
 
+/// Deliver a stream job's value to its attached handler.
+fn deliver_stream_outcome(connection: &mut Connection, outcome: BlockingOutcome) -> bool {
+    let Connection {
+        state, out, out_at, ..
+    } = connection;
+    let ConnState::Stream(driver) = state else {
+        return true;
+    };
+    driver.on_blocking_done(outcome, out, out_at)
+}
+
 fn stream_tick(connection: &mut Connection, now: Instant) -> bool {
     let Connection {
         state,
@@ -799,17 +787,6 @@ fn stream_tick(connection: &mut Connection, now: Instant) -> bool {
     };
     driver.on_tick(now, stream, out, out_at, last_active)
 }
-
-fn stream_busy() -> Vec<u8> {
-    let body = json!({ "error": { "code": "busy", "message": "stream cap reached" } });
-    http::response_with_headers(
-        503,
-        "application/json",
-        &[("Retry-After".to_string(), "1".to_string())],
-        &serde_json::to_vec(&body).unwrap_or_default(),
-    )
-}
-
 
 fn write_response(connection: &mut Connection, response: Vec<u8>, keep_alive: bool) {
     connection.out = response;

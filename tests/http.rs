@@ -1123,6 +1123,34 @@ fn sse_connect_with_last_id(address: &str, path: &str, last_id: Option<u64>) -> 
     stream
 }
 
+/// Open an SSE request and return its status without waiting for the stream
+/// to end. Used when a long-lived response may be refused or accepted.
+fn sse_probe(address: &str, path: &str) -> (u16, TcpStream) {
+    let mut stream = TcpStream::connect(address).expect("sse connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("sse timeout");
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\n\r\n",
+        path, address
+    );
+    stream.write_all(request.as_bytes()).expect("sse request");
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).expect("sse response head");
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head);
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .expect("sse status");
+    (status, stream)
+}
+
 fn sse_id(text: &str) -> Option<u64> {
     text.lines()
         .find_map(|line| line.strip_prefix("id: "))
@@ -3662,6 +3690,53 @@ fn plugin_web_ui_serves_assets_with_base_and_etag() {
     let post = raw_request(&address, "POST", &base, "", b"");
     assert_eq!(post.status, 405);
     assert_eq!(raw_header_values(&post, "allow"), vec!["GET"]);
+}
+
+#[test]
+fn plugin_ui_realtime_streams_consume_the_long_lived_stream_cap() {
+    // One SSE stream fills max_streams. A second long-lived stream is refused
+    // before its headers; a one-shot asset is still exempt; closing the stream
+    // releases the slot.
+    let (_sandbox, address) = web_ui_sandbox_with_conf(58, "max_streams = 1\n");
+    let base = plugin_ui_base(&address, "demo");
+    let events = format!("{}events", base);
+    let ws = format!("{}ws", base);
+
+    let first = sse_connect(&address, &events);
+    let second = raw_request(&address, "GET", &events, "", b"");
+    assert_eq!(
+        second.status,
+        503,
+        "{}",
+        String::from_utf8_lossy(&second.body)
+    );
+    assert!(String::from_utf8_lossy(&second.body).contains("busy"));
+    assert_eq!(raw_header_values(&second, "retry-after"), vec!["1"]);
+
+    let (_stream, status, head) = ws_handshake(&address, &ws, &[]);
+    assert_eq!(status, 503, "{head}");
+
+    // A page load is many one-shot responses; it must not trip the cap.
+    let page = raw_request(&address, "GET", &base, "", b"");
+    assert_eq!(page.status, 200);
+
+    drop(first);
+    let mut released = false;
+    for _ in 0..100 {
+        // A successful SSE response never ends, so probe the head instead of
+        // reading to EOF.
+        let (status, stream) = sse_probe(&address, &events);
+        drop(stream);
+        if status == 200 {
+            released = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        released,
+        "closing the SSE stream must release its max_streams slot"
+    );
 }
 
 #[test]

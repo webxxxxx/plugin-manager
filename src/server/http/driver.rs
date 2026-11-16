@@ -6,79 +6,16 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::limits;
 use crate::log;
 
+use super::budget::{Busy, StreamBudget, StreamPermit};
 use super::stream::{
-    CloseReason, FileSend, OutBuffer, StreamAction, StreamClass, StreamEvent, StreamHandler,
-    StreamStep,
+    BlockingJob, BlockingOutcome, CloseReason, FileSend, OutBuffer, StreamAction, StreamEvent,
+    StreamHandler, StreamStep,
 };
-
-static ACTIVE_STREAMS: AtomicUsize = AtomicUsize::new(0);
-
-/// Why a stream was refused before its headers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Busy;
-
-/// A `max_streams` slot held by one long-lived stream. One-shot responses do
-/// not acquire one, so a page's static assets never trip the long-lived cap.
-pub struct StreamPermit {
-    active: &'static AtomicUsize,
-}
-
-impl Drop for StreamPermit {
-    fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-/// The shared admission counter behind `max_streams`.
-pub struct StreamBudget {
-    active: &'static AtomicUsize,
-}
-
-impl StreamBudget {
-    pub fn global() -> StreamBudget {
-        StreamBudget {
-            active: &ACTIVE_STREAMS,
-        }
-    }
-
-    #[cfg(test)]
-    fn for_counter(active: &'static AtomicUsize) -> StreamBudget {
-        StreamBudget { active }
-    }
-
-    /// `Ok(None)` for an exempt one-shot response; `Err(Busy)` when the cap
-    /// is already reached.
-    pub fn acquire(&self, class: StreamClass, limit: usize) -> Result<Option<StreamPermit>, Busy> {
-        if class == StreamClass::OneShot {
-            return Ok(None);
-        }
-        let mut current = self.active.load(Ordering::Acquire);
-        loop {
-            if current >= limit {
-                return Err(Busy);
-            }
-            match self.active.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Ok(Some(StreamPermit {
-                        active: self.active,
-                    }))
-                }
-                Err(actual) => current = actual,
-            }
-        }
-    }
-}
 
 pub enum StreamAdmission {
     Admitted(StreamDriver),
@@ -88,13 +25,26 @@ pub enum StreamAdmission {
 /// One attached handler plus everything the connection needs to drive it.
 pub struct StreamDriver {
     handler: Box<dyn StreamHandler>,
-    /// The server's no-progress deadline, possibly shortened by the handler.
+    /// The server's no-progress upper bound.
     deadline: Instant,
+    /// The next tick, which a handler may move earlier (poll for bus events,
+    /// heartbeats). It can never move past `deadline`.
+    wakeup: Instant,
     /// A server-side file send requested by the handler, after the output
     /// buffer drains.
     file: Option<FileSend>,
     /// The handler asked to finish; flush the output buffer, then close.
     closing: Option<CloseReason>,
+    /// A blocking job the handler submitted, waiting for the server loop to
+    /// accept it. While it is set, or while it runs, the handler gets no other
+    /// event: the connection is not making protocol progress.
+    job: Option<BlockingJob>,
+    /// The server loop took the job; resume on BlockingDone.
+    awaiting: bool,
+    /// The handler still has output queued, so the server must not read more
+    /// client bytes until the socket drains. This is the per-connection
+    /// backpressure point for a slow reader.
+    blocked_on_write: bool,
     /// Held for long-lived streams, absent for one-shot responses.
     _permit: Option<StreamPermit>,
 }
@@ -107,17 +57,53 @@ impl StreamDriver {
             Ok(permit) => permit,
             Err(Busy) => return StreamAdmission::Busy,
         };
+        let deadline = Instant::now() + limits::current().transfer_timeout;
         StreamAdmission::Admitted(StreamDriver {
             handler,
-            deadline: Instant::now() + limits::current().transfer_timeout,
+            deadline,
+            wakeup: deadline,
             file: None,
             closing: None,
+            job: None,
+            awaiting: false,
+            blocked_on_write: false,
             _permit: permit,
         })
     }
 
     pub fn has_file(&self) -> bool {
         self.file.is_some()
+    }
+
+    /// Whether the server may read more client bytes. A handler that asked to
+    /// write first, or that has a job in flight, must not see new input yet.
+    pub fn wants_read(&self) -> bool {
+        !self.blocked_on_write && self.job.is_none() && !self.awaiting
+    }
+
+    /// The handler asked the server to run a job. The server takes it exactly
+    /// once and calls on_blocking_done when it finishes.
+    pub fn take_job(&mut self) -> Option<BlockingJob> {
+        let job = self.job.take();
+        if job.is_some() {
+            self.awaiting = true;
+        }
+        job
+    }
+
+    /// Deliver the outcome of the one in-flight job. A duplicate outcome after
+    /// a disconnect is ignored.
+    pub fn on_blocking_done(
+        &mut self,
+        outcome: BlockingOutcome,
+        out: &mut Vec<u8>,
+        out_at: &mut usize,
+    ) -> bool {
+        if !self.awaiting {
+            return true;
+        }
+        self.awaiting = false;
+        self.on_event(StreamEvent::BlockingDone(outcome), out, out_at)
     }
 
     /// Emit the first response bytes. The engine only calls `on_writable`
@@ -137,6 +123,9 @@ impl StreamDriver {
         if data.is_empty() {
             return true;
         }
+        if self.job.is_some() || self.awaiting {
+            return true;
+        }
         self.touch();
         self.on_event(StreamEvent::Data(data), out, out_at)
     }
@@ -148,6 +137,9 @@ impl StreamDriver {
         out_at: &mut usize,
         last_active: &mut Instant,
     ) -> bool {
+        if !self.wants_read() || *out_at < out.len() {
+            return true;
+        }
         let mut chunk = [0u8; 8 * 1024];
         match stream.read(&mut chunk) {
             Ok(0) => false,
@@ -197,6 +189,9 @@ impl StreamDriver {
             if self.closing.is_some() {
                 return false;
             }
+            if self.job.is_some() || self.awaiting {
+                return true;
+            }
             if !self.on_event(StreamEvent::Writable, out, out_at) {
                 return false;
             }
@@ -214,13 +209,19 @@ impl StreamDriver {
         out_at: &mut usize,
         last_active: &mut Instant,
     ) -> bool {
-        if now < self.deadline {
+        if self.job.is_some() || self.awaiting {
+            return true;
+        }
+        if now < self.wakeup {
             return true;
         }
         if !self.on_event(StreamEvent::Tick(now), out, out_at) {
             return false;
         }
-        if now < self.deadline {
+        if self.job.is_some() || self.awaiting {
+            return true;
+        }
+        if now < self.deadline && self.wakeup > now {
             return true;
         }
         self.closing = Some(CloseReason::TimedOut);
@@ -231,6 +232,7 @@ impl StreamDriver {
 
     fn touch(&mut self) {
         self.deadline = Instant::now() + limits::current().transfer_timeout;
+        self.wakeup = self.deadline;
     }
 
     fn on_event(&mut self, event: StreamEvent<'_>, out: &mut Vec<u8>, out_at: &mut usize) -> bool {
@@ -248,25 +250,37 @@ impl StreamDriver {
             self.touch();
         }
         if let Some(requested) = step.deadline {
-            if requested < self.deadline {
-                self.deadline = requested;
+            self.wakeup = requested.min(self.deadline);
+            let now = Instant::now();
+            if self.wakeup < now {
+                self.wakeup = now;
             }
         }
         match step.action {
-            StreamAction::Continue | StreamAction::NeedRead | StreamAction::NeedWrite => {}
-            // This slice has no blocking pool. The next server-loop slice
-            // (#116) hands this to it instead of closing the response.
-            StreamAction::SubmitBlocking(_) => {
-                self.closing = Some(CloseReason::Failed(
-                    "stream handlers cannot submit blocking jobs in this slice".into(),
-                ));
+            StreamAction::Continue | StreamAction::NeedRead => {
+                self.blocked_on_write = false;
+            }
+            StreamAction::NeedWrite => {
+                self.blocked_on_write = true;
+            }
+            StreamAction::SubmitBlocking(job) => {
+                self.blocked_on_write = false;
+                if self.job.is_some() || self.awaiting {
+                    self.closing = Some(CloseReason::Failed(
+                        "a stream handler submitted a second blocking job".into(),
+                    ));
+                } else {
+                    self.job = Some(job);
+                }
             }
             StreamAction::SendFile(send) => {
+                self.blocked_on_write = false;
                 self.file = Some(send);
                 // A file send is the last thing this response does.
                 self.closing = Some(CloseReason::Completed);
             }
             StreamAction::Close(reason) => {
+                self.blocked_on_write = false;
                 self.closing = Some(reason);
             }
         }
@@ -410,19 +424,118 @@ fn read_file_chunk(send: &mut FileSend, out: &mut Vec<u8>, limit: usize) -> std:
 mod tests {
     use super::*;
 
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    struct JobHandler;
+
+    impl StreamHandler for JobHandler {
+        fn on_event(&mut self, event: StreamEvent<'_>, out: &mut OutBuffer<'_>) -> StreamStep {
+            match event {
+                StreamEvent::Data(_) => {
+                    StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|| {
+                        BlockingOutcome::Ok(b"done".to_vec())
+                    })))
+                }
+                StreamEvent::BlockingDone(BlockingOutcome::Ok(bytes)) => {
+                    out.write(&bytes);
+                    StreamStep::wait(StreamAction::Close(CloseReason::Completed))
+                }
+                StreamEvent::BlockingDone(BlockingOutcome::Failed(message)) => {
+                    out.write(message.as_bytes());
+                    StreamStep::wait(StreamAction::Close(CloseReason::Failed(message)))
+                }
+                _ => StreamStep::wait(StreamAction::NeedRead),
+            }
+        }
+    }
 
     #[test]
-    fn a_one_shot_response_never_consumes_the_long_lived_cap() {
-        COUNTER.store(0, Ordering::SeqCst);
-        let budget = StreamBudget::for_counter(&COUNTER);
-        let held = budget
-            .acquire(StreamClass::LongLived, 1)
-            .expect("the first long-lived stream fits")
-            .expect("a long-lived stream holds a slot");
-        assert!(budget.acquire(StreamClass::LongLived, 1).is_err());
-        assert!(matches!(budget.acquire(StreamClass::OneShot, 1), Ok(None)));
-        drop(held);
-        assert!(budget.acquire(StreamClass::LongLived, 1).is_ok());
+    fn a_submitted_job_is_taken_once_and_resumed_with_its_outcome() {
+        let StreamAdmission::Admitted(mut driver) = StreamDriver::admit(Box::new(JobHandler), 8)
+        else {
+            panic!("the stream fits the cap");
+        };
+        let mut out = Vec::new();
+        let mut out_at = 0;
+        assert!(driver.on_data(b"request", &mut out, &mut out_at));
+        let job = driver.take_job().expect("the handler submitted one job");
+        assert!(driver.take_job().is_none(), "a job is taken once");
+        assert!(
+            driver.on_data(b"more", &mut out, &mut out_at),
+            "input is not delivered while the job runs"
+        );
+        assert!(out.is_empty(), "the handler saw no second event");
+        assert!(driver.on_blocking_done(
+            BlockingOutcome::Ok(job_result(job)),
+            &mut out,
+            &mut out_at
+        ));
+        assert_eq!(out, b"done");
+        assert!(
+            driver.closing.is_some(),
+            "the handler closed after the result"
+        );
+    }
+
+    fn job_result(job: BlockingJob) -> Vec<u8> {
+        match job() {
+            BlockingOutcome::Ok(bytes) => bytes,
+            BlockingOutcome::Failed(message) => panic!("unexpected failure: {message}"),
+        }
+    }
+
+    #[test]
+    fn a_handler_may_submit_a_follow_up_job_after_a_completion() {
+        struct TwoJobs {
+            calls: u8,
+        }
+        impl StreamHandler for TwoJobs {
+            fn on_event(&mut self, event: StreamEvent<'_>, out: &mut OutBuffer<'_>) -> StreamStep {
+                match event {
+                    StreamEvent::Data(_) => {
+                        StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|| {
+                            BlockingOutcome::Ok(b"one".to_vec())
+                        })))
+                    }
+                    StreamEvent::BlockingDone(BlockingOutcome::Ok(bytes)) => {
+                        self.calls += 1;
+                        out.write(&bytes);
+                        if self.calls == 1 {
+                            StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|| {
+                                BlockingOutcome::Ok(b"two".to_vec())
+                            })))
+                        } else {
+                            StreamStep::wait(StreamAction::Close(CloseReason::Completed))
+                        }
+                    }
+                    StreamEvent::BlockingDone(BlockingOutcome::Failed(message)) => {
+                        StreamStep::wait(StreamAction::Close(CloseReason::Failed(message)))
+                    }
+                    _ => StreamStep::wait(StreamAction::Continue),
+                }
+            }
+        }
+        let StreamAdmission::Admitted(mut driver) =
+            StreamDriver::admit(Box::new(TwoJobs { calls: 0 }), 8)
+        else {
+            panic!("the stream fits the cap");
+        };
+        let mut out = Vec::new();
+        let mut out_at = 0;
+        driver.on_data(b"x", &mut out, &mut out_at);
+        let first = driver.take_job().expect("first job");
+        driver.on_blocking_done(
+            BlockingOutcome::Ok(job_result(first)),
+            &mut out,
+            &mut out_at,
+        );
+        let second = driver
+            .take_job()
+            .expect("a WebSocket may queue the next call after a response");
+        driver.on_blocking_done(
+            BlockingOutcome::Ok(job_result(second)),
+            &mut out,
+            &mut out_at,
+        );
+        assert_eq!(out, b"onetwo");
+        assert!(driver.closing.is_some());
     }
 }
