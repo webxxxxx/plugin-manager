@@ -5,3 +5,5 @@
 // without failing dead-code analysis for types that later slices still use.
 #[cfg_attr(not(feature = "http"), allow(dead_code))]
 pub mod http;
+#[cfg_attr(not(all(feature = "http", unix)), allow(dead_code))]
+pub mod mcp;

@@ -905,6 +905,9 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
   if ($line -match '"id"\s*:\s*(\d+)') { $id = [int]$Matches[1] }
   $token = $null
   if ($line -match '"_meta"\s*:\s*\{[^}]*"progressToken"\s*:\s*"([^"]+)"') { $token = $Matches[1] }
+  if ($line -match '"name"\s*:\s*"slow"') {
+    Start-Sleep -Seconds 2
+  }
   if ($null -ne $token) {
     [Console]::Out.WriteLine('{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1,"progressToken":"' + $token + '"}}')
   }
@@ -923,6 +926,9 @@ while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   if [ -z "$id" ]; then id=1; fi
   meta=$(printf '%s\n' "$line" | sed -n 's/.*"_meta":{\([^}]*\)}.*/\1/p')
+  case "$line" in
+    *'"name":"slow"'*) sleep 2 ;;
+  esac
   token=$(printf '%s\n' "$meta" | sed -n 's/.*"progressToken":"\([^"]*\)".*/\1/p')
   if [ -n "$token" ]; then
     printf '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1,"progressToken":"%s"}}\n' "$token"
@@ -957,7 +963,8 @@ fn web_event_plugin_bundle(key: &SigningKey, id: &str) -> Vec<u8> {
         "protocol": 1,
         "exec": {"path": exec_path, "args": [], "ready": "notify"},
         "capabilities": [
-            {"name": "status", "desc": "sample status", "inputSchema": {"type": "object"}}
+            {"name": "status", "desc": "sample status", "inputSchema": {"type": "object"}},
+            {"name": "slow", "desc": "slow status", "inputSchema": {"type": "object"}}
         ],
         "ui": {"type": "web", "entry": "index.html"},
     });
@@ -2938,9 +2945,15 @@ fn http_mcp_streams_progress_for_tools_call() {
         "{head}"
     );
     let text = String::from_utf8_lossy(&decode_chunked(&response[split + 4..])).to_string();
-    assert!(text.contains("notifications/progress"), "{text}");
+    let progress = text
+        .find("notifications/progress")
+        .expect("a progress event before the result");
+    let final_at = text.find("\"id\":7").expect("the final response");
+    assert!(
+        progress < final_at,
+        "progress must arrive before the final result: {text}"
+    );
     assert!(text.contains("\"progressToken\":\"t1\""), "{text}");
-    assert!(text.contains("\"id\":7"), "{text}");
     assert!(text.contains("pong"), "{text}");
 }
 
@@ -6052,4 +6065,173 @@ fn run_min_config_phase(phase: &str, streams: bool) {
             &port_after,
         );
     }
+}
+
+/// Open one streaming `tools/call` and return the connection. The caller reads
+/// the response head first, so a 503 keeps its status without waiting for SSE.
+fn mcp_stream_request(address: &str, id: u64, name: &str) -> TcpStream {
+    let body = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": name,
+            "arguments": {},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "progressToken": "t1"
+            }
+        }
+    }))
+    .expect("body");
+    let mut stream = TcpStream::connect(address).expect("mcp connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        address,
+        TEST_PASSWORD,
+        name,
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).expect("write head");
+    stream.write_all(&body).expect("write body");
+    stream
+}
+
+/// A streaming MCP call is a long-lived stream: it draws from the same
+/// `max_streams` budget as downloads, and a full budget refuses it with the
+/// stable 503 before the plugin call starts.
+#[test]
+fn http_mcp_stream_consumes_the_long_lived_max_streams_budget() {
+    let mut sandbox = Sandbox::new();
+    sandbox.allow_insecure_install_with("max_streams = 1\n");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    set_password(&sandbox, TEST_PASSWORD);
+
+    // Hold the only long-lived slot with a stalled download.
+    let content = large_download_body();
+    let put = raw_request(
+        &address,
+        "POST",
+        "/api/v1/blobs",
+        "application/octet-stream",
+        &content,
+    );
+    assert_eq!(put.status, 200, "{:?}", put.body);
+    let id = json_body(&put)["id"].as_str().expect("blob id").to_string();
+    let mut stalled = TcpStream::connect(&address).expect("stalled connect");
+    stalled
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    stalled
+        .write_all(
+            format!(
+                "GET /api/v1/blobs/{} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                id, address
+            )
+            .as_bytes(),
+        )
+        .expect("stalled request");
+    assert_eq!(read_response_head(&mut stalled).0, 200);
+
+    let mut busy = mcp_stream_request(&address, 8, "demo.status");
+    let (status, headers) = read_response_head(&mut busy);
+    assert_eq!(status, 503, "a full stream budget refuses MCP SSE");
+    assert_eq!(
+        headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+            .map(|(_, value)| value.as_str()),
+        Some("1"),
+        "the busy response keeps the stable Retry-After contract"
+    );
+    drop(busy);
+
+    // Releasing the stalled reader releases the slot for the same call.
+    drop(stalled);
+    let mut accepted = None;
+    for _ in 0..200 {
+        let mut candidate = mcp_stream_request(&address, 9, "demo.status");
+        let (status, headers) = read_response_head(&mut candidate);
+        if status == 200 {
+            accepted = Some((candidate, headers));
+            break;
+        }
+        assert_eq!(status, 503, "only the busy status is retried");
+        drop(candidate);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (mut stream, headers) = accepted.expect("the MCP stream fits after the release");
+    assert!(
+        headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type") && value.contains("text/event-stream")
+        }),
+        "{headers:?}"
+    );
+    let mut body = Vec::new();
+    stream.read_to_end(&mut body).expect("read the SSE body");
+    let text = String::from_utf8_lossy(&decode_chunked(&body)).to_string();
+    assert!(
+        text.contains("\"id\":9"),
+        "the stream ends with a result: {text}"
+    );
+}
+
+/// A disconnected streaming MCP call must release its long-lived slot: with
+/// `max_streams = 1`, a second streaming call can start as soon as the first
+/// client goes away, even while the plugin call is still running. The Windows
+/// fallback cannot cancel the in-flight call, so this is a server-loop test.
+#[cfg(unix)]
+#[test]
+fn http_mcp_stream_disconnect_releases_the_budget() {
+    let mut sandbox = Sandbox::new();
+    sandbox.allow_insecure_install_with("max_streams = 1\n");
+    let key = SigningKey::from_bytes(&[62u8; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let package = web_event_plugin_bundle(&key, "demo");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let installed = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(installed.status, 200, "{}", installed.body);
+    let started = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
+    assert_eq!(started.status, 200, "{}", started.body);
+    set_password(&sandbox, TEST_PASSWORD);
+
+    // The plugin sleeps for two seconds, so the stream is still open when we
+    // drop the client after its head.
+    let mut slow = mcp_stream_request(&address, 11, "demo.slow");
+    assert_eq!(read_response_head(&mut slow).0, 200);
+    drop(slow);
+
+    let mut released = false;
+    for _ in 0..300 {
+        let mut candidate = mcp_stream_request(&address, 12, "demo.status");
+        let (status, _) = read_response_head(&mut candidate);
+        if status == 200 {
+            released = true;
+            drop(candidate);
+            break;
+        }
+        assert_eq!(status, 503, "only the busy status is retried");
+        drop(candidate);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        released,
+        "a disconnected MCP client must release the max_streams slot"
+    );
 }
