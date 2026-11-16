@@ -26,13 +26,20 @@ where
     F: Fn(&str) -> bool,
 {
     let mut out = Vec::new();
-    // Core services are lifecycle units, not tool providers.
-    for svc in reg.values().filter(|svc| svc.kind == Kind::Plugin) {
-        out.push(json!({
-            "name": format!("{}.start", svc.id),
-            "description": format!("Start plugin {}", svc.id),
-            "inputSchema": {"type": "object", "properties": {}}
-        }));
+    // The capability surface, not the kind, decides whether a service exposes
+    // tools: the builtin `svc` is a core service with tools. Only plugins get a
+    // `<id>.start` tool, because only a supervised process can be dead.
+    for svc in reg
+        .values()
+        .filter(|svc| svc.kind == Kind::Plugin || !svc.caps.is_empty())
+    {
+        if svc.kind == Kind::Plugin {
+            out.push(json!({
+                "name": format!("{}.start", svc.id),
+                "description": format!("Start plugin {}", svc.id),
+                "inputSchema": {"type": "object", "properties": {}}
+            }));
+        }
         if is_live(&svc.id) {
             for cap in &svc.caps {
                 let description = if cap.description.is_empty() {
@@ -595,22 +602,39 @@ mod tests {
     }
 
     #[test]
-    fn core_services_never_appear_in_the_tool_projection() {
+    fn the_capability_surface_not_the_kind_decides_the_tool_projection() {
         let mut registry = Registry::new();
         registry
             .insert(service("core", Kind::Core, &["status"]))
             .expect("core");
+        registry
+            .insert(service("lifecycle", Kind::Core, &[]))
+            .expect("lifecycle");
         registry
             .insert(service("plug", Kind::Plugin, &["status"]))
             .expect("plugin");
 
         let names = names(&tools(&registry, |_| true));
 
+        assert!(names.contains(&"core.status".to_string()), "{names:?}");
         assert!(
-            !names.iter().any(|name| name.starts_with("core.")),
+            !names.iter().any(|name| name.starts_with("lifecycle.")),
             "{names:?}"
         );
+        assert!(!names.contains(&"core.start".to_string()), "{names:?}");
         assert!(names.contains(&"plug.status".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn a_live_builtin_service_publishes_its_capabilities_without_start() {
+        let registry = Registry::with_builtin();
+
+        let names = names(&tools(&registry, |_| true));
+
+        assert_eq!(
+            names,
+            vec!["svc.health".to_string(), "svc.version".to_string()]
+        );
     }
 
     #[test]

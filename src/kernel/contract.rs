@@ -432,6 +432,21 @@ pub enum LaunchError {
     Failed(Failure),
 }
 
+impl LaunchError {
+    /// A launch is assembly, not a call: an unregistered tag is an
+    /// implementation error, while a registered launcher keeps its own class.
+    pub fn into_failure(self) -> Failure {
+        match self {
+            LaunchError::UnknownTag(tag) => Failure::new(
+                Class::ImplementationError,
+                Retry::Never,
+                format!("no launcher is registered for tag \"{tag}\""),
+            ),
+            LaunchError::Failed(failure) => failure,
+        }
+    }
+}
+
 impl Launchers {
     pub fn register(&mut self, tag: impl Into<String>, launcher: Box<dyn Launcher>) {
         self.by_tag.insert(tag.into(), launcher);
@@ -641,6 +656,14 @@ mod tests {
             Err(other) => panic!("unexpected launch error: {other:?}"),
             Ok(_) => panic!("an unregistered tag must fail to launch"),
         }
+    }
+
+    #[test]
+    fn a_launch_error_projects_to_a_kernel_failure() {
+        let failure = LaunchError::UnknownTag("wasm".into()).into_failure();
+        assert_eq!(failure.class, Class::ImplementationError);
+        assert_eq!(failure.retry, Retry::Never);
+        assert!(failure.detail.contains("wasm"), "{}", failure.detail);
     }
 
     #[test]

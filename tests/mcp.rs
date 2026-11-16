@@ -719,6 +719,19 @@ fn modern_bridge_discovers_lists_and_calls_tools() {
     assert_eq!(result["isError"], true);
     assert_eq!(result["content"][0]["text"], "boom");
 
+    // The builtin `svc` is assembled through Launchers, not a plugin slot.
+    let builtin = mcp.request(
+        8,
+        "tools/call",
+        modern_params(json!({"name": "svc.version", "arguments": {}})),
+    );
+    let result = builtin.get("result").expect("builtin result");
+    assert_eq!(result["resultType"], "complete");
+    assert_eq!(result["isError"], false);
+    let text = result["content"][0]["text"].as_str().expect("builtin text");
+    let value: Value = serde_json::from_str(text).expect("builtin json");
+    assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+
     let unknown = mcp.request(
         5,
         "tools/call",
@@ -820,7 +833,7 @@ fn legacy_bridge_initializes_and_notifies_list_changes() {
     assert!(result.get("resultType").is_none());
     assert!(result.get("ttlMs").is_none());
     let names = tool_names(&result["tools"]);
-    assert_eq!(names, vec!["demo.start"]);
+    assert_eq!(names, vec!["demo.start", "svc.health", "svc.version"]);
 
     // Let the bridge take its first baseline poll before the list changes.
     std::thread::sleep(Duration::from_millis(1500));
@@ -1089,7 +1102,7 @@ fn http_mcp_discovers_lists_and_calls_with_stdio_semantics() {
     );
     let after_stop = after_stop.json();
     let names = tool_names(&after_stop["result"]["tools"]);
-    assert_eq!(names, vec!["demo.start"]);
+    assert_eq!(names, vec!["demo.start", "svc.health", "svc.version"]);
 
     // No modern client notification exists in the core protocol; a
     // notification POST is still accepted with an empty 202.

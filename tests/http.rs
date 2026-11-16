@@ -3988,7 +3988,7 @@ fn phase_end_to_end_install_start_mcp_config_logs_and_uninstall() {
     let listed = mcp_request(&address, &token, "tools/list", json!({}), None);
     assert_eq!(
         tool_names(&listed.body["result"]["tools"]),
-        vec!["demo.start"]
+        vec!["demo.start", "svc.health", "svc.version"]
     );
     let stdio_listed = sandbox.mcp_stdio(json!({
         "jsonrpc": "2.0",
@@ -3998,7 +3998,7 @@ fn phase_end_to_end_install_start_mcp_config_logs_and_uninstall() {
     }));
     assert_eq!(
         tool_names(&stdio_listed["result"]["tools"]),
-        vec!["demo.start"]
+        vec!["demo.start", "svc.health", "svc.version"]
     );
 
     // Uninstall removes the service from every surface.
@@ -4014,14 +4014,20 @@ fn phase_end_to_end_install_start_mcp_config_logs_and_uninstall() {
     );
     let listed = mcp_request(&address, &token, "tools/list", json!({}), None);
     assert_eq!(listed.status, 200);
-    assert!(tool_names(&listed.body["result"]["tools"]).is_empty());
+    assert_eq!(
+        tool_names(&listed.body["result"]["tools"]),
+        vec!["svc.health", "svc.version"]
+    );
     let stdio_listed = sandbox.mcp_stdio(json!({
         "jsonrpc": "2.0",
         "id": 10,
         "method": "tools/list",
         "params": {"_meta": modern_meta()},
     }));
-    assert!(tool_names(&stdio_listed["result"]["tools"]).is_empty());
+    assert_eq!(
+        tool_names(&stdio_listed["result"]["tools"]),
+        vec!["svc.health", "svc.version"]
+    );
 }
 
 #[test]

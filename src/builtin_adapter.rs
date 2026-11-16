@@ -48,13 +48,13 @@ impl BuiltinWire {
 
     fn value(&self, capability: &str) -> Value {
         match capability {
-            "svc.version" => json!({ "version": env!("CARGO_PKG_VERSION") }),
-            "svc.describe" => json!({
+            "version" => json!({ "version": env!("CARGO_PKG_VERSION") }),
+            "describe" => json!({
                 "id": "svc",
                 "version": env!("CARGO_PKG_VERSION"),
                 "kind": "core",
             }),
-            "svc.health" => json!({ "state": "ready" }),
+            "health" => json!({ "state": "ready" }),
             _ => json!({ "ok": true }),
         }
     }
@@ -115,7 +115,9 @@ impl Wire for BuiltinWire {
 mod tests {
     use super::*;
     use crate::kernel::conformance::{assert_conforming, sample_contract};
-    use crate::kernel::contract::{Control, Instance, Limits};
+    use crate::kernel::contract::{
+        Capability, CapabilityName, Control, Effect, Instance, Limits, Obligations, ServiceId,
+    };
     use crate::kernel::failure::Class;
 
     fn contract() -> Contract {
@@ -153,6 +155,50 @@ mod tests {
         }) {
             Ok(_) => {}
             Err(error) => panic!("the builtin tag must launch: {error:?}"),
+        }
+    }
+
+    #[test]
+    fn the_builtin_reports_version_and_health_by_capability_name() {
+        let capability = |name: &str| Capability {
+            name: CapabilityName::new(name),
+            desc: String::new(),
+            input_schema: None,
+            effect: Effect::Read,
+            idempotent: true,
+        };
+        let contract = Contract::new(
+            ServiceId::new("svc"),
+            "1.0.0",
+            vec![capability("version"), capability("health")],
+            Obligations::default(),
+            Class::ALL.to_vec(),
+            Limits::default(),
+        );
+        let mut instance = Instance::new(contract.clone(), Box::new(BuiltinWire::new(contract)))
+            .expect("valid contract");
+
+        match instance
+            .call(Invocation::new(
+                "version",
+                json!({}),
+                std::time::Duration::from_secs(1),
+            ))
+            .expect("version call")
+        {
+            Reply::Value(value) => assert_eq!(value["version"], env!("CARGO_PKG_VERSION")),
+            other => panic!("expected a value reply, got {other:?}"),
+        }
+        match instance
+            .call(Invocation::new(
+                "health",
+                json!({}),
+                std::time::Duration::from_secs(1),
+            ))
+            .expect("health call")
+        {
+            Reply::Value(value) => assert_eq!(value["state"], "ready"),
+            other => panic!("expected a value reply, got {other:?}"),
         }
     }
 

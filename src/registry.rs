@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 /// The built-in core service id; reserved against `services.d` definitions.
 pub const RESERVED_ID: &str = "svc";
@@ -197,7 +198,18 @@ impl Service {
             protocol: 1,
             desc: "core service management".into(),
             deps: Vec::new(),
-            caps: Vec::new(),
+            caps: vec![
+                Capability {
+                    name: "version".into(),
+                    description: "svcd version".into(),
+                    input_schema: json!({"type": "object", "properties": {}}),
+                },
+                Capability {
+                    name: "health".into(),
+                    description: "svcd health".into(),
+                    input_schema: json!({"type": "object", "properties": {}}),
+                },
+            ],
             exec: None,
             lifecycle: None,
             enabled: true,
@@ -347,6 +359,13 @@ mod tests {
             serde_json::to_value(Kind::Plugin).expect("serialize"),
             json!("plugin")
         );
+    }
+
+    #[test]
+    fn the_builtin_service_declares_version_and_health() {
+        let service = Service::builtin_svc();
+        let names: Vec<&str> = service.caps.iter().map(|cap| cap.name.as_str()).collect();
+        assert_eq!(names, vec!["version", "health"]);
     }
 
     #[test]
