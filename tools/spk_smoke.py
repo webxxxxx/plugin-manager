@@ -436,6 +436,7 @@ class Smoke:
         self.port = None
         self.http = None
         self.artifacts = {}
+        self.ui_bases = {}
 
     # ---------------------------------------------------------------- setup
     def prepare(self):
@@ -589,6 +590,31 @@ class Smoke:
     def service_state(self, name):
         return self.status(name)["summary"]["state"]
 
+    def ui_base(self, name):
+        """Mint a plugin-UI token and return the base path it entitles.
+
+        The plugin UI lives under /plugin-ui/<id>/<token>/: the page, /ws,
+        /events and /rpc all hang off that base, and the bare
+        /plugin-ui/<id>/ path answers 401. Minting is memoised so the checks
+        below share one token.
+        """
+        cached = self.ui_bases.get(name)
+        if cached:
+            return cached
+        status, _, body = self.http.json(
+            "POST",
+            "/api/v1/plugins/%s/ui-token" % name,
+            None,
+            {"Authorization": "Bearer " + PASSWORD},
+        )
+        require(status == 200, "ui-token %s returned %d: %r" % (name, status, body))
+        url = body.get("url") or ""
+        require(url.startswith("/plugin-ui/"), "ui-token %s url is not a plugin UI path: %r" % (name, url))
+        if not url.endswith("/"):
+            url += "/"
+        self.ui_bases[name] = url
+        return url
+
     # -------------------------------------------------------------- sections
     def check_dependencies(self, report):
         def install_app_first():
@@ -740,20 +766,21 @@ class Smoke:
             return "ws-panel running"
 
         def ui_page():
-            status, headers, text = self.http.text("/plugin-ui/ws-panel/")
+            base = self.ui_base("ws-panel")
+            status, headers, text = self.http.text(base)
             require(status == 200, "ws-panel UI status %d" % status)
             require("new WebSocket(" in text, "UI page does not open a WebSocket")
-            require('/plugin-ui/" + pluginId + "/ws' in text or "/plugin-ui/ws-panel/ws" in text, "UI page does not name the /ws endpoint")
+            require(base in text, "UI page does not carry its tokenized base %r" % base)
             require("Emit notification" in text, "UI page is missing its controls")
-            return "GET /plugin-ui/ws-panel/ 200 (%d B)" % len(text.encode("utf-8"))
+            return "GET %s 200 (%d B)" % (base, len(text.encode("utf-8")))
 
         def upgrade_is_required():
-            status, headers, text = self.http.text("/plugin-ui/ws-panel/ws")
+            status, headers, text = self.http.text(self.ui_base("ws-panel") + "ws")
             require(status == 426, "plain GET /ws got %d, expected 426" % status)
             return "426 without an Upgrade header"
 
         def handshake_and_call():
-            client = WsClient(self.port, "/plugin-ui/ws-panel/ws")
+            client = WsClient(self.port, self.ui_base("ws-panel") + "ws")
             try:
                 client.send_frame(
                     0x1,
@@ -789,7 +816,7 @@ class Smoke:
                 client.close()
 
         def emit_and_pong():
-            client = WsClient(self.port, "/plugin-ui/ws-panel/ws")
+            client = WsClient(self.port, self.ui_base("ws-panel") + "ws")
             try:
                 client.send_frame(
                     0x1,
@@ -830,7 +857,7 @@ class Smoke:
                 client.close()
 
         def close_frame():
-            client = WsClient(self.port, "/plugin-ui/ws-panel/ws")
+            client = WsClient(self.port, self.ui_base("ws-panel") + "ws")
             try:
                 client.send_frame(0x8, struct.pack("!H", 1000))
                 deadline = time.time() + 5
@@ -859,15 +886,16 @@ class Smoke:
             return "sse-panel running"
 
         def ui_page():
-            status, headers, text = self.http.text("/plugin-ui/sse-panel/")
+            base = self.ui_base("sse-panel")
+            status, headers, text = self.http.text(base)
             require(status == 200, "sse-panel UI status %d" % status)
             require("new EventSource(" in text, "UI page does not open an EventSource")
             require("Last-Event-ID" in text, "UI page does not demonstrate Last-Event-ID")
             require("Emit notification" in text, "UI page is missing its controls")
-            return "GET /plugin-ui/sse-panel/ 200 (%d B)" % len(text.encode("utf-8"))
+            return "GET %s 200 (%d B)" % (base, len(text.encode("utf-8")))
 
         def stream_and_rpc():
-            stream = SseClient(self.port, "/plugin-ui/sse-panel/events")
+            stream = SseClient(self.port, self.ui_base("sse-panel") + "events")
             try:
                 event = stream.next_event()
                 require(event["id"] is not None, "SSE event has no id: %r" % event)
@@ -877,7 +905,7 @@ class Smoke:
 
                 status, _, body = self.http.json(
                     "POST",
-                    "/plugin-ui/sse-panel/rpc",
+                    self.ui_base("sse-panel") + "rpc",
                     {
                         "jsonrpc": "2.0",
                         "id": 7,
@@ -900,7 +928,7 @@ class Smoke:
                 stream.close()
 
         def replay_after_reconnect():
-            stream = SseClient(self.port, "/plugin-ui/sse-panel/events")
+            stream = SseClient(self.port, self.ui_base("sse-panel") + "events")
             try:
                 event = stream.next_event()
                 checkpoint = event["id"]
@@ -909,7 +937,7 @@ class Smoke:
 
             status, _, body = self.http.json(
                 "POST",
-                "/plugin-ui/sse-panel/rpc",
+                self.ui_base("sse-panel") + "rpc",
                 {
                     "jsonrpc": "2.0",
                     "id": 8,
@@ -920,7 +948,7 @@ class Smoke:
             require(status == 200 and body["result"]["isError"] is False, "emit replay-one failed: %r" % body)
             status, _, body = self.http.json(
                 "POST",
-                "/plugin-ui/sse-panel/rpc",
+                self.ui_base("sse-panel") + "rpc",
                 {
                     "jsonrpc": "2.0",
                     "id": 9,
@@ -930,7 +958,7 @@ class Smoke:
             )
             require(status == 200 and body["result"]["isError"] is False, "emit replay-two failed: %r" % body)
 
-            stream = SseClient(self.port, "/plugin-ui/sse-panel/events", last_event_id=checkpoint)
+            stream = SseClient(self.port, self.ui_base("sse-panel") + "events", last_event_id=checkpoint)
             try:
                 seen = []
                 deadline = time.time() + 10
@@ -1011,8 +1039,8 @@ def serve(smoke, args):
 
     host = "127.0.0.1" if not args.lan else wsl_address()
     print("\nserving the samples on port %d — Ctrl+C to stop" % smoke.port)
-    print("  ws-panel  http://%s:%d/plugin-ui/ws-panel/" % (host, smoke.port))
-    print("  sse-panel http://%s:%d/plugin-ui/sse-panel/" % (host, smoke.port))
+    print("  ws-panel  http://%s:%d%s" % (host, smoke.port, smoke.ui_base("ws-panel")))
+    print("  sse-panel http://%s:%d%s" % (host, smoke.port, smoke.ui_base("sse-panel")))
     print("  svcd UI   http://%s:%d/" % (host, smoke.port))
     if args.lan:
         print("  LAN auth is on; log in with password: %s" % PASSWORD)
@@ -1060,8 +1088,8 @@ def main(argv):
         print("\n%d/%d checks passed in %.1fs" % (sum(1 for row in report.rows if row["ok"]), len(report.rows), elapsed))
         print("\nThe smoke run shuts the daemon down on exit. Use --serve to keep the samples")
         print("running and open the web UIs at:")
-        print("  http://127.0.0.1:%d/plugin-ui/ws-panel/" % smoke.port)
-        print("  http://127.0.0.1:%d/plugin-ui/sse-panel/" % smoke.port)
+        print("  http://127.0.0.1:%d%s" % (smoke.port, smoke.ui_bases.get("ws-panel", "/plugin-ui/ws-panel/")))
+        print("  http://127.0.0.1:%d%s" % (smoke.port, smoke.ui_bases.get("sse-panel", "/plugin-ui/sse-panel/")))
         print("\nDSH MCP link (transport: streamable-http):")
         print("  url: http://127.0.0.1:%d/mcp" % smoke.port)
         print("  header: Authorization: Bearer %s" % PASSWORD)
@@ -1085,8 +1113,8 @@ def main(argv):
                     "checks": report.rows,
                     "artifacts": smoke.artifacts,
                     "web_ui": {
-                        "ws": "http://127.0.0.1:%d/plugin-ui/ws-panel/" % smoke.port,
-                        "sse": "http://127.0.0.1:%d/plugin-ui/sse-panel/" % smoke.port,
+                        "ws": "http://127.0.0.1:%d%s" % (smoke.port, smoke.ui_bases.get("ws-panel", "/plugin-ui/ws-panel/")),
+                        "sse": "http://127.0.0.1:%d%s" % (smoke.port, smoke.ui_bases.get("sse-panel", "/plugin-ui/sse-panel/")),
                     },
                     "dsh_mcp": {
                         "transport": "streamable-http",
