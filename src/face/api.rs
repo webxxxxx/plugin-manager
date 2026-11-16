@@ -2,9 +2,10 @@
 //!
 //! #113 moved `GET /api/v1/version` through the S4 seam, #116 added the first
 //! `Blocking` route, and #117 moves the remaining management JSON routes here.
-//! Blob/file transfer, export spk/spkb, import/install and the plugin UI
-//! streams keep their own streaming paths until #118–#122; this face owns the
-//! ordinary management surface, the console page and login/logout.
+//! Blob/file transfer, import/install and the plugin UI streams keep their own
+//! streaming paths until #118–#122; #120 moved export spk/spkb to
+//! `face/export.rs`. This face owns the ordinary management surface, the
+//! console page and login/logout.
 
 use std::io;
 use std::path::PathBuf;
@@ -25,6 +26,7 @@ use crate::server::http::{
 const UI: &str = include_str!("../web/index.html");
 
 use super::blob;
+use super::export;
 
 /// The management API face.
 pub struct ApiFace {
@@ -398,7 +400,7 @@ fn is_api_path(path: &str) -> bool {
     parts.first() == Some(&"api") && parts.get(1) == Some(&"v1")
 }
 
-/// Paths owned by the transfer slices (#118–#121) stay on the legacy bridge
+/// Paths owned by the transfer slices (#119–#121) stay on the legacy bridge
 /// until their own StreamHandler lands.
 fn is_transfer_path(method: &str, path: &str) -> bool {
     let path = path_only(path);
@@ -411,8 +413,6 @@ fn is_transfer_path(method: &str, path: &str) -> bool {
         ["api", "v1", "import"] if method == "POST" => true,
         ["api", "v1", "blobs", ..] => true,
         ["api", "v1", "file", ..] => true,
-        ["api", "v1", "export", _] if method == "GET" => true,
-        ["api", "v1", "export", _, "spk"] if method == "GET" => true,
         _ => false,
     }
 }
@@ -532,7 +532,7 @@ fn download_response(filename: &str, data: &[u8]) -> Response {
         .with_header("Cache-Control", "no-store")
 }
 
-fn safe_filename(value: &str) -> String {
+pub(crate) fn safe_filename(value: &str) -> String {
     value
         .chars()
         .filter(|character| {
@@ -562,7 +562,9 @@ fn project_service(status: &Value) -> Option<Value> {
 
 impl Face for ApiFace {
     fn route(&self, method: &str, path: &str) -> Option<Route> {
-        if blob::download_target(method, path).is_some() {
+        if blob::download_target(method, path).is_some()
+            || export::export_target(method, path).is_some()
+        {
             // A download has no request body, but its result is a stream
             // handler: the route must say so, or the dispatch check rejects it.
             return Some(Route::inline(BodyPolicy::Streamed));
@@ -578,6 +580,10 @@ impl Face for ApiFace {
     }
 
     fn handle(&self, request: Request, done: Completion) {
+        if let Some(target) = export::export_target(&request.method, &request.path) {
+            done.complete(Exchange::Stream(Box::new(export::ExportStream::open(target))));
+            return;
+        }
         if let Some(target) = blob::download_target(&request.method, &request.path) {
             done.complete(Exchange::Stream(Box::new(blob::DownloadStream::open(
                 &request, target,
@@ -702,19 +708,22 @@ mod tests {
     }
 
     #[test]
-    fn downloads_use_the_stream_face_and_uploads_stay_legacy() {
+    fn downloads_and_exports_use_the_stream_face_and_uploads_stay_legacy() {
         let face = face();
         for (method, path) in [
             ("GET", "/api/v1/blobs/abc"),
             ("HEAD", "/api/v1/file/abc"),
+            ("GET", "/api/v1/export/demo"),
+            ("GET", "/api/v1/export/demo/spk"),
         ] {
             let route = face
                 .route(method, path)
                 .unwrap_or_else(|| panic!("{method} {path} must be a face route"));
             assert!(
                 matches!(route.body, BodyPolicy::Streamed),
-                "{method} {path} must be a streamed download"
+                "{method} {path} must be a streamed response"
             );
+            assert_eq!(route.dispatch, Dispatch::Inline);
         }
         for (method, path) in [
             ("POST", "/api/v1/plugins"),
@@ -722,8 +731,6 @@ mod tests {
             ("POST", "/api/v1/blobs/uploads"),
             ("PUT", "/api/v1/blobs/uploads/abc/parts/1"),
             ("POST", "/api/v1/file/uploads"),
-            ("GET", "/api/v1/export/demo"),
-            ("GET", "/api/v1/export/demo/spk"),
             ("GET", "/mcp"),
             ("GET", "/plugin-ui/demo/token/events"),
         ] {
@@ -732,6 +739,26 @@ mod tests {
                 "{method} {path} must stay legacy"
             );
         }
+        // The other export shape is a management route: only the archive
+        // downloads are streams.
+        let config = face
+            .route("GET", "/api/v1/export/demo/config")
+            .expect("config export route");
+        assert_eq!(config.dispatch, Dispatch::Blocking);
+        let post = face
+            .route("POST", "/api/v1/export/demo")
+            .expect("405 route");
+        assert_eq!(post.dispatch, Dispatch::Blocking);
+    }
+
+    #[test]
+    fn an_export_route_returns_a_stream_handler() {
+        let face = face();
+        let path = "/api/v1/export/missing-plugin";
+        let route = face.route("GET", path).expect("export route");
+        let exchange = dispatch_inline(&face, &route, request("GET", path))
+            .expect("an unknown plugin is a streamed 404, not a dispatch error");
+        assert!(matches!(exchange, Exchange::Stream(_)));
     }
 
     #[test]

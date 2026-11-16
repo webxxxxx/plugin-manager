@@ -1316,23 +1316,6 @@ fn parse_ws_frame(buffer: &[u8], max: usize) -> Result<Option<(WsFrame, usize)>,
 }
 
 #[cfg(unix)]
-fn export_takeover(
-    connection: &mut Connection,
-) -> Option<(TcpStream, http::Head, crate::export_http::Route)> {
-    if connection.pending.is_some() {
-        return None;
-    }
-    let header_end = http::header_end(&connection.buffer)?;
-    if header_end > crate::limits::current().max_header {
-        return None;
-    }
-    let (head, _) = http::parse_head(&connection.buffer[..header_end + 4])?;
-    let route = crate::export_http::route(&head)?;
-    let stream = connection.stream.try_clone().ok()?;
-    Some((stream, head, route))
-}
-
-#[cfg(unix)]
 fn import_takeover(connection: &mut Connection) -> Option<(TcpStream, http::Head, Vec<u8>)> {
     if connection.pending.is_some() {
         return None;
@@ -1551,11 +1534,24 @@ fn serve_plugin_ui(stream: &mut TcpStream, head: &http::Head, peer: IpAddr, lan:
     }
 }
 
-/// Run one blob/file download through the face and the Windows fallback
-/// driver. The handler owns no connection; the fallback owns the socket and
-/// the shared `max_streams` slot.
+/// Whether the face claims this request as an inline streamed route. The
+/// fallback dispatches those before the body is read: their result is a
+/// sans-IO handler, not a memory response, so it cannot go through
+/// `serve_face`.
 #[cfg(not(unix))]
-fn serve_blob_download(
+fn is_streamed_route(face: &crate::face::api::ApiFace, head: &http::Head) -> bool {
+    use crate::server::http::{BodyPolicy, Dispatch, Face};
+
+    face.route(&head.method, &head.path)
+        .map(|route| route.dispatch == Dispatch::Inline && route.body == BodyPolicy::Streamed)
+        .unwrap_or(false)
+}
+
+/// Run one streamed face route on the Windows connection thread. The handler
+/// owns no connection; the fallback owns the socket and the shared
+/// `max_streams` slot. A download and an export share this path.
+#[cfg(not(unix))]
+fn serve_streamed_route(
     stream: &mut TcpStream,
     head: &http::Head,
     peer: IpAddr,
@@ -1574,7 +1570,7 @@ fn serve_blob_download(
     let prepared = match prepare_face_request(face, &request, peer, lan) {
         Ok(Some(prepared)) => prepared,
         Ok(None) => {
-            let _ = stream.write_all(&http::json_error(404, "not_found", "not a download route"));
+            let _ = stream.write_all(&http::json_error(404, "not_found", "unknown endpoint"));
             return;
         }
         Err(response) => {
@@ -1643,12 +1639,8 @@ fn handle(
             serve_plugin_ui(&mut stream, &head, peer, &lan);
             return;
         }
-        if crate::face::blob::download_target(&head.method, &head.path).is_some() {
-            serve_blob_download(&mut stream, &head, peer, &face, &lan);
-            return;
-        }
-        if let Some(route) = crate::export_http::route(&head) {
-            crate::export_http::serve(&mut stream, &head, &lan, &config, route);
+        if is_streamed_route(&face, &head) {
+            serve_streamed_route(&mut stream, &head, peer, &face, &lan);
             return;
         }
         if crate::install_http::import_route(&head) {
@@ -2277,8 +2269,6 @@ fn same_origin(request: &HttpRequest) -> bool {
     http::same_origin(&request.headers)
 }
 
-
-
 pub(crate) fn is_write(method: &str) -> bool {
     matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
 }
@@ -2442,19 +2432,11 @@ fn route(config: &std::path::Path, request: &HttpRequest) -> Vec<u8> {
         (_, ["api", "v1", "file", "uploads", _, "complete"]) => method_not_allowed("POST"),
         (_, ["api", "v1", "file", "uploads", _, "parts", _]) => method_not_allowed("PUT"),
         (_, ["api", "v1", "file", _]) => method_not_allowed("GET"),
-        ("GET", ["api", "v1", "export", id, "spk"]) => export_spk(config, &decode(id)),
-        (_, ["api", "v1", "export", _, "spk"]) => method_not_allowed("GET"),
-        ("GET", ["api", "v1", "export", id]) => export_spkb(config, &decode(id)),
-        (_, ["api", "v1", "export", _]) => method_not_allowed("GET"),
         ("POST", ["api", "v1", "import"]) => import_plugin(request, query),
         (_, ["api", "v1", "import"]) => method_not_allowed("POST"),
         _ => error(404, "not_found", "unknown endpoint"),
     }
 }
-
-
-
-
 
 fn install_plugin(config: &std::path::Path, request: &HttpRequest, query: &str) -> Vec<u8> {
     if request.body.is_empty() {
@@ -2523,10 +2505,6 @@ fn install_plugin(config: &std::path::Path, request: &HttpRequest, query: &str) 
     }
 }
 
-pub(crate) fn require_plugin(config: &Path, id: &str) -> Result<(), Vec<u8>> {
-    require_plugin_result(config, id).map_err(|(status, code, message)| error(status, code, &message))
-}
-
 pub(crate) fn require_plugin_result(
     config: &Path,
     id: &str,
@@ -2545,31 +2523,6 @@ pub(crate) fn require_plugin_result(
         Err((404, "not_found", format!("not a plugin: {}", id)))
     }
 }
-
-
-
-
-fn export_spkb(config: &Path, id: &str) -> Vec<u8> {
-    if let Err(response) = require_plugin(config, id) {
-        return response;
-    }
-    match plugin::export_spkb(id) {
-        Ok((version, data)) => download(&format!("{}-{}.spkb", id, version), &data),
-        Err(message) => error(500, "internal", &message),
-    }
-}
-
-/// The installable, signed package reconstructed from the current version.
-fn export_spk(config: &Path, id: &str) -> Vec<u8> {
-    if let Err(response) = require_plugin(config, id) {
-        return response;
-    }
-    match plugin::export_spk(id) {
-        Ok((version, data)) => download(&format!("{}-{}.spk", id, version), &data),
-        Err(message) => error(500, "internal", &message),
-    }
-}
-
 
 fn import_plugin(request: &HttpRequest, query: &str) -> Vec<u8> {
     let config_id = query_value(query, "config_id");
@@ -2601,22 +2554,8 @@ fn import_plugin(request: &HttpRequest, query: &str) -> Vec<u8> {
     }
 }
 
-
-
 fn method_not_allowed(allow: &str) -> Vec<u8> {
     http::method_not_allowed(allow)
-}
-
-fn download(filename: &str, data: &[u8]) -> Vec<u8> {
-    http::response_with_headers(
-        200,
-        "application/octet-stream",
-        &[(
-            "Content-Disposition".to_string(),
-            format!("attachment; filename=\"{}\"", filename),
-        )],
-        data,
-    )
 }
 
 fn import_error(message: &str) -> Vec<u8> {
@@ -2748,7 +2687,6 @@ fn code_for(status: u16) -> &'static str {
         _ => "internal",
     }
 }
-
 
 fn ok(value: Value) -> Vec<u8> {
     http::response(

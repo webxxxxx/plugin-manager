@@ -1519,7 +1519,7 @@ pub fn export_spkb_size(id: &str) -> Result<u64, String> {
     Ok(total.saturating_add(1024))
 }
 
-fn backup_json(id: &str, version: &str, config: Option<&[u8]>) -> Vec<u8> {
+pub(crate) fn backup_json(id: &str, version: &str, config: Option<&[u8]>) -> Vec<u8> {
     let exported_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

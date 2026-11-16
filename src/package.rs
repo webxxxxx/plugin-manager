@@ -262,7 +262,7 @@ pub fn tar_entry_size(size: u64) -> u64 {
         .saturating_add(padding(size as usize) as u64)
 }
 
-fn read_export_signature(version_dir: &Path) -> Result<Vec<u8>, String> {
+pub(crate) fn read_export_signature(version_dir: &Path) -> Result<Vec<u8>, String> {
     match fs::read(version_dir.join("signature.json")) {
         Ok(signature) => Ok(signature),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(
