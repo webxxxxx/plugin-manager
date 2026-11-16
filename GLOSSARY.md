@@ -151,6 +151,10 @@ _Avoid_: 引擎、监听器、endpoint
 一个协议面对外暴露的端点与投影：它把领域概念与能力面映射成该协议的请求/响应，自己不持有资源、不拥有连接。服务器（server）建立连接，对外面解释连接上的每个请求。
 _Avoid_: UI、界面层、接口层
 
+**请求交接（Request handover）**:
+服务器把「已解析的请求 + 恰好一次完成槽」交给对外面，自己保留连接、缓冲、deadline 与背压；对外面用内存响应或 sans-IO stream handler 作答，不接触 socket。见 [ADR-0016](docs/adr/0016-s4-request-handover.md)。
+_Avoid_: 接管、takeover、handler 调用
+
 **插件 stdio 反应器（Plugin stdio reactor）**:
 Unix 上唯一拥有插件管道的那条 poll 线程（`svcd-reactor`）：通知型插件的 stdout/stderr、exec 型插件的日志、协议 3 插件的 stdin/stdout/stderr 都由它读写，所以每个插件不再自带线程。超时/背压由每条管道自己的队列决定，不是线程阻塞。反应器起不来（或非 Unix 构建）时才退回「每插件读写线程」的降级路径。
 _Avoid_: IO 线程池、epoll 管理器

@@ -17,6 +17,8 @@ mod daemon;
 mod definition;
 #[cfg(feature = "http")]
 mod export_http;
+#[cfg(feature = "http")]
+mod face;
 mod hook;
 mod http;
 mod install;
@@ -44,6 +46,7 @@ mod registry;
 mod rpc;
 mod runtime;
 mod script;
+mod server;
 #[cfg(windows)]
 mod service_win;
 mod settings;

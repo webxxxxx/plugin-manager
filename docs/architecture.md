@@ -218,7 +218,7 @@ src/
   server/                     L4 服务器：协议会话
     mod.rs
     control/  listener.rs  session.rs    命令行通道也是服务器
-    http/     engine.rs  routes.rs  takeover.rs
+    http/     contract.rs  dispatch.rs  engine.rs  routes.rs  takeover.rs
     mcp/      session.rs  transport.rs  progress.rs
     auth/     gate.rs  token.rs  session.rs
 
@@ -289,7 +289,7 @@ src/
 | **S1** | **服务契约** | 内核 ↔ 四种运行实现 | 1 个显式 adapter（内置）+ 槽（exec）→ 未来 4 | **接口已定**（ADR-0013/0015）；待从 `slot`/`package`/`registry` 抽出 |
 | S2 | 调用传输 | 内核 ↔ 载体 | 1（本机 stdio） | 暂不开，但信封必须先定 |
 | S3 | 线格式实现 | 线格式 ↔ 平台 | 2（unix poll / windows 线程） | 未开，`cfg(unix)` 散在业务文件里 |
-| S4 | 请求交接 | 服务器 ↔ 对外面 | 6+（两种结果：响应 / 交出连接） | 未开，现在是 5 个硬编码钩子 |
+| S4 | 请求交接 | 服务器 ↔ 对外面 | 6+（两种结果：内存响应 / sans-IO stream handler） | **接口已定**（ADR-0016；#113 契约 + `/api/v1/version` 穿过 Face）；server-loop 接管见 #114 |
 | S5 | 失败投影 | 领域 ↔ 对外面 | 3（HTTP / CLI / MCP） | 未开，靠字符串匹配 |
 | S6 | 进程与管道 | 监督 ↔ 平台 | 2（unix / windows job） | 未开 |
 | S7 | 配置来源 | 所有模块 ↔ 配置 | 1 生产 + 测试 | 未开，全局 OnceLock |
@@ -337,7 +337,7 @@ flowchart TD
 | 要加的东西 | 改哪里 | 不需要动 |
 |---|---|---|
 | 一个 HTTP 端点 | `face/xxx.rs` + `server/http/routes` 一行 | 引擎、领域、其他面 |
-| 一个流式端点 | 同上，返回「交出连接」 | 引擎（今天要改两个引擎） |
+| 一个流式端点 | 同上，返回 sans-IO stream handler（连接仍归 server） | 引擎（今天要改两个引擎） |
 | 一种新协议（gRPC / MQTT / WS 控制面） | 新建 `server/xxx/` + `face/xxx_*.rs` | supervision、manage、编排、集群 |
 | 一种汇合策略 | `orchestrate/model` + `check` | 执行器、契约、监督 |
 | 一种触发器 | `orchestrate/ops` + `server` 一个入口 | 流模型、复合 |
@@ -383,7 +383,7 @@ flowchart LR
     S5 --> S6["6 目录纯搬家"]
     S6 --> DONE["目标树"]
 
-    NOW["当前：0–2 部分完成<br/>S1 已回调化"]:::current
+    NOW["当前：0–2 部分完成<br/>S1 已回调化<br/>S4 契约已定（#113）"]:::current
     NOW -.->|下一步| S3
 
     classDef current fill:#ffe08a,stroke:#b8860b,stroke-width:3px,color:#000
@@ -392,7 +392,7 @@ flowchart LR
 ## 13. 不做什么
 
 - **不切多个 crate**：36k 行、单二进制、交叉编译目标多；目录 + lint 已经给到九成收益。
-- **不做通用 HTTP 框架**：`server/http` 只认两种结果（内存响应、交出连接）、三个动作（接连接、派发、交出）。
+- **不做通用 HTTP 框架**：`server/http` 只认两种结果（内存响应、sans-IO stream handler）、三个动作（接连接、派发、交出 handler）。
 - **不给每个模块硬套三层**：`wake`(48 行)、`rpc`(88)、`paths`(252) 就是单文件。
 - **不引入事件总线或 DI 容器**：配置用显式参数；一个实现的 seam 不开。
 - **不动 ADR 已定的语义**：接管、oneshot、重启前清理、未签名安装、token 校验时机。

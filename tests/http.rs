@@ -3318,6 +3318,12 @@ fn password_auth_bearer_cookie_csrf() {
     assert_eq!(denied.status, 401);
     assert_eq!(denied.body["error"]["code"], "unauthorized");
 
+    // `/api/v1/version` moved behind the S4 face; the server still resolves
+    // authentication before the face runs, so it stays behind the same gate.
+    let denied_version = request(&address, "GET", "/api/v1/version", "", b"");
+    assert_eq!(denied_version.status, 401);
+    assert_eq!(denied_version.body["error"]["code"], "unauthorized");
+
     let bearer = format!("Bearer {}", password);
     let allowed = request_with(
         &address,
@@ -3328,6 +3334,16 @@ fn password_auth_bearer_cookie_csrf() {
         &[("Authorization", bearer.as_str())],
     );
     assert_eq!(allowed.status, 200, "{}", allowed.body);
+    let allowed_version = request_with(
+        &address,
+        "GET",
+        "/api/v1/version",
+        "",
+        b"",
+        &[("Authorization", bearer.as_str())],
+    );
+    assert_eq!(allowed_version.status, 200, "{}", allowed_version.body);
+    assert_eq!(allowed_version.body["protocol"], 1);
 
     let login = request_with(
         &address,
@@ -4291,6 +4307,37 @@ fn http_keep_alive_serves_two_requests_on_one_connection() {
 
     let second = format!(
         "GET /api/v1/services HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        address
+    );
+    stream.write_all(second.as_bytes()).expect("second request");
+    let second = read_one_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert_eq!(raw_header_values(&second, "connection"), vec!["close"]);
+}
+
+#[test]
+fn http_keep_alive_serves_version_through_the_face() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let mut stream = TcpStream::connect(&address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+
+    let first = format!(
+        "GET /api/v1/version HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\n\r\n",
+        address
+    );
+    stream.write_all(first.as_bytes()).expect("first request");
+    let first = read_one_response(&mut stream);
+    assert_eq!(first.status, 200);
+    assert_eq!(raw_header_values(&first, "connection"), vec!["keep-alive"]);
+    let body: Value = serde_json::from_slice(&first.body).expect("json body");
+    assert_eq!(body["protocol"], 1);
+
+    let second = format!(
+        "GET /api/v1/version HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
         address
     );
     stream.write_all(second.as_bytes()).expect("second request");

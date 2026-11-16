@@ -10,9 +10,7 @@
 use crate::channel_client_reactor::{ClientReactor, Event as ClientEvent};
 use std::fs;
 use std::io::{Read, Write};
-#[cfg(unix)]
-use std::net::IpAddr;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::atomic::AtomicUsize;
@@ -661,6 +659,16 @@ fn reactor_loop(
                             match advance_request(connection) {
                                 Ok(None) => break,
                                 Ok(Some(request)) => {
+                                    let keep_alive = wants_keep_alive(&request);
+                                    if let Some(response) =
+                                        serve_face(&request, connection.peer, &lan, keep_alive)
+                                    {
+                                        connection.out = response;
+                                        connection.out_at = 0;
+                                        connection.keep_alive = keep_alive;
+                                        connection.state = ConnState::Writing;
+                                        break;
+                                    }
                                     let path = request
                                         .path
                                         .split_once('?')
@@ -762,7 +770,6 @@ fn reactor_loop(
                                         }
                                         break;
                                     }
-                                    let keep_alive = wants_keep_alive(&request);
                                     queue.push(Work::Http(HttpJob {
                                         connection: id,
                                         request,
@@ -2259,13 +2266,14 @@ fn listener_loop(listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config: Pa
     };
     loop {
         match active.accept() {
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
+                let ip = peer.ip();
                 let lan = lan.clone();
                 let config = config.clone();
                 let _ = thread::Builder::new()
                     .name("svcd-http-conn".into())
                     .stack_size(threads::transfer_stack())
-                    .spawn(move || handle(stream, config, lan));
+                    .spawn(move || handle(stream, ip, config, lan));
             }
             Err(error) => {
                 log::svcd(&format!("svcd: HTTP accept failed: {}", error));
@@ -2276,7 +2284,7 @@ fn listener_loop(listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config: Pa
 }
 
 #[cfg(not(unix))]
-fn handle(mut stream: TcpStream, config: PathBuf, lan: Arc<Mutex<Lan>>) {
+fn handle(mut stream: TcpStream, peer: IpAddr, config: PathBuf, lan: Arc<Mutex<Lan>>) {
     // Windows accepted sockets inherit the listener's non-blocking mode
     // (Unix ones do not). Requests are read with blocking reads, so flip the
     // socket back before installing the read timeout. Otherwise a body that has
@@ -2343,6 +2351,16 @@ fn handle(mut stream: TcpStream, config: PathBuf, lan: Arc<Mutex<Lan>>) {
             }
         };
         first = false;
+        let keep_alive = wants_keep_alive(&request);
+        if let Some(response) = serve_face(&request, peer, &lan, keep_alive) {
+            if stream.write_all(&response).is_err() {
+                return;
+            }
+            if !keep_alive {
+                return;
+            }
+            continue;
+        }
         let path = request
             .path
             .split_once('?')
@@ -2375,7 +2393,6 @@ fn handle(mut stream: TcpStream, config: PathBuf, lan: Arc<Mutex<Lan>>) {
         if handle_stream(&mut stream, &config, &request, &lan) {
             return;
         }
-        let keep_alive = wants_keep_alive(&request);
         let mut response = respond(&config, &request, &lan);
         if keep_alive {
             response = keep_alive_response(response);
@@ -2467,6 +2484,68 @@ fn keep_alive_response(mut response: Vec<u8>) -> Vec<u8> {
         response.splice(position..position + CLOSE.len(), KEEP.iter().copied());
     }
     response
+}
+
+/// Ask the S4 face whether it owns this request, and serve it from the server
+/// side when it does. `None` means the request stays on the legacy path.
+///
+/// The server resolves authentication once and owns the connection policy
+/// (keep-alive) after the face answers. The face never sees the socket.
+fn serve_face(
+    request: &HttpRequest,
+    peer: IpAddr,
+    lan: &Arc<Mutex<Lan>>,
+    keep_alive: bool,
+) -> Option<Vec<u8>> {
+    let mut response = face_request(request, peer, lan)?;
+    if keep_alive {
+        response = keep_alive_response(response);
+    }
+    Some(response)
+}
+
+/// Run the face half of a request: route, resolve authentication, apply the
+/// body policy, and dispatch. The legacy engines call this where they used to
+/// hand the request to the old router.
+fn face_request(request: &HttpRequest, peer: IpAddr, lan: &Arc<Mutex<Lan>>) -> Option<Vec<u8>> {
+    use crate::server::http::{body_for, dispatch_inline, BodyError, Exchange, Face, Request};
+
+    let face = crate::face::api::ApiFace;
+    let route = face.route(&request.method, &request.path)?;
+    // Authentication still runs per request here. Moving the principal to
+    // connection setup belongs to the server-loop slice (#114).
+    let principal = match lan.lock() {
+        Ok(mut state) => match state.authenticate(&request.headers) {
+            Ok(principal) => principal,
+            Err(()) => return Some(error(401, "unauthorized", "authentication required")),
+        },
+        Err(_) => return Some(error(500, "internal", "LAN state unavailable")),
+    };
+    let body = match body_for(route.body, &request.body) {
+        Ok(body) => body,
+        Err(BodyError::TooLarge) => {
+            return Some(error(413, "payload_too_large", "request body is too large"))
+        }
+    };
+    let value = Request {
+        method: request.method.clone(),
+        path: request.path.clone(),
+        headers: request.headers.clone(),
+        peer,
+        principal,
+        body,
+    };
+    Some(match dispatch_inline(&face, &route, value) {
+        Ok(Exchange::Response(response)) => response.into_bytes(),
+        // Streamed routes are not wired into the legacy engines in this slice;
+        // #115 hands the stream handler to the server loop.
+        Ok(Exchange::Stream(_)) => error(
+            501,
+            "not_implemented",
+            "streamed face routes are not wired into this engine yet",
+        ),
+        Err(cause) => error(500, "internal", &cause.message()),
+    })
 }
 
 /// Serve the two streaming UI endpoints before the buffered router. Returns
@@ -3062,11 +3141,6 @@ fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<
     }
 
     match (request.method.as_str(), parts.as_slice()) {
-        ("GET", ["api", "v1", "version"]) => ok(json!({
-            "version": env!("CARGO_PKG_VERSION"),
-            "protocol": 1,
-            "platform": package::target(),
-        })),
         ("GET", ["api", "v1", "compat"]) => {
             ok(serde_json::to_value(crate::compat::detect()).unwrap_or(Value::Null))
         }
