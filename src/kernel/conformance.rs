@@ -134,7 +134,7 @@ fn call_violations(
     // 1. 未知能力必须在进实现之前被拒。
     {
         let mut instance = make();
-        match instance.call(Invocation::new(
+        match instance.call_blocking(Invocation::new(
             "__no_such_capability",
             json!({}),
             Duration::from_secs(1),
@@ -152,7 +152,7 @@ fn call_violations(
             continue;
         }
         let mut instance = make_failing(class);
-        match instance.call(Invocation::new(
+        match instance.call_blocking(Invocation::new(
             first.clone(),
             json!({}),
             Duration::from_secs(1),
@@ -176,7 +176,7 @@ fn call_violations(
             ));
         }
         let mut instance = make();
-        match instance.call(Invocation::new(
+        match instance.call_blocking(Invocation::new(
             first.clone(),
             exact,
             Duration::from_secs(1),
@@ -189,7 +189,7 @@ fn call_violations(
 
         let over = Value::String("x".repeat(max.saturating_sub(1)));
         let mut instance = make();
-        match instance.call(Invocation::new(first.clone(), over, Duration::from_secs(1))) {
+        match instance.call_blocking(Invocation::new(first.clone(), over, Duration::from_secs(1))) {
             Err(CallError::Rejected(Rejection::BadArguments { .. })) => {}
             other => violations.push(format!(
                 "arguments one byte over max_inline must be rejected: {other:?}"
@@ -202,7 +202,7 @@ fn call_violations(
         let mut instance = make();
         let invocation = Invocation::new(first.clone(), json!({}), Duration::from_secs(1));
         invocation.cancel.cancel();
-        match instance.call(invocation) {
+        match instance.call_blocking(invocation) {
             Err(CallError::Failed(failure)) if failure.class == Class::Cancelled => {}
             Err(CallError::Rejected(rejection)) => violations.push(format!(
                 "a cancelled call was rejected instead of failed: {:?}",

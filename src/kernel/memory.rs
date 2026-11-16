@@ -14,8 +14,10 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use super::contract::{Contract, Control, ImplRef, Instance, Invocation, Launcher, Reply, Settled, Wire};
-use super::failure::{Class, Failure, Retry};
+use super::contract::{
+    Contract, Control, ImplRef, Instance, Invocation, Launcher, Reply, ReplySink, Settled, Wire,
+};
+use super::failure::{Class, Failure, Rejection, Retry};
 
 pub struct MemoryWire {
     replies: HashMap<String, Result<Reply, Failure>>,
@@ -91,22 +93,24 @@ impl Default for MemoryWire {
 }
 
 impl Wire for MemoryWire {
-    fn call(&mut self, invocation: Invocation) -> Result<Reply, Failure> {
+    fn call(&mut self, invocation: Invocation, done: ReplySink) -> Result<(), Rejection> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        if invocation.cancel.is_cancelled() && self.honor_cancel {
-            return Err(Failure::new(Class::Cancelled, Retry::Never, "cancelled"));
-        }
-        if !self.running {
-            return Err(Failure::new(
+        let outcome = if invocation.cancel.is_cancelled() && self.honor_cancel {
+            Err(Failure::new(Class::Cancelled, Retry::Never, "cancelled"))
+        } else if !self.running {
+            Err(Failure::new(
                 Class::NotRunning,
                 Retry::After(Duration::from_secs(1)),
                 "not running",
-            ));
-        }
-        match self.replies.get(invocation.capability.as_str()) {
-            Some(reply) => reply.clone(),
-            None => Ok(Reply::Value(json!({}))),
-        }
+            ))
+        } else {
+            match self.replies.get(invocation.capability.as_str()) {
+                Some(reply) => reply.clone(),
+                None => Ok(Reply::Value(json!({}))),
+            }
+        };
+        done(outcome);
+        Ok(())
     }
 
     fn lifecycle(&mut self, control: Control) -> Result<Settled, Failure> {

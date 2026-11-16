@@ -1,4 +1,4 @@
-//! 服务契约：一个值（[`Contract`]）+ 两个入口（[`Instance::call`] 与
+//! 服务契约：一个值（[`Contract`]）+ 两个入口（[`Instance::call`] 完成回调与
 //! [`Instance::lifecycle`]）。
 //!
 //! 契约里没有进程、pid、端口、重启次数——那是实现（adapter）的事。四种运行方式
@@ -338,9 +338,14 @@ impl Invocation {
     }
 }
 
+/// 一次调用的完成回调。实现可以在 `call` 返回后调用它，也可以同步调用。
+pub type ReplySink = Box<dyn FnOnce(Result<Reply, Failure>) + Send + 'static>;
+
 /// 运行实现唯一需要实现的两个入口。
 pub trait Wire {
-    fn call(&mut self, invocation: Invocation) -> Result<Reply, Failure>;
+    /// 开始一次调用。返回 `Err(Rejection)` 表示调用没有被尝试；失败通过
+    /// `done` 交付，因为实现可能在另一个线程/事件循环上完成。
+    fn call(&mut self, invocation: Invocation, done: ReplySink) -> Result<(), Rejection>;
     fn lifecycle(&mut self, control: Control) -> Result<Settled, Failure>;
 }
 
@@ -362,47 +367,83 @@ impl Instance {
     }
 
     /// 调用。三种情况**不会**到达实现：能力不在能力面、参数超内联上限、
-    /// timeout 为零——它们返回 [`CallError::Rejected`]，不带失败类别。
-    pub fn call(&mut self, mut invocation: Invocation) -> Result<Reply, CallError> {
+    /// timeout 为零——它们返回 [`Rejection`]，不带失败类别。结果（成功或失败）
+    /// 一律通过 `done` 交付，因为实现可能是异步的。
+    pub fn call(&mut self, mut invocation: Invocation, done: ReplySink) -> Result<(), Rejection> {
         if self.contract.capability(&invocation.capability).is_none() {
-            return Err(CallError::Rejected(Rejection::UnknownCapability {
+            return Err(Rejection::UnknownCapability {
                 capability: invocation.capability.as_str().to_string(),
-            }));
+            });
         }
         if invocation.timeout.is_zero() {
-            return Err(CallError::Rejected(Rejection::BadArguments {
+            return Err(Rejection::BadArguments {
                 detail: "timeout must be greater than zero".into(),
-            }));
+            });
         }
         let inline = inline_len(&invocation.arguments);
         if inline > self.contract.limits.max_inline {
-            return Err(CallError::Rejected(Rejection::BadArguments {
+            return Err(Rejection::BadArguments {
                 detail: format!(
                     "arguments are {} bytes inline, limit is {}",
                     inline, self.contract.limits.max_inline
                 ),
-            }));
+            });
         }
         // 超出上限按上限计：防呆，不是调用方错误。
         if invocation.timeout > self.contract.limits.max_timeout {
             invocation.timeout = self.contract.limits.max_timeout;
         }
-        match self.wire.call(invocation) {
-            Ok(reply) => Ok(reply),
-            Err(failure) if self.contract.failures.contains(&failure.class) => {
-                Err(CallError::Failed(failure))
+        let failures = self.contract.failures.clone();
+        let done: ReplySink = Box::new(move |outcome| {
+            let outcome = match outcome {
+                Ok(reply) => Ok(reply),
+                Err(failure) if failures.contains(&failure.class) => Err(failure),
+                // 越界类别归一：实现报了契约没声明的类别，说明它在撒谎或契约写漏了。
+                Err(failure) => Err(Failure::new(
+                    Class::ImplementationError,
+                    Retry::Never,
+                    format!(
+                        "undeclared failure class {}: {}",
+                        failure.class.as_str(),
+                        failure.detail
+                    ),
+                )),
+            };
+            done(outcome);
+        });
+        self.wire.call(invocation, done)
+    }
+
+    /// Test-only blocking adapter over [`Instance::call`]. Production paths must
+    /// use the completion callback so the daemon event loop never blocks.
+    #[cfg(test)]
+    pub fn call_blocking(&mut self, invocation: Invocation) -> Result<Reply, CallError> {
+        let timeout = invocation.timeout;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.call(
+            invocation,
+            Box::new(move |outcome| {
+                let _ = tx.send(outcome);
+            }),
+        )
+        .map_err(CallError::Rejected)?;
+        match rx.recv_timeout(timeout.saturating_add(Duration::from_secs(1))) {
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(failure)) => Err(CallError::Failed(failure)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(CallError::Failed(Failure::new(
+                    Class::Timeout,
+                    Retry::After(Duration::from_secs(1)),
+                    "test call timed out",
+                )))
             }
-            // 越界类别归一：实现报了契约没声明的类别，说明它在撒谎或契约写漏了。
-            // 对调用方统一成 ImplementationError，避免"未声明的类别"泄漏到投影层。
-            Err(failure) => Err(CallError::Failed(Failure::new(
-                Class::ImplementationError,
-                Retry::Never,
-                format!(
-                    "undeclared failure class {}: {}",
-                    failure.class.as_str(),
-                    failure.detail
-                ),
-            ))),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(CallError::Failed(Failure::new(
+                    Class::NotRunning,
+                    Retry::After(Duration::from_secs(1)),
+                    "test call sink disconnected",
+                )))
+            }
         }
     }
 
@@ -498,10 +539,15 @@ mod tests {
     }
 
     impl Wire for RecordingWire {
-        fn call(&mut self, invocation: Invocation) -> Result<Reply, Failure> {
+        fn call(
+            &mut self,
+            invocation: Invocation,
+            done: ReplySink,
+        ) -> Result<(), Rejection> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_timeout.lock().expect("timeout slot") = Some(invocation.timeout);
-            Ok(Reply::Value(self.reply.clone()))
+            done(Ok(Reply::Value(self.reply.clone())));
+            Ok(())
         }
 
         fn lifecycle(&mut self, _control: Control) -> Result<Settled, Failure> {
@@ -569,7 +615,7 @@ mod tests {
     fn an_unknown_capability_is_rejected_without_touching_the_implementation() {
         let (mut instance, calls, _) = instance_with(Limits::default());
         let error = instance
-            .call(Invocation::new("nope", json!({}), Duration::from_secs(1)))
+            .call_blocking(Invocation::new("nope", json!({}), Duration::from_secs(1)))
             .expect_err("must be rejected");
         assert!(
             matches!(
@@ -587,7 +633,7 @@ mod tests {
         let limits = Limits { max_inline: 16, ..Limits::default() };
         let (mut instance, calls, _) = instance_with(limits);
         let error = instance
-            .call(Invocation::new(
+            .call_blocking(Invocation::new(
                 "status",
                 json!({"pad": "x".repeat(64)}),
                 Duration::from_secs(1),
@@ -601,7 +647,7 @@ mod tests {
     fn a_zero_timeout_is_rejected() {
         let (mut instance, calls, _) = instance_with(Limits::default());
         let error = instance
-            .call(Invocation::new("status", json!({}), Duration::ZERO))
+            .call_blocking(Invocation::new("status", json!({}), Duration::ZERO))
             .expect_err("zero timeout");
         assert!(matches!(error, CallError::Rejected(Rejection::BadArguments { .. })), "{error:?}");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -612,7 +658,7 @@ mod tests {
         let limits = Limits { default_timeout: Duration::from_secs(5), max_timeout: Duration::from_secs(5), ..Limits::default() };
         let (mut instance, calls, last_timeout) = instance_with(limits);
         instance
-            .call(Invocation::new("status", json!({}), Duration::from_secs(60)))
+            .call_blocking(Invocation::new("status", json!({}), Duration::from_secs(60)))
             .expect("clamped, not rejected");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let observed = last_timeout.lock().expect("timeout slot").expect("observed");
@@ -627,7 +673,7 @@ mod tests {
             Failure::new(Class::Busy, Retry::Never, "busy"),
         );
         let mut instance = Instance::new(contract_with(Limits::default()), Box::new(wire)).expect("valid");
-        match instance.call(Invocation::new("status", json!({}), Duration::from_secs(1))) {
+        match instance.call_blocking(Invocation::new("status", json!({}), Duration::from_secs(1))) {
             Err(CallError::Failed(failure)) => assert_eq!(
                 failure.class,
                 Class::ImplementationError,

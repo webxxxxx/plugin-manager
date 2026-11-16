@@ -20,7 +20,7 @@ use crate::compat;
 use crate::definition;
 use crate::kernel::contract::{
     Capability as KernelCapability, CapabilityName, Contract, Effect, Instance, Invocation,
-    Launchers, Limits as KernelLimits, Obligations, ProgressToken, Reply, ServiceId,
+    Launchers, Limits as KernelLimits, Obligations, ProgressToken, Reply, ReplySink, ServiceId,
 };
 use crate::kernel::failure::{Class, Failure, Rejection, Retry};
 use crate::lan::LanStatus;
@@ -362,8 +362,6 @@ struct Daemon {
     /// The tag -> runtime factory assembly point. A launch is a cheap view;
     /// the Slot (or the builtin service) keeps owning the resource.
     launchers: Arc<Launchers>,
-    /// Blocking calls run here; the event loop stays free to pump slots.
-    workers: crate::worker_pool::WorkerPool,
     shutdown: bool,
     started: Instant,
     epoch_at_start: SystemTime,
@@ -384,6 +382,7 @@ struct Daemon {
 }
 
 impl Daemon {
+    #[cfg(test)]
     fn new(
         registry: Registry,
         token: String,
@@ -445,10 +444,6 @@ impl Daemon {
             wake,
             slots,
             launchers: Arc::new(launchers),
-            workers: crate::worker_pool::WorkerPool::new(
-                if cfg!(test) { 2 } else { 8 },
-                256,
-            ),
             shutdown: false,
             started: Instant::now(),
             epoch_at_start: SystemTime::now(),
@@ -1076,35 +1071,32 @@ impl Daemon {
         if let Some(spec) = builtin {
             let launchers = self.launchers.clone();
             let contract = builtin_contract(service);
-            let worker_reply = reply.clone();
+            let mut instance = match launchers.launch(contract, &spec) {
+                Ok(instance) => instance,
+                Err(error) => {
+                    reply.send(project_builtin_outcome(id, Err(error.into_failure())));
+                    return;
+                }
+            };
             let external_id = id.clone();
-            let job = move || {
-                let mut instance = match launchers.launch(contract, &spec) {
-                    Ok(instance) => instance,
-                    Err(error) => {
-                        let _ = worker_reply.send(project_builtin_outcome(
-                            external_id,
-                            Err(error.into_failure()),
-                        ));
-                        return;
-                    }
-                };
-                let outcome = match instance.call(invocation) {
+            let done_reply = reply.clone();
+            let done: ReplySink = Box::new(move |outcome| {
+                let outcome = match outcome {
                     Ok(Reply::Value(value)) => Ok(value),
                     Ok(Reply::Stream(_)) => Err(Failure::new(
                         Class::ImplementationError,
                         Retry::Never,
                         "stream replies are not supported by the builtin adapter",
                     )),
-                    Err(error) => Err(kernel_call_failure(error)),
+                    Err(failure) => Err(failure),
                 };
-                let _ = worker_reply.send(project_builtin_outcome(external_id, outcome));
-            };
-            if self.workers.execute(Box::new(job)).is_err() {
-                send(
-                    &reply,
-                    rpc::err(id, -32000, "busy: call worker queue is full"),
-                );
+                let _ = done_reply.send(project_builtin_outcome(external_id, outcome));
+            });
+            if let Err(rejection) = instance.call(invocation, done) {
+                reply.send(project_builtin_outcome(
+                    id,
+                    Err(rejection_failure(rejection)),
+                ));
             }
             return;
         }
@@ -1118,34 +1110,33 @@ impl Daemon {
         };
         let handle = slot.handle();
         let contract = slot_contract(service);
-        let client = reply.clone();
-        let worker_reply = reply.clone();
+        let mut instance = match Instance::new(
+            contract,
+            Box::new(SlotWire::new(handle, Some(reply.clone()))),
+        ) {
+            Ok(instance) => instance,
+            Err(error) => {
+                let failure = Failure::new(Class::ImplementationError, Retry::Never, error);
+                reply.send(project_slot_outcome(id, Err(failure)));
+                return;
+            }
+        };
         let external_id = id.clone();
-        let job = move || {
-            let mut instance = match Instance::new(contract, Box::new(SlotWire::new(handle, Some(client)))) {
-                Ok(instance) => instance,
-                Err(error) => {
-                    let failure = Failure::new(Class::ImplementationError, Retry::Never, error);
-                    let _ = worker_reply.send(project_slot_outcome(external_id, Err(failure)));
-                    return;
-                }
-            };
-            let outcome = match instance.call(invocation) {
+        let done_reply = reply.clone();
+        let done: ReplySink = Box::new(move |outcome| {
+            let outcome = match outcome {
                 Ok(Reply::Value(value)) => Ok(value),
                 Ok(Reply::Stream(_)) => Err(Failure::new(
                     Class::ImplementationError,
                     Retry::Never,
                     "stream replies are not wired through SlotWire",
                 )),
-                Err(error) => Err(kernel_call_failure(error)),
+                Err(failure) => Err(failure),
             };
-            let _ = worker_reply.send(project_slot_outcome(external_id, outcome));
-        };
-        if self.workers.execute(Box::new(job)).is_err() {
-            send(
-                &reply,
-                rpc::err(id, -32000, "busy: call worker queue is full"),
-            );
+            let _ = done_reply.send(project_slot_outcome(external_id, outcome));
+        });
+        if let Err(rejection) = instance.call(invocation, done) {
+            reply.send(project_slot_outcome(id, Err(rejection_failure(rejection))));
         }
     }
 
@@ -1998,19 +1989,16 @@ fn project_slot_outcome(external_id: Option<Value>, outcome: Result<Value, Failu
     rpc::to_line(&project_slot_response(external_id, outcome))
 }
 
-fn kernel_call_failure(error: crate::kernel::failure::CallError) -> Failure {
-    match error {
-        crate::kernel::failure::CallError::Failed(failure) => failure,
-        crate::kernel::failure::CallError::Rejected(Rejection::BadArguments { detail }) => {
+fn rejection_failure(rejection: Rejection) -> Failure {
+    match rejection {
+        Rejection::BadArguments { detail } => {
             Failure::new(Class::FrameTooLarge, Retry::Never, detail)
         }
-        crate::kernel::failure::CallError::Rejected(Rejection::UnknownCapability { capability }) => {
-            Failure::new(
-                Class::ImplementationError,
-                Retry::Never,
-                format!("unknown capability {capability}"),
-            )
-        }
+        Rejection::UnknownCapability { capability } => Failure::new(
+            Class::ImplementationError,
+            Retry::Never,
+            format!("unknown capability {capability}"),
+        ),
     }
 }
 
@@ -2351,6 +2339,25 @@ mod tests {
             registry.insert(service).expect("insert");
         }
         registry
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_daemon_does_not_spawn_call_worker_threads() {
+        let (_sender, receiver) = mpsc::channel();
+        let _daemon = Daemon::new(Registry::with_builtin(), "token".into(), receiver, None);
+        let names: Vec<String> = std::fs::read_dir("/proc/self/task")
+            .expect("task dir")
+            .filter_map(|entry| {
+                let path = entry.ok()?.path().join("comm");
+                std::fs::read_to_string(path).ok()
+            })
+            .map(|name| name.trim().to_string())
+            .collect();
+        assert!(
+            !names.iter().any(|name| name.starts_with("svcd-call")),
+            "daemon must not spawn blocking call workers: {names:?}"
+        );
     }
 
     #[test]

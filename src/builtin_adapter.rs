@@ -10,9 +10,9 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::kernel::contract::{
-    Control, Contract, ImplRef, Invocation, Launcher, Reply, Settled, Wire,
+    Contract, Control, ImplRef, Invocation, Launcher, Reply, ReplySink, Settled, Wire,
 };
-use crate::kernel::failure::Failure;
+use crate::kernel::failure::{Failure, Rejection};
 
 /// 内置 adapter 的装配入口：\`tag=builtin\`。
 pub struct BuiltinLauncher;
@@ -62,35 +62,45 @@ impl BuiltinWire {
 }
 
 impl Wire for BuiltinWire {
-    fn call(&mut self, invocation: Invocation) -> Result<Reply, Failure> {
+    fn call(&mut self, invocation: Invocation, done: ReplySink) -> Result<(), Rejection> {
         if let Some(class) = self.forced_failure {
-            return Err(Failure::new(class, class.default_retry(), "forced failure"));
+            done(Err(Failure::new(
+                class,
+                class.default_retry(),
+                "forced failure",
+            )));
+            return Ok(());
         }
         if self.contract.capability(&invocation.capability).is_none() {
-            return Err(Failure::new(
+            done(Err(Failure::new(
                 crate::kernel::failure::Class::ImplementationError,
                 crate::kernel::failure::Retry::Never,
                 format!(
                     "builtin has no capability {}",
                     invocation.capability.as_str()
                 ),
-            ));
+            )));
+            return Ok(());
         }
         if invocation.cancel.is_cancelled() {
-            return Err(Failure::new(
+            done(Err(Failure::new(
                 crate::kernel::failure::Class::Cancelled,
                 crate::kernel::failure::Retry::Never,
                 "call was cancelled before dispatch",
-            ));
+            )));
+            return Ok(());
         }
         if !self.running.load(Ordering::SeqCst) {
-            return Err(Failure::new(
+            done(Err(Failure::new(
                 crate::kernel::failure::Class::NotRunning,
                 crate::kernel::failure::Retry::After(std::time::Duration::from_secs(1)),
                 "builtin service is stopped",
-            ));
+            )));
+            return Ok(());
         }
-        Ok(Reply::Value(self.value(invocation.capability.as_str())?))
+        let value = self.value(invocation.capability.as_str());
+        done(value.map(Reply::Value));
+        Ok(())
     }
 
     fn lifecycle(&mut self, control: Control) -> Result<Settled, Failure> {
@@ -180,7 +190,7 @@ mod tests {
             .expect("valid contract");
 
         match instance
-            .call(Invocation::new(
+            .call_blocking(Invocation::new(
                 "version",
                 json!({}),
                 std::time::Duration::from_secs(1),
@@ -191,7 +201,7 @@ mod tests {
             other => panic!("expected a value reply, got {other:?}"),
         }
         match instance
-            .call(Invocation::new(
+            .call_blocking(Invocation::new(
                 "health",
                 json!({}),
                 std::time::Duration::from_secs(1),
@@ -222,7 +232,7 @@ mod tests {
         );
         let mut instance = Instance::new(contract.clone(), Box::new(BuiltinWire::new(contract)))
             .expect("valid contract");
-        match instance.call(Invocation::new(
+        match instance.call_blocking(Invocation::new(
             "missing",
             json!({}),
             std::time::Duration::from_secs(1),
@@ -238,7 +248,7 @@ mod tests {
     fn the_builtin_reports_version_and_stops() {
         let mut instance = normal();
         let version = instance
-            .call(Invocation::new(
+            .call_blocking(Invocation::new(
                 "status",
                 json!({}),
                 std::time::Duration::from_secs(1),

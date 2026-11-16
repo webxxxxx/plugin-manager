@@ -137,7 +137,7 @@ stateDiagram-v2
 
 ### 4.1 接口形状（ADR-0013）
 
-契约是一个**值**（`Contract`）+ **两个入口**（`call`、`lifecycle(Ensure|Quiesce|Probe)`），实现由 `ImplRef{tag}` 交给装配点注册的 adapter——所以新增运行载体只加一个 adapter，不改内核。能力面显式声明并带 `effect` / `idempotent`；失败是 `{class, retry: Now|Never|After(t), detail}`，`detail` 不可被上层解析；死亡与超时按**判定时刻的客观状态**归类。
+契约是一个**值**（`Contract`）+ **两个入口**（`call` 完成回调、`lifecycle(Ensure|Quiesce|Probe)`），实现由 `ImplRef{tag}` 交给装配点注册的 adapter——所以新增运行载体只加一个 adapter，不改内核。能力面显式声明并带 `effect` / `idempotent`；失败是 `{class, retry: Now|Never|After(t), detail}`，`detail` 不可被上层解析；死亡与超时按**判定时刻的客观状态**归类。
 
 完整决定见 [ADR-0013](adr/0013-service-contract-interface.md)；复合服务的 v1 边界（root 定义、0 或 1 个能力、单机执行、加载期校验）见 [ADR-0014](adr/0014-composite-service-v1-boundary.md)。
 
@@ -150,29 +150,26 @@ sequenceDiagram
     autonumber
     participant C as MCP 客户端
     participant D as Daemon
-    participant W as WorkerPool
     participant I as Instance
     participant SW as SlotWire
     participant S as Slot
     participant P as 插件进程
 
     C->>D: tools/call
-    D->>W: submit(job)
-    W->>I: call(Invocation)
+    D->>I: call(Invocation, done)
     I->>SW: Wire::call
     SW->>S: SlotHandle::submit
     S->>P: tools/call 帧
     P-->>S: notifications/progress
     S-->>C: progress（原通道）
     P-->>S: final response
-    S-->>SW: result
-    SW-->>I: Reply / Failure
-    I-->>W: Reply / CallError
-    W-->>D: outcome
+    S->>SW: done(outcome)
+    SW->>I: done（类别归一）
+    I->>D: done
     D-->>C: tools/call result
 ```
 
-worker 阻塞在 `SlotWire`，事件循环继续 `pump` slot，所以慢插件不会阻塞 daemon。progress 走原客户端通道，最终结果走 worker 通道；图中最后一行由 worker 的 reply 写出。
+daemon 只递交调用，不等待；slot 事件循环在完成/超时时调用 `done`，所以慢插件占 pending 表而不是线程。progress 走原客户端通道，最终结果走 `done`。
 
 ## 5. 目录
 
@@ -386,7 +383,7 @@ flowchart LR
     S5 --> S6["6 目录纯搬家"]
     S6 --> DONE["目标树"]
 
-    NOW["当前：0–2 部分完成<br/>#103 后"]:::current
+    NOW["当前：0–2 完成<br/>S1 已回调化"]:::current
     NOW -.->|下一步| S3
 
     classDef current fill:#ffe08a,stroke:#b8860b,stroke-width:3px,color:#000

@@ -9,9 +9,9 @@ use std::thread;
 use serde_json::{json, Value};
 
 use crate::ipc::{self, FrameError, FrameEvent};
-use crate::kernel::contract::{
-    Contract, Control, Invocation, ProgressToken, Reply, Settled, Wire,
-};
+#[cfg(test)]
+use crate::kernel::contract::ProgressToken;
+use crate::kernel::contract::{Contract, Control, Invocation, Reply, ReplySink, Settled, Wire};
 use crate::kernel::failure::{Class, Failure, Rejection, Retry};
 use crate::log::{self, LogSink};
 use crate::paths;
@@ -89,8 +89,8 @@ pub(crate) struct Slot {
     health: Arc<AtomicU8>,
 }
 
-/// A blocking-side handle to one slot. Workers submit an `Invocation` and wait;
-/// the daemon event loop owns the process and completes the request.
+/// A handle to one slot. Submitting never waits: the slot event loop owns the
+/// process and calls `done` when the call finishes.
 #[derive(Clone)]
 pub(crate) struct SlotHandle {
     requests: mpsc::Sender<SlotRequest>,
@@ -101,42 +101,47 @@ pub(crate) struct SlotHandle {
 struct SlotRequest {
     invocation: Invocation,
     /// Progress still goes straight to the caller's channel; the final response
-    /// goes through `reply`.
+    /// goes through `done`.
     client: Option<crate::channel::Reply>,
-    reply: mpsc::Sender<Result<Value, Failure>>,
+    done: ReplySink,
 }
 
 enum CallSink {
+    #[cfg(test)]
     Client(crate::channel::Reply),
-    Worker(mpsc::Sender<Result<Value, Failure>>),
+    Completion(ReplySink),
+    /// Replaced out of a local sink before a successful insert; only exists so a
+    /// validation error can return the `FnOnce` sink to its caller.
+    Empty,
 }
 
 impl SlotHandle {
-    /// Submit a blocking call. The event loop drains the request on its next
-    /// pump and sends the result through the returned receiver.
+    /// Submit a call. The event loop drains the request on its next pump and
+    /// invokes `done`; the caller keeps running.
     pub(crate) fn submit(
         &self,
         invocation: Invocation,
         client: Option<crate::channel::Reply>,
-    ) -> Result<Receiver<Result<Value, Failure>>, Failure> {
-        let (reply, receiver) = mpsc::channel();
-        self.requests
-            .send(SlotRequest {
-                invocation,
-                client,
-                reply,
-            })
-            .map_err(|_| {
-                Failure::new(
-                    Class::NotRunning,
-                    Retry::After(std::time::Duration::from_secs(1)),
-                    "service runtime is gone",
-                )
-            })?;
+        done: ReplySink,
+    ) -> Result<(), (Failure, ReplySink)> {
+        let request = SlotRequest {
+            invocation,
+            client,
+            done,
+        };
+        if let Err(error) = self.requests.send(request) {
+            let request = error.0;
+            let failure = Failure::new(
+                Class::NotRunning,
+                Retry::After(std::time::Duration::from_secs(1)),
+                "service runtime is gone",
+            );
+            return Err((failure, request.done));
+        }
         if let Some(wake) = &self.wake {
             wake.notify();
         }
-        Ok(receiver)
+        Ok(())
     }
 
     pub(crate) fn probe(&self) -> Settled {
@@ -149,8 +154,8 @@ impl SlotHandle {
     }
 }
 
-/// The `Wire` used by blocking workers. It never touches the process; it submits
-/// to the event loop and waits, so the daemon itself stays non-blocking.
+/// The `Wire` used by the daemon. It never touches the process; it submits to
+/// the slot event loop and returns, so the daemon itself stays non-blocking.
 pub(crate) struct SlotWire {
     handle: SlotHandle,
     client: Option<crate::channel::Reply>,
@@ -165,8 +170,8 @@ impl SlotWire {
 /// Test-only handle: answers submitted calls with `respond` on its own thread.
 /// The thread ends when the handle is dropped, so the conformance suite can build
 /// a fresh handle per assertion. It exercises the real `SlotWire` plumbing
-/// (submit / reply channel / timeout) without spawning a supervised process; the
-/// event loop's own behaviour stays covered by the slot tests below.
+/// (submit / done callback) without spawning a supervised process; the event
+/// loop's own behaviour stays covered by the slot tests below.
 #[cfg(test)]
 impl SlotHandle {
     pub(crate) fn scripted(
@@ -176,7 +181,7 @@ impl SlotHandle {
         thread::spawn(move || {
             for request in receiver {
                 let outcome = respond(&request.invocation);
-                let _ = request.reply.send(outcome);
+                (request.done)(outcome.map(Reply::Value));
             }
         });
         SlotHandle {
@@ -189,33 +194,22 @@ impl SlotHandle {
 }
 
 impl Wire for SlotWire {
-    fn call(&mut self, invocation: Invocation) -> Result<Reply, Failure> {
+    fn call(&mut self, invocation: Invocation, done: ReplySink) -> Result<(), Rejection> {
         // 内核对「取消后不得返回 Ok」的承诺必须在这一层兑现：submit 之后就没有
         // 取消通道了（事件循环的 deadline 只覆盖超时），一个已取消的调用一旦进槽
         // 就会被真正执行，还可能以 Ok 回到调用方。
         if invocation.cancel.is_cancelled() {
-            return Err(Failure::new(
+            done(Err(Failure::new(
                 Class::Cancelled,
                 Retry::Never,
                 "call was cancelled before it reached the service",
-            ));
+            )));
+            return Ok(());
         }
-        let timeout = invocation.timeout;
-        let receiver = self.handle.submit(invocation, self.client.clone())?;
-        match receiver.recv_timeout(timeout.saturating_add(std::time::Duration::from_secs(1))) {
-            Ok(Ok(value)) => Ok(Reply::Value(value)),
-            Ok(Err(failure)) => Err(failure),
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(Failure::new(
-                Class::Timeout,
-                Retry::After(std::time::Duration::from_secs(1)),
-                "call timed out in the worker",
-            )),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(Failure::new(
-                Class::NotRunning,
-                Retry::After(std::time::Duration::from_secs(1)),
-                "service runtime stopped before replying",
-            )),
+        if let Err((failure, done)) = self.handle.submit(invocation, self.client.clone(), done) {
+            done(Err(failure));
         }
+        Ok(())
     }
 
     fn lifecycle(&mut self, control: Control) -> Result<Settled, Failure> {
@@ -470,16 +464,15 @@ impl Slot {
 
     fn drain_requests(&mut self, now: u64) {
         while let Ok(request) = self.request_rx.try_recv() {
-            let worker = request.reply.clone();
-            let outcome = self.request_invocation_sink(
+            let mut sink = CallSink::Completion(request.done);
+            if let Err(error) = self.request_invocation_sink(
                 request.invocation,
                 None,
                 now,
                 request.client,
-                CallSink::Worker(request.reply),
-            );
-            if let Err(error) = outcome {
-                let _ = worker.send(Err(call_error_failure(error)));
+                &mut sink,
+            ) {
+                self.finish_sink(None, sink, Err(call_error_failure(error)));
             }
         }
     }
@@ -501,6 +494,7 @@ impl Slot {
 
     /// Send one tools/call frame and remember the caller until the plugin
     /// answers, times out, or the service goes away.
+    #[cfg(test)]
     pub(crate) fn request_capability(
         &mut self,
         capability: &str,
@@ -521,6 +515,7 @@ impl Slot {
 
     /// Contract-aware call entry: validation, inline limit, timeout ceiling and
     /// failure classification all go through `kernel`.
+    #[cfg(test)]
     pub(crate) fn request_invocation(
         &mut self,
         invocation: Invocation,
@@ -529,13 +524,8 @@ impl Slot {
         reply: crate::channel::Reply,
     ) -> Result<(), CallError> {
         let client = Some(reply.clone());
-        self.request_invocation_sink(
-            invocation,
-            external_id,
-            now,
-            client,
-            CallSink::Client(reply),
-        )
+        let mut sink = CallSink::Client(reply);
+        self.request_invocation_sink(invocation, external_id, now, client, &mut sink)
     }
 
     fn request_invocation_sink(
@@ -544,7 +534,7 @@ impl Slot {
         external_id: Option<Value>,
         now: u64,
         client: Option<crate::channel::Reply>,
-        sink: CallSink,
+        sink: &mut CallSink,
     ) -> Result<(), CallError> {
         if let Some(contract) = &self.contract {
             if contract.capability(&invocation.capability).is_none() {
@@ -623,7 +613,7 @@ impl Slot {
                 deadline,
                 progress_token: invocation.progress.as_ref().map(|token| token.as_str().to_string()),
                 client,
-                sink,
+                sink: std::mem::replace(sink, CallSink::Empty),
             },
         );
         Ok(())
@@ -1098,17 +1088,29 @@ impl Slot {
     }
 
     fn finish_pending(&self, pending: PendingCall, outcome: Result<Value, Failure>) {
-        match pending.sink {
+        self.finish_sink(pending.external_id, pending.sink, outcome);
+    }
+
+    fn finish_sink(
+        &self,
+        _external_id: Option<Value>,
+        sink: CallSink,
+        outcome: Result<Value, Failure>,
+    ) {
+        match sink {
+            #[cfg(test)]
             CallSink::Client(reply) => {
-                let line = self.project(pending.external_id, outcome);
+                let line = self.project(_external_id, outcome);
                 reply.send(line);
             }
-            CallSink::Worker(reply) => {
-                let _ = reply.send(outcome);
+            CallSink::Completion(done) => {
+                done(outcome.map(Reply::Value));
             }
+            CallSink::Empty => {}
         }
     }
 
+    #[cfg(test)]
     fn project(&self, external_id: Option<Value>, outcome: Result<Value, Failure>) -> String {
         if let Some(project) = &self.project {
             return project(external_id, outcome);
@@ -1744,7 +1746,6 @@ fn spawn_thread_readers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
     use std::time::{Duration, Instant};
 
     fn exec() -> Exec {
@@ -2189,7 +2190,15 @@ done
         let invocation =
             Invocation::new("echo", json!({}), std::time::Duration::from_secs(1));
         invocation.cancel.cancel();
-        match wire.call(invocation) {
+        let (tx, rx) = mpsc::channel();
+        wire.call(
+            invocation,
+            Box::new(move |outcome| {
+                let _ = tx.send(outcome);
+            }),
+        )
+        .expect("dispatch");
+        match rx.recv_timeout(Duration::from_secs(1)).expect("cancelled result") {
             Err(failure) => assert_eq!(failure.class, Class::Cancelled),
             Ok(reply) => panic!("a cancelled call must not return Ok: {reply:?}"),
         }
@@ -2201,19 +2210,35 @@ done
     }
 
     #[test]
-    fn a_handle_that_never_replies_times_out_in_the_worker() {
+    fn a_call_returns_before_the_slot_answers() {
+        let (release_tx, release_rx) = mpsc::channel();
         let mut wire = SlotWire::new(
-            SlotHandle::scripted(|_| loop {
-                std::thread::park();
+            SlotHandle::scripted(move |_| {
+                let _ = release_rx.recv();
+                Ok(json!({"ok": true}))
             }),
             None,
         );
 
-        let invocation =
-            Invocation::new("echo", json!({}), std::time::Duration::from_millis(1));
-        match wire.call(invocation) {
-            Err(failure) => assert_eq!(failure.class, Class::Timeout),
-            Ok(reply) => panic!("a silent slot must not report success: {reply:?}"),
-        }
+        let (tx, rx) = mpsc::channel();
+        let started = Instant::now();
+        wire.call(
+            Invocation::new("echo", json!({}), Duration::from_secs(1)),
+            Box::new(move |outcome| {
+                let _ = tx.send(outcome);
+            }),
+        )
+        .expect("dispatch");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "submit must return without waiting for the slot"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the result must not be ready before the slot answers"
+        );
+        release_tx.send(()).expect("release the scripted slot");
+        let outcome = rx.recv_timeout(Duration::from_secs(1)).expect("done");
+        assert!(matches!(outcome, Ok(Reply::Value(value)) if value["ok"] == true));
     }
 }
