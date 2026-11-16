@@ -248,6 +248,12 @@ struct RawWsState {
     fragment: Vec<u8>,
     fragment_opcode: Option<u8>,
     heartbeat: Instant,
+    /// Diagnostics: bytes read from the socket and bytes consumed by the
+    /// frame parser. A mismatch between `bytes_read` and
+    /// `bytes_parsed + buffer.len()` means the parser lost its place.
+    bytes_read: u64,
+    bytes_parsed: u64,
+    frames: u64,
 }
 
 #[cfg(unix)]
@@ -386,24 +392,25 @@ fn reactor_loop(
             let ConnState::RawWs(state) = &mut connection.state else {
                 continue;
             };
-            let mut closed = false;
+            let mut closed = None;
             loop {
                 match state.subscription.try_recv() {
                     Ok(crate::rawhub::RawEvent::Frame(payload)) => {
                         push_ws_frame(&mut connection.out, 0x2, &payload);
                     }
                     Ok(crate::rawhub::RawEvent::Closed) => {
-                        closed = true;
+                        closed = Some("raw closed");
                         break;
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        closed = true;
+                        closed = Some("raw channel closed");
                         break;
                     }
                 }
             }
-            if closed {
+            if let Some(reason) = closed {
+                raw_ws_log(state, reason);
                 push_ws_frame(&mut connection.out, 0x8, &close_payload(1000, "raw closed"));
                 connection.keep_alive = false;
                 connection.state = ConnState::Writing;
@@ -532,6 +539,9 @@ fn reactor_loop(
             };
             let revents = descriptors[index].revents;
             if revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+                if let ConnState::RawWs(state) = &connection.state {
+                    raw_ws_log(state, &format!("poll flags {:#x}", revents));
+                }
                 release_mcp_stream(connection, client.as_deref());
                 connections.remove(&id);
                 continue;
@@ -836,7 +846,7 @@ fn reactor_loop(
             }
             if matches!(connection.state, ConnState::RawWs(_)) {
                 let readable = revents & libc::POLLIN != 0;
-                if !drive_raw_ws(connection, id, &queue, readable) {
+                if !drive_raw_ws(connection, id, &queue, readable, &raw_hub) {
                     connections.remove(&id);
                 }
                 continue;
@@ -1401,6 +1411,9 @@ fn start_raw_ws(
         fragment: Vec::new(),
         fragment_opcode: None,
         heartbeat: Instant::now(),
+        bytes_read: 0,
+        bytes_parsed: 0,
+        frames: 0,
     });
 }
 
@@ -1450,6 +1463,16 @@ fn fill_ws(connection: &mut Connection) {
         push_ws_frame(&mut connection.out, 0x9, b"");
         state.heartbeat = Instant::now();
     }
+}
+
+#[cfg(unix)]
+fn raw_ws_log(state: &RawWsState, reason: &str) {
+    log::svcd(&format!(
+        "svcd: raw ws closed: plugin={} stream={} reason={}",
+        state.subscription.plugin(),
+        state.subscription.stream(),
+        reason
+    ));
 }
 
 #[cfg(unix)]
@@ -1516,12 +1539,16 @@ fn drive_ws(connection: &mut Connection, id: u64, queue: &Arc<JobQueue>, readabl
         }
     }
 
+    let frame_limit = {
+        let limits = crate::limits::current();
+        limits.ws_max_message_bytes.max(limits.ws_raw_max_bytes)
+    };
     loop {
         let parsed = {
             let ConnState::Ws(state) = &mut connection.state else {
                 return false;
             };
-            parse_ws_frame(&state.buffer)
+            parse_ws_frame(&state.buffer, frame_limit)
         };
         match parsed {
             Ok(None) => break,
@@ -1537,6 +1564,7 @@ fn drive_ws(connection: &mut Connection, id: u64, queue: &Arc<JobQueue>, readabl
                     }
                 }
                 if !handle_ws_frame(connection, &frame, id, queue) {
+                    // /ws never defers a close: close_and_flush is raw-only.
                     let _ = flush_ws_out(connection);
                     return false;
                 }
@@ -1577,27 +1605,36 @@ fn drive_raw_ws(
     id: u64,
     queue: &Arc<JobQueue>,
     readable: bool,
+    raw_hub: &Arc<crate::rawhub::RawHub>,
 ) -> bool {
     if readable {
         let mut chunk = [0u8; 8 * 1024];
         match connection.stream.read(&mut chunk) {
+            // A normal UI disconnect is not a failure: no log line.
             Ok(0) => return false,
             Ok(read) => {
                 let ConnState::RawWs(state) = &mut connection.state else {
                     return false;
                 };
+                state.bytes_read += read as u64;
                 state.buffer.extend_from_slice(&chunk[..read]);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => return false,
+            Err(error) => {
+                if let ConnState::RawWs(state) = &connection.state {
+                    raw_ws_log(state, &format!("read error: {}", error));
+                }
+                return false;
+            }
         }
     }
+    let frame_limit = crate::limits::current().ws_raw_max_bytes;
     loop {
         let parsed = {
             let ConnState::RawWs(state) = &mut connection.state else {
                 return false;
             };
-            parse_ws_frame(&state.buffer)
+            parse_ws_frame(&state.buffer, frame_limit)
         };
         match parsed {
             Ok(None) => break,
@@ -1605,6 +1642,8 @@ fn drive_raw_ws(
                 let ConnState::RawWs(state) = &mut connection.state else {
                     return false;
                 };
+                state.bytes_parsed += used as u64;
+                state.frames += 1;
                 state.buffer.drain(..used);
                 if state.buffer.is_empty() {
                     let shrink = crate::limits::current().ws_buffer_shrink_bytes;
@@ -1613,27 +1652,62 @@ fn drive_raw_ws(
                     }
                 }
                 if !handle_ws_frame(connection, &frame, id, queue) {
+                    if matches!(connection.state, ConnState::Writing) {
+                        // A close frame is queued; the writer path finishes it.
+                        return true;
+                    }
                     let _ = flush_ws_out(connection);
                     return false;
                 }
             }
             Err(WsParseError::TooLarge { .. }) => {
-                push_ws_frame(
-                    &mut connection.out,
-                    0x8,
-                    &close_payload(1009, "message too large"),
-                );
-                let _ = flush_ws_out(connection);
-                return false;
+                return close_and_flush(connection, 1009, "message too large");
             }
             Err(WsParseError::Protocol(reason)) => {
-                push_ws_frame(&mut connection.out, 0x8, &close_payload(1002, reason));
-                let _ = flush_ws_out(connection);
-                return false;
+                if let ConnState::RawWs(state) = &connection.state {
+                    let head: Vec<String> = state
+                        .buffer
+                        .iter()
+                        .take(24)
+                        .map(|byte| format!("{:02x}", byte))
+                        .collect();
+                    raw_ws_log(
+                        state,
+                        &format!(
+                            "protocol error: {} buffer={} read={} parsed={} frames={} head={}",
+                            reason,
+                            state.buffer.len(),
+                            state.bytes_read,
+                            state.bytes_parsed,
+                            state.frames,
+                            head.join(" ")
+                        ),
+                    );
+                }
+                return close_and_flush(connection, 1002, reason);
             }
         }
     }
-    flush_ws_out(connection)
+    let flushed = flush_ws_out(connection);
+    if !flushed {
+        if let ConnState::RawWs(state) = &connection.state {
+            raw_ws_log(state, "websocket write failed");
+            raw_hub.note_transport_failure(
+                crate::rawhub::RawFailure::WsWriteError,
+                state.subscription.plugin(),
+            );
+        }
+    }
+    flushed
+}
+
+#[cfg(unix)]
+fn close_ws(connection: &mut Connection, code: u16, reason: &str) -> bool {
+    if matches!(connection.state, ConnState::RawWs(_)) {
+        return close_and_flush(connection, code, reason);
+    }
+    push_ws_frame(&mut connection.out, 0x8, &close_payload(code, reason));
+    false
 }
 
 #[cfg(unix)]
@@ -1651,8 +1725,7 @@ fn handle_ws_frame(
                 } else {
                     1000
                 };
-                push_ws_frame(&mut connection.out, 0x8, &close_payload(code, ""));
-                return false;
+                return close_ws(connection, code, "");
             }
             0x9 => {
                 push_ws_frame(&mut connection.out, 0xA, &frame.payload);
@@ -1660,12 +1733,7 @@ fn handle_ws_frame(
             }
             0xA => return true,
             _ => {
-                push_ws_frame(
-                    &mut connection.out,
-                    0x8,
-                    &close_payload(1002, "unknown control frame"),
-                );
-                return false;
+                return close_ws(connection, 1002, "unknown control frame");
             }
         }
     }
@@ -1674,23 +1742,13 @@ fn handle_ws_frame(
         match frame.opcode {
             0x2 => {
                 if frame.payload.len() > limits.ws_raw_max_bytes {
-                    push_ws_frame(
-                        &mut connection.out,
-                        0x8,
-                        &close_payload(1009, "raw message too large"),
-                    );
-                    return false;
+                    return close_and_flush(connection, 1009, "raw message too large");
                 }
                 let ConnState::RawWs(state) = &mut connection.state else {
                     return false;
                 };
                 if state.fragment_opcode.is_some() {
-                    push_ws_frame(
-                        &mut connection.out,
-                        0x8,
-                        &close_payload(1002, "interleaved data frame"),
-                    );
-                    return false;
+                    return close_and_flush(connection, 1002, "interleaved data frame");
                 }
                 if !frame.fin {
                     state.fragment = frame.payload.clone();
@@ -1698,57 +1756,44 @@ fn handle_ws_frame(
                     return true;
                 }
                 if let Err(error) = state.subscription.send(&frame.payload) {
-                    push_ws_frame(&mut connection.out, 0x8, &close_payload(1013, &error));
-                    return false;
+                    raw_ws_log(state, &format!("send rejected: {}", error));
+                    return close_and_flush(connection, 1013, &error);
                 }
                 return true;
             }
             0x1 => {
-                push_ws_frame(
-                    &mut connection.out,
-                    0x8,
-                    &close_payload(1003, "raw transport accepts binary frames only"),
+                if let ConnState::RawWs(state) = &connection.state {
+                    raw_ws_log(state, "text frame on a binary-only transport");
+                }
+                return close_and_flush(
+                    connection,
+                    1003,
+                    "raw transport accepts binary frames only",
                 );
-                return false;
             }
             0x0 => {
                 let ConnState::RawWs(state) = &mut connection.state else {
                     return false;
                 };
                 if state.fragment_opcode != Some(0x2) {
-                    push_ws_frame(
-                        &mut connection.out,
-                        0x8,
-                        &close_payload(1002, "unexpected continuation"),
-                    );
-                    return false;
+                    return close_and_flush(connection, 1002, "unexpected continuation");
                 }
                 state.fragment.extend_from_slice(&frame.payload);
                 if state.fragment.len() > limits.ws_raw_max_bytes {
-                    push_ws_frame(
-                        &mut connection.out,
-                        0x8,
-                        &close_payload(1009, "raw message too large"),
-                    );
-                    return false;
+                    return close_and_flush(connection, 1009, "raw message too large");
                 }
                 if frame.fin {
                     let payload = std::mem::take(&mut state.fragment);
                     state.fragment_opcode = None;
                     if let Err(error) = state.subscription.send(&payload) {
-                        push_ws_frame(&mut connection.out, 0x8, &close_payload(1013, &error));
-                        return false;
+                        raw_ws_log(state, &format!("send rejected: {}", error));
+                        return close_and_flush(connection, 1013, &error);
                     }
                 }
                 return true;
             }
             _ => {
-                push_ws_frame(
-                    &mut connection.out,
-                    0x8,
-                    &close_payload(1002, "unknown raw frame"),
-                );
-                return false;
+                return close_and_flush(connection, 1002, "unknown raw frame");
             }
         }
     }
@@ -1939,6 +1984,24 @@ fn flush_ws_out(connection: &mut Connection) -> bool {
     }
 }
 
+/// Queue a WebSocket close frame and keep the connection alive until the frame
+/// is actually written. Dropping a raw connection with bytes still buffered
+/// makes the client see a bare EOF instead of the close reason.
+///
+/// Returns true when the caller must keep the connection (the close is still
+/// in flight), false when it can be dropped now.
+#[cfg(unix)]
+fn close_and_flush(connection: &mut Connection, code: u16, reason: &str) -> bool {
+    push_ws_frame(&mut connection.out, 0x8, &close_payload(code, reason));
+    connection.keep_alive = false;
+    let _ = flush_ws_out(connection);
+    if connection.out_at >= connection.out.len() {
+        return false;
+    }
+    connection.state = ConnState::Writing;
+    true
+}
+
 #[cfg(unix)]
 struct WsFrame {
     fin: bool,
@@ -1953,7 +2016,7 @@ enum WsParseError {
 }
 
 #[cfg(unix)]
-fn parse_ws_frame(buffer: &[u8]) -> Result<Option<(WsFrame, usize)>, WsParseError> {
+fn parse_ws_frame(buffer: &[u8], max: usize) -> Result<Option<(WsFrame, usize)>, WsParseError> {
     if buffer.len() < 2 {
         return Ok(None);
     }
@@ -1982,7 +2045,7 @@ fn parse_ws_frame(buffer: &[u8]) -> Result<Option<(WsFrame, usize)>, WsParseErro
         length = u64::from_be_bytes(bytes);
         at += 8;
     }
-    if length > 1024 * 1024 {
+    if length > max as u64 {
         return Err(WsParseError::TooLarge {
             total: at + 4 + length as usize,
         });
@@ -2419,7 +2482,7 @@ fn handle_stream(
     let Some(ui) = ui_path(path) else {
         return false;
     };
-    if ui.sub != "events" && ui.sub != "ws" {
+    if ui.sub != "events" && ui.sub != "ws" && ui.sub != "raw" {
         return false;
     }
     if request.method != "GET" {
@@ -2439,7 +2502,7 @@ fn handle_stream(
             return true;
         }
     };
-    if !package::valid_name(ui.id) || plugin::web_assets(ui.id).is_none() {
+    if !package::valid_name(ui.id) {
         let _ = stream.write_all(&error(404, "not_found", "unknown plugin UI"));
         return true;
     }
@@ -2459,6 +2522,27 @@ fn handle_stream(
             "forbidden",
             "cross-origin calls are not allowed",
         ));
+        return true;
+    }
+
+    // Raw is checked before the web-asset lookup on purpose: a protocol-3
+    // plugin may be headless, and "unsupported transport" must not turn into
+    // "unknown plugin UI".
+    if ui.sub == "raw" {
+        if !crate::limits::current().ws_raw_enabled {
+            let _ = stream.write_all(&error(403, "forbidden", "raw transport is disabled"));
+            return true;
+        }
+        let _ = stream.write_all(&error(
+            501,
+            "not_supported",
+            "raw transport is not supported on this platform",
+        ));
+        return true;
+    }
+
+    if plugin::web_assets(ui.id).is_none() {
+        let _ = stream.write_all(&error(404, "not_found", "unknown plugin UI"));
         return true;
     }
 

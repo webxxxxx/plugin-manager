@@ -107,6 +107,14 @@ _Avoid_: supervisor、状态机（不带「核」）
 一个被监督服务的运行时载体：状态机核 + 子进程 + stdio 管线 + 定时器。
 _Avoid_: 实例、worker
 
+**插件 stdio 反应器（Plugin stdio reactor）**:
+Unix 上唯一拥有插件管道的那条 poll 线程（`svcd-reactor`）：通知型插件的 stdout/stderr、exec 型插件的日志、协议 3 插件的 stdin/stdout/stderr 都由它读写，所以每个插件不再自带线程。超时/背压由每条管道自己的队列决定，不是线程阻塞。反应器起不来（或非 Unix 构建）时才退回「每插件读写线程」的降级路径。
+_Avoid_: IO 线程池、epoll 管理器
+
+**raw 传输（Raw transport）**:
+协议 3 插件与 UI 之间的二进制通道：插件 stdin/stdout 上是 `u32 长度 + u32 stream_id + payload` 帧，UI 侧是 `/plugin-ui/{id}/{token}/raw` 上的 binary WebSocket。daemon 只做 stream 映射、全局在途预算与失败分类，不解析 payload。非 Unix 构建没有这条 WebSocket 桥（匿名子管道不可 poll），`/raw` 明确回 `501 not_supported`；协议 3 插件本身仍能启动，只是没人能订阅。
+_Avoid_: 二进制插件、直通 WebSocket
+
 **重启策略（restart）**:
 服务退出后怎么办的声明：`always`（任何退出都重启）、`on-failure`（仅失败退出重启，默认）、`never`（不重启，退出即 stopped）。它和 `enabled`（开机是否启动）是两个独立维度。
 _Avoid_: 自启、enabled、看护策略

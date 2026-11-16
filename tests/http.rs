@@ -90,9 +90,14 @@ impl Sandbox {
 
     /// Opt this sandbox's daemon into unsigned installs via `svcd.conf`.
     fn allow_insecure_install(&self) {
+        self.allow_insecure_install_with("");
+    }
+
+    /// Same, plus extra `svcd.conf` keys for one test.
+    fn allow_insecure_install_with(&self, extra: &str) {
         fs::write(
             self.config.join("svcd.conf"),
-            "allow_insecure_install = true\n",
+            format!("allow_insecure_install = true\n{}", extra),
         )
         .expect("write svcd.conf");
     }
@@ -1017,8 +1022,12 @@ fn ws_handshake(address: &str, path: &str, extra: &[(&str, &str)]) -> (TcpStream
 }
 
 fn ws_send(stream: &mut TcpStream, opcode: u8, payload: &[u8]) {
+    ws_send_with(stream, opcode, payload, true);
+}
+
+fn ws_send_with(stream: &mut TcpStream, opcode: u8, payload: &[u8], fin: bool) {
     let mask = [1u8, 2, 3, 4];
-    let mut frame = vec![0x80 | opcode];
+    let mut frame = vec![if fin { 0x80 | opcode } else { opcode }];
     if payload.len() < 126 {
         frame.push(0x80 | payload.len() as u8);
     } else if payload.len() <= u16::MAX as usize {
@@ -1113,6 +1122,66 @@ fn sse_wait_for_data(stream: &mut TcpStream, needle: &str) -> String {
             seen.clear();
         }
     }
+}
+
+/// A protocol-3 (raw) plugin whose agent echoes stdin to stdout verbatim.
+/// `cat` is enough: the daemon writes `len | stream | payload` frames and the
+/// plugin must return them unchanged.
+#[cfg(unix)]
+fn raw_plugin_bundle(key: &SigningKey, id: &str) -> Vec<u8> {
+    let exec_path = "payload/bin/raw-agent.sh".to_string();
+    let mut files: Vec<(String, Vec<u8>, u32)> = vec![
+        (exec_path.clone(), b"#!/bin/sh\nexec cat\n".to_vec(), 0o755),
+        (
+            "payload/web/index.html".to_string(),
+            b"<!doctype html>\n<html><body>raw</body></html>".to_vec(),
+            0o644,
+        ),
+    ];
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let manifest = json!({
+        "schema": 1,
+        "name": id,
+        "version": "1.0.0",
+        "desc": "raw echo plugin",
+        "platform": target(),
+        "protocol": 3,
+        "exec": {"path": exec_path, "args": [], "ready": "exec"},
+        "ui": {"type": "web", "entry": "index.html"},
+    });
+    signed_package(key, manifest, &files)
+}
+
+/// A running daemon with a protocol-3 plugin named `echo`.
+#[cfg(unix)]
+fn daemon_with_raw_plugin(key_byte: u8) -> (Sandbox, String) {
+    daemon_with_raw_plugin_with(key_byte, "")
+}
+
+#[cfg(unix)]
+fn daemon_with_raw_plugin_with(key_byte: u8, conf: &str) -> (Sandbox, String) {
+    let mut sandbox = Sandbox::new();
+    sandbox.allow_insecure_install_with(conf);
+    let key = SigningKey::from_bytes(&[key_byte; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let package = raw_plugin_bundle(&key, "echo");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let installed = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(installed.status, 200, "{}", installed.body);
+    let started = request(&address, "POST", "/api/v1/services/echo/start", "", b"");
+    assert_eq!(started.status, 200, "{}", started.body);
+    (sandbox, address)
 }
 
 /// Start a daemon and install the `demo` plugin (with a config template)
@@ -4023,6 +4092,92 @@ fn plugin_ui_websocket_bridges_calls_notifications_and_control_frames() {
     let (opcode, payload) = ws_read(&mut binary);
     assert_eq!(opcode, 0x2);
     assert_eq!(payload, b"binary");
+}
+
+/// The `/raw` route only exists for protocol-3 plugins: a JSON-RPC plugin has
+/// no raw transport, and a platform without a plugin-stdio reactor says so
+/// instead of returning a misleading 404.
+#[test]
+fn plugin_ui_raw_requires_a_raw_capable_plugin() {
+    let (_sandbox, address) = web_ui_sandbox(63);
+    let base = plugin_ui_base(&address, "demo");
+    let (mut stream, status, head) = ws_handshake(&address, &format!("{}raw", base), &[]);
+    let mut body = Vec::new();
+    let _ = stream.read_to_end(&mut body);
+    let body = String::from_utf8_lossy(&body).to_ascii_lowercase();
+    if cfg!(windows) {
+        assert_eq!(status, 501, "{head}");
+        assert!(body.contains("not_supported"), "{head}{body}");
+    } else {
+        assert_eq!(status, 503, "{head}");
+        assert!(body.contains("raw_unavailable"), "{head}{body}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_ui_raw_round_trips_binary_frames() {
+    let (_sandbox, address) = daemon_with_raw_plugin(61);
+    let base = plugin_ui_base(&address, "echo");
+    let (mut ws, status, head) = ws_handshake(&address, &format!("{}raw", base), &[]);
+    assert_eq!(status, 101, "{head}");
+
+    // One binary frame crosses the plugin link byte for byte.
+    ws_send(&mut ws, 0x2, b"raw-bytes\x00\xff");
+    let (opcode, payload) = ws_read(&mut ws);
+    assert_eq!(opcode, 0x2, "{}", String::from_utf8_lossy(&payload));
+    assert_eq!(payload, b"raw-bytes\x00\xff");
+
+    // A fragmented message is reassembled before it reaches the plugin.
+    ws_send_with(&mut ws, 0x2, b"part-one/", false);
+    ws_send_with(&mut ws, 0x0, b"part-two", true);
+    let (opcode, payload) = ws_read(&mut ws);
+    assert_eq!(opcode, 0x2, "{}", String::from_utf8_lossy(&payload));
+    assert_eq!(payload, b"part-one/part-two");
+
+    // A zero-length frame is a valid frame, not a disconnect.
+    ws_send(&mut ws, 0x2, b"");
+    let (opcode, payload) = ws_read(&mut ws);
+    assert_eq!(opcode, 0x2);
+    assert!(payload.is_empty());
+
+    // The transport is binary-only.
+    ws_send(&mut ws, 0x1, b"text");
+    let (opcode, payload) = ws_read(&mut ws);
+    assert_eq!(opcode, 0x8, "{}", String::from_utf8_lossy(&payload));
+    assert_eq!(u16::from_be_bytes([payload[0], payload[1]]), 1003);
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_ui_raw_closes_on_an_oversized_message() {
+    let (_sandbox, address) = daemon_with_raw_plugin_with(62, "ws_raw_max_bytes = 1024\n");
+    let base = plugin_ui_base(&address, "echo");
+    let (mut ws, status, head) = ws_handshake(&address, &format!("{}raw", base), &[]);
+    assert_eq!(status, 101, "{head}");
+    ws_send(&mut ws, 0x2, &vec![0x41; 2048]);
+    let (opcode, payload) = ws_read(&mut ws);
+    assert_eq!(opcode, 0x8, "{}", String::from_utf8_lossy(&payload));
+    assert_eq!(u16::from_be_bytes([payload[0], payload[1]]), 1009);
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_ui_raw_reports_protocol_errors_with_a_close_frame() {
+    let (_sandbox, address) = daemon_with_raw_plugin(64);
+    let base = plugin_ui_base(&address, "echo");
+    let (mut ws, status, head) = ws_handshake(&address, &format!("{}raw", base), &[]);
+    assert_eq!(status, 101, "{head}");
+
+    // A frame with reserved bits set is a protocol violation. The client must
+    // see the 1002 close, not a bare EOF from the daemon dropping the socket.
+    let mut frame = vec![0xF2, 0x80];
+    frame.extend_from_slice(&[1, 2, 3, 4]);
+    ws.write_all(&frame).expect("reserved-bit frame");
+    ws.flush().expect("flush");
+    let (opcode, payload) = ws_read(&mut ws);
+    assert_eq!(opcode, 0x8, "{}", String::from_utf8_lossy(&payload));
+    assert_eq!(u16::from_be_bytes([payload[0], payload[1]]), 1002);
 }
 
 #[test]

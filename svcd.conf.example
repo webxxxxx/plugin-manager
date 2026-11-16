@@ -82,6 +82,18 @@ bind = 127.0.0.1:8787
 #   ws_raw_max_bytes       1048576    1048576     1048576
 #   ws_raw_queue           16         64          128
 #
+# `ws_raw_*` control the protocol-3 raw transport
+# (`/plugin-ui/{id}/{token}/raw`): a plugin that declares `protocol: 3`
+# exchanges length-framed binary payloads on stdin/stdout.
+#   ws_raw_max_bytes        cap for one frame, in bytes
+#   ws_inflight_bytes       unacknowledged raw bytes across all plugins
+#   ws_inflight_requests    unacknowledged raw frames across all plugins
+#   ws_raw_queue            frames queued for one plugin's stdin
+# On Unix the plugin-stdio reactor owns the raw pipes, so a raw plugin adds no
+# threads; a slow plugin fills its queue instead of blocking a thread. Raise
+# the in-flight limits when the workload legitimately has many large frames in
+# flight. On Windows the route answers 501 not_supported.
+#
 # Explicit values below override the MEM_LEVEL defaults. They are clamped to a
 # safe range; changing them requires a daemon restart.
 # logs_dir = /var/log/svcd

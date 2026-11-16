@@ -560,16 +560,12 @@ impl Slot {
                     let _ = child.wait();
                     return Err("raw transport is unavailable".into());
                 };
-                if let Err(error) = hub.register(self.id.clone(), stdin, stdout) {
+                if let Err(error) =
+                    hub.register(self.id.clone(), stdin, stdout, Some(stderr), log.clone())
+                {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(error);
-                }
-                if let Err(error) = spawn_stderr_log(&self.id, stderr, log.clone()) {
-                    hub.unregister(&self.id);
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error.to_string());
                 }
                 self.stdin = None;
                 self.frames = None;
@@ -1286,25 +1282,6 @@ fn log_line(log: &Option<Arc<Mutex<LogSink>>>, line: &str) {
             let _ = sink.line(line);
         }
     }
-}
-
-/// Protocol-3 raw plugins keep stdout for the raw bridge; stderr is still
-/// collected into the service log.
-fn spawn_stderr_log(
-    id: &str,
-    stderr: ChildStderr,
-    log: Option<Arc<Mutex<LogSink>>>,
-) -> std::io::Result<()> {
-    thread::Builder::new()
-        .name(format!("svcd-{}-stderr", id))
-        .stack_size(threads::io_stack())
-        .spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
-                log_line(&log, &line);
-            }
-        })?;
-    Ok(())
 }
 
 /// Fallback used on Windows and whenever the reactor is unavailable.

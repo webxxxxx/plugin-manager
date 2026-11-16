@@ -277,6 +277,8 @@ fn default_conf_text(layout: &Layout) -> String {
          # ws_raw_enabled = on\n\
          # ws_raw_max_bytes = 1048576\n\
          # ws_raw_queue = 16 / 64 / 128\n\
+         # ws_raw_* gate the protocol-3 raw transport; on Windows /raw answers\n\
+         # 501 not_supported. See svcd.conf.example for the full semantics.\n\
          # Set the web/API password with: svc auth passwd <password>\n\
          # auth_passwd = pbkdf2-sha256$...\n",
         layout.config_dir.display(),

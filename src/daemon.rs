@@ -159,7 +159,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     notify_systemd("READY=1");
 
     let mut daemon = Daemon::new_with_raw(loaded.registry, token, rx, api, raw_hub.clone());
-    daemon.set_raw_hub(raw_hub);
+    daemon.set_raw_hub(raw_hub.clone());
     daemon.set_wake(wake);
     #[cfg(unix)]
     {
@@ -173,6 +173,9 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
                 None
             }
         };
+        if let Some(reactor) = &reactor {
+            raw_hub.set_reactor(reactor);
+        }
         daemon.set_reactor(reactor);
     }
     daemon.adopt_runtime();
@@ -180,6 +183,8 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     install_shutdown_signal();
     daemon.start_enabled();
     daemon.event_loop();
+    #[cfg(feature = "http")]
+    log::svcd(&format!("svcd: raw stats: {}", raw_hub.stats.summary()));
     notify_systemd("STOPPING=1");
     channel::remove_socket(&config);
     0
