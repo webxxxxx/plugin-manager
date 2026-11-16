@@ -218,7 +218,7 @@ src/
   server/                     L4 服务器：协议会话
     mod.rs
     control/  listener.rs  session.rs    命令行通道也是服务器
-    http/     contract.rs  dispatch.rs  engine.rs  stream.rs  driver.rs  routes.rs  takeover.rs
+    http/     contract.rs  dispatch.rs  engine.rs  stream.rs  driver.rs  pool.rs  routes.rs  takeover.rs
     mcp/      session.rs  transport.rs  progress.rs
     auth/     gate.rs  token.rs  session.rs
 
