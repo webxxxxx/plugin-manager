@@ -217,6 +217,37 @@ pub enum Settled {
     Stopped,
 }
 
+/// 服务级健康读数。`Settled` 是 lifecycle 动词的结局；`Health` 是对外读数。
+/// 四态与 `Settled` 相同：`Live` 只说明进程活着，`Ready` / `Degraded` 才可接受调用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Health {
+    pub state: Settled,
+}
+
+impl Health {
+    pub fn from_settled(state: Settled) -> Health {
+        Health { state }
+    }
+
+    pub fn state(&self) -> &Settled {
+        &self.state
+    }
+
+    /// 进程还在：`Live` / `Ready` / `Degraded`。
+    pub fn is_alive(&self) -> bool {
+        !matches!(self.state, Settled::Stopped)
+    }
+
+    /// 能接受调用：`Ready` / `Degraded`。
+    pub fn is_usable(&self) -> bool {
+        matches!(self.state, Settled::Ready | Settled::Degraded(_))
+    }
+
+    pub fn is_ready(&self) -> bool {
+        matches!(self.state, Settled::Ready)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StreamId(pub u64);
 
@@ -239,15 +270,44 @@ impl CancelToken {
     }
 }
 
-/// 一次调用：能力名、参数、预算，以及可选的幂等键与 trace。
+/// 一次调用的资源预算。`timeout` 是硬截止；这里放“还能花多少”的上限。
+/// 内核只透传，不解释；adapter / 编排按字段执行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Budget {
+    /// 允许触发的子调用 / 步骤数；`None` = 不限。
+    pub steps: Option<u32>,
+    /// 允许写回 / 流出的字节数；`None` = 契约的 `limits.max_inline`。
+    pub bytes: Option<usize>,
+}
+
+/// 进度关联 token，与 MCP 的 `progressToken` 同义。
+/// 内核只透传；进度事件由 adapter / 服务器投递。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProgressToken(String);
+
+impl ProgressToken {
+    pub fn new(token: impl Into<String>) -> ProgressToken {
+        ProgressToken(token.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// 一次调用：能力名、参数、期限 / 预算，以及可选的幂等键、进度 token 与 trace。
 #[derive(Debug, Clone)]
 pub struct Invocation {
     pub capability: CapabilityName,
     pub arguments: Value,
-    /// 调用方给的预算；内核到点即判 [`Class::Timeout`]，实现不得延长。
+    /// 调用方给的时限预算；内核到点即判 [`Class::Timeout`]，实现不得延长。
     pub timeout: Duration,
+    /// 调用方愿意为这次调用花的资源上限；内核只透传。
+    pub budget: Budget,
     /// 自动重试的幂等键：同一个键重复调用等价于一次（仅当能力 `idempotent`）。
     pub idempotency: Option<String>,
+    /// 进度关联 token；`None` = 调用方不要进度。
+    pub progress: Option<ProgressToken>,
     /// 排障用的串联 id；实现可以忽略。
     pub trace: Option<String>,
     pub cancel: CancelToken,
@@ -259,10 +319,22 @@ impl Invocation {
             capability: CapabilityName::new(capability),
             arguments,
             timeout,
+            budget: Budget::default(),
             idempotency: None,
+            progress: None,
             trace: None,
             cancel: CancelToken::default(),
         }
+    }
+
+    pub fn with_budget(mut self, budget: Budget) -> Invocation {
+        self.budget = budget;
+        self
+    }
+
+    pub fn with_progress(mut self, token: ProgressToken) -> Invocation {
+        self.progress = Some(token);
+        self
     }
 }
 
@@ -569,5 +641,49 @@ mod tests {
             Err(other) => panic!("unexpected launch error: {other:?}"),
             Ok(_) => panic!("an unregistered tag must fail to launch"),
         }
+    }
+
+    #[test]
+    fn invocation_carries_budget_and_progress() {
+        let invocation = Invocation::new("status", json!({}), Duration::from_secs(1))
+            .with_budget(Budget {
+                steps: Some(3),
+                bytes: Some(4096),
+            })
+            .with_progress(ProgressToken::new("t1"));
+
+        assert_eq!(invocation.budget.steps, Some(3));
+        assert_eq!(invocation.budget.bytes, Some(4096));
+        assert_eq!(
+            invocation.progress.as_ref().map(ProgressToken::as_str),
+            Some("t1")
+        );
+        assert_eq!(
+            Invocation::new("status", json!({}), Duration::from_secs(1)).budget,
+            Budget::default()
+        );
+    }
+
+    #[test]
+    fn health_classifies_live_ready_degraded_and_stopped() {
+        let live = Health::from_settled(Settled::Live);
+        assert!(live.is_alive());
+        assert!(!live.is_usable(), "alive is not yet ready");
+        assert!(!live.is_ready());
+
+        let ready = Health::from_settled(Settled::Ready);
+        assert!(ready.is_alive());
+        assert!(ready.is_usable());
+        assert!(ready.is_ready());
+
+        let degraded = Health::from_settled(Settled::Degraded("disk".into()));
+        assert!(degraded.is_alive());
+        assert!(degraded.is_usable());
+        assert!(!degraded.is_ready());
+
+        let stopped = Health::from_settled(Settled::Stopped);
+        assert!(!stopped.is_alive());
+        assert!(!stopped.is_usable());
+        assert!(!stopped.is_ready());
     }
 }
