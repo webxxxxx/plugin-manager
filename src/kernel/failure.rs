@@ -135,6 +135,25 @@ impl Failure {
             detail: detail.into(),
         }
     }
+
+    /// 插件协议里的 `error` 对象归一成失败。
+    ///
+    /// 插件可以声明类别，但 `cancelled` 只能由调用方产生；插件声明它，
+    /// 说明是插件自己的实现问题。未知类别同样归一为 `ImplementationError`。
+    pub fn from_plugin_error(error: &serde_json::Value) -> Failure {
+        let detail = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("plugin call failed")
+            .to_string();
+        let class = error
+            .pointer("/data/class")
+            .and_then(serde_json::Value::as_str)
+            .and_then(Class::from_str)
+            .filter(|class| *class != Class::Cancelled)
+            .unwrap_or(Class::ImplementationError);
+        Failure::new(class, class.default_retry(), detail)
+    }
 }
 
 /// 内核就地拒绝的原因：调用没有被尝试，也不会被尝试。
@@ -218,6 +237,31 @@ mod tests {
 
         let immediate = Failure::new(Class::NotRunning, Retry::Now, "");
         assert_eq!(retry_of(&immediate), Retry::Now);
+    }
+
+    #[test]
+    fn a_plugin_cannot_claim_cancelled_or_an_unknown_class() {
+        let cancelled = Failure::from_plugin_error(&serde_json::json!({
+            "message": "plugin says cancelled",
+            "data": { "class": "cancelled" }
+        }));
+        assert_eq!(cancelled.class, Class::ImplementationError);
+        assert_eq!(cancelled.retry, Retry::Never);
+        assert_eq!(cancelled.detail, "plugin says cancelled");
+
+        let unknown = Failure::from_plugin_error(&serde_json::json!({
+            "message": "boom",
+            "data": { "class": "not_a_class" }
+        }));
+        assert_eq!(unknown.class, Class::ImplementationError);
+        assert_eq!(unknown.detail, "boom");
+
+        let busy = Failure::from_plugin_error(&serde_json::json!({
+            "message": "busy",
+            "data": { "class": "busy" }
+        }));
+        assert_eq!(busy.class, Class::Busy);
+        assert_eq!(busy.retry, Class::Busy.default_retry());
     }
 
     #[test]

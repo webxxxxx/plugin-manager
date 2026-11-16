@@ -1039,16 +1039,7 @@ impl Slot {
             return;
         };
         let outcome = if let Some(error) = message.get("error") {
-            let text = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("plugin call failed");
-            let class = error
-                .pointer("/data/class")
-                .and_then(Value::as_str)
-                .and_then(Class::from_str)
-                .unwrap_or(Class::ImplementationError);
-            Err(Failure::new(class, class.default_retry(), text))
+            Err(Failure::from_plugin_error(error))
         } else if let Some(result) = message.get("result") {
             let mut result = result.clone();
             match crate::blob::materialize_result(&mut result) {
@@ -1756,6 +1747,18 @@ mod tests {
             },
         );
         rx
+    }
+
+    #[test]
+    fn the_slot_handle_reports_degraded_health() {
+        let mut slot = slot();
+        slot.machine.state = State::Running;
+        slot.machine.mark_degraded("last call failed");
+        slot.pump(0);
+        assert_eq!(
+            slot.handle().probe(),
+            Settled::Degraded("degraded".into())
+        );
     }
 
     #[test]

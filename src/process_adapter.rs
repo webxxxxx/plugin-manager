@@ -26,6 +26,10 @@ use crate::kernel::contract::{
 };
 use crate::kernel::failure::{Class, Failure, Retry};
 
+/// Bounded stdout queue: a child that floods frames blocks its reader instead
+/// of growing daemon memory without bound.
+const FRAME_QUEUE: usize = 256;
+
 /// 进程 adapter 的装配入口：\`tag=process\`。
 pub struct ProcessLauncher;
 
@@ -110,12 +114,12 @@ impl ProcessSpec {
             None | Some(Value::Null) => 1,
             Some(value) => value
                 .as_u64()
-                .filter(|value| *value >= 1 && *value <= 3)
+                .filter(|value| matches!(*value, 1 | 2))
                 .ok_or_else(|| {
                     Failure::new(
                         Class::MissingDependency,
                         Retry::Never,
-                        "process binding protocol must be 1, 2 or 3",
+                        "process binding protocol must be 1 or 2",
                     )
                 })? as u32,
         };
@@ -228,9 +232,9 @@ impl ProcessWire {
                 });
         }
 
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(FRAME_QUEUE);
         let protocol = self.spec.protocol;
-        thread::Builder::new()
+        let reader = thread::Builder::new()
             .name("process-adapter-reader".into())
             .stack_size(crate::threads::io_stack())
             .spawn(move || {
@@ -254,14 +258,17 @@ impl ProcessWire {
                         break;
                     }
                 }
-            })
-            .map_err(|error| {
-                Failure::new(
-                    Class::ImplementationError,
-                    Retry::Never,
-                    format!("cannot start reader thread: {error}"),
-                )
-            })?;
+            });
+        if let Err(error) = reader {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Failure::new(
+                Class::ImplementationError,
+                Retry::Never,
+                format!("cannot start reader thread: {error}"),
+            ));
+        }
 
         self.child = Some(child);
         self.stdin = stdin;
@@ -313,20 +320,6 @@ impl ProcessWire {
                 format!("cannot write to process: {error}"),
             )
         })
-    }
-
-    fn failure_from_error(error: &Value) -> Failure {
-        let detail = error
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("process call failed")
-            .to_string();
-        let class = error
-            .pointer("/data/class")
-            .and_then(Value::as_str)
-            .and_then(Class::from_str)
-            .unwrap_or(Class::ImplementationError);
-        Failure::new(class, class.default_retry(), detail)
     }
 
     fn mark_degraded(&mut self, failure: &Failure) {
@@ -462,7 +455,7 @@ impl Wire for ProcessWire {
                         continue;
                     }
                     if let Some(error) = message.get("error") {
-                        let failure = Self::failure_from_error(error);
+                        let failure = Failure::from_plugin_error(error);
                         self.mark_degraded(&failure);
                         return Err(failure);
                     }
@@ -697,6 +690,16 @@ done
             Reply::Value(value) => assert_eq!(value["ok"], true),
             other => panic!("expected a value reply, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_process_binding_rejects_protocol_three() {
+        // Protocol 3 is the raw/8-byte-header transport; this adapter only
+        // speaks the plugin call framing (1 = NDJSON, 2 = 4-byte length).
+        let error = ProcessSpec::parse(&json!({ "path": "/bin/agent", "protocol": 3 }))
+            .expect_err("protocol 3 is not call framing");
+        assert_eq!(error.class, Class::MissingDependency);
+        assert!(error.detail.contains("protocol must be 1 or 2"));
     }
 
     #[test]

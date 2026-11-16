@@ -1907,16 +1907,24 @@ fn slot_contract(service: &Service) -> Contract {
             name: CapabilityName::new(capability.name.clone()),
             desc: capability.description.clone(),
             input_schema: Some(capability.input_schema.clone()),
+            // The plugin manifest does not declare effect/idempotence yet;
+            // Write + non-idempotent is the conservative projection.
             effect: Effect::Write,
             idempotent: false,
         })
+        .collect();
+    // Cancelled is caller-driven only; a plugin that returns it is already
+    // normalized to ImplementationError before it reaches the contract.
+    let failures = Class::ALL
+        .into_iter()
+        .filter(|class| *class != Class::Cancelled)
         .collect();
     Contract::new(
         ServiceId::new(service.id.clone()),
         service.version.clone(),
         surface,
         Obligations::default(),
-        Class::ALL.to_vec(),
+        failures,
         KernelLimits {
             max_inline: 1024 * 1024,
             max_in_flight: crate::slot::MAX_IN_FLIGHT,
