@@ -123,9 +123,11 @@ impl RawPlugin {
             }
             subscribers.clear();
         }
-        if let Ok(streams) = self.inflight.lock() {
-            for stream in streams.keys().copied().collect::<Vec<_>>() {
-                hub.release_stream(self, stream);
+        if let Ok(mut inflight) = self.inflight.lock() {
+            let bytes: Vec<usize> = inflight.drain().map(|(_, bytes)| bytes).collect();
+            drop(inflight);
+            for bytes in bytes {
+                hub.release(bytes);
             }
         }
     }
