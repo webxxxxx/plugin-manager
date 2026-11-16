@@ -58,8 +58,6 @@ mod threads;
 mod transfer;
 mod trust;
 #[cfg(feature = "http")]
-mod ui_http;
-#[cfg(feature = "http")]
 mod uichannel;
 mod wake;
 #[cfg(feature = "http")]

@@ -22,7 +22,6 @@ pub enum BodyPolicy {
     #[allow(dead_code)] // #114 wires the first Buffered route.
     Buffered { limit: u64 },
     /// The server does not buffer; the returned stream handler consumes the body.
-    #[allow(dead_code)] // #115 wires the first Streamed route.
     Streamed,
 }
 
@@ -145,7 +144,6 @@ impl Response {
 /// The two and only two outcomes of a face request.
 pub enum Exchange {
     Response(Response),
-    #[allow(dead_code)] // #115 is the first Streamed route.
     Stream(Box<dyn StreamHandler>),
 }
 
@@ -164,10 +162,7 @@ pub enum ExchangeKind {
     Stream,
 }
 
-/// A sans-IO stream state machine. It receives events and returns actions; the
-/// server owns the socket and performs the bytes. The event/action surface
-/// arrives with #115; #113 only fixes the exchange shape.
-pub trait StreamHandler: Send {}
+pub use super::stream::StreamHandler;
 
 /// The one new seam: a face makes a route decision and handles a request.
 pub trait Face: Send + Sync {

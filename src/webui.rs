@@ -5,6 +5,8 @@
 //! JSON-RPC request to the plugin's stdio channel (see `bridge_request`), and
 //! `uichannel` mirrors the plugin's notifications to SSE/WebSocket clients.
 
+use std::path::{Path, PathBuf};
+
 use serde_json::Value;
 
 use crate::package;
@@ -166,6 +168,56 @@ fn doctype_end(html: &[u8]) -> Option<usize> {
     rest.iter()
         .position(|byte| *byte == b'>')
         .map(|pos| index + pos + 1)
+}
+
+/// Resolve a relative path under the web root and make sure it stays inside it
+/// (the installer rejects symlinks, but this is cheap defence in depth).
+pub(crate) fn web_file(root: &Path, relative: &str) -> Option<(PathBuf, std::fs::Metadata)> {
+    let mut path = root.to_path_buf();
+    for segment in relative.split('/') {
+        path.push(segment);
+    }
+    let root = root.canonicalize().ok()?;
+    let path = path.canonicalize().ok()?;
+    if !path.starts_with(&root) {
+        return None;
+    }
+    let metadata = std::fs::metadata(&path).ok()?;
+    metadata.is_file().then_some((path, metadata))
+}
+
+/// The response headers every plugin UI asset carries.
+pub(crate) fn web_headers(etag: &str) -> Vec<(String, String)> {
+    vec![
+        ("ETag".to_string(), etag.to_string()),
+        ("Cache-Control".to_string(), "no-cache".to_string()),
+        ("Vary".to_string(), "Accept".to_string()),
+        ("X-Content-Type-Options".to_string(), "nosniff".to_string()),
+        ("Referrer-Policy".to_string(), "no-referrer".to_string()),
+    ]
+}
+
+/// Whether a browser navigation asked for HTML. Used for the SPA fallback and
+/// for the login redirect on an unauthenticated plugin UI page.
+pub(crate) fn wants_html(headers: &[(String, String)]) -> bool {
+    crate::http::header(headers, "accept")
+        .map(|value| value.to_ascii_lowercase().contains("text/html"))
+        .unwrap_or(false)
+}
+
+/// Percent-encode a local path for a `next=` query value so `&`, `#` or `%`
+/// in a crafted `/plugin-ui/...` path cannot add query parts or a fragment.
+pub(crate) fn encode_query_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
 }
 
 fn entry_path(entry: &str) -> Option<String> {

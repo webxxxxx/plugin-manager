@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
@@ -201,6 +202,17 @@ impl Lan {
             return false;
         }
         true
+    }
+}
+
+/// Validate a plugin UI token while tolerating a poisoned lock (deny).
+///
+/// The token is endpoint policy, not transport authentication, so the face
+/// calls this after the server resolved the principal.
+pub fn plugin_token_valid(lan: &Mutex<Lan>, token: &str, plugin: &str) -> bool {
+    match lan.lock() {
+        Ok(mut state) => state.validate_plugin_token(token, plugin),
+        Err(_) => false,
     }
 }
 

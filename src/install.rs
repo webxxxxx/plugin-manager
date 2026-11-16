@@ -284,6 +284,9 @@ fn default_conf_text(layout: &Layout) -> String {
          # On Windows the HTTP fallback keeps one thread per admitted\n\
          # connection, so max_connections is its thread cap; the final Unix\n\
          # four-thread default budget does not apply there.\n\
+         # max_streams caps long-lived and transfer streams; one-shot plugin UI\n\
+         # static assets are exempt, so a page with more assets still loads.\n\
+         # stream_buffer_bytes bounds one handler's output buffer.\n\
          # Set the web/API password with: svc auth passwd <password>\n\
          # auth_passwd = pbkdf2-sha256$...\n",
         layout.config_dir.display(),

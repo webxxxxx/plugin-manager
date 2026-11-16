@@ -88,6 +88,13 @@ bind = 127.0.0.1:8787
 # max_connections is also the connection-thread cap; the final Unix
 # four-thread default budget does not apply there.
 #
+# max_streams caps long-lived and transfer streams: SSE, WebSocket, raw
+# WebSocket, MCP SSE, blob/file upload and download, export, import and install.
+# One-shot static assets served for a plugin UI page are exempt, so a page with
+# more assets than max_streams still loads. stream_buffer_bytes bounds one
+# handler's output buffer; a slow reader stops input at that high-water mark
+# instead of growing memory.
+#
 # `ws_raw_*` control the protocol-3 raw transport
 # (`/plugin-ui/{id}/{token}/raw`): a plugin that declares `protocol: 3`
 # exchanges length-framed binary payloads on stdin/stdout.

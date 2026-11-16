@@ -96,11 +96,20 @@ fn check_exchange(body: BodyPolicy, exchange: Exchange) -> Result<Exchange, Disp
 mod tests {
     use super::*;
     use crate::server::http::contract::{Completion, Response, StreamHandler};
+    use crate::server::http::{OutBuffer, StreamAction, StreamEvent, StreamStep};
     use serde_json::json;
 
     struct NoopStream;
 
-    impl StreamHandler for NoopStream {}
+    impl StreamHandler for NoopStream {
+        fn on_event(
+            &mut self,
+            _event: StreamEvent<'_>,
+            _out: &mut OutBuffer<'_>,
+        ) -> StreamStep {
+            StreamStep::wait(StreamAction::Continue)
+        }
+    }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Behavior {

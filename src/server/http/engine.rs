@@ -106,6 +106,9 @@ pub type Table<S> = HashMap<u64, Connection<S>>;
 pub enum PreRequest {
     /// Not a legacy takeover; let the loop parse and buffer the request.
     Continue,
+    /// The handler already consumed the readable bytes and set the
+    /// connection's next state (for example a stream or a written response).
+    Handled,
     /// The handler cloned/took the connection; remove the loop's handle.
     Close,
 }
@@ -295,6 +298,7 @@ where
                                         }
                                     }
                                 }
+                                PreRequest::Handled => {}
                                 PreRequest::Close => {
                                     if let Some(mut connection) = connections.remove(&id) {
                                         handler.on_close(&mut connection);

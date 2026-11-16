@@ -36,6 +36,7 @@ use serde_json::{json, Value};
 use crate::blob;
 use crate::blob_http;
 use crate::channel;
+use crate::face::plugin_ui::{ui_path, UiPath};
 use crate::http;
 use crate::lan::{self, AuthKind, Lan, LanStatus};
 use crate::log;
@@ -46,6 +47,8 @@ use crate::paths;
 use crate::plugin;
 use crate::rpc;
 use crate::server::http::engine::{self, keep_alive_response, wants_keep_alive, HttpRequest};
+#[cfg(unix)]
+use crate::server::http::{CloseReason, StreamClass, StreamHandler};
 use crate::settings;
 use crate::threads;
 use crate::transfer;
@@ -259,6 +262,30 @@ struct RawWsState {
     frames: u64,
 }
 
+/// A stream handler attached to one connection. The loop owns the socket and
+/// the buffers; the handler only sees events and returns actions.
+#[cfg(unix)]
+struct StreamState {
+    handler: Box<dyn StreamHandler>,
+    /// One-shot handlers are exempt from `max_streams`.
+    #[allow(dead_code)] // #118 adds the transfer budget that reads this.
+    class: StreamClass,
+    /// The server's no-progress deadline, possibly shortened by the handler.
+    deadline: Instant,
+    /// A server-side file send requested by the handler, after the output
+    /// buffer drains.
+    file: Option<PendingFile>,
+    /// The handler asked to finish; flush the output buffer, then close.
+    closing: Option<CloseReason>,
+}
+
+#[cfg(unix)]
+struct PendingFile {
+    file: fs::File,
+    offset: u64,
+    length: u64,
+}
+
 #[cfg(unix)]
 enum ConnState {
     Reading,
@@ -268,6 +295,7 @@ enum ConnState {
     Ws(WsState),
     RawWs(RawWsState),
     McpSse(McpSseState),
+    Stream(StreamState),
 }
 
 #[cfg(unix)]
@@ -1442,21 +1470,6 @@ fn parse_ws_frame(buffer: &[u8], max: usize) -> Result<Option<(WsFrame, usize)>,
 }
 
 #[cfg(unix)]
-fn ui_takeover(connection: &mut Connection) -> Option<(TcpStream, http::Head)> {
-    if connection.pending.is_some() {
-        return None;
-    }
-    let header_end = http::header_end(&connection.buffer)?;
-    if header_end > crate::limits::current().max_header {
-        return None;
-    }
-    let (head, _) = http::parse_head(&connection.buffer[..header_end + 4])?;
-    crate::ui_http::route(&head)?;
-    let stream = connection.stream.try_clone().ok()?;
-    Some((stream, head))
-}
-
-#[cfg(unix)]
 fn export_takeover(
     connection: &mut Connection,
 ) -> Option<(TcpStream, http::Head, crate::export_http::Route)> {
@@ -1704,8 +1717,8 @@ fn handle(
                 return;
             }
         };
-        if crate::ui_http::route(&head).is_some() {
-            crate::ui_http::serve(&mut stream, &head, &lan);
+        if crate::face::plugin_ui::PluginUiFace::route_for(&head.method, &head.path).is_some() {
+            crate::face::plugin_ui::serve(&mut stream, &head, &lan);
             return;
         }
         if let Some(route) = crate::export_http::route(&head) {
@@ -2113,7 +2126,7 @@ fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u
                         "text/plain; charset=utf-8",
                         &[(
                             "Location".to_string(),
-                            format!("/?next={}", encode_query_value(path)),
+                            format!("/?next={}", webui::encode_query_value(path)),
                         )],
                         b"",
                     );
@@ -2163,45 +2176,6 @@ fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u
     route(config, request, lan)
 }
 
-/// One parsed `/plugin-ui/{id}/{token}/...` path.
-pub(crate) struct UiPath<'a> {
-    /// The plugin id segment (still unvalidated).
-    pub(crate) id: &'a str,
-    /// The per-plugin UI token.
-    pub(crate) token: &'a str,
-    /// Everything after the token; empty for the plugin root.
-    pub(crate) sub: &'a str,
-    /// True for `/plugin-ui/{id}` or `/plugin-ui/{id}/{token}` without the
-    /// trailing slash.
-    pub(crate) slashless: bool,
-}
-
-pub(crate) fn ui_path(path: &str) -> Option<UiPath<'_>> {
-    let rest = path.strip_prefix("/plugin-ui/")?;
-    let (id, after, root_slash) = match rest.split_once('/') {
-        Some((id, after)) => (id, after, true),
-        None => (rest, "", false),
-    };
-    if after.is_empty() && root_slash {
-        return Some(UiPath {
-            id,
-            token: "",
-            sub: "",
-            slashless: false,
-        });
-    }
-    let (token, sub, slashless) = match after.split_once('/') {
-        Some((token, sub)) => (token, sub, false),
-        None => (after, "", true),
-    };
-    Some(UiPath {
-        id,
-        token,
-        sub,
-        slashless,
-    })
-}
-
 /// Serve `/plugin-ui/{id}/{token}/...`: the plugin's package-local web assets,
 /// the `/rpc` JSON-RPC bridge, and the SSE/WebSocket realtime streams. A plugin
 /// never runs an HTTP listener of its own, and the token must belong to this
@@ -2230,10 +2204,7 @@ fn plugin_ui(
 }
 
 pub(crate) fn token_valid(lan: &Arc<Mutex<Lan>>, token: &str, plugin: &str) -> bool {
-    match lan.lock() {
-        Ok(mut state) => state.validate_plugin_token(token, plugin),
-        Err(_) => false,
-    }
+    lan::plugin_token_valid(lan, token, plugin)
 }
 
 fn serve_ui(request: &HttpRequest, assets: &plugin::WebAssets, sub: &str, base: &str) -> Vec<u8> {
@@ -2243,34 +2214,20 @@ fn serve_ui(request: &HttpRequest, assets: &plugin::WebAssets, sub: &str, base: 
     let Some(relative) = webui::relative_path(sub, &assets.entry) else {
         return error(404, "not_found", "not found");
     };
-    if let Some((path, metadata)) = web_file(&assets.root, &relative) {
+    if let Some((path, metadata)) = webui::web_file(&assets.root, &relative) {
         return serve_web_file(request, &path, &metadata, base);
     }
     // SPA fallback: only an HTML navigation falls back to the entry. A missing
     // script must stay a 404 so the browser reports it instead of running HTML.
     if wants_html(request) {
-        if let Some((path, metadata)) = web_file(&assets.root, &assets.entry) {
+        if let Some((path, metadata)) = webui::web_file(&assets.root, &assets.entry) {
             return serve_web_file(request, &path, &metadata, base);
         }
     }
     error(404, "not_found", "not found")
 }
 
-/// Resolve a relative path under the web root and make sure it stays inside it
-/// (the installer rejects symlinks, but this is cheap defence in depth).
-pub(crate) fn web_file(root: &Path, relative: &str) -> Option<(PathBuf, fs::Metadata)> {
-    let mut path = root.to_path_buf();
-    for segment in relative.split('/') {
-        path.push(segment);
-    }
-    let root = root.canonicalize().ok()?;
-    let path = path.canonicalize().ok()?;
-    if !path.starts_with(&root) {
-        return None;
-    }
-    let metadata = fs::metadata(&path).ok()?;
-    metadata.is_file().then_some((path, metadata))
-}
+
 
 fn serve_web_file(
     request: &HttpRequest,
@@ -2281,7 +2238,7 @@ fn serve_web_file(
     let mime = http::content_type(&path.to_string_lossy());
     let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
     let etag = webui::etag(modified, metadata.len());
-    let headers = web_headers(&etag);
+    let headers = webui::web_headers(&etag);
     if webui::not_modified(request_header(request, "if-none-match"), &etag) {
         return http::response_with_headers(304, mime, &headers, b"");
     }
@@ -2297,15 +2254,7 @@ fn serve_web_file(
     http::response_with_headers(200, mime, &headers, &body)
 }
 
-pub(crate) fn web_headers(etag: &str) -> Vec<(String, String)> {
-    vec![
-        ("ETag".to_string(), etag.to_string()),
-        ("Cache-Control".to_string(), "no-cache".to_string()),
-        ("Vary".to_string(), "Accept".to_string()),
-        ("X-Content-Type-Options".to_string(), "nosniff".to_string()),
-        ("Referrer-Policy".to_string(), "no-referrer".to_string()),
-    ]
-}
+
 
 fn wants_html(request: &HttpRequest) -> bool {
     request_header(request, "accept")
@@ -2962,21 +2911,6 @@ fn ui_page() -> Vec<u8> {
         ],
         UI.as_bytes(),
     )
-}
-
-/// Percent-encode a local path for a `next=` query value so `&`, `#` or `%`
-/// in a crafted `/plugin-ui/...` path cannot add query parts or a fragment.
-pub(crate) fn encode_query_value(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{:02X}", byte)),
-        }
-    }
-    out
 }
 
 fn cap_log(mut text: String) -> String {

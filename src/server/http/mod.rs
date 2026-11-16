@@ -5,10 +5,20 @@
 pub mod contract;
 pub mod dispatch;
 pub mod engine;
+pub mod stream;
 
-#[cfg_attr(not(feature = "http"), allow(unused_imports))]
+// The S4 contract is deliberately available to the minimal build (parent spec
+// #112) even when no HTTP endpoint is compiled in. Re-exports are allowed to
+// look unused in one feature/platform combination.
+#[allow(unused_imports)]
 pub use contract::{
-    body_for, BodyError, BodyPolicy, Completion, Exchange, Face, Request, Response, Route,
+    body_for, BodyError, BodyPolicy, Completion, CompletionSlot, Dispatch, Exchange, Face,
+    Principal, Request, Response, Route,
 };
-#[cfg_attr(not(feature = "http"), allow(unused_imports))]
-pub use dispatch::dispatch_inline;
+#[allow(unused_imports)]
+pub use dispatch::{dispatch_inline, DispatchError};
+#[allow(unused_imports)]
+pub use stream::{
+    BlockingJob, BlockingOutcome, CloseReason, FileSend, OutBuffer, StreamAction, StreamClass,
+    StreamEvent, StreamHandler, StreamStep,
+};

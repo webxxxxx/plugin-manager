@@ -871,6 +871,7 @@ fn web_plugin_bundle(key: &SigningKey, id: &str, ui: bool) -> Vec<u8> {
             b"export const answer = 42;\n".to_vec(),
             0o644,
         ),
+        ("payload/web/large.html".to_string(), large_web_page(), 0o644),
     ];
     files.sort_by(|left, right| left.0.cmp(&right.0));
     let mut manifest = json!({
@@ -890,6 +891,21 @@ fn web_plugin_bundle(key: &SigningKey, id: &str, ui: bool) -> Vec<u8> {
         manifest["ui"] = json!({"type": "web", "entry": "index.html"});
     }
     signed_package(key, manifest, &files)
+}
+
+/// A page larger than the default stream buffer. Serving it end to end
+/// proves the stream handler chunks its memory body instead of growing the
+/// output buffer to the whole response.
+fn large_web_page() -> Vec<u8> {
+    let mut html = Vec::from(&b"<!doctype html>\n<html><head><title>large</title></head><body>\n"[..]);
+    for line in 0..400 {
+        html.extend_from_slice(
+            format!("<p>row {}: the plugin UI stream stays inside the configured buffer</p>\n", line)
+                .as_bytes(),
+        );
+    }
+    html.extend_from_slice(b"</body></html>\n");
+    html
 }
 
 /// A web UI plugin whose agent emits a notification before every response.
@@ -1219,6 +1235,30 @@ fn web_ui_sandbox(key_byte: u8) -> (Sandbox, String) {
     )
     .expect("trust key");
     let package = web_plugin_bundle(&key, "demo", true);
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let installed = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(installed.status, 200, "{}", installed.body);
+    (sandbox, address)
+}
+
+/// Like `web_ui_sandbox`, with extra `svcd.conf` keys for one test.
+fn web_ui_sandbox_with_conf(key_byte: u8, extra: &str) -> (Sandbox, String) {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[key_byte; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let package = web_plugin_bundle(&key, "demo", true);
+    sandbox.allow_insecure_install_with(extra);
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
     let installed = request(
@@ -3562,6 +3602,19 @@ fn plugin_web_ui_serves_assets_with_base_and_etag() {
     );
     assert_eq!(script.body, b"export const answer = 42;\n");
 
+    // A page larger than the stream buffer is chunked through the bounded
+    // output buffer; the response still arrives complete and with the base tag.
+    let large = raw_request(&address, "GET", &format!("{}large.html", base), "", b"");
+    assert_eq!(large.status, 200);
+    assert!(large.body.len() > 20_000, "{}", large.body.len());
+    let large_html = String::from_utf8_lossy(&large.body);
+    assert!(
+        large_html.starts_with(&format!("<!doctype html>\n<base href=\"{}\">\n", base)),
+        "{}",
+        &large_html[..large_html.len().min(120)]
+    );
+    assert!(large_html.ends_with("</body></html>\n"));
+
     // The canonical URL has a trailing slash so relative assets resolve.
     let no_slash = raw_request(&address, "GET", base.trim_end_matches('/'), "", b"");
     assert_eq!(no_slash.status, 308);
@@ -3605,6 +3658,37 @@ fn plugin_web_ui_serves_assets_with_base_and_etag() {
     let post = raw_request(&address, "POST", &base, "", b"");
     assert_eq!(post.status, 405);
     assert_eq!(raw_header_values(&post, "allow"), vec!["GET"]);
+}
+
+#[test]
+fn plugin_ui_assets_do_not_consume_the_long_lived_stream_cap() {
+    // One long-lived stream is the whole cap; a browser page still loads all
+    // of its assets because one-shot responses are exempt from max_streams.
+    let (_sandbox, address) = web_ui_sandbox_with_conf(57, "max_streams = 1\n");
+    let base = plugin_ui_base(&address, "demo");
+
+    let mut handles = Vec::new();
+    for index in 0..16 {
+        let address = address.clone();
+        let base = base.clone();
+        handles.push(std::thread::spawn(move || {
+            let path = match index % 3 {
+                0 => base.clone(),
+                1 => format!("{}app.js", base),
+                _ => format!("{}large.html", base),
+            };
+            let response = raw_request(&address, "GET", &path, "", b"");
+            assert_eq!(response.status, 200, "{path}");
+            assert!(!response.body.is_empty(), "{path} returned no body");
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("asset request thread");
+    }
+
+    // The cap did not leak after the burst.
+    let page = raw_request(&address, "GET", &base, "", b"");
+    assert_eq!(page.status, 200);
 }
 
 fn plugin_ui_base(address: &str, id: &str) -> String {
@@ -4478,6 +4562,31 @@ fn unix_idle_thread_count_has_no_per_request_or_per_stream_threads() {
         stable_thread_count(pid),
         idle,
         "8 open SSE streams must not add one daemon thread each"
+    );
+
+    // A browser page load is many static assets. Serving them on the server
+    // loop must not create one daemon thread per asset.
+    let mut assets = Vec::new();
+    for _ in 0..16 {
+        let address = address.clone();
+        let page = base.clone();
+        assets.push(std::thread::spawn(move || {
+            let response = raw_request(&address, "GET", &page, "", b"");
+            assert_eq!(
+                response.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&response.body)
+            );
+        }));
+    }
+    for asset in assets {
+        asset.join().expect("plugin UI asset request");
+    }
+    assert_eq!(
+        stable_thread_count(pid),
+        idle,
+        "a page load's static assets must not add one daemon thread each"
     );
 
     drop(streams);
