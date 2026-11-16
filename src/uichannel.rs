@@ -483,8 +483,30 @@ pub fn serve_ws(
 
         match frame.opcode {
             0x1 | 0x2 => {
+                let limits = crate::limits::current();
                 if frame.opcode == 0x2 {
-                    let _ = close_frame(stream, 1003, "text frames only");
+                    if !limits.ws_raw_enabled {
+                        let _ = close_frame(stream, 1003, "binary frames are disabled");
+                        break;
+                    }
+                    if frame.payload.len() > limits.ws_raw_max_bytes {
+                        let _ = close_frame(stream, 1009, "raw message too large");
+                        break;
+                    }
+                    if fragment_opcode.is_some() {
+                        let _ = close_frame(stream, 1002, "interleaved data frame");
+                        break;
+                    }
+                    if !frame.fin {
+                        fragment = frame.payload;
+                        fragment_opcode = Some(0x2);
+                    } else if write_frame(stream, 0x2, &frame.payload).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                if frame.payload.len() > limits.ws_max_message_bytes {
+                    let _ = close_frame(stream, 1009, "message too large");
                     break;
                 }
                 if fragment_opcode.is_some() {
@@ -504,14 +526,24 @@ pub fn serve_ws(
                     break;
                 }
                 fragment.extend_from_slice(&frame.payload);
-                if fragment.len() > MAX_MESSAGE {
+                let raw = fragment_opcode == Some(0x2);
+                let limit = if raw {
+                    crate::limits::current().ws_raw_max_bytes
+                } else {
+                    crate::limits::current().ws_max_message_bytes
+                };
+                if fragment.len() > limit {
                     let _ = close_frame(stream, 1009, "message too large");
                     break;
                 }
                 if frame.fin {
                     let payload = std::mem::take(&mut fragment);
                     fragment_opcode = None;
-                    if !handle_text(stream, config, plugin, &payload) {
+                    if raw {
+                        if write_frame(stream, 0x2, &payload).is_err() {
+                            break;
+                        }
+                    } else if !handle_text(stream, config, plugin, &payload) {
                         break;
                     }
                 }

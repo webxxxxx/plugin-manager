@@ -74,6 +74,12 @@ bind = 127.0.0.1:8787
 #   http_idle_timeout_secs 30         60          120
 #   max_package_bytes      8388608    67108864    536870912
 #   transfer_timeout_secs  120        120         120
+#   ws_max_message_bytes   1048576    1048576     1048576
+#   ws_inflight_bytes      2097152    8388608     67108864
+#   ws_inflight_requests   4          16          64
+#   ws_buffer_shrink_bytes 65536      65536       65536
+#   ws_raw_enabled         on         on          on
+#   ws_raw_max_bytes       1048576    1048576     1048576
 #
 # Explicit values below override the MEM_LEVEL defaults. They are clamped to a
 # safe range; changing them requires a daemon restart.
@@ -96,6 +102,12 @@ bind = 127.0.0.1:8787
 # http_idle_timeout_secs = 30
 # max_package_bytes = 8388608
 # transfer_timeout_secs = 120
+# ws_max_message_bytes = 1048576
+# ws_inflight_bytes = 2097152
+# ws_inflight_requests = 4
+# ws_buffer_shrink_bytes = 65536
+# ws_raw_enabled = on
+# ws_raw_max_bytes = 1048576
 
 # Absolute paths (the generated default uses the platform locations):
 # Linux:

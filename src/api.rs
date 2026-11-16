@@ -232,6 +232,7 @@ struct WsState {
     fragment_opcode: Option<u8>,
     pending: bool,
     queued: VecDeque<Vec<u8>>,
+    queued_bytes: usize,
     heartbeat: Instant,
     discard: usize,
     close_after: Option<(u16, String)>,
@@ -348,6 +349,8 @@ fn reactor_loop(mut listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config:
                                 state.pending = false;
                                 if let Some(payload) = state.queued.pop_front() {
                                     state.pending = true;
+                                    state.queued_bytes =
+                                        state.queued_bytes.saturating_sub(payload.len());
                                     queue.push(Work::Ws(WsJob {
                                         connection: result.connection,
                                         plugin: state.plugin.clone(),
@@ -1256,6 +1259,7 @@ fn start_ws(
         fragment_opcode: None,
         pending: false,
         queued: VecDeque::new(),
+        queued_bytes: 0,
         heartbeat: Instant::now(),
         discard: 0,
         close_after: None,
@@ -1354,6 +1358,12 @@ fn drive_ws(connection: &mut Connection, id: u64, queue: &Arc<JobQueue>, readabl
                     return false;
                 };
                 state.buffer.drain(..used);
+                if state.buffer.is_empty() {
+                    let shrink = crate::limits::current().ws_buffer_shrink_bytes;
+                    if state.buffer.capacity() > shrink {
+                        state.buffer.shrink_to(shrink);
+                    }
+                }
                 if !handle_ws_frame(connection, &frame, id, queue) {
                     let _ = flush_ws_out(connection);
                     return false;
@@ -1424,11 +1434,48 @@ fn handle_ws_frame(
     }
     match frame.opcode {
         0x1 | 0x2 => {
+            let limits = crate::limits::current();
             if frame.opcode == 0x2 {
+                if !limits.ws_raw_enabled {
+                    push_ws_frame(
+                        &mut connection.out,
+                        0x8,
+                        &close_payload(1003, "binary frames are disabled"),
+                    );
+                    return false;
+                }
+                if frame.payload.len() > limits.ws_raw_max_bytes {
+                    push_ws_frame(
+                        &mut connection.out,
+                        0x8,
+                        &close_payload(1009, "raw message too large"),
+                    );
+                    return false;
+                }
+                let ConnState::Ws(state) = &mut connection.state else {
+                    return false;
+                };
+                if state.fragment_opcode.is_some() {
+                    push_ws_frame(
+                        &mut connection.out,
+                        0x8,
+                        &close_payload(1002, "interleaved data frame"),
+                    );
+                    return false;
+                }
+                if !frame.fin {
+                    state.fragment = frame.payload.clone();
+                    state.fragment_opcode = Some(0x2);
+                    return true;
+                }
+                push_ws_frame(&mut connection.out, 0x2, &frame.payload);
+                return true;
+            }
+            if frame.payload.len() > limits.ws_max_message_bytes {
                 push_ws_frame(
                     &mut connection.out,
                     0x8,
-                    &close_payload(1003, "text frames only"),
+                    &close_payload(1009, "message too large"),
                 );
                 return false;
             }
@@ -1464,7 +1511,13 @@ fn handle_ws_frame(
                 return false;
             }
             state.fragment.extend_from_slice(&frame.payload);
-            if state.fragment.len() > 1024 * 1024 {
+            let raw = state.fragment_opcode == Some(0x2);
+            let limit = if raw {
+                crate::limits::current().ws_raw_max_bytes
+            } else {
+                crate::limits::current().ws_max_message_bytes
+            };
+            if state.fragment.len() > limit {
                 push_ws_frame(
                     &mut connection.out,
                     0x8,
@@ -1475,7 +1528,11 @@ fn handle_ws_frame(
             if frame.fin {
                 let payload = std::mem::take(&mut state.fragment);
                 state.fragment_opcode = None;
-                queue_ws_payload(connection, id, queue, &payload);
+                if raw {
+                    push_ws_frame(&mut connection.out, 0x2, &payload);
+                } else {
+                    queue_ws_payload(connection, id, queue, &payload);
+                }
             }
             true
         }
@@ -1492,10 +1549,24 @@ fn handle_ws_frame(
 
 #[cfg(unix)]
 fn queue_ws_payload(connection: &mut Connection, id: u64, queue: &Arc<JobQueue>, payload: &[u8]) {
+    let limits = crate::limits::current();
     let ConnState::Ws(state) = &mut connection.state else {
         return;
     };
+    if state.pending
+        && (state.queued.len() >= limits.ws_inflight_requests
+            || state.queued_bytes.saturating_add(payload.len()) > limits.ws_inflight_bytes)
+    {
+        push_ws_frame(
+            &mut connection.out,
+            0x8,
+            &close_payload(1013, "too many in-flight requests"),
+        );
+        state.close_after = Some((1013, "too many in-flight requests".into()));
+        return;
+    }
     if state.pending {
+        state.queued_bytes = state.queued_bytes.saturating_add(payload.len());
         state.queued.push_back(payload.to_vec());
         return;
     }
@@ -1519,6 +1590,10 @@ fn flush_ws_out(connection: &mut Connection) -> bool {
     if connection.out_at >= connection.out.len() {
         connection.out.clear();
         connection.out_at = 0;
+        let shrink = crate::limits::current().ws_buffer_shrink_bytes;
+        if connection.out.capacity() > shrink {
+            connection.out.shrink_to(shrink);
+        }
         return true;
     }
     match connection
@@ -1532,6 +1607,10 @@ fn flush_ws_out(connection: &mut Connection) -> bool {
             if connection.out_at >= connection.out.len() {
                 connection.out.clear();
                 connection.out_at = 0;
+                let shrink = crate::limits::current().ws_buffer_shrink_bytes;
+                if connection.out.capacity() > shrink {
+                    connection.out.shrink_to(shrink);
+                }
             }
             true
         }

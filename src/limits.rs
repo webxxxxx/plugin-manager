@@ -38,6 +38,11 @@ mod defaults {
     pub const LOG_MAX_BYTES: u64 = 64 * 1024;
     pub const LOG_ROTATIONS: usize = 3;
     pub const MAX_PACKAGE_BYTES: u64 = 8 * 1024 * 1024;
+    pub const WS_MAX_MESSAGE: usize = 1024 * 1024;
+    pub const WS_INFLIGHT_BYTES: usize = 2 * 1024 * 1024;
+    pub const WS_INFLIGHT_REQUESTS: usize = 4;
+    pub const WS_BUFFER_SHRINK: usize = 64 * 1024;
+    pub const WS_RAW_MAX: usize = 1024 * 1024;
 }
 
 #[cfg(mem_middle)]
@@ -58,6 +63,11 @@ mod defaults {
     pub const LOG_MAX_BYTES: u64 = 64 * 1024;
     pub const LOG_ROTATIONS: usize = 3;
     pub const MAX_PACKAGE_BYTES: u64 = 64 * 1024 * 1024;
+    pub const WS_MAX_MESSAGE: usize = 1024 * 1024;
+    pub const WS_INFLIGHT_BYTES: usize = 8 * 1024 * 1024;
+    pub const WS_INFLIGHT_REQUESTS: usize = 16;
+    pub const WS_BUFFER_SHRINK: usize = 64 * 1024;
+    pub const WS_RAW_MAX: usize = 1024 * 1024;
 }
 
 #[cfg(mem_high)]
@@ -78,6 +88,11 @@ mod defaults {
     pub const LOG_MAX_BYTES: u64 = 64 * 1024;
     pub const LOG_ROTATIONS: usize = 3;
     pub const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
+    pub const WS_MAX_MESSAGE: usize = 1024 * 1024;
+    pub const WS_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
+    pub const WS_INFLIGHT_REQUESTS: usize = 64;
+    pub const WS_BUFFER_SHRINK: usize = 64 * 1024;
+    pub const WS_RAW_MAX: usize = 1024 * 1024;
 }
 
 pub use defaults::{
@@ -85,7 +100,6 @@ pub use defaults::{
     MAX_JSON_BODY, MAX_PACKAGE_BYTES, MAX_REQUEST_STACK, MAX_STREAMS, MAX_SUBSCRIBERS_PER_PLUGIN,
     MAX_SUBSCRIPTIONS, STREAM_BUFFER,
 };
-
 /// Runtime view of the limits. `svcd.conf` may lower (or, within a sane range,
 /// raise) the compile-time defaults.
 #[derive(Debug, Clone)]
@@ -111,6 +125,15 @@ pub struct Limits {
     pub log_to_file: bool,
     pub max_package_bytes: u64,
     pub transfer_timeout: Duration,
+    pub ws_max_message_bytes: usize,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub ws_inflight_bytes: usize,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub ws_inflight_requests: usize,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub ws_buffer_shrink_bytes: usize,
+    pub ws_raw_enabled: bool,
+    pub ws_raw_max_bytes: usize,
 }
 
 impl Limits {
@@ -193,6 +216,37 @@ impl Limits {
                     .unwrap_or(120)
                     .clamp(10, 3600),
             ),
+            ws_max_message_bytes: clamp_usize(
+                settings.ws_max_message_bytes,
+                defaults::WS_MAX_MESSAGE,
+                1024,
+                16 * 1024 * 1024,
+            ),
+            ws_inflight_bytes: clamp_usize(
+                settings.ws_inflight_bytes,
+                defaults::WS_INFLIGHT_BYTES,
+                64 * 1024,
+                1024 * 1024 * 1024,
+            ),
+            ws_inflight_requests: clamp_usize(
+                settings.ws_inflight_requests,
+                defaults::WS_INFLIGHT_REQUESTS,
+                1,
+                4096,
+            ),
+            ws_buffer_shrink_bytes: clamp_usize(
+                settings.ws_buffer_shrink_bytes,
+                defaults::WS_BUFFER_SHRINK,
+                4 * 1024,
+                16 * 1024 * 1024,
+            ),
+            ws_raw_enabled: settings.ws_raw_enabled.unwrap_or(true),
+            ws_raw_max_bytes: clamp_usize(
+                settings.ws_raw_max_bytes,
+                defaults::WS_RAW_MAX,
+                1024,
+                16 * 1024 * 1024,
+            ),
         }
     }
 }
@@ -216,6 +270,12 @@ struct SettingsView<'a> {
     log_to_file: Option<bool>,
     max_package_bytes: Option<u64>,
     transfer_timeout_secs: Option<u64>,
+    ws_max_message_bytes: Option<usize>,
+    ws_inflight_bytes: Option<usize>,
+    ws_inflight_requests: Option<usize>,
+    ws_buffer_shrink_bytes: Option<usize>,
+    ws_raw_enabled: Option<bool>,
+    ws_raw_max_bytes: Option<usize>,
     #[allow(dead_code)]
     marker: std::marker::PhantomData<&'a ()>,
 }
@@ -241,6 +301,12 @@ impl<'a> SettingsView<'a> {
             log_to_file: settings.log_to_file,
             max_package_bytes: settings.max_package_bytes,
             transfer_timeout_secs: settings.transfer_timeout_secs,
+            ws_max_message_bytes: settings.ws_max_message_bytes,
+            ws_inflight_bytes: settings.ws_inflight_bytes,
+            ws_inflight_requests: settings.ws_inflight_requests,
+            ws_buffer_shrink_bytes: settings.ws_buffer_shrink_bytes,
+            ws_raw_enabled: settings.ws_raw_enabled,
+            ws_raw_max_bytes: settings.ws_raw_max_bytes,
             marker: std::marker::PhantomData,
         }
     }

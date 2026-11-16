@@ -4021,8 +4021,8 @@ fn plugin_ui_websocket_bridges_calls_notifications_and_control_frames() {
     assert_eq!(status, 101, "{head}");
     ws_send(&mut binary, 0x2, b"binary");
     let (opcode, payload) = ws_read(&mut binary);
-    assert_eq!(opcode, 0x8);
-    assert_eq!(u16::from_be_bytes([payload[0], payload[1]]), 1003);
+    assert_eq!(opcode, 0x2);
+    assert_eq!(payload, b"binary");
 }
 
 #[test]

@@ -57,6 +57,12 @@ pub struct Settings {
     pub http_idle_timeout_secs: Option<u64>,
     pub max_package_bytes: Option<u64>,
     pub transfer_timeout_secs: Option<u64>,
+    pub ws_max_message_bytes: Option<usize>,
+    pub ws_inflight_bytes: Option<usize>,
+    pub ws_inflight_requests: Option<usize>,
+    pub ws_buffer_shrink_bytes: Option<usize>,
+    pub ws_raw_enabled: Option<bool>,
+    pub ws_raw_max_bytes: Option<usize>,
     /// Relocated installation root for hosts whose `/usr` is read-only and
     /// whose writable tree is limited (SR6110: only `/etc` persists). When
     /// set, `--install` puts the binary, aliases and `svcd_daemon.sh` here;
@@ -288,6 +294,29 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
             "transfer_timeout_secs" => {
                 settings.transfer_timeout_secs =
                     Some(parse_u64(value, "transfer_timeout_secs", index)?)
+            }
+            "ws_max_message_bytes" => {
+                settings.ws_max_message_bytes =
+                    Some(parse_usize(value, "ws_max_message_bytes", index)?)
+            }
+            "ws_inflight_bytes" => {
+                settings.ws_inflight_bytes = Some(parse_usize(value, "ws_inflight_bytes", index)?)
+            }
+            "ws_inflight_requests" => {
+                settings.ws_inflight_requests =
+                    Some(parse_usize(value, "ws_inflight_requests", index)?)
+            }
+            "ws_buffer_shrink_bytes" => {
+                settings.ws_buffer_shrink_bytes =
+                    Some(parse_usize(value, "ws_buffer_shrink_bytes", index)?)
+            }
+            "ws_raw_enabled" => {
+                settings.ws_raw_enabled = Some(parse_bool(value).ok_or_else(|| {
+                    format!("line {}: invalid ws_raw_enabled {:?}", index + 1, value)
+                })?)
+            }
+            "ws_raw_max_bytes" => {
+                settings.ws_raw_max_bytes = Some(parse_usize(value, "ws_raw_max_bytes", index)?)
             }
             other => return Err(format!("line {}: unknown key {:?}", index + 1, other)),
         }

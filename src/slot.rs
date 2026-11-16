@@ -548,23 +548,13 @@ impl Slot {
                     let _ = child.wait();
                     return Err(error.to_string());
                 }
-            } else if let Err(error) = spawn_log_threads(
-                &self.id,
-                stdout,
-                stderr,
-                log.clone(),
-            ) {
+            } else if let Err(error) = spawn_log_threads(&self.id, stdout, stderr, log.clone()) {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(error.to_string());
             }
             #[cfg(not(unix))]
-            if let Err(error) = spawn_log_threads(
-                &self.id,
-                stdout,
-                stderr,
-                log.clone(),
-            ) {
+            if let Err(error) = spawn_log_threads(&self.id, stdout, stderr, log.clone()) {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(error.to_string());
