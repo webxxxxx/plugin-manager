@@ -63,6 +63,7 @@ pub struct Settings {
     pub ws_buffer_shrink_bytes: Option<usize>,
     pub ws_raw_enabled: Option<bool>,
     pub ws_raw_max_bytes: Option<usize>,
+    pub ws_raw_queue: Option<usize>,
     /// Relocated installation root for hosts whose `/usr` is read-only and
     /// whose writable tree is limited (SR6110: only `/etc` persists). When
     /// set, `--install` puts the binary, aliases and `svcd_daemon.sh` here;
@@ -317,6 +318,9 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
             }
             "ws_raw_max_bytes" => {
                 settings.ws_raw_max_bytes = Some(parse_usize(value, "ws_raw_max_bytes", index)?)
+            }
+            "ws_raw_queue" => {
+                settings.ws_raw_queue = Some(parse_usize(value, "ws_raw_queue", index)?)
             }
             other => return Err(format!("line {}: unknown key {:?}", index + 1, other)),
         }

@@ -42,6 +42,7 @@ pub(crate) struct Slot {
     wake: Option<Arc<Wake>>,
     #[cfg(unix)]
     reactor: Option<Arc<crate::reactor::Reactor>>,
+    raw_hub: Option<Arc<crate::rawhub::RawHub>>,
     log: Option<Arc<Mutex<LogSink>>>,
     /// Plugins must keep stdout protocol-only; core scripts may still print
     /// human-readable output, which is logged for diagnosis.
@@ -110,6 +111,7 @@ impl Slot {
             wake: None,
             #[cfg(unix)]
             reactor: None,
+            raw_hub: None,
             log: None,
             protocol_only: false,
             pending: BTreeMap::new(),
@@ -222,6 +224,10 @@ impl Slot {
     #[cfg(unix)]
     pub(crate) fn set_reactor(&mut self, reactor: Option<Arc<crate::reactor::Reactor>>) {
         self.reactor = reactor;
+    }
+
+    pub(crate) fn set_raw_hub(&mut self, hub: Option<Arc<crate::rawhub::RawHub>>) {
+        self.raw_hub = hub;
     }
 
     /// Start the stop hook before the state machine begins stopping. The hook
@@ -407,7 +413,11 @@ impl Slot {
             }
             Ready::Exec => {
                 command
-                    .stdin(Stdio::null())
+                    .stdin(if self.protocol == 3 {
+                        Stdio::piped()
+                    } else {
+                        Stdio::null()
+                    })
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
             }
@@ -538,6 +548,35 @@ impl Slot {
                     return Err("piped stderr is missing".into());
                 }
             };
+
+            if self.protocol == 3 {
+                let Some(stdin) = child.stdin.take() else {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("piped stdin is missing".into());
+                };
+                let Some(hub) = self.raw_hub.clone() else {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("raw transport is unavailable".into());
+                };
+                if let Err(error) = hub.register(self.id.clone(), stdin, stdout) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+                if let Err(error) = spawn_stderr_log(&self.id, stderr, log.clone()) {
+                    hub.unregister(&self.id);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error.to_string());
+                }
+                self.stdin = None;
+                self.frames = None;
+                self.child = Some(child);
+                self.adopted = false;
+                return Ok(pid);
+            }
 
             #[cfg(unix)]
             if let Some(reactor) = self.reactor.clone() {
@@ -1109,6 +1148,9 @@ impl Slot {
         if let Some(reactor) = &self.reactor {
             reactor.unregister(&self.id);
         }
+        if let Some(hub) = &self.raw_hub {
+            hub.unregister(&self.id);
+        }
         self.child = None;
         self.adopted = false;
         self.cleanup_then_spawn = false;
@@ -1244,6 +1286,25 @@ fn log_line(log: &Option<Arc<Mutex<LogSink>>>, line: &str) {
             let _ = sink.line(line);
         }
     }
+}
+
+/// Protocol-3 raw plugins keep stdout for the raw bridge; stderr is still
+/// collected into the service log.
+fn spawn_stderr_log(
+    id: &str,
+    stderr: ChildStderr,
+    log: Option<Arc<Mutex<LogSink>>>,
+) -> std::io::Result<()> {
+    thread::Builder::new()
+        .name(format!("svcd-{}-stderr", id))
+        .stack_size(threads::io_stack())
+        .spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                log_line(&log, &line);
+            }
+        })?;
+    Ok(())
 }
 
 /// Fallback used on Windows and whenever the reactor is unavailable.

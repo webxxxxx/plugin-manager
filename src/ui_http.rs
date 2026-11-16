@@ -30,7 +30,7 @@ pub fn route(head: &http::Head) -> Option<Route<'_>> {
         .map(|(path, _)| path)
         .unwrap_or(head.path.as_str());
     let ui = api::ui_path(path)?;
-    if ui.slashless || matches!(ui.sub, "rpc" | "events" | "ws") {
+    if ui.slashless || matches!(ui.sub, "rpc" | "events" | "ws" | "raw") {
         return None;
     }
     Some(Route { path, ui })

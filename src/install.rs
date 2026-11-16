@@ -276,6 +276,7 @@ fn default_conf_text(layout: &Layout) -> String {
          # ws_buffer_shrink_bytes = 65536\n\
          # ws_raw_enabled = on\n\
          # ws_raw_max_bytes = 1048576\n\
+         # ws_raw_queue = 16 / 64 / 128\n\
          # Set the web/API password with: svc auth passwd <password>\n\
          # auth_passwd = pbkdf2-sha256$...\n",
         layout.config_dir.display(),

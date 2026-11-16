@@ -96,7 +96,7 @@ fn resolve_bind(env: Option<&str>, configured: Option<SocketAddr>) -> SocketAddr
         .unwrap_or_else(default_bind)
 }
 
-pub fn spawn(config: PathBuf) -> std::io::Result<Arc<Api>> {
+pub fn spawn(config: PathBuf, raw_hub: Arc<crate::rawhub::RawHub>) -> std::io::Result<Arc<Api>> {
     let configured = settings::current().ok().and_then(|settings| settings.bind);
     let requested = resolve_bind(std::env::var("SVCD_BIND").ok().as_deref(), configured);
     let password_hash = settings::current()
@@ -135,12 +135,15 @@ pub fn spawn(config: PathBuf) -> std::io::Result<Arc<Api>> {
     thread::Builder::new()
         .name("svcd-http-reactor".into())
         .stack_size(threads::io_stack())
-        .spawn(move || reactor_loop(Some(listener), lan, config))?;
+        .spawn(move || reactor_loop(Some(listener), lan, config, raw_hub))?;
     #[cfg(not(unix))]
-    thread::Builder::new()
-        .name("svcd-http".into())
-        .stack_size(threads::io_stack())
-        .spawn(move || listener_loop(Some(listener), lan, config))?;
+    {
+        let _ = raw_hub;
+        thread::Builder::new()
+            .name("svcd-http".into())
+            .stack_size(threads::io_stack())
+            .spawn(move || listener_loop(Some(listener), lan, config))?;
+    }
     Ok(api)
 }
 
@@ -239,12 +242,22 @@ struct WsState {
 }
 
 #[cfg(unix)]
+struct RawWsState {
+    subscription: crate::rawhub::RawSubscription,
+    buffer: Vec<u8>,
+    fragment: Vec<u8>,
+    fragment_opcode: Option<u8>,
+    heartbeat: Instant,
+}
+
+#[cfg(unix)]
 enum ConnState {
     Reading,
     Processing,
     Writing,
     Sse(SseState),
     Ws(WsState),
+    RawWs(RawWsState),
     McpSse(McpSseState),
 }
 
@@ -282,7 +295,12 @@ enum PendingFraming {
 }
 
 #[cfg(unix)]
-fn reactor_loop(mut listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config: PathBuf) {
+fn reactor_loop(
+    mut listener: Option<TcpListener>,
+    lan: Arc<Mutex<Lan>>,
+    config: PathBuf,
+    raw_hub: Arc<crate::rawhub::RawHub>,
+) {
     if let Some(active) = &listener {
         let _ = active.set_nonblocking(true);
     }
@@ -364,6 +382,39 @@ fn reactor_loop(mut listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config:
             }
         }
 
+        for connection in connections.values_mut() {
+            let ConnState::RawWs(state) = &mut connection.state else {
+                continue;
+            };
+            let mut closed = false;
+            loop {
+                match state.subscription.try_recv() {
+                    Ok(crate::rawhub::RawEvent::Frame(payload)) => {
+                        push_ws_frame(&mut connection.out, 0x2, &payload);
+                    }
+                    Ok(crate::rawhub::RawEvent::Closed) => {
+                        closed = true;
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        closed = true;
+                        break;
+                    }
+                }
+            }
+            if closed {
+                push_ws_frame(&mut connection.out, 0x8, &close_payload(1000, "raw closed"));
+                connection.keep_alive = false;
+                connection.state = ConnState::Writing;
+                continue;
+            }
+            if state.heartbeat.elapsed() >= Duration::from_secs(30) {
+                push_ws_frame(&mut connection.out, 0x9, b"");
+                state.heartbeat = Instant::now();
+            }
+        }
+
         let mut descriptors: Vec<libc::pollfd> = Vec::with_capacity(connections.len() + 2);
         let mut keys: Vec<u64> = Vec::with_capacity(connections.len() + 2);
         descriptors.push(libc::pollfd {
@@ -389,6 +440,7 @@ fn reactor_loop(mut listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config:
                 ConnState::Writing => events |= libc::POLLOUT,
                 ConnState::Sse(_) => events |= libc::POLLIN,
                 ConnState::Ws(_) => events |= libc::POLLIN,
+                ConnState::RawWs(_) => events |= libc::POLLIN,
                 ConnState::McpSse(_) => events |= libc::POLLIN,
                 ConnState::Processing => {}
             }
@@ -662,6 +714,20 @@ fn reactor_loop(mut listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config:
                                             }
                                             break;
                                         }
+                                        if kind == "raw" {
+                                            match prepare_raw_ws(&request, &lan, &raw_hub) {
+                                                Ok((_plugin, accept, subscription)) => {
+                                                    start_raw_ws(connection, accept, subscription);
+                                                }
+                                                Err(response) => {
+                                                    connection.out = response;
+                                                    connection.out_at = 0;
+                                                    connection.keep_alive = false;
+                                                    connection.state = ConnState::Writing;
+                                                }
+                                            }
+                                            break;
+                                        }
                                         match prepare_ws(&request, &lan) {
                                             Ok((plugin, accept, receiver, subscription)) => {
                                                 start_ws(
@@ -764,6 +830,13 @@ fn reactor_loop(mut listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config:
             if matches!(connection.state, ConnState::Ws(_)) {
                 let readable = revents & libc::POLLIN != 0;
                 if !drive_ws(connection, id, &queue, readable) {
+                    connections.remove(&id);
+                }
+                continue;
+            }
+            if matches!(connection.state, ConnState::RawWs(_)) {
+                let readable = revents & libc::POLLIN != 0;
+                if !drive_raw_ws(connection, id, &queue, readable) {
                     connections.remove(&id);
                 }
                 continue;
@@ -928,6 +1001,7 @@ fn ui_stream_kind(path: &str) -> Option<&'static str> {
     match ui.sub {
         "events" => Some("events"),
         "ws" => Some("ws"),
+        "raw" => Some("raw"),
         _ => None,
     }
 }
@@ -1233,6 +1307,104 @@ fn prepare_ws(
 }
 
 #[cfg(unix)]
+fn prepare_raw_ws(
+    request: &HttpRequest,
+    lan: &Arc<Mutex<Lan>>,
+    raw_hub: &Arc<crate::rawhub::RawHub>,
+) -> Result<(String, String, crate::rawhub::RawSubscription), Vec<u8>> {
+    let path = request
+        .path
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(request.path.as_str());
+    let ui = ui_path(path).ok_or_else(|| error(404, "not_found", "unknown plugin UI"))?;
+    if ui.sub != "raw" {
+        return Err(error(404, "not_found", "unknown plugin UI"));
+    }
+    if request.method != "GET" {
+        return Err(method_not_allowed("GET"));
+    }
+    let auth = if let Ok(mut state) = lan.lock() {
+        state
+            .authenticate(&request.headers)
+            .map_err(|_| error(401, "unauthorized", "authentication required"))?
+    } else {
+        return Err(error(500, "internal", "LAN state unavailable"));
+    };
+    if !package::valid_name(ui.id) {
+        return Err(error(404, "not_found", "unknown plugin UI"));
+    }
+    if !crate::limits::current().ws_raw_enabled {
+        return Err(error(403, "forbidden", "raw transport is disabled"));
+    }
+    if !token_valid(lan, ui.token, ui.id) {
+        return Err(error(
+            401,
+            "unauthorized",
+            "invalid or expired plugin token",
+        ));
+    }
+    let origin = request_header(request, "origin");
+    if origin.is_some() && !http::same_origin(&request.headers) {
+        return Err(error(
+            403,
+            "forbidden",
+            "cross-origin calls are not allowed",
+        ));
+    }
+    if auth == AuthKind::Cookie && origin.is_none() {
+        return Err(error(
+            403,
+            "forbidden",
+            "Origin is required for cookie-authenticated calls",
+        ));
+    }
+    let accept = uichannel::ws_accept(&request.headers).map_err(|message| {
+        http::response_with_headers(
+            426,
+            "text/plain; charset=utf-8",
+            &[
+                ("Upgrade".to_string(), "websocket".to_string()),
+                ("Sec-WebSocket-Version".to_string(), "13".to_string()),
+            ],
+            message.as_bytes(),
+        )
+    })?;
+    let subscription = raw_hub.subscribe(ui.id).map_err(|message| {
+        error(
+            503,
+            "raw_unavailable",
+            &format!("raw transport unavailable: {}", message),
+        )
+    })?;
+    Ok((ui.id.to_string(), accept, subscription))
+}
+
+#[cfg(unix)]
+fn start_raw_ws(
+    connection: &mut Connection,
+    accept: String,
+    subscription: crate::rawhub::RawSubscription,
+) {
+    connection.out.extend_from_slice(
+        format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+            accept
+        )
+        .as_bytes(),
+    );
+    connection.out_at = 0;
+    connection.keep_alive = false;
+    connection.state = ConnState::RawWs(RawWsState {
+        subscription,
+        buffer: Vec::new(),
+        fragment: Vec::new(),
+        fragment_opcode: None,
+        heartbeat: Instant::now(),
+    });
+}
+
+#[cfg(unix)]
 fn start_ws(
     connection: &mut Connection,
     plugin: String,
@@ -1400,6 +1572,71 @@ fn drive_ws(connection: &mut Connection, id: u64, queue: &Arc<JobQueue>, readabl
 }
 
 #[cfg(unix)]
+fn drive_raw_ws(
+    connection: &mut Connection,
+    id: u64,
+    queue: &Arc<JobQueue>,
+    readable: bool,
+) -> bool {
+    if readable {
+        let mut chunk = [0u8; 8 * 1024];
+        match connection.stream.read(&mut chunk) {
+            Ok(0) => return false,
+            Ok(read) => {
+                let ConnState::RawWs(state) = &mut connection.state else {
+                    return false;
+                };
+                state.buffer.extend_from_slice(&chunk[..read]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => return false,
+        }
+    }
+    loop {
+        let parsed = {
+            let ConnState::RawWs(state) = &mut connection.state else {
+                return false;
+            };
+            parse_ws_frame(&state.buffer)
+        };
+        match parsed {
+            Ok(None) => break,
+            Ok(Some((frame, used))) => {
+                let ConnState::RawWs(state) = &mut connection.state else {
+                    return false;
+                };
+                state.buffer.drain(..used);
+                if state.buffer.is_empty() {
+                    let shrink = crate::limits::current().ws_buffer_shrink_bytes;
+                    if state.buffer.capacity() > shrink {
+                        state.buffer.shrink_to(shrink);
+                    }
+                }
+                if !handle_ws_frame(connection, &frame, id, queue) {
+                    let _ = flush_ws_out(connection);
+                    return false;
+                }
+            }
+            Err(WsParseError::TooLarge { .. }) => {
+                push_ws_frame(
+                    &mut connection.out,
+                    0x8,
+                    &close_payload(1009, "message too large"),
+                );
+                let _ = flush_ws_out(connection);
+                return false;
+            }
+            Err(WsParseError::Protocol(reason)) => {
+                push_ws_frame(&mut connection.out, 0x8, &close_payload(1002, reason));
+                let _ = flush_ws_out(connection);
+                return false;
+            }
+        }
+    }
+    flush_ws_out(connection)
+}
+
+#[cfg(unix)]
 fn handle_ws_frame(
     connection: &mut Connection,
     frame: &WsFrame,
@@ -1427,6 +1664,89 @@ fn handle_ws_frame(
                     &mut connection.out,
                     0x8,
                     &close_payload(1002, "unknown control frame"),
+                );
+                return false;
+            }
+        }
+    }
+    if matches!(connection.state, ConnState::RawWs(_)) {
+        let limits = crate::limits::current();
+        match frame.opcode {
+            0x2 => {
+                if frame.payload.len() > limits.ws_raw_max_bytes {
+                    push_ws_frame(
+                        &mut connection.out,
+                        0x8,
+                        &close_payload(1009, "raw message too large"),
+                    );
+                    return false;
+                }
+                let ConnState::RawWs(state) = &mut connection.state else {
+                    return false;
+                };
+                if state.fragment_opcode.is_some() {
+                    push_ws_frame(
+                        &mut connection.out,
+                        0x8,
+                        &close_payload(1002, "interleaved data frame"),
+                    );
+                    return false;
+                }
+                if !frame.fin {
+                    state.fragment = frame.payload.clone();
+                    state.fragment_opcode = Some(0x2);
+                    return true;
+                }
+                if let Err(error) = state.subscription.send(&frame.payload) {
+                    push_ws_frame(&mut connection.out, 0x8, &close_payload(1013, &error));
+                    return false;
+                }
+                return true;
+            }
+            0x1 => {
+                push_ws_frame(
+                    &mut connection.out,
+                    0x8,
+                    &close_payload(1003, "raw transport accepts binary frames only"),
+                );
+                return false;
+            }
+            0x0 => {
+                let ConnState::RawWs(state) = &mut connection.state else {
+                    return false;
+                };
+                if state.fragment_opcode != Some(0x2) {
+                    push_ws_frame(
+                        &mut connection.out,
+                        0x8,
+                        &close_payload(1002, "unexpected continuation"),
+                    );
+                    return false;
+                }
+                state.fragment.extend_from_slice(&frame.payload);
+                if state.fragment.len() > limits.ws_raw_max_bytes {
+                    push_ws_frame(
+                        &mut connection.out,
+                        0x8,
+                        &close_payload(1009, "raw message too large"),
+                    );
+                    return false;
+                }
+                if frame.fin {
+                    let payload = std::mem::take(&mut state.fragment);
+                    state.fragment_opcode = None;
+                    if let Err(error) = state.subscription.send(&payload) {
+                        push_ws_frame(&mut connection.out, 0x8, &close_payload(1013, &error));
+                        return false;
+                    }
+                }
+                return true;
+            }
+            _ => {
+                push_ws_frame(
+                    &mut connection.out,
+                    0x8,
+                    &close_payload(1002, "unknown raw frame"),
                 );
                 return false;
             }

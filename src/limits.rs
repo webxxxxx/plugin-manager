@@ -100,6 +100,8 @@ pub use defaults::{
     MAX_JSON_BODY, MAX_PACKAGE_BYTES, MAX_REQUEST_STACK, MAX_STREAMS, MAX_SUBSCRIBERS_PER_PLUGIN,
     MAX_SUBSCRIPTIONS, STREAM_BUFFER,
 };
+
+pub const WS_RAW_QUEUE: usize = 128;
 /// Runtime view of the limits. `svcd.conf` may lower (or, within a sane range,
 /// raise) the compile-time defaults.
 #[derive(Debug, Clone)]
@@ -134,6 +136,7 @@ pub struct Limits {
     pub ws_buffer_shrink_bytes: usize,
     pub ws_raw_enabled: bool,
     pub ws_raw_max_bytes: usize,
+    pub ws_raw_queue: usize,
 }
 
 impl Limits {
@@ -247,6 +250,7 @@ impl Limits {
                 1024,
                 16 * 1024 * 1024,
             ),
+            ws_raw_queue: clamp_usize(settings.ws_raw_queue, WS_RAW_QUEUE, 4, 4096),
         }
     }
 }
@@ -276,6 +280,7 @@ struct SettingsView<'a> {
     ws_buffer_shrink_bytes: Option<usize>,
     ws_raw_enabled: Option<bool>,
     ws_raw_max_bytes: Option<usize>,
+    ws_raw_queue: Option<usize>,
     #[allow(dead_code)]
     marker: std::marker::PhantomData<&'a ()>,
 }
@@ -307,6 +312,7 @@ impl<'a> SettingsView<'a> {
             ws_buffer_shrink_bytes: settings.ws_buffer_shrink_bytes,
             ws_raw_enabled: settings.ws_raw_enabled,
             ws_raw_max_bytes: settings.ws_raw_max_bytes,
+            ws_raw_queue: settings.ws_raw_queue,
             marker: std::marker::PhantomData,
         }
     }

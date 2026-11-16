@@ -133,7 +133,14 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         return 1;
     }
     #[cfg(feature = "http")]
-    let api = match api::spawn(config.clone()) {
+    let raw_hub = crate::rawhub::RawHub::new(
+        crate::limits::current().ws_raw_max_bytes,
+        crate::limits::current().ws_inflight_bytes,
+        crate::limits::current().ws_inflight_requests,
+        crate::limits::current().ws_raw_queue,
+    );
+    #[cfg(feature = "http")]
+    let api = match api::spawn(config.clone(), raw_hub.clone()) {
         Ok(api) => Some(api),
         Err(error) => {
             log::svcd(&format!("svcd: HTTP API disabled: {}", error));
@@ -141,10 +148,18 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         }
     };
     #[cfg(not(feature = "http"))]
+    let raw_hub = crate::rawhub::RawHub::new(
+        crate::limits::current().ws_raw_max_bytes,
+        crate::limits::current().ws_inflight_bytes,
+        crate::limits::current().ws_inflight_requests,
+        crate::limits::current().ws_raw_queue,
+    );
+    #[cfg(not(feature = "http"))]
     let api: Option<Arc<Api>> = None;
     notify_systemd("READY=1");
 
-    let mut daemon = Daemon::new(loaded.registry, token, rx, api);
+    let mut daemon = Daemon::new_with_raw(loaded.registry, token, rx, api, raw_hub.clone());
+    daemon.set_raw_hub(raw_hub);
     daemon.set_wake(wake);
     #[cfg(unix)]
     {
@@ -350,6 +365,7 @@ struct Daemon {
     next_rescan_ms: u64,
     #[cfg(unix)]
     reactor: Option<Arc<Reactor>>,
+    raw_hub: Arc<crate::rawhub::RawHub>,
 }
 
 impl Daemon {
@@ -358,6 +374,28 @@ impl Daemon {
         token: String,
         rx: Receiver<channel::PendingCall>,
         api: Option<Arc<Api>>,
+    ) -> Self {
+        let limits = crate::limits::current();
+        Self::new_with_raw(
+            registry,
+            token,
+            rx,
+            api,
+            crate::rawhub::RawHub::new(
+                limits.ws_raw_max_bytes,
+                limits.ws_inflight_bytes,
+                limits.ws_inflight_requests,
+                limits.ws_raw_queue,
+            ),
+        )
+    }
+
+    fn new_with_raw(
+        registry: Registry,
+        token: String,
+        rx: Receiver<channel::PendingCall>,
+        api: Option<Arc<Api>>,
+        raw_hub: Arc<crate::rawhub::RawHub>,
     ) -> Self {
         let wake = Arc::new(Wake::new());
         let rescan_interval_ms: u64 = std::env::var("SVCD_RESCAN_INTERVAL_MS")
@@ -400,6 +438,7 @@ impl Daemon {
             next_rescan_ms: rescan_interval_ms,
             #[cfg(unix)]
             reactor: None,
+            raw_hub,
         }
     }
 
@@ -604,6 +643,13 @@ impl Daemon {
         self.reactor = reactor.clone();
         for slot in self.slots.values_mut() {
             slot.set_reactor(reactor.clone());
+        }
+    }
+
+    fn set_raw_hub(&mut self, raw_hub: Arc<crate::rawhub::RawHub>) {
+        self.raw_hub = raw_hub;
+        for slot in self.slots.values_mut() {
+            slot.set_raw_hub(Some(self.raw_hub.clone()));
         }
     }
 
@@ -1165,6 +1211,7 @@ impl Daemon {
                         slot.set_wake(self.wake.clone());
                         #[cfg(unix)]
                         slot.set_reactor(self.reactor.clone());
+                        slot.set_raw_hub(Some(self.raw_hub.clone()));
                         self.slots.insert(id.clone(), slot);
                     }
                     self.registry.insert(service)?;
@@ -1433,6 +1480,7 @@ impl Daemon {
                 slot.set_wake(self.wake.clone());
                 #[cfg(unix)]
                 slot.set_reactor(self.reactor.clone());
+                slot.set_raw_hub(Some(self.raw_hub.clone()));
                 self.slots.insert(id.clone(), slot);
             }
         }
@@ -1538,6 +1586,7 @@ impl Daemon {
                 slot.set_wake(self.wake.clone());
                 #[cfg(unix)]
                 slot.set_reactor(self.reactor.clone());
+                slot.set_raw_hub(Some(self.raw_hub.clone()));
                 self.slots.insert(id.clone(), slot);
             }
         }

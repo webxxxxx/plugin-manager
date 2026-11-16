@@ -35,6 +35,7 @@ mod paths;
 mod plugin;
 mod plugin_cli;
 mod proc;
+mod rawhub;
 #[cfg(unix)]
 mod reactor;
 mod registry;

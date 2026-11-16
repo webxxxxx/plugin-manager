@@ -80,6 +80,7 @@ bind = 127.0.0.1:8787
 #   ws_buffer_shrink_bytes 65536      65536       65536
 #   ws_raw_enabled         on         on          on
 #   ws_raw_max_bytes       1048576    1048576     1048576
+#   ws_raw_queue           16         64          128
 #
 # Explicit values below override the MEM_LEVEL defaults. They are clamped to a
 # safe range; changing them requires a daemon restart.
@@ -108,6 +109,7 @@ bind = 127.0.0.1:8787
 # ws_buffer_shrink_bytes = 65536
 # ws_raw_enabled = on
 # ws_raw_max_bytes = 1048576
+# ws_raw_queue = 16
 
 # Absolute paths (the generated default uses the platform locations):
 # Linux:

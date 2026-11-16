@@ -25,7 +25,7 @@ pub(crate) const MAX_FILES: usize = 4096;
 /// Highest manifest schema this daemon understands.
 pub const MAX_SCHEMA: u32 = 3;
 /// Highest plugin protocol version this daemon understands.
-pub const MAX_PROTOCOL: u32 = 2;
+pub const MAX_PROTOCOL: u32 = 3;
 
 /// Whether a `.spk` must carry a valid manifest signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1825,6 +1825,14 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, String> {
     check_schema(&m)?;
     if m.protocol == 0 || m.protocol > MAX_PROTOCOL {
         return Err(format!("unsupported protocol {}", m.protocol));
+    }
+    if m.protocol == 3 {
+        if m.exec.ready.as_deref() != Some("exec") {
+            return Err("protocol 3 requires exec.ready=exec".into());
+        }
+        if !m.capabilities.is_empty() {
+            return Err("protocol 3 cannot declare JSON-RPC capabilities".into());
+        }
     }
     if !valid_name(&m.name) {
         return Err("invalid service id".into());
