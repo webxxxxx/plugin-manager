@@ -287,32 +287,23 @@ impl LegacyBridge for ServerHandler {
                         "arguments": call.arguments,
                         "progressToken": call.progress_token,
                     });
-                    match self
+                    // A token/connect failure becomes the stream's first
+                    // progress event, so the client still sees the -32603
+                    // channel error instead of an HTTP 500 before the SSE
+                    // headers.
+                    let stream = self
                         .client
-                        .open(&self.config, "registry.call", request, sender)
-                    {
-                        Ok(stream) => {
-                            let cancel = self.client.canceller();
-                            let handler = McpSseStream::new(
-                                receiver,
-                                call.id,
-                                stream,
-                                Box::new(move |id| cancel.cancel(id)),
-                            );
-                            // The slot reserved above becomes the driver's
-                            // `max_streams` permit.
-                            attach_stream(connection, Box::new(handler), &[], Some(permit));
-                        }
-                        Err(error) => write_response(
-                            connection,
-                            http::json_error(
-                                500,
-                                "stream_start_failed",
-                                &format!("cannot start streaming call: {}", error),
-                            ),
-                            false,
-                        ),
-                    }
+                        .open(&self.config, "registry.call", request, sender);
+                    let cancel = self.client.canceller();
+                    let handler = McpSseStream::new(
+                        receiver,
+                        call.id,
+                        stream,
+                        Box::new(move |id| cancel.cancel(id)),
+                    );
+                    // The slot reserved above becomes the driver's
+                    // `max_streams` permit.
+                    attach_stream(connection, Box::new(handler), &[], Some(permit));
                     return;
                 }
                 Ok(None) => {}

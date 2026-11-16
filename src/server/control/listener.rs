@@ -193,9 +193,18 @@ impl ControlServer {
                 }
             }
             if final_frame_seen {
-                // The reply is queued in the output buffer; flush writes it.
+                // Keep the connection for the next request; the reply is
+                // queued in the output buffer and `flush` writes it. A normal
+                // per-call sender drop after the final frame must not close a
+                // reusable CLI connection.
             } else if disconnected {
-                dead.push(*id);
+                // No final frame and no sender: the supervisor is gone. Deliver
+                // whatever progress frames were already collected, then close.
+                if connection.out.is_empty() {
+                    dead.push(*id);
+                } else {
+                    connection.close_after_write = true;
+                }
             } else {
                 connection.pending = Some(receiver);
             }
@@ -327,7 +336,7 @@ fn write_connection(connections: &mut HashMap<u64, Connection>, id: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::time::Instant;
 
     /// Two control connections send different request ids. The reply must go
@@ -515,6 +524,84 @@ mod tests {
         let line = client.join().expect("client");
         let value: serde_json::Value = serde_json::from_str(line.trim()).expect("reply");
         assert_eq!(value["id"], 9, "{line}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A supervisor that disappears after a progress frame but before the final
+    /// response must not drop the collected frame: the loop writes it, then
+    /// closes instead of leaving the client waiting forever.
+    #[test]
+    fn a_sender_that_disappears_without_a_final_frame_flushes_then_closes() {
+        let root = std::env::temp_dir().join(format!(
+            "svcd-control-progress-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("root");
+        let path = root.join("svcd.sock");
+        let listener = UnixListener::bind(&path).expect("listener");
+        let (notify_tx, _notify_rx) = UnixStream::pair().expect("notify");
+        let (tx, rx) = mpsc::sync_channel::<PendingCall>(8);
+        let mut server = ControlServer::new(
+            listener,
+            tx,
+            Arc::new(Wake::new()),
+            Arc::new(notify_tx),
+        )
+        .expect("server");
+
+        let mut client = UnixStream::connect(&path).expect("connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("timeout");
+        server.ready(Source::Listener, libc::POLLIN);
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"registry.call\"}\n")
+            .expect("write");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut call = None;
+        while call.is_none() && Instant::now() < deadline {
+            let mut fds = Vec::new();
+            let mut keys = Vec::new();
+            server.poll_sources(&mut fds, &mut keys);
+            for source in keys {
+                if let Source::Connection(id) = source {
+                    server.ready(Source::Connection(id), libc::POLLIN);
+                }
+            }
+            if let Ok(next) = rx.try_recv() {
+                call = Some(next);
+            }
+        }
+        let call = call.expect("request reached the supervisor");
+        call.reply
+            .send("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}".to_string());
+        drop(call);
+
+        server.drain_replies();
+        assert!(
+            server
+                .connections
+                .values()
+                .any(|connection| connection.close_after_write),
+            "the collected progress frame is queued and the connection closes after it"
+        );
+        server.flush();
+
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("progress frame");
+        assert!(line.contains("notifications/progress"), "{line}");
+        let mut eof = [0u8; 1];
+        assert_eq!(
+            reader.read(&mut eof).expect("eof after progress"),
+            0,
+            "the connection closes after delivering the collected frame"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

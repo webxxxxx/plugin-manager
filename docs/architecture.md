@@ -217,7 +217,7 @@ src/
 
   server/                     L4 服务器：协议会话
     mod.rs
-    control/  listener.rs  session.rs    命令行通道也是服务器
+    control/  listener.rs  client.rs  handle.rs   命令行通道与出站管理流也是服务器（#124）
     http/     contract.rs  dispatch.rs  engine.rs  stream.rs  driver.rs  pool.rs  budget.rs  wire.rs  routes.rs  takeover.rs
     mcp/      session.rs  transport.rs  progress.rs
     auth/     gate.rs  token.rs  session.rs
@@ -355,7 +355,7 @@ flowchart TD
 | `slot.rs` `supervisor.rs` `registry.rs` `runtime.rs` `hook.rs` `script.rs` `definition.rs` | `supervise/` + `kernel/registry.rs` | 注册表类型进内核，运行载体留监督 |
 | `blob.rs` | `platform/storage/`（内容寻址、上传会话、回收） | `$blob` 引用语义归 `kernel/contract` |
 | `ipc.rs` `rpc.rs` `rawhub.rs` `reactor.rs` | `wire/contract/` + `wire/message/` | 帧、消息、连接分开 |
-| `channel*.rs` | `wire/control/` + `server/control/` | 字节在线格式，会话在服务器 |
+| `channel.rs` | `wire/control/` + `server/control/` | 字节在线格式与客户端轮次在 wire；控制会话已在 `server/control/`（#124） |
 | `api.rs` | **四块**：`server/http/` + `face/api.rs` + `wire/ws/` + `kernel/failure.rs` | 它今天横跨三层 |
 | `mcp.rs` `mcp_http.rs` `catalog.rs` | `server/mcp/` + `face/mcp_tools.rs` | 传输契约与能力投影分开 |
 | `blob_http.rs` `install_http.rs` `export_http.rs` `ui_http.rs` `webui.rs` | `face/` 下同名词，去掉 `_http` | 只留投影 |
