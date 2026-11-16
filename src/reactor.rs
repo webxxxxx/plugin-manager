@@ -115,6 +115,39 @@ impl Reactor {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "reactor is not running"))
     }
 
+    /// Register an exec-ready service's stdout/stderr as log-only sources.
+    /// These have no protocol channel, but both pipes still belong to the
+    /// reactor so the daemon does not need two OS threads per service.
+    pub fn register_log(
+        &self,
+        id: String,
+        stdout: ChildStdout,
+        stderr: Option<ChildStderr>,
+        log: Option<Arc<Mutex<LogSink>>>,
+    ) -> io::Result<()> {
+        let mut sources = vec![Source {
+            key: id.clone(),
+            file: file(stdout),
+            kind: SourceKind::Log,
+            buffer: Vec::new(),
+            blocked: false,
+            log: log.clone(),
+        }];
+        if let Some(stderr) = stderr {
+            sources.push(Source {
+                key: id,
+                file: file(stderr),
+                kind: SourceKind::Log,
+                buffer: Vec::new(),
+                blocked: false,
+                log,
+            });
+        }
+        self.tx
+            .send(Command::Register(sources))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "reactor is not running"))
+    }
+
     pub fn unregister(&self, id: &str) {
         let _ = self.tx.send(Command::Unregister(id.to_string()));
     }

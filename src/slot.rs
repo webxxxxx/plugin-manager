@@ -539,33 +539,32 @@ impl Slot {
                 }
             };
 
-            let stdout_log = log.clone();
-            if let Err(error) = thread::Builder::new()
-                .name(format!("svcd-{}-stdout", self.id))
-                .stack_size(threads::io_stack())
-                .spawn(move || {
-                    let reader = BufReader::new(stdout);
-                    for line in reader.lines().map_while(Result::ok) {
-                        log_line(&stdout_log, &line);
-                    }
-                })
-            {
+            #[cfg(unix)]
+            if let Some(reactor) = self.reactor.clone() {
+                if let Err(error) =
+                    reactor.register_log(self.id.clone(), stdout, Some(stderr), log.clone())
+                {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error.to_string());
+                }
+            } else if let Err(error) = spawn_log_threads(
+                &self.id,
+                stdout,
+                stderr,
+                log.clone(),
+            ) {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(error.to_string());
             }
-
-            let stderr_log = log.clone();
-            if let Err(error) = thread::Builder::new()
-                .name(format!("svcd-{}-stderr", self.id))
-                .stack_size(threads::io_stack())
-                .spawn(move || {
-                    let reader = BufReader::new(stderr);
-                    for line in reader.lines().map_while(Result::ok) {
-                        log_line(&stderr_log, &line);
-                    }
-                })
-            {
+            #[cfg(not(unix))]
+            if let Err(error) = spawn_log_threads(
+                &self.id,
+                stdout,
+                stderr,
+                log.clone(),
+            ) {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(error.to_string());
@@ -1255,6 +1254,35 @@ fn log_line(log: &Option<Arc<Mutex<LogSink>>>, line: &str) {
             let _ = sink.line(line);
         }
     }
+}
+
+/// Fallback used on Windows and whenever the reactor is unavailable.
+fn spawn_log_threads(
+    id: &str,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    log: Option<Arc<Mutex<LogSink>>>,
+) -> std::io::Result<()> {
+    let stdout_log = log.clone();
+    thread::Builder::new()
+        .name(format!("svcd-{}-stdout", id))
+        .stack_size(threads::io_stack())
+        .spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                log_line(&stdout_log, &line);
+            }
+        })?;
+    thread::Builder::new()
+        .name(format!("svcd-{}-stderr", id))
+        .stack_size(threads::io_stack())
+        .spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                log_line(&log, &line);
+            }
+        })?;
+    Ok(())
 }
 
 /// Fallback used on Windows and whenever the reactor is unavailable.
