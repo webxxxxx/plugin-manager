@@ -4,7 +4,11 @@
 
 pub mod contract;
 pub mod dispatch;
+#[cfg(all(unix, feature = "http"))]
+pub mod driver;
 pub mod engine;
+#[cfg(all(not(unix), feature = "http"))]
+pub mod fallback;
 pub mod stream;
 
 // The S4 contract is deliberately available to the minimal build (parent spec

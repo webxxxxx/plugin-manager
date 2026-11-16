@@ -18,8 +18,9 @@ Accepted。细化 [ADR-0012](0012-protocol-is-server-plus-face.md)；切片见 #
 - **鉴权在服务器完成一次**：服务器把解析后的 principal 放进 `Request`；对外面只做端点策略（MCP bearer-only、插件 token、CSRF 等）。#113 的 `/api/v1/version` 没有额外端点策略。#114 仍沿用旧的每请求 `Lan::authenticate`；把 principal 提前到连接建立是后续 server-loop 工作。
 - **#113 只让 `/api/v1/version` 穿过对外面**；#114 已让 server-loop 接管全部 HTTP 连接，但其余端点仍经有界 legacy bridge 走既有 worker / takeover 路径。没有新增每请求或每流线程；Unix 默认仍为 10 条 daemon 线程，Windows 仍保留每连接线程回退。
 - **请求体策略仍是「带着」而不是「提前用」**：server-loop 在 `pre_request` 里先给插件 UI 路由和 legacy takeover 检查原始 head（上传/安装/导出仍能流式接手），其余请求仍按旧上限收完 body 再交给 face。把其余 face 的 route 决策移到读 body 之前仍待 #116/#117。
-- **#115 的第一个 `Streamed` 路由是插件 UI 静态资源**：`PluginUiFace` 在 `pre_request` 里认领 `GET /plugin-ui/{id}/{token}/...`（`rpc` / `events` / `ws` / `raw` 仍走自己的路径），server 解析一次 principal 后把请求交给 face；face 返回 `PluginUiStream`，server-loop 持有 socket、输出缓冲、transfer deadline 与文件发送。非 HTML 资源通过 `SendFile` 使用内核 `sendfile`（Linux）或 `TransmitFile`（Windows 线程回退的阻塞驱动），因此一次页面加载不再为每个资源起线。鉴权失败仍由 server 呈现：浏览器导航得到 303 登录跳转，API 客户端得到 401。
-- **一次性静态资源不占 `max_streams`**：handler 用 `StreamClass::OneShot` 声明这一点；长连接/传输 handler 默认 `LongLived`。#118 起的传输切片在这里接入 `max_streams` 预算，静态资源保持豁免。
+- **#115 的第一个 `Streamed` 路由是插件 UI 静态资源**：`PluginUiFace` 在 `pre_request` 里认领 `GET /plugin-ui/{id}/{token}/...`（`rpc` / `events` / `ws` / `raw` 仍走自己的路径），server 解析一次 principal 后把请求交给 face；face 返回 `PluginUiStream`，`server/http/driver.rs` 持有输出缓冲、transfer deadline、`max_streams` 槽与文件发送。HTML 只用 4 KiB 前缀定位 doctype，其余部分与其它资源一样通过 `SendFile` 走内核 `sendfile`（Linux）或 `TransmitFile`（Windows 线程回退的阻塞驱动），所以 server-loop 不读整页、一次页面加载也不为每个资源起线。鉴权失败仍由 server 呈现：浏览器导航得到 303 登录跳转，API 客户端得到 401。
+- **一次性静态资源不占 `max_streams`**：handler 用 `StreamClass::OneShot` 声明这一点；长连接/传输 handler 默认 `LongLived`。`server/http/driver.rs` 的 `StreamBudget` 在 attach 时为 `LongLived` 占一个 `max_streams` 槽（满时 503 + `Retry-After: 1`），`OneShot` 完全不进计数；#118 起的传输 handler 复用同一预算，静态资源保持豁免。
+- **#115 的 Windows 回退仍是每连接一线程**：`server/http/fallback.rs` 在连接线程上驱动同一个 handler，socket 与超时都在 server 层；页面加载不会额外产生 per-asset 线程，但也不承诺 Unix 的四线程目标。
 
 ## Consequences
 
