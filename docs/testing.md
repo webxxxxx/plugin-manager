@@ -124,6 +124,8 @@ node tools/perf/run.mjs --perf
 node tools/perf/run.mjs --scale
 ```
 
+线程预算回归（Linux 补充）：`cargo test --test http unix_idle_thread_count_has_no_per_request_or_per_stream_threads -- --exact`。它读 `/proc/<pid>/status` 的 `Threads:`，断言默认 S4 布局的空载基线为 10 条 daemon 线程；16 个 keep-alive 连接与 8 个 SSE 流不得各增加一条线程。改变拓扑的切片（#114/#125）要同步更新 `IDLE_DAEMON_THREADS`。
+
 ## 7. CI 落点
 
 | 工作流 | 触发 | 内容 |

@@ -4347,6 +4347,110 @@ fn http_keep_alive_serves_version_through_the_face() {
 }
 
 // ---------------------------------------------------------------------------
+// S4 thread-budget regression (Linux only).
+//
+// /proc is the practical Unix way to read another process's thread count; the
+// behavior tests stay platform-neutral, so this supplemental check is gated to
+// Linux. The default S4 baseline is ten daemon threads. Keep-alive connections
+// and SSE streams are driven by the reactor, so neither may add a thread each.
+// ---------------------------------------------------------------------------
+
+/// The default S4 topology before the server-loop migration (#114/#125).
+/// Update this pin in the slice that deliberately changes the baseline.
+#[cfg(target_os = "linux")]
+const IDLE_DAEMON_THREADS: usize = 10;
+
+#[cfg(target_os = "linux")]
+fn daemon_threads(pid: u32) -> usize {
+    let status = fs::read_to_string(format!("/proc/{}/status", pid)).expect("daemon status");
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Threads:"))
+        .and_then(|value| value.trim().parse().ok())
+        .expect("daemon status has a Threads line")
+}
+
+#[cfg(target_os = "linux")]
+fn stable_thread_count(pid: u32) -> usize {
+    let mut count = daemon_threads(pid);
+    let mut stable = 0;
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(20));
+        let next = daemon_threads(pid);
+        if next == count {
+            stable += 1;
+            if stable == 5 {
+                return count;
+            }
+        } else {
+            count = next;
+            stable = 0;
+        }
+    }
+    count
+}
+
+#[cfg(target_os = "linux")]
+fn open_keep_alive(address: &str) -> TcpStream {
+    let mut stream = TcpStream::connect(address).expect("keep-alive connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("keep-alive timeout");
+    let request = format!(
+        "GET /api/v1/version HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\n\r\n",
+        address
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("keep-alive request");
+    let response = read_one_response(&mut stream);
+    assert_eq!(response.status, 200, "{}", response.body.len());
+    stream
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn unix_idle_thread_count_has_no_per_request_or_per_stream_threads() {
+    let (sandbox, address) = daemon_with_web_event_plugin(55);
+    let pid = sandbox.daemon.as_ref().expect("running daemon").id();
+
+    let idle = stable_thread_count(pid);
+    assert_eq!(
+        idle, IDLE_DAEMON_THREADS,
+        "idle daemon uses {idle} threads; the default S4 baseline is {IDLE_DAEMON_THREADS}, so this is a thread-budget regression"
+    );
+
+    let mut connections = Vec::new();
+    for _ in 0..16 {
+        connections.push(open_keep_alive(&address));
+    }
+    assert_eq!(
+        stable_thread_count(pid),
+        idle,
+        "16 idle keep-alive connections must not add one daemon thread each"
+    );
+
+    let base = plugin_ui_base(&address, "demo");
+    let mut streams = Vec::new();
+    for _ in 0..8 {
+        streams.push(sse_connect(&address, &format!("{}events", base)));
+    }
+    assert_eq!(
+        stable_thread_count(pid),
+        idle,
+        "8 open SSE streams must not add one daemon thread each"
+    );
+
+    drop(streams);
+    drop(connections);
+    assert_eq!(
+        stable_thread_count(pid),
+        idle,
+        "closing connections and streams must leave no daemon threads behind"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // #108: a live daemon must survive the smallest svcd.conf the parser takes.
 //
 // limits::tests proves the clamp arithmetic for these keys; this proves the
