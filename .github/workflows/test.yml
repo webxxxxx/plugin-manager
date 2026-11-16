@@ -44,3 +44,25 @@ jobs:
         run: |
           node tools/gen_sample_key.mjs
           python3 tools/spk_smoke.py --binary target/debug/svcd
+
+  mem-levels:
+    name: mem-level / ${{ matrix.level }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        level: [low, middle, high]
+    env:
+      MEM_LEVEL: ${{ matrix.level }}
+      CARGO_TARGET_DIR: target/mem-${{ matrix.level }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mem-${{ matrix.level }}
+      - name: Limits tests under ${{ matrix.level }}
+        run: cargo test --bin svcd limits::tests -- --test-threads=1
+      - name: Check the profile compiles
+        run: cargo check --bin svcd

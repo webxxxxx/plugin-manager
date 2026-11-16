@@ -1,0 +1,45 @@
+name: perf
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf
+  cancel-in-progress: true
+
+jobs:
+  perf:
+    name: perf / ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: perf
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build release binary
+        run: cargo build --release
+      - name: Install perf harness dependencies
+        working-directory: tools/perf
+        run: npm ci
+      - name: Run the perf harness
+        run: node tools/perf/run.mjs --perf --out target/perf-results.json
+      - name: Upload the perf report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report
+          path: |
+            target/perf-report.md
+            target/perf-results.json
+            target/perf-run-*/daemon.stderr
+          if-no-files-found: warn

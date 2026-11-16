@@ -201,7 +201,8 @@ impl Limits {
             idle_timeout: Duration::from_secs(
                 settings
                     .idle_timeout_secs
-                    .unwrap_or(defaults::IDLE_TIMEOUT_SECS),
+                    .unwrap_or(defaults::IDLE_TIMEOUT_SECS)
+                    .clamp(1, 3600),
             ),
             log_max_bytes: clamp_u64(
                 settings.log_max_bytes,
@@ -366,6 +367,146 @@ pub fn current() -> &'static Limits {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn limits_with(settings: &settings::Settings) -> Limits {
+        Limits::from_settings(SettingsView::from(settings))
+    }
+
+    #[test]
+    fn idle_timeout_is_clamped() {
+        let mut settings = settings::Settings::default();
+        settings.http_idle_timeout_secs = Some(0);
+        let limits = limits_with(&settings);
+        assert_eq!(limits.idle_timeout, Duration::from_secs(1));
+
+        settings.http_idle_timeout_secs = Some(u64::MAX);
+        let limits = limits_with(&settings);
+        assert_eq!(limits.idle_timeout, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn every_limit_has_a_floor() {
+        let mut settings = settings::Settings::default();
+        settings.request_stack_bytes = Some(0);
+        settings.io_stack_bytes = Some(0);
+        settings.max_body_bytes = Some(0);
+        settings.max_json_body_bytes = Some(0);
+        settings.max_complete_body_bytes = Some(0);
+        settings.max_header_bytes = Some(0);
+        settings.max_streams = Some(0);
+        settings.stream_buffer_bytes = Some(0);
+        settings.max_connections = Some(0);
+        settings.max_connections_per_ip = Some(0);
+        settings.max_subscriptions = Some(0);
+        settings.max_subscribers_per_plugin = Some(0);
+        settings.http_idle_timeout_secs = Some(0);
+        settings.log_max_bytes = Some(0);
+        settings.log_rotations = Some(0);
+        settings.max_package_bytes = Some(0);
+        settings.transfer_timeout_secs = Some(0);
+        settings.default_timeout_ms = Some(0);
+        settings.max_timeout_ms = Some(0);
+        settings.ws_max_message_bytes = Some(0);
+        settings.ws_inflight_bytes = Some(0);
+        settings.ws_inflight_requests = Some(0);
+        settings.ws_buffer_shrink_bytes = Some(0);
+        settings.ws_raw_max_bytes = Some(0);
+        settings.ws_raw_queue = Some(0);
+
+        let limits = limits_with(&settings);
+        assert_eq!(limits.request_stack_bytes, 64 * 1024);
+        assert_eq!(limits.io_stack_bytes, 32 * 1024);
+        assert_eq!(limits.max_body, 64 * 1024);
+        assert_eq!(limits.max_json_body, 4 * 1024);
+        assert_eq!(limits.max_complete_body, 16 * 1024);
+        assert_eq!(limits.max_header, 1024);
+        assert_eq!(limits.max_streams, 1);
+        assert_eq!(limits.stream_buffer, 4 * 1024);
+        assert_eq!(limits.max_connections, 1);
+        assert_eq!(limits.max_connections_per_ip, 1);
+        assert_eq!(limits.max_subscriptions, 0);
+        assert_eq!(limits.max_subscribers_per_plugin, 0);
+        assert_eq!(limits.idle_timeout, Duration::from_secs(1));
+        assert_eq!(limits.log_max_bytes, 4 * 1024);
+        assert_eq!(limits.log_rotations, 1);
+        assert_eq!(limits.max_package_bytes, 1024 * 1024);
+        assert_eq!(limits.transfer_timeout, Duration::from_secs(10));
+        assert_eq!(limits.default_timeout, Duration::from_millis(100));
+        assert_eq!(limits.max_timeout, Duration::from_millis(100));
+        assert_eq!(limits.ws_max_message_bytes, 1024);
+        assert_eq!(limits.ws_inflight_bytes, 64 * 1024);
+        assert_eq!(limits.ws_inflight_requests, 1);
+        assert_eq!(limits.ws_buffer_shrink_bytes, 4 * 1024);
+        assert_eq!(limits.ws_raw_max_bytes, 1024);
+        assert_eq!(limits.ws_raw_queue, 4);
+    }
+
+    #[test]
+    fn every_limit_has_a_ceiling() {
+        let mut settings = settings::Settings::default();
+        settings.request_stack_bytes = Some(usize::MAX);
+        settings.io_stack_bytes = Some(usize::MAX);
+        settings.max_body_bytes = Some(u64::MAX);
+        settings.max_json_body_bytes = Some(u64::MAX);
+        settings.max_complete_body_bytes = Some(u64::MAX);
+        settings.max_header_bytes = Some(usize::MAX);
+        settings.max_streams = Some(usize::MAX);
+        settings.stream_buffer_bytes = Some(usize::MAX);
+        settings.max_connections = Some(usize::MAX);
+        settings.max_connections_per_ip = Some(usize::MAX);
+        settings.max_subscriptions = Some(usize::MAX);
+        settings.max_subscribers_per_plugin = Some(usize::MAX);
+        settings.http_idle_timeout_secs = Some(u64::MAX);
+        settings.log_max_bytes = Some(u64::MAX);
+        settings.log_rotations = Some(usize::MAX);
+        settings.max_package_bytes = Some(u64::MAX);
+        settings.transfer_timeout_secs = Some(u64::MAX);
+        settings.default_timeout_ms = Some(u64::MAX);
+        settings.max_timeout_ms = Some(u64::MAX);
+        settings.ws_max_message_bytes = Some(usize::MAX);
+        settings.ws_inflight_bytes = Some(usize::MAX);
+        settings.ws_inflight_requests = Some(usize::MAX);
+        settings.ws_buffer_shrink_bytes = Some(usize::MAX);
+        settings.ws_raw_max_bytes = Some(usize::MAX);
+        settings.ws_raw_queue = Some(usize::MAX);
+
+        let limits = limits_with(&settings);
+        assert_eq!(limits.request_stack_bytes, 8 * 1024 * 1024);
+        assert_eq!(limits.io_stack_bytes, 4 * 1024 * 1024);
+        assert_eq!(limits.max_body, 1024 * 1024 * 1024);
+        assert_eq!(limits.max_json_body, 64 * 1024 * 1024);
+        assert_eq!(limits.max_complete_body, 128 * 1024 * 1024);
+        assert_eq!(limits.max_header, 1024 * 1024);
+        assert_eq!(limits.max_streams, 1024);
+        assert_eq!(limits.stream_buffer, 1024 * 1024);
+        assert_eq!(limits.max_connections, 4096);
+        assert_eq!(limits.max_connections_per_ip, 1024);
+        assert_eq!(limits.max_subscriptions, 4096);
+        assert_eq!(limits.max_subscribers_per_plugin, 1024);
+        assert_eq!(limits.idle_timeout, Duration::from_secs(3600));
+        assert_eq!(limits.log_max_bytes, 16 * 1024 * 1024);
+        assert_eq!(limits.log_rotations, 10);
+        assert_eq!(limits.max_package_bytes, 1024 * 1024 * 1024);
+        assert_eq!(limits.transfer_timeout, Duration::from_secs(3600));
+        assert_eq!(limits.default_timeout, Duration::from_millis(300_000));
+        assert_eq!(limits.max_timeout, Duration::from_millis(600_000));
+        assert_eq!(limits.ws_max_message_bytes, 16 * 1024 * 1024);
+        assert_eq!(limits.ws_inflight_bytes, 1024 * 1024 * 1024);
+        assert_eq!(limits.ws_inflight_requests, 4096);
+        assert_eq!(limits.ws_buffer_shrink_bytes, 16 * 1024 * 1024);
+        assert_eq!(limits.ws_raw_max_bytes, 16 * 1024 * 1024);
+        assert_eq!(limits.ws_raw_queue, 4096);
+    }
+
+    #[test]
+    fn a_large_default_never_exceeds_the_max_timeout() {
+        let mut settings = settings::Settings::default();
+        settings.default_timeout_ms = Some(300_000);
+        settings.max_timeout_ms = Some(1);
+        let limits = limits_with(&settings);
+        assert_eq!(limits.default_timeout, Duration::from_millis(300_000));
+        assert_eq!(limits.max_timeout, Duration::from_millis(300_000));
+    }
 
     #[test]
     fn defaults_match_the_selected_level() {

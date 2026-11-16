@@ -1,0 +1,124 @@
+# 测试策略
+
+> 架构分层见 [architecture.md](architecture.md)。本文只回答：什么测试放在哪一层、跑在什么时候、失败代表什么。
+
+## 1. 先纠正一个术语
+
+我们常说的「W3C 兼容性」实际横跨四个不同标准组织，不能用一个 W3C 测试套件覆盖：
+
+| 面 | 真正的标准 | 说明 |
+|---|---|---|
+| HTTP/1.1 | IETF RFC 9110（语义）/ RFC 9112（报文） | W3C 不定义 HTTP/1.1 线格式；WPT 是浏览器测试，不是服务器一致性套件 |
+| WebSocket | IETF RFC 6455 | 事实标准套件是 Autobahn TestSuite，不是 W3C |
+| SSE | WHATWG HTML Living Standard §9.2 | 不是 W3C；WPT 的 `eventsource` 测试是浏览器级 |
+| MCP | Model Context Protocol 规范 | 不是 W3C；官方 SDK 是最接近一致性客户端的工具 |
+
+所以目标不是「跑一个 W3C 套件」，而是**按各自规范选对套件/向量，并测到线格式和错误路径**。
+
+## 2. 四层测试
+
+| 层 | 内容 | 什么时候跑 | 工具 |
+|---|---|---|---|
+| L1 单元 / 契约 | 解析、上限、状态机、失败类别、配置夹取 | 每个 PR | `cargo test` |
+| L2 协议兼容 | HTTP/1.1、WebSocket、SSE、MCP 的 framing、handshake、错误码、重连 | 每个 PR（轻量）+ 每晚（完整） | `tools/perf/run.mjs --compat`、Autobahn、官方 SDK |
+| L3 性能 | 延迟分位、吞吐、RSS、线程、插件规模、混合负载 | 每晚 / 手动 | `tools/perf/run.mjs --perf`、`--scale`、soak 脚本 |
+| L4 资源档位 | `MEM_LEVEL=low/middle/high` 的默认值与边界 | 每个 PR（矩阵） | `cargo test --bin svcd limits::tests` |
+
+原则：**L1 必须快且确定；L2 测线格式而不是业务；L3 不进 PR 门槛；L4 必须覆盖三档编译。**
+
+## 3. 协议兼容性：测什么
+
+### 3.1 HTTP/1.1（RFC 9112）
+
+已有 `tests/http.rs` 覆盖 chunked、`Expect: 100-continue`、Range、keep-alive 等；还缺一组「原始 socket 向量」：
+
+- 请求行 / header 的非法字符、obs-fold、重复 `Content-Length`、`Transfer-Encoding` 与 `Content-Length` 冲突；
+- `HEAD` / `204` / `304` 不得带 body；
+- `413` / `414` / `431` 的边界与 `Connection: close`；
+- HTTP/1.0 与 `Connection: keep-alive`、pipelining 的响应顺序。
+
+**不引入 h2spec**：当前实现是 HTTP/1.1，没有 HTTP/2；加 HTTP/2 时再引入。
+
+### 3.2 WebSocket（RFC 6455）
+
+- 握手：`Upgrade`、`Connection`、`Sec-WebSocket-Version: 13`、`Sec-WebSocket-Key`、`Sec-WebSocket-Accept`；
+- 帧：分片、控制帧、ping/pong、close code、掩码、超长消息 1009；
+- **Autobahn TestSuite** 作为完整一致性套件（Docker `crossbario/autobahn-testsuite`），只跑 `wstest` 的 fuzzingclient；
+- 对 `/plugin-ui/.../ws` 与原始 WS 通道分别跑，不能只测一个端点。
+
+### 3.3 SSE（WHATWG HTML §9.2）
+
+- 字段：`event:`、`data:`（多行拼接）、`id:`、`retry:`、注释行 `:`；
+- 换行：LF / CRLF / CR 都要接受；BOM 只在流开头允许；
+- 重连：`Last-Event-ID` 回放；无 `id` 的事件不改变 last id；
+- 非法 UTF-8 替换为 U+FFFD，不中断流。
+
+现有 `run.mjs --compat` 只测 EventSource 投递与 `Last-Event-ID`，上面这些要补成表驱动向量。
+
+### 3.4 MCP
+
+- 官方 `@modelcontextprotocol/sdk` 客户端：`initialize` / `server/discover` / `tools/list` / `tools/call`；
+- `MCP-Protocol-Version`、`_meta`、Bearer 401/403、缺失参数 `-32602`；
+- progress notification 与 SSE 流式回复；
+- 双时代 stdio bridge 与 Streamable HTTP 各跑一遍。
+
+MCP 不是 W3C，不要用 WPT 套；官方 SDK + 规范逐条向量就是这一层的「一致性测试」。
+
+## 4. MEM_LEVEL 与 `svcd.conf` 边界
+
+`MEM_LEVEL=low|middle|high` 是编译期档位，`svcd.conf` 是运行期覆盖；两者都在 [limits.rs](../src/limits.rs) 夹取。测试分三段：
+
+1. **档位矩阵**：CI 用 `low/middle/high` 各编译并跑 `limits::tests`。
+2. **边界夹取**：每个字段取 `0` / `1` / `MAX`，断言结果落在文档下限/上限，且不 panic。
+3. **默认值**：当前档位的默认值必须落在同一组下限/上限内；`default_timeout <= max_timeout`。
+
+已覆盖的坑：`max_streams=0`、`request_stack_bytes=1`、`io_stack_bytes=1`、`idle_timeout=0`、`u64::MAX` 超时。
+
+还缺一条**运行时崩溃回归**：用「全部取最小值」的 `svcd.conf` 启动 daemon，依次打 HTTP / MCP / WebSocket / SSE，断言返回 4xx/413 而不是进程退出。这条比纯 `Limits` 单测更接近用户报的「设置过小崩溃」。
+
+## 5. 性能测试
+
+`tools/perf` 已经是完整的兼容 + 性能 harness，但**不在 CI**：
+
+- `--compat`：协议/客户端兼容；
+- `--perf`：HTTP / MCP / WS / SSE 在并发 1/8/32 下的延迟与吞吐；
+- `--scale`：0/5/10/30 插件的进程树 RSS/CPU；
+- `reactor_scale*.py`：20/1000 连接与 soak。
+
+建议的 CI 策略：
+
+- **PR**：不跑真实网络性能（噪声大），只保留 `spk_smoke.py`；
+- **每晚 / 手动**：跑 `--perf`，上传 `target/perf-report.md` 与 JSON；
+- **基线**：先记录同一 runner 的 p50/p95/p99、RSS、线程数；稳定后对 p95 与 RSS 设 20% 回归阈值，超过才失败；
+- **MEM_LEVEL**：对 low/middle/high 各跑一次空载 RSS，确认低档确实更低，且没有 OOM/重启。
+
+性能数字是机器相关的；不要拿不同 runner 的绝对值当门槛，只做同机相对比较。
+
+## 6. 命令
+
+```sh
+# L1 + L4
+cargo test
+MEM_LEVEL=low cargo test --bin svcd limits::tests -- --test-threads=1
+MEM_LEVEL=middle cargo test --bin svcd limits::tests -- --test-threads=1
+MEM_LEVEL=high cargo test --bin svcd limits::tests -- --test-threads=1
+
+# L2（需要 release 二进制 + tools/perf 依赖）
+cargo build --release
+cd tools/perf && npm ci && cd ../..
+node tools/perf/run.mjs --compat
+
+# L3
+node tools/perf/run.mjs --perf
+node tools/perf/run.mjs --scale
+```
+
+## 7. CI 落点
+
+| 工作流 | 触发 | 内容 |
+|---|---|---|
+| `test.yml` | PR / main | `cargo test`、`--no-default-features`、`.spk` smoke、`MEM_LEVEL` 三档 |
+| `perf.yml` | 每周 / 手动 | `--perf`，上传报告与 JSON |
+| 兼容套件（待建） | 每晚 / 手动 | `--compat`、Autobahn、WHATWG SSE 向量 |
+
+性能与兼容的完整套件不要塞进 PR：PR 只保留可确定、分钟级的检查。

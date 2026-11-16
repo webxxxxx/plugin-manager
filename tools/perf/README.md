@@ -1,8 +1,10 @@
 # tools/perf
 
 Compatibility and performance harness for svcd's HTTP, MCP, WebSocket and SSE
-surfaces. This is intentionally **not** part of `cargo test` or CI: it starts a
-release daemon, a Python echo plugin and real network clients.
+surfaces. This is intentionally **not** part of `cargo test`: it starts a
+release daemon, a Python echo plugin and real network clients. Performance runs
+in `.github/workflows/perf.yml` (weekly/manual); the standards-based
+compatibility suite is tracked in #106. See [docs/testing.md](../../docs/testing.md).
 
 ## Requirements
 

@@ -2,7 +2,7 @@
 
 > 状态：v1.0（2026-11-16）。命名已定，见第 15 节与 ADR-0011 / ADR-0012。
 > 这份文档是全组唯一的「总图」：加模块、加协议、判断一处改动该落在哪一层，先看它。
-> 词表见 [GLOSSARY.md](../GLOSSARY.md)；已定决策见 [docs/adr/](adr/)。
+> 词表见 [GLOSSARY.md](../GLOSSARY.md)；已定决策见 [docs/adr/](adr/)；测试分层见 [testing.md](testing.md)。
 
 ## 0. 一句话
 
