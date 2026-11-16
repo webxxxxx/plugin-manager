@@ -381,25 +381,7 @@ fn read_raw_response(stream: &mut TcpStream) -> RawResponse {
 }
 
 fn read_one_response(stream: &mut TcpStream) -> RawResponse {
-    let mut head = Vec::new();
-    let mut byte = [0u8; 1];
-    while !head.ends_with(b"\r\n\r\n") {
-        stream.read_exact(&mut byte).expect("response head");
-        head.push(byte[0]);
-    }
-    let text = String::from_utf8_lossy(&head);
-    let mut lines = text.lines();
-    let status = lines
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|value| value.parse::<u16>().ok())
-        .expect("status");
-    let headers: Vec<(String, String)> = lines
-        .filter_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            Some((name.trim().to_string(), value.trim().to_string()))
-        })
-        .collect();
+    let (status, headers) = read_response_head(stream);
     let length = headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
@@ -1758,6 +1740,98 @@ fn blob_download_supports_range_etag_and_conditionals() {
     let missing = raw_request(&address, "HEAD", "/api/v1/blobs/sha256:deadbeef", "", b"");
     assert_eq!(missing.status, 404);
     assert!(missing.body.is_empty());
+}
+
+fn read_response_head(stream: &mut TcpStream) -> (u16, Vec<(String, String)>) {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).expect("response head");
+        head.push(byte[0]);
+    }
+    let text = String::from_utf8_lossy(&head);
+    let mut lines = text.lines();
+    let status = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .expect("status");
+    let headers = lines
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_string(), value.trim().to_string()))
+        })
+        .collect();
+    (status, headers)
+}
+
+/// A stalled blob download holds one long-lived `max_streams` slot and must
+/// not stop the server loop from serving another request. Both ends of the
+/// connection stay on the server loop; the client simply stops reading.
+#[test]
+fn a_slow_blob_reader_drops_the_stream_cap_and_leaves_the_loop_free() {
+    let mut sandbox = Sandbox::new();
+    sandbox.allow_insecure_install_with("max_streams = 1\n");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    // Larger than any plausible loopback socket buffer, so the transfer is
+    // still in progress while the client refuses to read.
+    let content = vec![0x5a; 32 * 1024 * 1024];
+    let put = raw_request(
+        &address,
+        "POST",
+        "/api/v1/blobs",
+        "application/octet-stream",
+        &content,
+    );
+    assert_eq!(put.status, 200, "{:?}", put.body);
+    let id = json_body(&put)["id"].as_str().expect("blob id").to_string();
+    let path = format!("/api/v1/blobs/{}", id);
+
+    let mut stalled = TcpStream::connect(&address).expect("stalled connect");
+    stalled
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("stalled timeout");
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        path, address
+    );
+    stalled
+        .write_all(request.as_bytes())
+        .expect("stalled request");
+    let (status, _) = read_response_head(&mut stalled);
+    assert_eq!(status, 200);
+
+    // The loop still answers an ordinary request while the transfer is stalled.
+    let version = raw_request(&address, "GET", "/api/v1/version", "", b"");
+    assert_eq!(version.status, 200, "a slow reader must not block the loop");
+
+    // The stalled transfer owns the only long-lived slot.
+    let busy = raw_request(&address, "GET", &path, "", b"");
+    assert_eq!(busy.status, 503, "{:?}", busy.body);
+    assert_eq!(
+        raw_header_values(&busy, "retry-after"),
+        vec!["1"],
+        "the busy response keeps the stable Retry-After contract"
+    );
+    assert_eq!(json_body(&busy)["error"]["code"], "busy");
+
+    // Releasing the stalled connection releases the slot.
+    drop(stalled);
+    let mut released = None;
+    for _ in 0..200 {
+        let response = raw_request(&address, "GET", &path, "", b"");
+        if response.status == 200 {
+            released = Some(response);
+            break;
+        }
+        assert_eq!(response.status, 503, "{:?}", response.body);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let released = released.expect("the stream cap must be released after a disconnect");
+    assert_eq!(released.body.len(), content.len());
+    assert_eq!(released.body, content);
 }
 
 #[test]
@@ -4604,6 +4678,53 @@ fn unix_idle_thread_count_has_no_per_request_or_per_stream_threads() {
         idle,
         "closing connections and streams must leave no daemon threads behind"
     );
+}
+
+/// A blob download used to take the connection out of the loop and spawn a
+/// `svcd-blob-http` thread. It is a stream handler now, so a stalled download
+/// must not change the daemon thread count.
+#[cfg(target_os = "linux")]
+#[test]
+fn unix_blob_download_has_no_takeover_thread() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let pid = sandbox.daemon.as_ref().expect("running daemon").id();
+
+    // The takeovers that remain (uploads) are transient; wait for the idle
+    // count after the upload has closed its connection.
+    let content = vec![0x5a; 32 * 1024 * 1024];
+    let put = raw_request(
+        &address,
+        "POST",
+        "/api/v1/blobs",
+        "application/octet-stream",
+        &content,
+    );
+    assert_eq!(put.status, 200, "{:?}", put.body);
+    let id = json_body(&put)["id"].as_str().expect("blob id").to_string();
+    let idle = stable_thread_count(pid);
+
+    let mut stalled = TcpStream::connect(&address).expect("stalled connect");
+    stalled
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("stalled timeout");
+    let request = format!(
+        "GET /api/v1/blobs/{} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        id, address
+    );
+    stalled
+        .write_all(request.as_bytes())
+        .expect("stalled request");
+    let (status, _) = read_response_head(&mut stalled);
+    assert_eq!(status, 200);
+
+    assert_eq!(
+        stable_thread_count(pid),
+        idle,
+        "a blob download must not add a takeover thread"
+    );
+    drop(stalled);
 }
 
 // ---------------------------------------------------------------------------

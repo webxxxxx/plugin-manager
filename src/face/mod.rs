@@ -6,4 +6,5 @@
 //! move in #117.
 
 pub mod api;
+pub mod blob;
 pub mod plugin_ui;

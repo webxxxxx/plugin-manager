@@ -1653,6 +1653,21 @@ fn listener_loop(listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config: Pa
     }
 }
 
+/// Drive a face-produced stream on the Windows connection thread. The
+/// fallback owns the socket and the shared max_streams slot; a Busy result is
+/// rendered before any handler bytes are written.
+#[cfg(not(unix))]
+fn drive_fallback(
+    stream: &mut TcpStream,
+    handler: Box<dyn crate::server::http::StreamHandler>,
+) {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_write_timeout(Some(crate::limits::current().transfer_timeout));
+    if crate::server::http::fallback::drive(stream, handler).is_err() {
+        let _ = stream.write_all(&crate::server::http::stream_busy_response());
+    }
+}
+
 /// Run one plugin UI request on the Windows connection thread. The face
 /// resolves the endpoint policy; the server layer's fallback driver owns the
 /// socket and the handler's events.
@@ -1667,10 +1682,48 @@ fn serve_plugin_ui(stream: &mut TcpStream, head: &http::Head, peer: IpAddr, lan:
         Ok(Exchange::Response(response)) => {
             let _ = stream.write_all(&response.into_bytes());
         }
-        Ok(Exchange::Stream(handler)) => {
-            let _ = stream.set_nonblocking(false);
-            let _ = stream.set_write_timeout(Some(crate::limits::current().transfer_timeout));
-            crate::server::http::fallback::drive(stream, handler);
+        Ok(Exchange::Stream(handler)) => drive_fallback(stream, handler),
+    }
+}
+
+/// Run one blob/file download through the face and the Windows fallback
+/// driver. The handler owns no connection; the fallback owns the socket and
+/// the shared `max_streams` slot.
+#[cfg(not(unix))]
+fn serve_blob_download(
+    stream: &mut TcpStream,
+    head: &http::Head,
+    peer: IpAddr,
+    face: &crate::face::api::ApiFace,
+    lan: &Arc<Mutex<Lan>>,
+) {
+    use crate::server::http::{dispatch_inline, Exchange};
+
+    let request = HttpRequest {
+        method: head.method.clone(),
+        path: head.path.clone(),
+        version: head.version.clone(),
+        headers: head.headers.clone(),
+        body: Vec::new(),
+    };
+    let prepared = match prepare_face_request(face, &request, peer, lan) {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => {
+            let _ = stream.write_all(&http::json_error(404, "not_found", "not a download route"));
+            return;
+        }
+        Err(response) => {
+            let _ = stream.write_all(&response);
+            return;
+        }
+    };
+    match dispatch_inline(face, &prepared.route, prepared.request) {
+        Ok(Exchange::Response(response)) => {
+            let _ = stream.write_all(&response.into_bytes());
+        }
+        Ok(Exchange::Stream(handler)) => drive_fallback(stream, handler),
+        Err(cause) => {
+            let _ = stream.write_all(&http::json_error(500, "internal", &cause.message()));
         }
     }
 }
@@ -1723,6 +1776,10 @@ fn handle(
         };
         if crate::face::plugin_ui::PluginUiFace::route_for(&head.method, &head.path).is_some() {
             serve_plugin_ui(&mut stream, &head, peer, &lan);
+            return;
+        }
+        if crate::face::blob::download_target(&head.method, &head.path).is_some() {
+            serve_blob_download(&mut stream, &head, peer, &face, &lan);
             return;
         }
         if let Some(route) = crate::export_http::route(&head) {
