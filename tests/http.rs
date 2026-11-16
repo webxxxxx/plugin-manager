@@ -1765,31 +1765,12 @@ fn read_response_head(stream: &mut TcpStream) -> (u16, Vec<(String, String)>) {
     (status, headers)
 }
 
-/// A stalled blob download holds one long-lived `max_streams` slot and must
-/// not stop the server loop from serving another request. Both ends of the
-/// connection stay on the server loop; the client simply stops reading.
-#[test]
-fn a_slow_blob_reader_drops_the_stream_cap_and_leaves_the_loop_free() {
-    let mut sandbox = Sandbox::new();
-    sandbox.allow_insecure_install_with("max_streams = 1\n");
-    sandbox.start_daemon();
-    let address = sandbox.wait_for_http();
-
-    // Larger than any plausible loopback socket buffer, so the transfer is
-    // still in progress while the client refuses to read.
-    let content = vec![0x5a; 32 * 1024 * 1024];
-    let put = raw_request(
-        &address,
-        "POST",
-        "/api/v1/blobs",
-        "application/octet-stream",
-        &content,
-    );
-    assert_eq!(put.status, 200, "{:?}", put.body);
-    let id = json_body(&put)["id"].as_str().expect("blob id").to_string();
-    let path = format!("/api/v1/blobs/{}", id);
-
-    let mut stalled = TcpStream::connect(&address).expect("stalled connect");
+/// A stalled download must hold one long-lived max_streams slot, keep the
+/// server loop free, and release the slot when the client disconnects. Both
+/// ends of the connection stay on the server loop; the client simply stops
+/// reading after the head.
+fn assert_slow_download_holds_the_cap(address: &str, path: &str, content: &[u8]) {
+    let mut stalled = TcpStream::connect(address).expect("stalled connect");
     stalled
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("stalled timeout");
@@ -1804,11 +1785,11 @@ fn a_slow_blob_reader_drops_the_stream_cap_and_leaves_the_loop_free() {
     assert_eq!(status, 200);
 
     // The loop still answers an ordinary request while the transfer is stalled.
-    let version = raw_request(&address, "GET", "/api/v1/version", "", b"");
+    let version = raw_request(address, "GET", "/api/v1/version", "", b"");
     assert_eq!(version.status, 200, "a slow reader must not block the loop");
 
     // The stalled transfer owns the only long-lived slot.
-    let busy = raw_request(&address, "GET", &path, "", b"");
+    let busy = raw_request(address, "GET", path, "", b"");
     assert_eq!(busy.status, 503, "{:?}", busy.body);
     assert_eq!(
         raw_header_values(&busy, "retry-after"),
@@ -1821,7 +1802,7 @@ fn a_slow_blob_reader_drops_the_stream_cap_and_leaves_the_loop_free() {
     drop(stalled);
     let mut released = None;
     for _ in 0..200 {
-        let response = raw_request(&address, "GET", &path, "", b"");
+        let response = raw_request(address, "GET", path, "", b"");
         if response.status == 200 {
             released = Some(response);
             break;
@@ -1832,6 +1813,72 @@ fn a_slow_blob_reader_drops_the_stream_cap_and_leaves_the_loop_free() {
     let released = released.expect("the stream cap must be released after a disconnect");
     assert_eq!(released.body.len(), content.len());
     assert_eq!(released.body, content);
+}
+
+/// Larger than any plausible loopback socket buffer, so the transfer is still
+/// in progress while the client refuses to read.
+fn large_download_body() -> Vec<u8> {
+    vec![0x5a; 32 * 1024 * 1024]
+}
+
+#[test]
+fn a_slow_blob_reader_drops_the_stream_cap_and_leaves_the_loop_free() {
+    let mut sandbox = Sandbox::new();
+    sandbox.allow_insecure_install_with("max_streams = 1\n");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let content = large_download_body();
+    let put = raw_request(
+        &address,
+        "POST",
+        "/api/v1/blobs",
+        "application/octet-stream",
+        &content,
+    );
+    assert_eq!(put.status, 200, "{:?}", put.body);
+    let id = json_body(&put)["id"].as_str().expect("blob id").to_string();
+    assert_slow_download_holds_the_cap(&address, &format!("/api/v1/blobs/{}", id), &content);
+}
+
+#[test]
+fn a_slow_file_bundle_reader_drops_the_stream_cap_and_leaves_the_loop_free() {
+    let mut sandbox = Sandbox::new();
+    sandbox.allow_insecure_install_with("max_streams = 1\n");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let created = request(&address, "POST", "/api/v1/file/uploads", "", b"");
+    assert_eq!(created.status, 200, "{}", created.body);
+    let upload_id = created.body["uploadId"]
+        .as_str()
+        .expect("upload id")
+        .to_string();
+    let first = vec![0x11; 16 * 1024 * 1024];
+    let second = vec![0x22; 16 * 1024 * 1024];
+    for (number, part) in [(1, first.as_slice()), (2, second.as_slice())] {
+        let response = raw_request(
+            &address,
+            "PUT",
+            &format!("/api/v1/file/uploads/{}/parts/{}", upload_id, number),
+            "application/octet-stream",
+            part,
+        );
+        assert_eq!(response.status, 200, "{:?}", response.body);
+    }
+    let complete = request(
+        &address,
+        "POST",
+        &format!("/api/v1/file/uploads/{}/complete", upload_id),
+        "application/json",
+        b"{\"parts\":[{\"partNumber\":1},{\"partNumber\":2}]}",
+    );
+    assert_eq!(complete.status, 200, "{}", complete.body);
+    let id = complete.body["id"].as_str().expect("file id");
+    let mut content = first;
+    content.extend_from_slice(&second);
+    assert_eq!(complete.body["size"], content.len() as u64);
+    assert_slow_download_holds_the_cap(&address, &format!("/api/v1/file/{}", id), &content);
 }
 
 #[test]

@@ -328,7 +328,7 @@ fn read_file_chunk(send: &mut FileSend, out: &mut Vec<u8>, limit: usize) -> std:
             out.truncate(base);
             Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                "UI asset ended before its advertised length",
+                "file send ended before its advertised length",
             ))
         }
         Ok(read) => {
@@ -341,5 +341,46 @@ fn read_file_chunk(send: &mut FileSend, out: &mut Vec<u8>, limit: usize) -> std:
             out.truncate(base);
             Err(error)
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, File};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn a_file_chunk_never_grows_past_the_stream_buffer() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "svcd-driver-chunk-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::write(&path, [7u8; 64]).expect("write test file");
+        let mut send = FileSend {
+            file: File::open(&path).expect("open test file"),
+            offset: 0,
+            length: 64,
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            read_file_chunk(&mut send, &mut out, 16).expect("first chunk"),
+            16
+        );
+        assert_eq!(out.len(), 16);
+        assert_eq!(
+            read_file_chunk(&mut send, &mut out, 16).expect("full buffer"),
+            0
+        );
+        assert_eq!(
+            out.len(),
+            16,
+            "a full output buffer stops the read at the high-water mark"
+        );
+        let _ = fs::remove_file(&path);
     }
 }

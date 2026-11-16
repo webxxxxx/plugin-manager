@@ -126,7 +126,7 @@ node tools/perf/run.mjs --scale
 
 线程预算回归（Linux 补充）：`cargo test --test http unix_idle_thread_count_has_no_per_request_or_per_stream_threads -- --exact`。它读 `/proc/<pid>/status` 的 `Threads:`，断言默认 S4 布局的空载基线为 12 条 daemon 线程（#116 的 2 条阻塞线程 + 迁移期 legacy 路径）；16 个 keep-alive 连接与 8 个 SSE 流不得各增加一条线程。改变拓扑的切片（如 #125）要同步更新 `IDLE_DAEMON_THREADS`。
 
-另外，#118 有一条下载专用回归：`cargo test --test http unix_blob_download_has_no_takeover_thread -- --exact`。它让一个慢读者挂住 32 MiB 的 blob 下载，然后断言 daemon 线程数不变——旧的 takeover 路径会在这里多出一条 `svcd-blob-http`。跨平台的 `a_slow_blob_reader_drops_the_stream_cap_and_leaves_the_loop_free` 同时断言慢读者只占 `max_streams` 的一个槽（第二个下载得到 503 + `Retry-After: 1`）、其他请求仍能完成，并在断开后释放槽。
+另外，#118 有一条下载专用回归：`cargo test --test http unix_blob_download_has_no_takeover_thread -- --exact`。它让一个慢读者挂住 32 MiB 的 blob 下载，然后断言 daemon 线程数不变——旧的 takeover 路径会在这里多出一条 `svcd-blob-http`。跨平台的 `a_slow_blob_reader_drops_the_stream_cap_and_leaves_the_loop_free` 与 `a_slow_file_bundle_reader_drops_the_stream_cap_and_leaves_the_loop_free` 同时断言慢读者只占 `max_streams` 的一个槽（第二个下载得到 503 + `Retry-After: 1`）、其他请求仍能完成，并在断开后释放槽。`server::http::driver::tests::a_file_chunk_never_grows_past_the_stream_buffer` 覆盖无 sendfile 时输出缓冲的高水位：缓冲满了就返回 0，不再读文件。
 
 legacy bridge 的 HTTP 队列有界由 `cargo test --bin svcd the_legacy_bridge_queue_is_bounded` 覆盖：上限 64，满时拒绝而不是增长；`api::legacy::tests::a_full_bridge_answers_503_with_retry_after` 覆盖满队列的 503 + `Retry-After: 1` 响应。WS 任务不占这 64 槽，由连接数与 `ws_inflight_requests` / `ws_inflight_bytes` 约束。
 

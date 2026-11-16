@@ -1,15 +1,16 @@
-//! Streaming HTTP surface for `/api/v1/blobs`.
+//! Streaming HTTP surface for blob uploads.
 //!
 //! A blob upload is written straight to a temp file while its SHA-256 is
-//! computed, and a download is streamed in chunks. This keeps daemon memory
-//! independent of file size and is also where `Range`, `ETag` and conditional
-//! requests live. Resumable uploads use a small S3-style part session:
+//! computed. This keeps daemon memory independent of file size. The download
+//! side, including `Range`, `ETag` and conditional requests, moved to
+//! `face::blob` (#118). Resumable uploads use a small S3-style part session:
 //! `POST /uploads` creates it, `PUT /uploads/{id}/parts/{n}` writes one part
 //! (retry by re-uploading the same number), and `POST .../complete` assembles
 //! the selected parts into one content-addressed blob.
 
 use std::io::{self, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
@@ -17,10 +18,10 @@ use serde_json::{json, Value};
 use crate::blob;
 use crate::http;
 use crate::lan::{AuthKind, Lan};
-use crate::server::http::budget::StreamBudget;
-use crate::server::http::stream::StreamClass;
 
 const MULTIPART_OVERHEAD: u64 = 8 * 1024 * 1024;
+
+static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
 /// Which streaming upload route a request head selects. Downloads are a
 /// sans-IO face handler now (`face::blob`); session metadata (status, complete,
@@ -73,9 +74,7 @@ pub fn serve(
 ) -> io::Result<()> {
     let _ = stream.set_read_timeout(Some(crate::limits::current().transfer_timeout));
     let _ = stream.set_write_timeout(Some(crate::limits::current().transfer_timeout));
-    let Ok(Some(_active)) = StreamBudget::global()
-        .acquire(StreamClass::LongLived, crate::limits::current().max_streams)
-    else {
+    let Some(_active) = ActiveGuard::acquire() else {
         return write_error_resp(
             stream,
             head,
@@ -115,6 +114,25 @@ pub fn serve(
         Route::Part { upload, part, kind } => {
             upload_part(stream, head, initial, &upload, part, kind)
         }
+    }
+}
+
+struct ActiveGuard;
+
+impl ActiveGuard {
+    fn acquire() -> Option<ActiveGuard> {
+        if ACTIVE.fetch_add(1, Ordering::SeqCst) >= crate::limits::current().max_streams {
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            None
+        } else {
+            Some(ActiveGuard)
+        }
+    }
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        ACTIVE.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -879,5 +897,41 @@ mod tests {
             None
         );
         assert!(multipart_boundary("multipart/form-data").is_err());
+    }
+
+    fn head(method: &str, path: &str) -> http::Head {
+        http::Head {
+            method: method.to_string(),
+            path: path.to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn downloads_never_enter_the_upload_takeover() {
+        // The face owns downloads now; the takeover route table must not claim
+        // a GET/HEAD. This is also the cross-platform proof that no
+        // `svcd-blob-http` thread can be spawned for a download.
+        for (method, path) in [
+            ("GET", "/api/v1/blobs/sha256:abc"),
+            ("HEAD", "/api/v1/blobs/sha256:abc"),
+            ("GET", "/api/v1/file/sha256:abc"),
+            ("GET", "/api/v1/files/sha256:abc"),
+            ("HEAD", "/api/v1/file/sha256:abc?x=1"),
+        ] {
+            assert!(
+                route(&head(method, path)).is_none(),
+                "{method} {path} must not use the upload takeover"
+            );
+        }
+        assert!(matches!(
+            route(&head("POST", "/api/v1/blobs")),
+            Some(Route::Upload)
+        ));
+        assert!(matches!(
+            route(&head("PUT", "/api/v1/blobs/uploads/u/parts/1")),
+            Some(Route::Part { .. })
+        ));
     }
 }
