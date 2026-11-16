@@ -4474,14 +4474,18 @@ fn an_idle_connection_is_closed_without_a_response() {
 //
 // /proc is the practical Unix way to read another process's thread count; the
 // behavior tests stay platform-neutral, so this supplemental check is gated to
-// Linux. The default S4 baseline is ten daemon threads. Keep-alive connections
-// and SSE streams are driven by the reactor, so neither may add a thread each.
+// Linux. The default S4 baseline is twelve daemon threads while the legacy
+// HTTP workers and takeovers still exist (#116 added the two blocking-pool
+// workers). Keep-alive connections and SSE streams are driven by the reactor,
+// so neither may add a thread each.
 // ---------------------------------------------------------------------------
 
 /// The default S4 topology before the control/plugin reactor merges
-/// (#124/#126). Update this pin in the slice that changes the baseline.
+/// (#124/#126). #116 added the two blocking-pool workers; the legacy HTTP
+/// workers and takeovers stay until #117/#125. Update this pin in the slice
+/// that changes the baseline.
 #[cfg(target_os = "linux")]
-const IDLE_DAEMON_THREADS: usize = 10;
+const IDLE_DAEMON_THREADS: usize = 12;
 
 #[cfg(target_os = "linux")]
 fn daemon_threads(pid: u32) -> usize {
@@ -4627,6 +4631,7 @@ const MIN_CONFIG_PASSWORD: &str = "min-config-password";
 const MINIMAL_LIMITS: &[(&str, &str)] = &[
     ("request_stack_bytes", "1"),
     ("io_stack_bytes", "1"),
+    ("blocking_threads", "0"),
     ("max_body_bytes", "1"),
     ("max_json_body_bytes", "1"),
     ("max_complete_body_bytes", "1"),

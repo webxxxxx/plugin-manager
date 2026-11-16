@@ -5,6 +5,8 @@
 pub mod contract;
 pub mod dispatch;
 pub mod engine;
+#[cfg_attr(not(unix), allow(dead_code))]
+pub mod pool;
 pub mod stream;
 
 // The S4 contract is deliberately available to the minimal build (parent spec
@@ -16,7 +18,9 @@ pub use contract::{
     Principal, Request, Response, Route,
 };
 #[allow(unused_imports)]
-pub use dispatch::{dispatch_inline, DispatchError};
+pub use dispatch::{complete_blocking, dispatch_blocking_now, dispatch_inline, DispatchError};
+#[allow(unused_imports)]
+pub use pool::{BlockingPool, Busy, CancelToken, JobOutcome};
 #[allow(unused_imports)]
 pub use stream::{
     BlockingJob, BlockingOutcome, CloseReason, FileSend, OutBuffer, StreamAction, StreamClass,

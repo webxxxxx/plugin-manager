@@ -102,12 +102,23 @@ pub use defaults::{
 };
 
 pub const WS_RAW_QUEUE: usize = 128;
+
+/// Default blocking-pool workers. The pool runs face handlers that cannot run
+/// on the server loop (control-channel round trips, disk work).
+pub const DEFAULT_BLOCKING_THREADS: usize = 2;
+/// A pool smaller than two workers cannot both run a slow job and keep a second
+/// one moving; the spec fixes the floor at two.
+pub const MIN_BLOCKING_THREADS: usize = 2;
+/// Upper bound so a typo cannot turn a small host into a thread farm.
+pub const MAX_BLOCKING_THREADS: usize = 8;
 /// Runtime view of the limits. `svcd.conf` may lower (or, within a sane range,
 /// raise) the compile-time defaults.
 #[derive(Debug, Clone)]
 pub struct Limits {
     pub request_stack_bytes: usize,
     pub io_stack_bytes: usize,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub blocking_threads: usize,
     pub max_body: u64,
     pub max_json_body: u64,
     pub max_complete_body: u64,
@@ -157,6 +168,12 @@ impl Limits {
                 MAX_IO_STACK,
                 32 * 1024,
                 4 * 1024 * 1024,
+            ),
+            blocking_threads: clamp_usize(
+                settings.blocking_threads,
+                DEFAULT_BLOCKING_THREADS,
+                MIN_BLOCKING_THREADS,
+                MAX_BLOCKING_THREADS,
             ),
             max_body: clamp_u64(
                 settings.max_body_bytes,
@@ -281,6 +298,7 @@ impl Limits {
 struct SettingsView<'a> {
     request_stack_bytes: Option<usize>,
     io_stack_bytes: Option<usize>,
+    blocking_threads: Option<usize>,
     max_body_bytes: Option<u64>,
     max_json_body_bytes: Option<u64>,
     max_complete_body_bytes: Option<u64>,
@@ -315,6 +333,7 @@ impl<'a> SettingsView<'a> {
         SettingsView {
             request_stack_bytes: settings.request_stack_bytes,
             io_stack_bytes: settings.io_stack_bytes,
+            blocking_threads: settings.blocking_threads,
             max_body_bytes: settings.max_body_bytes,
             max_json_body_bytes: settings.max_json_body_bytes,
             max_complete_body_bytes: settings.max_complete_body_bytes,
@@ -389,6 +408,7 @@ mod tests {
         let mut settings = settings::Settings::default();
         settings.request_stack_bytes = Some(0);
         settings.io_stack_bytes = Some(0);
+        settings.blocking_threads = Some(0);
         settings.max_body_bytes = Some(0);
         settings.max_json_body_bytes = Some(0);
         settings.max_complete_body_bytes = Some(0);
@@ -416,6 +436,7 @@ mod tests {
         let limits = limits_with(&settings);
         assert_eq!(limits.request_stack_bytes, 64 * 1024);
         assert_eq!(limits.io_stack_bytes, 32 * 1024);
+        assert_eq!(limits.blocking_threads, 2);
         assert_eq!(limits.max_body, 64 * 1024);
         assert_eq!(limits.max_json_body, 4 * 1024);
         assert_eq!(limits.max_complete_body, 16 * 1024);
@@ -446,6 +467,7 @@ mod tests {
         let mut settings = settings::Settings::default();
         settings.request_stack_bytes = Some(usize::MAX);
         settings.io_stack_bytes = Some(usize::MAX);
+        settings.blocking_threads = Some(usize::MAX);
         settings.max_body_bytes = Some(u64::MAX);
         settings.max_json_body_bytes = Some(u64::MAX);
         settings.max_complete_body_bytes = Some(u64::MAX);
@@ -473,6 +495,7 @@ mod tests {
         let limits = limits_with(&settings);
         assert_eq!(limits.request_stack_bytes, 8 * 1024 * 1024);
         assert_eq!(limits.io_stack_bytes, 4 * 1024 * 1024);
+        assert_eq!(limits.blocking_threads, 8);
         assert_eq!(limits.max_body, 1024 * 1024 * 1024);
         assert_eq!(limits.max_json_body, 64 * 1024 * 1024);
         assert_eq!(limits.max_complete_body, 128 * 1024 * 1024);
@@ -496,6 +519,24 @@ mod tests {
         assert_eq!(limits.ws_buffer_shrink_bytes, 16 * 1024 * 1024);
         assert_eq!(limits.ws_raw_max_bytes, 16 * 1024 * 1024);
         assert_eq!(limits.ws_raw_queue, 4096);
+    }
+
+    #[test]
+    fn blocking_threads_default_to_two_and_clamp_to_two_through_eight() {
+        let defaults = limits_with(&settings::Settings::default());
+        assert_eq!(defaults.blocking_threads, 2);
+
+        for (configured, expected) in [(0, 2), (1, 2), (2, 2), (5, 5), (8, 8), (9, 8), (64, 8)] {
+            let settings = settings::Settings {
+                blocking_threads: Some(configured),
+                ..settings::Settings::default()
+            };
+            assert_eq!(
+                limits_with(&settings).blocking_threads,
+                expected,
+                "configured {configured}"
+            );
+        }
     }
 
     #[test]

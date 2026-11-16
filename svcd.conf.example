@@ -84,6 +84,16 @@ bind = 127.0.0.1:8787
 #   ws_raw_max_bytes       1048576    1048576     1048576
 #   ws_raw_queue           16         64          128
 #
+# The blocking pool runs face handlers that cannot run on the server loop
+# (control-channel round trips and disk work). It starts a fixed number of
+# worker threads and never spawns a temporary one. A full queue or a second job
+# on one connection answers 503 busy with Retry-After.
+# `blocking_threads` defaults to 2 and is clamped to 2..8. The final default
+# topology is two server loops plus these two workers — four daemon threads —
+# once the legacy HTTP workers are removed (#125); raising the value is an
+# operator choice, not a regression. The pool is Unix-only in this slice; Windows keeps the
+# per-connection fallback. Requires a daemon restart.
+#
 # On Windows the HTTP listener keeps one thread per admitted connection, so
 # max_connections is also the connection-thread cap; the final Unix
 # four-thread default budget does not apply there.
@@ -115,6 +125,7 @@ bind = 127.0.0.1:8787
 # log_to_file = on
 # request_stack_bytes = 131072
 # io_stack_bytes = 65536
+# blocking_threads = 2
 # max_body_bytes = 8388608
 # max_json_body_bytes = 65536
 # max_complete_body_bytes = 131072

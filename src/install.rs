@@ -257,6 +257,13 @@ fn default_conf_text(layout: &Layout) -> String {
          # log_to_file = on\n\
          # request_stack_bytes = 131072 / 196608 / 262144\n\
          # io_stack_bytes = 65536 / 98304 / 131072\n\
+         # blocking_threads = 2 (default; clamped 2..8). The blocking pool\n\
+         # runs face handlers that cannot run on the server loop; a full\n\
+         # queue answers 503 busy. Unix only in this slice; Windows keeps\n\
+         # the per-connection fallback. The final default topology is two\n\
+         # server loops plus two blocking workers — four daemon threads —\n\
+         # once the legacy HTTP workers are removed (#125); raising the\n\
+         # value is an operator choice.\n\
          # max_body_bytes = 8388608 / 67108864 / 536870912\n\
          # max_json_body_bytes = 65536 / 262144 / 1048576\n\
          # max_complete_body_bytes = 131072 / 1048576 / 8388608\n\
@@ -2767,6 +2774,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("svc auth passwd"), "{text}");
+        assert!(text.contains("blocking_threads = 2"), "{text}");
         assert!(
             text.contains(&format!(
                 "plugins_dir = {}",
@@ -2832,6 +2840,7 @@ mod tests {
             "log_to_file",
             "request_stack_bytes",
             "io_stack_bytes",
+            "blocking_threads",
             "max_connections",
             "max_connections_per_ip",
             "max_subscriptions",
