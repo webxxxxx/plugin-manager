@@ -44,26 +44,41 @@ function loadMap(path) {
   return { map, rank, modules };
 }
 
-/** 只扫 src/ 顶层的 .rs；目录重排后再扩展成递归。 */
+function collectSources(dir, out = []) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) collectSources(full, out);
+    else if (entry.name.endsWith(".rs")) out.push(full);
+  }
+  return out;
+}
+
+/**
+ * 递归扫 src/。模块身份取路径第一段（src/kernel/contract.rs → kernel），
+ * 因为本工具的粒度是"概念模块"，不是单个文件。
+ */
 function scanSources(srcDir, modules) {
-  const files = readdirSync(srcDir)
-    .filter((name) => name.endsWith(".rs"))
-    .sort();
+  const sources = collectSources(srcDir)
+    .sort()
+    .map((full) => {
+      const relative = full.slice(srcDir.length + 1).split("\\").join("/");
+      const base = relative.slice(relative.lastIndexOf("/") + 1, -3);
+      return { full, file: `src/${relative}`, base, module: relative.split("/")[0].replace(/\.rs$/, "") };
+    });
   const edges = [];
   const unknown = [];
-  for (const name of files) {
-    const caller = name.slice(0, -3);
-    if (!modules.has(caller)) unknown.push(name);
-    const lines = stripComments(readFileSync(join(srcDir, name), "utf8")).split("\n");
+  for (const source of sources) {
+    if (!modules.has(source.module)) unknown.push(source.file);
+    const lines = stripComments(readFileSync(source.full, "utf8")).split("\n");
     for (let line = 0; line < lines.length; line += 1) {
       for (const match of lines[line].matchAll(/crate::([a-z_0-9]+)/g)) {
         const callee = match[1];
-        if (callee === caller || !modules.has(callee)) continue;
-        edges.push({ from: caller, to: callee, file: `src/${name}`, line: line + 1 });
+        if (callee === source.module || !modules.has(callee)) continue;
+        edges.push({ from: source.module, to: callee, file: source.file, line: line + 1 });
       }
     }
   }
-  return { files, edges, unknown };
+  return { sources, edges, unknown };
 }
 
 /**
@@ -260,25 +275,28 @@ function cycleViolations(nodes, edges) {
   });
 }
 
-function suffixViolations(files, map) {
+function suffixViolations(sources, map) {
   const errors = [];
   const warnings = [];
-  for (const name of files) {
-    const base = name.slice(0, -3);
+  for (const source of sources) {
     for (const suffix of map.suffixErrors ?? []) {
-      if (base !== suffix && base.endsWith(suffix)) errors.push({ file: `src/${name}`, suffix });
+      if (source.base !== suffix && source.base.endsWith(suffix)) {
+        errors.push({ file: source.file, suffix });
+      }
     }
     for (const suffix of map.suffixWarnings ?? []) {
-      if (base !== suffix && base.endsWith(suffix)) warnings.push({ file: `src/${name}`, suffix });
+      if (source.base !== suffix && source.base.endsWith(suffix)) {
+        warnings.push({ file: source.file, suffix });
+      }
     }
   }
   return { errors, warnings };
 }
 
-function report({ map, modules, files, edges, unknown, layers, cycles, suffixes }) {
+function report({ map, modules, sources, edges, unknown, layers, cycles, suffixes }) {
   const lines = [];
   lines.push("dep-lint · 观测基线（只读，不改代码）");
-  lines.push(`模块 ${files.length} 个，引用边 ${edges.length} 条，映射 ${modules.size} 项`);
+  lines.push(`模块 ${sources.length} 个源文件，引用边 ${edges.length} 条，映射 ${modules.size} 项`);
   const byLayer = new Map();
   for (const entry of modules.values()) byLayer.set(entry.layer, (byLayer.get(entry.layer) ?? 0) + 1);
   lines.push(
@@ -288,7 +306,7 @@ function report({ map, modules, files, edges, unknown, layers, cycles, suffixes 
         .map(([layer, count]) => `${layer} ${count}`)
         .join(" · "),
   );
-  if (unknown.length > 0) lines.push(`⚠ 未映射的模块：${unknown.join(", ")}`);
+  if (unknown.length > 0) lines.push(`⚠ 未映射的文件：${unknown.join(", ")}`);
 
   const pairs = new Map();
   for (const item of layers) {
@@ -337,15 +355,15 @@ function report({ map, modules, files, edges, unknown, layers, cycles, suffixes 
 
 const args = parseArgs(process.argv.slice(2));
 const { map, rank, modules } = loadMap(args.map);
-const { files, edges, unknown } = scanSources(args.src, modules);
-const nodes = [...modules.keys()].filter((name) => files.includes(`${name}.rs`));
+const { sources, edges, unknown } = scanSources(args.src, modules);
+const nodes = [...new Set(sources.map((source) => source.module))];
 const layers = layerViolations(edges, modules, rank);
 const cycles = cycleViolations(nodes, edges);
-const suffixes = suffixViolations(files, map);
-const { text, total } = report({ map, modules, files, edges, unknown, layers, cycles, suffixes });
+const suffixes = suffixViolations(sources, map);
+const { text, total } = report({ map, modules, sources, edges, unknown, layers, cycles, suffixes });
 
 if (args.json) {
-  console.log(JSON.stringify({ total, layers, cycles, suffixes, unknown, files: files.length, edges: edges.length }, null, 2));
+  console.log(JSON.stringify({ total, layers, cycles, suffixes, unknown, files: sources.length, edges: edges.length }, null, 2));
 } else {
   console.log(text);
 }

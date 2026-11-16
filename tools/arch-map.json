@@ -23,6 +23,8 @@
     "proc": { "concept": "platform/host", "layer": "platform" },
     "zerocopy": { "concept": "platform/host", "layer": "platform" },
     "compat": { "concept": "platform/compat", "layer": "platform" },
+
+    "kernel": { "concept": "kernel", "layer": "kernel", "note": "src/kernel/：契约、失败类别、conformance（#102 新建）" },
     "auth": { "concept": "platform/auth", "layer": "platform" },
 
     "ipc": { "concept": "wire/message", "layer": "wire" },

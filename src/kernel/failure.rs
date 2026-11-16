@@ -1,0 +1,227 @@
+//! 失败类别与调用结果。
+//!
+//! 一次调用的结局只有两种形状：
+//!
+//! - [`Failure`]：**尝试过**，实现（或投递路径）给出了类别；
+//! - [`Rejection`]：**没有被尝试，也不会被尝试**——能力不存在、参数不合规、超出上限。
+//!
+//! 后者不是失败类别：内核在把调用交给实现之前就拒绝，所以它没有 [`Class`]。
+//! 这条区分让"重试"有意义：只有 [`Failure`] 才带重试语义。
+
+use std::time::Duration;
+
+/// 实现或投递路径在**尝试之后**给出的失败类别。恰好八类。
+///
+/// 类别是领域词汇，不是字符串；对外面的投影（HTTP 状态码、CLI 退出码、
+/// MCP 错误码）都从这张表出，所以增减类别是破坏性变更。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Class {
+    /// 服务没在运行：进程不在、已被停止、正在重启。
+    NotRunning,
+    /// 在途上限已满：背压，不是错误。
+    Busy,
+    /// 内联参数超过契约声明的上限。
+    FrameTooLarge,
+    /// 往服务写调用失败：管道断了，通常意味着服务正在死。
+    WriteFailed,
+    /// 内核计时的超时：服务还活着，但没在预算内答复。
+    Timeout,
+    /// 调用方主动取消。
+    Cancelled,
+    /// 实现内部错误：它答应了，但自己崩了/返回了不合规的结果。
+    ImplementationError,
+    /// 依赖缺失：被依赖的服务不在，调用没意义。
+    MissingDependency,
+}
+
+impl Class {
+    pub const ALL: [Class; 8] = [
+        Class::NotRunning,
+        Class::Busy,
+        Class::FrameTooLarge,
+        Class::WriteFailed,
+        Class::Timeout,
+        Class::Cancelled,
+        Class::ImplementationError,
+        Class::MissingDependency,
+    ];
+
+    /// 稳定的名字：日志与投影用。改名字等于改契约。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Class::NotRunning => "not_running",
+            Class::Busy => "busy",
+            Class::FrameTooLarge => "frame_too_large",
+            Class::WriteFailed => "write_failed",
+            Class::Timeout => "timeout",
+            Class::Cancelled => "cancelled",
+            Class::ImplementationError => "implementation_error",
+            Class::MissingDependency => "missing_dependency",
+        }
+    }
+
+    /// 内核按类别决定重试形状，实现只能声明；声明与类别不符会被归一。
+    pub fn default_retry(self) -> Retry {
+        match self {
+            Class::NotRunning => Retry::After(Duration::from_secs(1)),
+            Class::Busy => Retry::After(Duration::from_millis(100)),
+            Class::Timeout => Retry::After(Duration::from_secs(1)),
+            Class::MissingDependency => Retry::After(Duration::from_secs(5)),
+            Class::FrameTooLarge => Retry::Never,
+            Class::WriteFailed => Retry::Never,
+            Class::Cancelled => Retry::Never,
+            Class::ImplementationError => Retry::Never,
+        }
+    }
+}
+
+/// 重试建议。`After` 是退避，不是"立刻再试"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retry {
+    Now,
+    Never,
+    After(Duration),
+}
+
+impl Retry {
+    /// 只比较**可重试与否**：`Now` 与 `After(_)` 同属可重试。
+    ///
+    /// 类别决定"可不可重试"（实现不许把永久失败说成可重试，也不许把
+    /// `NotRunning` 说成永不重试）；"立刻还是退避"是实现的余量，
+    /// 编排可以再按自己的策略调整。
+    pub fn shape(self) -> RetryShape {
+        match self {
+            Retry::Now | Retry::After(_) => RetryShape::Retryable,
+            Retry::Never => RetryShape::Never,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryShape {
+    Retryable,
+    Never,
+}
+
+/// 一次尝试的失败。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    pub class: Class,
+    pub retry: Retry,
+    /// 只给人看：日志与排障。上层**不得**解析它来判断类别。
+    pub detail: String,
+}
+
+impl Failure {
+    /// 归一：类别决定**可重试与否**；实现声明的"立刻 / 退避"只在同一侧时被保留。
+    ///
+    /// 这样实现永远无法把 `ImplementationError` 说成"可重试"，也无法把
+    /// `NotRunning` 说成"永不重试"——可重试性是事实，具体退避是余量。
+    pub fn new(class: Class, retry: Retry, detail: impl Into<String>) -> Failure {
+        let default = class.default_retry();
+        let retry = if retry.shape() == default.shape() {
+            retry
+        } else {
+            default
+        };
+        Failure {
+            class,
+            retry,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// 内核就地拒绝的原因：调用没有被尝试，也不会被尝试。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rejection {
+    /// 能力不在契约声明的 `surface` 里。
+    UnknownCapability { capability: String },
+    /// 参数不合契约声明的 schema，或超过内联上限。
+    BadArguments { detail: String },
+}
+
+impl Rejection {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Rejection::UnknownCapability { .. } => "unknown_capability",
+            Rejection::BadArguments { .. } => "bad_arguments",
+        }
+    }
+}
+
+/// 一次调用的完整结局。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallError {
+    Rejected(Rejection),
+    Failed(Failure),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn retry_of(failure: &Failure) -> Retry {
+        failure.retry
+    }
+
+    #[test]
+    fn every_class_has_a_distinct_stable_name() {
+        let mut names: Vec<&str> = Class::ALL.iter().map(|class| class.as_str()).collect();
+        let total = names.len();
+        assert_eq!(total, 8);
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "two classes share a name");
+    }
+
+    #[test]
+    fn an_implementation_cannot_claim_a_retry_shape_its_class_forbids() {
+        // ImplementationError 说自己可重试：被归一为 Never。
+        let failure = Failure::new(Class::ImplementationError, Retry::Now, "bug");
+        assert_eq!(retry_of(&failure), Retry::Never);
+
+        // Cancelled 说等一会再试：同样被归一。
+        let failure = Failure::new(Class::Cancelled, Retry::After(Duration::from_secs(1)), "");
+        assert_eq!(retry_of(&failure), Retry::Never);
+
+        // FrameTooLarge 说立刻重试：拒绝，因为重发同样的参数永远还是太大。
+        let failure = Failure::new(Class::FrameTooLarge, Retry::Now, "");
+        assert_eq!(retry_of(&failure), Retry::Never);
+    }
+
+    #[test]
+    fn an_implementation_cannot_claim_a_permanent_failure_is_transient() {
+        // NotRunning 说永不重试：被归一为退避。
+        let failure = Failure::new(Class::NotRunning, Retry::Never, "gone");
+        assert_eq!(
+            retry_of(&failure),
+            Class::NotRunning.default_retry(),
+            "a stopped service must stay retryable"
+        );
+
+        // Busy 说永不重试：背压不等于永久失败。
+        let failure = Failure::new(Class::Busy, Retry::Never, "");
+        assert_eq!(retry_of(&failure), Class::Busy.default_retry());
+    }
+
+    #[test]
+    fn a_consistent_retry_is_kept_verbatim() {
+        let custom = Retry::After(Duration::from_secs(7));
+        let failure = Failure::new(Class::NotRunning, custom, "");
+        assert_eq!(retry_of(&failure), custom, "same shape, keep the caller's backoff");
+
+        let immediate = Failure::new(Class::NotRunning, Retry::Now, "");
+        assert_eq!(retry_of(&immediate), Retry::Now);
+    }
+
+    #[test]
+    fn rejected_calls_carry_no_failure_class() {
+        let rejected = CallError::Rejected(Rejection::UnknownCapability {
+            capability: "status".into(),
+        });
+        assert!(matches!(rejected, CallError::Rejected(_)));
+        assert_eq!(Rejection::UnknownCapability { capability: "x".into() }.as_str(), "unknown_capability");
+        assert_eq!(Rejection::BadArguments { detail: "x".into() }.as_str(), "bad_arguments");
+    }
+}

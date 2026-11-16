@@ -23,6 +23,7 @@ mod install;
 mod install_http;
 mod interpreter;
 mod ipc;
+mod kernel;
 #[cfg_attr(not(feature = "http"), allow(dead_code))]
 mod lan;
 mod limits;
