@@ -14,23 +14,23 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
 use std::sync::mpsc::{self, Receiver, Sender};
+#[cfg(unix)]
+use std::sync::Condvar;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
-#[cfg(unix)]
-use std::sync::Condvar;
 
 use serde_json::{json, Value};
 
