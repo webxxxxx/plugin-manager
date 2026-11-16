@@ -39,8 +39,6 @@ use crate::face::plugin_ui::{ui_path, UiPath};
 use crate::http;
 use crate::lan::{self, AuthKind, Lan, LanStatus};
 use crate::log;
-#[cfg(not(unix))]
-use crate::mcp;
 use crate::mcp_http;
 use crate::package;
 use crate::paths;
@@ -1783,7 +1781,9 @@ fn serve_mcp_sse(
         },
     );
     let response = match response {
-        Ok(response) => mcp::finish_modern_tool_call(call.id, response),
+        Ok(response) => {
+            crate::server::mcp::result::finish_modern_tool_call(call.id, response)
+        }
         Err(error) => rpc::err(call.id, -32603, &format!("svcd unreachable: {}", error)),
     };
     if write_error.is_none() {

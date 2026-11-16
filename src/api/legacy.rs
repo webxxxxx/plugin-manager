@@ -16,7 +16,7 @@ use crate::server::http::{
     complete_blocking, dispatch_inline, BlockingPool, BodyPolicy, Busy, CancelToken,
     CompletionSlot, Dispatch, Exchange, Face, JobOutcome, StreamHandler,
 };
-use crate::server::mcp::progress::{McpSseStream, PROGRESS_QUEUE};
+use crate::server::mcp::progress::{McpSseStream, PROGRESS_QUEUE_SLOTS};
 
 /// One queued or running blocking request. The server owns the completion slot
 /// and the connection; the pool only reports that the job finished.
@@ -240,20 +240,17 @@ impl LegacyBridge for ServerHandler {
                     // Reserve the long-lived slot before starting the plugin
                     // call: a full budget must refuse the request without a
                     // side effect on the service.
-                    let permit = match crate::server::http::budget::StreamBudget::global()
+                    let Ok(Some(permit)) = crate::server::http::budget::StreamBudget::global()
                         .acquire(StreamClass::LongLived, crate::limits::current().max_streams)
-                    {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            write_response(
-                                connection,
-                                crate::server::http::stream_busy_response(),
-                                false,
-                            );
-                            return;
-                        }
+                    else {
+                        write_response(
+                            connection,
+                            crate::server::http::stream_busy_response(),
+                            false,
+                        );
+                        return;
                     };
-                    let (sender, receiver) = mpsc::sync_channel(PROGRESS_QUEUE);
+                    let (sender, receiver) = mpsc::sync_channel(PROGRESS_QUEUE_SLOTS);
                     let request = json!({
                         "name": call.name,
                         "arguments": call.arguments,
@@ -268,10 +265,9 @@ impl LegacyBridge for ServerHandler {
                                 stream,
                                 Box::new(move |id| cancel_client.cancel(id)),
                             );
-                            // The stream handler draws from the shared
-                            // `max_streams` budget; a full budget is the
-                            // standard 503 before any SSE bytes.
-                            attach_stream_reserved(connection, Box::new(handler), &[], permit);
+                            // The slot reserved above becomes the driver's
+                            // `max_streams` permit.
+                            attach_stream(connection, Box::new(handler), &[], Some(permit));
                         }
                         Err(error) => write_response(
                             connection,
@@ -645,7 +641,7 @@ impl ServerHandler {
         // buffer; the loop must not try to parse them again.
         let initial = connection.buffer.split_off(body_start);
         connection.buffer.clear();
-        attach_stream(connection, handler, &initial);
+        attach_stream(connection, handler, &initial, None);
         Some(PreRequest::Handled)
     }
 
@@ -695,7 +691,7 @@ impl ServerHandler {
                         // A streamed response is not a keep-alive response: its
                         // handler may own a file range and the wire head says
                         // `Connection: close`.
-                        attach_stream(connection, handler, &[]);
+                        attach_stream(connection, handler, &[], None);
                     }
                     Err(cause) => {
                         let response = http::json_error(500, "internal", &cause.message());
@@ -748,24 +744,11 @@ impl ServerHandler {
     }
 }
 
-/// Attach a face-produced stream handler under `max_streams`. On Busy the
-/// connection gets the shared 503 before any handler bytes are written.
-fn attach_stream(connection: &mut Connection, handler: Box<dyn StreamHandler>, initial: &[u8]) {
-    attach_stream_with(connection, handler, initial, None);
-}
-
-/// Attach a handler whose budget slot was reserved before a side effect (the
-/// outbound streaming call was already opened).
-fn attach_stream_reserved(
-    connection: &mut Connection,
-    handler: Box<dyn StreamHandler>,
-    initial: &[u8],
-    permit: Option<StreamPermit>,
-) {
-    attach_stream_with(connection, handler, initial, permit);
-}
-
-fn attach_stream_with(
+/// Attach a stream handler under `max_streams`. On Busy the connection gets
+/// the shared 503 before any handler bytes are written. `reserved` carries a
+/// slot acquired before a side effect (an outbound call was already opened);
+/// `None` lets the driver acquire one now.
+fn attach_stream(
     connection: &mut Connection,
     handler: Box<dyn StreamHandler>,
     initial: &[u8],
@@ -773,7 +756,7 @@ fn attach_stream_with(
 ) {
     connection.keep_alive = false;
     let mut driver = match reserved {
-        Some(permit) => StreamDriver::admit_reserved(handler, Some(permit)),
+        Some(permit) => StreamDriver::admit_reserved(handler, permit),
         None => match StreamDriver::admit(handler, crate::limits::current().max_streams) {
             StreamAdmission::Admitted(driver) => driver,
             StreamAdmission::Busy => {
