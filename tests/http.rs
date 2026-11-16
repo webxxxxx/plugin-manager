@@ -906,7 +906,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
   $token = $null
   if ($line -match '"_meta"\s*:\s*\{[^}]*"progressToken"\s*:\s*"([^"]+)"') { $token = $Matches[1] }
   if ($line -match '"name"\s*:\s*"slow"') {
-    Start-Sleep -Seconds 2
+    Start-Sleep -Seconds 5
   }
   if ($null -ne $token) {
     [Console]::Out.WriteLine('{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1,"progressToken":"' + $token + '"}}')
@@ -927,7 +927,7 @@ while IFS= read -r line; do
   if [ -z "$id" ]; then id=1; fi
   meta=$(printf '%s\n' "$line" | sed -n 's/.*"_meta":{\([^}]*\)}.*/\1/p')
   case "$line" in
-    *'"name":"slow"'*) sleep 2 ;;
+    *'"name":"slow"'*) sleep 5 ;;
   esac
   token=$(printf '%s\n' "$meta" | sed -n 's/.*"progressToken":"\([^"]*\)".*/\1/p')
   if [ -n "$token" ]; then
@@ -6312,7 +6312,9 @@ fn http_mcp_stream_disconnect_releases_the_budget() {
     drop(slow);
 
     let mut released = false;
-    for _ in 0..300 {
+    // The plugin sleeps for five seconds; a slot released only when that call
+    // ends would still be busy here.
+    for _ in 0..200 {
         let mut candidate = mcp_stream_request(&address, 12, "demo.status");
         let (status, _) = read_response_head(&mut candidate);
         if status == 200 {

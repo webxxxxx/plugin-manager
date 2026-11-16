@@ -356,6 +356,7 @@ mod tests {
             &Route {
                 body: BodyPolicy::Empty,
                 dispatch: Dispatch::Blocking,
+                public: false,
             },
             request(),
         ));

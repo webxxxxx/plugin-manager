@@ -290,8 +290,7 @@ src/
 | **S1** | **服务契约** | 内核 ↔ 四种运行实现 | 1 个显式 adapter（内置）+ 槽（exec）→ 未来 4 | **接口已定**（ADR-0013/0015）；待从 `slot`/`package`/`registry` 抽出 |
 | S2 | 调用传输 | 内核 ↔ 载体 | 1（本机 stdio） | 暂不开，但信封必须先定 |
 | S3 | 线格式实现 | 线格式 ↔ 平台 | 2（unix poll / windows 线程） | 未开，`cfg(unix)` 散在业务文件里 |
-| S4 | 请求交接 | 服务器 ↔ 对外面 | 6+（两种结果：内存响应 / sans-IO stream handler） | **接口已定**（ADR-0016；#113 契约）；**server-loop 已接管 Unix listener / 连接 / pending 表（#114）**；**stream handler 事件/动作面与插件 UI 静态资源已接入（#115）**，`server/http/driver.rs` 管 deadline/文件发送/`max_streams`，静态资源走 `SendFile` 且不占 `max_streams`；**阻塞池已接线（#116）**：固定 `blocking_threads`（默认 2，clamp 2..8），队列有界 64，每连接最多一个任务，满队列/重复任务 503 + `Retry-After`，首个 `Blocking` 路由是 `/api/v1/services`；**blob/file 下载已走 stream handler（#118）**：Range/条件请求线路不变，多分片按 `SendFile` 续传，下载占共享 `max_streams` 预算且 Unix 不再有下载 takeover 线程；**MCP SSE 进度流已走 stream handler（#123）**：`POST /mcp` 的 header/bearer 校验不变，进度事件先于最终结果，`McpSseStream` 占共享 `max_streams`（满时 503 + `Retry-After`，不启动插件调用），旧 `ConnState::McpSse` 与独立 64/429 计数已删除；**插件 UI 的 SSE / WebSocket / raw WebSocket 已走 stream handler（#122）**：handler 在 `face/plugin_streams/`，帧编解码在 `server/http/wire.rs`，WS 的 `registry.call` 以 `SubmitBlocking` 交给阻塞池（连接键唯一，结果经 `StreamJobDone` 回到 handler），Unix 与 Windows 回退驱动同一组 handler，三条流都占 `max_streams` 长连接预算；其余端点迁移中 |
-
+| S4 | 请求交接 | 服务器 ↔ 对外面 | 6+（两种结果：内存响应 / sans-IO stream handler） | **接口已定**（ADR-0016；#113 契约）；**server-loop 已接管 Unix listener / 连接 / pending 表（#114）**；**stream handler 事件/动作面与插件 UI 静态资源已接入（#115）**，`server/http/driver.rs` 管 deadline/文件发送/`max_streams`，静态资源走 `SendFile` 且不占 `max_streams`；**阻塞池已接线（#116）**：固定 `blocking_threads`（默认 2，clamp 2..8），队列有界 64，每连接最多一个任务，满队列/重复任务 503 + `Retry-After`，首个 `Blocking` 路由是 `/api/v1/services`；**剩余管理 JSON / login / 控制台已走 face（#117）**，除 version/console 外共用 2 条阻塞 worker（饱和时 503 + `Retry-After`），public route 跳过 transport auth，CSRF 与 plugin-token 留在 face；**blob/file 下载已走 stream handler（#118）**：Range/条件请求线路不变，多分片按 `SendFile` 续传，下载占共享 `max_streams` 预算且 Unix 不再有下载 takeover 线程；**MCP SSE 进度流已走 stream handler（#123）**：`POST /mcp` 的 header/bearer 校验不变，进度事件先于最终结果，`McpSseStream` 占共享 `max_streams`（满时 503 + `Retry-After`，不启动插件调用），旧 `ConnState::McpSse` 与独立 64/429 计数已删除；blob/file 上传、export spk/spkb、import/install 仍 takeover（#119–#121）；插件 UI 的 SSE / WS / raw 已走 stream handler（#122） |
 | S5 | 失败投影 | 领域 ↔ 对外面 | 3（HTTP / CLI / MCP） | 未开，靠字符串匹配 |
 | S6 | 进程与管道 | 监督 ↔ 平台 | 2（unix / windows job） | 未开 |
 | S7 | 配置来源 | 所有模块 ↔ 配置 | 1 生产 + 测试 | 未开，全局 OnceLock |
@@ -387,7 +386,7 @@ flowchart LR
     S5 --> S6["6 目录纯搬家"]
     S6 --> DONE["目标树"]
 
-    NOW["当前：0–2 部分完成<br/>S1 已回调化<br/>S4 契约已定（#113）<br/>server-loop 已接管 HTTP（#114）<br/>stream handler 与插件 UI 静态资源（#115）<br/>阻塞池与首个 Blocking 路由（#116）<br/>blob/file 下载走 stream handler（#118）<br/>MCP SSE 进度流走 stream handler（#123）<br/>插件 UI SSE/WS/raw 走 stream handler（#122）"]:::current
+    NOW["当前：0–2 部分完成<br/>S1 已回调化<br/>S4 契约已定（#113）<br/>server-loop 已接管 HTTP（#114）<br/>stream handler 与插件 UI 静态资源（#115）<br/>阻塞池与首个 Blocking 路由（#116）<br/>管理 API / login / 控制台走 face（#117）<br/>blob/file 下载走 stream handler（#118）<br/>MCP SSE 进度流走 stream handler（#123）<br/>插件 UI SSE/WS/raw 走 stream handler（#122）"]:::current
     NOW -.->|下一步| S3
 
     classDef current fill:#ffe08a,stroke:#b8860b,stroke-width:3px,color:#000

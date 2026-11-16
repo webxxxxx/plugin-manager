@@ -8,6 +8,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::compat;
@@ -20,6 +21,18 @@ use crate::registry::{
     Capability, Exec, Hook, Interpreter, Kind, Lifecycle, Ready, Restart, Service, State,
     RESERVED_ID,
 };
+
+/// Serialise config writes inside this process. The on-disk `config.lock`
+/// covers other processes on Unix; this mutex also covers Windows, where
+/// `flock` is a no-op, and keeps two threads from sharing the same
+/// `config.tmp.<pid>` path.
+static CONFIG_WRITES: Mutex<()> = Mutex::new(());
+
+pub(crate) fn config_lock() -> MutexGuard<'static, ()> {
+    CONFIG_WRITES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {

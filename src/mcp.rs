@@ -3,6 +3,9 @@ use crate::ipc::{self, FrameEvent};
 use crate::paths;
 use crate::registry::{Kind, Registry};
 use crate::rpc;
+use crate::server::mcp::result::{
+    error_response, result_value, server_meta, tool_error_result, tool_result_object, SERVER_NAME,
+};
 use serde_json::{json, Value};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -11,7 +14,6 @@ use std::time::{Duration, Instant};
 
 pub const MODERN_VERSION: &str = "2026-07-28";
 const LEGACY_VERSIONS: [&str; 3] = ["2025-11-25", "2025-06-18", "2025-03-26"];
-const SERVER_NAME: &str = "svcd";
 const TTL_MS: u64 = 1000;
 const LEGACY_POLL: Duration = Duration::from_secs(1);
 const MODERN_IDLE: Duration = Duration::from_secs(30);
@@ -69,26 +71,6 @@ pub fn tool_result(id: Option<Value>, text: String, is_error: bool) -> rpc::Resp
 /// A tool execution failure (plugin error, crash, timeout, protocol violation).
 pub fn tool_error(id: Option<Value>, message: &str) -> rpc::Response {
     tool_result(id, message.to_string(), true)
-}
-
-fn result_value(text: String, is_error: bool) -> Value {
-    json!({
-        "content": [{ "type": "text", "text": text }],
-        "isError": is_error,
-    })
-}
-
-fn tool_error_result(message: &str) -> Value {
-    result_value(message.to_string(), true)
-}
-
-fn error_response(id: Option<Value>, error: rpc::Error) -> rpc::Response {
-    rpc::Response {
-        jsonrpc: "2.0".into(),
-        id,
-        result: None,
-        error: Some(error),
-    }
 }
 
 /// Serve one MCP client over stdio. The bridge never launches svcd; if the
@@ -426,16 +408,6 @@ impl Bridge {
     }
 }
 
-/// A plugin may return an arbitrary JSON value. MCP tool results must be an
-/// object, so wrap a scalar before decorating it.
-fn tool_result_object(result: Value) -> Value {
-    if result.is_object() {
-        result
-    } else {
-        tool_error_result("plugin returned a non-object tool result")
-    }
-}
-
 pub(crate) fn validate_meta(id: Option<Value>, params: &Value) -> Result<(), rpc::Response> {
     let Some(meta) = params.get("_meta").and_then(Value::as_object) else {
         return Err(rpc::err(id, -32602, "missing _meta"));
@@ -470,15 +442,6 @@ pub(crate) fn validate_meta(id: Option<Value>, params: &Value) -> Result<(), rpc
         ));
     }
     Ok(())
-}
-
-fn server_meta() -> Value {
-    json!({
-        "io.modelcontextprotocol/serverInfo": {
-            "name": SERVER_NAME,
-            "version": env!("CARGO_PKG_VERSION"),
-        }
-    })
 }
 
 fn discover(id: Option<Value>) -> rpc::Response {
@@ -516,18 +479,6 @@ fn legacy_initialize(id: Option<Value>, params: &Value) -> rpc::Response {
             },
         }),
     )
-}
-
-/// Finish one modern `tools/call` result after a streaming transport has
-/// already forwarded progress notifications.
-pub fn finish_modern_tool_call(id: Option<Value>, response: rpc::Response) -> rpc::Response {
-    if let Some(error) = response.error {
-        return error_response(id, error);
-    }
-    let mut result = tool_result_object(response.result.unwrap_or_else(|| json!({})));
-    result["resultType"] = json!("complete");
-    result["_meta"] = server_meta();
-    rpc::ok(id, result)
 }
 
 fn write_response(stdout: &mut impl Write, response: &rpc::Response) -> io::Result<()> {

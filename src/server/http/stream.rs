@@ -106,7 +106,9 @@ impl StreamStep {
         }
     }
 
-    /// Ask the server for an earlier wakeup than its transfer deadline.
+    /// Ask the server to wake the handler earlier than its next tick. The
+    /// server keeps its own no-progress bound, so a handler that keeps asking
+    /// for wakeups still closes when a stalled transfer reaches that bound.
     pub fn within(mut self, deadline: Instant) -> StreamStep {
         self.deadline = Some(deadline);
         self

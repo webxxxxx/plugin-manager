@@ -62,6 +62,11 @@ pub enum Dispatch {
 pub struct Route {
     pub body: BodyPolicy,
     pub dispatch: Dispatch,
+    /// A public route must run without a resolved principal: login, logout and
+    /// the console page are reachable before a session exists. The face owns
+    /// the endpoint policy for its own public routes; the server only skips the
+    /// transport authentication step.
+    pub public: bool,
 }
 
 impl Route {
@@ -69,6 +74,7 @@ impl Route {
         Route {
             body,
             dispatch: Dispatch::Inline,
+            public: false,
         }
     }
 
@@ -79,7 +85,14 @@ impl Route {
         Route {
             body,
             dispatch: Dispatch::Blocking,
+            public: false,
         }
+    }
+
+    /// Declare that the route must be reachable before authentication.
+    pub fn public(mut self) -> Route {
+        self.public = true;
+        self
     }
 }
 
