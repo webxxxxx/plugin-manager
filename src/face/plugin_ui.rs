@@ -11,11 +11,12 @@ use crate::lan::Lan;
 use crate::package;
 use crate::plugin;
 use crate::server::http::{
-    BodyPolicy, CloseReason, Completion, Exchange, Face, FileSend, OutBuffer, Request, Route,
-    StreamAction, StreamClass, StreamEvent, StreamHandler, StreamStep,
+    dispatch_inline, BodyPolicy, CloseReason, Completion, Exchange, Face, FileSend, OutBuffer,
+    Request, Route, StreamAction, StreamClass, StreamEvent, StreamHandler, StreamStep,
 };
 use crate::webui;
 use std::fs;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
 /// One parsed `/plugin-ui/{id}/{token}/...` path.
@@ -84,6 +85,41 @@ impl PluginUiFace {
             return None;
         }
         Some(Route::inline(BodyPolicy::Streamed))
+    }
+
+    /// Resolve the principal and dispatch one plugin UI request. `Err` is the
+    /// response to send before the face runs: the login redirect for a browser
+    /// navigation, a 401 for an API client, or a dispatch error.
+    ///
+    /// Both engines use this helper so endpoint policy and the wire bytes have
+    /// one implementation; the caller owns the socket.
+    pub(crate) fn exchange(
+        head: &http::Head,
+        peer: IpAddr,
+        lan: &Arc<Mutex<Lan>>,
+    ) -> Result<Exchange, Vec<u8>> {
+        let Some(route) = PluginUiFace::route_for(&head.method, &head.path) else {
+            return Err(http::json_error(404, "not_found", "not a plugin UI asset"));
+        };
+        let principal = match lan.lock() {
+            Ok(mut state) => state.authenticate(&head.headers),
+            Err(_) => Err(()),
+        };
+        let principal = match principal {
+            Ok(principal) => principal,
+            Err(_) => return Err(unauthenticated(&head.headers, path_only(&head.path))),
+        };
+        let request = Request {
+            method: head.method.clone(),
+            path: head.path.clone(),
+            headers: head.headers.clone(),
+            peer,
+            principal,
+            body: Vec::new(),
+        };
+        let face = PluginUiFace::new(lan.clone());
+        dispatch_inline(&face, &route, request)
+            .map_err(|error| http::json_error(500, "internal", &error.message()))
     }
 
     /// Endpoint policy: a valid plugin id with a web UI, and a token minted for
@@ -196,7 +232,7 @@ impl PluginUiStream {
             return PluginUiStream::error(404, "not_found", "not found");
         };
         let mime = http::content_type(&path.to_string_lossy());
-        let file = match fs::File::open(&path) {
+        let mut file = match fs::File::open(&path) {
             Ok(file) => file,
             Err(error) => {
                 return PluginUiStream::error(500, "internal", &format!("open UI asset: {}", error))
@@ -219,9 +255,12 @@ impl PluginUiStream {
                 b"",
             ));
         }
+        let length = metadata.len();
         if mime.starts_with("text/html") {
-            let data = match fs::read(&path) {
-                Ok(data) => data,
+            // Insert the base tag from a bounded prefix, then send the rest of
+            // the page from disk. The event loop never reads a whole page.
+            let (injected, offset) = match webui::inject_base_prefix(&mut file, length, base) {
+                Ok(result) => result,
                 Err(error) => {
                     return PluginUiStream::error(
                         500,
@@ -230,15 +269,24 @@ impl PluginUiStream {
                     )
                 }
             };
-            let body = webui::inject_base(&data, base);
-            return PluginUiStream::response(http::response_with_headers(
-                200,
-                mime,
-                &response_headers,
-                &body,
-            ));
+            // `injected` already contains the file's first `offset` bytes, so
+            // the remainder is `length - offset`; do not count them twice.
+            let body_len = length + injected.len() as u64 - offset;
+            let mut head = http::response_head(200, mime, &response_headers, body_len);
+            head.extend_from_slice(&injected);
+            if offset >= length {
+                return PluginUiStream::response(head);
+            }
+            return PluginUiStream {
+                body: Body::File {
+                    head,
+                    head_sent: 0,
+                    file,
+                    offset,
+                    length: length - offset,
+                },
+            };
         }
-        let length = metadata.len();
         let head = http::response_head(200, mime, &response_headers, length);
         if length == 0 {
             // No file bytes to hand over; the head is the whole response.
@@ -326,120 +374,6 @@ impl StreamHandler for PluginUiStream {
     }
 }
 
-#[cfg(not(unix))]
-use std::net::TcpStream;
-
-/// The Windows thread fallback: resolve the request, then drive the same
-/// sans-IO handler over a blocking socket. Kept here so endpoint policy and
-/// response bytes have exactly one implementation on every platform.
-#[cfg(not(unix))]
-pub fn serve(stream: &mut TcpStream, head: &http::Head, lan: &Arc<Mutex<Lan>>) {
-    use std::io::Write;
-
-    let _ = stream.set_nonblocking(false);
-    let _ = stream.set_write_timeout(Some(crate::limits::current().transfer_timeout));
-    let path = path_only(&head.path);
-    let principal = match lan.lock() {
-        Ok(mut state) => state.authenticate(&head.headers),
-        Err(_) => Err(()),
-    };
-    let principal = match principal {
-        Ok(principal) => principal,
-        Err(_) => {
-            let _ = stream.write_all(&unauthenticated(&head.headers, path));
-            return;
-        }
-    };
-    let peer = stream
-        .peer_addr()
-        .map(|address| address.ip())
-        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-    let request = Request {
-        method: head.method.clone(),
-        path: head.path.clone(),
-        headers: head.headers.clone(),
-        peer,
-        principal,
-        body: Vec::new(),
-    };
-    let Some(route) = PluginUiFace::route_for(&request.method, &request.path) else {
-        return;
-    };
-    let face = PluginUiFace::new(lan.clone());
-    match crate::server::http::dispatch_inline(&face, &route, request) {
-        Ok(Exchange::Stream(handler)) => drive_blocking(stream, handler),
-        Ok(Exchange::Response(response)) => {
-            let _ = stream.write_all(&response.into_bytes());
-        }
-        Err(error) => {
-            let _ = stream.write_all(&http::json_error(500, "internal", &error.message()));
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn drive_blocking(stream: &mut TcpStream, mut handler: Box<dyn StreamHandler>) {
-    use std::io::Write;
-
-    let limit = crate::limits::current().stream_buffer;
-    let mut out = Vec::new();
-    loop {
-        let step = handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
-        let wrote = !out.is_empty();
-        if wrote && stream.write_all(&out).is_err() {
-            return;
-        }
-        out.clear();
-        match step.action {
-            StreamAction::Close(_) => return,
-            StreamAction::SendFile(send) => {
-                send_blocking(stream, send);
-                return;
-            }
-            // This slice has no blocking pool. The Unix server loop would hand
-            // the job to it (#116); the fallback must not run it on this thread.
-            StreamAction::SubmitBlocking(_) => {
-                let _ = stream.write_all(&http::json_error(
-                    500,
-                    "internal",
-                    "blocking jobs are not available on the thread fallback",
-                ));
-                return;
-            }
-            StreamAction::Continue | StreamAction::NeedRead | StreamAction::NeedWrite => {
-                if !wrote {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn send_blocking(stream: &mut TcpStream, send: FileSend) {
-    use std::io::{Read, Seek, SeekFrom, Write};
-
-    let FileSend {
-        mut file,
-        offset,
-        length,
-    } = send;
-    if length == 0 {
-        return;
-    }
-    match crate::zerocopy::send_file_range(&mut file, stream, offset, length) {
-        Ok(true) => {}
-        Ok(false) => {
-            if file.seek(SeekFrom::Start(offset)).is_ok() {
-                let mut reader = (&mut file).take(length);
-                let _ = std::io::copy(&mut reader, stream);
-            }
-        }
-        Err(_) => {}
-    }
-    let _ = stream.flush();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,17 +439,32 @@ mod tests {
     }
 
     fn drive(mut handler: PluginUiStream, limit: usize) -> (Vec<u8>, CloseReason) {
+        use std::io::{Read, Seek, SeekFrom};
+
         let mut all = Vec::new();
         let mut out = Vec::new();
         for _ in 0..10_000 {
             let step =
                 handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
+            assert!(
+                out.len() <= limit,
+                "a writable event must respect the buffer limit"
+            );
             all.extend_from_slice(&out);
             out.clear();
             match step.action {
                 StreamAction::Close(reason) => return (all, reason),
                 StreamAction::NeedWrite | StreamAction::Continue | StreamAction::NeedRead => {}
-                StreamAction::SendFile(_) => panic!("expected a memory response, got a file send"),
+                StreamAction::SendFile(mut send) => {
+                    // The server would send this range on the socket. Read it
+                    // back so the test can assert the exact response bytes.
+                    send.file
+                        .seek(SeekFrom::Start(send.offset))
+                        .expect("seek asset");
+                    let mut reader = (&mut send.file).take(send.length);
+                    reader.read_to_end(&mut all).expect("read asset remainder");
+                    return (all, CloseReason::Completed);
+                }
                 StreamAction::SubmitBlocking(_) => panic!("a static asset submits no job"),
             }
         }
@@ -592,24 +541,9 @@ mod tests {
             );
         }
         fs::write(dir.0.join("index.html"), &html).expect("write page");
-        let mut handler = PluginUiStream::asset(&[], "", &assets(&dir), "/plugin-ui/demo/tok/");
-        let mut all = Vec::new();
-        let mut out = Vec::new();
-        let mut reason = None;
-        for _ in 0..100_000 {
-            let step = handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, 64));
-            assert!(
-                out.len() <= 64,
-                "a writable event must respect the buffer limit"
-            );
-            all.extend_from_slice(&out);
-            out.clear();
-            if let StreamAction::Close(closed) = step.action {
-                reason = Some(closed);
-                break;
-            }
-        }
-        assert_eq!(reason, Some(CloseReason::Completed));
+        let handler = PluginUiStream::asset(&[], "", &assets(&dir), "/plugin-ui/demo/tok/");
+        let (all, reason) = drive(handler, 64);
+        assert_eq!(reason, CloseReason::Completed);
         let text = String::from_utf8_lossy(&all);
         assert!(text.ends_with("</p>\n"), "the last chunk is not truncated");
         assert!(
@@ -619,7 +553,9 @@ mod tests {
         let expected = webui::inject_base(&html, "/plugin-ui/demo/tok/");
         assert!(
             text.contains(&format!("Content-Length: {}\r\n", expected.len())),
-            "the injected body length is announced"
+            "the injected body length is announced: expected {} in {:?}",
+            expected.len(),
+            &text[..text.len().min(300)]
         );
     }
 

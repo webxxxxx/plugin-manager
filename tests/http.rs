@@ -897,11 +897,15 @@ fn web_plugin_bundle(key: &SigningKey, id: &str, ui: bool) -> Vec<u8> {
 /// proves the stream handler chunks its memory body instead of growing the
 /// output buffer to the whole response.
 fn large_web_page() -> Vec<u8> {
-    let mut html = Vec::from(&b"<!doctype html>\n<html><head><title>large</title></head><body>\n"[..]);
+    let mut html =
+        Vec::from(&b"<!doctype html>\n<html><head><title>large</title></head><body>\n"[..]);
     for line in 0..400 {
         html.extend_from_slice(
-            format!("<p>row {}: the plugin UI stream stays inside the configured buffer</p>\n", line)
-                .as_bytes(),
+            format!(
+                "<p>row {}: the plugin UI stream stays inside the configured buffer</p>\n",
+                line
+            )
+            .as_bytes(),
         );
     }
     html.extend_from_slice(b"</body></html>\n");

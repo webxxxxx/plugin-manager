@@ -48,7 +48,7 @@ use crate::plugin;
 use crate::rpc;
 use crate::server::http::engine::{self, keep_alive_response, wants_keep_alive, HttpRequest};
 #[cfg(unix)]
-use crate::server::http::{CloseReason, JobOutcome, StreamClass, StreamHandler};
+use crate::server::http::JobOutcome;
 use crate::settings;
 use crate::threads;
 use crate::transfer;
@@ -265,30 +265,6 @@ struct RawWsState {
     frames: u64,
 }
 
-/// A stream handler attached to one connection. The loop owns the socket and
-/// the buffers; the handler only sees events and returns actions.
-#[cfg(unix)]
-struct StreamState {
-    handler: Box<dyn StreamHandler>,
-    /// One-shot handlers are exempt from `max_streams`.
-    #[allow(dead_code)] // #118 adds the transfer budget that reads this.
-    class: StreamClass,
-    /// The server's no-progress deadline, possibly shortened by the handler.
-    deadline: Instant,
-    /// A server-side file send requested by the handler, after the output
-    /// buffer drains.
-    file: Option<PendingFile>,
-    /// The handler asked to finish; flush the output buffer, then close.
-    closing: Option<CloseReason>,
-}
-
-#[cfg(unix)]
-struct PendingFile {
-    file: fs::File,
-    offset: u64,
-    length: u64,
-}
-
 #[cfg(unix)]
 enum ConnState {
     Reading,
@@ -298,7 +274,9 @@ enum ConnState {
     Ws(WsState),
     RawWs(RawWsState),
     McpSse(McpSseState),
-    Stream(StreamState),
+    /// A sans-IO handler plus the server-side deadline, file send and
+    /// `max_streams` slot (see `server::http::driver`).
+    Stream(crate::server::http::driver::StreamDriver),
 }
 
 #[cfg(unix)]
@@ -1675,6 +1653,28 @@ fn listener_loop(listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config: Pa
     }
 }
 
+/// Run one plugin UI request on the Windows connection thread. The face
+/// resolves the endpoint policy; the server layer's fallback driver owns the
+/// socket and the handler's events.
+#[cfg(not(unix))]
+fn serve_plugin_ui(stream: &mut TcpStream, head: &http::Head, peer: IpAddr, lan: &Arc<Mutex<Lan>>) {
+    use crate::server::http::Exchange;
+
+    match crate::face::plugin_ui::PluginUiFace::exchange(head, peer, lan) {
+        Err(response) => {
+            let _ = stream.write_all(&response);
+        }
+        Ok(Exchange::Response(response)) => {
+            let _ = stream.write_all(&response.into_bytes());
+        }
+        Ok(Exchange::Stream(handler)) => {
+            let _ = stream.set_nonblocking(false);
+            let _ = stream.set_write_timeout(Some(crate::limits::current().transfer_timeout));
+            crate::server::http::fallback::drive(stream, handler);
+        }
+    }
+}
+
 /// Refuse one accepted connection with the same busy response the Unix reactor
 /// sends, instead of starting a thread that would exceed the connection cap.
 #[cfg(not(unix))]
@@ -1722,7 +1722,7 @@ fn handle(
             }
         };
         if crate::face::plugin_ui::PluginUiFace::route_for(&head.method, &head.path).is_some() {
-            crate::face::plugin_ui::serve(&mut stream, &head, &lan);
+            serve_plugin_ui(&mut stream, &head, peer, &lan);
             return;
         }
         if let Some(route) = crate::export_http::route(&head) {
@@ -2272,8 +2272,6 @@ fn serve_ui(request: &HttpRequest, assets: &plugin::WebAssets, sub: &str, base: 
     error(404, "not_found", "not found")
 }
 
-
-
 fn serve_web_file(
     request: &HttpRequest,
     path: &Path,
@@ -2299,12 +2297,8 @@ fn serve_web_file(
     http::response_with_headers(200, mime, &headers, &body)
 }
 
-
-
 fn wants_html(request: &HttpRequest) -> bool {
-    request_header(request, "accept")
-        .map(|value| value.to_ascii_lowercase().contains("text/html"))
-        .unwrap_or(false)
+    webui::wants_html(&request.headers)
 }
 
 fn ui_rpc(config: &Path, request: &HttpRequest, id: &str, auth: AuthKind) -> Vec<u8> {

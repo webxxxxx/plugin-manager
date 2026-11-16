@@ -5,6 +5,7 @@
 //! JSON-RPC request to the plugin's stdio channel (see `bridge_request`), and
 //! `uichannel` mirrors the plugin's notifications to SSE/WebSocket clients.
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -220,6 +221,46 @@ pub(crate) fn encode_query_value(value: &str) -> String {
     out
 }
 
+/// Insert \`<base href="{base}">\` into the head of a file without reading the
+/// whole body. Returns the bytes to write before the untouched remainder and
+/// the file offset where that remainder starts.
+///
+/// Only the first 4 KiB are inspected for a doctype. A page whose doctype
+/// starts after that much whitespace gets the tag at byte 0 instead; every
+/// real page puts the doctype first.
+pub(crate) fn inject_base_prefix<R: Read + Seek>(
+    reader: &mut R,
+    length: u64,
+    base: &str,
+) -> std::io::Result<(Vec<u8>, u64)> {
+    const PREFIX_LIMIT: usize = 4 * 1024;
+    let prefix_len = std::cmp::min(length, PREFIX_LIMIT as u64) as usize;
+    let mut prefix = vec![0u8; prefix_len];
+    let mut filled = 0;
+    if prefix_len > 0 {
+        reader.seek(SeekFrom::Start(0))?;
+        while filled < prefix_len {
+            match reader.read(&mut prefix[filled..]) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        prefix.truncate(filled);
+    }
+    let at = doctype_end(&prefix).unwrap_or(0);
+    let tag = format!("<base href=\"{}\">", base);
+    let mut head = Vec::with_capacity(at + tag.len() + 2);
+    head.extend_from_slice(&prefix[..at]);
+    if at > 0 {
+        head.push(b'\n');
+    }
+    head.extend_from_slice(tag.as_bytes());
+    head.push(b'\n');
+    Ok((head, at as u64))
+}
+
 fn entry_path(entry: &str) -> Option<String> {
     package::check_path(entry).ok()?;
     Some(entry.to_string())
@@ -250,6 +291,26 @@ fn percent_decode(value: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn the_prefix_injection_matches_the_in_memory_one() {
+        use std::io::Cursor;
+
+        let pages: &[&[u8]] = &[
+            b"<!doctype html>\n<html><body>x</body></html>",
+            b"<html><body>no doctype</body></html>",
+            b"\xEF\xBB\xBF  <!DOCTYPE HTML>\n<body>",
+            b"",
+        ];
+        for page in pages {
+            let mut reader = Cursor::new(page.to_vec());
+            let (head, at) =
+                inject_base_prefix(&mut reader, page.len() as u64, "/x/").expect("prefix");
+            let mut streamed = head;
+            streamed.extend_from_slice(&page[at as usize..]);
+            assert_eq!(streamed, inject_base(page, "/x/"));
+        }
+    }
 
     #[test]
     fn etag_is_mtime_plus_size_and_quoted() {

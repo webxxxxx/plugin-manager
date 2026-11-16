@@ -8,11 +8,11 @@
 use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd, RawFd};
 
+use crate::server::http::driver::{StreamAdmission, StreamDriver};
 use crate::server::http::engine::{self, HttpRequest, LegacyBridge, PreRequest, Table};
 use crate::server::http::{
-    complete_blocking, dispatch_inline, BlockingPool, BodyPolicy, Busy, CancelToken, CloseReason,
-    CompletionSlot, Dispatch, Exchange, Face, JobOutcome, OutBuffer, Request, StreamAction,
-    StreamEvent, StreamHandler, StreamStep,
+    complete_blocking, dispatch_inline, BlockingPool, BodyPolicy, Busy, CancelToken,
+    CompletionSlot, Dispatch, Exchange, Face, JobOutcome,
 };
 
 /// One queued or running blocking request. The server owns the completion slot
@@ -330,7 +330,7 @@ impl LegacyBridge for ServerHandler {
 
     fn on_writable(&mut self, connection: &mut Connection) -> bool {
         if matches!(&connection.state, ConnState::Stream(_)) {
-            return drive_stream_writable(connection);
+            return stream_writable(connection);
         }
         match &connection.state {
             ConnState::McpSse(_) => {
@@ -512,7 +512,7 @@ impl LegacyBridge for ServerHandler {
             .collect();
         for id in stream_ids {
             let keep = match connections.get_mut(&id) {
-                Some(connection) => drive_stream_tick(connection, now),
+                Some(connection) => stream_tick(connection, now),
                 None => true,
             };
             if !keep {
@@ -554,13 +554,8 @@ impl LegacyBridge for ServerHandler {
     }
 
     fn on_close(&mut self, connection: &mut Connection) {
-        if let ConnState::Stream(state) = &mut connection.state {
-            let reason = state.closing.clone().unwrap_or(CloseReason::PeerClosed);
-            let mut discarded = Vec::new();
-            let _ = state
-                .handler
-                .on_event(StreamEvent::Closed(reason), &mut OutBuffer::new(&mut discarded, 0));
-        }
+        // Replacing or dropping ConnState::Stream drops the driver, which
+        // delivers the handler's `Closed` event.
         if let Some(pending) = self.blocking_pending.remove(&connection.id) {
             // Seal the slot first: a job that finishes after this point writes
             // into a sealed slot and is ignored. Then free a queued slot or
@@ -595,49 +590,19 @@ impl ServerHandler {
             return None;
         }
         let (head, body_start) = http::parse_head(&connection.buffer[..header_end + 4])?;
-        let route = crate::face::plugin_ui::PluginUiFace::route_for(&head.method, &head.path)?;
-        let path = head
-            .path
-            .split_once('?')
-            .map(|(path, _)| path)
-            .unwrap_or(head.path.as_str());
-
-        // The server owns transport authentication. A failure is presented by
-        // the server (login redirect for a browser, 401 for an API client);
-        // the face never runs without a principal.
-        let principal = match self.lan.lock() {
-            Ok(mut state) => state.authenticate(&head.headers),
-            Err(_) => Err(()),
-        };
-        let principal = match principal {
-            Ok(principal) => principal,
-            Err(_) => {
-                let response = crate::face::plugin_ui::unauthenticated(&head.headers, path);
-                write_response(connection, response, false);
-                return Some(PreRequest::Handled);
-            }
-        };
-
-        let request = Request {
-            method: head.method.clone(),
-            path: head.path.clone(),
-            headers: head.headers.clone(),
-            peer: connection.peer,
-            principal,
-            body: Vec::new(),
-        };
-        let face = crate::face::plugin_ui::PluginUiFace::new(self.lan.clone());
-        let exchange = match dispatch_inline(&face, &route, request) {
-            Ok(exchange) => exchange,
-            Err(error) => {
-                write_response(
-                    connection,
-                    http::json_error(500, "internal", &error.message()),
-                    false,
-                );
-                return Some(PreRequest::Handled);
-            }
-        };
+        // Claim the path before authentication so an unauthenticated browser
+        // navigation gets the login redirect; the face applies the endpoint
+        // policy after the server resolved the principal.
+        crate::face::plugin_ui::PluginUiFace::route_for(&head.method, &head.path)?;
+        let exchange =
+            match crate::face::plugin_ui::PluginUiFace::exchange(&head, connection.peer, &self.lan)
+            {
+                Ok(exchange) => exchange,
+                Err(response) => {
+                    write_response(connection, response, false);
+                    return Some(PreRequest::Handled);
+                }
+            };
         let Exchange::Stream(handler) = exchange else {
             write_response(
                 connection,
@@ -656,9 +621,36 @@ impl ServerHandler {
         let initial = connection.buffer.split_off(body_start);
         connection.buffer.clear();
         connection.keep_alive = false;
-        stream_attach(connection, handler);
-        if matches!(connection.state, ConnState::Stream(_)) && !initial.is_empty() {
-            if !drive_stream_event(connection, StreamEvent::Data(&initial)) {
+
+        let mut driver = match StreamDriver::admit(handler, crate::limits::current().max_streams) {
+            StreamAdmission::Admitted(driver) => driver,
+            StreamAdmission::Busy => {
+                write_response(connection, stream_busy(), false);
+                return Some(PreRequest::Handled);
+            }
+        };
+        let primed = driver.prime(
+            &mut connection.stream,
+            &mut connection.out,
+            &mut connection.out_at,
+            &mut connection.last_active,
+        );
+        connection.state = ConnState::Stream(driver);
+        if !primed {
+            finish_stream(connection);
+            return Some(PreRequest::Handled);
+        }
+        if !initial.is_empty() {
+            let keep = {
+                let Connection {
+                    state, out, out_at, ..
+                } = connection;
+                match state {
+                    ConnState::Stream(driver) => driver.on_data(&initial, out, out_at),
+                    _ => true,
+                }
+            };
+            if !keep {
                 finish_stream(connection);
             }
         }
@@ -750,295 +742,72 @@ impl ServerHandler {
     }
 }
 
-/// Attach a handler and emit its first response bytes immediately. The engine
-/// only calls \`on_writable\` after a poll event, so the head would otherwise wait
-/// for the next loop tick.
-fn stream_attach(connection: &mut Connection, handler: Box<dyn StreamHandler>) {
-    let class = handler.stream_class();
-    connection.state = ConnState::Stream(StreamState {
-        handler,
-        class,
-        deadline: Instant::now() + crate::limits::current().transfer_timeout,
-        file: None,
-        closing: None,
-    });
-    if !drive_stream_writable(connection) {
-        finish_stream(connection);
-    }
-}
-
-fn stream_has_file(connection: &Connection) -> bool {
-    matches!(&connection.state, ConnState::Stream(state) if state.file.is_some())
-}
-
-fn stream_closing(connection: &Connection) -> bool {
-    matches!(&connection.state, ConnState::Stream(state) if state.closing.is_some())
-}
-
-/// End a stream whose output buffer is already empty. The handler gets its
-/// \`Closed\` event before it is dropped.
+/// End a stream whose output buffer is already empty. Replacing the state
+/// drops the driver, which delivers the handler's \`Closed\` event.
 fn finish_stream(connection: &mut Connection) {
-    if let ConnState::Stream(state) = &mut connection.state {
-        let reason = state.closing.clone().unwrap_or(CloseReason::Completed);
-        let mut discarded = Vec::new();
-        let _ = state.handler.on_event(
-            StreamEvent::Closed(reason),
-            &mut OutBuffer::new(&mut discarded, 0),
-        );
-    }
     connection.out.clear();
     connection.out_at = 0;
     connection.keep_alive = false;
     connection.state = ConnState::Writing;
 }
 
-/// Feed one event to the attached handler and apply its action.
-fn drive_stream_event(connection: &mut Connection, event: StreamEvent<'_>) -> bool {
-    let limit = crate::limits::current().stream_buffer;
-    let before = connection.out.len();
-    let step = {
-        let ConnState::Stream(state) = &mut connection.state else {
-            return true;
-        };
-        state
-            .handler
-            .on_event(event, &mut OutBuffer::new(&mut connection.out, limit))
-    };
-    let wrote = connection.out.len() > before;
-    apply_stream_step(connection, step, wrote)
+fn stream_has_file(connection: &Connection) -> bool {
+    matches!(&connection.state, ConnState::Stream(driver) if driver.has_file())
 }
 
-fn apply_stream_step(connection: &mut Connection, step: StreamStep, wrote: bool) -> bool {
-    let now = Instant::now();
-    let transfer = crate::limits::current().transfer_timeout;
-    let ConnState::Stream(state) = &mut connection.state else {
-        return false;
-    };
-    if wrote {
-        state.deadline = now + transfer;
-    }
-    if let Some(requested) = step.deadline {
-        if requested < state.deadline {
-            state.deadline = requested;
-        }
-    }
-    match step.action {
-        StreamAction::Continue | StreamAction::NeedRead | StreamAction::NeedWrite => {}
-        // #116 owns the pool-aware path for faces that submit work. A stream
-        // handler in this slice produces its bytes inline.
-        StreamAction::SubmitBlocking(_) => {
-            state.closing = Some(CloseReason::Failed(
-                "stream handlers cannot submit blocking jobs in this slice".into(),
-            ));
-        }
-        StreamAction::SendFile(send) => {
-            state.file = Some(PendingFile {
-                file: send.file,
-                offset: send.offset,
-                length: send.length,
-            });
-            // A file send is the last thing this response does.
-            state.closing = Some(CloseReason::Completed);
-        }
-        StreamAction::Close(reason) => {
-            state.closing = Some(reason);
-        }
-    }
-    if state.closing.is_some() && state.file.is_none() && connection.out_at >= connection.out.len()
-    {
-        return false;
-    }
-    true
-}
-
-/// Flush, then either send a queued file or let the handler write the next
-/// chunk. Returns false when the connection should be removed.
-fn drive_stream_writable(connection: &mut Connection) -> bool {
-    loop {
-        let before = connection.out_at;
-        if !connection.write_out() {
-            return false;
-        }
-        if connection.out_at > before {
-            if let ConnState::Stream(state) = &mut connection.state {
-                state.deadline = Instant::now() + crate::limits::current().transfer_timeout;
-            }
-        }
-        if connection.out_at < connection.out.len() {
-            return true;
-        }
-        if !connection.out.is_empty() {
-            connection.out.clear();
-        }
-        connection.out_at = 0;
-
-        if stream_has_file(connection) {
-            if !pump_stream_file(connection) {
-                return false;
-            }
-            if connection.out_at < connection.out.len() || stream_has_file(connection) {
-                return true;
-            }
-            continue;
-        }
-        if stream_closing(connection) {
-            return false;
-        }
-        if !drive_stream_event(connection, StreamEvent::Writable) {
-            return false;
-        }
-        if connection.out_at < connection.out.len() || stream_has_file(connection) {
-            return true;
-        }
-        // The handler accepted the event without producing bytes; wait for the
-        // next poll instead of spinning.
-        return true;
-    }
-}
-
-/// Advance the server-side file send. One-shot assets keep the zero-copy
-/// kernel path where the platform has an incremental one; elsewhere the
-/// bounded read+write fallback keeps memory inside the stream buffer.
-fn pump_stream_file(connection: &mut Connection) -> bool {
-    let limit = crate::limits::current().stream_buffer;
-    loop {
-        let ConnState::Stream(state) = &mut connection.state else {
-            return false;
-        };
-        let Some(mut pending) = state.file.take() else {
-            return true;
-        };
-        if pending.length == 0 {
-            continue;
-        }
-        match crate::zerocopy::try_send_file_range(
-            &mut pending.file,
-            &mut connection.stream,
-            pending.offset,
-            pending.length,
-        ) {
-            Ok(crate::zerocopy::FileSendProgress::Sent(sent)) => {
-                pending.offset += sent;
-                pending.length -= sent;
-                state.file = Some(pending);
-                state.deadline = Instant::now() + crate::limits::current().transfer_timeout;
-                continue;
-            }
-            Ok(crate::zerocopy::FileSendProgress::Done) => {
-                state.deadline = Instant::now() + crate::limits::current().transfer_timeout;
-                continue;
-            }
-            Ok(crate::zerocopy::FileSendProgress::WouldBlock) => {
-                state.file = Some(pending);
-                return true;
-            }
-            Ok(crate::zerocopy::FileSendProgress::Unsupported) => {
-                match read_file_chunk(&mut pending, &mut connection.out, limit) {
-                    Ok(0) => {
-                        // The output buffer is full; flush it before reading.
-                        state.file = Some(pending);
-                        return true;
-                    }
-                    Ok(_) => {
-                        state.file = Some(pending);
-                        state.deadline = Instant::now() + crate::limits::current().transfer_timeout;
-                        return true;
-                    }
-                    Err(error) => {
-                        log::svcd(&format!("svcd: plugin UI asset read failed: {}", error));
-                        state.closing =
-                            Some(CloseReason::Failed(format!("read UI asset: {}", error)));
-                        return true;
-                    }
-                }
-            }
-            Err(error) => {
-                log::svcd(&format!("svcd: plugin UI file send failed: {}", error));
-                state.closing = Some(CloseReason::Failed(format!("send UI asset: {}", error)));
-                return true;
-            }
-        }
-    }
-}
-
-/// Read the next bounded chunk of an asset into the connection's output
-/// buffer. Returns 0 when the buffer is full rather than at EOF.
-fn read_file_chunk(
-    pending: &mut PendingFile,
-    out: &mut Vec<u8>,
-    limit: usize,
-) -> std::io::Result<usize> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let capacity = limit.saturating_sub(out.len());
-    let want = std::cmp::min(capacity as u64, pending.length) as usize;
-    if want == 0 {
-        return Ok(0);
-    }
-    pending.file.seek(SeekFrom::Start(pending.offset))?;
-    let base = out.len();
-    out.resize(base + want, 0);
-    match pending.file.read(&mut out[base..]) {
-        Ok(0) => {
-            out.truncate(base);
-            Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "UI asset ended before its advertised length",
-            ))
-        }
-        Ok(read) => {
-            out.truncate(base + read);
-            pending.offset += read as u64;
-            pending.length -= read as u64;
-            Ok(read)
-        }
-        Err(error) => {
-            out.truncate(base);
-            Err(error)
-        }
-    }
-}
-
-/// Deliver a stream's deadline event. The server keeps the upper bound: a
-/// handler that neither made progress nor asked for a later wakeup closes.
-fn drive_stream_tick(connection: &mut Connection, now: Instant) -> bool {
-    let due = match &connection.state {
-        ConnState::Stream(state) => now >= state.deadline,
-        _ => false,
-    };
-    if !due {
-        return true;
-    }
-    if !drive_stream_event(connection, StreamEvent::Tick(now)) {
-        return false;
-    }
-    let still_due = match &connection.state {
-        ConnState::Stream(state) => now >= state.deadline,
-        _ => false,
-    };
-    if still_due {
-        if let ConnState::Stream(state) = &mut connection.state {
-            state.closing = Some(CloseReason::TimedOut);
-        }
-        return false;
-    }
-    true
-}
-
-/// Read request bytes for a streamed route and hand them to the handler.
 fn stream_readable(connection: &mut Connection) -> bool {
-    let mut chunk = [0u8; 8 * 1024];
-    match connection.stream.read(&mut chunk) {
-        Ok(0) => false,
-        Ok(read) => {
-            if let ConnState::Stream(state) = &mut connection.state {
-                state.deadline = Instant::now() + crate::limits::current().transfer_timeout;
-            }
-            drive_stream_event(connection, StreamEvent::Data(&chunk[..read]))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
-        Err(_) => false,
-    }
+    let Connection {
+        state,
+        stream,
+        out,
+        out_at,
+        last_active,
+        ..
+    } = connection;
+    let ConnState::Stream(driver) = state else {
+        return true;
+    };
+    driver.on_readable(stream, out, out_at, last_active)
+}
+
+fn stream_writable(connection: &mut Connection) -> bool {
+    let Connection {
+        state,
+        stream,
+        out,
+        out_at,
+        last_active,
+        ..
+    } = connection;
+    let ConnState::Stream(driver) = state else {
+        return true;
+    };
+    driver.on_writable(stream, out, out_at, last_active)
+}
+
+fn stream_tick(connection: &mut Connection, now: Instant) -> bool {
+    let Connection {
+        state,
+        stream,
+        out,
+        out_at,
+        last_active,
+        ..
+    } = connection;
+    let ConnState::Stream(driver) = state else {
+        return true;
+    };
+    driver.on_tick(now, stream, out, out_at, last_active)
+}
+
+fn stream_busy() -> Vec<u8> {
+    let body = json!({ "error": { "code": "busy", "message": "stream cap reached" } });
+    http::response_with_headers(
+        503,
+        "application/json",
+        &[("Retry-After".to_string(), "1".to_string())],
+        &serde_json::to_vec(&body).unwrap_or_default(),
+    )
 }
 
 

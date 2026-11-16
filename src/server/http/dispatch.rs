@@ -137,11 +137,7 @@ mod tests {
     struct NoopStream;
 
     impl StreamHandler for NoopStream {
-        fn on_event(
-            &mut self,
-            _event: StreamEvent<'_>,
-            _out: &mut OutBuffer<'_>,
-        ) -> StreamStep {
+        fn on_event(&mut self, _event: StreamEvent<'_>, _out: &mut OutBuffer<'_>) -> StreamStep {
             StreamStep::wait(StreamAction::Continue)
         }
     }
