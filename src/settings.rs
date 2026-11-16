@@ -42,6 +42,8 @@ pub struct Settings {
     /// Explicit thread stack sizes. `MEM_LEVEL` supplies the defaults.
     pub request_stack_bytes: Option<usize>,
     pub io_stack_bytes: Option<usize>,
+    /// Worker threads for the blocking face pool. Default: 2, clamped 2..8.
+    pub blocking_threads: Option<usize>,
     /// Runtime overrides/caps for the HTTP surface. All values are bytes or
     /// counts; `limits` clamps them to a safe range.
     pub max_body_bytes: Option<u64>,
@@ -256,6 +258,9 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
             }
             "io_stack_bytes" => {
                 settings.io_stack_bytes = Some(parse_usize(value, "io_stack_bytes", index)?)
+            }
+            "blocking_threads" => {
+                settings.blocking_threads = Some(parse_usize(value, "blocking_threads", index)?)
             }
             "max_body_bytes" => {
                 settings.max_body_bytes = Some(parse_u64(value, "max_body_bytes", index)?)
@@ -485,6 +490,7 @@ mod tests {
              log_to_file = off\n\
              request_stack_bytes = 131072\n\
              io_stack_bytes = 65536\n\
+             blocking_threads = 4\n\
              max_connections = 32\n\
              max_connections_per_ip = 8\n\
              max_subscriptions = 4\n\
@@ -509,6 +515,7 @@ mod tests {
         assert_eq!(settings.log_to_file, Some(false));
         assert_eq!(settings.request_stack_bytes, Some(131072));
         assert_eq!(settings.io_stack_bytes, Some(65536));
+        assert_eq!(settings.blocking_threads, Some(4));
         assert_eq!(settings.max_connections, Some(32));
         assert_eq!(settings.max_connections_per_ip, Some(8));
         assert_eq!(settings.max_subscriptions, Some(4));

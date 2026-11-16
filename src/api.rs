@@ -46,6 +46,8 @@ use crate::paths;
 use crate::plugin;
 use crate::rpc;
 use crate::server::http::engine::{self, keep_alive_response, wants_keep_alive, HttpRequest};
+#[cfg(unix)]
+use crate::server::http::JobOutcome;
 use crate::settings;
 use crate::threads;
 use crate::transfer;
@@ -206,6 +208,9 @@ struct WsResult {
 enum WorkResult {
     Http(JobResult),
     Ws(WsResult),
+    /// One blocking-pool job ended; the server loop takes its completion slot
+    /// by connection id, or drops it when the connection is gone.
+    BlockingDone { key: u64, outcome: JobOutcome },
 }
 
 #[cfg(unix)]
@@ -1695,6 +1700,7 @@ fn handle(
     // longer transfer is expected.
     let _ = stream.set_read_timeout(Some(idle_timeout));
     let _ = stream.set_write_timeout(Some(idle_timeout));
+    let face = crate::face::api::ApiFace::new(config.clone());
     loop {
         let (head, initial) = match read_head(&mut stream) {
             Ok(head) => head,
@@ -1746,7 +1752,7 @@ fn handle(
             }
         };
         let keep_alive = wants_keep_alive(&request);
-        if let Some(response) = serve_face(&request, peer, &lan, keep_alive) {
+        if let Some(response) = serve_face(&face, &request, peer, &lan, keep_alive) {
             if stream.write_all(&response).is_err() {
                 return;
             }
@@ -1849,66 +1855,107 @@ fn write_sse_line(stream: &mut TcpStream, line: &str) -> std::io::Result<()> {
     stream.flush()
 }
 
-/// Ask the S4 face whether it owns this request, and serve it from the server
-/// side when it does. `None` means the request stays on the legacy path.
-///
-/// The server resolves authentication once and owns the connection policy
-/// (keep-alive) after the face answers. The face never sees the socket.
-fn serve_face(
+/// A face-owned request with authentication and its body already resolved.
+struct PreparedFace {
+    route: crate::server::http::Route,
+    request: crate::server::http::Request,
+}
+
+/// Ask the face whether it owns the request, then resolve the principal and
+/// apply the route's body policy. `Ok(None)` leaves the request to the legacy
+/// path; `Err` is a rendered authentication or body error.
+fn prepare_face_request(
+    face: &dyn crate::server::http::Face,
     request: &HttpRequest,
     peer: IpAddr,
     lan: &Arc<Mutex<Lan>>,
-    keep_alive: bool,
-) -> Option<Vec<u8>> {
-    let mut response = face_request(request, peer, lan)?;
-    if keep_alive {
-        response = keep_alive_response(response);
-    }
-    Some(response)
-}
+) -> Result<Option<PreparedFace>, Vec<u8>> {
+    use crate::server::http::{body_for, BodyError, Request};
 
-/// Run the face half of a request: route, resolve authentication, apply the
-/// body policy, and dispatch. The legacy engines call this where they used to
-/// hand the request to the old router.
-fn face_request(request: &HttpRequest, peer: IpAddr, lan: &Arc<Mutex<Lan>>) -> Option<Vec<u8>> {
-    use crate::server::http::{body_for, dispatch_inline, BodyError, Exchange, Face, Request};
-
-    let face = crate::face::api::ApiFace;
-    let route = face.route(&request.method, &request.path)?;
+    let Some(route) = face.route(&request.method, &request.path) else {
+        return Ok(None);
+    };
     // Authentication still runs per request here. Moving the principal to
     // connection setup belongs to the server-loop slice (#114).
     let principal = match lan.lock() {
         Ok(mut state) => match state.authenticate(&request.headers) {
             Ok(principal) => principal,
-            Err(()) => return Some(error(401, "unauthorized", "authentication required")),
+            Err(()) => return Err(error(401, "unauthorized", "authentication required")),
         },
-        Err(_) => return Some(error(500, "internal", "LAN state unavailable")),
+        Err(_) => return Err(error(500, "internal", "LAN state unavailable")),
     };
     let body = match body_for(route.body, &request.body) {
         Ok(body) => body,
         Err(BodyError::TooLarge) => {
-            return Some(error(413, "payload_too_large", "request body is too large"))
+            return Err(error(413, "payload_too_large", "request body is too large"))
         }
     };
-    let value = Request {
-        method: request.method.clone(),
-        path: request.path.clone(),
-        headers: request.headers.clone(),
-        peer,
-        principal,
-        body,
-    };
-    Some(match dispatch_inline(&face, &route, value) {
+    Ok(Some(PreparedFace {
+        route,
+        request: Request {
+            method: request.method.clone(),
+            path: request.path.clone(),
+            headers: request.headers.clone(),
+            peer,
+            principal,
+            body,
+        },
+    }))
+}
+
+/// Turn a dispatch result into wire bytes. Streamed routes are not wired into
+/// the legacy engines in this slice; #115 hands the stream handler to the
+/// server loop.
+fn render_exchange(
+    result: Result<crate::server::http::Exchange, crate::server::http::DispatchError>,
+) -> Vec<u8> {
+    use crate::server::http::Exchange;
+
+    match result {
         Ok(Exchange::Response(response)) => response.into_bytes(),
-        // Streamed routes are not wired into the legacy engines in this slice;
-        // #115 hands the stream handler to the server loop.
         Ok(Exchange::Stream(_)) => error(
             501,
             "not_implemented",
             "streamed face routes are not wired into this engine yet",
         ),
         Err(cause) => error(500, "internal", &cause.message()),
-    })
+    }
+}
+
+/// The Windows per-connection fallback has no shared blocking pool: its
+/// connection thread is already dedicated to one request, so a `Blocking`
+/// route runs on that thread. The Unix server loop submits to
+/// `BlockingPool` instead and never blocks the loop.
+#[cfg(not(unix))]
+fn serve_face(
+    face: &crate::face::api::ApiFace,
+    request: &HttpRequest,
+    peer: IpAddr,
+    lan: &Arc<Mutex<Lan>>,
+    keep_alive: bool,
+) -> Option<Vec<u8>> {
+    use crate::server::http::{dispatch_blocking_now, dispatch_inline, Dispatch};
+
+    let prepared = match prepare_face_request(face, request, peer, lan) {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => return None,
+        Err(response) => {
+            return Some(if keep_alive {
+                keep_alive_response(response)
+            } else {
+                response
+            })
+        }
+    };
+    let result = match prepared.route.dispatch {
+        Dispatch::Inline => dispatch_inline(face, &prepared.route, prepared.request),
+        Dispatch::Blocking => dispatch_blocking_now(face, &prepared.route, prepared.request),
+    };
+    let mut response = render_exchange(result);
+    if keep_alive {
+        response = keep_alive_response(response);
+    }
+    Some(response)
 }
 
 /// Serve the two streaming UI endpoints before the buffered router. Returns
@@ -2530,38 +2577,6 @@ fn route(config: &std::path::Path, request: &HttpRequest, lan_state: &Arc<Mutex<
             })),
             Err(_) => error(500, "internal", "auth state unavailable"),
         },
-        ("GET", ["api", "v1", "services"]) => match rpc(config, "svc.list", json!({})) {
-            Ok(value) => {
-                let services = value
-                    .get("services")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                let summaries: Vec<Value> = services
-                    .into_iter()
-                    .filter_map(|status| {
-                        let has_config = status
-                            .pointer("/details/config")
-                            .and_then(Value::as_str)
-                            .is_some();
-                        let has_ui = status
-                            .get("summary")
-                            .and_then(|summary| summary.get("id"))
-                            .and_then(Value::as_str)
-                            .map(|id| plugin::web_assets(id).is_some())
-                            .unwrap_or(false);
-                        let mut summary = status.get("summary").cloned()?;
-                        if let Some(object) = summary.as_object_mut() {
-                            object.insert("hasConfig".into(), Value::Bool(has_config));
-                            object.insert("hasUI".into(), Value::Bool(has_ui));
-                        }
-                        Some(summary)
-                    })
-                    .collect();
-                ok(json!({ "services": summaries }))
-            }
-            Err(response) => response,
-        },
         ("GET", ["api", "v1", "services", id]) => {
             match rpc(config, "svc.status", json!({ "id": decode(id) })) {
                 Ok(status) => ok(status),
@@ -3061,20 +3076,39 @@ fn config_error(message: &str) -> Vec<u8> {
     error(status, code_for(status), message)
 }
 
-pub(crate) fn rpc(config: &std::path::Path, method: &str, params: Value) -> Result<Value, Vec<u8>> {
+/// A daemon RPC failure: status, error code and message. The caller renders
+/// the wire envelope; the face uses the same mapping as the legacy router.
+pub(crate) type RpcFailure = (u16, &'static str, String);
+
+pub(crate) fn rpc_result(
+    config: &std::path::Path,
+    method: &str,
+    params: Value,
+) -> Result<Value, RpcFailure> {
     let response = channel::request(config, method, params)
-        .map_err(|cause| error(500, "internal", &format!("svcd unreachable: {}", cause)))?;
+        .map_err(|cause| (500, "internal", format!("svcd unreachable: {}", cause)))?;
     if let Some(error) = response.error {
-        return Err(map_error(&error.message));
+        let status = status_for_error(&error.message);
+        return Err((status, code_for(status), error.message));
     }
     response
         .result
-        .ok_or_else(|| error(500, "internal", "empty daemon response"))
+        .ok_or_else(|| (500, "internal", "empty daemon response".to_string()))
+}
+
+pub(crate) fn rpc(config: &std::path::Path, method: &str, params: Value) -> Result<Value, Vec<u8>> {
+    rpc_result(config, method, params)
+        .map_err(|(status, code, message)| error(status, code, &message))
 }
 
 pub(crate) fn map_error(message: &str) -> Vec<u8> {
+    let status = status_for_error(message);
+    error(status, code_for(status), message)
+}
+
+fn status_for_error(message: &str) -> u16 {
     let lower = message.to_ascii_lowercase();
-    let status = if lower.contains("timed out") || lower.contains("timeout") {
+    if lower.contains("timed out") || lower.contains("timeout") {
         504
     } else if lower.contains("exceeds") || lower.contains("too large") {
         413
@@ -3106,8 +3140,7 @@ pub(crate) fn map_error(message: &str) -> Vec<u8> {
         400
     } else {
         500
-    };
-    error(status, code_for(status), message)
+    }
 }
 
 fn code_for(status: u16) -> &'static str {

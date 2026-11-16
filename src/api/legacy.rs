@@ -5,9 +5,22 @@
 //! worker/takeover path alive until #115-#125 move them to the face. The queue
 //! is bounded; a full queue answers 503 instead of growing without limit.
 
+use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd, RawFd};
 
 use crate::server::http::engine::{self, HttpRequest, LegacyBridge, PreRequest, Table};
+use crate::server::http::{
+    complete_blocking, dispatch_inline, BlockingPool, BodyPolicy, Busy, CancelToken,
+    CompletionSlot, Dispatch, Face, JobOutcome,
+};
+
+/// One queued or running blocking request. The server owns the completion slot
+/// and the connection; the pool only reports that the job finished.
+struct PendingBlocking {
+    slot: CompletionSlot,
+    body: BodyPolicy,
+    keep_alive: bool,
+}
 
 // Temporary bridge: this module is the only consumer of these legacy `api`
 // helpers and disappears with them in #125. Keeping `super::*` here makes the
@@ -24,22 +37,33 @@ pub(crate) fn start(
     config: PathBuf,
     raw_hub: Arc<crate::rawhub::RawHub>,
 ) -> std::io::Result<()> {
+    let (results_tx, results_rx) = mpsc::channel();
+    let (notify_rx, notify_tx) = UnixStream::pair()?;
+    let _ = notify_rx.set_nonblocking(true);
+    let _ = notify_tx.set_nonblocking(true);
+
+    let face: Arc<dyn Face> = Arc::new(crate::face::api::ApiFace::new(config.clone()));
+    // The pool belongs to the server loop, not to one request or the temporary
+    // bridge. Starting it before the loop means a thread-spawn failure fails
+    // HTTP startup instead of silently disabling every route after start().
+    let blocking = {
+        let results = results_tx.clone();
+        let notify = notify_tx.try_clone()?;
+        BlockingPool::start(
+            crate::limits::current().blocking_threads,
+            crate::server::http::pool::QUEUE_LIMIT,
+            move |key, outcome| {
+                let _ = results.send(WorkResult::BlockingDone { key, outcome });
+                let _ = (&notify).write(&[1]);
+            },
+        )?
+    };
+
     thread::Builder::new()
         .name("svcd-server-loop".into())
         .stack_size(threads::transfer_stack())
         .spawn(move || {
             let client = ClientReactor::start().ok();
-            let (results_tx, results_rx) = mpsc::channel();
-            let (notify_rx, notify_tx) = match UnixStream::pair() {
-                Ok((rx, tx)) => (rx, tx),
-                Err(error) => {
-                    log::svcd(&format!("svcd: server-loop notifier failed: {}", error));
-                    return;
-                }
-            };
-            let _ = notify_rx.set_nonblocking(true);
-            let _ = notify_tx.set_nonblocking(true);
-
             let queue = Arc::new(JobQueue {
                 queue: Mutex::new(VecDeque::new()),
                 ready: Condvar::new(),
@@ -65,6 +89,9 @@ pub(crate) fn start(
                 queue,
                 results: results_rx,
                 notify: notify_rx,
+                face,
+                blocking,
+                blocking_pending: HashMap::new(),
             };
             engine::run(listener, &mut handler, crate::limits::current());
         })?;
@@ -79,6 +106,9 @@ struct ServerHandler {
     queue: Arc<JobQueue>,
     results: Receiver<WorkResult>,
     notify: UnixStream,
+    face: Arc<dyn Face>,
+    blocking: BlockingPool,
+    blocking_pending: HashMap<u64, PendingBlocking>,
 }
 
 impl LegacyBridge for ServerHandler {
@@ -176,8 +206,7 @@ impl LegacyBridge for ServerHandler {
 
     fn on_request(&mut self, connection: &mut Connection, request: HttpRequest) {
         let keep_alive = wants_keep_alive(&request);
-        if let Some(response) = serve_face(&request, connection.peer, &self.lan, keep_alive) {
-            write_response(connection, response, keep_alive);
+        if self.serve_face(connection, &request, keep_alive) {
             return;
         }
         let path = request
@@ -371,6 +400,55 @@ impl LegacyBridge for ServerHandler {
                         }
                     }
                 }
+                WorkResult::BlockingDone { key, outcome } => {
+                    let Some(pending) = self.blocking_pending.remove(&key) else {
+                        // Cancel/drop outcomes are expected after a disconnect:
+                        // on_close already sealed and removed the slot. A
+                        // Finished outcome with no pending entry would mean the
+                        // loop lost its bookkeeping.
+                        if outcome == JobOutcome::Finished && connections.contains_key(&key) {
+                            log::svcd(&format!(
+                                "svcd: blocking completion for connection {} lost its slot",
+                                key
+                            ));
+                        }
+                        continue;
+                    };
+                    let exchange = pending.slot.take();
+                    let Some(connection) = connections.get_mut(&key) else {
+                        // The client disconnected while the job was running.
+                        // The sealed slot drops a late completion.
+                        continue;
+                    };
+                    let (response, keep_alive) = match outcome {
+                        JobOutcome::Dropped => (blocking_busy(Busy::Closed), false),
+                        JobOutcome::Finished | JobOutcome::Cancelled => {
+                            let mut response =
+                                super::render_exchange(complete_blocking(pending.body, exchange));
+                            if pending.keep_alive {
+                                response = keep_alive_response(response);
+                            }
+                            (response, pending.keep_alive)
+                        }
+                    };
+                    write_response(connection, response, keep_alive);
+                }
+            }
+        }
+
+        // A blocking job leaves the connection in `Processing`, where the loop
+        // does not request POLLIN. Check for a graceful peer FIN here so a
+        // disconnect cancels the job instead of waiting for POLLHUP.
+        let closed: Vec<u64> = connections
+            .iter()
+            .filter(|(_, connection)| {
+                matches!(connection.state, ConnState::Processing) && peer_closed(connection)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in closed {
+            if let Some(mut connection) = connections.remove(&id) {
+                self.on_close(&mut connection);
             }
         }
 
@@ -459,6 +537,13 @@ impl LegacyBridge for ServerHandler {
     }
 
     fn on_close(&mut self, connection: &mut Connection) {
+        if let Some(pending) = self.blocking_pending.remove(&connection.id) {
+            // Seal the slot first: a job that finishes after this point writes
+            // into a sealed slot and is ignored. Then free a queued slot or
+            // flip a running job's cancellation token.
+            pending.slot.take();
+            self.blocking.cancel(connection.id);
+        }
         release_mcp_stream(connection, self.client.as_deref());
     }
 
@@ -473,6 +558,92 @@ impl LegacyBridge for ServerHandler {
     }
 }
 
+impl ServerHandler {
+    /// Run the face-owned part of one request. Inline routes answer now;
+    /// blocking routes are submitted to the pool and the connection waits in
+    /// `Processing`. Returns false when the request stays on the legacy path.
+    fn serve_face(
+        &mut self,
+        connection: &mut Connection,
+        request: &HttpRequest,
+        keep_alive: bool,
+    ) -> bool {
+        let prepared = match super::prepare_face_request(
+            self.face.as_ref(),
+            request,
+            connection.peer,
+            &self.lan,
+        ) {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => return false,
+            Err(response) => {
+                write_response(
+                    connection,
+                    if keep_alive {
+                        keep_alive_response(response)
+                    } else {
+                        response
+                    },
+                    keep_alive,
+                );
+                return true;
+            }
+        };
+
+        match prepared.route.dispatch {
+            Dispatch::Inline => {
+                let response = super::render_exchange(dispatch_inline(
+                    self.face.as_ref(),
+                    &prepared.route,
+                    prepared.request,
+                ));
+                write_response(
+                    connection,
+                    if keep_alive {
+                        keep_alive_response(response)
+                    } else {
+                        response
+                    },
+                    keep_alive,
+                );
+            }
+            Dispatch::Blocking => {
+                let endpoint = format!("{} {}", request.method, request.path);
+                let (slot, done) = CompletionSlot::new(endpoint);
+                let face = self.face.clone();
+                let face_request = prepared.request;
+                let job = move |cancel: CancelToken| {
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    face.handle(face_request, done);
+                };
+                match self.blocking.try_submit(connection.id, job) {
+                    Ok(()) => {
+                        self.blocking_pending.insert(
+                            connection.id,
+                            PendingBlocking {
+                                slot,
+                                body: prepared.route.body,
+                                keep_alive,
+                            },
+                        );
+                        connection.state = ConnState::Processing;
+                    }
+                    Err(busy) => {
+                        // Pipelining is unsupported, so the loop normally
+                        // cannot submit a second job for one connection. The
+                        // pool still enforces one-per-connection for future
+                        // engines and stream handlers.
+                        write_response(connection, blocking_busy(busy), false);
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
 fn write_response(connection: &mut Connection, response: Vec<u8>, keep_alive: bool) {
     connection.out = response;
     connection.out_at = 0;
@@ -480,19 +651,104 @@ fn write_response(connection: &mut Connection, response: Vec<u8>, keep_alive: bo
     connection.state = ConnState::Writing;
 }
 
-fn bridge_busy() -> Vec<u8> {
-    const BODY: &[u8] = br#"{"error":{"code":"busy","message":"legacy request queue is full"}}"#;
+fn busy_response(message: &str) -> Vec<u8> {
+    let body = json!({ "error": { "code": "busy", "message": message } });
     http::response_with_headers(
         503,
         "application/json",
         &[("Retry-After".to_string(), "1".to_string())],
-        BODY,
+        &serde_json::to_vec(&body).unwrap_or_default(),
     )
+}
+
+fn bridge_busy() -> Vec<u8> {
+    busy_response("legacy request queue is full")
+}
+
+fn blocking_busy(busy: Busy) -> Vec<u8> {
+    busy_response(match busy {
+        Busy::QueueFull => "blocking request queue is full",
+        Busy::AlreadyInFlight => "this connection already has a blocking request in flight",
+        Busy::Closed => "server is shutting down",
+    })
+}
+
+/// Whether the peer sent FIN, without consuming data already buffered in the
+/// socket (that data is the next pipelined request). Called only for a
+/// `Processing` connection; the normal read path detects EOF itself.
+fn peer_closed(connection: &Connection) -> bool {
+    socket_closed(connection.stream.as_raw_fd())
+}
+
+fn socket_closed(fd: RawFd) -> bool {
+    let mut byte = 0u8;
+    let read = unsafe {
+        libc::recv(
+            fd,
+            &mut byte as *mut u8 as *mut libc::c_void,
+            1,
+            libc::MSG_PEEK,
+        )
+    };
+    if read == 0 {
+        return true;
+    }
+    if read < 0 {
+        let error = std::io::Error::last_os_error();
+        return error.kind() != std::io::ErrorKind::WouldBlock
+            && error.kind() != std::io::ErrorKind::Interrupted;
+    }
+    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_graceful_peer_close_is_detected_without_consuming_bytes() {
+        let (mut reader, mut writer) = UnixStream::pair().expect("pair");
+        reader.set_nonblocking(true).expect("nonblocking");
+        assert!(!socket_closed(reader.as_raw_fd()));
+
+        writer.write_all(b"next").expect("write");
+        assert!(
+            !socket_closed(reader.as_raw_fd()),
+            "pending data is not a close"
+        );
+        let mut buffered = [0u8; 4];
+        assert_eq!(reader.read(&mut buffered).expect("read"), 4);
+        assert_eq!(&buffered, b"next", "MSG_PEEK must not consume the bytes");
+
+        drop(writer);
+        reader.set_nonblocking(false).expect("blocking");
+        let mut eof = [0u8; 1];
+        assert_eq!(reader.read(&mut eof).expect("eof"), 0);
+        reader.set_nonblocking(true).expect("nonblocking");
+        assert!(socket_closed(reader.as_raw_fd()));
+    }
+
+    #[test]
+    fn every_busy_outcome_answers_503_with_retry_after() {
+        for (busy, message) in [
+            (Busy::QueueFull, "blocking request queue is full"),
+            (
+                Busy::AlreadyInFlight,
+                "this connection already has a blocking request in flight",
+            ),
+            (Busy::Closed, "server is shutting down"),
+        ] {
+            let response = blocking_busy(busy);
+            let text = String::from_utf8_lossy(&response);
+            assert!(
+                text.starts_with("HTTP/1.1 503 Service Unavailable"),
+                "{text}"
+            );
+            assert!(text.contains("Retry-After: 1"), "{text}");
+            assert!(text.contains("\"code\":\"busy\""), "{text}");
+            assert!(text.contains(message), "{text}");
+        }
+    }
 
     #[test]
     fn a_full_bridge_answers_503_with_retry_after() {

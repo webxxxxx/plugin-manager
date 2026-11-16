@@ -55,7 +55,6 @@ pub enum Dispatch {
     /// On the server loop, without blocking.
     Inline,
     /// On the blocking pool; the completion arrives later on the server loop.
-    #[allow(dead_code)] // #116 is the first Blocking route.
     Blocking,
 }
 
@@ -71,6 +70,16 @@ impl Route {
         Route {
             body,
             dispatch: Dispatch::Inline,
+        }
+    }
+
+    /// A handler that blocks on a control-channel round trip or disk work.
+    /// The server hands it to the blocking pool; the completion comes back on
+    /// the server loop.
+    pub fn blocking(body: BodyPolicy) -> Route {
+        Route {
+            body,
+            dispatch: Dispatch::Blocking,
         }
     }
 }

@@ -52,7 +52,29 @@ pub fn dispatch_inline(
     route: &Route,
     request: Request,
 ) -> Result<Exchange, DispatchError> {
-    if route.dispatch != Dispatch::Inline {
+    dispatch_now(face, route, request, Dispatch::Inline)
+}
+
+/// Run one blocking route on the calling thread. The Unix server loop hands
+/// `Blocking` routes to the blocking pool instead; the Windows per-connection
+/// fallback uses this because its connection thread is already the dedicated
+/// worker for one request.
+#[cfg_attr(unix, allow(dead_code))] // Unix uses BlockingPool instead.
+pub fn dispatch_blocking_now(
+    face: &dyn Face,
+    route: &Route,
+    request: Request,
+) -> Result<Exchange, DispatchError> {
+    dispatch_now(face, route, request, Dispatch::Blocking)
+}
+
+fn dispatch_now(
+    face: &dyn Face,
+    route: &Route,
+    request: Request,
+    expected: Dispatch,
+) -> Result<Exchange, DispatchError> {
+    if route.dispatch != expected {
         return Err(DispatchError::UnsupportedDispatch(route.dispatch));
     }
     let endpoint = format!("{} {}", request.method, request.path);
@@ -72,6 +94,19 @@ pub fn dispatch_inline(
             ));
             Err(error)
         }
+    }
+}
+
+/// Validate the exchange a blocking job produced. A missing completion is an
+/// implementation error, exactly as it is on the inline path.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn complete_blocking(
+    body: BodyPolicy,
+    exchange: Option<Exchange>,
+) -> Result<Exchange, DispatchError> {
+    match exchange {
+        Some(exchange) => check_exchange(body, exchange),
+        None => Err(DispatchError::MissingCompletion),
     }
 }
 
@@ -283,6 +318,27 @@ mod tests {
                 got: ExchangeKind::Response,
             }
         );
+    }
+
+    #[test]
+    fn a_blocking_route_can_run_on_the_calling_thread() {
+        let face = FakeFace {
+            behavior: Behavior::Respond,
+        };
+        let route = Route::blocking(BodyPolicy::Empty);
+        let exchange = dispatch_blocking_now(&face, &route, request())
+            .expect("a blocking route must complete on the calling thread");
+        let Exchange::Response(response) = exchange else {
+            panic!("the fake face returned a memory response");
+        };
+        assert_eq!(response.status, 200);
+
+        let error = expect_error(dispatch_blocking_now(
+            &face,
+            &Route::inline(BodyPolicy::Empty),
+            request(),
+        ));
+        assert_eq!(error, DispatchError::UnsupportedDispatch(Dispatch::Inline));
     }
 
     #[test]
