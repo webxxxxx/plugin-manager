@@ -944,4 +944,32 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn a_full_blocking_queue_turns_into_503_busy() {
+        let head = parse_head(
+            b"POST /api/v1/blobs HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n",
+        );
+        let mut handler = handler(&head);
+        let mut out = Vec::new();
+        let step = handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, 4096));
+        assert!(matches!(step.action, StreamAction::NeedRead));
+        let step = handler.on_event(
+            StreamEvent::Data(b"body"),
+            &mut OutBuffer::new(&mut out, 4096),
+        );
+        assert!(matches!(step.action, StreamAction::SubmitBlocking(_)));
+        let step = handler.on_event(
+            StreamEvent::BlockingDone(BlockingOutcome::Failed(
+                "the blocking queue is full".into(),
+            )),
+            &mut OutBuffer::new(&mut out, 4096),
+        );
+        assert!(matches!(step.action, StreamAction::Close(_)));
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.starts_with("HTTP/1.1 503 Service Unavailable\r\n"), "{text}");
+        assert!(text.contains("Retry-After: 1\r\n"), "{text}");
+        assert!(text.contains("\"code\":\"busy\""), "{text}");
+    }
+
 }
