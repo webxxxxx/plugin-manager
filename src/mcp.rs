@@ -77,12 +77,9 @@ pub fn tool_error(id: Option<Value>, message: &str) -> rpc::Response {
 /// Serve one MCP client over stdio. The bridge never launches svcd; if the
 /// daemon is unreachable at startup it writes to stderr and exits 1.
 pub fn run_stdio() -> i32 {
-    let config = match crate::config::Config::bootstrap(None) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("mcp: invalid config: {}", error);
-            return 1;
-        }
+    let config = match crate::config::Config::bootstrap_or_report("mcp") {
+        Some(config) => config,
+        None => return 1,
     };
     let config = config.paths.config_dir.clone();
     if let Err(error) = startup_ping(&config) {

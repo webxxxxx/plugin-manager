@@ -26,14 +26,12 @@ pub(crate) trait PreBodyRoutes: Send + Sync {
         head: &http::Head,
         peer: IpAddr,
         lan: &Arc<Mutex<Lan>>,
-        config: &std::path::Path,
         raw_hub: Arc<crate::rawhub::RawHub>,
     ) -> Option<Result<Exchange, Vec<u8>>>;
     fn package_upload(
         &self,
         head: &http::Head,
         lan: &Arc<Mutex<Lan>>,
-        config: &std::path::Path,
     ) -> Option<Result<Exchange, Vec<u8>>>;
     fn blob_upload(
         &self,

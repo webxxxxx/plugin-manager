@@ -16,7 +16,13 @@ use crate::limits::{self, Limits};
 use crate::paths::Paths;
 use crate::settings::{self, Settings};
 
-/// Everything the process needs to run, derived from one `svcd.conf`.
+/// Everything the composition root derives from one `svcd.conf`: the parsed
+/// document, the file it came from, the directory set, and the limits.
+///
+/// The `settings` and `limits` fields are the bootstrap snapshot. The
+/// process-wide `settings::current()` / `limits::current()` caches still serve
+/// the readers that S7b has not migrated yet; S7a changes where directories
+/// come from, not where those two values do.
 #[derive(Clone, Debug)]
 pub struct Config {
     /// The document this process runs with.
@@ -30,11 +36,12 @@ pub struct Config {
 }
 
 impl Config {
-    /// Derive a configuration from an already-parsed document.
+    /// Derive a configuration from an already-parsed document, resolving the
+    /// directory set with [`Paths::resolve`] (the production path).
     ///
-    /// Production goes through [`Config::bootstrap`]; unit tests that need a
-    /// whole configuration use this with [`Paths::under`] instead of the
-    /// process environment.
+    /// Unit tests that need a whole configuration use [`Config::with_paths`]
+    /// with [`Paths::under`] so they own the tree and never read the process
+    /// environment.
     pub fn new(settings: Settings, settings_path: Option<PathBuf>) -> Config {
         let paths = Paths::resolve(&settings);
         Self::with_paths(settings, settings_path, paths)
@@ -67,6 +74,29 @@ impl Config {
         let settings_path = settings::path().map(Path::to_path_buf);
         Ok(Config::new(settings, settings_path))
     }
+
+    /// [`Config::bootstrap`] for a process entry that reports the failure with
+    /// its own prefix and exit code.
+    pub fn bootstrap_or_report(label: &str) -> Option<Config> {
+        match Self::bootstrap(None) {
+            Ok(config) => Some(config),
+            Err(error) => {
+                eprintln!("{}: invalid config: {}", label, error);
+                None
+            }
+        }
+    }
+}
+
+/// Tolerant directory resolution for the few phases that must outlive a broken
+/// config: the daemon's pre-`ensure_conf` directory, `stop`/`shutdown`, install
+/// and uninstall, and the Windows SCM readiness probe.
+///
+/// It reads the same `SVCD_*` overrides as bootstrap but falls back to the
+/// platform defaults instead of failing. [`Config::bootstrap`] stays the hard
+/// error entry; this is the only other place that reads those variables.
+pub(crate) fn ambient_paths() -> Paths {
+    Paths::resolve(&settings::current().cloned().unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -79,7 +109,11 @@ mod tests {
         let mut settings = Settings::default();
         settings.http_idle_timeout_secs = Some(7);
         settings.config_dir = Some(PathBuf::from("/etc/svcd"));
-        let config = Config::new(settings, Some(PathBuf::from("/etc/svcd/svcd.conf")));
+        let config = Config::with_paths(
+            settings,
+            Some(PathBuf::from("/etc/svcd/svcd.conf")),
+            Paths::under(Path::new("/tmp/svcd-config-unit")),
+        );
 
         assert_eq!(
             config.settings_path.as_deref(),

@@ -742,7 +742,7 @@ impl Slot {
             Some(hook) => service_hook_command(&self.id, "start", hook, &self.paths),
             None => command_for(&self.exec),
         };
-        let blob_dir = crate::blob::dir(&self.paths);
+        let blob_dir = self.paths.temp_dir.clone();
         let _ = std::fs::create_dir_all(crate::blob::incoming_dir(&self.paths));
         command.env("SVCD_TEMP_DIR", &blob_dir);
         let plan = match self.exec.ready {

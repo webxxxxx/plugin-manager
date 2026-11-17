@@ -94,12 +94,8 @@ pub fn run(args: Vec<String>) -> i32 {
         }
     };
 
-    let config = match Config::bootstrap(None) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("svc: invalid config: {}", error);
-            return EXIT_SERVICE_ERROR;
-        }
+    let Some(config) = Config::bootstrap_or_report("svc") else {
+        return EXIT_SERVICE_ERROR;
     };
     match command {
         Command::List => list(&config),

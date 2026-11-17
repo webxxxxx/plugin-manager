@@ -61,7 +61,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     // Bootstrapping reads the settings cache without failing on a broken file
     // yet: the directory has to exist before `ensure_conf` can report the path
     // it settled on, and `Config::bootstrap` below is the hard failure point.
-    let initial_paths = Paths::resolve(&settings::current().cloned().unwrap_or_default());
+    let initial_paths = crate::config::ambient_paths();
     if let Err(error) = fs::create_dir_all(&initial_paths.config_dir) {
         eprintln!(
             "svcd: cannot create config directory {}: {}",
@@ -398,7 +398,7 @@ pub fn shutdown_quiet() -> i32 {
 fn shutdown_inner(verbose: bool) -> i32 {
     // Stopping only needs the control endpoint; a broken `svcd.conf` must not
     // make `svcd stop` unusable.
-    let paths = Paths::resolve(&settings::current().cloned().unwrap_or_default());
+    let paths = crate::config::ambient_paths();
     match channel::request(&paths.config_dir, "svcd.shutdown", json!({})) {
         Ok(response) => match response.error {
             Some(error) => {

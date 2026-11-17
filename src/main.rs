@@ -180,12 +180,9 @@ fn stop_daemon() {
 
 fn start_command() -> i32 {
     if crate::paths::user_mode() {
-        match crate::config::Config::bootstrap(None) {
-            Ok(config) => user_start(&config),
-            Err(error) => {
-                eprintln!("svcd: invalid config: {}", error);
-                return 1;
-            }
+        match crate::config::Config::bootstrap_or_report("svcd") {
+            Some(config) => user_start(&config),
+            None => 1,
         }
     } else {
         crate::install::service_start()
@@ -202,12 +199,9 @@ fn stop_command() -> i32 {
 
 fn status_command() -> i32 {
     if crate::paths::user_mode() {
-        match crate::config::Config::bootstrap(None) {
-            Ok(config) => user_status(&config),
-            Err(error) => {
-                eprintln!("svcd: invalid config: {}", error);
-                return 1;
-            }
+        match crate::config::Config::bootstrap_or_report("svcd") {
+            Some(config) => user_status(&config),
+            None => 1,
         }
     } else {
         crate::install::service_status()
@@ -216,13 +210,13 @@ fn status_command() -> i32 {
 
 fn user_command(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
-        Some("start") | Some("status") => match crate::config::Config::bootstrap(None) {
-            Ok(config) if args.first().map(String::as_str) == Some("start") => user_start(&config),
-            Ok(config) => user_status(&config),
-            Err(error) => {
-                eprintln!("svcd: invalid config: {}", error);
-                1
-            }
+        Some("start") => match crate::config::Config::bootstrap_or_report("svcd") {
+            Some(config) => user_start(&config),
+            None => 1,
+        },
+        Some("status") => match crate::config::Config::bootstrap_or_report("svcd") {
+            Some(config) => user_status(&config),
+            None => 1,
         },
         Some("stop") => crate::daemon::shutdown(),
         Some("install") => user_install(),

@@ -110,12 +110,8 @@ pub struct Meta {
     pub size: u64,
 }
 
-pub fn dir(paths: &Paths) -> PathBuf {
-    paths.temp_dir.clone()
-}
-
 pub fn incoming_dir(paths: &Paths) -> PathBuf {
-    dir(paths).join("incoming")
+    paths.temp_dir.join("incoming")
 }
 
 /// A streaming write into the content-addressed store. Bytes are hashed while
@@ -125,8 +121,6 @@ pub struct Upload {
     file: fs::File,
     hasher: Sha256,
     temp: PathBuf,
-    /// The content-store root chosen when the upload began.
-    root: PathBuf,
     size: u64,
     committed: bool,
 }
@@ -144,7 +138,6 @@ impl Upload {
             file,
             hasher: Sha256::new(),
             temp,
-            root: directory,
             size: 0,
             committed: false,
         })
@@ -167,13 +160,13 @@ impl Upload {
         Ok(())
     }
 
-    pub fn finish(mut self) -> Result<Meta> {
+    pub fn finish(mut self, paths: &Paths) -> Result<Meta> {
         self.file
             .sync_all()
             .map_err(|error| Error::internal(format!("sync {}: {}", self.temp.display(), error)))?;
         let digest = std::mem::replace(&mut self.hasher, Sha256::new()).finalize();
         let id = format!("sha256:{}", hex(&digest));
-        let destination = blob_path_in(&self.root, &id)?;
+        let destination = blob_path(paths, &id)?;
         if destination.is_file() {
             let _ = fs::remove_file(&self.temp);
         } else if let Err(error) = fs::rename(&self.temp, &destination) {
@@ -206,7 +199,7 @@ impl Drop for Upload {
 pub fn put( paths: &Paths, bytes: &[u8]) -> Result<Meta> {
     let mut upload = Upload::begin(paths)?;
     upload.write(bytes)?;
-    upload.finish()
+    upload.finish(paths)
 }
 
 #[cfg(test)]
@@ -257,7 +250,7 @@ impl UploadKind {
 
 #[cfg(feature = "http")]
 pub fn uploads_dir(paths: &Paths) -> PathBuf {
-    dir(paths).join("uploads")
+    paths.temp_dir.join("uploads")
 }
 
 #[cfg(feature = "http")]
@@ -499,7 +492,7 @@ pub fn complete_upload(
             upload.write(&buffer[..read])?;
         }
     }
-    let meta = upload.finish()?;
+    let meta = upload.finish(paths)?;
     let _ = fs::remove_dir_all(&directory);
     Ok(meta)
 }
@@ -579,7 +572,7 @@ pub struct FileMeta {
 
 #[cfg(feature = "http")]
 pub fn files_dir(paths: &Paths) -> PathBuf {
-    dir(paths).join("files")
+    paths.temp_dir.join("files")
 }
 
 #[cfg(feature = "http")]
@@ -783,7 +776,7 @@ fn random_id() -> Result<String> {
 /// blobs and stale `incoming/` files. Active reads/argument resolution touch
 /// the mtime first, so a file that is being used is not immediately eligible.
 pub fn cleanup( paths: &Paths, retention: Duration) -> std::io::Result<usize> {
-    let root = dir(paths);
+    let root = paths.temp_dir.clone();
     if !root.is_dir() {
         return Ok(0);
     }
@@ -964,7 +957,7 @@ fn import_file( paths: &Paths, source: &Path) -> Result<Meta> {
         let _ = fs::remove_file(&source);
         return Ok(Meta { id, size });
     }
-    let directory = dir(paths);
+    let directory = paths.temp_dir.clone();
     fs::create_dir_all(&directory)
         .map_err(|error| Error::internal(format!("create {}: {}", directory.display(), error)))?;
     match fs::rename(&source, &destination) {

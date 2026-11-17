@@ -91,12 +91,14 @@ pub fn run(args: Vec<String>) -> i32 {
             return EXIT_USAGE;
         }
     };
-    let config = match Config::bootstrap(None) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("plugin: invalid config: {}", error);
-            return 1;
-        }
+    // `plugin bundle` works on a directory and a key: it needs no runtime
+    // directories, so a broken `svcd.conf` must not block it.
+    let command = match command {
+        Command::Bundle(options) => return bundle_command(options),
+        other => other,
+    };
+    let Some(config) = Config::bootstrap_or_report("plugin") else {
+        return 1;
     };
     match command {
         Command::List => list(&config),
@@ -130,7 +132,7 @@ pub fn run(args: Vec<String>) -> i32 {
             no_config,
             force,
         } => import(&config, &path, config_id.as_deref(), no_config, force),
-        Command::Bundle(options) => bundle_command(options),
+        Command::Bundle(_) => unreachable!("bundle is handled before bootstrap"),
     }
 }
 

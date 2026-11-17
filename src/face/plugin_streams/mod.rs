@@ -15,7 +15,6 @@ pub mod raw;
 pub mod sse;
 pub mod ws;
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::face::plugin_ui::{PluginUiStream, UiPath};
@@ -30,9 +29,8 @@ use crate::uichannel;
 /// Everything the realtime handlers need that is not the request itself. The
 /// legacy engine always has it; a build without a raw transport has `None`.
 pub(crate) struct StreamContext {
-    /// The control endpoint directory (the socket path lives under it).
-    pub config: PathBuf,
-    /// The plugin tree the realtime handlers validate tokens against.
+    /// The one directory set: the control endpoint (`paths.config_dir`) and the
+    /// plugin tree both come from it.
     pub paths: Arc<Paths>,
     pub raw_hub: Option<Arc<crate::rawhub::RawHub>>,
 }
@@ -172,7 +170,7 @@ pub(crate) fn open_ws(
     };
     match uichannel::bus().subscribe(ui.id) {
         Ok((receiver, subscription)) => Box::new(ws::WsStream::new(
-            context.config.clone(),
+            context.paths.config_dir.clone(),
             ui.id.to_string(),
             accept,
             receiver,

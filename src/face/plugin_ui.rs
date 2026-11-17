@@ -90,7 +90,6 @@ impl PluginUiFace {
         PluginUiFace {
             lan,
             streams: Arc::new(StreamContext {
-                config: config.paths.config_dir.clone(),
                 paths: config.paths.clone(),
                 raw_hub,
             }),

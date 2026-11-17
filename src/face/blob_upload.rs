@@ -431,7 +431,7 @@ impl UploadState {
                 if upload.size() == 0 {
                     return Err(UploadFailure::body("empty blob body"));
                 }
-                let meta = upload.finish().map_err(UploadFailure::from)?;
+                let meta = upload.finish(&self.paths).map_err(UploadFailure::from)?;
                 self.finished = Some(Ok(Success::Blob(meta)));
             }
             UploadTarget::Part { .. } => {
