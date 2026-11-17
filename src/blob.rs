@@ -1022,6 +1022,19 @@ fn hex(bytes: &[u8]) -> String {
 /// Shared so the face download tests and the blob tests do not race by
 /// pointing `SVCD_TEMP_DIR` at two different trees.
 #[cfg(test)]
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Blob tests share one data/temp root (the env vars are process-global), so
+/// they run one at a time. CI is serial anyway; this keeps a parallel local
+/// run from aborting a session another test is cleaning up.
+#[cfg(test)]
+pub(crate) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+#[cfg(test)]
 pub(crate) fn test_temp_dir() -> &'static Path {
     use std::sync::OnceLock;
 
@@ -1050,6 +1063,7 @@ mod tests {
 
     #[test]
     fn blobs_are_content_addressed_and_readable() {
+        let _guard = test_guard();
         let _ = root();
         let first = put(b"hello").expect("put");
         let second = put(b"hello").expect("put");
@@ -1060,6 +1074,7 @@ mod tests {
 
     #[test]
     fn invalid_ids_are_rejected() {
+        let _guard = test_guard();
         for id in ["", "sha256:", "sha256:xyz", "../x", "sha256:../x"] {
             assert!(read(id).is_err(), "{id}");
         }
@@ -1067,6 +1082,7 @@ mod tests {
 
     #[test]
     fn a_plugin_blob_result_becomes_a_resource_link() {
+        let _guard = test_guard();
         let _ = root();
         let incoming = incoming_dir();
         std::fs::create_dir_all(&incoming).expect("incoming");
@@ -1093,6 +1109,7 @@ mod tests {
 
     #[test]
     fn cleanup_removes_old_files_and_keeps_fresh_ones() {
+        let _guard = test_guard();
         let _ = root();
         let incoming = incoming_dir();
         std::fs::create_dir_all(&incoming).expect("incoming");
@@ -1117,6 +1134,7 @@ mod tests {
 
     #[test]
     fn blob_refs_are_resolved_to_paths_in_arguments() {
+        let _guard = test_guard();
         let _ = root();
         let meta = put(b"file body").expect("put");
         let mut args = json!({"input": {"$blob": meta.id}, "other": 1});
@@ -1130,6 +1148,7 @@ mod tests {
     #[cfg(feature = "http")]
     #[test]
     fn part_writer_refuses_a_cross_kind_session() {
+        let _guard = test_guard();
         let _ = root();
         let upload = create_upload(UploadKind::File).expect("file upload");
         let error = match PartWriter::begin(&upload, 1, UploadKind::Blob) {
@@ -1143,6 +1162,7 @@ mod tests {
     #[cfg(feature = "http")]
     #[test]
     fn cleanup_removes_a_stale_file_bundle_as_one_unit() {
+        let _guard = test_guard();
         let _ = root();
         let upload = create_upload(UploadKind::File).expect("file upload");
         let mut writer = PartWriter::begin(&upload, 1, UploadKind::File).expect("part writer");
@@ -1168,6 +1188,7 @@ mod tests {
     #[cfg(feature = "http")]
     #[test]
     fn file_bundles_resolve_to_a_manifest_and_size() {
+        let _guard = test_guard();
         let _ = root();
         let upload = create_upload(UploadKind::File).expect("file upload");
         for (number, bytes) in [(1u32, b"hello ".as_slice()), (2u32, b"world!")] {
