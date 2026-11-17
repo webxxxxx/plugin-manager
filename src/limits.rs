@@ -414,6 +414,12 @@ mod tests {
     }
 
     #[test]
+    fn control_timeout_defaults_to_thirty_seconds() {
+        let limits = limits_with(&settings::Settings::default());
+        assert_eq!(limits.control_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
     fn every_limit_has_a_floor() {
         let mut settings = settings::Settings::default();
         settings.request_stack_bytes = Some(0);

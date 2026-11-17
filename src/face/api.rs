@@ -609,8 +609,8 @@ impl Face for ApiFace {
             }
         } else if is_api_path(&request.path) {
             if request.principal == AuthKind::Cookie
-                && support::is_write(&request.method)
-                && !support::csrf_ok_headers(&request.headers)
+                && http::is_write_method(&request.method)
+                && !http::csrf_ok(&request.headers)
             {
                 error_response(
                     403,

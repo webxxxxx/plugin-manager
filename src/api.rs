@@ -29,6 +29,7 @@ use serde_json::json;
 
 use crate::blob;
 use crate::blob_http;
+use crate::face::support::{decode, error};
 use crate::channel;
 use crate::face::plugin_ui::{ui_path, UiPath};
 use crate::http;
@@ -824,7 +825,7 @@ fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u
     // management API's custom CSRF header, so a plugin's own page can call it
     // with a plain `fetch` (see `ui_rpc`).
     if auth == AuthKind::Cookie
-        && crate::face::support::is_write(&request.method)
+        && http::is_write_method(&request.method)
         && !ui.as_ref().map(|route| route.sub == "rpc").unwrap_or(false)
         && !csrf_ok(request)
     {
@@ -984,7 +985,7 @@ fn same_origin(request: &HttpRequest) -> bool {
 }
 
 fn csrf_ok(request: &HttpRequest) -> bool {
-    crate::face::support::csrf_ok_headers(&request.headers)
+    http::csrf_ok(&request.headers)
 }
 
 /// Why no complete request head arrived. A timeout or EOF is a closed
@@ -1066,7 +1067,7 @@ fn read_body(
         } else {
             400
         };
-        error(status, code_for(status), &message)
+        error(status, crate::face::support::code_for(status), &message)
     })?;
     Ok(HttpRequest {
         method: head.method,
@@ -1140,27 +1141,6 @@ fn route(_config: &std::path::Path, request: &HttpRequest) -> Vec<u8> {
 
 fn method_not_allowed(allow: &str) -> Vec<u8> {
     http::method_not_allowed(allow)
-}
-
-#[cfg_attr(unix, allow(dead_code))] // the Unix path answers through the face helpers.
-fn code_for(status: u16) -> &'static str {
-    match status {
-        400 => "bad_request",
-        403 => "forbidden",
-        404 => "not_found",
-        409 => "conflict",
-        413 => "payload_too_large",
-        504 => "timeout",
-        _ => "internal",
-    }
-}
-
-fn error(status: u16, code: &str, message: &str) -> Vec<u8> {
-    http::json_error(status, code, message)
-}
-
-fn decode(value: &str) -> String {
-    http::percent_decode(value, true)
 }
 
 #[cfg(test)]

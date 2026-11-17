@@ -349,6 +349,37 @@ fn response_from_line(line: &str) -> io::Result<Option<crate::rpc::Response>> {
 /// cancellation to one poll period.
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// A control-stream read that never blocks. The readiness wait belongs to the
+/// deadline loop; without this adapter `BufReader::fill_buf` does a second
+/// blocking read after a partial frame and ignores both the deadline and a
+/// disconnect. A zero-timeout poll (Unix) or peek (Windows) turns that read
+/// into `WouldBlock` while `FrameReader` keeps the bytes it already has.
+struct PollReader {
+    stream: Stream,
+}
+
+impl PollReader {
+    fn wait_readable(&self, timeout: Duration) -> io::Result<bool> {
+        self.stream.wait_readable(timeout)
+    }
+
+    fn into_inner(self) -> Stream {
+        self.stream
+    }
+}
+
+impl std::io::Read for PollReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.stream.wait_readable(Duration::ZERO)? {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "no control data ready",
+            ));
+        }
+        std::io::Read::read(&mut self.stream, buf)
+    }
+}
+
 /// One request/response round trip with a deadline and a cancellation check.
 ///
 /// The blocking `request` stays the CLI path: a long-running service action is
@@ -371,7 +402,7 @@ pub fn request_within<C: Fn() -> bool>(
     let line = request_line(method, params, token);
     ipc::write_frame_limit(&mut stream, &line, ipc::LOCAL_FRAME_MAX)?;
 
-    let mut reader = ipc::FrameReader::new(BufReader::new(stream));
+    let mut reader = ipc::FrameReader::new(BufReader::new(PollReader { stream }));
     loop {
         if cancelled() {
             return Err(io::Error::new(
@@ -403,7 +434,9 @@ pub fn request_within<C: Fn() -> bool>(
             Err(ipc::FrameError::Io(error))
                 if matches!(
                     error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
                 ) =>
             {
                 continue;
@@ -415,7 +448,7 @@ pub fn request_within<C: Fn() -> bool>(
             // still share the frame parser so a protocol change cannot drift.
             continue;
         };
-        release(config, reader.into_inner().into_inner());
+        release(config, reader.into_inner().into_inner().into_inner());
         return Ok(response);
     }
 }
@@ -864,6 +897,45 @@ mod tests {
         )
         .expect("the resumed frame is a response");
         assert_eq!(response.result, Some(serde_json::json!({ "ok": true })));
+        server.join().expect("server");
+        let _ = fs::remove_dir_all(&config);
+    }
+
+    /// A half frame followed by silence must not park the worker in a blocking
+    /// read: the short read timeout has to keep the deadline and the cancel
+    /// token observable even with partial bytes already read.
+    #[test]
+    fn a_stalled_partial_frame_still_hits_the_deadline() {
+        let config = config_dir("stalled-partial");
+        let listener = listener(&config);
+        let server = std::thread::spawn(move || {
+            let mut stream = listener
+                .incoming()
+                .next()
+                .expect("accept")
+                .expect("stream");
+            stream
+                .write_all(br#"{"jsonrpc":"2.0","id":1,"#)
+                .expect("partial frame");
+            stream.flush().expect("flush");
+            std::thread::sleep(Duration::from_secs(2));
+        });
+
+        let started = Instant::now();
+        let error = request_within(
+            &config,
+            "svcd.ping",
+            serde_json::json!({}),
+            Instant::now() + Duration::from_millis(150),
+            || false,
+        )
+        .expect_err("a partial frame cannot extend the deadline");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the deadline must fire with a partial frame, took {:?}",
+            started.elapsed()
+        );
         server.join().expect("server");
         let _ = fs::remove_dir_all(&config);
     }

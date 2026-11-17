@@ -145,14 +145,6 @@ pub fn map_error_status(message: &str) -> (u16, &'static str, String) {
     (status, code_for(status), message.to_string())
 }
 
-pub fn is_write(method: &str) -> bool {
-    http::is_write_method(method)
-}
-
-pub fn csrf_ok_headers(headers: &[(String, String)]) -> bool {
-    http::csrf_ok(headers)
-}
-
 pub fn query_value(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (name, value) = pair.split_once('=')?;
@@ -205,7 +197,7 @@ fn status_for_error(message: &str) -> u16 {
     }
 }
 
-fn code_for(status: u16) -> &'static str {
+pub(crate) fn code_for(status: u16) -> &'static str {
     match status {
         400 => "bad_request",
         403 => "forbidden",
@@ -217,10 +209,10 @@ fn code_for(status: u16) -> &'static str {
     }
 }
 
-fn error(status: u16, code: &str, message: &str) -> Vec<u8> {
+pub(crate) fn error(status: u16, code: &str, message: &str) -> Vec<u8> {
     http::json_error(status, code, message)
 }
 
-fn decode(value: &str) -> String {
+pub(crate) fn decode(value: &str) -> String {
     http::percent_decode(value, true)
 }
