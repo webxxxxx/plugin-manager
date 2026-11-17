@@ -46,15 +46,6 @@ pub struct PendingRequest {
 }
 
 #[cfg(unix)]
-impl PendingRequest {
-    /// Whether the in-flight request is HEAD. The loop keeps the parsed head
-    /// while a body error is rendered, so the error reply can stay body-less.
-    pub fn head_only(&self) -> bool {
-        crate::http::is_head(&self.method)
-    }
-}
-
-#[cfg(unix)]
 pub enum PendingFraming {
     None,
     Length(u64),
@@ -73,6 +64,11 @@ pub struct Connection<S> {
     pub out: Vec<u8>,
     pub out_at: usize,
     pub keep_alive: bool,
+    /// The request being answered is HEAD: the server writes its response
+    /// head and no body. Set when the request head is parsed and cleared
+    /// before the next one, so a delayed completion still reads the method of
+    /// the request it belongs to.
+    pub head_only: bool,
     pub pending: Option<PendingRequest>,
     pub state: S,
 }
@@ -290,6 +286,7 @@ where
                                 out: Vec::new(),
                                 out_at: 0,
                                 keep_alive: false,
+                                head_only: false,
                                 pending: None,
                                 state: handler.new_state(id, ip),
                             };
@@ -401,6 +398,10 @@ pub fn advance_request<S>(
     body_limit: impl Fn(&str) -> u64,
 ) -> Result<Option<HttpRequest>, Vec<u8>> {
     if connection.pending.is_none() {
+        // This request's method decides how its response is rendered. Clear
+        // the previous request's flag first; an unparsable head leaves it
+        // false because there is no method to trust.
+        connection.head_only = false;
         let Some(header_end) = http::header_end(&connection.buffer) else {
             if connection.buffer.len() > crate::limits::current().max_header {
                 return Err(crate::http::json_error(
@@ -426,9 +427,19 @@ pub fn advance_request<S>(
                 "malformed request line",
             ));
         };
+        connection.head_only = crate::http::is_head(&head.method);
         let framing = http::framing(&head.headers)
             .map_err(|message| crate::http::json_error(400, "bad_request", &message))?;
         let limit = body_limit(&head.path);
+        if let http::Framing::Length(length) = framing {
+            if length > limit {
+                return Err(crate::http::json_error(
+                    413,
+                    "payload_too_large",
+                    "request body is too large",
+                ));
+            }
+        }
         let buffer = std::mem::take(&mut connection.buffer);
         connection.buffer = buffer[body_start..].to_vec();
         connection.pending = Some(PendingRequest {
@@ -443,17 +454,6 @@ pub fn advance_request<S>(
                 http::Framing::Chunked => PendingFraming::Chunked(http::ChunkedDecoder::new(limit)),
             },
         });
-        // Record the head before rejecting an oversized body: on_error reads
-        // the pending method to keep a HEAD error reply body-less.
-        if let http::Framing::Length(length) = framing {
-            if length > limit {
-                return Err(crate::http::json_error(
-                    413,
-                    "payload_too_large",
-                    "request body is too large",
-                ));
-            }
-        }
     }
 
     let mut ready = false;

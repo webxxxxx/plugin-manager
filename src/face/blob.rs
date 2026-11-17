@@ -51,7 +51,7 @@ pub fn download_target(method: &str, path: &str) -> Option<DownloadTarget> {
     if parts.get(2) == Some(&"files") {
         parts[2] = "file";
     }
-    let head_only = method == "HEAD";
+    let head_only = http::is_head(method);
     match (method, parts.as_slice()) {
         ("GET" | "HEAD", ["api", "v1", "blobs", id]) => Some(DownloadTarget::Blob {
             id: http::percent_decode(id, false),

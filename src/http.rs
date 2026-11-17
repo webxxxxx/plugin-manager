@@ -446,15 +446,15 @@ pub fn response_with_headers(
 
 /// Whether a request method is HEAD. A HEAD response carries the same head as
 /// the matching GET, including its `Content-Length`, but no body (RFC 9110
-/// §9.3.2). The server checks this at every point that renders an in-memory
-/// response, so error replies cannot leave bytes on a keep-alive connection.
+/// §9.3.2). The server's in-memory write points use this; a stream handler
+/// that writes its own bytes keeps the same rule itself.
 pub fn is_head(method: &str) -> bool {
     method.eq_ignore_ascii_case("HEAD")
 }
 
 /// Truncate a rendered response to its head. The declared `Content-Length` is
 /// kept, so the bytes match what the same route would answer to GET.
-pub fn head_only(mut response: Vec<u8>) -> Vec<u8> {
+pub fn strip_body(mut response: Vec<u8>) -> Vec<u8> {
     if let Some(end) = header_end(&response) {
         response.truncate(end + 4);
     }
@@ -875,7 +875,7 @@ mod tests {
     #[test]
     fn head_only_keeps_the_head_and_its_content_length() {
         let full = response(401, "application/json", br#"{"error":"unauthorized"}"#);
-        let head = head_only(full.clone());
+        let head = strip_body(full.clone());
         let end = full
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
@@ -887,6 +887,6 @@ mod tests {
         assert!(text.contains("Content-Length: 24"), "{text}");
         assert!(text.ends_with("\r\n\r\n"), "{text}");
         assert!(is_head("HEAD") && is_head("head") && !is_head("GET"));
-        assert_eq!(head_only(b"no header block".to_vec()), b"no header block");
+        assert_eq!(strip_body(b"no header block".to_vec()), b"no header block");
     }
 }

@@ -344,7 +344,7 @@ fn listener_loop(listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config: Pa
 #[cfg(not(unix))]
 fn write_http(stream: &mut TcpStream, response: &[u8], head_only: bool) -> std::io::Result<()> {
     if head_only {
-        stream.write_all(&http::head_only(response.to_vec()))
+        stream.write_all(&http::strip_body(response.to_vec()))
     } else {
         stream.write_all(response)
     }

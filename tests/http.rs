@@ -416,6 +416,17 @@ fn read_raw_response(stream: &mut TcpStream) -> RawResponse {
     }
 }
 
+/// Send one hand-built request head with no body and read the full response.
+/// Used when the test must declare a framing the helpers cannot express.
+fn send_request_head(address: &str, head: &str) -> RawResponse {
+    let mut stream = TcpStream::connect(address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    stream.write_all(head.as_bytes()).expect("write request head");
+    read_raw_response(&mut stream)
+}
+
 fn read_one_response(stream: &mut TcpStream) -> RawResponse {
     let (status, headers) = read_response_head(stream);
     let length = headers
@@ -1927,11 +1938,7 @@ fn head_payload_too_large_has_no_body() {
         address,
         512u64 * 1024 * 1024
     );
-    let mut get_stream = TcpStream::connect(&address).expect("connect");
-    get_stream
-        .write_all(get_request.as_bytes())
-        .expect("write GET head");
-    let get_refused = read_raw_response(&mut get_stream);
+    let get_refused = send_request_head(&address, &get_request);
     assert_eq!(get_refused.status, 413, "{:?}", get_refused.body);
     let get_length = header_value(&get_refused.headers, "content-length")
         .expect("GET 413 advertises a body")
@@ -1943,11 +1950,7 @@ fn head_payload_too_large_has_no_body() {
         address,
         512u64 * 1024 * 1024
     );
-    let mut head_stream = TcpStream::connect(&address).expect("connect");
-    head_stream
-        .write_all(head_request.as_bytes())
-        .expect("write HEAD head");
-    let head_refused = read_raw_response(&mut head_stream);
+    let head_refused = send_request_head(&address, &head_request);
     assert_eq!(head_refused.status, 413);
     assert!(
         head_refused.body.is_empty(),
@@ -1958,6 +1961,43 @@ fn head_payload_too_large_has_no_body() {
         header_value(&head_refused.headers, "content-length"),
         Some(get_length.as_str()),
         "HEAD 413 keeps the GET Content-Length"
+    );
+}
+
+/// An ambiguous request framing is rejected before the body policy resolves.
+/// The parsed method is still enough to keep a HEAD 400 body-less.
+#[test]
+fn head_bad_framing_has_no_body() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let get_request = format!(
+        "GET /api/v1/services HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        address
+    );
+    let get_refused = send_request_head(&address, &get_request);
+    assert_eq!(get_refused.status, 400, "{:?}", get_refused.body);
+    assert!(!get_refused.body.is_empty(), "GET 400 keeps its JSON body");
+    let get_length = header_value(&get_refused.headers, "content-length")
+        .expect("GET 400 advertises a body")
+        .to_string();
+
+    let head_request = format!(
+        "HEAD /api/v1/services HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        address
+    );
+    let head_refused = send_request_head(&address, &head_request);
+    assert_eq!(head_refused.status, 400);
+    assert!(
+        head_refused.body.is_empty(),
+        "HEAD 400 carried a body: {}",
+        String::from_utf8_lossy(&head_refused.body)
+    );
+    assert_eq!(
+        header_value(&head_refused.headers, "content-length"),
+        Some(get_length.as_str()),
+        "HEAD 400 keeps the GET Content-Length"
     );
 }
 
