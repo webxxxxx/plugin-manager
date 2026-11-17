@@ -25,10 +25,11 @@ use std::thread;
 #[cfg(not(unix))]
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::blob;
 use crate::blob_http;
+use crate::face::support::{decode, error};
 use crate::channel;
 use crate::face::plugin_ui::{ui_path, UiPath};
 use crate::http;
@@ -850,7 +851,7 @@ fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u
     // management API's custom CSRF header, so a plugin's own page can call it
     // with a plain `fetch` (see `ui_rpc`).
     if auth == AuthKind::Cookie
-        && is_write(&request.method)
+        && http::is_write_method(&request.method)
         && !ui.as_ref().map(|route| route.sub == "rpc").unwrap_or(false)
         && !csrf_ok(request)
     {
@@ -1009,16 +1010,8 @@ fn same_origin(request: &HttpRequest) -> bool {
     http::same_origin(&request.headers)
 }
 
-pub(crate) fn is_write(method: &str) -> bool {
-    http::is_write_method(method)
-}
-
 fn csrf_ok(request: &HttpRequest) -> bool {
-    csrf_ok_headers(&request.headers)
-}
-
-pub(crate) fn csrf_ok_headers(headers: &[(String, String)]) -> bool {
-    http::csrf_ok(headers)
+    http::csrf_ok(&request.headers)
 }
 
 /// Why no complete request head arrived. A timeout or EOF is a closed
@@ -1094,7 +1087,7 @@ fn read_body(
         } else {
             400
         };
-        error(status, code_for(status), &message)
+        error(status, crate::face::support::code_for(status), &message)
     })
 }
 
@@ -1191,147 +1184,6 @@ fn route(_config: &std::path::Path, request: &HttpRequest) -> Vec<u8> {
 
 fn method_not_allowed(allow: &str) -> Vec<u8> {
     http::method_not_allowed(allow)
-}
-
-pub(crate) fn require_plugin_result(
-    config: &Path,
-    id: &str,
-) -> Result<(), (u16, &'static str, String)> {
-    if !package::valid_name(id) {
-        return Err((404, "not_found", format!("unknown plugin: {}", id)));
-    }
-    let status = rpc_result(config, "svc.status", json!({ "id": id }))?;
-    let kind = status
-        .pointer("/summary/kind")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if kind == "plugin" {
-        Ok(())
-    } else {
-        Err((404, "not_found", format!("not a plugin: {}", id)))
-    }
-}
-
-pub(crate) fn config_error_status(message: &str) -> (u16, &'static str, String) {
-    let lower = message.to_ascii_lowercase();
-    let status = if lower.contains("unknown plugin") {
-        404
-    } else if lower.contains("exceeds 1 mib") {
-        413
-    } else if lower.contains("configcheck") {
-        409
-    } else {
-        500
-    };
-    (status, code_for(status), message.to_string())
-}
-
-/// A daemon RPC failure: status, error code and message. The caller renders
-/// the wire envelope; the face uses the same mapping as the legacy router.
-pub(crate) type RpcFailure = (u16, &'static str, String);
-
-pub(crate) fn rpc_result(
-    config: &std::path::Path,
-    method: &str,
-    params: Value,
-) -> Result<Value, RpcFailure> {
-    let response = channel::request(config, method, params)
-        .map_err(|cause| (500, "internal", format!("svcd unreachable: {}", cause)))?;
-    if let Some(error) = response.error {
-        let status = status_for_error(&error.message);
-        return Err((status, code_for(status), error.message));
-    }
-    response
-        .result
-        .ok_or_else(|| (500, "internal", "empty daemon response".to_string()))
-}
-
-pub(crate) fn rpc(config: &std::path::Path, method: &str, params: Value) -> Result<Value, Vec<u8>> {
-    rpc_result(config, method, params)
-        .map_err(|(status, code, message)| error(status, code, &message))
-}
-
-pub(crate) fn map_error(message: &str) -> Vec<u8> {
-    let (status, code, message) = map_error_status(message);
-    error(status, code, &message)
-}
-
-pub(crate) fn map_error_status(message: &str) -> (u16, &'static str, String) {
-    let status = status_for_error(message);
-    (status, code_for(status), message.to_string())
-}
-
-fn status_for_error(message: &str) -> u16 {
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("timed out") || lower.contains("timeout") {
-        504
-    } else if lower.contains("exceeds") || lower.contains("too large") {
-        413
-    } else if lower.contains("unknown keyid") || lower.contains("trust root") {
-        400
-    } else if lower.contains("id is a core service") {
-        404
-    } else if lower.contains("unknown") || lower.contains("not found") {
-        404
-    } else if lower.contains("configcheck") {
-        409
-    } else if lower.contains("not a plugin")
-        || lower.contains("core service")
-        || lower.contains("conflict")
-        || lower.contains("cannot be enabled")
-    {
-        409
-    } else if lower.contains("signature")
-        || lower.contains("platform")
-        || lower.contains("protocol")
-        || lower.contains("unsafe")
-        || lower.contains("setuid")
-        || lower.contains("hooks")
-        || lower.contains("invalid")
-        || lower.contains("not declared")
-        || lower.contains("missing")
-        || lower.contains("public key")
-    {
-        400
-    } else {
-        500
-    }
-}
-
-fn code_for(status: u16) -> &'static str {
-    match status {
-        400 => "bad_request",
-        403 => "forbidden",
-        404 => "not_found",
-        409 => "conflict",
-        413 => "payload_too_large",
-        504 => "timeout",
-        _ => "internal",
-    }
-}
-
-
-fn error(status: u16, code: &str, message: &str) -> Vec<u8> {
-    http::json_error(status, code, message)
-}
-
-pub(crate) fn query_value(query: &str, key: &str) -> Option<String> {
-    query.split('&').find_map(|pair| {
-        let (name, value) = pair.split_once('=')?;
-        if name == key {
-            Some(decode(value))
-        } else {
-            None
-        }
-    })
-}
-
-pub(crate) fn query_bool(query: &str, key: &str) -> Option<bool> {
-    query_value(query, key).map(|value| value == "true" || value == "1")
-}
-
-fn decode(value: &str) -> String {
-    http::percent_decode(value, true)
 }
 
 #[cfg(test)]

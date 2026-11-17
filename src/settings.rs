@@ -59,6 +59,9 @@ pub struct Settings {
     pub http_idle_timeout_secs: Option<u64>,
     pub max_package_bytes: Option<u64>,
     pub transfer_timeout_secs: Option<u64>,
+    /// Bound for one management route's control-channel round trip.
+    /// Default: 30, clamped 1..300. Requires a daemon restart.
+    pub control_timeout_secs: Option<u64>,
     /// 默认调用超时（毫秒）；0/缺失时由 limits 取默认值。
     pub default_timeout_ms: Option<u64>,
     /// 调用超时上限（毫秒）；必须 >= default_timeout。
@@ -305,6 +308,10 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
                 settings.transfer_timeout_secs =
                     Some(parse_u64(value, "transfer_timeout_secs", index)?)
             }
+            "control_timeout_secs" => {
+                settings.control_timeout_secs =
+                    Some(parse_u64(value, "control_timeout_secs", index)?)
+            }
             "default_timeout" => {
                 settings.default_timeout_ms =
                     Some(parse_u64(value, "default_timeout", index)?)
@@ -504,6 +511,7 @@ mod tests {
              stream_buffer_bytes = 16384\n\
              max_package_bytes = 8388608\n\
              transfer_timeout_secs = 120\n\
+             control_timeout_secs = 30\n\
              default_timeout = 45000\n\
              max_timeout = 450000\n",
             Path::new("/etc/svcd"),
@@ -529,6 +537,7 @@ mod tests {
         assert_eq!(settings.stream_buffer_bytes, Some(16384));
         assert_eq!(settings.max_package_bytes, Some(8 * 1024 * 1024));
         assert_eq!(settings.transfer_timeout_secs, Some(120));
+        assert_eq!(settings.control_timeout_secs, Some(30));
         assert_eq!(settings.default_timeout_ms, Some(45_000));
         assert_eq!(settings.max_timeout_ms, Some(450_000));
     }

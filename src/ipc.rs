@@ -79,38 +79,83 @@ pub fn read_frame_limit<R: BufRead + ?Sized>(
     reader: &mut R,
     max: usize,
 ) -> Result<Option<String>, FrameError> {
-    let mut bytes = Vec::new();
-    loop {
-        let available = match reader.fill_buf() {
-            Ok(buffer) => buffer,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(FrameError::Io(error)),
-        };
-        if available.is_empty() {
-            if bytes.is_empty() {
-                return Ok(None);
-            }
-            return Err(FrameError::Io(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "unterminated frame",
-            )));
+    FrameReader::new(reader).read_frame_limit(max)
+}
+
+/// An LF frame reader that survives short reads.
+///
+/// A control-channel request polls its socket with a short timeout so it can
+/// observe a deadline and a disconnect. The poll may return `WouldBlock` after
+/// a partial frame arrived; those bytes belong to the frame that is still in
+/// flight, so they are kept in this reader until the next poll. Throwing them
+/// away would desynchronize the stream and turn a slow supervisor into a
+/// protocol error.
+pub struct FrameReader<R> {
+    reader: R,
+    bytes: Vec<u8>,
+}
+
+impl<R: BufRead> FrameReader<R> {
+    pub fn new(reader: R) -> FrameReader<R> {
+        FrameReader {
+            reader,
+            bytes: Vec::new(),
         }
-        if let Some(position) = available.iter().position(|byte| *byte == b'\n') {
-            if bytes.len() + position > max {
+    }
+
+    pub fn get_ref(&self) -> &R {
+        &self.reader
+    }
+
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
+
+    /// Read one frame, retaining bytes read before a `WouldBlock`.
+    pub fn read_frame_limit(&mut self, max: usize) -> Result<Option<String>, FrameError> {
+        loop {
+            let available = match self.reader.fill_buf() {
+                Ok(buffer) => buffer,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                // `WouldBlock` (a short read timeout) is retryable: the bytes
+                // already consumed in `self.bytes` stay here for the retry.
+                Err(error) => return Err(FrameError::Io(error)),
+            };
+            if available.is_empty() {
+                if self.bytes.is_empty() {
+                    return Ok(None);
+                }
+                return Err(FrameError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unterminated frame",
+                )));
+            }
+            if let Some(position) = available.iter().position(|byte| *byte == b'\n') {
+                if self.bytes.len() + position > max {
+                    return Err(FrameError::TooLarge { max });
+                }
+                self.bytes.extend_from_slice(&available[..position]);
+                self.reader.consume(position + 1);
+                let bytes = std::mem::take(&mut self.bytes);
+                return String::from_utf8(bytes)
+                    .map(Some)
+                    .map_err(|_| FrameError::InvalidUtf8);
+            }
+            if self.bytes.len() + available.len() > max {
                 return Err(FrameError::TooLarge { max });
             }
-            bytes.extend_from_slice(&available[..position]);
-            reader.consume(position + 1);
-            return String::from_utf8(bytes)
-                .map(Some)
-                .map_err(|_| FrameError::InvalidUtf8);
+            let length = available.len();
+            self.bytes.extend_from_slice(available);
+            self.reader.consume(length);
         }
-        if bytes.len() + available.len() > max {
-            return Err(FrameError::TooLarge { max });
-        }
-        let length = available.len();
-        bytes.extend_from_slice(available);
-        reader.consume(length);
+    }
+}
+
+impl<R: Read> FrameReader<io::BufReader<R>> {
+    /// Whether bytes are already buffered. A deadline poll must drain those
+    /// before waiting: a second frame can arrive in the same read.
+    pub fn has_buffered(&self) -> bool {
+        !self.reader.buffer().is_empty()
     }
 }
 
@@ -391,6 +436,49 @@ mod tests {
             read_frame(&mut BufReader::new([0xffu8, b'\n'].as_slice())),
             Err(FrameError::InvalidUtf8)
         ));
+    }
+
+    /// A short read between two chunks must not lose the bytes already read:
+    /// the control channel polls with a timeout, so this is the normal case
+    /// for a frame that crosses two reads.
+    struct Yielding {
+        chunks: Vec<&'static [u8]>,
+        index: usize,
+        yielded: bool,
+    }
+
+    impl Read for Yielding {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if self.yielded {
+                self.yielded = false;
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "short read"));
+            }
+            let Some(chunk) = self.chunks.get(self.index) else {
+                return Ok(0);
+            };
+            self.index += 1;
+            self.yielded = true;
+            out[..chunk.len()].copy_from_slice(chunk);
+            Ok(chunk.len())
+        }
+    }
+
+    #[test]
+    fn a_would_block_keeps_the_partial_frame_for_the_next_read() {
+        let mut reader = FrameReader::new(BufReader::new(Yielding {
+            chunks: vec![b"{\"id\"", b":1}\n"],
+            index: 0,
+            yielded: false,
+        }));
+        assert!(matches!(
+            reader.read_frame_limit(MAX_FRAME_BYTES),
+            Err(FrameError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        let frame = reader
+            .read_frame_limit(MAX_FRAME_BYTES)
+            .expect("the frame resumes")
+            .expect("one frame");
+        assert_eq!(frame, "{\"id\":1}");
     }
 
     #[test]

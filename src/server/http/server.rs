@@ -34,9 +34,9 @@ use crate::server::http::engine::{
     PreRequest, ServerLoop, Table,
 };
 use crate::server::http::{
-    attach_face_body, complete_blocking, dispatch_inline, render_exchange, route_face_request,
-    BlockingOutcome, BlockingPool, BodyPolicy, Busy, CancelToken, CompletionSlot, Dispatch,
-    Exchange, Face, JobOutcome, PreparedFace, StreamClass, StreamHandler,
+    attach_face_body, busy_response, complete_blocking, dispatch_inline, render_exchange,
+    route_face_request, BlockingOutcome, BlockingPool, BodyPolicy, Busy, CancelToken,
+    CompletionSlot, Dispatch, Exchange, Face, JobOutcome, PreparedFace, StreamClass, StreamHandler,
 };
 use crate::server::mcp::progress::{McpSseStream, PROGRESS_QUEUE_SLOTS};
 use crate::wake::Wake;
@@ -794,7 +794,15 @@ impl Server {
                     if cancel.is_cancelled() {
                         return;
                     }
-                    face.handle(face_request, done);
+                    // Stamp the budget when the job actually starts, not when
+                    // it was queued: time spent behind another job is not part
+                    // of this route's control round trip.
+                    let request = face_request.with_control_budget(
+                        Instant::now(),
+                        crate::limits::current().control_timeout,
+                        Some(cancel),
+                    );
+                    face.handle(request, done);
                 };
                 match self.blocking.try_submit(connection.id, job) {
                     Ok(()) => {
@@ -956,16 +964,6 @@ fn write_response(connection: &mut Connection, response: Vec<u8>, keep_alive: bo
     connection.out_at = 0;
     connection.keep_alive = keep_alive;
     connection.state = ConnState::Writing;
-}
-
-fn busy_response(message: &str) -> Vec<u8> {
-    let body = json!({ "error": { "code": "busy", "message": message } });
-    http::response_with_headers(
-        503,
-        "application/json",
-        &[("Retry-After".to_string(), "1".to_string())],
-        &serde_json::to_vec(&body).unwrap_or_default(),
-    )
 }
 
 fn blocking_busy(busy: Busy) -> Vec<u8> {

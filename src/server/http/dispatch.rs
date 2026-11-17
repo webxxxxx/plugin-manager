@@ -2,6 +2,7 @@
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::http;
 use crate::lan::{AuthKind, Lan};
@@ -99,6 +100,8 @@ pub(crate) fn route_face_request(
             peer,
             principal,
             body: Vec::new(),
+            deadline: None,
+            cancel: None,
         },
     }))
 }
@@ -155,6 +158,14 @@ pub fn dispatch_blocking_now(
     route: &Route,
     request: Request,
 ) -> Result<Exchange, DispatchError> {
+    // The Windows fallback has no pool token, but the control round trip still
+    // needs the same bound. The Unix loop stamps the deadline itself when it
+    // hands the job to the pool.
+    let request = request.with_control_budget(
+        Instant::now(),
+        crate::limits::current().control_timeout,
+        None,
+    );
     dispatch_now(face, route, request, Dispatch::Blocking)
 }
 
@@ -285,6 +296,8 @@ mod tests {
             peer: "127.0.0.1".parse().expect("peer"),
             principal: crate::lan::AuthKind::None,
             body: Vec::new(),
+            deadline: None,
+            cancel: None,
         }
     }
 

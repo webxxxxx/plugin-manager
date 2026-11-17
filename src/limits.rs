@@ -138,6 +138,11 @@ pub struct Limits {
     pub log_to_file: bool,
     pub max_package_bytes: u64,
     pub transfer_timeout: Duration,
+    /// Bound for one management route's control-channel round trip. The
+    /// server stamps a blocking job with this deadline; an unresponsive
+    /// supervisor then answers 504 instead of pinning a worker and a
+    /// connection. Clamped 1..300 s; a daemon restart applies a change.
+    pub control_timeout: Duration,
     /// 默认调用超时；契约的 `default_timeout` 从这里来。
     pub default_timeout: Duration,
     /// 调用超时的上限；契约的 `max_timeout` 从这里来。
@@ -241,6 +246,9 @@ impl Limits {
                     .unwrap_or(120)
                     .clamp(10, 3600),
             ),
+            control_timeout: Duration::from_secs(
+                settings.control_timeout_secs.unwrap_or(30).clamp(1, 300),
+            ),
             default_timeout: Duration::from_millis(
                 settings
                     .default_timeout_ms
@@ -315,6 +323,7 @@ struct SettingsView<'a> {
     log_to_file: Option<bool>,
     max_package_bytes: Option<u64>,
     transfer_timeout_secs: Option<u64>,
+    control_timeout_secs: Option<u64>,
     default_timeout_ms: Option<u64>,
     max_timeout_ms: Option<u64>,
     ws_max_message_bytes: Option<usize>,
@@ -350,6 +359,7 @@ impl<'a> SettingsView<'a> {
             log_to_file: settings.log_to_file,
             max_package_bytes: settings.max_package_bytes,
             transfer_timeout_secs: settings.transfer_timeout_secs,
+            control_timeout_secs: settings.control_timeout_secs,
             default_timeout_ms: settings.default_timeout_ms,
             max_timeout_ms: settings.max_timeout_ms,
             ws_max_message_bytes: settings.ws_max_message_bytes,
@@ -404,6 +414,12 @@ mod tests {
     }
 
     #[test]
+    fn control_timeout_defaults_to_thirty_seconds() {
+        let limits = limits_with(&settings::Settings::default());
+        assert_eq!(limits.control_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
     fn every_limit_has_a_floor() {
         let mut settings = settings::Settings::default();
         settings.request_stack_bytes = Some(0);
@@ -424,6 +440,7 @@ mod tests {
         settings.log_rotations = Some(0);
         settings.max_package_bytes = Some(0);
         settings.transfer_timeout_secs = Some(0);
+        settings.control_timeout_secs = Some(0);
         settings.default_timeout_ms = Some(0);
         settings.max_timeout_ms = Some(0);
         settings.ws_max_message_bytes = Some(0);
@@ -452,6 +469,7 @@ mod tests {
         assert_eq!(limits.log_rotations, 1);
         assert_eq!(limits.max_package_bytes, 1024 * 1024);
         assert_eq!(limits.transfer_timeout, Duration::from_secs(10));
+        assert_eq!(limits.control_timeout, Duration::from_secs(1));
         assert_eq!(limits.default_timeout, Duration::from_millis(100));
         assert_eq!(limits.max_timeout, Duration::from_millis(100));
         assert_eq!(limits.ws_max_message_bytes, 1024);
@@ -483,6 +501,7 @@ mod tests {
         settings.log_rotations = Some(usize::MAX);
         settings.max_package_bytes = Some(u64::MAX);
         settings.transfer_timeout_secs = Some(u64::MAX);
+        settings.control_timeout_secs = Some(u64::MAX);
         settings.default_timeout_ms = Some(u64::MAX);
         settings.max_timeout_ms = Some(u64::MAX);
         settings.ws_max_message_bytes = Some(usize::MAX);
@@ -511,6 +530,7 @@ mod tests {
         assert_eq!(limits.log_rotations, 10);
         assert_eq!(limits.max_package_bytes, 1024 * 1024 * 1024);
         assert_eq!(limits.transfer_timeout, Duration::from_secs(3600));
+        assert_eq!(limits.control_timeout, Duration::from_secs(300));
         assert_eq!(limits.default_timeout, Duration::from_millis(300_000));
         assert_eq!(limits.max_timeout, Duration::from_millis(600_000));
         assert_eq!(limits.ws_max_message_bytes, 16 * 1024 * 1024);
