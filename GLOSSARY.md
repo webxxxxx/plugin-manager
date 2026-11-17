@@ -57,7 +57,7 @@ _Avoid_: settings.json、通用“配置文件”
 _Avoid_: lan-token、管理员 token
 
 **config_dir**:
-`svcd.conf` 里的配置目录覆盖项；`svcd.conf`、`trust.d`、`svcd.token` 都放在这里。默认 Linux `/etc/svcd`、Windows `%USERPROFILE%\.svcd`；`SVCD_CONFIG_DIR` 优先级更高。
+`svcd.conf` 里的配置目录覆盖项；`svcd.conf`、`trust.d` 都放在这里。默认 Linux `/etc/svcd`、Windows `%USERPROFILE%\.svcd`；`SVCD_CONFIG_DIR` 优先级更高。
 
 **install_dir**:
 `svcd.conf` 里记录的安装根：`svcd --install --prefix <dir>` 会把 `<dir>` 写回这里；之后不带 `--prefix` 的重装、运行时 data/logs 的默认值（`<install_dir>/data`、`<install_dir>/logs`）和 `--uninstall` 的清理都以它为准。手工写在 conf 里也有效，`--prefix` 优先于它；未记录时走平台默认。

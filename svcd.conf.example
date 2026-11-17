@@ -25,7 +25,7 @@ bind = 127.0.0.1:8787
 # accepting an unsigned package. There is no per-install flag or console option.
 # allow_insecure_install = false
 
-# Configuration directory: svcd.conf, trust.d and svcd.token.
+# Configuration directory: svcd.conf and trust.d.
 # Defaults: /etc/svcd (Linux), /Library/Application Support/svcd/config
 # (macOS), %USERPROFILE%\.svcd (Windows).
 # config_dir = /etc/svcd

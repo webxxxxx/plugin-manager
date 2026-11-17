@@ -92,7 +92,7 @@
 - `id` 不能是 `svc`（保留给内置 core），且不能与 plugin id 冲突；冲突时 plugin 安装拒绝、core 定义加载拒绝。
 - `<config>/services.d/<id>.disabled` 存在时该 core 服务 `enabled=false`：开机不自启、崩溃后不按退避自动重启；`svc enable/disable` 维护这个 sidecar，显式 `svc start` 仍然可用。
 - **core 不接受 `capabilities`**：core 是生命周期单元，不参与 `tools/call`；定义里出现该字段即拒绝加载。能力面只属于 plugin。
-- `<config>` 指平台配置目录（Linux `/etc/svcd`、macOS `/Library/Application Support/svcd/config`、Windows `%USERPROFILE%\.svcd`）；`svcd.conf` 的 `config_dir` 可覆盖，`SVCD_CONFIG_DIR` 再覆盖，供测试与非 root 开发使用。`svcd.conf`、`trust.d` 和 `svcd.token` 都在这个目录。
+- `<config>` 指平台配置目录（Linux `/etc/svcd`、macOS `/Library/Application Support/svcd/config`、Windows `%USERPROFILE%\.svcd`）；`svcd.conf` 的 `config_dir` 可覆盖，`SVCD_CONFIG_DIR` 再覆盖，供测试与非 root 开发使用。`svcd.conf` 和 `trust.d` 都在这个目录。
 - `<logs>` 指平台日志目录（Linux `/var/log/svcd`、macOS `/Library/Logs/svcd`、Windows `%ProgramData%\svcd\logs`）；`SVCD_LOG_DIR` 可覆盖，供测试与非 root 开发使用。
 - core 与 plugin 走同一监督器、同一 stdio NDJSON、同一依赖图、同一日志 / 状态；`svc list/status/start/stop/logs` 对两者一致；`install/uninstall/import/export/editconfig` 只对 plugin。
 
@@ -216,7 +216,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 ### 3.1 控制通道
 
 - 一套 **JSON-RPC 2.0 + NDJSON** 信封跑三条链路：插件 stdio、`svc`/`mcp` 的 UDS / 命名管道、UI 的 `POST /plugin-ui/{id}/{token}/rpc`。这三条是控制面；HTTP 的 `/mcp` 与 `/api/v1` 是另外两个面（§3.4 / §3.5），不复用 NDJSON 分帧。
-- `svc`/`svcd` 的本地管理通道用 UDS（Unix）/命名管道（Windows）上的 NDJSON；启动时生成 `<config>/svcd.token`（0640），请求携带该 token。Unix socket 0660；Windows 管道 ACL 仍是默认值，C8 的组授权细化落在 `channel/platform/windows.rs` 的权限 seam 上补齐（#143 已把该 seam 建好）。
+- `svc`/`svcd` 的本地管理通道用 UDS（Unix）/命名管道（Windows）上的 NDJSON，按权限分**两个端点**：`svcd`（载读 + 生命周期：`status` / `start` / `stop` / `restart` / `logs` / `export` / `editconfig --print`）与 `svcd-admin`（载写：`install` / `upgrade` / `uninstall` / `import` / `editconfig` / `enable` / `disable` / `auth`）。**鉴权就是端点 ACL，请求不携带凭据**：Unix 侧 `svcd` socket 0660（root:svcd）、`svcd-admin` 0600；Windows 侧两条显式 protected DACL（C8）。user mode 只有 `svcd` 一个端点，ACL 为当前用户私有。旧版本遗留的 `<config>/svcd.token` 由启动/安装路径清理。
 - 帧：UTF-8、LF、禁内嵌换行与 BOM；Windows 二进制模式；单帧上限 1 MiB，超限 = 协议违规，按崩溃路径杀进程。
 - 流控：每插件在途 64、排队 128；超出 `-32000 busy`；单请求默认 30s，超时先发 `notifications/cancelled` 再回错；id 用 svcd 侧单调 u64。
 - 插件 → svcd 只允许响应与通知，不允许发请求（v1 不做双向 RPC）；stdout 只走协议帧，stderr 是行式日志；stdout EOF = 退出。
@@ -382,6 +382,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 - 本地授权两档：
   - root / Administrator：install、upgrade、uninstall、`editconfig`、`import`、`svc auth passwd` / enable / disable。
   - `svcd` 组：start / stop / status / logs、`editconfig --print`、`export`（只读）。
+- 两档由控制通道的两个端点实施（§3.1）：`svcd` 端点只接受组档方法，`svcd-admin` 端点只接受 root / Administrator。端点 ACL 即鉴权，请求不携带凭据。
 - LAN 是另一套：管理员密码（`auth_passwd` 哈希）；UI 用 `svcd_session`，`/api/v1` 用 `svcd_api` 或 Bearer 密码，`/mcp` 只收 Bearer 密码；不映射 OS 用户。**HTTP 管理 API 覆盖全部 `svc` 命令，密码等价于 root / Administrator**；默认 LAN 关闭、无 TLS。
 - 配置明文 0640 root:svcd；不接 Keychain / DPAPI / Secret Service / TPM、不加密；导出/备份含明文 secret，文档警告；插件自管密钥。
 - **明确接受：任一服务/插件有 bug 或被攻破 = 整机 root / System**；补偿只在来源侧（core 的 root 文件权限、plugin 的签名/审核/`trust.d`）。
@@ -500,7 +501,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 | C5 | **边界（已定）** | TLS 不在核心；#24 的 token 明文过 LAN；#17 的 macOS ATS 只是本地回环例外。这是已接受的取舍，不是 bug | #11、#24、#17 | **已定（2026-11-12）**：v1 不支持 TLS，不生成证书；HTTPS 靠前置反代；LAN 只用于可信网络；token 等价 root，默认 LAN 关闭。不要在核心里偷偷加 TLS。 |
 | C6 | **已澄清** | 组权限：#17 说组管生命周期；#19 说组只做 start/stop/status/logs；#20 又给了只读 `export` / `editconfig --print` | #17、#19、#20 | 以 §6 的授权矩阵为准：组只读 + 生命周期；写操作 root；#19 已补评论 |
 | C7 | **平台例外** | #4 方法集有 `svcd.shutdown`；#14 说 BusyBox 上不提供 `svcd shutdown` | #4、#14 | 规格保留方法，但注明 BusyBox 不实现；插件必须能接受「不发 shutdown 直接 SIGTERM」 |
-| C8 | **实现约束** | Windows 命名管道默认 DACL 给 Everyone 读；#17/#19 要求组授权，不能吃默认值 | #15、#2 笔记 | 显式设置管道 DACL（SYSTEM/Administrators 完全，`svcd` 组读写）；不依赖默认 |
+| C8 | **实现约束（已定 2026-11-17）** | Windows 命名管道默认 DACL 给 Everyone 读；#17/#19 要求组授权，不能吃默认值 | #15、#2 笔记 | 控制通道分两个端点（`svcd` / `svcd-admin`），各设一条显式 protected DACL：`svcd` = SYSTEM/Administrators 完全 + `svcd` 组读写，`svcd-admin` = 仅 SYSTEM/Administrators；不依赖默认值。配套删除 `svcd.token`，鉴权即端点 ACL（§3.1 / §6）。 |
 | C9 | **边界（已澄清）** | 30MB 只量核心二进制，安装包不计；#11/#16 的预算表容易让人以为含安装包 | #11、#16、#17 | 文档统一写「核心二进制」，安装包体积单列记录 |
 | C10 | **文档债** | #13 的正文/Answer 仍写 `arch`；#18 只在评论里回填；样张已同步但 schema 文档未重生 | #13、#18、#12 | 以本规格 §2.2 为准，重新生成 manifest schema 文档与样张说明 |
 | C11 | **缺口（中）** | `svc ui` 只定了「入口」，没定界面内容；桌面商城客户端在 Out of scope，核心 UI 显示什么没写 | #17、地图 Out of scope | 明确 v1 `svc ui` 只做「本地服务列表 + 打开插件 UI」；商城另立 |
@@ -532,6 +533,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 - 2026-11-13（补）：服务树即进程组——Unix 独立进程组、Windows per-service job object；组内任一进程存活即 `Running`，stop 终止整棵树。
 - 2026-11-13（补）：信任根可管理——`svc trust list|add|remove`、`GET/POST/DELETE /api/v1/trust`、Web 控制台上传 `.pub`；包内不携带信任根，编译期 store 公钥仍未内置。
 - 2026-11-13（补）：脚本插件——`schema: 2` 增加 `lifecycle` / `interpreter`；脚本 payload 必须声明解释器（版本可空），安装时解析并校验，运行时统一经解释器执行；core drop-in 脚本可原样加 manifest 转成 plugin；`plugin bundle --from-core` 自动生成 lifecycle；老 daemon 拒绝 schema 2。
+- 2026-11-17：控制通道删除 `svcd.token`，鉴权改为端点 ACL；本地两档由 `svcd` / `svcd-admin` 两个端点实施；C8 改为两端点各一条显式 protected DACL。
 
 ## 16. 实施票（2026-11-12 拆出）
 
