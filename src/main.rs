@@ -7,6 +7,7 @@ mod bundle;
 mod catalog;
 mod channel;
 mod compat;
+mod config;
 mod daemon;
 mod definition;
 #[cfg(feature = "http")]
@@ -179,7 +180,13 @@ fn stop_daemon() {
 
 fn start_command() -> i32 {
     if crate::paths::user_mode() {
-        user_start()
+        match crate::config::Config::bootstrap(None) {
+            Ok(config) => user_start(&config),
+            Err(error) => {
+                eprintln!("svcd: invalid config: {}", error);
+                return 1;
+            }
+        }
     } else {
         crate::install::service_start()
     }
@@ -195,7 +202,13 @@ fn stop_command() -> i32 {
 
 fn status_command() -> i32 {
     if crate::paths::user_mode() {
-        user_status()
+        match crate::config::Config::bootstrap(None) {
+            Ok(config) => user_status(&config),
+            Err(error) => {
+                eprintln!("svcd: invalid config: {}", error);
+                return 1;
+            }
+        }
     } else {
         crate::install::service_status()
     }
@@ -203,9 +216,15 @@ fn status_command() -> i32 {
 
 fn user_command(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
-        Some("start") => user_start(),
+        Some("start") | Some("status") => match crate::config::Config::bootstrap(None) {
+            Ok(config) if args.first().map(String::as_str) == Some("start") => user_start(&config),
+            Ok(config) => user_status(&config),
+            Err(error) => {
+                eprintln!("svcd: invalid config: {}", error);
+                1
+            }
+        },
         Some("stop") => crate::daemon::shutdown(),
-        Some("status") => user_status(),
         Some("install") => user_install(),
         Some("run") => {
             std::env::set_var("SVCD_USER", "1");
@@ -226,30 +245,30 @@ fn user_usage() {
     eprintln!("       svcd user run --foreground [--conf|--config <file>]");
 }
 
-fn user_running() -> bool {
+fn user_running(config: &crate::config::Config) -> bool {
     crate::channel::request(
-        &crate::paths::config_dir(),
+        &config.paths.config_dir,
         "svc.list",
         serde_json::json!({}),
     )
     .is_ok()
 }
 
-fn user_start() -> i32 {
+fn user_start(config: &crate::config::Config) -> i32 {
     if !crate::paths::user_mode() {
         eprintln!(
             "svcd: user mode is only available to non-root users; set SVCD_USER=1 to force it"
         );
         return 1;
     }
-    if user_running() {
+    if user_running(config) {
         println!("svcd user daemon is already running");
         return 0;
     }
-    let config = crate::paths::config_dir();
-    let logs = crate::paths::logs_dir();
-    if let Err(error) = std::fs::create_dir_all(&config) {
-        eprintln!("svcd: create {}: {}", config.display(), error);
+    let config_dir = &config.paths.config_dir;
+    let logs = &config.paths.logs_dir;
+    if let Err(error) = std::fs::create_dir_all(config_dir) {
+        eprintln!("svcd: create {}: {}", config_dir.display(), error);
         return 1;
     }
     if let Err(error) = std::fs::create_dir_all(&logs) {
@@ -310,7 +329,7 @@ fn user_start() -> i32 {
     match command.spawn() {
         Ok(child) => {
             println!("svcd user daemon started (pid {})", child.id());
-            println!("config: {}", config.display());
+            println!("config: {}", config_dir.display());
             println!("logs:   {}", log_path.display());
             0
         }
@@ -321,12 +340,12 @@ fn user_start() -> i32 {
     }
 }
 
-fn user_status() -> i32 {
+fn user_status(config: &crate::config::Config) -> i32 {
     println!("mode:   user");
-    println!("config: {}", crate::paths::config_dir().display());
-    println!("data:   {}", crate::paths::data_dir().display());
-    println!("logs:   {}", crate::paths::logs_dir().display());
-    if user_running() {
+    println!("config: {}", config.paths.config_dir.display());
+    println!("data:   {}", config.paths.data_dir.display());
+    println!("logs:   {}", config.paths.logs_dir.display());
+    if user_running(config) {
         println!("state:  running");
         0
     } else {

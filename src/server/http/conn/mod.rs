@@ -15,10 +15,10 @@
 
 use std::io;
 use std::net::TcpListener;
-use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+use crate::config::Config;
 use crate::lan::Lan;
 use crate::rawhub::RawHub;
 use crate::server::http::hooks::{FallbackHandler, PreBodyRoutes};
@@ -85,12 +85,12 @@ impl ServerHandle {
 /// A driver the caller runs itself: the composition root supplies it because
 /// it composes faces.
 pub(crate) type ThreadDriver =
-    Arc<dyn Fn(TcpListener, Arc<Mutex<Lan>>, PathBuf) -> ServerHandle + Send + Sync>;
+    Arc<dyn Fn(TcpListener, Arc<Mutex<Lan>>, Arc<Config>) -> ServerHandle + Send + Sync>;
 
 /// Everything a driver needs, on every host. Platform-specific pieces are
 /// `Option`; whichever driver consumes a value leaves the rest untouched.
 pub(crate) struct StartInput {
-    pub config: PathBuf,
+    pub config: Arc<Config>,
     pub lan: Arc<Mutex<Lan>>,
     pub raw_hub: Arc<RawHub>,
     pub listener: Option<TcpListener>,

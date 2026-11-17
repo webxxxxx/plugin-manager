@@ -958,7 +958,6 @@ mod tests {
         write(source.path(), "payload/bin/agent", b"\x7fELF", 0o644);
         write(source.path(), "payload/bin/helper.dat", b"data", 0o644);
         write(source.path(), "config/config", b"{}", 0o644);
-        let key = SigningKey::from_bytes(&[41u8; 32]);
         let key_path = key_file(&work, 41);
         let out = work.path().join("bins.spk");
         let mut options = bundle_options(source.path(), &out, &key_path);
@@ -1161,14 +1160,20 @@ mod tests {
         let names: Vec<&str> = parsed.iter().map(|entry| entry.path.as_str()).collect();
         assert_eq!(names, ["manifest.json", exec_path]);
 
-        let inspection = package::inspect_bytes_with(&bytes, None).expect("inspect");
+        let inspection =
+            package::inspect_bytes_with(&bytes, None, &crate::test_support::temp_dir())
+                .expect("inspect");
         assert_eq!(inspection.signature.state, "missing");
 
         // A strict install refuses it; only the host-level switch accepts it,
         // which is exactly the local-development contract of `--unsigned`.
-        assert!(package::verify_bytes(&bytes).is_err());
-        package::verify_bytes_with(&bytes, package::SignatureCheck::AllowUnsigned)
-            .expect("insecure acceptance");
+        assert!(package::verify_bytes(&bytes, &crate::test_support::temp_dir()).is_err());
+        package::verify_bytes_with(
+            &bytes,
+            package::SignatureCheck::AllowUnsigned,
+            &crate::test_support::temp_dir(),
+        )
+        .expect("insecure acceptance");
     }
 
     #[test]

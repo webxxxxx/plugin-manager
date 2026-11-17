@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use crate::channel;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::log;
-use crate::paths;
+use crate::config::Config;
 use crate::rpc;
 use crate::status::{self, Status};
 
@@ -94,16 +94,23 @@ pub fn run(args: Vec<String>) -> i32 {
         }
     };
 
+    let config = match Config::bootstrap(None) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("svc: invalid config: {}", error);
+            return EXIT_SERVICE_ERROR;
+        }
+    };
     match command {
-        Command::List => list(),
-        Command::Status { id, json } => show_status(&id, json),
-        Command::Daemon { verb, id } => daemon_command(verb, &id),
-        Command::Reload => reload(),
-        Command::Compat { json } => compat_show(json),
-        Command::CompatInit { device, dry_run } => compat_init(&device, dry_run),
-        Command::Logs { id, follow, lines } => show_logs(&id, follow, lines),
-        Command::Auth { action } => auth_command(action),
-        Command::Trust { action } => trust_command(action),
+        Command::List => list(&config),
+        Command::Status { id, json } => show_status(&config, &id, json),
+        Command::Daemon { verb, id } => daemon_command(&config, verb, &id),
+        Command::Reload => reload(&config),
+        Command::Compat { json } => compat_show(&config, json),
+        Command::CompatInit { device, dry_run } => compat_init(&config, &device, dry_run),
+        Command::Logs { id, follow, lines } => show_logs(&config, &id, follow, lines),
+        Command::Auth { action } => auth_command(&config, action),
+        Command::Trust { action } => trust_command(&config, action),
     }
 }
 
@@ -271,15 +278,15 @@ fn parse_lines(value: &str) -> Result<usize, ()> {
 /// `services.d` when the daemon could not be reached, which made "daemon is
 /// down" and "there are no services" look identical; the fallback is gone and an
 /// unreachable daemon is now reported and exits non-zero.
-fn list() -> i32 {
-    match live_list() {
+fn list(config: &Config) -> i32 {
+    match live_list(config) {
         Ok(statuses) => {
             println!("{}", status::table(&statuses));
             EXIT_OK
         }
         Err(ListError::Unreachable(error)) => {
             eprintln!("svc: svcd unreachable: {}", error);
-            explain_unreachable();
+            explain_unreachable(config);
             EXIT_DAEMON_UNREACHABLE
         }
         Err(ListError::Daemon(message)) => {
@@ -294,12 +301,12 @@ fn list() -> i32 {
 /// The pipe ACL is the real gate (Administrators only become effective after
 /// elevation; the `svcd` group is the read-only tier), so point at that instead
 /// of leaving "pipe is not available" unexplained.
-fn explain_unreachable() {
+fn explain_unreachable(config: &Config) {
     if std::env::var_os("SVCD_CONFIG_DIR").is_some() {
         return;
     }
     let machine = crate::paths::platform_config_dir();
-    if machine == paths::config_dir() || !machine_wide_install_present(&machine) {
+    if machine == config.paths.config_dir || !machine_wide_install_present(&machine) {
         return;
     }
     if cfg!(windows) {
@@ -332,8 +339,8 @@ enum ListError {
     Daemon(String),
 }
 
-fn live_list() -> Result<Vec<Status>, ListError> {
-    let response = channel::request(&paths::config_dir(), "svc.list", json!({}))
+fn live_list(config: &Config) -> Result<Vec<Status>, ListError> {
+    let response = channel::request(&config.paths.config_dir, "svc.list", json!({}))
         .map_err(|error| ListError::Unreachable(error.to_string()))?;
     if let Some(error) = response.error {
         return Err(ListError::Daemon(error.message));
@@ -348,16 +355,16 @@ fn live_list() -> Result<Vec<Status>, ListError> {
 
 /// `svc status` reads live state only, for the same reason as `svc list`: the
 /// offline fallback made an unreachable daemon look like a stopped service.
-fn show_status(id: &str, json: bool) -> i32 {
+fn show_status(config: &Config, id: &str, json: bool) -> i32 {
     let response = match channel::request(
-        &paths::config_dir(),
+        &config.paths.config_dir,
         "svc.status",
         json!({ "id": id, "probe": true }),
     ) {
         Ok(response) => response,
         Err(error) => {
             eprintln!("svc: svcd unreachable: {}", error);
-            explain_unreachable();
+            explain_unreachable(config);
             return EXIT_DAEMON_UNREACHABLE;
         }
     };
@@ -379,7 +386,7 @@ fn show_status(id: &str, json: bool) -> i32 {
     }
 }
 
-fn daemon_command(verb: DaemonVerb, id: &str) -> i32 {
+fn daemon_command(config: &Config, verb: DaemonVerb, id: &str) -> i32 {
     let method = match verb {
         DaemonVerb::Start => "svc.start",
         DaemonVerb::Stop => "svc.stop",
@@ -387,7 +394,7 @@ fn daemon_command(verb: DaemonVerb, id: &str) -> i32 {
         DaemonVerb::Enable => "svc.enable",
         DaemonVerb::Disable => "svc.disable",
     };
-    match channel::request(&paths::config_dir(), method, json!({ "id": id })) {
+    match channel::request(&config.paths.config_dir, method, json!({ "id": id })) {
         Ok(response) => match response.error {
             Some(error) => {
                 eprintln!("svc: {}", error.message);
@@ -403,14 +410,14 @@ fn daemon_command(verb: DaemonVerb, id: &str) -> i32 {
         },
         Err(error) => {
             eprintln!("svc: svcd unreachable: {}", error);
-            explain_unreachable();
+            explain_unreachable(config);
             EXIT_DAEMON_UNREACHABLE
         }
     }
 }
 
-fn reload() -> i32 {
-    let response = match channel::request(&paths::config_dir(), "svc.reload", json!({})) {
+fn reload(config: &Config) -> i32 {
+    let response = match channel::request(&config.paths.config_dir, "svc.reload", json!({})) {
         Ok(response) => response,
         Err(error) => {
             eprintln!("svc: svcd unreachable: {}", error);
@@ -451,8 +458,8 @@ fn reload() -> i32 {
     EXIT_OK
 }
 
-fn compat_show(json: bool) -> i32 {
-    let facts = crate::compat::detect(MAX_SCHEMA, MAX_PROTOCOL);
+fn compat_show(config: &Config, json: bool) -> i32 {
+    let facts = crate::compat::detect(&config.paths, MAX_SCHEMA, MAX_PROTOCOL);
     if json {
         match serde_json::to_string_pretty(&facts) {
             Ok(text) => println!("{}", text),
@@ -482,7 +489,7 @@ fn compat_show(json: bool) -> i32 {
     EXIT_OK
 }
 
-fn compat_init(device: &str, dry_run: bool) -> i32 {
+fn compat_init(config: &Config, device: &str, dry_run: bool) -> i32 {
     if let Err(error) = crate::plugin::root_required() {
         eprintln!("svc: {}", error);
         return EXIT_SERVICE_ERROR;
@@ -491,7 +498,7 @@ fn compat_init(device: &str, dry_run: bool) -> i32 {
         eprintln!("svc: {}", error);
         return EXIT_SERVICE_ERROR;
     }
-    let path = crate::compat::marker_path();
+    let path = crate::compat::marker_path(&config.paths);
     if dry_run {
         println!("would write {}:", path.display());
         println!("device = {}", device);
@@ -502,10 +509,10 @@ fn compat_init(device: &str, dry_run: bool) -> i32 {
         return EXIT_SERVICE_ERROR;
     }
     println!("wrote {} (device = {})", path.display(), device);
-    compat_show(false)
+    compat_show(config, false)
 }
 
-fn auth_command(action: AuthAction) -> i32 {
+fn auth_command(config: &Config, action: AuthAction) -> i32 {
     if matches!(&action, AuthAction::Passwd(_)) {
         if let Err(error) = crate::lan::require_root() {
             eprintln!("svc: {}", error);
@@ -516,7 +523,7 @@ fn auth_command(action: AuthAction) -> i32 {
         AuthAction::Status => ("auth.status", json!({})),
         AuthAction::Passwd(password) => ("auth.passwd", json!({ "password": password })),
     };
-    let response = match channel::request(&paths::config_dir(), method, params) {
+    let response = match channel::request(&config.paths.config_dir, method, params) {
         Ok(response) => response,
         Err(error) => {
             eprintln!("svc: svcd unreachable: {}", error);
@@ -569,11 +576,11 @@ fn auth_command(action: AuthAction) -> i32 {
     EXIT_OK
 }
 
-fn trust_command(action: TrustAction) -> i32 {
+fn trust_command(config: &Config, action: TrustAction) -> i32 {
     match action {
-        TrustAction::List => match crate::trust::keys() {
+        TrustAction::List => match crate::trust::keys(&config.paths) {
             Ok(keys) if keys.is_empty() => {
-                println!("no trusted keys in {}", paths::trust_dir().display());
+                println!("no trusted keys in {}", config.paths.trust_dir.display());
                 EXIT_OK
             }
             Ok(keys) => {
@@ -603,7 +610,7 @@ fn trust_command(action: TrustAction) -> i32 {
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .unwrap_or_default();
-            match crate::trust::add(key_id, &pem) {
+            match crate::trust::add(&config.paths, key_id, &pem) {
                 Ok(target) => {
                     println!("trusted {} ({})", key_id, target.display());
                     EXIT_OK
@@ -619,7 +626,7 @@ fn trust_command(action: TrustAction) -> i32 {
                 eprintln!("svc: {}", error);
                 return EXIT_SERVICE_ERROR;
             }
-            match crate::trust::remove(&key_id) {
+            match crate::trust::remove(&config.paths, &key_id) {
                 Ok(true) => {
                     println!("removed {}", key_id);
                     EXIT_OK
@@ -645,11 +652,11 @@ fn require_root_for_trust() -> Result<(), String> {
     }
 }
 
-fn show_logs(id: &str, follow: bool, lines: usize) -> i32 {
+fn show_logs(config: &Config, id: &str, follow: bool, lines: usize) -> i32 {
     let path = if id == "svcd" {
-        paths::logs_dir().join("svcd.log")
+        config.paths.logs_dir.join("svcd.log")
     } else {
-        paths::logs_dir().join(format!("{}.log", id))
+        config.paths.logs_dir.join(format!("{}.log", id))
     };
     let tail = match log::tail(&path, lines) {
         Ok(tail) => tail,

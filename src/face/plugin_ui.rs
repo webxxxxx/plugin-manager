@@ -6,6 +6,7 @@
 //! A browser loading one page therefore costs one connection, not one thread
 //! per asset, and a one-shot asset never consumes `max_streams`.
 
+use crate::config::Config;
 use crate::face::plugin_streams::{self, StreamContext};
 use crate::http;
 use crate::lan::Lan;
@@ -18,7 +19,6 @@ use crate::server::http::{
 use crate::webui;
 use std::fs;
 use std::net::IpAddr;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// One parsed `/plugin-ui/{id}/{token}/...` path.
@@ -84,12 +84,16 @@ pub struct PluginUiFace {
 impl PluginUiFace {
     pub fn with_streams(
         lan: Arc<Mutex<Lan>>,
-        config: PathBuf,
+        config: Arc<Config>,
         raw_hub: Option<Arc<crate::rawhub::RawHub>>,
     ) -> PluginUiFace {
         PluginUiFace {
             lan,
-            streams: Arc::new(StreamContext { config, raw_hub }),
+            streams: Arc::new(StreamContext {
+                config: config.paths.config_dir.clone(),
+                paths: config.paths.clone(),
+                raw_hub,
+            }),
         }
     }
 
@@ -118,7 +122,7 @@ impl PluginUiFace {
         head: &http::Head,
         peer: IpAddr,
         lan: &Arc<Mutex<Lan>>,
-        config: PathBuf,
+        config: Arc<Config>,
         raw_hub: Option<Arc<crate::rawhub::RawHub>>,
     ) -> Result<Exchange, Vec<u8>> {
         let Some(route) = PluginUiFace::route_for(&head.method, &head.path) else {
@@ -175,7 +179,7 @@ impl PluginUiFace {
         if !package::valid_name(ui.id) {
             return Box::new(PluginUiStream::error(404, "not_found", "unknown plugin UI"));
         }
-        let Some(assets) = plugin::web_assets(ui.id) else {
+        let Some(assets) = plugin::web_assets(&self.streams.paths, ui.id) else {
             return Box::new(PluginUiStream::error(
                 404,
                 "not_found",

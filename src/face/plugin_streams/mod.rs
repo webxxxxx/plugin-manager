@@ -22,6 +22,7 @@ use crate::face::plugin_ui::{PluginUiStream, UiPath};
 use crate::http;
 use crate::lan::{AuthKind, Lan};
 use crate::package;
+use crate::paths::Paths;
 use crate::plugin;
 use crate::server::http::{Request, StreamHandler};
 use crate::uichannel;
@@ -29,7 +30,10 @@ use crate::uichannel;
 /// Everything the realtime handlers need that is not the request itself. The
 /// legacy engine always has it; a build without a raw transport has `None`.
 pub(crate) struct StreamContext {
+    /// The control endpoint directory (the socket path lives under it).
     pub config: PathBuf,
+    /// The plugin tree the realtime handlers validate tokens against.
+    pub paths: Arc<Paths>,
     pub raw_hub: Option<Arc<crate::rawhub::RawHub>>,
 }
 
@@ -44,11 +48,11 @@ fn unknown_ui() -> Refusal {
     http::json_error(404, "not_found", "unknown plugin UI")
 }
 
-fn valid_ui(ui: &UiPath<'_>, require_assets: bool) -> Result<(), Refusal> {
+fn valid_ui(paths: &Paths, ui: &UiPath<'_>, require_assets: bool) -> Result<(), Refusal> {
     if !package::valid_name(ui.id) {
         return Err(unknown_ui());
     }
-    if require_assets && plugin::web_assets(ui.id).is_none() {
+    if require_assets && plugin::web_assets(paths, ui.id).is_none() {
         return Err(unknown_ui());
     }
     Ok(())
@@ -116,9 +120,9 @@ pub(crate) fn open_sse(
     ui: &UiPath<'_>,
     request: &Request,
     lan: &Arc<Mutex<Lan>>,
-    _context: &StreamContext,
+    context: &StreamContext,
 ) -> Box<dyn StreamHandler> {
-    if let Err(response) = valid_ui(ui, true) {
+    if let Err(response) = valid_ui(&context.paths, ui, true) {
         return boxed(response);
     }
     if let Err(response) = valid_token(lan, ui) {
@@ -146,7 +150,7 @@ pub(crate) fn open_ws(
     lan: &Arc<Mutex<Lan>>,
     context: &StreamContext,
 ) -> Box<dyn StreamHandler> {
-    if let Err(response) = valid_ui(ui, true) {
+    if let Err(response) = valid_ui(&context.paths, ui, true) {
         return boxed(response);
     }
     if let Err(response) = valid_token(lan, ui) {
@@ -186,7 +190,7 @@ pub(crate) fn open_raw(
     lan: &Arc<Mutex<Lan>>,
     context: &StreamContext,
 ) -> Box<dyn StreamHandler> {
-    if let Err(response) = valid_ui(ui, false) {
+    if let Err(response) = valid_ui(&context.paths, ui, false) {
         return boxed(response);
     }
     if !crate::limits::current().ws_raw_enabled {

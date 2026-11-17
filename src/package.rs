@@ -20,7 +20,6 @@ use sha2::{Digest, Sha256};
 use crate::compat::CompatSpec;
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
-use crate::paths;
 
 pub(crate) const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const MAX_FILES: usize = 4096;
@@ -723,10 +722,15 @@ pub struct StagingInstaller {
 }
 
 impl StagingInstaller {
-    pub fn new(staging: PathBuf, allow_insecure: bool, max_bytes: u64) -> StagingInstaller {
+    pub fn new(
+        staging: PathBuf,
+        allow_insecure: bool,
+        max_bytes: u64,
+        trust_dir: &Path,
+    ) -> StagingInstaller {
         StagingInstaller {
             tar: TarFeed::new(max_bytes),
-            sink: SpkSink::new(staging, allow_insecure),
+            sink: SpkSink::new(staging, allow_insecure, trust_dir.to_path_buf()),
             finished: false,
         }
     }
@@ -764,6 +768,8 @@ impl Drop for StagingInstaller {
 struct SpkSink {
     staging: PathBuf,
     allow_insecure: bool,
+    /// Where signature verification looks up `<keyId>.pub`.
+    trust_dir: PathBuf,
     manifest: Option<Manifest>,
     manifest_bytes: Vec<u8>,
     signature_bytes: Vec<u8>,
@@ -790,10 +796,11 @@ enum Current {
 }
 
 impl SpkSink {
-    fn new(staging: PathBuf, allow_insecure: bool) -> SpkSink {
+    fn new(staging: PathBuf, allow_insecure: bool, trust_dir: PathBuf) -> SpkSink {
         SpkSink {
             staging,
             allow_insecure,
+            trust_dir,
             manifest: None,
             manifest_bytes: Vec::new(),
             signature_bytes: Vec::new(),
@@ -1010,6 +1017,7 @@ impl TarSink for SpkSink {
                         &bytes,
                         SignatureMode::Required,
                         None,
+                        &self.trust_dir,
                     )
                     .is_ok()
                 } else {
@@ -1018,6 +1026,7 @@ impl TarSink for SpkSink {
                         &bytes,
                         SignatureMode::Required,
                         None,
+                        &self.trust_dir,
                     )?;
                     true
                 };
@@ -1106,7 +1115,11 @@ pub fn validate_staged_payload(manifest: &Manifest, root: &Path) -> Result<(), P
 /// Re-open a staging directory produced by [`StagingInstaller`] without
 /// reading the payload again. Used by the daemon's `plugin.install_staged` RPC, which
 /// trusts the HTTP layer to have streamed and hashed the files.
-pub fn load_staged(root: &Path, allow_insecure: bool) -> Result<StagedPackage, ProblemError> {
+pub fn load_staged(
+    root: &Path,
+    allow_insecure: bool,
+    trust_dir: &Path,
+) -> Result<StagedPackage, ProblemError> {
     let manifest_path = root.join("manifest.json");
     let manifest_bytes = fs::read(&manifest_path)
         .map_err(|error| Problem::Internal.error(format!("read {}: {}", manifest_path.display(), error)))?;
@@ -1152,6 +1165,7 @@ pub fn load_staged(root: &Path, allow_insecure: bool) -> Result<StagedPackage, P
             &signature_bytes,
             SignatureMode::Required,
             None,
+            trust_dir,
         )
         .is_ok()
     } else {
@@ -1160,6 +1174,7 @@ pub fn load_staged(root: &Path, allow_insecure: bool) -> Result<StagedPackage, P
             &signature_bytes,
             SignatureMode::Required,
             None,
+            trust_dir,
         )?;
         true
     };
@@ -1194,11 +1209,15 @@ pub fn tar_header_path(header: &[u8]) -> Result<Option<String>, ProblemError> {
     Ok(parse_header(header)?.map(|entry| entry.path))
 }
 
-pub fn verify_package(path: &Path) -> Result<Package, ProblemError> {
-    verify_package_with(path, SignatureCheck::Required)
+pub fn verify_package(path: &Path, trust_dir: &Path) -> Result<Package, ProblemError> {
+    verify_package_with(path, SignatureCheck::Required, trust_dir)
 }
 
-pub fn verify_package_with(path: &Path, check: SignatureCheck) -> Result<Package, ProblemError> {
+pub fn verify_package_with(
+    path: &Path,
+    check: SignatureCheck,
+    trust_dir: &Path,
+) -> Result<Package, ProblemError> {
     let bytes = fs::read(path).map_err(|error| Problem::Internal.error(format!("read {}: {}", path.display(), error)))?;
     if bytes.len() as u64 > MAX_PACKAGE_BYTES {
         return Err(Problem::TooLarge.error(format!(
@@ -1206,19 +1225,23 @@ pub fn verify_package_with(path: &Path, check: SignatureCheck) -> Result<Package
             MAX_PACKAGE_BYTES / (1024 * 1024)
         )));
     }
-    verify_bytes_with(&bytes, check)
+    verify_bytes_with(&bytes, check, trust_dir)
 }
 
-pub fn verify_bytes(bytes: &[u8]) -> Result<Package, ProblemError> {
-    verify_bytes_with(bytes, SignatureCheck::Required)
+pub fn verify_bytes(bytes: &[u8], trust_dir: &Path) -> Result<Package, ProblemError> {
+    verify_bytes_with(bytes, SignatureCheck::Required, trust_dir)
 }
 
-pub fn verify_bytes_with(bytes: &[u8], check: SignatureCheck) -> Result<Package, ProblemError> {
+pub fn verify_bytes_with(
+    bytes: &[u8],
+    check: SignatureCheck,
+    trust_dir: &Path,
+) -> Result<Package, ProblemError> {
     let mode = match check {
         SignatureCheck::Required => SignatureMode::Required,
         SignatureCheck::AllowUnsigned => SignatureMode::AllowUnsigned,
     };
-    verify_bytes_mode(bytes, mode, None).map(|(package, _)| package)
+    verify_bytes_mode(bytes, mode, None, trust_dir).map(|(package, _)| package)
 }
 
 /// Verify a package's own integrity without consulting host policy: no
@@ -1228,12 +1251,17 @@ pub fn verify_bytes_with(bytes: &[u8], check: SignatureCheck) -> Result<Package,
 /// `public_key` may be an explicit PEM: a CI runner has no `trust.d`, so this
 /// is how it checks the release signature without pretending the key is
 /// trusted. `trusted` still reports whether the key happens to be in `trust.d`.
-pub fn inspect_bytes_with(bytes: &[u8], public_key: Option<&[u8]>) -> Result<Inspection, ProblemError> {
+pub fn inspect_bytes_with(
+    bytes: &[u8],
+    public_key: Option<&[u8]>,
+    trust_dir: &Path,
+) -> Result<Inspection, ProblemError> {
     let explicit = match public_key {
         Some(pem) => Some(parse_public_key(pem)?),
         None => None,
     };
-    let (package, signature) = verify_bytes_mode(bytes, SignatureMode::Inspect, explicit.as_ref())?;
+    let (package, signature) =
+        verify_bytes_mode(bytes, SignatureMode::Inspect, explicit.as_ref(), trust_dir)?;
     Ok(Inspection { package, signature })
 }
 
@@ -1248,6 +1276,7 @@ fn verify_bytes_mode(
     bytes: &[u8],
     mode: SignatureMode,
     explicit: Option<&VerifyingKey>,
+    trust_dir: &Path,
 ) -> Result<(Package, SignatureInfo), ProblemError> {
     let mut tar = Tar::new(bytes);
 
@@ -1274,7 +1303,7 @@ fn verify_bytes_mode(
             let data = header
                 .data
                 .ok_or_else(|| Problem::Invalid.error("signature.json must be a regular file"))?;
-            signature = check_signature(&manifest_bytes, data, mode, explicit)?;
+            signature = check_signature(&manifest_bytes, data, mode, explicit, trust_dir)?;
             signature_bytes = data.to_vec();
         }
         Some(_) if mode == SignatureMode::Required => {
@@ -1402,15 +1431,15 @@ fn verify_bytes_mode(
 pub fn verify_package_with_fallback(
     path: &Path,
     allow_insecure: bool,
+    trust_dir: &Path,
 ) -> Result<(Package, bool), ProblemError> {
     if !allow_insecure {
-        return verify_package(path).map(|package| (package, true));
+        return verify_package(path, trust_dir).map(|package| (package, true));
     }
-    match verify_package(path) {
+    match verify_package(path, trust_dir) {
         Ok(package) => Ok((package, true)),
-        Err(_) => {
-            verify_package_with(path, SignatureCheck::AllowUnsigned).map(|package| (package, false))
-        }
+        Err(_) => verify_package_with(path, SignatureCheck::AllowUnsigned, trust_dir)
+            .map(|package| (package, false)),
     }
 }
 
@@ -1418,15 +1447,15 @@ pub fn verify_package_with_fallback(
 pub fn verify_bytes_with_fallback(
     bytes: &[u8],
     allow_insecure: bool,
+    trust_dir: &Path,
 ) -> Result<(Package, bool), ProblemError> {
     if !allow_insecure {
-        return verify_bytes(bytes).map(|package| (package, true));
+        return verify_bytes(bytes, trust_dir).map(|package| (package, true));
     }
-    match verify_bytes(bytes) {
+    match verify_bytes(bytes, trust_dir) {
         Ok(package) => Ok((package, true)),
-        Err(_) => {
-            verify_bytes_with(bytes, SignatureCheck::AllowUnsigned).map(|package| (package, false))
-        }
+        Err(_) => verify_bytes_with(bytes, SignatureCheck::AllowUnsigned, trust_dir)
+            .map(|package| (package, false)),
     }
 }
 
@@ -1819,6 +1848,7 @@ fn check_signature(
     signature_bytes: &[u8],
     mode: SignatureMode,
     explicit: Option<&VerifyingKey>,
+    trust_dir: &Path,
 ) -> Result<SignatureInfo, ProblemError> {
     if mode == SignatureMode::AllowUnsigned {
         // Insecure installs skip signature verification entirely. The bytes
@@ -1837,7 +1867,7 @@ fn check_signature(
     if !valid_key_id(&sig.key_id) {
         return Err(Problem::Invalid.error(format!("invalid keyId: {}", sig.key_id)));
     }
-    let key_path = paths::trust_dir().join(format!("{}.pub", sig.key_id));
+    let key_path = trust_dir.join(format!("{}.pub", sig.key_id));
     if mode == SignatureMode::Required {
         let pem = fs::read(&key_path)
             .map_err(|error| unknown_key_error(&sig.key_id, &key_path, error))?;
@@ -2166,38 +2196,23 @@ pub fn pem_from_public(key: &[u8; 32]) -> Vec<u8> {
     pem.into_bytes()
 }
 
-#[cfg(test)]
-static TEST_SIGNING_KEY: std::sync::OnceLock<ed25519_dalek::SigningKey> =
-    std::sync::OnceLock::new();
-
-#[cfg(test)]
-static TEST_TRUST: std::sync::OnceLock<tempdir::TempDir> = std::sync::OnceLock::new();
-
-/// The one signing key every unit test that verifies a package shares.
+/// The one signing key every unit test that verifies a package shares. It is a
+/// deterministic value, not process state: a test that needs it derives it.
 #[cfg(test)]
 fn test_signing_key() -> ed25519_dalek::SigningKey {
-    TEST_SIGNING_KEY
-        .get_or_init(|| ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]))
-        .clone()
+    ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
 }
 
-/// Point `SVCD_TRUST_DIR` at one process-wide directory and install the shared
-/// test key there. Package and daemon unit tests run in the same process, so two
-/// independent `set_var` calls would race; every test uses this initializer.
+/// Install the shared test key into `trust_dir` so a package signed by
+/// [`test_signed_package`] verifies without touching process state.
 #[cfg(test)]
-fn test_trust_dir() -> &'static std::path::Path {
-    TEST_TRUST
-        .get_or_init(|| {
-            let dir = tempdir::TempDir::new();
-            std::env::set_var("SVCD_TRUST_DIR", dir.path());
-            std::fs::write(
-                dir.path().join("test.pub"),
-                pem_from_public(&test_signing_key().verifying_key().to_bytes()),
-            )
-            .expect("write test key");
-            dir
-        })
-        .path()
+pub(crate) fn install_test_trust(trust_dir: &Path) {
+    std::fs::create_dir_all(trust_dir).expect("create trust dir");
+    std::fs::write(
+        trust_dir.join("test.pub"),
+        pem_from_public(&test_signing_key().verifying_key().to_bytes()),
+    )
+    .expect("write test key");
 }
 
 /// A signed package for tests outside this module: two payload files, the
@@ -2206,7 +2221,6 @@ fn test_trust_dir() -> &'static std::path::Path {
 pub(crate) fn test_signed_package(name: &str, platform: &str) -> Vec<u8> {
     use ed25519_dalek::Signer;
 
-    let _ = test_trust_dir();
     let files: Vec<(&str, &[u8], u32)> = vec![
         ("payload/bin/demo", b"hello", 0o755),
         ("config/config", b"{}", 0o644),
@@ -2255,8 +2269,43 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::{json, Value};
 
+    /// One trust root per test binary, with the shared test key installed.
+    fn trust_dir() -> &'static std::path::Path {
+        static TRUST: std::sync::OnceLock<tempdir::TempDir> = std::sync::OnceLock::new();
+        TRUST
+            .get_or_init(|| {
+                let dir = tempdir::TempDir::new();
+                install_test_trust(dir.path());
+                dir
+            })
+            .path()
+    }
+
+    // The tests call the production entry points without repeating the trust
+    // root at every call site.
+    fn verify_bytes(bytes: &[u8]) -> Result<Package, ProblemError> {
+        super::verify_bytes(bytes, trust_dir())
+    }
+
+    fn verify_bytes_with(
+        bytes: &[u8],
+        check: SignatureCheck,
+    ) -> Result<Package, ProblemError> {
+        super::verify_bytes_with(bytes, check, trust_dir())
+    }
+
+    fn verify_bytes_with_fallback(
+        bytes: &[u8],
+        allow_insecure: bool,
+    ) -> Result<(Package, bool), ProblemError> {
+        super::verify_bytes_with_fallback(bytes, allow_insecure, trust_dir())
+    }
+
+    fn stager(staging: PathBuf, allow_insecure: bool, max_bytes: u64) -> StagingInstaller {
+        StagingInstaller::new(staging, allow_insecure, max_bytes, trust_dir())
+    }
+
     fn setup() -> SigningKey {
-        let _ = test_trust_dir();
         test_signing_key()
     }
 
@@ -2344,7 +2393,7 @@ mod tests {
     }
 
     fn install_bytes(bytes: &[u8], staging: &Path) -> Result<StagedPackage, ProblemError> {
-        let mut installer = StagingInstaller::new(staging.to_path_buf(), false, 1024 * 1024);
+        let mut installer = stager(staging.to_path_buf(), false, 1024 * 1024);
         installer.feed(bytes)?;
         installer.finish()
     }
@@ -2374,7 +2423,7 @@ mod tests {
         for chunk in [1usize, 3, 7, 511, 512, 513, 1000] {
             let root = tempdir::TempDir::new();
             let mut installer =
-                StagingInstaller::new(root.path().to_path_buf(), false, 1024 * 1024);
+                stager(root.path().to_path_buf(), false, 1024 * 1024);
             for part in bytes.chunks(chunk) {
                 installer
                     .feed(part)
@@ -2398,7 +2447,7 @@ mod tests {
         let bytes = package(&key);
         let root = tempdir::TempDir::new();
         let staging = root.path().join("staged");
-        let mut installer = StagingInstaller::new(staging.clone(), false, 1024 * 1024);
+        let mut installer = stager(staging.clone(), false, 1024 * 1024);
         installer
             .feed(&bytes[..bytes.len() / 2])
             .expect("prefix feed");

@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::paths;
+use crate::paths::Paths;
 
 /// The compatibility list a plugin declares in its signed manifest.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,11 +62,11 @@ pub enum Verdict {
     Unknown(String),
 }
 
-pub fn marker_path() -> PathBuf {
+pub fn marker_path(paths: &Paths) -> PathBuf {
     if let Some(path) = std::env::var_os("SVCD_COMPAT_CONF") {
         return PathBuf::from(path);
     }
-    paths::config_dir().join("compat.conf")
+    paths.config_dir.join("compat.conf")
 }
 
 /// Read the marker: `None` when the file does not exist, `Some(id)` when it
@@ -121,8 +121,8 @@ fn read_marker(path: &Path) -> (Option<String>, Vec<String>) {
     (device, warnings)
 }
 
-pub fn detect(schema_max: u32, protocol_max: u32) -> HostFacts {
-    let path = marker_path();
+pub fn detect(paths: &Paths, schema_max: u32, protocol_max: u32) -> HostFacts {
+    let path = marker_path(paths);
     let (mut device, mut warnings) = read_marker(&path);
     let mut device_source = device.as_ref().map(|_| "marker".to_string());
     if let Some(value) = std::env::var_os("SVCD_DEVICE") {

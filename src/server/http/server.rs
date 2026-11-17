@@ -76,7 +76,7 @@ pub(crate) fn start(
     pending: mpsc::SyncSender<PendingCall>,
     wake: Arc<Wake>,
     lan: Arc<Mutex<Lan>>,
-    config: PathBuf,
+    config: Arc<crate::config::Config>,
     raw_hub: Arc<crate::rawhub::RawHub>,
     face: Arc<dyn Face>,
     routes: Arc<dyn PreBodyRoutes>,
@@ -158,7 +158,7 @@ enum ExtraSource {
 
 struct Server {
     lan: Arc<Mutex<Lan>>,
-    config: PathBuf,
+    config: Arc<crate::config::Config>,
     raw_hub: Arc<crate::rawhub::RawHub>,
     control: ControlServer,
     client: StreamingClient,
@@ -243,10 +243,10 @@ impl ServerLoop for Server {
                 &head,
                 connection.peer,
                 &self.lan,
-                &self.config,
+                &self.config.paths.config_dir,
                 self.raw_hub.clone(),
             )
-            .or_else(|| self.routes.package_upload(&head, &self.lan, &self.config))
+            .or_else(|| self.routes.package_upload(&head, &self.lan, &self.config.paths.config_dir))
             .or_else(|| self.routes.blob_upload(&head, &self.lan));
         let Some(claim) = claim else {
             return PreRequest::Continue;
@@ -329,7 +329,7 @@ impl ServerLoop for Server {
                     // headers.
                     let stream = self
                         .client
-                        .open(&self.config, "registry.call", request, sender);
+                        .open(&self.config.paths.config_dir, "registry.call", request, sender);
                     let cancel = self.client.canceller();
                     let handler = McpSseStream::new(
                         receiver,

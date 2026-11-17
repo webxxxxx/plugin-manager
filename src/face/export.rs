@@ -19,10 +19,12 @@
 //! install path verifies `files[].sha256` again on import (#120).
 
 use std::fs::File;
+use std::sync::Arc;
 
 use crate::http;
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::package::{self, TarPart, TarPlan};
+use crate::paths::Paths;
 use crate::plugin;
 use crate::server::http::{
     CloseReason, FileSend, OutBuffer, StreamAction, StreamClass, StreamEvent, StreamHandler,
@@ -67,6 +69,7 @@ pub fn export_target(method: &str, path: &str) -> Option<ExportTarget> {
 /// The plan is built on the first writable event, after the server admitted
 /// the stream, so a request refused with 503 busy never pays for it.
 pub struct ExportStream {
+    paths: Arc<Paths>,
     pending: Option<Pending>,
     head: Vec<u8>,
     head_sent: usize,
@@ -82,16 +85,17 @@ struct Pending {
 }
 
 impl ExportStream {
-    pub fn open(target: ExportTarget) -> ExportStream {
+    pub fn open(target: ExportTarget, paths: Arc<Paths>) -> ExportStream {
         let id = target.id();
         // Validate before touching the filesystem: plugin_dir joins the id.
         let version = if package::valid_name(id) {
-            plugin::current_version(id)
+            plugin::current_version(&paths, id)
         } else {
             None
         };
         match version {
             Some(version) => ExportStream {
+                paths,
                 pending: Some(Pending { target, version }),
                 head: Vec::new(),
                 head_sent: 0,
@@ -99,18 +103,18 @@ impl ExportStream {
                 index: 0,
                 at: 0,
             },
-            None => ExportStream::response(http::json_error(
-                404,
-                "not_found",
-                &format!("unknown plugin: {}", id),
-            )),
+            None => ExportStream::response(
+                http::json_error(404, "not_found", &format!("unknown plugin: {}", id)),
+                paths,
+            ),
         }
     }
 
     /// A complete response that is not an archive. The route is streamed, so
     /// even a failure is a stream response.
-    fn response(head: Vec<u8>) -> ExportStream {
+    fn response(head: Vec<u8>, paths: Arc<Paths>) -> ExportStream {
         ExportStream {
+            paths,
             pending: None,
             head,
             head_sent: 0,
@@ -123,9 +127,14 @@ impl ExportStream {
     /// Stream an already-built plan. Production builds its plan lazily in
     /// ExportStream::begin; this constructor is the test seam.
     #[cfg(test)]
-    fn planned(filename: &str, plan: Result<TarPlan, ProblemError>) -> ExportStream {
+    fn planned(
+        filename: &str,
+        plan: Result<TarPlan, ProblemError>,
+        paths: Arc<Paths>,
+    ) -> ExportStream {
         match plan {
             Ok(plan) => ExportStream {
+                paths,
                 pending: None,
                 head: download_head(filename, plan.size()),
                 head_sent: 0,
@@ -133,7 +142,10 @@ impl ExportStream {
                 index: 0,
                 at: 0,
             },
-            Err(error) => ExportStream::response(http::json_error(500, "internal", error.detail())),
+            Err(error) => ExportStream::response(
+                http::json_error(500, "internal", error.detail()),
+                paths,
+            ),
         }
     }
 
@@ -143,7 +155,7 @@ impl ExportStream {
             return;
         };
         let id = target.id().to_string();
-        let version_dir = plugin::plugin_dir(&id).join(&version);
+        let version_dir = plugin::plugin_dir(&self.paths, &id).join(&version);
         let extension = match &target {
             ExportTarget::Spk { .. } => "spk",
             ExportTarget::Spkb { .. } => "spkb",
@@ -156,7 +168,7 @@ impl ExportStream {
         );
         let plan = match target {
             ExportTarget::Spk { .. } => package::plan_installed_spk(&version_dir),
-            ExportTarget::Spkb { .. } => match active_config(&id) {
+            ExportTarget::Spkb { .. } => match active_config(&self.paths, &id) {
                 Ok(config) => {
                     plugin::plan_export_spkb(&id, &version, &version_dir, config.as_deref())
                 }
@@ -248,8 +260,8 @@ impl StreamHandler for ExportStream {
 
 /// The active config of a .spkb backup; a plugin without one exports without
 /// the config entry.
-fn active_config(id: &str) -> Result<Option<Vec<u8>>, ProblemError> {
-    match plugin::active_config(id) {
+fn active_config(paths: &Paths, id: &str) -> Result<Option<Vec<u8>>, ProblemError> {
+    match plugin::active_config(paths, id) {
         Some(path) => Ok(Some(std::fs::read(&path).map_err(|error| {
             Problem::Internal.error(format!("read config: {}", error))
         })?)),
@@ -442,10 +454,15 @@ mod tests {
         package::write_tar(&entries).expect("reference tar")
     }
 
+    fn test_paths() -> Arc<Paths> {
+        Arc::new(Paths::under(&temp_dir()))
+    }
+
     fn spk(version_dir: &Path, name: &str) -> ExportStream {
         ExportStream::planned(
             &format!("{}-1.0.0.spk", name),
             package::plan_installed_spk(version_dir),
+            test_paths(),
         )
     }
 
@@ -453,6 +470,7 @@ mod tests {
         ExportStream::planned(
             &format!("{}-1.0.0.spkb", name),
             plugin::plan_export_spkb(name, "1.0.0", version_dir, config),
+            test_paths(),
         )
     }
 
@@ -596,9 +614,12 @@ mod tests {
     #[test]
     fn an_unknown_plugin_is_a_streamed_404() {
         let (bytes, reason) = drive(
-            ExportStream::open(ExportTarget::Spkb {
-                id: "no-such-export-plugin".into(),
-            }),
+            ExportStream::open(
+                ExportTarget::Spkb {
+                    id: "no-such-export-plugin".into(),
+                },
+                test_paths(),
+            ),
             4096,
         );
         assert_eq!(reason, CloseReason::Completed);
@@ -607,9 +628,12 @@ mod tests {
 
         // A name that cannot be a plugin id is rejected before any path join.
         let (bytes, _) = drive(
-            ExportStream::open(ExportTarget::Spk {
-                id: "../escape".into(),
-            }),
+            ExportStream::open(
+                ExportTarget::Spk {
+                    id: "../escape".into(),
+                },
+                test_paths(),
+            ),
             4096,
         );
         assert!(text(&bytes).starts_with("HTTP/1.1 404 Not Found\r\n"));

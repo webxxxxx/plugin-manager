@@ -17,7 +17,7 @@ use serde_json::json;
 use crate::channel;
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::package;
-use crate::paths;
+use crate::paths::Paths;
 use crate::plugin;
 use crate::rpc;
 use crate::settings;
@@ -48,6 +48,7 @@ pub enum Error {
 }
 
 pub fn import(
+    paths: &Paths,
     data: &[u8],
     config_id: Option<&str>,
     no_config: bool,
@@ -64,13 +65,14 @@ pub fn import(
     let first = entries.as_ref().and_then(|entries| entries.first());
     match first.map(|entry| entry.path.as_str()) {
         Some("backup.json") => import_backup(
+            paths,
             entries.as_ref().expect("entries"),
             no_config,
             force,
             require_root,
         ),
         Some("manifest.json") => {
-            let status = install_bytes(data, "spk").map_err(Error::Failed)?;
+            let status = install_bytes(paths, data, "spk").map_err(Error::Failed)?;
             Ok(Outcome {
                 status: Some(status),
                 config: None,
@@ -81,7 +83,7 @@ pub fn import(
             let Some(id) = config_id else {
                 return Err(Error::Usage("raw config requires --config <id>".into()));
             };
-            apply_config(id, data, require_root)?;
+            apply_config(paths, id, data, require_root)?;
             Ok(Outcome {
                 status: None,
                 config: Some(id.to_string()),
@@ -92,6 +94,7 @@ pub fn import(
 }
 
 fn import_backup(
+    paths: &Paths,
     entries: &[package::TarEntry],
     no_config: bool,
     force: bool,
@@ -115,8 +118,12 @@ fn import_backup(
         .find(|entry| entry.path == "plugin.spk")
         .ok_or_else(|| Error::Failed(Problem::Invalid.error("plugin.spk is missing")))?;
     let (package, _) =
-        package::verify_bytes_with_fallback(&spk.data, settings::allow_insecure_install())
-            .map_err(Error::Failed)?;
+        package::verify_bytes_with_fallback(
+            &spk.data,
+            settings::allow_insecure_install(),
+            &paths.trust_dir,
+        )
+        .map_err(Error::Failed)?;
     if package.manifest.name != backup.id {
         return Err(Error::Failed(Problem::Invalid.error(format!(
             "backup id {} does not match package id {}",
@@ -146,7 +153,7 @@ fn import_backup(
     }
 
     let mut warnings = Vec::new();
-    if let Some(current) = plugin::current_version(&backup.id) {
+    if let Some(current) = plugin::current_version(paths, &backup.id) {
         if current != backup.version {
             warnings.push(format!(
                 "installed {} is {}, importing {}",
@@ -165,9 +172,9 @@ fn import_backup(
     if with_config && require_root {
         plugin::root_required().map_err(Error::Failed)?;
     }
-    let status = install_bytes(&spk.data, "spkb").map_err(Error::Failed)?;
+    let status = install_bytes(paths, &spk.data, "spkb").map_err(Error::Failed)?;
     let config = if let Some(config) = config.filter(|_| with_config) {
-        apply_config(&backup.id, &config.data, require_root)?;
+        apply_config(paths, &backup.id, &config.data, require_root)?;
         Some(backup.id.clone())
     } else {
         None
@@ -179,22 +186,31 @@ fn import_backup(
     })
 }
 
-pub(crate) fn apply_config(id: &str, data: &[u8], require_root: bool) -> Result<(), Error> {
+pub(crate) fn apply_config(
+    paths: &Paths,
+    id: &str,
+    data: &[u8],
+    require_root: bool,
+) -> Result<(), Error> {
     if require_root {
         plugin::root_required().map_err(Error::Failed)?;
     }
-    if !package::valid_name(id) || plugin::current_version(id).is_none() {
+    if !package::valid_name(id) || plugin::current_version(paths, id).is_none() {
         return Err(Error::Failed(Problem::UnknownPlugin.error(format!(
             "unknown plugin: {}",
             id
         ))));
     }
-    let _lock = plugin::lock_config(id).map_err(Error::Failed)?;
-    plugin::replace_config(id, data, true).map_err(Error::Failed)
+    let _lock = plugin::lock_config(paths, id).map_err(Error::Failed)?;
+    plugin::replace_config(paths, id, data, true).map_err(Error::Failed)
 }
 
-fn install_bytes(bytes: &[u8], source: &str) -> Result<serde_json::Value, ProblemError> {
-    let directory = paths::config_dir().join("tmp");
+fn install_bytes(
+    paths: &Paths,
+    bytes: &[u8],
+    source: &str,
+) -> Result<serde_json::Value, ProblemError> {
+    let directory = paths.config_dir.join("tmp");
     fs::create_dir_all(&directory).map_err(|error| {
         Problem::Internal.error(format!("create {}: {}", directory.display(), error))
     })?;
@@ -212,7 +228,7 @@ fn install_bytes(bytes: &[u8], source: &str) -> Result<serde_json::Value, Proble
         )));
     }
     let response = channel::request(
-        &paths::config_dir(),
+        &paths.config_dir,
         "plugin.install",
         json!({ "path": path.to_string_lossy(), "strategy": "replace" }),
     );
@@ -245,7 +261,14 @@ mod tests {
 
     #[test]
     fn raw_config_without_an_id_is_a_usage_error() {
-        match import(b"plain text", None, false, false, true) {
+        match import(
+            &Paths::under(std::path::Path::new("/nonexistent-svcd-transfer")),
+            b"plain text",
+            None,
+            false,
+            false,
+            true,
+        ) {
             Err(Error::Usage(message)) => assert!(message.contains("--config"), "{message}"),
             other => panic!("expected a usage error, got {:?}", other),
         }
@@ -293,7 +316,13 @@ mod tests {
             mode: 0o644,
             data: b"{\"schema\":1,\"id\":\"demo\",\"version\":\"1.0.0\"}".to_vec(),
         }];
-        match import_backup(&entries, false, false, false) {
+        match import_backup(
+            &Paths::under(std::path::Path::new("/nonexistent-svcd-transfer")),
+            &entries,
+            false,
+            false,
+            false,
+        ) {
             Err(Error::Failed(error)) => {
                 assert_eq!(error.problem, Problem::Invalid);
                 assert!(error.detail().contains("plugin.spk"), "{}", error);

@@ -18,7 +18,7 @@ use crate::hook;
 use crate::interpreter;
 use crate::log;
 use crate::package::{self, Package};
-use crate::paths;
+use crate::paths::Paths;
 use crate::registry::{
     Exec, Hook, Interpreter, Kind, Lifecycle, Ready, Restart, Service, State, RESERVED_ID,
 };
@@ -125,13 +125,19 @@ pub struct Verified {
 /// package signature and file hashes, host compatibility, hook policy and the
 /// interpreter lookup. It has no side effects, so the daemon can run it before
 /// stopping a running version.
-pub fn verify(path: &Path, allow_insecure: bool, opt_in_hooks: bool) -> Result<Verified, ProblemError> {
+pub fn verify(
+    paths: &Paths,
+    path: &Path,
+    allow_insecure: bool,
+    opt_in_hooks: bool,
+) -> Result<Verified, ProblemError> {
     let (package, signature_verified) =
-        package::verify_package_with_fallback(path, allow_insecure)?;
-    verify_package(package, signature_verified, opt_in_hooks)
+        package::verify_package_with_fallback(path, allow_insecure, &paths.trust_dir)?;
+    verify_package(paths, package, signature_verified, opt_in_hooks)
 }
 
 fn verify_package(
+    paths: &Paths,
     package: Package,
     signature_verified: bool,
     opt_in_hooks: bool,
@@ -145,7 +151,7 @@ fn verify_package(
     if let Some(reason) = compat::verdict_reason(compat::evaluate(
         crate::platform::target(),
         &devices,
-        &compat::detect(MAX_SCHEMA, MAX_PROTOCOL),
+        &compat::detect(paths, MAX_SCHEMA, MAX_PROTOCOL),
     )) {
         // A restricted package on the wrong device generation is the same
         // family as a host triple mismatch: the host cannot run it (400).
@@ -175,6 +181,7 @@ pub fn prepare_staged(
 /// Commit a streamed package. The caller must run [`prepare_staged`] first and
 /// must stop the running version before calling this for `Replace`.
 pub fn install_staged(
+    paths: &Paths,
     staged: package::StagedPackage,
     strategy: Strategy,
     opt_in_hooks: bool,
@@ -188,24 +195,24 @@ pub fn install_staged(
         return Err(Problem::Invalid.error(format!("invalid plugin id: {}", id)));
     }
     ensure_hooks_allowed_manifest(&staged.manifest, opt_in_hooks)?;
-    if paths::services_dir().join(format!("{}.json", id)).exists() {
+    if paths.services_dir.join(format!("{}.json", id)).exists() {
         return Err(Problem::Conflict.error(format!("plugin id conflicts with a core service: {}", id)));
     }
 
-    let plugin_dir = plugin_dir(&id);
-    let was_installed = current_version(&id).is_some();
+    let plugin_dir = plugin_dir(paths, &id);
+    let was_installed = current_version(paths, &id).is_some();
     fs::create_dir_all(&plugin_dir)
         .map_err(|error| Problem::Internal.error(format!("create {}: {}", plugin_dir.display(), error)))?;
 
     match strategy {
-        Strategy::KeepOld => install_keep_old_staged(
+        Strategy::KeepOld => install_keep_old_staged(paths, 
             staged,
             &id,
             &plugin_dir,
             was_installed,
             host_interpreter.as_ref(),
         ),
-        Strategy::Replace => install_replace_staged(
+        Strategy::Replace => install_replace_staged(paths, 
             staged,
             &id,
             &plugin_dir,
@@ -216,6 +223,7 @@ pub fn install_staged(
 }
 
 fn install_keep_old_staged(
+    paths: &Paths,
     staged: package::StagedPackage,
     id: &str,
     plugin_dir: &Path,
@@ -225,12 +233,13 @@ fn install_keep_old_staged(
     let manifest = staged.manifest.clone();
     let (version_dir, enabled) = commit_staged(staged, plugin_dir, was_installed)?;
     copy_config_staged(&manifest, plugin_dir, &version_dir)?;
-    let service = service_from_manifest(id, &version_dir, &manifest, enabled, interpreter)?;
-    run_post_install_manifest(&manifest, id, &version_dir)?;
+    let service = service_from_manifest(paths, id, &version_dir, &manifest, enabled, interpreter)?;
+    run_post_install_manifest(paths, &manifest, id, &version_dir)?;
     Ok(service)
 }
 
 fn install_replace_staged(
+    paths: &Paths,
     staged: package::StagedPackage,
     id: &str,
     plugin_dir: &Path,
@@ -238,7 +247,7 @@ fn install_replace_staged(
     interpreter: Option<&Interpreter>,
 ) -> Result<Service, ProblemError> {
     let manifest = staged.manifest.clone();
-    let old_version = current_version(id).filter(|version| plugin_dir.join(version).is_dir());
+    let old_version = current_version(paths, id).filter(|version| plugin_dir.join(version).is_dir());
     let old_dir = old_version.as_ref().map(|version| plugin_dir.join(version));
     let backup = old_version
         .as_ref()
@@ -255,8 +264,8 @@ fn install_replace_staged(
     let result = (|| {
         let (version_dir, enabled) = commit_staged(staged, plugin_dir, was_installed)?;
         copy_config_staged(&manifest, plugin_dir, &version_dir)?;
-        let service = service_from_manifest(id, &version_dir, &manifest, enabled, interpreter)?;
-        run_post_install_manifest(&manifest, id, &version_dir)?;
+        let service = service_from_manifest(paths, id, &version_dir, &manifest, enabled, interpreter)?;
+        run_post_install_manifest(paths, &manifest, id, &version_dir)?;
         Ok(service)
     })();
     match result {
@@ -358,6 +367,7 @@ fn copy_config_staged(
 }
 
 fn run_post_install_manifest(
+    paths: &Paths,
     manifest: &package::Manifest,
     id: &str,
     version_dir: &Path,
@@ -378,6 +388,7 @@ fn run_post_install_manifest(
             path,
             timeout_ms: hook::TIMEOUT_MS,
         },
+        paths,
         &mut hook::poll_this_loop,
     )
     .map_err(|error| {
@@ -389,8 +400,8 @@ fn run_post_install_manifest(
 }
 
 /// Remove stale staging directories. Called once at daemon startup.
-pub fn cleanup_staging() {
-    let Ok(root) = fs::read_dir(paths::plugins_dir()) else {
+pub fn cleanup_staging(paths: &Paths) {
+    let Ok(root) = fs::read_dir(&paths.plugins_dir) else {
         return;
     };
     for entry in root.flatten() {
@@ -420,11 +431,11 @@ pub fn cleanup_staging() {
 /// Allocate a unique staging directory under the plugin's own tree so the
 /// final commit is a same-filesystem rename.
 #[allow(dead_code)]
-pub fn staging_dir(id: &str) -> Result<PathBuf, ProblemError> {
+pub fn staging_dir(paths: &Paths, id: &str) -> Result<PathBuf, ProblemError> {
     if !package::valid_name(id) {
         return Err(Problem::Invalid.error(format!("invalid plugin id: {}", id)));
     }
-    let directory = plugin_dir(id);
+    let directory = plugin_dir(paths, id);
     fs::create_dir_all(&directory)
         .map_err(|error| Problem::Internal.error(format!("create {}: {}", directory.display(), error)))?;
     let nanos = std::time::SystemTime::now()
@@ -462,6 +473,7 @@ impl From<ProblemError> for InstallFailure {
 }
 
 pub fn install_package(
+    paths: &Paths,
     package: &Package,
     strategy: Strategy,
     opt_in_hooks: bool,
@@ -472,7 +484,7 @@ pub fn install_package(
         return Err(Problem::Conflict.error("the built-in svc id is reserved").into());
     }
     ensure_hooks_allowed(package, opt_in_hooks)?;
-    if paths::services_dir().join(format!("{}.json", id)).exists() {
+    if paths.services_dir.join(format!("{}.json", id)).exists() {
         return Err(
             Problem::Conflict
                 .error(format!("plugin id conflicts with a core service: {}", id))
@@ -480,20 +492,20 @@ pub fn install_package(
         );
     }
 
-    let plugin_dir = plugin_dir(&id);
-    let was_installed = current_version(&id).is_some();
+    let plugin_dir = plugin_dir(paths, &id);
+    let was_installed = current_version(paths, &id).is_some();
     fs::create_dir_all(&plugin_dir)
         .map_err(|error| Problem::Internal.error(format!("create {}: {}", plugin_dir.display(), error)))?;
 
     match strategy {
-        Strategy::KeepOld => install_keep_old(
+        Strategy::KeepOld => install_keep_old(paths, 
             package,
             &id,
             &plugin_dir,
             was_installed,
             host_interpreter.as_ref(),
         ),
-        Strategy::Replace => install_replace(
+        Strategy::Replace => install_replace(paths, 
             package,
             &id,
             &plugin_dir,
@@ -505,6 +517,7 @@ pub fn install_package(
 }
 
 fn install_keep_old(
+    paths: &Paths,
     package: &Package,
     id: &str,
     plugin_dir: &Path,
@@ -527,12 +540,17 @@ fn install_keep_old(
     }
     let (version_dir, enabled) = write_version(package, plugin_dir, was_installed)?;
     copy_config(package, plugin_dir)?;
-    let service = service_from_manifest(id, &version_dir, &package.manifest, enabled, interpreter)?;
-    run_post_install(package, id, &version_dir)?;
+    let service = service_from_manifest(paths, id, &version_dir, &package.manifest, enabled, interpreter)?;
+    run_post_install(paths, package, id, &version_dir)?;
     Ok(service)
 }
 
-fn run_post_install(package: &Package, id: &str, version_dir: &Path) -> Result<(), ProblemError> {
+fn run_post_install(
+    paths: &Paths,
+    package: &Package,
+    id: &str,
+    version_dir: &Path,
+) -> Result<(), ProblemError> {
     let Some(path) = package
         .manifest
         .hooks
@@ -550,6 +568,7 @@ fn run_post_install(package: &Package, id: &str, version_dir: &Path) -> Result<(
             path,
             timeout_ms: hook::TIMEOUT_MS,
         },
+        paths,
         &mut hook::poll_this_loop,
     )
     .map_err(|error| {
@@ -561,13 +580,14 @@ fn run_post_install(package: &Package, id: &str, version_dir: &Path) -> Result<(
 }
 
 fn install_replace(
+    paths: &Paths,
     package: &Package,
     id: &str,
     plugin_dir: &Path,
     was_installed: bool,
     interpreter: Option<&Interpreter>,
 ) -> Result<Service, ProblemError> {
-    let old_version = current_version(id).filter(|version| plugin_dir.join(version).is_dir());
+    let old_version = current_version(paths, id).filter(|version| plugin_dir.join(version).is_dir());
     let old_dir = old_version.as_ref().map(|version| plugin_dir.join(version));
     let old_size = match &old_dir {
         Some(path) => Some(directory_size(path)?),
@@ -608,8 +628,8 @@ fn install_replace(
         write_version(package, plugin_dir, was_installed).and_then(|(version_dir, enabled)| {
             copy_config(package, plugin_dir)?;
             let service =
-                service_from_manifest(id, &version_dir, &package.manifest, enabled, interpreter)?;
-            run_post_install(package, id, &version_dir)?;
+                service_from_manifest(paths, id, &version_dir, &package.manifest, enabled, interpreter)?;
+            run_post_install(paths, package, id, &version_dir)?;
             Ok(service)
         });
 
@@ -851,9 +871,9 @@ fn restore_file(path: &Path, content: &Option<Vec<u8>>, config: bool) -> Result<
     }
 }
 
-pub fn scan() -> (Vec<Service>, Vec<String>) {
-    let root = paths::plugins_dir();
-    let host = crate::compat::detect(MAX_SCHEMA, MAX_PROTOCOL);
+pub fn scan(paths: &Paths) -> (Vec<Service>, Vec<String>) {
+    let root = &paths.plugins_dir;
+    let host = crate::compat::detect(paths, MAX_SCHEMA, MAX_PROTOCOL);
     let mut services = Vec::new();
     let mut warnings = Vec::new();
     let entries = match fs::read_dir(&root) {
@@ -872,7 +892,7 @@ pub fn scan() -> (Vec<Service>, Vec<String>) {
             continue;
         }
         let directory = entry.path();
-        let version = match current_version(&id) {
+        let version = match current_version(paths, &id) {
             Some(version) => version,
             None => {
                 warnings.push(format!("{}: missing current pointer", id));
@@ -895,7 +915,7 @@ pub fn scan() -> (Vec<Service>, Vec<String>) {
                 continue;
             }
         };
-        match service_from_manifest(&id, &version_dir, &manifest, enabled, interpreter.as_ref()) {
+        match service_from_manifest(paths, &id, &version_dir, &manifest, enabled, interpreter.as_ref()) {
             Ok(mut service) => {
                 let devices = service
                     .compat
@@ -922,8 +942,8 @@ pub fn scan() -> (Vec<Service>, Vec<String>) {
 /// Remove the service and install-hook logs for a purged plugin. The slot is
 /// already gone, but its reader threads may still be closing the file on
 /// Windows, so retry briefly instead of leaving rotated logs behind.
-pub fn remove_logs(id: &str) {
-    let directory = paths::logs_dir();
+pub fn remove_logs(paths: &Paths, id: &str) {
+    let directory = &paths.logs_dir;
     let names = [
         format!("{}.log", id),
         format!("{}.log.1", id),
@@ -944,15 +964,15 @@ pub fn remove_logs(id: &str) {
     }
 }
 
-pub fn uninstall(id: &str, purge: bool) -> Result<(), ProblemError> {
+pub fn uninstall(paths: &Paths, id: &str, purge: bool) -> Result<(), ProblemError> {
     if !package::valid_name(id) || id == RESERVED_ID {
         return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
     }
-    let directory = plugin_dir(id);
+    let directory = plugin_dir(paths, id);
     if !directory.is_dir() {
         return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
     }
-    run_pre_remove(id);
+    run_pre_remove(paths, id);
     if purge {
         fs::remove_dir_all(&directory)
             .map_err(|error| Problem::Internal.error(format!("remove {}: {}", directory.display(), error)))?;
@@ -973,11 +993,11 @@ pub fn uninstall(id: &str, purge: bool) -> Result<(), ProblemError> {
 
 /// A failing pre-remove hook must not block uninstall; the spec only requires a
 /// log line so a broken package can still be removed.
-fn run_pre_remove(id: &str) {
-    let Some(version) = current_version(id) else {
+fn run_pre_remove(paths: &Paths, id: &str) {
+    let Some(version) = current_version(paths, id) else {
         return;
     };
-    let version_dir = plugin_dir(id).join(&version);
+    let version_dir = plugin_dir(paths, id).join(&version);
     let manifest = match read_manifest(&version_dir) {
         Ok(manifest) => manifest,
         Err(error) => {
@@ -1004,6 +1024,7 @@ fn run_pre_remove(id: &str) {
             path,
             timeout_ms: hook::TIMEOUT_MS,
         },
+        paths,
         &mut hook::poll_this_loop,
     );
     if let Err(error) = result {
@@ -1014,12 +1035,12 @@ fn run_pre_remove(id: &str) {
     }
 }
 
-pub fn plugin_dir(id: &str) -> PathBuf {
-    paths::plugins_dir().join(id)
+pub fn plugin_dir(paths: &Paths, id: &str) -> PathBuf {
+    paths.plugins_dir.join(id)
 }
 
-pub fn current_version(id: &str) -> Option<String> {
-    let text = fs::read_to_string(plugin_dir(id).join("current")).ok()?;
+pub fn current_version(paths: &Paths, id: &str) -> Option<String> {
+    let text = fs::read_to_string(plugin_dir(paths, id).join("current")).ok()?;
     let version = text.trim();
     if version.is_empty()
         || version.split('.').count() != 3
@@ -1034,6 +1055,7 @@ pub fn current_version(id: &str) -> Option<String> {
 }
 
 fn service_from_manifest(
+    paths: &Paths,
     id: &str,
     version_dir: &Path,
     manifest: &package::Manifest,
@@ -1141,7 +1163,7 @@ fn service_from_manifest(
     }
 
     let config = {
-        let path = plugin_dir(id).join("config");
+        let path = plugin_dir(paths, id).join("config");
         path.is_file().then(|| path.to_string_lossy().to_string())
     };
 
@@ -1323,8 +1345,8 @@ fn write_hash(path: &Path, hash: &str) -> Result<(), ProblemError> {
     Ok(())
 }
 
-pub fn lock_config(id: &str) -> Result<fs::File, ProblemError> {
-    let path = plugin_dir(id).join("config.lock");
+pub fn lock_config(paths: &Paths, id: &str) -> Result<fs::File, ProblemError> {
+    let path = plugin_dir(paths, id).join("config.lock");
     let file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -1356,8 +1378,8 @@ pub fn write_config(path: &Path, data: &[u8]) -> Result<(), ProblemError> {
     Ok(())
 }
 
-pub fn active_config(id: &str) -> Option<PathBuf> {
-    let path = plugin_dir(id).join("config");
+pub fn active_config(paths: &Paths, id: &str) -> Option<PathBuf> {
+    let path = plugin_dir(paths, id).join("config");
     path.is_file().then_some(path)
 }
 
@@ -1377,9 +1399,9 @@ pub struct WebAssets {
 /// same files); `headerless` and unknown types have no UI to serve. The entry is
 /// relative to `payload/web/` and defaults to `index.html`.
 #[cfg(feature = "http")]
-pub fn web_assets(id: &str) -> Option<WebAssets> {
-    let version = current_version(id)?;
-    let version_dir = plugin_dir(id).join(version);
+pub fn web_assets(paths: &Paths, id: &str) -> Option<WebAssets> {
+    let version = current_version(paths, id)?;
+    let version_dir = plugin_dir(paths, id).join(version);
     let manifest = read_manifest(&version_dir).ok()?;
     let ui = manifest.ui.as_ref()?;
     if ui.kind != "web" && ui.kind != "gui" {
@@ -1391,20 +1413,20 @@ pub fn web_assets(id: &str) -> Option<WebAssets> {
     })
 }
 
-pub fn config_template(id: &str) -> Option<(Vec<u8>, package::Manifest)> {
-    let version = current_version(id)?;
-    let version_dir = plugin_dir(id).join(version);
+pub fn config_template(paths: &Paths, id: &str) -> Option<(Vec<u8>, package::Manifest)> {
+    let version = current_version(paths, id)?;
+    let version_dir = plugin_dir(paths, id).join(version);
     let manifest = read_manifest(&version_dir).ok()?;
     let config = manifest.config.as_deref().unwrap_or("config/config");
     let data = fs::read(version_dir.join(config)).ok()?;
     Some((data, manifest))
 }
 
-pub fn config_check(id: &str, candidate: &Path) -> Result<(), ProblemError> {
-    let Some(version) = current_version(id) else {
+pub fn config_check(paths: &Paths, id: &str, candidate: &Path) -> Result<(), ProblemError> {
+    let Some(version) = current_version(paths, id) else {
         return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
     };
-    let version_dir = plugin_dir(id).join(&version);
+    let version_dir = plugin_dir(paths, id).join(&version);
     let manifest = read_manifest(&version_dir)?;
     let Some(check) = manifest.config_check else {
         return Ok(());
@@ -1427,8 +1449,8 @@ pub fn config_check(id: &str, candidate: &Path) -> Result<(), ProblemError> {
         .env("WINDIR", std::env::var_os("WINDIR").unwrap_or_default())
         .env("SVCD_PLUGIN_ID", id)
         .env("SVCD_PLUGIN_VERSION", &version)
-        .env("SVCD_DATA_DIR", paths::data_dir())
-        .env("SVCD_CONFIG_DIR", paths::config_dir())
+        .env("SVCD_DATA_DIR", &paths.data_dir)
+        .env("SVCD_CONFIG_DIR", &paths.config_dir)
         .env("SVCD_CONFIG", candidate)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
@@ -1487,8 +1509,13 @@ fn check_command(program: &Path) -> Command {
     Command::new(program)
 }
 
-pub fn replace_config(id: &str, candidate: &[u8], check: bool) -> Result<(), ProblemError> {
-    let directory = plugin_dir(id);
+pub fn replace_config(
+    paths: &Paths,
+    id: &str,
+    candidate: &[u8],
+    check: bool,
+) -> Result<(), ProblemError> {
+    let directory = plugin_dir(paths, id);
     if !directory.is_dir() {
         return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
     }
@@ -1499,7 +1526,7 @@ pub fn replace_config(id: &str, candidate: &[u8], check: bool) -> Result<(), Pro
     let temporary = directory.join(format!("config.tmp.{}", std::process::id()));
     write_config(&temporary, candidate)?;
     if check {
-        if let Err(error) = config_check(id, &temporary) {
+        if let Err(error) = config_check(paths, id, &temporary) {
             let _ = fs::remove_file(&temporary);
             return Err(error);
         }
@@ -1529,9 +1556,9 @@ pub struct Backup {
     pub config_sha256: Option<String>,
 }
 
-pub fn export_config(id: &str) -> Result<(String, Vec<u8>), ProblemError> {
-    let version = current_version(id).ok_or_else(|| Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)))?;
-    let config = active_config(id).ok_or_else(|| Problem::UnknownPlugin.error(format!("plugin {} has no config", id)))?;
+pub fn export_config(paths: &Paths, id: &str) -> Result<(String, Vec<u8>), ProblemError> {
+    let version = current_version(paths, id).ok_or_else(|| Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)))?;
+    let config = active_config(paths, id).ok_or_else(|| Problem::UnknownPlugin.error(format!("plugin {} has no config", id)))?;
     let data = fs::read(&config).map_err(|error| Problem::Internal.error(format!("read config: {}", error)))?;
     Ok((version, data))
 }
@@ -1562,15 +1589,15 @@ pub fn plan_export_spkb(
     Ok(plan)
 }
 
-pub fn export_spkb(id: &str) -> Result<(String, Vec<u8>), ProblemError> {
-    let version = current_version(id).ok_or_else(|| Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)))?;
-    let config = active_config(id)
+pub fn export_spkb(paths: &Paths, id: &str) -> Result<(String, Vec<u8>), ProblemError> {
+    let version = current_version(paths, id).ok_or_else(|| Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)))?;
+    let config = active_config(paths, id)
         .map(|path| fs::read(path).map_err(|error| Problem::Internal.error(format!("read config: {}", error))))
         .transpose()?;
     let plan = plan_export_spkb(
         id,
         &version,
-        &plugin_dir(id).join(&version),
+        &plugin_dir(paths, id).join(&version),
         config.as_deref(),
     )?;
     let mut bytes = Vec::new();
@@ -1634,13 +1661,13 @@ mod tests {
             std::fs::create_dir_all(path.join("data/plugins")).expect("data");
             path
         });
-        // Other unit tests (e.g. blob) also point the process-wide data dir at
-        // their own temp tree. Re-assert ours before every use so test order
-        // cannot make `paths::plugins_dir()` disagree with `make_plugin`.
-        std::env::set_var("SVCD_DATA_DIR", path.join("data"));
-        std::env::set_var("SVCD_CONFIG_DIR", path.join("config"));
-        crate::paths::set_test_plugins_dir(path.join("data/plugins"));
         path
+    }
+
+    /// The directory set for the shared plugin tree: no process environment.
+    fn paths() -> &'static Paths {
+        static PATHS: OnceLock<Paths> = OnceLock::new();
+        PATHS.get_or_init(|| Paths::under(root()))
     }
 
     fn make_plugin(id: &str, config: &str, check: bool) {
@@ -1714,7 +1741,7 @@ mod tests {
         )
         .expect("write manifest");
 
-        let (services, _) = scan();
+        let (services, _) = scan(paths(), );
         let service = services
             .iter()
             .find(|service| service.id == id)
@@ -1756,12 +1783,12 @@ mod tests {
     #[test]
     fn replace_config_writes_last_good_and_checks_candidates() {
         make_plugin("plain", "old", false);
-        let active = active_config("plain").expect("active");
+        let active = active_config(paths(), "plain").expect("active");
         assert_eq!(std::fs::read(&active).expect("read"), b"old");
-        replace_config("plain", b"new", false).expect("replace");
+        replace_config(paths(), "plain", b"new", false).expect("replace");
         assert_eq!(std::fs::read(&active).expect("read"), b"new");
         assert_eq!(
-            std::fs::read(plugin_dir("plain").join("config.last-good")).expect("last-good"),
+            std::fs::read(plugin_dir(paths(), "plain").join("config.last-good")).expect("last-good"),
             b"old"
         );
     }
@@ -1769,12 +1796,12 @@ mod tests {
     #[test]
     fn config_check_rejects_a_bad_candidate_and_keeps_the_active_one() {
         make_plugin("checked", "old", true);
-        replace_config("checked", b"good config", true).expect("good");
-        let error = replace_config("checked", b"bad config", true).expect_err("bad");
+        replace_config(paths(), "checked", b"good config", true).expect("good");
+        let error = replace_config(paths(), "checked", b"bad config", true).expect_err("bad");
         assert!(error.detail().contains("configCheck"), "{error}");
         assert_eq!(error.problem, Problem::Conflict);
         assert_eq!(
-            std::fs::read(active_config("checked").expect("active")).expect("read"),
+            std::fs::read(active_config(paths(), "checked").expect("active")).expect("read"),
             b"good config"
         );
     }
@@ -1795,11 +1822,11 @@ mod tests {
     fn a_config_refusal_carries_its_status_family() {
         make_plugin("families", "old", false);
 
-        let error = replace_config("no-such-plugin", b"x", false).expect_err("unknown plugin");
+        let error = replace_config(paths(), "no-such-plugin", b"x", false).expect_err("unknown plugin");
         assert_eq!(error.problem, Problem::UnknownPlugin);
 
         let oversized = vec![b'x'; 1024 * 1024 + 1];
-        let error = replace_config("families", &oversized, false).expect_err("too large");
+        let error = replace_config(paths(), "families", &oversized, false).expect_err("too large");
         assert_eq!(error.problem, Problem::TooLarge);
     }
 
@@ -1853,7 +1880,7 @@ mod tests {
             })),
         );
 
-        let service = service_from_manifest("scripted", &version_dir, &manifest, true, Some(&host))
+        let service = service_from_manifest(paths(), "scripted", &version_dir, &manifest, true, Some(&host))
             .expect("service");
 
         let exec = service.exec.as_ref().expect("exec");
@@ -1891,7 +1918,7 @@ mod tests {
             None,
         );
 
-        let error = service_from_manifest("no-interpreter", &version_dir, &manifest, true, None)
+        let error = service_from_manifest(paths(), "no-interpreter", &version_dir, &manifest, true, None)
             .expect_err("missing interpreter");
 
         assert!(error.detail().contains("declares no interpreter"), "{error}");
@@ -1903,10 +1930,97 @@ mod tests {
             script_manifest("native", "payload/bin/tool", b"\x7fELFdemo", None, None);
 
         let service =
-            service_from_manifest("native", &version_dir, &manifest, true, None).expect("service");
+            service_from_manifest(paths(), "native", &version_dir, &manifest, true, None).expect("service");
 
         assert!(service.exec.as_ref().expect("exec").interpreter.is_none());
         assert!(service.lifecycle.is_none());
+    }
+
+    /// An in-memory package with one payload file, enough for the layout
+    /// strategies to run without a daemon.
+    fn layout_package(name: &str, version: &str) -> Package {
+        let manifest_json = serde_json::json!({
+            "schema": 1,
+            "name": name,
+            "version": version,
+            "desc": "layout test",
+            "platform": crate::platform::target(),
+            "protocol": 1,
+            "exec": {"path": "payload/bin/demo"},
+            "files": [{
+                "path": "payload/bin/demo",
+                "size": 5,
+                "sha256": package::hex_sha256(b"hello"),
+                "mode": 493
+            }]
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest_json).expect("manifest json");
+        let manifest = package::parse_manifest(&manifest_bytes).expect("manifest");
+        Package {
+            manifest,
+            manifest_bytes,
+            signature_bytes: Vec::new(),
+            files: vec![package::FileData {
+                path: "payload/bin/demo".into(),
+                data: b"hello".to_vec(),
+                mode: 0o755,
+            }],
+        }
+    }
+
+    #[test]
+    fn keep_old_keeps_both_versions_and_replace_drops_the_old_one() {
+        let root = crate::test_support::temp_dir().join(format!(
+            "svcd-plugin-layout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let paths = Paths::under(&root);
+
+        install_package(
+            &paths,
+            &layout_package("layout-demo", "1.0.0"),
+            Strategy::KeepOld,
+            false,
+            None,
+        )
+        .expect("first install");
+        install_package(
+            &paths,
+            &layout_package("layout-demo", "1.1.0"),
+            Strategy::KeepOld,
+            false,
+            None,
+        )
+        .expect("keep-old install");
+
+        let directory = plugin_dir(&paths, "layout-demo");
+        assert!(directory.join("1.0.0").is_dir());
+        assert!(directory.join("1.1.0").is_dir());
+        assert_eq!(
+            current_version(&paths, "layout-demo").as_deref(),
+            Some("1.1.0")
+        );
+        assert!(directory.join("current").is_file());
+
+        install_package(
+            &paths,
+            &layout_package("layout-demo", "1.1.0"),
+            Strategy::Replace,
+            false,
+            None,
+        )
+        .expect("replace install");
+        assert!(!directory.join("1.0.0").exists(), "replace keeps only the new version");
+        assert!(directory.join("1.1.0").is_dir());
+        assert_eq!(
+            current_version(&paths, "layout-demo").as_deref(),
+            Some("1.1.0")
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1923,7 +2037,7 @@ mod tests {
             None,
         );
 
-        let error = service_from_manifest("dangling", &version_dir, &manifest, true, Some(&host))
+        let error = service_from_manifest(paths(), "dangling", &version_dir, &manifest, true, Some(&host))
             .expect_err("no script payload");
 
         assert!(error.detail().contains("no script payload"), "{error}");

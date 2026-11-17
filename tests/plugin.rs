@@ -677,8 +677,12 @@ fn installs_lists_starts_and_uninstalls_a_plugin() {
     assert!(!plugin_dir.exists(), "--purge must remove the plugin tree");
 }
 
+/// The CLI wiring for both strategies: the daemon accepts the flag and both
+/// installs succeed. The directory layout that `keep-old` / `replace` leave
+/// behind is asserted by `plugin::tests::keep_old_keeps_both_versions_and_
+/// replace_drops_the_old_one`, which does not spawn a daemon.
 #[test]
-fn keep_old_and_replace_have_the_documented_layouts() {
+fn keep_old_and_replace_strategies_are_accepted() {
     let mut sandbox = Sandbox::new();
     let key = SigningKey::from_bytes(&[10u8; 32]);
     sandbox.write_key(&key);
@@ -706,13 +710,6 @@ fn keep_old_and_replace_have_the_documented_layouts() {
             .code(),
         Some(0)
     );
-    let plugin = sandbox.data.join("plugins").join("demo");
-    assert!(plugin.join("1.0.0").is_dir());
-    assert!(plugin.join("1.1.0").is_dir());
-    assert_eq!(
-        fs::read_to_string(plugin.join("current")).expect("current"),
-        "1.1.0"
-    );
 
     let replace = sandbox.run_plugin(&[
         "install",
@@ -721,8 +718,6 @@ fn keep_old_and_replace_have_the_documented_layouts() {
         "replace",
     ]);
     assert_eq!(replace.status.code(), Some(0), "{}", stderr(&replace));
-    assert!(!plugin.join("1.0.0").is_dir());
-    assert!(plugin.join("1.1.0").is_dir());
 }
 
 #[test]

@@ -7,16 +7,16 @@
 //!
 //! All timestamps are Unix epoch seconds. The supervisor itself runs on
 //! monotonic milliseconds, so `daemon.rs` converts both ways.
+//!
+//! The run directory is a construction parameter: this module never resolves a
+//! process-wide directory, so a test can point it at its own temporary root.
 
 use std::fs;
 use std::path::PathBuf;
 
-#[cfg(test)]
-use std::sync::Mutex;
-
 use serde::{Deserialize, Serialize};
 
-use crate::paths;
+use crate::paths::Paths;
 use crate::registry::State;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,33 +40,12 @@ pub struct Record {
     pub last_exit: Option<i32>,
 }
 
-#[cfg(test)]
-static TEST_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
-#[cfg(test)]
-static TEST_LOCK: Mutex<()> = Mutex::new(());
-
-/// Test-only override. Production resolves the run directory from paths;
-/// tests need two different roots without racing on a process-global env var.
-fn run_dir() -> PathBuf {
-    #[cfg(test)]
-    {
-        if let Some(root) = TEST_ROOT
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-        {
-            return root.clone();
-        }
-    }
-    paths::run_dir()
+fn path(id: &str, paths: &Paths) -> PathBuf {
+    paths.run_dir.join(format!("{}.json", id))
 }
 
-pub fn path(id: &str) -> PathBuf {
-    run_dir().join(format!("{}.json", id))
-}
-
-pub fn load(id: &str) -> Option<Record> {
-    let path = path(id);
+pub fn load(id: &str, paths: &Paths) -> Option<Record> {
+    let path = path(id, paths);
     let bytes = fs::read(&path).ok()?;
     match serde_json::from_slice::<Record>(&bytes) {
         Ok(record) => Some(record),
@@ -84,21 +63,21 @@ pub fn load(id: &str) -> Option<Record> {
 
 /// Write the record atomically (`<id>.json.tmp` + rename). A crash mid-write
 /// leaves the previous record intact.
-pub fn save(id: &str, record: &Record) -> Result<(), String> {
-    let directory = run_dir();
+pub fn save(id: &str, record: &Record, paths: &Paths) -> Result<(), String> {
+    let directory = paths.run_dir.clone();
     fs::create_dir_all(&directory)
         .map_err(|error| format!("create {}: {}", directory.display(), error))?;
     let bytes = serde_json::to_vec(record).map_err(|error| error.to_string())?;
     let temporary = directory.join(format!("{}.json.tmp", id));
-    let target = path(id);
+    let target = path(id, paths);
     fs::write(&temporary, bytes)
         .map_err(|error| format!("write {}: {}", temporary.display(), error))?;
     fs::rename(&temporary, &target)
         .map_err(|error| format!("rename {}: {}", target.display(), error))
 }
 
-pub fn remove(id: &str) {
-    let target = path(id);
+pub fn remove(id: &str, paths: &Paths) {
+    let target = path(id, paths);
     match fs::remove_file(&target) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -135,25 +114,19 @@ mod tests {
         base.join(format!("svcd-runtime-{}-{}", std::process::id(), nanos))
     }
 
-    fn with_root<T>(body: impl FnOnce(&std::path::Path) -> T) -> T {
-        let _guard = TEST_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+    /// The temporary root owns the run directory for exactly one test; two
+    /// tests cannot race through process state.
+    fn with_root<T>(body: impl FnOnce(&std::path::Path, &Paths) -> T) -> T {
         let root = temp_root();
-        *TEST_ROOT
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(root.join("run"));
-        let result = body(&root);
-        *TEST_ROOT
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = None;
+        let paths = Paths::under(&root);
+        let result = body(&root, &paths);
         let _ = fs::remove_dir_all(&root);
         result
     }
 
     #[test]
     fn a_record_round_trips_through_the_file() {
-        with_root(|root| {
+        with_root(|_root, paths| {
             let record = Record {
                 boot: Some("boot-1".into()),
                 state: State::Running,
@@ -164,9 +137,9 @@ mod tests {
                 failures: 2,
                 last_exit: Some(1),
             };
-            save("demo", &record).expect("save");
-            assert_eq!(load("demo"), Some(record));
-            let leftovers: Vec<String> = fs::read_dir(root.join("run"))
+            save("demo", &record, paths).expect("save");
+            assert_eq!(load("demo", paths), Some(record));
+            let leftovers: Vec<String> = fs::read_dir(&paths.run_dir)
                 .expect("run dir")
                 .flatten()
                 .map(|entry| entry.file_name().to_string_lossy().to_string())
@@ -177,18 +150,18 @@ mod tests {
                 "temporary files left: {:?}",
                 leftovers
             );
-            remove("demo");
-            assert_eq!(load("demo"), None);
+            remove("demo", paths);
+            assert_eq!(load("demo", paths), None);
         });
     }
 
     #[test]
     fn a_corrupt_record_is_ignored_instead_of_crashing() {
-        with_root(|_root| {
-            fs::create_dir_all(run_dir()).expect("run dir");
-            fs::write(path("demo"), b"{not json").expect("corrupt record");
-            assert_eq!(load("demo"), None);
-            remove("demo");
+        with_root(|_root, paths| {
+            fs::create_dir_all(&paths.run_dir).expect("run dir");
+            fs::write(path("demo", paths), b"{not json").expect("corrupt record");
+            assert_eq!(load("demo", paths), None);
+            remove("demo", paths);
         });
     }
 

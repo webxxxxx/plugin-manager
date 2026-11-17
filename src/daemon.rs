@@ -16,6 +16,7 @@ use crate::api::{self, Api};
 type Api = ();
 use crate::catalog;
 use crate::channel;
+use crate::config::Config;
 use crate::compat;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::definition;
@@ -27,7 +28,7 @@ use crate::lan::LanStatus;
 use crate::log;
 use crate::mcp;
 use crate::package;
-use crate::paths;
+use crate::paths::Paths;
 use crate::plugin::{self, Strategy};
 #[cfg(unix)]
 use crate::reactor::Reactor;
@@ -47,8 +48,8 @@ use crate::wake::Wake;
 const POLL_WAIT: Duration = Duration::from_millis(50);
 
 pub fn run(conf: Option<PathBuf>) -> i32 {
-    // The explicit --conf must be loaded before paths::config_dir() so its
-    // config_dir wins and does not get shadowed by the default cache.
+    // The explicit --conf must be loaded before the directory set is resolved,
+    // so its config_dir wins and is not shadowed by the default resolution.
     if let Some(path) = conf.as_deref() {
         if path.is_file() {
             if let Err(error) = settings::init_from_path(path) {
@@ -57,11 +58,14 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
             }
         }
     }
-    let initial_config = paths::config_dir();
-    if let Err(error) = fs::create_dir_all(&initial_config) {
+    // Bootstrapping reads the settings cache without failing on a broken file
+    // yet: the directory has to exist before `ensure_conf` can report the path
+    // it settled on, and `Config::bootstrap` below is the hard failure point.
+    let initial_paths = Paths::resolve(&settings::current().cloned().unwrap_or_default());
+    if let Err(error) = fs::create_dir_all(&initial_paths.config_dir) {
         eprintln!(
             "svcd: cannot create config directory {}: {}",
-            initial_config.display(),
+            initial_paths.config_dir.display(),
             error
         );
         return 1;
@@ -74,39 +78,49 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
             return 1;
         }
     };
-    if let Err(error) = settings::init_from_path(&config_path) {
-        eprintln!("svcd: invalid config: {}", error);
-        return 1;
-    }
-    if let Err(error) = log::init_svcd(&paths::logs_dir()) {
+    let config = match Config::bootstrap(Some(&config_path)) {
+        Ok(config) => Arc::new(config),
+        Err(error) => {
+            eprintln!("svcd: invalid config: {}", error);
+            return 1;
+        }
+    };
+    if let Err(error) = log::init_svcd(&config.paths.logs_dir) {
         eprintln!("svcd: cannot open log directory: {}", error);
     }
     log::svcd("svcd starting");
-    log::svcd(&format!("svcd: config: {}", config_path.display()));
+    log::svcd(&format!(
+        "svcd: config: {}",
+        config
+            .settings_path
+            .as_deref()
+            .unwrap_or(config_path.as_path())
+            .display()
+    ));
     // An explicit --conf may set config_dir to a different directory.
-    let config = paths::config_dir();
-    if config != initial_config {
-        if let Err(error) = fs::create_dir_all(&config) {
+    let config_dir = &config.paths.config_dir;
+    if config_dir != &initial_paths.config_dir {
+        if let Err(error) = fs::create_dir_all(config_dir) {
             eprintln!(
                 "svcd: cannot create config directory {}: {}",
-                config.display(),
+                config_dir.display(),
                 error
             );
             return 1;
         }
     }
-    crate::plugin::cleanup_staging();
+    crate::plugin::cleanup_staging(&config.paths);
     // The channel no longer uses a token: authorization is the endpoint ACL.
     // Remove whatever the previous version left behind so nothing keeps reading
     // a stale secret.
-    let legacy_token = config.join("svcd.token");
+    let legacy_token = config_dir.join("svcd.token");
     if legacy_token.exists() {
         let _ = fs::remove_file(&legacy_token);
         log::svcd("svcd: removed the legacy control token (endpoint ACLs authorize now)");
     }
     #[cfg(windows)]
-    if crate::platform::host::acl::is_machine_wide(&config) {
-        if let Err(error) = harden_directories() {
+    if crate::platform::host::acl::is_machine_wide(config_dir) {
+        if let Err(error) = harden_directories(&config.paths) {
             eprintln!("svcd: cannot protect the install directories: {}", error);
             return 1;
         }
@@ -118,14 +132,14 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         ));
     }
 
-    wait_for_services_dir(&paths::services_dir());
+    wait_for_services_dir(&config.paths.services_dir);
 
-    let mut loaded = definition::load_services(&paths::services_dir());
+    let mut loaded = definition::load_services(&config.paths.services_dir);
     for issue in &loaded.issues {
         log::svcd(&format!("svcd: warning: {}", issue));
     }
 
-    let (plugins, warnings) = plugin::scan();
+    let (plugins, warnings) = plugin::scan(&config.paths);
     for warning in warnings {
         log::svcd(&format!("svcd: plugin: {}", warning));
     }
@@ -147,7 +161,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     // One path on every host: the channel binds the endpoint and either hands
     // the listener to the server loop (Unix) or starts its own accept thread
     // (Windows). The composition root only sees the resulting server.
-    let control = match channel::bind_server(&config, tx, wake.clone()) {
+    let control = match channel::bind_server(&config.paths.config_dir, tx, wake.clone()) {
         Ok(control) => control,
         Err(error) => {
             log::svcd(&format!("svcd: cannot bind control channel: {}", error));
@@ -156,10 +170,10 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     };
     #[cfg(feature = "http")]
     let raw_hub = crate::rawhub::RawHub::new(
-        crate::limits::current().ws_raw_max_bytes,
-        crate::limits::current().ws_inflight_bytes,
-        crate::limits::current().ws_inflight_requests,
-        crate::limits::current().ws_raw_queue,
+        config.limits.ws_raw_max_bytes,
+        config.limits.ws_inflight_bytes,
+        config.limits.ws_inflight_requests,
+        config.limits.ws_raw_queue,
     );
     // The driver picks itself inside `server::http::entry`; the composition
     // root only hands over the control plumbing it owns.
@@ -195,16 +209,17 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     drop(control);
     #[cfg(not(feature = "http"))]
     let raw_hub = crate::rawhub::RawHub::new(
-        crate::limits::current().ws_raw_max_bytes,
-        crate::limits::current().ws_inflight_bytes,
-        crate::limits::current().ws_inflight_requests,
-        crate::limits::current().ws_raw_queue,
+        config.limits.ws_raw_max_bytes,
+        config.limits.ws_inflight_bytes,
+        config.limits.ws_inflight_requests,
+        config.limits.ws_raw_queue,
     );
     #[cfg(not(feature = "http"))]
     let api: Option<Arc<Api>> = None;
     notify_systemd("READY=1");
 
-    let mut daemon = Daemon::new_with_raw(loaded.registry, rx, api.clone(), raw_hub.clone());
+    let mut daemon =
+        Daemon::new_with_raw(loaded.registry, rx, api.clone(), raw_hub.clone(), config.clone());
     daemon.set_raw_hub(raw_hub.clone());
     daemon.set_wake(wake);
     #[cfg(unix)]
@@ -241,7 +256,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     #[cfg(feature = "http")]
     log::svcd(&format!("svcd: raw stats: {}", raw_hub.stats.summary()));
     notify_systemd("STOPPING=1");
-    channel::remove_socket(&config);
+    channel::remove_socket(&config.paths.config_dir);
     0
 }
 
@@ -381,8 +396,10 @@ pub fn shutdown_quiet() -> i32 {
 }
 
 fn shutdown_inner(verbose: bool) -> i32 {
-    let config = paths::config_dir();
-    match channel::request(&config, "svcd.shutdown", json!({})) {
+    // Stopping only needs the control endpoint; a broken `svcd.conf` must not
+    // make `svcd stop` unusable.
+    let paths = Paths::resolve(&settings::current().cloned().unwrap_or_default());
+    match channel::request(&paths.config_dir, "svcd.shutdown", json!({})) {
         Ok(response) => match response.error {
             Some(error) => {
                 if verbose {
@@ -426,9 +443,13 @@ fn shutdown_reply_lost(error: &std::io::Error) -> bool {
 /// and the `svcd` group. Without this a local user could drop a `.cmd` into
 /// `services.d` and have it executed as SYSTEM.
 #[cfg(windows)]
-fn harden_directories() -> std::io::Result<()> {
+fn harden_directories(paths: &Paths) -> std::io::Result<()> {
     use crate::platform::host::acl::Acl;
-    for dir in [paths::config_dir(), paths::services_dir(), paths::plugins_dir()] {
+    for dir in [
+        paths.config_dir.clone(),
+        paths.services_dir.clone(),
+        paths.plugins_dir.clone(),
+    ] {
         // Create first: a first start has no `services.d` / `plugins` yet, and a
         // directory created later would inherit `C:\ProgramData`'s Users-write
         // ACE instead of getting the protected DACL below.
@@ -442,6 +463,9 @@ fn harden_directories() -> std::io::Result<()> {
 }
 
 struct Daemon {
+    /// The one derived runtime configuration: settings file, directory set and
+    /// limits. Every directory this process touches comes from here.
+    config: Arc<Config>,
     registry: Registry,
     rx: Receiver<channel::PendingCall>,
     #[cfg_attr(not(feature = "http"), allow(dead_code))]
@@ -496,6 +520,24 @@ impl Daemon {
                 limits.ws_inflight_requests,
                 limits.ws_raw_queue,
             ),
+            Arc::new(Config::with_paths(
+                crate::settings::Settings::default(),
+                None,
+                {
+                    let nanos = SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos();
+                    let root = crate::test_support::temp_dir().join(format!(
+                        "svcd-daemon-unit-{}-{}",
+                        std::process::id(),
+                        nanos
+                    ));
+                    let paths = Paths::under(&root);
+                    crate::package::install_test_trust(&paths.trust_dir);
+                    paths
+                },
+            )),
         )
     }
 
@@ -504,6 +546,7 @@ impl Daemon {
         rx: Receiver<channel::PendingCall>,
         api: Option<Arc<Api>>,
         raw_hub: Arc<crate::rawhub::RawHub>,
+        config: Arc<Config>,
     ) -> Self {
         let wake = Arc::new(Wake::new());
         let rescan_interval_ms: u64 = std::env::var("SVCD_RESCAN_INTERVAL_MS")
@@ -518,6 +561,7 @@ impl Daemon {
                     exec,
                     service.lifecycle.clone(),
                     service.restart,
+                    config.paths.clone(),
                 );
                 slot.set_protocol(service.protocol);
                 slot.set_protocol_only(service.kind == Kind::Plugin);
@@ -528,16 +572,13 @@ impl Daemon {
                 slots.insert(service.id.clone(), slot);
             }
         }
-        let (temp_retention, temp_cleanup_interval_ms) = match settings::current() {
-            Ok(settings) => (
-                settings.temp_retention(),
-                settings.temp_cleanup_interval().as_millis() as u64,
-            ),
-            Err(_) => (crate::settings::Settings::default().temp_retention(), 0),
-        };
+        let temp_retention = config.settings.temp_retention();
+        let temp_cleanup_interval_ms = config.settings.temp_cleanup_interval().as_millis() as u64;
+        let services_fingerprint = services_fingerprint(&config.paths.services_dir);
         let mut launchers = Launchers::default();
         launchers.register("builtin", Box::new(crate::builtin_adapter::BuiltinLauncher));
         Daemon {
+            config,
             registry,
             rx,
             api,
@@ -551,7 +592,7 @@ impl Daemon {
             catalog_cache: None,
             persisted: BTreeMap::new(),
             boot_id: crate::platform::host::process::boot_id(),
-            services_fingerprint: services_fingerprint(&paths::services_dir()),
+            services_fingerprint,
             rescan_interval_ms,
             next_rescan_ms: rescan_interval_ms,
             temp_retention,
@@ -592,7 +633,7 @@ impl Daemon {
         let boot = self.boot_id.clone().or_else(crate::platform::host::process::boot_id);
         let now = self.now_ms();
         for id in self.slots.keys().cloned().collect::<Vec<_>>() {
-            let Some(record) = runtime::load(&id) else {
+            let Some(record) = runtime::load(&id, &self.config.paths) else {
                 continue;
             };
             if !runtime::same_boot(&record, boot.as_deref()) {
@@ -600,7 +641,7 @@ impl Daemon {
                     "svcd: {}: discarding runtime record from another boot",
                     id
                 ));
-                runtime::remove(&id);
+                runtime::remove(&id, &self.config.paths);
                 continue;
             }
             let Some(pid) = record.pid else {
@@ -623,18 +664,18 @@ impl Daemon {
                     self.persisted
                         .insert(id.clone(), (State::Running, None, failures));
                 } else {
-                    runtime::remove(&id);
+                    runtime::remove(&id, &self.config.paths);
                 }
                 continue;
             };
             // Windows has no process to adopt: the job object took the tree
             // down with the daemon. Records are only cleaned up there.
             if cfg!(windows) {
-                runtime::remove(&id);
+                runtime::remove(&id, &self.config.paths);
                 continue;
             }
             if !crate::platform::host::process::alive(pid) {
-                runtime::remove(&id);
+                runtime::remove(&id, &self.config.paths);
                 continue;
             }
             if let (Some(expected), Some(actual)) = (record.starttime, crate::platform::host::process::start_time(pid))
@@ -644,7 +685,7 @@ impl Daemon {
                         "svcd: {}: pid {} was reused (starttime {} != {}); not adopting",
                         id, pid, actual, expected
                     ));
-                    runtime::remove(&id);
+                    runtime::remove(&id, &self.config.paths);
                     continue;
                 }
             }
@@ -675,7 +716,7 @@ impl Daemon {
     /// about; a definition deleted while the daemon was down leaves an orphan
     /// that nothing else would ever visit.
     fn sweep_runtime_records(&mut self) {
-        let directory = paths::run_dir();
+        let directory = self.config.paths.run_dir.clone();
         let Ok(entries) = fs::read_dir(&directory) else {
             return;
         };
@@ -691,7 +732,7 @@ impl Daemon {
                 // A definition deleted while the daemon was down: take its
                 // process group down too (validated by pid + starttime), then
                 // forget the record.
-                if let Some(record) = runtime::load(id) {
+                if let Some(record) = runtime::load(id, &self.config.paths) {
                     if let Some(pid) = record.pid {
                         let fresh = crate::platform::host::process::alive(pid)
                             && match (record.starttime, crate::platform::host::process::start_time(pid)) {
@@ -703,7 +744,7 @@ impl Daemon {
                         }
                     }
                 }
-                runtime::remove(id);
+                runtime::remove(id, &self.config.paths);
                 self.persisted.remove(id);
                 log::svcd(&format!("svcd: dropped orphan runtime record {}", id));
             }
@@ -724,7 +765,7 @@ impl Daemon {
                 continue;
             }
             if pid.is_none() && matches!(state, State::Stopped | State::Failed) {
-                runtime::remove(&id);
+                runtime::remove(&id, &self.config.paths);
                 self.persisted.remove(&id);
                 continue;
             }
@@ -746,7 +787,7 @@ impl Daemon {
                 failures,
                 last_exit,
             };
-            match runtime::save(&id, &record) {
+            match runtime::save(&id, &record, &self.config.paths) {
                 Ok(()) => {
                     self.persisted.insert(id, (state, pid, failures));
                 }
@@ -866,7 +907,7 @@ impl Daemon {
                 self.next_temp_cleanup_ms = self
                     .now_ms()
                     .saturating_add(self.temp_cleanup_interval_ms);
-                match crate::blob::cleanup(self.temp_retention) {
+                match crate::blob::cleanup(&self.config.paths, self.temp_retention) {
                     Ok(0) => {}
                     Ok(removed) => log::svcd(&format!(
                         "svcd: temp cleanup removed {} file(s)",
@@ -937,7 +978,8 @@ impl Daemon {
             "svcd.ping" => rpc::ok(id, json!({"ok": true})),
             "svcd.compat" => rpc::ok(
                 id,
-                serde_json::to_value(compat::detect(MAX_SCHEMA, MAX_PROTOCOL)).unwrap_or(Value::Null),
+                serde_json::to_value(compat::detect(&self.config.paths, MAX_SCHEMA, MAX_PROTOCOL))
+                    .unwrap_or(Value::Null),
             ),
             "svcd.shutdown" => {
                 self.shutdown = true;
@@ -1243,7 +1285,7 @@ impl Daemon {
         }
 
         let mut arguments = arguments;
-        if let Err(message) = crate::blob::resolve_args(&mut arguments) {
+        if let Err(message) = crate::blob::resolve_args(&self.config.paths, &mut arguments) {
             send(
                 &reply,
                 mcp::tool_error(id, &format!("cannot resolve blob argument: {}", message)),
@@ -1330,7 +1372,12 @@ impl Daemon {
         else {
             return;
         };
-        status.details.probe = Some(run_status_hook(id, &hook, &mut crate::hook::poll_this_loop));
+        status.details.probe = Some(run_status_hook(
+            id,
+            &hook,
+            &self.config.paths,
+            &mut crate::hook::poll_this_loop,
+        ));
     }
 
     fn status_for(&self, service: &Service) -> Status {
@@ -1352,7 +1399,7 @@ impl Daemon {
     /// dropped in while the daemon runs starts (if enabled), a deleted one is
     /// stopped and forgotten. This mirrors the shell `svcd` poll loop.
     fn rescan_if_changed(&mut self) {
-        let fingerprint = services_fingerprint(&paths::services_dir());
+        let fingerprint = services_fingerprint(&self.config.paths.services_dir);
         if fingerprint == self.services_fingerprint {
             return;
         }
@@ -1376,7 +1423,7 @@ impl Daemon {
 
     fn reload(&mut self) -> Result<Value, ProblemError> {
         let summary = self.reconcile_definitions()?;
-        self.services_fingerprint = services_fingerprint(&paths::services_dir());
+        self.services_fingerprint = services_fingerprint(&self.config.paths.services_dir);
         Ok(summary)
     }
 
@@ -1385,7 +1432,7 @@ impl Daemon {
     /// definitions that disappeared are stopped and forgotten. Shared by
     /// `svc reload`, the periodic rescan, and boot recovery.
     fn reconcile_definitions(&mut self) -> Result<Value, ProblemError> {
-        let loaded = definition::load_services(&paths::services_dir());
+        let loaded = definition::load_services(&self.config.paths.services_dir);
         for issue in &loaded.issues {
             log::svcd(&format!("svcd: reload: warning: {}", issue));
         }
@@ -1395,7 +1442,7 @@ impl Daemon {
             .cloned()
             .map(|service| (service.id.clone(), service))
             .collect();
-        let (plugins, warnings) = plugin::scan();
+        let (plugins, warnings) = plugin::scan(&self.config.paths);
         for warning in warnings {
             log::svcd(&format!("svcd: reload: plugin: {}", warning));
         }
@@ -1435,7 +1482,7 @@ impl Daemon {
             }
             self.slots.remove(&id);
             self.registry.remove(&id);
-            runtime::remove(&id);
+            runtime::remove(&id, &self.config.paths);
             self.persisted.remove(&id);
             log::svcd(&format!("svcd: reload: removed {}", id));
             removed.push(id);
@@ -1482,7 +1529,8 @@ impl Daemon {
                     let plugin_only = service.kind == Kind::Plugin;
                     let remain_after_exit = service.remain_after_exit;
                     if let Some(exec) = exec {
-                        let mut slot = Slot::new(id.clone(), exec, lifecycle, restart);
+                        let mut slot =
+                            Slot::new(id.clone(), exec, lifecycle, restart, self.config.paths.clone());
                         slot.set_protocol(protocol);
                         slot.set_protocol_only(plugin_only);
                         slot.set_remain_after_exit(remain_after_exit);
@@ -1566,7 +1614,7 @@ impl Daemon {
             if let Some(reason) = compat::verdict_reason(compat::evaluate(
                 crate::platform::target(),
                 &devices,
-                &compat::detect(MAX_SCHEMA, MAX_PROTOCOL),
+                &compat::detect(&self.config.paths, MAX_SCHEMA, MAX_PROTOCOL),
             )) {
                 return Err(Problem::Internal.error(format!("{}: {}", id, reason)));
             }
@@ -1723,6 +1771,7 @@ impl Daemon {
         // untouched. `plugin::verify` is the same preflight `plugin verify`
         // exposes, so the two answers cannot drift apart.
         let verified = plugin::verify(
+            &self.config.paths,
             Path::new(path),
             settings::allow_insecure_install(),
             allow_hooks,
@@ -1753,6 +1802,7 @@ impl Daemon {
         }
         let still_running = running(&self.slots);
         let service = match plugin::install_package(
+            &self.config.paths,
             &package,
             strategy,
             allow_hooks,
@@ -1773,8 +1823,14 @@ impl Daemon {
                     "svcd: plugin {}: keep-old ran out of space; falling back to replace",
                     id
                 ));
-                plugin::install_package(&package, Strategy::Replace, allow_hooks, host_interpreter)
-                    .map_err(plugin::InstallFailure::into_problem)?
+                plugin::install_package(
+                    &self.config.paths,
+                    &package,
+                    Strategy::Replace,
+                    allow_hooks,
+                    host_interpreter,
+                )
+                .map_err(plugin::InstallFailure::into_problem)?
             }
             Err(failure) => return Err(failure.into_problem()),
         };
@@ -1790,8 +1846,13 @@ impl Daemon {
         if !still_running {
             self.slots.remove(&id);
             if let Some(exec) = service.exec.clone() {
-                let mut slot =
-                    Slot::new(id.clone(), exec, service.lifecycle.clone(), service.restart);
+                let mut slot = Slot::new(
+                    id.clone(),
+                    exec,
+                    service.lifecycle.clone(),
+                    service.restart,
+                    self.config.paths.clone(),
+                );
                 slot.set_protocol(service.protocol);
                 slot.set_protocol_only(true);
                 slot.set_remain_after_exit(service.remain_after_exit);
@@ -1866,7 +1927,7 @@ impl Daemon {
                 format!("staging path {}: {}", path, error),
             )
         })?;
-        let plugins = paths::plugins_dir().canonicalize().map_err(|error| {
+        let plugins = self.config.paths.plugins_dir.canonicalize().map_err(|error| {
             ProblemError::new(Problem::Internal, format!("plugins dir: {}", error))
         })?;
         if !staging.starts_with(&plugins)
@@ -1881,7 +1942,11 @@ impl Daemon {
             ));
         }
 
-        let staged = package::load_staged(&staging, settings::allow_insecure_install())?;
+        let staged = package::load_staged(
+            &staging,
+            settings::allow_insecure_install(),
+            &self.config.paths.trust_dir,
+        )?;
         let id = staged.manifest.name.clone();
         let version = staged.manifest.version.clone();
         if let Some(requested) = request.params.get("id").and_then(Value::as_str) {
@@ -1922,7 +1987,13 @@ impl Daemon {
             self.stop_service(&id)?;
         }
         let still_running = running(&self.slots);
-        let service = plugin::install_staged(staged, strategy, allow_hooks, host_interpreter)?;
+        let service = plugin::install_staged(
+            &self.config.paths,
+            staged,
+            strategy,
+            allow_hooks,
+            host_interpreter,
+        )?;
         if let Err(error) = service.carrier() {
             return Err(ProblemError::new(
                 Problem::Internal,
@@ -1932,8 +2003,13 @@ impl Daemon {
         if !still_running {
             self.slots.remove(&id);
             if let Some(exec) = service.exec.clone() {
-                let mut slot =
-                    Slot::new(id.clone(), exec, service.lifecycle.clone(), service.restart);
+                let mut slot = Slot::new(
+                    id.clone(),
+                    exec,
+                    service.lifecycle.clone(),
+                    service.restart,
+                    self.config.paths.clone(),
+                );
                 slot.set_protocol(service.protocol);
                 slot.set_protocol_only(true);
                 slot.set_remain_after_exit(service.remain_after_exit);
@@ -2003,14 +2079,14 @@ impl Daemon {
         if running {
             self.stop_service(id)?;
         }
-        plugin::uninstall(id, purge)?;
+        plugin::uninstall(&self.config.paths, id, purge)?;
         self.slots.remove(id);
         self.registry.remove(id);
-        runtime::remove(id);
+        runtime::remove(id, &self.config.paths);
         self.persisted.remove(id);
         self.bump_catalog();
         if purge {
-            plugin::remove_logs(id);
+            plugin::remove_logs(&self.config.paths, id);
             #[cfg(feature = "http")]
             crate::uichannel::forget(id);
         }
@@ -2039,9 +2115,9 @@ impl Daemon {
                 ProblemError::new(Problem::UnknownService, format!("unknown service: {}", id))
             })?;
         let (marker, create) = match kind {
-            Kind::Plugin => (plugin::plugin_dir(id).join("enabled"), enabled),
+            Kind::Plugin => (plugin::plugin_dir(&self.config.paths, id).join("enabled"), enabled),
             Kind::Core => (
-                paths::services_dir().join(format!("{}.disabled", id)),
+                self.config.paths.services_dir.join(format!("{}.disabled", id)),
                 !enabled,
             ),
         };
@@ -2380,8 +2456,13 @@ fn unknown_tool(id: &Option<Value>, name: &str) -> rpc::Response {
 /// becomes the `probe` text (capped), and a non-zero exit only appends the
 /// status word. Capture goes through a temp file so a hook that leaves a child
 /// holding stdout cannot block the daemon's event loop.
-fn run_status_hook(id: &str, hook: &Hook, poll: &mut dyn FnMut()) -> String {
-    let output_path = status_output_path(id);
+fn run_status_hook(
+    id: &str,
+    hook: &Hook,
+    paths: &Paths,
+    poll: &mut dyn FnMut(),
+) -> String {
+    let output_path = status_output_path(id, paths);
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -2393,7 +2474,7 @@ fn run_status_hook(id: &str, hook: &Hook, poll: &mut dyn FnMut()) -> String {
         Ok(file) => file,
         Err(error) => return format!("cannot create status output: {}", error),
     };
-    let mut command = hook_command(id, "status", hook);
+    let mut command = hook_command(id, "status", hook, paths);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::from(file))
@@ -2442,8 +2523,8 @@ fn run_status_hook(id: &str, hook: &Hook, poll: &mut dyn FnMut()) -> String {
     }
 }
 
-fn status_output_path(id: &str) -> PathBuf {
-    let directory = paths::config_dir().join("tmp");
+fn status_output_path(id: &str, paths: &Paths) -> PathBuf {
+    let directory = paths.config_dir.join("tmp");
     let _ = fs::create_dir_all(&directory);
     let nanos = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3012,7 +3093,6 @@ while ($null -ne ($line = $reader.ReadLine())) {
         let root =
             crate::test_support::temp_dir().join(format!("svcd-tools-unit-{}-{}", std::process::id(), nanos));
         std::fs::create_dir_all(root.join("logs")).expect("logs");
-        std::env::set_var("SVCD_LOG_DIR", root.join("logs"));
 
         let plugin = tool_service(
             "plug",
@@ -3060,7 +3140,6 @@ while ($null -ne ($line = $reader.ReadLine())) {
         let root =
             crate::test_support::temp_dir().join(format!("svcd-tools-unit-{}-{}", std::process::id(), nanos));
         std::fs::create_dir_all(root.join("logs")).expect("logs");
-        std::env::set_var("SVCD_LOG_DIR", root.join("logs"));
 
         let core = tool_service("core", Kind::Core, &["echo"], &root);
         let (_sender, receiver) = mpsc::channel();
@@ -3099,7 +3178,6 @@ while ($null -ne ($line = $reader.ReadLine())) {
         let root =
             crate::test_support::temp_dir().join(format!("svcd-tools-unit-{}-{}", std::process::id(), nanos));
         std::fs::create_dir_all(root.join("logs")).expect("logs");
-        std::env::set_var("SVCD_LOG_DIR", root.join("logs"));
 
         let service = tool_service("proc", Kind::Core, &["progress", "fail"], &root);
         let (_sender, receiver) = mpsc::channel();

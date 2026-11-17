@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::log::{self, LogSink};
 use crate::package;
-use crate::paths;
+use crate::paths::Paths;
 
 /// Both hook actions share the same 60-second budget.
 pub const TIMEOUT_MS: u64 = 60_000;
@@ -35,7 +35,11 @@ pub struct Invocation<'a> {
 /// Run the hook, calling `poll` before every wait step. The supervisor loop
 /// owns plugin stdio, so a hook it waits for must not stop the plugin pipes;
 /// production callers pass [`poll_this_loop`].
-pub fn run(spec: &Invocation<'_>, poll: &mut dyn FnMut()) -> Result<(), ProblemError> {
+pub fn run(
+    spec: &Invocation<'_>,
+    paths: &Paths,
+    poll: &mut dyn FnMut(),
+) -> Result<(), ProblemError> {
     package::check_path(spec.path)?;
     let program = spec.version_dir.join(spec.path);
     let metadata = fs::metadata(&program)
@@ -57,8 +61,8 @@ pub fn run(spec: &Invocation<'_>, poll: &mut dyn FnMut()) -> Result<(), ProblemE
         .env("SVCD_PLUGIN_ID", spec.id)
         .env("SVCD_PLUGIN_VERSION", spec.version)
         .env("SVCD_ACTION", spec.action)
-        .env("SVCD_DATA_DIR", paths::data_dir())
-        .env("SVCD_CONFIG_DIR", paths::config_dir());
+        .env("SVCD_DATA_DIR", &paths.data_dir)
+        .env("SVCD_CONFIG_DIR", &paths.config_dir);
     #[cfg(windows)]
     {
         // cmd.exe needs these to start; neither reveals user-specific state.
@@ -71,7 +75,7 @@ pub fn run(spec: &Invocation<'_>, poll: &mut dyn FnMut()) -> Result<(), ProblemE
 
     // Per the log contract, hook output goes to `<logs>/<id>-hooks.log`, not the
     // service log; `svc logs` keeps showing only the supervised process.
-    let log = match LogSink::open(&paths::logs_dir(), &format!("{}-hooks", spec.id)) {
+    let log = match LogSink::open(&paths.logs_dir, &format!("{}-hooks", spec.id)) {
         Ok(sink) => Some(Arc::new(Mutex::new(sink))),
         Err(error) => {
             log::svcd(&format!(
@@ -242,6 +246,24 @@ fn hook_command(program: &Path) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every hook test owns a temporary directory set; nothing reads the
+    /// process environment.
+    fn test_paths() -> Paths {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        Paths::under(&crate::test_support::temp_dir().join(format!(
+            "svcd-hook-unit-{}-{}",
+            std::process::id(),
+            nanos
+        )))
+    }
+
+    fn run(spec: &Invocation<'_>, poll: &mut dyn FnMut()) -> Result<(), ProblemError> {
+        super::run(spec, &test_paths(), poll)
+    }
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};

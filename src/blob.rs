@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::paths;
+use crate::paths::Paths;
 
 /// Why a storage operation failed (#151).
 ///
@@ -110,12 +110,12 @@ pub struct Meta {
     pub size: u64,
 }
 
-pub fn dir() -> PathBuf {
-    paths::temp_dir()
+pub fn dir(paths: &Paths) -> PathBuf {
+    paths.temp_dir.clone()
 }
 
-pub fn incoming_dir() -> PathBuf {
-    dir().join("incoming")
+pub fn incoming_dir(paths: &Paths) -> PathBuf {
+    dir(paths).join("incoming")
 }
 
 /// A streaming write into the content-addressed store. Bytes are hashed while
@@ -125,14 +125,16 @@ pub struct Upload {
     file: fs::File,
     hasher: Sha256,
     temp: PathBuf,
+    /// The content-store root chosen when the upload began.
+    root: PathBuf,
     size: u64,
     committed: bool,
 }
 
 #[cfg(any(feature = "http", test))]
 impl Upload {
-    pub fn begin() -> Result<Upload> {
-        let directory = dir();
+    pub fn begin(paths: &Paths) -> Result<Upload> {
+        let directory = paths.temp_dir.clone();
         fs::create_dir_all(&directory)
             .map_err(|error| Error::internal(format!("create {}: {}", directory.display(), error)))?;
         let temp = directory.join(format!(".upload-{}-{}", std::process::id(), next_temp()));
@@ -142,6 +144,7 @@ impl Upload {
             file,
             hasher: Sha256::new(),
             temp,
+            root: directory,
             size: 0,
             committed: false,
         })
@@ -170,7 +173,7 @@ impl Upload {
             .map_err(|error| Error::internal(format!("sync {}: {}", self.temp.display(), error)))?;
         let digest = std::mem::replace(&mut self.hasher, Sha256::new()).finalize();
         let id = format!("sha256:{}", hex(&digest));
-        let destination = blob_path(&id)?;
+        let destination = blob_path_in(&self.root, &id)?;
         if destination.is_file() {
             let _ = fs::remove_file(&self.temp);
         } else if let Err(error) = fs::rename(&self.temp, &destination) {
@@ -200,25 +203,25 @@ impl Drop for Upload {
 }
 
 #[cfg(test)]
-pub fn put(bytes: &[u8]) -> Result<Meta> {
-    let mut upload = Upload::begin()?;
+pub fn put( paths: &Paths, bytes: &[u8]) -> Result<Meta> {
+    let mut upload = Upload::begin(paths)?;
     upload.write(bytes)?;
     upload.finish()
 }
 
 #[cfg(test)]
-pub fn read(id: &str) -> Result<Vec<u8>> {
-    let path = blob_path(id)?;
+pub fn read( paths: &Paths, id: &str) -> Result<Vec<u8>> {
+    let path = blob_path(paths, id)?;
     touch(&path);
     fs::read(&path).map_err(|error| Error::internal(format!("read {}: {}", path.display(), error)))
 }
 
-pub fn locate(id: &str) -> Result<PathBuf> {
-    blob_path(id)
+pub fn locate( paths: &Paths, id: &str) -> Result<PathBuf> {
+    blob_path(paths, id)
 }
 
-pub fn path(id: &str) -> Result<PathBuf> {
-    let path = locate(id)?;
+pub fn path( paths: &Paths, id: &str) -> Result<PathBuf> {
+    let path = locate(paths, id)?;
     touch(&path);
     Ok(path)
 }
@@ -253,8 +256,8 @@ impl UploadKind {
 }
 
 #[cfg(feature = "http")]
-pub fn uploads_dir() -> PathBuf {
-    dir().join("uploads")
+pub fn uploads_dir(paths: &Paths) -> PathBuf {
+    dir(paths).join("uploads")
 }
 
 #[cfg(feature = "http")]
@@ -266,20 +269,20 @@ pub fn valid_upload_id(id: &str) -> bool {
 }
 
 #[cfg(feature = "http")]
-pub fn upload_dir(id: &str) -> Result<PathBuf> {
+pub fn upload_dir( paths: &Paths, id: &str) -> Result<PathBuf> {
     if !valid_upload_id(id) {
         return Err(Error::invalid("invalid upload id"));
     }
-    Ok(uploads_dir().join(id))
+    Ok(uploads_dir(paths).join(id))
 }
 
 /// Start a resumable upload session. The marker file keeps the directory from
 /// being pruned as "empty" until the normal temp retention expires, and records
 /// the commit mode so the other API cannot consume it.
 #[cfg(feature = "http")]
-pub fn create_upload(kind: UploadKind) -> Result<String> {
+pub fn create_upload( paths: &Paths, kind: UploadKind) -> Result<String> {
     let id = random_id()?;
-    let directory = upload_dir(&id)?;
+    let directory = upload_dir(paths, &id)?;
     fs::create_dir_all(&directory)
         .map_err(|error| Error::internal(format!("create {}: {}", directory.display(), error)))?;
     fs::write(directory.join("session"), kind.as_str().as_bytes())
@@ -288,8 +291,8 @@ pub fn create_upload(kind: UploadKind) -> Result<String> {
 }
 
 #[cfg(feature = "http")]
-fn read_upload_kind(id: &str) -> Result<UploadKind> {
-    let directory = upload_dir(id)?;
+fn read_upload_kind( paths: &Paths, id: &str) -> Result<UploadKind> {
+    let directory = upload_dir(paths, id)?;
     if !directory.is_dir() {
         return Err(Error::not_found("unknown upload"));
     }
@@ -304,8 +307,8 @@ fn read_upload_kind(id: &str) -> Result<UploadKind> {
 }
 
 #[cfg(feature = "http")]
-pub fn require_upload_kind(id: &str, expected: UploadKind) -> Result<()> {
-    let actual = read_upload_kind(id)?;
+pub fn require_upload_kind( paths: &Paths, id: &str, expected: UploadKind) -> Result<()> {
+    let actual = read_upload_kind(paths, id)?;
     if actual != expected {
         return Err(Error::conflict("upload kind mismatch"));
     }
@@ -313,9 +316,9 @@ pub fn require_upload_kind(id: &str, expected: UploadKind) -> Result<()> {
 }
 
 #[cfg(feature = "http")]
-pub fn upload_parts(id: &str, kind: UploadKind) -> Result<Vec<PartInfo>> {
-    require_upload_kind(id, kind)?;
-    let directory = upload_dir(id)?;
+pub fn upload_parts( paths: &Paths, id: &str, kind: UploadKind) -> Result<Vec<PartInfo>> {
+    require_upload_kind(paths, id, kind)?;
+    let directory = upload_dir(paths, id)?;
     if !directory.is_dir() {
         return Err(Error::not_found("unknown upload"));
     }
@@ -376,12 +379,12 @@ pub struct PartWriter {
 
 #[cfg(feature = "http")]
 impl PartWriter {
-    pub fn begin(upload_id: &str, number: u32, kind: UploadKind) -> Result<PartWriter> {
+    pub fn begin(paths: &Paths, upload_id: &str, number: u32, kind: UploadKind) -> Result<PartWriter> {
         if number == 0 || number > MAX_PART_NUMBER {
             return Err(Error::invalid("part number must be between 1 and 10000"));
         }
-        require_upload_kind(upload_id, kind)?;
-        let directory = upload_dir(upload_id)?;
+        require_upload_kind(paths, upload_id, kind)?;
+        let directory = upload_dir(paths, upload_id)?;
         if !directory.is_dir() {
             return Err(Error::not_found("unknown upload"));
         }
@@ -459,18 +462,19 @@ impl Drop for PartWriter {
 /// blob. `None` selects every part that exists; an explicit list must be
 /// strictly increasing and may omit parts. The session is removed on success.
 #[cfg(feature = "http")]
-pub fn complete_upload(
+pub fn complete_upload( 
+    paths: &Paths,
     id: &str,
     requested: Option<Vec<(u32, Option<String>)>>,
 ) -> Result<Meta> {
     let _guard = SESSION_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let directory = upload_dir(id)?;
+    let directory = upload_dir(paths, id)?;
     if !directory.is_dir() {
         return Err(Error::not_found("unknown upload"));
     }
-    let available = upload_parts(id, UploadKind::Blob)?;
+    let available = upload_parts(paths, id, UploadKind::Blob)?;
     let selected = select_parts(&available, requested)?;
     if selected.is_empty() {
         return Err(Error::invalid("no parts uploaded"));
@@ -479,7 +483,7 @@ pub fn complete_upload(
     if total > MAX_BLOB_BYTES {
         return Err(Error::too_large("blob is too large"));
     }
-    let mut upload = Upload::begin()?;
+    let mut upload = Upload::begin(paths)?;
     let mut buffer = [0u8; 64 * 1024];
     for part in selected {
         let path = directory.join(format!("part-{}", part.number));
@@ -574,18 +578,18 @@ pub struct FileMeta {
 }
 
 #[cfg(feature = "http")]
-pub fn files_dir() -> PathBuf {
-    dir().join("files")
+pub fn files_dir(paths: &Paths) -> PathBuf {
+    dir(paths).join("files")
 }
 
 #[cfg(feature = "http")]
-pub fn file_dir(id: &str) -> Result<PathBuf> {
-    Ok(files_dir().join(id_hex(id)?))
+pub fn file_dir( paths: &Paths, id: &str) -> Result<PathBuf> {
+    Ok(files_dir(paths).join(id_hex(id)?))
 }
 
 #[cfg(feature = "http")]
-pub fn file_manifest(id: &str) -> Result<(PathBuf, FileManifest)> {
-    let directory = file_dir(id)?;
+pub fn file_manifest( paths: &Paths, id: &str) -> Result<(PathBuf, FileManifest)> {
+    let directory = file_dir(paths, id)?;
     let path = directory.join("manifest.json");
     let bytes = fs::read(&path).map_err(|error| Error::internal(format!("read {}: {}", path.display(), error)))?;
     let manifest: FileManifest = serde_json::from_slice(&bytes)
@@ -601,8 +605,8 @@ pub fn file_manifest(id: &str) -> Result<(PathBuf, FileManifest)> {
 }
 
 #[cfg(feature = "http")]
-pub fn file_meta(id: &str) -> Result<FileMeta> {
-    let (_, manifest) = file_manifest(id)?;
+pub fn file_meta( paths: &Paths, id: &str) -> Result<FileMeta> {
+    let (_, manifest) = file_manifest(paths, id)?;
     Ok(FileMeta {
         id: manifest.id,
         size: manifest.size,
@@ -615,17 +619,18 @@ pub fn file_meta(id: &str) -> Result<FileMeta> {
 /// this does not write a second copy: it hashes the parts in place and renames
 /// the session directory into the file store.
 #[cfg(feature = "http")]
-pub fn complete_file(
+pub fn complete_file( 
+    paths: &Paths,
     upload_id: &str,
     requested: Option<Vec<(u32, Option<String>)>>,
     name: Option<String>,
     mime_type: Option<String>,
 ) -> Result<FileMeta> {
-    let directory = upload_dir(upload_id)?;
+    let directory = upload_dir(paths, upload_id)?;
     if !directory.is_dir() {
         return Err(Error::not_found("unknown upload"));
     }
-    let available = upload_parts(upload_id, UploadKind::File)?;
+    let available = upload_parts(paths, upload_id, UploadKind::File)?;
     let selected = select_parts(&available, requested)?;
     if selected.is_empty() {
         return Err(Error::invalid("no parts uploaded"));
@@ -668,7 +673,7 @@ pub fn complete_file(
     }
 
     let id = format!("sha256:{}", hex(&hasher.finalize()));
-    let destination = file_dir(&id)?;
+    let destination = file_dir(paths, &id)?;
     // Hash outside the global session lock: five concurrent 1.6 GiB files must
     // not serialise their whole-file hashing behind one mutex.
     let _guard = SESSION_LOCK
@@ -676,7 +681,7 @@ pub fn complete_file(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if destination.is_dir() {
         let _ = fs::remove_dir_all(&directory);
-        return file_meta(&id);
+        return file_meta(paths, &id);
     }
 
     let manifest = FileManifest {
@@ -702,13 +707,13 @@ pub fn complete_file(
     .map_err(|error| Error::internal(format!("write {}: {}", manifest_path.display(), error)))?;
     let _ = fs::remove_file(directory.join("session"));
 
-    fs::create_dir_all(files_dir())
-        .map_err(|error| Error::internal(format!("create {}: {}", files_dir().display(), error)))?;
+    fs::create_dir_all(files_dir(paths))
+        .map_err(|error| Error::internal(format!("create {}: {}", files_dir(paths).display(), error)))?;
     match fs::rename(&directory, &destination) {
         Ok(()) => {}
         Err(_error) if destination.is_dir() => {
             let _ = fs::remove_dir_all(&directory);
-            return file_meta(&id);
+            return file_meta(paths, &id);
         }
         Err(error) => return Err(Error::internal(format!("rename {}: {}", destination.display(), error))),
     }
@@ -721,12 +726,12 @@ pub fn complete_file(
 }
 
 #[cfg(feature = "http")]
-pub fn abort_upload(id: &str, kind: UploadKind) -> Result<()> {
-    require_upload_kind(id, kind)?;
+pub fn abort_upload( paths: &Paths, id: &str, kind: UploadKind) -> Result<()> {
+    require_upload_kind(paths, id, kind)?;
     let _guard = SESSION_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let directory = upload_dir(id)?;
+    let directory = upload_dir(paths, id)?;
     if !directory.is_dir() {
         return Err(Error::not_found("unknown upload"));
     }
@@ -777,8 +782,8 @@ fn random_id() -> Result<String> {
 /// Remove temp files older than `retention`. This includes content-addressed
 /// blobs and stale `incoming/` files. Active reads/argument resolution touch
 /// the mtime first, so a file that is being used is not immediately eligible.
-pub fn cleanup(retention: Duration) -> std::io::Result<usize> {
-    let root = dir();
+pub fn cleanup( paths: &Paths, retention: Duration) -> std::io::Result<usize> {
+    let root = dir(paths);
     if !root.is_dir() {
         return Ok(0);
     }
@@ -875,12 +880,12 @@ pub(crate) fn touch(path: &Path) {
 
 /// Import a file a plugin wrote into `SVCD_TEMP_DIR` and replace a
 /// `$blobPath` result with an MCP resource link plus structured blob metadata.
-pub fn materialize_result(result: &mut Value) -> Result<()> {
+pub fn materialize_result( paths: &Paths, result: &mut Value) -> Result<()> {
     let Some(path) = result.get("$blobPath").and_then(Value::as_str) else {
         return Ok(());
     };
     let path = PathBuf::from(path);
-    let meta = import_file(&path)?;
+    let meta = import_file(paths, &path)?;
     let name = result.get("name").and_then(Value::as_str).unwrap_or("blob");
     let mime = result
         .get("mimeType")
@@ -905,8 +910,8 @@ pub fn materialize_result(result: &mut Value) -> Result<()> {
     Ok(())
 }
 
-fn import_file(source: &Path) -> Result<Meta> {
-    let incoming = incoming_dir();
+fn import_file( paths: &Paths, source: &Path) -> Result<Meta> {
+    let incoming = incoming_dir(paths);
     fs::create_dir_all(&incoming)
         .map_err(|error| Error::internal(format!("create {}: {}", incoming.display(), error)))?;
     let source = source
@@ -954,12 +959,12 @@ fn import_file(source: &Path) -> Result<Meta> {
     }
 
     let id = format!("sha256:{}", hex(&hasher.finalize()));
-    let destination = blob_path(&id)?;
+    let destination = blob_path(paths, &id)?;
     if destination.is_file() {
         let _ = fs::remove_file(&source);
         return Ok(Meta { id, size });
     }
-    let directory = dir();
+    let directory = dir(paths);
     fs::create_dir_all(&directory)
         .map_err(|error| Error::internal(format!("create {}: {}", directory.display(), error)))?;
     match fs::rename(&source, &destination) {
@@ -978,8 +983,8 @@ fn import_file(source: &Path) -> Result<Meta> {
     Ok(Meta { id, size })
 }
 
-pub fn meta(id: &str) -> Result<Meta> {
-    let path = blob_path(id)?;
+pub fn meta( paths: &Paths, id: &str) -> Result<Meta> {
+    let path = blob_path(paths, id)?;
     let size = fs::metadata(&path)
         .map_err(|error| Error::internal(format!("stat {}: {}", path.display(), error)))?
         .len();
@@ -992,12 +997,12 @@ pub fn meta(id: &str) -> Result<Meta> {
 /// Resolve `$blob` references anywhere in a tool-call argument tree. The
 /// plugin receives `{ "$blob": id, "path": absolute_path, "size": n }`, which
 /// is explicit about what happened and keeps the path out of the client's JSON.
-pub fn resolve_args(value: &mut Value) -> Result<()> {
+pub fn resolve_args( paths: &Paths, value: &mut Value) -> Result<()> {
     match value {
         Value::Object(map) => {
             if let Some(Value::String(id)) = map.get("$blob") {
-                let meta = meta(id)?;
-                let path = path(id)?;
+                let meta = meta(paths, id)?;
+                let path = path(paths, id)?;
                 *value = json!({
                     "$blob": id,
                     "path": path.to_string_lossy(),
@@ -1007,8 +1012,8 @@ pub fn resolve_args(value: &mut Value) -> Result<()> {
             }
             #[cfg(feature = "http")]
             if let Some(Value::String(id)) = map.get("$file") {
-                let meta = file_meta(id)?;
-                let directory = file_dir(id)?;
+                let meta = file_meta(paths, id)?;
+                let directory = file_dir(paths, id)?;
                 let manifest = directory.join("manifest.json");
                 *value = json!({
                     "$file": id,
@@ -1021,12 +1026,12 @@ pub fn resolve_args(value: &mut Value) -> Result<()> {
                 return Ok(());
             }
             for child in map.values_mut() {
-                resolve_args(child)?;
+                resolve_args(paths, child)?;
             }
         }
         Value::Array(items) => {
             for child in items {
-                resolve_args(child)?;
+                resolve_args(paths, child)?;
             }
         }
         _ => {}
@@ -1044,8 +1049,12 @@ fn id_hex(id: &str) -> Result<&str> {
     Ok(hex)
 }
 
-fn blob_path(id: &str) -> Result<PathBuf> {
-    Ok(dir().join(id_hex(id)?))
+fn blob_path( paths: &Paths, id: &str) -> Result<PathBuf> {
+    blob_path_in(&paths.temp_dir, id)
+}
+
+fn blob_path_in(root: &Path, id: &str) -> Result<PathBuf> {
+    Ok(root.join(id_hex(id)?))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1057,83 +1066,60 @@ fn hex(bytes: &[u8]) -> String {
     text
 }
 
-/// One writable content-store root for every unit test that touches blobs.
-/// Shared so the face download tests and the blob tests do not race by
-/// pointing `SVCD_TEMP_DIR` at two different trees.
-#[cfg(test)]
-static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Blob tests share one data/temp root (the env vars are process-global), so
-/// they run one at a time. CI is serial anyway; this keeps a parallel local
-/// run from aborting a session another test is cleaning up.
-#[cfg(test)]
-pub(crate) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
-    TEST_LOCK
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-}
-
-#[cfg(test)]
-pub(crate) fn test_temp_dir() -> &'static Path {
-    use std::sync::OnceLock;
-
-    static ROOT: OnceLock<PathBuf> = OnceLock::new();
-    ROOT.get_or_init(|| {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let root = crate::test_support::temp_dir().join(format!("svcd-blob-{}-{}", std::process::id(), nanos));
-        std::env::set_var("SVCD_DATA_DIR", &root);
-        std::env::set_var("SVCD_TEMP_DIR", root.join("temp"));
-        std::fs::create_dir_all(root.join("temp")).expect("blob root");
-        root
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
-    fn root() -> &'static Path {
-        test_temp_dir()
+    /// Each test derives its own tree from a temporary root, so no process
+    /// environment is read and two tests cannot race.
+    fn test_paths() -> Paths {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = crate::test_support::temp_dir().join(format!(
+            "svcd-blob-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        let paths = Paths::under(&root);
+        std::fs::create_dir_all(&paths.temp_dir).expect("blob root");
+        paths
     }
 
     #[test]
     fn blobs_are_content_addressed_and_readable() {
-        let _guard = test_guard();
-        let _ = root();
-        let first = put(b"hello").expect("put");
-        let second = put(b"hello").expect("put");
+        let paths = test_paths();
+        let first = put(&paths, b"hello").expect("put");
+        let second = put(&paths, b"hello").expect("put");
         assert_eq!(first, second);
-        assert_eq!(read(&first.id).expect("read"), b"hello");
-        assert!(path(&first.id).expect("path").is_file());
+        assert_eq!(read(&paths, &first.id).expect("read"), b"hello");
+        assert!(path(&paths, &first.id).expect("path").is_file());
     }
 
     #[test]
     fn a_storage_failure_names_its_kind() {
+        let paths = test_paths();
         let missing = "0".repeat(32);
-        let error = read_upload_kind(&missing).expect_err("no session");
+        let error = read_upload_kind(&paths, &missing).expect_err("no session");
         assert_eq!(error.kind, Kind::NotFound);
 
-        let error = upload_dir("nope").expect_err("bad id");
+        let error = upload_dir(&paths, "nope").expect_err("bad id");
         assert_eq!(error.kind, Kind::Invalid);
     }
 
     #[test]
     fn invalid_ids_are_rejected() {
-        let _guard = test_guard();
+        let paths = test_paths();
         for id in ["", "sha256:", "sha256:xyz", "../x", "sha256:../x"] {
-            assert!(read(id).is_err(), "{id}");
+            assert!(read(&paths, id).is_err(), "{id}");
         }
     }
 
     #[test]
     fn a_plugin_blob_result_becomes_a_resource_link() {
-        let _guard = test_guard();
-        let _ = root();
-        let incoming = incoming_dir();
+        let paths = test_paths();
+        let incoming = incoming_dir(&paths);
         std::fs::create_dir_all(&incoming).expect("incoming");
         let source = incoming.join("report.txt");
         std::fs::write(&source, b"result body").expect("result");
@@ -1142,7 +1128,7 @@ mod tests {
             "name": "report.txt",
             "mimeType": "text/plain"
         });
-        materialize_result(&mut result).expect("materialize");
+        materialize_result(&paths, &mut result).expect("materialize");
         assert_eq!(result["isError"], false);
         assert_eq!(result["content"][1]["type"], "resource_link");
         assert!(result["structuredContent"]["$blob"]
@@ -1153,14 +1139,13 @@ mod tests {
         let id = result["structuredContent"]["$blob"]
             .as_str()
             .expect("blob id");
-        assert_eq!(read(id).expect("read"), b"result body");
+        assert_eq!(read(&paths, id).expect("read"), b"result body");
     }
 
     #[test]
     fn cleanup_removes_old_files_and_keeps_fresh_ones() {
-        let _guard = test_guard();
-        let _ = root();
-        let incoming = incoming_dir();
+        let paths = test_paths();
+        let incoming = incoming_dir(&paths);
         std::fs::create_dir_all(&incoming).expect("incoming");
         let old = incoming.join("old.bin");
         let fresh = incoming.join("fresh.bin");
@@ -1175,7 +1160,7 @@ mod tests {
                 .set_modified(SystemTime::now() - Duration::from_secs(3 * 60 * 60)),
         )
         .expect("old mtime");
-        let removed = cleanup(Duration::from_secs(2 * 60 * 60)).expect("cleanup");
+        let removed = cleanup(&paths, Duration::from_secs(2 * 60 * 60)).expect("cleanup");
         assert!(removed >= 1, "removed {removed}");
         assert!(!old.exists());
         assert!(fresh.exists());
@@ -1183,11 +1168,10 @@ mod tests {
 
     #[test]
     fn blob_refs_are_resolved_to_paths_in_arguments() {
-        let _guard = test_guard();
-        let _ = root();
-        let meta = put(b"file body").expect("put");
+        let paths = test_paths();
+        let meta = put(&paths, b"file body").expect("put");
         let mut args = json!({"input": {"$blob": meta.id}, "other": 1});
-        resolve_args(&mut args).expect("resolve");
+        resolve_args(&paths, &mut args).expect("resolve");
         let input = &args["input"];
         assert_eq!(input["$blob"], meta.id);
         assert_eq!(input["size"], 9);
@@ -1197,28 +1181,26 @@ mod tests {
     #[cfg(feature = "http")]
     #[test]
     fn part_writer_refuses_a_cross_kind_session() {
-        let _guard = test_guard();
-        let _ = root();
-        let upload = create_upload(UploadKind::File).expect("file upload");
-        let error = match PartWriter::begin(&upload, 1, UploadKind::Blob) {
+        let paths = test_paths();
+        let upload = create_upload(&paths, UploadKind::File).expect("file upload");
+        let error = match PartWriter::begin(&paths, &upload, 1, UploadKind::Blob) {
             Ok(_) => panic!("blob part accepted a file session"),
             Err(error) => error,
         };
         assert!(error.detail.contains("kind mismatch"), "{error}");
-        abort_upload(&upload, UploadKind::File).expect("abort file session");
+        abort_upload(&paths, &upload, UploadKind::File).expect("abort file session");
     }
 
     #[cfg(feature = "http")]
     #[test]
     fn cleanup_removes_a_stale_file_bundle_as_one_unit() {
-        let _guard = test_guard();
-        let _ = root();
-        let upload = create_upload(UploadKind::File).expect("file upload");
-        let mut writer = PartWriter::begin(&upload, 1, UploadKind::File).expect("part writer");
+        let paths = test_paths();
+        let upload = create_upload(&paths, UploadKind::File).expect("file upload");
+        let mut writer = PartWriter::begin(&paths, &upload, 1, UploadKind::File).expect("part writer");
         writer.write(b"hello").expect("part write");
         writer.finish().expect("part finish");
-        let meta = complete_file(&upload, None, None, None).expect("complete file");
-        let directory = file_dir(&meta.id).expect("file dir");
+        let meta = complete_file(&paths, &upload, None, None, None).expect("complete file");
+        let directory = file_dir(&paths, &meta.id).expect("file dir");
         let manifest = directory.join("manifest.json");
         let file = std::fs::OpenOptions::new()
             .write(true)
@@ -1229,7 +1211,7 @@ mod tests {
                 .set_modified(SystemTime::now() - Duration::from_secs(3 * 60 * 60)),
         )
         .expect("old manifest mtime");
-        let removed = cleanup(Duration::from_secs(2 * 60 * 60)).expect("cleanup");
+        let removed = cleanup(&paths, Duration::from_secs(2 * 60 * 60)).expect("cleanup");
         assert!(removed >= 1);
         assert!(!directory.exists());
     }
@@ -1237,16 +1219,15 @@ mod tests {
     #[cfg(feature = "http")]
     #[test]
     fn file_bundles_resolve_to_a_manifest_and_size() {
-        let _guard = test_guard();
-        let _ = root();
-        let upload = create_upload(UploadKind::File).expect("file upload");
+        let paths = test_paths();
+        let upload = create_upload(&paths, UploadKind::File).expect("file upload");
         for (number, bytes) in [(1u32, b"hello ".as_slice()), (2u32, b"world!")] {
             let mut writer =
-                PartWriter::begin(&upload, number, UploadKind::File).expect("part writer");
+                PartWriter::begin(&paths, &upload, number, UploadKind::File).expect("part writer");
             writer.write(bytes).expect("part write");
             writer.finish().expect("part finish");
         }
-        let meta = complete_file(
+        let meta = complete_file(&paths, 
             &upload,
             None,
             Some("hello.txt".to_string()),
@@ -1260,7 +1241,7 @@ mod tests {
         );
 
         let mut args = json!({"input": {"$file": meta.id}});
-        resolve_args(&mut args).expect("resolve file");
+        resolve_args(&paths, &mut args).expect("resolve file");
         let input = &args["input"];
         assert_eq!(input["size"], 12);
         assert_eq!(input["name"], "hello.txt");
@@ -1269,6 +1250,6 @@ mod tests {
             .as_str()
             .expect("manifest")
             .ends_with("manifest.json"));
-        assert!(file_dir(&meta.id).expect("file dir").is_dir());
+        assert!(file_dir(&paths, &meta.id).expect("file dir").is_dir());
     }
 }
