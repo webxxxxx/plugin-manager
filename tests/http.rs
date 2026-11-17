@@ -862,9 +862,13 @@ fn unsigned_package(manifest: Value, files: &[(String, Vec<u8>, u32)]) -> Vec<u8
 
 /// A `.spkb` backup wrapping an unsigned inner package.
 fn unsigned_backup(id: &str) -> Vec<u8> {
+    unsigned_backup_with_schema(id, 1)
+}
+
+fn unsigned_backup_with_schema(id: &str, schema: u32) -> Vec<u8> {
     let spk = unsigned_plugin_bundle(id);
-    let backup =
-        serde_json::to_vec(&json!({"schema": 1, "id": id, "version": "1.0.0"})).expect("backup");
+    let backup = serde_json::to_vec(&json!({"schema": schema, "id": id, "version": "1.0.0"}))
+        .expect("backup");
     let mut tar = Vec::new();
     for (path, data, mode) in [
         ("backup.json", backup.as_slice(), 0o644u32),
@@ -3904,6 +3908,54 @@ fn insecure_install_accepts_an_unknown_signing_key() {
     );
     assert_eq!(installed.status, 200, "{}", installed.body);
     assert_eq!(installed.body["id"], "demo");
+}
+
+/// Re-importing the same backup version without force is a conflict (409), not
+/// the 500 the message matcher used to guess: the raiser knows the category.
+#[test]
+fn importing_an_installed_backup_without_force_is_409() {
+    let mut sandbox = Sandbox::new();
+    sandbox.allow_insecure_install();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let backup = unsigned_backup("demo");
+
+    let first = raw_request(
+        &address,
+        "POST",
+        "/api/v1/import?force=true",
+        "application/octet-stream",
+        &backup,
+    );
+    assert_eq!(first.status, 200, "{}", String::from_utf8_lossy(&first.body));
+
+    let again = raw_request(
+        &address,
+        "POST",
+        "/api/v1/import",
+        "application/octet-stream",
+        &backup,
+    );
+    assert_eq!(again.status, 409, "{}", String::from_utf8_lossy(&again.body));
+}
+
+/// An unknown backup schema is the client's error (400), not a server fault.
+#[test]
+fn importing_a_backup_with_an_unknown_schema_is_400() {
+    let mut sandbox = Sandbox::new();
+    sandbox.allow_insecure_install();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let backup = unsigned_backup_with_schema("demo", 2);
+
+    let response = raw_request(
+        &address,
+        "POST",
+        "/api/v1/import",
+        "application/octet-stream",
+        &backup,
+    );
+    assert_eq!(response.status, 400, "{}", String::from_utf8_lossy(&response.body));
 }
 
 #[test]

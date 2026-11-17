@@ -12,13 +12,6 @@ use crate::http;
 
 use super::support;
 
-/// Every buffered blob endpoint renders a storage failure the same way: the
-/// kind the store raised decides the status, and the detail is only text
-/// (#151, never a `message.contains`).
-fn blob_error(error: blob::Error) -> Vec<u8> {
-    let status = support::status_for_storage(error.kind);
-    http::json_error(status, http::code_for(status), &error.detail)
-}
 
 pub fn create_upload(kind: blob::UploadKind) -> Vec<u8> {
     match blob::create_upload(kind) {
@@ -42,7 +35,7 @@ pub fn create_upload(kind: blob::UploadKind) -> Vec<u8> {
                 &body,
             )
         }
-        Err(error) => blob_error(error),
+        Err(error) => support::storage_response(&error),
     }
 }
 
@@ -71,7 +64,7 @@ pub fn upload_status(kind: blob::UploadKind, id: &str) -> Vec<u8> {
             .unwrap_or_default();
             http::response(200, "application/json", &body)
         }
-        Err(error) => blob_error(error),
+        Err(error) => support::storage_response(&error),
     }
 }
 
@@ -166,7 +159,7 @@ pub fn file_upload_complete(id: &str, body: &[u8]) -> Vec<u8> {
             ];
             http::response_with_headers(200, "application/json", &headers, &body)
         }
-        Err(error) => blob_error(error),
+        Err(error) => support::storage_response(&error),
     }
 }
 
@@ -180,14 +173,14 @@ pub fn abort_upload(kind: blob::UploadKind, id: &str) -> Vec<u8> {
             "application/json",
             &serde_json::to_vec(&json!({"ok": true})).unwrap_or_default(),
         ),
-        Err(error) => blob_error(error),
+        Err(error) => support::storage_response(&error),
     }
 }
 
 fn kind_rejection(id: &str, kind: blob::UploadKind) -> Option<Vec<u8>> {
     match blob::require_upload_kind(id, kind) {
         Ok(()) => None,
-        Err(error) => Some(blob_error(error)),
+        Err(error) => Some(support::storage_response(&error)),
     }
 }
 
@@ -235,6 +228,6 @@ pub fn complete_upload(id: &str, body: &[u8]) -> Vec<u8> {
             ];
             http::response_with_headers(200, "application/json", &headers, &body)
         }
-        Err(error) => blob_error(error),
+        Err(error) => support::storage_response(&error),
     }
 }

@@ -19,6 +19,7 @@ use crate::kernel::failure::{Problem, ProblemError};
 use crate::package;
 use crate::paths;
 use crate::plugin;
+use crate::rpc;
 use crate::settings;
 
 const MAX_IMPORT: u64 = 512 * 1024 * 1024;
@@ -219,16 +220,23 @@ fn install_bytes(bytes: &[u8], source: &str) -> Result<serde_json::Value, Proble
     let response = response.map_err(|error| {
         Problem::Internal.error(format!("svcd unreachable: {}", error))
     })?;
+    refused(response)
+}
+
+/// A daemon refusal as a typed failure.
+///
+/// The control channel names the category in `error.data.kind`; the message is
+/// only for people. A message that happens to contain "unknown" (the Linux
+/// `x86_64-unknown-linux-gnu` triple) must not become a missing-plugin error
+/// (#150 handoff).
+fn refused(response: rpc::Response) -> Result<serde_json::Value, ProblemError> {
     if let Some(error) = response.error {
-        // The daemon already named the category on the wire (S5b); the detail
-        // is only for the human reading the error.
         let problem = Problem::from_error_data(error.data.as_ref()).unwrap_or(Problem::Internal);
         return Err(problem.error(error.message));
     }
-    let result = response
+    response
         .result
-        .ok_or_else(|| Problem::Internal.error("empty install response"))?;
-    Ok(result)
+        .ok_or_else(|| Problem::Internal.error("empty install response"))
 }
 
 #[cfg(test)]
@@ -241,6 +249,41 @@ mod tests {
             Err(Error::Usage(message)) => assert!(message.contains("--config"), "{message}"),
             other => panic!("expected a usage error, got {:?}", other),
         }
+    }
+
+    /// The raw `.spk` import reads the daemon's category, not its message: the
+    /// host triple in a platform reason contains "unknown", which used to turn
+    /// a platform mismatch into 404 (#150 handoff).
+    #[test]
+    fn a_platform_refusal_keeps_its_wire_category_despite_the_host_triple() {
+        let response = rpc::Response {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            result: None,
+            error: Some(rpc::Error {
+                code: -32006,
+                message: "platform mismatch: package other, host x86_64-unknown-linux-gnu"
+                    .to_string(),
+                data: Some(json!({ "kind": "unsupported_platform" })),
+            }),
+        };
+        let error = refused(response).expect_err("refused");
+        assert_eq!(error.problem, Problem::UnsupportedPlatform);
+    }
+
+    #[test]
+    fn a_refusal_without_a_wire_category_is_internal() {
+        let response = rpc::Response {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            result: None,
+            error: Some(rpc::Error {
+                code: -32603,
+                message: "not a plugin: core".to_string(),
+                data: None,
+            }),
+        };
+        assert_eq!(refused(response).expect_err("refused").problem, Problem::Internal);
     }
 
     #[test]

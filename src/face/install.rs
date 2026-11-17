@@ -609,7 +609,7 @@ impl UploadState {
     }
 
     fn fail(&mut self, error: &ProblemError) {
-        let response = problem_response(error);
+        let response = support::problem_response(error);
         self.flow = Flow::Done;
         self.refused = true;
         self.outcome = Some(Outcome::Error(response));
@@ -674,11 +674,11 @@ impl InstallFlow {
 
     fn finish(&mut self, config: &Path, budget: &CallBudget) -> Vec<u8> {
         let Some(mut installer) = self.installer.take() else {
-            return problem_response(&Problem::Invalid.error("manifest.json is missing"));
+            return support::problem_response(&Problem::Invalid.error("manifest.json is missing"));
         };
         let staged = match installer.finish() {
             Ok(staged) => staged,
-            Err(error) => return problem_response(&error),
+            Err(error) => return support::problem_response(&error),
         };
         let root = staged.root.clone();
         let id = staged.manifest.name.clone();
@@ -771,14 +771,14 @@ impl ImportFlow {
             match stage {
                 ImportStage::Classify(prefix) => {
                     if let Err(error) = self.classify(prefix) {
-                        return problem_response(&error);
+                        return support::problem_response(&error);
                     }
                     continue;
                 }
                 ImportStage::Package { mut installer } => {
                     let staged = match installer.finish() {
                         Ok(staged) => staged,
-                        Err(error) => return problem_response(&error),
+                        Err(error) => return support::problem_response(&error),
                     };
                     let root = staged.root.clone();
                     return match install_staged(
@@ -797,7 +797,7 @@ impl ImportFlow {
                 ImportStage::Backup(mut import) => {
                     return match import.finish(config, budget) {
                         Ok(response) => response,
-                        Err(error) => problem_response(&error),
+                        Err(error) => support::problem_response(&error),
                     }
                 }
                 ImportStage::Raw(data) => return raw_config_response(&data, &self.params),
@@ -816,9 +816,9 @@ fn raw_config_response(data: &[u8], params: &ImportParams) -> Vec<u8> {
     ) {
         Ok(outcome) => import_outcome_json(outcome),
         Err(transfer::Error::Usage(message)) => {
-            problem_response(&Problem::Invalid.error(message))
+            support::problem_response(&Problem::Invalid.error(message))
         }
-        Err(transfer::Error::Failed(error)) => problem_response(&error),
+        Err(transfer::Error::Failed(error)) => support::problem_response(&error),
     }
 }
 
@@ -1194,12 +1194,6 @@ fn import_outcome_json(outcome: transfer::Outcome) -> Vec<u8> {
     )
 }
 
-/// One refusal projection for the whole install/import stream: the category
-/// raised where the body was rejected decides the status (#151).
-fn problem_response(error: &ProblemError) -> Vec<u8> {
-    let status = support::status_for_problem_error(error);
-    http::json_error(status, support::code_for(status), error.detail())
-}
 
 #[cfg(test)]
 mod tests {

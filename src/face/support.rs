@@ -194,13 +194,29 @@ pub(crate) fn status_for_problem_error(error: &ProblemError) -> u16 {
     status_for_problem(error.problem)
 }
 
-/// The status a storage failure projects to. Storage reuses the management
-/// table for the categories they share; "not there" is the only storage-only
-/// category, and it always renders as 404.
+/// A typed management refusal as the HTTP error envelope every face route
+/// writes. One implementation, so no route re-derives the status.
+pub(crate) fn problem_response(refusal: &ProblemError) -> Vec<u8> {
+    let status = status_for_problem_error(refusal);
+    error(status, code_for(status), refusal.detail())
+}
+
+/// A storage refusal as the HTTP error envelope (see [`status_for_storage`]).
+pub(crate) fn storage_response(refusal: &crate::blob::Error) -> Vec<u8> {
+    let status = status_for_storage(refusal.kind);
+    error(status, code_for(status), &refusal.detail)
+}
+
+/// The status a storage failure projects to. Storage keeps its own small
+/// taxonomy (it sits below the kernel), so this maps it onto the one management
+/// table; `NotFound` is the only category that table cannot name.
 pub(crate) fn status_for_storage(kind: crate::blob::Kind) -> u16 {
     match kind {
-        crate::blob::Kind::Problem(problem) => status_for_problem(problem),
-        crate::blob::Kind::NotThere => 404,
+        crate::blob::Kind::NotFound => 404,
+        crate::blob::Kind::Conflict => status_for_problem(Problem::Conflict),
+        crate::blob::Kind::Invalid => status_for_problem(Problem::Invalid),
+        crate::blob::Kind::TooLarge => status_for_problem(Problem::TooLarge),
+        crate::blob::Kind::Internal => status_for_problem(Problem::Internal),
     }
 }
 
@@ -260,15 +276,11 @@ mod tests {
     /// category of its own: a missing upload session is 404.
     #[test]
     fn a_storage_failure_projects_onto_the_same_table() {
-        assert_eq!(
-            status_for_storage(crate::blob::Kind::Problem(Problem::Conflict)),
-            409
-        );
-        assert_eq!(
-            status_for_storage(crate::blob::Kind::Problem(Problem::TooLarge)),
-            413
-        );
-        assert_eq!(status_for_storage(crate::blob::Kind::NotThere), 404);
+        assert_eq!(status_for_storage(crate::blob::Kind::Conflict), 409);
+        assert_eq!(status_for_storage(crate::blob::Kind::Invalid), 400);
+        assert_eq!(status_for_storage(crate::blob::Kind::TooLarge), 413);
+        assert_eq!(status_for_storage(crate::blob::Kind::Internal), 500);
+        assert_eq!(status_for_storage(crate::blob::Kind::NotFound), 404);
     }
 
     /// The stream-job handoff must carry both halves of the budget: a job that

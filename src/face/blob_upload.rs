@@ -145,7 +145,7 @@ pub fn exchange(head: &http::Head, lan: &Arc<Mutex<Lan>>) -> Result<Exchange, Ve
             ));
         }
         if let Err(error) = blob::require_upload_kind(upload, *kind) {
-            return Err(blob_error(error));
+            return Err(support::storage_response(&error));
         }
     }
 
@@ -375,12 +375,12 @@ impl UploadState {
         match &self.target {
             UploadTarget::Blob => {
                 if self.upload.is_none() {
-                    self.upload = Some(blob::Upload::begin().map_err(UploadFailure::storage)?);
+                    self.upload = Some(blob::Upload::begin().map_err(UploadFailure::from)?);
                 }
                 let upload = self.upload.as_mut().expect("blob upload initialized");
                 match &mut self.multipart {
                     Some(parser) => parser.push(bytes, upload),
-                    None => upload.write(bytes).map_err(UploadFailure::storage),
+                    None => upload.write(bytes).map_err(UploadFailure::from),
                 }
             }
             UploadTarget::Part { upload, part, kind } => {
@@ -390,14 +390,14 @@ impl UploadState {
                 if self.part.is_none() {
                     self.part = Some(
                         blob::PartWriter::begin(&upload_id, part, kind)
-                            .map_err(UploadFailure::storage)?,
+                            .map_err(UploadFailure::from)?,
                     );
                 }
                 self.part
                     .as_mut()
                     .expect("part writer initialized")
                     .write(bytes)
-                    .map_err(UploadFailure::storage)
+                    .map_err(UploadFailure::from)
             }
         }
     }
@@ -415,7 +415,7 @@ impl UploadState {
                 if upload.size() == 0 {
                     return Err(UploadFailure::body("empty blob body"));
                 }
-                let meta = upload.finish().map_err(UploadFailure::storage)?;
+                let meta = upload.finish().map_err(UploadFailure::from)?;
                 self.finished = Some(Ok(Success::Blob(meta)));
             }
             UploadTarget::Part { .. } => {
@@ -426,7 +426,7 @@ impl UploadState {
                 if writer.size() == 0 {
                     return Err(UploadFailure::body("empty part body"));
                 }
-                let info = writer.finish().map_err(UploadFailure::storage)?;
+                let info = writer.finish().map_err(UploadFailure::from)?;
                 self.finished = Some(Ok(Success::Part(info)));
             }
         }
@@ -496,10 +496,6 @@ impl UploadFailure {
         UploadFailure::Body(detail.into())
     }
 
-    fn storage(error: blob::Error) -> UploadFailure {
-        UploadFailure::Storage(error)
-    }
-
     fn status(&self) -> u16 {
         match self {
             UploadFailure::Body(_) => 400,
@@ -507,16 +503,12 @@ impl UploadFailure {
         }
     }
 
-    fn detail(&self) -> String {
+    fn detail(&self) -> &str {
         match self {
-            UploadFailure::Body(detail) => detail.clone(),
-            UploadFailure::Storage(error) => error.detail.clone(),
+            UploadFailure::Body(detail) => detail,
+            UploadFailure::Storage(error) => &error.detail,
         }
     }
-}
-
-fn blob_error(error: blob::Error) -> Vec<u8> {
-    failure_response(support::status_for_storage(error.kind), &error.detail)
 }
 
 fn failure_response(status: u16, message: &str) -> Vec<u8> {

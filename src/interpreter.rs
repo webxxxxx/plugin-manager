@@ -380,7 +380,7 @@ fn probe(path: &Path, timeout_ms: u64) -> Result<Version, ProblemError> {
         if started.elapsed() >= Duration::from_millis(timeout_ms) {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(Problem::Internal.error(format!(
+            return Err(Problem::Timeout.error(format!(
                 "interpreter {} version probe timed out after {}ms",
                 path.display(),
                 timeout_ms

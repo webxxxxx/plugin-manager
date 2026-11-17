@@ -21,21 +21,27 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::kernel::failure::Problem;
 use crate::paths;
 
 /// Why a storage operation failed (#151).
 ///
-/// Storage objects are not management objects: an upload session has no
-/// `Problem` variant (404 is the one category [`Problem`] cannot name), so the
-/// storage taxonomy reuses [`Problem`] for the categories it shares and adds
-/// exactly one of its own. The face projects both onto the same status table.
+/// Storage has its own taxonomy: an upload session is not a management object,
+/// and this module sits below the kernel (`platform/storage` in the target
+/// layout), so it must not depend on `Problem`. The face maps each of these
+/// onto the single management table (`Invalid`/`Conflict`/`TooLarge`/
+/// `Internal`) plus 404 for `NotFound`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    /// A management-style category: invalid, conflict, too large, internal.
-    Problem(Problem),
     /// The upload session or stored object the request named is not there.
-    NotThere,
+    NotFound,
+    /// The request contradicts the session's commit mode.
+    Conflict,
+    /// The request or the archive is malformed.
+    Invalid,
+    /// The body or the stored object exceeds a hard limit.
+    TooLarge,
+    /// The store could not do what was asked.
+    Internal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,23 +59,23 @@ impl Error {
     }
 
     pub fn invalid(detail: impl Into<String>) -> Error {
-        Error::new(Kind::Problem(Problem::Invalid), detail)
+        Error::new(Kind::Invalid, detail)
     }
 
-    pub fn not_there(detail: impl Into<String>) -> Error {
-        Error::new(Kind::NotThere, detail)
+    pub fn not_found(detail: impl Into<String>) -> Error {
+        Error::new(Kind::NotFound, detail)
     }
 
     pub fn conflict(detail: impl Into<String>) -> Error {
-        Error::new(Kind::Problem(Problem::Conflict), detail)
+        Error::new(Kind::Conflict, detail)
     }
 
     pub fn too_large(detail: impl Into<String>) -> Error {
-        Error::new(Kind::Problem(Problem::TooLarge), detail)
+        Error::new(Kind::TooLarge, detail)
     }
 
     pub fn internal(detail: impl Into<String>) -> Error {
-        Error::new(Kind::Problem(Problem::Internal), detail)
+        Error::new(Kind::Internal, detail)
     }
 }
 
@@ -285,7 +291,7 @@ pub fn create_upload(kind: UploadKind) -> Result<String> {
 fn read_upload_kind(id: &str) -> Result<UploadKind> {
     let directory = upload_dir(id)?;
     if !directory.is_dir() {
-        return Err(Error::not_there("unknown upload"));
+        return Err(Error::not_found("unknown upload"));
     }
     let marker = fs::read_to_string(directory.join("session")).unwrap_or_default();
     match marker.trim() {
@@ -293,7 +299,7 @@ fn read_upload_kind(id: &str) -> Result<UploadKind> {
         "file" => Ok(UploadKind::File),
         // Sessions created before kind markers existed were blob sessions.
         "" => Ok(UploadKind::Blob),
-        _ => Err(Error::not_there("unknown upload kind")),
+        _ => Err(Error::not_found("unknown upload kind")),
     }
 }
 
@@ -311,7 +317,7 @@ pub fn upload_parts(id: &str, kind: UploadKind) -> Result<Vec<PartInfo>> {
     require_upload_kind(id, kind)?;
     let directory = upload_dir(id)?;
     if !directory.is_dir() {
-        return Err(Error::not_there("unknown upload"));
+        return Err(Error::not_found("unknown upload"));
     }
     let mut parts = Vec::new();
     for entry in fs::read_dir(&directory)
@@ -377,7 +383,7 @@ impl PartWriter {
         require_upload_kind(upload_id, kind)?;
         let directory = upload_dir(upload_id)?;
         if !directory.is_dir() {
-            return Err(Error::not_there("unknown upload"));
+            return Err(Error::not_found("unknown upload"));
         }
         // Keep the whole session alive even when an early part is older than
         // the retention window by the time the upload finishes.
@@ -462,7 +468,7 @@ pub fn complete_upload(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let directory = upload_dir(id)?;
     if !directory.is_dir() {
-        return Err(Error::not_there("unknown upload"));
+        return Err(Error::not_found("unknown upload"));
     }
     let available = upload_parts(id, UploadKind::Blob)?;
     let selected = select_parts(&available, requested)?;
@@ -617,7 +623,7 @@ pub fn complete_file(
 ) -> Result<FileMeta> {
     let directory = upload_dir(upload_id)?;
     if !directory.is_dir() {
-        return Err(Error::not_there("unknown upload"));
+        return Err(Error::not_found("unknown upload"));
     }
     let available = upload_parts(upload_id, UploadKind::File)?;
     let selected = select_parts(&available, requested)?;
@@ -722,7 +728,7 @@ pub fn abort_upload(id: &str, kind: UploadKind) -> Result<()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let directory = upload_dir(id)?;
     if !directory.is_dir() {
-        return Err(Error::not_there("unknown upload"));
+        return Err(Error::not_found("unknown upload"));
     }
     fs::remove_dir_all(&directory)
         .map_err(|error| Error::internal(format!("remove {}: {}", directory.display(), error)))
@@ -1109,10 +1115,10 @@ mod tests {
     fn a_storage_failure_names_its_kind() {
         let missing = "0".repeat(32);
         let error = read_upload_kind(&missing).expect_err("no session");
-        assert_eq!(error.kind, Kind::NotThere);
+        assert_eq!(error.kind, Kind::NotFound);
 
         let error = upload_dir("nope").expect_err("bad id");
-        assert_eq!(error.kind, Kind::Problem(Problem::Invalid));
+        assert_eq!(error.kind, Kind::Invalid);
     }
 
     #[test]

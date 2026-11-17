@@ -380,7 +380,12 @@ fn run_post_install_manifest(
         },
         &mut hook::poll_this_loop,
     )
-    .map_err(|error| Problem::Invalid.error(format!("post-install hook failed: {}", error)))
+    .map_err(|error| {
+        ProblemError::new(
+            error.problem,
+            format!("post-install hook failed: {}", error),
+        )
+    })
 }
 
 /// Remove stale staging directories. Called once at daemon startup.
@@ -429,19 +434,50 @@ pub fn staging_dir(id: &str) -> Result<PathBuf, ProblemError> {
     Ok(directory.join(format!(".staging-{}-{}", std::process::id(), nanos)))
 }
 
+/// What an install rejection implies for its caller.
+///
+/// `keep-old` needs the new version next to the old one, so running out of
+/// disk is recoverable: the daemon may stop the plugin and retry as `replace`.
+/// The space plan decides that here, so no upper layer reads `detail` (#151).
+#[derive(Debug)]
+pub enum InstallFailure {
+    /// There is no room for the new version beside the old one.
+    OutOfSpace(ProblemError),
+    /// Any other refusal.
+    Refused(ProblemError),
+}
+
+impl InstallFailure {
+    pub fn into_problem(self) -> ProblemError {
+        match self {
+            InstallFailure::OutOfSpace(error) | InstallFailure::Refused(error) => error,
+        }
+    }
+}
+
+impl From<ProblemError> for InstallFailure {
+    fn from(error: ProblemError) -> InstallFailure {
+        InstallFailure::Refused(error)
+    }
+}
+
 pub fn install_package(
     package: &Package,
     strategy: Strategy,
     opt_in_hooks: bool,
     host_interpreter: Option<Interpreter>,
-) -> Result<Service, ProblemError> {
+) -> Result<Service, InstallFailure> {
     let id = package.manifest.name.clone();
     if id == RESERVED_ID {
-        return Err(Problem::Conflict.error("the built-in svc id is reserved"));
+        return Err(Problem::Conflict.error("the built-in svc id is reserved").into());
     }
     ensure_hooks_allowed(package, opt_in_hooks)?;
     if paths::services_dir().join(format!("{}.json", id)).exists() {
-        return Err(Problem::Conflict.error(format!("plugin id conflicts with a core service: {}", id)));
+        return Err(
+            Problem::Conflict
+                .error(format!("plugin id conflicts with a core service: {}", id))
+                .into(),
+        );
     }
 
     let plugin_dir = plugin_dir(&id);
@@ -463,7 +499,8 @@ pub fn install_package(
             &plugin_dir,
             was_installed,
             host_interpreter.as_ref(),
-        ),
+        )
+        .map_err(InstallFailure::from),
     }
 }
 
@@ -473,10 +510,21 @@ fn install_keep_old(
     plugin_dir: &Path,
     was_installed: bool,
     interpreter: Option<&Interpreter>,
-) -> Result<Service, ProblemError> {
+) -> Result<Service, InstallFailure> {
     // No hook-specific rollback here: keep-old keeps the previous version and
     // switches `current`, so a failing post-install just reports the error.
     // A replace install rolls back through its own strategy handling.
+    //
+    // The new version lives next to the old one until `current` switches, so
+    // the old version's bytes cannot be reclaimed: the plan is the same as a
+    // first install. Running out is the one refusal the caller can retry as
+    // `replace`, so it leaves with its own category.
+    let free = free_space(plugin_dir)?;
+    if replace_plan(free, None, package.unpacked_size()) == ReplacePlan::NoSpace {
+        return Err(InstallFailure::OutOfSpace(out_of_space(
+            package, free, None,
+        )));
+    }
     let (version_dir, enabled) = write_version(package, plugin_dir, was_installed)?;
     copy_config(package, plugin_dir)?;
     let service = service_from_manifest(id, &version_dir, &package.manifest, enabled, interpreter)?;
@@ -504,7 +552,12 @@ fn run_post_install(package: &Package, id: &str, version_dir: &Path) -> Result<(
         },
         &mut hook::poll_this_loop,
     )
-    .map_err(|error| Problem::Invalid.error(format!("post-install hook failed: {}", error)))
+    .map_err(|error| {
+        ProblemError::new(
+            error.problem,
+            format!("post-install hook failed: {}", error),
+        )
+    })
 }
 
 fn install_replace(
@@ -524,16 +577,7 @@ fn install_replace(
     let free = free_space(plugin_dir)?;
     let plan = replace_plan(free, old_size, new_size);
     if plan == ReplacePlan::NoSpace {
-        return Err(Problem::Internal.error(format!(
-            "not enough space to install {} {}: need {} bytes, {} free{}",
-            id,
-            package.manifest.version,
-            new_size,
-            free,
-            old_size
-                .map(|size| format!(", current version uses {size} bytes"))
-                .unwrap_or_default()
-        )));
+        return Err(out_of_space(package, free, old_size));
     }
 
     let backup = if plan == ReplacePlan::Backup {
@@ -679,6 +723,20 @@ fn write_version(
         false
     };
     Ok((version_dir, enabled))
+}
+
+/// The failure a full disk produces. One message shape for both strategies.
+fn out_of_space(package: &Package, free: u64, old_size: Option<u64>) -> ProblemError {
+    Problem::Internal.error(format!(
+        "not enough space to install {} {}: need {} bytes, {} free{}",
+        package.manifest.name,
+        package.manifest.version,
+        package.unpacked_size(),
+        free,
+        old_size
+            .map(|size| format!(", current version uses {size} bytes"))
+            .unwrap_or_default()
+    ))
 }
 
 fn directory_size(path: &Path) -> Result<u64, ProblemError> {
@@ -1719,6 +1777,18 @@ mod tests {
             std::fs::read(active_config("checked").expect("active")).expect("read"),
             b"good config"
         );
+    }
+
+    /// The daemon's keep-old fallback reads this signal, never the detail text.
+    #[test]
+    fn an_install_failure_keeps_its_retry_signal_and_its_category() {
+        let refused: InstallFailure = Problem::Conflict.error("reserved").into();
+        assert!(matches!(refused, InstallFailure::Refused(_)));
+        assert_eq!(refused.into_problem().problem, Problem::Conflict);
+
+        let full = InstallFailure::OutOfSpace(Problem::Internal.error("not enough space"));
+        assert!(matches!(full, InstallFailure::OutOfSpace(_)));
+        assert_eq!(full.into_problem().problem, Problem::Internal);
     }
 
     #[test]

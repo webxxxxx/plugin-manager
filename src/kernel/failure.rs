@@ -254,9 +254,9 @@ impl Problem {
 /// 一次管理操作的失败：类别 + 只给人看的细节。
 ///
 /// `detail` 会原样成为 JSON-RPC `error.message`；类别走 `error.data.kind`，
-/// 对外投影只读类别。唯一的例外在构造之前：`plugin`/`package` 仍返回
-/// `String`，调用方在 legacy 边界把它们归入某个 [`Problem`]；一旦进入
-/// `ProblemError`，上层不得再解析 `detail`。
+/// 对外投影只读类别。类别在**抛出处**给定（#151 起 `package`/`plugin`/
+/// `trust`/`transfer`/`interpreter`/`hook`/`bundle` 都返回本类型），进入
+/// `ProblemError` 之后，上层不得再解析 `detail`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProblemError {
     pub problem: Problem,

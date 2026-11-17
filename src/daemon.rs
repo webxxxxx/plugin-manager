@@ -1759,7 +1759,7 @@ impl Daemon {
             host_interpreter.clone(),
         ) {
             Ok(service) => service,
-            Err(error) if strategy == Strategy::KeepOld && is_no_space(error.detail()) => {
+            Err(plugin::InstallFailure::OutOfSpace(error)) if strategy == Strategy::KeepOld => {
                 if still_running {
                     return Err(ProblemError::new(
                         Problem::Internal,
@@ -1773,9 +1773,10 @@ impl Daemon {
                     "svcd: plugin {}: keep-old ran out of space; falling back to replace",
                     id
                 ));
-                plugin::install_package(&package, Strategy::Replace, allow_hooks, host_interpreter)?
+                plugin::install_package(&package, Strategy::Replace, allow_hooks, host_interpreter)
+                    .map_err(plugin::InstallFailure::into_problem)?
             }
-            Err(error) => return Err(error),
+            Err(failure) => return Err(failure.into_problem()),
         };
         // The package is already on disk, but registration can still be refused
         // (ADR-0015's carrier invariant). Check before touching the running slot
@@ -2568,12 +2569,6 @@ fn missing_dependencies(registry: &Registry, id: &str) -> Vec<String> {
     walk_dependencies(registry, &[id.to_string()]).1
 }
 
-fn is_no_space(error: &str) -> bool {
-    error.contains("os error 28")
-        || error.contains("os error 112")
-        || error.contains("No space left")
-        || error.contains("not enough space")
-}
 
 #[cfg(test)]
 mod tests {
