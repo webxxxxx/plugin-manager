@@ -23,9 +23,9 @@ pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// keeps the copy because creating symlinks needs a privilege there.
 ///
 /// A link makes `current_exe()` resolve to the cargo-built binary instead of the
-/// sandbox entry. The integration suites never self-install (that path lives in
-/// `install.rs` and is exercised by the suites that keep their own copies), so
-/// only argv[0] dispatch is under test.
+/// sandbox entry. None of the sandboxed suites self-installs — that path lives in
+/// `install.rs` and is covered by the suites that exec the cargo binary directly
+/// — so only argv[0] dispatch is under test here.
 pub fn install_multicall(binary: &Path, entries: &[&Path]) {
     for path in entries {
         #[cfg(unix)]
