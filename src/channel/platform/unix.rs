@@ -148,12 +148,6 @@ impl ControlChannel for Platform {
     fn remove_socket(config: &Path) {
         let _ = fs::remove_file(config.join("svcd.sock"));
     }
-
-    fn set_private(path: &Path) -> io::Result<()> {
-        // The svcd group may read the token; local management is group/root
-        // only.
-        fs::set_permissions(path, fs::Permissions::from_mode(0o640))
-    }
 }
 
 #[cfg(test)]
@@ -175,17 +169,16 @@ mod tests {
         directory
     }
 
-    /// The token stays group-readable (the `svc` CLI runs as a group member)
-    /// and is not exposed to other users. This is the POSIX half of the
-    /// permission seam; Windows keeps its own ACL semantics.
+    /// The control socket stays group-accessible: the `svc` CLI runs as a
+    /// group member and the socket's mode is the authorization.
     #[test]
-    fn the_token_is_private_to_the_owner_and_group() {
-        let config = config_dir("token");
-        let token = config.join("svcd.token");
-        fs::write(&token, "token").expect("token");
-        Platform::set_private(&token).expect("set private");
-        let mode = fs::metadata(&token).expect("metadata").permissions().mode() & 0o777;
-        assert_eq!(mode, 0o640, "token mode: {mode:o}");
+    fn the_socket_is_group_accessible() {
+        let config = config_dir("socket");
+        let listener = Platform::bind(&config).expect("bind");
+        let socket = config.join("svcd.sock");
+        let mode = fs::metadata(&socket).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o660, "socket mode: {mode:o}");
+        drop(listener);
         let _ = fs::remove_dir_all(&config);
     }
 }

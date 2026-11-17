@@ -1,6 +1,6 @@
 //! The local control channel: CLI/MCP clients ↔ the supervisor.
 //!
-//! This file is the platform-neutral half: the token, the request envelope, the
+//! This file is the platform-neutral half: the request envelope, the
 //! connection pool and the response reader. The two platform halves live in
 //! `channel/platform/{unix,windows}.rs` and implement [`ControlChannel`]; this
 //! file never names a platform, so the seam is one alias (`Platform`) rather
@@ -87,8 +87,8 @@ impl Reply {
 
 /// One control-channel implementation. There are two real implementations
 /// (UDS / named pipe); only the host's compiles. The interface covers the whole
-/// platform decision the channel makes: bind, serve-or-handoff, connect, socket
-/// cleanup and the token file's platform permission.
+/// platform decision the channel makes: bind, serve-or-handoff, connect and
+/// socket cleanup.
 pub(crate) trait ControlChannel {
     /// The connected byte stream used by clients and by one accepted server
     /// connection.
@@ -114,10 +114,6 @@ pub(crate) trait ControlChannel {
 
     /// Remove the endpoint's filesystem entry, if it has one.
     fn remove_socket(config: &Path);
-
-    /// Apply the token file's platform permission. POSIX bits and Windows ACLs
-    /// are not interchangeable; each implementation keeps its own semantics.
-    fn set_private(path: &Path) -> io::Result<()>;
 }
 
 /// The accept side of a bound endpoint.
@@ -131,54 +127,6 @@ pub(crate) trait ControlListener {
 pub(crate) trait ControlStream: Read + Write + Send + 'static {
     /// Wait until the stream is readable (or the timeout expires).
     fn wait_readable(&self, timeout: Duration) -> io::Result<bool>;
-}
-
-pub fn token_path(config: &Path) -> PathBuf {
-    config.join("svcd.token")
-}
-
-/// Read the local control token, creating it on first daemon start.
-pub fn ensure_token(config: &Path) -> io::Result<String> {
-    let path = token_path(config);
-    if let Ok(existing) = fs::read_to_string(&path) {
-        let token = existing.trim().to_string();
-        if !token.is_empty() {
-            Platform::set_private(&path)?;
-            return Ok(token);
-        }
-    }
-    let token = random_token();
-    fs::write(&path, &token)?;
-    Platform::set_private(&path)?;
-    Ok(token)
-}
-
-pub fn read_token(config: &Path) -> io::Result<String> {
-    let token = fs::read_to_string(token_path(config))?;
-    let token = token.trim().to_string();
-    if token.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "empty token"));
-    }
-    Ok(token)
-}
-
-fn random_token() -> String {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-
-    let mut token = String::with_capacity(32);
-    for _ in 0..2 {
-        let mut hasher = RandomState::new().build_hasher();
-        hasher.write_u128(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        );
-        hasher.write_u32(std::process::id());
-        token.push_str(&format!("{:016x}", hasher.finish()));
-    }
-    token
 }
 
 /// Bind and start the local control channel. Unix hands the listener to the
@@ -254,9 +202,8 @@ where
     F: FnMut(&str),
     C: Fn() -> bool,
 {
-    let token = read_token(config)?;
     let mut stream = acquire(config)?;
-    let line = request_line(method, params, token);
+    let line = request_line(method, params);
     ipc::write_frame_limit(&mut stream, &line, ipc::LOCAL_FRAME_MAX)?;
 
     let polling = idle.is_some();
@@ -268,14 +215,13 @@ where
 }
 
 /// The one control-channel request envelope. The local channel always uses id 1
-/// and carries the management token; only the read side varies by budget.
-fn request_line(method: &str, params: serde_json::Value, token: String) -> String {
+/// and carries no credential: authorization is the endpoint's ACL.
+fn request_line(method: &str, params: serde_json::Value) -> String {
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": method,
         "params": params,
-        "auth": token,
     })
     .to_string()
 }
@@ -454,9 +400,8 @@ pub fn request_within<C: Fn() -> bool>(
     deadline: Instant,
     cancelled: C,
 ) -> io::Result<crate::rpc::Response> {
-    let token = read_token(config)?;
     let mut stream = acquire(config)?;
-    let line = request_line(method, params, token);
+    let line = request_line(method, params);
     ipc::write_frame_limit(&mut stream, &line, ipc::LOCAL_FRAME_MAX)?;
 
     let mut reader = ipc::FrameReader::new(BufReader::new(PollReader {
@@ -499,7 +444,6 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&directory).expect("config dir");
-        fs::write(directory.join("svcd.token"), "test-token\n").expect("token");
         directory
     }
 
@@ -520,20 +464,6 @@ mod tests {
     fn the_host_control_channel_implements_the_seam() {
         fn assert_channel<C: ControlChannel>() {}
         assert_channel::<Platform>();
-    }
-
-    /// The token survives a second start, so the CLI reads exactly the token
-    /// the daemon created. The platform permission is covered by the
-    /// implementation's own test (POSIX mode on Unix; the Windows DACL seam is
-    /// the C8 deferral).
-    #[test]
-    fn the_token_is_stable_across_starts() {
-        let config = config_dir("token");
-        let first = ensure_token(&config).expect("first token");
-        let second = ensure_token(&config).expect("second token");
-        assert_eq!(first, second, "the daemon must reuse its token");
-        assert_eq!(read_token(&config).expect("read"), first);
-        let _ = fs::remove_dir_all(&config);
     }
 
     /// A supervisor that never answers must not hold the worker: the request

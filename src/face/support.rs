@@ -256,7 +256,6 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).expect("config dir");
-        std::fs::write(root.join("svcd.token"), "test-token\n").expect("token");
         let listener = UnixListener::bind(root.join("svcd.sock")).expect("listener");
         let server = std::thread::spawn(move || {
             let (_stream, _) = listener.accept().expect("accept");

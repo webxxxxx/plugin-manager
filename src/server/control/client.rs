@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-use crate::channel::{self, ProgressEvent};
+use crate::channel::ProgressEvent;
 use crate::ipc;
 
 struct Connection {
@@ -235,15 +235,12 @@ impl StreamingClient {
     }
 }
 
-fn management_request(config: &Path, method: &str, params: Value) -> Result<Vec<u8>, String> {
-    let token =
-        channel::read_token(config).map_err(|error| format!("svcd unreachable: {}", error))?;
+fn management_request(_config: &Path, method: &str, params: Value) -> Result<Vec<u8>, String> {
     let line = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": method,
         "params": params,
-        "auth": token,
     })
     .to_string();
     let mut bytes = line.into_bytes();

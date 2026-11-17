@@ -265,14 +265,6 @@ impl ControlChannel for Platform {
         // A named pipe disappears with its last handle; there is no filesystem
         // entry to unlink.
     }
-
-    fn set_private(_path: &Path) -> io::Result<()> {
-        // The Windows token permission seam is the C8 DACL work: the daemon can
-        // run as LocalSystem and the CLI as another user, so a current-user
-        // DACL would cut the operator off. Keep the platform default until the
-        // group policy (SYSTEM/Administrators + svcd group) lands.
-        Ok(())
-    }
 }
 
 /// One thread per control connection, exactly like the old fallback.
