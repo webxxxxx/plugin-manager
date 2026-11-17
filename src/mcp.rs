@@ -3,6 +3,7 @@ use crate::ipc::{self, FrameEvent};
 use crate::paths;
 use crate::registry::{Kind, Registry};
 use crate::rpc;
+use crate::server::mcp::session::{validate_meta, Served, MODERN_VERSION};
 use crate::server::mcp::result::{
     error_response, result_value, server_meta, tool_error_result, tool_result_object, SERVER_NAME,
 };
@@ -12,7 +13,6 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-pub const MODERN_VERSION: &str = "2026-07-28";
 const LEGACY_VERSIONS: [&str; 3] = ["2025-11-25", "2025-06-18", "2025-03-26"];
 const TTL_MS: u64 = 1000;
 const LEGACY_POLL: Duration = Duration::from_secs(1);
@@ -147,24 +147,6 @@ enum Era {
 enum Outcome {
     Continue,
     Exit(i32),
-}
-
-/// What a modern (2026-07-28) request produced. `Unreachable` still carries a
-/// reply for the client, but the control channel is gone: the stdio bridge
-/// sends it and exits 1; HTTP sends the same JSON-RPC envelope and stays up.
-pub enum Served {
-    Respond(rpc::Response),
-    Unreachable(rpc::Response),
-}
-
-impl Served {
-    fn new(response: rpc::Response, fatal: bool) -> Self {
-        if fatal {
-            Served::Unreachable(response)
-        } else {
-            Served::Respond(response)
-        }
-    }
 }
 
 /// Serve one modern request without a progress sink (HTTP).
@@ -406,42 +388,6 @@ impl Bridge {
         self.last_version = Some(version);
         Ok(())
     }
-}
-
-pub(crate) fn validate_meta(id: Option<Value>, params: &Value) -> Result<(), rpc::Response> {
-    let Some(meta) = params.get("_meta").and_then(Value::as_object) else {
-        return Err(rpc::err(id, -32602, "missing _meta"));
-    };
-    let Some(version) = meta
-        .get("io.modelcontextprotocol/protocolVersion")
-        .and_then(Value::as_str)
-    else {
-        return Err(rpc::err(
-            id,
-            -32602,
-            "missing io.modelcontextprotocol/protocolVersion",
-        ));
-    };
-    if !meta
-        .get("io.modelcontextprotocol/clientCapabilities")
-        .map(Value::is_object)
-        .unwrap_or(false)
-    {
-        return Err(rpc::err(
-            id,
-            -32602,
-            "missing io.modelcontextprotocol/clientCapabilities",
-        ));
-    }
-    if version != MODERN_VERSION {
-        return Err(rpc::err_data(
-            id,
-            -32022,
-            "Unsupported protocol version",
-            json!({ "supported": [MODERN_VERSION], "requested": version }),
-        ));
-    }
-    Ok(())
 }
 
 fn discover(id: Option<Value>) -> rpc::Response {

@@ -11,6 +11,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::compat;
+use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::hook;
 use crate::interpreter;
 use crate::log;
@@ -141,9 +142,9 @@ fn verify_package(
         .map(|spec| spec.devices.clone())
         .unwrap_or_default();
     if let Some(reason) = compat::verdict_reason(compat::evaluate(
-        package::target(),
+        crate::platform::target(),
         &devices,
-        &compat::detect(),
+        &compat::detect(MAX_SCHEMA, MAX_PROTOCOL),
     )) {
         return Err(reason);
     }
@@ -791,7 +792,7 @@ fn restore_file(path: &Path, content: &Option<Vec<u8>>, config: bool) -> Result<
 
 pub fn scan() -> (Vec<Service>, Vec<String>) {
     let root = paths::plugins_dir();
-    let host = crate::compat::detect();
+    let host = crate::compat::detect(MAX_SCHEMA, MAX_PROTOCOL);
     let mut services = Vec::new();
     let mut warnings = Vec::new();
     let entries = match fs::read_dir(&root) {
@@ -840,7 +841,7 @@ pub fn scan() -> (Vec<Service>, Vec<String>) {
                     .as_ref()
                     .map(|spec| spec.devices.clone())
                     .unwrap_or_default();
-                match crate::compat::evaluate(package::target(), &devices, &host) {
+                match crate::compat::evaluate(crate::platform::target(), &devices, &host) {
                     crate::compat::Verdict::Compatible => services.push(service),
                     verdict => {
                         let reason = crate::compat::verdict_reason(verdict)
@@ -978,11 +979,11 @@ fn service_from_manifest(
     enabled: bool,
     interpreter: Option<&Interpreter>,
 ) -> Result<Service, String> {
-    if manifest.platform != package::target() {
+    if manifest.platform != crate::platform::target() {
         return Err(format!(
             "platform mismatch: package {}, host {}",
             manifest.platform,
-            package::target()
+            crate::platform::target()
         ));
     }
     package::check_path(&manifest.exec.path)?;
@@ -1196,11 +1197,11 @@ fn read_manifest(version_dir: &Path) -> Result<package::Manifest, String> {
     let bytes = fs::read(version_dir.join("manifest.json"))
         .map_err(|error| format!("read manifest: {}", error))?;
     let manifest = package::parse_manifest(&bytes)?;
-    if manifest.platform != package::target() {
+    if manifest.platform != crate::platform::target() {
         return Err(format!(
             "platform mismatch: package {}, host {}",
             manifest.platform,
-            package::target()
+            crate::platform::target()
         ));
     }
     Ok(manifest)
@@ -1441,7 +1442,7 @@ pub fn replace_config(id: &str, candidate: &[u8], check: bool) -> Result<(), Str
 }
 
 pub fn root_required() -> Result<(), String> {
-    if crate::install::is_privileged() || crate::paths::user_mode() {
+    if crate::platform::is_privileged() || crate::paths::user_mode() {
         Ok(())
     } else {
         Err("root / Administrator is required".into())
@@ -1578,7 +1579,7 @@ mod tests {
             "name": id,
             "version": "1.0.0",
             "desc": "config test",
-            "platform": package::target(),
+            "platform": crate::platform::target(),
             "protocol": 1,
             "exec": {"path": "config/config"},
             "files": []
@@ -1677,7 +1678,7 @@ mod tests {
             "name": id,
             "version": "1.0.0",
             "desc": "script test",
-            "platform": package::target(),
+            "platform": crate::platform::target(),
             "protocol": 1,
             "exec": {"path": exec, "ready": "exec"},
             "files": []

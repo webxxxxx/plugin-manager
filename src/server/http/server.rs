@@ -21,7 +21,7 @@ use serde_json::json;
 
 use crate::channel::PendingCall;
 use crate::http;
-use crate::mcp_http;
+use crate::server::mcp::transport;
 use crate::lan::Lan;
 use crate::log;
 use crate::server::control::client::StreamingClient;
@@ -325,8 +325,8 @@ impl ServerLoop for Server {
                 .lock()
                 .ok()
                 .and_then(|state| state.password_hash().map(str::to_string));
-            let prepared = mcp_http::prepare_streaming(
-                &mcp_http::Request {
+            let prepared = transport::prepare_streaming(
+                &transport::Request {
                     method: &request.method,
                     headers: &request.headers,
                     body: &request.body,

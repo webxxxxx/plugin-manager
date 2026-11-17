@@ -2,8 +2,6 @@
 mod api;
 mod auth;
 mod blob;
-#[cfg(feature = "http")]
-mod blob_http;
 mod builtin_adapter;
 mod bundle;
 mod catalog;
@@ -24,10 +22,9 @@ mod lan;
 mod limits;
 mod log;
 mod mcp;
-#[cfg(feature = "http")]
-mod mcp_http;
 mod package;
 mod paths;
+mod platform;
 mod plugin;
 mod plugin_cli;
 mod proc;
@@ -85,7 +82,7 @@ fn main() {
                 args.insert(0, "--uninstall".into());
             }
             // The first element is the dispatch word, not part of the flags.
-            install::self_uninstall(&args[1..])
+            install::self_uninstall(&args[1..], &stop_daemon)
         }
         _ => svcd_run(std::env::args().skip(1).collect()),
     };
@@ -97,7 +94,7 @@ fn svcd_run(args: Vec<String>) -> i32 {
         Some("run") => run_command(&args[1..]),
         Some("shutdown") if args.len() == 1 => daemon::shutdown(),
         Some("--install") | Some("install") => install::self_install(&args[1..]),
-        Some("--uninstall") | Some("uninstall") => install::self_uninstall(&args[1..]),
+        Some("--uninstall") | Some("uninstall") => install::self_uninstall(&args[1..], &stop_daemon),
         Some("install-service") => install::install_service(&args[1..]),
         Some("uninstall-service") => install::uninstall_service(&args[1..]),
         Some("start") => start_command(),
@@ -160,10 +157,24 @@ fn run_command(args: &[String]) -> i32 {
 /// the plain daemon loop.
 fn run_foreground(conf: Option<std::path::PathBuf>) -> i32 {
     #[cfg(windows)]
-    if let Some(code) = service_win::run_if_service(conf.clone()) {
+    if let Some(code) = service_win::run_if_service(conf.clone(), daemon::run, request_shutdown) {
         return code;
     }
     daemon::run(conf)
+}
+
+/// Let the Windows SCM control handler stop the daemon without the SCM module
+/// reaching into the composition root itself (§7 rule 1).
+#[cfg(windows)]
+fn request_shutdown() {
+    daemon::request_shutdown();
+}
+
+/// Stop the running daemon before a self-uninstall replaces or removes the
+/// binary. A self-install action reports that it needs the daemon stopped; the
+/// composition root performs it instead of handing the domain a way back up.
+fn stop_daemon() {
+    let _ = daemon::shutdown_quiet();
 }
 
 fn start_command() -> i32 {

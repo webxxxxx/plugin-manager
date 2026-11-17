@@ -1299,7 +1299,7 @@ pub fn self_install(args: &[String]) -> i32 {
         }
         return EXIT_OK;
     }
-    if !is_privileged() {
+    if !crate::platform::is_privileged() {
         eprintln!("svcd: --install requires root / Administrator");
         return EXIT_ERROR;
     }
@@ -2124,7 +2124,7 @@ fn spawn_uninstall_helper(args: &[String]) -> i32 {
     }
 }
 
-fn self_uninstall_user(request: SelfRequest) -> i32 {
+fn self_uninstall_user(request: SelfRequest, stop_daemon: &dyn Fn()) -> i32 {
     let data = std::env::var_os("SVCD_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(paths::data_dir);
@@ -2139,8 +2139,10 @@ fn self_uninstall_user(request: SelfRequest) -> i32 {
         return EXIT_OK;
     }
     // The installed aliases can be hard links to the running daemon binary.
-    // Stop the user daemon first so Windows can release the shared file.
-    let _ = crate::daemon::shutdown_quiet();
+    // Stop the user daemon first so Windows can release the shared file. The
+    // composition root supplies the callback: a self-install action returns
+    // what it needs done instead of reaching up into the daemon itself (§6).
+    stop_daemon();
     std::thread::sleep(std::time::Duration::from_millis(500));
     for name in std::iter::once(target_name).chain(alias_names()) {
         let path = install_root.join(name);
@@ -2216,7 +2218,7 @@ fn self_uninstall_user(request: SelfRequest) -> i32 {
     EXIT_OK
 }
 
-pub fn self_uninstall(args: &[String]) -> i32 {
+pub fn self_uninstall(args: &[String], stop_daemon: &dyn Fn()) -> i32 {
     let request = match parse_self(args, true) {
         Ok(request) => request,
         Err(message) => {
@@ -2237,7 +2239,7 @@ pub fn self_uninstall(args: &[String]) -> i32 {
         return spawn_uninstall_helper(args);
     }
     if crate::paths::user_mode() {
-        return self_uninstall_user(request);
+        return self_uninstall_user(request, stop_daemon);
     }
     let installed = installed_conf_settings();
     let install_root = request
@@ -2271,7 +2273,7 @@ pub fn self_uninstall(args: &[String]) -> i32 {
         }
         return EXIT_OK;
     }
-    if !is_privileged() {
+    if !crate::platform::is_privileged() {
         eprintln!("svcd: --uninstall requires root / Administrator");
         return EXIT_ERROR;
     }
@@ -2427,7 +2429,7 @@ fn dispatch(action: Action, args: &[String]) -> i32 {
         return EXIT_OK;
     }
 
-    if !is_privileged() {
+    if !crate::platform::is_privileged() {
         eprintln!("svcd: {} requires root / Administrator", action.as_str());
         return EXIT_ERROR;
     }
@@ -2675,54 +2677,6 @@ fn run_command(argv: &[String], allow_codes: Option<&[i32]>) -> Result<(), Strin
             detail
         ))
     }
-}
-
-#[cfg(unix)]
-pub(crate) fn is_privileged() -> bool {
-    #[cfg(debug_assertions)]
-    if std::env::var_os("SVCD_TEST_UNPRIVILEGED").is_some() {
-        return true;
-    }
-    unsafe { libc::geteuid() == 0 }
-}
-
-#[cfg(windows)]
-pub(crate) fn is_privileged() -> bool {
-    #[cfg(debug_assertions)]
-    if std::env::var_os("SVCD_TEST_UNPRIVILEGED").is_some() {
-        return true;
-    }
-    use std::mem::size_of;
-    use std::ptr::null_mut;
-
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::Security::{
-        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
-    };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-    unsafe {
-        let mut token: HANDLE = null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-            return false;
-        }
-        let mut elevation: TOKEN_ELEVATION = std::mem::zeroed();
-        let mut returned = 0u32;
-        let ok = GetTokenInformation(
-            token,
-            TokenElevation,
-            &mut elevation as *mut _ as *mut _,
-            size_of::<TOKEN_ELEVATION>() as u32,
-            &mut returned,
-        );
-        CloseHandle(token);
-        ok != 0 && elevation.TokenIsElevated != 0
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn is_privileged() -> bool {
-    false
 }
 
 #[cfg(test)]

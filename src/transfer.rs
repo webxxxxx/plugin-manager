@@ -15,7 +15,6 @@ use crate::package;
 use crate::paths;
 use crate::plugin;
 use crate::settings;
-use crate::status::Status;
 
 const MAX_IMPORT: u64 = 512 * 1024 * 1024;
 
@@ -24,8 +23,10 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 /// What an import delivered.
 #[derive(Debug)]
 pub struct Outcome {
-    /// The installed package, when the input was `.spk` or `.spkb`.
-    pub status: Option<Status>,
+    /// The installed package, when the input was `.spk` or `.spkb`. This is the
+    /// daemon's `plugin.install` result, kept as JSON: the manage layer does
+    /// not own the CLI/HTTP projection of a status (§7).
+    pub status: Option<serde_json::Value>,
     /// The plugin whose config was replaced, when a config was applied.
     pub config: Option<String>,
     /// Non-fatal notes, such as importing over a different installed version.
@@ -175,7 +176,7 @@ pub(crate) fn apply_config(id: &str, data: &[u8], require_root: bool) -> Result<
     plugin::replace_config(id, data, true).map_err(Error::Failed)
 }
 
-fn install_bytes(bytes: &[u8], source: &str) -> Result<Status, String> {
+fn install_bytes(bytes: &[u8], source: &str) -> Result<serde_json::Value, String> {
     let directory = paths::config_dir().join("tmp");
     fs::create_dir_all(&directory)
         .map_err(|error| format!("create {}: {}", directory.display(), error))?;
@@ -201,7 +202,7 @@ fn install_bytes(bytes: &[u8], source: &str) -> Result<Status, String> {
     let result = response
         .result
         .ok_or_else(|| "empty install response".to_string())?;
-    serde_json::from_value(result).map_err(|error| format!("invalid status response: {}", error))
+    Ok(result)
 }
 
 #[cfg(test)]

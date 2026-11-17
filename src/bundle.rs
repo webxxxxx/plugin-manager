@@ -442,7 +442,7 @@ fn assemble_manifest(
             options
                 .platform
                 .clone()
-                .unwrap_or_else(|| package::target().to_string()),
+                .unwrap_or_else(|| crate::platform::target().to_string()),
         ),
     );
     let mut exec = manifest
@@ -1054,7 +1054,7 @@ mod tests {
         assert_eq!(manifest.name, "demo");
         assert_eq!(manifest.version, "1.2.3");
         assert_eq!(manifest.desc, "demo plugin");
-        assert_eq!(manifest.platform, package::target());
+        assert_eq!(manifest.platform, crate::platform::target());
         assert_eq!(manifest.exec.path, exec_path);
         assert_eq!(manifest.config.as_deref(), Some("config/config"));
         assert_eq!(manifest.ui.as_ref().map(|ui| ui.kind.as_str()), Some("web"));
@@ -1240,7 +1240,7 @@ mod tests {
         assert_eq!(manifest.name, "fresh");
         assert_eq!(manifest.version, "2.0.0");
         assert_eq!(manifest.desc, "fresh desc");
-        assert_eq!(manifest.platform, package::target());
+        assert_eq!(manifest.platform, crate::platform::target());
         assert_eq!(manifest.exec.args, vec!["--stdio".to_string()]);
         assert_eq!(manifest.exec.ready.as_deref(), Some("notify"));
         assert_eq!(manifest.capabilities.len(), 1);

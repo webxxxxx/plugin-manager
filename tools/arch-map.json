@@ -23,6 +23,7 @@
     "proc": { "concept": "platform/host", "layer": "platform" },
     "zerocopy": { "concept": "platform/host", "layer": "platform" },
     "compat": { "concept": "platform/compat", "layer": "platform" },
+    "platform": { "concept": "platform", "layer": "platform", "note": "src/platform/：宿主能力（特权判定、target triple）；#137 起承接从域层搬出的 OS 事实" },
 
     "kernel": { "concept": "kernel", "layer": "kernel", "note": "src/kernel/：契约、失败类别、conformance（#102 新建）" },
     "auth": { "concept": "platform/auth", "layer": "platform" },
@@ -55,7 +56,6 @@
     "service_win": { "concept": "selfinstall/service_win", "layer": "domain" },
 
     "http": { "concept": "server/http/model", "layer": "server" },
-    "mcp_http": { "concept": "server/mcp/transport", "layer": "server" },
     "lan": { "concept": "server/auth", "layer": "server" },
     "server": { "concept": "server/request", "layer": "server", "note": "S4 请求交接契约（#113）+ HTTP server-loop（#114）+ stream driver（#115）+ WebSocket 帧（#122）" },
 
@@ -65,7 +65,7 @@
     "catalog": { "concept": "face/mcp_tools", "layer": "face" },
     "webui": { "concept": "face/plugin_ui", "layer": "face" },
     "uichannel": { "concept": "face/plugin_ui", "layer": "face", "note": "事件总线、replay 与握手；SSE/WS transport 已迁到 face/plugin_streams" },
-    "blob_http": { "concept": "face/blob", "layer": "face" },
+    "test_support": { "concept": "test_support", "layer": "platform", "note": "仅测试编译的临时根 helper；除 std 外无依赖，按最低层计" },
 
     "svc": { "concept": "cli/svc", "layer": "cli" },
     "plugin_cli": { "concept": "cli/plugin", "layer": "cli" },

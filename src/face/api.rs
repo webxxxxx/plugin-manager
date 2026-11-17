@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use crate::http;
+use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::lan::{self, AuthKind, Lan};
 use crate::log;
 use crate::package;
@@ -309,7 +310,7 @@ impl ApiFace {
         match (request.method.as_str(), parts.as_slice()) {
             ("GET", ["api", "v1", "compat"]) => Response::json(
                 200,
-                &serde_json::to_value(crate::compat::detect()).unwrap_or(Value::Null),
+                &serde_json::to_value(crate::compat::detect(MAX_SCHEMA, MAX_PROTOCOL)).unwrap_or(Value::Null),
             ),
             ("GET", ["api", "v1", "auth"]) => match self.lan.lock() {
                 Ok(state) => Response::json(
@@ -328,7 +329,7 @@ impl ApiFace {
                 &json!({
                     "version": env!("CARGO_PKG_VERSION"),
                     "protocol": 1,
-                    "platform": crate::package::target(),
+                    "platform": crate::platform::target(),
                 }),
             ),
             ("GET", ["api", "v1", "services"]) => self.list_services(&budget),
@@ -879,7 +880,7 @@ mod tests {
         let body: Value = serde_json::from_slice(&response.body).expect("json");
         assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(body["protocol"], 1);
-        assert_eq!(body["platform"], crate::package::target());
+        assert_eq!(body["platform"], crate::platform::target());
     }
 
     #[test]

@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 
 use crate::channel;
 use crate::compat;
+use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::package;
 use crate::paths;
 use crate::plugin;
@@ -678,7 +679,7 @@ struct VerifyHost {
 }
 
 fn verify_host(inspection: &package::Inspection) -> VerifyHost {
-    let host = compat::detect();
+    let host = compat::detect(MAX_SCHEMA, MAX_PROTOCOL);
     VerifyHost {
         matches_host: inspection.package.manifest.platform == host.platform,
         device: host.device,
@@ -918,7 +919,13 @@ fn import(path: &Path, config_id: Option<&str>, no_config: bool, force: bool) ->
                 eprintln!("plugin: warning: {}", warning);
             }
             if let Some(status) = outcome.status {
-                print_status(status, false)
+                match serde_json::from_value::<Status>(status) {
+                    Ok(status) => print_status(status, false),
+                    Err(error) => {
+                        eprintln!("plugin: invalid status response: {}", error);
+                        EXIT_SERVICE_ERROR
+                    }
+                }
             } else if let Some(id) = outcome.config {
                 println!("config imported for {}; restart to apply", id);
                 EXIT_OK
