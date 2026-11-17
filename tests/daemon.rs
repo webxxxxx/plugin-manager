@@ -1155,6 +1155,191 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
+/// Creation time of `pid`, in the host's own units. A pid alone is not an
+/// identity: the OS hands a freed pid to an unrelated process, and a parallel
+/// run spawns enough processes to win that lottery (#155). Pid plus creation
+/// time is the same pair the daemon validates before adopting a process
+/// (`platform::host::process::start_time`).
+fn process_start_time(pid: u32) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+        use windows_sys::Win32::System::Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // Safe: the handle is closed before returning and every pointer below
+        // names a live `FILETIME`.
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return None;
+            }
+            let mut creation: FILETIME = std::mem::zeroed();
+            let mut exit: FILETIME = std::mem::zeroed();
+            let mut kernel: FILETIME = std::mem::zeroed();
+            let mut user: FILETIME = std::mem::zeroed();
+            let ok = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
+            CloseHandle(handle);
+            if ok == 0 {
+                return None;
+            }
+            return Some(
+                ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64,
+            );
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Field 22 of /proc/<pid>/stat, the number the runtime record stores.
+        let stat = fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+        let rest = stat.split_once(") ")?.1;
+        rest.split_whitespace().nth(19)?.parse().ok()
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// One process instance: the pid plus the creation time the OS gave it. The pid
+/// is reused, the creation time is not, so this is what "the same process"
+/// means when a test asks whether the pre-crash instance is still around.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessInstance {
+    pid: u32,
+    /// The creation time the OS reported when this instance was captured.
+    start: Option<u64>,
+    /// The pid was already free when this instance was captured.
+    gone: bool,
+}
+
+impl ProcessInstance {
+    /// Capture the instance that owns `pid` right now. Call this before the
+    /// process may die: after death there is no creation time left to read.
+    fn capture(pid: u32) -> Self {
+        match process_start_time(pid) {
+            Some(start) => Self {
+                pid,
+                start: Some(start),
+                gone: false,
+            },
+            // No creation time: either the pid was already free (then the
+            // instance is gone for good) or the host refused to describe it.
+            None => Self {
+                pid,
+                start: None,
+                gone: !pid_alive(pid),
+            },
+        }
+    }
+
+    /// True only while *this* instance is still running. A pid that now belongs
+    /// to another process (different creation time) is not this instance, even
+    /// though [`pid_alive`] answers true.
+    fn is_alive(self) -> bool {
+        // `pid_alive` is the "is it running" gate: Windows keeps a terminated
+        // process reachable by handle (and so by pid) until the last handle
+        // closes, while tasklist already reports it as gone.
+        if self.gone || !pid_alive(self.pid) {
+            return false;
+        }
+        let Some(recorded) = self.start else {
+            // The host refused to describe the process when it was captured;
+            // pid liveness is the weaker answer that is left.
+            return true;
+        };
+        // Identity known: the same creation time is the same instance. A pid
+        // whose creation time is no longer readable is gone, and asking the pid
+        // again would race a fast recycle and blame the new owner for the old
+        // instance's exit.
+        process_start_time(self.pid) == Some(recorded)
+    }
+
+    /// True when `other` is a different instance, so a restart did replace this
+    /// one. Same pid with no comparable creation time counts as the same
+    /// instance, so a missing identity never fakes a restart.
+    fn is_replaced_by(self, other: Self) -> bool {
+        if self.gone || self.pid != other.pid {
+            return true;
+        }
+        match (self.start, other.start) {
+            (Some(old), Some(new)) => old != new,
+            _ => false,
+        }
+    }
+}
+
+/// A pid that has been reused by another process is not the pre-crash
+/// instance; this is the false red #155 reported ("the pre-crash instance is
+/// still alive"). The reuse cannot be forced, so the creation time of a live
+/// process is compared against a recorded one that belongs to a different
+/// process: `pid_alive` is true and the instance must still read as gone.
+#[test]
+fn a_reused_pid_is_not_the_old_instance() {
+    let (mut child, pid) = spawn_sleeper();
+    let live = ProcessInstance::capture(pid);
+    assert!(live.is_alive(), "a live child is the instance we captured");
+
+    // A host without a creation time has only the pid to compare, so the reuse
+    // case below cannot be stated there.
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        let start = live.start.expect("a creation time for a live child");
+        let reused = ProcessInstance {
+            pid,
+            start: Some(start.wrapping_add(1)),
+            gone: false,
+        };
+        assert!(pid_alive(pid), "the pid itself is still occupied");
+        assert!(
+            !reused.is_alive(),
+            "a different process holding pid {pid} is not the pre-crash instance"
+        );
+        assert!(live.is_replaced_by(reused));
+    }
+
+    kill_pid(pid);
+    let _ = child.wait();
+    assert!(!live.is_alive(), "a reaped child is gone");
+
+    // Release the last handle: until then Windows keeps the terminated process
+    // (and its pid) reachable. A pid that is already free at capture carries no
+    // identity, so anyone who takes it later is not the instance the test meant
+    // to watch.
+    drop(child);
+    wait_until("the pid to be freed", Duration::from_secs(5), || {
+        process_start_time(pid).is_none() && !pid_alive(pid)
+    });
+    let absent = ProcessInstance::capture(pid);
+    assert!(absent.gone, "a free pid must capture as gone: {absent:?}");
+    assert!(!absent.is_alive());
+}
+
+#[cfg(windows)]
+fn spawn_sleeper() -> (Child, u32) {
+    let child = Command::new("cmd")
+        .args(["/c", "ping", "-n", "30", "127.0.0.1"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sleeper");
+    let pid = child.id();
+    (child, pid)
+}
+
+#[cfg(unix)]
+fn spawn_sleeper() -> (Child, u32) {
+    let child = Command::new("sleep")
+        .arg("30")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sleeper");
+    let pid = child.id();
+    (child, pid)
+}
+
 fn kill_pid(pid: u32) {
     #[cfg(windows)]
     {
@@ -1590,19 +1775,26 @@ esac
         self.wait_for_state(id, "stopped", Duration::from_secs(15))
     }
 
-    fn wait_for_restart(&self, id: &str, old_pid: u64, timeout: Duration) -> Value {
+    /// Wait until a *different instance* runs. The pid alone is not enough: the
+    /// OS can hand the pre-crash pid to the new process (which would look like
+    /// "not restarted" here) or to any unrelated process (#155).
+    fn wait_for_restart(&self, id: &str, old: ProcessInstance, timeout: Duration) -> Value {
         let deadline = Instant::now() + timeout;
         loop {
             let status = self.status(id);
             let pid = status["summary"]["pid"].as_u64().unwrap_or(0);
-            if status["summary"]["state"].as_str() == Some("running") && pid != old_pid && pid > 0 {
-                return status;
+            if pid > 0 && status["summary"]["state"].as_str() == Some("running") {
+                let current = ProcessInstance::capture(pid as u32);
+                if old.is_replaced_by(current) {
+                    return status;
+                }
             }
             assert!(
                 Instant::now() < deadline,
-                "{} did not restart after pid {}: {}",
+                "{} did not restart after pid {} (start {:?}): {}",
                 id,
-                old_pid,
+                old.pid,
+                old.start,
                 status
             );
             std::thread::sleep(Duration::from_millis(25));
@@ -1630,6 +1822,7 @@ fn assert_state_matrix(sandbox: &Sandbox, id: &str, kind: &str, boot_started: bo
         sandbox.start_service(id)
     };
     let pid = running["summary"]["pid"].as_u64().expect("pid");
+    let instance = ProcessInstance::capture(pid as u32);
     assert!(pid > 0);
     assert_eq!(running["summary"]["kind"], kind, "{running}");
     assert_eq!(running["summary"]["enabled"], true, "{running}");
@@ -1637,17 +1830,28 @@ fn assert_state_matrix(sandbox: &Sandbox, id: &str, kind: &str, boot_started: bo
     assert_eq!(running["details"]["failures"], 0, "{running}");
     assert_eq!(running["summary"]["state"], "running");
 
-    // Start is idempotent while running: same pid, still one instance.
+    // Start is idempotent while running: same instance, not a replacement. Pid
+    // equality alone would miss a replacement that won the pid back.
     let again = sandbox.start_when_ready(id);
     assert_eq!(again.status.code(), Some(0));
     let same = sandbox.status(id);
     assert_eq!(same["summary"]["state"], "running");
-    assert_eq!(same["summary"]["pid"].as_u64(), Some(pid));
+    let current = ProcessInstance::capture(
+        same["summary"]["pid"].as_u64().expect("pid") as u32,
+    );
+    assert!(
+        !instance.is_replaced_by(current),
+        "start while running replaced the instance: {same}"
+    );
 
     // Stop is synchronous, idempotent, and reaps the process.
     let stopped = sandbox.stop_service(id);
     assert!(stopped["summary"]["pid"].is_null(), "{stopped}");
-    assert!(!pid_alive(pid as u32), "stopped pid {pid} is still alive");
+    assert!(
+        !instance.is_alive(),
+        "stopped instance {:?} is still alive",
+        instance
+    );
     assert_eq!(sandbox.stop(id).status.code(), Some(0));
     assert_eq!(sandbox.status(id)["summary"]["state"], "stopped");
 
@@ -1677,9 +1881,9 @@ fn assert_state_matrix(sandbox: &Sandbox, id: &str, kind: &str, boot_started: bo
 
 fn assert_crash_restart(sandbox: &Sandbox, id: &str) {
     let running = sandbox.start_service(id);
-    let pid = running["summary"]["pid"].as_u64().expect("pid");
+    let old = ProcessInstance::capture(running["summary"]["pid"].as_u64().expect("pid") as u32);
 
-    kill_pid(pid as u32);
+    kill_pid(old.pid);
     let backoff = sandbox.wait_for_state(id, "backoff", Duration::from_secs(5));
     assert!(
         backoff["details"]["failures"].as_u64().unwrap_or(0) >= 1,
@@ -1687,8 +1891,14 @@ fn assert_crash_restart(sandbox: &Sandbox, id: &str) {
     );
     assert!(!backoff["details"]["next_at"].is_null(), "{backoff}");
 
-    let restarted = sandbox.wait_for_restart(id, pid, Duration::from_secs(15));
-    assert_ne!(restarted["summary"]["pid"].as_u64(), Some(pid));
+    let restarted = sandbox.wait_for_restart(id, old, Duration::from_secs(15));
+    let current =
+        ProcessInstance::capture(restarted["summary"]["pid"].as_u64().expect("pid") as u32);
+    assert!(
+        old.is_replaced_by(current),
+        "{}: the crash restart kept the pre-crash instance: {restarted}",
+        id
+    );
     assert_eq!(restarted["summary"]["state"], "running");
     sandbox.stop_service(id);
 }
@@ -1758,12 +1968,15 @@ fn five_quick_crashes_enter_failed_and_explicit_start_resets() {
     sandbox.write_core_json("crashy");
     sandbox.start_daemon();
 
-    let mut pid = sandbox.running_pid("crashy") as u64;
+    let mut instance = ProcessInstance::capture(sandbox.running_pid("crashy"));
     for attempt in 1..=5 {
-        kill_pid(pid as u32);
+        kill_pid(instance.pid);
         if attempt < 5 {
-            let restarted = sandbox.wait_for_restart("crashy", pid, Duration::from_secs(20));
-            pid = restarted["summary"]["pid"].as_u64().expect("pid");
+            let restarted =
+                sandbox.wait_for_restart("crashy", instance, Duration::from_secs(20));
+            instance = ProcessInstance::capture(
+                restarted["summary"]["pid"].as_u64().expect("pid") as u32,
+            );
         }
     }
 
@@ -1787,8 +2000,8 @@ fn disable_keeps_the_crash_restart_policy() {
         Some(0)
     );
 
-    let pid = sandbox.running_pid("off") as u64;
-    kill_pid(pid as u32);
+    let instance = ProcessInstance::capture(sandbox.running_pid("off"));
+    kill_pid(instance.pid);
     let backoff = sandbox.wait_for_state("off", "backoff", Duration::from_secs(5));
     assert!(
         backoff["details"]["failures"].as_u64().unwrap_or(0) >= 1,
@@ -1797,7 +2010,7 @@ fn disable_keeps_the_crash_restart_policy() {
 
     // enabled only gates the boot start; the default on-failure policy still
     // brings the process back.
-    let restarted = sandbox.wait_for_restart("off", pid, Duration::from_secs(20));
+    let restarted = sandbox.wait_for_restart("off", instance, Duration::from_secs(20));
     assert_eq!(restarted["summary"]["enabled"], false, "{restarted}");
     sandbox.stop_service("off");
 }
@@ -1811,13 +2024,14 @@ fn a_never_policy_service_stops_without_restarting() {
 
     let running = sandbox.wait_for_state("once", "running", Duration::from_secs(15));
     assert_eq!(running["details"]["restart"], "never", "{running}");
-    let pid = running["summary"]["pid"].as_u64().expect("pid");
-    kill_pid(pid as u32);
+    let instance =
+        ProcessInstance::capture(running["summary"]["pid"].as_u64().expect("pid") as u32);
+    kill_pid(instance.pid);
 
     let stopped = sandbox.wait_for_state("once", "stopped", Duration::from_secs(10));
     assert!(stopped["summary"]["pid"].is_null(), "{stopped}");
     assert_eq!(stopped["details"]["failures"], 0, "{stopped}");
-    assert!(!pid_alive(pid as u32));
+    assert!(!instance.is_alive(), "{instance:?} is still alive");
 }
 
 #[test]
@@ -1841,17 +2055,17 @@ fn graceful_svcd_restart_boots_enabled_services_and_skips_disabled() {
         Some(0)
     );
 
-    let mut pids = Vec::new();
+    let mut instances = Vec::new();
     for id in ["core", "script", "plug"] {
-        pids.push(sandbox.running_pid(id) as u64);
+        instances.push(ProcessInstance::capture(sandbox.running_pid(id)));
     }
 
     sandbox.shutdown();
-    for pid in &pids {
+    for instance in &instances {
         wait_until(
-            &format!("pid {} to exit", pid),
+            &format!("instance {:?} to exit", instance),
             Duration::from_secs(10),
-            || !pid_alive(*pid as u32),
+            || !instance.is_alive(),
         );
     }
 
@@ -2059,7 +2273,7 @@ fn reload_stops_and_forgets_a_deleted_definition() {
     let mut sandbox = Sandbox::new();
     sandbox.write_core_json("gone");
     sandbox.start_daemon();
-    let pid = sandbox.running_pid("gone");
+    let instance = ProcessInstance::capture(sandbox.running_pid("gone"));
 
     fs::remove_file(sandbox.config.join("services.d").join("gone.json"))
         .expect("remove definition");
@@ -2076,7 +2290,7 @@ fn reload_stops_and_forgets_a_deleted_definition() {
     wait_until(
         "the removed service to exit",
         Duration::from_secs(15),
-        || !pid_alive(pid),
+        || !instance.is_alive(),
     );
     let status = sandbox.run_when_ready(&["status", "gone"]);
     assert_eq!(status.status.code(), Some(1));
@@ -2406,10 +2620,10 @@ fn a_stable_crash_runs_the_stop_action_before_restarting() {
     fs::write(&path, serde_json::to_vec_pretty(&value).expect("json")).expect("write definition");
 
     sandbox.start_daemon();
-    let first = sandbox.running_pid("stable");
+    let first = ProcessInstance::capture(sandbox.running_pid("stable"));
     // Cross the 10s stability window so the crash takes the Cleanup path.
     std::thread::sleep(Duration::from_secs(11));
-    kill_pid(first);
+    kill_pid(first.pid);
 
     wait_until(
         "the stop action before the respawn",
@@ -2420,8 +2634,13 @@ fn a_stable_crash_runs_the_stop_action_before_restarting() {
                 .unwrap_or(false)
         },
     );
-    let restarted = sandbox.wait_for_restart("stable", first as u64, Duration::from_secs(15));
-    assert_ne!(restarted["summary"]["pid"].as_u64(), Some(first as u64));
+    let restarted = sandbox.wait_for_restart("stable", first, Duration::from_secs(15));
+    let current =
+        ProcessInstance::capture(restarted["summary"]["pid"].as_u64().expect("pid") as u32);
+    assert!(
+        first.is_replaced_by(current),
+        "the crash restart kept the pre-crash instance: {restarted}"
+    );
     sandbox.stop_service("stable");
 }
 
@@ -2430,7 +2649,7 @@ fn restart_runs_stop_then_start_and_changes_the_pid() {
     let mut sandbox = Sandbox::new();
     sandbox.write_core_json("core");
     sandbox.start_daemon();
-    let first = sandbox.running_pid("core");
+    let first = ProcessInstance::capture(sandbox.running_pid("core"));
 
     let output = sandbox.run_when_ready(&["restart", "core"]);
     assert_eq!(
@@ -2441,13 +2660,20 @@ fn restart_runs_stop_then_start_and_changes_the_pid() {
     );
 
     let status = sandbox.wait_for_state("core", "running", Duration::from_secs(15));
-    let second = status["summary"]["pid"].as_u64().expect("pid") as u32;
-    assert_ne!(first, second, "restart kept the same pid");
+    let second =
+        ProcessInstance::capture(status["summary"]["pid"].as_u64().expect("pid") as u32);
+    // `restart` must replace the process. Pid inequality alone is the wrong
+    // check: the OS may hand the old pid to the new process, and an unrelated
+    // process may hold the old pid without being the old instance (#155).
+    assert!(
+        first.is_replaced_by(second),
+        "restart kept the pre-crash instance: {status}"
+    );
     // The old process exits asynchronously after `restart` returns. Asserting
     // `!pid_alive` immediately made a parallel full run red while the process
     // was still winding down (#153); wait for the observable end state instead.
-    wait_until("the old process to exit", Duration::from_secs(10), || {
-        !pid_alive(first)
+    wait_until("the pre-restart instance to exit", Duration::from_secs(10), || {
+        !first.is_alive()
     });
     sandbox.stop_service("core");
 }
@@ -2518,6 +2744,7 @@ fn a_stopping_record_is_finished_with_the_stop_action() {
         .spawn()
         .expect("spawn leftover");
     let pid = child.id();
+    let leftover = ProcessInstance::capture(pid);
     let starttime: u64 = {
         let stat = fs::read_to_string(format!("/proc/{}/stat", pid)).expect("stat");
         stat.split_once(") ")
@@ -2561,7 +2788,7 @@ fn a_stopping_record_is_finished_with_the_stop_action() {
     wait_until(
         "the leftover process to go away",
         Duration::from_secs(10),
-        || !pid_alive(pid),
+        || !leftover.is_alive(),
     );
     let _ = child.wait();
 }
@@ -2596,14 +2823,14 @@ fn a_definition_deleted_while_running_is_stopped_without_reload() {
     let mut sandbox = Sandbox::new();
     sandbox.write_core_json("gone");
     sandbox.start_daemon_with_env(&[("SVCD_RESCAN_INTERVAL_MS", "50")]);
-    let pid = sandbox.running_pid("gone");
+    let instance = ProcessInstance::capture(sandbox.running_pid("gone"));
 
     fs::remove_file(sandbox.config.join("services.d").join("gone.json"))
         .expect("remove definition");
     wait_until(
         "the removed service to disappear",
         Duration::from_secs(15),
-        || sandbox.run_svc(&["status", "gone"]).status.code() == Some(1) && !pid_alive(pid),
+        || sandbox.run_svc(&["status", "gone"]).status.code() == Some(1) && !instance.is_alive(),
     );
 }
 
@@ -2709,36 +2936,38 @@ fn abrupt_svcd_exit_reaps_children_and_restart_starts_one_instance() {
         Some(0)
     );
 
-    let core_pid = sandbox.running_pid("core") as u64;
-    let script_pid = sandbox.running_pid("script") as u64;
-    let plugin_pid = sandbox.running_pid("plug") as u64;
+    let core = ProcessInstance::capture(sandbox.running_pid("core"));
+    let script = ProcessInstance::capture(sandbox.running_pid("script"));
+    let plugin = ProcessInstance::capture(sandbox.running_pid("plug"));
 
     sandbox.force_kill_daemon();
 
     wait_until(
         "all children to die with svcd",
         Duration::from_secs(10),
-        || {
-            !pid_alive(core_pid as u32)
-                && !pid_alive(script_pid as u32)
-                && !pid_alive(plugin_pid as u32)
-        },
+        || !core.is_alive() && !script.is_alive() && !plugin.is_alive(),
     );
 
     sandbox.start_daemon();
-    for (id, old_pid) in [
-        ("core", core_pid),
-        ("script", script_pid),
-        ("plug", plugin_pid),
-    ] {
-        let status = sandbox.wait_for_restart(id, old_pid, Duration::from_secs(15));
+    for (id, old) in [("core", core), ("script", script), ("plug", plugin)] {
+        let status = sandbox.wait_for_restart(id, old, Duration::from_secs(15));
+        let current =
+            ProcessInstance::capture(status["summary"]["pid"].as_u64().unwrap_or(0) as u32);
+        assert!(current.pid > 0, "{status}");
+        // The pre-crash instance must be gone. The pid alone cannot say that:
+        // under a parallel run the OS hands the freed pid to an unrelated
+        // process quickly, so compare the instance identity instead (#155).
         assert!(
-            status["summary"]["pid"].as_u64().unwrap_or(0) > 0,
-            "{status}"
+            !old.is_alive(),
+            "{}: the pre-crash instance (pid {}, start {:?}) is still alive after {:?}",
+            id,
+            old.pid,
+            old.start,
+            current
         );
         assert!(
-            !pid_alive(old_pid as u32),
-            "{}: the pre-crash instance is still alive",
+            old.is_replaced_by(current),
+            "{}: the restarted daemon adopted the pre-crash instance: {status}",
             id
         );
     }
