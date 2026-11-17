@@ -39,6 +39,8 @@ const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
 const ERROR_NONE_MAPPED: i32 = 1332;
 /// `FILE_ALL_ACCESS`.
 const FULL: u32 = 0x001F_01FF;
+/// `FILE_GENERIC_READ`.
+const READ: u32 = 0x0012_0089;
 /// `FILE_GENERIC_READ | FILE_GENERIC_WRITE`.
 const READ_WRITE: u32 = 0x0012_019F;
 /// `OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE`: the directory and everything
@@ -90,6 +92,22 @@ impl Acl {
             ],
             inherit,
         )
+    }
+
+    /// System mode, machine-wide directories: SYSTEM / Administrators full,
+    /// `svcd` group read-only. The group needs read access to inspect config and
+    /// logs, but must not be able to replace `services.d` scripts or plugin
+    /// payloads that the daemon runs as SYSTEM.
+    pub(crate) fn shared_read_only(inherit: bool) -> io::Result<Self> {
+        Self::build(
+            &[
+                (Trustee::Name("SYSTEM"), FULL),
+                (Trustee::Name("Administrators"), FULL),
+                (Trustee::Name(GROUP), READ),
+            ],
+            inherit,
+        )
+        .map_err(missing_group)
     }
 
     /// User mode: SYSTEM / Administrators full, the process token's user full.
@@ -317,11 +335,31 @@ mod tests {
         );
     }
 
+    /// The default system-mode config path must land in the machine-wide tier;
+    /// otherwise the control pipe gets a private ACL and no admin can reach it.
+    #[test]
+    fn the_default_system_config_is_machine_wide() {
+        assert!(is_machine_wide(&crate::paths::platform_config_dir()));
+    }
+
     /// A host without the `svcd` group must fail with the actionable message
     /// instead of a bare Win32 error.
     #[test]
     fn the_shared_acl_explains_a_missing_group() {
         match Acl::shared(false) {
+            Ok(_) => {}
+            Err(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+                assert!(error.to_string().contains("install-service"), "{error}");
+            }
+        }
+    }
+
+    /// The directory tier resolves the same group; a host without it must get
+    /// the same actionable message.
+    #[test]
+    fn the_read_only_directory_acl_explains_a_missing_group() {
+        match Acl::shared_read_only(false) {
             Ok(_) => {}
             Err(error) => {
                 assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");

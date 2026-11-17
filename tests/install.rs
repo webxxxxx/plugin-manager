@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,15 +46,32 @@ impl Sandbox {
         self.root.join("config")
     }
 
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_svcd"))
-            .args(args)
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_svcd"));
+        command
             .env("SVCD_CONFIG_DIR", self.config_dir())
             .env("SVCD_DATA_DIR", self.data_dir())
             .env("SVCD_LOG_DIR", self.root.join("logs"))
-            .env("SVCD_TEST_UNPRIVILEGED", "1")
-            .output()
-            .expect("run svcd")
+            // Install tests pin the role instead of inheriting the runner's:
+            // CI and the WSL runbook both exercise this suite as root.
+            .env("SVCD_TEST_PRIVILEGE", "privileged")
+            .env_remove("SVCD_TEST_UNPRIVILEGED")
+            .env_remove("SVCD_USER");
+        command
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.run_with(args, |_| {})
+    }
+
+    fn run_with<F>(&self, args: &[&str], configure: F) -> Output
+    where
+        F: FnOnce(&mut Command),
+    {
+        let mut command = self.command();
+        command.args(args);
+        configure(&mut command);
+        command.output().expect("run svcd")
     }
 }
 
@@ -147,6 +164,40 @@ fn every_target_dry_run_renders_its_plan() {
             );
         }
     }
+}
+
+#[test]
+fn scm_plan_tolerates_an_existing_group_and_verifies_it_before_starting() {
+    let sandbox = Sandbox::new();
+
+    let output = sandbox.run(&["install-service", "--dry-run", "--target", "scm"]);
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    // `net.exe` reports every failure as exit 2; the Win32 code (1379,
+    // ERROR_ALIAS_EXISTS) only appears in the message. A reinstall must not
+    // fail just because the group survived the previous install, so the plan
+    // tolerates exit 2 and then proves the group exists.
+    assert!(
+        text.contains("run net localgroup svcd /add (allow exit [0, 2])"),
+        "the group add must tolerate net.exe's generic failure exit:\n{}",
+        text
+    );
+    assert!(
+        text.contains("\n  run net localgroup svcd\n"),
+        "the plan must verify the group after adding it:\n{}",
+        text
+    );
+    let add = text.find("net localgroup svcd /add").expect("group add");
+    let verify = text
+        .find("\n  run net localgroup svcd\n")
+        .expect("group verify");
+    let create = text.find("sc create").expect("service create");
+    assert!(
+        add < verify && verify < create,
+        "the group must be proven before the service is created:\n{}",
+        text
+    );
 }
 
 #[test]
@@ -287,6 +338,525 @@ fn macos_detection_defaults_to_launchd() {
 
     assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
     assert!(stdout(&output).contains("install-service plan for launchd"));
+}
+
+#[cfg(unix)]
+fn unix_user_env(command: &mut Command, home: &Path, config: &Path, data: &Path, state: &Path) {
+    command
+        .env_remove("SVCD_CONFIG_DIR")
+        .env_remove("SVCD_DATA_DIR")
+        .env_remove("SVCD_LOG_DIR")
+        .env_remove("SVCD_USER")
+        // Auto-detection: a non-root process picks user mode without SVCD_USER.
+        .env("SVCD_TEST_PRIVILEGE", "unprivileged")
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", config)
+        .env("XDG_DATA_HOME", data)
+        .env("XDG_STATE_HOME", state);
+}
+
+#[cfg(windows)]
+fn windows_user_env(command: &mut Command, appdata: &Path, localappdata: &Path) {
+    command
+        .env_remove("SVCD_CONFIG_DIR")
+        .env_remove("SVCD_DATA_DIR")
+        .env_remove("SVCD_LOG_DIR")
+        .env_remove("SVCD_USER")
+        // Auto-detection: a non-elevated process picks user mode without SVCD_USER.
+        .env("SVCD_TEST_PRIVILEGE", "unprivileged")
+        .env("APPDATA", appdata)
+        .env("LOCALAPPDATA", localappdata)
+        // Never touch the developer's HKCU PATH from a test.
+        .env("SVCD_TEST_NO_USER_PATH", "1");
+}
+
+#[cfg(windows)]
+#[test]
+fn the_service_account_and_an_elevated_admin_share_one_config_directory() {
+    let sandbox = Sandbox::new();
+    let program_data = sandbox.root.join("ProgramData");
+    let system_profile = sandbox.root.join("systemprofile");
+    let admin_profile = sandbox.root.join("adminprofile");
+    let expected = program_data.join("svcd").join("config");
+
+    let run_as = |profile: &Path| {
+        sandbox.run_with(&["--install", "--dry-run"], |command| {
+            command
+                .env_remove("SVCD_CONFIG_DIR")
+                .env_remove("SVCD_DATA_DIR")
+                .env_remove("SVCD_LOG_DIR")
+                .env("SVCD_USER", "0")
+                .env("SVCD_TEST_PRIVILEGE", "privileged")
+                .env("ProgramData", &program_data)
+                .env("USERPROFILE", profile);
+        })
+    };
+
+    for (role, output) in [
+        ("LocalSystem", run_as(&system_profile)),
+        ("Administrator", run_as(&admin_profile)),
+    ] {
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{} stderr: {}",
+            role,
+            stderr(&output)
+        );
+        assert!(
+            stdout(&output).contains(&format!("config:  {}", expected.display())),
+            "{} must use the machine-wide config:\n{}",
+            role,
+            stdout(&output)
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn unreachable_user_cli_points_at_the_machine_wide_service() {
+    let sandbox = Sandbox::new();
+    let program_data = sandbox.root.join("ProgramData");
+    let machine_config = program_data.join("svcd").join("config");
+    fs::create_dir_all(&machine_config).expect("machine config dir");
+    fs::write(machine_config.join("svcd.conf"), "bind = 127.0.0.1:0\n").expect("machine conf");
+    let appdata = sandbox.root.join("appdata");
+    fs::create_dir_all(&appdata).expect("appdata");
+    let svc = sandbox.root.join("svc.exe");
+    fs::copy(env!("CARGO_BIN_EXE_svcd"), &svc).expect("copy svc alias");
+
+    let output = Command::new(&svc)
+        .arg("list")
+        .env_remove("SVCD_CONFIG_DIR")
+        .env_remove("SVCD_DATA_DIR")
+        .env_remove("SVCD_LOG_DIR")
+        .env_remove("SVCD_USER")
+        .env("SVCD_TEST_PRIVILEGE", "unprivileged")
+        .env("ProgramData", &program_data)
+        .env("APPDATA", &appdata)
+        .output()
+        .expect("run svc list");
+
+    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
+    let errors = stderr(&output);
+    assert!(errors.contains("svcd unreachable"), "{}", errors);
+    assert!(
+        errors.contains("elevated terminal"),
+        "a non-elevated CLI must explain the machine-wide service:\n{}",
+        errors
+    );
+    assert!(
+        errors.contains("\"svcd\" group"),
+        "read-only access through the group must be mentioned:\n{}",
+        errors
+    );
+}
+
+#[test]
+fn normal_user_detection_selects_user_mode() {
+    let sandbox = Sandbox::new();
+
+    let output = sandbox.run_with(&["--install", "--dry-run"], |command| {
+        command
+            .env_remove("SVCD_USER")
+            .env("SVCD_TEST_PRIVILEGE", "unprivileged");
+    });
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("user mode install (no system service)"),
+        "a normal user must not register a system service:\n{}",
+        text
+    );
+    assert!(
+        !text.contains("service: program"),
+        "a normal user must not get a system service plan:\n{}",
+        text
+    );
+}
+
+#[test]
+fn root_detection_selects_system_mode() {
+    let sandbox = Sandbox::new();
+
+    let output = sandbox.run_with(&["--install", "--dry-run"], |command| {
+        command
+            .env_remove("SVCD_USER")
+            .env("SVCD_TEST_PRIVILEGE", "privileged");
+    });
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("service: program"),
+        "root installs the system service:\n{}",
+        text
+    );
+    assert!(
+        !text.contains("user mode install"),
+        "root must not fall back to user mode:\n{}",
+        text
+    );
+}
+
+#[test]
+fn svcd_user_overrides_the_detected_role_both_ways() {
+    let sandbox = Sandbox::new();
+
+    let forced_user = sandbox.run_with(&["--install", "--dry-run"], |command| {
+        command
+            .env("SVCD_USER", "1")
+            .env("SVCD_TEST_PRIVILEGE", "privileged");
+    });
+    assert_eq!(
+        forced_user.status.code(),
+        Some(0),
+        "{}",
+        stderr(&forced_user)
+    );
+    assert!(
+        stdout(&forced_user).contains("user mode install (no system service)"),
+        "SVCD_USER=1 must force user mode for an Administrator:\n{}",
+        stdout(&forced_user)
+    );
+
+    let forced_system = sandbox.run_with(&["--install", "--dry-run"], |command| {
+        command
+            .env("SVCD_USER", "0")
+            .env("SVCD_TEST_PRIVILEGE", "unprivileged");
+    });
+    assert_eq!(
+        forced_system.status.code(),
+        Some(0),
+        "{}",
+        stderr(&forced_system)
+    );
+    assert!(
+        stdout(&forced_system).contains("service: program"),
+        "SVCD_USER=0 must plan the system install:\n{}",
+        stdout(&forced_system)
+    );
+}
+
+#[test]
+fn system_install_is_refused_for_a_normal_user() {
+    let sandbox = Sandbox::new();
+    let prefix = sandbox.root.join("system-prefix");
+
+    let output = sandbox.run_with(
+        &[
+            "--install",
+            "--prefix",
+            prefix.to_str().expect("utf8"),
+            "--no-service",
+        ],
+        |command| {
+            command
+                .env("SVCD_USER", "0")
+                .env("SVCD_TEST_PRIVILEGE", "unprivileged");
+        },
+    );
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("requires root / Administrator"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        !prefix.exists(),
+        "the refused install must not create {}",
+        prefix.display()
+    );
+    assert!(
+        !sandbox.config_dir().exists(),
+        "the refused install must not write config"
+    );
+}
+
+#[test]
+fn system_uninstall_is_refused_for_a_normal_user() {
+    let sandbox = Sandbox::new();
+    let prefix = sandbox.root.join("system-prefix");
+    fs::create_dir_all(&prefix).expect("create prefix");
+    let binary = prefix.join(executable_name());
+    fs::write(&binary, "installed").expect("seed installed binary");
+
+    let output = sandbox.run_with(
+        &[
+            "--uninstall",
+            "--prefix",
+            prefix.to_str().expect("utf8"),
+            "--no-service",
+        ],
+        |command| {
+            command
+                .env("SVCD_USER", "0")
+                .env("SVCD_TEST_PRIVILEGE", "unprivileged");
+        },
+    );
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("--uninstall requires root / Administrator"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        binary.is_file(),
+        "the refused uninstall must leave the binary in place"
+    );
+}
+
+#[test]
+fn service_actions_are_refused_for_a_normal_user() {
+    let sandbox = Sandbox::new();
+    let target = if cfg!(windows) { "scm" } else { "systemd" };
+
+    for action in ["install-service", "uninstall-service"] {
+        let output = sandbox.run_with(&[action, "--target", target], |command| {
+            command
+                .env("SVCD_USER", "0")
+                .env("SVCD_TEST_PRIVILEGE", "unprivileged");
+        });
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{} stderr: {}",
+            action,
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains(&format!("{} requires root / Administrator", action)),
+            "{} stderr: {}",
+            action,
+            stderr(&output)
+        );
+    }
+}
+
+#[test]
+fn user_dry_run_reports_the_profile_paths_without_writing() {
+    let sandbox = Sandbox::new();
+
+    #[cfg(unix)]
+    let config = sandbox.root.join("xdg-config");
+    #[cfg(unix)]
+    let data = sandbox.root.join("xdg-data");
+    #[cfg(unix)]
+    let state = sandbox.root.join("xdg-state");
+    #[cfg(unix)]
+    let home = sandbox.root.join("home");
+    #[cfg(unix)]
+    fs::create_dir_all(&home).expect("create home");
+
+    #[cfg(windows)]
+    let appdata = sandbox.root.join("appdata");
+    #[cfg(windows)]
+    let localappdata = sandbox.root.join("localappdata");
+
+    let output = sandbox.run_with(&["--install", "--dry-run"], |command| {
+        #[cfg(unix)]
+        unix_user_env(command, &home, &config, &data, &state);
+        #[cfg(windows)]
+        windows_user_env(command, &appdata, &localappdata);
+    });
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("user mode install (no system service)"),
+        "{}",
+        text
+    );
+    assert!(
+        text.contains("service: skipped (user mode; use svcd user start or systemd --user)"),
+        "{}",
+        text
+    );
+    #[cfg(unix)]
+    {
+        assert!(
+            text.contains(&format!(
+                "path:    add {} to shell profile",
+                data.join("svcd/bin").display()
+            )),
+            "{}",
+            text
+        );
+        assert!(
+            !data.join("svcd").exists() && !config.join("svcd").exists(),
+            "dry run created user state"
+        );
+    }
+    #[cfg(windows)]
+    {
+        assert!(
+            text.contains(&format!(
+                "path:    add {} to HKCU",
+                localappdata.join("svcd").join("bin").display()
+            )),
+            "{}",
+            text
+        );
+        assert!(
+            !localappdata.join("svcd").exists() && !appdata.join("svcd").exists(),
+            "dry run created user state"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_user_install_stays_in_the_profile_and_uninstall_removes_it() {
+    let sandbox = Sandbox::new();
+    let home = sandbox.root.join("home");
+    let config = sandbox.root.join("xdg-config");
+    let data = sandbox.root.join("xdg-data");
+    let state = sandbox.root.join("xdg-state");
+    fs::create_dir_all(&home).expect("create home");
+    let profile = home.join(".profile");
+    fs::write(&profile, "# user profile\n").expect("seed profile");
+    let install_root = data.join("svcd").join("bin");
+
+    let installed = sandbox.run_with(&["--install", "--no-service"], |command| {
+        unix_user_env(command, &home, &config, &data, &state);
+    });
+    assert_eq!(installed.status.code(), Some(0), "{}", stderr(&installed));
+    let printed = stdout(&installed);
+    assert!(
+        printed.contains(&format!(
+            "svcd installed (user mode): {}",
+            install_root.join("svcd").display()
+        )),
+        "{}",
+        printed
+    );
+    assert!(
+        printed.contains("service: not installed (--no-service)"),
+        "user install must not register a service:\n{}",
+        printed
+    );
+    assert!(install_root.join("svcd").is_file());
+    for alias in ["svc", "plugin", "mcp"] {
+        assert!(
+            install_root.join(alias).is_file(),
+            "alias {} missing",
+            alias
+        );
+    }
+    assert!(
+        config.join("svcd").join("svcd.conf").is_file(),
+        "user config missing"
+    );
+    let profile_text = fs::read_to_string(&profile).expect("read profile");
+    assert!(
+        profile_text.contains("# svcd user path")
+            && profile_text.contains(&install_root.display().to_string()),
+        "profile must export the user bin directory:\n{}",
+        profile_text
+    );
+    assert!(
+        !sandbox.data_dir().exists() && !sandbox.config_dir().exists(),
+        "user install must ignore the system directories"
+    );
+
+    let removed = sandbox.run_with(&["--uninstall", "--no-service", "--purge"], |command| {
+        unix_user_env(command, &home, &config, &data, &state);
+    });
+    assert_eq!(removed.status.code(), Some(0), "{}", stderr(&removed));
+    assert!(!install_root.join("svcd").exists(), "binary left behind");
+    for alias in ["svc", "plugin", "mcp"] {
+        assert!(
+            !install_root.join(alias).exists(),
+            "alias {} left behind",
+            alias
+        );
+    }
+    let profile_text = fs::read_to_string(&profile).expect("read profile");
+    assert!(
+        !profile_text.contains("# svcd user path"),
+        "uninstall must remove the PATH block:\n{}",
+        profile_text
+    );
+    assert!(
+        !config.join("svcd").exists() && !data.join("svcd").exists(),
+        "purge left user config/data behind"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_user_install_stays_in_localappdata_and_uninstall_removes_it() {
+    let sandbox = Sandbox::new();
+    let appdata = sandbox.root.join("appdata");
+    let localappdata = sandbox.root.join("localappdata");
+    let install_root = localappdata.join("svcd").join("bin");
+
+    let installed = sandbox.run_with(&["--install", "--no-service"], |command| {
+        windows_user_env(command, &appdata, &localappdata);
+    });
+    assert_eq!(installed.status.code(), Some(0), "{}", stderr(&installed));
+    let printed = stdout(&installed);
+    assert!(
+        printed.contains(&format!(
+            "svcd installed (user mode): {}",
+            install_root.join("svcd.exe").display()
+        )),
+        "{}",
+        printed
+    );
+    assert!(
+        printed.contains("service: not installed (--no-service)"),
+        "user install must not register a service:\n{}",
+        printed
+    );
+    assert!(
+        printed.contains("path: skipped (test hook)"),
+        "the test must not edit the host PATH:\n{}",
+        printed
+    );
+    for name in [
+        "svcd.exe",
+        "svc.exe",
+        "plugin.exe",
+        "mcp.exe",
+        "uninstall.exe",
+    ] {
+        assert!(
+            install_root.join(name).is_file(),
+            "{} missing from {}",
+            name,
+            install_root.display()
+        );
+    }
+    assert!(
+        appdata.join("svcd").join("svcd.conf").is_file(),
+        "user config missing under %APPDATA%"
+    );
+    assert!(
+        !sandbox.data_dir().exists() && !sandbox.config_dir().exists(),
+        "user install must ignore the system directories"
+    );
+
+    let removed = sandbox.run_with(&["--uninstall", "--no-service"], |command| {
+        windows_user_env(command, &appdata, &localappdata);
+    });
+    assert_eq!(removed.status.code(), Some(0), "{}", stderr(&removed));
+    for name in [
+        "svcd.exe",
+        "svc.exe",
+        "plugin.exe",
+        "mcp.exe",
+        "uninstall.exe",
+    ] {
+        assert!(
+            !install_root.join(name).exists(),
+            "{} left behind by uninstall",
+            name
+        );
+    }
 }
 
 #[test]

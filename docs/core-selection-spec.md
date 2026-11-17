@@ -92,7 +92,7 @@
 - `id` 不能是 `svc`（保留给内置 core），且不能与 plugin id 冲突；冲突时 plugin 安装拒绝、core 定义加载拒绝。
 - `<config>/services.d/<id>.disabled` 存在时该 core 服务 `enabled=false`：开机不自启、崩溃后不按退避自动重启；`svc enable/disable` 维护这个 sidecar，显式 `svc start` 仍然可用。
 - **core 不接受 `capabilities`**：core 是生命周期单元，不参与 `tools/call`；定义里出现该字段即拒绝加载。能力面只属于 plugin。
-- `<config>` 指平台配置目录（Linux `/etc/svcd`、macOS `/Library/Application Support/svcd/config`、Windows `%USERPROFILE%\.svcd`）；`svcd.conf` 的 `config_dir` 可覆盖，`SVCD_CONFIG_DIR` 再覆盖，供测试与非 root 开发使用。`svcd.conf` 和 `trust.d` 都在这个目录。
+- `<config>` 指平台配置目录（Linux `/etc/svcd`、macOS `/Library/Application Support/svcd/config`、Windows `%ProgramData%\svcd\config`）；user mode 的非 root 进程改用用户目录（Windows `%APPDATA%\svcd`）。`svcd.conf` 的 `config_dir` 可覆盖，`SVCD_CONFIG_DIR` 再覆盖，供测试与非 root 开发使用。`svcd.conf` 和 `trust.d` 都在这个目录。
 - `<logs>` 指平台日志目录（Linux `/var/log/svcd`、macOS `/Library/Logs/svcd`、Windows `%ProgramData%\svcd\logs`）；`SVCD_LOG_DIR` 可覆盖，供测试与非 root 开发使用。
 - core 与 plugin 走同一监督器、同一 stdio NDJSON、同一依赖图、同一日志 / 状态；`svc list/status/start/stop/logs` 对两者一致；`install/uninstall/import/export/editconfig` 只对 plugin。
 
@@ -187,7 +187,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 | | Linux | macOS | Windows |
 | --- | --- | --- | --- |
 | data | `/var/lib/svcd` | `/Library/Application Support/svcd` | `%ProgramData%\svcd` |
-| config | `/etc/svcd` | `/Library/Application Support/svcd/config` | `%USERPROFILE%\.svcd` |
+| config | `/etc/svcd` | `/Library/Application Support/svcd/config` | `%ProgramData%\svcd\config` |
 | logs | `/var/log/svcd` | `/Library/Logs/svcd` | `%ProgramData%\svcd\logs` |
 
 - 版本目录 `<data>/plugins/<id>/<version>/` 保留包内布局；`<id>/current` 是版本号文本、`<id>/enabled` 是标记。

@@ -5,11 +5,28 @@
 //! `SVCD_TEST_UNPRIVILEGED` keeps the debug-build escape hatch the self-install
 //! tests rely on.
 
+/// Debug-build seam that pins the role so install tests are deterministic on
+/// runners that happen to be root/Administrator (or not). `SVCD_TEST_UNPRIVILEGED`
+/// stays as the legacy "skip the privilege check" bypass.
+#[cfg(debug_assertions)]
+fn test_privilege() -> Option<bool> {
+    match std::env::var("SVCD_TEST_PRIVILEGE").ok().as_deref() {
+        Some("privileged") => Some(true),
+        Some("unprivileged") => Some(false),
+        _ => None,
+    }
+}
+
 #[cfg(unix)]
 pub fn is_privileged() -> bool {
     #[cfg(debug_assertions)]
-    if std::env::var_os("SVCD_TEST_UNPRIVILEGED").is_some() {
-        return true;
+    {
+        if let Some(privileged) = test_privilege() {
+            return privileged;
+        }
+        if std::env::var_os("SVCD_TEST_UNPRIVILEGED").is_some() {
+            return true;
+        }
     }
     unsafe { libc::geteuid() == 0 }
 }
@@ -17,8 +34,13 @@ pub fn is_privileged() -> bool {
 #[cfg(windows)]
 pub fn is_privileged() -> bool {
     #[cfg(debug_assertions)]
-    if std::env::var_os("SVCD_TEST_UNPRIVILEGED").is_some() {
-        return true;
+    {
+        if let Some(privileged) = test_privilege() {
+            return privileged;
+        }
+        if std::env::var_os("SVCD_TEST_UNPRIVILEGED").is_some() {
+            return true;
+        }
     }
     use std::mem::size_of;
     use std::ptr::null_mut;
@@ -50,5 +72,9 @@ pub fn is_privileged() -> bool {
 
 #[cfg(not(any(unix, windows)))]
 pub fn is_privileged() -> bool {
+    #[cfg(debug_assertions)]
+    if let Some(privileged) = test_privilege() {
+        return privileged;
+    }
     false
 }

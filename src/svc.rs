@@ -279,6 +279,7 @@ fn list() -> i32 {
         }
         Err(ListError::Unreachable(error)) => {
             eprintln!("svc: svcd unreachable: {}", error);
+            explain_unreachable();
             EXIT_DAEMON_UNREACHABLE
         }
         Err(ListError::Daemon(message)) => {
@@ -286,6 +287,42 @@ fn list() -> i32 {
             EXIT_SERVICE_ERROR
         }
     }
+}
+
+/// A user-mode CLI cannot open the machine-wide control pipe: the pipe name
+/// hashes the config directory, and the SCM service uses the machine-wide one.
+/// The pipe ACL is the real gate (Administrators only become effective after
+/// elevation; the `svcd` group is the read-only tier), so point at that instead
+/// of leaving "pipe is not available" unexplained.
+fn explain_unreachable() {
+    if std::env::var_os("SVCD_CONFIG_DIR").is_some() {
+        return;
+    }
+    let machine = crate::paths::platform_config_dir();
+    if machine == paths::config_dir() || !machine_wide_install_present(&machine) {
+        return;
+    }
+    if cfg!(windows) {
+        eprintln!(
+            "svc: hint: a machine-wide svcd is installed at {}; run this command from an elevated terminal, or add your account to the \"svcd\" group for read-only commands",
+            machine.display()
+        );
+    } else {
+        eprintln!(
+            "svc: hint: a machine-wide svcd is installed at {}; run this command as root",
+            machine.display()
+        );
+    }
+}
+
+/// A non-elevated administrator cannot read the protected machine-wide config
+/// directory after hardening, so also accept its visible parent (`%ProgramData%\svcd`),
+/// which the installer and service both create.
+fn machine_wide_install_present(machine: &Path) -> bool {
+    if machine.join("svcd.conf").is_file() {
+        return true;
+    }
+    cfg!(windows) && machine.parent().is_some_and(|parent| parent.is_dir())
 }
 
 /// A live listing failed. An unreachable daemon is an environment problem (exit
@@ -320,6 +357,7 @@ fn show_status(id: &str, json: bool) -> i32 {
         Ok(response) => response,
         Err(error) => {
             eprintln!("svc: svcd unreachable: {}", error);
+            explain_unreachable();
             return EXIT_DAEMON_UNREACHABLE;
         }
     };
@@ -365,6 +403,7 @@ fn daemon_command(verb: DaemonVerb, id: &str) -> i32 {
         },
         Err(error) => {
             eprintln!("svc: svcd unreachable: {}", error);
+            explain_unreachable();
             EXIT_DAEMON_UNREACHABLE
         }
     }

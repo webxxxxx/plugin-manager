@@ -155,8 +155,19 @@ Windows 保留副本（建符号链接需要权限）。`tests/cli.rs` 对并发
 `SVCD_RUN_DIR`（进程级 env + 全局缓存会让并行测试互相踩）。CI 仍用 `--test-threads=1`，本地并行
 跑全量时若看到这些类别失败，先按本节判断是不是环境噪声。
 
+### 安装测试的角色与宿主隔离
+
+`tests/install.rs` 不能假设 runner 的真实身份（CI 是普通用户，WSL runbook 是 root），也不能改宿主的 PATH：
+
+- `SVCD_TEST_PRIVILEGE=privileged|unprivileged`（仅 debug）固定 root / Administrator 判断，覆盖普通用户被拒绝系统安装、管理员走系统安装两条路径；`SVCD_TEST_UNPRIVILEGED` 只作为旧的“跳过权限检查”绕过保留。
+- 用户模式的默认目录用 `HOME` / `XDG_*`（Unix）或 `APPDATA` / `LOCALAPPDATA`（Windows）重定向到 sandbox；Unix 用临时 `HOME` 验证 `.profile` 的 PATH 块在安装时写入、卸载时删除。
+- 系统模式的 Windows 配置目录用 `ProgramData` / `USERPROFILE` 重定向；`the_service_account_and_an_elevated_admin_share_one_config_directory` 断言 LocalSystem 视图与管理员视图解析出同一个 `%ProgramData%\svcd\config`，因为控制管道名就是配置目录的哈希。
+- Windows 用户安装会写 `HKCU\Environment\Path`；测试设置 `SVCD_TEST_NO_USER_PATH=1` 跳过，避免污染开发者环境。
+- SCM 的 `net localgroup svcd /add` 用退出码 2 表示“已存在”，Win32 1379 只在消息里；计划先容忍 2，再跑一次 `net localgroup svcd` 证明组确实存在。`tests/install.rs` 与 `install::tests` 都锁住这组顺序。
+
 ### 异步等待与失败诊断
 
+- Windows 控制通道是每连接线程；`svcd.shutdown` 的回复可能与进程退出竞态而丢失，CLI 只读到 EOF。`daemon::shutdown_inner` 把 EOF / reset / broken pipe 当作 stop 成功（守护进程已退出），`tests/support::stop_daemon` 也允许请求失败但进程干净退出；只有管道根本建不起来才算 unreachable。
 - `tests/http.rs` 的 `wait_until` 在超时时会打印 daemon log 和调用方提供的诊断（例如 stalled socket 上已到达的响应）；新增等待 helper 必须走它，不要写裸 `sleep` + `panic!`。跨 sandbox 共用的有界等待放在 `tests/support/mod.rs`（`wait_for_exit` / `run_bounded` / `stop_daemon`），它们同样在超时时带 daemon log；新增等待先看这两处有没有现成的。
 - 四个集成 sandbox 的停止等待共用 `tests/support/mod.rs`（`stop_daemon` / `run_bounded` / `wait_for_exit`）：shutdown 请求本身与等待 daemon 退出都受 `STOP_TIMEOUT`（默认 10 s）约束，超时 kill + reap，错误里带请求结果与 daemon log 尾部，不再用无上限的 `child.wait()`。它**返回错误**而不是 panic（`Drop` 用 `report_stop` 包装）：可能跑在 unwind 里，二次 panic 会 abort 并掩盖原始失败。
 - 不要在转瞬即逝的中间状态上做轮询断言（例如 staging 刚创建就因 `already installed` 被删除）；先让触发路径确定（加 `force=true`、补完 body），或直接断言最终的结束状态。

@@ -10,7 +10,8 @@ pub(crate) use crate::platform::host::dirs::platform_config_dir;
 /// token. `SVCD_CONFIG_DIR` overrides it for tests; otherwise `config_dir` in
 /// the loaded `svcd.conf` wins over the platform default.
 /// Production defaults are `/etc/svcd`, `/Library/Application Support/svcd/config`
-/// and `%USERPROFILE%\.svcd`; a non-root process defaults to its user profile.
+/// and `%ProgramData%\svcd\config`; a non-root process defaults to its user
+/// profile (`%APPDATA%\svcd` on Windows).
 pub fn config_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("SVCD_CONFIG_DIR") {
         return PathBuf::from(dir);

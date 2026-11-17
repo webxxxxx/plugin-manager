@@ -40,6 +40,8 @@ Windows：
 
 `SVCD_CONFIG_DIR`、`SVCD_DATA_DIR`、`SVCD_LOG_DIR` 仍可覆盖。
 
+系统模式（管理员安装）使用 `%ProgramData%\svcd\config`，由 LocalSystem 服务和提升的 CLI 共用；上表的 `%APPDATA%\svcd` 只属于当前用户的 user mode 实例。两者互不可见，`svc list` 管理系统服务需要提升的终端，或加入 `svcd` 组走只读档。
+
 ## 安装与启动
 
 在非 root 账户下：

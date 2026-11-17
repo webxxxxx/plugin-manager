@@ -661,7 +661,11 @@ fn scm_install(layout: &Layout) -> Vec<Op> {
     );
     vec![
         // The read endpoint is shared with this group, so it must exist before
-        // the daemon binds. 1379: ERROR_ALIAS_EXISTS — a reinstall converges.
+        // the daemon binds. `net.exe` exits 2 for every failure; 1379
+        // (ERROR_ALIAS_EXISTS) only appears in the message, so a reinstall
+        // cannot key off the exit code alone. Tolerate exit 2 here and prove
+        // the group below: a real failure (access denied, no SAM) still fails
+        // the verify step and aborts before the service is created.
         Op::Run {
             argv: vec![
                 "net".into(),
@@ -669,7 +673,11 @@ fn scm_install(layout: &Layout) -> Vec<Op> {
                 SCM_GROUP.into(),
                 "/add".into(),
             ],
-            allow_codes: Some(vec![0, 1379]),
+            allow_codes: Some(vec![0, 2]),
+        },
+        Op::Run {
+            argv: vec!["net".into(), "localgroup".into(), SCM_GROUP.into()],
+            allow_codes: Some(vec![0]),
         },
         Op::Run {
             argv: vec![
@@ -1778,6 +1786,19 @@ fn remove_user_path(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(changed)
 }
 
+/// Debug-build seam: a user-mode install edits the profile of whoever runs the
+/// tests (HKCU PATH on Windows, shell profiles on Unix). Tests that only assert
+/// the installed files set this to keep the host profile untouched.
+#[cfg(debug_assertions)]
+fn user_path_update_skipped() -> bool {
+    std::env::var_os("SVCD_TEST_NO_USER_PATH").is_some()
+}
+
+#[cfg(not(debug_assertions))]
+fn user_path_update_skipped() -> bool {
+    false
+}
+
 fn self_install_user(request: SelfRequest) -> i32 {
     let runtime = RuntimeDirs {
         config: std::env::var_os("SVCD_CONFIG_DIR")
@@ -1917,24 +1938,36 @@ fn self_install_user(request: SelfRequest) -> i32 {
         }
     }
     #[cfg(windows)]
-    match add_user_path(&install_root) {
-        Ok(true) => println!("path: added {} to the user PATH", install_root.display()),
-        Ok(false) => println!(
-            "path: {} is already in the user PATH",
-            install_root.display()
-        ),
-        Err(error) => eprintln!("svcd: could not update the user PATH: {}", error),
+    {
+        if user_path_update_skipped() {
+            println!("path: skipped (test hook)");
+        } else {
+            match add_user_path(&install_root) {
+                Ok(true) => println!("path: added {} to the user PATH", install_root.display()),
+                Ok(false) => println!(
+                    "path: {} is already in the user PATH",
+                    install_root.display()
+                ),
+                Err(error) => eprintln!("svcd: could not update the user PATH: {}", error),
+            }
+        }
     }
     #[cfg(unix)]
-    match add_user_path(&install_root) {
-        Ok(files) => {
-            let names: Vec<String> = files
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect();
-            println!("path: updated {}", names.join(", "));
+    {
+        if user_path_update_skipped() {
+            println!("path: skipped (test hook)");
+        } else {
+            match add_user_path(&install_root) {
+                Ok(files) => {
+                    let names: Vec<String> = files
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect();
+                    println!("path: updated {}", names.join(", "));
+                }
+                Err(error) => eprintln!("svcd: could not update the shell PATH: {}", error),
+            }
         }
-        Err(error) => eprintln!("svcd: could not update the shell PATH: {}", error),
     }
     if let Some(launcher) = &launcher {
         if let Err(error) = write_file(launcher, &daemon_launcher(&target, &runtime), 0o755) {
@@ -2190,25 +2223,39 @@ fn self_uninstall_user(request: SelfRequest, stop_daemon: &dyn Fn()) -> i32 {
         }
     }
     #[cfg(windows)]
-    match remove_user_path(&install_root) {
-        Ok(true) => println!(
-            "path: removed {} from the user PATH",
-            install_root.display()
-        ),
-        Ok(false) => {}
-        Err(error) => eprintln!("svcd: warning: could not update the user PATH: {}", error),
+    {
+        if user_path_update_skipped() {
+            println!("path: skipped (test hook)");
+        } else {
+            match remove_user_path(&install_root) {
+                Ok(true) => println!(
+                    "path: removed {} from the user PATH",
+                    install_root.display()
+                ),
+                Ok(false) => {}
+                Err(error) => eprintln!("svcd: warning: could not update the user PATH: {}", error),
+            }
+        }
     }
     #[cfg(unix)]
-    match remove_user_path(&install_root) {
-        Ok(files) if !files.is_empty() => {
-            let names: Vec<String> = files
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect();
-            println!("path: removed from {}", names.join(", "));
+    {
+        if user_path_update_skipped() {
+            println!("path: skipped (test hook)");
+        } else {
+            match remove_user_path(&install_root) {
+                Ok(files) if !files.is_empty() => {
+                    let names: Vec<String> = files
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect();
+                    println!("path: removed from {}", names.join(", "));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("svcd: warning: could not update the shell PATH: {}", error)
+                }
+            }
         }
-        Ok(_) => {}
-        Err(error) => eprintln!("svcd: warning: could not update the shell PATH: {}", error),
     }
     let launcher = install_root.join(launcher_name());
     let _ = fs::remove_file(launcher);
@@ -2969,6 +3016,34 @@ mod tests {
             &plan,
             &["launchctl", "kickstart", "-k", "system/com.webxxxxx.svcd"]
         ));
+    }
+
+    #[test]
+    fn scm_plan_tolerates_net_exit_two_then_proves_the_group() {
+        // `net.exe` returns 2 both for "already exists" (1379) and for real
+        // failures, so the plan cannot stop at the add; the verify op is what
+        // keeps a refused group creation from reaching `sc create`.
+        let plan = install_plan(Target::Scm, &layout());
+        let group: Vec<&Op> = plan
+            .ops
+            .iter()
+            .filter(|op| matches!(op, Op::Run { argv, .. } if argv.first().map(String::as_str) == Some("net")))
+            .collect();
+        assert_eq!(group.len(), 2, "{group:?}");
+        match group[0] {
+            Op::Run { argv, allow_codes } => {
+                assert_eq!(argv, &["net", "localgroup", SCM_GROUP, "/add"]);
+                assert_eq!(allow_codes.as_deref(), Some(&[0, 2][..]));
+            }
+            _ => unreachable!("filtered Run"),
+        }
+        match group[1] {
+            Op::Run { argv, allow_codes } => {
+                assert_eq!(argv, &["net", "localgroup", SCM_GROUP]);
+                assert_eq!(allow_codes.as_deref(), Some(&[0][..]));
+            }
+            _ => unreachable!("filtered Run"),
+        }
     }
 
     #[test]
