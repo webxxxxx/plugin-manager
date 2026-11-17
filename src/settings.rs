@@ -120,7 +120,7 @@ pub fn current() -> Result<&'static Settings, String> {
                     return load_from(&path);
                 }
             }
-            load(&crate::paths::default_config_dir())
+            load(&crate::platform::host::dirs::default_config_dir())
         })
         .as_ref()
         .map_err(Clone::clone)
