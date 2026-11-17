@@ -109,6 +109,11 @@ node tools/check.mjs quick
 node tools/check.mjs test <filter>
 node tools/check.mjs full
 
+# 跨平台编译（Windows 宿主机必须跑一次：`cfg(unix)` 的代码在本机根本不编译，
+# quick/full 全绿不代表 Linux 能编；默认 target 与 CI 的 musl job 一致）
+node tools/check.mjs cross                   # x86_64-unknown-linux-musl
+node tools/check.mjs cross <target>
+
 # 原始 cargo（需要完整输出时）
 cargo test
 MEM_LEVEL=low cargo test --bin svcd limits::tests -- --test-threads=1
