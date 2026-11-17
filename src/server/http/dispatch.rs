@@ -155,9 +155,10 @@ pub fn dispatch_blocking_now(
     // The Windows fallback has no pool token, but the control round trip still
     // needs the same bound. The Unix loop stamps the deadline itself when it
     // hands the job to the pool.
-    let request = request.with_control_deadline(
+    let request = request.with_control_budget(
         Instant::now(),
         crate::limits::current().control_timeout,
+        None,
     );
     dispatch_now(face, route, request, Dispatch::Blocking)
 }

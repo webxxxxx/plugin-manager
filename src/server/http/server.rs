@@ -769,11 +769,11 @@ impl Server {
                     // Stamp the budget when the job actually starts, not when
                     // it was queued: time spent behind another job is not part
                     // of this route's control round trip.
-                    let mut request = face_request.with_control_deadline(
+                    let request = face_request.with_control_budget(
                         Instant::now(),
                         crate::limits::current().control_timeout,
+                        Some(cancel),
                     );
-                    request.cancel = Some(cancel);
                     face.handle(request, done);
                 };
                 match self.blocking.try_submit(connection.id, job) {

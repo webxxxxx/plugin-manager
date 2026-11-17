@@ -301,31 +301,47 @@ where
 {
     let token = read_token(config)?;
     let mut stream = acquire(config)?;
-    let line = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": params,
-        "auth": token,
-    })
-    .to_string();
+    let line = request_line(method, params, token);
     ipc::write_frame_limit(&mut stream, &line, ipc::LOCAL_FRAME_MAX)?;
 
     let mut reader = BufReader::new(stream);
     loop {
         let line = ipc::read_frame_limit(&mut reader, ipc::LOCAL_FRAME_MAX)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "empty response frame"))?;
-        let value: serde_json::Value = serde_json::from_str(&line)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if value.get("method").is_some() && value.get("id").is_none() {
-            on_notification(&line);
-            continue;
+        match response_from_line(&line)? {
+            Some(response) => {
+                release(config, reader.into_inner());
+                return Ok(response);
+            }
+            None => on_notification(&line),
         }
-        let response = serde_json::from_value(value)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        release(config, reader.into_inner());
-        return Ok(response);
     }
+}
+
+/// The one control-channel request envelope. The local channel always uses id 1
+/// and carries the management token; only the read side varies by budget.
+fn request_line(method: &str, params: serde_json::Value, token: String) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+        "auth": token,
+    })
+    .to_string()
+}
+
+/// Parse one response frame. `None` is an interim notification (no id) that the
+/// caller may forward or ignore; `Some` is the final response.
+fn response_from_line(line: &str) -> io::Result<Option<crate::rpc::Response>> {
+    let value: serde_json::Value = serde_json::from_str(line)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if value.get("method").is_some() && value.get("id").is_none() {
+        return Ok(None);
+    }
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 /// How long one control read waits before the caller re-checks its deadline
@@ -352,14 +368,7 @@ pub fn request_within<C: Fn() -> bool>(
 ) -> io::Result<crate::rpc::Response> {
     let token = read_token(config)?;
     let mut stream = acquire(config)?;
-    let line = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": params,
-        "auth": token,
-    })
-    .to_string();
+    let line = request_line(method, params, token);
     ipc::write_frame_limit(&mut stream, &line, ipc::LOCAL_FRAME_MAX)?;
 
     let mut reader = ipc::FrameReader::new(BufReader::new(stream));
@@ -401,13 +410,11 @@ pub fn request_within<C: Fn() -> bool>(
             }
             Err(error) => return Err(error.into()),
         };
-        let value: serde_json::Value = serde_json::from_str(&line)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if value.get("method").is_some() && value.get("id").is_none() {
+        let Some(response) = response_from_line(&line)? else {
+            // The management routes do not consume interim notifications; they
+            // still share the frame parser so a protocol change cannot drift.
             continue;
-        }
-        let response = serde_json::from_value(value)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        };
         release(config, reader.into_inner().into_inner());
         return Ok(response);
     }
@@ -713,11 +720,11 @@ mod imp {
 }
 
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
+    use super::imp::Listener;
     use super::*;
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
+    use std::io::Write;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -736,18 +743,22 @@ mod tests {
         directory
     }
 
-    fn listener(config: &Path) -> UnixListener {
-        UnixListener::bind(config.join("svcd.sock")).expect("listener")
+    fn listener(config: &Path) -> Listener {
+        Listener::bind(config).expect("listener")
     }
 
     /// A supervisor that never answers must not hold the worker: the request
     /// returns TimedOut at the deadline and the socket is not pooled.
     #[test]
-    fn a_silent_socket_hits_the_control_deadline() {
+    fn a_silent_control_channel_hits_the_deadline() {
         let config = config_dir("silent");
         let listener = listener(&config);
         let server = std::thread::spawn(move || {
-            let (_stream, _) = listener.accept().expect("accept");
+            let _stream = listener
+                .incoming()
+                .next()
+                .expect("accept")
+                .expect("stream");
             std::thread::sleep(Duration::from_secs(2));
         });
 
@@ -786,7 +797,11 @@ mod tests {
         let config = config_dir("cancel");
         let listener = listener(&config);
         let server = std::thread::spawn(move || {
-            let (_stream, _) = listener.accept().expect("accept");
+            let _stream = listener
+                .incoming()
+                .next()
+                .expect("accept")
+                .expect("stream");
             std::thread::sleep(Duration::from_secs(2));
         });
 
@@ -823,139 +838,6 @@ mod tests {
         let config = config_dir("partial");
         let listener = listener(&config);
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
-            let mut line = String::new();
-            reader.read_line(&mut line).expect("request line");
-            stream
-                .write_all(br#"{"jsonrpc":"2.0","id":1,"#)
-                .expect("first chunk");
-            stream.flush().expect("flush");
-            std::thread::sleep(Duration::from_millis(100));
-            stream
-                .write_all(br#""result":{"ok":true}}"#)
-                .expect("second chunk");
-            stream.write_all(b"\n").expect("newline");
-            stream.flush().expect("flush");
-        });
-
-        let response = request_within(
-            &config,
-            "svcd.ping",
-            serde_json::json!({}),
-            Instant::now() + Duration::from_secs(2),
-            || false,
-        )
-        .expect("the resumed frame is a response");
-        assert_eq!(response.result, Some(serde_json::json!({ "ok": true })));
-        server.join().expect("server");
-        let _ = fs::remove_dir_all(&config);
-    }
-}
-
-#[cfg(all(test, windows))]
-mod tests {
-    use super::*;
-    use std::io::Write;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-
-    fn config_dir(tag: &str) -> PathBuf {
-        let directory = crate::test_support::temp_dir().join(format!(
-            "svcd-channel-{}-{}-{}",
-            tag,
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&directory).expect("config dir");
-        fs::write(directory.join("svcd.token"), "test-token\n").expect("token");
-        directory
-    }
-
-    /// The Windows pipe has no read timeout: PeekNamedPipe must make the read
-    /// interruptible so a silent supervisor still hits the deadline.
-    #[test]
-    fn a_silent_pipe_hits_the_control_deadline() {
-        let config = config_dir("silent");
-        let listener = Listener::bind(&config).expect("listener");
-        let server = std::thread::spawn(move || {
-            let _stream = listener
-                .incoming()
-                .next()
-                .expect("accept")
-                .expect("stream");
-            std::thread::sleep(Duration::from_secs(2));
-        });
-
-        let started = Instant::now();
-        let error = request_within(
-            &config,
-            "svcd.ping",
-            serde_json::json!({}),
-            Instant::now() + Duration::from_millis(150),
-            || false,
-        )
-        .expect_err("the silent supervisor must time out");
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "the deadline must bound the round trip, took {:?}",
-            started.elapsed()
-        );
-        server.join().expect("server");
-        let _ = fs::remove_dir_all(&config);
-    }
-
-    /// The same interruptible read must notice a flipped disconnect token.
-    #[test]
-    fn a_disconnect_cancels_within_one_poll_period() {
-        let config = config_dir("cancel");
-        let listener = Listener::bind(&config).expect("listener");
-        let server = std::thread::spawn(move || {
-            let _stream = listener
-                .incoming()
-                .next()
-                .expect("accept")
-                .expect("stream");
-            std::thread::sleep(Duration::from_secs(2));
-        });
-
-        let started = Instant::now();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let flip = cancelled.clone();
-        let flipper = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            flip.store(true, Ordering::Release);
-        });
-        let error = request_within(
-            &config,
-            "svcd.ping",
-            serde_json::json!({}),
-            Instant::now() + Duration::from_secs(5),
-            || cancelled.load(Ordering::Acquire),
-        )
-        .expect_err("a cancelled request must not wait for the deadline");
-        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "cancel must arrive in one poll period, took {:?}",
-            started.elapsed()
-        );
-        flipper.join().expect("flipper");
-        server.join().expect("server");
-        let _ = fs::remove_dir_all(&config);
-    }
-
-    /// A frame split across two pipe writes must resume through PeekNamedPipe
-    /// instead of being lost between reads.
-    #[test]
-    fn a_partial_response_survives_the_poll_timeout() {
-        let config = config_dir("partial");
-        let listener = Listener::bind(&config).expect("listener");
-        let server = std::thread::spawn(move || {
             let mut stream = listener
                 .incoming()
                 .next()
@@ -986,4 +868,3 @@ mod tests {
         let _ = fs::remove_dir_all(&config);
     }
 }
-

@@ -129,12 +129,19 @@ pub struct Request {
 }
 
 impl Request {
-    /// The budget for this request's control-channel calls. An inline request
-    /// keeps the unlimited CLI-style round trip; a blocking job always has a
-    /// deadline (set by the server at dispatch).
-    pub fn with_control_deadline(mut self, now: Instant, timeout: std::time::Duration) -> Request {
-        if self.deadline.is_none() {
-            self.deadline = Some(now + timeout);
+    /// Stamp this request with the server's control-channel budget. An inline
+    /// request keeps the unlimited CLI-style round trip; a blocking job always
+    /// has a deadline. Keeping the stamp in one method means a future dispatch
+    /// entry point cannot copy half of it.
+    pub fn with_control_budget(
+        mut self,
+        now: Instant,
+        timeout: std::time::Duration,
+        cancel: Option<CancelToken>,
+    ) -> Request {
+        self.deadline.get_or_insert(now + timeout);
+        if cancel.is_some() {
+            self.cancel = cancel;
         }
         self
     }
