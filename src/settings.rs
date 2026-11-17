@@ -30,6 +30,14 @@ pub struct Settings {
     pub temp_retention_secs: Option<u64>,
     /// How often the supervisor scans `temp_dir`. `0` disables cleanup.
     pub temp_cleanup_interval_secs: Option<u64>,
+    /// How often the supervisor compares the `services.d` fingerprint and
+    /// reconciles. Milliseconds; `0` disables the periodic rescan. Default:
+    /// 5000.
+    pub rescan_interval_ms: Option<u64>,
+    /// How long the daemon waits at boot for `services.d` to appear before
+    /// scanning an empty tree. Milliseconds; `0` disables the wait. Default:
+    /// 10000.
+    pub boot_scan_wait_ms: Option<u64>,
     /// Per-service log directory. Empty/absent uses the platform or
     /// `install_dir/logs` default.
     pub logs_dir: Option<PathBuf>,
@@ -101,6 +109,35 @@ impl Settings {
     pub fn temp_cleanup_interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.temp_cleanup_interval_secs.unwrap_or(5 * 60))
     }
+
+    /// The supervisor's periodic rescan cadence. `0` means "never rescan".
+    pub fn rescan_interval_ms(&self) -> u64 {
+        self.rescan_interval_ms.unwrap_or(5_000)
+    }
+
+    /// How long boot waits for `services.d`. `0` means "do not wait".
+    pub fn boot_scan_wait_ms(&self) -> u64 {
+        self.boot_scan_wait_ms.unwrap_or(10_000)
+    }
+}
+
+/// The two loop cadences still accept their historical `SVCD_*` overrides.
+///
+/// This runs at the composition root only ([`crate::config::Config::bootstrap`]),
+/// like every other `SVCD_*` read. The `svcd.conf` keys are the supported knob;
+/// these two overrides are frozen — no new key may be added here, and removing
+/// them is the separate ticket ADR-0019 already left open.
+pub(crate) fn apply_loop_env_overrides(settings: &mut Settings) {
+    if let Some(value) = env_u64("SVCD_RESCAN_INTERVAL_MS") {
+        settings.rescan_interval_ms = Some(value);
+    }
+    if let Some(value) = env_u64("SVCD_BOOT_SCAN_WAIT_MS") {
+        settings.boot_scan_wait_ms = Some(value);
+    }
+}
+
+fn env_u64(key: &str) -> Option<u64> {
+    std::env::var(key).ok().and_then(|value| value.parse().ok())
 }
 
 /// Load the document this process runs with.
@@ -213,6 +250,12 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
                         value
                     )
                 })?);
+            }
+            "rescan_interval_ms" => {
+                settings.rescan_interval_ms = Some(parse_u64(value, "rescan_interval_ms", index)?)
+            }
+            "boot_scan_wait_ms" => {
+                settings.boot_scan_wait_ms = Some(parse_u64(value, "boot_scan_wait_ms", index)?)
             }
             "logs_dir" => settings.logs_dir = Some(resolve(base, value)),
             "log_max_bytes" => {
@@ -396,7 +439,7 @@ mod tests {
     #[test]
     fn parses_all_keys_and_resolves_relative_paths() {
         let settings = parse(
-            "\u{feff}# svcd runtime\nbind = 0.0.0.0:8787\nallow_insecure_install = on\nconfig_dir = /srv/svcd\nplugins_dir = plugins\nservices_dir = /var/lib/svcd/services.d\ninstall_dir = /etc/sr/svcd\nauth_passwd = pbkdf2-sha256$10000$c2FsdA$aGFzaA\ntemp_dir = /var/tmp/svcd\ntemp_retention_secs = 3600\ntemp_cleanup_interval_secs = 60\n",
+            "\u{feff}# svcd runtime\nbind = 0.0.0.0:8787\nallow_insecure_install = on\nconfig_dir = /srv/svcd\nplugins_dir = plugins\nservices_dir = /var/lib/svcd/services.d\ninstall_dir = /etc/sr/svcd\nauth_passwd = pbkdf2-sha256$10000$c2FsdA$aGFzaA\ntemp_dir = /var/tmp/svcd\ntemp_retention_secs = 3600\ntemp_cleanup_interval_secs = 60\nrescan_interval_ms = 250\nboot_scan_wait_ms = 0\n",
             Path::new("/etc/svcd"),
         )
         .expect("parse");
@@ -422,6 +465,10 @@ mod tests {
         assert_eq!(settings.temp_dir, Some(PathBuf::from("/var/tmp/svcd")));
         assert_eq!(settings.temp_retention_secs, Some(3600));
         assert_eq!(settings.temp_cleanup_interval_secs, Some(60));
+        assert_eq!(settings.rescan_interval_ms, Some(250));
+        assert_eq!(settings.boot_scan_wait_ms, Some(0));
+        assert_eq!(settings.rescan_interval_ms(), 250);
+        assert_eq!(settings.boot_scan_wait_ms(), 0);
         assert_eq!(settings.temp_retention().as_secs(), 3600);
         assert_eq!(settings.temp_cleanup_interval().as_secs(), 60);
     }
@@ -519,6 +566,29 @@ mod tests {
         assert_eq!(settings.temp_retention().as_secs(), 2 * 60 * 60);
         assert_eq!(settings.temp_cleanup_interval().as_secs(), 5 * 60);
         assert!(!settings.allow_insecure_install);
+    }
+
+    #[test]
+    fn loop_cadences_default_to_five_and_ten_seconds() {
+        let settings = Settings::default();
+        assert_eq!(settings.rescan_interval_ms(), 5_000);
+        assert_eq!(settings.boot_scan_wait_ms(), 10_000);
+    }
+
+    /// Without an env override the document value survives the bootstrap pass;
+    /// the override path itself is covered end to end by the tests that start a
+    /// daemon with `SVCD_RESCAN_INTERVAL_MS` / `SVCD_BOOT_SCAN_WAIT_MS`.
+    #[test]
+    fn loop_document_values_survive_without_an_override() {
+        let mut settings = parse(
+            "rescan_interval_ms = 250\nboot_scan_wait_ms = 100\n",
+            Path::new("/etc/svcd"),
+        )
+        .expect("parse");
+        // No env set in this process: the document survives.
+        apply_loop_env_overrides(&mut settings);
+        assert_eq!(settings.rescan_interval_ms(), 250);
+        assert_eq!(settings.boot_scan_wait_ms(), 100);
     }
 
     #[test]

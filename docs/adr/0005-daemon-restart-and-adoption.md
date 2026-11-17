@@ -8,9 +8,9 @@ svcd 被 kill -9、崩溃或被系统重新拉起时，旧实现的处理是「�
 - **启动校验**：只有同时满足三条才接管——`boot` 与当前 `/proc/sys/kernel/random/boot_id` 相同、`pid` 还活着、`/proc/<pid>/stat` 的 starttime 与记录一致（防 pid 复用）。任一不满足就丢弃记录，按正常开机流程处理。
 - **接管语义**：记录是 `running`/`starting` 的活进程 → 直接进 `Running`（不重启、不发信号）；记录是 `stopping` 的残留 → 按 `Running` 接管后走一次**正常停止**（先跑 stop 动作，再 SIGTERM/SIGKILL），不丢服务的清理逻辑；记录是 `running` 且 `pid` 为空（一次性服务已完成，见 ADR 0006）→ 恢复完成态、不重跑；其余状态没有 pid 可接管。
 - **孤儿记录清理**：启动时和 `svc reload` 末尾扫描 `<data>/run`，删掉 registry 里已不存在的 `<id>.json`。若记录里的 pid 仍有效（pid + starttime 校验通过），先对进程组发 SIGTERM 再删，覆盖「daemon 停机期间定义被删」的情况。
-- **运行期重扫**：`services.d` 的指纹（名字 + mtime + size）每 `SVCD_RESCAN_INTERVAL_MS`（默认 5s，0 关闭）比对一次，变了就复用 `reload` 的 reconcile：新增定义按 `enabled` 启动、删除定义停掉并遗忘。`svc reload` 仍保留，用于手动立即触发。
+- **运行期重扫**：`services.d` 的指纹（名字 + mtime + size）每 `rescan_interval_ms`（默认 5000ms，0 关闭；`SVCD_RESCAN_INTERVAL_MS` 仍在 bootstrap 作覆盖，见 ADR-0020）比对一次，变了就复用 `reload` 的 reconcile：新增定义按 `enabled` 启动、删除定义停掉并遗忘。`svc reload` 仍保留，用于手动立即触发。
 - **Unix 不再给服务进程挂 parent-death 信号**（`proc::configure_service`），服务在 daemon 死后继续运行，等下一个 daemon 接管；**hooks 仍保留** `PR_SET_PDEATHSIG`，它们不该比 daemon 活得久。Windows 保持不变：Job Object 随 daemon 关闭而终止整棵树，没有可接管的进程（记录只用于清理）。
-- **开机等待 + reload**：daemon 启动时若 `services.d` 还不存在，最多等 10 秒（`SVCD_BOOT_SCAN_WAIT_MS`，0 关闭），覆盖只读 rootfs 上 overlay 晚挂载；之后仍可用 `svc reload` 重新扫描并对账（新增/删除/修改定义）。
+- **开机等待 + reload**：daemon 启动时若 `services.d` 还不存在，最多等 10 秒（`boot_scan_wait_ms`，0 关闭；`SVCD_BOOT_SCAN_WAIT_MS` 仍在 bootstrap 作覆盖，见 ADR-0020），覆盖只读 rootfs 上 overlay 晚挂载；之后仍可用 `svc reload` 重新扫描并对账（新增/删除/修改定义）。
 - **策略与自启解耦**：`enabled` 只决定开机是否启动；崩溃是否重启由服务级 `restart=always|on-failure|never` 决定（core 定义字段，drop-in 脚本用 `RESTART=` / `TYPE=oneshot` 声明，插件默认 `on-failure`）。
 
 ## Considered Options
