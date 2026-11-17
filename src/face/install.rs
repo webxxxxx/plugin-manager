@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::config::Config;
+use crate::platform::config::Config;
 
 use serde_json::{json, Value};
 
@@ -22,7 +22,7 @@ use crate::http;
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::lan::{AuthKind, Lan};
 use crate::package;
-use crate::paths::Paths;
+use crate::platform::paths::Paths;
 use crate::plugin;
 use crate::server::http::{
     BlockingOutcome, CloseReason, Exchange, OutBuffer, StreamAction, StreamClass, StreamEvent,
@@ -312,7 +312,7 @@ enum Flow {
 
 struct InstallFlow {
     paths: Arc<Paths>,
-    limits: Arc<crate::limits::Limits>,
+    limits: Arc<crate::platform::limits::Limits>,
     allow_insecure: bool,
     strategy: String,
     enable: bool,
@@ -322,7 +322,7 @@ struct InstallFlow {
 
 struct ImportFlow {
     paths: Arc<Paths>,
-    limits: Arc<crate::limits::Limits>,
+    limits: Arc<crate::platform::limits::Limits>,
     allow_insecure: bool,
     params: ImportParams,
     stage: ImportStage,
@@ -867,7 +867,7 @@ impl BackupImport {
         params: &ImportParams,
         staging: PathBuf,
         paths: Arc<Paths>,
-        limits: Arc<crate::limits::Limits>,
+        limits: Arc<crate::platform::limits::Limits>,
         allow_insecure: bool,
     ) -> BackupImport {
         let max = limits.max_package_bytes;
@@ -890,7 +890,7 @@ impl BackupImport {
 struct BackupSink {
     staging: PathBuf,
     paths: Arc<Paths>,
-    limits: Arc<crate::limits::Limits>,
+    limits: Arc<crate::platform::limits::Limits>,
     allow_insecure: bool,
     no_config: bool,
     force: bool,
@@ -922,7 +922,7 @@ impl BackupSink {
         params: &ImportParams,
         staging: PathBuf,
         paths: Arc<Paths>,
-        limits: Arc<crate::limits::Limits>,
+        limits: Arc<crate::platform::limits::Limits>,
         allow_insecure: bool,
     ) -> BackupSink {
         BackupSink {
@@ -1328,7 +1328,7 @@ mod tests {
             nanos
         ));
         Arc::new(Config::with_paths(
-            crate::settings::Settings::default(),
+            crate::platform::settings::Settings::default(),
             None,
             Paths::under(&root),
         ))

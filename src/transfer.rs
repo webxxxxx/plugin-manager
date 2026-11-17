@@ -14,12 +14,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::json;
 
-use crate::channel;
+use crate::wire::control::channel;
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::package;
-use crate::paths::Paths;
+use crate::platform::paths::Paths;
 use crate::plugin;
-use crate::rpc;
+use crate::wire::message::rpc;
 
 const MAX_IMPORT: u64 = 512 * 1024 * 1024;
 

@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 
-use crate::log;
+use crate::platform::log;
 
 /// Maximum jobs waiting for a worker. The queue never grows past this; a full
 /// queue is a visible busy result, not an unbounded allocation.

@@ -20,8 +20,8 @@ use std::sync::mpsc::{Sender, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::ipc;
-use crate::wake::Wake;
+use crate::wire::message::ipc;
+use crate::platform::host::wake::Wake;
 
 use platform::Platform;
 pub(crate) use platform::{ControlBinding, Notify, Stream};
@@ -215,7 +215,7 @@ pub fn request(
     config: &Path,
     method: &str,
     params: serde_json::Value,
-) -> io::Result<crate::rpc::Response> {
+) -> io::Result<crate::wire::message::rpc::Response> {
     request_stream(config, method, params, None, || false, |_| {})
 }
 
@@ -238,7 +238,7 @@ pub fn request_stream<F, C>(
     idle: Option<Duration>,
     cancelled: C,
     on_notification: F,
-) -> io::Result<crate::rpc::Response>
+) -> io::Result<crate::wire::message::rpc::Response>
 where
     F: FnMut(&str),
     C: Fn() -> bool,
@@ -274,7 +274,7 @@ fn request_line(method: &str, params: serde_json::Value) -> String {
 
 /// Parse one response frame. `None` is an interim notification (no id) that the
 /// caller may forward or ignore; `Some` is the final response.
-fn response_from_line(line: &str) -> io::Result<Option<crate::rpc::Response>> {
+fn response_from_line(line: &str) -> io::Result<Option<crate::wire::message::rpc::Response>> {
     let value: serde_json::Value = serde_json::from_str(line)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if value.get("method").is_some() && value.get("id").is_none() {
@@ -346,7 +346,7 @@ fn read_response<C, F>(
     bound: ReadBound,
     cancelled: C,
     mut on_notification: F,
-) -> io::Result<crate::rpc::Response>
+) -> io::Result<crate::wire::message::rpc::Response>
 where
     C: Fn() -> bool,
     F: FnMut(&str),
@@ -445,7 +445,7 @@ pub fn request_within<C: Fn() -> bool>(
     params: serde_json::Value,
     deadline: Instant,
     cancelled: C,
-) -> io::Result<crate::rpc::Response> {
+) -> io::Result<crate::wire::message::rpc::Response> {
     let endpoint = Endpoint::for_method(method);
     let mut stream = acquire(config, endpoint)?;
     let line = request_line(method, params);

@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::platform::host::dirs;
-use crate::settings::Settings;
+use crate::platform::settings::Settings;
 
 pub use crate::platform::host::dirs::user_mode;
 pub(crate) use crate::platform::host::dirs::platform_config_dir;

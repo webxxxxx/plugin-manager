@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use crate::http;
 use crate::server::mcp::session::{validate_meta, Served};
-use crate::rpc;
+use crate::wire::message::rpc;
 
 const VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
 
@@ -274,7 +274,7 @@ fn authorize(headers: &[(String, String)], password_hash: Option<&str>) -> Resul
         return Err(unauthorized("Bearer authorization is required"));
     };
     match password_hash {
-        Some(hash) if crate::auth::verify_password(bearer, hash) => Ok(()),
+        Some(hash) if crate::platform::auth::verify_password(bearer, hash) => Ok(()),
         _ => Err(http::json_error(
             403,
             "forbidden",

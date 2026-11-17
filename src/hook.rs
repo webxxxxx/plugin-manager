@@ -14,9 +14,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::kernel::failure::{Problem, ProblemError};
-use crate::log::{self, LogSink};
+use crate::platform::log::{self, LogSink};
 use crate::package;
-use crate::paths::Paths;
+use crate::platform::paths::Paths;
 
 /// Both hook actions share the same 60-second budget.
 pub const TIMEOUT_MS: u64 = 60_000;
@@ -38,7 +38,7 @@ pub struct Invocation<'a> {
 pub fn run(
     spec: &Invocation<'_>,
     paths: &Paths,
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
     poll: &mut dyn FnMut(),
 ) -> Result<(), ProblemError> {
     package::check_path(spec.path)?;
@@ -94,7 +94,7 @@ pub fn run(
     };
     let tree = crate::platform::host::process::Tree::new();
     let (mut child, streams) =
-        crate::stdio::spawn(command, crate::stdio::Plan::hook()).map_err(|error| {
+        crate::wire::contract::stdio::spawn(command, crate::wire::contract::stdio::Plan::hook()).map_err(|error| {
             Problem::Internal.error(format!("spawn {} hook: {}", spec.action, error))
         })?;
     let _ = crate::platform::host::process::adopt(&child);
@@ -102,7 +102,7 @@ pub fn run(
         tree.assign(&child);
     }
     if let Some(stdout) = streams.stdout {
-        if let Err(error) = crate::stdio::log_lines(
+        if let Err(error) = crate::wire::contract::stdio::log_lines(
             format!("svcd-{}-hook-out", spec.id),
             stdout,
             log.clone(),
@@ -116,7 +116,7 @@ pub fn run(
     }
     if let Some(stderr) = streams.stderr {
         if let Err(error) =
-            crate::stdio::log_lines(format!("svcd-{}-hook-err", spec.id), stderr, log, limits)
+            crate::wire::contract::stdio::log_lines(format!("svcd-{}-hook-err", spec.id), stderr, log, limits)
         {
             log::svcd(&format!(
                 "svcd: plugin {}: {} hook stderr reader: {}",
@@ -165,7 +165,7 @@ pub fn run(
 /// The poll a production caller passes: the loop bound to this thread (the
 /// supervisor loop in the daemon), a no-op on a thread that owns none.
 pub fn poll_this_loop() {
-    crate::stdio::pump_waiting_loop();
+    crate::wire::contract::stdio::pump_waiting_loop();
 }
 
 /// Kill a hook and, on Unix, the process group it leads.
@@ -282,7 +282,7 @@ mod tests {
     }
 
     fn run(spec: &Invocation<'_>, poll: &mut dyn FnMut()) -> Result<(), ProblemError> {
-        super::run(spec, &test_paths(), &crate::limits::test_default(), poll)
+        super::run(spec, &test_paths(), &crate::platform::limits::test_default(), poll)
     }
     use std::fs;
     use std::path::PathBuf;

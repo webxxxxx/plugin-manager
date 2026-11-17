@@ -10,7 +10,7 @@
 //! ```
 //!
 //! The hub owns the stream table, the subscriber channels and the global
-//! in-flight budget. The I/O itself belongs to [`crate::reactor`] on Unix: a
+//! in-flight budget. The I/O itself belongs to [`crate::wire::contract::reactor`] on Unix: a
 //! raw plugin costs no extra thread there. When the reactor is unavailable
 //! (and on Windows, where anonymous child pipes are not pollable) the hub
 //! falls back to one writer thread and one reader thread per plugin.
@@ -25,9 +25,9 @@ use std::thread;
 #[cfg(unix)]
 use std::sync::Weak;
 
-use crate::ipc::{RawFailure, RawStopSink};
-use crate::log::LogSink;
-use crate::stdio::{self, ReadEnd, Streams, WriteEnd};
+use crate::wire::message::ipc::{RawFailure, RawStopSink};
+use crate::platform::log::LogSink;
+use crate::wire::contract::stdio::{self, ReadEnd, Streams, WriteEnd};
 
 pub const HEADER: usize = 8;
 const SUBSCRIBER_QUEUE: usize = 4;
@@ -71,7 +71,7 @@ impl RawStats {
             } else {
                 format!(" ({})", detail)
             };
-            crate::log::svcd(&format!(
+            crate::platform::log::svcd(&format!(
                 "svcd: raw {}: plugin={} stream={} total={}{}",
                 failure.as_str(),
                 plugin,
@@ -153,7 +153,7 @@ struct RawPlugin {
     closed: AtomicBool,
     /// Reactor-owned stdin queue once the reactor has adopted this plugin.
     #[cfg(unix)]
-    out: OnceLock<Arc<crate::reactor::RawOutQueue>>,
+    out: OnceLock<Arc<crate::wire::contract::reactor::RawOutQueue>>,
     /// Fallback writer-thread queue.
     writer: OnceLock<SyncSender<Vec<u8>>>,
 }
@@ -232,18 +232,18 @@ pub struct RawHub {
     max_inflight_bytes: usize,
     max_inflight_requests: usize,
     writer_queue: usize,
-    limits: Arc<crate::limits::Limits>,
+    limits: Arc<crate::platform::limits::Limits>,
     inflight_bytes: AtomicUsize,
     inflight_requests: AtomicUsize,
     next_generation: AtomicU64,
     /// Weak so the daemon's `Arc<Reactor>` stays the single owner.
     #[cfg(unix)]
-    reactor: OnceLock<Weak<crate::reactor::Reactor>>,
+    reactor: OnceLock<Weak<crate::wire::contract::reactor::Reactor>>,
     pub stats: RawStats,
 }
 
 impl RawHub {
-    pub fn new(limits: Arc<crate::limits::Limits>) -> Arc<Self> {
+    pub fn new(limits: Arc<crate::platform::limits::Limits>) -> Arc<Self> {
         Arc::new(Self {
             plugins: Mutex::new(HashMap::new()),
             next_stream: AtomicU32::new(1),
@@ -264,12 +264,12 @@ impl RawHub {
     /// Adopt the plugin-stdio reactor. Plugins registered after this call run
     /// without per-plugin threads.
     #[cfg(unix)]
-    pub fn set_reactor(&self, reactor: &Arc<crate::reactor::Reactor>) {
+    pub fn set_reactor(&self, reactor: &Arc<crate::wire::contract::reactor::Reactor>) {
         let _ = self.reactor.set(Arc::downgrade(reactor));
     }
 
     #[cfg(unix)]
-    fn reactor(&self) -> Option<Arc<crate::reactor::Reactor>> {
+    fn reactor(&self) -> Option<Arc<crate::wire::contract::reactor::Reactor>> {
         self.reactor.get().and_then(|reactor| reactor.upgrade())
     }
 
@@ -346,7 +346,7 @@ impl RawHub {
         let writer_id = id.clone();
         thread::Builder::new()
             .name(format!("svcd-{}-raw-write", id))
-            .stack_size(crate::threads::io_stack(&self.limits))
+            .stack_size(crate::platform::host::threads::io_stack(&self.limits))
             .spawn(move || {
                 while let Ok(frame) = writer_rx.recv() {
                     if stdin.write_all(&frame).is_err() {
@@ -370,7 +370,7 @@ impl RawHub {
         let max_frame = self.max_frame;
         thread::Builder::new()
             .name(format!("svcd-{}-raw-read", id))
-            .stack_size(crate::threads::io_stack(&self.limits))
+            .stack_size(crate::platform::host::threads::io_stack(&self.limits))
             .spawn(move || {
                 let mut header = [0u8; HEADER];
                 loop {
@@ -658,10 +658,10 @@ mod tests {
 
     #[test]
     fn pending_payload_counters_are_balanced() {
-        let mut settings = crate::settings::Settings::default();
+        let mut settings = crate::platform::settings::Settings::default();
         settings.ws_inflight_bytes = Some(64 * 1024);
         settings.ws_inflight_requests = Some(4);
-        let hub = RawHub::new(Arc::new(crate::limits::derive(&settings)));
+        let hub = RawHub::new(Arc::new(crate::platform::limits::derive(&settings)));
         assert!(hub.reserve(1024).is_ok());
         assert_eq!(hub.inflight_bytes.load(Ordering::SeqCst), 1024);
         hub.release(1024);

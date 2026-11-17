@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::channel;
-use crate::compat;
-use crate::config::Config;
+use crate::wire::control::channel;
+use crate::platform::compat;
+use crate::platform::config::Config;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::package;
 use crate::plugin;

@@ -8,7 +8,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::net::TcpStream;
 use std::time::Instant;
 
-use crate::log;
+use crate::platform::log;
 
 use super::budget::{Busy, StreamBudget, StreamPermit};
 use super::stream::{
@@ -51,7 +51,7 @@ pub struct StreamDriver {
     /// Held for long-lived streams, absent for one-shot responses.
     _permit: Option<StreamPermit>,
     /// The limits derived once at the composition root.
-    limits: std::sync::Arc<crate::limits::Limits>,
+    limits: std::sync::Arc<crate::platform::limits::Limits>,
 }
 
 impl StreamDriver {
@@ -59,7 +59,7 @@ impl StreamDriver {
     pub fn admit(
         handler: Box<dyn StreamHandler>,
         max_streams: usize,
-        limits: std::sync::Arc<crate::limits::Limits>,
+        limits: std::sync::Arc<crate::platform::limits::Limits>,
     ) -> StreamAdmission {
         match StreamBudget::global().acquire(handler.stream_class(), max_streams) {
             Ok(permit) => StreamAdmission::Admitted(StreamDriver::new(handler, permit, limits)),
@@ -74,7 +74,7 @@ impl StreamDriver {
     pub fn admit_reserved(
         handler: Box<dyn StreamHandler>,
         permit: super::budget::StreamPermit,
-        limits: std::sync::Arc<crate::limits::Limits>,
+        limits: std::sync::Arc<crate::platform::limits::Limits>,
     ) -> StreamDriver {
         StreamDriver::new(handler, Some(permit), limits)
     }
@@ -82,7 +82,7 @@ impl StreamDriver {
     fn new(
         handler: Box<dyn StreamHandler>,
         permit: Option<super::budget::StreamPermit>,
-        limits: std::sync::Arc<crate::limits::Limits>,
+        limits: std::sync::Arc<crate::platform::limits::Limits>,
     ) -> StreamDriver {
         let deadline = Instant::now() + limits.transfer_timeout;
         StreamDriver {
@@ -366,28 +366,28 @@ impl StreamDriver {
             if send.length == 0 {
                 continue;
             }
-            match crate::zerocopy::try_send_file_range(
+            match crate::platform::host::zerocopy::try_send_file_range(
                 &mut send.file,
                 stream,
                 send.offset,
                 send.length,
             ) {
-                Ok(crate::zerocopy::FileSendProgress::Sent(sent)) => {
+                Ok(crate::platform::host::zerocopy::FileSendProgress::Sent(sent)) => {
                     send.offset += sent;
                     send.length -= sent;
                     self.file = Some(send);
                     self.touch();
                     continue;
                 }
-                Ok(crate::zerocopy::FileSendProgress::Done) => {
+                Ok(crate::platform::host::zerocopy::FileSendProgress::Done) => {
                     self.touch();
                     continue;
                 }
-                Ok(crate::zerocopy::FileSendProgress::WouldBlock) => {
+                Ok(crate::platform::host::zerocopy::FileSendProgress::WouldBlock) => {
                     self.file = Some(send);
                     return true;
                 }
-                Ok(crate::zerocopy::FileSendProgress::Unsupported) => {
+                Ok(crate::platform::host::zerocopy::FileSendProgress::Unsupported) => {
                     match read_file_chunk(&mut send, out, limit) {
                         Ok(0) => {
                             // The output buffer is full; flush it before reading.
@@ -502,8 +502,8 @@ fn read_file_chunk(send: &mut FileSend, out: &mut Vec<u8>, limit: usize) -> std:
 }
 #[cfg(test)]
 mod tests {
-    fn test_limits() -> std::sync::Arc<crate::limits::Limits> {
-        std::sync::Arc::new(crate::limits::test_default())
+    fn test_limits() -> std::sync::Arc<crate::platform::limits::Limits> {
+        std::sync::Arc::new(crate::platform::limits::test_default())
     }
 
     use super::*;

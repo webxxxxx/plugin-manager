@@ -6,18 +6,18 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use crate::ipc::{self, FrameError, FrameEvent};
+use crate::wire::message::ipc::{self, FrameError, FrameEvent};
 #[cfg(test)]
 use crate::kernel::contract::ProgressToken;
 use crate::kernel::contract::{Contract, Control, Invocation, Reply, ReplySink, Settled, Wire};
 use crate::kernel::failure::{Class, Failure, Rejection, Retry};
-use crate::log::{self, LogSink};
-use crate::paths::Paths;
+use crate::platform::log::{self, LogSink};
+use crate::platform::paths::Paths;
 use crate::registry::{Exec, Hook, Interpreter, Lifecycle, Ready, Restart, State};
-use crate::rpc;
-use crate::stdio::{self, Plan, Streams, Target};
+use crate::wire::message::rpc;
+use crate::wire::contract::stdio::{self, Plan, Streams, Target};
 use crate::supervisor::{self, Action, Event, Machine};
-use crate::wake::Wake;
+use crate::platform::host::wake::Wake;
 
 /// Per-plugin in-flight cap from ticket #31. The full spec also describes a
 /// 128-slot queue behind this cap; the ticket scopes this tracer bullet to the
@@ -39,7 +39,7 @@ pub(crate) struct Slot {
     /// The directory set this slot uses for its log, its child environment and
     /// the blob store. Resolved once at the composition root.
     paths: Arc<Paths>,
-    limits: Arc<crate::limits::Limits>,
+    limits: Arc<crate::platform::limits::Limits>,
     pub(crate) machine: Machine,
     exec: Exec,
     protocol: u32,
@@ -51,7 +51,7 @@ pub(crate) struct Slot {
     /// Who reads this service's stdout/stderr: the supervisor's poll set on
     /// Unix, reader threads elsewhere.
     stdio: Target,
-    raw_hub: Option<Arc<crate::rawhub::RawHub>>,
+    raw_hub: Option<Arc<crate::wire::contract::rawhub::RawHub>>,
     log: Option<Arc<Mutex<LogSink>>>,
     /// Plugins must keep stdout protocol-only; core scripts may still print
     /// human-readable output, which is logged for diagnosis.
@@ -122,13 +122,13 @@ struct SlotRequest {
     invocation: Invocation,
     /// Progress still goes straight to the caller's channel; the final response
     /// goes through `done`.
-    client: Option<crate::channel::Reply>,
+    client: Option<crate::wire::control::channel::Reply>,
     done: ReplySink,
 }
 
 enum CallSink {
     #[cfg(test)]
-    Client(crate::channel::Reply),
+    Client(crate::wire::control::channel::Reply),
     Completion(ReplySink),
 }
 
@@ -138,7 +138,7 @@ impl SlotHandle {
     pub(crate) fn submit(
         &self,
         invocation: Invocation,
-        client: Option<crate::channel::Reply>,
+        client: Option<crate::wire::control::channel::Reply>,
         done: ReplySink,
     ) -> Result<(), (Failure, ReplySink)> {
         let request = SlotRequest {
@@ -186,11 +186,11 @@ impl SlotHandle {
 /// the slot event loop and returns, so the daemon itself stays non-blocking.
 pub(crate) struct SlotWire {
     handle: SlotHandle,
-    client: Option<crate::channel::Reply>,
+    client: Option<crate::wire::control::channel::Reply>,
 }
 
 impl SlotWire {
-    pub(crate) fn new(handle: SlotHandle, client: Option<crate::channel::Reply>) -> SlotWire {
+    pub(crate) fn new(handle: SlotHandle, client: Option<crate::wire::control::channel::Reply>) -> SlotWire {
         SlotWire { handle, client }
     }
 }
@@ -263,7 +263,7 @@ struct PendingCall {
     deadline: u64,
     progress_token: Option<String>,
     /// Progress notifications go here while the call is in flight.
-    client: Option<crate::channel::Reply>,
+    client: Option<crate::wire::control::channel::Reply>,
     /// Final result: projected for the legacy channel path, or delivered to the
     /// caller's completion sink.
     sink: CallSink,
@@ -296,7 +296,7 @@ impl Slot {
         lifecycle: Option<Lifecycle>,
         restart: Restart,
         paths: Arc<Paths>,
-        limits: Arc<crate::limits::Limits>,
+        limits: Arc<crate::platform::limits::Limits>,
     ) -> Self {
         let (request_tx, request_rx) = mpsc::sync_channel(CALL_QUEUE);
         Slot {
@@ -461,7 +461,7 @@ impl Slot {
         self.stdio = stdio;
     }
 
-    pub(crate) fn set_raw_hub(&mut self, hub: Option<Arc<crate::rawhub::RawHub>>) {
+    pub(crate) fn set_raw_hub(&mut self, hub: Option<Arc<crate::wire::contract::rawhub::RawHub>>) {
         self.raw_hub = hub;
     }
 
@@ -532,7 +532,7 @@ impl Slot {
         external_id: Option<Value>,
         now: u64,
         progress_token: Option<Value>,
-        reply: crate::channel::Reply,
+        reply: crate::wire::control::channel::Reply,
     ) -> Result<(), CallError> {
         let mut invocation = Invocation::new(capability, arguments, self.call_timeout);
         invocation.progress = progress_token.and_then(|token| match token {
@@ -551,7 +551,7 @@ impl Slot {
         invocation: Invocation,
         external_id: Option<Value>,
         now: u64,
-        reply: crate::channel::Reply,
+        reply: crate::wire::control::channel::Reply,
     ) -> Result<(), CallError> {
         let client = Some(reply.clone());
         let mut sink = Some(CallSink::Client(reply));
@@ -563,7 +563,7 @@ impl Slot {
         invocation: Invocation,
         external_id: Option<Value>,
         now: u64,
-        client: Option<crate::channel::Reply>,
+        client: Option<crate::wire::control::channel::Reply>,
         sink: &mut Option<CallSink>,
     ) -> Result<(), CallError> {
         if let Some(contract) = &self.contract {
@@ -746,7 +746,7 @@ impl Slot {
             None => command_for(&self.exec),
         };
         let blob_dir = self.paths.temp_dir.clone();
-        let _ = std::fs::create_dir_all(crate::blob::incoming_dir(&self.paths));
+        let _ = std::fs::create_dir_all(crate::platform::storage::blob::incoming_dir(&self.paths));
         command.env("SVCD_TEMP_DIR", &blob_dir);
         let plan = match self.exec.ready {
             Ready::Notify => Plan::notify(),
@@ -1016,7 +1016,7 @@ impl Slot {
             Err(Failure::from_plugin_error(error))
         } else if let Some(result) = message.get("result") {
             let mut result = result.clone();
-            match crate::blob::materialize_result(&self.paths, &mut result) {
+            match crate::platform::storage::blob::materialize_result(&self.paths, &mut result) {
                 Ok(()) => Ok(result),
                 Err(error) => Err(Failure::new(
                     Class::ImplementationError,
@@ -1641,8 +1641,8 @@ mod tests {
         Arc::new(paths)
     }
 
-    fn test_limits() -> Arc<crate::limits::Limits> {
-        Arc::new(crate::limits::test_default())
+    fn test_limits() -> Arc<crate::platform::limits::Limits> {
+        Arc::new(crate::platform::limits::test_default())
     }
 
     fn with_projector(mut slot: Slot) -> Slot {
@@ -1670,8 +1670,8 @@ mod tests {
                 capability: "echo".into(),
                 deadline,
                 progress_token: None,
-                client: Some(crate::channel::Reply::plain(tx.clone())),
-                sink: CallSink::Client(crate::channel::Reply::plain(tx)),
+                client: Some(crate::wire::control::channel::Reply::plain(tx.clone())),
+                sink: CallSink::Client(crate::wire::control::channel::Reply::plain(tx)),
             },
         );
         rx
@@ -1778,7 +1778,7 @@ mod tests {
             Some(json!(500)),
             0,
             None,
-            crate::channel::Reply::plain(tx),
+            crate::wire::control::channel::Reply::plain(tx),
         );
 
         assert!(matches!(
@@ -2002,7 +2002,7 @@ done
             Some(json!(100)),
             elapsed(&started),
             None,
-            crate::channel::Reply::plain(tx),
+            crate::wire::control::channel::Reply::plain(tx),
         )
         .expect("echo call");
         let response = wait_response(&mut slot, &rx, &started);
@@ -2018,7 +2018,7 @@ done
             Some(json!(101)),
             elapsed(&started),
             None,
-            crate::channel::Reply::plain(tx),
+            crate::wire::control::channel::Reply::plain(tx),
         )
         .expect("fail call");
         let result = wait_response(&mut slot, &rx, &started)
@@ -2034,7 +2034,7 @@ done
             Some(json!(102)),
             elapsed(&started),
             None,
-            crate::channel::Reply::plain(tx),
+            crate::wire::control::channel::Reply::plain(tx),
         )
         .expect("hang call");
         let (crash_tx, _crash_rx) = mpsc::channel();
@@ -2044,7 +2044,7 @@ done
             Some(json!(103)),
             elapsed(&started),
             None,
-            crate::channel::Reply::plain(crash_tx),
+            crate::wire::control::channel::Reply::plain(crash_tx),
         );
 
         let result = wait_response(&mut slot, &rx, &started)

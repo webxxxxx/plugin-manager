@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use crate::settings;
+use crate::platform::settings;
 
 #[allow(dead_code)]
 #[cfg(mem_low)]

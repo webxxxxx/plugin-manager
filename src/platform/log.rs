@@ -20,7 +20,7 @@ pub struct LogSink {
 
 impl LogSink {
     /// Open a sink using the limits derived once at the composition root.
-    pub fn open(dir: &Path, id: &str, limits: &crate::limits::Limits) -> io::Result<Self> {
+    pub fn open(dir: &Path, id: &str, limits: &crate::platform::limits::Limits) -> io::Result<Self> {
         Self::open_with(
             dir,
             id,
@@ -163,7 +163,7 @@ static SVCD_LOG: OnceLock<Mutex<LogSink>> = OnceLock::new();
 
 /// Open the daemon's own `svcd.log`. Failure is reported by the caller; the
 /// rest of the daemon still works with stderr only.
-pub fn init_svcd(limits: &crate::limits::Limits, dir: &Path) -> io::Result<()> {
+pub fn init_svcd(limits: &crate::platform::limits::Limits, dir: &Path) -> io::Result<()> {
     let sink = LogSink::open(dir, "svcd", limits)?;
     let _ = SVCD_LOG.set(Mutex::new(sink));
     Ok(())

@@ -27,10 +27,10 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use crate::ipc::{FrameError, FrameEvent};
-use crate::log::{self, LogSink};
-use crate::ipc::{RawFailure, RawStopSink};
-use crate::wake::Wake;
+use crate::wire::message::ipc::{FrameError, FrameEvent};
+use crate::platform::log::{self, LogSink};
+use crate::wire::message::ipc::{RawFailure, RawStopSink};
+use crate::platform::host::wake::Wake;
 
 const READ_CHUNK: usize = 8 * 1024;
 const MAX_LOG_LINE: usize = 64 * 1024;
@@ -301,7 +301,7 @@ impl Reactor {
     /// Register one notify plugin. A later registration with the same key
     /// replaces the old sources, which is what a restart needs.
     ///
-    /// `stdout`/`stderr` come from [`crate::stdio`]: the pipe layer created
+    /// `stdout`/`stderr` come from [`crate::wire::contract::stdio`]: the pipe layer created
     /// them and the caller asked for the ends. The poll set owns them from here
     /// on; they are blocking, and one read per readiness event is what keeps
     /// the supervisor loop from ever sitting in `read`.
@@ -357,7 +357,7 @@ impl Reactor {
     /// Register a protocol-3 plugin's stdin/stdout/stderr with the poll set
     /// and return the queue the hub feeds frames into.
     ///
-    /// `stdin`/`stdout` are already non-blocking (see [`crate::stdio::poll_read`]).
+    /// `stdin`/`stdout` are already non-blocking (see [`crate::wire::contract::stdio::poll_read`]).
     /// The raw transport drains in bursts, so `WouldBlock` is its "empty"
     /// signal; `enlarge_pipe` gives one poll pass room to hand a whole frame
     /// to the plugin.

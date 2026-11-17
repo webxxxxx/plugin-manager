@@ -1,7 +1,7 @@
-use crate::channel;
-use crate::ipc::{self, FrameEvent};
+use crate::wire::control::channel;
+use crate::wire::message::ipc::{self, FrameEvent};
 use crate::registry::{Kind, Registry};
-use crate::rpc;
+use crate::wire::message::rpc;
 use crate::server::mcp::result::{
     error_response, result_value, server_meta, tool_error_result, tool_result_object, SERVER_NAME,
 };
@@ -77,7 +77,7 @@ pub fn tool_error(id: Option<Value>, message: &str) -> rpc::Response {
 /// Serve one MCP client over stdio. The bridge never launches svcd; if the
 /// daemon is unreachable at startup it writes to stderr and exits 1.
 pub fn run_stdio() -> i32 {
-    let config = match crate::config::Config::bootstrap_or_report("mcp") {
+    let config = match crate::platform::config::Config::bootstrap_or_report("mcp") {
         Some(config) => config,
         None => return 1,
     };
@@ -476,7 +476,7 @@ mod tests {
             "1.0.0",
             caps,
             crate::registry::Carrier::Slot,
-            &crate::limits::test_default(),
+            &crate::platform::limits::test_default(),
         );
         Service {
             id: id.into(),
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn a_live_builtin_service_publishes_its_capabilities_without_start() {
-        let registry = Registry::with_builtin(&crate::limits::test_default());
+        let registry = Registry::with_builtin(&crate::platform::limits::test_default());
 
         let names = names(&tools(&registry, |_| true));
 

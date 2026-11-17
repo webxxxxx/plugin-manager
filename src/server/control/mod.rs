@@ -28,8 +28,8 @@ use self::listener::{ControlServer, Source};
 /// Start the server loop for the minimal (no HTTP) build: control channel only.
 #[cfg_attr(feature = "http", allow(dead_code))]
 pub fn spawn_control_only(
-    control: crate::channel::ControlBinding,
-    limits: std::sync::Arc<crate::limits::Limits>,
+    control: crate::wire::control::channel::ControlBinding,
+    limits: std::sync::Arc<crate::platform::limits::Limits>,
 ) -> std::io::Result<LoopHandle> {
     let (user, admin, tx, wake) = control.into_parts();
     let (notify_rx, notify_tx) = UnixStream::pair()?;
@@ -41,7 +41,7 @@ pub fn spawn_control_only(
     let control = ControlServer::new(user, admin, tx, wake, notify_tx)?;
     let join = thread::Builder::new()
         .name("svcd-server-loop".into())
-        .stack_size(crate::threads::transfer_stack(&limits))
+        .stack_size(crate::platform::host::threads::transfer_stack(&limits))
         .spawn(move || {
             let mut handler = ControlOnly {
                 control,
@@ -132,9 +132,9 @@ impl ServerLoop for ControlOnly {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channel::PendingCall;
-    use crate::rpc;
-    use crate::wake::Wake;
+    use crate::wire::control::channel::PendingCall;
+    use crate::wire::message::rpc;
+    use crate::platform::host::wake::Wake;
     use std::io::{BufRead, BufReader, Write};
     use std::sync::mpsc;
     use std::time::Duration;
@@ -164,10 +164,10 @@ mod tests {
                 )));
             }
         });
-        let control = crate::channel::bind_server(&root, tx, Arc::new(Wake::new()), 64 * 1024)
+        let control = crate::wire::control::channel::bind_server(&root, tx, Arc::new(Wake::new()), 64 * 1024)
             .expect("control channel");
         let handle =
-            spawn_control_only(control, std::sync::Arc::new(crate::limits::test_default()))
+            spawn_control_only(control, std::sync::Arc::new(crate::platform::limits::test_default()))
                 .expect("loop");
 
         let mut stream = UnixStream::connect(&path).expect("connect");

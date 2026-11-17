@@ -175,7 +175,7 @@ pub struct Service {
     /// runs it again and `svc stop` only runs the stop action.
     pub remain_after_exit: bool,
     /// Device compatibility list (schema-3 plugins); `None` means universal.
-    pub compat: Option<crate::compat::CompatSpec>,
+    pub compat: Option<crate::platform::compat::CompatSpec>,
     pub state: State,
     pub pid: Option<u32>,
     pub since: Option<u64>,
@@ -237,7 +237,7 @@ pub(crate) fn contract_for(
     version: &str,
     caps: Vec<KernelCapability>,
     carrier: Carrier,
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
 ) -> Contract {
     let failures = match carrier {
         Carrier::Launcher => Class::ALL.to_vec(),
@@ -284,7 +284,7 @@ impl Service {
     /// supervisor state machine. It is launcher-backed, so its contract uses
     /// the launcher failure set and default obligations: there is no supervised
     /// process to drive hooks or probes.
-    pub fn builtin_svc(limits: &crate::limits::Limits) -> Service {
+    pub fn builtin_svc(limits: &crate::platform::limits::Limits) -> Service {
         let caps = vec![
             KernelCapability {
                 name: CapabilityName::new("version"),
@@ -347,7 +347,7 @@ impl Registry {
         Registry::default()
     }
 
-    pub fn with_builtin(limits: &crate::limits::Limits) -> Self {
+    pub fn with_builtin(limits: &crate::platform::limits::Limits) -> Self {
         let mut registry = Registry::new();
         registry
             .insert(Service::builtin_svc(limits))
@@ -530,7 +530,7 @@ mod tests {
             "1.0.0",
             vec![cap.clone()],
             Carrier::Slot,
-            &crate::limits::test_default(),
+            &crate::platform::limits::test_default(),
         );
         let slot_cap = &slot.surface()[0];
         assert_eq!(slot_cap.effect, Effect::Write);
@@ -552,7 +552,7 @@ mod tests {
             "1.0.0",
             vec![read_cap],
             Carrier::Launcher,
-            &crate::limits::test_default(),
+            &crate::platform::limits::test_default(),
         );
         let builtin_cap = &builtin.surface()[0];
         assert_eq!(builtin_cap.effect, Effect::Read);
@@ -562,7 +562,7 @@ mod tests {
 
     #[test]
     fn the_builtin_service_declares_version_and_health() {
-        let service = Service::builtin_svc(&crate::limits::test_default());
+        let service = Service::builtin_svc(&crate::platform::limits::test_default());
         let names: Vec<&str> = service
             .contract
             .surface()
@@ -617,13 +617,13 @@ mod tests {
     }
 
     fn slot_backed(id: &str) -> Service {
-        let mut service = Service::builtin_svc(&crate::limits::test_default());
+        let mut service = Service::builtin_svc(&crate::platform::limits::test_default());
         let contract = contract_for(
             id,
             &service.version,
             service.contract.surface().to_vec(),
             Carrier::Slot,
-            &crate::limits::test_default(),
+            &crate::platform::limits::test_default(),
         );
         service.id = id.into();
         service.contract = contract;
@@ -639,13 +639,13 @@ mod tests {
     }
 
     fn launcher_backed(id: &str) -> Service {
-        let mut service = Service::builtin_svc(&crate::limits::test_default());
+        let mut service = Service::builtin_svc(&crate::platform::limits::test_default());
         let contract = contract_for(
             id,
             &service.version,
             service.contract.surface().to_vec(),
             Carrier::Launcher,
-            &crate::limits::test_default(),
+            &crate::platform::limits::test_default(),
         );
         service.id = id.into();
         service.contract = contract;
@@ -678,7 +678,7 @@ mod tests {
         let neither = Service {
             exec: None,
             impl_ref: None,
-            ..Service::builtin_svc(&crate::limits::test_default())
+            ..Service::builtin_svc(&crate::platform::limits::test_default())
         };
         assert_eq!(
             neither.carrier(),
@@ -717,7 +717,7 @@ mod tests {
 
     #[test]
     fn the_builtin_core_and_launcher_shapes_are_still_accepted() {
-        let mut registry = Registry::with_builtin(&crate::limits::test_default());
+        let mut registry = Registry::with_builtin(&crate::platform::limits::test_default());
         registry.insert(slot_backed("core")).expect("core");
         registry.insert(launcher_backed("built")).expect("launcher");
         assert!(registry.get("svc").is_some());

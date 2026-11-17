@@ -6,7 +6,7 @@
 //! keeps no process-wide copy — the composition root derives [`Config`] from
 //! one [`load`] and passes the value down.
 //!
-//! [`Config`]: crate::config::Config
+//! [`Config`]: crate::platform::config::Config
 //!
 //! `SVCD_BIND` overrides the `bind` key for tests and ad-hoc runs; explicit
 //! paths in `svcd.conf` win over the platform defaults.
@@ -123,7 +123,7 @@ impl Settings {
 
 /// The two loop cadences still accept their historical `SVCD_*` overrides.
 ///
-/// This runs at the composition root only ([`crate::config::Config::bootstrap`]),
+/// This runs at the composition root only ([`crate::platform::config::Config::bootstrap`]),
 /// like every other `SVCD_*` read. The `svcd.conf` keys are the supported knob;
 /// these two overrides are frozen — no new key may be added here, and removing
 /// them is the separate ticket ADR-0019 already left open.
@@ -143,7 +143,7 @@ fn env_u64(key: &str) -> Option<u64> {
 /// Load the document this process runs with.
 ///
 /// One call resolves the file *and* parses it, so the composition root
-/// ([`crate::config::Config::bootstrap`]) gets both values from a single read.
+/// ([`crate::platform::config::Config::bootstrap`]) gets both values from a single read.
 /// Precedence: an explicit `--conf` (which must exist), then
 /// `SVCD_CONFIG_DIR`, then `<program dir>/svcd.conf`, then the platform config
 /// directory. A missing file in a discovered location is an empty document,

@@ -4,11 +4,11 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::channel;
+use crate::wire::control::channel;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
-use crate::log;
-use crate::config::Config;
-use crate::rpc;
+use crate::platform::log;
+use crate::platform::config::Config;
+use crate::wire::message::rpc;
 use crate::status::{self, Status};
 
 pub const EXIT_OK: i32 = 0;
@@ -301,7 +301,7 @@ fn explain_unreachable(config: &Config) {
     if std::env::var_os("SVCD_CONFIG_DIR").is_some() {
         return;
     }
-    let machine = crate::paths::platform_config_dir();
+    let machine = crate::platform::paths::platform_config_dir();
     if machine == config.paths.config_dir || !machine_wide_install_present(&machine) {
         return;
     }
@@ -455,7 +455,7 @@ fn reload(config: &Config) -> i32 {
 }
 
 fn compat_show(config: &Config, json: bool) -> i32 {
-    let facts = crate::compat::detect(&config.paths, MAX_SCHEMA, MAX_PROTOCOL);
+    let facts = crate::platform::compat::detect(&config.paths, MAX_SCHEMA, MAX_PROTOCOL);
     if json {
         match serde_json::to_string_pretty(&facts) {
             Ok(text) => println!("{}", text),
@@ -490,17 +490,17 @@ fn compat_init(config: &Config, device: &str, dry_run: bool) -> i32 {
         eprintln!("svc: {}", error);
         return EXIT_SERVICE_ERROR;
     }
-    if let Err(error) = crate::compat::validate_device_id(device) {
+    if let Err(error) = crate::platform::compat::validate_device_id(device) {
         eprintln!("svc: {}", error);
         return EXIT_SERVICE_ERROR;
     }
-    let path = crate::compat::marker_path(&config.paths);
+    let path = crate::platform::compat::marker_path(&config.paths);
     if dry_run {
         println!("would write {}:", path.display());
         println!("device = {}", device);
         return EXIT_OK;
     }
-    if let Err(error) = crate::compat::write_device(&path, device) {
+    if let Err(error) = crate::platform::compat::write_device(&path, device) {
         eprintln!("svc: {}", error);
         return EXIT_SERVICE_ERROR;
     }
@@ -641,7 +641,7 @@ fn trust_command(config: &Config, action: TrustAction) -> i32 {
 }
 
 fn require_root_for_trust() -> Result<(), String> {
-    if crate::platform::is_privileged() || crate::paths::user_mode() {
+    if crate::platform::is_privileged() || crate::platform::paths::user_mode() {
         Ok(())
     } else {
         Err("root / Administrator is required to change trust roots".into())

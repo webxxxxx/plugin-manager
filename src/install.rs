@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::ambient_paths;
+use crate::platform::config::ambient_paths;
 
 const EXIT_OK: i32 = 0;
 const EXIT_ERROR: i32 = 1;
@@ -181,7 +181,7 @@ impl Layout {
 
     /// The same layout from an already-resolved directory set, so the daemon
     /// does not resolve the document again just to build `ensure_conf`'s view.
-    fn from_paths(paths: &crate::paths::Paths) -> Self {
+    fn from_paths(paths: &crate::platform::paths::Paths) -> Self {
         Layout {
             program: default_program(),
             data_dir: paths.data_dir.clone(),
@@ -199,7 +199,7 @@ impl Layout {
 /// the config directory is not writable).
 pub fn ensure_conf(
     explicit: Option<&Path>,
-    paths: &crate::paths::Paths,
+    paths: &crate::platform::paths::Paths,
 ) -> Result<PathBuf, String> {
     // The caller already resolved the directory set once; reusing it keeps the
     // daemon from parsing the same document a second time.
@@ -371,7 +371,7 @@ struct RuntimeDirs {
 }
 
 impl RuntimeDirs {
-    fn from_settings(settings: Option<&crate::settings::Settings>) -> Self {
+    fn from_settings(settings: Option<&crate::platform::settings::Settings>) -> Self {
         // Precedence differs from `ambient_paths`: the installer targets the
         // clean boot environment, so the target file's `install_dir` wins over
         // an ambient `SVCD_DATA_DIR`/`SVCD_LOG_DIR` (which still lose to an
@@ -381,7 +381,7 @@ impl RuntimeDirs {
             .map(PathBuf::from)
             .or_else(|| settings.and_then(|settings| settings.config_dir.clone()))
             .unwrap_or_else(|| match settings {
-                Some(_) => crate::paths::platform_config_dir(),
+                Some(_) => crate::platform::paths::platform_config_dir(),
                 None => ambient.config_dir.clone(),
             });
         let data = settings
@@ -458,7 +458,7 @@ fn daemon_launcher(program: &Path, dirs: &RuntimeDirs) -> String {
 /// Record the effective install root in the installed `svcd.conf`, keeping
 /// comments and the normal 0644 mode.
 fn record_install_dir(path: &Path, install_dir: &Path) -> Result<(), String> {
-    crate::settings::update_value(path, "install_dir", &install_dir.display().to_string())?;
+    crate::platform::settings::update_value(path, "install_dir", &install_dir.display().to_string())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -469,10 +469,10 @@ fn record_install_dir(path: &Path, install_dir: &Path) -> Result<(), String> {
 
 /// Parse the installed `svcd.conf`, if there is one, so `--uninstall` can find
 /// an `install_dir` without a `--conf` argument (uninstall does not accept one).
-fn installed_conf_settings() -> Option<crate::settings::Settings> {
+fn installed_conf_settings() -> Option<crate::platform::settings::Settings> {
     let path = ambient_paths(None).config_dir.join("svcd.conf");
     let text = fs::read_to_string(&path).ok()?;
-    crate::settings::parse(&text, path.parent().unwrap_or(Path::new("."))).ok()
+    crate::platform::settings::parse(&text, path.parent().unwrap_or(Path::new("."))).ok()
 }
 
 /// One reversible step of an installation plan.
@@ -1227,7 +1227,7 @@ pub fn self_install(args: &[String]) -> i32 {
             return EXIT_USAGE;
         }
     };
-    if crate::paths::user_mode() {
+    if crate::platform::paths::user_mode() {
         return self_install_user(request);
     }
     let prepared = match &request.conf {
@@ -1244,7 +1244,7 @@ pub fn self_install(args: &[String]) -> i32 {
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| ambient_paths(None).config_dir);
-            let settings = match crate::settings::parse(&text, &base) {
+            let settings = match crate::platform::settings::parse(&text, &base) {
                 Ok(settings) => settings,
                 Err(error) => {
                     eprintln!("svcd: {}: {}", path.display(), error);
@@ -1849,7 +1849,7 @@ fn self_install_user(request: SelfRequest) -> i32 {
                     .parent()
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| runtime.config.clone());
-                if let Err(error) = crate::settings::parse(&text, &base) {
+                if let Err(error) = crate::platform::settings::parse(&text, &base) {
                     eprintln!("svcd: {}: {}", path.display(), error);
                     return EXIT_ERROR;
                 }
@@ -2308,7 +2308,7 @@ pub fn self_uninstall(args: &[String], stop_daemon: &dyn Fn()) -> i32 {
         }
     };
     #[cfg(windows)]
-    if crate::paths::user_mode()
+    if crate::platform::paths::user_mode()
         && !request.dry_run
         && self_uninstall_current(&request)
         && !current_is_uninstaller(&request)
@@ -2318,7 +2318,7 @@ pub fn self_uninstall(args: &[String], stop_daemon: &dyn Fn()) -> i32 {
         }
         return spawn_uninstall_helper(args);
     }
-    if crate::paths::user_mode() {
+    if crate::platform::paths::user_mode() {
         return self_uninstall_user(request, stop_daemon);
     }
     let installed = installed_conf_settings();

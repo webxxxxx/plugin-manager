@@ -6,7 +6,7 @@
 //! A browser loading one page therefore costs one connection, not one thread
 //! per asset, and a one-shot asset never consumes `max_streams`.
 
-use crate::config::Config;
+use crate::platform::config::Config;
 use crate::face::plugin_streams::{self, StreamContext};
 use crate::http;
 use crate::lan::Lan;
@@ -85,7 +85,7 @@ impl PluginUiFace {
     pub fn with_streams(
         lan: Arc<Mutex<Lan>>,
         config: Arc<Config>,
-        raw_hub: Option<Arc<crate::rawhub::RawHub>>,
+        raw_hub: Option<Arc<crate::wire::contract::rawhub::RawHub>>,
     ) -> PluginUiFace {
         PluginUiFace {
             lan,
@@ -123,7 +123,7 @@ impl PluginUiFace {
         peer: IpAddr,
         lan: &Arc<Mutex<Lan>>,
         config: Arc<Config>,
-        raw_hub: Option<Arc<crate::rawhub::RawHub>>,
+        raw_hub: Option<Arc<crate::wire::contract::rawhub::RawHub>>,
     ) -> Result<Exchange, Vec<u8>> {
         let Some(route) = PluginUiFace::route_for(&head.method, &head.path) else {
             return Err(http::json_error(404, "not_found", "not a plugin UI path"));

@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::package;
-use crate::paths::Paths;
+use crate::platform::paths::Paths;
 
 /// Public keys are tiny; a larger file is a mistake, not a key.
 pub const MAX_KEY_BYTES: u64 = 16 * 1024;

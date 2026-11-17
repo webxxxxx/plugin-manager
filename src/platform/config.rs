@@ -12,9 +12,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::limits::{self, Limits};
-use crate::paths::Paths;
-use crate::settings::{self, Settings};
+use crate::platform::limits::{self, Limits};
+use crate::platform::paths::Paths;
+use crate::platform::settings::{self, Settings};
 
 /// Everything the composition root derives from one `svcd.conf`: the parsed
 /// document, the file it came from, the directory set, and the limits.

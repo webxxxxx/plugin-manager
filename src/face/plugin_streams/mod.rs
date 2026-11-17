@@ -21,7 +21,7 @@ use crate::face::plugin_ui::{PluginUiStream, UiPath};
 use crate::http;
 use crate::lan::{AuthKind, Lan};
 use crate::package;
-use crate::paths::Paths;
+use crate::platform::paths::Paths;
 use crate::plugin;
 use crate::server::http::{Request, StreamHandler};
 use crate::uichannel;
@@ -32,8 +32,8 @@ pub(crate) struct StreamContext {
     /// The one directory set: the control endpoint (`paths.config_dir`) and the
     /// plugin tree both come from it.
     pub paths: Arc<Paths>,
-    pub raw_hub: Option<Arc<crate::rawhub::RawHub>>,
-    pub limits: Arc<crate::limits::Limits>,
+    pub raw_hub: Option<Arc<crate::wire::contract::rawhub::RawHub>>,
+    pub limits: Arc<crate::platform::limits::Limits>,
 }
 
 /// Why a realtime request was refused before its first handler byte.

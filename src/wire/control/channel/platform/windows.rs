@@ -21,13 +21,13 @@ use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PeekNamedPipe, WaitNamedPipeW,
 };
 
-use crate::channel::{
+use crate::wire::control::channel::{
     ControlChannel, ControlListener, ControlStream, Endpoint, PendingCall, Reply,
 };
-use crate::ipc;
+use crate::wire::message::ipc;
 use crate::platform::host::acl::Acl;
-use crate::rpc;
-use crate::wake::Wake;
+use crate::wire::message::rpc;
+use crate::platform::host::wake::Wake;
 
 const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
 const PIPE_TYPE_BYTE: u32 = 0x0000_0000;

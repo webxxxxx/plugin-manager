@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crate::http;
 use crate::lan::{AuthKind, Lan};
-use crate::log;
+use crate::platform::log;
 
 use super::contract::{
     body_for, BodyError, BodyPolicy, CompletionSlot, Dispatch, Exchange, ExchangeKind, Face,

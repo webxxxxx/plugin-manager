@@ -1,6 +1,6 @@
 //! The host's control-channel implementation.
 //!
-//! `channel.rs` works against the [`crate::channel::ControlChannel`] interface
+//! `channel.rs` works against the [`crate::wire::control::channel::ControlChannel`] interface
 //! and never names a platform. This module is the only place that chooses an
 //! implementation: UDS on Unix, a named pipe elsewhere. The two modules export
 //! the same names, so adding a third host means one more `mod`/`use` pair and

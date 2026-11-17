@@ -32,10 +32,10 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::ipc::{self, FrameEvent};
-use crate::log::LogSink;
-use crate::threads;
-use crate::wake::Wake;
+use crate::wire::message::ipc::{self, FrameEvent};
+use crate::platform::log::LogSink;
+use crate::platform::host::threads;
+use crate::platform::host::wake::Wake;
 
 /// Whether one standard stream is piped to the parent or opened on `/dev/null`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -211,7 +211,7 @@ pub(crate) fn log_lines(
     name: String,
     stream: ReadEnd,
     log: Option<Arc<Mutex<LogSink>>>,
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
 ) -> io::Result<()> {
     thread::Builder::new()
         .name(name)
@@ -239,7 +239,7 @@ fn log_line(log: &Option<Arc<Mutex<LogSink>>>, line: &str) {
 #[derive(Clone, Default)]
 pub(crate) struct Target {
     #[cfg(unix)]
-    reactor: Option<Arc<crate::reactor::Reactor>>,
+    reactor: Option<Arc<crate::wire::contract::reactor::Reactor>>,
 }
 
 impl Target {
@@ -251,7 +251,7 @@ impl Target {
 
     /// The supervisor loop's poll set: no per-plugin threads.
     #[cfg(unix)]
-    pub(crate) fn polled(reactor: Arc<crate::reactor::Reactor>) -> Self {
+    pub(crate) fn polled(reactor: Arc<crate::wire::contract::reactor::Reactor>) -> Self {
         Self {
             reactor: Some(reactor),
         }
@@ -268,14 +268,14 @@ impl Target {
         sender: SyncSender<FrameEvent>,
         wake: Option<Arc<Wake>>,
         log: Option<Arc<Mutex<LogSink>>>,
-        limits: &crate::limits::Limits,
+        limits: &crate::platform::limits::Limits,
     ) -> io::Result<()> {
         #[cfg(unix)]
         if let Some(reactor) = &self.reactor {
             let framing = if protocol >= 2 {
-                crate::reactor::Framing::Length
+                crate::wire::contract::reactor::Framing::Length
             } else {
-                crate::reactor::Framing::Lines
+                crate::wire::contract::reactor::Framing::Lines
             };
             return reactor.register(
                 id,
@@ -320,7 +320,7 @@ impl Target {
         stdout: ReadEnd,
         stderr: Option<ReadEnd>,
         log: Option<Arc<Mutex<LogSink>>>,
-        limits: &crate::limits::Limits,
+        limits: &crate::platform::limits::Limits,
     ) -> io::Result<()> {
         #[cfg(unix)]
         if let Some(reactor) = &self.reactor {
@@ -364,7 +364,7 @@ impl Target {
 /// supervisor loop binds it while a hook blocks that loop.
 pub(crate) fn pump_waiting_loop() {
     #[cfg(unix)]
-    crate::reactor::poll_waiting_loop();
+    crate::wire::contract::reactor::poll_waiting_loop();
 }
 
 #[cfg(test)]
@@ -488,7 +488,7 @@ mod tests {
                 sender,
                 None,
                 None,
-                &crate::limits::test_default(),
+                &crate::platform::limits::test_default(),
             )
             .expect("reader threads");
         drop(streams.stdin);

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::paths::Paths;
+use crate::platform::paths::Paths;
 
 /// Why a storage operation failed (#151).
 ///

@@ -17,7 +17,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::compat::CompatSpec;
+use crate::platform::compat::CompatSpec;
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 
@@ -1633,7 +1633,7 @@ fn check_compat(manifest: &Manifest) -> Result<(), ProblemError> {
             }
             let mut seen = BTreeSet::new();
             for device in &spec.devices {
-                crate::compat::validate_device_id(device)
+                crate::platform::compat::validate_device_id(device)
                     .map_err(|error| Problem::Invalid.error(format!("compat.devices: {}", error)))?;
                 if !seen.insert(device) {
                     return Err(Problem::Invalid.error(format!("duplicate compat device id: {}", device)));

@@ -1,14 +1,22 @@
 //! L0 platform: host resources and OS capabilities.
 //!
-//! The full `platform/` layout in `docs/architecture.md` §5 lands with the
-//! directory move. This module currently holds only the pieces that migrated
-//! out of the domain layers to break the upward edges `dep-lint` reported
-//! (see #137): privilege detection and the target triple.
+//! The `platform/` layout from `docs/architecture.md` §5 lands with step 6
+//! (#170): directories, configuration, host facts and content storage live
+//! here. The five-file split of `storage/blob.rs` remains a follow-up ticket.
 //!
 //! A platform module may hold technical resources, but never a service,
 //! capability or call concept (§7 rule 4), and it depends on nothing above it.
 
+pub mod auth;
+pub mod clock;
+pub mod compat;
+pub mod config;
 pub mod host;
+pub mod limits;
+pub mod log;
+pub mod paths;
+pub mod settings;
+pub mod storage;
 
 pub use host::privilege::is_privileged;
 pub use host::target::target;

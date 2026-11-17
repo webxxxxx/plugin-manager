@@ -13,14 +13,14 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use crate::config::Config;
+use crate::platform::config::Config;
 use crate::http;
 use crate::kernel::failure::ProblemError;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::lan::{self, AuthKind, Lan};
-use crate::log;
+use crate::platform::log;
 use crate::package;
-use crate::paths::Paths;
+use crate::platform::paths::Paths;
 use crate::plugin;
 use crate::server::http::{
     BodyPolicy, Completion, Dispatch, Exchange, Face, Request, Response, Route,
@@ -314,7 +314,7 @@ impl ApiFace {
         match (request.method.as_str(), parts.as_slice()) {
             ("GET", ["api", "v1", "compat"]) => Response::json(
                 200,
-                &serde_json::to_value(crate::compat::detect(
+                &serde_json::to_value(crate::platform::compat::detect(
                     &self.config.paths,
                     MAX_SCHEMA,
                     MAX_PROTOCOL,
@@ -436,7 +436,7 @@ fn is_transfer_path(method: &str, path: &str) -> bool {
     }
 }
 
-fn body_policy(method: &str, path: &str, limits: &crate::limits::Limits) -> BodyPolicy {
+fn body_policy(method: &str, path: &str, limits: &crate::platform::limits::Limits) -> BodyPolicy {
     if is_login(method, path) {
         return BodyPolicy::Buffered {
             limit: limits.max_json_body,
@@ -663,7 +663,7 @@ mod tests {
             nanos
         ));
         Arc::new(Config::with_paths(
-            crate::settings::Settings::default(),
+            crate::platform::settings::Settings::default(),
             None,
             Paths::under(&root),
         ))
@@ -675,7 +675,7 @@ mod tests {
 
     fn face_with_password() -> ApiFace {
         let bind = "127.0.0.1:0".parse().expect("bind");
-        let hash = crate::auth::hash_password("secret").expect("hash");
+        let hash = crate::platform::auth::hash_password("secret").expect("hash");
         ApiFace::new(
             test_config(),
             Arc::new(Mutex::new(Lan::new(bind, bind, true, Some(hash)))),

@@ -393,7 +393,7 @@ fn assemble_manifest(
         let mut seen = BTreeSet::new();
         let mut devices = Vec::new();
         for device in &options.compat {
-            crate::compat::validate_device_id(device)
+            crate::platform::compat::validate_device_id(device)
                 .map_err(|error| Problem::Invalid.error(format!("--compat {}: {}", device, error)))?;
             if seen.insert(device.clone()) {
                 devices.push(device.clone());

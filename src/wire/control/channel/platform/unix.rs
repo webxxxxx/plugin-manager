@@ -10,8 +10,8 @@ use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::channel::{ControlChannel, ControlListener, ControlStream, Endpoint, PendingCall};
-use crate::wake::Wake;
+use crate::wire::control::channel::{ControlChannel, ControlListener, ControlStream, Endpoint, PendingCall};
+use crate::platform::host::wake::Wake;
 
 pub(crate) struct Platform;
 

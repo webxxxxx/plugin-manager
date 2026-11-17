@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::package;
-use crate::rpc;
+use crate::wire::message::rpc;
 
 /// The page-facing JSON-RPC bridge for `/plugin-ui/{id}/rpc`.
 ///

@@ -204,7 +204,7 @@ pub trait ServerLoop {
 }
 
 #[cfg(unix)]
-pub fn run<S, H>(listener: Option<TcpListener>, handler: &mut H, limits: &crate::limits::Limits)
+pub fn run<S, H>(listener: Option<TcpListener>, handler: &mut H, limits: &crate::platform::limits::Limits)
 where
     H: ServerLoop<State = S>,
 {
@@ -286,7 +286,7 @@ where
         if ready < 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() != std::io::ErrorKind::Interrupted {
-                crate::log::svcd(&format!("svcd: server loop poll failed: {}", error));
+                crate::platform::log::svcd(&format!("svcd: server loop poll failed: {}", error));
             }
             continue;
         }
@@ -329,7 +329,7 @@ where
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(error) => {
-                            crate::log::svcd(&format!(
+                            crate::platform::log::svcd(&format!(
                                 "svcd: server loop accept failed: {}",
                                 error
                             ));
@@ -622,7 +622,7 @@ pub fn keep_alive_response(mut response: Vec<u8>) -> Vec<u8> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    const M: usize = crate::limits::MAX_HEADER;
+    const M: usize = crate::platform::limits::MAX_HEADER;
 
     use super::*;
 

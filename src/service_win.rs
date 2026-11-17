@@ -35,7 +35,7 @@ use windows_sys::Win32::System::Services::{
     SERVICE_WIN32_OWN_PROCESS,
 };
 
-use crate::channel;
+use crate::wire::control::channel;
 use crate::install::SCM_NAME;
 
 /// The SCM gives a start request 30 seconds; report the same hint and probe for
@@ -88,7 +88,7 @@ pub fn run_if_service(
     // when it exists, or from the ordinary discovery otherwise; the daemon
     // thread then loads the same file through `Config::bootstrap`.
     let explicit = conf.as_deref().filter(|path| path.is_file());
-    let _ = SERVICE_ENDPOINT.set(crate::config::ambient_paths(explicit).config_dir);
+    let _ = SERVICE_ENDPOINT.set(crate::platform::config::ambient_paths(explicit).config_dir);
     let _ = SERVICE_CONF.set(conf);
     let _ = DAEMON_RUN.set(run_daemon);
     let _ = DAEMON_SHUTDOWN.set(request_shutdown);
@@ -187,7 +187,7 @@ fn wait_until_ready(daemon: &JoinHandle<i32>) -> bool {
     let endpoint = SERVICE_ENDPOINT
         .get()
         .cloned()
-        .unwrap_or_else(|| crate::config::ambient_paths(None).config_dir);
+        .unwrap_or_else(|| crate::platform::config::ambient_paths(None).config_dir);
     loop {
         if daemon.is_finished() {
             return false;

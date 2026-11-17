@@ -98,7 +98,7 @@ impl EventBus {
     pub fn subscribe(
         self: &Arc<Self>,
         plugin: &str,
-        limits: &crate::limits::Limits,
+        limits: &crate::platform::limits::Limits,
     ) -> Result<(Receiver<Event>, Subscription), SubscribeError> {
         let (receiver, subscription, _) = self.subscribe_from(plugin, None, limits)?;
         Ok((receiver, subscription))
@@ -111,7 +111,7 @@ impl EventBus {
         self: &Arc<Self>,
         plugin: &str,
         last_event_id: Option<u64>,
-        limits: &crate::limits::Limits,
+        limits: &crate::platform::limits::Limits,
     ) -> Result<(Receiver<Event>, Subscription, Replay), SubscribeError> {
         let (sender, receiver) = mpsc::sync_channel(QUEUE);
         let id = self.next_sub.fetch_add(1, Ordering::SeqCst) + 1;
@@ -156,7 +156,7 @@ impl EventBus {
         self: &Arc<Self>,
         plugin: &str,
         sender: SyncSender<Event>,
-        limits: &crate::limits::Limits,
+        limits: &crate::platform::limits::Limits,
     ) -> Result<Subscription, SubscribeError> {
         let id = self.next_sub.fetch_add(1, Ordering::SeqCst) + 1;
         self.reserve_subscriber(limits)?;
@@ -174,7 +174,7 @@ impl EventBus {
         })
     }
 
-    fn reserve_subscriber(&self, limits: &crate::limits::Limits) -> Result<(), SubscribeError> {
+    fn reserve_subscriber(&self, limits: &crate::platform::limits::Limits) -> Result<(), SubscribeError> {
         let max = limits.max_subscriptions;
         let mut current = self.total_subscribers.load(Ordering::SeqCst);
         loop {
@@ -458,9 +458,9 @@ mod tests {
     #[test]
     fn event_bus_fans_out_and_limits_subscribers() {
         let bus = Arc::new(EventBus::new());
-        let limits = crate::limits::test_default();
+        let limits = crate::platform::limits::test_default();
         let (receiver, subscription) = bus
-            .subscribe("demo", &crate::limits::test_default())
+            .subscribe("demo", &crate::platform::limits::test_default())
             .expect("subscribe");
         bus.publish("demo", "notifications/message", &json!({"data": "one"}));
         let event = receiver
@@ -493,7 +493,7 @@ mod tests {
     fn event_bus_forgets_a_purged_plugin() {
         let bus = Arc::new(EventBus::new());
         let (_receiver, subscription) = bus
-            .subscribe("demo", &crate::limits::test_default())
+            .subscribe("demo", &crate::platform::limits::test_default())
             .expect("subscribe");
         bus.publish("demo", "notifications/message", &json!({"data": "one"}));
         assert!(bus.history_len("demo") > 0);
@@ -512,7 +512,7 @@ mod tests {
         bus.publish("replay", "notifications/message", &json!({"data": "two"}));
         bus.publish("replay", "notifications/message", &json!({"data": "three"}));
         let (receiver, subscription, replay) = bus
-            .subscribe_from("replay", Some(1), &crate::limits::test_default())
+            .subscribe_from("replay", Some(1), &crate::platform::limits::test_default())
             .expect("subscribe");
         assert!(!replay.reset);
         assert_eq!(replay.replayed, 2);
@@ -540,7 +540,7 @@ mod tests {
         }
         assert_eq!(bus.history_len("gap"), HISTORY_EVENTS);
         let (receiver, subscription, replay) = bus
-            .subscribe_from("gap", Some(1), &crate::limits::test_default())
+            .subscribe_from("gap", Some(1), &crate::platform::limits::test_default())
             .expect("subscribe");
         assert!(replay.reset);
         assert_eq!(replay.replayed, HISTORY_EVENTS);

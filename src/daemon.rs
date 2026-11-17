@@ -15,10 +15,10 @@ use crate::api::{self, Api};
 #[cfg(not(feature = "http"))]
 type Api = ();
 use crate::catalog;
-use crate::channel;
-use crate::clock::{Clock, Now};
-use crate::compat;
-use crate::config::Config;
+use crate::wire::control::channel;
+use crate::platform::clock::{Clock, Now};
+use crate::platform::compat;
+use crate::platform::config::Config;
 use crate::definition;
 use crate::kernel::contract::{
     CapabilityName, Instance, Invocation, Launchers, ProgressToken, Reply, ReplySink,
@@ -26,22 +26,22 @@ use crate::kernel::contract::{
 use crate::kernel::failure::{Class, Failure, Problem, ProblemError, Rejection, Retry};
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::lan::LanStatus;
-use crate::log;
+use crate::platform::log;
 use crate::mcp;
 use crate::package;
-use crate::paths::Paths;
+use crate::platform::paths::Paths;
 use crate::plugin::{self, Strategy};
 #[cfg(unix)]
-use crate::reactor::Reactor;
+use crate::wire::contract::reactor::Reactor;
 use crate::registry::{Hook, Kind, Registry, Service, State, RESERVED_ID};
-use crate::rpc;
+use crate::wire::message::rpc;
 use crate::runtime::{self, Record};
-use crate::settings;
+use crate::platform::settings;
 use crate::slot::hook_command;
 use crate::slot::{Slot, SlotWire};
 use crate::status::Status;
 use crate::supervisor::{self, Event};
-use crate::wake::Wake;
+use crate::platform::host::wake::Wake;
 
 /// The supervisor loop's bounded wait when it has no earlier deadline. With a
 /// reactor this is the plugin poll's timeout, so an idle daemon wakes once per
@@ -168,7 +168,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         &config.paths.config_dir,
         tx,
         wake.clone(),
-        crate::threads::io_stack(&config.limits),
+        crate::platform::host::threads::io_stack(&config.limits),
     ) {
         Ok(control) => control,
         Err(error) => {
@@ -177,7 +177,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         }
     };
     #[cfg(feature = "http")]
-    let raw_hub = crate::rawhub::RawHub::new(config.limits.clone());
+    let raw_hub = crate::wire::contract::rawhub::RawHub::new(config.limits.clone());
     // The driver picks itself inside `server::http::entry`; the composition
     // root only hands over the control plumbing it owns.
     #[cfg(feature = "http")]
@@ -212,7 +212,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     #[cfg(all(not(unix), not(feature = "http")))]
     drop(control);
     #[cfg(not(feature = "http"))]
-    let raw_hub = crate::rawhub::RawHub::new(config.limits.clone());
+    let raw_hub = crate::wire::contract::rawhub::RawHub::new(config.limits.clone());
     #[cfg(not(feature = "http"))]
     let api: Option<Arc<Api>> = None;
     notify_systemd("READY=1");
@@ -393,7 +393,7 @@ pub fn shutdown_quiet() -> i32 {
 fn shutdown_inner(verbose: bool) -> i32 {
     // Stopping only needs the control endpoint; a broken `svcd.conf` must not
     // make `svcd stop` unusable.
-    let paths = crate::config::ambient_paths(None);
+    let paths = crate::platform::config::ambient_paths(None);
     match channel::request(&paths.config_dir, "svcd.shutdown", json!({})) {
         Ok(response) => match response.error {
             Some(error) => {
@@ -491,15 +491,15 @@ struct Daemon {
     reactor: Option<Arc<Reactor>>,
     /// Who reads plugin stdio: copied into every slot, including ones created
     /// after the poll set started.
-    stdio: crate::stdio::Target,
-    raw_hub: Arc<crate::rawhub::RawHub>,
+    stdio: crate::wire::contract::stdio::Target,
+    raw_hub: Arc<crate::wire::contract::rawhub::RawHub>,
 }
 
 impl Daemon {
     #[cfg(test)]
     fn new(registry: Registry, rx: Receiver<channel::PendingCall>, api: Option<Arc<Api>>) -> Self {
         let config = Arc::new(Config::with_paths(
-            crate::settings::Settings::default(),
+            crate::platform::settings::Settings::default(),
             None,
             {
                 let nanos = SystemTime::now()
@@ -520,7 +520,7 @@ impl Daemon {
             registry,
             rx,
             api,
-            crate::rawhub::RawHub::new(config.limits.clone()),
+            crate::wire::contract::rawhub::RawHub::new(config.limits.clone()),
             config,
         )
     }
@@ -529,7 +529,7 @@ impl Daemon {
         registry: Registry,
         rx: Receiver<channel::PendingCall>,
         api: Option<Arc<Api>>,
-        raw_hub: Arc<crate::rawhub::RawHub>,
+        raw_hub: Arc<crate::wire::contract::rawhub::RawHub>,
         config: Arc<Config>,
     ) -> Self {
         let wake = Arc::new(Wake::new());
@@ -582,7 +582,7 @@ impl Daemon {
             next_temp_cleanup_ms: 0,
             #[cfg(unix)]
             reactor: None,
-            stdio: crate::stdio::Target::threaded(),
+            stdio: crate::wire::contract::stdio::Target::threaded(),
             raw_hub,
         }
     }
@@ -780,7 +780,7 @@ impl Daemon {
         if let Some(reactor) = &reactor {
             // Synchronous waits on this thread (an install hook, a status
             // hook) poll through this binding, so plugin pipes keep moving.
-            crate::reactor::bind_waiting_loop(reactor);
+            crate::wire::contract::reactor::bind_waiting_loop(reactor);
             match reactor.interrupt_handle() {
                 Ok(interrupt) => self.wake.set_interrupt(interrupt),
                 // Without the self-pipe the loop still polls, so requests are
@@ -794,15 +794,15 @@ impl Daemon {
         }
         self.reactor = reactor.clone();
         self.stdio = match reactor {
-            Some(reactor) => crate::stdio::Target::polled(reactor),
-            None => crate::stdio::Target::threaded(),
+            Some(reactor) => crate::wire::contract::stdio::Target::polled(reactor),
+            None => crate::wire::contract::stdio::Target::threaded(),
         };
         for slot in self.slots.values_mut() {
             slot.set_stdio(self.stdio.clone());
         }
     }
 
-    fn set_raw_hub(&mut self, raw_hub: Arc<crate::rawhub::RawHub>) {
+    fn set_raw_hub(&mut self, raw_hub: Arc<crate::wire::contract::rawhub::RawHub>) {
         self.raw_hub = raw_hub;
         for slot in self.slots.values_mut() {
             slot.set_raw_hub(Some(self.raw_hub.clone()));
@@ -898,7 +898,7 @@ impl Daemon {
         }
         if self.temp_cleanup_interval_ms > 0 && now.mono_ms >= self.next_temp_cleanup_ms {
             self.next_temp_cleanup_ms = now.mono_ms.saturating_add(self.temp_cleanup_interval_ms);
-            match crate::blob::cleanup(&self.config.paths, self.temp_retention) {
+            match crate::platform::storage::blob::cleanup(&self.config.paths, self.temp_retention) {
                 Ok(0) => {}
                 Ok(removed) => {
                     log::svcd(&format!("svcd: temp cleanup removed {} file(s)", removed))
@@ -1110,7 +1110,7 @@ impl Daemon {
             self.config.settings_path.as_deref().ok_or_else(|| {
                 ProblemError::new(Problem::Internal, "svcd.conf path is unavailable")
             })?;
-        let hash = crate::auth::hash_password(password)
+        let hash = crate::platform::auth::hash_password(password)
             .map_err(|detail| ProblemError::new(Problem::Internal, detail))?;
         settings::update_value(path, "auth_passwd", &hash)
             .map_err(|detail| ProblemError::new(Problem::Internal, detail))?;
@@ -1222,7 +1222,7 @@ impl Daemon {
         &mut self,
         clock: &Clock,
         request: rpc::Request,
-        reply: crate::channel::Reply,
+        reply: crate::wire::control::channel::Reply,
     ) {
         let id = request.id.clone();
         let name = request
@@ -1301,7 +1301,7 @@ impl Daemon {
         }
 
         let mut arguments = arguments;
-        if let Err(message) = crate::blob::resolve_args(&self.config.paths, &mut arguments) {
+        if let Err(message) = crate::platform::storage::blob::resolve_args(&self.config.paths, &mut arguments) {
             send(
                 &reply,
                 mcp::tool_error(id, &format!("cannot resolve blob argument: {}", message)),
@@ -2439,7 +2439,7 @@ fn project_slot_outcome(external_id: Option<Value>, outcome: Result<Value, Failu
 /// Build the completion sink for one tools/call: a stream reply is an
 /// implementation error, and the final value/failure is projected by the face.
 fn projected_done(
-    reply: crate::channel::Reply,
+    reply: crate::wire::control::channel::Reply,
     external_id: Option<Value>,
     stream_error: &'static str,
     project: fn(Option<Value>, Result<Value, Failure>) -> String,
@@ -2489,7 +2489,7 @@ fn project_builtin_outcome(external_id: Option<Value>, outcome: Result<Value, Fa
 
 /// Give a slot its contract and the face-side projections. The slot itself no
 /// longer knows MCP or the UI bus.
-fn configure_slot(slot: &mut Slot, service: &Service, limits: &crate::limits::Limits) {
+fn configure_slot(slot: &mut Slot, service: &Service, limits: &crate::platform::limits::Limits) {
     slot.set_contract(service.contract.clone());
     slot.set_call_timeout(limits.default_timeout);
     slot.set_projector(Arc::new(project_slot_outcome));
@@ -2504,7 +2504,7 @@ fn configure_slot(slot: &mut Slot, service: &Service, limits: &crate::limits::Li
     }));
 }
 
-fn send(reply: &crate::channel::Reply, response: rpc::Response) {
+fn send(reply: &crate::wire::control::channel::Reply, response: rpc::Response) {
     reply.send(rpc::to_line(&response));
 }
 
@@ -2729,7 +2729,7 @@ mod tests {
                 "1.0.0",
                 caps,
                 crate::registry::Carrier::Slot,
-                &crate::limits::test_default(),
+                &crate::platform::limits::test_default(),
             ),
             ..service(id, &[])
         }
@@ -2741,7 +2741,7 @@ mod tests {
             "1.0.0",
             Vec::new(),
             crate::registry::Carrier::Slot,
-            &crate::limits::test_default(),
+            &crate::platform::limits::test_default(),
         );
         Service {
             id: id.into(),
@@ -2788,7 +2788,7 @@ mod tests {
     fn the_daemon_does_not_spawn_call_worker_threads() {
         let (_sender, receiver) = mpsc::channel();
         let _daemon = Daemon::new(
-            Registry::with_builtin(&crate::limits::test_default()),
+            Registry::with_builtin(&crate::platform::limits::test_default()),
             receiver,
             None,
         );
@@ -2974,7 +2974,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             "1.0.0",
             caps,
             crate::registry::Carrier::Slot,
-            &crate::limits::test_default(),
+            &crate::platform::limits::test_default(),
         );
         Service {
             id: id.into(),
@@ -3016,7 +3016,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             channel::PendingCall {
                 endpoint: channel::Endpoint::Admin,
                 line,
-                reply: crate::channel::Reply::plain(sender),
+                reply: crate::wire::control::channel::Reply::plain(sender),
             },
         );
         receiver
@@ -3042,7 +3042,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             channel::PendingCall {
                 endpoint,
                 line,
-                reply: crate::channel::Reply::plain(sender),
+                reply: crate::wire::control::channel::Reply::plain(sender),
             },
         );
         let line = receiver.recv().expect("reply");
@@ -3060,7 +3060,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
     fn the_read_endpoint_cannot_run_a_write_method() {
         let (_sender, receiver) = mpsc::channel();
         let mut daemon = Daemon::new(
-            Registry::with_builtin(&crate::limits::test_default()),
+            Registry::with_builtin(&crate::platform::limits::test_default()),
             receiver,
             None,
         );
@@ -3093,7 +3093,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
     fn the_admin_endpoint_reaches_a_write_method() {
         let (_sender, receiver) = mpsc::channel();
         let mut daemon = Daemon::new(
-            Registry::with_builtin(&crate::limits::test_default()),
+            Registry::with_builtin(&crate::platform::limits::test_default()),
             receiver,
             None,
         );
@@ -3126,7 +3126,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
     fn next_wait_shrinks_for_the_nearest_timer_and_never_exceeds_the_poll_tick() {
         let (_sender, receiver) = mpsc::channel();
         let mut daemon = Daemon::new(
-            Registry::with_builtin(&crate::limits::test_default()),
+            Registry::with_builtin(&crate::platform::limits::test_default()),
             receiver,
             None,
         );
@@ -3155,7 +3155,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
     fn tick_rearms_a_due_rescan_timer_without_double_firing() {
         let (_sender, receiver) = mpsc::channel();
         let mut daemon = Daemon::new(
-            Registry::with_builtin(&crate::limits::test_default()),
+            Registry::with_builtin(&crate::platform::limits::test_default()),
             receiver,
             None,
         );
@@ -3180,7 +3180,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
     fn tick_rearms_the_temp_cleanup_timer_from_its_own_now() {
         let (_sender, receiver) = mpsc::channel();
         let mut daemon = Daemon::new(
-            Registry::with_builtin(&crate::limits::test_default()),
+            Registry::with_builtin(&crate::platform::limits::test_default()),
             receiver,
             None,
         );
@@ -3431,7 +3431,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
                     "1.0.0",
                     caps,
                     crate::registry::Carrier::Slot,
-                    &crate::limits::test_default(),
+                    &crate::platform::limits::test_default(),
                 );
                 service
             })
@@ -3453,7 +3453,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             let tools = page["tools"].as_array().expect("tools");
             assert!(!tools.is_empty());
             assert!(
-                serde_json::to_vec(tools).expect("serialize").len() <= crate::ipc::CATALOG_PAGE_MAX
+                serde_json::to_vec(tools).expect("serialize").len() <= crate::wire::message::ipc::CATALOG_PAGE_MAX
             );
             total += tools.len();
             cursor = page["nextCursor"].as_str().map(str::to_string);
@@ -3619,7 +3619,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             "9.9.9",
             conflicting_live.contract.surface().to_vec(),
             crate::registry::Carrier::Launcher,
-            &crate::limits::test_default(),
+            &crate::platform::limits::test_default(),
         );
         desired.insert("live".to_string(), conflicting_live);
 
@@ -3652,7 +3652,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
 
     #[test]
     fn the_assembly_point_keeps_one_carrier_per_service() {
-        let mut registry = Registry::with_builtin(&crate::limits::test_default());
+        let mut registry = Registry::with_builtin(&crate::platform::limits::test_default());
         registry.insert(service("core", &[])).expect("core");
         let (_sender, receiver) = mpsc::channel();
         let daemon = Daemon::new(registry, receiver, None);
@@ -3679,7 +3679,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
     fn the_builtin_svc_is_projected_and_called_through_launchers() {
         let (_sender, receiver) = mpsc::channel();
         let mut daemon = Daemon::new(
-            Registry::with_builtin(&crate::limits::test_default()),
+            Registry::with_builtin(&crate::platform::limits::test_default()),
             receiver,
             None,
         );
@@ -3762,7 +3762,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
     fn lifecycle_management_errors_carry_their_problem_kind() {
         let (_sender, receiver) = mpsc::channel();
         let mut daemon = Daemon::new(
-            Registry::with_builtin(&crate::limits::test_default()),
+            Registry::with_builtin(&crate::platform::limits::test_default()),
             receiver,
             None,
         );
@@ -3820,7 +3820,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
     fn plugin_management_errors_carry_their_problem_kind() {
         let (_sender, receiver) = mpsc::channel();
         let mut daemon = Daemon::new(
-            Registry::with_builtin(&crate::limits::test_default()),
+            Registry::with_builtin(&crate::platform::limits::test_default()),
             receiver,
             None,
         );
@@ -3870,7 +3870,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
     fn auth_and_parameter_errors_carry_their_problem_kind() {
         let (_sender, receiver) = mpsc::channel();
         let mut daemon = Daemon::new(
-            Registry::with_builtin(&crate::limits::test_default()),
+            Registry::with_builtin(&crate::platform::limits::test_default()),
             receiver,
             None,
         );
@@ -3948,7 +3948,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
     fn installing_a_package_named_after_a_core_service_reports_core_service() {
         let (_sender, receiver) = mpsc::channel();
         let mut daemon = Daemon::new(
-            Registry::with_builtin(&crate::limits::test_default()),
+            Registry::with_builtin(&crate::platform::limits::test_default()),
             receiver,
             None,
         );
@@ -3973,7 +3973,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
     fn installing_a_package_for_another_platform_reports_unsupported_platform() {
         let (_sender, receiver) = mpsc::channel();
         let mut daemon = Daemon::new(
-            Registry::with_builtin(&crate::limits::test_default()),
+            Registry::with_builtin(&crate::platform::limits::test_default()),
             receiver,
             None,
         );

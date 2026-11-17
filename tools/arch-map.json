@@ -14,27 +14,11 @@
   "suffixErrors": ["_http", "_handler", "_manager", "utils"],
   "suffixWarnings": ["_reactor", "_client", "_server"],
   "modules": {
-    "paths": { "concept": "platform/paths", "layer": "platform" },
-    "log": { "concept": "platform/log", "layer": "platform" },
-    "settings": { "concept": "platform/config", "layer": "platform" },
-    "limits": { "concept": "platform/config", "layer": "platform" },
-    "config": { "concept": "platform/config", "layer": "platform", "note": "S7：运行配置 Config 在组合根派生一次（ADR-0019）；只依赖 settings/limits/paths 与 std" },
-    "clock": { "concept": "platform/clock", "layer": "platform", "note": "S8（#160）：时刻成对 Now + Clock，只在组合根构造一次（ADR-0020）；只依赖 std" },
-    "threads": { "concept": "platform/host", "layer": "platform" },
-    "wake": { "concept": "platform/host", "layer": "platform" },
-    "zerocopy": { "concept": "platform/host", "layer": "platform" },
-    "compat": { "concept": "platform/compat", "layer": "platform" },
-    "platform": { "concept": "platform", "layer": "platform", "note": "src/platform/：宿主能力（特权判定、target triple）；#137 起承接从域层搬出的 OS 事实" },
+    "platform": { "concept": "platform", "layer": "platform", "note": "src/platform/：目录、配置、宿主事实与内容存储；step 6（#170）起 §5 的 platform/ 布局落地（storage 的五文件拆分仍是后续票）" },
+    "wire": { "concept": "wire", "layer": "wire", "note": "src/wire/：message（信封）、contract（插件 stdio / raw / reactor）、control（控制通道）；step 6（#170）落地" },
 
     "kernel": { "concept": "kernel", "layer": "kernel", "note": "src/kernel/：契约、失败类别、conformance（#102 新建）" },
-    "auth": { "concept": "platform/auth", "layer": "platform" },
 
-    "ipc": { "concept": "wire/message", "layer": "wire" },
-    "rpc": { "concept": "wire/message", "layer": "wire" },
-    "reactor": { "concept": "wire/contract", "layer": "wire" },
-    "stdio": { "concept": "wire/contract/stdio", "layer": "wire", "note": "S6b（#142）：子进程 stdio 的接入 seam（`Plan` / `Target`）；宿主实现只在 `stdio/platform/{unix,windows}.rs`" },
-    "rawhub": { "concept": "wire/contract", "layer": "wire" },
-    "channel": { "concept": "wire/control", "layer": "wire", "note": "客户端轮次与端点分档（svcd / svcd-admin）在 channel.rs；平台实现收在 channel/platform/{unix,windows}.rs，channel.rs 无平台 cfg（#143 建 seam，#144 拆两端点、删 token）" },
 
     "package": { "concept": "manage/format", "layer": "domain" },
     "bundle": { "concept": "manage/ops", "layer": "domain" },
@@ -51,7 +35,6 @@
     "hook": { "concept": "supervise/hook", "layer": "domain" },
     "script": { "concept": "supervise/hook", "layer": "domain" },
 
-    "blob": { "concept": "storage", "layer": "domain", "note": "目标在 platform/storage" },
 
     "builtin_adapter": { "concept": "supervise/builtin", "layer": "domain" },
     "install": { "concept": "selfinstall/execute", "layer": "domain" },
@@ -75,5 +58,26 @@
 
     "main": { "concept": "compose", "layer": "compose" },
     "daemon": { "concept": "compose", "layer": "compose" }
+  },
+  "//files": "不参与 lint 的文件级落点（§11），仅供人读与后续拆分票；键是路径，值是 concept。step 6 按批补。",
+  "files": {
+    "src/platform/paths.rs": "platform/paths",
+    "src/platform/log.rs": "platform/log",
+    "src/platform/settings.rs": "platform/settings",
+    "src/platform/limits.rs": "platform/limits",
+    "src/platform/config.rs": "platform/config",
+    "src/platform/compat.rs": "platform/compat",
+    "src/platform/clock.rs": "platform/clock",
+    "src/platform/auth.rs": "platform/auth",
+    "src/platform/host/threads.rs": "platform/host",
+    "src/platform/host/wake.rs": "platform/host",
+    "src/platform/host/zerocopy.rs": "platform/host",
+    "src/platform/storage/blob.rs": "platform/storage/blob",
+    "src/wire/message/ipc.rs": "wire/message",
+    "src/wire/message/rpc.rs": "wire/message",
+    "src/wire/contract/rawhub.rs": "wire/contract",
+    "src/wire/contract/reactor.rs": "wire/contract",
+    "src/wire/contract/stdio.rs": "wire/contract/stdio",
+    "src/wire/control/channel.rs": "wire/control"
   }
 }

@@ -101,7 +101,7 @@ impl Lan {
         let Some(hash) = self.password_hash.as_deref() else {
             return Err("no password configured; run svc lan passwd".into());
         };
-        if crate::auth::verify_password(password, hash) {
+        if crate::platform::auth::verify_password(password, hash) {
             self.failures = 0;
             self.locked_until = None;
             let session = new_token();
@@ -131,7 +131,7 @@ impl Lan {
             if self
                 .password_hash
                 .as_deref()
-                .map(|hash| crate::auth::verify_password(bearer, hash))
+                .map(|hash| crate::platform::auth::verify_password(bearer, hash))
                 .unwrap_or(false)
             {
                 return Ok(AuthKind::Bearer);
@@ -290,7 +290,7 @@ pub fn require_root() -> Result<(), String> {
     if std::env::var_os("SVCD_TEST_UNPRIVILEGED").is_some() {
         return Ok(());
     }
-    if crate::platform::is_privileged() || crate::paths::user_mode() {
+    if crate::platform::is_privileged() || crate::platform::paths::user_mode() {
         Ok(())
     } else {
         Err("root / Administrator is required for auth changes".into())

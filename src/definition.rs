@@ -39,7 +39,7 @@ pub struct Loaded {
 ///
 /// The root-owned, 0640 layout is a deployment invariant enforced by the OS
 /// package manager; this loader assumes the configuration directory is trusted.
-pub fn load_services(services_dir: &Path, limits: &crate::limits::Limits) -> Loaded {
+pub fn load_services(services_dir: &Path, limits: &crate::platform::limits::Limits) -> Loaded {
     let mut registry = Registry::with_builtin(limits);
     let mut issues = Vec::new();
     let mut sources: BTreeMap<String, Option<String>> = BTreeMap::new();
@@ -123,7 +123,7 @@ fn load_scripts(
     registry: &mut Registry,
     issues: &mut Vec<LoadIssue>,
     sources: &BTreeMap<String, Option<String>>,
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
 ) {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -303,7 +303,7 @@ fn load_scripts(
     }
 }
 
-fn load_one(path: &Path, limits: &crate::limits::Limits) -> Result<Service, LoadIssue> {
+fn load_one(path: &Path, limits: &crate::platform::limits::Limits) -> Result<Service, LoadIssue> {
     let file = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -413,7 +413,7 @@ struct ExecDefinition {
     ready: Option<String>,
 }
 
-fn validate(definition: CoreDefinition, limits: &crate::limits::Limits) -> Result<Service, String> {
+fn validate(definition: CoreDefinition, limits: &crate::platform::limits::Limits) -> Result<Service, String> {
     if definition.schema != 1 {
         return Err(format!(
             "unsupported schema {} (expected 1)",
@@ -742,7 +742,7 @@ mod tests {
         let dir = TempDir::new();
         dir.write("demo", definition("demo"));
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert!(loaded.issues.is_empty(), "issues: {:?}", loaded.issues);
         let demo = loaded.registry.get("demo").expect("demo is registered");
@@ -773,7 +773,7 @@ mod tests {
     #[test]
     fn a_missing_services_dir_still_loads_the_builtin() {
         let dir = TempDir::new();
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert!(loaded.issues.is_empty());
         assert_eq!(loaded.registry.values().count(), 1);
@@ -786,7 +786,7 @@ mod tests {
         dir.write("demo", definition("demo"));
         dir.disable("demo");
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         let demo = loaded.registry.get("demo").expect("demo");
         assert!(!demo.enabled);
@@ -799,7 +799,7 @@ mod tests {
         body["future_field"] = json!({"anything": true});
         dir.write("demo", body);
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert!(loaded.issues.is_empty(), "issues: {:?}", loaded.issues);
         assert!(loaded.registry.get("demo").is_some());
@@ -813,7 +813,7 @@ mod tests {
             body[field] = json!("anything");
             dir.write("demo", body);
 
-            let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+            let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
             assert!(
                 loaded.registry.get("demo").is_none(),
@@ -841,7 +841,7 @@ mod tests {
         let dir = TempDir::new();
         dir.write(RESERVED_ID, definition(RESERVED_ID));
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert_eq!(loaded.registry.values().count(), 1);
         assert_eq!(
@@ -863,7 +863,7 @@ mod tests {
         let dir = TempDir::new();
         dir.write("some-file", definition("demo"));
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert!(loaded.issues.is_empty(), "issues: {:?}", loaded.issues);
         assert!(loaded.registry.get("demo").is_some());
@@ -875,7 +875,7 @@ mod tests {
         dir.write("a", definition("demo"));
         dir.write("b", definition("demo"));
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert!(loaded.registry.get("demo").is_some());
         assert_eq!(loaded.issues.len(), 1, "issues: {:?}", loaded.issues);
@@ -890,7 +890,7 @@ mod tests {
         body["exec"]["path"] = json!("payload/demo");
         dir.write("demo", body);
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert!(loaded.registry.get("demo").is_none());
         assert!(loaded.issues[0].reason.contains("must be absolute"));
@@ -907,7 +907,7 @@ mod tests {
             body[field] = value;
             dir.write("demo", body);
 
-            let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+            let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
             assert_eq!(loaded.issues.len(), 1, "{}: {:?}", field, loaded.issues);
             assert!(
@@ -923,7 +923,7 @@ mod tests {
         body["exec"]["ready"] = json!("later");
         dir.write("demo", body);
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert!(loaded.issues[0].reason.contains("exec.ready"));
     }
@@ -935,7 +935,7 @@ mod tests {
         body["capabilities"] = json!([{ "name": "status", "desc": "a", "inputSchema": {} }]);
         dir.write("demo", body);
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert!(loaded.registry.get("demo").is_none());
         assert!(loaded.issues[0].reason.contains("plugin-only"));
@@ -952,7 +952,7 @@ mod tests {
         });
         dir.write("demo", body);
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert!(loaded.issues.is_empty(), "issues: {:?}", loaded.issues);
         let lifecycle = loaded
@@ -975,7 +975,7 @@ mod tests {
         body["lifecycle"] = json!({"stop": {"path": "scripts/stop"}});
         dir.write("demo", body);
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert!(loaded.registry.get("demo").is_none());
         assert!(loaded.issues[0].reason.contains("must be absolute"));
@@ -988,7 +988,7 @@ mod tests {
         body["dependencies"] = json!(["not-installed"]);
         dir.write("demo", body);
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert!(loaded.issues.is_empty(), "issues: {:?}", loaded.issues);
         assert!(loaded.registry.get("demo").is_some());
@@ -1005,7 +1005,7 @@ mod tests {
         dir.write("b", b);
         dir.write("c", definition("c"));
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert!(loaded.registry.get("a").is_none());
         assert!(loaded.registry.get("b").is_none());
@@ -1032,7 +1032,7 @@ mod tests {
             "#!/bin/sh\nRESTART=always\nstart() { :; }\n",
         );
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert!(loaded.issues.is_empty(), "issues: {:?}", loaded.issues);
         assert_eq!(
@@ -1071,7 +1071,7 @@ mod tests {
         one_shot["remain_after_exit"] = serde_json::json!(true);
         dir.write("one-shot", one_shot);
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert!(loaded.issues.is_empty(), "issues: {:?}", loaded.issues);
         assert_eq!(
@@ -1104,7 +1104,7 @@ mod tests {
         let dir = TempDir::new();
         dir.write_script(&script_name("demo"), all_actions_body());
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert!(loaded.issues.is_empty(), "issues: {:?}", loaded.issues);
         let demo = loaded.registry.get("demo").expect("demo");
@@ -1129,7 +1129,7 @@ mod tests {
         let dir = TempDir::new();
         dir.write_script(&script_name("demo"), "#!/bin/sh\r\n");
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert!(loaded.issues.is_empty(), "issues: {:?}", loaded.issues);
         let demo = loaded.registry.get("demo").expect("demo");
@@ -1143,7 +1143,7 @@ mod tests {
         let dir = TempDir::new();
         dir.write_script(&script_name("demo"), start_only_body());
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         let demo = loaded.registry.get("demo").expect("demo");
         assert_eq!(demo.exec.as_ref().expect("exec").args, ["start"]);
@@ -1162,7 +1162,7 @@ mod tests {
         let body = "#!/bin/sh\n# start() { :; }\n# stop() { :; }\n# status() { :; }\n";
         dir.write_script(&script_name("demo"), body);
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         let demo = loaded.registry.get("demo").expect("demo");
         assert!(demo.exec.as_ref().expect("exec").args.is_empty());
@@ -1178,7 +1178,7 @@ mod tests {
             "#!/bin/sh\ncase \"$1\" in\n  start)\n    :;;\n  status)\n    :;;\nesac\n",
         );
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         let demo = loaded.registry.get("demo").expect("demo");
         assert_eq!(demo.exec.as_ref().expect("exec").args, ["start"]);
@@ -1194,7 +1194,7 @@ mod tests {
         dir.write_script(&script_name("demo"), "");
         dir.disable("demo");
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert!(!loaded.registry.get("demo").expect("demo").enabled);
     }
@@ -1205,7 +1205,7 @@ mod tests {
         dir.write("demo", definition("demo"));
         dir.write_script(&script_name("demo"), "");
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         let demo = loaded.registry.get("demo").expect("demo");
         assert!(demo.lifecycle.is_none());
@@ -1225,7 +1225,7 @@ mod tests {
         dir.write_script(&script_name("bad.name"), "");
         dir.write_script(&script_name("svc"), "");
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert_eq!(loaded.issues.len(), 2, "issues: {:?}", loaded.issues);
         assert!(loaded
@@ -1244,7 +1244,7 @@ mod tests {
         let dir = TempDir::new();
         dir.write_script("demo.ps1", "function Start { }\r\nfunction Stop { }\r\n");
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert!(loaded.issues.is_empty(), "issues: {:?}", loaded.issues);
         let demo = loaded.registry.get("demo").expect("demo");
@@ -1266,7 +1266,7 @@ mod tests {
         let path = dir.services_dir().join(&name);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert!(loaded.registry.get("demo").is_none());
         assert!(loaded.issues[0].reason.contains("executable"));
@@ -1281,7 +1281,7 @@ mod tests {
         fs::create_dir_all(dir.services_dir()).expect("services.d");
         std::os::unix::fs::symlink(&target, dir.services_dir().join("demo.sh")).expect("symlink");
 
-        let loaded = load_services(&dir.services_dir(), &crate::limits::test_default());
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
 
         assert!(loaded.registry.get("demo").is_none());
         assert!(loaded.issues[0].reason.contains("symlink"));

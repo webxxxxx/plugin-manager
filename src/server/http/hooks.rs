@@ -26,7 +26,7 @@ pub(crate) trait PreBodyRoutes: Send + Sync {
         head: &http::Head,
         peer: IpAddr,
         lan: &Arc<Mutex<Lan>>,
-        raw_hub: Arc<crate::rawhub::RawHub>,
+        raw_hub: Arc<crate::wire::contract::rawhub::RawHub>,
     ) -> Option<Result<Exchange, Vec<u8>>>;
     fn package_upload(
         &self,

@@ -10,15 +10,15 @@ use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::compat;
+use crate::platform::compat;
 use crate::hook;
 use crate::interpreter;
 use crate::kernel::contract::{Capability as KernelCapability, CapabilityName, Effect};
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
-use crate::log;
+use crate::platform::log;
 use crate::package::{self, Package};
-use crate::paths::Paths;
+use crate::platform::paths::Paths;
 use crate::registry::{
     Exec, Hook, Interpreter, Kind, Lifecycle, Ready, Restart, Service, State, RESERVED_ID,
 };
@@ -182,7 +182,7 @@ pub fn prepare_staged(
 /// must stop the running version before calling this for `Replace`.
 pub fn install_staged(
     paths: &Paths,
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
     staged: package::StagedPackage,
     strategy: Strategy,
     opt_in_hooks: bool,
@@ -232,7 +232,7 @@ pub fn install_staged(
 
 fn install_keep_old_staged(
     paths: &Paths,
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
     staged: package::StagedPackage,
     id: &str,
     plugin_dir: &Path,
@@ -257,7 +257,7 @@ fn install_keep_old_staged(
 
 fn install_replace_staged(
     paths: &Paths,
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
     staged: package::StagedPackage,
     id: &str,
     plugin_dir: &Path,
@@ -398,7 +398,7 @@ fn copy_config_staged(
 
 fn run_post_install_manifest(
     paths: &Paths,
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
     manifest: &package::Manifest,
     id: &str,
     version_dir: &Path,
@@ -507,7 +507,7 @@ impl From<ProblemError> for InstallFailure {
 
 pub fn install_package(
     paths: &Paths,
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
     package: &Package,
     strategy: Strategy,
     opt_in_hooks: bool,
@@ -557,7 +557,7 @@ pub fn install_package(
 
 fn install_keep_old(
     paths: &Paths,
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
     package: &Package,
     id: &str,
     plugin_dir: &Path,
@@ -595,7 +595,7 @@ fn install_keep_old(
 
 fn run_post_install(
     paths: &Paths,
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
     package: &Package,
     id: &str,
     version_dir: &Path,
@@ -631,7 +631,7 @@ fn run_post_install(
 
 fn install_replace(
     paths: &Paths,
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
     package: &Package,
     id: &str,
     plugin_dir: &Path,
@@ -941,9 +941,9 @@ fn restore_file(path: &Path, content: &Option<Vec<u8>>, config: bool) -> Result<
     }
 }
 
-pub fn scan(paths: &Paths, limits: &crate::limits::Limits) -> (Vec<Service>, Vec<String>) {
+pub fn scan(paths: &Paths, limits: &crate::platform::limits::Limits) -> (Vec<Service>, Vec<String>) {
     let root = &paths.plugins_dir;
-    let host = crate::compat::detect(paths, MAX_SCHEMA, MAX_PROTOCOL);
+    let host = crate::platform::compat::detect(paths, MAX_SCHEMA, MAX_PROTOCOL);
     let mut services = Vec::new();
     let mut warnings = Vec::new();
     let entries = match fs::read_dir(&root) {
@@ -1000,10 +1000,10 @@ pub fn scan(paths: &Paths, limits: &crate::limits::Limits) -> (Vec<Service>, Vec
                     .as_ref()
                     .map(|spec| spec.devices.clone())
                     .unwrap_or_default();
-                match crate::compat::evaluate(crate::platform::target(), &devices, &host) {
-                    crate::compat::Verdict::Compatible => services.push(service),
+                match crate::platform::compat::evaluate(crate::platform::target(), &devices, &host) {
+                    crate::platform::compat::Verdict::Compatible => services.push(service),
                     verdict => {
-                        let reason = crate::compat::verdict_reason(verdict)
+                        let reason = crate::platform::compat::verdict_reason(verdict)
                             .unwrap_or_else(|| "compat".into());
                         warnings.push(format!("{}: {}", id, reason));
                         service.state = State::Failed;
@@ -1044,7 +1044,7 @@ pub fn remove_logs(paths: &Paths, id: &str) {
 
 pub fn uninstall(
     paths: &Paths,
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
     id: &str,
     purge: bool,
 ) -> Result<(), ProblemError> {
@@ -1083,7 +1083,7 @@ pub fn uninstall(
 
 /// A failing pre-remove hook must not block uninstall; the spec only requires a
 /// log line so a broken package can still be removed.
-fn run_pre_remove(paths: &Paths, limits: &crate::limits::Limits, id: &str) {
+fn run_pre_remove(paths: &Paths, limits: &crate::platform::limits::Limits, id: &str) {
     let Some(version) = current_version(paths, id) else {
         return;
     };
@@ -1147,7 +1147,7 @@ pub fn current_version(paths: &Paths, id: &str) -> Option<String> {
 
 fn service_from_manifest(
     paths: &Paths,
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
     id: &str,
     version_dir: &Path,
     manifest: &package::Manifest,
@@ -1645,7 +1645,7 @@ pub fn replace_config(
 }
 
 pub fn root_required() -> Result<(), ProblemError> {
-    if crate::platform::is_privileged() || crate::paths::user_mode() {
+    if crate::platform::is_privileged() || crate::platform::paths::user_mode() {
         Ok(())
     } else {
         Err(Problem::Internal.error("root / Administrator is required"))
@@ -1855,7 +1855,7 @@ mod tests {
         )
         .expect("write manifest");
 
-        let (services, _) = scan(paths(), &crate::limits::test_default());
+        let (services, _) = scan(paths(), &crate::platform::limits::test_default());
         let service = services
             .iter()
             .find(|service| service.id == id)
@@ -1998,7 +1998,7 @@ mod tests {
 
         let service = service_from_manifest(
             paths(),
-            &crate::limits::test_default(),
+            &crate::platform::limits::test_default(),
             "scripted",
             &version_dir,
             &manifest,
@@ -2044,7 +2044,7 @@ mod tests {
 
         let error = service_from_manifest(
             paths(),
-            &crate::limits::test_default(),
+            &crate::platform::limits::test_default(),
             "no-interpreter",
             &version_dir,
             &manifest,
@@ -2066,7 +2066,7 @@ mod tests {
 
         let service = service_from_manifest(
             paths(),
-            &crate::limits::test_default(),
+            &crate::platform::limits::test_default(),
             "native",
             &version_dir,
             &manifest,
@@ -2125,7 +2125,7 @@ mod tests {
 
         install_package(
             &paths,
-            &crate::limits::test_default(),
+            &crate::platform::limits::test_default(),
             &layout_package("layout-demo", "1.0.0"),
             Strategy::KeepOld,
             false,
@@ -2134,7 +2134,7 @@ mod tests {
         .expect("first install");
         install_package(
             &paths,
-            &crate::limits::test_default(),
+            &crate::platform::limits::test_default(),
             &layout_package("layout-demo", "1.1.0"),
             Strategy::KeepOld,
             false,
@@ -2153,7 +2153,7 @@ mod tests {
 
         install_package(
             &paths,
-            &crate::limits::test_default(),
+            &crate::platform::limits::test_default(),
             &layout_package("layout-demo", "1.1.0"),
             Strategy::Replace,
             false,
@@ -2188,7 +2188,7 @@ mod tests {
 
         let error = service_from_manifest(
             paths(),
-            &crate::limits::test_default(),
+            &crate::platform::limits::test_default(),
             "dangling",
             &version_dir,
             &manifest,

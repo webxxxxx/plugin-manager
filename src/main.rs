@@ -1,14 +1,8 @@
 #[cfg(feature = "http")]
 mod api;
-mod auth;
-mod blob;
 mod builtin_adapter;
 mod bundle;
 mod catalog;
-mod channel;
-mod clock;
-mod compat;
-mod config;
 mod daemon;
 mod definition;
 #[cfg(feature = "http")]
@@ -17,46 +11,33 @@ mod hook;
 mod http;
 mod install;
 mod interpreter;
-mod ipc;
 mod kernel;
 #[cfg_attr(not(feature = "http"), allow(dead_code))]
 mod lan;
-mod limits;
-mod log;
 mod mcp;
 mod package;
-mod paths;
 mod platform;
+mod wire;
 mod plugin;
 mod plugin_cli;
-mod rawhub;
-#[cfg(unix)]
-mod reactor;
 mod registry;
-mod rpc;
 mod runtime;
 mod script;
 mod server;
 #[cfg(windows)]
 mod service_win;
-mod settings;
 mod slot;
 mod status;
-mod stdio;
 mod supervisor;
 mod svc;
-mod threads;
 #[cfg(test)]
 mod test_support;
 mod transfer;
 mod trust;
 #[cfg(feature = "http")]
 mod uichannel;
-mod wake;
 #[cfg(feature = "http")]
 mod webui;
-#[cfg(feature = "http")]
-mod zerocopy;
 
 fn main() {
     #[cfg(windows)]
@@ -180,8 +161,8 @@ fn stop_daemon() {
 }
 
 fn start_command() -> i32 {
-    if crate::paths::user_mode() {
-        match crate::config::Config::bootstrap_or_report("svcd") {
+    if crate::platform::paths::user_mode() {
+        match crate::platform::config::Config::bootstrap_or_report("svcd") {
             Some(config) => user_start(&config),
             None => 1,
         }
@@ -191,7 +172,7 @@ fn start_command() -> i32 {
 }
 
 fn stop_command() -> i32 {
-    if crate::paths::user_mode() {
+    if crate::platform::paths::user_mode() {
         crate::daemon::shutdown()
     } else {
         crate::install::service_stop()
@@ -199,8 +180,8 @@ fn stop_command() -> i32 {
 }
 
 fn status_command() -> i32 {
-    if crate::paths::user_mode() {
-        match crate::config::Config::bootstrap_or_report("svcd") {
+    if crate::platform::paths::user_mode() {
+        match crate::platform::config::Config::bootstrap_or_report("svcd") {
             Some(config) => user_status(&config),
             None => 1,
         }
@@ -211,11 +192,11 @@ fn status_command() -> i32 {
 
 fn user_command(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
-        Some("start") => match crate::config::Config::bootstrap_or_report("svcd") {
+        Some("start") => match crate::platform::config::Config::bootstrap_or_report("svcd") {
             Some(config) => user_start(&config),
             None => 1,
         },
-        Some("status") => match crate::config::Config::bootstrap_or_report("svcd") {
+        Some("status") => match crate::platform::config::Config::bootstrap_or_report("svcd") {
             Some(config) => user_status(&config),
             None => 1,
         },
@@ -240,8 +221,8 @@ fn user_usage() {
     eprintln!("       svcd user run --foreground [--conf|--config <file>]");
 }
 
-fn user_running(config: &crate::config::Config) -> bool {
-    crate::channel::request(
+fn user_running(config: &crate::platform::config::Config) -> bool {
+    crate::wire::control::channel::request(
         &config.paths.config_dir,
         "svc.list",
         serde_json::json!({}),
@@ -249,8 +230,8 @@ fn user_running(config: &crate::config::Config) -> bool {
     .is_ok()
 }
 
-fn user_start(config: &crate::config::Config) -> i32 {
-    if !crate::paths::user_mode() {
+fn user_start(config: &crate::platform::config::Config) -> i32 {
+    if !crate::platform::paths::user_mode() {
         eprintln!(
             "svcd: user mode is only available to non-root users; set SVCD_USER=1 to force it"
         );
@@ -335,7 +316,7 @@ fn user_start(config: &crate::config::Config) -> i32 {
     }
 }
 
-fn user_status(config: &crate::config::Config) -> i32 {
+fn user_status(config: &crate::platform::config::Config) -> i32 {
     println!("mode:   user");
     println!("config: {}", config.paths.config_dir.display());
     println!("data:   {}", config.paths.data_dir.display());

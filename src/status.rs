@@ -8,7 +8,7 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::clock::Now;
+use crate::platform::clock::Now;
 use crate::registry::{Kind, Service, State};
 use crate::supervisor::Machine;
 
@@ -243,7 +243,7 @@ mod tests {
                 "1.2.3",
                 Vec::new(),
                 crate::registry::Carrier::Slot,
-                &crate::limits::test_default(),
+                &crate::platform::limits::test_default(),
             ),
             impl_ref: None,
             exec: Some(crate::registry::Exec {

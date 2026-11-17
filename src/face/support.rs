@@ -12,11 +12,11 @@ use std::time::Instant;
 
 use serde_json::{json, Value};
 
-use crate::channel;
+use crate::wire::control::channel;
 use crate::http;
 use crate::kernel::failure::{Class, Problem, ProblemError};
 use crate::package;
-use crate::rpc;
+use crate::wire::message::rpc;
 use crate::server::http::{CancelToken, JobBudget, Request};
 
 /// The control-channel budget a face request carries.
@@ -202,7 +202,7 @@ pub(crate) fn problem_response(refusal: &ProblemError) -> Vec<u8> {
 }
 
 /// A storage refusal as the HTTP error envelope (see [`status_for_storage`]).
-pub(crate) fn storage_response(refusal: &crate::blob::Error) -> Vec<u8> {
+pub(crate) fn storage_response(refusal: &crate::platform::storage::blob::Error) -> Vec<u8> {
     let status = status_for_storage(refusal.kind);
     error(status, code_for(status), &refusal.detail)
 }
@@ -210,13 +210,13 @@ pub(crate) fn storage_response(refusal: &crate::blob::Error) -> Vec<u8> {
 /// The status a storage failure projects to. Storage keeps its own small
 /// taxonomy (it sits below the kernel), so this maps it onto the one management
 /// table; `NotFound` is the only category that table cannot name.
-pub(crate) fn status_for_storage(kind: crate::blob::Kind) -> u16 {
+pub(crate) fn status_for_storage(kind: crate::platform::storage::blob::Kind) -> u16 {
     match kind {
-        crate::blob::Kind::NotFound => 404,
-        crate::blob::Kind::Conflict => status_for_problem(Problem::Conflict),
-        crate::blob::Kind::Invalid => status_for_problem(Problem::Invalid),
-        crate::blob::Kind::TooLarge => status_for_problem(Problem::TooLarge),
-        crate::blob::Kind::Internal => status_for_problem(Problem::Internal),
+        crate::platform::storage::blob::Kind::NotFound => 404,
+        crate::platform::storage::blob::Kind::Conflict => status_for_problem(Problem::Conflict),
+        crate::platform::storage::blob::Kind::Invalid => status_for_problem(Problem::Invalid),
+        crate::platform::storage::blob::Kind::TooLarge => status_for_problem(Problem::TooLarge),
+        crate::platform::storage::blob::Kind::Internal => status_for_problem(Problem::Internal),
     }
 }
 
@@ -281,11 +281,11 @@ mod tests {
     /// category of its own: a missing upload session is 404.
     #[test]
     fn a_storage_failure_projects_onto_the_same_table() {
-        assert_eq!(status_for_storage(crate::blob::Kind::Conflict), 409);
-        assert_eq!(status_for_storage(crate::blob::Kind::Invalid), 400);
-        assert_eq!(status_for_storage(crate::blob::Kind::TooLarge), 413);
-        assert_eq!(status_for_storage(crate::blob::Kind::Internal), 500);
-        assert_eq!(status_for_storage(crate::blob::Kind::NotFound), 404);
+        assert_eq!(status_for_storage(crate::platform::storage::blob::Kind::Conflict), 409);
+        assert_eq!(status_for_storage(crate::platform::storage::blob::Kind::Invalid), 400);
+        assert_eq!(status_for_storage(crate::platform::storage::blob::Kind::TooLarge), 413);
+        assert_eq!(status_for_storage(crate::platform::storage::blob::Kind::Internal), 500);
+        assert_eq!(status_for_storage(crate::platform::storage::blob::Kind::NotFound), 404);
     }
 
     /// The stream-job handoff must carry both halves of the budget: a job that

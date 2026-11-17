@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::paths::Paths;
+use crate::platform::paths::Paths;
 use crate::registry::State;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,7 +50,7 @@ pub fn load(id: &str, paths: &Paths) -> Option<Record> {
     match serde_json::from_slice::<Record>(&bytes) {
         Ok(record) => Some(record),
         Err(error) => {
-            crate::log::svcd(&format!(
+            crate::platform::log::svcd(&format!(
                 "svcd: {}: unreadable runtime record {}: {}",
                 id,
                 path.display(),
@@ -82,7 +82,7 @@ pub fn remove(id: &str, paths: &Paths) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            crate::log::svcd(&format!(
+            crate::platform::log::svcd(&format!(
                 "svcd: {}: cannot remove {}: {}",
                 id,
                 target.display(),

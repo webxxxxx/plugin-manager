@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::http;
 use crate::lan::AuthKind;
-use crate::log;
+use crate::platform::log;
 
 use super::pool::CancelToken;
 

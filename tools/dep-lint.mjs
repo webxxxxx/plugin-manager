@@ -6,8 +6,8 @@
 //   2. 循环依赖：模块图必须是 DAG；报告强连通分量，并给出一条具体短环。
 //   3. 文件名后缀：协议名只该在 server/ 出现一次（_http / _handler / _manager / utils）。
 //   4. 映射卫生：映射里的模块必须在 src/ 存在；src/ 的顶层模块必须已映射。
-//   5. seam 不变量：子进程 stdio 的句柄与管道只在 src/stdio 里出现；正在被
-//      seam 接管的调用方（slot/hook/daemon/rawhub）不再自己 Stdio::piped。
+//   5. seam 不变量：子进程 stdio 的句柄与管道只在 src/wire/contract/stdio 里出现；
+//      正在被 seam 接管的调用方（slot/hook/daemon/rawhub）不再自己 Stdio::piped。
 //   6. 失败类别：`#[cfg(test)]` 之外不按 `detail` / `message` 的文案分支或比较
 //      （S5 的投影不变量，见 docs/architecture.md §8）。
 //
@@ -307,14 +307,16 @@ const SEAM_RULES = [
   {
     name: "stdio 的父子句柄",
     pattern: /\bChildStd(?:in|out|err)\b/,
-    allowed: (file) => file === "src/stdio.rs" || file.startsWith("src/stdio/"),
-    hint: "子进程 stdio 的句柄归 src/stdio；调用方用 Plan/Target。",
+    allowed: (file) =>
+      file === "src/wire/contract/stdio.rs" ||
+      file.startsWith("src/wire/contract/stdio/"),
+    hint: "子进程 stdio 的句柄归 src/wire/contract/stdio；调用方用 Plan/Target。",
   },
   {
     name: "stdio 的调用方直接开管道",
     pattern: /\bStdio::piped\b/,
-    files: ["src/slot.rs", "src/hook.rs", "src/daemon.rs", "src/rawhub.rs"],
-    hint: "这些文件问 src/stdio 要管道（Plan::notify / exec / hook / stop_hook）。",
+    files: ["src/slot.rs", "src/hook.rs", "src/daemon.rs", "src/wire/contract/rawhub.rs"],
+    hint: "这些文件问 src/wire/contract/stdio 要管道（Plan::notify / exec / hook / stop_hook）。",
   },
 ];
 

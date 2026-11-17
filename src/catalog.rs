@@ -8,7 +8,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde_json::Value;
 
-use crate::ipc::CATALOG_PAGE_MAX;
+use crate::wire::message::ipc::CATALOG_PAGE_MAX;
 
 pub const DEFAULT_LIMIT: usize = 100;
 pub const MAX_LIMIT: usize = 200;

@@ -11,8 +11,8 @@ use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::thread;
 
-use crate::threads;
-use crate::wake::Wake;
+use crate::platform::host::threads;
+use crate::platform::host::wake::Wake;
 
 /// One control-plane JSON-RPC message (ping, status, cancel) may not exceed
 /// this many bytes. Keeping it small makes accidental bulk data visible at the
@@ -268,7 +268,7 @@ pub fn spawn_reader<R: Read + Send + 'static>(
     stream: R,
     sender: SyncSender<FrameEvent>,
     wake: Option<Arc<Wake>>,
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
 ) -> io::Result<()> {
     spawn_reader_limit(name, stream, sender, wake, MAX_FRAME_BYTES, limits)
 }
@@ -283,7 +283,7 @@ pub fn spawn_reader_limit<R: Read + Send + 'static>(
     sender: SyncSender<FrameEvent>,
     wake: Option<Arc<Wake>>,
     max: usize,
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
 ) -> io::Result<()> {
     thread::Builder::new()
         .name(name)
@@ -318,7 +318,7 @@ pub fn spawn_length_reader_limit<R: Read + Send + 'static>(
     sender: SyncSender<FrameEvent>,
     wake: Option<Arc<Wake>>,
     max: usize,
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
 ) -> io::Result<()> {
     thread::Builder::new()
         .name(name)

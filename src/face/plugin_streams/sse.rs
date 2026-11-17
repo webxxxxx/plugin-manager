@@ -190,7 +190,7 @@ mod tests {
     fn harness() -> (Arc<EventBus>, SseStream) {
         let bus = Arc::new(EventBus::new());
         let (receiver, subscription, replay) = bus
-            .subscribe_from("demo", None, &crate::limits::test_default())
+            .subscribe_from("demo", None, &crate::platform::limits::test_default())
             .expect("subscribe");
         (bus, SseStream::new(receiver, subscription, replay))
     }
@@ -260,7 +260,7 @@ mod tests {
     fn a_replay_gap_writes_the_reset_event_first() {
         let bus = Arc::new(EventBus::new());
         let (receiver, subscription, _replay) = bus
-            .subscribe_from("demo", None, &crate::limits::test_default())
+            .subscribe_from("demo", None, &crate::platform::limits::test_default())
             .expect("subscribe");
         let mut stream = SseStream::new(
             receiver,
