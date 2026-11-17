@@ -20,7 +20,6 @@
     "limits": { "concept": "platform/config", "layer": "platform" },
     "threads": { "concept": "platform/host", "layer": "platform" },
     "wake": { "concept": "platform/host", "layer": "platform" },
-    "proc": { "concept": "platform/host", "layer": "platform" },
     "zerocopy": { "concept": "platform/host", "layer": "platform" },
     "compat": { "concept": "platform/compat", "layer": "platform" },
     "platform": { "concept": "platform", "layer": "platform", "note": "src/platform/：宿主能力（特权判定、target triple）；#137 起承接从域层搬出的 OS 事实" },
