@@ -60,6 +60,18 @@ preflight 默认只打一行（branch / ahead-behind / dirty / worktree 数）�
   目标票测试绿不代表早先票的逻辑还在。
 - 禁止在 main 上直接 commit；merge commit 与 fast-forward 不受限制。
 
+## 关票与 worktree 收尾
+
+关票是收尾的最后一步；只把 `feat/<ticket>` push 了不算做完。顺序固定：
+
+1. **合入 main**：按上一节 `merge --no-ff`（或 fast-forward）进 main，main 上必须有该改动，不能只在票分支上。
+2. **推送远程**：`git -C <main-wt> push origin main`；用 `git ls-remote origin refs/heads/main` 确认新 merge 已经在远端。
+3. **用 main 验证**：在合并后的 main 上跑受影响的 target；跨模块或用户要求时跑 `full`；Windows 宿主的 Linux 半按 `docs/testing.md` §6 跑 WSL。
+4. **清 worktree**：`git worktree remove target/wt-<ticket>`。有未提交改动先处理，不要 `--force` 丢掉；合并后的票分支可以保留作记录。
+5. **最后关票**：`deck_issue_patch ... close=true` 或 `gh issue close`，票面写 merge commit 与验证结果。
+
+只推分支、没合 main、没推远程、worktree 还在，都不算完成，不要关票。
+
 ## CI 边界
 
 默认**不主动跑 GitHub CI**：本地先跑 `node tools/check.mjs quick` 与相关测试；全量
