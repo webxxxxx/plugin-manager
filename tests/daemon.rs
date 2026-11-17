@@ -2792,3 +2792,39 @@ fn a_busy_http_port_keeps_the_control_channel_alive() {
     sandbox.wait_for_daemon();
     sandbox.shutdown();
 }
+
+/// The live text view carries both the summary and the details block.
+#[test]
+fn status_text_shows_summary_and_details() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_core_json("core");
+    sandbox.start_daemon();
+
+    let output = sandbox.run_when_ready(&["status", "core"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    for needle in [
+        "summary:",
+        "details:",
+        "id:",
+        "kind:",
+        "state:",
+        "dependencies:",
+        "failures:",
+        "restart:",
+    ] {
+        assert!(text.contains(needle), "missing {needle} in:\n{text}");
+    }
+    assert!(text.contains("core"), "service id missing:\n{text}");
+    // The daemon starts an enabled core service, so the state is `running`
+    // here; only its presence matters to the text layout.
+    assert!(
+        text.contains("running") || text.contains("stopped"),
+        "state missing:\n{text}"
+    );
+}

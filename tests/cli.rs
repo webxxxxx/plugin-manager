@@ -131,118 +131,21 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
-fn line_for<'a>(text: &'a str, id: &str) -> &'a str {
-    text.lines()
-        .find(|line| line.split_whitespace().next() == Some(id))
-        .unwrap_or_else(|| panic!("no line for {} in:\n{}", id, text))
-}
-
-fn has_row(text: &str, id: &str) -> bool {
-    text.lines()
-        .any(|line| line.split_whitespace().next() == Some(id))
-}
-
 #[test]
-fn list_hides_the_builtin_and_shows_a_core_definition() {
+fn list_without_a_daemon_reports_unreachable() {
     let sandbox = Sandbox::new();
     sandbox.write_definition("demo", definition("demo"));
 
     let output = sandbox.run(&["list"]);
 
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
-    let text = stdout(&output);
-    assert!(text.starts_with("ID"), "table:\n{}", text);
-    assert!(text.contains("KIND"));
-    assert!(text.contains("STATE"));
-    assert!(text.contains("AUTO"));
-    assert!(text.contains("PID"));
-    assert!(text.contains("VERSION"));
-
-    let demo = line_for(&text, "demo");
-    assert!(demo.contains("core"), "demo row: {}", demo);
-    assert!(demo.contains("stopped"), "demo row: {}", demo);
-    assert!(demo.contains("[auto]"), "demo row: {}", demo);
-    assert!(demo.contains("1.0.0"), "demo row: {}", demo);
-
-    assert!(!has_row(&text, "svc"), "table:\n{}", text);
-}
-
-#[test]
-fn status_text_shows_summary_and_details() {
-    let sandbox = Sandbox::new();
-    sandbox.write_definition("demo", definition("demo"));
-
-    let output = sandbox.run(&["status", "demo"]);
-
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
-    let text = stdout(&output);
-    assert!(text.contains("summary:"), "status:\n{}", text);
-    assert!(text.contains("details:"), "status:\n{}", text);
-    assert!(text.contains("id:"));
-    assert!(text.contains("demo"));
-    assert!(text.contains("kind:"));
-    assert!(text.contains("core"));
-    assert!(text.contains("state:"));
-    assert!(text.contains("stopped"));
-    assert!(text.contains("dependencies:"));
-    assert!(text.contains("failures:"));
-    assert!(text.contains("restart:"));
-}
-
-#[test]
-fn status_json_is_exactly_summary_and_details() {
-    let sandbox = Sandbox::new();
-    sandbox.write_definition("demo", definition("demo"));
-
-    let output = sandbox.run(&["status", "demo", "--json"]);
-
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
-    let value: Value = serde_json::from_str(&stdout(&output)).expect("valid json");
-    let object = value.as_object().expect("object");
-    assert_eq!(object.len(), 2);
-    assert!(object.contains_key("summary"));
-    assert!(object.contains_key("details"));
-
-    let summary = &value["summary"];
-    assert_eq!(summary["id"], "demo");
-    assert_eq!(summary["kind"], "core");
-    assert_eq!(summary["state"], "stopped");
-    assert_eq!(summary["enabled"], true);
-    assert!(summary["pid"].is_null());
-    assert!(summary["since"].is_null());
-    assert_eq!(summary["version"], "1.0.0");
-
-    let details = &value["details"];
-    assert_eq!(details["dependencies"], json!([]));
-    assert!(details["last_exit"].is_null());
-    assert!(details["next_at"].is_null());
-    assert!(details["ready_since"].is_null());
-    assert_eq!(details["failures"], 0);
-    assert!(details["config"].is_null());
-    assert!(details["restart"].is_null());
-    assert_eq!(details["unkillable"], false);
-}
-
-#[test]
-fn status_accepts_json_before_the_id() {
-    let sandbox = Sandbox::new();
-    sandbox.write_definition("demo", definition("demo"));
-
-    let output = sandbox.run(&["status", "--json", "demo"]);
-
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
-    let value: Value = serde_json::from_str(&stdout(&output)).expect("valid json");
-    assert_eq!(value["summary"]["id"], "demo");
-}
-
-#[test]
-fn an_unknown_service_exits_one() {
-    let sandbox = Sandbox::new();
-
-    let output = sandbox.run(&["status", "missing"]);
-
-    assert_eq!(output.status.code(), Some(1), "stderr: {}", stderr(&output));
-    assert!(stderr(&output).contains("unknown service"));
+    // The offline fallback is gone: a reachable daemon is required, and a dead
+    // one must be reported instead of printing an empty table.
+    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
+    assert!(
+        stderr(&output).contains("svcd unreachable"),
+        "stderr:\n{}",
+        stderr(&output)
+    );
 }
 
 #[test]
@@ -311,92 +214,6 @@ fn logs_read_svcd_log_and_missing_logs_exit_one() {
     let missing = sandbox.run(&["logs", "missing"]);
     assert_eq!(missing.status.code(), Some(1));
     assert!(stderr(&missing).contains("no log"));
-}
-
-#[test]
-fn an_spk_only_field_rejects_the_definition_with_a_reason() {
-    let sandbox = Sandbox::new();
-    let mut bad = definition("bad");
-    bad["platform"] = json!("x86_64-unknown-linux-musl");
-    sandbox.write_definition("bad", bad);
-
-    let output = sandbox.run(&["list"]);
-
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
-    assert!(
-        !stdout(&output)
-            .lines()
-            .any(|line| line.split_whitespace().next() == Some("bad")),
-        "rejected definition leaked into the table:\n{}",
-        stdout(&output)
-    );
-    let errors = stderr(&output);
-    assert!(errors.contains("bad.json"), "stderr:\n{}", errors);
-    assert!(errors.contains("platform"), "stderr:\n{}", errors);
-    assert!(errors.contains(".spk-only"), "stderr:\n{}", errors);
-
-    let status = sandbox.run(&["status", "bad"]);
-    assert_eq!(status.status.code(), Some(1));
-    assert!(stderr(&status).contains("platform"));
-}
-
-#[test]
-fn the_reserved_svc_id_is_rejected_and_the_builtin_stays_hidden_from_list() {
-    let sandbox = Sandbox::new();
-    sandbox.write_definition("svc", definition("svc"));
-
-    let output = sandbox.run(&["list"]);
-
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
-    let errors = stderr(&output);
-    assert!(errors.contains("reserved"), "stderr:\n{}", errors);
-    let table = stdout(&output);
-    assert!(!has_row(&table, "svc"), "table:\n{}", table);
-
-    let status = sandbox.run(&["status", "svc"]);
-    assert_eq!(status.status.code(), Some(0));
-    assert!(stdout(&status).contains("running"));
-}
-
-#[test]
-fn a_duplicate_id_is_rejected_and_the_first_definition_wins() {
-    let sandbox = Sandbox::new();
-    sandbox.write_definition("a", definition("demo"));
-    sandbox.write_definition("b", definition("demo"));
-
-    let output = sandbox.run(&["list"]);
-
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
-    let demo_lines = stdout(&output)
-        .lines()
-        .filter(|line| line.split_whitespace().next() == Some("demo"))
-        .count();
-    assert_eq!(demo_lines, 1, "table:\n{}", stdout(&output));
-    let errors = stderr(&output);
-    assert!(
-        errors.contains("duplicate service id"),
-        "stderr:\n{}",
-        errors
-    );
-
-    let status = sandbox.run(&["status", "demo"]);
-    assert_eq!(status.status.code(), Some(0));
-    assert!(stdout(&status).contains("id:"));
-}
-
-#[test]
-fn a_relative_exec_path_is_rejected_with_a_readable_reason() {
-    let sandbox = Sandbox::new();
-    let mut bad = definition("bad");
-    bad["exec"]["path"] = json!("payload/bad");
-    sandbox.write_definition("bad", bad);
-
-    let output = sandbox.run(&["list"]);
-
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
-    let errors = stderr(&output);
-    assert!(errors.contains("bad.json"), "stderr:\n{}", errors);
-    assert!(errors.contains("absolute"), "stderr:\n{}", errors);
 }
 
 /// Test-only Ed25519 public key. `samples/keys/` is generated locally by
