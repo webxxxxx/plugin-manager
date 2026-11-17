@@ -2,4 +2,5 @@
 
 pub mod dirs;
 pub mod privilege;
+pub mod process;
 pub mod target;
