@@ -4,7 +4,8 @@
 //! through the S4 completion sink. #113 starts with `/api/v1/version`; #115
 //! adds the plugin UI static-asset face; #116 adds the blocking pool; #117
 //! moves the remaining management JSON routes, login/logout and the console
-//! page here; #120 moves bundle export to a stream handler.
+//! page here; #119 moves uploads to a pre-body stream face; #120 moves bundle
+//! export to a stream handler.
 
 pub mod api;
 pub mod blob;
