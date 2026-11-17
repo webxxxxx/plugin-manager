@@ -174,6 +174,93 @@ impl Rejection {
     }
 }
 
+/// 管理失败的封闭类别。恰好十二类。
+///
+/// 与 [`Class`] 不同，`Problem` 描述的是**管理层**的失败（未知服务、冲突、
+/// 平台不支持），不是一次尝试的结果；`ProblemError` 只携带类别与给人看的
+/// 细节，重试语义由调用方按 HTTP/CLI 投影决定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Problem {
+    UnknownService,
+    UnknownPlugin,
+    UnknownStrategy,
+    CoreService,
+    NotAPlugin,
+    Conflict,
+    Invalid,
+    UnsupportedPlatform,
+    MissingDependency,
+    TooLarge,
+    Timeout,
+    Internal,
+}
+
+impl Problem {
+    pub const ALL: [Problem; 12] = [
+        Problem::UnknownService,
+        Problem::UnknownPlugin,
+        Problem::UnknownStrategy,
+        Problem::CoreService,
+        Problem::NotAPlugin,
+        Problem::Conflict,
+        Problem::Invalid,
+        Problem::UnsupportedPlatform,
+        Problem::MissingDependency,
+        Problem::TooLarge,
+        Problem::Timeout,
+        Problem::Internal,
+    ];
+
+    /// 稳定的名字：控制通道 `error.data.kind` 与投影读它。改名字等于改契约。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Problem::UnknownService => "unknown_service",
+            Problem::UnknownPlugin => "unknown_plugin",
+            Problem::UnknownStrategy => "unknown_strategy",
+            Problem::CoreService => "core_service",
+            Problem::NotAPlugin => "not_a_plugin",
+            Problem::Conflict => "conflict",
+            Problem::Invalid => "invalid",
+            Problem::UnsupportedPlatform => "unsupported_platform",
+            Problem::MissingDependency => "missing_dependency",
+            Problem::TooLarge => "too_large",
+            Problem::Timeout => "timeout",
+            Problem::Internal => "internal",
+        }
+    }
+}
+
+/// 一次管理操作的失败：类别 + 只给人看的细节。
+///
+/// `detail` 会原样成为 JSON-RPC `error.message`；类别走 `error.data.kind`，
+/// 上层不得解析 `detail` 来判断类别。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProblemError {
+    pub problem: Problem,
+    pub detail: String,
+}
+
+impl ProblemError {
+    pub fn new(problem: Problem, detail: impl Into<String>) -> ProblemError {
+        ProblemError {
+            problem,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl std::fmt::Display for ProblemError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for ProblemError {}
+
 /// 一次调用的完整结局。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallError {
@@ -262,6 +349,56 @@ mod tests {
         }));
         assert_eq!(busy.class, Class::Busy);
         assert_eq!(busy.retry, Class::Busy.default_retry());
+    }
+
+    #[test]
+    fn every_problem_has_a_distinct_stable_name() {
+        let mut names: Vec<&str> = Problem::ALL
+            .iter()
+            .map(|problem| problem.as_str())
+            .collect();
+        let total = names.len();
+        assert_eq!(total, 12);
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "two problems share a name");
+    }
+
+    #[test]
+    fn the_problem_names_are_the_wire_contract() {
+        let names: Vec<&str> = Problem::ALL
+            .iter()
+            .map(|problem| problem.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "unknown_service",
+                "unknown_plugin",
+                "unknown_strategy",
+                "core_service",
+                "not_a_plugin",
+                "conflict",
+                "invalid",
+                "unsupported_platform",
+                "missing_dependency",
+                "too_large",
+                "timeout",
+                "internal",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_problem_error_displays_its_detail_and_carries_its_kind() {
+        let error = ProblemError::new(Problem::Conflict, "plugin id conflicts");
+        assert_eq!(error.problem, Problem::Conflict);
+        assert_eq!(error.problem.as_str(), "conflict");
+        assert_eq!(error.detail(), "plugin id conflicts");
+        assert_eq!(error.to_string(), "plugin id conflicts");
+
+        let as_error: &dyn std::error::Error = &error;
+        assert_eq!(as_error.to_string(), "plugin id conflicts");
     }
 
     #[test]

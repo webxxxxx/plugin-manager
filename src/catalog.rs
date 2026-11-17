@@ -19,6 +19,30 @@ pub struct Page {
     pub next_cursor: Option<String>,
 }
 
+/// Why a cursor was rejected. The management layer projects this to a
+/// [`crate::kernel::failure::Problem`] without re-parsing the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageError {
+    /// Not base64, not `version:offset`, or a non-numeric field.
+    InvalidCursor,
+    /// Minted from a different catalog snapshot.
+    VersionMismatch,
+    /// The offset is beyond the current tool list.
+    PastEnd,
+}
+
+impl std::fmt::Display for PageError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            PageError::InvalidCursor => "invalid cursor",
+            PageError::VersionMismatch => "cursor does not match the current catalog version",
+            PageError::PastEnd => "cursor is past the end of the catalog",
+        })
+    }
+}
+
+impl std::error::Error for PageError {}
+
 /// Slice one page out of a stable, ordered tool list.
 ///
 /// `cursor` is opaque to clients. It encodes the catalog version and the
@@ -29,7 +53,7 @@ pub fn page(
     version: u64,
     cursor: Option<&str>,
     limit: Option<usize>,
-) -> Result<Page, String> {
+) -> Result<Page, PageError> {
     let offset = match cursor {
         Some(cursor) => decode_cursor(cursor, version, tools.len())?,
         None => 0,
@@ -63,23 +87,23 @@ fn encode_cursor(version: u64, offset: usize) -> String {
     URL_SAFE_NO_PAD.encode(format!("{}:{}", version, offset))
 }
 
-fn decode_cursor(cursor: &str, version: u64, len: usize) -> Result<usize, String> {
+fn decode_cursor(cursor: &str, version: u64, len: usize) -> Result<usize, PageError> {
     let bytes = URL_SAFE_NO_PAD
         .decode(cursor)
-        .map_err(|_| "invalid cursor".to_string())?;
-    let text = String::from_utf8(bytes).map_err(|_| "invalid cursor".to_string())?;
+        .map_err(|_| PageError::InvalidCursor)?;
+    let text = String::from_utf8(bytes).map_err(|_| PageError::InvalidCursor)?;
     let (cursor_version, offset) = text
         .split_once(':')
-        .ok_or_else(|| "invalid cursor".to_string())?;
+        .ok_or(PageError::InvalidCursor)?;
     let cursor_version: u64 = cursor_version
         .parse()
-        .map_err(|_| "invalid cursor".to_string())?;
+        .map_err(|_| PageError::InvalidCursor)?;
     if cursor_version != version {
-        return Err("cursor does not match the current catalog version".into());
+        return Err(PageError::VersionMismatch);
     }
-    let offset: usize = offset.parse().map_err(|_| "invalid cursor".to_string())?;
+    let offset: usize = offset.parse().map_err(|_| PageError::InvalidCursor)?;
     if offset > len {
-        return Err("cursor is past the end of the catalog".into());
+        return Err(PageError::PastEnd);
     }
     Ok(offset)
 }
@@ -129,15 +153,24 @@ mod tests {
         let all = tools(2);
         let first = page(&all, 1, None, Some(1)).expect("page");
         let cursor = first.next_cursor.expect("cursor");
-        assert!(page(&all, 2, Some(&cursor), Some(1)).is_err());
+        assert_eq!(
+            page(&all, 2, Some(&cursor), Some(1)),
+            Err(PageError::VersionMismatch)
+        );
     }
 
     #[test]
     fn invalid_and_past_end_cursors_are_rejected() {
         let all = tools(2);
-        assert!(page(&all, 1, Some("not-base64"), Some(1)).is_err());
+        assert_eq!(
+            page(&all, 1, Some("not-base64"), Some(1)),
+            Err(PageError::InvalidCursor)
+        );
         let past_end = URL_SAFE_NO_PAD.encode("1:99");
-        assert!(page(&all, 1, Some(&past_end), Some(1)).is_err());
+        assert_eq!(
+            page(&all, 1, Some(&past_end), Some(1)),
+            Err(PageError::PastEnd)
+        );
     }
 
     #[test]

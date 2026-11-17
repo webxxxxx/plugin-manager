@@ -22,7 +22,7 @@ use crate::definition;
 use crate::kernel::contract::{
     CapabilityName, Instance, Invocation, Launchers, ProgressToken, Reply, ReplySink,
 };
-use crate::kernel::failure::{Class, Failure, Rejection, Retry};
+use crate::kernel::failure::{Class, Failure, Problem, ProblemError, Rejection, Retry};
 use crate::lan::LanStatus;
 use crate::log;
 use crate::mcp;
@@ -913,7 +913,12 @@ impl Daemon {
         if incoming.endpoint == channel::Endpoint::User
             && channel::Endpoint::for_method(&request.method) == channel::Endpoint::Admin
         {
-            let response = rpc::err(request.id, -32000, "unauthorized");
+            let response = rpc::err_data(
+                request.id,
+                -32000,
+                "unauthorized",
+                json!({ "kind": Problem::Internal.as_str() }),
+            );
             let _ = incoming.reply.send(rpc::to_line(&response));
             return;
         }
@@ -940,7 +945,12 @@ impl Daemon {
             }
             "registry.tools" | "tools/list" => match self.tools_page(&request.params) {
                 Ok(value) => rpc::ok(id, value),
-                Err(message) => rpc::err(id, -32602, &message),
+                Err(error) => rpc::err_data(
+                    id,
+                    -32602,
+                    error.detail(),
+                    json!({ "kind": error.problem.as_str() }),
+                ),
             },
             "registry.version" => rpc::ok(id, json!({ "version": self.catalog_version })),
             "svc.list" => rpc::ok(id, json!({"services": self.statuses()})),
@@ -957,7 +967,12 @@ impl Daemon {
                         }
                         rpc::ok(id, status_json(status))
                     }
-                    None => rpc::err(id, -32001, &format!("unknown service: {}", service_id)),
+                    None => rpc::err_data(
+                        id,
+                        -32001,
+                        &format!("unknown service: {}", service_id),
+                        json!({ "kind": Problem::UnknownService.as_str() }),
+                    ),
                 },
                 Err(response) => response,
             },
@@ -983,23 +998,48 @@ impl Daemon {
             },
             "svc.reload" | "svcd.reload" => match self.reload() {
                 Ok(summary) => rpc::ok(id, summary),
-                Err(error) => rpc::err(id, -32009, &error),
+                Err(error) => rpc::err_data(
+                    id,
+                    -32009,
+                    error.detail(),
+                    json!({ "kind": error.problem.as_str() }),
+                ),
             },
             "plugin.install" => match self.install_plugin(&request) {
                 Ok(status) => rpc::ok(id, status_json(status)),
-                Err(error) => rpc::err(id, -32006, &error),
+                Err(error) => rpc::err_data(
+                    id,
+                    -32006,
+                    error.detail(),
+                    json!({ "kind": error.problem.as_str() }),
+                ),
             },
             "plugin.install_staged" => match self.install_staged(&request) {
                 Ok(status) => rpc::ok(id, status_json(status)),
-                Err(error) => rpc::err(id, -32006, &error),
+                Err(error) => rpc::err_data(
+                    id,
+                    -32006,
+                    error.detail(),
+                    json!({ "kind": error.problem.as_str() }),
+                ),
             },
             "plugin.uninstall" => match self.uninstall_plugin(&request) {
                 Ok(()) => rpc::ok(id, json!({ "ok": true })),
-                Err(error) => rpc::err(id, -32007, &error),
+                Err(error) => rpc::err_data(
+                    id,
+                    -32007,
+                    error.detail(),
+                    json!({ "kind": error.problem.as_str() }),
+                ),
             },
             "auth.status" => match self.auth_status() {
                 Ok(status) => rpc::ok(id, auth_json(&status)),
-                Err(error) => rpc::err(id, -32008, &error),
+                Err(error) => rpc::err_data(
+                    id,
+                    -32008,
+                    error.detail(),
+                    json!({ "kind": error.problem.as_str() }),
+                ),
             },
             "auth.passwd" => {
                 let password = request
@@ -1009,43 +1049,68 @@ impl Daemon {
                     .unwrap_or("");
                 match self.auth_passwd(password) {
                     Ok(status) => rpc::ok(id, auth_json(&status)),
-                    Err(error) => rpc::err(id, -32008, &error),
+                    Err(error) => rpc::err_data(
+                        id,
+                        -32008,
+                        error.detail(),
+                        json!({ "kind": error.problem.as_str() }),
+                    ),
                 }
             }
-            _ => rpc::err(id, -32601, "method not found"),
+            _ => rpc::err_data(
+                id,
+                -32601,
+                "method not found",
+                json!({ "kind": Problem::Invalid.as_str() }),
+            ),
         }
     }
 
     #[cfg(feature = "http")]
-    fn auth_status(&self) -> Result<LanStatus, String> {
+    fn auth_status(&self) -> Result<LanStatus, ProblemError> {
         self.api
             .as_ref()
-            .ok_or_else(|| "HTTP API is not running".to_string())?
+            .ok_or_else(|| ProblemError::new(Problem::Internal, "HTTP API is not running"))?
             .status()
+            .map_err(|detail| ProblemError::new(Problem::Internal, detail))
     }
 
     #[cfg(not(feature = "http"))]
-    fn auth_status(&self) -> Result<LanStatus, String> {
-        Err("HTTP API is disabled in this build".to_string())
+    fn auth_status(&self) -> Result<LanStatus, ProblemError> {
+        Err(ProblemError::new(
+            Problem::Internal,
+            "HTTP API is disabled in this build",
+        ))
     }
 
     #[cfg(feature = "http")]
-    fn auth_passwd(&self, password: &str) -> Result<LanStatus, String> {
+    fn auth_passwd(&self, password: &str) -> Result<LanStatus, ProblemError> {
         if password.is_empty() {
-            return Err("password must not be empty".into());
+            return Err(ProblemError::new(
+                Problem::Internal,
+                "password must not be empty",
+            ));
         }
-        let path = settings::path().ok_or_else(|| "svcd.conf path is unavailable".to_string())?;
-        let hash = crate::auth::hash_password(password)?;
-        settings::update_value(path, "auth_passwd", &hash)?;
+        let path = settings::path().ok_or_else(|| {
+            ProblemError::new(Problem::Internal, "svcd.conf path is unavailable")
+        })?;
+        let hash = crate::auth::hash_password(password)
+            .map_err(|detail| ProblemError::new(Problem::Internal, detail))?;
+        settings::update_value(path, "auth_passwd", &hash)
+            .map_err(|detail| ProblemError::new(Problem::Internal, detail))?;
         self.api
             .as_ref()
-            .ok_or_else(|| "HTTP API is not running".to_string())?
+            .ok_or_else(|| ProblemError::new(Problem::Internal, "HTTP API is not running"))?
             .set_password(hash)
+            .map_err(|detail| ProblemError::new(Problem::Internal, detail))
     }
 
     #[cfg(not(feature = "http"))]
-    fn auth_passwd(&self, _password: &str) -> Result<LanStatus, String> {
-        Err("HTTP API is disabled in this build".to_string())
+    fn auth_passwd(&self, _password: &str) -> Result<LanStatus, ProblemError> {
+        Err(ProblemError::new(
+            Problem::Internal,
+            "HTTP API is disabled in this build",
+        ))
     }
 
     fn statuses(&self) -> Vec<Status> {
@@ -1109,14 +1174,23 @@ impl Daemon {
             .1
     }
 
-    fn tools_page(&mut self, params: &Value) -> Result<Value, String> {
+    fn tools_page(&mut self, params: &Value) -> Result<Value, ProblemError> {
         let cursor = params.get("cursor").and_then(Value::as_str);
         let limit = params
             .get("limit")
             .and_then(Value::as_u64)
             .map(|value| value.min(usize::MAX as u64) as usize);
         let version = self.catalog_version;
-        let page = catalog::page(self.tool_list_cached(), version, cursor, limit)?;
+        let page = catalog::page(self.tool_list_cached(), version, cursor, limit)
+            .map_err(|error| {
+                let problem = match error {
+                    crate::catalog::PageError::InvalidCursor => Problem::Invalid,
+                    // Both today fall through to 500; keep that projection.
+                    crate::catalog::PageError::VersionMismatch
+                    | crate::catalog::PageError::PastEnd => Problem::Internal,
+                };
+                ProblemError::new(problem, error.to_string())
+            })?;
         let mut result = json!({ "tools": page.tools });
         if let Some(cursor) = page.next_cursor {
             result["nextCursor"] = json!(cursor);
@@ -1166,7 +1240,7 @@ impl Daemon {
         if let Some(service_id) = start_id {
             let response = match self.start_service(service_id) {
                 Ok(status) => mcp::tool_result(id, status_json(status).to_string(), false),
-                Err(error) => mcp::tool_error(id, &error),
+                Err(error) => mcp::tool_error(id, error.detail()),
             };
             send(&reply, response);
             return;
@@ -1243,10 +1317,7 @@ impl Daemon {
                 project_builtin_outcome,
             );
             if let Err(rejection) = instance.call(invocation, done) {
-                reply.send(project_builtin_outcome(
-                    id,
-                    Err(rejection_failure(rejection)),
-                ));
+                reply.send(rpc::to_line(&project_rejection(id, rejection)));
             }
             return;
         }
@@ -1278,7 +1349,7 @@ impl Daemon {
             project_slot_outcome,
         );
         if let Err(rejection) = instance.call(invocation, done) {
-            reply.send(project_slot_outcome(id, Err(rejection_failure(rejection))));
+            reply.send(rpc::to_line(&project_rejection(id, rejection)));
         }
     }
 
@@ -1338,7 +1409,7 @@ impl Daemon {
         }
     }
 
-    fn reload(&mut self) -> Result<Value, String> {
+    fn reload(&mut self) -> Result<Value, ProblemError> {
         let summary = self.reconcile_definitions()?;
         self.services_fingerprint = services_fingerprint(&paths::services_dir());
         Ok(summary)
@@ -1348,7 +1419,7 @@ impl Daemon {
     /// Running services keep running (a changed exec applies at the next start);
     /// definitions that disappeared are stopped and forgotten. Shared by
     /// `svc reload`, the periodic rescan, and boot recovery.
-    fn reconcile_definitions(&mut self) -> Result<Value, String> {
+    fn reconcile_definitions(&mut self) -> Result<Value, ProblemError> {
         let loaded = definition::load_services(&paths::services_dir());
         for issue in &loaded.issues {
             log::svcd(&format!("svcd: reload: warning: {}", issue));
@@ -1509,9 +1580,12 @@ impl Daemon {
         (added, updated)
     }
 
-    fn start_service(&mut self, id: &str) -> Result<Status, String> {
+    fn start_service(&mut self, id: &str) -> Result<Status, ProblemError> {
         if self.registry.get(id).is_none() {
-            return Err(format!("unknown service: {}", id));
+            return Err(ProblemError::new(
+                Problem::UnknownService,
+                format!("unknown service: {}", id),
+            ));
         }
         if id == RESERVED_ID {
             return Ok(self.status_for_id(id).expect("builtin"));
@@ -1529,7 +1603,7 @@ impl Daemon {
                 &devices,
                 &compat::detect(MAX_SCHEMA, MAX_PROTOCOL),
             )) {
-                return Err(format!("{}: {}", id, reason));
+                return Err(problem_for_plugin_detail(format!("{}: {}", id, reason)));
             }
         }
         if let Some(service) = self.registry.get(id) {
@@ -1568,13 +1642,22 @@ impl Daemon {
         {
             match self.slots.get(dependency).map(|slot| slot.machine.state) {
                 Some(State::Failed) => {
-                    return Err(format!("dependency {} is failed", dependency));
+                    return Err(ProblemError::new(
+                        Problem::Internal,
+                        format!("dependency {} is failed", dependency),
+                    ));
                 }
                 Some(State::Backoff) => {
-                    return Err(format!("dependency {} is backing off", dependency));
+                    return Err(ProblemError::new(
+                        Problem::Internal,
+                        format!("dependency {} is backing off", dependency),
+                    ));
                 }
                 Some(State::Stopping) => {
-                    return Err(format!("dependency {} is stopping", dependency));
+                    return Err(ProblemError::new(
+                        Problem::Internal,
+                        format!("dependency {} is stopping", dependency),
+                    ));
                 }
                 _ => {}
             }
@@ -1584,11 +1667,12 @@ impl Daemon {
             self.start_layer(&layer, deadline)?;
         }
 
-        self.status_for_id(id)
-            .ok_or_else(|| format!("unknown service: {}", id))
+        self.status_for_id(id).ok_or_else(|| {
+            ProblemError::new(Problem::UnknownService, format!("unknown service: {}", id))
+        })
     }
 
-    fn start_layer(&mut self, ids: &[String], deadline: u64) -> Result<(), String> {
+    fn start_layer(&mut self, ids: &[String], deadline: u64) -> Result<(), ProblemError> {
         let pending: Vec<String> = ids
             .iter()
             .filter(|id| self.slots.contains_key(*id))
@@ -1600,7 +1684,10 @@ impl Daemon {
         }
         for id in &pending {
             if self.slots[id].machine.state == State::Stopping {
-                return Err(format!("service {} is stopping", id));
+                return Err(ProblemError::new(
+                    Problem::Internal,
+                    format!("service {} is stopping", id),
+                ));
             }
             let now = self.now_ms();
             self.slots
@@ -1616,7 +1703,10 @@ impl Daemon {
                 match self.slots[id].machine.state {
                     State::Running => {}
                     State::Failed => {
-                        return Err(format!("service {} failed to start", id));
+                        return Err(ProblemError::new(
+                            Problem::Internal,
+                            format!("service {} failed to start", id),
+                        ));
                     }
                     _ => all_running = false,
                 }
@@ -1625,18 +1715,23 @@ impl Daemon {
                 return Ok(());
             }
             if self.now_ms() >= deadline {
-                return Err(format!("start timed out: {}", pending.join(", ")));
+                return Err(ProblemError::new(
+                    Problem::Timeout,
+                    format!("start timed out: {}", pending.join(", ")),
+                ));
             }
             thread::sleep(Duration::from_millis(20));
         }
     }
 
-    fn install_plugin(&mut self, request: &rpc::Request) -> Result<Status, String> {
+    fn install_plugin(&mut self, request: &rpc::Request) -> Result<Status, ProblemError> {
         let path = request
             .params
             .get("path")
             .and_then(Value::as_str)
-            .ok_or_else(|| "plugin.install requires path".to_string())?;
+            .ok_or_else(|| {
+                ProblemError::new(Problem::Internal, "plugin.install requires path")
+            })?;
         let strategy = match Strategy::parse(
             request
                 .params
@@ -1645,7 +1740,12 @@ impl Daemon {
                 .unwrap_or("replace"),
         ) {
             Some(strategy) => strategy,
-            None => return Err("unknown strategy".into()),
+            None => {
+                return Err(ProblemError::new(
+                    Problem::UnknownStrategy,
+                    "unknown strategy",
+                ))
+            }
         };
         let allow_hooks = request
             .params
@@ -1661,7 +1761,8 @@ impl Daemon {
             Path::new(path),
             settings::allow_insecure_install(),
             allow_hooks,
-        )?;
+        )
+        .map_err(problem_for_plugin_detail)?;
         let plugin::Verified {
             package,
             signature_verified,
@@ -1670,7 +1771,10 @@ impl Daemon {
         let id = package.manifest.name.clone();
         if let Some(existing) = self.registry.get(&id) {
             if existing.kind != Kind::Plugin {
-                return Err(format!("id is a core service: {}", id));
+                return Err(ProblemError::new(
+                    Problem::CoreService,
+                    format!("id is a core service: {}", id),
+                ));
             }
         }
 
@@ -1693,24 +1797,31 @@ impl Daemon {
             Ok(service) => service,
             Err(error) if strategy == Strategy::KeepOld && is_no_space(&error) => {
                 if still_running {
-                    return Err(format!(
-                        "not enough space for keep-old; stop the plugin and retry with replace: {}",
-                        error
+                    return Err(ProblemError::new(
+                        Problem::Internal,
+                        format!(
+                            "not enough space for keep-old; stop the plugin and retry with replace: {}",
+                            error
+                        ),
                     ));
                 }
                 log::svcd(&format!(
                     "svcd: plugin {}: keep-old ran out of space; falling back to replace",
                     id
                 ));
-                plugin::install_package(&package, Strategy::Replace, allow_hooks, host_interpreter)?
+                plugin::install_package(&package, Strategy::Replace, allow_hooks, host_interpreter)
+                    .map_err(problem_for_plugin_detail)?
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(problem_for_plugin_detail(error)),
         };
         // The package is already on disk, but registration can still be refused
         // (ADR-0015's carrier invariant). Check before touching the running slot
         // so a refusal leaves the live service untouched.
         if let Err(error) = service.carrier() {
-            return Err(format!("plugin {}: {}", id, error));
+            return Err(ProblemError::new(
+                Problem::Internal,
+                format!("plugin {}: {}", id, error),
+            ));
         }
         if !still_running {
             self.slots.remove(&id);
@@ -1732,7 +1843,9 @@ impl Daemon {
                 self.slots.insert(id.clone(), slot);
             }
         }
-        self.registry.replace(service)?;
+        self.registry
+            .replace(service)
+            .map_err(|detail| ProblemError::new(Problem::Internal, detail))?;
         self.bump_catalog();
         log::svcd(&format!(
             "svcd: plugin {} {} installed ({}){}",
@@ -1749,16 +1862,19 @@ impl Daemon {
                 "; signature was NOT verified (allow_insecure_install)"
             }
         ));
-        self.status_for_id(&id)
-            .ok_or_else(|| format!("unknown plugin: {}", id))
+        self.status_for_id(&id).ok_or_else(|| {
+            ProblemError::new(Problem::UnknownPlugin, format!("unknown plugin: {}", id))
+        })
     }
 
-    fn install_staged(&mut self, request: &rpc::Request) -> Result<Status, String> {
+    fn install_staged(&mut self, request: &rpc::Request) -> Result<Status, ProblemError> {
         let path = request
             .params
             .get("path")
             .and_then(Value::as_str)
-            .ok_or_else(|| "plugin.install_staged requires path".to_string())?;
+            .ok_or_else(|| {
+                ProblemError::new(Problem::Internal, "plugin.install_staged requires path")
+            })?;
         let strategy = match Strategy::parse(
             request
                 .params
@@ -1767,7 +1883,12 @@ impl Daemon {
                 .unwrap_or("replace"),
         ) {
             Some(strategy) => strategy,
-            None => return Err("unknown strategy".into()),
+            None => {
+                return Err(ProblemError::new(
+                    Problem::UnknownStrategy,
+                    "unknown strategy",
+                ))
+            }
         };
         let allow_hooks = request
             .params
@@ -1775,40 +1896,57 @@ impl Daemon {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-        let staging = Path::new(path)
-            .canonicalize()
-            .map_err(|error| format!("staging path {}: {}", path, error))?;
-        let plugins = paths::plugins_dir()
-            .canonicalize()
-            .map_err(|error| format!("plugins dir: {}", error))?;
+        let staging = Path::new(path).canonicalize().map_err(|error| {
+            ProblemError::new(
+                Problem::Internal,
+                format!("staging path {}: {}", path, error),
+            )
+        })?;
+        let plugins = paths::plugins_dir().canonicalize().map_err(|error| {
+            ProblemError::new(Problem::Internal, format!("plugins dir: {}", error))
+        })?;
         if !staging.starts_with(&plugins)
             || !staging
                 .file_name()
                 .map(|name| name.to_string_lossy().starts_with(".staging-"))
                 .unwrap_or(false)
         {
-            return Err("staging path is outside the plugin staging area".into());
+            return Err(ProblemError::new(
+                Problem::Internal,
+                "staging path is outside the plugin staging area",
+            ));
         }
 
-        let staged = package::load_staged(&staging, settings::allow_insecure_install())?;
+        let staged = package::load_staged(&staging, settings::allow_insecure_install())
+            .map_err(problem_for_plugin_detail)?;
         let id = staged.manifest.name.clone();
         let version = staged.manifest.version.clone();
         if let Some(requested) = request.params.get("id").and_then(Value::as_str) {
             if requested != id {
-                return Err("staged id does not match the request".into());
+                return Err(ProblemError::new(
+                    Problem::Internal,
+                    "staged id does not match the request",
+                ));
             }
         }
         if let Some(requested) = request.params.get("version").and_then(Value::as_str) {
             if requested != version {
-                return Err("staged version does not match the request".into());
+                return Err(ProblemError::new(
+                    Problem::Internal,
+                    "staged version does not match the request",
+                ));
             }
         }
         if let Some(existing) = self.registry.get(&id) {
             if existing.kind != Kind::Plugin {
-                return Err(format!("id is a core service: {}", id));
+                return Err(ProblemError::new(
+                    Problem::CoreService,
+                    format!("id is a core service: {}", id),
+                ));
             }
         }
-        let host_interpreter = plugin::prepare_staged(&staged, allow_hooks)?;
+        let host_interpreter =
+            plugin::prepare_staged(&staged, allow_hooks).map_err(problem_for_plugin_detail)?;
         let signature_verified = staged.signature_verified;
 
         let running = |slots: &BTreeMap<String, Slot>| {
@@ -1821,9 +1959,13 @@ impl Daemon {
             self.stop_service(&id)?;
         }
         let still_running = running(&self.slots);
-        let service = plugin::install_staged(staged, strategy, allow_hooks, host_interpreter)?;
+        let service = plugin::install_staged(staged, strategy, allow_hooks, host_interpreter)
+            .map_err(problem_for_plugin_detail)?;
         if let Err(error) = service.carrier() {
-            return Err(format!("plugin {}: {}", id, error));
+            return Err(ProblemError::new(
+                Problem::Internal,
+                format!("plugin {}: {}", id, error),
+            ));
         }
         if !still_running {
             self.slots.remove(&id);
@@ -1845,7 +1987,9 @@ impl Daemon {
                 self.slots.insert(id.clone(), slot);
             }
         }
-        self.registry.replace(service)?;
+        self.registry
+            .replace(service)
+            .map_err(|detail| ProblemError::new(Problem::Internal, detail))?;
         self.bump_catalog();
         log::svcd(&format!(
             "svcd: plugin {} {} installed ({}){}",
@@ -1862,27 +2006,32 @@ impl Daemon {
                 "; signature was NOT verified (allow_insecure_install)"
             }
         ));
-        self.status_for_id(&id)
-            .ok_or_else(|| format!("unknown plugin: {}", id))
+        self.status_for_id(&id).ok_or_else(|| {
+            ProblemError::new(Problem::UnknownPlugin, format!("unknown plugin: {}", id))
+        })
     }
 
-    fn uninstall_plugin(&mut self, request: &rpc::Request) -> Result<(), String> {
+    fn uninstall_plugin(&mut self, request: &rpc::Request) -> Result<(), ProblemError> {
         let id = request
             .params
             .get("id")
             .and_then(Value::as_str)
-            .ok_or_else(|| "plugin.uninstall requires id".to_string())?;
+            .ok_or_else(|| {
+                ProblemError::new(Problem::Internal, "plugin.uninstall requires id")
+            })?;
         let purge = request
             .params
             .get("purge")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let service = self
-            .registry
-            .get(id)
-            .ok_or_else(|| format!("unknown plugin: {}", id))?;
+        let service = self.registry.get(id).ok_or_else(|| {
+            ProblemError::new(Problem::UnknownPlugin, format!("unknown plugin: {}", id))
+        })?;
         if service.kind != Kind::Plugin {
-            return Err(format!("not a plugin: {}", id));
+            return Err(ProblemError::new(
+                Problem::NotAPlugin,
+                format!("not a plugin: {}", id),
+            ));
         }
         let running = self
             .slots
@@ -1892,7 +2041,7 @@ impl Daemon {
         if running {
             self.stop_service(id)?;
         }
-        plugin::uninstall(id, purge)?;
+        plugin::uninstall(id, purge).map_err(problem_for_plugin_detail)?;
         self.slots.remove(id);
         self.registry.remove(id);
         runtime::remove(id);
@@ -1907,18 +2056,26 @@ impl Daemon {
         Ok(())
     }
 
-    fn set_enabled(&mut self, id: &str, enabled: bool) -> Result<Status, String> {
+    fn set_enabled(&mut self, id: &str, enabled: bool) -> Result<Status, ProblemError> {
         if self.registry.get(id).is_none() {
-            return Err(format!("unknown service: {}", id));
+            return Err(ProblemError::new(
+                Problem::UnknownService,
+                format!("unknown service: {}", id),
+            ));
         }
         if id == RESERVED_ID {
-            return Err("the built-in svc service cannot be enabled or disabled".into());
+            return Err(ProblemError::new(
+                Problem::Conflict,
+                "the built-in svc service cannot be enabled or disabled",
+            ));
         }
         let kind = self
             .registry
             .get(id)
             .map(|service| service.kind)
-            .ok_or_else(|| format!("unknown service: {}", id))?;
+            .ok_or_else(|| {
+                ProblemError::new(Problem::UnknownService, format!("unknown service: {}", id))
+            })?;
         let (marker, create) = match kind {
             Kind::Plugin => (plugin::plugin_dir(id).join("enabled"), enabled),
             Kind::Core => (
@@ -1928,14 +2085,26 @@ impl Daemon {
         };
         if create {
             if let Some(parent) = marker.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| format!("cannot create {}: {}", parent.display(), error))?;
+                fs::create_dir_all(parent).map_err(|error| {
+                    ProblemError::new(
+                        Problem::Internal,
+                        format!("cannot create {}: {}", parent.display(), error),
+                    )
+                })?;
             }
-            fs::write(&marker, b"")
-                .map_err(|error| format!("cannot write {}: {}", marker.display(), error))?;
+            fs::write(&marker, b"").map_err(|error| {
+                ProblemError::new(
+                    Problem::Internal,
+                    format!("cannot write {}: {}", marker.display(), error),
+                )
+            })?;
         } else if marker.exists() {
-            fs::remove_file(&marker)
-                .map_err(|error| format!("cannot remove {}: {}", marker.display(), error))?;
+            fs::remove_file(&marker).map_err(|error| {
+                ProblemError::new(
+                    Problem::Internal,
+                    format!("cannot remove {}: {}", marker.display(), error),
+                )
+            })?;
         }
         if let Some(service) = self.registry.get_mut(id) {
             service.enabled = enabled;
@@ -1943,16 +2112,20 @@ impl Daemon {
         // `disable` changes the boot flag only. The crash-restart policy is a
         // separate service property and must not be turned off behind the
         // operator's back.
-        self.status_for_id(id)
-            .ok_or_else(|| format!("unknown service: {}", id))
+        self.status_for_id(id).ok_or_else(|| {
+            ProblemError::new(Problem::UnknownService, format!("unknown service: {}", id))
+        })
     }
 
     /// `svc restart` = stop then start, on one RPC so no other caller can slip
     /// in between. A finished one-shot is stopped (settles immediately) and
     /// then runs again.
-    fn restart_service(&mut self, id: &str) -> Result<Status, String> {
+    fn restart_service(&mut self, id: &str) -> Result<Status, ProblemError> {
         if self.registry.get(id).is_none() {
-            return Err(format!("unknown service: {}", id));
+            return Err(ProblemError::new(
+                Problem::UnknownService,
+                format!("unknown service: {}", id),
+            ));
         }
         if id == RESERVED_ID {
             return Ok(self.status_for_id(id).expect("builtin"));
@@ -1961,25 +2134,28 @@ impl Daemon {
         self.start_service(id)
     }
 
-    fn stop_service(&mut self, id: &str) -> Result<Status, String> {
+    fn stop_service(&mut self, id: &str) -> Result<Status, ProblemError> {
         if self.registry.get(id).is_none() {
-            return Err(format!("unknown service: {}", id));
+            return Err(ProblemError::new(
+                Problem::UnknownService,
+                format!("unknown service: {}", id),
+            ));
         }
         if id == RESERVED_ID {
             return Ok(self.status_for_id(id).expect("builtin"));
         }
         let Some(state) = self.slots.get(id).map(|slot| slot.machine.state) else {
-            return self
-                .status_for_id(id)
-                .ok_or_else(|| format!("unknown service: {}", id));
+            return self.status_for_id(id).ok_or_else(|| {
+                ProblemError::new(Problem::UnknownService, format!("unknown service: {}", id))
+            });
         };
 
         let now = self.now_ms();
         self.slots.get_mut(id).expect("slot").request_stop(now);
         if matches!(state, State::Stopped | State::Failed) {
-            return self
-                .status_for_id(id)
-                .ok_or_else(|| format!("unknown service: {}", id));
+            return self.status_for_id(id).ok_or_else(|| {
+                ProblemError::new(Problem::UnknownService, format!("unknown service: {}", id))
+            });
         }
         let deadline = now
             .saturating_add(supervisor::STOP_TIMEOUT_MS)
@@ -1989,16 +2165,25 @@ impl Daemon {
             self.pump();
             match self.slots[id].machine.state {
                 State::Stopped => break,
-                State::Failed => return Err(format!("service {} did not stop", id)),
+                State::Failed => {
+                    return Err(ProblemError::new(
+                        Problem::Internal,
+                        format!("service {} did not stop", id),
+                    ))
+                }
                 _ => {}
             }
             if self.now_ms() >= deadline {
-                return Err(format!("stop timed out: {}", id));
+                return Err(ProblemError::new(
+                    Problem::Timeout,
+                    format!("stop timed out: {}", id),
+                ));
             }
             thread::sleep(Duration::from_millis(20));
         }
-        self.status_for_id(id)
-            .ok_or_else(|| format!("unknown service: {}", id))
+        self.status_for_id(id).ok_or_else(|| {
+            ProblemError::new(Problem::UnknownService, format!("unknown service: {}", id))
+        })
     }
 
     fn pump(&mut self) {
@@ -2090,14 +2275,24 @@ impl Daemon {
 fn status_response(
     id: Option<Value>,
     error_code: i32,
-    result: Result<Status, String>,
+    result: Result<Status, ProblemError>,
 ) -> rpc::Response {
     match result {
         Ok(status) => match serde_json::to_value(status) {
             Ok(value) => rpc::ok(id, value),
-            Err(error) => rpc::err(id, -32603, &error.to_string()),
+            Err(error) => rpc::err_data(
+                id,
+                -32603,
+                &error.to_string(),
+                json!({ "kind": Problem::Internal.as_str() }),
+            ),
         },
-        Err(message) => rpc::err(id, error_code, &message),
+        Err(error) => rpc::err_data(
+            id,
+            error_code,
+            error.detail(),
+            json!({ "kind": error.problem.as_str() }),
+        ),
     }
 }
 
@@ -2114,11 +2309,17 @@ fn project_slot_response(
     match outcome {
         Ok(value) => rpc::ok(external_id, value),
         Err(failure) => match failure.class {
-            Class::Busy => rpc::err(external_id, -32000, "busy: too many in-flight tool calls"),
-            Class::FrameTooLarge => rpc::err(
+            Class::Busy => rpc::err_data(
+                external_id,
+                -32000,
+                "busy: too many in-flight tool calls",
+                json!({ "class": failure.class.as_str() }),
+            ),
+            Class::FrameTooLarge => rpc::err_data(
                 external_id,
                 -32602,
                 "tools/call request exceeds the 1 MiB frame limit",
+                json!({ "class": failure.class.as_str() }),
             ),
             Class::NotRunning | Class::WriteFailed => {
                 mcp::tool_result(external_id, failure.detail, true)
@@ -2154,16 +2355,23 @@ fn projected_done(
     })
 }
 
-fn rejection_failure(rejection: Rejection) -> Failure {
+/// Face-side projection of an immediate `Instance::call` rejection: the call was
+/// never attempted, so it has no [`Failure`]. The wire shapes stay the ones the
+/// old `rejection_failure` path produced (BadArguments through the frame-limit
+/// error, UnknownCapability through the isError tool result); only the
+/// structured `data.kind` is added to the JSON-RPC error.
+fn project_rejection(external_id: Option<Value>, rejection: Rejection) -> rpc::Response {
+    let kind = rejection.as_str();
     match rejection {
-        Rejection::BadArguments { detail } => {
-            Failure::new(Class::FrameTooLarge, Retry::Never, detail)
-        }
-        Rejection::UnknownCapability { capability } => Failure::new(
-            Class::ImplementationError,
-            Retry::Never,
-            format!("unknown capability {capability}"),
+        Rejection::BadArguments { .. } => rpc::err_data(
+            external_id,
+            -32602,
+            "tools/call request exceeds the 1 MiB frame limit",
+            json!({ "kind": kind }),
         ),
+        Rejection::UnknownCapability { capability } => {
+            mcp::tool_error(external_id, &format!("unknown capability {capability}"))
+        }
     }
 }
 
@@ -2310,19 +2518,89 @@ fn status_detail(output: &str, status: Option<std::process::ExitStatus>) -> Stri
     }
 }
 
+/// Classify a text-only error from `plugin`/`package` at the call site.
+///
+/// The daemon's management methods carry [`ProblemError`], but those modules
+/// still return `String`. This maps a detail to the [`Problem`] whose HTTP
+/// status today's `face::support::status_for_error` would pick, so the wire
+/// status cannot drift. It is deliberately *not* a `From<String>`: a new text
+/// cannot silently become a non-`Internal` category, and each call site still
+/// chooses to use this helper.
+fn problem_for_plugin_detail(detail: impl Into<String>) -> ProblemError {
+    let detail = detail.into();
+    let lower = detail.to_ascii_lowercase();
+    let problem = if lower.contains("timed out") || lower.contains("timeout") {
+        Problem::Timeout
+    } else if lower.contains("exceeds") || lower.contains("too large") {
+        Problem::TooLarge
+    } else if lower.contains("unknown keyid") || lower.contains("trust root") {
+        Problem::Invalid
+    } else if lower.contains("id is a core service") {
+        Problem::CoreService
+    } else if lower.contains("unknown strategy") {
+        Problem::UnknownStrategy
+    } else if lower.contains("unknown plugin") {
+        Problem::UnknownPlugin
+    } else if lower.contains("unknown service") {
+        Problem::UnknownService
+    } else if lower.contains("platform") {
+        // The host triple itself can contain "unknown" (e.g.
+        // x86_64-unknown-linux-gnu); classify the platform reason first so the
+        // host name does not turn a platform mismatch into a 404.
+        Problem::UnsupportedPlatform
+    } else if lower.contains("unknown") || lower.contains("not found") {
+        Problem::UnknownPlugin
+    } else if lower.contains("configcheck") {
+        Problem::Conflict
+    } else if lower.contains("not a plugin") {
+        Problem::NotAPlugin
+    } else if lower.contains("core service")
+        || lower.contains("conflict")
+        || lower.contains("cannot be enabled")
+    {
+        Problem::Conflict
+    } else if lower.contains("missing dependencies") {
+        Problem::MissingDependency
+    } else if lower.contains("signature")
+        || lower.contains("protocol")
+        || lower.contains("unsafe")
+        || lower.contains("setuid")
+        || lower.contains("hooks")
+        || lower.contains("invalid")
+        || lower.contains("not declared")
+        || lower.contains("missing")
+        || lower.contains("public key")
+    {
+        Problem::Invalid
+    } else {
+        Problem::Internal
+    };
+    ProblemError::new(problem, detail)
+}
+
 fn param_id(request: &rpc::Request) -> Result<String, rpc::Response> {
     request
         .params
         .get("id")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| rpc::err(request.id.clone(), -32602, "missing id"))
+        .ok_or_else(|| {
+            rpc::err_data(
+                request.id.clone(),
+                -32602,
+                "missing id",
+                json!({ "kind": Problem::Invalid.as_str() }),
+            )
+        })
 }
 
-fn start_layers(registry: &Registry, ids: &[String]) -> Result<Vec<Vec<String>>, String> {
+fn start_layers(registry: &Registry, ids: &[String]) -> Result<Vec<Vec<String>>, ProblemError> {
     let (closure, missing) = walk_dependencies(registry, ids);
     if !missing.is_empty() {
-        return Err(format!("missing dependencies: {}", missing.join(", ")));
+        return Err(ProblemError::new(
+            Problem::MissingDependency,
+            format!("missing dependencies: {}", missing.join(", ")),
+        ));
     }
 
     let mut remaining = closure;
@@ -2339,7 +2617,7 @@ fn start_layers(registry: &Registry, ids: &[String]) -> Result<Vec<Vec<String>>,
             .cloned()
             .collect();
         if layer.is_empty() {
-            return Err("dependency cycle".into());
+            return Err(ProblemError::new(Problem::Internal, "dependency cycle"));
         }
         for id in &layer {
             remaining.remove(id);
@@ -2518,9 +2796,10 @@ mod tests {
 
         let error = start_layers(&registry, &["app".into()]).expect_err("missing");
 
-        assert!(error.contains("missing dependencies:"));
-        assert!(error.contains("first"));
-        assert!(error.contains("second"));
+        assert_eq!(error.problem, Problem::MissingDependency);
+        assert!(error.detail().contains("missing dependencies:"), "{error}");
+        assert!(error.detail().contains("first"), "{error}");
+        assert!(error.detail().contains("second"), "{error}");
     }
 
     #[test]
@@ -2723,6 +3002,12 @@ while ($null -ne ($line = $reader.ReadLine())) {
         serde_json::from_str(&line).expect("response")
     }
 
+    /// Assert one management error's JSON-RPC code and structured kind.
+    fn assert_error_kind(response: &Value, code: i32, kind: &str) {
+        assert_eq!(response["error"]["code"], code, "{response}");
+        assert_eq!(response["error"]["data"]["kind"], kind, "{response}");
+    }
+
     /// §6: the read endpoint may drive lifecycle, never a write method.
     #[test]
     fn the_read_endpoint_cannot_run_a_write_method() {
@@ -2738,6 +3023,10 @@ while ($null -ne ($line = $reader.ReadLine())) {
         assert_eq!(
             refused["error"]["message"], "unauthorized",
             "the read endpoint must not reach a write method: {refused}"
+        );
+        assert_eq!(
+            refused["error"]["data"]["kind"], "internal",
+            "the unauthorized gate is a control-plane failure: {refused}"
         );
 
         let allowed = send_on(
@@ -3056,7 +3345,21 @@ while ($null -ne ($line = $reader.ReadLine())) {
         let stale = daemon
             .tools_page(&json!({"limit": 2, "cursor": "bm90LWEtY3Vyc29y"}))
             .expect_err("invalid cursor");
-        assert!(stale.contains("cursor"), "{stale}");
+        assert_eq!(stale.problem, Problem::Invalid);
+        assert!(stale.detail().contains("cursor"), "{stale}");
+
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let wrong_version = URL_SAFE_NO_PAD.encode("999:0");
+        let stale = daemon
+            .tools_page(&json!({"limit": 2, "cursor": wrong_version}))
+            .expect_err("version mismatch");
+        assert_eq!(stale.problem, Problem::Internal);
+        let past_end = URL_SAFE_NO_PAD.encode(format!("{}:99", daemon.catalog_version));
+        let stale = daemon
+            .tools_page(&json!({"limit": 2, "cursor": past_end}))
+            .expect_err("past end");
+        assert_eq!(stale.problem, Problem::Internal);
     }
 
     #[test]
@@ -3137,7 +3440,12 @@ while ($null -ne ($line = $reader.ReadLine())) {
 
         let error = daemon.start_service("app").expect_err("failed dependency");
 
-        assert!(error.contains("dependency base is failed"), "{}", error);
+        assert_eq!(error.problem, Problem::Internal);
+        assert!(
+            error.detail().contains("dependency base is failed"),
+            "{}",
+            error
+        );
     }
 
     fn two_owners(id: &str) -> Service {
@@ -3297,6 +3605,349 @@ while ($null -ne ($line = $reader.ReadLine())) {
             Err(Failure::new(Class::Busy, Retry::Never, "busy")),
         );
         let response: rpc::Response = serde_json::from_str(&failed).expect("error json");
-        assert_eq!(response.error.expect("error").code, -32000);
+        let error = response.error.expect("error");
+        assert_eq!(error.code, -32000);
+        assert_eq!(error.data.expect("data")["class"], "busy");
+    }
+
+    #[test]
+    fn lifecycle_management_errors_carry_their_problem_kind() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+
+        let started = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "svc.start",
+            json!({"id": "nope"}),
+        );
+        assert_error_kind(&started, -32003, "unknown_service");
+
+        let stopped = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "svc.stop",
+            json!({"id": "nope"}),
+        );
+        assert_error_kind(&stopped, -32004, "unknown_service");
+
+        let restarted = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "svc.restart",
+            json!({"id": "nope"}),
+        );
+        assert_error_kind(&restarted, -32010, "unknown_service");
+
+        let status = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "svc.status",
+            json!({"id": "nope"}),
+        );
+        assert_error_kind(&status, -32001, "unknown_service");
+
+        let enabled = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "svc.enable",
+            json!({"id": "svc"}),
+        );
+        assert_error_kind(&enabled, -32005, "conflict");
+
+        let disabled = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "svc.disable",
+            json!({"id": "svc"}),
+        );
+        assert_error_kind(&disabled, -32005, "conflict");
+    }
+
+    #[test]
+    fn plugin_management_errors_carry_their_problem_kind() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+
+        let missing_path = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "plugin.install",
+            json!({}),
+        );
+        assert_error_kind(&missing_path, -32006, "internal");
+
+        let missing_staged_path = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "plugin.install_staged",
+            json!({}),
+        );
+        assert_error_kind(&missing_staged_path, -32006, "internal");
+
+        let unknown_strategy = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "plugin.install",
+            json!({"path": "ignored", "strategy": "bogus"}),
+        );
+        assert_error_kind(&unknown_strategy, -32006, "unknown_strategy");
+
+        let unknown_plugin = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "plugin.uninstall",
+            json!({"id": "nope"}),
+        );
+        assert_error_kind(&unknown_plugin, -32007, "unknown_plugin");
+
+        let missing_id = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "plugin.uninstall",
+            json!({}),
+        );
+        assert_error_kind(&missing_id, -32007, "internal");
+    }
+
+    #[test]
+    fn auth_and_parameter_errors_carry_their_problem_kind() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+
+        let auth = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "auth.status",
+            json!({}),
+        );
+        assert_error_kind(&auth, -32008, "internal");
+
+        let password = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "auth.passwd",
+            json!({"password": ""}),
+        );
+        assert_error_kind(&password, -32008, "internal");
+
+        let missing_id = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "svc.start",
+            json!({}),
+        );
+        assert_error_kind(&missing_id, -32602, "invalid");
+
+        let cursor = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "tools/list",
+            json!({"cursor": "bm90LWEtY3Vyc29y"}),
+        );
+        assert_error_kind(&cursor, -32602, "invalid");
+
+        let unknown_method = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "no.such.method",
+            json!({}),
+        );
+        assert_error_kind(&unknown_method, -32601, "invalid");
+    }
+
+    #[test]
+    fn uninstalling_a_core_service_is_not_a_plugin() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(registry(vec![service("core", &[])]), receiver, None);
+
+        let response = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "plugin.uninstall",
+            json!({"id": "core"}),
+        );
+        assert_error_kind(&response, -32007, "not_a_plugin");
+    }
+
+    #[test]
+    fn a_start_with_a_missing_dependency_reports_missing_dependency() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(registry(vec![service("app", &["missing"])]), receiver, None);
+
+        let response = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "svc.start",
+            json!({"id": "app"}),
+        );
+        assert_error_kind(&response, -32003, "missing_dependency");
+    }
+
+    #[test]
+    fn installing_a_package_named_after_a_core_service_reports_core_service() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+        let dir = package::tempdir::TempDir::new();
+        let path = dir.path().join("svc.spk");
+        std::fs::write(
+            &path,
+            package::test_signed_package("svc", crate::platform::target()),
+        )
+        .expect("write package");
+
+        let response = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "plugin.install",
+            json!({"path": path.to_string_lossy(), "strategy": "replace"}),
+        );
+        assert_error_kind(&response, -32006, "core_service");
+    }
+
+    #[test]
+    fn installing_a_package_for_another_platform_reports_unsupported_platform() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+        let dir = package::tempdir::TempDir::new();
+        let path = dir.path().join("other.spk");
+        std::fs::write(&path, package::test_signed_package("other", "other-triple"))
+            .expect("write package");
+
+        let response = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "plugin.install",
+            json!({"path": path.to_string_lossy(), "strategy": "replace"}),
+        );
+        assert_error_kind(&response, -32006, "unsupported_platform");
+    }
+
+    #[test]
+    fn a_start_layer_past_its_deadline_projects_timeout_kind() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(registry(vec![service("stuck", &[])]), receiver, None);
+        // Force a start that is in flight but never becomes ready; the deadline
+        // is already past, so the layer must report a timeout without sleeping.
+        daemon.slots.get_mut("stuck").expect("slot").machine.state = State::Starting;
+
+        let error = daemon
+            .start_layer(&["stuck".into()], 0)
+            .expect_err("past deadline");
+        assert_eq!(error.problem, Problem::Timeout);
+
+        let response = status_response(Some(json!(7)), -32003, Err(error));
+        let error = response.error.expect("error");
+        assert_eq!(error.code, -32003);
+        assert_eq!(error.data.expect("data")["kind"], "timeout");
+    }
+
+    #[test]
+    fn the_plugin_detail_classifier_keeps_the_face_status_families() {
+        let cases = [
+            ("package exceeds 8 MiB", Problem::TooLarge),
+            ("start timed out: app", Problem::Timeout),
+            (
+                "platform mismatch: package other, host this",
+                Problem::UnsupportedPlatform,
+            ),
+            (
+                "platform mismatch: package other-triple, host x86_64-unknown-linux-gnu",
+                Problem::UnsupportedPlatform,
+            ),
+            ("id is a core service: svc", Problem::CoreService),
+            ("unknown strategy", Problem::UnknownStrategy),
+            ("unknown plugin: nope", Problem::UnknownPlugin),
+            ("unknown service: nope", Problem::UnknownService),
+            ("signature.json is missing", Problem::Invalid),
+            (
+                "plugin id conflicts with a core service: nope",
+                Problem::Conflict,
+            ),
+            ("not a plugin: core", Problem::NotAPlugin),
+            ("missing dependencies: base", Problem::MissingDependency),
+            ("dependency cycle", Problem::Internal),
+            ("requires device [sr6110]", Problem::Internal),
+        ];
+        for (detail, expected) in cases {
+            assert_eq!(
+                problem_for_plugin_detail(detail).problem,
+                expected,
+                "{detail}"
+            );
+        }
+
+        // No management path produces "exceeds" without a multi-hundred-MiB
+        // package; project the classified TooLarge through the response builder
+        // so its wire kind is covered like the reachable paths.
+        let response = status_response(
+            Some(json!(8)),
+            -32006,
+            Err(problem_for_plugin_detail("package exceeds 8 MiB")),
+        );
+        assert_eq!(
+            response.error.expect("error").data.expect("data")["kind"],
+            "too_large"
+        );
+    }
+
+    #[test]
+    fn the_slot_response_keeps_all_eight_class_shapes() {
+        for class in Class::ALL {
+            let detail = format!("detail {}", class.as_str());
+            let response = project_slot_response(
+                Some(json!(1)),
+                Err(Failure::new(class, class.default_retry(), detail.clone())),
+            );
+            match class {
+                Class::Busy => {
+                    let error = response.error.expect("busy error");
+                    assert_eq!(error.code, -32000);
+                    assert_eq!(error.message, "busy: too many in-flight tool calls");
+                    assert_eq!(error.data.expect("data")["class"], "busy");
+                }
+                Class::FrameTooLarge => {
+                    let error = response.error.expect("frame error");
+                    assert_eq!(error.code, -32602);
+                    assert_eq!(
+                        error.message,
+                        "tools/call request exceeds the 1 MiB frame limit"
+                    );
+                    assert_eq!(error.data.expect("data")["class"], "frame_too_large");
+                }
+                _ => {
+                    let result = response.result.expect("isError result");
+                    assert_eq!(result["isError"], true);
+                    assert_eq!(result["content"][0]["text"], detail);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_immediate_rejection_projects_its_kind_without_changing_the_message() {
+        let response = project_rejection(
+            Some(json!(5)),
+            Rejection::BadArguments {
+                detail: "arguments are too large".into(),
+            },
+        );
+        let error = response.error.expect("bad arguments error");
+        assert_eq!(error.code, -32602);
+        assert_eq!(
+            error.message,
+            "tools/call request exceeds the 1 MiB frame limit"
+        );
+        assert_eq!(error.data.expect("data")["kind"], "bad_arguments");
+
+        let response = project_rejection(
+            Some(json!(6)),
+            Rejection::UnknownCapability {
+                capability: "nope".into(),
+            },
+        );
+        let result = response.result.expect("unknown capability result");
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["content"][0]["text"], "unknown capability nope");
     }
 }

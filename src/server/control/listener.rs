@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use crate::channel::{Endpoint, Notify, PendingCall, Reply};
 use crate::ipc;
+use crate::kernel::failure::Problem;
 use crate::rpc;
 use crate::wake::Wake;
 
@@ -265,10 +266,11 @@ fn drain_requests(
     loop {
         let Some(position) = connection.buffer.iter().position(|byte| *byte == b'\n') else {
             if connection.buffer.len() > ipc::LOCAL_FRAME_MAX {
-                connection.out = rpc::to_line(&rpc::err(
+                connection.out = rpc::to_line(&rpc::err_data(
                     None,
                     -32700,
                     "management frame exceeds the local limit",
+                    serde_json::json!({ "kind": Problem::Invalid.as_str() }),
                 ))
                 .into_bytes();
                 connection.out.push(b'\n');
@@ -277,10 +279,11 @@ fn drain_requests(
             return true;
         };
         if position > ipc::LOCAL_FRAME_MAX {
-            connection.out = rpc::to_line(&rpc::err(
+            connection.out = rpc::to_line(&rpc::err_data(
                 None,
                 -32700,
                 "management frame exceeds the local limit",
+                serde_json::json!({ "kind": Problem::Invalid.as_str() }),
             ))
             .into_bytes();
             connection.out.push(b'\n');
@@ -300,10 +303,11 @@ fn drain_requests(
             Err(TrySendError::Full(_)) => {
                 // Bounded backpressure: answer this connection with a visible
                 // error and close it instead of growing the supervisor queue.
-                connection.out = rpc::to_line(&rpc::err(
+                connection.out = rpc::to_line(&rpc::err_data(
                     None,
                     -32000,
                     "control queue is full; retry later",
+                    serde_json::json!({ "kind": Problem::Internal.as_str() }),
                 ))
                 .into_bytes();
                 connection.out.push(b'\n');
@@ -654,5 +658,38 @@ mod tests {
         let text = String::from_utf8_lossy(&connection.out);
         assert!(text.contains("control queue is full"), "{text}");
         assert!(text.ends_with('\n'), "{text}");
+        let value: serde_json::Value = serde_json::from_str(text.trim()).expect("error frame");
+        assert_eq!(value["error"]["code"], -32000);
+        assert_eq!(value["error"]["data"]["kind"], "internal");
+    }
+
+    /// An oversized control frame is a JSON-RPC parse error and carries the
+    /// `invalid` kind, so the face never has to parse the message.
+    #[test]
+    fn an_oversized_control_frame_carries_the_invalid_kind() {
+        let (stream, _peer) = UnixStream::pair().expect("pair");
+        let (tx, _rx) = mpsc::sync_channel(0);
+        let (_notify_tx, notify_rx) = UnixStream::pair().expect("notify");
+        let mut connection = Connection {
+            stream,
+            buffer: vec![b'x'; ipc::LOCAL_FRAME_MAX + 1],
+            out: Vec::new(),
+            out_at: 0,
+            pending: None,
+            close_after_write: false,
+            endpoint: Endpoint::Admin,
+        };
+        let keep = drain_requests(
+            &mut connection,
+            &tx,
+            &Arc::new(Wake::new()),
+            Arc::new(notify_rx),
+        );
+        assert!(keep);
+        assert!(connection.close_after_write);
+        let text = String::from_utf8_lossy(&connection.out);
+        let value: serde_json::Value = serde_json::from_str(text.trim()).expect("error frame");
+        assert_eq!(value["error"]["code"], -32700);
+        assert_eq!(value["error"]["data"]["kind"], "invalid");
     }
 }
