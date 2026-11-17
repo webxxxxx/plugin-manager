@@ -137,21 +137,16 @@ impl ReadEnd {
 /// Spawn `command` with the plan's pipes.
 ///
 /// The child ends go onto the command before the spawn; the parent ends come
-/// back as [`Streams`]. The command's copies of the child ends are closed as
-/// soon as the child is running: a `Command` keeps whatever `Stdio` it was
-/// given, and on both hosts that is the parent's own handle to the child's end.
-/// Leaving it open would hold the other side of each pipe open — a reader would
-/// never see EOF, and a plugin would never see its stdin close.
+/// back as [`Streams`]. Take the command by value: a `Command` keeps whatever
+/// `Stdio` it was given, which is *this process's* handle to the child's end.
+/// Dropping the command at the end of this function closes those copies, so the
+/// caller's read ends can reach EOF and the child sees its stdin close.
 pub(crate) fn spawn(
     mut command: Command,
     plan: Plan,
 ) -> io::Result<(std::process::Child, Streams)> {
     let streams = arm(plan, &mut command)?;
     let child = command.spawn()?;
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
     Ok((child, streams))
 }
 
