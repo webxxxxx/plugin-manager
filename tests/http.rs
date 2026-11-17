@@ -389,9 +389,7 @@ fn request_head(
     request
 }
 
-fn read_raw_response(stream: &mut TcpStream) -> RawResponse {
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).expect("read response");
+fn parse_raw_response(response: Vec<u8>) -> RawResponse {
     let split = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -414,6 +412,31 @@ fn read_raw_response(stream: &mut TcpStream) -> RawResponse {
         body: response[split + 4..].to_vec(),
         headers,
     }
+}
+
+fn read_raw_response(stream: &mut TcpStream) -> RawResponse {
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("read response");
+    parse_raw_response(response)
+}
+
+/// Send one hand-built request head with no body and read the full response.
+/// Used when the test must declare a framing the helpers cannot express; the
+/// bounded read reports the daemon log on failure, per the suite's convention.
+fn send_request_head(sandbox: &Sandbox, address: &str, head: &str) -> RawResponse {
+    let mut stream = TcpStream::connect(address)
+        .unwrap_or_else(|error| panic!("connect {address}: {error}\n{}", sandbox.daemon_log()));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap_or_else(|error| panic!("read timeout: {error}\n{}", sandbox.daemon_log()));
+    stream
+        .write_all(head.as_bytes())
+        .unwrap_or_else(|error| panic!("write request head: {error}\n{}", sandbox.daemon_log()));
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .unwrap_or_else(|error| panic!("read response: {error}\n{}", sandbox.daemon_log()));
+    parse_raw_response(response)
 }
 
 fn read_one_response(stream: &mut TcpStream) -> RawResponse {
@@ -1852,14 +1875,201 @@ fn blob_download_supports_range_etag_and_conditionals() {
     assert!(missing.body.is_empty());
 }
 
-fn read_response_head(stream: &mut TcpStream) -> (u16, Vec<(String, String)>) {
+/// A server-level 401 keeps GET's Content-Length on HEAD and writes no body.
+/// If the body leaked, the next response on the keep-alive connection would
+/// start with JSON instead of a status line.
+#[test]
+fn head_unauthorized_has_no_body_and_the_connection_stays_parseable() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    // enable_auth writes the password through the control socket, so the
+    // daemon must be ready before it runs.
+    sandbox.wait_for_http();
+    let (address, password) = enable_auth(&mut sandbox);
+
+    let get_denied = raw_request(&address, "GET", "/api/v1/services", "", b"");
+    assert_eq!(get_denied.status, 401);
+    assert!(!get_denied.body.is_empty(), "GET 401 keeps its JSON body");
+    let get_length = header_value(&get_denied.headers, "content-length")
+        .expect("GET 401 advertises a body")
+        .to_string();
+
+    let mut stream = TcpStream::connect(&address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let head_request = format!(
+        "HEAD /api/v1/services HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\n\r\n",
+        address
+    );
+    stream
+        .write_all(head_request.as_bytes())
+        .expect("write HEAD");
+
+    let head = read_response_head_raw(&mut stream);
+    let (status, headers) = parse_response_head(&head);
+    assert_eq!(status, 401, "{}", String::from_utf8_lossy(&head));
+    assert_eq!(
+        header_value(&headers, "content-length"),
+        Some(get_length.as_str()),
+        "HEAD 401 keeps the GET Content-Length"
+    );
+    assert_eq!(
+        header_value(&headers, "connection"),
+        Some("keep-alive"),
+        "{}",
+        String::from_utf8_lossy(&head)
+    );
+
+    // The connection must still parse: a HEAD body would land here first.
+    let next = format!(
+        "GET /api/v1/services HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+        address, password
+    );
+    stream
+        .write_all(next.as_bytes())
+        .expect("write next request");
+    let next_head = read_response_head_raw(&mut stream);
+    assert!(
+        next_head.starts_with(b"HTTP/1.1 200"),
+        "HEAD 401 left body bytes on the connection: {}",
+        String::from_utf8_lossy(&next_head)
+    );
+    // The GET after the HEAD keeps its own body: the per-request flag must not
+    // leak into the next response.
+    let (_, next_headers) = parse_response_head(&next_head);
+    let next_length: usize = header_value(&next_headers, "content-length")
+        .expect("GET 200 advertises its body")
+        .parse()
+        .expect("content-length is a number");
+    let mut next_body = vec![0u8; next_length];
+    stream.read_exact(&mut next_body).expect("GET 200 body");
+    let next_json: Value = serde_json::from_slice(&next_body).expect("GET 200 JSON");
+    assert!(
+        next_json["services"].is_array(),
+        "GET 200 body after a HEAD: {next_json}"
+    );
+}
+
+/// A HEAD request refused for an oversized declared body gets the same 413 as
+/// GET, with the same Content-Length and no body.
+#[test]
+fn head_payload_too_large_has_no_body() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let get_request = format!(
+        "GET /api/v1/services HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        address,
+        512u64 * 1024 * 1024
+    );
+    let get_refused = send_request_head(&sandbox, &address, &get_request);
+    assert_eq!(get_refused.status, 413, "{:?}", get_refused.body);
+    let get_length = header_value(&get_refused.headers, "content-length")
+        .expect("GET 413 advertises a body")
+        .to_string();
+    assert!(!get_refused.body.is_empty(), "GET 413 keeps its JSON body");
+
+    let head_request = format!(
+        "HEAD /api/v1/services HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        address,
+        512u64 * 1024 * 1024
+    );
+    let head_refused = send_request_head(&sandbox, &address, &head_request);
+    assert_eq!(head_refused.status, 413);
+    assert!(
+        head_refused.body.is_empty(),
+        "HEAD 413 carried a body: {}",
+        String::from_utf8_lossy(&head_refused.body)
+    );
+    assert_eq!(
+        header_value(&head_refused.headers, "content-length"),
+        Some(get_length.as_str()),
+        "HEAD 413 keeps the GET Content-Length"
+    );
+}
+
+/// An ambiguous request framing is rejected before the body policy resolves.
+/// The parsed method is still enough to keep a HEAD 400 body-less.
+#[test]
+fn head_bad_framing_has_no_body() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let get_request = format!(
+        "GET /api/v1/services HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        address
+    );
+    let get_refused = send_request_head(&sandbox, &address, &get_request);
+    assert_eq!(get_refused.status, 400, "{:?}", get_refused.body);
+    assert!(!get_refused.body.is_empty(), "GET 400 keeps its JSON body");
+    let get_length = header_value(&get_refused.headers, "content-length")
+        .expect("GET 400 advertises a body")
+        .to_string();
+
+    let head_request = format!(
+        "HEAD /api/v1/services HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        address
+    );
+    let head_refused = send_request_head(&sandbox, &address, &head_request);
+    assert_eq!(head_refused.status, 400);
+    assert!(
+        head_refused.body.is_empty(),
+        "HEAD 400 carried a body: {}",
+        String::from_utf8_lossy(&head_refused.body)
+    );
+    assert_eq!(
+        header_value(&head_refused.headers, "content-length"),
+        Some(get_length.as_str()),
+        "HEAD 400 keeps the GET Content-Length"
+    );
+}
+
+/// A blocked route answers through the blocking pool's completion, not the
+/// inline write path. A HEAD 404 produced there must drop its body too.
+#[test]
+fn head_blocking_unknown_endpoint_has_no_body() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let get_missing = raw_request(&address, "GET", "/api/v1/does-not-exist", "", b"");
+    assert_eq!(get_missing.status, 404);
+    assert!(!get_missing.body.is_empty(), "GET 404 keeps its JSON body");
+    let get_length = header_value(&get_missing.headers, "content-length")
+        .expect("GET 404 advertises a body")
+        .to_string();
+
+    let head_missing = raw_request(&address, "HEAD", "/api/v1/does-not-exist", "", b"");
+    assert_eq!(head_missing.status, 404);
+    assert!(
+        head_missing.body.is_empty(),
+        "HEAD 404 carried a body: {}",
+        String::from_utf8_lossy(&head_missing.body)
+    );
+    assert_eq!(
+        header_value(&head_missing.headers, "content-length"),
+        Some(get_length.as_str()),
+        "HEAD 404 keeps the GET Content-Length"
+    );
+}
+
+/// Read exactly one response head. A HEAD response must put the next response
+/// immediately after this terminator, with no body bytes in between.
+fn read_response_head_raw(stream: &mut TcpStream) -> Vec<u8> {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
         stream.read_exact(&mut byte).expect("response head");
         head.push(byte[0]);
     }
-    let text = String::from_utf8_lossy(&head);
+    head
+}
+
+fn parse_response_head(head: &[u8]) -> (u16, Vec<(String, String)>) {
+    let text = String::from_utf8_lossy(head);
     let mut lines = text.lines();
     let status = lines
         .next()
@@ -1873,6 +2083,17 @@ fn read_response_head(stream: &mut TcpStream) -> (u16, Vec<(String, String)>) {
         })
         .collect();
     (status, headers)
+}
+
+fn read_response_head(stream: &mut TcpStream) -> (u16, Vec<(String, String)>) {
+    parse_response_head(&read_response_head_raw(stream))
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(header, _)| header.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
 }
 
 /// A stalled download must hold one long-lived max_streams slot, keep the
@@ -1907,6 +2128,25 @@ fn assert_slow_download_holds_the_cap(address: &str, path: &str, content: &[u8])
         "the busy response keeps the stable Retry-After contract"
     );
     assert_eq!(json_body(&busy)["error"]["code"], "busy");
+
+    // A HEAD download refused by the same budget carries GET's head without a
+    // body: the JSON envelope must not stay on the wire.
+    let get_busy_length = header_value(&busy.headers, "content-length")
+        .expect("GET 503 advertises its error body")
+        .to_string();
+    let head_busy = raw_request(address, "HEAD", path, "", b"");
+    assert_eq!(head_busy.status, 503);
+    assert!(
+        head_busy.body.is_empty(),
+        "HEAD 503 carried a body: {}",
+        String::from_utf8_lossy(&head_busy.body)
+    );
+    assert_eq!(
+        header_value(&head_busy.headers, "content-length"),
+        Some(get_busy_length.as_str()),
+        "HEAD 503 keeps the GET Content-Length"
+    );
+    assert_eq!(raw_header_values(&head_busy, "retry-after"), vec!["1"]);
 
     // Releasing the stalled connection releases the slot.
     drop(stalled);
@@ -3846,6 +4086,39 @@ fn a_buffered_route_sends_100_continue_before_reading_its_body() {
         response.status,
         200,
         "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+}
+
+/// A 413 before the body closes instead of treating the bytes after the
+/// rejected request as the next keep-alive request.
+#[test]
+fn a_413_before_the_body_does_not_answer_the_next_keep_alive_request() {
+    let mut sandbox = Sandbox::new();
+    sandbox.allow_insecure_install_with("max_json_body_bytes = 4096\n");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let mut stream = TcpStream::connect(&address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let pipelined = format!(
+        "PUT /api/v1/config/demo HTTP/1.1\r\nHost: {}\r\nContent-Type: text/plain\r\nContent-Length: 4097\r\nConnection: keep-alive\r\n\r\nGET /api/v1/version HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        address, address
+    );
+    stream
+        .write_all(pipelined.as_bytes())
+        .expect("write pipelined requests");
+    let response = read_raw_response(&mut stream);
+    assert_eq!(
+        response.status,
+        413,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+    assert!(
+        !String::from_utf8_lossy(&response.body).contains("protocol"),
+        "the rejected request's trailing bytes must not be answered: {}",
         String::from_utf8_lossy(&response.body)
     );
 }

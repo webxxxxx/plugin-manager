@@ -66,6 +66,11 @@ pub struct Connection<S> {
     pub out: Vec<u8>,
     pub out_at: usize,
     pub keep_alive: bool,
+    /// The request being answered is HEAD: the server writes its response
+    /// head and no body. Set when the request head is parsed and cleared
+    /// before the next one, so a delayed completion still reads the method of
+    /// the request it belongs to.
+    pub head_only: bool,
     pub pending: Option<PendingRequest>,
     pub state: S,
 }
@@ -290,6 +295,7 @@ where
                                 out: Vec::new(),
                                 out_at: 0,
                                 keep_alive: false,
+                                head_only: false,
                                 pending: None,
                                 state: handler.new_state(id, ip),
                             };
@@ -403,6 +409,10 @@ pub fn advance_request<S>(
     mut route: impl FnMut(&http::Head) -> Result<BodyPolicy, Vec<u8>>,
 ) -> Result<Option<HttpRequest>, Vec<u8>> {
     if connection.pending.is_none() {
+        // This request's method decides how its response is rendered. Clear
+        // the previous request's flag first; an unparsable head leaves it
+        // false because there is no method to trust.
+        connection.head_only = false;
         let Some(header_end) = http::header_end(&connection.buffer) else {
             if connection.buffer.len() > crate::limits::current().max_header {
                 return Err(crate::http::json_error(
@@ -428,12 +438,43 @@ pub fn advance_request<S>(
                 "malformed request line",
             ));
         };
+        connection.head_only = crate::http::is_head(&head.method);
+        let framing = http::framing(&head.headers)
+            .map_err(|message| crate::http::json_error(400, "bad_request", &message))?;
         // Route and authenticate before the body. While the body is still
         // arriving `pending` stays Some, so this callback runs exactly once per
         // request and the face never sees a different route for the same head.
-        let body = route(&head)?;
-        let framing = http::framing(&head.headers)
-            .map_err(|message| crate::http::json_error(400, "bad_request", &message))?;
+        let body = match route(&head) {
+            Ok(body) => body,
+            Err(response) => {
+                // A bodyless request can keep a refused connection alive: the
+                // 401 is the whole exchange, and there is no unread body to
+                // become the next request. A request that declared a body is
+                // closed instead (the result is returned to on_error).
+                if matches!(framing, http::Framing::None | http::Framing::Length(0)) {
+                    let keep_alive = wants_keep_alive_head(&head);
+                    let response = if keep_alive {
+                        keep_alive_response(response)
+                    } else {
+                        response
+                    };
+                    connection.out = if connection.head_only {
+                        http::strip_body(response)
+                    } else {
+                        response
+                    };
+                    connection.out_at = 0;
+                    connection.keep_alive = keep_alive;
+                    // Consume this head so the next poll does not route the
+                    // same refused request again; any bytes after it are the
+                    // next (unsupported) pipelined request and stay buffered.
+                    let buffer = std::mem::take(&mut connection.buffer);
+                    connection.buffer = buffer[body_start..].to_vec();
+                    return Ok(None);
+                }
+                return Err(response);
+            }
+        };
         let limit = body.limit();
         if !body.accepts(framing) {
             return Err(crate::http::json_error(
@@ -532,7 +573,6 @@ pub fn wants_keep_alive(request: &HttpRequest) -> bool {
 /// Keep-alive for a head whose body has not been read yet. The Windows
 /// fallback needs the decision before the body so a rejected request closes
 /// instead of leaving unread bytes in front of the next request.
-#[cfg(not(unix))]
 pub fn wants_keep_alive_head(head: &http::Head) -> bool {
     wants_keep_alive_parts(&head.version, &head.headers)
 }
@@ -584,6 +624,7 @@ mod tests {
             out: Vec::new(),
             out_at: 0,
             keep_alive: false,
+            head_only: false,
             pending: None,
             state: (),
         };

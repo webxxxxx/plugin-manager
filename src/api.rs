@@ -340,15 +340,35 @@ fn listener_loop(listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config: Pa
     }
 }
 
+/// Write one rendered response. HEAD keeps the head (including GET's
+/// `Content-Length`) and gets no body, so a keep-alive connection cannot read
+/// the omitted body as the start of the next response.
+#[cfg(not(unix))]
+fn write_http(stream: &mut TcpStream, response: &[u8], head_only: bool) -> std::io::Result<()> {
+    if head_only {
+        stream.write_all(&http::strip_body(response.to_vec()))
+    } else {
+        stream.write_all(response)
+    }
+}
+
 /// Drive a face-produced stream on the Windows connection thread. The
 /// fallback owns the socket and the shared max_streams slot; a Busy result is
 /// rendered before any handler bytes are written.
 #[cfg(not(unix))]
-fn drive_fallback(stream: &mut TcpStream, handler: Box<dyn crate::server::http::StreamHandler>) {
+fn drive_fallback(
+    stream: &mut TcpStream,
+    handler: Box<dyn crate::server::http::StreamHandler>,
+    head_only: bool,
+) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_write_timeout(Some(crate::limits::current().transfer_timeout));
     if crate::server::http::fallback::drive(stream, handler, &[]).is_err() {
-        let _ = stream.write_all(&crate::server::http::stream_busy_response());
+        let _ = write_http(
+            stream,
+            &crate::server::http::stream_busy_response(),
+            head_only,
+        );
     }
 }
 
@@ -365,14 +385,15 @@ fn serve_plugin_ui(
 ) {
     use crate::server::http::Exchange;
 
+    let head_only = http::is_head(&head.method);
     match crate::face::plugin_ui::PluginUiFace::exchange(head, peer, lan, config, None) {
         Err(response) => {
-            let _ = stream.write_all(&response);
+            let _ = write_http(stream, &response, head_only);
         }
         Ok(Exchange::Response(response)) => {
-            let _ = stream.write_all(&response.into_bytes());
+            let _ = write_http(stream, &response.into_bytes(), head_only);
         }
-        Ok(Exchange::Stream(handler)) => drive_fallback(stream, handler),
+        Ok(Exchange::Stream(handler)) => drive_fallback(stream, handler, head_only),
     }
 }
 
@@ -442,25 +463,34 @@ fn serve_package_upload(
 ) {
     use crate::server::http::Exchange;
 
+    let head_only = http::is_head(&head.method);
     match crate::face::install::exchange(head, lan, config) {
         Err(response) => {
-            let _ = stream.write_all(&response);
+            let _ = write_http(stream, &response, head_only);
         }
         Ok(Exchange::Response(_)) => {
             // A streamed route must not answer with a memory response; the
             // Unix loop renders the same 500 before any handler bytes go out.
-            let _ = stream.write_all(&http::json_error(
-                500,
-                "internal",
-                "a streamed package upload route returned a memory response",
-            ));
+            let _ = write_http(
+                stream,
+                &http::json_error(
+                    500,
+                    "internal",
+                    "a streamed package upload route returned a memory response",
+                ),
+                head_only,
+            );
         }
         Ok(Exchange::Stream(handler)) => {
             let _ = stream.set_nonblocking(false);
             let _ = stream.set_read_timeout(Some(crate::limits::current().transfer_timeout));
             let _ = stream.set_write_timeout(Some(crate::limits::current().transfer_timeout));
             if crate::server::http::fallback::drive(stream, handler, initial).is_err() {
-                let _ = stream.write_all(&crate::server::http::stream_busy_response());
+                let _ = write_http(
+                    stream,
+                    &crate::server::http::stream_busy_response(),
+                    head_only,
+                );
             }
         }
     }
@@ -478,19 +508,24 @@ fn serve_blob_upload(
 ) {
     use crate::server::http::Exchange;
 
+    let head_only = http::is_head(&head.method);
     match crate::face::blob_upload::exchange(head, lan) {
         Err(response) => {
-            let _ = stream.write_all(&response);
+            let _ = write_http(stream, &response, head_only);
         }
         Ok(Exchange::Response(response)) => {
-            let _ = stream.write_all(&response.into_bytes());
+            let _ = write_http(stream, &response.into_bytes(), head_only);
         }
         Ok(Exchange::Stream(handler)) => {
             let _ = stream.set_nonblocking(false);
             let _ = stream.set_read_timeout(Some(crate::limits::current().transfer_timeout));
             let _ = stream.set_write_timeout(Some(crate::limits::current().transfer_timeout));
             if crate::server::http::fallback::drive(stream, handler, initial).is_err() {
-                let _ = stream.write_all(&crate::server::http::stream_busy_response());
+                let _ = write_http(
+                    stream,
+                    &crate::server::http::stream_busy_response(),
+                    head_only,
+                );
             }
         }
     }
@@ -542,13 +577,30 @@ fn handle(
                 return;
             }
         };
+        let head_only = http::is_head(&head.method);
         // Resolve the face route and the principal exactly once, before any
         // body byte is read. The route's BodyPolicy is the only body limit.
         let planned = match crate::server::http::route_face_request(&face, &head, peer, &lan) {
             Ok(planned) => planned,
             Err(response) => {
-                let _ = stream.write_all(&response);
-                return;
+                // A bodyless request can keep the connection alive after a
+                // refusal; a request that declared a body is closed so its
+                // unread bytes cannot precede the next request.
+                let empty = matches!(
+                    http::framing(&head.headers),
+                    Ok(http::Framing::None) | Ok(http::Framing::Length(0))
+                );
+                let keep_alive = empty && wants_keep_alive_head(&head);
+                let response = if keep_alive {
+                    keep_alive_response(response)
+                } else {
+                    response
+                };
+                let _ = write_http(&mut stream, &response, head_only);
+                if !keep_alive {
+                    return;
+                }
+                continue;
             }
         };
         if let Some(prepared) = planned {
@@ -556,14 +608,14 @@ fn handle(
             let body = match read_body(&mut stream, &head, &initial, prepared.route.body) {
                 Ok(body) => body,
                 Err(response) => {
-                    let _ = stream.write_all(&response);
+                    let _ = write_http(&mut stream, &response, head_only);
                     return;
                 }
             };
             let prepared = match crate::server::http::attach_face_body(prepared, &body) {
                 Ok(prepared) => prepared,
                 Err(response) => {
-                    let _ = stream.write_all(&response);
+                    let _ = write_http(&mut stream, &response, head_only);
                     return;
                 }
             };
@@ -584,7 +636,7 @@ fn handle(
                     // A streamed response owns this connection until it closes.
                     // The fallback writes the shared 503 if the stream budget is
                     // full before any handler bytes go out.
-                    drive_fallback(&mut stream, handler);
+                    drive_fallback(&mut stream, handler, head_only);
                     return;
                 }
                 result => {
@@ -592,7 +644,7 @@ fn handle(
                     if keep_alive {
                         response = keep_alive_response(response);
                     }
-                    if stream.write_all(&response).is_err() {
+                    if write_http(&mut stream, &response, head_only).is_err() {
                         return;
                     }
                     if !keep_alive {
@@ -619,7 +671,7 @@ fn handle(
         let body = match read_body(&mut stream, &head, &initial, body_policy) {
             Ok(body) => body,
             Err(response) => {
-                let _ = stream.write_all(&response);
+                let _ = write_http(&mut stream, &response, head_only);
                 return;
             }
         };
@@ -650,12 +702,12 @@ fn handle(
                 password_hash.as_deref(),
             ) {
                 Ok(Some(call)) => {
-                    let _ = serve_mcp_sse(&mut stream, call, &config);
+                    let _ = serve_mcp_sse(&mut stream, call, &config, head_only);
                     return;
                 }
                 Ok(None) => {}
                 Err(response) => {
-                    let _ = stream.write_all(&response);
+                    let _ = write_http(&mut stream, &response, head_only);
                     return;
                 }
             }
@@ -664,7 +716,7 @@ fn handle(
         if keep_alive {
             response = keep_alive_response(response);
         }
-        if stream.write_all(&response).is_err() {
+        if write_http(&mut stream, &response, head_only).is_err() {
             return;
         }
         if !keep_alive {
@@ -678,6 +730,7 @@ fn serve_mcp_sse(
     stream: &mut TcpStream,
     call: mcp_http::StreamingCall,
     config: &Path,
+    head_only: bool,
 ) -> std::io::Result<()> {
     // The Windows fallback has no stream driver, but the long-lived budget is
     // still server policy: reserve it before the head and before the plugin
@@ -688,7 +741,11 @@ fn serve_mcp_sse(
     ) {
         Ok(permit) => permit,
         Err(_) => {
-            stream.write_all(&crate::server::http::stream_busy_response())?;
+            write_http(
+                stream,
+                &crate::server::http::stream_busy_response(),
+                head_only,
+            )?;
             return Ok(());
         }
     };

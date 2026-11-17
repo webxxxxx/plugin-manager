@@ -458,6 +458,23 @@ pub fn response_with_headers(
     out
 }
 
+/// Whether a request method is HEAD. A HEAD response carries the same head as
+/// the matching GET, including its `Content-Length`, but no body (RFC 9110
+/// §9.3.2). The server's in-memory write points use this; a stream handler
+/// that writes its own bytes keeps the same rule itself.
+pub fn is_head(method: &str) -> bool {
+    method.eq_ignore_ascii_case("HEAD")
+}
+
+/// Truncate a rendered response to its head. The declared `Content-Length` is
+/// kept, so the bytes match what the same route would answer to GET.
+pub fn strip_body(mut response: Vec<u8>) -> Vec<u8> {
+    if let Some(end) = header_end(&response) {
+        response.truncate(end + 4);
+    }
+    response
+}
+
 /// Status line plus headers for a body that the caller will write itself. Used
 /// for streamed blob downloads and `HEAD`.
 pub fn response_head(
@@ -867,5 +884,23 @@ mod tests {
         assert_eq!(percent_decode("sha256%3Aabcd", false), "sha256:abcd");
         assert_eq!(percent_decode("a+b", false), "a+b");
         assert_eq!(percent_decode("a+b", true), "a b");
+    }
+
+    #[test]
+    fn strip_body_keeps_the_head_and_its_content_length() {
+        let full = response(401, "application/json", br#"{"error":"unauthorized"}"#);
+        let head = strip_body(full.clone());
+        let end = full
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("header end")
+            + 4;
+        assert_eq!(head, full[..end]);
+        let text = String::from_utf8(head).expect("head is utf8");
+        assert!(text.starts_with("HTTP/1.1 401 Unauthorized"), "{text}");
+        assert!(text.contains("Content-Length: 24"), "{text}");
+        assert!(text.ends_with("\r\n\r\n"), "{text}");
+        assert!(is_head("HEAD") && is_head("head") && !is_head("GET"));
+        assert_eq!(strip_body(b"no header block".to_vec()), b"no header block");
     }
 }

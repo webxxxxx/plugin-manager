@@ -263,6 +263,10 @@ impl ServerLoop for Server {
         else {
             return PreRequest::Continue;
         };
+        // A pre-body route can answer before advance_request sees the head, so
+        // record the method here as well. advance_request resets it for the
+        // requests that continue to the buffered path.
+        connection.head_only = http::is_head(&head.method);
         let claim = self
             .routes
             .plugin_ui(
@@ -930,8 +934,16 @@ fn stream_tick(connection: &mut Connection, now: Instant) -> bool {
     driver.on_tick(now, stream, out, out_at, last_active)
 }
 
+/// Write one already-rendered response. The connection carries the method of
+/// the request being answered: a HEAD response keeps its head (and therefore
+/// GET's `Content-Length`) but never its body, which would otherwise be read
+/// as the start of the next response on a keep-alive connection.
 fn write_response(connection: &mut Connection, response: Vec<u8>, keep_alive: bool) {
-    connection.out = response;
+    connection.out = if connection.head_only {
+        http::strip_body(response)
+    } else {
+        response
+    };
     connection.out_at = 0;
     connection.keep_alive = keep_alive;
     connection.state = ConnState::Writing;
@@ -1077,6 +1089,43 @@ mod tests {
         assert_eq!(reader.read(&mut eof).expect("eof"), 0);
         reader.set_nonblocking(true).expect("nonblocking");
         assert!(socket_closed(reader.as_raw_fd()));
+    }
+
+    #[test]
+    fn a_head_write_drops_the_blocking_busy_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let stream = std::net::TcpStream::connect(listener.local_addr().expect("addr"))
+            .expect("connect");
+        let mut connection = Connection {
+            id: 1,
+            stream,
+            peer: "127.0.0.1".parse().expect("peer"),
+            last_active: Instant::now(),
+            buffer: Vec::new(),
+            out: Vec::new(),
+            out_at: 0,
+            keep_alive: false,
+            head_only: true,
+            pending: None,
+            state: ConnState::Reading,
+        };
+        let full = blocking_busy(Busy::QueueFull);
+        let full_text = String::from_utf8(full.clone()).expect("utf8");
+        let content_length = full_text
+            .lines()
+            .find(|line| line.starts_with("Content-Length: "))
+            .expect("content length")
+            .to_string();
+        write_response(&mut connection, full, false);
+        let text = String::from_utf8(connection.out).expect("utf8");
+        let header_end = text.find("\r\n\r\n").expect("header end") + 4;
+        assert_eq!(text.len(), header_end, "the HEAD body must be gone: {text}");
+        assert!(text.starts_with("HTTP/1.1 503 Service Unavailable"), "{text}");
+        assert!(text.contains("Retry-After: 1"), "{text}");
+        assert!(
+            text.contains(&content_length),
+            "Content-Length still describes GET's body: {text}"
+        );
     }
 
     #[test]
