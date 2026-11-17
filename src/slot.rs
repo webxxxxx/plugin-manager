@@ -1,10 +1,8 @@
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 use serde_json::{json, Value};
 
@@ -15,12 +13,10 @@ use crate::kernel::contract::{Contract, Control, Invocation, Reply, ReplySink, S
 use crate::kernel::failure::{Class, Failure, Rejection, Retry};
 use crate::log::{self, LogSink};
 use crate::paths;
-#[cfg(unix)]
-use crate::reactor::Framing;
 use crate::registry::{Exec, Hook, Interpreter, Lifecycle, Ready, Restart, State};
 use crate::rpc;
+use crate::stdio::{self, Plan, Streams, Target};
 use crate::supervisor::{self, Action, Event, Machine};
-use crate::threads;
 use crate::wake::Wake;
 
 /// Per-plugin in-flight cap from ticket #31. The full spec also describes a
@@ -45,11 +41,12 @@ pub(crate) struct Slot {
     protocol: u32,
     lifecycle: Option<Lifecycle>,
     child: Option<Child>,
-    stdin: Option<ChildStdin>,
+    stdin: Option<stdio::WriteEnd>,
     frames: Option<Receiver<FrameEvent>>,
     wake: Option<Arc<Wake>>,
-    #[cfg(unix)]
-    reactor: Option<Arc<crate::reactor::Reactor>>,
+    /// Who reads this service's stdout/stderr: the supervisor's poll set on
+    /// Unix, reader threads elsewhere.
+    stdio: Target,
     raw_hub: Option<Arc<crate::rawhub::RawHub>>,
     log: Option<Arc<Mutex<LogSink>>>,
     /// Plugins must keep stdout protocol-only; core scripts may still print
@@ -205,7 +202,7 @@ impl SlotHandle {
         respond: impl Fn(&Invocation) -> Result<Value, Failure> + Send + 'static,
     ) -> SlotHandle {
         let (requests, receiver) = mpsc::sync_channel::<SlotRequest>(CALL_QUEUE);
-        thread::spawn(move || {
+        std::thread::spawn(move || {
             for request in receiver {
                 let outcome = respond(&request.invocation);
                 (request.done)(outcome.map(Reply::Value));
@@ -306,8 +303,7 @@ impl Slot {
             stdin: None,
             frames: None,
             wake: None,
-            #[cfg(unix)]
-            reactor: None,
+            stdio: Target::threaded(),
             raw_hub: None,
             log: None,
             protocol_only: false,
@@ -454,9 +450,10 @@ impl Slot {
         self.wake = Some(wake);
     }
 
-    #[cfg(unix)]
-    pub(crate) fn set_reactor(&mut self, reactor: Option<Arc<crate::reactor::Reactor>>) {
-        self.reactor = reactor;
+    /// Adopt the daemon's stdio target. A slot created after the poll set
+    /// started gets the poll target; every earlier slot is updated here.
+    pub(crate) fn set_stdio(&mut self, stdio: Target) {
+        self.stdio = stdio;
     }
 
     pub(crate) fn set_raw_hub(&mut self, hub: Option<Arc<crate::rawhub::RawHub>>) {
@@ -743,31 +740,12 @@ impl Slot {
         let blob_dir = crate::blob::dir();
         let _ = std::fs::create_dir_all(crate::blob::incoming_dir());
         command.env("SVCD_TEMP_DIR", &blob_dir);
-        match self.exec.ready {
-            Ready::Notify => {
-                command
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-            }
-            Ready::Exec => {
-                command
-                    .stdin(if self.protocol == 3 {
-                        Stdio::piped()
-                    } else {
-                        Stdio::null()
-                    })
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-            }
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
-
-        let mut child = command.spawn().map_err(|error| error.to_string())?;
+        let plan = match self.exec.ready {
+            Ready::Notify => Plan::notify(),
+            Ready::Exec => Plan::exec(self.protocol),
+        };
+        let (mut child, streams) =
+            stdio::spawn(command, plan).map_err(|error| error.to_string())?;
         if let Err(error) = crate::platform::host::process::adopt(&child) {
             log::svcd(&format!(
                 "svcd: {}: parent-death protection: {}",
@@ -795,73 +773,30 @@ impl Slot {
         };
         self.log = log.clone();
 
-        if self.exec.ready == Ready::Notify {
-            let stdin = child.stdin.take();
-            let stdout = match child.stdout.take() {
-                Some(stdout) => stdout,
-                None => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err("piped stdout is missing".into());
-                }
-            };
-            let stderr = match child.stderr.take() {
-                Some(stderr) => stderr,
-                None => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err("piped stderr is missing".into());
-                }
-            };
+        let Streams {
+            stdin,
+            stdout,
+            stderr,
+        } = streams;
 
+        if self.exec.ready == Ready::Notify {
             let (sender, receiver) = mpsc::sync_channel(FRAME_QUEUE);
-            #[cfg(unix)]
-            if let Some(reactor) = self.reactor.clone() {
-                let framing = if self.protocol >= 2 {
-                    Framing::Length
-                } else {
-                    Framing::Lines
-                };
-                if let Err(error) = reactor.register(
-                    self.id.clone(),
-                    stdout,
-                    Some(stderr),
-                    sender,
-                    self.wake.clone(),
-                    log.clone(),
-                    ipc::CALL_FRAME_MAX,
-                    framing,
-                ) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error.to_string());
-                }
-            } else if let Err(error) = spawn_thread_readers(
-                &self.id,
+            let Some(stdout) = stdout else {
+                return abandon(&mut child, "piped stdout is missing");
+            };
+            let Some(stderr) = stderr else {
+                return abandon(&mut child, "piped stderr is missing");
+            };
+            if let Err(error) = self.stdio.frames(
+                self.id.clone(),
                 self.protocol,
                 stdout,
-                stderr,
-                log.clone(),
+                Some(stderr),
                 sender,
                 self.wake.clone(),
-            ) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error.to_string());
-            }
-            #[cfg(not(unix))]
-            if let Err(error) = spawn_thread_readers(
-                &self.id,
-                self.protocol,
-                stdout,
-                stderr,
                 log.clone(),
-                sender,
-                self.wake.clone(),
             ) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error.to_string());
+                return abandon(&mut child, error.to_string());
             }
 
             self.stdin = stdin;
@@ -870,67 +805,42 @@ impl Slot {
             self.ping_id = 1;
         } else {
             self.stdin = None;
-            let stdout = match child.stdout.take() {
-                Some(stdout) => stdout,
-                None => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err("piped stdout is missing".into());
-                }
+            let Some(stdout) = stdout else {
+                return abandon(&mut child, "piped stdout is missing");
             };
-            let stderr = match child.stderr.take() {
-                Some(stderr) => stderr,
-                None => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err("piped stderr is missing".into());
-                }
+            let Some(stderr) = stderr else {
+                return abandon(&mut child, "piped stderr is missing");
             };
 
             if self.protocol == 3 {
-                let Some(stdin) = child.stdin.take() else {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err("piped stdin is missing".into());
+                let Some(stdin) = stdin else {
+                    return abandon(&mut child, "piped stdin is missing");
                 };
                 let Some(hub) = self.raw_hub.clone() else {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err("raw transport is unavailable".into());
+                    return abandon(&mut child, "raw transport is unavailable");
                 };
-                if let Err(error) =
-                    hub.register(self.id.clone(), stdin, stdout, Some(stderr), log.clone())
-                {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error);
+                if let Err(error) = hub.register(
+                    self.id.clone(),
+                    Streams {
+                        stdin: Some(stdin),
+                        stdout: Some(stdout),
+                        stderr: Some(stderr),
+                    },
+                    log.clone(),
+                ) {
+                    return abandon(&mut child, error);
                 }
-                self.stdin = None;
                 self.frames = None;
                 self.child = Some(child);
                 self.adopted = false;
                 return Ok(pid);
             }
 
-            #[cfg(unix)]
-            if let Some(reactor) = self.reactor.clone() {
-                if let Err(error) =
-                    reactor.register_log(self.id.clone(), stdout, Some(stderr), log.clone())
-                {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error.to_string());
-                }
-            } else if let Err(error) = spawn_log_threads(&self.id, stdout, stderr, log.clone()) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error.to_string());
-            }
-            #[cfg(not(unix))]
-            if let Err(error) = spawn_log_threads(&self.id, stdout, stderr, log.clone()) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error.to_string());
+            if let Err(error) =
+                self.stdio
+                    .logs(self.id.clone(), stdout, Some(stderr), log.clone())
+            {
+                return abandon(&mut child, error.to_string());
             }
             self.frames = None;
         }
@@ -1229,7 +1139,11 @@ impl Slot {
     }
 
     fn log_service(&self, line: &str) {
-        log_line(&self.log, line);
+        if let Some(sink) = &self.log {
+            if let Ok(mut sink) = sink.lock() {
+                let _ = sink.line(line);
+            }
+        }
     }
 
     fn check_exit(&mut self, now: u64) {
@@ -1289,38 +1203,7 @@ impl Slot {
         let Some(pid) = self.machine.pid else {
             return false;
         };
-        #[cfg(unix)]
-        {
-            // Signal 0: 0 means a member exists; EPERM means it exists but is
-            // not ours to signal, which still counts as alive.
-            let member = unsafe { libc::kill(-(pid as i32), 0) } == 0
-                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-            if !member {
-                return false;
-            }
-            // A running leader is the group. Only when the leader is already a
-            // zombie (an adopted process we cannot reap) does the group need a
-            // per-member state scan, which keeps the fast path a single kill(2).
-            if crate::platform::host::process::alive(pid) {
-                return true;
-            }
-            #[cfg(target_os = "linux")]
-            {
-                return crate::platform::host::process::group_alive(pid);
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                return true;
-            }
-        }
-        #[cfg(windows)]
-        {
-            let _ = pid;
-            self.tree
-                .as_ref()
-                .map(|tree| tree.active() > 0)
-                .unwrap_or(false)
-        }
+        crate::platform::host::process::tree_alive(self.tree.as_ref(), pid)
     }
 
     fn check_timers(&mut self, now: u64) {
@@ -1377,18 +1260,9 @@ impl Slot {
         else {
             return false;
         };
-        let mut command = hook_command(&self.id, "stop", hook);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
-        match command.spawn() {
-            Ok(mut child) => {
+        let command = hook_command(&self.id, "stop", hook);
+        match stdio::spawn(command, Plan::stop_hook()) {
+            Ok((child, streams)) => {
                 let _ = crate::platform::host::process::adopt(&child);
                 if let Some(tree) = &self.tree {
                     // The stop action's own children belong to the service tree.
@@ -1397,17 +1271,16 @@ impl Slot {
                 let log = LogSink::open(&paths::logs_dir(), &self.id)
                     .ok()
                     .map(|sink| Arc::new(Mutex::new(sink)));
-                if let Some(stderr) = child.stderr.take() {
+                if let Some(stderr) = streams.stderr {
                     let log = log.clone();
-                    let id = self.id.clone();
-                    let _ = thread::Builder::new()
-                        .name(format!("svcd-{}-stop-stderr", id))
-                        .stack_size(threads::io_stack())
-                        .spawn(move || {
-                            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                                log_line(&log, &line);
-                            }
-                        });
+                    if let Err(error) =
+                        stdio::log_lines(format!("svcd-{}-stop-stderr", self.id), stderr, log)
+                    {
+                        log::svcd(&format!(
+                            "svcd: {}: stop hook stderr reader: {}",
+                            self.id, error
+                        ));
+                    }
                 }
                 log::svcd(&format!(
                     "svcd: {}: stop hook started ({})",
@@ -1553,10 +1426,7 @@ impl Slot {
 
     fn clear_process(&mut self) {
         self.fail_pending("service exited");
-        #[cfg(unix)]
-        if let Some(reactor) = &self.reactor {
-            reactor.unregister(&self.id);
-        }
+        self.stdio.unregister(&self.id);
         if let Some(hub) = &self.raw_hub {
             hub.unregister(&self.id);
         }
@@ -1689,81 +1559,12 @@ fn configure(mut command: Command, hook: bool) -> Command {
     command
 }
 
-fn log_line(log: &Option<Arc<Mutex<LogSink>>>, line: &str) {
-    if let Some(sink) = log {
-        if let Ok(mut sink) = sink.lock() {
-            let _ = sink.line(line);
-        }
-    }
-}
-
-/// Fallback used on Windows and whenever the reactor is unavailable.
-fn spawn_log_threads(
-    id: &str,
-    stdout: ChildStdout,
-    stderr: ChildStderr,
-    log: Option<Arc<Mutex<LogSink>>>,
-) -> std::io::Result<()> {
-    let stdout_log = log.clone();
-    thread::Builder::new()
-        .name(format!("svcd-{}-stdout", id))
-        .stack_size(threads::io_stack())
-        .spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines().map_while(Result::ok) {
-                log_line(&stdout_log, &line);
-            }
-        })?;
-    thread::Builder::new()
-        .name(format!("svcd-{}-stderr", id))
-        .stack_size(threads::io_stack())
-        .spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
-                log_line(&log, &line);
-            }
-        })?;
-    Ok(())
-}
-
-/// Fallback used on Windows and whenever the reactor is unavailable.
-fn spawn_thread_readers(
-    id: &str,
-    protocol: u32,
-    stdout: ChildStdout,
-    stderr: ChildStderr,
-    log: Option<Arc<Mutex<LogSink>>>,
-    sender: mpsc::SyncSender<FrameEvent>,
-    wake: Option<Arc<Wake>>,
-) -> std::io::Result<()> {
-    if protocol >= 2 {
-        ipc::spawn_length_reader_limit(
-            format!("svcd-{}-stdout", id),
-            stdout,
-            sender,
-            wake,
-            ipc::CALL_FRAME_MAX,
-        )?;
-    } else {
-        ipc::spawn_reader_limit(
-            format!("svcd-{}-stdout", id),
-            stdout,
-            sender,
-            wake,
-            ipc::CALL_FRAME_MAX,
-        )?;
-    }
-    let stderr_log = log;
-    thread::Builder::new()
-        .name(format!("svcd-{}-stderr", id))
-        .stack_size(threads::io_stack())
-        .spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
-                log_line(&stderr_log, &line);
-            }
-        })?;
-    Ok(())
+/// Kill the child a failed stdio registration left behind, then surface the
+/// reason. Shared by every registration failure in [`Slot::spawn`].
+fn abandon(child: &mut Child, reason: impl Into<String>) -> Result<u32, String> {
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(reason.into())
 }
 
 #[cfg(test)]

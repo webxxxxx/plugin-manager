@@ -50,11 +50,6 @@ impl Tree {
     pub(crate) fn terminate(&self) {
         self.imp.terminate();
     }
-
-    /// Live processes in the tree; `0` also covers a failed query.
-    pub(crate) fn active(&self) -> u32 {
-        self.imp.active()
-    }
 }
 
 /// Create the daemon-wide guard, if the host has one.
@@ -80,13 +75,13 @@ pub(crate) fn alive(pid: u32) -> bool {
     imp::alive(pid)
 }
 
-/// True while the process group `pgid` may still have a running member.
+/// True while any process of the service tree is still running.
 ///
-/// Linux scans `/proc`; other Unix hosts have no cheap scan and answer `true`,
-/// which is what the caller assumed before this seam existed. Windows has no
-/// process groups here: the tree guard answers instead.
-pub(crate) fn group_alive(pgid: u32) -> bool {
-    imp::group_alive(pgid)
+/// Unix has no tree handle: the process group plus the leader's liveness answer.
+/// Windows asks the job object; if the job could not be assigned there is no
+/// guard left, and the supervisor's stop path has already said so.
+pub(crate) fn tree_alive(tree: Option<&Tree>, pid: u32) -> bool {
+    imp::tree_alive(tree.map(|tree| &tree.imp), pid)
 }
 
 /// Start time of `pid` in clock ticks since boot (pid-reuse guard).
@@ -178,9 +173,9 @@ mod imp {
         false
     }
 
-    /// No process groups here; the tree guard answers instead.
-    pub(crate) fn group_alive(_pgid: u32) -> bool {
-        true
+    /// The job object knows exactly which processes of the tree are alive.
+    pub(crate) fn tree_alive(tree: Option<&Tree>, _pid: u32) -> bool {
+        tree.map(|tree| tree.active() > 0).unwrap_or(false)
     }
 
     pub(crate) fn start_time(_pid: u32) -> Option<u64> {
@@ -281,13 +276,20 @@ mod imp {
     }
 
     /// Services are adopted after a restart, so they must survive the daemon.
-    pub(crate) fn configure_service(_command: &mut Command) {}
+    /// They still get a process group of their own: the group *is* the tree the
+    /// supervisor signals, and it costs one `setpgid` at spawn.
+    pub(crate) fn configure_service(command: &mut Command) {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
 
     /// Hooks are never adopted: parent death kills them outright.
     pub(crate) fn configure_hook(command: &mut Command) {
+        use std::os::unix::process::CommandExt;
+        // Every hook gets its own process group so a timeout kills its tree.
+        command.process_group(0);
         #[cfg(target_os = "linux")]
         {
-            use std::os::unix::process::CommandExt;
             unsafe {
                 command.pre_exec(|| {
                     if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
@@ -296,10 +298,6 @@ mod imp {
                     Ok(())
                 });
             }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = command;
         }
     }
 
@@ -377,6 +375,26 @@ mod imp {
             let _ = pgid;
             true
         }
+    }
+
+    /// True while any process of the tree is still running. Unix has no tree
+    /// handle, so the process group answers for the tree; a leader that is
+    /// already a zombie (adopted, so unreapable by us) still needs the
+    /// per-member scan that [`group_alive`] does.
+    pub(crate) fn tree_alive(_tree: Option<&Tree>, pid: u32) -> bool {
+        // Signal 0: 0 means a member exists; EPERM means it exists but is not
+        // ours to signal, which still counts as alive.
+        let member = unsafe { libc::kill(-(pid as i32), 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        if !member {
+            return false;
+        }
+        // A running leader is the group; this keeps the fast path a single
+        // kill(2) for the common case.
+        if alive(pid) {
+            return true;
+        }
+        group_alive(pid)
     }
 
     /// Start time of `pid` in clock ticks since boot, as `/proc/<pid>/stat`

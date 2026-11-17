@@ -21,9 +21,8 @@ use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::process::{ChildStderr, ChildStdin, ChildStdout};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -301,11 +300,16 @@ impl Reactor {
 
     /// Register one notify plugin. A later registration with the same key
     /// replaces the old sources, which is what a restart needs.
+    ///
+    /// `stdout`/`stderr` come from [`crate::stdio`]: the pipe layer created
+    /// them and the caller asked for the ends. The poll set owns them from here
+    /// on; they are blocking, and one read per readiness event is what keeps
+    /// the supervisor loop from ever sitting in `read`.
     pub fn register(
         &self,
         id: String,
-        stdout: ChildStdout,
-        stderr: Option<ChildStderr>,
+        stdout: File,
+        stderr: Option<File>,
         sender: SyncSender<FrameEvent>,
         wake: Option<Arc<Wake>>,
         log: Option<Arc<Mutex<LogSink>>>,
@@ -315,7 +319,7 @@ impl Reactor {
         let mut sources = vec![
             Source::new(
                 id.clone(),
-                to_file(stdout),
+                stdout,
                 SourceKind::Frames {
                     sender,
                     max,
@@ -326,7 +330,7 @@ impl Reactor {
             .with_log(log.clone()),
         ];
         if let Some(stderr) = stderr {
-            sources.push(Source::new(id, to_file(stderr), SourceKind::Log).with_log(log));
+            sources.push(Source::new(id, stderr, SourceKind::Log).with_log(log));
         }
         self.send(Command::Register(sources))
     }
@@ -337,38 +341,39 @@ impl Reactor {
     pub fn register_log(
         &self,
         id: String,
-        stdout: ChildStdout,
-        stderr: Option<ChildStderr>,
+        stdout: File,
+        stderr: Option<File>,
         log: Option<Arc<Mutex<LogSink>>>,
     ) -> io::Result<()> {
         let mut sources = vec![
-            Source::new(id.clone(), to_file(stdout), SourceKind::Log).with_log(log.clone()),
+            Source::new(id.clone(), stdout, SourceKind::Log).with_log(log.clone()),
         ];
         if let Some(stderr) = stderr {
-            sources.push(Source::new(id, to_file(stderr), SourceKind::Log).with_log(log));
+            sources.push(Source::new(id, stderr, SourceKind::Log).with_log(log));
         }
         self.send(Command::Register(sources))
     }
 
     /// Register a protocol-3 plugin's stdin/stdout/stderr with the poll set
     /// and return the queue the hub feeds frames into.
+    ///
+    /// `stdin`/`stdout` are already non-blocking (see [`crate::stdio::poll_read`]).
+    /// The raw transport drains in bursts, so `WouldBlock` is its "empty"
+    /// signal; `enlarge_pipe` gives one poll pass room to hand a whole frame
+    /// to the plugin.
     pub fn register_raw(
         &self,
         id: String,
-        stdin: ChildStdin,
-        stdout: ChildStdout,
-        stderr: Option<ChildStderr>,
+        stdin: File,
+        stdout: File,
+        stderr: Option<File>,
         log: Option<Arc<Mutex<LogSink>>>,
         hub: Weak<dyn RawStopSink>,
         generation: u64,
         max_frame: usize,
         capacity: usize,
     ) -> io::Result<Arc<RawOutQueue>> {
-        let stdin = to_file(stdin);
-        set_nonblocking(&stdin)?;
         enlarge_pipe(&stdin);
-        let stdout = to_file(stdout);
-        set_nonblocking(&stdout)?;
         let queue = RawOutQueue::new(capacity, self.wake.try_clone()?);
         let mut sources = vec![
             Source::new(
@@ -388,7 +393,7 @@ impl Reactor {
             .with_plugin(hub, generation),
         ];
         if let Some(stderr) = stderr {
-            sources.push(Source::new(id, to_file(stderr), SourceKind::Log).with_log(log));
+            sources.push(Source::new(id, stderr, SourceKind::Log).with_log(log));
         }
         self.send(Command::Register(sources))?;
         Ok(queue)
@@ -416,22 +421,6 @@ impl Drop for Reactor {
             poll_set.sources.clear();
         }
     }
-}
-
-fn to_file<T: IntoRawFd>(source: T) -> File {
-    unsafe { File::from_raw_fd(source.into_raw_fd()) }
-}
-
-fn set_nonblocking(file: &File) -> io::Result<()> {
-    let fd = file.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 /// Ask for a larger pipe so one poll pass can hand a whole raw frame to the
@@ -896,7 +885,24 @@ fn log_line(log: &Option<Arc<Mutex<LogSink>>>, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::io::FromRawFd;
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
+
+    /// Pipe ends as the reactor sees them: plain files it owns.
+    fn to_file<T: IntoRawFd>(source: T) -> File {
+        unsafe { File::from_raw_fd(source.into_raw_fd()) }
+    }
+
+    fn set_nonblocking(file: &File) -> io::Result<()> {
+        let fd = file.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 
     fn nonblocking_pipe() -> (File, File) {
         let mut fds = [0i32; 2];
@@ -995,8 +1001,8 @@ mod tests {
         reactor
             .register(
                 "demo".into(),
-                child.stdout.take().expect("stdout"),
-                Some(child.stderr.take().expect("stderr")),
+                to_file(child.stdout.take().expect("stdout")),
+                Some(to_file(child.stderr.take().expect("stderr"))),
                 sender,
                 None,
                 None,
@@ -1068,8 +1074,8 @@ mod tests {
         reactor
             .register(
                 "demo".into(),
-                child.stdout.take().expect("stdout"),
-                Some(child.stderr.take().expect("stderr")),
+                to_file(child.stdout.take().expect("stdout")),
+                Some(to_file(child.stderr.take().expect("stderr"))),
                 sender,
                 None,
                 None,

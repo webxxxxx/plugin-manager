@@ -30,6 +30,7 @@
     "ipc": { "concept": "wire/message", "layer": "wire" },
     "rpc": { "concept": "wire/message", "layer": "wire" },
     "reactor": { "concept": "wire/contract", "layer": "wire" },
+    "stdio": { "concept": "wire/contract/stdio", "layer": "wire", "note": "S6b（#142）：子进程 stdio 的接入 seam（`Plan` / `Target`）；宿主实现只在 `stdio/platform/{unix,windows}.rs`" },
     "rawhub": { "concept": "wire/contract", "layer": "wire" },
     "channel": { "concept": "wire/control", "layer": "wire", "note": "控制面客户端与服务端混在一个文件" },
 

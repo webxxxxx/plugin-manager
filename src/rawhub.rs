@@ -17,7 +17,6 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::process::{ChildStderr, ChildStdin, ChildStdout};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -28,6 +27,7 @@ use std::sync::Weak;
 
 use crate::ipc::{RawFailure, RawStopSink};
 use crate::log::LogSink;
+use crate::stdio::{self, ReadEnd, Streams, WriteEnd};
 
 pub const HEADER: usize = 8;
 const SUBSCRIBER_QUEUE: usize = 4;
@@ -277,17 +277,37 @@ impl RawHub {
         self.reactor.get().and_then(|reactor| reactor.upgrade())
     }
 
+    /// Adopt a protocol-3 plugin's pipes.
+    ///
+    /// The pipe layer opened them and chose the handle types; the hub owns the
+    /// stream table either way. On Unix the poll set drives the I/O (the write
+    /// end becomes its bounded frame queue); everywhere else one writer, one
+    /// reader and one stderr thread do.
     pub fn register(
         self: &Arc<Self>,
         id: String,
-        stdin: ChildStdin,
-        stdout: ChildStdout,
-        stderr: Option<ChildStderr>,
+        streams: Streams,
         log: Option<Arc<Mutex<LogSink>>>,
     ) -> Result<(), String> {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let Streams {
+            stdin,
+            stdout,
+            stderr,
+        } = streams;
+        let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
+            return Err("raw stdio is not piped".into());
+        };
         #[cfg(unix)]
         if let Some(reactor) = self.reactor() {
+            let stdin =
+                stdio::poll_write(stdin).map_err(|error| format!("raw reactor: {}", error))?;
+            let stdout =
+                stdio::poll_read(stdout).map_err(|error| format!("raw reactor: {}", error))?;
+            let stderr = stderr
+                .map(stdio::poll_read)
+                .transpose()
+                .map_err(|error| format!("raw reactor: {}", error))?;
             let queue = reactor
                 .register_raw(
                     id.clone(),
@@ -316,9 +336,9 @@ impl RawHub {
         self: &Arc<Self>,
         id: String,
         generation: u64,
-        mut stdin: ChildStdin,
-        mut stdout: ChildStdout,
-        stderr: Option<ChildStderr>,
+        mut stdin: WriteEnd,
+        mut stdout: ReadEnd,
+        stderr: Option<ReadEnd>,
         log: Option<Arc<Mutex<LogSink>>>,
     ) -> Result<(), String> {
         let (writer_tx, writer_rx) = sync_channel::<Vec<u8>>(self.writer_queue);
@@ -410,7 +430,8 @@ impl RawHub {
             .map_err(|error| format!("raw reader thread: {}", error))?;
 
         if let Some(stderr) = stderr {
-            spawn_stderr_log(&id, stderr, log)?;
+            stdio::log_lines(format!("svcd-{}-stderr", id), stderr, log)
+                .map_err(|error| format!("raw stderr thread: {}", error))?;
         }
         self.install(id, plugin)
     }
@@ -601,31 +622,6 @@ impl RawHub {
             None => Err(RawFailure::WriterClosed),
         }
     }
-}
-
-/// Protocol-3 stderr is still plain log lines. Used only by the
-/// thread fallback; the reactor folds stderr into its log sources instead.
-fn spawn_stderr_log(
-    id: &str,
-    stderr: ChildStderr,
-    log: Option<Arc<Mutex<LogSink>>>,
-) -> Result<(), String> {
-    thread::Builder::new()
-        .name(format!("svcd-{}-stderr", id))
-        .stack_size(crate::threads::io_stack())
-        .spawn(move || {
-            use std::io::BufRead;
-            let reader = std::io::BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
-                if let Some(sink) = &log {
-                    if let Ok(mut sink) = sink.lock() {
-                        let _ = sink.line(&line);
-                    }
-                }
-            }
-        })
-        .map_err(|error| format!("raw stderr thread: {}", error))?;
-    Ok(())
 }
 
 #[cfg(test)]
