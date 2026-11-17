@@ -28,7 +28,7 @@ pub struct Settings {
     pub temp_dir: Option<PathBuf>,
     /// Files under `temp_dir` older than this are removed. Default: 2 hours.
     pub temp_retention_secs: Option<u64>,
-    /// How often the cleanup thread scans `temp_dir`. `0` disables cleanup.
+    /// How often the supervisor scans `temp_dir`. `0` disables cleanup.
     pub temp_cleanup_interval_secs: Option<u64>,
     /// Per-service log directory. Empty/absent uses the platform or
     /// `install_dir/logs` default.

@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::channel::PendingCall;
-use crate::server::http::engine::{self, Connection, HttpRequest, LegacyBridge, PreRequest, Table};
+use crate::server::http::engine::{self, Connection, HttpRequest, PreRequest, ServerLoop, Table};
 use crate::wake::Wake;
 
 use self::handle::LoopHandle;
@@ -66,7 +66,7 @@ struct ControlOnly {
     keys: Vec<Source>,
 }
 
-impl LegacyBridge for ControlOnly {
+impl ServerLoop for ControlOnly {
     type State = ();
 
     fn new_state(&mut self, _id: u64, _peer: std::net::IpAddr) {}

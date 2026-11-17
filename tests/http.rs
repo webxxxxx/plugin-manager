@@ -5430,20 +5430,18 @@ fn an_idle_connection_is_closed_without_a_response() {
 //
 // /proc is the practical Unix way to read another process's thread count; the
 // behavior tests stay platform-neutral, so this supplemental check is gated to
-// Linux. The default S4 baseline is twelve daemon threads while the legacy
-// HTTP workers and takeovers still exist (#116 added the two blocking-pool
-// workers). Keep-alive connections and SSE streams are driven by the reactor,
-// so neither may add a thread each.
+// Linux. #125 deleted the four legacy HTTP workers and the standalone
+// temp-cleanup thread, so the default S4 baseline is five: the main/supervisor
+// thread, the server loop, the plugin stdio reactor and two blocking-pool
+// workers. Keep-alive connections and SSE streams are driven by the server
+// loop, so neither may add a thread each.
 // ---------------------------------------------------------------------------
 
-/// The default S4 topology after the control-channel merge (#124). #116 added
-/// the two blocking-pool workers; #124 moved the control listener and the
-/// outbound management client onto the server loop, removing the two reactor
-/// threads (12 -> 10). The legacy HTTP workers and takeovers stay until
-/// #117/#125; #126 merges the plugin reactor and reaches 4-5. Update this pin
-/// in the slice that changes the baseline.
+/// The default S4 topology after #125: supervisor, server loop, plugin reactor
+/// and the two blocking workers. #126 merges the plugin reactor and reaches
+/// four. Update this pin in the slice that changes the baseline.
 #[cfg(target_os = "linux")]
-const IDLE_DAEMON_THREADS: usize = 10;
+const IDLE_DAEMON_THREADS: usize = 5;
 
 #[cfg(target_os = "linux")]
 fn daemon_threads(pid: u32) -> usize {
@@ -5531,6 +5529,20 @@ fn unix_idle_thread_count_has_no_per_request_or_per_stream_threads() {
         1,
         "the control channel runs on the one server loop: {names:?}"
     );
+    // /proc/<pid>/task/*/comm truncates the name to 15 characters, so these
+    // prefixes are the observable form of svcd-http-worker, svcd-temp-cleanup,
+    // svcd-import-http and svcd-install-http.
+    for gone in [
+        "svcd-http-work",
+        "svcd-temp-clea",
+        "svcd-import-ht",
+        "svcd-install-h",
+    ] {
+        assert!(
+            !names.iter().any(|name| name.starts_with(gone)),
+            "{gone} must not survive #125: {names:?}"
+        );
+    }
 
     let mut connections = Vec::new();
     for _ in 0..16 {

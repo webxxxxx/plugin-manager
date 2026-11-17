@@ -1,9 +1,16 @@
 //! Inline dispatch and exchange validation for the S4 seam.
 
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
+
+use crate::http;
+use crate::lan::{AuthKind, Lan};
 use crate::log;
+use crate::server::http::engine::HttpRequest;
 
 use super::contract::{
-    BodyPolicy, CompletionSlot, Dispatch, Exchange, ExchangeKind, Face, Request, Route,
+    body_for, BodyError, BodyPolicy, CompletionSlot, Dispatch, Exchange, ExchangeKind, Face,
+    Request, Route,
 };
 
 /// Why the server could not accept a face result.
@@ -43,6 +50,83 @@ impl DispatchError {
                 }
             ),
         }
+    }
+}
+
+/// A face-owned request with authentication and its body already resolved.
+pub(crate) struct PreparedFace {
+    pub(crate) route: Route,
+    pub(crate) request: Request,
+}
+
+/// Ask the face whether it owns the request, then resolve the principal and
+/// apply the route's body policy. `Ok(None)` leaves the request to the
+/// server-owned routes; `Err` is a rendered authentication or body error.
+pub(crate) fn prepare_face_request(
+    face: &dyn Face,
+    request: &HttpRequest,
+    peer: IpAddr,
+    lan: &Arc<Mutex<Lan>>,
+) -> Result<Option<PreparedFace>, Vec<u8>> {
+    let Some(route) = face.route(&request.method, &request.path) else {
+        return Ok(None);
+    };
+    let principal = if route.public {
+        AuthKind::None
+    } else {
+        match lan.lock() {
+            Ok(mut state) => match state.authenticate(&request.headers) {
+                Ok(principal) => principal,
+                Err(()) => {
+                    return Err(http::json_error(
+                        401,
+                        "unauthorized",
+                        "authentication required",
+                    ))
+                }
+            },
+            Err(_) => {
+                return Err(http::json_error(
+                    500,
+                    "internal",
+                    "LAN state unavailable",
+                ))
+            }
+        }
+    };
+    let body = match body_for(route.body, &request.body) {
+        Ok(body) => body,
+        Err(BodyError::TooLarge) => {
+            return Err(http::json_error(
+                413,
+                "payload_too_large",
+                "request body is too large",
+            ))
+        }
+    };
+    Ok(Some(PreparedFace {
+        route,
+        request: Request {
+            method: request.method.clone(),
+            path: request.path.clone(),
+            headers: request.headers.clone(),
+            peer,
+            principal,
+            body,
+        },
+    }))
+}
+
+/// Turn a dispatch result into wire bytes.
+pub(crate) fn render_exchange(result: Result<Exchange, DispatchError>) -> Vec<u8> {
+    match result {
+        Ok(Exchange::Response(response)) => response.into_bytes(),
+        Ok(Exchange::Stream(_)) => http::json_error(
+            501,
+            "not_implemented",
+            "streamed face routes are not wired into this engine yet",
+        ),
+        Err(cause) => http::json_error(500, "internal", &cause.message()),
     }
 }
 

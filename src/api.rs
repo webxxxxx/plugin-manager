@@ -4,29 +4,26 @@
 //! `bind` in `svcd.conf` chooses the listener address. A non-loopback bind
 //! requires `auth_passwd`; without it the daemon falls back to loopback so the
 //! operator can still run `svc auth passwd`. Management JSON projections and
-//! the stream endpoints live in `face/` (#117–#121); this module keeps the
-//! control-channel adapter, the Windows per-connection fallback and the
-//! remaining legacy worker queue (#125 deletes it).
+//! the stream endpoints live in `face/` (#117–#121); the Unix server loop owns
+//! connections and control transport (#124/#125); this module is the
+//! composition root plus the Windows per-connection fallback.
 
 #[cfg(any(not(unix), test))]
 use std::collections::HashMap;
-#[cfg(unix)]
-use std::collections::VecDeque;
 use std::fs;
+#[cfg(not(unix))]
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
+#[cfg(not(unix))]
+use std::net::TcpStream;
+use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
-use std::sync::mpsc::{self, Receiver, Sender};
-#[cfg(unix)]
-use std::sync::Condvar;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+#[cfg(not(unix))]
 use std::thread;
+#[cfg(not(unix))]
 use std::time::Duration;
-#[cfg(unix)]
-use std::time::Instant;
 
 use serde_json::{json, Value};
 
@@ -41,30 +38,13 @@ use crate::mcp_http;
 use crate::package;
 use crate::plugin;
 use crate::rpc;
-use crate::server::http::engine::{self, keep_alive_response, wants_keep_alive, HttpRequest};
-#[cfg(unix)]
-use crate::server::http::JobOutcome;
+use crate::server::http::engine::HttpRequest;
+#[cfg(not(unix))]
+use crate::server::http::engine::{self, keep_alive_response, wants_keep_alive};
 use crate::settings;
+#[cfg(not(unix))]
 use crate::threads;
 use crate::webui;
-
-/// Buffered-body limit for the routes that still go through the ordinary
-/// router. Blob uploads/downloads are streamed before this is consulted.
-fn body_limit(path: &str) -> u64 {
-    let limits = crate::limits::current();
-    let path = path.split_once('?').map(|(path, _)| path).unwrap_or(path);
-    if path.starts_with("/api/v1/plugins") || path.starts_with("/api/v1/import") {
-        limits.max_body
-    } else if path.trim_end_matches('/').ends_with("/complete")
-        && (path.starts_with("/api/v1/blobs/uploads/")
-            || path.starts_with("/api/v1/file/uploads/")
-            || path.starts_with("/api/v1/files/uploads/"))
-    {
-        limits.max_complete_body
-    } else {
-        limits.max_json_body
-    }
-}
 
 pub struct Api {
     lan: Arc<Mutex<Lan>>,
@@ -143,7 +123,13 @@ pub fn spawn(
     };
 
     let lan = Arc::new(Mutex::new(state));
-    let loop_handle = legacy::start(
+    let fallback_config = config.clone();
+    let face: Arc<dyn crate::server::http::Face> =
+        Arc::new(crate::face::api::ApiFace::new(config.clone(), lan.clone()));
+    let routes: Arc<dyn crate::server::http::server::PreBodyRoutes> = Arc::new(PreBodyFaces);
+    let fallback: crate::server::http::server::FallbackHandler =
+        Arc::new(move |request, lan| respond(&fallback_config, request, lan));
+    let loop_handle = crate::server::http::server::start(
         listener,
         control,
         pending,
@@ -151,6 +137,9 @@ pub fn spawn(
         lan.clone(),
         config,
         raw_hub,
+        face,
+        routes,
+        fallback,
     )?;
     Ok(Arc::new(Api { lan, loop_handle }))
 }
@@ -213,126 +202,6 @@ impl Api {
     pub fn shutdown(&self) {
         #[cfg(unix)]
         self.loop_handle.shutdown();
-    }
-}
-
-#[cfg(unix)]
-struct HttpJob {
-    connection: u64,
-    request: HttpRequest,
-    keep_alive: bool,
-}
-
-#[cfg(unix)]
-enum Work {
-    Http(HttpJob),
-}
-
-#[cfg(unix)]
-struct JobQueue {
-    queue: Mutex<VecDeque<Work>>,
-    ready: Condvar,
-    /// Maximum queued legacy jobs. The legacy bridge answers 503 instead of
-    /// growing without bound.
-    limit: usize,
-}
-
-#[cfg(unix)]
-struct JobResult {
-    connection: u64,
-    response: Vec<u8>,
-    keep_alive: bool,
-}
-
-#[cfg(unix)]
-enum WorkResult {
-    Http(JobResult),
-    /// One blocking-pool job ended; the server loop takes its completion slot
-    /// by connection id, or drops it when the connection is gone.
-    BlockingDone {
-        key: u64,
-        outcome: JobOutcome,
-    },
-    /// A stream handler's blocking job produced a value. The handler receives
-    /// it before the pool's own completion frees the key.
-    StreamJobDone {
-        connection: u64,
-        outcome: crate::server::http::BlockingOutcome,
-    },
-}
-
-#[cfg(unix)]
-enum ConnState {
-    Reading,
-    Processing,
-    Writing,
-    /// A sans-IO handler plus the server-side deadline, file send and
-    /// `max_streams` slot (see `server::http::driver`).
-    Stream(crate::server::http::driver::StreamDriver),
-}
-
-#[cfg(unix)]
-type Connection = engine::Connection<ConnState>;
-
-#[cfg(unix)]
-mod legacy;
-
-#[cfg(unix)]
-impl JobQueue {
-    /// Queue one legacy job, or hand it back when the bridge is full. The
-    /// queue never grows past `limit` and never spawns a temporary worker.
-    fn try_push(&self, work: Work) -> Result<(), Work> {
-        let mut queue = self.queue.lock().unwrap_or_else(|error| error.into_inner());
-        if queue.len() >= self.limit {
-            return Err(work);
-        }
-        queue.push_back(work);
-        self.ready.notify_one();
-        Ok(())
-    }
-
-    fn pop(&self) -> Work {
-        let mut queue = self.queue.lock().unwrap_or_else(|error| error.into_inner());
-        loop {
-            if let Some(job) = queue.pop_front() {
-                return job;
-            }
-            queue = self
-                .ready
-                .wait(queue)
-                .unwrap_or_else(|error| error.into_inner());
-        }
-    }
-}
-
-#[cfg(unix)]
-fn http_worker(
-    queue: Arc<JobQueue>,
-    config: PathBuf,
-    lan: Arc<Mutex<Lan>>,
-    results: Sender<WorkResult>,
-    notify: Option<UnixStream>,
-) {
-    loop {
-        let result = match queue.pop() {
-            Work::Http(job) => {
-                let mut response = respond(&config, &job.request, &lan);
-                if job.keep_alive {
-                    response = keep_alive_response(response);
-                }
-                WorkResult::Http(JobResult {
-                    connection: job.connection,
-                    response,
-                    keep_alive: job.keep_alive,
-                })
-            }
-        };
-        if results.send(result).is_err() {
-            return;
-        }
-        if let Some(notify) = &notify {
-            let _ = (&*notify).write(&[1]);
-        }
     }
 }
 
@@ -529,7 +398,7 @@ fn serve_streamed_route(
     face: &crate::face::api::ApiFace,
     lan: &Arc<Mutex<Lan>>,
 ) {
-    use crate::server::http::{dispatch_inline, Exchange};
+    use crate::server::http::{dispatch_inline, prepare_face_request, Exchange};
 
     let request = HttpRequest {
         method: head.method.clone(),
@@ -557,6 +426,55 @@ fn serve_streamed_route(
         Err(cause) => {
             let _ = stream.write_all(&http::json_error(500, "internal", &cause.message()));
         }
+    }
+}
+
+/// The composition root's pre-body stream faces. The server loop holds this
+/// trait object instead of depending on the face layer directly.
+#[cfg(unix)]
+struct PreBodyFaces;
+
+#[cfg(unix)]
+impl crate::server::http::server::PreBodyRoutes for PreBodyFaces {
+    fn plugin_ui(
+        &self,
+        head: &http::Head,
+        peer: IpAddr,
+        lan: &Arc<Mutex<Lan>>,
+        config: &Path,
+        raw_hub: Arc<crate::rawhub::RawHub>,
+    ) -> Option<Result<crate::server::http::Exchange, Vec<u8>>> {
+        crate::face::plugin_ui::PluginUiFace::route_for(&head.method, &head.path)?;
+        Some(crate::face::plugin_ui::PluginUiFace::exchange(
+            head,
+            peer,
+            lan,
+            config.to_path_buf(),
+            Some(raw_hub),
+        ))
+    }
+
+    fn package_upload(
+        &self,
+        head: &http::Head,
+        lan: &Arc<Mutex<Lan>>,
+        config: &Path,
+    ) -> Option<Result<crate::server::http::Exchange, Vec<u8>>> {
+        crate::face::install::target(head)?;
+        Some(crate::face::install::exchange(
+            head,
+            lan,
+            config.to_path_buf(),
+        ))
+    }
+
+    fn blob_upload(
+        &self,
+        head: &http::Head,
+        lan: &Arc<Mutex<Lan>>,
+    ) -> Option<Result<crate::server::http::Exchange, Vec<u8>>> {
+        crate::face::blob_upload::upload_target(head)?;
+        Some(crate::face::blob_upload::exchange(head, lan))
     }
 }
 
@@ -810,79 +728,6 @@ fn write_sse_line(stream: &mut TcpStream, line: &str) -> std::io::Result<()> {
     stream.flush()
 }
 
-/// A face-owned request with authentication and its body already resolved.
-struct PreparedFace {
-    route: crate::server::http::Route,
-    request: crate::server::http::Request,
-}
-
-/// Ask the face whether it owns the request, then resolve the principal and
-/// apply the route's body policy. `Ok(None)` leaves the request to the legacy
-/// path; `Err` is a rendered authentication or body error.
-fn prepare_face_request(
-    face: &dyn crate::server::http::Face,
-    request: &HttpRequest,
-    peer: IpAddr,
-    lan: &Arc<Mutex<Lan>>,
-) -> Result<Option<PreparedFace>, Vec<u8>> {
-    use crate::server::http::{body_for, BodyError, Request};
-
-    let Some(route) = face.route(&request.method, &request.path) else {
-        return Ok(None);
-    };
-    // Authentication still runs per request here. Moving the principal to
-    // connection setup belongs to the server-loop slice (#114). A public route
-    // (login, logout, console page) must run before a session exists; the face
-    // owns that route's endpoint policy.
-    let principal = if route.public {
-        AuthKind::None
-    } else {
-        match lan.lock() {
-            Ok(mut state) => match state.authenticate(&request.headers) {
-                Ok(principal) => principal,
-                Err(()) => return Err(error(401, "unauthorized", "authentication required")),
-            },
-            Err(_) => return Err(error(500, "internal", "LAN state unavailable")),
-        }
-    };
-    let body = match body_for(route.body, &request.body) {
-        Ok(body) => body,
-        Err(BodyError::TooLarge) => {
-            return Err(error(413, "payload_too_large", "request body is too large"))
-        }
-    };
-    Ok(Some(PreparedFace {
-        route,
-        request: Request {
-            method: request.method.clone(),
-            path: request.path.clone(),
-            headers: request.headers.clone(),
-            peer,
-            principal,
-            body,
-        },
-    }))
-}
-
-/// Turn a dispatch result into wire bytes. Streamed routes are not wired into
-/// the legacy engines in this slice; #115 hands the stream handler to the
-/// server loop.
-fn render_exchange(
-    result: Result<crate::server::http::Exchange, crate::server::http::DispatchError>,
-) -> Vec<u8> {
-    use crate::server::http::Exchange;
-
-    match result {
-        Ok(Exchange::Response(response)) => response.into_bytes(),
-        Ok(Exchange::Stream(_)) => error(
-            501,
-            "not_implemented",
-            "streamed face routes are not wired into this engine yet",
-        ),
-        Err(cause) => error(500, "internal", &cause.message()),
-    }
-}
-
 /// The Windows per-connection fallback has no shared blocking pool: its
 /// connection thread is already dedicated to one request, so a `Blocking`
 /// route runs on that thread. The Unix server loop submits to
@@ -895,7 +740,9 @@ fn serve_face(
     lan: &Arc<Mutex<Lan>>,
     keep_alive: bool,
 ) -> Option<Vec<u8>> {
-    use crate::server::http::{dispatch_blocking_now, dispatch_inline, Dispatch};
+    use crate::server::http::{
+        dispatch_blocking_now, dispatch_inline, prepare_face_request, render_exchange, Dispatch,
+    };
 
     let prepared = match prepare_face_request(face, request, peer, lan) {
         Ok(Some(prepared)) => prepared,
@@ -1205,7 +1052,7 @@ fn read_body(
 ) -> Result<HttpRequest, Vec<u8>> {
     let framing =
         http::framing(&head.headers).map_err(|message| error(400, "bad_request", &message))?;
-    let limit = body_limit(&head.path);
+    let limit = crate::server::http::body_limit(&head.path);
     if let http::Framing::Length(length) = framing {
         if length > limit {
             return Err(error(413, "payload_too_large", "request body is too large"));
@@ -1242,7 +1089,7 @@ fn request_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
     http::header(&request.headers, name)
 }
 
-/// The only buffered routes left on the legacy worker are the blob/file
+/// The buffered routes served by the fallback handler are the blob/file
 /// session routes (#118/#119); every management route and every streamed
 /// transfer is claimed before this function runs.
 fn route(_config: &std::path::Path, request: &HttpRequest) -> Vec<u8> {
@@ -1447,6 +1294,7 @@ fn decode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::http::prepare_face_request;
 
     #[test]
     fn a_public_face_route_skips_transport_auth() {
@@ -1491,42 +1339,6 @@ mod tests {
         assert_eq!(resolve_bind(Some("not-an-addr"), Some(b)), b);
         assert_eq!(resolve_bind(None, Some(b)), b);
         assert_eq!(resolve_bind(None, None), default_bind());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn the_legacy_bridge_queue_is_bounded() {
-        assert_eq!(legacy::LEGACY_QUEUE_LIMIT, 64);
-        let queue = JobQueue {
-            queue: Mutex::new(VecDeque::new()),
-            ready: Condvar::new(),
-            limit: legacy::LEGACY_QUEUE_LIMIT,
-        };
-        let job = || {
-            Work::Http(HttpJob {
-                connection: 1,
-                request: HttpRequest {
-                    method: "GET".into(),
-                    path: "/api/v1/version".into(),
-                    version: "HTTP/1.1".into(),
-                    headers: Vec::new(),
-                    body: Vec::new(),
-                },
-                keep_alive: false,
-            })
-        };
-        for _ in 0..legacy::LEGACY_QUEUE_LIMIT {
-            assert!(queue.try_push(job()).is_ok());
-        }
-        assert!(
-            queue.try_push(job()).is_err(),
-            "a full bridge rejects the job instead of growing the queue"
-        );
-        assert_eq!(
-            queue.queue.lock().expect("queue").len(),
-            legacy::LEGACY_QUEUE_LIMIT,
-            "the rejected job must not be queued"
-        );
     }
 
     /// The Windows fallback ties one admitted connection to one thread, so the

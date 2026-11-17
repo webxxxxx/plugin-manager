@@ -1,7 +1,6 @@
 //! The HTTP server loop: it owns the listener, the accepted sockets, the
-//! request buffers and the pending-request table. The legacy bridge implements
-//! the per-connection state machine until #125 deletes the bridge; the loop
-//! itself never knows an endpoint.
+//! request buffers and the pending-request table. A `ServerLoop` implements
+//! the per-connection state machine; the loop itself never knows an endpoint.
 //!
 //! The loop is Unix-only for now. Windows keeps the per-connection thread
 //! fallback (ADR-0016); moving that to IOCP belongs to S3/S6.
@@ -113,11 +112,11 @@ pub enum PreRequest {
     Handled,
 }
 
-/// The temporary legacy bridge. It owns the endpoint state machine and the
-/// bounded worker queue; the loop owns the connection and the buffers. The
-/// trait disappears with the bridge in #125, so it is not a product seam.
+/// The server's connection state machine. The loop owns the connection and the
+/// buffers; this trait only lets the full HTTP server and the control-only
+/// build share the same reactor. It is not a product seam.
 #[cfg(unix)]
-pub trait LegacyBridge {
+pub trait ServerLoop {
     type State;
 
     fn new_state(&mut self, id: u64, peer: IpAddr) -> Self::State;
@@ -136,13 +135,13 @@ pub trait LegacyBridge {
     fn on_close(&mut self, connection: &mut Connection<Self::State>);
 
     /// The loop is about to drop a connection after `POLLERR` / `POLLHUP`.
-    /// Legacy handlers use this for protocol-specific diagnostics.
+    /// Handlers use this for protocol-specific diagnostics.
     fn on_poll_error(&mut self, connection: &mut Connection<Self::State>, _revents: i16) {
         let _ = connection;
     }
 
-    /// The legacy worker wakes the loop through this fd; the loop only uses it
-    /// to leave poll early, the handler drains it in `on_tick`.
+    /// The blocking pool and control client wake the loop through this fd; the
+    /// loop only uses it to leave poll early, the handler drains it in `on_tick`.
     fn wake_fd(&self) -> Option<RawFd> {
         None
     }
@@ -168,7 +167,7 @@ pub trait LegacyBridge {
 #[cfg(unix)]
 pub fn run<S, H>(listener: Option<TcpListener>, handler: &mut H, limits: &crate::limits::Limits)
 where
-    H: LegacyBridge<State = S>,
+    H: ServerLoop<State = S>,
 {
     if let Some(listener) = &listener {
         let _ = listener.set_nonblocking(true);
