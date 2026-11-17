@@ -1110,10 +1110,21 @@ fn ws_key() -> String {
 
 /// Open a WebSocket handshake and return (stream, status, response head).
 fn ws_handshake(address: &str, path: &str, extra: &[(&str, &str)]) -> (TcpStream, u16, String) {
-    let mut stream = TcpStream::connect(address).expect("ws connect");
+    try_ws_handshake(address, path, extra)
+        .unwrap_or_else(|error| panic!("ws handshake {path}: {error}"))
+}
+
+/// The fallible form: an admission refusal is a transport failure, not a
+/// protocol verdict, so the caller can retry it.
+fn try_ws_handshake(
+    address: &str,
+    path: &str,
+    extra: &[(&str, &str)],
+) -> Result<(TcpStream, u16, String), String> {
+    let mut stream = TcpStream::connect(address).map_err(|error| format!("connect: {error}"))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("ws timeout");
+        .map_err(|error| format!("timeout: {error}"))?;
     let key = ws_key();
     let mut request = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n",
@@ -1123,11 +1134,15 @@ fn ws_handshake(address: &str, path: &str, extra: &[(&str, &str)]) -> (TcpStream
         request.push_str(&format!("{}: {}\r\n", name, value));
     }
     request.push_str("\r\n");
-    stream.write_all(request.as_bytes()).expect("ws request");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("write: {error}"))?;
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
-        stream.read_exact(&mut byte).expect("ws response head");
+        stream
+            .read_exact(&mut byte)
+            .map_err(|error| format!("read head: {error}"))?;
         head.push(byte[0]);
     }
     let head = String::from_utf8_lossy(&head).to_string();
@@ -1136,8 +1151,36 @@ fn ws_handshake(address: &str, path: &str, extra: &[(&str, &str)]) -> (TcpStream
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|value| value.parse::<u16>().ok())
-        .expect("ws status");
-    (stream, status, head)
+        .ok_or_else(|| format!("bad status line {:?}", head))?;
+    Ok((stream, status, head))
+}
+
+/// A handshake that has to reach the handler: retry until the daemon admits the
+/// connection instead of panicking on the admission refusal (#155).
+fn ws_handshake_admitted(
+    sandbox: &mut Sandbox,
+    address: &str,
+    path: &str,
+    extra: &[(&str, &str)],
+) -> (TcpStream, u16, String) {
+    let deadline = Instant::now() + ADMISSION_WAIT;
+    loop {
+        match try_ws_handshake(address, path, extra) {
+            Ok(handshake) => return handshake,
+            Err(error) => {
+                if Instant::now() >= deadline || !daemon_state(sandbox).starts_with("running") {
+                    regression_failure(
+                        sandbox,
+                        "max_connections",
+                        &format!("GET {path} (WebSocket handshake)"),
+                        "an answered handshake within the admission wait",
+                        &error,
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
 }
 
 fn ws_send(stream: &mut TcpStream, opcode: u8, payload: &[u8]) {
@@ -6509,7 +6552,7 @@ fn exchange(address: &str, head: &str, body: &[u8]) -> Exchange {
     }
 
     let mut exchange = parse_exchange(&raw);
-    exchange.error = exchange.error.or(failure);
+    exchange.error = failure.or(exchange.error);
     if exchange.error.is_some() {
         exchange.error = Some(format!(
             "{} (received {} bytes)",
@@ -6673,8 +6716,149 @@ fn assert_daemon_alive(sandbox: &mut Sandbox, phase: &str) {
     }
 }
 
+/// Bounded wait for the daemon to admit a probe.
+///
+/// The minimal config runs with `max_connections = 1`, which makes admission
+/// asynchronous: the daemon frees a slot only once the previous handler thread
+/// has returned, and a refused connection is closed without reading the request,
+/// so Windows turns that close into a reset that can discard the busy reply.
+/// "No answer" and "503 busy" therefore both mean "not admitted yet" on the
+/// client side, and a loaded machine widens the window; wait it out against a
+/// deadline instead of a fixed 2 s cap (#155).
+const ADMISSION_WAIT: Duration = Duration::from_secs(30);
+
+/// True when the probe never reached a handler: the admission gate answered
+/// busy, or the connection was reset before the response head.
+fn admission_refused(probe: &Exchange) -> bool {
+    probe.status == 0 || probe.status == 503 || probe.error.is_some()
+}
+
+/// One request that must be answered by a handler, not by the admission gate.
+/// Retries an admission refusal against [`ADMISSION_WAIT`]; a stopped daemon is
+/// the bail-out, so a crash is reported instead of waited on.
+fn exchange_admitted(
+    sandbox: &mut Sandbox,
+    address: &str,
+    head: &str,
+    body: &[u8],
+) -> Exchange {
+    let deadline = Instant::now() + ADMISSION_WAIT;
+    loop {
+        let probe = exchange(address, head, body);
+        if !admission_refused(&probe)
+            || Instant::now() >= deadline
+            || !daemon_state(sandbox).starts_with("running")
+        {
+            return probe;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// The floor admits exactly one of two concurrent connections, the usable
+/// config both. The pair is opened before either socket sends, so it races the
+/// slot release of whatever probe came before; retry the whole pair until it
+/// shows the configured shape (#155). The refused socket carries no request,
+/// so its 503 is not lost to the reset a pending request would cause.
+fn assert_concurrent_connections(sandbox: &mut Sandbox, address: &str, streams: bool) {
+    let request = format!(
+        "GET /api/v1/services HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        address
+    );
+    let deadline = Instant::now() + ADMISSION_WAIT;
+    let mut last = String::from("no attempt");
+    loop {
+        let mut first = TcpStream::connect(address).expect("first connection");
+        let mut second = TcpStream::connect(address).expect("second connection");
+        for stream in [&first, &second] {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+        }
+        // Let the accept loop admit (or refuse) both sockets before either
+        // writes, so the refusal arrives with no unread request data.
+        std::thread::sleep(Duration::from_millis(100));
+        let mut accepted = true;
+        if streams {
+            for (name, stream) in [("first", &mut first), ("second", &mut second)] {
+                if let Err(error) = stream.write_all(request.as_bytes()) {
+                    last = format!("{name} concurrent connection: write: {error}");
+                    accepted = false;
+                    continue;
+                }
+                match read_status_line(stream) {
+                    Ok(200) => {}
+                    Ok(status) => {
+                        last = format!("{name} concurrent connection: status {status}");
+                        accepted = false;
+                    }
+                    Err(error) => {
+                        last = format!("{name} concurrent connection: {error}");
+                        accepted = false;
+                    }
+                }
+            }
+            if accepted {
+                return;
+            }
+        } else {
+            match read_status_line(&mut second) {
+                Ok(503) => {
+                    // The second socket was refused at accept, so the first one
+                    // holds the only slot. A write can still fail when both
+                    // sockets were refused before the pair was retried.
+                    if let Err(error) = first.write_all(request.as_bytes()) {
+                        last = format!("first (admitted) concurrent connection: write: {error}");
+                    } else {
+                        match read_status_line(&mut first) {
+                            Ok(200) => return,
+                            Ok(status) => {
+                                last = format!(
+                                    "first (admitted) concurrent connection: status {status}"
+                                )
+                            }
+                            Err(error) => {
+                                last = format!("first (admitted) concurrent connection: {error}")
+                            }
+                        }
+                    }
+                }
+                Ok(status) => {
+                    last = format!(
+                        "second concurrent connection (refused at accept, no request sent): status {status}"
+                    )
+                }
+                Err(error) => {
+                    last = format!(
+                        "second concurrent connection (refused at accept, no request sent): {error}"
+                    )
+                }
+            }
+        }
+        if Instant::now() >= deadline || !daemon_state(sandbox).starts_with("running") {
+            regression_failure(
+                sandbox,
+                "max_connections",
+                if streams {
+                    "two concurrent connections"
+                } else {
+                    "first (admitted) concurrent connection"
+                },
+                if streams {
+                    "status 200 on both connections"
+                } else {
+                    "status 200 on the admitted connection after a 503 for the second"
+                },
+                &last,
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// One MCP request over the Streamable HTTP binding.
 fn mcp_min_exchange(
+    sandbox: &mut Sandbox,
     address: &str,
     password: &str,
     method: &str,
@@ -6704,7 +6888,7 @@ fn mcp_min_exchange(
         "Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     ));
-    exchange(address, &head, &body)
+    exchange_admitted(sandbox, address, &head, &body)
 }
 
 /// Read SSE events until one contains `needle`, reporting what arrived
@@ -6796,6 +6980,35 @@ fn sse_open_retrying(address: &str, path: &str, last_id: Option<u64>) -> Result<
     ))
 }
 
+/// An SSE stream that has to reach the handler. `sse_open_retrying` already
+/// retries the subscriber-release 429; this also retries the admission refusal
+/// and reports through the config-key channel instead of panicking (#155).
+fn sse_open_admitted(
+    sandbox: &mut Sandbox,
+    address: &str,
+    path: &str,
+    last_id: Option<u64>,
+) -> TcpStream {
+    let deadline = Instant::now() + ADMISSION_WAIT;
+    loop {
+        match sse_open_retrying(address, path, last_id) {
+            Ok(stream) => return stream,
+            Err(error) => {
+                if Instant::now() >= deadline || !daemon_state(sandbox).starts_with("running") {
+                    regression_failure(
+                        sandbox,
+                        "max_connections",
+                        &format!("GET {path} (SSE)"),
+                        "an admitted SSE stream within the admission wait",
+                        &error,
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+}
+
 #[test]
 fn minimal_svcd_conf_keeps_the_daemon_alive() {
     run_min_config_phase("floor", false);
@@ -6824,36 +7037,20 @@ fn run_min_config_phase(phase: &str, streams: bool) {
     let port_before = fs::read_to_string(sandbox.config.join("http.port")).expect("http.port");
 
     // wait_for_http drops a bare TCP connection. With max_connections = 1 the
-    // reactor can still count it when the first real request lands, so retry
-    // that one handshake instead of racing the clean-up.
-    let mut admitted = false;
-    let mut last = String::from("no attempt");
+    // daemon can still count it when the first real request lands, so the first
+    // probe is retried against the bounded admission wait instead of failing.
     let warmup = format!(
         "GET /api/v1/services HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
         address
     );
-    for _ in 0..80 {
-        let probe = exchange(&address, &warmup, b"");
-        if probe.status == 200 {
-            admitted = true;
-            break;
-        }
-        last = match &probe.error {
-            Some(error) => error.clone(),
-            None => format!("status {}", probe.status),
-        };
-        if probe.status != 503 && probe.error.is_none() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    if !admitted {
+    let probe = exchange_admitted(&mut sandbox, &address, &warmup, b"");
+    if probe.status != 200 {
         regression_failure(
             &mut sandbox,
             "max_connections",
             "GET /api/v1/services (the first admitted request)",
-            "status 200 within 2 s",
-            &last,
+            "status 200 within the admission wait",
+            &probe.describe(),
         );
     }
 
@@ -6861,7 +7058,8 @@ fn run_min_config_phase(phase: &str, streams: bool) {
     set_password(&sandbox, MIN_CONFIG_PASSWORD);
 
     // One installed plugin, so the plugin-UI surfaces (WS/SSE) exist at all.
-    let installed = exchange(
+    let installed = exchange_admitted(
+        &mut sandbox,
         &address,
         &request_head(
             &address,
@@ -6880,7 +7078,8 @@ fn run_min_config_phase(phase: &str, streams: bool) {
         &[200],
         &installed,
     );
-    let started = exchange(
+    let started = exchange_admitted(
+        &mut sandbox,
         &address,
         &request_head(&address, "POST", "/api/v1/services/demo/start", "", 0, &[]),
         b"",
@@ -6897,7 +7096,8 @@ fn run_min_config_phase(phase: &str, streams: bool) {
     // takeover, so the gate is this key (not max_body_bytes, which only bounds
     // the non-tar import body): an over-size Content-Length is refused before a
     // single body byte is read. The compile-time defaults are 8/64/512 MiB.
-    let over_package = exchange(
+    let over_package = exchange_admitted(
+        &mut sandbox,
         &address,
         &request_head(
             &address,
@@ -6925,7 +7125,8 @@ fn run_min_config_phase(phase: &str, streams: bool) {
     );
 
     // max_json_body_bytes clamps to 4 KiB on the ordinary JSON routes.
-    let over_json = exchange(
+    let over_json = exchange_admitted(
+        &mut sandbox,
         &address,
         &request_head(
             &address,
@@ -6947,7 +7148,8 @@ fn run_min_config_phase(phase: &str, streams: bool) {
 
     // max_header_bytes clamps to 1 KiB: a request just under the clamp parses...
     let pad = "a".repeat(700);
-    let under_header = exchange(
+    let under_header = exchange_admitted(
+        &mut sandbox,
         &address,
         &request_head(
             &address,
@@ -6973,7 +7175,8 @@ fn run_min_config_phase(phase: &str, streams: bool) {
     // the clamp in action. RFC 9110 asks for 431; the current code answers 400,
     // and #106 owns that conformance change.
     let just_over = "a".repeat(1000);
-    let over_header = exchange(
+    let over_header = exchange_admitted(
+        &mut sandbox,
         &address,
         &request_head(
             &address,
@@ -7000,18 +7203,25 @@ fn run_min_config_phase(phase: &str, streams: bool) {
     // status code is pinned by the probe above and #106 owns the RFC 9110
     // 431/graceful-close conformance.
     let big = "a".repeat(4 * 1024);
-    let huge_header = exchange(
+    let huge_head = request_head(
         &address,
-        &request_head(
-            &address,
-            "GET",
-            "/api/v1/services",
-            "",
-            0,
-            &[("X-Pad", big.as_str())],
-        ),
-        b"",
+        "GET",
+        "/api/v1/services",
+        "",
+        0,
+        &[("X-Pad", big.as_str())],
     );
+    let mut huge_header = exchange(&address, &huge_head, b"");
+    // A readable 503 here is the admission gate answering, not the header
+    // verdict: wait for a slot instead of reading it as a regression.
+    let huge_deadline = Instant::now() + ADMISSION_WAIT;
+    while huge_header.status == 503
+        && Instant::now() < huge_deadline
+        && daemon_state(&mut sandbox).starts_with("running")
+    {
+        std::thread::sleep(Duration::from_millis(25));
+        huge_header = exchange(&address, &huge_head, b"");
+    }
     if huge_header.status != 0 && !matches!(huge_header.status, 400 | 431) {
         regression_failure(
             &mut sandbox,
@@ -7026,102 +7236,36 @@ fn run_min_config_phase(phase: &str, streams: bool) {
     // Concurrent connections: the floor admits one connection and refuses the
     // second with 503 at accept time; the usable config admits two. Both
     // engines enforce this: the Unix reactor counts its connection table, the
-    // Windows fallback admits before it spawns the per-connection thread. The
-    // second socket is refused without a request, so its 503 is not lost to the
-    // abortive close a pending request would cause.
-    let mut admitted = TcpStream::connect(&address).expect("admitted connection");
-    let mut extra = TcpStream::connect(&address).expect("second connection");
-    for stream in [&admitted, &extra] {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("timeout");
-    }
-    std::thread::sleep(Duration::from_millis(100));
-    let concurrent = format!(
-        "GET /api/v1/services HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        address
-    );
-    if streams {
-        for (name, stream) in [("first", &mut admitted), ("second", &mut extra)] {
-            stream
-                .write_all(concurrent.as_bytes())
-                .expect("concurrent request");
-            let status = read_status_line(stream).unwrap_or_else(|error| {
-                regression_failure(
-                    &mut sandbox,
-                    "max_connections",
-                    &format!("{name} concurrent connection"),
-                    "status 200",
-                    &error,
-                )
-            });
-            if status != 200 {
-                regression_failure(
-                    &mut sandbox,
-                    "max_connections / max_connections_per_ip",
-                    &format!("{name} concurrent connection"),
-                    "status 200",
-                    &format!("status {status}"),
-                );
-            }
-        }
-    } else {
-        let refused = read_status_line(&mut extra).unwrap_or_else(|error| {
-            regression_failure(
-                &mut sandbox,
-                "max_connections",
-                "second concurrent connection (refused at accept, no request sent)",
-                "a 503 status line",
-                &error,
-            )
-        });
-        if refused != 503 {
-            regression_failure(
-                &mut sandbox,
-                "max_connections",
-                "second concurrent connection (refused at accept, no request sent)",
-                "status 503",
-                &format!("status {refused}"),
-            );
-        }
-        admitted
-            .write_all(concurrent.as_bytes())
-            .expect("admitted request");
-        let served = read_status_line(&mut admitted).unwrap_or_else(|error| {
-            regression_failure(
-                &mut sandbox,
-                "max_connections",
-                "first (admitted) concurrent connection",
-                "status 200",
-                &error,
-            )
-        });
-        if served != 200 {
-            regression_failure(
-                &mut sandbox,
-                "max_connections",
-                "first (admitted) concurrent connection",
-                "status 200",
-                &format!("status {served}"),
-            );
-        }
-    }
+    // Windows fallback admits before it spawns the per-connection thread.
+    assert_concurrent_connections(&mut sandbox, &address, streams);
 
     // http_idle_timeout_secs clamps to 1 s: the Unix reactor's idle sweep and
     // the Windows fallback's per-socket read timeout both close a keep-alive
     // connection instead of idling for the compile-time default (30/60/120 s).
-    let mut idle = TcpStream::connect(&address).expect("idle connection");
-    idle.set_read_timeout(Some(Duration::from_millis(500)))
-        .expect("timeout");
-    idle.write_all(
-        format!(
-            "GET /api/v1/services HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\n\r\n",
-            address
-        )
-        .as_bytes(),
-    )
-    .expect("keep-alive request");
-    let kept = read_one_response(&mut idle);
+    // The keep-alive probe needs an admitted slot too, so retry the handshake
+    // against the admission wait.
+    let idle_request = format!(
+        "GET /api/v1/services HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\n\r\n",
+        address
+    );
+    let idle_deadline = Instant::now() + ADMISSION_WAIT;
+    let (mut idle, kept) = loop {
+        let mut stream = TcpStream::connect(&address).expect("idle connection");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        stream
+            .write_all(idle_request.as_bytes())
+            .expect("keep-alive request");
+        let kept = read_one_response(&mut stream);
+        if kept.status == 200
+            || Instant::now() >= idle_deadline
+            || !daemon_state(&mut sandbox).starts_with("running")
+        {
+            break (stream, kept);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
     if kept.status != 200 {
         regression_failure(
             &mut sandbox,
@@ -7163,7 +7307,14 @@ fn run_min_config_phase(phase: &str, streams: bool) {
     // MCP over Streamable HTTP: tools/list and tools/call. The modern binding
     // has no initialize handshake, so that method must answer 404 -32601
     // rather than drop the connection.
-    let listed = mcp_min_exchange(&address, MIN_CONFIG_PASSWORD, "tools/list", json!({}), None);
+    let listed = mcp_min_exchange(
+        &mut sandbox,
+        &address,
+        MIN_CONFIG_PASSWORD,
+        "tools/list",
+        json!({}),
+        None,
+    );
     expect_status(
         &mut sandbox,
         "max_json_body_bytes",
@@ -7192,6 +7343,7 @@ fn run_min_config_phase(phase: &str, streams: bool) {
     }
 
     let called = mcp_min_exchange(
+        &mut sandbox,
         &address,
         MIN_CONFIG_PASSWORD,
         "tools/call",
@@ -7224,7 +7376,14 @@ fn run_min_config_phase(phase: &str, streams: bool) {
         );
     }
 
-    let initialize = mcp_min_exchange(&address, MIN_CONFIG_PASSWORD, "initialize", json!({}), None);
+    let initialize = mcp_min_exchange(
+        &mut sandbox,
+        &address,
+        MIN_CONFIG_PASSWORD,
+        "initialize",
+        json!({}),
+        None,
+    );
     expect_status(
         &mut sandbox,
         "max_json_body_bytes",
@@ -7276,7 +7435,8 @@ fn run_min_config_phase(phase: &str, streams: bool) {
     let events_path = format!("{}events", base);
 
     if streams {
-        let (mut ws, status, head) = ws_handshake(&address, &ws_path, &[]);
+        let (mut ws, status, head) =
+            ws_handshake_admitted(&mut sandbox, &address, &ws_path, &[]);
         expect_status_code(
             &mut sandbox,
             "max_subscribers_per_plugin",
@@ -7365,22 +7525,14 @@ fn run_min_config_phase(phase: &str, streams: bool) {
         drop(ws);
 
         // SSE: connect, receive one event, then reconnect with Last-Event-ID and
-        // receive the event published while no subscriber was attached.
-        // Retry a 429 here too: the WS probe's subscription is released by the
-        // server a poll cycle after its socket closes, and the usable config
-        // allows exactly one subscriber.
-        let mut sse = sse_open_retrying(&address, &events_path, None).unwrap_or_else(|error| {
-            regression_failure(
-                &mut sandbox,
-                "max_subscribers_per_plugin",
-                "GET <base>events (SSE)",
-                "status 200 within 2 s",
-                &error,
-            )
-        });
+        // receive the event published while no subscriber was attached. The
+        // subscriber slot and the connection slot are both released by the
+        // server asynchronously, so the open waits them out instead of failing.
+        let mut sse = sse_open_admitted(&mut sandbox, &address, &events_path, None);
         let rpc_path = format!("{}rpc", base);
         let call = br#"{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"status","arguments":{}}}"#;
-        let answered = exchange(
+        let answered = exchange_admitted(
+            &mut sandbox,
             &address,
             &request_head(
                 &address,
@@ -7440,7 +7592,8 @@ fn run_min_config_phase(phase: &str, streams: bool) {
         drop(sse);
 
         let later = br#"{"jsonrpc":"2.0","id":32,"method":"tools/call","params":{"name":"status","arguments":{}}}"#;
-        let published = exchange(
+        let published = exchange_admitted(
+            &mut sandbox,
             &address,
             &request_head(
                 &address,
@@ -7460,16 +7613,7 @@ fn run_min_config_phase(phase: &str, streams: bool) {
             &published,
         );
 
-        let mut replay =
-            sse_open_retrying(&address, &events_path, Some(last_id)).unwrap_or_else(|error| {
-                regression_failure(
-                    &mut sandbox,
-                    "max_subscribers_per_plugin",
-                    "GET <base>events with Last-Event-ID",
-                    "status 200 within 2 s",
-                    &error,
-                )
-            });
+        let mut replay = sse_open_admitted(&mut sandbox, &address, &events_path, Some(last_id));
         let replayed = sse_next_event(&mut replay, "pong-event", Duration::from_secs(5))
             .unwrap_or_else(|error| {
                 regression_failure(
@@ -7508,7 +7652,9 @@ fn run_min_config_phase(phase: &str, streams: bool) {
             address,
             ws_key()
         );
-        let handshake = exchange(&address, &upgrade, b"");
+        // Both surfaces answer a rejection for the subscriber limit, so the
+        // probe must reach the handler: an admission refusal is retried.
+        let handshake = exchange_admitted(&mut sandbox, &address, &upgrade, b"");
         expect_status(
             &mut sandbox,
             "max_subscribers_per_plugin",
@@ -7516,7 +7662,8 @@ fn run_min_config_phase(phase: &str, streams: bool) {
             &[429],
             &handshake,
         );
-        let events = exchange(
+        let events = exchange_admitted(
+            &mut sandbox,
             &address,
             &request_head(
                 &address,
@@ -7956,8 +8103,17 @@ fn a_stuck_supervisor_answers_504_and_the_worker_recovers() {
 
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
-    let started = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
-    assert_eq!(started.status, 200, "{}", started.body);
+    // Setup, not subject: the test runs with the deliberately tiny
+    // `control_timeout_secs = 1`, and a loaded host can push a normal control
+    // round trip past it. Retry the start (it is idempotent) instead of reading
+    // one 504 as a regression; the 504 assertions below are the subject.
+    wait_until_within(
+        &sandbox,
+        "the demo service never started",
+        Duration::from_secs(10),
+        || request(&address, "POST", "/api/v1/services/demo/start", "", b"").status == 200,
+        || String::new(),
+    );
 
     let stop_address = address.clone();
     let stop = std::thread::spawn(move || {
