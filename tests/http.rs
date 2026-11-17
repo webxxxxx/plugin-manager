@@ -2359,12 +2359,29 @@ fn has_staging(dir: &Path) -> bool {
     false
 }
 
-fn wait_until<F, D>(sandbox: &Sandbox, what: &str, mut ready: F, mut details: D)
+fn wait_until<F, D>(sandbox: &Sandbox, what: &str, ready: F, details: D)
 where
     F: FnMut() -> bool,
     D: FnMut() -> String,
 {
-    for _ in 0..300 {
+    wait_until_within(sandbox, what, Duration::from_secs(3), ready, details)
+}
+
+/// The bounded form for a wait that legitimately outlives the default three
+/// seconds (a lifecycle hook, for example). It keeps the daemon-log tail on
+/// timeout instead of a bare sleep loop.
+fn wait_until_within<F, D>(
+    sandbox: &Sandbox,
+    what: &str,
+    timeout: Duration,
+    mut ready: F,
+    mut details: D,
+) where
+    F: FnMut() -> bool,
+    D: FnMut() -> String,
+{
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
         if ready() {
             return;
         }
@@ -7532,3 +7549,110 @@ fn http_mcp_stream_reports_an_unreachable_channel_as_an_sse_error() {
         let _ = child.wait();
     }
 }
+
+
+/// A stuck supervisor must not pin a blocking worker or an HTTP connection.
+/// Two concurrent management calls hit their control deadline (504, not the
+/// queue-full 503), and the daemon serves requests again once the stop hook
+/// returns. The hook runs on the supervisor loop, so both calls queue behind
+/// the same stall; without a deadline they would occupy both workers for the
+/// whole hook.
+#[test]
+fn a_stuck_supervisor_answers_504_and_the_worker_recovers() {
+    let mut sandbox = Sandbox::new();
+    sandbox.allow_insecure_install_with("control_timeout_secs = 1\n");
+    sandbox.write_core();
+
+    let hook = if cfg!(windows) {
+        sandbox.root.join("slow-stop.cmd")
+    } else {
+        sandbox.root.join("slow-stop.sh")
+    };
+    // The marker makes the test deterministic: it proves the supervisor is
+    // inside the hook before the second request is sent, instead of relying on
+    // a fixed sleep.
+    let entered = sandbox.root.join("hook-entered");
+    #[cfg(windows)]
+    {
+        // Four pings, one per second: roughly three seconds of sleep.
+        fs::write(
+            &hook,
+            format!(
+                "@echo off\r\necho entered>\"{}\"\r\nping -n 4 127.0.0.1 >nul\r\n",
+                entered.display()
+            ),
+        )
+        .expect("stop hook");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch '{}'\nsleep 3\n", entered.display()),
+        )
+        .expect("stop hook");
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("hook mode");
+    }
+    let definition = sandbox.config.join("services.d").join("demo.json");
+    let mut value: Value =
+        serde_json::from_slice(&fs::read(&definition).expect("definition")).expect("json");
+    value["lifecycle"] = json!({
+        "stop": {"path": hook.to_string_lossy(), "args": [], "timeout": 5}
+    });
+    fs::write(&definition, serde_json::to_vec(&value).expect("definition")).expect("write");
+
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let started = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
+    assert_eq!(started.status, 200, "{}", started.body);
+
+    let stop_address = address.clone();
+    let stop = std::thread::spawn(move || {
+        let began = Instant::now();
+        let response = request(&stop_address, "POST", "/api/v1/services/demo/stop", "", b"");
+        (response, began.elapsed())
+    });
+    // Wait until the stop request is inside the hook. The marker appears well
+    // before the hook's own timeout and before either control deadline.
+    wait_until_within(
+        &sandbox,
+        "the stop hook never started",
+        Duration::from_secs(2),
+        || entered.exists(),
+        || String::new(),
+    );
+    let list_address = address.clone();
+    let list = std::thread::spawn(move || {
+        let began = Instant::now();
+        let response = request(&list_address, "GET", "/api/v1/services", "", b"");
+        (response, began.elapsed())
+    });
+
+    let (stop_response, stop_elapsed) = stop.join().expect("stop request");
+    let (list_response, list_elapsed) = list.join().expect("list request");
+    assert_eq!(
+        stop_response.status, 504,
+        "a stuck supervisor is a timeout, not a busy queue: {}",
+        stop_response.body
+    );
+    assert_eq!(list_response.status, 504, "{}", list_response.body);
+    assert_eq!(stop_response.body["error"]["code"], "timeout");
+    assert_eq!(list_response.body["error"]["code"], "timeout");
+    for elapsed in [stop_elapsed, list_elapsed] {
+        assert!(
+            elapsed < Duration::from_millis(2200),
+            "control_timeout_secs must release the worker before the hook returns, took {elapsed:?}"
+        );
+    }
+
+    // Once the hook returns, the workers are free and normal requests resume.
+    wait_until_within(
+        &sandbox,
+        "the daemon did not recover after the stop hook",
+        Duration::from_secs(10),
+        || request(&address, "GET", "/api/v1/services", "", b"").status == 200,
+        || String::new(),
+    );
+}
+

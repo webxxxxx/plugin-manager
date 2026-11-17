@@ -277,6 +277,10 @@ fn default_conf_text(layout: &Layout) -> String {
          # http_idle_timeout_secs = 30 / 60 / 120\n\
          # max_package_bytes = 8388608 / 67108864 / 536870912\n\
          # transfer_timeout_secs = 120 / 120 / 120\n\
+         # control_timeout_secs = 30 (clamped 1..300). A management route's\n\
+         # control round trip returns 504 when the supervisor does not answer\n\
+         # in time; 503 still means only that the blocking queue is full.\n\
+         # Requires a daemon restart.\n\
          # default_timeout = 30000 / 30000 / 30000\n\
          # max_timeout = 300000 / 300000 / 300000\n\
          # ws_max_message_bytes = 1048576 / 1048576 / 1048576\n\
@@ -2798,6 +2802,7 @@ mod tests {
         );
         assert!(text.contains("temp_retention_secs = 7200"), "{text}");
         assert!(text.contains("temp_cleanup_interval_secs = 300"), "{text}");
+        assert!(text.contains("control_timeout_secs = 30"), "{text}");
     }
 
     #[test]
@@ -2847,6 +2852,7 @@ mod tests {
             "max_subscribers_per_plugin",
             "http_idle_timeout_secs",
             "max_package_bytes",
+            "control_timeout_secs",
             "auth_passwd",
         ] {
             assert!(text.contains(key), "example is missing {key}");

@@ -74,6 +74,7 @@ bind = 127.0.0.1:8787
 #   http_idle_timeout_secs 30         60          120
 #   max_package_bytes      8388608    67108864    536870912
 #   transfer_timeout_secs  120        120         120
+#   control_timeout_secs   30         30          30
 #   default_timeout        30000      30000       30000
 #   max_timeout            300000     300000      300000
 #   ws_max_message_bytes   1048576    1048576     1048576
@@ -93,6 +94,12 @@ bind = 127.0.0.1:8787
 # stdio), the server loop and these two workers. Raising the value is an
 # operator choice, not a regression. The pool is Unix-only in this slice;
 # Windows keeps the per-connection fallback. Requires a daemon restart.
+#
+# control_timeout_secs bounds one management route's control-channel round
+# trip. A supervisor that does not answer within it releases the blocking
+# worker and the connection with HTTP 504 timeout; 503 remains only the
+# blocking-queue-full signal. Defaults to 30 and is clamped to 1..300.
+# Requires a daemon restart.
 #
 # On Windows the HTTP listener keeps one thread per admitted connection, so
 # max_connections is also the connection-thread cap; the final Unix
@@ -139,6 +146,7 @@ bind = 127.0.0.1:8787
 # http_idle_timeout_secs = 30
 # max_package_bytes = 8388608
 # transfer_timeout_secs = 120
+# control_timeout_secs = 30
 # Call timeout in milliseconds: default_timeout is the per-call budget,
 # max_timeout is the hard ceiling the kernel clamps to.
 # default_timeout = 30000

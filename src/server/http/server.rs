@@ -770,7 +770,15 @@ impl Server {
                     if cancel.is_cancelled() {
                         return;
                     }
-                    face.handle(face_request, done);
+                    // Stamp the budget when the job actually starts, not when
+                    // it was queued: time spent behind another job is not part
+                    // of this route's control round trip.
+                    let request = face_request.with_control_budget(
+                        Instant::now(),
+                        crate::limits::current().control_timeout,
+                        Some(cancel),
+                    );
+                    face.handle(request, done);
                 };
                 match self.blocking.try_submit(connection.id, job) {
                     Ok(()) => {

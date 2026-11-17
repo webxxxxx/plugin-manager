@@ -6,7 +6,7 @@ use std::sync::mpsc::Sender;
 #[cfg(not(unix))]
 use std::sync::mpsc::SyncSender;
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(not(unix))]
 pub use imp::Listener;
@@ -301,29 +301,154 @@ where
 {
     let token = read_token(config)?;
     let mut stream = acquire(config)?;
-    let line = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": params,
-        "auth": token,
-    })
-    .to_string();
+    let line = request_line(method, params, token);
     ipc::write_frame_limit(&mut stream, &line, ipc::LOCAL_FRAME_MAX)?;
 
     let mut reader = BufReader::new(stream);
     loop {
         let line = ipc::read_frame_limit(&mut reader, ipc::LOCAL_FRAME_MAX)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "empty response frame"))?;
-        let value: serde_json::Value = serde_json::from_str(&line)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if value.get("method").is_some() && value.get("id").is_none() {
-            on_notification(&line);
-            continue;
+        match response_from_line(&line)? {
+            Some(response) => {
+                release(config, reader.into_inner());
+                return Ok(response);
+            }
+            None => on_notification(&line),
         }
-        let response = serde_json::from_value(value)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        release(config, reader.into_inner());
+    }
+}
+
+/// The one control-channel request envelope. The local channel always uses id 1
+/// and carries the management token; only the read side varies by budget.
+fn request_line(method: &str, params: serde_json::Value, token: String) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+        "auth": token,
+    })
+    .to_string()
+}
+
+/// Parse one response frame. `None` is an interim notification (no id) that the
+/// caller may forward or ignore; `Some` is the final response.
+fn response_from_line(line: &str) -> io::Result<Option<crate::rpc::Response>> {
+    let value: serde_json::Value = serde_json::from_str(line)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if value.get("method").is_some() && value.get("id").is_none() {
+        return Ok(None);
+    }
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// How long one control read waits before the caller re-checks its deadline
+/// and the disconnect token. It bounds both the 504 deadline and disconnect
+/// cancellation to one poll period.
+const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// A control-stream read that never blocks. The readiness wait belongs to the
+/// deadline loop; without this adapter `BufReader::fill_buf` does a second
+/// blocking read after a partial frame and ignores both the deadline and a
+/// disconnect. A zero-timeout poll (Unix) or peek (Windows) turns that read
+/// into `WouldBlock` while `FrameReader` keeps the bytes it already has.
+struct PollReader {
+    stream: Stream,
+}
+
+impl PollReader {
+    fn wait_readable(&self, timeout: Duration) -> io::Result<bool> {
+        self.stream.wait_readable(timeout)
+    }
+
+    fn into_inner(self) -> Stream {
+        self.stream
+    }
+}
+
+impl std::io::Read for PollReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.stream.wait_readable(Duration::ZERO)? {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "no control data ready",
+            ));
+        }
+        std::io::Read::read(&mut self.stream, buf)
+    }
+}
+
+/// One request/response round trip with a deadline and a cancellation check.
+///
+/// The blocking `request` stays the CLI path: a long-running service action is
+/// not a hung supervisor, and the CLI connection pool keeps its semantics. A
+/// server-side management route calls this instead, so a supervisor that never
+/// answers releases the blocking worker and the connection at `deadline`.
+///
+/// `cancelled` is checked once per short poll. A timed-out or cancelled socket
+/// is dropped, never returned to the pool: a late response would otherwise be
+/// mistaken for the next request's reply.
+pub fn request_within<C: Fn() -> bool>(
+    config: &Path,
+    method: &str,
+    params: serde_json::Value,
+    deadline: Instant,
+    cancelled: C,
+) -> io::Result<crate::rpc::Response> {
+    let token = read_token(config)?;
+    let mut stream = acquire(config)?;
+    let line = request_line(method, params, token);
+    ipc::write_frame_limit(&mut stream, &line, ipc::LOCAL_FRAME_MAX)?;
+
+    let mut reader = ipc::FrameReader::new(BufReader::new(PollReader { stream }));
+    loop {
+        if cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "control request cancelled",
+            ));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "control request timed out",
+            ));
+        }
+        if !reader.has_buffered() {
+            let wait = deadline.saturating_duration_since(now).min(CONTROL_POLL_INTERVAL);
+            if !reader.get_ref().get_ref().wait_readable(wait)? {
+                continue;
+            }
+        }
+        let line = match reader.read_frame_limit(ipc::LOCAL_FRAME_MAX) {
+            Ok(Some(line)) => line,
+            Ok(None) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "empty response frame",
+                ))
+            }
+            Err(ipc::FrameError::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let Some(response) = response_from_line(&line)? else {
+            // The management routes do not consume interim notifications; they
+            // still share the frame parser so a protocol change cannot drift.
+            continue;
+        };
+        release(config, reader.into_inner().into_inner().into_inner());
         return Ok(response);
     }
 }
@@ -343,8 +468,10 @@ pub fn remove_socket(config: &Path) {
 mod imp {
     use std::fs;
     use std::io::{self, Read, Write};
+    use std::os::unix::io::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::Path;
+    use std::time::Duration;
 
     #[allow(dead_code)]
     pub struct Listener(UnixListener);
@@ -372,6 +499,31 @@ mod imp {
 
         pub fn incoming(&self) -> impl Iterator<Item = io::Result<Stream>> + '_ {
             self.0.incoming().map(|stream| stream.map(Stream))
+        }
+    }
+
+    impl Stream {
+        /// Wait until the socket is readable (or the timeout expires).
+        ///
+        /// The pooled stream keeps its blocking mode: poll decides when a read
+        /// is safe, so a deadline never has to mutate the socket that the next
+        /// request will reuse.
+        pub fn wait_readable(&self, timeout: Duration) -> io::Result<bool> {
+            let mut descriptor = libc::pollfd {
+                fd: self.0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let millis = timeout.as_millis().min(i32::MAX as u128) as i32;
+            let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    return Ok(false);
+                }
+                return Err(error);
+            }
+            Ok(ready > 0)
         }
     }
 
@@ -403,12 +555,14 @@ mod imp {
     use std::hash::{Hash, Hasher};
     use std::io::{self, Read, Write};
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::{FromRawHandle, RawHandle};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
     use std::path::Path;
     use std::time::Duration;
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::CreateFileW;
-    use windows_sys::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, WaitNamedPipeW};
+    use windows_sys::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, PeekNamedPipe, WaitNamedPipeW,
+    };
 
     const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
     const PIPE_TYPE_BYTE: u32 = 0x0000_0000;
@@ -419,8 +573,10 @@ mod imp {
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const OPEN_EXISTING: u32 = 3;
     const ERROR_FILE_NOT_FOUND: u32 = 2;
+    const ERROR_BROKEN_PIPE: u32 = 109;
     const ERROR_PIPE_BUSY: u32 = 231;
     const ERROR_PIPE_CONNECTED: u32 = 535;
+    const ERROR_PIPE_NOT_CONNECTED: u32 = 233;
 
     pub struct Listener {
         name: Vec<u16>,
@@ -502,6 +658,42 @@ mod imp {
         }
     }
 
+    impl Stream {
+        /// Wait until the pipe has bytes (or the timeout expires).
+        ///
+        /// A byte-mode pipe opened without `FILE_FLAG_OVERLAPPED` has no read
+        /// timeout: a plain `ReadFile` would block until the supervisor
+        /// answers. Peeking first makes the blocking read safe: it only runs
+        /// when at least one byte is already available, so the loop can check
+        /// its deadline and the disconnect token between peeks.
+        pub fn wait_readable(&self, timeout: Duration) -> io::Result<bool> {
+            let mut available = 0u32;
+            let peeked = unsafe {
+                PeekNamedPipe(
+                    self.0.as_raw_handle() as _,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            };
+            if peeked != 0 {
+                if available > 0 {
+                    return Ok(true);
+                }
+                std::thread::sleep(timeout);
+                return Ok(false);
+            }
+            let error = unsafe { GetLastError() };
+            if error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED {
+                // Report readable so the following read observes EOF.
+                return Ok(true);
+            }
+            Err(io::Error::from_raw_os_error(error as i32))
+        }
+    }
+
     impl Read for Stream {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             self.0.read(buf)
@@ -557,5 +749,194 @@ mod imp {
 
     fn wide(value: &str) -> Vec<u16> {
         OsStr::new(value).encode_wide().chain(Some(0)).collect()
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::imp::Listener;
+    use super::*;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn config_dir(tag: &str) -> PathBuf {
+        let directory = crate::test_support::temp_dir().join(format!(
+            "svcd-channel-{}-{}-{}",
+            tag,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("config dir");
+        fs::write(directory.join("svcd.token"), "test-token\n").expect("token");
+        directory
+    }
+
+    fn listener(config: &Path) -> Listener {
+        Listener::bind(config).expect("listener")
+    }
+
+    /// A supervisor that never answers must not hold the worker: the request
+    /// returns TimedOut at the deadline and the socket is not pooled.
+    #[test]
+    fn a_silent_control_channel_hits_the_deadline() {
+        let config = config_dir("silent");
+        let listener = listener(&config);
+        let server = std::thread::spawn(move || {
+            let _stream = listener
+                .incoming()
+                .next()
+                .expect("accept")
+                .expect("stream");
+            std::thread::sleep(Duration::from_secs(2));
+        });
+
+        let started = Instant::now();
+        let error = request_within(
+            &config,
+            "svcd.ping",
+            serde_json::json!({}),
+            Instant::now() + Duration::from_millis(150),
+            || false,
+        )
+        .expect_err("the silent supervisor must time out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the deadline must bound the round trip, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            pool()
+                .lock()
+                .expect("pool")
+                .get(&config)
+                .map(Vec::is_empty)
+                .unwrap_or(true),
+            "a timed-out connection must not be reused"
+        );
+        server.join().expect("server");
+        let _ = fs::remove_dir_all(&config);
+    }
+
+    /// A flipped disconnect token cancels within one poll period, well before
+    /// the deadline.
+    #[test]
+    fn a_disconnect_cancels_within_one_poll_period() {
+        let config = config_dir("cancel");
+        let listener = listener(&config);
+        let server = std::thread::spawn(move || {
+            let _stream = listener
+                .incoming()
+                .next()
+                .expect("accept")
+                .expect("stream");
+            std::thread::sleep(Duration::from_secs(2));
+        });
+
+        let started = Instant::now();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flip = cancelled.clone();
+        let flipper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            flip.store(true, Ordering::Release);
+        });
+        let error = request_within(
+            &config,
+            "svcd.ping",
+            serde_json::json!({}),
+            Instant::now() + Duration::from_secs(5),
+            || cancelled.load(Ordering::Acquire),
+        )
+        .expect_err("a cancelled request must not wait for the deadline");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cancel must arrive in one poll period, took {:?}",
+            started.elapsed()
+        );
+        flipper.join().expect("flipper");
+        server.join().expect("server");
+        let _ = fs::remove_dir_all(&config);
+    }
+
+    /// A response that arrives in two chunks must survive the poll timeout:
+    /// the first chunk is kept, not discarded as a desynchronized stream.
+    #[test]
+    fn a_partial_response_survives_the_poll_timeout() {
+        let config = config_dir("partial");
+        let listener = listener(&config);
+        let server = std::thread::spawn(move || {
+            let mut stream = listener
+                .incoming()
+                .next()
+                .expect("accept")
+                .expect("stream");
+            stream
+                .write_all(br#"{"jsonrpc":"2.0","id":1,"#)
+                .expect("first chunk");
+            stream.flush().expect("flush");
+            std::thread::sleep(Duration::from_millis(100));
+            stream
+                .write_all(br#""result":{"ok":true}}"#)
+                .expect("second chunk");
+            stream.write_all(b"\n").expect("newline");
+            stream.flush().expect("flush");
+        });
+
+        let response = request_within(
+            &config,
+            "svcd.ping",
+            serde_json::json!({}),
+            Instant::now() + Duration::from_secs(2),
+            || false,
+        )
+        .expect("the resumed frame is a response");
+        assert_eq!(response.result, Some(serde_json::json!({ "ok": true })));
+        server.join().expect("server");
+        let _ = fs::remove_dir_all(&config);
+    }
+
+    /// A half frame followed by silence must not park the worker in a blocking
+    /// read: the short read timeout has to keep the deadline and the cancel
+    /// token observable even with partial bytes already read.
+    #[test]
+    fn a_stalled_partial_frame_still_hits_the_deadline() {
+        let config = config_dir("stalled-partial");
+        let listener = listener(&config);
+        let server = std::thread::spawn(move || {
+            let mut stream = listener
+                .incoming()
+                .next()
+                .expect("accept")
+                .expect("stream");
+            stream
+                .write_all(br#"{"jsonrpc":"2.0","id":1,"#)
+                .expect("partial frame");
+            stream.flush().expect("flush");
+            std::thread::sleep(Duration::from_secs(2));
+        });
+
+        let started = Instant::now();
+        let error = request_within(
+            &config,
+            "svcd.ping",
+            serde_json::json!({}),
+            Instant::now() + Duration::from_millis(150),
+            || false,
+        )
+        .expect_err("a partial frame cannot extend the deadline");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the deadline must fire with a partial frame, took {:?}",
+            started.elapsed()
+        );
+        server.join().expect("server");
+        let _ = fs::remove_dir_all(&config);
     }
 }

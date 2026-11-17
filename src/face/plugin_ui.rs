@@ -148,6 +148,8 @@ impl PluginUiFace {
             peer,
             principal,
             body: Vec::new(),
+            deadline: None,
+            cancel: None,
         };
         let face = PluginUiFace::with_streams(lan.clone(), config, raw_hub);
         dispatch_inline(&face, &route, request)

@@ -55,7 +55,7 @@ pub type PoolJob = Box<dyn FnOnce(CancelToken) + Send + 'static>;
 
 /// A cancellation token for one job. A disconnect flips it; the job checks it
 /// at natural boundaries instead of being killed from another thread.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CancelToken {
     cancelled: Arc<AtomicBool>,
 }

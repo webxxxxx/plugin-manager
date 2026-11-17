@@ -155,6 +155,8 @@ MCP SSE 的 handler 由 `cargo test --bin svcd server::mcp::progress` 覆盖：S
 
 #125 删除 legacy bridge 后没有独立的 HTTP worker 队列：所有不能在 loop 上跑的路由（MCP、插件 UI rpc、blob 会话元数据）都提交给同一个阻塞池，池队列上限 64，满时 503 `busy` + `Retry-After: 1`。`server::http::pool` 的单测覆盖满队列与每连接一个 job；`tests/http.rs` 的并发/限流用例覆盖实际回包。
 
+#131 给 Blocking 控制往返加 deadline：server 在派发 job 时写 `Request.deadline` / `cancel`，`channel::request_within` 每 20 ms 轮询 deadline 与池 token 再决定是否继续读；`ipc::FrameReader` 在 `WouldBlock` 之间保留半帧，Unix 用 `poll`、Windows 用 `PeekNamedPipe` 等到可读。单测是 `ipc::tests::a_would_block_keeps_the_partial_frame_for_the_next_read`、`channel::tests::a_silent_socket_hits_the_control_deadline` / `a_disconnect_cancels_within_one_poll_period` / `a_partial_response_survives_the_poll_timeout`（Windows 有同名的 pipe 用例）。集成 `a_stuck_supervisor_answers_504_and_the_worker_recovers` 用 stop hook 卡住 supervisor（`control_timeout_secs = 1`），断言两条并发管理请求都在 hook 返回前得到 504 `timeout`（不是 503），hook 结束后请求恢复 200；`limits` 的 floor/ceiling 测试覆盖 `control_timeout_secs` 的 1..300 clamp。
+
 #122 的插件 UI 实时流由 `cargo test --bin svcd face::plugin_streams` 的无 socket 单测覆盖：SSE 分片/重放/心跳（含「部分事件在途时 tick 不得覆盖 pending」）、WS 握手/分片/控制帧/1009/1013 与响应先于队列下一条调用、raw 二进制/分片/关闭码。真实 TCP 回归是 `tests/http.rs` 的 `plugin_ui_*` 用例；`plugin_ui_realtime_streams_consume_the_long_lived_stream_cap` 断言 `max_streams = 1` 时第二条 SSE/WS 得到 503 + `Retry-After: 1`、静态资源仍豁免、释放后可重连。页面 WS 的 `tools/call` 走阻塞池（有界 64）而不是 legacy worker 队列；`ws_inflight_requests` / `ws_inflight_bytes` 约束已排队但未提交的调用。
 
 ## 7. CI 落点

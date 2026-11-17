@@ -615,6 +615,8 @@ mod tests {
             peer: "127.0.0.1".parse().expect("peer"),
             principal: AuthKind::None,
             body: Vec::new(),
+            deadline: None,
+            cancel: None,
         }
     }
 
