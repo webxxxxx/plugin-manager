@@ -1560,7 +1560,7 @@ mod tests {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
 
     fn root() -> &'static Path {
-        ROOT.get_or_init(|| {
+        let path = ROOT.get_or_init(|| {
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
@@ -1570,11 +1570,15 @@ mod tests {
                 std::process::id(),
                 nanos
             ));
-            std::env::set_var("SVCD_DATA_DIR", path.join("data"));
-            std::env::set_var("SVCD_CONFIG_DIR", path.join("config"));
             std::fs::create_dir_all(path.join("data/plugins")).expect("data");
             path
-        })
+        });
+        // Other unit tests (e.g. blob) also point the process-wide data dir at
+        // their own temp tree. Re-assert ours before every use so test order
+        // cannot make `paths::plugins_dir()` disagree with `make_plugin`.
+        std::env::set_var("SVCD_DATA_DIR", path.join("data"));
+        std::env::set_var("SVCD_CONFIG_DIR", path.join("config"));
+        path
     }
 
     fn make_plugin(id: &str, config: &str, check: bool) {
