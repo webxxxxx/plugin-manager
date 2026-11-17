@@ -1,0 +1,20 @@
+#!/bin/sh
+# Repository-local guardrails. Install with: node tools/install-hooks.mjs
+# - No direct commits on main (merge commits and SVCD_ALLOW_MAIN_COMMIT=1 are allowed).
+# - Rust-file commits run an incremental cargo check, which catches a truncated
+#   file before it reaches a commit.
+set -eu
+
+gitdir=$(git rev-parse --absolute-git-dir)
+branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || echo detached)
+if [ "$branch" = "main" ] && [ ! -f "$gitdir/MERGE_HEAD" ] && [ "${SVCD_ALLOW_MAIN_COMMIT:-0}" != "1" ]; then
+    echo "pre-commit: direct commits on main are disabled." >&2
+    echo "  Work in a ticket worktree/branch, or set SVCD_ALLOW_MAIN_COMMIT=1 deliberately." >&2
+    echo "  See docs/agents/parallel-work.md." >&2
+    exit 1
+fi
+
+if git diff --cached --name-only --diff-filter=ACM | grep -q '\.rs$'; then
+    echo "pre-commit: cargo check"
+    cargo check --quiet
+fi

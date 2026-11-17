@@ -45,6 +45,24 @@ jobs:
           node tools/gen_sample_key.mjs
           python3 tools/spk_smoke.py --binary target/debug/svcd
 
+  guardrails:
+    name: guardrails / closed tickets merged
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch main
+        run: git fetch --no-tags origin main:refs/remotes/origin/main
+      - name: Every closed #112 ticket has a commit on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node tools/closed-tickets-merged.mjs --map 112 --base origin/main
+
   mem-levels:
     name: mem-level / ${{ matrix.level }}
     runs-on: ubuntu-latest
