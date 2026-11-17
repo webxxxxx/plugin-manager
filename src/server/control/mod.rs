@@ -28,14 +28,14 @@ use self::listener::{ControlServer, Source};
 /// Start the server loop for the minimal (no HTTP) build: control channel only.
 #[cfg_attr(feature = "http", allow(dead_code))]
 pub fn spawn_control_only(control: crate::channel::ControlBinding) -> std::io::Result<LoopHandle> {
-    let (listener, tx, wake) = control.into_parts();
+    let (user, admin, tx, wake) = control.into_parts();
     let (notify_rx, notify_tx) = UnixStream::pair()?;
     notify_rx.set_nonblocking(true)?;
     notify_tx.set_nonblocking(true)?;
     let notify_tx = Arc::new(notify_tx);
     let handle = LoopHandle::new(notify_tx.clone());
     let stop = handle.stop_flag();
-    let control = ControlServer::new(listener, tx, wake, notify_tx)?;
+    let control = ControlServer::new(user, admin, tx, wake, notify_tx)?;
     let join = thread::Builder::new()
         .name("svcd-server-loop".into())
         .stack_size(crate::threads::transfer_stack())

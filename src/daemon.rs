@@ -856,6 +856,13 @@ impl Daemon {
                 return;
             }
         };
+        if incoming.endpoint == channel::Endpoint::User
+            && channel::Endpoint::for_method(&request.method) == channel::Endpoint::Admin
+        {
+            let response = rpc::err(request.id, -32000, "unauthorized");
+            let _ = incoming.reply.send(rpc::to_line(&response));
+            return;
+        }
         match request.method.as_str() {
             "registry.call" | "tools/call" => self.handle_tool_call(request, incoming.reply),
             _ => {
@@ -2660,10 +2667,83 @@ while ($null -ne ($line = $reader.ReadLine())) {
         .expect("request");
         let (sender, receiver) = mpsc::channel();
         daemon.handle(channel::PendingCall {
+            endpoint: channel::Endpoint::Admin,
             line,
             reply: crate::channel::Reply::plain(sender),
         });
         receiver
+    }
+
+    /// Dispatch one request as if it arrived on `endpoint`.
+    fn send_on(
+        daemon: &mut Daemon,
+        endpoint: channel::Endpoint,
+        method: &str,
+        params: Value,
+    ) -> serde_json::Value {
+        let line = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        }))
+        .expect("request");
+        let (sender, receiver) = mpsc::channel();
+        daemon.handle(channel::PendingCall {
+            endpoint,
+            line,
+            reply: crate::channel::Reply::plain(sender),
+        });
+        let line = receiver.recv().expect("reply");
+        serde_json::from_str(&line).expect("response")
+    }
+
+    /// §6: the read endpoint may drive lifecycle, never a write method.
+    #[test]
+    fn the_read_endpoint_cannot_run_a_write_method() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+
+        let refused = send_on(
+            &mut daemon,
+            channel::Endpoint::User,
+            "plugin.uninstall",
+            json!({ "id": "nope" }),
+        );
+        assert_eq!(
+            refused["error"]["message"], "unauthorized",
+            "the read endpoint must not reach a write method: {refused}"
+        );
+
+        let allowed = send_on(
+            &mut daemon,
+            channel::Endpoint::User,
+            "svc.list",
+            json!({}),
+        );
+        assert!(
+            allowed.get("error").is_none(),
+            "the read endpoint must still list services: {allowed}"
+        );
+    }
+
+    /// The same write method is not refused on the admin endpoint; it fails on
+    /// the missing plugin instead of on the tier.
+    #[test]
+    fn the_admin_endpoint_reaches_a_write_method() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+
+        let response = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "plugin.uninstall",
+            json!({ "id": "nope" }),
+        );
+        assert_ne!(
+            response["error"]["message"], "unauthorized",
+            "the admin endpoint must get past the tier check: {response}"
+        );
     }
 
     fn next_line(daemon: &mut Daemon, receiver: &Receiver<String>) -> Value {

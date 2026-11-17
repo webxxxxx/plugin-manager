@@ -10,7 +10,7 @@ use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::channel::{ControlChannel, ControlListener, ControlStream, PendingCall};
+use crate::channel::{ControlChannel, ControlListener, ControlStream, Endpoint, PendingCall};
 use crate::wake::Wake;
 
 pub(crate) struct Platform;
@@ -22,17 +22,25 @@ pub(crate) struct Stream(UnixStream);
 /// The bound server half. Unix hands the listener to the server loop; nothing
 /// is accepted off-thread.
 pub(crate) struct ControlBinding {
-    listener: Listener,
+    user: Listener,
+    admin: Listener,
     pending: SyncSender<PendingCall>,
     wake: Arc<Wake>,
 }
 
 impl ControlBinding {
-    /// Split the server into the listener and the plumbing its loop owns.
+    /// Split the server into both listeners and the plumbing its loop owns.
     /// Called by `server::control` (Unix-only), so the raw socket type does not
     /// leak into `daemon.rs`.
-    pub(crate) fn into_parts(self) -> (UnixListener, SyncSender<PendingCall>, Arc<Wake>) {
-        (self.listener.0, self.pending, self.wake)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        UnixListener,
+        UnixListener,
+        SyncSender<PendingCall>,
+        Arc<Wake>,
+    ) {
+        (self.user.0, self.admin.0, self.pending, self.wake)
     }
 }
 
@@ -52,8 +60,8 @@ impl Notify {
 }
 
 impl Listener {
-    pub(crate) fn bind(config: &Path) -> io::Result<Self> {
-        let path = config.join("svcd.sock");
+    pub(crate) fn bind(config: &Path, endpoint: Endpoint) -> io::Result<Self> {
+        let path = config.join(endpoint.socket_name());
         if path.exists() {
             if UnixStream::connect(&path).is_ok() {
                 return Err(io::Error::new(
@@ -64,10 +72,28 @@ impl Listener {
             let _ = fs::remove_file(&path);
         }
         let listener = UnixListener::bind(&path)?;
-        // The svcd group may talk to the socket; local management is
-        // group/root only.
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o660))?;
+        // The socket's mode is the authorization: the `svcd` group may drive the
+        // read endpoint, only root may open the admin one.
+        fs::set_permissions(&path, fs::Permissions::from_mode(endpoint.mode()))?;
         Ok(Listener(listener))
+    }
+}
+
+impl Endpoint {
+    fn socket_name(self) -> &'static str {
+        match self {
+            Endpoint::User => "svcd.sock",
+            Endpoint::Admin => "svcd-admin.sock",
+        }
+    }
+
+    /// 0660 lets the `svcd` group drive lifecycle; the admin endpoint stays
+    /// root-only at 0600.
+    fn mode(self) -> u32 {
+        match self {
+            Endpoint::User => 0o660,
+            Endpoint::Admin => 0o600,
+        }
     }
 }
 
@@ -125,28 +151,31 @@ impl ControlChannel for Platform {
     type Listener = Listener;
     type Server = ControlBinding;
 
-    fn bind(config: &Path) -> io::Result<Self::Listener> {
-        Listener::bind(config)
+    fn bind(config: &Path, endpoint: Endpoint) -> io::Result<Self::Listener> {
+        Listener::bind(config, endpoint)
     }
 
     fn into_server(
-        listener: Self::Listener,
+        user: Self::Listener,
+        admin: Self::Listener,
         pending: SyncSender<PendingCall>,
         wake: Arc<Wake>,
     ) -> io::Result<Self::Server> {
         Ok(ControlBinding {
-            listener,
+            user,
+            admin,
             pending,
             wake,
         })
     }
 
-    fn connect(config: &Path) -> io::Result<Self::Stream> {
-        UnixStream::connect(config.join("svcd.sock")).map(Stream)
+    fn connect(config: &Path, endpoint: Endpoint) -> io::Result<Self::Stream> {
+        UnixStream::connect(config.join(endpoint.socket_name())).map(Stream)
     }
 
     fn remove_socket(config: &Path) {
-        let _ = fs::remove_file(config.join("svcd.sock"));
+        let _ = fs::remove_file(config.join(Endpoint::User.socket_name()));
+        let _ = fs::remove_file(config.join(Endpoint::Admin.socket_name()));
     }
 }
 
@@ -169,16 +198,20 @@ mod tests {
         directory
     }
 
-    /// The control socket stays group-accessible: the `svc` CLI runs as a
-    /// group member and the socket's mode is the authorization.
+    /// The socket mode is the authorization: the group drives the read
+    /// endpoint, only root opens the admin one.
     #[test]
-    fn the_socket_is_group_accessible() {
+    fn each_endpoint_gets_its_own_mode() {
         let config = config_dir("socket");
-        let listener = Platform::bind(&config).expect("bind");
-        let socket = config.join("svcd.sock");
-        let mode = fs::metadata(&socket).expect("metadata").permissions().mode() & 0o777;
-        assert_eq!(mode, 0o660, "socket mode: {mode:o}");
-        drop(listener);
+        let user = Platform::bind(&config, Endpoint::User).expect("bind user");
+        let admin = Platform::bind(&config, Endpoint::Admin).expect("bind admin");
+        for (name, expected) in [("svcd.sock", 0o660), ("svcd-admin.sock", 0o600)] {
+            let path = config.join(name);
+            let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+            assert_eq!(mode, expected, "{name} mode: {mode:o}");
+        }
+        drop(user);
+        drop(admin);
         let _ = fs::remove_dir_all(&config);
     }
 }

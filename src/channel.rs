@@ -47,6 +47,8 @@ pub const PENDING_QUEUE_LIMIT: usize = 256;
 pub struct PendingCall {
     pub line: String,
     pub reply: Reply,
+    /// The endpoint the connection came in on; the daemon tiers on it.
+    pub endpoint: Endpoint,
 }
 
 /// A response handle for one management request. The daemon sends the serialized
@@ -97,19 +99,21 @@ pub(crate) trait ControlChannel {
     /// What `serve` returns to the composition root.
     type Server;
 
-    /// Bind the server endpoint.
-    fn bind(config: &Path) -> io::Result<Self::Listener>;
+    /// Bind one of the two server endpoints.
+    fn bind(config: &Path, endpoint: Endpoint) -> io::Result<Self::Listener>;
 
-    /// Turn a bound endpoint into the server the composition root will run:
-    /// the carrier itself on a poll host, a started accept thread otherwise.
+    /// Turn both bound endpoints into the server the composition root will run:
+    /// the carrier itself on a poll host, one started accept thread per
+    /// endpoint otherwise.
     fn into_server(
-        listener: Self::Listener,
+        user: Self::Listener,
+        admin: Self::Listener,
         pending: SyncSender<PendingCall>,
         wake: Arc<Wake>,
     ) -> io::Result<Self::Server>;
 
-    /// Connect a client to the bound endpoint.
-    fn connect(config: &Path) -> io::Result<Self::Stream>;
+    /// Connect a client to the endpoint its method belongs to.
+    fn connect(config: &Path, endpoint: Endpoint) -> io::Result<Self::Stream>;
 
     /// Remove the endpoint's filesystem entry, if it has one.
     fn remove_socket(config: &Path);
@@ -128,6 +132,45 @@ pub(crate) trait ControlStream: Read + Write + Send + 'static {
     fn wait_readable(&self, timeout: Duration) -> io::Result<bool>;
 }
 
+/// Which control endpoint a request or connection belongs to.
+///
+/// The split is enforced twice: the OS checks the endpoint's ACL when a client
+/// connects, and the daemon checks the tier again so a connection can never
+/// carry a method its endpoint was not granted (§6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Endpoint {
+    /// Read + lifecycle: the `svcd` socket/pipe, reachable by the `svcd` group.
+    User,
+    /// Write: the `svcd-admin` socket/pipe, reachable by root/Administrators.
+    Admin,
+}
+
+impl Endpoint {
+    /// §6: the group tier may read and drive lifecycle; every other method is
+    /// admin. Unknown methods fail closed onto the admin endpoint.
+    pub fn for_method(method: &str) -> Endpoint {
+        match method {
+            "svcd.ping"
+            | "svcd.compat"
+            | "svcd.reload"
+            | "registry.tools"
+            | "tools/list"
+            | "registry.version"
+            | "registry.call"
+            | "tools/call"
+            | "svc.list"
+            | "services"
+            | "svc.status"
+            | "svc.start"
+            | "svc.stop"
+            | "svc.restart"
+            | "svc.reload"
+            | "auth.status" => Endpoint::User,
+            _ => Endpoint::Admin,
+        }
+    }
+}
+
 /// Bind and start the local control channel. Unix hands the listener to the
 /// server loop; Windows keeps the thread-per-connection fallback. This is the
 /// one call the daemon makes on every host.
@@ -136,36 +179,45 @@ pub fn bind_server(
     pending: SyncSender<PendingCall>,
     wake: Arc<Wake>,
 ) -> io::Result<ControlBinding> {
-    Platform::into_server(Platform::bind(config)?, pending, wake)
+    let user = Platform::bind(config, Endpoint::User)?;
+    let admin = match Platform::bind(config, Endpoint::Admin) {
+        Ok(admin) => admin,
+        Err(error) => {
+            Platform::remove_socket(config);
+            return Err(error);
+        }
+    };
+    Platform::into_server(user, admin, pending, wake)
 }
 
 const POOL_MAX: usize = 8;
 
-fn pool() -> &'static Mutex<HashMap<PathBuf, Vec<Stream>>> {
-    static POOL: OnceLock<Mutex<HashMap<PathBuf, Vec<Stream>>>> = OnceLock::new();
+fn pool() -> &'static Mutex<HashMap<(PathBuf, Endpoint), Vec<Stream>>> {
+    static POOL: OnceLock<Mutex<HashMap<(PathBuf, Endpoint), Vec<Stream>>>> = OnceLock::new();
     POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn acquire(config: &Path) -> io::Result<Stream> {
+fn acquire(config: &Path, endpoint: Endpoint) -> io::Result<Stream> {
+    let key = (config.to_path_buf(), endpoint);
     if let Ok(mut pool) = pool().lock() {
-        if let Some(stream) = pool.get_mut(config).and_then(Vec::pop) {
+        if let Some(stream) = pool.get_mut(&key).and_then(Vec::pop) {
             return Ok(stream);
         }
     }
-    connect(config)
+    connect(config, endpoint)
 }
 
-fn release(config: &Path, stream: Stream) {
+fn release(config: &Path, endpoint: Endpoint, stream: Stream) {
     if let Ok(mut pool) = pool().lock() {
-        let connections = pool.entry(config.to_path_buf()).or_default();
+        let connections = pool.entry((config.to_path_buf(), endpoint)).or_default();
         if connections.len() < POOL_MAX {
             connections.push(stream);
         }
     }
 }
 
-pub fn connect(config: &Path) -> io::Result<Stream> {
-    Platform::connect(config)
+pub fn connect(config: &Path, endpoint: Endpoint) -> io::Result<Stream> {
+    Platform::connect(config, endpoint)
 }
 
 /// One request/response round trip on the local management channel.
@@ -201,7 +253,8 @@ where
     F: FnMut(&str),
     C: Fn() -> bool,
 {
-    let mut stream = acquire(config)?;
+    let endpoint = Endpoint::for_method(method);
+    let mut stream = acquire(config, endpoint)?;
     let line = request_line(method, params);
     ipc::write_frame_limit(&mut stream, &line, ipc::LOCAL_FRAME_MAX)?;
 
@@ -209,7 +262,7 @@ where
     let mut reader = ipc::FrameReader::new(BufReader::new(PollReader { stream, polling }));
     let bound = idle.map(ReadBound::Idle).unwrap_or(ReadBound::Unbounded);
     let response = read_response(&mut reader, bound, cancelled, on_notification)?;
-    release(config, reader.into_inner().into_inner().into_inner());
+    release(config, endpoint, reader.into_inner().into_inner().into_inner());
     Ok(response)
 }
 
@@ -399,7 +452,8 @@ pub fn request_within<C: Fn() -> bool>(
     deadline: Instant,
     cancelled: C,
 ) -> io::Result<crate::rpc::Response> {
-    let mut stream = acquire(config)?;
+    let endpoint = Endpoint::for_method(method);
+    let mut stream = acquire(config, endpoint)?;
     let line = request_line(method, params);
     ipc::write_frame_limit(&mut stream, &line, ipc::LOCAL_FRAME_MAX)?;
 
@@ -413,7 +467,7 @@ pub fn request_within<C: Fn() -> bool>(
         cancelled,
         |_| {},
     )?;
-    release(config, reader.into_inner().into_inner().into_inner());
+    release(config, endpoint, reader.into_inner().into_inner().into_inner());
     Ok(response)
 }
 
@@ -449,7 +503,7 @@ mod tests {
     }
 
     fn listener(config: &Path) -> Listener {
-        Platform::bind(config).expect("listener")
+        Platform::bind(config, Endpoint::User).expect("listener")
     }
 
     /// A supervisor that accepts one connection and never answers.
@@ -465,6 +519,35 @@ mod tests {
     fn the_host_control_channel_implements_the_seam() {
         fn assert_channel<C: ControlChannel>() {}
         assert_channel::<Platform>();
+    }
+
+    /// §6: the group tier reads and drives lifecycle; every other method is
+    /// admin, and unknown methods fail closed.
+    #[test]
+    fn methods_are_tiered_by_section_six() {
+        for method in [
+            "svcd.ping",
+            "svc.list",
+            "svc.status",
+            "svc.start",
+            "svc.stop",
+            "svc.restart",
+            "registry.tools",
+            "registry.call",
+        ] {
+            assert_eq!(Endpoint::for_method(method), Endpoint::User, "{method}");
+        }
+        for method in [
+            "plugin.install",
+            "plugin.uninstall",
+            "svc.enable",
+            "svc.disable",
+            "auth.passwd",
+            "svcd.shutdown",
+            "an.unknown.method",
+        ] {
+            assert_eq!(Endpoint::for_method(method), Endpoint::Admin, "{method}");
+        }
     }
 
     /// A supervisor that never answers must not hold the worker: the request
@@ -489,13 +572,9 @@ mod tests {
             "the deadline must bound the round trip, took {:?}",
             started.elapsed()
         );
-        assert!(
-            pool()
-                .lock()
-                .expect("pool")
-                .get(&config)
-                .map(Vec::is_empty)
-                .unwrap_or(true),
+        assert_eq!(
+            pooled(&config),
+            0,
             "a timed-out connection must not be reused"
         );
         server.join().expect("server");
@@ -607,9 +686,10 @@ mod tests {
         pool()
             .lock()
             .expect("pool")
-            .get(config)
-            .map(Vec::len)
-            .unwrap_or(0)
+            .iter()
+            .filter(|((path, _), _)| path.as_path() == config)
+            .map(|(_, streams)| streams.len())
+            .sum()
     }
 
     /// A notification split across two writes must be forwarded exactly once,
@@ -742,7 +822,7 @@ mod tests {
         let config = config_dir("idle-stream");
         let server = silent_server(listener(&config));
 
-        let stream = connect(&config).expect("connect");
+        let stream = connect(&config, Endpoint::User).expect("connect");
         let started = Instant::now();
         assert!(
             !stream.wait_readable(Duration::ZERO).expect("poll"),

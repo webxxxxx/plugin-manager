@@ -21,7 +21,7 @@ use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PeekNamedPipe, WaitNamedPipeW,
 };
 
-use crate::channel::{ControlChannel, ControlListener, ControlStream, PendingCall, Reply};
+use crate::channel::{ControlChannel, ControlListener, ControlStream, Endpoint, PendingCall, Reply};
 use crate::ipc;
 use crate::rpc;
 use crate::threads;
@@ -68,8 +68,8 @@ impl Notify {
 }
 
 impl Listener {
-    pub(crate) fn bind(config: &Path) -> io::Result<Self> {
-        let name = wide(&pipe_name(config));
+    pub(crate) fn bind(config: &Path, endpoint: Endpoint) -> io::Result<Self> {
+        let name = wide(&pipe_name(config, endpoint));
         if pipe_exists(&name) {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
@@ -198,40 +198,23 @@ impl ControlChannel for Platform {
     type Listener = Listener;
     type Server = ControlBinding;
 
-    fn bind(config: &Path) -> io::Result<Self::Listener> {
-        Listener::bind(config)
+    fn bind(config: &Path, endpoint: Endpoint) -> io::Result<Self::Listener> {
+        Listener::bind(config, endpoint)
     }
 
     fn into_server(
-        listener: Self::Listener,
+        user: Self::Listener,
+        admin: Self::Listener,
         pending: SyncSender<PendingCall>,
         wake: Arc<Wake>,
     ) -> io::Result<Self::Server> {
-        std::thread::Builder::new()
-            .name("svcd-channel".into())
-            .stack_size(threads::io_stack())
-            .spawn(move || {
-                for incoming in listener.incoming() {
-                    let stream = match incoming {
-                        Ok(stream) => stream,
-                        Err(error) => {
-                            eprintln!("svcd: channel accept failed: {}", error);
-                            continue;
-                        }
-                    };
-                    let pending = pending.clone();
-                    let wake = wake.clone();
-                    let _ = std::thread::Builder::new()
-                        .name("svcd-channel-conn".into())
-                        .stack_size(threads::io_stack())
-                        .spawn(move || serve_connection(stream, pending, wake));
-                }
-            })
-            .map(|_| ControlBinding)
+        spawn_accept(user, Endpoint::User, pending.clone(), wake.clone())?;
+        spawn_accept(admin, Endpoint::Admin, pending, wake)?;
+        Ok(ControlBinding)
     }
 
-    fn connect(config: &Path) -> io::Result<Self::Stream> {
-        let name = wide(&pipe_name(config));
+    fn connect(config: &Path, endpoint: Endpoint) -> io::Result<Self::Stream> {
+        let name = wide(&pipe_name(config, endpoint));
         for _ in 0..50 {
             let handle = unsafe {
                 CreateFileW(
@@ -268,7 +251,46 @@ impl ControlChannel for Platform {
 }
 
 /// One thread per control connection, exactly like the old fallback.
-fn serve_connection(stream: Stream, tx: SyncSender<PendingCall>, wake: Arc<Wake>) {
+/// One accept thread per endpoint: the thread owns the endpoint's tier, so a
+/// connection can never be mislabelled.
+fn spawn_accept(
+    listener: Listener,
+    endpoint: Endpoint,
+    pending: SyncSender<PendingCall>,
+    wake: Arc<Wake>,
+) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name(match endpoint {
+            Endpoint::User => "svcd-channel".into(),
+            Endpoint::Admin => "svcd-channel-admin".into(),
+        })
+        .stack_size(threads::io_stack())
+        .spawn(move || {
+            for incoming in listener.incoming() {
+                let stream = match incoming {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        eprintln!("svcd: channel accept failed: {}", error);
+                        continue;
+                    }
+                };
+                let pending = pending.clone();
+                let wake = wake.clone();
+                let _ = std::thread::Builder::new()
+                    .name("svcd-channel-conn".into())
+                    .stack_size(threads::io_stack())
+                    .spawn(move || serve_connection(stream, pending, wake, endpoint));
+            }
+        })
+        .map(|_| ())
+}
+
+fn serve_connection(
+    stream: Stream,
+    tx: SyncSender<PendingCall>,
+    wake: Arc<Wake>,
+    endpoint: Endpoint,
+) {
     let mut reader = BufReader::new(stream);
     loop {
         let line = match ipc::read_frame_limit(&mut reader, ipc::LOCAL_FRAME_MAX) {
@@ -294,6 +316,7 @@ fn serve_connection(stream: Stream, tx: SyncSender<PendingCall>, wake: Arc<Wake>
             .send(PendingCall {
                 line,
                 reply: Reply::plain(reply_tx),
+                endpoint,
             })
             .is_err()
         {
@@ -318,10 +341,14 @@ fn serve_connection(stream: Stream, tx: SyncSender<PendingCall>, wake: Arc<Wake>
     }
 }
 
-fn pipe_name(config: &Path) -> String {
+fn pipe_name(config: &Path, endpoint: Endpoint) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     config.to_string_lossy().hash(&mut hasher);
-    format!(r"\\.\pipe\svcd-{:016x}", hasher.finish())
+    let suffix = match endpoint {
+        Endpoint::User => "svcd",
+        Endpoint::Admin => "svcd-admin",
+    };
+    format!(r"\\.\pipe\{}-{:016x}", suffix, hasher.finish())
 }
 
 fn wide(value: &str) -> Vec<u16> {
