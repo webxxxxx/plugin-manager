@@ -149,10 +149,14 @@ pub fn poll_this_loop() {
     crate::stdio::pump_waiting_loop();
 }
 
-fn kill(child: &mut Child) {
+/// Kill a hook and, on Unix, the process group it leads.
+///
+/// `process::configure` puts every hook in a group of its own, so killing the
+/// leader alone would leave its children behind. Windows has no group here; the
+/// daemon-wide job covers the tree, and the leader is what we can stop now.
+pub(crate) fn kill(child: &mut Child) {
     #[cfg(unix)]
     unsafe {
-        // Every hook gets its own process group, so the whole tree goes down.
         libc::kill(-(child.id() as i32), libc::SIGKILL);
     }
     #[cfg(windows)]
@@ -345,6 +349,28 @@ mod tests {
             "timeout did not kill the hook: {:?}",
             started.elapsed()
         );
+    }
+
+    /// A timed-out hook takes its process group with it. Killing only the
+    /// leader would leave a hook's background child running unsupervised.
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_hook_kills_its_process_group() {
+        let dir = TempDir::new();
+        let marker = dir.0.join("late");
+        let body = format!(
+            "#!/bin/sh\n( sleep 1; echo late > '{}' ) &\nsleep 5\n",
+            marker.display()
+        );
+        let path = write_hook(&dir.0, "group", &body);
+
+        let error = run(&spec(&dir, &path, 150), &mut || {}).expect_err("hook times out");
+        assert!(error.contains("timed out"), "{error}");
+
+        // The background child would write after one second; the group kill
+        // must have taken it down before that.
+        thread::sleep(Duration::from_millis(1500));
+        assert!(!marker.exists(), "a killed hook's child wrote {:?}", marker);
     }
 
 
