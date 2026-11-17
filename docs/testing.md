@@ -104,7 +104,12 @@ Windows 走每连接线程回退，但上面的连接数、每 IP 与 idle 探�
 ## 6. 命令
 
 ```sh
-# L1 + L4
+# L1 + L4（摘要输出：每个 target 一行，失败才打印尾部）
+node tools/check.mjs quick
+node tools/check.mjs test <filter>
+node tools/check.mjs full
+
+# 原始 cargo（需要完整输出时）
 cargo test
 MEM_LEVEL=low cargo test --bin svcd limits::tests -- --test-threads=1
 MEM_LEVEL=middle cargo test --bin svcd limits::tests -- --test-threads=1
