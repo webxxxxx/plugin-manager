@@ -917,7 +917,7 @@ impl Daemon {
                 request.id,
                 -32000,
                 "unauthorized",
-                json!({ "kind": Problem::Internal.as_str() }),
+                problem_data(Problem::Internal),
             );
             let _ = incoming.reply.send(rpc::to_line(&response));
             return;
@@ -945,12 +945,7 @@ impl Daemon {
             }
             "registry.tools" | "tools/list" => match self.tools_page(&request.params) {
                 Ok(value) => rpc::ok(id, value),
-                Err(error) => rpc::err_data(
-                    id,
-                    -32602,
-                    error.detail(),
-                    json!({ "kind": error.problem.as_str() }),
-                ),
+                Err(error) => problem_response(id, -32602, error),
             },
             "registry.version" => rpc::ok(id, json!({ "version": self.catalog_version })),
             "svc.list" => rpc::ok(id, json!({"services": self.statuses()})),
@@ -971,7 +966,7 @@ impl Daemon {
                         id,
                         -32001,
                         &format!("unknown service: {}", service_id),
-                        json!({ "kind": Problem::UnknownService.as_str() }),
+                        problem_data(Problem::UnknownService),
                     ),
                 },
                 Err(response) => response,
@@ -998,48 +993,23 @@ impl Daemon {
             },
             "svc.reload" | "svcd.reload" => match self.reload() {
                 Ok(summary) => rpc::ok(id, summary),
-                Err(error) => rpc::err_data(
-                    id,
-                    -32009,
-                    error.detail(),
-                    json!({ "kind": error.problem.as_str() }),
-                ),
+                Err(error) => problem_response(id, -32009, error),
             },
             "plugin.install" => match self.install_plugin(&request) {
                 Ok(status) => rpc::ok(id, status_json(status)),
-                Err(error) => rpc::err_data(
-                    id,
-                    -32006,
-                    error.detail(),
-                    json!({ "kind": error.problem.as_str() }),
-                ),
+                Err(error) => problem_response(id, -32006, error),
             },
             "plugin.install_staged" => match self.install_staged(&request) {
                 Ok(status) => rpc::ok(id, status_json(status)),
-                Err(error) => rpc::err_data(
-                    id,
-                    -32006,
-                    error.detail(),
-                    json!({ "kind": error.problem.as_str() }),
-                ),
+                Err(error) => problem_response(id, -32006, error),
             },
             "plugin.uninstall" => match self.uninstall_plugin(&request) {
                 Ok(()) => rpc::ok(id, json!({ "ok": true })),
-                Err(error) => rpc::err_data(
-                    id,
-                    -32007,
-                    error.detail(),
-                    json!({ "kind": error.problem.as_str() }),
-                ),
+                Err(error) => problem_response(id, -32007, error),
             },
             "auth.status" => match self.auth_status() {
                 Ok(status) => rpc::ok(id, auth_json(&status)),
-                Err(error) => rpc::err_data(
-                    id,
-                    -32008,
-                    error.detail(),
-                    json!({ "kind": error.problem.as_str() }),
-                ),
+                Err(error) => problem_response(id, -32008, error),
             },
             "auth.passwd" => {
                 let password = request
@@ -1049,19 +1019,14 @@ impl Daemon {
                     .unwrap_or("");
                 match self.auth_passwd(password) {
                     Ok(status) => rpc::ok(id, auth_json(&status)),
-                    Err(error) => rpc::err_data(
-                        id,
-                        -32008,
-                        error.detail(),
-                        json!({ "kind": error.problem.as_str() }),
-                    ),
+                    Err(error) => problem_response(id, -32008, error),
                 }
             }
             _ => rpc::err_data(
                 id,
                 -32601,
                 "method not found",
-                json!({ "kind": Problem::Invalid.as_str() }),
+                problem_data(Problem::Invalid),
             ),
         }
     }
@@ -1603,7 +1568,7 @@ impl Daemon {
                 &devices,
                 &compat::detect(MAX_SCHEMA, MAX_PROTOCOL),
             )) {
-                return Err(problem_for_plugin_detail(format!("{}: {}", id, reason)));
+                return Err(problem_for_legacy_detail(format!("{}: {}", id, reason)));
             }
         }
         if let Some(service) = self.registry.get(id) {
@@ -1762,7 +1727,7 @@ impl Daemon {
             settings::allow_insecure_install(),
             allow_hooks,
         )
-        .map_err(problem_for_plugin_detail)?;
+        .map_err(problem_for_legacy_detail)?;
         let plugin::Verified {
             package,
             signature_verified,
@@ -1810,9 +1775,9 @@ impl Daemon {
                     id
                 ));
                 plugin::install_package(&package, Strategy::Replace, allow_hooks, host_interpreter)
-                    .map_err(problem_for_plugin_detail)?
+                    .map_err(problem_for_legacy_detail)?
             }
-            Err(error) => return Err(problem_for_plugin_detail(error)),
+            Err(error) => return Err(problem_for_legacy_detail(error)),
         };
         // The package is already on disk, but registration can still be refused
         // (ADR-0015's carrier invariant). Check before touching the running slot
@@ -1918,7 +1883,7 @@ impl Daemon {
         }
 
         let staged = package::load_staged(&staging, settings::allow_insecure_install())
-            .map_err(problem_for_plugin_detail)?;
+            .map_err(problem_for_legacy_detail)?;
         let id = staged.manifest.name.clone();
         let version = staged.manifest.version.clone();
         if let Some(requested) = request.params.get("id").and_then(Value::as_str) {
@@ -1946,7 +1911,7 @@ impl Daemon {
             }
         }
         let host_interpreter =
-            plugin::prepare_staged(&staged, allow_hooks).map_err(problem_for_plugin_detail)?;
+            plugin::prepare_staged(&staged, allow_hooks).map_err(problem_for_legacy_detail)?;
         let signature_verified = staged.signature_verified;
 
         let running = |slots: &BTreeMap<String, Slot>| {
@@ -1960,7 +1925,7 @@ impl Daemon {
         }
         let still_running = running(&self.slots);
         let service = plugin::install_staged(staged, strategy, allow_hooks, host_interpreter)
-            .map_err(problem_for_plugin_detail)?;
+            .map_err(problem_for_legacy_detail)?;
         if let Err(error) = service.carrier() {
             return Err(ProblemError::new(
                 Problem::Internal,
@@ -2041,7 +2006,7 @@ impl Daemon {
         if running {
             self.stop_service(id)?;
         }
-        plugin::uninstall(id, purge).map_err(problem_for_plugin_detail)?;
+        plugin::uninstall(id, purge).map_err(problem_for_legacy_detail)?;
         self.slots.remove(id);
         self.registry.remove(id);
         runtime::remove(id);
@@ -2284,16 +2249,21 @@ fn status_response(
                 id,
                 -32603,
                 &error.to_string(),
-                json!({ "kind": Problem::Internal.as_str() }),
+                problem_data(Problem::Internal),
             ),
         },
-        Err(error) => rpc::err_data(
-            id,
-            error_code,
-            error.detail(),
-            json!({ "kind": error.problem.as_str() }),
-        ),
+        Err(error) => problem_response(id, error_code, error),
     }
+}
+
+fn problem_data(problem: Problem) -> Value {
+    json!({ "kind": problem.as_str() })
+}
+
+/// One management error -> one JSON-RPC frame. Funnelling every dispatch arm
+/// through here keeps the `data.kind` and the code together.
+fn problem_response(id: Option<Value>, code: i32, error: ProblemError) -> rpc::Response {
+    rpc::err_data(id, code, error.detail(), problem_data(error.problem))
 }
 
 fn status_json(status: Status) -> Value {
@@ -2518,15 +2488,23 @@ fn status_detail(output: &str, status: Option<std::process::ExitStatus>) -> Stri
     }
 }
 
-/// Classify a text-only error from `plugin`/`package` at the call site.
+/// Classify a text-only error from `plugin`/`package`/`compat` at the legacy
+/// `String` boundary.
 ///
 /// The daemon's management methods carry [`ProblemError`], but those modules
 /// still return `String`. This maps a detail to the [`Problem`] whose HTTP
 /// status today's `face::support::status_for_error` would pick, so the wire
-/// status cannot drift. It is deliberately *not* a `From<String>`: a new text
-/// cannot silently become a non-`Internal` category, and each call site still
-/// chooses to use this helper.
-fn problem_for_plugin_detail(detail: impl Into<String>) -> ProblemError {
+/// status cannot drift — with one deliberate correction: platform reasons are
+/// checked before the generic `unknown` because the Linux host triple
+/// (`x86_64-unknown-linux-gnu`) contains that word; the old matcher turned a
+/// platform mismatch into 404, the kind turns it into `UnsupportedPlatform`
+/// (400 once S5b reads the kind).
+///
+/// It is deliberately *not* a `From<String>`: a new text cannot silently become
+/// a non-`Internal` category, and each call site still chooses to use this
+/// helper. S5b deletes the face copy; this helper remains only until the
+/// plugin/package APIs return typed errors.
+fn problem_for_legacy_detail(detail: impl Into<String>) -> ProblemError {
     let detail = detail.into();
     let lower = detail.to_ascii_lowercase();
     let problem = if lower.contains("timed out") || lower.contains("timeout") {
@@ -2589,7 +2567,7 @@ fn param_id(request: &rpc::Request) -> Result<String, rpc::Response> {
                 request.id.clone(),
                 -32602,
                 "missing id",
-                json!({ "kind": Problem::Invalid.as_str() }),
+                problem_data(Problem::Invalid),
             )
         })
 }
@@ -3871,7 +3849,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
         ];
         for (detail, expected) in cases {
             assert_eq!(
-                problem_for_plugin_detail(detail).problem,
+                problem_for_legacy_detail(detail).problem,
                 expected,
                 "{detail}"
             );
@@ -3883,7 +3861,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
         let response = status_response(
             Some(json!(8)),
             -32006,
-            Err(problem_for_plugin_detail("package exceeds 8 MiB")),
+            Err(problem_for_legacy_detail("package exceeds 8 MiB")),
         );
         assert_eq!(
             response.error.expect("error").data.expect("data")["kind"],
