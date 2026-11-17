@@ -1702,6 +1702,12 @@ impl Daemon {
                     format!("service {} is stopping", id),
                 ));
             }
+            if self.slots[id].machine.state == State::Starting {
+                log::svcd(&format!(
+                    "svcd: {}: start requested while already Starting; no new spawn for this call",
+                    id
+                ));
+            }
             let now = self.now_ms();
             self.slots
                 .get_mut(id)
@@ -1728,6 +1734,13 @@ impl Daemon {
                 return Ok(());
             }
             if self.now_ms() >= deadline {
+                for id in &pending {
+                    log::svcd(&format!(
+                        "svcd: {}: start timed out waiting for ready ({})",
+                        id,
+                        self.slots[id].handshake_snapshot()
+                    ));
+                }
                 return Err(ProblemError::new(
                     Problem::Timeout,
                     format!("start timed out: {}", pending.join(", ")),
