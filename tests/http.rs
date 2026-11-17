@@ -7666,7 +7666,7 @@ fn control_shutdown_reply_is_flushed_before_exit() {
     sandbox.start_daemon();
     let _address = sandbox.wait_for_http();
     let mut stream =
-        UnixStream::connect(sandbox.config.join("svcd.sock")).expect("control connect");
+        UnixStream::connect(sandbox.config.join("svcd-admin.sock")).expect("admin connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("timeout");
@@ -7695,11 +7695,11 @@ fn control_shutdown_reply_is_flushed_before_exit() {
     }
 }
 
-/// The control channel still checks its token after moving into the server
-/// loop: a wrong token gets the same -32000 unauthorized reply.
+/// The endpoint, not a token, decides: an admin method on the user endpoint
+/// gets the same -32000 unauthorized reply and must not run.
 #[cfg(unix)]
 #[test]
-fn control_channel_rejects_an_unknown_token() {
+fn control_channel_rejects_an_admin_method_on_the_user_endpoint() {
     use std::os::unix::net::UnixStream;
 
     let mut sandbox = Sandbox::new();
@@ -7710,17 +7710,20 @@ fn control_channel_rejects_an_unknown_token() {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("timeout");
-    let request = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"svcd.ping\",\"params\":{},\"auth\":\"not-the-token\"}\n";
+    let request = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"svcd.shutdown\",\"params\":{}}\n";
     stream
         .write_all(request.as_bytes())
-        .expect("write ping request");
+        .expect("write shutdown request");
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    reader.read_line(&mut line).expect("ping reply");
-    let response: Value = serde_json::from_str(line.trim()).expect("ping reply json");
+    reader.read_line(&mut line).expect("shutdown reply");
+    let response: Value = serde_json::from_str(line.trim()).expect("shutdown reply json");
     assert_eq!(response["id"], 3, "{line}");
     assert_eq!(response["error"]["code"], -32000, "{line}");
     assert_eq!(response["error"]["message"], "unauthorized", "{line}");
+
+    // The rejected admin method must leave the daemon serving the user tier.
+    sandbox.wait_for_http();
 }
 
 /// When the management channel cannot be reached, the MCP stream still starts

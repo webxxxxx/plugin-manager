@@ -530,10 +530,11 @@ fn a_silent_control_server_does_not_hold_the_shutdown_request() {
     use std::os::unix::net::UnixListener;
 
     let sandbox = Sandbox::new();
-    // Bind the control socket and never accept or answer: the CLI connects,
-    // sends the request, and waits for a reply that never comes.
-    let _listener =
-        UnixListener::bind(sandbox.config.join("svcd.sock")).expect("bind control socket");
+    // Bind the admin control socket (shutdown is an admin method) and never
+    // accept or answer: the CLI connects, sends the request, and waits for a
+    // reply that never comes.
+    let _listener = UnixListener::bind(sandbox.config.join("svcd-admin.sock"))
+        .expect("bind admin control socket");
     let mut command = Command::new(&sandbox.svcd);
     command.arg("shutdown");
     sandbox.env(&mut command);

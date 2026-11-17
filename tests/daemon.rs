@@ -353,6 +353,17 @@ impl Sandbox {
         self.start_daemon_with_env(&[]);
     }
 
+    /// Spawn the daemon and wait until its control channel answers.
+    ///
+    /// `svc list` / `svc status` no longer fall back to services.d, so a test
+    /// that calls them immediately must not race the daemon's startup: the
+    /// control socket is bound after the boot scan, and WSL is slow enough for
+    /// the difference to matter.
+    fn start_daemon_ready(&mut self) {
+        self.start_daemon();
+        self.wait_for_daemon();
+    }
+
     fn start_daemon_with_env(&mut self, extra: &[(&str, &str)]) {
         let stderr = fs::File::create(&self.daemon_stderr).expect("create daemon log");
         let mut command = Command::new(&self.svcd);
@@ -407,11 +418,10 @@ impl Sandbox {
 
     /// Wait until the daemon answers over the control channel.
     ///
-    /// `svc list` and `svc status` fall back to the on-disk definitions when
-    /// the daemon is down, so they answer *successfully* before it is ready and
-    /// are useless as readiness probes. `svc reload` has no offline path: it
-    /// exits EXIT_DAEMON_UNREACHABLE until the daemon accepts, and answering it
-    /// also proves the boot scan finished (the RPC is handled by the same loop).
+    /// `svc reload` is the readiness probe: it has no offline fallback and
+    /// exits EXIT_DAEMON_UNREACHABLE until the daemon accepts. Answering it
+    /// also proves the boot scan finished (the RPC is handled by the same
+    /// loop).
     fn wait_for_daemon(&self) {
         let output = self.run_when_ready(&["reload"]);
         assert_eq!(
@@ -846,7 +856,7 @@ fn a_drop_in_script_is_discovered_and_supervised() {
     let mut sandbox = Sandbox::new();
     let script = sandbox.write_script_service("demo");
     assert!(script.is_file());
-    sandbox.start_daemon();
+    sandbox.start_daemon_ready();
 
     let list = sandbox.run_svc(&["list"]);
     assert!(
@@ -1690,7 +1700,7 @@ fn assert_crash_restart(sandbox: &Sandbox, id: &str) {
 fn state_matrix_for_core_json_service() {
     let mut sandbox = Sandbox::new();
     sandbox.write_core_json("core");
-    sandbox.start_daemon();
+    sandbox.start_daemon_ready();
     assert_state_matrix(&sandbox, "core", "core", true);
 }
 
@@ -1698,7 +1708,7 @@ fn state_matrix_for_core_json_service() {
 fn state_matrix_for_script_service() {
     let mut sandbox = Sandbox::new();
     sandbox.write_stop_script("script");
-    sandbox.start_daemon();
+    sandbox.start_daemon_ready();
     assert_state_matrix(&sandbox, "script", "core", true);
 }
 
@@ -1800,7 +1810,7 @@ fn a_never_policy_service_stops_without_restarting() {
     let mut sandbox = Sandbox::new();
     sandbox.write_core_json("once");
     sandbox.set_restart("once", "never");
-    sandbox.start_daemon();
+    sandbox.start_daemon_ready();
 
     let running = sandbox.wait_for_state("once", "running", Duration::from_secs(15));
     assert_eq!(running["details"]["restart"], "never", "{running}");
@@ -1822,7 +1832,7 @@ fn graceful_svcd_restart_boots_enabled_services_and_skips_disabled() {
     fs::write(sandbox.config.join("services.d").join("off.disabled"), b"")
         .expect("disabled marker");
 
-    sandbox.start_daemon();
+    sandbox.start_daemon_ready();
     let package = sandbox.write_plugin_package("plug");
     sandbox.install_plugin("plug", &package);
     // Fresh installs are disabled; boot-start requires the opt-in.
@@ -1848,7 +1858,7 @@ fn graceful_svcd_restart_boots_enabled_services_and_skips_disabled() {
         );
     }
 
-    sandbox.start_daemon();
+    sandbox.start_daemon_ready();
     for id in ["core", "script", "plug"] {
         let status = sandbox.wait_for_state(id, "running", Duration::from_secs(15));
         assert!(
@@ -1864,7 +1874,7 @@ fn graceful_svcd_restart_boots_enabled_services_and_skips_disabled() {
 #[test]
 fn builtin_svc_stays_running_and_ignores_start_stop() {
     let mut sandbox = Sandbox::new();
-    sandbox.start_daemon();
+    sandbox.start_daemon_ready();
 
     let status = sandbox.status("svc");
     assert_eq!(status["summary"]["state"], "running", "{status}");
@@ -2099,7 +2109,7 @@ fn reload_without_changes_reports_nothing_to_do() {
 fn a_one_shot_service_stays_running_after_it_finishes() {
     let mut sandbox = Sandbox::new();
     sandbox.write_one_shot("once");
-    sandbox.start_daemon();
+    sandbox.start_daemon_ready();
 
     // Boot starts it. Once the process exits 0 the service stays running with
     // no pid instead of flipping to stopped.
@@ -2160,7 +2170,7 @@ fn a_finished_one_shot_dependency_is_not_rerun() {
     sandbox.write_script_body("once", body);
     sandbox.write_service("app", &["once"], Script::Ready);
 
-    sandbox.start_daemon();
+    sandbox.start_daemon_ready();
     // The one-shot may be observed in its brief Running-with-pid window right
     // after spawn; the point of this test is that it settles to
     // running/pid-null exactly once before the dependent app starts.
@@ -2256,7 +2266,7 @@ fn a_finished_one_shot_is_not_rerun_after_a_daemon_restart() {
     let body = "#!/bin/sh\necho once >> \"$(dirname \"$0\")/once-marker.txt\"\n";
     sandbox.write_script_body("once", body);
 
-    sandbox.start_daemon();
+    sandbox.start_daemon_ready();
     let record = sandbox.data.join("run").join("once.json");
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -2336,7 +2346,7 @@ fn stopping_a_finished_one_shot_runs_its_stop_action() {
     )
     .expect("write definition");
 
-    sandbox.start_daemon();
+    sandbox.start_daemon_ready();
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let status = sandbox.status("once");
@@ -2743,7 +2753,7 @@ fn abrupt_svcd_exit_reaps_children_and_restart_starts_one_instance() {
 fn a_restarted_daemon_adopts_an_exec_ready_service() {
     let mut sandbox = Sandbox::new();
     sandbox.write_stop_script("script");
-    sandbox.start_daemon();
+    sandbox.start_daemon_ready();
     let pid = sandbox.running_pid("script");
 
     sandbox.force_kill_daemon();
@@ -2753,7 +2763,7 @@ fn a_restarted_daemon_adopts_an_exec_ready_service() {
         || pid_alive(pid),
     );
 
-    sandbox.start_daemon();
+    sandbox.start_daemon_ready();
     let status = sandbox.wait_for_state("script", "running", Duration::from_secs(15));
     assert_eq!(
         status["summary"]["pid"].as_u64(),
@@ -2773,7 +2783,7 @@ fn a_restarted_daemon_adopts_an_exec_ready_service() {
 fn a_runtime_record_from_another_boot_is_ignored() {
     let mut sandbox = Sandbox::new();
     sandbox.write_stop_script("script");
-    sandbox.start_daemon();
+    sandbox.start_daemon_ready();
     let pid = sandbox.running_pid("script");
     sandbox.shutdown();
 
@@ -2791,7 +2801,7 @@ fn a_runtime_record_from_another_boot_is_ignored() {
     )
     .expect("rewrite record");
 
-    sandbox.start_daemon();
+    sandbox.start_daemon_ready();
     let status = sandbox.wait_for_state("script", "running", Duration::from_secs(15));
     assert_ne!(
         status["summary"]["pid"].as_u64(),
