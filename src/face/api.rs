@@ -4,9 +4,9 @@
 //! `Blocking` route, and #117 moves the remaining management JSON routes here.
 //! Blob/file downloads (#118) and uploads (#119) are claimed by their own
 //! stream faces before the body is read; #120 moved export spk/spkb to
-//! `face/export.rs`; import/install and the plugin UI streams keep their own
-//! streaming paths until #121. This face owns the ordinary management
-//! surface, the console page and login/logout.
+//! `face/export.rs`; #121 moved package import/install to `face/install.rs`.
+//! The plugin UI streams keep their own path (#122). This face owns the
+//! ordinary management surface, the console page and login/logout.
 
 use std::io;
 use std::path::PathBuf;
@@ -395,8 +395,9 @@ fn is_api_path(path: &str) -> bool {
     parts.first() == Some(&"api") && parts.get(1) == Some(&"v1")
 }
 
-/// Paths owned by the remaining transfer slice (#121) stay on the
-/// legacy bridge until their own StreamHandler lands.
+/// Paths claimed by a pre-body stream hook (#115 blade UI, #119 uploads,
+/// #121 package uploads) or by the remaining blob/file session routes stay off
+/// this buffered route table.
 fn is_transfer_path(method: &str, path: &str) -> bool {
     let path = path_only(path);
     let mut parts = parts(path);

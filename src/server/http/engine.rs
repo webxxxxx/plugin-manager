@@ -1,7 +1,7 @@
 //! The HTTP server loop: it owns the listener, the accepted sockets, the
 //! request buffers and the pending-request table. The legacy bridge implements
-//! the per-connection state machine until the remaining endpoints move to the
-//! face (#115-#125); the loop itself never knows an endpoint.
+//! the per-connection state machine until #125 deletes the bridge; the loop
+//! itself never knows an endpoint.
 //!
 //! The loop is Unix-only for now. Windows keeps the per-connection thread
 //! fallback (ADR-0016); moving that to IOCP belongs to S3/S6.
@@ -100,18 +100,17 @@ impl<S> Connection<S> {
 pub type Table<S> = HashMap<u64, Connection<S>>;
 
 /// What a handler wants the loop to do after it inspected the request head but
-/// before the body is read. Legacy takeover endpoints need this window.
+/// before the body is read. Stream handlers that consume the raw body need
+/// this window.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreRequest {
-    /// Not a legacy takeover; let the loop parse and buffer the request.
+    /// Not a stream route; let the loop parse and buffer the request.
     Continue,
     /// The handler took the readable bytes and set the connection's next
     /// state itself (a written response, or an attached stream driver); the
     /// loop must not parse the same buffer again.
     Handled,
-    /// The handler cloned/took the connection; remove the loop's handle.
-    Close,
 }
 
 /// The temporary legacy bridge. It owns the endpoint state machine and the
@@ -343,12 +342,6 @@ where
                                     }
                                 }
                                 PreRequest::Handled => {}
-                                PreRequest::Close => {
-                                    if let Some(mut connection) = connections.remove(&id) {
-                                        handler.on_close(&mut connection);
-                                    }
-                                    continue;
-                                }
                             }
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}

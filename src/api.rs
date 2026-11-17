@@ -3,9 +3,10 @@
 //!
 //! `bind` in `svcd.conf` chooses the listener address. A non-loopback bind
 //! requires `auth_passwd`; without it the daemon falls back to loopback so the
-//! operator can still run `svc auth passwd`. Management JSON projections live
-//! in `face/api.rs` (#117); this module keeps the control-channel adapter and
-//! the streaming takeovers owned by #118–#121.
+//! operator can still run `svc auth passwd`. Management JSON projections and
+//! the stream endpoints live in `face/` (#117–#121); this module keeps the
+//! control-channel adapter, the Windows per-connection fallback and the
+//! remaining legacy worker queue (#125 deletes it).
 
 #[cfg(any(not(unix), test))]
 use std::collections::HashMap;
@@ -17,7 +18,6 @@ use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
 use std::sync::mpsc::{self, Receiver, Sender};
 #[cfg(unix)]
@@ -39,7 +39,6 @@ use crate::lan::{self, AuthKind, Lan, LanStatus};
 use crate::log;
 use crate::mcp_http;
 use crate::package;
-use crate::paths;
 use crate::plugin;
 use crate::rpc;
 use crate::server::http::engine::{self, keep_alive_response, wants_keep_alive, HttpRequest};
@@ -47,7 +46,6 @@ use crate::server::http::engine::{self, keep_alive_response, wants_keep_alive, H
 use crate::server::http::JobOutcome;
 use crate::settings;
 use crate::threads;
-use crate::transfer;
 use crate::webui;
 
 /// Buffered-body limit for the routes that still go through the ordinary
@@ -67,8 +65,6 @@ fn body_limit(path: &str) -> u64 {
         limits.max_json_body
     }
 }
-
-static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 pub struct Api {
     lan: Arc<Mutex<Lan>>,
@@ -341,42 +337,6 @@ fn http_worker(
 }
 
 
-#[cfg(unix)]
-fn import_takeover(connection: &mut Connection) -> Option<(TcpStream, http::Head, Vec<u8>)> {
-    if connection.pending.is_some() {
-        return None;
-    }
-    let header_end = http::header_end(&connection.buffer)?;
-    if header_end > crate::limits::current().max_header {
-        return None;
-    }
-    let (head, body_start) = http::parse_head(&connection.buffer[..header_end + 4])?;
-    if !crate::install_http::import_route(&head) {
-        return None;
-    }
-    let stream = connection.stream.try_clone().ok()?;
-    let initial = connection.buffer[body_start..].to_vec();
-    Some((stream, head, initial))
-}
-
-#[cfg(unix)]
-fn install_takeover(connection: &mut Connection) -> Option<(TcpStream, http::Head, Vec<u8>)> {
-    if connection.pending.is_some() {
-        return None;
-    }
-    let header_end = http::header_end(&connection.buffer)?;
-    if header_end > crate::limits::current().max_header {
-        return None;
-    }
-    let (head, body_start) = http::parse_head(&connection.buffer[..header_end + 4])?;
-    if !crate::install_http::route(&head) {
-        return None;
-    }
-    let stream = connection.stream.try_clone().ok()?;
-    let initial = connection.buffer[body_start..].to_vec();
-    Some((stream, head, initial))
-}
-
 /// Admission bookkeeping for the Windows thread-per-connection fallback.
 ///
 /// The Unix reactor bounds its connection table directly. The fallback has no
@@ -600,6 +560,43 @@ fn serve_streamed_route(
     }
 }
 
+/// Run one package install/import through the face and the Windows fallback
+/// driver. The fallback owns the socket and runs staging jobs on this
+/// connection thread, so a slow client only blocks its own connection.
+#[cfg(not(unix))]
+fn serve_package_upload(
+    stream: &mut TcpStream,
+    head: &http::Head,
+    initial: &[u8],
+    lan: &Arc<Mutex<Lan>>,
+    config: PathBuf,
+) {
+    use crate::server::http::Exchange;
+
+    match crate::face::install::exchange(head, lan, config) {
+        Err(response) => {
+            let _ = stream.write_all(&response);
+        }
+        Ok(Exchange::Response(_)) => {
+            // A streamed route must not answer with a memory response; the
+            // Unix loop renders the same 500 before any handler bytes go out.
+            let _ = stream.write_all(&http::json_error(
+                500,
+                "internal",
+                "a streamed package upload route returned a memory response",
+            ));
+        }
+        Ok(Exchange::Stream(handler)) => {
+            let _ = stream.set_nonblocking(false);
+            let _ = stream.set_read_timeout(Some(crate::limits::current().transfer_timeout));
+            let _ = stream.set_write_timeout(Some(crate::limits::current().transfer_timeout));
+            if crate::server::http::fallback::drive(stream, handler, initial).is_err() {
+                let _ = stream.write_all(&crate::server::http::stream_busy_response());
+            }
+        }
+    }
+}
+
 /// Run one blob/file upload through the face and the Windows fallback driver.
 /// The fallback owns the socket and runs upload staging jobs on this
 /// connection thread, so a slow client only blocks its own connection.
@@ -662,7 +659,7 @@ fn handle(
     // between keep-alive requests, and a stalled request body. That matches the
     // Unix reactor's idle sweep. The same deadline bounds a blocking write, so
     // a client that stops reading cannot pin this connection thread forever;
-    // takeover handlers below install their own transfer timeout where a
+    // stream handlers below install their own transfer timeout where a
     // longer transfer is expected.
     let _ = stream.set_read_timeout(Some(idle_timeout));
     let _ = stream.set_write_timeout(Some(idle_timeout));
@@ -684,26 +681,8 @@ fn handle(
             serve_streamed_route(&mut stream, &head, peer, &face, &lan);
             return;
         }
-        if crate::install_http::import_route(&head) {
-            crate::install_http::serve_import(
-                &mut stream,
-                &head,
-                &initial,
-                &lan,
-                &config,
-                crate::limits::current(),
-            );
-            return;
-        }
-        if crate::install_http::route(&head) {
-            crate::install_http::serve(
-                &mut stream,
-                &head,
-                &initial,
-                &lan,
-                &config,
-                crate::limits::current(),
-            );
+        if crate::face::install::target(&head).is_some() {
+            serve_package_upload(&mut stream, &head, &initial, &lan, config.clone());
             return;
         }
         if crate::face::blob_upload::upload_target(&head).is_some() {
@@ -1263,11 +1242,11 @@ fn request_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
     http::header(&request.headers, name)
 }
 
-/// The only buffered routes left on the legacy worker are the transfer
-/// endpoints owned by #118–#121; every management route is claimed by
-/// `ApiFace` before this function runs.
-fn route(config: &std::path::Path, request: &HttpRequest) -> Vec<u8> {
-    let (path, query) = request
+/// The only buffered routes left on the legacy worker are the blob/file
+/// session routes (#118/#119); every management route and every streamed
+/// transfer is claimed before this function runs.
+fn route(_config: &std::path::Path, request: &HttpRequest) -> Vec<u8> {
+    let (path, _query) = request
         .path
         .split_once('?')
         .unwrap_or((request.path.as_str(), ""));
@@ -1280,7 +1259,6 @@ fn route(config: &std::path::Path, request: &HttpRequest) -> Vec<u8> {
     }
 
     match (request.method.as_str(), parts.as_slice()) {
-        ("POST", ["api", "v1", "plugins"]) => install_plugin(config, request, query),
         ("POST", ["api", "v1", "blobs", "uploads"]) => {
             blob_http::create_upload(blob::UploadKind::Blob)
         }
@@ -1317,77 +1295,12 @@ fn route(config: &std::path::Path, request: &HttpRequest) -> Vec<u8> {
         (_, ["api", "v1", "file", "uploads", _, "complete"]) => method_not_allowed("POST"),
         (_, ["api", "v1", "file", "uploads", _, "parts", _]) => method_not_allowed("PUT"),
         (_, ["api", "v1", "file", _]) => method_not_allowed("GET"),
-        ("POST", ["api", "v1", "import"]) => import_plugin(request, query),
-        (_, ["api", "v1", "import"]) => method_not_allowed("POST"),
         _ => error(404, "not_found", "unknown endpoint"),
     }
 }
 
-fn install_plugin(config: &std::path::Path, request: &HttpRequest, query: &str) -> Vec<u8> {
-    if request.body.is_empty() {
-        return error(400, "bad_request", "empty .spk body");
-    }
-    let content_type = request
-        .headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-        .map(|(_, value)| value.as_str())
-        .unwrap_or("");
-    if !content_type.starts_with("application/octet-stream") {
-        return error(
-            400,
-            "bad_request",
-            "Content-Type must be application/octet-stream",
-        );
-    }
-    let strategy = query_value(query, "strategy").unwrap_or_else(|| "replace".into());
-    if strategy != "keep-old" && strategy != "replace" {
-        return error(400, "bad_request", "strategy must be keep-old or replace");
-    }
-    let enable = query_bool(query, "enable").unwrap_or(true);
-    let allow_hooks = query_bool(query, "allow_hooks").unwrap_or(false);
-
-    let temp_dir = paths::config_dir().join("tmp");
-    let _ = fs::create_dir_all(&temp_dir);
-    let path = temp_dir.join(format!(
-        "upload-{}-{}.spk",
-        std::process::id(),
-        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-    ));
-    if let Err(cause) = fs::write(&path, &request.body) {
-        return error(500, "internal", &format!("cannot store upload: {}", cause));
-    }
-    let result = rpc(
-        config,
-        "plugin.install",
-        json!({
-            "path": path.to_string_lossy(),
-            "strategy": strategy,
-            "allowHooks": allow_hooks,
-        }),
-    );
-    let _ = fs::remove_file(&path);
-
-    match result {
-        Ok(status) => {
-            if !enable {
-                let id = status
-                    .get("summary")
-                    .and_then(|summary| summary.get("id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let _ = rpc(config, "svc.disable", json!({ "id": id }));
-            }
-            let summary = status.get("summary").cloned().unwrap_or(Value::Null);
-            ok(json!({
-                "id": summary.get("id").cloned().unwrap_or(Value::Null),
-                "version": summary.get("version").cloned().unwrap_or(Value::Null),
-                "state": summary.get("state").cloned().unwrap_or(Value::Null),
-            }))
-        }
-        Err(response) => response,
-    }
+fn method_not_allowed(allow: &str) -> Vec<u8> {
+    http::method_not_allowed(allow)
 }
 
 pub(crate) fn require_plugin_result(
@@ -1407,72 +1320,6 @@ pub(crate) fn require_plugin_result(
     } else {
         Err((404, "not_found", format!("not a plugin: {}", id)))
     }
-}
-
-fn import_plugin(request: &HttpRequest, query: &str) -> Vec<u8> {
-    let config_id = query_value(query, "config_id");
-    let no_config = query_bool(query, "no_config").unwrap_or(false);
-    let force = query_bool(query, "force").unwrap_or(false);
-    let _guard = plugin::config_lock();
-    // The HTTP surface is already authorised by the password / loopback
-    // policy; do not re-check the daemon's OS privilege here (the CLI does).
-    match transfer::import(&request.body, config_id.as_deref(), no_config, force, false) {
-        Ok(outcome) => {
-            let mut body = json!({
-                "ok": true,
-                "configApplied": outcome.config.is_some(),
-            });
-            if let Some(status) = outcome.status {
-                body["id"] = json!(status.summary.id);
-                body["version"] = json!(status.summary.version);
-                body["state"] = json!(status.summary.state);
-            } else if let Some(id) = outcome.config.clone() {
-                body["id"] = json!(id);
-            }
-            if !outcome.warnings.is_empty() {
-                body["warnings"] = json!(outcome.warnings);
-            }
-            ok(body)
-        }
-        Err(transfer::Error::Usage(message)) => error(400, "bad_request", &message),
-        Err(transfer::Error::Failed(message)) => import_error(&message),
-    }
-}
-
-fn method_not_allowed(allow: &str) -> Vec<u8> {
-    http::method_not_allowed(allow)
-}
-
-fn import_error(message: &str) -> Vec<u8> {
-    let lower = message.to_ascii_lowercase();
-    let status = if lower.contains("core service") || lower.contains("unknown plugin") {
-        404
-    } else if lower.contains("root / administrator") {
-        403
-    } else if lower.contains("already installed")
-        || lower.contains("conflict")
-        || lower.contains("configcheck")
-    {
-        409
-    } else if lower.contains("exceeds 1 mib") {
-        413
-    } else if lower.contains("signature")
-        || lower.contains("platform")
-        || lower.contains("protocol")
-        || lower.contains("unsafe")
-        || lower.contains("setuid")
-        || lower.contains("hooks")
-        || lower.contains("invalid")
-        || lower.contains("not declared")
-        || lower.contains("missing")
-        || lower.contains("does not match")
-        || lower.contains("unsupported")
-    {
-        400
-    } else {
-        500
-    };
-    error(status, code_for(status), message)
 }
 
 pub(crate) fn config_error_status(message: &str) -> (u16, &'static str, String) {
@@ -1573,13 +1420,6 @@ fn code_for(status: u16) -> &'static str {
     }
 }
 
-fn ok(value: Value) -> Vec<u8> {
-    http::response(
-        200,
-        "application/json",
-        &serde_json::to_vec(&value).unwrap_or_default(),
-    )
-}
 
 fn error(status: u16, code: &str, message: &str) -> Vec<u8> {
     http::json_error(status, code, message)

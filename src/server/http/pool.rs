@@ -108,7 +108,11 @@ impl BlockingPool {
             let worker = inner.clone();
             let spawned = thread::Builder::new()
                 .name(format!("svcd-blocking-{}", index + 1))
-                .stack_size(crate::threads::request_stack())
+                // A blocking job is not just a management call any more: since
+                // #121 it can parse a package manifest and tar entries. The
+                // transfer floor keeps that work inside the stack budget even
+                // when svcd.conf puts request_stack_bytes at its 64 KiB floor.
+                .stack_size(crate::threads::transfer_stack())
                 .spawn(move || run_worker(worker));
             if let Err(error) = spawned {
                 inner.shutdown();

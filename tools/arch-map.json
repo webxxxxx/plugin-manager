@@ -60,13 +60,12 @@
     "server": { "concept": "server/request", "layer": "server", "note": "S4 请求交接契约（#113）+ HTTP server-loop（#114）+ stream driver（#115）+ WebSocket 帧（#122）" },
 
     "api": { "concept": "face/api", "layer": "face", "note": "还含 face 路由与 legacy bridge（api/legacy.rs），要拆" },
-    "face": { "concept": "face/api", "layer": "face", "note": "#113 起承载已迁移的 /api/v1 端点" },
+    "face": { "concept": "face/api", "layer": "face", "note": "#113 起承载已迁移的 /api/v1 端点；install/import 在 face/install.rs（#121）" },
     "mcp": { "concept": "face/mcp_tools", "layer": "face" },
     "catalog": { "concept": "face/mcp_tools", "layer": "face" },
     "webui": { "concept": "face/plugin_ui", "layer": "face" },
     "uichannel": { "concept": "face/plugin_ui", "layer": "face", "note": "事件总线、replay 与握手；SSE/WS transport 已迁到 face/plugin_streams" },
     "blob_http": { "concept": "face/blob", "layer": "face" },
-    "install_http": { "concept": "face/install", "layer": "face" },
 
     "svc": { "concept": "cli/svc", "layer": "cli" },
     "plugin_cli": { "concept": "cli/plugin", "layer": "cli" },

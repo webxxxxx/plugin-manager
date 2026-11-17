@@ -2106,6 +2106,47 @@ fn wait_for_no_staging(dir: &Path) {
     );
 }
 
+/// A package install/import stages into a hidden directory directly under the
+/// plugin tree, not into the blob staging area.
+fn has_package_staging(plugins: &Path) -> bool {
+    fs::read_dir(plugins)
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".staging-")
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn wait_for_package_staging(plugins: &Path) {
+    for _ in 0..300 {
+        if has_package_staging(plugins) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!(
+        "package staging directory did not appear under {}",
+        plugins.display()
+    );
+}
+
+fn wait_for_no_package_staging(plugins: &Path) {
+    for _ in 0..300 {
+        if !has_package_staging(plugins) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!(
+        "package staging directory was not removed under {}",
+        plugins.display()
+    );
+}
+
 /// Open an upload and send only the head plus a first chunk. The server has a
 /// valid content-length but the body is deliberately left unfinished.
 fn start_stalled_upload(
@@ -2240,6 +2281,320 @@ fn unix_upload_has_no_takeover_thread() {
         idle,
         "a blob upload must not add a takeover thread"
     );
+    drop(stalled);
+}
+
+fn signed_demo_package(sandbox: &Sandbox, seed: u8) -> Vec<u8> {
+    let key = SigningKey::from_bytes(&[seed; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    plugin_bundle(&key, "demo", "1.0.0", Some(b"good template\n"), false)
+}
+
+#[test]
+fn package_install_and_import_accept_chunked_bodies() {
+    let mut sandbox = Sandbox::new();
+    let package = signed_demo_package(&sandbox, 43);
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let installed = raw_request_chunked(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+        &[],
+    );
+    assert_eq!(
+        installed.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&installed.body)
+    );
+    assert_eq!(json_body(&installed)["id"], "demo");
+
+    let imported = raw_request_chunked(
+        &address,
+        "POST",
+        "/api/v1/import?force=true",
+        "application/octet-stream",
+        &package,
+        &[],
+    );
+    assert_eq!(
+        imported.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&imported.body)
+    );
+    assert_eq!(json_body(&imported)["id"], "demo");
+
+    let config = raw_request_chunked(
+        &address,
+        "POST",
+        "/api/v1/import?config_id=demo",
+        "text/plain",
+        b"chunked config\n",
+        &[],
+    );
+    assert_eq!(
+        config.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&config.body)
+    );
+    assert_eq!(json_body(&config)["configApplied"], true);
+    assert_eq!(
+        fs::read(plugin_dir(&sandbox, "demo").join("config")).expect("config"),
+        b"chunked config\n"
+    );
+}
+
+#[test]
+fn package_upload_honours_expect_100_continue() {
+    let mut sandbox = Sandbox::new();
+    let package = signed_demo_package(&sandbox, 44);
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let mut stream = TcpStream::connect(&address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let head = format!(
+        "POST /api/v1/plugins HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nExpect: 100-continue\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        address,
+        package.len()
+    );
+    stream.write_all(head.as_bytes()).expect("write head");
+    let mut interim = Vec::new();
+    let mut byte = [0u8; 1];
+    while !interim.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).expect("100 continue");
+        interim.push(byte[0]);
+    }
+    assert!(
+        String::from_utf8_lossy(&interim).starts_with("HTTP/1.1 100"),
+        "{:?}",
+        String::from_utf8_lossy(&interim)
+    );
+    stream.write_all(&package).expect("write body");
+    let installed = read_raw_response(&mut stream);
+    assert_eq!(
+        installed.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&installed.body)
+    );
+
+    let body = b"continue config\n";
+    let mut stream = TcpStream::connect(&address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let head = format!(
+        "POST /api/v1/import?config_id=demo HTTP/1.1\r\nHost: {}\r\nContent-Type: text/plain\r\nExpect: 100-continue\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        address,
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).expect("write head");
+    let mut interim = Vec::new();
+    while !interim.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).expect("100 continue");
+        interim.push(byte[0]);
+    }
+    assert!(
+        String::from_utf8_lossy(&interim).starts_with("HTTP/1.1 100"),
+        "{:?}",
+        String::from_utf8_lossy(&interim)
+    );
+    stream.write_all(body).expect("write body");
+    let imported = read_raw_response(&mut stream);
+    assert_eq!(
+        imported.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&imported.body)
+    );
+    assert_eq!(json_body(&imported)["configApplied"], true);
+}
+
+#[test]
+fn a_disconnected_package_upload_removes_its_staging_directory() {
+    let mut sandbox = Sandbox::new();
+    let package = signed_demo_package(&sandbox, 45);
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let plugins = sandbox.data.join("plugins");
+    let installed = raw_request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(
+        installed.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&installed.body)
+    );
+    let backup = raw_request(&address, "GET", "/api/v1/export/demo", "", b"");
+    assert_eq!(
+        backup.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&backup.body)
+    );
+
+    // The .spk install, the .spk import and the .spkb import each stage into
+    // the plugin tree; a disconnect must remove that directory.
+    for (path, content) in [
+        ("/api/v1/plugins", package.as_slice()),
+        ("/api/v1/import", package.as_slice()),
+        ("/api/v1/import", backup.body.as_slice()),
+    ] {
+        let initial = content[..content.len().min(64 * 1024)].to_vec();
+        let stalled = start_stalled_upload(
+            &address,
+            "POST",
+            path,
+            content.len() + 32 * 1024 * 1024,
+            &initial,
+        );
+        wait_for_package_staging(&plugins);
+        drop(stalled);
+        wait_for_no_package_staging(&plugins);
+    }
+}
+
+#[test]
+fn a_failed_install_removes_its_staging_directory() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[46u8; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    // "svc" is the reserved core service id: the daemon refuses the staged
+    // package after the HTTP layer has already written its staging directory.
+    let package = plugin_bundle(&key, "svc", "1.0.0", None, false);
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let response = raw_request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(
+        response.status,
+        404,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+    wait_for_no_package_staging(&sandbox.data.join("plugins"));
+}
+
+/// The install/import upload used to take the connection out of the loop and
+/// spawn a per-request thread. Both are stream handlers now.
+#[cfg(target_os = "linux")]
+#[test]
+fn unix_package_uploads_have_no_takeover_thread() {
+    let mut sandbox = Sandbox::new();
+    let package = signed_demo_package(&sandbox, 47);
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let pid = sandbox.daemon.as_ref().expect("running daemon").id();
+    let idle = stable_thread_count(pid);
+    let plugins = sandbox.data.join("plugins");
+    let initial = package[..package.len().min(64 * 1024)].to_vec();
+
+    for path in ["/api/v1/plugins", "/api/v1/import"] {
+        let stalled = start_stalled_upload(
+            &address,
+            "POST",
+            path,
+            package.len() + 32 * 1024 * 1024,
+            &initial,
+        );
+        wait_for_package_staging(&plugins);
+        assert_eq!(
+            stable_thread_count(pid),
+            idle,
+            "a package upload must not add a takeover thread ({path})"
+        );
+        drop(stalled);
+        wait_for_no_package_staging(&plugins);
+    }
+}
+
+/// A package upload is a long-lived stream: it draws from the same
+/// `max_streams` budget as downloads and is refused with the stable 503 before
+/// its body is read.
+#[test]
+fn a_stalled_download_refuses_a_package_upload_with_503() {
+    let mut sandbox = Sandbox::new();
+    sandbox.allow_insecure_install_with("max_streams = 1\n");
+    let key = SigningKey::from_bytes(&[48u8; 32]);
+    let package = plugin_bundle(&key, "demo", "1.0.0", None, false);
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let content = large_download_body();
+    let put = raw_request(
+        &address,
+        "POST",
+        "/api/v1/blobs",
+        "application/octet-stream",
+        &content,
+    );
+    assert_eq!(put.status, 200, "{:?}", put.body);
+    let id = json_body(&put)["id"].as_str().expect("blob id").to_string();
+    let mut stalled = TcpStream::connect(&address).expect("stalled connect");
+    stalled
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    stalled
+        .write_all(
+            format!(
+                "GET /api/v1/blobs/{} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                id, address
+            )
+            .as_bytes(),
+        )
+        .expect("stalled request");
+    assert_eq!(read_response_head(&mut stalled).0, 200);
+
+    let mut upload = TcpStream::connect(&address).expect("upload connect");
+    upload
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    upload
+        .write_all(
+            format!(
+                "POST /api/v1/plugins HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                address,
+                package.len()
+            )
+            .as_bytes(),
+        )
+        .expect("upload head");
+    let (status, headers) = read_response_head(&mut upload);
+    assert_eq!(status, 503, "a full stream budget refuses the package upload");
+    assert!(
+        headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("retry-after") && value == "1"),
+        "busy upload keeps Retry-After: 1: {headers:?}"
+    );
+    drop(upload);
     drop(stalled);
 }
 
