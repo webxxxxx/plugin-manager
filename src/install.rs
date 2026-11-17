@@ -260,10 +260,10 @@ fn default_conf_text(layout: &Layout) -> String {
          # blocking_threads = 2 (default; clamped 2..8). The blocking pool\n\
          # runs face handlers that cannot run on the server loop; a full\n\
          # queue answers 503 busy. Unix only in this slice; Windows keeps\n\
-         # the per-connection fallback. After #125 the default topology is\n\
-         # five daemon threads: supervisor, server loop, plugin reactor and\n\
-         # two blocking workers. #126 merges the plugin reactor and reaches\n\
-         # four. Raising the value is an operator choice.\n\
+         # the per-connection fallback. The default Unix topology is four\n\
+         # daemon threads: the supervisor loop (which also polls plugin\n\
+         # stdio), the server loop and these two workers. Raising the value\n\
+         # is an operator choice.\n\
          # max_body_bytes = 8388608 / 67108864 / 536870912\n\
          # max_json_body_bytes = 65536 / 262144 / 1048576\n\
          # max_complete_body_bytes = 131072 / 1048576 / 8388608\n\

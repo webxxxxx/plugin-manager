@@ -41,6 +41,11 @@ use crate::status::Status;
 use crate::supervisor::{self, Event};
 use crate::wake::Wake;
 
+/// The supervisor loop's bounded wait when it has no earlier deadline. With a
+/// reactor this is the plugin poll's timeout, so an idle daemon wakes twice a
+/// tick at most: once for plugin stdio and once for shutdown/timers.
+const POLL_WAIT_MS: i32 = 50;
+
 pub fn run(conf: Option<PathBuf>) -> i32 {
     // The explicit --conf must be loaded before paths::config_dir() so its
     // config_dir wins and does not get shadowed by the default cache.
@@ -719,6 +724,18 @@ impl Daemon {
 
     #[cfg(unix)]
     fn set_reactor(&mut self, reactor: Option<Arc<Reactor>>) {
+        // The supervisor loop polls plugin stdio itself. Attaching the poll's
+        // self-pipe to the shared wake latch means a management request or a
+        // queued raw frame interrupts that poll instead of waiting it out.
+        if let Some(reactor) = &reactor {
+            match reactor.interrupt_handle() {
+                Ok(interrupt) => self.wake.set_interrupt(interrupt),
+                Err(error) => log::svcd(&format!(
+                    "svcd: cannot bind the plugin-stdio poll wake: {}",
+                    error
+                )),
+            }
+        }
         self.reactor = reactor.clone();
         for slot in self.slots.values_mut() {
             slot.set_reactor(reactor.clone());
@@ -816,9 +833,34 @@ impl Daemon {
             }
             // Management requests and plugin stdout wake this immediately;
             // the bounded wait is only for shutdown and timer deadlines.
-            self.wake.wait_timeout(Duration::from_millis(50));
+            self.wait_for_work();
         }
         self.stop_all();
+    }
+
+    /// Bounded wait for the next event. With a reactor this wait *is* the
+    /// plugin poll: the supervisor loop owns plugin stdio, and the shared wake
+    /// latch writes to the poll's self-pipe so a management request returns at
+    /// once. Without one (Windows, or a failed start) the condvar latch is the
+    /// only wake source.
+    fn wait_for_work(&self) {
+        #[cfg(unix)]
+        if let Some(reactor) = &self.reactor {
+            reactor.poll_once(POLL_WAIT_MS);
+            return;
+        }
+        self.wake
+            .wait_timeout(Duration::from_millis(POLL_WAIT_MS as u64));
+    }
+
+    /// One non-blocking plugin-stdio pass. A synchronous start/stop wait reaches
+    /// this through `pump`, so plugin pipes keep moving while the supervisor is
+    /// inside an RPC.
+    fn poll_plugin_io(&self) {
+        #[cfg(unix)]
+        if let Some(reactor) = &self.reactor {
+            reactor.poll_once(0);
+        }
     }
 
     fn handle(&mut self, incoming: channel::PendingCall) {
@@ -1922,6 +1964,7 @@ impl Daemon {
     }
 
     fn pump(&mut self) {
+        self.poll_plugin_io();
         let now = self.now_ms();
         let ids: Vec<String> = self.slots.keys().cloned().collect();
         let mut changed = false;

@@ -1,10 +1,15 @@
 //! Unix I/O reactor for plugin stdio.
 //!
 //! Each notify plugin used to own two OS threads (stdout and stderr readers).
-//! This module owns all those pipes from one poll loop instead, keeping the
+//! This module owns all those pipes from one poll set instead, keeping the
 //! process isolation boundary intact while removing the per-plugin thread cost.
 //! Windows keeps the existing reader-thread path because anonymous child pipes
 //! are not IOCP-ready.
+//!
+//! The poll set has no thread of its own: the supervisor loop owns it and
+//! drives one pass with Reactor::poll_once on its own thread, so plugin stdio
+//! costs no daemon thread (#126). Producers (a slot starting a plugin, the raw
+//! hub queueing a frame) only send commands and poke the self-pipe.
 //!
 //! Protocol-3 raw plugins are part of the same poll set: their stdout carries
 //! `u32 payload_len + u32 stream_id + payload` frames and their stdin is fed
@@ -20,15 +25,12 @@ use std::os::unix::net::UnixStream;
 use std::process::{ChildStderr, ChildStdin, ChildStdout};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
-use std::thread;
 
 use crate::ipc::{FrameError, FrameEvent};
 use crate::log::{self, LogSink};
 use crate::rawhub::{RawFailure, RawHub};
-use crate::threads;
 use crate::wake::Wake;
 
-const POLL_TIMEOUT_MS: i32 = 50;
 const READ_CHUNK: usize = 8 * 1024;
 const MAX_LOG_LINE: usize = 64 * 1024;
 /// Protocol-3 raw frame header: `u32 payload_len (BE) + u32 stream_id (BE)`.
@@ -47,16 +49,23 @@ const RAW_WRITE_BUDGET: usize = 256 * 1024;
 
 pub struct Reactor {
     tx: Sender<Command>,
-    /// Self-pipe: commands and raw payloads wake the poll loop immediately
-    /// instead of waiting for the poll timeout.
+    /// Self-pipe: commands and raw payloads wake the poll immediately instead
+    /// of waiting for the timeout.
     wake: UnixStream,
-    join: Mutex<Option<thread::JoinHandle<()>>>,
+    /// The poll set. The supervisor loop drives it; producers only enqueue
+    /// commands through tx and poke wake.
+    core: Mutex<Core>,
+}
+
+struct Core {
+    rx: Receiver<Command>,
+    wake: UnixStream,
+    sources: Vec<Source>,
 }
 
 enum Command {
     Register(Vec<Source>),
     Unregister(String),
-    Shutdown,
 }
 
 #[derive(Clone, Copy)]
@@ -134,10 +143,10 @@ impl Source {
 
 /// Bounded queue of complete raw frames waiting for one plugin's stdin.
 ///
-/// The hub pushes frames from the HTTP reactor thread; the plugin-stdio
-/// reactor drains them on `POLLOUT`. Both sides stay non-blocking, so a slow
-/// plugin costs queue slots (reported as `writer_queue_full`) instead of a
-/// blocked thread.
+/// The hub pushes frames from a server-loop thread; the supervisor loop's
+/// plugin-stdio poll drains them on `POLLOUT`. Both sides stay non-blocking,
+/// so a slow plugin costs queue slots (reported as `writer_queue_full`)
+/// instead of a blocked thread.
 pub struct RawOutQueue {
     state: Mutex<RawOutState>,
     wake: UnixStream,
@@ -228,20 +237,42 @@ impl RawOutQueue {
 }
 
 impl Reactor {
+    /// Build the poll set and its handle. No thread is started: the caller's
+    /// loop owns the polling, which is the supervisor loop in the daemon.
     pub fn start() -> io::Result<Arc<Self>> {
         let (wake_rx, wake) = UnixStream::pair()?;
         wake_rx.set_nonblocking(true)?;
         wake.set_nonblocking(true)?;
         let (tx, rx) = mpsc::channel();
-        let join = thread::Builder::new()
-            .name("svcd-reactor".into())
-            .stack_size(threads::io_stack())
-            .spawn(move || run(rx, wake_rx))?;
         Ok(Arc::new(Reactor {
             tx,
             wake,
-            join: Mutex::new(Some(join)),
+            core: Mutex::new(Core {
+                rx,
+                wake: wake_rx,
+                sources: Vec::new(),
+            }),
         }))
+    }
+
+    /// A writable clone of the self-pipe. A loop that owns this reactor attaches
+    /// it to its wake latch, so a management request interrupts the poll instead
+    /// of waiting for the timeout.
+    pub fn interrupt_handle(&self) -> io::Result<UnixStream> {
+        self.wake.try_clone()
+    }
+
+    /// Drive one poll pass on the caller's thread. Registration changes queued
+    /// since the last pass are applied first; `timeout_ms` bounds the wait, and
+    /// 0 turns the pass into a non-blocking drain for a caller that is already
+    /// busy (a synchronous start/stop wait).
+    pub fn poll_once(&self, timeout_ms: i32) {
+        let mut core = match self.core.lock() {
+            Ok(core) => core,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        core.apply_commands();
+        core.poll(timeout_ms);
     }
 
     /// Register one notify plugin. A later registration with the same key
@@ -295,7 +326,7 @@ impl Reactor {
         self.send(Command::Register(sources))
     }
 
-    /// Register a protocol-3 plugin's stdin/stdout/stderr with the poll loop
+    /// Register a protocol-3 plugin's stdin/stdout/stderr with the poll set
     /// and return the queue the hub feeds frames into.
     pub fn register_raw(
         &self,
@@ -355,11 +386,10 @@ impl Reactor {
 
 impl Drop for Reactor {
     fn drop(&mut self) {
-        let _ = self.send(Command::Shutdown);
-        if let Ok(mut join) = self.join.lock() {
-            if let Some(join) = join.take() {
-                let _ = join.join();
-            }
+        // The owning loop is going away; dropping the sources closes every
+        // plugin pipe this reactor held.
+        if let Ok(mut core) = self.core.lock() {
+            core.sources.clear();
         }
     }
 }
@@ -395,36 +425,34 @@ fn enlarge_pipe(file: &File) {
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn enlarge_pipe(_file: &File) {}
 
-fn run(rx: Receiver<Command>, wake: UnixStream) {
-    let mut sources: Vec<Source> = Vec::new();
-    loop {
-        let mut shutdown = false;
+impl Core {
+    /// Apply every registration change queued since the last pass.
+    fn apply_commands(&mut self) {
         loop {
-            match rx.try_recv() {
+            match self.rx.try_recv() {
                 Ok(Command::Register(mut incoming)) => {
                     if let Some(id) = incoming.first().map(|source| source.key.clone()) {
-                        sources.retain(|source| source.key != id);
+                        self.sources.retain(|source| source.key != id);
                     }
-                    sources.append(&mut incoming);
+                    self.sources.append(&mut incoming);
                 }
-                Ok(Command::Unregister(id)) => sources.retain(|source| source.key != id),
-                Ok(Command::Shutdown) => {
-                    shutdown = true;
-                    break;
-                }
+                Ok(Command::Unregister(id)) => self.sources.retain(|source| source.key != id),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    shutdown = true;
+                    // No producer can reach these pipes any more.
+                    self.sources.clear();
                     break;
                 }
             }
         }
-        if shutdown {
-            return;
-        }
+    }
 
+    /// One poll pass. The caller's loop owns this call, so the wait is the
+    /// supervisor loop's only blocking point for plugin stdio.
+    fn poll(&mut self, timeout_ms: i32) {
+        let sources = &mut self.sources;
         // A full per-plugin queue pauses that plugin's reader, not the whole
-        // reactor. Retry blocked sources before waiting for more I/O.
+        // poll set. Retry blocked sources before waiting for more I/O.
         for source in sources.iter_mut() {
             if !source.blocked {
                 continue;
@@ -432,15 +460,15 @@ fn run(rx: Receiver<Command>, wake: UnixStream) {
             source.blocked = false;
             resume(source);
         }
-        retire(&mut sources);
+        retire(sources);
 
         let mut fds: Vec<libc::pollfd> = Vec::with_capacity(sources.len() + 1);
         fds.push(libc::pollfd {
-            fd: wake.as_raw_fd(),
+            fd: self.wake.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         });
-        for source in &sources {
+        for source in sources.iter() {
             let events = poll_events(source);
             fds.push(libc::pollfd {
                 fd: if events == 0 {
@@ -453,17 +481,19 @@ fn run(rx: Receiver<Command>, wake: UnixStream) {
             });
         }
         let blocked_any = sources.iter().any(|source| source.blocked);
-        let timeout = if blocked_any { 10 } else { POLL_TIMEOUT_MS };
+        // A blocked source is retried on the next pass, so it must not wait for
+        // the caller's full timeout. A caller that is already busy passes 0.
+        let timeout = if blocked_any { timeout_ms.min(10) } else { timeout_ms };
         let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if ready < 0 {
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
                 log::svcd(&format!("svcd: reactor poll failed: {}", error));
             }
-            continue;
+            return;
         }
         if fds[0].revents & libc::POLLIN != 0 {
-            drain_wake(&wake);
+            drain_wake(&self.wake);
         }
 
         // Feed plugin stdin before collecting plugin stdout: a plugin can only
@@ -487,7 +517,7 @@ fn run(rx: Receiver<Command>, wake: UnixStream) {
                 read_source(&mut sources[index]);
             }
         }
-        retire(&mut sources);
+        retire(sources);
     }
 }
 
@@ -896,6 +926,53 @@ mod tests {
 
         let delivered = pump(&queue, &mut read, &mut write);
         assert_eq!(delivered, frame);
+    }
+
+    /// The supervisor loop owns the poll: nothing is delivered until the
+    /// caller polls. A background reactor thread would deliver on its own.
+    #[test]
+    fn plugin_frames_arrive_only_when_the_caller_polls() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let reactor = Reactor::start().expect("reactor");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("printf '{\"jsonrpc\":\"2.0\",\"method\":\"svcd.ready\"}\\n'")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("child");
+        let (sender, receiver) = mpsc::sync_channel(4);
+        reactor
+            .register(
+                "demo".into(),
+                child.stdout.take().expect("stdout"),
+                Some(child.stderr.take().expect("stderr")),
+                sender,
+                None,
+                None,
+                4096,
+                Framing::Lines,
+            )
+            .expect("register");
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            receiver.try_recv().is_err(),
+            "a background thread must not deliver plugin stdout"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let frame = loop {
+            assert!(Instant::now() < deadline, "the caller's poll never ran");
+            reactor.poll_once(50);
+            if let Ok(FrameEvent::Frame(frame)) = receiver.try_recv() {
+                break frame.expect("frame");
+            }
+        };
+        assert_eq!(frame, "{\"jsonrpc\":\"2.0\",\"method\":\"svcd.ready\"}");
+        let _ = child.wait();
     }
 
     #[test]

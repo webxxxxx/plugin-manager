@@ -161,7 +161,7 @@ Windows/macOS 可使用启动项或 LaunchAgent，当前未提供生成器。
 
 ## 资源
 
-- daemon 空闲：约 **3.1–3.4 MiB RSS**、**10 个线程**；
+- daemon 空闲：约 **3.1–3.4 MiB RSS**、**4 个线程**（Unix 默认拓扑：#126 之后为 supervisor、server loop 与 2 条阻塞 worker）；
 - 每个用户一个 daemon：10 个用户空闲约 30–40 MiB daemon RSS；
 - 插件进程另算；
 - 二进制可共享页缓存，不按用户复制。

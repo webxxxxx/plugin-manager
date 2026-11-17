@@ -88,12 +88,11 @@ bind = 127.0.0.1:8787
 # (control-channel round trips and disk work). It starts a fixed number of
 # worker threads and never spawns a temporary one. A full queue or a second job
 # on one connection answers 503 busy with Retry-After.
-# `blocking_threads` defaults to 2 and is clamped to 2..8. After #125 the
-# default topology is five daemon threads: supervisor, server loop, plugin
-# reactor and these two workers; #126 merges the plugin reactor and reaches
-# four. Raising the value is an operator choice, not a regression. The pool is
-# Unix-only in this slice; Windows keeps the per-connection fallback. Requires a
-# daemon restart.
+# `blocking_threads` defaults to 2 and is clamped to 2..8. The default Unix
+# topology is four daemon threads: the supervisor loop (which also polls plugin
+# stdio), the server loop and these two workers. Raising the value is an
+# operator choice, not a regression. The pool is Unix-only in this slice;
+# Windows keeps the per-connection fallback. Requires a daemon restart.
 #
 # On Windows the HTTP listener keeps one thread per admitted connection, so
 # max_connections is also the connection-thread cap; the final Unix
@@ -113,7 +112,7 @@ bind = 127.0.0.1:8787
 #   ws_inflight_bytes       unacknowledged raw bytes across all plugins
 #   ws_inflight_requests    unacknowledged raw frames across all plugins
 #   ws_raw_queue            frames queued for one plugin's stdin
-# On Unix the plugin-stdio reactor owns the raw pipes, so a raw plugin adds no
+# On Unix the supervisor loop polls the raw pipes, so a raw plugin adds no
 # threads; a slow plugin fills its queue instead of blocking a thread. Raise
 # the in-flight limits when the workload legitimately has many large frames in
 # flight. On Windows the route answers 501 not_supported.
