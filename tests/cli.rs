@@ -131,40 +131,21 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
-fn line_for<'a>(text: &'a str, id: &str) -> &'a str {
-    text.lines()
-        .find(|line| line.split_whitespace().next() == Some(id))
-        .unwrap_or_else(|| panic!("no line for {} in:\n{}", id, text))
-}
-
-fn has_row(text: &str, id: &str) -> bool {
-    text.lines()
-        .any(|line| line.split_whitespace().next() == Some(id))
-}
-
 #[test]
-fn list_hides_the_builtin_and_shows_a_core_definition() {
+fn list_without_a_daemon_reports_unreachable() {
     let sandbox = Sandbox::new();
     sandbox.write_definition("demo", definition("demo"));
 
     let output = sandbox.run(&["list"]);
 
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
-    let text = stdout(&output);
-    assert!(text.starts_with("ID"), "table:\n{}", text);
-    assert!(text.contains("KIND"));
-    assert!(text.contains("STATE"));
-    assert!(text.contains("AUTO"));
-    assert!(text.contains("PID"));
-    assert!(text.contains("VERSION"));
-
-    let demo = line_for(&text, "demo");
-    assert!(demo.contains("core"), "demo row: {}", demo);
-    assert!(demo.contains("stopped"), "demo row: {}", demo);
-    assert!(demo.contains("[auto]"), "demo row: {}", demo);
-    assert!(demo.contains("1.0.0"), "demo row: {}", demo);
-
-    assert!(!has_row(&text, "svc"), "table:\n{}", text);
+    // The offline fallback is gone: a reachable daemon is required, and a dead
+    // one must be reported instead of printing an empty table.
+    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
+    assert!(
+        stderr(&output).contains("svcd unreachable"),
+        "stderr:\n{}",
+        stderr(&output)
+    );
 }
 
 #[test]
@@ -320,39 +301,21 @@ fn an_spk_only_field_rejects_the_definition_with_a_reason() {
     bad["platform"] = json!("x86_64-unknown-linux-musl");
     sandbox.write_definition("bad", bad);
 
-    let output = sandbox.run(&["list"]);
-
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
-    assert!(
-        !stdout(&output)
-            .lines()
-            .any(|line| line.split_whitespace().next() == Some("bad")),
-        "rejected definition leaked into the table:\n{}",
-        stdout(&output)
-    );
-    let errors = stderr(&output);
+    let status = sandbox.run(&["status", "bad"]);
+    assert_eq!(status.status.code(), Some(1));
+    let errors = stderr(&status);
     assert!(errors.contains("bad.json"), "stderr:\n{}", errors);
     assert!(errors.contains("platform"), "stderr:\n{}", errors);
     assert!(errors.contains(".spk-only"), "stderr:\n{}", errors);
-
-    let status = sandbox.run(&["status", "bad"]);
-    assert_eq!(status.status.code(), Some(1));
-    assert!(stderr(&status).contains("platform"));
 }
 
 #[test]
-fn the_reserved_svc_id_is_rejected_and_the_builtin_stays_hidden_from_list() {
+fn the_builtin_svc_still_answers_status() {
     let sandbox = Sandbox::new();
     sandbox.write_definition("svc", definition("svc"));
 
-    let output = sandbox.run(&["list"]);
-
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
-    let errors = stderr(&output);
-    assert!(errors.contains("reserved"), "stderr:\n{}", errors);
-    let table = stdout(&output);
-    assert!(!has_row(&table, "svc"), "table:\n{}", table);
-
+    // The rejected definition is only visible through the daemon log now; the
+    // builtin keeps answering its own status.
     let status = sandbox.run(&["status", "svc"]);
     assert_eq!(status.status.code(), Some(0));
     assert!(stdout(&status).contains("running"));
@@ -363,21 +326,6 @@ fn a_duplicate_id_is_rejected_and_the_first_definition_wins() {
     let sandbox = Sandbox::new();
     sandbox.write_definition("a", definition("demo"));
     sandbox.write_definition("b", definition("demo"));
-
-    let output = sandbox.run(&["list"]);
-
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
-    let demo_lines = stdout(&output)
-        .lines()
-        .filter(|line| line.split_whitespace().next() == Some("demo"))
-        .count();
-    assert_eq!(demo_lines, 1, "table:\n{}", stdout(&output));
-    let errors = stderr(&output);
-    assert!(
-        errors.contains("duplicate service id"),
-        "stderr:\n{}",
-        errors
-    );
 
     let status = sandbox.run(&["status", "demo"]);
     assert_eq!(status.status.code(), Some(0));
@@ -391,10 +339,10 @@ fn a_relative_exec_path_is_rejected_with_a_readable_reason() {
     bad["exec"]["path"] = json!("payload/bad");
     sandbox.write_definition("bad", bad);
 
-    let output = sandbox.run(&["list"]);
+    let status = sandbox.run(&["status", "bad"]);
 
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
-    let errors = stderr(&output);
+    assert_eq!(status.status.code(), Some(1), "stderr: {}", stderr(&status));
+    let errors = stderr(&status);
     assert!(errors.contains("bad.json"), "stderr:\n{}", errors);
     assert!(errors.contains("absolute"), "stderr:\n{}", errors);
 }

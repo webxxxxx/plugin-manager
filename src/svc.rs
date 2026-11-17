@@ -268,35 +268,46 @@ fn parse_lines(value: &str) -> Result<usize, ()> {
     Ok(lines)
 }
 
+/// `svc list` reads live state only. It used to fall back to reading
+/// `services.d` when the daemon could not be reached, which made "daemon is
+/// down" and "there are no services" look identical; the fallback is gone and an
+/// unreachable daemon is now reported and exits non-zero.
 fn list() -> i32 {
-    if let Some(statuses) = live_list() {
-        println!("{}", status::table(&statuses));
-        return EXIT_OK;
-    }
-
-    let loaded = definition::load_services(&paths::services_dir());
-    for issue in &loaded.issues {
-        eprintln!("svc: warning: {}", issue);
-    }
-    let statuses: Vec<Status> = loaded.registry.managed_values().map(Status::of).collect();
-    println!("{}", status::table(&statuses));
-    EXIT_OK
-}
-
-fn live_list() -> Option<Vec<Status>> {
-    let response = channel::request(&paths::config_dir(), "svc.list", json!({})).ok()?;
-    if let Some(error) = response.error {
-        eprintln!("svc: {}", error.message);
-        return None;
-    }
-    let services = response.result?.get("services")?.clone();
-    match serde_json::from_value::<Vec<Status>>(services) {
-        Ok(statuses) => Some(statuses),
-        Err(error) => {
-            eprintln!("svc: invalid list response: {}", error);
-            None
+    match live_list() {
+        Ok(statuses) => {
+            println!("{}", status::table(&statuses));
+            EXIT_OK
+        }
+        Err(ListError::Unreachable(error)) => {
+            eprintln!("svc: svcd unreachable: {}", error);
+            EXIT_DAEMON_UNREACHABLE
+        }
+        Err(ListError::Daemon(message)) => {
+            eprintln!("svc: {}", message);
+            EXIT_SERVICE_ERROR
         }
     }
+}
+
+/// A live listing failed. An unreachable daemon is an environment problem (exit
+/// 2); a daemon that answered with an error is a service problem (exit 1).
+enum ListError {
+    Unreachable(String),
+    Daemon(String),
+}
+
+fn live_list() -> Result<Vec<Status>, ListError> {
+    let response = channel::request(&paths::config_dir(), "svc.list", json!({}))
+        .map_err(|error| ListError::Unreachable(error.to_string()))?;
+    if let Some(error) = response.error {
+        return Err(ListError::Daemon(error.message));
+    }
+    let services = response
+        .result
+        .and_then(|result| result.get("services").cloned())
+        .ok_or_else(|| ListError::Daemon("empty list response".into()))?;
+    serde_json::from_value::<Vec<Status>>(services)
+        .map_err(|error| ListError::Daemon(format!("invalid list response: {}", error)))
 }
 
 fn show_status(id: &str, json: bool) -> i32 {

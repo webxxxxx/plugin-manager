@@ -330,22 +330,20 @@ fn self_install_copies_aliases_and_uninstalls_without_touching_the_host() {
     }
 
     let svc = prefix.join(if cfg!(windows) { "svc.exe" } else { "svc" });
-    let listed = Command::new(&svc)
-        .arg("list")
+    // `svc list` needs a reachable daemon now; `compat` still proves the
+    // installed alias runs without one.
+    let ran = Command::new(&svc)
+        .arg("compat")
         .env("SVCD_CONFIG_DIR", sandbox.config_dir())
         .env("SVCD_DATA_DIR", sandbox.data_dir())
         .env("SVCD_LOG_DIR", sandbox.root.join("logs"))
         .output()
         .expect("run installed svc");
-    assert_eq!(listed.status.code(), Some(0), "{}", stderr(&listed));
-    let list_text = stdout(&listed);
-    assert!(list_text.starts_with("ID"), "list:\n{}", list_text);
+    assert_eq!(ran.status.code(), Some(0), "{}", stderr(&ran));
     assert!(
-        !list_text
-            .lines()
-            .any(|line| line.split_whitespace().next() == Some("svc")),
-        "list:\n{}",
-        list_text
+        stdout(&ran).contains("platform:"),
+        "compat:\n{}",
+        stdout(&ran)
     );
 
     let removed = sandbox.run(&["--uninstall", "--prefix", prefix_arg, "--no-service"]);
