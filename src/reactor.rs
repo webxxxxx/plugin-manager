@@ -17,6 +17,7 @@
 
 #![cfg(unix)]
 
+use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -25,6 +26,7 @@ use std::os::unix::net::UnixStream;
 use std::process::{ChildStderr, ChildStdin, ChildStdout};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use crate::ipc::{FrameError, FrameEvent};
 use crate::log::{self, LogSink};
@@ -54,10 +56,10 @@ pub struct Reactor {
     wake: UnixStream,
     /// The poll set. The supervisor loop drives it; producers only enqueue
     /// commands through tx and poke wake.
-    core: Mutex<Core>,
+    poll_set: Mutex<PollSet>,
 }
 
-struct Core {
+struct PollSet {
     rx: Receiver<Command>,
     wake: UnixStream,
     sources: Vec<Source>,
@@ -236,6 +238,28 @@ impl RawOutQueue {
     }
 }
 
+thread_local! {
+    /// Set on the supervisor loop only. That loop owns plugin stdio, so a
+    /// synchronous wait on its thread (an install hook, a status hook) polls
+    /// one pass to keep the plugin pipes moving. Other threads have no binding.
+    static WAITING_LOOP: RefCell<Option<Weak<Reactor>>> = const { RefCell::new(None) };
+}
+
+/// Bind `reactor` as this thread's poll set so synchronous waits can poll it.
+/// Only the loop that owns the reactor may bind it.
+pub fn bind_waiting_loop(reactor: &Arc<Reactor>) {
+    WAITING_LOOP.with(|slot| *slot.borrow_mut() = Some(Arc::downgrade(reactor)));
+}
+
+/// One non-blocking pass over the poll set bound to this thread. A thread that
+/// owns no reactor (a worker, a test, Windows) does nothing.
+pub fn poll_waiting_loop() {
+    let reactor = WAITING_LOOP.with(|slot| slot.borrow().as_ref().and_then(Weak::upgrade));
+    if let Some(reactor) = reactor {
+        reactor.poll_once(Duration::ZERO);
+    }
+}
+
 impl Reactor {
     /// Build the poll set and its handle. No thread is started: the caller's
     /// loop owns the polling, which is the supervisor loop in the daemon.
@@ -247,7 +271,7 @@ impl Reactor {
         Ok(Arc::new(Reactor {
             tx,
             wake,
-            core: Mutex::new(Core {
+            poll_set: Mutex::new(PollSet {
                 rx,
                 wake: wake_rx,
                 sources: Vec::new(),
@@ -263,16 +287,16 @@ impl Reactor {
     }
 
     /// Drive one poll pass on the caller's thread. Registration changes queued
-    /// since the last pass are applied first; `timeout_ms` bounds the wait, and
-    /// 0 turns the pass into a non-blocking drain for a caller that is already
-    /// busy (a synchronous start/stop wait).
-    pub fn poll_once(&self, timeout_ms: i32) {
-        let mut core = match self.core.lock() {
-            Ok(core) => core,
+    /// since the last pass are applied first; `timeout` bounds the wait, and
+    /// `Duration::ZERO` turns the pass into a non-blocking drain for a caller
+    /// that is already busy (a synchronous start/stop wait).
+    pub fn poll_once(&self, timeout: Duration) {
+        let mut poll_set = match self.poll_set.lock() {
+            Ok(poll_set) => poll_set,
             Err(poisoned) => poisoned.into_inner(),
         };
-        core.apply_commands();
-        core.poll(timeout_ms);
+        poll_set.apply_commands();
+        poll_set.poll(timeout);
     }
 
     /// Register one notify plugin. A later registration with the same key
@@ -388,8 +412,8 @@ impl Drop for Reactor {
     fn drop(&mut self) {
         // The owning loop is going away; dropping the sources closes every
         // plugin pipe this reactor held.
-        if let Ok(mut core) = self.core.lock() {
-            core.sources.clear();
+        if let Ok(mut poll_set) = self.poll_set.lock() {
+            poll_set.sources.clear();
         }
     }
 }
@@ -425,7 +449,7 @@ fn enlarge_pipe(file: &File) {
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn enlarge_pipe(_file: &File) {}
 
-impl Core {
+impl PollSet {
     /// Apply every registration change queued since the last pass.
     fn apply_commands(&mut self) {
         loop {
@@ -449,7 +473,7 @@ impl Core {
 
     /// One poll pass. The caller's loop owns this call, so the wait is the
     /// supervisor loop's only blocking point for plugin stdio.
-    fn poll(&mut self, timeout_ms: i32) {
+    fn poll(&mut self, timeout: Duration) {
         let sources = &mut self.sources;
         // A full per-plugin queue pauses that plugin's reader, not the whole
         // poll set. Retry blocked sources before waiting for more I/O.
@@ -481,10 +505,21 @@ impl Core {
             });
         }
         let blocked_any = sources.iter().any(|source| source.blocked);
+        let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
         // A blocked source is retried on the next pass, so it must not wait for
         // the caller's full timeout. A caller that is already busy passes 0.
-        let timeout = if blocked_any { timeout_ms.min(10) } else { timeout_ms };
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+        let timeout_ms = if blocked_any {
+            timeout_ms.min(10)
+        } else {
+            timeout_ms
+        };
+        let ready = unsafe {
+            libc::poll(
+                fds.as_mut_ptr(),
+                fds.len() as libc::nfds_t,
+                timeout_ms,
+            )
+        };
         if ready < 0 {
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
@@ -928,12 +963,25 @@ mod tests {
         assert_eq!(delivered, frame);
     }
 
+    /// One caller poll pass, returning the frames it delivered. `Closed` is
+    /// ignored: the test asserts frames, not the end of the pipe.
+    fn collect_frames(reactor: &Reactor, receiver: &Receiver<FrameEvent>) -> Vec<String> {
+        reactor.poll_once(Duration::from_millis(10));
+        let mut frames = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let FrameEvent::Frame(frame) = event {
+                frames.push(frame.expect("frame"));
+            }
+        }
+        frames
+    }
+
     /// The supervisor loop owns the poll: nothing is delivered until the
     /// caller polls. A background reactor thread would deliver on its own.
     #[test]
     fn plugin_frames_arrive_only_when_the_caller_polls() {
         use std::process::{Command, Stdio};
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
 
         let reactor = Reactor::start().expect("reactor");
         let mut child = Command::new("sh")
@@ -956,24 +1004,97 @@ mod tests {
                 Framing::Lines,
             )
             .expect("register");
-
-        std::thread::sleep(Duration::from_millis(300));
+        // The child has exited, so its frame is already in the pipe. From
+        // here on any delivery could only come from a thread this module owns.
+        let _ = child.wait();
         assert!(
             receiver.try_recv().is_err(),
             "a background thread must not deliver plugin stdout"
         );
 
+        let mut frame = None;
         let deadline = Instant::now() + Duration::from_secs(5);
-        let frame = loop {
-            assert!(Instant::now() < deadline, "the caller's poll never ran");
-            reactor.poll_once(50);
-            if let Ok(FrameEvent::Frame(frame)) = receiver.try_recv() {
-                break frame.expect("frame");
+        while frame.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "poll_once did not deliver the plugin frame within 5 s"
+            );
+            reactor.poll_once(Duration::from_millis(50));
+            if let Ok(FrameEvent::Frame(result)) = receiver.try_recv() {
+                frame = Some(result.expect("frame"));
             }
-        };
-        assert_eq!(frame, "{\"jsonrpc\":\"2.0\",\"method\":\"svcd.ready\"}");
-        let _ = child.wait();
+        }
+        assert_eq!(
+            frame.as_deref(),
+            Some("{\"jsonrpc\":\"2.0\",\"method\":\"svcd.ready\"}")
+        );
     }
+
+    /// A management request arrives while the supervisor loop waits inside the
+    /// poll; the shared wake latch must end that wait, not the timeout.
+    #[test]
+    fn a_wake_notify_ends_a_blocking_poll_at_once() {
+        use std::time::Instant;
+
+        let reactor = Reactor::start().expect("reactor");
+        let wake = Wake::new();
+        wake.set_interrupt(reactor.interrupt_handle().expect("interrupt"));
+        wake.notify();
+
+        let started = Instant::now();
+        reactor.poll_once(Duration::from_secs(30));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "notify must end the poll, not the timeout"
+        );
+    }
+
+    /// The per-plugin frame queue is bounded. A full queue pauses that source
+    /// instead of growing; the next caller poll hands over one more frame, so
+    /// nothing is lost or reordered.
+    #[test]
+    fn a_full_frame_queue_pauses_that_source_until_the_caller_drains_it() {
+        use std::process::{Command, Stdio};
+
+        let reactor = Reactor::start().expect("reactor");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("printf 'one\\ntwo\\nthree\\n'")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("child");
+        let (sender, receiver) = mpsc::sync_channel(1);
+        reactor
+            .register(
+                "demo".into(),
+                child.stdout.take().expect("stdout"),
+                Some(child.stderr.take().expect("stderr")),
+                sender,
+                None,
+                None,
+                64,
+                Framing::Lines,
+            )
+            .expect("register");
+        let _ = child.wait();
+
+        assert_eq!(
+            collect_frames(&reactor, &receiver),
+            vec!["one".to_string()],
+            "one pass must stop at the bounded queue instead of growing it"
+        );
+        assert_eq!(
+            collect_frames(&reactor, &receiver),
+            vec!["two".to_string()],
+            "the paused source resumes only when the caller drains a slot"
+        );
+        assert_eq!(
+            collect_frames(&reactor, &receiver),
+            vec!["three".to_string()]
+        );
+    }
+
 
     #[test]
     fn raw_queue_preserves_frame_order_across_passes() {

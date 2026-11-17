@@ -156,8 +156,8 @@ _Avoid_: UI、界面层、接口层
 _Avoid_: 接管、takeover、handler 调用
 
 **插件 stdio 反应器（Plugin stdio reactor）**:
-Unix 上唯一拥有插件管道的那条 poll 线程（`svcd-reactor`）：通知型插件的 stdout/stderr、exec 型插件的日志、协议 3 插件的 stdin/stdout/stderr 都由它读写，所以每个插件不再自带线程。超时/背压由每条管道自己的队列决定，不是线程阻塞。反应器起不来（或非 Unix 构建）时才退回「每插件读写线程」的降级路径。
-_Avoid_: IO 线程池、epoll 管理器
+Unix 上拥有插件管道的那个 poll 集：通知型插件的 stdout/stderr、exec 型插件的日志、协议 3 插件的 stdin/stdout/stderr 都由它读写，所以每个插件不再自带线程。它没有自己的线程——supervisor loop 在自己的循环里驱动它（`Reactor::poll_once`），注册与唤醒走命令通道加 self-pipe。超时/背压由每条管道自己的队列决定，不是线程阻塞。反应器不存在（或非 Unix 构建）时才退回「每插件读写线程」的降级路径。
+_Avoid_: IO 线程池、epoll 管理器、反应器线程
 
 **raw 传输（Raw transport）**:
 协议 3 插件与 UI 之间的二进制通道：插件 stdin/stdout 上是 `u32 长度 + u32 stream_id + payload` 帧，UI 侧是 `/plugin-ui/{id}/{token}/raw` 上的 binary WebSocket。daemon 只做 stream 映射、全局在途预算与失败分类，不解析 payload。非 Unix 构建没有这条 WebSocket 桥（匿名子管道不可 poll），`/raw` 明确回 `501 not_supported`；协议 3 插件本身仍能启动，只是没人能订阅。

@@ -42,9 +42,9 @@ use crate::supervisor::{self, Event};
 use crate::wake::Wake;
 
 /// The supervisor loop's bounded wait when it has no earlier deadline. With a
-/// reactor this is the plugin poll's timeout, so an idle daemon wakes twice a
-/// tick at most: once for plugin stdio and once for shutdown/timers.
-const POLL_WAIT_MS: i32 = 50;
+/// reactor this is the plugin poll's timeout, so an idle daemon wakes once per
+/// tick: the poll doubles as the wait for shutdown and the loop's timers.
+const POLL_WAIT: Duration = Duration::from_millis(50);
 
 pub fn run(conf: Option<PathBuf>) -> i32 {
     // The explicit --conf must be loaded before paths::config_dir() so its
@@ -728,10 +728,16 @@ impl Daemon {
         // self-pipe to the shared wake latch means a management request or a
         // queued raw frame interrupts that poll instead of waiting it out.
         if let Some(reactor) = &reactor {
+            // Synchronous waits on this thread (an install hook, a status
+            // hook) poll through this binding, so plugin pipes keep moving.
+            crate::reactor::bind_waiting_loop(reactor);
             match reactor.interrupt_handle() {
                 Ok(interrupt) => self.wake.set_interrupt(interrupt),
+                // Without the self-pipe the loop still polls, so requests are
+                // served; they just wait for the poll timeout instead of
+                // interrupting it.
                 Err(error) => log::svcd(&format!(
-                    "svcd: cannot bind the plugin-stdio poll wake: {}",
+                    "svcd: cannot bind the plugin-stdio poll wake; requests wait for the poll timeout: {}",
                     error
                 )),
             }
@@ -833,7 +839,7 @@ impl Daemon {
             }
             // Management requests and plugin stdout wake this immediately;
             // the bounded wait is only for shutdown and timer deadlines.
-            self.wait_for_work();
+            self.wait_for_work(POLL_WAIT);
         }
         self.stop_all();
     }
@@ -841,26 +847,15 @@ impl Daemon {
     /// Bounded wait for the next event. With a reactor this wait *is* the
     /// plugin poll: the supervisor loop owns plugin stdio, and the shared wake
     /// latch writes to the poll's self-pipe so a management request returns at
-    /// once. Without one (Windows, or a failed start) the condvar latch is the
-    /// only wake source.
-    fn wait_for_work(&self) {
+    /// once. Without one (Windows, or a reactor that failed to start) the
+    /// condvar latch is the wake source.
+    fn wait_for_work(&self, timeout: Duration) {
         #[cfg(unix)]
         if let Some(reactor) = &self.reactor {
-            reactor.poll_once(POLL_WAIT_MS);
+            reactor.poll_once(timeout);
             return;
         }
-        self.wake
-            .wait_timeout(Duration::from_millis(POLL_WAIT_MS as u64));
-    }
-
-    /// One non-blocking plugin-stdio pass. A synchronous start/stop wait reaches
-    /// this through `pump`, so plugin pipes keep moving while the supervisor is
-    /// inside an RPC.
-    fn poll_plugin_io(&self) {
-        #[cfg(unix)]
-        if let Some(reactor) = &self.reactor {
-            reactor.poll_once(0);
-        }
+        self.wake.wait_timeout(timeout);
     }
 
     fn handle(&mut self, incoming: channel::PendingCall) {
@@ -1253,7 +1248,7 @@ impl Daemon {
         else {
             return;
         };
-        status.details.probe = Some(run_status_hook(id, &hook));
+        status.details.probe = Some(run_status_hook(id, &hook, &mut crate::hook::poll_this_loop));
     }
 
     fn status_for(&self, service: &Service) -> Status {
@@ -1964,7 +1959,14 @@ impl Daemon {
     }
 
     fn pump(&mut self) {
-        self.poll_plugin_io();
+        // Plugin stdio belongs to this loop: one non-blocking pass before every
+        // pump keeps plugin pipes moving inside a synchronous start/stop wait.
+        // The condvar path needs no equivalent — its reader threads deliver
+        // into the slot channels on their own.
+        #[cfg(unix)]
+        if let Some(reactor) = &self.reactor {
+            reactor.poll_once(Duration::ZERO);
+        }
         let now = self.now_ms();
         let ids: Vec<String> = self.slots.keys().cloned().collect();
         let mut changed = false;
@@ -2221,7 +2223,7 @@ fn unknown_tool(id: &Option<Value>, name: &str) -> rpc::Response {
 /// becomes the `probe` text (capped), and a non-zero exit only appends the
 /// status word. Capture goes through a temp file so a hook that leaves a child
 /// holding stdout cannot block the daemon's event loop.
-fn run_status_hook(id: &str, hook: &Hook) -> String {
+fn run_status_hook(id: &str, hook: &Hook, poll: &mut dyn FnMut()) -> String {
     let output_path = status_output_path(id);
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -2275,6 +2277,8 @@ fn run_status_hook(id: &str, hook: &Hook) -> String {
                 format!("{} (timed out)", detail)
             };
         }
+        // The supervisor loop owns plugin stdio; a probe must not freeze it.
+        poll();
         thread::sleep(Duration::from_millis(50));
     }
 }

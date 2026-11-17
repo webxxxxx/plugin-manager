@@ -33,7 +33,10 @@ pub struct Invocation<'a> {
     pub timeout_ms: u64,
 }
 
-pub fn run(spec: &Invocation<'_>) -> Result<(), String> {
+/// Run the hook, calling `poll` before every wait step. The supervisor loop
+/// owns plugin stdio, so a hook it waits for must not stop the plugin pipes;
+/// production callers pass [`poll_this_loop`].
+pub fn run(spec: &Invocation<'_>, poll: &mut dyn FnMut()) -> Result<(), String> {
     package::check_path(spec.path)?;
     let program = spec.version_dir.join(spec.path);
     let metadata = fs::metadata(&program)
@@ -124,6 +127,7 @@ pub fn run(spec: &Invocation<'_>) -> Result<(), String> {
             Ok(None) => {}
             Err(error) => return Err(format!("{} hook: {}", spec.action, error)),
         }
+        poll();
         if started.elapsed() >= Duration::from_millis(spec.timeout_ms) {
             #[cfg(windows)]
             if let Some(job) = &job {
@@ -139,6 +143,13 @@ pub fn run(spec: &Invocation<'_>) -> Result<(), String> {
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// The poll a production caller passes: the loop bound to this thread (the
+/// supervisor loop in the daemon), a no-op on a thread that owns none.
+pub fn poll_this_loop() {
+    #[cfg(unix)]
+    crate::reactor::poll_waiting_loop();
 }
 
 fn spawn_reader<R>(name: String, stream: Option<R>, log: Option<Arc<Mutex<LogSink>>>)
@@ -316,7 +327,7 @@ mod tests {
         let body = "#!/bin/sh\nprintf '%s %s %s\\n' \"$SVCD_PLUGIN_ID\" \"$SVCD_PLUGIN_VERSION\" \"$SVCD_ACTION\" > marker.txt\npwd > cwd.txt\n";
         let path = write_hook(&dir.0, "env", body);
 
-        run(&spec(&dir, &path, TIMEOUT_MS)).expect("hook runs");
+        run(&spec(&dir, &path, TIMEOUT_MS), &mut || {}).expect("hook runs");
 
         let marker = fs::read_to_string(dir.0.join("marker.txt")).expect("marker");
         assert_eq!(marker.trim(), "demo 1.2.3 post-install");
@@ -333,7 +344,7 @@ mod tests {
         #[cfg(unix)]
         let path = write_hook(&dir.0, "fail", "#!/bin/sh\nexit 3\n");
 
-        let error = run(&spec(&dir, &path, TIMEOUT_MS)).expect_err("hook fails");
+        let error = run(&spec(&dir, &path, TIMEOUT_MS), &mut || {}).expect_err("hook fails");
 
         assert!(error.contains("exited"), "{error}");
     }
@@ -347,7 +358,7 @@ mod tests {
         let path = write_hook(&dir.0, "slow", "#!/bin/sh\nsleep 5\n");
 
         let started = Instant::now();
-        let error = run(&spec(&dir, &path, 150)).expect_err("hook times out");
+        let error = run(&spec(&dir, &path, 150), &mut || {}).expect_err("hook times out");
 
         assert!(error.contains("timed out"), "{error}");
         assert!(
@@ -357,11 +368,34 @@ mod tests {
         );
     }
 
+
+    /// The supervisor loop owns plugin stdio: a hook it waits for must keep
+    /// the loop polling instead of stalling every plugin pipe for up to a
+    /// minute.
+    #[cfg(unix)]
+    #[test]
+    fn a_waiting_hook_keeps_polling_its_loop() {
+        use std::cell::Cell;
+
+        let dir = TempDir::new();
+        let path = write_hook(&dir.0, "slow-wait", "#!/bin/sh\nsleep 0.3\n");
+        let polls = Cell::new(0);
+        let mut poll = || polls.set(polls.get() + 1);
+
+        run(&spec(&dir, &path, TIMEOUT_MS), &mut poll).expect("hook runs");
+
+        assert!(
+            polls.get() > 1,
+            "a hook wait must keep the loop polling: {} poll(s)",
+            polls.get()
+        );
+    }
+
     #[test]
     fn rejects_a_path_that_escapes_the_version_directory() {
         let dir = TempDir::new();
 
-        let error = run(&spec(&dir, "../outside", TIMEOUT_MS)).expect_err("escape");
+        let error = run(&spec(&dir, "../outside", TIMEOUT_MS), &mut || {}).expect_err("escape");
 
         assert!(error.contains("unsafe path"), "{error}");
     }
@@ -370,7 +404,7 @@ mod tests {
     fn rejects_a_missing_hook_file() {
         let dir = TempDir::new();
 
-        let error = run(&spec(&dir, "hooks/missing", TIMEOUT_MS)).expect_err("missing");
+        let error = run(&spec(&dir, "hooks/missing", TIMEOUT_MS), &mut || {}).expect_err("missing");
 
         assert!(error.contains("post-install hook"), "{error}");
     }
@@ -385,7 +419,7 @@ mod tests {
         fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write hook");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
 
-        let error = run(&spec(&dir, "not-executable", TIMEOUT_MS)).expect_err("mode");
+        let error = run(&spec(&dir, "not-executable", TIMEOUT_MS), &mut || {}).expect_err("mode");
 
         assert!(error.contains("not executable"), "{error}");
     }
@@ -399,7 +433,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
 
-        let error = run(&spec(&dir, "no-shebang", TIMEOUT_MS)).expect_err("shebang");
+        let error = run(&spec(&dir, "no-shebang", TIMEOUT_MS), &mut || {}).expect_err("shebang");
 
         assert!(error.contains("shebang"), "{error}");
     }
@@ -410,7 +444,7 @@ mod tests {
         let dir = TempDir::new();
         fs::write(dir.0.join("hook.sh"), "@echo off\r\n").expect("write hook");
 
-        let error = run(&spec(&dir, "hook.sh", TIMEOUT_MS)).expect_err("extension");
+        let error = run(&spec(&dir, "hook.sh", TIMEOUT_MS), &mut || {}).expect_err("extension");
 
         assert!(error.contains(".exe, .cmd or .bat"), "{error}");
     }

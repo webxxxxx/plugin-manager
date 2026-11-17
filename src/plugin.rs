@@ -365,14 +365,17 @@ fn run_post_install_manifest(
     else {
         return Ok(());
     };
-    hook::run(&hook::Invocation {
-        id,
-        version: &manifest.version,
-        action: "post-install",
-        version_dir,
-        path,
-        timeout_ms: hook::TIMEOUT_MS,
-    })
+    hook::run(
+        &hook::Invocation {
+            id,
+            version: &manifest.version,
+            action: "post-install",
+            version_dir,
+            path,
+            timeout_ms: hook::TIMEOUT_MS,
+        },
+        &mut hook::poll_this_loop,
+    )
     .map_err(|error| format!("post-install hook failed: {}", error))
 }
 
@@ -486,14 +489,17 @@ fn run_post_install(package: &Package, id: &str, version_dir: &Path) -> Result<(
     else {
         return Ok(());
     };
-    hook::run(&hook::Invocation {
-        id,
-        version: &package.manifest.version,
-        action: "post-install",
-        version_dir,
-        path,
-        timeout_ms: hook::TIMEOUT_MS,
-    })
+    hook::run(
+        &hook::Invocation {
+            id,
+            version: &package.manifest.version,
+            action: "post-install",
+            version_dir,
+            path,
+            timeout_ms: hook::TIMEOUT_MS,
+        },
+        &mut hook::poll_this_loop,
+    )
     .map_err(|error| format!("post-install hook failed: {}", error))
 }
 
@@ -927,14 +933,17 @@ fn run_pre_remove(id: &str) {
     else {
         return;
     };
-    let result = hook::run(&hook::Invocation {
-        id,
-        version: &version,
-        action: "pre-remove",
-        version_dir: &version_dir,
-        path,
-        timeout_ms: hook::TIMEOUT_MS,
-    });
+    let result = hook::run(
+        &hook::Invocation {
+            id,
+            version: &version,
+            action: "pre-remove",
+            version_dir: &version_dir,
+            path,
+            timeout_ms: hook::TIMEOUT_MS,
+        },
+        &mut hook::poll_this_loop,
+    );
     if let Err(error) = result {
         log::svcd(&format!(
             "svcd: plugin {}: pre-remove hook failed; continuing uninstall: {}",
