@@ -4,9 +4,10 @@
 //! `bind` in `svcd.conf` chooses the listener address. A non-loopback bind
 //! requires `auth_passwd`; without it the daemon falls back to loopback so the
 //! operator can still run `svc auth passwd`. Management JSON projections and
-//! the stream endpoints live in `face/` (#117–#121); the Unix server loop owns
-//! connections and control transport (#124/#125); this module is the
-//! composition root plus the Windows per-connection fallback.
+//! the stream endpoints live in `face/` (#117–#121); the connection drivers
+//! (the Unix poll loop and the per-connection threads) live in `server/http/`,
+//! which is also where the platform choice is made (#139). This module is the
+//! composition root plus the endpoints the face does not own yet.
 
 use std::fs;
 use std::io::Write;
