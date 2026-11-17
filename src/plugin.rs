@@ -1578,6 +1578,7 @@ mod tests {
         // cannot make `paths::plugins_dir()` disagree with `make_plugin`.
         std::env::set_var("SVCD_DATA_DIR", path.join("data"));
         std::env::set_var("SVCD_CONFIG_DIR", path.join("config"));
+        crate::paths::set_test_plugins_dir(path.join("data/plugins"));
         path
     }
 

@@ -339,7 +339,9 @@ mod tests {
     /// otherwise the control pipe gets a private ACL and no admin can reach it.
     #[test]
     fn the_default_system_config_is_machine_wide() {
-        assert!(is_machine_wide(&crate::paths::platform_config_dir()));
+        assert!(is_machine_wide(
+            &crate::platform::host::dirs::platform_config_dir()
+        ));
     }
 
     /// A host without the `svcd` group must fail with the actionable message

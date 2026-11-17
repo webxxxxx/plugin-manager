@@ -58,10 +58,29 @@ pub fn run_dir() -> PathBuf {
 /// Installed plugins: `<data>/plugins/<id>/<version>/`, or `plugins_dir` from
 /// `svcd.conf` when configured.
 pub fn plugins_dir() -> PathBuf {
+    // Unit tests share one process and may have loaded settings from another
+    // test's config. The override is thread-local so one test's temp tree
+    // cannot redirect a later test on another thread.
+    #[cfg(test)]
+    if let Some(dir) = TEST_PLUGINS_DIR.with(|slot| slot.borrow().clone()) {
+        return dir;
+    }
     settings::current()
         .ok()
         .and_then(|settings| settings.plugins_dir.clone())
         .unwrap_or_else(|| data_dir().join("plugins"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PLUGINS_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Point the current test thread at its own plugin tree.
+#[cfg(test)]
+pub(crate) fn set_test_plugins_dir(dir: PathBuf) {
+    TEST_PLUGINS_DIR.with(|slot| *slot.borrow_mut() = Some(dir));
 }
 
 /// Ed25519 trust roots: `<config>/trust.d/<keyId>.pub` (PEM SPKI).
