@@ -4038,6 +4038,184 @@ fn oversized_upload_is_rejected_before_the_body() {
     assert!(head.starts_with("HTTP/1.1 413"), "{}", head);
 }
 
+/// The route's body policy is enforced before the face runs. An Empty route
+/// declares that it reads no body, so a client that announces one is refused
+/// without the server buffering a byte.
+#[test]
+fn a_route_that_declares_no_body_refuses_one_before_the_face() {
+    let (_sandbox, address) = daemon_with_demo_plugin(47);
+    let mut stream = TcpStream::connect(&address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let head = format!(
+        "POST /api/v1/services/demo/start HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nExpect: 100-continue\r\nContent-Length: 2\r\nConnection: close\r\n\r\n",
+        address
+    );
+    stream.write_all(head.as_bytes()).expect("write head");
+    let response = read_raw_response(&mut stream);
+    assert_eq!(
+        response.status,
+        413,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+}
+
+/// A Streamed face route declares that it reads no buffered body. A client
+/// that announces one is refused before the face opens the stream.
+#[test]
+fn a_streamed_route_refuses_a_declared_body_before_the_face() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let mut stream = TcpStream::connect(&address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let head = format!(
+        "GET /api/v1/export/demo HTTP/1.1\r\nHost: {}\r\nExpect: 100-continue\r\nContent-Length: 1\r\nConnection: close\r\n\r\n",
+        address
+    );
+    stream.write_all(head.as_bytes()).expect("write head");
+    let response = read_raw_response(&mut stream);
+    assert_eq!(
+        response.status,
+        413,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+}
+
+/// An unauthenticated write must not receive 100 Continue: the server refuses
+/// it before the body and closes, so unread body bytes cannot precede the next
+/// request on a keep-alive connection.
+#[test]
+fn an_unauthenticated_write_with_expect_is_refused_before_the_body() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    sandbox.wait_for_http();
+    let (address, _password) = enable_auth(&mut sandbox);
+    let mut stream = TcpStream::connect(&address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let head = format!(
+        "PUT /api/v1/config/demo HTTP/1.1\r\nHost: {}\r\nContent-Type: text/plain\r\nExpect: 100-continue\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\n",
+        address
+    );
+    stream.write_all(head.as_bytes()).expect("write head");
+    let response = read_raw_response(&mut stream);
+    assert_eq!(
+        response.status,
+        401,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+    assert_eq!(
+        raw_header_values(&response, "connection"),
+        vec!["close"],
+        "an early refusal must close instead of leaving an unread body in front of the next request"
+    );
+}
+
+/// A buffered route accepts the body only after announcing the interim
+/// response, so a client that waits for 100 Continue still makes progress
+/// through the ordinary management surface.
+#[test]
+fn a_buffered_route_sends_100_continue_before_reading_its_body() {
+    let (_sandbox, address) = daemon_with_demo_plugin(48);
+    let mut stream = TcpStream::connect(&address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let body = b"good config\n";
+    let head = format!(
+        "PUT /api/v1/config/demo HTTP/1.1\r\nHost: {}\r\nContent-Type: text/plain\r\nExpect: 100-continue\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        address,
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).expect("write head");
+    let mut interim = Vec::new();
+    let mut byte = [0u8; 1];
+    while !interim.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).expect("100 continue");
+        interim.push(byte[0]);
+    }
+    assert!(
+        String::from_utf8_lossy(&interim).starts_with("HTTP/1.1 100"),
+        "{:?}",
+        String::from_utf8_lossy(&interim)
+    );
+    stream.write_all(body).expect("write body");
+    let response = read_raw_response(&mut stream);
+    assert_eq!(
+        response.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+}
+
+/// A 413 before the body closes instead of treating the bytes after the
+/// rejected request as the next keep-alive request.
+#[test]
+fn a_413_before_the_body_does_not_answer_the_next_keep_alive_request() {
+    let mut sandbox = Sandbox::new();
+    sandbox.allow_insecure_install_with("max_json_body_bytes = 4096\n");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let mut stream = TcpStream::connect(&address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let pipelined = format!(
+        "PUT /api/v1/config/demo HTTP/1.1\r\nHost: {}\r\nContent-Type: text/plain\r\nContent-Length: 4097\r\nConnection: keep-alive\r\n\r\nGET /api/v1/version HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        address, address
+    );
+    stream
+        .write_all(pipelined.as_bytes())
+        .expect("write pipelined requests");
+    let response = read_raw_response(&mut stream);
+    assert_eq!(
+        response.status,
+        413,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+    assert!(
+        !String::from_utf8_lossy(&response.body).contains("protocol"),
+        "the rejected request's trailing bytes must not be answered: {}",
+        String::from_utf8_lossy(&response.body)
+    );
+}
+
+/// A route that reads no body must not answer Expect: 100-continue: there is
+/// nothing to wait for, and a 100 line would change the response the client
+/// reads.
+#[test]
+fn a_bodyless_route_does_not_send_100_continue() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let mut stream = TcpStream::connect(&address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let head = format!(
+        "GET /api/v1/version HTTP/1.1\r\nHost: {}\r\nExpect: 100-continue\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        address
+    );
+    stream.write_all(head.as_bytes()).expect("write head");
+    let response = read_raw_response(&mut stream);
+    assert_eq!(
+        response.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+}
+
 const TEST_PASSWORD: &str = "test-password";
 const TEST_PASSWORD_2: &str = "new-test-password";
 
