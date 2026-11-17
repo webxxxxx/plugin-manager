@@ -672,6 +672,20 @@ fn plugin_bundle(
     signed_package(key, manifest, &files)
 }
 
+/// A signed package with one extra large payload file. Used by the export
+/// tests so the download is still in flight while the client stalls.
+fn plugin_bundle_with_payload(
+    key: &SigningKey,
+    id: &str,
+    version: &str,
+    payload: &[u8],
+) -> Vec<u8> {
+    let (manifest, mut files) = plugin_parts(id, version, None, false);
+    files.push(("payload/big.bin".to_string(), payload.to_vec(), 0o644));
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    signed_package(key, manifest, &files)
+}
+
 /// Same payload as `plugin_bundle`, but without the `signature.json` entry.
 fn unsigned_plugin_bundle(id: &str) -> Vec<u8> {
     let (manifest, files) = plugin_parts(id, "1.0.0", None, false);
@@ -1233,6 +1247,31 @@ fn daemon_with_demo_plugin(key_byte: u8) -> (Sandbox, String) {
     )
     .expect("trust key");
     let package = plugin_bundle(&key, "demo", "1.0.0", Some(b"good template\n"), true);
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let installed = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(installed.status, 200, "{}", installed.body);
+    (sandbox, address)
+}
+
+/// A running daemon with a plugin whose payload is large enough that an
+/// export cannot finish inside one socket buffer.
+fn export_sandbox(key_byte: u8, extra: &str, payload: &[u8]) -> (Sandbox, String) {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[key_byte; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let package = plugin_bundle_with_payload(&key, "demo", "1.0.0", payload);
+    sandbox.allow_insecure_install_with(extra);
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
     let installed = request(
@@ -1848,6 +1887,115 @@ fn assert_slow_download_holds_the_cap(address: &str, path: &str, content: &[u8])
     let released = released.expect("the stream cap must be released after a disconnect");
     assert_eq!(released.body.len(), content.len());
     assert_eq!(released.body, content);
+}
+
+/// An export used to take the connection out of the loop. It is a stream
+/// handler now: a slow reader must hold one long-lived slot, leave the loop
+/// free, and release both when it disconnects.
+#[test]
+fn a_slow_export_reader_drops_the_stream_cap_and_leaves_the_loop_free() {
+    let payload = large_download_body();
+    let (_sandbox, address) = export_sandbox(36, "max_streams = 1\n", &payload);
+    let path = "/api/v1/export/demo/spk";
+
+    let mut stalled = TcpStream::connect(&address).expect("stalled connect");
+    stalled
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("stalled timeout");
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        path, address
+    );
+    stalled
+        .write_all(request.as_bytes())
+        .expect("stalled request");
+    let (status, headers) = read_response_head(&mut stalled);
+    assert_eq!(status, 200);
+    let content_length: usize = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map(|(_, value)| value.as_str())
+        .expect("an export advertises its length")
+        .parse()
+        .expect("content-length is a number");
+    assert!(
+        content_length > payload.len(),
+        "the archive is larger than its payload: {content_length}"
+    );
+
+    // The loop still answers an ordinary request while the transfer is stalled.
+    let version = raw_request(&address, "GET", "/api/v1/version", "", b"");
+    assert_eq!(
+        version.status, 200,
+        "a slow export reader must not block the loop"
+    );
+
+    // The stalled export owns the only long-lived slot.
+    let busy = raw_request(&address, "GET", path, "", b"");
+    assert_eq!(busy.status, 503, "{:?}", busy.body);
+    assert_eq!(
+        raw_header_values(&busy, "retry-after"),
+        vec!["1"],
+        "the busy response keeps the stable Retry-After contract"
+    );
+    assert_eq!(json_body(&busy)["error"]["code"], "busy");
+
+    // Dropping the connection releases the slot and the file state.
+    drop(stalled);
+    let mut released = None;
+    for _ in 0..200 {
+        let response = raw_request(&address, "GET", path, "", b"");
+        if response.status == 200 {
+            released = Some(response);
+            break;
+        }
+        assert_eq!(response.status, 503, "{:?}", response.body);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let released = released.expect("the export cap must be released after a disconnect");
+    assert_eq!(
+        released.body.len(),
+        content_length,
+        "the export writes exactly the length it advertised"
+    );
+    let names = tar_names(&released.body);
+    assert!(
+        names.iter().any(|name| name == "payload/big.bin"),
+        "the released export still carries the payload: {names:?}"
+    );
+}
+
+/// An export used to take the connection out of the loop and spawn a
+/// per-export thread. It is a stream handler now, so a stalled export must not
+/// change the daemon thread count.
+#[cfg(target_os = "linux")]
+#[test]
+fn unix_export_has_no_takeover_thread() {
+    let payload = large_download_body();
+    let (sandbox, address) = export_sandbox(37, "", &payload);
+    let pid = sandbox.daemon.as_ref().expect("running daemon").id();
+    let idle = stable_thread_count(pid);
+
+    let mut stalled = TcpStream::connect(&address).expect("stalled connect");
+    stalled
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("stalled timeout");
+    let request = format!(
+        "GET /api/v1/export/demo HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        address
+    );
+    stalled
+        .write_all(request.as_bytes())
+        .expect("stalled request");
+    let (status, _) = read_response_head(&mut stalled);
+    assert_eq!(status, 200);
+
+    assert_eq!(
+        stable_thread_count(pid),
+        idle,
+        "an export must not add a takeover thread"
+    );
+    drop(stalled);
 }
 
 /// Larger than any plausible loopback socket buffer, so the transfer is still
@@ -3389,6 +3537,12 @@ fn export_import_and_logs() {
         vec!["application/octet-stream"]
     );
     assert!(raw_header_values(&spkb, "content-disposition")[0].contains("demo-1.0.0.spkb"));
+    assert_eq!(
+        raw_header_values(&spkb, "content-length"),
+        vec![spkb.body.len().to_string()],
+        "the export advertises the exact tar length"
+    );
+    assert_eq!(raw_header_values(&spkb, "cache-control"), vec!["no-store"]);
     let names = tar_names(&spkb.body);
     assert_eq!(names.first().map(String::as_str), Some("backup.json"));
     assert!(names.iter().any(|name| name == "plugin.spk"), "{names:?}");
@@ -3709,6 +3863,12 @@ fn password_auth_bearer_cookie_csrf() {
     assert_eq!(denied_version.status, 401);
     assert_eq!(denied_version.body["error"]["code"], "unauthorized");
 
+    // An export is a streamed face route now, but it is not a public route:
+    // authentication still happens before any archive work.
+    let denied_export = request(&address, "GET", "/api/v1/export/demo", "", b"");
+    assert_eq!(denied_export.status, 401);
+    assert_eq!(denied_export.body["error"]["code"], "unauthorized");
+
     let bearer = format!("Bearer {}", password);
     let allowed = request_with(
         &address,
@@ -3778,16 +3938,22 @@ fn password_auth_bearer_cookie_csrf() {
     assert_eq!(no_csrf.status, 403);
 
     // The blob upload face applies the same cookie-write CSRF policy as the
-    // buffered management routes.
-    let blob_no_csrf = raw_request_with(
+    // buffered management routes. Send only the head: the server rejects
+    // before the body, and writing the body could race the close with a reset.
+    let mut blob_stream = TcpStream::connect(&address).expect("blob csrf connect");
+    let blob_head = request_head(
         &address,
         "POST",
         "/api/v1/blobs",
         "application/octet-stream",
-        b"blob body",
+        9,
         &[("Cookie", api_cookie.as_str())],
     );
-    assert_eq!(blob_no_csrf.status, 403);
+    blob_stream
+        .write_all(blob_head.as_bytes())
+        .expect("blob csrf head");
+    let (blob_status, _) = read_response_head(&mut blob_stream);
+    assert_eq!(blob_status, 403);
 
     let origin = format!("http://{}", address);
     let csrf = request_with(

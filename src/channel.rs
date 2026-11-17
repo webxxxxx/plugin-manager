@@ -19,8 +19,8 @@ use crate::rpc;
 use crate::threads;
 
 /// One message from an outbound streaming management call. The control
-/// channel owns this shape; the MCP session consumes it. Only the Unix
-/// reactor produces it today, so Windows sees the type unused.
+/// channel owns this shape; the MCP session consumes it. The Unix server-loop
+/// client produces it today, so Windows sees the type unused.
 #[derive(Debug)]
 #[cfg_attr(any(not(unix), not(feature = "http")), allow(dead_code))]
 pub enum ProgressEvent {
@@ -43,7 +43,7 @@ pub struct PendingCall {
 }
 
 /// A response handle for one management request. The daemon sends the serialized
-/// response on the channel; a reactor-backed server also gets a byte on a
+/// response on the channel; the Unix server loop also gets a byte on a
 /// notifier pipe so it can wake immediately instead of polling.
 #[derive(Clone)]
 pub struct Reply {
@@ -216,6 +216,11 @@ fn serve(stream: Stream, tx: SyncSender<PendingCall>, wake: std::sync::Arc<crate
             }
         };
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        // The supervisor queue is bounded (`PENDING_QUEUE_LIMIT`). Windows has
+        // one thread per control connection, so a full queue blocks that
+        // connection's thread here: that is the fallback's backpressure, with
+        // no unbounded growth. Unix answers the same condition with -32000 on
+        // the server loop (see `server::control::listener`).
         if tx
             .send(PendingCall {
                 line,

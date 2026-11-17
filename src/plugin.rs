@@ -5,7 +5,6 @@
 //! is a version text file and `enabled` is a marker.
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
@@ -1456,70 +1455,49 @@ pub fn export_config(id: &str) -> Result<(String, Vec<u8>), String> {
     Ok((version, data))
 }
 
-pub fn export_spk(id: &str) -> Result<(String, Vec<u8>), String> {
-    let version = current_version(id).ok_or_else(|| format!("unknown plugin: {}", id))?;
-    let bytes = package::installed_spk(&plugin_dir(id).join(&version))?;
-    Ok((version, bytes))
+/// The .spkb layout: backup.json, the nested .spk entry, the active config
+/// when there is one, and the tar trailer.
+///
+/// Shared by the CLI export and the HTTP stream; the nested package is itself
+/// a plan, so both callers describe the archive the same way.
+pub fn plan_export_spkb(
+    id: &str,
+    version: &str,
+    version_dir: &Path,
+    config: Option<&[u8]>,
+) -> Result<package::TarPlan, String> {
+    let mut plan = package::TarPlan::new();
+    let backup = backup_json(id, version, config);
+    plan.push_bytes(package::tar_entry_bytes("backup.json", &backup, 0o644)?);
+    let inner = package::plan_installed_spk(version_dir)?;
+    let inner_size = inner.size();
+    plan.push_bytes(package::tar_header_bytes("plugin.spk", inner_size, 0o644)?);
+    plan.append(inner);
+    plan.push_bytes(package::tar_padding_bytes(inner_size)?);
+    if let Some(config) = config {
+        plan.push_bytes(package::tar_entry_bytes("config", config, 0o600)?);
+    }
+    plan.push_bytes(vec![0u8; package::TAR_TRAILER]);
+    Ok(plan)
 }
 
 pub fn export_spkb(id: &str) -> Result<(String, Vec<u8>), String> {
     let version = current_version(id).ok_or_else(|| format!("unknown plugin: {}", id))?;
-    let spec = export_spk(id)?.1;
     let config = active_config(id)
         .map(|path| fs::read(path).map_err(|error| format!("read config: {}", error)))
         .transpose()?;
-    let exported_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let backup = serde_json::json!({
-        "schema": 1,
-        "id": id,
-        "version": version,
-        "exportedAt": exported_at,
-        "configSha256": config.as_ref().map(|data| package::hex_sha256(data)),
-    });
-    let backup = serde_json::to_vec(&backup).map_err(|error| error.to_string())?;
-    let mut entries: Vec<(&str, &[u8], u32)> = vec![
-        ("backup.json", &backup, 0o644),
-        ("plugin.spk", &spec, 0o644),
-    ];
-    if let Some(config) = &config {
-        entries.push(("config", config, 0o600));
-    }
-    Ok((version, package::write_tar(&entries)?))
+    let plan = plan_export_spkb(
+        id,
+        &version,
+        &plugin_dir(id).join(&version),
+        config.as_deref(),
+    )?;
+    let mut bytes = Vec::new();
+    plan.write_verified(&mut bytes)?;
+    Ok((version, bytes))
 }
 
-/// Stream the installed package as a `.spk` without a temporary archive.
-pub fn export_spk_stream<W: Write>(id: &str, out: &mut W) -> Result<String, String> {
-    let version = current_version(id).ok_or_else(|| format!("unknown plugin: {}", id))?;
-    package::write_installed_spk(&plugin_dir(id).join(&version), out)?;
-    Ok(version)
-}
-
-pub fn export_spk_size(id: &str) -> Result<u64, String> {
-    let version = current_version(id).ok_or_else(|| format!("unknown plugin: {}", id))?;
-    package::installed_spk_size(&plugin_dir(id).join(&version))
-}
-
-pub fn export_spkb_size(id: &str) -> Result<u64, String> {
-    let version = current_version(id).ok_or_else(|| format!("unknown plugin: {}", id))?;
-    let version_dir = plugin_dir(id).join(&version);
-    let config = active_config(id)
-        .map(|path| fs::read(path).map_err(|error| format!("read config: {}", error)))
-        .transpose()?;
-    let backup = backup_json(id, &version, config.as_deref());
-    let mut total = package::tar_entry_size(backup.len() as u64);
-    total = total.saturating_add(package::tar_entry_size(package::installed_spk_size(
-        &version_dir,
-    )?));
-    if let Some(config) = &config {
-        total = total.saturating_add(package::tar_entry_size(config.len() as u64));
-    }
-    Ok(total.saturating_add(1024))
-}
-
-fn backup_json(id: &str, version: &str, config: Option<&[u8]>) -> Vec<u8> {
+pub(crate) fn backup_json(id: &str, version: &str, config: Option<&[u8]>) -> Vec<u8> {
     let exported_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1532,28 +1510,6 @@ fn backup_json(id: &str, version: &str, config: Option<&[u8]>) -> Vec<u8> {
         "configSha256": config.map(package::hex_sha256),
     }))
     .unwrap_or_default()
-}
-
-/// Stream a `.spkb` backup. The inner `.spk` size is computed from the
-/// manifest, so the outer tar header can be written before the nested stream.
-pub fn export_spkb_stream<W: Write>(id: &str, out: &mut W) -> Result<String, String> {
-    let version = current_version(id).ok_or_else(|| format!("unknown plugin: {}", id))?;
-    let version_dir = plugin_dir(id).join(&version);
-    let config = active_config(id)
-        .map(|path| fs::read(path).map_err(|error| format!("read config: {}", error)))
-        .transpose()?;
-    let backup = backup_json(id, &version, config.as_deref());
-    package::write_tar_entry(out, "backup.json", &backup, 0o644)?;
-    let inner_size = package::installed_spk_size(&version_dir)?;
-    package::write_tar_header(out, "plugin.spk", inner_size, 0o644)?;
-    package::write_installed_spk(&version_dir, out)?;
-    package::write_tar_padding(out, inner_size)?;
-    if let Some(config) = &config {
-        package::write_tar_entry(out, "config", config, 0o600)?;
-    }
-    out.write_all(&[0u8; 1024])
-        .map_err(|error| format!("write export trailer: {}", error))?;
-    Ok(version)
 }
 
 fn remove_versions(directory: &Path, keep: Option<&str>) -> Result<(), String> {

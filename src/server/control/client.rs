@@ -73,40 +73,43 @@ impl StreamingClient {
         self.cancels.clone()
     }
 
-    /// Open one streaming management request. The connection's request frame
-    /// is written without blocking; its progress lines are delivered to
-    /// `sender`. A local failure is delivered as `ProgressEvent::Error` so the
-    /// MCP stream keeps its 200 + -32603 shape.
+    /// Open one streaming management request and return its stream id. The
+    /// connection's request frame is written without blocking; its progress
+    /// lines are delivered to `sender`. Every local failure is delivered as
+    /// `ProgressEvent::Error`, so the MCP stream keeps its 200 + -32603 shape
+    /// instead of turning into an HTTP 500 before the stream starts.
     pub fn open(
         &mut self,
         config: &Path,
         method: &str,
         params: Value,
         sender: SyncSender<ProgressEvent>,
-    ) -> io::Result<u64> {
+    ) -> u64 {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let request = match management_request(config, method, params) {
             Ok(request) => request,
             Err(message) => {
                 let _ = sender.try_send(ProgressEvent::Error(message));
-                return Ok(id);
+                return id;
             }
         };
-        // A local AF_UNIX connect completes from the listener's backlog; it
-        // does not wait for the accept, and the control listener is polled by
-        // this same loop. A full backlog fails with EAGAIN instead of blocking.
+        // A local AF_UNIX connect completes from the listener's backlog; the
+        // accept happens later in this same loop. Pending outbound connects are
+        // bounded by `max_streams` (at most 64), below the listener's 128-entry
+        // backlog, so this inline connect does not wait for accept and cannot
+        // fill the backlog the loop must drain.
         let stream = match UnixStream::connect(config.join("svcd.sock")) {
             Ok(stream) => stream,
             Err(error) => {
                 let _ =
                     sender.try_send(ProgressEvent::Error(format!("svcd unreachable: {}", error)));
-                return Ok(id);
+                return id;
             }
         };
         if let Err(error) = stream.set_nonblocking(true) {
             let _ = sender.try_send(ProgressEvent::Error(format!("svcd unreachable: {}", error)));
-            return Ok(id);
+            return id;
         }
         let mut connection = Connection {
             stream,
@@ -121,10 +124,10 @@ impl StreamingClient {
             let _ = connection.sender.try_send(ProgressEvent::Error(
                 "cannot write management request".into(),
             ));
-            return Ok(id);
+            return id;
         }
         self.connections.insert(id, connection);
-        Ok(id)
+        id
     }
 
     /// Remove streams whose MCP handler already dropped or finished.
@@ -385,9 +388,7 @@ mod tests {
         ));
         let (sender, receiver) = std::sync::mpsc::sync_channel(4);
         let mut client = StreamingClient::new();
-        let _id = client
-            .open(&root, "registry.call", serde_json::json!({}), sender)
-            .expect("open returns a stream id even when the channel is missing");
+        let _id = client.open(&root, "registry.call", serde_json::json!({}), sender);
         match receiver.try_recv().expect("one error event") {
             ProgressEvent::Error(message) => {
                 assert!(message.contains("svcd unreachable"), "{message}")

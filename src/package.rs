@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -197,12 +197,15 @@ pub fn read_tar(bytes: &[u8]) -> Result<Vec<TarEntry>, String> {
     Ok(entries)
 }
 
+/// The ustar end-of-archive marker: two 512-byte zero blocks.
+pub const TAR_TRAILER: usize = 1024;
+
 pub fn write_tar(entries: &[(&str, &[u8], u32)]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     for (path, data, mode) in entries {
         write_tar_entry(&mut out, path, data, *mode)?;
     }
-    out.extend(std::iter::repeat_n(0, 1024));
+    out.extend(std::iter::repeat_n(0, TAR_TRAILER));
     Ok(out)
 }
 
@@ -256,12 +259,6 @@ pub fn write_tar_padding<W: Write>(out: &mut W, size: u64) -> Result<(), String>
     Ok(())
 }
 
-pub fn tar_entry_size(size: u64) -> u64 {
-    512u64
-        .saturating_add(size)
-        .saturating_add(padding(size as usize) as u64)
-}
-
 fn read_export_signature(version_dir: &Path) -> Result<Vec<u8>, String> {
     match fs::read(version_dir.join("signature.json")) {
         Ok(signature) => Ok(signature),
@@ -273,111 +270,157 @@ fn read_export_signature(version_dir: &Path) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Exact size of the `.spk` stream produced by [`write_installed_spk`].
-pub fn installed_spk_size(version_dir: &Path) -> Result<u64, String> {
-    let manifest_bytes = fs::read(version_dir.join("manifest.json"))
-        .map_err(|error| format!("read manifest: {}", error))?;
-    let manifest = parse_manifest(&manifest_bytes)?;
-    let signature = read_export_signature(version_dir)?;
-    let mut total = 512u64
-        .saturating_add(manifest_bytes.len() as u64)
-        .saturating_add(padding(manifest_bytes.len()) as u64);
-    total = total
-        .saturating_add(512)
-        .saturating_add(signature.len() as u64)
-        .saturating_add(padding(signature.len()) as u64);
-    for file in &manifest.files {
-        let metadata = fs::metadata(version_dir.join(&file.path))
-            .map_err(|error| format!("stat {}: {}", file.path, error))?;
-        if metadata.len() != file.size {
-            return Err(format!("installed file is corrupt: {}", file.path));
-        }
-        total = total
-            .saturating_add(512)
-            .saturating_add(file.size)
-            .saturating_add(padding(file.size as usize) as u64);
-    }
-    Ok(total.saturating_add(1024))
+/// One piece of an archive that can be written now or streamed later.
+///
+/// Small protocol pieces travel as bytes. A payload file stays on disk and is
+/// described by its path, length and the hash the manifest declares for it, so
+/// a streaming caller can hand it to the server without reading it here.
+pub enum TarPart {
+    Bytes(Vec<u8>),
+    File {
+        path: PathBuf,
+        length: u64,
+        sha256: Option<String>,
+    },
 }
 
-/// Stream the installed `.spk` without holding payload files in memory.
-pub fn write_installed_spk<W: Write>(version_dir: &Path, out: &mut W) -> Result<(), String> {
+/// An archive described as parts.
+///
+/// One layout, two consumers: [TarPlan::write_verified] produces the bytes
+/// (checking each payload's declared hash while copying) and a stream handler
+/// asks the server to send the file parts. The running size is the response's
+/// Content-Length, so every part is counted exactly once.
+#[derive(Default)]
+pub struct TarPlan {
+    parts: Vec<TarPart>,
+    size: u64,
+}
+
+impl TarPlan {
+    pub fn new() -> TarPlan {
+        TarPlan::default()
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn parts(&self) -> &[TarPart] {
+        &self.parts
+    }
+
+    pub fn push_bytes(&mut self, bytes: Vec<u8>) {
+        self.size = self.size.saturating_add(bytes.len() as u64);
+        self.parts.push(TarPart::Bytes(bytes));
+    }
+
+    pub fn push_file(&mut self, path: PathBuf, length: u64, sha256: Option<String>) {
+        self.size = self.size.saturating_add(length);
+        self.parts.push(TarPart::File {
+            path,
+            length,
+            sha256,
+        });
+    }
+
+    /// Append another archive's parts and size: the nested .spk of a backup.
+    pub fn append(&mut self, other: TarPlan) {
+        self.size = self.size.saturating_add(other.size);
+        self.parts.extend(other.parts);
+    }
+
+    /// Write the archive, verifying every file part that carries a hash.
+    pub fn write_verified<W: Write>(&self, out: &mut W) -> Result<(), String> {
+        for part in &self.parts {
+            match part {
+                TarPart::Bytes(bytes) => out
+                    .write_all(bytes)
+                    .map_err(|error| format!("write export: {}", error))?,
+                TarPart::File {
+                    path,
+                    length,
+                    sha256,
+                } => {
+                    let mut source = fs::File::open(path)
+                        .map_err(|error| format!("open {}: {}", path.display(), error))?;
+                    let mut hasher = Sha256::new();
+                    let mut written = 0u64;
+                    let mut buffer = [0u8; 64 * 1024];
+                    loop {
+                        let read = source
+                            .read(&mut buffer)
+                            .map_err(|error| format!("read {}: {}", path.display(), error))?;
+                        if read == 0 {
+                            break;
+                        }
+                        written = written.saturating_add(read as u64);
+                        hasher.update(&buffer[..read]);
+                        out.write_all(&buffer[..read])
+                            .map_err(|error| format!("write export: {}", error))?;
+                    }
+                    let hash_matches = sha256
+                        .as_ref()
+                        .map(|expected| hex_bytes(&hasher.finalize()) == *expected)
+                        .unwrap_or(true);
+                    if written != *length || !hash_matches {
+                        return Err(format!("installed file is corrupt: {}", path.display()));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One tar entry as bytes: header, data and padding.
+pub fn tar_entry_bytes(path: &str, data: &[u8], mode: u32) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(512 + data.len());
+    write_tar_entry(&mut out, path, data, mode)?;
+    Ok(out)
+}
+
+/// One tar header as bytes, for an entry whose data is sent separately.
+pub fn tar_header_bytes(path: &str, size: u64, mode: u32) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(512);
+    write_tar_header(&mut out, path, size, mode)?;
+    Ok(out)
+}
+
+pub fn tar_padding_bytes(size: u64) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(512);
+    write_tar_padding(&mut out, size)?;
+    Ok(out)
+}
+
+/// The installed .spk, described as parts. Payload bytes are not read here;
+/// only the manifest, the signature and each payload's size are.
+pub fn plan_installed_spk(version_dir: &Path) -> Result<TarPlan, String> {
     let manifest_bytes = fs::read(version_dir.join("manifest.json"))
         .map_err(|error| format!("read manifest: {}", error))?;
     let manifest = parse_manifest(&manifest_bytes)?;
     let signature = read_export_signature(version_dir)?;
-    write_tar_entry(out, "manifest.json", &manifest_bytes, 0o644)?;
-    write_tar_entry(out, "signature.json", &signature, 0o644)?;
+    let mut plan = TarPlan::new();
+    plan.push_bytes(tar_entry_bytes("manifest.json", &manifest_bytes, 0o644)?);
+    plan.push_bytes(tar_entry_bytes("signature.json", &signature, 0o644)?);
     let mut files = manifest.files.clone();
     files.sort_by(|left, right| left.path.cmp(&right.path));
     for file in files {
         let path = version_dir.join(&file.path);
-        let mut source =
-            fs::File::open(&path).map_err(|error| format!("open {}: {}", path.display(), error))?;
-        write_tar_header(out, &file.path, file.size, file.mode & 0o777)?;
-        let mut hasher = Sha256::new();
-        let mut written = 0u64;
-        let mut buffer = [0u8; 64 * 1024];
-        loop {
-            let read = source
-                .read(&mut buffer)
-                .map_err(|error| format!("read {}: {}", path.display(), error))?;
-            if read == 0 {
-                break;
-            }
-            written = written.saturating_add(read as u64);
-            hasher.update(&buffer[..read]);
-            out.write_all(&buffer[..read])
-                .map_err(|error| format!("write export: {}", error))?;
-        }
-        if written != file.size || hex_bytes(&hasher.finalize()) != file.sha256 {
+        // parse_manifest validated the path; the size check keeps a truncated
+        // install from advertising a Content-Length it cannot send.
+        let metadata =
+            fs::metadata(&path).map_err(|error| format!("stat {}: {}", file.path, error))?;
+        if metadata.len() != file.size {
             return Err(format!("installed file is corrupt: {}", file.path));
         }
-        write_tar_padding(out, written)?;
-    }
-    out.write_all(&[0u8; 1024])
-        .map_err(|error| format!("write export trailer: {}", error))
-}
-
-/// Rebuild a signed `.spk` from an installed version directory. The original
-/// `manifest.json` bytes and `signature.json` are kept verbatim.
-///
-/// A plugin installed with `allow_insecure_install` has no `signature.json`;
-/// exporting it as a signed package is impossible, so that case is reported
-/// explicitly.
-pub fn installed_spk(version_dir: &Path) -> Result<Vec<u8>, String> {
-    let manifest_bytes = fs::read(version_dir.join("manifest.json"))
-        .map_err(|error| format!("read manifest: {}", error))?;
-    let manifest = parse_manifest(&manifest_bytes)?;
-    let signature = match fs::read(version_dir.join("signature.json")) {
-        Ok(signature) => signature,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(
-                "installed package has no signature (installed insecurely); reinstall a signed package to export it"
-                    .into(),
-            )
+        plan.push_bytes(tar_header_bytes(&file.path, file.size, file.mode & 0o777)?);
+        if file.size > 0 {
+            plan.push_file(path, file.size, Some(file.sha256.clone()));
         }
-        Err(error) => return Err(format!("read signature: {}", error)),
-    };
-    let mut files = manifest.files.clone();
-    files.sort_by(|left, right| left.path.cmp(&right.path));
-    let mut owned: Vec<(String, Vec<u8>, u32)> = Vec::new();
-    for file in files {
-        let data = fs::read(version_dir.join(&file.path))
-            .map_err(|error| format!("read {}: {}", file.path, error))?;
-        if data.len() as u64 != file.size || hex_sha256(&data) != file.sha256 {
-            return Err(format!("installed file is corrupt: {}", file.path));
-        }
-        owned.push((file.path, data, file.mode & 0o777));
+        plan.push_bytes(tar_padding_bytes(file.size)?);
     }
-    let mut entries: Vec<(&str, &[u8], u32)> = vec![
-        ("manifest.json", &manifest_bytes, 0o644),
-        ("signature.json", &signature, 0o644),
-    ];
-    for (path, data, mode) in &owned {
-        entries.push((path.as_str(), data.as_slice(), *mode));
-    }
-    write_tar(&entries)
+    plan.push_bytes(vec![0u8; TAR_TRAILER]);
+    Ok(plan)
 }
 
 #[derive(Debug)]
@@ -2226,7 +2269,10 @@ mod tests {
         let root = tempdir::TempDir::new();
         package.write_to(root.path()).expect("write");
         assert!(!root.path().join("signature.json").exists());
-        let error = installed_spk(root.path()).expect_err("export");
+        let error = match plan_installed_spk(root.path()) {
+            Ok(_) => panic!("export must be refused without a signature"),
+            Err(error) => error,
+        };
         assert!(error.contains("no signature"), "{error}");
     }
 
