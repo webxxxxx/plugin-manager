@@ -6,6 +6,8 @@
 //   2. 循环依赖：模块图必须是 DAG；报告强连通分量，并给出一条具体短环。
 //   3. 文件名后缀：协议名只该在 server/ 出现一次（_http / _handler / _manager / utils）。
 //   4. 映射卫生：映射里的模块必须在 src/ 存在；src/ 的顶层模块必须已映射。
+//   5. seam 不变量：子进程 stdio 的句柄与管道只在 src/stdio 里出现；正在被
+//      seam 接管的调用方（slot/hook/daemon/rawhub）不再自己 Stdio::piped。
 //
 // 用法：
 //   node tools/dep-lint.mjs              人读输出；有违规退出码 1
@@ -294,7 +296,42 @@ function suffixViolations(sources, map) {
   return { errors, warnings };
 }
 
-function report({ map, modules, sources, edges, unknown, stale, layers, cycles, suffixes }) {
+/// V5：seam 的机械不变量。stdio seam 拥有子进程 stdio 的父子句柄；调用方描述
+/// 用途（Plan/Target）而不是自己取句柄或开管道。句柄规则用文件 allowlist，
+/// 让 reactor 测试里自建管道这类 fixture 不被误判。
+const SEAM_RULES = [
+  {
+    name: "stdio 的父子句柄",
+    pattern: /\bChildStd(?:in|out|err)\b/,
+    allowed: (file) => file === "src/stdio.rs" || file.startsWith("src/stdio/"),
+    hint: "子进程 stdio 的句柄归 src/stdio；调用方用 Plan/Target。",
+  },
+  {
+    name: "stdio 的调用方直接开管道",
+    pattern: /\bStdio::piped\b/,
+    files: ["src/slot.rs", "src/hook.rs", "src/daemon.rs", "src/rawhub.rs"],
+    hint: "这些文件问 src/stdio 要管道（Plan::notify / exec / hook / stop_hook）。",
+  },
+];
+
+function seamViolations(sources) {
+  const out = [];
+  for (const source of sources) {
+    for (const rule of SEAM_RULES) {
+      if (rule.files && !rule.files.includes(source.file)) continue;
+      if (rule.allowed && rule.allowed(source.file)) continue;
+      const lines = stripComments(readFileSync(source.full, "utf8")).split("\n");
+      for (let line = 0; line < lines.length; line += 1) {
+        if (rule.pattern.test(lines[line])) {
+          out.push({ rule: rule.name, file: source.file, line: line + 1, hint: rule.hint });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+function report({ map, modules, sources, edges, unknown, stale, layers, cycles, suffixes, seam }) {
   const lines = [];
   lines.push("dep-lint · 观测基线（只读，不改代码）");
   lines.push(`模块 ${sources.length} 个源文件，引用边 ${edges.length} 条，映射 ${modules.size} 项`);
@@ -355,10 +392,21 @@ function report({ map, modules, sources, edges, unknown, stale, layers, cycles, 
   for (const file of unknown) lines.push(`  ${file}  src/ 里有，映射里没有`);
   if (stale.length + unknown.length === 0) lines.push("  （无）");
 
-  const total = layers.length + cycles.length + suffixes.errors.length + stale.length + unknown.length;
+  lines.push("");
+  lines.push(`[V5] seam 不变量（${seam.length}）`);
+  for (const item of seam) lines.push(`  ${item.file}:${item.line}  ${item.rule}  —— ${item.hint}`);
+  if (seam.length === 0) lines.push("  （无）");
+
+  const total =
+    layers.length +
+    cycles.length +
+    suffixes.errors.length +
+    stale.length +
+    unknown.length +
+    seam.length;
   lines.push("");
   lines.push(
-    `合计 ${total} 条违规（层方向 ${layers.length} · 循环分量 ${cycles.length} · 后缀 ${suffixes.errors.length} · 映射 ${stale.length + unknown.length}）`,
+    `合计 ${total} 条违规（层方向 ${layers.length} · 循环分量 ${cycles.length} · 后缀 ${suffixes.errors.length} · 映射 ${stale.length + unknown.length} · seam ${seam.length}）`,
   );
   return { text: lines.join("\n"), total };
 }
@@ -372,10 +420,11 @@ const nodes = [...new Set(sources.map((source) => source.module))];
 const layers = layerViolations(edges, modules, rank);
 const cycles = cycleViolations(nodes, edges);
 const suffixes = suffixViolations(sources, map);
-const { text, total } = report({ map, modules, sources, edges, unknown, stale, layers, cycles, suffixes });
+const seam = seamViolations(sources);
+const { text, total } = report({ map, modules, sources, edges, unknown, stale, layers, cycles, suffixes, seam });
 
 if (args.json) {
-  console.log(JSON.stringify({ total, layers, cycles, suffixes, unknown, stale, files: sources.length, edges: edges.length }, null, 2));
+  console.log(JSON.stringify({ total, layers, cycles, suffixes, seam, unknown, stale, files: sources.length, edges: edges.length }, null, 2));
 } else {
   console.log(text);
 }
