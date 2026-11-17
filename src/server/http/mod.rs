@@ -9,10 +9,16 @@ pub mod dispatch;
 #[cfg(all(unix, feature = "http"))]
 pub mod driver;
 pub mod engine;
-#[cfg(all(not(unix), feature = "http"))]
+#[cfg(feature = "http")]
 pub mod fallback;
 #[cfg_attr(not(unix), allow(dead_code))]
 pub mod pool;
+#[cfg(feature = "http")]
+pub mod entry;
+#[cfg(feature = "http")]
+pub(crate) mod hooks;
+#[cfg(feature = "http")]
+pub(crate) mod threads;
 #[cfg(all(unix, feature = "http"))]
 pub mod server;
 pub mod stream;

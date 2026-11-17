@@ -77,7 +77,6 @@ impl JobBudget {
 
     /// The Windows inline fallback owns the connection thread, so it has no
     /// disconnect signal to flip; the deadline still bounds a stuck round trip.
-    #[cfg(not(unix))]
     pub fn for_fallback(timeout: std::time::Duration) -> JobBudget {
         JobBudget::at(CancelToken::never(), Instant::now() + timeout)
     }

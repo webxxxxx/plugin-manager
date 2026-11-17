@@ -160,28 +160,40 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         crate::limits::current().ws_inflight_requests,
         crate::limits::current().ws_raw_queue,
     );
-    #[cfg(all(unix, feature = "http"))]
-    let api = match api::spawn(
-        config.clone(),
-        raw_hub.clone(),
-        control,
-        tx.clone(),
-        wake.clone(),
-    ) {
-        Ok(api) => Some(api),
-        Err(error) => {
-            // The server loop now owns the control channel; failing to start
-            // it is fatal, not an HTTP-only degradation.
-            log::svcd(&format!("svcd: cannot start server loop: {}", error));
-            return 1;
+    // The driver picks itself inside `server::http::entry`; the composition
+    // root only hands over the control plumbing it owns.
+    #[cfg(feature = "http")]
+    let control_plumbing = {
+        #[cfg(unix)]
+        {
+            Some(crate::server::http::entry::ControlPlumbing {
+                listener: control,
+                pending: tx.clone(),
+                wake: wake.clone(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            // The thread driver owns no control listener to merge.
+            None
         }
     };
-    #[cfg(all(not(unix), feature = "http"))]
-    let api = match api::spawn(config.clone(), raw_hub.clone()) {
+    #[cfg(feature = "http")]
+    let api = match api::spawn(config.clone(), raw_hub.clone(), control_plumbing) {
         Ok(api) => Some(api),
         Err(error) => {
-            log::svcd(&format!("svcd: HTTP API disabled: {}", error));
-            None
+            #[cfg(unix)]
+            {
+                // The server loop now owns the control channel; failing to
+                // start it is fatal, not an HTTP-only degradation.
+                log::svcd(&format!("svcd: cannot start server loop: {}", error));
+                return 1;
+            }
+            #[cfg(not(unix))]
+            {
+                log::svcd(&format!("svcd: HTTP API disabled: {}", error));
+                None
+            }
         }
     };
     #[cfg(all(unix, not(feature = "http")))]

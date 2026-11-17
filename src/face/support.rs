@@ -213,17 +213,7 @@ fn status_for_error(message: &str) -> u16 {
     }
 }
 
-pub(crate) fn code_for(status: u16) -> &'static str {
-    match status {
-        400 => "bad_request",
-        403 => "forbidden",
-        404 => "not_found",
-        409 => "conflict",
-        413 => "payload_too_large",
-        504 => "timeout",
-        _ => "internal",
-    }
-}
+pub(crate) use crate::http::code_for;
 
 pub(crate) fn error(status: u16, code: &str, message: &str) -> Vec<u8> {
     http::json_error(status, code, message)

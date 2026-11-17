@@ -195,15 +195,21 @@ fn send_blocking(stream: &mut TcpStream, send: FileSend) {
     if length == 0 {
         return;
     }
-    match crate::zerocopy::send_file_range(&mut file, stream, offset, length) {
-        Ok(true) => {}
-        Ok(false) => {
-            if file.seek(SeekFrom::Start(offset)).is_ok() {
-                let mut reader = (&mut file).take(length);
-                let _ = std::io::copy(&mut reader, stream);
-            }
-        }
-        Err(_) => {}
+    // Windows can hand the range to the socket directly. Every other host
+    // copies; that path is unreachable while Unix uses its poll loop, but the
+    // module compiles on both so the composition root needs no platform
+    // branch (#139).
+    #[cfg(windows)]
+    let sent = match crate::zerocopy::send_file_range(&mut file, stream, offset, length) {
+        Ok(sent) => sent,
+        // Keep the old Windows behaviour on error: give up on this range.
+        Err(_) => true,
+    };
+    #[cfg(not(windows))]
+    let sent = false;
+    if !sent && file.seek(SeekFrom::Start(offset)).is_ok() {
+        let mut reader = (&mut file).take(length);
+        let _ = std::io::copy(&mut reader, stream);
     }
     let _ = stream.flush();
 }
