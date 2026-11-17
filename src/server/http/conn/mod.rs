@@ -24,6 +24,11 @@ use crate::rawhub::RawHub;
 use crate::server::http::hooks::{FallbackHandler, PreBodyRoutes};
 use crate::server::http::Face;
 
+#[cfg(unix)]
+pub(crate) mod poll;
+#[cfg_attr(unix, allow(dead_code))]
+pub(crate) mod threaded;
+
 /// One connection driver.
 ///
 /// Contract:
@@ -109,4 +114,22 @@ pub(crate) struct StartInput {
     pub control: Option<ControlPlumbing>,
     /// The per-connection driver, used when no poll loop runs.
     pub threads: ThreadDriver,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both drivers must satisfy the same seam; which one is compiled here
+    /// depends on the host, so the assertion is per host and there is no
+    /// third "test only" driver.
+    fn assert_driver<D: ConnectionDriver>() {}
+
+    #[test]
+    fn the_host_driver_implements_the_seam() {
+        #[cfg(unix)]
+        assert_driver::<poll::Driver>();
+        #[cfg(not(unix))]
+        assert_driver::<threaded::Driver>();
+    }
 }

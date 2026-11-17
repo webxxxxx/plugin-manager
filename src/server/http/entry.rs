@@ -1,62 +1,25 @@
 //! The one place that decides which connection driver this host gets.
 //!
 //! The composition root builds a [`StartInput`] and calls [`start`]; nothing
-//! above this module branches on the platform. Unix runs the single poll loop
-//! that also owns the control channel; every other host runs the thread driver
-//! the caller supplied (#139).
+//! above this module branches on the platform. The drivers live in
+//! `server/http/conn`: the Unix poll loop, or one thread per connection
+//! elsewhere. Adding a third driver (IOCP) is one more `impl ConnectionDriver`
+//! plus the alias below.
 
 use std::io;
-use std::sync::atomic::AtomicBool;
 
 pub(crate) use crate::server::http::conn::{
     ControlPlumbing, ServerHandle, StartInput, ThreadDriver,
 };
 
-/// Start this host's driver. This is the single platform branch.
+/// The driver this host runs. This alias is the only platform choice left.
+#[cfg(unix)]
+type HostDriver = crate::server::http::conn::poll::Driver;
+#[cfg(not(unix))]
+type HostDriver = crate::server::http::conn::threaded::Driver;
+
+/// Start this host's driver.
 pub(crate) fn start(input: StartInput) -> io::Result<ServerHandle> {
-    let StartInput {
-        config,
-        lan,
-        raw_hub,
-        listener,
-        face,
-        routes,
-        fallback,
-        control,
-        threads,
-    } = input;
-
-    #[cfg(unix)]
-    {
-        let _ = threads;
-        let Some(control) = control else {
-            return Err(io::Error::other(
-                "the Unix server loop needs the control channel",
-            ));
-        };
-        let loop_handle = crate::server::http::server::start(
-            listener,
-            control.listener,
-            control.pending,
-            control.wake,
-            lan,
-            config,
-            raw_hub,
-            face,
-            routes,
-            fallback,
-        )?;
-        Ok(ServerHandle::poll(loop_handle))
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = (face, routes, fallback, raw_hub, control);
-        let Some(listener) = listener else {
-            return Err(io::Error::other(
-                "the thread driver needs a bound listener",
-            ));
-        };
-        Ok(threads(listener, lan, config))
-    }
+    use crate::server::http::conn::ConnectionDriver;
+    HostDriver::start(input)
 }
