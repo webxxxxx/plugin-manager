@@ -5,7 +5,6 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::channel;
-use crate::definition;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::log;
 use crate::paths;
@@ -310,46 +309,36 @@ fn live_list() -> Result<Vec<Status>, ListError> {
         .map_err(|error| ListError::Daemon(format!("invalid list response: {}", error)))
 }
 
+/// `svc status` reads live state only, for the same reason as `svc list`: the
+/// offline fallback made an unreachable daemon look like a stopped service.
 fn show_status(id: &str, json: bool) -> i32 {
-    if let Ok(response) = channel::request(
+    let response = match channel::request(
         &paths::config_dir(),
         "svc.status",
         json!({ "id": id, "probe": true }),
     ) {
-        return match response {
-            rpc::Response {
-                error: Some(error), ..
-            } => {
-                eprintln!("svc: {}", error.message);
-                EXIT_NOT_FOUND
-            }
-            rpc::Response {
-                result: Some(result),
-                ..
-            } => print_status_value(result, json),
-            _ => {
-                eprintln!("svc: empty status response");
-                EXIT_NOT_FOUND
-            }
-        };
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("svc: svcd unreachable: {}", error);
+            return EXIT_DAEMON_UNREACHABLE;
+        }
+    };
+    match response {
+        rpc::Response {
+            error: Some(error), ..
+        } => {
+            eprintln!("svc: {}", error.message);
+            EXIT_NOT_FOUND
+        }
+        rpc::Response {
+            result: Some(result),
+            ..
+        } => print_status_value(result, json),
+        _ => {
+            eprintln!("svc: empty status response");
+            EXIT_NOT_FOUND
+        }
     }
-
-    let loaded = definition::load_services(&paths::services_dir());
-    if let Some(service) = loaded.registry.get(id) {
-        return print_status(Status::of(service), json);
-    }
-
-    let definition_file = format!("{}.json", id);
-    if let Some(issue) = loaded
-        .issues
-        .iter()
-        .find(|issue| issue.id == id || issue.file.as_deref() == Some(definition_file.as_str()))
-    {
-        eprintln!("svc: {}", issue);
-    } else {
-        eprintln!("svc: unknown service: {}", id);
-    }
-    EXIT_NOT_FOUND
 }
 
 fn daemon_command(verb: DaemonVerb, id: &str) -> i32 {
