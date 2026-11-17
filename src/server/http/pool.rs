@@ -61,7 +61,7 @@ pub struct CancelToken {
 }
 
 impl CancelToken {
-    fn new() -> CancelToken {
+    pub(crate) fn new() -> CancelToken {
         CancelToken {
             cancelled: Arc::new(AtomicBool::new(false)),
         }

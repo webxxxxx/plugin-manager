@@ -19,6 +19,15 @@ use crate::http;
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 
+/// Poll flags that mean the peer is gone. Linux reports a half-close as
+/// `POLLRDHUP` even when the socket still has unread bytes; without it a
+/// paused stream (a job in flight, so no read interest) never sees the client
+/// FIN and cannot cancel that job.
+#[cfg(all(unix, target_os = "linux"))]
+const POLL_CLOSE: i16 = libc::POLLERR | libc::POLLHUP | libc::POLLRDHUP;
+#[cfg(all(unix, not(target_os = "linux")))]
+const POLL_CLOSE: i16 = libc::POLLERR | libc::POLLHUP;
+
 /// The busy response for a connection refused by the loop. Both engines send
 /// the same bytes so a client sees one status on every host.
 pub const BUSY_CONNECTION_RESPONSE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\
@@ -134,8 +143,9 @@ pub trait ServerLoop {
     fn is_idle(&self, connection: &Connection<Self::State>, now: Instant, idle: Duration) -> bool;
     fn on_close(&mut self, connection: &mut Connection<Self::State>);
 
-    /// The loop is about to drop a connection after `POLLERR` / `POLLHUP`.
-    /// Handlers use this for protocol-specific diagnostics.
+    /// The loop is about to drop a connection after `POLLERR` / `POLLHUP`
+    /// (or Linux's `POLLRDHUP`). Handlers use this for protocol-specific
+    /// diagnostics.
     fn on_poll_error(&mut self, connection: &mut Connection<Self::State>, _revents: i16) {
         let _ = connection;
     }
@@ -306,7 +316,7 @@ where
                 continue;
             };
             let revents = descriptors[index].revents;
-            if revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+            if revents & POLL_CLOSE != 0 {
                 if let Some(mut connection) = connections.remove(&id) {
                     handler.on_poll_error(&mut connection, revents);
                     handler.on_close(&mut connection);

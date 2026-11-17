@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use crate::channel;
 use crate::http;
 use crate::package;
-use crate::server::http::{CancelToken, Request};
+use crate::server::http::{CancelToken, JobBudget, Request};
 
 /// The control-channel budget a face request carries.
 ///
@@ -36,10 +36,15 @@ impl CallBudget {
         }
     }
 
-    /// A request outside a server route: the CLI and the install/import streams
-    /// keep their existing unbounded control round trip.
-    pub fn unbounded() -> CallBudget {
-        CallBudget::default()
+    /// A stream job's budget: the pool's disconnect token plus the connection's
+    /// no-progress deadline. Stream jobs that call the control channel use
+    /// this; a deadline shorter than the connection's would report a failure
+    /// the client could no longer receive.
+    pub fn from_job(job: &JobBudget) -> CallBudget {
+        CallBudget {
+            deadline: Some(job.deadline),
+            cancel: Some(job.cancel.clone()),
+        }
     }
 }
 
@@ -215,4 +220,21 @@ pub(crate) fn error(status: u16, code: &str, message: &str) -> Vec<u8> {
 
 pub(crate) fn decode(value: &str) -> String {
     http::percent_decode(value, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stream-job handoff must carry both halves of the budget: a job that
+    /// only got a deadline would keep a disconnected install alive, and one
+    /// that only got the token would keep a stuck supervisor forever.
+    #[test]
+    fn a_stream_job_budget_carries_the_pool_token_and_deadline() {
+        let job = JobBudget::for_test();
+        let budget = CallBudget::from_job(&job);
+        assert_eq!(budget.deadline, Some(job.deadline));
+        assert!(budget.cancel.is_some());
+        assert!(!budget.cancel.unwrap().is_cancelled());
+    }
 }

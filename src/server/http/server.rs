@@ -36,7 +36,7 @@ use crate::server::http::engine::{
 use crate::server::http::{
     complete_blocking, dispatch_inline, prepare_face_request, render_exchange, BlockingOutcome,
     BlockingPool, BodyPolicy, Busy, CancelToken, CompletionSlot, Dispatch, Exchange, Face,
-    JobOutcome, StreamClass, StreamHandler,
+    JobBudget, JobOutcome, StreamClass, StreamHandler,
 };
 use crate::server::mcp::progress::{McpSseStream, PROGRESS_QUEUE_SLOTS};
 use crate::wake::Wake;
@@ -528,7 +528,18 @@ impl ServerLoop for Server {
                 if driver.wants_read() {
                     libc::POLLIN
                 } else {
-                    0
+                    // A paused stream still has to notice a client FIN so a
+                    // running job can be cancelled. Linux reports the
+                    // half-close without reading the unread body bytes; other
+                    // Unixes keep the old POLLHUP-only detection.
+                    #[cfg(target_os = "linux")]
+                    {
+                        libc::POLLRDHUP
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        0
+                    }
                 }
             }
             ConnState::Processing => 0,
@@ -663,7 +674,10 @@ impl Server {
             if cancel.is_cancelled() {
                 return;
             }
-            let outcome = job();
+            let outcome = job(JobBudget {
+                cancel,
+                deadline: Instant::now() + crate::limits::current().transfer_timeout,
+            });
             let _ = results.send(WorkResult::StreamJobDone {
                 connection: id,
                 outcome,

@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use crate::limits;
 use crate::server::http::{
-    CloseReason, FileSend, OutBuffer, StreamAction, StreamEvent, StreamHandler,
+    CancelToken, CloseReason, FileSend, JobBudget, OutBuffer, StreamAction, StreamEvent,
+    StreamHandler,
 };
 
 use super::budget::{Busy, StreamBudget};
@@ -88,7 +89,13 @@ fn drive_loop(
             // is just work that happens to take time. It never runs on a
             // shared server loop here.
             StreamAction::SubmitBlocking(job) => {
-                let outcome = job();
+                // This thread is already the connection thread, so it cannot
+                // observe a peer FIN while the job runs. The deadline still
+                // bounds a stuck control round trip; the token stays clean.
+                let outcome = job(JobBudget {
+                    cancel: CancelToken::new(),
+                    deadline: Instant::now() + timeout,
+                });
                 step = handler.on_event(
                     StreamEvent::BlockingDone(outcome),
                     &mut OutBuffer::new(&mut out, limit),

@@ -648,7 +648,7 @@ mod tests {
         fn on_event(&mut self, event: StreamEvent<'_>, out: &mut OutBuffer<'_>) -> StreamStep {
             match event {
                 StreamEvent::Data(_) => {
-                    StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|| {
+                    StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|_budget| {
                         BlockingOutcome::Ok(b"done".to_vec())
                     })))
                 }
@@ -699,7 +699,7 @@ mod tests {
     }
 
     fn job_result(job: BlockingJob) -> Vec<u8> {
-        match job() {
+        match job(crate::server::http::JobBudget::for_test()) {
             BlockingOutcome::Ok(bytes) => bytes,
             BlockingOutcome::Failed(message) => panic!("unexpected failure: {message}"),
         }
@@ -714,7 +714,7 @@ mod tests {
             fn on_event(&mut self, event: StreamEvent<'_>, out: &mut OutBuffer<'_>) -> StreamStep {
                 match event {
                     StreamEvent::Data(_) => {
-                        StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|| {
+                        StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|_budget| {
                             BlockingOutcome::Ok(b"one".to_vec())
                         })))
                     }
@@ -722,7 +722,7 @@ mod tests {
                         self.calls += 1;
                         out.write(&bytes);
                         if self.calls == 1 {
-                            StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|| {
+                            StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|_budget| {
                                 BlockingOutcome::Ok(b"two".to_vec())
                             })))
                         } else {
@@ -768,7 +768,7 @@ mod tests {
         fn on_event(&mut self, event: StreamEvent<'_>, _out: &mut OutBuffer<'_>) -> StreamStep {
             match event {
                 StreamEvent::Data(_) => StreamStep::wait(StreamAction::SubmitBlocking(Box::new(
-                    || BlockingOutcome::Ok(Vec::new()),
+                    |_budget| BlockingOutcome::Ok(Vec::new()),
                 ))),
                 StreamEvent::BlockingDone(_) => StreamStep::wait(StreamAction::NeedRead),
                 _ => StreamStep::wait(StreamAction::Continue),

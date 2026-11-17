@@ -12,6 +12,8 @@
 use std::fs::File;
 use std::time::Instant;
 
+use super::pool::CancelToken;
+
 /// One thing that happened to a stream.
 ///
 /// Events are values, not callbacks: a test can construct any sequence without
@@ -57,10 +59,31 @@ pub enum StreamAction {
     Close(CloseReason),
 }
 
+/// The budget the server gives one stream job: the pool's cancellation token
+/// (flipped when the connection closes) and a deadline that matches the
+/// connection's no-progress bound. A handler that makes a control-channel round
+/// trip must pass both into it; other handlers ignore the value explicitly.
+#[derive(Clone, Debug)]
+pub struct JobBudget {
+    pub cancel: CancelToken,
+    pub deadline: Instant,
+}
+
+#[cfg(test)]
+impl JobBudget {
+    /// A clean budget for a handler unit test that drives the job inline.
+    pub fn for_test() -> JobBudget {
+        JobBudget {
+            cancel: CancelToken::new(),
+            deadline: Instant::now() + std::time::Duration::from_secs(30),
+        }
+    }
+}
+
 /// Work the handler wants the blocking pool to run. The pool returns the
 /// outcome through `StreamEvent::BlockingDone`; no connection handle is
 /// involved.
-pub type BlockingJob = Box<dyn FnOnce() -> BlockingOutcome + Send + 'static>;
+pub type BlockingJob = Box<dyn FnOnce(JobBudget) -> BlockingOutcome + Send + 'static>;
 
 /// The value a blocking job returns.
 #[derive(Debug)]
