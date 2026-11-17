@@ -40,6 +40,10 @@ _Avoid_: 服务管理器进程、supervisor daemon
 与服务管理器交互的 CLI，也是核心服务的能力命名空间（`svc.list`、`svc.describe` 等）。
 _Avoid_: svcd CLI、管理客户端
 
+**控制通道（Control channel）**:
+CLI / MCP / plugin 与 svcd 之间的本地 NDJSON 通道：Unix 走 UDS，Windows 走命名管道；服务端 bind、客户端 connect、连接池与 token 权限由 `ControlChannel` 平台 seam 收口（#143）。与 HTTP / MCP HTTP 面区分。
+_Avoid_: IPC（那是插件 stdio 与控制通道的统称）、管理端口
+
 **plugin**:
 只管理插件的 CLI；动词与 `svc` 同源，但作用域限定在 `kind=plugin`，另加 `install / uninstall / editconfig / export / import`。
 _Avoid_: 插件管理器、PluginManager（那是已退役的进程）

@@ -15,26 +15,20 @@ pub mod handle;
 pub mod listener;
 
 use std::os::unix::io::RawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::thread;
 
-use crate::channel::PendingCall;
 use crate::server::http::engine::{self, Connection, HttpRequest, PreRequest, ServerLoop, Table};
-use crate::wake::Wake;
 
 use self::handle::LoopHandle;
 use self::listener::{ControlServer, Source};
 
 /// Start the server loop for the minimal (no HTTP) build: control channel only.
 #[cfg_attr(feature = "http", allow(dead_code))]
-pub fn spawn_control_only(
-    listener: UnixListener,
-    tx: SyncSender<PendingCall>,
-    wake: Arc<Wake>,
-) -> std::io::Result<LoopHandle> {
+pub fn spawn_control_only(control: crate::channel::ControlBinding) -> std::io::Result<LoopHandle> {
+    let (listener, tx, wake) = control.into_parts();
     let (notify_rx, notify_tx) = UnixStream::pair()?;
     notify_rx.set_nonblocking(true)?;
     notify_tx.set_nonblocking(true)?;
@@ -135,7 +129,9 @@ impl ServerLoop for ControlOnly {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channel::PendingCall;
     use crate::rpc;
+    use crate::wake::Wake;
     use std::io::{BufRead, BufReader, Write};
     use std::sync::mpsc;
     use std::time::Duration;
@@ -154,7 +150,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("root");
         let path = root.join("svcd.sock");
-        let listener = UnixListener::bind(&path).expect("listener");
         let (tx, rx) = mpsc::sync_channel::<PendingCall>(8);
         std::thread::spawn(move || {
             for call in rx {
@@ -166,7 +161,9 @@ mod tests {
                 )));
             }
         });
-        let handle = spawn_control_only(listener, tx, Arc::new(Wake::new())).expect("loop");
+        let control =
+            crate::channel::bind_server(&root, tx, Arc::new(Wake::new())).expect("control channel");
+        let handle = spawn_control_only(control).expect("loop");
 
         let mut stream = UnixStream::connect(&path).expect("connect");
         stream

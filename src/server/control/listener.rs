@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::channel::{PendingCall, Reply};
+use crate::channel::{Notify, PendingCall, Reply};
 use crate::ipc;
 use crate::rpc;
 use crate::wake::Wake;
@@ -276,10 +276,8 @@ fn drain_requests(
         let line: Vec<u8> = connection.buffer.drain(..=position).collect();
         let line = String::from_utf8_lossy(&line[..line.len().saturating_sub(1)]).to_string();
         let (sender, receiver) = mpsc::channel();
-        match tx.try_send(PendingCall {
-            line,
-            reply: Reply::with_notify(sender, notify),
-        }) {
+        let reply = Reply::with_notify(sender, Notify::new(notify));
+        match tx.try_send(PendingCall { line, reply }) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 // Bounded backpressure: answer this connection with a visible
