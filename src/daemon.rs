@@ -410,9 +410,10 @@ fn shutdown_inner(verbose: bool) -> i32 {
 fn harden_directories() -> std::io::Result<()> {
     use crate::platform::host::acl::Acl;
     for dir in [paths::config_dir(), paths::services_dir(), paths::plugins_dir()] {
-        if !dir.exists() {
-            continue;
-        }
+        // Create first: a first start has no `services.d` / `plugins` yet, and a
+        // directory created later would inherit `C:\ProgramData`'s Users-write
+        // ACE instead of getting the protected DACL below.
+        fs::create_dir_all(&dir)?;
         Acl::shared(true)?.apply_to_path(&dir)?;
     }
     Ok(())
