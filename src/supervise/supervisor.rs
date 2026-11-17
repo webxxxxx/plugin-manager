@@ -1,7 +1,7 @@
-pub use crate::supervise::registry::State;
+pub use crate::kernel::registry::State;
 
 use crate::kernel::contract::{Health, Settled};
-use crate::supervise::registry::Restart;
+use crate::kernel::registry::Restart;
 
 /// Full §1.3 schedule. `MAX_FAILURES = 5` means one crash loop enters `Failed`
 /// on the fifth failure, so only 1/2/4/8s are armed in practice; 16s/30s are
@@ -344,7 +344,7 @@ impl Machine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::supervise::registry::Restart;
+    use crate::kernel::registry::Restart;
 
     fn start(machine: &mut Machine, pid: u32, now: u64) -> Vec<Action> {
         let actions = machine.step(Event::Start, now);

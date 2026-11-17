@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::manage::package::valid_name;
-use crate::supervise::registry::{
+use crate::kernel::registry::{
     Exec, Hook, Kind, Lifecycle, Ready, Registry, Restart, Service, State, RESERVED_ID,
 };
 
@@ -254,11 +254,11 @@ fn load_scripts(
             None
         };
         let enabled = !dir.join(format!("{}.disabled", id)).exists();
-        let contract = crate::supervise::registry::contract_for(
+        let contract = crate::kernel::registry::contract_for(
             &id,
             "1.0.0",
             Vec::new(),
-            crate::supervise::registry::Carrier::Slot,
+            crate::kernel::registry::Carrier::Slot,
             limits,
         );
         let service = Service {
@@ -484,8 +484,8 @@ fn validate(definition: CoreDefinition, limits: &crate::platform::limits::Limits
                 .map(|hook| {
                     convert_hook(
                         hook,
-                        crate::supervise::registry::HOOK_START_TIMEOUT_MS,
-                        crate::supervise::registry::HOOK_TIMEOUT_MAX_MS,
+                        crate::kernel::registry::HOOK_START_TIMEOUT_MS,
+                        crate::kernel::registry::HOOK_TIMEOUT_MAX_MS,
                     )
                 })
                 .transpose()?,
@@ -494,8 +494,8 @@ fn validate(definition: CoreDefinition, limits: &crate::platform::limits::Limits
                 .map(|hook| {
                     convert_hook(
                         hook,
-                        crate::supervise::registry::HOOK_STOP_TIMEOUT_MS,
-                        crate::supervise::registry::HOOK_TIMEOUT_MAX_MS,
+                        crate::kernel::registry::HOOK_STOP_TIMEOUT_MS,
+                        crate::kernel::registry::HOOK_TIMEOUT_MAX_MS,
                     )
                 })
                 .transpose()?,
@@ -504,8 +504,8 @@ fn validate(definition: CoreDefinition, limits: &crate::platform::limits::Limits
                 .map(|hook| {
                     convert_hook(
                         hook,
-                        crate::supervise::registry::HOOK_STATUS_TIMEOUT_MS,
-                        crate::supervise::registry::HOOK_STATUS_TIMEOUT_MAX_MS,
+                        crate::kernel::registry::HOOK_STATUS_TIMEOUT_MS,
+                        crate::kernel::registry::HOOK_STATUS_TIMEOUT_MAX_MS,
                     )
                 })
                 .transpose()?,
@@ -519,11 +519,11 @@ fn validate(definition: CoreDefinition, limits: &crate::platform::limits::Limits
         }
     }
 
-    let contract = crate::supervise::registry::contract_for(
+    let contract = crate::kernel::registry::contract_for(
         &definition.id,
         &definition.version,
         Vec::new(),
-        crate::supervise::registry::Carrier::Slot,
+        crate::kernel::registry::Carrier::Slot,
         limits,
     );
     Ok(Service {

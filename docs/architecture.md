@@ -356,7 +356,7 @@ flowchart TD
 |---|---|---|
 | `package.rs` `bundle.rs` `trust.rs` `interpreter.rs` | `manage/` | 按 model / check / ops 三段拆 |
 | `plugin.rs` | `manage/`（布局与扫描）+ `kernel/contract.rs`（能力声明） | 声明与操作分开 |
-| `slot.rs` `supervisor.rs` `registry.rs` `runtime.rs` `hook.rs` `script.rs` `definition.rs` | `supervise/` + `kernel/registry.rs` | 注册表类型进内核，运行载体留监督 |
+| `slot.rs` `supervisor.rs` `runtime.rs` `hook.rs` `script.rs` `definition.rs` | `supervise/` | 运行载体留监督 |
 | `blob.rs` | `platform/storage/`（内容寻址、上传会话、回收） | `$blob` 引用语义归 `kernel/contract` |
 | `ipc.rs` `rpc.rs` `rawhub.rs` `reactor.rs` | `wire/contract/` + `wire/message/` | 帧、消息、连接分开 |
 | `channel.rs` | `wire/control/` + `server/control/` | 字节在线格式与客户端轮次在 wire；控制会话已在 `server/control/`（#124） |
@@ -436,7 +436,8 @@ flowchart LR
 下一步（按风险排序）：
 
 1. **拆分**：step 6 只搬不拆，`manage`/`supervise` 的 `model/check/ops`、`platform/storage` 五拆、`api.rs` 四拆各开票。
-2. **`registry` 进内核**：`supervise/registry.rs` 的类型目标是 `kernel/registry.rs`（§11）。
-3. **`SVCD_*` 覆盖**：ADR-0019 留下的独立票。
+2. **`SVCD_*` 覆盖**：ADR-0019 留下的独立票。
+
+已完成：`registry` 进内核（#172，`src/kernel/registry.rs`）。
 
 已完成：**S5 失败投影**（#149/#150 控制通道 `Problem`/`data` 与 HTTP 投影；#151 face-local typed errors——S5 的 HTTP 字符串匹配归零，全仓没有按 message 选状态的代码）。

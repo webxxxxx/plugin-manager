@@ -5,7 +5,7 @@
 //! shell function, PowerShell function, cmd label or shell `case` branch counts
 //! as an action. Comments are ignored.
 
-use crate::supervise::registry::Restart;
+use crate::kernel::registry::Restart;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Actions {
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn a_shell_script_declares_its_restart_policy() {
-        use crate::supervise::registry::Restart;
+        use crate::kernel::registry::Restart;
 
         assert_eq!(
             declared_restart("#!/bin/sh\nRESTART=never\nstart() { :; }\n", "sh"),

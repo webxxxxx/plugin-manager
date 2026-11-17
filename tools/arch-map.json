@@ -156,9 +156,9 @@
       "note": "导入语义，现横跨四个模块"
     },
     "registry": {
-      "concept": "supervise/registry",
-      "layer": "domain",
-      "note": "目标在 kernel/registry"
+      "concept": "kernel/registry",
+      "layer": "kernel",
+      "note": "注册表类型、依赖与环判定；#172 起进内核（step 6 遗留）"
     },
     "definition": {
       "concept": "supervise/definition",
@@ -322,7 +322,6 @@
     "src/manage/interpreter.rs": "interpreter",
     "src/manage/plugin.rs": "plugin",
     "src/manage/transfer.rs": "transfer",
-    "src/supervise/registry.rs": "registry",
     "src/supervise/definition.rs": "definition",
     "src/supervise/supervisor.rs": "supervisor",
     "src/supervise/slot.rs": "slot",
@@ -340,6 +339,7 @@
     "src/face/uichannel.rs": "uichannel",
     "src/cli/svc.rs": "svc",
     "src/cli/plugin.rs": "plugin_cli",
-    "src/cli/status.rs": "status"
+    "src/cli/status.rs": "status",
+    "src/kernel/registry.rs": "registry"
   }
 }
