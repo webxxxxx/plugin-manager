@@ -17,6 +17,8 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
+#[cfg(not(unix))]
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -721,7 +723,8 @@ fn serve_mcp_sse(
 ) -> std::io::Result<()> {
     // The Windows fallback has no stream driver, but the long-lived budget is
     // still server policy: reserve it before the head and before the plugin
-    // call starts. The permit lives until this blocking response ends.
+    // call starts. The permit lives until this blocking response ends, and a
+    // client disconnect ends it below (#135).
     let _permit = match crate::server::http::budget::StreamBudget::global().acquire(
         crate::server::http::StreamClass::LongLived,
         crate::limits::current().max_streams,
@@ -743,7 +746,21 @@ fn serve_mcp_sse(
           Connection: close\r\n\
           Transfer-Encoding: chunked\r\n\r\n",
     )?;
-    let mut write_error = None;
+    // The control read runs on this connection's thread, so it must be able to
+    // see the client leave. A cloned handle gives the poll a read-only probe
+    // while the response keeps writing to the original socket.
+    let probe = match stream.try_clone() {
+        Ok(probe) => probe,
+        Err(_) => {
+            let response = rpc::err(call.id, -32603, "cannot observe the client connection");
+            let _ = write_sse_line(stream, &rpc::to_line(&response));
+            let _ = stream.write_all(b"0\r\n\r\n");
+            let _ = stream.flush();
+            return Ok(());
+        }
+    };
+    let write_failed = Arc::new(AtomicBool::new(false));
+    let failed = write_failed.clone();
     let response = channel::request_stream(
         config,
         "registry.call",
@@ -752,22 +769,86 @@ fn serve_mcp_sse(
             "arguments": call.arguments,
             "progressToken": call.progress_token,
         }),
+        // The same no-progress bound the Unix stream driver applies to an SSE
+        // response: a hung supervisor cannot pin this thread forever.
+        Some(crate::limits::current().transfer_timeout),
+        move || failed.load(Ordering::Acquire) || client_gone(&probe),
         |notification| {
-            if write_error.is_none() && write_sse_line(stream, notification).is_err() {
-                write_error = Some(());
+            if !write_failed.load(Ordering::Acquire)
+                && write_sse_line(stream, notification).is_err()
+            {
+                write_failed.store(true, Ordering::Release);
             }
         },
     );
     let response = match response {
-        Ok(response) => crate::server::mcp::result::finish_modern_tool_call(call.id, response),
-        Err(error) => rpc::err(call.id, -32603, &format!("svcd unreachable: {}", error)),
+        Ok(response) => Some(crate::server::mcp::result::finish_modern_tool_call(
+            call.id,
+            response,
+        )),
+        // The client left, or a write failed: this response can no longer be
+        // delivered. Dropping the control socket discards a late final frame
+        // instead of pooling it for the next request.
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => None,
+        Err(error) => Some(rpc::err(
+            call.id,
+            -32603,
+            &format!("svcd unreachable: {}", error),
+        )),
     };
-    if write_error.is_none() {
-        let _ = write_sse_line(stream, &rpc::to_line(&response));
+    if !write_failed.load(Ordering::Acquire) {
+        if let Some(response) = &response {
+            let _ = write_sse_line(stream, &rpc::to_line(response));
+        }
+        let _ = stream.write_all(b"0\r\n\r\n");
+        let _ = stream.flush();
     }
-    let _ = stream.write_all(b"0\r\n\r\n");
-    let _ = stream.flush();
     Ok(())
+}
+
+/// Whether the SSE client has gone away (#135).
+///
+/// `peek` on a blocking socket waits for data, so a readiness check with a
+/// zero timeout must come first; only a readable socket is peeked. A graceful
+/// FIN is `Ok(0)`, and an error means the peer reset the connection: both mean
+/// the SSE response can no longer be delivered. This is the Windows equivalent
+/// of the Unix stream driver's cancel token, not a permanent exemption.
+#[cfg(not(unix))]
+fn client_gone(stream: &TcpStream) -> bool {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        select, FD_SET, SOCKET, SOCKET_ERROR, TIMEVAL,
+    };
+
+    let mut readable: FD_SET = unsafe { std::mem::zeroed() };
+    readable.fd_count = 1;
+    readable.fd_array[0] = stream.as_raw_socket() as SOCKET;
+    let timeout = TIMEVAL {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let ready = unsafe {
+        select(
+            0,
+            &mut readable,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &timeout,
+        )
+    };
+    if ready == SOCKET_ERROR {
+        return true;
+    }
+    if ready == 0 {
+        return false;
+    }
+    // Readable now, so this peek cannot block. A FIN shows up as `Ok(0)`.
+    let mut byte = [0u8; 1];
+    match stream.peek(&mut byte) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(_) => true,
+    }
 }
 
 #[cfg(not(unix))]

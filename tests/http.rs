@@ -7357,9 +7357,9 @@ fn http_mcp_stream_consumes_the_long_lived_max_streams_budget() {
 
 /// A disconnected streaming MCP call must release its long-lived slot: with
 /// `max_streams = 1`, a second streaming call can start as soon as the first
-/// client goes away, even while the plugin call is still running. The Windows
-/// fallback cannot cancel the in-flight call, so this is a server-loop test.
-#[cfg(unix)]
+/// client goes away, even while the plugin call is still running. Both engines
+/// own the slot: the Unix loop cancels the reactor call, and the Windows
+/// fallback peeks the client socket and abandons the control read (#135).
 #[test]
 fn http_mcp_stream_disconnect_releases_the_budget() {
     let mut sandbox = Sandbox::new();
@@ -7385,10 +7385,11 @@ fn http_mcp_stream_disconnect_releases_the_budget() {
     assert_eq!(started.status, 200, "{}", started.body);
     set_password(&sandbox, TEST_PASSWORD);
 
-    // The plugin sleeps for two seconds, so the stream is still open when we
+    // The plugin sleeps for five seconds, so the stream is still open when we
     // drop the client after its head.
     let mut slow = mcp_stream_request(&address, 11, "demo.slow");
     assert_eq!(read_response_head(&mut slow).0, 200);
+    let dropped_at = Instant::now();
     drop(slow);
 
     let mut released = false;
@@ -7409,6 +7410,12 @@ fn http_mcp_stream_disconnect_releases_the_budget() {
     assert!(
         released,
         "a disconnected MCP client must release the max_streams slot"
+    );
+    assert!(
+        dropped_at.elapsed() < Duration::from_secs(2),
+        "the slot must be released when the client leaves, not when the hung \
+         plugin call finally returns (took {:?})",
+        dropped_at.elapsed()
     );
 }
 

@@ -339,7 +339,7 @@ fn tools_call(
         request["progressToken"] = token;
     }
     let mut progress = progress;
-    let response = channel::request_stream(config, "registry.call", request, |line| {
+    let response = channel::request_stream(config, "registry.call", request, None, || false, |line| {
         if let Some(out) = progress.as_deref_mut() {
             let _ = out.write_all(line.as_bytes());
             let _ = out.write_all(b"\n");

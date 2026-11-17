@@ -284,36 +284,97 @@ pub fn request(
     method: &str,
     params: serde_json::Value,
 ) -> io::Result<crate::rpc::Response> {
-    request_stream(config, method, params, |_| {})
+    request_stream(config, method, params, None, || false, |_| {})
 }
 
 /// A request whose handler may emit JSON-RPC notifications before the final
 /// response. Notifications are delivered to `on_notification`; reading stops at
 /// the response with an `id`.
-pub fn request_stream<F>(
+///
+/// `idle` bounds how long the caller waits for the next frame; `cancelled` is
+/// checked once per short poll. The CLI passes no bound and never cancels, so
+/// it keeps the blocking round trip and the connection pool. A server-side
+/// SSE response passes the transfer bound and its client's disconnect check,
+/// so a hung supervisor or a gone client releases the stream permit instead of
+/// pinning the connection thread. A timed-out or cancelled socket is dropped,
+/// never returned to the pool: a late response would otherwise be mistaken for
+/// the next request's reply.
+pub fn request_stream<F, C>(
     config: &Path,
     method: &str,
     params: serde_json::Value,
+    idle: Option<Duration>,
+    cancelled: C,
     mut on_notification: F,
 ) -> io::Result<crate::rpc::Response>
 where
     F: FnMut(&str),
+    C: Fn() -> bool,
 {
     let token = read_token(config)?;
     let mut stream = acquire(config)?;
     let line = request_line(method, params, token);
     ipc::write_frame_limit(&mut stream, &line, ipc::LOCAL_FRAME_MAX)?;
 
-    let mut reader = BufReader::new(stream);
+    let mut reader = ipc::FrameReader::new(BufReader::new(PollReader { stream }));
+    let mut last_frame = Instant::now();
     loop {
-        let line = ipc::read_frame_limit(&mut reader, ipc::LOCAL_FRAME_MAX)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "empty response frame"))?;
-        match response_from_line(&line)? {
-            Some(response) => {
-                release(config, reader.into_inner());
+        if cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "control request cancelled",
+            ));
+        }
+        let now = Instant::now();
+        let wait = match idle {
+            Some(idle) => {
+                let elapsed = now.saturating_duration_since(last_frame);
+                if elapsed >= idle {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "control request timed out",
+                    ));
+                }
+                (idle - elapsed).min(CONTROL_POLL_INTERVAL)
+            }
+            None => CONTROL_POLL_INTERVAL,
+        };
+        if !reader.has_buffered() && !reader.get_ref().get_ref().wait_readable(wait)? {
+            continue;
+        }
+        match reader.read_frame_limit(ipc::LOCAL_FRAME_MAX) {
+            Ok(Some(line)) => {
+                last_frame = Instant::now();
+                let Some(response) = response_from_line(&line)? else {
+                    on_notification(&line);
+                    continue;
+                };
+                release(config, reader.into_inner().into_inner().into_inner());
                 return Ok(response);
             }
-            None => on_notification(&line),
+            Ok(None) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "empty response frame",
+                ))
+            }
+            Err(ipc::FrameError::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                // A partial frame is already buffered: let the socket wake the
+                // next poll instead of spinning on `WouldBlock`.
+                let _ = reader
+                    .get_ref()
+                    .get_ref()
+                    .wait_readable(CONTROL_POLL_INTERVAL);
+                continue;
+            }
+            Err(error) => return Err(error.into()),
         }
     }
 }
@@ -936,6 +997,188 @@ mod tests {
             "the deadline must fire with a partial frame, took {:?}",
             started.elapsed()
         );
+        server.join().expect("server");
+        let _ = fs::remove_dir_all(&config);
+    }
+
+    fn pooled(config: &Path) -> usize {
+        pool()
+            .lock()
+            .expect("pool")
+            .get(config)
+            .map(Vec::len)
+            .unwrap_or(0)
+    }
+
+    /// A notification split across two writes must be forwarded exactly once,
+    /// and the completed round trip must return to the pool, like every other
+    /// CLI control request.
+    #[test]
+    fn a_stream_request_forwards_a_split_notification_before_the_response() {
+        let config = config_dir("stream-notify");
+        let listener = listener(&config);
+        let server = std::thread::spawn(move || {
+            let mut stream = listener
+                .incoming()
+                .next()
+                .expect("accept")
+                .expect("stream");
+            stream
+                .write_all(br#"{"jsonrpc":"2.0","method":"notifications/progress","#)
+                .expect("first chunk");
+            stream.flush().expect("flush");
+            std::thread::sleep(Duration::from_millis(80));
+            stream
+                .write_all(br#""params":{"progress":1}}"#)
+                .expect("second chunk");
+            stream.write_all(b"\n").expect("newline");
+            stream
+                .write_all(br#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#)
+                .expect("response");
+            stream.write_all(b"\n").expect("newline");
+            stream.flush().expect("flush");
+        });
+
+        let mut notifications = Vec::new();
+        let response = request_stream(
+            &config,
+            "registry.call",
+            serde_json::json!({}),
+            None,
+            || false,
+            |line| notifications.push(line.to_string()),
+        )
+        .expect("the response arrives after the notification");
+        assert_eq!(response.result, Some(serde_json::json!({ "ok": true })));
+        assert_eq!(notifications.len(), 1, "{notifications:?}");
+        assert!(
+            notifications[0].contains("\"progress\":1"),
+            "{notifications:?}"
+        );
+        assert_eq!(
+            pooled(&config),
+            1,
+            "a completed stream returns its socket to the pool"
+        );
+        server.join().expect("server");
+        let _ = fs::remove_dir_all(&config);
+    }
+
+    /// A silent supervisor must not hold the caller past the idle bound.
+    #[test]
+    fn a_stream_request_without_a_frame_hits_its_idle_deadline() {
+        let config = config_dir("stream-idle");
+        let listener = listener(&config);
+        let server = std::thread::spawn(move || {
+            let _stream = listener
+                .incoming()
+                .next()
+                .expect("accept")
+                .expect("stream");
+            std::thread::sleep(Duration::from_secs(2));
+        });
+
+        let started = Instant::now();
+        let error = request_stream(
+            &config,
+            "registry.call",
+            serde_json::json!({}),
+            Some(Duration::from_millis(150)),
+            || false,
+            |_| {},
+        )
+        .expect_err("a silent stream must hit the idle deadline");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the idle bound must not wait for the final frame, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            pooled(&config),
+            0,
+            "a timed-out connection must not be reused"
+        );
+        server.join().expect("server");
+        let _ = fs::remove_dir_all(&config);
+    }
+
+    /// A disconnect check that flips must stop the read within one poll period,
+    /// and the half-finished request must not poison the pool.
+    #[test]
+    fn a_cancelled_stream_request_drops_the_socket_instead_of_pooling_it() {
+        let config = config_dir("stream-cancel");
+        let listener = listener(&config);
+        let server = std::thread::spawn(move || {
+            let _stream = listener
+                .incoming()
+                .next()
+                .expect("accept")
+                .expect("stream");
+            std::thread::sleep(Duration::from_secs(2));
+        });
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flip = cancelled.clone();
+        let flipper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            flip.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        let error = request_stream(
+            &config,
+            "registry.call",
+            serde_json::json!({}),
+            None,
+            || cancelled.load(Ordering::Acquire),
+            |_| {},
+        )
+        .expect_err("a cancelled stream must not wait for the final frame");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cancel must arrive in one poll period, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            pooled(&config),
+            0,
+            "a socket with a late reply must not be reused"
+        );
+        flipper.join().expect("flipper");
+        server.join().expect("server");
+        let _ = fs::remove_dir_all(&config);
+    }
+
+    /// The Windows control pipe has no read timeout: the peek that precedes a
+    /// short read must report "no data" without blocking, or the deadline and
+    /// the disconnect check above could never run.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_pipe_peek_does_not_wait_for_data() {
+        let config = config_dir("pipe-peek");
+        let listener = listener(&config);
+        let server = std::thread::spawn(move || {
+            let _stream = listener
+                .incoming()
+                .next()
+                .expect("accept")
+                .expect("stream");
+            std::thread::sleep(Duration::from_secs(2));
+        });
+
+        let stream = connect(&config).expect("connect");
+        let started = Instant::now();
+        assert!(
+            !stream.wait_readable(Duration::ZERO).expect("peek"),
+            "a silent pipe must not report readable"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the peek must not wait for data, took {:?}",
+            started.elapsed()
+        );
+        drop(stream);
         server.join().expect("server");
         let _ = fs::remove_dir_all(&config);
     }
