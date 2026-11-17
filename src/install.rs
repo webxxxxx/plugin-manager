@@ -302,7 +302,7 @@ fn default_conf_text(layout: &Layout) -> String {
          # max_streams caps long-lived and transfer streams; one-shot plugin UI\n\
          # static assets are exempt, so a page with more assets still loads.\n\
          # stream_buffer_bytes bounds one handler's output buffer.\n\
-         # Set the web/API password with: svc auth passwd <password>\n\
+         # Set the web/API password with: svc lan passwd <password>\n\
          # auth_passwd = pbkdf2-sha256$...\n",
         layout.config_dir.display(),
         plugins.display(),
@@ -2793,7 +2793,7 @@ mod tests {
             text.contains(&format!("config_dir = {}", layout.config_dir.display())),
             "{text}"
         );
-        assert!(text.contains("svc auth passwd"), "{text}");
+        assert!(text.contains("svc lan passwd"), "{text}");
         assert!(text.contains("blocking_threads = 2"), "{text}");
         assert!(
             text.contains(&format!(

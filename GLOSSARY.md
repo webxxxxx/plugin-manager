@@ -53,7 +53,7 @@ _Avoid_: 插件管理器、PluginManager（那是已退役的进程）
 _Avoid_: settings.json、通用“配置文件”
 
 **auth_passwd**:
-`svcd.conf` 里的 PBKDF2-HMAC-SHA256 口令哈希；明文只经过 `svc auth passwd <password>`，不落盘。网页登录、`/api/v1` 与 `/mcp` 的 Bearer 都用同一密码。
+`svcd.conf` 里的 PBKDF2-HMAC-SHA256 口令哈希；明文只经过 `svc lan passwd <password>`，不落盘。网页登录、`/api/v1` 与 `/mcp` 的 Bearer 都用同一密码。
 _Avoid_: lan-token、管理员 token
 
 **config_dir**:

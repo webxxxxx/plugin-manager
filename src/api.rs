@@ -3,7 +3,7 @@
 //!
 //! `bind` in `svcd.conf` chooses the listener address. A non-loopback bind
 //! requires `auth_passwd`; without it the daemon falls back to loopback so the
-//! operator can still run `svc auth passwd`. Management JSON projections and
+//! operator can still run `svc lan passwd`. Management JSON projections and
 //! the stream endpoints live in `face/` (#117–#121); the connection drivers
 //! (the Unix poll loop and the per-connection threads) live in `server/http/`,
 //! which is also where the platform choice is made (#139). This module is the
@@ -79,7 +79,7 @@ pub fn spawn(
 
     // A LAN bind without a password would expose an unauthenticated API. Keep
     // the daemon reachable on loopback so the operator can still run
-    // `svc auth passwd`, then restart to pick up the requested bind.
+    // `svc lan passwd`, then restart to pick up the requested bind.
     let mut bind = requested;
     if !requested.ip().is_loopback() && password_hash.is_none() {
         log::svcd(&format!(

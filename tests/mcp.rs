@@ -238,11 +238,11 @@ done
     /// Set the auth password without rebinding the listener, so /mcp can be
     /// exercised on the loopback surface.
     fn set_password(&self) -> String {
-        let output = self.run_svc(&["auth", "passwd", TEST_PASSWORD]);
+        let output = self.run_svc(&["lan", "passwd", TEST_PASSWORD]);
         assert_eq!(
             output.status.code(),
             Some(0),
-            "svc auth passwd failed: {}",
+            "svc lan passwd failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         TEST_PASSWORD.to_string()

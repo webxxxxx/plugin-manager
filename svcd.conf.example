@@ -16,7 +16,7 @@
 
 # HTTP listener. The default is loopback-only. A non-loopback bind (for
 # example 0.0.0.0:8787) requires auth_passwd; without it svcd falls back to
-# 127.0.0.1 so you can still run `svc auth passwd` and restart.
+# 127.0.0.1 so you can still run `svc lan passwd` and restart.
 bind = 127.0.0.1:8787
 
 # Unsigned plugin installs. Default false: an unsigned package is rejected as a
@@ -41,7 +41,7 @@ bind = 127.0.0.1:8787
 # install_dir = /etc/sr/svcd
 
 # Web/API password hash. Never put the plaintext here; set it with:
-#   svc auth passwd <password>
+#   svc lan passwd <password>
 # auth_passwd = pbkdf2-sha256$10000$...
 
 # Transient plugin data (blob arguments/results). Default: <data>/temp.

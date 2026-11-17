@@ -4227,7 +4227,7 @@ const TEST_PASSWORD: &str = "test-password";
 const TEST_PASSWORD_2: &str = "new-test-password";
 
 fn set_password(sandbox: &Sandbox, password: &str) {
-    let changed = sandbox.run_svc(&["auth", "passwd", password]);
+    let changed = sandbox.run_svc(&["lan", "passwd", password]);
     assert_eq!(
         changed.status.code(),
         Some(0),
@@ -4707,7 +4707,7 @@ fn lan_bind_without_password_falls_back_to_loopback() {
 
     let open = request(&address, "GET", "/api/v1/services", "", b"");
     assert_eq!(open.status, 200);
-    let status = sandbox.run_svc(&["auth", "status"]);
+    let status = sandbox.run_svc(&["lan", "status"]);
     assert_eq!(status.status.code(), Some(0));
     let text = String::from_utf8_lossy(&status.stdout);
     assert!(text.contains("requested: 0.0.0.0:0"), "{text}");
@@ -4723,10 +4723,10 @@ fn password_auth_bearer_cookie_csrf() {
     let open = request(&address, "GET", "/api/v1/services", "", b"");
     assert_eq!(open.status, 200);
 
-    let before_password = sandbox.run_svc(&["auth", "enable", "--bind", "0.0.0.0"]);
+    let before_password = sandbox.run_svc(&["lan", "enable", "--bind", "0.0.0.0"]);
     assert_ne!(before_password.status.code(), Some(0));
 
-    let changed = sandbox.run_svc(&["auth", "passwd", TEST_PASSWORD]);
+    let changed = sandbox.run_svc(&["lan", "passwd", TEST_PASSWORD]);
     assert_eq!(
         changed.status.code(),
         Some(0),
@@ -4734,7 +4734,7 @@ fn password_auth_bearer_cookie_csrf() {
         String::from_utf8_lossy(&changed.stderr)
     );
     // auth is derived from bind, so restart with a LAN bind after the password
-    // exists. No `auth enable` step is involved anymore.
+    // exists. No `lan enable` step is involved anymore.
     sandbox.shutdown();
     sandbox.start_daemon_with_bind("0.0.0.0:0");
     let address = sandbox.wait_for_http();
@@ -4901,7 +4901,7 @@ fn password_auth_bearer_cookie_csrf() {
     );
     assert_eq!(after_logout.status, 401);
 
-    let changed = sandbox.run_svc(&["auth", "passwd", TEST_PASSWORD_2]);
+    let changed = sandbox.run_svc(&["lan", "passwd", TEST_PASSWORD_2]);
     assert_eq!(changed.status.code(), Some(0));
     let old_bearer = request_with(
         &address,
@@ -4923,7 +4923,7 @@ fn password_auth_bearer_cookie_csrf() {
     );
     assert_eq!(new_allowed.status, 200);
 
-    let status = sandbox.run_svc(&["auth", "status"]);
+    let status = sandbox.run_svc(&["lan", "status"]);
     assert_eq!(status.status.code(), Some(0));
     let status_text = String::from_utf8_lossy(&status.stdout);
     assert!(status_text.contains("auth required: true"), "{status_text}");

@@ -154,7 +154,7 @@ fn parse(args: &[String]) -> Result<Command, ()> {
         "logs" => parse_logs(&args[1..]),
         "compat" => parse_compat(&args[1..]),
         "reload" if args.len() == 1 => Ok(Command::Reload),
-        "auth" => parse_auth(&args[1..]),
+        "auth" | "lan" => parse_auth(&args[1..]),
         "trust" => parse_trust(&args[1..]),
         _ => Err(()),
     }
@@ -727,7 +727,8 @@ fn usage() {
     eprintln!("       svc compat [--json]");
     eprintln!("       svc compat init --device <id> [--dry-run]");
     eprintln!("       svc logs <id> [--follow] [--lines N]");
-    eprintln!("       svc auth status|passwd <password>");
+    eprintln!("       svc lan status|passwd <password>");
+    eprintln!("       svc auth ...  (deprecated alias of svc lan)");
     eprintln!("       svc trust list|add <file.pub>|remove <keyId>");
 }
 
@@ -869,23 +870,30 @@ mod tests {
     }
 
     #[test]
-    fn parses_auth_commands() {
+    fn parses_lan_commands_and_the_deprecated_auth_alias() {
         assert_eq!(
-            parse(&args(&["auth", "status"])).expect("auth status"),
+            parse(&args(&["lan", "status"])).expect("lan status"),
             Command::Auth {
                 action: AuthAction::Status
             }
         );
         assert_eq!(
-            parse(&args(&["auth", "passwd", "secret"])).expect("auth passwd"),
+            parse(&args(&["lan", "passwd", "secret"])).expect("lan passwd"),
             Command::Auth {
                 action: AuthAction::Passwd("secret".into())
             }
         );
-        assert!(parse(&args(&["auth", "enable", "--bind"])).is_err());
-        assert!(parse(&args(&["auth", "bogus"])).is_err());
-        assert!(parse(&args(&["lan", "status"])).is_err());
+        // Existing scripts keep working while the docs move to `svc lan`.
+        assert_eq!(
+            parse(&args(&["auth", "status"])).expect("auth alias"),
+            Command::Auth {
+                action: AuthAction::Status
+            }
+        );
+        assert!(parse(&args(&["lan", "enable", "--bind"])).is_err());
+        assert!(parse(&args(&["lan", "bogus"])).is_err());
         assert!(parse(&args(&["auth", "passwd"])).is_err());
+        assert!(parse(&args(&["lan", "passwd"])).is_err());
     }
 
     #[test]
