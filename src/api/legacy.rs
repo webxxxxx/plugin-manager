@@ -179,19 +179,6 @@ impl LegacyBridge for ServerHandler {
         if let Some(outcome) = self.plugin_ui_stream(connection) {
             return outcome;
         }
-        if let Some((stream, head, route)) = export_takeover(connection) {
-            let lan = self.lan.clone();
-            let config = self.config.clone();
-            let _ = thread::Builder::new()
-                .name("svcd-export-http".into())
-                .stack_size(threads::transfer_stack())
-                .spawn(move || {
-                    let mut stream = stream;
-                    let _ = stream.set_nonblocking(false);
-                    crate::export_http::serve(&mut stream, &head, &lan, &config, route);
-                });
-            return PreRequest::Close;
-        }
         if let Some((stream, head, initial)) = import_takeover(connection) {
             let lan = self.lan.clone();
             let config = self.config.clone();

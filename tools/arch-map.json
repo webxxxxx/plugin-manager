@@ -67,7 +67,6 @@
     "uichannel": { "concept": "face/plugin_ui", "layer": "face", "note": "事件总线、replay 与握手；SSE/WS transport 已迁到 face/plugin_streams" },
     "blob_http": { "concept": "face/blob", "layer": "face" },
     "install_http": { "concept": "face/install", "layer": "face" },
-    "export_http": { "concept": "face/export", "layer": "face" },
 
     "svc": { "concept": "cli/svc", "layer": "cli" },
     "plugin_cli": { "concept": "cli/plugin", "layer": "cli" },
