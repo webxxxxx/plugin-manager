@@ -38,11 +38,30 @@ preflight 默认只打一行（branch / ahead-behind / dirty / worktree 数）�
 
 ## 提交与合并
 
+- 一张票只开一个 worktree；CI 修复、review 收口都在同一条分支上追加 commit，
+  不要为每个猜测新建 worktree（会多出 merge/push 步骤和 `AGENTS.md` 重载）。
 - 在 worktree 里小步 commit，尽早 push 分支。
-- 合并前 `node tools/merge-guard.mjs <branch> --strict`（brief；`--all` 才列全部重叠文件）。
+- 合并前 `node tools/merge-guard.mjs <branch> --strict --ci`（brief；`--all` 才列全部重叠文件）。
+  `--ci` 只读 main 最近一次 `test` workflow：如果 main 已经红，先修或说明为什么仍要合；
+  它不会启动 CI。
 - stale 分支合并后跑 `node tools/check.mjs full` + `node tools/closed-tickets-merged.mjs --map 112`；
   目标票测试绿不代表早先票的逻辑还在。
 - 禁止在 main 上直接 commit；merge commit 与 fast-forward 不受限制。
+
+## CI 边界
+
+默认**不主动跑 GitHub CI**：本地先跑 `node tools/check.mjs quick` 与相关测试；全量
+`full` 只在改动跨模块或用户要求时跑。只有用户明确要求“跑 GitHub CI / 全链路测试”时才触发或
+等待 Actions。
+
+用户要求看 CI 时：
+
+- 每轮只起一个后台 `gh run watch <id> --exit-status`，做本地工作的同时在轮次结束时收一次结果；
+  不要反复 `gh run list` / 轮询。
+- CI 失败先跑 `node tools/ci-failures.mjs <run-id>`（只打印失败测试、panic 上下文、daemon log 与
+  HTTP 响应探针），拿到真实原因再改代码；不要用一轮 CI 验证一个猜测。
+- 同一个失败最多两轮修复；第二轮仍不绿就停下来重新诊断，而不是继续 push。
+- `tests/http.rs` 的 `wait_until` 类 helper 超时会带 daemon log；新增等待 helper 也走它。
 
 ## 本仓库 hook
 
