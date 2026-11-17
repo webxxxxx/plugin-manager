@@ -225,49 +225,47 @@ impl std::fmt::Display for CarrierError {
 /// Build the one callable description for a service at load time. The managed
 /// `Contract` is immutable for the life of the entry; runtime code never
 /// constructs a second surface.
+///
+/// The carrier decides the failure set: a launcher-backed service is the
+/// builtin today, which can report every class; a supervised slot cannot
+/// produce `Cancelled` (the caller drives cancellation). Capability
+/// `effect`/`idempotent` stay with the caller that declares the surface; the
+/// manifest has no way to express them, so the plugin loader projects the
+/// conservative `Write` / non-idempotent pair.
 pub(crate) fn contract_for(
     id: &str,
     version: &str,
     caps: Vec<KernelCapability>,
-    builtin: bool,
+    carrier: Carrier,
 ) -> Contract {
-    let (effect, idempotent) = if builtin {
-        (Effect::Read, true)
-    } else {
-        (Effect::Write, false)
-    };
-    let surface = caps
-        .into_iter()
-        .map(|cap| KernelCapability {
-            effect,
-            idempotent,
-            ..cap
-        })
-        .collect();
-    let failures = if builtin {
-        Class::ALL.to_vec()
-    } else {
+    let failures = match carrier {
+        Carrier::Launcher => Class::ALL.to_vec(),
         // Cancelled is caller-driven only; a plugin that returns it is
         // normalized to ImplementationError before it reaches the contract.
-        Class::ALL
+        Carrier::Slot | Carrier::None => Class::ALL
             .into_iter()
             .filter(|class| *class != Class::Cancelled)
-            .collect()
+            .collect(),
     };
     let limits = crate::limits::current();
-    Contract::new(
+    let contract = Contract::new(
         ServiceId::new(id),
         version,
-        surface,
+        caps,
         Obligations::default(),
         failures,
         KernelLimits {
-            max_inline: 1024 * 1024,
-            max_in_flight: crate::kernel::contract::MAX_IN_FLIGHT,
             default_timeout: limits.default_timeout,
             max_timeout: limits.max_timeout,
+            ..KernelLimits::default()
         },
-    )
+    );
+    debug_assert!(
+        contract.validate().is_ok(),
+        "invalid contract for service {}",
+        id
+    );
+    contract
 }
 
 impl Service {
@@ -283,7 +281,9 @@ impl Service {
     }
 
     /// The in-process `svc` service. It is always running and never enters the
-    /// supervisor state machine.
+    /// supervisor state machine. It is launcher-backed, so its contract uses
+    /// the launcher failure set and default obligations: there is no supervised
+    /// process to drive hooks or probes.
     pub fn builtin_svc() -> Service {
         let caps = vec![
             KernelCapability {
@@ -308,7 +308,12 @@ impl Service {
             protocol: 1,
             desc: "core service management".into(),
             deps: Vec::new(),
-            contract: contract_for(RESERVED_ID, env!("CARGO_PKG_VERSION"), caps, true),
+            contract: contract_for(
+                RESERVED_ID,
+                env!("CARGO_PKG_VERSION"),
+                caps,
+                Carrier::Launcher,
+            ),
             impl_ref: Some(ImplRef {
                 tag: "builtin".into(),
                 binding: json!({}),
@@ -358,6 +363,7 @@ impl Registry {
             return Err(format!("duplicate service id \"{}\"", service.id));
         }
         self.check_carrier(&service)?;
+        self.check_identity(&service)?;
         self.services.insert(service.id.clone(), service);
         Ok(())
     }
@@ -367,6 +373,7 @@ impl Registry {
     /// can log and skip instead of dropping a live service.
     pub fn replace(&mut self, service: Service) -> Result<(), String> {
         self.check_carrier(&service)?;
+        self.check_identity(&service)?;
         self.services.insert(service.id.clone(), service);
         Ok(())
     }
@@ -376,6 +383,26 @@ impl Registry {
             .carrier()
             .map(|_| ())
             .map_err(|error| format!("service \"{}\" {}", service.id, error))
+    }
+
+    /// The contract is the callable identity, not a parallel copy: a registry
+    /// entry whose contract names another service would route calls and
+    /// diagnostics to the wrong id.
+    fn check_identity(&self, service: &Service) -> Result<(), String> {
+        if service.contract.id.as_str() != service.id {
+            return Err(format!(
+                "service \"{}\": contract names \"{}\"",
+                service.id,
+                service.contract.id.as_str()
+            ));
+        }
+        if service.contract.version != service.version {
+            return Err(format!(
+                "service \"{}\": contract version \"{}\" does not match \"{}\"",
+                service.id, service.contract.version, service.version
+            ));
+        }
+        Ok(())
     }
 
     pub fn remove(&mut self, id: &str) -> Option<Service> {
@@ -497,7 +524,7 @@ mod tests {
             effect: Effect::Write,
             idempotent: false,
         };
-        let slot = contract_for("demo", "1.0.0", vec![cap.clone()], false);
+        let slot = contract_for("demo", "1.0.0", vec![cap.clone()], Carrier::Slot);
         let slot_cap = &slot.surface()[0];
         assert_eq!(slot_cap.effect, Effect::Write);
         assert!(!slot_cap.idempotent);
@@ -508,7 +535,12 @@ mod tests {
             crate::kernel::contract::MAX_IN_FLIGHT
         );
 
-        let builtin = contract_for("svc", "1.0.0", vec![cap], true);
+        let read_cap = KernelCapability {
+            effect: Effect::Read,
+            idempotent: true,
+            ..cap
+        };
+        let builtin = contract_for("svc", "1.0.0", vec![read_cap], Carrier::Launcher);
         let builtin_cap = &builtin.surface()[0];
         assert_eq!(builtin_cap.effect, Effect::Read);
         assert!(builtin_cap.idempotent);
@@ -536,20 +568,12 @@ mod tests {
     #[test]
     fn find_cycle_reports_a_path() {
         let mut registry = Registry::new();
-        registry
-            .insert(Service {
-                id: "a".into(),
-                deps: vec!["b".into()],
-                ..Service::builtin_svc()
-            })
-            .expect("insert a");
-        registry
-            .insert(Service {
-                id: "b".into(),
-                deps: vec!["a".into()],
-                ..Service::builtin_svc()
-            })
-            .expect("insert b");
+        let mut a = slot_backed("a");
+        a.deps = vec!["b".into()];
+        registry.insert(a).expect("insert a");
+        let mut b = slot_backed("b");
+        b.deps = vec!["a".into()];
+        registry.insert(b).expect("insert b");
 
         let cycle = registry.find_cycle().expect("cycle");
         assert_eq!(cycle, vec!["a".to_string(), "b".to_string()]);
@@ -558,48 +582,64 @@ mod tests {
     #[test]
     fn duplicate_insert_is_rejected() {
         let mut registry = Registry::new();
-        registry
-            .insert(Service {
-                id: "demo".into(),
-                ..Service::builtin_svc()
-            })
-            .expect("first insert");
+        registry.insert(slot_backed("demo")).expect("first insert");
 
         let error = registry
-            .insert(Service {
-                id: "demo".into(),
-                ..Service::builtin_svc()
-            })
+            .insert(slot_backed("demo"))
             .expect_err("duplicate id");
 
         assert!(error.contains("duplicate service id"));
     }
 
+    #[test]
+    fn insert_rejects_a_contract_for_another_service() {
+        let mut service = slot_backed("a");
+        service.id = "b".into();
+
+        let error = Registry::new()
+            .insert(service)
+            .expect_err("contract id must match the entry");
+
+        assert!(error.contains("contract names"), "{}", error);
+    }
+
     fn slot_backed(id: &str) -> Service {
-        Service {
-            id: id.into(),
-            impl_ref: None,
-            exec: Some(Exec {
-                path: "/bin/true".into(),
-                args: Vec::new(),
-                env: Default::default(),
-                ready: Ready::Exec,
-                interpreter: None,
-            }),
-            ..Service::builtin_svc()
-        }
+        let mut service = Service::builtin_svc();
+        let contract = contract_for(
+            id,
+            &service.version,
+            service.contract.surface().to_vec(),
+            Carrier::Slot,
+        );
+        service.id = id.into();
+        service.contract = contract;
+        service.impl_ref = None;
+        service.exec = Some(Exec {
+            path: "/bin/true".into(),
+            args: Vec::new(),
+            env: Default::default(),
+            ready: Ready::Exec,
+            interpreter: None,
+        });
+        service
     }
 
     fn launcher_backed(id: &str) -> Service {
-        Service {
-            id: id.into(),
-            exec: None,
-            impl_ref: Some(crate::kernel::contract::ImplRef {
-                tag: "builtin".into(),
-                binding: json!({}),
-            }),
-            ..Service::builtin_svc()
-        }
+        let mut service = Service::builtin_svc();
+        let contract = contract_for(
+            id,
+            &service.version,
+            service.contract.surface().to_vec(),
+            Carrier::Launcher,
+        );
+        service.id = id.into();
+        service.contract = contract;
+        service.exec = None;
+        service.impl_ref = Some(crate::kernel::contract::ImplRef {
+            tag: "builtin".into(),
+            binding: json!({}),
+        });
+        service
     }
 
     fn two_owners(id: &str) -> Service {

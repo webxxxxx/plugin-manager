@@ -96,7 +96,7 @@ impl Default for Obligations {
 }
 
 /// Contract-wide concurrency ceiling. The slot uses the same value as its
-/// pending-table bound, so the contract cannot promise more than the carrier
+/// in-flight bound, so the contract cannot promise more than the carrier
 /// enforces.
 pub const MAX_IN_FLIGHT: usize = 64;
 

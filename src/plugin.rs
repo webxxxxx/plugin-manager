@@ -1018,7 +1018,12 @@ fn service_from_manifest(
     if ready == Ready::Exec && !caps.is_empty() {
         return Err("exec.ready=exec cannot declare capabilities: no protocol channel".into());
     }
-    let contract = crate::registry::contract_for(id, &manifest.version, caps, false);
+    let contract = crate::registry::contract_for(
+        id,
+        &manifest.version,
+        caps,
+        crate::registry::Carrier::Slot,
+    );
 
     let schema_two = manifest.schema >= 2;
     let exec_is_script = !is_native_file(&exec_path)?;

@@ -51,9 +51,7 @@ where
                 } else {
                     cap.desc.clone()
                 };
-                let input_schema = cap.input_schema.clone().unwrap_or_else(|| {
-                    json!({"type": "object", "properties": {}})
-                });
+                let input_schema = cap.input_schema.clone().unwrap_or(Value::Null);
                 out.push(json!({
                     "name": format!("{}.{}", svc.id, name),
                     "description": description,
@@ -460,7 +458,12 @@ mod tests {
 
     fn service(id: &str, kind: Kind, caps: &[&str]) -> Service {
         let caps = caps.iter().map(|cap| capability(cap)).collect();
-        let contract = crate::registry::contract_for(id, "1.0.0", caps, false);
+        let contract = crate::registry::contract_for(
+            id,
+            "1.0.0",
+            caps,
+            crate::registry::Carrier::Slot,
+        );
         Service {
             id: id.into(),
             kind,

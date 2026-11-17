@@ -245,7 +245,12 @@ mod tests {
             protocol: 1,
             desc: "demo service".into(),
             deps: vec!["base".into()],
-            contract: crate::registry::contract_for("demo", "1.2.3", Vec::new(), false),
+            contract: crate::registry::contract_for(
+                "demo",
+                "1.2.3",
+                Vec::new(),
+                crate::registry::Carrier::Slot,
+            ),
             impl_ref: None,
             exec: Some(crate::registry::Exec {
                 path: "/bin/demo".into(),

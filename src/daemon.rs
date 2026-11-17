@@ -2389,13 +2389,23 @@ mod tests {
         let caps = caps.iter().map(|cap| capability(cap)).collect();
         Service {
             kind: Kind::Plugin,
-            contract: crate::registry::contract_for(id, "1.0.0", caps, false),
+            contract: crate::registry::contract_for(
+                id,
+                "1.0.0",
+                caps,
+                crate::registry::Carrier::Slot,
+            ),
             ..service(id, &[])
         }
     }
 
     fn service(id: &str, deps: &[&str]) -> Service {
-        let contract = crate::registry::contract_for(id, "1.0.0", Vec::new(), false);
+        let contract = crate::registry::contract_for(
+            id,
+            "1.0.0",
+            Vec::new(),
+            crate::registry::Carrier::Slot,
+        );
         Service {
             id: id.into(),
             kind: Kind::Core,
@@ -2617,7 +2627,12 @@ while ($null -ne ($line = $reader.ReadLine())) {
 
     fn tool_service(id: &str, kind: Kind, caps: &[&str], root: &Path) -> Service {
         let caps = caps.iter().map(|cap| capability(cap)).collect();
-        let contract = crate::registry::contract_for(id, "1.0.0", caps, false);
+        let contract = crate::registry::contract_for(
+            id,
+            "1.0.0",
+            caps,
+            crate::registry::Carrier::Slot,
+        );
         Service {
             id: id.into(),
             kind,
@@ -2959,7 +2974,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
                     &service.id,
                     "1.0.0",
                     caps,
-                    false,
+                    crate::registry::Carrier::Slot,
                 );
                 service
             })
@@ -3125,6 +3140,12 @@ while ($null -ne ($line = $reader.ReadLine())) {
         desired.insert("bad".to_string(), two_owners("bad"));
         let mut conflicting_live = two_owners("live");
         conflicting_live.version = "9.9.9".into();
+        conflicting_live.contract = crate::registry::contract_for(
+            "live",
+            "9.9.9",
+            conflicting_live.contract.surface().to_vec(),
+            crate::registry::Carrier::Launcher,
+        );
         desired.insert("live".to_string(), conflicting_live);
 
         let (added, updated) = daemon.apply_definitions(desired);
