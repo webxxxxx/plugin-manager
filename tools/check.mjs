@@ -41,11 +41,27 @@ function failureTail(result, cap = 60) {
 function summarizeTests(result) {
   const all = lines(result.stdout).concat(lines(result.stderr));
   const results = all.filter((line) => line.startsWith("test result:"));
-  const failures = all
-    .filter((line) => line.includes("FAILED") || line.includes("panicked at") || line.startsWith("error:"))
-    .slice(0, 40);
-  console.log("test: " + (result.status === 0 ? "ok" : "FAILED") + " | " + results.length + " target result(s)");
-  for (const line of results) console.log("  " + line);
+  const kept = results.filter((line) => {
+    const match = line.match(/^test result: (ok|FAILED)\. (\d+) passed/);
+    return !match || Number(match[2]) > 0 || match[1] === "FAILED";
+  });
+  const failures = [...new Set(
+    all.filter(
+      (line) =>
+        !line.startsWith("test result:") &&
+        (line.includes("FAILED") || line.includes("panicked at") || line.startsWith("error:")),
+    ),
+  )].slice(0, 40);
+  const empty = results.length - kept.length;
+  console.log(
+    "test: " +
+      (result.status === 0 ? "ok" : "FAILED") +
+      " | " +
+      kept.length +
+      " target(s) with results" +
+      (empty > 0 ? ", " + empty + " empty" : ""),
+  );
+  for (const line of kept) console.log("  " + line);
   if (result.status !== 0) {
     console.log("failures:");
     for (const line of failures) console.log("  " + line);

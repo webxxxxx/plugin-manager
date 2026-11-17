@@ -55,5 +55,6 @@ node tools/install-hooks.mjs
 
 ## 票面移交（handoff）
 
-票里写“留给 #NNN”或“后续切片”时，在 `## Handoff` 逐条记 `项 | 目标票 | 关闭前核对`；
-没有目标票的写 `no-ticket: 原因`。目标票关闭前用 `closed-tickets-merged.mjs` 验一遍。
+票里写“留给 #NNN”或“后续切片”时，在 `## Handoff` 逐条记 `项 | 目标票 | 关闭前核对`。
+**没有目标票的，先建 tracking issue**（无主 deferral 总表见 #128），把票号写进 Handoff；
+不允许只写 `no-ticket` 留在正文。目标票关闭前用 `closed-tickets-merged.mjs` 验一遍。
