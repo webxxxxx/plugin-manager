@@ -90,15 +90,13 @@ pub fn run(spec: &Invocation<'_>, poll: &mut dyn FnMut()) -> Result<(), String> 
             None
         }
     };
-    #[cfg(windows)]
-    let job = crate::proc::Job::new();
+    let tree = crate::platform::host::process::Tree::new();
     let mut child = command
         .spawn()
         .map_err(|error| format!("spawn {} hook: {}", spec.action, error))?;
-    let _ = crate::proc::assign(&child);
-    #[cfg(windows)]
-    if let Some(job) = &job {
-        job.assign(&child);
+    let _ = crate::platform::host::process::adopt(&child);
+    if let Some(tree) = &tree {
+        tree.assign(&child);
     }
     spawn_reader(
         format!("svcd-{}-hook-out", spec.id),
@@ -129,9 +127,8 @@ pub fn run(spec: &Invocation<'_>, poll: &mut dyn FnMut()) -> Result<(), String> 
         }
         poll();
         if started.elapsed() >= Duration::from_millis(spec.timeout_ms) {
-            #[cfg(windows)]
-            if let Some(job) = &job {
-                job.terminate();
+            if let Some(tree) = &tree {
+                tree.terminate();
             }
             kill(&mut child);
             let _ = child.wait();
@@ -246,12 +243,12 @@ fn hook_command(program: &Path) -> Command {
             let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
             let mut command = Command::new(shell);
             command.arg("/C").arg(program);
-            crate::proc::configure(&mut command);
+            crate::platform::host::process::configure(&mut command, crate::platform::host::process::Kind::Hook);
             return command;
         }
     }
     let mut command = Command::new(program);
-    crate::proc::configure(&mut command);
+    crate::platform::host::process::configure(&mut command, crate::platform::host::process::Kind::Hook);
     command
 }
 

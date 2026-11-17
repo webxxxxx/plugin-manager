@@ -67,9 +67,9 @@ pub(crate) struct Slot {
     backoff_pending: bool,
     /// A stable crash is running the stop action; spawn when it finishes.
     cleanup_then_spawn: bool,
-    /// The whole service tree on Windows; on Unix the process group is the tree.
-    #[cfg(windows)]
-    job: Option<crate::proc::Job>,
+    /// The whole service tree; on Unix the process group is the tree and this
+    /// stays `None` (the platform returns no handle there).
+    tree: Option<crate::platform::host::process::Tree>,
     /// The leader exited but other group members are still alive; the service
     /// stays `Running` until the whole group is gone.
     pending_exit: Option<Option<i32>>,
@@ -318,8 +318,7 @@ impl Slot {
             kill_deadline: None,
             stop_hook: None,
             stop_hook_started: false,
-            #[cfg(windows)]
-            job: None,
+            tree: None,
             pending_exit: None,
             ping_id: 1,
             adopted: false,
@@ -724,10 +723,9 @@ impl Slot {
 
     fn spawn(&mut self) -> Result<u32, String> {
         self.pending_exit = None;
-        #[cfg(windows)]
-        if self.job.is_none() {
-            self.job = crate::proc::Job::new();
-            if self.job.is_none() {
+        if self.tree.is_none() {
+            self.tree = crate::platform::host::process::Tree::new();
+            if self.tree.is_none() {
                 log::svcd(&format!(
                     "svcd: {}: process job unavailable; stop only terminates the leader",
                     self.id
@@ -770,15 +768,14 @@ impl Slot {
         }
 
         let mut child = command.spawn().map_err(|error| error.to_string())?;
-        if let Err(error) = crate::proc::assign(&child) {
+        if let Err(error) = crate::platform::host::process::adopt(&child) {
             log::svcd(&format!(
                 "svcd: {}: parent-death protection: {}",
                 self.id, error
             ));
         }
-        #[cfg(windows)]
-        if let Some(job) = &self.job {
-            if !job.assign(&child) {
+        if let Some(tree) = &self.tree {
+            if !tree.assign(&child) {
                 log::svcd(&format!(
                     "svcd: {}: cannot assign the process job; stop only terminates the leader",
                     self.id
@@ -1304,12 +1301,12 @@ impl Slot {
             // A running leader is the group. Only when the leader is already a
             // zombie (an adopted process we cannot reap) does the group need a
             // per-member state scan, which keeps the fast path a single kill(2).
-            if crate::proc::alive(pid) {
+            if crate::platform::host::process::alive(pid) {
                 return true;
             }
             #[cfg(target_os = "linux")]
             {
-                return crate::proc::group_alive(pid);
+                return crate::platform::host::process::group_alive(pid);
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -1319,9 +1316,9 @@ impl Slot {
         #[cfg(windows)]
         {
             let _ = pid;
-            self.job
+            self.tree
                 .as_ref()
-                .map(|job| job.active() > 0)
+                .map(|tree| tree.active() > 0)
                 .unwrap_or(false)
         }
     }
@@ -1392,11 +1389,10 @@ impl Slot {
         }
         match command.spawn() {
             Ok(mut child) => {
-                let _ = crate::proc::assign(&child);
-                #[cfg(windows)]
-                if let Some(job) = &self.job {
+                let _ = crate::platform::host::process::adopt(&child);
+                if let Some(tree) = &self.tree {
                     // The stop action's own children belong to the service tree.
-                    job.assign(&child);
+                    tree.assign(&child);
                 }
                 let log = LogSink::open(&paths::logs_dir(), &self.id)
                     .ok()
@@ -1524,15 +1520,13 @@ impl Slot {
 
     pub(crate) fn signal_force(&mut self) {
         self.abort_stop_hook();
-        #[cfg(windows)]
-        {
-            // The leader may already be gone; the job still owns the tree.
-            if let Some(job) = &self.job {
-                job.terminate();
-            }
-            if let Some(child) = self.child.as_mut() {
-                let _ = child.kill();
-            }
+        // The leader may already be gone; the tree guard still owns the rest
+        // (on Unix that is the process group handled below).
+        if let Some(tree) = &self.tree {
+            tree.terminate();
+        }
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
         }
         #[cfg(unix)]
         {
@@ -1688,9 +1682,9 @@ fn command_for_parts(
 /// Services are adoptable after a daemon restart, hooks are not.
 fn configure(mut command: Command, hook: bool) -> Command {
     if hook {
-        crate::proc::configure_hook(&mut command);
+        crate::platform::host::process::configure(&mut command, crate::platform::host::process::Kind::Hook);
     } else {
-        crate::proc::configure_service(&mut command);
+        crate::platform::host::process::configure(&mut command, crate::platform::host::process::Kind::Service);
     }
     command
 }

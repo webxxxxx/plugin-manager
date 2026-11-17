@@ -97,7 +97,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         }
     }
     crate::plugin::cleanup_staging();
-    if let Err(error) = crate::proc::init() {
+    if let Err(error) = crate::platform::host::process::init() {
         log::svcd(&format!(
             "svcd: parent-death protection unavailable: {}",
             error
@@ -524,7 +524,7 @@ impl Daemon {
             catalog_version: 1,
             catalog_cache: None,
             persisted: BTreeMap::new(),
-            boot_id: crate::proc::boot_id(),
+            boot_id: crate::platform::host::process::boot_id(),
             services_fingerprint: services_fingerprint(&paths::services_dir()),
             rescan_interval_ms,
             next_rescan_ms: rescan_interval_ms,
@@ -562,7 +562,7 @@ impl Daemon {
     /// time still matches (a reused pid fails this check). On Windows the job
     /// objects kill the tree with the daemon, so there is nothing to adopt.
     fn adopt_runtime(&mut self) {
-        let boot = self.boot_id.clone().or_else(crate::proc::boot_id);
+        let boot = self.boot_id.clone().or_else(crate::platform::host::process::boot_id);
         let now = self.now_ms();
         for id in self.slots.keys().cloned().collect::<Vec<_>>() {
             let Some(record) = runtime::load(&id) else {
@@ -606,11 +606,11 @@ impl Daemon {
                 runtime::remove(&id);
                 continue;
             }
-            if !crate::proc::alive(pid) {
+            if !crate::platform::host::process::alive(pid) {
                 runtime::remove(&id);
                 continue;
             }
-            if let (Some(expected), Some(actual)) = (record.starttime, crate::proc::start_time(pid))
+            if let (Some(expected), Some(actual)) = (record.starttime, crate::platform::host::process::start_time(pid))
             {
                 if expected != actual {
                     log::svcd(&format!(
@@ -666,13 +666,13 @@ impl Daemon {
                 // forget the record.
                 if let Some(record) = runtime::load(id) {
                     if let Some(pid) = record.pid {
-                        let fresh = crate::proc::alive(pid)
-                            && match (record.starttime, crate::proc::start_time(pid)) {
+                        let fresh = crate::platform::host::process::alive(pid)
+                            && match (record.starttime, crate::platform::host::process::start_time(pid)) {
                                 (Some(expected), Some(actual)) => expected == actual,
                                 _ => true,
                             };
                         if fresh {
-                            crate::proc::terminate_group(pid);
+                            crate::platform::host::process::terminate_tree(pid);
                         }
                     }
                 }
@@ -713,7 +713,7 @@ impl Daemon {
                 boot: boot.clone(),
                 state,
                 pid,
-                starttime: pid.and_then(crate::proc::start_time),
+                starttime: pid.and_then(crate::platform::host::process::start_time),
                 since: Some(since),
                 ready_since,
                 failures,
@@ -2261,7 +2261,7 @@ fn run_status_hook(id: &str, hook: &Hook, poll: &mut dyn FnMut()) -> String {
             return format!("spawn failed: {}", error);
         }
     };
-    let _ = crate::proc::assign(&child);
+    let _ = crate::platform::host::process::adopt(&child);
     let started = Instant::now();
     loop {
         match child.try_wait() {
@@ -2885,7 +2885,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
         assert!(status.summary.pid.is_none());
         #[cfg(unix)]
         assert!(
-            !crate::proc::alive(pid),
+            !crate::platform::host::process::alive(pid),
             "the child process is still alive after stop"
         );
         // Windows has no portable liveness probe here; the per-service Job
