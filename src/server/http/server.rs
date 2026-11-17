@@ -204,7 +204,7 @@ struct Server {
     fallback: FallbackHandler,
     /// The route and principal resolved before this request's body was read.
     /// Present only for requests the face claims; the server-owned routes use
-    /// `routes.server_route`.
+    /// `routes.body_policy`.
     face_plans: HashMap<u64, PreparedFace>,
     blocking: BlockingPool,
     blocking_pending: HashMap<u64, PendingBlocking>,
@@ -383,6 +383,15 @@ impl ServerLoop for Server {
     }
 
     fn on_error(&mut self, connection: &mut Connection, response: Vec<u8>) {
+        if response.is_empty() {
+            // An interim response could not be written atomically. Close
+            // without adding a status line behind the truncated bytes.
+            connection.out.clear();
+            connection.out_at = 0;
+            connection.keep_alive = false;
+            connection.state = ConnState::Writing;
+            return;
+        }
         write_response(connection, response, false);
     }
 

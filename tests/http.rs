@@ -4020,6 +4020,31 @@ fn a_route_that_declares_no_body_refuses_one_before_the_face() {
     );
 }
 
+/// A Streamed face route declares that it reads no buffered body. A client
+/// that announces one is refused before the face opens the stream.
+#[test]
+fn a_streamed_route_refuses_a_declared_body_before_the_face() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let mut stream = TcpStream::connect(&address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let head = format!(
+        "GET /api/v1/export/demo HTTP/1.1\r\nHost: {}\r\nExpect: 100-continue\r\nContent-Length: 1\r\nConnection: close\r\n\r\n",
+        address
+    );
+    stream.write_all(head.as_bytes()).expect("write head");
+    let response = read_raw_response(&mut stream);
+    assert_eq!(
+        response.status,
+        413,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+}
+
 /// An unauthenticated write must not receive 100 Continue: the server refuses
 /// it before the body and closes, so unread body bytes cannot precede the next
 /// request on a keep-alive connection.

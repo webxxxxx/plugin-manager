@@ -484,15 +484,13 @@ pub fn advance_request<S>(
             ));
         }
         if body.confirms_body(&head, framing) {
-            // The socket is non-blocking, but a 25-byte interim head fits in an
-            // empty send buffer; a failure here is a broken connection, not a
-            // reason to read a body the client is still withholding.
-            connection
-                .stream
-                .write_all(http::CONTINUE_RESPONSE)
-                .map_err(|_| {
-                    crate::http::json_error(400, "bad_request", "cannot write response")
-                })?;
+            // Write the interim head in one non-blocking call. If it is only
+            // partially accepted, close without appending a second status line:
+            // a truncated 100 followed by a 400 would desync the client.
+            match connection.stream.write(http::CONTINUE_RESPONSE) {
+                Ok(written) if written == http::CONTINUE_RESPONSE.len() => {}
+                _ => return Err(Vec::new()),
+            }
         }
         let buffer = std::mem::take(&mut connection.buffer);
         connection.buffer = buffer[body_start..].to_vec();

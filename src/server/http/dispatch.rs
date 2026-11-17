@@ -299,6 +299,43 @@ mod tests {
         }
     }
 
+    struct CountingFace {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Face for CountingFace {
+        fn route(&self, _method: &str, _path: &str) -> Option<Route> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        }
+
+        fn handle(&self, _request: Request, _done: Completion) {}
+    }
+
+    #[test]
+    fn route_face_request_asks_the_face_once() {
+        let bind = "127.0.0.1:0".parse().expect("bind");
+        let lan = Arc::new(Mutex::new(Lan::new(bind, bind, true, Some("hash".into()))));
+        let face = CountingFace {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let head = http::Head {
+            method: "GET".into(),
+            path: "/api/v1/version".into(),
+            version: "HTTP/1.1".into(),
+            headers: Vec::new(),
+        };
+
+        let result = route_face_request(&face, &head, "127.0.0.1".parse().expect("peer"), &lan)
+            .expect("route");
+        assert!(result.is_none());
+        assert_eq!(
+            face.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the helper makes exactly one Face::route call"
+        );
+    }
+
     #[test]
     fn a_completed_face_returns_its_response() {
         let face = FakeFace {
