@@ -41,6 +41,10 @@ impl RawStopSink for RawHub {
     fn unregister_generation(&self, id: &str, generation: u64) {
         RawHub::unregister_generation(self, id, generation);
     }
+
+    fn deliver(&self, id: &str, stream: u32, payload: Vec<u8>) {
+        RawHub::deliver(self, id, stream, payload);
+    }
 }
 
 const FAILURES: usize = RawFailure::ALL.len();
