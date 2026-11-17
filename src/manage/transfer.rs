@@ -16,9 +16,9 @@ use serde_json::json;
 
 use crate::wire::control::channel;
 use crate::kernel::failure::{Problem, ProblemError};
-use crate::package;
+use crate::manage::package;
 use crate::platform::paths::Paths;
-use crate::plugin;
+use crate::manage::plugin;
 use crate::wire::message::rpc;
 
 const MAX_IMPORT: u64 = 512 * 1024 * 1024;

@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::package::valid_name;
-use crate::registry::{
+use crate::manage::package::valid_name;
+use crate::supervise::registry::{
     Exec, Hook, Kind, Lifecycle, Ready, Registry, Restart, Service, State, RESERVED_ID,
 };
 
@@ -143,7 +143,7 @@ fn load_scripts(
             path.extension()
                 .and_then(|extension| extension.to_str())
                 .map(|extension| {
-                    crate::script::extension_supported(&extension.to_ascii_lowercase())
+                    crate::supervise::script::extension_supported(&extension.to_ascii_lowercase())
                 })
                 .unwrap_or(false)
         })
@@ -229,9 +229,9 @@ fn load_scripts(
             }
         };
         let declarations =
-            crate::script::declared_actions(&String::from_utf8_lossy(&contents), &extension);
+            crate::supervise::script::declared_actions(&String::from_utf8_lossy(&contents), &extension);
         let restart =
-            crate::script::declared_restart(&String::from_utf8_lossy(&contents), &extension);
+            crate::supervise::script::declared_restart(&String::from_utf8_lossy(&contents), &extension);
         // Shell convention: anything that is not `RESTART=always` treats a
         // clean exit as "done" and keeps reporting running (RemainAfterExit).
         let remain_after_exit = restart != Restart::Always;
@@ -254,11 +254,11 @@ fn load_scripts(
             None
         };
         let enabled = !dir.join(format!("{}.disabled", id)).exists();
-        let contract = crate::registry::contract_for(
+        let contract = crate::supervise::registry::contract_for(
             &id,
             "1.0.0",
             Vec::new(),
-            crate::registry::Carrier::Slot,
+            crate::supervise::registry::Carrier::Slot,
             limits,
         );
         let service = Service {
@@ -484,8 +484,8 @@ fn validate(definition: CoreDefinition, limits: &crate::platform::limits::Limits
                 .map(|hook| {
                     convert_hook(
                         hook,
-                        crate::registry::HOOK_START_TIMEOUT_MS,
-                        crate::registry::HOOK_TIMEOUT_MAX_MS,
+                        crate::supervise::registry::HOOK_START_TIMEOUT_MS,
+                        crate::supervise::registry::HOOK_TIMEOUT_MAX_MS,
                     )
                 })
                 .transpose()?,
@@ -494,8 +494,8 @@ fn validate(definition: CoreDefinition, limits: &crate::platform::limits::Limits
                 .map(|hook| {
                     convert_hook(
                         hook,
-                        crate::registry::HOOK_STOP_TIMEOUT_MS,
-                        crate::registry::HOOK_TIMEOUT_MAX_MS,
+                        crate::supervise::registry::HOOK_STOP_TIMEOUT_MS,
+                        crate::supervise::registry::HOOK_TIMEOUT_MAX_MS,
                     )
                 })
                 .transpose()?,
@@ -504,8 +504,8 @@ fn validate(definition: CoreDefinition, limits: &crate::platform::limits::Limits
                 .map(|hook| {
                     convert_hook(
                         hook,
-                        crate::registry::HOOK_STATUS_TIMEOUT_MS,
-                        crate::registry::HOOK_STATUS_TIMEOUT_MAX_MS,
+                        crate::supervise::registry::HOOK_STATUS_TIMEOUT_MS,
+                        crate::supervise::registry::HOOK_STATUS_TIMEOUT_MAX_MS,
                     )
                 })
                 .transpose()?,
@@ -519,11 +519,11 @@ fn validate(definition: CoreDefinition, limits: &crate::platform::limits::Limits
         }
     }
 
-    let contract = crate::registry::contract_for(
+    let contract = crate::supervise::registry::contract_for(
         &definition.id,
         &definition.version,
         Vec::new(),
-        crate::registry::Carrier::Slot,
+        crate::supervise::registry::Carrier::Slot,
         limits,
     );
     Ok(Service {

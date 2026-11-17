@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::platform::paths::Paths;
-use crate::registry::State;
+use crate::supervise::registry::State;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {

@@ -1,6 +1,6 @@
 use crate::wire::control::channel;
 use crate::wire::message::ipc::{self, FrameEvent};
-use crate::registry::{Kind, Registry};
+use crate::supervise::registry::{Kind, Registry};
 use crate::wire::message::rpc;
 use crate::server::mcp::result::{
     error_response, result_value, server_meta, tool_error_result, tool_result_object, SERVER_NAME,
@@ -455,7 +455,7 @@ fn write_notification(stdout: &mut impl Write, method: &str) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::kernel::contract::{Capability as KernelCapability, CapabilityName, Effect};
-    use crate::registry::{Exec, Ready, Service, State};
+    use crate::supervise::registry::{Exec, Ready, Service, State};
 
     fn capability(name: &str) -> KernelCapability {
         KernelCapability {
@@ -471,11 +471,11 @@ mod tests {
 
     fn service(id: &str, kind: Kind, caps: &[&str]) -> Service {
         let caps = caps.iter().map(|cap| capability(cap)).collect();
-        let contract = crate::registry::contract_for(
+        let contract = crate::supervise::registry::contract_for(
             id,
             "1.0.0",
             caps,
-            crate::registry::Carrier::Slot,
+            crate::supervise::registry::Carrier::Slot,
             &crate::platform::limits::test_default(),
         );
         Service {
@@ -496,7 +496,7 @@ mod tests {
             }),
             lifecycle: None,
             enabled: true,
-            restart: crate::registry::Restart::Never,
+            restart: crate::supervise::registry::Restart::Never,
             remain_after_exit: false,
             compat: None,
             state: State::Running,

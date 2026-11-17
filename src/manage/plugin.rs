@@ -1,6 +1,6 @@
 //! Plugin installation layout and the `plugin` scan used by the daemon.
 //!
-//! The package is verified by [`crate::package`] before this module touches the
+//! The package is verified by [`crate::manage::package`] before this module touches the
 //! plugin tree. Versions live under `<data>/plugins/<id>/<version>/`; `current`
 //! is a version text file and `enabled` is a marker.
 
@@ -11,15 +11,15 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::platform::compat;
-use crate::hook;
-use crate::interpreter;
+use crate::supervise::hook;
+use crate::manage::interpreter;
 use crate::kernel::contract::{Capability as KernelCapability, CapabilityName, Effect};
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::platform::log;
-use crate::package::{self, Package};
+use crate::manage::package::{self, Package};
 use crate::platform::paths::Paths;
-use crate::registry::{
+use crate::supervise::registry::{
     Exec, Hook, Interpreter, Kind, Lifecycle, Ready, Restart, Service, State, RESERVED_ID,
 };
 
@@ -1194,11 +1194,11 @@ fn service_from_manifest(
         return Err(Problem::Invalid
             .error("exec.ready=exec cannot declare capabilities: no protocol channel"));
     }
-    let contract = crate::registry::contract_for(
+    let contract = crate::supervise::registry::contract_for(
         id,
         &manifest.version,
         caps,
-        crate::registry::Carrier::Slot,
+        crate::supervise::registry::Carrier::Slot,
         limits,
     );
 
@@ -1219,8 +1219,8 @@ fn service_from_manifest(
                 "start",
                 version_dir,
                 lifecycle.start.as_ref(),
-                crate::registry::HOOK_START_TIMEOUT_MS,
-                crate::registry::HOOK_TIMEOUT_MAX_MS,
+                crate::supervise::registry::HOOK_START_TIMEOUT_MS,
+                crate::supervise::registry::HOOK_TIMEOUT_MAX_MS,
                 interpreter,
                 &mut any_script,
             )?;
@@ -1228,8 +1228,8 @@ fn service_from_manifest(
                 "stop",
                 version_dir,
                 lifecycle.stop.as_ref(),
-                crate::registry::HOOK_STOP_TIMEOUT_MS,
-                crate::registry::HOOK_TIMEOUT_MAX_MS,
+                crate::supervise::registry::HOOK_STOP_TIMEOUT_MS,
+                crate::supervise::registry::HOOK_TIMEOUT_MAX_MS,
                 interpreter,
                 &mut any_script,
             )?;
@@ -1237,8 +1237,8 @@ fn service_from_manifest(
                 "status",
                 version_dir,
                 lifecycle.status.as_ref(),
-                crate::registry::HOOK_STATUS_TIMEOUT_MS,
-                crate::registry::HOOK_STATUS_TIMEOUT_MAX_MS,
+                crate::supervise::registry::HOOK_STATUS_TIMEOUT_MS,
+                crate::supervise::registry::HOOK_STATUS_TIMEOUT_MAX_MS,
                 interpreter,
                 &mut any_script,
             )?;

@@ -19,7 +19,7 @@ use crate::wire::control::channel;
 use crate::platform::clock::{Clock, Now};
 use crate::platform::compat;
 use crate::platform::config::Config;
-use crate::definition;
+use crate::supervise::definition;
 use crate::kernel::contract::{
     CapabilityName, Instance, Invocation, Launchers, ProgressToken, Reply, ReplySink,
 };
@@ -28,19 +28,19 @@ use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::lan::LanStatus;
 use crate::platform::log;
 use crate::mcp;
-use crate::package;
+use crate::manage::package;
 use crate::platform::paths::Paths;
-use crate::plugin::{self, Strategy};
+use crate::manage::plugin::{self, Strategy};
 #[cfg(unix)]
 use crate::wire::contract::reactor::Reactor;
-use crate::registry::{Hook, Kind, Registry, Service, State, RESERVED_ID};
+use crate::supervise::registry::{Hook, Kind, Registry, Service, State, RESERVED_ID};
 use crate::wire::message::rpc;
-use crate::runtime::{self, Record};
+use crate::supervise::runtime::{self, Record};
 use crate::platform::settings;
-use crate::slot::hook_command;
-use crate::slot::{Slot, SlotWire};
+use crate::supervise::slot::hook_command;
+use crate::supervise::slot::{Slot, SlotWire};
 use crate::status::Status;
-use crate::supervisor::{self, Event};
+use crate::supervise::supervisor::{self, Event};
 use crate::platform::host::wake::Wake;
 
 /// The supervisor loop's bounded wait when it has no earlier deadline. With a
@@ -72,7 +72,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         return 1;
     }
 
-    let config_path = match crate::install::ensure_conf(conf.as_deref(), &initial_paths) {
+    let config_path = match crate::selfinstall::install::ensure_conf(conf.as_deref(), &initial_paths) {
         Ok(path) => path,
         Err(error) => {
             eprintln!("svcd: {}", error);
@@ -109,7 +109,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
             return 1;
         }
     }
-    crate::plugin::cleanup_staging(&config.paths);
+    crate::manage::plugin::cleanup_staging(&config.paths);
     // The channel no longer uses a token: authorization is the endpoint ACL.
     // Remove whatever the previous version left behind so nothing keeps reading
     // a stale secret.
@@ -512,7 +512,7 @@ impl Daemon {
                     nanos
                 ));
                 let paths = Paths::under(&root);
-                crate::package::install_test_trust(&paths.trust_dir);
+                crate::manage::package::install_test_trust(&paths.trust_dir);
                 paths
             },
         ));
@@ -558,7 +558,7 @@ impl Daemon {
         let temp_cleanup_interval_ms = config.settings.temp_cleanup_interval().as_millis() as u64;
         let services_fingerprint = services_fingerprint(&config.paths.services_dir);
         let mut launchers = Launchers::default();
-        launchers.register("builtin", Box::new(crate::builtin_adapter::BuiltinLauncher));
+        launchers.register("builtin", Box::new(crate::supervise::builtin_adapter::BuiltinLauncher));
         Daemon {
             config,
             registry,
@@ -1389,7 +1389,7 @@ impl Daemon {
             id,
             &hook,
             &self.config.paths,
-            &mut crate::hook::poll_this_loop,
+            &mut crate::supervise::hook::poll_this_loop,
         ));
     }
 
@@ -2561,7 +2561,7 @@ fn run_status_hook(id: &str, hook: &Hook, paths: &Paths, poll: &mut dyn FnMut())
         if started.elapsed() >= Duration::from_millis(hook.timeout_ms) {
             // The probe runs in its own process group: stop the whole tree, not
             // just the leader, or a status hook's children outlive the timeout.
-            crate::hook::kill(&mut child);
+            crate::supervise::hook::kill(&mut child);
             let _ = child.wait();
             let output = read_status_output(&output_path);
             let _ = fs::remove_file(&output_path);
@@ -2708,7 +2708,7 @@ fn missing_dependencies(registry: &Registry, id: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::kernel::contract::{Capability as KernelCapability, CapabilityName, Effect};
-    use crate::registry::{Exec, Kind, Ready, Service};
+    use crate::supervise::registry::{Exec, Kind, Ready, Service};
 
     fn capability(name: &str) -> KernelCapability {
         KernelCapability {
@@ -2724,11 +2724,11 @@ mod tests {
         let caps = caps.iter().map(|cap| capability(cap)).collect();
         Service {
             kind: Kind::Plugin,
-            contract: crate::registry::contract_for(
+            contract: crate::supervise::registry::contract_for(
                 id,
                 "1.0.0",
                 caps,
-                crate::registry::Carrier::Slot,
+                crate::supervise::registry::Carrier::Slot,
                 &crate::platform::limits::test_default(),
             ),
             ..service(id, &[])
@@ -2736,11 +2736,11 @@ mod tests {
     }
 
     fn service(id: &str, deps: &[&str]) -> Service {
-        let contract = crate::registry::contract_for(
+        let contract = crate::supervise::registry::contract_for(
             id,
             "1.0.0",
             Vec::new(),
-            crate::registry::Carrier::Slot,
+            crate::supervise::registry::Carrier::Slot,
             &crate::platform::limits::test_default(),
         );
         Service {
@@ -2761,7 +2761,7 @@ mod tests {
             }),
             lifecycle: None,
             enabled: true,
-            restart: crate::registry::Restart::OnFailure,
+            restart: crate::supervise::registry::Restart::OnFailure,
             remain_after_exit: false,
             compat: None,
             state: State::Stopped,
@@ -2969,11 +2969,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
 
     fn tool_service(id: &str, kind: Kind, caps: &[&str], root: &Path) -> Service {
         let caps = caps.iter().map(|cap| capability(cap)).collect();
-        let contract = crate::registry::contract_for(
+        let contract = crate::supervise::registry::contract_for(
             id,
             "1.0.0",
             caps,
-            crate::registry::Carrier::Slot,
+            crate::supervise::registry::Carrier::Slot,
             &crate::platform::limits::test_default(),
         );
         Service {
@@ -2988,7 +2988,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             exec: Some(tool_agent(root)),
             lifecycle: None,
             enabled: true,
-            restart: crate::registry::Restart::OnFailure,
+            restart: crate::supervise::registry::Restart::OnFailure,
             remain_after_exit: false,
             compat: None,
             state: State::Stopped,
@@ -3426,11 +3426,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
                 let caps = (0..20)
                     .map(|cap| capability(&format!("cap{cap}")))
                     .collect();
-                service.contract = crate::registry::contract_for(
+                service.contract = crate::supervise::registry::contract_for(
                     &service.id,
                     "1.0.0",
                     caps,
-                    crate::registry::Carrier::Slot,
+                    crate::supervise::registry::Carrier::Slot,
                     &crate::platform::limits::test_default(),
                 );
                 service
@@ -3614,11 +3614,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
         desired.insert("bad".to_string(), two_owners("bad"));
         let mut conflicting_live = two_owners("live");
         conflicting_live.version = "9.9.9".into();
-        conflicting_live.contract = crate::registry::contract_for(
+        conflicting_live.contract = crate::supervise::registry::contract_for(
             "live",
             "9.9.9",
             conflicting_live.contract.surface().to_vec(),
-            crate::registry::Carrier::Launcher,
+            crate::supervise::registry::Carrier::Launcher,
             &crate::platform::limits::test_default(),
         );
         desired.insert("live".to_string(), conflicting_live);
@@ -3643,7 +3643,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             live.version, "1.0.0",
             "a rejected update must not reach the registry"
         );
-        assert_eq!(live.carrier(), Ok(crate::registry::Carrier::Slot));
+        assert_eq!(live.carrier(), Ok(crate::supervise::registry::Carrier::Slot));
         assert!(
             daemon.slots.contains_key("live"),
             "the live slot must survive a rejected update"
@@ -3667,11 +3667,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
         );
         assert_eq!(
             daemon.registry.get("svc").map(Service::carrier),
-            Some(Ok(crate::registry::Carrier::Launcher))
+            Some(Ok(crate::supervise::registry::Carrier::Launcher))
         );
         assert_eq!(
             daemon.registry.get("core").map(Service::carrier),
-            Some(Ok(crate::registry::Carrier::Slot))
+            Some(Ok(crate::supervise::registry::Carrier::Slot))
         );
     }
 

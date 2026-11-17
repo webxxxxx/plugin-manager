@@ -1721,14 +1721,14 @@ fn check_interpreter(manifest: &Manifest) -> Result<(), ProblemError> {
     let Some(interpreter) = &manifest.interpreter else {
         return Ok(());
     };
-    if !crate::interpreter::valid_name(&interpreter.name) {
+    if !crate::manage::interpreter::valid_name(&interpreter.name) {
         return Err(Problem::Invalid.error(format!(
             "interpreter.name {:?} is not a bare name (no paths or spaces)",
             interpreter.name
         )));
     }
     if let Some(version) = &interpreter.version {
-        crate::interpreter::validate_constraint(version)
+        crate::manage::interpreter::validate_constraint(version)
             .map_err(|error| Problem::Invalid.error(format!("interpreter.version: {}", error)))?;
     }
     for argument in &interpreter.args {

@@ -20,9 +20,9 @@ use std::sync::{Arc, Mutex};
 use crate::face::plugin_ui::{PluginUiStream, UiPath};
 use crate::http;
 use crate::lan::{AuthKind, Lan};
-use crate::package;
+use crate::manage::package;
 use crate::platform::paths::Paths;
-use crate::plugin;
+use crate::manage::plugin;
 use crate::server::http::{Request, StreamHandler};
 use crate::uichannel;
 

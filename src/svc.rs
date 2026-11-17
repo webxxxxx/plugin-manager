@@ -486,7 +486,7 @@ fn compat_show(config: &Config, json: bool) -> i32 {
 }
 
 fn compat_init(config: &Config, device: &str, dry_run: bool) -> i32 {
-    if let Err(error) = crate::plugin::root_required() {
+    if let Err(error) = crate::manage::plugin::root_required() {
         eprintln!("svc: {}", error);
         return EXIT_SERVICE_ERROR;
     }
@@ -574,7 +574,7 @@ fn auth_command(config: &Config, action: AuthAction) -> i32 {
 
 fn trust_command(config: &Config, action: TrustAction) -> i32 {
     match action {
-        TrustAction::List => match crate::trust::keys(&config.paths) {
+        TrustAction::List => match crate::manage::trust::keys(&config.paths) {
             Ok(keys) if keys.is_empty() => {
                 println!("no trusted keys in {}", config.paths.trust_dir.display());
                 EXIT_OK
@@ -606,7 +606,7 @@ fn trust_command(config: &Config, action: TrustAction) -> i32 {
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .unwrap_or_default();
-            match crate::trust::add(&config.paths, key_id, &pem) {
+            match crate::manage::trust::add(&config.paths, key_id, &pem) {
                 Ok(target) => {
                     println!("trusted {} ({})", key_id, target.display());
                     EXIT_OK
@@ -622,7 +622,7 @@ fn trust_command(config: &Config, action: TrustAction) -> i32 {
                 eprintln!("svc: {}", error);
                 return EXIT_SERVICE_ERROR;
             }
-            match crate::trust::remove(&config.paths, &key_id) {
+            match crate::manage::trust::remove(&config.paths, &key_id) {
                 Ok(true) => {
                     println!("removed {}", key_id);
                     EXIT_OK

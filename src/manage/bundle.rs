@@ -20,7 +20,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{Map, Value};
 
 use crate::kernel::failure::{Problem, ProblemError};
-use crate::package::{self, Manifest};
+use crate::manage::package::{self, Manifest};
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Options {
@@ -255,7 +255,7 @@ fn assemble_manifest(
             .unwrap_or("")
             .to_ascii_lowercase();
         let actions =
-            crate::script::declared_actions(&String::from_utf8_lossy(&source.data), &extension);
+            crate::supervise::script::declared_actions(&String::from_utf8_lossy(&source.data), &extension);
         if actions.any() {
             let mut lifecycle = Map::new();
             if actions.start {
@@ -753,7 +753,7 @@ fn looks_executable(source: &SourceFile, accept_scripts: bool) -> bool {
     #[cfg(unix)]
     {
         source.mode & 0o111 != 0
-            || (accept_scripts && crate::script::looks_like_script(&source.path, &source.data))
+            || (accept_scripts && crate::supervise::script::looks_like_script(&source.path, &source.data))
     }
     #[cfg(not(unix))]
     {
@@ -764,7 +764,7 @@ fn looks_executable(source: &SourceFile, accept_scripts: bool) -> bool {
             ),
             None => false,
         };
-        native || (accept_scripts && crate::script::looks_like_script(&source.path, &source.data))
+        native || (accept_scripts && crate::supervise::script::looks_like_script(&source.path, &source.data))
     }
 }
 
@@ -835,7 +835,7 @@ fn pem_body<'a>(text: &'a str, label: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::package::tempdir::TempDir;
+    use crate::manage::package::tempdir::TempDir;
     use ed25519_dalek::Signature;
     use std::fs;
 

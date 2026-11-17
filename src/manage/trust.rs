@@ -11,7 +11,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::kernel::failure::{Problem, ProblemError};
-use crate::package;
+use crate::manage::package;
 use crate::platform::paths::Paths;
 
 /// Public keys are tiny; a larger file is a mistake, not a key.

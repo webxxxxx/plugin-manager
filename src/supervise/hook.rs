@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::platform::log::{self, LogSink};
-use crate::package;
+use crate::manage::package;
 use crate::platform::paths::Paths;
 
 /// Both hook actions share the same 60-second budget.

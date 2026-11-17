@@ -13,10 +13,10 @@ use crate::kernel::contract::{Contract, Control, Invocation, Reply, ReplySink, S
 use crate::kernel::failure::{Class, Failure, Rejection, Retry};
 use crate::platform::log::{self, LogSink};
 use crate::platform::paths::Paths;
-use crate::registry::{Exec, Hook, Interpreter, Lifecycle, Ready, Restart, State};
+use crate::supervise::registry::{Exec, Hook, Interpreter, Lifecycle, Ready, Restart, State};
 use crate::wire::message::rpc;
 use crate::wire::contract::stdio::{self, Plan, Streams, Target};
-use crate::supervisor::{self, Action, Event, Machine};
+use crate::supervise::supervisor::{self, Action, Event, Machine};
 use crate::platform::host::wake::Wake;
 
 /// Per-plugin in-flight cap from ticket #31. The full spec also describes a

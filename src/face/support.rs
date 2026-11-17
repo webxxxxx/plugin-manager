@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use crate::wire::control::channel;
 use crate::http;
 use crate::kernel::failure::{Class, Problem, ProblemError};
-use crate::package;
+use crate::manage::package;
 use crate::wire::message::rpc;
 use crate::server::http::{CancelToken, JobBudget, Request};
 

@@ -48,7 +48,12 @@ function loadMap(path) {
   const map = JSON.parse(readFileSync(path, "utf8"));
   const rank = new Map(map.layers.map((layer) => [layer.name, layer.rank]));
   const modules = new Map(Object.entries(map.modules));
-  return { map, rank, modules };
+  // 文件 → 逻辑模块（`files`）。搬家会改路径但不会改模块身份：列出的文件按
+  // 映射取键，没列出的按路径第一段。这样目录重排（step 6）不移动模块图的边。
+  const fileModules = new Map(
+    Object.entries(map.files ?? {}).map(([file, moduleName]) => [file.split("\\").join("/"), moduleName]),
+  );
+  return { map, rank, modules, fileModules };
 }
 
 function collectSources(dir, out = []) {
@@ -64,13 +69,16 @@ function collectSources(dir, out = []) {
  * 递归扫 src/。模块身份取路径第一段（src/kernel/contract.rs → kernel），
  * 因为本工具的粒度是"概念模块"，不是单个文件。
  */
-function scanSources(srcDir, modules) {
+function scanSources(srcDir, modules, fileModules) {
   const sources = collectSources(srcDir)
     .sort()
     .map((full) => {
       const relative = full.slice(srcDir.length + 1).split("\\").join("/");
       const base = relative.slice(relative.lastIndexOf("/") + 1, -3);
-      return { full, file: `src/${relative}`, base, module: relative.split("/")[0].replace(/\.rs$/, "") };
+      const file = `src/${relative}`;
+      const module =
+        fileModules.get(file) ?? relative.split("/")[0].replace(/\.rs$/, "");
+      return { full, file, base, module };
     });
   const edges = [];
   const unknown = [];
@@ -315,7 +323,12 @@ const SEAM_RULES = [
   {
     name: "stdio 的调用方直接开管道",
     pattern: /\bStdio::piped\b/,
-    files: ["src/slot.rs", "src/hook.rs", "src/daemon.rs", "src/wire/contract/rawhub.rs"],
+    files: [
+      "src/supervise/slot.rs",
+      "src/supervise/hook.rs",
+      "src/daemon.rs",
+      "src/wire/contract/rawhub.rs",
+    ],
     hint: "这些文件问 src/wire/contract/stdio 要管道（Plan::notify / exec / hook / stop_hook）。",
   },
 ];
@@ -602,8 +615,8 @@ const args = parseArgs(process.argv.slice(2));
 if (args.selftest) {
   process.exit(selftest() === 0 ? 0 : 1);
 }
-const { map, rank, modules } = loadMap(args.map);
-const { sources, edges, unknown } = scanSources(args.src, modules);
+const { map, rank, modules, fileModules } = loadMap(args.map);
+const { sources, edges, unknown } = scanSources(args.src, modules, fileModules);
 const mapped = new Set(sources.map((source) => source.module));
 const stale = [...modules.keys()].filter((name) => !mapped.has(name)).sort();
 const nodes = [...new Set(sources.map((source) => source.module))];

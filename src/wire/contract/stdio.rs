@@ -1,7 +1,7 @@
 //! Child-process stdio: which pipes open, and who reads the parent ends.
 //!
-//! S6b (#142) pulls the last platform fork out of [`crate::slot`] and
-//! [`crate::hook`]. A caller says what the streams *mean* — JSON-RPC frames, a
+//! S6b (#142) pulls the last platform fork out of [`crate::supervise::slot`] and
+//! [`crate::supervise::hook`]. A caller says what the streams *mean* — JSON-RPC frames, a
 //! plugin log, a hook's output — and this module owns two things instead:
 //!
 //! - **Which pipes exist.** [`Plan`] answers that from `Ready` and the

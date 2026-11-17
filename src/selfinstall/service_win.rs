@@ -36,7 +36,7 @@ use windows_sys::Win32::System::Services::{
 };
 
 use crate::wire::control::channel;
-use crate::install::SCM_NAME;
+use crate::selfinstall::install::SCM_NAME;
 
 /// The SCM gives a start request 30 seconds; report the same hint and probe for
 /// readiness well inside it.

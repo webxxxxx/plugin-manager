@@ -21,14 +21,14 @@ use serde_json::{json, Value};
 use crate::http;
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::lan::{AuthKind, Lan};
-use crate::package;
+use crate::manage::package;
 use crate::platform::paths::Paths;
-use crate::plugin;
+use crate::manage::plugin;
 use crate::server::http::{
     BlockingOutcome, CloseReason, Exchange, OutBuffer, StreamAction, StreamClass, StreamEvent,
     StreamHandler, StreamStep,
 };
-use crate::transfer;
+use crate::manage::transfer;
 
 use super::support::{self, CallBudget};
 

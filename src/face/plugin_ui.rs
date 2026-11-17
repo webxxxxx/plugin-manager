@@ -10,8 +10,8 @@ use crate::platform::config::Config;
 use crate::face::plugin_streams::{self, StreamContext};
 use crate::http;
 use crate::lan::Lan;
-use crate::package;
-use crate::plugin;
+use crate::manage::package;
+use crate::manage::plugin;
 use crate::server::http::{
     dispatch_inline, BodyPolicy, CloseReason, Completion, Exchange, Face, FileSend, OutBuffer,
     Request, Route, StreamAction, StreamClass, StreamEvent, StreamHandler, StreamStep,

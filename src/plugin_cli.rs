@@ -13,11 +13,11 @@ use crate::wire::control::channel;
 use crate::platform::compat;
 use crate::platform::config::Config;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
-use crate::package;
-use crate::plugin;
-use crate::registry::Kind;
+use crate::manage::package;
+use crate::manage::plugin;
+use crate::supervise::registry::Kind;
 use crate::status::{self, Status};
-use crate::transfer;
+use crate::manage::transfer;
 
 const EXIT_OK: i32 = 0;
 const EXIT_SERVICE_ERROR: i32 = 1;
@@ -80,7 +80,7 @@ enum Command {
         no_config: bool,
         force: bool,
     },
-    Bundle(crate::bundle::Options),
+    Bundle(crate::manage::bundle::Options),
 }
 
 pub fn run(args: Vec<String>) -> i32 {
@@ -496,7 +496,7 @@ fn parse(args: &[String]) -> Result<Command, ()> {
                 index += 1;
             }
             dir.map(|dir| {
-                Command::Bundle(crate::bundle::Options {
+                Command::Bundle(crate::manage::bundle::Options {
                     dir,
                     out,
                     key,
@@ -695,7 +695,7 @@ fn verify_host(config: &Config, inspection: &package::Inspection) -> VerifyHost 
     VerifyHost {
         matches_host: inspection.package.manifest.platform == host.platform,
         device: host.device,
-        interpreter: crate::plugin::prepare(&inspection.package)
+        interpreter: crate::manage::plugin::prepare(&inspection.package)
             .ok()
             .flatten()
             .map(|interpreter| interpreter.path),
@@ -970,8 +970,8 @@ fn import(
     }
 }
 
-fn bundle_command(options: crate::bundle::Options) -> i32 {
-    match crate::bundle::bundle(&options) {
+fn bundle_command(options: crate::manage::bundle::Options) -> i32 {
+    match crate::manage::bundle::bundle(&options) {
         Ok(path) => {
             println!("{}", path.display());
             EXIT_OK
@@ -1083,7 +1083,7 @@ mod tests {
                 "--platform=aarch64-unknown-linux-musl"
             ]))
             .expect("bundle"),
-            Command::Bundle(crate::bundle::Options {
+            Command::Bundle(crate::manage::bundle::Options {
                 dir: PathBuf::from("src"),
                 key: Some(PathBuf::from("key.pem")),
                 compat: vec!["sr6110".into(), "sr1010".into()],
@@ -1095,7 +1095,7 @@ mod tests {
         assert!(parse(&args(&["bundle", "src", "--platform"])).is_err());
         assert_eq!(
             parse(&args(&["bundle", "src", "--unsigned"])).expect("unsigned bundle"),
-            Command::Bundle(crate::bundle::Options {
+            Command::Bundle(crate::manage::bundle::Options {
                 dir: PathBuf::from("src"),
                 unsigned: true,
                 ..Default::default()
@@ -1245,7 +1245,7 @@ mod tests {
                 "test"
             ]))
             .expect("bundle"),
-            Command::Bundle(crate::bundle::Options {
+            Command::Bundle(crate::manage::bundle::Options {
                 dir: PathBuf::from("samples/demo"),
                 out: Some(PathBuf::from("out.spk")),
                 key: Some(PathBuf::from("key.pem")),
@@ -1277,7 +1277,7 @@ mod tests {
                 "--interpreter-arg=-e"
             ]))
             .expect("script bundle"),
-            Command::Bundle(crate::bundle::Options {
+            Command::Bundle(crate::manage::bundle::Options {
                 dir: PathBuf::from("samples/demo"),
                 out: None,
                 key: Some(PathBuf::from("key.pem")),

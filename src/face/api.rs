@@ -19,9 +19,9 @@ use crate::kernel::failure::ProblemError;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::lan::{self, AuthKind, Lan};
 use crate::platform::log;
-use crate::package;
+use crate::manage::package;
 use crate::platform::paths::Paths;
-use crate::plugin;
+use crate::manage::plugin;
 use crate::server::http::{
     BodyPolicy, Completion, Dispatch, Exchange, Face, Request, Response, Route,
 };
@@ -183,7 +183,7 @@ impl ApiFace {
     }
 
     fn trust_list(&self) -> Response {
-        match crate::trust::keys(&self.config.paths) {
+        match crate::manage::trust::keys(&self.config.paths) {
             Ok(keys) => Response::json(
                 200,
                 &json!({
@@ -202,7 +202,7 @@ impl ApiFace {
         if body.is_empty() {
             return error_response(400, "bad_request", "empty public key");
         }
-        match crate::trust::add(&self.config.paths, &key_id, body) {
+        match crate::manage::trust::add(&self.config.paths, &key_id, body) {
             Ok(path) => Response::json(
                 200,
                 &json!({
@@ -215,7 +215,7 @@ impl ApiFace {
     }
 
     fn trust_remove(&self, key_id: &str) -> Response {
-        match crate::trust::remove(&self.config.paths, key_id) {
+        match crate::manage::trust::remove(&self.config.paths, key_id) {
             Ok(true) => Response::json(200, &json!({ "keyId": key_id, "removed": true })),
             Ok(false) => error_response(
                 404,
@@ -565,7 +565,7 @@ fn project_service(status: &Value, paths: &Paths) -> Option<Value> {
         .get("summary")
         .and_then(|summary| summary.get("id"))
         .and_then(Value::as_str)
-        .map(|id| crate::plugin::web_assets(paths, id).is_some())
+        .map(|id| crate::manage::plugin::web_assets(paths, id).is_some())
         .unwrap_or(false);
     let mut summary = status.get("summary").cloned()?;
     if let Some(object) = summary.as_object_mut() {

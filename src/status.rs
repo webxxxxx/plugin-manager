@@ -9,8 +9,8 @@ use std::fmt::Display;
 use serde::{Deserialize, Serialize};
 
 use crate::platform::clock::Now;
-use crate::registry::{Kind, Service, State};
-use crate::supervisor::Machine;
+use crate::supervise::registry::{Kind, Service, State};
+use crate::supervise::supervisor::Machine;
 
 /// The fixed `svc status` payload. `svc list` and the text output are both
 /// projections of this shape; MCP `svc.list` / `svc.describe` will reuse it when
@@ -226,8 +226,8 @@ fn dash<T: Display>(value: Option<T>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::Ready;
-    use crate::registry::Service;
+    use crate::supervise::registry::Ready;
+    use crate::supervise::registry::Service;
     use serde_json::Value;
 
     fn demo() -> Service {
@@ -238,15 +238,15 @@ mod tests {
             protocol: 1,
             desc: "demo service".into(),
             deps: vec!["base".into()],
-            contract: crate::registry::contract_for(
+            contract: crate::supervise::registry::contract_for(
                 "demo",
                 "1.2.3",
                 Vec::new(),
-                crate::registry::Carrier::Slot,
+                crate::supervise::registry::Carrier::Slot,
                 &crate::platform::limits::test_default(),
             ),
             impl_ref: None,
-            exec: Some(crate::registry::Exec {
+            exec: Some(crate::supervise::registry::Exec {
                 path: "/bin/demo".into(),
                 args: Vec::new(),
                 env: Default::default(),
@@ -255,7 +255,7 @@ mod tests {
             }),
             lifecycle: None,
             enabled: true,
-            restart: crate::registry::Restart::OnFailure,
+            restart: crate::supervise::registry::Restart::OnFailure,
             remain_after_exit: false,
             compat: None,
             state: State::Running,
@@ -330,10 +330,10 @@ mod tests {
 
     #[test]
     fn live_status_uses_the_machine_runtime_state() {
-        use crate::supervisor::Machine;
+        use crate::supervise::supervisor::Machine;
 
         let service = demo();
-        let mut machine = Machine::new(crate::registry::Restart::OnFailure);
+        let mut machine = Machine::new(crate::supervise::registry::Restart::OnFailure);
         machine.state = State::Backoff;
         machine.pid = None;
         machine.since_ms = 1_700_000_000_000;

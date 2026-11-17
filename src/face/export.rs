@@ -23,9 +23,9 @@ use std::sync::Arc;
 
 use crate::http;
 use crate::kernel::failure::{Problem, ProblemError};
-use crate::package::{self, TarPart, TarPlan};
+use crate::manage::package::{self, TarPart, TarPlan};
 use crate::platform::paths::Paths;
-use crate::plugin;
+use crate::manage::plugin;
 use crate::server::http::{
     CloseReason, FileSend, OutBuffer, StreamAction, StreamClass, StreamEvent, StreamHandler,
     StreamStep,
