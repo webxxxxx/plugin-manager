@@ -11,7 +11,8 @@ use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::rawhub::{RawEvent, RawFailure, RawHub, RawSubscription};
+use crate::ipc::RawFailure;
+use crate::rawhub::{RawEvent, RawHub, RawSubscription};
 use crate::server::http::wire;
 use crate::server::http::{
     CloseReason, OutBuffer, StreamAction, StreamEvent, StreamHandler, StreamStep,

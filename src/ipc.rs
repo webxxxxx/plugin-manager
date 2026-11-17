@@ -343,6 +343,108 @@ pub fn spawn_length_reader_limit<R: Read + Send + 'static>(
         .map(|_| ())
 }
 
+
+/// Why a raw stream stopped. Every failure path records exactly one reason so
+/// the daemon log reports a distribution instead of a bare error count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawFailure {
+    FrameTooLarge,
+    StreamNotSubscribed,
+    StreamConflict,
+    BudgetBytes,
+    BudgetRequests,
+    WriterQueueFull,
+    WriterClosed,
+    SubscriberFull,
+    SubscriberClosed,
+    PluginEof,
+    PluginReadError,
+    PluginWriteError,
+    WsWriteError,
+    PluginReplaced,
+}
+
+impl RawFailure {
+    /// Every failure, in counter order. `index` is the position in this table,
+    /// so adding a variant cannot silently reuse another one's slot.
+    pub const ALL: [RawFailure; 14] = [
+        RawFailure::FrameTooLarge,
+        RawFailure::StreamNotSubscribed,
+        RawFailure::StreamConflict,
+        RawFailure::BudgetBytes,
+        RawFailure::BudgetRequests,
+        RawFailure::WriterQueueFull,
+        RawFailure::WriterClosed,
+        RawFailure::SubscriberFull,
+        RawFailure::SubscriberClosed,
+        RawFailure::PluginEof,
+        RawFailure::PluginReadError,
+        RawFailure::PluginWriteError,
+        RawFailure::WsWriteError,
+        RawFailure::PluginReplaced,
+    ];
+
+    /// Stable counter/log name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RawFailure::FrameTooLarge => "frame_too_large",
+            RawFailure::StreamNotSubscribed => "stream_not_subscribed",
+            RawFailure::StreamConflict => "stream_conflict",
+            RawFailure::BudgetBytes => "budget_bytes",
+            RawFailure::BudgetRequests => "budget_requests",
+            RawFailure::WriterQueueFull => "writer_queue_full",
+            RawFailure::WriterClosed => "writer_closed",
+            RawFailure::SubscriberFull => "subscriber_full",
+            RawFailure::SubscriberClosed => "subscriber_closed",
+            RawFailure::PluginEof => "plugin_eof",
+            RawFailure::PluginReadError => "plugin_read_error",
+            RawFailure::PluginWriteError => "plugin_write_error",
+            RawFailure::WsWriteError => "ws_write_error",
+            RawFailure::PluginReplaced => "plugin_replaced",
+        }
+    }
+
+    /// Operator-facing reason, also used as the WebSocket close detail.
+    pub fn message(self) -> &'static str {
+        match self {
+            RawFailure::FrameTooLarge => "raw frame is too large",
+            RawFailure::StreamNotSubscribed => "raw stream is not subscribed",
+            RawFailure::StreamConflict => "raw stream already has an in-flight request",
+            RawFailure::BudgetBytes | RawFailure::BudgetRequests => {
+                "raw in-flight budget exceeded"
+            }
+            RawFailure::WriterQueueFull => "raw plugin writer queue is full",
+            RawFailure::WriterClosed => "raw plugin is closed",
+            RawFailure::SubscriberFull => "raw subscriber queue is full",
+            RawFailure::SubscriberClosed => "raw subscriber is closed",
+            RawFailure::PluginEof => "raw plugin closed its stdout",
+            RawFailure::PluginReadError => "raw plugin stdout read failed",
+            RawFailure::PluginWriteError => "raw plugin stdin is closed",
+            RawFailure::WsWriteError => "raw websocket write failed",
+            RawFailure::PluginReplaced => "raw plugin transport was replaced",
+        }
+    }
+
+    pub(crate) fn index(self) -> usize {
+        // ALL covers every variant; the unit test pins that down. Falling back
+        // to slot 0 keeps a table desync from aborting the daemon, which is
+        // built with `panic = "abort"`.
+        RawFailure::ALL
+            .iter()
+            .position(|kind| *kind == self)
+            .unwrap_or(0)
+    }
+}
+
+/// What a raw stream reports back when its transport dies.
+///
+/// `RawHub` implements it; the poll set only knows this interface, which is
+/// why `reactor` never names the hub type (no reactor ↔ hub cycle, #138).
+pub trait RawStopSink: Send + Sync {
+    fn note_transport_failure(&self, failure: RawFailure, plugin: &str);
+    fn unregister_generation(&self, id: &str, generation: u64);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use crate::ipc::{FrameError, FrameEvent};
 use crate::log::{self, LogSink};
-use crate::rawhub::{RawFailure, RawHub};
+use crate::ipc::{RawFailure, RawStopSink};
 use crate::wake::Wake;
 
 const READ_CHUNK: usize = 8 * 1024;
@@ -114,7 +114,7 @@ struct Source {
     log: Option<Arc<Mutex<LogSink>>>,
     /// Set for protocol-3 sources; the reactor reports the stop reason there
     /// together with the transport generation it registered.
-    hub: Option<(Weak<RawHub>, u64)>,
+    hub: Option<(Weak<dyn RawStopSink>, u64)>,
     stop: Option<Stop>,
 }
 
@@ -137,7 +137,7 @@ impl Source {
         self
     }
 
-    fn with_plugin(mut self, hub: Weak<RawHub>, generation: u64) -> Self {
+    fn with_plugin(mut self, hub: Weak<dyn RawStopSink>, generation: u64) -> Self {
         self.hub = Some((hub, generation));
         self
     }
@@ -359,7 +359,7 @@ impl Reactor {
         stdout: ChildStdout,
         stderr: Option<ChildStderr>,
         log: Option<Arc<Mutex<LogSink>>>,
-        hub: Weak<RawHub>,
+        hub: Weak<dyn RawStopSink>,
         generation: u64,
         max_frame: usize,
         capacity: usize,
@@ -592,7 +592,7 @@ fn retire(sources: &mut Vec<Source>) {
         return;
     }
     let mut kept = Vec::with_capacity(sources.len());
-    let mut closing: Vec<(String, Option<(Weak<RawHub>, u64)>, RawFailure)> = Vec::new();
+    let mut closing: Vec<(String, Option<(Weak<dyn RawStopSink>, u64)>, RawFailure)> = Vec::new();
     let mut closed = HashSet::new();
     for source in sources.drain(..) {
         match source.stop {
