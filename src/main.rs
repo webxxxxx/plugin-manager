@@ -16,8 +16,6 @@ mod face;
 mod hook;
 mod http;
 mod install;
-#[cfg(feature = "http")]
-mod install_http;
 mod interpreter;
 mod ipc;
 mod kernel;

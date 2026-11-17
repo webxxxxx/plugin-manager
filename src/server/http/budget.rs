@@ -3,8 +3,8 @@
 //! Long-lived stream handlers (downloads, uploads, SSE and WebSocket) draw
 //! from one budget; one-shot static assets are exempt. The Unix server loop uses
 //! it via `driver::StreamDriver`, the Windows thread fallback via
-//! `fallback::drive`. The still-legacy export/import/install takeovers are
-//! outside this counter until they migrate.
+//! `fallback::drive`. Downloads, uploads, package install/import and export
+//! all count here; one-shot static assets do not.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
