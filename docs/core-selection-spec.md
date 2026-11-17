@@ -216,7 +216,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 ### 3.1 控制通道
 
 - 一套 **JSON-RPC 2.0 + NDJSON** 信封跑三条链路：插件 stdio、`svc`/`mcp` 的 UDS / 命名管道、UI 的 `POST /plugin-ui/{id}/{token}/rpc`。这三条是控制面；HTTP 的 `/mcp` 与 `/api/v1` 是另外两个面（§3.4 / §3.5），不复用 NDJSON 分帧。
-- `svc`/`svcd` 的本地管理通道用 UDS（Unix）/命名管道（Windows）上的 NDJSON，按权限分**两个端点**：`svcd`（载读 + 生命周期：`status` / `start` / `stop` / `restart` / `logs` / `export` / `editconfig --print`）与 `svcd-admin`（载写：`install` / `upgrade` / `uninstall` / `import` / `editconfig` / `enable` / `disable` / `auth`）。**鉴权就是端点 ACL，请求不携带凭据**：Unix 侧 `svcd` socket 0660（root:svcd）、`svcd-admin` 0600；Windows 侧两条显式 protected DACL（C8）。user mode 只有 `svcd` 一个端点，ACL 为当前用户私有。旧版本遗留的 `<config>/svcd.token` 由启动/安装路径清理。
+- `svc`/`svcd` 的本地管理通道用 UDS（Unix）/命名管道（Windows）上的 NDJSON，按权限分**两个端点**：`svcd`（载读 + 生命周期：`status` / `start` / `stop` / `restart` / `logs` / `export` / `editconfig --print`）与 `svcd-admin`（载写：`install` / `upgrade` / `uninstall` / `import` / `editconfig` / `enable` / `disable` / `auth`）。**鉴权就是端点 ACL，请求不携带凭据**：Unix 侧 `svcd` socket 0660（root:svcd）、`svcd-admin` 0600；Windows 侧两条显式 protected DACL（C8）。user mode 也有两个端点，但两者共用同一条 ACL（当前用户私有）：方法分档照旧，客户端不需要知道自己在哪种模式。旧版本遗留的 `<config>/svcd.token` 由启动/安装路径清理。
 - 帧：UTF-8、LF、禁内嵌换行与 BOM；Windows 二进制模式；单帧上限 1 MiB，超限 = 协议违规，按崩溃路径杀进程。
 - 流控：每插件在途 64、排队 128；超出 `-32000 busy`；单请求默认 30s，超时先发 `notifications/cancelled` 再回错；id 用 svcd 侧单调 u64。
 - 插件 → svcd 只允许响应与通知，不允许发请求（v1 不做双向 RPC）；stdout 只走协议帧，stderr 是行式日志；stdout EOF = 退出。
@@ -383,6 +383,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
   - root / Administrator：install、upgrade、uninstall、`editconfig`、`import`、`svc auth passwd` / enable / disable。
   - `svcd` 组：start / stop / status / logs、`editconfig --print`、`export`（只读）。
 - 两档由控制通道的两个端点实施（§3.1）：`svcd` 端点只接受组档方法，`svcd-admin` 端点只接受 root / Administrator。端点 ACL 即鉴权，请求不携带凭据。
+- Windows 上 `svcd install-service` 建/校验 `svcd` 本地组，系统模式 daemon 启动时组缺失即失败；`uninstall-service` 不删组（误删成员比留一个成员更危险）。
 - LAN 是另一套：管理员密码（`auth_passwd` 哈希）；UI 用 `svcd_session`，`/api/v1` 用 `svcd_api` 或 Bearer 密码，`/mcp` 只收 Bearer 密码；不映射 OS 用户。**HTTP 管理 API 覆盖全部 `svc` 命令，密码等价于 root / Administrator**；默认 LAN 关闭、无 TLS。
 - 配置明文 0640 root:svcd；不接 Keychain / DPAPI / Secret Service / TPM、不加密；导出/备份含明文 secret，文档警告；插件自管密钥。
 - **明确接受：任一服务/插件有 bug 或被攻破 = 整机 root / System**；补偿只在来源侧（core 的 root 文件权限、plugin 的签名/审核/`trust.d`）。
