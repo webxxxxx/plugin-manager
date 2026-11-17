@@ -73,7 +73,8 @@ function failureTail(result, cap = 60) {
 /// How many message lines to keep after one `panicked at` header.
 const PANIC_CONTEXT_LINES = 12;
 /// Cap for the whole failure block, so a suite with many panics stays readable.
-const FAILURE_LINE_CAP = 80;
+/// Large enough that several panic blocks keep their message lines.
+const FAILURE_LINE_CAP = 200;
 
 /// The failing lines, plus the message cargo prints *after* each `panicked at`
 /// header. cargo puts the panic message on the following lines, so keeping only
@@ -87,7 +88,9 @@ function failureLines(all) {
   for (let index = 0; index < all.length; index += 1) {
     const line = all[index];
     if (line.includes("panicked at")) {
-      keep(line);
+      // Keep each panic block whole: deduping message lines globally would
+      // strip a later block of an identical line and leave it context-free.
+      const block = [line];
       for (let next = index + 1; next < all.length; next += 1) {
         const text = all[next];
         const stop =
@@ -99,8 +102,9 @@ function failureLines(all) {
           text.startsWith("test result:") ||
           text.includes("panicked at");
         if (stop) break;
-        keep(text);
+        if (!block.includes(text)) block.push(text);
       }
+      kept.push(...block);
       continue;
     }
     if (line.startsWith("test result:")) continue;
