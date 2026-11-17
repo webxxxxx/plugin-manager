@@ -251,8 +251,11 @@ impl StreamHandler for RejectAfterDrain {
         }
     }
 
+    /// The endpoint-policy refusal is a bounded response that was already
+    /// rejected before any transfer work; it must not be turned into a 503 by
+    /// a full max_streams budget, and the old takeover did not count it either.
     fn stream_class(&self) -> StreamClass {
-        StreamClass::LongLived
+        StreamClass::OneShot
     }
 }
 
@@ -285,6 +288,8 @@ struct UploadState {
     mode: Mode,
     framing: BodyFraming,
     body_done: bool,
+    /// A refusal is queued or already answered; later chunks are drained.
+    refused: bool,
     flow: Flow,
     outcome: Option<Outcome>,
     config: PathBuf,
@@ -332,7 +337,7 @@ enum ImportStage {
     /// a package, a backup and a bare config.
     Classify(Vec<u8>),
     Package {
-        installer: Option<package::StagingInstaller>,
+        installer: package::StagingInstaller,
     },
     Backup(BackupImport),
     Raw(Vec<u8>),
@@ -396,6 +401,7 @@ impl PackageUploadStream {
                 mode,
                 framing: BodyFraming::new(framing, max_package),
                 body_done: false,
+                refused: false,
                 flow,
                 outcome: None,
                 config,
@@ -567,14 +573,17 @@ impl UploadState {
         let (decoded, done) = match self.framing.feed(raw) {
             Ok(value) => value,
             Err(message) => {
-                self.fail(&message);
                 // A broken chunk framing cannot be drained: there is no
-                // boundary to wait for.
+                // boundary to wait for. If a refusal is already queued, keep
+                // it: replacing it would write a second response head.
+                if !self.refused {
+                    self.fail(&message);
+                }
                 self.body_done = true;
                 return;
             }
         };
-        if self.outcome.is_some() {
+        if self.refused || self.outcome.is_some() {
             // Draining the rest of a refused request: decode the framing and
             // discard, so the close is a clean FIN.
             if done {
@@ -594,7 +603,7 @@ impl UploadState {
         }
         if done {
             self.body_done = true;
-            if self.outcome.is_none() {
+            if self.outcome.is_none() && !self.refused {
                 self.finish();
             }
         }
@@ -606,6 +615,7 @@ impl UploadState {
             Mode::Import => import_error(message),
         };
         self.flow = Flow::Done;
+        self.refused = true;
         self.outcome = Some(Outcome::Error(response));
     }
 
@@ -672,16 +682,13 @@ impl InstallFlow {
         let root = staged.root.clone();
         let id = staged.manifest.name.clone();
         let version = staged.manifest.version.clone();
-        match crate::api::rpc(
+        match install_staged(
             config,
-            "plugin.install_staged",
-            json!({
-                "path": root.to_string_lossy(),
-                "id": id,
-                "version": version,
-                "strategy": self.strategy,
-                "allowHooks": self.allow_hooks,
-            }),
+            &root,
+            &id,
+            &version,
+            &self.strategy,
+            self.allow_hooks,
         ) {
             Ok(status) => {
                 if !self.enable {
@@ -696,10 +703,7 @@ impl InstallFlow {
                 .unwrap_or_default();
                 http::response(200, "application/json", &body)
             }
-            Err(response) => {
-                let _ = std::fs::remove_dir_all(&root);
-                response
-            }
+            Err(response) => response,
         }
     }
 }
@@ -715,10 +719,7 @@ impl ImportFlow {
                 }
                 Ok(())
             }
-            ImportStage::Package { installer } => installer
-                .as_mut()
-                .expect("package installer initialized")
-                .feed(data),
+            ImportStage::Package { installer } => installer.feed(data),
             ImportStage::Backup(import) => import.feed(data),
             ImportStage::Raw(config) => {
                 config.extend_from_slice(data);
@@ -740,9 +741,7 @@ impl ImportFlow {
                     limits::current().max_package_bytes,
                 );
                 installer.feed(&data)?;
-                self.stage = ImportStage::Package {
-                    installer: Some(installer),
-                };
+                self.stage = ImportStage::Package { installer };
             }
             Some("backup.json") => {
                 let mut import = BackupImport::new(&self.params, staging_path());
@@ -769,30 +768,22 @@ impl ImportFlow {
                     }
                     continue;
                 }
-                ImportStage::Package { installer } => {
-                    let Some(mut installer) = installer else {
-                        return import_error("manifest.json is missing");
-                    };
+                ImportStage::Package { mut installer } => {
                     let staged = match installer.finish() {
                         Ok(staged) => staged,
                         Err(message) => return import_error(&message),
                     };
                     let root = staged.root.clone();
-                    return match crate::api::rpc(
+                    return match install_staged(
                         config,
-                        "plugin.install_staged",
-                        json!({
-                            "path": root.to_string_lossy(),
-                            "id": staged.manifest.name,
-                            "version": staged.manifest.version,
-                            "strategy": "replace",
-                        }),
+                        &root,
+                        &staged.manifest.name,
+                        &staged.manifest.version,
+                        "replace",
+                        false,
                     ) {
                         Ok(status) => import_response(status, None, false, Vec::new()),
-                        Err(response) => {
-                            let _ = std::fs::remove_dir_all(&root);
-                            response
-                        }
+                        Err(response) => response,
                     };
                 }
                 ImportStage::Backup(mut import) => {
@@ -824,6 +815,11 @@ fn raw_config_response(data: &[u8], params: &ImportParams) -> Vec<u8> {
 /// A .spkb backup: backup.json, the nested .spk, and an optional config entry.
 /// The outer tar and the inner package are both parsed as they arrive; the
 /// inner package reuses package::StagingInstaller.
+///
+/// transfer::import_backup is the buffered twin used by the CLI and the legacy
+/// whole-body import. The rules (schema, id/version match, config hash,
+/// force/warning policy, config application) must stay in step; a change here
+/// belongs there too.
 struct BackupImport {
     tar: package::TarFeed,
     sink: BackupSink,
@@ -1043,21 +1039,16 @@ impl BackupSink {
             .take()
             .ok_or_else(|| "plugin.spk is missing".to_string())?;
         let applied = !self.no_config && self.config_data.is_some();
-        let status = match crate::api::rpc(
+        let status = match install_staged(
             config,
-            "plugin.install_staged",
-            json!({
-                "path": staged.root.to_string_lossy(),
-                "id": staged.manifest.name,
-                "version": staged.manifest.version,
-                "strategy": "replace",
-            }),
+            &staged.root,
+            &staged.manifest.name,
+            &staged.manifest.version,
+            "replace",
+            false,
         ) {
             Ok(status) => status,
-            Err(response) => {
-                let _ = std::fs::remove_dir_all(&staged.root);
-                return Ok(response);
-            }
+            Err(response) => return Ok(response),
         };
         if applied {
             transfer::apply_config(
@@ -1084,6 +1075,34 @@ impl Drop for BackupSink {
             let _ = std::fs::remove_dir_all(&staged.root);
         }
     }
+}
+
+/// Send one staged package tree to the daemon. A refusal removes the tree,
+/// so a failed install never leaves staging behind no matter which route
+/// (install, .spk import, .spkb import) produced it.
+fn install_staged(
+    config: &Path,
+    root: &Path,
+    id: &str,
+    version: &str,
+    strategy: &str,
+    allow_hooks: bool,
+) -> Result<Value, Vec<u8>> {
+    crate::api::rpc(
+        config,
+        "plugin.install_staged",
+        json!({
+            "path": root.to_string_lossy(),
+            "id": id,
+            "version": version,
+            "strategy": strategy,
+            "allowHooks": allow_hooks,
+        }),
+    )
+    .map_err(|response| {
+        let _ = std::fs::remove_dir_all(root);
+        response
+    })
 }
 
 fn staging_path() -> PathBuf {
@@ -1151,7 +1170,7 @@ fn import_outcome_json(outcome: transfer::Outcome) -> Vec<u8> {
 
 fn install_error(message: &str) -> Vec<u8> {
     let lower = message.to_ascii_lowercase();
-    let status = if lower.contains("too large") || lower.contains("exceeds") {
+    let status = if lower.contains("too large") {
         413
     } else if lower.contains("signature")
         || lower.contains("platform")
@@ -1173,7 +1192,7 @@ fn install_error(message: &str) -> Vec<u8> {
 
 fn import_error(message: &str) -> Vec<u8> {
     let lower = message.to_ascii_lowercase();
-    let status = if lower.contains("too large") || lower.contains("exceeds") {
+    let status = if lower.contains("too large") {
         413
     } else if lower.contains("signature")
         || lower.contains("platform")
@@ -1197,8 +1216,6 @@ fn import_error(message: &str) -> Vec<u8> {
 fn code_for(status: u16) -> &'static str {
     match status {
         400 => "bad_request",
-        404 => "not_found",
-        409 => "conflict",
         413 => "payload_too_large",
         500 => "internal",
         _ => "error",
@@ -1286,5 +1303,169 @@ mod tests {
         assert_eq!(config_id.as_deref(), Some("demo"));
         assert!(no_config);
         assert!(force);
+    }
+
+    fn lan() -> Arc<Mutex<Lan>> {
+        use std::net::SocketAddr;
+        let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
+        Arc::new(Mutex::new(Lan::new(bind, bind, false, None)))
+    }
+
+    fn stream_handler(request: &[u8]) -> Box<dyn StreamHandler> {
+        let head = parse_head(request);
+        match exchange(&head, &lan(), PathBuf::from("unused")).expect("streamed exchange") {
+            Exchange::Stream(handler) => handler,
+            Exchange::Response(_) => panic!("a package route must stream"),
+        }
+    }
+
+    /// Drive the handler the way the server does: write, read body chunks, run
+    /// submitted jobs inline, then write the final response. Returns the bytes
+    /// written, the close reason and how much of the body the handler consumed.
+    fn drive(
+        mut handler: Box<dyn StreamHandler>,
+        body: &[u8],
+        chunk: usize,
+    ) -> (Vec<u8>, CloseReason, usize) {
+        let limit = 4096;
+        let mut out = Vec::new();
+        let mut all = Vec::new();
+        let mut offset = 0;
+        let mut step =
+            handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
+        loop {
+            all.extend_from_slice(&out);
+            out.clear();
+            match step.action {
+                StreamAction::Close(reason) => return (all, reason, offset),
+                StreamAction::SubmitBlocking(job) => {
+                    let outcome = job();
+                    step = handler.on_event(
+                        StreamEvent::BlockingDone(outcome),
+                        &mut OutBuffer::new(&mut out, limit),
+                    );
+                }
+                StreamAction::NeedWrite => {
+                    step = handler
+                        .on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
+                }
+                StreamAction::NeedRead | StreamAction::Continue => {
+                    if offset >= body.len() {
+                        panic!("handler still wants body after {} bytes", offset);
+                    }
+                    let end = (offset + chunk).min(body.len());
+                    step = handler.on_event(
+                        StreamEvent::Data(&body[offset..end]),
+                        &mut OutBuffer::new(&mut out, limit),
+                    );
+                    offset = end;
+                }
+                StreamAction::SendFile(_) => panic!("a package upload sends no file"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_wrong_content_type_answers_then_consumes_the_body() {
+        let handler = stream_handler(
+            b"POST /api/v1/plugins HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\nContent-Length: 7\r\n\r\n",
+        );
+        let (response, reason, consumed) = drive(handler, b"ignored", 3);
+        assert_eq!(reason, CloseReason::Completed);
+        assert_eq!(consumed, 7, "the refused body must still be drained");
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 400 Bad Request"), "{text}");
+        assert!(
+            text.contains("Content-Type must be application/octet-stream"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_full_blocking_queue_turns_into_503_busy() {
+        let mut handler = stream_handler(
+            b"POST /api/v1/plugins HTTP/1.1\r\nHost: x\r\nContent-Type: application/octet-stream\r\nContent-Length: 4\r\n\r\n",
+        );
+        let mut out = Vec::new();
+        let step = handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, 4096));
+        assert!(matches!(step.action, StreamAction::NeedRead));
+        let step = handler.on_event(
+            StreamEvent::Data(b"body"),
+            &mut OutBuffer::new(&mut out, 4096),
+        );
+        assert!(matches!(step.action, StreamAction::SubmitBlocking(_)));
+        let step = handler.on_event(
+            StreamEvent::BlockingDone(BlockingOutcome::Failed("the blocking queue is full".into())),
+            &mut OutBuffer::new(&mut out, 4096),
+        );
+        assert!(matches!(step.action, StreamAction::Close(_)));
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "{text}"
+        );
+        assert!(text.contains("Retry-After: 1\r\n"), "{text}");
+        assert!(text.contains("\"code\":\"busy\""), "{text}");
+    }
+
+    #[test]
+    fn an_over_limit_chunked_body_is_refused_with_413() {
+        let handler = PackageUploadStream::new(
+            PackageTarget::Install {
+                strategy: "replace".into(),
+                enable: true,
+                allow_hooks: false,
+            },
+            http::Framing::Chunked,
+            false,
+            PathBuf::from("unused"),
+            8,
+        );
+        // Two 5-byte chunks exceed the 8-byte decoded limit.
+        let body = b"5\r\nabcde\r\n5\r\nfghij\r\n0\r\n\r\n";
+        let (response, reason, _) = drive(Box::new(handler), body, 3);
+        assert_eq!(reason, CloseReason::Completed);
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 413 Payload Too Large"), "{text}");
+        assert!(text.contains("\"code\":\"payload_too_large\""), "{text}");
+    }
+
+    #[test]
+    fn an_install_error_drains_the_rest_of_the_body() {
+        let handler = stream_handler(
+            b"POST /api/v1/plugins HTTP/1.1\r\nHost: x\r\nContent-Type: application/octet-stream\r\nContent-Length: 612\r\n\r\n",
+        );
+        // 0xAA is not a valid tar header: the feed fails at the first 512-byte
+        // boundary, after the handler has already promised a response.
+        let body = vec![0xAAu8; 612];
+        let (response, reason, consumed) = drive(handler, &body, 32);
+        assert_eq!(reason, CloseReason::Completed);
+        assert_eq!(consumed, body.len(), "the refused body must be drained");
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 400 Bad Request"), "{text}");
+    }
+
+    #[test]
+    fn a_broken_chunk_after_a_refusal_does_not_write_a_second_response() {
+        let handler = stream_handler(
+            b"POST /api/v1/plugins HTTP/1.1\r\nHost: x\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+        );
+        let mut body = Vec::new();
+        body.extend_from_slice(b"200\r\n");
+        body.extend_from_slice(&[0xAAu8; 512]);
+        body.extend_from_slice(b"\r\n");
+        // A size line that is not hex: the decoder cannot find a body boundary
+        // after the first chunk already produced a 400.
+        body.extend_from_slice(b"zz\r\n");
+        let (response, reason, consumed) = drive(handler, &body, 17);
+        assert_eq!(reason, CloseReason::Completed);
+        assert_eq!(consumed, body.len());
+        let text = String::from_utf8_lossy(&response);
+        assert_eq!(
+            text.matches("HTTP/1.1 ").count(),
+            1,
+            "only one response head may be written: {text}"
+        );
+        assert!(text.starts_with("HTTP/1.1 400 Bad Request"), "{text}");
     }
 }

@@ -2430,17 +2430,40 @@ fn a_disconnected_package_upload_removes_its_staging_directory() {
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
     let plugins = sandbox.data.join("plugins");
-    let initial = package[..package.len().min(64 * 1024)].to_vec();
+    let installed = raw_request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(
+        installed.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&installed.body)
+    );
+    let backup = raw_request(&address, "GET", "/api/v1/export/demo", "", b"");
+    assert_eq!(
+        backup.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&backup.body)
+    );
 
-    for (method, path) in [
-        ("POST", "/api/v1/plugins"),
-        ("POST", "/api/v1/import"),
+    // The .spk install, the .spk import and the .spkb import each stage into
+    // the plugin tree; a disconnect must remove that directory.
+    for (path, content) in [
+        ("/api/v1/plugins", package.as_slice()),
+        ("/api/v1/import", package.as_slice()),
+        ("/api/v1/import", backup.body.as_slice()),
     ] {
+        let initial = content[..content.len().min(64 * 1024)].to_vec();
         let stalled = start_stalled_upload(
             &address,
-            method,
+            "POST",
             path,
-            package.len() + 32 * 1024 * 1024,
+            content.len() + 32 * 1024 * 1024,
             &initial,
         );
         wait_for_package_staging(&plugins);
@@ -2470,9 +2493,9 @@ fn a_failed_install_removes_its_staging_directory() {
         "application/octet-stream",
         &package,
     );
-    assert_ne!(
+    assert_eq!(
         response.status,
-        200,
+        404,
         "{}",
         String::from_utf8_lossy(&response.body)
     );

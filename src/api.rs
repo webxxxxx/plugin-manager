@@ -577,8 +577,14 @@ fn serve_package_upload(
         Err(response) => {
             let _ = stream.write_all(&response);
         }
-        Ok(Exchange::Response(response)) => {
-            let _ = stream.write_all(&response.into_bytes());
+        Ok(Exchange::Response(_)) => {
+            // A streamed route must not answer with a memory response; the
+            // Unix loop renders the same 500 before any handler bytes go out.
+            let _ = stream.write_all(&http::json_error(
+                500,
+                "internal",
+                "a streamed package upload route returned a memory response",
+            ));
         }
         Ok(Exchange::Stream(handler)) => {
             let _ = stream.set_nonblocking(false);

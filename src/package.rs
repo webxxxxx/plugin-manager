@@ -1188,7 +1188,8 @@ pub fn load_staged(root: &Path, allow_insecure: bool) -> Result<StagedPackage, S
 }
 
 /// Read the path from one tar header without consuming a stream. Returns
-/// `None` for the zero blocks at end-of-archive.
+/// `None` for the zero blocks at end-of-archive. The classification path and
+/// the installer therefore validate a header exactly the same way.
 pub fn tar_header_path(header: &[u8]) -> Result<Option<String>, String> {
     if header.len() < 512 {
         return Ok(None);
@@ -1196,22 +1197,7 @@ pub fn tar_header_path(header: &[u8]) -> Result<Option<String>, String> {
     let header: &[u8; 512] = header[..512]
         .try_into()
         .map_err(|_| "truncated tar header".to_string())?;
-    if header.iter().all(|byte| *byte == 0) {
-        return Ok(None);
-    }
-    check_checksum(header)?;
-    let name = field(header, 0, 100);
-    let prefix = field(header, 345, 155);
-    let mut path = if prefix.is_empty() {
-        name
-    } else {
-        format!("{}/{}", prefix, name)
-    };
-    if header[156] == b'5' {
-        path = path.trim_end_matches('/').to_string();
-    }
-    check_path(&path)?;
-    Ok(Some(path))
+    Ok(parse_header(header)?.map(|entry| entry.path))
 }
 
 pub fn verify_package(path: &Path) -> Result<Package, String> {
