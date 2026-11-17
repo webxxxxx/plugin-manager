@@ -70,6 +70,45 @@ function failureTail(result, cap = 60) {
   return all.slice(-cap).join("\n");
 }
 
+/// How many message lines to keep after one `panicked at` header.
+const PANIC_CONTEXT_LINES = 12;
+/// Cap for the whole failure block, so a suite with many panics stays readable.
+const FAILURE_LINE_CAP = 80;
+
+/// The failing lines, plus the message cargo prints *after* each `panicked at`
+/// header. cargo puts the panic message on the following lines, so keeping only
+/// header-matching lines drops the key/request/actual detail that a named
+/// regression exists to report (#155).
+function failureLines(all) {
+  const kept = [];
+  const keep = (line) => {
+    if (!kept.includes(line)) kept.push(line);
+  };
+  for (let index = 0; index < all.length; index += 1) {
+    const line = all[index];
+    if (line.includes("panicked at")) {
+      keep(line);
+      for (let next = index + 1; next < all.length; next += 1) {
+        const text = all[next];
+        const stop =
+          next - index > PANIC_CONTEXT_LINES ||
+          text.trim() === "" ||
+          text.startsWith("note:") ||
+          text.startsWith("stack backtrace:") ||
+          text.startsWith("---- ") ||
+          text.startsWith("test result:") ||
+          text.includes("panicked at");
+        if (stop) break;
+        keep(text);
+      }
+      continue;
+    }
+    if (line.startsWith("test result:")) continue;
+    if (line.includes("FAILED") || line.startsWith("error:")) keep(line);
+  }
+  return kept.slice(0, FAILURE_LINE_CAP);
+}
+
 function summarizeTests(result) {
   const all = lines(result.stdout).concat(lines(result.stderr));
   const results = all.filter((line) => line.startsWith("test result:"));
@@ -77,13 +116,7 @@ function summarizeTests(result) {
     const match = line.match(/^test result: (ok|FAILED)\. (\d+) passed/);
     return !match || Number(match[2]) > 0 || match[1] === "FAILED";
   });
-  const failures = [...new Set(
-    all.filter(
-      (line) =>
-        !line.startsWith("test result:") &&
-        (line.includes("FAILED") || line.includes("panicked at") || line.startsWith("error:")),
-    ),
-  )].slice(0, 40);
+  const failures = failureLines(all);
   const empty = results.length - kept.length;
   console.log(
     "test: " +
