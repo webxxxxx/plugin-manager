@@ -43,10 +43,6 @@ impl ApiFace {
         ApiFace { config, lan }
     }
 
-    fn paths(&self) -> &Paths {
-        &self.config.paths
-    }
-
     fn rpc(
         &self,
         budget: &CallBudget,

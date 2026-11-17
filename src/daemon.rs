@@ -89,7 +89,14 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         eprintln!("svcd: cannot open log directory: {}", error);
     }
     log::svcd("svcd starting");
-    log::svcd(&format!("svcd: config: {}", config_path.display()));
+    log::svcd(&format!(
+        "svcd: config: {}",
+        config
+            .settings_path
+            .as_deref()
+            .unwrap_or(config_path.as_path())
+            .display()
+    ));
     // An explicit --conf may set config_dir to a different directory.
     let config_dir = &config.paths.config_dir;
     if config_dir != &initial_paths.config_dir {
@@ -163,10 +170,10 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     };
     #[cfg(feature = "http")]
     let raw_hub = crate::rawhub::RawHub::new(
-        crate::limits::current().ws_raw_max_bytes,
-        crate::limits::current().ws_inflight_bytes,
-        crate::limits::current().ws_inflight_requests,
-        crate::limits::current().ws_raw_queue,
+        config.limits.ws_raw_max_bytes,
+        config.limits.ws_inflight_bytes,
+        config.limits.ws_inflight_requests,
+        config.limits.ws_raw_queue,
     );
     // The driver picks itself inside `server::http::entry`; the composition
     // root only hands over the control plumbing it owns.
@@ -202,10 +209,10 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     drop(control);
     #[cfg(not(feature = "http"))]
     let raw_hub = crate::rawhub::RawHub::new(
-        crate::limits::current().ws_raw_max_bytes,
-        crate::limits::current().ws_inflight_bytes,
-        crate::limits::current().ws_inflight_requests,
-        crate::limits::current().ws_raw_queue,
+        config.limits.ws_raw_max_bytes,
+        config.limits.ws_inflight_bytes,
+        config.limits.ws_inflight_requests,
+        config.limits.ws_raw_queue,
     );
     #[cfg(not(feature = "http"))]
     let api: Option<Arc<Api>> = None;
@@ -565,13 +572,8 @@ impl Daemon {
                 slots.insert(service.id.clone(), slot);
             }
         }
-        let (temp_retention, temp_cleanup_interval_ms) = match settings::current() {
-            Ok(settings) => (
-                settings.temp_retention(),
-                settings.temp_cleanup_interval().as_millis() as u64,
-            ),
-            Err(_) => (crate::settings::Settings::default().temp_retention(), 0),
-        };
+        let temp_retention = config.settings.temp_retention();
+        let temp_cleanup_interval_ms = config.settings.temp_cleanup_interval().as_millis() as u64;
         let services_fingerprint = services_fingerprint(&config.paths.services_dir);
         let mut launchers = Launchers::default();
         launchers.register("builtin", Box::new(crate::builtin_adapter::BuiltinLauncher));

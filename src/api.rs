@@ -42,7 +42,6 @@ use crate::server::http::engine::HttpRequest;
 use crate::server::http::engine::{
     keep_alive_response, wants_keep_alive, wants_keep_alive_head,
 };
-use crate::settings;
 use crate::threads;
 use crate::webui;
 
@@ -73,11 +72,9 @@ pub fn spawn(
     raw_hub: Arc<crate::rawhub::RawHub>,
     control: crate::channel::ControlBinding,
 ) -> std::io::Result<Arc<Api>> {
-    let configured = settings::current().ok().and_then(|settings| settings.bind);
+    let configured = config.settings.bind;
     let requested = resolve_bind(std::env::var("SVCD_BIND").ok().as_deref(), configured);
-    let password_hash = settings::current()
-        .ok()
-        .and_then(|settings| settings.auth_passwd.clone());
+    let password_hash = config.settings.auth_passwd.clone();
 
     // A LAN bind without a password would expose an unauthenticated API. Keep
     // the daemon reachable on loopback so the operator can still run
@@ -235,6 +232,10 @@ fn serve_plugin_ui(
 /// The composition root's pre-body stream faces. The server loop holds this
 /// trait object instead of depending on the face layer directly.
 struct PreBodyFaces {
+    /// Read through the trait object by the poll-loop driver; the thread
+    /// driver uses `serve_plugin_ui` instead, so a non-Unix build has no
+    /// reader for it.
+    #[cfg_attr(not(unix), allow(dead_code))]
     config: Arc<Config>,
 }
 

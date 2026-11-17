@@ -2301,13 +2301,6 @@ mod tests {
         super::verify_bytes_with_fallback(bytes, allow_insecure, trust_dir())
     }
 
-    fn inspect_bytes_with(
-        bytes: &[u8],
-        public_key: Option<&[u8]>,
-    ) -> Result<Inspection, ProblemError> {
-        super::inspect_bytes_with(bytes, public_key, trust_dir())
-    }
-
     fn stager(staging: PathBuf, allow_insecure: bool, max_bytes: u64) -> StagingInstaller {
         StagingInstaller::new(staging, allow_insecure, max_bytes, trust_dir())
     }
