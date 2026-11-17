@@ -9,7 +9,7 @@
 use std::io;
 
 pub(crate) use crate::server::http::conn::{
-    ControlPlumbing, ServerHandle, StartInput, ThreadDriver,
+    ServerHandle, StartInput, ThreadDriver,
 };
 
 /// The driver this host runs. This alias is the only platform choice left.

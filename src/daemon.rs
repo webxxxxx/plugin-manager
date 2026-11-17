@@ -138,21 +138,16 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
 
     let (tx, rx) = mpsc::sync_channel(channel::PENDING_QUEUE_LIMIT);
     let wake = Arc::new(Wake::new());
-    // The server loop owns the control listener on Unix; Windows keeps its
-    // thread-per-connection fallback.
-    #[cfg(unix)]
-    let control = match channel::bind_server(&config) {
-        Ok(listener) => listener,
+    // One path on every host: the channel binds the endpoint and either hands
+    // the listener to the server loop (Unix) or starts its own accept thread
+    // (Windows). The composition root only sees the resulting server.
+    let control = match channel::bind_server(&config, tx, wake.clone()) {
+        Ok(control) => control,
         Err(error) => {
             log::svcd(&format!("svcd: cannot bind control channel: {}", error));
             return 1;
         }
     };
-    #[cfg(not(unix))]
-    if let Err(error) = channel::spawn_server(&config, tx.clone(), wake.clone()) {
-        log::svcd(&format!("svcd: cannot bind control channel: {}", error));
-        return 1;
-    }
     #[cfg(feature = "http")]
     let raw_hub = crate::rawhub::RawHub::new(
         crate::limits::current().ws_raw_max_bytes,
@@ -163,23 +158,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     // The driver picks itself inside `server::http::entry`; the composition
     // root only hands over the control plumbing it owns.
     #[cfg(feature = "http")]
-    let control_plumbing = {
-        #[cfg(unix)]
-        {
-            Some(crate::server::http::entry::ControlPlumbing {
-                listener: control,
-                pending: tx.clone(),
-                wake: wake.clone(),
-            })
-        }
-        #[cfg(not(unix))]
-        {
-            // The thread driver owns no control listener to merge.
-            None
-        }
-    };
-    #[cfg(feature = "http")]
-    let api = match api::spawn(config.clone(), raw_hub.clone(), control_plumbing) {
+    let api = match api::spawn(config.clone(), raw_hub.clone(), control) {
         Ok(api) => Some(api),
         Err(error) => {
             #[cfg(unix)]
@@ -197,14 +176,17 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         }
     };
     #[cfg(all(unix, not(feature = "http")))]
-    let control_loop =
-        match crate::server::control::spawn_control_only(control, tx.clone(), wake.clone()) {
-            Ok(handle) => handle,
-            Err(error) => {
-                log::svcd(&format!("svcd: cannot start server loop: {}", error));
-                return 1;
-            }
-        };
+    let control_loop = match crate::server::control::spawn_control_only(control) {
+        Ok(handle) => handle,
+        Err(error) => {
+            log::svcd(&format!("svcd: cannot start server loop: {}", error));
+            return 1;
+        }
+    };
+    // A host whose control loop already started (Windows) has nothing left to
+    // hand over: the accept thread owns the server from `bind_server` on.
+    #[cfg(all(not(unix), not(feature = "http")))]
+    drop(control);
     #[cfg(not(feature = "http"))]
     let raw_hub = crate::rawhub::RawHub::new(
         crate::limits::current().ws_raw_max_bytes,

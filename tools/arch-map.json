@@ -31,7 +31,7 @@
     "rpc": { "concept": "wire/message", "layer": "wire" },
     "reactor": { "concept": "wire/contract", "layer": "wire" },
     "rawhub": { "concept": "wire/contract", "layer": "wire" },
-    "channel": { "concept": "wire/control", "layer": "wire", "note": "控制面客户端与服务端混在一个文件" },
+    "channel": { "concept": "wire/control", "layer": "wire", "note": "客户端轮次与 token 在 channel.rs；平台实现收在 channel/platform/{unix,windows}.rs，channel.rs 无平台 cfg（#143）" },
 
     "package": { "concept": "manage/format", "layer": "domain" },
     "bundle": { "concept": "manage/ops", "layer": "domain" },

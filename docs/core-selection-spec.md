@@ -216,7 +216,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 ### 3.1 控制通道
 
 - 一套 **JSON-RPC 2.0 + NDJSON** 信封跑三条链路：插件 stdio、`svc`/`mcp` 的 UDS / 命名管道、UI 的 `POST /plugin-ui/{id}/{token}/rpc`。这三条是控制面；HTTP 的 `/mcp` 与 `/api/v1` 是另外两个面（§3.4 / §3.5），不复用 NDJSON 分帧。
-- `svc`/`svcd` 的本地管理通道用 UDS（Unix）/命名管道（Windows）上的 NDJSON；启动时生成 `<config>/svcd.token`（0640），请求携带该 token。Unix socket 0660；Windows 管道 ACL 仍是默认值，C8 的组授权细化随该边界实现补齐。
+- `svc`/`svcd` 的本地管理通道用 UDS（Unix）/命名管道（Windows）上的 NDJSON；启动时生成 `<config>/svcd.token`（0640），请求携带该 token。Unix socket 0660；Windows 管道 ACL 仍是默认值，C8 的组授权细化落在 `channel/platform/windows.rs` 的权限 seam 上补齐（#143 已把该 seam 建好）。
 - 帧：UTF-8、LF、禁内嵌换行与 BOM；Windows 二进制模式；单帧上限 1 MiB，超限 = 协议违规，按崩溃路径杀进程。
 - 流控：每插件在途 64、排队 128；超出 `-32000 busy`；单请求默认 30s，超时先发 `notifications/cancelled` 再回错；id 用 svcd 侧单调 u64。
 - 插件 → svcd 只允许响应与通知，不允许发请求（v1 不做双向 RPC）；stdout 只走协议帧，stderr 是行式日志；stdout EOF = 退出。
@@ -318,11 +318,11 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 | --- | --- | --- | --- |
 | `proc` | `spawn / request_stop(polite / force) / wait_exit / liveness` | fork+subreaper vs CreateProcess+Job | cfg 模块 |
 | `wait` | `wait(&[Handle], timeout) -> Ready` | poll(2) vs IOCP/线程 | driver |
-| `channel` | `bind(Channel) -> Listener -> Read+Write` | UDS vs 命名管道 + DACL | cfg 工厂 |
+| `channel` | `ControlChannel { bind / serve / connect / remove_socket / set_private }` | UDS vs 命名管道 + DACL | `channel/platform/{unix,windows}.rs`，编译期 trait（无运行时分发；#143） |
 | `install` | `plan(os) -> InstallPlan { files, commands }` | 有，但是数据 | 纯数据 |
 | `webview` | webview/webview 薄包装 | 无 | 桌面独占 |
 
-- 零 trait：同一构建只有一份实现、差异是一次性 syscall 映射，trait 没有运行时收益；可测性靠「纯决策核」（`Action` 枚举 + 派发），不靠 fake。
+- 零运行时 trait：同一构建只有一份实现、差异是一次性 syscall 映射，trait 没有运行时收益；#140 / #143 的编译期 seam（`ConnectionDriver` / `ControlChannel`）是单一实现的静态接口，不做 dyn 分发，可测性仍靠「纯决策核」（`Action` 枚举 + 派发），不靠 fake。
 - Unix 与嵌入式共用一条同步循环（单线程，`wait` 唯一 OS 触点，timer 线性扫描，不引 mio/tokio）；Windows 桌面走独立 driver。
 - Windows 两条事实外溢：`WaitForMultipleObjects` 64 句柄上限（每插件 3 个 ≈ 20 插件封顶）；管道没有「可读」可等待态，数据就绪靠 overlapped I/O 或线程。
 - 事件只认 `ShutdownRequested / ChildExited / Inbound`；Unix 用 self-pipe（不用 signalfd），Windows 用控制处理器线程 → event。
