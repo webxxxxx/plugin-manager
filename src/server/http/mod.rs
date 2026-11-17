@@ -34,8 +34,8 @@ pub(crate) use dispatch::{prepare_face_request, render_exchange};
 pub use pool::{BlockingPool, Busy, CancelToken, JobOutcome};
 #[allow(unused_imports)]
 pub use stream::{
-    BlockingJob, BlockingOutcome, CloseReason, FileSend, OutBuffer, StreamAction, StreamClass,
-    StreamEvent, StreamHandler, StreamStep,
+    BlockingJob, BlockingOutcome, CloseReason, FileSend, JobBudget, OutBuffer, StreamAction,
+    StreamClass, StreamEvent, StreamHandler, StreamStep,
 };
 
 /// Buffered-body limit for a request that reaches the ordinary router. Streamed

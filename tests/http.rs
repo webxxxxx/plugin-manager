@@ -1068,6 +1068,31 @@ fn daemon_with_web_event_plugin(key_byte: u8) -> (Sandbox, String) {
     (sandbox, address)
 }
 
+/// A signed plugin whose post-install hook writes `marker` and then sleeps for
+/// five seconds. The hook runs on the supervisor loop, so it holds the
+/// `plugin.install_staged` control round trip open long enough to disconnect.
+#[cfg(unix)]
+fn slow_hook_plugin_bundle(key: &SigningKey, marker: &Path) -> Vec<u8> {
+    let exec_path = "payload/bin/agent.sh".to_string();
+    let hook_path = "hooks/post-install.sh".to_string();
+    let hook = format!("#!/bin/sh\n: > '{}'\nsleep 5\n", marker.display());
+    let files: Vec<(String, Vec<u8>, u32)> = vec![
+        (exec_path.clone(), b"#!/bin/sh\nexit 0\n".to_vec(), 0o755),
+        (hook_path.clone(), hook.into_bytes(), 0o755),
+    ];
+    let manifest = json!({
+        "schema": 1,
+        "name": "slowhook",
+        "version": "1.0.0",
+        "desc": "slow post-install hook",
+        "platform": target(),
+        "protocol": 1,
+        "exec": {"path": exec_path, "args": [], "ready": "notify"},
+        "hooks": {"postInstall": hook_path},
+    });
+    signed_package(key, manifest, &files)
+}
+
 fn ws_key() -> String {
     BASE64.encode([0x42u8; 16])
 }
@@ -7656,3 +7681,72 @@ fn a_stuck_supervisor_answers_504_and_the_worker_recovers() {
     );
 }
 
+
+/// On Unix the install stream job runs on the shared blocking pool. A client
+/// that disconnects while `plugin.install_staged` is stuck in a post-install
+/// hook must release that worker: two other management calls then both reach a
+/// worker and time out at `control_timeout_secs`, instead of one queueing
+/// behind the dead install until the hook returns.
+#[cfg(unix)]
+#[test]
+fn a_disconnected_install_job_cancels_its_control_round_trip() {
+    let mut sandbox = Sandbox::new();
+    sandbox.allow_insecure_install_with("control_timeout_secs = 1\n");
+    let key = SigningKey::from_bytes(&[0x5b; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let marker = sandbox.root.join("install-hook-entered");
+    let package = slow_hook_plugin_bundle(&key, &marker);
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let mut install = TcpStream::connect(&address).expect("install connect");
+    let head = format!(
+        "POST /api/v1/plugins?strategy=replace HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        address,
+        package.len()
+    );
+    install.write_all(head.as_bytes()).expect("install head");
+    install.write_all(&package).expect("install body");
+    install.flush().expect("install flush");
+    wait_until_within(
+        &sandbox,
+        "the post-install hook did not start",
+        Duration::from_secs(3),
+        || marker.exists(),
+        || String::new(),
+    );
+    install
+        .shutdown(std::net::Shutdown::Both)
+        .expect("install shutdown");
+    drop(install);
+    // The FIN arrives while the install job is still in flight; the server
+    // flips the job's token and the job frees its worker on the next poll.
+    // Submitting the two probes immediately makes a missing cancellation show
+    // up as a queued request, which is what the bound below catches.
+    let started = Instant::now();
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let address = address.clone();
+        workers.push(std::thread::spawn(move || {
+            let began = Instant::now();
+            let response = request(&address, "GET", "/api/v1/services", "", b"");
+            (response, began.elapsed())
+        }));
+    }
+    for worker in workers {
+        let (response, elapsed) = worker.join().expect("management request");
+        assert_eq!(response.status, 504, "{}", response.body);
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "a cancelled install must free its worker, took {elapsed:?}"
+        );
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "both management calls must reach a worker"
+    );
+}

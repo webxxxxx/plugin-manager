@@ -172,7 +172,7 @@ impl DownloadStream {
         let target = self.target.clone();
         let slot = self.opened.clone();
         self.phase = Phase::Blocking;
-        StreamStep::wait(StreamAction::SubmitBlocking(Box::new(move || {
+        StreamStep::wait(StreamAction::SubmitBlocking(Box::new(move |_budget| {
             let opened = open_download(&headers, &target);
             *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(opened);
             BlockingOutcome::Ok(Vec::new())
@@ -795,7 +795,7 @@ mod tests {
                     reader.read_to_end(&mut all).expect("read file send");
                 }
                 StreamAction::SubmitBlocking(job) => {
-                    let outcome = job();
+                    let outcome = job(crate::server::http::JobBudget::for_test());
                     step = handler.on_event(
                         StreamEvent::BlockingDone(outcome),
                         &mut OutBuffer::new(&mut out, limit),
@@ -1038,7 +1038,7 @@ mod tests {
             panic!("the first Writable submits the open job");
         };
         let mut step = handler.on_event(
-            StreamEvent::BlockingDone(job()),
+            StreamEvent::BlockingDone(job(crate::server::http::JobBudget::for_test())),
             &mut OutBuffer::new(&mut out, 1024),
         );
         let mut sends = 0;
@@ -1084,7 +1084,7 @@ mod tests {
         let StreamAction::SubmitBlocking(job) = step.action else {
             panic!("the first Writable must submit the open job");
         };
-        job()
+        job(crate::server::http::JobBudget::for_test())
     }
 
     #[test]
@@ -1230,7 +1230,7 @@ mod tests {
         ));
         // The worker finished after the connection went away; the file it
         // opened is dropped with the shared slot and no bytes are written.
-        let outcome = job();
+        let outcome = job(crate::server::http::JobBudget::for_test());
         let late = handler.on_event(
             StreamEvent::BlockingDone(outcome),
             &mut OutBuffer::new(&mut out, 4096),

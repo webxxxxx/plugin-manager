@@ -102,6 +102,13 @@ impl StreamDriver {
         !self.blocked_on_write && self.job.is_none() && !self.awaiting
     }
 
+    /// Whether this stream owns a queued or running blocking job. Only that
+    /// state needs the half-close check: a handler that is merely blocked on
+    /// write may still have a response to deliver after the peer's FIN.
+    pub fn has_job(&self) -> bool {
+        self.job.is_some() || self.awaiting
+    }
+
     /// The handler asked the server to run a job. The server takes it exactly
     /// once and calls on_blocking_done when it finishes.
     pub fn take_job(&mut self) -> Option<BlockingJob> {
@@ -648,7 +655,7 @@ mod tests {
         fn on_event(&mut self, event: StreamEvent<'_>, out: &mut OutBuffer<'_>) -> StreamStep {
             match event {
                 StreamEvent::Data(_) => {
-                    StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|| {
+                    StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|_budget| {
                         BlockingOutcome::Ok(b"done".to_vec())
                     })))
                 }
@@ -699,7 +706,7 @@ mod tests {
     }
 
     fn job_result(job: BlockingJob) -> Vec<u8> {
-        match job() {
+        match job(crate::server::http::JobBudget::for_test()) {
             BlockingOutcome::Ok(bytes) => bytes,
             BlockingOutcome::Failed(message) => panic!("unexpected failure: {message}"),
         }
@@ -714,7 +721,7 @@ mod tests {
             fn on_event(&mut self, event: StreamEvent<'_>, out: &mut OutBuffer<'_>) -> StreamStep {
                 match event {
                     StreamEvent::Data(_) => {
-                        StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|| {
+                        StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|_budget| {
                             BlockingOutcome::Ok(b"one".to_vec())
                         })))
                     }
@@ -722,7 +729,7 @@ mod tests {
                         self.calls += 1;
                         out.write(&bytes);
                         if self.calls == 1 {
-                            StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|| {
+                            StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|_budget| {
                                 BlockingOutcome::Ok(b"two".to_vec())
                             })))
                         } else {
@@ -768,7 +775,7 @@ mod tests {
         fn on_event(&mut self, event: StreamEvent<'_>, _out: &mut OutBuffer<'_>) -> StreamStep {
             match event {
                 StreamEvent::Data(_) => StreamStep::wait(StreamAction::SubmitBlocking(Box::new(
-                    || BlockingOutcome::Ok(Vec::new()),
+                    |_budget| BlockingOutcome::Ok(Vec::new()),
                 ))),
                 StreamEvent::BlockingDone(_) => StreamStep::wait(StreamAction::NeedRead),
                 _ => StreamStep::wait(StreamAction::Continue),

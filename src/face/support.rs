@@ -15,14 +15,14 @@ use serde_json::{json, Value};
 use crate::channel;
 use crate::http;
 use crate::package;
-use crate::server::http::{CancelToken, Request};
+use crate::server::http::{CancelToken, JobBudget, Request};
 
 /// The control-channel budget a face request carries.
 ///
 /// A blocking route always has a deadline stamped by the server; an inline
 /// route has none and keeps the CLI-style round trip. \`cancel\` is the pool's
 /// per-job token, flipped when the client disconnects or the pool shuts down.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct CallBudget {
     pub deadline: Option<Instant>,
     pub cancel: Option<CancelToken>,
@@ -36,10 +36,26 @@ impl CallBudget {
         }
     }
 
-    /// A request outside a server route: the CLI and the install/import streams
-    /// keep their existing unbounded control round trip.
-    pub fn unbounded() -> CallBudget {
-        CallBudget::default()
+    /// A stream job's budget: the pool's disconnect token plus the connection's
+    /// no-progress deadline. Stream jobs that call the control channel use
+    /// this; a deadline shorter than the connection's would report a failure
+    /// the client could no longer receive.
+    pub fn from_job(job: &JobBudget) -> CallBudget {
+        CallBudget {
+            deadline: Some(job.deadline),
+            cancel: Some(job.cancel.clone()),
+        }
+    }
+
+    /// A short follow-up call after a successful long one. It keeps the
+    /// disconnect token but gets its own management budget, so an install that
+    /// consumed the stream deadline can still disable a plugin instead of
+    /// starting the follow-up with an expired deadline.
+    pub fn follow_up(&self) -> CallBudget {
+        CallBudget {
+            deadline: Some(Instant::now() + crate::limits::current().control_timeout),
+            cancel: self.cancel.clone(),
+        }
     }
 }
 
@@ -215,4 +231,57 @@ pub(crate) fn error(status: u16, code: &str, message: &str) -> Vec<u8> {
 
 pub(crate) fn decode(value: &str) -> String {
     http::percent_decode(value, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stream-job handoff must carry both halves of the budget: a job that
+    /// only got a deadline would keep a disconnected install alive, and one
+    /// that only got the token would keep a stuck supervisor forever.
+    #[test]
+    fn a_stream_job_budget_carries_the_pool_token_and_deadline() {
+        let job = JobBudget::for_test();
+        let budget = CallBudget::from_job(&job);
+        assert_eq!(budget.deadline, Some(job.deadline));
+        assert!(budget.cancel.is_some());
+        assert!(!budget.cancel.unwrap().is_cancelled());
+    }
+
+    /// The install/import helpers call this exact function with the stream
+    /// job budget. An expired budget must project 504 timeout instead of
+    /// blocking on a supervisor that does not answer.
+    #[cfg(unix)]
+    #[test]
+    fn an_expired_stream_budget_projects_504() {
+        use std::os::unix::net::UnixListener;
+
+        let root = crate::test_support::temp_dir().join(format!(
+            "svcd-support-budget-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("config dir");
+        std::fs::write(root.join("svcd.token"), "test-token\n").expect("token");
+        let listener = UnixListener::bind(root.join("svcd.sock")).expect("listener");
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept");
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        });
+        let budget = CallBudget {
+            deadline: Some(Instant::now()),
+            cancel: None,
+        };
+        let failure = rpc_result(&root, "svcd.ping", json!({}), &budget)
+            .expect_err("an expired budget must fail");
+        assert_eq!(failure.0, 504);
+        assert_eq!(failure.1, "timeout");
+        assert!(failure.2.contains("timed out"), "{}", failure.2);
+        server.join().expect("server");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

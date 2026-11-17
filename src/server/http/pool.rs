@@ -67,6 +67,13 @@ impl CancelToken {
         }
     }
 
+    /// A token that can never fire, for a path that has no disconnect signal
+    /// to flip (the Windows inline stream fallback).
+    #[cfg_attr(unix, allow(dead_code))] // only the Windows fallback needs it in production.
+    pub(crate) fn never() -> CancelToken {
+        CancelToken::new()
+    }
+
     /// Whether the server already dropped this request's completion.
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
