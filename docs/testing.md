@@ -156,6 +156,26 @@ Windows 保留副本（建符号链接需要权限）。`tests/cli.rs` 对并发
 `node tools/check.mjs full`（以及 `... test <filter>`）默认带同一个参数，所以本地红与 CI 红同义，
 不需要判断「是不是环境噪声」。只有显式 `--parallel` 才并行，那时执行顺序不由工具承诺。
 
+### 并行档（`--parallel`）的定位
+
+`--parallel` 只用于调试：它去掉 `--test-threads=1`，让同一个 target 的用例并发跑，更容易把
+顺序、端口、进程生命周期上的问题暴露出来。**并行档全绿不是门**——门是 CI 与默认档（串行），
+两者同参；并行档红的时候先判断它是真的红，再当回归处理。
+
+并行档里出现过的两类假红（#155）现在都用可判定的方式表达：
+
+- **进程实例**：并行负载下 OS 会把回收的 pid 交给无关进程，`pid_alive` 说「还活着」不代表
+  还是原来那个实例。断言「这个实例死了」要用 `ProcessInstance`（pid + 创建时间，
+  `is_alive` / `is_replaced_by`），不要只比较 pid；空闲 pid 回收得很快（Windows 上几百次
+  spawn 就能命中同一个号），所以「读 pid 再读存活」这种两步判断也会把新持有者误判成旧实例。
+- **准入**：`max_connections = 1` 的 sandbox 里，daemon 要等上一个连接线程返回才释放槽位，
+  被拒的连接又是不读请求就关闭，Windows 会把它变成 reset 并丢掉 busy 回包（客户端只看到
+  0 字节）。探针要按 `ADMISSION_WAIT` 有界重试，不能假设「上一个连接已经释放」，也不要用
+  2 s 硬上限。
+
+判读并行档的红时，`node tools/check.mjs full --parallel` 的摘要现在保留 panic 下面的消息行
+（key / request / expected / actual），先读那几行再决定是不是要按 `/diagnosing-bugs` 定位。
+
 ### 安装测试的角色与宿主隔离
 
 `tests/install.rs` 不能假设 runner 的真实身份（CI 是普通用户，WSL runbook 是 root），也不能改宿主的 PATH：
