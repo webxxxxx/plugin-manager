@@ -80,6 +80,14 @@ pub fn run_if_service(
     run_daemon: fn(Option<PathBuf>) -> i32,
     request_shutdown: fn(),
 ) -> Option<i32> {
+    // The SCM thread calls `paths::config_dir()` (the readiness probe) before the
+    // daemon thread applies `--conf`. Resolve the explicit config first, or the
+    // default value wins the `SETTINGS` slot and the daemon silently ignores it.
+    if let Some(path) = conf.as_deref() {
+        if path.is_file() {
+            let _ = crate::settings::init_from_path(path);
+        }
+    }
     let _ = SERVICE_CONF.set(conf);
     let _ = DAEMON_RUN.set(run_daemon);
     let _ = DAEMON_SHUTDOWN.set(request_shutdown);
