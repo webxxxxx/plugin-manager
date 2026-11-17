@@ -2303,7 +2303,7 @@ impl Daemon {
                     if self.now_ms() >= global_deadline {
                         for slot in self.slots.values_mut() {
                             if !matches!(slot.machine.state, State::Stopped | State::Failed) {
-                                slot.signal_force();
+                                slot.signal_force("daemon shutdown past its global budget");
                             }
                         }
                         break 'layers;
@@ -2311,7 +2311,7 @@ impl Daemon {
                     for id in &active {
                         if !matches!(self.slots[id].machine.state, State::Stopped | State::Failed) {
                             if let Some(slot) = self.slots.get_mut(id) {
-                                slot.signal_force();
+                                slot.signal_force("daemon shutdown per-layer timeout");
                             }
                         }
                     }
