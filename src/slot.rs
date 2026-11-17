@@ -22,7 +22,7 @@ use crate::wake::Wake;
 /// Per-plugin in-flight cap from ticket #31. The full spec also describes a
 /// 128-slot queue behind this cap; the ticket scopes this tracer bullet to the
 /// in-flight cap, so a 65th concurrent call is rejected as busy instead.
-pub(crate) const MAX_IN_FLIGHT: usize = 64;
+pub(crate) const MAX_IN_FLIGHT: usize = crate::kernel::contract::MAX_IN_FLIGHT;
 /// Bounded hand-off from a caller's thread to the slot event loop. A full queue
 /// is backpressure ('Busy'), not unbounded memory growth.
 pub(crate) const CALL_QUEUE: usize = 256;

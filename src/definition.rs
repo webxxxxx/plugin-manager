@@ -253,6 +253,8 @@ fn load_scripts(
             None
         };
         let enabled = !dir.join(format!("{}.disabled", id)).exists();
+        let contract =
+            crate::registry::contract_for(&id, "1.0.0", Vec::new(), crate::registry::Carrier::Slot);
         let service = Service {
             id: id.clone(),
             kind: Kind::Core,
@@ -260,7 +262,7 @@ fn load_scripts(
             protocol: 1,
             desc: format!("script service: {}", file.clone().unwrap_or_default()),
             deps: Vec::new(),
-            caps: Vec::new(),
+            contract,
             impl_ref: None,
             exec: Some(Exec {
                 path: path_text.clone(),
@@ -511,6 +513,12 @@ fn validate(definition: CoreDefinition) -> Result<Service, String> {
         }
     }
 
+    let contract = crate::registry::contract_for(
+        &definition.id,
+        &definition.version,
+        Vec::new(),
+        crate::registry::Carrier::Slot,
+    );
     Ok(Service {
         id: definition.id,
         kind: Kind::Core,
@@ -518,7 +526,7 @@ fn validate(definition: CoreDefinition) -> Result<Service, String> {
         protocol: definition.protocol,
         desc: definition.desc,
         deps: definition.dependencies,
-        caps: Vec::new(),
+        contract,
         impl_ref: None,
         exec: Some(Exec {
             path: definition.exec.path,
@@ -735,7 +743,19 @@ mod tests {
         assert_eq!(demo.state, State::Stopped);
         assert_eq!(demo.version, "1.0.0");
         assert_eq!(demo.deps, Vec::<String>::new());
-        assert!(demo.caps.is_empty());
+        assert!(demo.contract.surface().is_empty());
+        assert!(!demo
+            .contract
+            .failures
+            .contains(&crate::kernel::failure::Class::Cancelled));
+        assert_eq!(
+            demo.contract.failures.len(),
+            crate::kernel::failure::Class::ALL.len() - 1
+        );
+        assert_eq!(
+            demo.contract.limits.max_in_flight,
+            crate::kernel::contract::MAX_IN_FLIGHT
+        );
         assert!(demo.enabled);
         assert_eq!(demo.exec.as_ref().expect("exec").ready, Ready::Exec);
         let svc = loaded.registry.get(RESERVED_ID).expect("built-in svc");
@@ -1082,7 +1102,7 @@ mod tests {
         assert!(loaded.issues.is_empty(), "issues: {:?}", loaded.issues);
         let demo = loaded.registry.get("demo").expect("demo");
         assert_eq!(demo.kind, Kind::Core);
-        assert!(demo.caps.is_empty());
+        assert!(demo.contract.surface().is_empty());
         assert_eq!(demo.version, "1.0.0");
         assert!(demo.enabled);
         let exec = demo.exec.as_ref().expect("exec");
