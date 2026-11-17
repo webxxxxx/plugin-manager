@@ -694,7 +694,7 @@ impl Slot {
                         self.signal_polite();
                     }
                 }
-                Action::SignalForce => self.signal_force(),
+                Action::SignalForce => self.signal_force("stop timeout"),
                 Action::ArmStop => {
                     self.stop_deadline = Some(now.saturating_add(supervisor::STOP_TIMEOUT_MS));
                 }
@@ -769,6 +769,10 @@ impl Slot {
             }
         }
         let pid = child.id();
+        log::svcd(&format!(
+            "svcd: {}: spawned pid {} (ready={:?})",
+            self.id, pid, self.exec.ready
+        ));
         let log = match LogSink::open(&self.paths.logs_dir, &self.id, &self.limits) {
             Ok(sink) => Some(Arc::new(Mutex::new(sink))),
             Err(error) => {
@@ -873,7 +877,28 @@ impl Slot {
             "params": {},
         })
         .to_string();
-        let _ = self.write_json_frame(&line, ipc::CONTROL_FRAME_MAX);
+        if let Err(error) = self.write_json_frame(&line, ipc::CONTROL_FRAME_MAX) {
+            log::svcd(&format!(
+                "svcd: {}: ready ping {} write failed: {}",
+                self.id, id, error
+            ));
+        }
+    }
+
+    /// One line of readiness-handshake state for the start-timeout log.
+    ///
+    /// Read-only: the start wait calls it just before reporting a timeout, so a
+    /// failure names which hop stalled instead of only saying "timed out".
+    pub(crate) fn handshake_snapshot(&self) -> String {
+        format!(
+            "state={:?} pid={:?} ping_id={} stdin={} frames={} start_deadline={:?}",
+            self.machine.state,
+            self.machine.pid,
+            self.ping_id,
+            if self.stdin.is_some() { "open" } else { "closed" },
+            if self.frames.is_some() { "attached" } else { "none" },
+            self.start_deadline,
+        )
     }
 
     fn write_json_frame(&mut self, frame: &str, max: usize) -> std::io::Result<()> {
@@ -925,6 +950,7 @@ impl Slot {
                 } else {
                     // Core scripts may print to stdout; keep those lines in the
                     // service log for diagnosis.
+                    self.note_frame_during_start("not a JSON object", line);
                     self.log_service(line);
                 }
                 return;
@@ -946,15 +972,33 @@ impl Slot {
             if self.protocol_only {
                 self.protocol_violation("stdout frame has no method or response id");
             } else {
+                self.note_frame_during_start("no method or response id", line);
                 self.log_service(line);
             }
             return;
         };
-        if self.machine.state == State::Starting && id == self.ping_id {
-            if let Some(pid) = self.machine.pid {
-                self.apply(Event::Ready { pid }, now);
+        if self.machine.state == State::Starting {
+            if id == self.ping_id {
+                match self.machine.pid {
+                    Some(pid) => {
+                        log::svcd(&format!(
+                            "svcd: {}: ready ping {} answered by pid {}",
+                            self.id, id, pid
+                        ));
+                        self.apply(Event::Ready { pid }, now);
+                    }
+                    None => log::svcd(&format!(
+                        "svcd: {}: ready ping {} answered before the pid was known; dropped",
+                        self.id, id
+                    )),
+                }
+                return;
             }
-            return;
+            // Not the ready reply; the pending-call path below keeps its own log.
+            log::svcd(&format!(
+                "svcd: {}: frame id {} during Starting is not the ready ping {}",
+                self.id, id, self.ping_id
+            ));
         }
         self.complete_pending(id, &message);
     }
@@ -1136,7 +1180,7 @@ impl Slot {
                 "svcd: {}: stdout closed; treating the plugin as exited",
                 self.id
             ));
-            self.signal_force();
+            self.signal_force("stdout closed");
         }
     }
 
@@ -1147,7 +1191,22 @@ impl Slot {
         ));
         self.log_service(&format!("protocol violation: {}", reason));
         self.fail_pending("plugin protocol violation");
-        self.signal_force();
+        self.signal_force("protocol violation");
+    }
+
+    /// Readiness window only: note a stdout line that cannot become Ready.
+    ///
+    /// Bounded to `Starting` on purpose: the steady-state call path must stay
+    /// silent, and this is the only window where a stray line blocks a start.
+    fn note_frame_during_start(&self, reason: &str, line: &str) {
+        if self.machine.state != State::Starting {
+            return;
+        }
+        let excerpt: String = line.chars().take(200).collect();
+        log::svcd(&format!(
+            "svcd: {}: stdout during Starting is not usable for ready ({}): {}",
+            self.id, reason, excerpt
+        ));
     }
 
     fn log_service(&self, line: &str) {
@@ -1168,6 +1227,7 @@ impl Slot {
                 return;
             }
             // An adopted process is not our child, so there is no exit status.
+            self.note_exit(pid, None, "adopted, group gone");
             self.clear_process();
             self.apply(Event::Exited { pid, code: None }, now);
             return;
@@ -1186,6 +1246,7 @@ impl Slot {
                 return;
             }
             if let Some(pid) = pid {
+                self.note_exit(pid, status.code(), "try_wait");
                 self.clear_process();
                 self.apply(
                     Event::Exited {
@@ -1205,9 +1266,19 @@ impl Slot {
         }
         self.pending_exit = None;
         if let Some(pid) = self.machine.pid {
+            self.note_exit(pid, code, "pending exit");
             self.clear_process();
             self.apply(Event::Exited { pid, code }, now);
         }
+    }
+
+    /// One line per settled exit: the code decides restart vs stop, so the
+    /// daemon log must carry it instead of only the resulting state.
+    fn note_exit(&self, pid: u32, code: Option<i32>, how: &str) {
+        log::svcd(&format!(
+            "svcd: {}: exit pid {} code {:?} while {:?} ({})",
+            self.id, pid, code, self.machine.state, how
+        ));
     }
 
     /// True while any process of the service (not just the leader) is alive.
@@ -1353,7 +1424,7 @@ impl Slot {
             // instead of burning the whole stop window and force-killing anyway.
             #[cfg(windows)]
             if self.stdin.is_none() {
-                self.signal_force();
+                self.signal_force("stop hook finished and stdin already closed");
                 return;
             }
             self.signal_polite();
@@ -1382,7 +1453,16 @@ impl Slot {
 
     fn signal_polite(&mut self) {
         let line = rpc::notification("svcd.shutdown", json!({}));
-        let _ = self.write_json_frame(&line, ipc::CONTROL_FRAME_MAX);
+        match self.write_json_frame(&line, ipc::CONTROL_FRAME_MAX) {
+            Ok(()) => log::svcd(&format!(
+                "svcd: {}: polite stop: shutdown frame written, stdin closed",
+                self.id
+            )),
+            Err(error) => log::svcd(&format!(
+                "svcd: {}: polite stop: shutdown frame failed ({}), stdin closed",
+                self.id, error
+            )),
+        }
         self.stdin = None;
         #[cfg(unix)]
         {
@@ -1400,13 +1480,22 @@ impl Slot {
     fn stop_without_hook(&mut self) {
         #[cfg(windows)]
         if self.stdin.is_none() {
-            self.signal_force();
+            self.signal_force("no stop hook and stdin already closed");
             return;
         }
         self.signal_polite();
     }
 
-    pub(crate) fn signal_force(&mut self) {
+    pub(crate) fn signal_force(&mut self, reason: &str) {
+        log::svcd(&format!(
+            "svcd: {}: force stop ({}): state {:?}, pid {:?}, stdin {}, child {}",
+            self.id,
+            reason,
+            self.machine.state,
+            self.machine.pid,
+            if self.stdin.is_some() { "open" } else { "closed" },
+            if self.child.is_some() { "held" } else { "none" },
+        ));
         self.abort_stop_hook();
         // The leader may already be gone; the tree guard still owns the rest
         // (on Unix that is the process group handled below).
@@ -1435,11 +1524,15 @@ impl Slot {
                 self.id, self.machine.failures
             ));
         }
-        self.signal_force();
+        self.signal_force("give up");
         self.clear_process();
     }
 
     fn clear_process(&mut self) {
+        log::svcd(&format!(
+            "svcd: {}: clear process (state {:?}, pid {:?})",
+            self.id, self.machine.state, self.machine.pid
+        ));
         self.fail_pending("service exited");
         self.stdio.unregister(&self.id);
         if let Some(hub) = &self.raw_hub {

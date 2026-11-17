@@ -48,6 +48,12 @@ use crate::platform::host::wake::Wake;
 /// tick: the poll doubles as the wait for shutdown and the loop's timers.
 const POLL_WAIT: Duration = Duration::from_millis(50);
 
+/// Anything that holds the single supervisor loop longer than this is logged.
+///
+/// The loop is serial, so one slow phase delays every other caller; the 30 s
+/// management deadline then shows up as a 504 far from the real cause.
+const SLOW_LOOP_MS: u64 = 1_000;
+
 pub fn run(conf: Option<PathBuf>) -> i32 {
     // The directory set has to exist before `ensure_conf` can report the path
     // it settled on. Read the explicit document once when it exists; the
@@ -809,7 +815,16 @@ impl Daemon {
         }
     }
 
+    /// Log a loop phase that ran past [`SLOW_LOOP_MS`].
+    fn note_slow(&self, what: &str, started: Instant) {
+        let elapsed = started.elapsed();
+        if elapsed >= Duration::from_millis(SLOW_LOOP_MS) {
+            log::svcd(&format!("svcd: {} held the loop for {:?}", what, elapsed));
+        }
+    }
+
     fn start_enabled(&mut self, clock: &Clock) {
+        let started = Instant::now();
         let mut eligible = Vec::new();
         for id in self.slots.keys().cloned().collect::<Vec<_>>() {
             let enabled = self
@@ -837,12 +852,14 @@ impl Daemon {
             }
         }
         if eligible.is_empty() {
+            self.note_slow("start_enabled", started);
             return;
         }
         let layers = match start_layers(&self.registry, &eligible) {
             Ok(layers) => layers,
             Err(error) => {
                 log::svcd(&format!("svcd: start enabled: {}", error));
+                self.note_slow("start_enabled", started);
                 return;
             }
         };
@@ -855,6 +872,7 @@ impl Daemon {
                 log::svcd(&format!("svcd: start enabled: {}", error));
             }
         }
+        self.note_slow("start_enabled", started);
     }
 
     fn event_loop(&mut self, clock: &Clock) {
@@ -891,13 +909,18 @@ impl Daemon {
     /// snapshot, so a pass cannot mix two clock reads. The clock is only needed
     /// because a due rescan reconciles by blocking on start / stop.
     fn tick(&mut self, now: Now, clock: &Clock) {
+        let started = Instant::now();
         self.pump(now);
+        self.note_slow("pump", started);
         if self.rescan_interval_ms > 0 && now.mono_ms >= self.next_rescan_ms {
             self.next_rescan_ms = now.mono_ms.saturating_add(self.rescan_interval_ms);
+            let started = Instant::now();
             self.rescan_if_changed(clock);
+            self.note_slow("rescan", started);
         }
         if self.temp_cleanup_interval_ms > 0 && now.mono_ms >= self.next_temp_cleanup_ms {
             self.next_temp_cleanup_ms = now.mono_ms.saturating_add(self.temp_cleanup_interval_ms);
+            let started = Instant::now();
             match crate::platform::storage::blob::cleanup(&self.config.paths, self.temp_retention) {
                 Ok(0) => {}
                 Ok(removed) => {
@@ -905,6 +928,7 @@ impl Daemon {
                 }
                 Err(error) => log::svcd(&format!("svcd: temp cleanup failed: {}", error)),
             }
+            self.note_slow("temp cleanup", started);
         }
         if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
             self.shutdown = true;
@@ -941,6 +965,7 @@ impl Daemon {
     }
 
     fn handle(&mut self, clock: &Clock, incoming: channel::PendingCall) {
+        let started = Instant::now();
         let request = match rpc::parse(&incoming.line) {
             Ok(request) => request,
             Err(response) => {
@@ -948,8 +973,9 @@ impl Daemon {
                 return;
             }
         };
+        let method = request.method.clone();
         if incoming.endpoint == channel::Endpoint::User
-            && channel::Endpoint::for_method(&request.method) == channel::Endpoint::Admin
+            && channel::Endpoint::for_method(&method) == channel::Endpoint::Admin
         {
             let response = rpc::err_data(
                 request.id,
@@ -960,13 +986,14 @@ impl Daemon {
             let _ = incoming.reply.send(rpc::to_line(&response));
             return;
         }
-        match request.method.as_str() {
+        match method.as_str() {
             "registry.call" | "tools/call" => self.handle_tool_call(clock, request, incoming.reply),
             _ => {
                 let response = self.dispatch(clock, request);
                 let _ = incoming.reply.send(rpc::to_line(&response));
             }
         }
+        self.note_slow(&format!("request {}", method), started);
     }
 
     fn dispatch(&mut self, clock: &Clock, request: rpc::Request) -> rpc::Response {
@@ -1727,6 +1754,12 @@ impl Daemon {
                     format!("service {} is stopping", id),
                 ));
             }
+            if self.slots[id].machine.state == State::Starting {
+                log::svcd(&format!(
+                    "svcd: {}: start requested while already Starting; no new spawn for this call",
+                    id
+                ));
+            }
             let now = clock.now().mono_ms;
             self.slots
                 .get_mut(id)
@@ -1736,23 +1769,40 @@ impl Daemon {
 
         loop {
             self.pump(clock.now());
-            let mut all_running = true;
+            let mut all_settled = true;
             for id in &pending {
-                match self.slots[id].machine.state {
-                    State::Running => {}
-                    State::Failed => {
-                        return Err(ProblemError::new(
-                            Problem::Internal,
-                            format!("service {} failed to start", id),
-                        ));
-                    }
-                    _ => all_running = false,
+                let state = self.slots[id].machine.state;
+                if state == State::Failed {
+                    return Err(ProblemError::new(
+                        Problem::Internal,
+                        format!("service {} failed to start", id),
+                    ));
+                }
+                if state == State::Stopped {
+                    // It reached ready and then exited cleanly before this
+                    // pass looked (`ready: exec` one-shots do exactly that).
+                    // Waiting for Running burns the whole window and then
+                    // reports a timeout for a start that did succeed.
+                    log::svcd(&format!(
+                        "svcd: {}: exited cleanly during start; the start is complete",
+                        id
+                    ));
+                }
+                if !start_settled(state) {
+                    all_settled = false;
                 }
             }
-            if all_running {
+            if all_settled {
                 return Ok(());
             }
             if clock.now().mono_ms >= deadline {
+                for id in &pending {
+                    log::svcd(&format!(
+                        "svcd: {}: start timed out waiting for ready ({})",
+                        id,
+                        self.slots[id].handshake_snapshot()
+                    ));
+                }
                 return Err(ProblemError::new(
                     Problem::Timeout,
                     format!("start timed out: {}", pending.join(", ")),
@@ -2305,6 +2355,7 @@ impl Daemon {
     }
 
     fn stop_all(&mut self, clock: &Clock) {
+        let started = Instant::now();
         let ids: Vec<String> = self.slots.keys().cloned().collect();
         let layers = start_layers(&self.registry, &ids).unwrap_or_else(|_| vec![ids]);
         let global_deadline = clock
@@ -2350,7 +2401,7 @@ impl Daemon {
                     if clock.now().mono_ms >= global_deadline {
                         for slot in self.slots.values_mut() {
                             if !matches!(slot.machine.state, State::Stopped | State::Failed) {
-                                slot.signal_force();
+                                slot.signal_force("daemon shutdown past its global budget");
                             }
                         }
                         break 'layers;
@@ -2358,7 +2409,7 @@ impl Daemon {
                     for id in &active {
                         if !matches!(self.slots[id].machine.state, State::Stopped | State::Failed) {
                             if let Some(slot) = self.slots.get_mut(id) {
-                                slot.signal_force();
+                                slot.signal_force("daemon shutdown per-layer timeout");
                             }
                         }
                     }
@@ -2367,6 +2418,7 @@ impl Daemon {
                 thread::sleep(Duration::from_millis(20));
             }
         }
+        self.note_slow("stop_all", started);
     }
 }
 
@@ -2635,6 +2687,16 @@ fn param_id(request: &rpc::Request) -> Result<String, rpc::Response> {
                 problem_data(Problem::Invalid),
             )
         })
+}
+
+/// `true` once a pending start needs no further wait.
+///
+/// `Stopped` counts: a service that reaches ready and then exits cleanly is
+/// finished starting, not still starting. Waiting for `Running` there costs the
+/// whole start window and reports a timeout for a start that did work — a
+/// `ready: "exec"` one-shot (`cmd /c exit 0`) hits this on every boot scan.
+fn start_settled(state: State) -> bool {
+    matches!(state, State::Running | State::Stopped)
 }
 
 fn start_layers(registry: &Registry, ids: &[String]) -> Result<Vec<Vec<String>>, ProblemError> {
@@ -3989,6 +4051,18 @@ while ($null -ne ($line = $reader.ReadLine())) {
             json!({"path": path.to_string_lossy(), "strategy": "replace"}),
         );
         assert_error_kind(&response, -32006, "unsupported_platform");
+    }
+
+    #[test]
+    fn a_clean_exit_settles_a_pending_start_instead_of_waiting_for_running() {
+        // Regression for #159: the wait used to accept only `Running`, so a
+        // one-shot that exited right after ready kept the loop busy until the
+        // deadline (30 s) and reported a timeout for a start that succeeded.
+        assert!(start_settled(State::Running));
+        assert!(start_settled(State::Stopped));
+        assert!(!start_settled(State::Starting));
+        assert!(!start_settled(State::Stopping));
+        assert!(!start_settled(State::Backoff));
     }
 
     #[test]

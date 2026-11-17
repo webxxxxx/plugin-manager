@@ -327,6 +327,14 @@ fn stop_wait_is_bounded_when_the_request_cannot_reach_the_daemon() {
 impl Drop for Sandbox {
     fn drop(&mut self) {
         self.shutdown();
+        // A red in this target otherwise loses the daemon side entirely: the
+        // harness keeps the service log but never the supervisor's stderr.
+        if std::thread::panicking() {
+            let log = self.daemon_log();
+            if !log.is_empty() {
+                eprintln!("daemon log:\n{}", log);
+            }
+        }
         let _ = fs::remove_dir_all(&self.root);
     }
 }

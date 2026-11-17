@@ -694,8 +694,9 @@ fn enable_disable_round_trip_and_boot_skip() {
     assert_eq!(
         restarted.status.code(),
         Some(0),
-        "explicit start of disabled service failed: {}",
-        String::from_utf8_lossy(&restarted.stderr)
+        "explicit start of disabled service failed: {}\n{}",
+        String::from_utf8_lossy(&restarted.stderr),
+        sandbox.daemon_log()
     );
     assert_eq!(sandbox.status("demo")["summary"]["enabled"], false);
     assert_eq!(sandbox.stop("demo").status.code(), Some(0));
