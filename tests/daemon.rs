@@ -487,6 +487,20 @@ fn stop_wait_is_bounded_when_the_request_cannot_reach_the_daemon() {
     assert!(sandbox.daemon.is_none(), "the handle must be consumed");
 }
 
+/// The channel authorizes by endpoint ACL now; a token left by the previous
+/// version must not survive a start.
+#[test]
+fn the_legacy_control_token_is_removed_on_start() {
+    let mut sandbox = Sandbox::new();
+    fs::write(sandbox.config.join("svcd.token"), "legacy-token").expect("legacy token");
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    assert!(
+        !sandbox.config.join("svcd.token").exists(),
+        "the daemon must remove the token it no longer reads"
+    );
+}
+
 impl Drop for Sandbox {
     fn drop(&mut self) {
         self.shutdown();

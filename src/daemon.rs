@@ -97,6 +97,14 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         }
     }
     crate::plugin::cleanup_staging();
+    // The channel no longer uses a token: authorization is the endpoint ACL.
+    // Remove whatever the previous version left behind so nothing keeps reading
+    // a stale secret.
+    let legacy_token = config.join("svcd.token");
+    if legacy_token.exists() {
+        let _ = fs::remove_file(&legacy_token);
+        log::svcd("svcd: removed the legacy control token (endpoint ACLs authorize now)");
+    }
     #[cfg(windows)]
     if crate::platform::host::acl::is_machine_wide(&config) {
         if let Err(error) = harden_directories() {
