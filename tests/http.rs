@@ -2475,7 +2475,10 @@ fn a_disconnected_package_upload_removes_its_staging_directory() {
             &address,
             "POST",
             path,
-            content.len() + 32 * 1024 * 1024,
+            // Just past the bytes already sent: enough to stall, but under
+            // the 8 MiB low-profile package cap so the upload is not refused
+            // before it can stage.
+            content.len() + 1024 * 1024,
             &initial,
         );
         wait_for_package_staging(&plugins);
@@ -2533,7 +2536,7 @@ fn unix_package_uploads_have_no_takeover_thread() {
             &address,
             "POST",
             path,
-            package.len() + 32 * 1024 * 1024,
+            package.len() + 1024 * 1024,
             &initial,
         );
         wait_for_package_staging(&plugins);
