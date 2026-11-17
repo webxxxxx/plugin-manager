@@ -63,6 +63,14 @@ _Avoid_: lan-token、管理员 token
 `svcd.conf` 里记录的安装根：`svcd --install --prefix <dir>` 会把 `<dir>` 写回这里；之后不带 `--prefix` 的重装、运行时 data/logs 的默认值（`<install_dir>/data`、`<install_dir>/logs`）和 `--uninstall` 的清理都以它为准。手工写在 conf 里也有效，`--prefix` 优先于它；未记录时走平台默认。
 _Avoid_: 安装前缀（那是命令行 `--prefix`）、数据目录
 
+**运行配置（Config）**:
+启动时派生一次、进程内只读的配置值：解析后的 `svcd.conf`（Settings）、目录集（Paths）与由前者派生的限额（Limits）。组合根是唯一构造点；模块从构造参数拿它，不再查进程级全局。
+_Avoid_: 全局配置、配置单例、settings（那是 `svcd.conf` 的解析结果，只是其中一份）
+
+**目录集（Paths）**:
+由平台默认、`SVCD_*` 覆盖与 `svcd.conf` 的 `config_dir`/`install_dir` 解析出的一组绝对目录（config / data / logs / plugins / run / temp / trust）。生产在启动时解析一次；测试从一个临时根派生同一组结构，不读进程环境。
+_Avoid_: 路径工具、路径常量
+
 **manual 安装**:
 `svcd --install --manual`：不注册 init 服务，按宿主系统生成 `svcd_daemon.sh`（Unix）或 `svcd_daemon.bat`（Windows），脚本导出 `PATH`、`SVCD_DATA_DIR`、`SVCD_LOG_DIR` 后启动 svcd；启动接入与手动运行时的环境变量由用户负责。
 _Avoid_: 无服务模式（那是 `--no-service`）
