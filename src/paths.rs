@@ -190,6 +190,26 @@ mod tests {
     }
 
     #[test]
+    fn install_dir_moves_logs_unless_the_environment_overrides_it() {
+        let settings = Settings {
+            install_dir: Some(PathBuf::from("/install-from-file")),
+            ..Settings::default()
+        };
+
+        let paths = Paths::resolve_with(&settings, |_| None);
+        assert_eq!(paths.data_dir, PathBuf::from("/install-from-file/data"));
+        assert_eq!(paths.logs_dir, PathBuf::from("/install-from-file/logs"));
+
+        // `SVCD_LOG_DIR` still wins over `install_dir`; that is the runtime
+        // contract the launcher relies on.
+        let paths = Paths::resolve_with(&settings, |name| {
+            (name == "SVCD_LOG_DIR").then(|| OsString::from("/logs-from-env"))
+        });
+        assert_eq!(paths.logs_dir, PathBuf::from("/logs-from-env"));
+        assert_eq!(paths.data_dir, PathBuf::from("/install-from-file/data"));
+    }
+
+    #[test]
     fn resolve_falls_back_to_the_platform_defaults() {
         let paths = Paths::resolve_with(&Settings::default(), |_| None);
         assert_eq!(paths.config_dir, dirs::default_config_dir());

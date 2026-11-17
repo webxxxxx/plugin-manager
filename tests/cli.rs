@@ -246,6 +246,53 @@ fn a_broken_config_is_a_hard_error_for_every_entry() {
 
     // Usage does not need a config.
     assert_eq!(sandbox.run(&["--help"]).status.code(), Some(64));
+
+    // Stopping only pings the control endpoint: a broken config must not turn
+    // a stop into "invalid config" (there would be no way to stop the daemon).
+    let stop = sandbox.run_as("svcd", &["shutdown"]);
+    assert_eq!(stop.status.code(), Some(2), "{}", stderr(&stop));
+    assert!(
+        !stderr(&stop).contains("invalid config"),
+        "{}",
+        stderr(&stop)
+    );
+}
+
+/// `plugin bundle` works on a directory: it needs no runtime directories, so a
+/// broken config must not block it (only the entries that need a directory
+/// bootstrap).
+#[test]
+fn plugin_bundle_does_not_need_a_runtime_config() {
+    let sandbox = Sandbox::new();
+    fs::create_dir_all(sandbox.config_dir()).expect("config dir");
+    fs::write(sandbox.config_dir().join("svcd.conf"), "bind = nope\n").expect("broken conf");
+
+    let source = sandbox.root.join("source");
+    fs::create_dir_all(source.join("payload/bin")).expect("payload");
+    let exec = source.join("payload/bin/demo");
+    fs::write(&exec, b"#!/bin/sh\nexit 0\n").expect("exec");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&exec, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    let out = sandbox.root.join("demo.spk");
+    let output = sandbox.run_as(
+        "plugin",
+        &[
+            "bundle",
+            source.to_str().expect("utf8"),
+            "--unsigned",
+            "--id",
+            "demo",
+            "--exec",
+            "payload/bin/demo",
+            "-o",
+            out.to_str().expect("utf8"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(out.is_file(), "bundle output missing");
 }
 
 #[test]

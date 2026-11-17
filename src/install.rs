@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::paths::Paths;
+use crate::config::ambient_paths;
 
 const EXIT_OK: i32 = 0;
 const EXIT_ERROR: i32 = 1;
@@ -163,15 +163,6 @@ fn path_writable(path: &Path) -> bool {
 #[cfg(not(unix))]
 fn path_writable(path: &Path) -> bool {
     path.is_dir()
-}
-
-/// The ambient directory set, resolved the way the old free getters did:
-/// `SVCD_*` → the loaded settings (if any) → platform defaults.
-///
-/// Install and uninstall deliberately never bootstrap: they must still work
-/// when the config is broken or missing (that is often why they are run).
-fn ambient_paths() -> Paths {
-    Paths::resolve(&crate::settings::current().cloned().unwrap_or_default())
 }
 
 /// Everything a plan needs to spell out paths and command lines.
@@ -371,6 +362,10 @@ struct RuntimeDirs {
 
 impl RuntimeDirs {
     fn from_settings(settings: Option<&crate::settings::Settings>) -> Self {
+        // Precedence differs from `ambient_paths`: the installer targets the
+        // clean boot environment, so the target file's `install_dir` wins over
+        // an ambient `SVCD_DATA_DIR`/`SVCD_LOG_DIR` (which still lose to an
+        // explicit key in the file). `SVCD_CONFIG_DIR` keeps its usual priority.
         let ambient = ambient_paths();
         let config = std::env::var_os("SVCD_CONFIG_DIR")
             .map(PathBuf::from)

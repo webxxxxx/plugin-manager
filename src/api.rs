@@ -245,7 +245,6 @@ impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
         head: &http::Head,
         peer: IpAddr,
         lan: &Arc<Mutex<Lan>>,
-        _config: &Path,
         raw_hub: Arc<crate::rawhub::RawHub>,
     ) -> Option<Result<crate::server::http::Exchange, Vec<u8>>> {
         crate::face::plugin_ui::PluginUiFace::route_for(&head.method, &head.path)?;
@@ -262,7 +261,6 @@ impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
         &self,
         head: &http::Head,
         lan: &Arc<Mutex<Lan>>,
-        _config: &Path,
     ) -> Option<Result<crate::server::http::Exchange, Vec<u8>>> {
         crate::face::install::target(head)?;
         Some(crate::face::install::exchange(

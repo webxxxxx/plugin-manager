@@ -239,14 +239,8 @@ impl ServerLoop for Server {
         connection.head_only = http::is_head(&head.method);
         let claim = self
             .routes
-            .plugin_ui(
-                &head,
-                connection.peer,
-                &self.lan,
-                &self.config.paths.config_dir,
-                self.raw_hub.clone(),
-            )
-            .or_else(|| self.routes.package_upload(&head, &self.lan, &self.config.paths.config_dir))
+            .plugin_ui(&head, connection.peer, &self.lan, self.raw_hub.clone())
+            .or_else(|| self.routes.package_upload(&head, &self.lan))
             .or_else(|| self.routes.blob_upload(&head, &self.lan));
         let Some(claim) = claim else {
             return PreRequest::Continue;

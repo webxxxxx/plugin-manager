@@ -62,6 +62,10 @@ fn service_name() -> String {
 }
 
 static SERVICE_CONF: OnceLock<Option<PathBuf>> = OnceLock::new();
+/// The control endpoint the daemon thread will bind. Resolved once, after the
+/// explicit `--conf` is loaded, so the readiness probe polls the same directory
+/// the daemon uses.
+static SERVICE_ENDPOINT: OnceLock<PathBuf> = OnceLock::new();
 /// The composition root hands the SCM module the daemon entry point and the
 /// shutdown request it may make. The module never reaches up into `daemon`
 /// itself (no SCM → compose edge in `dep-lint`).
@@ -79,14 +83,16 @@ pub fn run_if_service(
     run_daemon: fn(Option<PathBuf>) -> i32,
     request_shutdown: fn(),
 ) -> Option<i32> {
-    // The SCM thread calls `paths::config_dir()` (the readiness probe) before the
-    // daemon thread applies `--conf`. Resolve the explicit config first, or the
-    // default value wins the `SETTINGS` slot and the daemon silently ignores it.
+    // The SCM thread polls the control endpoint before the daemon thread
+    // applies `--conf`. Load the explicit config first, or the default value
+    // wins the `SETTINGS` slot and the daemon silently ignores it; then resolve
+    // the endpoint once from the same settings.
     if let Some(path) = conf.as_deref() {
         if path.is_file() {
             let _ = crate::settings::init_from_path(path);
         }
     }
+    let _ = SERVICE_ENDPOINT.set(crate::config::ambient_paths().config_dir);
     let _ = SERVICE_CONF.set(conf);
     let _ = DAEMON_RUN.set(run_daemon);
     let _ = DAEMON_SHUTDOWN.set(request_shutdown);
@@ -182,17 +188,14 @@ fn finish(code: i32) {
 /// deadline expired (a slow start must not block the SCM forever).
 fn wait_until_ready(daemon: &JoinHandle<i32>) -> bool {
     let deadline = Instant::now() + Duration::from_millis(READY_TIMEOUT_MS);
+    let endpoint = SERVICE_ENDPOINT.get().cloned().unwrap_or_else(|| {
+        crate::config::ambient_paths().config_dir
+    });
     loop {
         if daemon.is_finished() {
             return false;
         }
-        // The daemon bootstrap fills the settings cache; before that the platform
-        // default is the same endpoint the daemon will use. Resolution is
-        // tolerant here: a probe must never make service start fail.
-        let paths = crate::paths::Paths::resolve(
-            &crate::settings::current().cloned().unwrap_or_default(),
-        );
-        if channel::request(&paths.config_dir, "svcd.ping", serde_json::json!({})).is_ok() {
+        if channel::request(&endpoint, "svcd.ping", serde_json::json!({})).is_ok() {
             return true;
         }
         if Instant::now() >= deadline {

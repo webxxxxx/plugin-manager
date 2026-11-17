@@ -27,6 +27,12 @@ Accepted。细化 [docs/architecture.md](../architecture.md) §8 的 S7 行；�
 - **S7a**：`Config` 骨架 + `Paths::{resolve, under}` + 四批迁移（1 `blob/plugin/package` → 2 `daemon/slot/hook` → 3 `face/transfer/main` → 4 `svc/install/plugin_cli`）+ contract（删六个 `paths::*` 与五个测试后门）+ 验收样本（2 个新模块级测试、1 个集成测试降级为单测）。
 - **S7b**（阻塞于 S7a）：`Settings`/`Limits` 收口——删 `settings::current()` / `limits::current()` 两个 `OnceLock`，41 + 69 处改从 `Config` 来。
 
+## Clarification (S7a, #157)
+
+- `Config::bootstrap` is the hard-error entry: the `SVCD_*` reads live in `Paths::resolve`, called from bootstrap and from the single tolerant `config::ambient_paths()`. That second entry exists only for phases that must outlive a broken `svcd.conf`: the daemon's pre-`ensure_conf` directory, `stop` / `shutdown`, install / uninstall and the Windows SCM readiness probe (resolved once, after `--conf`). Every other entry bootstraps and fails hard.
+- The repository had **eight** directory getters (`config` / `services` / `temp` / `run` / `plugins` / `trust` / `logs` / `data`), not six; all eight were removed by the S7a contract.
+- `settings::current()` / `limits::current()` stay until S7b; `Config` already carries the bootstrap snapshot so S7b only has to move the readers.
+
 ## Consequences
 
 - 模块级测试可以直接构造 `Config`（或 `Paths::under(tmp)`）+ 临时根，不再 spawn 进程；测试之间不再通过进程 env 互相踩。
