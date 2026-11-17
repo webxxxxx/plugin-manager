@@ -2692,7 +2692,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             .expect("clock")
             .as_nanos();
         let root =
-            std::env::temp_dir().join(format!("svcd-tools-unit-{}-{}", std::process::id(), nanos));
+            crate::test_support::temp_dir().join(format!("svcd-tools-unit-{}-{}", std::process::id(), nanos));
         std::fs::create_dir_all(root.join("logs")).expect("logs");
         std::env::set_var("SVCD_LOG_DIR", root.join("logs"));
 
@@ -2740,7 +2740,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             .expect("clock")
             .as_nanos();
         let root =
-            std::env::temp_dir().join(format!("svcd-tools-unit-{}-{}", std::process::id(), nanos));
+            crate::test_support::temp_dir().join(format!("svcd-tools-unit-{}-{}", std::process::id(), nanos));
         std::fs::create_dir_all(root.join("logs")).expect("logs");
         std::env::set_var("SVCD_LOG_DIR", root.join("logs"));
 
@@ -2779,7 +2779,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             .expect("clock")
             .as_nanos();
         let root =
-            std::env::temp_dir().join(format!("svcd-tools-unit-{}-{}", std::process::id(), nanos));
+            crate::test_support::temp_dir().join(format!("svcd-tools-unit-{}-{}", std::process::id(), nanos));
         std::fs::create_dir_all(root.join("logs")).expect("logs");
         std::env::set_var("SVCD_LOG_DIR", root.join("logs"));
 

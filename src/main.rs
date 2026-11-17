@@ -47,6 +47,8 @@ mod status;
 mod supervisor;
 mod svc;
 mod threads;
+#[cfg(test)]
+mod test_support;
 mod transfer;
 mod trust;
 #[cfg(feature = "http")]

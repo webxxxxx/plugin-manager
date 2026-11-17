@@ -2093,7 +2093,7 @@ mod tests {
             .expect("clock")
             .as_nanos();
         let root =
-            std::env::temp_dir().join(format!("svcd-ipc-unit-{}-{}", std::process::id(), nanos));
+            crate::test_support::temp_dir().join(format!("svcd-ipc-unit-{}-{}", std::process::id(), nanos));
         fs::create_dir_all(root.join("logs")).expect("logs");
         std::env::set_var("SVCD_LOG_DIR", root.join("logs"));
 

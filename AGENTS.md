@@ -4,6 +4,10 @@
 
 Issues and specs live in this repo's GitHub Issues, driven by the `gh` CLI. See `docs/agents/issue-tracker.md`.
 
+### 并行开发 / worktree
+
+每个票在自己的 worktree 里做；共享 main 只做集成。开工前读 [docs/agents/parallel-work.md](docs/agents/parallel-work.md)。
+
 ### Triage labels
 
 Default five triage roles: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.

@@ -11,6 +11,9 @@
 use std::fs;
 use std::path::PathBuf;
 
+#[cfg(test)]
+use std::sync::Mutex;
+
 use serde::{Deserialize, Serialize};
 
 use crate::paths;
@@ -37,8 +40,29 @@ pub struct Record {
     pub last_exit: Option<i32>,
 }
 
+#[cfg(test)]
+static TEST_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(test)]
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Test-only override. Production resolves the run directory from paths;
+/// tests need two different roots without racing on a process-global env var.
+fn run_dir() -> PathBuf {
+    #[cfg(test)]
+    {
+        if let Some(root) = TEST_ROOT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            return root.clone();
+        }
+    }
+    paths::run_dir()
+}
+
 pub fn path(id: &str) -> PathBuf {
-    paths::run_dir().join(format!("{}.json", id))
+    run_dir().join(format!("{}.json", id))
 }
 
 pub fn load(id: &str) -> Option<Record> {
@@ -61,7 +85,7 @@ pub fn load(id: &str) -> Option<Record> {
 /// Write the record atomically (`<id>.json.tmp` + rename). A crash mid-write
 /// leaves the previous record intact.
 pub fn save(id: &str, record: &Record) -> Result<(), String> {
-    let directory = paths::run_dir();
+    let directory = run_dir();
     fs::create_dir_all(&directory)
         .map_err(|error| format!("create {}: {}", directory.display(), error))?;
     let bytes = serde_json::to_vec(record).map_err(|error| error.to_string())?;
@@ -107,50 +131,65 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        std::env::temp_dir().join(format!("svcd-runtime-{}-{}", std::process::id(), nanos))
+        let base = crate::test_support::temp_dir();
+        base.join(format!("svcd-runtime-{}-{}", std::process::id(), nanos))
+    }
+
+    fn with_root<T>(body: impl FnOnce(&std::path::Path) -> T) -> T {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = temp_root();
+        *TEST_ROOT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(root.join("run"));
+        let result = body(&root);
+        *TEST_ROOT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        let _ = fs::remove_dir_all(&root);
+        result
     }
 
     #[test]
     fn a_record_round_trips_through_the_file() {
-        let root = temp_root();
-        std::env::set_var("SVCD_RUN_DIR", root.join("run"));
-        let record = Record {
-            boot: Some("boot-1".into()),
-            state: State::Running,
-            pid: Some(42),
-            starttime: Some(1234),
-            since: Some(1_700_000_000),
-            ready_since: Some(1_700_000_001),
-            failures: 2,
-            last_exit: Some(1),
-        };
-        save("demo", &record).expect("save");
-        assert_eq!(load("demo"), Some(record));
-        let leftovers: Vec<String> = fs::read_dir(root.join("run"))
-            .expect("run dir")
-            .flatten()
-            .map(|entry| entry.file_name().to_string_lossy().to_string())
-            .filter(|name| name.contains(".tmp"))
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "temporary files left: {:?}",
-            leftovers
-        );
-        remove("demo");
-        assert_eq!(load("demo"), None);
-        let _ = std::fs::remove_dir_all(root);
+        with_root(|root| {
+            let record = Record {
+                boot: Some("boot-1".into()),
+                state: State::Running,
+                pid: Some(42),
+                starttime: Some(1234),
+                since: Some(1_700_000_000),
+                ready_since: Some(1_700_000_001),
+                failures: 2,
+                last_exit: Some(1),
+            };
+            save("demo", &record).expect("save");
+            assert_eq!(load("demo"), Some(record));
+            let leftovers: Vec<String> = fs::read_dir(root.join("run"))
+                .expect("run dir")
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().to_string())
+                .filter(|name| name.contains(".tmp"))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "temporary files left: {:?}",
+                leftovers
+            );
+            remove("demo");
+            assert_eq!(load("demo"), None);
+        });
     }
 
     #[test]
     fn a_corrupt_record_is_ignored_instead_of_crashing() {
-        let root = temp_root();
-        std::env::set_var("SVCD_RUN_DIR", root.join("run"));
-        fs::create_dir_all(paths::run_dir()).expect("run dir");
-        fs::write(path("demo"), b"{not json").expect("corrupt record");
-        assert_eq!(load("demo"), None);
-        remove("demo");
-        let _ = std::fs::remove_dir_all(root);
+        with_root(|_root| {
+            fs::create_dir_all(run_dir()).expect("run dir");
+            fs::write(path("demo"), b"{not json").expect("corrupt record");
+            assert_eq!(load("demo"), None);
+            remove("demo");
+        });
     }
 
     #[test]
