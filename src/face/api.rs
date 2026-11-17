@@ -28,6 +28,7 @@ const UI: &str = include_str!("../web/index.html");
 
 use super::blob;
 use super::export;
+use super::support::{self, CallBudget};
 
 /// The management API face.
 pub struct ApiFace {
@@ -43,18 +44,23 @@ impl ApiFace {
         }
     }
 
-    fn rpc(&self, method: &str, params: Value) -> Result<Value, Response> {
-        crate::api::rpc_result(&self.config, method, params).map_err(rpc_error)
+    fn rpc(
+        &self,
+        budget: &CallBudget,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, Response> {
+        support::rpc_result(&self.config, method, params, budget).map_err(rpc_error)
     }
 
-    fn require_plugin(&self, id: &str) -> Result<(), Response> {
-        crate::api::require_plugin_result(&self.config, id)
+    fn require_plugin(&self, budget: &CallBudget, id: &str) -> Result<(), Response> {
+        support::require_plugin_result(&self.config, id, budget)
             .map_err(|(status, code, message)| error_response(status, code, &message))
     }
 
     /// Project `svc.list` into the summaries the console consumes.
-    fn list_services(&self) -> Response {
-        match self.rpc("svc.list", json!({})) {
+    fn list_services(&self, budget: &CallBudget) -> Response {
+        match self.rpc(budget, "svc.list", json!({})) {
             Ok(value) => {
                 let services: Vec<Value> = value
                     .get("services")
@@ -67,15 +73,15 @@ impl ApiFace {
         }
     }
 
-    fn service_status(&self, id: &str) -> Response {
-        match self.rpc("svc.status", json!({ "id": id })) {
+    fn service_status(&self, budget: &CallBudget, id: &str) -> Response {
+        match self.rpc(budget, "svc.status", json!({ "id": id })) {
             Ok(status) => Response::json(200, &status),
             Err(response) => response,
         }
     }
 
-    fn service_action(&self, method: &str, id: &str) -> Response {
-        match self.rpc(method, json!({ "id": id })) {
+    fn service_action(&self, budget: &CallBudget, method: &str, id: &str) -> Response {
+        match self.rpc(budget, method, json!({ "id": id })) {
             Ok(status) => summary_response(status),
             Err(response) => response,
         }
@@ -102,15 +108,15 @@ impl ApiFace {
         )
     }
 
-    fn uninstall_plugin(&self, id: &str, purge: bool) -> Response {
-        match self.rpc("plugin.uninstall", json!({ "id": id, "purge": purge })) {
+    fn uninstall_plugin(&self, budget: &CallBudget, id: &str, purge: bool) -> Response {
+        match self.rpc(budget, "plugin.uninstall", json!({ "id": id, "purge": purge })) {
             Ok(_) => Response::json(200, &json!({ "ok": true })),
             Err(response) => response,
         }
     }
 
-    fn get_config(&self, id: &str) -> Response {
-        if let Err(response) = self.require_plugin(id) {
+    fn get_config(&self, budget: &CallBudget, id: &str) -> Response {
+        if let Err(response) = self.require_plugin(budget, id) {
             return response;
         }
         let Some(path) = plugin::active_config(id) else {
@@ -122,8 +128,8 @@ impl ApiFace {
         }
     }
 
-    fn put_config(&self, id: &str, body: &[u8]) -> Response {
-        if let Err(response) = self.require_plugin(id) {
+    fn put_config(&self, budget: &CallBudget, id: &str, body: &[u8]) -> Response {
+        if let Err(response) = self.require_plugin(budget, id) {
             return response;
         }
         let _guard = plugin::config_lock();
@@ -137,8 +143,8 @@ impl ApiFace {
         }
     }
 
-    fn reset_config(&self, id: &str) -> Response {
-        if let Err(response) = self.require_plugin(id) {
+    fn reset_config(&self, budget: &CallBudget, id: &str) -> Response {
+        if let Err(response) = self.require_plugin(budget, id) {
             return response;
         }
         let Some((template, _)) = plugin::config_template(id) else {
@@ -159,8 +165,8 @@ impl ApiFace {
         }
     }
 
-    fn export_config(&self, id: &str) -> Response {
-        if let Err(response) = self.require_plugin(id) {
+    fn export_config(&self, budget: &CallBudget, id: &str) -> Response {
+        if let Err(response) = self.require_plugin(budget, id) {
             return response;
         }
         match plugin::export_config(id) {
@@ -189,7 +195,7 @@ impl ApiFace {
     }
 
     fn trust_add(&self, body: &[u8], query: &str) -> Response {
-        let Some(key_id) = crate::api::query_value(query, "key_id") else {
+        let Some(key_id) = support::query_value(query, "key_id") else {
             return error_response(400, "bad_request", "key_id is required");
         };
         if body.is_empty() {
@@ -219,11 +225,11 @@ impl ApiFace {
         }
     }
 
-    fn logs(&self, id: &str, query: &str) -> Response {
-        if let Err(response) = self.require_plugin(id) {
+    fn logs(&self, budget: &CallBudget, id: &str, query: &str) -> Response {
+        if let Err(response) = self.require_plugin(budget, id) {
             return response;
         }
-        let lines = match crate::api::query_value(query, "lines") {
+        let lines = match support::query_value(query, "lines") {
             None => 200,
             Some(value) => match value.parse::<usize>() {
                 Ok(lines) if lines <= 2000 => lines,
@@ -291,6 +297,7 @@ impl ApiFace {
     }
 
     fn handle_api(&self, request: &Request) -> Response {
+        let budget = CallBudget::from_request(request);
         let (path, query) = request
             .path
             .split_once('?')
@@ -324,32 +331,34 @@ impl ApiFace {
                     "platform": crate::package::target(),
                 }),
             ),
-            ("GET", ["api", "v1", "services"]) => self.list_services(),
-            ("GET", ["api", "v1", "services", id]) => self.service_status(&decode(id)),
+            ("GET", ["api", "v1", "services"]) => self.list_services(&budget),
+            ("GET", ["api", "v1", "services", id]) => self.service_status(&budget, &decode(id)),
             ("POST", ["api", "v1", "services", id, "start"]) => {
-                self.service_action("svc.start", &decode(id))
+                self.service_action(&budget, "svc.start", &decode(id))
             }
             ("POST", ["api", "v1", "services", id, "stop"]) => {
-                self.service_action("svc.stop", &decode(id))
+                self.service_action(&budget, "svc.stop", &decode(id))
             }
             ("POST", ["api", "v1", "services", id, "enable"]) => {
-                self.service_action("svc.enable", &decode(id))
+                self.service_action(&budget, "svc.enable", &decode(id))
             }
             ("POST", ["api", "v1", "services", id, "disable"]) => {
-                self.service_action("svc.disable", &decode(id))
+                self.service_action(&budget, "svc.disable", &decode(id))
             }
             ("POST", ["api", "v1", "plugins", id, "ui-token"]) => self.plugin_ui_token(&decode(id)),
             (_, ["api", "v1", "plugins", _, "ui-token"]) => method_not_allowed("POST"),
             ("DELETE", ["api", "v1", "plugins", id]) => {
-                let purge = crate::api::query_bool(query, "purge").unwrap_or(false);
-                self.uninstall_plugin(&decode(id), purge)
+                let purge = support::query_bool(query, "purge").unwrap_or(false);
+                self.uninstall_plugin(&budget, &decode(id), purge)
             }
-            ("POST", ["api", "v1", "config", id, "reset"]) => self.reset_config(&decode(id)),
+            ("POST", ["api", "v1", "config", id, "reset"]) => self.reset_config(&budget, &decode(id)),
             (_, ["api", "v1", "config", _, "reset"]) => method_not_allowed("POST"),
-            ("GET", ["api", "v1", "config", id]) => self.get_config(&decode(id)),
-            ("PUT", ["api", "v1", "config", id]) => self.put_config(&decode(id), &request.body),
+            ("GET", ["api", "v1", "config", id]) => self.get_config(&budget, &decode(id)),
+            ("PUT", ["api", "v1", "config", id]) => {
+                self.put_config(&budget, &decode(id), &request.body)
+            }
             (_, ["api", "v1", "config", _]) => method_not_allowed("GET, PUT"),
-            ("GET", ["api", "v1", "export", id, "config"]) => self.export_config(&decode(id)),
+            ("GET", ["api", "v1", "export", id, "config"]) => self.export_config(&budget, &decode(id)),
             (_, ["api", "v1", "export", _, "config"]) => method_not_allowed("GET"),
             (_, ["api", "v1", "export", _, "spk"]) => method_not_allowed("GET"),
             (_, ["api", "v1", "export", _]) => method_not_allowed("GET"),
@@ -359,7 +368,7 @@ impl ApiFace {
             ("DELETE", ["api", "v1", "trust", key]) => self.trust_remove(&decode(key)),
             (_, ["api", "v1", "trust"]) => method_not_allowed("GET, POST"),
             (_, ["api", "v1", "trust", _]) => method_not_allowed("DELETE"),
-            ("GET", ["api", "v1", "logs", id]) => self.logs(&decode(id), query),
+            ("GET", ["api", "v1", "logs", id]) => self.logs(&budget, &decode(id), query),
             (_, ["api", "v1", "logs", _]) => method_not_allowed("GET"),
             _ => error_response(404, "not_found", "unknown endpoint"),
         }
@@ -482,18 +491,18 @@ fn error_response(status: u16, code: &str, message: &str) -> Response {
     )
 }
 
-fn rpc_error(failure: crate::api::RpcFailure) -> Response {
+fn rpc_error(failure: support::RpcFailure) -> Response {
     let (status, code, message) = failure;
     error_response(status, code, &message)
 }
 
 fn map_error_response(message: &str) -> Response {
-    let (status, code, message) = crate::api::map_error_status(message);
+    let (status, code, message) = support::map_error_status(message);
     error_response(status, code, &message)
 }
 
 fn config_error_response(message: &str) -> Response {
-    let (status, code, message) = crate::api::config_error_status(message);
+    let (status, code, message) = support::config_error_status(message);
     error_response(status, code, &message)
 }
 
@@ -600,8 +609,8 @@ impl Face for ApiFace {
             }
         } else if is_api_path(&request.path) {
             if request.principal == AuthKind::Cookie
-                && crate::api::is_write(&request.method)
-                && !crate::api::csrf_ok_headers(&request.headers)
+                && support::is_write(&request.method)
+                && !support::csrf_ok_headers(&request.headers)
             {
                 error_response(
                     403,
@@ -649,6 +658,8 @@ mod tests {
             peer: "127.0.0.1".parse().expect("peer"),
             principal: AuthKind::None,
             body: Vec::new(),
+            deadline: None,
+            cancel: None,
         }
     }
 

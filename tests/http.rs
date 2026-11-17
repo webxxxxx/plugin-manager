@@ -7292,3 +7292,94 @@ fn http_mcp_stream_reports_an_unreachable_channel_as_an_sse_error() {
         let _ = child.wait();
     }
 }
+
+
+/// A stuck supervisor must not pin a blocking worker or an HTTP connection.
+/// Two concurrent management calls hit their control deadline (504, not the
+/// queue-full 503), and the daemon serves requests again once the stop hook
+/// returns. The hook runs on the supervisor loop, so both calls queue behind
+/// the same stall; without a deadline they would occupy both workers for the
+/// whole hook.
+#[test]
+fn a_stuck_supervisor_answers_504_and_the_worker_recovers() {
+    let mut sandbox = Sandbox::new();
+    sandbox.allow_insecure_install_with("control_timeout_secs = 1\n");
+    sandbox.write_core();
+
+    let hook = if cfg!(windows) {
+        sandbox.root.join("slow-stop.cmd")
+    } else {
+        sandbox.root.join("slow-stop.sh")
+    };
+    #[cfg(windows)]
+    {
+        // Four pings, one per second: roughly three seconds of sleep.
+        fs::write(&hook, "@echo off\r\nping -n 4 127.0.0.1 >nul\r\n").expect("stop hook");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(&hook, "#!/bin/sh\nsleep 3\n").expect("stop hook");
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("hook mode");
+    }
+    let definition = sandbox.config.join("services.d").join("demo.json");
+    let mut value: Value =
+        serde_json::from_slice(&fs::read(&definition).expect("definition")).expect("json");
+    value["lifecycle"] = json!({
+        "stop": {"path": hook.to_string_lossy(), "args": [], "timeout": 5}
+    });
+    fs::write(&definition, serde_json::to_vec(&value).expect("definition")).expect("write");
+
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let started = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
+    assert_eq!(started.status, 200, "{}", started.body);
+
+    let stop_address = address.clone();
+    let stop = std::thread::spawn(move || {
+        let began = Instant::now();
+        let response = request(&stop_address, "POST", "/api/v1/services/demo/stop", "", b"");
+        (response, began.elapsed())
+    });
+    // Let the stop request reach the supervisor and enter its hook.
+    std::thread::sleep(Duration::from_millis(200));
+    let list_address = address.clone();
+    let list = std::thread::spawn(move || {
+        let began = Instant::now();
+        let response = request(&list_address, "GET", "/api/v1/services", "", b"");
+        (response, began.elapsed())
+    });
+
+    let (stop_response, stop_elapsed) = stop.join().expect("stop request");
+    let (list_response, list_elapsed) = list.join().expect("list request");
+    assert_eq!(
+        stop_response.status, 504,
+        "a stuck supervisor is a timeout, not a busy queue: {}",
+        stop_response.body
+    );
+    assert_eq!(list_response.status, 504, "{}", list_response.body);
+    assert_eq!(stop_response.body["error"]["code"], "timeout");
+    assert_eq!(list_response.body["error"]["code"], "timeout");
+    for elapsed in [stop_elapsed, list_elapsed] {
+        assert!(
+            elapsed < Duration::from_millis(2200),
+            "control_timeout_secs must release the worker before the hook returns, took {elapsed:?}"
+        );
+    }
+
+    // Once the hook returns, the workers are free and normal requests resume.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let recovered = request(&address, "GET", "/api/v1/services", "", b"");
+        if recovered.status == 200 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never recovered: {}",
+            recovered.body
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+

@@ -1,17 +1,21 @@
 //! Values and traits for the S4 seam.
 //!
-//! Nothing here owns a socket, a file descriptor, a thread, or a deadline;
-//! those stay with the server. A face gets a [`Request`] and answers through a
-//! [`Completion`], exactly once.
+//! Nothing here owns a socket, a file descriptor or a thread; those stay with
+//! the server. A [`Request`] carries the server's deadline value and the
+//! pool's cancellation token, but owns no timer. A face gets a [`Request`] and
+//! answers through a [`Completion`], exactly once.
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use serde_json::Value;
 
 use crate::http;
 use crate::lan::AuthKind;
 use crate::log;
+
+use super::pool::CancelToken;
 
 /// How the server treats a request body before [`Face::handle`] runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,9 +118,27 @@ pub struct Request {
     /// Complete body for `Buffered` routes; empty for `Empty` and `Streamed`.
     #[allow(dead_code)] // #114/#116 wire the first Buffered route.
     pub body: Vec<u8>,
+    /// Absolute bound for this request's control-channel round trips. The
+    /// server stamps a blocking job at dispatch; inline routes leave it empty.
+    /// A face helper must not extend it, only honor it.
+    pub deadline: Option<Instant>,
+    /// The blocking pool's cancellation token. It flips when the connection
+    /// closes or the pool shuts down, so a control round trip can stop
+    /// polling long before its deadline. Inline routes have no token.
+    pub cancel: Option<CancelToken>,
 }
 
 impl Request {
+    /// The budget for this request's control-channel calls. An inline request
+    /// keeps the unlimited CLI-style round trip; a blocking job always has a
+    /// deadline (set by the server at dispatch).
+    pub fn with_control_deadline(mut self, now: Instant, timeout: std::time::Duration) -> Request {
+        if self.deadline.is_none() {
+            self.deadline = Some(now + timeout);
+        }
+        self
+    }
+
     pub fn path_only(&self) -> &str {
         self.path
             .split_once('?')
@@ -379,6 +401,8 @@ mod tests {
             peer: "127.0.0.1".parse().expect("peer"),
             principal: Principal::None,
             body: Vec::new(),
+            deadline: None,
+            cancel: None,
         };
         assert_eq!(request.path_only(), "/api/v1/version");
     }

@@ -15,3 +15,4 @@ pub mod export;
 pub mod install;
 pub mod plugin_streams;
 pub mod plugin_ui;
+pub mod support;

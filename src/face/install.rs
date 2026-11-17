@@ -29,6 +29,8 @@ use crate::server::http::{
 use crate::settings;
 use crate::transfer;
 
+use super::support::{self, CallBudget};
+
 /// One recognized package upload. The query is already parsed because both
 /// routes carry their endpoint policy there.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,15 +66,15 @@ pub fn target(head: &http::Head) -> Option<PackageTarget> {
         .unwrap_or("");
     match path {
         "/api/v1/plugins" => Some(PackageTarget::Install {
-            strategy: crate::api::query_value(query, "strategy")
+            strategy: support::query_value(query, "strategy")
                 .unwrap_or_else(|| "replace".into()),
-            enable: crate::api::query_bool(query, "enable").unwrap_or(true),
-            allow_hooks: crate::api::query_bool(query, "allow_hooks").unwrap_or(false),
+            enable: support::query_bool(query, "enable").unwrap_or(true),
+            allow_hooks: support::query_bool(query, "allow_hooks").unwrap_or(false),
         }),
         "/api/v1/import" => Some(PackageTarget::Import {
-            config_id: crate::api::query_value(query, "config_id"),
-            no_config: crate::api::query_bool(query, "no_config").unwrap_or(false),
-            force: crate::api::query_bool(query, "force").unwrap_or(false),
+            config_id: support::query_value(query, "config_id"),
+            no_config: support::query_bool(query, "no_config").unwrap_or(false),
+            force: support::query_bool(query, "force").unwrap_or(false),
         }),
         _ => None,
     }
@@ -692,7 +694,12 @@ impl InstallFlow {
         ) {
             Ok(status) => {
                 if !self.enable {
-                    let _ = crate::api::rpc(config, "svc.disable", json!({ "id": id }));
+                    let _ = support::rpc(
+                        config,
+                        "svc.disable",
+                        json!({ "id": id }),
+                        &CallBudget::unbounded(),
+                    );
                 }
                 let summary = status.get("summary").cloned().unwrap_or(Value::Null);
                 let body = serde_json::to_vec(&json!({
@@ -808,7 +815,7 @@ fn raw_config_response(data: &[u8], params: &ImportParams) -> Vec<u8> {
     ) {
         Ok(outcome) => import_outcome_json(outcome),
         Err(transfer::Error::Usage(message)) => http::json_error(400, "bad_request", &message),
-        Err(transfer::Error::Failed(message)) => crate::api::map_error(&message),
+        Err(transfer::Error::Failed(message)) => support::map_error(&message),
     }
 }
 
@@ -1088,7 +1095,7 @@ fn install_staged(
     strategy: &str,
     allow_hooks: bool,
 ) -> Result<Value, Vec<u8>> {
-    crate::api::rpc(
+    support::rpc(
         config,
         "plugin.install_staged",
         json!({
@@ -1098,6 +1105,7 @@ fn install_staged(
             "strategy": strategy,
             "allowHooks": allow_hooks,
         }),
+        &CallBudget::unbounded(),
     )
     .map_err(|response| {
         let _ = std::fs::remove_dir_all(root);
