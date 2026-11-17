@@ -2133,6 +2133,16 @@ fn has_package_staging(plugins: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn package_staging_appears(plugins: &Path) -> bool {
+    for _ in 0..300 {
+        if has_package_staging(plugins) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
 fn wait_for_package_staging(plugins: &Path) {
     for _ in 0..300 {
         if has_package_staging(plugins) {
@@ -2481,7 +2491,17 @@ fn a_disconnected_package_upload_removes_its_staging_directory() {
             content.len() + 1024 * 1024,
             &initial,
         );
-        wait_for_package_staging(&plugins);
+        if !package_staging_appears(&plugins) {
+            let mut probe = stalled.try_clone().expect("probe clone");
+            probe.set_nonblocking(true).expect("probe nonblocking");
+            let mut bytes = [0u8; 2048];
+            let read = std::io::Read::read(&mut probe, &mut bytes).unwrap_or(0);
+            panic!(
+                "no staging for {path}; daemon log:\n{}\nresponse: {:?}",
+                sandbox.daemon_log(),
+                String::from_utf8_lossy(&bytes[..read])
+            );
+        }
         drop(stalled);
         wait_for_no_package_staging(&plugins);
     }
