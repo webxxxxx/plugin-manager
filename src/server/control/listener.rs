@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::channel::{Notify, PendingCall, Reply};
+use crate::channel::{Endpoint, Notify, PendingCall, Reply};
 use crate::ipc;
 use crate::rpc;
 use crate::wake::Wake;
@@ -21,7 +21,7 @@ use crate::wake::Wake;
 /// One poll source owned by the control server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
-    Listener,
+    Listener(Endpoint),
     Connection(u64),
 }
 
@@ -32,10 +32,14 @@ struct Connection {
     out_at: usize,
     pending: Option<Receiver<String>>,
     close_after_write: bool,
+    /// The endpoint this connection was accepted on; every request it carries
+    /// inherits the tier.
+    endpoint: Endpoint,
 }
 
 pub struct ControlServer {
-    listener: UnixListener,
+    user: UnixListener,
+    admin: UnixListener,
     connections: HashMap<u64, Connection>,
     next_id: u64,
     tx: SyncSender<PendingCall>,
@@ -47,14 +51,17 @@ pub struct ControlServer {
 
 impl ControlServer {
     pub fn new(
-        listener: UnixListener,
+        user: UnixListener,
+        admin: UnixListener,
         tx: SyncSender<PendingCall>,
         wake: Arc<Wake>,
         notify: Arc<UnixStream>,
     ) -> io::Result<ControlServer> {
-        listener.set_nonblocking(true)?;
+        user.set_nonblocking(true)?;
+        admin.set_nonblocking(true)?;
         Ok(ControlServer {
-            listener,
+            user,
+            admin,
             connections: HashMap::new(),
             next_id: 1,
             tx,
@@ -66,8 +73,10 @@ impl ControlServer {
     /// Append this server's poll entries. The offset in `out` is the index
     /// passed to `ready`; `keys` carries the stable source for that index.
     pub fn poll_sources(&self, out: &mut Vec<(RawFd, i16)>, keys: &mut Vec<Source>) {
-        out.push((self.listener.as_raw_fd(), libc::POLLIN));
-        keys.push(Source::Listener);
+        out.push((self.user.as_raw_fd(), libc::POLLIN));
+        keys.push(Source::Listener(Endpoint::User));
+        out.push((self.admin.as_raw_fd(), libc::POLLIN));
+        keys.push(Source::Listener(Endpoint::Admin));
         for (id, connection) in &self.connections {
             let mut events = 0;
             if connection.pending.is_none() && connection.out.is_empty() {
@@ -86,14 +95,18 @@ impl ControlServer {
 
     pub fn ready(&mut self, source: Source, revents: i16) {
         match source {
-            Source::Listener => self.accept(),
+            Source::Listener(endpoint) => self.accept(endpoint),
             Source::Connection(id) => self.ready_connection(id, revents),
         }
     }
 
-    fn accept(&mut self) {
+    fn accept(&mut self, endpoint: Endpoint) {
+        let listener = match endpoint {
+            Endpoint::User => &self.user,
+            Endpoint::Admin => &self.admin,
+        };
         loop {
-            match self.listener.accept() {
+            match listener.accept() {
                 Ok((stream, _)) => {
                     let _ = stream.set_nonblocking(true);
                     let id = self.next_id;
@@ -107,6 +120,7 @@ impl ControlServer {
                             out_at: 0,
                             pending: None,
                             close_after_write: false,
+                            endpoint,
                         },
                     );
                 }
@@ -277,7 +291,11 @@ fn drain_requests(
         let line = String::from_utf8_lossy(&line[..line.len().saturating_sub(1)]).to_string();
         let (sender, receiver) = mpsc::channel();
         let reply = Reply::with_notify(sender, Notify::new(notify));
-        match tx.try_send(PendingCall { line, reply }) {
+        match tx.try_send(PendingCall {
+            line,
+            reply,
+            endpoint: connection.endpoint,
+        }) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 // Bounded backpressure: answer this connection with a visible
@@ -352,11 +370,13 @@ mod tests {
         std::fs::create_dir_all(&root).expect("root");
         let path = root.join("svcd.sock");
         let listener = UnixListener::bind(&path).expect("listener");
+        let admin = UnixListener::bind(root.join("svcd-admin.sock")).expect("admin listener");
         let (notify_tx, _notify_rx) = UnixStream::pair().expect("notify");
         let notify_tx = Arc::new(notify_tx);
         let (tx, rx) = mpsc::sync_channel::<PendingCall>(8);
         let mut server =
-            ControlServer::new(listener, tx, Arc::new(Wake::new()), notify_tx).expect("server");
+            ControlServer::new(listener, admin, tx, Arc::new(Wake::new()), notify_tx)
+                .expect("server");
         let supervisor = std::thread::spawn(move || {
             for call in rx {
                 let value: serde_json::Value = serde_json::from_str(&call.line).expect("request");
@@ -448,11 +468,13 @@ mod tests {
         std::fs::create_dir_all(&root).expect("root");
         let path = root.join("svcd.sock");
         let listener = UnixListener::bind(&path).expect("listener");
+        let admin = UnixListener::bind(root.join("svcd-admin.sock")).expect("admin listener");
         let (notify_tx, _notify_rx) = UnixStream::pair().expect("notify");
         let notify_tx = Arc::new(notify_tx);
         let (tx, rx) = mpsc::sync_channel::<PendingCall>(8);
         let mut server =
-            ControlServer::new(listener, tx, Arc::new(Wake::new()), notify_tx).expect("server");
+            ControlServer::new(listener, admin, tx, Arc::new(Wake::new()), notify_tx)
+                .expect("server");
         let (queued_tx, queued_rx) = mpsc::channel();
         std::thread::spawn(move || {
             for call in rx {
@@ -541,10 +563,12 @@ mod tests {
         std::fs::create_dir_all(&root).expect("root");
         let path = root.join("svcd.sock");
         let listener = UnixListener::bind(&path).expect("listener");
+        let admin = UnixListener::bind(root.join("svcd-admin.sock")).expect("admin listener");
         let (notify_tx, _notify_rx) = UnixStream::pair().expect("notify");
         let (tx, rx) = mpsc::sync_channel::<PendingCall>(8);
         let mut server = ControlServer::new(
             listener,
+            admin,
             tx,
             Arc::new(Wake::new()),
             Arc::new(notify_tx),
@@ -555,7 +579,7 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_secs(3)))
             .expect("timeout");
-        server.ready(Source::Listener, libc::POLLIN);
+        server.ready(Source::Listener(Endpoint::User), libc::POLLIN);
         client
             .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"registry.call\"}\n")
             .expect("write");
@@ -618,6 +642,7 @@ mod tests {
             out_at: 0,
             pending: None,
             close_after_write: false,
+            endpoint: Endpoint::User,
         };
         assert!(drain_requests(
             &mut connection,

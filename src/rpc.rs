@@ -8,9 +8,6 @@ pub struct Request {
     pub method: String,
     #[serde(default)]
     pub params: Value,
-    /// Local management channel token; plugin stdio never sets it.
-    #[serde(default)]
-    pub auth: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

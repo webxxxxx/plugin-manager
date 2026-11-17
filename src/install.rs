@@ -24,6 +24,10 @@ const INITTAB: &str = "/etc/inittab";
 const PROCD_SCRIPT: &str = "/etc/init.d/svcd";
 pub(crate) const SCM_NAME: &str = "svcd";
 const SCM_DISPLAY_NAME: &str = "svcd";
+/// The local group that shares the control channel's read endpoint. The channel
+/// authorizes by endpoint ACL, so the group has to exist before the service
+/// starts.
+const SCM_GROUP: &str = "svcd";
 
 /// A host init system that can own `svcd`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -656,6 +660,17 @@ fn scm_install(layout: &Layout) -> Vec<Op> {
         conf_arg(layout)
     );
     vec![
+        // The read endpoint is shared with this group, so it must exist before
+        // the daemon binds. 1379: ERROR_ALIAS_EXISTS — a reinstall converges.
+        Op::Run {
+            argv: vec![
+                "net".into(),
+                "localgroup".into(),
+                SCM_GROUP.into(),
+                "/add".into(),
+            ],
+            allow_codes: Some(vec![0, 1379]),
+        },
         Op::Run {
             argv: vec![
                 "sc".into(),

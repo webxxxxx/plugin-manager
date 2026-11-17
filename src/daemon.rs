@@ -97,6 +97,21 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         }
     }
     crate::plugin::cleanup_staging();
+    // The channel no longer uses a token: authorization is the endpoint ACL.
+    // Remove whatever the previous version left behind so nothing keeps reading
+    // a stale secret.
+    let legacy_token = config.join("svcd.token");
+    if legacy_token.exists() {
+        let _ = fs::remove_file(&legacy_token);
+        log::svcd("svcd: removed the legacy control token (endpoint ACLs authorize now)");
+    }
+    #[cfg(windows)]
+    if crate::platform::host::acl::is_machine_wide(&config) {
+        if let Err(error) = harden_directories() {
+            eprintln!("svcd: cannot protect the install directories: {}", error);
+            return 1;
+        }
+    }
     if let Err(error) = crate::platform::host::process::init() {
         log::svcd(&format!(
             "svcd: parent-death protection unavailable: {}",
@@ -127,14 +142,6 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
             log::svcd(&format!("svcd: plugin: {}", error));
         }
     }
-
-    let token = match channel::ensure_token(&config) {
-        Ok(token) => token,
-        Err(error) => {
-            log::svcd(&format!("svcd: cannot create control token: {}", error));
-            return 1;
-        }
-    };
 
     let (tx, rx) = mpsc::sync_channel(channel::PENDING_QUEUE_LIMIT);
     let wake = Arc::new(Wake::new());
@@ -198,7 +205,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     let api: Option<Arc<Api>> = None;
     notify_systemd("READY=1");
 
-    let mut daemon = Daemon::new_with_raw(loaded.registry, token, rx, api.clone(), raw_hub.clone());
+    let mut daemon = Daemon::new_with_raw(loaded.registry, rx, api.clone(), raw_hub.clone());
     daemon.set_raw_hub(raw_hub.clone());
     daemon.set_wake(wake);
     #[cfg(unix)]
@@ -395,9 +402,25 @@ fn shutdown_inner(verbose: bool) -> i32 {
     }
 }
 
+/// The daemon runs `services.d` scripts and plugin payloads as LocalSystem, so
+/// those directories must not be writable by anyone but SYSTEM, Administrators
+/// and the `svcd` group. Without this a local user could drop a `.cmd` into
+/// `services.d` and have it executed as SYSTEM.
+#[cfg(windows)]
+fn harden_directories() -> std::io::Result<()> {
+    use crate::platform::host::acl::Acl;
+    for dir in [paths::config_dir(), paths::services_dir(), paths::plugins_dir()] {
+        // Create first: a first start has no `services.d` / `plugins` yet, and a
+        // directory created later would inherit `C:\ProgramData`'s Users-write
+        // ACE instead of getting the protected DACL below.
+        fs::create_dir_all(&dir)?;
+        Acl::shared(true)?.apply_to_path(&dir)?;
+    }
+    Ok(())
+}
+
 struct Daemon {
     registry: Registry,
-    token: String,
     rx: Receiver<channel::PendingCall>,
     #[cfg_attr(not(feature = "http"), allow(dead_code))]
     api: Option<Arc<Api>>,
@@ -437,14 +460,12 @@ impl Daemon {
     #[cfg(test)]
     fn new(
         registry: Registry,
-        token: String,
         rx: Receiver<channel::PendingCall>,
         api: Option<Arc<Api>>,
     ) -> Self {
         let limits = crate::limits::current();
         Self::new_with_raw(
             registry,
-            token,
             rx,
             api,
             crate::rawhub::RawHub::new(
@@ -458,7 +479,6 @@ impl Daemon {
 
     fn new_with_raw(
         registry: Registry,
-        token: String,
         rx: Receiver<channel::PendingCall>,
         api: Option<Arc<Api>>,
         raw_hub: Arc<crate::rawhub::RawHub>,
@@ -497,7 +517,6 @@ impl Daemon {
         launchers.register("builtin", Box::new(crate::builtin_adapter::BuiltinLauncher));
         Daemon {
             registry,
-            token,
             rx,
             api,
             wake,
@@ -869,7 +888,9 @@ impl Daemon {
                 return;
             }
         };
-        if request.auth.as_deref() != Some(self.token.as_str()) {
+        if incoming.endpoint == channel::Endpoint::User
+            && channel::Endpoint::for_method(&request.method) == channel::Endpoint::Admin
+        {
             let response = rpc::err(request.id, -32000, "unauthorized");
             let _ = incoming.reply.send(rpc::to_line(&response));
             return;
@@ -884,9 +905,6 @@ impl Daemon {
     }
 
     fn dispatch(&mut self, request: rpc::Request) -> rpc::Response {
-        if request.auth.as_deref() != Some(self.token.as_str()) {
-            return rpc::err(request.id, -32000, "unauthorized");
-        }
         let id = request.id.clone();
         match request.method.as_str() {
             "svcd.ping" => rpc::ok(id, json!({"ok": true})),
@@ -2471,7 +2489,7 @@ mod tests {
     #[test]
     fn the_daemon_does_not_spawn_call_worker_threads() {
         let (_sender, receiver) = mpsc::channel();
-        let _daemon = Daemon::new(Registry::with_builtin(), "token".into(), receiver, None);
+        let _daemon = Daemon::new(Registry::with_builtin(), receiver, None);
         let names: Vec<String> = std::fs::read_dir("/proc/self/task")
             .expect("task dir")
             .filter_map(|entry| {
@@ -2679,15 +2697,87 @@ while ($null -ne ($line = $reader.ReadLine())) {
             "id": 1,
             "method": method,
             "params": params,
-            "auth": "token",
         }))
         .expect("request");
         let (sender, receiver) = mpsc::channel();
         daemon.handle(channel::PendingCall {
+            endpoint: channel::Endpoint::Admin,
             line,
             reply: crate::channel::Reply::plain(sender),
         });
         receiver
+    }
+
+    /// Dispatch one request as if it arrived on `endpoint`.
+    fn send_on(
+        daemon: &mut Daemon,
+        endpoint: channel::Endpoint,
+        method: &str,
+        params: Value,
+    ) -> serde_json::Value {
+        let line = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        }))
+        .expect("request");
+        let (sender, receiver) = mpsc::channel();
+        daemon.handle(channel::PendingCall {
+            endpoint,
+            line,
+            reply: crate::channel::Reply::plain(sender),
+        });
+        let line = receiver.recv().expect("reply");
+        serde_json::from_str(&line).expect("response")
+    }
+
+    /// §6: the read endpoint may drive lifecycle, never a write method.
+    #[test]
+    fn the_read_endpoint_cannot_run_a_write_method() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+
+        let refused = send_on(
+            &mut daemon,
+            channel::Endpoint::User,
+            "plugin.uninstall",
+            json!({ "id": "nope" }),
+        );
+        assert_eq!(
+            refused["error"]["message"], "unauthorized",
+            "the read endpoint must not reach a write method: {refused}"
+        );
+
+        let allowed = send_on(
+            &mut daemon,
+            channel::Endpoint::User,
+            "svc.list",
+            json!({}),
+        );
+        assert!(
+            allowed.get("error").is_none(),
+            "the read endpoint must still list services: {allowed}"
+        );
+    }
+
+    /// The same write method is not refused on the admin endpoint; it fails on
+    /// the missing plugin instead of on the tier.
+    #[test]
+    fn the_admin_endpoint_reaches_a_write_method() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+
+        let response = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "plugin.uninstall",
+            json!({ "id": "nope" }),
+        );
+        assert_ne!(
+            response["error"]["message"], "unauthorized",
+            "the admin endpoint must get past the tier check: {response}"
+        );
     }
 
     fn next_line(daemon: &mut Daemon, receiver: &Receiver<String>) -> Value {
@@ -2749,7 +2839,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             &root,
         );
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(registry(vec![plugin]), "token".into(), receiver, None);
+        let mut daemon = Daemon::new(registry(vec![plugin]), receiver, None);
         daemon.start_service("plug").expect("start");
         assert!(daemon.is_live("plug"));
 
@@ -2792,7 +2882,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
 
         let core = tool_service("core", Kind::Core, &["echo"], &root);
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(registry(vec![core]), "token".into(), receiver, None);
+        let mut daemon = Daemon::new(registry(vec![core]), receiver, None);
         daemon.start_service("core").expect("start");
         assert!(daemon.is_live("core"));
 
@@ -2831,7 +2921,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
 
         let service = tool_service("proc", Kind::Core, &["progress", "fail"], &root);
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(registry(vec![service]), "token".into(), receiver, None);
+        let mut daemon = Daemon::new(registry(vec![service]), receiver, None);
         daemon.start_service("proc").expect("start");
         assert!(daemon.is_live("proc"));
         let pid = daemon
@@ -2886,7 +2976,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
     fn tool_projection_follows_the_live_state() {
         let registry = registry(vec![plugin("plug", &["echo"])]);
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(registry, "token".into(), receiver, None);
+        let mut daemon = Daemon::new(registry, receiver, None);
 
         let tools = daemon.tool_list();
         assert_eq!(tools.len(), 1);
@@ -2916,7 +3006,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             })
             .collect();
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(registry(services), "token".into(), receiver, None);
+        let mut daemon = Daemon::new(registry(services), receiver, None);
         for slot in daemon.slots.values_mut() {
             slot.machine.state = State::Running;
         }
@@ -2951,7 +3041,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             plugin("c", &["z"]),
         ]);
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(registry, "token".into(), receiver, None);
+        let mut daemon = Daemon::new(registry, receiver, None);
 
         let first = daemon.tools_page(&json!({"limit": 2})).expect("first page");
         assert_eq!(first["tools"].as_array().expect("tools").len(), 2);
@@ -2976,7 +3066,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
     fn tools_list_and_unknown_tool_use_the_documented_codes() {
         let registry = registry(vec![plugin("plug", &["echo"])]);
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(registry, "token".into(), receiver, None);
+        let mut daemon = Daemon::new(registry, receiver, None);
 
         let listed = send(&mut daemon, "tools/list", json!({}));
         let listed = wait(&mut daemon, &listed);
@@ -3001,7 +3091,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
     fn a_known_tool_on_a_dead_plugin_is_a_tool_error() {
         let registry = registry(vec![plugin("plug", &["echo"])]);
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(registry, "token".into(), receiver, None);
+        let mut daemon = Daemon::new(registry, receiver, None);
 
         let response = send(&mut daemon, "tools/call", json!({"name": "plug.echo"}));
         let response = wait(&mut daemon, &response);
@@ -3017,7 +3107,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
     fn a_capability_ending_in_start_is_not_shadowed_by_the_lifecycle_tool() {
         let registry = registry(vec![plugin("plug", &["foo.start"])]);
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(registry, "token".into(), receiver, None);
+        let mut daemon = Daemon::new(registry, receiver, None);
 
         let response = send(&mut daemon, "tools/call", json!({"name": "plug.foo.start"}));
         let response = wait(&mut daemon, &response);
@@ -3034,7 +3124,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
     fn core_services_are_not_tools() {
         let registry = registry(vec![service("core", &[])]);
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(registry, "token".into(), receiver, None);
+        let mut daemon = Daemon::new(registry, receiver, None);
 
         let response = send(&mut daemon, "tools/call", json!({"name": "core.start"}));
         let response = wait(&mut daemon, &response);
@@ -3045,7 +3135,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
     fn start_refuses_a_failed_dependency() {
         let registry = registry(vec![service("app", &["base"]), service("base", &[])]);
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(registry, "token".into(), receiver, None);
+        let mut daemon = Daemon::new(registry, receiver, None);
         daemon.slots.get_mut("base").expect("base").machine.state = State::Failed;
 
         let error = daemon.start_service("app").expect_err("failed dependency");
@@ -3068,7 +3158,6 @@ while ($null -ne ($line = $reader.ReadLine())) {
         let (_sender, receiver) = mpsc::channel();
         let mut daemon = Daemon::new(
             registry(vec![service("live", &[])]),
-            "token".into(),
             receiver,
             None,
         );
@@ -3111,7 +3200,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
         let mut registry = Registry::with_builtin();
         registry.insert(service("core", &[])).expect("core");
         let (_sender, receiver) = mpsc::channel();
-        let daemon = Daemon::new(registry, "token".into(), receiver, None);
+        let daemon = Daemon::new(registry, receiver, None);
 
         assert!(
             daemon.slots.contains_key("core"),
@@ -3134,7 +3223,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
     #[test]
     fn the_builtin_svc_is_projected_and_called_through_launchers() {
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(Registry::with_builtin(), "token".into(), receiver, None);
+        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
 
         let listed = send(&mut daemon, "tools/list", json!({}));
         let listed = wait(&mut daemon, &listed);

@@ -165,12 +165,21 @@ impl Sandbox {
     /// Stop the daemon with a bounded request and a bounded wait; see
     /// [`support::stop_daemon`] for why both bounds exist.
     fn stop_daemon(&mut self) -> Result<(), String> {
+        let config = self.config.clone();
+        self.stop_daemon_at(&config)
+    }
+
+    /// Stop, but target `config` instead of the sandbox's own. The control
+    /// socket (Unix) and the pipe name (Windows) both derive from this string,
+    /// so a dir no daemon bound makes the request genuinely unreachable.
+    fn stop_daemon_at(&mut self, config: &Path) -> Result<(), String> {
         let Some(mut child) = self.daemon.take() else {
             return Ok(());
         };
         let log = self.daemon_stderr.clone();
         let mut command = self.command(&self.svcd);
         command.arg("shutdown");
+        command.env("SVCD_CONFIG_DIR", config);
         support::stop_daemon(&mut child, &mut command, self.stop_timeout, || {
             fs::read_to_string(&log).unwrap_or_default()
         })
@@ -506,13 +515,10 @@ fn shutdown_bounds_its_wait_when_the_daemon_cannot_be_reached() {
     sandbox.start_daemon();
     sandbox.wait_for_daemon();
 
-    // Move the config directory away: the CLI can no longer resolve the control
-    // channel (a socket on Unix, a named pipe on Windows), so the request fails
-    // the way it does when a test panics before the daemon is up.
-    let moved = sandbox.root.join("config-moved");
-    fs::rename(&sandbox.config, &moved).expect("move the config directory");
+    let unreachable = sandbox.root.join("no-daemon");
+    fs::create_dir_all(&unreachable).expect("unreachable config");
 
-    support::assert_bounded_stop(|| sandbox.stop_daemon(), timeout);
+    support::assert_bounded_stop(|| sandbox.stop_daemon_at(&unreachable), timeout);
     assert!(sandbox.daemon.is_none(), "the handle must be consumed");
 }
 
@@ -524,10 +530,6 @@ fn a_silent_control_server_does_not_hold_the_shutdown_request() {
     use std::os::unix::net::UnixListener;
 
     let sandbox = Sandbox::new();
-    // The CLI reads the control token before it connects, and the daemon is the
-    // one that creates it. Without a token the request fails before reaching the
-    // socket, which is not the case under test.
-    fs::write(sandbox.config.join("svcd.token"), "silent-server-token").expect("token");
     // Bind the control socket and never accept or answer: the CLI connects,
     // sends the request, and waits for a reply that never comes.
     let _listener =

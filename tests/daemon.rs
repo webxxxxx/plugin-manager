@@ -441,6 +441,14 @@ impl Sandbox {
     /// Stop the daemon with a bounded request and a bounded wait; see
     /// [`support::stop_daemon`].
     fn stop_daemon(&mut self) -> Result<(), String> {
+        let config = self.config.clone();
+        self.stop_daemon_at(&config)
+    }
+
+    /// Stop, but target `config` instead of the sandbox's own. The control
+    /// socket (Unix) and the pipe name (Windows) both derive from this string,
+    /// so a dir no daemon bound makes the request genuinely unreachable.
+    fn stop_daemon_at(&mut self, config: &Path) -> Result<(), String> {
         let Some(mut child) = self.daemon.take() else {
             return Ok(());
         };
@@ -448,6 +456,7 @@ impl Sandbox {
         let mut command = Command::new(&self.svcd);
         command.arg("shutdown");
         self.env(&mut command);
+        command.env("SVCD_CONFIG_DIR", config);
         support::stop_daemon(&mut child, &mut command, self.stop_timeout, || {
             fs::read_to_string(&log).unwrap_or_default()
         })
@@ -471,11 +480,25 @@ fn stop_wait_is_bounded_when_the_request_cannot_reach_the_daemon() {
     sandbox.stop_timeout = timeout;
     sandbox.start_daemon();
     sandbox.wait_for_daemon();
-    let moved = sandbox.root.join("config-moved");
-    fs::rename(&sandbox.config, &moved).expect("move the config directory");
+    let unreachable = sandbox.root.join("no-daemon");
+    fs::create_dir_all(&unreachable).expect("unreachable config");
 
-    support::assert_bounded_stop(|| sandbox.stop_daemon(), timeout);
+    support::assert_bounded_stop(|| sandbox.stop_daemon_at(&unreachable), timeout);
     assert!(sandbox.daemon.is_none(), "the handle must be consumed");
+}
+
+/// The channel authorizes by endpoint ACL now; a token left by the previous
+/// version must not survive a start.
+#[test]
+fn the_legacy_control_token_is_removed_on_start() {
+    let mut sandbox = Sandbox::new();
+    fs::write(sandbox.config.join("svcd.token"), "legacy-token").expect("legacy token");
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    assert!(
+        !sandbox.config.join("svcd.token").exists(),
+        "the daemon must remove the token it no longer reads"
+    );
 }
 
 impl Drop for Sandbox {

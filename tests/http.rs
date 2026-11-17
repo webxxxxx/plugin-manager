@@ -239,6 +239,14 @@ impl Sandbox {
     /// [`support::stop_daemon`]. `child.wait()` alone could hang the suite
     /// when the request never reached the daemon.
     fn stop_daemon(&mut self) -> Result<(), String> {
+        let config = self.config.clone();
+        self.stop_daemon_at(&config)
+    }
+
+    /// Stop, but target `config` instead of the sandbox's own. The control
+    /// socket (Unix) and the pipe name (Windows) both derive from this string,
+    /// so a dir no daemon bound makes the request genuinely unreachable.
+    fn stop_daemon_at(&mut self, config: &Path) -> Result<(), String> {
         let Some(mut child) = self.daemon.take() else {
             return Ok(());
         };
@@ -246,6 +254,7 @@ impl Sandbox {
         let mut command = Command::new(&self.svcd);
         command.arg("shutdown");
         self.env(&mut command);
+        command.env("SVCD_CONFIG_DIR", config);
         support::stop_daemon(&mut child, &mut command, self.stop_timeout, || {
             fs::read_to_string(&log).unwrap_or_default()
         })
@@ -308,12 +317,10 @@ fn stop_wait_is_bounded_when_the_request_cannot_reach_the_daemon() {
     sandbox.stop_timeout = timeout;
     sandbox.start_daemon();
     sandbox.wait_for_http();
-    // The CLI can no longer resolve the control channel: the request fails the
-    // way it does when a test panics before the daemon is up.
-    let moved = sandbox.root.join("config-moved");
-    fs::rename(&sandbox.config, &moved).expect("move the config directory");
+    let unreachable = sandbox.root.join("no-daemon");
+    fs::create_dir_all(&unreachable).expect("unreachable config");
 
-    support::assert_bounded_stop(|| sandbox.stop_daemon(), timeout);
+    support::assert_bounded_stop(|| sandbox.stop_daemon_at(&unreachable), timeout);
     assert!(sandbox.daemon.is_none(), "the handle must be consumed");
 }
 
@@ -7658,19 +7665,13 @@ fn control_shutdown_reply_is_flushed_before_exit() {
     let mut sandbox = Sandbox::new();
     sandbox.start_daemon();
     let _address = sandbox.wait_for_http();
-    let token = fs::read_to_string(sandbox.config.join("svcd.token"))
-        .expect("control token")
-        .trim()
-        .to_string();
     let mut stream =
         UnixStream::connect(sandbox.config.join("svcd.sock")).expect("control connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("timeout");
-    let request = format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"svcd.shutdown\",\"params\":{{}},\"auth\":\"{}\"}}\n",
-        token
-    );
+    let request =
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"svcd.shutdown\",\"params\":{}}\n";
     stream
         .write_all(request.as_bytes())
         .expect("write shutdown request");

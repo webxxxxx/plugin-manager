@@ -71,7 +71,8 @@ struct PendingBlocking {
 
 pub(crate) fn start(
     http: Option<TcpListener>,
-    control: UnixListener,
+    control_user: UnixListener,
+    control_admin: UnixListener,
     pending: mpsc::SyncSender<PendingCall>,
     wake: Arc<Wake>,
     lan: Arc<Mutex<Lan>>,
@@ -88,7 +89,7 @@ pub(crate) fn start(
     let notify_tx = Arc::new(notify_tx);
     let loop_handle = LoopHandle::new(notify_tx.clone());
     let stop = loop_handle.stop_flag();
-    let control = ControlServer::new(control, pending, wake, notify_tx.clone())?;
+    let control = ControlServer::new(control_user, control_admin, pending, wake, notify_tx.clone())?;
 
     // The pool belongs to the server loop, not to one request. Starting it
     // before the loop means a thread-spawn failure fails HTTP startup instead
