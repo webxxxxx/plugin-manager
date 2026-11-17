@@ -189,9 +189,8 @@ pub use super::stream::StreamHandler;
 /// The one new seam: a face makes a route decision and handles a request.
 pub trait Face: Send + Sync {
     /// Decide whether this face owns the request and how its body is handled.
-    /// The contract calls this before the body is read; the legacy engines in
-    /// #113 still buffer first, and #114 moves the call ahead of the read.
-    /// `None` leaves the request to the legacy path.
+    /// `None` leaves the request to the server-owned buffered routes. The
+    /// pre-body stream hooks run before this decision.
     fn route(&self, method: &str, path: &str) -> Option<Route>;
 
     /// Handle a routed request. Must call `done.complete` exactly once.

@@ -5517,6 +5517,9 @@ fn unix_idle_thread_count_has_no_per_request_or_per_stream_threads() {
         1,
         "the control channel runs on the one server loop: {names:?}"
     );
+    // /proc/<pid>/task/*/comm truncates the name to 15 characters, so these
+    // prefixes are the observable form of svcd-http-worker, svcd-temp-cleanup,
+    // svcd-import-http and svcd-install-http.
     for gone in [
         "svcd-http-work",
         "svcd-temp-clea",

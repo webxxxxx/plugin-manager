@@ -488,7 +488,7 @@ impl Daemon {
                 settings.temp_retention(),
                 settings.temp_cleanup_interval().as_millis() as u64,
             ),
-            Err(_) => (Duration::from_secs(2 * 60 * 60), 0),
+            Err(_) => (crate::settings::Settings::default().temp_retention(), 0),
         };
         let mut launchers = Launchers::default();
         launchers.register("builtin", Box::new(crate::builtin_adapter::BuiltinLauncher));

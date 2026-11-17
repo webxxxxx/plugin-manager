@@ -414,6 +414,8 @@ impl ServerLoop for Server {
                     response,
                     keep_alive,
                 } => {
+                    // The pool's own BlockingDone clears stream_job_keys; this
+                    // map only tracks the connection's one in-flight job.
                     self.stream_jobs.remove(&connection);
                     if let Some(connection) = connections.get_mut(&connection) {
                         write_response(connection, response, keep_alive);
@@ -459,6 +461,9 @@ impl ServerLoop for Server {
                     connection: id,
                     outcome,
                 } => {
+                    // The job is no longer in flight. A follow-up job submitted
+                    // from service_stream_job below gets a fresh key.
+                    self.stream_jobs.remove(&id);
                     let keep = match connections.get_mut(&id) {
                         Some(connection) => deliver_stream_outcome(connection, outcome),
                         None => false,
@@ -603,39 +608,39 @@ impl Server {
         keep_alive: bool,
     ) {
         let id = connection.id;
-        let key = self.next_stream_job;
-        self.next_stream_job = self.next_stream_job.wrapping_add(1).max(1 << 32);
-        let fallback = self.fallback.clone();
-        let lan = self.lan.clone();
-        let results = self.results_tx.clone();
-        let notify = self.notify.try_clone().ok();
-        let submitted = self.blocking.try_submit(key, move |cancel| {
-            if cancel.is_cancelled() {
-                return;
-            }
-            let response = fallback(&request, &lan);
-            let response = if keep_alive {
-                keep_alive_response(response)
-            } else {
-                response
-            };
-            let _ = results.send(WorkResult::Rendered {
-                connection: id,
-                response,
-                keep_alive,
-            });
-            if let Some(notify) = &notify {
-                let _ = (&*notify).write(&[1]);
-            }
-        });
+        let key = self.next_job_key();
+        let submitted = submit_rendered_job(
+            &self.blocking,
+            id,
+            key,
+            self.fallback.clone(),
+            self.lan.clone(),
+            self.results_tx.clone(),
+            self.notify.try_clone().ok(),
+            request,
+            keep_alive,
+        );
         match submitted {
             Ok(()) => {
+                debug_assert!(
+                    !self.stream_jobs.contains_key(&id),
+                    "one in-flight blocking job per connection"
+                );
                 self.stream_jobs.insert(id, key);
                 self.stream_job_keys.insert(key);
                 connection.state = ConnState::Processing;
             }
-            Err(_) => write_response(connection, blocking_busy(Busy::QueueFull), false),
+            Err(busy) => write_response(connection, blocking_busy(busy), false),
         }
+    }
+
+    /// Allocate one detached blocking-pool key. Face jobs and server-owned
+    /// routes share the range so a pool completion can never collide with a
+    /// connection id.
+    fn next_job_key(&mut self) -> u64 {
+        let key = self.next_stream_job;
+        self.next_stream_job = self.next_stream_job.wrapping_add(1).max(1 << 32);
+        key
     }
 
     /// Hand the stream handler's one pending job to the blocking pool. The
@@ -651,8 +656,7 @@ impl Server {
         let Some(job) = job else {
             return;
         };
-        let key = self.next_stream_job;
-        self.next_stream_job = self.next_stream_job.wrapping_add(1).max(1 << 32);
+        let key = self.next_job_key();
         let results = self.results_tx.clone();
         let notify = self.notify.try_clone().ok();
         let submitted = self.blocking.try_submit(key, move |cancel| {
@@ -670,6 +674,10 @@ impl Server {
         });
         match submitted {
             Ok(()) => {
+                debug_assert!(
+                    !self.stream_jobs.contains_key(&id),
+                    "one in-flight blocking job per connection"
+                );
                 self.stream_jobs.insert(id, key);
                 self.stream_job_keys.insert(key);
             }
@@ -933,6 +941,40 @@ fn blocking_busy(busy: Busy) -> Vec<u8> {
     })
 }
 
+/// Submit one server-owned buffered route. Kept as a free function so a
+/// queue-full test can drive it without building a whole connection table.
+fn submit_rendered_job(
+    pool: &BlockingPool,
+    connection: u64,
+    key: u64,
+    fallback: FallbackHandler,
+    lan: Arc<Mutex<Lan>>,
+    results: Sender<WorkResult>,
+    notify: Option<UnixStream>,
+    request: HttpRequest,
+    keep_alive: bool,
+) -> Result<(), Busy> {
+    pool.try_submit(key, move |cancel| {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let response = fallback(&request, &lan);
+        let response = if keep_alive {
+            keep_alive_response(response)
+        } else {
+            response
+        };
+        let _ = results.send(WorkResult::Rendered {
+            connection,
+            response,
+            keep_alive,
+        });
+        if let Some(notify) = &notify {
+            let _ = (&*notify).write(&[1]);
+        }
+    })
+}
+
 /// Whether the peer sent FIN, without consuming data already buffered in the
 /// socket (that data is the next pipelined request). Called only for a
 /// `Processing` connection; the normal read path detects EOF itself.
@@ -965,6 +1007,40 @@ fn socket_closed(fd: RawFd) -> bool {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[test]
+    fn a_full_blocking_pool_refuses_a_server_owned_route() {
+        let (results, _results_rx) = mpsc::channel();
+        let pool = BlockingPool::start(1, 1, |_, _| {}).expect("pool");
+        let (release, wait) = mpsc::channel::<()>();
+        let (started, running) = mpsc::channel::<()>();
+        pool.try_submit(1, move |_| {
+            let _ = started.send(());
+            let _ = wait.recv();
+        })
+        .expect("running job");
+        running.recv().expect("worker started");
+        pool.try_submit(2, |_| {}).expect("queued job");
+
+        let bind: std::net::SocketAddr = "127.0.0.1:0".parse().expect("bind");
+        let lan = Arc::new(Mutex::new(Lan::new(bind, bind, false, None)));
+        let (notify, _peer) = UnixStream::pair().expect("pair");
+        let fallback: FallbackHandler =
+            Arc::new(|_, _| http::json_error(500, "internal", "unused"));
+        let request = HttpRequest {
+            method: "GET".into(),
+            path: "/api/v1/blobs".into(),
+            version: "HTTP/1.1".into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let busy = submit_rendered_job(
+            &pool, 7, 3, fallback, lan, results, Some(notify), request, false,
+        )
+        .expect_err("a full pool must refuse the route");
+        assert_eq!(busy, Busy::QueueFull);
+        let _ = release.send(());
+    }
 
     #[test]
     fn a_graceful_peer_close_is_detected_without_consuming_bytes() {

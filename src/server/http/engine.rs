@@ -135,13 +135,13 @@ pub trait ServerLoop {
     fn on_close(&mut self, connection: &mut Connection<Self::State>);
 
     /// The loop is about to drop a connection after `POLLERR` / `POLLHUP`.
-    /// Legacy handlers use this for protocol-specific diagnostics.
+    /// Handlers use this for protocol-specific diagnostics.
     fn on_poll_error(&mut self, connection: &mut Connection<Self::State>, _revents: i16) {
         let _ = connection;
     }
 
-    /// The legacy worker wakes the loop through this fd; the loop only uses it
-    /// to leave poll early, the handler drains it in `on_tick`.
+    /// The blocking pool and control client wake the loop through this fd; the
+    /// loop only uses it to leave poll early, the handler drains it in `on_tick`.
     fn wake_fd(&self) -> Option<RawFd> {
         None
     }
