@@ -19,6 +19,7 @@ use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{Map, Value};
 
+use crate::kernel::failure::{Problem, ProblemError};
 use crate::package::{self, Manifest};
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -54,54 +55,53 @@ struct SourceFile {
     mode: u32,
 }
 
-pub fn bundle(options: &Options) -> Result<PathBuf, String> {
+pub fn bundle(options: &Options) -> Result<PathBuf, ProblemError> {
     let dir = fs::canonicalize(&options.dir)
-        .map_err(|error| format!("cannot read {}: {}", options.dir.display(), error))?;
+        .map_err(|error| Problem::Invalid.error(format!("cannot read {}: {}", options.dir.display(), error)))?;
     if !dir.is_dir() {
-        return Err(format!("not a directory: {}", dir.display()));
+        return Err(Problem::Invalid.error(format!("not a directory: {}", dir.display())));
     }
     if options.unsigned && (options.key.is_some() || options.key_id.is_some()) {
-        return Err("--unsigned cannot be combined with --key or --key-id".into());
+        return Err(Problem::Invalid.error("--unsigned cannot be combined with --key or --key-id"));
     }
     let key_path = match (options.key.as_deref(), options.unsigned) {
         (_, true) => None,
         (Some(key), false) => {
             let key = fs::canonicalize(key)
-                .map_err(|error| format!("read key {}: {}", key.display(), error))?;
+                .map_err(|error| Problem::Internal.error(format!("read key {}: {}", key.display(), error)))?;
             if key.starts_with(&dir) {
-                return Err("the signing key must not be inside the bundle directory".into());
+                return Err(Problem::Invalid.error("the signing key must not be inside the bundle directory"));
             }
             Some(key)
         }
         (None, false) => {
-            return Err(
-                "bundle requires --key <ed25519-private.pem> (or --unsigned for local builds)"
-                    .to_string(),
-            )
+            return Err(Problem::Invalid.error(
+                "bundle requires --key <ed25519-private.pem> (or --unsigned for local builds)",
+            ))
         }
     };
     if let Some(platform) = &options.platform {
         if !valid_platform(platform) {
-            return Err(format!("invalid target triple: {:?}", platform));
+            return Err(Problem::UnsupportedPlatform.error(format!("invalid target triple: {:?}", platform)));
         }
     }
 
     let mut sources = collect(&dir)?;
     if sources.is_empty() {
-        return Err("directory contains no files to bundle".into());
+        return Err(Problem::Invalid.error("directory contains no files to bundle"));
     }
     if sources.len() > package::MAX_FILES {
-        return Err(format!(
+        return Err(Problem::Invalid.error(format!(
             "too many files to bundle (limit {})",
             package::MAX_FILES
-        ));
+        )));
     }
     let total: u64 = sources.iter().map(|source| source.data.len() as u64).sum();
     if total > package::MAX_PACKAGE_BYTES {
-        return Err(format!(
+        return Err(Problem::TooLarge.error(format!(
             "package exceeds {} MiB",
             package::MAX_PACKAGE_BYTES / (1024 * 1024)
-        ));
+        )));
     }
 
     let skeleton = read_skeleton(&dir)?;
@@ -119,7 +119,7 @@ pub fn bundle(options: &Options) -> Result<PathBuf, String> {
     });
     let absolute = absolute_output(&path)?;
     if absolute.starts_with(&dir) {
-        return Err("package output must be outside the bundle directory".into());
+        return Err(Problem::Invalid.error("package output must be outside the bundle directory"));
     }
 
     let signature_bytes = match &key_path {
@@ -130,7 +130,7 @@ pub fn bundle(options: &Options) -> Result<PathBuf, String> {
                 None => default_key_id(key_path)?,
             };
             if !package::valid_key_id(&key_id) {
-                return Err(format!("invalid keyId: {} (pass --key-id)", key_id));
+                return Err(Problem::Invalid.error(format!("invalid keyId: {} (pass --key-id)", key_id)));
             }
             let signing_key = read_private_key(key_path)?;
             let signature = signing_key.sign(&manifest_bytes);
@@ -141,7 +141,7 @@ pub fn bundle(options: &Options) -> Result<PathBuf, String> {
             });
             Some(
                 serde_json::to_vec(&signature)
-                    .map_err(|error| format!("serialize signature: {}", error))?,
+                    .map_err(|error| Problem::Invalid.error(format!("serialize signature: {}", error)))?,
             )
         }
     };
@@ -155,13 +155,13 @@ pub fn bundle(options: &Options) -> Result<PathBuf, String> {
     }
     let archive = package::write_tar(&entries)?;
     if archive.len() as u64 > package::MAX_PACKAGE_BYTES {
-        return Err(format!(
+        return Err(Problem::TooLarge.error(format!(
             "package exceeds {} MiB",
             package::MAX_PACKAGE_BYTES / (1024 * 1024)
-        ));
+        )));
     }
 
-    fs::write(&path, &archive).map_err(|error| format!("write {}: {}", path.display(), error))?;
+    fs::write(&path, &archive).map_err(|error| Problem::Internal.error(format!("write {}: {}", path.display(), error)))?;
 
     Ok(path)
 }
@@ -171,7 +171,7 @@ fn assemble_manifest(
     sources: &mut [SourceFile],
     mut manifest: Map<String, Value>,
     options: &Options,
-) -> Result<(Vec<u8>, Manifest), String> {
+) -> Result<(Vec<u8>, Manifest), ProblemError> {
     let directory_name = dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -184,14 +184,14 @@ fn assemble_manifest(
             .map(str::to_string)
             .or_else(|| directory_name.clone())
             .ok_or_else(|| {
-                "cannot derive the plugin id from the directory name; pass --id".to_string()
+                Problem::Invalid.error("cannot derive the plugin id from the directory name; pass --id")
             })?,
     };
     if !package::valid_name(&name) {
-        return Err(format!(
+        return Err(Problem::Invalid.error(format!(
             "invalid plugin id: {} (expected [a-z0-9][a-z0-9_-]{{0,63}}; pass --id)",
             name
-        ));
+        )));
     }
     let version = match &options.version {
         Some(version) => version.clone(),
@@ -202,10 +202,10 @@ fn assemble_manifest(
             .unwrap_or_else(|| "0.1.0".to_string()),
     };
     if !package::valid_version(&version) {
-        return Err(format!(
+        return Err(Problem::Invalid.error(format!(
             "version is not semver: {} (pass --version)",
             version
-        ));
+        )));
     }
     let desc = match &options.desc {
         Some(desc) => desc.clone(),
@@ -217,7 +217,7 @@ fn assemble_manifest(
             .unwrap_or_else(|| name.clone()),
     };
     if desc.is_empty() {
-        return Err("desc must not be empty (pass --desc)".into());
+        return Err(Problem::Invalid.error("desc must not be empty (pass --desc)"));
     }
 
     let declared_exec = manifest
@@ -234,7 +234,7 @@ fn assemble_manifest(
         },
     };
     if !sources.iter().any(|source| source.path == exec_path) {
-        return Err(format!("exec.path is not in files[]: {}", exec_path));
+        return Err(Problem::Invalid.error(format!("exec.path is not in files[]: {}", exec_path)));
     }
     package::check_path(&exec_path)?;
 
@@ -244,10 +244,10 @@ fn assemble_manifest(
             .find(|source| source.path == exec_path)
             .expect("exec membership checked above");
         if package::is_native_binary(&source.data) {
-            return Err("--from-core needs a script payload, but exec is a native binary".into());
+            return Err(Problem::Invalid.error("--from-core needs a script payload, but exec is a native binary"));
         }
         if manifest.contains_key("capabilities") {
-            return Err("--from-core packages cannot declare capabilities".into());
+            return Err(Problem::Invalid.error("--from-core packages cannot declare capabilities"));
         }
         let extension = std::path::Path::new(&exec_path)
             .extension()
@@ -290,10 +290,10 @@ fn assemble_manifest(
     }
 
     if options.interpreter_version.is_some() && options.interpreter.is_none() {
-        return Err("--interpreter-version requires --interpreter".into());
+        return Err(Problem::Invalid.error("--interpreter-version requires --interpreter"));
     }
     if !options.interpreter_args.is_empty() && options.interpreter.is_none() {
-        return Err("--interpreter-arg requires --interpreter".into());
+        return Err(Problem::Invalid.error("--interpreter-arg requires --interpreter"));
     }
     if let Some(name) = &options.interpreter {
         let mut interpreter = manifest
@@ -321,7 +321,7 @@ fn assemble_manifest(
         manifest.insert("interpreter".into(), Value::Object(interpreter));
     }
     if options.from_core && !manifest.contains_key("interpreter") {
-        return Err("--from-core with a script payload requires --interpreter <name>".into());
+        return Err(Problem::Invalid.error("--from-core with a script payload requires --interpreter <name>"));
     }
 
     if !manifest.contains_key("hooks") {
@@ -360,10 +360,10 @@ fn assemble_manifest(
     for path in &hook_paths {
         if let Some(source) = sources.iter().find(|source| &source.path == path) {
             if !source.data.starts_with(b"#!") {
-                return Err(format!("hook must start with a shebang: {}", path));
+                return Err(Problem::Invalid.error(format!("hook must start with a shebang: {}", path)));
             }
             if source.data.contains(&b'\r') {
-                return Err(format!("hook must use LF line endings: {}", path));
+                return Err(Problem::Invalid.error(format!("hook must use LF line endings: {}", path)));
             }
         }
     }
@@ -394,7 +394,7 @@ fn assemble_manifest(
         let mut devices = Vec::new();
         for device in &options.compat {
             crate::compat::validate_device_id(device)
-                .map_err(|error| format!("--compat {}: {}", device, error))?;
+                .map_err(|error| Problem::Invalid.error(format!("--compat {}: {}", device, error)))?;
             if seen.insert(device.clone()) {
                 devices.push(device.clone());
             }
@@ -411,11 +411,10 @@ fn assemble_manifest(
         .map(|items| !items.is_empty())
         .unwrap_or(false);
     if has_kernel_module && !declared_compat {
-        return Err(
+        return Err(Problem::Invalid.error(
             "the payload contains a kernel module (.ko); pass --compat <device> so it is only \
-             installed on the matching firmware generation"
-                .into(),
-        );
+             installed on the matching firmware generation",
+        ));
     }
 
     let needs_three = declared_compat || has_kernel_module;
@@ -467,7 +466,7 @@ fn assemble_manifest(
         manifest.insert("ui".into(), serde_json::json!({"type": "web"}));
     }
     let manifest_bytes = serde_json::to_vec(&Value::Object(manifest))
-        .map_err(|error| format!("serialize manifest: {}", error))?;
+        .map_err(|error| Problem::Invalid.error(format!("serialize manifest: {}", error)))?;
     let parsed = package::parse_manifest(&manifest_bytes)?;
     package::validate_manifest(&parsed)?;
     let borrowed: Vec<(&str, &[u8])> = sources
@@ -478,29 +477,29 @@ fn assemble_manifest(
     Ok((manifest_bytes, parsed))
 }
 
-fn absolute_output(path: &Path) -> Result<PathBuf, String> {
+fn absolute_output(path: &Path) -> Result<PathBuf, ProblemError> {
     let absolute = std::path::absolute(path)
-        .map_err(|error| format!("resolve {}: {}", path.display(), error))?;
+        .map_err(|error| Problem::Invalid.error(format!("resolve {}: {}", path.display(), error)))?;
     let parent = match absolute.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
     };
     let parent = fs::canonicalize(parent)
-        .map_err(|error| format!("resolve {}: {}", path.display(), error))?;
+        .map_err(|error| Problem::Invalid.error(format!("resolve {}: {}", path.display(), error)))?;
     Ok(match absolute.file_name() {
         Some(name) => parent.join(name),
         None => parent,
     })
 }
 
-fn collect(root: &Path) -> Result<Vec<SourceFile>, String> {
+fn collect(root: &Path) -> Result<Vec<SourceFile>, ProblemError> {
     let mut sources = Vec::new();
     walk(root, root, &mut sources)?;
     sources.sort_by(|left, right| left.path.cmp(&right.path));
     let mut seen = BTreeSet::new();
     for source in &sources {
         if !seen.insert(source.path.clone()) {
-            return Err(format!("duplicate path: {}", source.path));
+            return Err(Problem::Invalid.error(format!("duplicate path: {}", source.path)));
         }
     }
     Ok(sources)
@@ -518,30 +517,30 @@ fn is_sparse(len: u64, allocated_blocks: u64) -> bool {
     allocated_blocks > 0 && allocated_blocks.saturating_mul(512) < len
 }
 
-fn walk(root: &Path, directory: &Path, out: &mut Vec<SourceFile>) -> Result<(), String> {
+fn walk(root: &Path, directory: &Path, out: &mut Vec<SourceFile>) -> Result<(), ProblemError> {
     let mut entries: Vec<fs::DirEntry> = fs::read_dir(directory)
-        .map_err(|error| format!("read {}: {}", directory.display(), error))?
+        .map_err(|error| Problem::Internal.error(format!("read {}: {}", directory.display(), error)))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("read {}: {}", directory.display(), error))?;
+        .map_err(|error| Problem::Internal.error(format!("read {}: {}", directory.display(), error)))?;
     entries.sort_by_key(|entry| entry.file_name());
 
     for entry in entries {
         let path = entry.path();
         let relative = relative_path(root, &path)?;
         if relative == ".." || relative.starts_with("../") {
-            return Err(format!("unsafe path: {}", relative));
+            return Err(Problem::Invalid.error(format!("unsafe path: {}", relative)));
         }
         let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| format!("stat {}: {}", path.display(), error))?;
+            .map_err(|error| Problem::Internal.error(format!("stat {}: {}", path.display(), error)))?;
         if metadata.file_type().is_symlink() {
-            return Err(format!("symbolic links are not allowed: {}", relative));
+            return Err(Problem::Invalid.error(format!("symbolic links are not allowed: {}", relative)));
         }
         if metadata.is_dir() {
             walk(root, &path, out)?;
             continue;
         }
         if !metadata.is_file() {
-            return Err(format!("not a regular file: {}", relative));
+            return Err(Problem::Invalid.error(format!("not a regular file: {}", relative)));
         }
         if matches!(relative.as_str(), "manifest.json" | "signature.json") {
             continue;
@@ -550,35 +549,35 @@ fn walk(root: &Path, directory: &Path, out: &mut Vec<SourceFile>) -> Result<(), 
         // files that declare a huge logical size but hold almost no data,
         // before `fs::read` would try to materialize them.
         if metadata.len() > package::MAX_PACKAGE_BYTES {
-            return Err(format!(
+            return Err(Problem::TooLarge.error(format!(
                 "file exceeds {} MiB: {}",
                 package::MAX_PACKAGE_BYTES / (1024 * 1024),
                 relative
-            ));
+            )));
         }
         #[cfg(windows)]
         {
             let file =
-                fs::File::open(&path).map_err(|error| format!("read {}: {}", relative, error))?;
+                fs::File::open(&path).map_err(|error| Problem::Internal.error(format!("read {}: {}", relative, error)))?;
             let info = windows_file_info(&file, &relative)?;
             if info.NumberOfLinks > 1 {
-                return Err(format!("hard links are not allowed: {}", relative));
+                return Err(Problem::Invalid.error(format!("hard links are not allowed: {}", relative)));
             }
             if info.EndOfFile > info.AllocationSize {
-                return Err(format!("sparse files are not allowed: {}", relative));
+                return Err(Problem::Invalid.error(format!("sparse files are not allowed: {}", relative)));
             }
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
             if metadata.nlink() > 1 {
-                return Err(format!("hard links are not allowed: {}", relative));
+                return Err(Problem::Invalid.error(format!("hard links are not allowed: {}", relative)));
             }
             if is_sparse(metadata.len(), metadata.blocks()) {
-                return Err(format!("sparse files are not allowed: {}", relative));
+                return Err(Problem::Invalid.error(format!("sparse files are not allowed: {}", relative)));
             }
         }
-        let data = fs::read(&path).map_err(|error| format!("read {}: {}", relative, error))?;
+        let data = fs::read(&path).map_err(|error| Problem::Internal.error(format!("read {}: {}", relative, error)))?;
         out.push(SourceFile {
             path: relative,
             data,
@@ -588,23 +587,23 @@ fn walk(root: &Path, directory: &Path, out: &mut Vec<SourceFile>) -> Result<(), 
     Ok(())
 }
 
-fn relative_path(root: &Path, path: &Path) -> Result<String, String> {
+fn relative_path(root: &Path, path: &Path) -> Result<String, ProblemError> {
     let relative = path
         .strip_prefix(root)
-        .map_err(|_| format!("{} is outside {}", path.display(), root.display()))?;
+        .map_err(|_| Problem::Invalid.error(format!("{} is outside {}", path.display(), root.display())))?;
     let mut parts = Vec::new();
     for component in relative.components() {
         match component {
             Component::Normal(name) => {
                 let name = name
                     .to_str()
-                    .ok_or_else(|| format!("non-UTF-8 file name under {}", root.display()))?;
+                    .ok_or_else(|| Problem::Invalid.error(format!("non-UTF-8 file name under {}", root.display())))?;
                 if name.contains('\\') {
-                    return Err(format!("backslash in file name: {}", path.display()));
+                    return Err(Problem::Invalid.error(format!("backslash in file name: {}", path.display())));
                 }
                 parts.push(name.to_string());
             }
-            _ => return Err(format!("unsafe path: {}", relative.display())),
+            _ => return Err(Problem::Invalid.error(format!("unsafe path: {}", relative.display()))),
         }
     }
     Ok(parts.join("/"))
@@ -614,7 +613,7 @@ fn relative_path(root: &Path, path: &Path) -> Result<String, String> {
 fn windows_file_info(
     file: &fs::File,
     relative: &str,
-) -> Result<windows_sys::Win32::Storage::FileSystem::FILE_STANDARD_INFO, String> {
+) -> Result<windows_sys::Win32::Storage::FileSystem::FILE_STANDARD_INFO, ProblemError> {
     use std::mem::size_of;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -631,27 +630,27 @@ fn windows_file_info(
         )
     };
     if ok == 0 {
-        return Err(format!(
+        return Err(Problem::Internal.error(format!(
             "stat {}: {}",
             relative,
             std::io::Error::last_os_error()
-        ));
+        )));
     }
     Ok(info)
 }
 
 #[cfg(unix)]
-fn raw_mode(metadata: &fs::Metadata, path: &Path) -> Result<u32, String> {
+fn raw_mode(metadata: &fs::Metadata, path: &Path) -> Result<u32, ProblemError> {
     use std::os::unix::fs::PermissionsExt;
     let mode = metadata.permissions().mode();
     if mode & 0o6000 != 0 {
-        return Err(format!("setuid/setgid is not allowed: {}", path.display()));
+        return Err(Problem::Invalid.error(format!("setuid/setgid is not allowed: {}", path.display())));
     }
     Ok(mode & 0o777)
 }
 
 #[cfg(not(unix))]
-fn raw_mode(_metadata: &fs::Metadata, _path: &Path) -> Result<u32, String> {
+fn raw_mode(_metadata: &fs::Metadata, _path: &Path) -> Result<u32, ProblemError> {
     Ok(0)
 }
 
@@ -661,7 +660,7 @@ fn effective_mode(
     exec: &str,
     hooks: &BTreeSet<String>,
     interpreter_runs_exec: bool,
-) -> Result<u32, String> {
+) -> Result<u32, ProblemError> {
     #[cfg(not(unix))]
     let _ = raw;
     #[cfg(not(unix))]
@@ -676,7 +675,7 @@ fn effective_mode(
                 return Ok(if raw & 0o111 == 0 { 0o755 } else { raw });
             }
             if raw & 0o111 == 0 {
-                return Err(format!("{} is not executable", path));
+                return Err(Problem::Invalid.error(format!("{} is not executable", path)));
             }
             return Ok(raw);
         }
@@ -717,13 +716,13 @@ fn valid_platform(platform: &str) -> bool {
         })
 }
 
-fn normalize_exec(value: &str) -> Result<String, String> {
+fn normalize_exec(value: &str) -> Result<String, ProblemError> {
     let value = value.strip_prefix("./").unwrap_or(value);
     package::check_path(value)?;
     Ok(value.to_string())
 }
 
-fn detect_exec(sources: &[SourceFile], accept_scripts: bool) -> Result<String, String> {
+fn detect_exec(sources: &[SourceFile], accept_scripts: bool) -> Result<String, ProblemError> {
     let mut candidates: Vec<String> = sources
         .iter()
         .filter(|source| {
@@ -734,12 +733,12 @@ fn detect_exec(sources: &[SourceFile], accept_scripts: bool) -> Result<String, S
     candidates.sort();
     candidates.dedup();
     match candidates.len() {
-        0 => Err("cannot determine exec.path; pass --exec <path>".into()),
+        0 => Err(Problem::Invalid.error("cannot determine exec.path; pass --exec <path>")),
         1 => Ok(candidates.remove(0)),
-        _ => Err(format!(
+        _ => Err(Problem::Invalid.error(format!(
             "multiple executable candidates: {}; pass --exec <path>",
             candidates.join(", ")
-        )),
+        ))),
     }
 }
 
@@ -769,59 +768,59 @@ fn looks_executable(source: &SourceFile, accept_scripts: bool) -> bool {
     }
 }
 
-fn read_skeleton(dir: &Path) -> Result<Option<Map<String, Value>>, String> {
+fn read_skeleton(dir: &Path) -> Result<Option<Map<String, Value>>, ProblemError> {
     let path = dir.join("manifest.json");
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("stat {}: {}", path.display(), error)),
+        Err(error) => return Err(Problem::Internal.error(format!("stat {}: {}", path.display(), error))),
     };
     if metadata.file_type().is_symlink() {
-        return Err("symbolic links are not allowed: manifest.json".into());
+        return Err(Problem::Invalid.error("symbolic links are not allowed: manifest.json"));
     }
     if !metadata.is_file() {
-        return Err("manifest.json must be a regular file".into());
+        return Err(Problem::Invalid.error("manifest.json must be a regular file"));
     }
-    let bytes = fs::read(&path).map_err(|error| format!("read {}: {}", path.display(), error))?;
+    let bytes = fs::read(&path).map_err(|error| Problem::Internal.error(format!("read {}: {}", path.display(), error)))?;
     let value: Value =
-        serde_json::from_slice(&bytes).map_err(|error| format!("{}: {}", path.display(), error))?;
+        serde_json::from_slice(&bytes).map_err(|error| Problem::Invalid.error(format!("{}: {}", path.display(), error)))?;
     match value {
         Value::Object(map) => Ok(Some(map)),
-        _ => Err("manifest.json must contain a JSON object".into()),
+        _ => Err(Problem::Invalid.error("manifest.json must contain a JSON object")),
     }
 }
 
-fn default_key_id(path: &Path) -> Result<String, String> {
+fn default_key_id(path: &Path) -> Result<String, ProblemError> {
     path.file_stem()
         .and_then(|stem| stem.to_str())
         .map(str::to_string)
-        .ok_or_else(|| "cannot derive keyId from the key file name; pass --key-id".to_string())
+        .ok_or_else(|| Problem::Invalid.error("cannot derive keyId from the key file name; pass --key-id"))
 }
 
-fn read_private_key(path: &Path) -> Result<SigningKey, String> {
+fn read_private_key(path: &Path) -> Result<SigningKey, ProblemError> {
     let bytes =
-        fs::read(path).map_err(|error| format!("read key {}: {}", path.display(), error))?;
+        fs::read(path).map_err(|error| Problem::Internal.error(format!("read key {}: {}", path.display(), error)))?;
     let text = String::from_utf8(bytes)
-        .map_err(|_| format!("key {} is not an Ed25519 PKCS#8 PEM", path.display()))?;
+        .map_err(|_| Problem::Invalid.error(format!("key {} is not an Ed25519 PKCS#8 PEM", path.display())))?;
     let body = pem_body(&text, "PRIVATE KEY")
-        .ok_or_else(|| format!("key {} is not an Ed25519 PKCS#8 PEM", path.display()))?;
+        .ok_or_else(|| Problem::Invalid.error(format!("key {} is not an Ed25519 PKCS#8 PEM", path.display())))?;
     let body: String = body.lines().map(str::trim).collect();
     let der = BASE64
         .decode(body)
-        .map_err(|error| format!("key {} base64: {}", path.display(), error))?;
+        .map_err(|error| Problem::Invalid.error(format!("key {} base64: {}", path.display(), error)))?;
     const PREFIX: [u8; 16] = [
         0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
         0x20,
     ];
     if der.len() != 48 || !der.starts_with(&PREFIX) {
-        return Err(format!(
+        return Err(Problem::Invalid.error(format!(
             "key {} is not an Ed25519 PKCS#8 PEM",
             path.display()
-        ));
+        )));
     }
     let seed: [u8; 32] = der[16..]
         .try_into()
-        .map_err(|_| "Ed25519 private key length".to_string())?;
+        .map_err(|_| Problem::Invalid.error("Ed25519 private key length"))?;
     Ok(SigningKey::from_bytes(&seed))
 }
 
@@ -935,7 +934,7 @@ mod tests {
         let mut options = bundle_options(source.path(), &out, &key_path);
 
         let error = bundle(&options).expect_err("kernel module without compat");
-        assert!(error.contains("--compat"), "{error}");
+        assert!(error.detail().contains("--compat"), "{error}");
 
         options.compat = vec!["sr6110".into()];
         options.platform = Some("aarch64-unknown-linux-musl".into());
@@ -1133,7 +1132,7 @@ mod tests {
         options.key = None;
 
         let error = bundle(&options).expect_err("missing key");
-        assert!(error.contains("--key"), "{error}");
+        assert!(error.detail().contains("--key"), "{error}");
         assert!(!out.exists());
     }
 
@@ -1188,14 +1187,14 @@ mod tests {
         let mut ambiguous = bundle_options(source.path(), &work.path().join("a.spk"), &key_path);
         ambiguous.id = Some("ambiguous".into());
         let error = bundle(&ambiguous).expect_err("ambiguous");
-        assert!(error.contains("multiple executable candidates"), "{error}");
+        assert!(error.detail().contains("multiple executable candidates"), "{error}");
 
         let source = TempDir::new();
         write(source.path(), "README.md", b"readme", 0o644);
         let mut missing = bundle_options(source.path(), &work.path().join("b.spk"), &key_path);
         missing.id = Some("missing".into());
         let error = bundle(&missing).expect_err("missing exec");
-        assert!(error.contains("cannot determine exec.path"), "{error}");
+        assert!(error.detail().contains("cannot determine exec.path"), "{error}");
     }
 
     #[test]
@@ -1272,19 +1271,19 @@ mod tests {
         options.id = Some("demo".into());
         options.exec = Some("payload/bin/missing".into());
         let error = bundle(&options).expect_err("missing exec");
-        assert!(error.contains("exec.path is not in files[]"), "{error}");
+        assert!(error.detail().contains("exec.path is not in files[]"), "{error}");
 
         options.exec = Some("../escape".into());
         let error = bundle(&options).expect_err("unsafe exec");
-        assert!(error.contains("unsafe path"), "{error}");
+        assert!(error.detail().contains("unsafe path"), "{error}");
 
         options.exec = Some("/absolute/tool".into());
         let error = bundle(&options).expect_err("absolute exec");
-        assert!(error.contains("unsafe path"), "{error}");
+        assert!(error.detail().contains("unsafe path"), "{error}");
 
         options.exec = Some("payload\\bin\\tool".into());
         let error = bundle(&options).expect_err("backslash exec");
-        assert!(error.contains("unsafe path"), "{error}");
+        assert!(error.detail().contains("unsafe path"), "{error}");
     }
 
     #[test]
@@ -1306,7 +1305,7 @@ mod tests {
         let key_path = key_file(&work, 27);
         let out = work.path().join("out.spk");
         let error = bundle(&bundle_options(source.path(), &out, &key_path)).expect_err("hook");
-        assert!(error.contains("postInstall is not in files[]"), "{error}");
+        assert!(error.detail().contains("postInstall is not in files[]"), "{error}");
     }
 
     #[test]
@@ -1325,7 +1324,7 @@ mod tests {
         ] {
             options.platform = Some(platform.into());
             let error = bundle(&options).expect_err("invalid platform");
-            assert!(error.contains("invalid target triple"), "{error}");
+            assert!(error.detail().contains("invalid target triple"), "{error}");
         }
     }
 
@@ -1344,7 +1343,7 @@ mod tests {
         let mut options = bundle_options(source.path(), &out, &key_path);
         options.id = Some("demo".into());
         let error = bundle(&options).expect_err("output inside");
-        assert!(error.contains("outside the bundle directory"), "{error}");
+        assert!(error.detail().contains("outside the bundle directory"), "{error}");
         assert!(!out.exists());
     }
 
@@ -1363,7 +1362,7 @@ mod tests {
         let mut options = bundle_options(source.path(), &out, &key_path);
         options.id = Some("demo".into());
         let error = bundle(&options).expect_err("key inside bundle");
-        assert!(error.contains("inside the bundle directory"), "{error}");
+        assert!(error.detail().contains("inside the bundle directory"), "{error}");
         assert!(!out.exists());
     }
 
@@ -1379,7 +1378,7 @@ mod tests {
         options.id = Some("demo".into());
         options.exec = Some("payload/bin/tool".into());
         let error = bundle(&options).expect_err("non-executable");
-        assert!(error.contains("is not executable"), "{error}");
+        assert!(error.detail().contains("is not executable"), "{error}");
     }
 
     #[cfg(windows)]
@@ -1398,7 +1397,7 @@ mod tests {
         let mut options = bundle_options(source.path(), &out, &key_path);
         options.id = Some("demo".into());
         let error = bundle(&options).expect_err("hard link");
-        assert!(error.contains("hard links are not allowed"), "{error}");
+        assert!(error.detail().contains("hard links are not allowed"), "{error}");
     }
 
     #[cfg(unix)]
@@ -1416,7 +1415,7 @@ mod tests {
         let mut options = bundle_options(source.path(), &work.path().join("a.spk"), &key_path);
         options.id = Some("symlink".into());
         let error = bundle(&options).expect_err("symlink");
-        assert!(error.contains("symbolic links are not allowed"), "{error}");
+        assert!(error.detail().contains("symbolic links are not allowed"), "{error}");
 
         let source = TempDir::new();
         write(source.path(), "payload/bin/tool", b"tool", 0o755);
@@ -1429,7 +1428,7 @@ mod tests {
             bundle_options(source.path(), &work.path().join("b.spk"), &key_path);
         hard_link_options.id = Some("hardlink".into());
         let error = bundle(&hard_link_options).expect_err("hard link");
-        assert!(error.contains("hard links are not allowed"), "{error}");
+        assert!(error.detail().contains("hard links are not allowed"), "{error}");
     }
 
     #[cfg(unix)]
@@ -1449,7 +1448,7 @@ mod tests {
         let mut options = bundle_options(source.path(), &work.path().join("a.spk"), &key_path);
         options.id = Some("setuid".into());
         let error = bundle(&options).expect_err("setuid");
-        assert!(error.contains("setuid"), "{error}");
+        assert!(error.detail().contains("setuid"), "{error}");
     }
 
     #[cfg(unix)]
@@ -1489,7 +1488,7 @@ mod tests {
         let mut options = bundle_options(source.path(), &work.path().join("a.spk"), &key_path);
         options.id = Some("sparse".into());
         let error = bundle(&options).expect_err("sparse");
-        assert!(error.contains("sparse files are not allowed"), "{error}");
+        assert!(error.detail().contains("sparse files are not allowed"), "{error}");
     }
 
     #[test]
@@ -1505,7 +1504,7 @@ mod tests {
         let mut options = bundle_options(source.path(), &work.path().join("a.spk"), &key_path);
         options.id = Some("huge".into());
         let error = bundle(&options).expect_err("huge file");
-        assert!(error.contains("file exceeds"), "{error}");
+        assert!(error.detail().contains("file exceeds"), "{error}");
     }
 
     fn script_service() -> (&'static str, Vec<u8>) {
@@ -1618,7 +1617,7 @@ mod tests {
 
         let error = bundle(&options).expect_err("missing interpreter");
 
-        assert!(error.contains("--interpreter"), "{error}");
+        assert!(error.detail().contains("--interpreter"), "{error}");
         assert!(!out.exists());
     }
 
@@ -1633,7 +1632,7 @@ mod tests {
 
         let error = bundle(&options).expect_err("native payload");
 
-        assert!(error.contains("native binary"), "{error}");
+        assert!(error.detail().contains("native binary"), "{error}");
     }
 
     #[test]
@@ -1650,6 +1649,6 @@ mod tests {
 
         let error = bundle(&options).expect_err("no script payload");
 
-        assert!(error.contains("no script"), "{error}");
+        assert!(error.detail().contains("no script"), "{error}");
     }
 }

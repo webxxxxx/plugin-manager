@@ -18,6 +18,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::compat::CompatSpec;
+use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::paths;
 
@@ -170,7 +171,7 @@ pub struct TarEntry {
     pub mode: u32,
 }
 
-pub fn read_tar(bytes: &[u8]) -> Result<Vec<TarEntry>, String> {
+pub fn read_tar(bytes: &[u8]) -> Result<Vec<TarEntry>, ProblemError> {
     let mut tar = Tar::new(bytes);
     let mut entries = Vec::new();
     while let Some(header) = tar.next()? {
@@ -179,7 +180,7 @@ pub fn read_tar(bytes: &[u8]) -> Result<Vec<TarEntry>, String> {
         }
         let data = header
             .data
-            .ok_or_else(|| format!("{} must be a regular file", header.path))?;
+            .ok_or_else(|| Problem::Invalid.error(format!("{} must be a regular file", header.path)))?;
         entries.push(TarEntry {
             path: header.path,
             data: data.to_vec(),
@@ -192,7 +193,7 @@ pub fn read_tar(bytes: &[u8]) -> Result<Vec<TarEntry>, String> {
 /// The ustar end-of-archive marker: two 512-byte zero blocks.
 pub const TAR_TRAILER: usize = 1024;
 
-pub fn write_tar(entries: &[(&str, &[u8], u32)]) -> Result<Vec<u8>, String> {
+pub fn write_tar(entries: &[(&str, &[u8], u32)]) -> Result<Vec<u8>, ProblemError> {
     let mut out = Vec::new();
     for (path, data, mode) in entries {
         write_tar_entry(&mut out, path, data, *mode)?;
@@ -206,10 +207,10 @@ pub fn write_tar_entry<W: Write>(
     path: &str,
     data: &[u8],
     mode: u32,
-) -> Result<(), String> {
+) -> Result<(), ProblemError> {
     write_tar_header(out, path, data.len() as u64, mode)?;
     out.write_all(data)
-        .map_err(|error| format!("write tar data: {}", error))?;
+        .map_err(|error| Problem::Internal.error(format!("write tar data: {}", error)))?;
     write_tar_padding(out, data.len() as u64)
 }
 
@@ -218,10 +219,10 @@ pub fn write_tar_header<W: Write>(
     path: &str,
     size: u64,
     mode: u32,
-) -> Result<(), String> {
+) -> Result<(), ProblemError> {
     check_path(path)?;
     if path.len() > 100 {
-        return Err(format!("tar path is too long: {}", path));
+        return Err(Problem::Invalid.error(format!("tar path is too long: {}", path)));
     }
     let mut header = [0u8; 512];
     header[..path.len()].copy_from_slice(path.as_bytes());
@@ -239,26 +240,27 @@ pub fn write_tar_header<W: Write>(
     let checksum = format!("{:06o}\0 ", checksum);
     header[148..156].copy_from_slice(checksum.as_bytes());
     out.write_all(&header)
-        .map_err(|error| format!("write tar header: {}", error))
+        .map_err(|error| Problem::Internal.error(format!("write tar header: {}", error)))
 }
 
-pub fn write_tar_padding<W: Write>(out: &mut W, size: u64) -> Result<(), String> {
+pub fn write_tar_padding<W: Write>(out: &mut W, size: u64) -> Result<(), ProblemError> {
     let padding = padding(size as usize);
     if padding > 0 {
         out.write_all(&[0u8; 512][..padding])
-            .map_err(|error| format!("write tar padding: {}", error))?;
+            .map_err(|error| Problem::Internal.error(format!("write tar padding: {}", error)))?;
     }
     Ok(())
 }
 
-fn read_export_signature(version_dir: &Path) -> Result<Vec<u8>, String> {
+fn read_export_signature(version_dir: &Path) -> Result<Vec<u8>, ProblemError> {
     match fs::read(version_dir.join("signature.json")) {
         Ok(signature) => Ok(signature),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(
-            "installed package has no signature (installed insecurely); reinstall a signed package to export it"
-                .into(),
-        ),
-        Err(error) => Err(format!("read signature: {}", error)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(Problem::Invalid.error(
+                "installed package has no signature (installed insecurely); reinstall a signed package to export it",
+            ))
+        }
+        Err(error) => Err(Problem::Internal.error(format!("read signature: {}", error))),
     }
 }
 
@@ -322,40 +324,40 @@ impl TarPlan {
     }
 
     /// Write the archive, verifying every file part that carries a hash.
-    pub fn write_verified<W: Write>(&self, out: &mut W) -> Result<(), String> {
+    pub fn write_verified<W: Write>(&self, out: &mut W) -> Result<(), ProblemError> {
         for part in &self.parts {
             match part {
                 TarPart::Bytes(bytes) => out
                     .write_all(bytes)
-                    .map_err(|error| format!("write export: {}", error))?,
+                    .map_err(|error| Problem::Internal.error(format!("write export: {}", error)))?,
                 TarPart::File {
                     path,
                     length,
                     sha256,
                 } => {
                     let mut source = fs::File::open(path)
-                        .map_err(|error| format!("open {}: {}", path.display(), error))?;
+                        .map_err(|error| Problem::Internal.error(format!("open {}: {}", path.display(), error)))?;
                     let mut hasher = Sha256::new();
                     let mut written = 0u64;
                     let mut buffer = [0u8; 64 * 1024];
                     loop {
                         let read = source
                             .read(&mut buffer)
-                            .map_err(|error| format!("read {}: {}", path.display(), error))?;
+                            .map_err(|error| Problem::Internal.error(format!("read {}: {}", path.display(), error)))?;
                         if read == 0 {
                             break;
                         }
                         written = written.saturating_add(read as u64);
                         hasher.update(&buffer[..read]);
                         out.write_all(&buffer[..read])
-                            .map_err(|error| format!("write export: {}", error))?;
+                            .map_err(|error| Problem::Internal.error(format!("write export: {}", error)))?;
                     }
                     let hash_matches = sha256
                         .as_ref()
                         .map(|expected| hex_bytes(&hasher.finalize()) == *expected)
                         .unwrap_or(true);
                     if written != *length || !hash_matches {
-                        return Err(format!("installed file is corrupt: {}", path.display()));
+                        return Err(Problem::Internal.error(format!("installed file is corrupt: {}", path.display())));
                     }
                 }
             }
@@ -365,20 +367,20 @@ impl TarPlan {
 }
 
 /// One tar entry as bytes: header, data and padding.
-pub fn tar_entry_bytes(path: &str, data: &[u8], mode: u32) -> Result<Vec<u8>, String> {
+pub fn tar_entry_bytes(path: &str, data: &[u8], mode: u32) -> Result<Vec<u8>, ProblemError> {
     let mut out = Vec::with_capacity(512 + data.len());
     write_tar_entry(&mut out, path, data, mode)?;
     Ok(out)
 }
 
 /// One tar header as bytes, for an entry whose data is sent separately.
-pub fn tar_header_bytes(path: &str, size: u64, mode: u32) -> Result<Vec<u8>, String> {
+pub fn tar_header_bytes(path: &str, size: u64, mode: u32) -> Result<Vec<u8>, ProblemError> {
     let mut out = Vec::with_capacity(512);
     write_tar_header(&mut out, path, size, mode)?;
     Ok(out)
 }
 
-pub fn tar_padding_bytes(size: u64) -> Result<Vec<u8>, String> {
+pub fn tar_padding_bytes(size: u64) -> Result<Vec<u8>, ProblemError> {
     let mut out = Vec::with_capacity(512);
     write_tar_padding(&mut out, size)?;
     Ok(out)
@@ -386,9 +388,9 @@ pub fn tar_padding_bytes(size: u64) -> Result<Vec<u8>, String> {
 
 /// The installed .spk, described as parts. Payload bytes are not read here;
 /// only the manifest, the signature and each payload's size are.
-pub fn plan_installed_spk(version_dir: &Path) -> Result<TarPlan, String> {
+pub fn plan_installed_spk(version_dir: &Path) -> Result<TarPlan, ProblemError> {
     let manifest_bytes = fs::read(version_dir.join("manifest.json"))
-        .map_err(|error| format!("read manifest: {}", error))?;
+        .map_err(|error| Problem::Internal.error(format!("read manifest: {}", error)))?;
     let manifest = parse_manifest(&manifest_bytes)?;
     let signature = read_export_signature(version_dir)?;
     let mut plan = TarPlan::new();
@@ -401,9 +403,9 @@ pub fn plan_installed_spk(version_dir: &Path) -> Result<TarPlan, String> {
         // parse_manifest validated the path; the size check keeps a truncated
         // install from advertising a Content-Length it cannot send.
         let metadata =
-            fs::metadata(&path).map_err(|error| format!("stat {}: {}", file.path, error))?;
+            fs::metadata(&path).map_err(|error| Problem::Internal.error(format!("stat {}: {}", file.path, error)))?;
         if metadata.len() != file.size {
-            return Err(format!("installed file is corrupt: {}", file.path));
+            return Err(Problem::Internal.error(format!("installed file is corrupt: {}", file.path)));
         }
         plan.push_bytes(tar_header_bytes(&file.path, file.size, file.mode & 0o777)?);
         if file.size > 0 {
@@ -446,9 +448,9 @@ pub struct Inspection {
 }
 
 impl Package {
-    pub fn write_to(&self, root: &Path) -> Result<(), String> {
+    pub fn write_to(&self, root: &Path) -> Result<(), ProblemError> {
         fs::create_dir_all(root)
-            .map_err(|error| format!("create {}: {}", root.display(), error))?;
+            .map_err(|error| Problem::Internal.error(format!("create {}: {}", root.display(), error)))?;
         write_one(&root.join("manifest.json"), &self.manifest_bytes, 0o644)?;
         // An insecure install may have arrived without a signature; keep the
         // version directory honest instead of writing an empty signature file.
@@ -459,7 +461,7 @@ impl Package {
             let path = root.join(&file.path);
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)
-                    .map_err(|error| format!("create {}: {}", parent.display(), error))?;
+                    .map_err(|error| Problem::Internal.error(format!("create {}: {}", parent.display(), error)))?;
             }
             write_one(&path, &file.data, file.mode)?;
         }
@@ -509,7 +511,7 @@ pub struct StreamEntry {
 /// Parse one 512-byte ustar header. `None` is the end-of-archive zero block.
 /// The sans-IO feed uses this one parser, so every tar consumer validates the
 /// same path, type and checksum rules.
-fn parse_header(header: &[u8; 512]) -> Result<Option<StreamEntry>, String> {
+fn parse_header(header: &[u8; 512]) -> Result<Option<StreamEntry>, ProblemError> {
     if header.iter().all(|byte| *byte == 0) {
         return Ok(None);
     }
@@ -524,12 +526,12 @@ fn parse_header(header: &[u8; 512]) -> Result<Option<StreamEntry>, String> {
     let size = parse_octal(&header[124..136], "size")?;
     let kind = header[156];
     if !matches!(kind, b'0' | b'5') {
-        return Err(format!("unsupported tar entry type for {}", path));
+        return Err(Problem::Invalid.error(format!("unsupported tar entry type for {}", path)));
     }
     if kind == b'5' {
         path = path.trim_end_matches('/').to_string();
         if size != 0 {
-            return Err(format!("directory entry has data: {}", path));
+            return Err(Problem::Invalid.error(format!("directory entry has data: {}", path)));
         }
     }
     check_path(&path)?;
@@ -555,9 +557,9 @@ fn padding_u64(size: u64) -> u64 {
 /// header, padding and byte-limit bookkeeping; the sink only decides what to
 /// do with one entry's bytes.
 pub trait TarSink {
-    fn entry_start(&mut self, entry: &StreamEntry) -> Result<(), String>;
-    fn entry_data(&mut self, data: &[u8]) -> Result<(), String>;
-    fn entry_end(&mut self) -> Result<(), String>;
+    fn entry_start(&mut self, entry: &StreamEntry) -> Result<(), ProblemError>;
+    fn entry_data(&mut self, data: &[u8]) -> Result<(), ProblemError>;
+    fn entry_end(&mut self) -> Result<(), ProblemError>;
 }
 
 /// A sans-IO ustar reader.
@@ -593,7 +595,7 @@ impl TarFeed {
     /// Consume one body chunk. Entry callbacks may be invoked any number of
     /// times per chunk; a chunk may also end in the middle of a header, an
     /// entry body or its padding.
-    pub fn feed<S: TarSink + ?Sized>(&mut self, data: &[u8], sink: &mut S) -> Result<(), String> {
+    pub fn feed<S: TarSink + ?Sized>(&mut self, data: &[u8], sink: &mut S) -> Result<(), ProblemError> {
         let mut data = data;
         while !data.is_empty() {
             if self.remaining > 0 {
@@ -649,41 +651,41 @@ impl TarFeed {
 
     /// The body ended. The archive must have reached its end-of-archive marker
     /// and no entry may still be in flight.
-    pub fn finish(&self) -> Result<(), String> {
+    pub fn finish(&self) -> Result<(), ProblemError> {
         if self.header_len != 0
             || self.in_entry
             || self.remaining != 0
             || self.padding != 0
             || !self.done
         {
-            return Err("read package: failed to fill whole buffer".into());
+            return Err(Problem::Internal.error("read package: failed to fill whole buffer"));
         }
         Ok(())
     }
 
-    fn count(&mut self, bytes: usize) -> Result<(), String> {
+    fn count(&mut self, bytes: usize) -> Result<(), ProblemError> {
         self.total = self.total.saturating_add(bytes as u64);
         if self.total > self.limit {
-            return Err(format!(
+            return Err(Problem::TooLarge.error(format!(
                 "package exceeds {} MiB",
                 self.limit / (1024 * 1024)
-            ));
+            )));
         }
         Ok(())
     }
 }
 
-fn parse_octal(bytes: &[u8], name: &str) -> Result<u64, String> {
+fn parse_octal(bytes: &[u8], name: &str) -> Result<u64, ProblemError> {
     let text = std::str::from_utf8(bytes)
-        .map_err(|_| format!("invalid octal {} field", name))?
+        .map_err(|_| Problem::Invalid.error(format!("invalid octal {} field", name)))?
         .trim_matches(['\0', ' ']);
     if text.is_empty() {
         return Ok(0);
     }
-    u64::from_str_radix(text, 8).map_err(|_| format!("invalid octal {} field", name))
+    u64::from_str_radix(text, 8).map_err(|_| Problem::Invalid.error(format!("invalid octal {} field", name)))
 }
 
-fn check_checksum(header: &[u8; 512]) -> Result<(), String> {
+fn check_checksum(header: &[u8; 512]) -> Result<(), ProblemError> {
     let expected = parse_octal(&header[148..156], "checksum")?;
     // Older fixtures and some third-party ustar writers leave the checksum
     // field zero. The manifest file hashes are the real integrity check, so a
@@ -703,7 +705,7 @@ fn check_checksum(header: &[u8; 512]) -> Result<(), String> {
         })
         .sum();
     if expected != actual {
-        return Err("invalid tar header checksum".into());
+        return Err(Problem::Invalid.error("invalid tar header checksum"));
     }
     Ok(())
 }
@@ -731,15 +733,15 @@ impl StagingInstaller {
 
     /// Feed the next body chunk. The bytes may end anywhere: inside a tar
     /// header, an entry body or its padding.
-    pub fn feed(&mut self, data: &[u8]) -> Result<(), String> {
+    pub fn feed(&mut self, data: &[u8]) -> Result<(), ProblemError> {
         self.tar.feed(data, &mut self.sink)
     }
 
     /// The body ended: require the end-of-archive marker, check every declared
     /// file landed, and validate the staged payload. Called once.
-    pub fn finish(&mut self) -> Result<StagedPackage, String> {
+    pub fn finish(&mut self) -> Result<StagedPackage, ProblemError> {
         if self.finished {
-            return Err("package already finished".into());
+            return Err(Problem::Internal.error("package already finished"));
         }
         self.tar.finish()?;
         let staged = self.sink.finish()?;
@@ -805,16 +807,16 @@ impl SpkSink {
         }
     }
 
-    fn prepare_staging(&mut self) -> Result<(), String> {
+    fn prepare_staging(&mut self) -> Result<(), ProblemError> {
         if self.staging_ready {
             return Ok(());
         }
         if self.staging.exists() {
             fs::remove_dir_all(&self.staging)
-                .map_err(|error| format!("remove {}: {}", self.staging.display(), error))?;
+                .map_err(|error| Problem::Internal.error(format!("remove {}: {}", self.staging.display(), error)))?;
         }
         fs::create_dir_all(&self.staging)
-            .map_err(|error| format!("create {}: {}", self.staging.display(), error))?;
+            .map_err(|error| Problem::Internal.error(format!("create {}: {}", self.staging.display(), error)))?;
         write_one(&self.staging.join("manifest.json"), &self.manifest_bytes, 0o644)?;
         if !self.signature_bytes.is_empty() {
             write_one(
@@ -827,7 +829,7 @@ impl SpkSink {
         Ok(())
     }
 
-    fn start_payload(&mut self, entry: &StreamEntry) -> Result<(), String> {
+    fn start_payload(&mut self, entry: &StreamEntry) -> Result<(), ProblemError> {
         self.payload_started = true;
         if entry.kind == b'5' {
             self.current = Some(Current::Directory);
@@ -836,28 +838,28 @@ impl SpkSink {
         let declared = self
             .declared
             .get(&entry.path)
-            .ok_or_else(|| format!("file is not declared in files[]: {}", entry.path))?
+            .ok_or_else(|| Problem::Invalid.error(format!("file is not declared in files[]: {}", entry.path)))?
             .clone();
         if !self.seen.insert(entry.path.clone()) {
-            return Err(format!("duplicate tar entry: {}", entry.path));
+            return Err(Problem::Invalid.error(format!("duplicate tar entry: {}", entry.path)));
         }
         if entry.size != declared.size {
-            return Err(format!(
+            return Err(Problem::Invalid.error(format!(
                 "size mismatch for {}: manifest {}, archive {}",
                 entry.path, declared.size, entry.size
-            ));
+            )));
         }
         if entry.mode & 0o777 != declared.mode & 0o777 {
-            return Err(format!("mode mismatch for {}", entry.path));
+            return Err(Problem::Invalid.error(format!("mode mismatch for {}", entry.path)));
         }
         self.prepare_staging()?;
         let path = self.staging.join(&entry.path);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
-                .map_err(|error| format!("create {}: {}", parent.display(), error))?;
+                .map_err(|error| Problem::Internal.error(format!("create {}: {}", parent.display(), error)))?;
         }
         let file =
-            File::create(&path).map_err(|error| format!("create {}: {}", path.display(), error))?;
+            File::create(&path).map_err(|error| Problem::Internal.error(format!("create {}: {}", path.display(), error)))?;
         self.current = Some(Current::Payload {
             file,
             hasher: Sha256::new(),
@@ -868,13 +870,13 @@ impl SpkSink {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<StagedPackage, String> {
+    fn finish(&mut self) -> Result<StagedPackage, ProblemError> {
         let manifest = self
             .manifest
             .clone()
-            .ok_or_else(|| "manifest.json is missing".to_string())?;
+            .ok_or_else(|| Problem::Invalid.error("manifest.json is missing"))?;
         if !self.signature_checked && !self.allow_insecure {
-            return Err("signature.json is missing".into());
+            return Err(Problem::Invalid.error("signature.json is missing"));
         }
         self.prepare_staging()?;
         if self.seen.len() != self.declared.len() {
@@ -884,10 +886,10 @@ impl SpkSink {
                 .filter(|path| !self.seen.contains(*path))
                 .map(String::as_str)
                 .collect();
-            return Err(format!("missing files: {}", missing.join(", ")));
+            return Err(Problem::Invalid.error(format!("missing files: {}", missing.join(", "))));
         }
         if self.seen.is_empty() {
-            return Err("package has no payload files".into());
+            return Err(Problem::Invalid.error("package has no payload files"));
         }
         validate_staged_payload(&manifest, &self.staging)?;
         let unpacked_size = manifest
@@ -909,13 +911,13 @@ impl SpkSink {
 }
 
 impl TarSink for SpkSink {
-    fn entry_start(&mut self, entry: &StreamEntry) -> Result<(), String> {
+    fn entry_start(&mut self, entry: &StreamEntry) -> Result<(), ProblemError> {
         if self.manifest.is_none() {
             if entry.path != "manifest.json" {
-                return Err("manifest.json must be the first entry".into());
+                return Err(Problem::Invalid.error("manifest.json must be the first entry"));
             }
             if entry.size > 1024 * 1024 {
-                return Err("manifest.json is too large".into());
+                return Err(Problem::TooLarge.error("manifest.json is too large"));
             }
             self.current = Some(Current::Manifest(Vec::with_capacity(entry.size as usize)));
             return Ok(());
@@ -923,13 +925,13 @@ impl TarSink for SpkSink {
         if !self.signature_checked && !self.payload_started {
             if entry.path == "signature.json" {
                 if entry.size > 64 * 1024 {
-                    return Err("signature.json is too large".into());
+                    return Err(Problem::TooLarge.error("signature.json is too large"));
                 }
                 self.current = Some(Current::Signature(Vec::with_capacity(entry.size as usize)));
                 return Ok(());
             }
             if !self.allow_insecure {
-                return Err("signature.json must be the second entry".into());
+                return Err(Problem::Invalid.error("signature.json must be the second entry"));
             }
             // The operator opted into unsigned packages: the first payload is
             // the second entry, exactly like the blocking install path.
@@ -939,7 +941,7 @@ impl TarSink for SpkSink {
         self.start_payload(entry)
     }
 
-    fn entry_data(&mut self, data: &[u8]) -> Result<(), String> {
+    fn entry_data(&mut self, data: &[u8]) -> Result<(), ProblemError> {
         match self.current.as_mut() {
             Some(Current::Manifest(buffer)) | Some(Current::Signature(buffer)) => {
                 buffer.extend_from_slice(data);
@@ -953,45 +955,45 @@ impl TarSink for SpkSink {
                 ..
             }) => {
                 file.write_all(data)
-                    .map_err(|error| format!("write {}: {}", path.display(), error))?;
+                    .map_err(|error| Problem::Internal.error(format!("write {}: {}", path.display(), error)))?;
                 hasher.update(data);
                 *written = written.saturating_add(data.len() as u64);
                 Ok(())
             }
             Some(Current::Directory) => Ok(()),
-            None => Err("tar entry data without a header".into()),
+            None => Err(Problem::Invalid.error("tar entry data without a header")),
         }
     }
 
-    fn entry_end(&mut self) -> Result<(), String> {
+    fn entry_end(&mut self) -> Result<(), ProblemError> {
         let Some(current) = self.current.take() else {
-            return Err("tar entry ended without a header".into());
+            return Err(Problem::Invalid.error("tar entry ended without a header"));
         };
         match current {
             Current::Manifest(bytes) => {
                 let manifest = parse_manifest(&bytes)?;
                 validate_manifest(&manifest)?;
                 if manifest.platform != crate::platform::target() {
-                    return Err(format!(
+                    return Err(Problem::UnsupportedPlatform.error(format!(
                         "platform mismatch: package {}, host {}",
                         manifest.platform,
                         crate::platform::target()
-                    ));
+                    )));
                 }
                 let mut declared = BTreeMap::new();
                 for entry in &manifest.files {
                     check_path(&entry.path)?;
                     if entry.path == "manifest.json" || entry.path == "signature.json" {
-                        return Err("manifest.json/signature.json cannot be in files[]".to_string());
+                        return Err(Problem::Invalid.error("manifest.json/signature.json cannot be in files[]"));
                     }
                     if declared.insert(entry.path.clone(), entry.clone()).is_some() {
-                        return Err(format!("duplicate files[] entry: {}", entry.path));
+                        return Err(Problem::Invalid.error(format!("duplicate files[] entry: {}", entry.path)));
                     }
                     if entry.mode & 0o6000 != 0 {
-                        return Err(format!("setuid/setgid is not allowed: {}", entry.path));
+                        return Err(Problem::Invalid.error(format!("setuid/setgid is not allowed: {}", entry.path)));
                     }
                     if declared.len() > MAX_FILES {
-                        return Err("too many files".into());
+                        return Err(Problem::TooLarge.error("too many files"));
                     }
                 }
                 check_manifest_paths(&manifest)?;
@@ -1032,14 +1034,14 @@ impl TarSink for SpkSink {
                 written,
             } => {
                 if written != declared.size {
-                    return Err(format!("size mismatch for {}", declared.path));
+                    return Err(Problem::Invalid.error(format!("size mismatch for {}", declared.path)));
                 }
                 let digest = hex_bytes(&hasher.finalize());
                 if digest != declared.sha256 {
-                    return Err(format!("sha256 mismatch for {}", declared.path));
+                    return Err(Problem::Invalid.error(format!("sha256 mismatch for {}", declared.path)));
                 }
                 file.sync_all()
-                    .map_err(|error| format!("sync {}: {}", path.display(), error))?;
+                    .map_err(|error| Problem::Internal.error(format!("sync {}: {}", path.display(), error)))?;
                 set_mode(&path, declared.mode)?;
                 Ok(())
             }
@@ -1051,7 +1053,7 @@ impl TarSink for SpkSink {
 /// Validate the executable/interpreter and hook constraints from the files
 /// that already landed in the staging directory. Only the small script/hook
 /// files are read; binaries are classified from their first bytes.
-pub fn validate_staged_payload(manifest: &Manifest, root: &Path) -> Result<(), String> {
+pub fn validate_staged_payload(manifest: &Manifest, root: &Path) -> Result<(), ProblemError> {
     let mut executables = vec![manifest.exec.path.as_str()];
     if let Some(lifecycle) = &manifest.lifecycle {
         for hook in [&lifecycle.start, &lifecycle.stop, &lifecycle.status]
@@ -1064,7 +1066,7 @@ pub fn validate_staged_payload(manifest: &Manifest, root: &Path) -> Result<(), S
     let mut files: Vec<(&str, Vec<u8>)> = Vec::new();
     for path in executables {
         let data =
-            fs::read(root.join(path)).map_err(|error| format!("read {}: {}", path, error))?;
+            fs::read(root.join(path)).map_err(|error| Problem::Internal.error(format!("read {}: {}", path, error)))?;
         files.push((path, data.into_iter().take(8).collect()));
     }
     let borrowed: Vec<(&str, &[u8])> = files
@@ -1089,7 +1091,7 @@ pub fn validate_staged_payload(manifest: &Manifest, root: &Path) -> Result<(), S
         .flatten()
         {
             let data = fs::read(root.join(path))
-                .map_err(|error| format!("read hook {}: {}", path, error))?;
+                .map_err(|error| Problem::Internal.error(format!("read hook {}: {}", path, error)))?;
             hooks.push(FileData {
                 path: path.to_string(),
                 data,
@@ -1104,30 +1106,30 @@ pub fn validate_staged_payload(manifest: &Manifest, root: &Path) -> Result<(), S
 /// Re-open a staging directory produced by [`StagingInstaller`] without
 /// reading the payload again. Used by the daemon's `plugin.install_staged` RPC, which
 /// trusts the HTTP layer to have streamed and hashed the files.
-pub fn load_staged(root: &Path, allow_insecure: bool) -> Result<StagedPackage, String> {
+pub fn load_staged(root: &Path, allow_insecure: bool) -> Result<StagedPackage, ProblemError> {
     let manifest_path = root.join("manifest.json");
     let manifest_bytes = fs::read(&manifest_path)
-        .map_err(|error| format!("read {}: {}", manifest_path.display(), error))?;
+        .map_err(|error| Problem::Internal.error(format!("read {}: {}", manifest_path.display(), error)))?;
     let manifest = parse_manifest(&manifest_bytes)?;
     validate_manifest(&manifest)?;
     if manifest.platform != crate::platform::target() {
-        return Err(format!(
+        return Err(Problem::UnsupportedPlatform.error(format!(
             "platform mismatch: package {}, host {}",
             manifest.platform,
             crate::platform::target()
-        ));
+        )));
     }
     let mut declared = BTreeMap::new();
     for entry in &manifest.files {
         check_path(&entry.path)?;
         if entry.path == "manifest.json" || entry.path == "signature.json" {
-            return Err("manifest.json/signature.json cannot be in files[]".to_string());
+            return Err(Problem::Invalid.error("manifest.json/signature.json cannot be in files[]"));
         }
         if declared.insert(entry.path.clone(), entry.clone()).is_some() {
-            return Err(format!("duplicate files[] entry: {}", entry.path));
+            return Err(Problem::Invalid.error(format!("duplicate files[] entry: {}", entry.path)));
         }
         if entry.mode & 0o6000 != 0 {
-            return Err(format!("setuid/setgid is not allowed: {}", entry.path));
+            return Err(Problem::Invalid.error(format!("setuid/setgid is not allowed: {}", entry.path)));
         }
     }
     check_manifest_paths(&manifest)?;
@@ -1137,11 +1139,11 @@ pub fn load_staged(root: &Path, allow_insecure: bool) -> Result<StagedPackage, S
     let signature_bytes = match fs::read(&signature_path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(format!("read {}: {}", signature_path.display(), error)),
+        Err(error) => return Err(Problem::Internal.error(format!("read {}: {}", signature_path.display(), error))),
     };
     let signature_verified = if signature_bytes.is_empty() {
         if !allow_insecure {
-            return Err("signature.json is missing".into());
+            return Err(Problem::Invalid.error("signature.json is missing"));
         }
         false
     } else if allow_insecure {
@@ -1182,36 +1184,36 @@ pub fn load_staged(root: &Path, allow_insecure: bool) -> Result<StagedPackage, S
 /// Read the path from one tar header without consuming a stream. Returns
 /// `None` for the zero blocks at end-of-archive. The classification path and
 /// the installer therefore validate a header exactly the same way.
-pub fn tar_header_path(header: &[u8]) -> Result<Option<String>, String> {
+pub fn tar_header_path(header: &[u8]) -> Result<Option<String>, ProblemError> {
     if header.len() < 512 {
         return Ok(None);
     }
     let header: &[u8; 512] = header[..512]
         .try_into()
-        .map_err(|_| "truncated tar header".to_string())?;
+        .map_err(|_| Problem::Invalid.error("truncated tar header"))?;
     Ok(parse_header(header)?.map(|entry| entry.path))
 }
 
-pub fn verify_package(path: &Path) -> Result<Package, String> {
+pub fn verify_package(path: &Path) -> Result<Package, ProblemError> {
     verify_package_with(path, SignatureCheck::Required)
 }
 
-pub fn verify_package_with(path: &Path, check: SignatureCheck) -> Result<Package, String> {
-    let bytes = fs::read(path).map_err(|error| format!("read {}: {}", path.display(), error))?;
+pub fn verify_package_with(path: &Path, check: SignatureCheck) -> Result<Package, ProblemError> {
+    let bytes = fs::read(path).map_err(|error| Problem::Internal.error(format!("read {}: {}", path.display(), error)))?;
     if bytes.len() as u64 > MAX_PACKAGE_BYTES {
-        return Err(format!(
+        return Err(Problem::TooLarge.error(format!(
             "package exceeds {} MiB",
             MAX_PACKAGE_BYTES / (1024 * 1024)
-        ));
+        )));
     }
     verify_bytes_with(&bytes, check)
 }
 
-pub fn verify_bytes(bytes: &[u8]) -> Result<Package, String> {
+pub fn verify_bytes(bytes: &[u8]) -> Result<Package, ProblemError> {
     verify_bytes_with(bytes, SignatureCheck::Required)
 }
 
-pub fn verify_bytes_with(bytes: &[u8], check: SignatureCheck) -> Result<Package, String> {
+pub fn verify_bytes_with(bytes: &[u8], check: SignatureCheck) -> Result<Package, ProblemError> {
     let mode = match check {
         SignatureCheck::Required => SignatureMode::Required,
         SignatureCheck::AllowUnsigned => SignatureMode::AllowUnsigned,
@@ -1226,7 +1228,7 @@ pub fn verify_bytes_with(bytes: &[u8], check: SignatureCheck) -> Result<Package,
 /// `public_key` may be an explicit PEM: a CI runner has no `trust.d`, so this
 /// is how it checks the release signature without pretending the key is
 /// trusted. `trusted` still reports whether the key happens to be in `trust.d`.
-pub fn inspect_bytes_with(bytes: &[u8], public_key: Option<&[u8]>) -> Result<Inspection, String> {
+pub fn inspect_bytes_with(bytes: &[u8], public_key: Option<&[u8]>) -> Result<Inspection, ProblemError> {
     let explicit = match public_key {
         Some(pem) => Some(parse_public_key(pem)?),
         None => None,
@@ -1246,18 +1248,18 @@ fn verify_bytes_mode(
     bytes: &[u8],
     mode: SignatureMode,
     explicit: Option<&VerifyingKey>,
-) -> Result<(Package, SignatureInfo), String> {
+) -> Result<(Package, SignatureInfo), ProblemError> {
     let mut tar = Tar::new(bytes);
 
     let manifest_header = tar
         .next()?
-        .ok_or_else(|| "manifest.json is missing".to_string())?;
+        .ok_or_else(|| Problem::Invalid.error("manifest.json is missing"))?;
     if manifest_header.path != "manifest.json" {
-        return Err("manifest.json must be the first entry".into());
+        return Err(Problem::Invalid.error("manifest.json must be the first entry"));
     }
     let manifest_bytes = manifest_header
         .data
-        .ok_or_else(|| "manifest.json must be a regular file".to_string())?
+        .ok_or_else(|| Problem::Invalid.error("manifest.json must be a regular file"))?
         .to_vec();
 
     let mut signature_bytes = Vec::new();
@@ -1271,19 +1273,19 @@ fn verify_bytes_mode(
         Some(header) if header.path == "signature.json" => {
             let data = header
                 .data
-                .ok_or_else(|| "signature.json must be a regular file".to_string())?;
+                .ok_or_else(|| Problem::Invalid.error("signature.json must be a regular file"))?;
             signature = check_signature(&manifest_bytes, data, mode, explicit)?;
             signature_bytes = data.to_vec();
         }
         Some(_) if mode == SignatureMode::Required => {
-            return Err("signature.json must be the second entry".into());
+            return Err(Problem::Invalid.error("signature.json must be the second entry"));
         }
         // Insecure installs and inspection accept a package whose second entry
         // is already a payload file; it stays in the archive and is validated
         // like any other `files[]` entry below.
         Some(header) => first_file = Some(header),
         None if mode == SignatureMode::Required => {
-            return Err("signature.json is missing".into());
+            return Err(Problem::Invalid.error("signature.json is missing"));
         }
         None => {}
     }
@@ -1294,26 +1296,26 @@ fn verify_bytes_mode(
     // for another target is still a well-formed package, and the caller gets
     // `host.matchesHost` as a fact.
     if mode != SignatureMode::Inspect && manifest.platform != crate::platform::target() {
-        return Err(format!(
+        return Err(Problem::UnsupportedPlatform.error(format!(
             "platform mismatch: package {}, host {}",
             manifest.platform,
             crate::platform::target()
-        ));
+        )));
     }
     let mut declared = BTreeMap::new();
     for entry in &manifest.files {
         check_path(&entry.path)?;
         if entry.path == "manifest.json" || entry.path == "signature.json" {
-            return Err("manifest.json/signature.json cannot be in files[]".to_string());
+            return Err(Problem::Invalid.error("manifest.json/signature.json cannot be in files[]"));
         }
         if declared.insert(entry.path.clone(), entry.clone()).is_some() {
-            return Err(format!("duplicate files[] entry: {}", entry.path));
+            return Err(Problem::Invalid.error(format!("duplicate files[] entry: {}", entry.path)));
         }
         if entry.mode & 0o6000 != 0 {
-            return Err(format!("setuid/setgid is not allowed: {}", entry.path));
+            return Err(Problem::Invalid.error(format!("setuid/setgid is not allowed: {}", entry.path)));
         }
         if declared.len() > MAX_FILES {
-            return Err("too many files".into());
+            return Err(Problem::TooLarge.error("too many files"));
         }
     }
 
@@ -1335,26 +1337,26 @@ fn verify_bytes_mode(
         }
         let entry = declared
             .get(&header.path)
-            .ok_or_else(|| format!("file is not declared in files[]: {}", header.path))?;
+            .ok_or_else(|| Problem::Invalid.error(format!("file is not declared in files[]: {}", header.path)))?;
         if seen.insert(header.path.clone(), ()).is_some() {
-            return Err(format!("duplicate tar entry: {}", header.path));
+            return Err(Problem::Invalid.error(format!("duplicate tar entry: {}", header.path)));
         }
         let data = header
             .data
-            .ok_or_else(|| format!("{} must be a regular file", header.path))?;
+            .ok_or_else(|| Problem::Invalid.error(format!("{} must be a regular file", header.path)))?;
         if data.len() as u64 != entry.size {
-            return Err(format!(
+            return Err(Problem::Invalid.error(format!(
                 "size mismatch for {}: manifest {}, archive {}",
                 entry.path,
                 entry.size,
                 data.len()
-            ));
+            )));
         }
         if hex_sha256(data) != entry.sha256 {
-            return Err(format!("sha256 mismatch for {}", entry.path));
+            return Err(Problem::Invalid.error(format!("sha256 mismatch for {}", entry.path)));
         }
         if header.mode & 0o777 != entry.mode & 0o777 {
-            return Err(format!("mode mismatch for {}", entry.path));
+            return Err(Problem::Invalid.error(format!("mode mismatch for {}", entry.path)));
         }
         files.push(FileData {
             path: header.path,
@@ -1369,10 +1371,10 @@ fn verify_bytes_mode(
             .filter(|path| !seen.contains_key(*path))
             .map(String::as_str)
             .collect();
-        return Err(format!("missing files: {}", missing.join(", ")));
+        return Err(Problem::Invalid.error(format!("missing files: {}", missing.join(", "))));
     }
     if files.is_empty() {
-        return Err("package has no payload files".into());
+        return Err(Problem::Invalid.error("package has no payload files"));
     }
     #[cfg(unix)]
     check_hook_shebangs(&manifest, &files)?;
@@ -1400,7 +1402,7 @@ fn verify_bytes_mode(
 pub fn verify_package_with_fallback(
     path: &Path,
     allow_insecure: bool,
-) -> Result<(Package, bool), String> {
+) -> Result<(Package, bool), ProblemError> {
     if !allow_insecure {
         return verify_package(path).map(|package| (package, true));
     }
@@ -1416,7 +1418,7 @@ pub fn verify_package_with_fallback(
 pub fn verify_bytes_with_fallback(
     bytes: &[u8],
     allow_insecure: bool,
-) -> Result<(Package, bool), String> {
+) -> Result<(Package, bool), ProblemError> {
     if !allow_insecure {
         return verify_bytes(bytes).map(|package| (package, true));
     }
@@ -1431,7 +1433,7 @@ pub fn verify_bytes_with_fallback(
 /// The install-time half of the "executable hook" rule: the Unix exec bit comes
 /// from the manifest, the shebang has to be read from the extracted file.
 #[cfg(unix)]
-fn check_hook_shebangs(manifest: &Manifest, files: &[FileData]) -> Result<(), String> {
+fn check_hook_shebangs(manifest: &Manifest, files: &[FileData]) -> Result<(), ProblemError> {
     for (name, path) in [
         (
             "postInstall",
@@ -1453,13 +1455,13 @@ fn check_hook_shebangs(manifest: &Manifest, files: &[FileData]) -> Result<(), St
             continue;
         };
         if !file.data.starts_with(b"#!") {
-            return Err(format!("{} must start with a shebang: {}", name, path));
+            return Err(Problem::Invalid.error(format!("{} must start with a shebang: {}", name, path)));
         }
         if file.data.contains(&b'\r') {
-            return Err(format!(
+            return Err(Problem::Invalid.error(format!(
                 "{} must use LF line endings (the CRLF shebang fails to spawn): {}",
                 name, path
-            ));
+            )));
         }
     }
     Ok(())
@@ -1468,13 +1470,13 @@ fn check_hook_shebangs(manifest: &Manifest, files: &[FileData]) -> Result<(), St
 /// Validate every cross-reference a manifest makes, including the hook and
 /// capability rules the install path enforces separately. The bundler calls
 /// this before writing so authoring mistakes fail early.
-pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
+pub fn validate_manifest(manifest: &Manifest) -> Result<(), ProblemError> {
     check_schema(manifest)?;
     check_ready(manifest)?;
     check_capabilities_with_exec(manifest)?;
     check_compat(manifest)?;
     if manifest.files.is_empty() {
-        return Err("package has no payload files".into());
+        return Err(Problem::Invalid.error("package has no payload files"));
     }
     check_manifest_paths(manifest)?;
     check_hooks(manifest)?;
@@ -1486,26 +1488,26 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
             let path = format!("payload/web/{}", entry);
             check_path(&path)?;
             if !manifest.files.iter().any(|file| file.path == path) {
-                return Err(format!("ui entry is not in files[]: {}", path));
+                return Err(Problem::Invalid.error(format!("ui entry is not in files[]: {}", path)));
             }
         }
     }
     let mut names = BTreeSet::new();
     for capability in &manifest.capabilities {
         if capability.name.is_empty() {
-            return Err("capability name must not be empty".into());
+            return Err(Problem::Invalid.error("capability name must not be empty"));
         }
         if capability.name.starts_with("svc.") {
-            return Err(format!(
+            return Err(Problem::Invalid.error(format!(
                 "capability may not use the svc. prefix: {}",
                 capability.name
-            ));
+            )));
         }
         if capability.name == "start" {
-            return Err("capability name \"start\" is reserved for the lifecycle tool".into());
+            return Err(Problem::Invalid.error("capability name \"start\" is reserved for the lifecycle tool"));
         }
         if !names.insert(&capability.name) {
-            return Err(format!("duplicate capability: {}", capability.name));
+            return Err(Problem::Invalid.error(format!("duplicate capability: {}", capability.name)));
         }
     }
     Ok(())
@@ -1531,7 +1533,7 @@ pub fn is_native_binary(bytes: &[u8]) -> bool {
 
 /// Schema-2 packages must name a host interpreter for every script payload and
 /// must not carry a dangling interpreter declaration for a native-only payload.
-pub fn validate_script_payload(manifest: &Manifest, files: &[(&str, &[u8])]) -> Result<(), String> {
+pub fn validate_script_payload(manifest: &Manifest, files: &[(&str, &[u8])]) -> Result<(), ProblemError> {
     if manifest.schema < 2 {
         return Ok(());
     }
@@ -1555,41 +1557,37 @@ pub fn validate_script_payload(manifest: &Manifest, files: &[(&str, &[u8])]) -> 
         }
     }
     if !scripts.is_empty() && manifest.interpreter.is_none() {
-        return Err(format!(
+        return Err(Problem::Invalid.error(format!(
             "script payload {} requires an interpreter declaration",
             scripts.join(", ")
-        ));
+        )));
     }
     if scripts.is_empty() && manifest.interpreter.is_some() {
-        return Err("interpreter is declared but the payload has no script to run".into());
+        return Err(Problem::Invalid.error("interpreter is declared but the payload has no script to run"));
     }
     Ok(())
 }
 
-fn check_schema(manifest: &Manifest) -> Result<(), String> {
+fn check_schema(manifest: &Manifest) -> Result<(), ProblemError> {
     if manifest.schema == 0 || manifest.schema > MAX_SCHEMA {
-        return Err(format!(
+        return Err(Problem::Invalid.error(format!(
             "unsupported schema {} (max {})",
             manifest.schema, MAX_SCHEMA
-        ));
+        )));
     }
     if manifest.schema == 1 && (manifest.interpreter.is_some() || manifest.lifecycle.is_some()) {
-        return Err(
-            "lifecycle and interpreter require schema 2; old daemons would silently ignore them"
-                .into(),
-        );
+        return Err(Problem::Invalid.error("lifecycle and interpreter require schema 2; old daemons would silently ignore them"));
     }
     if manifest.schema < 3 && manifest.compat.is_some() {
-        return Err(
+        return Err(Problem::Invalid.error(
             "compat requires schema 3; old daemons would ignore the device list and install a \
-             package that does not run here"
-                .into(),
-        );
+             package that does not run here",
+        ));
     }
     Ok(())
 }
 
-fn check_compat(manifest: &Manifest) -> Result<(), String> {
+fn check_compat(manifest: &Manifest) -> Result<(), ProblemError> {
     let kernel_module = manifest
         .files
         .iter()
@@ -1597,61 +1595,57 @@ fn check_compat(manifest: &Manifest) -> Result<(), String> {
     match &manifest.compat {
         Some(spec) => {
             if spec.devices.is_empty() {
-                return Err(
-                    "compat.devices must not be empty; omit compat for a universal package".into(),
-                );
+                return Err(Problem::Invalid.error(
+                    "compat.devices must not be empty; omit compat for a universal package",
+                ));
             }
             if spec.devices.len() > 64 {
-                return Err("compat.devices lists more than 64 ids".into());
+                return Err(Problem::Invalid.error("compat.devices lists more than 64 ids"));
             }
             let mut seen = BTreeSet::new();
             for device in &spec.devices {
                 crate::compat::validate_device_id(device)
-                    .map_err(|error| format!("compat.devices: {}", error))?;
+                    .map_err(|error| Problem::Invalid.error(format!("compat.devices: {}", error)))?;
                 if !seen.insert(device) {
-                    return Err(format!("duplicate compat device id: {}", device));
+                    return Err(Problem::Invalid.error(format!("duplicate compat device id: {}", device)));
                 }
             }
         }
         None => {
             if kernel_module {
-                return Err(
+                return Err(Problem::Invalid.error(
                     "the package contains a kernel module (.ko) but declares no compat.devices; \
-                     kernel modules only run on the device generation they were built for"
-                        .into(),
-                );
+                     kernel modules only run on the device generation they were built for",
+                ));
             }
         }
     }
     if kernel_module && manifest.schema < 3 {
-        return Err("kernel modules require schema 3 so old daemons reject them".into());
+        return Err(Problem::Invalid.error("kernel modules require schema 3 so old daemons reject them"));
     }
     Ok(())
 }
 
-fn check_ready(manifest: &Manifest) -> Result<(), String> {
+fn check_ready(manifest: &Manifest) -> Result<(), ProblemError> {
     match manifest.exec.ready.as_deref() {
         None | Some("notify") | Some("exec") => Ok(()),
-        Some(other) => Err(format!(
+        Some(other) => Err(Problem::Invalid.error(format!(
             "exec.ready {:?} is invalid; expected notify or exec",
             other
-        )),
+        ))),
     }
 }
 
 /// A capabilities list requires a protocol channel, which an exec-ready process
 /// does not have (stdin is closed).
-fn check_capabilities_with_exec(manifest: &Manifest) -> Result<(), String> {
+fn check_capabilities_with_exec(manifest: &Manifest) -> Result<(), ProblemError> {
     if !manifest.capabilities.is_empty() && manifest.exec.ready.as_deref() == Some("exec") {
-        return Err(
-            "exec.ready=exec cannot declare capabilities: the plugin has no protocol channel"
-                .into(),
-        );
+        return Err(Problem::Invalid.error("exec.ready=exec cannot declare capabilities: the plugin has no protocol channel"));
     }
     Ok(())
 }
 
-fn check_lifecycle(manifest: &Manifest) -> Result<(), String> {
+fn check_lifecycle(manifest: &Manifest) -> Result<(), ProblemError> {
     let Some(lifecycle) = &manifest.lifecycle else {
         return Ok(());
     };
@@ -1667,17 +1661,17 @@ fn check_lifecycle(manifest: &Manifest) -> Result<(), String> {
         declared = true;
         check_path(&hook.path)?;
         if !manifest.files.iter().any(|file| file.path == hook.path) {
-            return Err(format!(
+            return Err(Problem::Invalid.error(format!(
                 "lifecycle.{} is not in files[]: {}",
                 name, hook.path
-            ));
+            )));
         }
         if let Some(timeout) = hook.timeout {
             if timeout == 0 || timeout > max_seconds {
-                return Err(format!(
+                return Err(Problem::Invalid.error(format!(
                     "lifecycle.{}.timeout must be between 1 and {} seconds",
                     name, max_seconds
-                ));
+                )));
             }
         }
         for argument in &hook.args {
@@ -1689,24 +1683,24 @@ fn check_lifecycle(manifest: &Manifest) -> Result<(), String> {
         }
     }
     if !declared {
-        return Err("lifecycle declares no start, stop or status action".into());
+        return Err(Problem::Invalid.error("lifecycle declares no start, stop or status action"));
     }
     Ok(())
 }
 
-fn check_interpreter(manifest: &Manifest) -> Result<(), String> {
+fn check_interpreter(manifest: &Manifest) -> Result<(), ProblemError> {
     let Some(interpreter) = &manifest.interpreter else {
         return Ok(());
     };
     if !crate::interpreter::valid_name(&interpreter.name) {
-        return Err(format!(
+        return Err(Problem::Invalid.error(format!(
             "interpreter.name {:?} is not a bare name (no paths or spaces)",
             interpreter.name
-        ));
+        )));
     }
     if let Some(version) = &interpreter.version {
         crate::interpreter::validate_constraint(version)
-            .map_err(|error| format!("interpreter.version: {}", error))?;
+            .map_err(|error| Problem::Invalid.error(format!("interpreter.version: {}", error)))?;
     }
     for argument in &interpreter.args {
         check_argument("interpreter", &interpreter.name, argument)?;
@@ -1714,9 +1708,9 @@ fn check_interpreter(manifest: &Manifest) -> Result<(), String> {
     Ok(())
 }
 
-fn check_argument(section: &str, name: &str, value: &str) -> Result<(), String> {
+fn check_argument(section: &str, name: &str, value: &str) -> Result<(), ProblemError> {
     if value.contains('\0') {
-        return Err(format!("{} {} contains a NUL byte", section, name));
+        return Err(Problem::Invalid.error(format!("{} {} contains a NUL byte", section, name)));
     }
     Ok(())
 }
@@ -1733,7 +1727,7 @@ pub fn declares_hooks(manifest: &Manifest) -> bool {
 
 /// Hooks are package-signed executables under `hooks/`; the manifest path is
 /// resolved inside the installed version directory at run time.
-fn check_hooks(manifest: &Manifest) -> Result<(), String> {
+fn check_hooks(manifest: &Manifest) -> Result<(), ProblemError> {
     for (name, path) in [
         (
             "postInstall",
@@ -1753,23 +1747,23 @@ fn check_hooks(manifest: &Manifest) -> Result<(), String> {
         let Some(path) = path else { continue };
         check_path(path)?;
         if !path.starts_with("hooks/") {
-            return Err(format!("{} must be under hooks/: {}", name, path));
+            return Err(Problem::Invalid.error(format!("{} must be under hooks/: {}", name, path)));
         }
         let file = manifest
             .files
             .iter()
             .find(|file| file.path == path)
-            .ok_or_else(|| format!("{} is not in files[]: {}", name, path))?;
+            .ok_or_else(|| Problem::Invalid.error(format!("{} is not in files[]: {}", name, path)))?;
         check_hook_executable(name, path, file.mode)?;
     }
     Ok(())
 }
 
-fn check_hook_executable(name: &str, path: &str, mode: u32) -> Result<(), String> {
+fn check_hook_executable(name: &str, path: &str, mode: u32) -> Result<(), ProblemError> {
     #[cfg(unix)]
     {
         if mode & 0o111 == 0 {
-            return Err(format!("{} must be executable: {}", name, path));
+            return Err(Problem::Invalid.error(format!("{} must be executable: {}", name, path)));
         }
     }
     #[cfg(not(unix))]
@@ -1781,35 +1775,35 @@ fn check_hook_executable(name: &str, path: &str, mode: u32) -> Result<(), String
     Ok(())
 }
 
-fn check_manifest_paths(manifest: &Manifest) -> Result<(), String> {
+fn check_manifest_paths(manifest: &Manifest) -> Result<(), ProblemError> {
     check_path(&manifest.exec.path)?;
     if !manifest
         .files
         .iter()
         .any(|file| file.path == manifest.exec.path)
     {
-        return Err(format!(
+        return Err(Problem::Invalid.error(format!(
             "exec.path is not in files[]: {}",
             manifest.exec.path
-        ));
+        )));
     }
     if let Some(config) = &manifest.config {
         check_path(config)?;
         if !manifest.files.iter().any(|file| &file.path == config) {
-            return Err(format!("config is not in files[]: {}", config));
+            return Err(Problem::Invalid.error(format!("config is not in files[]: {}", config)));
         }
     }
     if let Some(check) = &manifest.config_check {
         check_path(&check.path)?;
         if !manifest.files.iter().any(|file| file.path == check.path) {
-            return Err(format!(
+            return Err(Problem::Invalid.error(format!(
                 "configCheck.path is not in files[]: {}",
                 check.path
-            ));
+            )));
         }
         let config = manifest.config.as_deref().unwrap_or("config/config");
         if !manifest.files.iter().any(|file| file.path == config) {
-            return Err("configCheck is declared but config is missing".into());
+            return Err(Problem::Invalid.error("configCheck is declared but config is missing"));
         }
     }
     if let Some(ui) = &manifest.ui {
@@ -1825,7 +1819,7 @@ fn check_signature(
     signature_bytes: &[u8],
     mode: SignatureMode,
     explicit: Option<&VerifyingKey>,
-) -> Result<SignatureInfo, String> {
+) -> Result<SignatureInfo, ProblemError> {
     if mode == SignatureMode::AllowUnsigned {
         // Insecure installs skip signature verification entirely. The bytes
         // are still kept in the installed tree; they are simply not trusted.
@@ -1836,12 +1830,12 @@ fn check_signature(
         });
     }
     let sig: SignatureFile =
-        serde_json::from_slice(signature_bytes).map_err(|error| format!("signature: {}", error))?;
+        serde_json::from_slice(signature_bytes).map_err(|error| Problem::Invalid.error(format!("signature: {}", error)))?;
     if sig.alg != "ed25519" {
-        return Err(format!("unsupported signature algorithm: {}", sig.alg));
+        return Err(Problem::Invalid.error(format!("unsupported signature algorithm: {}", sig.alg)));
     }
     if !valid_key_id(&sig.key_id) {
-        return Err(format!("invalid keyId: {}", sig.key_id));
+        return Err(Problem::Invalid.error(format!("invalid keyId: {}", sig.key_id)));
     }
     let key_path = paths::trust_dir().join(format!("{}.pub", sig.key_id));
     if mode == SignatureMode::Required {
@@ -1881,30 +1875,30 @@ fn verify_signature_with(
     manifest: &[u8],
     sig: &SignatureFile,
     key: &VerifyingKey,
-) -> Result<(), String> {
+) -> Result<(), ProblemError> {
     let signature = BASE64
         .decode(sig.sig.trim())
-        .map_err(|error| format!("signature base64: {}", error))?;
-    let signature = Signature::from_slice(&signature).map_err(|error| error.to_string())?;
+        .map_err(|error| Problem::Invalid.error(format!("signature base64: {}", error)))?;
+    let signature = Signature::from_slice(&signature).map_err(|error| Problem::Internal.error(error.to_string()))?;
     key.verify_strict(manifest, &signature)
-        .map_err(|_| "manifest signature is invalid".to_string())
+        .map_err(|_| Problem::Invalid.error("manifest signature is invalid"))
 }
 
-fn unknown_key_error(key_id: &str, key_path: &Path, error: std::io::Error) -> String {
-    format!(
+fn unknown_key_error(key_id: &str, key_path: &Path, error: std::io::Error) -> ProblemError {
+    Problem::Invalid.error(format!(
         "unknown keyId {}: {} (trust root path: {}; add it with `svc trust add <file.pub>` or upload it in the web console)",
         key_id,
         error,
         key_path.display()
-    )
+    ))
 }
 
 /// Validate a PEM SPKI Ed25519 public key without installing it.
-pub fn validate_public_key(pem: &[u8]) -> Result<(), String> {
+pub fn validate_public_key(pem: &[u8]) -> Result<(), ProblemError> {
     parse_public_key(pem).map(|_| ())
 }
 
-fn parse_public_key(pem: &[u8]) -> Result<VerifyingKey, String> {
+fn parse_public_key(pem: &[u8]) -> Result<VerifyingKey, ProblemError> {
     let text = String::from_utf8_lossy(pem);
     let mut body = String::new();
     let mut inside = false;
@@ -1919,42 +1913,43 @@ fn parse_public_key(pem: &[u8]) -> Result<VerifyingKey, String> {
     }
     let der = BASE64
         .decode(body)
-        .map_err(|error| format!("public key base64: {}", error))?;
+        .map_err(|error| Problem::Invalid.error(format!("public key base64: {}", error)))?;
     const SPKI_PREFIX: [u8; 12] = [
         0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
     ];
     let raw: [u8; 32] = if der.len() == 44 && der.starts_with(&SPKI_PREFIX) {
         der[12..]
             .try_into()
-            .map_err(|_| "public key length".to_string())?
+            .map_err(|_| Problem::Invalid.error("public key length"))?
     } else if der.len() == 32 {
         der.try_into()
-            .map_err(|_| "public key length".to_string())?
+            .map_err(|_| Problem::Invalid.error("public key length"))?
     } else {
-        return Err("public key is not an Ed25519 SPKI".into());
+        return Err(Problem::Invalid.error("public key is not an Ed25519 SPKI"));
     };
-    VerifyingKey::from_bytes(&raw).map_err(|error| error.to_string())
+    VerifyingKey::from_bytes(&raw).map_err(|error| Problem::Internal.error(error.to_string()))
 }
 
-pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, String> {
-    let m: Manifest = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, ProblemError> {
+    let m: Manifest = serde_json::from_slice(bytes)
+        .map_err(|error| Problem::Invalid.error(error.to_string()))?;
     check_schema(&m)?;
     if m.protocol == 0 || m.protocol > MAX_PROTOCOL {
-        return Err(format!("unsupported protocol {}", m.protocol));
+        return Err(Problem::Invalid.error(format!("unsupported protocol {}", m.protocol)));
     }
     if m.protocol == 3 {
         if m.exec.ready.as_deref() != Some("exec") {
-            return Err("protocol 3 requires exec.ready=exec".into());
+            return Err(Problem::Invalid.error("protocol 3 requires exec.ready=exec"));
         }
         if !m.capabilities.is_empty() {
-            return Err("protocol 3 cannot declare JSON-RPC capabilities".into());
+            return Err(Problem::Invalid.error("protocol 3 cannot declare JSON-RPC capabilities"));
         }
     }
     if !valid_name(&m.name) {
-        return Err("invalid service id".into());
+        return Err(Problem::Invalid.error("invalid service id"));
     }
     if !m.platform.contains('-') {
-        return Err("platform must be a target triple".into());
+        return Err(Problem::UnsupportedPlatform.error("platform must be a target triple"));
     }
     check_version(&m.version)?;
     Ok(m)
@@ -1980,9 +1975,9 @@ pub fn valid_key_id(s: &str) -> bool {
         && s != ".."
 }
 
-fn check_version(value: &str) -> Result<(), String> {
+fn check_version(value: &str) -> Result<(), ProblemError> {
     if !valid_version(value) {
-        return Err(format!("version is not semver: {}", value));
+        return Err(Problem::Invalid.error(format!("version is not semver: {}", value)));
     }
     Ok(())
 }
@@ -1995,14 +1990,14 @@ pub fn valid_version(value: &str) -> bool {
             .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
 }
 
-pub fn check_path(p: &str) -> Result<(), String> {
+pub fn check_path(p: &str) -> Result<(), ProblemError> {
     if p.starts_with('/') || p.contains('\\') || p.contains('\0') {
-        return Err(format!("unsafe path: {}", p));
+        return Err(Problem::Invalid.error(format!("unsafe path: {}", p)));
     }
     if p.split('/')
         .any(|seg| seg.is_empty() || seg == "." || seg == "..")
     {
-        return Err(format!("unsafe path: {}", p));
+        return Err(Problem::Invalid.error(format!("unsafe path: {}", p)));
     }
     Ok(())
 }
@@ -2020,27 +2015,27 @@ fn hex_bytes(bytes: &[u8]) -> String {
     out
 }
 
-fn write_one(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
+fn write_one(path: &Path, data: &[u8], mode: u32) -> Result<(), ProblemError> {
     let mut handle =
-        File::create(path).map_err(|error| format!("create {}: {}", path.display(), error))?;
+        File::create(path).map_err(|error| Problem::Internal.error(format!("create {}: {}", path.display(), error)))?;
     handle
         .write_all(data)
-        .map_err(|error| format!("write {}: {}", path.display(), error))?;
+        .map_err(|error| Problem::Internal.error(format!("write {}: {}", path.display(), error)))?;
     handle
         .sync_all()
-        .map_err(|error| format!("sync {}: {}", path.display(), error))?;
+        .map_err(|error| Problem::Internal.error(format!("sync {}: {}", path.display(), error)))?;
     set_mode(path, mode)
 }
 
 #[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
+fn set_mode(path: &Path, mode: u32) -> Result<(), ProblemError> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777))
-        .map_err(|error| format!("chmod {}: {}", path.display(), error))
+        .map_err(|error| Problem::Internal.error(format!("chmod {}: {}", path.display(), error)))
 }
 
 #[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) -> Result<(), String> {
+fn set_mode(_path: &Path, _mode: u32) -> Result<(), ProblemError> {
     Ok(())
 }
 
@@ -2066,13 +2061,13 @@ impl<'a> Tar<'a> {
         }
     }
 
-    fn next(&mut self) -> Result<Option<Header<'a>>, String> {
+    fn next(&mut self) -> Result<Option<Header<'a>>, ProblemError> {
         if self.done {
             return Ok(None);
         }
         let end = self.offset + 512;
         if end > self.bytes.len() {
-            return Err("truncated tar header".into());
+            return Err(Problem::Invalid.error("truncated tar header"));
         }
         let header = &self.bytes[self.offset..end];
         self.offset = end;
@@ -2091,7 +2086,7 @@ impl<'a> Tar<'a> {
         let size = octal(field(header, 124, 12));
         let kind = header[156];
         if !matches!(kind, b'0' | b'5') {
-            return Err(format!("unsupported tar entry type for {}", path));
+            return Err(Problem::Invalid.error(format!("unsupported tar entry type for {}", path)));
         }
         if kind == b'5' {
             path = path.trim_end_matches('/').to_string();
@@ -2101,15 +2096,15 @@ impl<'a> Tar<'a> {
             let start = self.offset;
             let end = start
                 .checked_add(size)
-                .ok_or_else(|| "tar size overflow".to_string())?;
+                .ok_or_else(|| Problem::Invalid.error("tar size overflow"))?;
             if end > self.bytes.len() {
-                return Err("truncated tar data".into());
+                return Err(Problem::Invalid.error("truncated tar data"));
             }
             self.offset = end + padding(size);
             Some(&self.bytes[start..end])
         } else {
             if size != 0 {
-                return Err(format!("directory entry has data: {}", path));
+                return Err(Problem::Invalid.error(format!("directory entry has data: {}", path)));
             }
             None
         };
@@ -2123,7 +2118,7 @@ impl<'a> Tar<'a> {
 }
 
 impl<'a> Iterator for Tar<'a> {
-    type Item = Result<Header<'a>, String>;
+    type Item = Result<Header<'a>, ProblemError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match Tar::next(self) {
@@ -2348,7 +2343,7 @@ mod tests {
         header
     }
 
-    fn install_bytes(bytes: &[u8], staging: &Path) -> Result<StagedPackage, String> {
+    fn install_bytes(bytes: &[u8], staging: &Path) -> Result<StagedPackage, ProblemError> {
         let mut installer = StagingInstaller::new(staging.to_path_buf(), false, 1024 * 1024);
         installer.feed(bytes)?;
         installer.finish()
@@ -2431,7 +2426,7 @@ mod tests {
             Ok(_) => panic!("a tampered payload is rejected"),
             Err(error) => error,
         };
-        assert!(error.contains("sha256"), "{error}");
+        assert!(error.detail().contains("sha256"), "{error}");
         assert!(!staging.exists(), "staging survives a rejected payload");
     }
 
@@ -2455,7 +2450,7 @@ mod tests {
         let bytes = unsigned_package_from(&manifest, &files);
 
         let error = verify_bytes(&bytes).expect_err("strict mode");
-        assert!(error.contains("signature.json"), "{error}");
+        assert!(error.detail().contains("signature.json"), "{error}");
         let package =
             verify_bytes_with(&bytes, SignatureCheck::AllowUnsigned).expect("insecure mode");
         assert!(package.signature_bytes.is_empty());
@@ -2472,7 +2467,7 @@ mod tests {
             Ok(_) => panic!("export must be refused without a signature"),
             Err(error) => error,
         };
-        assert!(error.contains("no signature"), "{error}");
+        assert!(error.detail().contains("no signature"), "{error}");
     }
 
     #[test]
@@ -2516,7 +2511,49 @@ mod tests {
         let mismatched = format!("{}-mismatch", crate::platform::target());
         let bytes = package_for(&key, &mismatched);
         let error = verify_bytes(&bytes).expect_err("platform");
-        assert!(error.contains("platform mismatch"), "{error}");
+        assert!(error.detail().contains("platform mismatch"), "{error}");
+        assert_eq!(error.problem, Problem::UnsupportedPlatform);
+    }
+
+    /// The host triple can itself contain "unknown" (`x86_64-unknown-linux-gnu`).
+    /// A carrier that cannot run here must stay a platform rejection (400), not
+    /// become "unknown plugin" (404) — the bug the #150 handoff named.
+    #[test]
+    fn a_platform_mismatch_with_a_real_triple_stays_unsupported_platform() {
+        let key = setup();
+        let host = crate::platform::target();
+        let other = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+            .into_iter()
+            .find(|candidate| *candidate != host)
+            .expect("a triple that differs from this host");
+        let error = verify_bytes(&package_for(&key, other)).expect_err("platform");
+        assert_eq!(error.problem, Problem::UnsupportedPlatform, "{error}");
+        assert!(other.contains("unknown"), "the trap only exists with a real triple");
+    }
+
+    #[test]
+    fn a_broken_manifest_is_invalid_not_internal() {
+        let error = parse_manifest(b"not json").expect_err("bad manifest");
+        assert_eq!(error.problem, Problem::Invalid);
+    }
+
+    #[test]
+    fn a_body_over_the_package_limit_is_too_large() {
+        struct Sink;
+        impl TarSink for Sink {
+            fn entry_start(&mut self, _entry: &StreamEntry) -> Result<(), ProblemError> {
+                Ok(())
+            }
+            fn entry_data(&mut self, _data: &[u8]) -> Result<(), ProblemError> {
+                Ok(())
+            }
+            fn entry_end(&mut self) -> Result<(), ProblemError> {
+                Ok(())
+            }
+        }
+        let mut feed = TarFeed::new(8);
+        let error = feed.feed(&[0u8; 16], &mut Sink).expect_err("over limit");
+        assert_eq!(error.problem, Problem::TooLarge);
     }
 
     fn compat_manifest_value(
@@ -2548,7 +2585,7 @@ mod tests {
         value
     }
 
-    fn parse_and_validate(value: serde_json::Value) -> Result<Manifest, String> {
+    fn parse_and_validate(value: serde_json::Value) -> Result<Manifest, ProblemError> {
         let bytes = serde_json::to_vec(&value).expect("manifest");
         let manifest = parse_manifest(&bytes)?;
         validate_manifest(&manifest)?;
@@ -2577,7 +2614,7 @@ mod tests {
             None,
         ))
         .expect_err("schema gate");
-        assert!(error.contains("compat requires schema 3"), "{error}");
+        assert!(error.detail().contains("compat requires schema 3"), "{error}");
     }
 
     #[test]
@@ -2585,7 +2622,7 @@ mod tests {
         let empty =
             parse_and_validate(compat_manifest_value(3, Some(json!({"devices": []})), None))
                 .expect_err("empty");
-        assert!(empty.contains("must not be empty"), "{empty}");
+        assert!(empty.detail().contains("must not be empty"), "{empty}");
 
         let duplicate = parse_and_validate(compat_manifest_value(
             3,
@@ -2593,7 +2630,7 @@ mod tests {
             None,
         ))
         .expect_err("duplicate");
-        assert!(duplicate.contains("duplicate"), "{duplicate}");
+        assert!(duplicate.detail().contains("duplicate"), "{duplicate}");
 
         let invalid = parse_and_validate(compat_manifest_value(
             3,
@@ -2601,14 +2638,14 @@ mod tests {
             None,
         ))
         .expect_err("invalid");
-        assert!(invalid.contains("device id"), "{invalid}");
+        assert!(invalid.detail().contains("device id"), "{invalid}");
     }
 
     #[test]
     fn a_kernel_module_requires_a_device_list() {
         let error = parse_and_validate(compat_manifest_value(3, None, Some("payload/driver.ko")))
             .expect_err("kernel module without compat");
-        assert!(error.contains("kernel module"), "{error}");
+        assert!(error.detail().contains("kernel module"), "{error}");
 
         let ok = parse_and_validate(compat_manifest_value(
             3,
@@ -2623,7 +2660,7 @@ mod tests {
     fn a_kernel_module_cannot_use_an_old_schema() {
         let error = parse_and_validate(compat_manifest_value(2, None, Some("payload/driver.ko")))
             .expect_err("old schema kernel module");
-        assert!(error.contains("kernel module"), "{error}");
+        assert!(error.detail().contains("kernel module"), "{error}");
     }
 
     #[test]
@@ -2632,9 +2669,9 @@ mod tests {
         let (manifest, files) = manifest(crate::platform::target());
         let bytes = package_from(&key, "missing", &manifest, &files);
         let error = verify_bytes(&bytes).expect_err("unknown key");
-        assert!(error.contains("unknown keyId"), "{error}");
-        assert!(error.contains("missing.pub"), "{error}");
-        assert!(error.contains("trust root"), "{error}");
+        assert!(error.detail().contains("unknown keyId"), "{error}");
+        assert!(error.detail().contains("missing.pub"), "{error}");
+        assert!(error.detail().contains("trust root"), "{error}");
     }
 
     #[test]
@@ -2650,7 +2687,7 @@ mod tests {
         let manifest = serde_json::to_vec(&value).expect("manifest");
         let bytes = package_from(&key, "test", &manifest, &[("../escape", data, 0o755)]);
         let error = verify_bytes(&bytes).expect_err("unsafe path");
-        assert!(error.contains("unsafe path"), "{error}");
+        assert!(error.detail().contains("unsafe path"), "{error}");
     }
 
     #[test]
@@ -2665,7 +2702,7 @@ mod tests {
 
         let error = validate_manifest(&manifest).expect_err("reserved capability");
 
-        assert!(error.contains("reserved"), "{error}");
+        assert!(error.detail().contains("reserved"), "{error}");
     }
 
     #[test]
@@ -2686,7 +2723,7 @@ mod tests {
             &[("payload/bin/demo", data, 0o4755)],
         );
         let error = verify_bytes(&bytes).expect_err("setuid");
-        assert!(error.contains("setuid"), "{error}");
+        assert!(error.detail().contains("setuid"), "{error}");
     }
 
     #[test]
@@ -2707,7 +2744,7 @@ mod tests {
             &[("payload/bin/demo", data, 0o755)],
         );
         let error = verify_bytes(&bytes).expect_err("protocol");
-        assert!(error.contains("protocol"), "{error}");
+        assert!(error.detail().contains("protocol"), "{error}");
     }
 
     #[test]
@@ -2814,7 +2851,7 @@ mod tests {
 
         let error = verify_bytes(&hook_package(&key, &path, 0o644)).expect_err("mode");
 
-        assert!(error.contains("must be executable"), "{error}");
+        assert!(error.detail().contains("must be executable"), "{error}");
     }
 
     #[cfg(unix)]
@@ -2831,7 +2868,7 @@ mod tests {
         ))
         .expect_err("shebang");
 
-        assert!(error.contains("shebang"), "{error}");
+        assert!(error.detail().contains("shebang"), "{error}");
     }
 
     #[cfg(unix)]
@@ -2848,7 +2885,7 @@ mod tests {
         ))
         .expect_err("crlf");
 
-        assert!(error.contains("LF line endings"), "{error}");
+        assert!(error.detail().contains("LF line endings"), "{error}");
     }
 
     #[test]
@@ -2857,7 +2894,7 @@ mod tests {
 
         let error = verify_bytes(&hook_package(&key, "payload/hook", 0o755)).expect_err("path");
 
-        assert!(error.contains("must be under hooks/"), "{error}");
+        assert!(error.detail().contains("must be under hooks/"), "{error}");
     }
 
     #[test]
@@ -2871,7 +2908,7 @@ mod tests {
         bytes.extend(std::iter::repeat_n(0, 509));
         bytes.extend(std::iter::repeat_n(0, 1024));
         let error = verify_bytes(&bytes).expect_err("extra");
-        assert!(error.contains("not declared"), "{error}");
+        assert!(error.detail().contains("not declared"), "{error}");
     }
 
     #[test]
@@ -2881,7 +2918,7 @@ mod tests {
         let missing = files.pop().expect("second file");
         let bytes = package_from(&key, "test", &manifest, &files);
         let error = verify_bytes(&bytes).expect_err("missing");
-        assert!(error.contains("missing files"), "{error} {}", missing.0);
+        assert!(error.detail().contains("missing files"), "{error} {}", missing.0);
     }
 
     fn script_manifest(schema: u32) -> (Vec<u8>, TestFiles) {
@@ -2915,7 +2952,7 @@ mod tests {
     fn rejects_lifecycle_or_interpreter_under_schema_one() {
         let (bytes, _) = script_manifest(1);
         let error = parse_manifest(&bytes).expect_err("schema gate");
-        assert!(error.contains("schema 2"), "{error}");
+        assert!(error.detail().contains("schema 2"), "{error}");
     }
 
     #[test]
@@ -2961,16 +2998,16 @@ mod tests {
         };
         let bytes = serde_json::to_vec(&value("missing/stop.sh", None)).expect("json");
         let error = validate_manifest(&parse_manifest(&bytes).expect("parse")).expect_err("path");
-        assert!(error.contains("not in files[]"), "{error}");
+        assert!(error.detail().contains("not in files[]"), "{error}");
 
         let bytes = serde_json::to_vec(&value("payload/bin/clock.sh", Some(0))).expect("json");
         let error = validate_manifest(&parse_manifest(&bytes).expect("parse")).expect_err("zero");
-        assert!(error.contains("between 1 and"), "{error}");
+        assert!(error.detail().contains("between 1 and"), "{error}");
 
         let bytes = serde_json::to_vec(&value("payload/bin/clock.sh", Some(301))).expect("json");
         let error =
             validate_manifest(&parse_manifest(&bytes).expect("parse")).expect_err("too long");
-        assert!(error.contains("between 1 and"), "{error}");
+        assert!(error.detail().contains("between 1 and"), "{error}");
     }
 
     #[test]
@@ -2983,7 +3020,7 @@ mod tests {
         let bytes = serde_json::to_vec(&value).expect("json");
         let error = validate_manifest(&parse_manifest(&bytes).expect("parse"))
             .expect_err("capabilities need a channel");
-        assert!(error.contains("no protocol channel"), "{error}");
+        assert!(error.detail().contains("no protocol channel"), "{error}");
     }
 
     #[test]
@@ -2994,15 +3031,15 @@ mod tests {
         let bytes = serde_json::to_vec(&value).expect("json");
         let error =
             validate_manifest(&parse_manifest(&bytes).expect("parse")).expect_err("bad name");
-        assert!(error.contains("bare name"), "{error}");
+        assert!(error.detail().contains("bare name"), "{error}");
 
         let mut value: Value = serde_json::from_slice(&script_manifest(2).0).expect("json");
         value["interpreter"]["version"] = json!("3.10");
         let bytes = serde_json::to_vec(&value).expect("json");
         let error =
             validate_manifest(&parse_manifest(&bytes).expect("parse")).expect_err("bad constraint");
-        assert!(error.contains("version"), "{error}");
-        assert!(error.contains("must start with"), "{error}");
+        assert!(error.detail().contains("version"), "{error}");
+        assert!(error.detail().contains("must start with"), "{error}");
     }
 
     #[test]
@@ -3011,7 +3048,7 @@ mod tests {
         let (manifest, files) = script_manifest(1);
         let bytes = package_from(&key, "test", &manifest, &files);
         let error = verify_bytes(&bytes).expect_err("schema one");
-        assert!(error.contains("schema 2"), "{error}");
+        assert!(error.detail().contains("schema 2"), "{error}");
     }
 
     #[test]
@@ -3023,7 +3060,7 @@ mod tests {
         let manifest = serde_json::to_vec(&value).expect("json");
         let error = verify_bytes(&package_from(&key, "test", &manifest, &files))
             .expect_err("missing interpreter");
-        assert!(error.contains("requires an interpreter"), "{error}");
+        assert!(error.detail().contains("requires an interpreter"), "{error}");
     }
 
     #[test]
@@ -3050,7 +3087,7 @@ mod tests {
         let manifest = serde_json::to_vec(&value).expect("manifest");
         let error = verify_bytes(&package_from(&key, "test", &manifest, &files))
             .expect_err("dangling interpreter");
-        assert!(error.contains("no script"), "{error}");
+        assert!(error.detail().contains("no script"), "{error}");
     }
 
     #[test]

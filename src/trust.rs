@@ -3,10 +3,14 @@
 //! A package can never carry its own trust root, so provisioning is an explicit
 //! admin action: `svc trust add <file.pub>`, an upload in the web console, or
 //! dropping a PEM into `trust.d`. Only Ed25519 SPKI public keys are accepted.
+//!
+//! Every failure names its [`Problem`] where it is raised (#151): the HTTP/CLI
+//! projections read the category, never the detail text.
 
 use std::fs;
 use std::path::PathBuf;
 
+use crate::kernel::failure::{Problem, ProblemError};
 use crate::package;
 use crate::paths;
 
@@ -14,12 +18,18 @@ use crate::paths;
 pub const MAX_KEY_BYTES: u64 = 16 * 1024;
 
 /// Sorted key ids present in `trust.d`; a missing directory means "none".
-pub fn keys() -> Result<Vec<String>, String> {
+pub fn keys() -> Result<Vec<String>, ProblemError> {
     let directory = paths::trust_dir();
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(format!("read {}: {}", directory.display(), error)),
+        Err(error) => {
+            return Err(Problem::Internal.error(format!(
+                "read {}: {}",
+                directory.display(),
+                error
+            )))
+        }
     };
     let mut keys = Vec::new();
     for entry in entries.flatten() {
@@ -43,43 +53,53 @@ pub fn key_path(key_id: &str) -> PathBuf {
 
 /// Validate and write `<keyId>.pub`; an existing file with the same id is
 /// replaced so rotating a key does not need a remove first.
-pub fn add(key_id: &str, pem: &[u8]) -> Result<PathBuf, String> {
-    if !package::valid_key_id(key_id) {
-        return Err(format!(
-            "invalid keyId {:?}; expected [A-Za-z0-9._-]{{1,64}}",
-            key_id
-        ));
-    }
+pub fn add(key_id: &str, pem: &[u8]) -> Result<PathBuf, ProblemError> {
+    check_key_id(key_id)?;
     if pem.is_empty() {
-        return Err("public key is empty".into());
+        return Err(Problem::Invalid.error("public key is empty"));
     }
     if pem.len() as u64 > MAX_KEY_BYTES {
-        return Err(format!("public key exceeds {} KiB", MAX_KEY_BYTES / 1024));
+        return Err(Problem::TooLarge.error(format!(
+            "public key exceeds {} KiB",
+            MAX_KEY_BYTES / 1024
+        )));
     }
     package::validate_public_key(pem)?;
     let directory = paths::trust_dir();
-    fs::create_dir_all(&directory)
-        .map_err(|error| format!("create {}: {}", directory.display(), error))?;
+    fs::create_dir_all(&directory).map_err(|error| {
+        Problem::Internal.error(format!("create {}: {}", directory.display(), error))
+    })?;
     set_dir_mode(&directory);
     let target = key_path(key_id);
-    fs::write(&target, pem).map_err(|error| format!("write {}: {}", target.display(), error))?;
+    fs::write(&target, pem)
+        .map_err(|error| Problem::Internal.error(format!("write {}: {}", target.display(), error)))?;
     set_file_mode(&target);
     Ok(target)
 }
 
 /// Remove a trusted key; `Ok(false)` means it was not there.
-pub fn remove(key_id: &str) -> Result<bool, String> {
-    if !package::valid_key_id(key_id) {
-        return Err(format!(
-            "invalid keyId {:?}; expected [A-Za-z0-9._-]{{1,64}}",
-            key_id
-        ));
-    }
+pub fn remove(key_id: &str) -> Result<bool, ProblemError> {
+    check_key_id(key_id)?;
     let path = key_path(key_id);
     match fs::remove_file(&path) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(format!("remove {}: {}", path.display(), error)),
+        Err(error) => Err(Problem::Internal.error(format!(
+            "remove {}: {}",
+            path.display(),
+            error
+        ))),
+    }
+}
+
+fn check_key_id(key_id: &str) -> Result<(), ProblemError> {
+    if package::valid_key_id(key_id) {
+        Ok(())
+    } else {
+        Err(Problem::Invalid.error(format!(
+            "invalid keyId {:?}; expected [A-Za-z0-9._-]{{1,64}}",
+            key_id
+        )))
     }
 }
 
@@ -102,3 +122,30 @@ fn set_dir_mode(path: &std::path::Path) {
 
 #[cfg(not(unix))]
 fn set_dir_mode(_path: &std::path::Path) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bad_key_id_is_invalid_not_a_read_failure() {
+        let error = add("../escape", b"pem").expect_err("path traversal");
+        assert_eq!(error.problem, Problem::Invalid);
+        assert!(error.detail().contains("invalid keyId"), "{}", error);
+
+        let error = remove("../escape").expect_err("path traversal");
+        assert_eq!(error.problem, Problem::Invalid);
+    }
+
+    #[test]
+    fn an_oversized_key_is_too_large() {
+        let error = add("demo", &vec![b'p'; MAX_KEY_BYTES as usize + 1]).expect_err("oversized");
+        assert_eq!(error.problem, Problem::TooLarge);
+    }
+
+    #[test]
+    fn an_empty_key_is_invalid() {
+        let error = add("demo", b"").expect_err("empty");
+        assert_eq!(error.problem, Problem::Invalid);
+    }
+}

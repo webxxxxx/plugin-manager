@@ -100,7 +100,26 @@ pub type BlockingJob = Box<dyn FnOnce(JobBudget) -> BlockingOutcome + Send + 'st
 #[derive(Debug)]
 pub enum BlockingOutcome {
     Ok(Vec<u8>),
-    Failed(String),
+    /// The queue refused the job before it ran: a full pool, a connection that
+    /// already owns a job, or a shutdown. Retryable backpressure, not a job
+    /// failure. Only the Unix server loop owns a pool; the thread driver has
+    /// no queue to refuse into.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Busy,
+    /// The job ran and failed. The status was decided where the failure was
+    /// raised (typed category, #151); the handler projects it and never parses
+    /// `message`.
+    Failed { status: u16, message: String },
+}
+
+impl BlockingOutcome {
+    /// A job failure that projects to `status`, carrying the detail verbatim.
+    pub fn failed(status: u16, message: impl Into<String>) -> BlockingOutcome {
+        BlockingOutcome::Failed {
+            status,
+            message: message.into(),
+        }
+    }
 }
 
 /// A file transfer the server performs. The handler owns the handle; the server

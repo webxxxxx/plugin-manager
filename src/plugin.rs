@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::compat;
 use crate::kernel::contract::{Capability as KernelCapability, CapabilityName, Effect};
+use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::hook;
 use crate::interpreter;
@@ -78,19 +79,19 @@ fn hooks_allowed(opt_in_hooks: bool) -> bool {
 
 /// Reject a hook package before any install side effect (such as stopping the
 /// running version) can happen.
-pub fn ensure_hooks_allowed(package: &Package, opt_in_hooks: bool) -> Result<(), String> {
+pub fn ensure_hooks_allowed(package: &Package, opt_in_hooks: bool) -> Result<(), ProblemError> {
     ensure_hooks_allowed_manifest(&package.manifest, opt_in_hooks)
 }
 
 pub fn ensure_hooks_allowed_manifest(
     manifest: &package::Manifest,
     opt_in_hooks: bool,
-) -> Result<(), String> {
+) -> Result<(), ProblemError> {
     if package::declares_hooks(manifest) && !hooks_allowed(opt_in_hooks) {
-        return Err(format!(
+        return Err(Problem::Invalid.error(format!(
             "package {} declares hooks; this build requires --allow-hooks",
             manifest.name
-        ));
+        )));
     }
     Ok(())
 }
@@ -99,7 +100,7 @@ pub fn ensure_hooks_allowed_manifest(
 /// resolve the host interpreter. The daemon runs this before stopping a running
 /// version, so a bad package or missing interpreter cannot leave the old
 /// version stopped.
-pub fn prepare(package: &Package) -> Result<Option<Interpreter>, String> {
+pub fn prepare(package: &Package) -> Result<Option<Interpreter>, ProblemError> {
     package::validate_manifest(&package.manifest)?;
     let files: Vec<(&str, &[u8])> = package
         .files
@@ -124,7 +125,7 @@ pub struct Verified {
 /// package signature and file hashes, host compatibility, hook policy and the
 /// interpreter lookup. It has no side effects, so the daemon can run it before
 /// stopping a running version.
-pub fn verify(path: &Path, allow_insecure: bool, opt_in_hooks: bool) -> Result<Verified, String> {
+pub fn verify(path: &Path, allow_insecure: bool, opt_in_hooks: bool) -> Result<Verified, ProblemError> {
     let (package, signature_verified) =
         package::verify_package_with_fallback(path, allow_insecure)?;
     verify_package(package, signature_verified, opt_in_hooks)
@@ -134,7 +135,7 @@ fn verify_package(
     package: Package,
     signature_verified: bool,
     opt_in_hooks: bool,
-) -> Result<Verified, String> {
+) -> Result<Verified, ProblemError> {
     let devices = package
         .manifest
         .compat
@@ -146,7 +147,9 @@ fn verify_package(
         &devices,
         &compat::detect(MAX_SCHEMA, MAX_PROTOCOL),
     )) {
-        return Err(reason);
+        // A restricted package on the wrong device generation is the same
+        // family as a host triple mismatch: the host cannot run it (400).
+        return Err(Problem::UnsupportedPlatform.error(reason));
     }
     ensure_hooks_allowed(&package, opt_in_hooks)?;
     let interpreter = prepare(&package)?;
@@ -162,7 +165,7 @@ fn verify_package(
 pub fn prepare_staged(
     staged: &package::StagedPackage,
     opt_in_hooks: bool,
-) -> Result<Option<Interpreter>, String> {
+) -> Result<Option<Interpreter>, ProblemError> {
     package::validate_manifest(&staged.manifest)?;
     ensure_hooks_allowed_manifest(&staged.manifest, opt_in_hooks)?;
     package::validate_staged_payload(&staged.manifest, &staged.root)?;
@@ -176,23 +179,23 @@ pub fn install_staged(
     strategy: Strategy,
     opt_in_hooks: bool,
     host_interpreter: Option<Interpreter>,
-) -> Result<Service, String> {
+) -> Result<Service, ProblemError> {
     let id = staged.manifest.name.clone();
     if id == RESERVED_ID {
-        return Err("the built-in svc id is reserved".into());
+        return Err(Problem::Conflict.error("the built-in svc id is reserved"));
     }
     if !package::valid_name(&id) {
-        return Err(format!("invalid plugin id: {}", id));
+        return Err(Problem::Invalid.error(format!("invalid plugin id: {}", id)));
     }
     ensure_hooks_allowed_manifest(&staged.manifest, opt_in_hooks)?;
     if paths::services_dir().join(format!("{}.json", id)).exists() {
-        return Err(format!("plugin id conflicts with a core service: {}", id));
+        return Err(Problem::Conflict.error(format!("plugin id conflicts with a core service: {}", id)));
     }
 
     let plugin_dir = plugin_dir(&id);
     let was_installed = current_version(&id).is_some();
     fs::create_dir_all(&plugin_dir)
-        .map_err(|error| format!("create {}: {}", plugin_dir.display(), error))?;
+        .map_err(|error| Problem::Internal.error(format!("create {}: {}", plugin_dir.display(), error)))?;
 
     match strategy {
         Strategy::KeepOld => install_keep_old_staged(
@@ -218,7 +221,7 @@ fn install_keep_old_staged(
     plugin_dir: &Path,
     was_installed: bool,
     interpreter: Option<&Interpreter>,
-) -> Result<Service, String> {
+) -> Result<Service, ProblemError> {
     let manifest = staged.manifest.clone();
     let (version_dir, enabled) = commit_staged(staged, plugin_dir, was_installed)?;
     copy_config_staged(&manifest, plugin_dir, &version_dir)?;
@@ -233,7 +236,7 @@ fn install_replace_staged(
     plugin_dir: &Path,
     was_installed: bool,
     interpreter: Option<&Interpreter>,
-) -> Result<Service, String> {
+) -> Result<Service, ProblemError> {
     let manifest = staged.manifest.clone();
     let old_version = current_version(id).filter(|version| plugin_dir.join(version).is_dir());
     let old_dir = old_version.as_ref().map(|version| plugin_dir.join(version));
@@ -243,10 +246,10 @@ fn install_replace_staged(
     if let (Some(old_dir), Some(backup)) = (&old_dir, &backup) {
         if backup.exists() {
             fs::remove_dir_all(backup)
-                .map_err(|error| format!("remove {}: {}", backup.display(), error))?;
+                .map_err(|error| Problem::Internal.error(format!("remove {}: {}", backup.display(), error)))?;
         }
         fs::rename(old_dir, backup)
-            .map_err(|error| format!("backup {}: {}", old_dir.display(), error))?;
+            .map_err(|error| Problem::Invalid.error(format!("backup {}: {}", old_dir.display(), error)))?;
     }
     let enabled_existed = plugin_dir.join("enabled").exists();
     let result = (|| {
@@ -285,27 +288,27 @@ fn commit_staged(
     staged: package::StagedPackage,
     plugin_dir: &Path,
     was_installed: bool,
-) -> Result<(PathBuf, bool), String> {
+) -> Result<(PathBuf, bool), ProblemError> {
     let staging_root = plugin_dir.parent().unwrap_or(plugin_dir);
     if !staged.root.starts_with(staging_root)
         && !fs::canonicalize(staging_root)
             .map(|path| staged.root.starts_with(path))
             .unwrap_or(false)
     {
-        return Err("staging directory is outside the plugin tree".into());
+        return Err(Problem::Invalid.error("staging directory is outside the plugin tree"));
     }
     let version_dir = plugin_dir.join(&staged.manifest.version);
     if version_dir.exists() {
         fs::remove_dir_all(&version_dir)
-            .map_err(|error| format!("remove {}: {}", version_dir.display(), error))?;
+            .map_err(|error| Problem::Internal.error(format!("remove {}: {}", version_dir.display(), error)))?;
     }
     fs::rename(&staged.root, &version_dir).map_err(|error| {
-        format!(
+        Problem::Internal.error(format!(
             "rename {} -> {}: {}",
             staged.root.display(),
             version_dir.display(),
             error
-        )
+        ))
     })?;
     write_current(plugin_dir, &staged.manifest.version)?;
     let enabled_marker = plugin_dir.join("enabled");
@@ -321,7 +324,7 @@ fn copy_config_staged(
     manifest: &package::Manifest,
     plugin_dir: &Path,
     version_dir: &Path,
-) -> Result<(), String> {
+) -> Result<(), ProblemError> {
     let template_path = manifest.config.as_deref().unwrap_or("config/config");
     let template_path = version_dir.join(template_path);
     let template = match fs::read(&template_path) {
@@ -358,7 +361,7 @@ fn run_post_install_manifest(
     manifest: &package::Manifest,
     id: &str,
     version_dir: &Path,
-) -> Result<(), String> {
+) -> Result<(), ProblemError> {
     let Some(path) = manifest
         .hooks
         .as_ref()
@@ -377,7 +380,12 @@ fn run_post_install_manifest(
         },
         &mut hook::poll_this_loop,
     )
-    .map_err(|error| format!("post-install hook failed: {}", error))
+    .map_err(|error| {
+        ProblemError::new(
+            error.problem,
+            format!("post-install hook failed: {}", error),
+        )
+    })
 }
 
 /// Remove stale staging directories. Called once at daemon startup.
@@ -412,13 +420,13 @@ pub fn cleanup_staging() {
 /// Allocate a unique staging directory under the plugin's own tree so the
 /// final commit is a same-filesystem rename.
 #[allow(dead_code)]
-pub fn staging_dir(id: &str) -> Result<PathBuf, String> {
+pub fn staging_dir(id: &str) -> Result<PathBuf, ProblemError> {
     if !package::valid_name(id) {
-        return Err(format!("invalid plugin id: {}", id));
+        return Err(Problem::Invalid.error(format!("invalid plugin id: {}", id)));
     }
     let directory = plugin_dir(id);
     fs::create_dir_all(&directory)
-        .map_err(|error| format!("create {}: {}", directory.display(), error))?;
+        .map_err(|error| Problem::Internal.error(format!("create {}: {}", directory.display(), error)))?;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -426,25 +434,56 @@ pub fn staging_dir(id: &str) -> Result<PathBuf, String> {
     Ok(directory.join(format!(".staging-{}-{}", std::process::id(), nanos)))
 }
 
+/// What an install rejection implies for its caller.
+///
+/// `keep-old` needs the new version next to the old one, so running out of
+/// disk is recoverable: the daemon may stop the plugin and retry as `replace`.
+/// The space plan decides that here, so no upper layer reads `detail` (#151).
+#[derive(Debug)]
+pub enum InstallFailure {
+    /// There is no room for the new version beside the old one.
+    OutOfSpace(ProblemError),
+    /// Any other refusal.
+    Refused(ProblemError),
+}
+
+impl InstallFailure {
+    pub fn into_problem(self) -> ProblemError {
+        match self {
+            InstallFailure::OutOfSpace(error) | InstallFailure::Refused(error) => error,
+        }
+    }
+}
+
+impl From<ProblemError> for InstallFailure {
+    fn from(error: ProblemError) -> InstallFailure {
+        InstallFailure::Refused(error)
+    }
+}
+
 pub fn install_package(
     package: &Package,
     strategy: Strategy,
     opt_in_hooks: bool,
     host_interpreter: Option<Interpreter>,
-) -> Result<Service, String> {
+) -> Result<Service, InstallFailure> {
     let id = package.manifest.name.clone();
     if id == RESERVED_ID {
-        return Err("the built-in svc id is reserved".into());
+        return Err(Problem::Conflict.error("the built-in svc id is reserved").into());
     }
     ensure_hooks_allowed(package, opt_in_hooks)?;
     if paths::services_dir().join(format!("{}.json", id)).exists() {
-        return Err(format!("plugin id conflicts with a core service: {}", id));
+        return Err(
+            Problem::Conflict
+                .error(format!("plugin id conflicts with a core service: {}", id))
+                .into(),
+        );
     }
 
     let plugin_dir = plugin_dir(&id);
     let was_installed = current_version(&id).is_some();
     fs::create_dir_all(&plugin_dir)
-        .map_err(|error| format!("create {}: {}", plugin_dir.display(), error))?;
+        .map_err(|error| Problem::Internal.error(format!("create {}: {}", plugin_dir.display(), error)))?;
 
     match strategy {
         Strategy::KeepOld => install_keep_old(
@@ -460,7 +499,8 @@ pub fn install_package(
             &plugin_dir,
             was_installed,
             host_interpreter.as_ref(),
-        ),
+        )
+        .map_err(InstallFailure::from),
     }
 }
 
@@ -470,10 +510,21 @@ fn install_keep_old(
     plugin_dir: &Path,
     was_installed: bool,
     interpreter: Option<&Interpreter>,
-) -> Result<Service, String> {
+) -> Result<Service, InstallFailure> {
     // No hook-specific rollback here: keep-old keeps the previous version and
     // switches `current`, so a failing post-install just reports the error.
     // A replace install rolls back through its own strategy handling.
+    //
+    // The new version lives next to the old one until `current` switches, so
+    // the old version's bytes cannot be reclaimed: the plan is the same as a
+    // first install. Running out is the one refusal the caller can retry as
+    // `replace`, so it leaves with its own category.
+    let free = free_space(plugin_dir)?;
+    if replace_plan(free, None, package.unpacked_size()) == ReplacePlan::NoSpace {
+        return Err(InstallFailure::OutOfSpace(out_of_space(
+            package, free, None,
+        )));
+    }
     let (version_dir, enabled) = write_version(package, plugin_dir, was_installed)?;
     copy_config(package, plugin_dir)?;
     let service = service_from_manifest(id, &version_dir, &package.manifest, enabled, interpreter)?;
@@ -481,7 +532,7 @@ fn install_keep_old(
     Ok(service)
 }
 
-fn run_post_install(package: &Package, id: &str, version_dir: &Path) -> Result<(), String> {
+fn run_post_install(package: &Package, id: &str, version_dir: &Path) -> Result<(), ProblemError> {
     let Some(path) = package
         .manifest
         .hooks
@@ -501,7 +552,12 @@ fn run_post_install(package: &Package, id: &str, version_dir: &Path) -> Result<(
         },
         &mut hook::poll_this_loop,
     )
-    .map_err(|error| format!("post-install hook failed: {}", error))
+    .map_err(|error| {
+        ProblemError::new(
+            error.problem,
+            format!("post-install hook failed: {}", error),
+        )
+    })
 }
 
 fn install_replace(
@@ -510,7 +566,7 @@ fn install_replace(
     plugin_dir: &Path,
     was_installed: bool,
     interpreter: Option<&Interpreter>,
-) -> Result<Service, String> {
+) -> Result<Service, ProblemError> {
     let old_version = current_version(id).filter(|version| plugin_dir.join(version).is_dir());
     let old_dir = old_version.as_ref().map(|version| plugin_dir.join(version));
     let old_size = match &old_dir {
@@ -521,16 +577,7 @@ fn install_replace(
     let free = free_space(plugin_dir)?;
     let plan = replace_plan(free, old_size, new_size);
     if plan == ReplacePlan::NoSpace {
-        return Err(format!(
-            "not enough space to install {} {}: need {} bytes, {} free{}",
-            id,
-            package.manifest.version,
-            new_size,
-            free,
-            old_size
-                .map(|size| format!(", current version uses {size} bytes"))
-                .unwrap_or_default()
-        ));
+        return Err(out_of_space(package, free, old_size));
     }
 
     let backup = if plan == ReplacePlan::Backup {
@@ -539,16 +586,16 @@ fn install_replace(
         let backup = plugin_dir.join(format!(".backup-{}.{}", old_version, std::process::id()));
         if backup.exists() {
             fs::remove_dir_all(&backup)
-                .map_err(|error| format!("remove {}: {}", backup.display(), error))?;
+                .map_err(|error| Problem::Internal.error(format!("remove {}: {}", backup.display(), error)))?;
         }
         fs::rename(old_dir, &backup)
-            .map_err(|error| format!("backup {}: {}", old_dir.display(), error))?;
+            .map_err(|error| Problem::Invalid.error(format!("backup {}: {}", old_dir.display(), error)))?;
         Some(backup)
     } else {
         if plan == ReplacePlan::Reclaim {
             if let Some(old_dir) = &old_dir {
                 fs::remove_dir_all(old_dir)
-                    .map_err(|error| format!("remove {}: {}", old_dir.display(), error))?;
+                    .map_err(|error| Problem::Internal.error(format!("remove {}: {}", old_dir.display(), error)))?;
             }
             let _ = fs::remove_file(plugin_dir.join("current"));
         }
@@ -609,7 +656,7 @@ fn install_replace(
                 match fs::rename(backup, old_dir) {
                     Ok(()) => {
                         if let Err(restore) = write_current(plugin_dir, old_version) {
-                            rollback.push(restore);
+                            rollback.push(restore.detail().to_string());
                         }
                     }
                     Err(restore) => {
@@ -627,11 +674,11 @@ fn install_replace(
             if rollback.is_empty() {
                 Err(error)
             } else {
-                Err(format!(
+                Err(Problem::Internal.error(format!(
                     "{} (rollback incomplete: {})",
                     error,
                     rollback.join("; ")
-                ))
+                )))
             }
         }
     }
@@ -641,7 +688,7 @@ fn write_version(
     package: &Package,
     plugin_dir: &Path,
     was_installed: bool,
-) -> Result<(PathBuf, bool), String> {
+) -> Result<(PathBuf, bool), ProblemError> {
     let temp = plugin_dir.join(format!(
         "{}.tmp.{}",
         package.manifest.version,
@@ -649,7 +696,7 @@ fn write_version(
     ));
     if temp.exists() {
         fs::remove_dir_all(&temp)
-            .map_err(|error| format!("remove {}: {}", temp.display(), error))?;
+            .map_err(|error| Problem::Internal.error(format!("remove {}: {}", temp.display(), error)))?;
     }
     if let Err(error) = package.write_to(&temp) {
         let _ = fs::remove_dir_all(&temp);
@@ -659,10 +706,10 @@ fn write_version(
     let version_dir = plugin_dir.join(&package.manifest.version);
     if version_dir.exists() {
         fs::remove_dir_all(&version_dir)
-            .map_err(|error| format!("remove {}: {}", version_dir.display(), error))?;
+            .map_err(|error| Problem::Internal.error(format!("remove {}: {}", version_dir.display(), error)))?;
     }
     fs::rename(&temp, &version_dir)
-        .map_err(|error| format!("rename {}: {}", version_dir.display(), error))?;
+        .map_err(|error| Problem::Internal.error(format!("rename {}: {}", version_dir.display(), error)))?;
 
     write_current(plugin_dir, &package.manifest.version)?;
 
@@ -678,15 +725,29 @@ fn write_version(
     Ok((version_dir, enabled))
 }
 
-fn directory_size(path: &Path) -> Result<u64, String> {
+/// The failure a full disk produces. One message shape for both strategies.
+fn out_of_space(package: &Package, free: u64, old_size: Option<u64>) -> ProblemError {
+    Problem::Internal.error(format!(
+        "not enough space to install {} {}: need {} bytes, {} free{}",
+        package.manifest.name,
+        package.manifest.version,
+        package.unpacked_size(),
+        free,
+        old_size
+            .map(|size| format!(", current version uses {size} bytes"))
+            .unwrap_or_default()
+    ))
+}
+
+fn directory_size(path: &Path) -> Result<u64, ProblemError> {
     let mut total = 0u64;
     let entries =
-        fs::read_dir(path).map_err(|error| format!("read {}: {}", path.display(), error))?;
+        fs::read_dir(path).map_err(|error| Problem::Internal.error(format!("read {}: {}", path.display(), error)))?;
     for entry in entries {
-        let entry = entry.map_err(|error| format!("read {}: {}", path.display(), error))?;
+        let entry = entry.map_err(|error| Problem::Internal.error(format!("read {}: {}", path.display(), error)))?;
         let metadata = entry
             .metadata()
-            .map_err(|error| format!("stat {}: {}", entry.path().display(), error))?;
+            .map_err(|error| Problem::Internal.error(format!("stat {}: {}", entry.path().display(), error)))?;
         if metadata.is_dir() {
             total = total.saturating_add(directory_size(&entry.path())?);
         } else {
@@ -696,20 +757,20 @@ fn directory_size(path: &Path) -> Result<u64, String> {
     Ok(total)
 }
 
-fn free_space(path: &Path) -> Result<u64, String> {
+fn free_space(path: &Path) -> Result<u64, ProblemError> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
 
         let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| format!("free space: invalid path {}", path.display()))?;
+            .map_err(|_| Problem::Internal.error(format!("free space: invalid path {}", path.display())))?;
         let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
         if unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) } != 0 {
-            return Err(format!(
+            return Err(Problem::Internal.error(format!(
                 "free space {}: {}",
                 path.display(),
                 std::io::Error::last_os_error()
-            ));
+            )));
         }
         Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
     }
@@ -727,18 +788,18 @@ fn free_space(path: &Path) -> Result<u64, String> {
             GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut total_free)
         } == 0
         {
-            return Err(format!(
+            return Err(Problem::Internal.error(format!(
                 "free space {}: {}",
                 path.display(),
                 std::io::Error::last_os_error()
-            ));
+            )));
         }
         Ok(available)
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
-        Err("free space is not supported on this platform".into())
+        Err(Problem::Internal.error("free space is not supported on this platform"))
     }
 }
 
@@ -769,23 +830,23 @@ impl ConfigSnapshot {
             (plugin_dir.join("config.new"), &self.config_new, false),
         ] {
             if let Err(error) = restore_file(&path, content, config) {
-                errors.push(error);
+                errors.push(error.detail().to_string());
             }
         }
         errors
     }
 }
 
-fn restore_file(path: &Path, content: &Option<Vec<u8>>, config: bool) -> Result<(), String> {
+fn restore_file(path: &Path, content: &Option<Vec<u8>>, config: bool) -> Result<(), ProblemError> {
     match content {
         Some(bytes) if config => write_config(path, bytes),
         Some(bytes) => {
-            fs::write(path, bytes).map_err(|error| format!("write {}: {}", path.display(), error))
+            fs::write(path, bytes).map_err(|error| Problem::Internal.error(format!("write {}: {}", path.display(), error)))
         }
         None => match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!("remove {}: {}", path.display(), error)),
+            Err(error) => Err(Problem::Internal.error(format!("remove {}: {}", path.display(), error))),
         },
     }
 }
@@ -883,18 +944,18 @@ pub fn remove_logs(id: &str) {
     }
 }
 
-pub fn uninstall(id: &str, purge: bool) -> Result<(), String> {
+pub fn uninstall(id: &str, purge: bool) -> Result<(), ProblemError> {
     if !package::valid_name(id) || id == RESERVED_ID {
-        return Err(format!("unknown plugin: {}", id));
+        return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
     }
     let directory = plugin_dir(id);
     if !directory.is_dir() {
-        return Err(format!("unknown plugin: {}", id));
+        return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
     }
     run_pre_remove(id);
     if purge {
         fs::remove_dir_all(&directory)
-            .map_err(|error| format!("remove {}: {}", directory.display(), error))?;
+            .map_err(|error| Problem::Internal.error(format!("remove {}: {}", directory.display(), error)))?;
         return Ok(());
     }
 
@@ -904,7 +965,7 @@ pub fn uninstall(id: &str, purge: bool) -> Result<(), String> {
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("remove {}: {}", path.display(), error)),
+            Err(error) => return Err(Problem::Internal.error(format!("remove {}: {}", path.display(), error))),
         }
     }
     Ok(())
@@ -978,23 +1039,23 @@ fn service_from_manifest(
     manifest: &package::Manifest,
     enabled: bool,
     interpreter: Option<&Interpreter>,
-) -> Result<Service, String> {
+) -> Result<Service, ProblemError> {
     if manifest.platform != crate::platform::target() {
-        return Err(format!(
+        return Err(Problem::UnsupportedPlatform.error(format!(
             "platform mismatch: package {}, host {}",
             manifest.platform,
             crate::platform::target()
-        ));
+        )));
     }
     package::check_path(&manifest.exec.path)?;
     let exec_path = version_dir.join(&manifest.exec.path);
     if !exec_path.is_file() {
-        return Err(format!("exec is missing: {}", exec_path.display()));
+        return Err(Problem::Invalid.error(format!("exec is missing: {}", exec_path.display())));
     }
     let ready = match manifest.exec.ready.as_deref() {
         None | Some("notify") => Ready::Notify,
         Some("exec") => Ready::Exec,
-        Some(other) => return Err(format!("unknown ready mode: {}", other)),
+        Some(other) => return Err(Problem::Invalid.error(format!("unknown ready mode: {}", other))),
     };
     let mut caps: Vec<KernelCapability> = Vec::new();
     for capability in &manifest.capabilities {
@@ -1005,7 +1066,7 @@ fn service_from_manifest(
                 .iter()
                 .any(|cap| cap.name.as_str() == capability.name)
         {
-            return Err(format!("invalid capability name: {}", capability.name));
+            return Err(Problem::Invalid.error(format!("invalid capability name: {}", capability.name)));
         }
         caps.push(KernelCapability {
             name: CapabilityName::new(capability.name.clone()),
@@ -1016,7 +1077,7 @@ fn service_from_manifest(
         });
     }
     if ready == Ready::Exec && !caps.is_empty() {
-        return Err("exec.ready=exec cannot declare capabilities: no protocol channel".into());
+        return Err(Problem::Invalid.error("exec.ready=exec cannot declare capabilities: no protocol channel"));
     }
     let contract = crate::registry::contract_for(
         id,
@@ -1029,10 +1090,10 @@ fn service_from_manifest(
     let exec_is_script = !is_native_file(&exec_path)?;
     let mut any_script = exec_is_script;
     if schema_two && exec_is_script && interpreter.is_none() {
-        return Err(format!(
+        return Err(Problem::Invalid.error(format!(
             "plugin {} runs a script but the manifest declares no interpreter",
             id
-        ));
+        )));
     }
 
     let lifecycle = match &manifest.lifecycle {
@@ -1073,10 +1134,10 @@ fn service_from_manifest(
         }
     };
     if schema_two && !any_script && interpreter.is_some() {
-        return Err(format!(
+        return Err(Problem::Invalid.error(format!(
             "plugin {} declares an interpreter but has no script payload",
             id
-        ));
+        )));
     }
 
     let config = {
@@ -1130,33 +1191,33 @@ fn convert_lifecycle_hook(
     max_timeout_ms: u64,
     interpreter: Option<&Interpreter>,
     any_script: &mut bool,
-) -> Result<Option<Hook>, String> {
+) -> Result<Option<Hook>, ProblemError> {
     let Some(hook) = hook else {
         return Ok(None);
     };
     let path = version_dir.join(&hook.path);
     if !path.is_file() {
-        return Err(format!("lifecycle.{} is missing: {}", name, path.display()));
+        return Err(Problem::Invalid.error(format!("lifecycle.{} is missing: {}", name, path.display())));
     }
     let is_script = !is_native_file(&path)?;
     if is_script {
         *any_script = true;
         if interpreter.is_none() {
-            return Err(format!(
+            return Err(Problem::Invalid.error(format!(
                 "lifecycle.{} is a script but the manifest declares no interpreter",
                 name
-            ));
+            )));
         }
     }
     let timeout_ms = match hook.timeout {
         Some(seconds) if seconds >= 1 && seconds <= max_timeout_ms / 1000 => seconds * 1000,
         Some(seconds) => {
-            return Err(format!(
+            return Err(Problem::Invalid.error(format!(
                 "lifecycle.{} timeout must be between 1 and {} seconds, got {}",
                 name,
                 max_timeout_ms / 1000,
                 seconds
-            ))
+            )))
         }
         None => default_timeout_ms,
     };
@@ -1174,21 +1235,21 @@ fn convert_lifecycle_hook(
 }
 
 /// Read only the header: installed payloads can be large native binaries.
-fn is_native_file(path: &Path) -> Result<bool, String> {
+fn is_native_file(path: &Path) -> Result<bool, ProblemError> {
     use std::io::Read;
     let mut file =
-        fs::File::open(path).map_err(|error| format!("read {}: {}", path.display(), error))?;
+        fs::File::open(path).map_err(|error| Problem::Internal.error(format!("read {}: {}", path.display(), error)))?;
     let mut head = [0u8; 8];
     let read = file
         .read(&mut head)
-        .map_err(|error| format!("read {}: {}", path.display(), error))?;
+        .map_err(|error| Problem::Internal.error(format!("read {}: {}", path.display(), error)))?;
     Ok(package::is_native_binary(&head[..read]))
 }
 
 fn resolve_interpreter(
     manifest: &package::Manifest,
-    resolve: fn(&interpreter::Spec) -> Result<interpreter::Resolved, String>,
-) -> Result<Option<Interpreter>, String> {
+    resolve: fn(&interpreter::Spec) -> Result<interpreter::Resolved, ProblemError>,
+) -> Result<Option<Interpreter>, ProblemError> {
     let Some(spec) = manifest.interpreter.as_ref().map(|spec| interpreter::Spec {
         name: spec.name.clone(),
         args: spec.args.clone(),
@@ -1203,26 +1264,26 @@ fn resolve_interpreter(
     }))
 }
 
-fn read_manifest(version_dir: &Path) -> Result<package::Manifest, String> {
+fn read_manifest(version_dir: &Path) -> Result<package::Manifest, ProblemError> {
     let bytes = fs::read(version_dir.join("manifest.json"))
-        .map_err(|error| format!("read manifest: {}", error))?;
+        .map_err(|error| Problem::Internal.error(format!("read manifest: {}", error)))?;
     let manifest = package::parse_manifest(&bytes)?;
     if manifest.platform != crate::platform::target() {
-        return Err(format!(
+        return Err(Problem::UnsupportedPlatform.error(format!(
             "platform mismatch: package {}, host {}",
             manifest.platform,
             crate::platform::target()
-        ));
+        )));
     }
     Ok(manifest)
 }
 
-fn write_current(plugin_dir: &Path, version: &str) -> Result<(), String> {
+fn write_current(plugin_dir: &Path, version: &str) -> Result<(), ProblemError> {
     let path = plugin_dir.join("current");
-    fs::write(&path, version).map_err(|error| format!("write {}: {}", path.display(), error))
+    fs::write(&path, version).map_err(|error| Problem::Internal.error(format!("write {}: {}", path.display(), error)))
 }
 
-fn copy_config(package: &Package, plugin_dir: &Path) -> Result<(), String> {
+fn copy_config(package: &Package, plugin_dir: &Path) -> Result<(), ProblemError> {
     let Some(template) = package.config_template() else {
         return Ok(());
     };
@@ -1252,8 +1313,8 @@ fn copy_config(package: &Package, plugin_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn write_hash(path: &Path, hash: &str) -> Result<(), String> {
-    fs::write(path, hash).map_err(|error| format!("write {}: {}", path.display(), error))?;
+fn write_hash(path: &Path, hash: &str) -> Result<(), ProblemError> {
+    fs::write(path, hash).map_err(|error| Problem::Internal.error(format!("write {}: {}", path.display(), error)))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1262,35 +1323,35 @@ fn write_hash(path: &Path, hash: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn lock_config(id: &str) -> Result<fs::File, String> {
+pub fn lock_config(id: &str) -> Result<fs::File, ProblemError> {
     let path = plugin_dir(id).join("config.lock");
     let file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .open(&path)
-        .map_err(|error| format!("open {}: {}", path.display(), error))?;
+        .map_err(|error| Problem::Internal.error(format!("open {}: {}", path.display(), error)))?;
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(format!(
+            return Err(Problem::Internal.error(format!(
                 "lock {}: {}",
                 path.display(),
                 std::io::Error::last_os_error()
-            ));
+            )));
         }
     }
     Ok(file)
 }
 
-pub fn write_config(path: &Path, data: &[u8]) -> Result<(), String> {
-    fs::write(path, data).map_err(|error| format!("write {}: {}", path.display(), error))?;
+pub fn write_config(path: &Path, data: &[u8]) -> Result<(), ProblemError> {
+    fs::write(path, data).map_err(|error| Problem::Internal.error(format!("write {}: {}", path.display(), error)))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o640))
-            .map_err(|error| format!("chmod {}: {}", path.display(), error))?;
+            .map_err(|error| Problem::Internal.error(format!("chmod {}: {}", path.display(), error)))?;
     }
     Ok(())
 }
@@ -1339,9 +1400,9 @@ pub fn config_template(id: &str) -> Option<(Vec<u8>, package::Manifest)> {
     Some((data, manifest))
 }
 
-pub fn config_check(id: &str, candidate: &Path) -> Result<(), String> {
+pub fn config_check(id: &str, candidate: &Path) -> Result<(), ProblemError> {
     let Some(version) = current_version(id) else {
-        return Err(format!("unknown plugin: {}", id));
+        return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
     };
     let version_dir = plugin_dir(id).join(&version);
     let manifest = read_manifest(&version_dir)?;
@@ -1351,7 +1412,7 @@ pub fn config_check(id: &str, candidate: &Path) -> Result<(), String> {
     package::check_path(&check.path)?;
     let program = version_dir.join(&check.path);
     if !program.is_file() {
-        return Err(format!("configCheck is missing: {}", program.display()));
+        return Err(Problem::Conflict.error(format!("configCheck is missing: {}", program.display())));
     }
     let mut command = check_command(&program);
     command
@@ -1373,7 +1434,7 @@ pub fn config_check(id: &str, candidate: &Path) -> Result<(), String> {
         .stderr(std::process::Stdio::piped());
     let mut child = command
         .spawn()
-        .map_err(|error| format!("spawn configCheck: {}", error))?;
+        .map_err(|error| Problem::Conflict.error(format!("spawn configCheck: {}", error)))?;
     let _ = crate::platform::host::process::adopt(&child);
     let started = Instant::now();
     loop {
@@ -1387,19 +1448,19 @@ pub fn config_check(id: &str, candidate: &Path) -> Result<(), String> {
                     use std::io::Read;
                     let _ = handle.read_to_string(&mut stderr);
                 }
-                return Err(format!(
+                return Err(Problem::Conflict.error(format!(
                     "configCheck failed ({}): {}",
                     status,
                     stderr.trim()
-                ));
+                )));
             }
             Ok(None) => {}
-            Err(error) => return Err(format!("configCheck: {}", error)),
+            Err(error) => return Err(Problem::Conflict.error(format!("configCheck: {}", error))),
         }
         if started.elapsed() > Duration::from_secs(10) {
             let _ = child.kill();
             let _ = child.wait();
-            return Err("configCheck timed out after 10s".into());
+            return Err(Problem::Conflict.error("configCheck timed out after 10s"));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1426,13 +1487,13 @@ fn check_command(program: &Path) -> Command {
     Command::new(program)
 }
 
-pub fn replace_config(id: &str, candidate: &[u8], check: bool) -> Result<(), String> {
+pub fn replace_config(id: &str, candidate: &[u8], check: bool) -> Result<(), ProblemError> {
     let directory = plugin_dir(id);
     if !directory.is_dir() {
-        return Err(format!("unknown plugin: {}", id));
+        return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
     }
     if candidate.len() > 1024 * 1024 {
-        return Err("config exceeds 1 MiB".into());
+        return Err(Problem::TooLarge.error("config exceeds 1 MiB"));
     }
     let target = directory.join("config");
     let temporary = directory.join(format!("config.tmp.{}", std::process::id()));
@@ -1445,17 +1506,17 @@ pub fn replace_config(id: &str, candidate: &[u8], check: bool) -> Result<(), Str
     }
     if target.exists() {
         fs::copy(&target, directory.join("config.last-good"))
-            .map_err(|error| format!("save last-good: {}", error))?;
+            .map_err(|error| Problem::Internal.error(format!("save last-good: {}", error)))?;
     }
-    fs::rename(&temporary, &target).map_err(|error| format!("replace config: {}", error))?;
+    fs::rename(&temporary, &target).map_err(|error| Problem::Internal.error(format!("replace config: {}", error)))?;
     Ok(())
 }
 
-pub fn root_required() -> Result<(), String> {
+pub fn root_required() -> Result<(), ProblemError> {
     if crate::platform::is_privileged() || crate::paths::user_mode() {
         Ok(())
     } else {
-        Err("root / Administrator is required".into())
+        Err(Problem::Internal.error("root / Administrator is required"))
     }
 }
 
@@ -1468,10 +1529,10 @@ pub struct Backup {
     pub config_sha256: Option<String>,
 }
 
-pub fn export_config(id: &str) -> Result<(String, Vec<u8>), String> {
-    let version = current_version(id).ok_or_else(|| format!("unknown plugin: {}", id))?;
-    let config = active_config(id).ok_or_else(|| format!("plugin {} has no config", id))?;
-    let data = fs::read(&config).map_err(|error| format!("read config: {}", error))?;
+pub fn export_config(id: &str) -> Result<(String, Vec<u8>), ProblemError> {
+    let version = current_version(id).ok_or_else(|| Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)))?;
+    let config = active_config(id).ok_or_else(|| Problem::UnknownPlugin.error(format!("plugin {} has no config", id)))?;
+    let data = fs::read(&config).map_err(|error| Problem::Internal.error(format!("read config: {}", error)))?;
     Ok((version, data))
 }
 
@@ -1485,7 +1546,7 @@ pub fn plan_export_spkb(
     version: &str,
     version_dir: &Path,
     config: Option<&[u8]>,
-) -> Result<package::TarPlan, String> {
+) -> Result<package::TarPlan, ProblemError> {
     let mut plan = package::TarPlan::new();
     let backup = backup_json(id, version, config);
     plan.push_bytes(package::tar_entry_bytes("backup.json", &backup, 0o644)?);
@@ -1501,10 +1562,10 @@ pub fn plan_export_spkb(
     Ok(plan)
 }
 
-pub fn export_spkb(id: &str) -> Result<(String, Vec<u8>), String> {
-    let version = current_version(id).ok_or_else(|| format!("unknown plugin: {}", id))?;
+pub fn export_spkb(id: &str) -> Result<(String, Vec<u8>), ProblemError> {
+    let version = current_version(id).ok_or_else(|| Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)))?;
     let config = active_config(id)
-        .map(|path| fs::read(path).map_err(|error| format!("read config: {}", error)))
+        .map(|path| fs::read(path).map_err(|error| Problem::Internal.error(format!("read config: {}", error))))
         .transpose()?;
     let plan = plan_export_spkb(
         id,
@@ -1532,9 +1593,9 @@ pub(crate) fn backup_json(id: &str, version: &str, config: Option<&[u8]>) -> Vec
     .unwrap_or_default()
 }
 
-fn remove_versions(directory: &Path, keep: Option<&str>) -> Result<(), String> {
+fn remove_versions(directory: &Path, keep: Option<&str>) -> Result<(), ProblemError> {
     let entries = fs::read_dir(directory)
-        .map_err(|error| format!("read {}: {}", directory.display(), error))?;
+        .map_err(|error| Problem::Internal.error(format!("read {}: {}", directory.display(), error)))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -1547,7 +1608,7 @@ fn remove_versions(directory: &Path, keep: Option<&str>) -> Result<(), String> {
             continue;
         }
         fs::remove_dir_all(&path)
-            .map_err(|error| format!("remove {}: {}", path.display(), error))?;
+            .map_err(|error| Problem::Internal.error(format!("remove {}: {}", path.display(), error)))?;
     }
     Ok(())
 }
@@ -1710,11 +1771,36 @@ mod tests {
         make_plugin("checked", "old", true);
         replace_config("checked", b"good config", true).expect("good");
         let error = replace_config("checked", b"bad config", true).expect_err("bad");
-        assert!(error.contains("configCheck"), "{error}");
+        assert!(error.detail().contains("configCheck"), "{error}");
+        assert_eq!(error.problem, Problem::Conflict);
         assert_eq!(
             std::fs::read(active_config("checked").expect("active")).expect("read"),
             b"good config"
         );
+    }
+
+    /// The daemon's keep-old fallback reads this signal, never the detail text.
+    #[test]
+    fn an_install_failure_keeps_its_retry_signal_and_its_category() {
+        let refused: InstallFailure = Problem::Conflict.error("reserved").into();
+        assert!(matches!(refused, InstallFailure::Refused(_)));
+        assert_eq!(refused.into_problem().problem, Problem::Conflict);
+
+        let full = InstallFailure::OutOfSpace(Problem::Internal.error("not enough space"));
+        assert!(matches!(full, InstallFailure::OutOfSpace(_)));
+        assert_eq!(full.into_problem().problem, Problem::Internal);
+    }
+
+    #[test]
+    fn a_config_refusal_carries_its_status_family() {
+        make_plugin("families", "old", false);
+
+        let error = replace_config("no-such-plugin", b"x", false).expect_err("unknown plugin");
+        assert_eq!(error.problem, Problem::UnknownPlugin);
+
+        let oversized = vec![b'x'; 1024 * 1024 + 1];
+        let error = replace_config("families", &oversized, false).expect_err("too large");
+        assert_eq!(error.problem, Problem::TooLarge);
     }
 
     fn script_manifest(
@@ -1808,7 +1894,7 @@ mod tests {
         let error = service_from_manifest("no-interpreter", &version_dir, &manifest, true, None)
             .expect_err("missing interpreter");
 
-        assert!(error.contains("declares no interpreter"), "{error}");
+        assert!(error.detail().contains("declares no interpreter"), "{error}");
     }
 
     #[test]
@@ -1840,6 +1926,6 @@ mod tests {
         let error = service_from_manifest("dangling", &version_dir, &manifest, true, Some(&host))
             .expect_err("no script payload");
 
-        assert!(error.contains("no script payload"), "{error}");
+        assert!(error.detail().contains("no script payload"), "{error}");
     }
 }

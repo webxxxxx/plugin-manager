@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use crate::http;
+use crate::kernel::failure::ProblemError;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::lan::{self, AuthKind, Lan};
 use crate::log;
@@ -136,11 +137,11 @@ impl ApiFace {
         let _guard = plugin::config_lock();
         let _lock = match plugin::lock_config(id) {
             Ok(lock) => lock,
-            Err(message) => return error_response(500, "internal", &message),
+            Err(error) => return problem_error_response(&error),
         };
         match plugin::replace_config(id, body, true) {
             Ok(()) => Response::json(200, &json!({ "ok": true })),
-            Err(message) => config_error_response(&message),
+            Err(error) => problem_error_response(&error),
         }
     }
 
@@ -158,11 +159,11 @@ impl ApiFace {
         let _guard = plugin::config_lock();
         let _lock = match plugin::lock_config(id) {
             Ok(lock) => lock,
-            Err(message) => return error_response(500, "internal", &message),
+            Err(error) => return problem_error_response(&error),
         };
         match plugin::replace_config(id, &template, true) {
             Ok(()) => Response::json(200, &json!({ "ok": true })),
-            Err(message) => config_error_response(&message),
+            Err(error) => problem_error_response(&error),
         }
     }
 
@@ -175,10 +176,7 @@ impl ApiFace {
                 &format!("{}-{}.config", safe_filename(id), safe_filename(&version)),
                 &data,
             ),
-            Err(message) if message.contains("has no config") => {
-                error_response(404, "not_found", &message)
-            }
-            Err(message) => error_response(500, "internal", &message),
+            Err(error) => problem_error_response(&error),
         }
     }
 
@@ -191,7 +189,7 @@ impl ApiFace {
                     "directory": paths::trust_dir().to_string_lossy(),
                 }),
             ),
-            Err(cause) => error_response(500, "internal", &cause),
+            Err(error) => problem_error_response(&error),
         }
     }
 
@@ -210,7 +208,7 @@ impl ApiFace {
                     "path": path.to_string_lossy(),
                 }),
             ),
-            Err(error) => map_error_response(&error),
+            Err(error) => problem_error_response(&error),
         }
     }
 
@@ -222,7 +220,7 @@ impl ApiFace {
                 "not_found",
                 &format!("unknown trusted key: {}", key_id),
             ),
-            Err(error) => map_error_response(&error),
+            Err(error) => problem_error_response(&error),
         }
     }
 
@@ -497,14 +495,11 @@ fn rpc_error(failure: support::RpcFailure) -> Response {
     error_response(status, code, &message)
 }
 
-fn map_error_response(message: &str) -> Response {
-    let (status, code, message) = support::map_error_status(message);
-    error_response(status, code, &message)
-}
-
-fn config_error_response(message: &str) -> Response {
-    let (status, code, message) = support::config_error_status(message);
-    error_response(status, code, &message)
+/// One projection for every typed management failure: the category raised
+/// where the operation failed decides the status (#151).
+fn problem_error_response(error: &ProblemError) -> Response {
+    let status = support::status_for_problem_error(error);
+    error_response(status, support::code_for(status), error.detail())
 }
 
 fn method_not_allowed(allow: &str) -> Response {

@@ -196,6 +196,20 @@ pub enum Problem {
 }
 
 impl Problem {
+    /// The typed management error for this category, for raise sites that
+    /// already know why they are failing (#151).
+    pub fn error(self, detail: impl Into<String>) -> ProblemError {
+        ProblemError::new(self, detail)
+    }
+
+    /// The category a control-channel error carries in `error.data.kind`.
+    ///
+    /// Absent or unrecognized is `None`: the wire is the only place a category
+    /// is read back, and it is never derived from `message`.
+    pub fn from_error_data(data: Option<&serde_json::Value>) -> Option<Problem> {
+        data?.get("kind")?.as_str().and_then(Problem::from_str)
+    }
+
     pub const ALL: [Problem; 12] = [
         Problem::UnknownService,
         Problem::UnknownPlugin,
@@ -240,9 +254,9 @@ impl Problem {
 /// 一次管理操作的失败：类别 + 只给人看的细节。
 ///
 /// `detail` 会原样成为 JSON-RPC `error.message`；类别走 `error.data.kind`，
-/// 对外投影只读类别。唯一的例外在构造之前：`plugin`/`package` 仍返回
-/// `String`，调用方在 legacy 边界把它们归入某个 [`Problem`]；一旦进入
-/// `ProblemError`，上层不得再解析 `detail`。
+/// 对外投影只读类别。类别在**抛出处**给定（#151 起 `package`/`plugin`/
+/// `trust`/`transfer`/`interpreter`/`hook`/`bundle` 都返回本类型），进入
+/// `ProblemError` 之后，上层不得再解析 `detail`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProblemError {
     pub problem: Problem,
@@ -416,6 +430,32 @@ mod tests {
 
         let as_error: &dyn std::error::Error = &error;
         assert_eq!(as_error.to_string(), "plugin id conflicts");
+    }
+
+    #[test]
+    fn a_problem_builds_its_own_error() {
+        let error = Problem::TooLarge.error("package exceeds 512 MiB");
+        assert_eq!(error.problem, Problem::TooLarge);
+        assert_eq!(error.detail(), "package exceeds 512 MiB");
+    }
+
+    #[test]
+    fn the_wire_category_is_read_from_data_kind_only() {
+        let data = serde_json::json!({ "kind": "conflict" });
+        assert_eq!(Problem::from_error_data(Some(&data)), Some(Problem::Conflict));
+
+        // The caller-side category lives in a different field; a management
+        // projection must not read it.
+        let class = serde_json::json!({ "class": "busy" });
+        assert_eq!(Problem::from_error_data(Some(&class)), None);
+
+        let unknown = serde_json::json!({ "kind": "not_a_problem" });
+        assert_eq!(Problem::from_error_data(Some(&unknown)), None);
+        assert_eq!(Problem::from_error_data(None), None);
+
+        // A message that names a category is not a category.
+        let message_only = serde_json::json!({ "message": "conflict" });
+        assert_eq!(Problem::from_error_data(Some(&message_only)), None);
     }
 
     #[test]

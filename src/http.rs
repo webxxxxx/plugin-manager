@@ -123,6 +123,37 @@ pub fn framing(headers: &[(String, String)]) -> Result<Framing, String> {
     }
 }
 
+/// Why a request body was refused while it was being decoded (#151).
+///
+/// The codec knows the two outcomes: malformed framing is the client's 400, a
+/// limit overrun is 413. Every projection reads the variant, never the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyError {
+    Malformed(String),
+    TooLarge(String),
+}
+
+impl BodyError {
+    pub fn status(&self) -> u16 {
+        match self {
+            BodyError::Malformed(_) => 400,
+            BodyError::TooLarge(_) => 413,
+        }
+    }
+
+    pub fn detail(&self) -> &str {
+        match self {
+            BodyError::Malformed(detail) | BodyError::TooLarge(detail) => detail,
+        }
+    }
+}
+
+impl std::fmt::Display for BodyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.detail())
+    }
+}
+
 /// Incremental decoder for `Transfer-Encoding: chunked` bodies. Input can be
 /// split at any byte boundary; decoded bytes are handed to `sink` without
 /// accumulating the whole body.
@@ -166,7 +197,7 @@ impl ChunkedDecoder {
         self.total
     }
 
-    pub fn feed<F>(&mut self, mut input: &[u8], sink: &mut F) -> Result<(), String>
+    pub fn feed<F>(&mut self, mut input: &[u8], sink: &mut F) -> Result<(), BodyError>
     where
         F: FnMut(&[u8]) -> Result<(), String> + ?Sized,
     {
@@ -191,7 +222,7 @@ impl ChunkedDecoder {
                     }
                     if let Some(position) = find_crlf(input) {
                         if self.buffer.len() + position > 8 * 1024 {
-                            return Err("invalid chunk size line".into());
+                            return Err(BodyError::Malformed("invalid chunk size line".into()));
                         }
                         self.buffer.extend_from_slice(&input[..position]);
                         input = &input[position + 2..];
@@ -200,7 +231,7 @@ impl ChunkedDecoder {
                         continue;
                     }
                     if self.buffer.len() + input.len() > 8 * 1024 {
-                        return Err("invalid chunk size line".into());
+                        return Err(BodyError::Malformed("invalid chunk size line".into()));
                     }
                     self.buffer.extend_from_slice(input);
                     return Ok(());
@@ -211,9 +242,9 @@ impl ChunkedDecoder {
                     }
                     let take = std::cmp::min(input.len() as u64, self.remaining) as usize;
                     if self.total.saturating_add(take as u64) > self.max {
-                        return Err("request body is too large".into());
+                        return Err(BodyError::TooLarge("request body is too large".into()));
                     }
-                    sink(&input[..take])?;
+                    sink(&input[..take]).map_err(BodyError::Malformed)?;
                     self.total += take as u64;
                     self.remaining -= take as u64;
                     input = &input[take..];
@@ -227,7 +258,7 @@ impl ChunkedDecoder {
                             return Ok(());
                         }
                         if input[0] != b'\n' {
-                            return Err("invalid chunk terminator".into());
+                            return Err(BodyError::Malformed("invalid chunk terminator".into()));
                         }
                         input = &input[1..];
                         self.pending_cr = false;
@@ -238,14 +269,14 @@ impl ChunkedDecoder {
                         return Ok(());
                     }
                     if input[0] != b'\r' {
-                        return Err("invalid chunk terminator".into());
+                        return Err(BodyError::Malformed("invalid chunk terminator".into()));
                     }
                     if input.len() == 1 {
                         self.pending_cr = true;
                         return Ok(());
                     }
                     if input[1] != b'\n' {
-                        return Err("invalid chunk terminator".into());
+                        return Err(BodyError::Malformed("invalid chunk terminator".into()));
                     }
                     input = &input[2..];
                     self.state = ChunkState::Size;
@@ -282,7 +313,7 @@ impl ChunkedDecoder {
                         continue;
                     }
                     if self.buffer.len() + input.len() > 8 * 1024 {
-                        return Err("chunked trailer is too large".into());
+                        return Err(BodyError::TooLarge("chunked trailer is too large".into()));
                     }
                     self.buffer.extend_from_slice(input);
                     return Ok(());
@@ -292,16 +323,16 @@ impl ChunkedDecoder {
         }
     }
 
-    fn apply_size(&mut self, line: &[u8]) -> Result<(), String> {
+    fn apply_size(&mut self, line: &[u8]) -> Result<(), BodyError> {
         let size_text = line.split(|byte| *byte == b';').next().unwrap_or(line);
         let size_text = std::str::from_utf8(size_text)
-            .map_err(|_| "invalid chunk size".to_string())?
+            .map_err(|_| BodyError::Malformed("invalid chunk size".into()))?
             .trim();
         if size_text.is_empty() || size_text.len() > 16 {
-            return Err("invalid chunk size".into());
+            return Err(BodyError::Malformed("invalid chunk size".into()));
         }
-        let size =
-            u64::from_str_radix(size_text, 16).map_err(|_| "invalid chunk size".to_string())?;
+        let size = u64::from_str_radix(size_text, 16)
+            .map_err(|_| BodyError::Malformed("invalid chunk size".into()))?;
         if size == 0 {
             self.state = ChunkState::Trailer;
         } else {
@@ -324,17 +355,17 @@ pub fn copy_body<R: Read>(
     max: u64,
     initial: &[u8],
     sink: &mut dyn FnMut(&[u8]) -> Result<(), String>,
-) -> Result<u64, String> {
+) -> Result<u64, BodyError> {
     match framing {
         Framing::None => Ok(0),
         Framing::Length(length) => {
             if length > max {
-                return Err("request body is too large".into());
+                return Err(BodyError::TooLarge("request body is too large".into()));
             }
             let mut total = 0u64;
             let take = std::cmp::min(initial.len() as u64, length) as usize;
             if take > 0 {
-                sink(&initial[..take])?;
+                sink(&initial[..take]).map_err(BodyError::Malformed)?;
                 total += take as u64;
             }
             let mut buffer = [0u8; 64 * 1024];
@@ -342,11 +373,13 @@ pub fn copy_body<R: Read>(
                 let want = std::cmp::min(buffer.len() as u64, length - total) as usize;
                 let read = reader
                     .read(&mut buffer[..want])
-                    .map_err(|error| format!("read request body: {}", error))?;
+                    .map_err(|error| {
+                        BodyError::Malformed(format!("read request body: {}", error))
+                    })?;
                 if read == 0 {
-                    return Err("truncated request body".into());
+                    return Err(BodyError::Malformed("truncated request body".into()));
                 }
-                sink(&buffer[..read])?;
+                sink(&buffer[..read]).map_err(BodyError::Malformed)?;
                 total += read as u64;
             }
             Ok(total)
@@ -358,9 +391,11 @@ pub fn copy_body<R: Read>(
             while !decoder.is_done() {
                 let read = reader
                     .read(&mut buffer)
-                    .map_err(|error| format!("read request body: {}", error))?;
+                    .map_err(|error| {
+                        BodyError::Malformed(format!("read request body: {}", error))
+                    })?;
                 if read == 0 {
-                    return Err("truncated chunked body".into());
+                    return Err(BodyError::Malformed("truncated chunked body".into()));
                 }
                 decoder.feed(&buffer[..read], sink)?;
             }
@@ -376,7 +411,7 @@ pub fn collect_body<R: Read>(
     framing: Framing,
     max: u64,
     initial: &[u8],
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, BodyError> {
     let mut body = Vec::new();
     copy_body(reader, framing, max, initial, &mut |chunk| {
         body.extend_from_slice(chunk);

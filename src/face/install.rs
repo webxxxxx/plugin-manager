@@ -17,6 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use crate::http;
+use crate::kernel::failure::{Problem, ProblemError};
 use crate::lan::{AuthKind, Lan};
 use crate::limits;
 use crate::package;
@@ -287,7 +288,6 @@ enum Phase {
 }
 
 struct UploadState {
-    mode: Mode,
     framing: BodyFraming,
     body_done: bool,
     /// A refusal is queued or already answered; later chunks are drained.
@@ -295,12 +295,6 @@ struct UploadState {
     flow: Flow,
     outcome: Option<Outcome>,
     config: PathBuf,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Install,
-    Import,
 }
 
 enum Outcome {
@@ -368,39 +362,32 @@ impl PackageUploadStream {
         config: PathBuf,
         max_package: u64,
     ) -> PackageUploadStream {
-        let (mode, flow) = match target {
+        let flow = match target {
             PackageTarget::Install {
                 strategy,
                 enable,
                 allow_hooks,
-            } => (
-                Mode::Install,
-                Flow::Install(InstallFlow {
-                    strategy,
-                    enable,
-                    allow_hooks,
-                    installer: None,
-                }),
-            ),
+            } => Flow::Install(InstallFlow {
+                strategy,
+                enable,
+                allow_hooks,
+                installer: None,
+            }),
             PackageTarget::Import {
                 config_id,
                 no_config,
                 force,
-            } => (
-                Mode::Import,
-                Flow::Import(ImportFlow {
-                    params: ImportParams {
-                        config_id,
-                        no_config,
-                        force,
-                    },
-                    stage: ImportStage::Classify(Vec::new()),
-                }),
-            ),
+            } => Flow::Import(ImportFlow {
+                params: ImportParams {
+                    config_id,
+                    no_config,
+                    force,
+                },
+                stage: ImportStage::Classify(Vec::new()),
+            }),
         };
         PackageUploadStream {
             state: Arc::new(Mutex::new(UploadState {
-                mode,
                 framing: BodyFraming::new(framing, max_package),
                 body_done: false,
                 refused: false,
@@ -480,18 +467,23 @@ impl PackageUploadStream {
         out: &mut OutBuffer<'_>,
     ) -> StreamStep {
         match outcome {
-            BlockingOutcome::Failed(message) => {
+            BlockingOutcome::Busy => {
                 if self.phase == Phase::DrainingBlocking {
                     self.phase = Phase::Done;
                     return StreamStep::wait(StreamAction::Close(CloseReason::Completed));
                 }
                 // A full pool refuses the chunk before a final answer: use the
                 // same 503 busy contract as a stream cap.
-                if message.contains("blocking queue is full") {
-                    self.respond(crate::server::http::stream_busy_response());
-                } else {
-                    self.respond(http::json_error(500, "internal", &message));
+                self.respond(crate::server::http::stream_busy_response());
+                self.phase = Phase::Responding;
+                self.on_writable(out)
+            }
+            BlockingOutcome::Failed { status, message } => {
+                if self.phase == Phase::DrainingBlocking {
+                    self.phase = Phase::Done;
+                    return StreamStep::wait(StreamAction::Close(CloseReason::Completed));
                 }
+                self.respond(http::json_error(status, crate::http::code_for(status), &message));
                 self.phase = Phase::Responding;
                 self.on_writable(out)
             }
@@ -579,12 +571,12 @@ impl UploadState {
     fn feed(&mut self, raw: &[u8], budget: &CallBudget) {
         let (decoded, done) = match self.framing.feed(raw) {
             Ok(value) => value,
-            Err(message) => {
+            Err(error) => {
                 // A broken chunk framing cannot be drained: there is no
                 // boundary to wait for. If a refusal is already queued, keep
                 // it: replacing it would write a second response head.
                 if !self.refused {
-                    self.fail(&message);
+                    self.fail(&error);
                 }
                 self.body_done = true;
                 return;
@@ -604,8 +596,8 @@ impl UploadState {
                 Flow::Import(flow) => flow.feed(&decoded),
                 Flow::Done => Ok(()),
             };
-            if let Err(message) = result {
-                self.fail(&message);
+            if let Err(error) = result {
+                self.fail(&error);
             }
         }
         if done {
@@ -616,11 +608,8 @@ impl UploadState {
         }
     }
 
-    fn fail(&mut self, message: &str) {
-        let response = match self.mode {
-            Mode::Install => install_error(message),
-            Mode::Import => import_error(message),
-        };
+    fn fail(&mut self, error: &ProblemError) {
+        let response = support::problem_response(error);
         self.flow = Flow::Done;
         self.refused = true;
         self.outcome = Some(Outcome::Error(response));
@@ -640,7 +629,7 @@ impl UploadState {
 
 impl BodyFraming {
     /// Decode one raw body chunk. The second value says the body ended.
-    fn feed(&mut self, raw: &[u8]) -> Result<(Vec<u8>, bool), String> {
+    fn feed(&mut self, raw: &[u8]) -> Result<(Vec<u8>, bool), ProblemError> {
         match self {
             BodyFraming::Length { remaining } => {
                 let take = std::cmp::min(raw.len() as u64, *remaining) as usize;
@@ -649,10 +638,15 @@ impl BodyFraming {
             }
             BodyFraming::Chunked(decoder) => {
                 let mut decoded = Vec::new();
-                decoder.feed(raw, &mut |chunk| {
-                    decoded.extend_from_slice(chunk);
-                    Ok(())
-                })?;
+                decoder
+                    .feed(raw, &mut |chunk| {
+                        decoded.extend_from_slice(chunk);
+                        Ok(())
+                    })
+                    .map_err(|error| match error {
+                        http::BodyError::Malformed(detail) => Problem::Invalid.error(detail),
+                        http::BodyError::TooLarge(detail) => Problem::TooLarge.error(detail),
+                    })?;
                 Ok((decoded, decoder.is_done()))
             }
         }
@@ -660,11 +654,11 @@ impl BodyFraming {
 }
 
 impl InstallFlow {
-    fn feed(&mut self, data: &[u8]) -> Result<(), String> {
+    fn feed(&mut self, data: &[u8]) -> Result<(), ProblemError> {
         self.installer()?.feed(data)
     }
 
-    fn installer(&mut self) -> Result<&mut package::StagingInstaller, String> {
+    fn installer(&mut self) -> Result<&mut package::StagingInstaller, ProblemError> {
         if self.installer.is_none() {
             self.installer = Some(package::StagingInstaller::new(
                 staging_path(),
@@ -680,11 +674,11 @@ impl InstallFlow {
 
     fn finish(&mut self, config: &Path, budget: &CallBudget) -> Vec<u8> {
         let Some(mut installer) = self.installer.take() else {
-            return install_error("manifest.json is missing");
+            return support::problem_response(&Problem::Invalid.error("manifest.json is missing"));
         };
         let staged = match installer.finish() {
             Ok(staged) => staged,
-            Err(message) => return install_error(&message),
+            Err(error) => return support::problem_response(&error),
         };
         let root = staged.root.clone();
         let id = staged.manifest.name.clone();
@@ -722,7 +716,7 @@ impl InstallFlow {
 }
 
 impl ImportFlow {
-    fn feed(&mut self, data: &[u8]) -> Result<(), String> {
+    fn feed(&mut self, data: &[u8]) -> Result<(), ProblemError> {
         match &mut self.stage {
             ImportStage::Classify(prefix) => {
                 prefix.extend_from_slice(data);
@@ -737,14 +731,14 @@ impl ImportFlow {
             ImportStage::Raw(config) => {
                 config.extend_from_slice(data);
                 if config.len() as u64 > limits::current().max_body {
-                    return Err("import is too large".into());
+                    return Err(Problem::TooLarge.error("import is too large"));
                 }
                 Ok(())
             }
         }
     }
 
-    fn classify(&mut self, data: Vec<u8>) -> Result<(), String> {
+    fn classify(&mut self, data: Vec<u8>) -> Result<(), ProblemError> {
         let first = package::tar_header_path(&data).ok().flatten();
         match first.as_deref() {
             Some("manifest.json") => {
@@ -763,7 +757,7 @@ impl ImportFlow {
             }
             _ => {
                 if data.len() as u64 > limits::current().max_body {
-                    return Err("import is too large".into());
+                    return Err(Problem::TooLarge.error("import is too large"));
                 }
                 self.stage = ImportStage::Raw(data);
             }
@@ -776,15 +770,15 @@ impl ImportFlow {
             let stage = std::mem::replace(&mut self.stage, ImportStage::Raw(Vec::new()));
             match stage {
                 ImportStage::Classify(prefix) => {
-                    if let Err(message) = self.classify(prefix) {
-                        return import_error(&message);
+                    if let Err(error) = self.classify(prefix) {
+                        return support::problem_response(&error);
                     }
                     continue;
                 }
                 ImportStage::Package { mut installer } => {
                     let staged = match installer.finish() {
                         Ok(staged) => staged,
-                        Err(message) => return import_error(&message),
+                        Err(error) => return support::problem_response(&error),
                     };
                     let root = staged.root.clone();
                     return match install_staged(
@@ -803,7 +797,7 @@ impl ImportFlow {
                 ImportStage::Backup(mut import) => {
                     return match import.finish(config, budget) {
                         Ok(response) => response,
-                        Err(message) => import_error(&message),
+                        Err(error) => support::problem_response(&error),
                     }
                 }
                 ImportStage::Raw(data) => return raw_config_response(&data, &self.params),
@@ -821,8 +815,10 @@ fn raw_config_response(data: &[u8], params: &ImportParams) -> Vec<u8> {
         false,
     ) {
         Ok(outcome) => import_outcome_json(outcome),
-        Err(transfer::Error::Usage(message)) => http::json_error(400, "bad_request", &message),
-        Err(transfer::Error::Failed(message)) => support::map_error(&message),
+        Err(transfer::Error::Usage(message)) => {
+            support::problem_response(&Problem::Invalid.error(message))
+        }
+        Err(transfer::Error::Failed(error)) => support::problem_response(&error),
     }
 }
 
@@ -848,11 +844,11 @@ impl BackupImport {
         }
     }
 
-    fn feed(&mut self, data: &[u8]) -> Result<(), String> {
+    fn feed(&mut self, data: &[u8]) -> Result<(), ProblemError> {
         self.tar.feed(data, &mut self.sink)
     }
 
-    fn finish(&mut self, config: &Path, budget: &CallBudget) -> Result<Vec<u8>, String> {
+    fn finish(&mut self, config: &Path, budget: &CallBudget) -> Result<Vec<u8>, ProblemError> {
         self.tar.finish()?;
         self.sink.finish(config, budget)
     }
@@ -905,14 +901,14 @@ impl BackupSink {
 }
 
 impl package::TarSink for BackupSink {
-    fn entry_start(&mut self, entry: &package::StreamEntry) -> Result<(), String> {
+    fn entry_start(&mut self, entry: &package::StreamEntry) -> Result<(), ProblemError> {
         match self.stage {
             BackupStage::ExpectBackup => {
                 if entry.path != "backup.json" {
-                    return Err("backup.json must be the first entry".into());
+                    return Err(Problem::Invalid.error("backup.json must be the first entry"));
                 }
                 if entry.size > 64 * 1024 {
-                    return Err("backup.json is too large".into());
+                    return Err(Problem::TooLarge.error("backup.json is too large"));
                 }
                 self.current = Some(BackupCurrent::Backup(Vec::with_capacity(
                     entry.size as usize,
@@ -920,10 +916,13 @@ impl package::TarSink for BackupSink {
             }
             BackupStage::ExpectSpk => {
                 if entry.path != "plugin.spk" {
-                    return Err("plugin.spk must be the second entry".into());
+                    return Err(Problem::Invalid.error("plugin.spk must be the second entry"));
                 }
                 if entry.kind != b'0' {
-                    return Err(format!("{} is not a regular file", entry.path));
+                    return Err(Problem::Invalid.error(format!(
+                        "{} is not a regular file",
+                        entry.path
+                    )));
                 }
                 self.installer = Some(package::StagingInstaller::new(
                     self.staging.clone(),
@@ -934,10 +933,13 @@ impl package::TarSink for BackupSink {
             }
             BackupStage::ExpectConfig => {
                 if entry.path != "config" {
-                    return Err(format!("unexpected entry: {}", entry.path));
+                    return Err(Problem::Invalid.error(format!(
+                        "unexpected entry: {}",
+                        entry.path
+                    )));
                 }
                 if entry.size > 64 * 1024 {
-                    return Err("config is too large".into());
+                    return Err(Problem::TooLarge.error("config is too large"));
                 }
                 self.current = Some(BackupCurrent::Config(Vec::with_capacity(
                     entry.size as usize,
@@ -945,13 +947,13 @@ impl package::TarSink for BackupSink {
                 self.stage = BackupStage::AfterConfig;
             }
             BackupStage::AfterConfig => {
-                return Err("unexpected entries after config".into());
+                return Err(Problem::Invalid.error("unexpected entries after config"));
             }
         }
         Ok(())
     }
 
-    fn entry_data(&mut self, data: &[u8]) -> Result<(), String> {
+    fn entry_data(&mut self, data: &[u8]) -> Result<(), ProblemError> {
         match self.current.as_mut() {
             Some(BackupCurrent::Backup(buffer)) | Some(BackupCurrent::Config(buffer)) => {
                 buffer.extend_from_slice(data);
@@ -962,20 +964,24 @@ impl package::TarSink for BackupSink {
                 .as_mut()
                 .expect("package installer initialized")
                 .feed(data),
-            None => Err("tar entry data without a header".into()),
+            None => Err(Problem::Invalid.error("tar entry data without a header")),
         }
     }
 
-    fn entry_end(&mut self) -> Result<(), String> {
+    fn entry_end(&mut self) -> Result<(), ProblemError> {
         let Some(current) = self.current.take() else {
-            return Err("tar entry ended without a header".into());
+            return Err(Problem::Invalid.error("tar entry ended without a header"));
         };
         match current {
             BackupCurrent::Backup(bytes) => {
-                let backup: plugin::Backup = serde_json::from_slice(&bytes)
-                    .map_err(|error| format!("invalid backup.json: {}", error))?;
+                let backup: plugin::Backup = serde_json::from_slice(&bytes).map_err(|error| {
+                    Problem::Invalid.error(format!("invalid backup.json: {}", error))
+                })?;
                 if backup.schema != 1 {
-                    return Err(format!("unsupported backup schema {}", backup.schema));
+                    return Err(Problem::Invalid.error(format!(
+                        "unsupported backup schema {}",
+                        backup.schema
+                    )));
                 }
                 self.backup = Some(backup);
                 self.stage = BackupStage::ExpectSpk;
@@ -985,26 +991,26 @@ impl package::TarSink for BackupSink {
                 let mut installer = self
                     .installer
                     .take()
-                    .ok_or_else(|| "plugin.spk is missing".to_string())?;
+                    .ok_or_else(|| Problem::Invalid.error("plugin.spk is missing"))?;
                 let staged = installer.finish()?;
                 // A later config check may fail; keep the staged tree in
                 // self.staged so the sink's Drop removes it.
                 self.staged = Some(staged);
                 let staged = self.staged.as_ref().expect("staged package");
                 let Some(backup) = self.backup.as_ref() else {
-                    return Err("backup.json is missing".into());
+                    return Err(Problem::Invalid.error("backup.json is missing"));
                 };
                 if staged.manifest.name != backup.id {
-                    return Err(format!(
+                    return Err(Problem::Invalid.error(format!(
                         "backup id {} does not match package id {}",
                         backup.id, staged.manifest.name
-                    ));
+                    )));
                 }
                 if staged.manifest.version != backup.version {
-                    return Err(format!(
+                    return Err(Problem::Invalid.error(format!(
                         "backup version {} does not match package version {}",
                         backup.version, staged.manifest.version
-                    ));
+                    )));
                 }
                 self.warnings.clear();
                 if let Some(current) = plugin::current_version(&backup.id) {
@@ -1014,10 +1020,10 @@ impl package::TarSink for BackupSink {
                             backup.id, current, backup.version
                         ));
                     } else if !self.force {
-                        return Err(format!(
+                        return Err(Problem::Conflict.error(format!(
                             "{} {} is already installed; use --force",
                             backup.id, backup.version
-                        ));
+                        )));
                     }
                 }
                 self.stage = BackupStage::ExpectConfig;
@@ -1033,25 +1039,27 @@ impl package::TarSink for BackupSink {
 }
 
 impl BackupSink {
-    fn finish(&mut self, config: &Path, budget: &CallBudget) -> Result<Vec<u8>, String> {
+    fn finish(&mut self, config: &Path, budget: &CallBudget) -> Result<Vec<u8>, ProblemError> {
         let backup = self
             .backup
             .take()
-            .ok_or_else(|| "backup.json is missing".to_string())?;
+            .ok_or_else(|| Problem::Invalid.error("backup.json is missing"))?;
         // Check the config hash before taking the staged tree: an error here
         // must leave it in self.staged so Drop removes the directory.
         if let Some(expected) = &backup.config_sha256 {
             let Some(config_data) = self.config_data.as_ref() else {
-                return Err("backup declares a config hash but config is missing".into());
+                return Err(Problem::Invalid.error(
+                    "backup declares a config hash but config is missing",
+                ));
             };
             if &package::hex_sha256(config_data) != expected {
-                return Err("backup config hash does not match".into());
+                return Err(Problem::Invalid.error("backup config hash does not match"));
             }
         }
         let staged = self
             .staged
             .take()
-            .ok_or_else(|| "plugin.spk is missing".to_string())?;
+            .ok_or_else(|| Problem::Invalid.error("plugin.spk is missing"))?;
         let applied = !self.no_config && self.config_data.is_some();
         let status = match install_staged(
             config,
@@ -1072,7 +1080,8 @@ impl BackupSink {
                 false,
             )
             .map_err(|error| match error {
-                transfer::Error::Usage(message) | transfer::Error::Failed(message) => message,
+                transfer::Error::Usage(message) => Problem::Invalid.error(message),
+                transfer::Error::Failed(error) => error,
             })?;
         }
         Ok(import_response(
@@ -1185,59 +1194,6 @@ fn import_outcome_json(outcome: transfer::Outcome) -> Vec<u8> {
     )
 }
 
-fn install_error(message: &str) -> Vec<u8> {
-    let lower = message.to_ascii_lowercase();
-    let status = if lower.contains("too large") {
-        413
-    } else if lower.contains("signature")
-        || lower.contains("platform")
-        || lower.contains("path")
-        || lower.contains("unsafe")
-        || lower.contains("setuid")
-        || lower.contains("checksum")
-        || lower.contains("declared")
-        || lower.contains("duplicate")
-        || lower.contains("missing")
-        || lower.contains("invalid")
-    {
-        400
-    } else {
-        500
-    };
-    http::json_error(status, code_for(status), message)
-}
-
-fn import_error(message: &str) -> Vec<u8> {
-    let lower = message.to_ascii_lowercase();
-    let status = if lower.contains("too large") {
-        413
-    } else if lower.contains("signature")
-        || lower.contains("platform")
-        || lower.contains("path")
-        || lower.contains("unsafe")
-        || lower.contains("setuid")
-        || lower.contains("checksum")
-        || lower.contains("declared")
-        || lower.contains("duplicate")
-        || lower.contains("missing")
-        || lower.contains("invalid")
-        || lower.contains("backup")
-    {
-        400
-    } else {
-        500
-    };
-    http::json_error(status, code_for(status), message)
-}
-
-fn code_for(status: u16) -> &'static str {
-    match status {
-        400 => "bad_request",
-        413 => "payload_too_large",
-        500 => "internal",
-        _ => "error",
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1412,7 +1368,7 @@ mod tests {
         );
         assert!(matches!(step.action, StreamAction::SubmitBlocking(_)));
         let step = handler.on_event(
-            StreamEvent::BlockingDone(BlockingOutcome::Failed("the blocking queue is full".into())),
+            StreamEvent::BlockingDone(BlockingOutcome::Busy),
             &mut OutBuffer::new(&mut out, 4096),
         );
         assert!(matches!(step.action, StreamAction::Close(_)));

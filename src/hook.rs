@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::kernel::failure::{Problem, ProblemError};
 use crate::log::{self, LogSink};
 use crate::package;
 use crate::paths;
@@ -34,17 +35,17 @@ pub struct Invocation<'a> {
 /// Run the hook, calling `poll` before every wait step. The supervisor loop
 /// owns plugin stdio, so a hook it waits for must not stop the plugin pipes;
 /// production callers pass [`poll_this_loop`].
-pub fn run(spec: &Invocation<'_>, poll: &mut dyn FnMut()) -> Result<(), String> {
+pub fn run(spec: &Invocation<'_>, poll: &mut dyn FnMut()) -> Result<(), ProblemError> {
     package::check_path(spec.path)?;
     let program = spec.version_dir.join(spec.path);
     let metadata = fs::metadata(&program)
-        .map_err(|error| format!("{} hook {}: {}", spec.action, program.display(), error))?;
+        .map_err(|error| Problem::Invalid.error(format!("{} hook {}: {}", spec.action, program.display(), error)))?;
     if !metadata.is_file() {
-        return Err(format!(
+        return Err(Problem::Invalid.error(format!(
             "{} hook is not a regular file: {}",
             spec.action,
             program.display()
-        ));
+        )));
     }
     check_executable(spec.action, &program)?;
 
@@ -82,7 +83,7 @@ pub fn run(spec: &Invocation<'_>, poll: &mut dyn FnMut()) -> Result<(), String> 
     };
     let tree = crate::platform::host::process::Tree::new();
     let (mut child, streams) = crate::stdio::spawn(command, crate::stdio::Plan::hook())
-        .map_err(|error| format!("spawn {} hook: {}", spec.action, error))?;
+        .map_err(|error| Problem::Internal.error(format!("spawn {} hook: {}", spec.action, error)))?;
     let _ = crate::platform::host::process::adopt(&child);
     if let Some(tree) = &tree {
         tree.assign(&child);
@@ -121,10 +122,10 @@ pub fn run(spec: &Invocation<'_>, poll: &mut dyn FnMut()) -> Result<(), String> 
                     ));
                     return Ok(());
                 }
-                return Err(format!("{} hook exited {}", spec.action, status));
+                return Err(Problem::Internal.error(format!("{} hook exited {}", spec.action, status)));
             }
             Ok(None) => {}
-            Err(error) => return Err(format!("{} hook: {}", spec.action, error)),
+            Err(error) => return Err(Problem::Internal.error(format!("{} hook: {}", spec.action, error))),
         }
         poll();
         if started.elapsed() >= Duration::from_millis(spec.timeout_ms) {
@@ -133,11 +134,11 @@ pub fn run(spec: &Invocation<'_>, poll: &mut dyn FnMut()) -> Result<(), String> 
             }
             kill(&mut child);
             let _ = child.wait();
-            return Err(format!(
+            return Err(Problem::Timeout.error(format!(
                 "{} hook timed out after {}s",
                 spec.action,
                 spec.timeout_ms / 1000
-            ));
+            )));
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -165,39 +166,39 @@ pub(crate) fn kill(child: &mut Child) {
     }
 }
 
-fn check_executable(action: &str, program: &Path) -> Result<(), String> {
+fn check_executable(action: &str, program: &Path) -> Result<(), ProblemError> {
     #[cfg(unix)]
     {
         use std::io::Read;
         use std::os::unix::fs::PermissionsExt;
 
         let mode = fs::metadata(program)
-            .map_err(|error| format!("{} hook: {}", action, error))?
+            .map_err(|error| Problem::Internal.error(format!("{} hook: {}", action, error)))?
             .permissions()
             .mode();
         if mode & 0o111 == 0 {
-            return Err(format!(
+            return Err(Problem::Invalid.error(format!(
                 "{} hook is not executable: {}",
                 action,
                 program.display()
-            ));
+            )));
         }
         let mut shebang = [0u8; 2];
         let mut file =
-            fs::File::open(program).map_err(|error| format!("{} hook: {}", action, error))?;
+            fs::File::open(program).map_err(|error| Problem::Internal.error(format!("{} hook: {}", action, error)))?;
         file.read_exact(&mut shebang).map_err(|_| {
-            format!(
+            Problem::Invalid.error(format!(
                 "{} hook must start with a shebang: {}",
                 action,
                 program.display()
-            )
+            ))
         })?;
         if &shebang != b"#!" {
-            return Err(format!(
+            return Err(Problem::Invalid.error(format!(
                 "{} hook must start with a shebang: {}",
                 action,
                 program.display()
-            ));
+            )));
         }
     }
     #[cfg(windows)]
@@ -207,11 +208,11 @@ fn check_executable(action: &str, program: &Path) -> Result<(), String> {
             .and_then(|extension| extension.to_str())
             .map(|extension| extension.to_ascii_lowercase());
         if !matches!(extension.as_deref(), Some("exe" | "cmd" | "bat")) {
-            return Err(format!(
+            return Err(Problem::Invalid.error(format!(
                 "{} hook must end with .exe, .cmd or .bat on Windows: {}",
                 action,
                 program.display()
-            ));
+            )));
         }
     }
     Ok(())
@@ -329,7 +330,7 @@ mod tests {
 
         let error = run(&spec(&dir, &path, TIMEOUT_MS), &mut || {}).expect_err("hook fails");
 
-        assert!(error.contains("exited"), "{error}");
+        assert!(error.detail().contains("exited"), "{error}");
     }
 
     #[test]
@@ -343,7 +344,7 @@ mod tests {
         let started = Instant::now();
         let error = run(&spec(&dir, &path, 150), &mut || {}).expect_err("hook times out");
 
-        assert!(error.contains("timed out"), "{error}");
+        assert!(error.detail().contains("timed out"), "{error}");
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "timeout did not kill the hook: {:?}",
@@ -365,7 +366,7 @@ mod tests {
         let path = write_hook(&dir.0, "group", &body);
 
         let error = run(&spec(&dir, &path, 150), &mut || {}).expect_err("hook times out");
-        assert!(error.contains("timed out"), "{error}");
+        assert!(error.detail().contains("timed out"), "{error}");
 
         // The background child would write after one second; the group kill
         // must have taken it down before that.
@@ -402,7 +403,7 @@ mod tests {
 
         let error = run(&spec(&dir, "../outside", TIMEOUT_MS), &mut || {}).expect_err("escape");
 
-        assert!(error.contains("unsafe path"), "{error}");
+        assert!(error.detail().contains("unsafe path"), "{error}");
     }
 
     #[test]
@@ -411,7 +412,7 @@ mod tests {
 
         let error = run(&spec(&dir, "hooks/missing", TIMEOUT_MS), &mut || {}).expect_err("missing");
 
-        assert!(error.contains("post-install hook"), "{error}");
+        assert!(error.detail().contains("post-install hook"), "{error}");
     }
 
     #[cfg(unix)]
@@ -426,7 +427,7 @@ mod tests {
 
         let error = run(&spec(&dir, "not-executable", TIMEOUT_MS), &mut || {}).expect_err("mode");
 
-        assert!(error.contains("not executable"), "{error}");
+        assert!(error.detail().contains("not executable"), "{error}");
     }
 
     #[cfg(unix)]
@@ -440,7 +441,7 @@ mod tests {
 
         let error = run(&spec(&dir, "no-shebang", TIMEOUT_MS), &mut || {}).expect_err("shebang");
 
-        assert!(error.contains("shebang"), "{error}");
+        assert!(error.detail().contains("shebang"), "{error}");
     }
 
     #[cfg(windows)]
@@ -451,6 +452,6 @@ mod tests {
 
         let error = run(&spec(&dir, "hook.sh", TIMEOUT_MS), &mut || {}).expect_err("extension");
 
-        assert!(error.contains(".exe, .cmd or .bat"), "{error}");
+        assert!(error.detail().contains(".exe, .cmd or .bat"), "{error}");
     }
 }

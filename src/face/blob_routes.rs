@@ -10,6 +10,9 @@ use serde_json::{json, Value};
 use crate::blob;
 use crate::http;
 
+use super::support;
+
+
 pub fn create_upload(kind: blob::UploadKind) -> Vec<u8> {
     match blob::create_upload(kind) {
         Ok(id) => {
@@ -32,7 +35,7 @@ pub fn create_upload(kind: blob::UploadKind) -> Vec<u8> {
                 &body,
             )
         }
-        Err(message) => http::json_error(500, "internal", &message),
+        Err(error) => support::storage_response(&error),
     }
 }
 
@@ -61,13 +64,7 @@ pub fn upload_status(kind: blob::UploadKind, id: &str) -> Vec<u8> {
             .unwrap_or_default();
             http::response(200, "application/json", &body)
         }
-        Err(message) if message.contains("unknown upload") => {
-            http::json_error(404, "not_found", &message)
-        }
-        Err(message) if message.contains("kind mismatch") || message.contains("kind") => {
-            http::json_error(409, "conflict", &message)
-        }
-        Err(message) => http::json_error(500, "internal", &message),
+        Err(error) => support::storage_response(&error),
     }
 }
 
@@ -162,24 +159,7 @@ pub fn file_upload_complete(id: &str, body: &[u8]) -> Vec<u8> {
             ];
             http::response_with_headers(200, "application/json", &headers, &body)
         }
-        Err(message) if message.contains("unknown upload") => {
-            http::json_error(404, "not_found", &message)
-        }
-        Err(message) if message.contains("kind mismatch") || message.contains("kind") => {
-            http::json_error(409, "conflict", &message)
-        }
-        Err(message) if message.contains("too large") => {
-            http::json_error(413, "payload_too_large", &message)
-        }
-        Err(message)
-            if message.contains("part")
-                || message.contains("invalid")
-                || message.contains("empty")
-                || message.contains("changed") =>
-        {
-            http::json_error(400, "bad_request", &message)
-        }
-        Err(message) => http::json_error(500, "internal", &message),
+        Err(error) => support::storage_response(&error),
     }
 }
 
@@ -193,26 +173,14 @@ pub fn abort_upload(kind: blob::UploadKind, id: &str) -> Vec<u8> {
             "application/json",
             &serde_json::to_vec(&json!({"ok": true})).unwrap_or_default(),
         ),
-        Err(message) if message.contains("unknown upload") => {
-            http::json_error(404, "not_found", &message)
-        }
-        Err(message) if message.contains("kind mismatch") || message.contains("kind") => {
-            http::json_error(409, "conflict", &message)
-        }
-        Err(message) => http::json_error(500, "internal", &message),
+        Err(error) => support::storage_response(&error),
     }
 }
 
 fn kind_rejection(id: &str, kind: blob::UploadKind) -> Option<Vec<u8>> {
     match blob::require_upload_kind(id, kind) {
         Ok(()) => None,
-        Err(message) if message.contains("unknown upload") => {
-            Some(http::json_error(404, "not_found", &message))
-        }
-        Err(message) if message.contains("kind") => {
-            Some(http::json_error(409, "conflict", &message))
-        }
-        Err(message) => Some(http::json_error(500, "internal", &message)),
+        Err(error) => Some(support::storage_response(&error)),
     }
 }
 
@@ -260,22 +228,6 @@ pub fn complete_upload(id: &str, body: &[u8]) -> Vec<u8> {
             ];
             http::response_with_headers(200, "application/json", &headers, &body)
         }
-        Err(message) if message.contains("unknown upload") => {
-            http::json_error(404, "not_found", &message)
-        }
-        Err(message) if message.contains("kind mismatch") || message.contains("kind") => {
-            http::json_error(409, "conflict", &message)
-        }
-        Err(message) if message.contains("too large") => {
-            http::json_error(413, "payload_too_large", &message)
-        }
-        Err(message)
-            if message.contains("part")
-                || message.contains("invalid")
-                || message.contains("empty") =>
-        {
-            http::json_error(400, "bad_request", &message)
-        }
-        Err(message) => http::json_error(500, "internal", &message),
+        Err(error) => support::storage_response(&error),
     }
 }

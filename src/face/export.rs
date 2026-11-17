@@ -21,6 +21,7 @@
 use std::fs::File;
 
 use crate::http;
+use crate::kernel::failure::{Problem, ProblemError};
 use crate::package::{self, TarPart, TarPlan};
 use crate::plugin;
 use crate::server::http::{
@@ -122,7 +123,7 @@ impl ExportStream {
     /// Stream an already-built plan. Production builds its plan lazily in
     /// ExportStream::begin; this constructor is the test seam.
     #[cfg(test)]
-    fn planned(filename: &str, plan: Result<TarPlan, String>) -> ExportStream {
+    fn planned(filename: &str, plan: Result<TarPlan, ProblemError>) -> ExportStream {
         match plan {
             Ok(plan) => ExportStream {
                 pending: None,
@@ -132,7 +133,7 @@ impl ExportStream {
                 index: 0,
                 at: 0,
             },
-            Err(message) => ExportStream::response(http::json_error(500, "internal", &message)),
+            Err(error) => ExportStream::response(http::json_error(500, "internal", error.detail())),
         }
     }
 
@@ -159,12 +160,15 @@ impl ExportStream {
                 Ok(config) => {
                     plugin::plan_export_spkb(&id, &version, &version_dir, config.as_deref())
                 }
-                Err(message) => Err(message),
+                Err(error) => Err(error),
             },
         };
         let (head, plan) = match plan {
             Ok(plan) => (download_head(&filename, plan.size()), plan),
-            Err(message) => (http::json_error(500, "internal", &message), TarPlan::new()),
+            Err(error) => (
+                http::json_error(500, "internal", error.detail()),
+                TarPlan::new(),
+            ),
         };
         self.head = head;
         self.head_sent = 0;
@@ -244,11 +248,11 @@ impl StreamHandler for ExportStream {
 
 /// The active config of a .spkb backup; a plugin without one exports without
 /// the config entry.
-fn active_config(id: &str) -> Result<Option<Vec<u8>>, String> {
+fn active_config(id: &str) -> Result<Option<Vec<u8>>, ProblemError> {
     match plugin::active_config(id) {
-        Some(path) => Ok(Some(
-            std::fs::read(&path).map_err(|error| format!("read config: {}", error))?,
-        )),
+        Some(path) => Ok(Some(std::fs::read(&path).map_err(|error| {
+            Problem::Internal.error(format!("read config: {}", error))
+        })?)),
         None => Ok(None),
     }
 }

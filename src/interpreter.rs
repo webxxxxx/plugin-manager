@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::kernel::failure::{Problem, ProblemError};
+
 /// Interpreter reference from the manifest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Spec {
@@ -38,7 +40,7 @@ pub struct Resolved {
 pub struct Version(Vec<u32>);
 
 /// Resolve and validate one manifest interpreter against the current host.
-pub fn check(spec: &Spec) -> Result<Resolved, String> {
+pub fn check(spec: &Spec) -> Result<Resolved, ProblemError> {
     let (path_var, pathext) = host_search();
     check_with(spec, &path_var, pathext.as_deref(), 5_000)
 }
@@ -58,7 +60,7 @@ pub fn check_with(
     path_var: &str,
     pathext: Option<&str>,
     timeout_ms: u64,
-) -> Result<Resolved, String> {
+) -> Result<Resolved, ProblemError> {
     let constraint = spec
         .version
         .as_deref()
@@ -66,19 +68,19 @@ pub fn check_with(
         .filter(|value| !value.is_empty());
     if let Some(constraint) = constraint {
         validate_constraint(constraint)
-            .map_err(|error| format!("interpreter {} version: {}", spec.name, error))?;
+            .map_err(|error| Problem::Invalid.error(format!("interpreter {} version: {}", spec.name, error)))?;
     }
     let resolved = lookup_with(spec, path_var, pathext)?;
     if let Some(constraint) = constraint {
         let actual = probe(&resolved.path, timeout_ms)?;
         if !satisfies(&actual, constraint)? {
-            return Err(format!(
+            return Err(Problem::Invalid.error(format!(
                 "interpreter {} is {} at {}, but the manifest requires {}",
                 spec.name,
                 actual,
                 resolved.path.display(),
                 constraint
-            ));
+            )));
         }
     }
     Ok(resolved)
@@ -86,12 +88,12 @@ pub fn check_with(
 
 /// Presence-only lookup for plugin scans: a daemon restart must not run every
 /// interpreter's version probe, but it still needs the absolute path.
-pub fn lookup(spec: &Spec) -> Result<Resolved, String> {
+pub fn lookup(spec: &Spec) -> Result<Resolved, ProblemError> {
     let (path_var, pathext) = host_search();
     lookup_with(spec, &path_var, pathext.as_deref())
 }
 
-fn lookup_with(spec: &Spec, path_var: &str, pathext: Option<&str>) -> Result<Resolved, String> {
+fn lookup_with(spec: &Spec, path_var: &str, pathext: Option<&str>) -> Result<Resolved, ProblemError> {
     let path = resolve(&spec.name, path_var, pathext)?;
     Ok(Resolved {
         path,
@@ -110,7 +112,7 @@ pub fn valid_name(name: &str) -> bool {
 
 /// Validate a version constraint without resolving anything. Empty is valid and
 /// means "presence only".
-pub fn validate_constraint(value: &str) -> Result<(), String> {
+pub fn validate_constraint(value: &str) -> Result<(), ProblemError> {
     if value.trim().is_empty() {
         return Ok(());
     }
@@ -118,12 +120,12 @@ pub fn validate_constraint(value: &str) -> Result<(), String> {
 }
 
 /// Find a bare executable name on the injected search path.
-pub fn resolve(name: &str, path_var: &str, pathext: Option<&str>) -> Result<PathBuf, String> {
+pub fn resolve(name: &str, path_var: &str, pathext: Option<&str>) -> Result<PathBuf, ProblemError> {
     if !valid_name(name) {
-        return Err(format!(
+        return Err(Problem::Invalid.error(format!(
             "interpreter {:?} is not a bare name (no paths or spaces)",
             name
-        ));
+        )));
     }
     let mut candidates: Vec<PathBuf> = Vec::new();
     #[cfg(windows)]
@@ -159,10 +161,10 @@ pub fn resolve(name: &str, path_var: &str, pathext: Option<&str>) -> Result<Path
     for candidate in candidates {
         if is_executable(&candidate) {
             return std::path::absolute(&candidate)
-                .map_err(|error| format!("interpreter {}: {}", candidate.display(), error));
+                .map_err(|error| Problem::Invalid.error(format!("interpreter {}: {}", candidate.display(), error)));
         }
     }
-    Err(format!("interpreter {} not found on PATH", name))
+    Err(Problem::Invalid.error(format!("interpreter {} not found on PATH", name)))
 }
 
 /// Extract the first `x.y[.z...]` version from probe output.
@@ -204,7 +206,7 @@ pub fn parse_version(text: &str) -> Option<Version> {
 }
 
 /// Check a probed version against a comma-separated constraint list.
-pub fn satisfies(version: &Version, constraint: &str) -> Result<bool, String> {
+pub fn satisfies(version: &Version, constraint: &str) -> Result<bool, ProblemError> {
     let clauses = parse_clauses(constraint)?;
     Ok(clauses
         .iter()
@@ -243,12 +245,12 @@ enum Op {
     Eq,
 }
 
-fn parse_clauses(value: &str) -> Result<Vec<(Op, Version)>, String> {
+fn parse_clauses(value: &str) -> Result<Vec<(Op, Version)>, ProblemError> {
     let mut clauses = Vec::new();
     for clause in value.split(',') {
         let clause = clause.trim();
         if clause.is_empty() {
-            return Err(format!("empty clause in version constraint {:?}", value));
+            return Err(Problem::Invalid.error(format!("empty clause in version constraint {:?}", value)));
         }
         let (op, rest) = if let Some(rest) = clause.strip_prefix(">=") {
             (Op::Ge, rest)
@@ -261,17 +263,17 @@ fn parse_clauses(value: &str) -> Result<Vec<(Op, Version)>, String> {
         } else if let Some(rest) = clause.strip_prefix('=') {
             (Op::Eq, rest)
         } else {
-            return Err(format!(
+            return Err(Problem::Invalid.error(format!(
                 "version clause {:?} must start with >=, <=, >, < or =",
                 clause
-            ));
+            )));
         };
         let version = parse_dotted(rest.trim())
-            .ok_or_else(|| format!("invalid version in clause {:?}", clause))?;
+            .ok_or_else(|| Problem::Invalid.error(format!("invalid version in clause {:?}", clause)))?;
         clauses.push((op, version));
     }
     if clauses.is_empty() {
-        return Err("empty version constraint".into());
+        return Err(Problem::Invalid.error("empty version constraint"));
     }
     Ok(clauses)
 }
@@ -332,7 +334,7 @@ impl fmt::Display for Version {
 }
 
 /// Run the interpreter's version probe with a hard timeout.
-fn probe(path: &Path, timeout_ms: u64) -> Result<Version, String> {
+fn probe(path: &Path, timeout_ms: u64) -> Result<Version, ProblemError> {
     let name = path
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -362,7 +364,7 @@ fn probe(path: &Path, timeout_ms: u64) -> Result<Version, String> {
     }
     let mut child = command
         .spawn()
-        .map_err(|error| format!("cannot run {} --version: {}", path.display(), error))?;
+        .map_err(|error| Problem::Invalid.error(format!("cannot run {} --version: {}", path.display(), error)))?;
 
     let started = Instant::now();
     let status = loop {
@@ -372,17 +374,17 @@ fn probe(path: &Path, timeout_ms: u64) -> Result<Version, String> {
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("{} --version: {}", path.display(), error));
+                return Err(Problem::Invalid.error(format!("{} --version: {}", path.display(), error)));
             }
         }
         if started.elapsed() >= Duration::from_millis(timeout_ms) {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(format!(
+            return Err(Problem::Timeout.error(format!(
                 "interpreter {} version probe timed out after {}ms",
                 path.display(),
                 timeout_ms
-            ));
+            )));
         }
         std::thread::sleep(Duration::from_millis(10));
     };
@@ -398,12 +400,12 @@ fn probe(path: &Path, timeout_ms: u64) -> Result<Version, String> {
     }
     let output = format!("{}\n{}", stdout, stderr);
     let version = parse_version(&output).ok_or_else(|| {
-        format!(
+        Problem::Invalid.error(format!(
             "cannot determine the version of {} ({}): {}",
             path.display(),
             status,
             output.trim()
-        )
+        ))
     })?;
     Ok(version)
 }
@@ -544,7 +546,7 @@ mod tests {
 
             let error = resolve("demo", &search_path(&dir.0), None).expect_err("missing");
 
-            assert!(error.contains("not found"), "{error}");
+            assert!(error.detail().contains("not found"), "{error}");
         }
 
         #[test]
@@ -556,7 +558,7 @@ mod tests {
                 version: None,
             };
             let error = check_with(&spec, &search_path(&dir.0), None, 100).expect_err("missing");
-            assert!(error.contains("not found"), "{error}");
+            assert!(error.detail().contains("not found"), "{error}");
         }
 
         #[test]
@@ -569,7 +571,7 @@ mod tests {
             };
             let error = check_with(&spec, &search_path(&dir.0), None, 100).expect_err("bad name");
             assert!(
-                error.contains("not a bare name") || error.contains("invalid"),
+                error.detail().contains("not a bare name") || error.detail().contains("invalid"),
                 "{error}"
             );
         }
@@ -618,8 +620,8 @@ mod tests {
                 version: Some(">=2.0".into()),
             };
             let error = check_with(&bad, &search_path(&dir.0), None, 1_000).expect_err("too old");
-            assert!(error.contains("2.0"), "{error}");
-            assert!(error.contains("1.2.3"), "{error}");
+            assert!(error.detail().contains("2.0"), "{error}");
+            assert!(error.detail().contains("1.2.3"), "{error}");
         }
 
         #[test]
@@ -627,7 +629,7 @@ mod tests {
             let dir = TempDir::new();
             let path = executable(dir.0.as_path(), "demo", "#!/bin/sh\nsleep 5\n");
             let error = probe(&path, 100).expect_err("timeout");
-            assert!(error.contains("timed out"), "{error}");
+            assert!(error.detail().contains("timed out"), "{error}");
         }
     }
 
