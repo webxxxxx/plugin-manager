@@ -50,6 +50,14 @@ start so `/mcp` works without root; LAN stays disabled.
   plugin (no Python); daemon and process-tree WorkingSet/CPU over a 5s idle
   window; start-all timing
 
+## Windows-only manual blob/file benchmarks
+
+`tools/perf/blob-bench/` holds the manual Windows PowerShell benchmarks for
+blob and logical-file transfers: an ISO upload/download loop and a multi-part
+file upload/download with the `filebench` plugin. They need a 1.59 GiB ISO,
+PowerShell 7 and a release binary; they are **not** part of `run.mjs` or
+`perf.yml`. See [blob-bench/README.md](blob-bench/README.md).
+
 ## Notes
 
 - On Windows, CPU/RSS sampling uses PowerShell `Get-Process`; on Linux it reads
