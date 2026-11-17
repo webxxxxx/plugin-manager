@@ -9,13 +9,14 @@
 
 use std::fs::{self, File};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::blob;
 use crate::http;
 use crate::server::http::{
-    CloseReason, FileSend, OutBuffer, Request, StreamAction, StreamClass, StreamEvent,
-    StreamHandler, StreamStep,
+    BlockingOutcome, CloseReason, FileSend, OutBuffer, Request, StreamAction, StreamClass,
+    StreamEvent, StreamHandler, StreamStep,
 };
 
 /// One recognized download. Uploads are claimed by `face::blob_upload` before
@@ -66,12 +67,56 @@ pub fn download_target(method: &str, path: &str) -> Option<DownloadTarget> {
 }
 
 /// A blob or logical-file download as a sans-IO state machine.
+///
+/// The response head and the file handle are produced by one blocking job
+/// (#132): `locate`, `metadata`, `touch`, `File::open` and the manifest
+/// read must not run on the server loop, or a slow `temp_dir` (UNC/SMB/slow
+/// disk/AV scan) freezes every HTTP connection, the control channel and the
+/// MCP SSE streams. `BlockingOutcome` cannot carry a `File`, so the job
+/// stores the opened value in a shared slot; the handler takes it when the
+/// server delivers `BlockingDone` (the upload path uses the same shape).
 pub struct DownloadStream {
+    target: DownloadTarget,
+    /// Request headers for the open job; taken by the first Writable.
+    headers: Vec<(String, String)>,
+    /// The opened value written by the pool job and taken by the handler.
+    opened: Arc<Mutex<Option<Opened>>>,
+    phase: Phase,
     /// Complete response head. Content-Length describes the representation,
     /// so a HEAD response carries it without a body.
     head: Vec<u8>,
     head_sent: usize,
     body: Body,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// No job submitted yet; the first Writable does the disk work on the pool.
+    Pending,
+    /// The open job is queued or running.
+    Blocking,
+    /// The job stored a head and body; write them in order.
+    Ready,
+    /// The connection is gone; a late completion must not write.
+    Done,
+}
+
+/// The result of the one open job. 304/404/412/416 are rendered in the job as
+/// complete head bytes; a refused submit renders the 503 busy envelope in the
+/// handler. Either way the handler writes the complete head before it closes.
+struct Opened {
+    head: Vec<u8>,
+    body: Body,
+}
+
+impl Opened {
+    /// A response whose body is already inside `head` (errors, 304, HEAD).
+    fn response(head: Vec<u8>) -> Opened {
+        Opened {
+            head,
+            body: Body::Done,
+        }
+    }
 }
 
 enum Body {
@@ -105,25 +150,100 @@ struct DownloadPlan {
 }
 
 impl DownloadStream {
-    /// Resolve one recognized download. Every failure is still a stream
-    /// response: the route body is Streamed, so a memory response here would
-    /// violate the S4 contract after headers.
+    /// Resolve one recognized download. This only captures the request values:
+    /// every filesystem call happens in the blocking job submitted by the
+    /// first Writable, so opening the handler cannot stall the server loop.
     pub fn open(request: &Request, target: DownloadTarget) -> DownloadStream {
-        match &target {
-            DownloadTarget::Blob { .. } => blob_download(&request.headers, &target),
-            DownloadTarget::File { .. } => file_download(&request.headers, &target),
-        }
-    }
-
-    fn response(head: Vec<u8>) -> DownloadStream {
         DownloadStream {
-            head,
+            target,
+            headers: request.headers.clone(),
+            opened: Arc::new(Mutex::new(None)),
+            phase: Phase::Pending,
+            head: Vec::new(),
             head_sent: 0,
             body: Body::Done,
         }
     }
 
+    /// Submit the one disk job. Headers and target move into the job; the
+    /// handler keeps the shared slot and the response state.
+    fn submit_open(&mut self) -> StreamStep {
+        let headers = std::mem::take(&mut self.headers);
+        let target = self.target.clone();
+        let slot = self.opened.clone();
+        self.phase = Phase::Blocking;
+        StreamStep::wait(StreamAction::SubmitBlocking(Box::new(move || {
+            let opened = open_download(&headers, &target);
+            *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(opened);
+            BlockingOutcome::Ok(Vec::new())
+        })))
+    }
+
+    fn install(&mut self, opened: Opened) {
+        self.head = opened.head;
+        self.head_sent = 0;
+        self.body = opened.body;
+        self.phase = Phase::Ready;
+    }
+
+    fn on_blocking_done(
+        &mut self,
+        outcome: BlockingOutcome,
+        out: &mut OutBuffer<'_>,
+    ) -> StreamStep {
+        if self.phase != Phase::Blocking {
+            // A completion after Closed: drain the slot so a file the job
+            // opened is dropped now, not at handler teardown. No bytes may
+            // reach a connection that is already gone.
+            let _ = self
+                .opened
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            return StreamStep::wait(StreamAction::Continue);
+        }
+        match outcome {
+            BlockingOutcome::Ok(_) => {
+                let opened = self
+                    .opened
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take();
+                debug_assert!(
+                    opened.is_some(),
+                    "the download open job always stores its result"
+                );
+                let Some(opened) = opened else {
+                    // Unreachable: the job stores the Opened before it returns
+                    // Ok. Never write a half response; log and close instead.
+                    crate::log::svcd(
+                        "svcd: download open job returned no result; closing the connection",
+                    );
+                    self.phase = Phase::Done;
+                    return StreamStep::wait(StreamAction::Close(CloseReason::Failed(
+                        "download open job returned no result".into(),
+                    )));
+                };
+                self.install(opened);
+            }
+            BlockingOutcome::Failed(_) => {
+                // The pool only refuses a submit (full queue, the connection
+                // already owns a job, or shutdown); every one is a retryable
+                // busy condition and no header has been sent yet. This is the
+                // one new failure mode of the download path (#132, ADR-0016).
+                self.install(Opened::response(busy_response(&self.target)));
+            }
+        }
+        self.on_writable(out)
+    }
+
     fn on_writable(&mut self, out: &mut OutBuffer<'_>) -> StreamStep {
+        match self.phase {
+            Phase::Pending => return self.submit_open(),
+            Phase::Blocking => return StreamStep::wait(StreamAction::NeedWrite),
+            Phase::Done => return StreamStep::wait(StreamAction::Continue),
+            Phase::Ready => {}
+        }
         // Take the body out so a file handle can move into FileSend; put it
         // back whenever a bounded write leaves work for the next Writable.
         let body = std::mem::replace(&mut self.body, Body::Done);
@@ -174,6 +294,9 @@ impl DownloadStream {
                 let local_start = position - part.start;
                 let want = (part_end - position).min(remaining);
                 let path = directory.join(format!("part-{}", part.number));
+                // Per-part opens stay here on purpose: the head is already on
+                // the wire, so this path cannot answer 503 and must not take a
+                // pool round trip (#132 keeps the shard open as it was).
                 let file =
                     match File::open(&path) {
                         Ok(file) => file,
@@ -212,13 +335,24 @@ impl StreamHandler for DownloadStream {
             StreamEvent::Writable => self.on_writable(out),
             StreamEvent::Tick(_) => StreamStep::wait(StreamAction::Close(CloseReason::TimedOut)),
             StreamEvent::Closed(reason) => {
+                self.phase = Phase::Done;
                 self.body = Body::Done;
+                self.head.clear();
+                self.head_sent = 0;
+                // Drop a file the job already opened. A job still running
+                // holds its own slot clone; if it finishes after this point,
+                // on_blocking_done drains the slot, and if the handler is gone
+                // the job's clone drop releases it.
+                let _ = self
+                    .opened
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take();
                 StreamStep::wait(StreamAction::Close(reason))
             }
-            // A download has no request body and submits no blocking job.
-            StreamEvent::Data(_) | StreamEvent::BlockingDone(_) => {
-                StreamStep::wait(StreamAction::Continue)
-            }
+            StreamEvent::BlockingDone(outcome) => self.on_blocking_done(outcome, out),
+            // A download has no request body.
+            StreamEvent::Data(_) => StreamStep::wait(StreamAction::Continue),
         }
     }
 
@@ -227,7 +361,17 @@ impl StreamHandler for DownloadStream {
     }
 }
 
-fn blob_download(headers: &[(String, String)], target: &DownloadTarget) -> DownloadStream {
+/// Run the one open job off the server loop. Every failure that the old
+/// synchronous path could answer before the head is rendered here, in the same
+/// order, so the wire bytes do not change.
+fn open_download(headers: &[(String, String)], target: &DownloadTarget) -> Opened {
+    match target {
+        DownloadTarget::Blob { .. } => blob_download(headers, target),
+        DownloadTarget::File { .. } => file_download(headers, target),
+    }
+}
+
+fn blob_download(headers: &[(String, String)], target: &DownloadTarget) -> Opened {
     let path = match blob::locate(target.id()) {
         Ok(path) => path,
         Err(_) => return not_found(target),
@@ -250,10 +394,10 @@ fn blob_download(headers: &[(String, String)], target: &DownloadTarget) -> Downl
         download_headers(target.id(), modified),
     ) {
         Ok(plan) => plan,
-        Err(response) => return response,
+        Err(head) => return Opened::response(head),
     };
     if target.head_only() {
-        return DownloadStream::response(plan.head);
+        return Opened::response(plan.head);
     }
     // Open before the server emits headers: if cleanup raced the metadata
     // snapshot, a 404 is still possible instead of a truncated 200.
@@ -261,9 +405,8 @@ fn blob_download(headers: &[(String, String)], target: &DownloadTarget) -> Downl
         Ok(file) => file,
         Err(_) => return not_found(target),
     };
-    DownloadStream {
+    Opened {
         head: plan.head,
-        head_sent: 0,
         body: if plan.length == 0 {
             Body::Done
         } else {
@@ -276,7 +419,7 @@ fn blob_download(headers: &[(String, String)], target: &DownloadTarget) -> Downl
     }
 }
 
-fn file_download(headers: &[(String, String)], target: &DownloadTarget) -> DownloadStream {
+fn file_download(headers: &[(String, String)], target: &DownloadTarget) -> Opened {
     let (directory, manifest) = match blob::file_manifest(target.id()) {
         Ok(file) => file,
         Err(_) => return not_found(target),
@@ -311,10 +454,18 @@ fn file_download(headers: &[(String, String)], target: &DownloadTarget) -> Downl
         response_headers,
     ) {
         Ok(plan) => plan,
-        Err(response) => return response,
+        Err(head) => {
+            return Opened {
+                head,
+                body: Body::Done,
+            }
+        }
     };
     if target.head_only() || plan.length == 0 {
-        return DownloadStream::response(plan.head);
+        return Opened {
+            head: plan.head,
+            body: Body::Done,
+        };
     }
     let mut offset = 0u64;
     let parts: Vec<BundlePart> = manifest
@@ -330,9 +481,8 @@ fn file_download(headers: &[(String, String)], target: &DownloadTarget) -> Downl
             }
         })
         .collect();
-    DownloadStream {
+    Opened {
         head: plan.head,
-        head_sent: 0,
         body: Body::Bundle {
             directory,
             parts,
@@ -354,8 +504,8 @@ fn download_headers(id: &str, modified: SystemTime) -> Vec<(String, String)> {
 }
 
 /// Evaluate the preconditions and Range once, then build the response head.
-/// A 304/412/416 is already a complete stream response and is returned as the
-/// error arm.
+/// A 304/412/416 is already a complete response and is returned as the error
+/// arm; rendering it here keeps the decision inside the open job.
 fn plan_download(
     headers: &[(String, String)],
     target: &DownloadTarget,
@@ -363,16 +513,16 @@ fn plan_download(
     total: u64,
     content_type: &str,
     mut response_headers: Vec<(String, String)>,
-) -> Result<DownloadPlan, DownloadStream> {
+) -> Result<DownloadPlan, Vec<u8>> {
     let (status, start, length, extra) =
         match decide_download(headers, target.id(), modified, total) {
             DownloadDecision::NotModified => {
-                return Err(DownloadStream::response(http::response_with_headers(
+                return Err(http::response_with_headers(
                     304,
                     content_type,
                     &response_headers,
                     b"",
-                )))
+                ))
             }
             DownloadDecision::PreconditionFailed => {
                 return Err(conditional_error(
@@ -460,11 +610,7 @@ fn decide_download(
     DownloadDecision::Full
 }
 
-fn range_error(
-    target: &DownloadTarget,
-    base_headers: &[(String, String)],
-    total: u64,
-) -> DownloadStream {
+fn range_error(target: &DownloadTarget, base_headers: &[(String, String)], total: u64) -> Vec<u8> {
     let body = serde_json::to_vec(&serde_json::json!({
         "error": {
             "code": "range_not_satisfiable",
@@ -475,47 +621,45 @@ fn range_error(
     let mut headers = base_headers.to_vec();
     headers.push(("Content-Range".to_string(), format!("bytes */{}", total)));
     if target.head_only() {
-        DownloadStream::response(http::response_head(
-            416,
-            "application/json",
-            &headers,
-            body.len() as u64,
-        ))
+        http::response_head(416, "application/json", &headers, body.len() as u64)
     } else {
-        DownloadStream::response(http::response_with_headers(
-            416,
-            "application/json",
-            &headers,
-            &body,
-        ))
+        http::response_with_headers(416, "application/json", &headers, &body)
     }
 }
 
-fn not_found(target: &DownloadTarget) -> DownloadStream {
-    conditional_error(target, 404, "not_found", "blob not found")
+fn not_found(target: &DownloadTarget) -> Opened {
+    Opened::response(conditional_error(
+        target,
+        404,
+        "not_found",
+        "blob not found",
+    ))
+}
+
+/// The pool refused the open job before any header: a GET answers the shared
+/// 503 busy envelope, a HEAD keeps its no-body shape and the same
+/// `Content-Length` (the server's own 503 also carries `Retry-After`).
+fn busy_response(target: &DownloadTarget) -> Vec<u8> {
+    let response = crate::server::http::busy_response("blocking queue is full");
+    if target.head_only() {
+        // Keep GET's Content-Length and Retry-After, drop only the body.
+        http::strip_body(response)
+    } else {
+        response
+    }
 }
 
 /// HEAD responses must not carry a body even on errors; keep the equivalent
 /// `Content-Length` so the response still describes the representation.
-fn conditional_error(
-    target: &DownloadTarget,
-    status: u16,
-    code: &str,
-    message: &str,
-) -> DownloadStream {
+fn conditional_error(target: &DownloadTarget, status: u16, code: &str, message: &str) -> Vec<u8> {
     if target.head_only() {
         let body = serde_json::to_vec(&serde_json::json!({
             "error": {"code": code, "message": message}
         }))
         .unwrap_or_default();
-        DownloadStream::response(http::response_head(
-            status,
-            "application/json",
-            &[],
-            body.len() as u64,
-        ))
+        http::response_head(status, "application/json", &[], body.len() as u64)
     } else {
-        DownloadStream::response(http::json_error(status, code, message))
+        http::json_error(status, code, message)
     }
 }
 
@@ -627,13 +771,14 @@ mod tests {
     }
 
     /// Drive the handler the way the Unix driver does: one bounded output
-    /// buffer, file sends performed, then a fresh Writable event.
+    /// buffer, the submitted open job run inline, file sends performed, then a
+    /// fresh Writable event.
     fn drive(mut handler: DownloadStream, limit: usize) -> (Vec<u8>, CloseReason) {
         let mut all = Vec::new();
         let mut out = Vec::new();
+        let mut step =
+            handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
         for _ in 0..10_000 {
-            let step =
-                handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
             assert!(
                 out.len() <= limit,
                 "a writable event must respect the output buffer limit"
@@ -649,9 +794,17 @@ mod tests {
                     let mut reader = (&mut send.file).take(send.length);
                     reader.read_to_end(&mut all).expect("read file send");
                 }
+                StreamAction::SubmitBlocking(job) => {
+                    let outcome = job();
+                    step = handler.on_event(
+                        StreamEvent::BlockingDone(outcome),
+                        &mut OutBuffer::new(&mut out, limit),
+                    );
+                    continue;
+                }
                 StreamAction::Continue | StreamAction::NeedRead | StreamAction::NeedWrite => {}
-                StreamAction::SubmitBlocking(_) => panic!("a download submits no blocking job"),
             }
+            step = handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
         }
         panic!("the handler never finished");
     }
@@ -880,10 +1033,17 @@ mod tests {
         let path = format!("/api/v1/blobs/{}", id);
         let mut handler = open("GET", &path, &[]);
         let mut out = Vec::new();
+        let step = handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, 1024));
+        let StreamAction::SubmitBlocking(job) = step.action else {
+            panic!("the first Writable submits the open job");
+        };
+        let mut step = handler.on_event(
+            StreamEvent::BlockingDone(job()),
+            &mut OutBuffer::new(&mut out, 1024),
+        );
         let mut sends = 0;
         let mut head_bytes = 0;
         for _ in 0..100 {
-            let step = handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, 1024));
             assert!(out.len() <= 1024, "the output buffer stays bounded");
             head_bytes += out.len();
             out.clear();
@@ -895,6 +1055,7 @@ mod tests {
                 StreamAction::Close(_) => break,
                 _ => {}
             }
+            step = handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, 1024));
         }
         assert_eq!(sends, 1, "the whole body is one server-side file send");
         assert!(
@@ -913,9 +1074,182 @@ mod tests {
         assert_eq!(value["error"]["code"], "not_found");
     }
 
+    /// Take the one job submitted by the first Writable and run it the way a
+    /// pool worker would. The step before it must write nothing: all locate /
+    /// metadata / touch / open / plan work belongs to the job.
+    fn run_open_job(handler: &mut DownloadStream) -> BlockingOutcome {
+        let mut out = Vec::new();
+        let step = handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, 4096));
+        assert!(out.is_empty(), "the first Writable must not write bytes");
+        let StreamAction::SubmitBlocking(job) = step.action else {
+            panic!("the first Writable must submit the open job");
+        };
+        job()
+    }
+
+    #[test]
+    fn the_first_writable_submits_the_open_job_before_any_bytes() {
+        let id = blob_of(b"0123456789");
+        let path = format!("/api/v1/blobs/{}", id);
+        let mut handler = open("GET", &path, &[]);
+        let outcome = run_open_job(&mut handler);
+        let mut out = Vec::new();
+        let step = handler.on_event(
+            StreamEvent::BlockingDone(outcome),
+            &mut OutBuffer::new(&mut out, 4096),
+        );
+        let head = text(&out);
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        assert!(head.ends_with("\r\n\r\n"), "only the head is written");
+        let StreamAction::SendFile(send) = step.action else {
+            panic!("the opened body is handed to the server as a file send");
+        };
+        assert_eq!(send.length, 10);
+        assert!(send.offset == 0);
+    }
+
+    #[test]
+    fn a_missing_blob_renders_404_through_blocking_done() {
+        let mut handler = open("GET", "/api/v1/blobs/sha256:deadbeef", &[]);
+        let outcome = run_open_job(&mut handler);
+        let mut out = Vec::new();
+        let step = handler.on_event(
+            StreamEvent::BlockingDone(outcome),
+            &mut OutBuffer::new(&mut out, 4096),
+        );
+        assert!(matches!(
+            step.action,
+            StreamAction::Close(CloseReason::Completed)
+        ));
+        let response = text(&out);
+        assert!(
+            response.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "{response}"
+        );
+        let value: serde_json::Value = serde_json::from_slice(body(&out)).expect("json error");
+        assert_eq!(value["error"]["code"], "not_found");
+    }
+
+    #[test]
+    fn conditional_and_range_failures_arrive_through_blocking_done() {
+        let id = blob_of(b"0123456789");
+        let path = format!("/api/v1/blobs/{}", id);
+        let etag = format!("\"{}\"", id);
+        let cases: [(Vec<(&str, &str)>, u16); 3] = [
+            (vec![("If-Match", "\"sha256:deadbeef\"")], 412),
+            (vec![("Range", "bytes=99-")], 416),
+            (vec![("If-None-Match", etag.as_str())], 304),
+        ];
+        for (headers, status) in cases {
+            let mut handler = open("GET", &path, &headers);
+            let outcome = run_open_job(&mut handler);
+            let mut out = Vec::new();
+            let step = handler.on_event(
+                StreamEvent::BlockingDone(outcome),
+                &mut OutBuffer::new(&mut out, 4096),
+            );
+            assert!(
+                matches!(step.action, StreamAction::Close(CloseReason::Completed)),
+                "{status} closes after its complete head"
+            );
+            let response = text(&out);
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {} ", status)),
+                "{status}: {response}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_queue_turns_the_download_into_503_busy() {
+        let id = blob_of(b"0123456789");
+        let path = format!("/api/v1/blobs/{}", id);
+        let mut handler = open("GET", &path, &[]);
+        let mut out = Vec::new();
+        let step = handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, 4096));
+        let StreamAction::SubmitBlocking(_job) = step.action else {
+            panic!("the first Writable submits the open job");
+        };
+        let step = handler.on_event(
+            StreamEvent::BlockingDone(BlockingOutcome::Failed("the blocking queue is full".into())),
+            &mut OutBuffer::new(&mut out, 4096),
+        );
+        assert!(matches!(
+            step.action,
+            StreamAction::Close(CloseReason::Completed)
+        ));
+        let response = text(&out);
+        assert!(
+            response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "{response}"
+        );
+        assert!(response.contains("Retry-After: 1\r\n"), "{response}");
+        assert!(response.contains("\"code\":\"busy\""), "{response}");
+    }
+
+    #[test]
+    fn a_head_download_refused_by_the_pool_has_no_body() {
+        let mut handler = open("HEAD", "/api/v1/blobs/sha256:deadbeef", &[]);
+        let mut out = Vec::new();
+        let step = handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, 4096));
+        assert!(matches!(step.action, StreamAction::SubmitBlocking(_)));
+        let step = handler.on_event(
+            StreamEvent::BlockingDone(BlockingOutcome::Failed("the blocking queue is full".into())),
+            &mut OutBuffer::new(&mut out, 4096),
+        );
+        assert!(matches!(
+            step.action,
+            StreamAction::Close(CloseReason::Completed)
+        ));
+        let response = text(&out);
+        assert!(
+            response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "{response}"
+        );
+        assert!(response.contains("Content-Length: "), "{response}");
+        assert!(body(&out).is_empty(), "HEAD must not write the JSON body");
+    }
+
+    #[test]
+    fn a_late_completion_after_close_is_discarded() {
+        let id = blob_of(b"0123456789");
+        let path = format!("/api/v1/blobs/{}", id);
+        let mut handler = open("GET", &path, &[]);
+        let mut out = Vec::new();
+        let step = handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, 4096));
+        let StreamAction::SubmitBlocking(job) = step.action else {
+            panic!("the first Writable submits the open job");
+        };
+        let closed = handler.on_event(
+            StreamEvent::Closed(CloseReason::PeerClosed),
+            &mut OutBuffer::new(&mut out, 0),
+        );
+        assert!(matches!(
+            closed.action,
+            StreamAction::Close(CloseReason::PeerClosed)
+        ));
+        // The worker finished after the connection went away; the file it
+        // opened is dropped with the shared slot and no bytes are written.
+        let outcome = job();
+        let late = handler.on_event(
+            StreamEvent::BlockingDone(outcome),
+            &mut OutBuffer::new(&mut out, 4096),
+        );
+        assert!(matches!(late.action, StreamAction::Continue));
+        assert!(out.is_empty(), "a late completion writes nothing");
+        assert!(
+            handler
+                .opened
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_none(),
+            "a late result is drained instead of keeping its file in the shared slot"
+        );
+    }
+
     #[test]
     fn the_download_handler_is_a_long_lived_stream() {
-        let handler = DownloadStream::response(Vec::new());
+        let handler = open("GET", "/api/v1/blobs/sha256:deadbeef", &[]);
         assert_eq!(handler.stream_class(), StreamClass::LongLived);
     }
 }

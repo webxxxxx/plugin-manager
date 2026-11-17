@@ -34,9 +34,9 @@ use crate::server::http::engine::{
     PreRequest, ServerLoop, Table,
 };
 use crate::server::http::{
-    complete_blocking, dispatch_inline, prepare_face_request, render_exchange, BlockingOutcome,
-    BlockingPool, BodyPolicy, Busy, CancelToken, CompletionSlot, Dispatch, Exchange, Face,
-    JobOutcome, StreamClass, StreamHandler,
+    busy_response, complete_blocking, dispatch_inline, prepare_face_request, render_exchange,
+    BlockingOutcome, BlockingPool, BodyPolicy, Busy, CancelToken, CompletionSlot, Dispatch,
+    Exchange, Face, JobOutcome, StreamClass, StreamHandler,
 };
 use crate::server::mcp::progress::{McpSseStream, PROGRESS_QUEUE_SLOTS};
 use crate::wake::Wake;
@@ -941,16 +941,6 @@ fn write_response(connection: &mut Connection, response: Vec<u8>, keep_alive: bo
     connection.out_at = 0;
     connection.keep_alive = keep_alive;
     connection.state = ConnState::Writing;
-}
-
-fn busy_response(message: &str) -> Vec<u8> {
-    let body = json!({ "error": { "code": "busy", "message": message } });
-    http::response_with_headers(
-        503,
-        "application/json",
-        &[("Retry-After".to_string(), "1".to_string())],
-        &serde_json::to_vec(&body).unwrap_or_default(),
-    )
 }
 
 fn blocking_busy(busy: Busy) -> Vec<u8> {

@@ -56,12 +56,12 @@ pub(crate) fn body_limit(path: &str) -> u64 {
     }
 }
 
-/// The busy response for a stream refused before its headers. Both engines send
-/// the same stable envelope so a client cannot tell which one refused it.
+/// The shared 503 busy envelope for a route refused before its headers: one
+/// status, one error code and one Retry-After header. Callers own the message.
 #[cfg(feature = "http")]
-pub fn stream_busy_response() -> Vec<u8> {
+pub fn busy_response(message: &str) -> Vec<u8> {
     let body = serde_json::json!({
-        "error": { "code": "busy", "message": "stream cap reached" }
+        "error": { "code": "busy", "message": message }
     });
     crate::http::response_with_headers(
         503,
@@ -69,4 +69,11 @@ pub fn stream_busy_response() -> Vec<u8> {
         &[("Retry-After".to_string(), "1".to_string())],
         &serde_json::to_vec(&body).unwrap_or_default(),
     )
+}
+
+/// The busy response for a stream refused before its headers. Both engines send
+/// the same stable envelope so a client cannot tell which one refused it.
+#[cfg(feature = "http")]
+pub fn stream_busy_response() -> Vec<u8> {
+    busy_response("stream cap reached")
 }
