@@ -124,7 +124,6 @@ pub(crate) fn attach_face_body(
 }
 
 /// Turn a dispatch result into wire bytes.
-#[cfg_attr(not(unix), allow(dead_code))] // the Windows fallback writes each exchange itself
 pub(crate) fn render_exchange(result: Result<Exchange, DispatchError>) -> Vec<u8> {
     match result {
         Ok(Exchange::Response(response)) => response.into_bytes(),

@@ -435,28 +435,14 @@ pub fn advance_request<S>(
         let framing = http::framing(&head.headers)
             .map_err(|message| crate::http::json_error(400, "bad_request", &message))?;
         let limit = body.limit();
-        match framing {
-            http::Framing::Length(length) if length > limit => {
-                return Err(crate::http::json_error(
-                    413,
-                    "payload_too_large",
-                    "request body is too large",
-                ));
-            }
-            // A streamed face route's body is consumed by its pre-body hook;
-            // reaching the buffered path means the request declared a body no
-            // route is going to read. Refuse it before the client waits for a
-            // 100 Continue that will never come.
-            http::Framing::Chunked if !body.buffers_body() => {
-                return Err(crate::http::json_error(
-                    413,
-                    "payload_too_large",
-                    "request body is too large",
-                ));
-            }
-            _ => {}
+        if !body.accepts(framing) {
+            return Err(crate::http::json_error(
+                413,
+                "payload_too_large",
+                "request body is too large",
+            ));
         }
-        if body.buffers_body() && framing_has_body(framing) && http::expects_continue(&head) {
+        if body.confirms_body(&head, framing) {
             // The socket is non-blocking, but a 25-byte interim head fits in an
             // empty send buffer; a failure here is a broken connection, not a
             // reason to read a body the client is still withholding.
@@ -536,22 +522,22 @@ pub fn advance_request<S>(
     }))
 }
 
-#[cfg(unix)]
-fn framing_has_body(framing: http::Framing) -> bool {
-    !matches!(framing, http::Framing::None | http::Framing::Length(0))
-}
-
 /// HTTP/1.1 defaults to keep-alive unless the client opts out; HTTP/1.0 is the
 /// opposite unless the client opts in. Pipelining is not supported: the next
 /// request is read after the previous response is written.
 pub fn wants_keep_alive(request: &HttpRequest) -> bool {
-    wants_keep_alive_headers(&request.version, &request.headers)
+    wants_keep_alive_parts(&request.version, &request.headers)
 }
 
-/// Keep-alive for a head whose body has not been read yet. Both engines need
-/// the decision before the body so a rejected request closes instead of
-/// leaving unread bytes in front of the next request.
-pub fn wants_keep_alive_headers(version: &str, headers: &[(String, String)]) -> bool {
+/// Keep-alive for a head whose body has not been read yet. The Windows
+/// fallback needs the decision before the body so a rejected request closes
+/// instead of leaving unread bytes in front of the next request.
+#[cfg(not(unix))]
+pub fn wants_keep_alive_head(head: &http::Head) -> bool {
+    wants_keep_alive_parts(&head.version, &head.headers)
+}
+
+fn wants_keep_alive_parts(version: &str, headers: &[(String, String)]) -> bool {
     let connection = http::header(headers, "connection")
         .unwrap_or("")
         .to_ascii_lowercase();

@@ -69,12 +69,10 @@ pub(crate) trait PreBodyRoutes: Send + Sync {
         head: &http::Head,
         lan: &Arc<Mutex<Lan>>,
     ) -> Option<Result<Exchange, Vec<u8>>>;
-    /// Body policy and transport authentication for the server-owned routes the
-    /// face leaves alone (MCP, blob/file session metadata). The composition
-    /// root owns this last legacy table; a new endpoint declares its policy in
-    /// `Face::route` instead.
-    fn server_route(&self, head: &http::Head, lan: &Arc<Mutex<Lan>>)
-        -> Result<BodyPolicy, Vec<u8>>;
+    /// Body policy for the server-owned routes the face leaves alone (MCP,
+    /// blob/file session metadata). The composition root owns this last legacy
+    /// table; a new endpoint declares its policy in `Face::route` instead.
+    fn body_policy(&self, head: &http::Head) -> BodyPolicy;
 }
 
 enum WorkResult {
@@ -242,7 +240,7 @@ impl ServerLoop for Server {
                 self.face_plans.insert(id, prepared);
                 Ok(body)
             }
-            Ok(None) => self.routes.server_route(head, &self.lan),
+            Ok(None) => Ok(self.routes.body_policy(head)),
             Err(response) => Err(response),
         }
     }
@@ -307,8 +305,8 @@ impl ServerLoop for Server {
 
     fn on_request(&mut self, connection: &mut Connection, request: HttpRequest) {
         let keep_alive = wants_keep_alive(&request);
-        if self.face_plans.contains_key(&connection.id) {
-            self.serve_face(connection, request, keep_alive);
+        if let Some(prepared) = self.face_plans.remove(&connection.id) {
+            self.serve_face(connection, prepared, request.body, keep_alive);
             return;
         }
         let path = request
@@ -724,18 +722,14 @@ impl Server {
     /// Run the face-owned part of one request from the plan resolved before the
     /// body was read. Inline routes answer now; blocking routes are submitted to
     /// the pool and the connection waits in `Processing`.
-    fn serve_face(&mut self, connection: &mut Connection, request: HttpRequest, keep_alive: bool) {
-        let Some(prepared) = self.face_plans.remove(&connection.id) else {
-            // The caller only enters here when a plan exists; answering an
-            // internal error keeps a lost plan from hanging the connection.
-            write_response(
-                connection,
-                http::json_error(500, "internal", "request route lost"),
-                false,
-            );
-            return;
-        };
-        let prepared = match attach_face_body(prepared, &request.body) {
+    fn serve_face(
+        &mut self,
+        connection: &mut Connection,
+        prepared: PreparedFace,
+        body: Vec<u8>,
+        keep_alive: bool,
+    ) {
+        let prepared = match attach_face_body(prepared, &body) {
             Ok(prepared) => prepared,
             Err(response) => {
                 // The wire limit should have caught this before the body was

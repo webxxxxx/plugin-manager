@@ -41,7 +41,7 @@ use crate::rpc;
 use crate::server::http::engine::HttpRequest;
 #[cfg(not(unix))]
 use crate::server::http::engine::{
-    self, keep_alive_response, wants_keep_alive, wants_keep_alive_headers,
+    self, keep_alive_response, wants_keep_alive, wants_keep_alive_head,
 };
 use crate::settings;
 #[cfg(not(unix))]
@@ -424,12 +424,8 @@ impl crate::server::http::server::PreBodyRoutes for PreBodyFaces {
         Some(crate::face::blob_upload::exchange(head, lan))
     }
 
-    fn server_route(
-        &self,
-        head: &http::Head,
-        lan: &Arc<Mutex<Lan>>,
-    ) -> Result<crate::server::http::BodyPolicy, Vec<u8>> {
-        crate::api::server_route(head, lan)
+    fn body_policy(&self, head: &http::Head) -> crate::server::http::BodyPolicy {
+        crate::api::server_body_policy(head)
     }
 }
 
@@ -556,7 +552,7 @@ fn handle(
             }
         };
         if let Some(prepared) = planned {
-            let keep_alive = wants_keep_alive_headers(&head.version, &head.headers);
+            let keep_alive = wants_keep_alive_head(&head);
             let body = match read_body(&mut stream, &head, &initial, prepared.route.body) {
                 Ok(body) => body,
                 Err(response) => {
@@ -584,20 +580,6 @@ fn handle(
                 }
             };
             match result {
-                Ok(crate::server::http::Exchange::Response(response)) => {
-                    let response = if keep_alive {
-                        keep_alive_response(response.into_bytes())
-                    } else {
-                        response.into_bytes()
-                    };
-                    if stream.write_all(&response).is_err() {
-                        return;
-                    }
-                    if !keep_alive {
-                        return;
-                    }
-                    continue;
-                }
                 Ok(crate::server::http::Exchange::Stream(handler)) => {
                     // A streamed response owns this connection until it closes.
                     // The fallback writes the shared 503 if the stream budget is
@@ -605,9 +587,18 @@ fn handle(
                     drive_fallback(&mut stream, handler);
                     return;
                 }
-                Err(cause) => {
-                    let _ = stream.write_all(&http::json_error(500, "internal", &cause.message()));
-                    return;
+                result => {
+                    let mut response = crate::server::http::render_exchange(result);
+                    if keep_alive {
+                        response = keep_alive_response(response);
+                    }
+                    if stream.write_all(&response).is_err() {
+                        return;
+                    }
+                    if !keep_alive {
+                        return;
+                    }
+                    continue;
                 }
             }
         }
@@ -624,13 +615,7 @@ fn handle(
             serve_blob_upload(&mut stream, &head, &initial, &lan);
             return;
         }
-        let body_policy = match server_route(&head, &lan) {
-            Ok(policy) => policy,
-            Err(response) => {
-                let _ = stream.write_all(&response);
-                return;
-            }
-        };
+        let body_policy = server_body_policy(&head);
         let body = match read_body(&mut stream, &head, &initial, body_policy) {
             Ok(body) => body,
             Err(response) => {
@@ -1038,22 +1023,10 @@ fn read_body(
     let framing =
         http::framing(&head.headers).map_err(|message| error(400, "bad_request", &message))?;
     let limit = body.limit();
-    match framing {
-        http::Framing::Length(length) if length > limit => {
-            return Err(error(413, "payload_too_large", "request body is too large"));
-        }
-        // A streamed face route's body is consumed by its pre-body hook. If it
-        // reaches this buffered path, the request declared a body no route is
-        // going to read; refuse it before the client waits for a 100 Continue.
-        http::Framing::Chunked if !body.buffers_body() => {
-            return Err(error(413, "payload_too_large", "request body is too large"));
-        }
-        _ => {}
+    if !body.accepts(framing) {
+        return Err(error(413, "payload_too_large", "request body is too large"));
     }
-    if body.buffers_body()
-        && !matches!(framing, http::Framing::None | http::Framing::Length(0))
-        && http::expects_continue(head)
-    {
+    if body.confirms_body(head, framing) {
         stream
             .write_all(http::CONTINUE_RESPONSE)
             .map_err(|_| error(400, "bad_request", "cannot write response"))?;
@@ -1072,30 +1045,13 @@ fn request_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
     http::header(&request.headers, name)
 }
 
-/// Body policy and transport authentication for the routes the face leaves to
-/// the server-owned fallback (the /mcp body cap and the blob/file session
-/// metadata). These legacy routes still live in this composition root, so this
-/// is the last place a path chooses a body limit. A new endpoint declares its
-/// policy in `Face::route` and never touches the HTTP engine. /mcp keeps its
-/// bearer-only endpoint policy in `mcp_http`; the transport principal below
-/// does not replace it.
-pub(crate) fn server_route(
-    head: &http::Head,
-    lan: &Arc<Mutex<Lan>>,
-) -> Result<crate::server::http::BodyPolicy, Vec<u8>> {
-    match lan.lock() {
-        Ok(mut state) => match state.authenticate(&head.headers) {
-            Ok(_) => {}
-            Err(()) => {
-                return Err(error(401, "unauthorized", "authentication required"));
-            }
-        },
-        Err(_) => return Err(error(500, "internal", "LAN state unavailable")),
-    }
-    Ok(server_body_policy(head))
-}
-
-fn server_body_policy(head: &http::Head) -> crate::server::http::BodyPolicy {
+/// Body policy for the routes the face leaves to the server-owned fallback
+/// (the /mcp body cap and the blob/file session metadata). These legacy routes
+/// still live in this composition root, so this is the last place a path
+/// chooses a body limit; their transport/bearer auth stays where it was
+/// (`respond` / `mcp_http`) until they become faces. A new endpoint declares
+/// its policy in `Face::route` and never touches the HTTP engine.
+pub(crate) fn server_body_policy(head: &http::Head) -> crate::server::http::BodyPolicy {
     use crate::server::http::BodyPolicy;
 
     let limits = crate::limits::current();
@@ -1104,11 +1060,7 @@ fn server_body_policy(head: &http::Head) -> crate::server::http::BodyPolicy {
         .split_once('?')
         .map(|(path, _)| path)
         .unwrap_or(&head.path);
-    if path.starts_with("/api/v1/plugins") || path.starts_with("/api/v1/import") {
-        BodyPolicy::Buffered {
-            limit: limits.max_body,
-        }
-    } else if path.trim_end_matches('/').ends_with("/complete")
+    if path.trim_end_matches('/').ends_with("/complete")
         && (path.starts_with("/api/v1/blobs/uploads/")
             || path.starts_with("/api/v1/file/uploads/")
             || path.starts_with("/api/v1/files/uploads/"))
