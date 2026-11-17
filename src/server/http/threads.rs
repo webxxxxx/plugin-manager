@@ -17,11 +17,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::http;
-use crate::server::http::engine;
 use crate::config::Config;
+use crate::http;
 use crate::lan::Lan;
 use crate::log;
+use crate::server::http::engine;
 use crate::threads;
 
 /// Admission bookkeeping for the Windows thread-per-connection fallback.
@@ -128,6 +128,7 @@ pub(crate) fn serve(
     stop: Arc<AtomicBool>,
     connection: Connection,
 ) {
+    let limits = config.limits.clone();
     loop {
         if stop.load(Ordering::SeqCst) {
             return;
@@ -147,7 +148,7 @@ pub(crate) fn serve(
                 let connection = connection.clone();
                 let spawned = thread::Builder::new()
                     .name("svcd-http-conn".into())
-                    .stack_size(threads::transfer_stack())
+                    .stack_size(threads::transfer_stack(&limits))
                     .spawn(move || {
                         let _lease = lease;
                         connection(stream, ip, config, lan, idle_timeout);
@@ -169,7 +170,11 @@ pub(crate) fn serve(
 /// Write one rendered response. HEAD keeps the head (including GET's
 /// `Content-Length`) and gets no body, so a keep-alive connection cannot read
 /// the omitted body as the start of the next response.
-pub(crate) fn write_http(stream: &mut TcpStream, response: &[u8], head_only: bool) -> std::io::Result<()> {
+pub(crate) fn write_http(
+    stream: &mut TcpStream,
+    response: &[u8],
+    head_only: bool,
+) -> std::io::Result<()> {
     if head_only {
         stream.write_all(&http::strip_body(response.to_vec()))
     } else {
@@ -184,10 +189,11 @@ pub(crate) fn drive_fallback(
     stream: &mut TcpStream,
     handler: Box<dyn crate::server::http::StreamHandler>,
     head_only: bool,
+    limits: &crate::limits::Limits,
 ) {
     let _ = stream.set_nonblocking(false);
-    let _ = stream.set_write_timeout(Some(crate::limits::current().transfer_timeout));
-    if crate::server::http::fallback::drive(stream, handler, &[]).is_err() {
+    let _ = stream.set_write_timeout(Some(limits.transfer_timeout));
+    if crate::server::http::fallback::drive(stream, handler, &[], limits).is_err() {
         let _ = write_http(
             stream,
             &crate::server::http::stream_busy_response(),
@@ -279,11 +285,14 @@ pub(crate) enum HeadFailure {
     Response(Vec<u8>),
 }
 
-pub(crate) fn read_head(stream: &mut TcpStream) -> Result<(http::Head, Vec<u8>), HeadFailure> {
+pub(crate) fn read_head(
+    stream: &mut TcpStream,
+    max_header: usize,
+) -> Result<(http::Head, Vec<u8>), HeadFailure> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
-        if buffer.len() > crate::limits::current().max_header {
+        if buffer.len() > max_header {
             return Err(HeadFailure::Response(http::json_error(
                 400,
                 "bad_request",
@@ -299,7 +308,7 @@ pub(crate) fn read_head(stream: &mut TcpStream) -> Result<(http::Head, Vec<u8>),
         }
         buffer.extend_from_slice(&chunk[..read]);
         if let Some(position) = http::header_end(&buffer) {
-            if position > crate::limits::current().max_header {
+            if position > max_header {
                 return Err(HeadFailure::Response(http::json_error(
                     400,
                     "bad_request",
@@ -324,19 +333,28 @@ pub(crate) fn read_body(
     initial: &[u8],
     body: crate::server::http::BodyPolicy,
 ) -> Result<Vec<u8>, Vec<u8>> {
-    let framing =
-        http::framing(&head.headers).map_err(|message| http::json_error(400, "bad_request", &message))?;
+    let framing = http::framing(&head.headers)
+        .map_err(|message| http::json_error(400, "bad_request", &message))?;
     let limit = body.limit();
     if !body.accepts(framing) {
-        return Err(http::json_error(413, "payload_too_large", "request body is too large"));
+        return Err(http::json_error(
+            413,
+            "payload_too_large",
+            "request body is too large",
+        ));
     }
     if body.confirms_body(head, framing) {
         stream
             .write_all(http::CONTINUE_RESPONSE)
             .map_err(|_| http::json_error(400, "bad_request", "cannot write response"))?;
     }
-    http::collect_body(stream, framing, limit, initial)
-        .map_err(|error| http::json_error(error.status(), http::code_for(error.status()), error.detail()))
+    http::collect_body(stream, framing, limit, initial).map_err(|error| {
+        http::json_error(
+            error.status(),
+            http::code_for(error.status()),
+            error.detail(),
+        )
+    })
 }
 
 #[cfg(test)]

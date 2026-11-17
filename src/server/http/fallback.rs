@@ -9,7 +9,6 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use crate::limits;
 use crate::server::http::{
     CloseReason, FileSend, JobBudget, OutBuffer, StreamAction, StreamEvent, StreamHandler,
 };
@@ -28,10 +27,10 @@ pub fn drive(
     stream: &mut TcpStream,
     mut handler: Box<dyn StreamHandler>,
     initial: &[u8],
+    limits: &crate::limits::Limits,
 ) -> Result<(), Busy> {
-    let permit =
-        StreamBudget::global().acquire(handler.stream_class(), limits::current().max_streams)?;
-    let result = drive_loop(stream, handler.as_mut(), initial);
+    let permit = StreamBudget::global().acquire(handler.stream_class(), limits.max_streams)?;
+    let result = drive_loop(stream, handler.as_mut(), initial, limits);
     // The Unix driver delivers this from its Drop; the fallback owns the
     // handler directly, so it must deliver the same final event here.
     let mut discarded = Vec::new();
@@ -47,9 +46,10 @@ fn drive_loop(
     stream: &mut TcpStream,
     handler: &mut dyn StreamHandler,
     initial: &[u8],
+    limits: &crate::limits::Limits,
 ) -> Result<(), Busy> {
-    let limit = limits::current().stream_buffer;
-    let timeout = limits::current().transfer_timeout;
+    let limit = limits.stream_buffer;
+    let timeout = limits.transfer_timeout;
     let mut out = Vec::new();
     let mut pending = initial;
     let mut read_buf = [0u8; 8 * 1024];
@@ -261,10 +261,9 @@ mod tests {
         let started = Instant::now();
         drive(
             &mut server,
-            Box::new(BudgetHandler {
-                captured: Some(tx),
-            }),
+            Box::new(BudgetHandler { captured: Some(tx) }),
             &[],
+            &crate::limits::test_default(),
         )
         .expect("drive");
         let (deadline, cancelled) = rx.try_recv().expect("job budget");

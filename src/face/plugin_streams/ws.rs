@@ -55,6 +55,7 @@ pub(crate) struct WsStream {
     /// Counters for the operator log when the transport closes.
     bytes_read: u64,
     frames_read: u64,
+    limits: std::sync::Arc<crate::limits::Limits>,
 }
 
 impl WsStream {
@@ -64,6 +65,7 @@ impl WsStream {
         accept: String,
         receiver: Receiver<Event>,
         subscription: Subscription,
+        limits: std::sync::Arc<crate::limits::Limits>,
     ) -> WsStream {
         let head = format!(
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
@@ -91,6 +93,7 @@ impl WsStream {
             closing: false,
             bytes_read: 0,
             frames_read: 0,
+            limits,
         }
     }
 
@@ -259,8 +262,10 @@ impl WsStream {
     }
 
     fn parse(&mut self) -> Option<BlockingJob> {
-        let limits = crate::limits::current();
-        let frame_limit = limits.ws_max_message_bytes.max(limits.ws_raw_max_bytes);
+        let frame_limit = self
+            .limits
+            .ws_max_message_bytes
+            .max(self.limits.ws_raw_max_bytes);
         let mut job = None;
         loop {
             match wire::parse_frame(&self.buffer, frame_limit) {
@@ -269,7 +274,7 @@ impl WsStream {
                     self.buffer.drain(..used);
                     self.frames_read += 1;
                     if self.buffer.is_empty() {
-                        let shrink = limits.ws_buffer_shrink_bytes;
+                        let shrink = self.limits.ws_buffer_shrink_bytes;
                         if self.buffer.capacity() > shrink {
                             self.buffer.shrink_to(shrink);
                         }
@@ -321,7 +326,6 @@ impl WsStream {
             }
             return None;
         }
-        let limits = crate::limits::current();
         match frame.opcode {
             0x1 | 0x2 => {
                 if self.fragment_opcode.is_some() {
@@ -342,9 +346,9 @@ impl WsStream {
                 };
                 self.fragment.extend_from_slice(&frame.payload);
                 let limit = if opcode == 0x2 {
-                    limits.ws_raw_max_bytes
+                    self.limits.ws_raw_max_bytes
                 } else {
-                    limits.ws_max_message_bytes
+                    self.limits.ws_max_message_bytes
                 };
                 if self.fragment.len() > limit {
                     self.fragment.clear();
@@ -368,11 +372,10 @@ impl WsStream {
     }
 
     fn complete_data(&mut self, opcode: u8, payload: Vec<u8>) -> Option<BlockingJob> {
-        let limits = crate::limits::current();
         if opcode == 0x2 {
-            if !limits.ws_raw_enabled {
+            if !self.limits.ws_raw_enabled {
                 self.queue_close(1003, "binary frames are disabled");
-            } else if payload.len() > limits.ws_raw_max_bytes {
+            } else if payload.len() > self.limits.ws_raw_max_bytes {
                 self.queue_close(1009, "raw message too large");
             } else {
                 // The old page transport echoed a binary frame back; that is a
@@ -381,13 +384,13 @@ impl WsStream {
             }
             return None;
         }
-        if payload.len() > limits.ws_max_message_bytes {
+        if payload.len() > self.limits.ws_max_message_bytes {
             self.queue_close(1009, "message too large");
             return None;
         }
         if self.call_in_flight {
-            if self.queued.len() >= limits.ws_inflight_requests
-                || self.queued_bytes.saturating_add(payload.len()) > limits.ws_inflight_bytes
+            if self.queued.len() >= self.limits.ws_inflight_requests
+                || self.queued_bytes.saturating_add(payload.len()) > self.limits.ws_inflight_bytes
             {
                 self.queue_close(1013, "too many in-flight requests");
             } else {
@@ -422,11 +425,8 @@ impl WsStream {
                 }
             }
             BlockingOutcome::Busy => {
-                let response = rpc::err(
-                    self.pending_id.take(),
-                    -32603,
-                    "the blocking queue is full",
-                );
+                let response =
+                    rpc::err(self.pending_id.take(), -32603, "the blocking queue is full");
                 self.queue_text(rpc::to_line(&response));
             }
             BlockingOutcome::Failed { message, .. } => {
@@ -483,15 +483,20 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
+    fn test_limits() -> Arc<crate::limits::Limits> {
+        Arc::new(crate::limits::test_default())
+    }
+
     fn harness() -> (Arc<EventBus>, WsStream) {
         let bus = Arc::new(EventBus::new());
-        let (receiver, subscription) = bus.subscribe("demo").expect("subscribe");
+        let (receiver, subscription) = bus.subscribe("demo", &test_limits()).expect("subscribe");
         let stream = WsStream::new(
             PathBuf::from("."),
             "demo".to_string(),
             "accept-key".to_string(),
             receiver,
             subscription,
+            test_limits(),
         );
         (bus, stream)
     }
@@ -695,7 +700,7 @@ mod tests {
     fn a_message_over_the_limit_closes_with_1009() {
         let (_bus, mut stream) = harness();
         let _ = drive(&mut stream, 4096);
-        let limit = crate::limits::current().ws_max_message_bytes;
+        let limit = test_limits().ws_max_message_bytes;
         let payload = vec![b'x'; limit + 1];
         let mut out = Vec::new();
         stream.on_event(
@@ -740,7 +745,7 @@ mod tests {
         let (_bus, mut stream) = harness();
         let _ = drive(&mut stream, 4096);
         stream.call_in_flight = true;
-        let limits = crate::limits::current();
+        let limits = test_limits();
         for _ in 0..=limits.ws_inflight_requests {
             stream.queued.push_back(vec![b'x'; 1]);
         }

@@ -5,7 +5,6 @@
 //! clamped to a safe range so a typo cannot turn a 50 MB router into a swap
 //! storm.
 
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::settings;
@@ -382,24 +381,20 @@ fn clamp_u64(value: Option<u64>, default: u64, min: u64, max: u64) -> u64 {
     value.unwrap_or(default).clamp(min, max)
 }
 
-static LIMITS: OnceLock<Limits> = OnceLock::new();
-
 /// Derive the limits from a parsed `svcd.conf`.
 ///
 /// Pure: it reads only the document, so the composition root can derive the
-/// limits once (S7b) and a test can derive them from its own settings without
-/// touching the process cache.
+/// limits once and a test can derive them from its own settings without
+/// touching process state.
 pub fn derive(settings: &settings::Settings) -> Limits {
     Limits::from_settings(SettingsView::from(settings))
 }
 
-/// The daemon-wide limits. The first call loads `svcd.conf`; later calls reuse
-/// the same values, so changing the file requires a restart.
-pub fn current() -> &'static Limits {
-    LIMITS.get_or_init(|| match settings::current() {
-        Ok(settings) => derive(settings),
-        Err(_) => derive(&settings::Settings::default()),
-    })
+/// The limits an unconfigured process would run with. Unit tests use this
+/// instead of re-deriving from `Settings::default()` at every seam.
+#[cfg(test)]
+pub(crate) fn test_default() -> Limits {
+    derive(&settings::Settings::default())
 }
 
 #[cfg(test)]

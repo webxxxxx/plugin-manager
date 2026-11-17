@@ -27,7 +27,10 @@ use self::listener::{ControlServer, Source};
 
 /// Start the server loop for the minimal (no HTTP) build: control channel only.
 #[cfg_attr(feature = "http", allow(dead_code))]
-pub fn spawn_control_only(control: crate::channel::ControlBinding) -> std::io::Result<LoopHandle> {
+pub fn spawn_control_only(
+    control: crate::channel::ControlBinding,
+    limits: std::sync::Arc<crate::limits::Limits>,
+) -> std::io::Result<LoopHandle> {
     let (user, admin, tx, wake) = control.into_parts();
     let (notify_rx, notify_tx) = UnixStream::pair()?;
     notify_rx.set_nonblocking(true)?;
@@ -38,7 +41,7 @@ pub fn spawn_control_only(control: crate::channel::ControlBinding) -> std::io::R
     let control = ControlServer::new(user, admin, tx, wake, notify_tx)?;
     let join = thread::Builder::new()
         .name("svcd-server-loop".into())
-        .stack_size(crate::threads::transfer_stack())
+        .stack_size(crate::threads::transfer_stack(&limits))
         .spawn(move || {
             let mut handler = ControlOnly {
                 control,
@@ -46,7 +49,7 @@ pub fn spawn_control_only(control: crate::channel::ControlBinding) -> std::io::R
                 notify_rx,
                 keys: Vec::new(),
             };
-            engine::run(None, &mut handler, crate::limits::current());
+            engine::run(None, &mut handler, &limits);
         })?;
     handle.set_join(join);
     Ok(handle)
@@ -161,9 +164,11 @@ mod tests {
                 )));
             }
         });
-        let control =
-            crate::channel::bind_server(&root, tx, Arc::new(Wake::new())).expect("control channel");
-        let handle = spawn_control_only(control).expect("loop");
+        let control = crate::channel::bind_server(&root, tx, Arc::new(Wake::new()), 64 * 1024)
+            .expect("control channel");
+        let handle =
+            spawn_control_only(control, std::sync::Arc::new(crate::limits::test_default()))
+                .expect("loop");
 
         let mut stream = UnixStream::connect(&path).expect("connect");
         stream

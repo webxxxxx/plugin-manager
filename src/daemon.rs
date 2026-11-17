@@ -16,14 +16,14 @@ use crate::api::{self, Api};
 type Api = ();
 use crate::catalog;
 use crate::channel;
-use crate::config::Config;
 use crate::compat;
-use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
+use crate::config::Config;
 use crate::definition;
 use crate::kernel::contract::{
     CapabilityName, Instance, Invocation, Launchers, ProgressToken, Reply, ReplySink,
 };
 use crate::kernel::failure::{Class, Failure, Problem, ProblemError, Rejection, Retry};
+use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::lan::LanStatus;
 use crate::log;
 use crate::mcp;
@@ -48,20 +48,20 @@ use crate::wake::Wake;
 const POLL_WAIT: Duration = Duration::from_millis(50);
 
 pub fn run(conf: Option<PathBuf>) -> i32 {
-    // The explicit --conf must be loaded before the directory set is resolved,
-    // so its config_dir wins and is not shadowed by the default resolution.
-    if let Some(path) = conf.as_deref() {
-        if path.is_file() {
-            if let Err(error) = settings::init_from_path(path) {
-                eprintln!("svcd: invalid config: {}", error);
-                return 1;
-            }
+    // The directory set has to exist before `ensure_conf` can report the path
+    // it settled on. Read the explicit document once when it exists; the
+    // bootstrap below reuses that value instead of parsing the same file twice.
+    // A missing `--conf` falls through to the normal discovery, exactly as
+    // `ensure_conf` does.
+    let explicit = conf.as_deref().filter(|path| path.is_file());
+    let preloaded = match Config::bootstrap(explicit) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("svcd: invalid config: {}", error);
+            return 1;
         }
-    }
-    // Bootstrapping reads the settings cache without failing on a broken file
-    // yet: the directory has to exist before `ensure_conf` can report the path
-    // it settled on, and `Config::bootstrap` below is the hard failure point.
-    let initial_paths = crate::config::ambient_paths();
+    };
+    let initial_paths = preloaded.paths.clone();
     if let Err(error) = fs::create_dir_all(&initial_paths.config_dir) {
         eprintln!(
             "svcd: cannot create config directory {}: {}",
@@ -71,21 +71,20 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         return 1;
     }
 
-    let config_path = match crate::install::ensure_conf(conf.as_deref()) {
+    let config_path = match crate::install::ensure_conf(conf.as_deref(), &initial_paths) {
         Ok(path) => path,
         Err(error) => {
             eprintln!("svcd: {}", error);
             return 1;
         }
     };
-    let config = match Config::bootstrap(Some(&config_path)) {
-        Ok(config) => Arc::new(config),
-        Err(error) => {
-            eprintln!("svcd: invalid config: {}", error);
-            return 1;
-        }
-    };
-    if let Err(error) = log::init_svcd(&config.paths.logs_dir) {
+    // Keep the document bootstrapped above. `ensure_conf` chooses or creates
+    // the file for the service unit and the next start; loading its result
+    // here would (a) parse a second time and (b) let `<program>/svcd.conf`
+    // override the `SVCD_CONFIG_DIR` document that won the bootstrap — the
+    // old process cache also kept the bootstrapped document for the run.
+    let config = Arc::new(preloaded);
+    if let Err(error) = log::init_svcd(&config.limits, &config.paths.logs_dir) {
         eprintln!("svcd: cannot open log directory: {}", error);
     }
     log::svcd("svcd starting");
@@ -134,12 +133,12 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
 
     wait_for_services_dir(&config.paths.services_dir);
 
-    let mut loaded = definition::load_services(&config.paths.services_dir);
+    let mut loaded = definition::load_services(&config.paths.services_dir, &config.limits);
     for issue in &loaded.issues {
         log::svcd(&format!("svcd: warning: {}", issue));
     }
 
-    let (plugins, warnings) = plugin::scan(&config.paths);
+    let (plugins, warnings) = plugin::scan(&config.paths, &config.limits);
     for warning in warnings {
         log::svcd(&format!("svcd: plugin: {}", warning));
     }
@@ -161,7 +160,12 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     // One path on every host: the channel binds the endpoint and either hands
     // the listener to the server loop (Unix) or starts its own accept thread
     // (Windows). The composition root only sees the resulting server.
-    let control = match channel::bind_server(&config.paths.config_dir, tx, wake.clone()) {
+    let control = match channel::bind_server(
+        &config.paths.config_dir,
+        tx,
+        wake.clone(),
+        crate::threads::io_stack(&config.limits),
+    ) {
         Ok(control) => control,
         Err(error) => {
             log::svcd(&format!("svcd: cannot bind control channel: {}", error));
@@ -169,12 +173,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         }
     };
     #[cfg(feature = "http")]
-    let raw_hub = crate::rawhub::RawHub::new(
-        config.limits.ws_raw_max_bytes,
-        config.limits.ws_inflight_bytes,
-        config.limits.ws_inflight_requests,
-        config.limits.ws_raw_queue,
-    );
+    let raw_hub = crate::rawhub::RawHub::new(config.limits.clone());
     // The driver picks itself inside `server::http::entry`; the composition
     // root only hands over the control plumbing it owns.
     #[cfg(feature = "http")]
@@ -196,30 +195,31 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         }
     };
     #[cfg(all(unix, not(feature = "http")))]
-    let control_loop = match crate::server::control::spawn_control_only(control) {
-        Ok(handle) => handle,
-        Err(error) => {
-            log::svcd(&format!("svcd: cannot start server loop: {}", error));
-            return 1;
-        }
-    };
+    let control_loop =
+        match crate::server::control::spawn_control_only(control, config.limits.clone()) {
+            Ok(handle) => handle,
+            Err(error) => {
+                log::svcd(&format!("svcd: cannot start server loop: {}", error));
+                return 1;
+            }
+        };
     // A host whose control loop already started (Windows) has nothing left to
     // hand over: the accept thread owns the server from `bind_server` on.
     #[cfg(all(not(unix), not(feature = "http")))]
     drop(control);
     #[cfg(not(feature = "http"))]
-    let raw_hub = crate::rawhub::RawHub::new(
-        config.limits.ws_raw_max_bytes,
-        config.limits.ws_inflight_bytes,
-        config.limits.ws_inflight_requests,
-        config.limits.ws_raw_queue,
-    );
+    let raw_hub = crate::rawhub::RawHub::new(config.limits.clone());
     #[cfg(not(feature = "http"))]
     let api: Option<Arc<Api>> = None;
     notify_systemd("READY=1");
 
-    let mut daemon =
-        Daemon::new_with_raw(loaded.registry, rx, api.clone(), raw_hub.clone(), config.clone());
+    let mut daemon = Daemon::new_with_raw(
+        loaded.registry,
+        rx,
+        api.clone(),
+        raw_hub.clone(),
+        config.clone(),
+    );
     daemon.set_raw_hub(raw_hub.clone());
     daemon.set_wake(wake);
     #[cfg(unix)]
@@ -398,7 +398,7 @@ pub fn shutdown_quiet() -> i32 {
 fn shutdown_inner(verbose: bool) -> i32 {
     // Stopping only needs the control endpoint; a broken `svcd.conf` must not
     // make `svcd stop` unusable.
-    let paths = crate::config::ambient_paths();
+    let paths = crate::config::ambient_paths(None);
     match channel::request(&paths.config_dir, "svcd.shutdown", json!({})) {
         Ok(response) => match response.error {
             Some(error) => {
@@ -504,40 +504,31 @@ struct Daemon {
 
 impl Daemon {
     #[cfg(test)]
-    fn new(
-        registry: Registry,
-        rx: Receiver<channel::PendingCall>,
-        api: Option<Arc<Api>>,
-    ) -> Self {
-        let limits = crate::limits::current();
+    fn new(registry: Registry, rx: Receiver<channel::PendingCall>, api: Option<Arc<Api>>) -> Self {
+        let config = Arc::new(Config::with_paths(
+            crate::settings::Settings::default(),
+            None,
+            {
+                let nanos = SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let root = crate::test_support::temp_dir().join(format!(
+                    "svcd-daemon-unit-{}-{}",
+                    std::process::id(),
+                    nanos
+                ));
+                let paths = Paths::under(&root);
+                crate::package::install_test_trust(&paths.trust_dir);
+                paths
+            },
+        ));
         Self::new_with_raw(
             registry,
             rx,
             api,
-            crate::rawhub::RawHub::new(
-                limits.ws_raw_max_bytes,
-                limits.ws_inflight_bytes,
-                limits.ws_inflight_requests,
-                limits.ws_raw_queue,
-            ),
-            Arc::new(Config::with_paths(
-                crate::settings::Settings::default(),
-                None,
-                {
-                    let nanos = SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos();
-                    let root = crate::test_support::temp_dir().join(format!(
-                        "svcd-daemon-unit-{}-{}",
-                        std::process::id(),
-                        nanos
-                    ));
-                    let paths = Paths::under(&root);
-                    crate::package::install_test_trust(&paths.trust_dir);
-                    paths
-                },
-            )),
+            crate::rawhub::RawHub::new(config.limits.clone()),
+            config,
         )
     }
 
@@ -562,13 +553,14 @@ impl Daemon {
                     service.lifecycle.clone(),
                     service.restart,
                     config.paths.clone(),
+                    config.limits.clone(),
                 );
                 slot.set_protocol(service.protocol);
                 slot.set_protocol_only(service.kind == Kind::Plugin);
                 slot.set_remain_after_exit(service.remain_after_exit);
                 slot.set_initial_state(service.state);
                 slot.set_wake(wake.clone());
-                configure_slot(&mut slot, &service);
+                configure_slot(&mut slot, &service, &config.limits);
                 slots.insert(service.id.clone(), slot);
             }
         }
@@ -630,7 +622,10 @@ impl Daemon {
     /// time still matches (a reused pid fails this check). On Windows the job
     /// objects kill the tree with the daemon, so there is nothing to adopt.
     fn adopt_runtime(&mut self) {
-        let boot = self.boot_id.clone().or_else(crate::platform::host::process::boot_id);
+        let boot = self
+            .boot_id
+            .clone()
+            .or_else(crate::platform::host::process::boot_id);
         let now = self.now_ms();
         for id in self.slots.keys().cloned().collect::<Vec<_>>() {
             let Some(record) = runtime::load(&id, &self.config.paths) else {
@@ -678,8 +673,10 @@ impl Daemon {
                 runtime::remove(&id, &self.config.paths);
                 continue;
             }
-            if let (Some(expected), Some(actual)) = (record.starttime, crate::platform::host::process::start_time(pid))
-            {
+            if let (Some(expected), Some(actual)) = (
+                record.starttime,
+                crate::platform::host::process::start_time(pid),
+            ) {
                 if expected != actual {
                     log::svcd(&format!(
                         "svcd: {}: pid {} was reused (starttime {} != {}); not adopting",
@@ -735,7 +732,10 @@ impl Daemon {
                 if let Some(record) = runtime::load(id, &self.config.paths) {
                     if let Some(pid) = record.pid {
                         let fresh = crate::platform::host::process::alive(pid)
-                            && match (record.starttime, crate::platform::host::process::start_time(pid)) {
+                            && match (
+                                record.starttime,
+                                crate::platform::host::process::start_time(pid),
+                            ) {
                                 (Some(expected), Some(actual)) => expected == actual,
                                 _ => true,
                             };
@@ -904,15 +904,13 @@ impl Daemon {
                 self.rescan_if_changed();
             }
             if self.temp_cleanup_interval_ms > 0 && self.now_ms() >= self.next_temp_cleanup_ms {
-                self.next_temp_cleanup_ms = self
-                    .now_ms()
-                    .saturating_add(self.temp_cleanup_interval_ms);
+                self.next_temp_cleanup_ms =
+                    self.now_ms().saturating_add(self.temp_cleanup_interval_ms);
                 match crate::blob::cleanup(&self.config.paths, self.temp_retention) {
                     Ok(0) => {}
-                    Ok(removed) => log::svcd(&format!(
-                        "svcd: temp cleanup removed {} file(s)",
-                        removed
-                    )),
+                    Ok(removed) => {
+                        log::svcd(&format!("svcd: temp cleanup removed {} file(s)", removed))
+                    }
                     Err(error) => log::svcd(&format!("svcd: temp cleanup failed: {}", error)),
                 }
             }
@@ -1098,9 +1096,10 @@ impl Daemon {
                 "password must not be empty",
             ));
         }
-        let path = settings::path().ok_or_else(|| {
-            ProblemError::new(Problem::Internal, "svcd.conf path is unavailable")
-        })?;
+        let path =
+            self.config.settings_path.as_deref().ok_or_else(|| {
+                ProblemError::new(Problem::Internal, "svcd.conf path is unavailable")
+            })?;
         let hash = crate::auth::hash_password(password)
             .map_err(|detail| ProblemError::new(Problem::Internal, detail))?;
         settings::update_value(path, "auth_passwd", &hash)
@@ -1188,8 +1187,8 @@ impl Daemon {
             .and_then(Value::as_u64)
             .map(|value| value.min(usize::MAX as u64) as usize);
         let version = self.catalog_version;
-        let page = catalog::page(self.tool_list_cached(), version, cursor, limit)
-            .map_err(|error| {
+        let page =
+            catalog::page(self.tool_list_cached(), version, cursor, limit).map_err(|error| {
                 let problem = match error {
                     crate::catalog::PageError::InvalidCursor => Problem::Invalid,
                     // Both today fall through to 500; keep that projection.
@@ -1241,7 +1240,9 @@ impl Daemon {
         let start_id = name.strip_suffix(".start").filter(|service_id| {
             self.registry
                 .get(service_id)
-                .map(|service| service.kind == Kind::Plugin || !service.contract.surface().is_empty())
+                .map(|service| {
+                    service.kind == Kind::Plugin || !service.contract.surface().is_empty()
+                })
                 .unwrap_or(false)
         });
         if let Some(service_id) = start_id {
@@ -1300,11 +1301,8 @@ impl Daemon {
                 Value::Number(token) => Some(ProgressToken::new(token.to_string())),
                 _ => None,
             });
-        let mut invocation = Invocation::new(
-            capability,
-            arguments,
-            crate::limits::current().default_timeout,
-        );
+        let mut invocation =
+            Invocation::new(capability, arguments, self.config.limits.default_timeout);
         invocation.progress = progress_token;
 
         if let Some(spec) = builtin {
@@ -1432,7 +1430,8 @@ impl Daemon {
     /// definitions that disappeared are stopped and forgotten. Shared by
     /// `svc reload`, the periodic rescan, and boot recovery.
     fn reconcile_definitions(&mut self) -> Result<Value, ProblemError> {
-        let loaded = definition::load_services(&self.config.paths.services_dir);
+        let loaded =
+            definition::load_services(&self.config.paths.services_dir, &self.config.limits);
         for issue in &loaded.issues {
             log::svcd(&format!("svcd: reload: warning: {}", issue));
         }
@@ -1442,7 +1441,7 @@ impl Daemon {
             .cloned()
             .map(|service| (service.id.clone(), service))
             .collect();
-        let (plugins, warnings) = plugin::scan(&self.config.paths);
+        let (plugins, warnings) = plugin::scan(&self.config.paths, &self.config.limits);
         for warning in warnings {
             log::svcd(&format!("svcd: reload: plugin: {}", warning));
         }
@@ -1529,15 +1528,21 @@ impl Daemon {
                     let plugin_only = service.kind == Kind::Plugin;
                     let remain_after_exit = service.remain_after_exit;
                     if let Some(exec) = exec {
-                        let mut slot =
-                            Slot::new(id.clone(), exec, lifecycle, restart, self.config.paths.clone());
+                        let mut slot = Slot::new(
+                            id.clone(),
+                            exec,
+                            lifecycle,
+                            restart,
+                            self.config.paths.clone(),
+                            self.config.limits.clone(),
+                        );
                         slot.set_protocol(protocol);
                         slot.set_protocol_only(plugin_only);
                         slot.set_remain_after_exit(remain_after_exit);
                         slot.set_wake(self.wake.clone());
                         slot.set_stdio(self.stdio.clone());
                         slot.set_raw_hub(Some(self.raw_hub.clone()));
-                        configure_slot(&mut slot, &service);
+                        configure_slot(&mut slot, &service, &self.config.limits);
                         self.slots.insert(id.clone(), slot);
                     }
                     // A rejected service must not leave a slot with no registry
@@ -1742,9 +1747,7 @@ impl Daemon {
             .params
             .get("path")
             .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ProblemError::new(Problem::Internal, "plugin.install requires path")
-            })?;
+            .ok_or_else(|| ProblemError::new(Problem::Internal, "plugin.install requires path"))?;
         let strategy = match Strategy::parse(
             request
                 .params
@@ -1773,7 +1776,7 @@ impl Daemon {
         let verified = plugin::verify(
             &self.config.paths,
             Path::new(path),
-            settings::allow_insecure_install(),
+            self.config.settings.allow_insecure_install,
             allow_hooks,
         )?;
         let plugin::Verified {
@@ -1803,6 +1806,7 @@ impl Daemon {
         let still_running = running(&self.slots);
         let service = match plugin::install_package(
             &self.config.paths,
+            &self.config.limits,
             &package,
             strategy,
             allow_hooks,
@@ -1825,6 +1829,7 @@ impl Daemon {
                 ));
                 plugin::install_package(
                     &self.config.paths,
+                    &self.config.limits,
                     &package,
                     Strategy::Replace,
                     allow_hooks,
@@ -1852,6 +1857,7 @@ impl Daemon {
                     service.lifecycle.clone(),
                     service.restart,
                     self.config.paths.clone(),
+                    self.config.limits.clone(),
                 );
                 slot.set_protocol(service.protocol);
                 slot.set_protocol_only(true);
@@ -1864,7 +1870,7 @@ impl Daemon {
                 // gives it. Without this the plugin answers calls but its
                 // notifications never reach the UI bus, and default_timeout is
                 // not applied to its calls.
-                configure_slot(&mut slot, &service);
+                configure_slot(&mut slot, &service, &self.config.limits);
                 self.slots.insert(id.clone(), slot);
             }
         }
@@ -1927,9 +1933,14 @@ impl Daemon {
                 format!("staging path {}: {}", path, error),
             )
         })?;
-        let plugins = self.config.paths.plugins_dir.canonicalize().map_err(|error| {
-            ProblemError::new(Problem::Internal, format!("plugins dir: {}", error))
-        })?;
+        let plugins = self
+            .config
+            .paths
+            .plugins_dir
+            .canonicalize()
+            .map_err(|error| {
+                ProblemError::new(Problem::Internal, format!("plugins dir: {}", error))
+            })?;
         if !staging.starts_with(&plugins)
             || !staging
                 .file_name()
@@ -1944,7 +1955,7 @@ impl Daemon {
 
         let staged = package::load_staged(
             &staging,
-            settings::allow_insecure_install(),
+            self.config.settings.allow_insecure_install,
             &self.config.paths.trust_dir,
         )?;
         let id = staged.manifest.name.clone();
@@ -1973,8 +1984,7 @@ impl Daemon {
                 ));
             }
         }
-        let host_interpreter =
-            plugin::prepare_staged(&staged, allow_hooks)?;
+        let host_interpreter = plugin::prepare_staged(&staged, allow_hooks)?;
         let signature_verified = staged.signature_verified;
 
         let running = |slots: &BTreeMap<String, Slot>| {
@@ -1989,6 +1999,7 @@ impl Daemon {
         let still_running = running(&self.slots);
         let service = plugin::install_staged(
             &self.config.paths,
+            &self.config.limits,
             staged,
             strategy,
             allow_hooks,
@@ -2009,6 +2020,7 @@ impl Daemon {
                     service.lifecycle.clone(),
                     service.restart,
                     self.config.paths.clone(),
+                    self.config.limits.clone(),
                 );
                 slot.set_protocol(service.protocol);
                 slot.set_protocol_only(true);
@@ -2021,7 +2033,7 @@ impl Daemon {
                 // gives it. Without this the plugin answers calls but its
                 // notifications never reach the UI bus, and default_timeout is
                 // not applied to its calls.
-                configure_slot(&mut slot, &service);
+                configure_slot(&mut slot, &service, &self.config.limits);
                 self.slots.insert(id.clone(), slot);
             }
         }
@@ -2054,9 +2066,7 @@ impl Daemon {
             .params
             .get("id")
             .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ProblemError::new(Problem::Internal, "plugin.uninstall requires id")
-            })?;
+            .ok_or_else(|| ProblemError::new(Problem::Internal, "plugin.uninstall requires id"))?;
         let purge = request
             .params
             .get("purge")
@@ -2079,7 +2089,7 @@ impl Daemon {
         if running {
             self.stop_service(id)?;
         }
-        plugin::uninstall(&self.config.paths, id, purge)?;
+        plugin::uninstall(&self.config.paths, &self.config.limits, id, purge)?;
         self.slots.remove(id);
         self.registry.remove(id);
         runtime::remove(id, &self.config.paths);
@@ -2115,9 +2125,15 @@ impl Daemon {
                 ProblemError::new(Problem::UnknownService, format!("unknown service: {}", id))
             })?;
         let (marker, create) = match kind {
-            Kind::Plugin => (plugin::plugin_dir(&self.config.paths, id).join("enabled"), enabled),
+            Kind::Plugin => (
+                plugin::plugin_dir(&self.config.paths, id).join("enabled"),
+                enabled,
+            ),
             Kind::Core => (
-                self.config.paths.services_dir.join(format!("{}.disabled", id)),
+                self.config
+                    .paths
+                    .services_dir
+                    .join(format!("{}.disabled", id)),
                 !enabled,
             ),
         };
@@ -2429,9 +2445,9 @@ fn project_builtin_outcome(external_id: Option<Value>, outcome: Result<Value, Fa
 
 /// Give a slot its contract and the face-side projections. The slot itself no
 /// longer knows MCP or the UI bus.
-fn configure_slot(slot: &mut Slot, service: &Service) {
+fn configure_slot(slot: &mut Slot, service: &Service, limits: &crate::limits::Limits) {
     slot.set_contract(service.contract.clone());
-    slot.set_call_timeout(crate::limits::current().default_timeout);
+    slot.set_call_timeout(limits.default_timeout);
     slot.set_projector(Arc::new(project_slot_outcome));
     let id = service.id.clone();
     slot.set_notifier(Arc::new(move |method, params| {
@@ -2456,12 +2472,7 @@ fn unknown_tool(id: &Option<Value>, name: &str) -> rpc::Response {
 /// becomes the `probe` text (capped), and a non-zero exit only appends the
 /// status word. Capture goes through a temp file so a hook that leaves a child
 /// holding stdout cannot block the daemon's event loop.
-fn run_status_hook(
-    id: &str,
-    hook: &Hook,
-    paths: &Paths,
-    poll: &mut dyn FnMut(),
-) -> String {
+fn run_status_hook(id: &str, hook: &Hook, paths: &Paths, poll: &mut dyn FnMut()) -> String {
     let output_path = status_output_path(id, paths);
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -2566,7 +2577,6 @@ fn status_detail(output: &str, status: Option<std::process::ExitStatus>) -> Stri
     }
 }
 
-
 fn param_id(request: &rpc::Request) -> Result<String, rpc::Response> {
     request
         .params
@@ -2650,13 +2660,10 @@ fn missing_dependencies(registry: &Registry, id: &str) -> Vec<String> {
     walk_dependencies(registry, &[id.to_string()]).1
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::contract::{
-        Capability as KernelCapability, CapabilityName, Effect,
-    };
+    use crate::kernel::contract::{Capability as KernelCapability, CapabilityName, Effect};
     use crate::registry::{Exec, Kind, Ready, Service};
 
     fn capability(name: &str) -> KernelCapability {
@@ -2678,6 +2685,7 @@ mod tests {
                 "1.0.0",
                 caps,
                 crate::registry::Carrier::Slot,
+                &crate::limits::test_default(),
             ),
             ..service(id, &[])
         }
@@ -2689,6 +2697,7 @@ mod tests {
             "1.0.0",
             Vec::new(),
             crate::registry::Carrier::Slot,
+            &crate::limits::test_default(),
         );
         Service {
             id: id.into(),
@@ -2734,7 +2743,11 @@ mod tests {
     #[test]
     fn the_daemon_does_not_spawn_call_worker_threads() {
         let (_sender, receiver) = mpsc::channel();
-        let _daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+        let _daemon = Daemon::new(
+            Registry::with_builtin(&crate::limits::test_default()),
+            receiver,
+            None,
+        );
         let names: Vec<String> = std::fs::read_dir("/proc/self/task")
             .expect("task dir")
             .filter_map(|entry| {
@@ -2917,6 +2930,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             "1.0.0",
             caps,
             crate::registry::Carrier::Slot,
+            &crate::limits::test_default(),
         );
         Service {
             id: id.into(),
@@ -2995,7 +3009,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
     #[test]
     fn the_read_endpoint_cannot_run_a_write_method() {
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+        let mut daemon = Daemon::new(
+            Registry::with_builtin(&crate::limits::test_default()),
+            receiver,
+            None,
+        );
 
         let refused = send_on(
             &mut daemon,
@@ -3012,12 +3030,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             "the unauthorized gate is a control-plane failure: {refused}"
         );
 
-        let allowed = send_on(
-            &mut daemon,
-            channel::Endpoint::User,
-            "svc.list",
-            json!({}),
-        );
+        let allowed = send_on(&mut daemon, channel::Endpoint::User, "svc.list", json!({}));
         assert!(
             allowed.get("error").is_none(),
             "the read endpoint must still list services: {allowed}"
@@ -3029,7 +3042,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
     #[test]
     fn the_admin_endpoint_reaches_a_write_method() {
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+        let mut daemon = Daemon::new(
+            Registry::with_builtin(&crate::limits::test_default()),
+            receiver,
+            None,
+        );
 
         let response = send_on(
             &mut daemon,
@@ -3090,8 +3107,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root =
-            crate::test_support::temp_dir().join(format!("svcd-tools-unit-{}-{}", std::process::id(), nanos));
+        let root = crate::test_support::temp_dir().join(format!(
+            "svcd-tools-unit-{}-{}",
+            std::process::id(),
+            nanos
+        ));
         std::fs::create_dir_all(root.join("logs")).expect("logs");
 
         let plugin = tool_service(
@@ -3137,8 +3157,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root =
-            crate::test_support::temp_dir().join(format!("svcd-tools-unit-{}-{}", std::process::id(), nanos));
+        let root = crate::test_support::temp_dir().join(format!(
+            "svcd-tools-unit-{}-{}",
+            std::process::id(),
+            nanos
+        ));
         std::fs::create_dir_all(root.join("logs")).expect("logs");
 
         let core = tool_service("core", Kind::Core, &["echo"], &root);
@@ -3175,8 +3198,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root =
-            crate::test_support::temp_dir().join(format!("svcd-tools-unit-{}-{}", std::process::id(), nanos));
+        let root = crate::test_support::temp_dir().join(format!(
+            "svcd-tools-unit-{}-{}",
+            std::process::id(),
+            nanos
+        ));
         std::fs::create_dir_all(root.join("logs")).expect("logs");
 
         let service = tool_service("proc", Kind::Core, &["progress", "fail"], &root);
@@ -3267,6 +3293,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
                     "1.0.0",
                     caps,
                     crate::registry::Carrier::Slot,
+                    &crate::limits::test_default(),
                 );
                 service
             })
@@ -3441,11 +3468,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
     #[test]
     fn a_reload_rejects_two_owners_and_leaves_the_live_service_and_slot_alone() {
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(
-            registry(vec![service("live", &[])]),
-            receiver,
-            None,
-        );
+        let mut daemon = Daemon::new(registry(vec![service("live", &[])]), receiver, None);
 
         let mut desired = BTreeMap::new();
         desired.insert("bad".to_string(), two_owners("bad"));
@@ -3456,6 +3479,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             "9.9.9",
             conflicting_live.contract.surface().to_vec(),
             crate::registry::Carrier::Launcher,
+            &crate::limits::test_default(),
         );
         desired.insert("live".to_string(), conflicting_live);
 
@@ -3488,7 +3512,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
 
     #[test]
     fn the_assembly_point_keeps_one_carrier_per_service() {
-        let mut registry = Registry::with_builtin();
+        let mut registry = Registry::with_builtin(&crate::limits::test_default());
         registry.insert(service("core", &[])).expect("core");
         let (_sender, receiver) = mpsc::channel();
         let daemon = Daemon::new(registry, receiver, None);
@@ -3514,7 +3538,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
     #[test]
     fn the_builtin_svc_is_projected_and_called_through_launchers() {
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+        let mut daemon = Daemon::new(
+            Registry::with_builtin(&crate::limits::test_default()),
+            receiver,
+            None,
+        );
 
         let listed = send(&mut daemon, "tools/list", json!({}));
         let listed = wait(&mut daemon, &listed);
@@ -3593,7 +3621,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
     #[test]
     fn lifecycle_management_errors_carry_their_problem_kind() {
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+        let mut daemon = Daemon::new(
+            Registry::with_builtin(&crate::limits::test_default()),
+            receiver,
+            None,
+        );
 
         let started = send_on(
             &mut daemon,
@@ -3647,7 +3679,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
     #[test]
     fn plugin_management_errors_carry_their_problem_kind() {
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+        let mut daemon = Daemon::new(
+            Registry::with_builtin(&crate::limits::test_default()),
+            receiver,
+            None,
+        );
 
         let missing_path = send_on(
             &mut daemon,
@@ -3693,7 +3729,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
     #[test]
     fn auth_and_parameter_errors_carry_their_problem_kind() {
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+        let mut daemon = Daemon::new(
+            Registry::with_builtin(&crate::limits::test_default()),
+            receiver,
+            None,
+        );
 
         let auth = send_on(
             &mut daemon,
@@ -3767,7 +3807,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
     #[test]
     fn installing_a_package_named_after_a_core_service_reports_core_service() {
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+        let mut daemon = Daemon::new(
+            Registry::with_builtin(&crate::limits::test_default()),
+            receiver,
+            None,
+        );
         let dir = package::tempdir::TempDir::new();
         let path = dir.path().join("svc.spk");
         std::fs::write(
@@ -3788,7 +3832,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
     #[test]
     fn installing_a_package_for_another_platform_reports_unsupported_platform() {
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+        let mut daemon = Daemon::new(
+            Registry::with_builtin(&crate::limits::test_default()),
+            receiver,
+            None,
+        );
         let dir = package::tempdir::TempDir::new();
         let path = dir.path().join("other.spk");
         std::fs::write(&path, package::test_signed_package("other", "other-triple"))

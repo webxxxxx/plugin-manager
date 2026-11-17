@@ -43,13 +43,9 @@ impl ApiFace {
         ApiFace { config, lan }
     }
 
-    fn rpc(
-        &self,
-        budget: &CallBudget,
-        method: &str,
-        params: Value,
-    ) -> Result<Value, Response> {
-        support::rpc_result(&self.config.paths.config_dir, method, params, budget).map_err(rpc_error)
+    fn rpc(&self, budget: &CallBudget, method: &str, params: Value) -> Result<Value, Response> {
+        support::rpc_result(&self.config.paths.config_dir, method, params, budget)
+            .map_err(rpc_error)
     }
 
     fn require_plugin(&self, budget: &CallBudget, id: &str) -> Result<(), Response> {
@@ -64,7 +60,12 @@ impl ApiFace {
                 let services: Vec<Value> = value
                     .get("services")
                     .and_then(Value::as_array)
-                    .map(|services| services.iter().filter_map(|service| project_service(service, &self.config.paths)).collect())
+                    .map(|services| {
+                        services
+                            .iter()
+                            .filter_map(|service| project_service(service, &self.config.paths))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 Response::json(200, &json!({ "services": services }))
             }
@@ -108,7 +109,11 @@ impl ApiFace {
     }
 
     fn uninstall_plugin(&self, budget: &CallBudget, id: &str, purge: bool) -> Response {
-        match self.rpc(budget, "plugin.uninstall", json!({ "id": id, "purge": purge })) {
+        match self.rpc(
+            budget,
+            "plugin.uninstall",
+            json!({ "id": id, "purge": purge }),
+        ) {
             Ok(_) => Response::json(200, &json!({ "ok": true })),
             Err(response) => response,
         }
@@ -240,7 +245,11 @@ impl ApiFace {
         };
         let path = self.config.paths.logs_dir.join(format!("{}.log", id));
         match log::tail(&path, lines) {
-            Ok(text) => Response::new(200, "text/plain; charset=utf-8", cap_log(text).into_bytes()),
+            Ok(text) => Response::new(
+                200,
+                "text/plain; charset=utf-8",
+                cap_log(text, self.config.limits.log_max_bytes).into_bytes(),
+            ),
             Err(cause) if cause.kind() == io::ErrorKind::NotFound => {
                 error_response(404, "not_found", &format!("no log for {}", id))
             }
@@ -305,7 +314,12 @@ impl ApiFace {
         match (request.method.as_str(), parts.as_slice()) {
             ("GET", ["api", "v1", "compat"]) => Response::json(
                 200,
-                &serde_json::to_value(crate::compat::detect(&self.config.paths, MAX_SCHEMA, MAX_PROTOCOL)).unwrap_or(Value::Null),
+                &serde_json::to_value(crate::compat::detect(
+                    &self.config.paths,
+                    MAX_SCHEMA,
+                    MAX_PROTOCOL,
+                ))
+                .unwrap_or(Value::Null),
             ),
             ("GET", ["api", "v1", "auth"]) => match self.lan.lock() {
                 Ok(state) => Response::json(
@@ -347,14 +361,18 @@ impl ApiFace {
                 let purge = support::query_bool(query, "purge").unwrap_or(false);
                 self.uninstall_plugin(&budget, &decode(id), purge)
             }
-            ("POST", ["api", "v1", "config", id, "reset"]) => self.reset_config(&budget, &decode(id)),
+            ("POST", ["api", "v1", "config", id, "reset"]) => {
+                self.reset_config(&budget, &decode(id))
+            }
             (_, ["api", "v1", "config", _, "reset"]) => method_not_allowed("POST"),
             ("GET", ["api", "v1", "config", id]) => self.get_config(&budget, &decode(id)),
             ("PUT", ["api", "v1", "config", id]) => {
                 self.put_config(&budget, &decode(id), &request.body)
             }
             (_, ["api", "v1", "config", _]) => method_not_allowed("GET, PUT"),
-            ("GET", ["api", "v1", "export", id, "config"]) => self.export_config(&budget, &decode(id)),
+            ("GET", ["api", "v1", "export", id, "config"]) => {
+                self.export_config(&budget, &decode(id))
+            }
             (_, ["api", "v1", "export", _, "config"]) => method_not_allowed("GET"),
             (_, ["api", "v1", "export", _, "spk"]) => method_not_allowed("GET"),
             (_, ["api", "v1", "export", _]) => method_not_allowed("GET"),
@@ -418,8 +436,7 @@ fn is_transfer_path(method: &str, path: &str) -> bool {
     }
 }
 
-fn body_policy(method: &str, path: &str) -> BodyPolicy {
-    let limits = crate::limits::current();
+fn body_policy(method: &str, path: &str, limits: &crate::limits::Limits) -> BodyPolicy {
     if is_login(method, path) {
         return BodyPolicy::Buffered {
             limit: limits.max_json_body,
@@ -460,11 +477,11 @@ fn decode(value: &str) -> String {
     http::percent_decode(value, true)
 }
 
-fn cap_log(mut text: String) -> String {
-    if text.len() <= crate::limits::current().log_max_bytes as usize {
+fn cap_log(mut text: String, log_max_bytes: u64) -> String {
+    if text.len() <= log_max_bytes as usize {
         return text;
     }
-    let mut start = text.len() - crate::limits::current().log_max_bytes as usize;
+    let mut start = text.len() - log_max_bytes as usize;
     while start < text.len() && !text.is_char_boundary(start) {
         start += 1;
     }
@@ -567,7 +584,7 @@ impl Face for ApiFace {
             // handler: the route must say so, or the dispatch check rejects it.
             return Some(Route::inline(BodyPolicy::Streamed));
         }
-        let body = body_policy(method, path);
+        let body = body_policy(method, path, &self.config.limits);
         if is_login(method, path) || is_logout(method, path) || is_console(path) {
             return Some(route_with(body, dispatch_for(method, path)).public());
         }
@@ -579,7 +596,10 @@ impl Face for ApiFace {
 
     fn handle(&self, request: Request, done: Completion) {
         if let Some(target) = export::export_target(&request.method, &request.path) {
-            done.complete(Exchange::Stream(Box::new(export::ExportStream::open(target, self.config.paths.clone()))));
+            done.complete(Exchange::Stream(Box::new(export::ExportStream::open(
+                target,
+                self.config.paths.clone(),
+            ))));
             return;
         }
         if let Some(target) = blob::download_target(&request.method, &request.path) {
@@ -637,8 +657,11 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = crate::test_support::temp_dir()
-            .join(format!("svcd-face-unit-{}-{}", std::process::id(), nanos));
+        let root = crate::test_support::temp_dir().join(format!(
+            "svcd-face-unit-{}-{}",
+            std::process::id(),
+            nanos
+        ));
         Arc::new(Config::with_paths(
             crate::settings::Settings::default(),
             None,

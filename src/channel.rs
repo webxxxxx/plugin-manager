@@ -110,6 +110,7 @@ pub(crate) trait ControlChannel {
         admin: Self::Listener,
         pending: SyncSender<PendingCall>,
         wake: Arc<Wake>,
+        io_stack: usize,
     ) -> io::Result<Self::Server>;
 
     /// Connect a client to the endpoint its method belongs to.
@@ -150,21 +151,9 @@ impl Endpoint {
     /// admin. Unknown methods fail closed onto the admin endpoint.
     pub fn for_method(method: &str) -> Endpoint {
         match method {
-            "svcd.ping"
-            | "svcd.compat"
-            | "svcd.reload"
-            | "registry.tools"
-            | "tools/list"
-            | "registry.version"
-            | "registry.call"
-            | "tools/call"
-            | "svc.list"
-            | "services"
-            | "svc.status"
-            | "svc.start"
-            | "svc.stop"
-            | "svc.restart"
-            | "svc.reload"
+            "svcd.ping" | "svcd.compat" | "svcd.reload" | "registry.tools" | "tools/list"
+            | "registry.version" | "registry.call" | "tools/call" | "svc.list" | "services"
+            | "svc.status" | "svc.start" | "svc.stop" | "svc.restart" | "svc.reload"
             | "auth.status" => Endpoint::User,
             _ => Endpoint::Admin,
         }
@@ -178,6 +167,7 @@ pub fn bind_server(
     config: &Path,
     pending: SyncSender<PendingCall>,
     wake: Arc<Wake>,
+    io_stack: usize,
 ) -> io::Result<ControlBinding> {
     let user = Platform::bind(config, Endpoint::User)?;
     let admin = match Platform::bind(config, Endpoint::Admin) {
@@ -187,7 +177,7 @@ pub fn bind_server(
             return Err(error);
         }
     };
-    Platform::into_server(user, admin, pending, wake)
+    Platform::into_server(user, admin, pending, wake, io_stack)
 }
 
 const POOL_MAX: usize = 8;
@@ -262,7 +252,11 @@ where
     let mut reader = ipc::FrameReader::new(BufReader::new(PollReader { stream, polling }));
     let bound = idle.map(ReadBound::Idle).unwrap_or(ReadBound::Unbounded);
     let response = read_response(&mut reader, bound, cancelled, on_notification)?;
-    release(config, endpoint, reader.into_inner().into_inner().into_inner());
+    release(
+        config,
+        endpoint,
+        reader.into_inner().into_inner().into_inner(),
+    );
     Ok(response)
 }
 
@@ -467,7 +461,11 @@ pub fn request_within<C: Fn() -> bool>(
         cancelled,
         |_| {},
     )?;
-    release(config, endpoint, reader.into_inner().into_inner().into_inner());
+    release(
+        config,
+        endpoint,
+        reader.into_inner().into_inner().into_inner(),
+    );
     Ok(response)
 }
 
@@ -483,8 +481,8 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
     use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     type Listener = <Platform as ControlChannel>::Listener;
 

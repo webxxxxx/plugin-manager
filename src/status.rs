@@ -250,6 +250,7 @@ mod tests {
                 "1.2.3",
                 Vec::new(),
                 crate::registry::Carrier::Slot,
+                &crate::limits::test_default(),
             ),
             impl_ref: None,
             exec: Some(crate::registry::Exec {

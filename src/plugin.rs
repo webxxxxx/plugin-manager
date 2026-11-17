@@ -11,11 +11,11 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::compat;
+use crate::hook;
+use crate::interpreter;
 use crate::kernel::contract::{Capability as KernelCapability, CapabilityName, Effect};
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
-use crate::hook;
-use crate::interpreter;
 use crate::log;
 use crate::package::{self, Package};
 use crate::paths::Paths;
@@ -182,6 +182,7 @@ pub fn prepare_staged(
 /// must stop the running version before calling this for `Replace`.
 pub fn install_staged(
     paths: &Paths,
+    limits: &crate::limits::Limits,
     staged: package::StagedPackage,
     strategy: Strategy,
     opt_in_hooks: bool,
@@ -196,23 +197,30 @@ pub fn install_staged(
     }
     ensure_hooks_allowed_manifest(&staged.manifest, opt_in_hooks)?;
     if paths.services_dir.join(format!("{}.json", id)).exists() {
-        return Err(Problem::Conflict.error(format!("plugin id conflicts with a core service: {}", id)));
+        return Err(
+            Problem::Conflict.error(format!("plugin id conflicts with a core service: {}", id))
+        );
     }
 
     let plugin_dir = plugin_dir(paths, &id);
     let was_installed = current_version(paths, &id).is_some();
-    fs::create_dir_all(&plugin_dir)
-        .map_err(|error| Problem::Internal.error(format!("create {}: {}", plugin_dir.display(), error)))?;
+    fs::create_dir_all(&plugin_dir).map_err(|error| {
+        Problem::Internal.error(format!("create {}: {}", plugin_dir.display(), error))
+    })?;
 
     match strategy {
-        Strategy::KeepOld => install_keep_old_staged(paths, 
+        Strategy::KeepOld => install_keep_old_staged(
+            paths,
+            limits,
             staged,
             &id,
             &plugin_dir,
             was_installed,
             host_interpreter.as_ref(),
         ),
-        Strategy::Replace => install_replace_staged(paths, 
+        Strategy::Replace => install_replace_staged(
+            paths,
+            limits,
             staged,
             &id,
             &plugin_dir,
@@ -224,6 +232,7 @@ pub fn install_staged(
 
 fn install_keep_old_staged(
     paths: &Paths,
+    limits: &crate::limits::Limits,
     staged: package::StagedPackage,
     id: &str,
     plugin_dir: &Path,
@@ -233,13 +242,22 @@ fn install_keep_old_staged(
     let manifest = staged.manifest.clone();
     let (version_dir, enabled) = commit_staged(staged, plugin_dir, was_installed)?;
     copy_config_staged(&manifest, plugin_dir, &version_dir)?;
-    let service = service_from_manifest(paths, id, &version_dir, &manifest, enabled, interpreter)?;
-    run_post_install_manifest(paths, &manifest, id, &version_dir)?;
+    let service = service_from_manifest(
+        paths,
+        limits,
+        id,
+        &version_dir,
+        &manifest,
+        enabled,
+        interpreter,
+    )?;
+    run_post_install_manifest(paths, limits, &manifest, id, &version_dir)?;
     Ok(service)
 }
 
 fn install_replace_staged(
     paths: &Paths,
+    limits: &crate::limits::Limits,
     staged: package::StagedPackage,
     id: &str,
     plugin_dir: &Path,
@@ -247,25 +265,36 @@ fn install_replace_staged(
     interpreter: Option<&Interpreter>,
 ) -> Result<Service, ProblemError> {
     let manifest = staged.manifest.clone();
-    let old_version = current_version(paths, id).filter(|version| plugin_dir.join(version).is_dir());
+    let old_version =
+        current_version(paths, id).filter(|version| plugin_dir.join(version).is_dir());
     let old_dir = old_version.as_ref().map(|version| plugin_dir.join(version));
     let backup = old_version
         .as_ref()
         .map(|version| plugin_dir.join(format!(".backup-{}.{}", version, std::process::id())));
     if let (Some(old_dir), Some(backup)) = (&old_dir, &backup) {
         if backup.exists() {
-            fs::remove_dir_all(backup)
-                .map_err(|error| Problem::Internal.error(format!("remove {}: {}", backup.display(), error)))?;
+            fs::remove_dir_all(backup).map_err(|error| {
+                Problem::Internal.error(format!("remove {}: {}", backup.display(), error))
+            })?;
         }
-        fs::rename(old_dir, backup)
-            .map_err(|error| Problem::Invalid.error(format!("backup {}: {}", old_dir.display(), error)))?;
+        fs::rename(old_dir, backup).map_err(|error| {
+            Problem::Invalid.error(format!("backup {}: {}", old_dir.display(), error))
+        })?;
     }
     let enabled_existed = plugin_dir.join("enabled").exists();
     let result = (|| {
         let (version_dir, enabled) = commit_staged(staged, plugin_dir, was_installed)?;
         copy_config_staged(&manifest, plugin_dir, &version_dir)?;
-        let service = service_from_manifest(paths, id, &version_dir, &manifest, enabled, interpreter)?;
-        run_post_install_manifest(paths, &manifest, id, &version_dir)?;
+        let service = service_from_manifest(
+            paths,
+            limits,
+            id,
+            &version_dir,
+            &manifest,
+            enabled,
+            interpreter,
+        )?;
+        run_post_install_manifest(paths, limits, &manifest, id, &version_dir)?;
         Ok(service)
     })();
     match result {
@@ -308,8 +337,9 @@ fn commit_staged(
     }
     let version_dir = plugin_dir.join(&staged.manifest.version);
     if version_dir.exists() {
-        fs::remove_dir_all(&version_dir)
-            .map_err(|error| Problem::Internal.error(format!("remove {}: {}", version_dir.display(), error)))?;
+        fs::remove_dir_all(&version_dir).map_err(|error| {
+            Problem::Internal.error(format!("remove {}: {}", version_dir.display(), error))
+        })?;
     }
     fs::rename(&staged.root, &version_dir).map_err(|error| {
         Problem::Internal.error(format!(
@@ -368,6 +398,7 @@ fn copy_config_staged(
 
 fn run_post_install_manifest(
     paths: &Paths,
+    limits: &crate::limits::Limits,
     manifest: &package::Manifest,
     id: &str,
     version_dir: &Path,
@@ -389,6 +420,7 @@ fn run_post_install_manifest(
             timeout_ms: hook::TIMEOUT_MS,
         },
         paths,
+        limits,
         &mut hook::poll_this_loop,
     )
     .map_err(|error| {
@@ -436,8 +468,9 @@ pub fn staging_dir(paths: &Paths, id: &str) -> Result<PathBuf, ProblemError> {
         return Err(Problem::Invalid.error(format!("invalid plugin id: {}", id)));
     }
     let directory = plugin_dir(paths, id);
-    fs::create_dir_all(&directory)
-        .map_err(|error| Problem::Internal.error(format!("create {}: {}", directory.display(), error)))?;
+    fs::create_dir_all(&directory).map_err(|error| {
+        Problem::Internal.error(format!("create {}: {}", directory.display(), error))
+    })?;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -474,6 +507,7 @@ impl From<ProblemError> for InstallFailure {
 
 pub fn install_package(
     paths: &Paths,
+    limits: &crate::limits::Limits,
     package: &Package,
     strategy: Strategy,
     opt_in_hooks: bool,
@@ -481,31 +515,36 @@ pub fn install_package(
 ) -> Result<Service, InstallFailure> {
     let id = package.manifest.name.clone();
     if id == RESERVED_ID {
-        return Err(Problem::Conflict.error("the built-in svc id is reserved").into());
+        return Err(Problem::Conflict
+            .error("the built-in svc id is reserved")
+            .into());
     }
     ensure_hooks_allowed(package, opt_in_hooks)?;
     if paths.services_dir.join(format!("{}.json", id)).exists() {
-        return Err(
-            Problem::Conflict
-                .error(format!("plugin id conflicts with a core service: {}", id))
-                .into(),
-        );
+        return Err(Problem::Conflict
+            .error(format!("plugin id conflicts with a core service: {}", id))
+            .into());
     }
 
     let plugin_dir = plugin_dir(paths, &id);
     let was_installed = current_version(paths, &id).is_some();
-    fs::create_dir_all(&plugin_dir)
-        .map_err(|error| Problem::Internal.error(format!("create {}: {}", plugin_dir.display(), error)))?;
+    fs::create_dir_all(&plugin_dir).map_err(|error| {
+        Problem::Internal.error(format!("create {}: {}", plugin_dir.display(), error))
+    })?;
 
     match strategy {
-        Strategy::KeepOld => install_keep_old(paths, 
+        Strategy::KeepOld => install_keep_old(
+            paths,
+            limits,
             package,
             &id,
             &plugin_dir,
             was_installed,
             host_interpreter.as_ref(),
         ),
-        Strategy::Replace => install_replace(paths, 
+        Strategy::Replace => install_replace(
+            paths,
+            limits,
             package,
             &id,
             &plugin_dir,
@@ -518,6 +557,7 @@ pub fn install_package(
 
 fn install_keep_old(
     paths: &Paths,
+    limits: &crate::limits::Limits,
     package: &Package,
     id: &str,
     plugin_dir: &Path,
@@ -540,13 +580,22 @@ fn install_keep_old(
     }
     let (version_dir, enabled) = write_version(package, plugin_dir, was_installed)?;
     copy_config(package, plugin_dir)?;
-    let service = service_from_manifest(paths, id, &version_dir, &package.manifest, enabled, interpreter)?;
-    run_post_install(paths, package, id, &version_dir)?;
+    let service = service_from_manifest(
+        paths,
+        limits,
+        id,
+        &version_dir,
+        &package.manifest,
+        enabled,
+        interpreter,
+    )?;
+    run_post_install(paths, limits, package, id, &version_dir)?;
     Ok(service)
 }
 
 fn run_post_install(
     paths: &Paths,
+    limits: &crate::limits::Limits,
     package: &Package,
     id: &str,
     version_dir: &Path,
@@ -569,6 +618,7 @@ fn run_post_install(
             timeout_ms: hook::TIMEOUT_MS,
         },
         paths,
+        limits,
         &mut hook::poll_this_loop,
     )
     .map_err(|error| {
@@ -581,13 +631,15 @@ fn run_post_install(
 
 fn install_replace(
     paths: &Paths,
+    limits: &crate::limits::Limits,
     package: &Package,
     id: &str,
     plugin_dir: &Path,
     was_installed: bool,
     interpreter: Option<&Interpreter>,
 ) -> Result<Service, ProblemError> {
-    let old_version = current_version(paths, id).filter(|version| plugin_dir.join(version).is_dir());
+    let old_version =
+        current_version(paths, id).filter(|version| plugin_dir.join(version).is_dir());
     let old_dir = old_version.as_ref().map(|version| plugin_dir.join(version));
     let old_size = match &old_dir {
         Some(path) => Some(directory_size(path)?),
@@ -605,17 +657,20 @@ fn install_replace(
         let old_version = old_version.as_ref().expect("backup implies an old version");
         let backup = plugin_dir.join(format!(".backup-{}.{}", old_version, std::process::id()));
         if backup.exists() {
-            fs::remove_dir_all(&backup)
-                .map_err(|error| Problem::Internal.error(format!("remove {}: {}", backup.display(), error)))?;
+            fs::remove_dir_all(&backup).map_err(|error| {
+                Problem::Internal.error(format!("remove {}: {}", backup.display(), error))
+            })?;
         }
-        fs::rename(old_dir, &backup)
-            .map_err(|error| Problem::Invalid.error(format!("backup {}: {}", old_dir.display(), error)))?;
+        fs::rename(old_dir, &backup).map_err(|error| {
+            Problem::Invalid.error(format!("backup {}: {}", old_dir.display(), error))
+        })?;
         Some(backup)
     } else {
         if plan == ReplacePlan::Reclaim {
             if let Some(old_dir) = &old_dir {
-                fs::remove_dir_all(old_dir)
-                    .map_err(|error| Problem::Internal.error(format!("remove {}: {}", old_dir.display(), error)))?;
+                fs::remove_dir_all(old_dir).map_err(|error| {
+                    Problem::Internal.error(format!("remove {}: {}", old_dir.display(), error))
+                })?;
             }
             let _ = fs::remove_file(plugin_dir.join("current"));
         }
@@ -627,9 +682,16 @@ fn install_replace(
     let result =
         write_version(package, plugin_dir, was_installed).and_then(|(version_dir, enabled)| {
             copy_config(package, plugin_dir)?;
-            let service =
-                service_from_manifest(paths, id, &version_dir, &package.manifest, enabled, interpreter)?;
-            run_post_install(paths, package, id, &version_dir)?;
+            let service = service_from_manifest(
+                paths,
+                limits,
+                id,
+                &version_dir,
+                &package.manifest,
+                enabled,
+                interpreter,
+            )?;
+            run_post_install(paths, limits, package, id, &version_dir)?;
             Ok(service)
         });
 
@@ -715,8 +777,9 @@ fn write_version(
         std::process::id()
     ));
     if temp.exists() {
-        fs::remove_dir_all(&temp)
-            .map_err(|error| Problem::Internal.error(format!("remove {}: {}", temp.display(), error)))?;
+        fs::remove_dir_all(&temp).map_err(|error| {
+            Problem::Internal.error(format!("remove {}: {}", temp.display(), error))
+        })?;
     }
     if let Err(error) = package.write_to(&temp) {
         let _ = fs::remove_dir_all(&temp);
@@ -725,11 +788,13 @@ fn write_version(
 
     let version_dir = plugin_dir.join(&package.manifest.version);
     if version_dir.exists() {
-        fs::remove_dir_all(&version_dir)
-            .map_err(|error| Problem::Internal.error(format!("remove {}: {}", version_dir.display(), error)))?;
+        fs::remove_dir_all(&version_dir).map_err(|error| {
+            Problem::Internal.error(format!("remove {}: {}", version_dir.display(), error))
+        })?;
     }
-    fs::rename(&temp, &version_dir)
-        .map_err(|error| Problem::Internal.error(format!("rename {}: {}", version_dir.display(), error)))?;
+    fs::rename(&temp, &version_dir).map_err(|error| {
+        Problem::Internal.error(format!("rename {}: {}", version_dir.display(), error))
+    })?;
 
     write_current(plugin_dir, &package.manifest.version)?;
 
@@ -761,13 +826,15 @@ fn out_of_space(package: &Package, free: u64, old_size: Option<u64>) -> ProblemE
 
 fn directory_size(path: &Path) -> Result<u64, ProblemError> {
     let mut total = 0u64;
-    let entries =
-        fs::read_dir(path).map_err(|error| Problem::Internal.error(format!("read {}: {}", path.display(), error)))?;
+    let entries = fs::read_dir(path)
+        .map_err(|error| Problem::Internal.error(format!("read {}: {}", path.display(), error)))?;
     for entry in entries {
-        let entry = entry.map_err(|error| Problem::Internal.error(format!("read {}: {}", path.display(), error)))?;
-        let metadata = entry
-            .metadata()
-            .map_err(|error| Problem::Internal.error(format!("stat {}: {}", entry.path().display(), error)))?;
+        let entry = entry.map_err(|error| {
+            Problem::Internal.error(format!("read {}: {}", path.display(), error))
+        })?;
+        let metadata = entry.metadata().map_err(|error| {
+            Problem::Internal.error(format!("stat {}: {}", entry.path().display(), error))
+        })?;
         if metadata.is_dir() {
             total = total.saturating_add(directory_size(&entry.path())?);
         } else {
@@ -782,8 +849,9 @@ fn free_space(path: &Path) -> Result<u64, ProblemError> {
     {
         use std::os::unix::ffi::OsStrExt;
 
-        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| Problem::Internal.error(format!("free space: invalid path {}", path.display())))?;
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            Problem::Internal.error(format!("free space: invalid path {}", path.display()))
+        })?;
         let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
         if unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) } != 0 {
             return Err(Problem::Internal.error(format!(
@@ -860,18 +928,20 @@ impl ConfigSnapshot {
 fn restore_file(path: &Path, content: &Option<Vec<u8>>, config: bool) -> Result<(), ProblemError> {
     match content {
         Some(bytes) if config => write_config(path, bytes),
-        Some(bytes) => {
-            fs::write(path, bytes).map_err(|error| Problem::Internal.error(format!("write {}: {}", path.display(), error)))
-        }
+        Some(bytes) => fs::write(path, bytes).map_err(|error| {
+            Problem::Internal.error(format!("write {}: {}", path.display(), error))
+        }),
         None => match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(Problem::Internal.error(format!("remove {}: {}", path.display(), error))),
+            Err(error) => {
+                Err(Problem::Internal.error(format!("remove {}: {}", path.display(), error)))
+            }
         },
     }
 }
 
-pub fn scan(paths: &Paths) -> (Vec<Service>, Vec<String>) {
+pub fn scan(paths: &Paths, limits: &crate::limits::Limits) -> (Vec<Service>, Vec<String>) {
     let root = &paths.plugins_dir;
     let host = crate::compat::detect(paths, MAX_SCHEMA, MAX_PROTOCOL);
     let mut services = Vec::new();
@@ -915,7 +985,15 @@ pub fn scan(paths: &Paths) -> (Vec<Service>, Vec<String>) {
                 continue;
             }
         };
-        match service_from_manifest(paths, &id, &version_dir, &manifest, enabled, interpreter.as_ref()) {
+        match service_from_manifest(
+            paths,
+            limits,
+            &id,
+            &version_dir,
+            &manifest,
+            enabled,
+            interpreter.as_ref(),
+        ) {
             Ok(mut service) => {
                 let devices = service
                     .compat
@@ -964,7 +1042,12 @@ pub fn remove_logs(paths: &Paths, id: &str) {
     }
 }
 
-pub fn uninstall(paths: &Paths, id: &str, purge: bool) -> Result<(), ProblemError> {
+pub fn uninstall(
+    paths: &Paths,
+    limits: &crate::limits::Limits,
+    id: &str,
+    purge: bool,
+) -> Result<(), ProblemError> {
     if !package::valid_name(id) || id == RESERVED_ID {
         return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
     }
@@ -972,10 +1055,11 @@ pub fn uninstall(paths: &Paths, id: &str, purge: bool) -> Result<(), ProblemErro
     if !directory.is_dir() {
         return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
     }
-    run_pre_remove(paths, id);
+    run_pre_remove(paths, limits, id);
     if purge {
-        fs::remove_dir_all(&directory)
-            .map_err(|error| Problem::Internal.error(format!("remove {}: {}", directory.display(), error)))?;
+        fs::remove_dir_all(&directory).map_err(|error| {
+            Problem::Internal.error(format!("remove {}: {}", directory.display(), error))
+        })?;
         return Ok(());
     }
 
@@ -985,7 +1069,13 @@ pub fn uninstall(paths: &Paths, id: &str, purge: bool) -> Result<(), ProblemErro
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(Problem::Internal.error(format!("remove {}: {}", path.display(), error))),
+            Err(error) => {
+                return Err(Problem::Internal.error(format!(
+                    "remove {}: {}",
+                    path.display(),
+                    error
+                )))
+            }
         }
     }
     Ok(())
@@ -993,7 +1083,7 @@ pub fn uninstall(paths: &Paths, id: &str, purge: bool) -> Result<(), ProblemErro
 
 /// A failing pre-remove hook must not block uninstall; the spec only requires a
 /// log line so a broken package can still be removed.
-fn run_pre_remove(paths: &Paths, id: &str) {
+fn run_pre_remove(paths: &Paths, limits: &crate::limits::Limits, id: &str) {
     let Some(version) = current_version(paths, id) else {
         return;
     };
@@ -1025,6 +1115,7 @@ fn run_pre_remove(paths: &Paths, id: &str) {
             timeout_ms: hook::TIMEOUT_MS,
         },
         paths,
+        limits,
         &mut hook::poll_this_loop,
     );
     if let Err(error) = result {
@@ -1056,6 +1147,7 @@ pub fn current_version(paths: &Paths, id: &str) -> Option<String> {
 
 fn service_from_manifest(
     paths: &Paths,
+    limits: &crate::limits::Limits,
     id: &str,
     version_dir: &Path,
     manifest: &package::Manifest,
@@ -1084,11 +1176,11 @@ fn service_from_manifest(
         if capability.name.is_empty()
             || capability.name.starts_with("svc.")
             || capability.name == "start"
-            || caps
-                .iter()
-                .any(|cap| cap.name.as_str() == capability.name)
+            || caps.iter().any(|cap| cap.name.as_str() == capability.name)
         {
-            return Err(Problem::Invalid.error(format!("invalid capability name: {}", capability.name)));
+            return Err(
+                Problem::Invalid.error(format!("invalid capability name: {}", capability.name))
+            );
         }
         caps.push(KernelCapability {
             name: CapabilityName::new(capability.name.clone()),
@@ -1099,13 +1191,15 @@ fn service_from_manifest(
         });
     }
     if ready == Ready::Exec && !caps.is_empty() {
-        return Err(Problem::Invalid.error("exec.ready=exec cannot declare capabilities: no protocol channel"));
+        return Err(Problem::Invalid
+            .error("exec.ready=exec cannot declare capabilities: no protocol channel"));
     }
     let contract = crate::registry::contract_for(
         id,
         &manifest.version,
         caps,
         crate::registry::Carrier::Slot,
+        limits,
     );
 
     let schema_two = manifest.schema >= 2;
@@ -1219,7 +1313,11 @@ fn convert_lifecycle_hook(
     };
     let path = version_dir.join(&hook.path);
     if !path.is_file() {
-        return Err(Problem::Invalid.error(format!("lifecycle.{} is missing: {}", name, path.display())));
+        return Err(Problem::Invalid.error(format!(
+            "lifecycle.{} is missing: {}",
+            name,
+            path.display()
+        )));
     }
     let is_script = !is_native_file(&path)?;
     if is_script {
@@ -1259,8 +1357,8 @@ fn convert_lifecycle_hook(
 /// Read only the header: installed payloads can be large native binaries.
 fn is_native_file(path: &Path) -> Result<bool, ProblemError> {
     use std::io::Read;
-    let mut file =
-        fs::File::open(path).map_err(|error| Problem::Internal.error(format!("read {}: {}", path.display(), error)))?;
+    let mut file = fs::File::open(path)
+        .map_err(|error| Problem::Internal.error(format!("read {}: {}", path.display(), error)))?;
     let mut head = [0u8; 8];
     let read = file
         .read(&mut head)
@@ -1302,7 +1400,8 @@ fn read_manifest(version_dir: &Path) -> Result<package::Manifest, ProblemError> 
 
 fn write_current(plugin_dir: &Path, version: &str) -> Result<(), ProblemError> {
     let path = plugin_dir.join("current");
-    fs::write(&path, version).map_err(|error| Problem::Internal.error(format!("write {}: {}", path.display(), error)))
+    fs::write(&path, version)
+        .map_err(|error| Problem::Internal.error(format!("write {}: {}", path.display(), error)))
 }
 
 fn copy_config(package: &Package, plugin_dir: &Path) -> Result<(), ProblemError> {
@@ -1336,7 +1435,8 @@ fn copy_config(package: &Package, plugin_dir: &Path) -> Result<(), ProblemError>
 }
 
 fn write_hash(path: &Path, hash: &str) -> Result<(), ProblemError> {
-    fs::write(path, hash).map_err(|error| Problem::Internal.error(format!("write {}: {}", path.display(), error)))?;
+    fs::write(path, hash)
+        .map_err(|error| Problem::Internal.error(format!("write {}: {}", path.display(), error)))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1368,12 +1468,14 @@ pub fn lock_config(paths: &Paths, id: &str) -> Result<fs::File, ProblemError> {
 }
 
 pub fn write_config(path: &Path, data: &[u8]) -> Result<(), ProblemError> {
-    fs::write(path, data).map_err(|error| Problem::Internal.error(format!("write {}: {}", path.display(), error)))?;
+    fs::write(path, data)
+        .map_err(|error| Problem::Internal.error(format!("write {}: {}", path.display(), error)))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o640))
-            .map_err(|error| Problem::Internal.error(format!("chmod {}: {}", path.display(), error)))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o640)).map_err(|error| {
+            Problem::Internal.error(format!("chmod {}: {}", path.display(), error))
+        })?;
     }
     Ok(())
 }
@@ -1434,7 +1536,9 @@ pub fn config_check(paths: &Paths, id: &str, candidate: &Path) -> Result<(), Pro
     package::check_path(&check.path)?;
     let program = version_dir.join(&check.path);
     if !program.is_file() {
-        return Err(Problem::Conflict.error(format!("configCheck is missing: {}", program.display())));
+        return Err(
+            Problem::Conflict.error(format!("configCheck is missing: {}", program.display()))
+        );
     }
     let mut command = check_command(&program);
     command
@@ -1535,7 +1639,8 @@ pub fn replace_config(
         fs::copy(&target, directory.join("config.last-good"))
             .map_err(|error| Problem::Internal.error(format!("save last-good: {}", error)))?;
     }
-    fs::rename(&temporary, &target).map_err(|error| Problem::Internal.error(format!("replace config: {}", error)))?;
+    fs::rename(&temporary, &target)
+        .map_err(|error| Problem::Internal.error(format!("replace config: {}", error)))?;
     Ok(())
 }
 
@@ -1557,9 +1662,12 @@ pub struct Backup {
 }
 
 pub fn export_config(paths: &Paths, id: &str) -> Result<(String, Vec<u8>), ProblemError> {
-    let version = current_version(paths, id).ok_or_else(|| Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)))?;
-    let config = active_config(paths, id).ok_or_else(|| Problem::UnknownPlugin.error(format!("plugin {} has no config", id)))?;
-    let data = fs::read(&config).map_err(|error| Problem::Internal.error(format!("read config: {}", error)))?;
+    let version = current_version(paths, id)
+        .ok_or_else(|| Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)))?;
+    let config = active_config(paths, id)
+        .ok_or_else(|| Problem::UnknownPlugin.error(format!("plugin {} has no config", id)))?;
+    let data = fs::read(&config)
+        .map_err(|error| Problem::Internal.error(format!("read config: {}", error)))?;
     Ok((version, data))
 }
 
@@ -1590,9 +1698,13 @@ pub fn plan_export_spkb(
 }
 
 pub fn export_spkb(paths: &Paths, id: &str) -> Result<(String, Vec<u8>), ProblemError> {
-    let version = current_version(paths, id).ok_or_else(|| Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)))?;
+    let version = current_version(paths, id)
+        .ok_or_else(|| Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)))?;
     let config = active_config(paths, id)
-        .map(|path| fs::read(path).map_err(|error| Problem::Internal.error(format!("read config: {}", error))))
+        .map(|path| {
+            fs::read(path)
+                .map_err(|error| Problem::Internal.error(format!("read config: {}", error)))
+        })
         .transpose()?;
     let plan = plan_export_spkb(
         id,
@@ -1621,8 +1733,9 @@ pub(crate) fn backup_json(id: &str, version: &str, config: Option<&[u8]>) -> Vec
 }
 
 fn remove_versions(directory: &Path, keep: Option<&str>) -> Result<(), ProblemError> {
-    let entries = fs::read_dir(directory)
-        .map_err(|error| Problem::Internal.error(format!("read {}: {}", directory.display(), error)))?;
+    let entries = fs::read_dir(directory).map_err(|error| {
+        Problem::Internal.error(format!("read {}: {}", directory.display(), error))
+    })?;
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -1634,8 +1747,9 @@ fn remove_versions(directory: &Path, keep: Option<&str>) -> Result<(), ProblemEr
         {
             continue;
         }
-        fs::remove_dir_all(&path)
-            .map_err(|error| Problem::Internal.error(format!("remove {}: {}", path.display(), error)))?;
+        fs::remove_dir_all(&path).map_err(|error| {
+            Problem::Internal.error(format!("remove {}: {}", path.display(), error))
+        })?;
     }
     Ok(())
 }
@@ -1741,7 +1855,7 @@ mod tests {
         )
         .expect("write manifest");
 
-        let (services, _) = scan(paths(), );
+        let (services, _) = scan(paths(), &crate::limits::test_default());
         let service = services
             .iter()
             .find(|service| service.id == id)
@@ -1788,7 +1902,8 @@ mod tests {
         replace_config(paths(), "plain", b"new", false).expect("replace");
         assert_eq!(std::fs::read(&active).expect("read"), b"new");
         assert_eq!(
-            std::fs::read(plugin_dir(paths(), "plain").join("config.last-good")).expect("last-good"),
+            std::fs::read(plugin_dir(paths(), "plain").join("config.last-good"))
+                .expect("last-good"),
             b"old"
         );
     }
@@ -1822,7 +1937,8 @@ mod tests {
     fn a_config_refusal_carries_its_status_family() {
         make_plugin("families", "old", false);
 
-        let error = replace_config(paths(), "no-such-plugin", b"x", false).expect_err("unknown plugin");
+        let error =
+            replace_config(paths(), "no-such-plugin", b"x", false).expect_err("unknown plugin");
         assert_eq!(error.problem, Problem::UnknownPlugin);
 
         let oversized = vec![b'x'; 1024 * 1024 + 1];
@@ -1880,8 +1996,16 @@ mod tests {
             })),
         );
 
-        let service = service_from_manifest(paths(), "scripted", &version_dir, &manifest, true, Some(&host))
-            .expect("service");
+        let service = service_from_manifest(
+            paths(),
+            &crate::limits::test_default(),
+            "scripted",
+            &version_dir,
+            &manifest,
+            true,
+            Some(&host),
+        )
+        .expect("service");
 
         let exec = service.exec.as_ref().expect("exec");
         assert_eq!(exec.ready, Ready::Exec);
@@ -1918,10 +2042,21 @@ mod tests {
             None,
         );
 
-        let error = service_from_manifest(paths(), "no-interpreter", &version_dir, &manifest, true, None)
-            .expect_err("missing interpreter");
+        let error = service_from_manifest(
+            paths(),
+            &crate::limits::test_default(),
+            "no-interpreter",
+            &version_dir,
+            &manifest,
+            true,
+            None,
+        )
+        .expect_err("missing interpreter");
 
-        assert!(error.detail().contains("declares no interpreter"), "{error}");
+        assert!(
+            error.detail().contains("declares no interpreter"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1929,8 +2064,16 @@ mod tests {
         let (version_dir, manifest) =
             script_manifest("native", "payload/bin/tool", b"\x7fELFdemo", None, None);
 
-        let service =
-            service_from_manifest(paths(), "native", &version_dir, &manifest, true, None).expect("service");
+        let service = service_from_manifest(
+            paths(),
+            &crate::limits::test_default(),
+            "native",
+            &version_dir,
+            &manifest,
+            true,
+            None,
+        )
+        .expect("service");
 
         assert!(service.exec.as_ref().expect("exec").interpreter.is_none());
         assert!(service.lifecycle.is_none());
@@ -1982,6 +2125,7 @@ mod tests {
 
         install_package(
             &paths,
+            &crate::limits::test_default(),
             &layout_package("layout-demo", "1.0.0"),
             Strategy::KeepOld,
             false,
@@ -1990,6 +2134,7 @@ mod tests {
         .expect("first install");
         install_package(
             &paths,
+            &crate::limits::test_default(),
             &layout_package("layout-demo", "1.1.0"),
             Strategy::KeepOld,
             false,
@@ -2008,13 +2153,17 @@ mod tests {
 
         install_package(
             &paths,
+            &crate::limits::test_default(),
             &layout_package("layout-demo", "1.1.0"),
             Strategy::Replace,
             false,
             None,
         )
         .expect("replace install");
-        assert!(!directory.join("1.0.0").exists(), "replace keeps only the new version");
+        assert!(
+            !directory.join("1.0.0").exists(),
+            "replace keeps only the new version"
+        );
         assert!(directory.join("1.1.0").is_dir());
         assert_eq!(
             current_version(&paths, "layout-demo").as_deref(),
@@ -2037,8 +2186,16 @@ mod tests {
             None,
         );
 
-        let error = service_from_manifest(paths(), "dangling", &version_dir, &manifest, true, Some(&host))
-            .expect_err("no script payload");
+        let error = service_from_manifest(
+            paths(),
+            &crate::limits::test_default(),
+            "dangling",
+            &version_dir,
+            &manifest,
+            true,
+            Some(&host),
+        )
+        .expect_err("no script payload");
 
         assert!(error.detail().contains("no script payload"), "{error}");
     }

@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted。细化 [docs/architecture.md](../architecture.md) §8 的 S7 行；切片 S7a（`Config` 骨架 + `Paths`）与 S7b（`Settings`/`Limits` 收口）待开票。与 [ADR-0011](0011-service-contract-is-the-only-composition-point.md)（服务契约是唯一组合点）同向：配置也只在一个组合点产生。
+Accepted。细化 [docs/architecture.md](../architecture.md) §8 的 S7 行；切片 S7a（`Config` 骨架 + `Paths`，#157）与 S7b（`Settings`/`Limits` 收口，#158）已交付。与 [ADR-0011](0011-service-contract-is-the-only-composition-point.md)（服务契约是唯一组合点）同向：配置也只在一个组合点产生。
 
 ## Context
 
@@ -31,7 +31,14 @@ Accepted。细化 [docs/architecture.md](../architecture.md) §8 的 S7 行；�
 
 - `Config::bootstrap` is the hard-error entry: the `SVCD_*` reads live in `Paths::resolve`, called from bootstrap and from the single tolerant `config::ambient_paths()`. That second entry exists only for phases that must outlive a broken `svcd.conf`: the daemon's pre-`ensure_conf` directory, `stop` / `shutdown`, install / uninstall and the Windows SCM readiness probe (resolved once, after `--conf`). Every other entry bootstraps and fails hard.
 - The repository had **eight** directory getters (`config` / `services` / `temp` / `run` / `plugins` / `trust` / `logs` / `data`), not six; all eight were removed by the S7a contract.
-- `settings::current()` / `limits::current()` stay until S7b; `Config` already carries the bootstrap snapshot so S7b only has to move the readers.
+- `settings::current()` / `limits::current()` stayed until S7b (removed by #158, see below); `Config` already carries the bootstrap snapshot so S7b only had to move the readers.
+
+## Clarification (S7b, #158)
+
+- `settings::{SETTINGS, CONFIG_PATH}` and `limits::LIMITS` are gone. `settings::load(conf)` resolves and parses the document once and returns `(Settings, Option<PathBuf>)`; `Config::bootstrap` is its only caller (the daemon resolves its pre-`ensure_conf` `Config` through that same entry). `Limits` is a pure projection (`limits::derive`) and carries no cache.
+- Readers receive the value through construction: a subsystem that already holds `Config` reads `config.limits` / `config.settings`; a function that needs only one of them takes `&Limits` (or the already-derived value) as a parameter. `settings_path` write-back (`svc lan passwd`) uses that field instead of guessing `config_dir/svcd.conf`.
+- The daemon still needs the config directory before `ensure_conf` can report the path it settled on. It bootstraps once before `ensure_conf` and keeps that document for the whole run; `ensure_conf` only chooses or creates the file the service unit and the next start use. This preserves the old cache's precedence (`SVCD_CONFIG_DIR` > program dir > platform default) instead of letting `ensure_conf`'s fallback silently switch documents mid-start, and it removes the second parse S7a still had on first start.
+- `config::ambient_paths(conf)` remains the single tolerant entry for phases that must outlive a broken config; it now takes the explicit `--conf` (when it exists) so the Windows SCM probe and the daemon agree.
 
 ## Consequences
 

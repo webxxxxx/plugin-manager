@@ -2,10 +2,10 @@ use crate::channel;
 use crate::ipc::{self, FrameEvent};
 use crate::registry::{Kind, Registry};
 use crate::rpc;
-use crate::server::mcp::session::{validate_meta, Served, MODERN_VERSION};
 use crate::server::mcp::result::{
     error_response, result_value, server_meta, tool_error_result, tool_result_object, SERVER_NAME,
 };
+use crate::server::mcp::session::{validate_meta, Served, MODERN_VERSION};
 use serde_json::{json, Value};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -81,18 +81,19 @@ pub fn run_stdio() -> i32 {
         Some(config) => config,
         None => return 1,
     };
-    let config = config.paths.config_dir.clone();
-    if let Err(error) = startup_ping(&config) {
+    let limits = config.limits.clone();
+    let config_dir = config.paths.config_dir.clone();
+    if let Err(error) = startup_ping(&config_dir) {
         eprintln!("mcp: {}", error);
         return 1;
     }
     let (sender, receiver) = mpsc::sync_channel(256);
-    if let Err(error) = ipc::spawn_reader("mcp-stdin".into(), io::stdin(), sender, None) {
+    if let Err(error) = ipc::spawn_reader("mcp-stdin".into(), io::stdin(), sender, None, &limits) {
         eprintln!("mcp: stdin: {}", error);
         return 1;
     }
     let mut bridge = Bridge {
-        config,
+        config: config_dir,
         era: None,
         legacy_ready: false,
         last_version: None,
@@ -326,13 +327,20 @@ fn tools_call(
         request["progressToken"] = token;
     }
     let mut progress = progress;
-    let response = channel::request_stream(config, "registry.call", request, None, || false, |line| {
-        if let Some(out) = progress.as_deref_mut() {
-            let _ = out.write_all(line.as_bytes());
-            let _ = out.write_all(b"\n");
-            let _ = out.flush();
-        }
-    });
+    let response = channel::request_stream(
+        config,
+        "registry.call",
+        request,
+        None,
+        || false,
+        |line| {
+            if let Some(out) = progress.as_deref_mut() {
+                let _ = out.write_all(line.as_bytes());
+                let _ = out.write_all(b"\n");
+                let _ = out.flush();
+            }
+        },
+    );
     match response {
         Ok(response) => {
             if let Some(error) = response.error {
@@ -453,7 +461,9 @@ mod tests {
         KernelCapability {
             name: CapabilityName::new(name),
             desc: format!("{} description", name),
-            input_schema: Some(json!({"type": "object", "properties": {"input": {"type": "string"}}})),
+            input_schema: Some(
+                json!({"type": "object", "properties": {"input": {"type": "string"}}}),
+            ),
             effect: Effect::Write,
             idempotent: false,
         }
@@ -466,6 +476,7 @@ mod tests {
             "1.0.0",
             caps,
             crate::registry::Carrier::Slot,
+            &crate::limits::test_default(),
         );
         Service {
             id: id.into(),
@@ -541,7 +552,7 @@ mod tests {
 
     #[test]
     fn a_live_builtin_service_publishes_its_capabilities_without_start() {
-        let registry = Registry::with_builtin();
+        let registry = Registry::with_builtin(&crate::limits::test_default());
 
         let names = names(&tools(&registry, |_| true));
 

@@ -21,11 +21,12 @@ use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PeekNamedPipe, WaitNamedPipeW,
 };
 
-use crate::channel::{ControlChannel, ControlListener, ControlStream, Endpoint, PendingCall, Reply};
+use crate::channel::{
+    ControlChannel, ControlListener, ControlStream, Endpoint, PendingCall, Reply,
+};
 use crate::ipc;
 use crate::platform::host::acl::Acl;
 use crate::rpc;
-use crate::threads;
 use crate::wake::Wake;
 
 const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
@@ -223,9 +224,16 @@ impl ControlChannel for Platform {
         admin: Self::Listener,
         pending: SyncSender<PendingCall>,
         wake: Arc<Wake>,
+        io_stack: usize,
     ) -> io::Result<Self::Server> {
-        spawn_accept(user, Endpoint::User, pending.clone(), wake.clone())?;
-        spawn_accept(admin, Endpoint::Admin, pending, wake)?;
+        spawn_accept(
+            user,
+            Endpoint::User,
+            pending.clone(),
+            wake.clone(),
+            io_stack,
+        )?;
+        spawn_accept(admin, Endpoint::Admin, pending, wake, io_stack)?;
         Ok(ControlBinding)
     }
 
@@ -274,13 +282,14 @@ fn spawn_accept(
     endpoint: Endpoint,
     pending: SyncSender<PendingCall>,
     wake: Arc<Wake>,
+    io_stack: usize,
 ) -> io::Result<()> {
     std::thread::Builder::new()
         .name(match endpoint {
             Endpoint::User => "svcd-channel".into(),
             Endpoint::Admin => "svcd-channel-admin".into(),
         })
-        .stack_size(threads::io_stack())
+        .stack_size(io_stack)
         .spawn(move || {
             for incoming in listener.incoming() {
                 let stream = match incoming {
@@ -294,7 +303,7 @@ fn spawn_accept(
                 let wake = wake.clone();
                 let _ = std::thread::Builder::new()
                     .name("svcd-channel-conn".into())
-                    .stack_size(threads::io_stack())
+                    .stack_size(io_stack)
                     .spawn(move || serve_connection(stream, pending, wake, endpoint));
             }
         })

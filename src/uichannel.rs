@@ -33,8 +33,6 @@ pub struct EventBus {
     inner: Mutex<HashMap<String, PluginState>>,
     next_seq: AtomicU64,
     next_sub: AtomicU64,
-    max_subscribers_per_plugin: usize,
-    max_subscriptions: usize,
     total_subscribers: AtomicU64,
 }
 
@@ -89,13 +87,10 @@ pub fn forget(plugin: &str) {
 
 impl EventBus {
     pub fn new() -> Self {
-        let limits = crate::limits::current();
         EventBus {
             inner: Mutex::new(HashMap::new()),
             next_seq: AtomicU64::new(0),
             next_sub: AtomicU64::new(0),
-            max_subscribers_per_plugin: limits.max_subscribers_per_plugin,
-            max_subscriptions: limits.max_subscriptions,
             total_subscribers: AtomicU64::new(0),
         }
     }
@@ -103,8 +98,9 @@ impl EventBus {
     pub fn subscribe(
         self: &Arc<Self>,
         plugin: &str,
+        limits: &crate::limits::Limits,
     ) -> Result<(Receiver<Event>, Subscription), SubscribeError> {
-        let (receiver, subscription, _) = self.subscribe_from(plugin, None)?;
+        let (receiver, subscription, _) = self.subscribe_from(plugin, None, limits)?;
         Ok((receiver, subscription))
     }
 
@@ -115,13 +111,14 @@ impl EventBus {
         self: &Arc<Self>,
         plugin: &str,
         last_event_id: Option<u64>,
+        limits: &crate::limits::Limits,
     ) -> Result<(Receiver<Event>, Subscription, Replay), SubscribeError> {
         let (sender, receiver) = mpsc::sync_channel(QUEUE);
         let id = self.next_sub.fetch_add(1, Ordering::SeqCst) + 1;
-        self.reserve_subscriber()?;
+        self.reserve_subscriber(limits)?;
         let mut inner = self.lock();
         let state = inner.entry(plugin.to_string()).or_default();
-        if state.subscribers.len() >= self.max_subscribers_per_plugin {
+        if state.subscribers.len() >= limits.max_subscribers_per_plugin {
             self.release_subscriber();
             return Err(SubscribeError::TooMany);
         }
@@ -159,12 +156,13 @@ impl EventBus {
         self: &Arc<Self>,
         plugin: &str,
         sender: SyncSender<Event>,
+        limits: &crate::limits::Limits,
     ) -> Result<Subscription, SubscribeError> {
         let id = self.next_sub.fetch_add(1, Ordering::SeqCst) + 1;
-        self.reserve_subscriber()?;
+        self.reserve_subscriber(limits)?;
         let mut inner = self.lock();
         let state = inner.entry(plugin.to_string()).or_default();
-        if state.subscribers.len() >= self.max_subscribers_per_plugin {
+        if state.subscribers.len() >= limits.max_subscribers_per_plugin {
             self.release_subscriber();
             return Err(SubscribeError::TooMany);
         }
@@ -176,8 +174,8 @@ impl EventBus {
         })
     }
 
-    fn reserve_subscriber(&self) -> Result<(), SubscribeError> {
-        let max = self.max_subscriptions;
+    fn reserve_subscriber(&self, limits: &crate::limits::Limits) -> Result<(), SubscribeError> {
+        let max = limits.max_subscriptions;
         let mut current = self.total_subscribers.load(Ordering::SeqCst);
         loop {
             if current as usize >= max {
@@ -460,7 +458,10 @@ mod tests {
     #[test]
     fn event_bus_fans_out_and_limits_subscribers() {
         let bus = Arc::new(EventBus::new());
-        let (receiver, subscription) = bus.subscribe("demo").expect("subscribe");
+        let limits = crate::limits::test_default();
+        let (receiver, subscription) = bus
+            .subscribe("demo", &crate::limits::test_default())
+            .expect("subscribe");
         bus.publish("demo", "notifications/message", &json!({"data": "one"}));
         let event = receiver
             .recv_timeout(std::time::Duration::from_secs(1))
@@ -471,18 +472,18 @@ mod tests {
         assert_eq!(bus.subscriber_count("demo"), 0);
 
         let mut held = Vec::new();
-        for index in 0..bus.max_subscribers_per_plugin {
+        for index in 0..limits.max_subscribers_per_plugin {
             let (sender, receiver) = mpsc::sync_channel(1);
             drop(receiver);
             held.push(
-                bus.subscribe_with("many", sender)
+                bus.subscribe_with("many", sender, &limits)
                     .unwrap_or_else(|_| panic!("subscriber {}", index)),
             );
         }
         let (sender, receiver) = mpsc::sync_channel(1);
         drop(receiver);
         assert!(matches!(
-            bus.subscribe_with("many", sender),
+            bus.subscribe_with("many", sender, &limits),
             Err(SubscribeError::TooMany)
         ));
         drop(held);
@@ -491,7 +492,9 @@ mod tests {
     #[test]
     fn event_bus_forgets_a_purged_plugin() {
         let bus = Arc::new(EventBus::new());
-        let (_receiver, subscription) = bus.subscribe("demo").expect("subscribe");
+        let (_receiver, subscription) = bus
+            .subscribe("demo", &crate::limits::test_default())
+            .expect("subscribe");
         bus.publish("demo", "notifications/message", &json!({"data": "one"}));
         assert!(bus.history_len("demo") > 0);
 
@@ -508,8 +511,9 @@ mod tests {
         bus.publish("replay", "notifications/message", &json!({"data": "one"}));
         bus.publish("replay", "notifications/message", &json!({"data": "two"}));
         bus.publish("replay", "notifications/message", &json!({"data": "three"}));
-        let (receiver, subscription, replay) =
-            bus.subscribe_from("replay", Some(1)).expect("subscribe");
+        let (receiver, subscription, replay) = bus
+            .subscribe_from("replay", Some(1), &crate::limits::test_default())
+            .expect("subscribe");
         assert!(!replay.reset);
         assert_eq!(replay.replayed, 2);
         let first = receiver
@@ -535,8 +539,9 @@ mod tests {
             bus.publish("gap", "notifications/message", &json!({"n": index}));
         }
         assert_eq!(bus.history_len("gap"), HISTORY_EVENTS);
-        let (receiver, subscription, replay) =
-            bus.subscribe_from("gap", Some(1)).expect("subscribe");
+        let (receiver, subscription, replay) = bus
+            .subscribe_from("gap", Some(1), &crate::limits::test_default())
+            .expect("subscribe");
         assert!(replay.reset);
         assert_eq!(replay.replayed, HISTORY_EVENTS);
         let first = receiver
