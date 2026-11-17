@@ -443,6 +443,8 @@ impl RawFailure {
 pub trait RawStopSink: Send + Sync {
     fn note_transport_failure(&self, failure: RawFailure, plugin: &str);
     fn unregister_generation(&self, id: &str, generation: u64);
+    /// Hand one complete frame read from the plugin's stdout to the hub.
+    fn deliver(&self, id: &str, stream: u32, payload: Vec<u8>);
 }
 
 #[cfg(test)]
