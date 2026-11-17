@@ -2443,7 +2443,12 @@ fn restart_runs_stop_then_start_and_changes_the_pid() {
     let status = sandbox.wait_for_state("core", "running", Duration::from_secs(15));
     let second = status["summary"]["pid"].as_u64().expect("pid") as u32;
     assert_ne!(first, second, "restart kept the same pid");
-    assert!(!pid_alive(first), "the old process survived restart");
+    // The old process exits asynchronously after `restart` returns. Asserting
+    // `!pid_alive` immediately made a parallel full run red while the process
+    // was still winding down (#153); wait for the observable end state instead.
+    wait_until("the old process to exit", Duration::from_secs(10), || {
+        !pid_alive(first)
+    });
     sandbox.stop_service("core");
 }
 

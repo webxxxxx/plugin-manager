@@ -106,8 +106,8 @@ Windows 走每连接线程回退，但上面的连接数、每 IP 与 idle 探�
 ```sh
 # L1 + L4（摘要输出：每个 target 一行，失败才打印尾部）
 node tools/check.mjs quick
-node tools/check.mjs test <filter>
-node tools/check.mjs full
+node tools/check.mjs test <filter>          # 默认 --test-threads=1，与 CI 同参
+node tools/check.mjs full                   # 同上；--parallel 才并行
 
 # 跨平台编译（Windows 宿主机必须跑一次：`cfg(unix)` 的代码在本机根本不编译，
 # quick/full 全绿不代表 Linux 能编；默认 target 与 CI 的 musl job 一致）
@@ -143,7 +143,7 @@ node tools/perf/run.mjs --perf
 node tools/perf/run.mjs --scale
 ```
 
-### 本机并行测试的环境约束
+### 本机测试的环境约束
 
 集成测试的 sandbox 根目录在 Windows 使用 Cargo 提供的 `CARGO_TARGET_TMPDIR`（在 `target/tmp`
 下），不再用系统 `%TEMP%`：受限的 TEMP ACL 曾让 `create sandbox` 直接 `PermissionDenied`，target
@@ -152,8 +152,9 @@ node tools/perf/run.mjs --scale
 符号链接指向多调用二进制（分派只看 argv[0] 的文件名），没有「复制后立即 exec」的 `ETXTBSY` 窗口；
 Windows 保留副本（建符号链接需要权限）。`tests/cli.rs` 对并发的 `ETXTBSY`（复制 multicall 二进制后立即 exec）
 做有限重试；不要把它当成测试失败。运行时记录的单测通过 `runtime::tests::with_root` 注入 root，**不要**再在测试里设
-`SVCD_RUN_DIR`（进程级 env + 全局缓存会让并行测试互相踩）。CI 仍用 `--test-threads=1`，本地并行
-跑全量时若看到这些类别失败，先按本节判断是不是环境噪声。
+`SVCD_RUN_DIR`（进程级 env + 全局缓存会让并行测试互相踩）。CI 用 `--test-threads=1`；
+`node tools/check.mjs full`（以及 `... test <filter>`）默认带同一个参数，所以本地红与 CI 红同义，
+不需要判断「是不是环境噪声」。只有显式 `--parallel` 才并行，那时执行顺序不由工具承诺。
 
 ### 安装测试的角色与宿主隔离
 
