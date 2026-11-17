@@ -5,7 +5,7 @@
 //! Blob/file downloads (#118) and uploads (#119) are claimed by their own
 //! stream faces before the body is read; #120 moved export spk/spkb to
 //! `face/export.rs`; import/install and the plugin UI streams keep their own
-//! streaming paths until #121–#122. This face owns the ordinary management
+//! streaming paths until #121. This face owns the ordinary management
 //! surface, the console page and login/logout.
 
 use std::io;
@@ -395,7 +395,7 @@ fn is_api_path(path: &str) -> bool {
     parts.first() == Some(&"api") && parts.get(1) == Some(&"v1")
 }
 
-/// Paths owned by the remaining transfer slices (#121–#122) stay on the
+/// Paths owned by the remaining transfer slice (#121) stay on the
 /// legacy bridge until their own StreamHandler lands.
 fn is_transfer_path(method: &str, path: &str) -> bool {
     let path = path_only(path);
