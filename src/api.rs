@@ -759,8 +759,13 @@ fn serve_mcp_sse(
             return Ok(());
         }
     };
-    let write_failed = Arc::new(AtomicBool::new(false));
-    let failed = write_failed.clone();
+    // `abandoned` means the SSE response can no longer be delivered: the
+    // client left or a write already failed. The poll closure sets it and the
+    // notification sink does the same, so neither path has to inspect an
+    // `io::ErrorKind` to know the connection is gone.
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let left = abandoned.clone();
+    let polled = abandoned.clone();
     let response = channel::request_stream(
         config,
         "registry.call",
@@ -772,12 +777,18 @@ fn serve_mcp_sse(
         // The same no-progress bound the Unix stream driver applies to an SSE
         // response: a hung supervisor cannot pin this thread forever.
         Some(crate::limits::current().transfer_timeout),
-        move || failed.load(Ordering::Acquire) || client_gone(&probe),
+        move || {
+            let gone = left.load(Ordering::Acquire) || client_gone(&probe);
+            if gone {
+                polled.store(true, Ordering::Release);
+            }
+            gone
+        },
         |notification| {
-            if !write_failed.load(Ordering::Acquire)
+            if !abandoned.load(Ordering::Acquire)
                 && write_sse_line(stream, notification).is_err()
             {
-                write_failed.store(true, Ordering::Release);
+                abandoned.store(true, Ordering::Release);
             }
         },
     );
@@ -789,14 +800,14 @@ fn serve_mcp_sse(
         // The client left, or a write failed: this response can no longer be
         // delivered. Dropping the control socket discards a late final frame
         // instead of pooling it for the next request.
-        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => None,
+        Err(_) if abandoned.load(Ordering::Acquire) => None,
         Err(error) => Some(rpc::err(
             call.id,
             -32603,
             &format!("svcd unreachable: {}", error),
         )),
     };
-    if !write_failed.load(Ordering::Acquire) {
+    if !abandoned.load(Ordering::Acquire) {
         if let Some(response) = &response {
             let _ = write_sse_line(stream, &rpc::to_line(response));
         }

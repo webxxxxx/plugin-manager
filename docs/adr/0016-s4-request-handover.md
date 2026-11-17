@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted。细化 [ADR-0012](0012-protocol-is-server-plus-face.md)；切片见 #113，server-loop 已由 #114 接管 HTTP listener / 连接，#115 落地 sans-IO stream handler 并让插件 UI 静态资源穿过它，#116 接线阻塞池与首个 `Blocking` 路由，#117 把剩余管理 JSON、login/logout 与控制台页移入 face，#118 让 blob/file 下载穿过 stream handler，#119 让 blob/file 上传穿过同一接口，#120 让 export spk/spkb 穿过同一接口，#121 让 import/install 上传穿过同一接口，#122 让插件 UI 的 SSE / WebSocket / raw WebSocket 改走 stream handler，#123 让 MCP SSE 进度流穿过同一接口，#124 把控制通道与出站管理流并入 server-loop，#125 删除 legacy bridge / HTTP worker / takeover / temp-cleaner，后续迁移见 #126；#131 给 Blocking 控制往返加可中断 deadline，并拆掉 `face → api` helper 环；#132 把下载的 locate / metadata / touch / open / manifest 读移进阻塞池，队列满时下载回 503 `busy`。
+Accepted。细化 [ADR-0012](0012-protocol-is-server-plus-face.md)；切片见 #113，server-loop 已由 #114 接管 HTTP listener / 连接，#115 落地 sans-IO stream handler 并让插件 UI 静态资源穿过它，#116 接线阻塞池与首个 `Blocking` 路由，#117 把剩余管理 JSON、login/logout 与控制台页移入 face，#118 让 blob/file 下载穿过 stream handler，#119 让 blob/file 上传穿过同一接口，#120 让 export spk/spkb 穿过同一接口，#121 让 import/install 上传穿过同一接口，#122 让插件 UI 的 SSE / WebSocket / raw WebSocket 改走 stream handler，#123 让 MCP SSE 进度流穿过同一接口，#124 把控制通道与出站管理流并入 server-loop，#125 删除 legacy bridge / HTTP worker / takeover / temp-cleaner，后续迁移见 #126；#131 给 Blocking 控制往返加可中断 deadline，并拆掉 `face → api` helper 环；#132 把下载的 locate / metadata / touch / open / manifest 读移进阻塞池，队列满时下载回 503 `busy`；#135 让 Windows 的 MCP SSE 在客户端断开时取消控制读并释放流预算。
 
 ## Decision
 
@@ -41,7 +41,7 @@ Accepted。细化 [ADR-0012](0012-protocol-is-server-plus-face.md)；切片见 #
 
 - **#134 的 HEAD 错误响应不写 body**：Unix 的 `Connection` 在解析请求头后记录 `head_only`，`write_response` 在写回所有内存响应（401/500、阻塞池 503、`stream_busy_response` 503、413/400）前按它截断 body，保留与 GET 相同的 `Content-Length`；Windows 的 `write_http` 在每条响应写出点做同一件事。解析不出请求头时无法得知 method，仍按 400 处理；stream handler 自己写字节的 503 负责自己的 HEAD 语义（上传/SSE 路由不接受 HEAD；下载的 503 在 `face/blob.rs` 里按 HEAD 截断 body）。
 
-- **#135 的 Windows MCP 断开取消**：`channel::request_stream` 增加可选的空闲 deadline 与轮询取消回调；`serve_mcp_sse` 在每次控制读之前先用零超时 `select` 检查可读性、再 `TcpStream::peek()` 一次（`Ok(0)` 是 FIN，错误是 RST；没有可读事件就不碰 socket，因为阻塞 socket 上的 `peek` 会等数据），客户端离开就放弃控制连接、丢弃迟到回包并释放 `max_streams` permit 与连接线程。空闲 deadline 取 `transfer_timeout`（默认 120 s），与 Unix stream driver 的 no-progress 上限一致，所以 supervisor 卡住时也不会无界占用线程。Windows 命名管道没有 `FILE_FLAG_OVERLAPPED`，等价机制是 `PeekNamedPipe` 的 20 ms 短轮询（与 #131 的 `PollReader` 同形）；CLI 的 `request` 传 `None` + `|| false`，连接池语义不变。这条不是平台豁免：两侧的验收测试是同一个 `max_streams = 1` + 挂住 `tools/call` + 断开 + 重试的 HTTP 测试。
+- **#135 的 Windows MCP 断开取消**：`channel::request_stream` 增加可选的空闲 deadline 与轮询取消回调；`serve_mcp_sse` 在每次控制读之前先用零超时 `select` 检查可读性、再 `TcpStream::peek()` 一次（`Ok(0)` 是 FIN，错误是 RST；没有可读事件就不碰 socket，因为阻塞 socket 上的 `peek` 会等数据），客户端离开就放弃控制连接、丢弃迟到回包并释放 `max_streams` permit 与连接线程。空闲 deadline 取 `transfer_timeout`（默认 120 s），与 Unix stream driver 的 no-progress 上限一致，所以 supervisor 卡住时也不会无界占用线程。Windows 命名管道没有 `FILE_FLAG_OVERLAPPED`，等价机制是 `PeekNamedPipe` 的 20 ms 短轮询（与 #131 的 `PollReader` 同形）；CLI 的 `request` 传 `None` + `|| false`，连接池语义不变。这条不是平台豁免：两侧的验收测试是同一个 `max_streams = 1` + 挂住 `tools/call` + 断开 + 重试的 HTTP 测试。取消发生在客户端一侧：daemon 上已经开始的插件调用没有 outbound cancel 通道，会自行跑完，回包因控制连接已关而被丢弃；permit、连接线程与连接本身不受影响。CLI 的逐帧读也从阻塞读改为 20 ms 轮询，Windows 上最坏多等一个轮询周期，连接池语义不变。
 
 ## Consequences
 
