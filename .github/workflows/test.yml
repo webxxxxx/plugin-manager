@@ -58,6 +58,8 @@ jobs:
           fetch-depth: 0
       - name: Fetch main
         run: git fetch --no-tags origin main:refs/remotes/origin/main
+      - name: Architecture rules (dep-lint)
+        run: node tools/dep-lint.mjs
       - name: Every closed #112 ticket has a commit on main
         env:
           GH_TOKEN: ${{ github.token }}

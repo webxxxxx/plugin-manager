@@ -11,6 +11,10 @@
 //
 // `cross` exists because a Windows host never compiles `cfg(unix)` code:
 // a green `quick`/`full` says nothing about the Linux build (#139).
+//
+// Every tier has a wall-clock cap: a hung test prints TIMEOUT and the last
+// lines instead of looking like a slow compile. Override with
+// `SVCD_CHECK_TIMEOUT_MS` while debugging.
 
 import { spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
@@ -19,18 +23,37 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "..");
 
-function cargo(args) {
+/// 编译档和测试档的墙钟上限；`SVCD_CHECK_TIMEOUT_MS` 覆盖（调试卡死用）。
+const COMPILE_TIMEOUT_MS = Number(process.env.SVCD_CHECK_TIMEOUT_MS) || 10 * 60 * 1000;
+const TEST_TIMEOUT_MS = Number(process.env.SVCD_CHECK_TIMEOUT_MS) || 20 * 60 * 1000;
+
+function cargo(args, timeoutMs) {
+  const started = Date.now();
   const result = spawnSync("cargo", args, {
     cwd: REPO,
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
     env: process.env,
+    timeout: timeoutMs,
   });
-  if (result.error) {
+  result.elapsedMs = Date.now() - started;
+  // A killed child reports `status: null` + `error.code === "ETIMEDOUT"`;
+  // any other spawn error is the tool itself being unusable.
+  if (result.error && result.error.code !== "ETIMEDOUT") {
     console.error("check: cannot run cargo: " + result.error.message);
     process.exit(2);
   }
   return result;
+}
+
+function timedOut(result) {
+  return Boolean(result.error && result.error.code === "ETIMEDOUT");
+}
+
+function reportTimeout(result) {
+  const seconds = Math.round((result.elapsedMs ?? 0) / 1000);
+  console.log(`check: TIMEOUT after ${seconds}s (cargo was killed); last output:`);
+  console.log(failureTail(result, 40));
 }
 
 function lines(text) {
@@ -115,7 +138,12 @@ if (tier === "--help" || tier === "-h") {
 }
 
 if (tier === "quick") {
-  const result = cargo(["check", "--all-targets", "--quiet"]);
+  console.log("check: running cargo check --all-targets");
+  const result = cargo(["check", "--all-targets", "--quiet"], COMPILE_TIMEOUT_MS);
+  if (timedOut(result)) {
+    reportTimeout(result);
+    process.exit(124);
+  }
   if (result.status === 0) console.log("check: ok (all targets)");
   else {
     console.log("check: FAILED");
@@ -125,7 +153,15 @@ if (tier === "quick") {
 }
 
 if (tier === "no-default") {
-  const result = cargo(["check", "--no-default-features", "--bin", "svcd", "--quiet"]);
+  console.log("check: running cargo check --no-default-features --bin svcd");
+  const result = cargo(
+    ["check", "--no-default-features", "--bin", "svcd", "--quiet"],
+    COMPILE_TIMEOUT_MS,
+  );
+  if (timedOut(result)) {
+    reportTimeout(result);
+    process.exit(124);
+  }
   if (result.status === 0) console.log("check: ok (no default features)");
   else {
     console.log("check: FAILED (no default features)");
@@ -136,14 +172,27 @@ if (tier === "no-default") {
 
 if (tier === "cross") {
   const target = rest[0] || CROSS_TARGET;
-  const result = cargo(["check", "--target", target, "--all-targets", "--quiet"]);
+  console.log(`check: running cargo check --target ${target} --all-targets`);
+  const result = cargo(
+    ["check", "--target", target, "--all-targets", "--quiet"],
+    COMPILE_TIMEOUT_MS,
+  );
+  if (timedOut(result)) {
+    reportTimeout(result);
+    process.exit(124);
+  }
   reportCross(target, result);
   process.exit(result.status ?? 1);
 }
 
 if (tier === "test" || tier === "full") {
   const filter = tier === "test" ? rest : [];
-  const result = cargo(["test", ...filter, "--no-fail-fast"]);
+  console.log("check: running cargo test " + [...filter, "--no-fail-fast"].join(" "));
+  const result = cargo(["test", ...filter, "--no-fail-fast"], TEST_TIMEOUT_MS);
+  if (timedOut(result)) {
+    reportTimeout(result);
+    process.exit(124);
+  }
   summarizeTests(result);
   process.exit(result.status ?? 1);
 }
