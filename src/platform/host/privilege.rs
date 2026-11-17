@@ -1,0 +1,54 @@
+//! Whether this process runs with elevated privileges.
+//!
+//! Moved out of `install` (#137): the platform layer answers OS questions, so
+//! `paths` and the CLI no longer have to reach into a domain module for it.
+//! `SVCD_TEST_UNPRIVILEGED` keeps the debug-build escape hatch the self-install
+//! tests rely on.
+
+#[cfg(unix)]
+pub fn is_privileged() -> bool {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SVCD_TEST_UNPRIVILEGED").is_some() {
+        return true;
+    }
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(windows)]
+pub fn is_privileged() -> bool {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SVCD_TEST_UNPRIVILEGED").is_some() {
+        return true;
+    }
+    use std::mem::size_of;
+    use std::ptr::null_mut;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token: HANDLE = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut elevation: TOKEN_ELEVATION = std::mem::zeroed();
+        let mut returned = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            &mut elevation as *mut _ as *mut _,
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        );
+        CloseHandle(token);
+        ok != 0 && elevation.TokenIsElevated != 0
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn is_privileged() -> bool {
+    false
+}

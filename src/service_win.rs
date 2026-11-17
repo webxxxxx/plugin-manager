@@ -6,7 +6,7 @@
 //! though the daemon itself is healthy. The same binary therefore probes for
 //! SCM ownership first: a console run gets
 //! `ERROR_FAILED_SERVICE_CONTROLLER_CONNECT`, which means "not started by the
-//! SCM" and falls back to [`crate::daemon::run`] exactly as before.
+//! SCM" and falls back to the daemon entry point exactly as before.
 //!
 //! Once attached, the dispatcher owns the main thread and the daemon runs on a
 //! worker thread so `ServiceMain` can report `START_PENDING`, wait until the
@@ -63,6 +63,11 @@ fn service_name() -> String {
 }
 
 static SERVICE_CONF: OnceLock<Option<PathBuf>> = OnceLock::new();
+/// The composition root hands the SCM module the daemon entry point and the
+/// shutdown request it may make. The module never reaches up into `daemon`
+/// itself (no SCM → compose edge in `dep-lint`).
+static DAEMON_RUN: OnceLock<fn(Option<PathBuf>) -> i32> = OnceLock::new();
+static DAEMON_SHUTDOWN: OnceLock<fn()> = OnceLock::new();
 
 /// Attach to the SCM and run the daemon there.
 ///
@@ -70,8 +75,14 @@ static SERVICE_CONF: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// `svcd run --foreground` from a console) and the caller should run the
 /// daemon directly. `Some(code)` is the service exit code after the SCM has
 /// stopped the service.
-pub fn run_if_service(conf: Option<PathBuf>) -> Option<i32> {
+pub fn run_if_service(
+    conf: Option<PathBuf>,
+    run_daemon: fn(Option<PathBuf>) -> i32,
+    request_shutdown: fn(),
+) -> Option<i32> {
     let _ = SERVICE_CONF.set(conf);
+    let _ = DAEMON_RUN.set(run_daemon);
+    let _ = DAEMON_SHUTDOWN.set(request_shutdown);
     let mut name = wide(&service_name());
     let table = [
         SERVICE_TABLE_ENTRYW {
@@ -112,7 +123,10 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
 
     let daemon = thread::Builder::new()
         .name("svcd-daemon".into())
-        .spawn(move || crate::daemon::run(SERVICE_CONF.get().cloned().flatten()));
+        .spawn(move || match DAEMON_RUN.get().copied() {
+            Some(run) => run(SERVICE_CONF.get().cloned().flatten()),
+            None => 1,
+        });
     let daemon = match daemon {
         Ok(daemon) => daemon,
         Err(error) => {
@@ -186,7 +200,9 @@ unsafe extern "system" fn control_handler(
             // Return to the SCM immediately: the daemon thread performs the
             // bounded shutdown and `ServiceMain` reports STOPPED afterwards.
             report(SERVICE_STOP_PENDING, 0, 1, STOP_WAIT_HINT_MS, 0, 0);
-            crate::daemon::request_shutdown();
+            if let Some(shutdown) = DAEMON_SHUTDOWN.get().copied() {
+                shutdown();
+            }
         }
         SERVICE_CONTROL_INTERROGATE => {
             let state = STATE.load(Ordering::SeqCst);

@@ -290,7 +290,7 @@ pub fn require_root() -> Result<(), String> {
     if std::env::var_os("SVCD_TEST_UNPRIVILEGED").is_some() {
         return Ok(());
     }
-    if crate::install::is_privileged() || crate::paths::user_mode() {
+    if crate::platform::is_privileged() || crate::paths::user_mode() {
         Ok(())
     } else {
         Err("root / Administrator is required for auth changes".into())

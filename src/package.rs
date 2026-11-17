@@ -18,14 +18,11 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::compat::CompatSpec;
+use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::paths;
 
 pub(crate) const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const MAX_FILES: usize = 4096;
-/// Highest manifest schema this daemon understands.
-pub const MAX_SCHEMA: u32 = 3;
-/// Highest plugin protocol version this daemon understands.
-pub const MAX_PROTOCOL: u32 = 3;
 
 /// Whether a `.spk` must carry a valid manifest signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,11 +33,6 @@ pub enum SignatureCheck {
     /// Host-level insecure mode: a package without `signature.json` is
     /// accepted, and a signature that is present is not verified.
     AllowUnsigned,
-}
-
-/// Exact target triple the package was built for.
-pub fn target() -> &'static str {
-    env!("SVCD_TARGET")
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -979,11 +971,11 @@ impl TarSink for SpkSink {
             Current::Manifest(bytes) => {
                 let manifest = parse_manifest(&bytes)?;
                 validate_manifest(&manifest)?;
-                if manifest.platform != target() {
+                if manifest.platform != crate::platform::target() {
                     return Err(format!(
                         "platform mismatch: package {}, host {}",
                         manifest.platform,
-                        target()
+                        crate::platform::target()
                     ));
                 }
                 let mut declared = BTreeMap::new();
@@ -1118,11 +1110,11 @@ pub fn load_staged(root: &Path, allow_insecure: bool) -> Result<StagedPackage, S
         .map_err(|error| format!("read {}: {}", manifest_path.display(), error))?;
     let manifest = parse_manifest(&manifest_bytes)?;
     validate_manifest(&manifest)?;
-    if manifest.platform != target() {
+    if manifest.platform != crate::platform::target() {
         return Err(format!(
             "platform mismatch: package {}, host {}",
             manifest.platform,
-            target()
+            crate::platform::target()
         ));
     }
     let mut declared = BTreeMap::new();
@@ -1301,11 +1293,11 @@ fn verify_bytes_mode(
     // Inspection deliberately skips the host-platform gate: a package built
     // for another target is still a well-formed package, and the caller gets
     // `host.matchesHost` as a fact.
-    if mode != SignatureMode::Inspect && manifest.platform != target() {
+    if mode != SignatureMode::Inspect && manifest.platform != crate::platform::target() {
         return Err(format!(
             "platform mismatch: package {}, host {}",
             manifest.platform,
-            target()
+            crate::platform::target()
         ));
     }
     let mut declared = BTreeMap::new();
@@ -2263,7 +2255,7 @@ mod tests {
     }
 
     fn package(key: &SigningKey) -> Vec<u8> {
-        package_for(key, target())
+        package_for(key, crate::platform::target())
     }
 
     fn unsigned_package_from(manifest: &[u8], files: &[(&str, Vec<u8>, u32)]) -> Vec<u8> {
@@ -2390,7 +2382,7 @@ mod tests {
 
     #[test]
     fn unsigned_packages_need_the_insecure_switch() {
-        let (manifest, files) = manifest(target());
+        let (manifest, files) = manifest(crate::platform::target());
         let bytes = unsigned_package_from(&manifest, &files);
 
         let error = verify_bytes(&bytes).expect_err("strict mode");
@@ -2452,7 +2444,7 @@ mod tests {
     #[test]
     fn rejects_a_platform_mismatch() {
         let key = setup();
-        let mismatched = format!("{}-mismatch", target());
+        let mismatched = format!("{}-mismatch", crate::platform::target());
         let bytes = package_for(&key, &mismatched);
         let error = verify_bytes(&bytes).expect_err("platform");
         assert!(error.contains("platform mismatch"), "{error}");
@@ -2475,7 +2467,7 @@ mod tests {
             "name": "demo",
             "version": "1.0.0",
             "desc": "demo",
-            "platform": target(),
+            "platform": crate::platform::target(),
             "protocol": 1,
             "exec": {"path": "payload/bin/demo"},
             "files": files,
@@ -2568,7 +2560,7 @@ mod tests {
     #[test]
     fn rejects_an_unknown_key_id() {
         let key = setup();
-        let (manifest, files) = manifest(target());
+        let (manifest, files) = manifest(crate::platform::target());
         let bytes = package_from(&key, "missing", &manifest, &files);
         let error = verify_bytes(&bytes).expect_err("unknown key");
         assert!(error.contains("unknown keyId"), "{error}");
@@ -2582,7 +2574,7 @@ mod tests {
         let data = b"payload".to_vec();
         let value = json!({
             "schema": 1, "name": "demo", "version": "1.0.0", "desc": "demo",
-            "platform": target(), "protocol": 1,
+            "platform": crate::platform::target(), "protocol": 1,
             "exec": {"path": "../escape"},
             "files": [{"path": "../escape", "size": data.len(), "sha256": hex_sha256(&data), "mode": 0o755}]
         });
@@ -2594,7 +2586,7 @@ mod tests {
 
     #[test]
     fn rejects_a_capability_named_start() {
-        let (bytes, _files) = manifest(target());
+        let (bytes, _files) = manifest(crate::platform::target());
         let mut value: Value = serde_json::from_slice(&bytes).expect("manifest");
         value["capabilities"] = json!([
             {"name": "start", "desc": "reserved", "inputSchema": {"type": "object"}}
@@ -2613,7 +2605,7 @@ mod tests {
         let data = b"payload".to_vec();
         let value = json!({
             "schema": 1, "name": "demo", "version": "1.0.0", "desc": "demo",
-            "platform": target(), "protocol": 1,
+            "platform": crate::platform::target(), "protocol": 1,
             "exec": {"path": "payload/bin/demo"},
             "files": [{"path": "payload/bin/demo", "size": data.len(), "sha256": hex_sha256(&data), "mode": 0o4755}]
         });
@@ -2634,7 +2626,7 @@ mod tests {
         let data = b"payload".to_vec();
         let value = json!({
             "schema": 1, "name": "demo", "version": "1.0.0", "desc": "demo",
-            "platform": target(), "protocol": 3,
+            "platform": crate::platform::target(), "protocol": 3,
             "exec": {"path": "payload/bin/demo"},
             "files": [{"path": "payload/bin/demo", "size": data.len(), "sha256": hex_sha256(&data), "mode": 0o755}]
         });
@@ -2655,7 +2647,7 @@ mod tests {
         let data = b"payload".to_vec();
         let value = json!({
             "schema": 1, "name": "demo", "version": "1.0.0", "desc": "demo",
-            "platform": target(), "protocol": 2,
+            "platform": crate::platform::target(), "protocol": 2,
             "exec": {"path": "payload/bin/demo"},
             "files": [{"path": "payload/bin/demo", "size": data.len(), "sha256": hex_sha256(&data), "mode": 0o755}]
         });
@@ -2719,7 +2711,7 @@ mod tests {
             .collect();
         let value = json!({
             "schema": 1, "name": "demo", "version": "1.0.0", "desc": "demo",
-            "platform": target(), "protocol": 1,
+            "platform": crate::platform::target(), "protocol": 1,
             "exec": {"path": "payload/bin/demo"},
             "hooks": {"postInstall": hook_path},
             "files": entries
@@ -2816,7 +2808,7 @@ mod tests {
     #[test]
     fn rejects_a_missing_declared_file() {
         let key = setup();
-        let (manifest, mut files) = manifest(target());
+        let (manifest, mut files) = manifest(crate::platform::target());
         let missing = files.pop().expect("second file");
         let bytes = package_from(&key, "test", &manifest, &files);
         let error = verify_bytes(&bytes).expect_err("missing");
@@ -2836,7 +2828,7 @@ mod tests {
             "name": "clock",
             "version": "1.0.0",
             "desc": "clock service",
-            "platform": target(),
+            "platform": crate::platform::target(),
             "protocol": 1,
             "exec": {"path": "payload/bin/clock.sh", "ready": "exec"},
             "interpreter": {"name": "sh"},
@@ -2888,7 +2880,7 @@ mod tests {
             })];
             json!({
                 "schema": 2, "name": "clock", "version": "1.0.0", "desc": "clock",
-                "platform": target(), "protocol": 1,
+                "platform": crate::platform::target(), "protocol": 1,
                 "exec": {"path": "payload/bin/clock.sh", "ready": "exec"},
                 "interpreter": {"name": "sh"},
                 "lifecycle": {"stop": {
@@ -2980,7 +2972,7 @@ mod tests {
             "name": "native",
             "version": "1.0.0",
             "desc": "native",
-            "platform": target(),
+            "platform": crate::platform::target(),
             "protocol": 1,
             "exec": {"path": "payload/bin/demo", "ready": "notify"},
             "interpreter": {"name": "sh"},
@@ -3007,7 +2999,7 @@ mod tests {
             "name": "legacy",
             "version": "1.0.0",
             "desc": "legacy",
-            "platform": target(),
+            "platform": crate::platform::target(),
             "protocol": 1,
             "exec": {"path": "payload/bin/demo"},
             "files": entries

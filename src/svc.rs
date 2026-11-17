@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 use crate::channel;
 use crate::definition;
+use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::log;
 use crate::paths;
 use crate::rpc;
@@ -412,7 +413,7 @@ fn reload() -> i32 {
 }
 
 fn compat_show(json: bool) -> i32 {
-    let facts = crate::compat::detect();
+    let facts = crate::compat::detect(MAX_SCHEMA, MAX_PROTOCOL);
     if json {
         match serde_json::to_string_pretty(&facts) {
             Ok(text) => println!("{}", text),
@@ -598,7 +599,7 @@ fn trust_command(action: TrustAction) -> i32 {
 }
 
 fn require_root_for_trust() -> Result<(), String> {
-    if crate::install::is_privileged() || crate::paths::user_mode() {
+    if crate::platform::is_privileged() || crate::paths::user_mode() {
         Ok(())
     } else {
         Err("root / Administrator is required to change trust roots".into())

@@ -334,7 +334,7 @@ mod tests {
             "name": name,
             "version": "1.0.0",
             "desc": "export unit test",
-            "platform": package::target(),
+            "platform": crate::platform::target(),
             "protocol": 1,
             "exec": {"path": files[0].0},
             "capabilities": [],

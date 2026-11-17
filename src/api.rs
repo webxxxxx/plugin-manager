@@ -30,14 +30,14 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::blob;
-use crate::blob_http;
+use crate::face::blob_routes;
 use crate::face::support::{decode, error};
 use crate::channel;
 use crate::face::plugin_ui::{ui_path, UiPath};
 use crate::http;
 use crate::lan::{self, AuthKind, Lan, LanStatus};
 use crate::log;
-use crate::mcp_http;
+use crate::server::mcp::transport;
 use crate::package;
 use crate::plugin;
 use crate::rpc;
@@ -696,8 +696,8 @@ fn handle(
                 .lock()
                 .ok()
                 .and_then(|state| state.password_hash().map(str::to_string));
-            match mcp_http::prepare_streaming(
-                &mcp_http::Request {
+            match transport::prepare_streaming(
+                &transport::Request {
                     method: &request.method,
                     headers: &request.headers,
                     body: &request.body,
@@ -731,7 +731,7 @@ fn handle(
 #[cfg(not(unix))]
 fn serve_mcp_sse(
     stream: &mut TcpStream,
-    call: mcp_http::StreamingCall,
+    call: transport::StreamingCall,
     config: &Path,
     head_only: bool,
 ) -> std::io::Result<()> {
@@ -912,9 +912,9 @@ fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u
             Ok(state) => state.password_hash().map(str::to_string),
             Err(_) => return error(500, "internal", "auth state unavailable"),
         };
-        return mcp_http::handle(
-            config,
-            &mcp_http::Request {
+        return transport::handle(
+            &|request| crate::mcp::serve_modern(config, request),
+            &transport::Request {
                 method: &request.method,
                 headers: &request.headers,
                 body: &request.body,
@@ -1247,16 +1247,16 @@ fn route(_config: &std::path::Path, request: &HttpRequest) -> Vec<u8> {
 
     match (request.method.as_str(), parts.as_slice()) {
         ("POST", ["api", "v1", "blobs", "uploads"]) => {
-            blob_http::create_upload(blob::UploadKind::Blob)
+            blob_routes::create_upload(blob::UploadKind::Blob)
         }
         ("GET", ["api", "v1", "blobs", "uploads", id]) => {
-            blob_http::upload_status(blob::UploadKind::Blob, &decode(id))
+            blob_routes::upload_status(blob::UploadKind::Blob, &decode(id))
         }
         ("POST", ["api", "v1", "blobs", "uploads", id, "complete"]) => {
-            blob_http::complete_upload(&decode(id), &request.body)
+            blob_routes::complete_upload(&decode(id), &request.body)
         }
         ("DELETE", ["api", "v1", "blobs", "uploads", id]) => {
-            blob_http::abort_upload(blob::UploadKind::Blob, &decode(id))
+            blob_routes::abort_upload(blob::UploadKind::Blob, &decode(id))
         }
         (_, ["api", "v1", "blobs"]) => method_not_allowed("POST"),
         (_, ["api", "v1", "blobs", "uploads"]) => method_not_allowed("POST"),
@@ -1265,16 +1265,16 @@ fn route(_config: &std::path::Path, request: &HttpRequest) -> Vec<u8> {
         (_, ["api", "v1", "blobs", "uploads", _, "parts", _]) => method_not_allowed("PUT"),
         (_, ["api", "v1", "blobs", _]) => method_not_allowed("GET"),
         ("POST", ["api", "v1", "file", "uploads"]) => {
-            blob_http::create_upload(blob::UploadKind::File)
+            blob_routes::create_upload(blob::UploadKind::File)
         }
         ("GET", ["api", "v1", "file", "uploads", id]) => {
-            blob_http::upload_status(blob::UploadKind::File, &decode(id))
+            blob_routes::upload_status(blob::UploadKind::File, &decode(id))
         }
         ("POST", ["api", "v1", "file", "uploads", id, "complete"]) => {
-            blob_http::file_upload_complete(&decode(id), &request.body)
+            blob_routes::file_upload_complete(&decode(id), &request.body)
         }
         ("DELETE", ["api", "v1", "file", "uploads", id]) => {
-            blob_http::abort_upload(blob::UploadKind::File, &decode(id))
+            blob_routes::abort_upload(blob::UploadKind::File, &decode(id))
         }
         (_, ["api", "v1", "file"]) => method_not_allowed("POST"),
         (_, ["api", "v1", "file", "uploads"]) => method_not_allowed("POST"),

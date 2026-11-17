@@ -20,7 +20,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::package;
 use crate::paths;
 
 /// The compatibility list a plugin declares in its signed manifest.
@@ -122,7 +121,7 @@ fn read_marker(path: &Path) -> (Option<String>, Vec<String>) {
     (device, warnings)
 }
 
-pub fn detect() -> HostFacts {
+pub fn detect(schema_max: u32, protocol_max: u32) -> HostFacts {
     let path = marker_path();
     let (mut device, mut warnings) = read_marker(&path);
     let mut device_source = device.as_ref().map(|_| "marker".to_string());
@@ -143,13 +142,13 @@ pub fn detect() -> HostFacts {
         ));
     }
     HostFacts {
-        platform: package::target().to_string(),
+        platform: crate::platform::target().to_string(),
         device,
         device_source,
         kernel_release: uname_release(),
         svcd_version: env!("CARGO_PKG_VERSION").to_string(),
-        schema_max: package::MAX_SCHEMA,
-        protocol_max: package::MAX_PROTOCOL,
+        schema_max,
+        protocol_max,
         marker_path: path.to_string_lossy().to_string(),
         warnings,
     }

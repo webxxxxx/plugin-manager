@@ -10,6 +10,7 @@
 
 pub mod api;
 pub mod blob;
+pub mod blob_routes;
 pub mod blob_upload;
 pub mod export;
 pub mod install;

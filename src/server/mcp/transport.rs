@@ -1,18 +1,18 @@
 //! `POST /mcp`: the modern-only (2026-07-28) Streamable HTTP binding.
 //!
 //! The transport owns authentication, mirrored-header validation and HTTP
-//! status mapping; the JSON-RPC semantics come from `mcp::serve_modern`, the
-//! same code the stdio bridge uses. There is no session and no SSE: every
-//! request is one POST answered with one JSON object.
+//! status mapping. It never reaches up into the face: the caller passes the
+//! endpoint projection in as `serve` (for the daemon that is
+//! `mcp::serve_modern`, the same code the stdio bridge uses). There is no
+//! session and no SSE: every request is one POST answered with one JSON object.
 
-use std::path::Path;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde_json::{json, Value};
 
 use crate::http;
-use crate::mcp::{self, Served};
+use crate::server::mcp::session::{validate_meta, Served};
 use crate::rpc;
 
 const VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
@@ -25,9 +25,14 @@ pub struct Request<'a> {
     pub body: &'a [u8],
 }
 
-/// `POST /mcp`. `password_hash` is the configured `auth_passwd`; `None`
-/// means no Bearer value can match, so the endpoint stays closed.
-pub fn handle(config: &Path, request: &Request<'_>, password_hash: Option<&str>) -> Vec<u8> {
+/// `POST /mcp`. `serve` is the face's MCP endpoint projection; `password_hash`
+/// is the configured `auth_passwd`, and `None` means no Bearer value can match,
+/// so the endpoint stays closed.
+pub fn handle(
+    serve: &dyn Fn(&rpc::Request) -> Served,
+    request: &Request<'_>,
+    password_hash: Option<&str>,
+) -> Vec<u8> {
     if request.method != "POST" {
         return http::method_not_allowed("POST");
     }
@@ -60,7 +65,7 @@ pub fn handle(config: &Path, request: &Request<'_>, password_hash: Option<&str>)
     // Both variants still carry a JSON-RPC envelope. A lost control channel
     // is a -32603 (or `isError` result for tools/call) exactly as on stdio;
     // the transport only remaps status codes the protocol defines.
-    let response = match mcp::serve_modern(config, &request) {
+    let response = match serve(&request) {
         Served::Respond(response) | Served::Unreachable(response) => response,
     };
     let status = if response
@@ -185,7 +190,7 @@ fn validate_headers(
         .map(str::to_string);
     let Some(body_version) = body_version else {
         // Give the same -32602 the stdio bridge gives for missing _meta.
-        return Err(mcp::validate_meta(id.clone(), &request.params)
+        return Err(validate_meta(id.clone(), &request.params)
             .err()
             .unwrap_or_else(|| rpc::err(id, -32602, "missing _meta")));
     };
@@ -230,7 +235,7 @@ fn validate_headers(
     }
     // Finally the request-level _meta contract: client capabilities are
     // required and only 2026-07-28 is implemented. Both map to 400 here.
-    mcp::validate_meta(request.id.clone(), &request.params)?;
+    validate_meta(request.id.clone(), &request.params)?;
     Ok(())
 }
 

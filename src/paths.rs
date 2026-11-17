@@ -8,7 +8,7 @@ pub fn user_mode() -> bool {
     match std::env::var("SVCD_USER").ok().as_deref() {
         Some("0") => false,
         Some("1") => true,
-        _ => !crate::install::is_privileged(),
+        _ => !crate::platform::is_privileged(),
     }
 }
 

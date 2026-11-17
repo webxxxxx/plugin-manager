@@ -17,6 +17,7 @@ type Api = ();
 use crate::catalog;
 use crate::channel;
 use crate::compat;
+use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::definition;
 use crate::kernel::contract::{
     Capability as KernelCapability, CapabilityName, Contract, Effect, Instance, Invocation,
@@ -889,7 +890,7 @@ impl Daemon {
             "svcd.ping" => rpc::ok(id, json!({"ok": true})),
             "svcd.compat" => rpc::ok(
                 id,
-                serde_json::to_value(compat::detect()).unwrap_or(Value::Null),
+                serde_json::to_value(compat::detect(MAX_SCHEMA, MAX_PROTOCOL)).unwrap_or(Value::Null),
             ),
             "svcd.shutdown" => {
                 self.shutdown = true;
@@ -1480,9 +1481,9 @@ impl Daemon {
                 .map(|spec| spec.devices.clone())
                 .unwrap_or_default();
             if let Some(reason) = compat::verdict_reason(compat::evaluate(
-                package::target(),
+                crate::platform::target(),
                 &devices,
-                &compat::detect(),
+                &compat::detect(MAX_SCHEMA, MAX_PROTOCOL),
             )) {
                 return Err(format!("{}: {}", id, reason));
             }

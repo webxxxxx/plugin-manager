@@ -6,6 +6,7 @@
 
 pub mod contract;
 pub mod failure;
+pub mod schema;
 
 #[cfg(test)]
 pub(crate) mod conformance;

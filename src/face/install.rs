@@ -1168,10 +1168,10 @@ fn import_outcome_json(outcome: transfer::Outcome) -> Vec<u8> {
         "configApplied": outcome.config.is_some(),
     });
     if let Some(status) = outcome.status {
-        let value = serde_json::to_value(status.summary).unwrap_or(Value::Null);
-        body["id"] = value.get("id").cloned().unwrap_or(Value::Null);
-        body["version"] = value.get("version").cloned().unwrap_or(Value::Null);
-        body["state"] = value.get("state").cloned().unwrap_or(Value::Null);
+        let summary = &status["summary"];
+        body["id"] = summary.get("id").cloned().unwrap_or(Value::Null);
+        body["version"] = summary.get("version").cloned().unwrap_or(Value::Null);
+        body["state"] = summary.get("state").cloned().unwrap_or(Value::Null);
     } else if let Some(id) = outcome.config {
         body["id"] = json!(id);
     }
