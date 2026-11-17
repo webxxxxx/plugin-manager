@@ -43,4 +43,5 @@ This repo is single-context: one `GLOSSARY.md` at the repo root and ADRs in `doc
 - **测试 helper**：不得伪造生产失败类别；实现没回调、没结果时直接失败，不要编一个 `Timeout` / `NotRunning`。
 - **提交边界**：行为改动与 dead-code 清理、`#[cfg(test)]` gating 分开提交；review 的 Spec 轴会把混入的清理列为 scope creep。
 - **文档一致性**：改 `docs/architecture.md` 的「当前/下一步」时同步 §8 seam 表；`tools/arch-map.json` 的过期/缺失映射由 `dep-lint` 检查。
+- **CI 边界**：除非用户明确要求 GitHub CI 或全链路测试，不主动触发、等待或观察 GitHub Actions；先用本地 `node tools/check.mjs`。
 

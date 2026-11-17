@@ -2095,26 +2095,42 @@ fn has_staging(dir: &Path) -> bool {
     false
 }
 
-fn wait_for_staging(dir: &Path) {
+fn wait_until<F, D>(sandbox: &Sandbox, what: &str, mut ready: F, mut details: D)
+where
+    F: FnMut() -> bool,
+    D: FnMut() -> String,
+{
     for _ in 0..300 {
-        if has_staging(dir) {
+        if ready() {
             return;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    panic!("upload staging file did not appear under {}", dir.display());
+    let extra = details();
+    panic!(
+        "{what}\ndaemon log:\n{}\n{extra}",
+        sandbox.daemon_log()
+    );
 }
 
-fn wait_for_no_staging(dir: &Path) {
-    for _ in 0..300 {
-        if !has_staging(dir) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    panic!(
-        "upload staging file was not removed under {}",
-        dir.display()
+fn wait_for_staging(sandbox: &Sandbox, dir: &Path) {
+    wait_until(
+        sandbox,
+        &format!("upload staging file did not appear under {}", dir.display()),
+        || has_staging(dir),
+        || String::new(),
+    );
+}
+
+fn wait_for_no_staging(sandbox: &Sandbox, dir: &Path) {
+    wait_until(
+        sandbox,
+        &format!(
+            "upload staging file was not removed under {}",
+            dir.display()
+        ),
+        || !has_staging(dir),
+        || String::new(),
     );
 }
 
@@ -2133,39 +2149,34 @@ fn has_package_staging(plugins: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn package_staging_appears(plugins: &Path) -> bool {
-    for _ in 0..300 {
-        if has_package_staging(plugins) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    false
-}
-
-fn wait_for_package_staging(plugins: &Path) {
-    for _ in 0..300 {
-        if has_package_staging(plugins) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    panic!(
-        "package staging directory did not appear under {}",
-        plugins.display()
+fn wait_for_package_staging_with<D>(sandbox: &Sandbox, plugins: &Path, details: D)
+where
+    D: FnMut() -> String,
+{
+    wait_until(
+        sandbox,
+        &format!(
+            "package staging directory did not appear under {}",
+            plugins.display()
+        ),
+        || has_package_staging(plugins),
+        details,
     );
 }
 
-fn wait_for_no_package_staging(plugins: &Path) {
-    for _ in 0..300 {
-        if !has_package_staging(plugins) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    panic!(
-        "package staging directory was not removed under {}",
-        plugins.display()
+fn wait_for_package_staging(sandbox: &Sandbox, plugins: &Path) {
+    wait_for_package_staging_with(sandbox, plugins, || String::new());
+}
+
+fn wait_for_no_package_staging(sandbox: &Sandbox, plugins: &Path) {
+    wait_until(
+        sandbox,
+        &format!(
+            "package staging directory was not removed under {}",
+            plugins.display()
+        ),
+        || !has_package_staging(plugins),
+        || String::new(),
     );
 }
 
@@ -2227,7 +2238,7 @@ fn a_slow_upload_holds_the_stream_cap_and_leaves_no_staging_file() {
         32 * 1024 * 1024,
         &initial,
     );
-    wait_for_staging(&temp);
+    wait_for_staging(&sandbox, &temp);
 
     let version = raw_request(&address, "GET", "/api/v1/version", "", b"");
     assert_eq!(version.status, 200, "an upload must not block the loop");
@@ -2243,7 +2254,7 @@ fn a_slow_upload_holds_the_stream_cap_and_leaves_no_staging_file() {
     );
 
     drop(stalled);
-    wait_for_no_staging(&temp);
+    wait_for_no_staging(&sandbox, &temp);
 
     let put = raw_request(
         &address,
@@ -2271,9 +2282,9 @@ fn a_disconnected_part_upload_removes_its_staging_file() {
 
     let initial = vec![0x5a; 64 * 1024];
     let stalled = start_stalled_upload(&address, "PUT", &path, 32 * 1024 * 1024, &initial);
-    wait_for_staging(&temp);
+    wait_for_staging(&sandbox, &temp);
     drop(stalled);
-    wait_for_no_staging(&temp);
+    wait_for_no_staging(&sandbox, &temp);
 }
 
 /// The upload used to take the connection out of the loop and spawn a
@@ -2296,7 +2307,7 @@ fn unix_upload_has_no_takeover_thread() {
         32 * 1024 * 1024,
         &initial,
     );
-    wait_for_staging(&sandbox.data.join("temp"));
+    wait_for_staging(&sandbox, &sandbox.data.join("temp"));
 
     assert_eq!(
         stable_thread_count(pid),
@@ -2495,19 +2506,15 @@ fn a_disconnected_package_upload_removes_its_staging_directory() {
             content.len() + 1024 * 1024,
             &initial,
         );
-        if !package_staging_appears(&plugins) {
+        wait_for_package_staging_with(&sandbox, &plugins, || {
             let mut probe = stalled.try_clone().expect("probe clone");
             probe.set_nonblocking(true).expect("probe nonblocking");
             let mut bytes = [0u8; 2048];
             let read = std::io::Read::read(&mut probe, &mut bytes).unwrap_or(0);
-            panic!(
-                "no staging for {path}; daemon log:\n{}\nresponse: {:?}",
-                sandbox.daemon_log(),
-                String::from_utf8_lossy(&bytes[..read])
-            );
-        }
+            format!("response: {:?}", String::from_utf8_lossy(&bytes[..read]))
+        });
         drop(stalled);
-        wait_for_no_package_staging(&plugins);
+        wait_for_no_package_staging(&sandbox, &plugins);
     }
 }
 
@@ -2538,7 +2545,7 @@ fn a_failed_install_removes_its_staging_directory() {
         "{}",
         String::from_utf8_lossy(&response.body)
     );
-    wait_for_no_package_staging(&sandbox.data.join("plugins"));
+    wait_for_no_package_staging(&sandbox, &sandbox.data.join("plugins"));
 }
 
 /// The install/import upload used to take the connection out of the loop and
@@ -2563,14 +2570,14 @@ fn unix_package_uploads_have_no_takeover_thread() {
             package.len() + 1024 * 1024,
             &initial,
         );
-        wait_for_package_staging(&plugins);
+        wait_for_package_staging(&sandbox, &plugins);
         assert_eq!(
             stable_thread_count(pid),
             idle,
             "a package upload must not add a takeover thread ({path})"
         );
         drop(stalled);
-        wait_for_no_package_staging(&plugins);
+        wait_for_no_package_staging(&sandbox, &plugins);
     }
 }
 
