@@ -6,17 +6,28 @@
 
 ## 开工
 
+worktree **一律放仓库外**，默认 `<repo-parent>/<repo-name>.worktrees/<ticket>`（例如
+`plugin-manager.worktrees/143`）。不要放 `target/`：`cargo clean` 会删掉整个 `target/`，
+藏在里面的 worktree 会一起消失。
+
 ```sh
 node tools/agent-preflight.mjs --fetch
-git worktree add target/wt-<ticket> -b feat/<ticket> origin/main
+node tools/worktree-add.mjs <ticket>   # 打印外部 worktree 路径
 ```
+
+`worktree-add` 默认从 `origin/main` 建 `feat/<ticket>`；需要时用 `--base` / `--branch`，
+`--print` 只打印路径。换根时设 `SVCD_WT_ROOT=/some/outside/dir`，它必须在仓库外。
+
+历史遗留的 `target/wt-*` 是风险存量：`node tools/agent-preflight.mjs --all` 会把它们标成
+`[under target!]`，`--strict` 也会因此失败。已合并且干净的用 `git worktree move <old> <repo>.worktrees/<name>`
+搬出来；还在用的等它关票时清掉。迁移完成前不要对仓库根跑 `cargo clean`。
 
 preflight 默认只打一行（branch / ahead-behind / dirty / worktree 数）；只有排查时才加
 `--all` 列出每个 worktree。看到 `on main` 就先建 worktree。
 
 共享工作区（仓库根目录）可能停在任意分支，甚至落后 main 几十个提交。读代码、grep、
 取「main 的现状」之前先确认在哪个 worktree：`git -C <worktree> rev-parse --abbrev-ref HEAD`，
-或直接用 `git -C target/wt-<ticket>`。根目录的文件不是 main 的权威副本。
+或直接用 `git -C <worktree>`。根目录的文件不是 main 的权威副本。
 
 ## 输出预算
 
@@ -36,7 +47,9 @@ preflight 默认只打一行（branch / ahead-behind / dirty / worktree 数）�
 
 - `git checkout/switch`：会换掉共享工作区，别的 session 的未提交改动会消失。
 - `git reset --hard` / `git clean -fd`：未跟踪的 `src/server/control/` 就是这么消失的。
-- 直接实现或 amend：实现放 `target/wt-<ticket>`，主工作区只 fetch / merge / 审计。
+- `cargo clean`（在仓库根/共享 main 上）：会删掉 `target/`，包括历史遗留的 `target/wt-*`；
+  清构建产物前先 `git worktree list` 确认没有仓库内的 worktree。
+- 直接实现或 amend：实现放外部 worktree，主工作区只 fetch / merge / 审计。
 
 看到不属于你的 dirty 文件：不要提交、不要清理；先看 `agent-preflight` 和
 `git worktree list`。
@@ -49,7 +62,7 @@ preflight 默认只打一行（branch / ahead-behind / dirty / worktree 数）�
 - 多行或含反引号/`$` 的提交信息用 `git commit -F <file>`；`-m` 会过 shell，反引号会被
   命令替换吃掉。
 - main 的 worktree 不一定是仓库根目录：`git worktree list` 里找 `[main]` 那条
-  （通常是 `target/wt-merge-*`）。集成用
+  （通常是 `<repo>.worktrees/` 下的集成 worktree）。集成用
   `git -C <main-wt> merge --ff-only origin/main` 追上，
   再 `git -C <main-wt> merge --no-ff <branch> -m "merge #<ticket>: <一句话>"`，
   验证后 `git -C <main-wt> push origin main`。合并后的票分支保留。
@@ -67,7 +80,7 @@ preflight 默认只打一行（branch / ahead-behind / dirty / worktree 数）�
 1. **合入 main**：按上一节 `merge --no-ff`（或 fast-forward）进 main，main 上必须有该改动，不能只在票分支上。
 2. **推送远程**：`git -C <main-wt> push origin main`；用 `git ls-remote origin refs/heads/main` 确认新 merge 已经在远端。
 3. **用 main 验证**：在合并后的 main 上跑受影响的 target；跨模块或用户要求时跑 `full`；Windows 宿主的 Linux 半按 `docs/testing.md` §6 跑 WSL。
-4. **清 worktree**：`git worktree remove target/wt-<ticket>`。有未提交改动先处理，不要 `--force` 丢掉；合并后的票分支可以保留作记录。
+4. **清 worktree**：`git worktree remove <worktree>`（路径由 `worktree-add` 打印）。有未提交改动先处理，不要 `--force` 丢掉；合并后的票分支可以保留作记录。历史遗留的 `target/wt-*` 先 `git worktree move` 到仓库外或直接 `remove`，再清构建产物。
 5. **最后关票**：`deck_issue_patch ... close=true` 或 `gh issue close`，票面写 merge commit 与验证结果。
 
 只推分支、没合 main、没推远程、worktree 还在，都不算完成，不要关票。

@@ -6,7 +6,7 @@ Issues and specs live in this repo's GitHub Issues, driven by the `gh` CLI. See 
 
 ### 并行开发 / worktree
 
-每个票在自己的 worktree 里做；共享 main 只做集成。开工前读 [docs/agents/parallel-work.md](docs/agents/parallel-work.md)。关票前先把代码合入 main、推送远程，并清掉该票 worktree；只推分支不算完成。
+每个票在自己的 worktree 里做；worktree 放仓库外（默认 `<repo>.worktrees/`），不要放 `target/`（`cargo clean` 会连它一起删）；共享 main 只做集成。开工前读 [docs/agents/parallel-work.md](docs/agents/parallel-work.md)。关票前先把代码合入 main、推送远程，并清掉该票 worktree；只推分支不算完成。
 
 ### Triage labels
 

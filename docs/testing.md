@@ -116,7 +116,7 @@ node tools/check.mjs cross <target>
 
 # 跨平台行为（Windows 宿主，WSL2）：cross 只编译；Linux 的 reactor、线程预算与
 # cfg(unix) 测试在 WSL 里真跑。用票自己的 worktree，target 放 Linux 文件系统。
-#   cd /mnt/d/<repo>/target/wt-<ticket>
+#   cd /mnt/d/<repo-parent>/<repo>.worktrees/<ticket>   # worktree 在仓库外，cargo clean 不会删
 #   CARGO_TARGET_DIR=/tmp/wt-<ticket>-target cargo test --no-fail-fast -- --test-threads=1
 #   CARGO_TARGET_DIR=/tmp/wt-<ticket>-target cargo test --test http \
 #     unix_idle_thread_count_has_no_per_request_or_per_stream_threads -- --exact

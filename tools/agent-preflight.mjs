@@ -6,7 +6,7 @@
 //   node tools/agent-preflight.mjs --json
 
 import { execFileSync } from "node:child_process";
-import { dirname, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -67,17 +67,55 @@ const dirty = git(["status", "--porcelain"]).split("\n").filter(Boolean).length;
 const counts = git(["rev-list", "--left-right", "--count", "HEAD...origin/main"], true);
 const [ahead, behind] = counts ? counts.split(/\s+/).map(Number) : [0, 0];
 const trees = worktrees();
+// Worktrees under the main checkout's target/ are deleted by `cargo clean`.
+// Resolve the main checkout from the shared git dir, so this warns from any
+// linked worktree too.
+const commonDir = git(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+const mainRoot = dirname(commonDir);
+const targetRoot = resolve(mainRoot, "target");
+const targetWorktrees = trees.filter((tree) => {
+  const inside = relative(targetRoot, resolve(tree.path));
+  return inside !== "" && !inside.startsWith("..") && !isAbsolute(inside);
+});
 const warnings = [];
-if (branch === "main") warnings.push("on main: create target/wt-<ticket> from origin/main before editing");
+if (branch === "main") {
+  warnings.push("on main: create an external worktree with node tools/worktree-add.mjs <ticket> before editing");
+}
 if (behind > 0) warnings.push("HEAD is " + behind + " commit(s) behind origin/main");
 if (branch === "main" && dirty > 0) warnings.push("shared main is dirty: do not reset/clean it");
 if (branch === "main" && trees.length > 1) warnings.push(trees.length - 1 + " other worktree(s) exist");
-if (args.strict && branch === "main") process.exitCode = 1;
+if (targetWorktrees.length > 0) {
+  warnings.push(
+    targetWorktrees.length +
+      " worktree(s) under target/: cargo clean deletes them; move them outside the repo (git worktree move / node tools/worktree-add.mjs <ticket>)",
+  );
+}
+if (args.strict && (branch === "main" || targetWorktrees.length > 0)) process.exitCode = 1;
 
 if (args.json) {
-  console.log(JSON.stringify({ branch, head, dirty, ahead, behind, worktrees: trees, warnings }, null, 2));
+  console.log(
+    JSON.stringify(
+      {
+        branch,
+        head,
+        dirty,
+        ahead,
+        behind,
+        worktrees: trees,
+        targetWorktrees: targetWorktrees.map((tree) => tree.path),
+        warnings,
+      },
+      null,
+      2,
+    ),
+  );
 } else {
   console.log("branch " + branch + " @ " + head + " | origin/main +" + ahead + " -" + behind + " | dirty " + dirty + " | worktrees " + trees.length);
-  if (args.all) for (const tree of trees) console.log("  " + tree.path + " [" + (tree.branch || "detached") + "]");
+  if (args.all) {
+    for (const tree of trees) {
+      const danger = targetWorktrees.includes(tree) ? "  [under target!]" : "";
+      console.log("  " + tree.path + " [" + (tree.branch || "detached") + "]" + danger);
+    }
+  }
   for (const warning of warnings) console.log("warning: " + warning);
 }
