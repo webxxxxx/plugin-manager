@@ -138,7 +138,7 @@ mod tests {
     /// request must still be answered and the loop must stop on the handle.
     #[test]
     fn the_control_only_loop_answers_a_request_and_stops() {
-        let root = std::env::temp_dir().join(format!(
+        let root = crate::test_support::temp_dir().join(format!(
             "svcd-control-only-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

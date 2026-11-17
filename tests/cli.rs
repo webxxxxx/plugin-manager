@@ -2,11 +2,23 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
+
+fn sandbox_base() -> std::path::PathBuf {
+    // Unix domain sockets cap the whole path at ~108 bytes, so Unix keeps the
+    // short system temp. Windows needs a target-local directory: a restricted
+    // %TEMP% ACL made sandbox creation fail there.
+    if cfg!(windows) {
+        return std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")));
+    }
+    std::env::temp_dir()
+}
 
 struct Sandbox {
     root: PathBuf,
@@ -19,7 +31,7 @@ impl Sandbox {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = sandbox_base().join(format!(
             "svcd-cli-{}-{}-{}",
             std::process::id(),
             nanos,
@@ -60,14 +72,29 @@ impl Sandbox {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(&self.binary)
+        let mut command = Command::new(&self.binary);
+        command
             .args(args)
             .env("SVCD_CONFIG_DIR", self.config_dir())
             .env("SVCD_LOG_DIR", self.logs_dir())
-            .env("SVCD_TEST_UNPRIVILEGED", "1")
-            .output()
-            .expect("run svc")
+            .env("SVCD_TEST_UNPRIVILEGED", "1");
+        // Parallel tests can briefly hit ETXTBSY while another sandbox copies
+        // the multicall binary on a shared filesystem. Retry the exec only.
+        for attempt in 0..50 {
+            match command.output() {
+                Ok(output) => return output,
+                Err(error) if is_executable_busy(&error) && attempt < 49 => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("run svc: {error}"),
+            }
+        }
+        unreachable!("the retry loop returns or panics")
     }
+}
+
+fn is_executable_busy(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::ExecutableFileBusy || error.raw_os_error() == Some(26)
 }
 
 impl Drop for Sandbox {

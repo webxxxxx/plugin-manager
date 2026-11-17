@@ -3050,7 +3050,7 @@ pub mod tempdir {
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!(
+            let path = crate::test_support::temp_dir().join(format!(
                 "svcd-package-{}-{}-{}",
                 std::process::id(),
                 nanos,

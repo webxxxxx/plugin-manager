@@ -124,6 +124,17 @@ node tools/perf/run.mjs --perf
 node tools/perf/run.mjs --scale
 ```
 
+
+### 本机并行测试的环境约束
+
+集成测试的 sandbox 根目录在 Windows 使用 Cargo 提供的 `CARGO_TARGET_TMPDIR`（在 `target/tmp`
+下），不再用系统 `%TEMP%`：受限的 TEMP ACL 曾让 `create sandbox` 直接 `PermissionDenied`，target
+目录始终可写。Unix 保持系统临时目录，因为 Unix domain socket 对整条路径有 ~108 字节上限，target 下
+的深路径会直接 `cannot bind control channel`。`tests/cli.rs` 对并发的 `ETXTBSY`（复制 multicall 二进制后立即 exec）做有限重试；不要把它
+当成测试失败。运行时记录的单测通过 `runtime::tests::with_root` 注入 root，**不要**再在测试里设
+`SVCD_RUN_DIR`（进程级 env + 全局缓存会让并行测试互相踩）。CI 仍用 `--test-threads=1`，本地并行
+跑全量时若看到这些类别失败，先按本节判断是不是环境噪声。
+
 线程预算回归（Linux 补充）：`cargo test --test http unix_idle_thread_count_has_no_per_request_or_per_stream_threads -- --exact`。它读 `/proc/<pid>/status` 的 `Threads:`，断言默认 S4 布局的空载基线为 10 条 daemon 线程（#116 的 2 条阻塞线程 + 迁移期 legacy 路径；#124 删除控制通道与出站客户端两条 reactor）；16 个 keep-alive 连接与 8 个 SSE 流不得各增加一条线程。改变拓扑的切片（如 #125）要同步更新 `IDLE_DAEMON_THREADS`。同一测试还读 `/proc/<pid>/task/*/comm`，断言 `svcd-channel-reactor` / `svcd-channel-client` 不再存在、`svcd-server-loop` 恰好一条；`control_shutdown_reply_is_flushed_before_exit` 在原始控制 socket 上断言 shutdown 回包在进程退出前到达；`server::control` 单测覆盖两个控制连接的回包路由、满 256 队列的 -32000、queued reply 的 shutdown 排空、缺失控制 socket 时的 SSE -32603、无 HTTP 的 control-only loop；`a_busy_http_port_keeps_the_control_channel_alive` 证明 HTTP bind 失败只停 HTTP、CLI 仍可用。
 
 MCP SSE 的 handler 由 `cargo test --bin svcd server::mcp::progress` 覆盖：SSE 头 / chunk 编码、progress 先于 final、-32603 映射、小输出缓冲的分片、断开时取消恰好一次，以及「输出被堵住时不得延长 no-progress 上限」。Unix 上还有 `server::http::driver` 的 wakeup 测试：短 poll wakeup 只提前 tick，不能替换传输 deadline。集成回归是 `cargo test --test http http_mcp_streams_progress_for_tools_call`（顺序断言）与 `http_mcp_stream_consumes_the_long_lived_max_streams_budget`（`max_streams = 1` 时 503 + `Retry-After`，释放后同一调用得到 200 SSE）；Unix 另有 `http_mcp_stream_disconnect_releases_the_budget`（断开的慢调用立即释放槽；Windows 回退没有可取消的 in-flight call，不断言这一条）。
@@ -139,6 +150,7 @@ legacy bridge 的 HTTP 队列有界由 `cargo test --bin svcd the_legacy_bridge_
 | 工作流 | 触发 | 内容 |
 |---|---|---|
 | `test.yml` | PR / main | `cargo test`、`--no-default-features`、`.spk` smoke、`MEM_LEVEL` 三档 |
+| `test.yml` guardrails | PR / main | `tools/closed-tickets-merged.mjs --map 112`：已关闭子票必须有提交在 base |
 | `perf.yml` | 每周 / 手动 | `--perf`，上传报告与 JSON |
 | 兼容套件（待建） | 每晚 / 手动 | `--compat`、Autobahn、WHATWG SSE 向量 |
 

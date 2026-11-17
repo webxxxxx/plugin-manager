@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn the_marker_round_trips_and_ignores_unknown_keys() {
-        let root = std::env::temp_dir().join(format!(
+        let root = crate::test_support::temp_dir().join(format!(
             "svcd-compat-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
