@@ -7,9 +7,8 @@
 //! the hook so a bad package cannot wedge the installer.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,7 +16,6 @@ use std::time::{Duration, Instant};
 use crate::log::{self, LogSink};
 use crate::package;
 use crate::paths;
-use crate::threads;
 
 /// Both hook actions share the same 60-second budget.
 pub const TIMEOUT_MS: u64 = 60_000;
@@ -59,10 +57,7 @@ pub fn run(spec: &Invocation<'_>, poll: &mut dyn FnMut()) -> Result<(), String> 
         .env("SVCD_PLUGIN_VERSION", spec.version)
         .env("SVCD_ACTION", spec.action)
         .env("SVCD_DATA_DIR", paths::data_dir())
-        .env("SVCD_CONFIG_DIR", paths::config_dir())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .env("SVCD_CONFIG_DIR", paths::config_dir());
     #[cfg(windows)]
     {
         // cmd.exe needs these to start; neither reveals user-specific state.
@@ -71,11 +66,6 @@ pub fn run(spec: &Invocation<'_>, poll: &mut dyn FnMut()) -> Result<(), String> 
                 command.env(key, value);
             }
         }
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
     }
 
     // Per the log contract, hook output goes to `<logs>/<id>-hooks.log`, not the
@@ -91,23 +81,34 @@ pub fn run(spec: &Invocation<'_>, poll: &mut dyn FnMut()) -> Result<(), String> 
         }
     };
     let tree = crate::platform::host::process::Tree::new();
-    let mut child = command
-        .spawn()
+    let (mut child, streams) = crate::stdio::spawn(command, crate::stdio::Plan::hook())
         .map_err(|error| format!("spawn {} hook: {}", spec.action, error))?;
     let _ = crate::platform::host::process::adopt(&child);
     if let Some(tree) = &tree {
         tree.assign(&child);
     }
-    spawn_reader(
-        format!("svcd-{}-hook-out", spec.id),
-        child.stdout.take(),
-        log.clone(),
-    );
-    spawn_reader(
-        format!("svcd-{}-hook-err", spec.id),
-        child.stderr.take(),
-        log,
-    );
+    if let Some(stdout) = streams.stdout {
+        if let Err(error) = crate::stdio::log_lines(
+            format!("svcd-{}-hook-out", spec.id),
+            stdout,
+            log.clone(),
+        ) {
+            log::svcd(&format!(
+                "svcd: plugin {}: {} hook stdout reader: {}",
+                spec.id, spec.action, error
+            ));
+        }
+    }
+    if let Some(stderr) = streams.stderr {
+        if let Err(error) =
+            crate::stdio::log_lines(format!("svcd-{}-hook-err", spec.id), stderr, log)
+        {
+            log::svcd(&format!(
+                "svcd: plugin {}: {} hook stderr reader: {}",
+                spec.id, spec.action, error
+            ));
+        }
+    }
 
     let started = Instant::now();
     loop {
@@ -145,27 +146,7 @@ pub fn run(spec: &Invocation<'_>, poll: &mut dyn FnMut()) -> Result<(), String> 
 /// The poll a production caller passes: the loop bound to this thread (the
 /// supervisor loop in the daemon), a no-op on a thread that owns none.
 pub fn poll_this_loop() {
-    #[cfg(unix)]
-    crate::reactor::poll_waiting_loop();
-}
-
-fn spawn_reader<R>(name: String, stream: Option<R>, log: Option<Arc<Mutex<LogSink>>>)
-where
-    R: Read + Send + 'static,
-{
-    let Some(stream) = stream else { return };
-    let _ = thread::Builder::new()
-        .name(name)
-        .stack_size(threads::io_stack())
-        .spawn(move || {
-            for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                if let Some(log) = &log {
-                    if let Ok(mut sink) = log.lock() {
-                        let _ = sink.line(&line);
-                    }
-                }
-            }
-        });
+    crate::stdio::pump_waiting_loop();
 }
 
 fn kill(child: &mut Child) {
@@ -183,6 +164,7 @@ fn kill(child: &mut Child) {
 fn check_executable(action: &str, program: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
+        use std::io::Read;
         use std::os::unix::fs::PermissionsExt;
 
         let mode = fs::metadata(program)

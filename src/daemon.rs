@@ -427,6 +427,9 @@ struct Daemon {
     next_temp_cleanup_ms: u64,
     #[cfg(unix)]
     reactor: Option<Arc<Reactor>>,
+    /// Who reads plugin stdio: copied into every slot, including ones created
+    /// after the poll set started.
+    stdio: crate::stdio::Target,
     raw_hub: Arc<crate::rawhub::RawHub>,
 }
 
@@ -517,6 +520,7 @@ impl Daemon {
             next_temp_cleanup_ms: 0,
             #[cfg(unix)]
             reactor: None,
+            stdio: crate::stdio::Target::threaded(),
             raw_hub,
         }
     }
@@ -738,8 +742,12 @@ impl Daemon {
             }
         }
         self.reactor = reactor.clone();
+        self.stdio = match reactor {
+            Some(reactor) => crate::stdio::Target::polled(reactor),
+            None => crate::stdio::Target::threaded(),
+        };
         for slot in self.slots.values_mut() {
-            slot.set_reactor(reactor.clone());
+            slot.set_stdio(self.stdio.clone());
         }
     }
 
@@ -1400,8 +1408,7 @@ impl Daemon {
                         slot.set_protocol_only(plugin_only);
                         slot.set_remain_after_exit(remain_after_exit);
                         slot.set_wake(self.wake.clone());
-                        #[cfg(unix)]
-                        slot.set_reactor(self.reactor.clone());
+                        slot.set_stdio(self.stdio.clone());
                         slot.set_raw_hub(Some(self.raw_hub.clone()));
                         configure_slot(&mut slot, &service);
                         self.slots.insert(id.clone(), slot);
@@ -1671,8 +1678,7 @@ impl Daemon {
                 slot.set_protocol_only(true);
                 slot.set_remain_after_exit(service.remain_after_exit);
                 slot.set_wake(self.wake.clone());
-                #[cfg(unix)]
-                slot.set_reactor(self.reactor.clone());
+                slot.set_stdio(self.stdio.clone());
                 slot.set_raw_hub(Some(self.raw_hub.clone()));
                 // A slot created by a runtime install needs the same contract,
                 // projector, call budget and notification sink the boot path
@@ -1785,8 +1791,7 @@ impl Daemon {
                 slot.set_protocol_only(true);
                 slot.set_remain_after_exit(service.remain_after_exit);
                 slot.set_wake(self.wake.clone());
-                #[cfg(unix)]
-                slot.set_reactor(self.reactor.clone());
+                slot.set_stdio(self.stdio.clone());
                 slot.set_raw_hub(Some(self.raw_hub.clone()));
                 // A slot created by a runtime install needs the same contract,
                 // projector, call budget and notification sink the boot path
@@ -1956,12 +1961,9 @@ impl Daemon {
     fn pump(&mut self) {
         // Plugin stdio belongs to this loop: one non-blocking pass before every
         // pump keeps plugin pipes moving inside a synchronous start/stop wait.
-        // The condvar path needs no equivalent — its reader threads deliver
+        // The reader-thread target needs no equivalent — its threads deliver
         // into the slot channels on their own.
-        #[cfg(unix)]
-        if let Some(reactor) = &self.reactor {
-            reactor.poll_once(Duration::ZERO);
-        }
+        self.stdio.pump();
         let now = self.now_ms();
         let ids: Vec<String> = self.slots.keys().cloned().collect();
         let mut changed = false;

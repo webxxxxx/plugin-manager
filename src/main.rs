@@ -40,6 +40,7 @@ mod service_win;
 mod settings;
 mod slot;
 mod status;
+mod stdio;
 mod supervisor;
 mod svc;
 mod threads;
