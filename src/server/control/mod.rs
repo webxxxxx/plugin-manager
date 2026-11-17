@@ -71,8 +71,14 @@ impl ServerLoop for ControlOnly {
 
     fn new_state(&mut self, _id: u64, _peer: std::net::IpAddr) {}
     fn on_accept(&mut self, _connection: &mut Connection<()>) {}
-    fn body_limit(&self, _path: &str) -> u64 {
-        0
+    fn route_request(
+        &mut self,
+        _id: u64,
+        _peer: std::net::IpAddr,
+        _head: &crate::http::Head,
+    ) -> Result<crate::server::http::BodyPolicy, Vec<u8>> {
+        // The control-only loop never reads HTTP requests.
+        Ok(crate::server::http::BodyPolicy::Buffered { limit: 0 })
     }
     fn reads_request(&self, _connection: &Connection<()>) -> bool {
         false

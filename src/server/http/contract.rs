@@ -29,6 +29,45 @@ pub enum BodyPolicy {
     Streamed,
 }
 
+impl BodyPolicy {
+    /// Bytes the server may buffer for this route. `Empty` and `Streamed`
+    /// declare that the route does not read a buffered request body, so any
+    /// declared body is refused before it is read.
+    pub(crate) fn limit(self) -> u64 {
+        match self {
+            BodyPolicy::Empty | BodyPolicy::Streamed => 0,
+            BodyPolicy::Buffered { limit } => limit,
+        }
+    }
+
+    /// Whether the server buffers and hands the body to the face. Only a
+    /// `Buffered` route reads a request body; a `Streamed` route's stream
+    /// handler consumes it in the pre-body stream hooks, before this policy is
+    /// consulted.
+    pub(crate) fn buffers_body(self) -> bool {
+        matches!(self, BodyPolicy::Buffered { .. })
+    }
+
+    /// Whether this policy accepts the request's declared framing. A route
+    /// that does not read a body refuses one before a byte is buffered; a
+    /// buffered route enforces its own limit here, before the body.
+    pub(crate) fn accepts(self, framing: http::Framing) -> bool {
+        match framing {
+            http::Framing::None => true,
+            http::Framing::Length(length) => length <= self.limit(),
+            http::Framing::Chunked => self.buffers_body(),
+        }
+    }
+
+    /// Whether the server must answer `Expect: 100-continue` before reading
+    /// this body. A bodyless or streamed route never confirms one.
+    pub(crate) fn confirms_body(self, head: &http::Head, framing: http::Framing) -> bool {
+        self.buffers_body()
+            && !matches!(framing, http::Framing::None | http::Framing::Length(0))
+            && http::expects_continue(head)
+    }
+}
+
 /// Why a route's body cannot be handed to the face.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyError {
@@ -386,6 +425,45 @@ mod tests {
             body_for(BodyPolicy::Buffered { limit: 3 }, b"body"),
             Err(BodyError::TooLarge)
         );
+    }
+
+    #[test]
+    fn a_body_policy_accepts_only_the_framing_it_declares() {
+        use crate::http::Framing;
+
+        assert!(BodyPolicy::Empty.accepts(Framing::None));
+        assert!(BodyPolicy::Empty.accepts(Framing::Length(0)));
+        assert!(!BodyPolicy::Empty.accepts(Framing::Length(1)));
+        assert!(!BodyPolicy::Empty.accepts(Framing::Chunked));
+
+        assert!(BodyPolicy::Buffered { limit: 4 }.accepts(Framing::Length(4)));
+        assert!(!BodyPolicy::Buffered { limit: 4 }.accepts(Framing::Length(5)));
+        assert!(BodyPolicy::Buffered { limit: 4 }.accepts(Framing::Chunked));
+        assert!(!BodyPolicy::Streamed.accepts(Framing::Length(1)));
+    }
+
+    #[test]
+    fn a_body_policy_confirms_expect_only_when_it_reads_a_body() {
+        let head = |expect: bool| {
+            let expect = if expect {
+                "Expect: 100-continue\r\n"
+            } else {
+                ""
+            };
+            let raw = format!(
+                "PUT /x HTTP/1.1\r\nHost: x\r\n{}Content-Length: 4\r\n\r\n",
+                expect
+            );
+            crate::http::parse_head(raw.as_bytes()).expect("head").0
+        };
+        let framing = crate::http::Framing::Length(4);
+
+        assert!(BodyPolicy::Buffered { limit: 4 }.confirms_body(&head(true), framing));
+        assert!(!BodyPolicy::Buffered { limit: 4 }.confirms_body(&head(false), framing));
+        assert!(!BodyPolicy::Empty.confirms_body(&head(true), framing));
+        assert!(!BodyPolicy::Streamed.confirms_body(&head(true), framing));
+        assert!(!BodyPolicy::Buffered { limit: 4 }
+            .confirms_body(&head(true), crate::http::Framing::Length(0)));
     }
 
     #[test]

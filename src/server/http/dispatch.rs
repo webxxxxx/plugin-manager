@@ -7,7 +7,6 @@ use std::time::Instant;
 use crate::http;
 use crate::lan::{AuthKind, Lan};
 use crate::log;
-use crate::server::http::engine::HttpRequest;
 
 use super::contract::{
     body_for, BodyError, BodyPolicy, CompletionSlot, Dispatch, Exchange, ExchangeKind, Face,
@@ -54,29 +53,32 @@ impl DispatchError {
     }
 }
 
-/// A face-owned request with authentication and its body already resolved.
+/// A face-owned request whose principal is resolved but whose body is still
+/// on the wire. The server reads the body under `route.body` and only then
+/// attaches it, so authentication and the route's limit are enforced before a
+/// single body byte is buffered.
 pub(crate) struct PreparedFace {
     pub(crate) route: Route,
     pub(crate) request: Request,
 }
 
-/// Ask the face whether it owns the request, then resolve the principal and
-/// apply the route's body policy. `Ok(None)` leaves the request to the
-/// server-owned routes; `Err` is a rendered authentication or body error.
-pub(crate) fn prepare_face_request(
+/// Ask the face whether it owns the request and resolve the principal. This is
+/// the one `Face::route` call for a request; `Ok(None)` leaves the request to
+/// the server-owned routes, `Err` is a rendered authentication error.
+pub(crate) fn route_face_request(
     face: &dyn Face,
-    request: &HttpRequest,
+    head: &http::Head,
     peer: IpAddr,
     lan: &Arc<Mutex<Lan>>,
 ) -> Result<Option<PreparedFace>, Vec<u8>> {
-    let Some(route) = face.route(&request.method, &request.path) else {
+    let Some(route) = face.route(&head.method, &head.path) else {
         return Ok(None);
     };
     let principal = if route.public {
         AuthKind::None
     } else {
         match lan.lock() {
-            Ok(mut state) => match state.authenticate(&request.headers) {
+            Ok(mut state) => match state.authenticate(&head.headers) {
                 Ok(principal) => principal,
                 Err(()) => {
                     return Err(http::json_error(
@@ -86,16 +88,32 @@ pub(crate) fn prepare_face_request(
                     ))
                 }
             },
-            Err(_) => {
-                return Err(http::json_error(
-                    500,
-                    "internal",
-                    "LAN state unavailable",
-                ))
-            }
+            Err(_) => return Err(http::json_error(500, "internal", "LAN state unavailable")),
         }
     };
-    let body = match body_for(route.body, &request.body) {
+    Ok(Some(PreparedFace {
+        route,
+        request: Request {
+            method: head.method.clone(),
+            path: head.path.clone(),
+            headers: head.headers.clone(),
+            peer,
+            principal,
+            body: Vec::new(),
+            deadline: None,
+            cancel: None,
+        },
+    }))
+}
+
+/// Attach the body the server read under `route.body`. The server already
+/// enforced the limit on the wire; this repeats the check so a future engine
+/// cannot hand a route more than it declared.
+pub(crate) fn attach_face_body(
+    mut prepared: PreparedFace,
+    body: &[u8],
+) -> Result<PreparedFace, Vec<u8>> {
+    prepared.request.body = match body_for(prepared.route.body, body) {
         Ok(body) => body,
         Err(BodyError::TooLarge) => {
             return Err(http::json_error(
@@ -105,19 +123,7 @@ pub(crate) fn prepare_face_request(
             ))
         }
     };
-    Ok(Some(PreparedFace {
-        route,
-        request: Request {
-            method: request.method.clone(),
-            path: request.path.clone(),
-            headers: request.headers.clone(),
-            peer,
-            principal,
-            body,
-            deadline: None,
-            cancel: None,
-        },
-    }))
+    Ok(prepared)
 }
 
 /// Turn a dispatch result into wire bytes.
@@ -304,6 +310,43 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("expected a dispatch error, got a successful exchange"),
         }
+    }
+
+    struct CountingFace {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Face for CountingFace {
+        fn route(&self, _method: &str, _path: &str) -> Option<Route> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        }
+
+        fn handle(&self, _request: Request, _done: Completion) {}
+    }
+
+    #[test]
+    fn route_face_request_asks_the_face_once() {
+        let bind = "127.0.0.1:0".parse().expect("bind");
+        let lan = Arc::new(Mutex::new(Lan::new(bind, bind, true, Some("hash".into()))));
+        let face = CountingFace {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let head = http::Head {
+            method: "GET".into(),
+            path: "/api/v1/version".into(),
+            version: "HTTP/1.1".into(),
+            headers: Vec::new(),
+        };
+
+        let result = route_face_request(&face, &head, "127.0.0.1".parse().expect("peer"), &lan)
+            .expect("route");
+        assert!(result.is_none());
+        assert_eq!(
+            face.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the helper makes exactly one Face::route call"
+        );
     }
 
     #[test]

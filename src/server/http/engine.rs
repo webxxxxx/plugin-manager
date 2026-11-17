@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 use crate::http;
 
 #[cfg(unix)]
+use crate::server::http::contract::BodyPolicy;
+#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 
 /// The busy response for a connection refused by the loop. Both engines send
@@ -128,7 +130,14 @@ pub trait ServerLoop {
     fn on_accept(&mut self, connection: &mut Connection<Self::State>);
     /// True when the state machine is waiting for an HTTP request head/body.
     fn reads_request(&self, connection: &Connection<Self::State>) -> bool;
-    fn body_limit(&self, path: &str) -> u64;
+    /// Resolve the request's route (once) and authentication, and return the
+    /// body policy the loop must apply before reading a single body byte.
+    fn route_request(
+        &mut self,
+        id: u64,
+        peer: IpAddr,
+        head: &http::Head,
+    ) -> Result<BodyPolicy, Vec<u8>>;
     fn pre_request(&mut self, connection: &mut Connection<Self::State>) -> PreRequest;
     fn on_request(&mut self, connection: &mut Connection<Self::State>, request: HttpRequest);
     fn on_error(&mut self, connection: &mut Connection<Self::State>, response: Vec<u8>);
@@ -334,8 +343,10 @@ where
                             connection.buffer.extend_from_slice(&chunk[..read]);
                             match handler.pre_request(connection) {
                                 PreRequest::Continue => {
-                                    match advance_request(connection, |path| {
-                                        handler.body_limit(path)
+                                    let id = connection.id;
+                                    let peer = connection.peer;
+                                    match advance_request(connection, |head| {
+                                        handler.route_request(id, peer, head)
                                     }) {
                                         Ok(None) => {}
                                         Ok(Some(request)) => {
@@ -395,7 +406,7 @@ fn reject_connection(mut stream: TcpStream) {
 #[cfg(unix)]
 pub fn advance_request<S>(
     connection: &mut Connection<S>,
-    body_limit: impl Fn(&str) -> u64,
+    mut route: impl FnMut(&http::Head) -> Result<BodyPolicy, Vec<u8>>,
 ) -> Result<Option<HttpRequest>, Vec<u8>> {
     if connection.pending.is_none() {
         // This request's method decides how its response is rendered. Clear
@@ -430,14 +441,55 @@ pub fn advance_request<S>(
         connection.head_only = crate::http::is_head(&head.method);
         let framing = http::framing(&head.headers)
             .map_err(|message| crate::http::json_error(400, "bad_request", &message))?;
-        let limit = body_limit(&head.path);
-        if let http::Framing::Length(length) = framing {
-            if length > limit {
-                return Err(crate::http::json_error(
-                    413,
-                    "payload_too_large",
-                    "request body is too large",
-                ));
+        // Route and authenticate before the body. While the body is still
+        // arriving `pending` stays Some, so this callback runs exactly once per
+        // request and the face never sees a different route for the same head.
+        let body = match route(&head) {
+            Ok(body) => body,
+            Err(response) => {
+                // A bodyless request can keep a refused connection alive: the
+                // 401 is the whole exchange, and there is no unread body to
+                // become the next request. A request that declared a body is
+                // closed instead (the result is returned to on_error).
+                if matches!(framing, http::Framing::None | http::Framing::Length(0)) {
+                    let keep_alive = wants_keep_alive_head(&head);
+                    let response = if keep_alive {
+                        keep_alive_response(response)
+                    } else {
+                        response
+                    };
+                    connection.out = if connection.head_only {
+                        http::strip_body(response)
+                    } else {
+                        response
+                    };
+                    connection.out_at = 0;
+                    connection.keep_alive = keep_alive;
+                    // Consume this head so the next poll does not route the
+                    // same refused request again; any bytes after it are the
+                    // next (unsupported) pipelined request and stay buffered.
+                    let buffer = std::mem::take(&mut connection.buffer);
+                    connection.buffer = buffer[body_start..].to_vec();
+                    return Ok(None);
+                }
+                return Err(response);
+            }
+        };
+        let limit = body.limit();
+        if !body.accepts(framing) {
+            return Err(crate::http::json_error(
+                413,
+                "payload_too_large",
+                "request body is too large",
+            ));
+        }
+        if body.confirms_body(&head, framing) {
+            // Write the interim head in one non-blocking call. If it is only
+            // partially accepted, close without appending a second status line:
+            // a truncated 100 followed by a 400 would desync the client.
+            match connection.stream.write(http::CONTINUE_RESPONSE) {
+                Ok(written) if written == http::CONTINUE_RESPONSE.len() => {}
+                _ => return Err(Vec::new()),
             }
         }
         let buffer = std::mem::take(&mut connection.buffer);
@@ -513,14 +565,25 @@ pub fn advance_request<S>(
 /// opposite unless the client opts in. Pipelining is not supported: the next
 /// request is read after the previous response is written.
 pub fn wants_keep_alive(request: &HttpRequest) -> bool {
-    let connection = http::header(&request.headers, "connection")
+    wants_keep_alive_parts(&request.version, &request.headers)
+}
+
+/// Keep-alive for a head whose body has not been read yet. The Windows
+/// fallback needs the decision before the body so a rejected request closes
+/// instead of leaving unread bytes in front of the next request.
+pub fn wants_keep_alive_head(head: &http::Head) -> bool {
+    wants_keep_alive_parts(&head.version, &head.headers)
+}
+
+fn wants_keep_alive_parts(version: &str, headers: &[(String, String)]) -> bool {
+    let connection = http::header(headers, "connection")
         .unwrap_or("")
         .to_ascii_lowercase();
     let close = connection.split(',').any(|token| token.trim() == "close");
     if close {
         return false;
     }
-    if request.version.eq_ignore_ascii_case("HTTP/1.0") {
+    if version.eq_ignore_ascii_case("HTTP/1.0") {
         return connection
             .split(',')
             .any(|token| token.trim() == "keep-alive");
@@ -538,4 +601,77 @@ pub fn keep_alive_response(mut response: Vec<u8>) -> Vec<u8> {
         response.splice(position..position + CLOSE.len(), KEEP.iter().copied());
     }
     response
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn connection(buffer: &[u8]) -> Connection<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let client = TcpStream::connect(address).expect("client");
+        let (stream, peer) = listener.accept().expect("accept");
+        stream.set_nonblocking(true).expect("nonblocking");
+        let mut connection = Connection {
+            id: 1,
+            stream,
+            peer: peer.ip(),
+            last_active: Instant::now(),
+            buffer: Vec::new(),
+            out: Vec::new(),
+            out_at: 0,
+            keep_alive: false,
+            head_only: false,
+            pending: None,
+            state: (),
+        };
+        connection.buffer.extend_from_slice(buffer);
+        drop(client);
+        connection
+    }
+
+    #[test]
+    fn the_route_callback_runs_once_while_a_chunked_body_arrives_in_pieces() {
+        let mut connection =
+            connection(b"POST /body HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n");
+        let mut calls = 0;
+        let mut route = |_head: &http::Head| {
+            calls += 1;
+            Ok(BodyPolicy::Buffered { limit: 64 })
+        };
+
+        assert!(advance_request(&mut connection, &mut route)
+            .expect("head")
+            .is_none());
+        connection.buffer.extend_from_slice(b"4\r\npart\r\n");
+        assert!(advance_request(&mut connection, &mut route)
+            .expect("first chunk")
+            .is_none());
+        connection
+            .buffer
+            .extend_from_slice(b"4\r\nbody\r\n0\r\n\r\n");
+        let request = advance_request(&mut connection, &mut route)
+            .expect("last chunk")
+            .expect("complete request");
+
+        assert_eq!(request.body, b"partbody");
+        assert_eq!(
+            calls, 1,
+            "route must be resolved once, before the body is read"
+        );
+    }
+
+    #[test]
+    fn an_empty_route_refuses_a_declared_body_before_any_body_byte_is_read() {
+        let mut connection =
+            connection(b"POST /action HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n");
+        let response = advance_request(&mut connection, |_head| Ok(BodyPolicy::Empty))
+            .expect_err("an empty route must refuse a declared body");
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 413"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+    }
 }
