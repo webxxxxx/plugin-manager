@@ -1744,20 +1744,30 @@ impl Daemon {
 
         loop {
             self.pump();
-            let mut all_running = true;
+            let mut all_settled = true;
             for id in &pending {
-                match self.slots[id].machine.state {
-                    State::Running => {}
-                    State::Failed => {
-                        return Err(ProblemError::new(
-                            Problem::Internal,
-                            format!("service {} failed to start", id),
-                        ));
-                    }
-                    _ => all_running = false,
+                let state = self.slots[id].machine.state;
+                if state == State::Failed {
+                    return Err(ProblemError::new(
+                        Problem::Internal,
+                        format!("service {} failed to start", id),
+                    ));
+                }
+                if state == State::Stopped {
+                    // It reached ready and then exited cleanly before this
+                    // pass looked (`ready: exec` one-shots do exactly that).
+                    // Waiting for Running burns the whole window and then
+                    // reports a timeout for a start that did succeed.
+                    log::svcd(&format!(
+                        "svcd: {}: exited cleanly during start; the start is complete",
+                        id
+                    ));
+                }
+                if !start_settled(state) {
+                    all_settled = false;
                 }
             }
-            if all_running {
+            if all_settled {
                 return Ok(());
             }
             if self.now_ms() >= deadline {
@@ -2623,6 +2633,16 @@ fn param_id(request: &rpc::Request) -> Result<String, rpc::Response> {
                 problem_data(Problem::Invalid),
             )
         })
+}
+
+/// `true` once a pending start needs no further wait.
+///
+/// `Stopped` counts: a service that reaches ready and then exits cleanly is
+/// finished starting, not still starting. Waiting for `Running` there costs the
+/// whole start window and reports a timeout for a start that did work — a
+/// `ready: "exec"` one-shot (`cmd /c exit 0`) hits this on every boot scan.
+fn start_settled(state: State) -> bool {
+    matches!(state, State::Running | State::Stopped)
 }
 
 fn start_layers(registry: &Registry, ids: &[String]) -> Result<Vec<Vec<String>>, ProblemError> {
@@ -3843,6 +3863,18 @@ while ($null -ne ($line = $reader.ReadLine())) {
             json!({"path": path.to_string_lossy(), "strategy": "replace"}),
         );
         assert_error_kind(&response, -32006, "unsupported_platform");
+    }
+
+    #[test]
+    fn a_clean_exit_settles_a_pending_start_instead_of_waiting_for_running() {
+        // Regression for #159: the wait used to accept only `Running`, so a
+        // one-shot that exited right after ready kept the loop busy until the
+        // deadline (30 s) and reported a timeout for a start that succeeded.
+        assert!(start_settled(State::Running));
+        assert!(start_settled(State::Stopped));
+        assert!(!start_settled(State::Starting));
+        assert!(!start_settled(State::Stopping));
+        assert!(!start_settled(State::Backoff));
     }
 
     #[test]
