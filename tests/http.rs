@@ -1156,7 +1156,9 @@ fn try_ws_handshake(
 }
 
 /// A handshake that has to reach the handler: retry until the daemon admits the
-/// connection instead of panicking on the admission refusal (#155).
+/// connection instead of panicking on the admission refusal (#155). A readable
+/// 503 is the same refusal as a reset one: the gate answers busy without a
+/// handler, so it is retried too.
 fn ws_handshake_admitted(
     sandbox: &mut Sandbox,
     address: &str,
@@ -1166,6 +1168,19 @@ fn ws_handshake_admitted(
     let deadline = Instant::now() + ADMISSION_WAIT;
     loop {
         match try_ws_handshake(address, path, extra) {
+            Ok((stream, 503, _head)) => {
+                drop(stream);
+                if Instant::now() >= deadline || !daemon_state(sandbox).starts_with("running") {
+                    regression_failure(
+                        sandbox,
+                        "max_connections",
+                        &format!("GET {path} (WebSocket handshake)"),
+                        "an admitted handshake within the admission wait",
+                        "the admission gate kept answering 503",
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
             Ok(handshake) => return handshake,
             Err(error) => {
                 if Instant::now() >= deadline || !daemon_state(sandbox).starts_with("running") {
@@ -6552,6 +6567,9 @@ fn exchange(address: &str, head: &str, body: &[u8]) -> Exchange {
     }
 
     let mut exchange = parse_exchange(&raw);
+    // The read failure is the more specific diagnosis: with an empty buffer
+    // `parse_exchange` can only say "incomplete response", hiding the reset or
+    // read error that actually happened.
     exchange.error = failure.or(exchange.error);
     if exchange.error.is_some() {
         exchange.error = Some(format!(
@@ -6728,7 +6746,9 @@ fn assert_daemon_alive(sandbox: &mut Sandbox, phase: &str) {
 const ADMISSION_WAIT: Duration = Duration::from_secs(30);
 
 /// True when the probe never reached a handler: the admission gate answered
-/// busy, or the connection was reset before the response head.
+/// busy, or the connection was reset before the response head. A complete
+/// non-2xx answer (a real 4xx/5xx from a handler) is *not* a refusal, so the
+/// retry loops return it immediately and report it as a failure.
 fn admission_refused(probe: &Exchange) -> bool {
     probe.status == 0 || probe.status == 503 || probe.error.is_some()
 }
@@ -6768,12 +6788,28 @@ fn assert_concurrent_connections(sandbox: &mut Sandbox, address: &str, streams: 
     let deadline = Instant::now() + ADMISSION_WAIT;
     let mut last = String::from("no attempt");
     loop {
-        let mut first = TcpStream::connect(address).expect("first connection");
-        let mut second = TcpStream::connect(address).expect("second connection");
+        let mut first = connect_for_probe(
+            sandbox,
+            "max_connections",
+            "first concurrent connection",
+            address,
+        );
+        let mut second = connect_for_probe(
+            sandbox,
+            "max_connections",
+            "second concurrent connection",
+            address,
+        );
         for stream in [&first, &second] {
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("timeout");
+            if let Err(error) = stream.set_read_timeout(Some(Duration::from_secs(5))) {
+                regression_failure(
+                    sandbox,
+                    "max_connections",
+                    "a concurrent connection",
+                    "a socket with a read timeout",
+                    &format!("read timeout: {error}"),
+                );
+            }
         }
         // Let the accept loop admit (or refuse) both sockets before either
         // writes, so the refusal arrives with no unread request data.
@@ -6782,16 +6818,27 @@ fn assert_concurrent_connections(sandbox: &mut Sandbox, address: &str, streams: 
         if streams {
             for (name, stream) in [("first", &mut first), ("second", &mut second)] {
                 if let Err(error) = stream.write_all(request.as_bytes()) {
+                    // Both sockets can be refused before the pair is retried.
                     last = format!("{name} concurrent connection: write: {error}");
                     accepted = false;
                     continue;
                 }
                 match read_status_line(stream) {
                     Ok(200) => {}
-                    Ok(status) => {
-                        last = format!("{name} concurrent connection: status {status}");
+                    // 503 is the admission gate answering; wait for a slot.
+                    Ok(503) => {
+                        last = format!("{name} concurrent connection: status 503");
                         accepted = false;
                     }
+                    // Any other complete answer is a real failure, not a
+                    // refusal: report it now instead of retrying it away.
+                    Ok(status) => regression_failure(
+                        sandbox,
+                        "max_connections",
+                        &format!("{name} concurrent connection"),
+                        "status 200",
+                        &format!("status {status}"),
+                    ),
                     Err(error) => {
                         last = format!("{name} concurrent connection: {error}");
                         accepted = false;
@@ -6812,22 +6859,35 @@ fn assert_concurrent_connections(sandbox: &mut Sandbox, address: &str, streams: 
                     } else {
                         match read_status_line(&mut first) {
                             Ok(200) => return,
-                            Ok(status) => {
+                            // The first socket was refused too: a fresh pair
+                            // may still see the released slot.
+                            Ok(503) => {
                                 last = format!(
-                                    "first (admitted) concurrent connection: status {status}"
+                                    "first (admitted) concurrent connection: status 503"
                                 )
                             }
+                            Ok(status) => regression_failure(
+                                sandbox,
+                                "max_connections",
+                                "first (admitted) concurrent connection",
+                                "status 200",
+                                &format!("status {status}"),
+                            ),
                             Err(error) => {
                                 last = format!("first (admitted) concurrent connection: {error}")
                             }
                         }
                     }
                 }
-                Ok(status) => {
-                    last = format!(
-                        "second concurrent connection (refused at accept, no request sent): status {status}"
-                    )
-                }
+                // A complete non-503 answer means the floor admitted both (or
+                // answered something else): a real failure, not a retry.
+                Ok(status) => regression_failure(
+                    sandbox,
+                    "max_connections",
+                    "second concurrent connection (refused at accept, no request sent)",
+                    "status 503",
+                    &format!("status {status}"),
+                ),
                 Err(error) => {
                     last = format!(
                         "second concurrent connection (refused at accept, no request sent): {error}"
@@ -6853,6 +6913,21 @@ fn assert_concurrent_connections(sandbox: &mut Sandbox, address: &str, streams: 
             );
         }
         std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Connect one probe socket, reporting a dead listener through the config-key
+/// channel instead of a bare panic (docs/testing.md §6).
+fn connect_for_probe(sandbox: &mut Sandbox, key: &str, what: &str, address: &str) -> TcpStream {
+    match TcpStream::connect(address) {
+        Ok(stream) => stream,
+        Err(error) => regression_failure(
+            sandbox,
+            key,
+            what,
+            "a connectable daemon",
+            &format!("connect {address}: {error}"),
+        ),
     }
 }
 
@@ -6982,9 +7057,11 @@ fn sse_open_retrying(address: &str, path: &str, last_id: Option<u64>) -> Result<
 
 /// An SSE stream that has to reach the handler. `sse_open_retrying` already
 /// retries the subscriber-release 429; this also retries the admission refusal
-/// and reports through the config-key channel instead of panicking (#155).
+/// and reports through the config key that the caller's probe belongs to
+/// instead of panicking (#155).
 fn sse_open_admitted(
     sandbox: &mut Sandbox,
+    key: &str,
     address: &str,
     path: &str,
     last_id: Option<u64>,
@@ -6997,7 +7074,7 @@ fn sse_open_admitted(
                 if Instant::now() >= deadline || !daemon_state(sandbox).starts_with("running") {
                     regression_failure(
                         sandbox,
-                        "max_connections",
+                        key,
                         &format!("GET {path} (SSE)"),
                         "an admitted SSE stream within the admission wait",
                         &error,
@@ -7249,32 +7326,61 @@ fn run_min_config_phase(phase: &str, streams: bool) {
         address
     );
     let idle_deadline = Instant::now() + ADMISSION_WAIT;
+    let mut idle_last = String::from("no attempt");
     let (mut idle, kept) = loop {
-        let mut stream = TcpStream::connect(&address).expect("idle connection");
-        stream
-            .set_read_timeout(Some(Duration::from_millis(500)))
-            .expect("timeout");
-        stream
-            .write_all(idle_request.as_bytes())
-            .expect("keep-alive request");
-        let kept = read_one_response(&mut stream);
-        if kept.status == 200
-            || Instant::now() >= idle_deadline
-            || !daemon_state(&mut sandbox).starts_with("running")
-        {
-            break (stream, kept);
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    };
-    if kept.status != 200 {
-        regression_failure(
+        let mut stream = connect_for_probe(
             &mut sandbox,
             "http_idle_timeout_secs",
             "keep-alive GET /api/v1/services",
-            "status 200 on the keep-alive connection",
-            &format!("status {}", kept.status),
+            &address,
         );
-    }
+        if let Err(error) = stream.set_read_timeout(Some(Duration::from_millis(500))) {
+            regression_failure(
+                &mut sandbox,
+                "http_idle_timeout_secs",
+                "keep-alive GET /api/v1/services",
+                "a socket with a read timeout",
+                &format!("read timeout: {error}"),
+            );
+        }
+        let kept = match stream.write_all(idle_request.as_bytes()) {
+            Ok(()) => read_one_response(&mut stream),
+            // A refused connection can be reset on write: not admitted yet.
+            Err(error) => {
+                idle_last = format!("write: {error}");
+                RawResponse {
+                    status: 0,
+                    body: Vec::new(),
+                    headers: Vec::new(),
+                }
+            }
+        };
+        if kept.status == 200 {
+            break (stream, kept);
+        }
+        if kept.status != 0 && kept.status != 503 {
+            // A complete answer that is neither success nor the admission
+            // gate is a real failure; do not retry it away.
+            regression_failure(
+                &mut sandbox,
+                "http_idle_timeout_secs",
+                "keep-alive GET /api/v1/services",
+                "status 200 on the keep-alive connection",
+                &format!("status {}", kept.status),
+            );
+        }
+        idle_last = format!("status {}", kept.status);
+        if Instant::now() >= idle_deadline || !daemon_state(&mut sandbox).starts_with("running") {
+            regression_failure(
+                &mut sandbox,
+                "http_idle_timeout_secs",
+                "keep-alive GET /api/v1/services",
+                "status 200 on the keep-alive connection",
+                &idle_last,
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
     let opened = Instant::now();
     let mut closed = false;
     let mut sink = [0u8; 128];
@@ -7528,7 +7634,13 @@ fn run_min_config_phase(phase: &str, streams: bool) {
         // receive the event published while no subscriber was attached. The
         // subscriber slot and the connection slot are both released by the
         // server asynchronously, so the open waits them out instead of failing.
-        let mut sse = sse_open_admitted(&mut sandbox, &address, &events_path, None);
+        let mut sse = sse_open_admitted(
+            &mut sandbox,
+            "max_subscribers_per_plugin",
+            &address,
+            &events_path,
+            None,
+        );
         let rpc_path = format!("{}rpc", base);
         let call = br#"{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"status","arguments":{}}}"#;
         let answered = exchange_admitted(
@@ -7613,7 +7725,13 @@ fn run_min_config_phase(phase: &str, streams: bool) {
             &published,
         );
 
-        let mut replay = sse_open_admitted(&mut sandbox, &address, &events_path, Some(last_id));
+        let mut replay = sse_open_admitted(
+            &mut sandbox,
+            "max_subscribers_per_plugin",
+            &address,
+            &events_path,
+            Some(last_id),
+        );
         let replayed = sse_next_event(&mut replay, "pong-event", Duration::from_secs(5))
             .unwrap_or_else(|error| {
                 regression_failure(
@@ -8106,13 +8224,22 @@ fn a_stuck_supervisor_answers_504_and_the_worker_recovers() {
     // Setup, not subject: the test runs with the deliberately tiny
     // `control_timeout_secs = 1`, and a loaded host can push a normal control
     // round trip past it. Retry the start (it is idempotent) instead of reading
-    // one 504 as a regression; the 504 assertions below are the subject.
+    // one 504 as a regression; the 504 assertions below are the subject. Keep
+    // the last answer so a timeout still prints what the daemon replied.
+    let last_start = std::cell::RefCell::new(String::from("no attempt"));
     wait_until_within(
         &sandbox,
         "the demo service never started",
         Duration::from_secs(10),
-        || request(&address, "POST", "/api/v1/services/demo/start", "", b"").status == 200,
-        || String::new(),
+        || {
+            let response = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
+            if response.status == 200 {
+                return true;
+            }
+            *last_start.borrow_mut() = format!("status {}: {}", response.status, response.body);
+            false
+        },
+        || last_start.borrow().clone(),
     );
 
     let stop_address = address.clone();

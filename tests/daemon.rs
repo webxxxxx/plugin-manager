@@ -1066,11 +1066,12 @@ if ($action -eq 'start') { start } elseif ($action -eq 'status') { status }
         .parse()
         .expect("child pid");
 
-    let leader = sandbox.status("demo")["summary"]["pid"]
-        .as_u64()
-        .expect("leader pid") as u32;
+    let child = ProcessInstance::capture(child_pid);
+    let leader = ProcessInstance::capture(
+        sandbox.status("demo")["summary"]["pid"].as_u64().expect("leader pid") as u32,
+    );
     wait_until("the script leader to exit", Duration::from_secs(10), || {
-        !pid_alive(leader)
+        !leader.is_alive()
     });
 
     let status = sandbox.status("demo");
@@ -1088,7 +1089,7 @@ if ($action -eq 'start') { start } elseif ($action -eq 'status') { status }
     wait_until(
         "the background child to die with the service",
         Duration::from_secs(10),
-        || !pid_alive(child_pid),
+        || !child.is_alive(),
     );
 }
 
@@ -1197,6 +1198,8 @@ fn process_start_time(pid: u32) -> Option<u64> {
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
+        // No cheap creation-time source here. Instance checks then degrade to
+        // pid liveness (the pre-#155 answer): weaker, but never a fake "gone".
         let _ = pid;
         None
     }
@@ -2745,17 +2748,8 @@ fn a_stopping_record_is_finished_with_the_stop_action() {
         .expect("spawn leftover");
     let pid = child.id();
     let leftover = ProcessInstance::capture(pid);
-    let starttime: u64 = {
-        let stat = fs::read_to_string(format!("/proc/{}/stat", pid)).expect("stat");
-        stat.split_once(") ")
-            .expect("stat format")
-            .1
-            .split_whitespace()
-            .nth(19)
-            .expect("starttime")
-            .parse()
-            .expect("starttime integer")
-    };
+    // The record stores the same field 22 that the instance identity captured.
+    let starttime: u64 = leftover.start.expect("starttime");
     let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .expect("boot id")
         .trim()
@@ -2985,22 +2979,22 @@ fn a_restarted_daemon_adopts_an_exec_ready_service() {
     let mut sandbox = Sandbox::new();
     sandbox.write_stop_script("script");
     sandbox.start_daemon_ready();
-    let pid = sandbox.running_pid("script");
+    let adopted = ProcessInstance::capture(sandbox.running_pid("script"));
 
     sandbox.force_kill_daemon();
     wait_until(
         "the service to survive svcd",
         Duration::from_secs(10),
-        || pid_alive(pid),
+        || adopted.is_alive(),
     );
 
     sandbox.start_daemon_ready();
     let status = sandbox.wait_for_state("script", "running", Duration::from_secs(15));
     assert_eq!(
         status["summary"]["pid"].as_u64(),
-        Some(pid as u64),
+        Some(adopted.pid as u64),
         "the restarted daemon should adopt pid {}: {}",
-        pid,
+        adopted.pid,
         status
     );
     assert_eq!(status["details"]["failures"], 0, "{status}");
@@ -3015,7 +3009,7 @@ fn a_runtime_record_from_another_boot_is_ignored() {
     let mut sandbox = Sandbox::new();
     sandbox.write_stop_script("script");
     sandbox.start_daemon_ready();
-    let pid = sandbox.running_pid("script");
+    let stale = ProcessInstance::capture(sandbox.running_pid("script"));
     sandbox.shutdown();
 
     // Leave a record as if the previous daemon had written it before a reboot.
@@ -3026,7 +3020,7 @@ fn a_runtime_record_from_another_boot_is_ignored() {
         serde_json::to_vec(&json!({
             "boot": "an-older-boot",
             "state": "running",
-            "pid": pid,
+            "pid": stale.pid,
         }))
         .expect("json"),
     )
@@ -3034,9 +3028,10 @@ fn a_runtime_record_from_another_boot_is_ignored() {
 
     sandbox.start_daemon_ready();
     let status = sandbox.wait_for_state("script", "running", Duration::from_secs(15));
-    assert_ne!(
-        status["summary"]["pid"].as_u64(),
-        Some(pid as u64),
+    let current =
+        ProcessInstance::capture(status["summary"]["pid"].as_u64().expect("pid") as u32);
+    assert!(
+        stale.is_replaced_by(current),
         "a record from another boot must not be adopted: {}",
         status
     );
