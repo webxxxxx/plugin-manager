@@ -873,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn head_only_keeps_the_head_and_its_content_length() {
+    fn strip_body_keeps_the_head_and_its_content_length() {
         let full = response(401, "application/json", br#"{"error":"unauthorized"}"#);
         let head = strip_body(full.clone());
         let end = full
