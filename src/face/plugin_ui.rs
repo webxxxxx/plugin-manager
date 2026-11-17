@@ -92,6 +92,7 @@ impl PluginUiFace {
             streams: Arc::new(StreamContext {
                 paths: config.paths.clone(),
                 raw_hub,
+                limits: config.limits.clone(),
             }),
         }
     }

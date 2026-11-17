@@ -19,6 +19,7 @@
     "settings": { "concept": "platform/config", "layer": "platform" },
     "limits": { "concept": "platform/config", "layer": "platform" },
     "config": { "concept": "platform/config", "layer": "platform", "note": "S7：运行配置 Config 在组合根派生一次（ADR-0019）；只依赖 settings/limits/paths 与 std" },
+    "clock": { "concept": "platform/clock", "layer": "platform", "note": "S8（#160）：时刻成对 Now + Clock，只在组合根构造一次（ADR-0020）；只依赖 std" },
     "threads": { "concept": "platform/host", "layer": "platform" },
     "wake": { "concept": "platform/host", "layer": "platform" },
     "zerocopy": { "concept": "platform/host", "layer": "platform" },

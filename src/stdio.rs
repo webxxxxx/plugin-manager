@@ -211,10 +211,11 @@ pub(crate) fn log_lines(
     name: String,
     stream: ReadEnd,
     log: Option<Arc<Mutex<LogSink>>>,
+    limits: &crate::limits::Limits,
 ) -> io::Result<()> {
     thread::Builder::new()
         .name(name)
-        .stack_size(threads::io_stack())
+        .stack_size(threads::io_stack(limits))
         .spawn(move || {
             for line in BufReader::new(stream).lines().map_while(Result::ok) {
                 log_line(&log, &line);
@@ -267,6 +268,7 @@ impl Target {
         sender: SyncSender<FrameEvent>,
         wake: Option<Arc<Wake>>,
         log: Option<Arc<Mutex<LogSink>>>,
+        limits: &crate::limits::Limits,
     ) -> io::Result<()> {
         #[cfg(unix)]
         if let Some(reactor) = &self.reactor {
@@ -293,6 +295,7 @@ impl Target {
                 sender,
                 wake,
                 ipc::CALL_FRAME_MAX,
+                limits,
             )?;
         } else {
             ipc::spawn_reader_limit(
@@ -301,10 +304,11 @@ impl Target {
                 sender,
                 wake,
                 ipc::CALL_FRAME_MAX,
+                limits,
             )?;
         }
         if let Some(stderr) = stderr {
-            log_lines(format!("svcd-{}-stderr", id), stderr, log)?;
+            log_lines(format!("svcd-{}-stderr", id), stderr, log, limits)?;
         }
         Ok(())
     }
@@ -316,6 +320,7 @@ impl Target {
         stdout: ReadEnd,
         stderr: Option<ReadEnd>,
         log: Option<Arc<Mutex<LogSink>>>,
+        limits: &crate::limits::Limits,
     ) -> io::Result<()> {
         #[cfg(unix)]
         if let Some(reactor) = &self.reactor {
@@ -326,9 +331,9 @@ impl Target {
                 log,
             );
         }
-        log_lines(format!("svcd-{}-stdout", id), stdout, log.clone())?;
+        log_lines(format!("svcd-{}-stdout", id), stdout, log.clone(), limits)?;
         if let Some(stderr) = stderr {
-            log_lines(format!("svcd-{}-stderr", id), stderr, log)?;
+            log_lines(format!("svcd-{}-stderr", id), stderr, log, limits)?;
         }
         Ok(())
     }
@@ -483,6 +488,7 @@ mod tests {
                 sender,
                 None,
                 None,
+                &crate::limits::test_default(),
             )
             .expect("reader threads");
         drop(streams.stdin);

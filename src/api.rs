@@ -22,26 +22,24 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::blob;
+use crate::channel;
 use crate::config::Config;
 use crate::face::blob_routes;
-use crate::face::support::{decode, error};
-use crate::channel;
 use crate::face::plugin_ui::{ui_path, UiPath};
+use crate::face::support::{decode, error};
 use crate::http;
 use crate::lan::{self, AuthKind, Lan, LanStatus};
 use crate::log;
-use crate::server::mcp::transport;
 use crate::package;
 use crate::paths::Paths;
 use crate::plugin;
 use crate::rpc;
+use crate::server::http::engine::HttpRequest;
+use crate::server::http::engine::{keep_alive_response, wants_keep_alive, wants_keep_alive_head};
 use crate::server::http::threads::{
     client_gone, drive_fallback, read_body, read_head, write_http, HeadFailure,
 };
-use crate::server::http::engine::HttpRequest;
-use crate::server::http::engine::{
-    keep_alive_response, wants_keep_alive, wants_keep_alive_head,
-};
+use crate::server::mcp::transport;
 use crate::threads;
 use crate::webui;
 
@@ -125,10 +123,9 @@ pub fn spawn(
     let fallback_config = config.clone();
     let face: Arc<dyn crate::server::http::Face> =
         Arc::new(crate::face::api::ApiFace::new(config.clone(), lan.clone()));
-    let routes: Arc<dyn crate::server::http::hooks::PreBodyRoutes> =
-        Arc::new(PreBodyFaces {
-            config: config.clone(),
-        });
+    let routes: Arc<dyn crate::server::http::hooks::PreBodyRoutes> = Arc::new(PreBodyFaces {
+        config: config.clone(),
+    });
     let fallback: crate::server::http::hooks::FallbackHandler =
         Arc::new(move |request, lan| respond(&fallback_config, request, lan));
 
@@ -140,8 +137,9 @@ pub fn spawn(
             handle(stream, peer, config, lan, idle_timeout)
         });
     let driver_config = config.clone();
+    let thread_limits = config.limits.clone();
     let threads: crate::server::http::entry::ThreadDriver = Arc::new(move |listener, lan, _| {
-        let limits = crate::limits::current();
+        let limits = &thread_limits;
         let connection = connection.clone();
         let admission = crate::server::http::threads::admission(
             limits.max_connections,
@@ -153,7 +151,7 @@ pub fn spawn(
         let serve_config = driver_config.clone();
         let spawned = thread::Builder::new()
             .name("svcd-http".into())
-            .stack_size(threads::io_stack())
+            .stack_size(threads::io_stack(&thread_limits))
             .spawn(move || {
                 crate::server::http::threads::serve(
                     listener,
@@ -204,7 +202,6 @@ impl Api {
     }
 }
 
-
 /// Run one plugin UI request on the Windows connection thread. The face
 /// resolves the endpoint policy; the server layer's fallback driver owns the
 /// socket and the handler's events.
@@ -218,6 +215,7 @@ fn serve_plugin_ui(
     use crate::server::http::Exchange;
 
     let head_only = http::is_head(&head.method);
+    let limits = config.limits.clone();
     match crate::face::plugin_ui::PluginUiFace::exchange(head, peer, lan, config, None) {
         Err(response) => {
             let _ = write_http(stream, &response, head_only);
@@ -225,7 +223,7 @@ fn serve_plugin_ui(
         Ok(Exchange::Response(response)) => {
             let _ = write_http(stream, &response.into_bytes(), head_only);
         }
-        Ok(Exchange::Stream(handler)) => drive_fallback(stream, handler, head_only),
+        Ok(Exchange::Stream(handler)) => drive_fallback(stream, handler, head_only, &limits),
     }
 }
 
@@ -284,7 +282,7 @@ impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
     }
 
     fn body_policy(&self, head: &http::Head) -> crate::server::http::BodyPolicy {
-        crate::api::server_body_policy(head)
+        crate::api::server_body_policy(head, &self.config.limits)
     }
 }
 
@@ -301,6 +299,7 @@ fn serve_package_upload(
     use crate::server::http::Exchange;
 
     let head_only = http::is_head(&head.method);
+    let limits = config.limits.clone();
     match crate::face::install::exchange(head, lan, config) {
         Err(response) => {
             let _ = write_http(stream, &response, head_only);
@@ -320,9 +319,9 @@ fn serve_package_upload(
         }
         Ok(Exchange::Stream(handler)) => {
             let _ = stream.set_nonblocking(false);
-            let _ = stream.set_read_timeout(Some(crate::limits::current().transfer_timeout));
-            let _ = stream.set_write_timeout(Some(crate::limits::current().transfer_timeout));
-            if crate::server::http::fallback::drive(stream, handler, initial).is_err() {
+            let _ = stream.set_read_timeout(Some(limits.transfer_timeout));
+            let _ = stream.set_write_timeout(Some(limits.transfer_timeout));
+            if crate::server::http::fallback::drive(stream, handler, initial, &limits).is_err() {
                 let _ = write_http(
                     stream,
                     &crate::server::http::stream_busy_response(),
@@ -342,6 +341,7 @@ fn serve_blob_upload(
     initial: &[u8],
     lan: &Arc<Mutex<Lan>>,
     paths: Arc<Paths>,
+    limits: &crate::limits::Limits,
 ) {
     use crate::server::http::Exchange;
 
@@ -355,9 +355,9 @@ fn serve_blob_upload(
         }
         Ok(Exchange::Stream(handler)) => {
             let _ = stream.set_nonblocking(false);
-            let _ = stream.set_read_timeout(Some(crate::limits::current().transfer_timeout));
-            let _ = stream.set_write_timeout(Some(crate::limits::current().transfer_timeout));
-            if crate::server::http::fallback::drive(stream, handler, initial).is_err() {
+            let _ = stream.set_read_timeout(Some(limits.transfer_timeout));
+            let _ = stream.set_write_timeout(Some(limits.transfer_timeout));
+            if crate::server::http::fallback::drive(stream, handler, initial, &limits).is_err() {
                 let _ = write_http(
                     stream,
                     &crate::server::http::stream_busy_response(),
@@ -396,7 +396,7 @@ fn handle(
     let _ = stream.set_write_timeout(Some(idle_timeout));
     let face = crate::face::api::ApiFace::new(config.clone(), lan.clone());
     loop {
-        let (head, initial) = match read_head(&mut stream) {
+        let (head, initial) = match read_head(&mut stream, config.limits.max_header) {
             Ok(head) => head,
             Err(HeadFailure::Closed) => return,
             Err(HeadFailure::Response(response)) => {
@@ -455,6 +455,7 @@ fn handle(
                         &face,
                         &prepared.route,
                         prepared.request,
+                        config.limits.control_timeout,
                     )
                 }
             };
@@ -463,7 +464,7 @@ fn handle(
                     // A streamed response owns this connection until it closes.
                     // The fallback writes the shared 503 if the stream budget is
                     // full before any handler bytes go out.
-                    drive_fallback(&mut stream, handler, head_only);
+                    drive_fallback(&mut stream, handler, head_only, &config.limits);
                     return;
                 }
                 result => {
@@ -491,10 +492,17 @@ fn handle(
             return;
         }
         if crate::face::blob_upload::upload_target(&head).is_some() {
-            serve_blob_upload(&mut stream, &head, &initial, &lan, config.paths.clone());
+            serve_blob_upload(
+                &mut stream,
+                &head,
+                &initial,
+                &lan,
+                config.paths.clone(),
+                &config.limits,
+            );
             return;
         }
-        let body_policy = server_body_policy(&head);
+        let body_policy = server_body_policy(&head, &config.limits);
         let body = match read_body(&mut stream, &head, &initial, body_policy) {
             Ok(body) => body,
             Err(response) => {
@@ -529,7 +537,13 @@ fn handle(
                 password_hash.as_deref(),
             ) {
                 Ok(Some(call)) => {
-                    let _ = serve_mcp_sse(&mut stream, call, &config.paths.config_dir, head_only);
+                    let _ = serve_mcp_sse(
+                        &mut stream,
+                        call,
+                        &config.paths.config_dir,
+                        head_only,
+                        &config.limits,
+                    );
                     return;
                 }
                 Ok(None) => {}
@@ -557,6 +571,7 @@ fn serve_mcp_sse(
     call: transport::StreamingCall,
     config: &Path,
     head_only: bool,
+    limits: &crate::limits::Limits,
 ) -> std::io::Result<()> {
     // The Windows fallback has no stream driver, but the long-lived budget is
     // still server policy: reserve it before the head and before the plugin
@@ -564,7 +579,7 @@ fn serve_mcp_sse(
     // client disconnect ends it below (#135).
     let _permit = match crate::server::http::budget::StreamBudget::global().acquire(
         crate::server::http::StreamClass::LongLived,
-        crate::limits::current().max_streams,
+        limits.max_streams,
     ) {
         Ok(permit) => permit,
         Err(_) => {
@@ -613,7 +628,7 @@ fn serve_mcp_sse(
         }),
         // The same no-progress bound the Unix stream driver applies to an SSE
         // response: a hung supervisor cannot pin this thread forever.
-        Some(crate::limits::current().transfer_timeout),
+        Some(limits.transfer_timeout),
         move || {
             let gone = left.load(Ordering::Acquire) || client_gone(&probe);
             if gone {
@@ -622,17 +637,14 @@ fn serve_mcp_sse(
             gone
         },
         |notification| {
-            if !abandoned.load(Ordering::Acquire)
-                && write_sse_line(stream, notification).is_err()
-            {
+            if !abandoned.load(Ordering::Acquire) && write_sse_line(stream, notification).is_err() {
                 abandoned.store(true, Ordering::Release);
             }
         },
     );
     let response = match response {
         Ok(response) => Some(crate::server::mcp::result::finish_modern_tool_call(
-            call.id,
-            response,
+            call.id, response,
         )),
         // The client left, or a write failed: this response can no longer be
         // delivered. Dropping the control socket discards a late final frame
@@ -893,10 +905,12 @@ fn request_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
 /// chooses a body limit; their transport/bearer auth stays where it was
 /// (`respond` / `mcp_http`) until they become faces. A new endpoint declares
 /// its policy in `Face::route` and never touches the HTTP engine.
-pub(crate) fn server_body_policy(head: &http::Head) -> crate::server::http::BodyPolicy {
+pub(crate) fn server_body_policy(
+    head: &http::Head,
+    limits: &crate::limits::Limits,
+) -> crate::server::http::BodyPolicy {
     use crate::server::http::BodyPolicy;
 
-    let limits = crate::limits::current();
     let path = head
         .path
         .split_once('?')
@@ -1039,5 +1053,4 @@ mod tests {
         assert_eq!(resolve_bind(None, Some(b)), b);
         assert_eq!(resolve_bind(None, None), default_bind());
     }
-
 }

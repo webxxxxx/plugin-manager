@@ -370,7 +370,7 @@ where
                                 PreRequest::Continue => {
                                     let id = connection.id;
                                     let peer = connection.peer;
-                                    match advance_request(connection, |head| {
+                                    match advance_request(connection, limits.max_header, |head| {
                                         handler.route_request(id, peer, head)
                                     }) {
                                         Ok(None) => {}
@@ -431,6 +431,7 @@ fn reject_connection(mut stream: TcpStream) {
 #[cfg(unix)]
 pub fn advance_request<S>(
     connection: &mut Connection<S>,
+    max_header: usize,
     mut route: impl FnMut(&http::Head) -> Result<BodyPolicy, Vec<u8>>,
 ) -> Result<Option<HttpRequest>, Vec<u8>> {
     if connection.pending.is_none() {
@@ -439,7 +440,7 @@ pub fn advance_request<S>(
         // false because there is no method to trust.
         connection.head_only = false;
         let Some(header_end) = http::header_end(&connection.buffer) else {
-            if connection.buffer.len() > crate::limits::current().max_header {
+            if connection.buffer.len() > max_header {
                 return Err(crate::http::json_error(
                     400,
                     "bad_request",
@@ -448,7 +449,7 @@ pub fn advance_request<S>(
             }
             return Ok(None);
         };
-        if header_end > crate::limits::current().max_header {
+        if header_end > max_header {
             return Err(crate::http::json_error(
                 400,
                 "bad_request",
@@ -621,6 +622,8 @@ pub fn keep_alive_response(mut response: Vec<u8>) -> Vec<u8> {
 
 #[cfg(all(test, unix))]
 mod tests {
+    const M: usize = crate::limits::MAX_HEADER;
+
     use super::*;
 
     fn connection(buffer: &[u8]) -> Connection<()> {
@@ -657,17 +660,17 @@ mod tests {
             Ok(BodyPolicy::Buffered { limit: 64 })
         };
 
-        assert!(advance_request(&mut connection, &mut route)
+        assert!(advance_request(&mut connection, M, &mut route)
             .expect("head")
             .is_none());
         connection.buffer.extend_from_slice(b"4\r\npart\r\n");
-        assert!(advance_request(&mut connection, &mut route)
+        assert!(advance_request(&mut connection, M, &mut route)
             .expect("first chunk")
             .is_none());
         connection
             .buffer
             .extend_from_slice(b"4\r\nbody\r\n0\r\n\r\n");
-        let request = advance_request(&mut connection, &mut route)
+        let request = advance_request(&mut connection, M, &mut route)
             .expect("last chunk")
             .expect("complete request");
 
@@ -682,7 +685,7 @@ mod tests {
     fn an_empty_route_refuses_a_declared_body_before_any_body_byte_is_read() {
         let mut connection =
             connection(b"POST /action HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n");
-        let response = advance_request(&mut connection, |_head| Ok(BodyPolicy::Empty))
+        let response = advance_request(&mut connection, M, |_head| Ok(BodyPolicy::Empty))
             .expect_err("an empty route must refuse a declared body");
         assert!(
             String::from_utf8_lossy(&response).starts_with("HTTP/1.1 413"),

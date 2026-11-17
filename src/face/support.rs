@@ -53,9 +53,9 @@ impl CallBudget {
     /// disconnect token but gets its own management budget, so an install that
     /// consumed the stream deadline can still disable a plugin instead of
     /// starting the follow-up with an expired deadline.
-    pub fn follow_up(&self) -> CallBudget {
+    pub fn follow_up(&self, control_timeout: std::time::Duration) -> CallBudget {
         CallBudget {
-            deadline: Some(Instant::now() + crate::limits::current().control_timeout),
+            deadline: Some(Instant::now() + control_timeout),
             cancel: self.cancel.clone(),
         }
     }
@@ -268,7 +268,12 @@ mod tests {
         for (problem, status) in cases {
             assert_eq!(status_for_problem(problem), status, "{}", problem.as_str());
             let error = problem.error("detail");
-            assert_eq!(status_for_problem_error(&error), status, "{}", problem.as_str());
+            assert_eq!(
+                status_for_problem_error(&error),
+                status,
+                "{}",
+                problem.as_str()
+            );
         }
     }
 
@@ -342,7 +347,10 @@ mod tests {
             ("internal", 500),
         ];
         for (kind, status) in cases {
-            let error = rpc_error("this message would project differently", Some(json!({"kind": kind})));
+            let error = rpc_error(
+                "this message would project differently",
+                Some(json!({"kind": kind})),
+            );
             assert_eq!(status_for_rpc_error(&error), status, "{kind}");
         }
     }
@@ -361,7 +369,10 @@ mod tests {
         assert_eq!(status_for_rpc_error(&class("missing_dependency")), 400);
         assert_eq!(status_for_rpc_error(&class("busy")), 500);
 
-        assert_eq!(status_for_rpc_error(&rpc_error("unknown service: demo", None)), 500);
+        assert_eq!(
+            status_for_rpc_error(&rpc_error("unknown service: demo", None)),
+            500
+        );
         assert_eq!(
             status_for_rpc_error(&rpc_error("ignored", Some(json!({"kind": "no_such_kind"})))),
             500

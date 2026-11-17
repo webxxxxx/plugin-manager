@@ -66,6 +66,7 @@ pub(crate) struct RawWsStream {
     bytes_read: u64,
     bytes_parsed: u64,
     frames_read: u64,
+    limits: std::sync::Arc<crate::limits::Limits>,
 }
 
 impl RawWsStream {
@@ -73,6 +74,7 @@ impl RawWsStream {
         accept: String,
         link: Box<dyn RawLink>,
         hub: Option<Arc<RawHub>>,
+        limits: std::sync::Arc<crate::limits::Limits>,
     ) -> RawWsStream {
         let head = format!(
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
@@ -95,6 +97,7 @@ impl RawWsStream {
             bytes_read: 0,
             bytes_parsed: 0,
             frames_read: 0,
+            limits,
         }
     }
 
@@ -226,7 +229,7 @@ impl RawWsStream {
     }
 
     fn parse(&mut self) {
-        let limit = crate::limits::current().ws_raw_max_bytes;
+        let limit = self.limits.ws_raw_max_bytes;
         loop {
             match wire::parse_frame(&self.buffer, limit) {
                 Ok(None) => break,
@@ -235,7 +238,7 @@ impl RawWsStream {
                     self.frames_read += 1;
                     self.buffer.drain(..used);
                     if self.buffer.is_empty() {
-                        let shrink = crate::limits::current().ws_buffer_shrink_bytes;
+                        let shrink = self.limits.ws_buffer_shrink_bytes;
                         if self.buffer.capacity() > shrink {
                             self.buffer.shrink_to(shrink);
                         }
@@ -289,7 +292,7 @@ impl RawWsStream {
             }
             return;
         }
-        let limit = crate::limits::current().ws_raw_max_bytes;
+        let limit = self.limits.ws_raw_max_bytes;
         match frame.opcode {
             0x2 => {
                 if frame.payload.len() > limit {
@@ -403,6 +406,10 @@ mod tests {
         }
     }
 
+    fn test_limits() -> Arc<crate::limits::Limits> {
+        Arc::new(crate::limits::test_default())
+    }
+
     fn harness() -> (RawWsStream, Receiver<Vec<u8>>, SyncSender<RawEvent>) {
         let (events_tx, events_rx) = sync_channel(4);
         let (sent_tx, sent_rx) = sync_channel(4);
@@ -413,7 +420,7 @@ mod tests {
             sender: sent_tx,
         };
         (
-            RawWsStream::new("accept".into(), Box::new(link), None),
+            RawWsStream::new("accept".into(), Box::new(link), None, test_limits()),
             sent_rx,
             events_tx,
         )
@@ -527,7 +534,7 @@ mod tests {
     fn an_oversized_message_closes_with_1009() {
         let (mut stream, _sent, _events) = harness();
         let _ = drive(&mut stream, 4096);
-        let limit = crate::limits::current().ws_raw_max_bytes;
+        let limit = test_limits().ws_raw_max_bytes;
         let mut out = Vec::new();
         stream.on_event(
             StreamEvent::Data(&client_frame(0x2, &vec![0x41; limit + 1])),

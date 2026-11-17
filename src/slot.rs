@@ -39,6 +39,7 @@ pub(crate) struct Slot {
     /// The directory set this slot uses for its log, its child environment and
     /// the blob store. Resolved once at the composition root.
     paths: Arc<Paths>,
+    limits: Arc<crate::limits::Limits>,
     pub(crate) machine: Machine,
     exec: Exec,
     protocol: u32,
@@ -295,11 +296,13 @@ impl Slot {
         lifecycle: Option<Lifecycle>,
         restart: Restart,
         paths: Arc<Paths>,
+        limits: Arc<crate::limits::Limits>,
     ) -> Self {
         let (request_tx, request_rx) = mpsc::sync_channel(CALL_QUEUE);
         Slot {
             id,
             paths,
+            limits,
             machine: Machine::new(restart),
             exec,
             protocol: 1,
@@ -358,10 +361,7 @@ impl Slot {
         self.project = Some(project);
     }
 
-    pub(crate) fn set_notifier(
-        &mut self,
-        notify: Arc<dyn Fn(&str, &Value) + Send + Sync>,
-    ) {
+    pub(crate) fn set_notifier(&mut self, notify: Arc<dyn Fn(&str, &Value) + Send + Sync>) {
         self.notify_sink = Some(notify);
     }
 
@@ -641,7 +641,10 @@ impl Slot {
                 external_id,
                 capability: invocation.capability.as_str().to_string(),
                 deadline,
-                progress_token: invocation.progress.as_ref().map(|token| token.as_str().to_string()),
+                progress_token: invocation
+                    .progress
+                    .as_ref()
+                    .map(|token| token.as_str().to_string()),
                 client,
                 sink: sink.take().expect("call sink must be present"),
             },
@@ -770,7 +773,7 @@ impl Slot {
             "svcd: {}: spawned pid {} (ready={:?})",
             self.id, pid, self.exec.ready
         ));
-        let log = match LogSink::open(&self.paths.logs_dir, &self.id) {
+        let log = match LogSink::open(&self.paths.logs_dir, &self.id, &self.limits) {
             Ok(sink) => Some(Arc::new(Mutex::new(sink))),
             Err(error) => {
                 log::svcd(&format!(
@@ -804,6 +807,7 @@ impl Slot {
                 sender,
                 self.wake.clone(),
                 log.clone(),
+                &self.limits,
             ) {
                 return abandon(&mut child, error.to_string());
             }
@@ -845,10 +849,13 @@ impl Slot {
                 return Ok(pid);
             }
 
-            if let Err(error) =
-                self.stdio
-                    .logs(self.id.clone(), stdout, Some(stderr), log.clone())
-            {
+            if let Err(error) = self.stdio.logs(
+                self.id.clone(),
+                stdout,
+                Some(stderr),
+                log.clone(),
+                &self.limits,
+            ) {
                 return abandon(&mut child, error.to_string());
             }
             self.frames = None;
@@ -1344,14 +1351,17 @@ impl Slot {
                     // The stop action's own children belong to the service tree.
                     tree.assign(&child);
                 }
-                let log = LogSink::open(&self.paths.logs_dir, &self.id)
+                let log = LogSink::open(&self.paths.logs_dir, &self.id, &self.limits)
                     .ok()
                     .map(|sink| Arc::new(Mutex::new(sink)));
                 if let Some(stderr) = streams.stderr {
                     let log = log.clone();
-                    if let Err(error) =
-                        stdio::log_lines(format!("svcd-{}-stop-stderr", self.id), stderr, log)
-                    {
+                    if let Err(error) = stdio::log_lines(
+                        format!("svcd-{}-stop-stderr", self.id),
+                        stderr,
+                        log,
+                        &self.limits,
+                    ) {
                         log::svcd(&format!(
                             "svcd: {}: stop hook stderr reader: {}",
                             self.id, error
@@ -1656,9 +1666,15 @@ fn command_for_parts(
 /// Services are adoptable after a daemon restart, hooks are not.
 fn configure(mut command: Command, hook: bool) -> Command {
     if hook {
-        crate::platform::host::process::configure(&mut command, crate::platform::host::process::Kind::Hook);
+        crate::platform::host::process::configure(
+            &mut command,
+            crate::platform::host::process::Kind::Hook,
+        );
     } else {
-        crate::platform::host::process::configure(&mut command, crate::platform::host::process::Kind::Service);
+        crate::platform::host::process::configure(
+            &mut command,
+            crate::platform::host::process::Kind::Service,
+        );
     }
     command
 }
@@ -1686,10 +1702,7 @@ mod tests {
         }
     }
 
-    fn test_projector(
-        external_id: Option<Value>,
-        outcome: Result<Value, Failure>,
-    ) -> String {
+    fn test_projector(external_id: Option<Value>, outcome: Result<Value, Failure>) -> String {
         match outcome {
             Ok(value) => rpc::to_line(&rpc::ok(external_id, value)),
             Err(failure) => json!({
@@ -1721,6 +1734,10 @@ mod tests {
         Arc::new(paths)
     }
 
+    fn test_limits() -> Arc<crate::limits::Limits> {
+        Arc::new(crate::limits::test_default())
+    }
+
     fn with_projector(mut slot: Slot) -> Slot {
         slot.set_projector(Arc::new(test_projector));
         slot
@@ -1733,6 +1750,7 @@ mod tests {
             None,
             Restart::OnFailure,
             test_paths(),
+            test_limits(),
         ))
     }
 
@@ -1758,10 +1776,7 @@ mod tests {
         slot.machine.state = State::Running;
         slot.machine.mark_degraded("last call failed");
         slot.pump(0);
-        assert_eq!(
-            slot.handle().probe(),
-            Settled::Degraded("degraded".into())
-        );
+        assert_eq!(slot.handle().probe(), Settled::Degraded("degraded".into()));
     }
 
     #[test]
@@ -1825,6 +1840,7 @@ mod tests {
             None,
             Restart::OnFailure,
             test_paths(),
+            test_limits(),
         ));
         slot.set_notifier(Arc::new(move |method: &str, params: &Value| {
             let _ = tx.send((method.to_string(), params.clone()));
@@ -2015,8 +2031,11 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root =
-            crate::test_support::temp_dir().join(format!("svcd-ipc-unit-{}-{}", std::process::id(), nanos));
+        let root = crate::test_support::temp_dir().join(format!(
+            "svcd-ipc-unit-{}-{}",
+            std::process::id(),
+            nanos
+        ));
         let paths = Arc::new(Paths::under(&root));
         fs::create_dir_all(&paths.logs_dir).expect("logs");
 
@@ -2054,6 +2073,7 @@ done
             None,
             Restart::OnFailure,
             paths,
+            test_limits(),
         ));
         slot.set_protocol_only(true);
         let started = Instant::now();
@@ -2158,9 +2178,8 @@ done
     fn conforming_wire(
         respond: impl Fn(&Invocation) -> Result<Value, Failure> + Send + 'static,
     ) -> crate::kernel::contract::Instance {
-        let contract = crate::kernel::conformance::sample_contract(
-            crate::kernel::contract::Limits::default(),
-        );
+        let contract =
+            crate::kernel::conformance::sample_contract(crate::kernel::contract::Limits::default());
         crate::kernel::contract::Instance::new(
             contract,
             Box::new(SlotWire::new(SlotHandle::scripted(respond), None)),
@@ -2170,16 +2189,13 @@ done
 
     #[test]
     fn the_slot_wire_conforms_on_the_call_surface_and_delegates_lifecycle() {
-        let contract = crate::kernel::conformance::sample_contract(
-            crate::kernel::contract::Limits::default(),
-        );
+        let contract =
+            crate::kernel::conformance::sample_contract(crate::kernel::contract::Limits::default());
         crate::kernel::conformance::assert_call_conforming(
             &contract,
             || conforming_wire(|_| Ok(json!({"ok": true}))),
             |class| {
-                conforming_wire(move |_| {
-                    Err(Failure::new(class, Retry::Never, "injected failure"))
-                })
+                conforming_wire(move |_| Err(Failure::new(class, Retry::Never, "injected failure")))
             },
         );
         crate::kernel::conformance::assert_delegates_lifecycle(&contract, || {
@@ -2191,9 +2207,8 @@ done
     fn the_slot_wire_cannot_pass_the_owned_lifecycle_suite() {
         // 钉住「为什么套件要按入口拆」：槽的生命周期属于 daemon（ADR-0015），
         // SlotWire 只能拒绝 Ensure / Quiesce，所以它永远过不了生命周期那一套。
-        let contract = crate::kernel::conformance::sample_contract(
-            crate::kernel::contract::Limits::default(),
-        );
+        let contract =
+            crate::kernel::conformance::sample_contract(crate::kernel::contract::Limits::default());
         let violations = crate::kernel::conformance::check(
             &contract,
             || conforming_wire(|_| Ok(json!({}))),
@@ -2219,8 +2234,7 @@ done
             None,
         );
 
-        let invocation =
-            Invocation::new("echo", json!({}), std::time::Duration::from_secs(1));
+        let invocation = Invocation::new("echo", json!({}), std::time::Duration::from_secs(1));
         invocation.cancel.cancel();
         let (tx, rx) = mpsc::channel();
         wire.call(
@@ -2230,7 +2244,10 @@ done
             }),
         )
         .expect("dispatch");
-        match rx.recv_timeout(Duration::from_secs(1)).expect("cancelled result") {
+        match rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancelled result")
+        {
             Err(failure) => assert_eq!(failure.class, Class::Cancelled),
             Ok(reply) => panic!("a cancelled call must not return Ok: {reply:?}"),
         }

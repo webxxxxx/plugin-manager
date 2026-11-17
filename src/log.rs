@@ -4,8 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
-use crate::limits;
-
 /// Rotation threshold used when a caller does not have a configured limit
 /// (unit tests and the generated sample defaults).
 #[cfg(test)]
@@ -21,9 +19,8 @@ pub struct LogSink {
 }
 
 impl LogSink {
-    /// Open a sink using `svcd.conf` (or `MEM_LEVEL` defaults).
-    pub fn open(dir: &Path, id: &str) -> io::Result<Self> {
-        let limits = limits::current();
+    /// Open a sink using the limits derived once at the composition root.
+    pub fn open(dir: &Path, id: &str, limits: &crate::limits::Limits) -> io::Result<Self> {
         Self::open_with(
             dir,
             id,
@@ -166,8 +163,8 @@ static SVCD_LOG: OnceLock<Mutex<LogSink>> = OnceLock::new();
 
 /// Open the daemon's own `svcd.log`. Failure is reported by the caller; the
 /// rest of the daemon still works with stderr only.
-pub fn init_svcd(dir: &Path) -> io::Result<()> {
-    let sink = LogSink::open(dir, "svcd")?;
+pub fn init_svcd(limits: &crate::limits::Limits, dir: &Path) -> io::Result<()> {
+    let sink = LogSink::open(dir, "svcd", limits)?;
     let _ = SVCD_LOG.set(Mutex::new(sink));
     Ok(())
 }

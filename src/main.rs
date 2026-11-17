@@ -6,6 +6,7 @@ mod builtin_adapter;
 mod bundle;
 mod catalog;
 mod channel;
+mod clock;
 mod compat;
 mod config;
 mod daemon;

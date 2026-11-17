@@ -16,14 +16,15 @@ use crate::api::{self, Api};
 type Api = ();
 use crate::catalog;
 use crate::channel;
-use crate::config::Config;
+use crate::clock::{Clock, Now};
 use crate::compat;
-use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
+use crate::config::Config;
 use crate::definition;
 use crate::kernel::contract::{
     CapabilityName, Instance, Invocation, Launchers, ProgressToken, Reply, ReplySink,
 };
 use crate::kernel::failure::{Class, Failure, Problem, ProblemError, Rejection, Retry};
+use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::lan::LanStatus;
 use crate::log;
 use crate::mcp;
@@ -54,20 +55,20 @@ const POLL_WAIT: Duration = Duration::from_millis(50);
 const SLOW_LOOP_MS: u64 = 1_000;
 
 pub fn run(conf: Option<PathBuf>) -> i32 {
-    // The explicit --conf must be loaded before the directory set is resolved,
-    // so its config_dir wins and is not shadowed by the default resolution.
-    if let Some(path) = conf.as_deref() {
-        if path.is_file() {
-            if let Err(error) = settings::init_from_path(path) {
-                eprintln!("svcd: invalid config: {}", error);
-                return 1;
-            }
+    // The directory set has to exist before `ensure_conf` can report the path
+    // it settled on. Read the explicit document once when it exists; the
+    // bootstrap below reuses that value instead of parsing the same file twice.
+    // A missing `--conf` falls through to the normal discovery, exactly as
+    // `ensure_conf` does.
+    let explicit = conf.as_deref().filter(|path| path.is_file());
+    let preloaded = match Config::bootstrap(explicit) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("svcd: invalid config: {}", error);
+            return 1;
         }
-    }
-    // Bootstrapping reads the settings cache without failing on a broken file
-    // yet: the directory has to exist before `ensure_conf` can report the path
-    // it settled on, and `Config::bootstrap` below is the hard failure point.
-    let initial_paths = crate::config::ambient_paths();
+    };
+    let initial_paths = preloaded.paths.clone();
     if let Err(error) = fs::create_dir_all(&initial_paths.config_dir) {
         eprintln!(
             "svcd: cannot create config directory {}: {}",
@@ -77,21 +78,20 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         return 1;
     }
 
-    let config_path = match crate::install::ensure_conf(conf.as_deref()) {
+    let config_path = match crate::install::ensure_conf(conf.as_deref(), &initial_paths) {
         Ok(path) => path,
         Err(error) => {
             eprintln!("svcd: {}", error);
             return 1;
         }
     };
-    let config = match Config::bootstrap(Some(&config_path)) {
-        Ok(config) => Arc::new(config),
-        Err(error) => {
-            eprintln!("svcd: invalid config: {}", error);
-            return 1;
-        }
-    };
-    if let Err(error) = log::init_svcd(&config.paths.logs_dir) {
+    // Keep the document bootstrapped above. `ensure_conf` chooses or creates
+    // the file for the service unit and the next start; loading its result
+    // here would (a) parse a second time and (b) let `<program>/svcd.conf`
+    // override the `SVCD_CONFIG_DIR` document that won the bootstrap — the
+    // old process cache also kept the bootstrapped document for the run.
+    let config = Arc::new(preloaded);
+    if let Err(error) = log::init_svcd(&config.limits, &config.paths.logs_dir) {
         eprintln!("svcd: cannot open log directory: {}", error);
     }
     log::svcd("svcd starting");
@@ -138,14 +138,17 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         ));
     }
 
-    wait_for_services_dir(&config.paths.services_dir);
+    wait_for_services_dir(
+        &config.paths.services_dir,
+        config.settings.boot_scan_wait_ms(),
+    );
 
-    let mut loaded = definition::load_services(&config.paths.services_dir);
+    let mut loaded = definition::load_services(&config.paths.services_dir, &config.limits);
     for issue in &loaded.issues {
         log::svcd(&format!("svcd: warning: {}", issue));
     }
 
-    let (plugins, warnings) = plugin::scan(&config.paths);
+    let (plugins, warnings) = plugin::scan(&config.paths, &config.limits);
     for warning in warnings {
         log::svcd(&format!("svcd: plugin: {}", warning));
     }
@@ -167,7 +170,12 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     // One path on every host: the channel binds the endpoint and either hands
     // the listener to the server loop (Unix) or starts its own accept thread
     // (Windows). The composition root only sees the resulting server.
-    let control = match channel::bind_server(&config.paths.config_dir, tx, wake.clone()) {
+    let control = match channel::bind_server(
+        &config.paths.config_dir,
+        tx,
+        wake.clone(),
+        crate::threads::io_stack(&config.limits),
+    ) {
         Ok(control) => control,
         Err(error) => {
             log::svcd(&format!("svcd: cannot bind control channel: {}", error));
@@ -175,12 +183,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         }
     };
     #[cfg(feature = "http")]
-    let raw_hub = crate::rawhub::RawHub::new(
-        config.limits.ws_raw_max_bytes,
-        config.limits.ws_inflight_bytes,
-        config.limits.ws_inflight_requests,
-        config.limits.ws_raw_queue,
-    );
+    let raw_hub = crate::rawhub::RawHub::new(config.limits.clone());
     // The driver picks itself inside `server::http::entry`; the composition
     // root only hands over the control plumbing it owns.
     #[cfg(feature = "http")]
@@ -202,30 +205,31 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         }
     };
     #[cfg(all(unix, not(feature = "http")))]
-    let control_loop = match crate::server::control::spawn_control_only(control) {
-        Ok(handle) => handle,
-        Err(error) => {
-            log::svcd(&format!("svcd: cannot start server loop: {}", error));
-            return 1;
-        }
-    };
+    let control_loop =
+        match crate::server::control::spawn_control_only(control, config.limits.clone()) {
+            Ok(handle) => handle,
+            Err(error) => {
+                log::svcd(&format!("svcd: cannot start server loop: {}", error));
+                return 1;
+            }
+        };
     // A host whose control loop already started (Windows) has nothing left to
     // hand over: the accept thread owns the server from `bind_server` on.
     #[cfg(all(not(unix), not(feature = "http")))]
     drop(control);
     #[cfg(not(feature = "http"))]
-    let raw_hub = crate::rawhub::RawHub::new(
-        config.limits.ws_raw_max_bytes,
-        config.limits.ws_inflight_bytes,
-        config.limits.ws_inflight_requests,
-        config.limits.ws_raw_queue,
-    );
+    let raw_hub = crate::rawhub::RawHub::new(config.limits.clone());
     #[cfg(not(feature = "http"))]
     let api: Option<Arc<Api>> = None;
     notify_systemd("READY=1");
 
-    let mut daemon =
-        Daemon::new_with_raw(loaded.registry, rx, api.clone(), raw_hub.clone(), config.clone());
+    let mut daemon = Daemon::new_with_raw(
+        loaded.registry,
+        rx,
+        api.clone(),
+        raw_hub.clone(),
+        config.clone(),
+    );
     daemon.set_raw_hub(raw_hub.clone());
     daemon.set_wake(wake);
     #[cfg(unix)]
@@ -245,11 +249,12 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         }
         daemon.set_reactor(reactor);
     }
-    daemon.adopt_runtime();
+    let clock = Clock::boot();
+    daemon.adopt_runtime(clock.now());
     daemon.sweep_runtime_records();
     install_shutdown_signal();
-    daemon.start_enabled();
-    daemon.event_loop();
+    daemon.start_enabled(&clock);
+    daemon.event_loop(&clock);
     // The supervisor loop has returned and no reply can arrive after this
     // point. The server loop drains queued control replies before the process
     // exits, so the shutdown response is not lost.
@@ -287,13 +292,6 @@ fn notify_systemd(state: &str) {
 #[cfg(not(unix))]
 fn notify_systemd(_state: &str) {}
 
-fn now_epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-}
-
 /// Name + mtime + size of every entry in `services.d`. Cheap enough to poll;
 /// any create/delete/edit changes it and triggers a reconcile.
 fn services_fingerprint(directory: &Path) -> Vec<(String, u64, u64)> {
@@ -329,12 +327,9 @@ static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// The service directory lives on the overlay on read-only-rootfs hosts, so it
 /// can appear a few seconds after inittab starts svcd. Wait for it instead of
 /// scanning an empty tree once and never looking again; `svc reload` covers the
-/// rest. `SVCD_BOOT_SCAN_WAIT_MS=0` disables the wait (tests, desktop).
-fn wait_for_services_dir(dir: &Path) {
-    let budget: u64 = std::env::var("SVCD_BOOT_SCAN_WAIT_MS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(10_000);
+/// rest. The budget comes from `svcd.conf`'s `boot_scan_wait_ms` (`0` disables
+/// the wait; the `SVCD_BOOT_SCAN_WAIT_MS` override still wins at bootstrap).
+fn wait_for_services_dir(dir: &Path, budget: u64) {
     if dir.is_dir() {
         return;
     }
@@ -404,7 +399,7 @@ pub fn shutdown_quiet() -> i32 {
 fn shutdown_inner(verbose: bool) -> i32 {
     // Stopping only needs the control endpoint; a broken `svcd.conf` must not
     // make `svcd stop` unusable.
-    let paths = crate::config::ambient_paths();
+    let paths = crate::config::ambient_paths(None);
     match channel::request(&paths.config_dir, "svcd.shutdown", json!({})) {
         Ok(response) => match response.error {
             Some(error) => {
@@ -482,8 +477,6 @@ struct Daemon {
     /// the Slot (or the builtin service) keeps owning the resource.
     launchers: Arc<Launchers>,
     shutdown: bool,
-    started: Instant,
-    epoch_at_start: SystemTime,
     catalog_version: u64,
     catalog_cache: Option<(u64, Vec<Value>)>,
     /// Last record written per service: state, pid, failures. Only a change
@@ -510,40 +503,31 @@ struct Daemon {
 
 impl Daemon {
     #[cfg(test)]
-    fn new(
-        registry: Registry,
-        rx: Receiver<channel::PendingCall>,
-        api: Option<Arc<Api>>,
-    ) -> Self {
-        let limits = crate::limits::current();
+    fn new(registry: Registry, rx: Receiver<channel::PendingCall>, api: Option<Arc<Api>>) -> Self {
+        let config = Arc::new(Config::with_paths(
+            crate::settings::Settings::default(),
+            None,
+            {
+                let nanos = SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let root = crate::test_support::temp_dir().join(format!(
+                    "svcd-daemon-unit-{}-{}",
+                    std::process::id(),
+                    nanos
+                ));
+                let paths = Paths::under(&root);
+                crate::package::install_test_trust(&paths.trust_dir);
+                paths
+            },
+        ));
         Self::new_with_raw(
             registry,
             rx,
             api,
-            crate::rawhub::RawHub::new(
-                limits.ws_raw_max_bytes,
-                limits.ws_inflight_bytes,
-                limits.ws_inflight_requests,
-                limits.ws_raw_queue,
-            ),
-            Arc::new(Config::with_paths(
-                crate::settings::Settings::default(),
-                None,
-                {
-                    let nanos = SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos();
-                    let root = crate::test_support::temp_dir().join(format!(
-                        "svcd-daemon-unit-{}-{}",
-                        std::process::id(),
-                        nanos
-                    ));
-                    let paths = Paths::under(&root);
-                    crate::package::install_test_trust(&paths.trust_dir);
-                    paths
-                },
-            )),
+            crate::rawhub::RawHub::new(config.limits.clone()),
+            config,
         )
     }
 
@@ -555,10 +539,7 @@ impl Daemon {
         config: Arc<Config>,
     ) -> Self {
         let wake = Arc::new(Wake::new());
-        let rescan_interval_ms: u64 = std::env::var("SVCD_RESCAN_INTERVAL_MS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(5_000);
+        let rescan_interval_ms = config.settings.rescan_interval_ms();
         let mut slots = BTreeMap::new();
         for service in registry.managed_values() {
             if let Some(exec) = service.exec.clone() {
@@ -568,13 +549,14 @@ impl Daemon {
                     service.lifecycle.clone(),
                     service.restart,
                     config.paths.clone(),
+                    config.limits.clone(),
                 );
                 slot.set_protocol(service.protocol);
                 slot.set_protocol_only(service.kind == Kind::Plugin);
                 slot.set_remain_after_exit(service.remain_after_exit);
                 slot.set_initial_state(service.state);
                 slot.set_wake(wake.clone());
-                configure_slot(&mut slot, &service);
+                configure_slot(&mut slot, &service, &config.limits);
                 slots.insert(service.id.clone(), slot);
             }
         }
@@ -592,8 +574,6 @@ impl Daemon {
             slots,
             launchers: Arc::new(launchers),
             shutdown: false,
-            started: Instant::now(),
-            epoch_at_start: SystemTime::now(),
             catalog_version: 1,
             catalog_cache: None,
             persisted: BTreeMap::new(),
@@ -613,39 +593,15 @@ impl Daemon {
         }
     }
 
-    fn now_ms(&self) -> u64 {
-        self.started.elapsed().as_millis() as u64
-    }
-
-    /// Log a loop phase that ran past [`SLOW_LOOP_MS`].
-    fn note_slow(&self, what: &str, started: Instant) {
-        let elapsed = started.elapsed();
-        if elapsed >= Duration::from_millis(SLOW_LOOP_MS) {
-            log::svcd(&format!("svcd: {} held the loop for {:?}", what, elapsed));
-        }
-    }
-
-    /// Convert a monotonic supervisor timestamp to epoch seconds.
-    fn epoch_of(&self, ms: u64) -> u64 {
-        let now = self.now_ms();
-        let now_epoch = now_epoch_secs();
-        now_epoch.saturating_sub(now.saturating_sub(ms) / 1000)
-    }
-
-    /// The inverse of [`epoch_of`]: epoch seconds back to a monotonic stamp.
-    fn ms_of(&self, epoch: u64) -> u64 {
-        let now = self.now_ms();
-        let now_epoch = now_epoch_secs();
-        now.saturating_sub(now_epoch.saturating_sub(epoch).saturating_mul(1000))
-    }
-
     /// Reconnect to processes that survived a previous daemon. A record is only
     /// trusted when its boot id matches, the pid is alive and the pid's start
     /// time still matches (a reused pid fails this check). On Windows the job
     /// objects kill the tree with the daemon, so there is nothing to adopt.
-    fn adopt_runtime(&mut self) {
-        let boot = self.boot_id.clone().or_else(crate::platform::host::process::boot_id);
-        let now = self.now_ms();
+    fn adopt_runtime(&mut self, now: Now) {
+        let boot = self
+            .boot_id
+            .clone()
+            .or_else(crate::platform::host::process::boot_id);
         for id in self.slots.keys().cloned().collect::<Vec<_>>() {
             let Some(record) = runtime::load(&id, &self.config.paths) else {
                 continue;
@@ -669,7 +625,7 @@ impl Daemon {
                         .map(|slot| slot.machine.remain_after_exit)
                         .unwrap_or(false);
                 if keep {
-                    let since = self.ms_of(record.since.unwrap_or_else(now_epoch_secs));
+                    let since = now.mono_of(record.since.unwrap_or(now.epoch_secs));
                     let last_exit = record.last_exit;
                     let failures = record.failures;
                     if let Some(slot) = self.slots.get_mut(&id) {
@@ -692,8 +648,10 @@ impl Daemon {
                 runtime::remove(&id, &self.config.paths);
                 continue;
             }
-            if let (Some(expected), Some(actual)) = (record.starttime, crate::platform::host::process::start_time(pid))
-            {
+            if let (Some(expected), Some(actual)) = (
+                record.starttime,
+                crate::platform::host::process::start_time(pid),
+            ) {
                 if expected != actual {
                     log::svcd(&format!(
                         "svcd: {}: pid {} was reused (starttime {} != {}); not adopting",
@@ -703,19 +661,19 @@ impl Daemon {
                     continue;
                 }
             }
-            let since = self.ms_of(record.since.unwrap_or_else(now_epoch_secs));
-            let ready = record.ready_since.map(|epoch| self.ms_of(epoch));
+            let since = now.mono_of(record.since.unwrap_or(now.epoch_secs));
+            let ready = record.ready_since.map(|epoch| now.mono_of(epoch));
             let failures = record.failures;
             let last_exit = record.last_exit;
             let state = record.state;
             let was_stopping = state == State::Stopping;
             if let Some(slot) = self.slots.get_mut(&id) {
-                slot.adopt(pid, state, since, ready, failures, last_exit, now);
+                slot.adopt(pid, state, since, ready, failures, last_exit, now.mono_ms);
                 if was_stopping {
                     // Finish the interrupted stop the same way a live stop
                     // does: stop action first, then signals and the kill
                     // window. Otherwise the service's cleanup would be lost.
-                    slot.request_stop(now);
+                    slot.request_stop(now.mono_ms);
                 }
                 let adopted = slot.machine.state;
                 let adopted_pid = slot.machine.pid;
@@ -749,7 +707,10 @@ impl Daemon {
                 if let Some(record) = runtime::load(id, &self.config.paths) {
                     if let Some(pid) = record.pid {
                         let fresh = crate::platform::host::process::alive(pid)
-                            && match (record.starttime, crate::platform::host::process::start_time(pid)) {
+                            && match (
+                                record.starttime,
+                                crate::platform::host::process::start_time(pid),
+                            ) {
                                 (Some(expected), Some(actual)) => expected == actual,
                                 _ => true,
                             };
@@ -768,7 +729,7 @@ impl Daemon {
     /// Write the runtime record of every service whose (state, pid, failures)
     /// tuple changed since the last write. Stopped/failed services with no pid
     /// need no record: there is nothing to reconnect.
-    fn persist_states(&mut self) {
+    fn persist_states(&mut self, now: Now) {
         let boot = self.boot_id.clone();
         for id in self.slots.keys().cloned().collect::<Vec<_>>() {
             let (state, pid, failures) = {
@@ -786,8 +747,8 @@ impl Daemon {
             let (since, ready_since, last_exit) = {
                 let machine = &self.slots[&id].machine;
                 (
-                    self.epoch_of(machine.since_ms),
-                    machine.ready_since_ms.map(|ms| self.epoch_of(ms)),
+                    now.epoch_of(machine.since_ms),
+                    machine.ready_since_ms.map(|ms| now.epoch_of(ms)),
                     machine.last_exit,
                 )
             };
@@ -854,7 +815,15 @@ impl Daemon {
         }
     }
 
-    fn start_enabled(&mut self) {
+    /// Log a loop phase that ran past [`SLOW_LOOP_MS`].
+    fn note_slow(&self, what: &str, started: Instant) {
+        let elapsed = started.elapsed();
+        if elapsed >= Duration::from_millis(SLOW_LOOP_MS) {
+            log::svcd(&format!("svcd: {} held the loop for {:?}", what, elapsed));
+        }
+    }
+
+    fn start_enabled(&mut self, clock: &Clock) {
         let started = Instant::now();
         let mut eligible = Vec::new();
         for id in self.slots.keys().cloned().collect::<Vec<_>>() {
@@ -895,62 +864,90 @@ impl Daemon {
             }
         };
         for layer in layers {
-            let deadline = self.now_ms().saturating_add(supervisor::START_TIMEOUT_MS);
-            if let Err(error) = self.start_layer(&layer, deadline) {
+            let deadline = clock
+                .now()
+                .mono_ms
+                .saturating_add(supervisor::START_TIMEOUT_MS);
+            if let Err(error) = self.start_layer(&layer, deadline, clock) {
                 log::svcd(&format!("svcd: start enabled: {}", error));
             }
         }
         self.note_slow("start_enabled", started);
     }
 
-    fn event_loop(&mut self) {
+    fn event_loop(&mut self, clock: &Clock) {
         loop {
-            let mut disconnected = false;
-            loop {
-                match self.rx.try_recv() {
-                    Ok(incoming) => self.handle(incoming),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
-                }
-            }
-            let started = Instant::now();
-            self.pump();
-            self.note_slow("pump", started);
-            if self.rescan_interval_ms > 0 && self.now_ms() >= self.next_rescan_ms {
-                self.next_rescan_ms = self.now_ms().saturating_add(self.rescan_interval_ms);
-                let started = Instant::now();
-                self.rescan_if_changed();
-                self.note_slow("rescan", started);
-            }
-            if self.temp_cleanup_interval_ms > 0 && self.now_ms() >= self.next_temp_cleanup_ms {
-                self.next_temp_cleanup_ms = self
-                    .now_ms()
-                    .saturating_add(self.temp_cleanup_interval_ms);
-                let started = Instant::now();
-                match crate::blob::cleanup(&self.config.paths, self.temp_retention) {
-                    Ok(0) => {}
-                    Ok(removed) => log::svcd(&format!(
-                        "svcd: temp cleanup removed {} file(s)",
-                        removed
-                    )),
-                    Err(error) => log::svcd(&format!("svcd: temp cleanup failed: {}", error)),
-                }
-                self.note_slow("temp cleanup", started);
-            }
-            if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
-                self.shutdown = true;
-            }
+            let disconnected = self.drain(clock);
+            let now = clock.now();
+            self.tick(now, clock);
             if self.shutdown || disconnected {
                 break;
             }
-            // Management requests and plugin stdout wake this immediately;
-            // the bounded wait is only for shutdown and timer deadlines.
-            self.wait_for_work(POLL_WAIT);
+            // Management requests and plugin stdout wake this immediately; the
+            // bounded wait is only for shutdown and timer deadlines. A timer
+            // that comes due sooner shortens the wait.
+            self.wait_for_work(self.next_wait(now));
         }
-        self.stop_all();
+        self.stop_all(clock);
+    }
+
+    /// Handle every queued management request, then report whether the control
+    /// channel closed. Blocking requests (start / stop / reload) wait on the
+    /// clock, so the drain takes the clock rather than a stale snapshot.
+    fn drain(&mut self, clock: &Clock) -> bool {
+        loop {
+            match self.rx.try_recv() {
+                Ok(incoming) => self.handle(clock, incoming),
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => return true,
+            }
+        }
+    }
+
+    /// One non-blocking supervisor pass: plugin stdio, the state machines, the
+    /// periodic timers and the shutdown flag. Everything reads the same `now`
+    /// snapshot, so a pass cannot mix two clock reads. The clock is only needed
+    /// because a due rescan reconciles by blocking on start / stop.
+    fn tick(&mut self, now: Now, clock: &Clock) {
+        let started = Instant::now();
+        self.pump(now);
+        self.note_slow("pump", started);
+        if self.rescan_interval_ms > 0 && now.mono_ms >= self.next_rescan_ms {
+            self.next_rescan_ms = now.mono_ms.saturating_add(self.rescan_interval_ms);
+            let started = Instant::now();
+            self.rescan_if_changed(clock);
+            self.note_slow("rescan", started);
+        }
+        if self.temp_cleanup_interval_ms > 0 && now.mono_ms >= self.next_temp_cleanup_ms {
+            self.next_temp_cleanup_ms = now.mono_ms.saturating_add(self.temp_cleanup_interval_ms);
+            let started = Instant::now();
+            match crate::blob::cleanup(&self.config.paths, self.temp_retention) {
+                Ok(0) => {}
+                Ok(removed) => {
+                    log::svcd(&format!("svcd: temp cleanup removed {} file(s)", removed))
+                }
+                Err(error) => log::svcd(&format!("svcd: temp cleanup failed: {}", error)),
+            }
+            self.note_slow("temp cleanup", started);
+        }
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            self.shutdown = true;
+        }
+    }
+
+    /// How long the loop may wait before the next timer is due, capped by the
+    /// poll tick so shutdown and the reactor are serviced even with no timers.
+    fn next_wait(&self, now: Now) -> Duration {
+        let mut wait = POLL_WAIT;
+        for (interval, next) in [
+            (self.rescan_interval_ms, self.next_rescan_ms),
+            (self.temp_cleanup_interval_ms, self.next_temp_cleanup_ms),
+        ] {
+            if interval > 0 {
+                wait = wait.min(Duration::from_millis(next.saturating_sub(now.mono_ms)));
+            }
+        }
+        wait
     }
 
     /// Bounded wait for the next event. With a reactor this wait *is* the
@@ -967,7 +964,7 @@ impl Daemon {
         self.wake.wait_timeout(timeout);
     }
 
-    fn handle(&mut self, incoming: channel::PendingCall) {
+    fn handle(&mut self, clock: &Clock, incoming: channel::PendingCall) {
         let started = Instant::now();
         let request = match rpc::parse(&incoming.line) {
             Ok(request) => request,
@@ -990,16 +987,17 @@ impl Daemon {
             return;
         }
         match method.as_str() {
-            "registry.call" | "tools/call" => self.handle_tool_call(request, incoming.reply),
+            "registry.call" | "tools/call" => self.handle_tool_call(clock, request, incoming.reply),
             _ => {
-                let response = self.dispatch(request);
+                let response = self.dispatch(clock, request);
                 let _ = incoming.reply.send(rpc::to_line(&response));
             }
         }
         self.note_slow(&format!("request {}", method), started);
     }
 
-    fn dispatch(&mut self, request: rpc::Request) -> rpc::Response {
+    fn dispatch(&mut self, clock: &Clock, request: rpc::Request) -> rpc::Response {
+        let now = clock.now();
         let id = request.id.clone();
         match request.method.as_str() {
             "svcd.ping" => rpc::ok(id, json!({"ok": true})),
@@ -1017,9 +1015,9 @@ impl Daemon {
                 Err(error) => problem_response(id, -32602, error),
             },
             "registry.version" => rpc::ok(id, json!({ "version": self.catalog_version })),
-            "svc.list" => rpc::ok(id, json!({"services": self.statuses()})),
+            "svc.list" => rpc::ok(id, json!({"services": self.statuses(now)})),
             "svc.status" => match param_id(&request) {
-                Ok(service_id) => match self.status_for_id(&service_id) {
+                Ok(service_id) => match self.status_for_id(&service_id, now) {
                     Some(mut status) => {
                         if request
                             .params
@@ -1041,38 +1039,48 @@ impl Daemon {
                 Err(response) => response,
             },
             "svc.start" => match param_id(&request) {
-                Ok(service_id) => status_response(id, -32003, self.start_service(&service_id)),
+                Ok(service_id) => {
+                    status_response(id, -32003, self.start_service(&service_id, clock))
+                }
                 Err(response) => response,
             },
             "svc.stop" => match param_id(&request) {
-                Ok(service_id) => status_response(id, -32004, self.stop_service(&service_id)),
+                Ok(service_id) => {
+                    status_response(id, -32004, self.stop_service(&service_id, clock))
+                }
                 Err(response) => response,
             },
             "svc.enable" => match param_id(&request) {
-                Ok(service_id) => status_response(id, -32005, self.set_enabled(&service_id, true)),
+                Ok(service_id) => {
+                    status_response(id, -32005, self.set_enabled(&service_id, true, clock))
+                }
                 Err(response) => response,
             },
             "svc.disable" => match param_id(&request) {
-                Ok(service_id) => status_response(id, -32005, self.set_enabled(&service_id, false)),
+                Ok(service_id) => {
+                    status_response(id, -32005, self.set_enabled(&service_id, false, clock))
+                }
                 Err(response) => response,
             },
             "svc.restart" => match param_id(&request) {
-                Ok(service_id) => status_response(id, -32010, self.restart_service(&service_id)),
+                Ok(service_id) => {
+                    status_response(id, -32010, self.restart_service(&service_id, clock))
+                }
                 Err(response) => response,
             },
-            "svc.reload" | "svcd.reload" => match self.reload() {
+            "svc.reload" | "svcd.reload" => match self.reload(clock) {
                 Ok(summary) => rpc::ok(id, summary),
                 Err(error) => problem_response(id, -32009, error),
             },
-            "plugin.install" => match self.install_plugin(&request) {
+            "plugin.install" => match self.install_plugin(&request, clock) {
                 Ok(status) => rpc::ok(id, status_json(status)),
                 Err(error) => problem_response(id, -32006, error),
             },
-            "plugin.install_staged" => match self.install_staged(&request) {
+            "plugin.install_staged" => match self.install_staged(&request, clock) {
                 Ok(status) => rpc::ok(id, status_json(status)),
                 Err(error) => problem_response(id, -32006, error),
             },
-            "plugin.uninstall" => match self.uninstall_plugin(&request) {
+            "plugin.uninstall" => match self.uninstall_plugin(&request, clock) {
                 Ok(()) => rpc::ok(id, json!({ "ok": true })),
                 Err(error) => problem_response(id, -32007, error),
             },
@@ -1125,9 +1133,10 @@ impl Daemon {
                 "password must not be empty",
             ));
         }
-        let path = settings::path().ok_or_else(|| {
-            ProblemError::new(Problem::Internal, "svcd.conf path is unavailable")
-        })?;
+        let path =
+            self.config.settings_path.as_deref().ok_or_else(|| {
+                ProblemError::new(Problem::Internal, "svcd.conf path is unavailable")
+            })?;
         let hash = crate::auth::hash_password(password)
             .map_err(|detail| ProblemError::new(Problem::Internal, detail))?;
         settings::update_value(path, "auth_passwd", &hash)
@@ -1147,17 +1156,17 @@ impl Daemon {
         ))
     }
 
-    fn statuses(&self) -> Vec<Status> {
+    fn statuses(&self, now: Now) -> Vec<Status> {
         self.registry
             .managed_values()
-            .map(|service| self.status_for(service))
+            .map(|service| self.status_for(service, now))
             .collect()
     }
 
-    fn status_for_id(&self, id: &str) -> Option<Status> {
+    fn status_for_id(&self, id: &str, now: Now) -> Option<Status> {
         self.registry
             .get(id)
-            .map(|service| self.status_for(service))
+            .map(|service| self.status_for(service, now))
     }
 
     /// The MCP projection asks the daemon rather than the registry because the
@@ -1215,8 +1224,8 @@ impl Daemon {
             .and_then(Value::as_u64)
             .map(|value| value.min(usize::MAX as u64) as usize);
         let version = self.catalog_version;
-        let page = catalog::page(self.tool_list_cached(), version, cursor, limit)
-            .map_err(|error| {
+        let page =
+            catalog::page(self.tool_list_cached(), version, cursor, limit).map_err(|error| {
                 let problem = match error {
                     crate::catalog::PageError::InvalidCursor => Problem::Invalid,
                     // Both today fall through to 500; keep that projection.
@@ -1236,7 +1245,12 @@ impl Daemon {
     /// on the slot pump, so the control connection stays open without blocking
     /// the daemon's event loop. A start tool is synchronous because starting is
     /// defined as synchronous in the service contract.
-    fn handle_tool_call(&mut self, request: rpc::Request, reply: crate::channel::Reply) {
+    fn handle_tool_call(
+        &mut self,
+        clock: &Clock,
+        request: rpc::Request,
+        reply: crate::channel::Reply,
+    ) {
         let id = request.id.clone();
         let name = request
             .params
@@ -1268,11 +1282,13 @@ impl Daemon {
         let start_id = name.strip_suffix(".start").filter(|service_id| {
             self.registry
                 .get(service_id)
-                .map(|service| service.kind == Kind::Plugin || !service.contract.surface().is_empty())
+                .map(|service| {
+                    service.kind == Kind::Plugin || !service.contract.surface().is_empty()
+                })
                 .unwrap_or(false)
         });
         if let Some(service_id) = start_id {
-            let response = match self.start_service(service_id) {
+            let response = match self.start_service(service_id, clock) {
                 Ok(status) => mcp::tool_result(id, status_json(status).to_string(), false),
                 Err(error) => mcp::tool_error(id, error.detail()),
             };
@@ -1327,11 +1343,8 @@ impl Daemon {
                 Value::Number(token) => Some(ProgressToken::new(token.to_string())),
                 _ => None,
             });
-        let mut invocation = Invocation::new(
-            capability,
-            arguments,
-            crate::limits::current().default_timeout,
-        );
+        let mut invocation =
+            Invocation::new(capability, arguments, self.config.limits.default_timeout);
         invocation.progress = progress_token;
 
         if let Some(spec) = builtin {
@@ -1407,12 +1420,12 @@ impl Daemon {
         ));
     }
 
-    fn status_for(&self, service: &Service) -> Status {
+    fn status_for(&self, service: &Service, now: Now) -> Status {
         if service.id == RESERVED_ID {
             return Status::builtin(service);
         }
         match self.slots.get(&service.id) {
-            Some(slot) => Status::live(service, &slot.machine, self.epoch_at_start),
+            Some(slot) => Status::live(service, &slot.machine, now),
             None => Status::of(service),
         }
     }
@@ -1425,13 +1438,13 @@ impl Daemon {
     /// Reconcile when `services.d` changed since the last scan: a definition
     /// dropped in while the daemon runs starts (if enabled), a deleted one is
     /// stopped and forgotten. This mirrors the shell `svcd` poll loop.
-    fn rescan_if_changed(&mut self) {
+    fn rescan_if_changed(&mut self, clock: &Clock) {
         let fingerprint = services_fingerprint(&self.config.paths.services_dir);
         if fingerprint == self.services_fingerprint {
             return;
         }
         self.services_fingerprint = fingerprint;
-        match self.reconcile_definitions() {
+        match self.reconcile_definitions(clock) {
             Ok(summary) => {
                 let changed = ["added", "removed", "updated"].iter().any(|key| {
                     summary
@@ -1448,8 +1461,8 @@ impl Daemon {
         }
     }
 
-    fn reload(&mut self) -> Result<Value, ProblemError> {
-        let summary = self.reconcile_definitions()?;
+    fn reload(&mut self, clock: &Clock) -> Result<Value, ProblemError> {
+        let summary = self.reconcile_definitions(clock)?;
         self.services_fingerprint = services_fingerprint(&self.config.paths.services_dir);
         Ok(summary)
     }
@@ -1458,8 +1471,9 @@ impl Daemon {
     /// Running services keep running (a changed exec applies at the next start);
     /// definitions that disappeared are stopped and forgotten. Shared by
     /// `svc reload`, the periodic rescan, and boot recovery.
-    fn reconcile_definitions(&mut self) -> Result<Value, ProblemError> {
-        let loaded = definition::load_services(&self.config.paths.services_dir);
+    fn reconcile_definitions(&mut self, clock: &Clock) -> Result<Value, ProblemError> {
+        let loaded =
+            definition::load_services(&self.config.paths.services_dir, &self.config.limits);
         for issue in &loaded.issues {
             log::svcd(&format!("svcd: reload: warning: {}", issue));
         }
@@ -1469,7 +1483,7 @@ impl Daemon {
             .cloned()
             .map(|service| (service.id.clone(), service))
             .collect();
-        let (plugins, warnings) = plugin::scan(&self.config.paths);
+        let (plugins, warnings) = plugin::scan(&self.config.paths, &self.config.limits);
         for warning in warnings {
             log::svcd(&format!("svcd: reload: plugin: {}", warning));
         }
@@ -1505,7 +1519,7 @@ impl Daemon {
                 })
                 .unwrap_or(false);
             if active {
-                let _ = self.stop_service(&id);
+                let _ = self.stop_service(&id, clock);
             }
             self.slots.remove(&id);
             self.registry.remove(&id);
@@ -1526,7 +1540,7 @@ impl Daemon {
                 .map(|service| service.enabled)
                 .unwrap_or(false);
             if enabled {
-                if let Err(error) = self.start_service(id) {
+                if let Err(error) = self.start_service(id, clock) {
                     log::svcd(&format!("svcd: reload: cannot start {}: {}", id, error));
                 }
             }
@@ -1556,15 +1570,21 @@ impl Daemon {
                     let plugin_only = service.kind == Kind::Plugin;
                     let remain_after_exit = service.remain_after_exit;
                     if let Some(exec) = exec {
-                        let mut slot =
-                            Slot::new(id.clone(), exec, lifecycle, restart, self.config.paths.clone());
+                        let mut slot = Slot::new(
+                            id.clone(),
+                            exec,
+                            lifecycle,
+                            restart,
+                            self.config.paths.clone(),
+                            self.config.limits.clone(),
+                        );
                         slot.set_protocol(protocol);
                         slot.set_protocol_only(plugin_only);
                         slot.set_remain_after_exit(remain_after_exit);
                         slot.set_wake(self.wake.clone());
                         slot.set_stdio(self.stdio.clone());
                         slot.set_raw_hub(Some(self.raw_hub.clone()));
-                        configure_slot(&mut slot, &service);
+                        configure_slot(&mut slot, &service, &self.config.limits);
                         self.slots.insert(id.clone(), slot);
                     }
                     // A rejected service must not leave a slot with no registry
@@ -1620,7 +1640,7 @@ impl Daemon {
         (added, updated)
     }
 
-    fn start_service(&mut self, id: &str) -> Result<Status, ProblemError> {
+    fn start_service(&mut self, id: &str, clock: &Clock) -> Result<Status, ProblemError> {
         if self.registry.get(id).is_none() {
             return Err(ProblemError::new(
                 Problem::UnknownService,
@@ -1628,7 +1648,7 @@ impl Daemon {
             ));
         }
         if id == RESERVED_ID {
-            return Ok(self.status_for_id(id).expect("builtin"));
+            return Ok(self.status_for_id(id, clock.now()).expect("builtin"));
         }
         // A restricted package must never start on a host it does not support,
         // even if the marker changed after it was installed.
@@ -1664,13 +1684,13 @@ impl Daemon {
         // A finished one-shot is `Running` with no pid. An explicit start must
         // run it again, while a dependency in the same state stays satisfied
         // (start_layer skips Running services).
-        let now = self.now_ms();
+        let now = clock.now();
         if let Some(slot) = self.slots.get_mut(id) {
             if slot.machine.state == State::Running
                 && slot.machine.pid.is_none()
                 && slot.machine.remain_after_exit
             {
-                slot.apply(Event::Start, now);
+                slot.apply(Event::Start, now.mono_ms);
             }
         }
 
@@ -1702,17 +1722,22 @@ impl Daemon {
                 _ => {}
             }
         }
-        let deadline = self.now_ms().saturating_add(supervisor::START_TIMEOUT_MS);
+        let deadline = now.mono_ms.saturating_add(supervisor::START_TIMEOUT_MS);
         for layer in layers {
-            self.start_layer(&layer, deadline)?;
+            self.start_layer(&layer, deadline, clock)?;
         }
 
-        self.status_for_id(id).ok_or_else(|| {
+        self.status_for_id(id, clock.now()).ok_or_else(|| {
             ProblemError::new(Problem::UnknownService, format!("unknown service: {}", id))
         })
     }
 
-    fn start_layer(&mut self, ids: &[String], deadline: u64) -> Result<(), ProblemError> {
+    fn start_layer(
+        &mut self,
+        ids: &[String],
+        deadline: u64,
+        clock: &Clock,
+    ) -> Result<(), ProblemError> {
         let pending: Vec<String> = ids
             .iter()
             .filter(|id| self.slots.contains_key(*id))
@@ -1735,7 +1760,7 @@ impl Daemon {
                     id
                 ));
             }
-            let now = self.now_ms();
+            let now = clock.now().mono_ms;
             self.slots
                 .get_mut(id)
                 .expect("slot")
@@ -1743,7 +1768,7 @@ impl Daemon {
         }
 
         loop {
-            self.pump();
+            self.pump(clock.now());
             let mut all_settled = true;
             for id in &pending {
                 let state = self.slots[id].machine.state;
@@ -1770,7 +1795,7 @@ impl Daemon {
             if all_settled {
                 return Ok(());
             }
-            if self.now_ms() >= deadline {
+            if clock.now().mono_ms >= deadline {
                 for id in &pending {
                     log::svcd(&format!(
                         "svcd: {}: start timed out waiting for ready ({})",
@@ -1787,14 +1812,16 @@ impl Daemon {
         }
     }
 
-    fn install_plugin(&mut self, request: &rpc::Request) -> Result<Status, ProblemError> {
+    fn install_plugin(
+        &mut self,
+        request: &rpc::Request,
+        clock: &Clock,
+    ) -> Result<Status, ProblemError> {
         let path = request
             .params
             .get("path")
             .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ProblemError::new(Problem::Internal, "plugin.install requires path")
-            })?;
+            .ok_or_else(|| ProblemError::new(Problem::Internal, "plugin.install requires path"))?;
         let strategy = match Strategy::parse(
             request
                 .params
@@ -1823,7 +1850,7 @@ impl Daemon {
         let verified = plugin::verify(
             &self.config.paths,
             Path::new(path),
-            settings::allow_insecure_install(),
+            self.config.settings.allow_insecure_install,
             allow_hooks,
         )?;
         let plugin::Verified {
@@ -1848,11 +1875,12 @@ impl Daemon {
                 .unwrap_or(false)
         };
         if running(&self.slots) && strategy == Strategy::Replace {
-            self.stop_service(&id)?;
+            self.stop_service(&id, clock)?;
         }
         let still_running = running(&self.slots);
         let service = match plugin::install_package(
             &self.config.paths,
+            &self.config.limits,
             &package,
             strategy,
             allow_hooks,
@@ -1875,6 +1903,7 @@ impl Daemon {
                 ));
                 plugin::install_package(
                     &self.config.paths,
+                    &self.config.limits,
                     &package,
                     Strategy::Replace,
                     allow_hooks,
@@ -1902,6 +1931,7 @@ impl Daemon {
                     service.lifecycle.clone(),
                     service.restart,
                     self.config.paths.clone(),
+                    self.config.limits.clone(),
                 );
                 slot.set_protocol(service.protocol);
                 slot.set_protocol_only(true);
@@ -1914,7 +1944,7 @@ impl Daemon {
                 // gives it. Without this the plugin answers calls but its
                 // notifications never reach the UI bus, and default_timeout is
                 // not applied to its calls.
-                configure_slot(&mut slot, &service);
+                configure_slot(&mut slot, &service, &self.config.limits);
                 self.slots.insert(id.clone(), slot);
             }
         }
@@ -1937,12 +1967,16 @@ impl Daemon {
                 "; signature was NOT verified (allow_insecure_install)"
             }
         ));
-        self.status_for_id(&id).ok_or_else(|| {
+        self.status_for_id(&id, clock.now()).ok_or_else(|| {
             ProblemError::new(Problem::UnknownPlugin, format!("unknown plugin: {}", id))
         })
     }
 
-    fn install_staged(&mut self, request: &rpc::Request) -> Result<Status, ProblemError> {
+    fn install_staged(
+        &mut self,
+        request: &rpc::Request,
+        clock: &Clock,
+    ) -> Result<Status, ProblemError> {
         let path = request
             .params
             .get("path")
@@ -1977,9 +2011,14 @@ impl Daemon {
                 format!("staging path {}: {}", path, error),
             )
         })?;
-        let plugins = self.config.paths.plugins_dir.canonicalize().map_err(|error| {
-            ProblemError::new(Problem::Internal, format!("plugins dir: {}", error))
-        })?;
+        let plugins = self
+            .config
+            .paths
+            .plugins_dir
+            .canonicalize()
+            .map_err(|error| {
+                ProblemError::new(Problem::Internal, format!("plugins dir: {}", error))
+            })?;
         if !staging.starts_with(&plugins)
             || !staging
                 .file_name()
@@ -1994,7 +2033,7 @@ impl Daemon {
 
         let staged = package::load_staged(
             &staging,
-            settings::allow_insecure_install(),
+            self.config.settings.allow_insecure_install,
             &self.config.paths.trust_dir,
         )?;
         let id = staged.manifest.name.clone();
@@ -2023,8 +2062,7 @@ impl Daemon {
                 ));
             }
         }
-        let host_interpreter =
-            plugin::prepare_staged(&staged, allow_hooks)?;
+        let host_interpreter = plugin::prepare_staged(&staged, allow_hooks)?;
         let signature_verified = staged.signature_verified;
 
         let running = |slots: &BTreeMap<String, Slot>| {
@@ -2034,11 +2072,12 @@ impl Daemon {
                 .unwrap_or(false)
         };
         if running(&self.slots) && strategy == Strategy::Replace {
-            self.stop_service(&id)?;
+            self.stop_service(&id, clock)?;
         }
         let still_running = running(&self.slots);
         let service = plugin::install_staged(
             &self.config.paths,
+            &self.config.limits,
             staged,
             strategy,
             allow_hooks,
@@ -2059,6 +2098,7 @@ impl Daemon {
                     service.lifecycle.clone(),
                     service.restart,
                     self.config.paths.clone(),
+                    self.config.limits.clone(),
                 );
                 slot.set_protocol(service.protocol);
                 slot.set_protocol_only(true);
@@ -2071,7 +2111,7 @@ impl Daemon {
                 // gives it. Without this the plugin answers calls but its
                 // notifications never reach the UI bus, and default_timeout is
                 // not applied to its calls.
-                configure_slot(&mut slot, &service);
+                configure_slot(&mut slot, &service, &self.config.limits);
                 self.slots.insert(id.clone(), slot);
             }
         }
@@ -2094,19 +2134,21 @@ impl Daemon {
                 "; signature was NOT verified (allow_insecure_install)"
             }
         ));
-        self.status_for_id(&id).ok_or_else(|| {
+        self.status_for_id(&id, clock.now()).ok_or_else(|| {
             ProblemError::new(Problem::UnknownPlugin, format!("unknown plugin: {}", id))
         })
     }
 
-    fn uninstall_plugin(&mut self, request: &rpc::Request) -> Result<(), ProblemError> {
+    fn uninstall_plugin(
+        &mut self,
+        request: &rpc::Request,
+        clock: &Clock,
+    ) -> Result<(), ProblemError> {
         let id = request
             .params
             .get("id")
             .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ProblemError::new(Problem::Internal, "plugin.uninstall requires id")
-            })?;
+            .ok_or_else(|| ProblemError::new(Problem::Internal, "plugin.uninstall requires id"))?;
         let purge = request
             .params
             .get("purge")
@@ -2127,9 +2169,9 @@ impl Daemon {
             .map(|slot| !matches!(slot.machine.state, State::Stopped | State::Failed))
             .unwrap_or(false);
         if running {
-            self.stop_service(id)?;
+            self.stop_service(id, clock)?;
         }
-        plugin::uninstall(&self.config.paths, id, purge)?;
+        plugin::uninstall(&self.config.paths, &self.config.limits, id, purge)?;
         self.slots.remove(id);
         self.registry.remove(id);
         runtime::remove(id, &self.config.paths);
@@ -2144,7 +2186,12 @@ impl Daemon {
         Ok(())
     }
 
-    fn set_enabled(&mut self, id: &str, enabled: bool) -> Result<Status, ProblemError> {
+    fn set_enabled(
+        &mut self,
+        id: &str,
+        enabled: bool,
+        clock: &Clock,
+    ) -> Result<Status, ProblemError> {
         if self.registry.get(id).is_none() {
             return Err(ProblemError::new(
                 Problem::UnknownService,
@@ -2165,9 +2212,15 @@ impl Daemon {
                 ProblemError::new(Problem::UnknownService, format!("unknown service: {}", id))
             })?;
         let (marker, create) = match kind {
-            Kind::Plugin => (plugin::plugin_dir(&self.config.paths, id).join("enabled"), enabled),
+            Kind::Plugin => (
+                plugin::plugin_dir(&self.config.paths, id).join("enabled"),
+                enabled,
+            ),
             Kind::Core => (
-                self.config.paths.services_dir.join(format!("{}.disabled", id)),
+                self.config
+                    .paths
+                    .services_dir
+                    .join(format!("{}.disabled", id)),
                 !enabled,
             ),
         };
@@ -2200,7 +2253,7 @@ impl Daemon {
         // `disable` changes the boot flag only. The crash-restart policy is a
         // separate service property and must not be turned off behind the
         // operator's back.
-        self.status_for_id(id).ok_or_else(|| {
+        self.status_for_id(id, clock.now()).ok_or_else(|| {
             ProblemError::new(Problem::UnknownService, format!("unknown service: {}", id))
         })
     }
@@ -2208,7 +2261,7 @@ impl Daemon {
     /// `svc restart` = stop then start, on one RPC so no other caller can slip
     /// in between. A finished one-shot is stopped (settles immediately) and
     /// then runs again.
-    fn restart_service(&mut self, id: &str) -> Result<Status, ProblemError> {
+    fn restart_service(&mut self, id: &str, clock: &Clock) -> Result<Status, ProblemError> {
         if self.registry.get(id).is_none() {
             return Err(ProblemError::new(
                 Problem::UnknownService,
@@ -2216,13 +2269,13 @@ impl Daemon {
             ));
         }
         if id == RESERVED_ID {
-            return Ok(self.status_for_id(id).expect("builtin"));
+            return Ok(self.status_for_id(id, clock.now()).expect("builtin"));
         }
-        self.stop_service(id)?;
-        self.start_service(id)
+        self.stop_service(id, clock)?;
+        self.start_service(id, clock)
     }
 
-    fn stop_service(&mut self, id: &str) -> Result<Status, ProblemError> {
+    fn stop_service(&mut self, id: &str, clock: &Clock) -> Result<Status, ProblemError> {
         if self.registry.get(id).is_none() {
             return Err(ProblemError::new(
                 Problem::UnknownService,
@@ -2230,27 +2283,31 @@ impl Daemon {
             ));
         }
         if id == RESERVED_ID {
-            return Ok(self.status_for_id(id).expect("builtin"));
+            return Ok(self.status_for_id(id, clock.now()).expect("builtin"));
         }
         let Some(state) = self.slots.get(id).map(|slot| slot.machine.state) else {
-            return self.status_for_id(id).ok_or_else(|| {
+            return self.status_for_id(id, clock.now()).ok_or_else(|| {
                 ProblemError::new(Problem::UnknownService, format!("unknown service: {}", id))
             });
         };
 
-        let now = self.now_ms();
-        self.slots.get_mut(id).expect("slot").request_stop(now);
+        let now = clock.now();
+        self.slots
+            .get_mut(id)
+            .expect("slot")
+            .request_stop(now.mono_ms);
         if matches!(state, State::Stopped | State::Failed) {
-            return self.status_for_id(id).ok_or_else(|| {
+            return self.status_for_id(id, clock.now()).ok_or_else(|| {
                 ProblemError::new(Problem::UnknownService, format!("unknown service: {}", id))
             });
         }
         let deadline = now
+            .mono_ms
             .saturating_add(supervisor::STOP_TIMEOUT_MS)
             .saturating_add(supervisor::KILL_TIMEOUT_MS)
             .saturating_add(1_000);
         loop {
-            self.pump();
+            self.pump(clock.now());
             match self.slots[id].machine.state {
                 State::Stopped => break,
                 State::Failed => {
@@ -2261,7 +2318,7 @@ impl Daemon {
                 }
                 _ => {}
             }
-            if self.now_ms() >= deadline {
+            if clock.now().mono_ms >= deadline {
                 return Err(ProblemError::new(
                     Problem::Timeout,
                     format!("stop timed out: {}", id),
@@ -2269,24 +2326,23 @@ impl Daemon {
             }
             thread::sleep(Duration::from_millis(20));
         }
-        self.status_for_id(id).ok_or_else(|| {
+        self.status_for_id(id, clock.now()).ok_or_else(|| {
             ProblemError::new(Problem::UnknownService, format!("unknown service: {}", id))
         })
     }
 
-    fn pump(&mut self) {
+    fn pump(&mut self, now: Now) {
         // Plugin stdio belongs to this loop: one non-blocking pass before every
         // pump keeps plugin pipes moving inside a synchronous start/stop wait.
         // The reader-thread target needs no equivalent — its threads deliver
         // into the slot channels on their own.
         self.stdio.pump();
-        let now = self.now_ms();
         let ids: Vec<String> = self.slots.keys().cloned().collect();
         let mut changed = false;
         for id in ids {
             let mut slot = self.slots.remove(&id).expect("slot");
             let before = slot.machine.state;
-            slot.pump(now);
+            slot.pump(now.mono_ms);
             if slot.machine.state != before {
                 changed = true;
             }
@@ -2295,14 +2351,17 @@ impl Daemon {
         if changed {
             self.bump_catalog();
         }
-        self.persist_states();
+        self.persist_states(now);
     }
 
-    fn stop_all(&mut self) {
+    fn stop_all(&mut self, clock: &Clock) {
         let started = Instant::now();
         let ids: Vec<String> = self.slots.keys().cloned().collect();
         let layers = start_layers(&self.registry, &ids).unwrap_or_else(|_| vec![ids]);
-        let global_deadline = self.now_ms().saturating_add(supervisor::SHUTDOWN_BUDGET_MS);
+        let global_deadline = clock
+            .now()
+            .mono_ms
+            .saturating_add(supervisor::SHUTDOWN_BUDGET_MS);
         'layers: for layer in layers.into_iter().rev() {
             let active: Vec<String> = layer
                 .into_iter()
@@ -2322,23 +2381,24 @@ impl Daemon {
                 continue;
             }
             for id in &active {
-                let now = self.now_ms();
+                let now = clock.now().mono_ms;
                 self.slots.get_mut(id).expect("slot").request_stop(now);
             }
-            let deadline = self
-                .now_ms()
+            let deadline = clock
+                .now()
+                .mono_ms
                 .saturating_add(supervisor::STOP_TIMEOUT_MS)
                 .saturating_add(supervisor::KILL_TIMEOUT_MS)
                 .min(global_deadline);
             loop {
-                self.pump();
+                self.pump(clock.now());
                 if active.iter().all(|id| {
                     matches!(self.slots[id].machine.state, State::Stopped | State::Failed)
                 }) {
                     break;
                 }
-                if self.now_ms() >= deadline {
-                    if self.now_ms() >= global_deadline {
+                if clock.now().mono_ms >= deadline {
+                    if clock.now().mono_ms >= global_deadline {
                         for slot in self.slots.values_mut() {
                             if !matches!(slot.machine.state, State::Stopped | State::Failed) {
                                 slot.signal_force("daemon shutdown past its global budget");
@@ -2481,9 +2541,9 @@ fn project_builtin_outcome(external_id: Option<Value>, outcome: Result<Value, Fa
 
 /// Give a slot its contract and the face-side projections. The slot itself no
 /// longer knows MCP or the UI bus.
-fn configure_slot(slot: &mut Slot, service: &Service) {
+fn configure_slot(slot: &mut Slot, service: &Service, limits: &crate::limits::Limits) {
     slot.set_contract(service.contract.clone());
-    slot.set_call_timeout(crate::limits::current().default_timeout);
+    slot.set_call_timeout(limits.default_timeout);
     slot.set_projector(Arc::new(project_slot_outcome));
     let id = service.id.clone();
     slot.set_notifier(Arc::new(move |method, params| {
@@ -2508,12 +2568,7 @@ fn unknown_tool(id: &Option<Value>, name: &str) -> rpc::Response {
 /// becomes the `probe` text (capped), and a non-zero exit only appends the
 /// status word. Capture goes through a temp file so a hook that leaves a child
 /// holding stdout cannot block the daemon's event loop.
-fn run_status_hook(
-    id: &str,
-    hook: &Hook,
-    paths: &Paths,
-    poll: &mut dyn FnMut(),
-) -> String {
+fn run_status_hook(id: &str, hook: &Hook, paths: &Paths, poll: &mut dyn FnMut()) -> String {
     let output_path = status_output_path(id, paths);
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -2618,7 +2673,6 @@ fn status_detail(output: &str, status: Option<std::process::ExitStatus>) -> Stri
     }
 }
 
-
 fn param_id(request: &rpc::Request) -> Result<String, rpc::Response> {
     request
         .params
@@ -2712,13 +2766,10 @@ fn missing_dependencies(registry: &Registry, id: &str) -> Vec<String> {
     walk_dependencies(registry, &[id.to_string()]).1
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::contract::{
-        Capability as KernelCapability, CapabilityName, Effect,
-    };
+    use crate::kernel::contract::{Capability as KernelCapability, CapabilityName, Effect};
     use crate::registry::{Exec, Kind, Ready, Service};
 
     fn capability(name: &str) -> KernelCapability {
@@ -2740,6 +2791,7 @@ mod tests {
                 "1.0.0",
                 caps,
                 crate::registry::Carrier::Slot,
+                &crate::limits::test_default(),
             ),
             ..service(id, &[])
         }
@@ -2751,6 +2803,7 @@ mod tests {
             "1.0.0",
             Vec::new(),
             crate::registry::Carrier::Slot,
+            &crate::limits::test_default(),
         );
         Service {
             id: id.into(),
@@ -2796,7 +2849,11 @@ mod tests {
     #[test]
     fn the_daemon_does_not_spawn_call_worker_threads() {
         let (_sender, receiver) = mpsc::channel();
-        let _daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+        let _daemon = Daemon::new(
+            Registry::with_builtin(&crate::limits::test_default()),
+            receiver,
+            None,
+        );
         let names: Vec<String> = std::fs::read_dir("/proc/self/task")
             .expect("task dir")
             .filter_map(|entry| {
@@ -2979,6 +3036,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             "1.0.0",
             caps,
             crate::registry::Carrier::Slot,
+            &crate::limits::test_default(),
         );
         Service {
             id: id.into(),
@@ -3015,11 +3073,14 @@ while ($null -ne ($line = $reader.ReadLine())) {
         }))
         .expect("request");
         let (sender, receiver) = mpsc::channel();
-        daemon.handle(channel::PendingCall {
-            endpoint: channel::Endpoint::Admin,
-            line,
-            reply: crate::channel::Reply::plain(sender),
-        });
+        daemon.handle(
+            &clock(),
+            channel::PendingCall {
+                endpoint: channel::Endpoint::Admin,
+                line,
+                reply: crate::channel::Reply::plain(sender),
+            },
+        );
         receiver
     }
 
@@ -3038,11 +3099,14 @@ while ($null -ne ($line = $reader.ReadLine())) {
         }))
         .expect("request");
         let (sender, receiver) = mpsc::channel();
-        daemon.handle(channel::PendingCall {
-            endpoint,
-            line,
-            reply: crate::channel::Reply::plain(sender),
-        });
+        daemon.handle(
+            &clock(),
+            channel::PendingCall {
+                endpoint,
+                line,
+                reply: crate::channel::Reply::plain(sender),
+            },
+        );
         let line = receiver.recv().expect("reply");
         serde_json::from_str(&line).expect("response")
     }
@@ -3057,7 +3121,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
     #[test]
     fn the_read_endpoint_cannot_run_a_write_method() {
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+        let mut daemon = Daemon::new(
+            Registry::with_builtin(&crate::limits::test_default()),
+            receiver,
+            None,
+        );
 
         let refused = send_on(
             &mut daemon,
@@ -3074,12 +3142,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             "the unauthorized gate is a control-plane failure: {refused}"
         );
 
-        let allowed = send_on(
-            &mut daemon,
-            channel::Endpoint::User,
-            "svc.list",
-            json!({}),
-        );
+        let allowed = send_on(&mut daemon, channel::Endpoint::User, "svc.list", json!({}));
         assert!(
             allowed.get("error").is_none(),
             "the read endpoint must still list services: {allowed}"
@@ -3091,7 +3154,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
     #[test]
     fn the_admin_endpoint_reaches_a_write_method() {
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+        let mut daemon = Daemon::new(
+            Registry::with_builtin(&crate::limits::test_default()),
+            receiver,
+            None,
+        );
 
         let response = send_on(
             &mut daemon,
@@ -3105,13 +3172,100 @@ while ($null -ne ($line = $reader.ReadLine())) {
         );
     }
 
+    /// A real clock for the tests that drive blocking start / stop paths.
+    fn clock() -> Clock {
+        Clock::boot()
+    }
+
+    /// A fixed pair for the tests that only read a projection.
+    fn now() -> Now {
+        Now::at(0, 0)
+    }
+
+    /// The loop waits for the nearest timer and never longer than one poll
+    /// tick: that bound is what keeps shutdown and plugin stdio serviced.
+    #[test]
+    fn next_wait_shrinks_for_the_nearest_timer_and_never_exceeds_the_poll_tick() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(
+            Registry::with_builtin(&crate::limits::test_default()),
+            receiver,
+            None,
+        );
+        daemon.rescan_interval_ms = 5_000;
+        daemon.next_rescan_ms = 5_000;
+        daemon.temp_cleanup_interval_ms = 60_000;
+        daemon.next_temp_cleanup_ms = 60_000;
+
+        assert_eq!(
+            daemon.next_wait(now()),
+            POLL_WAIT,
+            "no timer inside the tick"
+        );
+
+        daemon.next_rescan_ms = 20;
+        assert_eq!(daemon.next_wait(now()), Duration::from_millis(20));
+
+        daemon.rescan_interval_ms = 0;
+        daemon.next_rescan_ms = 0;
+        assert_eq!(daemon.next_wait(now()), POLL_WAIT, "0 disables the timer");
+    }
+
+    /// A due timer is re-armed exactly one interval ahead, so a late tick does
+    /// not fire the same timer twice.
+    #[test]
+    fn tick_rearms_a_due_rescan_timer_without_double_firing() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(
+            Registry::with_builtin(&crate::limits::test_default()),
+            receiver,
+            None,
+        );
+        daemon.rescan_interval_ms = 5_000;
+        daemon.next_rescan_ms = 5_000;
+        daemon.temp_cleanup_interval_ms = 0;
+        daemon.next_temp_cleanup_ms = 0;
+
+        daemon.tick(Now::at(4_999, 0), &clock());
+        assert_eq!(daemon.next_rescan_ms, 5_000, "not due yet");
+
+        daemon.tick(Now::at(5_000, 0), &clock());
+        assert_eq!(
+            daemon.next_rescan_ms, 10_000,
+            "due: re-armed one interval ahead"
+        );
+    }
+
+    /// The temp cleanup cadence is the loop's other timer; a tick past its
+    /// deadline re-arms it from the tick's own `now`.
+    #[test]
+    fn tick_rearms_the_temp_cleanup_timer_from_its_own_now() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(
+            Registry::with_builtin(&crate::limits::test_default()),
+            receiver,
+            None,
+        );
+        daemon.rescan_interval_ms = 0;
+        daemon.next_rescan_ms = 0;
+        daemon.temp_cleanup_interval_ms = 1_000;
+        daemon.next_temp_cleanup_ms = 0;
+
+        daemon.tick(Now::at(500, 0), &clock());
+        assert_eq!(
+            daemon.next_temp_cleanup_ms, 1_500,
+            "re-armed from the tick's now, not from a second clock read"
+        );
+    }
+
     fn next_line(daemon: &mut Daemon, receiver: &Receiver<String>) -> Value {
         let deadline = Instant::now() + Duration::from_secs(5);
+        let clock = clock();
         loop {
             if let Ok(line) = receiver.try_recv() {
                 return serde_json::from_str(&line).expect("line json");
             }
-            daemon.pump();
+            daemon.pump(clock.now());
             assert!(Instant::now() < deadline, "no line");
             thread::sleep(Duration::from_millis(10));
         }
@@ -3119,6 +3273,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
 
     fn wait(daemon: &mut Daemon, receiver: &Receiver<String>) -> rpc::Response {
         let deadline = Instant::now() + Duration::from_secs(5);
+        let clock = clock();
         loop {
             if let Ok(line) = receiver.try_recv() {
                 let value: Value = serde_json::from_str(&line).expect("response json");
@@ -3133,7 +3288,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
                 }
                 return serde_json::from_value(value).expect("response");
             }
-            daemon.pump();
+            daemon.pump(clock.now());
             assert!(Instant::now() < deadline, "no response");
             thread::sleep(Duration::from_millis(10));
         }
@@ -3152,8 +3307,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root =
-            crate::test_support::temp_dir().join(format!("svcd-tools-unit-{}-{}", std::process::id(), nanos));
+        let root = crate::test_support::temp_dir().join(format!(
+            "svcd-tools-unit-{}-{}",
+            std::process::id(),
+            nanos
+        ));
         std::fs::create_dir_all(root.join("logs")).expect("logs");
 
         let plugin = tool_service(
@@ -3164,7 +3322,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
         );
         let (_sender, receiver) = mpsc::channel();
         let mut daemon = Daemon::new(registry(vec![plugin]), receiver, None);
-        daemon.start_service("plug").expect("start");
+        daemon.start_service("plug", &clock()).expect("start");
         assert!(daemon.is_live("plug"));
 
         let echo = send(
@@ -3199,14 +3357,17 @@ while ($null -ne ($line = $reader.ReadLine())) {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root =
-            crate::test_support::temp_dir().join(format!("svcd-tools-unit-{}-{}", std::process::id(), nanos));
+        let root = crate::test_support::temp_dir().join(format!(
+            "svcd-tools-unit-{}-{}",
+            std::process::id(),
+            nanos
+        ));
         std::fs::create_dir_all(root.join("logs")).expect("logs");
 
         let core = tool_service("core", Kind::Core, &["echo"], &root);
         let (_sender, receiver) = mpsc::channel();
         let mut daemon = Daemon::new(registry(vec![core]), receiver, None);
-        daemon.start_service("core").expect("start");
+        daemon.start_service("core", &clock()).expect("start");
         assert!(daemon.is_live("core"));
 
         let tools = daemon.tool_list();
@@ -3237,17 +3398,20 @@ while ($null -ne ($line = $reader.ReadLine())) {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root =
-            crate::test_support::temp_dir().join(format!("svcd-tools-unit-{}-{}", std::process::id(), nanos));
+        let root = crate::test_support::temp_dir().join(format!(
+            "svcd-tools-unit-{}-{}",
+            std::process::id(),
+            nanos
+        ));
         std::fs::create_dir_all(root.join("logs")).expect("logs");
 
         let service = tool_service("proc", Kind::Core, &["progress", "fail"], &root);
         let (_sender, receiver) = mpsc::channel();
         let mut daemon = Daemon::new(registry(vec![service]), receiver, None);
-        daemon.start_service("proc").expect("start");
+        daemon.start_service("proc", &clock()).expect("start");
         assert!(daemon.is_live("proc"));
         let pid = daemon
-            .status_for_id("proc")
+            .status_for_id("proc", now())
             .expect("status")
             .summary
             .pid
@@ -3277,8 +3441,8 @@ while ($null -ne ($line = $reader.ReadLine())) {
         // tool error, not only a successful value.
         assert_tool_error(&mut daemon, "proc.fail", "boom");
 
-        daemon.stop_service("proc").expect("stop");
-        let status = daemon.status_for_id("proc").expect("status");
+        daemon.stop_service("proc", &clock()).expect("stop");
+        let status = daemon.status_for_id("proc", now()).expect("status");
         assert_eq!(status.summary.state, State::Stopped);
         assert!(status.summary.pid.is_none());
         #[cfg(unix)]
@@ -3329,6 +3493,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
                     "1.0.0",
                     caps,
                     crate::registry::Carrier::Slot,
+                    &crate::limits::test_default(),
                 );
                 service
             })
@@ -3480,7 +3645,9 @@ while ($null -ne ($line = $reader.ReadLine())) {
         let mut daemon = Daemon::new(registry, receiver, None);
         daemon.slots.get_mut("base").expect("base").machine.state = State::Failed;
 
-        let error = daemon.start_service("app").expect_err("failed dependency");
+        let error = daemon
+            .start_service("app", &clock())
+            .expect_err("failed dependency");
 
         assert_eq!(error.problem, Problem::Internal);
         assert!(
@@ -3503,11 +3670,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
     #[test]
     fn a_reload_rejects_two_owners_and_leaves_the_live_service_and_slot_alone() {
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(
-            registry(vec![service("live", &[])]),
-            receiver,
-            None,
-        );
+        let mut daemon = Daemon::new(registry(vec![service("live", &[])]), receiver, None);
 
         let mut desired = BTreeMap::new();
         desired.insert("bad".to_string(), two_owners("bad"));
@@ -3518,6 +3681,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             "9.9.9",
             conflicting_live.contract.surface().to_vec(),
             crate::registry::Carrier::Launcher,
+            &crate::limits::test_default(),
         );
         desired.insert("live".to_string(), conflicting_live);
 
@@ -3550,7 +3714,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
 
     #[test]
     fn the_assembly_point_keeps_one_carrier_per_service() {
-        let mut registry = Registry::with_builtin();
+        let mut registry = Registry::with_builtin(&crate::limits::test_default());
         registry.insert(service("core", &[])).expect("core");
         let (_sender, receiver) = mpsc::channel();
         let daemon = Daemon::new(registry, receiver, None);
@@ -3576,7 +3740,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
     #[test]
     fn the_builtin_svc_is_projected_and_called_through_launchers() {
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+        let mut daemon = Daemon::new(
+            Registry::with_builtin(&crate::limits::test_default()),
+            receiver,
+            None,
+        );
 
         let listed = send(&mut daemon, "tools/list", json!({}));
         let listed = wait(&mut daemon, &listed);
@@ -3655,7 +3823,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
     #[test]
     fn lifecycle_management_errors_carry_their_problem_kind() {
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+        let mut daemon = Daemon::new(
+            Registry::with_builtin(&crate::limits::test_default()),
+            receiver,
+            None,
+        );
 
         let started = send_on(
             &mut daemon,
@@ -3709,7 +3881,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
     #[test]
     fn plugin_management_errors_carry_their_problem_kind() {
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+        let mut daemon = Daemon::new(
+            Registry::with_builtin(&crate::limits::test_default()),
+            receiver,
+            None,
+        );
 
         let missing_path = send_on(
             &mut daemon,
@@ -3755,7 +3931,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
     #[test]
     fn auth_and_parameter_errors_carry_their_problem_kind() {
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+        let mut daemon = Daemon::new(
+            Registry::with_builtin(&crate::limits::test_default()),
+            receiver,
+            None,
+        );
 
         let auth = send_on(
             &mut daemon,
@@ -3829,7 +4009,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
     #[test]
     fn installing_a_package_named_after_a_core_service_reports_core_service() {
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+        let mut daemon = Daemon::new(
+            Registry::with_builtin(&crate::limits::test_default()),
+            receiver,
+            None,
+        );
         let dir = package::tempdir::TempDir::new();
         let path = dir.path().join("svc.spk");
         std::fs::write(
@@ -3850,7 +4034,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
     #[test]
     fn installing_a_package_for_another_platform_reports_unsupported_platform() {
         let (_sender, receiver) = mpsc::channel();
-        let mut daemon = Daemon::new(Registry::with_builtin(), receiver, None);
+        let mut daemon = Daemon::new(
+            Registry::with_builtin(&crate::limits::test_default()),
+            receiver,
+            None,
+        );
         let dir = package::tempdir::TempDir::new();
         let path = dir.path().join("other.spk");
         std::fs::write(&path, package::test_signed_package("other", "other-triple"))
@@ -3886,7 +4074,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
         daemon.slots.get_mut("stuck").expect("slot").machine.state = State::Starting;
 
         let error = daemon
-            .start_layer(&["stuck".into()], 0)
+            .start_layer(&["stuck".into()], 0, &clock())
             .expect_err("past deadline");
         assert_eq!(error.problem, Problem::Timeout);
 

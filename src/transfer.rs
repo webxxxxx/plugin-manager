@@ -20,7 +20,6 @@ use crate::package;
 use crate::paths::Paths;
 use crate::plugin;
 use crate::rpc;
-use crate::settings;
 
 const MAX_IMPORT: u64 = 512 * 1024 * 1024;
 
@@ -49,6 +48,7 @@ pub enum Error {
 
 pub fn import(
     paths: &Paths,
+    allow_insecure: bool,
     data: &[u8],
     config_id: Option<&str>,
     no_config: bool,
@@ -66,6 +66,7 @@ pub fn import(
     match first.map(|entry| entry.path.as_str()) {
         Some("backup.json") => import_backup(
             paths,
+            allow_insecure,
             entries.as_ref().expect("entries"),
             no_config,
             force,
@@ -95,6 +96,7 @@ pub fn import(
 
 fn import_backup(
     paths: &Paths,
+    allow_insecure: bool,
     entries: &[package::TarEntry],
     no_config: bool,
     force: bool,
@@ -108,22 +110,17 @@ fn import_backup(
         Error::Failed(Problem::Invalid.error(format!("invalid backup.json: {}", error)))
     })?;
     if backup.schema != 1 {
-        return Err(Error::Failed(Problem::Invalid.error(format!(
-            "unsupported backup schema {}",
-            backup.schema
-        ))));
+        return Err(Error::Failed(
+            Problem::Invalid.error(format!("unsupported backup schema {}", backup.schema)),
+        ));
     }
     let spk = entries
         .iter()
         .find(|entry| entry.path == "plugin.spk")
         .ok_or_else(|| Error::Failed(Problem::Invalid.error("plugin.spk is missing")))?;
     let (package, _) =
-        package::verify_bytes_with_fallback(
-            &spk.data,
-            settings::allow_insecure_install(),
-            &paths.trust_dir,
-        )
-        .map_err(Error::Failed)?;
+        package::verify_bytes_with_fallback(&spk.data, allow_insecure, &paths.trust_dir)
+            .map_err(Error::Failed)?;
     if package.manifest.name != backup.id {
         return Err(Error::Failed(Problem::Invalid.error(format!(
             "backup id {} does not match package id {}",
@@ -141,14 +138,14 @@ fn import_backup(
             .iter()
             .find(|entry| entry.path == "config")
             .ok_or_else(|| {
-                Error::Failed(Problem::Invalid.error(
-                    "backup declares a config hash but config is missing",
-                ))
+                Error::Failed(
+                    Problem::Invalid.error("backup declares a config hash but config is missing"),
+                )
             })?;
         if &package::hex_sha256(&config.data) != expected {
-            return Err(Error::Failed(Problem::Invalid.error(
-                "backup config hash does not match",
-            )));
+            return Err(Error::Failed(
+                Problem::Invalid.error("backup config hash does not match"),
+            ));
         }
     }
 
@@ -196,10 +193,9 @@ pub(crate) fn apply_config(
         plugin::root_required().map_err(Error::Failed)?;
     }
     if !package::valid_name(id) || plugin::current_version(paths, id).is_none() {
-        return Err(Error::Failed(Problem::UnknownPlugin.error(format!(
-            "unknown plugin: {}",
-            id
-        ))));
+        return Err(Error::Failed(
+            Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)),
+        ));
     }
     let _lock = plugin::lock_config(paths, id).map_err(Error::Failed)?;
     plugin::replace_config(paths, id, data, true).map_err(Error::Failed)
@@ -221,11 +217,7 @@ fn install_bytes(
         NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
     ));
     if let Err(error) = fs::write(&path, bytes) {
-        return Err(Problem::Internal.error(format!(
-            "write {}: {}",
-            path.display(),
-            error
-        )));
+        return Err(Problem::Internal.error(format!("write {}: {}", path.display(), error)));
     }
     let response = channel::request(
         &paths.config_dir,
@@ -233,9 +225,8 @@ fn install_bytes(
         json!({ "path": path.to_string_lossy(), "strategy": "replace" }),
     );
     let _ = fs::remove_file(&path);
-    let response = response.map_err(|error| {
-        Problem::Internal.error(format!("svcd unreachable: {}", error))
-    })?;
+    let response = response
+        .map_err(|error| Problem::Internal.error(format!("svcd unreachable: {}", error)))?;
     refused(response)
 }
 
@@ -263,6 +254,7 @@ mod tests {
     fn raw_config_without_an_id_is_a_usage_error() {
         match import(
             &Paths::under(std::path::Path::new("/nonexistent-svcd-transfer")),
+            false,
             b"plain text",
             None,
             false,
@@ -306,7 +298,10 @@ mod tests {
                 data: None,
             }),
         };
-        assert_eq!(refused(response).expect_err("refused").problem, Problem::Internal);
+        assert_eq!(
+            refused(response).expect_err("refused").problem,
+            Problem::Internal
+        );
     }
 
     #[test]
@@ -318,6 +313,7 @@ mod tests {
         }];
         match import_backup(
             &Paths::under(std::path::Path::new("/nonexistent-svcd-transfer")),
+            false,
             &entries,
             false,
             false,

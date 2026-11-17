@@ -96,6 +96,7 @@ impl BlockingPool {
     pub fn start(
         workers: usize,
         queue_limit: usize,
+        stack_bytes: usize,
         finished: impl Fn(u64, JobOutcome) + Send + Sync + 'static,
     ) -> io::Result<BlockingPool> {
         let workers = workers.max(1);
@@ -119,7 +120,7 @@ impl BlockingPool {
                 // #121 it can parse a package manifest and tar entries. The
                 // transfer floor keeps that work inside the stack budget even
                 // when svcd.conf puts request_stack_bytes at its 64 KiB floor.
-                .stack_size(crate::threads::transfer_stack())
+                .stack_size(stack_bytes)
                 .spawn(move || run_worker(worker));
             if let Err(error) = spawned {
                 inner.shutdown();
@@ -347,7 +348,7 @@ mod tests {
     #[test]
     fn a_full_queue_is_busy_instead_of_growing() {
         let (finished, finished_rx) = finished_channel();
-        let pool = BlockingPool::start(1, 1, move |key, outcome| {
+        let pool = BlockingPool::start(1, 1, 256 * 1024, move |key, outcome| {
             let _ = finished.send((key, outcome));
         })
         .expect("pool");
@@ -374,7 +375,7 @@ mod tests {
     #[test]
     fn one_job_per_connection_is_busy_while_queued_or_running() {
         let (finished, finished_rx) = finished_channel();
-        let pool = BlockingPool::start(1, 4, move |key, outcome| {
+        let pool = BlockingPool::start(1, 4, 256 * 1024, move |key, outcome| {
             let _ = finished.send((key, outcome));
         })
         .expect("pool");
@@ -410,7 +411,7 @@ mod tests {
     #[test]
     fn a_disconnect_drops_a_queued_job_and_reports_it_dropped() {
         let (finished, finished_rx) = finished_channel();
-        let pool = BlockingPool::start(1, 4, move |key, outcome| {
+        let pool = BlockingPool::start(1, 4, 256 * 1024, move |key, outcome| {
             let _ = finished.send((key, outcome));
         })
         .expect("pool");
@@ -450,7 +451,7 @@ mod tests {
     #[test]
     fn cancelling_a_running_job_reports_cancelled_and_frees_its_key() {
         let (finished, finished_rx) = finished_channel();
-        let pool = BlockingPool::start(1, 4, move |key, outcome| {
+        let pool = BlockingPool::start(1, 4, 256 * 1024, move |key, outcome| {
             let _ = finished.send((key, outcome));
         })
         .expect("pool");
@@ -492,7 +493,7 @@ mod tests {
     #[test]
     fn a_refused_boxed_job_is_handed_back_to_its_stream() {
         let (finished, _finished_rx) = finished_channel();
-        let pool = BlockingPool::start(1, 1, move |key, outcome| {
+        let pool = BlockingPool::start(1, 1, 256 * 1024, move |key, outcome| {
             let _ = finished.send((key, outcome));
         })
         .expect("pool");
@@ -528,7 +529,7 @@ mod tests {
     #[test]
     fn a_panicking_job_keeps_the_worker_and_reports_finished() {
         let (finished, finished_rx) = finished_channel();
-        let pool = BlockingPool::start(1, 2, move |key, outcome| {
+        let pool = BlockingPool::start(1, 2, 256 * 1024, move |key, outcome| {
             let _ = finished.send((key, outcome));
         })
         .expect("pool");
@@ -544,7 +545,7 @@ mod tests {
     #[test]
     fn shutdown_rejects_new_jobs_and_reports_queued_jobs_dropped() {
         let (finished, finished_rx) = finished_channel();
-        let pool = BlockingPool::start(1, 2, move |key, outcome| {
+        let pool = BlockingPool::start(1, 2, 256 * 1024, move |key, outcome| {
             let _ = finished.send((key, outcome));
         })
         .expect("pool");

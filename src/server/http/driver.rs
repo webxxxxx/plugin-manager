@@ -8,7 +8,6 @@ use std::io::{Read, Seek, SeekFrom};
 use std::net::TcpStream;
 use std::time::Instant;
 
-use crate::limits;
 use crate::log;
 
 use super::budget::{Busy, StreamBudget, StreamPermit};
@@ -51,13 +50,19 @@ pub struct StreamDriver {
     paused: Option<Instant>,
     /// Held for long-lived streams, absent for one-shot responses.
     _permit: Option<StreamPermit>,
+    /// The limits derived once at the composition root.
+    limits: std::sync::Arc<crate::limits::Limits>,
 }
 
 impl StreamDriver {
     /// Admit a handler under `max_streams`. A one-shot response is exempt.
-    pub fn admit(handler: Box<dyn StreamHandler>, max_streams: usize) -> StreamAdmission {
+    pub fn admit(
+        handler: Box<dyn StreamHandler>,
+        max_streams: usize,
+        limits: std::sync::Arc<crate::limits::Limits>,
+    ) -> StreamAdmission {
         match StreamBudget::global().acquire(handler.stream_class(), max_streams) {
-            Ok(permit) => StreamAdmission::Admitted(StreamDriver::new(handler, permit)),
+            Ok(permit) => StreamAdmission::Admitted(StreamDriver::new(handler, permit, limits)),
             Err(Busy) => StreamAdmission::Busy,
         }
     }
@@ -69,15 +74,17 @@ impl StreamDriver {
     pub fn admit_reserved(
         handler: Box<dyn StreamHandler>,
         permit: super::budget::StreamPermit,
+        limits: std::sync::Arc<crate::limits::Limits>,
     ) -> StreamDriver {
-        StreamDriver::new(handler, Some(permit))
+        StreamDriver::new(handler, Some(permit), limits)
     }
 
     fn new(
         handler: Box<dyn StreamHandler>,
         permit: Option<super::budget::StreamPermit>,
+        limits: std::sync::Arc<crate::limits::Limits>,
     ) -> StreamDriver {
-        let deadline = Instant::now() + limits::current().transfer_timeout;
+        let deadline = Instant::now() + limits.transfer_timeout;
         StreamDriver {
             handler,
             deadline,
@@ -89,6 +96,7 @@ impl StreamDriver {
             blocked_on_write: false,
             paused: None,
             _permit: permit,
+            limits,
         }
     }
 
@@ -254,7 +262,7 @@ impl StreamDriver {
             // must still make progress within the transfer timeout. This is
             // the bound that stops a queue-full retry from pinning the slot.
             if let Some(paused) = self.paused {
-                if now.saturating_duration_since(paused) >= limits::current().transfer_timeout {
+                if now.saturating_duration_since(paused) >= self.limits.transfer_timeout {
                     self.closing = Some(CloseReason::TimedOut);
                     let _ = flush(stream, out, out_at, last_active);
                     return false;
@@ -281,12 +289,12 @@ impl StreamDriver {
     }
 
     fn touch(&mut self) {
-        self.deadline = Instant::now() + limits::current().transfer_timeout;
+        self.deadline = Instant::now() + self.limits.transfer_timeout;
         self.wakeup = self.deadline;
     }
 
     fn on_event(&mut self, event: StreamEvent<'_>, out: &mut Vec<u8>, out_at: &mut usize) -> bool {
-        let limit = limits::current().stream_buffer;
+        let limit = self.limits.stream_buffer;
         let before = out.len();
         let step = self
             .handler
@@ -350,7 +358,7 @@ impl StreamDriver {
     /// kernel path where the platform has an incremental one; elsewhere the
     /// bounded read+write fallback keeps memory inside the stream buffer.
     fn pump_file(&mut self, stream: &mut TcpStream, out: &mut Vec<u8>) -> bool {
-        let limit = limits::current().stream_buffer;
+        let limit = self.limits.stream_buffer;
         loop {
             let Some(mut send) = self.file.take() else {
                 return true;
@@ -494,6 +502,10 @@ fn read_file_chunk(send: &mut FileSend, out: &mut Vec<u8>, limit: usize) -> std:
 }
 #[cfg(test)]
 mod tests {
+    fn test_limits() -> std::sync::Arc<crate::limits::Limits> {
+        std::sync::Arc::new(crate::limits::test_default())
+    }
+
     use super::*;
     use std::fs::{self, File};
     use std::net::TcpListener;
@@ -569,7 +581,11 @@ mod tests {
     }
 
     fn driver(wait: Duration) -> StreamDriver {
-        match StreamDriver::admit(Box::new(IdleWaiter { ticks: 0, wait }), usize::MAX) {
+        match StreamDriver::admit(
+            Box::new(IdleWaiter { ticks: 0, wait }),
+            usize::MAX,
+            test_limits(),
+        ) {
             StreamAdmission::Admitted(driver) => driver,
             StreamAdmission::Busy => panic!("an unlimited budget admits the handler"),
         }
@@ -674,7 +690,8 @@ mod tests {
 
     #[test]
     fn a_submitted_job_is_taken_once_and_resumed_with_its_outcome() {
-        let StreamAdmission::Admitted(mut driver) = StreamDriver::admit(Box::new(JobHandler), 8)
+        let StreamAdmission::Admitted(mut driver) =
+            StreamDriver::admit(Box::new(JobHandler), 8, test_limits())
         else {
             panic!("the stream fits the cap");
         };
@@ -745,7 +762,7 @@ mod tests {
             }
         }
         let StreamAdmission::Admitted(mut driver) =
-            StreamDriver::admit(Box::new(TwoJobs { calls: 0 }), 8)
+            StreamDriver::admit(Box::new(TwoJobs { calls: 0 }), 8, test_limits())
         else {
             panic!("the stream fits the cap");
         };
@@ -775,9 +792,11 @@ mod tests {
     impl StreamHandler for PauseOnce {
         fn on_event(&mut self, event: StreamEvent<'_>, _out: &mut OutBuffer<'_>) -> StreamStep {
             match event {
-                StreamEvent::Data(_) => StreamStep::wait(StreamAction::SubmitBlocking(Box::new(
-                    |_budget| BlockingOutcome::Ok(Vec::new()),
-                ))),
+                StreamEvent::Data(_) => {
+                    StreamStep::wait(StreamAction::SubmitBlocking(Box::new(|_budget| {
+                        BlockingOutcome::Ok(Vec::new())
+                    })))
+                }
                 StreamEvent::BlockingDone(_) => StreamStep::wait(StreamAction::NeedRead),
                 _ => StreamStep::wait(StreamAction::Continue),
             }
@@ -787,7 +806,7 @@ mod tests {
     #[test]
     fn a_paused_job_still_closes_at_the_transfer_bound() {
         let StreamAdmission::Admitted(mut driver) =
-            StreamDriver::admit(Box::new(PauseOnce), 1)
+            StreamDriver::admit(Box::new(PauseOnce), 1, test_limits())
         else {
             panic!("the stream fits the cap");
         };
@@ -798,15 +817,8 @@ mod tests {
         drop(job);
         let mut stream = socket();
         let mut last_active = Instant::now();
-        let beyond = Instant::now() + limits::current().transfer_timeout + Duration::from_secs(1);
-        assert!(!driver.on_tick(
-            beyond,
-            &mut stream,
-            &mut out,
-            &mut out_at,
-            &mut last_active
-        ));
+        let beyond = Instant::now() + test_limits().transfer_timeout + Duration::from_secs(1);
+        assert!(!driver.on_tick(beyond, &mut stream, &mut out, &mut out_at, &mut last_active));
         assert_eq!(driver.closing, Some(CloseReason::TimedOut));
     }
-
 }

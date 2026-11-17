@@ -51,6 +51,15 @@ bind = 127.0.0.1:8787
 # temp_retention_secs = 7200
 # temp_cleanup_interval_secs = 300
 
+# Supervisor loop cadences, in milliseconds. `rescan_interval_ms` compares the
+# services.d fingerprint and reconciles (0 = never rescan; `svc reload` still
+# works). `boot_scan_wait_ms` is how long boot waits for services.d to appear on
+# a read-only-rootfs host (0 = do not wait). Defaults: 5000 and 10000. The
+# legacy `SVCD_RESCAN_INTERVAL_MS` / `SVCD_BOOT_SCAN_WAIT_MS` env vars still
+# override these at startup and take precedence.
+# rescan_interval_ms = 5000
+# boot_scan_wait_ms = 10000
+
 # Logs. `logs_dir` defaults to install_dir/logs or the platform log directory.
 # `log_max_bytes` is the rotation threshold for one file; `log_rotations` is
 # how many old files are kept. `log_to_file = off` keeps stderr/syslog only.

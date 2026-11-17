@@ -268,8 +268,9 @@ pub fn spawn_reader<R: Read + Send + 'static>(
     stream: R,
     sender: SyncSender<FrameEvent>,
     wake: Option<Arc<Wake>>,
+    limits: &crate::limits::Limits,
 ) -> io::Result<()> {
-    spawn_reader_limit(name, stream, sender, wake, MAX_FRAME_BYTES)
+    spawn_reader_limit(name, stream, sender, wake, MAX_FRAME_BYTES, limits)
 }
 
 /// Spawn a frame reader with an explicit transport limit. Plugins use the
@@ -282,10 +283,11 @@ pub fn spawn_reader_limit<R: Read + Send + 'static>(
     sender: SyncSender<FrameEvent>,
     wake: Option<Arc<Wake>>,
     max: usize,
+    limits: &crate::limits::Limits,
 ) -> io::Result<()> {
     thread::Builder::new()
         .name(name)
-        .stack_size(threads::io_stack())
+        .stack_size(threads::io_stack(limits))
         .spawn(move || {
             let mut reader = io::BufReader::new(stream);
             loop {
@@ -316,10 +318,11 @@ pub fn spawn_length_reader_limit<R: Read + Send + 'static>(
     sender: SyncSender<FrameEvent>,
     wake: Option<Arc<Wake>>,
     max: usize,
+    limits: &crate::limits::Limits,
 ) -> io::Result<()> {
     thread::Builder::new()
         .name(name)
-        .stack_size(threads::io_stack())
+        .stack_size(threads::io_stack(limits))
         .spawn(move || {
             let mut reader = io::BufReader::new(stream);
             loop {
@@ -342,7 +345,6 @@ pub fn spawn_length_reader_limit<R: Read + Send + 'static>(
         })
         .map(|_| ())
 }
-
 
 /// Why a raw stream stopped. Every failure path records exactly one reason so
 /// the daemon log reports a distribution instead of a bare error count.
@@ -410,9 +412,7 @@ impl RawFailure {
             RawFailure::FrameTooLarge => "raw frame is too large",
             RawFailure::StreamNotSubscribed => "raw stream is not subscribed",
             RawFailure::StreamConflict => "raw stream already has an in-flight request",
-            RawFailure::BudgetBytes | RawFailure::BudgetRequests => {
-                "raw in-flight budget exceeded"
-            }
+            RawFailure::BudgetBytes | RawFailure::BudgetRequests => "raw in-flight budget exceeded",
             RawFailure::WriterQueueFull => "raw plugin writer queue is full",
             RawFailure::WriterClosed => "raw plugin is closed",
             RawFailure::SubscriberFull => "raw subscriber queue is full",

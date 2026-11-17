@@ -59,8 +59,12 @@ impl TestService {
         // Services get the machine environment plus this REG_MULTI_SZ value.
         // Isolating the config dir also isolates the control pipe, whose name is
         // derived from the config path, from any svcd already running on the host.
+        // `SVCD_BOOT_SCAN_WAIT_MS=0` skips the overlay wait: this root has no
+        // `services.d` and nothing will create one, so the default 10s budget
+        // would eat the test's whole RUNNING deadline before the SCM contract is
+        // even exercised.
         let environment = format!(
-            "SVCD_CONFIG_DIR={}\\0SVCD_DATA_DIR={}\\0SVCD_LOG_DIR={}\\0SVCD_BIND=127.0.0.1:0\\0SVCD_TEST_SCM_NAME={}",
+            "SVCD_CONFIG_DIR={}\\0SVCD_DATA_DIR={}\\0SVCD_LOG_DIR={}\\0SVCD_BIND=127.0.0.1:0\\0SVCD_BOOT_SCAN_WAIT_MS=0\\0SVCD_TEST_SCM_NAME={}",
             root.join("config").display(),
             root.join("data").display(),
             root.join("logs").display(),

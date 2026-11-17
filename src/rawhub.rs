@@ -32,7 +32,6 @@ use crate::stdio::{self, ReadEnd, Streams, WriteEnd};
 pub const HEADER: usize = 8;
 const SUBSCRIBER_QUEUE: usize = 4;
 
-
 impl RawStopSink for RawHub {
     fn note_transport_failure(&self, failure: RawFailure, plugin: &str) {
         RawHub::note_transport_failure(self, failure, plugin);
@@ -233,6 +232,7 @@ pub struct RawHub {
     max_inflight_bytes: usize,
     max_inflight_requests: usize,
     writer_queue: usize,
+    limits: Arc<crate::limits::Limits>,
     inflight_bytes: AtomicUsize,
     inflight_requests: AtomicUsize,
     next_generation: AtomicU64,
@@ -243,19 +243,15 @@ pub struct RawHub {
 }
 
 impl RawHub {
-    pub fn new(
-        max_frame: usize,
-        max_inflight_bytes: usize,
-        max_inflight_requests: usize,
-        writer_queue: usize,
-    ) -> Arc<Self> {
+    pub fn new(limits: Arc<crate::limits::Limits>) -> Arc<Self> {
         Arc::new(Self {
             plugins: Mutex::new(HashMap::new()),
             next_stream: AtomicU32::new(1),
-            max_frame,
-            max_inflight_bytes,
-            max_inflight_requests,
-            writer_queue: writer_queue.max(1),
+            max_frame: limits.ws_raw_max_bytes,
+            max_inflight_bytes: limits.ws_inflight_bytes,
+            max_inflight_requests: limits.ws_inflight_requests,
+            writer_queue: limits.ws_raw_queue.max(1),
+            limits,
             inflight_bytes: AtomicUsize::new(0),
             inflight_requests: AtomicUsize::new(0),
             next_generation: AtomicU64::new(1),
@@ -350,7 +346,7 @@ impl RawHub {
         let writer_id = id.clone();
         thread::Builder::new()
             .name(format!("svcd-{}-raw-write", id))
-            .stack_size(crate::threads::io_stack())
+            .stack_size(crate::threads::io_stack(&self.limits))
             .spawn(move || {
                 while let Ok(frame) = writer_rx.recv() {
                     if stdin.write_all(&frame).is_err() {
@@ -374,7 +370,7 @@ impl RawHub {
         let max_frame = self.max_frame;
         thread::Builder::new()
             .name(format!("svcd-{}-raw-read", id))
-            .stack_size(crate::threads::io_stack())
+            .stack_size(crate::threads::io_stack(&self.limits))
             .spawn(move || {
                 let mut header = [0u8; HEADER];
                 loop {
@@ -430,7 +426,7 @@ impl RawHub {
             .map_err(|error| format!("raw reader thread: {}", error))?;
 
         if let Some(stderr) = stderr {
-            stdio::log_lines(format!("svcd-{}-stderr", id), stderr, log)
+            stdio::log_lines(format!("svcd-{}-stderr", id), stderr, log, &self.limits)
                 .map_err(|error| format!("raw stderr thread: {}", error))?;
         }
         self.install(id, plugin)
@@ -442,7 +438,8 @@ impl RawHub {
             .lock()
             .map_err(|_| "raw plugin lock poisoned".to_string())?;
         if let Some(old) = plugins.insert(id, plugin) {
-            self.stats.record(RawFailure::PluginReplaced, &old.id, 0, "");
+            self.stats
+                .record(RawFailure::PluginReplaced, &old.id, 0, "");
             old.close(self);
         }
         Ok(())
@@ -661,7 +658,10 @@ mod tests {
 
     #[test]
     fn pending_payload_counters_are_balanced() {
-        let hub = RawHub::new(1024, 4096, 4, 8);
+        let mut settings = crate::settings::Settings::default();
+        settings.ws_inflight_bytes = Some(64 * 1024);
+        settings.ws_inflight_requests = Some(4);
+        let hub = RawHub::new(Arc::new(crate::limits::derive(&settings)));
         assert!(hub.reserve(1024).is_ok());
         assert_eq!(hub.inflight_bytes.load(Ordering::SeqCst), 1024);
         hub.release(1024);
@@ -669,7 +669,7 @@ mod tests {
         assert_eq!(hub.inflight_requests.load(Ordering::SeqCst), 0);
 
         // One frame larger than the whole budget never reserves.
-        assert_eq!(hub.reserve(8192).err(), Some(RawFailure::BudgetBytes));
+        assert_eq!(hub.reserve(65 * 1024).err(), Some(RawFailure::BudgetBytes));
         assert_eq!(hub.inflight_bytes.load(Ordering::SeqCst), 0);
 
         // The request cap holds even when bytes are available.

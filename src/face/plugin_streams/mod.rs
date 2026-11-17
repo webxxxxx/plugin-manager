@@ -33,6 +33,7 @@ pub(crate) struct StreamContext {
     /// plugin tree both come from it.
     pub paths: Arc<Paths>,
     pub raw_hub: Option<Arc<crate::rawhub::RawHub>>,
+    pub limits: Arc<crate::limits::Limits>,
 }
 
 /// Why a realtime request was refused before its first handler byte.
@@ -131,7 +132,7 @@ pub(crate) fn open_sse(
     }
     let last_event_id = http::header(&request.headers, "last-event-id")
         .and_then(|value| value.trim().parse::<u64>().ok());
-    match uichannel::bus().subscribe_from(ui.id, last_event_id) {
+    match uichannel::bus().subscribe_from(ui.id, last_event_id, &context.limits) {
         Ok((receiver, subscription, replay)) => {
             Box::new(sse::SseStream::new(receiver, subscription, replay))
         }
@@ -168,13 +169,14 @@ pub(crate) fn open_ws(
         Ok(accept) => accept,
         Err(response) => return boxed(response),
     };
-    match uichannel::bus().subscribe(ui.id) {
+    match uichannel::bus().subscribe(ui.id, &context.limits) {
         Ok((receiver, subscription)) => Box::new(ws::WsStream::new(
             context.paths.config_dir.clone(),
             ui.id.to_string(),
             accept,
             receiver,
             subscription,
+            context.limits.clone(),
         )),
         Err(_) => boxed(too_many_subscribers()),
     }
@@ -191,7 +193,7 @@ pub(crate) fn open_raw(
     if let Err(response) = valid_ui(&context.paths, ui, false) {
         return boxed(response);
     }
-    if !crate::limits::current().ws_raw_enabled {
+    if !context.limits.ws_raw_enabled {
         return boxed(http::json_error(
             403,
             "forbidden",
@@ -227,6 +229,7 @@ pub(crate) fn open_raw(
             accept,
             Box::new(subscription),
             Some(hub.clone()),
+            context.limits.clone(),
         )),
         Err(message) => boxed(http::json_error(
             503,

@@ -176,11 +176,16 @@ pub struct Layout {
 
 impl Layout {
     pub fn current() -> Self {
-        let paths = ambient_paths();
+        Layout::from_paths(&ambient_paths(None))
+    }
+
+    /// The same layout from an already-resolved directory set, so the daemon
+    /// does not resolve the document again just to build `ensure_conf`'s view.
+    fn from_paths(paths: &crate::paths::Paths) -> Self {
         Layout {
             program: default_program(),
-            data_dir: paths.data_dir,
-            config_dir: paths.config_dir,
+            data_dir: paths.data_dir.clone(),
+            config_dir: paths.config_dir.clone(),
             conf: None,
         }
     }
@@ -192,8 +197,13 @@ impl Layout {
 /// then `<config>/svcd.conf` (legacy), then a generated platform-aware default
 /// written into the config directory (falling back to the program directory when
 /// the config directory is not writable).
-pub fn ensure_conf(explicit: Option<&Path>) -> Result<PathBuf, String> {
-    let layout = Layout::current();
+pub fn ensure_conf(
+    explicit: Option<&Path>,
+    paths: &crate::paths::Paths,
+) -> Result<PathBuf, String> {
+    // The caller already resolved the directory set once; reusing it keeps the
+    // daemon from parsing the same document a second time.
+    let layout = Layout::from_paths(paths);
     let program_conf = std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(|parent| parent.join("svcd.conf")));
@@ -366,7 +376,7 @@ impl RuntimeDirs {
         // clean boot environment, so the target file's `install_dir` wins over
         // an ambient `SVCD_DATA_DIR`/`SVCD_LOG_DIR` (which still lose to an
         // explicit key in the file). `SVCD_CONFIG_DIR` keeps its usual priority.
-        let ambient = ambient_paths();
+        let ambient = ambient_paths(None);
         let config = std::env::var_os("SVCD_CONFIG_DIR")
             .map(PathBuf::from)
             .or_else(|| settings.and_then(|settings| settings.config_dir.clone()))
@@ -460,7 +470,7 @@ fn record_install_dir(path: &Path, install_dir: &Path) -> Result<(), String> {
 /// Parse the installed `svcd.conf`, if there is one, so `--uninstall` can find
 /// an `install_dir` without a `--conf` argument (uninstall does not accept one).
 fn installed_conf_settings() -> Option<crate::settings::Settings> {
-    let path = ambient_paths().config_dir.join("svcd.conf");
+    let path = ambient_paths(None).config_dir.join("svcd.conf");
     let text = fs::read_to_string(&path).ok()?;
     crate::settings::parse(&text, path.parent().unwrap_or(Path::new("."))).ok()
 }
@@ -1233,7 +1243,7 @@ pub fn self_install(args: &[String]) -> i32 {
             let base = source
                 .parent()
                 .map(Path::to_path_buf)
-                .unwrap_or_else(|| ambient_paths().config_dir);
+                .unwrap_or_else(|| ambient_paths(None).config_dir);
             let settings = match crate::settings::parse(&text, &base) {
                 Ok(settings) => settings,
                 Err(error) => {
@@ -1806,7 +1816,7 @@ fn user_path_update_skipped() -> bool {
 }
 
 fn self_install_user(request: SelfRequest) -> i32 {
-    let ambient = ambient_paths();
+    let ambient = ambient_paths(None);
     let runtime = RuntimeDirs {
         config: std::env::var_os("SVCD_CONFIG_DIR")
             .map(PathBuf::from)
@@ -2044,7 +2054,7 @@ fn self_uninstall_current(request: &SelfRequest) -> bool {
     };
     let data = std::env::var_os("SVCD_DATA_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| ambient_paths().data_dir);
+        .unwrap_or_else(|| ambient_paths(None).data_dir);
     let root = request.prefix.clone().unwrap_or_else(|| data.join("bin"));
     let current = current.to_string_lossy().to_ascii_lowercase();
     let root = root.to_string_lossy().to_ascii_lowercase();
@@ -2055,7 +2065,7 @@ fn self_uninstall_current(request: &SelfRequest) -> bool {
 fn uninstaller_path(request: &SelfRequest) -> PathBuf {
     let data = std::env::var_os("SVCD_DATA_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| ambient_paths().data_dir);
+        .unwrap_or_else(|| ambient_paths(None).data_dir);
     request
         .prefix
         .clone()
@@ -2180,7 +2190,7 @@ fn spawn_uninstall_helper(args: &[String]) -> i32 {
 }
 
 fn self_uninstall_user(request: SelfRequest, stop_daemon: &dyn Fn()) -> i32 {
-    let ambient = ambient_paths();
+    let ambient = ambient_paths(None);
     let data = std::env::var_os("SVCD_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or(ambient.data_dir.clone());

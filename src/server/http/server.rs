@@ -21,7 +21,6 @@ use serde_json::json;
 
 use crate::channel::PendingCall;
 use crate::http;
-use crate::server::mcp::transport;
 use crate::lan::Lan;
 use crate::log;
 use crate::server::control::client::StreamingClient;
@@ -40,6 +39,7 @@ use crate::server::http::{
     StreamHandler,
 };
 use crate::server::mcp::progress::{McpSseStream, PROGRESS_QUEUE_SLOTS};
+use crate::server::mcp::transport;
 use crate::wake::Wake;
 
 use crate::server::http::hooks::{FallbackHandler, PreBodyRoutes};
@@ -89,7 +89,13 @@ pub(crate) fn start(
     let notify_tx = Arc::new(notify_tx);
     let loop_handle = LoopHandle::new(notify_tx.clone());
     let stop = loop_handle.stop_flag();
-    let control = ControlServer::new(control_user, control_admin, pending, wake, notify_tx.clone())?;
+    let control = ControlServer::new(
+        control_user,
+        control_admin,
+        pending,
+        wake,
+        notify_tx.clone(),
+    )?;
 
     // The pool belongs to the server loop, not to one request. Starting it
     // before the loop means a thread-spawn failure fails HTTP startup instead
@@ -98,8 +104,9 @@ pub(crate) fn start(
         let results = results_tx.clone();
         let notify = notify_tx.try_clone()?;
         BlockingPool::start(
-            crate::limits::current().blocking_threads,
+            config.limits.blocking_threads,
             crate::server::http::pool::QUEUE_LIMIT,
+            crate::threads::transfer_stack(&config.limits),
             move |key, outcome| {
                 let _ = results.send(WorkResult::BlockingDone { key, outcome });
                 let _ = (&notify).write(&[1]);
@@ -107,9 +114,10 @@ pub(crate) fn start(
         )?
     };
 
+    let loop_limits = config.limits.clone();
     let join = thread::Builder::new()
         .name("svcd-server-loop".into())
-        .stack_size(crate::threads::transfer_stack())
+        .stack_size(crate::threads::transfer_stack(&loop_limits))
         .spawn(move || {
             let mut server = Server {
                 lan,
@@ -132,7 +140,7 @@ pub(crate) fn start(
                 stream_job_keys: HashSet::new(),
                 next_stream_job: 1 << 32,
             };
-            engine::run(http, &mut server, crate::limits::current());
+            engine::run(http, &mut server, &loop_limits);
         })?;
     loop_handle.set_join(join);
     Ok(loop_handle)
@@ -226,7 +234,7 @@ impl ServerLoop for Server {
         let Some(header_end) = http::header_end(&connection.buffer) else {
             return PreRequest::Continue;
         };
-        if header_end > crate::limits::current().max_header {
+        if header_end > self.config.limits.max_header {
             return PreRequest::Continue;
         }
         let Some((head, body_start)) = http::parse_head(&connection.buffer[..header_end + 4])
@@ -266,7 +274,7 @@ impl ServerLoop for Server {
         };
         let initial = connection.buffer.split_off(body_start);
         connection.buffer.clear();
-        attach_stream(connection, handler, &initial, None);
+        attach_stream(connection, handler, &initial, None, &self.config.limits);
         self.service_stream_job(connection);
         PreRequest::Handled
     }
@@ -302,7 +310,7 @@ impl ServerLoop for Server {
                     // call: a full budget must refuse the request without a
                     // side effect on the service.
                     let Ok(Some(permit)) = crate::server::http::budget::StreamBudget::global()
-                        .acquire(StreamClass::LongLived, crate::limits::current().max_streams)
+                        .acquire(StreamClass::LongLived, self.config.limits.max_streams)
                     else {
                         write_response(
                             connection,
@@ -321,9 +329,12 @@ impl ServerLoop for Server {
                     // progress event, so the client still sees the -32603
                     // channel error instead of an HTTP 500 before the SSE
                     // headers.
-                    let stream = self
-                        .client
-                        .open(&self.config.paths.config_dir, "registry.call", request, sender);
+                    let stream = self.client.open(
+                        &self.config.paths.config_dir,
+                        "registry.call",
+                        request,
+                        sender,
+                    );
                     let cancel = self.client.canceller();
                     let handler = McpSseStream::new(
                         receiver,
@@ -333,7 +344,13 @@ impl ServerLoop for Server {
                     );
                     // The slot reserved above becomes the driver's
                     // `max_streams` permit.
-                    attach_stream(connection, Box::new(handler), &[], Some(permit));
+                    attach_stream(
+                        connection,
+                        Box::new(handler),
+                        &[],
+                        Some(permit),
+                        &self.config.limits,
+                    );
                     return;
                 }
                 Ok(None) => {}
@@ -671,7 +688,7 @@ impl Server {
         // Stamp the deadline at submission, the same instant the driver starts
         // its no-progress clock. A job that waits in the queue must not get a
         // fresh budget after the connection has already been given up on.
-        let deadline = Instant::now() + crate::limits::current().transfer_timeout;
+        let deadline = Instant::now() + self.config.limits.transfer_timeout;
         let submitted = self.blocking.try_submit(key, move |cancel| {
             if cancel.is_cancelled() {
                 return;
@@ -742,7 +759,7 @@ impl Server {
                         // A streamed response is not a keep-alive response: its
                         // handler may own a file range and the wire head says
                         // `Connection: close`.
-                        attach_stream(connection, handler, &[], None);
+                        attach_stream(connection, handler, &[], None, &self.config.limits);
                         self.service_stream_job(connection);
                     }
                     Err(cause) => {
@@ -764,6 +781,7 @@ impl Server {
                 let (slot, done) = CompletionSlot::new(endpoint);
                 let face = self.face.clone();
                 let face_request = prepared.request;
+                let control_timeout = self.config.limits.control_timeout;
                 let job = move |cancel: CancelToken| {
                     if cancel.is_cancelled() {
                         return;
@@ -773,7 +791,7 @@ impl Server {
                     // of this route's control round trip.
                     let request = face_request.with_control_budget(
                         Instant::now(),
-                        crate::limits::current().control_timeout,
+                        control_timeout,
                         Some(cancel),
                     );
                     face.handle(request, done);
@@ -812,11 +830,12 @@ fn attach_stream(
     handler: Box<dyn StreamHandler>,
     initial: &[u8],
     reserved: Option<StreamPermit>,
+    limits: &std::sync::Arc<crate::limits::Limits>,
 ) {
     connection.keep_alive = false;
     let mut driver = match reserved {
-        Some(permit) => StreamDriver::admit_reserved(handler, permit),
-        None => match StreamDriver::admit(handler, crate::limits::current().max_streams) {
+        Some(permit) => StreamDriver::admit_reserved(handler, permit, limits.clone()),
+        None => match StreamDriver::admit(handler, limits.max_streams, limits.clone()) {
             StreamAdmission::Admitted(driver) => driver,
             StreamAdmission::Busy => {
                 write_response(
@@ -1018,7 +1037,7 @@ mod tests {
     #[test]
     fn a_full_blocking_pool_refuses_a_server_owned_route() {
         let (results, _results_rx) = mpsc::channel();
-        let pool = BlockingPool::start(1, 1, |_, _| {}).expect("pool");
+        let pool = BlockingPool::start(1, 1, 256 * 1024, |_, _| {}).expect("pool");
         let (release, wait) = mpsc::channel::<()>();
         let (started, running) = mpsc::channel::<()>();
         pool.try_submit(1, move |_| {
@@ -1042,7 +1061,15 @@ mod tests {
             body: Vec::new(),
         };
         let busy = submit_rendered_job(
-            &pool, 7, 3, fallback, lan, results, Some(notify), request, false,
+            &pool,
+            7,
+            3,
+            fallback,
+            lan,
+            results,
+            Some(notify),
+            request,
+            false,
         )
         .expect_err("a full pool must refuse the route");
         assert_eq!(busy, Busy::QueueFull);
@@ -1075,8 +1102,8 @@ mod tests {
     #[test]
     fn a_head_write_drops_the_blocking_busy_body() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let stream = std::net::TcpStream::connect(listener.local_addr().expect("addr"))
-            .expect("connect");
+        let stream =
+            std::net::TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
         let mut connection = Connection {
             id: 1,
             stream,
@@ -1101,7 +1128,10 @@ mod tests {
         let text = String::from_utf8(connection.out).expect("utf8");
         let header_end = text.find("\r\n\r\n").expect("header end") + 4;
         assert_eq!(text.len(), header_end, "the HEAD body must be gone: {text}");
-        assert!(text.starts_with("HTTP/1.1 503 Service Unavailable"), "{text}");
+        assert!(
+            text.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "{text}"
+        );
         assert!(text.contains("Retry-After: 1"), "{text}");
         assert!(
             text.contains(&content_length),

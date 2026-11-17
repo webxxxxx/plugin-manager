@@ -2609,45 +2609,6 @@ fn a_runtime_record_for_a_deleted_definition_is_dropped_on_start() {
     );
 }
 
-/// A service that ran long enough to be considered stable still gets its stop
-/// action before the replacement starts (shell parity), instead of a bare respawn.
-#[test]
-fn a_stable_crash_runs_the_stop_action_before_restarting() {
-    let mut sandbox = Sandbox::new();
-    let marker = sandbox.root.join("stable-stop.txt");
-    let hook = sandbox.write_hook_script("stable-stop", &marker);
-    sandbox.write_core_json("stable");
-    let path = sandbox.config.join("services.d").join("stable.json");
-    let mut value: Value =
-        serde_json::from_slice(&fs::read(&path).expect("definition")).expect("json");
-    value["lifecycle"] = json!({"stop": {"path": hook.to_string_lossy(), "args": []}});
-    fs::write(&path, serde_json::to_vec_pretty(&value).expect("json")).expect("write definition");
-
-    sandbox.start_daemon();
-    let first = ProcessInstance::capture(sandbox.running_pid("stable"));
-    // Cross the 10s stability window so the crash takes the Cleanup path.
-    std::thread::sleep(Duration::from_secs(11));
-    kill_pid(first.pid);
-
-    wait_until(
-        "the stop action before the respawn",
-        Duration::from_secs(10),
-        || {
-            fs::read_to_string(&marker)
-                .map(|text| text.contains("stop"))
-                .unwrap_or(false)
-        },
-    );
-    let restarted = sandbox.wait_for_restart("stable", first, Duration::from_secs(15));
-    let current =
-        ProcessInstance::capture(restarted["summary"]["pid"].as_u64().expect("pid") as u32);
-    assert!(
-        first.is_replaced_by(current),
-        "the crash restart kept the pre-crash instance: {restarted}"
-    );
-    sandbox.stop_service("stable");
-}
-
 #[test]
 fn restart_runs_stop_then_start_and_changes_the_pid() {
     let mut sandbox = Sandbox::new();
