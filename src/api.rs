@@ -43,7 +43,9 @@ use crate::plugin;
 use crate::rpc;
 use crate::server::http::engine::HttpRequest;
 #[cfg(not(unix))]
-use crate::server::http::engine::{self, keep_alive_response, wants_keep_alive};
+use crate::server::http::engine::{
+    self, keep_alive_response, wants_keep_alive, wants_keep_alive_head,
+};
 use crate::settings;
 #[cfg(not(unix))]
 use crate::threads;
@@ -398,70 +400,6 @@ fn serve_plugin_ui(
     }
 }
 
-/// Whether the face claims this request as an inline streamed route. The
-/// fallback dispatches those before the body is read: their result is a
-/// sans-IO handler, not a memory response, so it cannot go through
-/// `serve_face`.
-#[cfg(not(unix))]
-fn is_streamed_route(face: &crate::face::api::ApiFace, head: &http::Head) -> bool {
-    use crate::server::http::{BodyPolicy, Dispatch, Face};
-
-    face.route(&head.method, &head.path)
-        .map(|route| route.dispatch == Dispatch::Inline && route.body == BodyPolicy::Streamed)
-        .unwrap_or(false)
-}
-
-/// Run one streamed face route on the Windows connection thread. The handler
-/// owns no connection; the fallback owns the socket and the shared
-/// `max_streams` slot. A download and an export share this path.
-#[cfg(not(unix))]
-fn serve_streamed_route(
-    stream: &mut TcpStream,
-    head: &http::Head,
-    peer: IpAddr,
-    face: &crate::face::api::ApiFace,
-    lan: &Arc<Mutex<Lan>>,
-) {
-    use crate::server::http::{dispatch_inline, prepare_face_request, Exchange};
-
-    let head_only = http::is_head(&head.method);
-    let request = HttpRequest {
-        method: head.method.clone(),
-        path: head.path.clone(),
-        version: head.version.clone(),
-        headers: head.headers.clone(),
-        body: Vec::new(),
-    };
-    let prepared = match prepare_face_request(face, &request, peer, lan) {
-        Ok(Some(prepared)) => prepared,
-        Ok(None) => {
-            let _ = write_http(
-                stream,
-                &http::json_error(404, "not_found", "unknown endpoint"),
-                head_only,
-            );
-            return;
-        }
-        Err(response) => {
-            let _ = write_http(stream, &response, head_only);
-            return;
-        }
-    };
-    match dispatch_inline(face, &prepared.route, prepared.request) {
-        Ok(Exchange::Response(response)) => {
-            let _ = write_http(stream, &response.into_bytes(), head_only);
-        }
-        Ok(Exchange::Stream(handler)) => drive_fallback(stream, handler, head_only),
-        Err(cause) => {
-            let _ = write_http(
-                stream,
-                &http::json_error(500, "internal", &cause.message()),
-                head_only,
-            );
-        }
-    }
-}
-
 /// The composition root's pre-body stream faces. The server loop holds this
 /// trait object instead of depending on the face layer directly.
 #[cfg(unix)]
@@ -508,6 +446,10 @@ impl crate::server::http::server::PreBodyRoutes for PreBodyFaces {
     ) -> Option<Result<crate::server::http::Exchange, Vec<u8>>> {
         crate::face::blob_upload::upload_target(head)?;
         Some(crate::face::blob_upload::exchange(head, lan))
+    }
+
+    fn body_policy(&self, head: &http::Head) -> crate::server::http::BodyPolicy {
+        crate::api::server_body_policy(head)
     }
 }
 
@@ -639,12 +581,85 @@ fn handle(
             }
         };
         let head_only = http::is_head(&head.method);
+        // Resolve the face route and the principal exactly once, before any
+        // body byte is read. The route's BodyPolicy is the only body limit.
+        let planned = match crate::server::http::route_face_request(&face, &head, peer, &lan) {
+            Ok(planned) => planned,
+            Err(response) => {
+                // A bodyless request can keep the connection alive after a
+                // refusal; a request that declared a body is closed so its
+                // unread bytes cannot precede the next request.
+                let empty = matches!(
+                    http::framing(&head.headers),
+                    Ok(http::Framing::None) | Ok(http::Framing::Length(0))
+                );
+                let keep_alive = empty && wants_keep_alive_head(&head);
+                let response = if keep_alive {
+                    keep_alive_response(response)
+                } else {
+                    response
+                };
+                let _ = write_http(&mut stream, &response, head_only);
+                if !keep_alive {
+                    return;
+                }
+                continue;
+            }
+        };
+        if let Some(prepared) = planned {
+            let keep_alive = wants_keep_alive_head(&head);
+            let body = match read_body(&mut stream, &head, &initial, prepared.route.body) {
+                Ok(body) => body,
+                Err(response) => {
+                    let _ = write_http(&mut stream, &response, head_only);
+                    return;
+                }
+            };
+            let prepared = match crate::server::http::attach_face_body(prepared, &body) {
+                Ok(prepared) => prepared,
+                Err(response) => {
+                    let _ = write_http(&mut stream, &response, head_only);
+                    return;
+                }
+            };
+            let result = match prepared.route.dispatch {
+                crate::server::http::Dispatch::Inline => {
+                    crate::server::http::dispatch_inline(&face, &prepared.route, prepared.request)
+                }
+                crate::server::http::Dispatch::Blocking => {
+                    crate::server::http::dispatch_blocking_now(
+                        &face,
+                        &prepared.route,
+                        prepared.request,
+                    )
+                }
+            };
+            match result {
+                Ok(crate::server::http::Exchange::Stream(handler)) => {
+                    // A streamed response owns this connection until it closes.
+                    // The fallback writes the shared 503 if the stream budget is
+                    // full before any handler bytes go out.
+                    drive_fallback(&mut stream, handler, head_only);
+                    return;
+                }
+                result => {
+                    let mut response = crate::server::http::render_exchange(result);
+                    if keep_alive {
+                        response = keep_alive_response(response);
+                    }
+                    if write_http(&mut stream, &response, head_only).is_err() {
+                        return;
+                    }
+                    if !keep_alive {
+                        return;
+                    }
+                    continue;
+                }
+            }
+        }
+        // The face leaves these pre-body stream routes to their own faces.
         if crate::face::plugin_ui::PluginUiFace::route_for(&head.method, &head.path).is_some() {
             serve_plugin_ui(&mut stream, &head, peer, &lan, config.clone());
-            return;
-        }
-        if is_streamed_route(&face, &head) {
-            serve_streamed_route(&mut stream, &head, peer, &face, &lan);
             return;
         }
         if crate::face::install::target(&head).is_some() {
@@ -655,23 +670,22 @@ fn handle(
             serve_blob_upload(&mut stream, &head, &initial, &lan);
             return;
         }
-        let request = match read_body(&mut stream, head, &initial) {
-            Ok(request) => request,
+        let body_policy = server_body_policy(&head);
+        let body = match read_body(&mut stream, &head, &initial, body_policy) {
+            Ok(body) => body,
             Err(response) => {
                 let _ = write_http(&mut stream, &response, head_only);
                 return;
             }
         };
+        let request = HttpRequest {
+            method: head.method,
+            path: head.path,
+            version: head.version,
+            headers: head.headers,
+            body,
+        };
         let keep_alive = wants_keep_alive(&request);
-        if let Some(response) = serve_face(&face, &request, peer, &lan, keep_alive) {
-            if write_http(&mut stream, &response, head_only).is_err() {
-                return;
-            }
-            if !keep_alive {
-                return;
-            }
-            continue;
-        }
         let path = request
             .path
             .split_once('?')
@@ -881,44 +895,6 @@ fn write_sse_line(stream: &mut TcpStream, line: &str) -> std::io::Result<()> {
     stream.write_all(payload.as_bytes())?;
     stream.write_all(b"\r\n")?;
     stream.flush()
-}
-
-/// The Windows per-connection fallback has no shared blocking pool: its
-/// connection thread is already dedicated to one request, so a `Blocking`
-/// route runs on that thread. The Unix server loop submits to
-/// `BlockingPool` instead and never blocks the loop.
-#[cfg(not(unix))]
-fn serve_face(
-    face: &crate::face::api::ApiFace,
-    request: &HttpRequest,
-    peer: IpAddr,
-    lan: &Arc<Mutex<Lan>>,
-    keep_alive: bool,
-) -> Option<Vec<u8>> {
-    use crate::server::http::{
-        dispatch_blocking_now, dispatch_inline, prepare_face_request, render_exchange, Dispatch,
-    };
-
-    let prepared = match prepare_face_request(face, request, peer, lan) {
-        Ok(Some(prepared)) => prepared,
-        Ok(None) => return None,
-        Err(response) => {
-            return Some(if keep_alive {
-                keep_alive_response(response)
-            } else {
-                response
-            })
-        }
-    };
-    let result = match prepared.route.dispatch {
-        Dispatch::Inline => dispatch_inline(face, &prepared.route, prepared.request),
-        Dispatch::Blocking => dispatch_blocking_now(face, &prepared.route, prepared.request),
-    };
-    let mut response = render_exchange(result);
-    if keep_alive {
-        response = keep_alive_response(response);
-    }
-    Some(response)
 }
 
 /// Serve the paths that still own their protocol: MCP, plugin UI rpc/static
@@ -1194,46 +1170,63 @@ fn read_head(stream: &mut TcpStream) -> Result<(http::Head, Vec<u8>), HeadFailur
 #[cfg(not(unix))]
 fn read_body(
     stream: &mut TcpStream,
-    head: http::Head,
+    head: &http::Head,
     initial: &[u8],
-) -> Result<HttpRequest, Vec<u8>> {
+    body: crate::server::http::BodyPolicy,
+) -> Result<Vec<u8>, Vec<u8>> {
     let framing =
         http::framing(&head.headers).map_err(|message| error(400, "bad_request", &message))?;
-    let limit = crate::server::http::body_limit(&head.path);
-    if let http::Framing::Length(length) = framing {
-        if length > limit {
-            return Err(error(413, "payload_too_large", "request body is too large"));
-        }
+    let limit = body.limit();
+    if !body.accepts(framing) {
+        return Err(error(413, "payload_too_large", "request body is too large"));
     }
-    if !matches!(framing, http::Framing::None)
-        && head.version.eq_ignore_ascii_case("HTTP/1.1")
-        && http::header(&head.headers, "expect")
-            .map(|value| value.eq_ignore_ascii_case("100-continue"))
-            .unwrap_or(false)
-    {
+    if body.confirms_body(head, framing) {
         stream
-            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .write_all(http::CONTINUE_RESPONSE)
             .map_err(|_| error(400, "bad_request", "cannot write response"))?;
     }
-    let body = http::collect_body(stream, framing, limit, initial).map_err(|message| {
+    http::collect_body(stream, framing, limit, initial).map_err(|message| {
         let status = if message.contains("too large") {
             413
         } else {
             400
         };
         error(status, crate::face::support::code_for(status), &message)
-    })?;
-    Ok(HttpRequest {
-        method: head.method,
-        path: head.path,
-        version: head.version,
-        headers: head.headers,
-        body,
     })
 }
 
 fn request_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
     http::header(&request.headers, name)
+}
+
+/// Body policy for the routes the face leaves to the server-owned fallback
+/// (the /mcp body cap and the blob/file session metadata). These legacy routes
+/// still live in this composition root, so this is the last place a path
+/// chooses a body limit; their transport/bearer auth stays where it was
+/// (`respond` / `mcp_http`) until they become faces. A new endpoint declares
+/// its policy in `Face::route` and never touches the HTTP engine.
+pub(crate) fn server_body_policy(head: &http::Head) -> crate::server::http::BodyPolicy {
+    use crate::server::http::BodyPolicy;
+
+    let limits = crate::limits::current();
+    let path = head
+        .path
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(&head.path);
+    if path.trim_end_matches('/').ends_with("/complete")
+        && (path.starts_with("/api/v1/blobs/uploads/")
+            || path.starts_with("/api/v1/file/uploads/")
+            || path.starts_with("/api/v1/files/uploads/"))
+    {
+        BodyPolicy::Buffered {
+            limit: limits.max_complete_body,
+        }
+    } else {
+        BodyPolicy::Buffered {
+            limit: limits.max_json_body,
+        }
+    }
 }
 
 /// The buffered routes served by the fallback handler are the blob/file
@@ -1300,7 +1293,7 @@ fn method_not_allowed(allow: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::http::prepare_face_request;
+    use crate::server::http::route_face_request;
 
     #[test]
     fn a_public_face_route_skips_transport_auth() {
@@ -1312,27 +1305,25 @@ mod tests {
         let peer = "127.0.0.1".parse().expect("peer");
 
         assert!(face.route("POST", "/login").expect("route").public);
-        let login = HttpRequest {
+        let login = http::Head {
             method: "POST".into(),
             path: "/login".into(),
             version: "HTTP/1.1".into(),
             headers: Vec::new(),
-            body: b"{}".to_vec(),
         };
-        let prepared = prepare_face_request(&face, &login, peer, &lan)
+        let prepared = route_face_request(&face, &login, peer, &lan)
             .expect("a public route must not fail authentication")
             .expect("the face claims login");
         assert_eq!(prepared.request.principal, AuthKind::None);
 
-        let protected = HttpRequest {
+        let protected = http::Head {
             method: "GET".into(),
             path: "/api/v1/auth".into(),
             version: "HTTP/1.1".into(),
             headers: Vec::new(),
-            body: Vec::new(),
         };
         assert!(
-            prepare_face_request(&face, &protected, peer, &lan).is_err(),
+            route_face_request(&face, &protected, peer, &lan).is_err(),
             "a protected route still requires a principal"
         );
     }

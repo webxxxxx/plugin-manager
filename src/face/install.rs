@@ -469,8 +469,8 @@ impl PackageUploadStream {
         }
         let chunk = data.to_vec();
         let state = self.state.clone();
-        StreamStep::wait(StreamAction::SubmitBlocking(Box::new(move || {
-            run_chunk(&state, &chunk)
+        StreamStep::wait(StreamAction::SubmitBlocking(Box::new(move |budget| {
+            run_chunk(&state, &chunk, &budget)
         })))
     }
 
@@ -564,14 +564,19 @@ impl StreamHandler for PackageUploadStream {
     }
 }
 
-fn run_chunk(state: &Arc<Mutex<UploadState>>, chunk: &[u8]) -> BlockingOutcome {
+fn run_chunk(
+    state: &Arc<Mutex<UploadState>>,
+    chunk: &[u8],
+    job_budget: &crate::server::http::JobBudget,
+) -> BlockingOutcome {
+    let budget = CallBudget::from_job(job_budget);
     let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
-    state.feed(chunk);
+    state.feed(chunk, &budget);
     BlockingOutcome::Ok(Vec::new())
 }
 
 impl UploadState {
-    fn feed(&mut self, raw: &[u8]) {
+    fn feed(&mut self, raw: &[u8], budget: &CallBudget) {
         let (decoded, done) = match self.framing.feed(raw) {
             Ok(value) => value,
             Err(message) => {
@@ -606,7 +611,7 @@ impl UploadState {
         if done {
             self.body_done = true;
             if self.outcome.is_none() && !self.refused {
-                self.finish();
+                self.finish(budget);
             }
         }
     }
@@ -621,12 +626,12 @@ impl UploadState {
         self.outcome = Some(Outcome::Error(response));
     }
 
-    fn finish(&mut self) {
+    fn finish(&mut self, budget: &CallBudget) {
         let config = self.config.clone();
         let flow = std::mem::replace(&mut self.flow, Flow::Done);
         let response = match flow {
-            Flow::Install(mut flow) => flow.finish(&config),
-            Flow::Import(mut flow) => flow.finish(&config),
+            Flow::Install(mut flow) => flow.finish(&config, budget),
+            Flow::Import(mut flow) => flow.finish(&config, budget),
             Flow::Done => return,
         };
         self.outcome = Some(Outcome::Response(response));
@@ -673,7 +678,7 @@ impl InstallFlow {
             .expect("staging installer initialized"))
     }
 
-    fn finish(&mut self, config: &Path) -> Vec<u8> {
+    fn finish(&mut self, config: &Path, budget: &CallBudget) -> Vec<u8> {
         let Some(mut installer) = self.installer.take() else {
             return install_error("manifest.json is missing");
         };
@@ -691,6 +696,7 @@ impl InstallFlow {
             &version,
             &self.strategy,
             self.allow_hooks,
+            budget,
         ) {
             Ok(status) => {
                 if !self.enable {
@@ -698,7 +704,7 @@ impl InstallFlow {
                         config,
                         "svc.disable",
                         json!({ "id": id }),
-                        &CallBudget::unbounded(),
+                        &budget.follow_up(),
                     );
                 }
                 let summary = status.get("summary").cloned().unwrap_or(Value::Null);
@@ -765,7 +771,7 @@ impl ImportFlow {
         Ok(())
     }
 
-    fn finish(&mut self, config: &Path) -> Vec<u8> {
+    fn finish(&mut self, config: &Path, budget: &CallBudget) -> Vec<u8> {
         loop {
             let stage = std::mem::replace(&mut self.stage, ImportStage::Raw(Vec::new()));
             match stage {
@@ -788,13 +794,14 @@ impl ImportFlow {
                         &staged.manifest.version,
                         "replace",
                         false,
+                        budget,
                     ) {
                         Ok(status) => import_response(status, None, false, Vec::new()),
                         Err(response) => response,
                     };
                 }
                 ImportStage::Backup(mut import) => {
-                    return match import.finish(config) {
+                    return match import.finish(config, budget) {
                         Ok(response) => response,
                         Err(message) => import_error(&message),
                     }
@@ -845,9 +852,9 @@ impl BackupImport {
         self.tar.feed(data, &mut self.sink)
     }
 
-    fn finish(&mut self, config: &Path) -> Result<Vec<u8>, String> {
+    fn finish(&mut self, config: &Path, budget: &CallBudget) -> Result<Vec<u8>, String> {
         self.tar.finish()?;
-        self.sink.finish(config)
+        self.sink.finish(config, budget)
     }
 }
 
@@ -1026,7 +1033,7 @@ impl package::TarSink for BackupSink {
 }
 
 impl BackupSink {
-    fn finish(&mut self, config: &Path) -> Result<Vec<u8>, String> {
+    fn finish(&mut self, config: &Path, budget: &CallBudget) -> Result<Vec<u8>, String> {
         let backup = self
             .backup
             .take()
@@ -1053,6 +1060,7 @@ impl BackupSink {
             &staged.manifest.version,
             "replace",
             false,
+            budget,
         ) {
             Ok(status) => status,
             Err(response) => return Ok(response),
@@ -1094,6 +1102,7 @@ fn install_staged(
     version: &str,
     strategy: &str,
     allow_hooks: bool,
+    budget: &CallBudget,
 ) -> Result<Value, Vec<u8>> {
     support::rpc(
         config,
@@ -1105,7 +1114,7 @@ fn install_staged(
             "strategy": strategy,
             "allowHooks": allow_hooks,
         }),
-        &CallBudget::unbounded(),
+        budget,
     )
     .map_err(|response| {
         let _ = std::fs::remove_dir_all(root);
@@ -1347,7 +1356,7 @@ mod tests {
             match step.action {
                 StreamAction::Close(reason) => return (all, reason, offset),
                 StreamAction::SubmitBlocking(job) => {
-                    let outcome = job();
+                    let outcome = job(crate::server::http::JobBudget::for_test());
                     step = handler.on_event(
                         StreamEvent::BlockingDone(outcome),
                         &mut OutBuffer::new(&mut out, limit),

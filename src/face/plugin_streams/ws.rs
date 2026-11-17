@@ -228,7 +228,7 @@ impl WsStream {
                 self.pending_id = id.clone();
                 self.call_in_flight = true;
                 let config = self.config.clone();
-                Some(Box::new(move || {
+                Some(Box::new(move |_budget| {
                     match channel::request(
                         &config,
                         "registry.call",
@@ -622,7 +622,7 @@ mod tests {
         let StreamAction::SubmitBlocking(job) = step.action else {
             panic!("a forwarded call is a blocking job");
         };
-        let outcome = job();
+        let outcome = job(crate::server::http::JobBudget::for_test());
         let mut out = Vec::new();
         stream.on_event(
             StreamEvent::BlockingDone(outcome),

@@ -256,7 +256,7 @@ impl BlobUploadStream {
         let chunk = data.to_vec();
         let state = self.state.clone();
         self.phase = Phase::Blocking;
-        StreamStep::wait(StreamAction::SubmitBlocking(Box::new(move || {
+        StreamStep::wait(StreamAction::SubmitBlocking(Box::new(move |_budget| {
             run_chunk(&state, chunk)
         })))
     }
@@ -741,7 +741,7 @@ mod tests {
             match step.action {
                 StreamAction::Close(reason) => return (all, reason),
                 StreamAction::SubmitBlocking(job) => {
-                    let outcome = job();
+                    let outcome = job(crate::server::http::JobBudget::for_test());
                     step = handler.on_event(
                         StreamEvent::BlockingDone(outcome),
                         &mut OutBuffer::new(&mut out, limit),

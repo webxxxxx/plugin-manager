@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::limits;
 use crate::server::http::{
-    CloseReason, FileSend, OutBuffer, StreamAction, StreamEvent, StreamHandler,
+    CloseReason, FileSend, JobBudget, OutBuffer, StreamAction, StreamEvent, StreamHandler,
 };
 
 use super::budget::{Busy, StreamBudget};
@@ -88,7 +88,10 @@ fn drive_loop(
             // is just work that happens to take time. It never runs on a
             // shared server loop here.
             StreamAction::SubmitBlocking(job) => {
-                let outcome = job();
+                // This thread is already the connection thread, so it cannot
+                // observe a peer FIN while the job runs. The deadline still
+                // bounds a stuck control round trip; the token stays clean.
+                let outcome = job(JobBudget::for_fallback(timeout));
                 step = handler.on_event(
                     StreamEvent::BlockingDone(outcome),
                     &mut OutBuffer::new(&mut out, limit),
@@ -203,4 +206,64 @@ fn send_blocking(stream: &mut TcpStream, send: FileSend) {
         Err(_) => {}
     }
     let _ = stream.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::http::{BlockingOutcome, StreamStep};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+
+    struct BudgetHandler {
+        captured: Option<mpsc::Sender<(Instant, bool)>>,
+    }
+
+    impl StreamHandler for BudgetHandler {
+        fn on_event(&mut self, event: StreamEvent<'_>, _out: &mut OutBuffer<'_>) -> StreamStep {
+            match event {
+                StreamEvent::Writable => StreamStep::wait(StreamAction::NeedRead),
+                StreamEvent::Data(_) => {
+                    let captured = self.captured.take().expect("one data event");
+                    StreamStep::wait(StreamAction::SubmitBlocking(Box::new(move |budget| {
+                        let _ = captured.send((budget.deadline, budget.cancel.is_cancelled()));
+                        BlockingOutcome::Ok(Vec::new())
+                    })))
+                }
+                StreamEvent::BlockingDone(_) => {
+                    StreamStep::wait(StreamAction::Close(CloseReason::Completed))
+                }
+                _ => StreamStep::wait(StreamAction::Continue),
+            }
+        }
+    }
+
+    /// The Windows fallback owns the connection thread, so it cannot observe a
+    /// peer FIN while the job runs; the deadline still has to be set so a stuck
+    /// control round trip cannot pin that thread forever.
+    #[test]
+    fn a_fallback_stream_job_gets_a_deadline_and_a_clean_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("addr");
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("connect");
+            std::io::Write::write_all(&mut stream, b"x").expect("write");
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        let (mut server, _) = listener.accept().expect("accept");
+        let (tx, rx) = mpsc::channel();
+        let started = Instant::now();
+        drive(
+            &mut server,
+            Box::new(BudgetHandler {
+                captured: Some(tx),
+            }),
+            &[],
+        )
+        .expect("drive");
+        let (deadline, cancelled) = rx.try_recv().expect("job budget");
+        assert!(deadline > started, "the fallback must stamp a deadline");
+        assert!(!cancelled, "the fallback has no disconnect signal");
+        client.join().expect("client");
+    }
 }

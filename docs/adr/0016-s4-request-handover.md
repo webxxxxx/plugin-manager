@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted。细化 [ADR-0012](0012-protocol-is-server-plus-face.md)；切片见 #113，server-loop 已由 #114 接管 HTTP listener / 连接，#115 落地 sans-IO stream handler 并让插件 UI 静态资源穿过它，#116 接线阻塞池与首个 `Blocking` 路由，#117 把剩余管理 JSON、login/logout 与控制台页移入 face，#118 让 blob/file 下载穿过 stream handler，#119 让 blob/file 上传穿过同一接口，#120 让 export spk/spkb 穿过同一接口，#121 让 import/install 上传穿过同一接口，#122 让插件 UI 的 SSE / WebSocket / raw WebSocket 改走 stream handler，#123 让 MCP SSE 进度流穿过同一接口，#124 把控制通道与出站管理流并入 server-loop，#125 删除 legacy bridge / HTTP worker / takeover / temp-cleaner，后续迁移见 #126；#131 给 Blocking 控制往返加可中断 deadline，并拆掉 `face → api` helper 环；#132 把下载的 locate / metadata / touch / open / manifest 读移进阻塞池，队列满时下载回 503 `busy`；#135 让 Windows 的 MCP SSE 在客户端断开时取消控制读并释放流预算。
+Accepted。细化 [ADR-0012](0012-protocol-is-server-plus-face.md)；切片见 #113，server-loop 已由 #114 接管 HTTP listener / 连接，#115 落地 sans-IO stream handler 并让插件 UI 静态资源穿过它，#116 接线阻塞池与首个 `Blocking` 路由，#117 把剩余管理 JSON、login/logout 与控制台页移入 face，#118 让 blob/file 下载穿过 stream handler，#119 让 blob/file 上传穿过同一接口，#120 让 export spk/spkb 穿过同一接口，#121 让 import/install 上传穿过同一接口，#122 让插件 UI 的 SSE / WebSocket / raw WebSocket 改走 stream handler，#123 让 MCP SSE 进度流穿过同一接口，#124 把控制通道与出站管理流并入 server-loop，#125 删除 legacy bridge / HTTP worker / takeover / temp-cleaner，后续迁移见 #126；#131 给 Blocking 控制往返加可中断 deadline，并拆掉 `face → api` helper 环；#132 把下载的 locate / metadata / touch / open / manifest 读移进阻塞池，队列满时下载回 503 `busy`；#133 把 face 的 route 与 transport auth 前移到读 body 之前，body limit 由 `Route.body` 唯一决定；#136 把同一预算扩到 install/import 的 stream job；#135 让 Windows 的 MCP SSE 在客户端断开时取消控制读并释放流预算。
 
 ## Decision
 
