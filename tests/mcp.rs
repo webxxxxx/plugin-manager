@@ -8,6 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+mod support;
+
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 fn sandbox_base() -> std::path::PathBuf {
@@ -63,12 +65,15 @@ impl Sandbox {
         let svc = root.join(names.1);
         let mcp = root.join(names.2);
         for path in [&svcd, &svc, &mcp] {
-            fs::copy(binary, path).expect("copy multicall");
+            // The multicall dispatch only reads argv[0]'s file name, so a link
+            // is enough on Unix. A copy that is exec'd right after it is written
+            // races its own close on slow filesystems (/mnt/d, DrvFs) and fails
+            // with ETXTBSY. Windows keeps the copy: creating symlinks needs a
+            // privilege there.
             #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
-            }
+            std::os::unix::fs::symlink(binary, path).expect("link multicall");
+            #[cfg(not(unix))]
+            fs::copy(binary, path).expect("copy multicall");
         }
 
         let sandbox = Sandbox {
@@ -299,24 +304,50 @@ done
         )
     }
 
-    fn shutdown(&mut self) {
-        if self.daemon.is_some() {
-            let mut command = Command::new(&self.svcd);
-            command.arg("shutdown");
-            self.env(&mut command);
-            let _ = command.output();
-            if let Some(mut child) = self.daemon.take() {
-                for _ in 0..200 {
-                    if let Ok(Some(_)) = child.try_wait() {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
+    /// Stop the daemon with a bounded request and a bounded wait; see
+    /// [`support::stop_daemon`].
+    fn stop_daemon(&mut self) -> Result<(), String> {
+        let Some(mut child) = self.daemon.take() else {
+            return Ok(());
+        };
+        let log = self.daemon_stderr.clone();
+        let mut command = Command::new(&self.svcd);
+        command.arg("shutdown");
+        self.env(&mut command);
+        support::stop_daemon(
+            &mut child,
+            &mut command,
+            support::STOP_TIMEOUT,
+            "the daemon",
+            || fs::read_to_string(&log).unwrap_or_default(),
+        )
     }
+
+    fn shutdown(&mut self) {
+        support::report_stop(self.stop_daemon());
+    }
+}
+
+/// The suite used to wait on `child.wait()` forever when the shutdown request
+/// never reached the daemon. The wait is bounded now and reports why.
+#[test]
+fn stop_wait_is_bounded_when_the_request_cannot_reach_the_daemon() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    // The CLI can no longer resolve the control channel: the request fails the
+    // way it does when a test panics before the daemon is up.
+    let moved = sandbox.root.join("config-moved");
+    fs::rename(&sandbox.config, &moved).expect("move the config directory");
+
+    let mut child = sandbox.daemon.take().expect("running daemon");
+    let log = sandbox.daemon_stderr.clone();
+    let mut command = Command::new(&sandbox.svcd);
+    command.arg("shutdown");
+    sandbox.env(&mut command);
+    support::assert_bounded_stop(&mut child, &mut command, Duration::from_secs(1), || {
+        fs::read_to_string(&log).unwrap_or_default()
+    });
 }
 
 impl Drop for Sandbox {

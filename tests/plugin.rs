@@ -10,13 +10,9 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-static NEXT: AtomicU64 = AtomicU64::new(0);
+mod support;
 
-/// How long a sandbox waits for its daemon to exit after a shutdown request.
-/// An unreachable request (the socket is not up yet, or a test panicked before
-/// the daemon got going) must not hang the suite: past this bound the daemon is
-/// killed and the wait reports what failed.
-const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+static NEXT: AtomicU64 = AtomicU64::new(0);
 
 fn sandbox_base() -> std::path::PathBuf {
     // Unix domain sockets cap the whole path at ~108 bytes, so Unix keeps the
@@ -102,7 +98,7 @@ impl Sandbox {
             svc,
             plugin,
             daemon: None,
-            stop_timeout: DAEMON_STOP_TIMEOUT,
+            stop_timeout: support::STOP_TIMEOUT,
         }
     }
 
@@ -136,50 +132,6 @@ impl Sandbox {
 
     fn try_run(&self, binary: &Path, args: &[&str]) -> std::io::Result<Output> {
         self.command(binary).args(args).output()
-    }
-
-    /// Run a CLI with a bounded wait. `output()` has none: a control request
-    /// waits for a reply, and a daemon that accepts but never answers would
-    /// block the suite the same way the unbounded `child.wait()` did.
-    fn run_bounded(
-        &self,
-        binary: &Path,
-        args: &[&str],
-        timeout: Duration,
-    ) -> Result<Output, String> {
-        let mut child = self
-            .command(binary)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("cannot run {} {args:?}: {error}", binary.display()))?;
-        let deadline = Instant::now() + timeout;
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    return child.wait_with_output().map_err(|error| {
-                        format!("cannot read {} output: {error}", binary.display())
-                    })
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("cannot wait for {}: {error}", binary.display()));
-                }
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "{} {args:?} did not finish within {timeout:?}",
-                    binary.display()
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
     }
 
     fn run(&self, binary: &Path, args: &[&str]) -> Output {
@@ -225,67 +177,22 @@ impl Sandbox {
         fs::read_to_string(&self.daemon_stderr).unwrap_or_default()
     }
 
-    /// Stop the daemon with a bounded wait. Mirrors the diagnostic contract of
-    /// `tests/http.rs`'s wait helper (a timeout carries the daemon log) but
-    /// returns the message instead of panicking: `Drop` may be running while
-    /// another panic unwinds, and panicking there aborts the process.
+    /// Stop the daemon with a bounded request and a bounded wait; see
+    /// [`support::stop_daemon`] for why both bounds exist.
     fn stop_daemon(&mut self) -> Result<(), String> {
         let Some(mut child) = self.daemon.take() else {
             return Ok(());
         };
-        // The request is bounded too: `svcd shutdown` waits for a control reply
-        // with no timeout of its own.
-        let request = self.run_bounded(&self.svcd, &["shutdown"], self.stop_timeout);
-        let deadline = Instant::now() + self.stop_timeout;
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    // The daemon is gone. A failed request here is a race with
-                    // the exit (the reply can be lost on the way out), not a
-                    // test failure: keep it visible, do not fail the test.
-                    if !matches!(&request, Ok(output) if output.status.success()) {
-                        eprintln!(
-                            "sandbox: the shutdown request reported {} but the daemon exited",
-                            failed_request(&request)
-                        );
-                    }
-                    return Ok(());
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    // The handle is already out of `self.daemon`, so leaving the
-                    // process running here would leak it past the Drop.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!(
-                        "cannot wait for the daemon: {error}; killed it. shutdown request: {}; daemon stderr (tail):\n{}",
-                        failed_request(&request),
-                        tail(&self.daemon_log(), 20)
-                    ));
-                }
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "the daemon did not stop within {:?}; killed it. shutdown request: {}; daemon stderr (tail):\n{}",
-                    self.stop_timeout,
-                    failed_request(&request),
-                    tail(&self.daemon_log(), 20)
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let log = self.daemon_stderr.clone();
+        let mut command = self.command(&self.svcd);
+        command.arg("shutdown");
+        support::stop_daemon(&mut child, &mut command, self.stop_timeout, "the daemon", || {
+            fs::read_to_string(&log).unwrap_or_default()
+        })
     }
 
     fn shutdown(&mut self) {
-        match self.stop_daemon() {
-            Ok(()) => {}
-            // A panic while another panic unwinds aborts the process, which
-            // would hide the failure that started it: print instead.
-            Err(message) if std::thread::panicking() => eprintln!("sandbox: {message}"),
-            Err(message) => panic!("sandbox: {message}"),
-        }
+        support::report_stop(self.stop_daemon());
     }
 
     fn write_key(&self, key: &SigningKey) {
@@ -601,23 +508,6 @@ fn json(output: &Output) -> Value {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
-}
-
-/// What the shutdown request looked like, for diagnostics.
-fn failed_request(outcome: &Result<Output, String>) -> String {
-    match outcome {
-        Ok(output) => format!(
-            "exit {:?} stderr {:?}",
-            output.status.code(),
-            stderr(output).trim()
-        ),
-        Err(message) => message.clone(),
-    }
-}
-
-fn tail(text: &str, lines: usize) -> String {
-    let all: Vec<&str> = text.lines().collect();
-    all[all.len().saturating_sub(lines)..].join("\n")
 }
 
 /// A shutdown request that never reaches the daemon used to block the suite
