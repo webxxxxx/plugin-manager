@@ -34,9 +34,9 @@ use crate::server::http::engine::{
     PreRequest, ServerLoop, Table,
 };
 use crate::server::http::{
-    complete_blocking, dispatch_inline, prepare_face_request, render_exchange, BlockingOutcome,
-    BlockingPool, BodyPolicy, Busy, CancelToken, CompletionSlot, Dispatch, Exchange, Face,
-    JobOutcome, StreamClass, StreamHandler,
+    attach_face_body, complete_blocking, dispatch_inline, render_exchange, route_face_request,
+    BlockingOutcome, BlockingPool, BodyPolicy, Busy, CancelToken, CompletionSlot, Dispatch,
+    Exchange, Face, JobOutcome, PreparedFace, StreamClass, StreamHandler,
 };
 use crate::server::mcp::progress::{McpSseStream, PROGRESS_QUEUE_SLOTS};
 use crate::wake::Wake;
@@ -69,6 +69,12 @@ pub(crate) trait PreBodyRoutes: Send + Sync {
         head: &http::Head,
         lan: &Arc<Mutex<Lan>>,
     ) -> Option<Result<Exchange, Vec<u8>>>;
+    /// Body policy and transport authentication for the server-owned routes the
+    /// face leaves alone (MCP, blob/file session metadata). The composition
+    /// root owns this last legacy table; a new endpoint declares its policy in
+    /// `Face::route` instead.
+    fn server_route(&self, head: &http::Head, lan: &Arc<Mutex<Lan>>)
+        -> Result<BodyPolicy, Vec<u8>>;
 }
 
 enum WorkResult {
@@ -151,6 +157,7 @@ pub(crate) fn start(
                 face,
                 routes,
                 fallback,
+                face_plans: HashMap::new(),
                 blocking,
                 blocking_pending: HashMap::new(),
                 stream_jobs: HashMap::new(),
@@ -197,6 +204,10 @@ struct Server {
     face: Arc<dyn Face>,
     routes: Arc<dyn PreBodyRoutes>,
     fallback: FallbackHandler,
+    /// The route and principal resolved before this request's body was read.
+    /// Present only for requests the face claims; the server-owned routes use
+    /// `routes.server_route`.
+    face_plans: HashMap<u64, PreparedFace>,
     blocking: BlockingPool,
     blocking_pending: HashMap<u64, PendingBlocking>,
     /// Connection -> the unique pool key of its in-flight stream job. Stream
@@ -219,8 +230,21 @@ impl ServerLoop for Server {
 
     fn on_accept(&mut self, _connection: &mut Connection) {}
 
-    fn body_limit(&self, path: &str) -> u64 {
-        crate::server::http::body_limit(path)
+    fn route_request(
+        &mut self,
+        id: u64,
+        peer: IpAddr,
+        head: &http::Head,
+    ) -> Result<BodyPolicy, Vec<u8>> {
+        match route_face_request(self.face.as_ref(), head, peer, &self.lan) {
+            Ok(Some(prepared)) => {
+                let body = prepared.route.body;
+                self.face_plans.insert(id, prepared);
+                Ok(body)
+            }
+            Ok(None) => self.routes.server_route(head, &self.lan),
+            Err(response) => Err(response),
+        }
     }
 
     fn reads_request(&self, connection: &Connection) -> bool {
@@ -283,7 +307,8 @@ impl ServerLoop for Server {
 
     fn on_request(&mut self, connection: &mut Connection, request: HttpRequest) {
         let keep_alive = wants_keep_alive(&request);
-        if self.serve_face(connection, &request, keep_alive) {
+        if self.face_plans.contains_key(&connection.id) {
+            self.serve_face(connection, request, keep_alive);
             return;
         }
         let path = request
@@ -545,6 +570,9 @@ impl ServerLoop for Server {
     }
 
     fn on_close(&mut self, connection: &mut Connection) {
+        // A plan is resolved per request and consumed by `serve_face`; a
+        // connection that dies while waiting for its body leaves it behind.
+        self.face_plans.remove(&connection.id);
         // Replacing or dropping ConnState::Stream drops the driver, which
         // delivers the handler's `Closed` event.
         if let Some(pending) = self.blocking_pending.remove(&connection.id) {
@@ -693,35 +721,28 @@ impl Server {
         }
     }
 
-    /// Run the face-owned part of one request. Inline routes answer now;
-    /// blocking routes are submitted to the pool and the connection waits in
-    /// `Processing`. Returns false when the request stays on the server-owned
-    /// buffered routes.
-    fn serve_face(
-        &mut self,
-        connection: &mut Connection,
-        request: &HttpRequest,
-        keep_alive: bool,
-    ) -> bool {
-        let prepared = match prepare_face_request(
-            self.face.as_ref(),
-            request,
-            connection.peer,
-            &self.lan,
-        ) {
-            Ok(Some(prepared)) => prepared,
-            Ok(None) => return false,
+    /// Run the face-owned part of one request from the plan resolved before the
+    /// body was read. Inline routes answer now; blocking routes are submitted to
+    /// the pool and the connection waits in `Processing`.
+    fn serve_face(&mut self, connection: &mut Connection, request: HttpRequest, keep_alive: bool) {
+        let Some(prepared) = self.face_plans.remove(&connection.id) else {
+            // The caller only enters here when a plan exists; answering an
+            // internal error keeps a lost plan from hanging the connection.
+            write_response(
+                connection,
+                http::json_error(500, "internal", "request route lost"),
+                false,
+            );
+            return;
+        };
+        let prepared = match attach_face_body(prepared, &request.body) {
+            Ok(prepared) => prepared,
             Err(response) => {
-                write_response(
-                    connection,
-                    if keep_alive {
-                        keep_alive_response(response)
-                    } else {
-                        response
-                    },
-                    keep_alive,
-                );
-                return true;
+                // The wire limit should have caught this before the body was
+                // read. A late mismatch must not keep the connection alive,
+                // because unread body bytes would precede the next request.
+                write_response(connection, response, false);
+                return;
             }
         };
 
@@ -758,7 +779,7 @@ impl Server {
                 }
             }
             Dispatch::Blocking => {
-                let endpoint = format!("{} {}", request.method, request.path);
+                let endpoint = format!("{} {}", prepared.request.method, prepared.request.path);
                 let (slot, done) = CompletionSlot::new(endpoint);
                 let face = self.face.clone();
                 let face_request = prepared.request;
@@ -790,7 +811,6 @@ impl Server {
                 }
             }
         }
-        true
     }
 }
 

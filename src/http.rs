@@ -55,6 +55,20 @@ pub fn parse_head(bytes: &[u8]) -> Option<(Head, usize)> {
     ))
 }
 
+/// The interim response a server writes when it accepts a body that the
+/// client offered with `Expect: 100-continue`.
+pub const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+
+/// Whether this request asks the server to confirm the body first. Only
+/// HTTP/1.1 defines the expectation; a declared body on a route that does not
+/// read one must be refused without sending this interim response.
+pub fn expects_continue(head: &Head) -> bool {
+    head.version.eq_ignore_ascii_case("HTTP/1.1")
+        && header(&head.headers, "expect")
+            .map(|value| value.eq_ignore_ascii_case("100-continue"))
+            .unwrap_or(false)
+}
+
 /// How the body of a request (or response) is delimited on the wire.
 #[derive(Clone, Copy)]
 pub enum Framing {

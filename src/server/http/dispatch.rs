@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use crate::http;
 use crate::lan::{AuthKind, Lan};
 use crate::log;
-use crate::server::http::engine::HttpRequest;
 
 use super::contract::{
     body_for, BodyError, BodyPolicy, CompletionSlot, Dispatch, Exchange, ExchangeKind, Face,
@@ -53,29 +52,32 @@ impl DispatchError {
     }
 }
 
-/// A face-owned request with authentication and its body already resolved.
+/// A face-owned request whose principal is resolved but whose body is still
+/// on the wire. The server reads the body under `route.body` and only then
+/// attaches it, so authentication and the route's limit are enforced before a
+/// single body byte is buffered.
 pub(crate) struct PreparedFace {
     pub(crate) route: Route,
     pub(crate) request: Request,
 }
 
-/// Ask the face whether it owns the request, then resolve the principal and
-/// apply the route's body policy. `Ok(None)` leaves the request to the
-/// server-owned routes; `Err` is a rendered authentication or body error.
-pub(crate) fn prepare_face_request(
+/// Ask the face whether it owns the request and resolve the principal. This is
+/// the one `Face::route` call for a request; `Ok(None)` leaves the request to
+/// the server-owned routes, `Err` is a rendered authentication error.
+pub(crate) fn route_face_request(
     face: &dyn Face,
-    request: &HttpRequest,
+    head: &http::Head,
     peer: IpAddr,
     lan: &Arc<Mutex<Lan>>,
 ) -> Result<Option<PreparedFace>, Vec<u8>> {
-    let Some(route) = face.route(&request.method, &request.path) else {
+    let Some(route) = face.route(&head.method, &head.path) else {
         return Ok(None);
     };
     let principal = if route.public {
         AuthKind::None
     } else {
         match lan.lock() {
-            Ok(mut state) => match state.authenticate(&request.headers) {
+            Ok(mut state) => match state.authenticate(&head.headers) {
                 Ok(principal) => principal,
                 Err(()) => {
                     return Err(http::json_error(
@@ -85,16 +87,30 @@ pub(crate) fn prepare_face_request(
                     ))
                 }
             },
-            Err(_) => {
-                return Err(http::json_error(
-                    500,
-                    "internal",
-                    "LAN state unavailable",
-                ))
-            }
+            Err(_) => return Err(http::json_error(500, "internal", "LAN state unavailable")),
         }
     };
-    let body = match body_for(route.body, &request.body) {
+    Ok(Some(PreparedFace {
+        route,
+        request: Request {
+            method: head.method.clone(),
+            path: head.path.clone(),
+            headers: head.headers.clone(),
+            peer,
+            principal,
+            body: Vec::new(),
+        },
+    }))
+}
+
+/// Attach the body the server read under `route.body`. The server already
+/// enforced the limit on the wire; this repeats the check so a future engine
+/// cannot hand a route more than it declared.
+pub(crate) fn attach_face_body(
+    mut prepared: PreparedFace,
+    body: &[u8],
+) -> Result<PreparedFace, Vec<u8>> {
+    prepared.request.body = match body_for(prepared.route.body, body) {
         Ok(body) => body,
         Err(BodyError::TooLarge) => {
             return Err(http::json_error(
@@ -104,20 +120,11 @@ pub(crate) fn prepare_face_request(
             ))
         }
     };
-    Ok(Some(PreparedFace {
-        route,
-        request: Request {
-            method: request.method.clone(),
-            path: request.path.clone(),
-            headers: request.headers.clone(),
-            peer,
-            principal,
-            body,
-        },
-    }))
+    Ok(prepared)
 }
 
 /// Turn a dispatch result into wire bytes.
+#[cfg_attr(not(unix), allow(dead_code))] // the Windows fallback writes each exchange itself
 pub(crate) fn render_exchange(result: Result<Exchange, DispatchError>) -> Vec<u8> {
     match result {
         Ok(Exchange::Response(response)) => response.into_bytes(),

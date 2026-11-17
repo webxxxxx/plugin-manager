@@ -25,6 +25,26 @@ pub enum BodyPolicy {
     Streamed,
 }
 
+impl BodyPolicy {
+    /// Bytes the server may buffer for this route. `Empty` and `Streamed`
+    /// declare that the route does not read a buffered request body, so any
+    /// declared body is refused before it is read.
+    pub(crate) fn limit(self) -> u64 {
+        match self {
+            BodyPolicy::Empty | BodyPolicy::Streamed => 0,
+            BodyPolicy::Buffered { limit } => limit,
+        }
+    }
+
+    /// Whether the server buffers and hands the body to the face. Only a
+    /// `Buffered` route reads a request body; a `Streamed` route's stream
+    /// handler consumes it in the pre-body stream hooks, before this policy is
+    /// consulted.
+    pub(crate) fn buffers_body(self) -> bool {
+        matches!(self, BodyPolicy::Buffered { .. })
+    }
+}
+
 /// Why a route's body cannot be handed to the face.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyError {
