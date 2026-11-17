@@ -47,6 +47,12 @@ use crate::wake::Wake;
 /// tick: the poll doubles as the wait for shutdown and the loop's timers.
 const POLL_WAIT: Duration = Duration::from_millis(50);
 
+/// Anything that holds the single supervisor loop longer than this is logged.
+///
+/// The loop is serial, so one slow phase delays every other caller; the 30 s
+/// management deadline then shows up as a 504 far from the real cause.
+const SLOW_LOOP_MS: u64 = 1_000;
+
 pub fn run(conf: Option<PathBuf>) -> i32 {
     // The explicit --conf must be loaded before the directory set is resolved,
     // so its config_dir wins and is not shadowed by the default resolution.
@@ -611,6 +617,14 @@ impl Daemon {
         self.started.elapsed().as_millis() as u64
     }
 
+    /// Log a loop phase that ran past [`SLOW_LOOP_MS`].
+    fn note_slow(&self, what: &str, started: Instant) {
+        let elapsed = started.elapsed();
+        if elapsed >= Duration::from_millis(SLOW_LOOP_MS) {
+            log::svcd(&format!("svcd: {} held the loop for {:?}", what, elapsed));
+        }
+    }
+
     /// Convert a monotonic supervisor timestamp to epoch seconds.
     fn epoch_of(&self, ms: u64) -> u64 {
         let now = self.now_ms();
@@ -841,6 +855,7 @@ impl Daemon {
     }
 
     fn start_enabled(&mut self) {
+        let started = Instant::now();
         let mut eligible = Vec::new();
         for id in self.slots.keys().cloned().collect::<Vec<_>>() {
             let enabled = self
@@ -868,12 +883,14 @@ impl Daemon {
             }
         }
         if eligible.is_empty() {
+            self.note_slow("start_enabled", started);
             return;
         }
         let layers = match start_layers(&self.registry, &eligible) {
             Ok(layers) => layers,
             Err(error) => {
                 log::svcd(&format!("svcd: start enabled: {}", error));
+                self.note_slow("start_enabled", started);
                 return;
             }
         };
@@ -883,6 +900,7 @@ impl Daemon {
                 log::svcd(&format!("svcd: start enabled: {}", error));
             }
         }
+        self.note_slow("start_enabled", started);
     }
 
     fn event_loop(&mut self) {
@@ -898,15 +916,20 @@ impl Daemon {
                     }
                 }
             }
+            let started = Instant::now();
             self.pump();
+            self.note_slow("pump", started);
             if self.rescan_interval_ms > 0 && self.now_ms() >= self.next_rescan_ms {
                 self.next_rescan_ms = self.now_ms().saturating_add(self.rescan_interval_ms);
+                let started = Instant::now();
                 self.rescan_if_changed();
+                self.note_slow("rescan", started);
             }
             if self.temp_cleanup_interval_ms > 0 && self.now_ms() >= self.next_temp_cleanup_ms {
                 self.next_temp_cleanup_ms = self
                     .now_ms()
                     .saturating_add(self.temp_cleanup_interval_ms);
+                let started = Instant::now();
                 match crate::blob::cleanup(&self.config.paths, self.temp_retention) {
                     Ok(0) => {}
                     Ok(removed) => log::svcd(&format!(
@@ -915,6 +938,7 @@ impl Daemon {
                     )),
                     Err(error) => log::svcd(&format!("svcd: temp cleanup failed: {}", error)),
                 }
+                self.note_slow("temp cleanup", started);
             }
             if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
                 self.shutdown = true;
@@ -944,6 +968,7 @@ impl Daemon {
     }
 
     fn handle(&mut self, incoming: channel::PendingCall) {
+        let started = Instant::now();
         let request = match rpc::parse(&incoming.line) {
             Ok(request) => request,
             Err(response) => {
@@ -951,8 +976,9 @@ impl Daemon {
                 return;
             }
         };
+        let method = request.method.clone();
         if incoming.endpoint == channel::Endpoint::User
-            && channel::Endpoint::for_method(&request.method) == channel::Endpoint::Admin
+            && channel::Endpoint::for_method(&method) == channel::Endpoint::Admin
         {
             let response = rpc::err_data(
                 request.id,
@@ -963,13 +989,14 @@ impl Daemon {
             let _ = incoming.reply.send(rpc::to_line(&response));
             return;
         }
-        match request.method.as_str() {
+        match method.as_str() {
             "registry.call" | "tools/call" => self.handle_tool_call(request, incoming.reply),
             _ => {
                 let response = self.dispatch(request);
                 let _ = incoming.reply.send(rpc::to_line(&response));
             }
         }
+        self.note_slow(&format!("request {}", method), started);
     }
 
     fn dispatch(&mut self, request: rpc::Request) -> rpc::Response {
@@ -2262,6 +2289,7 @@ impl Daemon {
     }
 
     fn stop_all(&mut self) {
+        let started = Instant::now();
         let ids: Vec<String> = self.slots.keys().cloned().collect();
         let layers = start_layers(&self.registry, &ids).unwrap_or_else(|_| vec![ids]);
         let global_deadline = self.now_ms().saturating_add(supervisor::SHUTDOWN_BUDGET_MS);
@@ -2320,6 +2348,7 @@ impl Daemon {
                 thread::sleep(Duration::from_millis(20));
             }
         }
+        self.note_slow("stop_all", started);
     }
 }
 
