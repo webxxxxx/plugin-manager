@@ -1568,7 +1568,7 @@ impl Daemon {
                 &devices,
                 &compat::detect(MAX_SCHEMA, MAX_PROTOCOL),
             )) {
-                return Err(problem_for_legacy_detail(format!("{}: {}", id, reason)));
+                return Err(Problem::Internal.error(format!("{}: {}", id, reason)));
             }
         }
         if let Some(service) = self.registry.get(id) {
@@ -1726,8 +1726,7 @@ impl Daemon {
             Path::new(path),
             settings::allow_insecure_install(),
             allow_hooks,
-        )
-        .map_err(problem_for_legacy_detail)?;
+        )?;
         let plugin::Verified {
             package,
             signature_verified,
@@ -1760,7 +1759,7 @@ impl Daemon {
             host_interpreter.clone(),
         ) {
             Ok(service) => service,
-            Err(error) if strategy == Strategy::KeepOld && is_no_space(&error) => {
+            Err(error) if strategy == Strategy::KeepOld && is_no_space(error.detail()) => {
                 if still_running {
                     return Err(ProblemError::new(
                         Problem::Internal,
@@ -1774,10 +1773,9 @@ impl Daemon {
                     "svcd: plugin {}: keep-old ran out of space; falling back to replace",
                     id
                 ));
-                plugin::install_package(&package, Strategy::Replace, allow_hooks, host_interpreter)
-                    .map_err(problem_for_legacy_detail)?
+                plugin::install_package(&package, Strategy::Replace, allow_hooks, host_interpreter)?
             }
-            Err(error) => return Err(problem_for_legacy_detail(error)),
+            Err(error) => return Err(error),
         };
         // The package is already on disk, but registration can still be refused
         // (ADR-0015's carrier invariant). Check before touching the running slot
@@ -1882,8 +1880,7 @@ impl Daemon {
             ));
         }
 
-        let staged = package::load_staged(&staging, settings::allow_insecure_install())
-            .map_err(problem_for_legacy_detail)?;
+        let staged = package::load_staged(&staging, settings::allow_insecure_install())?;
         let id = staged.manifest.name.clone();
         let version = staged.manifest.version.clone();
         if let Some(requested) = request.params.get("id").and_then(Value::as_str) {
@@ -1911,7 +1908,7 @@ impl Daemon {
             }
         }
         let host_interpreter =
-            plugin::prepare_staged(&staged, allow_hooks).map_err(problem_for_legacy_detail)?;
+            plugin::prepare_staged(&staged, allow_hooks)?;
         let signature_verified = staged.signature_verified;
 
         let running = |slots: &BTreeMap<String, Slot>| {
@@ -1924,8 +1921,7 @@ impl Daemon {
             self.stop_service(&id)?;
         }
         let still_running = running(&self.slots);
-        let service = plugin::install_staged(staged, strategy, allow_hooks, host_interpreter)
-            .map_err(problem_for_legacy_detail)?;
+        let service = plugin::install_staged(staged, strategy, allow_hooks, host_interpreter)?;
         if let Err(error) = service.carrier() {
             return Err(ProblemError::new(
                 Problem::Internal,
@@ -2006,7 +2002,7 @@ impl Daemon {
         if running {
             self.stop_service(id)?;
         }
-        plugin::uninstall(id, purge).map_err(problem_for_legacy_detail)?;
+        plugin::uninstall(id, purge)?;
         self.slots.remove(id);
         self.registry.remove(id);
         runtime::remove(id);
@@ -2488,73 +2484,6 @@ fn status_detail(output: &str, status: Option<std::process::ExitStatus>) -> Stri
     }
 }
 
-/// Classify a text-only error from `plugin`/`package`/`compat` at the legacy
-/// `String` boundary.
-///
-/// The daemon's management methods carry [`ProblemError`], but those modules
-/// still return `String`. This maps a detail to the [`Problem`] whose HTTP
-/// status the face's legacy matcher gives a face-local `String` error, so the
-/// wire status cannot drift — with one deliberate correction: platform reasons
-/// are checked before the generic `unknown` because the Linux host triple
-/// (`x86_64-unknown-linux-gnu`) contains that word; the old matcher turned a
-/// platform mismatch into 404, the kind turns it into `UnsupportedPlatform`
-/// (400).
-///
-/// It is deliberately *not* a `From<String>`: a new text cannot silently become
-/// a non-`Internal` category, and each call site still chooses to use this
-/// helper. S5b removes the control-path use; this helper remains only until the
-/// plugin/package APIs return typed errors (S5c, #151).
-fn problem_for_legacy_detail(detail: impl Into<String>) -> ProblemError {
-    let detail = detail.into();
-    let lower = detail.to_ascii_lowercase();
-    let problem = if lower.contains("timed out") || lower.contains("timeout") {
-        Problem::Timeout
-    } else if lower.contains("exceeds") || lower.contains("too large") {
-        Problem::TooLarge
-    } else if lower.contains("unknown keyid") || lower.contains("trust root") {
-        Problem::Invalid
-    } else if lower.contains("id is a core service") {
-        Problem::CoreService
-    } else if lower.contains("unknown strategy") {
-        Problem::UnknownStrategy
-    } else if lower.contains("unknown plugin") {
-        Problem::UnknownPlugin
-    } else if lower.contains("unknown service") {
-        Problem::UnknownService
-    } else if lower.contains("platform") {
-        // The host triple itself can contain "unknown" (e.g.
-        // x86_64-unknown-linux-gnu); classify the platform reason first so the
-        // host name does not turn a platform mismatch into a 404.
-        Problem::UnsupportedPlatform
-    } else if lower.contains("unknown") || lower.contains("not found") {
-        Problem::UnknownPlugin
-    } else if lower.contains("configcheck") {
-        Problem::Conflict
-    } else if lower.contains("not a plugin") {
-        Problem::NotAPlugin
-    } else if lower.contains("core service")
-        || lower.contains("conflict")
-        || lower.contains("cannot be enabled")
-    {
-        Problem::Conflict
-    } else if lower.contains("missing dependencies") {
-        Problem::MissingDependency
-    } else if lower.contains("signature")
-        || lower.contains("protocol")
-        || lower.contains("unsafe")
-        || lower.contains("setuid")
-        || lower.contains("hooks")
-        || lower.contains("invalid")
-        || lower.contains("not declared")
-        || lower.contains("missing")
-        || lower.contains("public key")
-    {
-        Problem::Invalid
-    } else {
-        Problem::Internal
-    };
-    ProblemError::new(problem, detail)
-}
 
 fn param_id(request: &rpc::Request) -> Result<String, rpc::Response> {
     request
@@ -3821,47 +3750,13 @@ while ($null -ne ($line = $reader.ReadLine())) {
     }
 
     #[test]
-    fn the_plugin_detail_classifier_keeps_the_face_status_families() {
-        let cases = [
-            ("package exceeds 8 MiB", Problem::TooLarge),
-            ("start timed out: app", Problem::Timeout),
-            (
-                "platform mismatch: package other, host this",
-                Problem::UnsupportedPlatform,
-            ),
-            (
-                "platform mismatch: package other-triple, host x86_64-unknown-linux-gnu",
-                Problem::UnsupportedPlatform,
-            ),
-            ("id is a core service: svc", Problem::CoreService),
-            ("unknown strategy", Problem::UnknownStrategy),
-            ("unknown plugin: nope", Problem::UnknownPlugin),
-            ("unknown service: nope", Problem::UnknownService),
-            ("signature.json is missing", Problem::Invalid),
-            (
-                "plugin id conflicts with a core service: nope",
-                Problem::Conflict,
-            ),
-            ("not a plugin: core", Problem::NotAPlugin),
-            ("missing dependencies: base", Problem::MissingDependency),
-            ("dependency cycle", Problem::Internal),
-            ("requires device [sr6110]", Problem::Internal),
-        ];
-        for (detail, expected) in cases {
-            assert_eq!(
-                problem_for_legacy_detail(detail).problem,
-                expected,
-                "{detail}"
-            );
-        }
-
-        // No management path produces "exceeds" without a multi-hundred-MiB
-        // package; project the classified TooLarge through the response builder
-        // so its wire kind is covered like the reachable paths.
+    fn a_typed_management_error_projects_its_wire_kind() {
+        // The category is raised by the layer that rejected the input (#151);
+        // the wire projection only reads it.
         let response = status_response(
             Some(json!(8)),
             -32006,
-            Err(problem_for_legacy_detail("package exceeds 8 MiB")),
+            Err(Problem::TooLarge.error("package exceeds 8 MiB")),
         );
         assert_eq!(
             response.error.expect("error").data.expect("data")["kind"],

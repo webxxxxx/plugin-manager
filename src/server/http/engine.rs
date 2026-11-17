@@ -553,20 +553,11 @@ pub fn advance_request<S>(
                         pending.body.extend_from_slice(chunk);
                         Ok(())
                     })
-                    .map_err(|message| {
-                        let status = if message.contains("too large") {
-                            413
-                        } else {
-                            400
-                        };
+                    .map_err(|error| {
                         crate::http::json_error(
-                            status,
-                            if status == 413 {
-                                "payload_too_large"
-                            } else {
-                                "bad_request"
-                            },
-                            &message,
+                            error.status(),
+                            crate::http::code_for(error.status()),
+                            error.detail(),
                         )
                     })?;
                 ready = decoder.is_done();

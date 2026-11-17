@@ -635,7 +635,7 @@ fn verify(path: &Path, json: bool, pubkey: Option<&Path>) -> i32 {
     };
     let inspection = match package::inspect_bytes_with(&bytes, explicit_key.as_deref()) {
         Ok(inspection) => inspection,
-        Err(error) => return verify_failure(&file, &error, json),
+        Err(error) => return verify_failure(&file, error.detail(), json),
     };
     let host = verify_host(&inspection);
     if json {
@@ -855,7 +855,7 @@ fn edit_with_editor(id: &str) -> Result<Vec<u8>, String> {
         .ok_or_else(|| format!("plugin {} has no config", id))?;
     let directory = plugin::plugin_dir(id);
     let temporary = directory.join(format!("config.edit.{}", std::process::id()));
-    plugin::write_config(&temporary, &initial)?;
+    plugin::write_config(&temporary, &initial).map_err(|error| error.detail().to_string())?;
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
     let mut parts = editor.split_whitespace();
     let program = parts.next().ok_or_else(|| "EDITOR is empty".to_string())?;

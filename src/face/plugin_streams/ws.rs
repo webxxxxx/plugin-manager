@@ -239,7 +239,7 @@ impl WsStream {
                             BlockingOutcome::Ok(rpc::to_line(&response).into_bytes())
                         }
                         Err(cause) => {
-                            BlockingOutcome::Failed(format!("svcd unreachable: {}", cause))
+                            BlockingOutcome::failed(500, format!("svcd unreachable: {}", cause))
                         }
                     }
                 }))
@@ -421,7 +421,15 @@ impl WsStream {
                     self.queue_text(rpc::to_line(&response));
                 }
             }
-            BlockingOutcome::Failed(message) => {
+            BlockingOutcome::Busy => {
+                let response = rpc::err(
+                    self.pending_id.take(),
+                    -32603,
+                    "the blocking queue is full",
+                );
+                self.queue_text(rpc::to_line(&response));
+            }
+            BlockingOutcome::Failed { message, .. } => {
                 let response = rpc::err(self.pending_id.take(), -32603, &message);
                 self.queue_text(rpc::to_line(&response));
             }
@@ -643,7 +651,7 @@ mod tests {
         stream.pending_id = Some(json!(7));
         let mut out = Vec::new();
         stream.on_event(
-            StreamEvent::BlockingDone(BlockingOutcome::Failed("the blocking queue is full".into())),
+            StreamEvent::BlockingDone(BlockingOutcome::Busy),
             &mut OutBuffer::new(&mut out, 4096),
         );
         let (_, frames) = server_frames(&out);

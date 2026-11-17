@@ -196,6 +196,20 @@ pub enum Problem {
 }
 
 impl Problem {
+    /// The typed management error for this category, for raise sites that
+    /// already know why they are failing (#151).
+    pub fn error(self, detail: impl Into<String>) -> ProblemError {
+        ProblemError::new(self, detail)
+    }
+
+    /// The category a control-channel error carries in `error.data.kind`.
+    ///
+    /// Absent or unrecognized is `None`: the wire is the only place a category
+    /// is read back, and it is never derived from `message`.
+    pub fn from_error_data(data: Option<&serde_json::Value>) -> Option<Problem> {
+        data?.get("kind")?.as_str().and_then(Problem::from_str)
+    }
+
     pub const ALL: [Problem; 12] = [
         Problem::UnknownService,
         Problem::UnknownPlugin,
@@ -416,6 +430,32 @@ mod tests {
 
         let as_error: &dyn std::error::Error = &error;
         assert_eq!(as_error.to_string(), "plugin id conflicts");
+    }
+
+    #[test]
+    fn a_problem_builds_its_own_error() {
+        let error = Problem::TooLarge.error("package exceeds 512 MiB");
+        assert_eq!(error.problem, Problem::TooLarge);
+        assert_eq!(error.detail(), "package exceeds 512 MiB");
+    }
+
+    #[test]
+    fn the_wire_category_is_read_from_data_kind_only() {
+        let data = serde_json::json!({ "kind": "conflict" });
+        assert_eq!(Problem::from_error_data(Some(&data)), Some(Problem::Conflict));
+
+        // The caller-side category lives in a different field; a management
+        // projection must not read it.
+        let class = serde_json::json!({ "class": "busy" });
+        assert_eq!(Problem::from_error_data(Some(&class)), None);
+
+        let unknown = serde_json::json!({ "kind": "not_a_problem" });
+        assert_eq!(Problem::from_error_data(Some(&unknown)), None);
+        assert_eq!(Problem::from_error_data(None), None);
+
+        // A message that names a category is not a category.
+        let message_only = serde_json::json!({ "message": "conflict" });
+        assert_eq!(Problem::from_error_data(Some(&message_only)), None);
     }
 
     #[test]

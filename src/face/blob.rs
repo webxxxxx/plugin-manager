@@ -226,12 +226,21 @@ impl DownloadStream {
                 };
                 self.install(opened);
             }
-            BlockingOutcome::Failed(_) => {
+            BlockingOutcome::Busy => {
                 // The pool only refuses a submit (full queue, the connection
                 // already owns a job, or shutdown); every one is a retryable
                 // busy condition and no header has been sent yet. This is the
                 // one new failure mode of the download path (#132, ADR-0016).
                 self.install(Opened::response(busy_response(&self.target)));
+            }
+            BlockingOutcome::Failed { status, message } => {
+                // The open job itself never fails, but the stream layer still
+                // renders a refusal without parsing it.
+                self.install(Opened::response(http::json_error(
+                    status,
+                    crate::http::code_for(status),
+                    &message,
+                )));
             }
         }
         self.on_writable(out)
@@ -1171,7 +1180,7 @@ mod tests {
             panic!("the first Writable submits the open job");
         };
         let step = handler.on_event(
-            StreamEvent::BlockingDone(BlockingOutcome::Failed("the blocking queue is full".into())),
+            StreamEvent::BlockingDone(BlockingOutcome::Busy),
             &mut OutBuffer::new(&mut out, 4096),
         );
         assert!(matches!(
@@ -1194,7 +1203,7 @@ mod tests {
         let step = handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, 4096));
         assert!(matches!(step.action, StreamAction::SubmitBlocking(_)));
         let step = handler.on_event(
-            StreamEvent::BlockingDone(BlockingOutcome::Failed("the blocking queue is full".into())),
+            StreamEvent::BlockingDone(BlockingOutcome::Busy),
             &mut OutBuffer::new(&mut out, 4096),
         );
         assert!(matches!(

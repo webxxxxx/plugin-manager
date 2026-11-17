@@ -1006,10 +1006,10 @@ impl Slot {
             let mut result = result.clone();
             match crate::blob::materialize_result(&mut result) {
                 Ok(()) => Ok(result),
-                Err(message) => Err(Failure::new(
+                Err(error) => Err(Failure::new(
                     Class::ImplementationError,
                     Retry::Never,
-                    message,
+                    error.detail,
                 )),
             }
         } else {

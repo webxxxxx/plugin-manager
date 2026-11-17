@@ -663,7 +663,7 @@ mod tests {
                     out.write(&bytes);
                     StreamStep::wait(StreamAction::Close(CloseReason::Completed))
                 }
-                StreamEvent::BlockingDone(BlockingOutcome::Failed(message)) => {
+                StreamEvent::BlockingDone(BlockingOutcome::Failed { message, .. }) => {
                     out.write(message.as_bytes());
                     StreamStep::wait(StreamAction::Close(CloseReason::Failed(message)))
                 }
@@ -708,7 +708,8 @@ mod tests {
     fn job_result(job: BlockingJob) -> Vec<u8> {
         match job(crate::server::http::JobBudget::for_test()) {
             BlockingOutcome::Ok(bytes) => bytes,
-            BlockingOutcome::Failed(message) => panic!("unexpected failure: {message}"),
+            BlockingOutcome::Busy => panic!("unexpected busy outcome"),
+            BlockingOutcome::Failed { message, .. } => panic!("unexpected failure: {message}"),
         }
     }
 
@@ -736,7 +737,7 @@ mod tests {
                             StreamStep::wait(StreamAction::Close(CloseReason::Completed))
                         }
                     }
-                    StreamEvent::BlockingDone(BlockingOutcome::Failed(message)) => {
+                    StreamEvent::BlockingDone(BlockingOutcome::Failed { message, .. }) => {
                         StreamStep::wait(StreamAction::Close(CloseReason::Failed(message)))
                     }
                     _ => StreamStep::wait(StreamAction::Continue),

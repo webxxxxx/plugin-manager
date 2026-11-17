@@ -703,7 +703,7 @@ impl Server {
             Err(_) => {
                 if let ConnState::Stream(driver) = &mut connection.state {
                     driver.on_blocking_done(
-                        BlockingOutcome::Failed("the blocking queue is full".into()),
+                        BlockingOutcome::Busy,
                         &mut connection.out,
                         &mut connection.out_at,
                     );

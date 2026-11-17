@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::channel;
 use crate::http;
-use crate::kernel::failure::{Class, Problem};
+use crate::kernel::failure::{Class, Problem, ProblemError};
 use crate::package;
 use crate::rpc;
 use crate::server::http::{CancelToken, JobBudget, Request};
@@ -143,37 +143,6 @@ pub fn require_plugin_result(
     }
 }
 
-/// Face-local config/install status mapping. S5c (#151) replaces this together
-/// with the package/settings APIs that still return `String`.
-pub fn config_error_status(message: &str) -> (u16, &'static str, String) {
-    let lower = message.to_ascii_lowercase();
-    let status = if lower.contains("unknown plugin") {
-        404
-    } else if lower.contains("exceeds 1 mib") {
-        413
-    } else if lower.contains("configcheck") {
-        409
-    } else {
-        500
-    };
-    (status, code_for(status), message.to_string())
-}
-
-/// Face-local legacy rendering for install/trust errors that still arrive as
-/// `String`. The control channel projects from `error.data` instead.
-pub fn map_error(message: &str) -> Vec<u8> {
-    let (status, code, message) = map_error_status(message);
-    error(status, code, &message)
-}
-
-/// Face-local legacy status mapping. New control-channel code must use
-/// [`status_for_rpc_error`]; this remains only until S5c (#151) types the
-/// source APIs.
-pub fn map_error_status(message: &str) -> (u16, &'static str, String) {
-    let status = status_for_legacy_message(message);
-    (status, code_for(status), message.to_string())
-}
-
 pub fn query_value(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (name, value) = pair.split_once('=')?;
@@ -193,14 +162,12 @@ pub fn query_bool(query: &str, key: &str) -> Option<bool> {
 /// `Internal`: the projection never falls back to parsing `message`, so an old
 /// or hand-written error cannot pick a status by accident.
 fn status_for_rpc_error(error: &rpc::Error) -> u16 {
+    if let Some(problem) = Problem::from_error_data(error.data.as_ref()) {
+        return status_for_problem(problem);
+    }
     let Some(data) = error.data.as_ref() else {
         return 500;
     };
-    if let Some(kind) = data.get("kind").and_then(Value::as_str) {
-        return Problem::from_str(kind)
-            .map(status_for_problem)
-            .unwrap_or(500);
-    }
     if let Some(class) = data.get("class").and_then(Value::as_str) {
         return Class::from_str(class).map(status_for_class).unwrap_or(500);
     }
@@ -221,6 +188,22 @@ fn status_for_problem(problem: Problem) -> u16 {
     }
 }
 
+/// The status a typed management failure projects to. Callers never inspect
+/// the detail: the category raised where the failure happened decides (#151).
+pub(crate) fn status_for_problem_error(error: &ProblemError) -> u16 {
+    status_for_problem(error.problem)
+}
+
+/// The status a storage failure projects to. Storage reuses the management
+/// table for the categories they share; "not there" is the only storage-only
+/// category, and it always renders as 404.
+pub(crate) fn status_for_storage(kind: crate::blob::Kind) -> u16 {
+    match kind {
+        crate::blob::Kind::Problem(problem) => status_for_problem(problem),
+        crate::blob::Kind::NotThere => 404,
+    }
+}
+
 /// No face route produces `data.class` today (only MCP tool errors do), but a
 /// future control client may. Keep the statuses the old matcher gave those
 /// details; `Busy` stays 500 (503 is reserved for the blocking queue).
@@ -230,46 +213,6 @@ fn status_for_class(class: Class) -> u16 {
         Class::Timeout => 504,
         Class::MissingDependency => 400,
         _ => 500,
-    }
-}
-
-/// Face-local install/import details still come from `String` APIs. The control
-/// channel no longer uses this; S5c (#151) replaces it together with the source
-/// APIs.
-fn status_for_legacy_message(message: &str) -> u16 {
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("timed out") || lower.contains("timeout") {
-        504
-    } else if lower.contains("exceeds") || lower.contains("too large") {
-        413
-    } else if lower.contains("unknown keyid") || lower.contains("trust root") {
-        400
-    } else if lower.contains("id is a core service") {
-        404
-    } else if lower.contains("unknown") || lower.contains("not found") {
-        404
-    } else if lower.contains("configcheck") {
-        409
-    } else if lower.contains("not a plugin")
-        || lower.contains("core service")
-        || lower.contains("conflict")
-        || lower.contains("cannot be enabled")
-    {
-        409
-    } else if lower.contains("signature")
-        || lower.contains("platform")
-        || lower.contains("protocol")
-        || lower.contains("unsafe")
-        || lower.contains("setuid")
-        || lower.contains("hooks")
-        || lower.contains("invalid")
-        || lower.contains("not declared")
-        || lower.contains("missing")
-        || lower.contains("public key")
-    {
-        400
-    } else {
-        500
     }
 }
 
@@ -286,6 +229,47 @@ pub(crate) fn decode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The face-local HTTP table, one row per management category. These are
+    /// the codes the old message matchers returned (#151); the category is now
+    /// the only input.
+    #[test]
+    fn every_management_category_keeps_its_http_status() {
+        let cases = [
+            (Problem::UnknownService, 404),
+            (Problem::UnknownPlugin, 404),
+            (Problem::UnknownStrategy, 404),
+            (Problem::CoreService, 404),
+            (Problem::NotAPlugin, 409),
+            (Problem::Conflict, 409),
+            (Problem::Invalid, 400),
+            (Problem::UnsupportedPlatform, 400),
+            (Problem::MissingDependency, 400),
+            (Problem::TooLarge, 413),
+            (Problem::Timeout, 504),
+            (Problem::Internal, 500),
+        ];
+        for (problem, status) in cases {
+            assert_eq!(status_for_problem(problem), status, "{}", problem.as_str());
+            let error = problem.error("detail");
+            assert_eq!(status_for_problem_error(&error), status, "{}", problem.as_str());
+        }
+    }
+
+    /// The storage taxonomy reuses the management table and adds exactly one
+    /// category of its own: a missing upload session is 404.
+    #[test]
+    fn a_storage_failure_projects_onto_the_same_table() {
+        assert_eq!(
+            status_for_storage(crate::blob::Kind::Problem(Problem::Conflict)),
+            409
+        );
+        assert_eq!(
+            status_for_storage(crate::blob::Kind::Problem(Problem::TooLarge)),
+            413
+        );
+        assert_eq!(status_for_storage(crate::blob::Kind::NotThere), 404);
+    }
 
     /// The stream-job handoff must carry both halves of the budget: a job that
     /// only got a deadline would keep a disconnected install alive, and one

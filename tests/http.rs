@@ -3069,6 +3069,27 @@ fn blob_2mib_upload_and_multipart_complete_round_trip() {
     assert_eq!(downloaded.body, expected);
 }
 
+/// A well-formed but unknown upload id is a 404 on every session endpoint: the
+/// storage kind decides the status, never the message text (#151).
+#[test]
+fn an_unknown_upload_session_is_not_found() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let unknown = "0".repeat(32);
+
+    for (method, path, body) in [
+        ("GET", format!("/api/v1/blobs/uploads/{}", unknown), ""),
+        ("POST", format!("/api/v1/blobs/uploads/{}/complete", unknown), ""),
+        ("DELETE", format!("/api/v1/blobs/uploads/{}", unknown), ""),
+        ("GET", format!("/api/v1/file/uploads/{}", unknown), ""),
+    ] {
+        let response = request(&address, method, &path, "", body.as_bytes());
+        assert_eq!(response.status, 404, "{method} {path}: {:?}", response.body);
+        assert_eq!(response.body["error"]["code"], "not_found", "{path}");
+    }
+}
+
 #[test]
 fn upload_sessions_reject_cross_kind_requests() {
     let mut sandbox = Sandbox::new();

@@ -12,6 +12,8 @@ use serde_json::json;
 
 use crate::blob;
 use crate::http;
+
+use super::support;
 use crate::lan::{AuthKind, Lan};
 use crate::server::http::{
     BlockingOutcome, CloseReason, Exchange, OutBuffer, StreamAction, StreamClass, StreamEvent,
@@ -142,8 +144,8 @@ pub fn exchange(head: &http::Head, lan: &Arc<Mutex<Lan>>) -> Result<Exchange, Ve
                 "part number must be between 1 and 10000",
             ));
         }
-        if let Err(message) = blob::require_upload_kind(upload, *kind) {
-            return Err(status_response(&message));
+        if let Err(error) = blob::require_upload_kind(upload, *kind) {
+            return Err(blob_error(error));
         }
     }
 
@@ -183,7 +185,7 @@ struct UploadState {
     multipart: Option<MultipartParser>,
     upload: Option<blob::Upload>,
     part: Option<blob::PartWriter>,
-    finished: Option<Result<Success, String>>,
+    finished: Option<Result<Success, UploadFailure>>,
 }
 
 enum BodyFraming {
@@ -267,14 +269,14 @@ impl BlobUploadStream {
         out: &mut OutBuffer<'_>,
     ) -> StreamStep {
         match outcome {
-            BlockingOutcome::Failed(message) if message.contains("blocking queue is full") => {
+            BlockingOutcome::Busy => {
                 // The pool refused the chunk before a final response: use the
                 // same 503 busy contract as a stream cap.
                 self.respond(crate::server::http::stream_busy_response());
                 self.on_writable(out)
             }
-            BlockingOutcome::Failed(message) => {
-                self.respond(status_response(&message));
+            BlockingOutcome::Failed { status, message } => {
+                self.respond(failure_response(status, &message));
                 self.on_writable(out)
             }
             BlockingOutcome::Ok(_) => {
@@ -289,8 +291,8 @@ impl BlobUploadStream {
                         self.respond(success_response(success));
                         self.on_writable(out)
                     }
-                    Some(Err(message)) => {
-                        self.respond(status_response(&message));
+                    Some(Err(failure)) => {
+                        self.respond(failure_response(failure.status(), &failure.detail()));
                         self.on_writable(out)
                     }
                     None => {
@@ -334,12 +336,12 @@ fn run_chunk(state: &Arc<Mutex<UploadState>>, chunk: Vec<u8>) -> BlockingOutcome
     let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
     match state.feed(&chunk) {
         Ok(()) => BlockingOutcome::Ok(Vec::new()),
-        Err(message) => BlockingOutcome::Failed(message),
+        Err(failure) => BlockingOutcome::failed(failure.status(), failure.detail()),
     }
 }
 
 impl UploadState {
-    fn feed(&mut self, raw: &[u8]) -> Result<(), String> {
+    fn feed(&mut self, raw: &[u8]) -> Result<(), UploadFailure> {
         if self.finished.is_some() {
             return Ok(());
         }
@@ -351,10 +353,12 @@ impl UploadState {
             }
             BodyFraming::Chunked(decoder) => {
                 let mut decoded = Vec::new();
-                decoder.feed(raw, &mut |chunk| {
-                    decoded.extend_from_slice(chunk);
-                    Ok(())
-                })?;
+                decoder
+                    .feed(raw, &mut |chunk| {
+                        decoded.extend_from_slice(chunk);
+                        Ok(())
+                    })
+                    .map_err(UploadFailure::from)?;
                 (decoded, decoder.is_done())
             }
         };
@@ -367,16 +371,16 @@ impl UploadState {
         Ok(())
     }
 
-    fn write_body(&mut self, bytes: &[u8]) -> Result<(), String> {
+    fn write_body(&mut self, bytes: &[u8]) -> Result<(), UploadFailure> {
         match &self.target {
             UploadTarget::Blob => {
                 if self.upload.is_none() {
-                    self.upload = Some(blob::Upload::begin()?);
+                    self.upload = Some(blob::Upload::begin().map_err(UploadFailure::storage)?);
                 }
                 let upload = self.upload.as_mut().expect("blob upload initialized");
                 match &mut self.multipart {
                     Some(parser) => parser.push(bytes, upload),
-                    None => upload.write(bytes),
+                    None => upload.write(bytes).map_err(UploadFailure::storage),
                 }
             }
             UploadTarget::Part { upload, part, kind } => {
@@ -384,35 +388,45 @@ impl UploadState {
                 let part = *part;
                 let kind = *kind;
                 if self.part.is_none() {
-                    self.part = Some(blob::PartWriter::begin(&upload_id, part, kind)?);
+                    self.part = Some(
+                        blob::PartWriter::begin(&upload_id, part, kind)
+                            .map_err(UploadFailure::storage)?,
+                    );
                 }
                 self.part
                     .as_mut()
                     .expect("part writer initialized")
                     .write(bytes)
+                    .map_err(UploadFailure::storage)
             }
         }
     }
 
-    fn finish_body(&mut self) -> Result<(), String> {
+    fn finish_body(&mut self) -> Result<(), UploadFailure> {
         match &self.target {
             UploadTarget::Blob => {
                 if let Some(parser) = &self.multipart {
                     parser.finish()?;
                 }
-                let upload = self.upload.take().ok_or("empty blob body")?;
+                let upload = self
+                    .upload
+                    .take()
+                    .ok_or_else(|| UploadFailure::body("empty blob body"))?;
                 if upload.size() == 0 {
-                    return Err("empty blob body".into());
+                    return Err(UploadFailure::body("empty blob body"));
                 }
-                let meta = upload.finish()?;
+                let meta = upload.finish().map_err(UploadFailure::storage)?;
                 self.finished = Some(Ok(Success::Blob(meta)));
             }
             UploadTarget::Part { .. } => {
-                let writer = self.part.take().ok_or("empty part body")?;
+                let writer = self
+                    .part
+                    .take()
+                    .ok_or_else(|| UploadFailure::body("empty part body"))?;
                 if writer.size() == 0 {
-                    return Err("empty part body".into());
+                    return Err(UploadFailure::body("empty part body"));
                 }
-                let info = writer.finish()?;
+                let info = writer.finish().map_err(UploadFailure::storage)?;
                 self.finished = Some(Ok(Success::Part(info)));
             }
         }
@@ -453,36 +467,60 @@ fn success_response(success: Success) -> Vec<u8> {
     }
 }
 
-fn status_response(message: &str) -> Vec<u8> {
-    let status = if message.contains("too large") {
-        413
-    } else if message.contains("unknown upload") {
-        404
-    } else if message.contains("kind mismatch") || message.contains("kind") {
-        409
-    } else if message.contains("part number")
-        || message.contains("invalid")
-        || message.contains("truncated")
-        || message.contains("multipart")
-        || message.contains("chunk")
-        || message.contains("empty")
-    {
-        400
-    } else {
-        500
-    };
-    http::json_error(status, code_for(status), message)
+/// A malformed request body. The face's own framing layer (multipart, chunked
+/// transfer) only ever rejects the input, so it is always a 400; the store's
+/// failures carry their own kind.
+#[derive(Debug)]
+enum UploadFailure {
+    Body(String),
+    Storage(blob::Error),
 }
 
-fn code_for(status: u16) -> &'static str {
-    match status {
-        400 => "bad_request",
-        404 => "not_found",
-        409 => "conflict",
-        413 => "payload_too_large",
-        500 => "internal",
-        _ => "error",
+impl From<blob::Error> for UploadFailure {
+    fn from(error: blob::Error) -> UploadFailure {
+        UploadFailure::Storage(error)
     }
+}
+
+impl From<http::BodyError> for UploadFailure {
+    fn from(error: http::BodyError) -> UploadFailure {
+        match error {
+            http::BodyError::Malformed(detail) => UploadFailure::Body(detail),
+            http::BodyError::TooLarge(detail) => UploadFailure::Storage(blob::Error::too_large(detail)),
+        }
+    }
+}
+
+impl UploadFailure {
+    fn body(detail: impl Into<String>) -> UploadFailure {
+        UploadFailure::Body(detail.into())
+    }
+
+    fn storage(error: blob::Error) -> UploadFailure {
+        UploadFailure::Storage(error)
+    }
+
+    fn status(&self) -> u16 {
+        match self {
+            UploadFailure::Body(_) => 400,
+            UploadFailure::Storage(error) => support::status_for_storage(error.kind),
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self {
+            UploadFailure::Body(detail) => detail.clone(),
+            UploadFailure::Storage(error) => error.detail.clone(),
+        }
+    }
+}
+
+fn blob_error(error: blob::Error) -> Vec<u8> {
+    failure_response(support::status_for_storage(error.kind), &error.detail)
+}
+
+fn failure_response(status: u16, message: &str) -> Vec<u8> {
+    http::json_error(status, support::code_for(status), message)
 }
 
 fn multipart_boundary(content_type: &str) -> Result<Option<String>, String> {
@@ -544,7 +582,7 @@ impl MultipartParser {
         }
     }
 
-    fn push(&mut self, chunk: &[u8], upload: &mut blob::Upload) -> Result<(), String> {
+    fn push(&mut self, chunk: &[u8], upload: &mut blob::Upload) -> Result<(), UploadFailure> {
         if self.done {
             return Ok(());
         }
@@ -555,7 +593,7 @@ impl MultipartParser {
         self.advance(upload)
     }
 
-    fn push_body_direct(&mut self, chunk: &[u8], upload: &mut blob::Upload) -> Result<(), String> {
+    fn push_body_direct(&mut self, chunk: &[u8], upload: &mut blob::Upload) -> Result<(), UploadFailure> {
         let mut delimiter = Vec::with_capacity(self.boundary.len() + 2);
         delimiter.extend_from_slice(b"\r\n");
         delimiter.extend_from_slice(&self.boundary);
@@ -578,7 +616,7 @@ impl MultipartParser {
         Ok(())
     }
 
-    fn advance(&mut self, upload: &mut blob::Upload) -> Result<(), String> {
+    fn advance(&mut self, upload: &mut blob::Upload) -> Result<(), UploadFailure> {
         loop {
             match self.state {
                 MpState::Preamble => {
@@ -596,7 +634,7 @@ impl MultipartParser {
                 MpState::Headers => {
                     let Some(position) = find(&self.buffer, b"\r\n\r\n") else {
                         if self.buffer.len() > 64 * 1024 {
-                            return Err("multipart part headers are too large".into());
+                            return Err(UploadFailure::body("multipart part headers are too large"));
                         }
                         return Ok(());
                     };
@@ -644,18 +682,18 @@ impl MultipartParser {
                         self.state = MpState::Headers;
                         continue;
                     }
-                    return Err("invalid multipart boundary".into());
+                    return Err(UploadFailure::body("invalid multipart boundary"));
                 }
             }
         }
     }
 
-    fn finish(&self) -> Result<(), String> {
+    fn finish(&self) -> Result<(), UploadFailure> {
         if !self.found_file {
-            return Err("multipart body has no file part".into());
+            return Err(UploadFailure::body("multipart body has no file part"));
         }
         if !self.done {
-            return Err("incomplete multipart body".into());
+            return Err(UploadFailure::body("incomplete multipart body"));
         }
         Ok(())
     }
@@ -794,10 +832,12 @@ mod tests {
         let id = blob_id(&response);
         let mut content = Vec::new();
         crate::blob::path(&id)
-            .and_then(|path| std::fs::File::open(path).map_err(|error| error.to_string()))
+            .and_then(|path| {
+                std::fs::File::open(path).map_err(|error| blob::Error::internal(error.to_string()))
+            })
             .and_then(|mut file| {
                 file.read_to_end(&mut content)
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| blob::Error::internal(error.to_string()))
             })
             .expect("read staged blob");
         assert_eq!(content, b"blob body");
@@ -960,9 +1000,7 @@ mod tests {
         );
         assert!(matches!(step.action, StreamAction::SubmitBlocking(_)));
         let step = handler.on_event(
-            StreamEvent::BlockingDone(BlockingOutcome::Failed(
-                "the blocking queue is full".into(),
-            )),
+            StreamEvent::BlockingDone(BlockingOutcome::Busy),
             &mut OutBuffer::new(&mut out, 4096),
         );
         assert!(matches!(step.action, StreamAction::Close(_)));

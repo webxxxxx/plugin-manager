@@ -335,14 +335,8 @@ pub(crate) fn read_body(
             .write_all(http::CONTINUE_RESPONSE)
             .map_err(|_| http::json_error(400, "bad_request", "cannot write response"))?;
     }
-    http::collect_body(stream, framing, limit, initial).map_err(|message| {
-        let status = if message.contains("too large") {
-            413
-        } else {
-            400
-        };
-        http::json_error(status, http::code_for(status), &message)
-    })
+    http::collect_body(stream, framing, limit, initial)
+        .map_err(|error| http::json_error(error.status(), http::code_for(error.status()), error.detail()))
 }
 
 #[cfg(test)]
