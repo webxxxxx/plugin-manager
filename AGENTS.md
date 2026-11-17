@@ -42,6 +42,7 @@ This repo is single-context: one `GLOSSARY.md` at the repo root and ADRs in `doc
 - **跨平台测试**：行为测试必须平台中立；`/proc`、Win32 等 OS 细节测试只能做补充，不能替代另一平台的验证。
 - **测试 helper**：不得伪造生产失败类别；实现没回调、没结果时直接失败，不要编一个 `Timeout` / `NotRunning`。
 - **提交边界**：行为改动与 dead-code 清理、`#[cfg(test)]` gating 分开提交；review 的 Spec 轴会把混入的清理列为 scope creep。
+- **宽改**：重命名 / 改类型 / 搬符号这类「一处机械改、几百个调用点」先读 `docs/agents/wide-refactor.md`，用 `node tools/codemod.mjs` 的清单 + 编译门，不要手写 `str.replace` 脚本。
 - **文档一致性**：改 `docs/architecture.md` 的「当前/下一步」时同步 §8 seam 表；`tools/arch-map.json` 的过期/缺失映射与 stdio seam 不变量由 `dep-lint` 检查（CI `guardrails` job 会跑）。
 - **CI 边界**：除非用户明确要求 GitHub CI 或全链路测试，不主动触发、等待或观察 GitHub Actions；先用本地 `node tools/check.mjs`。
 
