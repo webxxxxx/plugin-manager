@@ -71,6 +71,47 @@ impl Sandbox {
         .expect("write definition");
     }
 
+    /// Run an installed alias (`svc` / `plugin` / `mcp` / `svcd`) from this
+    /// sandbox. The multicall binary dispatches on its file stem.
+    fn run_as(&self, name: &str, args: &[&str]) -> Output {
+        let suffix = if cfg!(windows) { ".exe" } else { "" };
+        let binary = self.root.join(format!("{}{}", name, suffix));
+        if binary == self.binary {
+            return self.run(args);
+        }
+        // Windows reports a sharing violation while another sandbox's copy of
+        // the freshly written binary is still being scanned or released.
+        let mut last = None;
+        for _ in 0..50 {
+            match fs::copy(&self.binary, &binary) {
+                Ok(_) => {
+                    last = None;
+                    break;
+                }
+                Err(error) => {
+                    last = Some(error);
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+        if let Some(error) = last {
+            panic!("copy alias {name}: {error}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
+                .expect("make alias executable");
+        }
+        let mut command = Command::new(&binary);
+        command
+            .args(args)
+            .env("SVCD_CONFIG_DIR", self.config_dir())
+            .env("SVCD_LOG_DIR", self.logs_dir())
+            .env("SVCD_TEST_UNPRIVILEGED", "1");
+        command.output().expect("run alias")
+    }
+
     fn run(&self, args: &[&str]) -> Output {
         let mut command = Command::new(&self.binary);
         command
@@ -146,6 +187,65 @@ fn list_without_a_daemon_reports_unreachable() {
         "stderr:\n{}",
         stderr(&output)
     );
+}
+
+/// The config is derived once at each entry. A broken file is a hard error
+/// instead of a silent fallback to defaults; `--help`/usage stays available
+/// because it never bootstraps.
+#[test]
+fn a_broken_config_is_a_hard_error_for_every_entry() {
+    let sandbox = Sandbox::new();
+    fs::create_dir_all(sandbox.config_dir()).expect("config dir");
+    fs::write(
+        sandbox.config_dir().join("svcd.conf"),
+        "bind = not-an-address\n",
+    )
+    .expect("broken conf");
+
+    for (name, args) in [("svc", &["list"][..]), ("plugin", &["list"][..])] {
+        let output = sandbox.run_as(name, args);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{name}: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("invalid config"),
+            "{name}: {}",
+            stderr(&output)
+        );
+    }
+
+    // The daemon entry reports it before touching any service.
+    let conf = sandbox.config_dir().join("svcd.conf");
+    let mut daemon_command = Command::new(env!("CARGO_BIN_EXE_svcd"));
+    daemon_command
+        .arg("run")
+        .arg("--foreground")
+        .arg("--conf")
+        .arg(&conf)
+        .env("SVCD_CONFIG_DIR", sandbox.config_dir());
+    let daemon = daemon_command.output().expect("run daemon entry");
+    assert_eq!(daemon.status.code(), Some(1), "{}", stderr(&daemon));
+    assert!(
+        stderr(&daemon).contains("invalid config"),
+        "{}",
+        stderr(&daemon)
+    );
+
+    // MCP is an entry too: no stdin is read before the bootstrap fails. The
+    // multicall binary dispatches on its file stem, so it must be `mcp`.
+    let mcp = sandbox.run_as("mcp", &[]);
+    assert_eq!(mcp.status.code(), Some(1), "{}", stderr(&mcp));
+    assert!(
+        stderr(&mcp).contains("invalid config"),
+        "{}",
+        stderr(&mcp)
+    );
+
+    // Usage does not need a config.
+    assert_eq!(sandbox.run(&["--help"]).status.code(), Some(64));
 }
 
 #[test]
@@ -293,3 +393,5 @@ fn trust_add_list_and_remove_manage_the_trust_store() {
         .join("bad.pub")
         .exists());
 }
+
+
