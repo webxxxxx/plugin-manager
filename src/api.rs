@@ -848,7 +848,11 @@ fn client_gone(stream: &TcpStream) -> bool {
         )
     };
     if ready == SOCKET_ERROR {
-        return true;
+        // A transient winsock failure is not proof that the client left;
+        // cancelling on it would truncate a live SSE body. A real reset still
+        // surfaces as readable + peek error, and a write failure flips the
+        // caller's abandonment flag.
+        return false;
     }
     if ready == 0 {
         return false;
@@ -857,7 +861,15 @@ fn client_gone(stream: &TcpStream) -> bool {
     let mut byte = [0u8; 1];
     match stream.peek(&mut byte) {
         Ok(0) => true,
-        Ok(_) => false,
+        Ok(_) => {
+            // Pipelined or stray bytes on a `Connection: close` response can
+            // never be served; drain them so a FIN queued behind them becomes
+            // visible instead of leaving the socket readable forever.
+            let mut junk = [0u8; 64];
+            let mut socket = stream;
+            let _ = socket.read(&mut junk);
+            false
+        }
         Err(_) => true,
     }
 }

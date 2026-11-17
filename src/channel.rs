@@ -291,14 +291,14 @@ pub fn request(
 /// response. Notifications are delivered to `on_notification`; reading stops at
 /// the response with an `id`.
 ///
-/// `idle` bounds how long the caller waits for the next frame; `cancelled` is
-/// checked once per short poll. The CLI passes no bound and never cancels, so
-/// it keeps the blocking round trip and the connection pool. A server-side
-/// SSE response passes the transfer bound and its client's disconnect check,
-/// so a hung supervisor or a gone client releases the stream permit instead of
-/// pinning the connection thread. A timed-out or cancelled socket is dropped,
-/// never returned to the pool: a late response would otherwise be mistaken for
-/// the next request's reply.
+/// `idle` bounds how long the caller waits for the next frame; a bound also
+/// turns the read into a short poll so `cancelled` can be observed. The CLI
+/// passes no bound and never cancels, so it keeps the old blocking read and
+/// the connection pool. A server-side SSE response passes the transfer bound
+/// and its client's disconnect check, so a hung supervisor or a gone client
+/// releases the stream permit instead of pinning the connection thread. A
+/// timed-out or cancelled socket is dropped, never returned to the pool: a
+/// late response would otherwise be mistaken for the next request's reply.
 pub fn request_stream<F, C>(
     config: &Path,
     method: &str,
@@ -316,7 +316,8 @@ where
     let line = request_line(method, params, token);
     ipc::write_frame_limit(&mut stream, &line, ipc::LOCAL_FRAME_MAX)?;
 
-    let mut reader = ipc::FrameReader::new(BufReader::new(PollReader { stream }));
+    let polling = idle.is_some();
+    let mut reader = ipc::FrameReader::new(BufReader::new(PollReader { stream, polling }));
     let bound = idle.map(ReadBound::Idle).unwrap_or(ReadBound::Unbounded);
     let response = read_response(&mut reader, bound, cancelled, on_notification)?;
     release(config, reader.into_inner().into_inner().into_inner());
@@ -361,6 +362,10 @@ const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// into `WouldBlock` while `FrameReader` keeps the bytes it already has.
 struct PollReader {
     stream: Stream,
+    /// `true` turns a read into a zero-timeout readiness check. The CLI keeps
+    /// `false`: without a deadline there is nothing to wake up for, and the
+    /// blocking read avoids a poll period of added latency.
+    polling: bool,
 }
 
 impl PollReader {
@@ -375,7 +380,7 @@ impl PollReader {
 
 impl std::io::Read for PollReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if !self.stream.wait_readable(Duration::ZERO)? {
+        if self.polling && !self.stream.wait_readable(Duration::ZERO)? {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "no control data ready",
@@ -388,9 +393,8 @@ impl std::io::Read for PollReader {
 /// What bounds one control read.
 #[derive(Clone, Copy)]
 enum ReadBound {
-    /// No deadline: the caller waits for the final frame, still re-checking the
-    /// cancellation flag every poll period (the CLI passes a never-cancelled
-    /// closure).
+    /// No deadline: a plain blocking frame read (the CLI). Without a bound the
+    /// cancellation flag is not observed, because there is no poll to check it.
     Unbounded,
     /// Fail when no frame arrives for this long; every frame resets it.
     Idle(Duration),
@@ -422,7 +426,9 @@ where
         }
         let now = Instant::now();
         let wait = match bound {
-            ReadBound::Unbounded => CONTROL_POLL_INTERVAL,
+            // The CLI path has no deadline and no cancellation to observe, so
+            // it keeps the old blocking read instead of waking every poll.
+            ReadBound::Unbounded => None,
             ReadBound::Idle(idle) => {
                 let elapsed = now.saturating_duration_since(last_frame);
                 if elapsed >= idle {
@@ -431,7 +437,7 @@ where
                         "control request timed out",
                     ));
                 }
-                (idle - elapsed).min(CONTROL_POLL_INTERVAL)
+                Some((idle - elapsed).min(CONTROL_POLL_INTERVAL))
             }
             ReadBound::Deadline(deadline) => {
                 if now >= deadline {
@@ -440,13 +446,17 @@ where
                         "control request timed out",
                     ));
                 }
-                deadline
-                    .saturating_duration_since(now)
-                    .min(CONTROL_POLL_INTERVAL)
+                Some(
+                    deadline
+                        .saturating_duration_since(now)
+                        .min(CONTROL_POLL_INTERVAL),
+                )
             }
         };
-        if !reader.has_buffered() && !reader.get_ref().get_ref().wait_readable(wait)? {
-            continue;
+        if let Some(wait) = wait {
+            if !reader.has_buffered() && !reader.get_ref().get_ref().wait_readable(wait)? {
+                continue;
+            }
         }
         match reader.read_frame_limit(ipc::LOCAL_FRAME_MAX) {
             Ok(Some(line)) => {
@@ -506,7 +516,10 @@ pub fn request_within<C: Fn() -> bool>(
     let line = request_line(method, params, token);
     ipc::write_frame_limit(&mut stream, &line, ipc::LOCAL_FRAME_MAX)?;
 
-    let mut reader = ipc::FrameReader::new(BufReader::new(PollReader { stream }));
+    let mut reader = ipc::FrameReader::new(BufReader::new(PollReader {
+        stream,
+        polling: true,
+    }));
     let response = read_response(
         &mut reader,
         ReadBound::Deadline(deadline),
@@ -1095,7 +1108,9 @@ mod tests {
     }
 
     /// A disconnect check that flips must stop the read within one poll period,
-    /// and the half-finished request must not poison the pool.
+    /// and the half-finished request must not poison the pool. On Windows this
+    /// is the interruptible-pipe unit test: the read is parked on a silent
+    /// `PeekNamedPipe`, and the cancel flag must return it without new data.
     #[test]
     fn a_cancelled_stream_request_drops_the_socket_instead_of_pooling_it() {
         let config = config_dir("stream-cancel");
@@ -1112,7 +1127,7 @@ mod tests {
             &config,
             "registry.call",
             serde_json::json!({}),
-            None,
+            Some(Duration::from_secs(5)),
             || cancelled.load(Ordering::Acquire),
             |_| {},
         )

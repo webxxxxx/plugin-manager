@@ -7362,6 +7362,23 @@ fn http_mcp_stream_consumes_the_long_lived_max_streams_budget() {
 /// fallback peeks the client socket and abandons the control read (#135).
 #[test]
 fn http_mcp_stream_disconnect_releases_the_budget() {
+    let (_sandbox, address) = mcp_disconnect_sandbox();
+    assert_mcp_disconnect_releases(&address, 11, None);
+}
+
+/// The same disconnect, but with a byte sent after the request body. The
+/// Windows probe must drain bytes a `Connection: close` response can never
+/// serve, or a FIN queued behind them would keep the slot until the hung call
+/// ends.
+#[cfg(windows)]
+#[test]
+fn http_mcp_stream_disconnect_with_trailing_bytes_releases_the_budget() {
+    let (_sandbox, address) = mcp_disconnect_sandbox();
+    assert_mcp_disconnect_releases(&address, 11, Some(b'G'));
+}
+
+/// A `max_streams = 1` sandbox with the event plugin installed and started.
+fn mcp_disconnect_sandbox() -> (Sandbox, String) {
     let mut sandbox = Sandbox::new();
     sandbox.allow_insecure_install_with("max_streams = 1\n");
     let key = SigningKey::from_bytes(&[62u8; 32]);
@@ -7384,11 +7401,19 @@ fn http_mcp_stream_disconnect_releases_the_budget() {
     let started = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
     assert_eq!(started.status, 200, "{}", started.body);
     set_password(&sandbox, TEST_PASSWORD);
+    (sandbox, address)
+}
 
+/// Open a hung `tools/call`, leave (optionally after trailing bytes), and
+/// require the long-lived slot back before the plugin call can finish.
+fn assert_mcp_disconnect_releases(address: &str, id: u64, trailing: Option<u8>) {
     // The plugin sleeps for five seconds, so the stream is still open when we
     // drop the client after its head.
-    let mut slow = mcp_stream_request(&address, 11, "demo.slow");
+    let mut slow = mcp_stream_request(address, id, "demo.slow");
     assert_eq!(read_response_head(&mut slow).0, 200);
+    if let Some(byte) = trailing {
+        slow.write_all(&[byte]).expect("trailing byte");
+    }
     let dropped_at = Instant::now();
     drop(slow);
 
@@ -7396,7 +7421,7 @@ fn http_mcp_stream_disconnect_releases_the_budget() {
     // The plugin sleeps for five seconds; a slot released only when that call
     // ends would still be busy here.
     for _ in 0..200 {
-        let mut candidate = mcp_stream_request(&address, 12, "demo.status");
+        let mut candidate = mcp_stream_request(address, id + 1, "demo.status");
         let (status, _) = read_response_head(&mut candidate);
         if status == 200 {
             released = true;
