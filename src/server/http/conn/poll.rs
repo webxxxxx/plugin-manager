@@ -25,11 +25,6 @@ impl ConnectionDriver for Driver {
             threads,
         } = input;
         let _ = threads;
-        let Some(control) = control else {
-            return Err(io::Error::other(
-                "the Unix server loop needs the control channel",
-            ));
-        };
         let (control_listener, pending, wake) = control.into_parts();
         let loop_handle = crate::server::http::server::start(
             listener,

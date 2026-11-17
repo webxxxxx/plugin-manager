@@ -141,8 +141,8 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     // One path on every host: the channel binds the endpoint and either hands
     // the listener to the server loop (Unix) or starts its own accept thread
     // (Windows). The composition root only sees the resulting server.
-    let mut control = match channel::bind_server(&config, tx, wake.clone()) {
-        Ok(control) => Some(control),
+    let control = match channel::bind_server(&config, tx, wake.clone()) {
+        Ok(control) => control,
         Err(error) => {
             log::svcd(&format!("svcd: cannot bind control channel: {}", error));
             return 1;
@@ -158,7 +158,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     // The driver picks itself inside `server::http::entry`; the composition
     // root only hands over the control plumbing it owns.
     #[cfg(feature = "http")]
-    let api = match api::spawn(config.clone(), raw_hub.clone(), control.take()) {
+    let api = match api::spawn(config.clone(), raw_hub.clone(), control) {
         Ok(api) => Some(api),
         Err(error) => {
             #[cfg(unix)]
@@ -176,9 +176,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         }
     };
     #[cfg(all(unix, not(feature = "http")))]
-    let control_loop = match crate::server::control::spawn_control_only(
-        control.take().expect("control channel"),
-    ) {
+    let control_loop = match crate::server::control::spawn_control_only(control) {
         Ok(handle) => handle,
         Err(error) => {
             log::svcd(&format!("svcd: cannot start server loop: {}", error));
@@ -186,8 +184,9 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         }
     };
     // A host whose control loop already started (Windows) has nothing left to
-    // hand over; this keeps the binding used on every cfg path.
-    let _ = control.take();
+    // hand over: the accept thread owns the server from `bind_server` on.
+    #[cfg(all(not(unix), not(feature = "http")))]
+    drop(control);
     #[cfg(not(feature = "http"))]
     let raw_hub = crate::rawhub::RawHub::new(
         crate::limits::current().ws_raw_max_bytes,

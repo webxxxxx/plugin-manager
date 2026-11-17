@@ -69,7 +69,7 @@ fn resolve_bind(env: Option<&str>, configured: Option<SocketAddr>) -> SocketAddr
 pub fn spawn(
     config: PathBuf,
     raw_hub: Arc<crate::rawhub::RawHub>,
-    control: Option<crate::channel::ControlServer>,
+    control: crate::channel::ControlBinding,
 ) -> std::io::Result<Arc<Api>> {
     let configured = settings::current().ok().and_then(|settings| settings.bind);
     let requested = resolve_bind(std::env::var("SVCD_BIND").ok().as_deref(), configured);

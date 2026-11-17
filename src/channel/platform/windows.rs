@@ -54,9 +54,9 @@ pub(crate) struct Incoming {
 }
 
 /// The thread-per-connection fallback owns the accept loop. It is started by
-/// [`Platform::serve`] and the value itself is only a marker the composition
-/// root hands to the driver that owns the HTTP loop.
-pub(crate) struct ControlServer;
+/// [`Platform::into_server`] and the value itself is only a marker the
+/// composition root hands to the driver that owns the HTTP loop.
+pub(crate) struct ControlBinding;
 
 /// The wake pipe has no Windows counterpart in this channel: the supervisor's
 /// reply is picked up by the thread that owns the connection.
@@ -196,13 +196,13 @@ impl Write for Stream {
 impl ControlChannel for Platform {
     type Stream = Stream;
     type Listener = Listener;
-    type Server = ControlServer;
+    type Server = ControlBinding;
 
     fn bind(config: &Path) -> io::Result<Self::Listener> {
         Listener::bind(config)
     }
 
-    fn serve(
+    fn into_server(
         listener: Self::Listener,
         pending: SyncSender<PendingCall>,
         wake: Arc<Wake>,
@@ -224,10 +224,10 @@ impl ControlChannel for Platform {
                     let _ = std::thread::Builder::new()
                         .name("svcd-channel-conn".into())
                         .stack_size(threads::io_stack())
-                        .spawn(move || serve(stream, pending, wake));
+                        .spawn(move || serve_connection(stream, pending, wake));
                 }
             })
-            .map(|_| ControlServer)
+            .map(|_| ControlBinding)
     }
 
     fn connect(config: &Path) -> io::Result<Self::Stream> {
@@ -276,7 +276,7 @@ impl ControlChannel for Platform {
 }
 
 /// One thread per control connection, exactly like the old fallback.
-fn serve(stream: Stream, tx: SyncSender<PendingCall>, wake: Arc<Wake>) {
+fn serve_connection(stream: Stream, tx: SyncSender<PendingCall>, wake: Arc<Wake>) {
     let mut reader = BufReader::new(stream);
     loop {
         let line = match ipc::read_frame_limit(&mut reader, ipc::LOCAL_FRAME_MAX) {

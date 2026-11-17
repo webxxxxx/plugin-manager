@@ -21,13 +21,13 @@ pub(crate) struct Stream(UnixStream);
 
 /// The bound server half. Unix hands the listener to the server loop; nothing
 /// is accepted off-thread.
-pub(crate) struct ControlServer {
+pub(crate) struct ControlBinding {
     listener: Listener,
     pending: SyncSender<PendingCall>,
     wake: Arc<Wake>,
 }
 
-impl ControlServer {
+impl ControlBinding {
     /// Split the server into the listener and the plumbing its loop owns.
     /// Called by `server::control` (Unix-only), so the raw socket type does not
     /// leak into `daemon.rs`.
@@ -123,18 +123,18 @@ impl Write for Stream {
 impl ControlChannel for Platform {
     type Stream = Stream;
     type Listener = Listener;
-    type Server = ControlServer;
+    type Server = ControlBinding;
 
     fn bind(config: &Path) -> io::Result<Self::Listener> {
         Listener::bind(config)
     }
 
-    fn serve(
+    fn into_server(
         listener: Self::Listener,
         pending: SyncSender<PendingCall>,
         wake: Arc<Wake>,
     ) -> io::Result<Self::Server> {
-        Ok(ControlServer {
+        Ok(ControlBinding {
             listener,
             pending,
             wake,

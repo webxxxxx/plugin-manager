@@ -25,7 +25,7 @@ use crate::ipc;
 use crate::wake::Wake;
 
 use platform::Platform;
-pub(crate) use platform::{ControlServer, Notify, Stream};
+pub(crate) use platform::{ControlBinding, Notify, Stream};
 
 /// One message from an outbound streaming management call. The control
 /// channel owns this shape; the MCP session consumes it.
@@ -102,8 +102,8 @@ pub(crate) trait ControlChannel {
     fn bind(config: &Path) -> io::Result<Self::Listener>;
 
     /// Turn a bound endpoint into the server the composition root will run:
-    /// the listener itself on a poll host, a started accept thread otherwise.
-    fn serve(
+    /// the carrier itself on a poll host, a started accept thread otherwise.
+    fn into_server(
         listener: Self::Listener,
         pending: SyncSender<PendingCall>,
         wake: Arc<Wake>,
@@ -188,8 +188,8 @@ pub fn bind_server(
     config: &Path,
     pending: SyncSender<PendingCall>,
     wake: Arc<Wake>,
-) -> io::Result<ControlServer> {
-    Platform::serve(Platform::bind(config)?, pending, wake)
+) -> io::Result<ControlBinding> {
+    Platform::into_server(Platform::bind(config)?, pending, wake)
 }
 
 const POOL_MAX: usize = 8;
@@ -480,11 +480,13 @@ pub fn remove_socket(config: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::platform::Listener;
+    use super::platform::Platform;
     use super::*;
     use std::io::Write;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    type Listener = <Platform as ControlChannel>::Listener;
 
     fn config_dir(tag: &str) -> PathBuf {
         let directory = crate::test_support::temp_dir().join(format!(
@@ -520,10 +522,12 @@ mod tests {
         assert_channel::<Platform>();
     }
 
-    /// The token survives a second start and keeps the platform's private
-    /// permission: the CLI reads exactly the token the daemon created.
+    /// The token survives a second start, so the CLI reads exactly the token
+    /// the daemon created. The platform permission is covered by the
+    /// implementation's own test (POSIX mode on Unix; the Windows DACL seam is
+    /// the C8 deferral).
     #[test]
-    fn the_token_is_stable_and_private() {
+    fn the_token_is_stable_across_starts() {
         let config = config_dir("token");
         let first = ensure_token(&config).expect("first token");
         let second = ensure_token(&config).expect("second token");

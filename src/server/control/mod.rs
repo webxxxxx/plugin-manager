@@ -27,7 +27,7 @@ use self::listener::{ControlServer, Source};
 
 /// Start the server loop for the minimal (no HTTP) build: control channel only.
 #[cfg_attr(feature = "http", allow(dead_code))]
-pub fn spawn_control_only(control: crate::channel::ControlServer) -> std::io::Result<LoopHandle> {
+pub fn spawn_control_only(control: crate::channel::ControlBinding) -> std::io::Result<LoopHandle> {
     let (listener, tx, wake) = control.into_parts();
     let (notify_rx, notify_tx) = UnixStream::pair()?;
     notify_rx.set_nonblocking(true)?;

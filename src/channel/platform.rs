@@ -8,16 +8,10 @@
 
 #[cfg(unix)]
 mod unix;
-/// The bound half is named directly by the channel's platform-neutral tests.
-#[cfg(all(test, unix))]
-pub(crate) use unix::Listener;
 #[cfg(unix)]
-pub(crate) use unix::{ControlServer, Notify, Platform, Stream};
+pub(crate) use unix::{ControlBinding, Notify, Platform, Stream};
 
 #[cfg(windows)]
 mod windows;
-/// The bound half is named directly by the channel's platform-neutral tests.
-#[cfg(all(test, windows))]
-pub(crate) use windows::Listener;
 #[cfg(windows)]
-pub(crate) use windows::{ControlServer, Notify, Platform, Stream};
+pub(crate) use windows::{ControlBinding, Notify, Platform, Stream};

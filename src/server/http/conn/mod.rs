@@ -45,11 +45,6 @@ pub(crate) trait ConnectionDriver {
     fn start(input: StartInput) -> io::Result<ServerHandle>;
 }
 
-/// The bound control channel. A driver that can merge the control channel into
-/// its wait set consumes the listener; a driver that cannot leaves it to the
-/// channel's own accept thread.
-pub(crate) type ControlPlumbing = crate::channel::ControlServer;
-
 /// Handle over the running driver.
 pub(crate) struct ServerHandle {
     #[cfg(unix)]
@@ -105,7 +100,7 @@ pub(crate) struct StartInput {
     /// The bound control channel. The poll loop merges its listener into the
     /// wait set; the thread driver ignores it because the channel already runs
     /// its own accept thread on that host.
-    pub control: Option<ControlPlumbing>,
+    pub control: crate::channel::ControlBinding,
     /// The per-connection driver, used when no poll loop runs.
     pub threads: ThreadDriver,
 }
