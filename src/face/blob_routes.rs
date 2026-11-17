@@ -9,12 +9,13 @@ use serde_json::{json, Value};
 
 use crate::blob;
 use crate::http;
+use crate::paths::Paths;
 
 use super::support;
 
 
-pub fn create_upload(kind: blob::UploadKind) -> Vec<u8> {
-    match blob::create_upload(kind) {
+pub fn create_upload(paths: &Paths, kind: blob::UploadKind) -> Vec<u8> {
+    match blob::create_upload(paths, kind) {
         Ok(id) => {
             let prefix = match kind {
                 blob::UploadKind::Blob => "blobs",
@@ -39,11 +40,11 @@ pub fn create_upload(kind: blob::UploadKind) -> Vec<u8> {
     }
 }
 
-pub fn upload_status(kind: blob::UploadKind, id: &str) -> Vec<u8> {
+pub fn upload_status(paths: &Paths, kind: blob::UploadKind, id: &str) -> Vec<u8> {
     if !blob::valid_upload_id(id) {
         return http::json_error(400, "bad_request", "invalid upload id");
     }
-    match blob::upload_parts(id, kind) {
+    match blob::upload_parts(paths, id, kind) {
         Ok(parts) => {
             let total: u64 = parts.iter().map(|part| part.size).sum();
             let parts: Vec<Value> = parts
@@ -68,11 +69,11 @@ pub fn upload_status(kind: blob::UploadKind, id: &str) -> Vec<u8> {
     }
 }
 
-pub fn file_upload_complete(id: &str, body: &[u8]) -> Vec<u8> {
+pub fn file_upload_complete(paths: &Paths, id: &str, body: &[u8]) -> Vec<u8> {
     if !blob::valid_upload_id(id) {
         return http::json_error(400, "bad_request", "invalid upload id");
     }
-    if let Some(response) = kind_rejection(id, blob::UploadKind::File) {
+    if let Some(response) = kind_rejection(paths, id, blob::UploadKind::File) {
         return response;
     }
     let mut requested = None;
@@ -144,7 +145,7 @@ pub fn file_upload_complete(id: &str, body: &[u8]) -> Vec<u8> {
             );
         }
     }
-    match blob::complete_file(id, requested, name, mime_type) {
+    match blob::complete_file(paths, id, requested, name, mime_type) {
         Ok(meta) => {
             let body = serde_json::to_vec(&json!({
                 "id": meta.id,
@@ -163,11 +164,11 @@ pub fn file_upload_complete(id: &str, body: &[u8]) -> Vec<u8> {
     }
 }
 
-pub fn abort_upload(kind: blob::UploadKind, id: &str) -> Vec<u8> {
+pub fn abort_upload(paths: &Paths, kind: blob::UploadKind, id: &str) -> Vec<u8> {
     if !blob::valid_upload_id(id) {
         return http::json_error(400, "bad_request", "invalid upload id");
     }
-    match blob::abort_upload(id, kind) {
+    match blob::abort_upload(paths, id, kind) {
         Ok(()) => http::response(
             200,
             "application/json",
@@ -177,18 +178,18 @@ pub fn abort_upload(kind: blob::UploadKind, id: &str) -> Vec<u8> {
     }
 }
 
-fn kind_rejection(id: &str, kind: blob::UploadKind) -> Option<Vec<u8>> {
-    match blob::require_upload_kind(id, kind) {
+fn kind_rejection(paths: &Paths, id: &str, kind: blob::UploadKind) -> Option<Vec<u8>> {
+    match blob::require_upload_kind(paths, id, kind) {
         Ok(()) => None,
         Err(error) => Some(support::storage_response(&error)),
     }
 }
 
-pub fn complete_upload(id: &str, body: &[u8]) -> Vec<u8> {
+pub fn complete_upload(paths: &Paths, id: &str, body: &[u8]) -> Vec<u8> {
     if !blob::valid_upload_id(id) {
         return http::json_error(400, "bad_request", "invalid upload id");
     }
-    if let Some(response) = kind_rejection(id, blob::UploadKind::Blob) {
+    if let Some(response) = kind_rejection(paths, id, blob::UploadKind::Blob) {
         return response;
     }
     let requested = if body.is_empty() {
@@ -218,7 +219,7 @@ pub fn complete_upload(id: &str, body: &[u8]) -> Vec<u8> {
         }
         Some(requested)
     };
-    match blob::complete_upload(id, requested) {
+    match blob::complete_upload(paths, id, requested) {
         Ok(meta) => {
             let body =
                 serde_json::to_vec(&json!({"id": meta.id, "size": meta.size})).unwrap_or_default();

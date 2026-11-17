@@ -37,7 +37,6 @@ use windows_sys::Win32::System::Services::{
 
 use crate::channel;
 use crate::install::SCM_NAME;
-use crate::paths;
 
 /// The SCM gives a start request 30 seconds; report the same hint and probe for
 /// readiness well inside it.
@@ -187,7 +186,13 @@ fn wait_until_ready(daemon: &JoinHandle<i32>) -> bool {
         if daemon.is_finished() {
             return false;
         }
-        if channel::request(&paths::config_dir(), "svcd.ping", serde_json::json!({})).is_ok() {
+        // The daemon bootstrap fills the settings cache; before that the platform
+        // default is the same endpoint the daemon will use. Resolution is
+        // tolerant here: a probe must never make service start fail.
+        let paths = crate::paths::Paths::resolve(
+            &crate::settings::current().cloned().unwrap_or_default(),
+        );
+        if channel::request(&paths.config_dir, "svcd.ping", serde_json::json!({})).is_ok() {
             return true;
         }
         if Instant::now() >= deadline {

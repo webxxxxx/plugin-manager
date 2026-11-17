@@ -12,7 +12,7 @@ use crate::kernel::contract::ProgressToken;
 use crate::kernel::contract::{Contract, Control, Invocation, Reply, ReplySink, Settled, Wire};
 use crate::kernel::failure::{Class, Failure, Rejection, Retry};
 use crate::log::{self, LogSink};
-use crate::paths;
+use crate::paths::Paths;
 use crate::registry::{Exec, Hook, Interpreter, Lifecycle, Ready, Restart, State};
 use crate::rpc;
 use crate::stdio::{self, Plan, Streams, Target};
@@ -36,6 +36,9 @@ pub(crate) const FRAME_QUEUE: usize = 256;
 /// deadlines the machine's actions drive.
 pub(crate) struct Slot {
     id: String,
+    /// The directory set this slot uses for its log, its child environment and
+    /// the blob store. Resolved once at the composition root.
+    paths: Arc<Paths>,
     pub(crate) machine: Machine,
     exec: Exec,
     protocol: u32,
@@ -291,10 +294,12 @@ impl Slot {
         exec: Exec,
         lifecycle: Option<Lifecycle>,
         restart: Restart,
+        paths: Arc<Paths>,
     ) -> Self {
         let (request_tx, request_rx) = mpsc::sync_channel(CALL_QUEUE);
         Slot {
             id,
+            paths,
             machine: Machine::new(restart),
             exec,
             protocol: 1,
@@ -734,11 +739,11 @@ impl Slot {
             .as_ref()
             .and_then(|lifecycle| lifecycle.start.as_ref());
         let mut command = match start {
-            Some(hook) => service_hook_command(&self.id, "start", hook),
+            Some(hook) => service_hook_command(&self.id, "start", hook, &self.paths),
             None => command_for(&self.exec),
         };
-        let blob_dir = crate::blob::dir();
-        let _ = std::fs::create_dir_all(crate::blob::incoming_dir());
+        let blob_dir = crate::blob::dir(&self.paths);
+        let _ = std::fs::create_dir_all(crate::blob::incoming_dir(&self.paths));
         command.env("SVCD_TEMP_DIR", &blob_dir);
         let plan = match self.exec.ready {
             Ready::Notify => Plan::notify(),
@@ -761,7 +766,7 @@ impl Slot {
             }
         }
         let pid = child.id();
-        let log = match LogSink::open(&paths::logs_dir(), &self.id) {
+        let log = match LogSink::open(&self.paths.logs_dir, &self.id) {
             Ok(sink) => Some(Arc::new(Mutex::new(sink))),
             Err(error) => {
                 log::svcd(&format!(
@@ -1004,7 +1009,7 @@ impl Slot {
             Err(Failure::from_plugin_error(error))
         } else if let Some(result) = message.get("result") {
             let mut result = result.clone();
-            match crate::blob::materialize_result(&mut result) {
+            match crate::blob::materialize_result(&self.paths, &mut result) {
                 Ok(()) => Ok(result),
                 Err(error) => Err(Failure::new(
                     Class::ImplementationError,
@@ -1260,7 +1265,7 @@ impl Slot {
         else {
             return false;
         };
-        let command = hook_command(&self.id, "stop", hook);
+        let command = hook_command(&self.id, "stop", hook, &self.paths);
         match stdio::spawn(command, Plan::stop_hook()) {
             Ok((child, streams)) => {
                 let _ = crate::platform::host::process::adopt(&child);
@@ -1268,7 +1273,7 @@ impl Slot {
                     // The stop action's own children belong to the service tree.
                     tree.assign(&child);
                 }
-                let log = LogSink::open(&paths::logs_dir(), &self.id)
+                let log = LogSink::open(&self.paths.logs_dir, &self.id)
                     .ok()
                     .map(|sink| Arc::new(Mutex::new(sink)));
                 if let Some(stderr) = streams.stderr {
@@ -1451,17 +1456,23 @@ fn command_for(exec: &Exec) -> Command {
     }
 }
 
-pub(crate) fn hook_command(id: &str, action: &str, hook: &Hook) -> Command {
-    build_action_command(id, action, hook, true)
+pub(crate) fn hook_command(id: &str, action: &str, hook: &Hook, paths: &Paths) -> Command {
+    build_action_command(id, action, hook, true, paths)
 }
 
 /// A `lifecycle.start` action *is* the supervised foreground process, so it is
 /// adoptable after a daemon restart just like `exec`.
-pub(crate) fn service_hook_command(id: &str, action: &str, hook: &Hook) -> Command {
-    build_action_command(id, action, hook, false)
+pub(crate) fn service_hook_command(id: &str, action: &str, hook: &Hook, paths: &Paths) -> Command {
+    build_action_command(id, action, hook, false, paths)
 }
 
-fn build_action_command(id: &str, action: &str, hook: &Hook, hook_lifetime: bool) -> Command {
+fn build_action_command(
+    id: &str,
+    action: &str,
+    hook: &Hook,
+    hook_lifetime: bool,
+    paths: &Paths,
+) -> Command {
     let mut command = match &hook.interpreter {
         Some(interpreter) => command_for_interpreter(
             interpreter,
@@ -1475,9 +1486,9 @@ fn build_action_command(id: &str, action: &str, hook: &Hook, hook_lifetime: bool
     command
         .env("SVCD_SERVICE_ID", id)
         .env("SVCD_ACTION", action)
-        .env("SVCD_DATA_DIR", paths::data_dir())
-        .env("SVCD_CONFIG_DIR", paths::config_dir())
-        .env("SVCD_LOG_DIR", paths::logs_dir());
+        .env("SVCD_DATA_DIR", &paths.data_dir)
+        .env("SVCD_CONFIG_DIR", &paths.config_dir)
+        .env("SVCD_LOG_DIR", &paths.logs_dir);
     command
 }
 
@@ -1600,13 +1611,36 @@ mod tests {
         }
     }
 
+    /// Every slot test owns its tree; nothing here reads or writes the
+    /// process environment.
+    fn test_paths() -> Arc<Paths> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = crate::test_support::temp_dir().join(format!(
+            "svcd-slot-unit-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        let paths = Paths::under(&root);
+        std::fs::create_dir_all(&paths.logs_dir).expect("logs");
+        Arc::new(paths)
+    }
+
     fn with_projector(mut slot: Slot) -> Slot {
         slot.set_projector(Arc::new(test_projector));
         slot
     }
 
     fn slot() -> Slot {
-        with_projector(Slot::new("demo".into(), exec(), None, Restart::OnFailure))
+        with_projector(Slot::new(
+            "demo".into(),
+            exec(),
+            None,
+            Restart::OnFailure,
+            test_paths(),
+        ))
     }
 
     fn queue(slot: &mut Slot, id: u64, deadline: u64) -> Receiver<String> {
@@ -1673,7 +1707,7 @@ mod tests {
             }),
         };
 
-        let command = hook_command("demo", "stop", &hook);
+        let command = hook_command("demo", "stop", &hook, &test_paths());
         let args: Vec<String> = command
             .get_args()
             .map(|argument| argument.to_string_lossy().to_string())
@@ -1697,6 +1731,7 @@ mod tests {
             exec(),
             None,
             Restart::OnFailure,
+            test_paths(),
         ));
         slot.set_notifier(Arc::new(move |method: &str, params: &Value| {
             let _ = tx.send((method.to_string(), params.clone()));
@@ -1889,8 +1924,8 @@ mod tests {
             .as_nanos();
         let root =
             crate::test_support::temp_dir().join(format!("svcd-ipc-unit-{}-{}", std::process::id(), nanos));
-        fs::create_dir_all(root.join("logs")).expect("logs");
-        std::env::set_var("SVCD_LOG_DIR", root.join("logs"));
+        let paths = Arc::new(Paths::under(&root));
+        fs::create_dir_all(&paths.logs_dir).expect("logs");
 
         let script = root.join("agent.sh");
         fs::write(
@@ -1920,7 +1955,13 @@ done
             ready: Ready::Notify,
             interpreter: None,
         };
-        let mut slot = with_projector(Slot::new("demo".into(), exec, None, Restart::OnFailure));
+        let mut slot = with_projector(Slot::new(
+            "demo".into(),
+            exec,
+            None,
+            Restart::OnFailure,
+            paths,
+        ));
         slot.set_protocol_only(true);
         let started = Instant::now();
         slot.apply(Event::Start, 0);

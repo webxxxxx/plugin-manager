@@ -13,7 +13,7 @@ use crate::channel;
 use crate::compat;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::package;
-use crate::paths;
+use crate::config::Config;
 use crate::plugin;
 use crate::registry::Kind;
 use crate::status::{self, Status};
@@ -91,38 +91,45 @@ pub fn run(args: Vec<String>) -> i32 {
             return EXIT_USAGE;
         }
     };
+    let config = match Config::bootstrap(None) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("plugin: invalid config: {}", error);
+            return 1;
+        }
+    };
     match command {
-        Command::List => list(),
-        Command::Status { id, json } => status_command(&id, json),
-        Command::Start { id } => lifecycle("start", &id),
-        Command::Stop { id } => lifecycle("stop", &id),
-        Command::Restart { id } => lifecycle("restart", &id),
-        Command::Enable { id } => lifecycle("enable", &id),
-        Command::Disable { id } => lifecycle("disable", &id),
+        Command::List => list(&config),
+        Command::Status { id, json } => status_command(&config, &id, json),
+        Command::Start { id } => lifecycle(&config, "start", &id),
+        Command::Stop { id } => lifecycle(&config, "stop", &id),
+        Command::Restart { id } => lifecycle(&config, "restart", &id),
+        Command::Enable { id } => lifecycle(&config, "enable", &id),
+        Command::Disable { id } => lifecycle(&config, "disable", &id),
         Command::Install {
             path,
             strategy,
             allow_hooks,
-        } => install(&path, &strategy, allow_hooks),
-        Command::Verify { path, json, pubkey } => verify(&path, json, pubkey.as_deref()),
-        Command::Uninstall { id, purge } => uninstall(&id, purge),
+        } => install(&config, &path, &strategy, allow_hooks),
+        Command::Verify { path, json, pubkey } => verify(&config, &path, json, pubkey.as_deref()),
+        Command::Uninstall { id, purge } => uninstall(&config, &id, purge),
         Command::EditConfig {
             id,
             print,
             file,
             reset,
-        } => edit_config(&id, print, file.as_deref(), reset),
+        } => edit_config(&config, &id, print, file.as_deref(), reset),
         Command::Export {
             id,
             config_only,
             out,
-        } => export(&id, config_only, out.as_deref()),
+        } => export(&config, &id, config_only, out.as_deref()),
         Command::Import {
             path,
             config_id,
             no_config,
             force,
-        } => import(&path, config_id.as_deref(), no_config, force),
+        } => import(&config, &path, config_id.as_deref(), no_config, force),
         Command::Bundle(options) => bundle_command(options),
     }
 }
@@ -511,8 +518,8 @@ fn parse(args: &[String]) -> Result<Command, ()> {
     }
 }
 
-fn list() -> i32 {
-    let response = match channel::request(&paths::config_dir(), "svc.list", json!({})) {
+fn list(config: &Config) -> i32 {
+    let response = match channel::request(&config.paths.config_dir, "svc.list", json!({})) {
         Ok(response) => response,
         Err(error) => return unreachable(&error),
     };
@@ -543,8 +550,8 @@ fn list() -> i32 {
     EXIT_OK
 }
 
-fn status_command(id: &str, json: bool) -> i32 {
-    let status = match fetch_status(id, true) {
+fn status_command(config: &Config, id: &str, json: bool) -> i32 {
+    let status = match fetch_status(config, id, true) {
         Ok(status) => status,
         Err(code) => return code,
     };
@@ -555,8 +562,8 @@ fn status_command(id: &str, json: bool) -> i32 {
     print_status(status, json)
 }
 
-fn lifecycle(verb: &str, id: &str) -> i32 {
-    let status = match fetch_status(id, false) {
+fn lifecycle(config: &Config, verb: &str, id: &str) -> i32 {
+    let status = match fetch_status(config, id, false) {
         Ok(status) => status,
         Err(code) => return code,
     };
@@ -565,13 +572,13 @@ fn lifecycle(verb: &str, id: &str) -> i32 {
         return EXIT_SERVICE_ERROR;
     }
     let method = format!("svc.{}", verb);
-    match request(&method, json!({ "id": id })) {
+    match request(config, &method, json!({ "id": id })) {
         Ok(status) => print_status(status, false),
         Err(code) => code,
     }
 }
 
-fn install(path: &PathBuf, strategy: &str, allow_hooks: bool) -> i32 {
+fn install(config: &Config, path: &PathBuf, strategy: &str, allow_hooks: bool) -> i32 {
     // The daemon runs `plugin::verify` before it touches the plugin tree; the
     // same function backs `plugin verify`. Checking here as well would read
     // trust.d and svcd.conf in the caller's environment instead of the
@@ -583,7 +590,7 @@ fn install(path: &PathBuf, strategy: &str, allow_hooks: bool) -> i32 {
             return EXIT_SERVICE_ERROR;
         }
     };
-    match request(
+    match request(config, 
         "plugin.install",
         json!({
             "path": path.to_string_lossy(),
@@ -596,7 +603,7 @@ fn install(path: &PathBuf, strategy: &str, allow_hooks: bool) -> i32 {
     }
 }
 
-fn verify(path: &Path, json: bool, pubkey: Option<&Path>) -> i32 {
+fn verify(config: &Config, path: &Path, json: bool, pubkey: Option<&Path>) -> i32 {
     let file = file_name(path);
     if let Ok(metadata) = fs::metadata(path) {
         if metadata.len() > package::MAX_PACKAGE_BYTES {
@@ -633,11 +640,15 @@ fn verify(path: &Path, json: bool, pubkey: Option<&Path>) -> i32 {
         },
         None => None,
     };
-    let inspection = match package::inspect_bytes_with(&bytes, explicit_key.as_deref()) {
+    let inspection = match package::inspect_bytes_with(
+        &bytes,
+        explicit_key.as_deref(),
+        &config.paths.trust_dir,
+    ) {
         Ok(inspection) => inspection,
         Err(error) => return verify_failure(&file, error.detail(), json),
     };
-    let host = verify_host(&inspection);
+    let host = verify_host(config, &inspection);
     if json {
         return match serde_json::to_string_pretty(&verify_json(&file, &bytes, &inspection, &host)) {
             Ok(text) => {
@@ -678,8 +689,8 @@ struct VerifyHost {
     interpreter: Option<String>,
 }
 
-fn verify_host(inspection: &package::Inspection) -> VerifyHost {
-    let host = compat::detect(MAX_SCHEMA, MAX_PROTOCOL);
+fn verify_host(config: &Config, inspection: &package::Inspection) -> VerifyHost {
+    let host = compat::detect(&config.paths, MAX_SCHEMA, MAX_PROTOCOL);
     VerifyHost {
         matches_host: inspection.package.manifest.platform == host.platform,
         device: host.device,
@@ -751,9 +762,9 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-fn uninstall(id: &str, purge: bool) -> i32 {
+fn uninstall(config: &Config, id: &str, purge: bool) -> i32 {
     match channel::request(
-        &paths::config_dir(),
+        &config.paths.config_dir,
         "plugin.uninstall",
         json!({ "id": id, "purge": purge }),
     ) {
@@ -771,9 +782,15 @@ fn uninstall(id: &str, purge: bool) -> i32 {
     }
 }
 
-fn edit_config(id: &str, print: bool, file: Option<&Path>, reset: bool) -> i32 {
+fn edit_config(
+    config: &Config,
+    id: &str,
+    print: bool,
+    file: Option<&Path>,
+    reset: bool,
+) -> i32 {
     if print {
-        let Some(path) = plugin::active_config(id) else {
+        let Some(path) = plugin::active_config(&config.paths, id) else {
             eprintln!("plugin: {} has no config", id);
             return EXIT_SERVICE_ERROR;
         };
@@ -792,7 +809,7 @@ fn edit_config(id: &str, print: bool, file: Option<&Path>, reset: bool) -> i32 {
         eprintln!("plugin: {}", error);
         return EXIT_SERVICE_ERROR;
     }
-    let _lock = match plugin::lock_config(id) {
+    let _lock = match plugin::lock_config(&config.paths, id) {
         Ok(lock) => lock,
         Err(error) => {
             eprintln!("plugin: {}", error);
@@ -801,7 +818,7 @@ fn edit_config(id: &str, print: bool, file: Option<&Path>, reset: bool) -> i32 {
     };
 
     let candidate = if reset {
-        match plugin::config_template(id) {
+        match plugin::config_template(&config.paths, id) {
             Some((data, _)) => data,
             None => {
                 eprintln!("plugin: {} has no config template", id);
@@ -817,7 +834,7 @@ fn edit_config(id: &str, print: bool, file: Option<&Path>, reset: bool) -> i32 {
             }
         }
     } else {
-        match edit_with_editor(id) {
+        match edit_with_editor(config, id) {
             Ok(data) => data,
             Err(error) => {
                 eprintln!("plugin: {}", error);
@@ -826,7 +843,7 @@ fn edit_config(id: &str, print: bool, file: Option<&Path>, reset: bool) -> i32 {
         }
     };
 
-    match plugin::replace_config(id, &candidate, true) {
+    match plugin::replace_config(&config.paths, id, &candidate, true) {
         Ok(()) => {
             println!("config updated; restart the plugin to apply");
             EXIT_OK
@@ -846,14 +863,14 @@ fn read_config(path: &Path) -> Result<Vec<u8>, String> {
     Ok(data)
 }
 
-fn edit_with_editor(id: &str) -> Result<Vec<u8>, String> {
-    let initial = plugin::active_config(id)
+fn edit_with_editor(config: &Config, id: &str) -> Result<Vec<u8>, String> {
+    let initial = plugin::active_config(&config.paths, id)
         .map(|path| fs::read(&path))
         .transpose()
         .map_err(|error| format!("read config: {}", error))?
-        .or_else(|| plugin::config_template(id).map(|(data, _)| data))
+        .or_else(|| plugin::config_template(&config.paths, id).map(|(data, _)| data))
         .ok_or_else(|| format!("plugin {} has no config", id))?;
-    let directory = plugin::plugin_dir(id);
+    let directory = plugin::plugin_dir(&config.paths, id);
     let temporary = directory.join(format!("config.edit.{}", std::process::id()));
     plugin::write_config(&temporary, &initial).map_err(|error| error.detail().to_string())?;
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
@@ -876,9 +893,9 @@ fn edit_with_editor(id: &str) -> Result<Vec<u8>, String> {
     Ok(data)
 }
 
-fn export(id: &str, config_only: bool, out: Option<&Path>) -> i32 {
+fn export(config: &Config, id: &str, config_only: bool, out: Option<&Path>) -> i32 {
     let (version, data, extension) = if config_only {
-        match plugin::export_config(id) {
+        match plugin::export_config(&config.paths, id) {
             Ok((version, data)) => (version, data, "config"),
             Err(error) => {
                 eprintln!("plugin: {}", error);
@@ -886,7 +903,7 @@ fn export(id: &str, config_only: bool, out: Option<&Path>) -> i32 {
             }
         }
     } else {
-        match plugin::export_spkb(id) {
+        match plugin::export_spkb(&config.paths, id) {
             Ok((version, data)) => (version, data, "spkb"),
             Err(error) => {
                 eprintln!("plugin: {}", error);
@@ -905,7 +922,13 @@ fn export(id: &str, config_only: bool, out: Option<&Path>) -> i32 {
     EXIT_OK
 }
 
-fn import(path: &Path, config_id: Option<&str>, no_config: bool, force: bool) -> i32 {
+fn import(
+    config: &Config,
+    path: &Path,
+    config_id: Option<&str>,
+    no_config: bool,
+    force: bool,
+) -> i32 {
     let data = match fs::read(path) {
         Ok(data) => data,
         Err(error) => {
@@ -913,7 +936,7 @@ fn import(path: &Path, config_id: Option<&str>, no_config: bool, force: bool) ->
             return EXIT_SERVICE_ERROR;
         }
     };
-    match transfer::import(&data, config_id, no_config, force, true) {
+    match transfer::import(&config.paths, &data, config_id, no_config, force, true) {
         Ok(outcome) => {
             for warning in &outcome.warnings {
                 eprintln!("plugin: warning: {}", warning);
@@ -968,18 +991,18 @@ fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn fetch_status(id: &str, probe: bool) -> Result<Status, i32> {
+fn fetch_status(config: &Config, id: &str, probe: bool) -> Result<Status, i32> {
     // Match `svc status`: a plugin lifecycle `status` action runs only for the
     // status command, not as a side effect of start/stop.
     let mut params = json!({ "id": id });
     if probe {
         params["probe"] = json!(true);
     }
-    request("svc.status", params)
+    request(config, "svc.status", params)
 }
 
-fn request(method: &str, params: Value) -> Result<Status, i32> {
-    let response = match channel::request(&paths::config_dir(), method, params) {
+fn request(config: &Config, method: &str, params: Value) -> Result<Status, i32> {
+    let response = match channel::request(&config.paths.config_dir, method, params) {
         Ok(response) => response,
         Err(error) => return Err(unreachable(&error)),
     };

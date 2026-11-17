@@ -36,9 +36,17 @@ impl Config {
     /// whole configuration use this with [`Paths::under`] instead of the
     /// process environment.
     pub fn new(settings: Settings, settings_path: Option<PathBuf>) -> Config {
+        let paths = Paths::resolve(&settings);
+        Self::with_paths(settings, settings_path, paths)
+    }
+
+    /// The same value with an explicit directory set. Production derives it
+    /// from the document; a unit test passes [`Paths::under`] and owns the
+    /// whole tree without touching the process environment.
+    pub fn with_paths(settings: Settings, settings_path: Option<PathBuf>, paths: Paths) -> Config {
         let limits = limits::derive(&settings);
         Config {
-            paths: Arc::new(Paths::resolve(&settings)),
+            paths: Arc::new(paths),
             settings: Arc::new(settings),
             settings_path,
             limits,

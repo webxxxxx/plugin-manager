@@ -9,18 +9,18 @@
 //! ordinary management surface, the console page and login/logout.
 
 use std::io;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
+use crate::config::Config;
 use crate::http;
 use crate::kernel::failure::ProblemError;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::lan::{self, AuthKind, Lan};
 use crate::log;
 use crate::package;
-use crate::paths;
+use crate::paths::Paths;
 use crate::plugin;
 use crate::server::http::{
     BodyPolicy, Completion, Dispatch, Exchange, Face, Request, Response, Route,
@@ -34,16 +34,17 @@ use super::support::{self, CallBudget};
 
 /// The management API face.
 pub struct ApiFace {
-    config: PathBuf,
+    config: Arc<Config>,
     lan: Arc<Mutex<Lan>>,
 }
 
 impl ApiFace {
-    pub fn new(config: impl Into<PathBuf>, lan: Arc<Mutex<Lan>>) -> ApiFace {
-        ApiFace {
-            config: config.into(),
-            lan,
-        }
+    pub fn new(config: Arc<Config>, lan: Arc<Mutex<Lan>>) -> ApiFace {
+        ApiFace { config, lan }
+    }
+
+    fn paths(&self) -> &Paths {
+        &self.config.paths
     }
 
     fn rpc(
@@ -52,11 +53,11 @@ impl ApiFace {
         method: &str,
         params: Value,
     ) -> Result<Value, Response> {
-        support::rpc_result(&self.config, method, params, budget).map_err(rpc_error)
+        support::rpc_result(&self.config.paths.config_dir, method, params, budget).map_err(rpc_error)
     }
 
     fn require_plugin(&self, budget: &CallBudget, id: &str) -> Result<(), Response> {
-        support::require_plugin_result(&self.config, id, budget)
+        support::require_plugin_result(&self.config.paths.config_dir, id, budget)
             .map_err(|(status, code, message)| error_response(status, code, &message))
     }
 
@@ -67,7 +68,7 @@ impl ApiFace {
                 let services: Vec<Value> = value
                     .get("services")
                     .and_then(Value::as_array)
-                    .map(|services| services.iter().filter_map(project_service).collect())
+                    .map(|services| services.iter().filter_map(|service| project_service(service, &self.config.paths)).collect())
                     .unwrap_or_default();
                 Response::json(200, &json!({ "services": services }))
             }
@@ -93,7 +94,7 @@ impl ApiFace {
         if !package::valid_name(id) {
             return error_response(404, "not_found", &format!("unknown plugin UI: {}", id));
         }
-        if plugin::web_assets(id).is_none() {
+        if plugin::web_assets(&self.config.paths, id).is_none() {
             return error_response(404, "not_found", &format!("plugin {} has no web UI", id));
         }
         let token = match self.lan.lock() {
@@ -121,7 +122,7 @@ impl ApiFace {
         if let Err(response) = self.require_plugin(budget, id) {
             return response;
         }
-        let Some(path) = plugin::active_config(id) else {
+        let Some(path) = plugin::active_config(&self.config.paths, id) else {
             return error_response(404, "not_found", &format!("plugin {} has no config", id));
         };
         match std::fs::read(&path) {
@@ -135,11 +136,11 @@ impl ApiFace {
             return response;
         }
         let _guard = plugin::config_lock();
-        let _lock = match plugin::lock_config(id) {
+        let _lock = match plugin::lock_config(&self.config.paths, id) {
             Ok(lock) => lock,
             Err(error) => return problem_error_response(&error),
         };
-        match plugin::replace_config(id, body, true) {
+        match plugin::replace_config(&self.config.paths, id, body, true) {
             Ok(()) => Response::json(200, &json!({ "ok": true })),
             Err(error) => problem_error_response(&error),
         }
@@ -149,7 +150,7 @@ impl ApiFace {
         if let Err(response) = self.require_plugin(budget, id) {
             return response;
         }
-        let Some((template, _)) = plugin::config_template(id) else {
+        let Some((template, _)) = plugin::config_template(&self.config.paths, id) else {
             return error_response(
                 404,
                 "not_found",
@@ -157,11 +158,11 @@ impl ApiFace {
             );
         };
         let _guard = plugin::config_lock();
-        let _lock = match plugin::lock_config(id) {
+        let _lock = match plugin::lock_config(&self.config.paths, id) {
             Ok(lock) => lock,
             Err(error) => return problem_error_response(&error),
         };
-        match plugin::replace_config(id, &template, true) {
+        match plugin::replace_config(&self.config.paths, id, &template, true) {
             Ok(()) => Response::json(200, &json!({ "ok": true })),
             Err(error) => problem_error_response(&error),
         }
@@ -171,7 +172,7 @@ impl ApiFace {
         if let Err(response) = self.require_plugin(budget, id) {
             return response;
         }
-        match plugin::export_config(id) {
+        match plugin::export_config(&self.config.paths, id) {
             Ok((version, data)) => download_response(
                 &format!("{}-{}.config", safe_filename(id), safe_filename(&version)),
                 &data,
@@ -181,12 +182,12 @@ impl ApiFace {
     }
 
     fn trust_list(&self) -> Response {
-        match crate::trust::keys() {
+        match crate::trust::keys(&self.config.paths) {
             Ok(keys) => Response::json(
                 200,
                 &json!({
                     "keys": keys,
-                    "directory": paths::trust_dir().to_string_lossy(),
+                    "directory": self.config.paths.trust_dir.to_string_lossy(),
                 }),
             ),
             Err(error) => problem_error_response(&error),
@@ -200,7 +201,7 @@ impl ApiFace {
         if body.is_empty() {
             return error_response(400, "bad_request", "empty public key");
         }
-        match crate::trust::add(&key_id, body) {
+        match crate::trust::add(&self.config.paths, &key_id, body) {
             Ok(path) => Response::json(
                 200,
                 &json!({
@@ -213,7 +214,7 @@ impl ApiFace {
     }
 
     fn trust_remove(&self, key_id: &str) -> Response {
-        match crate::trust::remove(key_id) {
+        match crate::trust::remove(&self.config.paths, key_id) {
             Ok(true) => Response::json(200, &json!({ "keyId": key_id, "removed": true })),
             Ok(false) => error_response(
                 404,
@@ -241,7 +242,7 @@ impl ApiFace {
                 }
             },
         };
-        let path = paths::logs_dir().join(format!("{}.log", id));
+        let path = self.config.paths.logs_dir.join(format!("{}.log", id));
         match log::tail(&path, lines) {
             Ok(text) => Response::new(200, "text/plain; charset=utf-8", cap_log(text).into_bytes()),
             Err(cause) if cause.kind() == io::ErrorKind::NotFound => {
@@ -308,7 +309,7 @@ impl ApiFace {
         match (request.method.as_str(), parts.as_slice()) {
             ("GET", ["api", "v1", "compat"]) => Response::json(
                 200,
-                &serde_json::to_value(crate::compat::detect(MAX_SCHEMA, MAX_PROTOCOL)).unwrap_or(Value::Null),
+                &serde_json::to_value(crate::compat::detect(&self.config.paths, MAX_SCHEMA, MAX_PROTOCOL)).unwrap_or(Value::Null),
             ),
             ("GET", ["api", "v1", "auth"]) => match self.lan.lock() {
                 Ok(state) => Response::json(
@@ -542,7 +543,7 @@ pub(crate) fn safe_filename(value: &str) -> String {
         .collect()
 }
 
-fn project_service(status: &Value) -> Option<Value> {
+fn project_service(status: &Value, paths: &Paths) -> Option<Value> {
     let has_config = status
         .pointer("/details/config")
         .and_then(Value::as_str)
@@ -551,7 +552,7 @@ fn project_service(status: &Value) -> Option<Value> {
         .get("summary")
         .and_then(|summary| summary.get("id"))
         .and_then(Value::as_str)
-        .map(|id| crate::plugin::web_assets(id).is_some())
+        .map(|id| crate::plugin::web_assets(paths, id).is_some())
         .unwrap_or(false);
     let mut summary = status.get("summary").cloned()?;
     if let Some(object) = summary.as_object_mut() {
@@ -582,12 +583,14 @@ impl Face for ApiFace {
 
     fn handle(&self, request: Request, done: Completion) {
         if let Some(target) = export::export_target(&request.method, &request.path) {
-            done.complete(Exchange::Stream(Box::new(export::ExportStream::open(target))));
+            done.complete(Exchange::Stream(Box::new(export::ExportStream::open(target, self.config.paths.clone()))));
             return;
         }
         if let Some(target) = blob::download_target(&request.method, &request.path) {
             done.complete(Exchange::Stream(Box::new(blob::DownloadStream::open(
-                &request, target,
+                &request,
+                target,
+                self.config.paths.clone(),
             ))));
             return;
         }
@@ -633,15 +636,29 @@ mod tests {
         Arc::new(Mutex::new(Lan::new(bind, bind, false, None)))
     }
 
+    fn test_config() -> Arc<Config> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = crate::test_support::temp_dir()
+            .join(format!("svcd-face-unit-{}-{}", std::process::id(), nanos));
+        Arc::new(Config::with_paths(
+            crate::settings::Settings::default(),
+            None,
+            Paths::under(&root),
+        ))
+    }
+
     fn face() -> ApiFace {
-        ApiFace::new(".", lan())
+        ApiFace::new(test_config(), lan())
     }
 
     fn face_with_password() -> ApiFace {
         let bind = "127.0.0.1:0".parse().expect("bind");
         let hash = crate::auth::hash_password("secret").expect("hash");
         ApiFace::new(
-            ".",
+            test_config(),
             Arc::new(Mutex::new(Lan::new(bind, bind, true, Some(hash)))),
         )
     }
@@ -928,14 +945,14 @@ mod tests {
             "summary": { "id": "unit-test-missing", "kind": "plugin" },
             "details": { "config": "/tmp/config" }
         });
-        let summary = project_service(&with_config).expect("summary");
+        let summary = project_service(&with_config, &test_config().paths).expect("summary");
         assert_eq!(summary["hasConfig"], true);
         assert_eq!(summary["hasUI"], false);
 
         let without_config = json!({
             "summary": { "id": "unit-test-missing", "kind": "core" }
         });
-        let summary = project_service(&without_config).expect("summary");
+        let summary = project_service(&without_config, &test_config().paths).expect("summary");
         assert_eq!(summary["hasConfig"], false);
         assert_eq!(summary["hasUI"], false);
     }

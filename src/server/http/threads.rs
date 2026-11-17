@@ -12,7 +12,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -20,6 +19,7 @@ use std::time::Duration;
 
 use crate::http;
 use crate::server::http::engine;
+use crate::config::Config;
 use crate::lan::Lan;
 use crate::log;
 use crate::threads;
@@ -101,7 +101,7 @@ impl Drop for ConnectionLease {
 
 /// One accepted connection, handed to the composition root's handler.
 pub(crate) type Connection =
-    Arc<dyn Fn(TcpStream, IpAddr, PathBuf, Arc<Mutex<Lan>>, Duration) + Send + Sync>;
+    Arc<dyn Fn(TcpStream, IpAddr, Arc<Config>, Arc<Mutex<Lan>>, Duration) + Send + Sync>;
 
 /// The bounded admission caps for this driver: one lease is one connection and
 /// one thread, so both caps are applied before the thread exists.
@@ -121,7 +121,7 @@ pub(crate) fn admission(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn serve(
     active: TcpListener,
-    config: PathBuf,
+    config: Arc<Config>,
     lan: Arc<Mutex<Lan>>,
     admission: Arc<Mutex<Admission>>,
     idle_timeout: Duration,

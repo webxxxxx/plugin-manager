@@ -13,7 +13,7 @@ use std::fs;
 use std::io::Write;
 use std::net::TcpStream;
 use std::net::{IpAddr, SocketAddr, TcpListener};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -22,6 +22,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::blob;
+use crate::config::Config;
 use crate::face::blob_routes;
 use crate::face::support::{decode, error};
 use crate::channel;
@@ -31,6 +32,7 @@ use crate::lan::{self, AuthKind, Lan, LanStatus};
 use crate::log;
 use crate::server::mcp::transport;
 use crate::package;
+use crate::paths::Paths;
 use crate::plugin;
 use crate::rpc;
 use crate::server::http::threads::{
@@ -67,7 +69,7 @@ fn resolve_bind(env: Option<&str>, configured: Option<SocketAddr>) -> SocketAddr
 /// started its accept thread). Which driver runs is decided in
 /// `server::http::entry`, not here.
 pub fn spawn(
-    config: PathBuf,
+    config: Arc<Config>,
     raw_hub: Arc<crate::rawhub::RawHub>,
     control: crate::channel::ControlBinding,
 ) -> std::io::Result<Arc<Api>> {
@@ -97,7 +99,7 @@ pub fn spawn(
         Ok(listener) => match listener.local_addr() {
             Ok(local) => {
                 state.bind = local;
-                let port_file = config.join("http.port");
+                let port_file = config.paths.config_dir.join("http.port");
                 if let Err(error) = fs::write(&port_file, format!("127.0.0.1:{}", local.port())) {
                     log::svcd(&format!(
                         "svcd: cannot write {}: {}",
@@ -126,7 +128,10 @@ pub fn spawn(
     let fallback_config = config.clone();
     let face: Arc<dyn crate::server::http::Face> =
         Arc::new(crate::face::api::ApiFace::new(config.clone(), lan.clone()));
-    let routes: Arc<dyn crate::server::http::hooks::PreBodyRoutes> = Arc::new(PreBodyFaces);
+    let routes: Arc<dyn crate::server::http::hooks::PreBodyRoutes> =
+        Arc::new(PreBodyFaces {
+            config: config.clone(),
+        });
     let fallback: crate::server::http::hooks::FallbackHandler =
         Arc::new(move |request, lan| respond(&fallback_config, request, lan));
 
@@ -211,7 +216,7 @@ fn serve_plugin_ui(
     head: &http::Head,
     peer: IpAddr,
     lan: &Arc<Mutex<Lan>>,
-    config: PathBuf,
+    config: Arc<Config>,
 ) {
     use crate::server::http::Exchange;
 
@@ -229,7 +234,9 @@ fn serve_plugin_ui(
 
 /// The composition root's pre-body stream faces. The server loop holds this
 /// trait object instead of depending on the face layer directly.
-struct PreBodyFaces;
+struct PreBodyFaces {
+    config: Arc<Config>,
+}
 
 impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
     fn plugin_ui(
@@ -237,7 +244,7 @@ impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
         head: &http::Head,
         peer: IpAddr,
         lan: &Arc<Mutex<Lan>>,
-        config: &Path,
+        _config: &Path,
         raw_hub: Arc<crate::rawhub::RawHub>,
     ) -> Option<Result<crate::server::http::Exchange, Vec<u8>>> {
         crate::face::plugin_ui::PluginUiFace::route_for(&head.method, &head.path)?;
@@ -245,7 +252,7 @@ impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
             head,
             peer,
             lan,
-            config.to_path_buf(),
+            self.config.clone(),
             Some(raw_hub),
         ))
     }
@@ -254,13 +261,13 @@ impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
         &self,
         head: &http::Head,
         lan: &Arc<Mutex<Lan>>,
-        config: &Path,
+        _config: &Path,
     ) -> Option<Result<crate::server::http::Exchange, Vec<u8>>> {
         crate::face::install::target(head)?;
         Some(crate::face::install::exchange(
             head,
             lan,
-            config.to_path_buf(),
+            self.config.clone(),
         ))
     }
 
@@ -270,7 +277,11 @@ impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
         lan: &Arc<Mutex<Lan>>,
     ) -> Option<Result<crate::server::http::Exchange, Vec<u8>>> {
         crate::face::blob_upload::upload_target(head)?;
-        Some(crate::face::blob_upload::exchange(head, lan))
+        Some(crate::face::blob_upload::exchange(
+            head,
+            lan,
+            self.config.paths.clone(),
+        ))
     }
 
     fn body_policy(&self, head: &http::Head) -> crate::server::http::BodyPolicy {
@@ -286,7 +297,7 @@ fn serve_package_upload(
     head: &http::Head,
     initial: &[u8],
     lan: &Arc<Mutex<Lan>>,
-    config: PathBuf,
+    config: Arc<Config>,
 ) {
     use crate::server::http::Exchange;
 
@@ -331,11 +342,12 @@ fn serve_blob_upload(
     head: &http::Head,
     initial: &[u8],
     lan: &Arc<Mutex<Lan>>,
+    paths: Arc<Paths>,
 ) {
     use crate::server::http::Exchange;
 
     let head_only = http::is_head(&head.method);
-    match crate::face::blob_upload::exchange(head, lan) {
+    match crate::face::blob_upload::exchange(head, lan, paths) {
         Err(response) => {
             let _ = write_http(stream, &response, head_only);
         }
@@ -360,7 +372,7 @@ fn serve_blob_upload(
 fn handle(
     mut stream: TcpStream,
     peer: IpAddr,
-    config: PathBuf,
+    config: Arc<Config>,
     lan: Arc<Mutex<Lan>>,
     idle_timeout: Duration,
 ) {
@@ -480,7 +492,7 @@ fn handle(
             return;
         }
         if crate::face::blob_upload::upload_target(&head).is_some() {
-            serve_blob_upload(&mut stream, &head, &initial, &lan);
+            serve_blob_upload(&mut stream, &head, &initial, &lan, config.paths.clone());
             return;
         }
         let body_policy = server_body_policy(&head);
@@ -518,7 +530,7 @@ fn handle(
                 password_hash.as_deref(),
             ) {
                 Ok(Some(call)) => {
-                    let _ = serve_mcp_sse(&mut stream, call, &config, head_only);
+                    let _ = serve_mcp_sse(&mut stream, call, &config.paths.config_dir, head_only);
                     return;
                 }
                 Ok(None) => {}
@@ -653,7 +665,7 @@ fn write_sse_line(stream: &mut TcpStream, line: &str) -> std::io::Result<()> {
 
 /// Serve the paths that still own their protocol: MCP, plugin UI rpc/static
 /// assets, and the transfer fallbacks the face deliberately leaves alone.
-fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u8> {
+fn respond(config: &Config, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u8> {
     let path = request
         .path
         .split_once('?')
@@ -667,7 +679,7 @@ fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u
             Err(_) => return error(500, "internal", "auth state unavailable"),
         };
         return transport::handle(
-            &|request| crate::mcp::serve_modern(config, request),
+            &|request| crate::mcp::serve_modern(&config.paths.config_dir, request),
             &transport::Request {
                 method: &request.method,
                 headers: &request.headers,
@@ -726,7 +738,7 @@ fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u
         if request.method == "GET"
             && ui.slashless
             && package::valid_name(ui.id)
-            && plugin::web_assets(ui.id).is_some()
+            && plugin::web_assets(&config.paths, ui.id).is_some()
         {
             let location = if ui.token.is_empty() {
                 format!("/plugin-ui/{}/", ui.id)
@@ -750,7 +762,7 @@ fn respond(config: &Path, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec<u
 /// never runs an HTTP listener of its own, and the token must belong to this
 /// plugin id.
 fn plugin_ui(
-    config: &Path,
+    config: &Config,
     request: &HttpRequest,
     ui: &UiPath<'_>,
     auth: AuthKind,
@@ -759,14 +771,14 @@ fn plugin_ui(
     if !package::valid_name(ui.id) {
         return error(404, "not_found", "unknown plugin UI");
     }
-    let Some(assets) = plugin::web_assets(ui.id) else {
+    let Some(assets) = plugin::web_assets(&config.paths, ui.id) else {
         return error(404, "not_found", &format!("plugin {} has no web UI", ui.id));
     };
     if !token_valid(lan, ui.token, ui.id) {
         return error(401, "unauthorized", "invalid or expired plugin token");
     }
     if ui.sub == "rpc" {
-        return ui_rpc(config, request, ui.id, auth);
+        return ui_rpc(&config.paths.config_dir, request, ui.id, auth);
     }
     let base = format!("/plugin-ui/{}/{}/", ui.id, ui.token);
     serve_ui(request, &assets, ui.sub, &base)
@@ -909,7 +921,7 @@ pub(crate) fn server_body_policy(head: &http::Head) -> crate::server::http::Body
 /// The buffered routes served by the fallback handler are the blob/file
 /// session routes (#118/#119); every management route and every streamed
 /// transfer is claimed before this function runs.
-fn route(_config: &std::path::Path, request: &HttpRequest) -> Vec<u8> {
+fn route(config: &Config, request: &HttpRequest) -> Vec<u8> {
     let (path, _query) = request
         .path
         .split_once('?')
@@ -924,16 +936,16 @@ fn route(_config: &std::path::Path, request: &HttpRequest) -> Vec<u8> {
 
     match (request.method.as_str(), parts.as_slice()) {
         ("POST", ["api", "v1", "blobs", "uploads"]) => {
-            blob_routes::create_upload(blob::UploadKind::Blob)
+            blob_routes::create_upload(&config.paths, blob::UploadKind::Blob)
         }
         ("GET", ["api", "v1", "blobs", "uploads", id]) => {
-            blob_routes::upload_status(blob::UploadKind::Blob, &decode(id))
+            blob_routes::upload_status(&config.paths, blob::UploadKind::Blob, &decode(id))
         }
         ("POST", ["api", "v1", "blobs", "uploads", id, "complete"]) => {
-            blob_routes::complete_upload(&decode(id), &request.body)
+            blob_routes::complete_upload(&config.paths, &decode(id), &request.body)
         }
         ("DELETE", ["api", "v1", "blobs", "uploads", id]) => {
-            blob_routes::abort_upload(blob::UploadKind::Blob, &decode(id))
+            blob_routes::abort_upload(&config.paths, blob::UploadKind::Blob, &decode(id))
         }
         (_, ["api", "v1", "blobs"]) => method_not_allowed("POST"),
         (_, ["api", "v1", "blobs", "uploads"]) => method_not_allowed("POST"),
@@ -942,16 +954,16 @@ fn route(_config: &std::path::Path, request: &HttpRequest) -> Vec<u8> {
         (_, ["api", "v1", "blobs", "uploads", _, "parts", _]) => method_not_allowed("PUT"),
         (_, ["api", "v1", "blobs", _]) => method_not_allowed("GET"),
         ("POST", ["api", "v1", "file", "uploads"]) => {
-            blob_routes::create_upload(blob::UploadKind::File)
+            blob_routes::create_upload(&config.paths, blob::UploadKind::File)
         }
         ("GET", ["api", "v1", "file", "uploads", id]) => {
-            blob_routes::upload_status(blob::UploadKind::File, &decode(id))
+            blob_routes::upload_status(&config.paths, blob::UploadKind::File, &decode(id))
         }
         ("POST", ["api", "v1", "file", "uploads", id, "complete"]) => {
-            blob_routes::file_upload_complete(&decode(id), &request.body)
+            blob_routes::file_upload_complete(&config.paths, &decode(id), &request.body)
         }
         ("DELETE", ["api", "v1", "file", "uploads", id]) => {
-            blob_routes::abort_upload(blob::UploadKind::File, &decode(id))
+            blob_routes::abort_upload(&config.paths, blob::UploadKind::File, &decode(id))
         }
         (_, ["api", "v1", "file"]) => method_not_allowed("POST"),
         (_, ["api", "v1", "file", "uploads"]) => method_not_allowed("POST"),
@@ -978,7 +990,21 @@ mod tests {
 
         let bind = "127.0.0.1:0".parse().expect("bind");
         let lan = Arc::new(Mutex::new(Lan::new(bind, bind, true, Some("hash".into()))));
-        let face = crate::face::api::ApiFace::new(".", lan.clone());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = crate::test_support::temp_dir().join(format!(
+            "svcd-api-unit-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        let config = Arc::new(Config::with_paths(
+            crate::settings::Settings::default(),
+            None,
+            Paths::under(&root),
+        ));
+        let face = crate::face::api::ApiFace::new(config, lan.clone());
         let peer = "127.0.0.1".parse().expect("peer");
 
         assert!(face.route("POST", "/login").expect("route").public);

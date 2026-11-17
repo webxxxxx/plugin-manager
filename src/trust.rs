@@ -12,14 +12,14 @@ use std::path::PathBuf;
 
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::package;
-use crate::paths;
+use crate::paths::Paths;
 
 /// Public keys are tiny; a larger file is a mistake, not a key.
 pub const MAX_KEY_BYTES: u64 = 16 * 1024;
 
 /// Sorted key ids present in `trust.d`; a missing directory means "none".
-pub fn keys() -> Result<Vec<String>, ProblemError> {
-    let directory = paths::trust_dir();
+pub fn keys(paths: &Paths) -> Result<Vec<String>, ProblemError> {
+    let directory = &paths.trust_dir;
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -47,13 +47,13 @@ pub fn keys() -> Result<Vec<String>, ProblemError> {
     Ok(keys)
 }
 
-pub fn key_path(key_id: &str) -> PathBuf {
-    paths::trust_dir().join(format!("{}.pub", key_id))
+pub fn key_path(paths: &Paths, key_id: &str) -> PathBuf {
+    paths.trust_dir.join(format!("{}.pub", key_id))
 }
 
 /// Validate and write `<keyId>.pub`; an existing file with the same id is
 /// replaced so rotating a key does not need a remove first.
-pub fn add(key_id: &str, pem: &[u8]) -> Result<PathBuf, ProblemError> {
+pub fn add(paths: &Paths, key_id: &str, pem: &[u8]) -> Result<PathBuf, ProblemError> {
     check_key_id(key_id)?;
     if pem.is_empty() {
         return Err(Problem::Invalid.error("public key is empty"));
@@ -65,12 +65,12 @@ pub fn add(key_id: &str, pem: &[u8]) -> Result<PathBuf, ProblemError> {
         )));
     }
     package::validate_public_key(pem)?;
-    let directory = paths::trust_dir();
+    let directory = &paths.trust_dir;
     fs::create_dir_all(&directory).map_err(|error| {
         Problem::Internal.error(format!("create {}: {}", directory.display(), error))
     })?;
     set_dir_mode(&directory);
-    let target = key_path(key_id);
+    let target = key_path(paths, key_id);
     fs::write(&target, pem)
         .map_err(|error| Problem::Internal.error(format!("write {}: {}", target.display(), error)))?;
     set_file_mode(&target);
@@ -78,9 +78,9 @@ pub fn add(key_id: &str, pem: &[u8]) -> Result<PathBuf, ProblemError> {
 }
 
 /// Remove a trusted key; `Ok(false)` means it was not there.
-pub fn remove(key_id: &str) -> Result<bool, ProblemError> {
+pub fn remove(paths: &Paths, key_id: &str) -> Result<bool, ProblemError> {
     check_key_id(key_id)?;
-    let path = key_path(key_id);
+    let path = key_path(paths, key_id);
     match fs::remove_file(&path) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -127,25 +127,29 @@ fn set_dir_mode(_path: &std::path::Path) {}
 mod tests {
     use super::*;
 
+    fn test_paths() -> Paths {
+        Paths::under(std::path::Path::new("/nonexistent-svcd-trust"))
+    }
+
     #[test]
     fn a_bad_key_id_is_invalid_not_a_read_failure() {
-        let error = add("../escape", b"pem").expect_err("path traversal");
+        let error = add(&test_paths(), "../escape", b"pem").expect_err("path traversal");
         assert_eq!(error.problem, Problem::Invalid);
         assert!(error.detail().contains("invalid keyId"), "{}", error);
 
-        let error = remove("../escape").expect_err("path traversal");
+        let error = remove(&test_paths(), "../escape").expect_err("path traversal");
         assert_eq!(error.problem, Problem::Invalid);
     }
 
     #[test]
     fn an_oversized_key_is_too_large() {
-        let error = add("demo", &vec![b'p'; MAX_KEY_BYTES as usize + 1]).expect_err("oversized");
+        let error = add(&test_paths(), "demo", &vec![b'p'; MAX_KEY_BYTES as usize + 1]).expect_err("oversized");
         assert_eq!(error.problem, Problem::TooLarge);
     }
 
     #[test]
     fn an_empty_key_is_invalid() {
-        let error = add("demo", b"").expect_err("empty");
+        let error = add(&test_paths(), "demo", b"").expect_err("empty");
         assert_eq!(error.problem, Problem::Invalid);
     }
 }

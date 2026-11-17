@@ -1,6 +1,5 @@
 use crate::channel;
 use crate::ipc::{self, FrameEvent};
-use crate::paths;
 use crate::registry::{Kind, Registry};
 use crate::rpc;
 use crate::server::mcp::session::{validate_meta, Served, MODERN_VERSION};
@@ -78,7 +77,14 @@ pub fn tool_error(id: Option<Value>, message: &str) -> rpc::Response {
 /// Serve one MCP client over stdio. The bridge never launches svcd; if the
 /// daemon is unreachable at startup it writes to stderr and exits 1.
 pub fn run_stdio() -> i32 {
-    let config = paths::config_dir();
+    let config = match crate::config::Config::bootstrap(None) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("mcp: invalid config: {}", error);
+            return 1;
+        }
+    };
+    let config = config.paths.config_dir.clone();
     if let Err(error) = startup_ping(&config) {
         eprintln!("mcp: {}", error);
         return 1;

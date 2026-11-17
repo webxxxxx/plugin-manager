@@ -12,6 +12,7 @@ use serde_json::json;
 
 use crate::blob;
 use crate::http;
+use crate::paths::Paths;
 
 use super::support;
 use crate::lan::{AuthKind, Lan};
@@ -69,7 +70,11 @@ pub fn upload_target(head: &http::Head) -> Option<UploadTarget> {
 /// Resolve auth and endpoint policy, validate the framing, and return the
 /// stream handler. Errors are complete response bytes: the server writes them
 /// and closes without reading a body.
-pub fn exchange(head: &http::Head, lan: &Arc<Mutex<Lan>>) -> Result<Exchange, Vec<u8>> {
+pub fn exchange(
+    head: &http::Head,
+    lan: &Arc<Mutex<Lan>>,
+    paths: Arc<Paths>,
+) -> Result<Exchange, Vec<u8>> {
     let Some(target) = upload_target(head) else {
         return Err(http::json_error(404, "not_found", "not an upload route"));
     };
@@ -144,12 +149,19 @@ pub fn exchange(head: &http::Head, lan: &Arc<Mutex<Lan>>) -> Result<Exchange, Ve
                 "part number must be between 1 and 10000",
             ));
         }
-        if let Err(error) = blob::require_upload_kind(upload, *kind) {
+        if let Err(error) = blob::require_upload_kind(&paths, upload, *kind) {
             return Err(support::storage_response(&error));
         }
     }
 
-    let handler = BlobUploadStream::new(target, framing, multipart, limit, expects_continue(head));
+    let handler = BlobUploadStream::new(
+        target,
+        framing,
+        multipart,
+        limit,
+        expects_continue(head),
+        paths,
+    );
     Ok(Exchange::Stream(Box::new(handler)))
 }
 
@@ -180,6 +192,8 @@ enum Phase {
 }
 
 struct UploadState {
+    /// The content-store root: every blob call in this handler uses it.
+    paths: Arc<Paths>,
     target: UploadTarget,
     framing: BodyFraming,
     multipart: Option<MultipartParser>,
@@ -205,6 +219,7 @@ impl BlobUploadStream {
         multipart: Option<MultipartParser>,
         limit: u64,
         expect_continue: bool,
+        paths: Arc<Paths>,
     ) -> BlobUploadStream {
         let framing = match framing {
             http::Framing::Length(remaining) => BodyFraming::Length { remaining },
@@ -213,6 +228,7 @@ impl BlobUploadStream {
         };
         BlobUploadStream {
             state: Arc::new(Mutex::new(UploadState {
+                paths,
                 target,
                 framing,
                 multipart,
@@ -375,7 +391,7 @@ impl UploadState {
         match &self.target {
             UploadTarget::Blob => {
                 if self.upload.is_none() {
-                    self.upload = Some(blob::Upload::begin().map_err(UploadFailure::from)?);
+                    self.upload = Some(blob::Upload::begin(&self.paths).map_err(UploadFailure::from)?);
                 }
                 let upload = self.upload.as_mut().expect("blob upload initialized");
                 match &mut self.multipart {
@@ -389,7 +405,7 @@ impl UploadState {
                 let kind = *kind;
                 if self.part.is_none() {
                     self.part = Some(
-                        blob::PartWriter::begin(&upload_id, part, kind)
+                        blob::PartWriter::begin(&self.paths, &upload_id, part, kind)
                             .map_err(UploadFailure::from)?,
                     );
                 }
@@ -752,13 +768,33 @@ mod tests {
             multipart,
             limit,
             expects_continue(head),
+            Arc::new(test_paths().clone()),
         )
+    }
+
+    /// The module's single temporary content store; the ids are
+    /// content-addressed, so sharing it between tests is safe.
+    fn test_paths() -> &'static Paths {
+        static PATHS: std::sync::OnceLock<Paths> = std::sync::OnceLock::new();
+        PATHS.get_or_init(|| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let root = crate::test_support::temp_dir().join(format!(
+                "svcd-blob-upload-face-{}-{}",
+                std::process::id(),
+                nanos
+            ));
+            let paths = Paths::under(&root);
+            std::fs::create_dir_all(&paths.temp_dir).expect("content store");
+            paths
+        })
     }
 
     /// Drive the handler the way the server does: write, read body chunks,
     /// run submitted jobs inline, then write the final response.
     fn drive(mut handler: BlobUploadStream, body: &[u8], chunk: usize) -> (Vec<u8>, CloseReason) {
-        let _ = crate::blob::test_temp_dir();
         let mut out = Vec::new();
         let mut all = Vec::new();
         let mut offset = 0;
@@ -823,7 +859,7 @@ mod tests {
         assert!(text.contains("ETag: \"sha256:"), "{text}");
         let id = blob_id(&response);
         let mut content = Vec::new();
-        crate::blob::path(&id)
+        crate::blob::path(test_paths(), &id)
             .and_then(|path| {
                 std::fs::File::open(path).map_err(|error| blob::Error::internal(error.to_string()))
             })
@@ -845,7 +881,7 @@ mod tests {
         assert_eq!(reason, CloseReason::Completed);
         let id = blob_id(&response);
         let mut content = Vec::new();
-        let path = crate::blob::path(&id).expect("blob path");
+        let path = crate::blob::path(test_paths(), &id).expect("blob path");
         std::fs::File::open(path)
             .and_then(|mut file| file.read_to_end(&mut content))
             .expect("read staged blob");
@@ -870,7 +906,7 @@ mod tests {
         assert_eq!(reason, CloseReason::Completed);
         let id = blob_id(&response);
         let mut content = Vec::new();
-        let path = crate::blob::path(&id).expect("blob path");
+        let path = crate::blob::path(test_paths(), &id).expect("blob path");
         std::fs::File::open(path)
             .and_then(|mut file| file.read_to_end(&mut content))
             .expect("read staged blob");
@@ -879,8 +915,8 @@ mod tests {
 
     #[test]
     fn a_resumable_part_can_be_reuploaded() {
-        let _ = crate::blob::test_temp_dir();
-        let upload = crate::blob::create_upload(blob::UploadKind::Blob).expect("upload");
+        let upload =
+            crate::blob::create_upload(test_paths(), blob::UploadKind::Blob).expect("upload");
         let path = format!("/api/v1/blobs/uploads/{}/parts/1", upload);
         let head = parse_head(
             format!(
@@ -906,11 +942,12 @@ mod tests {
         assert_eq!(reason, CloseReason::Completed);
         assert!(String::from_utf8_lossy(&second).starts_with("HTTP/1.1 200 OK"));
 
-        let parts = crate::blob::upload_parts(&upload, blob::UploadKind::Blob).expect("parts");
+        let parts =
+            crate::blob::upload_parts(test_paths(), &upload, blob::UploadKind::Blob).expect("parts");
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].size, 6);
-        let meta = crate::blob::complete_upload(&upload, None).expect("complete");
-        let path = crate::blob::path(&meta.id).expect("path");
+        let meta = crate::blob::complete_upload(test_paths(), &upload, None).expect("complete");
+        let path = crate::blob::path(test_paths(), &meta.id).expect("path");
         let content = std::fs::read(path).expect("read");
         assert_eq!(content, b"second");
     }

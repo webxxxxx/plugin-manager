@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::config::Config;
+
 use serde_json::{json, Value};
 
 use crate::http;
@@ -21,7 +23,7 @@ use crate::kernel::failure::{Problem, ProblemError};
 use crate::lan::{AuthKind, Lan};
 use crate::limits;
 use crate::package;
-use crate::paths;
+use crate::paths::Paths;
 use crate::plugin;
 use crate::server::http::{
     BlockingOutcome, CloseReason, Exchange, OutBuffer, StreamAction, StreamClass, StreamEvent,
@@ -87,7 +89,7 @@ pub fn target(head: &http::Head) -> Option<PackageTarget> {
 pub fn exchange(
     head: &http::Head,
     lan: &Arc<Mutex<Lan>>,
-    config: PathBuf,
+    config: Arc<Config>,
 ) -> Result<Exchange, Vec<u8>> {
     let Some(target) = target(head) else {
         return Err(http::json_error(
@@ -294,7 +296,7 @@ struct UploadState {
     refused: bool,
     flow: Flow,
     outcome: Option<Outcome>,
-    config: PathBuf,
+    config: Arc<Config>,
 }
 
 enum Outcome {
@@ -311,6 +313,7 @@ enum Flow {
 }
 
 struct InstallFlow {
+    paths: Arc<Paths>,
     strategy: String,
     enable: bool,
     allow_hooks: bool,
@@ -318,6 +321,7 @@ struct InstallFlow {
 }
 
 struct ImportFlow {
+    paths: Arc<Paths>,
     params: ImportParams,
     stage: ImportStage,
 }
@@ -359,15 +363,17 @@ impl PackageUploadStream {
         target: PackageTarget,
         framing: http::Framing,
         expect_continue: bool,
-        config: PathBuf,
+        config: Arc<Config>,
         max_package: u64,
     ) -> PackageUploadStream {
+        let self_paths = config.paths.clone();
         let flow = match target {
             PackageTarget::Install {
                 strategy,
                 enable,
                 allow_hooks,
             } => Flow::Install(InstallFlow {
+                paths: self_paths.clone(),
                 strategy,
                 enable,
                 allow_hooks,
@@ -378,6 +384,7 @@ impl PackageUploadStream {
                 no_config,
                 force,
             } => Flow::Import(ImportFlow {
+                paths: self_paths.clone(),
                 params: ImportParams {
                     config_id,
                     no_config,
@@ -661,9 +668,10 @@ impl InstallFlow {
     fn installer(&mut self) -> Result<&mut package::StagingInstaller, ProblemError> {
         if self.installer.is_none() {
             self.installer = Some(package::StagingInstaller::new(
-                staging_path(),
+                staging_path(&self.paths),
                 settings::allow_insecure_install(),
                 limits::current().max_package_bytes,
+                &self.paths.trust_dir,
             ));
         }
         Ok(self
@@ -672,7 +680,7 @@ impl InstallFlow {
             .expect("staging installer initialized"))
     }
 
-    fn finish(&mut self, config: &Path, budget: &CallBudget) -> Vec<u8> {
+    fn finish(&mut self, config: &Config, budget: &CallBudget) -> Vec<u8> {
         let Some(mut installer) = self.installer.take() else {
             return support::problem_response(&Problem::Invalid.error("manifest.json is missing"));
         };
@@ -695,7 +703,7 @@ impl InstallFlow {
             Ok(status) => {
                 if !self.enable {
                     let _ = support::rpc(
-                        config,
+                        &config.paths.config_dir,
                         "svc.disable",
                         json!({ "id": id }),
                         &budget.follow_up(),
@@ -743,15 +751,17 @@ impl ImportFlow {
         match first.as_deref() {
             Some("manifest.json") => {
                 let mut installer = package::StagingInstaller::new(
-                    staging_path(),
+                    staging_path(&self.paths),
                     settings::allow_insecure_install(),
                     limits::current().max_package_bytes,
+                    &self.paths.trust_dir,
                 );
                 installer.feed(&data)?;
                 self.stage = ImportStage::Package { installer };
             }
             Some("backup.json") => {
-                let mut import = BackupImport::new(&self.params, staging_path());
+                let mut import =
+                    BackupImport::new(&self.params, staging_path(&self.paths), self.paths.clone());
                 import.feed(&data)?;
                 self.stage = ImportStage::Backup(import);
             }
@@ -765,7 +775,7 @@ impl ImportFlow {
         Ok(())
     }
 
-    fn finish(&mut self, config: &Path, budget: &CallBudget) -> Vec<u8> {
+    fn finish(&mut self, config: &Config, budget: &CallBudget) -> Vec<u8> {
         loop {
             let stage = std::mem::replace(&mut self.stage, ImportStage::Raw(Vec::new()));
             match stage {
@@ -800,14 +810,17 @@ impl ImportFlow {
                         Err(error) => support::problem_response(&error),
                     }
                 }
-                ImportStage::Raw(data) => return raw_config_response(&data, &self.params),
+                ImportStage::Raw(data) => {
+                    return raw_config_response(&data, &self.params, &config.paths)
+                }
             }
         }
     }
 }
 
-fn raw_config_response(data: &[u8], params: &ImportParams) -> Vec<u8> {
+fn raw_config_response(data: &[u8], params: &ImportParams, paths: &Paths) -> Vec<u8> {
     match transfer::import(
+        paths,
         data,
         params.config_id.as_deref(),
         params.no_config,
@@ -836,11 +849,11 @@ struct BackupImport {
 }
 
 impl BackupImport {
-    fn new(params: &ImportParams, staging: PathBuf) -> BackupImport {
+    fn new(params: &ImportParams, staging: PathBuf, paths: Arc<Paths>) -> BackupImport {
         let max = limits::current().max_package_bytes;
         BackupImport {
             tar: package::TarFeed::new(max),
-            sink: BackupSink::new(params, staging),
+            sink: BackupSink::new(params, staging, paths),
         }
     }
 
@@ -848,7 +861,7 @@ impl BackupImport {
         self.tar.feed(data, &mut self.sink)
     }
 
-    fn finish(&mut self, config: &Path, budget: &CallBudget) -> Result<Vec<u8>, ProblemError> {
+    fn finish(&mut self, config: &Config, budget: &CallBudget) -> Result<Vec<u8>, ProblemError> {
         self.tar.finish()?;
         self.sink.finish(config, budget)
     }
@@ -856,6 +869,7 @@ impl BackupImport {
 
 struct BackupSink {
     staging: PathBuf,
+    paths: Arc<Paths>,
     allow_insecure: bool,
     no_config: bool,
     force: bool,
@@ -883,9 +897,10 @@ enum BackupCurrent {
 }
 
 impl BackupSink {
-    fn new(params: &ImportParams, staging: PathBuf) -> BackupSink {
+    fn new(params: &ImportParams, staging: PathBuf, paths: Arc<Paths>) -> BackupSink {
         BackupSink {
             staging,
+            paths,
             allow_insecure: settings::allow_insecure_install(),
             no_config: params.no_config,
             force: params.force,
@@ -928,6 +943,7 @@ impl package::TarSink for BackupSink {
                     self.staging.clone(),
                     self.allow_insecure,
                     limits::current().max_package_bytes,
+                    &self.paths.trust_dir,
                 ));
                 self.current = Some(BackupCurrent::Spk);
             }
@@ -1013,7 +1029,7 @@ impl package::TarSink for BackupSink {
                     )));
                 }
                 self.warnings.clear();
-                if let Some(current) = plugin::current_version(&backup.id) {
+                if let Some(current) = plugin::current_version(&self.paths, &backup.id) {
                     if current != backup.version {
                         self.warnings.push(format!(
                             "installed {} is {}, importing {}",
@@ -1039,7 +1055,7 @@ impl package::TarSink for BackupSink {
 }
 
 impl BackupSink {
-    fn finish(&mut self, config: &Path, budget: &CallBudget) -> Result<Vec<u8>, ProblemError> {
+    fn finish(&mut self, config: &Config, budget: &CallBudget) -> Result<Vec<u8>, ProblemError> {
         let backup = self
             .backup
             .take()
@@ -1075,6 +1091,7 @@ impl BackupSink {
         };
         if applied {
             transfer::apply_config(
+                &config.paths,
                 &backup.id,
                 self.config_data.as_ref().expect("config data"),
                 false,
@@ -1105,7 +1122,7 @@ impl Drop for BackupSink {
 /// so a failed install never leaves staging behind no matter which route
 /// (install, .spk import, .spkb import) produced it.
 fn install_staged(
-    config: &Path,
+    config: &Config,
     root: &Path,
     id: &str,
     version: &str,
@@ -1114,7 +1131,7 @@ fn install_staged(
     budget: &CallBudget,
 ) -> Result<Value, Vec<u8>> {
     support::rpc(
-        config,
+        &config.paths.config_dir,
         "plugin.install_staged",
         json!({
             "path": root.to_string_lossy(),
@@ -1131,10 +1148,11 @@ fn install_staged(
     })
 }
 
-fn staging_path() -> PathBuf {
-    let plugins = paths::plugins_dir()
+fn staging_path(paths: &Paths) -> PathBuf {
+    let plugins = paths
+        .plugins_dir
         .canonicalize()
-        .unwrap_or_else(|_| paths::plugins_dir());
+        .unwrap_or_else(|_| paths.plugins_dir.clone());
     let _ = std::fs::create_dir_all(&plugins);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1278,6 +1296,23 @@ mod tests {
         assert!(force);
     }
 
+    fn test_config() -> Arc<Config> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = crate::test_support::temp_dir().join(format!(
+            "svcd-install-face-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        Arc::new(Config::with_paths(
+            crate::settings::Settings::default(),
+            None,
+            Paths::under(&root),
+        ))
+    }
+
     fn lan() -> Arc<Mutex<Lan>> {
         use std::net::SocketAddr;
         let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
@@ -1286,7 +1321,7 @@ mod tests {
 
     fn stream_handler(request: &[u8]) -> Box<dyn StreamHandler> {
         let head = parse_head(request);
-        match exchange(&head, &lan(), PathBuf::from("unused")).expect("streamed exchange") {
+        match exchange(&head, &lan(), test_config()).expect("streamed exchange") {
             Exchange::Stream(handler) => handler,
             Exchange::Response(_) => panic!("a package route must stream"),
         }
@@ -1391,7 +1426,7 @@ mod tests {
             },
             http::Framing::Chunked,
             false,
-            PathBuf::from("unused"),
+            test_config(),
             8,
         );
         // Two 5-byte chunks exceed the 8-byte decoded limit.

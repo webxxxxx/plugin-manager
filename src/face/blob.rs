@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::blob;
 use crate::http;
+use crate::paths::Paths;
 use crate::server::http::{
     BlockingOutcome, CloseReason, FileSend, OutBuffer, Request, StreamAction, StreamClass,
     StreamEvent, StreamHandler, StreamStep,
@@ -77,6 +78,8 @@ pub fn download_target(method: &str, path: &str) -> Option<DownloadTarget> {
 /// server delivers `BlockingDone` (the upload path uses the same shape).
 pub struct DownloadStream {
     target: DownloadTarget,
+    /// The content-store root this download resolves against.
+    paths: Arc<Paths>,
     /// Request headers for the open job; taken by the first Writable.
     headers: Vec<(String, String)>,
     /// The opened value written by the pool job and taken by the handler.
@@ -153,9 +156,10 @@ impl DownloadStream {
     /// Resolve one recognized download. This only captures the request values:
     /// every filesystem call happens in the blocking job submitted by the
     /// first Writable, so opening the handler cannot stall the server loop.
-    pub fn open(request: &Request, target: DownloadTarget) -> DownloadStream {
+    pub fn open(request: &Request, target: DownloadTarget, paths: Arc<Paths>) -> DownloadStream {
         DownloadStream {
             target,
+            paths,
             headers: request.headers.clone(),
             opened: Arc::new(Mutex::new(None)),
             phase: Phase::Pending,
@@ -171,9 +175,10 @@ impl DownloadStream {
         let headers = std::mem::take(&mut self.headers);
         let target = self.target.clone();
         let slot = self.opened.clone();
+        let paths = self.paths.clone();
         self.phase = Phase::Blocking;
         StreamStep::wait(StreamAction::SubmitBlocking(Box::new(move |_budget| {
-            let opened = open_download(&headers, &target);
+            let opened = open_download(&headers, &target, &paths);
             *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(opened);
             BlockingOutcome::Ok(Vec::new())
         })))
@@ -373,15 +378,15 @@ impl StreamHandler for DownloadStream {
 /// Run the one open job off the server loop. Every failure that the old
 /// synchronous path could answer before the head is rendered here, in the same
 /// order, so the wire bytes do not change.
-fn open_download(headers: &[(String, String)], target: &DownloadTarget) -> Opened {
+fn open_download(headers: &[(String, String)], target: &DownloadTarget, paths: &Paths) -> Opened {
     match target {
-        DownloadTarget::Blob { .. } => blob_download(headers, target),
-        DownloadTarget::File { .. } => file_download(headers, target),
+        DownloadTarget::Blob { .. } => blob_download(headers, target, paths),
+        DownloadTarget::File { .. } => file_download(headers, target, paths),
     }
 }
 
-fn blob_download(headers: &[(String, String)], target: &DownloadTarget) -> Opened {
-    let path = match blob::locate(target.id()) {
+fn blob_download(headers: &[(String, String)], target: &DownloadTarget, paths: &Paths) -> Opened {
+    let path = match blob::locate(paths, target.id()) {
         Ok(path) => path,
         Err(_) => return not_found(target),
     };
@@ -428,8 +433,8 @@ fn blob_download(headers: &[(String, String)], target: &DownloadTarget) -> Opene
     }
 }
 
-fn file_download(headers: &[(String, String)], target: &DownloadTarget) -> Opened {
-    let (directory, manifest) = match blob::file_manifest(target.id()) {
+fn file_download(headers: &[(String, String)], target: &DownloadTarget, paths: &Paths) -> Opened {
+    let (directory, manifest) = match blob::file_manifest(paths, target.id()) {
         Ok(file) => file,
         Err(_) => return not_found(target),
     };
@@ -773,10 +778,30 @@ mod tests {
         }
     }
 
+    /// One temporary content store for this module's tests. No process
+    /// environment is read, and the content-addressed ids make sharing safe.
+    fn test_paths() -> &'static Paths {
+        static PATHS: std::sync::OnceLock<Paths> = std::sync::OnceLock::new();
+        PATHS.get_or_init(|| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let root = crate::test_support::temp_dir().join(format!(
+                "svcd-blob-face-{}-{}",
+                std::process::id(),
+                nanos
+            ));
+            let paths = Paths::under(&root);
+            std::fs::create_dir_all(&paths.temp_dir).expect("content store");
+            paths
+        })
+    }
+
     fn open(method: &str, path: &str, headers: &[(&str, &str)]) -> DownloadStream {
         let request = request(method, path, headers);
         let target = download_target(method, path).expect("download route");
-        DownloadStream::open(&request, target)
+        DownloadStream::open(&request, target, Arc::new(test_paths().clone()))
     }
 
     /// Drive the handler the way the Unix driver does: one bounded output
@@ -830,22 +855,19 @@ mod tests {
         String::from_utf8_lossy(bytes).into_owned()
     }
 
-    /// Use the content-store root the blob unit tests also use, so the two
-    /// test modules never point `SVCD_TEMP_DIR` at different trees.
-    fn test_temp() {
-        let _ = crate::blob::test_temp_dir();
-    }
-
     fn blob_of(bytes: &[u8]) -> String {
-        test_temp();
-        crate::blob::put(bytes).expect("write test blob").id
+        crate::blob::put(test_paths(), bytes)
+            .expect("write test blob")
+            .id
     }
 
     fn file_of(parts: &[&[u8]], name: Option<&str>, mime: Option<&str>) -> String {
-        test_temp();
-        let upload = crate::blob::create_upload(crate::blob::UploadKind::File).expect("upload");
+        let paths = test_paths();
+        let upload =
+            crate::blob::create_upload(paths, crate::blob::UploadKind::File).expect("upload");
         for (index, content) in parts.iter().enumerate() {
             let mut writer = crate::blob::PartWriter::begin(
+                paths,
                 &upload,
                 index as u32 + 1,
                 crate::blob::UploadKind::File,
@@ -855,6 +877,7 @@ mod tests {
             writer.finish().expect("finish part");
         }
         crate::blob::complete_file(
+            paths,
             &upload,
             None,
             name.map(str::to_string),

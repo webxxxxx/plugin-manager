@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::paths;
+use crate::paths::Paths;
 
 const EXIT_OK: i32 = 0;
 const EXIT_ERROR: i32 = 1;
@@ -165,6 +165,15 @@ fn path_writable(path: &Path) -> bool {
     path.is_dir()
 }
 
+/// The ambient directory set, resolved the way the old free getters did:
+/// `SVCD_*` → the loaded settings (if any) → platform defaults.
+///
+/// Install and uninstall deliberately never bootstrap: they must still work
+/// when the config is broken or missing (that is often why they are run).
+fn ambient_paths() -> Paths {
+    Paths::resolve(&crate::settings::current().cloned().unwrap_or_default())
+}
+
 /// Everything a plan needs to spell out paths and command lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
@@ -176,10 +185,11 @@ pub struct Layout {
 
 impl Layout {
     pub fn current() -> Self {
+        let paths = ambient_paths();
         Layout {
             program: default_program(),
-            data_dir: paths::data_dir(),
-            config_dir: paths::config_dir(),
+            data_dir: paths.data_dir,
+            config_dir: paths.config_dir,
             conf: None,
         }
     }
@@ -361,21 +371,22 @@ struct RuntimeDirs {
 
 impl RuntimeDirs {
     fn from_settings(settings: Option<&crate::settings::Settings>) -> Self {
+        let ambient = ambient_paths();
         let config = std::env::var_os("SVCD_CONFIG_DIR")
             .map(PathBuf::from)
             .or_else(|| settings.and_then(|settings| settings.config_dir.clone()))
             .unwrap_or_else(|| match settings {
-                Some(_) => paths::platform_config_dir(),
-                None => paths::config_dir(),
+                Some(_) => crate::paths::platform_config_dir(),
+                None => ambient.config_dir.clone(),
             });
         let data = settings
             .and_then(|settings| settings.install_data_dir())
             .or_else(|| std::env::var_os("SVCD_DATA_DIR").map(PathBuf::from))
-            .unwrap_or_else(paths::data_dir);
+            .unwrap_or(ambient.data_dir);
         let logs = settings
             .and_then(|settings| settings.install_logs_dir())
             .or_else(|| std::env::var_os("SVCD_LOG_DIR").map(PathBuf::from))
-            .unwrap_or_else(paths::logs_dir);
+            .unwrap_or(ambient.logs_dir);
         RuntimeDirs { config, data, logs }
     }
 
@@ -454,7 +465,7 @@ fn record_install_dir(path: &Path, install_dir: &Path) -> Result<(), String> {
 /// Parse the installed `svcd.conf`, if there is one, so `--uninstall` can find
 /// an `install_dir` without a `--conf` argument (uninstall does not accept one).
 fn installed_conf_settings() -> Option<crate::settings::Settings> {
-    let path = paths::config_dir().join("svcd.conf");
+    let path = ambient_paths().config_dir.join("svcd.conf");
     let text = fs::read_to_string(&path).ok()?;
     crate::settings::parse(&text, path.parent().unwrap_or(Path::new("."))).ok()
 }
@@ -1227,7 +1238,7 @@ pub fn self_install(args: &[String]) -> i32 {
             let base = source
                 .parent()
                 .map(Path::to_path_buf)
-                .unwrap_or_else(|| paths::config_dir());
+                .unwrap_or_else(|| ambient_paths().config_dir);
             let settings = match crate::settings::parse(&text, &base) {
                 Ok(settings) => settings,
                 Err(error) => {
@@ -1800,16 +1811,17 @@ fn user_path_update_skipped() -> bool {
 }
 
 fn self_install_user(request: SelfRequest) -> i32 {
+    let ambient = ambient_paths();
     let runtime = RuntimeDirs {
         config: std::env::var_os("SVCD_CONFIG_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(paths::config_dir),
+            .unwrap_or(ambient.config_dir),
         data: std::env::var_os("SVCD_DATA_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(paths::data_dir),
+            .unwrap_or(ambient.data_dir),
         logs: std::env::var_os("SVCD_LOG_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(paths::logs_dir),
+            .unwrap_or(ambient.logs_dir),
     };
     let install_root = request
         .prefix
@@ -2037,7 +2049,7 @@ fn self_uninstall_current(request: &SelfRequest) -> bool {
     };
     let data = std::env::var_os("SVCD_DATA_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(paths::data_dir);
+        .unwrap_or_else(|| ambient_paths().data_dir);
     let root = request.prefix.clone().unwrap_or_else(|| data.join("bin"));
     let current = current.to_string_lossy().to_ascii_lowercase();
     let root = root.to_string_lossy().to_ascii_lowercase();
@@ -2048,7 +2060,7 @@ fn self_uninstall_current(request: &SelfRequest) -> bool {
 fn uninstaller_path(request: &SelfRequest) -> PathBuf {
     let data = std::env::var_os("SVCD_DATA_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(paths::data_dir);
+        .unwrap_or_else(|| ambient_paths().data_dir);
     request
         .prefix
         .clone()
@@ -2173,9 +2185,10 @@ fn spawn_uninstall_helper(args: &[String]) -> i32 {
 }
 
 fn self_uninstall_user(request: SelfRequest, stop_daemon: &dyn Fn()) -> i32 {
+    let ambient = ambient_paths();
     let data = std::env::var_os("SVCD_DATA_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(paths::data_dir);
+        .unwrap_or(ambient.data_dir.clone());
     let install_root = request.prefix.clone().unwrap_or_else(|| data.join("bin"));
     let target_name = if cfg!(windows) { "svcd.exe" } else { "svcd" };
     let target = install_root.join(target_name);
@@ -2263,11 +2276,11 @@ fn self_uninstall_user(request: SelfRequest, stop_daemon: &dyn Fn()) -> i32 {
         for dir in [
             std::env::var_os("SVCD_CONFIG_DIR")
                 .map(PathBuf::from)
-                .unwrap_or_else(paths::config_dir),
+                .unwrap_or(ambient.config_dir),
             data,
             std::env::var_os("SVCD_LOG_DIR")
                 .map(PathBuf::from)
-                .unwrap_or_else(paths::logs_dir),
+                .unwrap_or(ambient.logs_dir),
         ] {
             if dir.exists() {
                 let _ = fs::remove_dir_all(&dir);
