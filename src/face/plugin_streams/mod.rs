@@ -18,13 +18,13 @@ pub mod ws;
 use std::sync::{Arc, Mutex};
 
 use crate::face::plugin_ui::{PluginUiStream, UiPath};
-use crate::server::http::model as http;
-use crate::server::auth::lan::{AuthKind, Lan};
+use crate::face::uichannel;
 use crate::manage::package;
-use crate::platform::paths::Paths;
 use crate::manage::plugin;
+use crate::platform::paths::Paths;
+use crate::server::auth::lan::{AuthKind, Lan};
+use crate::server::http::model as http;
 use crate::server::http::{Request, StreamHandler};
-use crate::face::uichannel as uichannel;
 
 /// Everything the realtime handlers need that is not the request itself. The
 /// legacy engine always has it; a build without a raw transport has `None`.
@@ -58,7 +58,7 @@ fn valid_ui(paths: &Paths, ui: &UiPath<'_>, require_assets: bool) -> Result<(), 
 }
 
 fn valid_token(lan: &Arc<Mutex<Lan>>, ui: &UiPath<'_>) -> Result<(), Refusal> {
-    if crate::server::auth::lan::plugin_token_valid(lan, ui.token, ui.id) {
+    if crate::server::auth::admission::plugin_token_valid(lan, ui.token, ui.id) {
         Ok(())
     } else {
         Err(http::json_error(

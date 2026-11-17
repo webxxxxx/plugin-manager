@@ -9,10 +9,10 @@
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
+use crate::face::uichannel::{Event, Replay, Subscription};
 use crate::server::http::{
     CloseReason, OutBuffer, StreamAction, StreamEvent, StreamHandler, StreamStep,
 };
-use crate::face::uichannel::{Event, Replay, Subscription};
 
 const HEAD: &[u8] = b"HTTP/1.1 200 OK\r\n\
 Content-Type: text/event-stream\r\n\

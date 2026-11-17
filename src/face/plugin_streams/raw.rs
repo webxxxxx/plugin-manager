@@ -11,12 +11,12 @@ use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::wire::message::ipc::RawFailure;
-use crate::wire::contract::rawhub::{RawEvent, RawHub, RawSubscription};
 use crate::server::http::wire;
 use crate::server::http::{
     CloseReason, OutBuffer, StreamAction, StreamEvent, StreamHandler, StreamStep,
 };
+use crate::wire::contract::rawhub::{RawEvent, RawHub, RawSubscription};
+use crate::wire::message::ipc::RawFailure;
 
 use super::frame::PendingFrame;
 

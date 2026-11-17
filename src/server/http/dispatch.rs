@@ -4,9 +4,10 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::server::http::model as http;
-use crate::server::auth::lan::{AuthKind, Lan};
 use crate::platform::log;
+use crate::server::auth::admission::{Admission, Rejected};
+use crate::server::auth::lan::Lan;
+use crate::server::http::model as http;
 
 use super::contract::{
     body_for, BodyError, BodyPolicy, CompletionSlot, Dispatch, Exchange, ExchangeKind, Face,
@@ -75,20 +76,20 @@ pub(crate) fn route_face_request(
         return Ok(None);
     };
     let principal = if route.public {
-        AuthKind::None
+        Admission::local()
     } else {
-        match lan.lock() {
-            Ok(mut state) => match state.authenticate(&head.headers) {
-                Ok(principal) => principal,
-                Err(()) => {
-                    return Err(http::json_error(
-                        401,
-                        "unauthorized",
-                        "authentication required",
-                    ))
-                }
-            },
-            Err(_) => return Err(http::json_error(500, "internal", "LAN state unavailable")),
+        match Admission::new(lan).admit(&head.headers) {
+            Ok(principal) => principal,
+            Err(Rejected::Unauthorized) => {
+                return Err(http::json_error(
+                    401,
+                    "unauthorized",
+                    "authentication required",
+                ))
+            }
+            Err(Rejected::Unavailable) => {
+                return Err(http::json_error(500, "internal", "LAN state unavailable"))
+            }
         }
     };
     Ok(Some(PreparedFace {

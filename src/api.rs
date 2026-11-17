@@ -21,27 +21,28 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::platform::storage::blob;
-use crate::wire::control::channel;
-use crate::platform::config::Config;
 use crate::face::blob_routes;
 use crate::face::plugin_ui::{ui_path, UiPath};
 use crate::face::support::{decode, error};
-use crate::server::http::model as http;
-use crate::server::auth::lan::{self, AuthKind, Lan, LanStatus};
-use crate::platform::log;
+use crate::face::webui;
 use crate::manage::package;
-use crate::platform::paths::Paths;
 use crate::manage::plugin;
-use crate::wire::message::rpc;
+use crate::platform::config::Config;
+use crate::platform::host::threads;
+use crate::platform::log;
+use crate::platform::paths::Paths;
+use crate::platform::storage::blob;
+use crate::server::auth::admission::{Admission, Rejected};
+use crate::server::auth::lan::{AuthKind, Lan, LanStatus};
 use crate::server::http::engine::HttpRequest;
 use crate::server::http::engine::{keep_alive_response, wants_keep_alive, wants_keep_alive_head};
+use crate::server::http::model as http;
 use crate::server::http::threads::{
     client_gone, drive_fallback, read_body, read_head, write_http, HeadFailure,
 };
 use crate::server::mcp::transport;
-use crate::platform::host::threads;
-use crate::face::webui as webui;
+use crate::wire::control::channel;
+use crate::wire::message::rpc;
 
 pub struct Api {
     lan: Arc<Mutex<Lan>>,
@@ -701,32 +702,30 @@ fn respond(config: &Config, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec
     }
 
     let ui = ui_path(path);
-    let auth = match lan.lock() {
-        Ok(mut state) => match state.authenticate(&request.headers) {
-            Ok(auth) => auth,
-            Err(()) => {
-                // A browser navigation to a plugin UI should land on the
-                // console login instead of raw JSON. API clients keep the 401.
-                if request.method == "GET"
-                    && path.starts_with("/plugin-ui/")
-                    && request_header(request, "accept")
-                        .map(|value| value.contains("text/html"))
-                        .unwrap_or(false)
-                {
-                    return http::response_with_headers(
-                        303,
-                        "text/plain; charset=utf-8",
-                        &[(
-                            "Location".to_string(),
-                            format!("/?next={}", webui::encode_query_value(path)),
-                        )],
-                        b"",
-                    );
-                }
-                return error(401, "unauthorized", "authentication required");
+    let auth = match Admission::new(lan).admit(&request.headers) {
+        Ok(auth) => auth,
+        Err(Rejected::Unavailable) => return error(500, "internal", "LAN state unavailable"),
+        Err(Rejected::Unauthorized) => {
+            // A browser navigation to a plugin UI should land on the
+            // console login instead of raw JSON. API clients keep the 401.
+            if request.method == "GET"
+                && path.starts_with("/plugin-ui/")
+                && request_header(request, "accept")
+                    .map(|value| value.contains("text/html"))
+                    .unwrap_or(false)
+            {
+                return http::response_with_headers(
+                    303,
+                    "text/plain; charset=utf-8",
+                    &[(
+                        "Location".to_string(),
+                        format!("/?next={}", webui::encode_query_value(path)),
+                    )],
+                    b"",
+                );
             }
-        },
-        Err(_) => return error(500, "internal", "LAN state unavailable"),
+            return error(401, "unauthorized", "authentication required");
+        }
     };
     // `/plugin-ui/{id}/rpc` keeps the same-origin Origin check instead of the
     // management API's custom CSRF header, so a plugin's own page can call it
@@ -796,7 +795,7 @@ fn plugin_ui(
 }
 
 pub(crate) fn token_valid(lan: &Arc<Mutex<Lan>>, token: &str, plugin: &str) -> bool {
-    lan::plugin_token_valid(lan, token, plugin)
+    crate::server::auth::admission::plugin_token_valid(lan, token, plugin)
 }
 
 fn serve_ui(request: &HttpRequest, assets: &plugin::WebAssets, sub: &str, base: &str) -> Vec<u8> {
