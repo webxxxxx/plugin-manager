@@ -126,7 +126,7 @@ pub fn current() -> Result<&'static Settings, String> {
         .map_err(Clone::clone)
 }
 
-/// The file this process loaded. `svc auth passwd` updates this exact file.
+/// The file this process loaded. `svc lan passwd` updates this exact file.
 pub fn path() -> Option<&'static Path> {
     CONFIG_PATH.get().map(PathBuf::as_path)
 }
@@ -381,7 +381,7 @@ fn parse_usize(value: &str, key: &str, index: usize) -> Result<usize, String> {
 }
 
 /// Replace one key in an existing conf, preserving comments and other keys.
-/// Used by `svc auth passwd` to write `auth_passwd` without a restart.
+/// Used by `svc lan passwd` to write `auth_passwd` without a restart.
 pub fn update_value(path: &Path, key: &str, value: &str) -> Result<(), String> {
     let text =
         fs::read_to_string(path).map_err(|error| format!("read {}: {}", path.display(), error))?;

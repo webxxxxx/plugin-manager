@@ -48,7 +48,7 @@
 - 安装需 root / Administrator；幂等（原子替换 + EnsureLine；`sc create` 1073 视为已存在）。
 - `svcd --install [--prefix] [--conf <file>] [--no-service] [--target]`：复制/硬链 `svcd`、`svc`、`plugin`、`mcp` 到平台默认目录（Unix `/usr/sbin`，Windows `%ProgramFiles%\svcd`），再调用 `install-service --program <安装路径>`；`--uninstall` 逆操作，默认保留 config/data/logs，`--purge` 才清。
 - `svcd --install --conf <file>`：校验并原子复制到 `<config>/svcd.conf`。键：`bind`（默认 `127.0.0.1:8787`；非 loopback 需要 `auth_passwd`，缺失时降级 loopback；`SVCD_BIND` 覆盖）、`allow_insecure_install`（默认 false；开启后验签失败时降级接受未签名包，没有逐次开关）、`config_dir`、`plugins_dir`、`services_dir`、`auth_passwd`。相对路径相对 `<config>`；未知键/坏值拒绝且不覆盖已安装配置；`--uninstall` 默认保留，`--purge` 删除。
-- 服务启动配置优先级：`--conf`（`--install --conf` 记录到服务命令行）→ 程序目录 `svcd.conf` → `<config>/svcd.conf`（legacy）→ 生成默认（`<config>/svcd.conf`；不可写时程序目录）。默认含 `bind = 127.0.0.1:8787`、`allow_insecure_install = false`、`config_dir` 与平台 plugin/services 路径；`auth_passwd` 由 `svc auth passwd` 写入。模板见根目录 `svcd.conf.example`。
+- 服务启动配置优先级：`--conf`（`--install --conf` 记录到服务命令行）→ 程序目录 `svcd.conf` → `<config>/svcd.conf`（legacy）→ 生成默认（`<config>/svcd.conf`；不可写时程序目录）。默认含 `bind = 127.0.0.1:8787`、`allow_insecure_install = false`、`config_dir` 与平台 plugin/services 路径；`auth_passwd` 由 `svc lan passwd` 写入。模板见根目录 `svcd.conf.example`。
 - 卸载默认保留 `<data>` 与配置，`--purge` 才删。
 
 ### 1.6 core 服务与 plugin 的边界
@@ -262,7 +262,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 - 监听：与 HTTP UI 同一个 listener；默认 loopback，LAN 需显式开启；单请求体上限 1 MiB。
 - legacy 客户端走 `mcp` stdio 桥（§3.2）；HTTP 只做 modern。
 - 工具可见性/错误映射与 §3.2 完全相同；死服务只出 `<id>.start`。
-- **实现状态（2026-11-12，#40）**：`POST /mcp` 已实现 modern-only Streamable HTTP：单请求单 JSON 响应、无 session / 无 SSE，`GET`/`DELETE` 返回 405。逐请求校验 `MCP-Protocol-Version`（必须等于正文 `_meta` 版本）、`Mcp-Method`、`tools/call` 的 `Mcp-Name`（支持 `=?base64?…?=` 哨兵）：头缺失或头/正文值不一致返回 400 + `-32020`；正文缺 `_meta` 字段按核心规范 400 + `-32602`（与 stdio 同一条错误）；未知方法 404 + `-32601`；未实现版本 400 + `-32022`（带 `supported`）；`Origin` 必须同源（否则 403）。`Authorization: Bearer <password>` 必需：缺密码 401（带 `WWW-Authenticate: Bearer`）、密码错 403，cookie 完全不参与；未设置 `auth_passwd` 时端点保持关闭，`svc auth passwd <password>` 可在不开 LAN 时设置密码。`server/discover` / `tools/list` / `tools/call` 走与 stdio 桥相同的 `mcp::serve_modern`（`resultType:"complete"`、`ttlMs:1000`、`cacheScope:"private"`、`<id>.start` 可见性、`isError` 映射）；正文上限 1 MiB（超限 413）；通知 POST 返回 202 空体（该修订未定义通知的头要求，故不做镜像校验）；控制通道不可达仍回 JSON-RPC（与 stdio 同映射，不引入 503）；不做 `subscriptions/listen`。
+- **实现状态（2026-11-12，#40）**：`POST /mcp` 已实现 modern-only Streamable HTTP：单请求单 JSON 响应、无 session / 无 SSE，`GET`/`DELETE` 返回 405。逐请求校验 `MCP-Protocol-Version`（必须等于正文 `_meta` 版本）、`Mcp-Method`、`tools/call` 的 `Mcp-Name`（支持 `=?base64?…?=` 哨兵）：头缺失或头/正文值不一致返回 400 + `-32020`；正文缺 `_meta` 字段按核心规范 400 + `-32602`（与 stdio 同一条错误）；未知方法 404 + `-32601`；未实现版本 400 + `-32022`（带 `supported`）；`Origin` 必须同源（否则 403）。`Authorization: Bearer <password>` 必需：缺密码 401（带 `WWW-Authenticate: Bearer`）、密码错 403，cookie 完全不参与；未设置 `auth_passwd` 时端点保持关闭，`svc lan passwd <password>` 可在不开 LAN 时设置密码。`server/discover` / `tools/list` / `tools/call` 走与 stdio 桥相同的 `mcp::serve_modern`（`resultType:"complete"`、`ttlMs:1000`、`cacheScope:"private"`、`<id>.start` 可见性、`isError` 映射）；正文上限 1 MiB（超限 413）；通知 POST 返回 202 空体（该修订未定义通知的头要求，故不做镜像校验）；控制通道不可达仍回 JSON-RPC（与 stdio 同映射，不引入 503）；不做 `subscriptions/listen`。
 
 ### 3.5 HTTP 管理 API
 
@@ -296,19 +296,19 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 - HTTP/1.1 keep-alive：同一连接顺序处理多个请求；`Connection: close` 显式关闭；不支持 pipelining；每个连接仍占一个线程。
 - **嵌入式构建（#86）**：默认 feature `http`（HTTP 管理 API、内嵌控制台、插件 Web UI、LAN、MCP HTTP）。`cargo build --release --no-default-features` 移除这些，保留 daemon/supervisor、channel、CLI 与 MCP stdio；Windows 二进制约 1.14 MB → 1.00 MB，musl 约 1.36 MB → 1.21 MB。HTTP/channel/plugin reader/WS worker 线程使用 128–256 KB 显式栈（默认约 2 MB）；musl 下 daemon VM @30 插件由约 128 MB 降到约 11.6 MB，RSS 基本不变。
 - **实现状态（2026-11-13，#79/#83）**：HTTP 监听改为阻塞 accept；daemon 改用 condvar 唤醒控制通道和插件 stdout，事件循环只在 50ms 兜底等待中检查 shutdown/定时器，无 1ms 轮询；`/api/v1` 与 `/mcp` 支持 HTTP/1.1 keep-alive（顺序多请求，`Connection: close` 可关闭），WS/SSE 仍独占连接。性能对比见 `docs/research/2026-11-13-core-compat-and-performance.md`。
-- **实现状态（2026-11-12，#37 / #38 / #39）**：已实现 `GET /services`、`GET /services/{id}`、`POST start/stop`、`GET /version`、`POST /plugins`、`DELETE /plugins/{id}`；`bind` 默认 `127.0.0.1:8787`（`SVCD_BIND` 覆盖；`0` 端口写 `<config>/http.port`），非 loopback 需要密码 cookie/Bearer，**无 TLS**；`svc auth enable/disable` 已删除，认证由 `bind` 推导。#39 补齐 `GET/PUT /config/{id}`、`POST /config/{id}/reset`、`GET /export/{id}/spk`（可安装 `.spk`）、`GET /export/{id}`（`.spkb` 备份）、`GET /export/{id}/config`、`POST /import`（自动识别）、`GET /logs/{id}?lines=N`（默认 200、上限 2000、不提供 follow）、`POST /services/{id}/enable|disable`；这些端点只接受 plugin id，core 服务返回 404，方法不符返回 405。`GET /` 提供内嵌控制台（插件列表/安装/启停/自启/打开/配置/日志/导出）：上传按钮直接弹文件框，公钥上传在顶栏，无配置的插件不显示“配置”，有 web/gui UI 的插件显示“打开”，日志弹框可 3 秒自动刷新，删除走 `purge=true`。“安装包”导出 `/export/{id}/spk`（签名包，使用包内配置模板）；“导出备份”导出 `/export/{id}` 的 `.spkb`（签名包 + 当前活动配置），可直接在“上传安装”里选择 `.spkb` 走 `POST /import` 恢复。页面无需认证即可加载，API 调用仍走同一鉴权。
+- **实现状态（2026-11-12，#37 / #38 / #39）**：已实现 `GET /services`、`GET /services/{id}`、`POST start/stop`、`GET /version`、`POST /plugins`、`DELETE /plugins/{id}`；`bind` 默认 `127.0.0.1:8787`（`SVCD_BIND` 覆盖；`0` 端口写 `<config>/http.port`），非 loopback 需要密码 cookie/Bearer，**无 TLS**；`svc lan enable/disable` 已删除，认证由 `bind` 推导。#39 补齐 `GET/PUT /config/{id}`、`POST /config/{id}/reset`、`GET /export/{id}/spk`（可安装 `.spk`）、`GET /export/{id}`（`.spkb` 备份）、`GET /export/{id}/config`、`POST /import`（自动识别）、`GET /logs/{id}?lines=N`（默认 200、上限 2000、不提供 follow）、`POST /services/{id}/enable|disable`；这些端点只接受 plugin id，core 服务返回 404，方法不符返回 405。`GET /` 提供内嵌控制台（插件列表/安装/启停/自启/打开/配置/日志/导出）：上传按钮直接弹文件框，公钥上传在顶栏，无配置的插件不显示“配置”，有 web/gui UI 的插件显示“打开”，日志弹框可 3 秒自动刷新，删除走 `purge=true`。“安装包”导出 `/export/{id}/spk`（签名包，使用包内配置模板）；“导出备份”导出 `/export/{id}` 的 `.spkb`（签名包 + 当前活动配置），可直接在“上传安装”里选择 `.spkb` 走 `POST /import` 恢复。页面无需认证即可加载，API 调用仍走同一鉴权。
 
 ### 3.6 LAN 鉴权与会话
 
 - 默认只绑 `127.0.0.1:8787`；要开 LAN 改 `bind = 0.0.0.0:8787` 并重启。非 loopback 没有 `auth_passwd` 时 daemon 降级 loopback 并报错。
-- 密码通过 `svc auth passwd <plaintext>` 设置，明文不进配置文件；daemon 用 PBKDF2-HMAC-SHA256（随机盐，`pbkdf2-sha256$<iterations>$<salt>$<hash>`）写入 `svcd.conf` 的 `auth_passwd`，并立即清空已有会话。密码（**等价 root / Administrator**）只用于登录与 Bearer；无用户体系、无注册。
-- `svc auth status` 显示 requested/effective bind、`authRequired` 和 `passwordSet`；`svc auth enable/disable` 已删除。
+- 密码通过 `svc lan passwd <plaintext>` 设置，明文不进配置文件；daemon 用 PBKDF2-HMAC-SHA256（随机盐，`pbkdf2-sha256$<iterations>$<salt>$<hash>`）写入 `svcd.conf` 的 `auth_passwd`，并立即清空已有会话。密码（**等价 root / Administrator**）只用于登录与 Bearer；无用户体系、无注册。
+- `svc lan status` 显示 requested/effective bind、`authRequired` 和 `passwordSet`；`svc lan enable/disable` 已删除。
 - 登录：`POST /login` 带 `{password}` → 设两个 cookie：`svcd_session`（Path=`/`）与 `svcd_api`（Path=`/api/v1/`），均 HttpOnly、SameSite=Strict、Max-Age=86400、无 Secure（无 TLS）；滑动续期 24h；`POST /logout` 清两个并撤销服务端会话。同一密码也可直接作为 `Authorization: Bearer` 访问 `/mcp` 与 `/api/v1/*`。
 - LAN 开启时 `/plugin-ui/*` 与 `/rpc` 都要求会话；插件 UI 另外要求 per-plugin token（路径 `/plugin-ui/{id}/{token}/`，见 §3.5）；`/rpc` 保留 Origin 校验：只接受同源 Origin/Host、拒绝 CORS，cookie 调用必须带同源 `Origin`，但不要求 `X-Svcd-Csrf`（SameSite=Strict + 同源 Origin 承担 CSRF/DNS rebinding）；`/api/v1` 的 cookie 写仍要求 `X-Svcd-Csrf`。
 - 登录失败固定 1s 延迟，连续 10 次锁 5 分钟（内存）。
 - **v1 不支持 TLS**：核心不终止、不生成证书；要 HTTPS 就在前面放反代。明文密码过 LAN 的风险写进文档；默认关闭 LAN 是安全默认。
 - 单用户 / 单角色；多用户、角色不做；HTTP 管理 API 见 §3.5。
-- **实现状态（2026-11-15）**：`bind` 决定监听与认证（loopback 免密，非 loopback 必须有 `auth_passwd`）；`svc auth passwd` 写 `auth_passwd` 哈希并热更新，`svc auth status` 只读；`POST /login` 下发 `svcd_session`（Path=`/`）/`svcd_api` 两个 cookie；`/api/v1` 收 Bearer 密码或 cookie，cookie 写要求同源 `Origin` + `X-Svcd-Csrf: 1`；`POST /logout` 撤销服务端会话；登录失败 1s、10 次锁 5 分钟。`/mcp` 的 Bearer 面由 #40 实现（见 §3.4）；cookie 不参与 MCP 认证。
+- **实现状态（2026-11-15）**：`bind` 决定监听与认证（loopback 免密，非 loopback 必须有 `auth_passwd`）；`svc lan passwd` 写 `auth_passwd` 哈希并热更新，`svc lan status` 只读；`POST /login` 下发 `svcd_session`（Path=`/`）/`svcd_api` 两个 cookie；`/api/v1` 收 Bearer 密码或 cookie，cookie 写要求同源 `Origin` + `X-Svcd-Csrf: 1`；`POST /logout` 撤销服务端会话；登录失败 1s、10 次锁 5 分钟。`/mcp` 的 Bearer 面由 #40 实现（见 §3.4）；cookie 不参与 MCP 认证。
 
 ## 4. OSAL 与平台边界
 
@@ -380,7 +380,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 - **所有服务进程（core 脚本/bin、plugin）与 hooks 以 svcd 身份运行**：Linux / macOS = root，Windows = LocalSystem。不降权、不做每服务身份、不做沙箱、不设 `privilege` 字段。
 - 服务之间没有身份隔离：可互读数据、互发信号；这是接受的取舍。core 定义无签名，信任来自 root 所有的 `services.d/*.json` 与本机管理员；plugin 信任来自 Ed25519 签名 + `trust.d`。
 - 本地授权两档：
-  - root / Administrator：install、upgrade、uninstall、`editconfig`、`import`、`svc auth passwd` / enable / disable。
+  - root / Administrator：install、upgrade、uninstall、`editconfig`、`import`、`svc lan passwd`。
   - `svcd` 组：start / stop / status / logs、`editconfig --print`、`export`（只读）。
 - 两档由控制通道的两个端点实施（§3.1）：`svcd` 端点只接受组档方法，`svcd-admin` 端点只接受 root / Administrator。端点 ACL 即鉴权，请求不携带凭据。
 - Windows 上 `svcd install-service` 建/校验 `svcd` 本地组，系统模式 daemon 启动时组缺失即失败；`uninstall-service` 不删组（误删成员比留一个成员更危险）。

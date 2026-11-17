@@ -49,7 +49,7 @@ node tools/gen_sample_key.mjs
 python3 tools/spk_smoke.py --binary target/debug/svcd
 ```
 
-The harness uses the documented password writer (`svc auth passwd`) after
+The harness uses the documented password writer (`svc lan passwd`) after
 starting the daemon, so it needs root or a debug build (where the test-only
 `SVCD_TEST_UNPRIVILEGED=1` bypass is compiled in; the harness sets it). Use a
 release binary only when running the smoke as root.

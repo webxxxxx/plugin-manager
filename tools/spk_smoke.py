@@ -519,13 +519,13 @@ class Smoke:
         )
         self._wait_for_http()
         # The password is written only through the documented writer, so the
-        # harness never owns the PBKDF2 wire format. `svc auth passwd` needs
+        # harness never owns the PBKDF2 wire format. `svc lan passwd` needs
         # root, or a debug build with SVCD_TEST_UNPRIVILEGED=1 (which this env
         # already sets) — that is why CI runs the smoke against target/debug.
-        code, output = cli(os.path.join(self.bin, "svc"), ["auth", "passwd", PASSWORD], self.env)
+        code, output = cli(os.path.join(self.bin, "svc"), ["lan", "passwd", PASSWORD], self.env)
         require(
             code == 0,
-            "svc auth passwd failed (%d): %s\nrun as root or use a debug build (SVCD_TEST_UNPRIVILEGED=1)"
+            "svc lan passwd failed (%d): %s\nrun as root or use a debug build (SVCD_TEST_UNPRIVILEGED=1)"
             % (code, output),
         )
         if self.args.lan:

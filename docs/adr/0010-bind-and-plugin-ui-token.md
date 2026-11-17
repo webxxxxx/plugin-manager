@@ -1,5 +1,7 @@
 # HTTP bind 与插件 UI token
 
+> CLI 名称后来由 [ADR-0018](0018-svc-lan-command-name.md) 恢复为 `svc lan`；本文的 `svc auth` 均指当前的 `svc lan`，`svc auth` 保留为兼容别名。
+
 ## Decision
 
 - **`bind` 取代 `http_port` + `lan_default`**：`svcd.conf` 只写一个 `bind = <ip>:<port>`，默认 `127.0.0.1:8787`。不再保留 `lan.json`、`http_port`、`lan_default` 旧键，也不做迁移；旧配置会被当作未知键拒绝。

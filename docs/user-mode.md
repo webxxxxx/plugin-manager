@@ -126,7 +126,7 @@ svc list
 
 以上命令在非 root 下自动使用用户配置，**不再要求 root/Administrator**。
 
-`svc auth passwd`、`plugin edit-config`、`svc trust add` 在 user mode 下也允许当前用户操作自己的实例。
+`svc lan passwd`、`plugin edit-config`、`svc trust add` 在 user mode 下也允许当前用户操作自己的实例。
 
 ## 与 root 系统 daemon 的关系
 

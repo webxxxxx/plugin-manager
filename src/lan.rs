@@ -99,7 +99,7 @@ impl Lan {
             }
         }
         let Some(hash) = self.password_hash.as_deref() else {
-            return Err("no password configured; run svc auth passwd".into());
+            return Err("no password configured; run svc lan passwd".into());
         };
         if crate::auth::verify_password(password, hash) {
             self.failures = 0;

@@ -2,6 +2,7 @@
 
 > 已被 [ADR 0010](0010-bind-and-plugin-ui-token.md) 部分取代：`svc auth enable/disable`、`lan.json`、`lan_default` 已删除，认证改由 `bind` 推导；本文保留当时的决策背景。
 > Windows 系统模式的默认配置目录已由 [ADR 0017](0017-windows-machine-wide-config.md) 取代为 `%ProgramData%\svcd\config`。
+> CLI 命令名已由 [ADR 0018](0018-svc-lan-command-name.md) 恢复为 `svc lan`；`svc auth` 仅保留为兼容别名。
 
 `svc lan` 把「LAN 开关」和「管理员 token」绑在一起：首次 `enable` 生成随机 token、写 `lan-token`、只打印一次，UI 用 token 登录。token 长、不能记忆，用户经常把 `svcd.token`（本地控制通道）和 `lan-token` 混用；`svc lan token rotate` 又让「改密码」和「轮换 API 凭据」耦合。配置目录则固定在平台路径，Windows 默认落在 `%ProgramData%\svcd\config`，与用户可读写的 home 不一致。
 
