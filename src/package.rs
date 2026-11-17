@@ -2172,28 +2172,97 @@ pub fn pem_from_public(key: &[u8; 32]) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
-    use serde_json::{json, Value};
-    use std::sync::OnceLock;
+static TEST_SIGNING_KEY: std::sync::OnceLock<ed25519_dalek::SigningKey> =
+    std::sync::OnceLock::new();
 
-    static TRUST: OnceLock<tempdir::TempDir> = OnceLock::new();
+#[cfg(test)]
+static TEST_TRUST: std::sync::OnceLock<tempdir::TempDir> = std::sync::OnceLock::new();
 
-    fn setup() -> SigningKey {
-        let key = SigningKey::from_bytes(&[7u8; 32]);
-        let dir = TRUST.get_or_init(|| {
+/// The one signing key every unit test that verifies a package shares.
+#[cfg(test)]
+fn test_signing_key() -> ed25519_dalek::SigningKey {
+    TEST_SIGNING_KEY
+        .get_or_init(|| ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]))
+        .clone()
+}
+
+/// Point `SVCD_TRUST_DIR` at one process-wide directory and install the shared
+/// test key there. Package and daemon unit tests run in the same process, so two
+/// independent `set_var` calls would race; every test uses this initializer.
+#[cfg(test)]
+fn test_trust_dir() -> &'static std::path::Path {
+    TEST_TRUST
+        .get_or_init(|| {
             let dir = tempdir::TempDir::new();
             std::env::set_var("SVCD_TRUST_DIR", dir.path());
             std::fs::write(
                 dir.path().join("test.pub"),
-                pem_from_public(&key.verifying_key().to_bytes()),
+                pem_from_public(&test_signing_key().verifying_key().to_bytes()),
             )
-            .expect("write key");
+            .expect("write test key");
             dir
-        });
-        let _ = dir;
-        key
+        })
+        .path()
+}
+
+/// A signed package for tests outside this module: two payload files, the
+/// shared test key, and the caller's name and platform.
+#[cfg(test)]
+pub(crate) fn test_signed_package(name: &str, platform: &str) -> Vec<u8> {
+    use ed25519_dalek::Signer;
+
+    let _ = test_trust_dir();
+    let files: Vec<(&str, &[u8], u32)> = vec![
+        ("payload/bin/demo", b"hello", 0o755),
+        ("config/config", b"{}", 0o644),
+    ];
+    let entries: Vec<serde_json::Value> = files
+        .iter()
+        .map(|(path, data, mode)| {
+            serde_json::json!({
+                "path": path,
+                "size": data.len(),
+                "sha256": hex_sha256(data),
+                "mode": mode,
+            })
+        })
+        .collect();
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "schema": 1,
+        "name": name,
+        "version": "1.0.0",
+        "desc": "test package",
+        "platform": platform,
+        "protocol": 1,
+        "exec": {"path": "payload/bin/demo"},
+        "files": entries,
+        "config": "config/config",
+    }))
+    .expect("manifest");
+    let signature = serde_json::to_vec(&serde_json::json!({
+        "alg": "ed25519",
+        "keyId": "test",
+        "sig": BASE64.encode(test_signing_key().sign(&manifest).to_bytes()),
+    }))
+    .expect("signature");
+    let tar_entries: Vec<(&str, &[u8], u32)> = vec![
+        ("manifest.json", manifest.as_slice(), 0o644),
+        ("signature.json", signature.as_slice(), 0o644),
+        ("payload/bin/demo", files[0].1, files[0].2),
+        ("config/config", files[1].1, files[1].2),
+    ];
+    write_tar(&tar_entries).expect("write package tar")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use serde_json::{json, Value};
+
+    fn setup() -> SigningKey {
+        let _ = test_trust_dir();
+        test_signing_key()
     }
 
     type TestFiles = Vec<(&'static str, Vec<u8>, u32)>;
