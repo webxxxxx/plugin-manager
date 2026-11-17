@@ -46,6 +46,15 @@ pub struct PendingRequest {
 }
 
 #[cfg(unix)]
+impl PendingRequest {
+    /// Whether the in-flight request is HEAD. The loop keeps the parsed head
+    /// while a body error is rendered, so the error reply can stay body-less.
+    pub fn head_only(&self) -> bool {
+        crate::http::is_head(&self.method)
+    }
+}
+
+#[cfg(unix)]
 pub enum PendingFraming {
     None,
     Length(u64),
@@ -420,15 +429,6 @@ pub fn advance_request<S>(
         let framing = http::framing(&head.headers)
             .map_err(|message| crate::http::json_error(400, "bad_request", &message))?;
         let limit = body_limit(&head.path);
-        if let http::Framing::Length(length) = framing {
-            if length > limit {
-                return Err(crate::http::json_error(
-                    413,
-                    "payload_too_large",
-                    "request body is too large",
-                ));
-            }
-        }
         let buffer = std::mem::take(&mut connection.buffer);
         connection.buffer = buffer[body_start..].to_vec();
         connection.pending = Some(PendingRequest {
@@ -443,6 +443,17 @@ pub fn advance_request<S>(
                 http::Framing::Chunked => PendingFraming::Chunked(http::ChunkedDecoder::new(limit)),
             },
         });
+        // Record the head before rejecting an oversized body: on_error reads
+        // the pending method to keep a HEAD error reply body-less.
+        if let http::Framing::Length(length) = framing {
+            if length > limit {
+                return Err(crate::http::json_error(
+                    413,
+                    "payload_too_large",
+                    "request body is too large",
+                ));
+            }
+        }
     }
 
     let mut ready = false;

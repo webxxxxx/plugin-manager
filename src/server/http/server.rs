@@ -81,6 +81,7 @@ enum WorkResult {
         connection: u64,
         response: Vec<u8>,
         keep_alive: bool,
+        head_only: bool,
     },
     StreamJobDone {
         connection: u64,
@@ -94,6 +95,7 @@ struct PendingBlocking {
     slot: CompletionSlot,
     body: BodyPolicy,
     keep_alive: bool,
+    head_only: bool,
 }
 
 pub(crate) fn start(
@@ -241,6 +243,7 @@ impl ServerLoop for Server {
         else {
             return PreRequest::Continue;
         };
+        let head_only = http::is_head(&head.method);
         let claim = self
             .routes
             .plugin_ui(
@@ -258,7 +261,7 @@ impl ServerLoop for Server {
         let exchange = match claim {
             Ok(exchange) => exchange,
             Err(response) => {
-                write_response(connection, response, false);
+                write_response(connection, response, false, head_only);
                 return PreRequest::Handled;
             }
         };
@@ -271,18 +274,20 @@ impl ServerLoop for Server {
                     "a streamed route returned a memory response",
                 ),
                 false,
+                head_only,
             );
             return PreRequest::Handled;
         };
         let initial = connection.buffer.split_off(body_start);
         connection.buffer.clear();
-        attach_stream(connection, handler, &initial, None);
+        attach_stream(connection, handler, &initial, None, head_only);
         self.service_stream_job(connection);
         PreRequest::Handled
     }
 
     fn on_request(&mut self, connection: &mut Connection, request: HttpRequest) {
         let keep_alive = wants_keep_alive(&request);
+        let head_only = http::is_head(&request.method);
         if self.serve_face(connection, &request, keep_alive) {
             return;
         }
@@ -317,6 +322,7 @@ impl ServerLoop for Server {
                             connection,
                             crate::server::http::stream_busy_response(),
                             false,
+                            head_only,
                         );
                         return;
                     };
@@ -342,12 +348,12 @@ impl ServerLoop for Server {
                     );
                     // The slot reserved above becomes the driver's
                     // `max_streams` permit.
-                    attach_stream(connection, Box::new(handler), &[], Some(permit));
+                    attach_stream(connection, Box::new(handler), &[], Some(permit), head_only);
                     return;
                 }
                 Ok(None) => {}
                 Err(response) => {
-                    write_response(connection, response, false);
+                    write_response(connection, response, false, head_only);
                     return;
                 }
             }
@@ -356,7 +362,13 @@ impl ServerLoop for Server {
     }
 
     fn on_error(&mut self, connection: &mut Connection, response: Vec<u8>) {
-        write_response(connection, response, false);
+        // The parsed request head survives a body/framing error, so a HEAD
+        // error reply can still omit its body.
+        let head_only = connection
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.head_only());
+        write_response(connection, response, false, head_only);
     }
 
     fn on_readable(&mut self, connection: &mut Connection) -> bool {
@@ -413,12 +425,13 @@ impl ServerLoop for Server {
                     connection,
                     response,
                     keep_alive,
+                    head_only,
                 } => {
                     // The pool's own BlockingDone clears stream_job_keys; this
                     // map only tracks the connection's one in-flight job.
                     self.stream_jobs.remove(&connection);
                     if let Some(connection) = connections.get_mut(&connection) {
-                        write_response(connection, response, keep_alive);
+                        write_response(connection, response, keep_alive, head_only);
                     }
                 }
                 WorkResult::BlockingDone { key, outcome } => {
@@ -439,6 +452,7 @@ impl ServerLoop for Server {
                         continue;
                     };
                     let exchange = pending.slot.take();
+                    let head_only = pending.head_only;
                     let Some(connection) = connections.get_mut(&key) else {
                         // The client disconnected while the job was running.
                         // The sealed slot drops a late completion.
@@ -455,7 +469,7 @@ impl ServerLoop for Server {
                             (response, pending.keep_alive)
                         }
                     };
-                    write_response(connection, response, keep_alive);
+                    write_response(connection, response, keep_alive, head_only);
                 }
                 WorkResult::StreamJobDone {
                     connection: id,
@@ -609,6 +623,7 @@ impl Server {
     ) {
         let id = connection.id;
         let key = self.next_job_key();
+        let head_only = http::is_head(&request.method);
         let submitted = submit_rendered_job(
             &self.blocking,
             id,
@@ -619,6 +634,7 @@ impl Server {
             self.notify.try_clone().ok(),
             request,
             keep_alive,
+            head_only,
         );
         match submitted {
             Ok(()) => {
@@ -630,7 +646,7 @@ impl Server {
                 self.stream_job_keys.insert(key);
                 connection.state = ConnState::Processing;
             }
-            Err(busy) => write_response(connection, blocking_busy(busy), false),
+            Err(busy) => write_response(connection, blocking_busy(busy), false, head_only),
         }
     }
 
@@ -703,6 +719,7 @@ impl Server {
         request: &HttpRequest,
         keep_alive: bool,
     ) -> bool {
+        let head_only = http::is_head(&request.method);
         let prepared = match prepare_face_request(
             self.face.as_ref(),
             request,
@@ -720,6 +737,7 @@ impl Server {
                         response
                     },
                     keep_alive,
+                    head_only,
                 );
                 return true;
             }
@@ -734,13 +752,13 @@ impl Server {
                         } else {
                             response.into_bytes()
                         };
-                        write_response(connection, response, keep_alive);
+                        write_response(connection, response, keep_alive, head_only);
                     }
                     Ok(Exchange::Stream(handler)) => {
                         // A streamed response is not a keep-alive response: its
                         // handler may own a file range and the wire head says
                         // `Connection: close`.
-                        attach_stream(connection, handler, &[], None);
+                        attach_stream(connection, handler, &[], None, head_only);
                         self.service_stream_job(connection);
                     }
                     Err(cause) => {
@@ -753,6 +771,7 @@ impl Server {
                                 response
                             },
                             keep_alive,
+                            head_only,
                         );
                     }
                 }
@@ -776,6 +795,7 @@ impl Server {
                                 slot,
                                 body: prepared.route.body,
                                 keep_alive,
+                                head_only,
                             },
                         );
                         connection.state = ConnState::Processing;
@@ -785,7 +805,7 @@ impl Server {
                         // cannot submit a second job for one connection. The
                         // pool still enforces one-per-connection for future
                         // engines and stream handlers.
-                        write_response(connection, blocking_busy(busy), false);
+                        write_response(connection, blocking_busy(busy), false, head_only);
                     }
                 }
             }
@@ -803,6 +823,7 @@ fn attach_stream(
     handler: Box<dyn StreamHandler>,
     initial: &[u8],
     reserved: Option<StreamPermit>,
+    head_only: bool,
 ) {
     connection.keep_alive = false;
     let mut driver = match reserved {
@@ -814,6 +835,7 @@ fn attach_stream(
                     connection,
                     crate::server::http::stream_busy_response(),
                     false,
+                    head_only,
                 );
                 return;
             }
@@ -916,8 +938,20 @@ fn stream_tick(connection: &mut Connection, now: Instant) -> bool {
     driver.on_tick(now, stream, out, out_at, last_active)
 }
 
-fn write_response(connection: &mut Connection, response: Vec<u8>, keep_alive: bool) {
-    connection.out = response;
+/// Write one already-rendered response. A HEAD response keeps its head (and
+/// therefore GET's `Content-Length`) but never its body; otherwise the body
+/// would be left on a keep-alive connection and parsed as the next response.
+fn write_response(
+    connection: &mut Connection,
+    response: Vec<u8>,
+    keep_alive: bool,
+    head_only: bool,
+) {
+    connection.out = if head_only {
+        http::head_only(response)
+    } else {
+        response
+    };
     connection.out_at = 0;
     connection.keep_alive = keep_alive;
     connection.state = ConnState::Writing;
@@ -953,6 +987,7 @@ fn submit_rendered_job(
     notify: Option<UnixStream>,
     request: HttpRequest,
     keep_alive: bool,
+    head_only: bool,
 ) -> Result<(), Busy> {
     pool.try_submit(key, move |cancel| {
         if cancel.is_cancelled() {
@@ -968,6 +1003,7 @@ fn submit_rendered_job(
             connection,
             response,
             keep_alive,
+            head_only,
         });
         if let Some(notify) = &notify {
             let _ = (&*notify).write(&[1]);
@@ -1035,7 +1071,16 @@ mod tests {
             body: Vec::new(),
         };
         let busy = submit_rendered_job(
-            &pool, 7, 3, fallback, lan, results, Some(notify), request, false,
+            &pool,
+            7,
+            3,
+            fallback,
+            lan,
+            results,
+            Some(notify),
+            request,
+            false,
+            false,
         )
         .expect_err("a full pool must refuse the route");
         assert_eq!(busy, Busy::QueueFull);
