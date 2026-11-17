@@ -14,12 +14,11 @@
 mod platform;
 
 use std::collections::HashMap;
-use std::fs;
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Sender, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::ipc;
 use crate::wake::Wake;
@@ -427,8 +426,10 @@ pub fn remove_socket(config: &Path) {
 mod tests {
     use super::platform::Platform;
     use super::*;
+    use std::fs;
     use std::io::Write;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
     use std::sync::Arc;
 
     type Listener = <Platform as ControlChannel>::Listener;
