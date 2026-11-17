@@ -14,6 +14,8 @@ pub mod fallback;
 #[cfg_attr(not(unix), allow(dead_code))]
 pub mod pool;
 #[cfg(feature = "http")]
+pub(crate) mod conn;
+#[cfg(feature = "http")]
 pub mod entry;
 #[cfg(feature = "http")]
 pub(crate) mod hooks;
