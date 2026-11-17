@@ -62,13 +62,14 @@ fn resolve_bind(env: Option<&str>, configured: Option<SocketAddr>) -> SocketAddr
 
 /// Compose the HTTP surface and start this host's connection driver.
 ///
-/// `control` is the Unix control-channel plumbing; `None` on hosts whose
-/// driver is one thread per connection. Which driver runs is decided in
+/// `control` is the bound control channel; a poll-loop host consumes its
+/// listener, a thread-per-connection host ignores it (the channel already
+/// started its accept thread). Which driver runs is decided in
 /// `server::http::entry`, not here.
 pub fn spawn(
     config: PathBuf,
     raw_hub: Arc<crate::rawhub::RawHub>,
-    control: Option<crate::server::http::entry::ControlPlumbing>,
+    control: Option<crate::channel::ControlServer>,
 ) -> std::io::Result<Arc<Api>> {
     let configured = settings::current().ok().and_then(|settings| settings.bind);
     let requested = resolve_bind(std::env::var("SVCD_BIND").ok().as_deref(), configured);

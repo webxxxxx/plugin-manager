@@ -45,17 +45,10 @@ pub(crate) trait ConnectionDriver {
     fn start(input: StartInput) -> io::Result<ServerHandle>;
 }
 
-/// Control-channel plumbing only a Unix server loop can own. The composition
-/// root builds it from its own cfg matrix; on other hosts the value never
-/// exists, so every field is compiled out.
-pub(crate) struct ControlPlumbing {
-    #[cfg(unix)]
-    pub listener: std::os::unix::net::UnixListener,
-    #[cfg(unix)]
-    pub pending: std::sync::mpsc::SyncSender<crate::channel::PendingCall>,
-    #[cfg(unix)]
-    pub wake: Arc<crate::wake::Wake>,
-}
+/// The bound control channel. A driver that can merge the control channel into
+/// its wait set consumes the listener; a driver that cannot leaves it to the
+/// channel's own accept thread.
+pub(crate) type ControlPlumbing = crate::channel::ControlServer;
 
 /// Handle over the running driver.
 pub(crate) struct ServerHandle {
@@ -109,8 +102,9 @@ pub(crate) struct StartInput {
     pub face: Arc<dyn Face>,
     pub routes: Arc<dyn PreBodyRoutes>,
     pub fallback: FallbackHandler,
-    /// Present on Unix only; the poll loop merges the control channel into its
-    /// wait set. `None` elsewhere.
+    /// The bound control channel. The poll loop merges its listener into the
+    /// wait set; the thread driver ignores it because the channel already runs
+    /// its own accept thread on that host.
     pub control: Option<ControlPlumbing>,
     /// The per-connection driver, used when no poll loop runs.
     pub threads: ThreadDriver,

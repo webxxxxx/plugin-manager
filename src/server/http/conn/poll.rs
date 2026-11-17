@@ -30,11 +30,12 @@ impl ConnectionDriver for Driver {
                 "the Unix server loop needs the control channel",
             ));
         };
+        let (control_listener, pending, wake) = control.into_parts();
         let loop_handle = crate::server::http::server::start(
             listener,
-            control.listener,
-            control.pending,
-            control.wake,
+            control_listener,
+            pending,
+            wake,
             lan,
             config,
             raw_hub,
