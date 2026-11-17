@@ -13,15 +13,15 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::wire::control::channel;
-use crate::wire::message::rpc;
+use crate::face::uichannel::{Event, Subscription};
+use crate::face::webui;
 use crate::server::http::wire;
 use crate::server::http::{
     BlockingJob, BlockingOutcome, CloseReason, OutBuffer, StreamAction, StreamEvent, StreamHandler,
     StreamStep,
 };
-use crate::face::uichannel::{Event, Subscription};
-use crate::face::webui as webui;
+use crate::wire::control::channel;
+use crate::wire::message::rpc;
 
 use super::frame::PendingFrame;
 
