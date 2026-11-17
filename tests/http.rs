@@ -8103,8 +8103,17 @@ fn a_stuck_supervisor_answers_504_and_the_worker_recovers() {
 
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
-    let started = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
-    assert_eq!(started.status, 200, "{}", started.body);
+    // Setup, not subject: the test runs with the deliberately tiny
+    // `control_timeout_secs = 1`, and a loaded host can push a normal control
+    // round trip past it. Retry the start (it is idempotent) instead of reading
+    // one 504 as a regression; the 504 assertions below are the subject.
+    wait_until_within(
+        &sandbox,
+        "the demo service never started",
+        Duration::from_secs(10),
+        || request(&address, "POST", "/api/v1/services/demo/start", "", b"").status == 200,
+        || String::new(),
+    );
 
     let stop_address = address.clone();
     let stop = std::thread::spawn(move || {
