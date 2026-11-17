@@ -6,11 +6,16 @@
 //   node tools/check.mjs quick            cargo check --all-targets
 //   node tools/check.mjs no-default       cargo check --no-default-features --bin svcd
 //   node tools/check.mjs cross [target]   cargo check --target <target> --all-targets
-//   node tools/check.mjs test <filter>    cargo test <filter> --no-fail-fast
-//   node tools/check.mjs full             cargo test --no-fail-fast
+//   node tools/check.mjs test <filter>    cargo test <filter> --no-fail-fast -- --test-threads=1
+//   node tools/check.mjs full             cargo test --no-fail-fast -- --test-threads=1
+//   ... --parallel                        drop `--test-threads=1` (one-off debugging)
 //
 // `cross` exists because a Windows host never compiles `cfg(unix)` code:
 // a green `quick`/`full` says nothing about the Linux build (#139).
+//
+// The test tiers default to the same knob CI uses (`--test-threads=1`), so a
+// red run means the same thing locally and in CI. Parallel runs share process
+// state and have always needed a human to judge "noise" (#153).
 //
 // Every tier has a wall-clock cap: a hung test prints TIMEOUT and the last
 // lines instead of looking like a slow compile. Override with
@@ -186,9 +191,12 @@ if (tier === "cross") {
 }
 
 if (tier === "test" || tier === "full") {
-  const filter = tier === "test" ? rest : [];
-  console.log("check: running cargo test " + [...filter, "--no-fail-fast"].join(" "));
-  const result = cargo(["test", ...filter, "--no-fail-fast"], TEST_TIMEOUT_MS);
+  const parallel = rest.includes("--parallel");
+  const filter = tier === "test" ? rest.filter((arg) => arg !== "--parallel") : [];
+  const args = ["test", ...filter, "--no-fail-fast"];
+  if (!parallel) args.push("--", "--test-threads=1");
+  console.log("check: running cargo " + args.join(" "));
+  const result = cargo(args, TEST_TIMEOUT_MS);
   if (timedOut(result)) {
     reportTimeout(result);
     process.exit(124);
@@ -198,6 +206,6 @@ if (tier === "test" || tier === "full") {
 }
 
 console.error(
-  "check: unknown tier " + tier + "; use quick|no-default|cross [target]|full|test <filter>",
+  "check: unknown tier " + tier + "; use quick|no-default|cross [target]|full [--parallel]|test <filter> [--parallel]",
 );
 process.exit(2);
