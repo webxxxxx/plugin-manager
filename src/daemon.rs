@@ -90,7 +90,6 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
             return 1;
         }
     }
-    crate::blob::spawn_cleanup();
     crate::plugin::cleanup_staging();
     if let Err(error) = crate::proc::init() {
         log::svcd(&format!(
@@ -421,6 +420,11 @@ struct Daemon {
     services_fingerprint: Vec<(String, u64, u64)>,
     rescan_interval_ms: u64,
     next_rescan_ms: u64,
+    /// Temp-file retention and the supervisor's own cleanup cadence. The
+    /// supervisor loop owns timers, so there is no standalone cleanup thread.
+    temp_retention: Duration,
+    temp_cleanup_interval_ms: u64,
+    next_temp_cleanup_ms: u64,
     #[cfg(unix)]
     reactor: Option<Arc<Reactor>>,
     raw_hub: Arc<crate::rawhub::RawHub>,
@@ -479,6 +483,13 @@ impl Daemon {
                 slots.insert(service.id.clone(), slot);
             }
         }
+        let (temp_retention, temp_cleanup_interval_ms) = match settings::current() {
+            Ok(settings) => (
+                settings.temp_retention(),
+                settings.temp_cleanup_interval().as_millis() as u64,
+            ),
+            Err(_) => (Duration::from_secs(2 * 60 * 60), 0),
+        };
         let mut launchers = Launchers::default();
         launchers.register("builtin", Box::new(crate::builtin_adapter::BuiltinLauncher));
         Daemon {
@@ -499,6 +510,11 @@ impl Daemon {
             services_fingerprint: services_fingerprint(&paths::services_dir()),
             rescan_interval_ms,
             next_rescan_ms: rescan_interval_ms,
+            temp_retention,
+            temp_cleanup_interval_ms,
+            // The old cleanup thread ran once before its first sleep; the
+            // supervisor does the same by treating the first tick as due.
+            next_temp_cleanup_ms: 0,
             #[cfg(unix)]
             reactor: None,
             raw_hub,
@@ -778,6 +794,19 @@ impl Daemon {
             if self.rescan_interval_ms > 0 && self.now_ms() >= self.next_rescan_ms {
                 self.next_rescan_ms = self.now_ms().saturating_add(self.rescan_interval_ms);
                 self.rescan_if_changed();
+            }
+            if self.temp_cleanup_interval_ms > 0 && self.now_ms() >= self.next_temp_cleanup_ms {
+                self.next_temp_cleanup_ms = self
+                    .now_ms()
+                    .saturating_add(self.temp_cleanup_interval_ms);
+                match crate::blob::cleanup(self.temp_retention) {
+                    Ok(0) => {}
+                    Ok(removed) => log::svcd(&format!(
+                        "svcd: temp cleanup removed {} file(s)",
+                        removed
+                    )),
+                    Err(error) => log::svcd(&format!("svcd: temp cleanup failed: {}", error)),
+                }
             }
             if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
                 self.shutdown = true;

@@ -59,7 +59,7 @@
     "lan": { "concept": "server/auth", "layer": "server" },
     "server": { "concept": "server/request", "layer": "server", "note": "S4 请求交接契约（#113）+ HTTP server-loop（#114）+ stream driver（#115）+ WebSocket 帧（#122）" },
 
-    "api": { "concept": "face/api", "layer": "face", "note": "还含 face 路由与 legacy bridge（api/legacy.rs），要拆" },
+    "api": { "concept": "face/api", "layer": "face", "note": "组合根 + Windows 回退；Unix server loop 在 server/http/server.rs" },
     "face": { "concept": "face/api", "layer": "face", "note": "#113 起承载已迁移的 /api/v1 端点；install/import 在 face/install.rs（#121）" },
     "mcp": { "concept": "face/mcp_tools", "layer": "face" },
     "catalog": { "concept": "face/mcp_tools", "layer": "face" },

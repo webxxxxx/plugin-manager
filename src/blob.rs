@@ -22,7 +22,6 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::paths;
-use crate::settings;
 
 pub const MAX_BLOB_BYTES: u64 = 512 * 1024 * 1024;
 /// A file bundle is made of parts; the existing blob cap is the per-part cap.
@@ -785,32 +784,6 @@ fn cleanup_dir(
         }
     }
     Ok(())
-}
-
-/// Start one background cleanup thread. `temp_cleanup_interval_secs = 0`
-/// disables it.
-pub fn spawn_cleanup() {
-    let Ok(settings) = settings::current() else {
-        return;
-    };
-    let retention = settings.temp_retention();
-    let interval = settings.temp_cleanup_interval();
-    if interval.is_zero() {
-        return;
-    }
-    let _ = std::thread::Builder::new()
-        .name("svcd-temp-cleanup".into())
-        .stack_size(128 * 1024)
-        .spawn(move || loop {
-            match cleanup(retention) {
-                Ok(0) => {}
-                Ok(removed) => {
-                    crate::log::svcd(&format!("svcd: temp cleanup removed {} file(s)", removed))
-                }
-                Err(error) => crate::log::svcd(&format!("svcd: temp cleanup failed: {}", error)),
-            }
-            std::thread::sleep(interval);
-        });
 }
 
 pub(crate) fn touch(path: &Path) {

@@ -1,30 +1,92 @@
-//! Temporary legacy bridge for the server loop.
+//! The Unix server loop state machine.
 //!
 //! The loop in `server::http::engine` owns the listener, the sockets and the
-//! request buffers. This module keeps the remaining legacy routes, the bounded
-//! worker queue and the pre-body stream hooks until #125 deletes the bridge.
-//! The queue is bounded; a full queue answers 503 instead of growing without
-//! limit.
+//! request buffers. This module owns the connection state, the face dispatch,
+//! the blocking-pool completions and the pre-body stream hooks. There is no
+//! per-request worker: blocking work goes to the shared pool.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Write};
+use std::net::{IpAddr, TcpListener};
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use serde_json::json;
 
 use crate::channel::PendingCall;
+use crate::http;
+use crate::mcp_http;
+use crate::lan::Lan;
+use crate::log;
 use crate::server::control::client::StreamingClient;
 use crate::server::control::handle::LoopHandle;
 use crate::server::control::listener::{ControlServer, Source};
 use crate::server::http::budget::StreamPermit;
 use crate::server::http::driver::{StreamAdmission, StreamDriver};
-use crate::server::http::engine::{self, HttpRequest, LegacyBridge, PreRequest, Table};
-use crate::server::http::StreamClass;
+use crate::server::http::engine::{
+    self, keep_alive_response, wants_keep_alive, Connection as EngineConnection, HttpRequest,
+    PreRequest, ServerLoop, Table,
+};
 use crate::server::http::{
-    complete_blocking, dispatch_inline, BlockingOutcome, BlockingPool, BodyPolicy, Busy,
-    CancelToken, CompletionSlot, Dispatch, Exchange, Face, JobOutcome, StreamHandler,
+    complete_blocking, dispatch_inline, prepare_face_request, render_exchange, BlockingOutcome,
+    BlockingPool, BodyPolicy, Busy, CancelToken, CompletionSlot, Dispatch, Exchange, Face,
+    JobOutcome, StreamClass, StreamHandler,
 };
 use crate::server::mcp::progress::{McpSseStream, PROGRESS_QUEUE_SLOTS};
 use crate::wake::Wake;
+
+/// The remaining server-owned routes (buffered MCP, plugin UI rpc and the blob
+/// session metadata). Composition injects this closure so the server stays
+/// below the face layer; it runs on the blocking pool, never on the loop.
+pub(crate) type FallbackHandler =
+    Arc<dyn Fn(&HttpRequest, &Arc<Mutex<Lan>>) -> Vec<u8> + Send + Sync>;
+
+/// The pre-body stream hooks. Composition owns the concrete faces; the server
+/// only asks each hook whether it claims the head and, if so, for the handler.
+pub(crate) trait PreBodyRoutes: Send + Sync {
+    fn plugin_ui(
+        &self,
+        head: &http::Head,
+        peer: IpAddr,
+        lan: &Arc<Mutex<Lan>>,
+        config: &std::path::Path,
+        raw_hub: Arc<crate::rawhub::RawHub>,
+    ) -> Option<Result<Exchange, Vec<u8>>>;
+    fn package_upload(
+        &self,
+        head: &http::Head,
+        lan: &Arc<Mutex<Lan>>,
+        config: &std::path::Path,
+    ) -> Option<Result<Exchange, Vec<u8>>>;
+    fn blob_upload(
+        &self,
+        head: &http::Head,
+        lan: &Arc<Mutex<Lan>>,
+    ) -> Option<Result<Exchange, Vec<u8>>>;
+}
+
+enum WorkResult {
+    BlockingDone {
+        key: u64,
+        outcome: JobOutcome,
+    },
+    /// One blocking-pool job produced already-rendered response bytes.
+    Rendered {
+        connection: u64,
+        response: Vec<u8>,
+        keep_alive: bool,
+    },
+    StreamJobDone {
+        connection: u64,
+        outcome: BlockingOutcome,
+    },
+}
 
 /// One queued or running blocking request. The server owns the completion slot
 /// and the connection; the pool only reports that the job finished.
@@ -34,15 +96,6 @@ struct PendingBlocking {
     keep_alive: bool,
 }
 
-// Temporary bridge: this module is the only consumer of these legacy `api`
-// helpers and disappears with them in #125. Keeping `super::*` here makes the
-// ownership move mechanical; add explicit imports only if this module survives.
-use super::*;
-
-/// Maximum legacy jobs waiting for the four HTTP workers. A full queue is a
-/// visible 503, not an unbounded allocation.
-pub(super) const LEGACY_QUEUE_LIMIT: usize = 64;
-
 pub(crate) fn start(
     http: Option<TcpListener>,
     control: UnixListener,
@@ -51,6 +104,9 @@ pub(crate) fn start(
     lan: Arc<Mutex<Lan>>,
     config: PathBuf,
     raw_hub: Arc<crate::rawhub::RawHub>,
+    face: Arc<dyn Face>,
+    routes: Arc<dyn PreBodyRoutes>,
+    fallback: FallbackHandler,
 ) -> std::io::Result<LoopHandle> {
     let (results_tx, results_rx) = mpsc::channel();
     let (notify_rx, notify_tx) = UnixStream::pair()?;
@@ -61,10 +117,9 @@ pub(crate) fn start(
     let stop = loop_handle.stop_flag();
     let control = ControlServer::new(control, pending, wake, notify_tx.clone())?;
 
-    let face: Arc<dyn Face> = Arc::new(crate::face::api::ApiFace::new(config.clone(), lan.clone()));
-    // The pool belongs to the server loop, not to one request or the temporary
-    // bridge. Starting it before the loop means a thread-spawn failure fails
-    // HTTP startup instead of silently disabling every route after start().
+    // The pool belongs to the server loop, not to one request. Starting it
+    // before the loop means a thread-spawn failure fails HTTP startup instead
+    // of silently disabling every route after start().
     let blocking = {
         let results = results_tx.clone();
         let notify = notify_tx.try_clone()?;
@@ -80,26 +135,9 @@ pub(crate) fn start(
 
     let join = thread::Builder::new()
         .name("svcd-server-loop".into())
-        .stack_size(threads::transfer_stack())
+        .stack_size(crate::threads::transfer_stack())
         .spawn(move || {
-            let queue = Arc::new(JobQueue {
-                queue: Mutex::new(VecDeque::new()),
-                ready: Condvar::new(),
-                limit: LEGACY_QUEUE_LIMIT,
-            });
-            for _ in 0..4 {
-                let queue = queue.clone();
-                let config = config.clone();
-                let lan = lan.clone();
-                let results = results_tx.clone();
-                let notify = notify_tx.try_clone().ok();
-                let _ = thread::Builder::new()
-                    .name("svcd-http-worker".into())
-                    .stack_size(threads::request_stack())
-                    .spawn(move || http_worker(queue, config, lan, results, notify));
-            }
-
-            let mut handler = ServerHandler {
+            let mut server = Server {
                 lan,
                 config,
                 raw_hub,
@@ -107,22 +145,34 @@ pub(crate) fn start(
                 client: StreamingClient::new(),
                 extra_keys: Vec::new(),
                 stop,
-                queue,
                 results: results_rx,
                 results_tx: results_tx.clone(),
                 notify: notify_rx,
                 face,
+                routes,
+                fallback,
                 blocking,
                 blocking_pending: HashMap::new(),
                 stream_jobs: HashMap::new(),
                 stream_job_keys: HashSet::new(),
                 next_stream_job: 1 << 32,
             };
-            engine::run(http, &mut handler, crate::limits::current());
+            engine::run(http, &mut server, crate::limits::current());
         })?;
     loop_handle.set_join(join);
     Ok(loop_handle)
 }
+
+enum ConnState {
+    Reading,
+    Processing,
+    Writing,
+    /// A sans-IO handler plus the server-side deadline, file send and
+    /// `max_streams` slot (see `server::http::driver`).
+    Stream(crate::server::http::driver::StreamDriver),
+}
+
+type Connection = EngineConnection<ConnState>;
 
 /// One extra poll source in the order the engine dispatched it.
 #[derive(Clone, Copy)]
@@ -131,7 +181,7 @@ enum ExtraSource {
     Client(u64),
 }
 
-struct ServerHandler {
+struct Server {
     lan: Arc<Mutex<Lan>>,
     config: PathBuf,
     raw_hub: Arc<crate::rawhub::RawHub>,
@@ -139,13 +189,14 @@ struct ServerHandler {
     client: StreamingClient,
     extra_keys: Vec<ExtraSource>,
     stop: Arc<AtomicBool>,
-    queue: Arc<JobQueue>,
     results: Receiver<WorkResult>,
     /// A sender kept for stream-handler blocking jobs; their result is
     /// delivered to the handler, not to a completion slot.
     results_tx: Sender<WorkResult>,
     notify: UnixStream,
     face: Arc<dyn Face>,
+    routes: Arc<dyn PreBodyRoutes>,
+    fallback: FallbackHandler,
     blocking: BlockingPool,
     blocking_pending: HashMap<u64, PendingBlocking>,
     /// Connection -> the unique pool key of its in-flight stream job. Stream
@@ -159,7 +210,7 @@ struct ServerHandler {
     next_stream_job: u64,
 }
 
-impl LegacyBridge for ServerHandler {
+impl ServerLoop for Server {
     type State = ConnState;
 
     fn new_state(&mut self, _id: u64, _peer: IpAddr) -> ConnState {
@@ -169,7 +220,7 @@ impl LegacyBridge for ServerHandler {
     fn on_accept(&mut self, _connection: &mut Connection) {}
 
     fn body_limit(&self, path: &str) -> u64 {
-        super::body_limit(path)
+        crate::server::http::body_limit(path)
     }
 
     fn reads_request(&self, connection: &Connection) -> bool {
@@ -177,16 +228,57 @@ impl LegacyBridge for ServerHandler {
     }
 
     fn pre_request(&mut self, connection: &mut Connection) -> PreRequest {
-        if let Some(outcome) = self.plugin_ui_stream(connection) {
-            return outcome;
+        if connection.pending.is_some() {
+            return PreRequest::Continue;
         }
-        if let Some(outcome) = self.package_upload_stream(connection) {
-            return outcome;
+        let Some(header_end) = http::header_end(&connection.buffer) else {
+            return PreRequest::Continue;
+        };
+        if header_end > crate::limits::current().max_header {
+            return PreRequest::Continue;
         }
-        if let Some(outcome) = self.blob_upload_stream(connection) {
-            return outcome;
-        }
-        PreRequest::Continue
+        let Some((head, body_start)) = http::parse_head(&connection.buffer[..header_end + 4])
+        else {
+            return PreRequest::Continue;
+        };
+        let claim = self
+            .routes
+            .plugin_ui(
+                &head,
+                connection.peer,
+                &self.lan,
+                &self.config,
+                self.raw_hub.clone(),
+            )
+            .or_else(|| self.routes.package_upload(&head, &self.lan, &self.config))
+            .or_else(|| self.routes.blob_upload(&head, &self.lan));
+        let Some(claim) = claim else {
+            return PreRequest::Continue;
+        };
+        let exchange = match claim {
+            Ok(exchange) => exchange,
+            Err(response) => {
+                write_response(connection, response, false);
+                return PreRequest::Handled;
+            }
+        };
+        let Exchange::Stream(handler) = exchange else {
+            write_response(
+                connection,
+                http::json_error(
+                    500,
+                    "internal",
+                    "a streamed route returned a memory response",
+                ),
+                false,
+            );
+            return PreRequest::Handled;
+        };
+        let initial = connection.buffer.split_off(body_start);
+        connection.buffer.clear();
+        attach_stream(connection, handler, &initial, None);
+        self.service_stream_job(connection);
+        PreRequest::Handled
     }
 
     fn on_request(&mut self, connection: &mut Connection, request: HttpRequest) {
@@ -260,16 +352,7 @@ impl LegacyBridge for ServerHandler {
                 }
             }
         }
-        let job = Work::Http(HttpJob {
-            connection: connection.id,
-            request,
-            keep_alive,
-        });
-        if self.queue.try_push(job).is_err() {
-            write_response(connection, bridge_busy(), false);
-        } else {
-            connection.state = ConnState::Processing;
-        }
+        self.submit_rendered(connection, request, keep_alive);
     }
 
     fn on_error(&mut self, connection: &mut Connection, response: Vec<u8>) {
@@ -326,9 +409,14 @@ impl LegacyBridge for ServerHandler {
 
         while let Ok(result) = self.results.try_recv() {
             match result {
-                WorkResult::Http(result) => {
-                    if let Some(connection) = connections.get_mut(&result.connection) {
-                        write_response(connection, result.response, result.keep_alive);
+                WorkResult::Rendered {
+                    connection,
+                    response,
+                    keep_alive,
+                } => {
+                    self.stream_jobs.remove(&connection);
+                    if let Some(connection) = connections.get_mut(&connection) {
+                        write_response(connection, response, keep_alive);
                     }
                 }
                 WorkResult::BlockingDone { key, outcome } => {
@@ -358,7 +446,7 @@ impl LegacyBridge for ServerHandler {
                         JobOutcome::Dropped => (blocking_busy(Busy::Closed), false),
                         JobOutcome::Finished | JobOutcome::Cancelled => {
                             let mut response =
-                                super::render_exchange(complete_blocking(pending.body, exchange));
+                                render_exchange(complete_blocking(pending.body, exchange));
                             if pending.keep_alive {
                                 response = keep_alive_response(response);
                             }
@@ -504,83 +592,50 @@ impl LegacyBridge for ServerHandler {
     }
 }
 
-impl ServerHandler {
-    /// Claim a package install/import before its body is buffered, resolve auth
-    /// and endpoint policy once, then attach the sans-IO upload handler. Any
-    /// already-read body bytes are delivered as the first data event.
-    fn package_upload_stream(&mut self, connection: &mut Connection) -> Option<PreRequest> {
-        if connection.pending.is_some() {
-            return None;
-        }
-        let header_end = http::header_end(&connection.buffer)?;
-        if header_end > crate::limits::current().max_header {
-            return None;
-        }
-        let (head, body_start) = http::parse_head(&connection.buffer[..header_end + 4])?;
-        crate::face::install::target(&head)?;
-        let exchange = match crate::face::install::exchange(&head, &self.lan, self.config.clone()) {
-            Ok(exchange) => exchange,
-            Err(response) => {
-                write_response(connection, response, false);
-                return Some(PreRequest::Handled);
+impl Server {
+    /// Run one server-owned buffered route on the blocking pool. The closure
+    /// is the composition root's leftover router; the loop only writes the
+    /// rendered bytes back.
+    fn submit_rendered(
+        &mut self,
+        connection: &mut Connection,
+        request: HttpRequest,
+        keep_alive: bool,
+    ) {
+        let id = connection.id;
+        let key = self.next_stream_job;
+        self.next_stream_job = self.next_stream_job.wrapping_add(1).max(1 << 32);
+        let fallback = self.fallback.clone();
+        let lan = self.lan.clone();
+        let results = self.results_tx.clone();
+        let notify = self.notify.try_clone().ok();
+        let submitted = self.blocking.try_submit(key, move |cancel| {
+            if cancel.is_cancelled() {
+                return;
             }
-        };
-        let Exchange::Stream(handler) = exchange else {
-            write_response(
-                connection,
-                http::json_error(
-                    500,
-                    "internal",
-                    "a streamed package upload route returned a memory response",
-                ),
-                false,
-            );
-            return Some(PreRequest::Handled);
-        };
-        let initial = connection.buffer.split_off(body_start);
-        connection.buffer.clear();
-        attach_stream(connection, handler, &initial, None);
-        self.service_stream_job(connection);
-        Some(PreRequest::Handled)
-    }
-
-    /// Claim a blob/file upload before its body is buffered, resolve auth and
-    /// endpoint policy once, then attach the sans-IO upload handler. Any
-    /// already-read body bytes are delivered as the first data event.
-    fn blob_upload_stream(&mut self, connection: &mut Connection) -> Option<PreRequest> {
-        if connection.pending.is_some() {
-            return None;
-        }
-        let header_end = http::header_end(&connection.buffer)?;
-        if header_end > crate::limits::current().max_header {
-            return None;
-        }
-        let (head, body_start) = http::parse_head(&connection.buffer[..header_end + 4])?;
-        crate::face::blob_upload::upload_target(&head)?;
-        let exchange = match crate::face::blob_upload::exchange(&head, &self.lan) {
-            Ok(exchange) => exchange,
-            Err(response) => {
-                write_response(connection, response, false);
-                return Some(PreRequest::Handled);
+            let response = fallback(&request, &lan);
+            let response = if keep_alive {
+                keep_alive_response(response)
+            } else {
+                response
+            };
+            let _ = results.send(WorkResult::Rendered {
+                connection: id,
+                response,
+                keep_alive,
+            });
+            if let Some(notify) = &notify {
+                let _ = (&*notify).write(&[1]);
             }
-        };
-        let Exchange::Stream(handler) = exchange else {
-            write_response(
-                connection,
-                http::json_error(
-                    500,
-                    "internal",
-                    "a streamed upload route returned a memory response",
-                ),
-                false,
-            );
-            return Some(PreRequest::Handled);
-        };
-        let initial = connection.buffer.split_off(body_start);
-        connection.buffer.clear();
-        attach_stream(connection, handler, &initial, None);
-        self.service_stream_job(connection);
-        Some(PreRequest::Handled)
+        });
+        match submitted {
+            Ok(()) => {
+                self.stream_jobs.insert(id, key);
+                self.stream_job_keys.insert(key);
+                connection.state = ConnState::Processing;
+            }
+            Err(_) => write_response(connection, blocking_busy(Busy::QueueFull), false),
+        }
     }
 
     /// Hand the stream handler's one pending job to the blocking pool. The
@@ -630,69 +685,17 @@ impl ServerHandler {
         }
     }
 
-    /// The plugin UI path: decide the route before the body is read, resolve
-    /// the principal once, then attach the sans-IO handler to the connection.
-    /// Returns \`None\` when this request is not a plugin UI route.
-    fn plugin_ui_stream(&mut self, connection: &mut Connection) -> Option<PreRequest> {
-        if connection.pending.is_some() {
-            return None;
-        }
-        let header_end = http::header_end(&connection.buffer)?;
-        if header_end > crate::limits::current().max_header {
-            return None;
-        }
-        let (head, body_start) = http::parse_head(&connection.buffer[..header_end + 4])?;
-        // Claim the path before authentication so an unauthenticated browser
-        // navigation gets the login redirect; the face applies the endpoint
-        // policy after the server resolved the principal.
-        crate::face::plugin_ui::PluginUiFace::route_for(&head.method, &head.path)?;
-        let exchange = match crate::face::plugin_ui::PluginUiFace::exchange(
-            &head,
-            connection.peer,
-            &self.lan,
-            self.config.clone(),
-            Some(self.raw_hub.clone()),
-        ) {
-            Ok(exchange) => exchange,
-            Err(response) => {
-                write_response(connection, response, false);
-                return Some(PreRequest::Handled);
-            }
-        };
-        let Exchange::Stream(handler) = exchange else {
-            write_response(
-                connection,
-                http::json_error(
-                    500,
-                    "internal",
-                    "a streamed route returned a memory response",
-                ),
-                false,
-            );
-            return Some(PreRequest::Handled);
-        };
-
-        // Take the head (and any already-read body bytes) out of the request
-        // buffer; the loop must not try to parse them again.
-        let initial = connection.buffer.split_off(body_start);
-        connection.buffer.clear();
-        attach_stream(connection, handler, &initial, None);
-        // A WebSocket client may have sent its first frames with the opening
-        // handshake; the handler can submit a blocking job from those bytes.
-        self.service_stream_job(connection);
-        Some(PreRequest::Handled)
-    }
-
     /// Run the face-owned part of one request. Inline routes answer now;
     /// blocking routes are submitted to the pool and the connection waits in
-    /// `Processing`. Returns false when the request stays on the legacy path.
+    /// `Processing`. Returns false when the request stays on the server-owned
+    /// buffered routes.
     fn serve_face(
         &mut self,
         connection: &mut Connection,
         request: &HttpRequest,
         keep_alive: bool,
     ) -> bool {
-        let prepared = match super::prepare_face_request(
+        let prepared = match prepare_face_request(
             self.face.as_ref(),
             request,
             connection.peer,
@@ -922,10 +925,6 @@ fn busy_response(message: &str) -> Vec<u8> {
     )
 }
 
-fn bridge_busy() -> Vec<u8> {
-    busy_response("legacy request queue is full")
-}
-
 fn blocking_busy(busy: Busy) -> Vec<u8> {
     busy_response(match busy {
         Busy::QueueFull => "blocking request queue is full",
@@ -965,6 +964,7 @@ fn socket_closed(fd: RawFd) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
 
     #[test]
     fn a_graceful_peer_close_is_detected_without_consuming_bytes() {
@@ -1009,17 +1009,5 @@ mod tests {
             assert!(text.contains("\"code\":\"busy\""), "{text}");
             assert!(text.contains(message), "{text}");
         }
-    }
-
-    #[test]
-    fn a_full_bridge_answers_503_with_retry_after() {
-        let response = bridge_busy();
-        let text = String::from_utf8_lossy(&response);
-        assert!(
-            text.starts_with("HTTP/1.1 503 Service Unavailable"),
-            "{text}"
-        );
-        assert!(text.contains("Retry-After: 1"), "{text}");
-        assert!(text.contains("legacy request queue is full"), "{text}");
     }
 }
