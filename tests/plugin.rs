@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -11,6 +11,12 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
+
+/// How long a sandbox waits for its daemon to exit after a shutdown request.
+/// An unreachable request (the socket is not up yet, or a test panicked before
+/// the daemon got going) must not hang the suite: past this bound the daemon is
+/// killed and the wait reports what failed.
+const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn sandbox_base() -> std::path::PathBuf {
     // Unix domain sockets cap the whole path at ~108 bytes, so Unix keeps the
@@ -35,6 +41,8 @@ struct Sandbox {
     plugin: PathBuf,
     daemon: Option<Child>,
     daemon_stderr: PathBuf,
+    /// Overridable so the bounded-wait test does not spend the production bound.
+    stop_timeout: Duration,
 }
 
 impl Sandbox {
@@ -67,12 +75,15 @@ impl Sandbox {
         let svc = root.join(names.1);
         let plugin = root.join(names.2);
         for path in [&svcd, &svc, &plugin] {
-            fs::copy(binary, path).expect("copy multicall");
+            // The multicall dispatch only reads argv[0]'s file name, so a link
+            // is enough on Unix. A copy that is exec'd right after it is
+            // written races its own close on slow filesystems (/mnt/d, DrvFs)
+            // and fails with ETXTBSY; the link has no such window. Windows
+            // keeps the copy because creating symlinks needs a privilege.
             #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
-            }
+            std::os::unix::fs::symlink(binary, path).expect("link multicall");
+            #[cfg(not(unix))]
+            fs::copy(binary, path).expect("copy multicall");
         }
 
         Sandbox {
@@ -86,6 +97,7 @@ impl Sandbox {
             svc,
             plugin,
             daemon: None,
+            stop_timeout: DAEMON_STOP_TIMEOUT,
         }
     }
 
@@ -111,11 +123,20 @@ impl Sandbox {
         self.daemon = Some(command.spawn().expect("spawn daemon"));
     }
 
-    fn run(&self, binary: &Path, args: &[&str]) -> Output {
+    fn command(&self, binary: &Path) -> Command {
         let mut command = Command::new(binary);
-        command.args(args);
         self.env(&mut command);
-        command.output().expect("run svcd entry")
+        command
+    }
+
+    fn try_run(&self, binary: &Path, args: &[&str]) -> std::io::Result<Output> {
+        self.command(binary).args(args).output()
+    }
+
+    fn run(&self, binary: &Path, args: &[&str]) -> Output {
+        self.try_run(binary, args).unwrap_or_else(|error| {
+            panic!("run {} {args:?}: {error}", binary.display());
+        })
     }
 
     fn run_plugin(&self, args: &[&str]) -> Output {
@@ -123,10 +144,17 @@ impl Sandbox {
     }
 
     fn run_plugin_in(&self, directory: &Path, args: &[&str]) -> Output {
-        let mut command = Command::new(&self.plugin);
-        command.args(args).current_dir(directory);
-        self.env(&mut command);
-        command.output().expect("run plugin entry")
+        self.command(&self.plugin)
+            .args(args)
+            .current_dir(directory)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "run {} {args:?} in {}: {error}",
+                    self.plugin.display(),
+                    directory.display()
+                );
+            })
     }
 
     fn run_svc(&self, args: &[&str]) -> Output {
@@ -148,12 +176,44 @@ impl Sandbox {
         fs::read_to_string(&self.daemon_stderr).unwrap_or_default()
     }
 
-    fn shutdown(&mut self) {
-        if self.daemon.is_some() {
-            let _ = self.run(&self.svcd, &["shutdown"]);
-            if let Some(mut child) = self.daemon.take() {
-                let _ = child.wait();
+    /// Stop the daemon with a bounded wait. Returns the diagnostic when the
+    /// shutdown request failed and the daemon had to be killed, so a caller
+    /// (or the bounded-wait test) can report why instead of hanging.
+    fn stop_daemon(&mut self) -> Result<(), String> {
+        let Some(mut child) = self.daemon.take() else {
+            return Ok(());
+        };
+        let request = self.try_run(&self.svcd, &["shutdown"]);
+        let deadline = Instant::now() + self.stop_timeout;
+        loop {
+            match child.try_wait() {
+                // The daemon exited; a failed request is then irrelevant (a
+                // sibling sandbox or a signal may have stopped it).
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => {}
+                Err(error) => return Err(format!("cannot wait for the daemon: {error}")),
             }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "the daemon did not stop within {:?}; killed it. shutdown request: {}; daemon stderr (tail):\n{}",
+                    self.stop_timeout,
+                    describe(request),
+                    tail(&self.daemon_log(), 20)
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn shutdown(&mut self) {
+        match self.stop_daemon() {
+            Ok(()) => {}
+            // A panic while another panic unwinds aborts the process, which
+            // would hide the failure that started it: print instead.
+            Err(message) if std::thread::panicking() => eprintln!("sandbox: {message}"),
+            Err(message) => panic!("sandbox: {message}"),
         }
     }
 
@@ -470,6 +530,56 @@ fn json(output: &Output) -> Value {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+/// What a failed `svcd` invocation looked like, for diagnostics.
+fn describe(outcome: std::io::Result<Output>) -> String {
+    match outcome {
+        Ok(output) => format!(
+            "exit {:?} stderr {:?}",
+            output.status.code(),
+            stderr(&output).trim()
+        ),
+        Err(error) => format!("cannot run svcd: {error}"),
+    }
+}
+
+fn tail(text: &str, lines: usize) -> String {
+    let all: Vec<&str> = text.lines().collect();
+    all[all.len().saturating_sub(lines)..].join("\n")
+}
+
+/// A shutdown request that never reaches the daemon used to block the suite
+/// forever in `child.wait()` (the failure inside `Sandbox::drop` after a
+/// panicking test). The wait is bounded now and names what failed.
+#[test]
+fn shutdown_bounds_its_wait_when_the_daemon_cannot_be_reached() {
+    let mut sandbox = Sandbox::new();
+    sandbox.stop_timeout = Duration::from_secs(1);
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+
+    // Move the config directory away: the CLI can no longer resolve the control
+    // channel (a socket on Unix, a named pipe on Windows), so the request fails
+    // the way it does when a test panics before the daemon is up.
+    let moved = sandbox.root.join("config-moved");
+    fs::rename(&sandbox.config, &moved).expect("move the config directory");
+
+    let started = Instant::now();
+    let error = sandbox
+        .stop_daemon()
+        .expect_err("a daemon that had to be killed is reported, not ignored");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the wait must be bounded, took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        error.contains("did not stop") && error.contains("shutdown request:"),
+        "the error must name the failed request: {error}"
+    );
+    assert!(sandbox.daemon.is_none(), "the handle must be consumed");
 }
 
 #[test]
