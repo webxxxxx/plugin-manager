@@ -18,8 +18,8 @@ use crate::server::http::{
     StreamHandler, StreamStep,
 };
 
-/// One recognized download. Uploads and JSON session metadata stay on the
-/// legacy path until #119.
+/// One recognized download. Uploads are claimed by `face::blob_upload` before
+/// the request body is read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadTarget {
     Blob { id: String, head_only: bool },

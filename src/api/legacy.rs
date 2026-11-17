@@ -214,17 +214,8 @@ impl LegacyBridge for ServerHandler {
                 });
             return PreRequest::Close;
         }
-        if let Some((stream, head, initial, route)) = blob_takeover(connection) {
-            let lan = self.lan.clone();
-            let _ = thread::Builder::new()
-                .name("svcd-blob-http".into())
-                .stack_size(threads::transfer_stack())
-                .spawn(move || {
-                    let mut stream = stream;
-                    let _ = stream.set_nonblocking(false);
-                    let _ = blob_http::serve(&mut stream, &head, &initial, &lan, route);
-                });
-            return PreRequest::Close;
+        if let Some(outcome) = self.blob_upload_stream(connection) {
+            return outcome;
         }
         PreRequest::Continue
     }
@@ -545,6 +536,45 @@ impl LegacyBridge for ServerHandler {
 }
 
 impl ServerHandler {
+    /// Claim a blob/file upload before its body is buffered, resolve auth and
+    /// endpoint policy once, then attach the sans-IO upload handler. Any
+    /// already-read body bytes are delivered as the first data event.
+    fn blob_upload_stream(&mut self, connection: &mut Connection) -> Option<PreRequest> {
+        if connection.pending.is_some() {
+            return None;
+        }
+        let header_end = http::header_end(&connection.buffer)?;
+        if header_end > crate::limits::current().max_header {
+            return None;
+        }
+        let (head, body_start) = http::parse_head(&connection.buffer[..header_end + 4])?;
+        crate::face::blob_upload::upload_target(&head)?;
+        let exchange = match crate::face::blob_upload::exchange(&head, &self.lan) {
+            Ok(exchange) => exchange,
+            Err(response) => {
+                write_response(connection, response, false);
+                return Some(PreRequest::Handled);
+            }
+        };
+        let Exchange::Stream(handler) = exchange else {
+            write_response(
+                connection,
+                http::json_error(
+                    500,
+                    "internal",
+                    "a streamed upload route returned a memory response",
+                ),
+                false,
+            );
+            return Some(PreRequest::Handled);
+        };
+        let initial = connection.buffer.split_off(body_start);
+        connection.buffer.clear();
+        attach_stream(connection, handler, &initial, None);
+        self.service_stream_job(connection);
+        Some(PreRequest::Handled)
+    }
+
     /// Hand the stream handler's one pending job to the blocking pool. The
     /// job's value comes back as `StreamJobDone`; the pool's own completion
     /// only frees the key. A full queue is reported to the handler, which can

@@ -57,8 +57,9 @@ pub enum StreamAction {
     Close(CloseReason),
 }
 
-/// Work the handler wants the blocking pool to run. The pool returns the value
-/// through `StreamEvent::BlockingDone`; no connection handle is involved.
+/// Work the handler wants the blocking pool to run. The pool returns the
+/// outcome through `StreamEvent::BlockingDone`; no connection handle is
+/// involved.
 pub type BlockingJob = Box<dyn FnOnce() -> BlockingOutcome + Send + 'static>;
 
 /// The value a blocking job returns.

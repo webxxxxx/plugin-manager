@@ -24,10 +24,14 @@ const IDLE_TICK: Duration = Duration::from_millis(250);
 /// Drive one handler to completion on this connection thread. The face and
 /// the request are the caller's job; this function owns the socket and the
 /// stream-budget slot. `Err(Busy)` means nothing has been written yet.
-pub fn drive(stream: &mut TcpStream, mut handler: Box<dyn StreamHandler>) -> Result<(), Busy> {
+pub fn drive(
+    stream: &mut TcpStream,
+    mut handler: Box<dyn StreamHandler>,
+    initial: &[u8],
+) -> Result<(), Busy> {
     let permit =
         StreamBudget::global().acquire(handler.stream_class(), limits::current().max_streams)?;
-    let result = drive_loop(stream, handler.as_mut());
+    let result = drive_loop(stream, handler.as_mut(), initial);
     // The Unix driver delivers this from its Drop; the fallback owns the
     // handler directly, so it must deliver the same final event here.
     let mut discarded = Vec::new();
@@ -39,10 +43,15 @@ pub fn drive(stream: &mut TcpStream, mut handler: Box<dyn StreamHandler>) -> Res
     result
 }
 
-fn drive_loop(stream: &mut TcpStream, handler: &mut dyn StreamHandler) -> Result<(), Busy> {
+fn drive_loop(
+    stream: &mut TcpStream,
+    handler: &mut dyn StreamHandler,
+    initial: &[u8],
+) -> Result<(), Busy> {
     let limit = limits::current().stream_buffer;
     let timeout = limits::current().transfer_timeout;
     let mut out = Vec::new();
+    let mut pending = initial;
     let mut read_buf = [0u8; 8 * 1024];
     let mut last_active = Instant::now();
     let mut deadline = last_active + timeout;
@@ -110,6 +119,15 @@ fn drive_loop(stream: &mut TcpStream, handler: &mut dyn StreamHandler) -> Result
                     handler.on_event(StreamEvent::Tick(now), &mut OutBuffer::new(&mut out, limit));
             }
             StreamAction::NeedRead => {
+                if !pending.is_empty() {
+                    let data = pending;
+                    pending = &[];
+                    step = handler.on_event(
+                        StreamEvent::Data(data),
+                        &mut OutBuffer::new(&mut out, limit),
+                    );
+                    continue;
+                }
                 let now = Instant::now();
                 let next = step.deadline.unwrap_or(deadline).min(deadline);
                 if now >= next {

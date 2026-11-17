@@ -2,9 +2,10 @@
 //!
 //! #113 moved `GET /api/v1/version` through the S4 seam, #116 added the first
 //! `Blocking` route, and #117 moves the remaining management JSON routes here.
-//! Blob/file transfer, import/install and the plugin UI streams keep their own
-//! streaming paths until #118–#122; #120 moved export spk/spkb to
-//! `face/export.rs`. This face owns the ordinary management surface, the
+//! Blob/file downloads (#118) and uploads (#119) are claimed by their own
+//! stream faces before the body is read; export spk/spkb lives in
+//! `face/export.rs` (#120). Import/install (#121) and the plugin UI streams
+//! keep their own paths. This face owns the ordinary management surface, the
 //! console page and login/logout.
 
 use std::io;
@@ -400,8 +401,9 @@ fn is_api_path(path: &str) -> bool {
     parts.first() == Some(&"api") && parts.get(1) == Some(&"v1")
 }
 
-/// Paths owned by the transfer slices (#119–#121) stay on the legacy bridge
-/// until their own StreamHandler lands.
+/// Paths owned by the remaining transfer slice (#121) stay on the legacy
+/// bridge. Uploads are claimed by the pre-body upload face before this check;
+/// downloads and exports are claimed above it.
 fn is_transfer_path(method: &str, path: &str) -> bool {
     let path = path_only(path);
     let mut parts = parts(path);
@@ -708,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn downloads_and_exports_use_the_stream_face_and_uploads_stay_legacy() {
+    fn downloads_and_exports_use_the_stream_face_and_uploads_use_the_prebody_face() {
         let face = face();
         for (method, path) in [
             ("GET", "/api/v1/blobs/abc"),
@@ -725,12 +727,26 @@ mod tests {
             );
             assert_eq!(route.dispatch, Dispatch::Inline);
         }
+        // Uploads are claimed by the pre-body upload face, not by ApiFace.
+        for (method, path) in [
+            ("POST", "/api/v1/blobs"),
+            ("PUT", "/api/v1/blobs/uploads/abc/parts/1"),
+            ("PUT", "/api/v1/file/uploads/abc/parts/2"),
+        ] {
+            let head = crate::http::Head {
+                method: method.to_string(),
+                path: path.to_string(),
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+            };
+            assert!(
+                crate::face::blob_upload::upload_target(&head).is_some(),
+                "{method} {path} must use the pre-body upload face"
+            );
+        }
         for (method, path) in [
             ("POST", "/api/v1/plugins"),
             ("POST", "/api/v1/import"),
-            ("POST", "/api/v1/blobs/uploads"),
-            ("PUT", "/api/v1/blobs/uploads/abc/parts/1"),
-            ("POST", "/api/v1/file/uploads"),
             ("GET", "/mcp"),
             ("GET", "/plugin-ui/demo/token/events"),
         ] {

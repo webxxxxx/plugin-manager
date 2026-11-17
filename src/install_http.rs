@@ -57,7 +57,7 @@ pub fn serve(
             return;
         }
     };
-    if auth == AuthKind::Cookie && !csrf_ok(head) {
+    if auth == AuthKind::Cookie && !http::csrf_ok(&head.headers) {
         let _ = write_error(
             stream,
             403,
@@ -220,13 +220,6 @@ fn code_for(status: u16) -> &'static str {
     }
 }
 
-fn csrf_ok(head: &http::Head) -> bool {
-    let host = http::header(&head.headers, "host").unwrap_or("");
-    let origin = http::header(&head.headers, "origin").unwrap_or("");
-    let csrf = http::header(&head.headers, "x-svcd-csrf").unwrap_or("");
-    !host.is_empty() && origin == format!("http://{}", host) && csrf == "1"
-}
-
 fn query_value(query: &str, key: &str) -> Option<String> {
     for pair in query.split('&') {
         let Some((name, value)) = pair.split_once('=') else {
@@ -284,7 +277,7 @@ pub fn serve_import(
             return;
         }
     };
-    if auth == AuthKind::Cookie && !csrf_ok(head) {
+    if auth == AuthKind::Cookie && !http::csrf_ok(&head.headers) {
         let _ = write_error(
             stream,
             403,

@@ -46,6 +46,9 @@ pub struct StreamDriver {
     /// client bytes until the socket drains. This is the per-connection
     /// backpressure point for a slow reader.
     blocked_on_write: bool,
+    /// When the handler last paused for a blocking job. A queued or running
+    /// job that makes no progress for the transfer timeout closes the stream.
+    paused: Option<Instant>,
     /// Held for long-lived streams, absent for one-shot responses.
     _permit: Option<StreamPermit>,
 }
@@ -84,6 +87,7 @@ impl StreamDriver {
             job: None,
             awaiting: false,
             blocked_on_write: false,
+            paused: None,
             _permit: permit,
         }
     }
@@ -104,6 +108,7 @@ impl StreamDriver {
         let job = self.job.take();
         if job.is_some() {
             self.awaiting = true;
+            self.paused.get_or_insert_with(Instant::now);
         }
         job
     }
@@ -120,6 +125,8 @@ impl StreamDriver {
             return true;
         }
         self.awaiting = false;
+        self.paused = None;
+        self.touch();
         self.on_event(StreamEvent::BlockingDone(outcome), out, out_at)
     }
 
@@ -236,6 +243,16 @@ impl StreamDriver {
         last_active: &mut Instant,
     ) -> bool {
         if self.job.is_some() || self.awaiting {
+            // A queued/running job may take longer than one poll tick, but it
+            // must still make progress within the transfer timeout. This is
+            // the bound that stops a queue-full retry from pinning the slot.
+            if let Some(paused) = self.paused {
+                if now.saturating_duration_since(paused) >= limits::current().transfer_timeout {
+                    self.closing = Some(CloseReason::TimedOut);
+                    let _ = flush(stream, out, out_at, last_active);
+                    return false;
+                }
+            }
             return true;
         }
         if now < self.wakeup {
@@ -300,6 +317,7 @@ impl StreamDriver {
                     ));
                 } else {
                     self.job = Some(job);
+                    self.paused.get_or_insert_with(Instant::now);
                 }
             }
             StreamAction::SendFile(send) => {
@@ -314,6 +332,9 @@ impl StreamDriver {
                 self.blocked_on_write = false;
                 self.closing = Some(reason);
             }
+        }
+        if self.job.is_none() && !self.awaiting {
+            self.paused = None;
         }
         !(self.closing.is_some() && self.file.is_none() && *out_at >= out_len)
     }
@@ -740,4 +761,44 @@ mod tests {
         assert_eq!(out, b"onetwo");
         assert!(driver.closing.is_some());
     }
+
+    struct PauseOnce;
+
+    impl StreamHandler for PauseOnce {
+        fn on_event(&mut self, event: StreamEvent<'_>, _out: &mut OutBuffer<'_>) -> StreamStep {
+            match event {
+                StreamEvent::Data(_) => StreamStep::wait(StreamAction::SubmitBlocking(Box::new(
+                    || BlockingOutcome::Ok(Vec::new()),
+                ))),
+                StreamEvent::BlockingDone(_) => StreamStep::wait(StreamAction::NeedRead),
+                _ => StreamStep::wait(StreamAction::Continue),
+            }
+        }
+    }
+
+    #[test]
+    fn a_paused_job_still_closes_at_the_transfer_bound() {
+        let StreamAdmission::Admitted(mut driver) =
+            StreamDriver::admit(Box::new(PauseOnce), 1)
+        else {
+            panic!("the stream fits the cap");
+        };
+        let mut out = Vec::new();
+        let mut out_at = 0;
+        assert!(driver.on_data(b"body", &mut out, &mut out_at));
+        let job = driver.take_job().expect("the handler submitted one job");
+        drop(job);
+        let mut stream = socket();
+        let mut last_active = Instant::now();
+        let beyond = Instant::now() + limits::current().transfer_timeout + Duration::from_secs(1);
+        assert!(!driver.on_tick(
+            beyond,
+            &mut stream,
+            &mut out,
+            &mut out_at,
+            &mut last_active
+        ));
+        assert_eq!(driver.closing, Some(CloseReason::TimedOut));
+    }
+
 }

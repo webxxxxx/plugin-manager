@@ -1,10 +1,10 @@
 //! The shared `max_streams` admission counter for stream-handler transfers.
 //!
-//! Long-lived stream handlers (downloads today; uploads, SSE and WebSocket as
-//! they migrate) draw from one budget; one-shot static assets are exempt. The
-//! Unix server loop uses it via `driver::StreamDriver`, the Windows thread
-//! fallback via `fallback::drive`. The still-legacy blob upload takeover keeps
-//! its own counter until #119.
+//! Long-lived stream handlers (downloads, uploads, SSE and WebSocket) draw
+//! from one budget; one-shot static assets are exempt. The Unix server loop uses
+//! it via `driver::StreamDriver`, the Windows thread fallback via
+//! `fallback::drive`. The still-legacy export/import/install takeovers are
+//! outside this counter until they migrate.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

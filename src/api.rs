@@ -377,24 +377,6 @@ fn install_takeover(connection: &mut Connection) -> Option<(TcpStream, http::Hea
     Some((stream, head, initial))
 }
 
-#[cfg(unix)]
-fn blob_takeover(
-    connection: &mut Connection,
-) -> Option<(TcpStream, http::Head, Vec<u8>, crate::blob_http::Route)> {
-    if connection.pending.is_some() {
-        return None;
-    }
-    let header_end = http::header_end(&connection.buffer)?;
-    if header_end > crate::limits::current().max_header {
-        return None;
-    }
-    let (head, body_start) = http::parse_head(&connection.buffer[..header_end + 4])?;
-    let route = blob_http::route(&head)?;
-    let stream = connection.stream.try_clone().ok()?;
-    let initial = connection.buffer[body_start..].to_vec();
-    Some((stream, head, initial, route))
-}
-
 /// Admission bookkeeping for the Windows thread-per-connection fallback.
 ///
 /// The Unix reactor bounds its connection table directly. The fallback has no
@@ -534,7 +516,7 @@ fn listener_loop(listener: Option<TcpListener>, lan: Arc<Mutex<Lan>>, config: Pa
 fn drive_fallback(stream: &mut TcpStream, handler: Box<dyn crate::server::http::StreamHandler>) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_write_timeout(Some(crate::limits::current().transfer_timeout));
-    if crate::server::http::fallback::drive(stream, handler).is_err() {
+    if crate::server::http::fallback::drive(stream, handler, &[]).is_err() {
         let _ = stream.write_all(&crate::server::http::stream_busy_response());
     }
 }
@@ -618,6 +600,36 @@ fn serve_streamed_route(
     }
 }
 
+/// Run one blob/file upload through the face and the Windows fallback driver.
+/// The fallback owns the socket and runs upload staging jobs on this
+/// connection thread, so a slow client only blocks its own connection.
+#[cfg(not(unix))]
+fn serve_blob_upload(
+    stream: &mut TcpStream,
+    head: &http::Head,
+    initial: &[u8],
+    lan: &Arc<Mutex<Lan>>,
+) {
+    use crate::server::http::Exchange;
+
+    match crate::face::blob_upload::exchange(head, lan) {
+        Err(response) => {
+            let _ = stream.write_all(&response);
+        }
+        Ok(Exchange::Response(response)) => {
+            let _ = stream.write_all(&response.into_bytes());
+        }
+        Ok(Exchange::Stream(handler)) => {
+            let _ = stream.set_nonblocking(false);
+            let _ = stream.set_read_timeout(Some(crate::limits::current().transfer_timeout));
+            let _ = stream.set_write_timeout(Some(crate::limits::current().transfer_timeout));
+            if crate::server::http::fallback::drive(stream, handler, initial).is_err() {
+                let _ = stream.write_all(&crate::server::http::stream_busy_response());
+            }
+        }
+    }
+}
+
 /// Refuse one accepted connection with the same busy response the Unix reactor
 /// sends, instead of starting a thread that would exceed the connection cap.
 #[cfg(not(unix))]
@@ -694,8 +706,8 @@ fn handle(
             );
             return;
         }
-        if let Some(route) = blob_http::route(&head) {
-            let _ = blob_http::serve(&mut stream, &head, &initial, &lan, route);
+        if crate::face::blob_upload::upload_target(&head).is_some() {
+            serve_blob_upload(&mut stream, &head, &initial, &lan);
             return;
         }
         let request = match read_body(&mut stream, head, &initial) {
@@ -1146,7 +1158,7 @@ fn same_origin(request: &HttpRequest) -> bool {
 }
 
 pub(crate) fn is_write(method: &str) -> bool {
-    matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
+    http::is_write_method(method)
 }
 
 fn csrf_ok(request: &HttpRequest) -> bool {
@@ -1154,10 +1166,7 @@ fn csrf_ok(request: &HttpRequest) -> bool {
 }
 
 pub(crate) fn csrf_ok_headers(headers: &[(String, String)]) -> bool {
-    let host = http::header(headers, "host").unwrap_or("");
-    let origin = http::header(headers, "origin").unwrap_or("");
-    let csrf = http::header(headers, "x-svcd-csrf").unwrap_or("");
-    !host.is_empty() && origin == format!("http://{}", host) && csrf == "1"
+    http::csrf_ok(headers)
 }
 
 /// Why no complete request head arrived. A timeout or EOF is a closed

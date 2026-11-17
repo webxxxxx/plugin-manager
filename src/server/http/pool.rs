@@ -49,6 +49,10 @@ pub enum JobOutcome {
     Dropped,
 }
 
+/// A boxed pool job. The stream path needs the job back when the queue is
+/// full, so the pool accepts it already boxed.
+pub type PoolJob = Box<dyn FnOnce(CancelToken) + Send + 'static>;
+
 /// A cancellation token for one job. A disconnect flips it; the job checks it
 /// at natural boundaries instead of being killed from another thread.
 #[derive(Clone)]
@@ -121,20 +125,28 @@ impl BlockingPool {
         key: u64,
         job: impl FnOnce(CancelToken) + Send + 'static,
     ) -> Result<(), Busy> {
+        self.try_submit_boxed(key, Box::new(job))
+            .map_err(|(busy, _job)| busy)
+    }
+
+    /// Like `try_submit`, but returns the boxed job when the pool refuses it.
+    /// A stream handler that runs out of queue space keeps the job in its
+    /// pending slot and retries later, so an upload chunk is never dropped.
+    pub fn try_submit_boxed(&self, key: u64, job: PoolJob) -> Result<(), (Busy, PoolJob)> {
         let mut state = self.inner.lock();
         if state.closed {
-            return Err(Busy::Closed);
+            return Err((Busy::Closed, job));
         }
         if !state.inflight.insert(key) {
-            return Err(Busy::AlreadyInFlight);
+            return Err((Busy::AlreadyInFlight, job));
         }
         if state.queue.len() >= self.inner.queue_limit {
             state.inflight.remove(&key);
-            return Err(Busy::QueueFull);
+            return Err((Busy::QueueFull, job));
         }
         state.queue.push_back(Job {
             key,
-            run: Box::new(job),
+            run: job,
             cancel: CancelToken::new(),
         });
         self.inner.ready.notify_one();
@@ -464,6 +476,42 @@ mod tests {
         pool.try_submit(3, |_| {})
             .expect("the cancelled key is reusable");
         assert_eq!(recv(&finished_rx), (3, JobOutcome::Finished));
+    }
+
+    #[test]
+    fn a_refused_boxed_job_is_handed_back_to_its_stream() {
+        let (finished, _finished_rx) = finished_channel();
+        let pool = BlockingPool::start(1, 1, move |key, outcome| {
+            let _ = finished.send((key, outcome));
+        })
+        .expect("pool");
+
+        let started = Gate::new();
+        let release = Gate::new();
+        let started_by_job = started.clone();
+        let release_job = release.clone();
+        pool.try_submit(1, move |_| {
+            started_by_job.release();
+            release_job.wait();
+        })
+        .expect("the worker takes the first job");
+        started.wait();
+        pool.try_submit(2, |_| {}).expect("fills the queue");
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_by_job = ran.clone();
+        let refused = pool.try_submit_boxed(
+            3,
+            Box::new(move |_| {
+                ran_by_job.store(true, Ordering::SeqCst);
+            }),
+        );
+        let (busy, job) = refused.expect_err("the queue is full");
+        assert_eq!(busy, Busy::QueueFull);
+        drop(job);
+
+        release.release();
+        assert!(!ran.load(Ordering::SeqCst), "a refused job must not run");
     }
 
     #[test]

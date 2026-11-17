@@ -503,9 +503,24 @@ pub fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str
         .map(|(_, value)| value.as_str())
 }
 
+/// Methods that mutate state. Cookie-authenticated writes require the CSRF
+/// header; the transport and every face use one definition.
+pub fn is_write_method(method: &str) -> bool {
+    matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
+}
+
+/// The cookie-write CSRF policy: same-origin `Origin` plus `X-Svcd-Csrf: 1`.
+/// A missing Host or Origin fails closed.
+pub fn csrf_ok(headers: &[(String, String)]) -> bool {
+    let host = header(headers, "host").unwrap_or("");
+    let origin = header(headers, "origin").unwrap_or("");
+    let csrf = header(headers, "x-svcd-csrf").unwrap_or("");
+    !host.is_empty() && origin == format!("http://{}", host) && csrf == "1"
+}
+
 /// Same-origin check shared by the UI `/rpc` bridge, cookie writes and
 /// `/mcp`. A missing `Origin` is allowed: non-browser clients do not send one
-/// and the cookie surfaces require it explicitly (see `api::csrf_ok`).
+/// and the cookie surfaces require it explicitly (see `csrf_ok`).
 pub fn same_origin(headers: &[(String, String)]) -> bool {
     let Some(origin) = header(headers, "origin") else {
         return true;
