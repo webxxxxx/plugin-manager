@@ -2281,7 +2281,9 @@ fn run_status_hook(id: &str, hook: &Hook, poll: &mut dyn FnMut()) -> String {
             }
         }
         if started.elapsed() >= Duration::from_millis(hook.timeout_ms) {
-            let _ = child.kill();
+            // The probe runs in its own process group: stop the whole tree, not
+            // just the leader, or a status hook's children outlive the timeout.
+            crate::hook::kill(&mut child);
             let _ = child.wait();
             let output = read_status_output(&output_path);
             let _ = fs::remove_file(&output_path);

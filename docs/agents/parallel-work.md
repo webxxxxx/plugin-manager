@@ -14,6 +14,10 @@ git worktree add target/wt-<ticket> -b feat/<ticket> origin/main
 preflight 默认只打一行（branch / ahead-behind / dirty / worktree 数）；只有排查时才加
 `--all` 列出每个 worktree。看到 `on main` 就先建 worktree。
 
+共享工作区（仓库根目录）可能停在任意分支，甚至落后 main 几十个提交。读代码、grep、
+取「main 的现状」之前先确认在哪个 worktree：`git -C <worktree> rev-parse --abbrev-ref HEAD`，
+或直接用 `git -C target/wt-<ticket>`。根目录的文件不是 main 的权威副本。
+
 ## 输出预算
 
 每次工具输出都会长期占用上下文，默认走摘要：
@@ -24,8 +28,9 @@ preflight 默认只打一行（branch / ahead-behind / dirty / worktree 数）�
   它只打印每个 target 的 `test result` 和失败尾部，不把几千行 cargo 输出带进上下文。
 - **guard 工具**：preflight / merge-guard / closed-tickets 默认都是 brief；
   `--all`、`--verbose`、`--json` 只在需要机器处理或定位时用。
-- **文件**：`read` 带 `offset`/`limit`，不整文件读；整文件重写用 `fs.readFileSync`
-  或 `edit`。`read` 的 `totalLines` 大于返回行数时，永远不要拿它回写。
+- **文件**：用带 `offset`/`limit` 的读取工具，不整文件读（本 DSH 环境是
+  `ops_inspect_local_file`；搜索用 `ops_grep`，找路径用 `ops_glob`）。整文件重写用
+  `write`/`edit`。读取结果明显被截断时，不要拿它回写。
 
 ## 共享 main 上不要做
 
@@ -41,6 +46,13 @@ preflight 默认只打一行（branch / ahead-behind / dirty / worktree 数）�
 - 一张票只开一个 worktree；CI 修复、review 收口都在同一条分支上追加 commit，
   不要为每个猜测新建 worktree（会多出 merge/push 步骤和 `AGENTS.md` 重载）。
 - 在 worktree 里小步 commit，尽早 push 分支。
+- 多行或含反引号/`$` 的提交信息用 `git commit -F <file>`；`-m` 会过 shell，反引号会被
+  命令替换吃掉。
+- main 的 worktree 不一定是仓库根目录：`git worktree list` 里找 `[main]` 那条
+  （通常是 `target/wt-merge-*`）。集成用
+  `git -C <main-wt> merge --ff-only origin/main` 追上，
+  再 `git -C <main-wt> merge --no-ff <branch> -m "merge #<ticket>: <一句话>"`，
+  验证后 `git -C <main-wt> push origin main`。合并后的票分支保留。
 - 合并前 `node tools/merge-guard.mjs <branch> --strict --ci`（brief；`--all` 才列全部重叠文件）。
   `--ci` 只读 main 最近一次 `test` workflow：如果 main 已经红，先修或说明为什么仍要合；
   它不会启动 CI。
