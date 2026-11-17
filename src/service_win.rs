@@ -84,15 +84,11 @@ pub fn run_if_service(
     request_shutdown: fn(),
 ) -> Option<i32> {
     // The SCM thread polls the control endpoint before the daemon thread
-    // applies `--conf`. Load the explicit config first, or the default value
-    // wins the `SETTINGS` slot and the daemon silently ignores it; then resolve
-    // the endpoint once from the same settings.
-    if let Some(path) = conf.as_deref() {
-        if path.is_file() {
-            let _ = crate::settings::init_from_path(path);
-        }
-    }
-    let _ = SERVICE_ENDPOINT.set(crate::config::ambient_paths().config_dir);
+    // applies `--conf`. Resolve the endpoint once from the explicit document
+    // when it exists, or from the ordinary discovery otherwise; the daemon
+    // thread then loads the same file through `Config::bootstrap`.
+    let explicit = conf.as_deref().filter(|path| path.is_file());
+    let _ = SERVICE_ENDPOINT.set(crate::config::ambient_paths(explicit).config_dir);
     let _ = SERVICE_CONF.set(conf);
     let _ = DAEMON_RUN.set(run_daemon);
     let _ = DAEMON_SHUTDOWN.set(request_shutdown);
@@ -188,9 +184,10 @@ fn finish(code: i32) {
 /// deadline expired (a slow start must not block the SCM forever).
 fn wait_until_ready(daemon: &JoinHandle<i32>) -> bool {
     let deadline = Instant::now() + Duration::from_millis(READY_TIMEOUT_MS);
-    let endpoint = SERVICE_ENDPOINT.get().cloned().unwrap_or_else(|| {
-        crate::config::ambient_paths().config_dir
-    });
+    let endpoint = SERVICE_ENDPOINT
+        .get()
+        .cloned()
+        .unwrap_or_else(|| crate::config::ambient_paths(None).config_dir);
     loop {
         if daemon.is_finished() {
             return false;

@@ -157,15 +157,12 @@ pub fn dispatch_blocking_now(
     face: &dyn Face,
     route: &Route,
     request: Request,
+    control_timeout: std::time::Duration,
 ) -> Result<Exchange, DispatchError> {
     // The Windows fallback has no pool token, but the control round trip still
     // needs the same bound. The Unix loop stamps the deadline itself when it
     // hands the job to the pool.
-    let request = request.with_control_budget(
-        Instant::now(),
-        crate::limits::current().control_timeout,
-        None,
-    );
+    let request = request.with_control_budget(Instant::now(), control_timeout, None);
     dispatch_now(face, route, request, Dispatch::Blocking)
 }
 
@@ -471,8 +468,9 @@ mod tests {
             behavior: Behavior::Respond,
         };
         let route = Route::blocking(BodyPolicy::Empty);
-        let exchange = dispatch_blocking_now(&face, &route, request())
-            .expect("a blocking route must complete on the calling thread");
+        let exchange =
+            dispatch_blocking_now(&face, &route, request(), std::time::Duration::from_secs(30))
+                .expect("a blocking route must complete on the calling thread");
         let Exchange::Response(response) = exchange else {
             panic!("the fake face returned a memory response");
         };
@@ -482,6 +480,7 @@ mod tests {
             &face,
             &Route::inline(BodyPolicy::Empty),
             request(),
+            std::time::Duration::from_secs(30),
         ));
         assert_eq!(error, DispatchError::UnsupportedDispatch(Dispatch::Inline));
     }

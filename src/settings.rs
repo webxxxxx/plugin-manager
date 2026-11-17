@@ -2,7 +2,11 @@
 //!
 //! The file is a small `key = value` document. The install layer resolves
 //! which file to use (explicit install path, program directory, config
-//! directory, or a generated default); this module only parses and caches it.
+//! directory, or a generated default); this module parses and rewrites it but
+//! keeps no process-wide copy — the composition root derives [`Config`] from
+//! one [`load`] and passes the value down.
+//!
+//! [`Config`]: crate::config::Config
 //!
 //! `SVCD_BIND` overrides the `bind` key for tests and ad-hoc runs; explicit
 //! paths in `svcd.conf` win over the platform defaults.
@@ -10,10 +14,6 @@
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-
-static SETTINGS: OnceLock<Result<Settings, String>> = OnceLock::new();
-static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
@@ -103,68 +103,39 @@ impl Settings {
     }
 }
 
-/// The settings for this process. Loaded once from `SVCD_CONFIG_DIR` when it is
-/// set, otherwise the program directory first and the platform config
-/// directory second. An explicitly initialized service config wins over both.
-pub fn current() -> Result<&'static Settings, String> {
-    SETTINGS
-        .get_or_init(|| {
-            if let Some(dir) = std::env::var_os("SVCD_CONFIG_DIR") {
-                return load(&PathBuf::from(dir));
-            }
-            let program_conf = std::env::current_exe()
-                .ok()
-                .and_then(|path| path.parent().map(|parent| parent.join("svcd.conf")));
-            if let Some(path) = program_conf {
-                if path.is_file() {
-                    return load_from(&path);
-                }
-            }
-            load(&crate::platform::host::dirs::default_config_dir())
-        })
-        .as_ref()
-        .map_err(Clone::clone)
-}
-
-/// The file this process loaded. `svc lan passwd` updates this exact file.
-pub fn path() -> Option<&'static Path> {
-    CONFIG_PATH.get().map(PathBuf::as_path)
-}
-
-/// Whether the operator enabled unsigned installs in `svcd.conf`. This is the
-/// only switch: CLI, HTTP and the console have no per-install insecure option.
-pub fn allow_insecure_install() -> bool {
-    current()
-        .map(|settings| settings.allow_insecure_install)
-        .unwrap_or(false)
-}
-
-/// Load the config file chosen by `install::ensure_conf` into the process cache.
-pub fn init_from_path(path: &Path) -> Result<(), String> {
-    if let Some(existing) = SETTINGS.get() {
-        return existing.as_ref().map(|_| ()).map_err(Clone::clone);
-    }
-    if !path.is_file() {
-        return Err(format!("config not found: {}", path.display()));
-    }
-    match load_from(path) {
-        Ok(settings) => {
-            let _ = SETTINGS.set(Ok(settings));
-            Ok(())
+/// Load the document this process runs with.
+///
+/// One call resolves the file *and* parses it, so the composition root
+/// ([`crate::config::Config::bootstrap`]) gets both values from a single read.
+/// Precedence: an explicit `--conf` (which must exist), then
+/// `SVCD_CONFIG_DIR`, then `<program dir>/svcd.conf`, then the platform config
+/// directory. A missing file in a discovered location is an empty document,
+/// not an error; a broken one is an error. There is no process cache: every
+/// caller decides once and passes the value down.
+pub(crate) fn load(conf: Option<&Path>) -> Result<(Settings, Option<PathBuf>), String> {
+    if let Some(path) = conf {
+        if !path.is_file() {
+            return Err(format!("config not found: {}", path.display()));
         }
-        Err(error) => {
-            let _ = SETTINGS.set(Err(error.clone()));
-            Err(error)
+        return Ok((load_from(path)?, Some(path.to_path_buf())));
+    }
+    if let Some(dir) = std::env::var_os("SVCD_CONFIG_DIR") {
+        let path = PathBuf::from(dir).join("svcd.conf");
+        return Ok((load_from(&path)?, Some(path)));
+    }
+    let program_conf = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join("svcd.conf")));
+    if let Some(path) = program_conf {
+        if path.is_file() {
+            return Ok((load_from(&path)?, Some(path)));
         }
     }
-}
-
-fn load(config_dir: &Path) -> Result<Settings, String> {
-    load_from(&config_dir.join("svcd.conf"))
+    let path = crate::platform::host::dirs::default_config_dir().join("svcd.conf");
+    Ok((load_from(&path)?, Some(path)))
 }
 
 fn load_from(path: &Path) -> Result<Settings, String> {
-    let _ = CONFIG_PATH.set(path.to_path_buf());
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -313,8 +284,7 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
                     Some(parse_u64(value, "control_timeout_secs", index)?)
             }
             "default_timeout" => {
-                settings.default_timeout_ms =
-                    Some(parse_u64(value, "default_timeout", index)?)
+                settings.default_timeout_ms = Some(parse_u64(value, "default_timeout", index)?)
             }
             "max_timeout" => {
                 settings.max_timeout_ms = Some(parse_u64(value, "max_timeout", index)?)
@@ -472,7 +442,8 @@ mod tests {
 
     #[test]
     fn update_value_collapses_duplicate_keys() {
-        let directory = crate::test_support::temp_dir().join(format!("svcd-settings-{}", std::process::id()));
+        let directory =
+            crate::test_support::temp_dir().join(format!("svcd-settings-{}", std::process::id()));
         fs::create_dir_all(&directory).expect("temp dir");
         let path = directory.join("svcd.conf");
         fs::write(

@@ -160,6 +160,7 @@ impl ControlChannel for Platform {
         admin: Self::Listener,
         pending: SyncSender<PendingCall>,
         wake: Arc<Wake>,
+        _io_stack: usize,
     ) -> io::Result<Self::Server> {
         Ok(ControlBinding {
             user,

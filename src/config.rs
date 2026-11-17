@@ -19,10 +19,10 @@ use crate::settings::{self, Settings};
 /// Everything the composition root derives from one `svcd.conf`: the parsed
 /// document, the file it came from, the directory set, and the limits.
 ///
-/// The `settings` and `limits` fields are the bootstrap snapshot. The
-/// process-wide `settings::current()` / `limits::current()` caches still serve
-/// the readers that S7b has not migrated yet; S7a changes where directories
-/// come from, not where those two values do.
+/// The four fields are the bootstrap snapshot. There is no process-wide cache
+/// behind any of them: every reader receives the value through a construction
+/// parameter, so a unit test can supply its own document without touching the
+/// process environment.
 #[derive(Clone, Debug)]
 pub struct Config {
     /// The document this process runs with.
@@ -32,7 +32,7 @@ pub struct Config {
     /// Every directory the process uses.
     pub paths: Arc<Paths>,
     /// Limits derived from `settings`.
-    pub limits: Limits,
+    pub limits: Arc<Limits>,
 }
 
 impl Config {
@@ -56,22 +56,19 @@ impl Config {
             paths: Arc::new(paths),
             settings: Arc::new(settings),
             settings_path,
-            limits,
+            limits: Arc::new(limits),
         }
     }
 
     /// The single bootstrap point.
     ///
-    /// Loads the settings document once (through the shared settings cache, so
-    /// `--conf` and the default discovery cannot disagree), then resolves the
-    /// directory set and the limits from it. A broken or unreadable document is
-    /// a hard error: nothing silently falls back to defaults.
+    /// Resolves and parses the settings document exactly once, then derives the
+    /// directory set and the limits from it. There is no process cache behind
+    /// the returned value: a broken or unreadable document is a hard error, and
+    /// callers that find a missing discovered file get an empty document, not a
+    /// silent retry.
     pub fn bootstrap(conf: Option<&Path>) -> Result<Config, String> {
-        if let Some(path) = conf {
-            settings::init_from_path(path)?;
-        }
-        let settings = settings::current()?.clone();
-        let settings_path = settings::path().map(Path::to_path_buf);
+        let (settings, settings_path) = settings::load(conf)?;
         Ok(Config::new(settings, settings_path))
     }
 
@@ -93,16 +90,38 @@ impl Config {
 /// and uninstall, and the Windows SCM readiness probe.
 ///
 /// It reads the same `SVCD_*` overrides as bootstrap but falls back to the
-/// platform defaults instead of failing. [`Config::bootstrap`] stays the hard
-/// error entry; this is the only other place that reads those variables.
-pub(crate) fn ambient_paths() -> Paths {
-    Paths::resolve(&settings::current().cloned().unwrap_or_default())
+/// platform defaults instead of failing. `conf` is loaded when it exists; a
+/// missing or broken document falls back to the default settings. [`Config::bootstrap`]
+/// stays the hard error entry; this is the only other place that reads those
+/// variables.
+pub(crate) fn ambient_paths(conf: Option<&Path>) -> Paths {
+    match Config::bootstrap(conf) {
+        Ok(config) => config.paths.as_ref().clone(),
+        Err(_) => Paths::resolve(&Settings::default()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn write_conf(name: &str, text: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = crate::test_support::temp_dir().join(format!(
+            "svcd-config-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            name
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("svcd.conf");
+        std::fs::write(&path, text).expect("write conf");
+        path
+    }
 
     #[test]
     fn a_config_keeps_the_document_the_path_and_the_derived_limits() {
@@ -122,5 +141,54 @@ mod tests {
         assert_eq!(config.settings.http_idle_timeout_secs, Some(7));
         // The limits are a pure projection of the document, not a second cache.
         assert_eq!(config.limits.idle_timeout, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn bootstrap_reads_the_explicit_document_and_keeps_its_path() {
+        let path = write_conf("explicit", "http_idle_timeout_secs = 7\n");
+        let config = Config::bootstrap(Some(&path)).expect("bootstrap");
+
+        assert_eq!(config.settings.http_idle_timeout_secs, Some(7));
+        assert_eq!(config.settings_path.as_deref(), Some(path.as_path()));
+        assert_eq!(config.limits.idle_timeout, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn two_bootstraps_from_different_documents_do_not_share_state() {
+        // The old process-wide cache made the second document invisible. The
+        // derived value must follow the document each call is given.
+        let first = write_conf("first", "http_idle_timeout_secs = 7\n");
+        let second = write_conf("second", "http_idle_timeout_secs = 11\n");
+
+        let first = Config::bootstrap(Some(&first)).expect("first");
+        let second = Config::bootstrap(Some(&second)).expect("second");
+
+        assert_eq!(first.limits.idle_timeout, Duration::from_secs(7));
+        assert_eq!(second.limits.idle_timeout, Duration::from_secs(11));
+    }
+
+    #[test]
+    fn ambient_paths_honours_an_explicit_document() {
+        let root = crate::test_support::temp_dir().join(format!(
+            "svcd-config-ambient-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let conf_dir = root.join("custom-config");
+        let path = write_conf("ambient", &format!("config_dir = {}\n", conf_dir.display()));
+        std::fs::create_dir_all(&conf_dir).expect("custom config dir");
+
+        let paths = ambient_paths(Some(&path));
+        assert_eq!(paths.config_dir, conf_dir);
+    }
+
+    #[test]
+    fn a_missing_explicit_document_is_a_hard_error() {
+        let path = crate::test_support::temp_dir().join("svcd-config-missing.conf");
+        let error = Config::bootstrap(Some(&path)).expect_err("missing conf");
+        assert!(error.contains("config not found"), "{error}");
     }
 }

@@ -21,7 +21,6 @@ use serde_json::{json, Value};
 use crate::http;
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::lan::{AuthKind, Lan};
-use crate::limits;
 use crate::package;
 use crate::paths::Paths;
 use crate::plugin;
@@ -29,7 +28,6 @@ use crate::server::http::{
     BlockingOutcome, CloseReason, Exchange, OutBuffer, StreamAction, StreamClass, StreamEvent,
     StreamHandler, StreamStep,
 };
-use crate::settings;
 use crate::transfer;
 
 use super::support::{self, CallBudget};
@@ -69,8 +67,7 @@ pub fn target(head: &http::Head) -> Option<PackageTarget> {
         .unwrap_or("");
     match path {
         "/api/v1/plugins" => Some(PackageTarget::Install {
-            strategy: support::query_value(query, "strategy")
-                .unwrap_or_else(|| "replace".into()),
+            strategy: support::query_value(query, "strategy").unwrap_or_else(|| "replace".into()),
             enable: support::query_bool(query, "enable").unwrap_or(true),
             allow_hooks: support::query_bool(query, "allow_hooks").unwrap_or(false),
         }),
@@ -118,7 +115,7 @@ pub fn exchange(
             "cookie writes require Origin and X-Svcd-Csrf",
         ));
     }
-    let limits = limits::current();
+    let limits = &config.limits;
     let framing = http::framing(&head.headers)
         .map_err(|message| http::json_error(400, "bad_request", &message))?;
     match &target {
@@ -170,12 +167,13 @@ pub fn exchange(
             _ => {}
         },
     }
+    let max_package_bytes = config.limits.max_package_bytes;
     let handler = PackageUploadStream::new(
         target,
         framing,
         expects_continue(head),
         config,
-        limits.max_package_bytes,
+        max_package_bytes,
     );
     Ok(Exchange::Stream(Box::new(handler)))
 }
@@ -314,6 +312,8 @@ enum Flow {
 
 struct InstallFlow {
     paths: Arc<Paths>,
+    limits: Arc<crate::limits::Limits>,
+    allow_insecure: bool,
     strategy: String,
     enable: bool,
     allow_hooks: bool,
@@ -322,6 +322,8 @@ struct InstallFlow {
 
 struct ImportFlow {
     paths: Arc<Paths>,
+    limits: Arc<crate::limits::Limits>,
+    allow_insecure: bool,
     params: ImportParams,
     stage: ImportStage,
 }
@@ -374,6 +376,8 @@ impl PackageUploadStream {
                 allow_hooks,
             } => Flow::Install(InstallFlow {
                 paths: self_paths.clone(),
+                limits: config.limits.clone(),
+                allow_insecure: config.settings.allow_insecure_install,
                 strategy,
                 enable,
                 allow_hooks,
@@ -385,6 +389,8 @@ impl PackageUploadStream {
                 force,
             } => Flow::Import(ImportFlow {
                 paths: self_paths.clone(),
+                limits: config.limits.clone(),
+                allow_insecure: config.settings.allow_insecure_install,
                 params: ImportParams {
                     config_id,
                     no_config,
@@ -490,7 +496,11 @@ impl PackageUploadStream {
                     self.phase = Phase::Done;
                     return StreamStep::wait(StreamAction::Close(CloseReason::Completed));
                 }
-                self.respond(http::json_error(status, crate::http::code_for(status), &message));
+                self.respond(http::json_error(
+                    status,
+                    crate::http::code_for(status),
+                    &message,
+                ));
                 self.phase = Phase::Responding;
                 self.on_writable(out)
             }
@@ -669,8 +679,8 @@ impl InstallFlow {
         if self.installer.is_none() {
             self.installer = Some(package::StagingInstaller::new(
                 staging_path(&self.paths),
-                settings::allow_insecure_install(),
-                limits::current().max_package_bytes,
+                self.allow_insecure,
+                self.limits.max_package_bytes,
                 &self.paths.trust_dir,
             ));
         }
@@ -706,7 +716,7 @@ impl InstallFlow {
                         &config.paths.config_dir,
                         "svc.disable",
                         json!({ "id": id }),
-                        &budget.follow_up(),
+                        &budget.follow_up(config.limits.control_timeout),
                     );
                 }
                 let summary = status.get("summary").cloned().unwrap_or(Value::Null);
@@ -738,7 +748,7 @@ impl ImportFlow {
             ImportStage::Backup(import) => import.feed(data),
             ImportStage::Raw(config) => {
                 config.extend_from_slice(data);
-                if config.len() as u64 > limits::current().max_body {
+                if config.len() as u64 > self.limits.max_body {
                     return Err(Problem::TooLarge.error("import is too large"));
                 }
                 Ok(())
@@ -752,21 +762,26 @@ impl ImportFlow {
             Some("manifest.json") => {
                 let mut installer = package::StagingInstaller::new(
                     staging_path(&self.paths),
-                    settings::allow_insecure_install(),
-                    limits::current().max_package_bytes,
+                    self.allow_insecure,
+                    self.limits.max_package_bytes,
                     &self.paths.trust_dir,
                 );
                 installer.feed(&data)?;
                 self.stage = ImportStage::Package { installer };
             }
             Some("backup.json") => {
-                let mut import =
-                    BackupImport::new(&self.params, staging_path(&self.paths), self.paths.clone());
+                let mut import = BackupImport::new(
+                    &self.params,
+                    staging_path(&self.paths),
+                    self.paths.clone(),
+                    self.limits.clone(),
+                    self.allow_insecure,
+                );
                 import.feed(&data)?;
                 self.stage = ImportStage::Backup(import);
             }
             _ => {
-                if data.len() as u64 > limits::current().max_body {
+                if data.len() as u64 > self.limits.max_body {
                     return Err(Problem::TooLarge.error("import is too large"));
                 }
                 self.stage = ImportStage::Raw(data);
@@ -810,17 +825,16 @@ impl ImportFlow {
                         Err(error) => support::problem_response(&error),
                     }
                 }
-                ImportStage::Raw(data) => {
-                    return raw_config_response(&data, &self.params, &config.paths)
-                }
+                ImportStage::Raw(data) => return raw_config_response(&data, &self.params, config),
             }
         }
     }
 }
 
-fn raw_config_response(data: &[u8], params: &ImportParams, paths: &Paths) -> Vec<u8> {
+fn raw_config_response(data: &[u8], params: &ImportParams, config: &Config) -> Vec<u8> {
     match transfer::import(
-        paths,
+        &config.paths,
+        config.settings.allow_insecure_install,
         data,
         params.config_id.as_deref(),
         params.no_config,
@@ -849,11 +863,17 @@ struct BackupImport {
 }
 
 impl BackupImport {
-    fn new(params: &ImportParams, staging: PathBuf, paths: Arc<Paths>) -> BackupImport {
-        let max = limits::current().max_package_bytes;
+    fn new(
+        params: &ImportParams,
+        staging: PathBuf,
+        paths: Arc<Paths>,
+        limits: Arc<crate::limits::Limits>,
+        allow_insecure: bool,
+    ) -> BackupImport {
+        let max = limits.max_package_bytes;
         BackupImport {
             tar: package::TarFeed::new(max),
-            sink: BackupSink::new(params, staging, paths),
+            sink: BackupSink::new(params, staging, paths, limits, allow_insecure),
         }
     }
 
@@ -870,6 +890,7 @@ impl BackupImport {
 struct BackupSink {
     staging: PathBuf,
     paths: Arc<Paths>,
+    limits: Arc<crate::limits::Limits>,
     allow_insecure: bool,
     no_config: bool,
     force: bool,
@@ -897,11 +918,18 @@ enum BackupCurrent {
 }
 
 impl BackupSink {
-    fn new(params: &ImportParams, staging: PathBuf, paths: Arc<Paths>) -> BackupSink {
+    fn new(
+        params: &ImportParams,
+        staging: PathBuf,
+        paths: Arc<Paths>,
+        limits: Arc<crate::limits::Limits>,
+        allow_insecure: bool,
+    ) -> BackupSink {
         BackupSink {
             staging,
             paths,
-            allow_insecure: settings::allow_insecure_install(),
+            limits,
+            allow_insecure,
             no_config: params.no_config,
             force: params.force,
             backup: None,
@@ -934,25 +962,21 @@ impl package::TarSink for BackupSink {
                     return Err(Problem::Invalid.error("plugin.spk must be the second entry"));
                 }
                 if entry.kind != b'0' {
-                    return Err(Problem::Invalid.error(format!(
-                        "{} is not a regular file",
-                        entry.path
-                    )));
+                    return Err(
+                        Problem::Invalid.error(format!("{} is not a regular file", entry.path))
+                    );
                 }
                 self.installer = Some(package::StagingInstaller::new(
                     self.staging.clone(),
                     self.allow_insecure,
-                    limits::current().max_package_bytes,
+                    self.limits.max_package_bytes,
                     &self.paths.trust_dir,
                 ));
                 self.current = Some(BackupCurrent::Spk);
             }
             BackupStage::ExpectConfig => {
                 if entry.path != "config" {
-                    return Err(Problem::Invalid.error(format!(
-                        "unexpected entry: {}",
-                        entry.path
-                    )));
+                    return Err(Problem::Invalid.error(format!("unexpected entry: {}", entry.path)));
                 }
                 if entry.size > 64 * 1024 {
                     return Err(Problem::TooLarge.error("config is too large"));
@@ -994,10 +1018,8 @@ impl package::TarSink for BackupSink {
                     Problem::Invalid.error(format!("invalid backup.json: {}", error))
                 })?;
                 if backup.schema != 1 {
-                    return Err(Problem::Invalid.error(format!(
-                        "unsupported backup schema {}",
-                        backup.schema
-                    )));
+                    return Err(Problem::Invalid
+                        .error(format!("unsupported backup schema {}", backup.schema)));
                 }
                 self.backup = Some(backup);
                 self.stage = BackupStage::ExpectSpk;
@@ -1064,9 +1086,9 @@ impl BackupSink {
         // must leave it in self.staged so Drop removes the directory.
         if let Some(expected) = &backup.config_sha256 {
             let Some(config_data) = self.config_data.as_ref() else {
-                return Err(Problem::Invalid.error(
-                    "backup declares a config hash but config is missing",
-                ));
+                return Err(
+                    Problem::Invalid.error("backup declares a config hash but config is missing")
+                );
             };
             if &package::hex_sha256(config_data) != expected {
                 return Err(Problem::Invalid.error("backup config hash does not match"));
@@ -1211,7 +1233,6 @@ fn import_outcome_json(outcome: transfer::Outcome) -> Vec<u8> {
         &serde_json::to_vec(&body).unwrap_or_default(),
     )
 }
-
 
 #[cfg(test)]
 mod tests {

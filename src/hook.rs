@@ -38,12 +38,19 @@ pub struct Invocation<'a> {
 pub fn run(
     spec: &Invocation<'_>,
     paths: &Paths,
+    limits: &crate::limits::Limits,
     poll: &mut dyn FnMut(),
 ) -> Result<(), ProblemError> {
     package::check_path(spec.path)?;
     let program = spec.version_dir.join(spec.path);
-    let metadata = fs::metadata(&program)
-        .map_err(|error| Problem::Invalid.error(format!("{} hook {}: {}", spec.action, program.display(), error)))?;
+    let metadata = fs::metadata(&program).map_err(|error| {
+        Problem::Invalid.error(format!(
+            "{} hook {}: {}",
+            spec.action,
+            program.display(),
+            error
+        ))
+    })?;
     if !metadata.is_file() {
         return Err(Problem::Invalid.error(format!(
             "{} hook is not a regular file: {}",
@@ -75,7 +82,7 @@ pub fn run(
 
     // Per the log contract, hook output goes to `<logs>/<id>-hooks.log`, not the
     // service log; `svc logs` keeps showing only the supervised process.
-    let log = match LogSink::open(&paths.logs_dir, &format!("{}-hooks", spec.id)) {
+    let log = match LogSink::open(&paths.logs_dir, &format!("{}-hooks", spec.id), limits) {
         Ok(sink) => Some(Arc::new(Mutex::new(sink))),
         Err(error) => {
             log::svcd(&format!(
@@ -86,8 +93,10 @@ pub fn run(
         }
     };
     let tree = crate::platform::host::process::Tree::new();
-    let (mut child, streams) = crate::stdio::spawn(command, crate::stdio::Plan::hook())
-        .map_err(|error| Problem::Internal.error(format!("spawn {} hook: {}", spec.action, error)))?;
+    let (mut child, streams) =
+        crate::stdio::spawn(command, crate::stdio::Plan::hook()).map_err(|error| {
+            Problem::Internal.error(format!("spawn {} hook: {}", spec.action, error))
+        })?;
     let _ = crate::platform::host::process::adopt(&child);
     if let Some(tree) = &tree {
         tree.assign(&child);
@@ -97,6 +106,7 @@ pub fn run(
             format!("svcd-{}-hook-out", spec.id),
             stdout,
             log.clone(),
+            limits,
         ) {
             log::svcd(&format!(
                 "svcd: plugin {}: {} hook stdout reader: {}",
@@ -106,7 +116,7 @@ pub fn run(
     }
     if let Some(stderr) = streams.stderr {
         if let Err(error) =
-            crate::stdio::log_lines(format!("svcd-{}-hook-err", spec.id), stderr, log)
+            crate::stdio::log_lines(format!("svcd-{}-hook-err", spec.id), stderr, log, limits)
         {
             log::svcd(&format!(
                 "svcd: plugin {}: {} hook stderr reader: {}",
@@ -126,10 +136,14 @@ pub fn run(
                     ));
                     return Ok(());
                 }
-                return Err(Problem::Internal.error(format!("{} hook exited {}", spec.action, status)));
+                return Err(
+                    Problem::Internal.error(format!("{} hook exited {}", spec.action, status))
+                );
             }
             Ok(None) => {}
-            Err(error) => return Err(Problem::Internal.error(format!("{} hook: {}", spec.action, error))),
+            Err(error) => {
+                return Err(Problem::Internal.error(format!("{} hook: {}", spec.action, error)))
+            }
         }
         poll();
         if started.elapsed() >= Duration::from_millis(spec.timeout_ms) {
@@ -188,8 +202,8 @@ fn check_executable(action: &str, program: &Path) -> Result<(), ProblemError> {
             )));
         }
         let mut shebang = [0u8; 2];
-        let mut file =
-            fs::File::open(program).map_err(|error| Problem::Internal.error(format!("{} hook: {}", action, error)))?;
+        let mut file = fs::File::open(program)
+            .map_err(|error| Problem::Internal.error(format!("{} hook: {}", action, error)))?;
         file.read_exact(&mut shebang).map_err(|_| {
             Problem::Invalid.error(format!(
                 "{} hook must start with a shebang: {}",
@@ -234,12 +248,18 @@ fn hook_command(program: &Path) -> Command {
             let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
             let mut command = Command::new(shell);
             command.arg("/C").arg(program);
-            crate::platform::host::process::configure(&mut command, crate::platform::host::process::Kind::Hook);
+            crate::platform::host::process::configure(
+                &mut command,
+                crate::platform::host::process::Kind::Hook,
+            );
             return command;
         }
     }
     let mut command = Command::new(program);
-    crate::platform::host::process::configure(&mut command, crate::platform::host::process::Kind::Hook);
+    crate::platform::host::process::configure(
+        &mut command,
+        crate::platform::host::process::Kind::Hook,
+    );
     command
 }
 
@@ -262,7 +282,7 @@ mod tests {
     }
 
     fn run(spec: &Invocation<'_>, poll: &mut dyn FnMut()) -> Result<(), ProblemError> {
-        super::run(spec, &test_paths(), poll)
+        super::run(spec, &test_paths(), &crate::limits::test_default(), poll)
     }
     use std::fs;
     use std::path::PathBuf;
@@ -395,7 +415,6 @@ mod tests {
         thread::sleep(Duration::from_millis(1500));
         assert!(!marker.exists(), "a killed hook's child wrote {:?}", marker);
     }
-
 
     /// The supervisor loop owns plugin stdio: a hook it waits for must keep
     /// the loop polling instead of stalling every plugin pipe for up to a

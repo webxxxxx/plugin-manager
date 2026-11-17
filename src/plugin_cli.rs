@@ -11,9 +11,9 @@ use serde_json::{json, Value};
 
 use crate::channel;
 use crate::compat;
+use crate::config::Config;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::package;
-use crate::config::Config;
 use crate::plugin;
 use crate::registry::Kind;
 use crate::status::{self, Status};
@@ -592,7 +592,8 @@ fn install(config: &Config, path: &PathBuf, strategy: &str, allow_hooks: bool) -
             return EXIT_SERVICE_ERROR;
         }
     };
-    match request(config, 
+    match request(
+        config,
         "plugin.install",
         json!({
             "path": path.to_string_lossy(),
@@ -642,14 +643,12 @@ fn verify(config: &Config, path: &Path, json: bool, pubkey: Option<&Path>) -> i3
         },
         None => None,
     };
-    let inspection = match package::inspect_bytes_with(
-        &bytes,
-        explicit_key.as_deref(),
-        &config.paths.trust_dir,
-    ) {
-        Ok(inspection) => inspection,
-        Err(error) => return verify_failure(&file, error.detail(), json),
-    };
+    let inspection =
+        match package::inspect_bytes_with(&bytes, explicit_key.as_deref(), &config.paths.trust_dir)
+        {
+            Ok(inspection) => inspection,
+            Err(error) => return verify_failure(&file, error.detail(), json),
+        };
     let host = verify_host(config, &inspection);
     if json {
         return match serde_json::to_string_pretty(&verify_json(&file, &bytes, &inspection, &host)) {
@@ -784,13 +783,7 @@ fn uninstall(config: &Config, id: &str, purge: bool) -> i32 {
     }
 }
 
-fn edit_config(
-    config: &Config,
-    id: &str,
-    print: bool,
-    file: Option<&Path>,
-    reset: bool,
-) -> i32 {
+fn edit_config(config: &Config, id: &str, print: bool, file: Option<&Path>, reset: bool) -> i32 {
     if print {
         let Some(path) = plugin::active_config(&config.paths, id) else {
             eprintln!("plugin: {} has no config", id);
@@ -938,7 +931,15 @@ fn import(
             return EXIT_SERVICE_ERROR;
         }
     };
-    match transfer::import(&config.paths, &data, config_id, no_config, force, true) {
+    match transfer::import(
+        &config.paths,
+        config.settings.allow_insecure_install,
+        &data,
+        config_id,
+        no_config,
+        force,
+        true,
+    ) {
         Ok(outcome) => {
             for warning in &outcome.warnings {
                 eprintln!("plugin: warning: {}", warning);
