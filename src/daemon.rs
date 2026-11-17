@@ -393,6 +393,14 @@ fn shutdown_inner(verbose: bool) -> i32 {
             }
             None => 0,
         },
+        Err(error) if shutdown_reply_lost(&error) => {
+            // The request reached a daemon that then exited. On Windows the
+            // per-connection control thread can lose the race with process exit
+            // and close the pipe before its reply frame is written; the stop
+            // hooks have already run. Reporting "unreachable" here would turn a
+            // successful stop into a failure.
+            0
+        }
         Err(error) => {
             if verbose {
                 eprintln!("svcd: svcd unreachable: {}", error);
@@ -400,6 +408,18 @@ fn shutdown_inner(verbose: bool) -> i32 {
             2
         }
     }
+}
+
+/// Whether an error means the daemon closed the control channel after taking
+/// the shutdown request, instead of never answering it.
+fn shutdown_reply_lost(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+    )
 }
 
 /// The daemon runs `services.d` scripts and plugin payloads as LocalSystem, so
@@ -414,7 +434,10 @@ fn harden_directories() -> std::io::Result<()> {
         // directory created later would inherit `C:\ProgramData`'s Users-write
         // ACE instead of getting the protected DACL below.
         fs::create_dir_all(&dir)?;
-        Acl::shared(true)?.apply_to_path(&dir)?;
+        // Group members may read the config and inspect the tree, but they must
+        // not be able to replace a `services.d` script or plugin payload that
+        // this daemon executes as SYSTEM.
+        Acl::shared_read_only(true)?.apply_to_path(&dir)?;
     }
     Ok(())
 }
@@ -3260,6 +3283,25 @@ while ($null -ne ($line = $reader.ReadLine())) {
         let text = result["content"][0]["text"].as_str().expect("health text");
         let value: Value = serde_json::from_str(text).expect("health json");
         assert_eq!(value["state"], "ready");
+    }
+
+    #[test]
+    fn a_closed_channel_after_shutdown_is_not_reported_as_unreachable() {
+        for kind in [
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            assert!(shutdown_reply_lost(&std::io::Error::from(kind)), "{kind:?}");
+        }
+        // A pipe that was never available is a real "not running" failure.
+        assert!(!shutdown_reply_lost(&std::io::Error::from(
+            std::io::ErrorKind::TimedOut
+        )));
+        assert!(!shutdown_reply_lost(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
     }
 
     #[test]

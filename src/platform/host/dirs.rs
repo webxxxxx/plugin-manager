@@ -96,11 +96,15 @@ pub(crate) fn default_config_dir() -> PathBuf {
 
 #[cfg(target_os = "windows")]
 pub(crate) fn platform_config_dir() -> PathBuf {
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
+    // System mode is machine-wide: the SCM service runs as LocalSystem, whose
+    // `%USERPROFILE%` is a different, ACL-private profile from the admin's.
+    // A per-profile config path would give the service and the elevated CLI
+    // different control-pipe names (the pipe name hashes the config path) and
+    // would make `trust.d` / `auth_passwd` invisible to one of them.
+    let base = std::env::var_os("ProgramData")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Users\Default"));
-    home.join(".svcd")
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    base.join("svcd").join("config")
 }
 
 #[cfg(target_os = "macos")]
@@ -137,6 +141,27 @@ pub(crate) fn platform_data_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
     base.join("svcd")
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_config_is_machine_wide_and_not_in_a_user_profile() {
+        let machine = platform_config_dir();
+        let base = std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        assert!(machine.starts_with(base.join("svcd")), "{machine:?}");
+        assert!(
+            !machine.starts_with(user_config_dir()),
+            "system mode must not share the user-mode config: {machine:?}"
+        );
+        if let Some(home) = home_dir() {
+            assert!(!machine.starts_with(home), "{machine:?}");
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
