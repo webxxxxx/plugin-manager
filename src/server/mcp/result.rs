@@ -7,7 +7,7 @@
 
 use serde_json::{json, Value};
 
-use crate::rpc;
+use crate::wire::message::rpc;
 
 pub(crate) const SERVER_NAME: &str = "svcd";
 

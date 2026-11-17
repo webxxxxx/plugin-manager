@@ -9,6 +9,7 @@ pub mod dispatch;
 #[cfg(all(unix, feature = "http"))]
 pub mod driver;
 pub mod engine;
+pub mod model;
 #[cfg(feature = "http")]
 pub mod fallback;
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -53,7 +54,7 @@ pub fn busy_response(message: &str) -> Vec<u8> {
     let body = serde_json::json!({
         "error": { "code": "busy", "message": message }
     });
-    crate::http::response_with_headers(
+    crate::server::http::model::response_with_headers(
         503,
         "application/json",
         &[("Retry-After".to_string(), "1".to_string())],

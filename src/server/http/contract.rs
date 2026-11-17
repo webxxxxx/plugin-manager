@@ -11,9 +11,9 @@ use std::time::Instant;
 
 use serde_json::Value;
 
-use crate::http;
-use crate::lan::AuthKind;
-use crate::log;
+use crate::server::http::model as http;
+use crate::server::auth::lan::AuthKind;
+use crate::platform::log;
 
 use super::pool::CancelToken;
 
@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn a_body_policy_accepts_only_the_framing_it_declares() {
-        use crate::http::Framing;
+        use crate::server::http::model::Framing;
 
         assert!(BodyPolicy::Empty.accepts(Framing::None));
         assert!(BodyPolicy::Empty.accepts(Framing::Length(0)));
@@ -454,22 +454,22 @@ mod tests {
                 "PUT /x HTTP/1.1\r\nHost: x\r\n{}Content-Length: 4\r\n\r\n",
                 expect
             );
-            crate::http::parse_head(raw.as_bytes()).expect("head").0
+            crate::server::http::model::parse_head(raw.as_bytes()).expect("head").0
         };
-        let framing = crate::http::Framing::Length(4);
+        let framing = crate::server::http::model::Framing::Length(4);
 
         assert!(BodyPolicy::Buffered { limit: 4 }.confirms_body(&head(true), framing));
         assert!(!BodyPolicy::Buffered { limit: 4 }.confirms_body(&head(false), framing));
         assert!(!BodyPolicy::Empty.confirms_body(&head(true), framing));
         assert!(!BodyPolicy::Streamed.confirms_body(&head(true), framing));
         assert!(!BodyPolicy::Buffered { limit: 4 }
-            .confirms_body(&head(true), crate::http::Framing::Length(0)));
+            .confirms_body(&head(true), crate::server::http::model::Framing::Length(0)));
     }
 
     #[test]
     fn a_memory_response_renders_with_the_legacy_http_wire_format() {
         let value = json!({"version": "0.0.0"});
-        let expected = crate::http::response(
+        let expected = crate::server::http::model::response(
             200,
             "application/json",
             &serde_json::to_vec(&value).expect("json"),

@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-use crate::channel::ProgressEvent;
-use crate::ipc;
+use crate::wire::control::channel::ProgressEvent;
+use crate::wire::message::ipc;
 
 struct Connection {
     stream: UnixStream,

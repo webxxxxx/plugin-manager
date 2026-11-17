@@ -17,12 +17,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::config::Config;
-use crate::http;
-use crate::lan::Lan;
-use crate::log;
+use crate::platform::config::Config;
+use crate::server::http::model as http;
+use crate::server::auth::lan::Lan;
+use crate::platform::log;
 use crate::server::http::engine;
-use crate::threads;
+use crate::platform::host::threads;
 
 /// Admission bookkeeping for the Windows thread-per-connection fallback.
 ///
@@ -189,7 +189,7 @@ pub(crate) fn drive_fallback(
     stream: &mut TcpStream,
     handler: Box<dyn crate::server::http::StreamHandler>,
     head_only: bool,
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
 ) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_write_timeout(Some(limits.transfer_timeout));

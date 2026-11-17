@@ -243,6 +243,8 @@ src/
     mod.rs  plan.rs  execute.rs  service_win.rs
 ```
 
+**step 6（#170）已按本树整文件搬迁**：文件进了对应目录但内容没切，`manage`/`supervise` 的 `model/check/ops`、`platform/storage` 的五文件、`api.rs` 的四块仍是后续票。
+
 `orchestrate/` 与 `cluster/` 现在不建：**目录在第一个文件出现时创建**，不建空壳。
 
 `platform/storage` 是内容寻址存储（原 `blob.rs`）：上传会话、分片、过期回收。它和 `log` 的文件轮转同类——都是技术资源，所以归平台，不归领域。领域侧只需要契约能表达「这个大参数是 `$blob` 引用」。
@@ -294,7 +296,7 @@ src/
 | S5 | 失败投影 | 领域 ↔ 对外面 | 3（HTTP / CLI / MCP） | **已完成**（#149/#150 控制通道 `Problem`/`data` 与 HTTP 投影；#151 把 face-local 的安装/导入/配置/trust/blob 错误改成 typed，`package/plugin/trust/transfer/blob/interpreter/hook/bundle` 在抛出处给类别，face 只按类型投影（管理失败一张 `Problem → HTTP` 表，存储/请求体/阻塞池各自带窄类别），不再按 message 猜状态） |
 | S6 | 进程与管道 | 监督/线格式 ↔ 平台 | 2（unix / windows） | **已完成**：**#141 把进程宿主收进 `platform/host/process`**（unix 进程组 / Windows Job，服务与 hook 的组、父死保护都在 `configure` 里）；**#142 起管道也是一个真 seam：`stdio`（`Plan` / `Target`）按 `Ready`/`protocol` 开匿名管道、把读端交给 poll set 或读线程**，宿主差异只在 `stdio/platform/{unix,windows}.rs`（`O_CLOEXEC`/`O_NONBLOCK` 与 `CreatePipe`/句柄继承），`slot.rs` / `hook.rs` 的 stdio 段无平台 cfg；**#143 把控制通道收进 `ControlChannel` seam**：`channel/platform/{unix,windows}.rs`，`channel.rs` 无平台 cfg，`daemon.rs` 只剩一条 `bind_server`；**#144 删掉 `svcd.token`，控制通道按端点 ACL 分两档**：Unix `svcd.sock` 0660 / `svcd-admin.sock` 0600，Windows 两条管道各自显式 protected DACL（当前用户或 `svcd` 组），`install-service` 建组，客户端按方法选端点、未知方法 fail closed 到 admin |
 | S7 | 配置来源 | 所有模块 ↔ 配置 | 1 生产 + 测试 | **设计已定**（[ADR-0019](adr/0019-config-is-derived-once-at-the-composition-root.md)：运行配置 `Config{settings, settings_path, paths, limits}` 在组合根派生一次，传值不传 trait；`Paths::{resolve, under}` 两个构造入口；env 只在 bootstrap 读；`log` 保持进程级 sink、`S8` 单开）。**S7a 已完成（#157）**：`Config`/`Paths` 在组合根派生一次，四批把 95 处目录调用迁到构造参数，contract 删掉全部目录自由函数与 5 个测试后门（模块级测试不再起 daemon）；`SVCD_*` 只在 `Config::bootstrap` 与唯一的容忍入口 `config::ambient_paths`（stop / install / SCM readiness）读；**S7b 已完成（#158）**：`settings` 与 `limits` 的两个进程级缓存（`settings::{SETTINGS,CONFIG_PATH}`、`limits::LIMITS`）和 `current()` 入口删除，`settings::load` 一次解析文档与路径、`limits::derive` 保持纯投影，所有读取点改从 `Config`（或收窄的 `&Limits` / `&Settings`）来；daemon 全程只解析一次：`ensure_conf` 生成或选中的文件供 service unit 与下次启动，本次运行沿用 bootstrap 得到的文档 |
-| S8 | 时钟 | 监督/编排 ↔ 时间 | 1 生产 + 测试（`Clock::boot()`；测试直接构造 `Now`） | **已完成（#160）**（[ADR-0020](adr/0020-time-is-a-parameter-not-a-trait.md)）：时刻成对 `Now{mono_ms, epoch_secs}`（`src/clock.rs`），`Clock::boot()` 在组合根构造一次、以参数进 `event_loop`；`event_loop` 拆成 `drain` / `tick(now)` / `next_wait(now)`；`Status::live`、`persist_states`、`adopt_runtime` 改吃同一对，删掉 `now_epoch_secs` / `epoch_of` / `ms_of` 的实时重读；`rescan_interval_ms` / `boot_scan_wait_ms` 进 `Settings`（env 覆盖只在 bootstrap）；循环定时器改为模块级单测，`tests/daemon.rs` 的 11 秒睡眠删除 |
+| S8 | 时钟 | 监督/编排 ↔ 时间 | 1 生产 + 测试（`Clock::boot()`；测试直接构造 `Now`） | **已完成（#160）**（[ADR-0020](adr/0020-time-is-a-parameter-not-a-trait.md)）：时刻成对 `Now{mono_ms, epoch_secs}`（`src/platform/clock.rs`），`Clock::boot()` 在组合根构造一次、以参数进 `event_loop`；`event_loop` 拆成 `drain` / `tick(now)` / `next_wait(now)`；`Status::live`、`persist_states`、`adopt_runtime` 改吃同一对，删掉 `now_epoch_secs` / `epoch_of` / `ms_of` 的实时重读；`rescan_interval_ms` / `boot_scan_wait_ms` 进 `Settings`（env 覆盖只在 bootstrap）；循环定时器改为模块级单测，`tests/daemon.rs` 的 11 秒睡眠删除 |
 | S9 | 准入 | 服务器 ↔ 认证 | 4（token / bearer / cookie / 本机免认证） | 未开，四分支挤在 `lan` |
 
 开 seam 的顺序：**S1（含 S5 失败类别）→ S4 → S3 → S6 → S7/S8**；**S1 / S3 / S4 / S5 / S6 / S7 / S8 已完成，下一步是 §12 step 6（目录纯搬家）**。S9 随时可做，S2 等集群真正开始再开。
@@ -348,6 +350,8 @@ flowchart TD
 
 ## 11. 今天的文件怎么进这棵树
 
+> **step 6（#170）已按此表整文件搬迁**；「今天」列保留的是搬迁前的路径，现在它们都已在 §5 的目录里，剩下的「拆点」是后续票的线索。
+
 | 今天 | 将来 | 拆点 |
 |---|---|---|
 | `package.rs` `bundle.rs` `trust.rs` `interpreter.rs` | `manage/` | 按 model / check / ops 三段拆 |
@@ -374,9 +378,9 @@ flowchart TD
 | 3 | 抽 `server/http` + `server/mcp` + 请求交接（S4） | `api.rs` 降到 1500 行以下 | 完成（#112–#136） |
 | 4 | 线格式与进程（S3 / S6） | Windows 支持变成「加一个 adapter」 | 完成（#139–#144） |
 | 5 | 配置与时钟（S7 / S8） | 模块级测试不再起 daemon | **S7 完成（#157/#158）**：`Config`/`Paths` 注入 + contract，`Settings`/`Limits` 收口、无进程级缓存；**S8 完成（#160）**：`Now`/`Clock` + 循环拆壳，时间只从参数来，两个 cadence 进 `Settings` |
-| 6 | 目录按本文件重排（纯搬家） | 编译与测试全绿 | 未做 |
+| 6 | 目录按本文件重排（纯搬家） | 编译与测试全绿 | **完成（#170）**：三批把 40+ 个顶层文件整搬进 `platform/` `wire/` `manage/` `supervise/` `selfinstall/` `server/` `face/` `cli/`；文件内容不切，`model/check/ops` 等拆分仍是后续票 |
 
-当前：0 / 1 / 3 / 4 完成；2（S1+S5）已完成；5 完成（S7 / S8 均已交付）；6 未做。
+当前：0 / 1 / 2 / 3 / 4 / 5 / 6 全部完成；`orchestrate/` 与 `cluster/` 等第一个文件出现时再建。
 
 ```mermaid
 flowchart LR
@@ -431,7 +435,8 @@ flowchart LR
 
 下一步（按风险排序）：
 
-1. **S8 时钟**：设计见 [ADR-0020](adr/0020-time-is-a-parameter-not-a-trait.md)，S8a / S8b 已交付（#160）。
-2. **目录按本文件重排**：§12 的 step 6，纯搬家，等时钟收口后做。
+1. **拆分**：step 6 只搬不拆，`manage`/`supervise` 的 `model/check/ops`、`platform/storage` 五拆、`api.rs` 四拆各开票。
+2. **`registry` 进内核**：`supervise/registry.rs` 的类型目标是 `kernel/registry.rs`（§11）。
+3. **`SVCD_*` 覆盖**：ADR-0019 留下的独立票。
 
 已完成：**S5 失败投影**（#149/#150 控制通道 `Problem`/`data` 与 HTTP 投影；#151 face-local typed errors——S5 的 HTTP 字符串匹配归零，全仓没有按 message 选状态的代码）。

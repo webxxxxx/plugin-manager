@@ -6,17 +6,17 @@
 //! A browser loading one page therefore costs one connection, not one thread
 //! per asset, and a one-shot asset never consumes `max_streams`.
 
-use crate::config::Config;
+use crate::platform::config::Config;
 use crate::face::plugin_streams::{self, StreamContext};
-use crate::http;
-use crate::lan::Lan;
-use crate::package;
-use crate::plugin;
+use crate::server::http::model as http;
+use crate::server::auth::lan::Lan;
+use crate::manage::package;
+use crate::manage::plugin;
 use crate::server::http::{
     dispatch_inline, BodyPolicy, CloseReason, Completion, Exchange, Face, FileSend, OutBuffer,
     Request, Route, StreamAction, StreamClass, StreamEvent, StreamHandler, StreamStep,
 };
-use crate::webui;
+use crate::face::webui as webui;
 use std::fs;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -85,7 +85,7 @@ impl PluginUiFace {
     pub fn with_streams(
         lan: Arc<Mutex<Lan>>,
         config: Arc<Config>,
-        raw_hub: Option<Arc<crate::rawhub::RawHub>>,
+        raw_hub: Option<Arc<crate::wire::contract::rawhub::RawHub>>,
     ) -> PluginUiFace {
         PluginUiFace {
             lan,
@@ -123,7 +123,7 @@ impl PluginUiFace {
         peer: IpAddr,
         lan: &Arc<Mutex<Lan>>,
         config: Arc<Config>,
-        raw_hub: Option<Arc<crate::rawhub::RawHub>>,
+        raw_hub: Option<Arc<crate::wire::contract::rawhub::RawHub>>,
     ) -> Result<Exchange, Vec<u8>> {
         let Some(route) = PluginUiFace::route_for(&head.method, &head.path) else {
             return Err(http::json_error(404, "not_found", "not a plugin UI path"));
@@ -186,7 +186,7 @@ impl PluginUiFace {
                 &format!("plugin {} has no web UI", ui.id),
             ));
         };
-        if !crate::lan::plugin_token_valid(&self.lan, ui.token, ui.id) {
+        if !crate::server::auth::lan::plugin_token_valid(&self.lan, ui.token, ui.id) {
             return Box::new(PluginUiStream::error(
                 401,
                 "unauthorized",

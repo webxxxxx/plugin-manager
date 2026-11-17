@@ -18,9 +18,9 @@ use std::net::TcpListener;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use crate::config::Config;
-use crate::lan::Lan;
-use crate::rawhub::RawHub;
+use crate::platform::config::Config;
+use crate::server::auth::lan::Lan;
+use crate::wire::contract::rawhub::RawHub;
 use crate::server::http::hooks::{FallbackHandler, PreBodyRoutes};
 use crate::server::http::Face;
 
@@ -100,7 +100,7 @@ pub(crate) struct StartInput {
     /// The bound control channel. The poll loop merges its listener into the
     /// wait set; the thread driver ignores it because the channel already runs
     /// its own accept thread on that host.
-    pub control: crate::channel::ControlBinding,
+    pub control: crate::wire::control::channel::ControlBinding,
     /// The per-connection driver, used when no poll loop runs.
     pub threads: ThreadDriver,
 }

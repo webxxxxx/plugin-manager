@@ -11,8 +11,8 @@ use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::ipc::RawFailure;
-use crate::rawhub::{RawEvent, RawHub, RawSubscription};
+use crate::wire::message::ipc::RawFailure;
+use crate::wire::contract::rawhub::{RawEvent, RawHub, RawSubscription};
 use crate::server::http::wire;
 use crate::server::http::{
     CloseReason, OutBuffer, StreamAction, StreamEvent, StreamHandler, StreamStep,
@@ -66,7 +66,7 @@ pub(crate) struct RawWsStream {
     bytes_read: u64,
     bytes_parsed: u64,
     frames_read: u64,
-    limits: std::sync::Arc<crate::limits::Limits>,
+    limits: std::sync::Arc<crate::platform::limits::Limits>,
 }
 
 impl RawWsStream {
@@ -74,7 +74,7 @@ impl RawWsStream {
         accept: String,
         link: Box<dyn RawLink>,
         hub: Option<Arc<RawHub>>,
-        limits: std::sync::Arc<crate::limits::Limits>,
+        limits: std::sync::Arc<crate::platform::limits::Limits>,
     ) -> RawWsStream {
         let head = format!(
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
@@ -102,7 +102,7 @@ impl RawWsStream {
     }
 
     fn log(&self, reason: &str) {
-        crate::log::svcd(&format!(
+        crate::platform::log::svcd(&format!(
             "svcd: raw ws closed: plugin={} stream={} reason={} read={} parsed={} frames={}",
             self.link.plugin(),
             self.link.stream(),
@@ -406,8 +406,8 @@ mod tests {
         }
     }
 
-    fn test_limits() -> Arc<crate::limits::Limits> {
-        Arc::new(crate::limits::test_default())
+    fn test_limits() -> Arc<crate::platform::limits::Limits> {
+        Arc::new(crate::platform::limits::test_default())
     }
 
     fn harness() -> (RawWsStream, Receiver<Vec<u8>>, SyncSender<RawEvent>) {

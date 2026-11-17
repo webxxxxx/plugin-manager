@@ -13,15 +13,15 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use crate::config::Config;
-use crate::http;
+use crate::platform::config::Config;
+use crate::server::http::model as http;
 use crate::kernel::failure::ProblemError;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
-use crate::lan::{self, AuthKind, Lan};
-use crate::log;
-use crate::package;
-use crate::paths::Paths;
-use crate::plugin;
+use crate::server::auth::lan::{self, AuthKind, Lan};
+use crate::platform::log;
+use crate::manage::package;
+use crate::platform::paths::Paths;
+use crate::manage::plugin;
 use crate::server::http::{
     BodyPolicy, Completion, Dispatch, Exchange, Face, Request, Response, Route,
 };
@@ -183,7 +183,7 @@ impl ApiFace {
     }
 
     fn trust_list(&self) -> Response {
-        match crate::trust::keys(&self.config.paths) {
+        match crate::manage::trust::keys(&self.config.paths) {
             Ok(keys) => Response::json(
                 200,
                 &json!({
@@ -202,7 +202,7 @@ impl ApiFace {
         if body.is_empty() {
             return error_response(400, "bad_request", "empty public key");
         }
-        match crate::trust::add(&self.config.paths, &key_id, body) {
+        match crate::manage::trust::add(&self.config.paths, &key_id, body) {
             Ok(path) => Response::json(
                 200,
                 &json!({
@@ -215,7 +215,7 @@ impl ApiFace {
     }
 
     fn trust_remove(&self, key_id: &str) -> Response {
-        match crate::trust::remove(&self.config.paths, key_id) {
+        match crate::manage::trust::remove(&self.config.paths, key_id) {
             Ok(true) => Response::json(200, &json!({ "keyId": key_id, "removed": true })),
             Ok(false) => error_response(
                 404,
@@ -314,7 +314,7 @@ impl ApiFace {
         match (request.method.as_str(), parts.as_slice()) {
             ("GET", ["api", "v1", "compat"]) => Response::json(
                 200,
-                &serde_json::to_value(crate::compat::detect(
+                &serde_json::to_value(crate::platform::compat::detect(
                     &self.config.paths,
                     MAX_SCHEMA,
                     MAX_PROTOCOL,
@@ -436,7 +436,7 @@ fn is_transfer_path(method: &str, path: &str) -> bool {
     }
 }
 
-fn body_policy(method: &str, path: &str, limits: &crate::limits::Limits) -> BodyPolicy {
+fn body_policy(method: &str, path: &str, limits: &crate::platform::limits::Limits) -> BodyPolicy {
     if is_login(method, path) {
         return BodyPolicy::Buffered {
             limit: limits.max_json_body,
@@ -565,7 +565,7 @@ fn project_service(status: &Value, paths: &Paths) -> Option<Value> {
         .get("summary")
         .and_then(|summary| summary.get("id"))
         .and_then(Value::as_str)
-        .map(|id| crate::plugin::web_assets(paths, id).is_some())
+        .map(|id| crate::manage::plugin::web_assets(paths, id).is_some())
         .unwrap_or(false);
     let mut summary = status.get("summary").cloned()?;
     if let Some(object) = summary.as_object_mut() {
@@ -663,7 +663,7 @@ mod tests {
             nanos
         ));
         Arc::new(Config::with_paths(
-            crate::settings::Settings::default(),
+            crate::platform::settings::Settings::default(),
             None,
             Paths::under(&root),
         ))
@@ -675,7 +675,7 @@ mod tests {
 
     fn face_with_password() -> ApiFace {
         let bind = "127.0.0.1:0".parse().expect("bind");
-        let hash = crate::auth::hash_password("secret").expect("hash");
+        let hash = crate::platform::auth::hash_password("secret").expect("hash");
         ApiFace::new(
             test_config(),
             Arc::new(Mutex::new(Lan::new(bind, bind, true, Some(hash)))),
@@ -769,7 +769,7 @@ mod tests {
             ("PUT", "/api/v1/file/uploads/abc/parts/2"),
         ] {
             assert!(
-                crate::face::blob_upload::upload_target(&crate::http::Head {
+                crate::face::blob_upload::upload_target(&crate::server::http::model::Head {
                     method: method.to_string(),
                     path: path.to_string(),
                     version: "HTTP/1.1".to_string(),

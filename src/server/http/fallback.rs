@@ -27,7 +27,7 @@ pub fn drive(
     stream: &mut TcpStream,
     mut handler: Box<dyn StreamHandler>,
     initial: &[u8],
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
 ) -> Result<(), Busy> {
     let permit = StreamBudget::global().acquire(handler.stream_class(), limits.max_streams)?;
     let result = drive_loop(stream, handler.as_mut(), initial, limits);
@@ -46,7 +46,7 @@ fn drive_loop(
     stream: &mut TcpStream,
     handler: &mut dyn StreamHandler,
     initial: &[u8],
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
 ) -> Result<(), Busy> {
     let limit = limits.stream_buffer;
     let timeout = limits.transfer_timeout;
@@ -200,7 +200,7 @@ fn send_blocking(stream: &mut TcpStream, send: FileSend) {
     // module compiles on both so the composition root needs no platform
     // branch (#139).
     #[cfg(windows)]
-    let sent = match crate::zerocopy::send_file_range(&mut file, stream, offset, length) {
+    let sent = match crate::platform::host::zerocopy::send_file_range(&mut file, stream, offset, length) {
         Ok(sent) => sent,
         // Keep the old Windows behaviour on error: give up on this range.
         Err(_) => true,
@@ -263,7 +263,7 @@ mod tests {
             &mut server,
             Box::new(BudgetHandler { captured: Some(tx) }),
             &[],
-            &crate::limits::test_default(),
+            &crate::platform::limits::test_default(),
         )
         .expect("drive");
         let (deadline, cancelled) = rx.try_recv().expect("job budget");

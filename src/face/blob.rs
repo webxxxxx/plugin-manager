@@ -12,9 +12,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::blob;
-use crate::http;
-use crate::paths::Paths;
+use crate::platform::storage::blob;
+use crate::server::http::model as http;
+use crate::platform::paths::Paths;
 use crate::server::http::{
     BlockingOutcome, CloseReason, FileSend, OutBuffer, Request, StreamAction, StreamClass,
     StreamEvent, StreamHandler, StreamStep,
@@ -221,7 +221,7 @@ impl DownloadStream {
                 let Some(opened) = opened else {
                     // Unreachable: the job stores the Opened before it returns
                     // Ok. Never write a half response; log and close instead.
-                    crate::log::svcd(
+                    crate::platform::log::svcd(
                         "svcd: download open job returned no result; closing the connection",
                     );
                     self.phase = Phase::Done;
@@ -243,7 +243,7 @@ impl DownloadStream {
                 // renders a refusal without parsing it.
                 self.install(Opened::response(http::json_error(
                     status,
-                    crate::http::code_for(status),
+                    crate::server::http::model::code_for(status),
                     &message,
                 )));
             }
@@ -759,7 +759,7 @@ fn etag_matches(header: &str, etag: &str, strong: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lan::AuthKind;
+    use crate::server::auth::lan::AuthKind;
     use std::io::{Read, Seek, SeekFrom};
 
     fn request(method: &str, path: &str, headers: &[(&str, &str)]) -> Request {
@@ -856,7 +856,7 @@ mod tests {
     }
 
     fn blob_of(bytes: &[u8]) -> String {
-        crate::blob::put(test_paths(), bytes)
+        crate::platform::storage::blob::put(test_paths(), bytes)
             .expect("write test blob")
             .id
     }
@@ -864,19 +864,19 @@ mod tests {
     fn file_of(parts: &[&[u8]], name: Option<&str>, mime: Option<&str>) -> String {
         let paths = test_paths();
         let upload =
-            crate::blob::create_upload(paths, crate::blob::UploadKind::File).expect("upload");
+            crate::platform::storage::blob::create_upload(paths, crate::platform::storage::blob::UploadKind::File).expect("upload");
         for (index, content) in parts.iter().enumerate() {
-            let mut writer = crate::blob::PartWriter::begin(
+            let mut writer = crate::platform::storage::blob::PartWriter::begin(
                 paths,
                 &upload,
                 index as u32 + 1,
-                crate::blob::UploadKind::File,
+                crate::platform::storage::blob::UploadKind::File,
             )
             .expect("part");
             writer.write(content).expect("write part");
             writer.finish().expect("finish part");
         }
-        crate::blob::complete_file(
+        crate::platform::storage::blob::complete_file(
             paths,
             &upload,
             None,

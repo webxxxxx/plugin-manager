@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::channel::ProgressEvent;
-use crate::rpc;
+use crate::wire::control::channel::ProgressEvent;
+use crate::wire::message::rpc;
 use crate::server::http::{
     CloseReason, OutBuffer, StreamAction, StreamClass, StreamEvent, StreamHandler, StreamStep,
 };
