@@ -33,7 +33,7 @@ use crate::platform::paths::Paths;
 use crate::manage::plugin::{self, Strategy};
 #[cfg(unix)]
 use crate::wire::contract::reactor::Reactor;
-use crate::supervise::registry::{Hook, Kind, Registry, Service, State, RESERVED_ID};
+use crate::kernel::registry::{Hook, Kind, Registry, Service, State, RESERVED_ID};
 use crate::wire::message::rpc;
 use crate::supervise::runtime::{self, Record};
 use crate::platform::settings;
@@ -2770,7 +2770,7 @@ fn missing_dependencies(registry: &Registry, id: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::kernel::contract::{Capability as KernelCapability, CapabilityName, Effect};
-    use crate::supervise::registry::{Exec, Kind, Ready, Service};
+    use crate::kernel::registry::{Exec, Kind, Ready, Service};
 
     fn capability(name: &str) -> KernelCapability {
         KernelCapability {
@@ -2786,11 +2786,11 @@ mod tests {
         let caps = caps.iter().map(|cap| capability(cap)).collect();
         Service {
             kind: Kind::Plugin,
-            contract: crate::supervise::registry::contract_for(
+            contract: crate::kernel::registry::contract_for(
                 id,
                 "1.0.0",
                 caps,
-                crate::supervise::registry::Carrier::Slot,
+                crate::kernel::registry::Carrier::Slot,
                 &crate::platform::limits::test_default(),
             ),
             ..service(id, &[])
@@ -2798,11 +2798,11 @@ mod tests {
     }
 
     fn service(id: &str, deps: &[&str]) -> Service {
-        let contract = crate::supervise::registry::contract_for(
+        let contract = crate::kernel::registry::contract_for(
             id,
             "1.0.0",
             Vec::new(),
-            crate::supervise::registry::Carrier::Slot,
+            crate::kernel::registry::Carrier::Slot,
             &crate::platform::limits::test_default(),
         );
         Service {
@@ -2823,7 +2823,7 @@ mod tests {
             }),
             lifecycle: None,
             enabled: true,
-            restart: crate::supervise::registry::Restart::OnFailure,
+            restart: crate::kernel::registry::Restart::OnFailure,
             remain_after_exit: false,
             compat: None,
             state: State::Stopped,
@@ -3031,11 +3031,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
 
     fn tool_service(id: &str, kind: Kind, caps: &[&str], root: &Path) -> Service {
         let caps = caps.iter().map(|cap| capability(cap)).collect();
-        let contract = crate::supervise::registry::contract_for(
+        let contract = crate::kernel::registry::contract_for(
             id,
             "1.0.0",
             caps,
-            crate::supervise::registry::Carrier::Slot,
+            crate::kernel::registry::Carrier::Slot,
             &crate::platform::limits::test_default(),
         );
         Service {
@@ -3050,7 +3050,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             exec: Some(tool_agent(root)),
             lifecycle: None,
             enabled: true,
-            restart: crate::supervise::registry::Restart::OnFailure,
+            restart: crate::kernel::registry::Restart::OnFailure,
             remain_after_exit: false,
             compat: None,
             state: State::Stopped,
@@ -3488,11 +3488,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
                 let caps = (0..20)
                     .map(|cap| capability(&format!("cap{cap}")))
                     .collect();
-                service.contract = crate::supervise::registry::contract_for(
+                service.contract = crate::kernel::registry::contract_for(
                     &service.id,
                     "1.0.0",
                     caps,
-                    crate::supervise::registry::Carrier::Slot,
+                    crate::kernel::registry::Carrier::Slot,
                     &crate::platform::limits::test_default(),
                 );
                 service
@@ -3676,11 +3676,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
         desired.insert("bad".to_string(), two_owners("bad"));
         let mut conflicting_live = two_owners("live");
         conflicting_live.version = "9.9.9".into();
-        conflicting_live.contract = crate::supervise::registry::contract_for(
+        conflicting_live.contract = crate::kernel::registry::contract_for(
             "live",
             "9.9.9",
             conflicting_live.contract.surface().to_vec(),
-            crate::supervise::registry::Carrier::Launcher,
+            crate::kernel::registry::Carrier::Launcher,
             &crate::platform::limits::test_default(),
         );
         desired.insert("live".to_string(), conflicting_live);
@@ -3705,7 +3705,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             live.version, "1.0.0",
             "a rejected update must not reach the registry"
         );
-        assert_eq!(live.carrier(), Ok(crate::supervise::registry::Carrier::Slot));
+        assert_eq!(live.carrier(), Ok(crate::kernel::registry::Carrier::Slot));
         assert!(
             daemon.slots.contains_key("live"),
             "the live slot must survive a rejected update"
@@ -3729,11 +3729,11 @@ while ($null -ne ($line = $reader.ReadLine())) {
         );
         assert_eq!(
             daemon.registry.get("svc").map(Service::carrier),
-            Some(Ok(crate::supervise::registry::Carrier::Launcher))
+            Some(Ok(crate::kernel::registry::Carrier::Launcher))
         );
         assert_eq!(
             daemon.registry.get("core").map(Service::carrier),
-            Some(Ok(crate::supervise::registry::Carrier::Slot))
+            Some(Ok(crate::kernel::registry::Carrier::Slot))
         );
     }
 

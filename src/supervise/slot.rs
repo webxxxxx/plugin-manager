@@ -13,7 +13,7 @@ use crate::kernel::contract::{Contract, Control, Invocation, Reply, ReplySink, S
 use crate::kernel::failure::{Class, Failure, Rejection, Retry};
 use crate::platform::log::{self, LogSink};
 use crate::platform::paths::Paths;
-use crate::supervise::registry::{Exec, Hook, Interpreter, Lifecycle, Ready, Restart, State};
+use crate::kernel::registry::{Exec, Hook, Interpreter, Lifecycle, Ready, Restart, State};
 use crate::wire::message::rpc;
 use crate::wire::contract::stdio::{self, Plan, Streams, Target};
 use crate::supervise::supervisor::{self, Action, Event, Machine};

@@ -15,7 +15,7 @@ use crate::platform::config::Config;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::manage::package;
 use crate::manage::plugin;
-use crate::supervise::registry::Kind;
+use crate::kernel::registry::Kind;
 use crate::cli::status::{self, Status};
 use crate::manage::transfer;
 

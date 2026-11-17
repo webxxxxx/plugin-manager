@@ -5,7 +5,6 @@
 pub mod builtin_adapter;
 pub mod definition;
 pub mod hook;
-pub mod registry;
 pub mod runtime;
 pub mod script;
 pub mod slot;
