@@ -8,12 +8,15 @@
 //   4. 映射卫生：映射里的模块必须在 src/ 存在；src/ 的顶层模块必须已映射。
 //   5. seam 不变量：子进程 stdio 的句柄与管道只在 src/stdio 里出现；正在被
 //      seam 接管的调用方（slot/hook/daemon/rawhub）不再自己 Stdio::piped。
+//   6. 失败类别：`#[cfg(test)]` 之外不按 `detail` / `message` 的文案分支或比较
+//      （S5 的投影不变量，见 docs/architecture.md §8）。
 //
 // 用法：
 //   node tools/dep-lint.mjs              人读输出；有违规退出码 1
 //   node tools/dep-lint.mjs --json       机器可读（CI 用）
 //   node tools/dep-lint.mjs --no-fail    已知基线模式：始终退出 0
 //   node tools/dep-lint.mjs --map <p>    指定映射文件
+//   node tools/dep-lint.mjs --selftest   只跑规则自身的用例（不扫仓库）
 //
 // 不做：model/check/ops 三层检查（代码还没分层，会全是假阳性），也不改任何代码。
 
@@ -25,11 +28,12 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "..");
 
 function parseArgs(argv) {
-  const args = { json: false, fail: true, map: join(HERE, "arch-map.json"), src: join(REPO, "src") };
+  const args = { json: false, fail: true, selftest: false, map: join(HERE, "arch-map.json"), src: join(REPO, "src") };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--json") args.json = true;
     else if (arg === "--no-fail") args.fail = false;
+    else if (arg === "--selftest") args.selftest = true;
     else if (arg === "--map") args.map = resolve(argv[(index += 1)]);
     else if (arg === "--src") args.src = resolve(argv[(index += 1)]);
     else {
@@ -331,7 +335,182 @@ function seamViolations(sources) {
   return out;
 }
 
-function report({ map, modules, sources, edges, unknown, stale, layers, cycles, suffixes, seam }) {
+/// V6：失败类别的不变量（#149–#151）。生产代码按 `Problem` 类别决定行为；`detail`
+/// 与 `message` 是给人看的文案，拿它们做分支或比较等于把状态判断藏回字符串里。
+/// 测试里断言文案是允许的，所以规则只看 `#[cfg(test)]` 之外。
+const CATEGORY_RULES = [
+  {
+    name: "按 detail 分支",
+    pattern: /\.detail(?:\(\))?\s*\.\s*(?:contains|starts_with|ends_with|find|split|rsplit)\b/,
+    hint: "按 Problem 类别投影（face/support.rs 一张表）；detail 只用于展示。",
+  },
+  {
+    name: "按 detail 比较",
+    pattern: /\.detail(?:\(\))?\s*(?:==|!=)/,
+    hint: "按 Problem 类别比较，不要比较 detail 文案。",
+  },
+  {
+    name: "按 message 分支",
+    pattern: /\bmessage\s*\.\s*(?:contains|starts_with|ends_with|find)\b/,
+    hint: "message 是给人看的文案；状态读 error.data.kind / Problem。",
+  },
+  {
+    name: "按 message 比较",
+    pattern: /\bmessage\s*(?:==|!=)/,
+    hint: "message 是给人看的文案；状态读 error.data.kind / Problem。",
+  },
+];
+
+/// `#[cfg(test)]` 覆盖的字节区间。属性修饰 mod 时吃到配对的 `}`，修饰单个条目时
+/// 吃到 `;`。调用方传的是遮罩过字符串与注释的文本，所以括号计数永远安全。
+function testRegions(text) {
+  const regions = [];
+  let index = 0;
+  for (;;) {
+    const at = text.indexOf("#[cfg(test)]", index);
+    if (at === -1) break;
+    index = at + "#[cfg(test)]".length;
+    const opener = itemOpener(text, index);
+    if (opener) regions.push([at, opener.end]);
+  }
+  return regions;
+}
+
+/// 从属性后面找条目本体：`{` 开 block（配对的 `}` 是终点），`;` 结 statement。
+/// `(`/`[` 里的行列不算本体，`fn foo() {` 才不会在参数表里停住。
+function itemOpener(text, from) {
+  let brackets = 0;
+  for (let index = from; index < text.length; index += 1) {
+    const char = text[index];
+    if (char === "(" || char === "[") brackets += 1;
+    else if (char === ")" || char === "]") brackets = Math.max(0, brackets - 1);
+    else if (brackets === 0 && char === "{") {
+      const end = matchingBrace(text, index);
+      return end === -1 ? null : { end };
+    } else if (brackets === 0 && char === ";") return { end: index };
+  }
+  return null;
+}
+
+function matchingBrace(text, open) {
+  let depth = 0;
+  for (let index = open; index < text.length; index += 1) {
+    if (text[index] === "{") depth += 1;
+    else if (text[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+/// 1-based 行号：二分找最后一个 start <= offset 的行首。
+function lineNumberAt(lineStarts, offset) {
+  let low = 0;
+  let high = lineStarts.length - 1;
+  while (low < high) {
+    const mid = (low + high + 1) >> 1;
+    if (lineStarts[mid] <= offset) low = mid;
+    else high = mid - 1;
+  }
+  return low + 1;
+}
+
+function categoryViolationsIn(file, text) {
+  const masked = stripComments(text);
+  const lineStarts = [0];
+  for (let index = 0; index < masked.length; index += 1) {
+    if (masked[index] === "\n") lineStarts.push(index + 1);
+  }
+  const covered = new Set();
+  for (const [start, end] of testRegions(masked)) {
+    const first = lineNumberAt(lineStarts, start);
+    const last = lineNumberAt(lineStarts, end);
+    for (let line = first; line <= last; line += 1) covered.add(line);
+  }
+  const lines = masked.split("\n");
+  const out = [];
+  for (let line = 0; line < lines.length; line += 1) {
+    if (covered.has(line + 1)) continue;
+    for (const rule of CATEGORY_RULES) {
+      if (rule.pattern.test(lines[line])) {
+        out.push({ rule: rule.name, file, line: line + 1, hint: rule.hint });
+      }
+    }
+  }
+  return out;
+}
+
+function categoryViolations(sources) {
+  return sources.flatMap((source) =>
+    categoryViolationsIn(source.file, readFileSync(source.full, "utf8")),
+  );
+}
+
+const SELFTEST_CASES = [
+  {
+    name: "生产里的 detail 分支",
+    source: 'fn build(error: &ProblemError) -> bool {\n    error.detail().contains("x")\n}\n',
+    expected: ["按 detail 分支"],
+  },
+  {
+    name: "生产里的 detail 比较（blob 的字段）",
+    source: 'fn build(error: &blob::Error) -> bool {\n    error.detail == "x"\n}\n',
+    expected: ["按 detail 比较"],
+  },
+  {
+    name: "生产里的 message 分支",
+    source: 'fn build(message: &str) -> bool {\n    message.contains("svcd")\n}\n',
+    expected: ["按 message 分支"],
+  },
+  {
+    name: "生产里的 message 比较",
+    source: 'fn build(message: &str) -> bool {\n    message != "ok"\n}\n',
+    expected: ["按 message 比较"],
+  },
+  {
+    name: "mod tests 里的断言不算",
+    source:
+      'fn build() {}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        assert!(error.detail().contains("x"));\n    }\n}\n',
+    expected: [],
+  },
+  {
+    name: "单个 #[cfg(test)] 条目不算",
+    source:
+      '#[cfg(test)]\nfn helper(error: &ProblemError) -> bool {\n    error.detail().contains("x")\n}\n',
+    expected: [],
+  },
+  {
+    name: "字符串与注释不算",
+    source:
+      'fn build() {\n    // error.detail().contains("x")\n    let note = "error.detail().contains";\n    let _ = note;\n}\n',
+    expected: [],
+  },
+  {
+    name: "测试之后的生产代码仍然算",
+    source:
+      '#[cfg(test)]\nmod tests {\n    fn t() { assert!(error.detail().contains("x")); }\n}\n\nfn build(message: &str) -> bool {\n    message.contains("x")\n}\n',
+    expected: ["按 message 分支"],
+  },
+];
+
+function selftest() {
+  let failures = 0;
+  for (const item of SELFTEST_CASES) {
+    const found = [...new Set(categoryViolationsIn("<selftest>", item.source).map((entry) => entry.rule))].sort();
+    const expected = [...new Set(item.expected)].sort();
+    const ok = JSON.stringify(found) === JSON.stringify(expected);
+    console.log(`selftest: ${ok ? "ok" : "FAILED"}  ${item.name}`);
+    if (!ok) {
+      failures += 1;
+      console.log(`  expected ${JSON.stringify(expected)}, got ${JSON.stringify(found)}`);
+    }
+  }
+  console.log(`selftest: ${SELFTEST_CASES.length - failures}/${SELFTEST_CASES.length} 通过`);
+  return failures;
+}
+
+function report({ map, modules, sources, edges, unknown, stale, layers, cycles, suffixes, seam, category }) {
   const lines = [];
   lines.push("dep-lint · 观测基线（只读，不改代码）");
   lines.push(`模块 ${sources.length} 个源文件，引用边 ${edges.length} 条，映射 ${modules.size} 项`);
@@ -397,21 +576,30 @@ function report({ map, modules, sources, edges, unknown, stale, layers, cycles, 
   for (const item of seam) lines.push(`  ${item.file}:${item.line}  ${item.rule}  —— ${item.hint}`);
   if (seam.length === 0) lines.push("  （无）");
 
+  lines.push("");
+  lines.push(`[V6] 失败类别：detail / message 不参与分支（${category.length}）`);
+  for (const item of category) lines.push(`  ${item.file}:${item.line}  ${item.rule}  —— ${item.hint}`);
+  if (category.length === 0) lines.push("  （无）");
+
   const total =
     layers.length +
     cycles.length +
     suffixes.errors.length +
     stale.length +
     unknown.length +
-    seam.length;
+    seam.length +
+    category.length;
   lines.push("");
   lines.push(
-    `合计 ${total} 条违规（层方向 ${layers.length} · 循环分量 ${cycles.length} · 后缀 ${suffixes.errors.length} · 映射 ${stale.length + unknown.length} · seam ${seam.length}）`,
+    `合计 ${total} 条违规（层方向 ${layers.length} · 循环分量 ${cycles.length} · 后缀 ${suffixes.errors.length} · 映射 ${stale.length + unknown.length} · seam ${seam.length} · 失败类别 ${category.length}）`,
   );
   return { text: lines.join("\n"), total };
 }
 
 const args = parseArgs(process.argv.slice(2));
+if (args.selftest) {
+  process.exit(selftest() === 0 ? 0 : 1);
+}
 const { map, rank, modules } = loadMap(args.map);
 const { sources, edges, unknown } = scanSources(args.src, modules);
 const mapped = new Set(sources.map((source) => source.module));
@@ -421,10 +609,11 @@ const layers = layerViolations(edges, modules, rank);
 const cycles = cycleViolations(nodes, edges);
 const suffixes = suffixViolations(sources, map);
 const seam = seamViolations(sources);
-const { text, total } = report({ map, modules, sources, edges, unknown, stale, layers, cycles, suffixes, seam });
+const category = categoryViolations(sources);
+const { text, total } = report({ map, modules, sources, edges, unknown, stale, layers, cycles, suffixes, seam, category });
 
 if (args.json) {
-  console.log(JSON.stringify({ total, layers, cycles, suffixes, seam, unknown, stale, files: sources.length, edges: edges.length }, null, 2));
+  console.log(JSON.stringify({ total, layers, cycles, suffixes, seam, category, unknown, stale, files: sources.length, edges: edges.length }, null, 2));
 } else {
   console.log(text);
 }
