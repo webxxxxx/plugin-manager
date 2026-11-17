@@ -134,14 +134,16 @@ node tools/perf/run.mjs --scale
 集成测试的 sandbox 根目录在 Windows 使用 Cargo 提供的 `CARGO_TARGET_TMPDIR`（在 `target/tmp`
 下），不再用系统 `%TEMP%`：受限的 TEMP ACL 曾让 `create sandbox` 直接 `PermissionDenied`，target
 目录始终可写。Unix 保持系统临时目录，因为 Unix domain socket 对整条路径有 ~108 字节上限，target 下
-的深路径会直接 `cannot bind control channel`。单测写入临时目录的地方统一走 `src/test_support.rs::temp_dir()`（Windows 下是 `target/<profile>/tmp`，Unix 仍是系统 temp）。`tests/cli.rs` 对并发的 `ETXTBSY`（复制 multicall 二进制后立即 exec）做有限重试；不要把它
-当成测试失败。运行时记录的单测通过 `runtime::tests::with_root` 注入 root，**不要**再在测试里设
+的深路径会直接 `cannot bind control channel`。单测写入临时目录的地方统一走 `src/test_support.rs::temp_dir()`（Windows 下是 `target/<profile>/tmp`，Unix 仍是系统 temp）。`tests/plugin.rs` 的 sandbox 在 Unix 用符号链接指向多调用二进制（分派只看 argv[0] 的文件名），
+没有「复制后立即 exec」的 `ETXTBSY` 窗口；Windows 保留副本（建符号链接需要权限）。`tests/cli.rs` 对并发的
+`ETXTBSY`（复制 multicall 二进制后立即 exec）做有限重试；不要把它当成测试失败。运行时记录的单测通过 `runtime::tests::with_root` 注入 root，**不要**再在测试里设
 `SVCD_RUN_DIR`（进程级 env + 全局缓存会让并行测试互相踩）。CI 仍用 `--test-threads=1`，本地并行
 跑全量时若看到这些类别失败，先按本节判断是不是环境噪声。
 
 ### 异步等待与失败诊断
 
 - `tests/http.rs` 的 `wait_until` 在超时时会打印 daemon log 和调用方提供的诊断（例如 stalled socket 上已到达的响应）；新增等待 helper 必须走它，不要写裸 `sleep` + `panic!`。
+- `tests/plugin.rs` 的 sandbox 停止等待（`stop_daemon`）遵循同一诊断契约：超时带上 shutdown 请求的结果与 daemon log 尾部；但它**返回错误**而不是 panic，因为它可能跑在 `Drop` 的 unwind 里，二次 panic 会 abort 并掩盖原始失败。`DAEMON_STOP_TIMEOUT` 默认 10 s，超时后 kill + reap，不再用无上限的 `child.wait()`。
 - 不要在转瞬即逝的中间状态上做轮询断言（例如 staging 刚创建就因 `already installed` 被删除）；先让触发路径确定（加 `force=true`、补完 body），或直接断言最终的结束状态。
 
 线程预算回归（Linux 补充）：`cargo test --test http unix_idle_thread_count_has_no_per_request_or_per_stream_threads -- --exact`。它读 `/proc/<pid>/status` 的 `Threads:`，断言 #126 后的默认空载基线为 4 条 daemon 线程（supervisor——同时 poll 插件 stdio、server loop、2 条阻塞线程）；16 个 keep-alive 连接与 8 个 SSE 流不得各增加一条线程。改变拓扑的切片要同步更新 `IDLE_DAEMON_THREADS`。同一测试还读 `/proc/<pid>/task/*/comm`，断言 `svcd-channel-reactor` / `svcd-channel-client` 不再存在，`svcd-http-worker` / `svcd-temp-cleanup` / `svcd-import-http` / `svcd-install-http` / `svcd-reactor` 不再存在，`svcd-server-loop` 恰好一条；`control_shutdown_reply_is_flushed_before_exit` 在原始控制 socket 上断言 shutdown 回包在进程退出前到达；`server::control` 单测覆盖两个控制连接的回包路由、满 256 队列的 -32000、queued reply 的 shutdown 排空、缺失控制 socket 时的 SSE -32603、无 HTTP 的 control-only loop；`a_busy_http_port_keeps_the_control_channel_alive` 证明 HTTP bind 失败只停 HTTP、CLI 仍可用。

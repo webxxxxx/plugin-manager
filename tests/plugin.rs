@@ -80,6 +80,11 @@ impl Sandbox {
             // written races its own close on slow filesystems (/mnt/d, DrvFs)
             // and fails with ETXTBSY; the link has no such window. Windows
             // keeps the copy because creating symlinks needs a privilege.
+            //
+            // A link makes `current_exe()` resolve to the cargo-built binary
+            // instead of the sandbox entry. The plugin suite never self-installs
+            // (that path lives in install.rs and is exercised by the suites that
+            // keep their own copies), so only argv[0] dispatch is under test.
             #[cfg(unix)]
             std::os::unix::fs::symlink(binary, path).expect("link multicall");
             #[cfg(not(unix))]
@@ -133,6 +138,50 @@ impl Sandbox {
         self.command(binary).args(args).output()
     }
 
+    /// Run a CLI with a bounded wait. `output()` has none: a control request
+    /// waits for a reply, and a daemon that accepts but never answers would
+    /// block the suite the same way the unbounded `child.wait()` did.
+    fn run_bounded(
+        &self,
+        binary: &Path,
+        args: &[&str],
+        timeout: Duration,
+    ) -> Result<Output, String> {
+        let mut child = self
+            .command(binary)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("cannot run {} {args:?}: {error}", binary.display()))?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    return child.wait_with_output().map_err(|error| {
+                        format!("cannot read {} output: {error}", binary.display())
+                    })
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("cannot wait for {}: {error}", binary.display()));
+                }
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{} {args:?} did not finish within {timeout:?}",
+                    binary.display()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn run(&self, binary: &Path, args: &[&str]) -> Output {
         self.try_run(binary, args).unwrap_or_else(|error| {
             panic!("run {} {args:?}: {error}", binary.display());
@@ -176,22 +225,44 @@ impl Sandbox {
         fs::read_to_string(&self.daemon_stderr).unwrap_or_default()
     }
 
-    /// Stop the daemon with a bounded wait. Returns the diagnostic when the
-    /// shutdown request failed and the daemon had to be killed, so a caller
-    /// (or the bounded-wait test) can report why instead of hanging.
+    /// Stop the daemon with a bounded wait. Mirrors the diagnostic contract of
+    /// `tests/http.rs`'s wait helper (a timeout carries the daemon log) but
+    /// returns the message instead of panicking: `Drop` may be running while
+    /// another panic unwinds, and panicking there aborts the process.
     fn stop_daemon(&mut self) -> Result<(), String> {
         let Some(mut child) = self.daemon.take() else {
             return Ok(());
         };
-        let request = self.try_run(&self.svcd, &["shutdown"]);
+        // The request is bounded too: `svcd shutdown` waits for a control reply
+        // with no timeout of its own.
+        let request = self.run_bounded(&self.svcd, &["shutdown"], self.stop_timeout);
         let deadline = Instant::now() + self.stop_timeout;
         loop {
             match child.try_wait() {
-                // The daemon exited; a failed request is then irrelevant (a
-                // sibling sandbox or a signal may have stopped it).
-                Ok(Some(_)) => return Ok(()),
+                Ok(Some(_)) => {
+                    // The daemon is gone. A failed request here is a race with
+                    // the exit (the reply can be lost on the way out), not a
+                    // test failure: keep it visible, do not fail the test.
+                    if !matches!(&request, Ok(output) if output.status.success()) {
+                        eprintln!(
+                            "sandbox: the shutdown request reported {} but the daemon exited",
+                            failed_request(&request)
+                        );
+                    }
+                    return Ok(());
+                }
                 Ok(None) => {}
-                Err(error) => return Err(format!("cannot wait for the daemon: {error}")),
+                Err(error) => {
+                    // The handle is already out of `self.daemon`, so leaving the
+                    // process running here would leak it past the Drop.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "cannot wait for the daemon: {error}; killed it. shutdown request: {}; daemon stderr (tail):\n{}",
+                        failed_request(&request),
+                        tail(&self.daemon_log(), 20)
+                    ));
+                }
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
@@ -199,7 +270,7 @@ impl Sandbox {
                 return Err(format!(
                     "the daemon did not stop within {:?}; killed it. shutdown request: {}; daemon stderr (tail):\n{}",
                     self.stop_timeout,
-                    describe(request),
+                    failed_request(&request),
                     tail(&self.daemon_log(), 20)
                 ));
             }
@@ -532,15 +603,15 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
-/// What a failed `svcd` invocation looked like, for diagnostics.
-fn describe(outcome: std::io::Result<Output>) -> String {
+/// What the shutdown request looked like, for diagnostics.
+fn failed_request(outcome: &Result<Output, String>) -> String {
     match outcome {
         Ok(output) => format!(
             "exit {:?} stderr {:?}",
             output.status.code(),
-            stderr(&output).trim()
+            stderr(output).trim()
         ),
-        Err(error) => format!("cannot run svcd: {error}"),
+        Err(message) => message.clone(),
     }
 }
 
@@ -580,6 +651,33 @@ fn shutdown_bounds_its_wait_when_the_daemon_cannot_be_reached() {
         "the error must name the failed request: {error}"
     );
     assert!(sandbox.daemon.is_none(), "the handle must be consumed");
+}
+
+/// The failure that started the hang: a panicking test drops its sandbox while
+/// unwinding. The Drop must stay bounded and must not panic again (a panic in
+/// a destructor during unwind aborts the process and hides the real failure).
+#[test]
+fn dropping_a_sandbox_while_unwinding_stays_bounded() {
+    let mut sandbox = Sandbox::new();
+    sandbox.stop_timeout = Duration::from_secs(1);
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    let moved = sandbox.root.join("config-moved");
+    fs::rename(&sandbox.config, &moved).expect("move the config directory");
+
+    let started = Instant::now();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        // Own the sandbox in this frame so its Drop runs while unwinding.
+        let _sandbox = sandbox;
+        panic!("simulated test failure");
+    }));
+
+    assert!(outcome.is_err(), "the simulated failure must unwind");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "dropping the sandbox while unwinding must stay bounded, took {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
