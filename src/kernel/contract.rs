@@ -95,6 +95,11 @@ impl Default for Obligations {
     }
 }
 
+/// Contract-wide concurrency ceiling. The slot uses the same value as its
+/// pending-table bound, so the contract cannot promise more than the carrier
+/// enforces.
+pub const MAX_IN_FLIGHT: usize = 64;
+
 /// 调用与并发的硬上限。来自 `kernel` 的默认值，可被契约覆盖。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
@@ -110,7 +115,7 @@ impl Default for Limits {
     fn default() -> Self {
         Limits {
             max_inline: 1024 * 1024,
-            max_in_flight: 64,
+            max_in_flight: MAX_IN_FLIGHT,
             default_timeout: Duration::from_secs(30),
             max_timeout: Duration::from_secs(300),
         }

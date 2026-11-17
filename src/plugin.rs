@@ -11,6 +11,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::compat;
+use crate::kernel::contract::{Capability as KernelCapability, CapabilityName, Effect};
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::hook;
 use crate::interpreter;
@@ -18,8 +19,7 @@ use crate::log;
 use crate::package::{self, Package};
 use crate::paths;
 use crate::registry::{
-    Capability, Exec, Hook, Interpreter, Kind, Lifecycle, Ready, Restart, Service, State,
-    RESERVED_ID,
+    Exec, Hook, Interpreter, Kind, Lifecycle, Ready, Restart, Service, State, RESERVED_ID,
 };
 
 /// Serialise config writes inside this process. The on-disk `config.lock`
@@ -996,24 +996,29 @@ fn service_from_manifest(
         Some("exec") => Ready::Exec,
         Some(other) => return Err(format!("unknown ready mode: {}", other)),
     };
-    let mut caps: Vec<Capability> = Vec::new();
+    let mut caps: Vec<KernelCapability> = Vec::new();
     for capability in &manifest.capabilities {
         if capability.name.is_empty()
             || capability.name.starts_with("svc.")
             || capability.name == "start"
-            || caps.iter().any(|cap| cap.name == capability.name)
+            || caps
+                .iter()
+                .any(|cap| cap.name.as_str() == capability.name)
         {
             return Err(format!("invalid capability name: {}", capability.name));
         }
-        caps.push(Capability {
-            name: capability.name.clone(),
-            description: capability.desc.clone(),
-            input_schema: capability.input_schema.clone(),
+        caps.push(KernelCapability {
+            name: CapabilityName::new(capability.name.clone()),
+            desc: capability.desc.clone(),
+            input_schema: Some(capability.input_schema.clone()),
+            effect: Effect::Write,
+            idempotent: false,
         });
     }
     if ready == Ready::Exec && !caps.is_empty() {
         return Err("exec.ready=exec cannot declare capabilities: no protocol channel".into());
     }
+    let contract = crate::registry::contract_for(id, &manifest.version, caps, false);
 
     let schema_two = manifest.schema >= 2;
     let exec_is_script = !is_native_file(&exec_path)?;
@@ -1081,7 +1086,7 @@ fn service_from_manifest(
         protocol: manifest.protocol,
         desc: manifest.desc.clone(),
         deps: manifest.dependencies.clone(),
-        caps,
+        contract,
         impl_ref: None,
         exec: Some(Exec {
             path: exec_path.to_string_lossy().to_string(),
@@ -1613,6 +1618,46 @@ mod tests {
             serde_json::to_vec(&manifest).expect("manifest"),
         )
         .expect("write manifest");
+    }
+
+    #[test]
+    fn scan_builds_the_contract_from_manifest_capabilities() {
+        let id = "contract-caps";
+        make_plugin(id, "", false);
+        let manifest_path = root()
+            .join("data/plugins")
+            .join(id)
+            .join("1.0.0")
+            .join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("manifest"))
+                .expect("manifest json");
+        manifest["capabilities"] = serde_json::json!([{
+            "name": "run",
+            "desc": "run it",
+            "inputSchema": {"type": "object"}
+        }]);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).expect("manifest"),
+        )
+        .expect("write manifest");
+
+        let (services, _) = scan();
+        let service = services
+            .iter()
+            .find(|service| service.id == id)
+            .expect("plugin is scanned");
+        let surface = service.contract.surface();
+        assert_eq!(surface.len(), 1);
+        assert_eq!(surface[0].name.as_str(), "run");
+        assert_eq!(surface[0].desc, "run it");
+        assert_eq!(surface[0].effect, Effect::Write);
+        assert!(!surface[0].idempotent);
+        assert!(!service
+            .contract
+            .failures
+            .contains(&crate::kernel::failure::Class::Cancelled));
     }
 
     #[test]

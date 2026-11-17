@@ -33,7 +33,7 @@ where
     // `<id>.start` tool, because only a supervised process can be dead.
     for svc in reg
         .values()
-        .filter(|svc| svc.kind == Kind::Plugin || !svc.caps.is_empty())
+        .filter(|svc| svc.kind == Kind::Plugin || !svc.contract.surface().is_empty())
     {
         let live = is_live(&svc.id);
         if svc.kind == Kind::Plugin || !live {
@@ -44,16 +44,20 @@ where
             }));
         }
         if live {
-            for cap in &svc.caps {
-                let description = if cap.description.is_empty() {
-                    format!("{} on {}", cap.name, svc.id)
+            for cap in svc.contract.surface() {
+                let name = cap.name.as_str();
+                let description = if cap.desc.is_empty() {
+                    format!("{} on {}", name, svc.id)
                 } else {
-                    cap.description.clone()
+                    cap.desc.clone()
                 };
+                let input_schema = cap.input_schema.clone().unwrap_or_else(|| {
+                    json!({"type": "object", "properties": {}})
+                });
                 out.push(json!({
-                    "name": format!("{}.{}", svc.id, cap.name),
+                    "name": format!("{}.{}", svc.id, name),
                     "description": description,
-                    "inputSchema": cap.input_schema.clone()
+                    "inputSchema": input_schema
                 }));
             }
         }
@@ -441,17 +445,22 @@ fn write_notification(stdout: &mut impl Write, method: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{Capability, Exec, Ready, Service, State};
+    use crate::kernel::contract::{Capability as KernelCapability, CapabilityName, Effect};
+    use crate::registry::{Exec, Ready, Service, State};
 
-    fn capability(name: &str) -> Capability {
-        Capability {
-            name: name.into(),
-            description: format!("{} description", name),
-            input_schema: json!({"type": "object", "properties": {"input": {"type": "string"}}}),
+    fn capability(name: &str) -> KernelCapability {
+        KernelCapability {
+            name: CapabilityName::new(name),
+            desc: format!("{} description", name),
+            input_schema: Some(json!({"type": "object", "properties": {"input": {"type": "string"}}})),
+            effect: Effect::Write,
+            idempotent: false,
         }
     }
 
     fn service(id: &str, kind: Kind, caps: &[&str]) -> Service {
+        let caps = caps.iter().map(|cap| capability(cap)).collect();
+        let contract = crate::registry::contract_for(id, "1.0.0", caps, false);
         Service {
             id: id.into(),
             kind,
@@ -459,7 +468,7 @@ mod tests {
             protocol: 1,
             desc: "test".into(),
             deps: Vec::new(),
-            caps: caps.iter().map(|cap| capability(cap)).collect(),
+            contract,
             impl_ref: None,
             exec: Some(Exec {
                 path: "/bin/true".into(),

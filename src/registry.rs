@@ -3,7 +3,11 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::kernel::contract::ImplRef;
+use crate::kernel::contract::{
+    Capability as KernelCapability, CapabilityName, Contract, Effect, ImplRef,
+    Limits as KernelLimits, Obligations, ServiceId,
+};
+use crate::kernel::failure::Class;
 
 /// The built-in core service id; reserved against `services.d` definitions.
 pub const RESERVED_ID: &str = "svc";
@@ -128,17 +132,6 @@ pub struct Hook {
     pub interpreter: Option<Interpreter>,
 }
 
-/// A capability advertised by a plugin manifest.
-///
-/// The aggregation layer passes `input_schema` through without validating it;
-/// the plugin owns the schema.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Capability {
-    pub name: String,
-    pub description: String,
-    pub input_schema: serde_json::Value,
-}
-
 /// Optional start/stop/status commands declared by a service definition or an
 /// `.spk` manifest.
 ///
@@ -163,8 +156,9 @@ pub struct Service {
     #[allow(dead_code)]
     pub desc: String,
     pub deps: Vec<String>,
-    /// Only plugins declare capabilities; core services are lifecycle units.
-    pub caps: Vec<Capability>,
+    /// The only description of the service's callable surface. Built at load;
+    /// runtime code reads this instead of a second capability vector.
+    pub contract: Contract,
     /// The runtime carrier selected by the assembly point. `None` keeps the
     /// supervised-slot path; the builtin `svc` names `tag=builtin`.
     pub impl_ref: Option<ImplRef>,
@@ -228,6 +222,54 @@ impl std::fmt::Display for CarrierError {
     }
 }
 
+/// Build the one callable description for a service at load time. The managed
+/// `Contract` is immutable for the life of the entry; runtime code never
+/// constructs a second surface.
+pub(crate) fn contract_for(
+    id: &str,
+    version: &str,
+    caps: Vec<KernelCapability>,
+    builtin: bool,
+) -> Contract {
+    let (effect, idempotent) = if builtin {
+        (Effect::Read, true)
+    } else {
+        (Effect::Write, false)
+    };
+    let surface = caps
+        .into_iter()
+        .map(|cap| KernelCapability {
+            effect,
+            idempotent,
+            ..cap
+        })
+        .collect();
+    let failures = if builtin {
+        Class::ALL.to_vec()
+    } else {
+        // Cancelled is caller-driven only; a plugin that returns it is
+        // normalized to ImplementationError before it reaches the contract.
+        Class::ALL
+            .into_iter()
+            .filter(|class| *class != Class::Cancelled)
+            .collect()
+    };
+    let limits = crate::limits::current();
+    Contract::new(
+        ServiceId::new(id),
+        version,
+        surface,
+        Obligations::default(),
+        failures,
+        KernelLimits {
+            max_inline: 1024 * 1024,
+            max_in_flight: crate::kernel::contract::MAX_IN_FLIGHT,
+            default_timeout: limits.default_timeout,
+            max_timeout: limits.max_timeout,
+        },
+    )
+}
+
 impl Service {
     /// ADR-0015's invariant: `exec` and `impl_ref` are mutually exclusive.
     /// Both empty is allowed (the service is supervised but not callable).
@@ -243,6 +285,22 @@ impl Service {
     /// The in-process `svc` service. It is always running and never enters the
     /// supervisor state machine.
     pub fn builtin_svc() -> Service {
+        let caps = vec![
+            KernelCapability {
+                name: CapabilityName::new("version"),
+                desc: "svcd version".into(),
+                input_schema: Some(json!({"type": "object", "properties": {}})),
+                effect: Effect::Read,
+                idempotent: true,
+            },
+            KernelCapability {
+                name: CapabilityName::new("health"),
+                desc: "svcd health".into(),
+                input_schema: Some(json!({"type": "object", "properties": {}})),
+                effect: Effect::Read,
+                idempotent: true,
+            },
+        ];
         Service {
             id: RESERVED_ID.into(),
             kind: Kind::Core,
@@ -250,18 +308,7 @@ impl Service {
             protocol: 1,
             desc: "core service management".into(),
             deps: Vec::new(),
-            caps: vec![
-                Capability {
-                    name: "version".into(),
-                    description: "svcd version".into(),
-                    input_schema: json!({"type": "object", "properties": {}}),
-                },
-                Capability {
-                    name: "health".into(),
-                    description: "svcd health".into(),
-                    input_schema: json!({"type": "object", "properties": {}}),
-                },
-            ],
+            contract: contract_for(RESERVED_ID, env!("CARGO_PKG_VERSION"), caps, true),
             impl_ref: Some(ImplRef {
                 tag: "builtin".into(),
                 binding: json!({}),
@@ -442,10 +489,48 @@ mod tests {
     }
 
     #[test]
+    fn a_contract_carries_the_carrier_effect_and_failure_set() {
+        let cap = KernelCapability {
+            name: CapabilityName::new("run"),
+            desc: "run it".into(),
+            input_schema: None,
+            effect: Effect::Write,
+            idempotent: false,
+        };
+        let slot = contract_for("demo", "1.0.0", vec![cap.clone()], false);
+        let slot_cap = &slot.surface()[0];
+        assert_eq!(slot_cap.effect, Effect::Write);
+        assert!(!slot_cap.idempotent);
+        assert!(!slot.failures.contains(&Class::Cancelled));
+        assert_eq!(slot.failures.len(), Class::ALL.len() - 1);
+        assert_eq!(
+            slot.limits.max_in_flight,
+            crate::kernel::contract::MAX_IN_FLIGHT
+        );
+
+        let builtin = contract_for("svc", "1.0.0", vec![cap], true);
+        let builtin_cap = &builtin.surface()[0];
+        assert_eq!(builtin_cap.effect, Effect::Read);
+        assert!(builtin_cap.idempotent);
+        assert_eq!(builtin.failures, Class::ALL.to_vec());
+    }
+
+    #[test]
     fn the_builtin_service_declares_version_and_health() {
         let service = Service::builtin_svc();
-        let names: Vec<&str> = service.caps.iter().map(|cap| cap.name.as_str()).collect();
-        assert_eq!(names, vec!["version", "health"]);
+        let names: Vec<&str> = service
+            .contract
+            .surface()
+            .iter()
+            .map(|cap| cap.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["health", "version"]);
+        assert!(service
+            .contract
+            .surface()
+            .iter()
+            .all(|cap| cap.effect == Effect::Read && cap.idempotent));
+        assert_eq!(service.contract.failures, Class::ALL.to_vec());
     }
 
     #[test]

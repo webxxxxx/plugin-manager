@@ -20,8 +20,7 @@ use crate::compat;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::definition;
 use crate::kernel::contract::{
-    Capability as KernelCapability, CapabilityName, Contract, Effect, Instance, Invocation,
-    Launchers, Limits as KernelLimits, Obligations, ProgressToken, Reply, ReplySink, ServiceId,
+    CapabilityName, Instance, Invocation, Launchers, ProgressToken, Reply, ReplySink,
 };
 use crate::kernel::failure::{Class, Failure, Rejection, Retry};
 use crate::lan::LanStatus;
@@ -1138,7 +1137,7 @@ impl Daemon {
         let start_id = name.strip_suffix(".start").filter(|service_id| {
             self.registry
                 .get(service_id)
-                .map(|service| service.kind == Kind::Plugin || !service.caps.is_empty())
+                .map(|service| service.kind == Kind::Plugin || !service.contract.surface().is_empty())
                 .unwrap_or(false)
         });
         if let Some(service_id) = start_id {
@@ -1162,7 +1161,10 @@ impl Daemon {
         // the assembly point knows how to reach it. `svc` is builtin and has no
         // supervised process; everything else keeps the SlotWire path.
         let builtin = service.impl_ref.clone();
-        let known = service.caps.iter().any(|cap| cap.name == capability);
+        let known = service
+            .contract
+            .capability(&CapabilityName::new(capability))
+            .is_some();
         let callable = builtin.is_some()
             || service.kind == Kind::Plugin
             || self.slots.contains_key(service_id);
@@ -1203,7 +1205,7 @@ impl Daemon {
 
         if let Some(spec) = builtin {
             let launchers = self.launchers.clone();
-            let contract = builtin_contract(service);
+            let contract = service.contract.clone();
             let mut instance = match launchers.launch(contract, &spec) {
                 Ok(instance) => instance,
                 Err(error) => {
@@ -1234,7 +1236,7 @@ impl Daemon {
             return;
         };
         let handle = slot.handle();
-        let contract = slot_contract(service);
+        let contract = service.contract.clone();
         let mut instance = match Instance::new(
             contract,
             Box::new(SlotWire::new(handle, Some(reply.clone()))),
@@ -2151,68 +2153,10 @@ fn project_builtin_outcome(external_id: Option<Value>, outcome: Result<Value, Fa
     }
 }
 
-fn contract_limits() -> KernelLimits {
-    let limits = crate::limits::current();
-    KernelLimits {
-        max_inline: 1024 * 1024,
-        max_in_flight: crate::slot::MAX_IN_FLIGHT,
-        default_timeout: limits.default_timeout,
-        max_timeout: limits.max_timeout,
-    }
-}
-
-fn contract_surface(service: &Service, effect: Effect, idempotent: bool) -> Vec<KernelCapability> {
-    service
-        .caps
-        .iter()
-        .map(|capability| KernelCapability {
-            name: CapabilityName::new(capability.name.clone()),
-            desc: capability.description.clone(),
-            input_schema: Some(capability.input_schema.clone()),
-            effect,
-            idempotent,
-        })
-        .collect()
-}
-
-fn builtin_contract(service: &Service) -> Contract {
-    // A builtin has no process, and the supervisor does not drive its
-    // lifecycle: each call gets a fresh view. Keep the default obligations
-    // rather than claiming hooks or probes that never run.
-    Contract::new(
-        ServiceId::new(service.id.clone()),
-        service.version.clone(),
-        contract_surface(service, Effect::Read, true),
-        Obligations::default(),
-        Class::ALL.to_vec(),
-        contract_limits(),
-    )
-}
-
-fn slot_contract(service: &Service) -> Contract {
-    // The plugin manifest does not declare effect/idempotence yet; Write +
-    // non-idempotent is the conservative projection.
-    let surface = contract_surface(service, Effect::Write, false);
-    // Cancelled is caller-driven only; a plugin that returns it is already
-    // normalized to ImplementationError before it reaches the contract.
-    let failures = Class::ALL
-        .into_iter()
-        .filter(|class| *class != Class::Cancelled)
-        .collect();
-    Contract::new(
-        ServiceId::new(service.id.clone()),
-        service.version.clone(),
-        surface,
-        Obligations::default(),
-        failures,
-        contract_limits(),
-    )
-}
-
 /// Give a slot its contract and the face-side projections. The slot itself no
 /// longer knows MCP or the UI bus.
 fn configure_slot(slot: &mut Slot, service: &Service) {
-    slot.set_contract(slot_contract(service));
+    slot.set_contract(service.contract.clone());
     slot.set_call_timeout(crate::limits::current().default_timeout);
     slot.set_projector(Arc::new(project_slot_outcome));
     let id = service.id.clone();
@@ -2426,25 +2370,32 @@ fn is_no_space(error: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{Capability, Exec, Kind, Ready, Service};
+    use crate::kernel::contract::{
+        Capability as KernelCapability, CapabilityName, Effect,
+    };
+    use crate::registry::{Exec, Kind, Ready, Service};
 
-    fn capability(name: &str) -> Capability {
-        Capability {
-            name: name.into(),
-            description: format!("{} description", name),
-            input_schema: json!({"type": "object"}),
+    fn capability(name: &str) -> KernelCapability {
+        KernelCapability {
+            name: CapabilityName::new(name),
+            desc: format!("{} description", name),
+            input_schema: Some(json!({"type": "object"})),
+            effect: Effect::Write,
+            idempotent: false,
         }
     }
 
     fn plugin(id: &str, caps: &[&str]) -> Service {
+        let caps = caps.iter().map(|cap| capability(cap)).collect();
         Service {
             kind: Kind::Plugin,
-            caps: caps.iter().map(|cap| capability(cap)).collect(),
+            contract: crate::registry::contract_for(id, "1.0.0", caps, false),
             ..service(id, &[])
         }
     }
 
     fn service(id: &str, deps: &[&str]) -> Service {
+        let contract = crate::registry::contract_for(id, "1.0.0", Vec::new(), false);
         Service {
             id: id.into(),
             kind: Kind::Core,
@@ -2452,7 +2403,7 @@ mod tests {
             protocol: 1,
             desc: "test".into(),
             deps: deps.iter().map(|dep| dep.to_string()).collect(),
-            caps: Vec::new(),
+            contract,
             impl_ref: None,
             exec: Some(Exec {
                 path: "/bin/true".into(),
@@ -2665,6 +2616,8 @@ while ($null -ne ($line = $reader.ReadLine())) {
     }
 
     fn tool_service(id: &str, kind: Kind, caps: &[&str], root: &Path) -> Service {
+        let caps = caps.iter().map(|cap| capability(cap)).collect();
+        let contract = crate::registry::contract_for(id, "1.0.0", caps, false);
         Service {
             id: id.into(),
             kind,
@@ -2672,7 +2625,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
             protocol: 1,
             desc: "tools".into(),
             deps: Vec::new(),
-            caps: caps.iter().map(|cap| capability(cap)).collect(),
+            contract,
             impl_ref: None,
             exec: Some(tool_agent(root)),
             lifecycle: None,
@@ -2999,9 +2952,15 @@ while ($null -ne ($line = $reader.ReadLine())) {
         let services: Vec<Service> = (0..80)
             .map(|index| {
                 let mut service = plugin(&format!("p{index}"), &[]);
-                service.caps = (0..20)
+                let caps = (0..20)
                     .map(|cap| capability(&format!("cap{cap}")))
                     .collect();
+                service.contract = crate::registry::contract_for(
+                    &service.id,
+                    "1.0.0",
+                    caps,
+                    false,
+                );
                 service
             })
             .collect();
