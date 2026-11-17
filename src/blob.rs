@@ -755,12 +755,27 @@ fn cleanup_dir(
             return Ok(());
         }
     }
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        // Cleanup runs concurrently with uploads and other cleanup passes; a
+        // file that disappears between read_dir and stat is not an error.
+        let Ok(entry) = entry else {
+            continue;
+        };
         let path = entry.path();
-        let file_type = entry.file_type()?;
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         if file_type.is_dir() {
-            cleanup_dir(root, &path, cutoff, removed)?;
+            match cleanup_dir(root, &path, cutoff, removed) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            }
             if path != root
                 && path
                     .file_name()
@@ -1016,7 +1031,7 @@ pub(crate) fn test_temp_dir() -> &'static Path {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("svcd-blob-{}-{}", std::process::id(), nanos));
+        let root = crate::test_support::temp_dir().join(format!("svcd-blob-{}-{}", std::process::id(), nanos));
         std::env::set_var("SVCD_DATA_DIR", &root);
         std::env::set_var("SVCD_TEMP_DIR", root.join("temp"));
         std::fs::create_dir_all(root.join("temp")).expect("blob root");
