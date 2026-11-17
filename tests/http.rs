@@ -2027,6 +2027,35 @@ fn head_bad_framing_has_no_body() {
     );
 }
 
+/// A blocked route answers through the blocking pool's completion, not the
+/// inline write path. A HEAD 404 produced there must drop its body too.
+#[test]
+fn head_blocking_unknown_endpoint_has_no_body() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let get_missing = raw_request(&address, "GET", "/api/v1/does-not-exist", "", b"");
+    assert_eq!(get_missing.status, 404);
+    assert!(!get_missing.body.is_empty(), "GET 404 keeps its JSON body");
+    let get_length = header_value(&get_missing.headers, "content-length")
+        .expect("GET 404 advertises a body")
+        .to_string();
+
+    let head_missing = raw_request(&address, "HEAD", "/api/v1/does-not-exist", "", b"");
+    assert_eq!(head_missing.status, 404);
+    assert!(
+        head_missing.body.is_empty(),
+        "HEAD 404 carried a body: {}",
+        String::from_utf8_lossy(&head_missing.body)
+    );
+    assert_eq!(
+        header_value(&head_missing.headers, "content-length"),
+        Some(get_length.as_str()),
+        "HEAD 404 keeps the GET Content-Length"
+    );
+}
+
 /// Read exactly one response head. A HEAD response must put the next response
 /// immediately after this terminator, with no body bytes in between.
 fn read_response_head_raw(stream: &mut TcpStream) -> Vec<u8> {

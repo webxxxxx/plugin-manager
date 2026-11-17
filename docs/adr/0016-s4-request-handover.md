@@ -38,7 +38,7 @@ Accepted。细化 [ADR-0012](0012-protocol-is-server-plus-face.md)；切片见 #
 
 - **#126 把插件 stdio 并入 supervisor-loop**：`reactor.rs` 不再起 `svcd-reactor` 线程，只保留 poll set（`register` / `unregister` 走命令通道加 self-pipe）；daemon 的 supervisor loop 在自己的循环里调用 `Reactor::poll_once`，`pump()` 每次先做一次 0 超时 pass，所以同步 start/stop 等待期间插件管道仍在推进。共享 `Wake` 增加 poll self-pipe（`set_interrupt`）：管理请求、slot 提交、raw 帧入队都写一个字节打断 poll，请求延迟不取决于 50 ms 超时。插件 stdout/stderr、exec-ready 日志、协议 3 raw stdin/stdout 的线路与背压不变（每插件 256 帧队列、raw 队列 `ws_raw_queue`、每次 pass 的 raw 读写预算）。同步等待不会冻结插件 stdio：start/stop 等待由 `pump` 每 20 ms 做一次 0 超时 pass；install/uninstall 的 hook 等待与 `svc status --probe` 的 status hook 等待也各自 poll（`hook::poll_this_loop` / `run_status_hook`）。剩下的窗口是同步 RPC 里的纯 CPU/磁盘工作（例如解包 staging）：此时插件输出先填 OS 管道（raw stdin 在 Linux 上放大到 512 KiB），管道与每插件 256 帧队列都满后该插件的写入方阻塞——背压还在，窗口从一次 poll pass 变成一个同步步骤。import 不在 supervisor loop 上：它的请求体由阻塞池上的 stream handler 处理（#121）。Unix 默认空载 4 条：supervisor（同时 poll 插件 stdio）、server loop、2 条阻塞 worker。
 
-- **#134 的 HEAD 错误响应不写 body**：Unix 的 `Connection` 在解析请求头后记录 `head_only`，`write_response` 在写回所有内存响应（401/500、阻塞池 503、`stream_busy_response` 503、413/400）前按它截断 body，保留与 GET 相同的 `Content-Length`；Windows 的 `write_http` 在每条响应写出点做同一件事。解析不出请求头时无法得知 method，仍按 400/431 处理；stream handler 自己写字节的 503 负责自己的 HEAD 语义（当前上传/SSE 路由不接受 HEAD）。
+- **#134 的 HEAD 错误响应不写 body**：Unix 的 `Connection` 在解析请求头后记录 `head_only`，`write_response` 在写回所有内存响应（401/500、阻塞池 503、`stream_busy_response` 503、413/400）前按它截断 body，保留与 GET 相同的 `Content-Length`；Windows 的 `write_http` 在每条响应写出点做同一件事。解析不出请求头时无法得知 method，仍按 400 处理；stream handler 自己写字节的 503 负责自己的 HEAD 语义（当前上传/SSE 路由不接受 HEAD）。
 
 ## Consequences
 
