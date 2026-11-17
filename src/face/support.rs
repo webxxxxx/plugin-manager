@@ -22,7 +22,7 @@ use crate::server::http::{CancelToken, JobBudget, Request};
 /// A blocking route always has a deadline stamped by the server; an inline
 /// route has none and keeps the CLI-style round trip. \`cancel\` is the pool's
 /// per-job token, flipped when the client disconnects or the pool shuts down.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct CallBudget {
     pub deadline: Option<Instant>,
     pub cancel: Option<CancelToken>,
@@ -44,6 +44,17 @@ impl CallBudget {
         CallBudget {
             deadline: Some(job.deadline),
             cancel: Some(job.cancel.clone()),
+        }
+    }
+
+    /// A short follow-up call after a successful long one. It keeps the
+    /// disconnect token but gets its own management budget, so an install that
+    /// consumed the stream deadline can still disable a plugin instead of
+    /// starting the follow-up with an expired deadline.
+    pub fn follow_up(&self) -> CallBudget {
+        CallBudget {
+            deadline: Some(Instant::now() + crate::limits::current().control_timeout),
+            cancel: self.cancel.clone(),
         }
     }
 }
@@ -236,5 +247,41 @@ mod tests {
         assert_eq!(budget.deadline, Some(job.deadline));
         assert!(budget.cancel.is_some());
         assert!(!budget.cancel.unwrap().is_cancelled());
+    }
+
+    /// The install/import helpers call this exact function with the stream
+    /// job budget. An expired budget must project 504 timeout instead of
+    /// blocking on a supervisor that does not answer.
+    #[cfg(unix)]
+    #[test]
+    fn an_expired_stream_budget_projects_504() {
+        use std::os::unix::net::UnixListener;
+
+        let root = crate::test_support::temp_dir().join(format!(
+            "svcd-support-budget-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("config dir");
+        std::fs::write(root.join("svcd.token"), "test-token\n").expect("token");
+        let listener = UnixListener::bind(root.join("svcd.sock")).expect("listener");
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept");
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        });
+        let budget = CallBudget {
+            deadline: Some(Instant::now()),
+            cancel: None,
+        };
+        let failure = rpc_result(&root, "svcd.ping", json!({}), &budget)
+            .expect_err("an expired budget must fail");
+        assert_eq!(failure.0, 504);
+        assert_eq!(failure.1, "timeout");
+        assert!(failure.2.contains("timed out"), "{}", failure.2);
+        server.join().expect("server");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -7483,10 +7483,10 @@ fn a_disconnected_install_job_cancels_its_control_round_trip() {
         .shutdown(std::net::Shutdown::Both)
         .expect("install shutdown");
     drop(install);
-    // The server loop sees the FIN and flips the stream job's token; one poll
-    // period is enough for the job to abandon the control round trip.
-    std::thread::sleep(Duration::from_millis(250));
-
+    // The FIN arrives while the install job is still in flight; the server
+    // flips the job's token and the job frees its worker on the next poll.
+    // Submitting the two probes immediately makes a missing cancellation show
+    // up as a queued request, which is what the bound below catches.
     let started = Instant::now();
     let mut workers = Vec::new();
     for _ in 0..2 {
@@ -7501,7 +7501,7 @@ fn a_disconnected_install_job_cancels_its_control_round_trip() {
         let (response, elapsed) = worker.join().expect("management request");
         assert_eq!(response.status, 504, "{}", response.body);
         assert!(
-            elapsed < Duration::from_secs(2),
+            elapsed < Duration::from_millis(1500),
             "a cancelled install must free its worker, took {elapsed:?}"
         );
     }

@@ -102,6 +102,13 @@ impl StreamDriver {
         !self.blocked_on_write && self.job.is_none() && !self.awaiting
     }
 
+    /// Whether this stream owns a queued or running blocking job. Only that
+    /// state needs the half-close check: a handler that is merely blocked on
+    /// write may still have a response to deliver after the peer's FIN.
+    pub fn has_job(&self) -> bool {
+        self.job.is_some() || self.awaiting
+    }
+
     /// The handler asked the server to run a job. The server takes it exactly
     /// once and calls on_blocking_done when it finishes.
     pub fn take_job(&mut self) -> Option<BlockingJob> {

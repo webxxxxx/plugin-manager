@@ -28,6 +28,21 @@ const POLL_CLOSE: i16 = libc::POLLERR | libc::POLLHUP | libc::POLLRDHUP;
 #[cfg(all(unix, not(target_os = "linux")))]
 const POLL_CLOSE: i16 = libc::POLLERR | libc::POLLHUP;
 
+/// What a paused stream asks poll for. It must not ask to read (the handler is
+/// applying backpressure), but Linux only reports a half-close through
+/// `POLLRDHUP`; other Unixes keep `POLLHUP`, which the loop already handles.
+#[cfg(unix)]
+pub(crate) fn paused_stream_interest() -> i16 {
+    #[cfg(target_os = "linux")]
+    {
+        libc::POLLRDHUP
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
 /// The busy response for a connection refused by the loop. Both engines send
 /// the same bytes so a client sees one status on every host.
 pub const BUSY_CONNECTION_RESPONSE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\

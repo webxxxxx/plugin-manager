@@ -567,9 +567,9 @@ impl StreamHandler for PackageUploadStream {
 fn run_chunk(
     state: &Arc<Mutex<UploadState>>,
     chunk: &[u8],
-    job: &crate::server::http::JobBudget,
+    job_budget: &crate::server::http::JobBudget,
 ) -> BlockingOutcome {
-    let budget = CallBudget::from_job(job);
+    let budget = CallBudget::from_job(job_budget);
     let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
     state.feed(chunk, &budget);
     BlockingOutcome::Ok(Vec::new())
@@ -700,7 +700,12 @@ impl InstallFlow {
         ) {
             Ok(status) => {
                 if !self.enable {
-                    let _ = support::rpc(config, "svc.disable", json!({ "id": id }), budget);
+                    let _ = support::rpc(
+                        config,
+                        "svc.disable",
+                        json!({ "id": id }),
+                        &budget.follow_up(),
+                    );
                 }
                 let summary = status.get("summary").cloned().unwrap_or(Value::Null);
                 let body = serde_json::to_vec(&json!({

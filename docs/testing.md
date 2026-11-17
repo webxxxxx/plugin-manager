@@ -157,9 +157,9 @@ MCP SSE 的 handler 由 `cargo test --bin svcd server::mcp::progress` 覆盖：S
 
 #131 给 Blocking 控制往返加 deadline：server 在派发 job 时写 `Request.deadline` / `cancel`，`channel::request_within` 每 20 ms 轮询 deadline 与池 token 再决定是否继续读；`ipc::FrameReader` 在 `WouldBlock` 之间保留半帧，Unix 用 `poll`、Windows 用 `PeekNamedPipe` 等到可读。单测是 `ipc::tests::a_would_block_keeps_the_partial_frame_for_the_next_read`、`channel::tests::a_silent_control_channel_hits_the_deadline` / `a_disconnect_cancels_within_one_poll_period` / `a_partial_response_survives_the_poll_timeout` / `a_stalled_partial_frame_still_hits_the_deadline`。集成 `a_stuck_supervisor_answers_504_and_the_worker_recovers` 用 stop hook 卡住 supervisor（`control_timeout_secs = 1`），断言两条并发管理请求都在 hook 返回前得到 504 `timeout`（不是 503），hook 结束后请求恢复 200；`limits` 的 floor/ceiling 测试覆盖 `control_timeout_secs` 的 1..300 clamp。
 
-#136 把同一预算接到 stream job：`BlockingJob` 接收 `JobBudget { cancel, deadline }`，server 用 `transfer_timeout` 作 deadline 并传入池 token；install/import 的 `install_staged` / `svc.disable` 走该预算。`face::support::tests::a_stream_job_budget_carries_the_pool_token_and_deadline` 覆盖预算交接；Unix 集成 `a_disconnected_install_job_cancels_its_control_round_trip` 用 post-install hook 卡住 supervisor，断开上传后两条管理请求都在 1 s 内得到 504（worker 未释放时第二条会排队到 hook 结束）。Linux 暂停 stream 的 FIN 检测用 `POLLRDHUP`，否则 events=0 的 poll 看不到半关闭。
-
 #122 的插件 UI 实时流由 `cargo test --bin svcd face::plugin_streams` 的无 socket 单测覆盖：SSE 分片/重放/心跳（含「部分事件在途时 tick 不得覆盖 pending」）、WS 握手/分片/控制帧/1009/1013 与响应先于队列下一条调用、raw 二进制/分片/关闭码。真实 TCP 回归是 `tests/http.rs` 的 `plugin_ui_*` 用例；`plugin_ui_realtime_streams_consume_the_long_lived_stream_cap` 断言 `max_streams = 1` 时第二条 SSE/WS 得到 503 + `Retry-After: 1`、静态资源仍豁免、释放后可重连。页面 WS 的 `tools/call` 走阻塞池（有界 64）而不是 legacy worker 队列；`ws_inflight_requests` / `ws_inflight_bytes` 约束已排队但未提交的调用。
+
+#136 把同一预算接到 stream job：`BlockingJob` 接收 `JobBudget { cancel, deadline }`，server 在提交 job 时用 `transfer_timeout` 冻结 deadline 并传入池 token；install/import 的 `install_staged` / `svc.disable` 走该预算（`svc.disable` 用同一 token 的短 follow-up 预算）。`face::support::tests` 覆盖预算字段交接与过期预算的 504 投影，`server::http::fallback` 的 Windows 单测覆盖 fallback 的 deadline；Unix 集成 `a_disconnected_install_job_cancels_its_control_round_trip` 用 post-install hook 卡住 supervisor，断开上传后两条管理请求都在 1.5 s 内得到 504（worker 未释放时第二条会排队到 hook 结束）。Linux 暂停 stream 的 FIN 检测用 `POLLRDHUP`，否则 events=0 的 poll 看不到半关闭。
 
 ## 7. CI 落点
 

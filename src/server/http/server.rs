@@ -527,19 +527,14 @@ impl ServerLoop for Server {
             ConnState::Stream(driver) => {
                 if driver.wants_read() {
                     libc::POLLIN
+                } else if driver.has_job() {
+                    // A stream job in flight still has to notice a client FIN
+                    // so it can be cancelled; the engine owns the platform's
+                    // half-close flag. A stream merely blocked on write keeps
+                    // the old behaviour and may still deliver its response.
+                    engine::paused_stream_interest()
                 } else {
-                    // A paused stream still has to notice a client FIN so a
-                    // running job can be cancelled. Linux reports the
-                    // half-close without reading the unread body bytes; other
-                    // Unixes keep the old POLLHUP-only detection.
-                    #[cfg(target_os = "linux")]
-                    {
-                        libc::POLLRDHUP
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        0
-                    }
+                    0
                 }
             }
             ConnState::Processing => 0,
@@ -670,14 +665,15 @@ impl Server {
         let key = self.next_job_key();
         let results = self.results_tx.clone();
         let notify = self.notify.try_clone().ok();
+        // Stamp the deadline at submission, the same instant the driver starts
+        // its no-progress clock. A job that waits in the queue must not get a
+        // fresh budget after the connection has already been given up on.
+        let deadline = Instant::now() + crate::limits::current().transfer_timeout;
         let submitted = self.blocking.try_submit(key, move |cancel| {
             if cancel.is_cancelled() {
                 return;
             }
-            let outcome = job(JobBudget {
-                cancel,
-                deadline: Instant::now() + crate::limits::current().transfer_timeout,
-            });
+            let outcome = job(JobBudget::at(cancel, deadline));
             let _ = results.send(WorkResult::StreamJobDone {
                 connection: id,
                 outcome,

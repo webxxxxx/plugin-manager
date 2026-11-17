@@ -63,20 +63,32 @@ pub enum StreamAction {
 /// (flipped when the connection closes) and a deadline that matches the
 /// connection's no-progress bound. A handler that makes a control-channel round
 /// trip must pass both into it; other handlers ignore the value explicitly.
-#[derive(Clone, Debug)]
 pub struct JobBudget {
     pub cancel: CancelToken,
     pub deadline: Instant,
 }
 
-#[cfg(test)]
 impl JobBudget {
+    /// The deadline is fixed when the job is submitted. Queue wait belongs to
+    /// the connection's no-progress bound, not to the job's run time.
+    pub fn at(cancel: CancelToken, deadline: Instant) -> JobBudget {
+        JobBudget { cancel, deadline }
+    }
+
+    /// The Windows inline fallback owns the connection thread, so it has no
+    /// disconnect signal to flip; the deadline still bounds a stuck round trip.
+    #[cfg(not(unix))]
+    pub fn for_fallback(timeout: std::time::Duration) -> JobBudget {
+        JobBudget::at(CancelToken::never(), Instant::now() + timeout)
+    }
+
     /// A clean budget for a handler unit test that drives the job inline.
+    #[cfg(test)]
     pub fn for_test() -> JobBudget {
-        JobBudget {
-            cancel: CancelToken::new(),
-            deadline: Instant::now() + std::time::Duration::from_secs(30),
-        }
+        JobBudget::at(
+            CancelToken::never(),
+            Instant::now() + std::time::Duration::from_secs(30),
+        )
     }
 }
 
