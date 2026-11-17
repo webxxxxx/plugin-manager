@@ -38,6 +38,8 @@ struct Sandbox {
     plugin: PathBuf,
     daemon: Option<Child>,
     daemon_stderr: PathBuf,
+    /// Overridable so the bounded-wait test does not spend the production bound.
+    stop_timeout: Duration,
 }
 
 impl Sandbox {
@@ -70,17 +72,7 @@ impl Sandbox {
         let svcd = root.join(svcd_name);
         let svc = root.join(svc_name);
         let plugin = root.join(plugin_name);
-        for path in [&svcd, &svc, &plugin] {
-            // The multicall dispatch only reads argv[0]'s file name, so a link
-            // is enough on Unix. A copy that is exec'd right after it is written
-            // races its own close on slow filesystems (/mnt/d, DrvFs) and fails
-            // with ETXTBSY. Windows keeps the copy: creating symlinks needs a
-            // privilege there.
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(binary, path).expect("link multicall");
-            #[cfg(not(unix))]
-            fs::copy(binary, path).expect("copy multicall");
-        }
+        support::install_multicall(Path::new(binary), &[&svcd, &svc, &plugin]);
 
         Sandbox {
             daemon_stderr: root.join("daemon.stderr"),
@@ -93,6 +85,7 @@ impl Sandbox {
             svc,
             plugin,
             daemon: None,
+            stop_timeout: support::STOP_TIMEOUT,
         }
     }
 
@@ -382,13 +375,6 @@ impl Sandbox {
         command.output().expect("run svc")
     }
 
-    fn run_svcd(&self, args: &[&str]) -> Output {
-        let mut command = Command::new(&self.svcd);
-        command.args(args);
-        self.env(&mut command);
-        command.output().expect("run svcd")
-    }
-
     fn run_plugin(&self, args: &[&str]) -> Output {
         let mut command = Command::new(&self.plugin);
         command.args(args);
@@ -462,13 +448,9 @@ impl Sandbox {
         let mut command = Command::new(&self.svcd);
         command.arg("shutdown");
         self.env(&mut command);
-        support::stop_daemon(
-            &mut child,
-            &mut command,
-            support::STOP_TIMEOUT,
-            "the daemon",
-            || fs::read_to_string(&log).unwrap_or_default(),
-        )
+        support::stop_daemon(&mut child, &mut command, self.stop_timeout, || {
+            fs::read_to_string(&log).unwrap_or_default()
+        })
     }
 
     fn shutdown(&mut self) {
@@ -485,19 +467,15 @@ impl Sandbox {
 #[test]
 fn stop_wait_is_bounded_when_the_request_cannot_reach_the_daemon() {
     let mut sandbox = Sandbox::new();
+    let timeout = Duration::from_secs(1);
+    sandbox.stop_timeout = timeout;
     sandbox.start_daemon();
     sandbox.wait_for_daemon();
     let moved = sandbox.root.join("config-moved");
     fs::rename(&sandbox.config, &moved).expect("move the config directory");
 
-    let mut child = sandbox.daemon.take().expect("running daemon");
-    let log = sandbox.daemon_stderr.clone();
-    let mut command = Command::new(&sandbox.svcd);
-    command.arg("shutdown");
-    sandbox.env(&mut command);
-    support::assert_bounded_stop(&mut child, &mut command, Duration::from_secs(1), || {
-        fs::read_to_string(&log).unwrap_or_default()
-    });
+    support::assert_bounded_stop(|| sandbox.stop_daemon(), timeout);
+    assert!(sandbox.daemon.is_none(), "the handle must be consumed");
 }
 
 impl Drop for Sandbox {

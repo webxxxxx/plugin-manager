@@ -70,22 +70,7 @@ impl Sandbox {
         let svcd = root.join(names.0);
         let svc = root.join(names.1);
         let plugin = root.join(names.2);
-        for path in [&svcd, &svc, &plugin] {
-            // The multicall dispatch only reads argv[0]'s file name, so a link
-            // is enough on Unix. A copy that is exec'd right after it is
-            // written races its own close on slow filesystems (/mnt/d, DrvFs)
-            // and fails with ETXTBSY; the link has no such window. Windows
-            // keeps the copy because creating symlinks needs a privilege.
-            //
-            // A link makes `current_exe()` resolve to the cargo-built binary
-            // instead of the sandbox entry. The plugin suite never self-installs
-            // (that path lives in install.rs and is exercised by the suites that
-            // keep their own copies), so only argv[0] dispatch is under test.
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(binary, path).expect("link multicall");
-            #[cfg(not(unix))]
-            fs::copy(binary, path).expect("copy multicall");
-        }
+        support::install_multicall(Path::new(binary), &[&svcd, &svc, &plugin]);
 
         Sandbox {
             daemon_stderr: root.join("daemon.stderr"),
@@ -186,7 +171,7 @@ impl Sandbox {
         let log = self.daemon_stderr.clone();
         let mut command = self.command(&self.svcd);
         command.arg("shutdown");
-        support::stop_daemon(&mut child, &mut command, self.stop_timeout, "the daemon", || {
+        support::stop_daemon(&mut child, &mut command, self.stop_timeout, || {
             fs::read_to_string(&log).unwrap_or_default()
         })
     }
@@ -516,7 +501,8 @@ fn stderr(output: &Output) -> String {
 #[test]
 fn shutdown_bounds_its_wait_when_the_daemon_cannot_be_reached() {
     let mut sandbox = Sandbox::new();
-    sandbox.stop_timeout = Duration::from_secs(1);
+    let timeout = Duration::from_secs(1);
+    sandbox.stop_timeout = timeout;
     sandbox.start_daemon();
     sandbox.wait_for_daemon();
 
@@ -526,21 +512,44 @@ fn shutdown_bounds_its_wait_when_the_daemon_cannot_be_reached() {
     let moved = sandbox.root.join("config-moved");
     fs::rename(&sandbox.config, &moved).expect("move the config directory");
 
+    support::assert_bounded_stop(|| sandbox.stop_daemon(), timeout);
+    assert!(sandbox.daemon.is_none(), "the handle must be consumed");
+}
+
+/// A daemon that accepts the control connection but never answers must not
+/// hold the stop request: the request itself has a bound now.
+#[cfg(unix)]
+#[test]
+fn a_silent_control_server_does_not_hold_the_shutdown_request() {
+    use std::os::unix::net::UnixListener;
+
+    let sandbox = Sandbox::new();
+    // The CLI reads the control token before it connects, and the daemon is the
+    // one that creates it. Without a token the request fails before reaching the
+    // socket, which is not the case under test.
+    fs::write(sandbox.config.join("svcd.token"), "silent-server-token").expect("token");
+    // Bind the control socket and never accept or answer: the CLI connects,
+    // sends the request, and waits for a reply that never comes.
+    let _listener =
+        UnixListener::bind(sandbox.config.join("svcd.sock")).expect("bind control socket");
+    let mut command = Command::new(&sandbox.svcd);
+    command.arg("shutdown");
+    sandbox.env(&mut command);
+
+    let timeout = Duration::from_secs(1);
     let started = Instant::now();
-    let error = sandbox
-        .stop_daemon()
-        .expect_err("a daemon that had to be killed is reported, not ignored");
+    let error = support::run_bounded(&mut command, timeout)
+        .expect_err("a request without a reply must be killed at the bound");
 
     assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "the wait must be bounded, took {:?}",
+        started.elapsed() < timeout * 3,
+        "the request wait must be bounded, took {:?}",
         started.elapsed()
     );
     assert!(
-        error.contains("did not stop") && error.contains("shutdown request:"),
-        "the error must name the failed request: {error}"
+        error.contains("did not exit within"),
+        "the error must name the bound: {error}"
     );
-    assert!(sandbox.daemon.is_none(), "the handle must be consumed");
 }
 
 /// The failure that started the hang: a panicking test drops its sandbox while

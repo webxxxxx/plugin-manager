@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -34,6 +34,8 @@ struct Sandbox {
     mcp: PathBuf,
     daemon: Option<Child>,
     daemon_stderr: PathBuf,
+    /// Overridable so the bounded-wait test does not spend the production bound.
+    stop_timeout: Duration,
 }
 
 impl Sandbox {
@@ -64,17 +66,7 @@ impl Sandbox {
         let svcd = root.join(names.0);
         let svc = root.join(names.1);
         let mcp = root.join(names.2);
-        for path in [&svcd, &svc, &mcp] {
-            // The multicall dispatch only reads argv[0]'s file name, so a link
-            // is enough on Unix. A copy that is exec'd right after it is written
-            // races its own close on slow filesystems (/mnt/d, DrvFs) and fails
-            // with ETXTBSY. Windows keeps the copy: creating symlinks needs a
-            // privilege there.
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(binary, path).expect("link multicall");
-            #[cfg(not(unix))]
-            fs::copy(binary, path).expect("copy multicall");
-        }
+        support::install_multicall(Path::new(binary), &[&svcd, &svc, &mcp]);
 
         let sandbox = Sandbox {
             daemon_stderr: root.join("daemon.stderr"),
@@ -86,6 +78,7 @@ impl Sandbox {
             svc,
             mcp,
             daemon: None,
+            stop_timeout: support::STOP_TIMEOUT,
         };
         sandbox.write_plugin();
         sandbox
@@ -314,13 +307,9 @@ done
         let mut command = Command::new(&self.svcd);
         command.arg("shutdown");
         self.env(&mut command);
-        support::stop_daemon(
-            &mut child,
-            &mut command,
-            support::STOP_TIMEOUT,
-            "the daemon",
-            || fs::read_to_string(&log).unwrap_or_default(),
-        )
+        support::stop_daemon(&mut child, &mut command, self.stop_timeout, || {
+            fs::read_to_string(&log).unwrap_or_default()
+        })
     }
 
     fn shutdown(&mut self) {
@@ -333,6 +322,8 @@ done
 #[test]
 fn stop_wait_is_bounded_when_the_request_cannot_reach_the_daemon() {
     let mut sandbox = Sandbox::new();
+    let timeout = Duration::from_secs(1);
+    sandbox.stop_timeout = timeout;
     sandbox.start_daemon();
     sandbox.wait_for_daemon();
     // The CLI can no longer resolve the control channel: the request fails the
@@ -340,14 +331,8 @@ fn stop_wait_is_bounded_when_the_request_cannot_reach_the_daemon() {
     let moved = sandbox.root.join("config-moved");
     fs::rename(&sandbox.config, &moved).expect("move the config directory");
 
-    let mut child = sandbox.daemon.take().expect("running daemon");
-    let log = sandbox.daemon_stderr.clone();
-    let mut command = Command::new(&sandbox.svcd);
-    command.arg("shutdown");
-    sandbox.env(&mut command);
-    support::assert_bounded_stop(&mut child, &mut command, Duration::from_secs(1), || {
-        fs::read_to_string(&log).unwrap_or_default()
-    });
+    support::assert_bounded_stop(|| sandbox.stop_daemon(), timeout);
+    assert!(sandbox.daemon.is_none(), "the handle must be consumed");
 }
 
 impl Drop for Sandbox {

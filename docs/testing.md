@@ -143,7 +143,7 @@ Windows 保留副本（建符号链接需要权限）。`tests/cli.rs` 对并发
 
 ### 异步等待与失败诊断
 
-- `tests/http.rs` 的 `wait_until` 在超时时会打印 daemon log 和调用方提供的诊断（例如 stalled socket 上已到达的响应）；新增等待 helper 必须走它，不要写裸 `sleep` + `panic!`。
+- `tests/http.rs` 的 `wait_until` 在超时时会打印 daemon log 和调用方提供的诊断（例如 stalled socket 上已到达的响应）；新增等待 helper 必须走它，不要写裸 `sleep` + `panic!`。跨 sandbox 共用的有界等待放在 `tests/support/mod.rs`（`wait_for_exit` / `run_bounded` / `stop_daemon`），它们同样在超时时带 daemon log；新增等待先看这两处有没有现成的。
 - 四个集成 sandbox 的停止等待共用 `tests/support/mod.rs`（`stop_daemon` / `run_bounded` / `wait_for_exit`）：shutdown 请求本身与等待 daemon 退出都受 `STOP_TIMEOUT`（默认 10 s）约束，超时 kill + reap，错误里带请求结果与 daemon log 尾部，不再用无上限的 `child.wait()`。它**返回错误**而不是 panic（`Drop` 用 `report_stop` 包装）：可能跑在 unwind 里，二次 panic 会 abort 并掩盖原始失败。
 - 不要在转瞬即逝的中间状态上做轮询断言（例如 staging 刚创建就因 `already installed` 被删除）；先让触发路径确定（加 `force=true`、补完 body），或直接断言最终的结束状态。
 
