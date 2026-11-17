@@ -14,7 +14,9 @@ use serde_json::{json, Value};
 
 use crate::channel;
 use crate::http;
+use crate::kernel::failure::{Class, Problem};
 use crate::package;
+use crate::rpc;
 use crate::server::http::{CancelToken, JobBudget, Request};
 
 /// The control-channel budget a face request carries.
@@ -96,8 +98,12 @@ pub fn rpc_result(
             (500, "internal", format!("svcd unreachable: {}", cause))
         }
     })?;
+    project_response(response)
+}
+
+fn project_response(response: rpc::Response) -> Result<Value, RpcFailure> {
     if let Some(error) = response.error {
-        let status = status_for_error(&error.message);
+        let status = status_for_rpc_error(&error);
         return Err((status, code_for(status), error.message));
     }
     response
@@ -137,6 +143,8 @@ pub fn require_plugin_result(
     }
 }
 
+/// Face-local config/install status mapping. S5c (#151) replaces this together
+/// with the package/settings APIs that still return `String`.
 pub fn config_error_status(message: &str) -> (u16, &'static str, String) {
     let lower = message.to_ascii_lowercase();
     let status = if lower.contains("unknown plugin") {
@@ -151,13 +159,18 @@ pub fn config_error_status(message: &str) -> (u16, &'static str, String) {
     (status, code_for(status), message.to_string())
 }
 
+/// Face-local legacy rendering for install/trust errors that still arrive as
+/// `String`. The control channel projects from `error.data` instead.
 pub fn map_error(message: &str) -> Vec<u8> {
     let (status, code, message) = map_error_status(message);
     error(status, code, &message)
 }
 
+/// Face-local legacy status mapping. New control-channel code must use
+/// [`status_for_rpc_error`]; this remains only until S5c (#151) types the
+/// source APIs.
 pub fn map_error_status(message: &str) -> (u16, &'static str, String) {
-    let status = status_for_error(message);
+    let status = status_for_legacy_message(message);
     (status, code_for(status), message.to_string())
 }
 
@@ -176,7 +189,54 @@ pub fn query_bool(query: &str, key: &str) -> Option<bool> {
     query_value(query, key).map(|value| value == "true" || value == "1")
 }
 
-fn status_for_error(message: &str) -> u16 {
+/// Read the structured category first. A missing or unrecognized category is
+/// `Internal`: the projection never falls back to parsing `message`, so an old
+/// or hand-written error cannot pick a status by accident.
+fn status_for_rpc_error(error: &rpc::Error) -> u16 {
+    let Some(data) = error.data.as_ref() else {
+        return 500;
+    };
+    if let Some(kind) = data.get("kind").and_then(Value::as_str) {
+        return Problem::from_str(kind)
+            .map(status_for_problem)
+            .unwrap_or(500);
+    }
+    if let Some(class) = data.get("class").and_then(Value::as_str) {
+        return Class::from_str(class).map(status_for_class).unwrap_or(500);
+    }
+    500
+}
+
+fn status_for_problem(problem: Problem) -> u16 {
+    match problem {
+        Problem::UnknownService
+        | Problem::UnknownPlugin
+        | Problem::UnknownStrategy
+        | Problem::CoreService => 404,
+        Problem::NotAPlugin | Problem::Conflict => 409,
+        Problem::Invalid | Problem::UnsupportedPlatform | Problem::MissingDependency => 400,
+        Problem::TooLarge => 413,
+        Problem::Timeout => 504,
+        Problem::Internal => 500,
+    }
+}
+
+/// No face route produces `data.class` today (only MCP tool errors do), but a
+/// future control client may. Keep the statuses the old matcher gave those
+/// details; `Busy` stays 500 (503 is reserved for the blocking queue).
+fn status_for_class(class: Class) -> u16 {
+    match class {
+        Class::FrameTooLarge => 413,
+        Class::Timeout => 504,
+        Class::MissingDependency => 400,
+        _ => 500,
+    }
+}
+
+/// Face-local install/import details still come from `String` APIs. The control
+/// channel no longer uses this; S5c (#151) replaces it together with the source
+/// APIs.
+fn status_for_legacy_message(message: &str) -> u16 {
     let lower = message.to_ascii_lowercase();
     if lower.contains("timed out") || lower.contains("timeout") {
         504
@@ -237,6 +297,79 @@ mod tests {
         assert_eq!(budget.deadline, Some(job.deadline));
         assert!(budget.cancel.is_some());
         assert!(!budget.cancel.unwrap().is_cancelled());
+    }
+
+    fn rpc_error(message: &str, data: Option<Value>) -> rpc::Error {
+        rpc::Error {
+            code: -32000,
+            message: message.into(),
+            data,
+        }
+    }
+
+    #[test]
+    fn the_control_projection_reads_the_wire_kind() {
+        let response = |data: Option<Value>| rpc::Response {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(1)),
+            result: None,
+            error: Some(rpc::Error {
+                code: -32003,
+                message: "start failed".into(),
+                data,
+            }),
+        };
+        let failure = project_response(response(Some(json!({"kind": "conflict"}))))
+            .expect_err("structured conflict");
+        assert_eq!(failure.0, 409);
+        assert_eq!(failure.1, "conflict");
+        assert_eq!(failure.2, "start failed");
+
+        let failure = project_response(response(None)).expect_err("missing data");
+        assert_eq!(failure.0, 500);
+    }
+
+    #[test]
+    fn structured_problem_kinds_project_without_reading_the_message() {
+        let cases = [
+            ("unknown_service", 404),
+            ("unknown_plugin", 404),
+            ("unknown_strategy", 404),
+            ("core_service", 404),
+            ("not_a_plugin", 409),
+            ("conflict", 409),
+            ("invalid", 400),
+            ("unsupported_platform", 400),
+            ("missing_dependency", 400),
+            ("too_large", 413),
+            ("timeout", 504),
+            ("internal", 500),
+        ];
+        for (kind, status) in cases {
+            let error = rpc_error("this message would project differently", Some(json!({"kind": kind})));
+            assert_eq!(status_for_rpc_error(&error), status, "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_structured_kind_wins_over_a_misleading_message() {
+        let error = rpc_error("unknown service: demo", Some(json!({"kind": "internal"})));
+        assert_eq!(status_for_rpc_error(&error), 500);
+    }
+
+    #[test]
+    fn class_data_and_missing_data_have_a_safe_projection() {
+        let class = |name: &str| rpc_error("ignored", Some(json!({"class": name})));
+        assert_eq!(status_for_rpc_error(&class("frame_too_large")), 413);
+        assert_eq!(status_for_rpc_error(&class("timeout")), 504);
+        assert_eq!(status_for_rpc_error(&class("missing_dependency")), 400);
+        assert_eq!(status_for_rpc_error(&class("busy")), 500);
+
+        assert_eq!(status_for_rpc_error(&rpc_error("unknown service: demo", None)), 500);
+        assert_eq!(
+            status_for_rpc_error(&rpc_error("ignored", Some(json!({"kind": "no_such_kind"})))),
+            500
+        );
     }
 
     /// The install/import helpers call this exact function with the stream

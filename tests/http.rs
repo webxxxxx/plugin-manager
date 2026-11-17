@@ -3797,6 +3797,39 @@ fn unsigned_install_requires_the_conf_switch() {
 }
 
 #[test]
+fn installing_a_package_for_another_platform_is_400() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[31u8; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let (mut manifest, files) = plugin_parts("other", "1.0.0", None, false);
+    manifest["platform"] = json!("other-triple");
+    let package = signed_package(&key, manifest, &files);
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let installed = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(installed.status, 400, "{}", installed.body);
+    assert!(
+        installed.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("platform"),
+        "{}",
+        installed.body
+    );
+}
+
+#[test]
 fn unsigned_install_is_accepted_when_the_conf_switch_is_on() {
     let mut sandbox = Sandbox::new();
     let package = unsigned_plugin_bundle("demo");

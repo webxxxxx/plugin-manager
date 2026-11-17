@@ -211,6 +211,13 @@ impl Problem {
         Problem::Internal,
     ];
 
+    /// 从稳定名字反查类别；只给协议/投影解析用，不用来从 `detail` 猜类别。
+    pub fn from_str(name: &str) -> Option<Problem> {
+        Problem::ALL
+            .into_iter()
+            .find(|problem| problem.as_str() == name)
+    }
+
     /// 稳定的名字：控制通道 `error.data.kind` 与投影读它。改名字等于改契约。
     pub fn as_str(self) -> &'static str {
         match self {
@@ -364,6 +371,14 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), total, "two problems share a name");
+    }
+
+    #[test]
+    fn every_problem_round_trips_through_its_stable_name() {
+        for problem in Problem::ALL {
+            assert_eq!(Problem::from_str(problem.as_str()), Some(problem));
+        }
+        assert_eq!(Problem::from_str("no_such_problem"), None);
     }
 
     #[test]

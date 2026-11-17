@@ -2493,17 +2493,17 @@ fn status_detail(output: &str, status: Option<std::process::ExitStatus>) -> Stri
 ///
 /// The daemon's management methods carry [`ProblemError`], but those modules
 /// still return `String`. This maps a detail to the [`Problem`] whose HTTP
-/// status today's `face::support::status_for_error` would pick, so the wire
-/// status cannot drift — with one deliberate correction: platform reasons are
-/// checked before the generic `unknown` because the Linux host triple
+/// status the face's legacy matcher gives a face-local `String` error, so the
+/// wire status cannot drift — with one deliberate correction: platform reasons
+/// are checked before the generic `unknown` because the Linux host triple
 /// (`x86_64-unknown-linux-gnu`) contains that word; the old matcher turned a
 /// platform mismatch into 404, the kind turns it into `UnsupportedPlatform`
-/// (400 once S5b reads the kind).
+/// (400).
 ///
 /// It is deliberately *not* a `From<String>`: a new text cannot silently become
 /// a non-`Internal` category, and each call site still chooses to use this
-/// helper. S5b deletes the face copy; this helper remains only until the
-/// plugin/package APIs return typed errors.
+/// helper. S5b removes the control-path use; this helper remains only until the
+/// plugin/package APIs return typed errors (S5c, #151).
 fn problem_for_legacy_detail(detail: impl Into<String>) -> ProblemError {
     let detail = detail.into();
     let lower = detail.to_ascii_lowercase();
