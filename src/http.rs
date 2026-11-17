@@ -569,6 +569,20 @@ pub fn same_origin(headers: &[(String, String)]) -> bool {
 }
 
 /// The `{"error":{"code","message"}}` envelope every non-MCP HTTP error uses.
+/// The stable error code a bare status maps to, for the drivers that render a
+/// refusal before any face sees the request.
+pub(crate) fn code_for(status: u16) -> &'static str {
+    match status {
+        400 => "bad_request",
+        403 => "forbidden",
+        404 => "not_found",
+        409 => "conflict",
+        413 => "payload_too_large",
+        504 => "timeout",
+        _ => "internal",
+    }
+}
+
 pub fn json_error(status: u16, code: &str, message: &str) -> Vec<u8> {
     let body = json!({ "error": { "code": code, "message": message } });
     response(
