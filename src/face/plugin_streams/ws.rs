@@ -13,15 +13,15 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::channel;
-use crate::rpc;
+use crate::wire::control::channel;
+use crate::wire::message::rpc;
 use crate::server::http::wire;
 use crate::server::http::{
     BlockingJob, BlockingOutcome, CloseReason, OutBuffer, StreamAction, StreamEvent, StreamHandler,
     StreamStep,
 };
-use crate::uichannel::{Event, Subscription};
-use crate::webui;
+use crate::face::uichannel::{Event, Subscription};
+use crate::face::webui as webui;
 
 use super::frame::PendingFrame;
 
@@ -55,7 +55,7 @@ pub(crate) struct WsStream {
     /// Counters for the operator log when the transport closes.
     bytes_read: u64,
     frames_read: u64,
-    limits: std::sync::Arc<crate::limits::Limits>,
+    limits: std::sync::Arc<crate::platform::limits::Limits>,
 }
 
 impl WsStream {
@@ -65,7 +65,7 @@ impl WsStream {
         accept: String,
         receiver: Receiver<Event>,
         subscription: Subscription,
-        limits: std::sync::Arc<crate::limits::Limits>,
+        limits: std::sync::Arc<crate::platform::limits::Limits>,
     ) -> WsStream {
         let head = format!(
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
@@ -441,7 +441,7 @@ impl WsStream {
         if matches!(reason, CloseReason::Completed | CloseReason::PeerClosed) {
             return;
         }
-        crate::log::svcd(&format!(
+        crate::platform::log::svcd(&format!(
             "svcd: plugin ui ws closed: plugin={} reason={:?} bytes={} frames={}",
             self.plugin, reason, self.bytes_read, self.frames_read
         ));
@@ -479,12 +479,12 @@ impl StreamHandler for WsStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::uichannel::EventBus;
+    use crate::face::uichannel::EventBus;
     use serde_json::json;
     use std::sync::Arc;
 
-    fn test_limits() -> Arc<crate::limits::Limits> {
-        Arc::new(crate::limits::test_default())
+    fn test_limits() -> Arc<crate::platform::limits::Limits> {
+        Arc::new(crate::platform::limits::test_default())
     }
 
     fn harness() -> (Arc<EventBus>, WsStream) {

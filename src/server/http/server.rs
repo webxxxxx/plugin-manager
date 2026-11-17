@@ -19,10 +19,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use crate::channel::PendingCall;
-use crate::http;
-use crate::lan::Lan;
-use crate::log;
+use crate::wire::control::channel::PendingCall;
+use crate::server::http::model as http;
+use crate::server::auth::lan::Lan;
+use crate::platform::log;
 use crate::server::control::client::StreamingClient;
 use crate::server::control::handle::LoopHandle;
 use crate::server::control::listener::{ControlServer, Source};
@@ -40,7 +40,7 @@ use crate::server::http::{
 };
 use crate::server::mcp::progress::{McpSseStream, PROGRESS_QUEUE_SLOTS};
 use crate::server::mcp::transport;
-use crate::wake::Wake;
+use crate::platform::host::wake::Wake;
 
 use crate::server::http::hooks::{FallbackHandler, PreBodyRoutes};
 
@@ -76,8 +76,8 @@ pub(crate) fn start(
     pending: mpsc::SyncSender<PendingCall>,
     wake: Arc<Wake>,
     lan: Arc<Mutex<Lan>>,
-    config: Arc<crate::config::Config>,
-    raw_hub: Arc<crate::rawhub::RawHub>,
+    config: Arc<crate::platform::config::Config>,
+    raw_hub: Arc<crate::wire::contract::rawhub::RawHub>,
     face: Arc<dyn Face>,
     routes: Arc<dyn PreBodyRoutes>,
     fallback: FallbackHandler,
@@ -106,7 +106,7 @@ pub(crate) fn start(
         BlockingPool::start(
             config.limits.blocking_threads,
             crate::server::http::pool::QUEUE_LIMIT,
-            crate::threads::transfer_stack(&config.limits),
+            crate::platform::host::threads::transfer_stack(&config.limits),
             move |key, outcome| {
                 let _ = results.send(WorkResult::BlockingDone { key, outcome });
                 let _ = (&notify).write(&[1]);
@@ -117,7 +117,7 @@ pub(crate) fn start(
     let loop_limits = config.limits.clone();
     let join = thread::Builder::new()
         .name("svcd-server-loop".into())
-        .stack_size(crate::threads::transfer_stack(&loop_limits))
+        .stack_size(crate::platform::host::threads::transfer_stack(&loop_limits))
         .spawn(move || {
             let mut server = Server {
                 lan,
@@ -166,8 +166,8 @@ enum ExtraSource {
 
 struct Server {
     lan: Arc<Mutex<Lan>>,
-    config: Arc<crate::config::Config>,
-    raw_hub: Arc<crate::rawhub::RawHub>,
+    config: Arc<crate::platform::config::Config>,
+    raw_hub: Arc<crate::wire::contract::rawhub::RawHub>,
     control: ControlServer,
     client: StreamingClient,
     extra_keys: Vec<ExtraSource>,
@@ -830,7 +830,7 @@ fn attach_stream(
     handler: Box<dyn StreamHandler>,
     initial: &[u8],
     reserved: Option<StreamPermit>,
-    limits: &std::sync::Arc<crate::limits::Limits>,
+    limits: &std::sync::Arc<crate::platform::limits::Limits>,
 ) {
     connection.keep_alive = false;
     let mut driver = match reserved {

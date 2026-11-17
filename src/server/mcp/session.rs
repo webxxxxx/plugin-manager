@@ -8,7 +8,7 @@
 
 use serde_json::{json, Value};
 
-use crate::rpc;
+use crate::wire::message::rpc;
 
 /// The modern MCP protocol revision this daemon speaks.
 pub const MODERN_VERSION: &str = "2026-07-28";

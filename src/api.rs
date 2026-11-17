@@ -21,27 +21,27 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::blob;
-use crate::channel;
-use crate::config::Config;
+use crate::platform::storage::blob;
+use crate::wire::control::channel;
+use crate::platform::config::Config;
 use crate::face::blob_routes;
 use crate::face::plugin_ui::{ui_path, UiPath};
 use crate::face::support::{decode, error};
-use crate::http;
-use crate::lan::{self, AuthKind, Lan, LanStatus};
-use crate::log;
-use crate::package;
-use crate::paths::Paths;
-use crate::plugin;
-use crate::rpc;
+use crate::server::http::model as http;
+use crate::server::auth::lan::{self, AuthKind, Lan, LanStatus};
+use crate::platform::log;
+use crate::manage::package;
+use crate::platform::paths::Paths;
+use crate::manage::plugin;
+use crate::wire::message::rpc;
 use crate::server::http::engine::HttpRequest;
 use crate::server::http::engine::{keep_alive_response, wants_keep_alive, wants_keep_alive_head};
 use crate::server::http::threads::{
     client_gone, drive_fallback, read_body, read_head, write_http, HeadFailure,
 };
 use crate::server::mcp::transport;
-use crate::threads;
-use crate::webui;
+use crate::platform::host::threads;
+use crate::face::webui as webui;
 
 pub struct Api {
     lan: Arc<Mutex<Lan>>,
@@ -67,8 +67,8 @@ fn resolve_bind(env: Option<&str>, configured: Option<SocketAddr>) -> SocketAddr
 /// `server::http::entry`, not here.
 pub fn spawn(
     config: Arc<Config>,
-    raw_hub: Arc<crate::rawhub::RawHub>,
-    control: crate::channel::ControlBinding,
+    raw_hub: Arc<crate::wire::contract::rawhub::RawHub>,
+    control: crate::wire::control::channel::ControlBinding,
 ) -> std::io::Result<Arc<Api>> {
     let configured = config.settings.bind;
     let requested = resolve_bind(std::env::var("SVCD_BIND").ok().as_deref(), configured);
@@ -243,7 +243,7 @@ impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
         head: &http::Head,
         peer: IpAddr,
         lan: &Arc<Mutex<Lan>>,
-        raw_hub: Arc<crate::rawhub::RawHub>,
+        raw_hub: Arc<crate::wire::contract::rawhub::RawHub>,
     ) -> Option<Result<crate::server::http::Exchange, Vec<u8>>> {
         crate::face::plugin_ui::PluginUiFace::route_for(&head.method, &head.path)?;
         Some(crate::face::plugin_ui::PluginUiFace::exchange(
@@ -341,7 +341,7 @@ fn serve_blob_upload(
     initial: &[u8],
     lan: &Arc<Mutex<Lan>>,
     paths: Arc<Paths>,
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
 ) {
     use crate::server::http::Exchange;
 
@@ -571,7 +571,7 @@ fn serve_mcp_sse(
     call: transport::StreamingCall,
     config: &Path,
     head_only: bool,
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
 ) -> std::io::Result<()> {
     // The Windows fallback has no stream driver, but the long-lived budget is
     // still server policy: reserve it before the head and before the plugin
@@ -690,7 +690,7 @@ fn respond(config: &Config, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec
             Err(_) => return error(500, "internal", "auth state unavailable"),
         };
         return transport::handle(
-            &|request| crate::mcp::serve_modern(&config.paths.config_dir, request),
+            &|request| crate::face::mcp::serve_modern(&config.paths.config_dir, request),
             &transport::Request {
                 method: &request.method,
                 headers: &request.headers,
@@ -907,7 +907,7 @@ fn request_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
 /// its policy in `Face::route` and never touches the HTTP engine.
 pub(crate) fn server_body_policy(
     head: &http::Head,
-    limits: &crate::limits::Limits,
+    limits: &crate::platform::limits::Limits,
 ) -> crate::server::http::BodyPolicy {
     use crate::server::http::BodyPolicy;
 
@@ -1013,7 +1013,7 @@ mod tests {
             nanos
         ));
         let config = Arc::new(Config::with_paths(
-            crate::settings::Settings::default(),
+            crate::platform::settings::Settings::default(),
             None,
             Paths::under(&root),
         ));

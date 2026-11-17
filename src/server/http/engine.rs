@@ -14,7 +14,7 @@ use std::net::{IpAddr, TcpListener, TcpStream};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
-use crate::http;
+use crate::server::http::model as http;
 
 #[cfg(unix)]
 use crate::server::http::contract::BodyPolicy;
@@ -204,7 +204,7 @@ pub trait ServerLoop {
 }
 
 #[cfg(unix)]
-pub fn run<S, H>(listener: Option<TcpListener>, handler: &mut H, limits: &crate::limits::Limits)
+pub fn run<S, H>(listener: Option<TcpListener>, handler: &mut H, limits: &crate::platform::limits::Limits)
 where
     H: ServerLoop<State = S>,
 {
@@ -286,7 +286,7 @@ where
         if ready < 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() != std::io::ErrorKind::Interrupted {
-                crate::log::svcd(&format!("svcd: server loop poll failed: {}", error));
+                crate::platform::log::svcd(&format!("svcd: server loop poll failed: {}", error));
             }
             continue;
         }
@@ -329,7 +329,7 @@ where
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(error) => {
-                            crate::log::svcd(&format!(
+                            crate::platform::log::svcd(&format!(
                                 "svcd: server loop accept failed: {}",
                                 error
                             ));
@@ -441,7 +441,7 @@ pub fn advance_request<S>(
         connection.head_only = false;
         let Some(header_end) = http::header_end(&connection.buffer) else {
             if connection.buffer.len() > max_header {
-                return Err(crate::http::json_error(
+                return Err(crate::server::http::model::json_error(
                     400,
                     "bad_request",
                     "request headers are too large",
@@ -450,7 +450,7 @@ pub fn advance_request<S>(
             return Ok(None);
         };
         if header_end > max_header {
-            return Err(crate::http::json_error(
+            return Err(crate::server::http::model::json_error(
                 400,
                 "bad_request",
                 "request headers are too large",
@@ -458,15 +458,15 @@ pub fn advance_request<S>(
         }
         let Some((head, body_start)) = http::parse_head(&connection.buffer[..header_end + 4])
         else {
-            return Err(crate::http::json_error(
+            return Err(crate::server::http::model::json_error(
                 400,
                 "bad_request",
                 "malformed request line",
             ));
         };
-        connection.head_only = crate::http::is_head(&head.method);
+        connection.head_only = crate::server::http::model::is_head(&head.method);
         let framing = http::framing(&head.headers)
-            .map_err(|message| crate::http::json_error(400, "bad_request", &message))?;
+            .map_err(|message| crate::server::http::model::json_error(400, "bad_request", &message))?;
         // Route and authenticate before the body. While the body is still
         // arriving `pending` stays Some, so this callback runs exactly once per
         // request and the face never sees a different route for the same head.
@@ -503,7 +503,7 @@ pub fn advance_request<S>(
         };
         let limit = body.limit();
         if !body.accepts(framing) {
-            return Err(crate::http::json_error(
+            return Err(crate::server::http::model::json_error(
                 413,
                 "payload_too_large",
                 "request body is too large",
@@ -555,9 +555,9 @@ pub fn advance_request<S>(
                         Ok(())
                     })
                     .map_err(|error| {
-                        crate::http::json_error(
+                        crate::server::http::model::json_error(
                             error.status(),
-                            crate::http::code_for(error.status()),
+                            crate::server::http::model::code_for(error.status()),
                             error.detail(),
                         )
                     })?;
@@ -622,7 +622,7 @@ pub fn keep_alive_response(mut response: Vec<u8>) -> Vec<u8> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    const M: usize = crate::limits::MAX_HEADER;
+    const M: usize = crate::platform::limits::MAX_HEADER;
 
     use super::*;
 

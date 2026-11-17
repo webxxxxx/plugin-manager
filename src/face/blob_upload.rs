@@ -10,12 +10,12 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::json;
 
-use crate::blob;
-use crate::http;
-use crate::paths::Paths;
+use crate::platform::storage::blob;
+use crate::server::http::model as http;
+use crate::platform::paths::Paths;
 
 use super::support;
-use crate::lan::{AuthKind, Lan};
+use crate::server::auth::lan::{AuthKind, Lan};
 use crate::server::http::{
     BlockingOutcome, CloseReason, Exchange, OutBuffer, StreamAction, StreamClass, StreamEvent,
     StreamHandler, StreamStep,
@@ -859,7 +859,7 @@ mod tests {
         assert!(text.contains("ETag: \"sha256:"), "{text}");
         let id = blob_id(&response);
         let mut content = Vec::new();
-        crate::blob::path(test_paths(), &id)
+        crate::platform::storage::blob::path(test_paths(), &id)
             .and_then(|path| {
                 std::fs::File::open(path).map_err(|error| blob::Error::internal(error.to_string()))
             })
@@ -881,7 +881,7 @@ mod tests {
         assert_eq!(reason, CloseReason::Completed);
         let id = blob_id(&response);
         let mut content = Vec::new();
-        let path = crate::blob::path(test_paths(), &id).expect("blob path");
+        let path = crate::platform::storage::blob::path(test_paths(), &id).expect("blob path");
         std::fs::File::open(path)
             .and_then(|mut file| file.read_to_end(&mut content))
             .expect("read staged blob");
@@ -906,7 +906,7 @@ mod tests {
         assert_eq!(reason, CloseReason::Completed);
         let id = blob_id(&response);
         let mut content = Vec::new();
-        let path = crate::blob::path(test_paths(), &id).expect("blob path");
+        let path = crate::platform::storage::blob::path(test_paths(), &id).expect("blob path");
         std::fs::File::open(path)
             .and_then(|mut file| file.read_to_end(&mut content))
             .expect("read staged blob");
@@ -916,7 +916,7 @@ mod tests {
     #[test]
     fn a_resumable_part_can_be_reuploaded() {
         let upload =
-            crate::blob::create_upload(test_paths(), blob::UploadKind::Blob).expect("upload");
+            crate::platform::storage::blob::create_upload(test_paths(), blob::UploadKind::Blob).expect("upload");
         let path = format!("/api/v1/blobs/uploads/{}/parts/1", upload);
         let head = parse_head(
             format!(
@@ -943,11 +943,11 @@ mod tests {
         assert!(String::from_utf8_lossy(&second).starts_with("HTTP/1.1 200 OK"));
 
         let parts =
-            crate::blob::upload_parts(test_paths(), &upload, blob::UploadKind::Blob).expect("parts");
+            crate::platform::storage::blob::upload_parts(test_paths(), &upload, blob::UploadKind::Blob).expect("parts");
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].size, 6);
-        let meta = crate::blob::complete_upload(test_paths(), &upload, None).expect("complete");
-        let path = crate::blob::path(test_paths(), &meta.id).expect("path");
+        let meta = crate::platform::storage::blob::complete_upload(test_paths(), &upload, None).expect("complete");
+        let path = crate::platform::storage::blob::path(test_paths(), &meta.id).expect("path");
         let content = std::fs::read(path).expect("read");
         assert_eq!(content, b"second");
     }

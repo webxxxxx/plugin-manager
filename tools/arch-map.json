@@ -2,78 +2,344 @@
   "//": "当前 src/*.rs 到目标架构的映射。对应 docs/architecture.md §5 目录与 §11 文件落点。文件搬家时同步改这里，否则基线会失真。",
   "//layers": "rank 越大越靠上；调用者的 rank 必须 >= 被调用者，反向即违规。",
   "layers": [
-    { "name": "platform", "rank": 0 },
-    { "name": "wire", "rank": 1 },
-    { "name": "kernel", "rank": 2 },
-    { "name": "domain", "rank": 3 },
-    { "name": "server", "rank": 4 },
-    { "name": "face", "rank": 5 },
-    { "name": "cli", "rank": 5 },
-    { "name": "compose", "rank": 6 }
+    {
+      "name": "platform",
+      "rank": 0
+    },
+    {
+      "name": "wire",
+      "rank": 1
+    },
+    {
+      "name": "kernel",
+      "rank": 2
+    },
+    {
+      "name": "domain",
+      "rank": 3
+    },
+    {
+      "name": "server",
+      "rank": 4
+    },
+    {
+      "name": "face",
+      "rank": 5
+    },
+    {
+      "name": "cli",
+      "rank": 5
+    },
+    {
+      "name": "compose",
+      "rank": 6
+    }
   ],
-  "suffixErrors": ["_http", "_handler", "_manager", "utils"],
-  "suffixWarnings": ["_reactor", "_client", "_server"],
+  "suffixErrors": [
+    "_http",
+    "_handler",
+    "_manager",
+    "utils"
+  ],
+  "suffixWarnings": [
+    "_reactor",
+    "_client",
+    "_server"
+  ],
   "modules": {
-    "paths": { "concept": "platform/paths", "layer": "platform" },
-    "log": { "concept": "platform/log", "layer": "platform" },
-    "settings": { "concept": "platform/config", "layer": "platform" },
-    "limits": { "concept": "platform/config", "layer": "platform" },
-    "config": { "concept": "platform/config", "layer": "platform", "note": "S7：运行配置 Config 在组合根派生一次（ADR-0019）；只依赖 settings/limits/paths 与 std" },
-    "clock": { "concept": "platform/clock", "layer": "platform", "note": "S8（#160）：时刻成对 Now + Clock，只在组合根构造一次（ADR-0020）；只依赖 std" },
-    "threads": { "concept": "platform/host", "layer": "platform" },
-    "wake": { "concept": "platform/host", "layer": "platform" },
-    "zerocopy": { "concept": "platform/host", "layer": "platform" },
-    "compat": { "concept": "platform/compat", "layer": "platform" },
-    "platform": { "concept": "platform", "layer": "platform", "note": "src/platform/：宿主能力（特权判定、target triple）；#137 起承接从域层搬出的 OS 事实" },
-
-    "kernel": { "concept": "kernel", "layer": "kernel", "note": "src/kernel/：契约、失败类别、conformance（#102 新建）" },
-    "auth": { "concept": "platform/auth", "layer": "platform" },
-
-    "ipc": { "concept": "wire/message", "layer": "wire" },
-    "rpc": { "concept": "wire/message", "layer": "wire" },
-    "reactor": { "concept": "wire/contract", "layer": "wire" },
-    "stdio": { "concept": "wire/contract/stdio", "layer": "wire", "note": "S6b（#142）：子进程 stdio 的接入 seam（`Plan` / `Target`）；宿主实现只在 `stdio/platform/{unix,windows}.rs`" },
-    "rawhub": { "concept": "wire/contract", "layer": "wire" },
-    "channel": { "concept": "wire/control", "layer": "wire", "note": "客户端轮次与端点分档（svcd / svcd-admin）在 channel.rs；平台实现收在 channel/platform/{unix,windows}.rs，channel.rs 无平台 cfg（#143 建 seam，#144 拆两端点、删 token）" },
-
-    "package": { "concept": "manage/format", "layer": "domain" },
-    "bundle": { "concept": "manage/ops", "layer": "domain" },
-    "trust": { "concept": "manage/check", "layer": "domain" },
-    "interpreter": { "concept": "manage/check", "layer": "domain" },
-    "plugin": { "concept": "manage/layout", "layer": "domain", "note": "布局+扫描+能力声明混在一起" },
-    "transfer": { "concept": "manage/ops", "layer": "domain", "note": "导入语义，现横跨四个模块" },
-
-    "registry": { "concept": "supervise/registry", "layer": "domain", "note": "目标在 kernel/registry" },
-    "definition": { "concept": "supervise/definition", "layer": "domain" },
-    "supervisor": { "concept": "supervise/state", "layer": "domain" },
-    "slot": { "concept": "supervise/slot", "layer": "domain", "note": "还含契约调用与 raw 注册" },
-    "runtime": { "concept": "supervise/record", "layer": "domain" },
-    "hook": { "concept": "supervise/hook", "layer": "domain" },
-    "script": { "concept": "supervise/hook", "layer": "domain" },
-
-    "blob": { "concept": "storage", "layer": "domain", "note": "目标在 platform/storage" },
-
-    "builtin_adapter": { "concept": "supervise/builtin", "layer": "domain" },
-    "install": { "concept": "selfinstall/execute", "layer": "domain" },
-    "service_win": { "concept": "selfinstall/service_win", "layer": "domain" },
-
-    "http": { "concept": "server/http/model", "layer": "server" },
-    "lan": { "concept": "server/auth", "layer": "server" },
-    "server": { "concept": "server/request", "layer": "server", "note": "S4 请求交接契约（#113）+ HTTP server-loop（#114）+ stream driver（#115）+ WebSocket 帧（#122）" },
-
-    "api": { "concept": "compose", "layer": "compose", "note": "组合根 + Windows 回退；Unix server loop 在 server/http/server.rs。管理 helper 已下沉到 face/support.rs（#131）" },
-    "face": { "concept": "face/api", "layer": "face", "note": "#113 起承载已迁移的 /api/v1 端点；install/import 在 face/install.rs（#121）；控制通道/错误映射 helper 在 face/support.rs（#131）" },
-    "mcp": { "concept": "face/mcp_tools", "layer": "face" },
-    "catalog": { "concept": "face/mcp_tools", "layer": "face" },
-    "webui": { "concept": "face/plugin_ui", "layer": "face" },
-    "uichannel": { "concept": "face/plugin_ui", "layer": "face", "note": "事件总线、replay 与握手；SSE/WS transport 已迁到 face/plugin_streams" },
-    "test_support": { "concept": "test_support", "layer": "platform", "note": "仅测试编译的临时根 helper；除 std 外无依赖，按最低层计" },
-
-    "svc": { "concept": "cli/svc", "layer": "cli" },
-    "plugin_cli": { "concept": "cli/plugin", "layer": "cli" },
-    "status": { "concept": "cli/status", "layer": "cli" },
-
-    "main": { "concept": "compose", "layer": "compose" },
-    "daemon": { "concept": "compose", "layer": "compose" }
+    "paths": {
+      "concept": "platform/paths",
+      "layer": "platform"
+    },
+    "log": {
+      "concept": "platform/log",
+      "layer": "platform"
+    },
+    "settings": {
+      "concept": "platform/config",
+      "layer": "platform"
+    },
+    "limits": {
+      "concept": "platform/config",
+      "layer": "platform"
+    },
+    "config": {
+      "concept": "platform/config",
+      "layer": "platform",
+      "note": "S7：运行配置 Config 在组合根派生一次（ADR-0019）；只依赖 settings/limits/paths 与 std"
+    },
+    "clock": {
+      "concept": "platform/clock",
+      "layer": "platform",
+      "note": "S8（#160）：时刻成对 Now + Clock，只在组合根构造一次（ADR-0020）；只依赖 std"
+    },
+    "threads": {
+      "concept": "platform/host",
+      "layer": "platform"
+    },
+    "wake": {
+      "concept": "platform/host",
+      "layer": "platform"
+    },
+    "zerocopy": {
+      "concept": "platform/host",
+      "layer": "platform"
+    },
+    "compat": {
+      "concept": "platform/compat",
+      "layer": "platform"
+    },
+    "platform": {
+      "concept": "platform",
+      "layer": "platform",
+      "note": "src/platform/：宿主能力（特权判定、target triple）；#137 起承接从域层搬出的 OS 事实"
+    },
+    "kernel": {
+      "concept": "kernel",
+      "layer": "kernel",
+      "note": "src/kernel/：契约、失败类别、conformance（#102 新建）"
+    },
+    "auth": {
+      "concept": "platform/auth",
+      "layer": "platform"
+    },
+    "ipc": {
+      "concept": "wire/message",
+      "layer": "wire"
+    },
+    "rpc": {
+      "concept": "wire/message",
+      "layer": "wire"
+    },
+    "reactor": {
+      "concept": "wire/contract",
+      "layer": "wire"
+    },
+    "stdio": {
+      "concept": "wire/contract/stdio",
+      "layer": "wire",
+      "note": "S6b（#142）：子进程 stdio 的接入 seam（`Plan` / `Target`）；宿主实现只在 `stdio/platform/{unix,windows}.rs`"
+    },
+    "rawhub": {
+      "concept": "wire/contract",
+      "layer": "wire"
+    },
+    "channel": {
+      "concept": "wire/control",
+      "layer": "wire",
+      "note": "客户端轮次与端点分档（svcd / svcd-admin）在 channel.rs；平台实现收在 channel/platform/{unix,windows}.rs，channel.rs 无平台 cfg（#143 建 seam，#144 拆两端点、删 token）"
+    },
+    "package": {
+      "concept": "manage/format",
+      "layer": "domain"
+    },
+    "bundle": {
+      "concept": "manage/ops",
+      "layer": "domain"
+    },
+    "trust": {
+      "concept": "manage/check",
+      "layer": "domain"
+    },
+    "interpreter": {
+      "concept": "manage/check",
+      "layer": "domain"
+    },
+    "plugin": {
+      "concept": "manage/layout",
+      "layer": "domain",
+      "note": "布局+扫描+能力声明混在一起"
+    },
+    "transfer": {
+      "concept": "manage/ops",
+      "layer": "domain",
+      "note": "导入语义，现横跨四个模块"
+    },
+    "registry": {
+      "concept": "supervise/registry",
+      "layer": "domain",
+      "note": "目标在 kernel/registry"
+    },
+    "definition": {
+      "concept": "supervise/definition",
+      "layer": "domain"
+    },
+    "supervisor": {
+      "concept": "supervise/state",
+      "layer": "domain"
+    },
+    "slot": {
+      "concept": "supervise/slot",
+      "layer": "domain",
+      "note": "还含契约调用与 raw 注册"
+    },
+    "runtime": {
+      "concept": "supervise/record",
+      "layer": "domain"
+    },
+    "hook": {
+      "concept": "supervise/hook",
+      "layer": "domain"
+    },
+    "script": {
+      "concept": "supervise/hook",
+      "layer": "domain"
+    },
+    "blob": {
+      "concept": "storage",
+      "layer": "domain",
+      "note": "目标在 platform/storage"
+    },
+    "builtin_adapter": {
+      "concept": "supervise/builtin",
+      "layer": "domain"
+    },
+    "install": {
+      "concept": "selfinstall/execute",
+      "layer": "domain"
+    },
+    "service_win": {
+      "concept": "selfinstall/service_win",
+      "layer": "domain"
+    },
+    "http": {
+      "concept": "server/http/model",
+      "layer": "server"
+    },
+    "lan": {
+      "concept": "server/auth",
+      "layer": "server"
+    },
+    "server": {
+      "concept": "server/request",
+      "layer": "server",
+      "note": "S4 请求交接契约（#113）+ HTTP server-loop（#114）+ stream driver（#115）+ WebSocket 帧（#122）"
+    },
+    "api": {
+      "concept": "compose",
+      "layer": "compose",
+      "note": "组合根 + Windows 回退；Unix server loop 在 server/http/server.rs。管理 helper 已下沉到 face/support.rs（#131）"
+    },
+    "face": {
+      "concept": "face/api",
+      "layer": "face",
+      "note": "#113 起承载已迁移的 /api/v1 端点；install/import 在 face/install.rs（#121）；控制通道/错误映射 helper 在 face/support.rs（#131）"
+    },
+    "mcp": {
+      "concept": "face/mcp_tools",
+      "layer": "face"
+    },
+    "catalog": {
+      "concept": "face/mcp_tools",
+      "layer": "face"
+    },
+    "webui": {
+      "concept": "face/plugin_ui",
+      "layer": "face"
+    },
+    "uichannel": {
+      "concept": "face/plugin_ui",
+      "layer": "face",
+      "note": "事件总线、replay 与握手；SSE/WS transport 已迁到 face/plugin_streams"
+    },
+    "test_support": {
+      "concept": "test_support",
+      "layer": "platform",
+      "note": "仅测试编译的临时根 helper；除 std 外无依赖，按最低层计"
+    },
+    "svc": {
+      "concept": "cli/svc",
+      "layer": "cli"
+    },
+    "plugin_cli": {
+      "concept": "cli/plugin",
+      "layer": "cli"
+    },
+    "status": {
+      "concept": "cli/status",
+      "layer": "cli"
+    },
+    "main": {
+      "concept": "compose",
+      "layer": "compose"
+    },
+    "daemon": {
+      "concept": "compose",
+      "layer": "compose"
+    },
+    "wire": {
+      "concept": "wire",
+      "layer": "wire"
+    },
+    "manage": {
+      "concept": "manage",
+      "layer": "domain"
+    },
+    "supervise": {
+      "concept": "supervise",
+      "layer": "domain"
+    },
+    "selfinstall": {
+      "concept": "selfinstall",
+      "layer": "domain"
+    },
+    "cli": {
+      "concept": "cli",
+      "layer": "cli"
+    }
+  },
+  "//files": "path → 逻辑模块键（键必须是 modules 里的键）；dep-lint 用 files 取身份，没列出的文件按路径第一段。这样搬家不改变模块图，文件级层方向检查得以保留。",
+  "files": {
+    "src/platform/paths.rs": "paths",
+    "src/platform/log.rs": "log",
+    "src/platform/settings.rs": "settings",
+    "src/platform/limits.rs": "limits",
+    "src/platform/config.rs": "config",
+    "src/platform/compat.rs": "compat",
+    "src/platform/clock.rs": "clock",
+    "src/platform/auth.rs": "auth",
+    "src/platform/host/threads.rs": "threads",
+    "src/platform/host/wake.rs": "wake",
+    "src/platform/host/zerocopy.rs": "zerocopy",
+    "src/platform/storage/blob.rs": "blob",
+    "src/wire/message/ipc.rs": "ipc",
+    "src/wire/message/rpc.rs": "rpc",
+    "src/wire/contract/rawhub.rs": "rawhub",
+    "src/wire/contract/reactor.rs": "reactor",
+    "src/wire/contract/stdio.rs": "stdio",
+    "src/wire/contract/stdio/mod.rs": "stdio",
+    "src/wire/contract/stdio/platform.rs": "stdio",
+    "src/wire/contract/stdio/platform/unix.rs": "stdio",
+    "src/wire/contract/stdio/platform/windows.rs": "stdio",
+    "src/wire/control/channel.rs": "channel",
+    "src/wire/control/channel/mod.rs": "channel",
+    "src/wire/control/channel/platform.rs": "channel",
+    "src/wire/control/channel/platform/unix.rs": "channel",
+    "src/wire/control/channel/platform/windows.rs": "channel",
+    "src/manage/package.rs": "package",
+    "src/manage/bundle.rs": "bundle",
+    "src/manage/trust.rs": "trust",
+    "src/manage/interpreter.rs": "interpreter",
+    "src/manage/plugin.rs": "plugin",
+    "src/manage/transfer.rs": "transfer",
+    "src/supervise/registry.rs": "registry",
+    "src/supervise/definition.rs": "definition",
+    "src/supervise/supervisor.rs": "supervisor",
+    "src/supervise/slot.rs": "slot",
+    "src/supervise/runtime.rs": "runtime",
+    "src/supervise/hook.rs": "hook",
+    "src/supervise/script.rs": "script",
+    "src/supervise/builtin_adapter.rs": "builtin_adapter",
+    "src/selfinstall/install.rs": "install",
+    "src/selfinstall/service_win.rs": "service_win",
+    "src/server/http/model.rs": "http",
+    "src/server/auth/lan.rs": "lan",
+    "src/face/mcp.rs": "mcp",
+    "src/face/catalog.rs": "catalog",
+    "src/face/webui.rs": "webui",
+    "src/face/uichannel.rs": "uichannel",
+    "src/cli/svc.rs": "svc",
+    "src/cli/plugin.rs": "plugin_cli",
+    "src/cli/status.rs": "status"
   }
 }

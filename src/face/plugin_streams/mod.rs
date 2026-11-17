@@ -18,13 +18,13 @@ pub mod ws;
 use std::sync::{Arc, Mutex};
 
 use crate::face::plugin_ui::{PluginUiStream, UiPath};
-use crate::http;
-use crate::lan::{AuthKind, Lan};
-use crate::package;
-use crate::paths::Paths;
-use crate::plugin;
+use crate::server::http::model as http;
+use crate::server::auth::lan::{AuthKind, Lan};
+use crate::manage::package;
+use crate::platform::paths::Paths;
+use crate::manage::plugin;
 use crate::server::http::{Request, StreamHandler};
-use crate::uichannel;
+use crate::face::uichannel as uichannel;
 
 /// Everything the realtime handlers need that is not the request itself. The
 /// legacy engine always has it; a build without a raw transport has `None`.
@@ -32,8 +32,8 @@ pub(crate) struct StreamContext {
     /// The one directory set: the control endpoint (`paths.config_dir`) and the
     /// plugin tree both come from it.
     pub paths: Arc<Paths>,
-    pub raw_hub: Option<Arc<crate::rawhub::RawHub>>,
-    pub limits: Arc<crate::limits::Limits>,
+    pub raw_hub: Option<Arc<crate::wire::contract::rawhub::RawHub>>,
+    pub limits: Arc<crate::platform::limits::Limits>,
 }
 
 /// Why a realtime request was refused before its first handler byte.
@@ -58,7 +58,7 @@ fn valid_ui(paths: &Paths, ui: &UiPath<'_>, require_assets: bool) -> Result<(), 
 }
 
 fn valid_token(lan: &Arc<Mutex<Lan>>, ui: &UiPath<'_>) -> Result<(), Refusal> {
-    if crate::lan::plugin_token_valid(lan, ui.token, ui.id) {
+    if crate::server::auth::lan::plugin_token_valid(lan, ui.token, ui.id) {
         Ok(())
     } else {
         Err(http::json_error(

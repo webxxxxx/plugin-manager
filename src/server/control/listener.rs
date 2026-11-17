@@ -13,11 +13,11 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::channel::{Endpoint, Notify, PendingCall, Reply};
-use crate::ipc;
+use crate::wire::control::channel::{Endpoint, Notify, PendingCall, Reply};
+use crate::wire::message::ipc;
 use crate::kernel::failure::Problem;
-use crate::rpc;
-use crate::wake::Wake;
+use crate::wire::message::rpc;
+use crate::platform::host::wake::Wake;
 
 /// One poll source owned by the control server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +127,7 @@ impl ControlServer {
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => {
-                    crate::log::svcd(&format!("svcd: control accept failed: {}", error));
+                    crate::platform::log::svcd(&format!("svcd: control accept failed: {}", error));
                     break;
                 }
             }
