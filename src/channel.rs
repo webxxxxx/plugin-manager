@@ -284,38 +284,44 @@ pub fn request(
     method: &str,
     params: serde_json::Value,
 ) -> io::Result<crate::rpc::Response> {
-    request_stream(config, method, params, |_| {})
+    request_stream(config, method, params, None, || false, |_| {})
 }
 
 /// A request whose handler may emit JSON-RPC notifications before the final
 /// response. Notifications are delivered to `on_notification`; reading stops at
 /// the response with an `id`.
-pub fn request_stream<F>(
+///
+/// `idle` bounds how long the caller waits for the next frame; a bound also
+/// turns the read into a short poll so `cancelled` can be observed. The CLI
+/// passes no bound and never cancels, so it keeps the old blocking read and
+/// the connection pool. A server-side SSE response passes the transfer bound
+/// and its client's disconnect check, so a hung supervisor or a gone client
+/// releases the stream permit instead of pinning the connection thread. A
+/// timed-out or cancelled socket is dropped, never returned to the pool: a
+/// late response would otherwise be mistaken for the next request's reply.
+pub fn request_stream<F, C>(
     config: &Path,
     method: &str,
     params: serde_json::Value,
-    mut on_notification: F,
+    idle: Option<Duration>,
+    cancelled: C,
+    on_notification: F,
 ) -> io::Result<crate::rpc::Response>
 where
     F: FnMut(&str),
+    C: Fn() -> bool,
 {
     let token = read_token(config)?;
     let mut stream = acquire(config)?;
     let line = request_line(method, params, token);
     ipc::write_frame_limit(&mut stream, &line, ipc::LOCAL_FRAME_MAX)?;
 
-    let mut reader = BufReader::new(stream);
-    loop {
-        let line = ipc::read_frame_limit(&mut reader, ipc::LOCAL_FRAME_MAX)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "empty response frame"))?;
-        match response_from_line(&line)? {
-            Some(response) => {
-                release(config, reader.into_inner());
-                return Ok(response);
-            }
-            None => on_notification(&line),
-        }
-    }
+    let polling = idle.is_some();
+    let mut reader = ipc::FrameReader::new(BufReader::new(PollReader { stream, polling }));
+    let bound = idle.map(ReadBound::Idle).unwrap_or(ReadBound::Unbounded);
+    let response = read_response(&mut reader, bound, cancelled, on_notification)?;
+    release(config, reader.into_inner().into_inner().into_inner());
+    Ok(response)
 }
 
 /// The one control-channel request envelope. The local channel always uses id 1
@@ -356,6 +362,10 @@ const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// into `WouldBlock` while `FrameReader` keeps the bytes it already has.
 struct PollReader {
     stream: Stream,
+    /// `true` turns a read into a zero-timeout readiness check. The CLI keeps
+    /// `false`: without a deadline there is nothing to wake up for, and the
+    /// blocking read avoids a poll period of added latency.
+    polling: bool,
 }
 
 impl PollReader {
@@ -370,13 +380,117 @@ impl PollReader {
 
 impl std::io::Read for PollReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if !self.stream.wait_readable(Duration::ZERO)? {
+        if self.polling && !self.stream.wait_readable(Duration::ZERO)? {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "no control data ready",
             ));
         }
         std::io::Read::read(&mut self.stream, buf)
+    }
+}
+
+/// What bounds one control read.
+#[derive(Clone, Copy)]
+enum ReadBound {
+    /// No deadline: a plain blocking frame read (the CLI). Without a bound the
+    /// cancellation flag is not observed, because there is no poll to check it.
+    Unbounded,
+    /// Fail when no frame arrives for this long; every frame resets it.
+    Idle(Duration),
+    /// Fail at this absolute instant.
+    Deadline(Instant),
+}
+
+/// One frame loop shared by the streaming and the deadline-bound control reads.
+/// Notifications are forwarded to `on_notification`; `request_within` passes a
+/// sink that drops them because management routes do not consume interim
+/// frames, but both share the frame parser so a protocol change cannot drift.
+fn read_response<C, F>(
+    reader: &mut ipc::FrameReader<BufReader<PollReader>>,
+    bound: ReadBound,
+    cancelled: C,
+    mut on_notification: F,
+) -> io::Result<crate::rpc::Response>
+where
+    C: Fn() -> bool,
+    F: FnMut(&str),
+{
+    let mut last_frame = Instant::now();
+    loop {
+        if cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "control request cancelled",
+            ));
+        }
+        let now = Instant::now();
+        let wait = match bound {
+            // The CLI path has no deadline and no cancellation to observe, so
+            // it keeps the old blocking read instead of waking every poll.
+            ReadBound::Unbounded => None,
+            ReadBound::Idle(idle) => {
+                let elapsed = now.saturating_duration_since(last_frame);
+                if elapsed >= idle {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "control request timed out",
+                    ));
+                }
+                Some((idle - elapsed).min(CONTROL_POLL_INTERVAL))
+            }
+            ReadBound::Deadline(deadline) => {
+                if now >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "control request timed out",
+                    ));
+                }
+                Some(
+                    deadline
+                        .saturating_duration_since(now)
+                        .min(CONTROL_POLL_INTERVAL),
+                )
+            }
+        };
+        if let Some(wait) = wait {
+            if !reader.has_buffered() && !reader.get_ref().get_ref().wait_readable(wait)? {
+                continue;
+            }
+        }
+        match reader.read_frame_limit(ipc::LOCAL_FRAME_MAX) {
+            Ok(Some(line)) => {
+                last_frame = Instant::now();
+                let Some(response) = response_from_line(&line)? else {
+                    on_notification(&line);
+                    continue;
+                };
+                return Ok(response);
+            }
+            Ok(None) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "empty response frame",
+                ))
+            }
+            Err(ipc::FrameError::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                // A partial frame is already buffered: let the socket wake the
+                // next poll instead of spinning on `WouldBlock`.
+                let _ = reader
+                    .get_ref()
+                    .get_ref()
+                    .wait_readable(CONTROL_POLL_INTERVAL);
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
 }
 
@@ -402,55 +516,18 @@ pub fn request_within<C: Fn() -> bool>(
     let line = request_line(method, params, token);
     ipc::write_frame_limit(&mut stream, &line, ipc::LOCAL_FRAME_MAX)?;
 
-    let mut reader = ipc::FrameReader::new(BufReader::new(PollReader { stream }));
-    loop {
-        if cancelled() {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "control request cancelled",
-            ));
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "control request timed out",
-            ));
-        }
-        if !reader.has_buffered() {
-            let wait = deadline.saturating_duration_since(now).min(CONTROL_POLL_INTERVAL);
-            if !reader.get_ref().get_ref().wait_readable(wait)? {
-                continue;
-            }
-        }
-        let line = match reader.read_frame_limit(ipc::LOCAL_FRAME_MAX) {
-            Ok(Some(line)) => line,
-            Ok(None) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "empty response frame",
-                ))
-            }
-            Err(ipc::FrameError::Io(error))
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::Interrupted
-                ) =>
-            {
-                continue;
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let Some(response) = response_from_line(&line)? else {
-            // The management routes do not consume interim notifications; they
-            // still share the frame parser so a protocol change cannot drift.
-            continue;
-        };
-        release(config, reader.into_inner().into_inner().into_inner());
-        return Ok(response);
-    }
+    let mut reader = ipc::FrameReader::new(BufReader::new(PollReader {
+        stream,
+        polling: true,
+    }));
+    let response = read_response(
+        &mut reader,
+        ReadBound::Deadline(deadline),
+        cancelled,
+        |_| {},
+    )?;
+    release(config, reader.into_inner().into_inner().into_inner());
+    Ok(response)
 }
 
 pub fn remove_socket(config: &Path) {
@@ -780,20 +857,24 @@ mod tests {
         Listener::bind(config).expect("listener")
     }
 
-    /// A supervisor that never answers must not hold the worker: the request
-    /// returns TimedOut at the deadline and the socket is not pooled.
-    #[test]
-    fn a_silent_control_channel_hits_the_deadline() {
-        let config = config_dir("silent");
-        let listener = listener(&config);
-        let server = std::thread::spawn(move || {
+    /// A supervisor that accepts one connection and never answers.
+    fn silent_server(listener: Listener) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
             let _stream = listener
                 .incoming()
                 .next()
                 .expect("accept")
                 .expect("stream");
             std::thread::sleep(Duration::from_secs(2));
-        });
+        })
+    }
+
+    /// A supervisor that never answers must not hold the worker: the request
+    /// returns TimedOut at the deadline and the socket is not pooled.
+    #[test]
+    fn a_silent_control_channel_hits_the_deadline() {
+        let config = config_dir("silent");
+        let server = silent_server(listener(&config));
 
         let started = Instant::now();
         let error = request_within(
@@ -828,15 +909,7 @@ mod tests {
     #[test]
     fn a_disconnect_cancels_within_one_poll_period() {
         let config = config_dir("cancel");
-        let listener = listener(&config);
-        let server = std::thread::spawn(move || {
-            let _stream = listener
-                .incoming()
-                .next()
-                .expect("accept")
-                .expect("stream");
-            std::thread::sleep(Duration::from_secs(2));
-        });
+        let server = silent_server(listener(&config));
 
         let started = Instant::now();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -936,6 +1009,166 @@ mod tests {
             "the deadline must fire with a partial frame, took {:?}",
             started.elapsed()
         );
+        server.join().expect("server");
+        let _ = fs::remove_dir_all(&config);
+    }
+
+    fn pooled(config: &Path) -> usize {
+        pool()
+            .lock()
+            .expect("pool")
+            .get(config)
+            .map(Vec::len)
+            .unwrap_or(0)
+    }
+
+    /// A notification split across two writes must be forwarded exactly once,
+    /// and the completed round trip must return to the pool, like every other
+    /// CLI control request.
+    #[test]
+    fn a_stream_request_forwards_a_split_notification_before_the_response() {
+        let config = config_dir("stream-notify");
+        let listener = listener(&config);
+        let server = std::thread::spawn(move || {
+            let mut stream = listener
+                .incoming()
+                .next()
+                .expect("accept")
+                .expect("stream");
+            stream
+                .write_all(br#"{"jsonrpc":"2.0","method":"notifications/progress","#)
+                .expect("first chunk");
+            stream.flush().expect("flush");
+            std::thread::sleep(Duration::from_millis(80));
+            stream
+                .write_all(br#""params":{"progress":1}}"#)
+                .expect("second chunk");
+            stream.write_all(b"\n").expect("newline");
+            stream
+                .write_all(br#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#)
+                .expect("response");
+            stream.write_all(b"\n").expect("newline");
+            stream.flush().expect("flush");
+        });
+
+        let mut notifications = Vec::new();
+        let response = request_stream(
+            &config,
+            "registry.call",
+            serde_json::json!({}),
+            None,
+            || false,
+            |line| notifications.push(line.to_string()),
+        )
+        .expect("the response arrives after the notification");
+        assert_eq!(response.result, Some(serde_json::json!({ "ok": true })));
+        assert_eq!(notifications.len(), 1, "{notifications:?}");
+        assert!(
+            notifications[0].contains("\"progress\":1"),
+            "{notifications:?}"
+        );
+        assert_eq!(
+            pooled(&config),
+            1,
+            "a completed stream returns its socket to the pool"
+        );
+        server.join().expect("server");
+        let _ = fs::remove_dir_all(&config);
+    }
+
+    /// A silent supervisor must not hold the caller past the idle bound.
+    #[test]
+    fn a_stream_request_without_a_frame_hits_its_idle_deadline() {
+        let config = config_dir("stream-idle");
+        let server = silent_server(listener(&config));
+
+        let started = Instant::now();
+        let error = request_stream(
+            &config,
+            "registry.call",
+            serde_json::json!({}),
+            Some(Duration::from_millis(150)),
+            || false,
+            |_| {},
+        )
+        .expect_err("a silent stream must hit the idle deadline");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the idle bound must not wait for the final frame, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            pooled(&config),
+            0,
+            "a timed-out connection must not be reused"
+        );
+        server.join().expect("server");
+        let _ = fs::remove_dir_all(&config);
+    }
+
+    /// A disconnect check that flips must stop the read within one poll period,
+    /// and the half-finished request must not poison the pool. On Windows this
+    /// is the interruptible-pipe unit test: the read is parked on a silent
+    /// `PeekNamedPipe`, and the cancel flag must return it without new data.
+    #[test]
+    fn a_cancelled_stream_request_drops_the_socket_instead_of_pooling_it() {
+        let config = config_dir("stream-cancel");
+        let server = silent_server(listener(&config));
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flip = cancelled.clone();
+        let flipper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            flip.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        let error = request_stream(
+            &config,
+            "registry.call",
+            serde_json::json!({}),
+            Some(Duration::from_secs(5)),
+            || cancelled.load(Ordering::Acquire),
+            |_| {},
+        )
+        .expect_err("a cancelled stream must not wait for the final frame");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cancel must arrive in one poll period, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            pooled(&config),
+            0,
+            "a socket with a late reply must not be reused"
+        );
+        flipper.join().expect("flipper");
+        server.join().expect("server");
+        let _ = fs::remove_dir_all(&config);
+    }
+
+    /// The Windows control pipe has no read timeout: the peek that precedes a
+    /// short read must report "no data" without blocking, or the deadline and
+    /// the disconnect check above could never run.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_pipe_peek_does_not_wait_for_data() {
+        let config = config_dir("pipe-peek");
+        let server = silent_server(listener(&config));
+
+        let stream = connect(&config).expect("connect");
+        let started = Instant::now();
+        assert!(
+            !stream.wait_readable(Duration::ZERO).expect("peek"),
+            "a silent pipe must not report readable"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the peek must not wait for data, took {:?}",
+            started.elapsed()
+        );
+        drop(stream);
         server.join().expect("server");
         let _ = fs::remove_dir_all(&config);
     }
