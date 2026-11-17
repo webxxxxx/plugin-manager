@@ -7722,8 +7722,15 @@ fn control_channel_rejects_an_admin_method_on_the_user_endpoint() {
     assert_eq!(response["error"]["code"], -32000, "{line}");
     assert_eq!(response["error"]["message"], "unauthorized", "{line}");
 
-    // The rejected admin method must leave the daemon serving the user tier.
-    sandbox.wait_for_http();
+    // The rejected admin method must leave the user tier usable: `svc list`
+    // goes through svcd.sock and would fail if shutdown had run.
+    let listed = sandbox.run_svc(&["list"]);
+    assert_eq!(
+        listed.status.code(),
+        Some(0),
+        "user tier after rejected admin method: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
 }
 
 /// When the management channel cannot be reached, the MCP stream still starts

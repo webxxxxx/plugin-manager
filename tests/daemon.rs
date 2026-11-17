@@ -353,12 +353,9 @@ impl Sandbox {
         self.start_daemon_with_env(&[]);
     }
 
-    /// Spawn the daemon and wait until its control channel answers.
-    ///
-    /// `svc list` / `svc status` no longer fall back to services.d, so a test
-    /// that calls them immediately must not race the daemon's startup: the
-    /// control socket is bound after the boot scan, and WSL is slow enough for
-    /// the difference to matter.
+    /// Spawn the daemon and wait until its control channel answers. Tests that
+    /// call `svc`/`status` immediately must use this: the CLI exits
+    /// `EXIT_DAEMON_UNREACHABLE` until the daemon's RPC loop is live.
     fn start_daemon_ready(&mut self) {
         self.start_daemon();
         self.wait_for_daemon();
