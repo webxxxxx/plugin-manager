@@ -5,10 +5,10 @@
 //! supervisor (#29) supplies them.
 
 use std::fmt::Display;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::clock::Now;
 use crate::registry::{Kind, Service, State};
 use crate::supervisor::Machine;
 
@@ -79,15 +79,15 @@ impl Status {
     }
 
     /// The live projection of a supervised core service. Machine timers are
-    /// monotonic; `epoch_at_start` anchors them back to epoch seconds.
-    pub fn live(service: &Service, machine: &Machine, epoch_at_start: SystemTime) -> Self {
+    /// monotonic; the `now` pair anchors them back to epoch seconds.
+    pub fn live(service: &Service, machine: &Machine, now: Now) -> Self {
         let mut status = Status::of(service);
         status.summary.state = machine.state;
         status.summary.pid = machine.pid;
-        status.summary.since = epoch_secs(epoch_at_start, machine.since_ms);
+        status.summary.since = epoch_secs(now, machine.since_ms);
         status.details.last_exit = machine.last_exit;
-        status.details.next_at = epoch_secs_opt(epoch_at_start, machine.next_at_ms);
-        status.details.ready_since = epoch_secs_opt(epoch_at_start, machine.ready_since_ms);
+        status.details.next_at = epoch_secs_opt(now, machine.next_at_ms);
+        status.details.ready_since = epoch_secs_opt(now, machine.ready_since_ms);
         status.details.failures = machine.failures;
         status.details.restart = Some(machine.restart.as_str().into());
         status.details.unkillable = machine.unkillable;
@@ -106,22 +106,15 @@ impl Status {
     }
 }
 
-fn epoch_secs(epoch_at_start: SystemTime, ms: u64) -> Option<u64> {
+fn epoch_secs(now: Now, ms: u64) -> Option<u64> {
     if ms == 0 {
         return None;
     }
-    Some(
-        epoch_at_start
-            .checked_add(Duration::from_millis(ms))
-            .unwrap_or(epoch_at_start)
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    )
+    Some(now.epoch_of(ms))
 }
 
-fn epoch_secs_opt(epoch_at_start: SystemTime, ms: Option<u64>) -> Option<u64> {
-    ms.and_then(|value| epoch_secs(epoch_at_start, value))
+fn epoch_secs_opt(now: Now, ms: Option<u64>) -> Option<u64> {
+    ms.and_then(|value| epoch_secs(now, value))
 }
 
 const COLUMNS: [&str; 6] = ["ID", "KIND", "STATE", "AUTO", "PID", "VERSION"];
@@ -349,7 +342,11 @@ mod tests {
         machine.last_exit = Some(1);
         machine.unkillable = true;
 
-        let status = Status::live(&service, &machine, UNIX_EPOCH);
+        let status = Status::live(
+            &service,
+            &machine,
+            Now::at(1_700_000_010_000, 1_700_000_010),
+        );
 
         assert_eq!(status.summary.state, State::Backoff);
         assert_eq!(status.summary.pid, None);

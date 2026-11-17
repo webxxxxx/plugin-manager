@@ -68,7 +68,11 @@ impl Config {
     /// callers that find a missing discovered file get an empty document, not a
     /// silent retry.
     pub fn bootstrap(conf: Option<&Path>) -> Result<Config, String> {
-        let (settings, settings_path) = settings::load(conf)?;
+        let (mut settings, settings_path) = settings::load(conf)?;
+        // The two loop cadences still take their historical `SVCD_*` env
+        // override. Applying it here keeps "env is read at bootstrap" true for
+        // every key, and keeps the override out of the modules below.
+        settings::apply_loop_env_overrides(&mut settings);
         Ok(Config::new(settings, settings_path))
     }
 

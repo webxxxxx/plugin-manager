@@ -294,10 +294,10 @@ src/
 | S5 | 失败投影 | 领域 ↔ 对外面 | 3（HTTP / CLI / MCP） | **已完成**（#149/#150 控制通道 `Problem`/`data` 与 HTTP 投影；#151 把 face-local 的安装/导入/配置/trust/blob 错误改成 typed，`package/plugin/trust/transfer/blob/interpreter/hook/bundle` 在抛出处给类别，face 只按类型投影（管理失败一张 `Problem → HTTP` 表，存储/请求体/阻塞池各自带窄类别），不再按 message 猜状态） |
 | S6 | 进程与管道 | 监督/线格式 ↔ 平台 | 2（unix / windows） | **已完成**：**#141 把进程宿主收进 `platform/host/process`**（unix 进程组 / Windows Job，服务与 hook 的组、父死保护都在 `configure` 里）；**#142 起管道也是一个真 seam：`stdio`（`Plan` / `Target`）按 `Ready`/`protocol` 开匿名管道、把读端交给 poll set 或读线程**，宿主差异只在 `stdio/platform/{unix,windows}.rs`（`O_CLOEXEC`/`O_NONBLOCK` 与 `CreatePipe`/句柄继承），`slot.rs` / `hook.rs` 的 stdio 段无平台 cfg；**#143 把控制通道收进 `ControlChannel` seam**：`channel/platform/{unix,windows}.rs`，`channel.rs` 无平台 cfg，`daemon.rs` 只剩一条 `bind_server`；**#144 删掉 `svcd.token`，控制通道按端点 ACL 分两档**：Unix `svcd.sock` 0660 / `svcd-admin.sock` 0600，Windows 两条管道各自显式 protected DACL（当前用户或 `svcd` 组），`install-service` 建组，客户端按方法选端点、未知方法 fail closed 到 admin |
 | S7 | 配置来源 | 所有模块 ↔ 配置 | 1 生产 + 测试 | **设计已定**（[ADR-0019](adr/0019-config-is-derived-once-at-the-composition-root.md)：运行配置 `Config{settings, settings_path, paths, limits}` 在组合根派生一次，传值不传 trait；`Paths::{resolve, under}` 两个构造入口；env 只在 bootstrap 读；`log` 保持进程级 sink、`S8` 单开）。**S7a 已完成（#157）**：`Config`/`Paths` 在组合根派生一次，四批把 95 处目录调用迁到构造参数，contract 删掉全部目录自由函数与 5 个测试后门（模块级测试不再起 daemon）；`SVCD_*` 只在 `Config::bootstrap` 与唯一的容忍入口 `config::ambient_paths`（stop / install / SCM readiness）读；**S7b 已完成（#158）**：`settings` 与 `limits` 的两个进程级缓存（`settings::{SETTINGS,CONFIG_PATH}`、`limits::LIMITS`）和 `current()` 入口删除，`settings::load` 一次解析文档与路径、`limits::derive` 保持纯投影，所有读取点改从 `Config`（或收窄的 `&Limits` / `&Settings`）来；daemon 全程只解析一次：`ensure_conf` 生成或选中的文件供 service unit 与下次启动，本次运行沿用 bootstrap 得到的文档 |
-| S8 | 时钟 | 监督/编排 ↔ 时间 | 1 生产 + 测试 | 未开 |
+| S8 | 时钟 | 监督/编排 ↔ 时间 | 1 生产 + 测试（`Clock::boot()`；测试直接构造 `Now`） | **已完成（#160）**（[ADR-0020](adr/0020-time-is-a-parameter-not-a-trait.md)）：时刻成对 `Now{mono_ms, epoch_secs}`（`src/clock.rs`），`Clock::boot()` 在组合根构造一次、以参数进 `event_loop`；`event_loop` 拆成 `drain` / `tick(now)` / `next_wait(now)`；`Status::live`、`persist_states`、`adopt_runtime` 改吃同一对，删掉 `now_epoch_secs` / `epoch_of` / `ms_of` 的实时重读；`rescan_interval_ms` / `boot_scan_wait_ms` 进 `Settings`（env 覆盖只在 bootstrap）；循环定时器改为模块级单测，`tests/daemon.rs` 的 11 秒睡眠删除 |
 | S9 | 准入 | 服务器 ↔ 认证 | 4（token / bearer / cookie / 本机免认证） | 未开，四分支挤在 `lan` |
 
-开 seam 的顺序：**S1（含 S5 失败类别）→ S4 → S3 → S6 → S7/S8**；**S1 / S3 / S4 / S5 / S6 已完成，下一步是 S7（配置来源）**。S9 随时可做，S2 等集群真正开始再开。
+开 seam 的顺序：**S1（含 S5 失败类别）→ S4 → S3 → S6 → S7/S8**；**S1 / S3 / S4 / S5 / S6 / S7 / S8 已完成，下一步是 §12 step 6（目录纯搬家）**。S9 随时可做，S2 等集群真正开始再开。
 
 S4 的最终线程预算（#126 合并插件 stdio 反应器后：两条循环 + 两条阻塞线程，默认 4 条）是 **Unix 的默认拓扑**。迁移期：legacy HTTP worker（4 条）和 takeover 仍在时默认 12 条；#124 把控制 listener 与出站客户端并入 server-loop、删掉两条 reactor 后为 10 条；**#125 删除 legacy bridge、4 条 worker 与独立 temp-cleaner 线程后为 5 条（supervisor、server loop、插件 stdio reactor、2 条阻塞 worker）；#126 把插件 reactor 并入 supervisor loop 后为 4 条（supervisor——同时 poll 插件 stdio、server loop、2 条阻塞 worker）**。Windows 本轮保留每连接一条线程的回退，`max_connections` 是它的线程上限；Windows 不承诺 4 条线程，IOCP 留给 S3/S6。该回退仍执行 `max_connections` / `max_connections_per_ip` / `http_idle_timeout_secs`。**#140 之后这条线固定为：Unix 空载 4 条；Windows 每连接一条线程、`max_connections` 是线程上限，不承诺 4 条（IOCP 留给后续）。**
 
@@ -373,10 +373,10 @@ flowchart TD
 | 2 | 契约从 `slot`/`package`/`registry` 抽出（S1 + S5 失败类别，形状见 ADR-0013） | 编排可以用 fake 契约开始写 | **S1 完成（#148）；S5 完成（#149/#150/#151）** |
 | 3 | 抽 `server/http` + `server/mcp` + 请求交接（S4） | `api.rs` 降到 1500 行以下 | 完成（#112–#136） |
 | 4 | 线格式与进程（S3 / S6） | Windows 支持变成「加一个 adapter」 | 完成（#139–#144） |
-| 5 | 配置与时钟（S7 / S8） | 模块级测试不再起 daemon | **S7 完成（#157/#158）**：`Config`/`Paths` 注入 + contract，`Settings`/`Limits` 收口、无进程级缓存；S8 未开 |
+| 5 | 配置与时钟（S7 / S8） | 模块级测试不再起 daemon | **S7 完成（#157/#158）**：`Config`/`Paths` 注入 + contract，`Settings`/`Limits` 收口、无进程级缓存；**S8 完成（#160）**：`Now`/`Clock` + 循环拆壳，时间只从参数来，两个 cadence 进 `Settings` |
 | 6 | 目录按本文件重排（纯搬家） | 编译与测试全绿 | 未做 |
 
-当前：0 / 1 / 3 / 4 完成；2（S1+S5）已完成；5 进行中（S7 完成；S8 未开）；6 未做。
+当前：0 / 1 / 3 / 4 完成；2（S1+S5）已完成；5 完成（S7 / S8 均已交付）；6 未做。
 
 ```mermaid
 flowchart LR
@@ -388,8 +388,8 @@ flowchart LR
     S5 --> S6["6 目录纯搬家"]
     S6 --> DONE["目标树"]
 
-    NOW["当前：0/1/3/4 完成；2（S1+S5）S1 完成、S5 核心完成<br/>S1 已回调化<br/>S1 契约收尾（#148）<br/>S5 失败投影（#149/#150）<br/>S4 契约已定（#113）<br/>server-loop 已接管 HTTP（#114）<br/>stream handler 与插件 UI 静态资源（#115）<br/>阻塞池与首个 Blocking 路由（#116）<br/>管理 API / login / 控制台走 face（#117）<br/>blob/file 下载走 stream handler（#118）<br/>blob/file 上传走 stream handler（#119）<br/>export spk/spkb 走 stream handler（#120）<br/>import/install 走 stream handler（#121）<br/>插件 UI SSE/WS/raw 走 stream handler（#122）<br/>MCP SSE 进度流走 stream handler（#123）<br/>控制通道与出站管理流并入 server-loop（#124）<br/>删除 legacy bridge / workers / temp-cleaner（#125）<br/>插件 stdio 并入 supervisor-loop；默认 4（#126）<br/>Blocking 控制往返 deadline + face/support 拆环（#131）<br/>下载 open/metadata 进阻塞池（#132）<br/>install/import stream job 控制往返预算 + 断开取消（#136）<br/>Windows MCP 断开取消（#135）<br/>清掉 7 条向上边与 _http 后缀，dep-lint 四类归零（#137/#138）<br/>Windows 连接驱动收进 server/http，api.rs 无平台 cfg（#139）<br/>连接驱动成为一等 seam（#140）<br/>进程宿主收进 platform/host/process（#141）<br/>控制通道成为一等 seam（#143）<br/>插件与 hook 的 stdio 收进 stdio seam（#142）<br/>控制通道删 token、按端点 ACL 分两档（#144）"]:::current
-    NOW -.->|下一步：S5| S2
+    NOW["当前：0/1/3/4 完成；2（S1+S5）S1 完成、S5 核心完成<br/>S1 已回调化<br/>S1 契约收尾（#148）<br/>S5 失败投影（#149/#150）<br/>S4 契约已定（#113）<br/>server-loop 已接管 HTTP（#114）<br/>stream handler 与插件 UI 静态资源（#115）<br/>阻塞池与首个 Blocking 路由（#116）<br/>管理 API / login / 控制台走 face（#117）<br/>blob/file 下载走 stream handler（#118）<br/>blob/file 上传走 stream handler（#119）<br/>export spk/spkb 走 stream handler（#120）<br/>import/install 走 stream handler（#121）<br/>插件 UI SSE/WS/raw 走 stream handler（#122）<br/>MCP SSE 进度流走 stream handler（#123）<br/>控制通道与出站管理流并入 server-loop（#124）<br/>删除 legacy bridge / workers / temp-cleaner（#125）<br/>插件 stdio 并入 supervisor-loop；默认 4（#126）<br/>Blocking 控制往返 deadline + face/support 拆环（#131）<br/>下载 open/metadata 进阻塞池（#132）<br/>install/import stream job 控制往返预算 + 断开取消（#136）<br/>Windows MCP 断开取消（#135）<br/>清掉 7 条向上边与 _http 后缀，dep-lint 四类归零（#137/#138）<br/>Windows 连接驱动收进 server/http，api.rs 无平台 cfg（#139）<br/>连接驱动成为一等 seam（#140）<br/>进程宿主收进 platform/host/process（#141）<br/>控制通道成为一等 seam（#143）<br/>插件与 hook 的 stdio 收进 stdio seam（#142）<br/>控制通道删 token、按端点 ACL 分两档（#144）<br/>时钟成对捕获 + 监督循环拆壳（#160）<br/>rescan / boot-scan cadence 进 Settings（#160）"]:::current
+    NOW -.->|下一步：step 6 目录纯搬家| S6
 
     classDef current fill:#ffe08a,stroke:#b8860b,stroke-width:3px,color:#000
 ```
@@ -431,7 +431,7 @@ flowchart LR
 
 下一步（按风险排序）：
 
-1. **S8 时钟**：与 S7 同期但独立成票；S7（#157/#158）已经收口，注入形状固定。
+1. **S8 时钟**：设计见 [ADR-0020](adr/0020-time-is-a-parameter-not-a-trait.md)，S8a / S8b 已交付（#160）。
 2. **目录按本文件重排**：§12 的 step 6，纯搬家，等时钟收口后做。
 
 已完成：**S5 失败投影**（#149/#150 控制通道 `Problem`/`data` 与 HTTP 投影；#151 face-local typed errors——S5 的 HTTP 字符串匹配归零，全仓没有按 message 选状态的代码）。
