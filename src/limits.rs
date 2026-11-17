@@ -384,12 +384,21 @@ fn clamp_u64(value: Option<u64>, default: u64, min: u64, max: u64) -> u64 {
 
 static LIMITS: OnceLock<Limits> = OnceLock::new();
 
+/// Derive the limits from a parsed `svcd.conf`.
+///
+/// Pure: it reads only the document, so the composition root can derive the
+/// limits once (S7b) and a test can derive them from its own settings without
+/// touching the process cache.
+pub fn derive(settings: &settings::Settings) -> Limits {
+    Limits::from_settings(SettingsView::from(settings))
+}
+
 /// The daemon-wide limits. The first call loads `svcd.conf`; later calls reuse
 /// the same values, so changing the file requires a restart.
 pub fn current() -> &'static Limits {
     LIMITS.get_or_init(|| match settings::current() {
-        Ok(settings) => Limits::from_settings(SettingsView::from(settings)),
-        Err(_) => Limits::from_settings(SettingsView::from(&settings::Settings::default())),
+        Ok(settings) => derive(settings),
+        Err(_) => derive(&settings::Settings::default()),
     })
 }
 

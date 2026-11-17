@@ -7,6 +7,7 @@ mod bundle;
 mod catalog;
 mod channel;
 mod compat;
+mod config;
 mod daemon;
 mod definition;
 #[cfg(feature = "http")]
