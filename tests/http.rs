@@ -2478,7 +2478,11 @@ fn a_disconnected_package_upload_removes_its_staging_directory() {
     for (path, content) in [
         ("/api/v1/plugins", package.as_slice()),
         ("/api/v1/import", package.as_slice()),
-        ("/api/v1/import", backup.body.as_slice()),
+        // The package was installed above, so the .spkb import must opt into
+        // force before its nested package is staged; otherwise BackupSink
+        // rejects it right after staging and the staging dir is already gone
+        // when the test looks for it.
+        ("/api/v1/import?force=true", backup.body.as_slice()),
     ] {
         let initial = content[..content.len().min(64 * 1024)].to_vec();
         let stalled = start_stalled_upload(
