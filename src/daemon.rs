@@ -97,6 +97,13 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         }
     }
     crate::plugin::cleanup_staging();
+    #[cfg(windows)]
+    if crate::platform::host::acl::is_machine_wide(&config) {
+        if let Err(error) = harden_directories() {
+            eprintln!("svcd: cannot protect the install directories: {}", error);
+            return 1;
+        }
+    }
     if let Err(error) = crate::platform::host::process::init() {
         log::svcd(&format!(
             "svcd: parent-death protection unavailable: {}",
@@ -385,6 +392,22 @@ fn shutdown_inner(verbose: bool) -> i32 {
             2
         }
     }
+}
+
+/// The daemon runs `services.d` scripts and plugin payloads as LocalSystem, so
+/// those directories must not be writable by anyone but SYSTEM, Administrators
+/// and the `svcd` group. Without this a local user could drop a `.cmd` into
+/// `services.d` and have it executed as SYSTEM.
+#[cfg(windows)]
+fn harden_directories() -> std::io::Result<()> {
+    use crate::platform::host::acl::Acl;
+    for dir in [paths::config_dir(), paths::services_dir(), paths::plugins_dir()] {
+        if !dir.exists() {
+            continue;
+        }
+        Acl::shared(true)?.apply_to_path(&dir)?;
+    }
+    Ok(())
 }
 
 struct Daemon {

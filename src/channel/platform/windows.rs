@@ -23,6 +23,7 @@ use windows_sys::Win32::System::Pipes::{
 
 use crate::channel::{ControlChannel, ControlListener, ControlStream, Endpoint, PendingCall, Reply};
 use crate::ipc;
+use crate::platform::host::acl::Acl;
 use crate::rpc;
 use crate::threads;
 use crate::wake::Wake;
@@ -45,12 +46,14 @@ pub(crate) struct Platform;
 
 pub(crate) struct Listener {
     name: Vec<u16>,
+    acl: Arc<Acl>,
 }
 
 pub(crate) struct Stream(File);
 
 pub(crate) struct Incoming {
     name: Vec<u16>,
+    acl: Arc<Acl>,
 }
 
 /// The thread-per-connection fallback owns the accept loop. It is started by
@@ -76,7 +79,18 @@ impl Listener {
                 "svcd control pipe is already in use",
             ));
         }
-        Ok(Listener { name })
+        let acl = Arc::new(endpoint_acl(config, endpoint)?);
+        Ok(Listener { name, acl })
+    }
+}
+
+fn endpoint_acl(config: &Path, endpoint: Endpoint) -> io::Result<Acl> {
+    if !crate::platform::host::acl::is_machine_wide(config) {
+        return Acl::private(false);
+    }
+    match endpoint {
+        Endpoint::User => Acl::shared(false),
+        Endpoint::Admin => Acl::admin_only(false),
     }
 }
 
@@ -86,6 +100,7 @@ impl ControlListener for Listener {
     fn incoming(&self) -> impl Iterator<Item = io::Result<Stream>> + '_ {
         Incoming {
             name: self.name.clone(),
+            acl: Arc::clone(&self.acl),
         }
     }
 }
@@ -113,6 +128,7 @@ impl Iterator for Incoming {
     type Item = io::Result<Stream>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let attributes = self.acl.attributes();
         let handle = unsafe {
             CreateNamedPipeW(
                 self.name.as_ptr(),
@@ -122,7 +138,7 @@ impl Iterator for Incoming {
                 64 * 1024,
                 64 * 1024,
                 0,
-                std::ptr::null(),
+                &attributes,
             )
         };
         if handle == INVALID_HANDLE_VALUE {
