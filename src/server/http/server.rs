@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use crate::wire::control::channel::PendingCall;
-use crate::http;
-use crate::lan::Lan;
+use crate::server::http::model as http;
+use crate::server::auth::lan::Lan;
 use crate::platform::log;
 use crate::server::control::client::StreamingClient;
 use crate::server::control::handle::LoopHandle;

@@ -1,29 +1,17 @@
 #[cfg(feature = "http")]
 mod api;
-mod catalog;
+mod cli;
 mod daemon;
-#[cfg(feature = "http")]
 mod face;
-mod http;
 mod kernel;
 mod manage;
 mod selfinstall;
 mod supervise;
-#[cfg_attr(not(feature = "http"), allow(dead_code))]
-mod lan;
-mod mcp;
 mod platform;
 mod wire;
-mod plugin_cli;
 mod server;
-mod status;
-mod svc;
 #[cfg(test)]
 mod test_support;
-#[cfg(feature = "http")]
-mod uichannel;
-#[cfg(feature = "http")]
-mod webui;
 
 fn main() {
     #[cfg(windows)]
@@ -42,9 +30,9 @@ fn main() {
         .unwrap_or("svcd");
 
     let code = match name {
-        "svc" => svc::run(std::env::args().skip(1).collect()),
-        "plugin" => plugin_cli::run(std::env::args().skip(1).collect()),
-        "mcp" => mcp::run_stdio(),
+        "svc" => cli::svc::run(std::env::args().skip(1).collect()),
+        "plugin" => cli::plugin::run(std::env::args().skip(1).collect()),
+        "mcp" => face::mcp::run_stdio(),
         "uninstall" => {
             let mut args: Vec<String> = std::env::args().skip(1).collect();
             if args.first().map(String::as_str) != Some("--uninstall") {

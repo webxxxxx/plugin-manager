@@ -72,7 +72,7 @@ impl ServerLoop for ControlOnly {
         &mut self,
         _id: u64,
         _peer: std::net::IpAddr,
-        _head: &crate::http::Head,
+        _head: &crate::server::http::model::Head,
     ) -> Result<crate::server::http::BodyPolicy, Vec<u8>> {
         // The control-only loop never reads HTTP requests.
         Ok(crate::server::http::BodyPolicy::Buffered { limit: 0 })

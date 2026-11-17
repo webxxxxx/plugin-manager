@@ -19,7 +19,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use crate::platform::config::Config;
-use crate::lan::Lan;
+use crate::server::auth::lan::Lan;
 use crate::wire::contract::rawhub::RawHub;
 use crate::server::http::hooks::{FallbackHandler, PreBodyRoutes};
 use crate::server::http::Face;

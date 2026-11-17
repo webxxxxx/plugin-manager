@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use crate::server::http::{
     CloseReason, OutBuffer, StreamAction, StreamEvent, StreamHandler, StreamStep,
 };
-use crate::uichannel::{Event, Replay, Subscription};
+use crate::face::uichannel::{Event, Replay, Subscription};
 
 const HEAD: &[u8] = b"HTTP/1.1 200 OK\r\n\
 Content-Type: text/event-stream\r\n\
@@ -109,7 +109,7 @@ impl SseStream {
             }
             match self.receiver.try_recv() {
                 Ok(event) => {
-                    self.set_pending(crate::uichannel::sse_event(&event).into_bytes());
+                    self.set_pending(crate::face::uichannel::sse_event(&event).into_bytes());
                     continue;
                 }
                 Err(TryRecvError::Empty) => {}
@@ -183,7 +183,7 @@ impl StreamHandler for SseStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::uichannel::EventBus;
+    use crate::face::uichannel::EventBus;
     use serde_json::json;
     use std::sync::Arc;
 

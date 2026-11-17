@@ -8,12 +8,27 @@
 //! export to a stream handler; #121 moves package import/install uploads to the
 //! same pre-body stream face.
 
+#[cfg(feature = "http")]
 pub mod api;
+#[cfg(feature = "http")]
 pub mod blob;
+#[cfg(feature = "http")]
 pub mod blob_routes;
+#[cfg(feature = "http")]
 pub mod blob_upload;
+pub mod catalog;
+#[cfg(feature = "http")]
 pub mod export;
+#[cfg(feature = "http")]
 pub mod install;
+pub mod mcp;
+#[cfg(feature = "http")]
 pub mod plugin_streams;
+#[cfg(feature = "http")]
 pub mod plugin_ui;
+#[cfg(feature = "http")]
 pub mod support;
+#[cfg(feature = "http")]
+pub mod uichannel;
+#[cfg(feature = "http")]
+pub mod webui;

@@ -18,9 +18,9 @@ use crate::platform::config::Config;
 
 use serde_json::{json, Value};
 
-use crate::http;
+use crate::server::http::model as http;
 use crate::kernel::failure::{Problem, ProblemError};
-use crate::lan::{AuthKind, Lan};
+use crate::server::auth::lan::{AuthKind, Lan};
 use crate::manage::package;
 use crate::platform::paths::Paths;
 use crate::manage::plugin;
@@ -498,7 +498,7 @@ impl PackageUploadStream {
                 }
                 self.respond(http::json_error(
                     status,
-                    crate::http::code_for(status),
+                    crate::server::http::model::code_for(status),
                     &message,
                 ));
                 self.phase = Phase::Responding;

@@ -8,15 +8,15 @@
 
 use crate::platform::config::Config;
 use crate::face::plugin_streams::{self, StreamContext};
-use crate::http;
-use crate::lan::Lan;
+use crate::server::http::model as http;
+use crate::server::auth::lan::Lan;
 use crate::manage::package;
 use crate::manage::plugin;
 use crate::server::http::{
     dispatch_inline, BodyPolicy, CloseReason, Completion, Exchange, Face, FileSend, OutBuffer,
     Request, Route, StreamAction, StreamClass, StreamEvent, StreamHandler, StreamStep,
 };
-use crate::webui;
+use crate::face::webui as webui;
 use std::fs;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -186,7 +186,7 @@ impl PluginUiFace {
                 &format!("plugin {} has no web UI", ui.id),
             ));
         };
-        if !crate::lan::plugin_token_valid(&self.lan, ui.token, ui.id) {
+        if !crate::server::auth::lan::plugin_token_valid(&self.lan, ui.token, ui.id) {
             return Box::new(PluginUiStream::error(
                 401,
                 "unauthorized",

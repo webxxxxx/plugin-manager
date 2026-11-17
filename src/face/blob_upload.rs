@@ -11,11 +11,11 @@ use std::sync::{Arc, Mutex};
 use serde_json::json;
 
 use crate::platform::storage::blob;
-use crate::http;
+use crate::server::http::model as http;
 use crate::platform::paths::Paths;
 
 use super::support;
-use crate::lan::{AuthKind, Lan};
+use crate::server::auth::lan::{AuthKind, Lan};
 use crate::server::http::{
     BlockingOutcome, CloseReason, Exchange, OutBuffer, StreamAction, StreamClass, StreamEvent,
     StreamHandler, StreamStep,

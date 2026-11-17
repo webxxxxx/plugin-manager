@@ -16,7 +16,7 @@ use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::manage::package;
 use crate::manage::plugin;
 use crate::supervise::registry::Kind;
-use crate::status::{self, Status};
+use crate::cli::status::{self, Status};
 use crate::manage::transfer;
 
 const EXIT_OK: i32 = 0;

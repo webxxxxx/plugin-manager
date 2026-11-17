@@ -20,8 +20,8 @@ use crate::server::http::{
     BlockingJob, BlockingOutcome, CloseReason, OutBuffer, StreamAction, StreamEvent, StreamHandler,
     StreamStep,
 };
-use crate::uichannel::{Event, Subscription};
-use crate::webui;
+use crate::face::uichannel::{Event, Subscription};
+use crate::face::webui as webui;
 
 use super::frame::PendingFrame;
 
@@ -479,7 +479,7 @@ impl StreamHandler for WsStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::uichannel::EventBus;
+    use crate::face::uichannel::EventBus;
     use serde_json::json;
     use std::sync::Arc;
 

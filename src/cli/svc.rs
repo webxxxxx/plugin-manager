@@ -9,7 +9,7 @@ use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::platform::log;
 use crate::platform::config::Config;
 use crate::wire::message::rpc;
-use crate::status::{self, Status};
+use crate::cli::status::{self, Status};
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_NOT_FOUND: i32 = 1;
@@ -510,7 +510,7 @@ fn compat_init(config: &Config, device: &str, dry_run: bool) -> i32 {
 
 fn auth_command(config: &Config, action: AuthAction) -> i32 {
     if matches!(&action, AuthAction::Passwd(_)) {
-        if let Err(error) = crate::lan::require_root() {
+        if let Err(error) = crate::server::auth::lan::require_root() {
             eprintln!("svc: {}", error);
             return EXIT_SERVICE_ERROR;
         }

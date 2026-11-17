@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use crate::api::{self, Api};
 #[cfg(not(feature = "http"))]
 type Api = ();
-use crate::catalog;
+use crate::face::catalog as catalog;
 use crate::wire::control::channel;
 use crate::platform::clock::{Clock, Now};
 use crate::platform::compat;
@@ -25,9 +25,9 @@ use crate::kernel::contract::{
 };
 use crate::kernel::failure::{Class, Failure, Problem, ProblemError, Rejection, Retry};
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
-use crate::lan::LanStatus;
+use crate::server::auth::lan::LanStatus;
 use crate::platform::log;
-use crate::mcp;
+use crate::face::mcp as mcp;
 use crate::manage::package;
 use crate::platform::paths::Paths;
 use crate::manage::plugin::{self, Strategy};
@@ -39,7 +39,7 @@ use crate::supervise::runtime::{self, Record};
 use crate::platform::settings;
 use crate::supervise::slot::hook_command;
 use crate::supervise::slot::{Slot, SlotWire};
-use crate::status::Status;
+use crate::cli::status::Status;
 use crate::supervise::supervisor::{self, Event};
 use crate::platform::host::wake::Wake;
 
@@ -1200,10 +1200,10 @@ impl Daemon {
         let page =
             catalog::page(self.tool_list_cached(), version, cursor, limit).map_err(|error| {
                 let problem = match error {
-                    crate::catalog::PageError::InvalidCursor => Problem::Invalid,
+                    crate::face::catalog::PageError::InvalidCursor => Problem::Invalid,
                     // Both today fall through to 500; keep that projection.
-                    crate::catalog::PageError::VersionMismatch
-                    | crate::catalog::PageError::PastEnd => Problem::Internal,
+                    crate::face::catalog::PageError::VersionMismatch
+                    | crate::face::catalog::PageError::PastEnd => Problem::Internal,
                 };
                 ProblemError::new(problem, error.to_string())
             })?;
@@ -2130,7 +2130,7 @@ impl Daemon {
         if purge {
             plugin::remove_logs(&self.config.paths, id);
             #[cfg(feature = "http")]
-            crate::uichannel::forget(id);
+            crate::face::uichannel::forget(id);
         }
         log::svcd(&format!("svcd: plugin {} uninstalled", id));
         Ok(())
@@ -2496,7 +2496,7 @@ fn configure_slot(slot: &mut Slot, service: &Service, limits: &crate::platform::
     let id = service.id.clone();
     slot.set_notifier(Arc::new(move |method, params| {
         #[cfg(feature = "http")]
-        crate::uichannel::publish(&id, method, params);
+        crate::face::uichannel::publish(&id, method, params);
         #[cfg(not(feature = "http"))]
         {
             let _ = (method, params);

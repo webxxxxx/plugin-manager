@@ -11,7 +11,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde_json::{json, Value};
 
-use crate::http;
+use crate::server::http::model as http;
 use crate::server::mcp::session::{validate_meta, Served};
 use crate::wire::message::rpc;
 

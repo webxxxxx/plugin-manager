@@ -282,6 +282,10 @@
     "selfinstall": {
       "concept": "selfinstall",
       "layer": "domain"
+    },
+    "cli": {
+      "concept": "cli",
+      "layer": "cli"
     }
   },
   "//files": "path → 逻辑模块键（键必须是 modules 里的键）；dep-lint 用 files 取身份，没列出的文件按路径第一段。这样搬家不改变模块图，文件级层方向检查得以保留。",
@@ -327,6 +331,15 @@
     "src/supervise/script.rs": "script",
     "src/supervise/builtin_adapter.rs": "builtin_adapter",
     "src/selfinstall/install.rs": "install",
-    "src/selfinstall/service_win.rs": "service_win"
+    "src/selfinstall/service_win.rs": "service_win",
+    "src/server/http/model.rs": "http",
+    "src/server/auth/lan.rs": "lan",
+    "src/face/mcp.rs": "mcp",
+    "src/face/catalog.rs": "catalog",
+    "src/face/webui.rs": "webui",
+    "src/face/uichannel.rs": "uichannel",
+    "src/cli/svc.rs": "svc",
+    "src/cli/plugin.rs": "plugin_cli",
+    "src/cli/status.rs": "status"
   }
 }

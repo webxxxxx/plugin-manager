@@ -18,8 +18,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::platform::config::Config;
-use crate::http;
-use crate::lan::Lan;
+use crate::server::http::model as http;
+use crate::server::auth::lan::Lan;
 use crate::platform::log;
 use crate::server::http::engine;
 use crate::platform::host::threads;

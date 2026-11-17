@@ -13,7 +13,7 @@ use std::time::Instant;
 use serde_json::{json, Value};
 
 use crate::wire::control::channel;
-use crate::http;
+use crate::server::http::model as http;
 use crate::kernel::failure::{Class, Problem, ProblemError};
 use crate::manage::package;
 use crate::wire::message::rpc;
@@ -232,7 +232,7 @@ fn status_for_class(class: Class) -> u16 {
     }
 }
 
-pub(crate) use crate::http::code_for;
+pub(crate) use crate::server::http::model::code_for;
 
 pub(crate) fn error(status: u16, code: &str, message: &str) -> Vec<u8> {
     http::json_error(status, code, message)

@@ -201,7 +201,7 @@ pub(crate) fn web_headers(etag: &str) -> Vec<(String, String)> {
 /// Whether a browser navigation asked for HTML. Used for the SPA fallback and
 /// for the login redirect on an unauthenticated plugin UI page.
 pub(crate) fn wants_html(headers: &[(String, String)]) -> bool {
-    crate::http::header(headers, "accept")
+    crate::server::http::model::header(headers, "accept")
         .map(|value| value.to_ascii_lowercase().contains("text/html"))
         .unwrap_or(false)
 }

@@ -14,10 +14,10 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use crate::platform::config::Config;
-use crate::http;
+use crate::server::http::model as http;
 use crate::kernel::failure::ProblemError;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
-use crate::lan::{self, AuthKind, Lan};
+use crate::server::auth::lan::{self, AuthKind, Lan};
 use crate::platform::log;
 use crate::manage::package;
 use crate::platform::paths::Paths;
@@ -769,7 +769,7 @@ mod tests {
             ("PUT", "/api/v1/file/uploads/abc/parts/2"),
         ] {
             assert!(
-                crate::face::blob_upload::upload_target(&crate::http::Head {
+                crate::face::blob_upload::upload_target(&crate::server::http::model::Head {
                     method: method.to_string(),
                     path: path.to_string(),
                     version: "HTTP/1.1".to_string(),

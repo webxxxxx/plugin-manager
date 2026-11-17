@@ -4,8 +4,8 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::http;
-use crate::lan::{AuthKind, Lan};
+use crate::server::http::model as http;
+use crate::server::auth::lan::{AuthKind, Lan};
 use crate::platform::log;
 
 use super::contract::{
@@ -291,7 +291,7 @@ mod tests {
             path: "/api/v1/version".into(),
             headers: Vec::new(),
             peer: "127.0.0.1".parse().expect("peer"),
-            principal: crate::lan::AuthKind::None,
+            principal: crate::server::auth::lan::AuthKind::None,
             body: Vec::new(),
             deadline: None,
             cancel: None,

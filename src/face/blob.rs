@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::platform::storage::blob;
-use crate::http;
+use crate::server::http::model as http;
 use crate::platform::paths::Paths;
 use crate::server::http::{
     BlockingOutcome, CloseReason, FileSend, OutBuffer, Request, StreamAction, StreamClass,
@@ -243,7 +243,7 @@ impl DownloadStream {
                 // renders a refusal without parsing it.
                 self.install(Opened::response(http::json_error(
                     status,
-                    crate::http::code_for(status),
+                    crate::server::http::model::code_for(status),
                     &message,
                 )));
             }
@@ -759,7 +759,7 @@ fn etag_matches(header: &str, etag: &str, strong: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lan::AuthKind;
+    use crate::server::auth::lan::AuthKind;
     use std::io::{Read, Seek, SeekFrom};
 
     fn request(method: &str, path: &str, headers: &[(&str, &str)]) -> Request {

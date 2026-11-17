@@ -27,8 +27,8 @@ use crate::platform::config::Config;
 use crate::face::blob_routes;
 use crate::face::plugin_ui::{ui_path, UiPath};
 use crate::face::support::{decode, error};
-use crate::http;
-use crate::lan::{self, AuthKind, Lan, LanStatus};
+use crate::server::http::model as http;
+use crate::server::auth::lan::{self, AuthKind, Lan, LanStatus};
 use crate::platform::log;
 use crate::manage::package;
 use crate::platform::paths::Paths;
@@ -41,7 +41,7 @@ use crate::server::http::threads::{
 };
 use crate::server::mcp::transport;
 use crate::platform::host::threads;
-use crate::webui;
+use crate::face::webui as webui;
 
 pub struct Api {
     lan: Arc<Mutex<Lan>>,
@@ -690,7 +690,7 @@ fn respond(config: &Config, request: &HttpRequest, lan: &Arc<Mutex<Lan>>) -> Vec
             Err(_) => return error(500, "internal", "auth state unavailable"),
         };
         return transport::handle(
-            &|request| crate::mcp::serve_modern(&config.paths.config_dir, request),
+            &|request| crate::face::mcp::serve_modern(&config.paths.config_dir, request),
             &transport::Request {
                 method: &request.method,
                 headers: &request.headers,
