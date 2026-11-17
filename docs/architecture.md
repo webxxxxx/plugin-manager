@@ -386,7 +386,7 @@ flowchart LR
     S5 --> S6["6 目录纯搬家"]
     S6 --> DONE["目标树"]
 
-    NOW["当前：0–2 部分完成<br/>S1 已回调化<br/>S4 契约已定（#113）<br/>server-loop 已接管 HTTP（#114）<br/>stream handler 与插件 UI 静态资源（#115）<br/>阻塞池与首个 Blocking 路由（#116）<br/>管理 API / login / 控制台走 face（#117）<br/>blob/file 下载走 stream handler（#118）<br/>blob/file 上传走 stream handler（#119）<br/>export spk/spkb 走 stream handler（#120）<br/>import/install 走 stream handler（#121）<br/>插件 UI SSE/WS/raw 走 stream handler（#122）<br/>MCP SSE 进度流走 stream handler（#123）<br/>控制通道与出站管理流并入 server-loop（#124）<br/>删除 legacy bridge / workers / temp-cleaner（#125）"]:::current
+    NOW["当前：0–2 部分完成<br/>S1 已回调化<br/>S4 契约已定（#113）<br/>server-loop 已接管 HTTP（#114）<br/>stream handler 与插件 UI 静态资源（#115）<br/>阻塞池与首个 Blocking 路由（#116）<br/>管理 API / login / 控制台走 face（#117）<br/>blob/file 下载走 stream handler（#118）<br/>blob/file 上传走 stream handler（#119）<br/>export spk/spkb 走 stream handler（#120）<br/>import/install 走 stream handler（#121）<br/>插件 UI SSE/WS/raw 走 stream handler（#122）<br/>MCP SSE 进度流走 stream handler（#123）<br/>控制通道与出站管理流并入 server-loop（#124）<br/>删除 legacy bridge / workers / temp-cleaner（#125）<br/>插件 stdio 并入 supervisor-loop；默认 4（#126）"]:::current
     NOW -.->|下一步| S3
 
     classDef current fill:#ffe08a,stroke:#b8860b,stroke-width:3px,color:#000
