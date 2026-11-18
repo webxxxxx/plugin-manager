@@ -299,14 +299,12 @@ impl PluginUiStream {
                 return PluginUiStream::error(500, "internal", &format!("stat UI asset: {}", error))
             }
         };
-        let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-        let etag = webui::etag(modified, metadata.len());
-        let response_headers = webui::web_headers(&etag);
-        if webui::not_modified(http::header(headers, "if-none-match"), &etag) {
+        let validators = webui::asset_validators(&metadata, http::header(headers, "if-none-match"));
+        if validators.matches_if_none_match() {
             return PluginUiStream::response(http::response_with_headers(
                 304,
                 mime,
-                &response_headers,
+                validators.headers(),
                 b"",
             ));
         }
@@ -327,7 +325,7 @@ impl PluginUiStream {
             // `injected` already contains the file's first `offset` bytes, so
             // the remainder is `length - offset`; do not count them twice.
             let body_len = length + injected.len() as u64 - offset;
-            let mut head = http::response_head(200, mime, &response_headers, body_len);
+            let mut head = http::response_head(200, mime, validators.headers(), body_len);
             head.extend_from_slice(&injected);
             if offset >= length {
                 return PluginUiStream::response(head);
@@ -342,7 +340,7 @@ impl PluginUiStream {
                 },
             };
         }
-        let head = http::response_head(200, mime, &response_headers, length);
+        let head = http::response_head(200, mime, validators.headers(), length);
         if length == 0 {
             // No file bytes to hand over; the head is the whole response.
             return PluginUiStream::response(head);
@@ -432,6 +430,7 @@ impl StreamHandler for PluginUiStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::http::engine::HttpRequest;
     use crate::server::http::BodyPolicy;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -587,6 +586,61 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 304 Not Modified\r\n"), "{text}");
         assert!(text.contains(&format!("ETag: {}\r\n", etag)), "{text}");
         assert_eq!(reason, CloseReason::Completed);
+    }
+
+    /// One metadata plus one `If-None-Match` must give both faces the same
+    /// ETag header and the same 304 decision. The streamed face is driven with
+    /// the bytes the server would write; the buffered face is the fallback's
+    /// own response builder, reached here through its crate-visible entry.
+    #[test]
+    fn both_faces_agree_on_the_conditional_request_for_one_asset() {
+        let dir = TempDir::new();
+        fs::write(dir.0.join("app.js"), b"console.log(1);").expect("write asset");
+        let path = dir.0.join("app.js");
+        let metadata = fs::metadata(&path).expect("metadata");
+        let tag = webui::etag(metadata.modified().unwrap_or(UNIX_EPOCH), metadata.len());
+        let base = "/plugin-ui/demo/tok/";
+
+        for (if_none_match, status) in [
+            (tag.clone(), "HTTP/1.1 304 Not Modified\r\n"),
+            ("\"other\"".to_string(), "HTTP/1.1 200 OK\r\n"),
+        ] {
+            let request_headers = headers(&[("If-None-Match", if_none_match.as_str())]);
+            let (streamed, _) = drive(
+                PluginUiStream::asset(&request_headers, "app.js", &assets(&dir), base),
+                4096,
+            );
+            let buffered = crate::face::fallback::serve_web_file(
+                &HttpRequest {
+                    method: "GET".into(),
+                    path: "/plugin-ui/demo/tok/app.js".into(),
+                    version: "HTTP/1.1".into(),
+                    headers: request_headers,
+                    body: Vec::new(),
+                },
+                &path,
+                &metadata,
+                base,
+            );
+            for (side, response) in [("streamed", streamed), ("buffered", buffered)] {
+                let response = String::from_utf8_lossy(&response).to_string();
+                assert!(response.starts_with(status), "{side}: {response}");
+                assert!(
+                    response.contains(&format!("ETag: {}\r\n", tag)),
+                    "{side}: {response}"
+                );
+                assert!(
+                    response.contains("Cache-Control: no-cache\r\n"),
+                    "{side}: {response}"
+                );
+                if status.contains("304") {
+                    assert!(
+                        response.ends_with("\r\n\r\n"),
+                        "{side} 304 must carry no body: {response}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
