@@ -437,6 +437,14 @@ impl Slot {
         self.protocol = protocol;
     }
 
+    /// Whether callers depend on this service's stdio channel staying open: a
+    /// notify-ready plugin speaks JSON-RPC on it, and a protocol-3 plugin
+    /// carries the raw transport on it. Everything else (`ready: exec` with
+    /// protocol 1/2) is fire-and-forget once spawned.
+    pub(crate) fn is_channel_peer(&self) -> bool {
+        self.exec.ready == Ready::Notify || self.protocol == 3
+    }
+
     /// Seed the state for a service that was already unhealthy at scan time
     /// (for example a plugin whose compat check failed). No process is attached.
     pub(crate) fn set_initial_state(&mut self, state: State) {
@@ -1752,6 +1760,28 @@ mod tests {
             test_paths(),
             test_limits(),
         ))
+    }
+
+    #[test]
+    fn notify_and_raw_transport_services_are_channel_peers() {
+        // #183: a channel peer must stay alive for callers; a clean exit is
+        // death, not completion. Protocol 1/2 exec services own no channel.
+        let mut slot = slot();
+        assert!(
+            slot.is_channel_peer(),
+            "a notify service must stay reachable"
+        );
+
+        let mut fire_and_forget = exec();
+        fire_and_forget.ready = Ready::Exec;
+        slot.set_exec(fire_and_forget);
+        assert!(!slot.is_channel_peer(), "exec protocol 1 is fire-and-forget");
+
+        slot.set_protocol(3);
+        assert!(
+            slot.is_channel_peer(),
+            "protocol 3 carries the raw transport"
+        );
     }
 
     fn queue(slot: &mut Slot, id: u64, deadline: u64) -> Receiver<String> {
