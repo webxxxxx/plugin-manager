@@ -36,7 +36,7 @@ Accepted（2026-11-18）。细化 [docs/architecture.md](../architecture.md) §5
 - **能力面 → tools 不进内核。** 它只有 MCP 一个消费方（HTTP 没有能力面路由），按 §8 的 seam 判定不建「内核值 + 面映射」两层；`tools()` 留在 `face/mcp_tools.rs`。
 - **不新开 trait。** 投影不做成端口：只有一个实现，且 ADR-0019 已为配置拒过同一形状。
 - **验收三档。** ① CLI 文本逐字节不变；② 控制通道 / HTTP / MCP 的 JSON 键集合、值与嵌套不变，**键序不承诺**；③ 跨面一致性断言（stdio 与 HTTP 的工具名相同等）保留。
-- **§7 反例表换新，并保持一条未修。** 表的作用是证明四条不变量不是空话；全换成已修的就又成了空话。
+- **§7 反例表只记真实反例，不设配额。** 修好一行就翻成「已修于 #N」，表里可以全是已修；新反例只在工作中自然碰到时补。「规则不是空话」由 `dep-lint` 的 V7「单点组装」证明（#220）：同一份组合在第二个函数里再拼一遍就红。
 
 ## Considered options
 
@@ -53,6 +53,7 @@ Accepted（2026-11-18）。细化 [docs/architecture.md](../architecture.md) §5
 - `Slot::set_projector` 曾是「想象中的 seam」的现成反例：唯一注入点在组合根，而读它的 `Slot::project` 与 `CallSink::Client` 都标着 `#[cfg(test)]`，生产路径只走 `CallSink::Completion` → `projected_done`。**已由 #209 把那套机制连同 `CallSink` 枚举一起删掉**：槽的完成回调现在直接就是调用方给的 `ReplySink`。
 - `persist_states` 的重复换算**已由 #215 收掉**（写侧行为改动，带模块级测试）：它改吃 `Machine::live()`，锚定只走内核的 `anchored_secs`，`since_ms == 0` 不再落盘成伪造的 epoch 秒。`adopt_runtime` 的缺失回落**已由 #216 收掉**：反向换算走同一处的 `anchored_mono_ms`，缺 `since` 落到 `since_ms == 0`，投影为 `null`。
 - `face/mcp_tools.rs` 与 `kernel/projection.rs` 已登记进 `tools/arch-map.json`（#211 / #212）。
+- `dep-lint` 新增 V7「单点组装」（#220）：`etag` / `web_headers` / `not_modified`、`epoch_of` / `mono_of`、`start_time` 只在允许点出现；§7 的配额规则同一条改动里删掉，反例表不再生产票。
 - 词表新增「值投影」「协议投影」「运行面（Live）」三条；前两条由 #210 落地，第三条由 #213 补。
 - MCP 分页包与 auth 四键的重复**已修于 #210**：控制通道返回面中立值（分页用 `next`），由 MCP 面渲染 `nextCursor`；auth 四键从同一 `LanStatus` 渲染，并有一条跨面一致性测试。#213 负责把 §7 的这条反例换掉。
 - **控制通道只传面中立值。** 控制 RPC 的结果不写对外协议的字段名；需要跨进程传递的值用中性名，由对外面渲染成协议报文。

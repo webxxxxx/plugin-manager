@@ -116,11 +116,13 @@ node tools/check.mjs cross                   # x86_64-unknown-linux-musl
 node tools/check.mjs cross <target>
 
 # 跨平台行为（Windows 宿主，WSL2）：cross 只编译；Linux 的 reactor、线程预算与
-# cfg(unix) 测试在 WSL 里真跑。用票自己的 worktree，target 放 Linux 文件系统。
-#   cd /mnt/d/<repo>/<repo>/.worktrees/<ticket>          # worktree 在仓库内 .worktrees/
+# cfg(unix) 测试在 WSL 里真跑。一条命令：从当前 worktree（或仓库根）推 WSL 路径与
+# /tmp/wt-<目录名>-target，发行版默认 Debian（SVCD_WSL_DISTRO 覆盖）。
+node tools/check.mjs linux                    # 全量；非 Windows 宿主上等价 full
+node tools/check.mjs linux <filter>           # 单条/单组用例（--exact 语义同 cargo test）
+
+# 原始命令（排查时用）：cd /mnt/d/<repo>/<repo>/.worktrees/<ticket> &&
 #   CARGO_TARGET_DIR=/tmp/wt-<ticket>-target cargo test --no-fail-fast -- --test-threads=1
-#   CARGO_TARGET_DIR=/tmp/wt-<ticket>-target cargo test --test http \
-#     unix_idle_thread_count_has_no_per_request_or_per_stream_threads -- --exact
 # worktree 的 .git 文件里是 Windows 绝对路径，WSL 里 git 命令不可用；cargo/rustc
 # 不依赖它，测试不受影响。
 

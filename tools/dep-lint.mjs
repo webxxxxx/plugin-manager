@@ -499,6 +499,108 @@ function categoryViolations(sources) {
   );
 }
 
+/// V7：单点组装。同一份「两三个调用拼起来的判定或投影」只许拼一次；第二次
+/// 拼接就是 #215–#219 那一类重复。每条规则列一组成员正则，并给出允许点：
+/// 一条 fn 里命中的成员数 ≥ `min`（默认 1，即「只许在这里调用」）、且不在
+/// 允许点，就报违规。允许点可以只给文件（整文件放行），也可以精确到函数名。
+/// 成员定义本身也算命中，所以定义所在的文件或函数要进允许点。
+const ASSEMBLY_RULES = [
+  {
+    name: "静态资源条件请求投影",
+    members: [/\betag\(/, /\bweb_headers\(/, /\bnot_modified\(/],
+    min: 2,
+    allow: [{ file: "src/face/webui.rs", item: "asset_validators" }],
+    hint: "ETag/304 只经 face/webui.rs 的 asset_validators 组装（#218）。",
+  },
+  {
+    name: "单调毫秒 → epoch 秒的锚定",
+    members: [/\.epoch_of\(/],
+    allow: [{ file: "src/kernel/projection.rs" }],
+    hint: "锚定只许 kernel/projection.rs 的 anchored_secs*（#215）。",
+  },
+  {
+    name: "epoch 秒 → 单调毫秒的锚定",
+    members: [/\.mono_of\(/],
+    allow: [{ file: "src/kernel/projection.rs" }],
+    hint: "反向锚定只许 kernel/projection.rs 的 anchored_mono_ms（#216）。",
+  },
+  {
+    name: "pid 创建时间探针",
+    members: [/start_time\(/],
+    allow: [
+      { file: "src/platform/host/process.rs" },
+      { file: "src/daemon.rs", item: "process_probe" },
+    ],
+    hint: "starttime 只在 process_probe 里探；判定走 runtime::pid_state（#217）。",
+  },
+];
+
+/// 生产 fn 的正文区间（入参是 `stripComments` 遮罩过的文本）。`#[cfg(test)]`
+/// 区域整段跳过；正文取参数表 `)` 之后的 `{` 到配对 `}`，所以签名里的符号
+/// 不会被算成组装。
+function functionRegions(masked) {
+  const tests = testRegions(masked);
+  const inTests = (offset) => tests.some(([start, end]) => offset >= start && offset <= end);
+  const out = [];
+  const pattern = /\bfn\s+([A-Za-z0-9_]+)\s*(?:<[^>{}]*>)?\s*\(/g;
+  for (let match = pattern.exec(masked); match; match = pattern.exec(masked)) {
+    if (inTests(match.index)) continue;
+    const body = functionBody(masked, match.index + match[0].length - 1);
+    if (body) out.push({ name: match[1], start: match.index, body });
+  }
+  return out;
+}
+
+/// 从参数表的 `(` 找到配对的 `)`，再找紧跟着的本体 `{` 与其 `}`。
+function functionBody(text, open) {
+  let depth = 0;
+  for (let index = open; index < text.length; index += 1) {
+    if (text[index] === "(") depth += 1;
+    else if (text[index] === ")") {
+      depth -= 1;
+      if (depth === 0) {
+        const opener = itemOpener(text, index + 1);
+        return opener ? text.slice(index + 1, opener.end) : null;
+      }
+    }
+  }
+  return null;
+}
+
+function assemblyViolationsIn(file, text) {
+  const masked = stripComments(text);
+  const lineStarts = [0];
+  for (let index = 0; index < masked.length; index += 1) {
+    if (masked[index] === "\n") lineStarts.push(index + 1);
+  }
+  const out = [];
+  for (const fn of functionRegions(masked)) {
+    for (const rule of ASSEMBLY_RULES) {
+      const allowed = rule.allow.some(
+        (entry) => entry.file === file && (!entry.item || entry.item === fn.name),
+      );
+      if (allowed) continue;
+      const hits = rule.members.filter((member) => member.test(fn.body));
+      if (hits.length >= (rule.min ?? 1)) {
+        out.push({
+          rule: rule.name,
+          file,
+          item: fn.name,
+          line: lineNumberAt(lineStarts, fn.start),
+          hint: rule.hint,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+function assemblyViolations(sources) {
+  return sources.flatMap((source) =>
+    assemblyViolationsIn(source.file, readFileSync(source.full, "utf8")),
+  );
+}
+
 const SELFTEST_CASES = [
   {
     name: "生产里的 detail 分支",
@@ -610,6 +712,55 @@ const SELFTEST_SEAM = [
   },
 ];
 
+const SELFTEST_ASSEMBLY = [
+  {
+    name: "同一函数里第二次组装算违规",
+    file: "src/face/other.rs",
+    source:
+      'fn render(metadata: &Metadata) -> Vec<(String, String)> {\n    let tag = webui::etag(modified, 1);\n    webui::web_headers(&tag)\n}\n',
+    expected: ["静态资源条件请求投影"],
+  },
+  {
+    name: "允许的组装点不算",
+    file: "src/face/webui.rs",
+    source:
+      'fn asset_validators(metadata: &Metadata) -> bool {\n    let tag = etag(modified, 1);\n    let _ = web_headers(&tag);\n    not_modified(None, &tag)\n}\n',
+    expected: [],
+  },
+  {
+    name: "同一文件两个函数各出现一次不算",
+    file: "src/face/other.rs",
+    source:
+      'fn build(metadata: &Metadata) -> String {\n    etag(modified, 1)\n}\nfn headers(tag: &str) -> usize {\n    web_headers(tag).len()\n}\n',
+    expected: [],
+  },
+  {
+    name: "名单外的锚定算违规",
+    file: "src/daemon.rs",
+    source: 'fn persist(now: Now, ms: u64) -> u64 {\n    now.epoch_of(ms)\n}\n',
+    expected: ["单调毫秒 → epoch 秒的锚定"],
+  },
+  {
+    name: "锚定留在 projection 里不算",
+    file: "src/kernel/projection.rs",
+    source: 'fn anchored_secs(now: Now, ms: u64) -> Option<u64> {\n    Some(now.epoch_of(ms))\n}\n',
+    expected: [],
+  },
+  {
+    name: "长相相近的标识符不算（normalize_etag）",
+    file: "src/platform/storage/upload.rs",
+    source: 'fn compare(etag: &str) -> bool {\n    normalize_etag(etag) == etag\n}\n',
+    expected: [],
+  },
+  {
+    name: "测试里的第二次组装不算",
+    file: "src/face/other.rs",
+    source:
+      '#[cfg(test)]\nmod tests {\n    fn t() {\n        let tag = etag(m, 1);\n        let _ = web_headers(&tag);\n    }\n}\n',
+    expected: [],
+  },
+];
+
 function selftest() {
   let total = 0;
   let failures = 0;
@@ -643,11 +794,16 @@ function selftest() {
     check(item.name, found, [...new Set(item.expected)].sort());
   }
 
+  for (const item of SELFTEST_ASSEMBLY) {
+    const found = [...new Set(assemblyViolationsIn(item.file, item.source).map((entry) => entry.rule))].sort();
+    check(item.name, found, [...new Set(item.expected)].sort());
+  }
+
   console.log(`selftest: ${total - failures}/${total} 通过`);
   return failures;
 }
 
-function report({ map, modules, sources, edges, unknown, stale, missingFiles, badFileModules, unmapped, layers, cycles, suffixes, seam, category }) {
+function report({ map, modules, sources, edges, unknown, stale, missingFiles, badFileModules, unmapped, layers, cycles, suffixes, seam, category, assembly }) {
   const lines = [];
   lines.push("dep-lint · 观测基线（只读，不改代码）");
   lines.push(`模块 ${sources.length} 个源文件，引用边 ${edges.length} 条，映射 ${modules.size} 项`);
@@ -723,6 +879,13 @@ function report({ map, modules, sources, edges, unknown, stale, missingFiles, ba
   for (const item of category) lines.push(`  ${item.file}:${item.line}  ${item.rule}  —— ${item.hint}`);
   if (category.length === 0) lines.push("  （无）");
 
+  lines.push("");
+  lines.push(`[V7] 单点组装：同一份组合只拼一次（${assembly.length}）`);
+  for (const item of assembly) {
+    lines.push(`  ${item.file}:${item.line}  ${item.item}  ${item.rule}  —— ${item.hint}`);
+  }
+  if (assembly.length === 0) lines.push("  （无）");
+
   const total =
     layers.length +
     cycles.length +
@@ -733,10 +896,11 @@ function report({ map, modules, sources, edges, unknown, stale, missingFiles, ba
     badFileModules.length +
     unmapped.length +
     seam.length +
-    category.length;
+    category.length +
+    assembly.length;
   lines.push("");
   lines.push(
-    `合计 ${total} 条违规（层方向 ${layers.length} · 循环分量 ${cycles.length} · 后缀 ${suffixes.errors.length} · 映射 ${mapCount} · seam ${seam.length} · 失败类别 ${category.length}）`,
+    `合计 ${total} 条违规（层方向 ${layers.length} · 循环分量 ${cycles.length} · 后缀 ${suffixes.errors.length} · 映射 ${mapCount} · seam ${seam.length} · 失败类别 ${category.length} · 单点组装 ${assembly.length}）`,
   );
   return { text: lines.join("\n"), total };
 }
@@ -761,10 +925,11 @@ const cycles = cycleViolations(nodes, edges);
 const suffixes = suffixViolations(sources, map);
 const seam = seamViolations(sources);
 const category = categoryViolations(sources);
-const { text, total } = report({ map, modules, sources, edges, unknown, stale, missingFiles, badFileModules, unmapped, layers, cycles, suffixes, seam, category });
+const assembly = assemblyViolations(sources);
+const { text, total } = report({ map, modules, sources, edges, unknown, stale, missingFiles, badFileModules, unmapped, layers, cycles, suffixes, seam, category, assembly });
 
 if (args.json) {
-  console.log(JSON.stringify({ total, layers, cycles, suffixes, seam, category, unknown, stale, missingFiles, badFileModules, unmapped, files: sources.length, edges: edges.length }, null, 2));
+  console.log(JSON.stringify({ total, layers, cycles, suffixes, seam, category, assembly, unknown, stale, missingFiles, badFileModules, unmapped, files: sources.length, edges: edges.length }, null, 2));
 } else {
   console.log(text);
 }
