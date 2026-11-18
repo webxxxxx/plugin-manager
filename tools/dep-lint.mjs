@@ -5,9 +5,11 @@
 //   1. 层方向：调用者的层 rank 必须 >= 被调用者；反向即违规。
 //   2. 循环依赖：模块图必须是 DAG；报告强连通分量，并给出一条具体短环。
 //   3. 文件名后缀：协议名只该在 server/ 出现一次（_http / _handler / _manager / utils）。
-//   4. 映射卫生：映射里的模块必须在 src/ 存在；src/ 的顶层模块必须已映射。
+//   4. 映射卫生：映射里的模块必须在 src/ 存在；src/ 的顶层模块必须已映射；
+//      `files` 的每个路径必须在磁盘上存在、每个 value 必须是合法模块键；
+//      每个 src/*.rs 都必须登记（新文件要显式选模块，不许静默回退）。
 //   5. seam 不变量：子进程 stdio 的句柄与管道只在 src/wire/contract/stdio 里出现；
-//      正在被 seam 接管的调用方（slot/hook/daemon/rawhub）不再自己 Stdio::piped。
+//      `Stdio::piped` 只在显式 allowlist（已登记的直接调用方）里出现，名单外一律违规。
 //   6. 失败类别：`#[cfg(test)]` 之外不按 `detail` / `message` 的文案分支或比较
 //      （S5 的投影不变量，见 docs/architecture.md §8）。
 //
@@ -20,7 +22,7 @@
 //
 // 不做：model/check/ops 三层检查（代码还没分层，会全是假阳性），也不改任何代码。
 
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -49,11 +51,39 @@ function loadMap(path) {
   const rank = new Map(map.layers.map((layer) => [layer.name, layer.rank]));
   const modules = new Map(Object.entries(map.modules));
   // 文件 → 逻辑模块（`files`）。搬家会改路径但不会改模块身份：列出的文件按
-  // 映射取键，没列出的按路径第一段。这样目录重排（step 6）不移动模块图的边。
+  // 映射取键；`files` 覆盖全部 src/*.rs（V4 强制），未登记的路径第一段只作为
+  // selftest 的回退用例存在。
   const fileModules = new Map(
-    Object.entries(map.files ?? {}).map(([file, moduleName]) => [file.split("\\").join("/"), moduleName]),
+    Object.entries(map.files ?? {}).map(([file, moduleName]) => [normalizeFileKey(file), moduleName]),
   );
   return { map, rank, modules, fileModules };
+}
+
+function normalizeFileKey(file) {
+  return file.split("\\").join("/");
+}
+
+/// 文件 → 逻辑模块：先查 `files`，落空按路径第一段（`src/kernel/x.rs` → `kernel`）。
+function resolveFileModule(file, fileModules) {
+  return (
+    fileModules.get(file) ??
+    file.replace(/^src\//, "").split("/")[0].replace(/\.rs$/, "")
+  );
+}
+
+/// `files` 自身的卫生：键必须存在，值必须是合法模块键。`exists` 由调用方注入，
+/// 这样 selftest 不需要真文件。
+function partitionFileModules(fileModules, modules, exists) {
+  const missing = [];
+  const unknown = [];
+  for (const [file, name] of fileModules) {
+    if (!exists(file)) {
+      missing.push(file);
+      continue;
+    }
+    if (!modules.has(name)) unknown.push({ file, name });
+  }
+  return { missing, unknown };
 }
 
 function collectSources(dir, out = []) {
@@ -76,9 +106,8 @@ function scanSources(srcDir, modules, fileModules) {
       const relative = full.slice(srcDir.length + 1).split("\\").join("/");
       const base = relative.slice(relative.lastIndexOf("/") + 1, -3);
       const file = `src/${relative}`;
-      const module =
-        fileModules.get(file) ?? relative.split("/")[0].replace(/\.rs$/, "");
-      return { full, file, base, module };
+      const module = resolveFileModule(file, fileModules);
+      return { full, file, base, module, explicit: fileModules.has(file) };
     });
   const edges = [];
   const unknown = [];
@@ -323,31 +352,39 @@ const SEAM_RULES = [
   {
     name: "stdio 的调用方直接开管道",
     pattern: /\bStdio::piped\b/,
-    files: [
-      "src/supervise/slot.rs",
-      "src/supervise/hook.rs",
-      "src/daemon.rs",
-      "src/wire/contract/rawhub.rs",
+    allowed: (file) =>
+      file === "src/wire/contract/stdio.rs" ||
+      file.startsWith("src/wire/contract/stdio/"),
+    allow: [
+      // 已登记的直接调用方：seam 的同步 API 还没覆盖这两种用途。
+      "src/manage/check/interpreter.rs",
+      "src/manage/ops/config.rs",
+      // reactor 的测试 fixture 自建管道。
+      "src/wire/contract/reactor.rs",
     ],
-    hint: "这些文件问 src/wire/contract/stdio 要管道（Plan::notify / exec / hook / stop_hook）。",
+    hint: "调用方问 src/wire/contract/stdio 要管道（Plan::notify / exec / hook / stop_hook）；新调用方要么改走 seam，要么登记到 allow 并说明理由。",
   },
 ];
 
-function seamViolations(sources) {
+function seamViolationsIn(file, text) {
   const out = [];
-  for (const source of sources) {
-    for (const rule of SEAM_RULES) {
-      if (rule.files && !rule.files.includes(source.file)) continue;
-      if (rule.allowed && rule.allowed(source.file)) continue;
-      const lines = stripComments(readFileSync(source.full, "utf8")).split("\n");
-      for (let line = 0; line < lines.length; line += 1) {
-        if (rule.pattern.test(lines[line])) {
-          out.push({ rule: rule.name, file: source.file, line: line + 1, hint: rule.hint });
-        }
+  for (const rule of SEAM_RULES) {
+    if (rule.allow && rule.allow.includes(file)) continue;
+    if (rule.allowed && rule.allowed(file)) continue;
+    const lines = stripComments(text).split("\n");
+    for (let line = 0; line < lines.length; line += 1) {
+      if (rule.pattern.test(lines[line])) {
+        out.push({ rule: rule.name, file, line: line + 1, hint: rule.hint });
       }
     }
   }
   return out;
+}
+
+function seamViolations(sources) {
+  return sources.flatMap((source) =>
+    seamViolationsIn(source.file, readFileSync(source.full, "utf8")),
+  );
 }
 
 /// V6：失败类别的不变量（#149–#151）。生产代码按 `Problem` 类别决定行为；`detail`
@@ -509,23 +546,108 @@ const SELFTEST_CASES = [
   },
 ];
 
+const SELFTEST_IDENTITY = [
+  {
+    name: "files 命中优先于首段回退",
+    file: "src/manage/ops/scan.rs",
+    files: [["src/manage/ops/scan.rs", "plugin"]],
+    expected: "plugin",
+  },
+  {
+    name: "未命中回退路径首段",
+    file: "src/manage/ops/new.rs",
+    files: [],
+    expected: "manage",
+  },
+  {
+    name: "Windows 分隔符先归一",
+    file: normalizeFileKey("src\\manage\\ops\\scan.rs"),
+    files: [["src/manage/ops/scan.rs", "plugin"]],
+    expected: "plugin",
+  },
+];
+
+const SELFTEST_FILE_MAP = [
+  {
+    name: "过期 files 键被报出",
+    files: [["src/gone.rs", "kernel"]],
+    exists: () => false,
+    expected: { missing: ["src/gone.rs"], unknown: [] },
+  },
+  {
+    name: "files 指向不存在的模块被报出",
+    files: [["src/main.rs", "nope"]],
+    exists: () => true,
+    expected: { missing: [], unknown: [{ file: "src/main.rs", name: "nope" }] },
+  },
+  {
+    name: "健康的 files 表零违规",
+    files: [["src/main.rs", "api"]],
+    exists: () => true,
+    modules: ["api"],
+    expected: { missing: [], unknown: [] },
+  },
+];
+
+const SELFTEST_SEAM = [
+  {
+    name: "名单外的文件自己开管道算违规",
+    file: "src/server/http/threads.rs",
+    source: "let stderr = Stdio::piped();\n",
+    expected: ["stdio 的调用方直接开管道"],
+  },
+  {
+    name: "已登记的直接调用方不算",
+    file: "src/manage/ops/config.rs",
+    source: "let stderr = Stdio::piped();\n",
+    expected: [],
+  },
+  {
+    name: "stdio seam 自己不算",
+    file: "src/wire/contract/stdio/platform/unix.rs",
+    source: "let stderr = Stdio::piped();\n",
+    expected: [],
+  },
+];
+
 function selftest() {
+  let total = 0;
   let failures = 0;
-  for (const item of SELFTEST_CASES) {
-    const found = [...new Set(categoryViolationsIn("<selftest>", item.source).map((entry) => entry.rule))].sort();
-    const expected = [...new Set(item.expected)].sort();
+  const check = (name, found, expected) => {
+    total += 1;
     const ok = JSON.stringify(found) === JSON.stringify(expected);
-    console.log(`selftest: ${ok ? "ok" : "FAILED"}  ${item.name}`);
+    console.log(`selftest: ${ok ? "ok" : "FAILED"}  ${name}`);
     if (!ok) {
       failures += 1;
       console.log(`  expected ${JSON.stringify(expected)}, got ${JSON.stringify(found)}`);
     }
+  };
+
+  for (const item of SELFTEST_CASES) {
+    const found = [...new Set(categoryViolationsIn("<selftest>", item.source).map((entry) => entry.rule))].sort();
+    check(item.name, found, [...new Set(item.expected)].sort());
   }
-  console.log(`selftest: ${SELFTEST_CASES.length - failures}/${SELFTEST_CASES.length} 通过`);
+
+  for (const item of SELFTEST_IDENTITY) {
+    const fileModules = new Map(item.files);
+    check(item.name, resolveFileModule(item.file, fileModules), item.expected);
+  }
+
+  for (const item of SELFTEST_FILE_MAP) {
+    const modules = new Set(item.modules ?? ["api", "kernel"]);
+    check(item.name, partitionFileModules(new Map(item.files), modules, item.exists), item.expected);
+  }
+
+  for (const item of SELFTEST_SEAM) {
+    const found = [...new Set(seamViolationsIn(item.file, item.source).map((entry) => entry.rule))].sort();
+    check(item.name, found, [...new Set(item.expected)].sort());
+  }
+
+  console.log(`selftest: ${total - failures}/${total} 通过`);
   return failures;
 }
 
-function report({ map, modules, sources, edges, unknown, stale, layers, cycles, suffixes, seam, category }) {
+function report({ map, modules, sources, edges, unknown, stale, missingFiles, badFileModules, unmapped, layers, cycles, suffixes, seam, category }) {
   const lines = [];
   lines.push("dep-lint · 观测基线（只读，不改代码）");
   lines.push(`模块 ${sources.length} 个源文件，引用边 ${edges.length} 条，映射 ${modules.size} 项`);
@@ -581,10 +703,15 @@ function report({ map, modules, sources, edges, unknown, stale, layers, cycles, 
   }
 
   lines.push("");
-  lines.push(`[V4] 模块映射：映射缺失或过期（${stale.length + unknown.length}）`);
+  const mapCount =
+    stale.length + unknown.length + missingFiles.length + badFileModules.length + unmapped.length;
+  lines.push(`[V4] 模块映射：映射缺失或过期（${mapCount}）`);
   for (const name of stale) lines.push(`  ${name}  映射里有，src/ 里没有`);
   for (const file of unknown) lines.push(`  ${file}  src/ 里有，映射里没有`);
-  if (stale.length + unknown.length === 0) lines.push("  （无）");
+  for (const file of missingFiles) lines.push(`  ${file}  files 里登记了，磁盘上没有`);
+  for (const item of badFileModules) lines.push(`  ${item.file}  files 指向不存在的模块 ${item.name}`);
+  for (const file of unmapped) lines.push(`  ${file}  没有 files 映射（新文件必须在 arch-map.files 里登记）`);
+  if (mapCount === 0) lines.push("  （无）");
 
   lines.push("");
   lines.push(`[V5] seam 不变量（${seam.length}）`);
@@ -602,11 +729,14 @@ function report({ map, modules, sources, edges, unknown, stale, layers, cycles, 
     suffixes.errors.length +
     stale.length +
     unknown.length +
+    missingFiles.length +
+    badFileModules.length +
+    unmapped.length +
     seam.length +
     category.length;
   lines.push("");
   lines.push(
-    `合计 ${total} 条违规（层方向 ${layers.length} · 循环分量 ${cycles.length} · 后缀 ${suffixes.errors.length} · 映射 ${stale.length + unknown.length} · seam ${seam.length} · 失败类别 ${category.length}）`,
+    `合计 ${total} 条违规（层方向 ${layers.length} · 循环分量 ${cycles.length} · 后缀 ${suffixes.errors.length} · 映射 ${mapCount} · seam ${seam.length} · 失败类别 ${category.length}）`,
   );
   return { text: lines.join("\n"), total };
 }
@@ -617,6 +747,12 @@ if (args.selftest) {
 }
 const { map, rank, modules, fileModules } = loadMap(args.map);
 const { sources, edges, unknown } = scanSources(args.src, modules, fileModules);
+const unmapped = sources.filter((source) => !source.explicit).map((source) => source.file);
+const { missing: missingFiles, unknown: badFileModules } = partitionFileModules(
+  fileModules,
+  modules,
+  (file) => existsSync(join(REPO, file)),
+);
 const mapped = new Set(sources.map((source) => source.module));
 const stale = [...modules.keys()].filter((name) => !mapped.has(name)).sort();
 const nodes = [...new Set(sources.map((source) => source.module))];
@@ -625,10 +761,10 @@ const cycles = cycleViolations(nodes, edges);
 const suffixes = suffixViolations(sources, map);
 const seam = seamViolations(sources);
 const category = categoryViolations(sources);
-const { text, total } = report({ map, modules, sources, edges, unknown, stale, layers, cycles, suffixes, seam, category });
+const { text, total } = report({ map, modules, sources, edges, unknown, stale, missingFiles, badFileModules, unmapped, layers, cycles, suffixes, seam, category });
 
 if (args.json) {
-  console.log(JSON.stringify({ total, layers, cycles, suffixes, seam, category, unknown, stale, files: sources.length, edges: edges.length }, null, 2));
+  console.log(JSON.stringify({ total, layers, cycles, suffixes, seam, category, unknown, stale, missingFiles, badFileModules, unmapped, files: sources.length, edges: edges.length }, null, 2));
 } else {
   console.log(text);
 }
