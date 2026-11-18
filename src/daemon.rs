@@ -3991,6 +3991,15 @@ while ($null -ne [Console]::In.ReadLine()) { }
 
         let never = runtime::load("never", &daemon.config.paths).expect("never record");
         assert_eq!(never.since, None, "a never-started slot must not anchor 0");
+        // `load` proves the semantic absence; the raw file proves the key is
+        // omitted instead of being written as `"since": null`.
+        let raw =
+            std::fs::read(daemon.config.paths.run_dir.join("never.json")).expect("never record");
+        let raw: Value = serde_json::from_slice(&raw).expect("never record json");
+        assert!(
+            raw.get("since").is_none(),
+            "a never-started slot must omit the since key: {raw}"
+        );
 
         let recorded = runtime::load("started", &daemon.config.paths).expect("started record");
         let service = daemon.registry.get("started").expect("started service");
