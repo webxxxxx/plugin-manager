@@ -1738,21 +1738,9 @@ esac
     }
 
     fn wait_for_state(&self, id: &str, expected: &str, timeout: Duration) -> Value {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let status = self.status(id);
-            if status["summary"]["state"].as_str() == Some(expected) {
-                return status;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "{} never reached {}: {}",
-                id,
-                expected,
-                status
-            );
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        support::wait_for_state(id, expected, timeout, || self.status(id), || {
+            support::tail_lines(&self.daemon_log(), 20)
+        })
     }
 
     fn start_service(&self, id: &str) -> Value {

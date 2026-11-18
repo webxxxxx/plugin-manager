@@ -32,6 +32,7 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use super::RAW_PROTOCOL;
 use crate::wire::message::ipc::{self, FrameEvent};
 use crate::platform::log::LogSink;
 use crate::platform::host::threads;
@@ -67,7 +68,7 @@ impl Plan {
     /// protocols have no input channel at all.
     pub(crate) fn exec(protocol: u32) -> Self {
         Self {
-            stdin: if protocol == 3 {
+            stdin: if protocol == RAW_PROTOCOL {
                 Open::Pipe
             } else {
                 Open::Null

@@ -28,3 +28,7 @@ core 服务里有一类"干完就退出"的：建隧道（`wg-start.sh`）、挂
 - `svc restart` 对完成态 = 重跑一次；对运行中的进程仍是「停 → 起」。
 - 完成态在 daemon 崩溃后按记录恢复（`run/<id>.json` 中 `pid` 为空、`state=running`），因此不会因为一次 svcd 重启重复建隧道/重复挂载；机器重启后记录因 boot id 不符被丢弃，按 `enabled` 重跑——与 shell 版行为一致。优雅重启（`svcd shutdown`/服务管理器 stop）会先停服务、删记录，下次启动重跑。
 - 插件不受影响：退出 0 仍是 `stopped`，退出非 0 仍按退避重试。
+
+## 补（2026-11-18，`#183`）
+
+启动收敛按「是否通道对端」区分：上文的「完成态」只属于**不欠活通道**的服务（`ready: exec` 的 protocol 1/2）。通知型插件或 `protocol: 3` 的服务在启动窗口内落到 `Stopped` 是**失去通道**，`svc start` 返回失败并点名退出码，而不是报成功。判定在 `check::start::start_step`，通道对端的定义见 `GLOSSARY.md`。
