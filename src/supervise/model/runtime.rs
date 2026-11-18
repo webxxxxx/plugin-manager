@@ -101,6 +101,22 @@ pub fn same_boot(record: &Record, boot: Option<&str>) -> bool {
     }
 }
 
+/// Whether the live process named by the record's `pid` is still the one the
+/// record was written for.
+///
+/// `alive` and `current_starttime` come from the platform host; this predicate
+/// itself never touches the OS. A mismatching start time means the pid was
+/// reused. If either side has no start time the record is trusted: the platform
+/// cannot prove reuse, and pid + starttime is the only guard it has. "Cannot
+/// prove reuse" is not the same as "proved to be the same instance".
+pub fn same_process(record: &Record, alive: bool, current_starttime: Option<u64>) -> bool {
+    alive
+        && match (record.starttime, current_starttime) {
+            (Some(expected), Some(actual)) => expected == actual,
+            _ => true,
+        }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +201,37 @@ mod tests {
             ..record
         };
         assert!(same_boot(&legacy, Some("boot-2")));
+    }
+
+    #[test]
+    fn a_reused_pid_is_not_the_same_process() {
+        let record = Record {
+            boot: Some("boot-1".into()),
+            state: State::Running,
+            pid: Some(42),
+            starttime: Some(7_000),
+            since: None,
+            ready_since: None,
+            failures: 0,
+            last_exit: None,
+        };
+
+        assert!(
+            same_process(&record, true, Some(7_000)),
+            "same start time is the same instance"
+        );
+        assert!(
+            !same_process(&record, true, Some(8_000)),
+            "a mismatching start time means the pid was reused"
+        );
+        assert!(!same_process(&record, false, None), "a dead pid is gone");
+
+        // The platform cannot prove reuse when either side has no start time.
+        assert!(same_process(&record, true, None));
+        let legacy = Record {
+            starttime: None,
+            ..record
+        };
+        assert!(same_process(&legacy, true, Some(8_000)));
     }
 }
