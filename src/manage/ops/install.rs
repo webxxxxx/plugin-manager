@@ -1,0 +1,582 @@
+//! 安装：把校验通过的包写进版本目录、流式 staging 与读取。
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
+
+use crate::kernel::failure::{Problem, ProblemError};
+#[cfg(unix)]
+use crate::manage::check::verify::check_hook_shebangs;
+use crate::manage::check::verify::{
+    check_hooks, check_manifest_paths, check_signature, parse_manifest, validate_manifest,
+    validate_script_payload, SignatureMode,
+};
+use crate::manage::model::manifest::{FileData, FileEntry, Manifest, Package};
+use crate::manage::model::ustar::{StreamEntry, TarFeed, TarSink};
+use crate::manage::package::{check_path, hex_bytes, MAX_FILES};
+
+impl Package {
+    pub fn write_to(&self, root: &Path) -> Result<(), ProblemError> {
+        fs::create_dir_all(root)
+            .map_err(|error| Problem::Internal.error(format!("create {}: {}", root.display(), error)))?;
+        write_one(&root.join("manifest.json"), &self.manifest_bytes, 0o644)?;
+        // An insecure install may have arrived without a signature; keep the
+        // version directory honest instead of writing an empty signature file.
+        if !self.signature_bytes.is_empty() {
+            write_one(&root.join("signature.json"), &self.signature_bytes, 0o644)?;
+        }
+        for file in &self.files {
+            let path = root.join(&file.path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| Problem::Internal.error(format!("create {}: {}", parent.display(), error)))?;
+            }
+            write_one(&path, &file.data, file.mode)?;
+        }
+        Ok(())
+    }
+
+    /// Total bytes this package writes to disk: declared files plus the two
+    /// package metadata files.
+    pub fn unpacked_size(&self) -> u64 {
+        let files: u64 = self.files.iter().map(|file| file.data.len() as u64).sum();
+        files
+            .saturating_add(self.manifest_bytes.len() as u64)
+            .saturating_add(self.signature_bytes.len() as u64)
+    }
+
+    /// The manifest's `config` template, if declared.
+    pub fn config_template(&self) -> Option<&FileData> {
+        let path = self.manifest.config.as_deref().unwrap_or("config/config");
+        self.files.iter().find(|file| file.path == path)
+    }
+}
+
+/// A package received as a stream and extracted into a staging directory.
+///
+/// The tar archive itself is never stored: only the final files are written.
+/// `signature_verified` is false for the insecure fallback.
+pub struct StagedPackage {
+    pub manifest: Manifest,
+    #[allow(dead_code)]
+    pub manifest_bytes: Vec<u8>,
+    #[allow(dead_code)]
+    pub signature_bytes: Vec<u8>,
+    pub signature_verified: bool,
+    pub root: std::path::PathBuf,
+    #[allow(dead_code)]
+    pub unpacked_size: u64,
+}
+
+/// A package installer driven by body chunks instead of a blocking reader.
+///
+/// It runs the whole validation sequence in one place: manifest first, the
+/// signature before any payload byte, every entry checked against `files[]`,
+/// then the staged payload. A caller feeds whatever bytes arrived, so no
+/// temporary archive and no per-upload thread exist.
+pub struct StagingInstaller {
+    tar: TarFeed,
+    sink: SpkSink,
+    finished: bool,
+}
+
+impl StagingInstaller {
+    pub fn new(
+        staging: PathBuf,
+        allow_insecure: bool,
+        max_bytes: u64,
+        trust_dir: &Path,
+    ) -> StagingInstaller {
+        StagingInstaller {
+            tar: TarFeed::new(max_bytes),
+            sink: SpkSink::new(staging, allow_insecure, trust_dir.to_path_buf()),
+            finished: false,
+        }
+    }
+
+    /// Feed the next body chunk. The bytes may end anywhere: inside a tar
+    /// header, an entry body or its padding.
+    pub fn feed(&mut self, data: &[u8]) -> Result<(), ProblemError> {
+        self.tar.feed(data, &mut self.sink)
+    }
+
+    /// The body ended: require the end-of-archive marker, check every declared
+    /// file landed, and validate the staged payload. Called once.
+    pub fn finish(&mut self) -> Result<StagedPackage, ProblemError> {
+        if self.finished {
+            return Err(Problem::Internal.error("package already finished"));
+        }
+        self.tar.finish()?;
+        let staged = self.sink.finish()?;
+        self.finished = true;
+        Ok(staged)
+    }
+}
+
+impl Drop for StagingInstaller {
+    fn drop(&mut self) {
+        // A rejected, disconnected or half-fed package must not leave a
+        // staging directory behind. A finished install owns its directory and
+        // the caller removes it if the daemon did not commit it.
+        if !self.finished {
+            let _ = fs::remove_dir_all(&self.sink.staging);
+        }
+    }
+}
+
+struct SpkSink {
+    staging: PathBuf,
+    allow_insecure: bool,
+    /// Where signature verification looks up `<keyId>.pub`.
+    trust_dir: PathBuf,
+    manifest: Option<Manifest>,
+    manifest_bytes: Vec<u8>,
+    signature_bytes: Vec<u8>,
+    signature_verified: bool,
+    signature_checked: bool,
+    payload_started: bool,
+    declared: BTreeMap<String, FileEntry>,
+    seen: BTreeSet<String>,
+    staging_ready: bool,
+    current: Option<Current>,
+}
+
+enum Current {
+    Manifest(Vec<u8>),
+    Signature(Vec<u8>),
+    Payload {
+        file: File,
+        hasher: Sha256,
+        declared: FileEntry,
+        path: PathBuf,
+        written: u64,
+    },
+    Directory,
+}
+
+impl SpkSink {
+    fn new(staging: PathBuf, allow_insecure: bool, trust_dir: PathBuf) -> SpkSink {
+        SpkSink {
+            staging,
+            allow_insecure,
+            trust_dir,
+            manifest: None,
+            manifest_bytes: Vec::new(),
+            signature_bytes: Vec::new(),
+            signature_verified: false,
+            signature_checked: false,
+            payload_started: false,
+            declared: BTreeMap::new(),
+            seen: BTreeSet::new(),
+            staging_ready: false,
+            current: None,
+        }
+    }
+
+    fn prepare_staging(&mut self) -> Result<(), ProblemError> {
+        if self.staging_ready {
+            return Ok(());
+        }
+        if self.staging.exists() {
+            fs::remove_dir_all(&self.staging)
+                .map_err(|error| Problem::Internal.error(format!("remove {}: {}", self.staging.display(), error)))?;
+        }
+        fs::create_dir_all(&self.staging)
+            .map_err(|error| Problem::Internal.error(format!("create {}: {}", self.staging.display(), error)))?;
+        write_one(&self.staging.join("manifest.json"), &self.manifest_bytes, 0o644)?;
+        if !self.signature_bytes.is_empty() {
+            write_one(
+                &self.staging.join("signature.json"),
+                &self.signature_bytes,
+                0o644,
+            )?;
+        }
+        self.staging_ready = true;
+        Ok(())
+    }
+
+    fn start_payload(&mut self, entry: &StreamEntry) -> Result<(), ProblemError> {
+        self.payload_started = true;
+        if entry.kind == b'5' {
+            self.current = Some(Current::Directory);
+            return Ok(());
+        }
+        let declared = self
+            .declared
+            .get(&entry.path)
+            .ok_or_else(|| Problem::Invalid.error(format!("file is not declared in files[]: {}", entry.path)))?
+            .clone();
+        if !self.seen.insert(entry.path.clone()) {
+            return Err(Problem::Invalid.error(format!("duplicate tar entry: {}", entry.path)));
+        }
+        if entry.size != declared.size {
+            return Err(Problem::Invalid.error(format!(
+                "size mismatch for {}: manifest {}, archive {}",
+                entry.path, declared.size, entry.size
+            )));
+        }
+        if entry.mode & 0o777 != declared.mode & 0o777 {
+            return Err(Problem::Invalid.error(format!("mode mismatch for {}", entry.path)));
+        }
+        self.prepare_staging()?;
+        let path = self.staging.join(&entry.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| Problem::Internal.error(format!("create {}: {}", parent.display(), error)))?;
+        }
+        let file =
+            File::create(&path).map_err(|error| Problem::Internal.error(format!("create {}: {}", path.display(), error)))?;
+        self.current = Some(Current::Payload {
+            file,
+            hasher: Sha256::new(),
+            declared,
+            path,
+            written: 0,
+        });
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<StagedPackage, ProblemError> {
+        let manifest = self
+            .manifest
+            .clone()
+            .ok_or_else(|| Problem::Invalid.error("manifest.json is missing"))?;
+        if !self.signature_checked && !self.allow_insecure {
+            return Err(Problem::Invalid.error("signature.json is missing"));
+        }
+        self.prepare_staging()?;
+        if self.seen.len() != self.declared.len() {
+            let missing: Vec<&str> = self
+                .declared
+                .keys()
+                .filter(|path| !self.seen.contains(*path))
+                .map(String::as_str)
+                .collect();
+            return Err(Problem::Invalid.error(format!("missing files: {}", missing.join(", "))));
+        }
+        if self.seen.is_empty() {
+            return Err(Problem::Invalid.error("package has no payload files"));
+        }
+        validate_staged_payload(&manifest, &self.staging)?;
+        let unpacked_size = manifest
+            .files
+            .iter()
+            .map(|file| file.size)
+            .sum::<u64>()
+            .saturating_add(self.manifest_bytes.len() as u64)
+            .saturating_add(self.signature_bytes.len() as u64);
+        Ok(StagedPackage {
+            manifest,
+            manifest_bytes: std::mem::take(&mut self.manifest_bytes),
+            signature_bytes: std::mem::take(&mut self.signature_bytes),
+            signature_verified: self.signature_verified,
+            root: self.staging.clone(),
+            unpacked_size,
+        })
+    }
+}
+
+impl TarSink for SpkSink {
+    fn entry_start(&mut self, entry: &StreamEntry) -> Result<(), ProblemError> {
+        if self.manifest.is_none() {
+            if entry.path != "manifest.json" {
+                return Err(Problem::Invalid.error("manifest.json must be the first entry"));
+            }
+            if entry.size > 1024 * 1024 {
+                return Err(Problem::TooLarge.error("manifest.json is too large"));
+            }
+            self.current = Some(Current::Manifest(Vec::with_capacity(entry.size as usize)));
+            return Ok(());
+        }
+        if !self.signature_checked && !self.payload_started {
+            if entry.path == "signature.json" {
+                if entry.size > 64 * 1024 {
+                    return Err(Problem::TooLarge.error("signature.json is too large"));
+                }
+                self.current = Some(Current::Signature(Vec::with_capacity(entry.size as usize)));
+                return Ok(());
+            }
+            if !self.allow_insecure {
+                return Err(Problem::Invalid.error("signature.json must be the second entry"));
+            }
+            // The operator opted into unsigned packages: the first payload is
+            // the second entry, exactly like the blocking install path.
+            self.signature_checked = true;
+            return self.start_payload(entry);
+        }
+        self.start_payload(entry)
+    }
+
+    fn entry_data(&mut self, data: &[u8]) -> Result<(), ProblemError> {
+        match self.current.as_mut() {
+            Some(Current::Manifest(buffer)) | Some(Current::Signature(buffer)) => {
+                buffer.extend_from_slice(data);
+                Ok(())
+            }
+            Some(Current::Payload {
+                file,
+                hasher,
+                path,
+                written,
+                ..
+            }) => {
+                file.write_all(data)
+                    .map_err(|error| Problem::Internal.error(format!("write {}: {}", path.display(), error)))?;
+                hasher.update(data);
+                *written = written.saturating_add(data.len() as u64);
+                Ok(())
+            }
+            Some(Current::Directory) => Ok(()),
+            None => Err(Problem::Invalid.error("tar entry data without a header")),
+        }
+    }
+
+    fn entry_end(&mut self) -> Result<(), ProblemError> {
+        let Some(current) = self.current.take() else {
+            return Err(Problem::Invalid.error("tar entry ended without a header"));
+        };
+        match current {
+            Current::Manifest(bytes) => {
+                let manifest = parse_manifest(&bytes)?;
+                validate_manifest(&manifest)?;
+                if manifest.platform != crate::platform::target() {
+                    return Err(Problem::UnsupportedPlatform.error(format!(
+                        "platform mismatch: package {}, host {}",
+                        manifest.platform,
+                        crate::platform::target()
+                    )));
+                }
+                let mut declared = BTreeMap::new();
+                for entry in &manifest.files {
+                    check_path(&entry.path)?;
+                    if entry.path == "manifest.json" || entry.path == "signature.json" {
+                        return Err(Problem::Invalid.error("manifest.json/signature.json cannot be in files[]"));
+                    }
+                    if declared.insert(entry.path.clone(), entry.clone()).is_some() {
+                        return Err(Problem::Invalid.error(format!("duplicate files[] entry: {}", entry.path)));
+                    }
+                    if entry.mode & 0o6000 != 0 {
+                        return Err(Problem::Invalid.error(format!("setuid/setgid is not allowed: {}", entry.path)));
+                    }
+                    if declared.len() > MAX_FILES {
+                        return Err(Problem::TooLarge.error("too many files"));
+                    }
+                }
+                check_manifest_paths(&manifest)?;
+                check_hooks(&manifest)?;
+                self.declared = declared;
+                self.manifest_bytes = bytes;
+                self.manifest = Some(manifest);
+                Ok(())
+            }
+            Current::Signature(bytes) => {
+                let verified = if self.allow_insecure {
+                    check_signature(
+                        &self.manifest_bytes,
+                        &bytes,
+                        SignatureMode::Required,
+                        None,
+                        &self.trust_dir,
+                    )
+                    .is_ok()
+                } else {
+                    check_signature(
+                        &self.manifest_bytes,
+                        &bytes,
+                        SignatureMode::Required,
+                        None,
+                        &self.trust_dir,
+                    )?;
+                    true
+                };
+                self.signature_verified = verified;
+                self.signature_bytes = bytes;
+                self.signature_checked = true;
+                Ok(())
+            }
+            Current::Payload {
+                file,
+                hasher,
+                declared,
+                path,
+                written,
+            } => {
+                if written != declared.size {
+                    return Err(Problem::Invalid.error(format!("size mismatch for {}", declared.path)));
+                }
+                let digest = hex_bytes(&hasher.finalize());
+                if digest != declared.sha256 {
+                    return Err(Problem::Invalid.error(format!("sha256 mismatch for {}", declared.path)));
+                }
+                file.sync_all()
+                    .map_err(|error| Problem::Internal.error(format!("sync {}: {}", path.display(), error)))?;
+                set_mode(&path, declared.mode)?;
+                Ok(())
+            }
+            Current::Directory => Ok(()),
+        }
+    }
+}
+
+/// Validate the executable/interpreter and hook constraints from the files
+/// that already landed in the staging directory. Only the small script/hook
+/// files are read; binaries are classified from their first bytes.
+pub fn validate_staged_payload(manifest: &Manifest, root: &Path) -> Result<(), ProblemError> {
+    let mut executables = vec![manifest.exec.path.as_str()];
+    if let Some(lifecycle) = &manifest.lifecycle {
+        for hook in [&lifecycle.start, &lifecycle.stop, &lifecycle.status]
+            .into_iter()
+            .flatten()
+        {
+            executables.push(hook.path.as_str());
+        }
+    }
+    let mut files: Vec<(&str, Vec<u8>)> = Vec::new();
+    for path in executables {
+        let data =
+            fs::read(root.join(path)).map_err(|error| Problem::Internal.error(format!("read {}: {}", path, error)))?;
+        files.push((path, data.into_iter().take(8).collect()));
+    }
+    let borrowed: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(path, data)| (*path, data.as_slice()))
+        .collect();
+    validate_script_payload(manifest, &borrowed)?;
+    #[cfg(unix)]
+    {
+        let mut hooks = Vec::new();
+        for path in [
+            manifest
+                .hooks
+                .as_ref()
+                .and_then(|hooks| hooks.post_install.as_deref()),
+            manifest
+                .hooks
+                .as_ref()
+                .and_then(|hooks| hooks.pre_remove.as_deref()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let data = fs::read(root.join(path))
+                .map_err(|error| Problem::Internal.error(format!("read hook {}: {}", path, error)))?;
+            hooks.push(FileData {
+                path: path.to_string(),
+                data,
+                mode: 0o755,
+            });
+        }
+        check_hook_shebangs(manifest, &hooks)?;
+    }
+    Ok(())
+}
+
+/// Re-open a staging directory produced by [`StagingInstaller`] without
+/// reading the payload again. Used by the daemon's `plugin.install_staged` RPC, which
+/// trusts the HTTP layer to have streamed and hashed the files.
+pub fn load_staged(
+    root: &Path,
+    allow_insecure: bool,
+    trust_dir: &Path,
+) -> Result<StagedPackage, ProblemError> {
+    let manifest_path = root.join("manifest.json");
+    let manifest_bytes = fs::read(&manifest_path)
+        .map_err(|error| Problem::Internal.error(format!("read {}: {}", manifest_path.display(), error)))?;
+    let manifest = parse_manifest(&manifest_bytes)?;
+    validate_manifest(&manifest)?;
+    if manifest.platform != crate::platform::target() {
+        return Err(Problem::UnsupportedPlatform.error(format!(
+            "platform mismatch: package {}, host {}",
+            manifest.platform,
+            crate::platform::target()
+        )));
+    }
+    let mut declared = BTreeMap::new();
+    for entry in &manifest.files {
+        check_path(&entry.path)?;
+        if entry.path == "manifest.json" || entry.path == "signature.json" {
+            return Err(Problem::Invalid.error("manifest.json/signature.json cannot be in files[]"));
+        }
+        if declared.insert(entry.path.clone(), entry.clone()).is_some() {
+            return Err(Problem::Invalid.error(format!("duplicate files[] entry: {}", entry.path)));
+        }
+        if entry.mode & 0o6000 != 0 {
+            return Err(Problem::Invalid.error(format!("setuid/setgid is not allowed: {}", entry.path)));
+        }
+    }
+    check_manifest_paths(&manifest)?;
+    check_hooks(&manifest)?;
+
+    let signature_path = root.join("signature.json");
+    let signature_bytes = match fs::read(&signature_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(Problem::Internal.error(format!("read {}: {}", signature_path.display(), error))),
+    };
+    let signature_verified = if signature_bytes.is_empty() {
+        if !allow_insecure {
+            return Err(Problem::Invalid.error("signature.json is missing"));
+        }
+        false
+    } else if allow_insecure {
+        check_signature(
+            &manifest_bytes,
+            &signature_bytes,
+            SignatureMode::Required,
+            None,
+            trust_dir,
+        )
+        .is_ok()
+    } else {
+        check_signature(
+            &manifest_bytes,
+            &signature_bytes,
+            SignatureMode::Required,
+            None,
+            trust_dir,
+        )?;
+        true
+    };
+    validate_staged_payload(&manifest, root)?;
+    let unpacked_size = manifest
+        .files
+        .iter()
+        .map(|file| file.size)
+        .sum::<u64>()
+        .saturating_add(manifest_bytes.len() as u64)
+        .saturating_add(signature_bytes.len() as u64);
+    Ok(StagedPackage {
+        manifest,
+        manifest_bytes,
+        signature_bytes,
+        signature_verified,
+        root: root.to_path_buf(),
+        unpacked_size,
+    })
+}
+
+fn write_one(path: &Path, data: &[u8], mode: u32) -> Result<(), ProblemError> {
+    let mut handle =
+        File::create(path).map_err(|error| Problem::Internal.error(format!("create {}: {}", path.display(), error)))?;
+    handle
+        .write_all(data)
+        .map_err(|error| Problem::Internal.error(format!("write {}: {}", path.display(), error)))?;
+    handle
+        .sync_all()
+        .map_err(|error| Problem::Internal.error(format!("sync {}: {}", path.display(), error)))?;
+    set_mode(path, mode)
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> Result<(), ProblemError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777))
+        .map_err(|error| Problem::Internal.error(format!("chmod {}: {}", path.display(), error)))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) -> Result<(), ProblemError> {
+    Ok(())
+}
