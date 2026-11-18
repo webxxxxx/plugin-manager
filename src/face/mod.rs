@@ -24,6 +24,7 @@ pub mod fallback;
 #[cfg(feature = "http")]
 pub mod install;
 pub mod mcp;
+pub mod mcp_tools;
 #[cfg(feature = "http")]
 pub mod plugin_streams;
 #[cfg(feature = "http")]

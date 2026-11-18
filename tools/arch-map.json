@@ -306,6 +306,7 @@
     "src/face/fallback.rs": "face",
     "src/face/install.rs": "face",
     "src/face/mcp.rs": "mcp",
+    "src/face/mcp_tools.rs": "mcp",
     "src/face/mod.rs": "face",
     "src/face/plugin_streams/frame.rs": "face",
     "src/face/plugin_streams/mod.rs": "face",
