@@ -133,6 +133,47 @@ pub fn not_modified(if_none_match: Option<&str>, etag: &str) -> bool {
     })
 }
 
+/// The conditional-request projection for one static asset.
+///
+/// The two faces that serve files from disk — the fallback's `serve_web_file`
+/// and the plugin UI's `PluginUiStream::asset` — answer `If-None-Match` the
+/// same way. This is the one place that turns a file's metadata into the
+/// headers every response carries and decides whether the request already
+/// holds that representation. The faces still own their own response shape
+/// (buffered bytes vs. a streamed file) and their own 304 body.
+pub(crate) struct AssetValidators {
+    headers: Vec<(String, String)>,
+    matches_if_none_match: bool,
+}
+
+impl AssetValidators {
+    /// The headers both the 200 and the 304 response carry.
+    pub(crate) fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
+    /// Whether the request's `If-None-Match` selected this representation, so
+    /// the face answers 304 with no body.
+    pub(crate) fn not_modified(&self) -> bool {
+        self.matches_if_none_match
+    }
+}
+
+/// Project an asset's metadata and the request's `If-None-Match` onto its
+/// validators. The modification time falls back to the Unix epoch when the
+/// filesystem cannot report one, so a stat-less entry still gets a stable tag.
+pub(crate) fn asset_validators(
+    metadata: &std::fs::Metadata,
+    if_none_match: Option<&str>,
+) -> AssetValidators {
+    let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+    let etag = etag(modified, metadata.len());
+    AssetValidators {
+        matches_if_none_match: not_modified(if_none_match, &etag),
+        headers: web_headers(&etag),
+    }
+}
+
 /// Insert `<base href="{base}">` so a plugin's relative assets and
 /// `fetch('rpc')` resolve under its own (token-bearing) prefix.
 ///
@@ -318,6 +359,43 @@ mod tests {
         let modified =
             UNIX_EPOCH + Duration::from_secs(1_700_000_000) + Duration::from_micros(123_456);
         assert_eq!(etag(modified, 42), "\"1700000000.123456000-42\"");
+    }
+
+    #[test]
+    fn one_projection_decides_the_304_and_the_headers_of_both_paths() {
+        let root = crate::test_support::temp_dir().join(format!(
+            "svcd-webui-validators-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let path = root.join("app.js");
+        std::fs::write(&path, b"console.log(1);").expect("write asset");
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        let tag = etag(metadata.modified().unwrap_or(UNIX_EPOCH), metadata.len());
+
+        let hit = asset_validators(&metadata, Some(&format!("W/{}", tag)));
+        assert!(
+            hit.not_modified(),
+            "a weak form of the current tag is a 304"
+        );
+        assert_eq!(
+            crate::server::http::model::header(hit.headers(), "etag"),
+            Some(tag.as_str())
+        );
+
+        let miss = asset_validators(&metadata, Some("\"other\""));
+        assert!(!miss.not_modified(), "a different tag keeps the 200 path");
+        assert_eq!(
+            miss.headers(),
+            hit.headers(),
+            "the 200 path carries the same header set as the 304"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

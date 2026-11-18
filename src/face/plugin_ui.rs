@@ -299,14 +299,12 @@ impl PluginUiStream {
                 return PluginUiStream::error(500, "internal", &format!("stat UI asset: {}", error))
             }
         };
-        let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-        let etag = webui::etag(modified, metadata.len());
-        let response_headers = webui::web_headers(&etag);
-        if webui::not_modified(http::header(headers, "if-none-match"), &etag) {
+        let validators = webui::asset_validators(&metadata, http::header(headers, "if-none-match"));
+        if validators.not_modified() {
             return PluginUiStream::response(http::response_with_headers(
                 304,
                 mime,
-                &response_headers,
+                validators.headers(),
                 b"",
             ));
         }
@@ -327,7 +325,7 @@ impl PluginUiStream {
             // `injected` already contains the file's first `offset` bytes, so
             // the remainder is `length - offset`; do not count them twice.
             let body_len = length + injected.len() as u64 - offset;
-            let mut head = http::response_head(200, mime, &response_headers, body_len);
+            let mut head = http::response_head(200, mime, validators.headers(), body_len);
             head.extend_from_slice(&injected);
             if offset >= length {
                 return PluginUiStream::response(head);
@@ -342,7 +340,7 @@ impl PluginUiStream {
                 },
             };
         }
-        let head = http::response_head(200, mime, &response_headers, length);
+        let head = http::response_head(200, mime, validators.headers(), length);
         if length == 0 {
             // No file bytes to hand over; the head is the whole response.
             return PluginUiStream::response(head);

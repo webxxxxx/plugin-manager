@@ -175,11 +175,9 @@ fn serve_web_file(
     base: &str,
 ) -> Vec<u8> {
     let mime = http::content_type(&path.to_string_lossy());
-    let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-    let etag = webui::etag(modified, metadata.len());
-    let headers = webui::web_headers(&etag);
-    if webui::not_modified(request_header(request, "if-none-match"), &etag) {
-        return http::response_with_headers(304, mime, &headers, b"");
+    let validators = webui::asset_validators(metadata, request_header(request, "if-none-match"));
+    if validators.not_modified() {
+        return http::response_with_headers(304, mime, validators.headers(), b"");
     }
     let data = match fs::read(path) {
         Ok(data) => data,
@@ -190,7 +188,7 @@ fn serve_web_file(
     } else {
         data
     };
-    http::response_with_headers(200, mime, &headers, &body)
+    http::response_with_headers(200, mime, validators.headers(), &body)
 }
 
 fn wants_html(request: &HttpRequest) -> bool {
@@ -307,4 +305,64 @@ fn route(config: &Config, request: &HttpRequest) -> Vec<u8> {
 
 fn method_not_allowed(allow: &str) -> Vec<u8> {
     http::method_not_allowed(allow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn request(if_none_match: Option<&str>) -> HttpRequest {
+        HttpRequest {
+            method: "GET".into(),
+            path: "/plugin-ui/demo/tok/app.js".into(),
+            version: "HTTP/1.1".into(),
+            headers: if_none_match
+                .map(|value| vec![("If-None-Match".to_string(), value.to_string())])
+                .unwrap_or_default(),
+            body: Vec::new(),
+        }
+    }
+
+    /// The buffered face answers 304 from the same projection the streamed
+    /// face uses, and both paths carry the projection's whole header set.
+    #[test]
+    fn the_buffered_asset_path_answers_304_with_the_shared_projection_headers() {
+        let root = crate::test_support::temp_dir().join(format!(
+            "svcd-fallback-asset-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("temp root");
+        fs::write(root.join("app.js"), b"console.log(1);").expect("write asset");
+        let (path, metadata) = webui::web_file(&root, "app.js").expect("asset");
+        let tag = webui::etag(metadata.modified().unwrap_or(UNIX_EPOCH), metadata.len());
+        let headers: Vec<String> = webui::asset_validators(&metadata, None)
+            .headers()
+            .iter()
+            .map(|(name, value)| format!("{}: {}\r\n", name, value))
+            .collect();
+
+        let fresh = serve_web_file(&request(Some(&format!("W/{}", tag))), &path, &metadata, "/");
+        let fresh = String::from_utf8_lossy(&fresh).to_string();
+        assert!(
+            fresh.starts_with("HTTP/1.1 304 Not Modified\r\n"),
+            "{fresh}"
+        );
+        for header in &headers {
+            assert!(fresh.contains(header), "304 lost {header:?}:\n{fresh}");
+        }
+
+        let body = serve_web_file(&request(None), &path, &metadata, "/");
+        let body = String::from_utf8_lossy(&body).to_string();
+        assert!(body.starts_with("HTTP/1.1 200 OK\r\n"), "{body}");
+        for header in &headers {
+            assert!(body.contains(header), "200 lost {header:?}:\n{body}");
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }
