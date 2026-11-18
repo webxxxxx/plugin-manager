@@ -4,11 +4,11 @@
 //! plugin tree. Versions live under `<data>/plugins/<id>/<version>/`; `current`
 //! is a version text file and `enabled` is a marker.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::platform::compat;
 use crate::supervise::ops::hook;
@@ -31,6 +31,9 @@ use crate::kernel::contract::Effect;
 static CONFIG_WRITES: Mutex<()> = Mutex::new(());
 
 pub use crate::manage::ops::scan::*;
+pub use crate::manage::model::layout::*;
+pub use crate::manage::ops::config::*;
+use crate::manage::ops::config::write_hash;
 
 pub(crate) fn config_lock() -> MutexGuard<'static, ()> {
     CONFIG_WRITES
@@ -1053,25 +1056,6 @@ fn run_pre_remove(paths: &Paths, limits: &crate::platform::limits::Limits, id: &
     }
 }
 
-pub fn plugin_dir(paths: &Paths, id: &str) -> PathBuf {
-    paths.plugins_dir.join(id)
-}
-
-pub fn current_version(paths: &Paths, id: &str) -> Option<String> {
-    let text = fs::read_to_string(plugin_dir(paths, id).join("current")).ok()?;
-    let version = text.trim();
-    if version.is_empty()
-        || version.split('.').count() != 3
-        || version
-            .split('.')
-            .any(|part| part.is_empty() || !part.chars().all(|c| c.is_ascii_digit()))
-    {
-        None
-    } else {
-        Some(version.to_string())
-    }
-}
-
 fn write_current(plugin_dir: &Path, version: &str) -> Result<(), ProblemError> {
     let path = plugin_dir.join("current");
     fs::write(&path, version)
@@ -1108,164 +1092,6 @@ fn copy_config(package: &Package, plugin_dir: &Path) -> Result<(), ProblemError>
     Ok(())
 }
 
-fn write_hash(path: &Path, hash: &str) -> Result<(), ProblemError> {
-    fs::write(path, hash)
-        .map_err(|error| Problem::Internal.error(format!("write {}: {}", path.display(), error)))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o640));
-    }
-    Ok(())
-}
-
-pub fn lock_config(paths: &Paths, id: &str) -> Result<fs::File, ProblemError> {
-    let path = plugin_dir(paths, id).join("config.lock");
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(|error| Problem::Internal.error(format!("open {}: {}", path.display(), error)))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(Problem::Internal.error(format!(
-                "lock {}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            )));
-        }
-    }
-    Ok(file)
-}
-
-pub fn write_config(path: &Path, data: &[u8]) -> Result<(), ProblemError> {
-    fs::write(path, data)
-        .map_err(|error| Problem::Internal.error(format!("write {}: {}", path.display(), error)))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o640)).map_err(|error| {
-            Problem::Internal.error(format!("chmod {}: {}", path.display(), error))
-        })?;
-    }
-    Ok(())
-}
-
-pub fn active_config(paths: &Paths, id: &str) -> Option<PathBuf> {
-    let path = plugin_dir(paths, id).join("config");
-    path.is_file().then_some(path)
-}
-
-/// Where an installed plugin's declared web UI lives on disk.
-#[derive(Clone, Debug)]
-#[cfg(feature = "http")]
-pub struct WebAssets {
-    /// `payload/web/` inside the current version directory.
-    pub root: PathBuf,
-    /// Entry file relative to `root`; defaults to `index.html`.
-    pub entry: String,
-}
-
-/// Resolve the web UI declared by `manifest.ui`.
-///
-/// Only `web` and `gui` UIs are browser-loadable (the desktop WebView loads the
-/// same files); `headerless` and unknown types have no UI to serve. The entry is
-/// relative to `payload/web/` and defaults to `index.html`.
-#[cfg(feature = "http")]
-pub fn web_assets(paths: &Paths, id: &str) -> Option<WebAssets> {
-    let version = current_version(paths, id)?;
-    let version_dir = plugin_dir(paths, id).join(version);
-    let manifest = read_manifest(&version_dir).ok()?;
-    let ui = manifest.ui.as_ref()?;
-    if ui.kind != "web" && ui.kind != "gui" {
-        return None;
-    }
-    Some(WebAssets {
-        root: version_dir.join("payload/web"),
-        entry: ui.entry.clone().unwrap_or_else(|| "index.html".to_string()),
-    })
-}
-
-pub fn config_template(paths: &Paths, id: &str) -> Option<(Vec<u8>, package::Manifest)> {
-    let version = current_version(paths, id)?;
-    let version_dir = plugin_dir(paths, id).join(version);
-    let manifest = read_manifest(&version_dir).ok()?;
-    let config = manifest.config.as_deref().unwrap_or("config/config");
-    let data = fs::read(version_dir.join(config)).ok()?;
-    Some((data, manifest))
-}
-
-pub fn config_check(paths: &Paths, id: &str, candidate: &Path) -> Result<(), ProblemError> {
-    let Some(version) = current_version(paths, id) else {
-        return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
-    };
-    let version_dir = plugin_dir(paths, id).join(&version);
-    let manifest = read_manifest(&version_dir)?;
-    let Some(check) = manifest.config_check else {
-        return Ok(());
-    };
-    package::check_path(&check.path)?;
-    let program = version_dir.join(&check.path);
-    if !program.is_file() {
-        return Err(
-            Problem::Conflict.error(format!("configCheck is missing: {}", program.display()))
-        );
-    }
-    let mut command = check_command(&program);
-    command
-        .args(&check.args)
-        .current_dir(&version_dir)
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env(
-            "SystemRoot",
-            std::env::var_os("SystemRoot").unwrap_or_default(),
-        )
-        .env("WINDIR", std::env::var_os("WINDIR").unwrap_or_default())
-        .env("SVCD_PLUGIN_ID", id)
-        .env("SVCD_PLUGIN_VERSION", &version)
-        .env("SVCD_DATA_DIR", &paths.data_dir)
-        .env("SVCD_CONFIG_DIR", &paths.config_dir)
-        .env("SVCD_CONFIG", candidate)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| Problem::Conflict.error(format!("spawn configCheck: {}", error)))?;
-    let _ = crate::platform::host::process::adopt(&child);
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if status.success() {
-                    return Ok(());
-                }
-                let mut stderr = String::new();
-                if let Some(mut handle) = child.stderr.take() {
-                    use std::io::Read;
-                    let _ = handle.read_to_string(&mut stderr);
-                }
-                return Err(Problem::Conflict.error(format!(
-                    "configCheck failed ({}): {}",
-                    status,
-                    stderr.trim()
-                )));
-            }
-            Ok(None) => {}
-            Err(error) => return Err(Problem::Conflict.error(format!("configCheck: {}", error))),
-        }
-        if started.elapsed() > Duration::from_secs(10) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(Problem::Conflict.error("configCheck timed out after 10s"));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
 #[cfg(windows)]
 fn check_command(program: &Path) -> Command {
     let extension = program
@@ -1285,37 +1111,6 @@ fn check_command(program: &Path) -> Command {
 #[cfg(not(windows))]
 fn check_command(program: &Path) -> Command {
     Command::new(program)
-}
-
-pub fn replace_config(
-    paths: &Paths,
-    id: &str,
-    candidate: &[u8],
-    check: bool,
-) -> Result<(), ProblemError> {
-    let directory = plugin_dir(paths, id);
-    if !directory.is_dir() {
-        return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
-    }
-    if candidate.len() > 1024 * 1024 {
-        return Err(Problem::TooLarge.error("config exceeds 1 MiB"));
-    }
-    let target = directory.join("config");
-    let temporary = directory.join(format!("config.tmp.{}", std::process::id()));
-    write_config(&temporary, candidate)?;
-    if check {
-        if let Err(error) = config_check(paths, id, &temporary) {
-            let _ = fs::remove_file(&temporary);
-            return Err(error);
-        }
-    }
-    if target.exists() {
-        fs::copy(&target, directory.join("config.last-good"))
-            .map_err(|error| Problem::Internal.error(format!("save last-good: {}", error)))?;
-    }
-    fs::rename(&temporary, &target)
-        .map_err(|error| Problem::Internal.error(format!("replace config: {}", error)))?;
-    Ok(())
 }
 
 pub fn root_required() -> Result<(), ProblemError> {
