@@ -360,6 +360,7 @@
     "src/manage/check/plugin.rs": "plugin",
     "src/manage/ops/uninstall.rs": "plugin",
     "src/manage/ops/export_plugin.rs": "plugin",
-    "src/supervise/check/oneshot.rs": "supervisor"
+    "src/supervise/check/oneshot.rs": "supervisor",
+    "src/supervise/check/reconcile.rs": "supervisor"
   }
 }
