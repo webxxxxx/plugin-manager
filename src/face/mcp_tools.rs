@@ -1,16 +1,18 @@
 //! MCP 面的协议投影：能力面 → `tools`，一次调用结果 → MCP envelope。
 //!
-//! 按 ADR-0025 的二分，值投影归内核、**协议投影归面**。凡是输出里带 MCP 的词
-//! （`inputSchema`、`content[0].text`、`isError`）或 JSON-RPC 码（`-32000` /
-//! `-32602`）的形状都在这里成形，组合根只做装配与分发。
+//! 按 ADR-0025 的二分，值投影归内核、**协议投影归面**。`tools` 的
+//! `inputSchema`，四个 envelope 函数的 `content[0].text` / `isError` /
+//! `data.class` / `data.kind`，以及 JSON-RPC 码（`-32000` / `-32602`）都在这里
+//! 成形，组合根只做装配与分发。
 //!
 //! 桥客户端（`run_stdio` / `Bridge` / era 装饰 / legacy 握手）仍留在
 //! [`crate::face::mcp`]：它要 stdio、mpsc 与 socket，不属于投影。
 
 use crate::kernel::failure::{Class, Failure, Rejection};
 use crate::kernel::registry::{Kind, Registry};
-// 唯一一条 face → server 的依赖：`content[0].text` 形状的单源留在 server，
-// `server/mcp/result.rs` 的模块注释点名了这个方向（面引用它，而不是反过来）。
+// 本文件唯一一条 face → server 依赖：`content[0].text` 的字面形状单源在
+// `server/mcp/result.rs`（HTTP 会话那边也要用），它的模块注释点名了 face →
+// server 这个方向。face 里 api.rs 等也引 server，这条不是全局唯一。
 use crate::server::mcp::result::result_value;
 use crate::wire::message::rpc;
 use serde_json::{json, Value};
@@ -73,8 +75,10 @@ pub fn tool_error(id: Option<Value>, message: &str) -> rpc::Response {
 }
 
 /// Face-side projection of a completed slot call. The slot only emits a
-/// `Result<Value, Failure>`; MCP codes/strings live here.
-pub fn project_slot_response(
+/// `Result<Value, Failure>`; MCP codes/strings live here. Only
+/// [`project_slot_outcome`] needs the structured frame; the assembly point
+/// consumes the serialized line.
+fn project_slot_response(
     external_id: Option<Value>,
     outcome: Result<Value, Failure>,
 ) -> rpc::Response {
