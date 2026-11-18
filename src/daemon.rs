@@ -19,6 +19,7 @@ use crate::wire::control::channel;
 use crate::platform::clock::{Clock, Now};
 use crate::platform::compat;
 use crate::platform::config::Config;
+use crate::supervise::check::reconcile;
 use crate::supervise::model::definition;
 use crate::kernel::contract::{
     CapabilityName, Instance, Invocation, Launchers, ProgressToken, Reply, ReplySink,
@@ -1477,36 +1478,21 @@ impl Daemon {
         for issue in &loaded.issues {
             log::svcd(&format!("svcd: reload: warning: {}", issue));
         }
-        let mut desired: BTreeMap<String, Service> = loaded
-            .registry
-            .managed_values()
-            .cloned()
-            .map(|service| (service.id.clone(), service))
-            .collect();
         let (plugins, warnings) = plugin::scan(&self.config.paths, &self.config.limits);
         for warning in warnings {
             log::svcd(&format!("svcd: reload: plugin: {}", warning));
         }
-        for service in plugins {
-            // A core definition with the same id wins. An installed plugin is
-            // authoritative in the registry (install/uninstall update it), but
-            // it must still land in `desired`: otherwise the stale sweep below
-            // unregisters every installed plugin on each reload. The update
-            // branch in `apply_definitions` already skips plugin-over-plugin
-            // overwrites, so carrying the scanned snapshot is safe.
-            if desired.contains_key(&service.id) {
-                continue;
-            }
-            desired.insert(service.id.clone(), service);
-        }
+        // Core definitions win; an installed plugin still lands in `desired` so
+        // the stale sweep below does not unregister it on every reload.
+        let desired = reconcile::merge_desired(loaded.registry.managed_values().cloned(), plugins);
 
         let mut removed = Vec::new();
-        let stale: Vec<String> = self
-            .registry
-            .managed_values()
-            .map(|service| service.id.clone())
-            .filter(|id| !desired.contains_key(id))
-            .collect();
+        let stale = reconcile::stale_ids(
+            self.registry
+                .managed_values()
+                .map(|service| service.id.as_str()),
+            &desired,
+        );
         for id in stale {
             let active = self
                 .slots
@@ -1561,8 +1547,10 @@ impl Daemon {
         let mut added = Vec::new();
         let mut updated = Vec::new();
         for (id, service) in desired {
-            match self.registry.get(&id).cloned() {
-                None => {
+            let old = self.registry.get(&id).cloned();
+            match reconcile::action_for(old.as_ref(), &service) {
+                reconcile::Action::Skip => continue,
+                reconcile::Action::Add => {
                     let exec = service.exec.clone();
                     let lifecycle = service.lifecycle.clone();
                     let restart = service.restart;
@@ -1597,12 +1585,10 @@ impl Daemon {
                     log::svcd(&format!("svcd: reload: added {}", id));
                     added.push(id);
                 }
-                Some(old) => {
-                    // Plugins are managed through install/uninstall RPCs; scanning
-                    // their store must not overwrite live install state.
-                    if old.kind == Kind::Plugin && service.kind == Kind::Plugin {
-                        continue;
-                    }
+                reconcile::Action::Update => {
+                    // Plugins are managed through install/uninstall RPCs; the
+                    // pure classifier already returned Skip for those.
+                    let old = old.expect("update implies an existing definition");
                     let mut next = service;
                     next.state = old.state;
                     next.pid = old.pid;
