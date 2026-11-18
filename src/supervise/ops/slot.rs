@@ -14,6 +14,7 @@ use crate::kernel::failure::{Class, Failure, Rejection, Retry};
 use crate::platform::log::{self, LogSink};
 use crate::platform::paths::Paths;
 use crate::kernel::registry::{Exec, Hook, Interpreter, Lifecycle, Ready, Restart, State};
+use crate::wire::contract::RAW_PROTOCOL;
 use crate::wire::message::rpc;
 use crate::wire::contract::stdio::{self, Plan, Streams, Target};
 use crate::supervise::model::supervisor::{self, Action, Event, Machine};
@@ -442,7 +443,7 @@ impl Slot {
     /// carries the raw transport on it. Everything else (`ready: exec` with
     /// protocol 1/2) is fire-and-forget once spawned.
     pub(crate) fn is_channel_peer(&self) -> bool {
-        self.exec.ready == Ready::Notify || self.protocol == 3
+        self.exec.ready == Ready::Notify || self.protocol == RAW_PROTOCOL
     }
 
     /// Seed the state for a service that was already unhealthy at scan time
@@ -833,7 +834,7 @@ impl Slot {
                 return abandon(&mut child, "piped stderr is missing");
             };
 
-            if self.protocol == 3 {
+            if self.protocol == RAW_PROTOCOL {
                 let Some(stdin) = stdin else {
                     return abandon(&mut child, "piped stdin is missing");
                 };

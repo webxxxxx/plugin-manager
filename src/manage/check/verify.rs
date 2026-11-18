@@ -12,6 +12,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
+use crate::wire::contract::RAW_PROTOCOL;
 use crate::manage::model::manifest::{FileData, Manifest, SignatureCheck, SignatureFile};
 use crate::manage::model::ustar::Tar;
 use crate::manage::package::{
@@ -776,7 +777,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, ProblemError> {
     if m.protocol == 0 || m.protocol > MAX_PROTOCOL {
         return Err(Problem::Invalid.error(format!("unsupported protocol {}", m.protocol)));
     }
-    if m.protocol == 3 {
+    if m.protocol == RAW_PROTOCOL {
         if m.exec.ready.as_deref() != Some("exec") {
             return Err(Problem::Invalid.error("protocol 3 requires exec.ready=exec"));
         }
