@@ -92,7 +92,7 @@ fn cookie_origin(
 }
 
 fn handshake(headers: &[(String, String)]) -> Result<String, Refusal> {
-    uichannel::ws_accept(headers).map_err(|message| {
+    crate::wire::ws::accept::ws_accept(headers).map_err(|message| {
         http::response_with_headers(
             426,
             "text/plain; charset=utf-8",

@@ -5,8 +5,8 @@
 //! writes them across consecutive writable events; it never replaces the
 //! server's buffer with an unbounded one.
 
-use crate::server::http::wire;
 use crate::server::http::OutBuffer;
+use crate::wire::ws::frame;
 
 pub(crate) struct PendingFrame {
     header: Vec<u8>,
@@ -18,7 +18,7 @@ pub(crate) struct PendingFrame {
 impl PendingFrame {
     pub(crate) fn new(opcode: u8, payload: Vec<u8>) -> PendingFrame {
         PendingFrame {
-            header: wire::frame_header(opcode, payload.len()),
+            header: frame::frame_header(opcode, payload.len()),
             header_at: 0,
             payload,
             payload_at: 0,

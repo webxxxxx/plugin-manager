@@ -391,7 +391,6 @@
     "src/server/http/server.rs": "server",
     "src/server/http/stream.rs": "server",
     "src/server/http/threads.rs": "server",
-    "src/server/http/wire.rs": "server",
     "src/server/mcp/fallback.rs": "server",
     "src/server/mcp/mod.rs": "server",
     "src/server/mcp/progress.rs": "server",
@@ -432,6 +431,9 @@
     "src/wire/message/ipc.rs": "ipc",
     "src/wire/message/mod.rs": "wire",
     "src/wire/message/rpc.rs": "rpc",
-    "src/wire/mod.rs": "wire"
+    "src/wire/mod.rs": "wire",
+    "src/wire/ws/accept.rs": "wire",
+    "src/wire/ws/frame.rs": "wire",
+    "src/wire/ws/mod.rs": "wire"
   }
 }
