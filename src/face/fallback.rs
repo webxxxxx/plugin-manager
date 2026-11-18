@@ -168,7 +168,7 @@ fn serve_ui(request: &HttpRequest, assets: &plugin::WebAssets, sub: &str, base: 
     error(404, "not_found", "not found")
 }
 
-fn serve_web_file(
+pub(crate) fn serve_web_file(
     request: &HttpRequest,
     path: &Path,
     metadata: &fs::Metadata,
@@ -176,7 +176,7 @@ fn serve_web_file(
 ) -> Vec<u8> {
     let mime = http::content_type(&path.to_string_lossy());
     let validators = webui::asset_validators(metadata, request_header(request, "if-none-match"));
-    if validators.not_modified() {
+    if validators.matches_if_none_match() {
         return http::response_with_headers(304, mime, validators.headers(), b"");
     }
     let data = match fs::read(path) {

@@ -153,8 +153,10 @@ impl AssetValidators {
     }
 
     /// Whether the request's `If-None-Match` selected this representation, so
-    /// the face answers 304 with no body.
-    pub(crate) fn not_modified(&self) -> bool {
+    /// the face answers 304 with no body. Named after the header test rather
+    /// than the 304: the value is the request's match, not a statement about
+    /// the asset.
+    pub(crate) fn matches_if_none_match(&self) -> bool {
         self.matches_if_none_match
     }
 }
@@ -379,16 +381,26 @@ mod tests {
 
         let hit = asset_validators(&metadata, Some(&format!("W/{}", tag)));
         assert!(
-            hit.not_modified(),
+            hit.matches_if_none_match(),
             "a weak form of the current tag is a 304"
         );
+        // Pin the whole set literally: dropping a cache header here must fail.
         assert_eq!(
-            crate::server::http::model::header(hit.headers(), "etag"),
-            Some(tag.as_str())
+            hit.headers(),
+            [
+                ("ETag".to_string(), tag.clone()),
+                ("Cache-Control".to_string(), "no-cache".to_string()),
+                ("Vary".to_string(), "Accept".to_string()),
+                ("X-Content-Type-Options".to_string(), "nosniff".to_string()),
+                ("Referrer-Policy".to_string(), "no-referrer".to_string()),
+            ]
         );
 
         let miss = asset_validators(&metadata, Some("\"other\""));
-        assert!(!miss.not_modified(), "a different tag keeps the 200 path");
+        assert!(
+            !miss.matches_if_none_match(),
+            "a different tag keeps the 200 path"
+        );
         assert_eq!(
             miss.headers(),
             hit.headers(),
