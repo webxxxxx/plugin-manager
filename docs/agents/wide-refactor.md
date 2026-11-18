@@ -86,6 +86,19 @@ node tools/check.mjs full                # 行为没动也应该绿；变了就�
 
 `--skip-verify` 只用于「先看清写盘结果」的临时探路，落地前必须再跑一次带门的 `--apply`。
 
+## 格式化
+
+只对**点名的文件**跑：
+
+```sh
+node tools/fmt.mjs src/manage/package.rs
+node tools/fmt.mjs --check src/manage/package.rs
+```
+
+直接 `rustfmt src/manage/mod.rs` 会顺着 `mod` 声明递归格式化整棵子树（一次卷进 27 个无关
+文件）；`fmt.mjs` 带 `--config skip_children=true`，并且拒绝 `src/`、`tests/` 以外的路径。
+没有「格式化全仓」模式：不传文件就是用法错误。
+
 ## 反例（#151 实录）
 
 - 手写 `str.replace` 全局替换，一次把 `Result<T, String>` 改成了 `Result<T>`，66 个签名丢掉
