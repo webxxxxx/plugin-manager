@@ -975,4 +975,38 @@ mod tests {
         assert_eq!(summary["hasConfig"], false);
         assert_eq!(summary["hasUI"], false);
     }
+
+    #[test]
+    fn a_public_face_route_skips_transport_auth() {
+        use crate::server::auth::lan::AuthKind;
+        use crate::server::http::{route_face_request, Face};
+
+        let bind = "127.0.0.1:0".parse().expect("bind");
+        let lan = Arc::new(Mutex::new(Lan::new(bind, bind, true, Some("hash".into()))));
+        let face = ApiFace::new(test_config(), lan.clone());
+        let peer = "127.0.0.1".parse().expect("peer");
+
+        assert!(face.route("POST", "/login").expect("route").public);
+        let login = http::Head {
+            method: "POST".into(),
+            path: "/login".into(),
+            version: "HTTP/1.1".into(),
+            headers: Vec::new(),
+        };
+        let prepared = route_face_request(&face, &login, peer, &lan)
+            .expect("a public route must not fail authentication")
+            .expect("the face claims login");
+        assert_eq!(prepared.request.principal, AuthKind::None);
+
+        let protected = http::Head {
+            method: "GET".into(),
+            path: "/api/v1/auth".into(),
+            version: "HTTP/1.1".into(),
+            headers: Vec::new(),
+        };
+        assert!(
+            route_face_request(&face, &protected, peer, &lan).is_err(),
+            "a protected route still requires a principal"
+        );
+    }
 }

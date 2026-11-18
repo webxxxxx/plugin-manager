@@ -81,11 +81,6 @@ impl ServerHandle {
     }
 }
 
-/// A driver the caller runs itself: the composition root supplies it because
-/// it composes faces.
-pub(crate) type ThreadDriver =
-    Arc<dyn Fn(TcpListener, Arc<Mutex<Lan>>, Arc<Config>) -> ServerHandle + Send + Sync>;
-
 /// Everything a driver needs, on every host. Platform-specific pieces are
 /// `Option`; whichever driver consumes a value leaves the rest untouched.
 pub(crate) struct StartInput {
@@ -100,8 +95,6 @@ pub(crate) struct StartInput {
     /// wait set; the thread driver ignores it because the channel already runs
     /// its own accept thread on that host.
     pub control: crate::wire::control::channel::ControlBinding,
-    /// The per-connection driver, used when no poll loop runs.
-    pub threads: ThreadDriver,
 }
 
 #[cfg(test)]

@@ -215,11 +215,6 @@
       "layer": "server",
       "note": "S4 请求交接契约（#113）+ HTTP server-loop（#114）+ stream driver（#115）+ WebSocket 帧（#122）"
     },
-    "api": {
-      "concept": "compose",
-      "layer": "compose",
-      "note": "组合根 + Windows 回退；Unix server loop 在 server/http/server.rs。管理 helper 已下沉到 face/support.rs（#131）"
-    },
     "face": {
       "concept": "face/api",
       "layer": "face",
@@ -290,7 +285,6 @@
   },
   "//files": "path → 逻辑模块键（键必须是 modules 里的键）；dep-lint 用 files 取身份，没列出的文件按路径第一段。这样搬家不改变模块图，文件级层方向检查得以保留。",
   "files": {
-    "src/api.rs": "api",
     "src/cli/mod.rs": "cli",
     "src/cli/plugin.rs": "plugin_cli",
     "src/cli/status.rs": "status",

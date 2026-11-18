@@ -22,9 +22,7 @@ impl ConnectionDriver for Driver {
             routes,
             fallback,
             control,
-            threads,
         } = input;
-        let _ = threads;
         let (control_user, control_admin, pending, wake) = control.into_parts();
         let loop_handle = crate::server::http::server::start(
             listener,

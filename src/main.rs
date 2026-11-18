@@ -1,5 +1,3 @@
-#[cfg(feature = "http")]
-mod api;
 mod cli;
 mod daemon;
 mod face;

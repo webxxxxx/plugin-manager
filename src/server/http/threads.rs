@@ -22,7 +22,13 @@ use crate::platform::host::threads;
 use crate::platform::log;
 use crate::server::auth::lan::Lan;
 use crate::server::http::engine;
+use crate::server::http::engine::{
+    keep_alive_response, wants_keep_alive, wants_keep_alive_head, HttpRequest,
+};
+use crate::server::http::hooks::{FallbackHandler, PreBodyRoutes};
 use crate::server::http::model as http;
+use crate::server::http::Exchange;
+use crate::wire::contract::rawhub::RawHub;
 
 /// Admission bookkeeping for the Windows thread-per-connection fallback.
 ///
@@ -99,9 +105,17 @@ impl Drop for ConnectionLease {
     }
 }
 
-/// One accepted connection, handed to the composition root's handler.
-pub(crate) type Connection =
-    Arc<dyn Fn(TcpStream, IpAddr, Arc<Config>, Arc<Mutex<Lan>>, Duration) + Send + Sync>;
+/// Everything one connection needs from above this layer: the face, the
+/// pre-body route table, the fallback and the raw hub.
+///
+/// The loop itself stays in this module, so a driver never names a face and the
+/// composition root only injects data (#205).
+pub(crate) struct Connection {
+    pub(crate) face: Arc<dyn crate::server::http::Face>,
+    pub(crate) routes: Arc<dyn PreBodyRoutes>,
+    pub(crate) fallback: FallbackHandler,
+    pub(crate) raw_hub: Arc<RawHub>,
+}
 
 /// The bounded admission caps for this driver: one lease is one connection and
 /// one thread, so both caps are applied before the thread exists.
@@ -116,8 +130,7 @@ pub(crate) fn admission(
 }
 
 /// Accept loop for the thread driver. `connection` receives the accepted
-/// socket and the per-connection settings; the composition root supplies it so
-/// this module never names a face.
+/// socket and the per-connection settings.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn serve(
     active: TcpListener,
@@ -126,7 +139,7 @@ pub(crate) fn serve(
     admission: Arc<Mutex<Admission>>,
     idle_timeout: Duration,
     stop: Arc<AtomicBool>,
-    connection: Connection,
+    connection: Arc<Connection>,
 ) {
     let limits = config.limits.clone();
     loop {
@@ -151,7 +164,7 @@ pub(crate) fn serve(
                     .stack_size(threads::transfer_stack(&limits))
                     .spawn(move || {
                         let _lease = lease;
-                        connection(stream, ip, config, lan, idle_timeout);
+                        connection.handle(stream, ip, config, lan, idle_timeout);
                     });
                 if let Err(error) = spawned {
                     // The failed spawn drops the closure, and with it the
@@ -167,6 +180,291 @@ pub(crate) fn serve(
         }
     }
 }
+impl Connection {
+    /// Serve one accepted socket until it closes or the idle timeout elapses.
+    ///
+    /// This is the loop that used to sit in `api.rs` (#205): every decision it
+    /// takes goes through an injected seam (`Face`, `PreBodyRoutes`,
+    /// `FallbackHandler`), so this module names no face and the composition
+    /// root only supplies data.
+    fn handle(
+        &self,
+        mut stream: TcpStream,
+        peer: IpAddr,
+        config: Arc<Config>,
+        lan: Arc<Mutex<Lan>>,
+        idle_timeout: Duration,
+    ) {
+        // Windows accepted sockets inherit the listener's non-blocking mode
+        // (Unix ones do not). Requests are read with blocking reads, so flip
+        // the socket back before installing the read timeout. Otherwise a body
+        // that has not arrived yet becomes a WouldBlock "read" error.
+        if let Err(error) = stream.set_nonblocking(false) {
+            log::svcd(&format!(
+                "svcd: HTTP connection: cannot switch to blocking mode: {}",
+                error
+            ));
+        }
+        // The configured `http_idle_timeout_secs` replaces the old hard-coded
+        // 60 s. It covers any wait for request bytes: the first request, the
+        // gap between keep-alive requests, and a stalled request body. That
+        // matches the Unix reactor's idle sweep. The same deadline bounds a
+        // blocking write, so a client that stops reading cannot pin this
+        // connection thread forever; stream handlers below install their own
+        // transfer timeout where a longer transfer is expected.
+        let _ = stream.set_read_timeout(Some(idle_timeout));
+        let _ = stream.set_write_timeout(Some(idle_timeout));
+        let face = self.face.as_ref();
+        loop {
+            let (head, initial) = match read_head(&mut stream, config.limits.max_header) {
+                Ok(head) => head,
+                Err(HeadFailure::Closed) => return,
+                Err(HeadFailure::Response(response)) => {
+                    let _ = stream.write_all(&response);
+                    return;
+                }
+            };
+            let head_only = http::is_head(&head.method);
+            // Resolve the face route and the principal exactly once, before
+            // any body byte is read. The route's BodyPolicy is the only body
+            // limit.
+            let planned = match crate::server::http::route_face_request(face, &head, peer, &lan) {
+                Ok(planned) => planned,
+                Err(response) => {
+                    // A bodyless request can keep the connection alive after a
+                    // refusal; a request that declared a body is closed so its
+                    // unread bytes cannot precede the next request.
+                    let empty = matches!(
+                        http::framing(&head.headers),
+                        Ok(http::Framing::None) | Ok(http::Framing::Length(0))
+                    );
+                    let keep_alive = empty && wants_keep_alive_head(&head);
+                    let response = if keep_alive {
+                        keep_alive_response(response)
+                    } else {
+                        response
+                    };
+                    let _ = write_http(&mut stream, &response, head_only);
+                    if !keep_alive {
+                        return;
+                    }
+                    continue;
+                }
+            };
+            if let Some(prepared) = planned {
+                let keep_alive = wants_keep_alive_head(&head);
+                let body = match read_body(&mut stream, &head, &initial, prepared.route.body) {
+                    Ok(body) => body,
+                    Err(response) => {
+                        let _ = write_http(&mut stream, &response, head_only);
+                        return;
+                    }
+                };
+                let prepared = match crate::server::http::attach_face_body(prepared, &body) {
+                    Ok(prepared) => prepared,
+                    Err(response) => {
+                        let _ = write_http(&mut stream, &response, head_only);
+                        return;
+                    }
+                };
+                let result = match prepared.route.dispatch {
+                    crate::server::http::Dispatch::Inline => crate::server::http::dispatch_inline(
+                        face,
+                        &prepared.route,
+                        prepared.request,
+                    ),
+                    crate::server::http::Dispatch::Blocking => {
+                        crate::server::http::dispatch_blocking_now(
+                            face,
+                            &prepared.route,
+                            prepared.request,
+                            config.limits.control_timeout,
+                        )
+                    }
+                };
+                match result {
+                    Ok(crate::server::http::Exchange::Stream(handler)) => {
+                        // A streamed response owns this connection until it
+                        // closes. The fallback writes the shared 503 if the
+                        // stream budget is full before any handler bytes go
+                        // out.
+                        drive_fallback(&mut stream, handler, head_only, &config.limits);
+                        return;
+                    }
+                    result => {
+                        let mut response = crate::server::http::render_exchange(result);
+                        if keep_alive {
+                            response = keep_alive_response(response);
+                        }
+                        if write_http(&mut stream, &response, head_only).is_err() {
+                            return;
+                        }
+                        if !keep_alive {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+            }
+            // The face leaves these pre-body stream routes to their own faces.
+            // Every driver claims them through the same table, so a new
+            // pre-body endpoint is one `PreBodyRoutes` method, not an `if` in
+            // a driver.
+            if let Some(claim) = self
+                .routes
+                .plugin_ui(&head, peer, &lan, self.raw_hub.clone())
+            {
+                serve_claimed(
+                    &mut stream,
+                    claim,
+                    &initial,
+                    head_only,
+                    &config.limits,
+                    false,
+                );
+                return;
+            }
+            if let Some(claim) = self.routes.package_upload(&head, &lan) {
+                serve_claimed(
+                    &mut stream,
+                    claim,
+                    &initial,
+                    head_only,
+                    &config.limits,
+                    true,
+                );
+                return;
+            }
+            if let Some(claim) = self.routes.blob_upload(&head, &lan) {
+                serve_claimed(
+                    &mut stream,
+                    claim,
+                    &initial,
+                    head_only,
+                    &config.limits,
+                    true,
+                );
+                return;
+            }
+            let body_policy = self.routes.body_policy(&head);
+            let body = match read_body(&mut stream, &head, &initial, body_policy) {
+                Ok(body) => body,
+                Err(response) => {
+                    let _ = write_http(&mut stream, &response, head_only);
+                    return;
+                }
+            };
+            let request = HttpRequest {
+                method: head.method,
+                path: head.path,
+                version: head.version,
+                headers: head.headers,
+                body,
+            };
+            let keep_alive = wants_keep_alive(&request);
+            let path = request
+                .path
+                .split_once('?')
+                .map(|(path, _)| path)
+                .unwrap_or(request.path.as_str());
+            if path == "/mcp" {
+                let password_hash = lan
+                    .lock()
+                    .ok()
+                    .and_then(|state| state.password_hash().map(str::to_string));
+                match crate::server::mcp::transport::prepare_streaming(
+                    &crate::server::mcp::transport::Request {
+                        method: &request.method,
+                        headers: &request.headers,
+                        body: &request.body,
+                    },
+                    password_hash.as_deref(),
+                ) {
+                    Ok(Some(call)) => {
+                        let _ = crate::server::mcp::fallback::serve_mcp_sse(
+                            &mut stream,
+                            call,
+                            &config.paths.config_dir,
+                            head_only,
+                            &config.limits,
+                        );
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(response) => {
+                        let _ = write_http(&mut stream, &response, head_only);
+                        return;
+                    }
+                }
+            }
+            let mut response = (self.fallback)(&request, &lan);
+            if keep_alive {
+                response = keep_alive_response(response);
+            }
+            if write_http(&mut stream, &response, head_only).is_err() {
+                return;
+            }
+            if !keep_alive {
+                return;
+            }
+        }
+    }
+}
+
+/// Write what a pre-body face claimed.
+///
+/// `transfer` selects the upload path: the transfer timeout replaces the idle
+/// timeout and the already-read bytes seed the handler. The UI stream keeps the
+/// connection's idle timeout and needs neither.
+fn serve_claimed(
+    stream: &mut TcpStream,
+    claim: Result<Exchange, Vec<u8>>,
+    initial: &[u8],
+    head_only: bool,
+    limits: &crate::platform::limits::Limits,
+    transfer: bool,
+) {
+    let handler = match claim {
+        Err(response) => {
+            let _ = write_http(stream, &response, head_only);
+            return;
+        }
+        Ok(Exchange::Response(response)) if !transfer => {
+            let _ = write_http(stream, &response.into_bytes(), head_only);
+            return;
+        }
+        Ok(Exchange::Response(_)) => {
+            // A streamed route must not answer with a memory response; the
+            // Unix loop renders the same 500 before any handler bytes go out.
+            let _ = write_http(
+                stream,
+                &http::json_error(
+                    500,
+                    "internal",
+                    "a streamed package upload route returned a memory response",
+                ),
+                head_only,
+            );
+            return;
+        }
+        Ok(Exchange::Stream(handler)) => handler,
+    };
+    if transfer {
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(limits.transfer_timeout));
+        let _ = stream.set_write_timeout(Some(limits.transfer_timeout));
+        if crate::server::http::fallback::drive(stream, handler, initial, limits).is_err() {
+            let _ = write_http(
+                stream,
+                &crate::server::http::stream_busy_response(),
+                head_only,
+            );
+        }
+    } else {
+        drive_fallback(stream, handler, head_only, limits);
+    }
+}
+
 /// Write one rendered response. HEAD keeps the head (including GET's
 /// `Content-Length`) and gets no body, so a keep-alive connection cannot read
 /// the omitted body as the start of the next response.
