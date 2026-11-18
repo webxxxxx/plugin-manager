@@ -32,6 +32,11 @@ const REPO = resolve(HERE, "..");
 const COMPILE_TIMEOUT_MS = Number(process.env.SVCD_CHECK_TIMEOUT_MS) || 10 * 60 * 1000;
 const TEST_TIMEOUT_MS = Number(process.env.SVCD_CHECK_TIMEOUT_MS) || 20 * 60 * 1000;
 
+/// `no-default` 的警告预算，棘轮语义：只许降不许升。基线是恢复
+/// `server/auth/lan.rs` 的 `cfg_attr(allow(dead_code))` 之后的真实计数（#194）。
+/// rustc 升级让计数变化时，先判断新警告是否合理，再改这个数。
+const NO_DEFAULT_WARNING_BUDGET = 36;
+
 function cargo(args, timeoutMs) {
   const started = Date.now();
   const result = spawnSync("cargo", args, {
@@ -197,19 +202,35 @@ if (tier === "quick") {
 if (tier === "no-default") {
   console.log("check: running cargo check --no-default-features --bin svcd");
   const result = cargo(
-    ["check", "--no-default-features", "--bin", "svcd", "--quiet"],
+    ["check", "--no-default-features", "--bin", "svcd", "--message-format", "short"],
     COMPILE_TIMEOUT_MS,
   );
   if (timedOut(result)) {
     reportTimeout(result);
     process.exit(124);
   }
-  if (result.status === 0) console.log("check: ok (no default features)");
-  else {
+  if (result.status !== 0) {
     console.log("check: FAILED (no default features)");
     console.log(failureTail(result));
+    process.exit(result.status ?? 1);
   }
-  process.exit(result.status ?? 1);
+  // 警告计数守卫（#194）：`lan` 的 `allow(dead_code)` 曾在搬家时丢失，多出 12 条
+  // 警告却没人发现。计数只许降不许升，超了就打印新增的那些行。
+  const warnings = lines(result.stdout)
+    .concat(lines(result.stderr))
+    .filter((line) => line.includes(": warning: "));
+  if (warnings.length > NO_DEFAULT_WARNING_BUDGET) {
+    console.log(
+      `check: FAILED (no default features): ${warnings.length} warnings > budget ${NO_DEFAULT_WARNING_BUDGET}`,
+    );
+    // 无法判断哪几条是新出现的，打印全量（当前 40 行以内），让人自己核对。
+    console.log(warnings.join("\n"));
+    process.exit(1);
+  }
+  console.log(
+    `check: ok (no default features; warnings ${warnings.length}/${NO_DEFAULT_WARNING_BUDGET})`,
+  );
+  process.exit(0);
 }
 
 if (tier === "cross") {
