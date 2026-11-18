@@ -101,20 +101,49 @@ pub fn same_boot(record: &Record, boot: Option<&str>) -> bool {
     }
 }
 
-/// Whether the live process named by the record's `pid` is still the one the
-/// record was written for.
+/// What the platform host can say about the pid a record names.
 ///
-/// `alive` and `current_starttime` come from the platform host; this predicate
-/// itself never touches the OS. A mismatching start time means the pid was
-/// reused. If either side has no start time the record is trusted: the platform
-/// cannot prove reuse, and pid + starttime is the only guard it has. "Cannot
-/// prove reuse" is not the same as "proved to be the same instance".
-pub fn same_process(record: &Record, alive: bool, current_starttime: Option<u64>) -> bool {
-    alive
-        && match (record.starttime, current_starttime) {
-            (Some(expected), Some(actual)) => expected == actual,
-            _ => true,
+/// The host probes `alive` / `start_time`; this model never touches the OS. A
+/// dead pid carries no start time, so `Gone` cannot carry one either: the
+/// invariant lives in the type instead of in each caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessStamp {
+    Gone,
+    Alive { starttime: Option<u64> },
+}
+
+/// What the record's pid refers to now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PidState {
+    /// No live process holds the pid.
+    Gone,
+    /// The live process has the recorded start time.
+    Same,
+    /// A live process holds the pid with a different start time: the pid was
+    /// reused, so it is not the process the record was written for.
+    Reused { expected: u64, actual: u64 },
+    /// A live process holds the pid, but one side has no start time: reuse
+    /// cannot be proved, so the record is trusted. This is the boundary the
+    /// platform has always used, and it is not proof of identity.
+    Unknown,
+}
+
+/// Classify the record's pid from one platform stamp.
+///
+/// This is the only implementation of the pid + starttime rule: adoption and
+/// cleanup both consume [`PidState`], so the "reused" and "cannot prove reuse"
+/// cases cannot drift apart.
+pub fn pid_state(record: &Record, stamp: ProcessStamp) -> PidState {
+    let ProcessStamp::Alive { starttime } = stamp else {
+        return PidState::Gone;
+    };
+    match (record.starttime, starttime) {
+        (Some(expected), Some(actual)) if expected != actual => {
+            PidState::Reused { expected, actual }
         }
+        (Some(_), Some(_)) => PidState::Same,
+        _ => PidState::Unknown,
+    }
 }
 
 #[cfg(test)]
@@ -204,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reused_pid_is_not_the_same_process() {
+    fn a_pid_is_only_trusted_when_reuse_cannot_be_proved() {
         let record = Record {
             boot: Some("boot-1".into()),
             state: State::Running,
@@ -216,22 +245,47 @@ mod tests {
             last_exit: None,
         };
 
-        assert!(
-            same_process(&record, true, Some(7_000)),
-            "same start time is the same instance"
+        assert_eq!(pid_state(&record, ProcessStamp::Gone), PidState::Gone);
+        assert_eq!(
+            pid_state(
+                &record,
+                ProcessStamp::Alive {
+                    starttime: Some(7_000)
+                }
+            ),
+            PidState::Same
         );
-        assert!(
-            !same_process(&record, true, Some(8_000)),
+        assert_eq!(
+            pid_state(
+                &record,
+                ProcessStamp::Alive {
+                    starttime: Some(8_000)
+                }
+            ),
+            PidState::Reused {
+                expected: 7_000,
+                actual: 8_000
+            },
             "a mismatching start time means the pid was reused"
         );
-        assert!(!same_process(&record, false, None), "a dead pid is gone");
-
-        // The platform cannot prove reuse when either side has no start time.
-        assert!(same_process(&record, true, None));
+        assert_eq!(
+            pid_state(&record, ProcessStamp::Alive { starttime: None }),
+            PidState::Unknown,
+            "a live pid without a current start time cannot prove reuse"
+        );
         let legacy = Record {
             starttime: None,
             ..record
         };
-        assert!(same_process(&legacy, true, Some(8_000)));
+        assert_eq!(
+            pid_state(
+                &legacy,
+                ProcessStamp::Alive {
+                    starttime: Some(8_000)
+                }
+            ),
+            PidState::Unknown,
+            "a record without starttime cannot prove reuse"
+        );
     }
 }
