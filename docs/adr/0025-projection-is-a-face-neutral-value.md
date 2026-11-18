@@ -7,19 +7,27 @@ Accepted（2026-11-18）。细化 [docs/architecture.md](../architecture.md) §5
 ## Context
 
 - `docs/architecture.md` §5 从 #170 起就写着 `kernel/projection.rs`（「能力面 → 各对外面的唯一投影源」），但文件至今不存在。
-- **状态投影的载体类型在 L5。** `Status` / `Summary` / `Details` 定义在 `src/cli/status.rs:19/25/36`；组合根反向引用它——`daemon.rs:20` 的 `use crate::cli::status::Status`。而 `Status` 除 `supervise::model::supervisor::Machine`（L3）之外，依赖全是 `kernel::registry::{Kind, Service, State}`（`cli/status.rs:11`）与 `platform::clock::Now`（`:12`）。
-- **「唯一投影源」在值的层面今天已经成立。** 三个对外面都是控制通道 RPC 客户端，不是各自投影：CLI 的 `svc.list` 走 `serde_json::from_value::<Vec<Status>>`（`cli/svc.rs:348`）；HTTP 走 `face/api.rs:47 rpc()` → `support::rpc_result`（`face/support.rs:71`）→ `channel::request`；MCP 桥走 `face/mcp.rs:263` → `channel::request("registry.tools")`。缺的不是合并重复，而是这个值的**类型没有合法落点**。
-- **「投影族」其实是三族黏在一起**（`daemon.rs` 约 350 行）：值形状构造（真正的实现在 `cli/status.rs:56/83/98`）、MCP envelope（`project_slot_response` / `_outcome`、`project_rejection`、`project_builtin_outcome`，`daemon.rs:2606-2686`）、会话状态（`catalog_version` / `catalog_cache` / `tools_page`，`daemon.rs:1337-1381`）。
-- **层 rank 允许 envelope 进内核，语义不允许。** `tools/arch-map.json:5-30` 是 platform 0 < wire 1 < kernel 2 < domain 3，`rpc::Response` 属 wire（rank 1），内核依赖它不违规（1 ≤ 2）——但那等于让内核认识 JSON-RPC。
-- **有一条现成的对称落点。** `problem_data`（`daemon.rs:2590-2592`）写 `{"kind": …}`，而对称的解码器 `Problem::from_error_data` 已在 `kernel/failure.rs:209-211`，被 `face/support.rs:164` 依赖。
-- **§7 的三条「真实反例」全部过时**（`node tools/dep-lint.mjs` = 0 违规）：`slot` 调 `mcp::tool_error` 已不存在（`grep -rn "crate::face" src/supervise src/manage src/kernel src/platform` 为空）；`transfer`（`manage/ops/transfer.rs:17-22`）已不依赖 `status`；`install` 调 `daemon::shutdown_quiet` 只剩 `main.rs:136`，与定义同在组合根。
-- **同一转换有两处实现。** `Status::live` 的 `epoch_secs`（`cli/status.rs:87-90, 109-113`）带 `ms == 0 → None` 护栏；`daemon.rs:886-893 persist_states` 自己算一遍，没有护栏。
-- **「逐字节不变」这条验收今天不成立。** 没有任何测试逐字节比对 HTTP / MCP 的 JSON 响应，全是按 `Value` 键值断言；`Cargo.toml:15` 是 `serde_json = "1"` 未开 `preserve_order`，`Cargo.lock` 里没有 `indexmap`，所以线上 `Map` 是 `BTreeMap`（键按字母序），而 CLI `svc status --json` 走结构体声明序（`cli/svc.rs:711`）。
+- **状态投影的载体类型在 L5。** `Status` / `Summary` / `Details` 曾定义在 `src/cli/status.rs`；组合根反向引用它——`daemon.rs` 里的 `use crate::cli::status::Status`。而 `Status` 除 `supervise::model::supervisor::Machine`（L3）之外，依赖全是 `kernel::registry::{Kind, Service, State}` 与 `platform::clock::Now`。
+- **「唯一投影源」在值的层面今天已经成立。** 三个对外面都是控制通道 RPC 客户端，不是各自投影：CLI 的 `svc.list` 把结果 `serde_json::from_value::<Vec<Status>>`；HTTP 面走 `face/api.rs` 的 `rpc()` → `face/support.rs` 的 `rpc_result` → `channel::request`；MCP 桥走 `face/mcp.rs` → `channel::request("registry.tools")`。缺的不是合并重复，而是这个值的**类型没有合法落点**。
+- **「投影族」其实是三族黏在一起**（`daemon.rs` 约 350 行）：值形状构造（真正的实现在 `cli/status.rs` 的 `of` / `live` / `builtin`）、MCP envelope（`project_slot_response` / `_outcome`、`project_rejection`、`project_builtin_outcome`）、会话状态（`catalog_version` / `catalog_cache` / `tools_page`）。
+- **层 rank 允许 envelope 进内核，语义不允许。** `tools/arch-map.json` 里 platform 0 < wire 1 < kernel 2 < domain 3；`rpc::Response` 属 wire（rank 1），内核依赖它不违规（1 ≤ 2）——但那等于让内核认识 JSON-RPC。
+- **有一条现成的对称落点。** `problem_data`（`daemon.rs`）写 `{"kind": …}`，而对称的解码器 `Problem::from_error_data` 已在 `kernel/failure.rs`，被 `face/support.rs` 依赖。
+- **§7 的三条「真实反例」全部过时**（`node tools/dep-lint.mjs` = 0 违规）：`slot` 调 `mcp::tool_error` 已不存在（`grep -rn "crate::face" src/supervise src/manage src/kernel src/platform` 为空）；`transfer`（`manage/ops/transfer.rs`）已不依赖 `status`；`install` 调 `daemon::shutdown_quiet` 只剩 `main.rs` 里同一 rank 的调用。
+- **同一转换有两处实现。** `Status::live` 的 `epoch_secs` 带 `ms == 0 → None` 护栏；`daemon.rs` 的 `persist_states` 自己算一遍，没有护栏（今由 #215 跟踪）。
+- **「逐字节不变」这条验收今天不成立。** 没有任何测试逐字节比对 HTTP / MCP 的 JSON 响应，全是按 `Value` 键值断言；`serde_json` 未开 `preserve_order`（`Cargo.lock` 里没有 `indexmap`），所以线上 `Map` 是 `BTreeMap`（键按字母序），而 CLI `svc status --json` 走结构体声明序。
+
+> 本节的 `file:line` 口径：只写符号与文件名，不写行号——这些位置在 #209 / #210 / #211 / #212 落地后都动过。落地后的落点见下面这条。
+>
+> - `Status` / `Live` → `kernel/projection.rs`（#212）；`cli/status.rs` 只剩 `table` / `text`。
+> - MCP envelope 四函数 → `face/mcp_tools.rs`（#211）。
+> - `problem_data` → `Problem::error_data()`（`kernel/failure.rs`，#212）。
+> - `Slot::set_projector` 连同 `CallSink` 枚举 → 已删（#209）。
+> - 分页包改成控制通道传面中立的 `next`、MCP 面渲染 `nextCursor`；auth 四键收敛到 `LanStatus`（#210）。
 
 ## Decision
 
 - **投影两分。** **值投影** = 领域值 → 面中立值形状的**纯函数**，归内核；**协议投影** = 面中立值 → 某协议报文，归该对外面。判据只有一条：输出里有没有某个协议的词（`inputSchema`、`nextCursor`、JSON-RPC 帧、HTTP 状态码）。
-- **第三类排除项：面级装饰。** `hasConfig` / `hasUI`（`face/api.rs:559-575`）这类字段可以在投影值之上追加，也可以读盘（`manage::plugin::web_assets`），但它不是投影，不进内核形状。
+- **第三类排除项：面级装饰。** `hasConfig` / `hasUI`（`face/api.rs`）这类字段可以在投影值之上追加，也可以读盘（`manage::plugin::web_assets`），但它不是投影，不进内核形状。
 - **`kernel/projection.rs` 的内容。** `Status` / `Summary` / `Details` + `Live` + `of` / `live` / `builtin` 与私有 `epoch_secs*`。只依赖 `kernel` 与 `platform`；不出现进程、socket、文件。
 - **`Live` 是 `Machine` 被投影读到的那 9 个字段。** 六态、pid、失败次数、`since_ms`、`ready_since_ms`、`next_at_ms`、最近退出码、不可杀标记、重启策略。时刻**只存单调毫秒**；`impl Machine { pub fn live(&self) -> Live }` 是纯字段拷贝、**不接收 `Now`**——锚定留在 `Status::live(service, &live, now)` 一处，跨层边界不传时间。`remain_after_exit` / `fail_after_stop` / `degraded` 不进：今天没有任何对外面读到它们。
 - **`problem_data` 进 `kernel/failure.rs`。** 它写 `{"kind": …}`，与已有的解码器对称；帧构造（`rpc::err_data`）仍留在面。
@@ -42,9 +50,9 @@ Accepted（2026-11-18）。细化 [docs/architecture.md](../architecture.md) §5
 ## Consequences
 
 - `daemon.rs` 不再 `use crate::cli::status`；组合根持对外面类型的反例消失（#212）。
-- `Slot::set_projector` 成为「想象中的 seam」的现成反例：唯一注入点是 `daemon.rs:2693`，而读它的 `Slot::project` 与 `CallSink::Client` 都标着 `#[cfg(test)]`（`slot.rs:131/1124`），生产路径只走 `CallSink::Completion` → `projected_done`。清理票 #209 把它删掉。
-- `persist_states` 的重复换算**不在本次范围**：收掉它会改变 `since_ms == 0` 时写进运行态记录的值，属行为改动，另开票带测试。
-- `face/mcp_tools.rs` 与 `kernel/projection.rs` 要登记进 `tools/arch-map.json`，否则 `dep-lint` 的 V4 会红；各自由 #211 / #212 做。
+- `Slot::set_projector` 曾是「想象中的 seam」的现成反例：唯一注入点在组合根，而读它的 `Slot::project` 与 `CallSink::Client` 都标着 `#[cfg(test)]`，生产路径只走 `CallSink::Completion` → `projected_done`。**已由 #209 把那套机制连同 `CallSink` 枚举一起删掉**：槽的完成回调现在直接就是调用方给的 `ReplySink`。
+- `persist_states` 的重复换算**不在本次范围**：收掉它会改变 `since_ms == 0` 时写进运行态记录的值，属行为改动，另开票带测试（**#215**）。
+- `face/mcp_tools.rs` 与 `kernel/projection.rs` 已登记进 `tools/arch-map.json`（#211 / #212）。
 - 词表新增「值投影」「协议投影」「运行面（Live）」三条；前两条由 #210 落地，第三条由 #213 补。
 - MCP 分页包与 auth 四键的重复**已修于 #210**：控制通道返回面中立值（分页用 `next`），由 MCP 面渲染 `nextCursor`；auth 四键从同一 `LanStatus` 渲染，并有一条跨面一致性测试。#213 负责把 §7 的这条反例换掉。
 - **控制通道只传面中立值。** 控制 RPC 的结果不写对外协议的字段名；需要跨进程传递的值用中性名，由对外面渲染成协议报文。
