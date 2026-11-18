@@ -45,6 +45,36 @@ node tools/codemod.mjs --selftest               # 工具自身的 5 个用例
   编译报错分不清是哪个变换漏了。
 - **门必须在写盘之后立刻跑**。红了自动逐字节还原，现场不会留在 `git status` 里等人猜。
 
+## 整块 item 搬家
+
+「把这些 item 搬到新模块」也是宽改，但没有调用点要改，只有**文件边界**要动。手写提取脚本
+翻车过两次：`#[cfg(unix)]` / `#[cfg(not(unix))]` 同名双实现被按名字覆盖；两个 item 之间的
+`pub use` 块被一起吞进目标文件。用清单 + 门：
+
+```sh
+node tools/move-item.mjs plan.json            # dry run：列出 item 与行号
+node tools/move-item.mjs plan.json --apply    # 写盘，然后 cargo check --all-targets
+```
+
+```json
+{
+  "moves": [
+    {
+      "from": "src/manage/package.rs",
+      "to": "src/manage/model/ustar.rs",
+      "header": "//! ustar 编解码。\n\nuse std::io::Write;\n",
+      "items": ["TarEntry", "read_tar", "impl TarPlan"]
+    }
+  ]
+}
+```
+
+- item 连同紧贴的 `///` 与 `#[...]` 一起搬；目标不存在时写入 `header`。
+- 同名多处**直接拒绝**并列出全部行号——那通常就是 `#[cfg]` 双实现；确实要搬其中一半就写
+  `名字@行号`。
+- 名字可带 kind（`fn probe`）也可裸写（`TarEntry`；`impl` 要带 `impl ` 前缀）。
+- 门红了逐字节还原两个文件并退出 1。
+
 ## 门顺序
 
 ```sh
