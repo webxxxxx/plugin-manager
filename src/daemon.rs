@@ -21,13 +21,13 @@ use crate::cli::status::Status;
 use crate::face::catalog;
 #[cfg(feature = "http")]
 use crate::face::fallback::respond;
-use crate::face::mcp;
+use crate::face::mcp_tools;
 #[cfg(feature = "http")]
 use crate::face::prebody::PreBodyFaces;
 use crate::kernel::contract::{
     CapabilityName, Instance, Invocation, Launchers, ProgressToken, Reply, ReplySink,
 };
-use crate::kernel::failure::{Class, Failure, Problem, ProblemError, Rejection, Retry};
+use crate::kernel::failure::{Class, Failure, Problem, ProblemError, Retry};
 use crate::kernel::registry::{Hook, Kind, Registry, Service, State, RESERVED_ID};
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::manage::package;
@@ -1329,7 +1329,7 @@ impl Daemon {
     }
 
     fn tool_list(&self) -> Vec<Value> {
-        mcp::tools(&self.registry, |id| self.is_live(id))
+        mcp_tools::tools(&self.registry, |id| self.is_live(id))
     }
 
     /// Invalidate the cached tool projection. The cache is keyed by the
@@ -1428,8 +1428,8 @@ impl Daemon {
         });
         if let Some(service_id) = start_id {
             let response = match self.start_service(service_id, clock) {
-                Ok(status) => mcp::tool_result(id, status_json(status).to_string(), false),
-                Err(error) => mcp::tool_error(id, error.detail()),
+                Ok(status) => mcp_tools::tool_result(id, status_json(status).to_string(), false),
+                Err(error) => mcp_tools::tool_error(id, error.detail()),
             };
             send(&reply, response);
             return;
@@ -1461,7 +1461,7 @@ impl Daemon {
         if builtin.is_some() && !self.is_live(service_id) {
             send(
                 &reply,
-                mcp::tool_result(id, format!("service {} is not running", service_id), true),
+                mcp_tools::tool_result(id, format!("service {} is not running", service_id), true),
             );
             return;
         }
@@ -1472,7 +1472,7 @@ impl Daemon {
         {
             send(
                 &reply,
-                mcp::tool_error(id, &format!("cannot resolve blob argument: {}", message)),
+                mcp_tools::tool_error(id, &format!("cannot resolve blob argument: {}", message)),
             );
             return;
         }
@@ -1494,7 +1494,10 @@ impl Daemon {
             let mut instance = match launchers.launch(contract, &spec) {
                 Ok(instance) => instance,
                 Err(error) => {
-                    reply.send(project_builtin_outcome(id, Err(error.into_failure())));
+                    reply.send(mcp_tools::project_builtin_outcome(
+                        id,
+                        Err(error.into_failure()),
+                    ));
                     return;
                 }
             };
@@ -1502,10 +1505,10 @@ impl Daemon {
                 reply.clone(),
                 id.clone(),
                 "stream replies are not supported by the builtin adapter",
-                project_builtin_outcome,
+                mcp_tools::project_builtin_outcome,
             );
             if let Err(rejection) = instance.call(invocation, done) {
-                reply.send(rpc::to_line(&project_rejection(id, rejection)));
+                reply.send(rpc::to_line(&mcp_tools::project_rejection(id, rejection)));
             }
             return;
         }
@@ -1513,7 +1516,7 @@ impl Daemon {
         let Some(slot) = self.slots.get_mut(service_id) else {
             send(
                 &reply,
-                mcp::tool_result(id, format!("service {} has no runtime", service_id), true),
+                mcp_tools::tool_result(id, format!("service {} has no runtime", service_id), true),
             );
             return;
         };
@@ -1526,7 +1529,7 @@ impl Daemon {
             Ok(instance) => instance,
             Err(error) => {
                 let failure = Failure::new(Class::ImplementationError, Retry::Never, error);
-                reply.send(project_slot_outcome(id, Err(failure)));
+                reply.send(mcp_tools::project_slot_outcome(id, Err(failure)));
                 return;
             }
         };
@@ -1534,10 +1537,10 @@ impl Daemon {
             reply.clone(),
             id.clone(),
             "stream replies are not wired through SlotWire",
-            project_slot_outcome,
+            mcp_tools::project_slot_outcome,
         );
         if let Err(rejection) = instance.call(invocation, done) {
-            reply.send(rpc::to_line(&project_rejection(id, rejection)));
+            reply.send(rpc::to_line(&mcp_tools::project_rejection(id, rejection)));
         }
     }
 
@@ -2601,39 +2604,6 @@ fn status_json(status: Status) -> Value {
     serde_json::to_value(status).unwrap_or(Value::Null)
 }
 
-/// Face-side projection of a completed slot call. The slot only emits a
-/// `Result<Value, Failure>`; MCP codes/strings live here.
-fn project_slot_response(
-    external_id: Option<Value>,
-    outcome: Result<Value, Failure>,
-) -> rpc::Response {
-    match outcome {
-        Ok(value) => rpc::ok(external_id, value),
-        Err(failure) => match failure.class {
-            Class::Busy => rpc::err_data(
-                external_id,
-                -32000,
-                "busy: too many in-flight tool calls",
-                json!({ "class": failure.class.as_str() }),
-            ),
-            Class::FrameTooLarge => rpc::err_data(
-                external_id,
-                -32602,
-                "tools/call request exceeds the 1 MiB frame limit",
-                json!({ "class": failure.class.as_str() }),
-            ),
-            Class::NotRunning | Class::WriteFailed => {
-                mcp::tool_result(external_id, failure.detail, true)
-            }
-            _ => mcp::tool_error(external_id, &failure.detail),
-        },
-    }
-}
-
-fn project_slot_outcome(external_id: Option<Value>, outcome: Result<Value, Failure>) -> String {
-    rpc::to_line(&project_slot_response(external_id, outcome))
-}
-
 /// Build the completion sink for one tools/call: a stream reply is an
 /// implementation error, and the final value/failure is projected by the face.
 fn projected_done(
@@ -2654,35 +2624,6 @@ fn projected_done(
         };
         let _ = reply.send(project(external_id, outcome));
     })
-}
-
-/// Face-side projection of an immediate `Instance::call` rejection: the call was
-/// never attempted, so it has no [`Failure`]. The wire shapes stay the ones the
-/// old `rejection_failure` path produced (BadArguments through the frame-limit
-/// error, UnknownCapability through the isError tool result); only the
-/// structured `data.kind` is added to the JSON-RPC error.
-fn project_rejection(external_id: Option<Value>, rejection: Rejection) -> rpc::Response {
-    let kind = rejection.as_str();
-    match rejection {
-        Rejection::BadArguments { .. } => rpc::err_data(
-            external_id,
-            -32602,
-            "tools/call request exceeds the 1 MiB frame limit",
-            json!({ "kind": kind }),
-        ),
-        Rejection::UnknownCapability { capability } => {
-            mcp::tool_error(external_id, &format!("unknown capability {capability}"))
-        }
-    }
-}
-
-/// Project a builtin call the same way the MCP face projects a slot call:
-/// success becomes a text tool result, failures keep the classified envelope.
-fn project_builtin_outcome(external_id: Option<Value>, outcome: Result<Value, Failure>) -> String {
-    match outcome {
-        Ok(value) => rpc::to_line(&mcp::tool_result(external_id, value.to_string(), false)),
-        Err(failure) => project_slot_outcome(external_id, Err(failure)),
-    }
 }
 
 /// Give a slot its contract and the face-side projections. The slot itself no
@@ -4082,24 +4023,6 @@ while ($null -ne [Console]::In.ReadLine()) { }
     }
 
     #[test]
-    fn the_builtin_outcome_projects_values_and_failures() {
-        let ok = project_builtin_outcome(Some(json!(1)), Ok(json!({"version": "1.2.3"})));
-        let response: rpc::Response = serde_json::from_str(&ok).expect("ok json");
-        let result = response.result.expect("result");
-        assert_eq!(result["isError"], false);
-        assert_eq!(result["content"][0]["text"], "{\"version\":\"1.2.3\"}");
-
-        let failed = project_builtin_outcome(
-            Some(json!(2)),
-            Err(Failure::new(Class::Busy, Retry::Never, "busy")),
-        );
-        let response: rpc::Response = serde_json::from_str(&failed).expect("error json");
-        let error = response.error.expect("error");
-        assert_eq!(error.code, -32000);
-        assert_eq!(error.data.expect("data")["class"], "busy");
-    }
-
-    #[test]
     fn lifecycle_management_errors_carry_their_problem_kind() {
         let (_sender, receiver) = mpsc::channel();
         let mut daemon = Daemon::new(
@@ -4512,66 +4435,6 @@ while ($null -ne [Console]::In.ReadLine()) { }
             response.error.expect("error").data.expect("data")["kind"],
             "too_large"
         );
-    }
-
-    #[test]
-    fn the_slot_response_keeps_all_eight_class_shapes() {
-        for class in Class::ALL {
-            let detail = format!("detail {}", class.as_str());
-            let response = project_slot_response(
-                Some(json!(1)),
-                Err(Failure::new(class, class.default_retry(), detail.clone())),
-            );
-            match class {
-                Class::Busy => {
-                    let error = response.error.expect("busy error");
-                    assert_eq!(error.code, -32000);
-                    assert_eq!(error.message, "busy: too many in-flight tool calls");
-                    assert_eq!(error.data.expect("data")["class"], "busy");
-                }
-                Class::FrameTooLarge => {
-                    let error = response.error.expect("frame error");
-                    assert_eq!(error.code, -32602);
-                    assert_eq!(
-                        error.message,
-                        "tools/call request exceeds the 1 MiB frame limit"
-                    );
-                    assert_eq!(error.data.expect("data")["class"], "frame_too_large");
-                }
-                _ => {
-                    let result = response.result.expect("isError result");
-                    assert_eq!(result["isError"], true);
-                    assert_eq!(result["content"][0]["text"], detail);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn an_immediate_rejection_projects_its_kind_without_changing_the_message() {
-        let response = project_rejection(
-            Some(json!(5)),
-            Rejection::BadArguments {
-                detail: "arguments are too large".into(),
-            },
-        );
-        let error = response.error.expect("bad arguments error");
-        assert_eq!(error.code, -32602);
-        assert_eq!(
-            error.message,
-            "tools/call request exceeds the 1 MiB frame limit"
-        );
-        assert_eq!(error.data.expect("data")["kind"], "bad_arguments");
-
-        let response = project_rejection(
-            Some(json!(6)),
-            Rejection::UnknownCapability {
-                capability: "nope".into(),
-            },
-        );
-        let result = response.result.expect("unknown capability result");
-        assert_eq!(result["isError"], true);
-        assert_eq!(result["content"][0]["text"], "unknown capability nope");
     }
 }
 

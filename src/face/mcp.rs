@@ -1,6 +1,5 @@
-use crate::kernel::registry::{Kind, Registry};
 use crate::server::mcp::result::{
-    error_response, result_value, server_meta, tool_error_result, tool_result_object, SERVER_NAME,
+    error_response, server_meta, tool_error_result, tool_result_object, SERVER_NAME,
 };
 use crate::server::mcp::session::{validate_meta, Served, MODERN_VERSION};
 use crate::wire::control::channel;
@@ -16,63 +15,6 @@ const LEGACY_VERSIONS: [&str; 3] = ["2025-11-25", "2025-06-18", "2025-03-26"];
 const TTL_MS: u64 = 1000;
 const LEGACY_POLL: Duration = Duration::from_secs(1);
 const MODERN_IDLE: Duration = Duration::from_secs(30);
-
-/// Project the current plugin tool surface.
-///
-/// The daemon supplies the live predicate because the registry snapshot alone
-/// cannot distinguish a crashed plugin from a running one. A dead plugin still
-/// exposes its <id>.start tool so it can be brought back.
-pub fn tools<F>(reg: &Registry, is_live: F) -> Vec<Value>
-where
-    F: Fn(&str) -> bool,
-{
-    let mut out = Vec::new();
-    // The capability surface, not the kind, decides whether a service exposes
-    // tools: the builtin `svc` is a core service with tools. Only plugins get a
-    // `<id>.start` tool, because only a supervised process can be dead.
-    for svc in reg
-        .values()
-        .filter(|svc| svc.kind == Kind::Plugin || !svc.contract.surface().is_empty())
-    {
-        let live = is_live(&svc.id);
-        if svc.kind == Kind::Plugin || !live {
-            out.push(json!({
-                "name": format!("{}.start", svc.id),
-                "description": format!("Start service {}", svc.id),
-                "inputSchema": {"type": "object", "properties": {}}
-            }));
-        }
-        if live {
-            for cap in svc.contract.surface() {
-                let name = cap.name.as_str();
-                let description = if cap.desc.is_empty() {
-                    format!("{} on {}", name, svc.id)
-                } else {
-                    cap.desc.clone()
-                };
-                let input_schema = cap.input_schema.clone().unwrap_or(Value::Null);
-                out.push(json!({
-                    "name": format!("{}.{}", svc.id, name),
-                    "description": description,
-                    "inputSchema": input_schema
-                }));
-            }
-        }
-    }
-    out.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-    out
-}
-
-/// Build one MCP tool result. Both the aggregation layer and the plugin slot
-/// use this shape, so the envelope lives here rather than in each caller.
-pub fn tool_result(id: Option<Value>, text: String, is_error: bool) -> rpc::Response {
-    rpc::ok(id, result_value(text, is_error))
-}
-
-/// A tool execution failure (plugin error, crash, timeout, protocol violation).
-pub fn tool_error(id: Option<Value>, message: &str) -> rpc::Response {
-    tool_result(id, message.to_string(), true)
-}
 
 /// Serve one MCP client over stdio. The bridge never launches svcd; if the
 /// daemon is unreachable at startup it writes to stderr and exits 1.
@@ -454,68 +396,6 @@ fn write_notification(stdout: &mut impl Write, method: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::contract::{Capability as KernelCapability, CapabilityName, Effect};
-    use crate::kernel::registry::{Exec, Ready, Service, State};
-
-    fn capability(name: &str) -> KernelCapability {
-        KernelCapability {
-            name: CapabilityName::new(name),
-            desc: format!("{} description", name),
-            input_schema: Some(
-                json!({"type": "object", "properties": {"input": {"type": "string"}}}),
-            ),
-            effect: Effect::Write,
-            idempotent: false,
-        }
-    }
-
-    fn service(id: &str, kind: Kind, caps: &[&str]) -> Service {
-        let caps = caps.iter().map(|cap| capability(cap)).collect();
-        let contract = crate::kernel::registry::contract_for(
-            id,
-            "1.0.0",
-            caps,
-            crate::kernel::registry::Carrier::Slot,
-            &crate::platform::limits::test_default(),
-        );
-        Service {
-            id: id.into(),
-            kind,
-            version: "1.0.0".into(),
-            protocol: 1,
-            desc: "test".into(),
-            deps: Vec::new(),
-            contract,
-            impl_ref: None,
-            exec: Some(Exec {
-                path: "/bin/true".into(),
-                args: Vec::new(),
-                env: Default::default(),
-                ready: Ready::Exec,
-                interpreter: None,
-            }),
-            lifecycle: None,
-            enabled: true,
-            restart: crate::kernel::registry::Restart::Never,
-            remain_after_exit: false,
-            compat: None,
-            state: State::Running,
-            pid: None,
-            since: None,
-            ready_since: None,
-            next_at: None,
-            failures: 0,
-            last_exit: None,
-            config: None,
-        }
-    }
-
-    fn names(tools: &[Value]) -> Vec<String> {
-        tools
-            .iter()
-            .filter_map(|tool| tool["name"].as_str().map(str::to_string))
-            .collect()
-    }
 
     fn modern_meta(version: &str) -> Value {
         json!({
@@ -524,104 +404,6 @@ mod tests {
                 "io.modelcontextprotocol/clientCapabilities": {}
             }
         })
-    }
-
-    #[test]
-    fn the_capability_surface_not_the_kind_decides_the_tool_projection() {
-        let mut registry = Registry::new();
-        registry
-            .insert(service("core", Kind::Core, &["status"]))
-            .expect("core");
-        registry
-            .insert(service("lifecycle", Kind::Core, &[]))
-            .expect("lifecycle");
-        registry
-            .insert(service("plug", Kind::Plugin, &["status"]))
-            .expect("plugin");
-
-        let names = names(&tools(&registry, |_| true));
-
-        assert!(names.contains(&"core.status".to_string()), "{names:?}");
-        assert!(
-            !names.iter().any(|name| name.starts_with("lifecycle.")),
-            "{names:?}"
-        );
-        assert!(!names.contains(&"core.start".to_string()), "{names:?}");
-        assert!(names.contains(&"plug.status".to_string()), "{names:?}");
-    }
-
-    #[test]
-    fn a_live_builtin_service_publishes_its_capabilities_without_start() {
-        let registry = Registry::with_builtin(&crate::platform::limits::test_default());
-
-        let names = names(&tools(&registry, |_| true));
-
-        assert_eq!(
-            names,
-            vec!["svc.health".to_string(), "svc.version".to_string()]
-        );
-    }
-
-    #[test]
-    fn a_dead_core_with_capabilities_only_exposes_start() {
-        let mut registry = Registry::new();
-        registry
-            .insert(service("core", Kind::Core, &["status"]))
-            .expect("core");
-
-        let names = names(&tools(&registry, |_| false));
-
-        assert_eq!(names, vec!["core.start".to_string()]);
-    }
-
-    #[test]
-    fn a_dead_plugin_only_exposes_start() {
-        let mut registry = Registry::new();
-        registry
-            .insert(service("plug", Kind::Plugin, &["status"]))
-            .expect("plugin");
-
-        let names = names(&tools(&registry, |_| false));
-
-        assert_eq!(names, vec!["plug.start".to_string()]);
-    }
-
-    #[test]
-    fn a_live_plugin_exposes_manifest_descriptions_and_schemas() {
-        let mut registry = Registry::new();
-        registry
-            .insert(service("plug", Kind::Plugin, &["status"]))
-            .expect("plugin");
-
-        let projected = tools(&registry, |_| true);
-        let status = projected
-            .iter()
-            .find(|tool| tool["name"] == "plug.status")
-            .expect("status tool");
-
-        assert_eq!(status["description"], "status description");
-        assert_eq!(status["inputSchema"]["type"], "object");
-        assert_eq!(
-            status["inputSchema"]["properties"]["input"]["type"],
-            "string"
-        );
-    }
-
-    #[test]
-    fn tools_are_sorted_by_name() {
-        let mut registry = Registry::new();
-        registry
-            .insert(service("z", Kind::Plugin, &["alpha"]))
-            .expect("z");
-        registry
-            .insert(service("a", Kind::Plugin, &["zeta"]))
-            .expect("a");
-
-        let names = names(&tools(&registry, |_| true));
-
-        let mut sorted = names.clone();
-        sorted.sort();
-        assert_eq!(names, sorted);
     }
 
     #[test]
