@@ -2,9 +2,8 @@
 //!
 //! 套件按**入口**划分，不按适配器划分（#109）：
 //!
-//! - [`check_call`]：调用面。内核拒绝（未知能力 / 内联上限 / 零超时）、声明的失败
-//!   类别原样表达、取消后不得返回 Ok、内联边界恰好通过。
-//! - [`check_lifecycle`]：适配器**自己拥有**生命周期时，Ensure / Quiesce / Probe 的断言。
+//! - [`check`]：两个入口都自己拥有的适配器——调用面 + 生命周期面。
+//! - [`check_call`]：只拥有调用面的适配器（生命周期交给别人）。
 //! - [`check_delegated_lifecycle`]：适配器把生命周期交给别人（例如监督槽，ADR-0015）时，
 //!   必须以 `implementation_error` + `never` 拒绝 Ensure / Quiesce，Probe 仍要作答。
 //!
@@ -76,13 +75,6 @@ pub fn check_call(
         return violations;
     };
     violations.extend(call_violations(contract, &first, &make, &make_failing));
-    violations
-}
-
-/// 检查适配器自己拥有的生命周期入口。
-pub fn check_lifecycle(contract: &Contract, make: impl Fn() -> Instance) -> Vec<String> {
-    let mut violations = check_contract(contract);
-    violations.extend(lifecycle_violations(&make));
     violations
 }
 

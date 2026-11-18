@@ -8,11 +8,9 @@
 #![cfg(test)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::json;
 
 use super::contract::{
     Contract, Control, ImplRef, Instance, Invocation, Launcher, Reply, ReplySink, Settled, Wire,
@@ -26,7 +24,6 @@ pub struct MemoryWire {
     live: bool,
     honor_cancel: bool,
     stop_works: bool,
-    calls: Arc<AtomicUsize>,
 }
 
 impl MemoryWire {
@@ -38,14 +35,7 @@ impl MemoryWire {
             live: false,
             honor_cancel: true,
             stop_works: true,
-            calls: Arc::new(AtomicUsize::new(0)),
         }
-    }
-
-    pub fn with_value(mut self, capability: &str, value: Value) -> MemoryWire {
-        self.replies
-            .insert(capability.to_string(), Ok(Reply::Value(value)));
-        self
     }
 
     pub fn with_failure(mut self, capability: &str, failure: Failure) -> MemoryWire {
@@ -75,11 +65,6 @@ impl MemoryWire {
         self
     }
 
-    /// 调用计数：证明"内核拒绝时实现一次都没被叫到"。
-    pub fn calls(&self) -> Arc<AtomicUsize> {
-        self.calls.clone()
-    }
-
     pub fn instance(self, contract: Contract) -> Instance {
         Instance::new(contract, Box::new(self)).expect("memory contract is valid")
     }
@@ -93,7 +78,6 @@ impl Default for MemoryWire {
 
 impl Wire for MemoryWire {
     fn call(&mut self, invocation: Invocation, done: ReplySink) -> Result<(), Rejection> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
         let outcome = if invocation.cancel.is_cancelled() && self.honor_cancel {
             Err(Failure::new(Class::Cancelled, Retry::Never, "cancelled"))
         } else if !self.running {

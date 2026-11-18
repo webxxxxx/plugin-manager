@@ -44,6 +44,10 @@ impl CapabilityName {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effect {
     /// 无副作用：重试总是安全的。
+    ///
+    /// 只有内核的单测构造它（`surface_is_sorted_so_projections_are_stable`）；
+    /// 生产里所有能力都是 `Read` 或 `Write`。
+    #[cfg_attr(not(test), allow(dead_code))]
     Pure,
     /// 只读：重试安全。
     Read,
@@ -67,7 +71,12 @@ pub struct Capability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthCheck {
     ExitOnly,
+    /// 义务模型里「主动探测」的两档。今天没有任何契约构造它们（全部走
+    /// `Obligations::default()` 的 `ExitOnly`）；将来要做主动健康探测时从这里接。
+    #[allow(dead_code)]
     Ping,
+    /// 见 [`HealthCheck::Ping`]。
+    #[allow(dead_code)]
     Status,
 }
 
@@ -75,6 +84,10 @@ pub enum HealthCheck {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleObligation {
     Process,
+    /// 义务模型里「由 hook 声明生命周期」这一档。manifest 的 `lifecycle` 是真的，
+    /// 但没有人把它写进 `Obligations`（全部走 `default()` 的 `Process`）；
+    /// 要做这项接线时从这里接。
+    #[allow(dead_code)]
     Hooks,
 }
 
@@ -208,6 +221,11 @@ pub struct ImplRef {
 }
 
 /// 生命周期动词。健康走 `Probe`，不是第三个入口，也不是保留能力。
+///
+/// 生产实现了 `lifecycle` 却没有调用者：`SlotWire` 把 Ensure / Quiesce 转成
+/// `implementation_error`（ADR-0015 把 exec 服务的生命周期交给监督槽），
+/// `BuiltinWire` 会作答。真正发起这三个动词的只有 `conformance`。
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
     Ensure,
@@ -241,11 +259,17 @@ impl Health {
     }
 
     /// 进程还在：`Live` / `Ready` / `Degraded`。
+    ///
+    /// 只有测试读它（`conformance` 与内核单测）；生产按 `Settled` 的四个值直接分支。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_alive(&self) -> bool {
         !matches!(self.state, Settled::Stopped)
     }
 
     /// 能接受调用：`Ready` / `Degraded`。
+    ///
+    /// 同 [`Health::is_alive`]：只有测试读它。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_usable(&self) -> bool {
         matches!(self.state, Settled::Ready | Settled::Degraded(_))
     }
@@ -261,6 +285,9 @@ pub struct StreamId(pub u64);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
     Value(Value),
+    /// 流式结果的占位。今天没有任何实现构造它；`projected_done` 把收到
+    /// `Stream` 当实现错误处理。要真做流式时，从这里开始接。
+    #[allow(dead_code)]
     Stream(StreamId),
 }
 
@@ -269,6 +296,9 @@ pub enum Reply {
 pub struct CancelToken(Arc<AtomicBool>);
 
 impl CancelToken {
+    /// 只有 `conformance` 会主动取消（它断言「取消后不得返回 Ok」）；生产里
+    /// 取消还没有驱动者。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn cancel(&self) {
         self.0.store(true, Ordering::SeqCst);
     }
@@ -310,12 +340,21 @@ pub struct Invocation {
     /// 调用方给的时限预算；内核到点即判 [`Class::Timeout`]，实现不得延长。
     pub timeout: Duration,
     /// 调用方愿意为这次调用花的资源上限；内核只透传。
+    ///
+    /// 只有内核自己的单测读写它；生产还没有按预算裁事的执行器。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub budget: Budget,
     /// 自动重试的幂等键：同一个键重复调用等价于一次（仅当能力 `idempotent`）。
+    ///
+    /// ADR-0013 规定信封可带它；今天没有任何编排读它。
+    #[allow(dead_code)]
     pub idempotency: Option<String>,
     /// 进度关联 token；`None` = 调用方不要进度。
     pub progress: Option<ProgressToken>,
     /// 排障用的串联 id；实现可以忽略。
+    ///
+    /// ADR-0013 规定信封可带它；今天没有任何编排读它。
+    #[allow(dead_code)]
     pub trace: Option<String>,
     pub cancel: CancelToken,
 }
@@ -334,11 +373,17 @@ impl Invocation {
         }
     }
 
+    /// 设置预算。只有内核单测用它（`invocation_carries_budget_and_progress`）；
+    /// 生产还没有按预算裁事的执行器。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_budget(mut self, budget: Budget) -> Invocation {
         self.budget = budget;
         self
     }
 
+    /// 设置进度 token。生产直接写 `invocation.progress`，不走这个 builder；
+    /// 只有上面那个单测用它。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_progress(mut self, token: ProgressToken) -> Invocation {
         self.progress = Some(token);
         self
@@ -353,6 +398,9 @@ pub trait Wire {
     /// 开始一次调用。返回 `Err(Rejection)` 表示调用没有被尝试；失败通过
     /// `done` 交付，因为实现可能在另一个线程/事件循环上完成。
     fn call(&mut self, invocation: Invocation, done: ReplySink) -> Result<(), Rejection>;
+    /// 生产还没有驱动这个入口（见 [`Control`]）；`conformance` 用它断言实现
+    /// 是「自己拥有生命周期」还是「委托给别人」。
+    #[cfg_attr(not(test), allow(dead_code))]
     fn lifecycle(&mut self, control: Control) -> Result<Settled, Failure>;
 }
 
@@ -367,10 +415,6 @@ impl Instance {
     pub fn new(contract: Contract, wire: Box<dyn Wire>) -> Result<Instance, String> {
         contract.validate()?;
         Ok(Instance { contract, wire })
-    }
-
-    pub fn contract(&self) -> &Contract {
-        &self.contract
     }
 
     /// 调用。三种情况**不会**到达实现：能力不在能力面、参数超内联上限、
@@ -446,6 +490,9 @@ impl Instance {
         }
     }
 
+    /// 生产还没有驱动它（见 [`Wire::lifecycle`]）；`conformance` 用它断言
+    /// 实现的生命周期行为。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn lifecycle(&mut self, control: Control) -> Result<Settled, CallError> {
         self.wire.lifecycle(control).map_err(CallError::Failed)
     }

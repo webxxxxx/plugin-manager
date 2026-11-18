@@ -83,6 +83,9 @@ impl Class {
 /// 重试建议。`After` 是退避，不是"立刻再试"。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Retry {
+    /// 立刻再试。今天只有内核的失败类别测试构造它（用来断言 `Now` 与
+    /// `After(_)` 在 `shape()` 里同属可重试）；生产只会给 `After` / `Never`。
+    #[cfg_attr(not(test), allow(dead_code))]
     Now,
     Never,
     After(Duration),
@@ -291,6 +294,10 @@ impl std::fmt::Display for ProblemError {
 impl std::error::Error for ProblemError {}
 
 /// 一次调用的完整结局。
+///
+/// 只有 [`Instance::lifecycle`](crate::kernel::contract::Instance::lifecycle) 用它；
+/// 调用面走 `Rejection` / `Failure` 两条分开的路。
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallError {
     Rejected(Rejection),
