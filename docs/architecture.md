@@ -227,7 +227,8 @@ src/
     api.rs           /api/v1
     plugin_ui.rs     /plugin-ui 静态资源与实时路由的入口（#115/#122）
     plugin_streams/  /plugin-ui SSE · WS · raw 的 sans-IO handler（#122）
-    mcp_tools.rs     能力面 → tools/list · tools/call
+    mcp_tools.rs     能力面 → tools/list；MCP 的 envelope 投影（工具结果、拒绝）
+    mcp.rs           `mcp` 入口：MCP 客户端 ↔ svcd 的 stdio 桥（era 装饰、分页渲染、legacy 握手）
     blob.rs  blob_upload.rs  install.rs  export.rs
 
   cli/                        L5 对外面：命令行
@@ -277,13 +278,15 @@ src/
 3. **L4 不认识 L3 的领域概念；L5 不拥有连接。**
 4. **`platform` 可以持有技术资源及其回收，但不许出现领域概念；`kernel` 不许出现进程、socket、文件。**
 
-今天的三处真实反例（用来验证规则不是空话；修完后换上新的，**不要删表**——表里至少要留一条未修的，否则它自己就成了空话）：
+四条不变量今天全部由 `dep-lint` 守着（0 违规）。下面保留两条最近抓到的真实违规和一条现行的漏网，用来证明规则不是空话；**不要删表**——修完后把新的写进来，表里至少要留一条未修的。
 
-- **组合根反向持有对外面的数据类型**：`daemon.rs:20` 的 `use crate::cli::status::Status`（rank 6 持有 rank 5 的类型，层方向检查抓不到，因为 6 ≥ 5）。**待 #212 修**（`Status` 与 `Live` 进 `kernel/projection.rs`，见 [ADR-0025](adr/0025-projection-is-a-face-neutral-value.md)）。
-- **想象中的 seam**：`Slot::set_projector`（`slot.rs:361`）的唯一注入点是 `daemon.rs:2693`，而读它的 `Slot::project` 与 `CallSink::Client` 都标着 `#[cfg(test)]`（`slot.rs:1124` / `:131`）——生产路径只走 `CallSink::Completion` → `projected_done`。**待 #209 修。**
-- **同一份协议 envelope 在两个面各写一次**：MCP 分页包在 `daemon.rs:1376-1379` 与 `face/mcp.rs:282-285` 各组装一遍；auth 四键在 `daemon.rs:2892` 与 `face/api.rs:327` 各写一遍。**未修，见 #210。**
+| 反例 | 落点 | 状态 |
+|---|---|---|
+| **组合根反向持有对外面的数据类型** | 组合根曾 `use crate::cli::status::Status`（rank 6 持有 rank 5 的类型，层方向检查抓不到，因为 6 ≥ 5） | **已修于 #212**：`Status` 与 `Live` 进 `kernel/projection.rs`，`cli/status.rs` 只剩 `table` / `text` |
+| **想象中的 seam** | `Slot::set_projector` 的唯一注入点在组合根，而读它的 `Slot::project` 与 `CallSink::Client` 当时都标着 `#[cfg(test)]` | **已修于 #209**：那套机制连同 `CallSink` 枚举一起删掉，槽的完成回调直接就是调用方给的 `ReplySink` |
+| **同一份值转换实现两次，护栏只有一处** | `daemon.rs` 的 `persist_states` 自己算 `now.epoch_of(machine.since_ms)`，而 `kernel/projection.rs` 的 `epoch_secs` 另有 `ms == 0 → None` 保护 | **未修，见 #215**：这不是四条不变量里的哪一条，而是「唯一投影源」在时间换算上的漏网——同一份事实可能给出两个 `since` |
 
-（原文三条已全部失效，核实记录见 [ADR-0025](adr/0025-projection-is-a-face-neutral-value.md) 的 Context：`slot` 调 `mcp::tool_error` 已不存在，`transfer` 已不依赖 `status`，`install` 调 `daemon::shutdown_quiet` 只剩 `main.rs:136` 的同一 rank 调用。）
+（历史：原文那三条与上表第三条的前身都已修掉，核实记录见 [ADR-0025](adr/0025-projection-is-a-face-neutral-value.md) 的 Context。#210 把「同一份协议 envelope 在两个面各写一次」也修了：分页包改成控制通道传面中立的 `next`、由 MCP 面渲染成 `nextCursor`；auth 四键收敛到 `LanStatus` 一个值，两面各自渲染并加跨面一致性测试。）
 
 ## 8. seam 地图
 
