@@ -149,6 +149,16 @@ pub(crate) fn anchored_secs_opt(now: Now, ms: Option<u64>) -> Option<u64> {
     ms.and_then(|value| anchored_secs(now, value))
 }
 
+/// The inverse of [`anchored_secs`]: epoch seconds back to the supervisor's
+/// monotonic timeline.
+///
+/// A missing value stays missing. A runtime record without `since` means
+/// "never happened"; substituting `now` would invent a start that the status
+/// projection then reports as a plausible-looking epoch second.
+pub(crate) fn anchored_mono_ms(now: Now, epoch: Option<u64>) -> Option<u64> {
+    epoch.map(|value| now.mono_of(value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
