@@ -15,13 +15,13 @@ use serde_json::Value;
 
 use crate::face::uichannel::{Event, Subscription};
 use crate::face::webui;
-use crate::server::http::wire;
 use crate::server::http::{
     BlockingJob, BlockingOutcome, CloseReason, OutBuffer, StreamAction, StreamEvent, StreamHandler,
     StreamStep,
 };
 use crate::wire::control::channel;
 use crate::wire::message::rpc;
+use crate::wire::ws::frame;
 
 use super::frame::PendingFrame;
 
@@ -131,7 +131,7 @@ impl WsStream {
         self.queued.clear();
         self.queued_bytes = 0;
         if self.close.is_none() {
-            self.close = Some(wire::close_payload(code, reason));
+            self.close = Some(frame::close_payload(code, reason));
         }
     }
 
@@ -268,7 +268,7 @@ impl WsStream {
             .max(self.limits.ws_raw_max_bytes);
         let mut job = None;
         loop {
-            match wire::parse_frame(&self.buffer, frame_limit) {
+            match frame::parse_frame(&self.buffer, frame_limit) {
                 Ok(None) => break,
                 Ok(Some((frame, used))) => {
                     self.buffer.drain(..used);
@@ -293,14 +293,14 @@ impl WsStream {
                         break;
                     }
                 }
-                Err(wire::ParseError::TooLarge { total }) => {
+                Err(frame::ParseError::TooLarge { total }) => {
                     let buffered = self.buffer.len();
                     self.buffer.clear();
                     self.discard = total.saturating_sub(buffered);
                     self.queue_close(1009, "message too large");
                     break;
                 }
-                Err(wire::ParseError::Protocol(reason)) => {
+                Err(frame::ParseError::Protocol(reason)) => {
                     self.queue_close(1002, reason);
                     break;
                 }
@@ -309,7 +309,7 @@ impl WsStream {
         job
     }
 
-    fn handle_frame(&mut self, frame: &wire::Frame) -> Option<BlockingJob> {
+    fn handle_frame(&mut self, frame: &frame::Frame) -> Option<BlockingJob> {
         if frame.opcode >= 0x8 {
             match frame.opcode {
                 0x8 => {
@@ -503,7 +503,7 @@ mod tests {
 
     fn client_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
         let mask = [1u8, 2, 3, 4];
-        let mut bytes = wire::frame_header(opcode, payload.len());
+        let mut bytes = frame::frame_header(opcode, payload.len());
         bytes[1] |= 0x80;
         bytes.extend_from_slice(&mask);
         bytes.extend(

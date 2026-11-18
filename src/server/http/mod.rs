@@ -25,7 +25,6 @@ pub mod server;
 pub mod stream;
 #[cfg(feature = "http")]
 pub(crate) mod threads;
-pub mod wire;
 
 // The S4 contract is deliberately available to the minimal build (parent spec
 // #112) even when no HTTP endpoint is compiled in. Re-exports are allowed to

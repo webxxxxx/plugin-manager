@@ -11,12 +11,12 @@ use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::server::http::wire;
 use crate::server::http::{
     CloseReason, OutBuffer, StreamAction, StreamEvent, StreamHandler, StreamStep,
 };
 use crate::wire::contract::rawhub::{RawEvent, RawHub, RawSubscription};
 use crate::wire::message::ipc::RawFailure;
+use crate::wire::ws::frame;
 
 use super::frame::PendingFrame;
 
@@ -138,7 +138,7 @@ impl RawWsStream {
     fn queue_close(&mut self, code: u16, reason: &str) {
         self.closing = true;
         if self.close.is_none() {
-            self.close = Some(wire::close_payload(code, reason));
+            self.close = Some(frame::close_payload(code, reason));
         }
     }
 
@@ -231,7 +231,7 @@ impl RawWsStream {
     fn parse(&mut self) {
         let limit = self.limits.ws_raw_max_bytes;
         loop {
-            match wire::parse_frame(&self.buffer, limit) {
+            match frame::parse_frame(&self.buffer, limit) {
                 Ok(None) => break,
                 Ok(Some((frame, used))) => {
                     self.bytes_parsed += used as u64;
@@ -248,14 +248,14 @@ impl RawWsStream {
                         break;
                     }
                 }
-                Err(wire::ParseError::TooLarge { total }) => {
+                Err(frame::ParseError::TooLarge { total }) => {
                     let buffered = self.buffer.len();
                     self.buffer.clear();
                     self.discard = total.saturating_sub(buffered);
                     self.queue_close(1009, "message too large");
                     break;
                 }
-                Err(wire::ParseError::Protocol(reason)) => {
+                Err(frame::ParseError::Protocol(reason)) => {
                     let head: Vec<String> = self
                         .buffer
                         .iter()
@@ -275,7 +275,7 @@ impl RawWsStream {
         }
     }
 
-    fn handle_frame(&mut self, frame: &wire::Frame) {
+    fn handle_frame(&mut self, frame: &frame::Frame) {
         if frame.opcode >= 0x8 {
             match frame.opcode {
                 0x8 => {
@@ -428,7 +428,7 @@ mod tests {
 
     fn client_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
         let mask = [9u8, 8, 7, 6];
-        let mut bytes = wire::frame_header(opcode, payload.len());
+        let mut bytes = frame::frame_header(opcode, payload.len());
         bytes[1] |= 0x80;
         bytes.extend_from_slice(&mask);
         bytes.extend(
