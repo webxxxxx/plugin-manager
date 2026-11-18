@@ -243,7 +243,7 @@ src/
     mod.rs  plan.rs  execute.rs  service_win.rs
 ```
 
-**step 6（#170）已按本树整文件搬迁**：文件进了对应目录但内容没切，`manage`/`supervise` 的 `model/check/ops`、`platform/storage` 的五文件、`api.rs` 的四块仍是后续票。
+**step 6（#170）已按本树整文件搬迁**：文件进了对应目录但内容没切。`api.rs` 的四块已在 #173 拆完（只剩 compose 的装配与回退 loop）；`manage`/`supervise` 的 `model/check/ops` 与 `platform/storage` 的五文件仍是后续票。
 
 `orchestrate/` 与 `cluster/` 现在不建：**目录在第一个文件出现时创建**，不建空壳。
 
@@ -360,7 +360,7 @@ flowchart TD
 | `blob.rs` | `platform/storage/`（内容寻址、上传会话、回收） | `$blob` 引用语义归 `kernel/contract` |
 | `ipc.rs` `rpc.rs` `rawhub.rs` `reactor.rs` | `wire/contract/` + `wire/message/` | 帧、消息、连接分开 |
 | `channel.rs` | `wire/control/` + `server/control/` | 字节在线格式与客户端轮次在 wire；控制会话已在 `server/control/`（#124） |
-| `api.rs` | **四块**：`server/http/` + `face/api.rs` + `wire/ws/` + `kernel/failure.rs` | 它今天横跨三层 |
+| `api.rs` | 拆完（#173）：端点投影与谓词 → `face/fallback.rs`；读 body 之前的路由 → `face/prebody.rs`；MCP 的回退 SSE → `server/mcp/fallback.rs`；body 预算 → `server/http` | `api.rs` 只剩 compose（`Api` + `spawn` + 回退 loop 与三个流驱动） |
 | `mcp.rs` `mcp_http.rs` `catalog.rs` | `server/mcp/` + `face/mcp_tools.rs` | 传输契约与能力投影分开 |
 | `blob_http.rs` `ui_http.rs` `webui.rs` | `face/` 下同名词，去掉 `_http` | 只留投影（export 已在 #120 落到 `face/export.rs`，install 已在 #121 落到 `face/install.rs`，`install_http.rs` 已删除） |
 | `svc.rs` `plugin_cli.rs` `status.rs` | `cli/` | — |

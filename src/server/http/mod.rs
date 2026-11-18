@@ -68,3 +68,31 @@ pub fn busy_response(message: &str) -> Vec<u8> {
 pub fn stream_busy_response() -> Vec<u8> {
     busy_response("stream cap reached")
 }
+
+/// Body policy for the routes the face leaves to the server-owned fallback
+/// (the `/mcp` body cap and the blob/file session metadata). These legacy routes
+/// still live in the composition root; a new endpoint declares its policy in
+/// `Face::route` and never touches the HTTP engine.
+pub(crate) fn server_body_policy(
+    head: &crate::server::http::model::Head,
+    limits: &crate::platform::limits::Limits,
+) -> BodyPolicy {
+    let path = head
+        .path
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(&head.path);
+    if path.trim_end_matches('/').ends_with("/complete")
+        && (path.starts_with("/api/v1/blobs/uploads/")
+            || path.starts_with("/api/v1/file/uploads/")
+            || path.starts_with("/api/v1/files/uploads/"))
+    {
+        BodyPolicy::Buffered {
+            limit: limits.max_complete_body,
+        }
+    } else {
+        BodyPolicy::Buffered {
+            limit: limits.max_json_body,
+        }
+    }
+}
