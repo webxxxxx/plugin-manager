@@ -1760,18 +1760,16 @@ impl Daemon {
                 let slot = &self.slots[id];
                 let state = slot.machine.state;
                 match start::start_step(state, slot.is_channel_peer()) {
-                    start::Step::Settled => {
-                        if state == State::Stopped {
-                            // It reached ready and then exited cleanly before
-                            // this pass looked (`ready: exec` one-shots do
-                            // exactly that). Waiting for Running burns the whole
-                            // window and reports a timeout for a start that did
-                            // succeed.
-                            log::svcd(&format!(
-                                "svcd: {}: exited cleanly during start; the start is complete",
-                                id
-                            ));
-                        }
+                    start::Step::Settled => {}
+                    start::Step::Finished => {
+                        // It reached ready and then exited cleanly before this
+                        // pass looked (`ready: exec` one-shots do exactly that).
+                        // Waiting for Running burns the whole window and reports
+                        // a timeout for a start that did succeed.
+                        log::svcd(&format!(
+                            "svcd: {}: exited cleanly during start; the start is complete",
+                            id
+                        ));
                     }
                     start::Step::Waiting => all_settled = false,
                     start::Step::Failed => {
@@ -1780,7 +1778,7 @@ impl Daemon {
                             format!("service {} failed to start", id),
                         ));
                     }
-                    start::Step::Died => {
+                    start::Step::ChannelLost => {
                         // It answered ready and then left. The channel callers
                         // depend on is gone, so this start produced nothing
                         // usable even though the exit itself was clean.
@@ -4268,10 +4266,41 @@ while ($null -ne [Console]::In.ReadLine()) { }
             )
             .expect_err("the dead peer must fail the layer");
         assert_eq!(error.problem, Problem::Internal);
-        assert!(
-            error.detail().contains("exited during start"),
-            "{error}"
+        assert!(error.detail().contains("exited during start"), "{error}");
+        assert!(error.detail().contains("(exit code 0)"), "{error}");
+
+        let status = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "svc.status",
+            json!({"id": "dead"}),
         );
+        assert_eq!(status["result"]["summary"]["state"], "stopped", "{status}");
+    }
+
+    #[test]
+    fn a_raw_peer_that_dies_while_the_layer_is_still_starting_loses_the_channel() {
+        // protocol 3 forces `exec.ready=exec`, so a single-service start settles
+        // on `Running` at spawn. The slow peer is what lets a later pass observe
+        // the raw peer's clean exit, exactly like the notify case.
+        let (_sender, receiver) = mpsc::channel();
+        let dir = package::tempdir::TempDir::new();
+        let raw = peer_plugin("raw", exit_zero_exec(), 3);
+        let slow = peer_plugin("slow", slow_ping_agent(dir.path()), 1);
+        let mut daemon = Daemon::new(registry(vec![raw, slow]), receiver, None);
+        let hub = daemon.raw_hub.clone();
+        daemon.set_raw_hub(hub);
+
+        let error = daemon
+            .start_layer(
+                &["raw".into(), "slow".into()],
+                clock().now().mono_ms + 5_000,
+                &clock(),
+            )
+            .expect_err("the raw peer must fail the layer");
+        assert_eq!(error.problem, Problem::Internal);
+        assert!(error.detail().contains("exited during start"), "{error}");
+        assert!(error.detail().contains("(exit code 0)"), "{error}");
     }
 
     #[test]
