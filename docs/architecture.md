@@ -243,7 +243,7 @@ src/
     mod.rs  plan.rs  execute.rs  service_win.rs
 ```
 
-**step 6（#170）已按本树整文件搬迁**：文件进了对应目录但内容没切。`api.rs` 的四块已在 #173 拆完（只剩 compose 的装配与回退 loop）；`platform/storage` 的五文件已在 #174 拆完（`meta` / `path` / `upload` / `part` / `gc`）；`manage`/`supervise` 的 `model/check/ops` 仍是后续票。
+**step 6（#170）已按本树整文件搬迁**：文件进了对应目录但内容没切。`api.rs` 的四块已在 #173 拆完（只剩 compose 的装配与回退 loop）；`platform/storage` 的五文件已在 #175 拆完（`meta` / `path` / `upload` / `part` / `gc`）；`manage`/`supervise` 的 `model/check/ops` 仍是后续票。
 
 `orchestrate/` 与 `cluster/` 现在不建：**目录在第一个文件出现时创建**，不建空壳。
 
@@ -357,7 +357,7 @@ flowchart TD
 | `package.rs` `bundle.rs` `trust.rs` `interpreter.rs` | `manage/` | 按 model / check / ops 三段拆 |
 | `plugin.rs` | `manage/`（布局与扫描）+ `kernel/contract.rs`（能力声明） | 声明与操作分开 |
 | `slot.rs` `supervisor.rs` `runtime.rs` `hook.rs` `script.rs` `definition.rs` | `supervise/` | 运行载体留监督 |
-| `blob.rs` | `platform/storage/`：`meta`（值类型与 `$blob` 引用）/ `path`（内容寻址与布局）/ `upload`（会话与两种 commit 模式）/ `part`（分片）/ `gc`（过期回收）——#174 已拆完 | `$blob` 引用语义的目标在 `kernel/contract`（仍是后续票） |
+| `blob.rs` | `platform/storage/`：`meta`（值类型与 `$blob` 引用）/ `path`（内容寻址与布局）/ `upload`（会话与两种 commit 模式）/ `part`（分片）/ `gc`（过期回收）——#175 已拆完 | `$blob` 引用语义的目标在 `kernel/contract`（仍是后续票） |
 | `ipc.rs` `rpc.rs` `rawhub.rs` `reactor.rs` | `wire/contract/` + `wire/message/` | 帧、消息、连接分开 |
 | `channel.rs` | `wire/control/` + `server/control/` | 字节在线格式与客户端轮次在 wire；控制会话已在 `server/control/`（#124） |
 | `api.rs` | 拆完（#173）：端点投影与谓词 → `face/fallback.rs`；读 body 之前的路由 → `face/prebody.rs`；MCP 的回退 SSE → `server/mcp/fallback.rs`；body 预算 → `server/http` | `api.rs` 只剩 compose（`Api` + `spawn` + 回退 loop 与三个流驱动） |
