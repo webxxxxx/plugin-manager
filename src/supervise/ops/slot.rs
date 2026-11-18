@@ -83,8 +83,6 @@ pub(crate) struct Slot {
     contract: Option<Contract>,
     /// Default timeout for a call that does not carry its own.
     call_timeout: std::time::Duration,
-    /// Face-side projection of a completed call; `None` gives a neutral envelope.
-    project: Option<Arc<dyn Fn(Option<Value>, Result<Value, Failure>) -> String + Send + Sync>>,
     /// Face-side projection of a plugin notification (progress/logging).
     notify_sink: Option<Arc<dyn Fn(&str, &Value) + Send + Sync>>,
     /// Requests submitted by callers, drained on the event loop.
@@ -125,12 +123,6 @@ struct SlotRequest {
     /// goes through `done`.
     client: Option<crate::wire::control::channel::Reply>,
     done: ReplySink,
-}
-
-enum CallSink {
-    #[cfg(test)]
-    Client(crate::wire::control::channel::Reply),
-    Completion(ReplySink),
 }
 
 impl SlotHandle {
@@ -262,15 +254,14 @@ struct HookRun {
 }
 
 struct PendingCall {
-    external_id: Option<Value>,
     capability: String,
     deadline: u64,
     progress_token: Option<String>,
     /// Progress notifications go here while the call is in flight.
     client: Option<crate::wire::control::channel::Reply>,
-    /// Final result: projected for the legacy channel path, or delivered to the
-    /// caller's completion sink.
-    sink: CallSink,
+    /// Final result, delivered to the caller's completion sink. The slot does
+    /// not encode it: the face that owns the protocol supplied the sink.
+    sink: ReplySink,
 }
 
 #[derive(Debug)]
@@ -334,7 +325,6 @@ impl Slot {
             cleanup_then_spawn: false,
             contract: None,
             call_timeout: DEFAULT_CALL_TIMEOUT,
-            project: None,
             notify_sink: None,
             request_tx,
             request_rx,
@@ -356,13 +346,6 @@ impl Slot {
 
     pub(crate) fn set_call_timeout(&mut self, timeout: std::time::Duration) {
         self.call_timeout = timeout;
-    }
-
-    pub(crate) fn set_projector(
-        &mut self,
-        project: Arc<dyn Fn(Option<Value>, Result<Value, Failure>) -> String + Send + Sync>,
-    ) {
-        self.project = Some(project);
     }
 
     pub(crate) fn set_notifier(&mut self, notify: Arc<dyn Fn(&str, &Value) + Send + Sync>) {
@@ -503,16 +486,12 @@ impl Slot {
 
     fn drain_requests(&mut self, now: u64) {
         while let Ok(request) = self.request_rx.try_recv() {
-            let mut sink = Some(CallSink::Completion(request.done));
-            if let Err(error) = self.request_invocation_sink(
-                request.invocation,
-                None,
-                now,
-                request.client,
-                &mut sink,
-            ) {
+            let mut sink = Some(request.done);
+            if let Err(error) =
+                self.request_invocation_sink(request.invocation, now, request.client, &mut sink)
+            {
                 if let Some(sink) = sink.take() {
-                    self.finish_sink(None, sink, Err(call_error_failure(error)));
+                    self.finish_sink(sink, Err(call_error_failure(error)));
                 }
             }
         }
@@ -565,17 +544,16 @@ impl Slot {
         reply: crate::wire::control::channel::Reply,
     ) -> Result<(), CallError> {
         let client = Some(reply.clone());
-        let mut sink = Some(CallSink::Client(reply));
-        self.request_invocation_sink(invocation, external_id, now, client, &mut sink)
+        let mut sink = Some(test_reply_sink(reply, external_id));
+        self.request_invocation_sink(invocation, now, client, &mut sink)
     }
 
     fn request_invocation_sink(
         &mut self,
         invocation: Invocation,
-        external_id: Option<Value>,
         now: u64,
         client: Option<crate::wire::control::channel::Reply>,
-        sink: &mut Option<CallSink>,
+        sink: &mut Option<ReplySink>,
     ) -> Result<(), CallError> {
         if let Some(contract) = &self.contract {
             if contract.capability(&invocation.capability).is_none() {
@@ -649,7 +627,6 @@ impl Slot {
         self.pending.insert(
             id,
             PendingCall {
-                external_id,
                 capability: invocation.capability.as_str().to_string(),
                 deadline,
                 progress_token: invocation
@@ -1099,37 +1076,14 @@ impl Slot {
     }
 
     fn finish_pending(&self, pending: PendingCall, outcome: Result<Value, Failure>) {
-        self.finish_sink(pending.external_id, pending.sink, outcome);
+        self.finish_sink(pending.sink, outcome);
     }
 
-    #[cfg_attr(not(test), allow(unused_variables))]
-    fn finish_sink(
-        &self,
-        external_id: Option<Value>,
-        sink: CallSink,
-        outcome: Result<Value, Failure>,
-    ) {
-        match sink {
-            #[cfg(test)]
-            CallSink::Client(reply) => {
-                let line = self.project(external_id, outcome);
-                reply.send(line);
-            }
-            CallSink::Completion(done) => {
-                done(outcome.map(Reply::Value));
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn project(&self, external_id: Option<Value>, outcome: Result<Value, Failure>) -> String {
-        if let Some(project) = &self.project {
-            return project(external_id, outcome);
-        }
-        match outcome {
-            Ok(value) => rpc::to_line(&rpc::ok(external_id, value)),
-            Err(failure) => rpc::to_line(&rpc::err(external_id, -32000, &failure.detail)),
-        }
+    /// One completion point: the slot turns the call outcome into a [`Reply`]
+    /// and hands it to the sink the caller supplied. It does not encode
+    /// anything — the face that owns the protocol supplied the sink.
+    fn finish_sink(&self, sink: ReplySink, outcome: Result<Value, Failure>) {
+        sink(outcome.map(Reply::Value));
     }
 
     fn mark_degraded(&mut self, outcome: &Result<Value, Failure>) {
@@ -1710,6 +1664,36 @@ fn abandon(child: &mut Child, reason: impl Into<String>) -> Result<u32, String> 
     Err(reason.into())
 }
 
+/// Test-only sink factory: it encodes a completed call exactly the way the old
+/// injected projector did, so the slot tests can still assert on the JSON line
+/// while the slot itself holds no protocol knowledge.
+#[cfg(test)]
+fn test_reply_sink(
+    reply: crate::wire::control::channel::Reply,
+    external_id: Option<Value>,
+) -> ReplySink {
+    Box::new(move |outcome| {
+        let line = match outcome {
+            Ok(Reply::Value(value)) => rpc::to_line(&rpc::ok(external_id, value)),
+            Ok(Reply::Stream(_)) => rpc::to_line(&rpc::err(
+                external_id,
+                -32000,
+                "stream replies are not wired through the test slot",
+            )),
+            Err(failure) => json!({
+                "jsonrpc": "2.0",
+                "id": external_id,
+                "result": {
+                    "content": [{ "type": "text", "text": failure.detail }],
+                    "isError": true,
+                },
+            })
+            .to_string(),
+        };
+        let _ = reply.send(line);
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1722,21 +1706,6 @@ mod tests {
             env: BTreeMap::new(),
             ready: Ready::Notify,
             interpreter: None,
-        }
-    }
-
-    fn test_projector(external_id: Option<Value>, outcome: Result<Value, Failure>) -> String {
-        match outcome {
-            Ok(value) => rpc::to_line(&rpc::ok(external_id, value)),
-            Err(failure) => json!({
-                "jsonrpc": "2.0",
-                "id": external_id,
-                "result": {
-                    "content": [{ "type": "text", "text": failure.detail }],
-                    "isError": true,
-                },
-            })
-            .to_string(),
         }
     }
 
@@ -1761,20 +1730,15 @@ mod tests {
         Arc::new(crate::platform::limits::test_default())
     }
 
-    fn with_projector(mut slot: Slot) -> Slot {
-        slot.set_projector(Arc::new(test_projector));
-        slot
-    }
-
     fn slot() -> Slot {
-        with_projector(Slot::new(
+        Slot::new(
             "demo".into(),
             exec(),
             None,
             Restart::OnFailure,
             test_paths(),
             test_limits(),
-        ))
+        )
     }
 
     #[test]
@@ -1807,12 +1771,14 @@ mod tests {
         slot.pending.insert(
             id,
             PendingCall {
-                external_id: Some(json!(100 + id)),
                 capability: "echo".into(),
                 deadline,
                 progress_token: None,
                 client: Some(crate::wire::control::channel::Reply::plain(tx.clone())),
-                sink: CallSink::Client(crate::wire::control::channel::Reply::plain(tx)),
+                sink: test_reply_sink(
+                    crate::wire::control::channel::Reply::plain(tx),
+                    Some(json!(100 + id)),
+                ),
             },
         );
         rx
@@ -1882,14 +1848,14 @@ mod tests {
     #[test]
     fn notifications_are_forwarded_to_the_face_sink() {
         let (tx, rx) = mpsc::channel();
-        let mut slot = with_projector(Slot::new(
+        let mut slot = Slot::new(
             "slot-ui-test".into(),
             exec(),
             None,
             Restart::OnFailure,
             test_paths(),
             test_limits(),
-        ));
+        );
         slot.set_notifier(Arc::new(move |method: &str, params: &Value| {
             let _ = tx.send((method.to_string(), params.clone()));
         }));
@@ -1960,14 +1926,13 @@ mod tests {
         slot.pending.insert(
             7,
             PendingCall {
-                external_id: Some(json!(107)),
                 capability: "echo".into(),
                 deadline: 10,
                 progress_token: None,
                 client: None,
-                sink: CallSink::Completion(Box::new(move |outcome| {
+                sink: Box::new(move |outcome| {
                     let _ = tx.send(outcome);
-                })),
+                }),
             },
         );
 
@@ -2115,14 +2080,14 @@ done
             ready: Ready::Notify,
             interpreter: None,
         };
-        let mut slot = with_projector(Slot::new(
+        let mut slot = Slot::new(
             "demo".into(),
             exec,
             None,
             Restart::OnFailure,
             paths,
             test_limits(),
-        ));
+        );
         slot.set_protocol_only(true);
         let started = Instant::now();
         slot.apply(Event::Start, 0);

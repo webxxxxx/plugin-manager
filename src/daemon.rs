@@ -2690,7 +2690,6 @@ fn project_builtin_outcome(external_id: Option<Value>, outcome: Result<Value, Fa
 fn configure_slot(slot: &mut Slot, service: &Service, limits: &crate::platform::limits::Limits) {
     slot.set_contract(service.contract.clone());
     slot.set_call_timeout(limits.default_timeout);
-    slot.set_projector(Arc::new(project_slot_outcome));
     let id = service.id.clone();
     slot.set_notifier(Arc::new(move |method, params| {
         #[cfg(feature = "http")]
