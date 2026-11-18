@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::cli::status::{self, Status};
+use crate::cli::status;
+use crate::kernel::projection::Status;
 use crate::kernel::registry::Kind;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::manage::ops::transfer;

@@ -323,6 +323,8 @@
     "src/kernel/memory.rs": "kernel",
     "src/kernel/mod.rs": "kernel",
     "src/kernel/registry.rs": "registry",
+    "src/kernel/fixtures.rs": "kernel",
+    "src/kernel/projection.rs": "kernel",
     "src/kernel/schema.rs": "kernel",
     "src/main.rs": "main",
     "src/manage/check/interpreter.rs": "interpreter",

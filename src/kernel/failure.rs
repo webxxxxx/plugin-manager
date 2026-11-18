@@ -210,6 +210,12 @@ impl Problem {
         data?.get("kind")?.as_str().and_then(Problem::from_str)
     }
 
+    /// The `error.data` encoding of this category, symmetric with
+    /// [`Problem::from_error_data`].
+    pub fn error_data(self) -> serde_json::Value {
+        serde_json::json!({ "kind": self.as_str() })
+    }
+
     pub const ALL: [Problem; 12] = [
         Problem::UnknownService,
         Problem::UnknownPlugin,
