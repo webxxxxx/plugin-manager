@@ -158,6 +158,43 @@ impl Sandbox {
         panic!("daemon never became reachable: {}", self.daemon_log());
     }
 
+    fn status(&self, id: &str) -> Value {
+        let output = self.run_plugin(&["status", id, "--json"]);
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        json(&output)
+    }
+
+    /// Start a service and wait for it to report `running`. A service that
+    /// never gets there fails with the daemon log, so a start that reported
+    /// success for a service that then died names the reason instead of only
+    /// the state mismatch.
+    fn start_and_wait(&self, id: &str, timeout: Duration) -> Value {
+        let started = self.run_plugin(&["start", id]);
+        assert_eq!(
+            started.status.code(),
+            Some(0),
+            "start {id}: {}",
+            stderr(&started)
+        );
+        self.wait_for_state(id, "running", timeout)
+    }
+
+    fn wait_for_state(&self, id: &str, expected: &str, timeout: Duration) -> Value {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let status = self.status(id);
+            if status["summary"]["state"].as_str() == Some(expected) {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "service {id} never reached {expected} within {timeout:?}: {status}\ndaemon log (tail):\n{}",
+                support::tail_lines(&self.daemon_log(), 20)
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     fn daemon_log(&self) -> String {
         fs::read_to_string(&self.daemon_stderr).unwrap_or_default()
     }
@@ -269,15 +306,39 @@ fn other_target() -> &'static str {
 
 fn script() -> (&'static str, Vec<u8>) {
     if cfg!(windows) {
+        // `set /p` reading a redirected stdin is undocumented cmd behaviour
+        // (see docs/research/2026-11-18-windows-cmd-stdin-pipe-and-job-object.md),
+        // so the readiness loop uses the documented .NET console API the
+        // daemon's own unit harness already relies on.
         (
-            "agent.cmd",
-            b"@echo off\r\n:loop\r\nset \"line=\"\r\nset /p line=\r\nif errorlevel 1 goto end\r\necho {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\r\ngoto loop\r\n:end\r\n".to_vec(),
+            "agent.ps1",
+            br#"$reader = [Console]::In
+while ($null -ne ($line = $reader.ReadLine())) {
+  $msg = $line | ConvertFrom-Json
+  [Console]::Out.WriteLine('{"jsonrpc":"2.0","id":' + $msg.id + ',"result":{"ok":true}}')
+  [Console]::Out.Flush()
+}
+"#
+            .to_vec(),
         )
     } else {
         (
             "agent.sh",
             b"#!/bin/sh\nwhile IFS= read -r line; do\n  printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\\n'\ndone\n".to_vec(),
         )
+    }
+}
+
+/// A native exec for the bundling tests.
+///
+/// `detect_exec` only auto-detects native binaries, and a script payload has to
+/// name `--exec` explicitly — so the bundling fixtures don't use the
+/// readiness-loop stub.
+fn bundle_exec() -> (&'static str, Vec<u8>) {
+    if cfg!(windows) {
+        ("agent.cmd", b"@echo off\r\nexit /b 0\r\n".to_vec())
+    } else {
+        ("agent", b"#!/bin/sh\nexit 0\n".to_vec())
     }
 }
 
@@ -621,10 +682,8 @@ fn installs_lists_starts_and_uninstalls_a_plugin() {
     assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
     assert_eq!(json(&status)["summary"]["kind"], "plugin");
 
-    let started = sandbox.run_plugin(&["start", "demo"]);
-    assert_eq!(started.status.code(), Some(0), "{}", stderr(&started));
-    let running = sandbox.run_plugin(&["status", "demo", "--json"]);
-    assert_eq!(json(&running)["summary"]["state"], "running");
+    let running = sandbox.start_and_wait("demo", Duration::from_secs(10));
+    assert_eq!(running["summary"]["state"], "running", "{running}");
 
     let stopped = sandbox.run_plugin(&["stop", "demo"]);
     assert_eq!(stopped.status.code(), Some(0), "{}", stderr(&stopped));
@@ -903,9 +962,8 @@ fn running_upgrade_keeps_old_until_restart_and_replace_stops_first() {
         fs::read_to_string(plugin.join("current")).expect("current"),
         "1.1.0"
     );
-    let running = sandbox.run_plugin(&["status", "demo", "--json"]);
-    assert_eq!(json(&running)["summary"]["state"], "running");
-    assert_eq!(json(&running)["summary"]["version"], "1.1.0");
+    let running = sandbox.wait_for_state("demo", "running", Duration::from_secs(10));
+    assert_eq!(running["summary"]["version"], "1.1.0", "{running}");
     assert!(plugin.join("1.0.0").is_dir());
 
     assert_eq!(sandbox.run_plugin(&["stop", "demo"]).status.code(), Some(0));
@@ -1001,7 +1059,7 @@ fn bundles_a_directory_into_a_working_signed_package() {
     let key = SigningKey::from_bytes(&[15u8; 32]);
     sandbox.write_key(&key);
     let source = sandbox.root.join("demo");
-    let (script_name, data) = script();
+    let (script_name, data) = bundle_exec();
     let exec = source.join("payload/bin").join(script_name);
     fs::create_dir_all(exec.parent().expect("exec parent")).expect("source");
     fs::write(&exec, &data).expect("exec");
@@ -1276,7 +1334,7 @@ fn bundle_refuses_missing_keys_ambiguous_execs_and_symlinks() {
     let key_path = sandbox.root.join("bundle.key");
     fs::write(&key_path, pem_from_private(&key)).expect("key");
     let source = sandbox.root.join("demo");
-    let (name, data) = script();
+    let (name, data) = bundle_exec();
     let exec = source.join("payload/bin").join(name);
     fs::create_dir_all(exec.parent().expect("exec parent")).expect("source");
     fs::write(&exec, &data).expect("exec");
@@ -1600,10 +1658,7 @@ fn installs_and_supervises_a_script_service_with_lifecycle() {
     let started = sandbox.run_plugin(&["start", "clock"]);
     assert_eq!(started.status.code(), Some(0), "{}", stderr(&started));
 
-    let status = sandbox.run_plugin(&["status", "--json", "clock"]);
-    assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
-    let value: Value = serde_json::from_slice(&status.stdout).expect("status json");
-    assert_eq!(value["summary"]["state"], "running", "{value}");
+    let value = sandbox.wait_for_state("clock", "running", Duration::from_secs(10));
     assert!(
         value["details"]["probe"]
             .as_str()
@@ -1685,10 +1740,7 @@ fn a_missing_interpreter_on_upgrade_leaves_the_old_version_running() {
     assert_ne!(failed.status.code(), Some(0), "{}", stderr(&failed));
     assert!(stderr(&failed).contains("not found"), "{}", stderr(&failed));
 
-    let status = sandbox.run_plugin(&["status", "--json", "clock"]);
-    assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
-    let value: Value = serde_json::from_slice(&status.stdout).expect("status json");
-    assert_eq!(value["summary"]["state"], "running", "{value}");
+    let value = sandbox.wait_for_state("clock", "running", Duration::from_secs(10));
     assert_eq!(value["summary"]["version"], "1.0.0", "{value}");
 }
 

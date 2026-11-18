@@ -19,7 +19,7 @@ use crate::wire::control::channel;
 use crate::platform::clock::{Clock, Now};
 use crate::platform::compat;
 use crate::platform::config::Config;
-use crate::supervise::check::reconcile;
+use crate::supervise::check::{reconcile, start};
 use crate::supervise::model::definition;
 use crate::kernel::contract::{
     CapabilityName, Instance, Invocation, Launchers, ProgressToken, Reply, ReplySink,
@@ -1757,25 +1757,47 @@ impl Daemon {
             self.pump(clock.now());
             let mut all_settled = true;
             for id in &pending {
-                let state = self.slots[id].machine.state;
-                if state == State::Failed {
-                    return Err(ProblemError::new(
-                        Problem::Internal,
-                        format!("service {} failed to start", id),
-                    ));
-                }
-                if state == State::Stopped {
-                    // It reached ready and then exited cleanly before this
-                    // pass looked (`ready: exec` one-shots do exactly that).
-                    // Waiting for Running burns the whole window and then
-                    // reports a timeout for a start that did succeed.
-                    log::svcd(&format!(
-                        "svcd: {}: exited cleanly during start; the start is complete",
-                        id
-                    ));
-                }
-                if !start_settled(state) {
-                    all_settled = false;
+                let slot = &self.slots[id];
+                let state = slot.machine.state;
+                match start::start_step(state, slot.is_channel_peer()) {
+                    start::Step::Settled => {
+                        if state == State::Stopped {
+                            // It reached ready and then exited cleanly before
+                            // this pass looked (`ready: exec` one-shots do
+                            // exactly that). Waiting for Running burns the whole
+                            // window and reports a timeout for a start that did
+                            // succeed.
+                            log::svcd(&format!(
+                                "svcd: {}: exited cleanly during start; the start is complete",
+                                id
+                            ));
+                        }
+                    }
+                    start::Step::Waiting => all_settled = false,
+                    start::Step::Failed => {
+                        return Err(ProblemError::new(
+                            Problem::Internal,
+                            format!("service {} failed to start", id),
+                        ));
+                    }
+                    start::Step::Died => {
+                        // It answered ready and then left. The channel callers
+                        // depend on is gone, so this start produced nothing
+                        // usable even though the exit itself was clean.
+                        let code = slot
+                            .machine
+                            .last_exit
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "unknown".into());
+                        log::svcd(&format!(
+                            "svcd: {}: exited during start (exit code {}); the start failed",
+                            id, code
+                        ));
+                        return Err(ProblemError::new(
+                            Problem::Internal,
+                            format!("service {} exited during start (exit code {})", id, code),
+                        ));
+                    }
                 }
             }
             if all_settled {
@@ -2675,16 +2697,6 @@ fn param_id(request: &rpc::Request) -> Result<String, rpc::Response> {
         })
 }
 
-/// `true` once a pending start needs no further wait.
-///
-/// `Stopped` counts: a service that reaches ready and then exits cleanly is
-/// finished starting, not still starting. Waiting for `Running` there costs the
-/// whole start window and reports a timeout for a start that did work — a
-/// `ready: "exec"` one-shot (`cmd /c exit 0`) hits this on every boot scan.
-fn start_settled(state: State) -> bool {
-    matches!(state, State::Running | State::Stopped)
-}
-
 fn start_layers(registry: &Registry, ids: &[String]) -> Result<Vec<Vec<String>>, ProblemError> {
     let (closure, missing) = walk_dependencies(registry, ids);
     if !missing.is_empty() {
@@ -3048,6 +3060,149 @@ while ($null -ne ($line = $reader.ReadLine())) {
             last_exit: None,
             config: None,
         }
+    }
+
+    /// A notify-ready peer that answers the ready ping and then exits: exactly
+    /// the shape a channel peer must never have.
+    fn ping_once_agent(root: &Path) -> Exec {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let script = root.join("ping-once.sh");
+            std::fs::write(
+                &script,
+                "#!/bin/sh\nread -r line\nprintf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\\n'\nexit 0\n",
+            )
+            .expect("script");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+            Exec {
+                path: "/bin/sh".into(),
+                args: vec![script.to_string_lossy().to_string()],
+                env: Default::default(),
+                ready: Ready::Notify,
+                interpreter: None,
+            }
+        }
+        #[cfg(windows)]
+        {
+            let script = root.join("ping-once.ps1");
+            std::fs::write(
+                &script,
+                r#"$null = [Console]::In.ReadLine()
+[Console]::Out.WriteLine('{"jsonrpc":"2.0","id":1,"result":{"ok":true}}')
+[Console]::Out.Flush()
+"#,
+            )
+            .expect("script");
+            let powershell = std::env::var_os("SystemRoot")
+                .map(|root| Path::new(&root).join("System32/WindowsPowerShell/v1.0/powershell.exe"))
+                .filter(|path| path.is_file())
+                .unwrap_or_else(|| std::path::PathBuf::from("powershell.exe"));
+            Exec {
+                path: powershell.to_string_lossy().to_string(),
+                args: vec![
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-ExecutionPolicy".into(),
+                    "Bypass".into(),
+                    "-File".into(),
+                    script.to_string_lossy().to_string(),
+                ],
+                env: Default::default(),
+                ready: Ready::Notify,
+                interpreter: None,
+            }
+        }
+    }
+
+    /// A notify-ready peer that answers the ready ping late, then stays alive:
+    /// the "other service" that keeps a start layer open long enough for a dead
+    /// peer to be observed.
+    fn slow_ping_agent(root: &Path) -> Exec {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let script = root.join("slow-ping.sh");
+            std::fs::write(
+                &script,
+                "#!/bin/sh\nsleep 0.3\nread -r line\nprintf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\\n'\nwhile IFS= read -r line; do :; done\n",
+            )
+            .expect("script");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+            Exec {
+                path: "/bin/sh".into(),
+                args: vec![script.to_string_lossy().to_string()],
+                env: Default::default(),
+                ready: Ready::Notify,
+                interpreter: None,
+            }
+        }
+        #[cfg(windows)]
+        {
+            let script = root.join("slow-ping.ps1");
+            std::fs::write(
+                &script,
+                r#"Start-Sleep -Milliseconds 300
+$null = [Console]::In.ReadLine()
+[Console]::Out.WriteLine('{"jsonrpc":"2.0","id":1,"result":{"ok":true}}')
+[Console]::Out.Flush()
+while ($null -ne [Console]::In.ReadLine()) { }
+"#,
+            )
+            .expect("script");
+            let powershell = std::env::var_os("SystemRoot")
+                .map(|root| Path::new(&root).join("System32/WindowsPowerShell/v1.0/powershell.exe"))
+                .filter(|path| path.is_file())
+                .unwrap_or_else(|| std::path::PathBuf::from("powershell.exe"));
+            Exec {
+                path: powershell.to_string_lossy().to_string(),
+                args: vec![
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-ExecutionPolicy".into(),
+                    "Bypass".into(),
+                    "-File".into(),
+                    script.to_string_lossy().to_string(),
+                ],
+                env: Default::default(),
+                ready: Ready::Notify,
+                interpreter: None,
+            }
+        }
+    }
+
+    /// A fire-and-forget command that exits cleanly as fast as it can.
+    fn exit_zero_exec() -> Exec {
+        #[cfg(windows)]
+        {
+            Exec {
+                path: r"C:\Windows\System32\cmd.exe".into(),
+                args: vec!["/c".into(), "exit".into(), "0".into()],
+                env: Default::default(),
+                ready: Ready::Exec,
+                interpreter: None,
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            Exec {
+                path: "/bin/true".into(),
+                args: Vec::new(),
+                env: Default::default(),
+                ready: Ready::Exec,
+                interpreter: None,
+            }
+        }
+    }
+
+    /// A plugin-shaped service with a chosen exec and protocol.
+    fn peer_plugin(id: &str, exec: Exec, protocol: u32) -> Service {
+        let mut service = plugin(id, &[]);
+        service.exec = Some(exec);
+        service.protocol = protocol;
+        service
     }
 
     fn send(daemon: &mut Daemon, method: &str, params: Value) -> Receiver<String> {
@@ -4040,18 +4195,6 @@ while ($null -ne ($line = $reader.ReadLine())) {
     }
 
     #[test]
-    fn a_clean_exit_settles_a_pending_start_instead_of_waiting_for_running() {
-        // Regression for #159: the wait used to accept only `Running`, so a
-        // one-shot that exited right after ready kept the loop busy until the
-        // deadline (30 s) and reported a timeout for a start that succeeded.
-        assert!(start_settled(State::Running));
-        assert!(start_settled(State::Stopped));
-        assert!(!start_settled(State::Starting));
-        assert!(!start_settled(State::Stopping));
-        assert!(!start_settled(State::Backoff));
-    }
-
-    #[test]
     fn a_start_layer_past_its_deadline_projects_timeout_kind() {
         let (_sender, receiver) = mpsc::channel();
         let mut daemon = Daemon::new(registry(vec![service("stuck", &[])]), receiver, None);
@@ -4068,6 +4211,123 @@ while ($null -ne ($line = $reader.ReadLine())) {
         let error = response.error.expect("error");
         assert_eq!(error.code, -32003);
         assert_eq!(error.data.expect("data")["kind"], "timeout");
+    }
+
+    /// Let the supervisor observe an exit that already happened: the unit
+    /// harness drives `pump` itself instead of running the event loop.
+    fn wait_for_stopped(daemon: &mut Daemon, id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            daemon.pump(clock().now());
+            if daemon.slots[id].machine.state == State::Stopped {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{id} never stopped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A remain-after-exit one-shot ends as `running` with no pid; wait for the
+    /// supervisor to settle that state.
+    fn wait_until_remaining(daemon: &mut Daemon, id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            daemon.pump(clock().now());
+            let machine = &daemon.slots[id].machine;
+            if machine.state == State::Running && machine.pid.is_none() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{id} never reached the remain state: {:?} pid {:?}",
+                machine.state,
+                machine.pid
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_peer_that_dies_while_the_layer_is_still_starting_fails_the_layer() {
+        // #183 in its deterministic shape: the dead peer reaches ready and
+        // exits while a second service keeps the wait open, so a later pass
+        // observes `Stopped` and must refuse the start instead of reporting
+        // success. Without the slow peer the layer would settle on `Running`
+        // in the same millisecond the peer left.
+        let (_sender, receiver) = mpsc::channel();
+        let dir = package::tempdir::TempDir::new();
+        let dead = peer_plugin("dead", ping_once_agent(dir.path()), 1);
+        let slow = peer_plugin("slow", slow_ping_agent(dir.path()), 1);
+        let mut daemon = Daemon::new(registry(vec![dead, slow]), receiver, None);
+
+        let error = daemon
+            .start_layer(
+                &["dead".into(), "slow".into()],
+                clock().now().mono_ms + 5_000,
+                &clock(),
+            )
+            .expect_err("the dead peer must fail the layer");
+        assert_eq!(error.problem, Problem::Internal);
+        assert!(
+            error.detail().contains("exited during start"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_fire_and_forget_one_shot_still_settles_a_start() {
+        // Regression for #159: an exec one-shot owes no channel, so a clean
+        // exit right after spawn is a finished start.
+        let (_sender, receiver) = mpsc::channel();
+        let mut service = service("once", &[]);
+        service.exec = Some(exit_zero_exec());
+        let mut daemon = Daemon::new(registry(vec![service]), receiver, None);
+
+        let response = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "svc.start",
+            json!({"id": "once"}),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+
+        wait_for_stopped(&mut daemon, "once");
+        let status = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "svc.status",
+            json!({"id": "once"}),
+        );
+        assert_eq!(status["result"]["summary"]["state"], "stopped", "{status}");
+    }
+
+    #[test]
+    fn a_remain_after_exit_one_shot_keeps_running_after_start() {
+        // The other axis: "the effect is still there". The process exits, the
+        // service stays running with no pid, and the start still succeeds.
+        let (_sender, receiver) = mpsc::channel();
+        let mut service = service("keep", &[]);
+        service.exec = Some(exit_zero_exec());
+        service.remain_after_exit = true;
+        let mut daemon = Daemon::new(registry(vec![service]), receiver, None);
+
+        let response = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "svc.start",
+            json!({"id": "keep"}),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+
+        wait_until_remaining(&mut daemon, "keep");
+        let status = send_on(
+            &mut daemon,
+            channel::Endpoint::Admin,
+            "svc.status",
+            json!({"id": "keep"}),
+        );
+        assert_eq!(status["result"]["summary"]["state"], "running", "{status}");
+        assert!(status["result"]["summary"]["pid"].is_null(), "{status}");
     }
 
     #[test]
