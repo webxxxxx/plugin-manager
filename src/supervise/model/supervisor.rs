@@ -3,12 +3,8 @@ pub use crate::kernel::registry::State;
 use crate::kernel::contract::{Health, Settled};
 use crate::kernel::registry::Restart;
 
-/// Full §1.3 schedule. `MAX_FAILURES = 5` means one crash loop enters `Failed`
-/// on the fifth failure, so only 1/2/4/8s are armed in practice; 16s/30s are
-/// the policy ceiling kept for a raised cap.
-pub const BACKOFF_MS: [u64; 6] = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
-pub const STABLE_MS: u64 = 10_000;
-pub const MAX_FAILURES: u32 = 5;
+pub use crate::supervise::check::backoff::{backoff_delay, MAX_FAILURES};
+use crate::supervise::check::restart::is_stable;
 pub const START_TIMEOUT_MS: u64 = 30_000;
 pub const STOP_TIMEOUT_MS: u64 = 10_000;
 pub const KILL_TIMEOUT_MS: u64 = 5_000;
@@ -58,11 +54,6 @@ pub enum Action {
     Publish,
     Withdraw,
     GiveUp,
-}
-
-pub fn backoff_delay(failures: u32) -> u64 {
-    let index = failures.saturating_sub(1) as usize;
-    BACKOFF_MS[index.min(BACKOFF_MS.len() - 1)]
 }
 
 /// Pure six-state supervisor core. The shell owns processes, pipes and timers;
@@ -208,10 +199,7 @@ impl Machine {
                                 self.next_at_ms = None;
                             }
                         } else {
-                            let stable = self
-                                .ready_since_ms
-                                .map(|ready| now_ms.saturating_sub(ready) >= STABLE_MS)
-                                .unwrap_or(false);
+                            let stable = is_stable(self.ready_since_ms, now_ms);
                             if stable {
                                 self.failures = 0;
                                 self.state = S::Starting;
