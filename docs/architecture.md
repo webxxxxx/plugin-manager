@@ -184,7 +184,7 @@ src/
     registry.rs                 注册表：定义、能力索引、依赖与环检测
     invoke.rs                   一次调用：超时、重试、取消、预算
     failure.rs                  失败类别 + 可重试性 + 汇合聚合
-    projection.rs               能力面 → 各对外面的唯一投影源
+    projection.rs               状态与运行面 → 各对外面的唯一来源（值投影；协议投影在面）
 
   manage/                     L3 领域·管理
     mod.rs                      唯一对外接口
@@ -277,11 +277,13 @@ src/
 3. **L4 不认识 L3 的领域概念；L5 不拥有连接。**
 4. **`platform` 可以持有技术资源及其回收，但不许出现领域概念；`kernel` 不许出现进程、socket、文件。**
 
-今天的三处真实反例（用来验证规则不是空话）：
+今天的三处真实反例（用来验证规则不是空话；修完后换上新的，**不要删表**——表里至少要留一条未修的，否则它自己就成了空话）：
 
-- `slot`（L3 监督）调用 `mcp::tool_error`（L5 的错误格式）——领域调对外面。
-- `transfer`（本应是 manage 的一次导入动作）反向依赖 `package` / `plugin` / `status` / `channel`。
-- `install`（自身安装）直接调 `daemon::shutdown_quiet`——下层调装配点。
+- **组合根反向持有对外面的数据类型**：`daemon.rs:20` 的 `use crate::cli::status::Status`（rank 6 持有 rank 5 的类型，层方向检查抓不到，因为 6 ≥ 5）。**待 #212 修**（`Status` 与 `Live` 进 `kernel/projection.rs`，见 [ADR-0025](adr/0025-projection-is-a-face-neutral-value.md)）。
+- **想象中的 seam**：`Slot::set_projector`（`slot.rs:361`）的唯一注入点是 `daemon.rs:2693`，而读它的 `Slot::project` 与 `CallSink::Client` 都标着 `#[cfg(test)]`（`slot.rs:1124` / `:131`）——生产路径只走 `CallSink::Completion` → `projected_done`。**待 #209 修。**
+- **同一份协议 envelope 在两个面各写一次**：MCP 分页包在 `daemon.rs:1376-1379` 与 `face/mcp.rs:282-285` 各组装一遍；auth 四键在 `daemon.rs:2892` 与 `face/api.rs:327` 各写一遍。**未修，见 #210。**
+
+（原文三条已全部失效，核实记录见 [ADR-0025](adr/0025-projection-is-a-face-neutral-value.md) 的 Context：`slot` 调 `mcp::tool_error` 已不存在，`transfer` 已不依赖 `status`，`install` 调 `daemon::shutdown_quiet` 只剩 `main.rs:136` 的同一 rank 调用。）
 
 ## 8. seam 地图
 
