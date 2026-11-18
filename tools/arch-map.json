@@ -356,6 +356,7 @@
     "src/manage/ops/scan.rs": "plugin",
     "src/manage/model/layout.rs": "plugin",
     "src/manage/ops/config.rs": "plugin",
-    "src/manage/ops/install_plugin.rs": "plugin"
+    "src/manage/ops/install_plugin.rs": "plugin",
+    "src/manage/check/plugin.rs": "plugin"
   }
 }
