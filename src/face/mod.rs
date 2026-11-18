@@ -20,12 +20,16 @@ pub mod catalog;
 #[cfg(feature = "http")]
 pub mod export;
 #[cfg(feature = "http")]
+pub mod fallback;
+#[cfg(feature = "http")]
 pub mod install;
 pub mod mcp;
 #[cfg(feature = "http")]
 pub mod plugin_streams;
 #[cfg(feature = "http")]
 pub mod plugin_ui;
+#[cfg(feature = "http")]
+pub mod prebody;
 #[cfg(feature = "http")]
 pub mod support;
 #[cfg(feature = "http")]
