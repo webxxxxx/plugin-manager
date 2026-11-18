@@ -286,7 +286,8 @@ src/
 | **想象中的 seam** | `Slot::set_projector` 的唯一注入点在组合根，而读它的 `Slot::project` 与 `CallSink::Client` 当时都标着 `#[cfg(test)]` | **已修于 #209**：那套机制连同 `CallSink` 枚举一起删掉，槽的完成回调直接就是调用方给的 `ReplySink` |
 | **同一份值转换实现两次，护栏只有一处** | `daemon.rs` 的 `persist_states` 自己算 `now.epoch_of(machine.since_ms)`，而 `kernel/projection.rs` 的 `epoch_secs` 另有 `ms == 0 → None` 保护 | **已修于 #215**：`persist_states` 改吃 `Machine::live()`，锚定只走内核唯一的 `anchored_secs`（`ms == 0 → None`）；`since_ms == 0` 时记录里不再有 `since`，新增的模块级测试同时断言记录与 `Status::live` 一致 |
 | **同一份反向换算写两遍，缺失值被回落成 `now`** | `daemon.rs` 的 `adopt_runtime` 两个分支各写一遍 `now.mono_of(record.since.unwrap_or(now.epoch_secs))`：记录缺 `since` 时被回落成本次 daemon 启动时刻，`Status::live` 会给出一个合理但错误的 `since` | **已修于 #216**：反向换算收进 `kernel/projection.rs` 的 `anchored_mono_ms`，`adopt_runtime` 两个分支都调它；缺失 `since` 落到 `since_ms == 0`（`Status::live` 为 `null`），有值的记录仍与记录里的 epoch 秒一致 |
-| **同一份「还是同一个进程」判定写两遍** | `adopt_runtime` 用 `alive(pid)` + `starttime` 比对决定是否接管，`sweep_runtime_records` 又把同一判据写一遍才决定是否 `terminate_tree`；两处的组合方式已经不同（早退 vs 合成 `fresh`） | **未修，见 #217**：pid 复用防护只有一份判据，接管与清理才不会各自漂移 |
+| **同一份「还是同一个进程」判定写两遍** | `adopt_runtime` 用 `alive(pid)` + `starttime` 比对决定是否接管，`sweep_runtime_records` 又把同一判据写一遍才决定是否 `terminate_tree`；两处的组合方式已经不同（早退 vs 合成 `fresh`） | **已修于 #217**：判据收进 `supervise/model/runtime.rs` 的 `same_process`，接管与清理都调它；任一侧缺 `starttime` 时仍按「不能证明复用」信任记录，动作与日志不变 |
+| **同一份静态资源条件请求投影写两遍** | `face/fallback.rs` 的 `serve_web_file` 与 `face/plugin_ui.rs` 的静态资源分支各自组装 `metadata.modified → webui::etag → webui::web_headers → not_modified → 304`；`webui` 只共享单步函数 | **未修，见 #218**：加缓存头或改 304 条件时要同时改两处，靠复制保持一致 |
 
 （历史：原文那三条与上表第三条的前身都已修掉，核实记录见 [ADR-0025](adr/0025-projection-is-a-face-neutral-value.md) 的 Context。#210 把「同一份协议 envelope 在两个面各写一次」也修了：分页包改成控制通道传面中立的 `next`、由 MCP 面渲染成 `nextCursor`；auth 四键收敛到 `LanStatus` 一个值，两面各自渲染并加跨面一致性测试。）
 
