@@ -45,5 +45,8 @@ Accepted（2026-11-18）。细化 [docs/architecture.md](../architecture.md) §5
 - `Slot::set_projector` 成为「想象中的 seam」的现成反例：唯一注入点是 `daemon.rs:2693`，而读它的 `Slot::project` 与 `CallSink::Client` 都标着 `#[cfg(test)]`（`slot.rs:131/1124`），生产路径只走 `CallSink::Completion` → `projected_done`。清理票 #209 把它删掉。
 - `persist_states` 的重复换算**不在本次范围**：收掉它会改变 `since_ms == 0` 时写进运行态记录的值，属行为改动，另开票带测试。
 - `face/mcp_tools.rs` 与 `kernel/projection.rs` 要登记进 `tools/arch-map.json`，否则 `dep-lint` 的 V4 会红；各自由 #211 / #212 做。
-- 词表新增「值投影」「协议投影」「运行面（Live）」三条（#213）。
-- 未修的第三方重复（MCP 分页包在 `daemon.rs:1376-1379` 与 `face/mcp.rs:282-285` 各一份；auth 四键在 `daemon.rs:2892` 与 `face/api.rs:327` 各一份）记在 #210，`needs-triage`。
+- 词表新增「值投影」「协议投影」「运行面（Live）」三条；前两条由 #210 落地，第三条由 #213 补。
+- MCP 分页包与 auth 四键的重复**已修于 #210**：控制通道返回面中立值（分页用 `next`），由 MCP 面渲染 `nextCursor`；auth 四键从同一 `LanStatus` 渲染，并有一条跨面一致性测试。#213 负责把 §7 的这条反例换掉。
+- **控制通道只传面中立值。** 控制 RPC 的结果不写对外协议的字段名；需要跨进程传递的值用中性名，由对外面渲染成协议报文。
+- **对外协议的报文只在面里组装。** 组合根只装配与分发，不写对外协议的键名。
+- **同形承诺要有跨面测试。** 两个面对外承诺同一形状（如 auth 四键）时，值只能来自一个面中立值；各自渲染时，必须有一条跨面一致性测试，并证明编码器被人为改坏时它会红。

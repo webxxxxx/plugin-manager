@@ -187,6 +187,14 @@ _Avoid_: 引擎、监听器、endpoint
 一个协议面对外暴露的端点与投影：它把领域概念与能力面映射成该协议的请求/响应，自己不持有资源、不拥有连接。服务器（server）建立连接，对外面解释连接上的每个请求。
 _Avoid_: UI、界面层、接口层
 
+**值投影（Value projection）**:
+把一个领域值变成面中立值形状的纯函数，归内核；`Status` 是现成的例子。
+_Avoid_: 视图模型、DTO
+
+**协议投影（Protocol projection）**:
+把面中立值变成某个协议报文的函数，归该对外面；各面的 envelope 与协议字段属于它。
+_Avoid_: 编码、格式化
+
 **请求交接（Request handover）**:
 服务器把「已解析的请求 + 恰好一次完成槽」交给对外面，自己保留连接、缓冲、deadline 与背压；对外面用内存响应或 sans-IO stream handler 作答，不接触 socket。见 [ADR-0016](docs/adr/0016-s4-request-handover.md)。
 _Avoid_: 接管、takeover、handler 调用
