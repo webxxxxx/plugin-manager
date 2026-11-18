@@ -7,6 +7,7 @@
 //   node tools/check.mjs fmt              rustfmt --check on every src/ and tests/ file
 //   node tools/check.mjs no-default       cargo check --no-default-features --bin svcd
 //   node tools/check.mjs cross [target]   cargo check --target <target> --all-targets
+//   node tools/check.mjs linux [filter]   Windows 宿主：在 WSL2 里跑 Linux 全量（或一个 filter）
 //   node tools/check.mjs test <filter>    cargo test <filter> --no-fail-fast -- --test-threads=1
 //   node tools/check.mjs full             cargo test --no-fail-fast -- --test-threads=1
 //   ... --parallel                        drop `--test-threads=1` (one-off debugging)
@@ -24,7 +25,7 @@
 
 import { readdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -184,8 +185,70 @@ function reportCross(target, result) {
   );
 }
 
+/// Windows 路径 → WSL 里的 `/mnt/<drive>/...`；非 Windows 路径原样返回。
+function wslPath(path) {
+  const match = /^([A-Za-z]):[\\/](.*)$/.exec(path);
+  if (!match) return path.split("\\").join("/");
+  return "/mnt/" + match[1].toLowerCase() + "/" + match[2].split("\\").join("/");
+}
+
+function shellQuote(value) {
+  return "'" + String(value).replace(/'/g, "'\\''") + "'";
+}
+
+/// Windows 宿主的 Linux 半：`cfg(unix)` 测试只能在 WSL2 里真跑（docs/testing.md §6）。
+/// 用票自己的 worktree，target 放 Linux 文件系统，避免与 Windows 的 target 抢锁。
+if (tier === "linux") {
+  if (rest.length > 1) {
+    console.error("check: linux takes at most one test-name filter; use the raw runbook in docs/testing.md §6 for --exact/--test");
+    process.exit(2);
+  }
+  const filter = rest[0] || "";
+  const args = filter
+    ? ["test", filter, "--no-fail-fast", "--", "--test-threads=1"]
+    : ["test", "--no-fail-fast", "--", "--test-threads=1"];
+  if (process.platform !== "win32") {
+    console.log("check: running cargo " + args.join(" ") + " (Linux host)");
+    const result = cargo(args, TEST_TIMEOUT_MS);
+    if (timedOut(result)) {
+      reportTimeout(result);
+      process.exit(124);
+    }
+    summarizeTests(result);
+    process.exit(result.status ?? 1);
+  }
+  const distro = process.env.SVCD_WSL_DISTRO || "Debian";
+  const target = "/tmp/wt-" + basename(REPO) + "-target";
+  const where = wslPath(REPO);
+  const script = `cd ${shellQuote(where)} && CARGO_TARGET_DIR=${shellQuote(target)} cargo ${args
+    .map(shellQuote)
+    .join(" ")}`;
+  console.log(`check: running Linux tests in WSL (${distro}) at ${where}`);
+  const result = spawnSync("wsl.exe", ["-d", distro, "--", "bash", "-lc", script], {
+    cwd: REPO,
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+    env: process.env,
+    timeout: TEST_TIMEOUT_MS,
+  });
+  if (result.error && result.error.code !== "ETIMEDOUT") {
+    console.error(
+      "check: cannot run wsl.exe: " +
+        result.error.message +
+        " (WSL2 与发行版见 docs/testing.md §6；发行版用 SVCD_WSL_DISTRO 覆盖)",
+    );
+    process.exit(2);
+  }
+  if (timedOut(result)) {
+    reportTimeout(result);
+    process.exit(124);
+  }
+  summarizeTests(result);
+  process.exit(result.status ?? 1);
+}
+
 if (tier === "--help" || tier === "-h") {
-  console.log("usage: node tools/check.mjs quick|no-default|fmt|cross [target]|full|test <filter>");
+  console.log("usage: node tools/check.mjs quick|no-default|fmt|cross [target]|linux [filter]|full|test <filter>");
   process.exit(0);
 }
 
@@ -311,6 +374,6 @@ if (tier === "test" || tier === "full") {
 }
 
 console.error(
-  "check: unknown tier " + tier + "; use quick|no-default|cross [target]|full [--parallel]|test <filter> [--parallel]",
+  "check: unknown tier " + tier + "; use quick|no-default|cross [target]|linux [filter]|full [--parallel]|test <filter> [--parallel]",
 );
 process.exit(2);
