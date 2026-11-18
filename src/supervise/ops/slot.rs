@@ -16,7 +16,7 @@ use crate::platform::paths::Paths;
 use crate::kernel::registry::{Exec, Hook, Interpreter, Lifecycle, Ready, Restart, State};
 use crate::wire::message::rpc;
 use crate::wire::contract::stdio::{self, Plan, Streams, Target};
-use crate::supervise::supervisor::{self, Action, Event, Machine};
+use crate::supervise::model::supervisor::{self, Action, Event, Machine};
 use crate::platform::host::wake::Wake;
 
 /// Per-plugin in-flight cap from ticket #31. The full spec also describes a

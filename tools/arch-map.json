@@ -321,13 +321,6 @@
     "src/manage/interpreter.rs": "interpreter",
     "src/manage/plugin.rs": "plugin",
     "src/manage/transfer.rs": "transfer",
-    "src/supervise/definition.rs": "definition",
-    "src/supervise/supervisor.rs": "supervisor",
-    "src/supervise/slot.rs": "slot",
-    "src/supervise/runtime.rs": "runtime",
-    "src/supervise/hook.rs": "hook",
-    "src/supervise/script.rs": "script",
-    "src/supervise/builtin_adapter.rs": "builtin_adapter",
     "src/selfinstall/install.rs": "install",
     "src/selfinstall/service_win.rs": "service_win",
     "src/server/http/model.rs": "http",
@@ -345,6 +338,13 @@
     "src/platform/storage/upload.rs": "blob",
     "src/platform/storage/part.rs": "blob",
     "src/platform/storage/gc.rs": "blob",
-    "src/platform/storage/mod.rs": "blob"
+    "src/platform/storage/mod.rs": "blob",
+    "src/supervise/model/definition.rs": "definition",
+    "src/supervise/model/runtime.rs": "runtime",
+    "src/supervise/model/supervisor.rs": "supervisor",
+    "src/supervise/ops/slot.rs": "slot",
+    "src/supervise/ops/hook.rs": "hook",
+    "src/supervise/ops/script.rs": "script",
+    "src/supervise/ops/builtin_adapter.rs": "builtin_adapter"
   }
 }

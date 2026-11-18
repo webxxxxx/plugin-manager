@@ -143,7 +143,7 @@ fn load_scripts(
             path.extension()
                 .and_then(|extension| extension.to_str())
                 .map(|extension| {
-                    crate::supervise::script::extension_supported(&extension.to_ascii_lowercase())
+                    crate::supervise::ops::script::extension_supported(&extension.to_ascii_lowercase())
                 })
                 .unwrap_or(false)
         })
@@ -229,9 +229,9 @@ fn load_scripts(
             }
         };
         let declarations =
-            crate::supervise::script::declared_actions(&String::from_utf8_lossy(&contents), &extension);
+            crate::supervise::ops::script::declared_actions(&String::from_utf8_lossy(&contents), &extension);
         let restart =
-            crate::supervise::script::declared_restart(&String::from_utf8_lossy(&contents), &extension);
+            crate::supervise::ops::script::declared_restart(&String::from_utf8_lossy(&contents), &extension);
         // Shell convention: anything that is not `RESTART=always` treats a
         // clean exit as "done" and keeps reporting running (RemainAfterExit).
         let remain_after_exit = restart != Restart::Always;

@@ -11,7 +11,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::platform::compat;
-use crate::supervise::hook;
+use crate::supervise::ops::hook;
 use crate::manage::interpreter;
 use crate::kernel::contract::{Capability as KernelCapability, CapabilityName, Effect};
 use crate::kernel::failure::{Problem, ProblemError};
