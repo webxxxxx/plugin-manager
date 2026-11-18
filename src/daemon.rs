@@ -27,7 +27,7 @@ use crate::kernel::contract::{
     CapabilityName, Instance, Invocation, Launchers, ProgressToken, Reply, ReplySink,
 };
 use crate::kernel::failure::{Class, Failure, Problem, ProblemError, Retry};
-use crate::kernel::projection::{anchored_secs, anchored_secs_opt, Status};
+use crate::kernel::projection::{anchored_mono_ms, anchored_secs, anchored_secs_opt, Status};
 use crate::kernel::registry::{Hook, Kind, Registry, Service, State, RESERVED_ID};
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::manage::package;
@@ -732,6 +732,13 @@ impl Daemon {
         }
     }
 
+    /// The adoption-side guard: a record with no `since` stays "never
+    /// happened" (`0`) instead of being anchored to this daemon's boot. One
+    /// helper so both adoption branches agree.
+    fn adopted_since(now: Now, record: &Record) -> u64 {
+        anchored_mono_ms(now, record.since).unwrap_or(0)
+    }
+
     /// Reconnect to processes that survived a previous daemon. A record is only
     /// trusted when its boot id matches, the pid is alive and the pid's start
     /// time still matches (a reused pid fails this check). On Windows the job
@@ -764,7 +771,7 @@ impl Daemon {
                         .map(|slot| slot.machine.remain_after_exit)
                         .unwrap_or(false);
                 if keep {
-                    let since = now.mono_of(record.since.unwrap_or(now.epoch_secs));
+                    let since = Self::adopted_since(now, &record);
                     let last_exit = record.last_exit;
                     let failures = record.failures;
                     if let Some(slot) = self.slots.get_mut(&id) {
@@ -800,8 +807,8 @@ impl Daemon {
                     continue;
                 }
             }
-            let since = now.mono_of(record.since.unwrap_or(now.epoch_secs));
-            let ready = record.ready_since.map(|epoch| now.mono_of(epoch));
+            let since = Self::adopted_since(now, &record);
+            let ready = anchored_mono_ms(now, record.ready_since);
             let failures = record.failures;
             let last_exit = record.last_exit;
             let state = record.state;
@@ -4002,6 +4009,62 @@ while ($null -ne [Console]::In.ReadLine()) { }
             "the record and the status projection must agree"
         );
         assert_eq!(recorded.since, Some(1_700_000_000));
+    }
+
+    /// Adoption must not invent a start. A record without `since` keeps
+    /// `since_ms == 0`, which `Status::live` projects as `since: null`; a
+    /// record with a concrete `since` still anchors back to the same second.
+    #[test]
+    fn adopting_a_record_without_since_reports_no_since() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(
+            registry(vec![service("never", &[]), service("started", &[])]),
+            receiver,
+            None,
+        );
+        let now = Now::at(1_700_000_010_000, 1_700_000_010);
+        for id in ["never", "started"] {
+            daemon
+                .slots
+                .get_mut(id)
+                .expect("slot")
+                .set_remain_after_exit(true);
+            let since = (id == "started").then_some(1_700_000_000);
+            runtime::save(
+                id,
+                &Record {
+                    boot: None,
+                    state: State::Running,
+                    pid: None,
+                    starttime: None,
+                    since,
+                    ready_since: None,
+                    failures: 0,
+                    last_exit: Some(0),
+                },
+                &daemon.config.paths,
+            )
+            .expect("save record");
+        }
+
+        daemon.adopt_runtime(now);
+
+        let never = Status::live(
+            daemon.registry.get("never").expect("never service"),
+            &daemon.slots["never"].machine.live(),
+            now,
+        );
+        assert_eq!(
+            never.summary.since, None,
+            "a record without since must stay absent"
+        );
+        let started = Status::live(
+            daemon.registry.get("started").expect("started service"),
+            &daemon.slots["started"].machine.live(),
+            now,
+        );
+        assert_eq!(started.summary.since, Some(1_700_000_000));
+        assert_eq!(daemon.slots["started"].machine.since_ms, 1_700_000_000_000);
     }
 
     #[test]
