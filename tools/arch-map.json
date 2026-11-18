@@ -350,6 +350,8 @@
     "src/supervise/check/restart.rs": "supervisor",
     "src/manage/model/manifest.rs": "package",
     "src/manage/model/ustar.rs": "package",
-    "src/manage/check/verify.rs": "package"
+    "src/manage/check/verify.rs": "package",
+    "src/manage/ops/install.rs": "package",
+    "src/manage/ops/export.rs": "package"
   }
 }

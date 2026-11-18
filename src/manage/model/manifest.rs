@@ -144,3 +144,33 @@ pub struct FileData {
     pub data: Vec<u8>,
     pub mode: u32,
 }
+
+#[derive(Debug)]
+pub struct Package {
+    pub manifest: Manifest,
+    pub manifest_bytes: Vec<u8>,
+    pub signature_bytes: Vec<u8>,
+    pub files: Vec<FileData>,
+}
+
+/// What `signature.json` says about the package itself. Trust is a separate
+/// host fact, so a signature whose key is unknown is reported as `unknown-key`
+/// rather than `valid`: claiming validity without having verified anything is
+/// exactly the hole a CI gate would fall into. The caller decides what to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignatureInfo {
+    /// `valid`, `unknown-key`, `missing`, or `unverified` (malformed signatures
+    /// are errors).
+    pub state: &'static str,
+    pub key_id: Option<String>,
+    pub trusted: bool,
+}
+
+/// A package that passed its own integrity checks. Host-dependent facts are
+/// deliberately absent: the caller compares `platform`/`compat` with its own
+/// host state.
+#[derive(Debug)]
+pub struct Inspection {
+    pub package: Package,
+    pub signature: SignatureInfo,
+}
