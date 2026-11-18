@@ -746,7 +746,7 @@ impl Slot {
             None => command_for(&self.exec),
         };
         let blob_dir = self.paths.temp_dir.clone();
-        let _ = std::fs::create_dir_all(crate::platform::storage::blob::incoming_dir(&self.paths));
+        let _ = std::fs::create_dir_all(crate::platform::storage::incoming_dir(&self.paths));
         command.env("SVCD_TEMP_DIR", &blob_dir);
         let plan = match self.exec.ready {
             Ready::Notify => Plan::notify(),
@@ -1060,7 +1060,7 @@ impl Slot {
             Err(Failure::from_plugin_error(error))
         } else if let Some(result) = message.get("result") {
             let mut result = result.clone();
-            match crate::platform::storage::blob::materialize_result(&self.paths, &mut result) {
+            match crate::platform::storage::materialize_result(&self.paths, &mut result) {
                 Ok(()) => Ok(result),
                 Err(error) => Err(Failure::new(
                     Class::ImplementationError,

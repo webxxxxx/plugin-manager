@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::platform::storage::blob;
+use crate::platform::storage as blob;
 use crate::server::http::model as http;
 use crate::platform::paths::Paths;
 use crate::server::http::{
@@ -856,7 +856,7 @@ mod tests {
     }
 
     fn blob_of(bytes: &[u8]) -> String {
-        crate::platform::storage::blob::put(test_paths(), bytes)
+        crate::platform::storage::put(test_paths(), bytes)
             .expect("write test blob")
             .id
     }
@@ -864,19 +864,19 @@ mod tests {
     fn file_of(parts: &[&[u8]], name: Option<&str>, mime: Option<&str>) -> String {
         let paths = test_paths();
         let upload =
-            crate::platform::storage::blob::create_upload(paths, crate::platform::storage::blob::UploadKind::File).expect("upload");
+            crate::platform::storage::create_upload(paths, crate::platform::storage::UploadKind::File).expect("upload");
         for (index, content) in parts.iter().enumerate() {
-            let mut writer = crate::platform::storage::blob::PartWriter::begin(
+            let mut writer = crate::platform::storage::PartWriter::begin(
                 paths,
                 &upload,
                 index as u32 + 1,
-                crate::platform::storage::blob::UploadKind::File,
+                crate::platform::storage::UploadKind::File,
             )
             .expect("part");
             writer.write(content).expect("write part");
             writer.finish().expect("finish part");
         }
-        crate::platform::storage::blob::complete_file(
+        crate::platform::storage::complete_file(
             paths,
             &upload,
             None,

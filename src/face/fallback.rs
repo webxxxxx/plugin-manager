@@ -17,7 +17,7 @@ use crate::face::webui;
 use crate::manage::package;
 use crate::manage::plugin;
 use crate::platform::config::Config;
-use crate::platform::storage::blob;
+use crate::platform::storage as blob;
 use crate::server::auth::admission::{Admission, Rejected};
 use crate::server::auth::lan::{AuthKind, Lan};
 use crate::server::http::engine::HttpRequest;

@@ -921,7 +921,7 @@ impl Daemon {
         if self.temp_cleanup_interval_ms > 0 && now.mono_ms >= self.next_temp_cleanup_ms {
             self.next_temp_cleanup_ms = now.mono_ms.saturating_add(self.temp_cleanup_interval_ms);
             let started = Instant::now();
-            match crate::platform::storage::blob::cleanup(&self.config.paths, self.temp_retention) {
+            match crate::platform::storage::cleanup(&self.config.paths, self.temp_retention) {
                 Ok(0) => {}
                 Ok(removed) => {
                     log::svcd(&format!("svcd: temp cleanup removed {} file(s)", removed))
@@ -1328,7 +1328,7 @@ impl Daemon {
         }
 
         let mut arguments = arguments;
-        if let Err(message) = crate::platform::storage::blob::resolve_args(&self.config.paths, &mut arguments) {
+        if let Err(message) = crate::platform::storage::resolve_args(&self.config.paths, &mut arguments) {
             send(
                 &reply,
                 mcp::tool_error(id, &format!("cannot resolve blob argument: {}", message)),

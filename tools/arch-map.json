@@ -188,7 +188,7 @@
     "blob": {
       "concept": "storage",
       "layer": "domain",
-      "note": "目标在 platform/storage"
+      "note": "内容寻址存储：meta/path/upload/part/gc 五拆（#174）；face 只认 storage 的公开 API"
     },
     "builtin_adapter": {
       "concept": "supervise/builtin",
@@ -301,7 +301,6 @@
     "src/platform/host/threads.rs": "threads",
     "src/platform/host/wake.rs": "wake",
     "src/platform/host/zerocopy.rs": "zerocopy",
-    "src/platform/storage/blob.rs": "blob",
     "src/wire/message/ipc.rs": "ipc",
     "src/wire/message/rpc.rs": "rpc",
     "src/wire/contract/rawhub.rs": "rawhub",
@@ -340,6 +339,12 @@
     "src/cli/svc.rs": "svc",
     "src/cli/plugin.rs": "plugin_cli",
     "src/cli/status.rs": "status",
-    "src/kernel/registry.rs": "registry"
+    "src/kernel/registry.rs": "registry",
+    "src/platform/storage/meta.rs": "blob",
+    "src/platform/storage/path.rs": "blob",
+    "src/platform/storage/upload.rs": "blob",
+    "src/platform/storage/part.rs": "blob",
+    "src/platform/storage/gc.rs": "blob",
+    "src/platform/storage/mod.rs": "blob"
   }
 }

@@ -7,7 +7,7 @@
 
 use serde_json::{json, Value};
 
-use crate::platform::storage::blob;
+use crate::platform::storage as blob;
 use crate::server::http::model as http;
 use crate::platform::paths::Paths;
 
