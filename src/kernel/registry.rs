@@ -16,8 +16,7 @@ pub const RESERVED_ID: &str = "svc";
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Core,
-    /// Plugins enter the same registry once the .spk scanner lands (#30).
-    #[allow(dead_code)]
+    /// 由 .spk 安装路径写入（`kind=plugin`）；core 服务来自 `services.d`。
     Plugin,
 }
 
@@ -146,7 +145,8 @@ pub struct Service {
     pub version: String,
     /// Plugin protocol version: 1 = LF-delimited NDJSON, 2 = length-prefixed.
     pub protocol: u32,
-    /// Kept from the definition; the status payload does not expose it yet.
+    /// definition 里的描述。接进注册表是为了让定义完整；今天还没有对外面读它
+    /// （`svc describe` 尚未做）。
     #[allow(dead_code)]
     pub desc: String,
     pub deps: Vec<String>,
