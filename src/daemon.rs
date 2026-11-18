@@ -88,14 +88,13 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         return 1;
     }
 
-    let config_path =
-        match crate::selfinstall::install::ensure_conf(conf.as_deref(), &initial_paths) {
-            Ok(path) => path,
-            Err(error) => {
-                eprintln!("svcd: {}", error);
-                return 1;
-            }
-        };
+    let config_path = match crate::selfinstall::ensure_conf(conf.as_deref(), &initial_paths) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("svcd: {}", error);
+            return 1;
+        }
+    };
     // Keep the document bootstrapped above. `ensure_conf` chooses or creates
     // the file for the service unit and the next start; loading its result
     // here would (a) parse a second time and (b) let `<program>/svcd.conf`

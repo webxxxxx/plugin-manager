@@ -195,8 +195,19 @@
       "layer": "domain"
     },
     "install": {
+      "concept": "selfinstall/composition",
+      "layer": "domain",
+      "note": "只做显式再导出；决定在 plan，副作用在 execute（#207）"
+    },
+    "plan": {
+      "concept": "selfinstall/plan",
+      "layer": "domain",
+      "note": "安装计划：纯函数，给定 Layout/Probe/请求出同一份计划"
+    },
+    "execute": {
       "concept": "selfinstall/execute",
-      "layer": "domain"
+      "layer": "domain",
+      "note": "输入构造 + 副作用 + 平台分派"
     },
     "service_win": {
       "concept": "selfinstall/service_win",
@@ -272,10 +283,6 @@
     },
     "supervise": {
       "concept": "supervise",
-      "layer": "domain"
-    },
-    "selfinstall": {
-      "concept": "selfinstall",
       "layer": "domain"
     },
     "cli": {
@@ -364,8 +371,9 @@
     "src/platform/storage/part.rs": "blob",
     "src/platform/storage/path.rs": "blob",
     "src/platform/storage/upload.rs": "blob",
-    "src/selfinstall/install.rs": "install",
-    "src/selfinstall/mod.rs": "selfinstall",
+    "src/selfinstall/execute.rs": "execute",
+    "src/selfinstall/mod.rs": "install",
+    "src/selfinstall/plan.rs": "plan",
     "src/selfinstall/service_win.rs": "service_win",
     "src/server/auth/admission.rs": "server",
     "src/server/auth/lan.rs": "lan",
