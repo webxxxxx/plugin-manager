@@ -12,4 +12,6 @@ pub mod schema;
 #[cfg(test)]
 pub(crate) mod conformance;
 #[cfg(test)]
+pub(crate) mod fixtures;
+#[cfg(test)]
 mod memory;

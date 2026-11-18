@@ -320,6 +320,7 @@
     "src/kernel/conformance.rs": "kernel",
     "src/kernel/contract.rs": "kernel",
     "src/kernel/failure.rs": "kernel",
+    "src/kernel/fixtures.rs": "kernel",
     "src/kernel/memory.rs": "kernel",
     "src/kernel/mod.rs": "kernel",
     "src/kernel/registry.rs": "registry",
