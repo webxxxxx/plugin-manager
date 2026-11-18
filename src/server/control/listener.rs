@@ -270,7 +270,7 @@ fn drain_requests(
                     None,
                     -32700,
                     "management frame exceeds the local limit",
-                    serde_json::json!({ "kind": Problem::Invalid.as_str() }),
+                    Problem::Invalid.error_data(),
                 ))
                 .into_bytes();
                 connection.out.push(b'\n');
@@ -283,7 +283,7 @@ fn drain_requests(
                 None,
                 -32700,
                 "management frame exceeds the local limit",
-                serde_json::json!({ "kind": Problem::Invalid.as_str() }),
+                Problem::Invalid.error_data(),
             ))
             .into_bytes();
             connection.out.push(b'\n');
@@ -307,7 +307,7 @@ fn drain_requests(
                     None,
                     -32000,
                     "control queue is full; retry later",
-                    serde_json::json!({ "kind": Problem::Internal.as_str() }),
+                    Problem::Internal.error_data(),
                 ))
                 .into_bytes();
                 connection.out.push(b'\n');
