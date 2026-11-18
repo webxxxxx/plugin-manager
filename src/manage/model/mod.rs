@@ -4,3 +4,4 @@
 //! 后续切片落地。
 
 pub mod manifest;
+pub mod ustar;
