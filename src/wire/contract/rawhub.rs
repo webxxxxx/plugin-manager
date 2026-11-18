@@ -243,6 +243,25 @@ pub struct RawHub {
 }
 
 impl RawHub {
+    /// The hub a plugin UI raw stream may attach to on this host.
+    ///
+    /// Raw plugin streams are driven by the stdio reactor, which exists only on
+    /// Unix. Elsewhere the face must answer 501 `not_supported` instead of
+    /// claiming a channel it cannot serve — that per-host answer used to live
+    /// in the Windows-only pre-body path; since both connection drivers share
+    /// one table (#205) it lives here, next to the reactor it depends on.
+    pub(crate) fn ui_hub(hub: Arc<RawHub>) -> Option<Arc<RawHub>> {
+        #[cfg(unix)]
+        {
+            Some(hub)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = hub;
+            None
+        }
+    }
+
     pub fn new(limits: Arc<crate::platform::limits::Limits>) -> Arc<Self> {
         Arc::new(Self {
             plugins: Mutex::new(HashMap::new()),

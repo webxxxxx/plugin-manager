@@ -11,12 +11,19 @@ use std::time::{Duration, Instant, SystemTime};
 use serde_json::{json, Value};
 
 #[cfg(feature = "http")]
-use crate::api::{self, Api};
+use std::net::{SocketAddr, TcpListener};
+#[cfg(feature = "http")]
+use std::sync::Mutex;
+
 #[cfg(not(feature = "http"))]
 type Api = ();
 use crate::cli::status::Status;
 use crate::face::catalog;
+#[cfg(feature = "http")]
+use crate::face::fallback::respond;
 use crate::face::mcp;
+#[cfg(feature = "http")]
+use crate::face::prebody::PreBodyFaces;
 use crate::kernel::contract::{
     CapabilityName, Instance, Invocation, Launchers, ProgressToken, Reply, ReplySink,
 };
@@ -32,6 +39,8 @@ use crate::platform::host::wake::Wake;
 use crate::platform::log;
 use crate::platform::paths::Paths;
 use crate::platform::settings;
+#[cfg(feature = "http")]
+use crate::server::auth::lan::Lan;
 use crate::server::auth::lan::LanStatus;
 use crate::supervise::check::{reconcile, start};
 use crate::supervise::model::definition;
@@ -189,7 +198,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     // The driver picks itself inside `server::http::entry`; the composition
     // root only hands over the control plumbing it owns.
     #[cfg(feature = "http")]
-    let api = match api::spawn(config.clone(), raw_hub.clone(), control) {
+    let api = match spawn_http(config.clone(), raw_hub.clone(), control) {
         Ok(api) => Some(api),
         Err(error) => {
             #[cfg(unix)]
@@ -271,6 +280,132 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     notify_systemd("STOPPING=1");
     channel::remove_socket(&config.paths.config_dir);
     0
+}
+
+/// The daemon's own handle on the HTTP surface: LAN state plus the driver that
+/// stops the server loop. Assembly lives here (§5: `daemon.rs` is the
+/// composition root); the driver itself lives in `server/http` (#205).
+#[cfg(feature = "http")]
+pub(crate) struct Api {
+    lan: Arc<Mutex<Lan>>,
+    /// Stops this host's connection driver on shutdown.
+    driver: crate::server::http::entry::ServerHandle,
+}
+
+#[cfg(feature = "http")]
+impl Api {
+    pub(crate) fn set_password(&self, hash: String) -> Result<LanStatus, String> {
+        let mut state = self.lan.lock().map_err(|_| "LAN state poisoned")?;
+        state.set_password(hash);
+        Ok(state.status())
+    }
+
+    pub(crate) fn status(&self) -> Result<LanStatus, String> {
+        let state = self.lan.lock().map_err(|_| "LAN state poisoned")?;
+        Ok(state.status())
+    }
+
+    /// Stop the server loop after the supervisor loop returned. On Unix this
+    /// drains queued control replies and flushes them before the process exits.
+    pub(crate) fn shutdown(&self) {
+        self.driver.shutdown();
+    }
+}
+
+#[cfg(feature = "http")]
+fn default_bind() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 8787))
+}
+
+#[cfg(feature = "http")]
+fn resolve_bind(env: Option<&str>, configured: Option<SocketAddr>) -> SocketAddr {
+    env.and_then(|value| value.parse::<SocketAddr>().ok())
+        .or(configured)
+        .unwrap_or_else(default_bind)
+}
+
+/// Compose the HTTP surface and start this host's connection driver.
+///
+/// `control` is the bound control channel; a poll-loop host consumes its
+/// listener, a thread-per-connection host ignores it (the channel already
+/// started its accept thread). Which driver runs is decided in
+/// `server::http::entry`, not here.
+#[cfg(feature = "http")]
+fn spawn_http(
+    config: Arc<Config>,
+    raw_hub: Arc<crate::wire::contract::rawhub::RawHub>,
+    control: crate::wire::control::channel::ControlBinding,
+) -> std::io::Result<Arc<Api>> {
+    let configured = config.settings.bind;
+    let requested = resolve_bind(std::env::var("SVCD_BIND").ok().as_deref(), configured);
+    let password_hash = config.settings.auth_passwd.clone();
+
+    // A LAN bind without a password would expose an unauthenticated API. Keep
+    // the daemon reachable on loopback so the operator can still run
+    // `svc lan passwd`, then restart to pick up the requested bind.
+    let mut bind = requested;
+    if !requested.ip().is_loopback() && password_hash.is_none() {
+        log::svcd(&format!(
+            "svcd: bind {} requires auth_passwd; falling back to 127.0.0.1:{}",
+            requested,
+            requested.port()
+        ));
+        bind = SocketAddr::from(([127, 0, 0, 1], requested.port()));
+    }
+    let require_auth = !bind.ip().is_loopback();
+    let mut state = Lan::new(bind, requested, require_auth, password_hash);
+    // A failed bind disables HTTP only: the Unix loop still serves the CLI,
+    // and the thread driver reports the same failure through `entry::start`.
+    let listener = match TcpListener::bind(bind) {
+        Ok(listener) => match listener.local_addr() {
+            Ok(local) => {
+                state.bind = local;
+                let port_file = config.paths.config_dir.join("http.port");
+                if let Err(error) = fs::write(&port_file, format!("127.0.0.1:{}", local.port())) {
+                    log::svcd(&format!(
+                        "svcd: cannot write {}: {}",
+                        port_file.display(),
+                        error
+                    ));
+                }
+                log::svcd(&format!(
+                    "svcd: HTTP API on {} (auth required: {})",
+                    local, require_auth
+                ));
+                Some(listener)
+            }
+            Err(error) => {
+                log::svcd(&format!("svcd: HTTP API disabled: {}", error));
+                None
+            }
+        },
+        Err(error) => {
+            log::svcd(&format!("svcd: HTTP API disabled: {}", error));
+            None
+        }
+    };
+
+    let lan = Arc::new(Mutex::new(state));
+    let fallback_config = config.clone();
+    let face: Arc<dyn crate::server::http::Face> =
+        Arc::new(crate::face::api::ApiFace::new(config.clone(), lan.clone()));
+    let routes: Arc<dyn crate::server::http::hooks::PreBodyRoutes> = Arc::new(PreBodyFaces {
+        config: config.clone(),
+    });
+    let fallback: crate::server::http::hooks::FallbackHandler =
+        Arc::new(move |request, lan| respond(&fallback_config, request, lan));
+
+    let driver = crate::server::http::entry::start(crate::server::http::entry::StartInput {
+        config,
+        lan: lan.clone(),
+        raw_hub,
+        listener,
+        face,
+        routes,
+        fallback,
+        control,
+    })?;
+    Ok(Arc::new(Api { lan, driver }))
 }
 
 /// systemd's `Type=notify` expects READY=1 once the management channel can
@@ -4439,5 +4574,20 @@ while ($null -ne [Console]::In.ReadLine()) { }
         let result = response.result.expect("unknown capability result");
         assert_eq!(result["isError"], true);
         assert_eq!(result["content"][0]["text"], "unknown capability nope");
+    }
+}
+
+#[cfg(all(test, feature = "http"))]
+mod http_assembly_tests {
+    use super::{default_bind, resolve_bind};
+
+    #[test]
+    fn bind_precedence_is_env_then_config_then_default() {
+        let a: std::net::SocketAddr = "127.0.0.1:1234".parse().expect("addr");
+        let b: std::net::SocketAddr = "0.0.0.0:5678".parse().expect("addr");
+        assert_eq!(resolve_bind(Some("127.0.0.1:1234"), Some(b)), a);
+        assert_eq!(resolve_bind(Some("not-an-addr"), Some(b)), b);
+        assert_eq!(resolve_bind(None, Some(b)), b);
+        assert_eq!(resolve_bind(None, None), default_bind());
     }
 }

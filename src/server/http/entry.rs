@@ -8,7 +8,7 @@
 
 use std::io;
 
-pub(crate) use crate::server::http::conn::{ServerHandle, StartInput, ThreadDriver};
+pub(crate) use crate::server::http::conn::{ServerHandle, StartInput};
 
 /// The driver this host runs. This alias is the only platform choice left.
 #[cfg(unix)]

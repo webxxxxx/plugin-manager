@@ -11,10 +11,8 @@ use crate::server::auth::lan::Lan;
 use crate::server::http::model as http;
 
 pub(crate) struct PreBodyFaces {
-    /// Read through the trait object by the poll-loop driver; the thread
-    /// driver uses `serve_plugin_ui` instead, so a non-Unix build has no
-    /// reader for it.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    /// Read through the trait object by both drivers: the poll loop on Unix and
+    /// the thread-per-connection driver elsewhere (#205).
     pub(crate) config: Arc<Config>,
 }
 
@@ -32,7 +30,7 @@ impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
             peer,
             lan,
             self.config.clone(),
-            Some(raw_hub),
+            crate::wire::contract::rawhub::RawHub::ui_hub(raw_hub),
         ))
     }
 
