@@ -408,6 +408,7 @@
     "src/supervise/check/backoff.rs": "supervisor",
     "src/supervise/check/mod.rs": "supervise",
     "src/supervise/check/oneshot.rs": "supervisor",
+    "src/supervise/check/peer.rs": "supervisor",
     "src/supervise/check/reconcile.rs": "supervisor",
     "src/supervise/check/restart.rs": "supervisor",
     "src/supervise/check/start.rs": "supervisor",

@@ -3,6 +3,7 @@
 
 pub mod backoff;
 pub mod oneshot;
+pub mod peer;
 pub mod reconcile;
 pub mod restart;
 pub mod start;

@@ -438,12 +438,11 @@ impl Slot {
         self.protocol = protocol;
     }
 
-    /// Whether callers depend on this service's stdio channel staying open: a
-    /// notify-ready plugin speaks JSON-RPC on it, and a protocol-3 plugin
-    /// carries the raw transport on it. Everything else (`ready: exec` with
-    /// protocol 1/2) is fire-and-forget once spawned.
+    /// Whether callers depend on this service's stdio channel staying open.
+    /// The rule itself lives in `check::peer` so the definition loader and the
+    /// runtime cannot drift apart.
     pub(crate) fn is_channel_peer(&self) -> bool {
-        self.exec.ready == Ready::Notify || self.protocol == RAW_PROTOCOL
+        crate::supervise::check::peer::is_channel_peer(self.exec.ready, self.protocol)
     }
 
     /// Seed the state for a service that was already unhealthy at scan time
