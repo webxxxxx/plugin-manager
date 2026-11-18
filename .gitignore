@@ -1,4 +1,7 @@
 /target
+
+# 每票的 worktree（仓库内，git 忽略）
+/.worktrees/
 /size-report.json
 /dist
 

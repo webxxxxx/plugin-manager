@@ -6,21 +6,28 @@
 
 ## 开工
 
-worktree **一律放仓库外**，默认 `<repo-parent>/<repo-name>.worktrees/<ticket>`（例如
-`plugin-manager.worktrees/143`）。不要放 `target/`：`cargo clean` 会删掉整个 `target/`，
-藏在里面的 worktree 会一起消失。
+worktree **一律放仓库内 `.worktrees/`**（已 git 忽略），默认 `.worktrees/<ticket>`（例如
+`.worktrees/198`）。放仓库内是因为本机沙箱默认只给 workspace 读写权限；仓库外（旧的
+`<repo>.worktrees/`）不再作为默认。不要放 `target/`：`cargo clean` 会删掉整个 `target/`，
+藏在里面的 worktree 会一起消失；`worktree-add` 会拒绝落在 `target/` 下的根。
 
 ```sh
-node tools/agent-preflight.mjs --fetch
-node tools/worktree-add.mjs <ticket>   # 打印外部 worktree 路径
+node tools/agent-preflight.mjs --fetch   # 一行看清分支 / ahead-behind / dirty / worktree 数
+node tools/worktree-add.mjs <ticket>     # 先校验票存在且未关闭，再打印 worktree 路径
 ```
 
 `worktree-add` 默认从 `origin/main` 建 `feat/<ticket>`；需要时用 `--base` / `--branch`，
-`--print` 只打印路径。换根时设 `SVCD_WT_ROOT=/some/outside/dir`，它必须在仓库外。
+`--print` 只打印路径，`--force` 跳过票校验（hotfix 用）。换根时设 `SVCD_WT_ROOT=<dir>`，
+仍然只拒绝落在 `target/` 下的根。
 
-历史遗留的 `target/wt-*` 是风险存量：`node tools/agent-preflight.mjs --all` 会把它们标成
-`[under target!]`，`--strict` 也会因此失败。已合并且干净的用 `git worktree move <old> <repo>.worktrees/<name>`
-搬出来；还在用的等它关票时清掉。迁移完成前不要对仓库根跑 `cargo clean`。
+票号必须是**已存在且未关闭**的票：`worktree-add` 会打印 `ticket: #N <标题> [labels]`，标题
+与你要做的事不符就停下——#174 那次就是把别的 session 的票号当成了自己的。开工前用
+`deck_work_route` 看一眼本工作区 24 小时的在办表，确认票没被别的 session 拿走。
+
+历史遗留的 `target/wt-*` 与 `<repo>.worktrees/` 是旧布局：`node tools/agent-preflight.mjs --all`
+会把 `target/` 里的标成 `[under target!]`，`--strict` 会失败。已合并且干净的用
+`git worktree move <old> .worktrees/<name>` 搬进来；还在用的等它关票时清掉。迁移完成前
+不要对仓库根跑 `cargo clean`。
 
 preflight 默认只打一行（branch / ahead-behind / dirty / worktree 数）；只有排查时才加
 `--all` 列出每个 worktree。看到 `on main` 就先建 worktree。
@@ -61,8 +68,7 @@ preflight 默认只打一行（branch / ahead-behind / dirty / worktree 数）�
 - 在 worktree 里小步 commit，尽早 push 分支。
 - 多行或含反引号/`$` 的提交信息用 `git commit -F <file>`；`-m` 会过 shell，反引号会被
   命令替换吃掉。
-- main 的 worktree 不一定是仓库根目录：`git worktree list` 里找 `[main]` 那条
-  （通常是 `<repo>.worktrees/` 下的集成 worktree）。集成用
+- main 的 worktree 通常就是仓库根目录：`git worktree list` 里找 `[main]` 那条。集成用
   `git -C <main-wt> merge --ff-only origin/main` 追上，
   再 `git -C <main-wt> merge --no-ff <branch> -m "merge #<ticket>: <一句话>"`，
   验证后 `git -C <main-wt> push origin main`。合并后的票分支保留。
