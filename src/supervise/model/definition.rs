@@ -485,6 +485,16 @@ fn validate(
             ))
         }
     };
+    // `protocol != 1` was rejected above, so `ready: notify` is the only
+    // channel peer a core definition can declare. The predicate is shared with
+    // the runtime slot so the two notions of "channel peer" cannot drift.
+    if definition.remain_after_exit
+        && crate::supervise::check::peer::is_channel_peer(ready, definition.protocol)
+    {
+        return Err(
+            "remain_after_exit is incompatible with a channel peer: exec.ready=notify (or omitted, which defaults to notify) and protocol 3 keep callers on the stdio channel, which ends when the process exits; use exec.ready=exec for a one-shot service".into(),
+        );
+    }
 
     let lifecycle = match definition.lifecycle {
         Some(lifecycle) => Some(Lifecycle {
@@ -1153,6 +1163,77 @@ mod tests {
             loaded.registry.get("never").expect("never").restart,
             Restart::Never
         );
+        assert!(
+            loaded
+                .registry
+                .get("one-shot")
+                .expect("one-shot")
+                .remain_after_exit
+        );
+    }
+
+    #[test]
+    fn rejects_remain_after_exit_for_a_notify_ready_definition() {
+        // #197: a one-shot keeps no process after it exits, but a notify-ready
+        // service is a channel peer: callers write into the stdio channel that
+        // dies with the process. Accepting the pair lets `svc start` report
+        // success while the service has no way left to serve a call.
+        for ready in [Some("notify"), None] {
+            let dir = TempDir::new();
+            let mut body = definition("odd");
+            match ready {
+                Some(ready) => body["exec"]["ready"] = json!(ready),
+                None => {
+                    body["exec"]
+                        .as_object_mut()
+                        .expect("exec object")
+                        .remove("ready");
+                }
+            }
+            body["remain_after_exit"] = json!(true);
+            dir.write("odd", body);
+
+            let loaded =
+                load_services(&dir.services_dir(), &crate::platform::limits::test_default());
+
+            assert!(
+                loaded.registry.get("odd").is_none(),
+                "ready={ready:?} must be rejected"
+            );
+            assert_eq!(
+                loaded.issues.len(),
+                1,
+                "ready={ready:?}: {:?}",
+                loaded.issues
+            );
+            let reason = &loaded.issues[0].reason;
+            assert!(
+                reason.contains("remain_after_exit"),
+                "ready={ready:?}: {reason}"
+            );
+            assert!(reason.contains("notify"), "ready={ready:?}: {reason}");
+        }
+    }
+
+    #[test]
+    fn keeps_notify_services_and_exec_one_shots_loadable() {
+        // The rejection above must not narrow the two legitimate shapes: a
+        // notify-ready long-running service, and an exec one-shot whose work
+        // outlives its process.
+        let dir = TempDir::new();
+        let mut notify = definition("notify");
+        notify["exec"]["ready"] = json!("notify");
+        dir.write("notify", notify);
+        let mut one_shot = definition("one-shot");
+        one_shot["remain_after_exit"] = json!(true);
+        dir.write("one-shot", one_shot);
+
+        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
+
+        assert!(loaded.issues.is_empty(), "issues: {:?}", loaded.issues);
+        let notify = loaded.registry.get("notify").expect("notify");
+        assert_eq!(notify.exec.as_ref().expect("exec").ready, Ready::Notify);
+        assert!(!notify.remain_after_exit);
         assert!(
             loaded
                 .registry

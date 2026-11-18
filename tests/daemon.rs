@@ -741,6 +741,37 @@ fn a_missing_dependency_rejects_start_with_its_id() {
 }
 
 #[test]
+fn a_notify_one_shot_definition_never_becomes_a_startable_service() {
+    // #197: accepting `remain_after_exit` on a notify-ready definition would
+    // let `svc start` settle on Running with no pid while the stdio channel is
+    // already gone. The definition is rejected at load, so no service exists.
+    let mut sandbox = Sandbox::new();
+    sandbox.write_core_json("odd");
+    sandbox.set_definition_field("odd", "remain_after_exit", json!(true));
+
+    sandbox.start_daemon();
+
+    let started = sandbox.start_when_ready("odd");
+    assert_eq!(
+        started.status.code(),
+        Some(1),
+        "stderr: {}\n{}",
+        String::from_utf8_lossy(&started.stderr),
+        sandbox.daemon_log()
+    );
+    assert!(
+        String::from_utf8_lossy(&started.stderr).contains("unknown service: odd"),
+        "stderr: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    assert!(
+        sandbox.daemon_log().contains("remain_after_exit"),
+        "the load warning must explain the rejection:\n{}",
+        sandbox.daemon_log()
+    );
+}
+
+#[test]
 fn a_crashing_service_enters_backoff() {
     let mut sandbox = Sandbox::new();
     sandbox.write_service("crash", &[], Script::CrashAfterReady);
@@ -1518,13 +1549,18 @@ done
 
     /// Add or replace the `restart` policy of an already written definition.
     fn set_restart(&self, id: &str, policy: &str) {
+        self.set_definition_field(id, "restart", json!(policy));
+    }
+
+    /// Add or replace one field of an already written definition.
+    fn set_definition_field(&self, id: &str, field: &str, value: Value) {
         let path = self.config.join("services.d").join(format!("{}.json", id));
-        let mut value: Value =
+        let mut definition: Value =
             serde_json::from_slice(&fs::read(&path).expect("read definition")).expect("json");
-        value["restart"] = json!(policy);
+        definition[field] = value;
         fs::write(
             &path,
-            serde_json::to_vec_pretty(&value).expect("definition"),
+            serde_json::to_vec_pretty(&definition).expect("definition"),
         )
         .expect("write definition");
     }
