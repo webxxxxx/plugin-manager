@@ -221,8 +221,10 @@ fn tools_list(config: &Path, id: Option<Value>, era: Era, params: &Value) -> (rp
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
+            // `registry.tools` returns the face-neutral `next`; the MCP result
+            // names the cursor and decides which fields cross into the protocol.
             let mut result = json!({ "tools": tools });
-            if let Some(next_cursor) = result_value.get("nextCursor") {
+            if let Some(next_cursor) = result_value.get("next") {
                 result["nextCursor"] = next_cursor.clone();
             }
             if era == Era::Modern {

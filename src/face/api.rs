@@ -322,15 +322,23 @@ impl ApiFace {
                 .unwrap_or(Value::Null),
             ),
             ("GET", ["api", "v1", "auth"]) => match self.lan.lock() {
-                Ok(state) => Response::json(
-                    200,
-                    &json!({
-                        "bind": state.bind.to_string(),
-                        "requestedBind": state.requested_bind.to_string(),
-                        "authRequired": state.require_auth,
-                        "passwordSet": state.password_hash().is_some(),
-                    }),
-                ),
+                Ok(state) => {
+                    // One face-neutral value, two renderers: `auth.status` and
+                    // this route both read `LanStatus`, so `password_set` has a
+                    // single derivation. The renderer still spells this
+                    // protocol's keys; the cross-surface test keeps the two
+                    // shapes honest.
+                    let status = state.status();
+                    Response::json(
+                        200,
+                        &json!({
+                            "bind": status.bind.to_string(),
+                            "requestedBind": status.requested_bind.to_string(),
+                            "authRequired": status.require_auth,
+                            "passwordSet": status.password_set,
+                        }),
+                    )
+                }
                 Err(_) => error_response(500, "internal", "auth state unavailable"),
             },
             ("GET", ["api", "v1", "version"]) => Response::json(

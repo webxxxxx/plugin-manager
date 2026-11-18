@@ -4887,6 +4887,70 @@ fn serves_the_embedded_console() {
     assert_eq!(raw_header_values(&post, "allow"), vec!["GET"]);
 }
 
+fn lan_status_field(text: &str, prefix: &str) -> String {
+    text.lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .unwrap_or_else(|| panic!("missing {prefix:?} in the control reply: {text:?}"))
+        .trim()
+        .to_string()
+}
+
+/// The control channel and `GET /api/v1/auth` render the same four-key auth
+/// status from one `LanStatus`. Keep them honest with a real daemon: a drift in
+/// either renderer (or in the value it derives) turns this red.
+#[test]
+fn control_and_http_report_the_same_auth_status() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let _ = sandbox.wait_for_http();
+
+    let changed = sandbox.run_svc(&["lan", "passwd", TEST_PASSWORD]);
+    assert_eq!(
+        changed.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&changed.stderr)
+    );
+    // Bind to a LAN address so `authRequired` is true on both surfaces.
+    sandbox.shutdown();
+    sandbox.start_daemon_with_bind("0.0.0.0:0");
+    let address = sandbox.wait_for_http();
+
+    let bearer = format!("Bearer {}", TEST_PASSWORD);
+    let http = request_with(
+        &address,
+        "GET",
+        "/api/v1/auth",
+        "",
+        b"",
+        &[("Authorization", bearer.as_str())],
+    );
+    assert_eq!(http.status, 200, "{}", http.body);
+
+    let status = sandbox.run_svc(&["lan", "status"]);
+    assert_eq!(
+        status.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let text = String::from_utf8_lossy(&status.stdout);
+
+    let bind = lan_status_field(&text, "bind:");
+    let requested = lan_status_field(&text, "requested:");
+    let auth_required = lan_status_field(&text, "auth required:");
+    let password = lan_status_field(&text, "password:");
+
+    assert_eq!(http.body["bind"].as_str(), Some(bind.as_str()), "{text}");
+    assert_eq!(
+        http.body["requestedBind"].as_str(),
+        Some(requested.as_str()),
+        "{text}"
+    );
+    assert_eq!(http.body["authRequired"], auth_required == "true", "{text}");
+    assert_eq!(http.body["passwordSet"], password == "set", "{text}");
+}
+
 #[test]
 fn lan_bind_without_password_falls_back_to_loopback() {
     let mut sandbox = Sandbox::new();
