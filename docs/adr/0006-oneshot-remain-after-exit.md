@@ -8,6 +8,7 @@ core 服务里有一类"干完就退出"的：建隧道（`wg-start.sh`）、挂
 - **core JSON 显式声明**：`"remain_after_exit": true`，默认 `false`（Rust 原生服务不为历史行为买单）。
 - **drop-in shell 脚本沿用 shell 约定**：`restart != always` 即视为一次性（`TYPE=oneshot`、`RESTART=never`、缺省 `on-failure` 都命中），与服务版 `svcd` 对齐。
 - **插件恒为 `false`**：插件契约是被监督进程常驻；退出 0 说明它不该再报 running，也不存在可调开关。
+- **与通道对端互斥**：`remain_after_exit: true` 不能和通道对端同时声明——`exec.ready: notify`（省略 `ready` 也默认 notify）或 protocol 3；定义加载即拒绝。通道跟着进程走，进程可以退出就没人接调用；一次性服务要声明 `exec.ready: exec`（#197）。
 - `svc start` 对「完成态」允许重跑（`Running` 且无 pid），与 shell 版一致；对正在运行的进程仍是幂等 no-op。
 - `svc stop` 对完成态不发信号、不进入停止/强杀窗口：有 stop 动作就先跑它，然后 `StopSettled` 直接回 `stopped`。
 - 运行态记录（ADR 0005）落盘后，daemon 重启会把「完成态」按记录恢复成 `Running`/无 pid，**不重跑**一次性工作；跨 boot 的记录仍被丢弃，开机按 `enabled` 重新执行。
