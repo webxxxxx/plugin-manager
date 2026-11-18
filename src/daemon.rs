@@ -1120,7 +1120,7 @@ impl Daemon {
                 request.id,
                 -32000,
                 "unauthorized",
-                problem_data(Problem::Internal),
+                Problem::Internal.error_data(),
             );
             let _ = incoming.reply.send(rpc::to_line(&response));
             return;
@@ -1172,7 +1172,7 @@ impl Daemon {
                         id,
                         -32001,
                         &format!("unknown service: {}", service_id),
-                        problem_data(Problem::UnknownService),
+                        Problem::UnknownService.error_data(),
                     ),
                 },
                 Err(response) => response,
@@ -1242,7 +1242,7 @@ impl Daemon {
                 id,
                 -32601,
                 "method not found",
-                problem_data(Problem::Invalid),
+                Problem::Invalid.error_data(),
             ),
         }
     }
@@ -2580,21 +2580,17 @@ fn status_response(
                 id,
                 -32603,
                 &error.to_string(),
-                problem_data(Problem::Internal),
+                Problem::Internal.error_data(),
             ),
         },
         Err(error) => problem_response(id, error_code, error),
     }
 }
 
-fn problem_data(problem: Problem) -> Value {
-    json!({ "kind": problem.as_str() })
-}
-
 /// One management error -> one JSON-RPC frame. Funnelling every dispatch arm
 /// through here keeps the `data.kind` and the code together.
 fn problem_response(id: Option<Value>, code: i32, error: ProblemError) -> rpc::Response {
-    rpc::err_data(id, code, error.detail(), problem_data(error.problem))
+    rpc::err_data(id, code, error.detail(), error.problem.error_data())
 }
 
 fn status_json(status: Status) -> Value {
@@ -2829,7 +2825,7 @@ fn param_id(request: &rpc::Request) -> Result<String, rpc::Response> {
                 request.id.clone(),
                 -32602,
                 "missing id",
-                problem_data(Problem::Invalid),
+                Problem::Invalid.error_data(),
             )
         })
 }
