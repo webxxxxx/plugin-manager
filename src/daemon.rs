@@ -732,17 +732,16 @@ impl Daemon {
         }
     }
 
-    /// The platform's view of a recorded pid: alive, plus its start time when
-    /// it is alive. One probe so adoption and cleanup hand `same_process`
-    /// identical inputs.
-    fn process_probe(pid: u32) -> (bool, Option<u64>) {
-        let alive = crate::platform::host::process::alive(pid);
-        let starttime = if alive {
-            crate::platform::host::process::start_time(pid)
+    /// Probe a recorded pid once: the model takes a `runtime::ProcessStamp` and
+    /// never touches the OS.
+    fn process_probe(pid: u32) -> runtime::ProcessStamp {
+        if crate::platform::host::process::alive(pid) {
+            runtime::ProcessStamp::Alive {
+                starttime: crate::platform::host::process::start_time(pid),
+            }
         } else {
-            None
-        };
-        (alive, starttime)
+            runtime::ProcessStamp::Gone
+        }
     }
 
     /// The adoption-side guard: a record with no `since` stays "never
@@ -803,16 +802,20 @@ impl Daemon {
                 runtime::remove(&id, &self.config.paths);
                 continue;
             }
-            let (alive, current_starttime) = Self::process_probe(pid);
-            if !runtime::same_process(&record, alive, current_starttime) {
-                if let (Some(expected), Some(actual)) = (record.starttime, current_starttime) {
+            match runtime::pid_state(&record, Self::process_probe(pid)) {
+                runtime::PidState::Gone => {
+                    runtime::remove(&id, &self.config.paths);
+                    continue;
+                }
+                runtime::PidState::Reused { expected, actual } => {
                     log::svcd(&format!(
                         "svcd: {}: pid {} was reused (starttime {} != {}); not adopting",
                         id, pid, actual, expected
                     ));
+                    runtime::remove(&id, &self.config.paths);
+                    continue;
                 }
-                runtime::remove(&id, &self.config.paths);
-                continue;
+                runtime::PidState::Same | runtime::PidState::Unknown => {}
             }
             let since = Self::adopted_since(now, &record);
             let ready = anchored_mono_ms(now, record.ready_since);
@@ -859,8 +862,8 @@ impl Daemon {
                 // forget the record.
                 if let Some(record) = runtime::load(id, &self.config.paths) {
                     if let Some(pid) = record.pid {
-                        let (alive, current_starttime) = Self::process_probe(pid);
-                        if runtime::same_process(&record, alive, current_starttime) {
+                        let state = runtime::pid_state(&record, Self::process_probe(pid));
+                        if matches!(state, runtime::PidState::Same | runtime::PidState::Unknown) {
                             crate::platform::host::process::terminate_tree(pid);
                         }
                     }
