@@ -19,7 +19,7 @@ use crate::wire::control::channel;
 use crate::platform::clock::{Clock, Now};
 use crate::platform::compat;
 use crate::platform::config::Config;
-use crate::supervise::definition;
+use crate::supervise::model::definition;
 use crate::kernel::contract::{
     CapabilityName, Instance, Invocation, Launchers, ProgressToken, Reply, ReplySink,
 };
@@ -35,12 +35,12 @@ use crate::manage::plugin::{self, Strategy};
 use crate::wire::contract::reactor::Reactor;
 use crate::kernel::registry::{Hook, Kind, Registry, Service, State, RESERVED_ID};
 use crate::wire::message::rpc;
-use crate::supervise::runtime::{self, Record};
+use crate::supervise::model::runtime::{self, Record};
 use crate::platform::settings;
-use crate::supervise::slot::hook_command;
-use crate::supervise::slot::{Slot, SlotWire};
+use crate::supervise::ops::slot::hook_command;
+use crate::supervise::ops::slot::{Slot, SlotWire};
 use crate::cli::status::Status;
-use crate::supervise::supervisor::{self, Event};
+use crate::supervise::model::supervisor::{self, Event};
 use crate::platform::host::wake::Wake;
 
 /// The supervisor loop's bounded wait when it has no earlier deadline. With a
@@ -564,7 +564,7 @@ impl Daemon {
         let temp_cleanup_interval_ms = config.settings.temp_cleanup_interval().as_millis() as u64;
         let services_fingerprint = services_fingerprint(&config.paths.services_dir);
         let mut launchers = Launchers::default();
-        launchers.register("builtin", Box::new(crate::supervise::builtin_adapter::BuiltinLauncher));
+        launchers.register("builtin", Box::new(crate::supervise::ops::builtin_adapter::BuiltinLauncher));
         Daemon {
             config,
             registry,
@@ -1416,7 +1416,7 @@ impl Daemon {
             id,
             &hook,
             &self.config.paths,
-            &mut crate::supervise::hook::poll_this_loop,
+            &mut crate::supervise::ops::hook::poll_this_loop,
         ));
     }
 
@@ -2613,7 +2613,7 @@ fn run_status_hook(id: &str, hook: &Hook, paths: &Paths, poll: &mut dyn FnMut())
         if started.elapsed() >= Duration::from_millis(hook.timeout_ms) {
             // The probe runs in its own process group: stop the whole tree, not
             // just the leader, or a status hook's children outlive the timeout.
-            crate::supervise::hook::kill(&mut child);
+            crate::supervise::ops::hook::kill(&mut child);
             let _ = child.wait();
             let output = read_status_output(&output_path);
             let _ = fs::remove_file(&output_path);

@@ -1,11 +1,7 @@
-//! L3 领域·监督：注册表、6 态核、监督槽、运行态记录与生命周期动作。
+//! L3 领域·监督：注册表在内核，这里按 `model` / `ops` 落位（`check` 随内容拆分再建）。
 //!
-//! `model` / `check` / `ops` 三段拆分是每个文件的后续票；step 6 只搬文件。
+//! - `model/`：定义解析、运行态记录、6 态纯核。
+//! - `ops/`：监督槽、hook、脚本与内置载体。
 
-pub mod builtin_adapter;
-pub mod definition;
-pub mod hook;
-pub mod runtime;
-pub mod script;
-pub mod slot;
-pub mod supervisor;
+pub mod model;
+pub mod ops;

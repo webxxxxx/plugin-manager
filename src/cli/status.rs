@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::platform::clock::Now;
 use crate::kernel::registry::{Kind, Service, State};
-use crate::supervise::supervisor::Machine;
+use crate::supervise::model::supervisor::Machine;
 
 /// The fixed `svc status` payload. `svc list` and the text output are both
 /// projections of this shape; MCP `svc.list` / `svc.describe` will reuse it when
@@ -330,7 +330,7 @@ mod tests {
 
     #[test]
     fn live_status_uses_the_machine_runtime_state() {
-        use crate::supervise::supervisor::Machine;
+        use crate::supervise::model::supervisor::Machine;
 
         let service = demo();
         let mut machine = Machine::new(crate::kernel::registry::Restart::OnFailure);

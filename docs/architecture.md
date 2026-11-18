@@ -243,7 +243,7 @@ src/
     mod.rs  plan.rs  execute.rs  service_win.rs
 ```
 
-**step 6（#170）已按本树整文件搬迁**：文件进了对应目录但内容没切。`api.rs` 的四块已在 #173 拆完（只剩 compose 的装配与回退 loop）；`platform/storage` 的五文件已在 #175 拆完（`meta` / `path` / `upload` / `part` / `gc`）；`manage`/`supervise` 的 `model/check/ops` 仍是后续票。
+**step 6（#170）已按本树整文件搬迁**：文件进了对应目录但内容没切。`api.rs` 的四块已在 #173 拆完（只剩 compose 的装配与回退 loop）；`platform/storage` 的五文件已在 #175 拆完（`meta` / `path` / `upload` / `part` / `gc`）；`supervise` 的 `model/` 与 `ops/` 已整文件落位（#176，`check/` 随内容拆分再建）；`manage` 的三段仍是后续票。
 
 `orchestrate/` 与 `cluster/` 现在不建：**目录在第一个文件出现时创建**，不建空壳。
 
