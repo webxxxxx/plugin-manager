@@ -6,3 +6,4 @@ pub mod transfer;
 pub mod export;
 pub mod install;
 pub mod scan;
+pub mod install_plugin;
