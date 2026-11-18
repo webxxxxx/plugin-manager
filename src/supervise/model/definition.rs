@@ -1193,8 +1193,10 @@ mod tests {
             body["remain_after_exit"] = json!(true);
             dir.write("odd", body);
 
-            let loaded =
-                load_services(&dir.services_dir(), &crate::platform::limits::test_default());
+            let loaded = load_services(
+                &dir.services_dir(),
+                &crate::platform::limits::test_default(),
+            );
 
             assert!(
                 loaded.registry.get("odd").is_none(),
@@ -1228,7 +1230,10 @@ mod tests {
         one_shot["remain_after_exit"] = json!(true);
         dir.write("one-shot", one_shot);
 
-        let loaded = load_services(&dir.services_dir(), &crate::platform::limits::test_default());
+        let loaded = load_services(
+            &dir.services_dir(),
+            &crate::platform::limits::test_default(),
+        );
 
         assert!(loaded.issues.is_empty(), "issues: {:?}", loaded.issues);
         let notify = loaded.registry.get("notify").expect("notify");
