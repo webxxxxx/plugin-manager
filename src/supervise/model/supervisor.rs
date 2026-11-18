@@ -4,6 +4,7 @@ use crate::kernel::contract::{Health, Settled};
 use crate::kernel::registry::Restart;
 
 pub use crate::supervise::check::backoff::{backoff_delay, MAX_FAILURES};
+use crate::supervise::check::oneshot::{exited_successfully, keeps_running_after_exit};
 use crate::supervise::check::restart::is_stable;
 pub const START_TIMEOUT_MS: u64 = 30_000;
 pub const STOP_TIMEOUT_MS: u64 = 10_000;
@@ -178,14 +179,14 @@ impl Machine {
                         // restarting, with the same stable-run reset as a crash.
                         // A clean exit from a degraded service is still a
                         // failure: health, not just the exit code, decides.
-                        let successful = code == Some(0) && self.health().is_ready();
+                        let successful = exited_successfully(code, self.health().is_ready());
                         let restart = match self.restart {
                             Restart::Always => true,
                             Restart::OnFailure => !successful,
                             Restart::Never => false,
                         };
                         if !restart {
-                            if self.remain_after_exit && successful {
+                            if keeps_running_after_exit(self.remain_after_exit, successful) {
                                 // One-shot finished: the effect is still there,
                                 // so the service stays "running" with no pid.
                                 self.state = S::Running;
