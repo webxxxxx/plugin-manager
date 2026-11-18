@@ -1,6 +1,7 @@
 pub use crate::kernel::registry::State;
 
 use crate::kernel::contract::{Health, Settled};
+use crate::kernel::projection::Live;
 use crate::kernel::registry::Restart;
 
 pub use crate::supervise::check::backoff::{backoff_delay, MAX_FAILURES};
@@ -110,6 +111,23 @@ impl Machine {
             _ => Settled::Stopped,
         };
         Health::from_settled(state)
+    }
+
+    /// The projection facet: exactly the fields the status projection reads,
+    /// with the three stamps left in the monotonic domain. Anchoring them to
+    /// epoch seconds happens in the kernel, so no clock crosses this boundary.
+    pub fn live(&self) -> Live {
+        Live {
+            state: self.state,
+            pid: self.pid,
+            failures: self.failures,
+            since_ms: self.since_ms,
+            ready_since_ms: self.ready_since_ms,
+            next_at_ms: self.next_at_ms,
+            last_exit: self.last_exit,
+            unkillable: self.unkillable,
+            restart: self.restart,
+        }
     }
 
     pub fn step(&mut self, event: Event, now_ms: u64) -> Vec<Action> {
@@ -343,6 +361,31 @@ mod tests {
 
     fn ready(machine: &mut Machine, pid: u32, now: u64) -> Vec<Action> {
         machine.step(Event::Ready { pid }, now)
+    }
+
+    #[test]
+    fn live_carries_every_projected_field() {
+        let mut machine = Machine::new(Restart::OnFailure);
+        machine.state = State::Backoff;
+        machine.pid = Some(7);
+        machine.failures = 3;
+        machine.since_ms = 1_700_000_000_000;
+        machine.ready_since_ms = Some(1_700_000_001_000);
+        machine.next_at_ms = Some(1_700_000_002_000);
+        machine.last_exit = Some(9);
+        machine.unkillable = true;
+
+        let live = machine.live();
+
+        assert_eq!(live.state, State::Backoff);
+        assert_eq!(live.pid, Some(7));
+        assert_eq!(live.failures, 3);
+        assert_eq!(live.since_ms, 1_700_000_000_000);
+        assert_eq!(live.ready_since_ms, Some(1_700_000_001_000));
+        assert_eq!(live.next_at_ms, Some(1_700_000_002_000));
+        assert_eq!(live.last_exit, Some(9));
+        assert!(live.unkillable);
+        assert_eq!(live.restart, Restart::OnFailure);
     }
 
     #[test]

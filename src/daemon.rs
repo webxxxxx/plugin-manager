@@ -17,7 +17,6 @@ use std::sync::Mutex;
 
 #[cfg(not(feature = "http"))]
 type Api = ();
-use crate::cli::status::Status;
 use crate::face::catalog;
 #[cfg(feature = "http")]
 use crate::face::fallback::respond;
@@ -28,6 +27,7 @@ use crate::kernel::contract::{
     CapabilityName, Instance, Invocation, Launchers, ProgressToken, Reply, ReplySink,
 };
 use crate::kernel::failure::{Class, Failure, Problem, ProblemError, Rejection, Retry};
+use crate::kernel::projection::Status;
 use crate::kernel::registry::{Hook, Kind, Registry, Service, State, RESERVED_ID};
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::manage::package;
@@ -1566,7 +1566,7 @@ impl Daemon {
             return Status::builtin(service);
         }
         match self.slots.get(&service.id) {
-            Some(slot) => Status::live(service, &slot.machine, now),
+            Some(slot) => Status::live(service, &slot.machine.live(), now),
             None => Status::of(service),
         }
     }

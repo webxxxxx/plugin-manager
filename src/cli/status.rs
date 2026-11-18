@@ -1,121 +1,11 @@
-//! `svc status` payload and its text projection.
+//! `svc status` text projection.
 //!
-//! `since`, `ready_since` and `next_at` are Unix epoch seconds; `last_exit` is
-//! the last recorded exit code. Missing runtime values stay `null`/`-` until the
-//! supervisor (#29) supplies them.
+//! The payload itself is a kernel value ([`crate::kernel::projection::Status`]);
+//! this module only renders it for a terminal.
 
 use std::fmt::Display;
 
-use serde::{Deserialize, Serialize};
-
-use crate::kernel::registry::{Kind, Service, State};
-use crate::platform::clock::Now;
-use crate::supervise::model::supervisor::Machine;
-
-/// The fixed `svc status` payload. `svc list` and the text output are both
-/// projections of this shape; MCP `svc.list` / `svc.describe` will reuse it when
-/// the bridge lands (#32).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Status {
-    pub summary: Summary,
-    pub details: Details,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Summary {
-    pub id: String,
-    pub kind: Kind,
-    pub state: State,
-    pub enabled: bool,
-    pub pid: Option<u32>,
-    pub since: Option<u64>,
-    pub version: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Details {
-    pub dependencies: Vec<String>,
-    pub last_exit: Option<i32>,
-    pub next_at: Option<u64>,
-    pub ready_since: Option<u64>,
-    pub failures: u32,
-    pub config: Option<String>,
-    /// Crash-restart policy; the supervisor supplies it in #29.
-    pub restart: Option<String>,
-    /// `true` only when a forced stop ran out of its kill window.
-    pub unkillable: bool,
-    /// Supplementary detail from the optional core status action; only
-    /// `svc status` probes it, and its exit code never changes the service
-    /// state.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub probe: Option<String>,
-}
-
-impl Status {
-    /// The on-disk/offline projection of a service definition.
-    pub fn of(service: &Service) -> Self {
-        Status {
-            summary: Summary {
-                id: service.id.clone(),
-                kind: service.kind,
-                state: service.state,
-                enabled: service.enabled,
-                pid: service.pid,
-                since: service.since,
-                version: service.version.clone(),
-            },
-            details: Details {
-                dependencies: service.deps.clone(),
-                last_exit: service.last_exit,
-                next_at: service.next_at,
-                ready_since: service.ready_since,
-                failures: service.failures,
-                config: service.config.clone(),
-                restart: None,
-                unkillable: false,
-                probe: None,
-            },
-        }
-    }
-
-    /// The live projection of a supervised core service. Machine timers are
-    /// monotonic; the `now` pair anchors them back to epoch seconds.
-    pub fn live(service: &Service, machine: &Machine, now: Now) -> Self {
-        let mut status = Status::of(service);
-        status.summary.state = machine.state;
-        status.summary.pid = machine.pid;
-        status.summary.since = epoch_secs(now, machine.since_ms);
-        status.details.last_exit = machine.last_exit;
-        status.details.next_at = epoch_secs_opt(now, machine.next_at_ms);
-        status.details.ready_since = epoch_secs_opt(now, machine.ready_since_ms);
-        status.details.failures = machine.failures;
-        status.details.restart = Some(machine.restart.as_str().into());
-        status.details.unkillable = machine.unkillable;
-        status
-    }
-
-    /// The in-process `svc` service is always running and never supervised.
-    pub fn builtin(service: &Service) -> Self {
-        let mut status = Status::of(service);
-        status.summary.state = State::Running;
-        status.summary.enabled = true;
-        status.summary.pid = None;
-        status.summary.since = None;
-        status.details.restart = Some(service.restart.as_str().into());
-        status
-    }
-}
-
-fn epoch_secs(now: Now, ms: u64) -> Option<u64> {
-    if ms == 0 {
-        return None;
-    }
-    Some(now.epoch_of(ms))
-}
-
-fn epoch_secs_opt(now: Now, ms: Option<u64>) -> Option<u64> {
-    ms.and_then(|value| epoch_secs(now, value))
-}
+use crate::kernel::projection::Status;
 
 const COLUMNS: [&str; 6] = ["ID", "KIND", "STATE", "AUTO", "PID", "VERSION"];
 
@@ -226,142 +116,12 @@ fn dash<T: Display>(value: Option<T>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::registry::Ready;
-    use crate::kernel::registry::Service;
+    use crate::kernel::fixtures::test_service;
     use serde_json::Value;
-
-    fn demo() -> Service {
-        Service {
-            id: "demo".into(),
-            kind: Kind::Core,
-            version: "1.2.3".into(),
-            protocol: 1,
-            desc: "demo service".into(),
-            deps: vec!["base".into()],
-            contract: crate::kernel::registry::contract_for(
-                "demo",
-                "1.2.3",
-                Vec::new(),
-                crate::kernel::registry::Carrier::Slot,
-                &crate::platform::limits::test_default(),
-            ),
-            impl_ref: None,
-            exec: Some(crate::kernel::registry::Exec {
-                path: "/bin/demo".into(),
-                args: Vec::new(),
-                env: Default::default(),
-                ready: Ready::Exec,
-                interpreter: None,
-            }),
-            lifecycle: None,
-            enabled: true,
-            restart: crate::kernel::registry::Restart::OnFailure,
-            remain_after_exit: false,
-            compat: None,
-            state: State::Running,
-            pid: Some(42),
-            since: Some(1_700_000_000),
-            ready_since: Some(1_700_000_002),
-            next_at: None,
-            failures: 0,
-            last_exit: Some(3),
-            config: Some("/var/lib/svcd/demo/config".into()),
-        }
-    }
-
-    #[test]
-    fn json_has_the_fixed_summary_and_details_shape() {
-        let service = demo();
-        let value = serde_json::to_value(Status::of(&service)).expect("serialize");
-
-        assert_eq!(
-            value,
-            serde_json::json!({
-                "summary": {
-                    "id": "demo",
-                    "kind": "core",
-                    "state": "running",
-                    "enabled": true,
-                    "pid": 42,
-                    "since": 1_700_000_000u64,
-                    "version": "1.2.3"
-                },
-                "details": {
-                    "dependencies": ["base"],
-                    "last_exit": 3,
-                    "next_at": null,
-                    "ready_since": 1_700_000_002u64,
-                    "failures": 0,
-                    "config": "/var/lib/svcd/demo/config",
-                    "restart": null,
-                    "unkillable": false
-                }
-            })
-        );
-
-        let object = value.as_object().expect("object");
-        assert_eq!(object.len(), 2);
-        assert!(object.contains_key("summary"));
-        assert!(object.contains_key("details"));
-    }
-
-    #[test]
-    fn stopped_service_serializes_null_runtime_fields() {
-        let mut service = demo();
-        service.state = State::Stopped;
-        service.enabled = false;
-        service.pid = None;
-        service.since = None;
-        service.ready_since = None;
-        service.last_exit = None;
-        service.config = None;
-
-        let value = serde_json::to_value(Status::of(&service)).expect("serialize");
-
-        assert_eq!(value["summary"]["state"], "stopped");
-        assert_eq!(value["summary"]["enabled"], false);
-        assert!(value["summary"]["pid"].is_null());
-        assert!(value["summary"]["since"].is_null());
-        assert!(value["details"]["last_exit"].is_null());
-        assert!(value["details"]["config"].is_null());
-        assert!(value["details"]["restart"].is_null());
-        assert_eq!(value["details"]["unkillable"], false);
-    }
-
-    #[test]
-    fn live_status_uses_the_machine_runtime_state() {
-        use crate::supervise::model::supervisor::Machine;
-
-        let service = demo();
-        let mut machine = Machine::new(crate::kernel::registry::Restart::OnFailure);
-        machine.state = State::Backoff;
-        machine.pid = None;
-        machine.since_ms = 1_700_000_000_000;
-        machine.next_at_ms = Some(1_700_000_005_000);
-        machine.failures = 2;
-        machine.last_exit = Some(1);
-        machine.unkillable = true;
-
-        let status = Status::live(
-            &service,
-            &machine,
-            Now::at(1_700_000_010_000, 1_700_000_010),
-        );
-
-        assert_eq!(status.summary.state, State::Backoff);
-        assert_eq!(status.summary.pid, None);
-        assert_eq!(status.summary.since, Some(1_700_000_000));
-        assert_eq!(status.details.next_at, Some(1_700_000_005));
-        assert_eq!(status.details.failures, 2);
-        assert_eq!(status.details.last_exit, Some(1));
-        assert_eq!(status.details.restart.as_deref(), Some("on-failure"));
-        assert!(status.details.unkillable);
-    }
 
     #[test]
     fn list_table_has_the_specified_columns() {
-        let service = demo();
-        let rendered = table(&[Status::of(&service)]);
+        let rendered = table(&[Status::of(&test_service())]);
         let lines: Vec<&str> = rendered.lines().collect();
 
         assert_eq!(lines[0].split_whitespace().collect::<Vec<_>>(), COLUMNS);
@@ -375,8 +135,7 @@ mod tests {
 
     #[test]
     fn status_text_has_summary_and_details_sections() {
-        let service = demo();
-        let rendered = text(&Status::of(&service));
+        let rendered = text(&Status::of(&test_service()));
 
         assert!(rendered.contains("summary:"));
         assert!(rendered.contains("details:"));
@@ -392,7 +151,7 @@ mod tests {
 
     #[test]
     fn a_missing_optional_value_renders_as_dash() {
-        let mut service = demo();
+        let mut service = test_service();
         service.pid = None;
         service.next_at = None;
         service.config = None;
