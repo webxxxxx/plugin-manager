@@ -4,6 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::time::{Duration, Instant};
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
 
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::manage::model::layout::{current_version, plugin_dir};
@@ -184,4 +185,16 @@ fn check_command(program: &Path) -> Command {
 #[cfg(not(windows))]
 fn check_command(program: &Path) -> Command {
     Command::new(program)
+}
+
+/// Serialise config writes inside this process. The on-disk `config.lock`
+/// covers other processes on Unix; this mutex also covers Windows, where
+/// `flock` is a no-op, and keeps two threads from sharing the same
+/// `config.tmp.<pid>` path.
+pub(crate) static CONFIG_WRITES: Mutex<()> = Mutex::new(());
+
+pub(crate) fn config_lock() -> MutexGuard<'static, ()> {
+    CONFIG_WRITES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }

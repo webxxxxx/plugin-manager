@@ -4,6 +4,8 @@ pub mod bundle;
 pub mod config;
 pub mod transfer;
 pub mod export;
+pub mod export_plugin;
 pub mod install;
 pub mod scan;
 pub mod install_plugin;
+pub mod uninstall;
