@@ -369,10 +369,6 @@ impl Instance {
         Ok(Instance { contract, wire })
     }
 
-    pub fn contract(&self) -> &Contract {
-        &self.contract
-    }
-
     /// 调用。三种情况**不会**到达实现：能力不在能力面、参数超内联上限、
     /// timeout 为零——它们返回 [`Rejection`]，不带失败类别。结果（成功或失败）
     /// 一律通过 `done` 交付，因为实现可能是异步的。

@@ -77,12 +77,6 @@ impl State {
             State::Failed => "failed",
         }
     }
-
-    /// Only a fully running service publishes its capability surface.
-    #[allow(dead_code)]
-    pub fn is_live(self) -> bool {
-        matches!(self, State::Running)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
