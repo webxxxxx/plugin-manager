@@ -13,7 +13,7 @@ Accepted（2026-11-18）。细化 [docs/architecture.md](../architecture.md) §5
 - **层 rank 允许 envelope 进内核，语义不允许。** `tools/arch-map.json` 里 platform 0 < wire 1 < kernel 2 < domain 3；`rpc::Response` 属 wire（rank 1），内核依赖它不违规（1 ≤ 2）——但那等于让内核认识 JSON-RPC。
 - **有一条现成的对称落点。** `problem_data`（`daemon.rs`）写 `{"kind": …}`，而对称的解码器 `Problem::from_error_data` 已在 `kernel/failure.rs`，被 `face/support.rs` 依赖。
 - **§7 的三条「真实反例」全部过时**（`node tools/dep-lint.mjs` = 0 违规）：`slot` 调 `mcp::tool_error` 已不存在（`grep -rn "crate::face" src/supervise src/manage src/kernel src/platform` 为空）；`transfer`（`manage/ops/transfer.rs`）已不依赖 `status`；`install` 调 `daemon::shutdown_quiet` 只剩 `main.rs` 里同一 rank 的调用。
-- **同一转换曾有两处实现。** `Status::live` 的 `epoch_secs` 带 `ms == 0 → None` 护栏；`daemon.rs` 的 `persist_states` 自己算一遍，没有护栏（#215 收掉写侧并把 `epoch_secs*` 改名 `anchored_secs*`；读侧的缺失回落见 #216）。
+- **同一转换曾有两处实现。** `Status::live` 的 `epoch_secs` 带 `ms == 0 → None` 护栏；`daemon.rs` 的 `persist_states` 自己算一遍，没有护栏（#215 收掉写侧并把 `epoch_secs*` 改名 `anchored_secs*`；读侧已由 #216 收掉）。
 - **「逐字节不变」这条验收今天不成立。** 没有任何测试逐字节比对 HTTP / MCP 的 JSON 响应，全是按 `Value` 键值断言；`serde_json` 未开 `preserve_order`（`Cargo.lock` 里没有 `indexmap`），所以线上 `Map` 是 `BTreeMap`（键按字母序），而 CLI `svc status --json` 走结构体声明序。
 
 > 本节的 `file:line` 口径：只写符号与文件名，不写行号——这些位置在 #209 / #210 / #211 / #212 落地后都动过。落地后的落点见下面这条。
@@ -28,7 +28,7 @@ Accepted（2026-11-18）。细化 [docs/architecture.md](../architecture.md) §5
 
 - **投影两分。** **值投影** = 领域值 → 面中立值形状的**纯函数**，归内核；**协议投影** = 面中立值 → 某协议报文，归该对外面。判据只有一条：输出里有没有某个协议的词（`inputSchema`、`nextCursor`、JSON-RPC 帧、HTTP 状态码）。
 - **第三类排除项：面级装饰。** `hasConfig` / `hasUI`（`face/api.rs`）这类字段可以在投影值之上追加，也可以读盘（`manage::plugin::web_assets`），但它不是投影，不进内核形状。
-- **`kernel/projection.rs` 的内容。** `Status` / `Summary` / `Details` + `Live` + `of` / `live` / `builtin` 与 `anchored_secs*`（#215 起 `pub(crate)`，写侧也调它）。只依赖 `kernel` 与 `platform`；不出现进程、socket、文件。
+- **`kernel/projection.rs` 的内容。** `Status` / `Summary` / `Details` + `Live` + `of` / `live` / `builtin` 与 `anchored_secs*` / `anchored_mono_ms`（#215 / #216 起 `pub(crate)`，写侧与接管也调它们）。只依赖 `kernel` 与 `platform`；不出现进程、socket、文件。
 - **`Live` 是 `Machine` 被投影读到的那 9 个字段。** 六态、pid、失败次数、`since_ms`、`ready_since_ms`、`next_at_ms`、最近退出码、不可杀标记、重启策略。时刻**只存单调毫秒**；`impl Machine { pub fn live(&self) -> Live }` 是纯字段拷贝、**不接收 `Now`**——锚定留在 `Status::live(service, &live, now)` 一处，跨层边界不传时间。`remain_after_exit` / `fail_after_stop` / `degraded` 不进：今天没有任何对外面读到它们。
 - **`problem_data` 进 `kernel/failure.rs`。** 它写 `{"kind": …}`，与已有的解码器对称；帧构造（`rpc::err_data`）仍留在面。
 - **MCP envelope 四函数进 `face/mcp_tools.rs`。** 组合根只做装配与分发；`face/mcp.rs` 保留桥客户端（`run_stdio` / `Bridge` / era 装饰）。这与 §5 早已写下的文件名对齐。
@@ -51,7 +51,7 @@ Accepted（2026-11-18）。细化 [docs/architecture.md](../architecture.md) §5
 
 - `daemon.rs` 不再 `use crate::cli::status`；组合根持对外面类型的反例消失（#212）。
 - `Slot::set_projector` 曾是「想象中的 seam」的现成反例：唯一注入点在组合根，而读它的 `Slot::project` 与 `CallSink::Client` 都标着 `#[cfg(test)]`，生产路径只走 `CallSink::Completion` → `projected_done`。**已由 #209 把那套机制连同 `CallSink` 枚举一起删掉**：槽的完成回调现在直接就是调用方给的 `ReplySink`。
-- `persist_states` 的重复换算**已由 #215 收掉**（写侧行为改动，带模块级测试）：它改吃 `Machine::live()`，锚定只走内核的 `anchored_secs`，`since_ms == 0` 不再落盘成伪造的 epoch 秒。`adopt_runtime` 在记录缺 `since` 时回落 `now` 是读侧的同型漏网，另开 **#216**。
+- `persist_states` 的重复换算**已由 #215 收掉**（写侧行为改动，带模块级测试）：它改吃 `Machine::live()`，锚定只走内核的 `anchored_secs`，`since_ms == 0` 不再落盘成伪造的 epoch 秒。`adopt_runtime` 的缺失回落**已由 #216 收掉**：反向换算走同一处的 `anchored_mono_ms`，缺 `since` 落到 `since_ms == 0`，投影为 `null`。
 - `face/mcp_tools.rs` 与 `kernel/projection.rs` 已登记进 `tools/arch-map.json`（#211 / #212）。
 - 词表新增「值投影」「协议投影」「运行面（Live）」三条；前两条由 #210 落地，第三条由 #213 补。
 - MCP 分页包与 auth 四键的重复**已修于 #210**：控制通道返回面中立值（分页用 `next`），由 MCP 面渲染 `nextCursor`；auth 四键从同一 `LanStatus` 渲染，并有一条跨面一致性测试。#213 负责把 §7 的这条反例换掉。
