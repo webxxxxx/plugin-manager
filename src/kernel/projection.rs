@@ -107,10 +107,10 @@ impl Status {
         let mut status = Status::of(service);
         status.summary.state = live.state;
         status.summary.pid = live.pid;
-        status.summary.since = epoch_secs(now, live.since_ms);
+        status.summary.since = anchored_secs(now, live.since_ms);
         status.details.last_exit = live.last_exit;
-        status.details.next_at = epoch_secs_opt(now, live.next_at_ms);
-        status.details.ready_since = epoch_secs_opt(now, live.ready_since_ms);
+        status.details.next_at = anchored_secs_opt(now, live.next_at_ms);
+        status.details.ready_since = anchored_secs_opt(now, live.ready_since_ms);
         status.details.failures = live.failures;
         status.details.restart = Some(live.restart.as_str().into());
         status.details.unkillable = live.unkillable;
@@ -129,17 +129,24 @@ impl Status {
     }
 }
 
-/// A monotonic stamp of `0` means "never happened"; anchoring it would produce a
-/// plausible-looking but wrong epoch second.
-fn epoch_secs(now: Now, ms: u64) -> Option<u64> {
+/// Anchor a monotonic supervisor stamp to epoch seconds; `0` means "never
+/// happened", so it stays [`None`] instead of becoming a plausible-looking but
+/// wrong epoch second.
+///
+/// This is the production's only implementation of that conversion. Both
+/// consumers call it: [`Status::live`] for the status projection and
+/// `daemon::persist_states` for the runtime record. Keeping the guard here is
+/// what makes the same fact (`one start`) produce the same `since` in
+/// `svc status` and `<data>/run/<id>.json`.
+pub(crate) fn anchored_secs(now: Now, ms: u64) -> Option<u64> {
     if ms == 0 {
         return None;
     }
     Some(now.epoch_of(ms))
 }
 
-fn epoch_secs_opt(now: Now, ms: Option<u64>) -> Option<u64> {
-    ms.and_then(|value| epoch_secs(now, value))
+pub(crate) fn anchored_secs_opt(now: Now, ms: Option<u64>) -> Option<u64> {
+    ms.and_then(|value| anchored_secs(now, value))
 }
 
 #[cfg(test)]

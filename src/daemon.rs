@@ -27,7 +27,7 @@ use crate::kernel::contract::{
     CapabilityName, Instance, Invocation, Launchers, ProgressToken, Reply, ReplySink,
 };
 use crate::kernel::failure::{Class, Failure, Problem, ProblemError, Retry};
-use crate::kernel::projection::Status;
+use crate::kernel::projection::{anchored_secs, anchored_secs_opt, Status};
 use crate::kernel::registry::{Hook, Kind, Registry, Service, State, RESERVED_ID};
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::manage::package;
@@ -871,10 +871,11 @@ impl Daemon {
     fn persist_states(&mut self, now: Now) {
         let boot = self.boot_id.clone();
         for id in self.slots.keys().cloned().collect::<Vec<_>>() {
-            let (state, pid, failures) = {
-                let machine = &self.slots[&id].machine;
-                (machine.state, machine.pid, machine.failures)
-            };
+            // Read the same facet the status projection reads, and anchor it
+            // with the kernel's one guarded conversion. A `since_ms` of 0 means
+            // "never started", so it must stay absent on disk too.
+            let live = self.slots[&id].machine.live();
+            let (state, pid, failures) = (live.state, live.pid, live.failures);
             if self.persisted.get(&id) == Some(&(state, pid, failures)) {
                 continue;
             }
@@ -883,23 +884,15 @@ impl Daemon {
                 self.persisted.remove(&id);
                 continue;
             }
-            let (since, ready_since, last_exit) = {
-                let machine = &self.slots[&id].machine;
-                (
-                    now.epoch_of(machine.since_ms),
-                    machine.ready_since_ms.map(|ms| now.epoch_of(ms)),
-                    machine.last_exit,
-                )
-            };
             let record = Record {
                 boot: boot.clone(),
                 state,
                 pid,
                 starttime: pid.and_then(crate::platform::host::process::start_time),
-                since: Some(since),
-                ready_since,
+                since: anchored_secs(now, live.since_ms),
+                ready_since: anchored_secs_opt(now, live.ready_since_ms),
                 failures,
-                last_exit,
+                last_exit: live.last_exit,
             };
             match runtime::save(&id, &record, &self.config.paths) {
                 Ok(()) => {
@@ -3956,6 +3949,50 @@ while ($null -ne [Console]::In.ReadLine()) { }
             daemon.registry.get("core").map(Service::carrier),
             Some(Ok(crate::kernel::registry::Carrier::Slot))
         );
+    }
+
+    /// One fact, one `since`: the runtime record anchors the same [`Live`]
+    /// facet, with the same guarded conversion, as `Status::live`. A slot that
+    /// never started has `since_ms == 0`, which must stay absent on disk
+    /// instead of becoming a plausible-looking but wrong epoch second.
+    ///
+    /// [`Live`]: crate::kernel::projection::Live
+    #[test]
+    fn the_runtime_record_anchors_since_like_the_status_projection() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut daemon = Daemon::new(
+            registry(vec![service("never", &[]), service("started", &[])]),
+            receiver,
+            None,
+        );
+        let now = Now::at(1_700_000_010_000, 1_700_000_010);
+        daemon
+            .slots
+            .get_mut("never")
+            .expect("never slot")
+            .machine
+            .state = State::Running;
+        let started = &mut daemon
+            .slots
+            .get_mut("started")
+            .expect("started slot")
+            .machine;
+        started.state = State::Running;
+        started.since_ms = 1_700_000_000_000;
+
+        daemon.persist_states(now);
+
+        let never = runtime::load("never", &daemon.config.paths).expect("never record");
+        assert_eq!(never.since, None, "a never-started slot must not anchor 0");
+
+        let recorded = runtime::load("started", &daemon.config.paths).expect("started record");
+        let service = daemon.registry.get("started").expect("started service");
+        let status = Status::live(service, &daemon.slots["started"].machine.live(), now);
+        assert_eq!(
+            recorded.since, status.summary.since,
+            "the record and the status projection must agree"
+        );
+        assert_eq!(recorded.since, Some(1_700_000_000));
     }
 
     #[test]
