@@ -4,6 +4,7 @@
 // printed, capped.
 //
 //   node tools/check.mjs quick            cargo check --all-targets
+//   node tools/check.mjs fmt              rustfmt --check on every src/ and tests/ file
 //   node tools/check.mjs no-default       cargo check --no-default-features --bin svcd
 //   node tools/check.mjs cross [target]   cargo check --target <target> --all-targets
 //   node tools/check.mjs test <filter>    cargo test <filter> --no-fail-fast -- --test-threads=1
@@ -21,8 +22,9 @@
 // lines instead of looking like a slow compile. Override with
 // `SVCD_CHECK_TIMEOUT_MS` while debugging.
 
+import { readdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -183,7 +185,7 @@ function reportCross(target, result) {
 }
 
 if (tier === "--help" || tier === "-h") {
-  console.log("usage: node tools/check.mjs quick|no-default|cross [target]|full|test <filter>");
+  console.log("usage: node tools/check.mjs quick|no-default|fmt|cross [target]|full|test <filter>");
   process.exit(0);
 }
 
@@ -200,6 +202,48 @@ if (tier === "quick") {
     console.log(failureTail(result));
   }
   process.exit(result.status ?? 1);
+}
+
+/// Every Rust source the fmt gate covers.
+function rustSources() {
+  const out = [];
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith(".rs")) {
+        out.push(relative(REPO, full).split("\\").join("/"));
+      }
+    }
+  };
+  walk(join(REPO, "src"));
+  walk(join(REPO, "tests"));
+  return out.sort();
+}
+
+if (tier === "fmt") {
+  const files = rustSources();
+  console.log(`check: running rustfmt --check on ${files.length} files`);
+  const result = spawnSync(process.execPath, [join(HERE, "fmt.mjs"), "--check", ...files], {
+    cwd: REPO,
+    encoding: "utf8",
+    timeout: COMPILE_TIMEOUT_MS,
+  });
+  if (result.error && result.error.code !== "ETIMEDOUT") {
+    console.error("check: cannot run fmt.mjs: " + result.error.message);
+    process.exit(2);
+  }
+  if (timedOut(result)) {
+    reportTimeout(result);
+    process.exit(124);
+  }
+  if (result.status === 0) {
+    console.log(`check: ok (fmt; ${files.length} files)`);
+    process.exit(0);
+  }
+  console.log("check: FAILED (fmt)");
+  console.log(failureTail(result));
+  process.exit(1);
 }
 
 if (tier === "no-default") {
