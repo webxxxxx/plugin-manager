@@ -71,6 +71,14 @@ _Avoid_: 全局配置、配置单例、settings（那是 `svcd.conf` 的解析�
 由平台默认、`SVCD_*` 覆盖与 `svcd.conf` 的 `config_dir`/`install_dir` 解析出的一组绝对目录（config / data / logs / plugins / run / temp / trust）。生产在启动时解析一次；测试从一个临时根派生同一组结构，不读进程环境。
 _Avoid_: 路径工具、路径常量
 
+**日志行（Log line）**:
+`<logs>` 里的一行，固定为「时间戳 级别 来源 消息」；来源只有 `svcd`、`plugin:<id>`、`hook:<id>`、`stats` 四种。`svc logs`、HTTP 与控制台都按这一行的形状过滤和显示。
+_Avoid_: 日志记录、log event（会与结构化事件混淆）
+
+**日志级别（Log level）**:
+日志行的第二列，取 `ERROR`/`WARN`/`INFO`/`DEBUG`/`TRACE` 之一；默认 `INFO`，低于阈值的行在写侧就被丢弃、不落盘。
+_Avoid_: 优先级、verbosity
+
 **manual 安装**:
 `svcd --install --manual`：不注册 init 服务，按宿主系统生成 `svcd_daemon.sh`（Unix）或 `svcd_daemon.bat`（Windows），脚本导出 `PATH`、`SVCD_DATA_DIR`、`SVCD_LOG_DIR` 后启动 svcd；启动接入与手动运行时的环境变量由用户负责。
 _Avoid_: 无服务模式（那是 `--no-service`）
