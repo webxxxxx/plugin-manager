@@ -349,6 +349,7 @@
     "src/supervise/check/backoff.rs": "supervisor",
     "src/supervise/check/restart.rs": "supervisor",
     "src/manage/model/manifest.rs": "package",
-    "src/manage/model/ustar.rs": "package"
+    "src/manage/model/ustar.rs": "package",
+    "src/manage/check/verify.rs": "package"
   }
 }
