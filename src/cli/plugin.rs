@@ -17,7 +17,7 @@ use crate::manage::package;
 use crate::manage::plugin;
 use crate::kernel::registry::Kind;
 use crate::cli::status::{self, Status};
-use crate::manage::transfer;
+use crate::manage::ops::transfer;
 
 const EXIT_OK: i32 = 0;
 const EXIT_SERVICE_ERROR: i32 = 1;
@@ -80,7 +80,7 @@ enum Command {
         no_config: bool,
         force: bool,
     },
-    Bundle(crate::manage::bundle::Options),
+    Bundle(crate::manage::ops::bundle::Options),
 }
 
 pub fn run(args: Vec<String>) -> i32 {
@@ -496,7 +496,7 @@ fn parse(args: &[String]) -> Result<Command, ()> {
                 index += 1;
             }
             dir.map(|dir| {
-                Command::Bundle(crate::manage::bundle::Options {
+                Command::Bundle(crate::manage::ops::bundle::Options {
                     dir,
                     out,
                     key,
@@ -970,8 +970,8 @@ fn import(
     }
 }
 
-fn bundle_command(options: crate::manage::bundle::Options) -> i32 {
-    match crate::manage::bundle::bundle(&options) {
+fn bundle_command(options: crate::manage::ops::bundle::Options) -> i32 {
+    match crate::manage::ops::bundle::bundle(&options) {
         Ok(path) => {
             println!("{}", path.display());
             EXIT_OK
@@ -1083,7 +1083,7 @@ mod tests {
                 "--platform=aarch64-unknown-linux-musl"
             ]))
             .expect("bundle"),
-            Command::Bundle(crate::manage::bundle::Options {
+            Command::Bundle(crate::manage::ops::bundle::Options {
                 dir: PathBuf::from("src"),
                 key: Some(PathBuf::from("key.pem")),
                 compat: vec!["sr6110".into(), "sr1010".into()],
@@ -1095,7 +1095,7 @@ mod tests {
         assert!(parse(&args(&["bundle", "src", "--platform"])).is_err());
         assert_eq!(
             parse(&args(&["bundle", "src", "--unsigned"])).expect("unsigned bundle"),
-            Command::Bundle(crate::manage::bundle::Options {
+            Command::Bundle(crate::manage::ops::bundle::Options {
                 dir: PathBuf::from("src"),
                 unsigned: true,
                 ..Default::default()
@@ -1245,7 +1245,7 @@ mod tests {
                 "test"
             ]))
             .expect("bundle"),
-            Command::Bundle(crate::manage::bundle::Options {
+            Command::Bundle(crate::manage::ops::bundle::Options {
                 dir: PathBuf::from("samples/demo"),
                 out: Some(PathBuf::from("out.spk")),
                 key: Some(PathBuf::from("key.pem")),
@@ -1277,7 +1277,7 @@ mod tests {
                 "--interpreter-arg=-e"
             ]))
             .expect("script bundle"),
-            Command::Bundle(crate::manage::bundle::Options {
+            Command::Bundle(crate::manage::ops::bundle::Options {
                 dir: PathBuf::from("samples/demo"),
                 out: None,
                 key: Some(PathBuf::from("key.pem")),

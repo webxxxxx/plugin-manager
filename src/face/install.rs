@@ -28,7 +28,7 @@ use crate::server::http::{
     BlockingOutcome, CloseReason, Exchange, OutBuffer, StreamAction, StreamClass, StreamEvent,
     StreamHandler, StreamStep,
 };
-use crate::manage::transfer;
+use crate::manage::ops::transfer;
 
 use super::support::{self, CallBudget};
 
