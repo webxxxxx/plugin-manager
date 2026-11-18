@@ -80,7 +80,15 @@ function checkTicket(ticket, force) {
       return;
     }
     if (force) {
-      console.log("worktree-add: ticket #" + ticket + " not found (--force)");
+      console.log("worktree-add: ticket check skipped (--force)");
+      return;
+    }
+    // Only an authoritative "no such issue" answer blocks. A network / TLS /
+    // auth failure must not brick the tool: warn and let the caller proceed.
+    const detail = (error.stderr ?? "").toString().trim().split("\n")[0] || "gh failed";
+    const missing = /could not resolve|not found|http 404/i.test(detail);
+    if (!missing) {
+      console.log("worktree-add: warning: ticket #" + ticket + " not checked (" + detail + ")");
       return;
     }
     fail(
