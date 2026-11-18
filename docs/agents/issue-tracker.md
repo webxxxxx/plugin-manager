@@ -20,6 +20,36 @@ Infer the repo from `git remote -v`; `gh` does this automatically when run insid
 
 File issues only into the user's own repo. Never file into `mattpocock/skills` (the repo these skills come from) unless the user owns it. In a fork, `gh` can default to the upstream parent, so before the first `gh issue create` of a session, check the target with `gh repo view --json nameWithOwner` and confirm it with the user if it is not their repo.
 
+## 收口报告
+
+实现票关闭前，正文里补齐这四节。格式固定，不要拿旧票的全文当模板抄：
+
+```markdown
+## 实现记录（YYYY-MM-DD）
+
+- 改了什么（文件 + 符号）、为什么这样切；行为变了列对照，没变就写没变
+- 评审判断项里没做的，写「不修 + 理由」
+
+### 验证
+
+- Windows：`node tools/check.mjs full` 每个 target 的计数
+- Linux：`node tools/check.mjs linux` 每个 target 的计数
+- `node tools/dep-lint.mjs`、`node tools/check.mjs fmt` 的结果
+- 合并 sha、推送状态、worktree 清理
+
+## Handoff
+
+| 项 | 目标票 | 关闭前核对 |
+
+### code-review 判断项
+
+| 项 | 处置 | 理由 |
+
+## 进度
+```
+
+`## 进度` 由 deck 工具写（`deck_issue_patch` 的 `progress`），不要手改。报告写进正文而不是评论：正文是下一个人读的。
+
 ## Pull requests as a triage surface
 
 **PRs as a request surface: no.** _(Set to `yes` if this repo treats external PRs as feature requests; `/triage` reads this flag.)_
