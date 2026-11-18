@@ -32,10 +32,13 @@ const REPO = resolve(HERE, "..");
 const COMPILE_TIMEOUT_MS = Number(process.env.SVCD_CHECK_TIMEOUT_MS) || 10 * 60 * 1000;
 const TEST_TIMEOUT_MS = Number(process.env.SVCD_CHECK_TIMEOUT_MS) || 20 * 60 * 1000;
 
-/// `no-default` 的警告预算，棘轮语义：只许降不许升。基线是恢复
-/// `server/auth/lan.rs` 的 `cfg_attr(allow(dead_code))` 之后的真实计数（#194）。
-/// rustc 升级让计数变化时，先判断新警告是否合理，再改这个数。
-const NO_DEFAULT_WARNING_BUDGET = 36;
+/// `no-default` 的警告预算，棘轮语义：只许降不许升。两个值都是恢复
+/// `server/auth/lan.rs` 的 `cfg_attr(allow(dead_code))` 之后的实测基线（#194/#201）：
+/// Windows 36、Linux 35（`cfg(unix)` 那半的 dead_code 计数不同）。rustc 升级让计数
+/// 变化时，先跑 `cargo check --no-default-features --message-format short | grep -c ': warning:'`
+/// 判断新警告是否合理，再改这个数；`SVCD_NO_DEFAULT_BUDGET` 可临时覆盖（调试用）。
+const NO_DEFAULT_WARNING_BUDGET = Number(process.env.SVCD_NO_DEFAULT_BUDGET) ||
+  (process.platform === "win32" ? 36 : 35);
 
 function cargo(args, timeoutMs) {
   const started = Date.now();
