@@ -59,6 +59,10 @@ _Avoid_: lan-token、管理员 token
 **config_dir**:
 `svcd.conf` 里的配置目录覆盖项；`svcd.conf`、`trust.d` 都放在这里。默认 Linux `/etc/svcd`、Windows `%USERPROFILE%\.svcd`；`SVCD_CONFIG_DIR` 优先级更高。
 
+**安装计划（Install plan）**:
+一组有序的宿主操作（写文件、跑命令、改 PATH）加上由它生成的服务定义文本；`--dry-run` 打印的和实际执行的是同一份。计划是输入的纯函数：同一份布局、探测结果与请求，输出逐字节相同；读环境、探文件、发命令都在执行侧。
+_Avoid_: 安装步骤脚本（计划不是脚本，由执行器逐条施加）
+
 **install_dir**:
 `svcd.conf` 里记录的安装根：`svcd --install --prefix <dir>` 会把 `<dir>` 写回这里；之后不带 `--prefix` 的重装、运行时 data/logs 的默认值（`<install_dir>/data`、`<install_dir>/logs`）和 `--uninstall` 的清理都以它为准。手工写在 conf 里也有效，`--prefix` 优先于它；未记录时走平台默认。
 _Avoid_: 安装前缀（那是命令行 `--prefix`）、数据目录

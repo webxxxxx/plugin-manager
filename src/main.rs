@@ -17,7 +17,7 @@ fn main() {
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
     {
-        selfinstall::install::wait_for_process(pid);
+        selfinstall::wait_for_process(pid);
     }
     let arg0 = std::env::args().next().unwrap_or_default();
     // Installed entries are hardlinks/symlinks named `svc`, `plugin`, `mcp`
@@ -37,7 +37,7 @@ fn main() {
                 args.insert(0, "--uninstall".into());
             }
             // The first element is the dispatch word, not part of the flags.
-            selfinstall::install::self_uninstall(&args[1..], &stop_daemon)
+            selfinstall::self_uninstall(&args[1..], &stop_daemon)
         }
         _ => svcd_run(std::env::args().skip(1).collect()),
     };
@@ -48,12 +48,12 @@ fn svcd_run(args: Vec<String>) -> i32 {
     match args.first().map(String::as_str) {
         Some("run") => run_command(&args[1..]),
         Some("shutdown") if args.len() == 1 => daemon::shutdown(),
-        Some("--install") | Some("install") => selfinstall::install::self_install(&args[1..]),
+        Some("--install") | Some("install") => selfinstall::self_install(&args[1..]),
         Some("--uninstall") | Some("uninstall") => {
-            selfinstall::install::self_uninstall(&args[1..], &stop_daemon)
+            selfinstall::self_uninstall(&args[1..], &stop_daemon)
         }
-        Some("install-service") => selfinstall::install::install_service(&args[1..]),
-        Some("uninstall-service") => selfinstall::install::uninstall_service(&args[1..]),
+        Some("install-service") => selfinstall::install_service(&args[1..]),
+        Some("uninstall-service") => selfinstall::uninstall_service(&args[1..]),
         Some("start") => start_command(),
         Some("stop") => stop_command(),
         Some("status") => status_command(),
@@ -143,7 +143,7 @@ fn start_command() -> i32 {
             None => 1,
         }
     } else {
-        crate::selfinstall::install::service_start()
+        crate::selfinstall::service_start()
     }
 }
 
@@ -151,7 +151,7 @@ fn stop_command() -> i32 {
     if crate::platform::paths::user_mode() {
         crate::daemon::shutdown()
     } else {
-        crate::selfinstall::install::service_stop()
+        crate::selfinstall::service_stop()
     }
 }
 
@@ -162,7 +162,7 @@ fn status_command() -> i32 {
             None => 1,
         }
     } else {
-        crate::selfinstall::install::service_status()
+        crate::selfinstall::service_status()
     }
 }
 
@@ -307,7 +307,7 @@ fn user_status(config: &crate::platform::config::Config) -> i32 {
 }
 
 fn user_install() -> i32 {
-    crate::selfinstall::install::self_install(&[])
+    crate::selfinstall::self_install(&[])
 }
 
 fn usage() {
