@@ -1373,9 +1373,13 @@ impl Daemon {
                 };
                 ProblemError::new(problem, error.to_string())
             })?;
+        // The control channel carries a face-neutral page; the MCP face renders
+        // the protocol field `nextCursor` (ADR-0025: protocol projection is the
+        // face's job). Keep `next` neutral here so the composition root never
+        // spells an MCP key.
         let mut result = json!({ "tools": page.tools });
         if let Some(cursor) = page.next_cursor {
-            result["nextCursor"] = json!(cursor);
+            result["next"] = json!(cursor);
         }
         Ok(result)
     }
@@ -3734,7 +3738,7 @@ while ($null -ne [Console]::In.ReadLine()) { }
                     <= crate::wire::message::ipc::CATALOG_PAGE_MAX
             );
             total += tools.len();
-            cursor = page["nextCursor"].as_str().map(str::to_string);
+            cursor = page["next"].as_str().map(str::to_string);
             if cursor.is_none() {
                 break;
             }
@@ -3754,16 +3758,17 @@ while ($null -ne [Console]::In.ReadLine()) { }
 
         let first = daemon.tools_page(&json!({"limit": 2})).expect("first page");
         assert_eq!(first["tools"].as_array().expect("tools").len(), 2);
-        let cursor = first["nextCursor"]
-            .as_str()
-            .expect("next cursor")
-            .to_string();
+        assert!(
+            first.get("nextCursor").is_none(),
+            "the control result must not use the MCP field name: {first}"
+        );
+        let cursor = first["next"].as_str().expect("next cursor").to_string();
 
         let second = daemon
             .tools_page(&json!({"limit": 2, "cursor": cursor}))
             .expect("second page");
         assert_eq!(second["tools"].as_array().expect("tools").len(), 1);
-        assert!(second.get("nextCursor").is_none());
+        assert!(second.get("next").is_none());
 
         let stale = daemon
             .tools_page(&json!({"limit": 2, "cursor": "bm90LWEtY3Vyc29y"}))
