@@ -353,6 +353,8 @@
     "src/manage/check/verify.rs": "package",
     "src/manage/ops/install.rs": "package",
     "src/manage/ops/export.rs": "package",
-    "src/manage/ops/scan.rs": "plugin"
+    "src/manage/ops/scan.rs": "plugin",
+    "src/manage/model/layout.rs": "plugin",
+    "src/manage/ops/config.rs": "plugin"
   }
 }
