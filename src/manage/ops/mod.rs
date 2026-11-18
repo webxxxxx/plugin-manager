@@ -4,3 +4,4 @@ pub mod bundle;
 pub mod transfer;
 pub mod export;
 pub mod install;
+pub mod scan;
