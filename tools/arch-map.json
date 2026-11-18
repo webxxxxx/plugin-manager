@@ -188,7 +188,7 @@
     "blob": {
       "concept": "storage",
       "layer": "domain",
-      "note": "内容寻址存储：meta/path/upload/part/gc 五拆（#174）；face 只认 storage 的公开 API"
+      "note": "内容寻址存储：meta/path/upload/part/gc 五拆（#175）；face 只认 storage 的公开 API"
     },
     "builtin_adapter": {
       "concept": "supervise/builtin",
