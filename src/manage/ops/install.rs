@@ -19,8 +19,9 @@ use crate::manage::package::{check_path, hex_bytes, MAX_FILES};
 
 impl Package {
     pub fn write_to(&self, root: &Path) -> Result<(), ProblemError> {
-        fs::create_dir_all(root)
-            .map_err(|error| Problem::Internal.error(format!("create {}: {}", root.display(), error)))?;
+        fs::create_dir_all(root).map_err(|error| {
+            Problem::Internal.error(format!("create {}: {}", root.display(), error))
+        })?;
         write_one(&root.join("manifest.json"), &self.manifest_bytes, 0o644)?;
         // An insecure install may have arrived without a signature; keep the
         // version directory honest instead of writing an empty signature file.
@@ -30,8 +31,9 @@ impl Package {
         for file in &self.files {
             let path = root.join(&file.path);
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| Problem::Internal.error(format!("create {}: {}", parent.display(), error)))?;
+                fs::create_dir_all(parent).map_err(|error| {
+                    Problem::Internal.error(format!("create {}: {}", parent.display(), error))
+                })?;
             }
             write_one(&path, &file.data, file.mode)?;
         }
@@ -180,12 +182,18 @@ impl SpkSink {
             return Ok(());
         }
         if self.staging.exists() {
-            fs::remove_dir_all(&self.staging)
-                .map_err(|error| Problem::Internal.error(format!("remove {}: {}", self.staging.display(), error)))?;
+            fs::remove_dir_all(&self.staging).map_err(|error| {
+                Problem::Internal.error(format!("remove {}: {}", self.staging.display(), error))
+            })?;
         }
-        fs::create_dir_all(&self.staging)
-            .map_err(|error| Problem::Internal.error(format!("create {}: {}", self.staging.display(), error)))?;
-        write_one(&self.staging.join("manifest.json"), &self.manifest_bytes, 0o644)?;
+        fs::create_dir_all(&self.staging).map_err(|error| {
+            Problem::Internal.error(format!("create {}: {}", self.staging.display(), error))
+        })?;
+        write_one(
+            &self.staging.join("manifest.json"),
+            &self.manifest_bytes,
+            0o644,
+        )?;
         if !self.signature_bytes.is_empty() {
             write_one(
                 &self.staging.join("signature.json"),
@@ -206,7 +214,9 @@ impl SpkSink {
         let declared = self
             .declared
             .get(&entry.path)
-            .ok_or_else(|| Problem::Invalid.error(format!("file is not declared in files[]: {}", entry.path)))?
+            .ok_or_else(|| {
+                Problem::Invalid.error(format!("file is not declared in files[]: {}", entry.path))
+            })?
             .clone();
         if !self.seen.insert(entry.path.clone()) {
             return Err(Problem::Invalid.error(format!("duplicate tar entry: {}", entry.path)));
@@ -223,11 +233,13 @@ impl SpkSink {
         self.prepare_staging()?;
         let path = self.staging.join(&entry.path);
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| Problem::Internal.error(format!("create {}: {}", parent.display(), error)))?;
+            fs::create_dir_all(parent).map_err(|error| {
+                Problem::Internal.error(format!("create {}: {}", parent.display(), error))
+            })?;
         }
-        let file =
-            File::create(&path).map_err(|error| Problem::Internal.error(format!("create {}: {}", path.display(), error)))?;
+        let file = File::create(&path).map_err(|error| {
+            Problem::Internal.error(format!("create {}: {}", path.display(), error))
+        })?;
         self.current = Some(Current::Payload {
             file,
             hasher: Sha256::new(),
@@ -322,8 +334,9 @@ impl TarSink for SpkSink {
                 written,
                 ..
             }) => {
-                file.write_all(data)
-                    .map_err(|error| Problem::Internal.error(format!("write {}: {}", path.display(), error)))?;
+                file.write_all(data).map_err(|error| {
+                    Problem::Internal.error(format!("write {}: {}", path.display(), error))
+                })?;
                 hasher.update(data);
                 *written = written.saturating_add(data.len() as u64);
                 Ok(())
@@ -352,13 +365,16 @@ impl TarSink for SpkSink {
                 for entry in &manifest.files {
                     check_path(&entry.path)?;
                     if entry.path == "manifest.json" || entry.path == "signature.json" {
-                        return Err(Problem::Invalid.error("manifest.json/signature.json cannot be in files[]"));
+                        return Err(Problem::Invalid
+                            .error("manifest.json/signature.json cannot be in files[]"));
                     }
                     if declared.insert(entry.path.clone(), entry.clone()).is_some() {
-                        return Err(Problem::Invalid.error(format!("duplicate files[] entry: {}", entry.path)));
+                        return Err(Problem::Invalid
+                            .error(format!("duplicate files[] entry: {}", entry.path)));
                     }
                     if entry.mode & 0o6000 != 0 {
-                        return Err(Problem::Invalid.error(format!("setuid/setgid is not allowed: {}", entry.path)));
+                        return Err(Problem::Invalid
+                            .error(format!("setuid/setgid is not allowed: {}", entry.path)));
                     }
                     if declared.len() > MAX_FILES {
                         return Err(Problem::TooLarge.error("too many files"));
@@ -404,14 +420,19 @@ impl TarSink for SpkSink {
                 written,
             } => {
                 if written != declared.size {
-                    return Err(Problem::Invalid.error(format!("size mismatch for {}", declared.path)));
+                    return Err(
+                        Problem::Invalid.error(format!("size mismatch for {}", declared.path))
+                    );
                 }
                 let digest = hex_bytes(&hasher.finalize());
                 if digest != declared.sha256 {
-                    return Err(Problem::Invalid.error(format!("sha256 mismatch for {}", declared.path)));
+                    return Err(
+                        Problem::Invalid.error(format!("sha256 mismatch for {}", declared.path))
+                    );
                 }
-                file.sync_all()
-                    .map_err(|error| Problem::Internal.error(format!("sync {}: {}", path.display(), error)))?;
+                file.sync_all().map_err(|error| {
+                    Problem::Internal.error(format!("sync {}: {}", path.display(), error))
+                })?;
                 set_mode(&path, declared.mode)?;
                 Ok(())
             }
@@ -435,8 +456,8 @@ pub fn validate_staged_payload(manifest: &Manifest, root: &Path) -> Result<(), P
     }
     let mut files: Vec<(&str, Vec<u8>)> = Vec::new();
     for path in executables {
-        let data =
-            fs::read(root.join(path)).map_err(|error| Problem::Internal.error(format!("read {}: {}", path, error)))?;
+        let data = fs::read(root.join(path))
+            .map_err(|error| Problem::Internal.error(format!("read {}: {}", path, error)))?;
         files.push((path, data.into_iter().take(8).collect()));
     }
     let borrowed: Vec<(&str, &[u8])> = files
@@ -460,8 +481,9 @@ pub fn validate_staged_payload(manifest: &Manifest, root: &Path) -> Result<(), P
         .into_iter()
         .flatten()
         {
-            let data = fs::read(root.join(path))
-                .map_err(|error| Problem::Internal.error(format!("read hook {}: {}", path, error)))?;
+            let data = fs::read(root.join(path)).map_err(|error| {
+                Problem::Internal.error(format!("read hook {}: {}", path, error))
+            })?;
             hooks.push(FileData {
                 path: path.to_string(),
                 data,
@@ -482,8 +504,9 @@ pub fn load_staged(
     trust_dir: &Path,
 ) -> Result<StagedPackage, ProblemError> {
     let manifest_path = root.join("manifest.json");
-    let manifest_bytes = fs::read(&manifest_path)
-        .map_err(|error| Problem::Internal.error(format!("read {}: {}", manifest_path.display(), error)))?;
+    let manifest_bytes = fs::read(&manifest_path).map_err(|error| {
+        Problem::Internal.error(format!("read {}: {}", manifest_path.display(), error))
+    })?;
     let manifest = parse_manifest(&manifest_bytes)?;
     validate_manifest(&manifest)?;
     if manifest.platform != crate::platform::target() {
@@ -503,7 +526,9 @@ pub fn load_staged(
             return Err(Problem::Invalid.error(format!("duplicate files[] entry: {}", entry.path)));
         }
         if entry.mode & 0o6000 != 0 {
-            return Err(Problem::Invalid.error(format!("setuid/setgid is not allowed: {}", entry.path)));
+            return Err(
+                Problem::Invalid.error(format!("setuid/setgid is not allowed: {}", entry.path))
+            );
         }
     }
     check_manifest_paths(&manifest)?;
@@ -513,7 +538,13 @@ pub fn load_staged(
     let signature_bytes = match fs::read(&signature_path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(Problem::Internal.error(format!("read {}: {}", signature_path.display(), error))),
+        Err(error) => {
+            return Err(Problem::Internal.error(format!(
+                "read {}: {}",
+                signature_path.display(),
+                error
+            )))
+        }
     };
     let signature_verified = if signature_bytes.is_empty() {
         if !allow_insecure {
@@ -558,8 +589,9 @@ pub fn load_staged(
 }
 
 fn write_one(path: &Path, data: &[u8], mode: u32) -> Result<(), ProblemError> {
-    let mut handle =
-        File::create(path).map_err(|error| Problem::Internal.error(format!("create {}: {}", path.display(), error)))?;
+    let mut handle = File::create(path).map_err(|error| {
+        Problem::Internal.error(format!("create {}: {}", path.display(), error))
+    })?;
     handle
         .write_all(data)
         .map_err(|error| Problem::Internal.error(format!("write {}: {}", path.display(), error)))?;

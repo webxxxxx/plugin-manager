@@ -1,10 +1,10 @@
 //! 插件配置：读模板、校验候选、原子替换与跨进程锁。
 
 use std::fs::{self, OpenOptions};
-use std::time::{Duration, Instant};
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::manage::model::layout::{current_version, plugin_dir};

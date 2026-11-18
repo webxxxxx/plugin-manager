@@ -259,8 +259,8 @@ fn delegated_violations(make: &impl Fn() -> Instance) -> Vec<String> {
         let mut instance = make();
         match instance.lifecycle(control) {
             Err(CallError::Failed(failure))
-                if failure.class == Class::ImplementationError
-                    && failure.retry == Retry::Never => {}
+                if failure.class == Class::ImplementationError && failure.retry == Retry::Never => {
+            }
             other => violations.push(format!(
                 "a delegating adapter must reject {name} with implementation_error/never: {other:?}"
             )),

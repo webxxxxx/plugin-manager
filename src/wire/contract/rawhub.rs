@@ -25,9 +25,9 @@ use std::thread;
 #[cfg(unix)]
 use std::sync::Weak;
 
-use crate::wire::message::ipc::{RawFailure, RawStopSink};
 use crate::platform::log::LogSink;
 use crate::wire::contract::stdio::{self, ReadEnd, Streams, WriteEnd};
+use crate::wire::message::ipc::{RawFailure, RawStopSink};
 
 pub const HEADER: usize = 8;
 const SUBSCRIBER_QUEUE: usize = 4;

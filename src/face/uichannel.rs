@@ -174,7 +174,10 @@ impl EventBus {
         })
     }
 
-    fn reserve_subscriber(&self, limits: &crate::platform::limits::Limits) -> Result<(), SubscribeError> {
+    fn reserve_subscriber(
+        &self,
+        limits: &crate::platform::limits::Limits,
+    ) -> Result<(), SubscribeError> {
         let max = limits.max_subscriptions;
         let mut current = self.total_subscribers.load(Ordering::SeqCst);
         loop {

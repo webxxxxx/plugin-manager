@@ -19,12 +19,12 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::wire::control::channel::ProgressEvent;
-use crate::wire::message::rpc;
 use crate::server::http::{
     CloseReason, OutBuffer, StreamAction, StreamClass, StreamEvent, StreamHandler, StreamStep,
 };
 use crate::server::mcp::result::finish_modern_tool_call;
+use crate::wire::control::channel::ProgressEvent;
+use crate::wire::message::rpc;
 
 /// The bound on progress events between the reactor and one stream. The old
 /// `start_mcp_sse` used the same 64-slot channel; the count did not change.

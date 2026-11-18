@@ -10,28 +10,28 @@ use std::path::PathBuf;
 use std::process::Command;
 
 #[cfg(test)]
-use crate::manage::package;
-#[cfg(test)]
-use crate::manage::model::manifest::Package;
-#[cfg(test)]
-use crate::platform::paths::Paths;
+use crate::kernel::contract::Effect;
 #[cfg(test)]
 use crate::kernel::registry::Interpreter;
 #[cfg(test)]
 use crate::kernel::registry::Ready;
 #[cfg(test)]
-use crate::kernel::contract::Effect;
+use crate::manage::model::manifest::Package;
+#[cfg(test)]
+use crate::manage::package;
+#[cfg(test)]
+use crate::platform::paths::Paths;
 
-pub use crate::manage::ops::scan::*;
-pub use crate::manage::model::layout::*;
-pub use crate::manage::ops::config::*;
-pub use crate::manage::ops::install_plugin::*;
-pub use crate::manage::check::plugin::*;
-pub use crate::manage::ops::export_plugin::*;
-pub use crate::manage::ops::uninstall::*;
-pub(crate) use crate::manage::ops::config::config_lock;
 #[cfg(test)]
 use crate::kernel::failure::Problem;
+pub use crate::manage::check::plugin::*;
+pub use crate::manage::model::layout::*;
+pub(crate) use crate::manage::ops::config::config_lock;
+pub use crate::manage::ops::config::*;
+pub use crate::manage::ops::export_plugin::*;
+pub use crate::manage::ops::install_plugin::*;
+pub use crate::manage::ops::scan::*;
+pub use crate::manage::ops::uninstall::*;
 
 #[cfg(windows)]
 fn check_command(program: &Path) -> Command {

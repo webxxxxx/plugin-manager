@@ -11,9 +11,9 @@ use std::time::Instant;
 
 use serde_json::Value;
 
-use crate::server::http::model as http;
-use crate::server::auth::lan::AuthKind;
 use crate::platform::log;
+use crate::server::auth::lan::AuthKind;
+use crate::server::http::model as http;
 
 use super::pool::CancelToken;
 
@@ -454,7 +454,9 @@ mod tests {
                 "PUT /x HTTP/1.1\r\nHost: x\r\n{}Content-Length: 4\r\n\r\n",
                 expect
             );
-            crate::server::http::model::parse_head(raw.as_bytes()).expect("head").0
+            crate::server::http::model::parse_head(raw.as_bytes())
+                .expect("head")
+                .0
         };
         let framing = crate::server::http::model::Framing::Length(4);
 

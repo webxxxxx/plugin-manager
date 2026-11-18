@@ -6,7 +6,6 @@
 //! `mcp::serve_modern`, the same code the stdio bridge uses). There is no
 //! session and no SSE: every request is one POST answered with one JSON object.
 
-
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde_json::{json, Value};

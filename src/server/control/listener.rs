@@ -13,11 +13,11 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::kernel::failure::Problem;
+use crate::platform::host::wake::Wake;
 use crate::wire::control::channel::{Endpoint, Notify, PendingCall, Reply};
 use crate::wire::message::ipc;
-use crate::kernel::failure::Problem;
 use crate::wire::message::rpc;
-use crate::platform::host::wake::Wake;
 
 /// One poll source owned by the control server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,9 +378,8 @@ mod tests {
         let (notify_tx, _notify_rx) = UnixStream::pair().expect("notify");
         let notify_tx = Arc::new(notify_tx);
         let (tx, rx) = mpsc::sync_channel::<PendingCall>(8);
-        let mut server =
-            ControlServer::new(listener, admin, tx, Arc::new(Wake::new()), notify_tx)
-                .expect("server");
+        let mut server = ControlServer::new(listener, admin, tx, Arc::new(Wake::new()), notify_tx)
+            .expect("server");
         let supervisor = std::thread::spawn(move || {
             for call in rx {
                 let value: serde_json::Value = serde_json::from_str(&call.line).expect("request");
@@ -476,9 +475,8 @@ mod tests {
         let (notify_tx, _notify_rx) = UnixStream::pair().expect("notify");
         let notify_tx = Arc::new(notify_tx);
         let (tx, rx) = mpsc::sync_channel::<PendingCall>(8);
-        let mut server =
-            ControlServer::new(listener, admin, tx, Arc::new(Wake::new()), notify_tx)
-                .expect("server");
+        let mut server = ControlServer::new(listener, admin, tx, Arc::new(Wake::new()), notify_tx)
+            .expect("server");
         let (queued_tx, queued_rx) = mpsc::channel();
         std::thread::spawn(move || {
             for call in rx {

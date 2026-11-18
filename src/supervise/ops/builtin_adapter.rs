@@ -136,11 +136,7 @@ mod tests {
     }
 
     fn normal() -> Instance {
-        Instance::new(
-            contract(),
-            Box::new(BuiltinWire::new(contract())),
-        )
-        .expect("valid contract")
+        Instance::new(contract(), Box::new(BuiltinWire::new(contract()))).expect("valid contract")
     }
 
     fn failing(class: Class) -> Instance {
@@ -160,10 +156,13 @@ mod tests {
     fn the_svc_tag_is_registered_at_the_test_assembly_point() {
         let mut launchers = crate::kernel::contract::Launchers::default();
         launchers.register("builtin", Box::new(BuiltinLauncher));
-        match launchers.launch(contract(), &ImplRef {
-            tag: "builtin".into(),
-            binding: json!({ "service": "svc" }),
-        }) {
+        match launchers.launch(
+            contract(),
+            &ImplRef {
+                tag: "builtin".into(),
+                binding: json!({ "service": "svc" }),
+            },
+        ) {
             Ok(_) => {}
             Err(error) => panic!("the builtin tag must launch: {error:?}"),
         }

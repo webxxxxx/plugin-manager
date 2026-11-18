@@ -343,7 +343,11 @@ mod tests {
     fn a_consistent_retry_is_kept_verbatim() {
         let custom = Retry::After(Duration::from_secs(7));
         let failure = Failure::new(Class::NotRunning, custom, "");
-        assert_eq!(retry_of(&failure), custom, "same shape, keep the caller's backoff");
+        assert_eq!(
+            retry_of(&failure),
+            custom,
+            "same shape, keep the caller's backoff"
+        );
 
         let immediate = Failure::new(Class::NotRunning, Retry::Now, "");
         assert_eq!(retry_of(&immediate), Retry::Now);
@@ -442,7 +446,10 @@ mod tests {
     #[test]
     fn the_wire_category_is_read_from_data_kind_only() {
         let data = serde_json::json!({ "kind": "conflict" });
-        assert_eq!(Problem::from_error_data(Some(&data)), Some(Problem::Conflict));
+        assert_eq!(
+            Problem::from_error_data(Some(&data)),
+            Some(Problem::Conflict)
+        );
 
         // The caller-side category lives in a different field; a management
         // projection must not read it.
@@ -464,7 +471,16 @@ mod tests {
             capability: "status".into(),
         });
         assert!(matches!(rejected, CallError::Rejected(_)));
-        assert_eq!(Rejection::UnknownCapability { capability: "x".into() }.as_str(), "unknown_capability");
-        assert_eq!(Rejection::BadArguments { detail: "x".into() }.as_str(), "bad_arguments");
+        assert_eq!(
+            Rejection::UnknownCapability {
+                capability: "x".into()
+            }
+            .as_str(),
+            "unknown_capability"
+        );
+        assert_eq!(
+            Rejection::BadArguments { detail: "x".into() }.as_str(),
+            "bad_arguments"
+        );
     }
 }

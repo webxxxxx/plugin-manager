@@ -12,12 +12,12 @@ use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
-use crate::wire::contract::RAW_PROTOCOL;
 use crate::manage::model::manifest::{FileData, Manifest, SignatureCheck, SignatureFile};
 use crate::manage::model::ustar::Tar;
 use crate::manage::package::{
     check_path, hex_sha256, Inspection, Package, SignatureInfo, MAX_FILES, MAX_PACKAGE_BYTES,
 };
+use crate::wire::contract::RAW_PROTOCOL;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SignatureMode {
@@ -35,7 +35,8 @@ pub fn verify_package_with(
     check: SignatureCheck,
     trust_dir: &Path,
 ) -> Result<Package, ProblemError> {
-    let bytes = fs::read(path).map_err(|error| Problem::Internal.error(format!("read {}: {}", path.display(), error)))?;
+    let bytes = fs::read(path)
+        .map_err(|error| Problem::Internal.error(format!("read {}: {}", path.display(), error)))?;
     if bytes.len() as u64 > MAX_PACKAGE_BYTES {
         return Err(Problem::TooLarge.error(format!(
             "package exceeds {} MiB",
@@ -151,7 +152,9 @@ fn verify_bytes_mode(
             return Err(Problem::Invalid.error(format!("duplicate files[] entry: {}", entry.path)));
         }
         if entry.mode & 0o6000 != 0 {
-            return Err(Problem::Invalid.error(format!("setuid/setgid is not allowed: {}", entry.path)));
+            return Err(
+                Problem::Invalid.error(format!("setuid/setgid is not allowed: {}", entry.path))
+            );
         }
         if declared.len() > MAX_FILES {
             return Err(Problem::TooLarge.error("too many files"));
@@ -174,15 +177,15 @@ fn verify_bytes_mode(
         if header.kind == b'5' {
             continue;
         }
-        let entry = declared
-            .get(&header.path)
-            .ok_or_else(|| Problem::Invalid.error(format!("file is not declared in files[]: {}", header.path)))?;
+        let entry = declared.get(&header.path).ok_or_else(|| {
+            Problem::Invalid.error(format!("file is not declared in files[]: {}", header.path))
+        })?;
         if seen.insert(header.path.clone(), ()).is_some() {
             return Err(Problem::Invalid.error(format!("duplicate tar entry: {}", header.path)));
         }
-        let data = header
-            .data
-            .ok_or_else(|| Problem::Invalid.error(format!("{} must be a regular file", header.path)))?;
+        let data = header.data.ok_or_else(|| {
+            Problem::Invalid.error(format!("{} must be a regular file", header.path))
+        })?;
         if data.len() as u64 != entry.size {
             return Err(Problem::Invalid.error(format!(
                 "size mismatch for {}: manifest {}, archive {}",
@@ -272,7 +275,10 @@ pub fn verify_bytes_with_fallback(
 /// The install-time half of the "executable hook" rule: the Unix exec bit comes
 /// from the manifest, the shebang has to be read from the extracted file.
 #[cfg(unix)]
-pub(crate) fn check_hook_shebangs(manifest: &Manifest, files: &[FileData]) -> Result<(), ProblemError> {
+pub(crate) fn check_hook_shebangs(
+    manifest: &Manifest,
+    files: &[FileData],
+) -> Result<(), ProblemError> {
     for (name, path) in [
         (
             "postInstall",
@@ -294,7 +300,9 @@ pub(crate) fn check_hook_shebangs(manifest: &Manifest, files: &[FileData]) -> Re
             continue;
         };
         if !file.data.starts_with(b"#!") {
-            return Err(Problem::Invalid.error(format!("{} must start with a shebang: {}", name, path)));
+            return Err(
+                Problem::Invalid.error(format!("{} must start with a shebang: {}", name, path))
+            );
         }
         if file.data.contains(&b'\r') {
             return Err(Problem::Invalid.error(format!(
@@ -343,10 +351,13 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), ProblemError> {
             )));
         }
         if capability.name == "start" {
-            return Err(Problem::Invalid.error("capability name \"start\" is reserved for the lifecycle tool"));
+            return Err(Problem::Invalid
+                .error("capability name \"start\" is reserved for the lifecycle tool"));
         }
         if !names.insert(&capability.name) {
-            return Err(Problem::Invalid.error(format!("duplicate capability: {}", capability.name)));
+            return Err(
+                Problem::Invalid.error(format!("duplicate capability: {}", capability.name))
+            );
         }
     }
     Ok(())
@@ -372,7 +383,10 @@ pub fn is_native_binary(bytes: &[u8]) -> bool {
 
 /// Schema-2 packages must name a host interpreter for every script payload and
 /// must not carry a dangling interpreter declaration for a native-only payload.
-pub fn validate_script_payload(manifest: &Manifest, files: &[(&str, &[u8])]) -> Result<(), ProblemError> {
+pub fn validate_script_payload(
+    manifest: &Manifest,
+    files: &[(&str, &[u8])],
+) -> Result<(), ProblemError> {
     if manifest.schema < 2 {
         return Ok(());
     }
@@ -402,7 +416,9 @@ pub fn validate_script_payload(manifest: &Manifest, files: &[(&str, &[u8])]) -> 
         )));
     }
     if scripts.is_empty() && manifest.interpreter.is_some() {
-        return Err(Problem::Invalid.error("interpreter is declared but the payload has no script to run"));
+        return Err(
+            Problem::Invalid.error("interpreter is declared but the payload has no script to run")
+        );
     }
     Ok(())
 }
@@ -415,7 +431,9 @@ fn check_schema(manifest: &Manifest) -> Result<(), ProblemError> {
         )));
     }
     if manifest.schema == 1 && (manifest.interpreter.is_some() || manifest.lifecycle.is_some()) {
-        return Err(Problem::Invalid.error("lifecycle and interpreter require schema 2; old daemons would silently ignore them"));
+        return Err(Problem::Invalid.error(
+            "lifecycle and interpreter require schema 2; old daemons would silently ignore them",
+        ));
     }
     if manifest.schema < 3 && manifest.compat.is_some() {
         return Err(Problem::Invalid.error(
@@ -443,10 +461,13 @@ fn check_compat(manifest: &Manifest) -> Result<(), ProblemError> {
             }
             let mut seen = BTreeSet::new();
             for device in &spec.devices {
-                crate::platform::compat::validate_device_id(device)
-                    .map_err(|error| Problem::Invalid.error(format!("compat.devices: {}", error)))?;
+                crate::platform::compat::validate_device_id(device).map_err(|error| {
+                    Problem::Invalid.error(format!("compat.devices: {}", error))
+                })?;
                 if !seen.insert(device) {
-                    return Err(Problem::Invalid.error(format!("duplicate compat device id: {}", device)));
+                    return Err(
+                        Problem::Invalid.error(format!("duplicate compat device id: {}", device))
+                    );
                 }
             }
         }
@@ -460,7 +481,9 @@ fn check_compat(manifest: &Manifest) -> Result<(), ProblemError> {
         }
     }
     if kernel_module && manifest.schema < 3 {
-        return Err(Problem::Invalid.error("kernel modules require schema 3 so old daemons reject them"));
+        return Err(
+            Problem::Invalid.error("kernel modules require schema 3 so old daemons reject them")
+        );
     }
     Ok(())
 }
@@ -479,7 +502,9 @@ fn check_ready(manifest: &Manifest) -> Result<(), ProblemError> {
 /// does not have (stdin is closed).
 fn check_capabilities_with_exec(manifest: &Manifest) -> Result<(), ProblemError> {
     if !manifest.capabilities.is_empty() && manifest.exec.ready.as_deref() == Some("exec") {
-        return Err(Problem::Invalid.error("exec.ready=exec cannot declare capabilities: the plugin has no protocol channel"));
+        return Err(Problem::Invalid.error(
+            "exec.ready=exec cannot declare capabilities: the plugin has no protocol channel",
+        ));
     }
     Ok(())
 }
@@ -592,7 +617,9 @@ pub(crate) fn check_hooks(manifest: &Manifest) -> Result<(), ProblemError> {
             .files
             .iter()
             .find(|file| file.path == path)
-            .ok_or_else(|| Problem::Invalid.error(format!("{} is not in files[]: {}", name, path)))?;
+            .ok_or_else(|| {
+                Problem::Invalid.error(format!("{} is not in files[]: {}", name, path))
+            })?;
         check_hook_executable(name, path, file.mode)?;
     }
     Ok(())
@@ -669,8 +696,8 @@ pub(crate) fn check_signature(
             trusted: false,
         });
     }
-    let sig: SignatureFile =
-        serde_json::from_slice(signature_bytes).map_err(|error| Problem::Invalid.error(format!("signature: {}", error)))?;
+    let sig: SignatureFile = serde_json::from_slice(signature_bytes)
+        .map_err(|error| Problem::Invalid.error(format!("signature: {}", error)))?;
     if sig.alg != "ed25519" {
         return Err(Problem::Invalid.error(format!("unsupported signature algorithm: {}", sig.alg)));
     }
@@ -719,7 +746,8 @@ fn verify_signature_with(
     let signature = BASE64
         .decode(sig.sig.trim())
         .map_err(|error| Problem::Invalid.error(format!("signature base64: {}", error)))?;
-    let signature = Signature::from_slice(&signature).map_err(|error| Problem::Internal.error(error.to_string()))?;
+    let signature = Signature::from_slice(&signature)
+        .map_err(|error| Problem::Internal.error(error.to_string()))?;
     key.verify_strict(manifest, &signature)
         .map_err(|_| Problem::Invalid.error("manifest signature is invalid"))
 }
@@ -771,8 +799,8 @@ fn parse_public_key(pem: &[u8]) -> Result<VerifyingKey, ProblemError> {
 }
 
 pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, ProblemError> {
-    let m: Manifest = serde_json::from_slice(bytes)
-        .map_err(|error| Problem::Invalid.error(error.to_string()))?;
+    let m: Manifest =
+        serde_json::from_slice(bytes).map_err(|error| Problem::Invalid.error(error.to_string()))?;
     check_schema(&m)?;
     if m.protocol == 0 || m.protocol > MAX_PROTOCOL {
         return Err(Problem::Invalid.error(format!("unsupported protocol {}", m.protocol)));

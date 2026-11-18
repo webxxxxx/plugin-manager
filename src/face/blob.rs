@@ -12,9 +12,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::platform::paths::Paths;
 use crate::platform::storage as blob;
 use crate::server::http::model as http;
-use crate::platform::paths::Paths;
 use crate::server::http::{
     BlockingOutcome, CloseReason, FileSend, OutBuffer, Request, StreamAction, StreamClass,
     StreamEvent, StreamHandler, StreamStep,
@@ -863,8 +863,11 @@ mod tests {
 
     fn file_of(parts: &[&[u8]], name: Option<&str>, mime: Option<&str>) -> String {
         let paths = test_paths();
-        let upload =
-            crate::platform::storage::create_upload(paths, crate::platform::storage::UploadKind::File).expect("upload");
+        let upload = crate::platform::storage::create_upload(
+            paths,
+            crate::platform::storage::UploadKind::File,
+        )
+        .expect("upload");
         for (index, content) in parts.iter().enumerate() {
             let mut writer = crate::platform::storage::PartWriter::begin(
                 paths,

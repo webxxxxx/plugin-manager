@@ -20,8 +20,8 @@ use std::sync::mpsc::{Sender, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::wire::message::ipc;
 use crate::platform::host::wake::Wake;
+use crate::wire::message::ipc;
 
 use platform::Platform;
 pub(crate) use platform::{ControlBinding, Notify, Stream};

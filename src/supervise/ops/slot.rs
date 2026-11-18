@@ -6,19 +6,19 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use crate::wire::message::ipc::{self, FrameError, FrameEvent};
 #[cfg(test)]
 use crate::kernel::contract::ProgressToken;
 use crate::kernel::contract::{Contract, Control, Invocation, Reply, ReplySink, Settled, Wire};
 use crate::kernel::failure::{Class, Failure, Rejection, Retry};
+use crate::kernel::registry::{Exec, Hook, Interpreter, Lifecycle, Ready, Restart, State};
+use crate::platform::host::wake::Wake;
 use crate::platform::log::{self, LogSink};
 use crate::platform::paths::Paths;
-use crate::kernel::registry::{Exec, Hook, Interpreter, Lifecycle, Ready, Restart, State};
-use crate::wire::contract::RAW_PROTOCOL;
-use crate::wire::message::rpc;
-use crate::wire::contract::stdio::{self, Plan, Streams, Target};
 use crate::supervise::model::supervisor::{self, Action, Event, Machine};
-use crate::platform::host::wake::Wake;
+use crate::wire::contract::stdio::{self, Plan, Streams, Target};
+use crate::wire::contract::RAW_PROTOCOL;
+use crate::wire::message::ipc::{self, FrameError, FrameEvent};
+use crate::wire::message::rpc;
 
 /// Per-plugin in-flight cap from ticket #31. The full spec also describes a
 /// 128-slot queue behind this cap; the ticket scopes this tracer bullet to the
@@ -191,7 +191,10 @@ pub(crate) struct SlotWire {
 }
 
 impl SlotWire {
-    pub(crate) fn new(handle: SlotHandle, client: Option<crate::wire::control::channel::Reply>) -> SlotWire {
+    pub(crate) fn new(
+        handle: SlotHandle,
+        client: Option<crate::wire::control::channel::Reply>,
+    ) -> SlotWire {
         SlotWire { handle, client }
     }
 }
@@ -904,8 +907,16 @@ impl Slot {
             self.machine.state,
             self.machine.pid,
             self.ping_id,
-            if self.stdin.is_some() { "open" } else { "closed" },
-            if self.frames.is_some() { "attached" } else { "none" },
+            if self.stdin.is_some() {
+                "open"
+            } else {
+                "closed"
+            },
+            if self.frames.is_some() {
+                "attached"
+            } else {
+                "none"
+            },
             self.start_deadline,
         )
     }
@@ -1502,7 +1513,11 @@ impl Slot {
             reason,
             self.machine.state,
             self.machine.pid,
-            if self.stdin.is_some() { "open" } else { "closed" },
+            if self.stdin.is_some() {
+                "open"
+            } else {
+                "closed"
+            },
             if self.child.is_some() { "held" } else { "none" },
         ));
         self.abort_stop_hook();
@@ -1776,7 +1791,10 @@ mod tests {
         let mut fire_and_forget = exec();
         fire_and_forget.ready = Ready::Exec;
         slot.set_exec(fire_and_forget);
-        assert!(!slot.is_channel_peer(), "exec protocol 1 is fire-and-forget");
+        assert!(
+            !slot.is_channel_peer(),
+            "exec protocol 1 is fire-and-forget"
+        );
 
         slot.set_protocol(3);
         assert!(

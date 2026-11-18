@@ -67,8 +67,9 @@ pub fn check_with(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     if let Some(constraint) = constraint {
-        validate_constraint(constraint)
-            .map_err(|error| Problem::Invalid.error(format!("interpreter {} version: {}", spec.name, error)))?;
+        validate_constraint(constraint).map_err(|error| {
+            Problem::Invalid.error(format!("interpreter {} version: {}", spec.name, error))
+        })?;
     }
     let resolved = lookup_with(spec, path_var, pathext)?;
     if let Some(constraint) = constraint {
@@ -93,7 +94,11 @@ pub fn lookup(spec: &Spec) -> Result<Resolved, ProblemError> {
     lookup_with(spec, &path_var, pathext.as_deref())
 }
 
-fn lookup_with(spec: &Spec, path_var: &str, pathext: Option<&str>) -> Result<Resolved, ProblemError> {
+fn lookup_with(
+    spec: &Spec,
+    path_var: &str,
+    pathext: Option<&str>,
+) -> Result<Resolved, ProblemError> {
     let path = resolve(&spec.name, path_var, pathext)?;
     Ok(Resolved {
         path,
@@ -160,8 +165,9 @@ pub fn resolve(name: &str, path_var: &str, pathext: Option<&str>) -> Result<Path
     }
     for candidate in candidates {
         if is_executable(&candidate) {
-            return std::path::absolute(&candidate)
-                .map_err(|error| Problem::Invalid.error(format!("interpreter {}: {}", candidate.display(), error)));
+            return std::path::absolute(&candidate).map_err(|error| {
+                Problem::Invalid.error(format!("interpreter {}: {}", candidate.display(), error))
+            });
         }
     }
     Err(Problem::Invalid.error(format!("interpreter {} not found on PATH", name)))
@@ -250,7 +256,9 @@ fn parse_clauses(value: &str) -> Result<Vec<(Op, Version)>, ProblemError> {
     for clause in value.split(',') {
         let clause = clause.trim();
         if clause.is_empty() {
-            return Err(Problem::Invalid.error(format!("empty clause in version constraint {:?}", value)));
+            return Err(
+                Problem::Invalid.error(format!("empty clause in version constraint {:?}", value))
+            );
         }
         let (op, rest) = if let Some(rest) = clause.strip_prefix(">=") {
             (Op::Ge, rest)
@@ -268,8 +276,9 @@ fn parse_clauses(value: &str) -> Result<Vec<(Op, Version)>, ProblemError> {
                 clause
             )));
         };
-        let version = parse_dotted(rest.trim())
-            .ok_or_else(|| Problem::Invalid.error(format!("invalid version in clause {:?}", clause)))?;
+        let version = parse_dotted(rest.trim()).ok_or_else(|| {
+            Problem::Invalid.error(format!("invalid version in clause {:?}", clause))
+        })?;
         clauses.push((op, version));
     }
     if clauses.is_empty() {
@@ -362,9 +371,13 @@ fn probe(path: &Path, timeout_ms: u64) -> Result<Version, ProblemError> {
             command.env(key, value);
         }
     }
-    let mut child = command
-        .spawn()
-        .map_err(|error| Problem::Invalid.error(format!("cannot run {} --version: {}", path.display(), error)))?;
+    let mut child = command.spawn().map_err(|error| {
+        Problem::Invalid.error(format!(
+            "cannot run {} --version: {}",
+            path.display(),
+            error
+        ))
+    })?;
 
     let started = Instant::now();
     let status = loop {
@@ -374,7 +387,11 @@ fn probe(path: &Path, timeout_ms: u64) -> Result<Version, ProblemError> {
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(Problem::Invalid.error(format!("{} --version: {}", path.display(), error)));
+                return Err(Problem::Invalid.error(format!(
+                    "{} --version: {}",
+                    path.display(),
+                    error
+                )));
             }
         }
         if started.elapsed() >= Duration::from_millis(timeout_ms) {

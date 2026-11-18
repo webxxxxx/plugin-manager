@@ -14,35 +14,35 @@ use serde_json::{json, Value};
 use crate::api::{self, Api};
 #[cfg(not(feature = "http"))]
 type Api = ();
-use crate::face::catalog as catalog;
-use crate::wire::control::channel;
-use crate::platform::clock::{Clock, Now};
-use crate::platform::compat;
-use crate::platform::config::Config;
-use crate::supervise::check::{reconcile, start};
-use crate::supervise::model::definition;
+use crate::cli::status::Status;
+use crate::face::catalog;
+use crate::face::mcp;
 use crate::kernel::contract::{
     CapabilityName, Instance, Invocation, Launchers, ProgressToken, Reply, ReplySink,
 };
 use crate::kernel::failure::{Class, Failure, Problem, ProblemError, Rejection, Retry};
-use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
-use crate::server::auth::lan::LanStatus;
-use crate::platform::log;
-use crate::face::mcp as mcp;
-use crate::manage::package;
-use crate::platform::paths::Paths;
-use crate::manage::plugin::{self, Strategy};
-#[cfg(unix)]
-use crate::wire::contract::reactor::Reactor;
 use crate::kernel::registry::{Hook, Kind, Registry, Service, State, RESERVED_ID};
-use crate::wire::message::rpc;
-use crate::supervise::model::runtime::{self, Record};
+use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
+use crate::manage::package;
+use crate::manage::plugin::{self, Strategy};
+use crate::platform::clock::{Clock, Now};
+use crate::platform::compat;
+use crate::platform::config::Config;
+use crate::platform::host::wake::Wake;
+use crate::platform::log;
+use crate::platform::paths::Paths;
 use crate::platform::settings;
+use crate::server::auth::lan::LanStatus;
+use crate::supervise::check::{reconcile, start};
+use crate::supervise::model::definition;
+use crate::supervise::model::runtime::{self, Record};
+use crate::supervise::model::supervisor::{self, Event};
 use crate::supervise::ops::slot::hook_command;
 use crate::supervise::ops::slot::{Slot, SlotWire};
-use crate::cli::status::Status;
-use crate::supervise::model::supervisor::{self, Event};
-use crate::platform::host::wake::Wake;
+#[cfg(unix)]
+use crate::wire::contract::reactor::Reactor;
+use crate::wire::control::channel;
+use crate::wire::message::rpc;
 
 /// The supervisor loop's bounded wait when it has no earlier deadline. With a
 /// reactor this is the plugin poll's timeout, so an idle daemon wakes once per
@@ -79,13 +79,14 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         return 1;
     }
 
-    let config_path = match crate::selfinstall::install::ensure_conf(conf.as_deref(), &initial_paths) {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("svcd: {}", error);
-            return 1;
-        }
-    };
+    let config_path =
+        match crate::selfinstall::install::ensure_conf(conf.as_deref(), &initial_paths) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("svcd: {}", error);
+                return 1;
+            }
+        };
     // Keep the document bootstrapped above. `ensure_conf` chooses or creates
     // the file for the service unit and the next start; loading its result
     // here would (a) parse a second time and (b) let `<program>/svcd.conf`
@@ -565,7 +566,10 @@ impl Daemon {
         let temp_cleanup_interval_ms = config.settings.temp_cleanup_interval().as_millis() as u64;
         let services_fingerprint = services_fingerprint(&config.paths.services_dir);
         let mut launchers = Launchers::default();
-        launchers.register("builtin", Box::new(crate::supervise::ops::builtin_adapter::BuiltinLauncher));
+        launchers.register(
+            "builtin",
+            Box::new(crate::supervise::ops::builtin_adapter::BuiltinLauncher),
+        );
         Daemon {
             config,
             registry,
@@ -1329,7 +1333,9 @@ impl Daemon {
         }
 
         let mut arguments = arguments;
-        if let Err(message) = crate::platform::storage::resolve_args(&self.config.paths, &mut arguments) {
+        if let Err(message) =
+            crate::platform::storage::resolve_args(&self.config.paths, &mut arguments)
+        {
             send(
                 &reply,
                 mcp::tool_error(id, &format!("cannot resolve blob argument: {}", message)),
@@ -3654,7 +3660,8 @@ while ($null -ne [Console]::In.ReadLine()) { }
             let tools = page["tools"].as_array().expect("tools");
             assert!(!tools.is_empty());
             assert!(
-                serde_json::to_vec(tools).expect("serialize").len() <= crate::wire::message::ipc::CATALOG_PAGE_MAX
+                serde_json::to_vec(tools).expect("serialize").len()
+                    <= crate::wire::message::ipc::CATALOG_PAGE_MAX
             );
             total += tools.len();
             cursor = page["nextCursor"].as_str().map(str::to_string);

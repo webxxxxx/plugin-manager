@@ -20,9 +20,9 @@ use crate::kernel::failure::{Problem, ProblemError};
 pub(crate) const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const MAX_FILES: usize = 4096;
 
+pub use crate::manage::check::verify::*;
 pub use crate::manage::model::manifest::*;
 pub use crate::manage::model::ustar::*;
-pub use crate::manage::check::verify::*;
 pub use crate::manage::ops::export::*;
 pub use crate::manage::ops::install::*;
 
@@ -160,10 +160,7 @@ mod tests {
         super::verify_bytes(bytes, trust_dir())
     }
 
-    fn verify_bytes_with(
-        bytes: &[u8],
-        check: SignatureCheck,
-    ) -> Result<Package, ProblemError> {
+    fn verify_bytes_with(bytes: &[u8], check: SignatureCheck) -> Result<Package, ProblemError> {
         super::verify_bytes_with(bytes, check, trust_dir())
     }
 
@@ -295,8 +292,7 @@ mod tests {
         let bytes = package(&key);
         for chunk in [1usize, 3, 7, 511, 512, 513, 1000] {
             let root = tempdir::TempDir::new();
-            let mut installer =
-                stager(root.path().to_path_buf(), false, 1024 * 1024);
+            let mut installer = stager(root.path().to_path_buf(), false, 1024 * 1024);
             for part in bytes.chunks(chunk) {
                 installer
                     .feed(part)
@@ -450,7 +446,10 @@ mod tests {
             .expect("a triple that differs from this host");
         let error = verify_bytes(&package_for(&key, other)).expect_err("platform");
         assert_eq!(error.problem, Problem::UnsupportedPlatform, "{error}");
-        assert!(other.contains("unknown"), "the trap only exists with a real triple");
+        assert!(
+            other.contains("unknown"),
+            "the trap only exists with a real triple"
+        );
     }
 
     #[test]
@@ -536,7 +535,10 @@ mod tests {
             None,
         ))
         .expect_err("schema gate");
-        assert!(error.detail().contains("compat requires schema 3"), "{error}");
+        assert!(
+            error.detail().contains("compat requires schema 3"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -840,7 +842,11 @@ mod tests {
         let missing = files.pop().expect("second file");
         let bytes = package_from(&key, "test", &manifest, &files);
         let error = verify_bytes(&bytes).expect_err("missing");
-        assert!(error.detail().contains("missing files"), "{error} {}", missing.0);
+        assert!(
+            error.detail().contains("missing files"),
+            "{error} {}",
+            missing.0
+        );
     }
 
     fn script_manifest(schema: u32) -> (Vec<u8>, TestFiles) {
@@ -982,7 +988,10 @@ mod tests {
         let manifest = serde_json::to_vec(&value).expect("json");
         let error = verify_bytes(&package_from(&key, "test", &manifest, &files))
             .expect_err("missing interpreter");
-        assert!(error.detail().contains("requires an interpreter"), "{error}");
+        assert!(
+            error.detail().contains("requires an interpreter"),
+            "{error}"
+        );
     }
 
     #[test]

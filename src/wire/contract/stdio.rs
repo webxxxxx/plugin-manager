@@ -33,10 +33,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use super::RAW_PROTOCOL;
-use crate::wire::message::ipc::{self, FrameEvent};
-use crate::platform::log::LogSink;
 use crate::platform::host::threads;
 use crate::platform::host::wake::Wake;
+use crate::platform::log::LogSink;
+use crate::wire::message::ipc::{self, FrameEvent};
 
 /// Whether one standard stream is piped to the parent or opened on `/dev/null`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

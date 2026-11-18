@@ -20,7 +20,11 @@ pub struct LogSink {
 
 impl LogSink {
     /// Open a sink using the limits derived once at the composition root.
-    pub fn open(dir: &Path, id: &str, limits: &crate::platform::limits::Limits) -> io::Result<Self> {
+    pub fn open(
+        dir: &Path,
+        id: &str,
+        limits: &crate::platform::limits::Limits,
+    ) -> io::Result<Self> {
         Self::open_with(
             dir,
             id,

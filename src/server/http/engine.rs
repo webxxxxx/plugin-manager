@@ -204,8 +204,11 @@ pub trait ServerLoop {
 }
 
 #[cfg(unix)]
-pub fn run<S, H>(listener: Option<TcpListener>, handler: &mut H, limits: &crate::platform::limits::Limits)
-where
+pub fn run<S, H>(
+    listener: Option<TcpListener>,
+    handler: &mut H,
+    limits: &crate::platform::limits::Limits,
+) where
     H: ServerLoop<State = S>,
 {
     if let Some(listener) = &listener {
@@ -465,8 +468,9 @@ pub fn advance_request<S>(
             ));
         };
         connection.head_only = crate::server::http::model::is_head(&head.method);
-        let framing = http::framing(&head.headers)
-            .map_err(|message| crate::server::http::model::json_error(400, "bad_request", &message))?;
+        let framing = http::framing(&head.headers).map_err(|message| {
+            crate::server::http::model::json_error(400, "bad_request", &message)
+        })?;
         // Route and authenticate before the body. While the body is still
         // arriving `pending` stays Some, so this callback runs exactly once per
         // request and the face never sees a different route for the same head.

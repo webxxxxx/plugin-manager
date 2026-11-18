@@ -92,9 +92,7 @@ fn decode_cursor(cursor: &str, version: u64, len: usize) -> Result<usize, PageEr
         .decode(cursor)
         .map_err(|_| PageError::InvalidCursor)?;
     let text = String::from_utf8(bytes).map_err(|_| PageError::InvalidCursor)?;
-    let (cursor_version, offset) = text
-        .split_once(':')
-        .ok_or(PageError::InvalidCursor)?;
+    let (cursor_version, offset) = text.split_once(':').ok_or(PageError::InvalidCursor)?;
     let cursor_version: u64 = cursor_version
         .parse()
         .map_err(|_| PageError::InvalidCursor)?;

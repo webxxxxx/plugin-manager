@@ -10,9 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::json;
 
+use crate::platform::paths::Paths;
 use crate::platform::storage as blob;
 use crate::server::http::model as http;
-use crate::platform::paths::Paths;
 
 use super::support;
 use crate::server::auth::lan::{AuthKind, Lan};
@@ -391,7 +391,8 @@ impl UploadState {
         match &self.target {
             UploadTarget::Blob => {
                 if self.upload.is_none() {
-                    self.upload = Some(blob::Upload::begin(&self.paths).map_err(UploadFailure::from)?);
+                    self.upload =
+                        Some(blob::Upload::begin(&self.paths).map_err(UploadFailure::from)?);
                 }
                 let upload = self.upload.as_mut().expect("blob upload initialized");
                 match &mut self.multipart {
@@ -502,7 +503,9 @@ impl From<http::BodyError> for UploadFailure {
     fn from(error: http::BodyError) -> UploadFailure {
         match error {
             http::BodyError::Malformed(detail) => UploadFailure::Body(detail),
-            http::BodyError::TooLarge(detail) => UploadFailure::Storage(blob::Error::too_large(detail)),
+            http::BodyError::TooLarge(detail) => {
+                UploadFailure::Storage(blob::Error::too_large(detail))
+            }
         }
     }
 }
@@ -601,7 +604,11 @@ impl MultipartParser {
         self.advance(upload)
     }
 
-    fn push_body_direct(&mut self, chunk: &[u8], upload: &mut blob::Upload) -> Result<(), UploadFailure> {
+    fn push_body_direct(
+        &mut self,
+        chunk: &[u8],
+        upload: &mut blob::Upload,
+    ) -> Result<(), UploadFailure> {
         let mut delimiter = Vec::with_capacity(self.boundary.len() + 2);
         delimiter.extend_from_slice(b"\r\n");
         delimiter.extend_from_slice(&self.boundary);
@@ -642,7 +649,9 @@ impl MultipartParser {
                 MpState::Headers => {
                     let Some(position) = find(&self.buffer, b"\r\n\r\n") else {
                         if self.buffer.len() > 64 * 1024 {
-                            return Err(UploadFailure::body("multipart part headers are too large"));
+                            return Err(UploadFailure::body(
+                                "multipart part headers are too large",
+                            ));
                         }
                         return Ok(());
                     };
@@ -915,8 +924,8 @@ mod tests {
 
     #[test]
     fn a_resumable_part_can_be_reuploaded() {
-        let upload =
-            crate::platform::storage::create_upload(test_paths(), blob::UploadKind::Blob).expect("upload");
+        let upload = crate::platform::storage::create_upload(test_paths(), blob::UploadKind::Blob)
+            .expect("upload");
         let path = format!("/api/v1/blobs/uploads/{}/parts/1", upload);
         let head = parse_head(
             format!(
@@ -943,10 +952,12 @@ mod tests {
         assert!(String::from_utf8_lossy(&second).starts_with("HTTP/1.1 200 OK"));
 
         let parts =
-            crate::platform::storage::upload_parts(test_paths(), &upload, blob::UploadKind::Blob).expect("parts");
+            crate::platform::storage::upload_parts(test_paths(), &upload, blob::UploadKind::Blob)
+                .expect("parts");
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].size, 6);
-        let meta = crate::platform::storage::complete_upload(test_paths(), &upload, None).expect("complete");
+        let meta = crate::platform::storage::complete_upload(test_paths(), &upload, None)
+            .expect("complete");
         let path = crate::platform::storage::path(test_paths(), &meta.id).expect("path");
         let content = std::fs::read(path).expect("read");
         assert_eq!(content, b"second");
@@ -1016,9 +1027,8 @@ mod tests {
 
     #[test]
     fn a_full_blocking_queue_turns_into_503_busy() {
-        let head = parse_head(
-            b"POST /api/v1/blobs HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n",
-        );
+        let head =
+            parse_head(b"POST /api/v1/blobs HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n");
         let mut handler = handler(&head);
         let mut out = Vec::new();
         let step = handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, 4096));
@@ -1034,9 +1044,11 @@ mod tests {
         );
         assert!(matches!(step.action, StreamAction::Close(_)));
         let text = String::from_utf8_lossy(&out);
-        assert!(text.starts_with("HTTP/1.1 503 Service Unavailable\r\n"), "{text}");
+        assert!(
+            text.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "{text}"
+        );
         assert!(text.contains("Retry-After: 1\r\n"), "{text}");
         assert!(text.contains("\"code\":\"busy\""), "{text}");
     }
-
 }

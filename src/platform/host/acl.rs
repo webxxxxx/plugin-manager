@@ -25,8 +25,8 @@ use windows_sys::Win32::Security::Authorization::{
 use windows_sys::Win32::Security::{
     GetLengthSid, GetTokenInformation, InitializeSecurityDescriptor, SetSecurityDescriptorControl,
     SetSecurityDescriptorDacl, TokenUser, ACL, DACL_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
-    SECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
+    PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+    SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 

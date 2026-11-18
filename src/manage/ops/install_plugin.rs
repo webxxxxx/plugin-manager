@@ -2,7 +2,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::registry::{Interpreter, Service, RESERVED_ID};
 use crate::manage::check::interpreter;
@@ -12,12 +11,12 @@ use crate::manage::ops::config::{write_config, write_hash};
 use crate::manage::ops::scan::{resolve_interpreter, service_from_manifest};
 use crate::manage::package;
 use crate::manage::plugin::{
-    ensure_hooks_allowed, ensure_hooks_allowed_manifest, replace_plan, remove_versions, ReplacePlan,
-    Strategy,
+    ensure_hooks_allowed, ensure_hooks_allowed_manifest, remove_versions, replace_plan,
+    ReplacePlan, Strategy,
 };
 use crate::platform::log;
-use crate::supervise::ops::hook;
 use crate::platform::paths::Paths;
+use crate::supervise::ops::hook;
 
 /// Preflight a package that has already been streamed into a staging directory.
 /// This mirrors [`verify_package`] but never holds the payload in memory.

@@ -9,15 +9,15 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::wire::control::channel;
-use crate::platform::compat;
-use crate::platform::config::Config;
+use crate::cli::status::{self, Status};
+use crate::kernel::registry::Kind;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
+use crate::manage::ops::transfer;
 use crate::manage::package;
 use crate::manage::plugin;
-use crate::kernel::registry::Kind;
-use crate::cli::status::{self, Status};
-use crate::manage::ops::transfer;
+use crate::platform::compat;
+use crate::platform::config::Config;
+use crate::wire::control::channel;
 
 const EXIT_OK: i32 = 0;
 const EXIT_SERVICE_ERROR: i32 = 1;

@@ -4,12 +4,12 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::wire::control::channel;
-use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
-use crate::platform::log;
-use crate::platform::config::Config;
-use crate::wire::message::rpc;
 use crate::cli::status::{self, Status};
+use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
+use crate::platform::config::Config;
+use crate::platform::log;
+use crate::wire::control::channel;
+use crate::wire::message::rpc;
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_NOT_FOUND: i32 = 1;

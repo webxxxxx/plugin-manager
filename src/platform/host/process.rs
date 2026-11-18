@@ -360,8 +360,7 @@ mod imp {
                 let mut fields = rest.split_whitespace();
                 let state = fields.next().unwrap_or("");
                 let _parent = fields.next();
-                let Some(group) = fields.next().and_then(|value| value.parse::<u32>().ok())
-                else {
+                let Some(group) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
                     continue;
                 };
                 if group == pgid && state != "Z" && state != "X" {

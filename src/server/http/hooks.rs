@@ -7,9 +7,9 @@
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
-use crate::server::http::model as http;
 use crate::server::auth::lan::Lan;
 use crate::server::http::engine::HttpRequest;
+use crate::server::http::model as http;
 use crate::server::http::{BodyPolicy, Exchange};
 
 /// The remaining server-owned routes (buffered MCP, plugin UI rpc and the blob

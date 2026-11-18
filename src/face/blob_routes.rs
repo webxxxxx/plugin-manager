@@ -7,12 +7,11 @@
 
 use serde_json::{json, Value};
 
+use crate::platform::paths::Paths;
 use crate::platform::storage as blob;
 use crate::server::http::model as http;
-use crate::platform::paths::Paths;
 
 use super::support;
-
 
 pub fn create_upload(paths: &Paths, kind: blob::UploadKind) -> Vec<u8> {
     match blob::create_upload(paths, kind) {

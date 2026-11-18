@@ -27,9 +27,9 @@ pub fn read_tar(bytes: &[u8]) -> Result<Vec<TarEntry>, ProblemError> {
         if header.kind == b'5' {
             continue;
         }
-        let data = header
-            .data
-            .ok_or_else(|| Problem::Invalid.error(format!("{} must be a regular file", header.path)))?;
+        let data = header.data.ok_or_else(|| {
+            Problem::Invalid.error(format!("{} must be a regular file", header.path))
+        })?;
         entries.push(TarEntry {
             path: header.path,
             data: data.to_vec(),
@@ -172,29 +172,32 @@ impl TarPlan {
                     length,
                     sha256,
                 } => {
-                    let mut source = fs::File::open(path)
-                        .map_err(|error| Problem::Internal.error(format!("open {}: {}", path.display(), error)))?;
+                    let mut source = fs::File::open(path).map_err(|error| {
+                        Problem::Internal.error(format!("open {}: {}", path.display(), error))
+                    })?;
                     let mut hasher = Sha256::new();
                     let mut written = 0u64;
                     let mut buffer = [0u8; 64 * 1024];
                     loop {
-                        let read = source
-                            .read(&mut buffer)
-                            .map_err(|error| Problem::Internal.error(format!("read {}: {}", path.display(), error)))?;
+                        let read = source.read(&mut buffer).map_err(|error| {
+                            Problem::Internal.error(format!("read {}: {}", path.display(), error))
+                        })?;
                         if read == 0 {
                             break;
                         }
                         written = written.saturating_add(read as u64);
                         hasher.update(&buffer[..read]);
-                        out.write_all(&buffer[..read])
-                            .map_err(|error| Problem::Internal.error(format!("write export: {}", error)))?;
+                        out.write_all(&buffer[..read]).map_err(|error| {
+                            Problem::Internal.error(format!("write export: {}", error))
+                        })?;
                     }
                     let hash_matches = sha256
                         .as_ref()
                         .map(|expected| hex_bytes(&hasher.finalize()) == *expected)
                         .unwrap_or(true);
                     if written != *length || !hash_matches {
-                        return Err(Problem::Internal.error(format!("installed file is corrupt: {}", path.display())));
+                        return Err(Problem::Internal
+                            .error(format!("installed file is corrupt: {}", path.display())));
                     }
                 }
             }
@@ -309,7 +312,11 @@ impl TarFeed {
     /// Consume one body chunk. Entry callbacks may be invoked any number of
     /// times per chunk; a chunk may also end in the middle of a header, an
     /// entry body or its padding.
-    pub fn feed<S: TarSink + ?Sized>(&mut self, data: &[u8], sink: &mut S) -> Result<(), ProblemError> {
+    pub fn feed<S: TarSink + ?Sized>(
+        &mut self,
+        data: &[u8],
+        sink: &mut S,
+    ) -> Result<(), ProblemError> {
         let mut data = data;
         while !data.is_empty() {
             if self.remaining > 0 {
@@ -396,7 +403,8 @@ pub(crate) fn parse_octal(bytes: &[u8], name: &str) -> Result<u64, ProblemError>
     if text.is_empty() {
         return Ok(0);
     }
-    u64::from_str_radix(text, 8).map_err(|_| Problem::Invalid.error(format!("invalid octal {} field", name)))
+    u64::from_str_radix(text, 8)
+        .map_err(|_| Problem::Invalid.error(format!("invalid octal {} field", name)))
 }
 
 pub(crate) fn check_checksum(header: &[u8; 512]) -> Result<(), ProblemError> {

@@ -181,9 +181,13 @@ impl Sandbox {
     }
 
     fn wait_for_state(&self, id: &str, expected: &str, timeout: Duration) -> Value {
-        support::wait_for_state(id, expected, timeout, || self.status(id), || {
-            support::tail_lines(&self.daemon_log(), 20)
-        })
+        support::wait_for_state(
+            id,
+            expected,
+            timeout,
+            || self.status(id),
+            || support::tail_lines(&self.daemon_log(), 20),
+        )
     }
 
     fn daemon_log(&self) -> String {

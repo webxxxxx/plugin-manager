@@ -21,11 +21,11 @@
 use std::fs::File;
 use std::sync::Arc;
 
-use crate::server::http::model as http;
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::manage::package::{self, TarPart, TarPlan};
-use crate::platform::paths::Paths;
 use crate::manage::plugin;
+use crate::platform::paths::Paths;
+use crate::server::http::model as http;
 use crate::server::http::{
     CloseReason, FileSend, OutBuffer, StreamAction, StreamClass, StreamEvent, StreamHandler,
     StreamStep,
@@ -142,10 +142,9 @@ impl ExportStream {
                 index: 0,
                 at: 0,
             },
-            Err(error) => ExportStream::response(
-                http::json_error(500, "internal", error.detail()),
-                paths,
-            ),
+            Err(error) => {
+                ExportStream::response(http::json_error(500, "internal", error.detail()), paths)
+            }
         }
     }
 

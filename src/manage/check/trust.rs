@@ -24,11 +24,7 @@ pub fn keys(paths: &Paths) -> Result<Vec<String>, ProblemError> {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
-            return Err(Problem::Internal.error(format!(
-                "read {}: {}",
-                directory.display(),
-                error
-            )))
+            return Err(Problem::Internal.error(format!("read {}: {}", directory.display(), error)))
         }
     };
     let mut keys = Vec::new();
@@ -59,10 +55,9 @@ pub fn add(paths: &Paths, key_id: &str, pem: &[u8]) -> Result<PathBuf, ProblemEr
         return Err(Problem::Invalid.error("public key is empty"));
     }
     if pem.len() as u64 > MAX_KEY_BYTES {
-        return Err(Problem::TooLarge.error(format!(
-            "public key exceeds {} KiB",
-            MAX_KEY_BYTES / 1024
-        )));
+        return Err(
+            Problem::TooLarge.error(format!("public key exceeds {} KiB", MAX_KEY_BYTES / 1024))
+        );
     }
     package::validate_public_key(pem)?;
     let directory = &paths.trust_dir;
@@ -71,8 +66,9 @@ pub fn add(paths: &Paths, key_id: &str, pem: &[u8]) -> Result<PathBuf, ProblemEr
     })?;
     set_dir_mode(&directory);
     let target = key_path(paths, key_id);
-    fs::write(&target, pem)
-        .map_err(|error| Problem::Internal.error(format!("write {}: {}", target.display(), error)))?;
+    fs::write(&target, pem).map_err(|error| {
+        Problem::Internal.error(format!("write {}: {}", target.display(), error))
+    })?;
     set_file_mode(&target);
     Ok(target)
 }
@@ -84,11 +80,7 @@ pub fn remove(paths: &Paths, key_id: &str) -> Result<bool, ProblemError> {
     match fs::remove_file(&path) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(Problem::Internal.error(format!(
-            "remove {}: {}",
-            path.display(),
-            error
-        ))),
+        Err(error) => Err(Problem::Internal.error(format!("remove {}: {}", path.display(), error))),
     }
 }
 
@@ -143,7 +135,12 @@ mod tests {
 
     #[test]
     fn an_oversized_key_is_too_large() {
-        let error = add(&test_paths(), "demo", &vec![b'p'; MAX_KEY_BYTES as usize + 1]).expect_err("oversized");
+        let error = add(
+            &test_paths(),
+            "demo",
+            &vec![b'p'; MAX_KEY_BYTES as usize + 1],
+        )
+        .expect_err("oversized");
         assert_eq!(error.problem, Problem::TooLarge);
     }
 
