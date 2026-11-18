@@ -12,12 +12,12 @@ use std::time::Instant;
 
 use serde_json::{json, Value};
 
-use crate::wire::control::channel;
-use crate::server::http::model as http;
 use crate::kernel::failure::{Class, Problem, ProblemError};
 use crate::manage::package;
-use crate::wire::message::rpc;
+use crate::server::http::model as http;
 use crate::server::http::{CancelToken, JobBudget, Request};
+use crate::wire::control::channel;
+use crate::wire::message::rpc;
 
 /// The control-channel budget a face request carries.
 ///
@@ -281,11 +281,26 @@ mod tests {
     /// category of its own: a missing upload session is 404.
     #[test]
     fn a_storage_failure_projects_onto_the_same_table() {
-        assert_eq!(status_for_storage(crate::platform::storage::Kind::Conflict), 409);
-        assert_eq!(status_for_storage(crate::platform::storage::Kind::Invalid), 400);
-        assert_eq!(status_for_storage(crate::platform::storage::Kind::TooLarge), 413);
-        assert_eq!(status_for_storage(crate::platform::storage::Kind::Internal), 500);
-        assert_eq!(status_for_storage(crate::platform::storage::Kind::NotFound), 404);
+        assert_eq!(
+            status_for_storage(crate::platform::storage::Kind::Conflict),
+            409
+        );
+        assert_eq!(
+            status_for_storage(crate::platform::storage::Kind::Invalid),
+            400
+        );
+        assert_eq!(
+            status_for_storage(crate::platform::storage::Kind::TooLarge),
+            413
+        );
+        assert_eq!(
+            status_for_storage(crate::platform::storage::Kind::Internal),
+            500
+        );
+        assert_eq!(
+            status_for_storage(crate::platform::storage::Kind::NotFound),
+            404
+        );
     }
 
     /// The stream-job handoff must carry both halves of the budget: a job that

@@ -5,12 +5,12 @@ use std::time::Duration;
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::registry::RESERVED_ID;
 use crate::manage::model::layout::{current_version, plugin_dir};
-use crate::manage::ops::scan::read_manifest;
-use crate::platform::log;
-use crate::supervise::ops::hook;
 use crate::manage::ops::export_plugin::remove_versions;
+use crate::manage::ops::scan::read_manifest;
 use crate::manage::package;
+use crate::platform::log;
 use crate::platform::paths::Paths;
+use crate::supervise::ops::hook;
 
 /// Remove the service and install-hook logs for a purged plugin. The slot is
 /// already gone, but its reader threads may still be closing the file on

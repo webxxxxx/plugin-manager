@@ -2490,10 +2490,7 @@ fn wait_until_within<F, D>(
         std::thread::sleep(Duration::from_millis(10));
     }
     let extra = details();
-    panic!(
-        "{what}\ndaemon log:\n{}\n{extra}",
-        sandbox.daemon_log()
-    );
+    panic!("{what}\ndaemon log:\n{}\n{extra}", sandbox.daemon_log());
 }
 
 fn wait_for_staging(sandbox: &Sandbox, dir: &Path) {
@@ -2522,12 +2519,9 @@ fn wait_for_no_staging(sandbox: &Sandbox, dir: &Path) {
 fn has_package_staging(plugins: &Path) -> bool {
     fs::read_dir(plugins)
         .map(|entries| {
-            entries.flatten().any(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".staging-")
-            })
+            entries
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(".staging-"))
         })
         .unwrap_or(false)
 }
@@ -3016,7 +3010,10 @@ fn a_stalled_download_refuses_a_package_upload_with_503() {
         )
         .expect("upload head");
     let (status, headers) = read_response_head(&mut upload);
-    assert_eq!(status, 503, "a full stream budget refuses the package upload");
+    assert_eq!(
+        status, 503,
+        "a full stream budget refuses the package upload"
+    );
     assert!(
         headers
             .iter()
@@ -3150,7 +3147,11 @@ fn an_unknown_upload_session_is_not_found() {
 
     for (method, path, body) in [
         ("GET", format!("/api/v1/blobs/uploads/{}", unknown), ""),
-        ("POST", format!("/api/v1/blobs/uploads/{}/complete", unknown), ""),
+        (
+            "POST",
+            format!("/api/v1/blobs/uploads/{}/complete", unknown),
+            "",
+        ),
         ("DELETE", format!("/api/v1/blobs/uploads/{}", unknown), ""),
         ("GET", format!("/api/v1/file/uploads/{}", unknown), ""),
     ] {
@@ -3993,7 +3994,12 @@ fn importing_an_installed_backup_without_force_is_409() {
         "application/octet-stream",
         &backup,
     );
-    assert_eq!(first.status, 200, "{}", String::from_utf8_lossy(&first.body));
+    assert_eq!(
+        first.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&first.body)
+    );
 
     let again = raw_request(
         &address,
@@ -4002,7 +4008,12 @@ fn importing_an_installed_backup_without_force_is_409() {
         "application/octet-stream",
         &backup,
     );
-    assert_eq!(again.status, 409, "{}", String::from_utf8_lossy(&again.body));
+    assert_eq!(
+        again.status,
+        409,
+        "{}",
+        String::from_utf8_lossy(&again.body)
+    );
 }
 
 /// An unknown backup schema is the client's error (400), not a server fault.
@@ -4021,7 +4032,12 @@ fn importing_a_backup_with_an_unknown_schema_is_400() {
         "application/octet-stream",
         &backup,
     );
-    assert_eq!(response.status, 400, "{}", String::from_utf8_lossy(&response.body));
+    assert_eq!(
+        response.status,
+        400,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
 }
 
 #[test]
@@ -6764,12 +6780,7 @@ fn admission_refused(probe: &Exchange) -> bool {
 /// One request that must be answered by a handler, not by the admission gate.
 /// Retries an admission refusal against [`ADMISSION_WAIT`]; a stopped daemon is
 /// the bail-out, so a crash is reported instead of waited on.
-fn exchange_admitted(
-    sandbox: &mut Sandbox,
-    address: &str,
-    head: &str,
-    body: &[u8],
-) -> Exchange {
+fn exchange_admitted(sandbox: &mut Sandbox, address: &str, head: &str, body: &[u8]) -> Exchange {
     let deadline = Instant::now() + ADMISSION_WAIT;
     loop {
         let probe = exchange(address, head, body);
@@ -6870,9 +6881,7 @@ fn assert_concurrent_connections(sandbox: &mut Sandbox, address: &str, streams: 
                             // The first socket was refused too: a fresh pair
                             // may still see the released slot.
                             Ok(503) => {
-                                last = format!(
-                                    "first (admitted) concurrent connection: status 503"
-                                )
+                                last = format!("first (admitted) concurrent connection: status 503")
                             }
                             Ok(status) => regression_failure(
                                 sandbox,
@@ -7549,8 +7558,7 @@ fn run_min_config_phase(phase: &str, streams: bool) {
     let events_path = format!("{}events", base);
 
     if streams {
-        let (mut ws, status, head) =
-            ws_handshake_admitted(&mut sandbox, &address, &ws_path, &[]);
+        let (mut ws, status, head) = ws_handshake_admitted(&mut sandbox, &address, &ws_path, &[]);
         expect_status_code(
             &mut sandbox,
             "max_subscribers_per_plugin",
@@ -8049,8 +8057,7 @@ fn control_shutdown_reply_is_flushed_before_exit() {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("timeout");
-    let request =
-        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"svcd.shutdown\",\"params\":{}}\n";
+    let request = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"svcd.shutdown\",\"params\":{}}\n";
     stream
         .write_all(request.as_bytes())
         .expect("write shutdown request");
@@ -8175,7 +8182,6 @@ fn http_mcp_stream_reports_an_unreachable_channel_as_an_sse_error() {
     }
 }
 
-
 /// A stuck supervisor must not pin a blocking worker or an HTTP connection.
 /// Two concurrent management calls hit their control deadline (504, not the
 /// queue-full 503), and the daemon serves requests again once the stop hook
@@ -8298,7 +8304,6 @@ fn a_stuck_supervisor_answers_504_and_the_worker_recovers() {
         || String::new(),
     );
 }
-
 
 /// On Unix the install stream job runs on the shared blocking pool. A client
 /// that disconnects while `plugin.install_staged` is stuck in a post-install

@@ -4,27 +4,27 @@
 
 #[cfg(feature = "http")]
 pub mod budget;
+#[cfg(feature = "http")]
+pub(crate) mod conn;
 pub mod contract;
 pub mod dispatch;
 #[cfg(all(unix, feature = "http"))]
 pub mod driver;
 pub mod engine;
-pub mod model;
-#[cfg(feature = "http")]
-pub mod fallback;
-#[cfg_attr(not(unix), allow(dead_code))]
-pub mod pool;
-#[cfg(feature = "http")]
-pub(crate) mod conn;
 #[cfg(feature = "http")]
 pub mod entry;
 #[cfg(feature = "http")]
-pub(crate) mod hooks;
+pub mod fallback;
 #[cfg(feature = "http")]
-pub(crate) mod threads;
+pub(crate) mod hooks;
+pub mod model;
+#[cfg_attr(not(unix), allow(dead_code))]
+pub mod pool;
 #[cfg(all(unix, feature = "http"))]
 pub mod server;
 pub mod stream;
+#[cfg(feature = "http")]
+pub(crate) mod threads;
 pub mod wire;
 
 // The S4 contract is deliberately available to the minimal build (parent spec

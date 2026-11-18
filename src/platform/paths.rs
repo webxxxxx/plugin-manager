@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use crate::platform::host::dirs;
 use crate::platform::settings::Settings;
 
-pub use crate::platform::host::dirs::user_mode;
 pub(crate) use crate::platform::host::dirs::platform_config_dir;
+pub use crate::platform::host::dirs::user_mode;
 
 /// Every directory the process uses, resolved once at the composition root.
 ///
@@ -213,10 +213,7 @@ mod tests {
     fn resolve_falls_back_to_the_platform_defaults() {
         let paths = Paths::resolve_with(&Settings::default(), |_| None);
         assert_eq!(paths.config_dir, dirs::default_config_dir());
-        assert_eq!(
-            paths.services_dir,
-            paths.config_dir.join("services.d")
-        );
+        assert_eq!(paths.services_dir, paths.config_dir.join("services.d"));
         assert_eq!(paths.trust_dir, paths.config_dir.join("trust.d"));
         assert_eq!(paths.data_dir, default_data_dir());
         assert_eq!(paths.plugins_dir, paths.data_dir.join("plugins"));

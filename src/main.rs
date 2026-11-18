@@ -5,13 +5,13 @@ mod daemon;
 mod face;
 mod kernel;
 mod manage;
-mod selfinstall;
-mod supervise;
 mod platform;
-mod wire;
+mod selfinstall;
 mod server;
+mod supervise;
 #[cfg(test)]
 mod test_support;
+mod wire;
 
 fn main() {
     #[cfg(windows)]
@@ -51,7 +51,9 @@ fn svcd_run(args: Vec<String>) -> i32 {
         Some("run") => run_command(&args[1..]),
         Some("shutdown") if args.len() == 1 => daemon::shutdown(),
         Some("--install") | Some("install") => selfinstall::install::self_install(&args[1..]),
-        Some("--uninstall") | Some("uninstall") => selfinstall::install::self_uninstall(&args[1..], &stop_daemon),
+        Some("--uninstall") | Some("uninstall") => {
+            selfinstall::install::self_uninstall(&args[1..], &stop_daemon)
+        }
         Some("install-service") => selfinstall::install::install_service(&args[1..]),
         Some("uninstall-service") => selfinstall::install::uninstall_service(&args[1..]),
         Some("start") => start_command(),
@@ -114,7 +116,9 @@ fn run_command(args: &[String]) -> i32 {
 /// the plain daemon loop.
 fn run_foreground(conf: Option<std::path::PathBuf>) -> i32 {
     #[cfg(windows)]
-    if let Some(code) = selfinstall::service_win::run_if_service(conf.clone(), daemon::run, request_shutdown) {
+    if let Some(code) =
+        selfinstall::service_win::run_if_service(conf.clone(), daemon::run, request_shutdown)
+    {
         return code;
     }
     daemon::run(conf)

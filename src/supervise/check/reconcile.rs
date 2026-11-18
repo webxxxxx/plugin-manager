@@ -20,8 +20,10 @@ pub(crate) fn merge_desired(
     core: impl IntoIterator<Item = Service>,
     plugins: Vec<Service>,
 ) -> BTreeMap<String, Service> {
-    let mut desired: BTreeMap<String, Service> =
-        core.into_iter().map(|service| (service.id.clone(), service)).collect();
+    let mut desired: BTreeMap<String, Service> = core
+        .into_iter()
+        .map(|service| (service.id.clone(), service))
+        .collect();
     for service in plugins {
         if desired.contains_key(&service.id) {
             continue;

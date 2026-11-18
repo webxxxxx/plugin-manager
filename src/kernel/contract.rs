@@ -162,7 +162,9 @@ impl Contract {
     }
 
     pub fn capability(&self, name: &CapabilityName) -> Option<&Capability> {
-        self.surface.iter().find(|capability| &capability.name == name)
+        self.surface
+            .iter()
+            .find(|capability| &capability.name == name)
     }
 
     /// 契约自身是否合法：能力名唯一、失败类别子集非空、上限单调。
@@ -451,7 +453,9 @@ impl Instance {
 
 /// 内联参数的字节数。用序列化长度，因为它就是线格式的代价。
 pub fn inline_len(arguments: &Value) -> usize {
-    serde_json::to_vec(arguments).map(|bytes| bytes.len()).unwrap_or(usize::MAX)
+    serde_json::to_vec(arguments)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
 }
 
 /// 装配点注册：`tag` → 创建实现的工厂。新增运行载体只加一个 launcher。
@@ -523,7 +527,13 @@ mod tests {
     }
 
     impl RecordingWire {
-        fn boxed(reply: Value) -> (Box<dyn Wire>, Arc<AtomicUsize>, Arc<std::sync::Mutex<Option<Duration>>>) {
+        fn boxed(
+            reply: Value,
+        ) -> (
+            Box<dyn Wire>,
+            Arc<AtomicUsize>,
+            Arc<std::sync::Mutex<Option<Duration>>>,
+        ) {
             let calls = Arc::new(AtomicUsize::new(0));
             let last_timeout = Arc::new(std::sync::Mutex::new(None));
             let wire = RecordingWire {
@@ -536,11 +546,7 @@ mod tests {
     }
 
     impl Wire for RecordingWire {
-        fn call(
-            &mut self,
-            invocation: Invocation,
-            done: ReplySink,
-        ) -> Result<(), Rejection> {
+        fn call(&mut self, invocation: Invocation, done: ReplySink) -> Result<(), Rejection> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_timeout.lock().expect("timeout slot") = Some(invocation.timeout);
             done(Ok(Reply::Value(self.reply.clone())));
@@ -569,7 +575,13 @@ mod tests {
         )
     }
 
-    fn instance_with(limits: Limits) -> (Instance, Arc<AtomicUsize>, Arc<std::sync::Mutex<Option<Duration>>>) {
+    fn instance_with(
+        limits: Limits,
+    ) -> (
+        Instance,
+        Arc<AtomicUsize>,
+        Arc<std::sync::Mutex<Option<Duration>>>,
+    ) {
         let (wire, calls, last_timeout) = RecordingWire::boxed(json!({"ok": true}));
         let instance = Instance::new(contract_with(limits), wire).expect("valid contract");
         (instance, calls, last_timeout)
@@ -622,12 +634,19 @@ mod tests {
             ),
             "{error:?}"
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "the implementation must not be called");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the implementation must not be called"
+        );
     }
 
     #[test]
     fn arguments_over_the_inline_limit_are_rejected_before_the_call() {
-        let limits = Limits { max_inline: 16, ..Limits::default() };
+        let limits = Limits {
+            max_inline: 16,
+            ..Limits::default()
+        };
         let (mut instance, calls, _) = instance_with(limits);
         let error = instance
             .call_blocking(Invocation::new(
@@ -636,8 +655,15 @@ mod tests {
                 Duration::from_secs(1),
             ))
             .expect_err("too large");
-        assert!(matches!(error, CallError::Rejected(Rejection::BadArguments { .. })), "{error:?}");
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "the implementation must not be called");
+        assert!(
+            matches!(error, CallError::Rejected(Rejection::BadArguments { .. })),
+            "{error:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the implementation must not be called"
+        );
     }
 
     #[test]
@@ -646,30 +672,43 @@ mod tests {
         let error = instance
             .call_blocking(Invocation::new("status", json!({}), Duration::ZERO))
             .expect_err("zero timeout");
-        assert!(matches!(error, CallError::Rejected(Rejection::BadArguments { .. })), "{error:?}");
+        assert!(
+            matches!(error, CallError::Rejected(Rejection::BadArguments { .. })),
+            "{error:?}"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
     fn a_timeout_above_the_ceiling_is_clamped_not_rejected() {
-        let limits = Limits { default_timeout: Duration::from_secs(5), max_timeout: Duration::from_secs(5), ..Limits::default() };
+        let limits = Limits {
+            default_timeout: Duration::from_secs(5),
+            max_timeout: Duration::from_secs(5),
+            ..Limits::default()
+        };
         let (mut instance, calls, last_timeout) = instance_with(limits);
         instance
-            .call_blocking(Invocation::new("status", json!({}), Duration::from_secs(60)))
+            .call_blocking(Invocation::new(
+                "status",
+                json!({}),
+                Duration::from_secs(60),
+            ))
             .expect("clamped, not rejected");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        let observed = last_timeout.lock().expect("timeout slot").expect("observed");
+        let observed = last_timeout
+            .lock()
+            .expect("timeout slot")
+            .expect("observed");
         assert_eq!(observed, Duration::from_secs(5), "clamped to max_timeout");
     }
 
     #[test]
     fn an_undeclared_failure_class_is_normalized_to_implementation_error() {
         // 契约只声明 NotRunning 与 ImplementationError；实现却报了 Busy。
-        let wire = crate::kernel::memory::MemoryWire::new().with_failure(
-            "status",
-            Failure::new(Class::Busy, Retry::Never, "busy"),
-        );
-        let mut instance = Instance::new(contract_with(Limits::default()), Box::new(wire)).expect("valid");
+        let wire = crate::kernel::memory::MemoryWire::new()
+            .with_failure("status", Failure::new(Class::Busy, Retry::Never, "busy"));
+        let mut instance =
+            Instance::new(contract_with(Limits::default()), Box::new(wire)).expect("valid");
         match instance.call_blocking(Invocation::new("status", json!({}), Duration::from_secs(1))) {
             Err(CallError::Failed(failure)) => assert_eq!(
                 failure.class,
@@ -692,7 +731,10 @@ mod tests {
         let launchers = Launchers::default();
         let outcome = launchers.launch(
             contract_with(Limits::default()),
-            &ImplRef { tag: "wasm".into(), binding: json!({}) },
+            &ImplRef {
+                tag: "wasm".into(),
+                binding: json!({}),
+            },
         );
         match outcome {
             Err(LaunchError::UnknownTag(tag)) => assert_eq!(tag, "wasm"),

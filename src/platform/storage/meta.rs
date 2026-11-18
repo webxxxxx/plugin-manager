@@ -9,9 +9,9 @@ use serde_json::{json, Value};
 
 use crate::platform::paths::Paths;
 
-use super::path::{blob_path, import_file, path};
 #[cfg(feature = "http")]
 use super::path::file_dir;
+use super::path::{blob_path, import_file, path};
 #[cfg(feature = "http")]
 use super::upload::file_meta;
 use super::{Error, Result};

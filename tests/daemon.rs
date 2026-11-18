@@ -1100,7 +1100,9 @@ if ($action -eq 'start') { start } elseif ($action -eq 'status') { status }
 
     let child = ProcessInstance::capture(child_pid);
     let leader = ProcessInstance::capture(
-        sandbox.status("demo")["summary"]["pid"].as_u64().expect("leader pid") as u32,
+        sandbox.status("demo")["summary"]["pid"]
+            .as_u64()
+            .expect("leader pid") as u32,
     );
     wait_until("the script leader to exit", Duration::from_secs(10), || {
         !leader.is_alive()
@@ -1216,9 +1218,7 @@ fn process_start_time(pid: u32) -> Option<u64> {
             if ok == 0 {
                 return None;
             }
-            return Some(
-                ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64,
-            );
+            return Some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64);
         }
     }
     #[cfg(target_os = "linux")]
@@ -1774,9 +1774,13 @@ esac
     }
 
     fn wait_for_state(&self, id: &str, expected: &str, timeout: Duration) -> Value {
-        support::wait_for_state(id, expected, timeout, || self.status(id), || {
-            support::tail_lines(&self.daemon_log(), 20)
-        })
+        support::wait_for_state(
+            id,
+            expected,
+            timeout,
+            || self.status(id),
+            || support::tail_lines(&self.daemon_log(), 20),
+        )
     }
 
     fn start_service(&self, id: &str) -> Value {
@@ -1864,9 +1868,7 @@ fn assert_state_matrix(sandbox: &Sandbox, id: &str, kind: &str, boot_started: bo
     assert_eq!(again.status.code(), Some(0));
     let same = sandbox.status(id);
     assert_eq!(same["summary"]["state"], "running");
-    let current = ProcessInstance::capture(
-        same["summary"]["pid"].as_u64().expect("pid") as u32,
-    );
+    let current = ProcessInstance::capture(same["summary"]["pid"].as_u64().expect("pid") as u32);
     assert!(
         !instance.is_replaced_by(current),
         "start while running replaced the instance: {same}"
@@ -2000,11 +2002,9 @@ fn five_quick_crashes_enter_failed_and_explicit_start_resets() {
     for attempt in 1..=5 {
         kill_pid(instance.pid);
         if attempt < 5 {
-            let restarted =
-                sandbox.wait_for_restart("crashy", instance, Duration::from_secs(20));
-            instance = ProcessInstance::capture(
-                restarted["summary"]["pid"].as_u64().expect("pid") as u32,
-            );
+            let restarted = sandbox.wait_for_restart("crashy", instance, Duration::from_secs(20));
+            instance =
+                ProcessInstance::capture(restarted["summary"]["pid"].as_u64().expect("pid") as u32);
         }
     }
 
@@ -2649,8 +2649,7 @@ fn restart_runs_stop_then_start_and_changes_the_pid() {
     );
 
     let status = sandbox.wait_for_state("core", "running", Duration::from_secs(15));
-    let second =
-        ProcessInstance::capture(status["summary"]["pid"].as_u64().expect("pid") as u32);
+    let second = ProcessInstance::capture(status["summary"]["pid"].as_u64().expect("pid") as u32);
     // `restart` must replace the process. Pid inequality alone is the wrong
     // check: the OS may hand the old pid to the new process, and an unrelated
     // process may hold the old pid without being the old instance (#155).
@@ -2661,9 +2660,11 @@ fn restart_runs_stop_then_start_and_changes_the_pid() {
     // The old process exits asynchronously after `restart` returns. Asserting
     // `!pid_alive` immediately made a parallel full run red while the process
     // was still winding down (#153); wait for the observable end state instead.
-    wait_until("the pre-restart instance to exit", Duration::from_secs(10), || {
-        !first.is_alive()
-    });
+    wait_until(
+        "the pre-restart instance to exit",
+        Duration::from_secs(10),
+        || !first.is_alive(),
+    );
     sandbox.stop_service("core");
 }
 
@@ -3014,8 +3015,7 @@ fn a_runtime_record_from_another_boot_is_ignored() {
 
     sandbox.start_daemon_ready();
     let status = sandbox.wait_for_state("script", "running", Duration::from_secs(15));
-    let current =
-        ProcessInstance::capture(status["summary"]["pid"].as_u64().expect("pid") as u32);
+    let current = ProcessInstance::capture(status["summary"]["pid"].as_u64().expect("pid") as u32);
     assert!(
         stale.is_replaced_by(current),
         "a record from another boot must not be adopted: {}",

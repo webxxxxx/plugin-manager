@@ -27,10 +27,10 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use crate::wire::message::ipc::{FrameError, FrameEvent};
-use crate::platform::log::{self, LogSink};
-use crate::wire::message::ipc::{RawFailure, RawStopSink};
 use crate::platform::host::wake::Wake;
+use crate::platform::log::{self, LogSink};
+use crate::wire::message::ipc::{FrameError, FrameEvent};
+use crate::wire::message::ipc::{RawFailure, RawStopSink};
 
 const READ_CHUNK: usize = 8 * 1024;
 const MAX_LOG_LINE: usize = 64 * 1024;
@@ -316,19 +316,17 @@ impl Reactor {
         max: usize,
         framing: Framing,
     ) -> io::Result<()> {
-        let mut sources = vec![
-            Source::new(
-                id.clone(),
-                stdout,
-                SourceKind::Frames {
-                    sender,
-                    max,
-                    wake,
-                    framing,
-                },
-            )
-            .with_log(log.clone()),
-        ];
+        let mut sources = vec![Source::new(
+            id.clone(),
+            stdout,
+            SourceKind::Frames {
+                sender,
+                max,
+                wake,
+                framing,
+            },
+        )
+        .with_log(log.clone())];
         if let Some(stderr) = stderr {
             sources.push(Source::new(id, stderr, SourceKind::Log).with_log(log));
         }
@@ -345,9 +343,8 @@ impl Reactor {
         stderr: Option<File>,
         log: Option<Arc<Mutex<LogSink>>>,
     ) -> io::Result<()> {
-        let mut sources = vec![
-            Source::new(id.clone(), stdout, SourceKind::Log).with_log(log.clone()),
-        ];
+        let mut sources =
+            vec![Source::new(id.clone(), stdout, SourceKind::Log).with_log(log.clone())];
         if let Some(stderr) = stderr {
             sources.push(Source::new(id, stderr, SourceKind::Log).with_log(log));
         }
@@ -376,13 +373,9 @@ impl Reactor {
         enlarge_pipe(&stdin);
         let queue = RawOutQueue::new(capacity, self.wake.try_clone()?);
         let mut sources = vec![
-            Source::new(
-                id.clone(),
-                stdout,
-                SourceKind::RawStdout { max_frame },
-            )
-            .with_log(log.clone())
-            .with_plugin(hub.clone(), generation),
+            Source::new(id.clone(), stdout, SourceKind::RawStdout { max_frame })
+                .with_log(log.clone())
+                .with_plugin(hub.clone(), generation),
             Source::new(
                 id.clone(),
                 stdin,
@@ -502,13 +495,7 @@ impl PollSet {
         } else {
             timeout_ms
         };
-        let ready = unsafe {
-            libc::poll(
-                fds.as_mut_ptr(),
-                fds.len() as libc::nfds_t,
-                timeout_ms,
-            )
-        };
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
         if ready < 0 {
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
@@ -597,7 +584,9 @@ fn retire(sources: &mut Vec<Source>) {
     kept.retain(|source| !closed.contains(&source.key));
     *sources = kept;
     for (key, hub, reason) in closing {
-        let Some((hub, generation)) = hub else { continue };
+        let Some((hub, generation)) = hub else {
+            continue;
+        };
         let Some(hub) = hub.upgrade() else { continue };
         hub.note_transport_failure(reason, &key);
         hub.unregister_generation(&key, generation);
@@ -1100,7 +1089,6 @@ mod tests {
             vec!["three".to_string()]
         );
     }
-
 
     #[test]
     fn raw_queue_preserves_frame_order_across_passes() {

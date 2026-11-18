@@ -371,11 +371,9 @@ pub fn copy_body<R: Read>(
             let mut buffer = [0u8; 64 * 1024];
             while total < length {
                 let want = std::cmp::min(buffer.len() as u64, length - total) as usize;
-                let read = reader
-                    .read(&mut buffer[..want])
-                    .map_err(|error| {
-                        BodyError::Malformed(format!("read request body: {}", error))
-                    })?;
+                let read = reader.read(&mut buffer[..want]).map_err(|error| {
+                    BodyError::Malformed(format!("read request body: {}", error))
+                })?;
                 if read == 0 {
                     return Err(BodyError::Malformed("truncated request body".into()));
                 }
@@ -389,11 +387,9 @@ pub fn copy_body<R: Read>(
             decoder.feed(initial, sink)?;
             let mut buffer = [0u8; 64 * 1024];
             while !decoder.is_done() {
-                let read = reader
-                    .read(&mut buffer)
-                    .map_err(|error| {
-                        BodyError::Malformed(format!("read request body: {}", error))
-                    })?;
+                let read = reader.read(&mut buffer).map_err(|error| {
+                    BodyError::Malformed(format!("read request body: {}", error))
+                })?;
                 if read == 0 {
                     return Err(BodyError::Malformed("truncated chunked body".into()));
                 }

@@ -5,7 +5,7 @@
 /// JSON-RPC frames; manifest validation forces `exec.ready=exec` for it.
 pub(crate) const RAW_PROTOCOL: u32 = 3;
 
+pub mod rawhub;
 #[cfg(unix)]
 pub mod reactor;
-pub mod rawhub;
 pub mod stdio;

@@ -19,10 +19,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use crate::wire::control::channel::PendingCall;
-use crate::server::http::model as http;
-use crate::server::auth::lan::Lan;
+use crate::platform::host::wake::Wake;
 use crate::platform::log;
+use crate::server::auth::lan::Lan;
 use crate::server::control::client::StreamingClient;
 use crate::server::control::handle::LoopHandle;
 use crate::server::control::listener::{ControlServer, Source};
@@ -32,6 +31,7 @@ use crate::server::http::engine::{
     self, keep_alive_response, wants_keep_alive, Connection as EngineConnection, HttpRequest,
     PreRequest, ServerLoop, Table,
 };
+use crate::server::http::model as http;
 use crate::server::http::{
     attach_face_body, busy_response, complete_blocking, dispatch_inline, render_exchange,
     route_face_request, BlockingOutcome, BlockingPool, BodyPolicy, Busy, CancelToken,
@@ -40,7 +40,7 @@ use crate::server::http::{
 };
 use crate::server::mcp::progress::{McpSseStream, PROGRESS_QUEUE_SLOTS};
 use crate::server::mcp::transport;
-use crate::platform::host::wake::Wake;
+use crate::wire::control::channel::PendingCall;
 
 use crate::server::http::hooks::{FallbackHandler, PreBodyRoutes};
 

@@ -109,7 +109,10 @@ pub enum BlockingOutcome {
     /// The job ran and failed. The status was decided where the failure was
     /// raised (typed category, #151); the handler projects it and never parses
     /// `message`.
-    Failed { status: u16, message: String },
+    Failed {
+        status: u16,
+        message: String,
+    },
 }
 
 impl BlockingOutcome {

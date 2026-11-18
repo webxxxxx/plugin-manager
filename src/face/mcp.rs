@@ -1,11 +1,11 @@
-use crate::wire::control::channel;
-use crate::wire::message::ipc::{self, FrameEvent};
 use crate::kernel::registry::{Kind, Registry};
-use crate::wire::message::rpc;
 use crate::server::mcp::result::{
     error_response, result_value, server_meta, tool_error_result, tool_result_object, SERVER_NAME,
 };
 use crate::server::mcp::session::{validate_meta, Served, MODERN_VERSION};
+use crate::wire::control::channel;
+use crate::wire::message::ipc::{self, FrameEvent};
+use crate::wire::message::rpc;
 use serde_json::{json, Value};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};

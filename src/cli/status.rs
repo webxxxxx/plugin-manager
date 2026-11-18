@@ -8,8 +8,8 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::platform::clock::Now;
 use crate::kernel::registry::{Kind, Service, State};
+use crate::platform::clock::Now;
 use crate::supervise::model::supervisor::Machine;
 
 /// The fixed `svc status` payload. `svc list` and the text output are both

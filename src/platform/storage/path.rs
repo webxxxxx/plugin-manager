@@ -5,9 +5,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(any(feature = "http", test))]
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 #[cfg(feature = "http")]
 use std::time::UNIX_EPOCH;
-use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
 

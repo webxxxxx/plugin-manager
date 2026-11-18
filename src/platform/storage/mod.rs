@@ -14,9 +14,9 @@ mod path;
 mod upload;
 
 pub(crate) use gc::cleanup;
-pub(crate) use meta::{materialize_result, resolve_args};
 #[cfg(any(feature = "http", test))]
 pub(crate) use meta::Meta;
+pub(crate) use meta::{materialize_result, resolve_args};
 #[cfg(feature = "http")]
 pub(crate) use part::{upload_parts, PartInfo, PartWriter};
 #[cfg(any(feature = "http", test))]
@@ -27,13 +27,13 @@ pub(crate) use upload::{
     require_upload_kind, Upload, UploadKind,
 };
 
-#[cfg(test)]
-pub(crate) use path::{file_dir, hex, path, put, read, upload_dir};
 pub(crate) use path::incoming_dir;
 #[cfg(any(feature = "http", test))]
 pub(crate) use path::locate;
 #[cfg(feature = "http")]
 pub(crate) use path::valid_upload_id;
+#[cfg(test)]
+pub(crate) use path::{file_dir, hex, path, put, read, upload_dir};
 #[cfg(test)]
 pub(crate) use upload::read_upload_kind;
 

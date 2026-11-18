@@ -458,7 +458,11 @@ fn daemon_launcher(program: &Path, dirs: &RuntimeDirs) -> String {
 /// Record the effective install root in the installed `svcd.conf`, keeping
 /// comments and the normal 0644 mode.
 fn record_install_dir(path: &Path, install_dir: &Path) -> Result<(), String> {
-    crate::platform::settings::update_value(path, "install_dir", &install_dir.display().to_string())?;
+    crate::platform::settings::update_value(
+        path,
+        "install_dir",
+        &install_dir.display().to_string(),
+    )?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

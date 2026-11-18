@@ -4,7 +4,9 @@ use std::path::Path;
 
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::manage::check::verify::parse_manifest;
-use crate::manage::model::ustar::{tar_entry_bytes, tar_header_bytes, tar_padding_bytes, TarPlan, TAR_TRAILER};
+use crate::manage::model::ustar::{
+    tar_entry_bytes, tar_header_bytes, tar_padding_bytes, TarPlan, TAR_TRAILER,
+};
 
 fn read_export_signature(version_dir: &Path) -> Result<Vec<u8>, ProblemError> {
     match fs::read(version_dir.join("signature.json")) {
@@ -34,10 +36,12 @@ pub fn plan_installed_spk(version_dir: &Path) -> Result<TarPlan, ProblemError> {
         let path = version_dir.join(&file.path);
         // parse_manifest validated the path; the size check keeps a truncated
         // install from advertising a Content-Length it cannot send.
-        let metadata =
-            fs::metadata(&path).map_err(|error| Problem::Internal.error(format!("stat {}: {}", file.path, error)))?;
+        let metadata = fs::metadata(&path)
+            .map_err(|error| Problem::Internal.error(format!("stat {}: {}", file.path, error)))?;
         if metadata.len() != file.size {
-            return Err(Problem::Internal.error(format!("installed file is corrupt: {}", file.path)));
+            return Err(
+                Problem::Internal.error(format!("installed file is corrupt: {}", file.path))
+            );
         }
         plan.push_bytes(tar_header_bytes(&file.path, file.size, file.mode & 0o777)?);
         if file.size > 0 {

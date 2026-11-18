@@ -132,9 +132,9 @@ impl ServerLoop for ControlOnly {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::host::wake::Wake;
     use crate::wire::control::channel::PendingCall;
     use crate::wire::message::rpc;
-    use crate::platform::host::wake::Wake;
     use std::io::{BufRead, BufReader, Write};
     use std::sync::mpsc;
     use std::time::Duration;
@@ -164,11 +164,14 @@ mod tests {
                 )));
             }
         });
-        let control = crate::wire::control::channel::bind_server(&root, tx, Arc::new(Wake::new()), 64 * 1024)
-            .expect("control channel");
-        let handle =
-            spawn_control_only(control, std::sync::Arc::new(crate::platform::limits::test_default()))
-                .expect("loop");
+        let control =
+            crate::wire::control::channel::bind_server(&root, tx, Arc::new(Wake::new()), 64 * 1024)
+                .expect("control channel");
+        let handle = spawn_control_only(
+            control,
+            std::sync::Arc::new(crate::platform::limits::test_default()),
+        )
+        .expect("loop");
 
         let mut stream = UnixStream::connect(&path).expect("connect");
         stream

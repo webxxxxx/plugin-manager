@@ -204,12 +204,7 @@ fn a_broken_config_is_a_hard_error_for_every_entry() {
 
     for (name, args) in [("svc", &["list"][..]), ("plugin", &["list"][..])] {
         let output = sandbox.run_as(name, args);
-        assert_eq!(
-            output.status.code(),
-            Some(1),
-            "{name}: {}",
-            stderr(&output)
-        );
+        assert_eq!(output.status.code(), Some(1), "{name}: {}", stderr(&output));
         assert!(
             stderr(&output).contains("invalid config"),
             "{name}: {}",
@@ -238,11 +233,7 @@ fn a_broken_config_is_a_hard_error_for_every_entry() {
     // multicall binary dispatches on its file stem, so it must be `mcp`.
     let mcp = sandbox.run_as("mcp", &[]);
     assert_eq!(mcp.status.code(), Some(1), "{}", stderr(&mcp));
-    assert!(
-        stderr(&mcp).contains("invalid config"),
-        "{}",
-        stderr(&mcp)
-    );
+    assert!(stderr(&mcp).contains("invalid config"), "{}", stderr(&mcp));
 
     // Usage does not need a config.
     assert_eq!(sandbox.run(&["--help"]).status.code(), Some(64));
@@ -440,5 +431,3 @@ fn trust_add_list_and_remove_manage_the_trust_store() {
         .join("bad.pub")
         .exists());
 }
-
-

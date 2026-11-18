@@ -58,8 +58,13 @@ jobs:
           fetch-depth: 0
       - name: Fetch main
         run: git fetch --no-tags origin main:refs/remotes/origin/main
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - name: Architecture rules (dep-lint)
         run: node tools/dep-lint.mjs
+      - name: Formatting (rustfmt)
+        run: node tools/check.mjs fmt
       - name: Every closed #112 ticket has a commit on main
         env:
           GH_TOKEN: ${{ github.token }}

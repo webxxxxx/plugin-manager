@@ -99,6 +99,8 @@ node tools/fmt.mjs --check src/manage/package.rs
 文件）；`fmt.mjs` 带 `--config skip_children=true`，并且拒绝 `src/`、`tests/` 以外的路径。
 没有「格式化全仓」模式：不传文件就是用法错误。
 
+全仓是否干净由 gate 检查：`node tools/check.mjs fmt`（CI `guardrails` 同款，156 个文件）。
+
 ## 反例（#151 实录）
 
 - 手写 `str.replace` 全局替换，一次把 `Result<T, String>` 改成了 `Result<T>`，66 个签名丢掉

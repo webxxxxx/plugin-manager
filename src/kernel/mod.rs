@@ -5,8 +5,8 @@
 // 并入调用点后应逐项摘掉。
 
 pub mod contract;
-pub mod registry;
 pub mod failure;
+pub mod registry;
 pub mod schema;
 
 #[cfg(test)]

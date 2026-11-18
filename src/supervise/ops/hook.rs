@@ -14,8 +14,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::kernel::failure::{Problem, ProblemError};
-use crate::platform::log::{self, LogSink};
 use crate::manage::package;
+use crate::platform::log::{self, LogSink};
 use crate::platform::paths::Paths;
 
 /// Both hook actions share the same 60-second budget.
@@ -94,9 +94,10 @@ pub fn run(
     };
     let tree = crate::platform::host::process::Tree::new();
     let (mut child, streams) =
-        crate::wire::contract::stdio::spawn(command, crate::wire::contract::stdio::Plan::hook()).map_err(|error| {
-            Problem::Internal.error(format!("spawn {} hook: {}", spec.action, error))
-        })?;
+        crate::wire::contract::stdio::spawn(command, crate::wire::contract::stdio::Plan::hook())
+            .map_err(|error| {
+                Problem::Internal.error(format!("spawn {} hook: {}", spec.action, error))
+            })?;
     let _ = crate::platform::host::process::adopt(&child);
     if let Some(tree) = &tree {
         tree.assign(&child);
@@ -115,9 +116,12 @@ pub fn run(
         }
     }
     if let Some(stderr) = streams.stderr {
-        if let Err(error) =
-            crate::wire::contract::stdio::log_lines(format!("svcd-{}-hook-err", spec.id), stderr, log, limits)
-        {
+        if let Err(error) = crate::wire::contract::stdio::log_lines(
+            format!("svcd-{}-hook-err", spec.id),
+            stderr,
+            log,
+            limits,
+        ) {
             log::svcd(&format!(
                 "svcd: plugin {}: {} hook stderr reader: {}",
                 spec.id, spec.action, error
@@ -282,7 +286,12 @@ mod tests {
     }
 
     fn run(spec: &Invocation<'_>, poll: &mut dyn FnMut()) -> Result<(), ProblemError> {
-        super::run(spec, &test_paths(), &crate::platform::limits::test_default(), poll)
+        super::run(
+            spec,
+            &test_paths(),
+            &crate::platform::limits::test_default(),
+            poll,
+        )
     }
     use std::fs;
     use std::path::PathBuf;

@@ -108,6 +108,7 @@ Windows 走每连接线程回退，但上面的连接数、每 IP 与 idle 探�
 node tools/check.mjs quick
 node tools/check.mjs test <filter>          # 默认 --test-threads=1，与 CI 同参
 node tools/check.mjs full                   # 同上；--parallel 才并行
+node tools/check.mjs fmt                    # rustfmt --check 全仓（CI guardrails 同款）
 
 # 跨平台编译（Windows 宿主机必须跑一次：`cfg(unix)` 的代码在本机根本不编译，
 # quick/full 全绿不代表 Linux 能编；默认 target 与 CI 的 musl job 一致）
@@ -116,7 +117,7 @@ node tools/check.mjs cross <target>
 
 # 跨平台行为（Windows 宿主，WSL2）：cross 只编译；Linux 的 reactor、线程预算与
 # cfg(unix) 测试在 WSL 里真跑。用票自己的 worktree，target 放 Linux 文件系统。
-#   cd /mnt/d/<repo-parent>/<repo>.worktrees/<ticket>   # worktree 在仓库外，cargo clean 不会删
+#   cd /mnt/d/<repo>/<repo>/.worktrees/<ticket>          # worktree 在仓库内 .worktrees/
 #   CARGO_TARGET_DIR=/tmp/wt-<ticket>-target cargo test --no-fail-fast -- --test-threads=1
 #   CARGO_TARGET_DIR=/tmp/wt-<ticket>-target cargo test --test http \
 #     unix_idle_thread_count_has_no_per_request_or_per_stream_threads -- --exact

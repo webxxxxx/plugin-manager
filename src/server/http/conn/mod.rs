@@ -20,9 +20,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::platform::config::Config;
 use crate::server::auth::lan::Lan;
-use crate::wire::contract::rawhub::RawHub;
 use crate::server::http::hooks::{FallbackHandler, PreBodyRoutes};
 use crate::server::http::Face;
+use crate::wire::contract::rawhub::RawHub;
 
 #[cfg(unix)]
 pub(crate) mod poll;
@@ -77,8 +77,7 @@ impl ServerHandle {
         if let Some(inner) = &self.inner {
             inner.shutdown();
         }
-        self.stop
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

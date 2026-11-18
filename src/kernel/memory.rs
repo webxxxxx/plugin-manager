@@ -49,8 +49,7 @@ impl MemoryWire {
     }
 
     pub fn with_failure(mut self, capability: &str, failure: Failure) -> MemoryWire {
-        self.replies
-            .insert(capability.to_string(), Err(failure));
+        self.replies.insert(capability.to_string(), Err(failure));
         self
     }
 

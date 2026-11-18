@@ -14,7 +14,10 @@ use crate::manage::package;
 use crate::manage::plugin::{current_version, plugin_dir};
 use crate::platform::paths::Paths;
 
-pub fn scan(paths: &Paths, limits: &crate::platform::limits::Limits) -> (Vec<Service>, Vec<String>) {
+pub fn scan(
+    paths: &Paths,
+    limits: &crate::platform::limits::Limits,
+) -> (Vec<Service>, Vec<String>) {
     let root = &paths.plugins_dir;
     let host = crate::platform::compat::detect(paths, MAX_SCHEMA, MAX_PROTOCOL);
     let mut services = Vec::new();
@@ -73,7 +76,8 @@ pub fn scan(paths: &Paths, limits: &crate::platform::limits::Limits) -> (Vec<Ser
                     .as_ref()
                     .map(|spec| spec.devices.clone())
                     .unwrap_or_default();
-                match crate::platform::compat::evaluate(crate::platform::target(), &devices, &host) {
+                match crate::platform::compat::evaluate(crate::platform::target(), &devices, &host)
+                {
                     crate::platform::compat::Verdict::Compatible => services.push(service),
                     verdict => {
                         let reason = crate::platform::compat::verdict_reason(verdict)
