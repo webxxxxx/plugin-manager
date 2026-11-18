@@ -211,6 +211,10 @@ _Avoid_: 恢复、重启、重连
 启动动作成功退出后效果仍然存在的服务（建隧道、挂载）。成功退出后保持 `running`、`pid` 为空；`svc start` 重跑，`svc stop` 只跑停止动作。core JSON 用 `remain_after_exit` 显式声明；drop-in shell 脚本在 `restart != always` 时沿用 shell 约定。
 _Avoid_: 守护脚本、短命服务
 
+**通道对端（Channel peer）**:
+一种服务形态：就绪后，调用方的话要说进它的 stdio 通道——通知型插件的 JSON-RPC，或 raw 传输的二进制帧。通道跟着进程走，进程退出通道就没了，所以对调用方来说它的「干净退出」不是完成，而是不可用。
+_Avoid_: 长驻服务、后台服务、守护进程（daemon 专指 svcd）、有状态服务
+
 **流（Flow）**:
 一组步骤及其依赖关系，加上每步的输入输出映射；它是一份可被包装成服务的编排定义。
 _Avoid_: 工作流、pipeline；也不要拿「编排」当名词用——编排是动作，流是定义
