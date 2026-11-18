@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::platform::compat;
 use crate::supervise::ops::hook;
-use crate::manage::interpreter;
+use crate::manage::check::interpreter;
 use crate::kernel::contract::{Capability as KernelCapability, CapabilityName, Effect};
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};

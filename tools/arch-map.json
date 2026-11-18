@@ -316,11 +316,7 @@
     "src/wire/control/channel/platform/unix.rs": "channel",
     "src/wire/control/channel/platform/windows.rs": "channel",
     "src/manage/package.rs": "package",
-    "src/manage/bundle.rs": "bundle",
-    "src/manage/trust.rs": "trust",
-    "src/manage/interpreter.rs": "interpreter",
     "src/manage/plugin.rs": "plugin",
-    "src/manage/transfer.rs": "transfer",
     "src/selfinstall/install.rs": "install",
     "src/selfinstall/service_win.rs": "service_win",
     "src/server/http/model.rs": "http",
@@ -345,6 +341,10 @@
     "src/supervise/ops/slot.rs": "slot",
     "src/supervise/ops/hook.rs": "hook",
     "src/supervise/ops/script.rs": "script",
-    "src/supervise/ops/builtin_adapter.rs": "builtin_adapter"
+    "src/supervise/ops/builtin_adapter.rs": "builtin_adapter",
+    "src/manage/check/trust.rs": "trust",
+    "src/manage/check/interpreter.rs": "interpreter",
+    "src/manage/ops/bundle.rs": "bundle",
+    "src/manage/ops/transfer.rs": "transfer"
   }
 }

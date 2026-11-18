@@ -183,7 +183,7 @@ impl ApiFace {
     }
 
     fn trust_list(&self) -> Response {
-        match crate::manage::trust::keys(&self.config.paths) {
+        match crate::manage::check::trust::keys(&self.config.paths) {
             Ok(keys) => Response::json(
                 200,
                 &json!({
@@ -202,7 +202,7 @@ impl ApiFace {
         if body.is_empty() {
             return error_response(400, "bad_request", "empty public key");
         }
-        match crate::manage::trust::add(&self.config.paths, &key_id, body) {
+        match crate::manage::check::trust::add(&self.config.paths, &key_id, body) {
             Ok(path) => Response::json(
                 200,
                 &json!({
@@ -215,7 +215,7 @@ impl ApiFace {
     }
 
     fn trust_remove(&self, key_id: &str) -> Response {
-        match crate::manage::trust::remove(&self.config.paths, key_id) {
+        match crate::manage::check::trust::remove(&self.config.paths, key_id) {
             Ok(true) => Response::json(200, &json!({ "keyId": key_id, "removed": true })),
             Ok(false) => error_response(
                 404,
