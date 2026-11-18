@@ -284,7 +284,8 @@ src/
 |---|---|---|
 | **组合根反向持有对外面的数据类型** | 组合根曾 `use crate::cli::status::Status`（rank 6 持有 rank 5 的类型，层方向检查抓不到，因为 6 ≥ 5） | **已修于 #212**：`Status` 与 `Live` 进 `kernel/projection.rs`，`cli/status.rs` 只剩 `table` / `text` |
 | **想象中的 seam** | `Slot::set_projector` 的唯一注入点在组合根，而读它的 `Slot::project` 与 `CallSink::Client` 当时都标着 `#[cfg(test)]` | **已修于 #209**：那套机制连同 `CallSink` 枚举一起删掉，槽的完成回调直接就是调用方给的 `ReplySink` |
-| **同一份值转换实现两次，护栏只有一处** | `daemon.rs` 的 `persist_states` 自己算 `now.epoch_of(machine.since_ms)`，而 `kernel/projection.rs` 的 `epoch_secs` 另有 `ms == 0 → None` 保护 | **未修，见 #215**：这不是四条不变量里的哪一条，而是「唯一投影源」在时间换算上的漏网——同一份事实可能给出两个 `since` |
+| **同一份值转换实现两次，护栏只有一处** | `daemon.rs` 的 `persist_states` 自己算 `now.epoch_of(machine.since_ms)`，而 `kernel/projection.rs` 的 `epoch_secs` 另有 `ms == 0 → None` 保护 | **已修于 #215**：`persist_states` 改吃 `Machine::live()`，锚定只走内核唯一的 `anchored_secs`（`ms == 0 → None`）；`since_ms == 0` 时记录里不再有 `since`，新增的模块级测试同时断言记录与 `Status::live` 一致 |
+| **同一份反向换算写两遍，缺失值被回落成 `now`** | `daemon.rs` 的 `adopt_runtime` 两个分支各写一遍 `now.mono_of(record.since.unwrap_or(now.epoch_secs))`：记录缺 `since` 时被回落成本次 daemon 启动时刻，`Status::live` 会给出一个合理但错误的 `since` | **未修，见 #216**：写侧已由 #215 收掉；读侧应把缺失落到「从未发生过」（`since_ms == 0` → `since: null`），并把两处换算收成一处 |
 
 （历史：原文那三条与上表第三条的前身都已修掉，核实记录见 [ADR-0025](adr/0025-projection-is-a-face-neutral-value.md) 的 Context。#210 把「同一份协议 envelope 在两个面各写一次」也修了：分页包改成控制通道传面中立的 `next`、由 MCP 面渲染成 `nextCursor`；auth 四键收敛到 `LanStatus` 一个值，两面各自渲染并加跨面一致性测试。）
 
