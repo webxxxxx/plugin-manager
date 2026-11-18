@@ -243,7 +243,7 @@ src/
     mod.rs  plan.rs  execute.rs  service_win.rs
 ```
 
-**step 6（#170）已按本树整文件搬迁**：文件进了对应目录但内容没切。`api.rs` 的四块已在 #173 拆完（只剩 compose 的装配与回退 loop）；`platform/storage` 的五文件已在 #175 拆完（`meta` / `path` / `upload` / `part` / `gc`）；`supervise` 的 `model/` 与 `ops/` 已整文件落位（#176）；`check/` 先落了 `backoff` 与 `restart` 的纯判定（#178），`oneshot` / `reconcile` 仍待拆分；`manage` 的 `check/` 与 `ops/` 已整文件落位（#177）；`package.rs` 的清单类型已搬进 `model/manifest.rs`（#181），tar 编解码、校验与 staging 仍待切片；`plugin.rs` 的内容拆分仍是后续票。
+**step 6（#170）已按本树整文件搬迁**：文件进了对应目录但内容没切。`api.rs` 的四块已在 #173 拆完（只剩 compose 的装配与回退 loop）；`platform/storage` 的五文件已在 #175 拆完（`meta` / `path` / `upload` / `part` / `gc`）；`supervise` 的 `model/` 与 `ops/` 已整文件落位（#176）；`check/` 先落了 `backoff` 与 `restart` 的纯判定（#178），`oneshot` / `reconcile` 仍待拆分；`manage` 的 `check/` 与 `ops/` 已整文件落位（#177）；`package.rs` 的清单类型已搬进 `model/manifest.rs`（#181）、tar 编解码搬进 `model/ustar.rs`（#182），校验与 staging 仍待切片；`plugin.rs` 的内容拆分仍是后续票。
 
 `orchestrate/` 与 `cluster/` 现在不建：**目录在第一个文件出现时创建**，不建空壳。
 
