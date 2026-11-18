@@ -4,22 +4,17 @@
 //! plugin tree. Versions live under `<data>/plugins/<id>/<version>/`; `current`
 //! is a version text file and `enabled` is a marker.
 
-use std::fs;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
 
-use crate::supervise::ops::hook;
-use crate::kernel::failure::{Problem, ProblemError};
-use crate::platform::log;
+#[cfg(test)]
 use crate::manage::package;
 #[cfg(test)]
 use crate::manage::model::manifest::Package;
+#[cfg(test)]
 use crate::platform::paths::Paths;
-use crate::kernel::registry::RESERVED_ID;
 #[cfg(test)]
 use crate::kernel::registry::Interpreter;
 #[cfg(test)]
@@ -27,132 +22,16 @@ use crate::kernel::registry::Ready;
 #[cfg(test)]
 use crate::kernel::contract::Effect;
 
-/// Serialise config writes inside this process. The on-disk `config.lock`
-/// covers other processes on Unix; this mutex also covers Windows, where
-/// `flock` is a no-op, and keeps two threads from sharing the same
-/// `config.tmp.<pid>` path.
-static CONFIG_WRITES: Mutex<()> = Mutex::new(());
-
 pub use crate::manage::ops::scan::*;
 pub use crate::manage::model::layout::*;
 pub use crate::manage::ops::config::*;
 pub use crate::manage::ops::install_plugin::*;
 pub use crate::manage::check::plugin::*;
-
-pub(crate) fn config_lock() -> MutexGuard<'static, ()> {
-    CONFIG_WRITES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Remove the service and install-hook logs for a purged plugin. The slot is
-/// already gone, but its reader threads may still be closing the file on
-/// Windows, so retry briefly instead of leaving rotated logs behind.
-pub fn remove_logs(paths: &Paths, id: &str) {
-    let directory = &paths.logs_dir;
-    let names = [
-        format!("{}.log", id),
-        format!("{}.log.1", id),
-        format!("{}.log.2", id),
-        format!("{}-hooks.log", id),
-        format!("{}-hooks.log.1", id),
-        format!("{}-hooks.log.2", id),
-    ];
-    for name in names {
-        let path = directory.join(name);
-        for _ in 0..10 {
-            match fs::remove_file(&path) {
-                Ok(()) => break,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-                Err(_) => std::thread::sleep(Duration::from_millis(50)),
-            }
-        }
-    }
-}
-
-pub fn uninstall(
-    paths: &Paths,
-    limits: &crate::platform::limits::Limits,
-    id: &str,
-    purge: bool,
-) -> Result<(), ProblemError> {
-    if !package::valid_name(id) || id == RESERVED_ID {
-        return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
-    }
-    let directory = plugin_dir(paths, id);
-    if !directory.is_dir() {
-        return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
-    }
-    run_pre_remove(paths, limits, id);
-    if purge {
-        fs::remove_dir_all(&directory).map_err(|error| {
-            Problem::Internal.error(format!("remove {}: {}", directory.display(), error))
-        })?;
-        return Ok(());
-    }
-
-    remove_versions(&directory, Some("config"))?;
-    for name in ["current", "enabled"] {
-        let path = directory.join(name);
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(Problem::Internal.error(format!(
-                    "remove {}: {}",
-                    path.display(),
-                    error
-                )))
-            }
-        }
-    }
-    Ok(())
-}
-
-/// A failing pre-remove hook must not block uninstall; the spec only requires a
-/// log line so a broken package can still be removed.
-fn run_pre_remove(paths: &Paths, limits: &crate::platform::limits::Limits, id: &str) {
-    let Some(version) = current_version(paths, id) else {
-        return;
-    };
-    let version_dir = plugin_dir(paths, id).join(&version);
-    let manifest = match read_manifest(&version_dir) {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            log::svcd(&format!(
-                "svcd: plugin {}: skipped pre-remove hook: {}",
-                id, error
-            ));
-            return;
-        }
-    };
-    let Some(path) = manifest
-        .hooks
-        .as_ref()
-        .and_then(|hooks| hooks.pre_remove.as_deref())
-    else {
-        return;
-    };
-    let result = hook::run(
-        &hook::Invocation {
-            id,
-            version: &version,
-            action: "pre-remove",
-            version_dir: &version_dir,
-            path,
-            timeout_ms: hook::TIMEOUT_MS,
-        },
-        paths,
-        limits,
-        &mut hook::poll_this_loop,
-    );
-    if let Err(error) = result {
-        log::svcd(&format!(
-            "svcd: plugin {}: pre-remove hook failed; continuing uninstall: {}",
-            id, error
-        ));
-    }
-}
+pub use crate::manage::ops::export_plugin::*;
+pub use crate::manage::ops::uninstall::*;
+pub(crate) use crate::manage::ops::config::config_lock;
+#[cfg(test)]
+use crate::kernel::failure::Problem;
 
 #[cfg(windows)]
 fn check_command(program: &Path) -> Command {
@@ -173,108 +52,6 @@ fn check_command(program: &Path) -> Command {
 #[cfg(not(windows))]
 fn check_command(program: &Path) -> Command {
     Command::new(program)
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct Backup {
-    pub schema: u32,
-    pub id: String,
-    pub version: String,
-    #[serde(rename = "configSha256")]
-    pub config_sha256: Option<String>,
-}
-
-pub fn export_config(paths: &Paths, id: &str) -> Result<(String, Vec<u8>), ProblemError> {
-    let version = current_version(paths, id)
-        .ok_or_else(|| Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)))?;
-    let config = active_config(paths, id)
-        .ok_or_else(|| Problem::UnknownPlugin.error(format!("plugin {} has no config", id)))?;
-    let data = fs::read(&config)
-        .map_err(|error| Problem::Internal.error(format!("read config: {}", error)))?;
-    Ok((version, data))
-}
-
-/// The .spkb layout: backup.json, the nested .spk entry, the active config
-/// when there is one, and the tar trailer.
-///
-/// Shared by the CLI export and the HTTP stream; the nested package is itself
-/// a plan, so both callers describe the archive the same way.
-pub fn plan_export_spkb(
-    id: &str,
-    version: &str,
-    version_dir: &Path,
-    config: Option<&[u8]>,
-) -> Result<package::TarPlan, ProblemError> {
-    let mut plan = package::TarPlan::new();
-    let backup = backup_json(id, version, config);
-    plan.push_bytes(package::tar_entry_bytes("backup.json", &backup, 0o644)?);
-    let inner = package::plan_installed_spk(version_dir)?;
-    let inner_size = inner.size();
-    plan.push_bytes(package::tar_header_bytes("plugin.spk", inner_size, 0o644)?);
-    plan.append(inner);
-    plan.push_bytes(package::tar_padding_bytes(inner_size)?);
-    if let Some(config) = config {
-        plan.push_bytes(package::tar_entry_bytes("config", config, 0o600)?);
-    }
-    plan.push_bytes(vec![0u8; package::TAR_TRAILER]);
-    Ok(plan)
-}
-
-pub fn export_spkb(paths: &Paths, id: &str) -> Result<(String, Vec<u8>), ProblemError> {
-    let version = current_version(paths, id)
-        .ok_or_else(|| Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)))?;
-    let config = active_config(paths, id)
-        .map(|path| {
-            fs::read(path)
-                .map_err(|error| Problem::Internal.error(format!("read config: {}", error)))
-        })
-        .transpose()?;
-    let plan = plan_export_spkb(
-        id,
-        &version,
-        &plugin_dir(paths, id).join(&version),
-        config.as_deref(),
-    )?;
-    let mut bytes = Vec::new();
-    plan.write_verified(&mut bytes)?;
-    Ok((version, bytes))
-}
-
-pub(crate) fn backup_json(id: &str, version: &str, config: Option<&[u8]>) -> Vec<u8> {
-    let exported_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    serde_json::to_vec(&serde_json::json!({
-        "schema": 1,
-        "id": id,
-        "version": version,
-        "exportedAt": exported_at,
-        "configSha256": config.map(package::hex_sha256),
-    }))
-    .unwrap_or_default()
-}
-
-pub(crate) fn remove_versions(directory: &Path, keep: Option<&str>) -> Result<(), ProblemError> {
-    let entries = fs::read_dir(directory).map_err(|error| {
-        Problem::Internal.error(format!("read {}: {}", directory.display(), error))
-    })?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        if keep
-            .map(|name| entry.file_name().to_string_lossy() == name)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        fs::remove_dir_all(&path).map_err(|error| {
-            Problem::Internal.error(format!("remove {}: {}", path.display(), error))
-        })?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

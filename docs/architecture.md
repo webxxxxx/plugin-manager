@@ -243,7 +243,7 @@ src/
     mod.rs  plan.rs  execute.rs  service_win.rs
 ```
 
-**step 6（#170）已按本树整文件搬迁**：文件进了对应目录但内容没切。`api.rs` 的四块已在 #173 拆完（只剩 compose 的装配与回退 loop）；`platform/storage` 的五文件已在 #175 拆完（`meta` / `path` / `upload` / `part` / `gc`）；`supervise` 的 `model/` 与 `ops/` 已整文件落位（#176）；`check/` 先落了 `backoff` 与 `restart` 的纯判定（#178），`oneshot` / `reconcile` 仍待拆分；`manage` 的 `check/` 与 `ops/` 已整文件落位（#177）；`plugin.rs` 的第一、二切片已落地（扫描 → `manage/ops/scan.rs` #186；布局 → `manage/model/layout.rs`、config → `manage/ops/config.rs` #187；安装生命周期 → `manage/ops/install_plugin.rs` #188；check 段 → `manage/check/plugin.rs` #189）；`package.rs` 三段已拆完：清单类型 → `model/manifest.rs`（#181）、tar 编解码 → `model/ustar.rs`（#182）、校验与 manifest 解析 → `check/verify.rs`（#184）、staging 与导出计划 → `ops/{install,export}.rs`（#185）；`package.rs` 只剩再导出与测试；`plugin.rs` 的内容拆分仍是后续票。
+**step 6（#170）已按本树整文件搬迁**：文件进了对应目录但内容没切。`api.rs` 的四块已在 #173 拆完（只剩 compose 的装配与回退 loop）；`platform/storage` 的五文件已在 #175 拆完（`meta` / `path` / `upload` / `part` / `gc`）；`supervise` 的 `model/` 与 `ops/` 已整文件落位（#176）；`check/` 先落了 `backoff` 与 `restart` 的纯判定（#178），`oneshot` / `reconcile` 仍待拆分；`manage` 的 `check/` 与 `ops/` 已整文件落位（#177）；`plugin.rs` 的第一、二切片已落地（扫描 → `manage/ops/scan.rs` #186；布局 → `manage/model/layout.rs`、config → `manage/ops/config.rs` #187；安装生命周期 → `manage/ops/install_plugin.rs` #188；check 段 → `manage/check/plugin.rs` #189；导出与 uninstall → `manage/ops/{export_plugin,uninstall}.rs` #190）；`plugin.rs` 只剩再导出与测试；`package.rs` 三段已拆完：清单类型 → `model/manifest.rs`（#181）、tar 编解码 → `model/ustar.rs`（#182）、校验与 manifest 解析 → `check/verify.rs`（#184）、staging 与导出计划 → `ops/{install,export}.rs`（#185）；`package.rs` 只剩再导出与测试；`plugin.rs` 的内容拆分仍是后续票。
 
 `orchestrate/` 与 `cluster/` 现在不建：**目录在第一个文件出现时创建**，不建空壳。
 
