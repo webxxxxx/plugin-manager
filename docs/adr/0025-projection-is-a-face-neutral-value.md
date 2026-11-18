@@ -13,7 +13,7 @@ Accepted（2026-11-18）。细化 [docs/architecture.md](../architecture.md) §5
 - **层 rank 允许 envelope 进内核，语义不允许。** `tools/arch-map.json` 里 platform 0 < wire 1 < kernel 2 < domain 3；`rpc::Response` 属 wire（rank 1），内核依赖它不违规（1 ≤ 2）——但那等于让内核认识 JSON-RPC。
 - **有一条现成的对称落点。** `problem_data`（`daemon.rs`）写 `{"kind": …}`，而对称的解码器 `Problem::from_error_data` 已在 `kernel/failure.rs`，被 `face/support.rs` 依赖。
 - **§7 的三条「真实反例」全部过时**（`node tools/dep-lint.mjs` = 0 违规）：`slot` 调 `mcp::tool_error` 已不存在（`grep -rn "crate::face" src/supervise src/manage src/kernel src/platform` 为空）；`transfer`（`manage/ops/transfer.rs`）已不依赖 `status`；`install` 调 `daemon::shutdown_quiet` 只剩 `main.rs` 里同一 rank 的调用。
-- **同一转换有两处实现。** `Status::live` 的 `epoch_secs` 带 `ms == 0 → None` 护栏；`daemon.rs` 的 `persist_states` 自己算一遍，没有护栏（#215 收掉写侧；读侧的缺失回落见 #216）。
+- **同一转换曾有两处实现。** `Status::live` 的 `epoch_secs` 带 `ms == 0 → None` 护栏；`daemon.rs` 的 `persist_states` 自己算一遍，没有护栏（#215 收掉写侧并把 `epoch_secs*` 改名 `anchored_secs*`；读侧的缺失回落见 #216）。
 - **「逐字节不变」这条验收今天不成立。** 没有任何测试逐字节比对 HTTP / MCP 的 JSON 响应，全是按 `Value` 键值断言；`serde_json` 未开 `preserve_order`（`Cargo.lock` 里没有 `indexmap`），所以线上 `Map` 是 `BTreeMap`（键按字母序），而 CLI `svc status --json` 走结构体声明序。
 
 > 本节的 `file:line` 口径：只写符号与文件名，不写行号——这些位置在 #209 / #210 / #211 / #212 落地后都动过。落地后的落点见下面这条。
