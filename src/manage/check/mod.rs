@@ -2,3 +2,4 @@
 
 pub mod interpreter;
 pub mod trust;
+pub mod verify;
