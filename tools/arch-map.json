@@ -347,6 +347,7 @@
     "src/manage/ops/bundle.rs": "bundle",
     "src/manage/ops/transfer.rs": "transfer",
     "src/supervise/check/backoff.rs": "supervisor",
-    "src/supervise/check/restart.rs": "supervisor"
+    "src/supervise/check/restart.rs": "supervisor",
+    "src/manage/model/manifest.rs": "package"
   }
 }
