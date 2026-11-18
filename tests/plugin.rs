@@ -173,26 +173,17 @@ impl Sandbox {
         assert_eq!(
             started.status.code(),
             Some(0),
-            "start {id}: {}",
-            stderr(&started)
+            "start {id}: {}\ndaemon log (tail):\n{}",
+            stderr(&started),
+            support::tail_lines(&self.daemon_log(), 20)
         );
         self.wait_for_state(id, "running", timeout)
     }
 
     fn wait_for_state(&self, id: &str, expected: &str, timeout: Duration) -> Value {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let status = self.status(id);
-            if status["summary"]["state"].as_str() == Some(expected) {
-                return status;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "service {id} never reached {expected} within {timeout:?}: {status}\ndaemon log (tail):\n{}",
-                support::tail_lines(&self.daemon_log(), 20)
-            );
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        support::wait_for_state(id, expected, timeout, || self.status(id), || {
+            support::tail_lines(&self.daemon_log(), 20)
+        })
     }
 
     fn daemon_log(&self) -> String {
@@ -324,17 +315,17 @@ while ($null -ne ($line = $reader.ReadLine())) {
     } else {
         (
             "agent.sh",
-            b"#!/bin/sh\nwhile IFS= read -r line; do\n  printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\\n'\ndone\n".to_vec(),
+            b"#!/bin/sh\nwhile IFS= read -r line; do\n  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p')\n  printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"ok\":true}}\\n' \"$id\"\ndone\n".to_vec(),
         )
     }
 }
 
-/// A native exec for the bundling tests.
+/// A platform-native executable stub for tests that only need a valid exec
+/// (bundling detection, manifest verification).
 ///
 /// `detect_exec` only auto-detects native binaries, and a script payload has to
-/// name `--exec` explicitly — so the bundling fixtures don't use the
-/// readiness-loop stub.
-fn bundle_exec() -> (&'static str, Vec<u8>) {
+/// name `--exec` explicitly — so these fixtures don't use the readiness stub.
+fn platform_exec() -> (&'static str, Vec<u8>) {
     if cfg!(windows) {
         ("agent.cmd", b"@echo off\r\nexit /b 0\r\n".to_vec())
     } else {
@@ -1059,7 +1050,7 @@ fn bundles_a_directory_into_a_working_signed_package() {
     let key = SigningKey::from_bytes(&[15u8; 32]);
     sandbox.write_key(&key);
     let source = sandbox.root.join("demo");
-    let (script_name, data) = bundle_exec();
+    let (script_name, data) = platform_exec();
     let exec = source.join("payload/bin").join(script_name);
     fs::create_dir_all(exec.parent().expect("exec parent")).expect("source");
     fs::write(&exec, &data).expect("exec");
@@ -1153,7 +1144,7 @@ fn verify_reports_capabilities_and_compat() {
     sandbox.write_key(&key);
     fs::write(sandbox.config.join("compat.conf"), "device = sr6110\n").expect("marker");
 
-    let (name, data) = script();
+    let (name, data) = platform_exec();
     let path = format!("payload/bin/{}", name);
     let files = [(path.as_str(), data.as_slice(), 0o755u32)];
     let interpreter = if cfg!(windows) {
@@ -1334,7 +1325,7 @@ fn bundle_refuses_missing_keys_ambiguous_execs_and_symlinks() {
     let key_path = sandbox.root.join("bundle.key");
     fs::write(&key_path, pem_from_private(&key)).expect("key");
     let source = sandbox.root.join("demo");
-    let (name, data) = bundle_exec();
+    let (name, data) = platform_exec();
     let exec = source.join("payload/bin").join(name);
     fs::create_dir_all(exec.parent().expect("exec parent")).expect("source");
     fs::write(&exec, &data).expect("exec");

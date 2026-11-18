@@ -11,6 +11,8 @@ use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
+
 /// How long a sandbox waits for its daemon to stop after a shutdown request.
 /// A request that never reaches the daemon must not hang the suite.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -160,4 +162,33 @@ pub fn failed_request(outcome: &Result<Output, String>) -> String {
 pub fn tail_lines(text: &str, lines: usize) -> String {
     let all: Vec<&str> = text.lines().collect();
     all[all.len().saturating_sub(lines)..].join("\n")
+}
+
+/// Poll a service's status until `summary.state` is `expected`, bounded.
+///
+/// `probe` is the sandbox's own status call; `details` runs only on timeout, so
+/// a failed wait names the daemon log instead of only the state mismatch. The
+/// daemon and plugin sandboxes share this; `tests/http.rs` has its own
+/// `wait_until` with a different shape on purpose.
+pub fn wait_for_state(
+    id: &str,
+    expected: &str,
+    timeout: Duration,
+    mut probe: impl FnMut() -> Value,
+    details: impl FnOnce() -> String,
+) -> Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = probe();
+        if status["summary"]["state"].as_str() == Some(expected) {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "service {id} never reached {expected} within {timeout:?}: {status}\ndaemon log (tail):\n{}",
+                details()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
