@@ -410,6 +410,7 @@
     "src/supervise/check/oneshot.rs": "supervisor",
     "src/supervise/check/reconcile.rs": "supervisor",
     "src/supervise/check/restart.rs": "supervisor",
+    "src/supervise/check/start.rs": "supervisor",
     "src/supervise/mod.rs": "supervise",
     "src/supervise/model/definition.rs": "definition",
     "src/supervise/model/mod.rs": "supervise",
