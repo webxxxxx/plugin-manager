@@ -3,5 +3,6 @@
 //! - `model/`：定义解析、运行态记录、6 态纯核。
 //! - `ops/`：监督槽、hook、脚本与内置载体。
 
+pub mod check;
 pub mod model;
 pub mod ops;
