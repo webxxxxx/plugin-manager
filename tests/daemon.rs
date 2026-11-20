@@ -3120,8 +3120,14 @@ fn the_daemon_reports_the_memory_budget_it_derived() {
     }
 
     let log = sandbox.daemon_log();
-    assert!(log.contains("svcd: memory:"), "log misses the budget:\n{log}");
-    assert!(log.contains("svcd: workload:"), "log misses the shape:\n{log}");
+    assert!(
+        log.contains("svcd: memory:"),
+        "log misses the budget:\n{log}"
+    );
+    assert!(
+        log.contains("svcd: workload:"),
+        "log misses the shape:\n{log}"
+    );
 }
 
 /// The snapshot appears after the daemon has logged; ask for it with a bound

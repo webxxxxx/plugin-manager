@@ -69,7 +69,10 @@ pub fn config_text(limits: &Limits, report: &ResourceReport) -> String {
         ("max_package_bytes", limits.max_package_bytes),
         ("ws_max_message_bytes", limits.ws_max_message_bytes as u64),
         ("ws_inflight_bytes", limits.ws_inflight_bytes as u64),
-        ("ws_buffer_shrink_bytes", limits.ws_buffer_shrink_bytes as u64),
+        (
+            "ws_buffer_shrink_bytes",
+            limits.ws_buffer_shrink_bytes as u64,
+        ),
         ("ws_raw_max_bytes", limits.ws_raw_max_bytes as u64),
     ];
     for (key, value) in byte_keys {
@@ -93,10 +96,7 @@ pub fn config_text(limits: &Limits, report: &ResourceReport) -> String {
         ("log_rotations", limits.log_rotations as u64),
         ("transfer_timeout_secs", limits.transfer_timeout.as_secs()),
         ("control_timeout_secs", limits.control_timeout.as_secs()),
-        (
-            "default_timeout",
-            limits.default_timeout.as_millis() as u64,
-        ),
+        ("default_timeout", limits.default_timeout.as_millis() as u64),
         ("max_timeout", limits.max_timeout.as_millis() as u64),
         ("ws_inflight_requests", limits.ws_inflight_requests as u64),
         ("ws_raw_queue", limits.ws_raw_queue as u64),
@@ -107,7 +107,10 @@ pub fn config_text(limits: &Limits, report: &ResourceReport) -> String {
         out.push_str(&count_line(
             key,
             *value,
-            &format!("derived at the {workload} shape from the {} budget", bytes_text(budget)),
+            &format!(
+                "derived at the {workload} shape from the {} budget",
+                bytes_text(budget)
+            ),
         ));
     }
 

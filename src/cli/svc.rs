@@ -489,7 +489,12 @@ fn config_tune(config: &Config, write: bool) -> i32 {
     };
     match settings::upsert_block(&path, tune::BLOCK_BEGIN, tune::BLOCK_END, &body) {
         Ok(()) => {
-            println!("wrote {} (block {} .. {})", path.display(), tune::BLOCK_BEGIN, tune::BLOCK_END);
+            println!(
+                "wrote {} (block {} .. {})",
+                path.display(),
+                tune::BLOCK_BEGIN,
+                tune::BLOCK_END
+            );
             println!("restart svcd to apply");
             EXIT_OK
         }

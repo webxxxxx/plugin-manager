@@ -117,6 +117,7 @@ impl Config {
     /// [`Config::bootstrap`] with the machine injected, so a test can state the
     /// host the way it states the document. It keeps the refusal gate: this is
     /// the entry that decides whether a process may run.
+    #[cfg(test)]
     pub fn bootstrap_with(
         settings: &Settings,
         settings_path: Option<PathBuf>,
@@ -130,7 +131,11 @@ impl Config {
     }
 
     /// Probe the injected machine and derive, refusing nothing.
-    fn assembled(settings: &Settings, settings_path: Option<PathBuf>, machine: &dyn Machine) -> Config {
+    fn assembled(
+        settings: &Settings,
+        settings_path: Option<PathBuf>,
+        machine: &dyn Machine,
+    ) -> Config {
         let paths = Paths::resolve(settings);
         let probe_paths = ProbePaths::host(&paths.data_dir, &paths.temp_dir);
         let profile = resources::probe(machine, &probe_paths);
@@ -275,18 +280,17 @@ mod tests {
         // 25% of 16 GiB is 4 GiB, which the build ceiling still caps.
         assert_eq!(config.resources.budget.raw, limits::BUDGET_CAP);
         assert_eq!(config.resources.profile.cpus, Some(4));
-        assert_eq!(config.resources.profile.install_free_disk, Some(10 * 1024 * 1024 * 1024));
+        assert_eq!(
+            config.resources.profile.install_free_disk,
+            Some(10 * 1024 * 1024 * 1024)
+        );
     }
 
     #[test]
     fn a_small_machine_derives_a_smaller_shape() {
         let settings = Settings::default();
-        let config = Config::bootstrap_with(
-            &settings,
-            None,
-            &Fixed(Some(1024 * 1024 * 1024)),
-        )
-        .expect("bootstrap");
+        let config = Config::bootstrap_with(&settings, None, &Fixed(Some(1024 * 1024 * 1024)))
+            .expect("bootstrap");
 
         // 25% of 1 GiB drives the budget, and 256 MiB is a tiny shape.
         assert_eq!(config.resources.budget.raw, 256 * 1024 * 1024);
@@ -318,8 +322,7 @@ mod tests {
             ..Settings::default()
         };
 
-        let error = Config::bootstrap_with(&settings, None, &Fixed(None))
-            .expect_err("must refuse");
+        let error = Config::bootstrap_with(&settings, None, &Fixed(None)).expect_err("must refuse");
         assert!(error.contains("does not fit"), "{error}");
         assert!(error.contains("memory budget"), "{error}");
     }

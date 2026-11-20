@@ -864,8 +864,8 @@ mod document_tests {
         assert_eq!(settings.mem_budget_bytes, None);
         assert_eq!(settings.workload, Some(Workload::Streaming));
 
-        let settings = parse("mem_budget_bytes = 536870912\n", Path::new("/etc/svcd"))
-            .expect("number");
+        let settings =
+            parse("mem_budget_bytes = 536870912\n", Path::new("/etc/svcd")).expect("number");
         assert_eq!(settings.mem_budget_bytes, Some(512 * 1024 * 1024));
 
         let error = parse("workload = huge\n", Path::new("/etc/svcd")).expect_err("invalid");
@@ -910,8 +910,8 @@ mod document_tests {
         let original = "# BEGIN\nmax_connections = 32\n";
         let path = temp_file("unterminated", original);
 
-        let error = upsert_block(&path, "# BEGIN", "# END", "max_streams = 8\n")
-            .expect_err("must refuse");
+        let error =
+            upsert_block(&path, "# BEGIN", "# END", "max_streams = 8\n").expect_err("must refuse");
         assert!(error.contains("no \"# END\" line"), "{error}");
         assert_eq!(std::fs::read_to_string(&path).expect("read"), original);
     }

@@ -13,9 +13,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use crate::platform::resources::{
-    budget, Budget, ResourceProfile, Workload, WorkloadSource,
-};
+use crate::platform::resources::{budget, Budget, ResourceProfile, Workload, WorkloadSource};
 use crate::platform::settings;
 
 /// The most this build may ever plan for. It only tightens: whatever the machine
@@ -140,7 +138,9 @@ impl KeySpec {
     /// The largest value a document may name and still be taken as written.
     fn upper_bound(&self, workload: Workload, budget: u64) -> u64 {
         match self.basis {
-            Basis::Share(shares) => shares[workload.index()].at(budget).clamp(self.min, self.max),
+            Basis::Share(shares) => shares[workload.index()]
+                .at(budget)
+                .clamp(self.min, self.max),
             Basis::Fixed(_) => self.max,
         }
     }
@@ -489,11 +489,12 @@ const REQUEST_STACK: KeySpec = KeySpec::fixed(
     8 * MIB,
     [128 * 1024, 192 * 1024, 256 * 1024],
 );
-const IO_STACK: KeySpec = KeySpec::fixed("io_stack_bytes", 32 * 1024, 4 * MIB, [
-    64 * 1024,
-    96 * 1024,
-    128 * 1024,
-]);
+const IO_STACK: KeySpec = KeySpec::fixed(
+    "io_stack_bytes",
+    32 * 1024,
+    4 * MIB,
+    [64 * 1024, 96 * 1024, 128 * 1024],
+);
 const BLOCKING_THREADS: KeySpec = KeySpec::fixed(
     "blocking_threads",
     MIN_BLOCKING_THREADS as u64,
@@ -510,11 +511,7 @@ const MAX_BODY: KeySpec = KeySpec::share(
     "max_body_bytes",
     64 * 1024,
     1024 * MIB,
-    [
-        Share::of(1, 16),
-        Share::of(1, 8),
-        Share::of(1, 4),
-    ],
+    [Share::of(1, 16), Share::of(1, 8), Share::of(1, 4)],
 );
 const MAX_JSON_BODY: KeySpec = KeySpec::share(
     "max_json_body_bytes",
@@ -541,7 +538,11 @@ const STREAM_BUFFER: KeySpec = KeySpec::share(
     "stream_buffer_bytes",
     4 * 1024,
     MIB,
-    [Share::of(1, 16384), Share::of(1, 16384), Share::of(1, 16384)],
+    [
+        Share::of(1, 16384),
+        Share::of(1, 16384),
+        Share::of(1, 16384),
+    ],
 );
 /// One connection slot may claim this much budget. The three shares are strictly
 /// ordered, so the shapes stay distinguishable at any budget.
@@ -549,20 +550,18 @@ const MAX_CONNECTIONS: KeySpec = KeySpec::share(
     "max_connections",
     1,
     4096,
-    [Share::per(16 * MIB / 3), Share::per(4 * MIB), Share::per(3 * MIB)],
+    [
+        Share::per(16 * MIB / 3),
+        Share::per(4 * MIB),
+        Share::per(3 * MIB),
+    ],
 );
-const MAX_CONNECTIONS_PER_IP: KeySpec = KeySpec::fixed(
-    "max_connections_per_ip",
-    1,
-    1024,
-    [8, 32, 64],
-);
-const MAX_SUBSCRIPTIONS: KeySpec =
-    KeySpec::fixed("max_subscriptions", 0, 4096, [4, 16, 64]);
+const MAX_CONNECTIONS_PER_IP: KeySpec =
+    KeySpec::fixed("max_connections_per_ip", 1, 1024, [8, 32, 64]);
+const MAX_SUBSCRIPTIONS: KeySpec = KeySpec::fixed("max_subscriptions", 0, 4096, [4, 16, 64]);
 const MAX_SUBSCRIBERS_PER_PLUGIN: KeySpec =
     KeySpec::fixed("max_subscribers_per_plugin", 0, 1024, [4, 16, 64]);
-const IDLE_TIMEOUT: KeySpec =
-    KeySpec::fixed("http_idle_timeout_secs", 1, 3600, [30, 60, 120]);
+const IDLE_TIMEOUT: KeySpec = KeySpec::fixed("http_idle_timeout_secs", 1, 3600, [30, 60, 120]);
 const LOG_MAX_BYTES: KeySpec = KeySpec::fixed(
     "log_max_bytes",
     4 * 1024,
@@ -578,26 +577,13 @@ const MAX_PACKAGE_BYTES: KeySpec = KeySpec::fixed(
 );
 const TRANSFER_TIMEOUT: KeySpec =
     KeySpec::fixed("transfer_timeout_secs", 10, 3600, [120, 120, 120]);
-const CONTROL_TIMEOUT: KeySpec =
-    KeySpec::fixed("control_timeout_secs", 1, 300, [30, 30, 30]);
-const DEFAULT_TIMEOUT: KeySpec = KeySpec::fixed(
-    "default_timeout",
-    100,
-    300_000,
-    [30_000, 30_000, 30_000],
-);
-const MAX_TIMEOUT: KeySpec = KeySpec::fixed(
-    "max_timeout",
-    100,
-    600_000,
-    [300_000, 300_000, 300_000],
-);
-const WS_MAX_MESSAGE: KeySpec = KeySpec::fixed(
-    "ws_max_message_bytes",
-    1024,
-    16 * MIB,
-    [MIB, MIB, MIB],
-);
+const CONTROL_TIMEOUT: KeySpec = KeySpec::fixed("control_timeout_secs", 1, 300, [30, 30, 30]);
+const DEFAULT_TIMEOUT: KeySpec =
+    KeySpec::fixed("default_timeout", 100, 300_000, [30_000, 30_000, 30_000]);
+const MAX_TIMEOUT: KeySpec =
+    KeySpec::fixed("max_timeout", 100, 600_000, [300_000, 300_000, 300_000]);
+const WS_MAX_MESSAGE: KeySpec =
+    KeySpec::fixed("ws_max_message_bytes", 1024, 16 * MIB, [MIB, MIB, MIB]);
 const WS_INFLIGHT_BYTES: KeySpec = KeySpec::share(
     "ws_inflight_bytes",
     64 * 1024,
@@ -608,7 +594,11 @@ const WS_INFLIGHT_REQUESTS: KeySpec = KeySpec::share(
     "ws_inflight_requests",
     1,
     4096,
-    [Share::per(32 * MIB), Share::per(32 * MIB), Share::per(16 * MIB)],
+    [
+        Share::per(32 * MIB),
+        Share::per(32 * MIB),
+        Share::per(16 * MIB),
+    ],
 );
 const WS_BUFFER_SHRINK: KeySpec = KeySpec::fixed(
     "ws_buffer_shrink_bytes",
@@ -616,29 +606,40 @@ const WS_BUFFER_SHRINK: KeySpec = KeySpec::fixed(
     16 * MIB,
     [64 * 1024, 64 * 1024, 64 * 1024],
 );
-const WS_RAW_MAX: KeySpec =
-    KeySpec::fixed("ws_raw_max_bytes", 1024, 16 * MIB, [MIB, MIB, MIB]);
+const WS_RAW_MAX: KeySpec = KeySpec::fixed("ws_raw_max_bytes", 1024, 16 * MIB, [MIB, MIB, MIB]);
 const WS_RAW_QUEUE: KeySpec = KeySpec::share(
     "ws_raw_queue",
     4,
     4096,
-    [Share::per(16 * MIB), Share::per(16 * MIB), Share::per(16 * MIB)],
+    [
+        Share::per(16 * MIB),
+        Share::per(16 * MIB),
+        Share::per(16 * MIB),
+    ],
 );
 const PENDING_QUEUE: KeySpec = KeySpec::share(
     "pending_queue",
     8,
     4096,
-    [Share::per(4 * MIB), Share::per(4 * MIB), Share::per(4 * MIB)],
+    [
+        Share::per(4 * MIB),
+        Share::per(4 * MIB),
+        Share::per(4 * MIB),
+    ],
 );
 const PROGRESS_QUEUE: KeySpec = KeySpec::share(
     "progress_queue",
     4,
     1024,
-    [Share::per(8 * MIB), Share::per(8 * MIB), Share::per(8 * MIB)],
+    [
+        Share::per(8 * MIB),
+        Share::per(8 * MIB),
+        Share::per(8 * MIB),
+    ],
 );
 
 /// Everything a derivation needs from the document.
-struct SettingsView<'a> {
+struct SettingsView {
     request_stack_bytes: Option<usize>,
     io_stack_bytes: Option<usize>,
     blocking_threads: Option<usize>,
@@ -670,12 +671,10 @@ struct SettingsView<'a> {
     ws_raw_queue: Option<usize>,
     pending_queue: Option<usize>,
     progress_queue: Option<usize>,
-    #[allow(dead_code)]
-    marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a> SettingsView<'a> {
-    fn from(settings: &'a settings::Settings) -> Self {
+impl SettingsView {
+    fn from(settings: &settings::Settings) -> Self {
         SettingsView {
             request_stack_bytes: settings.request_stack_bytes,
             io_stack_bytes: settings.io_stack_bytes,
@@ -708,14 +707,14 @@ impl<'a> SettingsView<'a> {
             ws_raw_queue: settings.ws_raw_queue,
             pending_queue: settings.pending_queue,
             progress_queue: settings.progress_queue,
-            marker: std::marker::PhantomData,
         }
     }
 }
 
 impl Limits {
-    fn from_settings(settings: SettingsView<'_>, derivation: &mut Derivation<'_>) -> Limits {
-        let request_stack_bytes = derivation.byte_count(&REQUEST_STACK, settings.request_stack_bytes);
+    fn from_settings(settings: SettingsView, derivation: &mut Derivation<'_>) -> Limits {
+        let request_stack_bytes =
+            derivation.byte_count(&REQUEST_STACK, settings.request_stack_bytes);
         let io_stack_bytes = derivation.byte_count(&IO_STACK, settings.io_stack_bytes);
         let blocking_threads = derivation.count(
             &BLOCKING_THREADS,
@@ -728,13 +727,16 @@ impl Limits {
         let max_header = derivation.byte_count(&MAX_HEADER, settings.max_header_bytes);
         let max_streams = derivation.count(&MAX_STREAMS, settings.max_streams.map(|v| v as u64));
         let stream_buffer = derivation.byte_count(&STREAM_BUFFER, settings.stream_buffer_bytes);
-        let max_connections = derivation.count(&MAX_CONNECTIONS, settings.max_connections.map(|v| v as u64));
+        let max_connections =
+            derivation.count(&MAX_CONNECTIONS, settings.max_connections.map(|v| v as u64));
         let max_connections_per_ip = derivation.count(
             &MAX_CONNECTIONS_PER_IP,
             settings.max_connections_per_ip.map(|v| v as u64),
         );
-        let max_subscriptions =
-            derivation.count(&MAX_SUBSCRIPTIONS, settings.max_subscriptions.map(|v| v as u64));
+        let max_subscriptions = derivation.count(
+            &MAX_SUBSCRIPTIONS,
+            settings.max_subscriptions.map(|v| v as u64),
+        );
         let max_subscribers_per_plugin = derivation.count(
             &MAX_SUBSCRIBERS_PER_PLUGIN,
             settings.max_subscribers_per_plugin.map(|v| v as u64),
@@ -745,8 +747,7 @@ impl Limits {
             derivation.count(&LOG_ROTATIONS, settings.log_rotations.map(|v| v as u64));
         let log_to_file = settings.log_to_file.unwrap_or(true);
         let max_package_bytes = derivation.bytes(&MAX_PACKAGE_BYTES, settings.max_package_bytes);
-        let transfer_timeout =
-            derivation.secs(&TRANSFER_TIMEOUT, settings.transfer_timeout_secs);
+        let transfer_timeout = derivation.secs(&TRANSFER_TIMEOUT, settings.transfer_timeout_secs);
         let control_timeout = derivation.secs(&CONTROL_TIMEOUT, settings.control_timeout_secs);
         let default_timeout = derivation.millis(&DEFAULT_TIMEOUT, settings.default_timeout_ms);
         // The max timeout's floor is dynamic: it can never be below the default,
@@ -776,8 +777,7 @@ impl Limits {
             derivation.byte_count(&WS_BUFFER_SHRINK, settings.ws_buffer_shrink_bytes);
         let ws_raw_enabled = settings.ws_raw_enabled.unwrap_or(true);
         let ws_raw_max_bytes = derivation.byte_count(&WS_RAW_MAX, settings.ws_raw_max_bytes);
-        let ws_raw_queue =
-            derivation.count(&WS_RAW_QUEUE, settings.ws_raw_queue.map(|v| v as u64));
+        let ws_raw_queue = derivation.count(&WS_RAW_QUEUE, settings.ws_raw_queue.map(|v| v as u64));
         let pending_queue =
             derivation.count(&PENDING_QUEUE, settings.pending_queue.map(|v| v as u64));
         let progress_queue =
@@ -943,8 +943,7 @@ fn apply_invariant(limits: &mut Limits, budget: u64, notes: &mut Vec<Override>) 
     let floor = CONNECTION_FLOOR.min(configured_connections);
     let per_connection = (limits.max_complete_body + limits.stream_buffer as u64)
         .saturating_add(stack_per_connection(limits));
-    let others = limits.worst_case_bytes()
-        - limits.max_connections as u64 * per_connection.max(1);
+    let others = limits.worst_case_bytes() - limits.max_connections as u64 * per_connection.max(1);
     let fits = budget.saturating_sub(others) / per_connection.max(1);
     let next = (fits as usize).clamp(floor, configured_connections);
     if next < configured_connections {
@@ -966,13 +965,7 @@ fn apply_invariant(limits: &mut Limits, budget: u64, notes: &mut Vec<Override>) 
     let terms = limits
         .worst_case_terms()
         .into_iter()
-        .map(|(name, bytes)| {
-            format!(
-                "{} {}",
-                name,
-                crate::platform::resources::bytes_text(bytes)
-            )
-        })
+        .map(|(name, bytes)| format!("{} {}", name, crate::platform::resources::bytes_text(bytes)))
         .collect::<Vec<_>>()
         .join(", ");
     Some(format!(
@@ -1015,7 +1008,11 @@ mod tests {
     }
 
     fn at_reference(workload: Workload) -> Derived {
-        derive_for(workload.reference_budget(), Some(workload), Settings::default())
+        derive_for(
+            workload.reference_budget(),
+            Some(workload),
+            Settings::default(),
+        )
     }
 
     fn note<'a>(report: &'a ResourceReport, key: &str) -> Option<&'a Override> {
@@ -1027,7 +1024,8 @@ mod tests {
         for workload in Workload::ALL {
             let derived = at_reference(workload);
             assert_eq!(
-                derived.report.refusal, None,
+                derived.report.refusal,
+                None,
                 "{} refuses at its reference budget",
                 workload.as_str()
             );
@@ -1066,17 +1064,9 @@ mod tests {
         // the problem statement names, so it stays strictly ordered at every
         // budget; the shapes are also pairwise distinct, and streaming pays for
         // its concurrency with a smaller resident body than interactive.
-        for budget in [
-            64 * MIB,
-            128 * MIB,
-            256 * MIB,
-            512 * MIB,
-            GIB,
-            2 * GIB,
-        ] {
+        for budget in [64 * MIB, 128 * MIB, 256 * MIB, 512 * MIB, GIB, 2 * GIB] {
             let tiny = derive_for(budget, Some(Workload::Tiny), Settings::default());
-            let interactive =
-                derive_for(budget, Some(Workload::Interactive), Settings::default());
+            let interactive = derive_for(budget, Some(Workload::Interactive), Settings::default());
             let streaming = derive_for(budget, Some(Workload::Streaming), Settings::default());
 
             assert!(
@@ -1170,8 +1160,7 @@ mod tests {
         let default = derive_for(128 * MIB, Some(Workload::Tiny), Settings::default());
 
         assert_eq!(
-            derived.limits.max_body,
-            default.limits.max_body,
+            derived.limits.max_body, default.limits.max_body,
             "falls back to the tiny shape's reference body"
         );
         let note = note(&derived.report, "max_body_bytes").expect("a note");
@@ -1461,7 +1450,9 @@ mod tests {
         assert!(json["worst_case"].as_u64().unwrap() <= 128 * MIB);
 
         let lines = derived.report.lines();
-        assert!(lines.iter().any(|line| line.contains("workload: tiny (configured)")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("workload: tiny (configured)")));
         assert!(lines.iter().any(|line| line.contains("worst case")));
     }
 
@@ -1481,10 +1472,7 @@ mod tests {
     fn the_worst_case_is_what_the_report_says_it_is() {
         let derived = at_reference(Workload::Interactive);
 
-        assert_eq!(
-            derived.report.worst_case,
-            derived.limits.worst_case_bytes()
-        );
+        assert_eq!(derived.report.worst_case, derived.limits.worst_case_bytes());
         // Adding a connection cannot lower the worst case.
         let mut raised = derived.limits.clone();
         raised.max_connections += 1;
@@ -1547,9 +1535,7 @@ pub fn write_snapshot(
 }
 
 /// Read the snapshot of the last start.
-pub fn read_snapshot(
-    paths: &crate::platform::paths::Paths,
-) -> Result<serde_json::Value, String> {
+pub fn read_snapshot(paths: &crate::platform::paths::Paths) -> Result<serde_json::Value, String> {
     let path = snapshot_path(paths);
     let text = std::fs::read_to_string(&path).map_err(|error| {
         format!(
@@ -1571,7 +1557,11 @@ pub fn describe_snapshot(snapshot: &serde_json::Value) -> Vec<String> {
         free.push_str(&format!(", cgroup {}", text(remaining)));
     }
     let cpus = bytes("cpus").map(|cpus| format!(", {cpus} cpus"));
-    let mut lines = vec![format!("probe:    free memory {}{}", free, cpus.unwrap_or_default())];
+    let mut lines = vec![format!(
+        "probe:    free memory {}{}",
+        free,
+        cpus.unwrap_or_default()
+    )];
     lines.push(format!(
         "memory:   {} usable, from {} raw ({}), build cap {}",
         show("budget_quantized"),
@@ -1615,10 +1605,18 @@ pub fn describe_snapshot(snapshot: &serde_json::Value) -> Vec<String> {
             for note in notes {
                 lines.push(format!(
                     "override: {}: {} -> {} ({})",
-                    note.get("key").and_then(serde_json::Value::as_str).unwrap_or("?"),
-                    note.get("configured").and_then(serde_json::Value::as_u64).unwrap_or(0),
-                    note.get("effective").and_then(serde_json::Value::as_u64).unwrap_or(0),
-                    note.get("reason").and_then(serde_json::Value::as_str).unwrap_or("?")
+                    note.get("key")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?"),
+                    note.get("configured")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    note.get("effective")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    note.get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?")
                 ));
             }
         }

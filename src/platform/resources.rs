@@ -170,9 +170,7 @@ fn cgroup_remaining(machine: &dyn Machine, paths: &ProbePaths) -> Option<u64> {
         let path = fields.next()?;
         (hierarchy == "0" && controllers.is_empty()).then(|| path.trim())
     })?;
-    let directory = paths
-        .cgroup_mount
-        .join(relative.trim_start_matches('/'));
+    let directory = paths.cgroup_mount.join(relative.trim_start_matches('/'));
     let max = machine.read(&directory.join("memory.max"))?;
     let max = max.trim();
     if max == "max" {
@@ -447,14 +445,8 @@ fn free_disk(path: &Path) -> Option<u64> {
     let mut total_free: u64 = 0;
     // SAFETY: `wide` is NUL-terminated and the three pointers are valid for the
     // duration of the call.
-    let ok = unsafe {
-        GetDiskFreeSpaceExW(
-            wide.as_ptr(),
-            &mut available,
-            &mut total,
-            &mut total_free,
-        )
-    };
+    let ok =
+        unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut total_free) };
     if ok == 0 {
         return None;
     }
@@ -521,9 +513,15 @@ mod tests {
     #[test]
     fn the_probe_reads_mem_available_and_the_cgroup_remainder() {
         let machine = Fake::default()
-            .with_file("/proc/meminfo", "MemTotal: 2097152 kB\nMemAvailable: 1048576 kB\n")
+            .with_file(
+                "/proc/meminfo",
+                "MemTotal: 2097152 kB\nMemAvailable: 1048576 kB\n",
+            )
             .with_file("/proc/self/cgroup", "0::/system.slice/svcd.service\n")
-            .with_file("/sys/fs/cgroup/system.slice/svcd.service/memory.max", "1073741824\n")
+            .with_file(
+                "/sys/fs/cgroup/system.slice/svcd.service/memory.max",
+                "1073741824\n",
+            )
             .with_file(
                 "/sys/fs/cgroup/system.slice/svcd.service/memory.current",
                 "268435456\n",
@@ -664,10 +662,17 @@ mod tests {
         // The shape is derived from the quantized budget, so a machine that
         // reports 4.0 GiB and 3.98 GiB free must derive the same shape.
         let shape = |available: u64| {
-            Workload::of_budget(quantize(budget(None, &ResourceProfile {
-                available_memory: Some(available),
-                ..ResourceProfile::default()
-            }, 8 * GIB).raw))
+            Workload::of_budget(quantize(
+                budget(
+                    None,
+                    &ResourceProfile {
+                        available_memory: Some(available),
+                        ..ResourceProfile::default()
+                    },
+                    8 * GIB,
+                )
+                .raw,
+            ))
         };
 
         assert_eq!(shape(4 * GIB), shape(4 * GIB - 20 * MIB));

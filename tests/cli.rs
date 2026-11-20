@@ -488,7 +488,11 @@ fn config_tune_prints_a_document_that_derives_the_same_values() {
             .map(str::to_string)
             .collect::<Vec<_>>()
     };
-    assert_eq!(tuned(&again), tuned(&output), "a tuned document must not drift");
+    assert_eq!(
+        tuned(&again),
+        tuned(&output),
+        "a tuned document must not drift"
+    );
 }
 
 #[test]
@@ -514,7 +518,11 @@ fn config_tune_write_keeps_one_block_and_the_rest_of_the_document() {
     let output = sandbox.run_as("svc", &["config", "tune", "--write"]);
     assert_eq!(output.status.code(), Some(0));
     let text = fs::read_to_string(&conf).expect("read conf");
-    assert_eq!(text.matches("# BEGIN svcd config tune").count(), 1, "{text}");
+    assert_eq!(
+        text.matches("# BEGIN svcd config tune").count(),
+        1,
+        "{text}"
+    );
     assert_eq!(text.matches("# END svcd config tune").count(), 1, "{text}");
 
     let output = sandbox.run_as("svc", &["config", "tune"]);
@@ -534,7 +542,10 @@ fn status_resources_reports_the_last_start_and_falls_back_without_one() {
 
     // No snapshot yet: the command still answers and says where the numbers
     // came from.
-    let output = sandbox.run_env(&["status", "--resources", "--json"], &[("SVCD_DATA_DIR", &data)]);
+    let output = sandbox.run_env(
+        &["status", "--resources", "--json"],
+        &[("SVCD_DATA_DIR", &data)],
+    );
     assert_eq!(
         output.status.code(),
         Some(0),
