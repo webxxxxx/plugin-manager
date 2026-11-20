@@ -22,9 +22,9 @@ use crate::platform::log;
 use crate::platform::paths::Paths;
 use crate::server::auth::lan::{self, AuthKind, Lan};
 use crate::server::http::model as http;
-use crate::server::http::{
-    BodyPolicy, Completion, Dispatch, Exchange, Face, Request, Response, Route,
-};
+use crate::server::http::{Completion, Exchange, Face, Request, Response, Route};
+
+use super::routes::{self, Endpoint};
 
 const UI: &str = include_str!("../web/index.html");
 
@@ -303,16 +303,15 @@ impl ApiFace {
 
     fn handle_api(&self, request: &Request) -> Response {
         let budget = CallBudget::from_request(request);
-        let (path, query) = request
-            .path
-            .split_once('?')
-            .unwrap_or((request.path.as_str(), ""));
-        let mut parts: Vec<&str> = path.trim_matches('/').split('/').collect();
-        if parts.get(2) == Some(&"files") {
-            parts[2] = "file";
-        }
-        match (request.method.as_str(), parts.as_slice()) {
-            ("GET", ["api", "v1", "compat"]) => Response::json(
+        let (_, query) = routes::split_query(&request.path);
+        let matched = match routes::resolve(&request.method, &request.path) {
+            routes::Match::Found(matched) => matched,
+            routes::Match::MethodNotAllowed { allow, .. } => return method_not_allowed(&allow),
+            routes::Match::NotFound => return error_response(404, "not_found", "unknown endpoint"),
+        };
+        let param = |name: &str| matched.param(name).map(decode).unwrap_or_default();
+        match matched.spec.endpoint {
+            Endpoint::Compat => Response::json(
                 200,
                 &serde_json::to_value(crate::platform::compat::detect(
                     &self.config.paths,
@@ -321,10 +320,10 @@ impl ApiFace {
                 ))
                 .unwrap_or(Value::Null),
             ),
-            ("GET", ["api", "v1", "auth"]) => match self.lan.lock() {
+            Endpoint::Auth => match self.lan.lock() {
                 Ok(state) => {
-                    // One face-neutral value, two renderers: `auth.status` and
-                    // this route both read `LanStatus`, so `password_set` has a
+                    // One face-neutral value, two renderers: auth.status and
+                    // this route both read LanStatus, so password_set has a
                     // single derivation. The renderer still spells this
                     // protocol's keys; the cross-surface test keeps the two
                     // shapes honest.
@@ -341,7 +340,7 @@ impl ApiFace {
                 }
                 Err(_) => error_response(500, "internal", "auth state unavailable"),
             },
-            ("GET", ["api", "v1", "version"]) => Response::json(
+            Endpoint::Version => Response::json(
                 200,
                 &json!({
                     "version": env!("CARGO_PKG_VERSION"),
@@ -349,135 +348,28 @@ impl ApiFace {
                     "platform": crate::platform::target(),
                 }),
             ),
-            ("GET", ["api", "v1", "services"]) => self.list_services(&budget),
-            ("GET", ["api", "v1", "services", id]) => self.service_status(&budget, &decode(id)),
-            ("POST", ["api", "v1", "services", id, "start"]) => {
-                self.service_action(&budget, "svc.start", &decode(id))
-            }
-            ("POST", ["api", "v1", "services", id, "stop"]) => {
-                self.service_action(&budget, "svc.stop", &decode(id))
-            }
-            ("POST", ["api", "v1", "services", id, "enable"]) => {
-                self.service_action(&budget, "svc.enable", &decode(id))
-            }
-            ("POST", ["api", "v1", "services", id, "disable"]) => {
-                self.service_action(&budget, "svc.disable", &decode(id))
-            }
-            ("POST", ["api", "v1", "plugins", id, "ui-token"]) => self.plugin_ui_token(&decode(id)),
-            (_, ["api", "v1", "plugins", _, "ui-token"]) => method_not_allowed("POST"),
-            ("DELETE", ["api", "v1", "plugins", id]) => {
+            Endpoint::ServiceList => self.list_services(&budget),
+            Endpoint::ServiceStatus => self.service_status(&budget, &param("id")),
+            Endpoint::ServiceStart => self.service_action(&budget, "svc.start", &param("id")),
+            Endpoint::ServiceStop => self.service_action(&budget, "svc.stop", &param("id")),
+            Endpoint::ServiceEnable => self.service_action(&budget, "svc.enable", &param("id")),
+            Endpoint::ServiceDisable => self.service_action(&budget, "svc.disable", &param("id")),
+            Endpoint::PluginUiToken => self.plugin_ui_token(&param("id")),
+            Endpoint::PluginUninstall => {
                 let purge = support::query_bool(query, "purge").unwrap_or(false);
-                self.uninstall_plugin(&budget, &decode(id), purge)
+                self.uninstall_plugin(&budget, &param("id"), purge)
             }
-            ("POST", ["api", "v1", "config", id, "reset"]) => {
-                self.reset_config(&budget, &decode(id))
-            }
-            (_, ["api", "v1", "config", _, "reset"]) => method_not_allowed("POST"),
-            ("GET", ["api", "v1", "config", id]) => self.get_config(&budget, &decode(id)),
-            ("PUT", ["api", "v1", "config", id]) => {
-                self.put_config(&budget, &decode(id), &request.body)
-            }
-            (_, ["api", "v1", "config", _]) => method_not_allowed("GET, PUT"),
-            ("GET", ["api", "v1", "export", id, "config"]) => {
-                self.export_config(&budget, &decode(id))
-            }
-            (_, ["api", "v1", "export", _, "config"]) => method_not_allowed("GET"),
-            (_, ["api", "v1", "export", _, "spk"]) => method_not_allowed("GET"),
-            (_, ["api", "v1", "export", _]) => method_not_allowed("GET"),
-            (_, ["api", "v1", "import"]) => method_not_allowed("POST"),
-            ("GET", ["api", "v1", "trust"]) => self.trust_list(),
-            ("POST", ["api", "v1", "trust"]) => self.trust_add(&request.body, query),
-            ("DELETE", ["api", "v1", "trust", key]) => self.trust_remove(&decode(key)),
-            (_, ["api", "v1", "trust"]) => method_not_allowed("GET, POST"),
-            (_, ["api", "v1", "trust", _]) => method_not_allowed("DELETE"),
-            ("GET", ["api", "v1", "logs", id]) => self.logs(&budget, &decode(id), query),
-            (_, ["api", "v1", "logs", _]) => method_not_allowed("GET"),
-            _ => error_response(404, "not_found", "unknown endpoint"),
+            Endpoint::ConfigReset => self.reset_config(&budget, &param("id")),
+            Endpoint::ConfigGet => self.get_config(&budget, &param("id")),
+            Endpoint::ConfigPut => self.put_config(&budget, &param("id"), &request.body),
+            Endpoint::ExportConfig => self.export_config(&budget, &param("id")),
+            Endpoint::TrustList => self.trust_list(),
+            Endpoint::TrustAdd => self.trust_add(&request.body, query),
+            Endpoint::TrustRemove => self.trust_remove(&param("key")),
+            Endpoint::Logs => self.logs(&budget, &param("id"), query),
+            Endpoint::UnknownApi => error_response(404, "not_found", "unknown endpoint"),
+            _ => error_response(500, "internal", "face handled a route it did not claim"),
         }
-    }
-}
-
-fn path_only(path: &str) -> &str {
-    path.split_once('?').map(|(path, _)| path).unwrap_or(path)
-}
-
-fn parts(path: &str) -> Vec<&str> {
-    path.trim_matches('/').split('/').collect()
-}
-
-fn is_version(method: &str, path: &str) -> bool {
-    method == "GET" && path_only(path).trim_matches('/') == "api/v1/version"
-}
-
-fn is_login(method: &str, path: &str) -> bool {
-    method == "POST" && path_only(path) == "/login"
-}
-
-fn is_logout(method: &str, path: &str) -> bool {
-    method == "POST" && path_only(path) == "/logout"
-}
-
-fn is_console(path: &str) -> bool {
-    matches!(path_only(path), "/" | "/index.html")
-}
-
-fn is_api_path(path: &str) -> bool {
-    let parts = parts(path_only(path));
-    parts.first() == Some(&"api") && parts.get(1) == Some(&"v1")
-}
-
-/// Paths claimed by a pre-body stream hook (#115 blade UI, #119 uploads,
-/// #121 package uploads) or by the remaining blob/file session routes stay off
-/// this buffered route table.
-fn is_transfer_path(method: &str, path: &str) -> bool {
-    let path = path_only(path);
-    let mut parts = parts(path);
-    if parts.get(2) == Some(&"files") {
-        parts[2] = "file";
-    }
-    match parts.as_slice() {
-        ["api", "v1", "plugins"] if method == "POST" => true,
-        ["api", "v1", "import"] if method == "POST" => true,
-        ["api", "v1", "blobs", ..] => true,
-        ["api", "v1", "file", ..] => true,
-        _ => false,
-    }
-}
-
-fn body_policy(method: &str, path: &str, limits: &crate::platform::limits::Limits) -> BodyPolicy {
-    if is_login(method, path) {
-        return BodyPolicy::Buffered {
-            limit: limits.max_json_body,
-        };
-    }
-    let path = path_only(path);
-    let mut parts = parts(path);
-    if parts.get(2) == Some(&"files") {
-        parts[2] = "file";
-    }
-    match (method, parts.as_slice()) {
-        ("PUT", ["api", "v1", "config", _]) => BodyPolicy::Buffered {
-            limit: limits.max_json_body,
-        },
-        ("POST", ["api", "v1", "trust"]) => BodyPolicy::Buffered {
-            limit: limits.max_json_body,
-        },
-        _ => BodyPolicy::Empty,
-    }
-}
-
-fn dispatch_for(method: &str, path: &str) -> Dispatch {
-    if is_version(method, path) || is_console(path) {
-        Dispatch::Inline
-    } else {
-        Dispatch::Blocking
-    }
-}
-
-fn route_with(body: BodyPolicy, dispatch: Dispatch) -> Route {
-    match dispatch {
-        Dispatch::Inline => Route::inline(body),
-        Dispatch::Blocking => Route::blocking(body),
     }
 }
 
@@ -585,74 +477,106 @@ fn project_service(status: &Value, paths: &Paths) -> Option<Value> {
 
 impl Face for ApiFace {
     fn route(&self, method: &str, path: &str) -> Option<Route> {
-        if blob::download_target(method, path).is_some()
-            || export::export_target(method, path).is_some()
-        {
-            // A download has no request body, but its result is a stream
-            // handler: the route must say so, or the dispatch check rejects it.
-            return Some(Route::inline(BodyPolicy::Streamed));
+        match routes::resolve(method, path) {
+            routes::Match::Found(matched) if matched.spec.owner == routes::Owner::Api => {
+                Some(matched.spec.route(&self.config.limits))
+            }
+            routes::Match::MethodNotAllowed { owners, spec, .. } if owners.api_claims() => {
+                Some(spec.route_for_405())
+            }
+            _ => None,
         }
-        let body = body_policy(method, path, &self.config.limits);
-        if is_login(method, path) || is_logout(method, path) || is_console(path) {
-            return Some(route_with(body, dispatch_for(method, path)).public());
-        }
-        if !is_api_path(path) || is_transfer_path(method, path) {
-            return None;
-        }
-        Some(route_with(body, dispatch_for(method, path)))
     }
 
     fn handle(&self, request: Request, done: Completion) {
-        if let Some(target) = export::export_target(&request.method, &request.path) {
-            done.complete(Exchange::Stream(Box::new(export::ExportStream::open(
-                target,
-                self.config.paths.clone(),
-            ))));
-            return;
-        }
-        if let Some(target) = blob::download_target(&request.method, &request.path) {
-            done.complete(Exchange::Stream(Box::new(blob::DownloadStream::open(
-                &request,
-                target,
-                self.config.paths.clone(),
-            ))));
-            return;
-        }
-        let response = if is_login(&request.method, &request.path) {
-            self.login(&request)
-        } else if is_logout(&request.method, &request.path) {
-            self.logout(&request)
-        } else if matches!(path_only(&request.path), "/" | "/index.html") {
-            if request.method != "GET" {
-                method_not_allowed("GET")
-            } else {
-                Response::new(200, "text/html; charset=utf-8", UI.as_bytes())
-                    .with_header("Cache-Control", "no-store")
-                    .with_header("X-Content-Type-Options", "nosniff")
+        let matched = match routes::resolve(&request.method, &request.path) {
+            routes::Match::Found(matched) => matched,
+            routes::Match::MethodNotAllowed { allow, .. } => {
+                done.complete(Exchange::Response(method_not_allowed(&allow)));
+                return;
             }
-        } else if is_api_path(&request.path) {
-            if request.principal == AuthKind::Cookie
-                && http::is_write_method(&request.method)
-                && !http::csrf_ok(&request.headers)
-            {
-                error_response(
-                    403,
-                    "forbidden",
-                    "cookie writes require Origin and X-Svcd-Csrf",
-                )
-            } else {
-                self.handle_api(&request)
+            routes::Match::NotFound => {
+                done.complete(Exchange::Response(error_response(
+                    500,
+                    "internal",
+                    "face handled a route it did not claim",
+                )));
+                return;
             }
-        } else {
-            error_response(500, "internal", "face handled a route it did not claim")
         };
-        done.complete(Exchange::Response(response));
+        match matched.spec.endpoint {
+            Endpoint::ExportSpk | Endpoint::ExportBundle => {
+                let Some(target) = export::export_target(&request.method, &request.path) else {
+                    done.complete(Exchange::Response(error_response(
+                        500,
+                        "internal",
+                        "export route mismatch",
+                    )));
+                    return;
+                };
+                done.complete(Exchange::Stream(Box::new(export::ExportStream::open(
+                    target,
+                    self.config.paths.clone(),
+                ))));
+            }
+            Endpoint::BlobDownload | Endpoint::FileDownload => {
+                let Some(target) = blob::download_target(&request.method, &request.path) else {
+                    done.complete(Exchange::Response(error_response(
+                        500,
+                        "internal",
+                        "download route mismatch",
+                    )));
+                    return;
+                };
+                done.complete(Exchange::Stream(Box::new(blob::DownloadStream::open(
+                    &request,
+                    target,
+                    self.config.paths.clone(),
+                ))));
+            }
+            Endpoint::Login => {
+                done.complete(Exchange::Response(self.login(&request)));
+            }
+            Endpoint::Logout => {
+                done.complete(Exchange::Response(self.logout(&request)));
+            }
+            Endpoint::Console => {
+                done.complete(Exchange::Response(
+                    Response::new(200, "text/html; charset=utf-8", UI.as_bytes())
+                        .with_header("Cache-Control", "no-store")
+                        .with_header("X-Content-Type-Options", "nosniff"),
+                ));
+            }
+            Endpoint::UnknownApi => {
+                done.complete(Exchange::Response(error_response(
+                    404,
+                    "not_found",
+                    "unknown endpoint",
+                )));
+            }
+            _ => {
+                if request.principal == AuthKind::Cookie
+                    && http::is_write_method(&request.method)
+                    && !http::csrf_ok(&request.headers)
+                {
+                    done.complete(Exchange::Response(error_response(
+                        403,
+                        "forbidden",
+                        "cookie writes require Origin and X-Svcd-Csrf",
+                    )));
+                } else {
+                    done.complete(Exchange::Response(self.handle_api(&request)));
+                }
+            }
+        }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::server::http::dispatch_inline;
+    use crate::server::http::{BodyPolicy, Dispatch};
     use crate::server::http::{CompletionSlot, Exchange};
 
     fn lan() -> Arc<Mutex<Lan>> {

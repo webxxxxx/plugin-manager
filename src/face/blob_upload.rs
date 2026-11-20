@@ -38,15 +38,7 @@ pub enum UploadTarget {
 /// Recognize the streaming upload routes. The path parser mirrors the old
 /// takeover: /api/v1/files/{id} is the historical alias for /api/v1/file/{id}.
 pub fn upload_target(head: &http::Head) -> Option<UploadTarget> {
-    let path = head
-        .path
-        .split_once('?')
-        .map(|(path, _)| path)
-        .unwrap_or(head.path.as_str());
-    let mut parts: Vec<&str> = path.trim_matches('/').split('/').collect();
-    if parts.get(2) == Some(&"files") {
-        parts[2] = "file";
-    }
+    let parts = super::routes::segments(&head.path);
     match (head.method.as_str(), parts.as_slice()) {
         ("POST", ["api", "v1", "blobs"]) => Some(UploadTarget::Blob),
         ("PUT", ["api", "v1", "blobs", "uploads", upload, "parts", part]) => {

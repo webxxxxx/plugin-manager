@@ -229,6 +229,7 @@ src/
     plugin_streams/  /plugin-ui SSE · WS · raw 的 sans-IO handler（#122）
     mcp_tools.rs     能力面 → tools/list；MCP 的 envelope 投影（工具结果、拒绝）
     mcp.rs           `mcp` 入口：MCP 客户端 ↔ svcd 的 stdio 桥（era 装饰、分页渲染、legacy 握手）
+    routes.rs        method/path → owner、405 Allow、body policy 的唯一来源
     blob.rs  blob_upload.rs  install.rs  export.rs
 
   cli/                        L5 对外面：命令行
@@ -350,7 +351,7 @@ flowchart TD
 
 | 要加的东西 | 改哪里 | 不需要动 |
 |---|---|---|
-| 一个 HTTP 端点 | `face/xxx.rs` + `server/http/routes` 一行 | 引擎、领域、其他面 |
+| 一个 HTTP 端点 | `face/routes.rs` 一行 + handler | 引擎、领域、其他面 |
 | 一个流式端点 | 同上，返回 sans-IO stream handler（连接仍归 server） | 引擎（今天要改两个引擎） |
 | 一种新协议（gRPC / MQTT / WS 控制面） | 新建 `server/xxx/` + `face/xxx_*.rs` | supervision、manage、编排、集群 |
 | 一种汇合策略 | `orchestrate/model` + `check` | 执行器、契约、监督 |
