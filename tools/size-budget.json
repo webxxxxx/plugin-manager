@@ -1,0 +1,77 @@
+{
+  "$comment": "存量超预算文件白名单；值只能降不能升（#239）。新增文件超过 700 生产行 / 1,200 总行直接红。",
+  "files": {
+    "src/cli/plugin.rs": {
+      "production": 1028,
+      "total": 1264
+    },
+    "src/cli/svc.rs": {
+      "production": 771,
+      "total": 993
+    },
+    "src/daemon/tests.rs": {
+      "production": 1704,
+      "total": 1704
+    },
+    "src/face/blob_upload.rs": {
+      "production": 736,
+      "total": 1037
+    },
+    "src/face/blob.rs": {
+      "production": 754,
+      "total": 1249
+    },
+    "src/face/install.rs": {
+      "production": 1237,
+      "total": 1501
+    },
+    "src/face/routes.rs": {
+      "production": 1106,
+      "total": 1330
+    },
+    "src/manage/check/verify.rs": {
+      "production": 881,
+      "total": 1507
+    },
+    "src/manage/ops/bundle.rs": {
+      "production": 892,
+      "total": 894
+    },
+    "src/manage/ops/bundle/tests.rs": {
+      "production": 851,
+      "total": 851
+    },
+    "src/manage/ops/install_plugin.rs": {
+      "production": 840,
+      "total": 956
+    },
+    "src/platform/limits.rs": {
+      "production": 1111,
+      "total": 1113
+    },
+    "src/selfinstall/plan.rs": {
+      "production": 889,
+      "total": 891
+    },
+    "src/server/http/model.rs": {
+      "production": 760,
+      "total": 951
+    },
+    "src/server/http/server.rs": {
+      "production": 1039,
+      "total": 1171
+    },
+    "src/supervise/model/definition/tests.rs": {
+      "production": 841,
+      "total": 841
+    },
+    "src/supervise/ops/slot.rs": {
+      "production": 1700,
+      "total": 1702
+    },
+    "src/wire/contract/reactor.rs": {
+      "production": 848,
+      "total": 1083
+    }
+  }
+}
