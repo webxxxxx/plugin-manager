@@ -1,5 +1,4 @@
-use std::collections::BTreeMap;
-use std::process::{Child, Command};
+use std::process::Child;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -8,9 +7,9 @@ use serde_json::{json, Value};
 
 #[cfg(test)]
 use crate::kernel::contract::ProgressToken;
-use crate::kernel::contract::{Contract, Control, Invocation, Reply, ReplySink, Settled, Wire};
+use crate::kernel::contract::{Contract, Invocation, Reply, ReplySink, Settled};
 use crate::kernel::failure::{Class, Failure, Rejection, Retry};
-use crate::kernel::registry::{Exec, Hook, Interpreter, Lifecycle, Ready, Restart, State};
+use crate::kernel::registry::{Exec, Lifecycle, Ready, Restart, State};
 use crate::platform::host::wake::Wake;
 use crate::platform::log::{self, LogSink};
 use crate::platform::paths::Paths;
@@ -21,8 +20,13 @@ use crate::wire::message::ipc;
 use crate::wire::message::rpc;
 
 use self::calls::PendingCalls;
+use self::commands::{abandon, command_for, service_hook_command};
 use self::frames::Frames;
+use self::handle::SlotRequest;
 use self::stop::StopFlow;
+
+pub(crate) use self::commands::hook_command;
+pub(crate) use self::handle::{SlotHandle, SlotWire};
 
 /// Per-plugin in-flight cap from ticket #31. The full spec also describes a
 /// 128-slot queue behind this cap; the ticket scopes this tracer bullet to the
@@ -99,146 +103,6 @@ impl Drop for Slot {
                 Retry::After(std::time::Duration::from_secs(1)),
                 "service runtime stopped",
             )));
-        }
-    }
-}
-
-/// A handle to one slot. Submitting never waits: the slot event loop owns the
-/// process and calls `done` when the call finishes.
-#[derive(Clone)]
-pub(crate) struct SlotHandle {
-    requests: mpsc::SyncSender<SlotRequest>,
-    wake: Option<Arc<Wake>>,
-    health: Arc<AtomicU8>,
-}
-
-struct SlotRequest {
-    invocation: Invocation,
-    /// Progress still goes straight to the caller's channel; the final response
-    /// goes through `done`.
-    client: Option<crate::wire::control::channel::Reply>,
-    done: ReplySink,
-}
-
-impl SlotHandle {
-    /// Submit a call. The event loop drains the request on its next pump and
-    /// invokes `done`; the caller keeps running.
-    pub(crate) fn submit(
-        &self,
-        invocation: Invocation,
-        client: Option<crate::wire::control::channel::Reply>,
-        done: ReplySink,
-    ) -> Result<(), (Failure, ReplySink)> {
-        let request = SlotRequest {
-            invocation,
-            client,
-            done,
-        };
-        match self.requests.try_send(request) {
-            Ok(()) => {
-                if let Some(wake) = &self.wake {
-                    wake.notify();
-                }
-                Ok(())
-            }
-            Err(mpsc::TrySendError::Full(request)) => Err((
-                Failure::new(
-                    Class::Busy,
-                    Retry::After(std::time::Duration::from_millis(100)),
-                    "too many queued calls",
-                ),
-                request.done,
-            )),
-            Err(mpsc::TrySendError::Disconnected(request)) => Err((
-                Failure::new(
-                    Class::NotRunning,
-                    Retry::After(std::time::Duration::from_secs(1)),
-                    "service runtime is gone",
-                ),
-                request.done,
-            )),
-        }
-    }
-
-    pub(crate) fn probe(&self) -> Settled {
-        match self.health.load(Ordering::SeqCst) {
-            1 => Settled::Live,
-            2 => Settled::Ready,
-            3 => Settled::Degraded("degraded".into()),
-            _ => Settled::Stopped,
-        }
-    }
-}
-
-/// The `Wire` used by the daemon. It never touches the process; it submits to
-/// the slot event loop and returns, so the daemon itself stays non-blocking.
-pub(crate) struct SlotWire {
-    handle: SlotHandle,
-    client: Option<crate::wire::control::channel::Reply>,
-}
-
-impl SlotWire {
-    pub(crate) fn new(
-        handle: SlotHandle,
-        client: Option<crate::wire::control::channel::Reply>,
-    ) -> SlotWire {
-        SlotWire { handle, client }
-    }
-}
-
-/// Test-only handle: answers submitted calls with `respond` on its own thread.
-/// The thread ends when the handle is dropped, so the conformance suite can build
-/// a fresh handle per assertion. It exercises the real `SlotWire` plumbing
-/// (submit / done callback) without spawning a supervised process; the event
-/// loop's own behaviour stays covered by the slot tests below.
-#[cfg(test)]
-impl SlotHandle {
-    pub(crate) fn scripted(
-        respond: impl Fn(&Invocation) -> Result<Value, Failure> + Send + 'static,
-    ) -> SlotHandle {
-        let (requests, receiver) = mpsc::sync_channel::<SlotRequest>(CALL_QUEUE);
-        std::thread::spawn(move || {
-            for request in receiver {
-                let outcome = respond(&request.invocation);
-                (request.done)(outcome.map(Reply::Value));
-            }
-        });
-        SlotHandle {
-            requests,
-            wake: None,
-            // Ready: a delegating adapter must still answer Probe.
-            health: Arc::new(AtomicU8::new(2)),
-        }
-    }
-}
-
-impl Wire for SlotWire {
-    fn call(&mut self, invocation: Invocation, done: ReplySink) -> Result<(), Rejection> {
-        // 内核对「取消后不得返回 Ok」的承诺必须在这一层兑现：submit 之后就没有
-        // 取消通道了（事件循环的 deadline 只覆盖超时），一个已取消的调用一旦进槽
-        // 就会被真正执行，还可能以 Ok 回到调用方。
-        if invocation.cancel.is_cancelled() {
-            done(Err(Failure::new(
-                Class::Cancelled,
-                Retry::Never,
-                "call was cancelled before it reached the service",
-            )));
-            return Ok(());
-        }
-        if let Err((failure, done)) = self.handle.submit(invocation, self.client.clone(), done) {
-            done(Err(failure));
-        }
-        Ok(())
-    }
-
-    fn lifecycle(&mut self, control: Control) -> Result<Settled, Failure> {
-        match control {
-            Control::Probe => Ok(self.handle.probe()),
-            _ => Err(Failure::new(
-                Class::ImplementationError,
-                Retry::Never,
-                "slot lifecycle must go through the daemon",
-            )),
         }
     }
 }
@@ -811,175 +675,10 @@ impl Slot {
     }
 }
 
-fn command_for(exec: &Exec) -> Command {
-    match &exec.interpreter {
-        Some(interpreter) => {
-            command_for_interpreter(interpreter, &exec.path, &exec.args, &exec.env, false)
-        }
-        None => command_for_parts(&exec.path, &exec.args, &exec.env, false),
-    }
-}
-
-pub(crate) fn hook_command(id: &str, action: &str, hook: &Hook, paths: &Paths) -> Command {
-    build_action_command(id, action, hook, true, paths)
-}
-
-/// A `lifecycle.start` action *is* the supervised foreground process, so it is
-/// adoptable after a daemon restart just like `exec`.
-pub(crate) fn service_hook_command(id: &str, action: &str, hook: &Hook, paths: &Paths) -> Command {
-    build_action_command(id, action, hook, false, paths)
-}
-
-fn build_action_command(
-    id: &str,
-    action: &str,
-    hook: &Hook,
-    hook_lifetime: bool,
-    paths: &Paths,
-) -> Command {
-    let mut command = match &hook.interpreter {
-        Some(interpreter) => command_for_interpreter(
-            interpreter,
-            &hook.path,
-            &hook.args,
-            &hook.env,
-            hook_lifetime,
-        ),
-        None => command_for_parts(&hook.path, &hook.args, &hook.env, hook_lifetime),
-    };
-    command
-        .env("SVCD_SERVICE_ID", id)
-        .env("SVCD_ACTION", action)
-        .env("SVCD_DATA_DIR", &paths.data_dir)
-        .env("SVCD_CONFIG_DIR", &paths.config_dir)
-        .env("SVCD_LOG_DIR", &paths.logs_dir);
-    command
-}
-
-/// A script payload is not executable on its own in every layout: the manifest
-/// resolved an interpreter at install time, so the supervisor runs
-/// `interp [interp args] script [action args]`.
-fn command_for_interpreter(
-    interpreter: &Interpreter,
-    script: &str,
-    args: &[String],
-    env: &BTreeMap<String, String>,
-    hook: bool,
-) -> Command {
-    let mut command = Command::new(&interpreter.path);
-    command
-        .args(&interpreter.args)
-        .arg(script)
-        .args(args)
-        .envs(env);
-    configure(command, hook)
-}
-
-fn command_for_parts(
-    path: &str,
-    args: &[String],
-    env: &BTreeMap<String, String>,
-    hook: bool,
-) -> Command {
-    let extension = std::path::Path::new(path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if extension == "ps1" {
-        #[cfg(windows)]
-        {
-            let mut command = Command::new("powershell");
-            command
-                .arg("-NoProfile")
-                .arg("-ExecutionPolicy")
-                .arg("Bypass")
-                .arg("-File")
-                .arg(path)
-                .args(args)
-                .envs(env);
-            return configure(command, hook);
-        }
-        #[cfg(not(windows))]
-        {
-            let mut command = Command::new("pwsh");
-            command
-                .arg("-NoProfile")
-                .arg("-File")
-                .arg(path)
-                .args(args)
-                .envs(env);
-            return configure(command, hook);
-        }
-    }
-    #[cfg(windows)]
-    if extension == "cmd" || extension == "bat" {
-        let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
-        let mut command = Command::new(shell);
-        command.arg("/C").arg(path).args(args).envs(env);
-        return configure(command, hook);
-    }
-    let mut command = Command::new(path);
-    command.args(args).envs(env);
-    configure(command, hook)
-}
-
-/// Services are adoptable after a daemon restart, hooks are not.
-fn configure(mut command: Command, hook: bool) -> Command {
-    if hook {
-        crate::platform::host::process::configure(
-            &mut command,
-            crate::platform::host::process::Kind::Hook,
-        );
-    } else {
-        crate::platform::host::process::configure(
-            &mut command,
-            crate::platform::host::process::Kind::Service,
-        );
-    }
-    command
-}
-
-/// Kill the child a failed stdio registration left behind, then surface the
-/// reason. Shared by every registration failure in [`Slot::spawn`].
-fn abandon(child: &mut Child, reason: impl Into<String>) -> Result<u32, String> {
-    let _ = child.kill();
-    let _ = child.wait();
-    Err(reason.into())
-}
-
-/// Test-only sink factory: it encodes a completed call exactly the way the old
-/// injected projector did, so the slot tests can still assert on the JSON line
-/// while the slot itself holds no protocol knowledge.
-#[cfg(test)]
-fn test_reply_sink(
-    reply: crate::wire::control::channel::Reply,
-    external_id: Option<Value>,
-) -> ReplySink {
-    Box::new(move |outcome| {
-        let line = match outcome {
-            Ok(Reply::Value(value)) => rpc::to_line(&rpc::ok(external_id, value)),
-            Ok(Reply::Stream(_)) => rpc::to_line(&rpc::err(
-                external_id,
-                -32000,
-                "stream replies are not wired through the test slot",
-            )),
-            Err(failure) => json!({
-                "jsonrpc": "2.0",
-                "id": external_id,
-                "result": {
-                    "content": [{ "type": "text", "text": failure.detail }],
-                    "isError": true,
-                },
-            })
-            .to_string(),
-        };
-        reply.send(line);
-    })
-}
-
 mod calls;
+mod commands;
 mod frames;
+mod handle;
 mod stop;
 
 #[cfg(test)]

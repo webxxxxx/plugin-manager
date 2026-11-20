@@ -332,3 +332,33 @@ pub(crate) fn call_error_failure(error: CallError) -> Failure {
         ),
     }
 }
+
+/// Test-only sink factory: it encodes a completed call exactly the way the old
+/// injected projector did, so the slot tests can still assert on the JSON line
+/// while the slot itself holds no protocol knowledge.
+#[cfg(test)]
+pub(super) fn test_reply_sink(
+    reply: crate::wire::control::channel::Reply,
+    external_id: Option<Value>,
+) -> ReplySink {
+    Box::new(move |outcome| {
+        let line = match outcome {
+            Ok(Reply::Value(value)) => rpc::to_line(&rpc::ok(external_id, value)),
+            Ok(Reply::Stream(_)) => rpc::to_line(&rpc::err(
+                external_id,
+                -32000,
+                "stream replies are not wired through the test slot",
+            )),
+            Err(failure) => json!({
+                "jsonrpc": "2.0",
+                "id": external_id,
+                "result": {
+                    "content": [{ "type": "text", "text": failure.detail }],
+                    "isError": true,
+                },
+            })
+            .to_string(),
+        };
+        reply.send(line);
+    })
+}
