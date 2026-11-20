@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
