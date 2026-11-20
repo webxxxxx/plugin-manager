@@ -63,6 +63,11 @@
       "concept": "platform/config",
       "layer": "platform"
     },
+    "resources": {
+      "concept": "platform/resources",
+      "layer": "platform",
+      "note": "（#161 新文件）：启动探测 + 内存预算 + 形状；读 OS 只经注入的 Machine，配置里的 probe_* 可以逐项取代探测，派生在 limits 里"
+    },
     "config": {
       "concept": "platform/config",
       "layer": "platform",
@@ -261,6 +266,11 @@
       "concept": "cli/plugin",
       "layer": "cli"
     },
+    "tune": {
+      "concept": "cli/status",
+      "layer": "cli",
+      "note": "（#161 新文件）：svc config tune 与 svc status --resources 的文本投影；只把 limits 的派生结果与启动快照渲染出来，不重新派生"
+    },
     "status": {
       "concept": "cli/status",
       "layer": "cli"
@@ -296,6 +306,7 @@
     "src/cli/mod.rs": "cli",
     "src/cli/plugin.rs": "plugin_cli",
     "src/cli/status.rs": "status",
+    "src/cli/tune.rs": "tune",
     "src/cli/svc.rs": "svc",
     "src/daemon.rs": "daemon",
     "src/face/api.rs": "face",
@@ -371,6 +382,7 @@
     "src/platform/host/wake.rs": "wake",
     "src/platform/host/zerocopy.rs": "zerocopy",
     "src/platform/limits.rs": "limits",
+    "src/platform/resources.rs": "resources",
     "src/platform/log.rs": "log",
     "src/platform/mod.rs": "platform",
     "src/platform/paths.rs": "paths",

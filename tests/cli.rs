@@ -112,6 +112,21 @@ impl Sandbox {
         command.output().expect("run alias")
     }
 
+    /// The same command with extra environment, for the keys a test needs to
+    /// pin (`SVCD_DATA_DIR`) without changing what `run` sets.
+    fn run_env(&self, args: &[&str], envs: &[(&str, &std::path::Path)]) -> Output {
+        let mut command = Command::new(&self.binary);
+        command
+            .args(args)
+            .env("SVCD_CONFIG_DIR", self.config_dir())
+            .env("SVCD_LOG_DIR", self.logs_dir())
+            .env("SVCD_TEST_UNPRIVILEGED", "1");
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        command.output().expect("run svc with env")
+    }
+
     fn run(&self, args: &[&str]) -> Output {
         let mut command = Command::new(&self.binary);
         command
@@ -430,4 +445,185 @@ fn trust_add_list_and_remove_manage_the_trust_store() {
         .join("trust.d")
         .join("bad.pub")
         .exists());
+}
+
+#[test]
+fn config_tune_prints_a_document_that_derives_the_same_values() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run_as("svc", &["config", "tune"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = stdout(&output);
+    for needle in [
+        "# machine:",
+        "memory budget:",
+        "% of the",
+        "mem_budget_bytes =",
+        "workload =",
+        "max_connections =",
+        "# disk (does not enter the memory budget):",
+    ] {
+        assert!(text.contains(needle), "missing {needle} in:\n{text}");
+    }
+
+    // The printed text is a document: writing it back must derive the same
+    // numbers, which is what "写入后运行时以 svcd.conf 为准" means.
+    fs::create_dir_all(sandbox.config_dir()).expect("config dir");
+    fs::write(sandbox.config_dir().join("svcd.conf"), &text).expect("write tuned conf");
+    let again = sandbox.run_as("svc", &["config", "tune"]);
+    assert_eq!(
+        again.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    let tuned = |output: &Output| {
+        stdout(output)
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        tuned(&again),
+        tuned(&output),
+        "a tuned document must not drift"
+    );
+}
+
+#[test]
+fn config_tune_write_keeps_one_block_and_the_rest_of_the_document() {
+    let sandbox = Sandbox::new();
+    fs::create_dir_all(sandbox.config_dir()).expect("config dir");
+    let conf = sandbox.config_dir().join("svcd.conf");
+    fs::write(&conf, "bind = 127.0.0.1:8787\n").expect("write conf");
+
+    let output = sandbox.run_as("svc", &["config", "tune", "--write"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = fs::read_to_string(&conf).expect("read conf");
+    assert!(text.starts_with("bind = 127.0.0.1:8787\n"), "{text}");
+    assert!(text.contains("# BEGIN svcd config tune"), "{text}");
+    assert!(text.contains("max_connections ="), "{text}");
+
+    // Re-running owns exactly one block, and the document still loads.
+    let output = sandbox.run_as("svc", &["config", "tune", "--write"]);
+    assert_eq!(output.status.code(), Some(0));
+    let text = fs::read_to_string(&conf).expect("read conf");
+    assert_eq!(
+        text.matches("# BEGIN svcd config tune").count(),
+        1,
+        "{text}"
+    );
+    assert_eq!(text.matches("# END svcd config tune").count(), 1, "{text}");
+
+    let output = sandbox.run_as("svc", &["config", "tune"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the written document must load: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn status_resources_reports_the_last_start_and_falls_back_without_one() {
+    let sandbox = Sandbox::new();
+    let data = sandbox.root.join("data");
+    fs::create_dir_all(data.join("run").join("resources")).expect("data dir");
+
+    // No snapshot yet: the command still answers and says where the numbers
+    // came from.
+    let output = sandbox.run_env(
+        &["status", "--resources", "--json"],
+        &[("SVCD_DATA_DIR", &data)],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("resource report");
+    assert!(report["budget_quantized"].as_u64().unwrap() >= 64 * 1024 * 1024);
+    assert!(report["worst_case"].as_u64().unwrap() <= report["budget_quantized"].as_u64().unwrap());
+
+    // A snapshot stands in for the last start.
+    fs::write(
+        data.join("run").join("resources").join("startup.json"),
+        serde_json::to_vec_pretty(&report).expect("serialize"),
+    )
+    .expect("write snapshot");
+    let output = sandbox.run_env(&["status", "--resources"], &[("SVCD_DATA_DIR", &data)]);
+    assert_eq!(output.status.code(), Some(0));
+    let text = stdout(&output);
+    for needle in ["source:  last start", "memory:", "workload:", "worst case:"] {
+        assert!(text.contains(needle), "missing {needle} in:\n{text}");
+    }
+
+    let plain = sandbox.run_env(&["status", "--resources"], &[]);
+    assert!(
+        stdout(&plain).contains("this process"),
+        "without a snapshot the source must say so:\n{}",
+        stdout(&plain)
+    );
+}
+
+#[test]
+fn an_unrunnable_document_is_still_inspectable() {
+    let sandbox = Sandbox::new();
+    fs::create_dir_all(sandbox.config_dir()).expect("config dir");
+    // A 64 MiB budget with an 8 MiB stack on ten threads cannot be planned.
+    fs::write(
+        sandbox.config_dir().join("svcd.conf"),
+        "mem_budget_bytes = 67108864\nrequest_stack_bytes = 8388608\nblocking_threads = 8\n",
+    )
+    .expect("write conf");
+
+    // The status and tuning views still answer: they are how the operator finds
+    // out what is wrong.
+    let output = sandbox.run(&["status", "--resources"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout(&output).contains("refused:"),
+        "the refusal must be visible:\n{}",
+        stdout(&output)
+    );
+
+    let output = sandbox.run(&["config", "tune"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout(&output).contains("WARNING: the daemon refuses to start"),
+        "the tuning output must warn:\n{}",
+        stdout(&output)
+    );
+
+    // The process entry that would run the daemon keeps refusing, with a
+    // readable reason and a non-zero exit code. `user status` goes through the
+    // strict bootstrap without needing a daemon.
+    let output = sandbox.run_as("svcd", &["user", "status"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("does not fit"),
+        "{}",
+        stderr(&output)
+    );
 }

@@ -115,6 +115,28 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
             .unwrap_or(config_path.as_path())
             .display()
     ));
+    // The derivation report comes after the log is open: the budget, the shape
+    // and every rewritten value are the first thing a support engineer needs.
+    // `lines()` already renders the override list, so it is not printed twice.
+    for line in config.resources.lines() {
+        log::svcd(&format!("svcd: {}", line));
+    }
+    let stated = config.settings.probe_overrides().stated_names();
+    log::svcd(&format!(
+        "svcd: probe inputs stated by svcd.conf: {}",
+        if stated.is_empty() {
+            "none".to_string()
+        } else {
+            stated.join(", ")
+        }
+    ));
+    match crate::platform::limits::write_snapshot(&config.paths, &config.resources) {
+        Ok(()) => {}
+        Err(error) => log::svcd(&format!(
+            "svcd: cannot write the resource snapshot: {}",
+            error
+        )),
+    }
     // An explicit --conf may set config_dir to a different directory.
     let config_dir = &config.paths.config_dir;
     if config_dir != &initial_paths.config_dir {
@@ -177,7 +199,10 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         }
     }
 
-    let (tx, rx) = mpsc::sync_channel(channel::PENDING_QUEUE_LIMIT);
+    // The supervisor's pending management queue depth is derived with the rest
+    // of the backpressure limits, so a full queue is the same visible busy
+    // signal on every budget.
+    let (tx, rx) = mpsc::sync_channel(config.limits.pending_queue);
     let wake = Arc::new(Wake::new());
     // One path on every host: the channel binds the endpoint and either hands
     // the listener to the server loop (Unix) or starts its own accept thread

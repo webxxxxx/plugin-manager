@@ -26,10 +26,6 @@ use crate::server::mcp::result::finish_modern_tool_call;
 use crate::wire::control::channel::ProgressEvent;
 use crate::wire::message::rpc;
 
-/// The bound on progress events between the reactor and one stream. The old
-/// `start_mcp_sse` used the same 64-slot channel; the count did not change.
-pub const PROGRESS_QUEUE_SLOTS: usize = 64;
-
 /// The legacy poll cadence of the server loop. Waiting for the next event
 /// schedules a tick this far ahead instead of waiting for the transfer bound.
 const POLL: Duration = Duration::from_millis(100);

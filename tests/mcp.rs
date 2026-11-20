@@ -56,6 +56,15 @@ impl Sandbox {
         fs::create_dir_all(&config).expect("config");
         fs::create_dir_all(&data).expect("data");
         fs::create_dir_all(&logs).expect("logs");
+        // The derived limits follow the memory budget, and the budget follows
+        // the machine running the suite. Stating the probe input keeps every
+        // test in this file on the same 2 GiB budget — the shape the historical
+        // `high` build produced — instead of depending on this host's RAM.
+        fs::write(
+            config.join("svcd.conf"),
+            "probe_available_memory = 8589934592\n",
+        )
+        .expect("pin the probe");
 
         let binary = env!("CARGO_BIN_EXE_svcd");
         let names = if cfg!(windows) {

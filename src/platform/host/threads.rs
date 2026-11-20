@@ -2,7 +2,7 @@
 //! usually 2 MiB of reserve per thread; embedded targets care about both the
 //! reserve and the pages touched, so keep request/control threads bounded.
 //!
-//! The values come from `limits` (compile-time `MEM_LEVEL` defaults plus
+//! The values come from `limits` (the derived budget, workload shape and
 //! optional `svcd.conf` overrides). They are read when a thread is created;
 //! changing the config requires a daemon restart.
 

@@ -1,28 +1,36 @@
 //! Runtime configuration, derived once at the composition root.
 //!
 //! [`Config`] is the read-only value the process hands to every subsystem: the
-//! parsed `svcd.conf`, the file it came from, the directory set and the limits
-//! derived from the document. The `SVCD_*` overrides and the file discovery are
-//! read here — once — and modules below the composition root receive their
-//! directories as parameters instead of consulting process state.
+//! parsed `svcd.conf`, the file it came from, the directory set, the limits
+//! derived from the document, and the report that explains the derivation (the
+//! memory budget, the workload shape and every rewritten value).
+//!
+//! The machine is probed exactly here, once: [`Config::bootstrap`] reads the
+//! host (unless `svcd.conf` states an item with a `probe_*` key, in which case
+//! that item is taken as written and not read), and [`Config::with_paths`]
+//! takes no probe at all and derives from the compile-time ceiling, which is
+//! what keeps a test independent of the machine it runs on. [`Config::inspect`]
+//! is the same bootstrap without the refuse-to-start gate.
 //!
 //! Shape and rationale:
-//! [`docs/adr/0019-config-is-derived-once-at-the-composition-root.md`](../../docs/adr/0019-config-is-derived-once-at-the-composition-root.md).
+//! [`docs/adr/0019-config-is-derived-once-at-the-composition-root.md`](../../docs/adr/0019-config-is-derived-once-at-the-composition-root.md)
+//! and [`docs/adr/0026-the-memory-budget-is-the-truth.md`](../../docs/adr/0026-the-memory-budget-is-the-truth.md).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::platform::limits::{self, Limits};
+use crate::platform::limits::{self, Derived, Limits, ResourceReport};
 use crate::platform::paths::Paths;
+use crate::platform::resources::{self, Machine, ProbePaths, ResourceProfile};
 use crate::platform::settings::{self, Settings};
 
 /// Everything the composition root derives from one `svcd.conf`: the parsed
-/// document, the file it came from, the directory set, and the limits.
+/// document, the file it came from, the directory set, the limits and the
+/// report behind them.
 ///
-/// The four fields are the bootstrap snapshot. There is no process-wide cache
-/// behind any of them: every reader receives the value through a construction
-/// parameter, so a unit test can supply its own document without touching the
-/// process environment.
+/// There is no process-wide cache behind any of them: every reader receives the
+/// value through a construction parameter, so a unit test can supply its own
+/// document without touching the process environment.
 #[derive(Clone, Debug)]
 pub struct Config {
     /// The document this process runs with.
@@ -31,49 +39,109 @@ pub struct Config {
     pub settings_path: Option<PathBuf>,
     /// Every directory the process uses.
     pub paths: Arc<Paths>,
-    /// Limits derived from `settings`.
+    /// Limits derived from `settings` and the probed machine.
     pub limits: Arc<Limits>,
+    /// Bytes, shape and rewrites behind `limits`.
+    pub resources: Arc<ResourceReport>,
 }
 
 impl Config {
-    /// Derive a configuration from an already-parsed document, resolving the
-    /// directory set with [`Paths::resolve`] (the production path).
+    /// The same value with an explicit directory set and no machine probe.
     ///
-    /// Unit tests that need a whole configuration use [`Config::with_paths`]
-    /// with [`Paths::under`] so they own the tree and never read the process
-    /// environment.
-    pub fn new(settings: Settings, settings_path: Option<PathBuf>) -> Config {
-        let paths = Paths::resolve(&settings);
-        Self::with_paths(settings, settings_path, paths)
+    /// Only tests and unit-test composition roots need this: they pass
+    /// [`Paths::under`] and own the whole tree, and the empty profile keeps the
+    /// derived limits the same on every machine (the budget is the build
+    /// ceiling). Production goes through [`Config::bootstrap`].
+    #[cfg(test)]
+    pub fn with_paths(settings: Settings, settings_path: Option<PathBuf>, paths: Paths) -> Config {
+        Self::assemble(settings, settings_path, paths, &ResourceProfile::default())
     }
 
-    /// The same value with an explicit directory set. Production derives it
-    /// from the document; a unit test passes [`Paths::under`] and owns the
-    /// whole tree without touching the process environment.
-    pub fn with_paths(settings: Settings, settings_path: Option<PathBuf>, paths: Paths) -> Config {
-        let limits = limits::derive(&settings);
+    /// The same value with an explicit resource description. A test that wants
+    /// to pin the machine states it here instead of probing this host.
+    pub fn with_resources(
+        settings: Settings,
+        settings_path: Option<PathBuf>,
+        paths: Paths,
+        profile: &ResourceProfile,
+    ) -> Config {
+        Self::assemble(settings, settings_path, paths, profile)
+    }
+
+    fn assemble(
+        settings: Settings,
+        settings_path: Option<PathBuf>,
+        paths: Paths,
+        profile: &ResourceProfile,
+    ) -> Config {
+        let Derived { limits, report } = limits::derive_with(&settings, profile);
         Config {
             paths: Arc::new(paths),
             settings: Arc::new(settings),
             settings_path,
             limits: Arc::new(limits),
+            resources: Arc::new(report),
         }
     }
 
     /// The single bootstrap point.
     ///
-    /// Resolves and parses the settings document exactly once, then derives the
-    /// directory set and the limits from it. There is no process cache behind
-    /// the returned value: a broken or unreadable document is a hard error, and
-    /// callers that find a missing discovered file get an empty document, not a
-    /// silent retry.
+    /// Resolves and parses the settings document exactly once, probes the
+    /// machine exactly once, then derives the directory set, the memory budget,
+    /// the limits and the override list from them. There is no process cache
+    /// behind the returned value: a broken or unreadable document is a hard
+    /// error, and a configuration whose worst case cannot fit its budget is
+    /// also a hard error — the process refuses to start instead of running
+    /// until it is killed for memory (user story 25).
     pub fn bootstrap(conf: Option<&Path>) -> Result<Config, String> {
+        let config = Self::inspect(conf)?;
+        match &config.resources.refusal {
+            Some(reason) => Err(reason.clone()),
+            None => Ok(config),
+        }
+    }
+
+    /// [`Config::bootstrap`] without the refusal check.
+    ///
+    /// The CLI uses this: a document the daemon refuses is exactly the moment an
+    /// operator needs `svc status --resources` and `svc config tune` to explain
+    /// why, so the report has to be readable even when the configuration is not
+    /// runnable.
+    pub fn inspect(conf: Option<&Path>) -> Result<Config, String> {
         let (mut settings, settings_path) = settings::load(conf)?;
         // The two loop cadences still take their historical `SVCD_*` env
         // override. Applying it here keeps "env is read at bootstrap" true for
         // every key, and keeps the override out of the modules below.
         settings::apply_loop_env_overrides(&mut settings);
-        Ok(Config::new(settings, settings_path))
+        Ok(Self::assembled(&settings, settings_path, &resources::Host))
+    }
+
+    /// [`Config::bootstrap`] with the machine injected, so a test can state the
+    /// host the way it states the document. It keeps the refusal gate: this is
+    /// the entry that decides whether a process may run.
+    #[cfg(test)]
+    pub fn bootstrap_with(
+        settings: &Settings,
+        settings_path: Option<PathBuf>,
+        machine: &dyn Machine,
+    ) -> Result<Config, String> {
+        let config = Self::assembled(settings, settings_path, machine);
+        match &config.resources.refusal {
+            Some(reason) => Err(reason.clone()),
+            None => Ok(config),
+        }
+    }
+
+    /// Probe the injected machine and derive, refusing nothing.
+    fn assembled(
+        settings: &Settings,
+        settings_path: Option<PathBuf>,
+        machine: &dyn Machine,
+    ) -> Config {
+        let paths = Paths::resolve(settings);
+        let probe_paths = ProbePaths::host(&paths.data_dir, &paths.temp_dir);
+        let profile = resources::probe(machine, &probe_paths, &settings.probe_overrides());
+        Self::with_resources(settings.clone(), settings_path, paths, &profile)
     }
 
     /// [`Config::bootstrap`] for a process entry that reports the failure with
@@ -81,6 +149,23 @@ impl Config {
     pub fn bootstrap_or_report(label: &str) -> Option<Config> {
         match Self::bootstrap(None) {
             Ok(config) => Some(config),
+            Err(error) => {
+                eprintln!("{}: invalid config: {}", label, error);
+                None
+            }
+        }
+    }
+
+    /// [`Config::inspect`] with the same reporting shape. A refusal is reported
+    /// as a warning and does not stop the command.
+    pub fn inspect_or_report(label: &str) -> Option<Config> {
+        match Self::inspect(None) {
+            Ok(config) => {
+                if let Some(reason) = &config.resources.refusal {
+                    eprintln!("{}: warning: {}", label, reason);
+                }
+                Some(config)
+            }
             Err(error) => {
                 eprintln!("{}: invalid config: {}", label, error);
                 None
@@ -108,6 +193,7 @@ pub(crate) fn ambient_paths(conf: Option<&Path>) -> Paths {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::resources::{BudgetSource, Machine, Workload, WorkloadSource};
     use std::time::Duration;
 
     fn write_conf(name: &str, text: &str) -> PathBuf {
@@ -125,6 +211,27 @@ mod tests {
         let path = dir.join("svcd.conf");
         std::fs::write(&path, text).expect("write conf");
         path
+    }
+
+    /// A machine stated by the test: one number for free memory.
+    struct Fixed(Option<u64>);
+
+    impl Machine for Fixed {
+        fn read(&self, _path: &Path) -> Option<String> {
+            None
+        }
+
+        fn physical_memory(&self) -> Option<(u64, u64)> {
+            self.0.map(|available| (available, available * 2))
+        }
+
+        fn cpu_count(&self) -> Option<usize> {
+            Some(4)
+        }
+
+        fn free_disk(&self, _path: &Path) -> Option<u64> {
+            Some(10 * 1024 * 1024 * 1024)
+        }
     }
 
     #[test]
@@ -145,6 +252,97 @@ mod tests {
         assert_eq!(config.settings.http_idle_timeout_secs, Some(7));
         // The limits are a pure projection of the document, not a second cache.
         assert_eq!(config.limits.idle_timeout, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn the_test_seam_derives_from_the_build_ceiling_and_not_from_this_machine() {
+        let config = Config::with_paths(
+            Settings::default(),
+            None,
+            Paths::under(Path::new("/tmp/svcd-config-neutral")),
+        );
+
+        assert_eq!(config.resources.budget.quantized, limits::BUDGET_CAP);
+        assert_eq!(config.resources.budget.source, BudgetSource::Auto);
+        assert_eq!(config.resources.workload_source, WorkloadSource::Derived);
+        assert!(config.resources.notes.is_empty());
+        assert_eq!(config.resources.refusal, None);
+    }
+
+    #[test]
+    fn bootstrap_with_states_the_machine_and_reports_it() {
+        let settings = Settings::default();
+        let config = Config::bootstrap_with(
+            &settings,
+            Some(PathBuf::from("/etc/svcd/svcd.conf")),
+            &Fixed(Some(16 * 1024 * 1024 * 1024)),
+        )
+        .expect("bootstrap");
+
+        // 25% of 16 GiB is 4 GiB, which the build ceiling still caps.
+        assert_eq!(config.resources.budget.raw, limits::BUDGET_CAP);
+        assert_eq!(config.resources.profile.cpus, Some(4));
+        assert_eq!(
+            config.resources.profile.install_free_disk,
+            Some(10 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn a_stated_probe_input_decides_the_budget_instead_of_this_machine() {
+        // The user's requirement: a configured resource is the truth, and the
+        // matching OS read does not happen. The injected machine says "64 GiB";
+        // the document says 1 GiB and that is what the derivation uses.
+        let settings = Settings {
+            probe_available_memory: Some(1024 * 1024 * 1024),
+            ..Settings::default()
+        };
+        let config = Config::bootstrap_with(&settings, None, &Fixed(Some(64 * 1024 * 1024 * 1024)))
+            .expect("bootstrap");
+
+        assert_eq!(config.resources.budget.raw, 256 * 1024 * 1024);
+        assert_eq!(config.resources.workload, Workload::Tiny);
+    }
+
+    #[test]
+    fn a_small_machine_derives_a_smaller_shape() {
+        let settings = Settings::default();
+        let config = Config::bootstrap_with(&settings, None, &Fixed(Some(1024 * 1024 * 1024)))
+            .expect("bootstrap");
+
+        // 25% of 1 GiB drives the budget, and 256 MiB is a tiny shape.
+        assert_eq!(config.resources.budget.raw, 256 * 1024 * 1024);
+        assert_eq!(config.resources.workload, Workload::Tiny);
+        assert_eq!(config.resources.workload_source, WorkloadSource::Derived);
+    }
+
+    #[test]
+    fn an_explicit_workload_overrides_the_derived_one() {
+        let settings = Settings {
+            workload: Some(Workload::Streaming),
+            ..Settings::default()
+        };
+        let config = Config::bootstrap_with(&settings, None, &Fixed(Some(256 * 1024 * 1024)))
+            .expect("bootstrap");
+
+        assert_eq!(config.resources.workload, Workload::Streaming);
+        assert_eq!(config.resources.workload_source, WorkloadSource::Configured);
+    }
+
+    #[test]
+    fn a_config_that_cannot_fit_its_budget_refuses_to_start() {
+        // A 64 MiB budget with a 8 MiB stack on ten threads cannot be planned:
+        // the stack term alone is larger than the whole budget.
+        let settings = Settings {
+            mem_budget_bytes: Some(64 * 1024 * 1024),
+            request_stack_bytes: Some(8 * 1024 * 1024),
+            blocking_threads: Some(8),
+            ..Settings::default()
+        };
+
+        let error = Config::bootstrap_with(&settings, None, &Fixed(None)).expect_err("must refuse");
+        assert!(error.contains("does not fit"), "{error}");
+        assert!(error.contains("memory budget"), "{error}");
     }
 
     #[test]

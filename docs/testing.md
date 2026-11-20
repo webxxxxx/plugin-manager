@@ -22,7 +22,7 @@
 | L1 单元 / 契约 | 解析、上限、状态机、失败类别、配置夹取 | 每个 PR | `cargo test` |
 | L2 协议兼容 | HTTP/1.1、WebSocket、SSE、MCP 的 framing、handshake、错误码、重连 | 每个 PR（轻量）+ 每晚（完整） | `tools/perf/run.mjs --compat`、Autobahn、官方 SDK |
 | L3 性能 | 延迟分位、吞吐、RSS、线程、插件规模、混合负载 | 每晚 / 手动 | `tools/perf/run.mjs --perf`、`--scale`、soak 脚本 |
-| L4 资源档位 | `MEM_LEVEL=low/middle/high` 的默认值与边界 | 每个 PR（矩阵） | `cargo test --bin svcd limits::tests` |
+| L4 内存预算 | `MEM_LEVEL=low/middle/high` 上限 × tiny/interactive/streaming × 边界与不变量 | 每个 PR（矩阵） | `cargo test --bin svcd platform::limits` |
 
 原则：**L1 必须快且确定；L2 测线格式而不是业务；L3 不进 PR 门槛；L4 必须覆盖三档编译。**
 
@@ -64,24 +64,53 @@
 
 MCP 不是 W3C，不要用 WPT 套；官方 SDK + 规范逐条向量就是这一层的「一致性测试」。
 
-## 4. MEM_LEVEL 与 `svcd.conf` 边界
+## 4. 内存预算、形状与 `svcd.conf` 边界
 
-`MEM_LEVEL=low|middle|high` 是编译期档位，`svcd.conf` 是运行期覆盖；两者都在 [limits.rs](../src/limits.rs) 夹取。测试分三段：
+`MEM_LEVEL=low|middle|high` 现在是**编译期预算上限**（128 MiB / 512 MiB / 2 GiB，只收紧），`svcd.conf` 的 `mem_budget_bytes` / `workload` 与其余键是运行期输入；派生全部落在 [limits.rs](../src/platform/limits.rs)，探测落在 [resources.rs](../src/platform/resources.rs)。测试分五段：
 
-1. **档位矩阵**：CI 用 `low/middle/high` 各编译并跑 `limits::tests`。
-2. **边界夹取**：每个字段取 `0` / `1` / `MAX`，断言结果落在文档下限/上限，且不 panic。
-3. **默认值**：当前档位的默认值必须落在同一组下限/上限内；`default_timeout <= max_timeout`。
+1. **档位矩阵**：CI 用 `low/middle/high` 各编译并跑 `limits::tests`
+   （`cargo test --bin svcd platform::limits`）。断言的是不变量恒成立或启动被拒，
+   **不是**某档的具体数字——数字随机器变，承诺不随机器变。
+2. **边界夹取**：每个字段取 `0` / `1` / `MAX`。低于绝对下限抬到下限并留下
+   `below-floor` 覆盖说明；高于 `min(份额 × 预算, 绝对上限)` 回落到**形状基准**
+   （不是上限）并留下 `above-upper-bound`。已被 `every_limit_has_a_floor` 与
+   `a_value_above_the_upper_bound_falls_back_to_the_shape_reference` 覆盖。
+3. **派生矩阵**：`{low/middle/high 上限} × {tiny/interactive/streaming} × {界内, 低于下限,
+   高于上界, 超预算}`，平台中立；`ResourceProfile` 由测试注入，不读 `/proc`。
+   - `every_shape_fits_its_reference_budget` / `every_shape_fits_the_floor_budget`：
+     每个形状在自己的参考预算和 64 MiB 地板上都满足不变量且无覆盖说明。
+   - `the_shapes_never_collapse_into_one_result`：任意预算下并发严格单调，三个形状两两可区分，
+     streaming 用更小的单体换更多长连接。
+   - `the_reference_values_stay_close_to_the_historical_table`：参考预算下的派生值与旧三档表
+     同量级（比值 1/4..4），偏差在测试里逐条记录。
+   - `a_maxed_out_legal_configuration_is_shrunk_until_the_invariant_holds` /
+     `a_configuration_that_cannot_fit_is_refused_with_the_terms`：收缩顺序与拒绝启动。
+   - `the_build_cap_only_tightens_the_budget`：任意注入 profile 与任意文档都不能把预算推过
+     编译期上限——这条不依赖机器，是保留 `MEM_LEVEL` 成上限的直接收益。
+4. **平台补充分测**：Linux `/proc/meminfo` + cgroup v2（`memory.max` 为 `max` 时忽略、
+   v1 层级忽略）与 Windows `GlobalMemoryStatusEx` 各一条，只验证取数正确，不替代主路径。
+5. **端到端**：`tests/daemon.rs` 的 sandbox 启动真实 daemon，读 `run/resources/startup.json`
+   与 `svc status --resources`，断言覆盖说明条数与四个字段；`svc config tune` 的输出
+   必须能被 `settings::parse` 读回并派生出同一组限额。
 
-已覆盖的坑：`max_streams=0`、`request_stack_bytes=1`、`io_stack_bytes=1`、`idle_timeout=0`、`u64::MAX` 超时。
+沙箱里的限额是**确定的**：`Config::with_paths` / `Config::with_resources` 不探测本机，
+`B` 等于编译期上限；只有 `Config::bootstrap` 读真实机器。集成 sandbox 里的 daemon 确实探测，
+所以断言**绝对**限额的用例必须自己钉住：要么写死那个键（`max_json_body_bytes = 1048576`），
+要么钉住探测输入（`probe_available_memory = 8589934592` → 2 GiB 预算，等价于旧的 `high`
+形状）。`tests/mcp.rs` 的 sandbox 就是后者。
 
-第 4 条已经落地：`tests/http.rs::minimal_svcd_conf_keeps_the_daemon_alive` 用两份 `svcd.conf` 驱动真实 daemon，比纯 `Limits` 单测更接近用户报的「设置过小崩溃」。
+已覆盖的坑：`max_streams=0`、`request_stack_bytes=1`、`io_stack_bytes=1`、`idle_timeout=0`、
+`u64::MAX` 超时、`workload=huge`、`mem_budget_bytes=lots`。
+
+`tests/http.rs::minimal_svcd_conf_keeps_the_daemon_alive` 仍然用两份 `svcd.conf` 驱动真实
+daemon，比纯 `Limits` 单测更接近用户报的「设置过小崩溃」。
 
 - **floor**：每个键都取解析器接受的最小值（0/1）。断言夹取真的到了运行期（超长 header 400、超 body 413、零订阅 429、超连接 503），进程不退出、不 panic、不重启。
 - **usable**：同样的下限，只把「0 等于关掉功能」的键抬到最小可用值（连接 2、订阅 1、`default_timeout` 1000 ms），让 HTTP / MCP / WebSocket / SSE 各完成一次真实往返：WS ping/pong 与 1009、SSE 投递与 `Last-Event-ID` 重连、`/mcp` 的 `tools/list`/`tools/call` 与 stdio bridge 的 `initialize`。
 
 每条探针都归属一个 `svcd.conf` 键，失败时打印该键、原始请求、响应和 daemon 输出。
 
-Windows 走每连接线程回退，但上面的连接数、每 IP 与 idle 探针在两端断言同一结果：回退在 accept 后、起线程前准入，线程数上限由 `max_connections` 约束，不是最终的四线程拓扑。
+Windows 走每连接线程回退，但上面的连接数、每 IP 与 idle 探针在两端断言同一结果：回退在 accept 后、起线程前准入，线程数上限由 `max_connections` 约束，不是最终的四线程拓扑。Windows 上不变量把每个连接都算一条线程栈，所以同一份显式配置在 Windows 上更早触发收缩，这是预期差异，不是平台缺陷。
 
 ## 5. 性能测试
 
@@ -97,7 +126,7 @@ Windows 走每连接线程回退，但上面的连接数、每 IP 与 idle 探�
 - **PR**：不跑真实网络性能（噪声大），只保留 `spk_smoke.py`；
 - **每晚 / 手动**：跑 `--perf`，上传 `target/perf-report.md` 与 JSON；
 - **基线**：先记录同一 runner 的 p50/p95/p99、RSS、线程数；稳定后对 p95 与 RSS 设 20% 回归阈值，超过才失败；
-- **MEM_LEVEL**：对 low/middle/high 各跑一次空载 RSS，确认低档确实更低，且没有 OOM/重启。
+- **内存预算**：用 `workload = tiny|interactive|streaming`（而不是 `MEM_LEVEL` 档位）各跑一次空载 RSS，确认三种形状确实不同，且没有 OOM/重启。
 
 性能数字是机器相关的；不要拿不同 runner 的绝对值当门槛，只做同机相对比较。
 
@@ -128,9 +157,9 @@ node tools/check.mjs linux <filter>           # 单条/单组用例（--exact �
 
 # 原始 cargo（需要完整输出时）
 cargo test
-MEM_LEVEL=low cargo test --bin svcd limits::tests -- --test-threads=1
-MEM_LEVEL=middle cargo test --bin svcd limits::tests -- --test-threads=1
-MEM_LEVEL=high cargo test --bin svcd limits::tests -- --test-threads=1
+MEM_LEVEL=low cargo test --bin svcd platform::limits -- --test-threads=1
+MEM_LEVEL=middle cargo test --bin svcd platform::limits -- --test-threads=1
+MEM_LEVEL=high cargo test --bin svcd platform::limits -- --test-threads=1
 
 # 运行时崩溃回归（#108，MEM_LEVEL 各跑一次）
 cargo test --test http minimal_svcd_conf -- --test-threads=1

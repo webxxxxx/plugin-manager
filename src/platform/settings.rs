@@ -15,6 +15,8 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use crate::platform::resources::Workload;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
     /// HTTP listener address. Default: `127.0.0.1:8787`.
@@ -41,13 +43,14 @@ pub struct Settings {
     /// Per-service log directory. Empty/absent uses the platform or
     /// `install_dir/logs` default.
     pub logs_dir: Option<PathBuf>,
-    /// Rotation threshold for one log file. Default is chosen by `MEM_LEVEL`.
+    /// Rotation threshold for one log file. Default is chosen by the workload
+    /// shape (it does not scale with the memory budget).
     pub log_max_bytes: Option<u64>,
     /// Number of rotated files to keep (1 = only the current file).
     pub log_rotations: Option<usize>,
     /// `false` keeps logs on stderr/syslog only. Default: true.
     pub log_to_file: Option<bool>,
-    /// Explicit thread stack sizes. `MEM_LEVEL` supplies the defaults.
+    /// Explicit thread stack sizes. The workload shape supplies the defaults.
     pub request_stack_bytes: Option<usize>,
     pub io_stack_bytes: Option<usize>,
     /// Worker threads for the blocking face pool. Default: 2, clamped 2..8.
@@ -81,6 +84,30 @@ pub struct Settings {
     pub ws_raw_enabled: Option<bool>,
     pub ws_raw_max_bytes: Option<usize>,
     pub ws_raw_queue: Option<usize>,
+    /// Queued management requests between the server loop and the supervisor
+    /// loop. Derived from the memory budget; clamped 8..4096.
+    pub pending_queue: Option<usize>,
+    /// Progress events queued between the reactor and one MCP stream. Derived
+    /// from the memory budget; clamped 4..1024.
+    pub progress_queue: Option<usize>,
+    /// The peak memory this process may plan for, in bytes. `auto` (or absent)
+    /// discounts the probed free memory; a number is taken as written and only
+    /// clamped by the floor and the compile-time ceiling. See
+    /// [`crate::platform::limits`].
+    pub mem_budget_bytes: Option<u64>,
+    /// How the budget is spent. Absent derives the shape from the budget:
+    /// below 512 MiB `tiny`, below 2 GiB `interactive`, otherwise `streaming`.
+    pub workload: Option<Workload>,
+    /// Probe inputs stated by the document. Each one is taken as written and
+    /// the matching OS read is skipped, which is how a container with an
+    /// unhelpful `/proc` — or a reproduction of someone else's machine — states
+    /// its resources without an environment override.
+    pub probe_available_memory: Option<u64>,
+    /// What the memory cgroup still allows (`memory.max - memory.current`).
+    pub probe_cgroup_remaining: Option<u64>,
+    pub probe_cpus: Option<usize>,
+    pub probe_install_free_disk: Option<u64>,
+    pub probe_temp_free_disk: Option<u64>,
     /// Relocated installation root for hosts whose `/usr` is read-only and
     /// whose writable tree is limited (SR6110: only `/etc` persists). When
     /// set, `--install` puts the binary, aliases and `svcd_daemon.sh` here;
@@ -100,6 +127,17 @@ impl Settings {
     /// Runtime log directory implied by `install_dir`, if that key is set.
     pub fn install_logs_dir(&self) -> Option<PathBuf> {
         self.install_dir.as_ref().map(|dir| dir.join("logs"))
+    }
+
+    /// The probe inputs this document states; every other item is probed.
+    pub fn probe_overrides(&self) -> crate::platform::resources::ProbeOverrides {
+        crate::platform::resources::ProbeOverrides {
+            available_memory: self.probe_available_memory,
+            cgroup_remaining: self.probe_cgroup_remaining,
+            cpus: self.probe_cpus,
+            install_free_disk: self.probe_install_free_disk,
+            temp_free_disk: self.probe_temp_free_disk,
+        }
     }
 
     pub fn temp_retention(&self) -> std::time::Duration {
@@ -196,7 +234,7 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
             .split_once('=')
             .ok_or_else(|| format!("line {}: expected key = value", index + 1))?;
         let key = key.trim();
-        let value = value.trim();
+        let value = strip_comment(value.trim());
         if key.is_empty() {
             return Err(format!("line {}: empty key", index + 1));
         }
@@ -358,6 +396,45 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
             "ws_raw_queue" => {
                 settings.ws_raw_queue = Some(parse_usize(value, "ws_raw_queue", index)?)
             }
+            "pending_queue" => {
+                settings.pending_queue = Some(parse_usize(value, "pending_queue", index)?)
+            }
+            "progress_queue" => {
+                settings.progress_queue = Some(parse_usize(value, "progress_queue", index)?)
+            }
+            "mem_budget_bytes" => {
+                settings.mem_budget_bytes = match value {
+                    "auto" => None,
+                    _ => Some(parse_u64(value, "mem_budget_bytes", index)?),
+                }
+            }
+            "probe_available_memory" => {
+                settings.probe_available_memory =
+                    Some(parse_u64(value, "probe_available_memory", index)?)
+            }
+            "probe_cgroup_remaining" => {
+                settings.probe_cgroup_remaining =
+                    Some(parse_u64(value, "probe_cgroup_remaining", index)?)
+            }
+            "probe_cpus" => settings.probe_cpus = Some(parse_usize(value, "probe_cpus", index)?),
+            "probe_install_free_disk" => {
+                settings.probe_install_free_disk =
+                    Some(parse_u64(value, "probe_install_free_disk", index)?)
+            }
+            "probe_temp_free_disk" => {
+                settings.probe_temp_free_disk =
+                    Some(parse_u64(value, "probe_temp_free_disk", index)?)
+            }
+            "workload" => {
+                settings.workload = Some(Workload::parse(value).ok_or_else(|| {
+                    format!(
+                        "line {}: invalid workload {:?} ({})",
+                        index + 1,
+                        value,
+                        Workload::ALL.map(Workload::as_str).join("|")
+                    )
+                })?)
+            }
             other => return Err(format!("line {}: unknown key {:?}", index + 1, other)),
         }
     }
@@ -370,6 +447,16 @@ fn resolve(base: &Path, value: &str) -> PathBuf {
         path
     } else {
         base.join(path)
+    }
+}
+
+/// A trailing `# ...` comment is allowed after a value when the hash is
+/// preceded by whitespace. `svc config tune` writes the derivation on the same
+/// line, and a hand-edited file may do the same.
+fn strip_comment(value: &str) -> &str {
+    match value.find(" #") {
+        Some(index) => value[..index].trim_end(),
+        None => value,
     }
 }
 
@@ -694,5 +781,206 @@ mod tests {
             settings.plugins_dir,
             Some(PathBuf::from(r"C:\svcd\plugins"))
         );
+    }
+}
+
+/// Replace or append one delimited block of a `svcd.conf` document.
+///
+/// Everything outside `begin`..`end` is preserved byte for byte, so the block
+/// `svc config tune --write` owns can be re-written on every run and removed by
+/// deleting its two marker lines. An unterminated block is an error: rewriting a
+/// document whose structure cannot be trusted would lose the operator's edit.
+pub fn upsert_block(path: &Path, begin: &str, end: &str, body: &str) -> Result<(), String> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        // A host that never had a `svcd.conf` gets the block as its document.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("read {}: {}", path.display(), error)),
+    };
+    let mut output = String::with_capacity(text.len() + body.len() + 128);
+    let mut inside = false;
+    let mut wrote = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if inside {
+            if trimmed == end {
+                inside = false;
+            }
+            continue;
+        }
+        if trimmed == begin {
+            output.push_str(&block(begin, end, body));
+            wrote = true;
+            inside = true;
+            continue;
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    if inside {
+        return Err(format!(
+            "{}: the {:?} block has no {:?} line",
+            path.display(),
+            begin,
+            end
+        ));
+    }
+    if !wrote {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&block(begin, end, body));
+    }
+    fs::write(path, output).map_err(|error| format!("write {}: {}", path.display(), error))
+}
+
+fn block(begin: &str, end: &str, body: &str) -> String {
+    let mut out = String::with_capacity(body.len() + begin.len() + end.len() + 4);
+    out.push_str(begin);
+    out.push('\n');
+    out.push_str(body);
+    if !body.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(end);
+    out.push('\n');
+    out
+}
+
+#[cfg(test)]
+mod document_tests {
+    use super::*;
+
+    fn temp_file(name: &str, text: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = crate::test_support::temp_dir().join(format!(
+            "svcd-settings-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            name
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("svcd.conf");
+        std::fs::write(&path, text).expect("write conf");
+        path
+    }
+
+    #[test]
+    fn a_trailing_comment_is_part_of_the_value_syntax() {
+        let settings = parse(
+            "max_connections = 32   # half of nothing\nworkload = tiny # derived\n",
+            Path::new("/etc/svcd"),
+        )
+        .expect("parse");
+
+        assert_eq!(settings.max_connections, Some(32));
+        assert_eq!(settings.workload, Some(Workload::Tiny));
+    }
+
+    #[test]
+    fn a_hash_inside_a_value_without_a_leading_space_survives() {
+        let settings = parse("bind = 127.0.0.1:8787\n", Path::new("/etc/svcd")).expect("parse");
+        assert!(settings.bind.is_some());
+
+        let settings = parse("config_dir = /srv/svcd#1\n", Path::new("/")).expect("parse");
+        assert_eq!(settings.config_dir, Some(PathBuf::from("/srv/svcd#1")));
+    }
+
+    #[test]
+    fn the_budget_and_the_workload_parse() {
+        let settings = parse(
+            "mem_budget_bytes = auto\nworkload = streaming\n",
+            Path::new("/etc/svcd"),
+        )
+        .expect("auto");
+        assert_eq!(settings.mem_budget_bytes, None);
+        assert_eq!(settings.workload, Some(Workload::Streaming));
+
+        let settings =
+            parse("mem_budget_bytes = 536870912\n", Path::new("/etc/svcd")).expect("number");
+        assert_eq!(settings.mem_budget_bytes, Some(512 * 1024 * 1024));
+
+        let error = parse("workload = huge\n", Path::new("/etc/svcd")).expect_err("invalid");
+        assert!(error.contains("tiny|interactive|streaming"), "{error}");
+        let error =
+            parse("mem_budget_bytes = lots\n", Path::new("/etc/svcd")).expect_err("invalid");
+        assert!(error.contains("mem_budget_bytes"), "{error}");
+    }
+
+    #[test]
+    fn the_probe_inputs_parse_and_become_overrides() {
+        let settings = parse(
+            "probe_available_memory = 34359738368\n\
+             probe_cgroup_remaining = 1073741824\n\
+             probe_cpus = 2\n\
+             probe_install_free_disk = 10737418240\n\
+             probe_temp_free_disk = 5368709120\n",
+            Path::new("/etc/svcd"),
+        )
+        .expect("parse");
+        let overrides = settings.probe_overrides();
+
+        assert_eq!(overrides.available_memory, Some(32 * 1024 * 1024 * 1024));
+        assert_eq!(overrides.cgroup_remaining, Some(1024 * 1024 * 1024));
+        assert_eq!(overrides.cpus, Some(2));
+        assert_eq!(overrides.install_free_disk, Some(10 * 1024 * 1024 * 1024));
+        assert_eq!(overrides.temp_free_disk, Some(5 * 1024 * 1024 * 1024));
+        assert_eq!(overrides.stated_names().len(), 5);
+
+        // Nothing stated: the probe reads every item.
+        assert!(Settings::default()
+            .probe_overrides()
+            .stated_names()
+            .is_empty());
+
+        let error = parse("probe_cpus = many\n", Path::new("/etc/svcd")).expect_err("invalid");
+        assert!(error.contains("probe_cpus"), "{error}");
+    }
+
+    #[test]
+    fn upsert_block_appends_once_and_replaces_in_place() {
+        let path = temp_file("block", "bind = 127.0.0.1:8787\n");
+        upsert_block(&path, "# BEGIN", "# END", "max_connections = 32\n").expect("append");
+        upsert_block(&path, "# BEGIN", "# END", "max_connections = 64\n").expect("replace");
+        let text = std::fs::read_to_string(&path).expect("read");
+
+        assert_eq!(
+            text,
+            "bind = 127.0.0.1:8787\n\n# BEGIN\nmax_connections = 64\n# END\n"
+        );
+        let settings = parse(&text, Path::new("/")).expect("parse");
+        assert_eq!(settings.max_connections, Some(64));
+    }
+
+    #[test]
+    fn upsert_block_keeps_everything_outside_the_block() {
+        let path = temp_file(
+            "keep",
+            "bind = 127.0.0.1:8787\n# BEGIN\nmax_connections = 32\n# END\nmax_body_bytes = 65536\n",
+        );
+        upsert_block(&path, "# BEGIN", "# END", "max_streams = 8\n").expect("replace");
+
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            text,
+            "bind = 127.0.0.1:8787\n# BEGIN\nmax_streams = 8\n# END\nmax_body_bytes = 65536\n"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_block_is_an_error_and_the_file_is_untouched() {
+        let original = "# BEGIN\nmax_connections = 32\n";
+        let path = temp_file("unterminated", original);
+
+        let error =
+            upsert_block(&path, "# BEGIN", "# END", "max_streams = 8\n").expect_err("must refuse");
+        assert!(error.contains("no \"# END\" line"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), original);
     }
 }

@@ -37,7 +37,7 @@ use crate::server::http::{
     CompletionSlot, Dispatch, Exchange, Face, JobBudget, JobOutcome, PreparedFace, StreamClass,
     StreamHandler,
 };
-use crate::server::mcp::progress::{McpSseStream, PROGRESS_QUEUE_SLOTS};
+use crate::server::mcp::progress::McpSseStream;
 use crate::wire::control::channel::PendingCall;
 
 use crate::server::http::hooks::{FallbackHandler, PreBodyRoutes};
@@ -311,7 +311,7 @@ impl ConnectionOps for Server {
                         );
                         return;
                     };
-                    let (sender, receiver) = mpsc::sync_channel(PROGRESS_QUEUE_SLOTS);
+                    let (sender, receiver) = mpsc::sync_channel(self.config.limits.progress_queue);
                     let request = json!({
                         "name": call.name,
                         "arguments": call.arguments,
