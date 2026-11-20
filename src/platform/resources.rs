@@ -420,8 +420,10 @@ impl Workload {
     /// three-level table becomes the expected value *at this budget*.
     ///
     /// These are calibration anchors, not the compile-time ceilings: a `low`
-    /// build caps the budget at 128 MiB whatever the shape's reference says, and
-    /// a value falling back to a reference is bounded by the budget in force.
+    /// build caps the budget at 128 MiB whatever the shape's reference says.
+    /// Only the tests read them: nothing the process derives falls back to a
+    /// reference budget any more.
+    #[cfg(test)]
     pub fn reference_budget(self) -> u64 {
         match self {
             Workload::Tiny => 128 * 1024 * 1024,

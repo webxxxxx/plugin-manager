@@ -128,11 +128,12 @@ impl KeySpec {
         raw.clamp(self.min, self.max)
     }
 
-    /// Where an over-the-line value falls back to: this shape's expectation at
-    /// its reference budget, not the ceiling. A typo therefore returns to a
-    /// sane number rather than to the largest one that happens to fit.
-    fn fallback_value(&self, workload: Workload) -> u64 {
-        self.default_value(workload, workload.reference_budget())
+    /// Where an over-the-line value falls back to: this shape's expectation
+    /// at the budget actually in force, not the ceiling and not the number a
+    /// larger build would have used. A typo therefore returns to a sane
+    /// number rather than to the largest one that happens to fit.
+    fn fallback_value(&self, workload: Workload, budget: u64) -> u64 {
+        self.default_value(workload, budget)
     }
 
     /// The largest value a document may name and still be taken as written.
@@ -418,7 +419,7 @@ impl Derivation<'_> {
         };
         let upper = spec.upper_bound(self.workload, self.budget);
         if configured > upper {
-            let effective = spec.fallback_value(self.workload);
+            let effective = spec.fallback_value(self.workload, self.budget);
             self.notes.push(Override::new(
                 spec.key,
                 configured,
@@ -993,9 +994,16 @@ mod tests {
         derive_with(&settings, &ResourceProfile::default())
     }
 
+    /// A shape's reference budget, clipped to what this build may spend. A
+    /// `mem_low` binary cannot express the streaming shape's 2 GiB reference,
+    /// so its tests compare against the budget the binary really gets.
+    fn reference_budget(workload: Workload) -> u64 {
+        workload.reference_budget().min(BUDGET_CAP)
+    }
+
     fn at_reference(workload: Workload) -> Derived {
         derive_for(
-            workload.reference_budget(),
+            reference_budget(workload),
             Some(workload),
             Settings::default(),
         )
@@ -1008,6 +1016,7 @@ mod tests {
     #[test]
     fn every_shape_fits_its_reference_budget() {
         for workload in Workload::ALL {
+            let budget = reference_budget(workload);
             let derived = at_reference(workload);
             assert_eq!(
                 derived.report.refusal,
@@ -1016,11 +1025,11 @@ mod tests {
                 workload.as_str()
             );
             assert!(
-                derived.limits.worst_case_bytes() <= workload.reference_budget(),
+                derived.limits.worst_case_bytes() <= budget,
                 "{}: worst case {} > budget {}",
                 workload.as_str(),
                 derived.limits.worst_case_bytes(),
-                workload.reference_budget()
+                budget
             );
             assert!(
                 derived.report.notes.is_empty(),
@@ -1101,6 +1110,12 @@ mod tests {
         ];
         for (key, row) in historical {
             for (index, workload) in Workload::ALL.into_iter().enumerate() {
+                if workload.reference_budget() > BUDGET_CAP {
+                    // The cap is below this shape's reference budget, so the
+                    // historical anchor is not reachable in this build: the
+                    // shape runs on a smaller budget and derives from that.
+                    continue;
+                }
                 let derived = at_reference(workload);
                 let value = match *key {
                     "max_body_bytes" => derived.limits.max_body,
@@ -1130,7 +1145,7 @@ mod tests {
         // own reference budget. The fourth column, "over budget", is
         // `every_shape_refuses_when_the_fixed_terms_alone_do_not_fit` below.
         for workload in Workload::ALL {
-            let budget = workload.reference_budget();
+            let budget = reference_budget(workload);
 
             let in_band = derive_for(
                 budget,
@@ -1240,13 +1255,23 @@ mod tests {
             crate::platform::resources::WorkloadSource::Derived
         );
 
-        // Many cores, same budget: the budget decides.
+        // Many cores, same budget: the budget decides — but only up to the
+        // cap this build has. When the cap pulls the budget below a shape's
+        // threshold, sixteen cores cannot buy the shape back.
         let profile = ResourceProfile {
             cpus: Some(16),
             ..profile
         };
         let derived = derive_with(&settings, &profile);
-        assert_eq!(derived.report.workload, Workload::Streaming);
+        let quantized = derived.report.budget.quantized;
+        let expected = if quantized < 512 * MIB {
+            Workload::Tiny
+        } else if quantized < 2 * GIB {
+            Workload::Interactive
+        } else {
+            Workload::Streaming
+        };
+        assert_eq!(derived.report.workload, expected);
     }
 
     #[test]
@@ -1362,6 +1387,11 @@ mod tests {
         assert!(reason.contains("64.0 MiB"), "{reason}");
     }
 
+    /// Not in a `mem_low` build: the fixed terms alone (128 × 2 MiB of queued
+    /// frames) need more than its 128 MiB budget, so the shrink has nowhere to
+    /// go and the derivation refuses instead — which is
+    /// `every_shape_refuses_when_the_fixed_terms_alone_do_not_fit`.
+    #[cfg(not(mem_low))]
     #[test]
     fn a_maxed_out_legal_configuration_is_shrunk_until_the_invariant_holds() {
         // Every value here is inside its band, but together they cannot fit:
@@ -1574,8 +1604,16 @@ mod tests {
     #[test]
     fn a_derived_workload_is_labelled_as_derived() {
         let derived = derive_for(2 * GIB, None, Settings::default());
+        let quantized = derived.report.budget.quantized;
+        let expected = if quantized < 512 * MIB {
+            Workload::Tiny
+        } else if quantized < 2 * GIB {
+            Workload::Interactive
+        } else {
+            Workload::Streaming
+        };
 
-        assert_eq!(derived.report.workload, Workload::Streaming);
+        assert_eq!(derived.report.workload, expected);
         assert_eq!(derived.report.workload_source, WorkloadSource::Derived);
         assert_eq!(
             derived.report.budget.source,
