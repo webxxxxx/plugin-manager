@@ -3,9 +3,20 @@
 use super::*;
 
 use std::collections::BTreeMap;
-use std::time::SystemTime;
+use std::path::Path;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
+
+use serde_json::json;
 
 use crate::kernel::contract::{Capability as KernelCapability, CapabilityName, Effect};
+use crate::kernel::failure::Problem;
+use crate::kernel::projection::Status;
+use crate::wire::message::rpc;
+
+use super::driver::status_response;
+use super::shutdown::shutdown_reply_lost;
 use crate::kernel::registry::{Exec, Kind, Ready, Service, State};
 use crate::platform::clock::{Clock, Now};
 use crate::supervise::model::runtime::{self, Record};
@@ -644,7 +655,7 @@ fn a_live_plugin_routes_tool_calls_and_fails_them_on_a_crash() {
     let (_sender, receiver) = mpsc::channel();
     let mut daemon = Daemon::new(registry(vec![plugin]), receiver, None);
     daemon.host.start_service("plug", &clock()).expect("start");
-    assert!(daemon.host.is_live("plug"));
+    assert!(daemon.host.is_live("plug", now()));
 
     let echo = send(
         &mut daemon,
@@ -663,9 +674,9 @@ fn a_live_plugin_routes_tool_calls_and_fails_them_on_a_crash() {
     let _crashed = send(&mut daemon, "tools/call", json!({"name": "plug.crash"}));
     let result = wait(&mut daemon, &hung).result.expect("crash result");
     assert_eq!(result["isError"], true);
-    assert!(!daemon.host.is_live("plug"));
+    assert!(!daemon.host.is_live("plug", now()));
 
-    let tools = daemon.tool_list();
+    let tools = daemon.tool_list(now());
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0]["name"], "plug.start");
 
@@ -689,9 +700,9 @@ fn a_core_service_with_capabilities_is_callable_through_the_slot_path() {
     let (_sender, receiver) = mpsc::channel();
     let mut daemon = Daemon::new(registry(vec![core]), receiver, None);
     daemon.host.start_service("core", &clock()).expect("start");
-    assert!(daemon.host.is_live("core"));
+    assert!(daemon.host.is_live("core", now()));
 
-    let tools = daemon.tool_list();
+    let tools = daemon.tool_list(now());
     assert!(
         tools.iter().any(|tool| tool["name"] == "core.echo"),
         "{tools:?}"
@@ -730,7 +741,7 @@ fn an_exec_core_service_forwards_progress_and_cleans_up_its_child() {
     let (_sender, receiver) = mpsc::channel();
     let mut daemon = Daemon::new(registry(vec![service]), receiver, None);
     daemon.host.start_service("proc", &clock()).expect("start");
-    assert!(daemon.host.is_live("proc"));
+    assert!(daemon.host.is_live("proc", now()));
     let pid = daemon
         .host
         .status_for_id("proc", now())
@@ -786,7 +797,7 @@ fn tool_projection_follows_the_live_state() {
     let (_sender, receiver) = mpsc::channel();
     let mut daemon = Daemon::new(registry, receiver, None);
 
-    let tools = daemon.tool_list();
+    let tools = daemon.tool_list(now());
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0]["name"], "plug.start");
 
@@ -797,7 +808,7 @@ fn tool_projection_follows_the_live_state() {
         .expect("slot")
         .machine
         .state = State::Running;
-    let tools = daemon.tool_list();
+    let tools = daemon.tool_list(now());
     let names: Vec<&str> = tools
         .iter()
         .filter_map(|tool| tool["name"].as_str())
@@ -811,7 +822,7 @@ fn tool_projection_follows_the_live_state() {
         .expect("slot")
         .machine
         .state = State::Backoff;
-    assert_eq!(daemon.tool_list().len(), 1);
+    assert_eq!(daemon.tool_list(now()).len(), 1);
 }
 
 #[test]
@@ -842,7 +853,7 @@ fn an_eighty_plugin_catalog_is_returned_in_bounded_pages() {
     let mut total = 0usize;
     loop {
         let page = daemon
-            .tools_page(cursor.as_deref(), Some(100))
+            .tools_page(cursor.as_deref(), Some(100), now())
             .expect("page");
         let tools = page["tools"].as_array().expect("tools");
         assert!(!tools.is_empty());
@@ -869,7 +880,7 @@ fn tool_pages_are_stable_and_reject_stale_cursors() {
     let (_sender, receiver) = mpsc::channel();
     let mut daemon = Daemon::new(registry, receiver, None);
 
-    let first = daemon.tools_page(None, Some(2)).expect("first page");
+    let first = daemon.tools_page(None, Some(2), now()).expect("first page");
     assert_eq!(first["tools"].as_array().expect("tools").len(), 2);
     assert!(
         first.get("nextCursor").is_none(),
@@ -878,13 +889,13 @@ fn tool_pages_are_stable_and_reject_stale_cursors() {
     let cursor = first["next"].as_str().expect("next cursor").to_string();
 
     let second = daemon
-        .tools_page(Some(&cursor), Some(2))
+        .tools_page(Some(&cursor), Some(2), now())
         .expect("second page");
     assert_eq!(second["tools"].as_array().expect("tools").len(), 1);
     assert!(second.get("next").is_none());
 
     let stale = daemon
-        .tools_page(Some("bm90LWEtY3Vyc29y"), Some(2))
+        .tools_page(Some("bm90LWEtY3Vyc29y"), Some(2), now())
         .expect_err("invalid cursor");
     assert_eq!(stale.problem, Problem::Invalid);
     assert!(stale.detail().contains("cursor"), "{stale}");
@@ -893,12 +904,12 @@ fn tool_pages_are_stable_and_reject_stale_cursors() {
     use base64::Engine;
     let wrong_version = URL_SAFE_NO_PAD.encode("999:0");
     let stale = daemon
-        .tools_page(Some(&wrong_version), Some(2))
+        .tools_page(Some(&wrong_version), Some(2), now())
         .expect_err("version mismatch");
     assert_eq!(stale.problem, Problem::Internal);
-    let past_end = URL_SAFE_NO_PAD.encode(format!("{}:99", daemon.catalog_version));
+    let past_end = URL_SAFE_NO_PAD.encode(format!("{}:99", daemon.catalog.version()));
     let stale = daemon
-        .tools_page(Some(&past_end), Some(2))
+        .tools_page(Some(&past_end), Some(2), now())
         .expect_err("past end");
     assert_eq!(stale.problem, Problem::Internal);
 }

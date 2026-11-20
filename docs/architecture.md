@@ -176,8 +176,14 @@ daemon 只递交调用，不等待；slot 事件循环在完成/超时时调用 
 ```
 src/
   main.rs                     多入口分派（argv[0]）
-  daemon/                     装配点：装配所有模块 + 事件循环 + 关停（#228 起）
-    mod.rs
+  daemon/                     装配点：装配所有模块 + 事件循环 + 关停（#228–#230）
+    mod.rs                    Daemon 宿主：字段、构造、Api 句柄
+    bootstrap.rs              启动序列：配置、日志、通道、服务加载
+    assembly.rs               HTTP 面装配与 bind 解析
+    driver.rs                 控制通道循环：drain / handle / dispatch
+    tools.rs                  tools/list 快照、分页与 tools/call 投影
+    plugins.rs                install / uninstall / enable 的跨域编排
+    shutdown.rs               多调用入口的 stop 客户端
     tests.rs                  装配点的行为测试（只在 cfg(test) 下编译）
 
   kernel/                     L2 内核（四动词共用，只有定义与判定）
@@ -247,7 +253,7 @@ src/
     mod.rs  plan.rs  execute.rs  service_win.rs
 ```
 
-**step 6（#170）已按本树整文件搬迁**：文件进了对应目录但内容没切。`api.rs` 已在 #173 拆完端点、#205 整文件溶解（连接驱动与每连接循环 → `server/http/thread_loop.rs`，装配 → `daemon.rs`，目标树里不再有它）；`platform/storage` 的五文件已在 #175 拆完（`meta` / `path` / `upload` / `part` / `gc`）；`supervise` 的 `model/` 与 `ops/` 已整文件落位（#176）；`check/` 已落 `backoff` / `restart`（#178）、`oneshot`（#191）与 `reconcile` 的纯判定（#192）；`manage` 的 `check/` 与 `ops/` 已整文件落位（#177）；`plugin.rs` 的第一、二切片已落地（扫描 → `manage/ops/scan.rs` #186；布局 → `manage/model/layout.rs`、config → `manage/ops/config.rs` #187；安装生命周期 → `manage/ops/install_plugin.rs` #188；check 段 → `manage/check/plugin.rs` #189；导出与 uninstall → `manage/ops/{export_plugin,uninstall}.rs` #190）；`package.rs` 三段已拆完：清单类型 → `model/manifest.rs`（#181）、tar 编解码 → `model/ustar.rs`（#182）、校验与 manifest 解析 → `check/verify.rs`（#184）、staging 与导出计划 → `ops/{install,export}.rs`（#185）。两个壳已在 #227 溶解：`package.rs` 与 `plugin.rs` 的 54 个测试按被测模块落回 `check/verify.rs` / `ops/install.rs` / `model/ustar.rs` / `ops/scan.rs` / `check/plugin.rs` / `ops/config.rs` / `ops/install_plugin.rs`，共用的包与插件树构造器收进 `manage/test_support.rs`（与 `platform/test_support.rs` 同构），`src/manage/{package,plugin}.rs` 不再存在。`wire/ws/{frame,accept}.rs` 已从 `server/http/wire.rs` 与 `face/uichannel.rs` 收进 L1（#206：帧与握手是字节格式，L4/L5 不再持有）。`selfinstall/` 已拆成 `plan.rs`（纯决定：`InstallPlan` / `SelfInstallPlan` 与五个平台的计划构造）与 `execute.rs`（输入构造、副作用、平台分派），`mod.rs` 只做显式再导出（#207）。
+**step 6（#170）已按本树整文件搬迁**：文件进了对应目录但内容没切。`api.rs` 已在 #173 拆完端点、#205 整文件溶解（连接驱动与每连接循环 → `server/http/thread_loop.rs`，装配 → `daemon.rs`，目标树里不再有它）；`platform/storage` 的五文件已在 #175 拆完（`meta` / `path` / `upload` / `part` / `gc`）；`supervise` 的 `model/` 与 `ops/` 已整文件落位（#176）；`check/` 已落 `backoff` / `restart`（#178）、`oneshot`（#191）与 `reconcile` 的纯判定（#192）；`manage` 的 `check/` 与 `ops/` 已整文件落位（#177）；`plugin.rs` 的第一、二切片已落地（扫描 → `manage/ops/scan.rs` #186；布局 → `manage/model/layout.rs`、config → `manage/ops/config.rs` #187；安装生命周期 → `manage/ops/install_plugin.rs` #188；check 段 → `manage/check/plugin.rs` #189；导出与 uninstall → `manage/ops/{export_plugin,uninstall}.rs` #190）；`package.rs` 三段已拆完：清单类型 → `model/manifest.rs`（#181）、tar 编解码 → `model/ustar.rs`（#182）、校验与 manifest 解析 → `check/verify.rs`（#184）、staging 与导出计划 → `ops/{install,export}.rs`（#185）。两个壳已在 #227 溶解：`package.rs` 与 `plugin.rs` 的 54 个测试按被测模块落回 `check/verify.rs` / `ops/install.rs` / `model/ustar.rs` / `ops/scan.rs` / `check/plugin.rs` / `ops/config.rs` / `ops/install_plugin.rs`，共用的包与插件树构造器收进 `manage/test_support.rs`（与 `platform/test_support.rs` 同构），`src/manage/{package,plugin}.rs` 不再存在。`wire/ws/{frame,accept}.rs` 已从 `server/http/wire.rs` 与 `face/uichannel.rs` 收进 L1（#206：帧与握手是字节格式，L4/L5 不再持有）。`selfinstall/` 已拆成 `plan.rs`（纯决定：`InstallPlan` / `SelfInstallPlan` 与五个平台的计划构造）与 `execute.rs`（输入构造、副作用、平台分派），`mod.rs` 只做显式再导出（#207）。装配点也不再是一个文件：#228–#230 把 4543 行的 `daemon.rs` 拆成 `daemon/` 的八个文件，监督逻辑（接管、落盘、重扫、启停、探针、载体选择）进 `supervise/ops`，`daemon/` 只剩装配、控制通道循环、MCP 投影与跨域编排，`dep-lint` V8 守住这条线。
 
 `orchestrate/` 与 `cluster/` 现在不建：**目录在第一个文件出现时创建**，不建空壳。
 
@@ -289,6 +295,7 @@ src/
 | **想象中的 seam** | `Slot::set_projector` 的唯一注入点在组合根，而读它的 `Slot::project` 与 `CallSink::Client` 当时都标着 `#[cfg(test)]` | **已修于 #209**：那套机制连同 `CallSink` 枚举一起删掉，槽的完成回调直接就是调用方给的 `ReplySink` |
 | **同一份值转换实现两次，护栏只有一处** | `daemon.rs` 的 `persist_states` 自己算 `now.epoch_of(machine.since_ms)`，而 `kernel/projection.rs` 的 `epoch_secs` 另有 `ms == 0 → None` 保护 | **已修于 #215**：`persist_states` 改吃 `Machine::live()`，锚定只走内核唯一的 `anchored_secs`（`ms == 0 → None`）；`since_ms == 0` 时记录里不再有 `since`，新增的模块级测试同时断言记录与 `Status::live` 一致 |
 | **同一份反向换算写两遍，缺失值被回落成 `now`** | `daemon.rs` 的 `adopt_runtime` 两个分支各写一遍 `now.mono_of(record.since.unwrap_or(now.epoch_secs))`：记录缺 `since` 时被回落成本次 daemon 启动时刻，`Status::live` 会给出一个合理但错误的 `since` | **已修于 #216**：反向换算收进 `kernel/projection.rs` 的 `anchored_mono_ms`，`adopt_runtime` 两个分支都调它；缺失 `since` 落到 `since_ms == 0`（`Status::live` 为 `null`），有值的记录仍与记录里的 epoch 秒一致 |
+| **装配点重新长出业务** | `daemon.rs` 一度装着状态机、落盘、依赖分层与进程派生；层方向检查抓不到，因为 compose 在最上面，调谁都算向下 | **已修于 #229/#230**：监督进 `supervise/ops`，`daemon/` 只剩装配与协议投影；`dep-lint` V8 盯住 `src/daemon/**` 的 `State::` / `Slot::new` / `start_layers` / `runtime::*` / `Command::spawn` |
 | **同一份 slot 组装抄了四遍** | 启动、rescan、install、staged install 各自手写一遍「12 个 setter」；漏一个 setter 只让某条路径少掉通知或调用预算，编译与测试都不报 | **已修于 #229**：`SlotFactory::build` 是唯一的组装点，四条路径都走它；`Supervisor` 下沉到 L3 后由它持有工厂 |
 | **同一份「还是同一个进程」判定写两遍** | `adopt_runtime` 用 `alive(pid)` + `starttime` 比对决定是否接管，`sweep_runtime_records` 又把同一判据写一遍才决定是否 `terminate_tree`；两处的组合方式已经不同（早退 vs 合成 `fresh`） | **已修于 #217**：判据收进 `supervise/model/runtime.rs` 的 `pid_state`（返回 `PidState::{Gone, Same, Reused, Unknown}`），接管与清理都调它；任一侧缺 `starttime` 时仍是 `Unknown`（「不能证明复用」），动作与日志不变 |
 | **同一份静态资源条件请求投影写两遍** | `face/fallback.rs` 的 `serve_web_file` 与 `face/plugin_ui.rs` 的静态资源分支各自组装 `metadata.modified → webui::etag → webui::web_headers → not_modified → 304`；`webui` 只共享单步函数 | **已修于 #218**：投影收进 `face/webui.rs` 的 `asset_validators`（返回带 `headers()` / `matches_if_none_match()` 的 `AssetValidators`），两个面只决定 200/304 与 body 形状，200 与 304 带同一组头 |
@@ -450,7 +457,7 @@ flowchart LR
 
 下一步（按风险排序）：
 
-1. **拆分**：step 6 只搬不拆，`supervise` 的 `model/check/ops`、`platform/storage` 五拆各开票（`api.rs` 已由 #173/#205 做完，文件已不存在；`manage` 的 `package.rs` / `plugin.rs` 已由 #227 溶解，测试跟着被测模块走）。
+1. **拆分**：step 6 只搬不拆；`daemon.rs` 已由 #228–#230 拆完（文件不再是单点，`supervise/ops` 接走监督、`dep-lint` V8 守住装配点），剩下的 `supervise` 内部与 `platform/storage` 五拆各开票（`api.rs` 已由 #173/#205 做完，文件已不存在；`manage` 的 `package.rs` / `plugin.rs` 已由 #227 溶解，测试跟着被测模块走）。
 2. **`SVCD_*` 覆盖**：ADR-0019 留下的独立票。
 
 已完成：`registry` 进内核（#172，`src/kernel/registry.rs`）。

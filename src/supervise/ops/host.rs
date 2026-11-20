@@ -488,23 +488,12 @@ impl Supervisor {
             .map(|service| self.status_for(service, now))
     }
 
-    /// The MCP projection asks the daemon rather than the registry because the
-    /// registry snapshot does not track the supervised process.
-    pub(crate) fn is_live(&self, id: &str) -> bool {
-        if let Some(service) = self.registry.get(id) {
-            if service
-                .impl_ref
-                .as_ref()
-                .map(|spec| spec.tag.as_str() == "builtin")
-                .unwrap_or(false)
-            {
-                // The builtin `svc` has no slot; its registry state is the truth.
-                return service.state == State::Running;
-            }
-        }
-        self.slots
-            .get(id)
-            .map(|slot| slot.machine.state == State::Running)
+    /// Liveness is a projection, not a second predicate: ask the same
+    /// `Status::live` the list/status faces read, so "is this tool callable"
+    /// and "what does status say" cannot drift apart (#230).
+    pub(crate) fn is_live(&self, id: &str, now: Now) -> bool {
+        self.status_for_id(id, now)
+            .map(|status| status.summary.state == State::Running)
             .unwrap_or(false)
     }
 
