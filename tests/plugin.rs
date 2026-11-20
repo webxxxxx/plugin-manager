@@ -92,7 +92,6 @@ impl Sandbox {
             .env("SVCD_CONFIG_DIR", &self.config)
             .env("SVCD_DATA_DIR", &self.data)
             .env("SVCD_LOG_DIR", &self.logs)
-            .env("SVCD_TRUST_DIR", &self.trust)
             .env("SVCD_BOOT_SCAN_WAIT_MS", "0")
             .env("SVCD_RESCAN_INTERVAL_MS", "0");
     }
@@ -212,6 +211,12 @@ impl Sandbox {
         let mut command = self.command(&self.svcd);
         command.arg("shutdown");
         command.env("SVCD_CONFIG_DIR", config);
+        // A different config is the "unreachable" probe: on Unix the control
+        // socket is under data/run and on Windows the pipe name is derived from
+        // config_dir, so move both. The normal stop keeps the sandbox roots.
+        if config != self.config {
+            command.env("SVCD_DATA_DIR", config.join("no-data"));
+        }
         support::stop_daemon(&mut child, &mut command, self.stop_timeout, || {
             fs::read_to_string(&log).unwrap_or_default()
         })
@@ -589,7 +594,8 @@ fn a_silent_control_server_does_not_hold_the_shutdown_request() {
     // Bind the admin control socket (shutdown is an admin method) and never
     // accept or answer: the CLI connects, sends the request, and waits for a
     // reply that never comes.
-    let _listener = UnixListener::bind(sandbox.config.join("svcd-admin.sock"))
+    fs::create_dir_all(sandbox.data.join("run")).expect("run dir");
+    let _listener = UnixListener::bind(sandbox.data.join("run").join("svcd-admin.sock"))
         .expect("bind admin control socket");
     let mut command = Command::new(&sandbox.svcd);
     command.arg("shutdown");

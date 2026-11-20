@@ -519,7 +519,7 @@ fn parse(args: &[String]) -> Result<Command, ()> {
 }
 
 fn list(config: &Config) -> i32 {
-    let response = match channel::request(&config.paths.config_dir, "svc.list", json!({})) {
+    let response = match channel::request(config.paths.control_dir(), "svc.list", json!({})) {
         Ok(response) => response,
         Err(error) => return client::unreachable(&error, "plugin"),
     };
@@ -763,7 +763,7 @@ fn file_name(path: &Path) -> String {
 
 fn uninstall(config: &Config, id: &str, purge: bool) -> i32 {
     match channel::request(
-        &config.paths.config_dir,
+        config.paths.control_dir(),
         "plugin.uninstall",
         json!({ "id": id, "purge": purge }),
     ) {

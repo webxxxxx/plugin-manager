@@ -9,10 +9,14 @@
 #   4. a generated default with platform paths
 #
 # Lines are `key = value`; lines starting with `#` are comments.
+# Every key can be overridden by `SVCD_<KEY>` in the environment, with the key
+# upper-cased (for example `SVCD_MAX_STREAMS`, `SVCD_ALLOW_INSECURE_INSTALL`).
+# The environment wins over this file; an empty variable means "not set".
+# Unknown `SVCD_*` variables (test hooks, `SVCD_USER`, ...) are not config keys.
 # Non-root processes default to user mode (config under ~/.config/svcd on
 # Linux); this example is primarily for the root/system service.
-# Relative `config_dir` / `plugins_dir` / `services_dir` / `temp_dir` values
-# resolve against the directory containing this file.
+# Relative `config_dir` / `data_dir` / `logs_dir` values resolve against the
+# directory containing this file.
 
 # HTTP listener. The default is loopback-only. A non-loopback bind (for
 # example 0.0.0.0:8787) requires auth_passwd; without it svcd falls back to
@@ -25,29 +29,43 @@ bind = 127.0.0.1:8787
 # accepting an unsigned package. There is no per-install flag or console option.
 # allow_insecure_install = false
 
-# Configuration directory: svcd.conf and trust.d.
-# Defaults: /etc/svcd (Linux), /Library/Application Support/svcd/config
-# (macOS), %USERPROFILE%\.svcd (Windows).
+# The three roots. Everything else derives from them:
+#   config_dir -> svcd.conf, services.d/, trust.d/, compat.conf
+#   data_dir   -> plugins/, temp/, run/ (control socket and http.port)
+#   logs_dir   -> svcd.log, <id>.log, <id>-hooks.log, stats.log
+# Defaults: /etc/svcd (Linux config), /Library/Application Support/svcd/config
+# (macOS), %ProgramData%\svcd\config (Windows system mode), and the matching
+# platform data/log directories.
 # config_dir = /etc/svcd
+# data_dir = /var/lib/svcd
+# logs_dir = /var/log/svcd
+#
+# Removed keys and variables are ignored with a warning that names the derived
+# path: plugins_dir, services_dir, temp_dir, SVCD_TEMP_DIR, SVCD_RUN_DIR,
+# SVCD_TRUST_DIR. Every live key instead has an SVCD_<KEY> override (see the
+# top of this file); the removed names are not aliases for them.
 
 # Installation root, recorded by `svcd --install --prefix <dir>` and also
-# honored when written by hand: reinstalls without `--prefix`, the data/logs
-# defaults (<install_dir>/data, <install_dir>/logs) and `--uninstall` all use
-# it. `--prefix` still wins over it. On read-only-rootfs hosts (for example
-# SR6110) install with `svcd --install --manual` to skip init registration and
-# generate `svcd_daemon.sh` (Unix) or `svcd_daemon.bat` (Windows).
-# Changing this value directly moves data/logs; it does not regenerate a
-# launcher that was already written by `--manual`.
+# honored when written by hand: reinstalls without `--prefix` and
+# `--uninstall` use it. It is only an install prefix: at configuration
+# initialization it supplies <install_dir>/data and <install_dir>/logs when
+# those roots are absent, then the roots above are written into this file.
+# Runtime never derives paths from it. `--prefix` still wins over it. On
+# read-only-rootfs hosts (for example SR6110) install with
+# `svcd --install --manual` to skip init registration and generate
+# `svcd_daemon.sh` (Unix) or `svcd_daemon.bat` (Windows).
+# Changing the recorded root does not move an existing materialized data_dir or
+# logs_dir; edit those roots to move them.
 # install_dir = /etc/sr/svcd
 
 # Web/API password hash. Never put the plaintext here; set it with:
 #   svc lan passwd <password>
 # auth_passwd = pbkdf2-sha256$10000$...
 
-# Transient plugin data (blob arguments/results). Default: <data>/temp.
+# Transient plugin data (blob arguments/results) lives in <data>/temp. It is
+# derived, not configured; upload staging and status hooks use the same tree.
 # Files older than temp_retention_secs are deleted; 0 disables the cleanup
 # thread entirely. Defaults: retention 7200s (2h), scan every 300s.
-# temp_dir = /var/tmp/svcd
 # temp_retention_secs = 7200
 # temp_cleanup_interval_secs = 300
 
@@ -60,7 +78,8 @@ bind = 127.0.0.1:8787
 # rescan_interval_ms = 5000
 # boot_scan_wait_ms = 10000
 
-# Logs. `logs_dir` defaults to install_dir/logs or the platform log directory.
+# Logs. `logs_dir` is one of the three roots above; the platform default is
+# used only when the file does not name it.
 # `log_max_bytes` is the rotation threshold for one file; `log_rotations` is
 # how many old files are kept. `log_to_file = off` keeps stderr/syslog only.
 #

@@ -379,7 +379,7 @@ impl Connection {
                         let _ = crate::server::mcp::fallback::serve_mcp_sse(
                             &mut stream,
                             call,
-                            &config.paths.config_dir,
+                            config.paths.control_dir(),
                             head_only,
                             &self.budget,
                             &config.limits,

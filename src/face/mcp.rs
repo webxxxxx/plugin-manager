@@ -24,7 +24,7 @@ pub fn run_stdio() -> i32 {
         None => return 1,
     };
     let limits = config.limits.clone();
-    let config_dir = config.paths.config_dir.clone();
+    let config_dir = config.paths.control_dir().to_path_buf();
     if let Err(error) = startup_ping(&config_dir) {
         eprintln!("mcp: {}", error);
         return 1;

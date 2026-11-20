@@ -26,7 +26,7 @@ Accepted（2026-11-18）。收窄 [ADR-0019](0019-config-is-derived-once-at-the-
 
   `Paths` 的字段保留（`services_dir`/`plugins_dir`/`trust_dir`/`temp_dir`/`run_dir` 照旧是字段），但只从根派生；派生值不接受单独配置。
 - **配置键只剩四个**：`config_dir`、`data_dir`、`logs_dir`、`install_dir`。`install_dir` 只表示安装前缀，不再在运行期推任何路径——它在配置初始化时被折算成三个根的值写进文件。
-- **环境变量只剩三个**：`SVCD_CONFIG_DIR`、`SVCD_DATA_DIR`、`SVCD_LOG_DIR`。删掉 `SVCD_TEMP_DIR`、`SVCD_RUN_DIR`、`SVCD_TRUST_DIR`。
+- **路径环境变量只剩三个**：`SVCD_CONFIG_DIR`、`SVCD_DATA_DIR`、`SVCD_LOG_DIR`。删掉 `SVCD_TEMP_DIR`、`SVCD_RUN_DIR`、`SVCD_TRUST_DIR`。每个配置键另有 `SVCD_<KEY>` 覆盖（2026-11-20 追加，见文末 Amendment）。
 - **删掉的两个键与三个变量按“告警并忽略”处理**：启动时打一行 `WARN` 说明被忽略并给出实际派生路径，不改写用户的文件；发布说明给替换表。旧配置缺根键时则相反——补齐一次并写回文件，写回失败只告警。
 - **物化是唯一默认来源**：生成的配置写全三个根的绝对值，派生目录不进配置、只在注释里列出解析结果；`svcd --install` 在没有配置文件时也生成一份（不再“什么都不写”）。运行期不再计算平台默认，只读文件。
 - **一个解析器**：install 与 daemon 都走 `Paths::resolve`；`RuntimeDirs::from_settings` 的独立优先级链删除。
@@ -46,9 +46,20 @@ Accepted（2026-11-18）。收窄 [ADR-0019](0019-config-is-derived-once-at-the-
 - `svcd --install` 多了“写配置”这个副作用；没有 `--conf` 的安装不再依赖环境里的平台默认。
 - 旧键被静默忽略会有一次性的迁移成本；告警里必须给出实际路径，否则现场无从判断。
 - 受影响测试：`paths.rs` 的五条优先级测试、`settings.rs` 的路径键测试、`install.rs` 的生成配置与 `--prefix` 测试、`tests/install.rs` 的 install/uninstall 与 user-mode 测试。`Paths::under` 的测试布局要跟新派生关系对齐。
-- 不在本决定内：`SVCD_BIND` 等非路径环境变量、per-source 配置、日志级别与统计。
+- 不在本决定内：per-source 配置、日志级别与统计；非路径环境变量原本也不在，后由 Amendment 纳入。
 
 ## Clarification
 
 - 本文说的“物化”只针对目录。其余默认值（`bind`、限额、超时）仍按“配置里有就用、没有就用编译期默认”，因为它们不需要在运行期重新推导路径。
 - `user_mode()` 仍是进程级判定，用于**配置初始化时**选择默认根；判定结果不写进文件——文件里的绝对路径已经表达了它。
+
+## Amendment
+
+2026-11-20（#179）：用户要求所有配置项都能用环境变量覆盖。路径根变量仍只有
+`SVCD_CONFIG_DIR`、`SVCD_DATA_DIR`、`SVCD_LOG_DIR`；除此之外，任意
+`svcd.conf` 键 `<key>` 都可用 `SVCD_<KEY>`（键名大写）覆盖，环境变量优先于
+文件，空值视为未设置。覆盖只在 `settings::load` 时解析一次，未知的
+`SVCD_*`（`SVCD_USER`、测试钩子等）不会被当作配置键。被删除的
+`SVCD_TEMP_DIR` / `SVCD_RUN_DIR` / `SVCD_TRUST_DIR` 仍是告警并忽略的旧变量，
+不是新键的别名。
+

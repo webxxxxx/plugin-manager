@@ -43,6 +43,9 @@ pub struct Config {
     pub limits: Arc<Limits>,
     /// Bytes, shape and rewrites behind `limits`.
     pub resources: Arc<ResourceReport>,
+    /// Migration messages for removed path keys and variables. The
+    /// composition root logs them after the log sink exists.
+    pub warnings: Vec<String>,
 }
 
 impl Config {
@@ -81,6 +84,7 @@ impl Config {
             settings_path,
             limits: Arc::new(limits),
             resources: Arc::new(report),
+            warnings: Vec::new(),
         }
     }
 
@@ -109,10 +113,23 @@ impl Config {
     /// runnable.
     pub fn inspect(conf: Option<&Path>) -> Result<Config, String> {
         let (mut settings, settings_path) = settings::load(conf)?;
-        // The two loop cadences still take their historical `SVCD_*` env
-        // override. Applying it here keeps "env is read at bootstrap" true for
-        // every key, and keeps the override out of the modules below.
-        settings::apply_loop_env_overrides(&mut settings);
+        // Fill an existing document in memory once, at the one place every
+        // process (daemon and CLI) reads its configuration. Writing belongs to
+        // the daemon's `ensure_conf`, so a read-only config directory only
+        // warns when the daemon starts, not on every `svc` command.
+        if settings_path.as_ref().is_some_and(|path| path.is_file()) {
+            let initial = Paths::resolve_with(&settings, |name| std::env::var_os(name));
+            let (config_default, data_default, logs_default) =
+                crate::platform::config_file::defaults_from_paths(&settings, &initial, |name| {
+                    std::env::var_os(name)
+                });
+            crate::platform::config_file::fill_missing_with(
+                &mut settings,
+                config_default,
+                data_default,
+                logs_default,
+            );
+        }
         Ok(Self::assembled(&settings, settings_path, &resources::Host))
     }
 
@@ -130,6 +147,19 @@ impl Config {
             Some(reason) => Err(reason.clone()),
             None => Ok(config),
         }
+    }
+
+    /// Replace the document and the derived directories on an already-probed
+    /// config. The daemon uses this after `ensure_conf` materializes the file:
+    /// the probe and the resource report belong to this process, and only the
+    /// settings roots can have changed (ADR-0023).
+    pub(crate) fn rebind(mut self, settings: Settings, settings_path: Option<PathBuf>) -> Config {
+        let (paths, warnings) = Paths::resolve_reporting(&settings, |name| std::env::var_os(name));
+        self.settings = Arc::new(settings);
+        self.settings_path = settings_path;
+        self.paths = Arc::new(paths);
+        self.warnings = warnings;
+        self
     }
 
     /// Probe the injected machine and derive, refusing nothing.

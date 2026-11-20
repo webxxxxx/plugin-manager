@@ -715,7 +715,7 @@ impl InstallFlow {
             Ok(status) => {
                 if !self.enable {
                     let _ = support::rpc(
-                        &config.paths.config_dir,
+                        config.paths.control_dir(),
                         "svc.disable",
                         json!({ "id": id }),
                         &budget.follow_up(config.limits.control_timeout),
@@ -1155,7 +1155,7 @@ fn install_staged(
     budget: &CallBudget,
 ) -> Result<Value, Vec<u8>> {
     support::rpc(
-        &config.paths.config_dir,
+        config.paths.control_dir(),
         "plugin.install_staged",
         json!({
             "path": root.to_string_lossy(),

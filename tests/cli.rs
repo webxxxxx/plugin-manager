@@ -57,6 +57,10 @@ impl Sandbox {
         self.root.join("config")
     }
 
+    fn data_dir(&self) -> PathBuf {
+        self.root.join("data")
+    }
+
     fn logs_dir(&self) -> PathBuf {
         self.root.join("logs")
     }
@@ -107,6 +111,7 @@ impl Sandbox {
         command
             .args(args)
             .env("SVCD_CONFIG_DIR", self.config_dir())
+            .env("SVCD_DATA_DIR", self.data_dir())
             .env("SVCD_LOG_DIR", self.logs_dir())
             .env("SVCD_TEST_UNPRIVILEGED", "1");
         command.output().expect("run alias")
@@ -132,6 +137,7 @@ impl Sandbox {
         command
             .args(args)
             .env("SVCD_CONFIG_DIR", self.config_dir())
+            .env("SVCD_DATA_DIR", self.data_dir())
             .env("SVCD_LOG_DIR", self.logs_dir())
             .env("SVCD_TEST_UNPRIVILEGED", "1");
         // Parallel tests can briefly hit ETXTBSY while another sandbox copies

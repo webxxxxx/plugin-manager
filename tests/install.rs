@@ -975,10 +975,26 @@ fn self_install_accepts_bind_in_conf() {
     assert!(!sandbox.config_dir().join("lan.json").exists());
     assert!(!sandbox.config_dir().join("lan-token").exists());
     let copied = sandbox.config_dir().join("svcd.conf");
-    assert_eq!(
-        fs::read_to_string(&copied).expect("copied conf"),
-        format!("{text}install_dir = {}\n", prefix.display()),
-        "the CLI prefix is recorded in the installed conf"
+    let installed_text = fs::read_to_string(&copied).expect("copied conf");
+    assert!(
+        installed_text.starts_with(&text),
+        "the source document and its comments must survive:\n{}",
+        installed_text
+    );
+    assert!(
+        installed_text.contains(&format!("install_dir = {}\n", prefix.display())),
+        "the CLI prefix is recorded in the installed conf:\n{}",
+        installed_text
+    );
+    assert!(
+        installed_text.contains(&format!("data_dir = {}\n", prefix.join("data").display())),
+        "the missing data root is materialized:\n{}",
+        installed_text
+    );
+    assert!(
+        installed_text.contains(&format!("logs_dir = {}\n", prefix.join("logs").display())),
+        "the missing logs root is materialized:\n{}",
+        installed_text
     );
 }
 

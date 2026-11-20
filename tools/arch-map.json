@@ -73,6 +73,11 @@
       "layer": "platform",
       "note": "S7：运行配置 Config 在组合根派生一次（ADR-0019）；只依赖 settings/limits/paths 与 std"
     },
+    "config_file": {
+      "concept": "platform/config",
+      "layer": "platform",
+      "note": "ADR-0023：三个根的物化与生成文本；只依赖 settings/paths/dirs 与 std"
+    },
     "clock": {
       "concept": "platform/clock",
       "layer": "platform",
@@ -370,6 +375,7 @@
     "src/platform/clock.rs": "clock",
     "src/platform/compat.rs": "compat",
     "src/platform/config.rs": "config",
+    "src/platform/config_file.rs": "config_file",
     "src/platform/host/acl.rs": "platform",
     "src/platform/host/dirs.rs": "platform",
     "src/platform/host/mod.rs": "platform",

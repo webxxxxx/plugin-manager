@@ -49,7 +49,7 @@ _Avoid_: IPC（那是插件 stdio 与控制通道的统称）、管理端口
 _Avoid_: 插件管理器、PluginManager（那是已退役的进程）
 
 **svcd.conf**:
-`<config>` 下的运行时配置文件，由 `svcd --install --conf <file>` 写入；承载 HTTP 端口、`config_dir`、`install_dir`、`auth_passwd` 哈希、LAN 默认开关、plugin 安装位置与 core 服务扫描位置。
+`<config>` 下的运行时配置文件，由 `svcd --install --conf <file>` 写入；承载 HTTP 端口、三个目录根（`config_dir` / `data_dir` / `logs_dir`）、`install_dir` 安装前缀与 `auth_passwd` 哈希。派生的 `services.d` / `trust.d` / `plugins` / `temp` / `run` 不写进文件，只出现在注释里。每个键都可用 `SVCD_<KEY>`（键名大写）覆盖，环境变量优先于文件。
 _Avoid_: settings.json、通用“配置文件”
 
 **auth_passwd**:
@@ -57,14 +57,14 @@ _Avoid_: settings.json、通用“配置文件”
 _Avoid_: lan-token、管理员 token
 
 **config_dir**:
-`svcd.conf` 里的配置目录覆盖项；`svcd.conf`、`trust.d` 都放在这里。默认 Linux `/etc/svcd`、Windows `%USERPROFILE%\.svcd`；`SVCD_CONFIG_DIR` 优先级更高。
+三个目录根之一，只放输入：`svcd.conf`、`services.d`、`trust.d`、`compat.conf`。默认 Linux `/etc/svcd`、Windows 系统模式 `%ProgramData%\svcd\config`；`SVCD_CONFIG_DIR` 优先级更高。控制 socket、`http.port`、上传暂存都不在这里。
 
 **安装计划（Install plan）**:
 一组有序的宿主操作（写文件、跑命令、改 PATH）加上由它生成的服务定义文本；`--dry-run` 打印的和实际执行的是同一份。计划是输入的纯函数：同一份布局、探测结果与请求，输出逐字节相同；读环境、探文件、发命令都在执行侧。
 _Avoid_: 安装步骤脚本（计划不是脚本，由执行器逐条施加）
 
 **install_dir**:
-`svcd.conf` 里记录的安装根：`svcd --install --prefix <dir>` 会把 `<dir>` 写回这里；之后不带 `--prefix` 的重装、运行时 data/logs 的默认值（`<install_dir>/data`、`<install_dir>/logs`）和 `--uninstall` 的清理都以它为准。手工写在 conf 里也有效，`--prefix` 优先于它；未记录时走平台默认。
+`svcd.conf` 里记录的安装前缀：`svcd --install --prefix <dir>` 会把 `<dir>` 写回这里；之后不带 `--prefix` 的重装和 `--uninstall` 都以它为准。它只在配置初始化时折算成 data/logs 的默认根，运行期不再从它推路径。手工写在 conf 里也有效，`--prefix` 优先于它；未记录时走平台默认。
 _Avoid_: 安装前缀（那是命令行 `--prefix`）、数据目录
 
 **运行配置（Config）**:
@@ -72,7 +72,7 @@ _Avoid_: 安装前缀（那是命令行 `--prefix`）、数据目录
 _Avoid_: 全局配置、配置单例、settings（那是 `svcd.conf` 的解析结果，只是其中一份）
 
 **目录集（Paths）**:
-由平台默认、`SVCD_*` 覆盖与 `svcd.conf` 的 `config_dir`/`install_dir` 解析出的一组绝对目录（config / data / logs / plugins / run / temp / trust）。生产在启动时解析一次；测试从一个临时根派生同一组结构，不读进程环境。
+由三个根（`config_dir` / `data_dir` / `logs_dir`）派生的一组绝对目录（config / data / logs / plugins / run / temp / trust）。根可由 `SVCD_*` 或 `svcd.conf` 覆盖，派生值不可单独配置。生产在启动时解析一次；测试从一个临时根派生同一组结构，不读进程环境。
 _Avoid_: 路径工具、路径常量
 
 **日志行（Log line）**:

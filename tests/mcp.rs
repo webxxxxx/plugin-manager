@@ -233,7 +233,7 @@ done
 
     fn wait_for_http(&self) -> String {
         for _ in 0..200 {
-            if let Ok(address) = fs::read_to_string(self.config.join("http.port")) {
+            if let Ok(address) = fs::read_to_string(self.data.join("run").join("http.port")) {
                 let address = address.trim().to_string();
                 if std::net::TcpStream::connect(&address).is_ok() {
                     return address;
@@ -325,6 +325,12 @@ done
         command.arg("shutdown");
         self.env(&mut command);
         command.env("SVCD_CONFIG_DIR", config);
+        // A different config is the "unreachable" probe: on Unix the control
+        // socket is under data/run and on Windows the pipe name is derived from
+        // config_dir, so move both. The normal stop keeps the sandbox roots.
+        if config != self.config {
+            command.env("SVCD_DATA_DIR", config.join("no-data"));
+        }
         support::stop_daemon(&mut child, &mut command, self.stop_timeout, || {
             fs::read_to_string(&log).unwrap_or_default()
         })

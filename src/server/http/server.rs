@@ -322,7 +322,7 @@ impl ConnectionOps for Server {
                     // channel error instead of an HTTP 500 before the SSE
                     // headers.
                     let stream = self.client.open(
-                        &self.config.paths.config_dir,
+                        self.config.paths.control_dir(),
                         "registry.call",
                         request,
                         sender,

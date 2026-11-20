@@ -94,6 +94,24 @@ pub(crate) fn default_config_dir() -> PathBuf {
     }
 }
 
+/// The data root used when neither the document nor `install_dir` names one.
+pub(crate) fn default_data_dir() -> PathBuf {
+    if user_mode() {
+        user_data_dir()
+    } else {
+        platform_data_dir()
+    }
+}
+
+/// The logs root used when neither the document nor `install_dir` names one.
+pub(crate) fn default_logs_dir() -> PathBuf {
+    if user_mode() {
+        user_logs_dir()
+    } else {
+        platform_logs_dir()
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub(crate) fn platform_config_dir() -> PathBuf {
     // System mode is machine-wide: the SCM service runs as LocalSystem, whose

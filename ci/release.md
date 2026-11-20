@@ -114,6 +114,27 @@ On Windows use `cargo build --release --target x86_64-pc-windows-msvc` and
 `lipo -create` them first. `tools/package_release.py` picks `.zip` whenever the
 target name contains `windows`, `.tar.gz` otherwise.
 
+## Directory migration (0.2.x)
+
+ADR-0023 reduces the path surface to three roots. The old keys and variables
+are still parsed, warned about at startup, and ignored:
+
+| Removed input | Replacement |
+| --- | --- |
+| `plugins_dir` | `data_dir` (plugins derive as `<data_dir>/plugins`) |
+| `services_dir` | `config_dir` (services derive as `<config_dir>/services.d`) |
+| `temp_dir` | `data_dir` (temp derives as `<data_dir>/temp`) |
+| `SVCD_TEMP_DIR` | `SVCD_DATA_DIR` |
+| `SVCD_RUN_DIR` | `SVCD_DATA_DIR` (run derives as `<data_dir>/run`) |
+| `SVCD_TRUST_DIR` | `SVCD_CONFIG_DIR` (trust derives as `<config_dir>/trust.d`) |
+
+A document with `config_dir`, `data_dir` or `logs_dir` missing is filled once
+and written back; the same run uses the filled value. A generated default is
+used for the current start, not only the next one. On Unix the control socket
+and `http.port` move to `<data>/run`, and upload staging moves to
+`<data>/temp`; `config_dir` can be mounted read-only. Windows named pipes keep
+their config-directory-derived names.
+
 ## Deliberately out of scope
 
 - **Installers and signing** (deb/rpm, MSI, pkg + notarization) belong to #42,

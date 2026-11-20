@@ -206,7 +206,7 @@ fn install_bytes(
     bytes: &[u8],
     source: &str,
 ) -> Result<serde_json::Value, ProblemError> {
-    let directory = paths.config_dir.join("tmp");
+    let directory = paths.temp_dir.clone();
     fs::create_dir_all(&directory).map_err(|error| {
         Problem::Internal.error(format!("create {}: {}", directory.display(), error))
     })?;
@@ -220,7 +220,7 @@ fn install_bytes(
         return Err(Problem::Internal.error(format!("write {}: {}", path.display(), error)));
     }
     let response = channel::request(
-        &paths.config_dir,
+        paths.control_dir(),
         "plugin.install",
         json!({ "path": path.to_string_lossy(), "strategy": "replace" }),
     );
