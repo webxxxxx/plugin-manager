@@ -1,8 +1,14 @@
 #![cfg(test)]
 
 use super::*;
+
+use std::collections::BTreeMap;
+use std::time::SystemTime;
+
 use crate::kernel::contract::{Capability as KernelCapability, CapabilityName, Effect};
-use crate::kernel::registry::{Exec, Kind, Ready, Service};
+use crate::kernel::registry::{Exec, Kind, Ready, Service, State};
+use crate::platform::clock::{Clock, Now};
+use crate::supervise::model::runtime::{self, Record};
 
 fn capability(name: &str) -> KernelCapability {
     KernelCapability {
@@ -503,23 +509,27 @@ fn next_wait_shrinks_for_the_nearest_timer_and_never_exceeds_the_poll_tick() {
         receiver,
         None,
     );
-    daemon.rescan_interval_ms = 5_000;
-    daemon.next_rescan_ms = 5_000;
-    daemon.temp_cleanup_interval_ms = 60_000;
-    daemon.next_temp_cleanup_ms = 60_000;
+    daemon.host.rescan_interval_ms = 5_000;
+    daemon.host.next_rescan_ms = 5_000;
+    daemon.host.temp_cleanup_interval_ms = 60_000;
+    daemon.host.next_temp_cleanup_ms = 60_000;
 
     assert_eq!(
-        daemon.next_wait(now()),
-        POLL_WAIT,
+        daemon.host.next_wait(now()),
+        crate::supervise::ops::host::POLL_WAIT,
         "no timer inside the tick"
     );
 
-    daemon.next_rescan_ms = 20;
-    assert_eq!(daemon.next_wait(now()), Duration::from_millis(20));
+    daemon.host.next_rescan_ms = 20;
+    assert_eq!(daemon.host.next_wait(now()), Duration::from_millis(20));
 
-    daemon.rescan_interval_ms = 0;
-    daemon.next_rescan_ms = 0;
-    assert_eq!(daemon.next_wait(now()), POLL_WAIT, "0 disables the timer");
+    daemon.host.rescan_interval_ms = 0;
+    daemon.host.next_rescan_ms = 0;
+    assert_eq!(
+        daemon.host.next_wait(now()),
+        crate::supervise::ops::host::POLL_WAIT,
+        "0 disables the timer"
+    );
 }
 
 /// A due timer is re-armed exactly one interval ahead, so a late tick does
@@ -532,17 +542,17 @@ fn tick_rearms_a_due_rescan_timer_without_double_firing() {
         receiver,
         None,
     );
-    daemon.rescan_interval_ms = 5_000;
-    daemon.next_rescan_ms = 5_000;
-    daemon.temp_cleanup_interval_ms = 0;
-    daemon.next_temp_cleanup_ms = 0;
+    daemon.host.rescan_interval_ms = 5_000;
+    daemon.host.next_rescan_ms = 5_000;
+    daemon.host.temp_cleanup_interval_ms = 0;
+    daemon.host.next_temp_cleanup_ms = 0;
 
-    daemon.tick(Now::at(4_999, 0), &clock());
-    assert_eq!(daemon.next_rescan_ms, 5_000, "not due yet");
+    daemon.host.tick(Now::at(4_999, 0), &clock());
+    assert_eq!(daemon.host.next_rescan_ms, 5_000, "not due yet");
 
-    daemon.tick(Now::at(5_000, 0), &clock());
+    daemon.host.tick(Now::at(5_000, 0), &clock());
     assert_eq!(
-        daemon.next_rescan_ms, 10_000,
+        daemon.host.next_rescan_ms, 10_000,
         "due: re-armed one interval ahead"
     );
 }
@@ -557,14 +567,14 @@ fn tick_rearms_the_temp_cleanup_timer_from_its_own_now() {
         receiver,
         None,
     );
-    daemon.rescan_interval_ms = 0;
-    daemon.next_rescan_ms = 0;
-    daemon.temp_cleanup_interval_ms = 1_000;
-    daemon.next_temp_cleanup_ms = 0;
+    daemon.host.rescan_interval_ms = 0;
+    daemon.host.next_rescan_ms = 0;
+    daemon.host.temp_cleanup_interval_ms = 1_000;
+    daemon.host.next_temp_cleanup_ms = 0;
 
-    daemon.tick(Now::at(500, 0), &clock());
+    daemon.host.tick(Now::at(500, 0), &clock());
     assert_eq!(
-        daemon.next_temp_cleanup_ms, 1_500,
+        daemon.host.next_temp_cleanup_ms, 1_500,
         "re-armed from the tick's now, not from a second clock read"
     );
 }
@@ -576,7 +586,7 @@ fn next_line(daemon: &mut Daemon, receiver: &Receiver<String>) -> Value {
         if let Ok(line) = receiver.try_recv() {
             return serde_json::from_str(&line).expect("line json");
         }
-        daemon.pump(clock.now());
+        daemon.host.pump(clock.now());
         assert!(Instant::now() < deadline, "no line");
         thread::sleep(Duration::from_millis(10));
     }
@@ -599,7 +609,7 @@ fn wait(daemon: &mut Daemon, receiver: &Receiver<String>) -> rpc::Response {
             }
             return serde_json::from_value(value).expect("response");
         }
-        daemon.pump(clock.now());
+        daemon.host.pump(clock.now());
         assert!(Instant::now() < deadline, "no response");
         thread::sleep(Duration::from_millis(10));
     }
@@ -633,8 +643,8 @@ fn a_live_plugin_routes_tool_calls_and_fails_them_on_a_crash() {
     );
     let (_sender, receiver) = mpsc::channel();
     let mut daemon = Daemon::new(registry(vec![plugin]), receiver, None);
-    daemon.start_service("plug", &clock()).expect("start");
-    assert!(daemon.is_live("plug"));
+    daemon.host.start_service("plug", &clock()).expect("start");
+    assert!(daemon.host.is_live("plug"));
 
     let echo = send(
         &mut daemon,
@@ -653,7 +663,7 @@ fn a_live_plugin_routes_tool_calls_and_fails_them_on_a_crash() {
     let _crashed = send(&mut daemon, "tools/call", json!({"name": "plug.crash"}));
     let result = wait(&mut daemon, &hung).result.expect("crash result");
     assert_eq!(result["isError"], true);
-    assert!(!daemon.is_live("plug"));
+    assert!(!daemon.host.is_live("plug"));
 
     let tools = daemon.tool_list();
     assert_eq!(tools.len(), 1);
@@ -678,8 +688,8 @@ fn a_core_service_with_capabilities_is_callable_through_the_slot_path() {
     let core = tool_service("core", Kind::Core, &["echo"], &root);
     let (_sender, receiver) = mpsc::channel();
     let mut daemon = Daemon::new(registry(vec![core]), receiver, None);
-    daemon.start_service("core", &clock()).expect("start");
-    assert!(daemon.is_live("core"));
+    daemon.host.start_service("core", &clock()).expect("start");
+    assert!(daemon.host.is_live("core"));
 
     let tools = daemon.tool_list();
     assert!(
@@ -719,9 +729,10 @@ fn an_exec_core_service_forwards_progress_and_cleans_up_its_child() {
     let service = tool_service("proc", Kind::Core, &["progress", "fail"], &root);
     let (_sender, receiver) = mpsc::channel();
     let mut daemon = Daemon::new(registry(vec![service]), receiver, None);
-    daemon.start_service("proc", &clock()).expect("start");
-    assert!(daemon.is_live("proc"));
+    daemon.host.start_service("proc", &clock()).expect("start");
+    assert!(daemon.host.is_live("proc"));
     let pid = daemon
+        .host
         .status_for_id("proc", now())
         .expect("status")
         .summary
@@ -752,8 +763,8 @@ fn an_exec_core_service_forwards_progress_and_cleans_up_its_child() {
     // tool error, not only a successful value.
     assert_tool_error(&mut daemon, "proc.fail", "boom");
 
-    daemon.stop_service("proc", &clock()).expect("stop");
-    let status = daemon.status_for_id("proc", now()).expect("status");
+    daemon.host.stop_service("proc", &clock()).expect("stop");
+    let status = daemon.host.status_for_id("proc", now()).expect("status");
     assert_eq!(status.summary.state, State::Stopped);
     assert!(status.summary.pid.is_none());
     #[cfg(unix)]
@@ -779,7 +790,13 @@ fn tool_projection_follows_the_live_state() {
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0]["name"], "plug.start");
 
-    daemon.slots.get_mut("plug").expect("slot").machine.state = State::Running;
+    daemon
+        .host
+        .slots
+        .get_mut("plug")
+        .expect("slot")
+        .machine
+        .state = State::Running;
     let tools = daemon.tool_list();
     let names: Vec<&str> = tools
         .iter()
@@ -787,7 +804,13 @@ fn tool_projection_follows_the_live_state() {
         .collect();
     assert_eq!(names, vec!["plug.echo", "plug.start"]);
 
-    daemon.slots.get_mut("plug").expect("slot").machine.state = State::Backoff;
+    daemon
+        .host
+        .slots
+        .get_mut("plug")
+        .expect("slot")
+        .machine
+        .state = State::Backoff;
     assert_eq!(daemon.tool_list().len(), 1);
 }
 
@@ -811,7 +834,7 @@ fn an_eighty_plugin_catalog_is_returned_in_bounded_pages() {
         .collect();
     let (_sender, receiver) = mpsc::channel();
     let mut daemon = Daemon::new(registry(services), receiver, None);
-    for slot in daemon.slots.values_mut() {
+    for slot in daemon.host.slots.values_mut() {
         slot.machine.state = State::Running;
     }
 
@@ -954,9 +977,16 @@ fn start_refuses_a_failed_dependency() {
     let registry = registry(vec![service("app", &["base"]), service("base", &[])]);
     let (_sender, receiver) = mpsc::channel();
     let mut daemon = Daemon::new(registry, receiver, None);
-    daemon.slots.get_mut("base").expect("base").machine.state = State::Failed;
+    daemon
+        .host
+        .slots
+        .get_mut("base")
+        .expect("base")
+        .machine
+        .state = State::Failed;
 
     let error = daemon
+        .host
         .start_service("app", &clock())
         .expect_err("failed dependency");
 
@@ -996,7 +1026,7 @@ fn a_reload_rejects_two_owners_and_leaves_the_live_service_and_slot_alone() {
     );
     desired.insert("live".to_string(), conflicting_live);
 
-    let (added, updated) = daemon.apply_definitions(desired);
+    let (added, updated) = daemon.host.apply_definitions(desired);
 
     assert!(
         added.is_empty(),
@@ -1006,19 +1036,19 @@ fn a_reload_rejects_two_owners_and_leaves_the_live_service_and_slot_alone() {
         updated.is_empty(),
         "a rejected update must not be reported as updated"
     );
-    assert!(daemon.registry.get("bad").is_none());
+    assert!(daemon.host.registry.get("bad").is_none());
     assert!(
-        !daemon.slots.contains_key("bad"),
+        !daemon.host.slots.contains_key("bad"),
         "a rejected new service must not leave a slot behind"
     );
-    let live = daemon.registry.get("live").expect("live service");
+    let live = daemon.host.registry.get("live").expect("live service");
     assert_eq!(
         live.version, "1.0.0",
         "a rejected update must not reach the registry"
     );
     assert_eq!(live.carrier(), Ok(crate::kernel::registry::Carrier::Slot));
     assert!(
-        daemon.slots.contains_key("live"),
+        daemon.host.slots.contains_key("live"),
         "the live slot must survive a rejected update"
     );
 }
@@ -1031,19 +1061,19 @@ fn the_assembly_point_keeps_one_carrier_per_service() {
     let daemon = Daemon::new(registry, receiver, None);
 
     assert!(
-        daemon.slots.contains_key("core"),
+        daemon.host.slots.contains_key("core"),
         "an exec service is owned by the supervised slot"
     );
     assert!(
-        !daemon.slots.contains_key("svc"),
+        !daemon.host.slots.contains_key("svc"),
         "the builtin is launcher-backed and must never get a slot"
     );
     assert_eq!(
-        daemon.registry.get("svc").map(Service::carrier),
+        daemon.host.registry.get("svc").map(Service::carrier),
         Some(Ok(crate::kernel::registry::Carrier::Launcher))
     );
     assert_eq!(
-        daemon.registry.get("core").map(Service::carrier),
+        daemon.host.registry.get("core").map(Service::carrier),
         Some(Ok(crate::kernel::registry::Carrier::Slot))
     );
 }
@@ -1064,12 +1094,14 @@ fn the_runtime_record_anchors_since_like_the_status_projection() {
     );
     let now = Now::at(1_700_000_010_000, 1_700_000_010);
     daemon
+        .host
         .slots
         .get_mut("never")
         .expect("never slot")
         .machine
         .state = State::Running;
     let started = &mut daemon
+        .host
         .slots
         .get_mut("started")
         .expect("started slot")
@@ -1077,7 +1109,7 @@ fn the_runtime_record_anchors_since_like_the_status_projection() {
     started.state = State::Running;
     started.since_ms = 1_700_000_000_000;
 
-    daemon.persist_states(now);
+    daemon.host.persist_states(now);
 
     let never = runtime::load("never", &daemon.config.paths).expect("never record");
     assert_eq!(never.since, None, "a never-started slot must not anchor 0");
@@ -1091,8 +1123,12 @@ fn the_runtime_record_anchors_since_like_the_status_projection() {
     );
 
     let recorded = runtime::load("started", &daemon.config.paths).expect("started record");
-    let service = daemon.registry.get("started").expect("started service");
-    let status = Status::live(service, &daemon.slots["started"].machine.live(), now);
+    let service = daemon
+        .host
+        .registry
+        .get("started")
+        .expect("started service");
+    let status = Status::live(service, &daemon.host.slots["started"].machine.live(), now);
     assert_eq!(
         recorded.since, status.summary.since,
         "the record and the status projection must agree"
@@ -1114,6 +1150,7 @@ fn adopting_a_record_without_since_reports_no_since() {
     let now = Now::at(1_700_000_010_000, 1_700_000_010);
     for id in ["never", "started"] {
         daemon
+            .host
             .slots
             .get_mut(id)
             .expect("slot")
@@ -1136,11 +1173,11 @@ fn adopting_a_record_without_since_reports_no_since() {
         .expect("save record");
     }
 
-    daemon.adopt_runtime(now);
+    daemon.host.adopt_runtime(now);
 
     let never = Status::live(
-        daemon.registry.get("never").expect("never service"),
-        &daemon.slots["never"].machine.live(),
+        daemon.host.registry.get("never").expect("never service"),
+        &daemon.host.slots["never"].machine.live(),
         now,
     );
     assert_eq!(
@@ -1148,12 +1185,19 @@ fn adopting_a_record_without_since_reports_no_since() {
         "a record without since must stay absent"
     );
     let started = Status::live(
-        daemon.registry.get("started").expect("started service"),
-        &daemon.slots["started"].machine.live(),
+        daemon
+            .host
+            .registry
+            .get("started")
+            .expect("started service"),
+        &daemon.host.slots["started"].machine.live(),
         now,
     );
     assert_eq!(started.summary.since, Some(1_700_000_000));
-    assert_eq!(daemon.slots["started"].machine.since_ms, 1_700_000_000_000);
+    assert_eq!(
+        daemon.host.slots["started"].machine.since_ms,
+        1_700_000_000_000
+    );
 }
 
 #[test]
@@ -1463,9 +1507,16 @@ fn a_start_layer_past_its_deadline_projects_timeout_kind() {
     let mut daemon = Daemon::new(registry(vec![service("stuck", &[])]), receiver, None);
     // Force a start that is in flight but never becomes ready; the deadline
     // is already past, so the layer must report a timeout without sleeping.
-    daemon.slots.get_mut("stuck").expect("slot").machine.state = State::Starting;
+    daemon
+        .host
+        .slots
+        .get_mut("stuck")
+        .expect("slot")
+        .machine
+        .state = State::Starting;
 
     let error = daemon
+        .host
         .start_layer(&["stuck".into()], 0, &clock())
         .expect_err("past deadline");
     assert_eq!(error.problem, Problem::Timeout);
@@ -1481,8 +1532,8 @@ fn a_start_layer_past_its_deadline_projects_timeout_kind() {
 fn wait_for_stopped(daemon: &mut Daemon, id: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        daemon.pump(clock().now());
-        if daemon.slots[id].machine.state == State::Stopped {
+        daemon.host.pump(clock().now());
+        if daemon.host.slots[id].machine.state == State::Stopped {
             return;
         }
         assert!(Instant::now() < deadline, "{id} never stopped");
@@ -1495,8 +1546,8 @@ fn wait_for_stopped(daemon: &mut Daemon, id: &str) {
 fn wait_until_remaining(daemon: &mut Daemon, id: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        daemon.pump(clock().now());
-        let machine = &daemon.slots[id].machine;
+        daemon.host.pump(clock().now());
+        let machine = &daemon.host.slots[id].machine;
         if machine.state == State::Running && machine.pid.is_none() {
             return;
         }
@@ -1524,6 +1575,7 @@ fn a_peer_that_dies_while_the_layer_is_still_starting_fails_the_layer() {
     let mut daemon = Daemon::new(registry(vec![dead, slow]), receiver, None);
 
     let error = daemon
+        .host
         .start_layer(
             &["dead".into(), "slow".into()],
             clock().now().mono_ms + 5_000,
@@ -1553,10 +1605,11 @@ fn a_raw_peer_that_dies_while_the_layer_is_still_starting_loses_the_channel() {
     let raw = peer_plugin("raw", exit_zero_exec(), 3);
     let slow = peer_plugin("slow", slow_ping_agent(dir.path()), 1);
     let mut daemon = Daemon::new(registry(vec![raw, slow]), receiver, None);
-    let hub = daemon.raw_hub.clone();
-    daemon.set_raw_hub(hub);
+    let hub = daemon.host.factory.raw_hub();
+    daemon.host.set_raw_hub(hub);
 
     let error = daemon
+        .host
         .start_layer(
             &["raw".into(), "slow".into()],
             clock().now().mono_ms + 5_000,
