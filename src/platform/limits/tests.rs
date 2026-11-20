@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use crate::platform::resources::MIN_BUDGET;
 use crate::platform::settings::Settings;
