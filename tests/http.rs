@@ -1065,6 +1065,11 @@ fn web_event_plugin_bundle(key: &SigningKey, id: &str) -> Vec<u8> {
 
 fn daemon_with_web_event_plugin(key_byte: u8) -> (Sandbox, String) {
     let mut sandbox = Sandbox::new();
+    // This plugin's UI test opens 8 SSE streams and then 16 concurrent page
+    // requests. Stating the stream budget keeps the sandbox independent of the
+    // memory budget this host happens to derive (a 1 GiB budget gets 16 slots,
+    // which is not enough for the page load this test is about).
+    fs::write(sandbox.config.join("svcd.conf"), "max_streams = 64\n").expect("write svcd.conf");
     let key = SigningKey::from_bytes(&[key_byte; 32]);
     fs::write(
         sandbox.trust.join("test.pub"),
