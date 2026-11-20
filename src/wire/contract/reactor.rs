@@ -17,7 +17,6 @@
 
 #![cfg(unix)]
 
-use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -235,28 +234,6 @@ impl RawOutQueue {
                 Err(error) => return Err(error),
             }
         }
-    }
-}
-
-thread_local! {
-    /// Set on the supervisor loop only. That loop owns plugin stdio, so a
-    /// synchronous wait on its thread (an install hook, a status hook) polls
-    /// one pass to keep the plugin pipes moving. Other threads have no binding.
-    static WAITING_LOOP: RefCell<Option<Weak<Reactor>>> = const { RefCell::new(None) };
-}
-
-/// Bind `reactor` as this thread's poll set so synchronous waits can poll it.
-/// Only the loop that owns the reactor may bind it.
-pub fn bind_waiting_loop(reactor: &Arc<Reactor>) {
-    WAITING_LOOP.with(|slot| *slot.borrow_mut() = Some(Arc::downgrade(reactor)));
-}
-
-/// One non-blocking pass over the poll set bound to this thread. A thread that
-/// owns no reactor (a worker, a test, Windows) does nothing.
-pub fn poll_waiting_loop() {
-    let reactor = WAITING_LOOP.with(|slot| slot.borrow().as_ref().and_then(Weak::upgrade));
-    if let Some(reactor) = reactor {
-        reactor.poll_once(Duration::ZERO);
     }
 }
 

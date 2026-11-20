@@ -34,7 +34,8 @@ pub struct Invocation<'a> {
 
 /// Run the hook, calling `poll` before every wait step. The supervisor loop
 /// owns plugin stdio, so a hook it waits for must not stop the plugin pipes;
-/// production callers pass [`poll_this_loop`].
+/// the composition root passes a closure over its reactor, and a caller with
+/// no reactor passes a no-op.
 pub fn run(
     spec: &Invocation<'_>,
     paths: &Paths,
@@ -164,12 +165,6 @@ pub fn run(
         }
         thread::sleep(Duration::from_millis(20));
     }
-}
-
-/// The poll a production caller passes: the loop bound to this thread (the
-/// supervisor loop in the daemon), a no-op on a thread that owns none.
-pub fn poll_this_loop() {
-    crate::wire::contract::stdio::pump_waiting_loop();
 }
 
 /// Kill a hook and, on Unix, the process group it leads.
@@ -362,6 +357,26 @@ mod tests {
         let cwd = fs::read_to_string(dir.0.join("cwd.txt")).expect("cwd");
         let name = dir.0.file_name().expect("temp name").to_string_lossy();
         assert!(cwd.contains(name.as_ref()), "cwd was {cwd:?}");
+    }
+
+    #[test]
+    fn a_hook_wait_pumps_the_injected_poll() {
+        let dir = TempDir::new();
+        #[cfg(windows)]
+        let path = write_hook(
+            &dir.0,
+            "pump",
+            "@echo off\npowershell -NoProfile -Command \"Start-Sleep -Milliseconds 300\"\n",
+        );
+        #[cfg(unix)]
+        let path = write_hook(&dir.0, "pump", "#!/bin/sh\nsleep 0.2\n");
+
+        let mut polls = 0u32;
+        run(&spec(&dir, &path, 5_000), &mut || polls += 1).expect("hook runs");
+        assert!(
+            polls >= 1,
+            "the synchronous wait must call the poll closure it was given"
+        );
     }
 
     #[test]

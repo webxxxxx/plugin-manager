@@ -42,6 +42,7 @@ pub fn uninstall(
     limits: &crate::platform::limits::Limits,
     id: &str,
     purge: bool,
+    poll: &mut dyn FnMut(),
 ) -> Result<(), ProblemError> {
     if !package::valid_name(id) || id == RESERVED_ID {
         return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
@@ -50,7 +51,7 @@ pub fn uninstall(
     if !directory.is_dir() {
         return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
     }
-    run_pre_remove(paths, limits, id);
+    run_pre_remove(paths, limits, id, poll);
     if purge {
         fs::remove_dir_all(&directory).map_err(|error| {
             Problem::Internal.error(format!("remove {}: {}", directory.display(), error))
@@ -78,7 +79,12 @@ pub fn uninstall(
 
 /// A failing pre-remove hook must not block uninstall; the spec only requires a
 /// log line so a broken package can still be removed.
-fn run_pre_remove(paths: &Paths, limits: &crate::platform::limits::Limits, id: &str) {
+fn run_pre_remove(
+    paths: &Paths,
+    limits: &crate::platform::limits::Limits,
+    id: &str,
+    poll: &mut dyn FnMut(),
+) {
     let Some(version) = current_version(paths, id) else {
         return;
     };
@@ -111,7 +117,7 @@ fn run_pre_remove(paths: &Paths, limits: &crate::platform::limits::Limits, id: &
         },
         paths,
         limits,
-        &mut hook::poll_this_loop,
+        poll,
     );
     if let Err(error) = result {
         log::svcd(&format!(

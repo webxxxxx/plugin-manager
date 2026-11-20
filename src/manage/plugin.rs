@@ -404,6 +404,7 @@ mod tests {
             Strategy::KeepOld,
             false,
             None,
+            &mut || {},
         )
         .expect("first install");
         install_package(
@@ -413,6 +414,7 @@ mod tests {
             Strategy::KeepOld,
             false,
             None,
+            &mut || {},
         )
         .expect("keep-old install");
 
@@ -432,6 +434,7 @@ mod tests {
             Strategy::Replace,
             false,
             None,
+            &mut || {},
         )
         .expect("replace install");
         assert!(

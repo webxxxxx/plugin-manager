@@ -950,8 +950,7 @@ impl Daemon {
         // queued raw frame interrupts that poll instead of waiting it out.
         if let Some(reactor) = &reactor {
             // Synchronous waits on this thread (an install hook, a status
-            // hook) poll through this binding, so plugin pipes keep moving.
-            crate::wire::contract::reactor::bind_waiting_loop(reactor);
+            // hook) get an explicit poll closure from hook_pump.
             match reactor.interrupt_handle() {
                 Ok(interrupt) => self.wake.set_interrupt(interrupt),
                 // Without the self-pipe the loop still polls, so requests are
@@ -1543,12 +1542,26 @@ impl Daemon {
         else {
             return;
         };
-        status.details.probe = Some(run_status_hook(
-            id,
-            &hook,
-            &self.config.paths,
-            &mut crate::supervise::ops::hook::poll_this_loop,
-        ));
+        let mut poll = self.hook_pump();
+        status.details.probe = Some(run_status_hook(id, &hook, &self.config.paths, &mut poll));
+    }
+
+    /// A one-pass poll for a synchronous hook wait. The closure owns the
+    /// reactor handle, so running the hook with a mutable borrow of self
+    /// cannot re-borrow the poll set through a hidden thread-local.
+    #[cfg(unix)]
+    fn hook_pump(&self) -> impl FnMut() + 'static {
+        let reactor = self.reactor.clone();
+        move || {
+            if let Some(reactor) = &reactor {
+                reactor.poll_once(Duration::ZERO);
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn hook_pump(&self) -> impl FnMut() + 'static {
+        || {}
     }
 
     fn status_for(&self, service: &Service, now: Now) -> Status {
@@ -1992,6 +2005,7 @@ impl Daemon {
             self.stop_service(&id, clock)?;
         }
         let still_running = running(&self.slots);
+        let mut poll = self.hook_pump();
         let service = match plugin::install_package(
             &self.config.paths,
             &self.config.limits,
@@ -1999,6 +2013,7 @@ impl Daemon {
             strategy,
             allow_hooks,
             host_interpreter.clone(),
+            &mut poll,
         ) {
             Ok(service) => service,
             Err(plugin::InstallFailure::OutOfSpace(error)) if strategy == Strategy::KeepOld => {
@@ -2022,6 +2037,7 @@ impl Daemon {
                     Strategy::Replace,
                     allow_hooks,
                     host_interpreter,
+                    &mut poll,
                 )
                 .map_err(plugin::InstallFailure::into_problem)?
             }
@@ -2165,6 +2181,7 @@ impl Daemon {
             self.stop_service(&id, clock)?;
         }
         let still_running = running(&self.slots);
+        let mut poll = self.hook_pump();
         let service = plugin::install_staged(
             &self.config.paths,
             &self.config.limits,
@@ -2172,6 +2189,7 @@ impl Daemon {
             strategy,
             allow_hooks,
             host_interpreter,
+            &mut poll,
         )?;
         if let Err(error) = service.carrier() {
             return Err(ProblemError::new(
@@ -2252,7 +2270,14 @@ impl Daemon {
         if running {
             self.stop_service(id, clock)?;
         }
-        plugin::uninstall(&self.config.paths, &self.config.limits, id, purge)?;
+        let mut poll = self.hook_pump();
+        plugin::uninstall(
+            &self.config.paths,
+            &self.config.limits,
+            id,
+            purge,
+            &mut poll,
+        )?;
         self.slots.remove(id);
         self.registry.remove(id);
         runtime::remove(id, &self.config.paths);

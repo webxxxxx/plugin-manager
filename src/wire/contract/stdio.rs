@@ -362,13 +362,6 @@ impl Target {
     }
 }
 
-/// One pass of the poll set bound to this thread, if the host has one. The
-/// supervisor loop binds it while a hook blocks that loop.
-pub(crate) fn pump_waiting_loop() {
-    #[cfg(unix)]
-    crate::wire::contract::reactor::poll_waiting_loop();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
