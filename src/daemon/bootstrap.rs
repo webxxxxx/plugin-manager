@@ -16,10 +16,10 @@ use crate::supervise::model::definition;
 use crate::wire::contract::reactor::Reactor;
 use crate::wire::control::channel;
 
-#[cfg(not(feature = "http"))]
-use super::Api;
 #[cfg(feature = "http")]
 use super::assembly::spawn_http;
+#[cfg(not(feature = "http"))]
+use super::Api;
 use super::Daemon;
 
 pub fn run(conf: Option<PathBuf>) -> i32 {
