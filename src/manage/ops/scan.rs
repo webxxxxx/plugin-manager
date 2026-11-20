@@ -346,3 +346,212 @@ pub(crate) fn is_native_file(path: &Path) -> Result<bool, ProblemError> {
         .map_err(|error| Problem::Internal.error(format!("read {}: {}", path.display(), error)))?;
     Ok(package::is_native_binary(&head[..read]))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::contract::Effect;
+    use crate::kernel::registry::{Interpreter, Ready};
+    use crate::manage::test_support::*;
+
+    fn script_manifest(
+        id: &str,
+        exec: &str,
+        data: &[u8],
+        interpreter: Option<serde_json::Value>,
+        lifecycle: Option<serde_json::Value>,
+    ) -> (std::path::PathBuf, package::Manifest) {
+        let version_dir = root().join("data/plugins").join(id).join("1.0.0");
+        let exec_path = version_dir.join(exec);
+        std::fs::create_dir_all(exec_path.parent().expect("parent")).expect("script dir");
+        std::fs::write(&exec_path, data).expect("script");
+        let mut value = serde_json::json!({
+            "schema": 2,
+            "name": id,
+            "version": "1.0.0",
+            "desc": "script test",
+            "platform": crate::platform::target(),
+            "protocol": 1,
+            "exec": {"path": exec, "ready": "exec"},
+            "files": []
+        });
+        if let Some(interpreter) = interpreter {
+            value["interpreter"] = interpreter;
+        }
+        if let Some(lifecycle) = lifecycle {
+            value["lifecycle"] = lifecycle;
+        }
+        let bytes = serde_json::to_vec(&value).expect("manifest");
+        let manifest = package::parse_manifest(&bytes).expect("parse");
+        (version_dir, manifest)
+    }
+
+    #[test]
+    fn scan_builds_the_contract_from_manifest_capabilities() {
+        let id = "contract-caps";
+        make_plugin(id, "", false);
+        let manifest_path = root()
+            .join("data/plugins")
+            .join(id)
+            .join("1.0.0")
+            .join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("manifest"))
+                .expect("manifest json");
+        manifest["capabilities"] = serde_json::json!([{
+            "name": "run",
+            "desc": "run it",
+            "inputSchema": {"type": "object"}
+        }]);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).expect("manifest"),
+        )
+        .expect("write manifest");
+
+        let (services, _) = scan(paths(), &crate::platform::limits::test_default());
+        let service = services
+            .iter()
+            .find(|service| service.id == id)
+            .expect("plugin is scanned");
+        let surface = service.contract.surface();
+        assert_eq!(surface.len(), 1);
+        assert_eq!(surface[0].name.as_str(), "run");
+        assert_eq!(surface[0].desc, "run it");
+        assert_eq!(surface[0].effect, Effect::Write);
+        assert!(!surface[0].idempotent);
+        assert!(!service
+            .contract
+            .failures
+            .contains(&crate::kernel::failure::Class::Cancelled));
+    }
+
+    #[test]
+    fn maps_a_schema_two_script_lifecycle_and_interpreter() {
+        let host = Interpreter {
+            path: "/bin/sh".into(),
+            args: Vec::new(),
+        };
+        let (version_dir, manifest) = script_manifest(
+            "scripted",
+            "payload/actions.sh",
+            b"#!/bin/sh\n",
+            Some(serde_json::json!({"name": "sh"})),
+            Some(serde_json::json!({
+                "start": {"path": "payload/actions.sh", "args": ["start"]},
+                "stop": {"path": "payload/actions.sh", "args": ["stop"]},
+                "status": {"path": "payload/actions.sh", "args": ["status"]}
+            })),
+        );
+
+        let service = service_from_manifest(
+            paths(),
+            &crate::platform::limits::test_default(),
+            "scripted",
+            &version_dir,
+            &manifest,
+            true,
+            Some(&host),
+        )
+        .expect("service");
+
+        let exec = service.exec.as_ref().expect("exec");
+        assert_eq!(exec.ready, Ready::Exec);
+        assert_eq!(
+            exec.interpreter.as_ref().map(|i| i.path.as_str()),
+            Some("/bin/sh")
+        );
+        let lifecycle = service.lifecycle.as_ref().expect("lifecycle");
+        let start = lifecycle.start.as_ref().expect("start");
+        assert_eq!(start.args, ["start".to_string()]);
+        assert_eq!(start.timeout_ms, 30_000);
+        assert_eq!(
+            start.interpreter.as_ref().map(|i| i.path.as_str()),
+            Some("/bin/sh")
+        );
+        assert!(std::path::Path::new(&start.path).is_absolute());
+        assert_eq!(
+            std::path::Path::new(&start.path)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("actions.sh")
+        );
+        assert_eq!(lifecycle.stop.as_ref().expect("stop").timeout_ms, 10_000);
+        assert_eq!(lifecycle.status.as_ref().expect("status").timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn a_schema_two_script_requires_an_interpreter() {
+        let (version_dir, manifest) = script_manifest(
+            "no-interpreter",
+            "payload/actions.sh",
+            b"#!/bin/sh\n",
+            None,
+            None,
+        );
+
+        let error = service_from_manifest(
+            paths(),
+            &crate::platform::limits::test_default(),
+            "no-interpreter",
+            &version_dir,
+            &manifest,
+            true,
+            None,
+        )
+        .expect_err("missing interpreter");
+
+        assert!(
+            error.detail().contains("declares no interpreter"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_native_schema_two_payload_runs_directly() {
+        let (version_dir, manifest) =
+            script_manifest("native", "payload/bin/tool", b"\x7fELFdemo", None, None);
+
+        let service = service_from_manifest(
+            paths(),
+            &crate::platform::limits::test_default(),
+            "native",
+            &version_dir,
+            &manifest,
+            true,
+            None,
+        )
+        .expect("service");
+
+        assert!(service.exec.as_ref().expect("exec").interpreter.is_none());
+        assert!(service.lifecycle.is_none());
+    }
+
+    #[test]
+    fn a_dangling_interpreter_on_a_native_payload_is_rejected() {
+        let host = Interpreter {
+            path: "/bin/sh".into(),
+            args: Vec::new(),
+        };
+        let (version_dir, manifest) = script_manifest(
+            "dangling",
+            "payload/bin/tool",
+            b"\x7fELFdemo",
+            Some(serde_json::json!({"name": "sh"})),
+            None,
+        );
+
+        let error = service_from_manifest(
+            paths(),
+            &crate::platform::limits::test_default(),
+            "dangling",
+            &version_dir,
+            &manifest,
+            true,
+            Some(&host),
+        )
+        .expect_err("no script payload");
+
+        assert!(error.detail().contains("no script payload"), "{error}");
+    }
+}

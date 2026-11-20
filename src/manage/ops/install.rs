@@ -563,3 +563,100 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), ProblemError> {
 fn set_mode(_path: &Path, _mode: u32) -> Result<(), ProblemError> {
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manage::test_support::*;
+    use std::path::PathBuf;
+
+    fn stager(staging: PathBuf, allow_insecure: bool, max_bytes: u64) -> StagingInstaller {
+        StagingInstaller::new(staging, allow_insecure, max_bytes, trust_dir())
+    }
+
+    fn install_bytes(bytes: &[u8], staging: &Path) -> Result<StagedPackage, ProblemError> {
+        let mut installer = stager(staging.to_path_buf(), false, 1024 * 1024);
+        installer.feed(bytes)?;
+        installer.finish()
+    }
+
+    #[test]
+    fn streaming_install_matches_the_in_memory_path() {
+        let key = setup();
+        let bytes = package(&key);
+        let root = tempdir::TempDir::new();
+        let staged = install_bytes(&bytes, root.path()).expect("stream install");
+        assert_eq!(staged.manifest.name, "demo");
+        assert!(staged.signature_verified);
+        assert_eq!(
+            std::fs::read(root.path().join("payload/bin/demo")).expect("read"),
+            b"hello"
+        );
+
+        let truncated = &bytes[..bytes.len() / 2];
+        let broken = tempdir::TempDir::new();
+        assert!(install_bytes(truncated, broken.path()).is_err());
+    }
+
+    #[test]
+    fn a_streamed_install_accepts_any_chunk_boundary() {
+        let key = setup();
+        let bytes = package(&key);
+        for chunk in [1usize, 3, 7, 511, 512, 513, 1000] {
+            let root = tempdir::TempDir::new();
+            let mut installer = stager(root.path().to_path_buf(), false, 1024 * 1024);
+            for part in bytes.chunks(chunk) {
+                installer
+                    .feed(part)
+                    .unwrap_or_else(|error| panic!("chunk {}: {}", chunk, error));
+            }
+            let staged = installer
+                .finish()
+                .unwrap_or_else(|error| panic!("chunk {}: {}", chunk, error));
+            assert_eq!(staged.manifest.name, "demo");
+            assert!(staged.signature_verified);
+            assert_eq!(
+                std::fs::read(root.path().join("payload/bin/demo")).expect("read"),
+                b"hello"
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_streamed_install_removes_its_staging_directory() {
+        let key = setup();
+        let bytes = package(&key);
+        let root = tempdir::TempDir::new();
+        let staging = root.path().join("staged");
+        let mut installer = stager(staging.clone(), false, 1024 * 1024);
+        installer
+            .feed(&bytes[..bytes.len() / 2])
+            .expect("prefix feed");
+        assert!(installer.finish().is_err());
+        drop(installer);
+        assert!(
+            !staging.exists(),
+            "a rejected package must not leave a staging directory"
+        );
+    }
+
+    #[test]
+    fn a_streamed_payload_is_hashed_against_the_manifest() {
+        let key = setup();
+        let mut bytes = package(&key);
+        let needle = b"hello";
+        let position = bytes
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("payload");
+        bytes[position] = b'j';
+        let root = tempdir::TempDir::new();
+        let staging = root.path().join("staged");
+        let error = match install_bytes(&bytes, &staging) {
+            Ok(_) => panic!("a tampered payload is rejected"),
+            Err(error) => error,
+        };
+        assert!(error.detail().contains("sha256"), "{error}");
+        assert!(!staging.exists(), "staging survives a rejected payload");
+    }
+}

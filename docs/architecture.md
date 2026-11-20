@@ -245,7 +245,7 @@ src/
     mod.rs  plan.rs  execute.rs  service_win.rs
 ```
 
-**step 6（#170）已按本树整文件搬迁**：文件进了对应目录但内容没切。`api.rs` 已在 #173 拆完端点、#205 整文件溶解（连接驱动与每连接循环 → `server/http/thread_loop.rs`，装配 → `daemon.rs`，目标树里不再有它）；`platform/storage` 的五文件已在 #175 拆完（`meta` / `path` / `upload` / `part` / `gc`）；`supervise` 的 `model/` 与 `ops/` 已整文件落位（#176）；`check/` 已落 `backoff` / `restart`（#178）、`oneshot`（#191）与 `reconcile` 的纯判定（#192）；`manage` 的 `check/` 与 `ops/` 已整文件落位（#177）；`plugin.rs` 的第一、二切片已落地（扫描 → `manage/ops/scan.rs` #186；布局 → `manage/model/layout.rs`、config → `manage/ops/config.rs` #187；安装生命周期 → `manage/ops/install_plugin.rs` #188；check 段 → `manage/check/plugin.rs` #189；导出与 uninstall → `manage/ops/{export_plugin,uninstall}.rs` #190）；`plugin.rs` 只剩再导出与测试；`package.rs` 三段已拆完：清单类型 → `model/manifest.rs`（#181）、tar 编解码 → `model/ustar.rs`（#182）、校验与 manifest 解析 → `check/verify.rs`（#184）、staging 与导出计划 → `ops/{install,export}.rs`（#185）；`package.rs` 只剩再导出与测试；`plugin.rs` 的内容拆分仍是后续票。`wire/ws/{frame,accept}.rs` 已从 `server/http/wire.rs` 与 `face/uichannel.rs` 收进 L1（#206：帧与握手是字节格式，L4/L5 不再持有）。`selfinstall/` 已拆成 `plan.rs`（纯决定：`InstallPlan` / `SelfInstallPlan` 与五个平台的计划构造）与 `execute.rs`（输入构造、副作用、平台分派），`mod.rs` 只做显式再导出（#207）。
+**step 6（#170）已按本树整文件搬迁**：文件进了对应目录但内容没切。`api.rs` 已在 #173 拆完端点、#205 整文件溶解（连接驱动与每连接循环 → `server/http/thread_loop.rs`，装配 → `daemon.rs`，目标树里不再有它）；`platform/storage` 的五文件已在 #175 拆完（`meta` / `path` / `upload` / `part` / `gc`）；`supervise` 的 `model/` 与 `ops/` 已整文件落位（#176）；`check/` 已落 `backoff` / `restart`（#178）、`oneshot`（#191）与 `reconcile` 的纯判定（#192）；`manage` 的 `check/` 与 `ops/` 已整文件落位（#177）；`plugin.rs` 的第一、二切片已落地（扫描 → `manage/ops/scan.rs` #186；布局 → `manage/model/layout.rs`、config → `manage/ops/config.rs` #187；安装生命周期 → `manage/ops/install_plugin.rs` #188；check 段 → `manage/check/plugin.rs` #189；导出与 uninstall → `manage/ops/{export_plugin,uninstall}.rs` #190）；`package.rs` 三段已拆完：清单类型 → `model/manifest.rs`（#181）、tar 编解码 → `model/ustar.rs`（#182）、校验与 manifest 解析 → `check/verify.rs`（#184）、staging 与导出计划 → `ops/{install,export}.rs`（#185）。两个壳已在 #227 溶解：`package.rs` 与 `plugin.rs` 的 54 个测试按被测模块落回 `check/verify.rs` / `ops/install.rs` / `model/ustar.rs` / `ops/scan.rs` / `check/plugin.rs` / `ops/config.rs` / `ops/install_plugin.rs`，共用的包与插件树构造器收进 `manage/test_support.rs`（与 `platform/test_support.rs` 同构），`src/manage/{package,plugin}.rs` 不再存在。`wire/ws/{frame,accept}.rs` 已从 `server/http/wire.rs` 与 `face/uichannel.rs` 收进 L1（#206：帧与握手是字节格式，L4/L5 不再持有）。`selfinstall/` 已拆成 `plan.rs`（纯决定：`InstallPlan` / `SelfInstallPlan` 与五个平台的计划构造）与 `execute.rs`（输入构造、副作用、平台分派），`mod.rs` 只做显式再导出（#207）。
 
 `orchestrate/` 与 `cluster/` 现在不建：**目录在第一个文件出现时创建**，不建空壳。
 
@@ -364,8 +364,8 @@ flowchart TD
 
 | 状态 | 今天 | 将来 | 拆点 |
 |---|---|---|---|
-| 已搬（#170） | `package.rs` `bundle.rs` `trust.rs` `interpreter.rs` | `manage/` | 按 model / check / ops 三段拆 |
-| 已搬（#170） | `plugin.rs` | `manage/`（布局与扫描）+ `kernel/contract.rs`（能力声明） | 声明与操作分开 |
+| 已拆完（#227） | `package.rs` `bundle.rs` `trust.rs` `interpreter.rs` | `manage/` | 按 model / check / ops 三段拆；`package.rs` 整文件溶解，测试按被测模块落回 |
+| 已拆完（#227） | `plugin.rs` | `manage/`（布局与扫描）+ `kernel/contract.rs`（能力声明） | 声明与操作分开；`plugin.rs` 整文件溶解，测试按被测模块落回 |
 | 已搬（#170） | `slot.rs` `supervisor.rs` `runtime.rs` `hook.rs` `script.rs` `definition.rs` | `supervise/` | 运行载体留监督 |
 | 已搬（#170） | `blob.rs` | `platform/storage/`：`meta`（值类型与 `$blob` 引用）/ `path`（内容寻址与布局）/ `upload`（会话与两种 commit 模式）/ `part`（分片）/ `gc`（过期回收）——#175 已拆完 | `$blob` 引用语义的目标在 `kernel/contract`（仍是后续票） |
 | 已搬（#170） | `ipc.rs` `rpc.rs` `rawhub.rs` `reactor.rs` | `wire/contract/` + `wire/message/` | 帧、消息、连接分开 |
@@ -447,7 +447,7 @@ flowchart LR
 
 下一步（按风险排序）：
 
-1. **拆分**：step 6 只搬不拆，`manage`/`supervise` 的 `model/check/ops`、`platform/storage` 五拆、`api.rs` 四拆各开票（`api.rs` 已由 #173/#205 做完，文件已不存在）。
+1. **拆分**：step 6 只搬不拆，`supervise` 的 `model/check/ops`、`platform/storage` 五拆各开票（`api.rs` 已由 #173/#205 做完，文件已不存在；`manage` 的 `package.rs` / `plugin.rs` 已由 #227 溶解，测试跟着被测模块走）。
 2. **`SVCD_*` 覆盖**：ADR-0019 留下的独立票。
 
 已完成：`registry` 进内核（#172，`src/kernel/registry.rs`）。
