@@ -17,6 +17,7 @@ pub mod blob_routes;
 #[cfg(feature = "http")]
 pub mod blob_upload;
 pub mod catalog;
+pub mod control;
 #[cfg(feature = "http")]
 pub mod export;
 #[cfg(feature = "http")]
