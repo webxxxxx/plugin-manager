@@ -88,7 +88,9 @@ pub fn run(args: Vec<String>) -> i32 {
         }
     };
 
-    let Some(config) = Config::bootstrap_or_report("svc") else {
+    // Inspection, not bootstrap: a document the daemon refuses is exactly when
+    // `svc status --resources` and `svc config tune` have to be readable.
+    let Some(config) = Config::inspect_or_report("svc") else {
         return EXIT_SERVICE_ERROR;
     };
     match command {
@@ -468,7 +470,15 @@ fn resources_command(config: &Config, json: bool) -> i32 {
 /// `svc config tune` prints (or writes) the configuration this machine
 /// suggests: one key per line with its derivation in the trailing comment.
 fn config_tune(config: &Config, write: bool) -> i32 {
-    let body = tune::config_text(&config.limits, &config.resources);
+    let mut body = tune::config_text(&config.limits, &config.resources);
+    if let Some(reason) = &config.resources.refusal {
+        body.push_str(&format!(
+            "#\n# WARNING: the daemon refuses to start with the current document.\n\
+             # Writing this configuration pins the budget, which is what makes it fit.\n\
+             # {}\n",
+            reason
+        ));
+    }
     if !write {
         print!("{}", body);
         return EXIT_OK;

@@ -565,3 +565,54 @@ fn status_resources_reports_the_last_start_and_falls_back_without_one() {
         stdout(&plain)
     );
 }
+
+#[test]
+fn an_unrunnable_document_is_still_inspectable() {
+    let sandbox = Sandbox::new();
+    fs::create_dir_all(sandbox.config_dir()).expect("config dir");
+    // A 64 MiB budget with an 8 MiB stack on ten threads cannot be planned.
+    fs::write(
+        sandbox.config_dir().join("svcd.conf"),
+        "mem_budget_bytes = 67108864\nrequest_stack_bytes = 8388608\nblocking_threads = 8\n",
+    )
+    .expect("write conf");
+
+    // The status and tuning views still answer: they are how the operator finds
+    // out what is wrong.
+    let output = sandbox.run(&["status", "--resources"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout(&output).contains("refused:"),
+        "the refusal must be visible:\n{}",
+        stdout(&output)
+    );
+
+    let output = sandbox.run(&["config", "tune"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout(&output).contains("WARNING: the daemon refuses to start"),
+        "the tuning output must warn:\n{}",
+        stdout(&output)
+    );
+
+    // The process entry that would run the daemon keeps refusing, with a
+    // readable reason and a non-zero exit code. `user status` goes through the
+    // strict bootstrap without needing a daemon.
+    let output = sandbox.run_as("svcd", &["user", "status"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("does not fit"),
+        "{}",
+        stderr(&output)
+    );
+}

@@ -92,29 +92,49 @@ impl Config {
     /// also a hard error — the process refuses to start instead of running
     /// until it is killed for memory (user story 25).
     pub fn bootstrap(conf: Option<&Path>) -> Result<Config, String> {
+        let config = Self::inspect(conf)?;
+        match &config.resources.refusal {
+            Some(reason) => Err(reason.clone()),
+            None => Ok(config),
+        }
+    }
+
+    /// [`Config::bootstrap`] without the refusal check.
+    ///
+    /// The CLI uses this: a document the daemon refuses is exactly the moment an
+    /// operator needs `svc status --resources` and `svc config tune` to explain
+    /// why, so the report has to be readable even when the configuration is not
+    /// runnable.
+    pub fn inspect(conf: Option<&Path>) -> Result<Config, String> {
         let (mut settings, settings_path) = settings::load(conf)?;
         // The two loop cadences still take their historical `SVCD_*` env
         // override. Applying it here keeps "env is read at bootstrap" true for
         // every key, and keeps the override out of the modules below.
         settings::apply_loop_env_overrides(&mut settings);
-        Config::bootstrap_with(&settings, settings_path, &resources::Host)
+        Ok(Self::assembled(&settings, settings_path, &resources::Host))
     }
 
     /// [`Config::bootstrap`] with the machine injected, so a test can state the
-    /// host the way it states the document.
+    /// host the way it states the document. It keeps the refusal gate: this is
+    /// the entry that decides whether a process may run.
     pub fn bootstrap_with(
         settings: &Settings,
         settings_path: Option<PathBuf>,
         machine: &dyn Machine,
     ) -> Result<Config, String> {
-        let paths = Paths::resolve(settings);
-        let probe_paths = ProbePaths::host(&paths.data_dir, &paths.temp_dir);
-        let profile = resources::probe(machine, &probe_paths);
-        let config = Self::with_resources(settings.clone(), settings_path, paths, &profile);
+        let config = Self::assembled(settings, settings_path, machine);
         match &config.resources.refusal {
             Some(reason) => Err(reason.clone()),
             None => Ok(config),
         }
+    }
+
+    /// Probe the injected machine and derive, refusing nothing.
+    fn assembled(settings: &Settings, settings_path: Option<PathBuf>, machine: &dyn Machine) -> Config {
+        let paths = Paths::resolve(settings);
+        let probe_paths = ProbePaths::host(&paths.data_dir, &paths.temp_dir);
+        let profile = resources::probe(machine, &probe_paths);
+        Self::with_resources(settings.clone(), settings_path, paths, &profile)
     }
 
     /// [`Config::bootstrap`] for a process entry that reports the failure with
@@ -122,6 +142,23 @@ impl Config {
     pub fn bootstrap_or_report(label: &str) -> Option<Config> {
         match Self::bootstrap(None) {
             Ok(config) => Some(config),
+            Err(error) => {
+                eprintln!("{}: invalid config: {}", label, error);
+                None
+            }
+        }
+    }
+
+    /// [`Config::inspect`] with the same reporting shape. A refusal is reported
+    /// as a warning and does not stop the command.
+    pub fn inspect_or_report(label: &str) -> Option<Config> {
+        match Self::inspect(None) {
+            Ok(config) => {
+                if let Some(reason) = &config.resources.refusal {
+                    eprintln!("{}: warning: {}", label, reason);
+                }
+                Some(config)
+            }
             Err(error) => {
                 eprintln!("{}: invalid config: {}", label, error);
                 None

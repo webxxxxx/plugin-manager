@@ -318,6 +318,7 @@ impl ResourceReport {
             "workload": self.workload.as_str(),
             "workload_source": self.workload_source.as_str(),
             "worst_case": self.worst_case,
+            "refusal": self.refusal,
             "notes": self
                 .notes
                 .iter()
@@ -1597,6 +1598,13 @@ pub fn describe_snapshot(snapshot: &serde_json::Value) -> Vec<String> {
         show("worst_case"),
         show("budget_quantized")
     ));
+    if let Some(reason) = snapshot
+        .get("refusal")
+        .and_then(serde_json::Value::as_str)
+        .filter(|reason| !reason.is_empty())
+    {
+        lines.push(format!("refused: {}", reason));
+    }
     match snapshot
         .get("notes")
         .and_then(serde_json::Value::as_array)
