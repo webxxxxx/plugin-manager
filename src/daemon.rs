@@ -18,14 +18,13 @@ use std::sync::Mutex;
 #[cfg(not(feature = "http"))]
 type Api = ();
 use crate::face::catalog;
+use crate::face::control;
 #[cfg(feature = "http")]
 use crate::face::fallback::respond;
 use crate::face::mcp_tools;
 #[cfg(feature = "http")]
 use crate::face::prebody::PreBodyFaces;
-use crate::kernel::contract::{
-    CapabilityName, Instance, Invocation, Launchers, ProgressToken, Reply, ReplySink,
-};
+use crate::kernel::contract::{CapabilityName, Instance, Invocation, Launchers, Reply, ReplySink};
 use crate::kernel::failure::{Class, Failure, Problem, ProblemError, Retry};
 use crate::kernel::projection::{anchored_mono_ms, anchored_secs, anchored_secs_opt, Status};
 use crate::kernel::registry::{Hook, Kind, Registry, Service, State, RESERVED_ID};
@@ -1119,137 +1118,125 @@ impl Daemon {
                 return;
             }
         };
+        let id = request.id.clone();
         let method = request.method.clone();
         if incoming.endpoint == channel::Endpoint::User
             && channel::Endpoint::for_method(&method) == channel::Endpoint::Admin
         {
-            let response = rpc::err_data(
-                request.id,
-                -32000,
-                "unauthorized",
-                Problem::Internal.error_data(),
-            );
+            let response =
+                rpc::err_data(id, -32000, "unauthorized", Problem::Internal.error_data());
             incoming.reply.send(rpc::to_line(&response));
             return;
         }
-        match method.as_str() {
-            "registry.call" | "tools/call" => self.handle_tool_call(clock, request, incoming.reply),
-            _ => {
-                let response = self.dispatch(clock, request);
+        let call = match control::parse(request) {
+            Ok(call) => call,
+            Err(response) => {
+                incoming.reply.send(rpc::to_line(&response));
+                return;
+            }
+        };
+        match call.command {
+            control::Command::ToolCall(tool) => {
+                self.handle_tool_call(clock, call.id, tool, incoming.reply)
+            }
+            command => {
+                let response = self.dispatch(clock, call.id, command);
                 incoming.reply.send(rpc::to_line(&response));
             }
         }
         self.note_slow(&format!("request {}", method), started);
     }
 
-    fn dispatch(&mut self, clock: &Clock, request: rpc::Request) -> rpc::Response {
+    fn dispatch(
+        &mut self,
+        clock: &Clock,
+        id: Option<Value>,
+        command: control::Command,
+    ) -> rpc::Response {
         let now = clock.now();
-        let id = request.id.clone();
-        match request.method.as_str() {
-            "svcd.ping" => rpc::ok(id, json!({"ok": true})),
-            "svcd.compat" => rpc::ok(
+        match command {
+            control::Command::Ping => rpc::ok(id, json!({"ok": true})),
+            control::Command::Compat => rpc::ok(
                 id,
                 serde_json::to_value(compat::detect(&self.config.paths, MAX_SCHEMA, MAX_PROTOCOL))
                     .unwrap_or(Value::Null),
             ),
-            "svcd.shutdown" => {
+            control::Command::Shutdown => {
                 self.shutdown = true;
                 rpc::ok(id, json!({"ok": true}))
             }
-            "registry.tools" | "tools/list" => match self.tools_page(&request.params) {
-                Ok(value) => rpc::ok(id, value),
-                Err(error) => problem_response(id, -32602, error),
-            },
-            "registry.version" => rpc::ok(id, json!({ "version": self.catalog_version })),
-            "svc.list" => rpc::ok(id, json!({"services": self.statuses(now)})),
-            "svc.status" => match param_id(&request) {
-                Ok(service_id) => match self.status_for_id(&service_id, now) {
+            control::Command::ToolsPage { cursor, limit } => {
+                match self.tools_page(cursor.as_deref(), limit) {
+                    Ok(value) => rpc::ok(id, value),
+                    Err(error) => problem_response(id, -32602, error),
+                }
+            }
+            control::Command::Version => rpc::ok(id, json!({ "version": self.catalog_version })),
+            control::Command::List => rpc::ok(id, json!({"services": self.statuses(now)})),
+            control::Command::Status { service, probe } => {
+                match self.status_for_id(&service, now) {
                     Some(mut status) => {
-                        if request
-                            .params
-                            .get("probe")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false)
-                        {
-                            self.probe_status(&service_id, &mut status);
+                        if probe {
+                            self.probe_status(&service, &mut status);
                         }
                         rpc::ok(id, status_json(status))
                     }
                     None => rpc::err_data(
                         id,
                         -32001,
-                        &format!("unknown service: {}", service_id),
+                        &format!("unknown service: {}", service),
                         Problem::UnknownService.error_data(),
                     ),
-                },
-                Err(response) => response,
-            },
-            "svc.start" => match param_id(&request) {
-                Ok(service_id) => {
-                    status_response(id, -32003, self.start_service(&service_id, clock))
                 }
-                Err(response) => response,
-            },
-            "svc.stop" => match param_id(&request) {
-                Ok(service_id) => {
-                    status_response(id, -32004, self.stop_service(&service_id, clock))
-                }
-                Err(response) => response,
-            },
-            "svc.enable" => match param_id(&request) {
-                Ok(service_id) => {
-                    status_response(id, -32005, self.set_enabled(&service_id, true, clock))
-                }
-                Err(response) => response,
-            },
-            "svc.disable" => match param_id(&request) {
-                Ok(service_id) => {
-                    status_response(id, -32005, self.set_enabled(&service_id, false, clock))
-                }
-                Err(response) => response,
-            },
-            "svc.restart" => match param_id(&request) {
-                Ok(service_id) => {
-                    status_response(id, -32010, self.restart_service(&service_id, clock))
-                }
-                Err(response) => response,
-            },
-            "svc.reload" | "svcd.reload" => match self.reload(clock) {
+            }
+            control::Command::Start { service } => {
+                status_response(id, -32003, self.start_service(&service, clock))
+            }
+            control::Command::Stop { service } => {
+                status_response(id, -32004, self.stop_service(&service, clock))
+            }
+            control::Command::Restart { service } => {
+                status_response(id, -32010, self.restart_service(&service, clock))
+            }
+            control::Command::Enable { service } => {
+                status_response(id, -32005, self.set_enabled(&service, true, clock))
+            }
+            control::Command::Disable { service } => {
+                status_response(id, -32005, self.set_enabled(&service, false, clock))
+            }
+            control::Command::Reload => match self.reload(clock) {
                 Ok(summary) => rpc::ok(id, summary),
                 Err(error) => problem_response(id, -32009, error),
             },
-            "plugin.install" => match self.install_plugin(&request, clock) {
+            control::Command::Install(install) => match self.install_plugin(install, clock) {
                 Ok(status) => rpc::ok(id, status_json(status)),
                 Err(error) => problem_response(id, -32006, error),
             },
-            "plugin.install_staged" => match self.install_staged(&request, clock) {
+            control::Command::InstallStaged(install) => match self.install_staged(install, clock) {
                 Ok(status) => rpc::ok(id, status_json(status)),
                 Err(error) => problem_response(id, -32006, error),
             },
-            "plugin.uninstall" => match self.uninstall_plugin(&request, clock) {
-                Ok(()) => rpc::ok(id, json!({ "ok": true })),
-                Err(error) => problem_response(id, -32007, error),
-            },
-            "auth.status" => match self.auth_status() {
+            control::Command::Uninstall { service, purge } => {
+                match self.uninstall_plugin(&service, purge, clock) {
+                    Ok(()) => rpc::ok(id, json!({ "ok": true })),
+                    Err(error) => problem_response(id, -32007, error),
+                }
+            }
+            control::Command::AuthStatus => match self.auth_status() {
                 Ok(status) => rpc::ok(id, auth_json(&status)),
                 Err(error) => problem_response(id, -32008, error),
             },
-            "auth.passwd" => {
-                let password = request
-                    .params
-                    .get("password")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                match self.auth_passwd(password) {
-                    Ok(status) => rpc::ok(id, auth_json(&status)),
-                    Err(error) => problem_response(id, -32008, error),
-                }
-            }
-            _ => rpc::err_data(
+            control::Command::AuthPasswd { password } => match self.auth_passwd(&password) {
+                Ok(status) => rpc::ok(id, auth_json(&status)),
+                Err(error) => problem_response(id, -32008, error),
+            },
+            // handle() routes streaming tool calls to the reply sink; a direct
+            // caller has no sink, so refuse instead of dropping the call.
+            control::Command::ToolCall(_) => rpc::err_data(
                 id,
-                -32601,
-                "method not found",
-                Problem::Invalid.error_data(),
+                -32603,
+                "tools/call needs a control reply sink",
+                Problem::Internal.error_data(),
             ),
         }
     }
@@ -1363,12 +1350,11 @@ impl Daemon {
             .1
     }
 
-    fn tools_page(&mut self, params: &Value) -> Result<Value, ProblemError> {
-        let cursor = params.get("cursor").and_then(Value::as_str);
-        let limit = params
-            .get("limit")
-            .and_then(Value::as_u64)
-            .map(|value| value.min(usize::MAX as u64) as usize);
+    fn tools_page(
+        &mut self,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Value, ProblemError> {
         let version = self.catalog_version;
         let page =
             catalog::page(self.tool_list_cached(), version, cursor, limit).map_err(|error| {
@@ -1398,34 +1384,12 @@ impl Daemon {
     fn handle_tool_call(
         &mut self,
         clock: &Clock,
-        request: rpc::Request,
+        id: Option<Value>,
+        call: control::ToolCall,
         reply: crate::wire::control::channel::Reply,
     ) {
-        let id = request.id.clone();
-        let name = request
-            .params
-            .get("name")
-            .or_else(|| request.params.get("tool"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let Some(name) = name else {
-            send(
-                &reply,
-                rpc::err(id, -32602, "tools/call requires params.name"),
-            );
-            return;
-        };
-        let arguments = match request.params.get("arguments") {
-            None | Some(Value::Null) => json!({}),
-            Some(value) if value.is_object() => value.clone(),
-            Some(_) => {
-                send(
-                    &reply,
-                    rpc::err(id, -32602, "tools/call arguments must be an object"),
-                );
-                return;
-            }
-        };
+        let name = call.name;
+        let mut arguments = call.arguments;
 
         // Only a known plugin's <id>.start is the lifecycle tool. A capability
         // named "foo.start" falls through to the capability lookup below.
@@ -1477,7 +1441,6 @@ impl Daemon {
             return;
         }
 
-        let mut arguments = arguments;
         if let Err(message) =
             crate::platform::storage::resolve_args(&self.config.paths, &mut arguments)
         {
@@ -1487,14 +1450,7 @@ impl Daemon {
             );
             return;
         }
-        let progress_token = request
-            .params
-            .get("progressToken")
-            .and_then(|token| match token {
-                Value::String(token) => Some(ProgressToken::new(token.clone())),
-                Value::Number(token) => Some(ProgressToken::new(token.to_string())),
-                _ => None,
-            });
+        let progress_token = call.progress;
         let mut invocation =
             Invocation::new(capability, arguments, self.config.limits.default_timeout);
         invocation.progress = progress_token;
@@ -1974,34 +1930,12 @@ impl Daemon {
 
     fn install_plugin(
         &mut self,
-        request: &rpc::Request,
+        install: control::Install,
         clock: &Clock,
     ) -> Result<Status, ProblemError> {
-        let path = request
-            .params
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ProblemError::new(Problem::Internal, "plugin.install requires path"))?;
-        let strategy = match Strategy::parse(
-            request
-                .params
-                .get("strategy")
-                .and_then(Value::as_str)
-                .unwrap_or("replace"),
-        ) {
-            Some(strategy) => strategy,
-            None => {
-                return Err(ProblemError::new(
-                    Problem::UnknownStrategy,
-                    "unknown strategy",
-                ))
-            }
-        };
-        let allow_hooks = request
-            .params
-            .get("allowHooks")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let path = install.path.as_str();
+        let strategy = install.strategy;
+        let allow_hooks = install.allow_hooks;
 
         // Everything that can reject the package runs before anything is
         // stopped or written: a bad package must leave the installed version
@@ -2134,36 +2068,12 @@ impl Daemon {
 
     fn install_staged(
         &mut self,
-        request: &rpc::Request,
+        install: control::Install,
         clock: &Clock,
     ) -> Result<Status, ProblemError> {
-        let path = request
-            .params
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ProblemError::new(Problem::Internal, "plugin.install_staged requires path")
-            })?;
-        let strategy = match Strategy::parse(
-            request
-                .params
-                .get("strategy")
-                .and_then(Value::as_str)
-                .unwrap_or("replace"),
-        ) {
-            Some(strategy) => strategy,
-            None => {
-                return Err(ProblemError::new(
-                    Problem::UnknownStrategy,
-                    "unknown strategy",
-                ))
-            }
-        };
-        let allow_hooks = request
-            .params
-            .get("allowHooks")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let path = install.path.as_str();
+        let strategy = install.strategy;
+        let allow_hooks = install.allow_hooks;
 
         let staging = Path::new(path).canonicalize().map_err(|error| {
             ProblemError::new(
@@ -2198,7 +2108,7 @@ impl Daemon {
         )?;
         let id = staged.manifest.name.clone();
         let version = staged.manifest.version.clone();
-        if let Some(requested) = request.params.get("id").and_then(Value::as_str) {
+        if let Some(requested) = install.expected_id.as_deref() {
             if requested != id {
                 return Err(ProblemError::new(
                     Problem::Internal,
@@ -2206,7 +2116,7 @@ impl Daemon {
                 ));
             }
         }
-        if let Some(requested) = request.params.get("version").and_then(Value::as_str) {
+        if let Some(requested) = install.expected_version.as_deref() {
             if requested != version {
                 return Err(ProblemError::new(
                     Problem::Internal,
@@ -2301,19 +2211,10 @@ impl Daemon {
 
     fn uninstall_plugin(
         &mut self,
-        request: &rpc::Request,
+        id: &str,
+        purge: bool,
         clock: &Clock,
     ) -> Result<(), ProblemError> {
-        let id = request
-            .params
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ProblemError::new(Problem::Internal, "plugin.uninstall requires id"))?;
-        let purge = request
-            .params
-            .get("purge")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
         let service = self.registry.get(id).ok_or_else(|| {
             ProblemError::new(Problem::UnknownPlugin, format!("unknown plugin: {}", id))
         })?;
@@ -2764,23 +2665,6 @@ fn status_detail(output: &str, status: Option<std::process::ExitStatus>) -> Stri
         (false, Some(status)) => format!("{} ({})", text, status),
         (false, None) => text,
     }
-}
-
-#[allow(clippy::result_large_err)] // The response is the wire value; boxing it would only move the cost.
-fn param_id(request: &rpc::Request) -> Result<String, rpc::Response> {
-    request
-        .params
-        .get("id")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| {
-            rpc::err_data(
-                request.id.clone(),
-                -32602,
-                "missing id",
-                Problem::Invalid.error_data(),
-            )
-        })
 }
 
 fn start_layers(registry: &Registry, ids: &[String]) -> Result<Vec<Vec<String>>, ProblemError> {
@@ -3734,11 +3618,9 @@ while ($null -ne [Console]::In.ReadLine()) { }
         let mut cursor = None;
         let mut total = 0usize;
         loop {
-            let params = match &cursor {
-                Some(cursor) => json!({"limit": 100, "cursor": cursor}),
-                None => json!({"limit": 100}),
-            };
-            let page = daemon.tools_page(&params).expect("page");
+            let page = daemon
+                .tools_page(cursor.as_deref(), Some(100))
+                .expect("page");
             let tools = page["tools"].as_array().expect("tools");
             assert!(!tools.is_empty());
             assert!(
@@ -3764,7 +3646,7 @@ while ($null -ne [Console]::In.ReadLine()) { }
         let (_sender, receiver) = mpsc::channel();
         let mut daemon = Daemon::new(registry, receiver, None);
 
-        let first = daemon.tools_page(&json!({"limit": 2})).expect("first page");
+        let first = daemon.tools_page(None, Some(2)).expect("first page");
         assert_eq!(first["tools"].as_array().expect("tools").len(), 2);
         assert!(
             first.get("nextCursor").is_none(),
@@ -3773,13 +3655,13 @@ while ($null -ne [Console]::In.ReadLine()) { }
         let cursor = first["next"].as_str().expect("next cursor").to_string();
 
         let second = daemon
-            .tools_page(&json!({"limit": 2, "cursor": cursor}))
+            .tools_page(Some(&cursor), Some(2))
             .expect("second page");
         assert_eq!(second["tools"].as_array().expect("tools").len(), 1);
         assert!(second.get("next").is_none());
 
         let stale = daemon
-            .tools_page(&json!({"limit": 2, "cursor": "bm90LWEtY3Vyc29y"}))
+            .tools_page(Some("bm90LWEtY3Vyc29y"), Some(2))
             .expect_err("invalid cursor");
         assert_eq!(stale.problem, Problem::Invalid);
         assert!(stale.detail().contains("cursor"), "{stale}");
@@ -3788,12 +3670,12 @@ while ($null -ne [Console]::In.ReadLine()) { }
         use base64::Engine;
         let wrong_version = URL_SAFE_NO_PAD.encode("999:0");
         let stale = daemon
-            .tools_page(&json!({"limit": 2, "cursor": wrong_version}))
+            .tools_page(Some(&wrong_version), Some(2))
             .expect_err("version mismatch");
         assert_eq!(stale.problem, Problem::Internal);
         let past_end = URL_SAFE_NO_PAD.encode(format!("{}:99", daemon.catalog_version));
         let stale = daemon
-            .tools_page(&json!({"limit": 2, "cursor": past_end}))
+            .tools_page(Some(&past_end), Some(2))
             .expect_err("past end");
         assert_eq!(stale.problem, Problem::Internal);
     }
