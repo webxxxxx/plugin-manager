@@ -893,7 +893,7 @@ fn pem_body<'a>(text: &'a str, label: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manage::package::tempdir::TempDir;
+    use crate::manage::test_support::tempdir::TempDir;
     use ed25519_dalek::Signature;
     use std::fs;
 

@@ -199,3 +199,51 @@ pub(crate) fn config_lock() -> MutexGuard<'static, ()> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::failure::Problem;
+    use crate::manage::model::layout::{active_config, plugin_dir};
+    use crate::manage::test_support::*;
+
+    #[test]
+    fn replace_config_writes_last_good_and_checks_candidates() {
+        make_plugin("plain", "old", false);
+        let active = active_config(paths(), "plain").expect("active");
+        assert_eq!(std::fs::read(&active).expect("read"), b"old");
+        replace_config(paths(), "plain", b"new", false).expect("replace");
+        assert_eq!(std::fs::read(&active).expect("read"), b"new");
+        assert_eq!(
+            std::fs::read(plugin_dir(paths(), "plain").join("config.last-good"))
+                .expect("last-good"),
+            b"old"
+        );
+    }
+
+    #[test]
+    fn config_check_rejects_a_bad_candidate_and_keeps_the_active_one() {
+        make_plugin("checked", "old", true);
+        replace_config(paths(), "checked", b"good config", true).expect("good");
+        let error = replace_config(paths(), "checked", b"bad config", true).expect_err("bad");
+        assert!(error.detail().contains("configCheck"), "{error}");
+        assert_eq!(error.problem, Problem::Conflict);
+        assert_eq!(
+            std::fs::read(active_config(paths(), "checked").expect("active")).expect("read"),
+            b"good config"
+        );
+    }
+
+    #[test]
+    fn a_config_refusal_carries_its_status_family() {
+        make_plugin("families", "old", false);
+
+        let error =
+            replace_config(paths(), "no-such-plugin", b"x", false).expect_err("unknown plugin");
+        assert_eq!(error.problem, Problem::UnknownPlugin);
+
+        let oversized = vec![b'x'; 1024 * 1024 + 1];
+        let error = replace_config(paths(), "families", &oversized, false).expect_err("too large");
+        assert_eq!(error.problem, Problem::TooLarge);
+    }
+}

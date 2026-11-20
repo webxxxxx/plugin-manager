@@ -141,3 +141,30 @@ fn verify_package(
         interpreter,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hooks_are_allowed_by_default_only_with_the_http_feature() {
+        assert!(hooks_allowed(true));
+        assert_eq!(hooks_allowed(false), cfg!(feature = "http"));
+    }
+
+    #[test]
+    fn replace_plan_decides_from_free_old_and_new_sizes() {
+        // Fresh installs need the whole package to fit.
+        assert_eq!(replace_plan(100, None, 100), ReplacePlan::Fresh);
+        assert_eq!(replace_plan(99, None, 100), ReplacePlan::NoSpace);
+        // A backup is only safe while the new copy also fits next to the old one.
+        assert_eq!(replace_plan(100, Some(80), 100), ReplacePlan::Backup);
+        assert_eq!(replace_plan(150, Some(1), 100), ReplacePlan::Backup);
+        // Reclaiming the old version is the fallback when both copies cannot coexist.
+        assert_eq!(replace_plan(99, Some(80), 100), ReplacePlan::Reclaim);
+        assert_eq!(replace_plan(20, Some(80), 100), ReplacePlan::Reclaim);
+        assert_eq!(replace_plan(19, Some(80), 100), ReplacePlan::NoSpace);
+        assert_eq!(replace_plan(0, Some(100), 100), ReplacePlan::Reclaim);
+        assert_eq!(replace_plan(0, Some(98), 100), ReplacePlan::NoSpace);
+    }
+}

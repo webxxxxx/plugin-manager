@@ -563,3 +563,27 @@ pub trait TarSink {
     fn entry_data(&mut self, data: &[u8]) -> Result<(), ProblemError>;
     fn entry_end(&mut self) -> Result<(), ProblemError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_body_over_the_package_limit_is_too_large() {
+        struct Sink;
+        impl TarSink for Sink {
+            fn entry_start(&mut self, _entry: &StreamEntry) -> Result<(), ProblemError> {
+                Ok(())
+            }
+            fn entry_data(&mut self, _data: &[u8]) -> Result<(), ProblemError> {
+                Ok(())
+            }
+            fn entry_end(&mut self) -> Result<(), ProblemError> {
+                Ok(())
+            }
+        }
+        let mut feed = TarFeed::new(8);
+        let error = feed.feed(&[0u8; 16], &mut Sink).expect_err("over limit");
+        assert_eq!(error.problem, Problem::TooLarge);
+    }
+}
