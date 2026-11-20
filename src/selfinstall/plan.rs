@@ -199,7 +199,7 @@ pub(crate) fn default_conf_text(layout: &Layout) -> String {
          # max_streams = 8 / 16 / 64\n\
          # stream_buffer_bytes = 8192 / 32768 / 131072\n\
          # max_connections = 24 / 128 / 682\n\
-         # max_connections_per_ip = 8 / 32 / 64\n\
+         # max_connections_per_ip = 6 / 32 / 170\n\
          # max_subscriptions = 4 / 16 / 64\n\
          # max_subscribers_per_plugin = 4 / 16 / 64\n\
          # http_idle_timeout_secs = 30 / 60 / 120\n\

@@ -1093,6 +1093,9 @@ mod tests {
             // 512 connections at 8 MiB each never fit a 2 GiB budget.
             ("max_complete_body_bytes", [128 * KIB, MIB, 8 * MIB]),
             ("max_connections", [32, 128, 512]),
+            // Historical 8 / 32 / 64. The relationship (a quarter of the
+            // connection budget) is what survived; the numbers follow it.
+            ("max_connections_per_ip", [8, 32, 64]),
             ("max_streams", [8, 16, 64]),
             ("ws_raw_queue", [16, 64, 128]),
         ];
@@ -1104,6 +1107,7 @@ mod tests {
                     "max_json_body_bytes" => derived.limits.max_json_body,
                     "max_complete_body_bytes" => derived.limits.max_complete_body,
                     "max_connections" => derived.limits.max_connections as u64,
+                    "max_connections_per_ip" => derived.limits.max_connections_per_ip as u64,
                     "max_streams" => derived.limits.max_streams as u64,
                     "ws_raw_queue" => derived.limits.ws_raw_queue as u64,
                     other => panic!("no accessor for {other}"),

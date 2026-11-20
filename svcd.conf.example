@@ -116,7 +116,7 @@ bind = 127.0.0.1:8787
 #   max_json_body_bytes          65536        262144              1048576
 #   max_complete_body_bytes      65536        1048576             2097152
 #   max_connections              24           128                 682
-#   max_connections_per_ip       8            32                  64
+#   max_connections_per_ip       6            32                  170
 #   max_streams                  8            16                  64
 #   stream_buffer_bytes          8192         32768               131072
 #   ws_inflight_bytes            2097152      8388608             67108864
