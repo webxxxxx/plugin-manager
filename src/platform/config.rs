@@ -268,9 +268,11 @@ mod tests {
 
     #[test]
     fn a_config_keeps_the_document_the_path_and_the_derived_limits() {
-        let mut settings = Settings::default();
-        settings.http_idle_timeout_secs = Some(7);
-        settings.config_dir = Some(PathBuf::from("/etc/svcd"));
+        let settings = Settings {
+            http_idle_timeout_secs: Some(7),
+            config_dir: Some(PathBuf::from("/etc/svcd")),
+            ..Settings::default()
+        };
         let config = Config::with_paths(
             settings,
             Some(PathBuf::from("/etc/svcd/svcd.conf")),

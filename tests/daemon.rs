@@ -1207,7 +1207,7 @@ fn process_start_time(pid: u32) -> Option<u64> {
         use windows_sys::Win32::System::Threading::{
             GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
         };
-        // Safe: the handle is closed before returning and every pointer below
+        // SAFETY: the handle is closed before returning and every pointer below
         // names a live `FILETIME`.
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
@@ -1223,7 +1223,7 @@ fn process_start_time(pid: u32) -> Option<u64> {
             if ok == 0 {
                 return None;
             }
-            return Some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64);
+            Some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
         }
     }
     #[cfg(target_os = "linux")]

@@ -496,6 +496,8 @@ fn physical_memory() -> Option<(u64, u64)> {
     // `dwLength` bytes we declare, and we read only the two ull fields.
     let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: `status` is a valid, fully initialized `MEMORYSTATUSEX` and
+    // `dwLength` names exactly its size.
     let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
     if ok == 0 {
         return None;

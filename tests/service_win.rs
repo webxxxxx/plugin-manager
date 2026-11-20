@@ -137,6 +137,8 @@ fn wait_for_state(name: &str, wanted: &str, timeout: Duration) -> bool {
 }
 
 fn is_elevated() -> bool {
+    // SAFETY: `GetCurrentProcess` is a pseudo-handle, and the token handle is
+    // closed by `CloseHandle` before returning.
     unsafe {
         let mut token: HANDLE = std::ptr::null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {

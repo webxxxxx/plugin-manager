@@ -1694,7 +1694,7 @@ fn test_reply_sink(
             })
             .to_string(),
         };
-        let _ = reply.send(line);
+        reply.send(line);
     })
 }
 

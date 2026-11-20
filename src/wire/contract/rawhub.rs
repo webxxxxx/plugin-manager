@@ -677,9 +677,11 @@ mod tests {
 
     #[test]
     fn pending_payload_counters_are_balanced() {
-        let mut settings = crate::platform::settings::Settings::default();
-        settings.ws_inflight_bytes = Some(64 * 1024);
-        settings.ws_inflight_requests = Some(4);
+        let settings = crate::platform::settings::Settings {
+            ws_inflight_bytes: Some(64 * 1024),
+            ws_inflight_requests: Some(4),
+            ..Default::default()
+        };
         let hub = RawHub::new(Arc::new(crate::platform::limits::derive(&settings).limits));
         assert!(hub.reserve(1024).is_ok());
         assert_eq!(hub.inflight_bytes.load(Ordering::SeqCst), 1024);

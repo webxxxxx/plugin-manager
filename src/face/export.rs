@@ -469,9 +469,7 @@ mod tests {
         let head = text(&bytes);
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
         assert!(head.contains("Content-Type: application/octet-stream\r\n"));
-        assert!(head.contains(&format!(
-            "Content-Disposition: attachment; filename=\"demo-1.0.0.spk\"\r\n"
-        )));
+        assert!(head.contains("Content-Disposition: attachment; filename=\"demo-1.0.0.spk\"\r\n"));
         assert!(head.contains("Cache-Control: no-store\r\n"));
         assert!(
             head.contains(&format!("Content-Length: {}\r\n", expected.len())),
