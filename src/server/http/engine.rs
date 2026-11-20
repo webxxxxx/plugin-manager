@@ -634,7 +634,8 @@ pub fn keep_alive_response(mut response: Vec<u8>) -> Vec<u8> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    const M: usize = crate::platform::limits::MAX_HEADER;
+    // Large enough for the request heads these cases build.
+    const M: usize = 64 * 1024;
 
     use super::*;
 

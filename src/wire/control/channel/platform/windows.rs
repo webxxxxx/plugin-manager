@@ -346,7 +346,7 @@ fn serve_connection(
             }
         };
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        // The supervisor queue is bounded (`PENDING_QUEUE_LIMIT`). Windows has
+        // The supervisor queue is bounded (`limits.pending_queue`). Windows has
         // one thread per control connection, so a full queue blocks that
         // connection's thread here: that is the fallback's backpressure, with
         // no unbounded growth. Unix answers the same condition with -32000 on

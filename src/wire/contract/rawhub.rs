@@ -680,7 +680,7 @@ mod tests {
         let mut settings = crate::platform::settings::Settings::default();
         settings.ws_inflight_bytes = Some(64 * 1024);
         settings.ws_inflight_requests = Some(4);
-        let hub = RawHub::new(Arc::new(crate::platform::limits::derive(&settings)));
+        let hub = RawHub::new(Arc::new(crate::platform::limits::derive(&settings).limits));
         assert!(hub.reserve(1024).is_ok());
         assert_eq!(hub.inflight_bytes.load(Ordering::SeqCst), 1024);
         hub.release(1024);

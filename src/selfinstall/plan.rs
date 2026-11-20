@@ -165,13 +165,20 @@ pub(crate) fn default_conf_text(layout: &Layout) -> String {
          temp_dir = {}\n\
          temp_retention_secs = 7200\n\
          temp_cleanup_interval_secs = 300\n\
-         # Optional resource limits. MEM_LEVEL (low|middle|high, default high)\n\
-         # supplies the built-in defaults. Values below are comments only;\n\
-         # uncomment to override. low / middle / high defaults:\n\
+         # Optional resource limits. On every start svcd derives a memory\n\
+         # budget from this machine (free memory, the cgroup v2 limit, CPU\n\
+         # count) and spends it according to a workload shape. MEM_LEVEL\n\
+         # (low|middle|high, default high) is the ceiling the budget can never\n\
+         # exceed: 128 MiB / 512 MiB / 2 GiB. Values below are comments only;\n\
+         # uncomment to override. Expected values at each shape's reference\n\
+         # budget (tiny@128MiB, interactive@512MiB, streaming@2GiB):\n\
          # logs_dir = /var/log/svcd\n\
          # log_max_bytes = 65536 / 65536 / 65536\n\
          # log_rotations = 3 / 3 / 3\n\
          # log_to_file = on\n\
+         # mem_budget_bytes = auto (25% of free memory, capped by MEM_LEVEL)\n\
+         # workload = tiny | interactive | streaming (default: from the budget,\n\
+         #   below 2 GiB of budget is interactive, below 512 MiB is tiny)\n\
          # request_stack_bytes = 131072 / 196608 / 262144\n\
          # io_stack_bytes = 65536 / 98304 / 131072\n\
          # blocking_threads = 2 (default; clamped 2..8). The blocking pool\n\
@@ -183,11 +190,11 @@ pub(crate) fn default_conf_text(layout: &Layout) -> String {
          # is an operator choice.\n\
          # max_body_bytes = 8388608 / 67108864 / 536870912\n\
          # max_json_body_bytes = 65536 / 262144 / 1048576\n\
-         # max_complete_body_bytes = 131072 / 1048576 / 8388608\n\
+         # max_complete_body_bytes = 65536 / 1048576 / 2097152\n\
          # max_header_bytes = 8192 / 16384 / 65536\n\
          # max_streams = 8 / 16 / 64\n\
-         # stream_buffer_bytes = 16384 / 32768 / 65536\n\
-         # max_connections = 32 / 128 / 512\n\
+         # stream_buffer_bytes = 8192 / 32768 / 131072\n\
+         # max_connections = 24 / 128 / 682\n\
          # max_connections_per_ip = 8 / 32 / 64\n\
          # max_subscriptions = 4 / 16 / 64\n\
          # max_subscribers_per_plugin = 4 / 16 / 64\n\
@@ -202,11 +209,21 @@ pub(crate) fn default_conf_text(layout: &Layout) -> String {
          # max_timeout = 300000 / 300000 / 300000\n\
          # ws_max_message_bytes = 1048576 / 1048576 / 1048576\n\
          # ws_inflight_bytes = 2097152 / 8388608 / 67108864\n\
-         # ws_inflight_requests = 4 / 16 / 64\n\
+         # ws_inflight_requests = 4 / 16 / 128\n\
          # ws_buffer_shrink_bytes = 65536\n\
          # ws_raw_enabled = on\n\
          # ws_raw_max_bytes = 1048576\n\
-         # ws_raw_queue = 16 / 64 / 128\n\
+         # ws_raw_queue = 8 / 32 / 128\n\
+         # pending_queue = 32 / 128 / 512 (management requests queued between\n\
+         #   the server loop and the supervisor loop)\n\
+         # progress_queue = 16 / 64 / 256 (progress events queued for one MCP\n\
+         #   stream)\n\
+         # A value outside [absolute floor, min(share x budget, absolute\n\
+         # ceiling)] is rewritten and logged as an override; the worst case is\n\
+         # checked against the budget before serving, and a configuration that\n\
+         # cannot fit refuses to start. `svc config tune` prints the\n\
+         # configuration this machine suggests; `svc status --resources` shows\n\
+         # what the last start ran with.\n\
          # ws_raw_* gate the protocol-3 raw transport; on Windows /raw answers\n\
          # 501 not_supported. See svcd.conf.example for the full semantics.\n\
          # On Windows the HTTP fallback keeps one thread per admitted\n\

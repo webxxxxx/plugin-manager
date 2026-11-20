@@ -39,11 +39,6 @@ pub enum ProgressEvent {
     Error(String),
 }
 
-/// Bound on queued management requests between the server loop and the
-/// supervisor loop. A full queue is a visible error, not memory growth; each
-/// control connection has at most one request in flight.
-pub const PENDING_QUEUE_LIMIT: usize = 256;
-
 pub struct PendingCall {
     pub line: String,
     pub reply: Reply,

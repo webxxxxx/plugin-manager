@@ -8,10 +8,12 @@ use crate::cli::client::{
     self, EXIT_DAEMON_UNREACHABLE, EXIT_NOT_FOUND, EXIT_OK, EXIT_SERVICE_ERROR, EXIT_USAGE,
 };
 use crate::cli::status;
+use crate::cli::tune;
 use crate::kernel::projection::Status;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::platform::config::Config;
 use crate::platform::log;
+use crate::platform::settings;
 use crate::wire::control::channel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +68,15 @@ enum Command {
     Trust {
         action: TrustAction,
     },
+    /// `svc status --resources`: what the last start derived, from the
+    /// snapshot the daemon wrote.
+    Resources {
+        json: bool,
+    },
+    /// `svc config tune`: the configuration this machine suggests.
+    ConfigTune {
+        write: bool,
+    },
 }
 
 pub fn run(args: Vec<String>) -> i32 {
@@ -90,6 +101,8 @@ pub fn run(args: Vec<String>) -> i32 {
         Command::Logs { id, follow, lines } => show_logs(&config, &id, follow, lines),
         Command::Auth { action } => auth_command(&config, action),
         Command::Trust { action } => trust_command(&config, action),
+        Command::Resources { json } => resources_command(&config, json),
+        Command::ConfigTune { write } => config_tune(&config, write),
     }
 }
 
@@ -109,14 +122,23 @@ fn parse(args: &[String]) -> Result<Command, ()> {
         "status" => {
             let mut id = None;
             let mut json = false;
+            let mut resources = false;
             for arg in &args[1..] {
                 if arg == "--json" {
                     json = true;
+                } else if arg == "--resources" {
+                    resources = true;
                 } else if arg.starts_with('-') || id.is_some() {
                     return Err(());
                 } else {
                     id = Some(arg.clone());
                 }
+            }
+            if resources {
+                return match id {
+                    None => Ok(Command::Resources { json }),
+                    Some(_) => Err(()),
+                };
             }
             id.map(|id| Command::Status { id, json }).ok_or(())
         }
@@ -142,6 +164,17 @@ fn parse(args: &[String]) -> Result<Command, ()> {
         "reload" if args.len() == 1 => Ok(Command::Reload),
         "auth" | "lan" => parse_auth(&args[1..]),
         "trust" => parse_trust(&args[1..]),
+        "config" => parse_config(&args[1..]),
+        _ => Err(()),
+    }
+}
+
+fn parse_config(args: &[String]) -> Result<Command, ()> {
+    match args {
+        [action] if action == "tune" => Ok(Command::ConfigTune { write: false }),
+        [action, flag] if action == "tune" && flag == "--write" => {
+            Ok(Command::ConfigTune { write: true })
+        }
         _ => Err(()),
     }
 }
@@ -407,6 +440,56 @@ fn reload(config: &Config) -> i32 {
     EXIT_OK
 }
 
+/// `svc status --resources` reads the snapshot the daemon wrote at startup, so
+/// the numbers are the ones in force rather than a second guess at this
+/// machine. Without a snapshot it falls back to a local derivation and says so.
+fn resources_command(config: &Config, json: bool) -> i32 {
+    let (snapshot, origin) = match crate::platform::limits::read_snapshot(&config.paths) {
+        Ok(snapshot) => (snapshot, "last start"),
+        Err(_) => (
+            config.resources.to_json(),
+            "this process (the daemon left no snapshot; numbers are a local derivation)",
+        ),
+    };
+    if json {
+        match serde_json::to_string_pretty(&snapshot) {
+            Ok(text) => println!("{}", text),
+            Err(error) => {
+                eprintln!("svc: cannot encode the resource report: {}", error);
+                return EXIT_SERVICE_ERROR;
+            }
+        }
+        return EXIT_OK;
+    }
+    print!("{}", tune::resources_text(&snapshot, origin));
+    EXIT_OK
+}
+
+/// `svc config tune` prints (or writes) the configuration this machine
+/// suggests: one key per line with its derivation in the trailing comment.
+fn config_tune(config: &Config, write: bool) -> i32 {
+    let body = tune::config_text(&config.limits, &config.resources);
+    if !write {
+        print!("{}", body);
+        return EXIT_OK;
+    }
+    let Some(path) = config.settings_path.clone() else {
+        eprintln!("svc: no svcd.conf was located; pass --conf or start the daemon once");
+        return EXIT_SERVICE_ERROR;
+    };
+    match settings::upsert_block(&path, tune::BLOCK_BEGIN, tune::BLOCK_END, &body) {
+        Ok(()) => {
+            println!("wrote {} (block {} .. {})", path.display(), tune::BLOCK_BEGIN, tune::BLOCK_END);
+            println!("restart svcd to apply");
+            EXIT_OK
+        }
+        Err(error) => {
+            eprintln!("svc: {}", error);
+            EXIT_SERVICE_ERROR
+        }
+    }
+}
+
 fn compat_show(config: &Config, json: bool) -> i32 {
     let facts = crate::platform::compat::detect(&config.paths, MAX_SCHEMA, MAX_PROTOCOL);
     if json {
@@ -661,6 +744,8 @@ fn usage() {
     eprintln!("       svc lan status|passwd <password>");
     eprintln!("       svc auth ...  (deprecated alias of svc lan)");
     eprintln!("       svc trust list|add <file.pub>|remove <keyId>");
+    eprintln!("       svc status --resources [--json]");
+    eprintln!("       svc config tune [--write]");
 }
 
 #[cfg(test)]
@@ -701,6 +786,32 @@ mod tests {
                 json: true
             }
         );
+    }
+
+    #[test]
+    fn parses_the_resource_and_tuning_views() {
+        assert_eq!(
+            parse(&args(&["status", "--resources"])).expect("resources"),
+            Command::Resources { json: false }
+        );
+        assert_eq!(
+            parse(&args(&["status", "--resources", "--json"])).expect("resources json"),
+            Command::Resources { json: true }
+        );
+        assert_eq!(
+            parse(&args(&["config", "tune"])).expect("tune"),
+            Command::ConfigTune { write: false }
+        );
+        assert_eq!(
+            parse(&args(&["config", "tune", "--write"])).expect("tune write"),
+            Command::ConfigTune { write: true }
+        );
+        // A resource view is not a service status: an id has no meaning there,
+        // and an unknown config action is a usage error.
+        assert!(parse(&args(&["status", "--resources", "demo"])).is_err());
+        assert!(parse(&args(&["config"])).is_err());
+        assert!(parse(&args(&["config", "apply"])).is_err());
+        assert!(parse(&args(&["config", "tune", "--force"])).is_err());
     }
 
     #[test]

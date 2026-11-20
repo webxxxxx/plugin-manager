@@ -15,6 +15,7 @@ pub mod host;
 pub mod limits;
 pub mod log;
 pub mod paths;
+pub mod resources;
 pub mod settings;
 pub mod storage;
 #[cfg(test)]
