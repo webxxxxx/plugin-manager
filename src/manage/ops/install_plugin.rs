@@ -39,6 +39,7 @@ pub fn install_staged(
     strategy: Strategy,
     opt_in_hooks: bool,
     host_interpreter: Option<Interpreter>,
+    poll: &mut dyn FnMut(),
 ) -> Result<Service, ProblemError> {
     let id = staged.manifest.name.clone();
     if id == RESERVED_ID {
@@ -69,6 +70,7 @@ pub fn install_staged(
             &plugin_dir,
             was_installed,
             host_interpreter.as_ref(),
+            poll,
         ),
         Strategy::Replace => install_replace_staged(
             paths,
@@ -78,10 +80,12 @@ pub fn install_staged(
             &plugin_dir,
             was_installed,
             host_interpreter.as_ref(),
+            poll,
         ),
     }
 }
 
+#[allow(clippy::too_many_arguments)] // The strategy split already carries every install input.
 fn install_keep_old_staged(
     paths: &Paths,
     limits: &crate::platform::limits::Limits,
@@ -90,6 +94,7 @@ fn install_keep_old_staged(
     plugin_dir: &Path,
     was_installed: bool,
     interpreter: Option<&Interpreter>,
+    poll: &mut dyn FnMut(),
 ) -> Result<Service, ProblemError> {
     let manifest = staged.manifest.clone();
     let (version_dir, enabled) = commit_staged(staged, plugin_dir, was_installed)?;
@@ -103,10 +108,11 @@ fn install_keep_old_staged(
         enabled,
         interpreter,
     )?;
-    run_post_install_manifest(paths, limits, &manifest, id, &version_dir)?;
+    run_post_install_manifest(paths, limits, &manifest, id, &version_dir, poll)?;
     Ok(service)
 }
 
+#[allow(clippy::too_many_arguments)] // The strategy split already carries every install input.
 fn install_replace_staged(
     paths: &Paths,
     limits: &crate::platform::limits::Limits,
@@ -115,6 +121,7 @@ fn install_replace_staged(
     plugin_dir: &Path,
     was_installed: bool,
     interpreter: Option<&Interpreter>,
+    poll: &mut dyn FnMut(),
 ) -> Result<Service, ProblemError> {
     let manifest = staged.manifest.clone();
     let old_version =
@@ -146,7 +153,7 @@ fn install_replace_staged(
             enabled,
             interpreter,
         )?;
-        run_post_install_manifest(paths, limits, &manifest, id, &version_dir)?;
+        run_post_install_manifest(paths, limits, &manifest, id, &version_dir, poll)?;
         Ok(service)
     })();
     match result {
@@ -254,6 +261,7 @@ fn run_post_install_manifest(
     manifest: &package::Manifest,
     id: &str,
     version_dir: &Path,
+    poll: &mut dyn FnMut(),
 ) -> Result<(), ProblemError> {
     let Some(path) = manifest
         .hooks
@@ -273,7 +281,7 @@ fn run_post_install_manifest(
         },
         paths,
         limits,
-        &mut hook::poll_this_loop,
+        poll,
     )
     .map_err(|error| {
         ProblemError::new(
@@ -346,6 +354,7 @@ pub fn install_package(
     strategy: Strategy,
     opt_in_hooks: bool,
     host_interpreter: Option<Interpreter>,
+    poll: &mut dyn FnMut(),
 ) -> Result<Service, InstallFailure> {
     let id = package.manifest.name.clone();
     if id == RESERVED_ID {
@@ -375,6 +384,7 @@ pub fn install_package(
             &plugin_dir,
             was_installed,
             host_interpreter.as_ref(),
+            poll,
         ),
         Strategy::Replace => install_replace(
             paths,
@@ -384,11 +394,13 @@ pub fn install_package(
             &plugin_dir,
             was_installed,
             host_interpreter.as_ref(),
+            poll,
         )
         .map_err(InstallFailure::from),
     }
 }
 
+#[allow(clippy::too_many_arguments)] // The strategy split already carries every install input.
 fn install_keep_old(
     paths: &Paths,
     limits: &crate::platform::limits::Limits,
@@ -397,6 +409,7 @@ fn install_keep_old(
     plugin_dir: &Path,
     was_installed: bool,
     interpreter: Option<&Interpreter>,
+    poll: &mut dyn FnMut(),
 ) -> Result<Service, InstallFailure> {
     // No hook-specific rollback here: keep-old keeps the previous version and
     // switches `current`, so a failing post-install just reports the error.
@@ -423,7 +436,7 @@ fn install_keep_old(
         enabled,
         interpreter,
     )?;
-    run_post_install(paths, limits, package, id, &version_dir)?;
+    run_post_install(paths, limits, package, id, &version_dir, poll)?;
     Ok(service)
 }
 
@@ -433,6 +446,7 @@ fn run_post_install(
     package: &Package,
     id: &str,
     version_dir: &Path,
+    poll: &mut dyn FnMut(),
 ) -> Result<(), ProblemError> {
     let Some(path) = package
         .manifest
@@ -453,7 +467,7 @@ fn run_post_install(
         },
         paths,
         limits,
-        &mut hook::poll_this_loop,
+        poll,
     )
     .map_err(|error| {
         ProblemError::new(
@@ -463,6 +477,7 @@ fn run_post_install(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // The strategy split already carries every install input.
 fn install_replace(
     paths: &Paths,
     limits: &crate::platform::limits::Limits,
@@ -471,6 +486,7 @@ fn install_replace(
     plugin_dir: &Path,
     was_installed: bool,
     interpreter: Option<&Interpreter>,
+    poll: &mut dyn FnMut(),
 ) -> Result<Service, ProblemError> {
     let old_version =
         current_version(paths, id).filter(|version| plugin_dir.join(version).is_dir());
@@ -525,7 +541,7 @@ fn install_replace(
                 enabled,
                 interpreter,
             )?;
-            run_post_install(paths, limits, package, id, &version_dir)?;
+            run_post_install(paths, limits, package, id, &version_dir, poll)?;
             Ok(service)
         });
 
