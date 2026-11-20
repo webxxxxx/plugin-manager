@@ -365,10 +365,14 @@ impl Supervisor {
     pub(crate) fn stop_all(&mut self, clock: &Clock) {
         let started = Instant::now();
         let ids: Vec<String> = self.slots.keys().cloned().collect();
-        let layers = self
-            .registry
-            .start_layers(&ids)
-            .unwrap_or_else(|_| vec![ids]);
+        let (layers, forced) = shutdown_layers(&self.registry, ids);
+        if forced {
+            for slot in self.slots.values_mut() {
+                if !matches!(slot.machine.state, State::Stopped | State::Failed) {
+                    slot.signal_force("the dependency graph is inconsistent at shutdown");
+                }
+            }
+        }
         let global_deadline = clock
             .now()
             .mono_ms
@@ -430,5 +434,66 @@ impl Supervisor {
             }
         }
         log::note_slow("stop_all", started);
+    }
+}
+/// Shutdown order for every live slot. A cycle cannot survive the registry
+/// door, but if one is ever there, logging it and forcing everything down in
+/// one layer beats the old silent `unwrap_or_else(|_| vec![ids])`.
+fn shutdown_layers(registry: &Registry, ids: Vec<String>) -> (Vec<Vec<String>>, bool) {
+    match registry.start_layers(&ids) {
+        Ok(layers) => (layers, false),
+        Err(error) => {
+            log::svcd(&format!(
+                "svcd: shutdown: {}; stopping every service in one layer",
+                error
+            ));
+            (vec![ids], true)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::registry::{contract_for, Carrier, Exec, Ready, Restart, Service};
+
+    fn slot_backed(id: &str, deps: &[&str]) -> Service {
+        let limits = crate::platform::limits::test_default();
+        let mut service = Service::builtin_svc(&limits);
+        service.id = id.into();
+        service.contract = contract_for(
+            id,
+            &service.version,
+            service.contract.surface().to_vec(),
+            Carrier::Slot,
+            &limits,
+        );
+        service.impl_ref = None;
+        service.exec = Some(Exec {
+            path: "/bin/true".into(),
+            args: Vec::new(),
+            env: Default::default(),
+            ready: Ready::Exec,
+            interpreter: None,
+        });
+        service.deps = deps.iter().map(|dep| dep.to_string()).collect();
+        service.restart = Restart::OnFailure;
+        service
+    }
+
+    #[test]
+    fn a_dependency_cycle_is_reported_instead_of_silently_collapsing_to_one_layer() {
+        let mut registry = Registry::new();
+        registry.insert(slot_backed("a", &["b"])).expect("a");
+        registry.insert(slot_backed("b", &["a"])).expect("b");
+
+        let (layers, forced) = shutdown_layers(&registry, vec!["a".into(), "b".into()]);
+
+        assert!(forced, "the cycle must be reported");
+        assert_eq!(
+            layers,
+            vec![vec!["a".to_string(), "b".to_string()]],
+            "every service still gets a stop pass"
+        );
     }
 }
