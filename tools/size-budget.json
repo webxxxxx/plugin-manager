@@ -1,5 +1,5 @@
 {
-  "$comment": "存量超预算文件白名单；值只能降不能升（#239）。新增文件超过 700 生产行 / 1,200 总行直接红。",
+  "$comment": "存量超预算文件白名单；值只能降不能升（#239）。新增文件超过 700 生产行 / 1,200 总行直接红；外置 tests.rs 的生产行按 0 计。",
   "files": {
     "src/cli/plugin.rs": {
       "production": 1028,
@@ -10,16 +10,16 @@
       "total": 993
     },
     "src/daemon/tests.rs": {
-      "production": 1704,
+      "production": 0,
       "total": 1704
-    },
-    "src/face/blob_upload.rs": {
-      "production": 736,
-      "total": 1037
     },
     "src/face/blob.rs": {
       "production": 754,
       "total": 1249
+    },
+    "src/face/blob_upload.rs": {
+      "production": 736,
+      "total": 1037
     },
     "src/face/install.rs": {
       "production": 1237,
@@ -36,10 +36,6 @@
     "src/manage/ops/bundle.rs": {
       "production": 892,
       "total": 894
-    },
-    "src/manage/ops/bundle/tests.rs": {
-      "production": 851,
-      "total": 851
     },
     "src/manage/ops/install_plugin.rs": {
       "production": 840,
@@ -60,10 +56,6 @@
     "src/server/http/server.rs": {
       "production": 1039,
       "total": 1171
-    },
-    "src/supervise/model/definition/tests.rs": {
-      "production": 841,
-      "total": 841
     },
     "src/supervise/ops/slot.rs": {
       "production": 1700,

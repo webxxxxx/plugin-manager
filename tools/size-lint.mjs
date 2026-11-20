@@ -91,31 +91,58 @@ function loadBudget(path) {
   return { files };
 }
 
+const CFG_TEST_LINE = /^\s*#\[cfg\(.*\btest\b.*\)\]\s*(?:\/\/.*)?$/;
+
+/** cfg(test) 与 mod tests 之间允许空行/注释/属性；遇到代码就停。 */
+function nextCodeLine(lines, start) {
+  let next = start;
+  while (
+    next < lines.length &&
+    (/^\s*$/.test(lines[next]) ||
+      /^\s*\/\//.test(lines[next]) ||
+      /^\s*#\[/.test(lines[next]))
+  ) {
+    next += 1;
+  }
+  return next;
+}
+
 /**
  * 生产行 = 文件总行数减去内联测试模块（`#[cfg(test)]` / `#[cfg(all(test, ...))]`
- * 后接 `mod tests`）及其后的所有内容。外置 `mod tests;` 的文件本身就是测试
- * 文件，没有内联分界，生产行按全文计——它们同样受总行数预算约束。
+ * 后接 `mod tests`）及其后的所有内容。
+ * 外置测试文件（父模块只写 `#[cfg(test)] mod tests;`）生产行为 0，总行数照常计入。
  */
-function measureSource(text) {
+function measureSource(text, testOnly = false) {
   const lines = text.split(/\r?\n/);
   const total = lines.length > 0 && lines[lines.length - 1] === "" ? lines.length - 1 : lines.length;
+  if (testOnly) return { production: 0, total };
   for (let index = 0; index < lines.length; index += 1) {
-    if (!/^\s*#\[cfg\(.*\btest\b.*\)\]\s*(?:\/\/.*)?$/.test(lines[index])) continue;
-    let next = index + 1;
-    // 属性/注释可以夹在 cfg 与 mod 之间（如 #[allow(...)]），但遇到代码就停。
-    while (
-      next < lines.length &&
-      (/^\s*$/.test(lines[next]) ||
-        /^\s*\/\//.test(lines[next]) ||
-        /^\s*#\[/.test(lines[next]))
-    ) {
-      next += 1;
-    }
+    if (!CFG_TEST_LINE.test(lines[index])) continue;
+    const next = nextCodeLine(lines, index + 1);
     if (next < lines.length && /^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+tests\b/.test(lines[next])) {
       return { production: index, total };
     }
   }
   return { production: total, total };
+}
+
+/** `mod tests;` 的落点：`foo.rs` → `foo/tests.rs`，`foo/mod.rs` → `foo/tests.rs`。 */
+function externalTestsPath(file) {
+  if (file.endsWith("/mod.rs")) return file.slice(0, -"mod.rs".length) + "tests.rs";
+  return file.slice(0, -".rs".length) + "/tests.rs";
+}
+
+/** 父模块里出现 `#[cfg(test)] mod tests;` 即认定外置测试文件。 */
+function declaresExternalTests(text) {
+  const lines = text.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!CFG_TEST_LINE.test(lines[index])) continue;
+    const next = nextCodeLine(lines, index + 1);
+    if (next < lines.length && /^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+tests\s*;/.test(lines[next])) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function collectSources(srcDir) {
@@ -139,11 +166,19 @@ function sourceKey(srcDir, full) {
 function evaluate(srcDir, budget) {
   const rows = [];
   const violations = [];
-  const seen = new Set();
+  const sources = new Map();
   for (const full of collectSources(srcDir)) {
-    const file = sourceKey(srcDir, full);
-    seen.add(file);
-    const { production, total } = measureSource(readFileSync(full, "utf8"));
+    sources.set(sourceKey(srcDir, full), readFileSync(full, "utf8"));
+  }
+  // 外置测试文件由父模块的 `#[cfg(test)] mod tests;` 声明，生产行按 0 计。
+  const testOnly = new Set();
+  for (const [file, text] of sources) {
+    if (!declaresExternalTests(text)) continue;
+    const target = externalTestsPath(file);
+    if (sources.has(target)) testOnly.add(target);
+  }
+  for (const [file, text] of sources) {
+    const { production, total } = measureSource(text, testOnly.has(file));
     const allowed = budget.files.get(file) ?? null;
     const values = { production, total };
     if (allowed) {
@@ -168,7 +203,7 @@ function evaluate(srcDir, budget) {
     }
     rows.push({ file, production, total, allowed });
   }
-  const stale = [...budget.files.keys()].filter((file) => !seen.has(file)).sort();
+  const stale = [...budget.files.keys()].filter((file) => !sources.has(file)).sort();
   return { rows, violations, stale };
 }
 
@@ -219,6 +254,10 @@ function syntheticSource(productionLines, testBodyLines = 0) {
     lines.push("}");
   }
   return lines.join("\n") + "\n";
+}
+
+function syntheticTestBody(lineCount) {
+  return Array.from({ length: lineCount }, (_, index) => `// test ${index + 1}`).join("\n") + "\n";
 }
 
 function writeFixture(root, files, budget) {
@@ -321,7 +360,39 @@ function selftest() {
       JSON.stringify(result.violations),
     );
 
-    // 5) 真实 CLI：坏输入退出 1，--report 只打印退出 0，恢复后退出 0。
+    // 5) 外置 tests.rs 生产按 0 计；总行数仍受 1,200 预算。
+    writeFixture(
+      root,
+      {
+        "src/parent.rs": "#[cfg(test)]\nmod tests;\n",
+        "src/parent/tests.rs": syntheticTestBody(800),
+      },
+      {},
+    );
+    result = evaluate(srcDir, loadBudget(budgetPath));
+    check(
+      "外置 tests.rs 800 行 -> 绿（生产按 0 计）",
+      result.violations.length === 0,
+      JSON.stringify(result.violations),
+    );
+    writeFixture(
+      root,
+      {
+        "src/parent.rs": "#[cfg(test)]\nmod tests;\n",
+        "src/parent/tests.rs": syntheticTestBody(1301),
+      },
+      {},
+    );
+    result = evaluate(srcDir, loadBudget(budgetPath));
+    check(
+      "外置 tests.rs 1,301 行 -> 总预算红",
+      result.violations.some(
+        (v) => v.file === "src/parent/tests.rs" && v.kind === "over-budget" && v.metric === "total",
+      ),
+      JSON.stringify(result.violations),
+    );
+
+    // 6) 真实 CLI：坏输入退出 1，--report 只打印退出 0，恢复后退出 0。
     writeFixture(root, { "src/cli-check.rs": syntheticSource(701) }, {});
     let cli = runCli(cliArgs);
     check(
