@@ -199,7 +199,7 @@ fn user_usage() {
 
 fn user_running(config: &crate::platform::config::Config) -> bool {
     crate::wire::control::channel::request(
-        &config.paths.config_dir,
+        config.paths.control_dir(),
         "svc.list",
         serde_json::json!({}),
     )

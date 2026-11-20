@@ -90,23 +90,33 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         return 1;
     }
 
-    let config_path = match crate::selfinstall::ensure_conf(conf.as_deref(), &initial_paths) {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("svcd: {}", error);
-            return 1;
-        }
-    };
-    // Keep the document bootstrapped above. `ensure_conf` chooses or creates
-    // the file for the service unit and the next start; loading its result
-    // here would (a) parse a second time and (b) let `<program>/svcd.conf`
-    // override the `SVCD_CONFIG_DIR` document that won the bootstrap — the
-    // old process cache also kept the bootstrapped document for the run.
-    let config = Arc::new(preloaded);
+    let mut settings = (*preloaded.settings).clone();
+    let config_path =
+        match crate::selfinstall::ensure_conf(conf.as_deref(), &mut settings, &initial_paths) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("svcd: {}", error);
+                return 1;
+            }
+        };
+    // The generated or filled document is this start's document. Rebuilding
+    // from the value `ensure_conf` just materialized keeps the first start on
+    // the same roots as every later start (ADR-0023).
+    let config = Arc::new(Config::new(settings, Some(config_path.clone())));
     if let Err(error) = log::init_svcd(&config.limits, &config.paths.logs_dir) {
         eprintln!("svcd: cannot open log directory: {}", error);
     }
     log::svcd("svcd starting");
+    for warning in &config.warnings {
+        log::svcd(&format!("svcd: warning: {}", warning));
+    }
+    // Runtime state no longer lives in the config tree: Unix sockets and the
+    // HTTP port file need data/run to exist before the channel binds.
+    for dir in [&config.paths.run_dir, &config.paths.temp_dir] {
+        if let Err(error) = fs::create_dir_all(dir) {
+            log::svcd(&format!("svcd: cannot create {}: {}", dir.display(), error));
+        }
+    }
     log::svcd(&format!(
         "svcd: config: {}",
         config
@@ -183,7 +193,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     // the listener to the server loop (Unix) or starts its own accept thread
     // (Windows). The composition root only sees the resulting server.
     let control = match channel::bind_server(
-        &config.paths.config_dir,
+        config.paths.control_dir(),
         tx,
         wake.clone(),
         crate::platform::host::threads::io_stack(&config.limits),
@@ -289,7 +299,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     #[cfg(feature = "http")]
     log::svcd(&format!("svcd: raw stats: {}", raw_hub.stats.summary()));
     notify_systemd("STOPPING=1");
-    channel::remove_socket(&config.paths.config_dir);
+    channel::remove_socket(config.paths.control_dir());
     0
 }
 
@@ -373,7 +383,7 @@ fn spawn_http(
         Ok(listener) => match listener.local_addr() {
             Ok(local) => {
                 state.bind = local;
-                let port_file = config.paths.config_dir.join("http.port");
+                let port_file = config.paths.run_dir.join("http.port");
                 if let Err(error) = fs::write(&port_file, format!("127.0.0.1:{}", local.port())) {
                     log::svcd(&format!(
                         "svcd: cannot write {}: {}",
@@ -554,7 +564,7 @@ fn shutdown_inner(verbose: bool) -> i32 {
     // Stopping only needs the control endpoint; a broken `svcd.conf` must not
     // make `svcd stop` unusable.
     let paths = crate::platform::config::ambient_paths(None);
-    match channel::request(&paths.config_dir, "svcd.shutdown", json!({})) {
+    match channel::request(paths.control_dir(), "svcd.shutdown", json!({})) {
         Ok(response) => match response.error {
             Some(error) => {
                 if verbose {
@@ -2676,7 +2686,7 @@ fn run_status_hook(id: &str, hook: &Hook, paths: &Paths, poll: &mut dyn FnMut())
 }
 
 fn status_output_path(id: &str, paths: &Paths) -> PathBuf {
-    let directory = paths.config_dir.join("tmp");
+    let directory = paths.temp_dir.clone();
     let _ = fs::create_dir_all(&directory);
     let nanos = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

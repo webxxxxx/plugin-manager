@@ -319,7 +319,7 @@ enum ListError {
 }
 
 fn live_list(config: &Config) -> Result<Vec<Status>, ListError> {
-    let response = channel::request(&config.paths.config_dir, "svc.list", json!({}))
+    let response = channel::request(config.paths.control_dir(), "svc.list", json!({}))
         .map_err(|error| ListError::Unreachable(error.to_string()))?;
     if let Some(error) = response.error {
         return Err(ListError::Daemon(error.message));
@@ -366,7 +366,7 @@ fn daemon_command(config: &Config, verb: DaemonVerb, id: &str) -> i32 {
 }
 
 fn reload(config: &Config) -> i32 {
-    let response = match channel::request(&config.paths.config_dir, "svc.reload", json!({})) {
+    let response = match channel::request(config.paths.control_dir(), "svc.reload", json!({})) {
         Ok(response) => response,
         Err(error) => {
             eprintln!("svc: svcd unreachable: {}", error);
@@ -472,7 +472,7 @@ fn auth_command(config: &Config, action: AuthAction) -> i32 {
         AuthAction::Status => ("auth.status", json!({})),
         AuthAction::Passwd(password) => ("auth.passwd", json!({ "password": password })),
     };
-    let response = match channel::request(&config.paths.config_dir, method, params) {
+    let response = match channel::request(config.paths.control_dir(), method, params) {
         Ok(response) => response,
         Err(error) => {
             eprintln!("svc: svcd unreachable: {}", error);

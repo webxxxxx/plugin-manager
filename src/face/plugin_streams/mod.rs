@@ -28,8 +28,8 @@ use crate::server::http::{Request, StreamHandler};
 /// Everything the realtime handlers need that is not the request itself. The
 /// legacy engine always has it; a build without a raw transport has `None`.
 pub(crate) struct StreamContext {
-    /// The one directory set: the control endpoint (`paths.config_dir`) and the
-    /// plugin tree both come from it.
+    /// The one directory set: the control endpoint (`control_dir`, which is
+    /// `data/run` on Unix) and the plugin tree both come from it.
     pub paths: Arc<Paths>,
     pub raw_hub: Option<Arc<crate::wire::contract::rawhub::RawHub>>,
     pub limits: Arc<crate::platform::limits::Limits>,
@@ -202,7 +202,7 @@ pub(crate) fn open_ws(
     };
     match context.bus.subscribe(ui.id, &context.limits) {
         Ok((receiver, subscription)) => Box::new(ws::WsStream::new(
-            context.paths.config_dir.clone(),
+            context.paths.control_dir().to_path_buf(),
             ui.id.to_string(),
             accept,
             receiver,

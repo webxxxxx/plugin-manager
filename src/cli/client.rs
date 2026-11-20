@@ -35,7 +35,7 @@ pub(crate) fn request(
     params: Value,
     label: &str,
 ) -> Result<Status, i32> {
-    let response = match channel::request(&config.paths.config_dir, method, params) {
+    let response = match channel::request(config.paths.control_dir(), method, params) {
         Ok(response) => response,
         Err(error) => return Err(unreachable(&error, label)),
     };

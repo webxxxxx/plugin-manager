@@ -62,41 +62,67 @@ impl Layout {
 /// Resolve the config used by the daemon service.
 ///
 /// Precedence: the path passed at install/startup, then `<program dir>/svcd.conf`,
-/// then `<config>/svcd.conf` (legacy), then a generated platform-aware default
-/// written into the config directory (falling back to the program directory when
-/// the config directory is not writable).
+/// then `<config>/svcd.conf` (legacy), then a generated default written into
+/// the config directory (falling back to the program directory when the config
+/// directory is not writable).
+///
+/// A chosen document is the one this process runs with: missing roots are
+/// filled in memory and written back, and a generated document is used for
+/// this start, not only the next one (ADR-0023).
 pub fn ensure_conf(
     explicit: Option<&Path>,
+    settings: &mut crate::platform::settings::Settings,
     paths: &crate::platform::paths::Paths,
 ) -> Result<PathBuf, String> {
-    // The caller already resolved the directory set once; reusing it keeps the
-    // daemon from parsing the same document a second time.
-    let layout = Layout::from_paths(paths);
     let program_conf = std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(|parent| parent.join("svcd.conf")));
-    let config_conf = layout.config_dir.join("svcd.conf");
+    let config_conf = paths.config_dir.join("svcd.conf");
+    // The initial paths already applied the SVCD_* overrides. Prefer them when
+    // the variable is set; otherwise an install prefix supplies the data/logs
+    // defaults (ADR-0023 folding), and finally the platform default.
+    let (config_default, data_default, logs_default) =
+        crate::platform::config_file::defaults_from_paths(settings, paths, |name| {
+            std::env::var_os(name)
+        });
 
-    if let Some(path) = explicit {
+    let chosen = if let Some(path) = explicit {
         let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
         if path.is_file() {
-            return Ok(path);
+            Some(path)
+        } else {
+            eprintln!(
+                "svcd: config {} not found; falling back to the service default",
+                path.display()
+            );
+            None
         }
-        eprintln!(
-            "svcd: config {} not found; falling back to the service default",
-            path.display()
-        );
+    } else {
+        None
     }
-    if let Some(path) = &program_conf {
-        if path.is_file() {
-            return Ok(path.clone());
-        }
-    }
-    if config_conf.is_file() {
-        return Ok(config_conf);
-    }
+    .or_else(|| program_conf.as_ref().filter(|path| path.is_file()).cloned())
+    .or_else(|| config_conf.is_file().then_some(config_conf.clone()));
 
-    let text = default_conf_text(&layout);
+    if let Some(path) = chosen {
+        crate::platform::config_file::fill_missing_with(
+            settings,
+            config_default,
+            data_default,
+            logs_default,
+        );
+        let missing = crate::platform::config_file::missing_roots(&path);
+        for warning in crate::platform::config_file::update_filled(&path, settings, &missing) {
+            eprintln!("svcd: warning: {}", warning);
+        }
+        return Ok(path);
+    }
+    crate::platform::config_file::fill_missing_with(
+        settings,
+        config_default,
+        data_default,
+        logs_default,
+    );
+    let text = crate::platform::config_file::generated(settings);
     let mut failures = Vec::new();
     match write_conf(&config_conf, &text) {
         Ok(()) => {
@@ -145,22 +171,20 @@ fn default_program() -> PathBuf {
 }
 
 /// The directories the installed daemon will use, resolved from the target
-/// `svcd.conf` and this process's environment (#207: the resolver is pure, the
-/// reads are here).
+/// `svcd.conf` with the same [`Paths::resolve_with`] the daemon uses.
+///
+/// The installer targets the clean boot environment, so only
+/// `SVCD_CONFIG_DIR` is read here: it decides where the installer writes.
+/// Data and logs come from the materialized roots in the document, never from
+/// the operator's shell (ADR-0023).
 fn current_runtime_dirs(settings: Option<&crate::platform::settings::Settings>) -> RuntimeDirs {
-    // Precedence differs from `ambient_paths`: the installer targets the clean
-    // boot environment, so the target file's `install_dir` wins over an
-    // ambient `SVCD_DATA_DIR`/`SVCD_LOG_DIR` (which still lose to an explicit
-    // key in the file). `SVCD_CONFIG_DIR` keeps its usual priority.
-    RuntimeDirs::resolve(
-        settings,
-        &ambient_paths(None),
-        &RuntimeOverrides {
-            config: std::env::var_os("SVCD_CONFIG_DIR").map(PathBuf::from),
-            data: std::env::var_os("SVCD_DATA_DIR").map(PathBuf::from),
-            logs: std::env::var_os("SVCD_LOG_DIR").map(PathBuf::from),
-        },
-    )
+    let settings = settings.cloned().unwrap_or_default();
+    let paths = crate::platform::paths::Paths::resolve_with(&settings, |name| {
+        (name == "SVCD_CONFIG_DIR")
+            .then(|| std::env::var_os(name))
+            .flatten()
+    });
+    RuntimeDirs::from_paths(&paths)
 }
 
 /// Record the effective install root in the installed `svcd.conf`, keeping
@@ -184,7 +208,10 @@ fn record_install_dir(path: &Path, install_dir: &Path) -> Result<(), String> {
 fn installed_conf_settings() -> Option<crate::platform::settings::Settings> {
     let path = ambient_paths(None).config_dir.join("svcd.conf");
     let text = fs::read_to_string(&path).ok()?;
-    crate::platform::settings::parse(&text, path.parent().unwrap_or(Path::new("."))).ok()
+    let mut settings =
+        crate::platform::settings::parse(&text, path.parent().unwrap_or(Path::new("."))).ok()?;
+    crate::platform::config_file::fill_missing(&mut settings);
+    Some(settings)
 }
 
 /// `svcd start`: start the installed system service. User mode is handled by
@@ -419,14 +446,15 @@ pub fn self_install(args: &[String]) -> i32 {
     } else {
         None
     };
-    let target_settings = prepared
+    let mut settings = prepared
         .as_ref()
-        .map(|(_, settings, _)| settings)
-        .or(installed.as_ref());
+        .map(|(_, settings, _)| settings.clone())
+        .or(installed)
+        .unwrap_or_default();
     let prefix_requested = request.prefix.is_some();
     let install_root = resolve_install_root(
         request.prefix.as_deref(),
-        target_settings.and_then(|settings| settings.install_dir.as_deref()),
+        settings.install_dir.as_deref(),
         default_install_prefix(),
     );
     let install_root = if install_root.is_absolute() {
@@ -436,21 +464,20 @@ pub fn self_install(args: &[String]) -> i32 {
     };
     // A CLI `--prefix` becomes the recorded `install_dir`, so later reinstalls,
     // runtime paths and `--uninstall` all agree with where the files went.
-    let runtime_settings = match (target_settings, prefix_requested) {
-        (None, false) => None,
-        (settings, true) => {
-            let mut settings = settings.cloned().unwrap_or_default();
-            settings.install_dir = Some(install_root.clone());
-            Some(settings)
-        }
-        (Some(settings), false) => Some(settings.clone()),
-    };
-    let runtime = current_runtime_dirs(runtime_settings.as_ref());
-    let record_root = prefix_requested
-        || (prepared.is_some()
-            && target_settings
-                .and_then(|settings| settings.install_dir.as_ref())
-                .is_some());
+    if prefix_requested {
+        settings.install_dir = Some(install_root.clone());
+    }
+    // The roots are filled before the resolver runs; `install_dir` is folded
+    // here and nowhere else. A source document with explicit roots keeps them.
+    crate::platform::config_file::fill_missing(&mut settings);
+    let runtime = current_runtime_dirs(Some(&settings));
+    // The document records the roots the installed daemon will resolve, not a
+    // pre-override guess. This also makes `SVCD_CONFIG_DIR` part of install's
+    // own answer instead of a value that disappears at the next boot.
+    settings.config_dir = Some(runtime.config.clone());
+    settings.data_dir = Some(runtime.data.clone());
+    settings.logs_dir = Some(runtime.logs.clone());
+    let record_root = prefix_requested || (prepared.is_some() && settings.install_dir.is_some());
     // One plan decides for both the dry run and the real run (#207).
     let plan = plan_self_install(SelfInstallInputs {
         install_root: &install_root,
@@ -523,42 +550,46 @@ pub fn self_install(args: &[String]) -> i32 {
         eprintln!("svcd: cannot create {}: {}", install_root.display(), error);
         return EXIT_ERROR;
     }
-    for dir in [&runtime.config, &runtime.data, &runtime.logs] {
+    for dir in [
+        &runtime.config,
+        &runtime.data,
+        &runtime.logs,
+        &runtime.data.join("run"),
+        &runtime.data.join("temp"),
+    ] {
         if let Err(error) = fs::create_dir_all(dir) {
             eprintln!("svcd: cannot create {}: {}", dir.display(), error);
             return EXIT_ERROR;
         }
     }
 
+    let conf_path = runtime.conf();
+    let had_conf = conf_path.is_file();
     if let Some((text, _, _)) = &prepared {
-        let path = runtime.conf();
-        if let Err(error) = write_file(&path, text, 0o644) {
-            eprintln!("svcd: cannot write {}: {}", path.display(), error);
+        if let Err(error) = write_file(&conf_path, text, 0o644) {
+            eprintln!("svcd: cannot write {}: {}", conf_path.display(), error);
+            return EXIT_ERROR;
+        }
+    } else if !had_conf {
+        // No source and no installed document: install owns the first one.
+        let text = crate::platform::config_file::generated(&settings);
+        if let Err(error) = write_conf(&conf_path, &text) {
+            eprintln!("svcd: cannot write {}: {}", conf_path.display(), error);
             return EXIT_ERROR;
         }
     }
 
     if record_root {
-        if !runtime.conf().is_file() {
-            let layout = Layout {
-                program: target.clone(),
-                data_dir: runtime.data.clone(),
-                config_dir: runtime.config.clone(),
-                conf: None,
-            };
-            let text = default_conf_text(&layout);
-            if let Err(error) = write_conf(&runtime.conf(), &text) {
-                eprintln!("svcd: cannot write {}: {}", runtime.conf().display(), error);
-                return EXIT_ERROR;
-            }
-        }
-        if let Err(error) = record_install_dir(&runtime.conf(), &install_root) {
-            eprintln!(
-                "svcd: cannot update {}: {}",
-                runtime.conf().display(),
-                error
-            );
+        if let Err(error) = record_install_dir(&conf_path, &install_root) {
+            eprintln!("svcd: cannot update {}: {}", conf_path.display(), error);
             return EXIT_ERROR;
+        }
+    }
+    if prepared.is_some() || had_conf {
+        let missing = crate::platform::config_file::missing_roots(&conf_path);
+        for warning in crate::platform::config_file::update_filled(&conf_path, &settings, &missing)
+        {
+            eprintln!("svcd: warning: {}", warning);
         }
     }
 
@@ -1000,44 +1031,22 @@ fn user_path_update_skipped() -> bool {
 }
 
 fn self_install_user(request: SelfRequest) -> i32 {
-    let ambient = ambient_paths(None);
-    let runtime = RuntimeDirs {
-        config: std::env::var_os("SVCD_CONFIG_DIR")
-            .map(PathBuf::from)
-            .unwrap_or(ambient.config_dir),
-        data: std::env::var_os("SVCD_DATA_DIR")
-            .map(PathBuf::from)
-            .unwrap_or(ambient.data_dir),
-        logs: std::env::var_os("SVCD_LOG_DIR")
-            .map(PathBuf::from)
-            .unwrap_or(ambient.logs_dir),
-    };
-    let install_root = request
-        .prefix
-        .clone()
-        .unwrap_or_else(|| runtime.data.join("bin"));
-    let install_root = if install_root.is_absolute() {
-        install_root
-    } else {
-        std::path::absolute(&install_root).unwrap_or(install_root)
-    };
-    let target_name = if cfg!(windows) { "svcd.exe" } else { "svcd" };
-    let target = install_root.join(target_name);
-    let current = std::env::current_exe().unwrap_or_else(|_| target.clone());
-    let launcher = request.manual.then(|| install_root.join(launcher_name()));
-
     let prepared = match &request.conf {
         Some(path) => match fs::read_to_string(path) {
             Ok(text) => {
-                let base = path
+                let source = std::path::absolute(path).unwrap_or_else(|_| path.clone());
+                let base = source
                     .parent()
                     .map(Path::to_path_buf)
-                    .unwrap_or_else(|| runtime.config.clone());
-                if let Err(error) = crate::platform::settings::parse(&text, &base) {
-                    eprintln!("svcd: {}: {}", path.display(), error);
-                    return EXIT_ERROR;
-                }
-                Some(text)
+                    .unwrap_or_else(|| ambient_paths(None).config_dir);
+                let settings = match crate::platform::settings::parse(&text, &base) {
+                    Ok(settings) => settings,
+                    Err(error) => {
+                        eprintln!("svcd: {}: {}", path.display(), error);
+                        return EXIT_ERROR;
+                    }
+                };
+                Some((text, settings))
             }
             Err(error) => {
                 eprintln!("svcd: cannot read {}: {}", path.display(), error);
@@ -1046,6 +1055,36 @@ fn self_install_user(request: SelfRequest) -> i32 {
         },
         None => None,
     };
+    let mut settings = prepared
+        .as_ref()
+        .map(|(_, settings)| settings.clone())
+        .or_else(installed_conf_settings)
+        .unwrap_or_default();
+    let prefix = request.prefix.as_ref().map(|prefix| {
+        if prefix.is_absolute() {
+            prefix.clone()
+        } else {
+            std::path::absolute(prefix).unwrap_or_else(|_| prefix.clone())
+        }
+    });
+    if let Some(prefix) = &prefix {
+        settings.install_dir = Some(prefix.clone());
+    }
+    crate::platform::config_file::fill_missing(&mut settings);
+    let paths =
+        crate::platform::paths::Paths::resolve_with(&settings, |name| std::env::var_os(name));
+    let runtime = RuntimeDirs::from_paths(&paths);
+    // The document records the roots this user's daemon will resolve.
+    settings.config_dir = Some(runtime.config.clone());
+    settings.data_dir = Some(runtime.data.clone());
+    settings.logs_dir = Some(runtime.logs.clone());
+    let install_root = prefix
+        .or_else(|| settings.install_dir.clone())
+        .unwrap_or_else(|| runtime.data.join("bin"));
+    let target_name = if cfg!(windows) { "svcd.exe" } else { "svcd" };
+    let target = install_root.join(target_name);
+    let current = std::env::current_exe().unwrap_or_else(|_| target.clone());
+    let launcher = request.manual.then(|| install_root.join(launcher_name()));
 
     if request.dry_run {
         println!("user mode install (no system service)");
@@ -1082,7 +1121,14 @@ fn self_install_user(request: SelfRequest) -> i32 {
         return EXIT_OK;
     }
 
-    for dir in [&install_root, &runtime.config, &runtime.data, &runtime.logs] {
+    for dir in [
+        &install_root,
+        &runtime.config,
+        &runtime.data,
+        &runtime.logs,
+        &runtime.data.join("run"),
+        &runtime.data.join("temp"),
+    ] {
         if let Err(error) = fs::create_dir_all(dir) {
             eprintln!("svcd: cannot create {}: {}", dir.display(), error);
             if cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied {
@@ -1094,24 +1140,31 @@ fn self_install_user(request: SelfRequest) -> i32 {
         }
     }
 
-    if let Some(text) = prepared {
-        if let Err(error) = write_file(&runtime.conf(), &text, 0o644) {
-            eprintln!("svcd: cannot write {}: {}", runtime.conf().display(), error);
+    let conf_path = runtime.conf();
+    let had_conf = conf_path.is_file();
+    if let Some((text, _)) = &prepared {
+        if let Err(error) = write_file(&conf_path, text, 0o644) {
+            eprintln!("svcd: cannot write {}: {}", conf_path.display(), error);
             return EXIT_ERROR;
         }
-    } else if runtime.conf().is_file() {
-        // An existing conf is kept as-is; bind is a plain config key now.
-    } else {
-        let layout = Layout {
-            program: target.clone(),
-            data_dir: runtime.data.clone(),
-            config_dir: runtime.config.clone(),
-            conf: None,
-        };
-        let text = default_conf_text(&layout);
-        if let Err(error) = write_conf(&runtime.conf(), &text) {
-            eprintln!("svcd: cannot write {}: {}", runtime.conf().display(), error);
+    } else if !had_conf {
+        let text = crate::platform::config_file::generated(&settings);
+        if let Err(error) = write_conf(&conf_path, &text) {
+            eprintln!("svcd: cannot write {}: {}", conf_path.display(), error);
             return EXIT_ERROR;
+        }
+    }
+    if request.prefix.is_some() {
+        if let Err(error) = record_install_dir(&conf_path, &install_root) {
+            eprintln!("svcd: cannot update {}: {}", conf_path.display(), error);
+            return EXIT_ERROR;
+        }
+    }
+    if prepared.is_some() || had_conf {
+        let missing = crate::platform::config_file::missing_roots(&conf_path);
+        for warning in crate::platform::config_file::update_filled(&conf_path, &settings, &missing)
+        {
+            eprintln!("svcd: warning: {}", warning);
         }
     }
 

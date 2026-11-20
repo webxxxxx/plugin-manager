@@ -44,12 +44,12 @@ impl ApiFace {
     }
 
     fn rpc(&self, budget: &CallBudget, method: &str, params: Value) -> Result<Value, Response> {
-        support::rpc_result(&self.config.paths.config_dir, method, params, budget)
+        support::rpc_result(self.config.paths.control_dir(), method, params, budget)
             .map_err(rpc_error)
     }
 
     fn require_plugin(&self, budget: &CallBudget, id: &str) -> Result<(), Response> {
-        support::require_plugin_result(&self.config.paths.config_dir, id, budget)
+        support::require_plugin_result(self.config.paths.control_dir(), id, budget)
             .map_err(|(status, code, message)| error_response(status, code, &message))
     }
 

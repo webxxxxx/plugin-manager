@@ -8,25 +8,37 @@
 //!
 //! [`Config`]: crate::platform::config::Config
 //!
-//! `SVCD_BIND` overrides the `bind` key for tests and ad-hoc runs; explicit
-//! paths in `svcd.conf` win over the platform defaults.
+//! Every key can be overridden by `SVCD_<KEY>` (the key upper-cased), applied
+//! once when the document is loaded. The environment wins over the file; an
+//! empty variable means "not set".
 
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+/// A removed path key that is still present in an old document.
+///
+/// The key is ignored; it is kept only so the bootstrap can explain which
+/// path is actually used. See ADR-0023.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoredPathKey {
+    pub key: &'static str,
+    pub value: PathBuf,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
     /// HTTP listener address. Default: `127.0.0.1:8787`.
     pub bind: Option<SocketAddr>,
+    /// Root for input: `svcd.conf`, `services.d`, `trust.d`, `compat.conf`.
     pub config_dir: Option<PathBuf>,
-    pub plugins_dir: Option<PathBuf>,
-    pub services_dir: Option<PathBuf>,
+    /// Root for runtime state: `plugins`, `temp`, `run`.
+    pub data_dir: Option<PathBuf>,
     pub auth_passwd: Option<String>,
-    /// Root for transient plugin data (`SVCD_TEMP_DIR`). Defaults to
-    /// `<data>/temp`.
-    pub temp_dir: Option<PathBuf>,
-    /// Files under `temp_dir` older than this are removed. Default: 2 hours.
+    /// Removed path keys found in the document. They are never read as paths;
+    /// the bootstrap warns about them and uses the derived value instead.
+    pub ignored_path_keys: Vec<IgnoredPathKey>,
+    /// Files under `data/temp` older than this are removed. Default: 2 hours.
     pub temp_retention_secs: Option<u64>,
     /// How often the supervisor scans `temp_dir`. `0` disables cleanup.
     pub temp_cleanup_interval_secs: Option<u64>,
@@ -92,16 +104,6 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// Runtime data directory implied by `install_dir`, if that key is set.
-    pub fn install_data_dir(&self) -> Option<PathBuf> {
-        self.install_dir.as_ref().map(|dir| dir.join("data"))
-    }
-
-    /// Runtime log directory implied by `install_dir`, if that key is set.
-    pub fn install_logs_dir(&self) -> Option<PathBuf> {
-        self.install_dir.as_ref().map(|dir| dir.join("logs"))
-    }
-
     pub fn temp_retention(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.temp_retention_secs.unwrap_or(2 * 60 * 60))
     }
@@ -121,23 +123,78 @@ impl Settings {
     }
 }
 
-/// The two loop cadences still accept their historical `SVCD_*` overrides.
+/// Every `svcd.conf` key that an environment variable can override.
 ///
-/// This runs at the composition root only ([`crate::platform::config::Config::bootstrap`]),
-/// like every other `SVCD_*` read. The `svcd.conf` keys are the supported knob;
-/// these two overrides are frozen — no new key may be added here, and removing
-/// them is the separate ticket ADR-0019 already left open.
-pub(crate) fn apply_loop_env_overrides(settings: &mut Settings) {
-    if let Some(value) = env_u64("SVCD_RESCAN_INTERVAL_MS") {
-        settings.rescan_interval_ms = Some(value);
-    }
-    if let Some(value) = env_u64("SVCD_BOOT_SCAN_WAIT_MS") {
-        settings.boot_scan_wait_ms = Some(value);
-    }
-}
+/// The name is `SVCD_` + the key upper-cased (`max_streams` ->
+/// `SVCD_MAX_STREAMS`). Keeping one list makes the override surface explicit:
+/// an unknown `SVCD_*` variable (a test hook or a typo) is not silently
+/// treated as a config key.
+pub(crate) const ENV_KEYS: &[&str] = &[
+    "bind",
+    "allow_insecure_install",
+    "config_dir",
+    "data_dir",
+    "logs_dir",
+    "install_dir",
+    "auth_passwd",
+    "temp_retention_secs",
+    "temp_cleanup_interval_secs",
+    "rescan_interval_ms",
+    "boot_scan_wait_ms",
+    "log_max_bytes",
+    "log_rotations",
+    "log_to_file",
+    "request_stack_bytes",
+    "io_stack_bytes",
+    "blocking_threads",
+    "max_body_bytes",
+    "max_json_body_bytes",
+    "max_complete_body_bytes",
+    "max_header_bytes",
+    "max_streams",
+    "stream_buffer_bytes",
+    "max_connections",
+    "max_connections_per_ip",
+    "max_subscriptions",
+    "max_subscribers_per_plugin",
+    "http_idle_timeout_secs",
+    "max_package_bytes",
+    "transfer_timeout_secs",
+    "control_timeout_secs",
+    "default_timeout",
+    "max_timeout",
+    "ws_max_message_bytes",
+    "ws_inflight_bytes",
+    "ws_inflight_requests",
+    "ws_buffer_shrink_bytes",
+    "ws_raw_enabled",
+    "ws_raw_max_bytes",
+    "ws_raw_queue",
+];
 
-fn env_u64(key: &str) -> Option<u64> {
-    std::env::var(key).ok().and_then(|value| value.parse().ok())
+/// Build a document from the environment and append it after the file, so the
+/// normal parser sees the override last and every validation rule stays in one
+/// place. Empty values mean "not set"; a multi-line value cannot be a config
+/// line and is rejected instead of being silently truncated.
+fn environment_document(env: impl Fn(&str) -> Option<String>) -> Result<String, String> {
+    let mut text = String::new();
+    for key in ENV_KEYS {
+        let name = format!("SVCD_{}", key.to_ascii_uppercase());
+        let Some(value) = env(&name) else {
+            continue;
+        };
+        if value.is_empty() {
+            continue;
+        }
+        if value.contains(['\n', '\r']) {
+            return Err(format!("{} must not contain a newline", name));
+        }
+        text.push_str(key);
+        text.push_str(" = ");
+        text.push_str(&value);
+        text.push('\n');
+    }
+    Ok(text)
 }
 
 /// Load the document this process runs with.
@@ -173,13 +230,18 @@ pub(crate) fn load(conf: Option<&Path>) -> Result<(Settings, Option<PathBuf>), S
 }
 
 fn load_from(path: &Path) -> Result<Settings, String> {
-    let text = match fs::read_to_string(path) {
+    let mut text = match fs::read_to_string(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Settings::default())
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(format!("read {}: {}", path.display(), error)),
     };
+    let env = environment_document(|name| std::env::var(name).ok())?;
+    if !env.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&env);
+    }
     parse(&text, path.parent().unwrap_or(Path::new(".")))
         .map_err(|error| format!("{}: {}", path.display(), error))
 }
@@ -203,6 +265,8 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
         if value.is_empty() {
             return Err(format!("line {}: empty value for {}", index + 1, key));
         }
+        // When adding or removing a key here, update ENV_KEYS above; that list
+        // is the whole environment-override surface.
         match key {
             "bind" => {
                 settings.bind = Some(
@@ -221,11 +285,22 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
                 })?;
             }
             "config_dir" => settings.config_dir = Some(resolve(base, value)),
-            "plugins_dir" => settings.plugins_dir = Some(resolve(base, value)),
-            "services_dir" => settings.services_dir = Some(resolve(base, value)),
+            "data_dir" => settings.data_dir = Some(resolve(base, value)),
             "install_dir" => settings.install_dir = Some(resolve(base, value)),
             "auth_passwd" => settings.auth_passwd = Some(value.to_string()),
-            "temp_dir" => settings.temp_dir = Some(resolve(base, value)),
+            // Removed in ADR-0023. Parsing them lets an old document boot; the
+            // resolver ignores the value and the bootstrap warns with the
+            // derived path. A syntax error in the line is still an error.
+            "plugins_dir" | "services_dir" | "temp_dir" => {
+                settings.ignored_path_keys.push(IgnoredPathKey {
+                    key: match key {
+                        "plugins_dir" => "plugins_dir",
+                        "services_dir" => "services_dir",
+                        _ => "temp_dir",
+                    },
+                    value: resolve(base, value),
+                })
+            }
             "temp_retention_secs" => {
                 let seconds = value.parse::<u64>().map_err(|_| {
                     format!(
@@ -398,6 +473,7 @@ fn parse_usize(value: &str, key: &str, index: usize) -> Result<usize, String> {
 pub fn update_value(path: &Path, key: &str, value: &str) -> Result<(), String> {
     let text =
         fs::read_to_string(path).map_err(|error| format!("read {}: {}", path.display(), error))?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     let mut output = String::with_capacity(text.len() + value.len() + 16);
     let mut replaced = false;
     for line in text.lines() {
@@ -437,9 +513,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn environment_document_uses_svcd_prefixed_keys() {
+        let doc = environment_document(|name| match name {
+            "SVCD_BIND" => Some("127.0.0.1:9".into()),
+            "SVCD_MAX_STREAMS" => Some("7".into()),
+            "SVCD_DATA_DIR" => Some("/env/data".into()),
+            "SVCD_ALLOW_INSECURE_INSTALL" => Some("on".into()),
+            _ => None,
+        })
+        .expect("env document");
+        let settings = parse(&doc, Path::new("/etc/svcd")).expect("parse env");
+        assert_eq!(
+            settings.bind,
+            Some("127.0.0.1:9".parse::<SocketAddr>().expect("bind"))
+        );
+        assert_eq!(settings.max_streams, Some(7));
+        assert_eq!(settings.data_dir, Some(PathBuf::from("/env/data")));
+        assert!(settings.allow_insecure_install);
+    }
+
+    #[test]
+    fn environment_document_wins_over_the_file() {
+        let file = parse("bind = 127.0.0.1:1\nmax_streams = 1\n", Path::new("/etc")).expect("file");
+        let env = environment_document(|name| match name {
+            "SVCD_BIND" => Some("127.0.0.1:2".into()),
+            "SVCD_MAX_STREAMS" => Some("3".into()),
+            _ => None,
+        })
+        .expect("env");
+        let combined = format!("bind = 127.0.0.1:1\nmax_streams = 1\n{}", env);
+        let settings = parse(&combined, Path::new("/etc")).expect("combined");
+        assert_eq!(
+            settings.bind,
+            Some("127.0.0.1:2".parse::<SocketAddr>().expect("bind"))
+        );
+        assert_eq!(settings.max_streams, Some(3));
+        assert_eq!(file.max_streams, Some(1));
+    }
+
+    #[test]
+    fn environment_override_rejects_a_multiline_value() {
+        let error = environment_document(|name| {
+            (name == "SVCD_AUTH_PASSWD").then(|| "one\ntwo".to_string())
+        })
+        .expect_err("newline");
+        assert!(error.contains("SVCD_AUTH_PASSWD"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_environment_value_is_not_an_override() {
+        let doc =
+            environment_document(|name| (name == "SVCD_BIND").then(String::new)).expect("empty");
+        assert!(doc.is_empty(), "{doc}");
+    }
+
+    #[test]
     fn parses_all_keys_and_resolves_relative_paths() {
         let settings = parse(
-            "\u{feff}# svcd runtime\nbind = 0.0.0.0:8787\nallow_insecure_install = on\nconfig_dir = /srv/svcd\nplugins_dir = plugins\nservices_dir = /var/lib/svcd/services.d\ninstall_dir = /etc/sr/svcd\nauth_passwd = pbkdf2-sha256$10000$c2FsdA$aGFzaA\ntemp_dir = /var/tmp/svcd\ntemp_retention_secs = 3600\ntemp_cleanup_interval_secs = 60\nrescan_interval_ms = 250\nboot_scan_wait_ms = 0\n",
+            "\u{feff}# svcd runtime\nbind = 0.0.0.0:8787\nallow_insecure_install = on\nconfig_dir = /srv/svcd\ndata_dir = state\nlogs_dir = logs\ninstall_dir = /etc/sr/svcd\nauth_passwd = pbkdf2-sha256$10000$c2FsdA$aGFzaA\nplugins_dir = plugins\nservices_dir = /var/lib/svcd/services.d\ntemp_dir = /var/tmp/svcd\ntemp_retention_secs = 3600\ntemp_cleanup_interval_secs = 60\nrescan_interval_ms = 250\nboot_scan_wait_ms = 0\n",
             Path::new("/etc/svcd"),
         )
         .expect("parse");
@@ -449,20 +580,21 @@ mod tests {
         );
         assert!(settings.allow_insecure_install);
         assert_eq!(settings.config_dir, Some(PathBuf::from("/srv/svcd")));
-        assert_eq!(
-            settings.plugins_dir,
-            Some(PathBuf::from("/etc/svcd/plugins"))
-        );
-        assert_eq!(
-            settings.services_dir,
-            Some(PathBuf::from("/var/lib/svcd/services.d"))
-        );
+        assert_eq!(settings.data_dir, Some(PathBuf::from("/etc/svcd/state")));
+        assert_eq!(settings.logs_dir, Some(PathBuf::from("/etc/svcd/logs")));
         assert_eq!(settings.install_dir, Some(PathBuf::from("/etc/sr/svcd")));
         assert_eq!(
             settings.auth_passwd.as_deref(),
             Some("pbkdf2-sha256$10000$c2FsdA$aGFzaA")
         );
-        assert_eq!(settings.temp_dir, Some(PathBuf::from("/var/tmp/svcd")));
+        assert_eq!(
+            settings
+                .ignored_path_keys
+                .iter()
+                .map(|ignored| ignored.key)
+                .collect::<Vec<_>>(),
+            vec!["plugins_dir", "services_dir", "temp_dir"]
+        );
         assert_eq!(settings.temp_retention_secs, Some(3600));
         assert_eq!(settings.temp_cleanup_interval_secs, Some(60));
         assert_eq!(settings.rescan_interval_ms, Some(250));
@@ -579,41 +711,12 @@ mod tests {
     /// the override path itself is covered end to end by the tests that start a
     /// daemon with `SVCD_RESCAN_INTERVAL_MS` / `SVCD_BOOT_SCAN_WAIT_MS`.
     #[test]
-    fn loop_document_values_survive_without_an_override() {
-        let mut settings = parse(
-            "rescan_interval_ms = 250\nboot_scan_wait_ms = 100\n",
-            Path::new("/etc/svcd"),
-        )
-        .expect("parse");
-        // No env set in this process: the document survives.
-        apply_loop_env_overrides(&mut settings);
-        assert_eq!(settings.rescan_interval_ms(), 250);
-        assert_eq!(settings.boot_scan_wait_ms(), 100);
-    }
-
-    #[test]
     fn relative_install_dir_resolves_against_the_conf_directory() {
         let settings = parse("install_dir = sr/svcd\n", Path::new("/etc/svcd")).expect("parse");
         assert_eq!(
             settings.install_dir,
             Some(PathBuf::from("/etc/svcd/sr/svcd"))
         );
-    }
-
-    #[test]
-    fn install_dir_implies_data_and_log_directories() {
-        let settings =
-            parse("install_dir = /etc/sr/svcd\n", Path::new("/etc/svcd")).expect("parse");
-        assert_eq!(
-            settings.install_data_dir(),
-            Some(PathBuf::from("/etc/sr/svcd/data"))
-        );
-        assert_eq!(
-            settings.install_logs_dir(),
-            Some(PathBuf::from("/etc/sr/svcd/logs"))
-        );
-        assert_eq!(Settings::default().install_data_dir(), None);
-        assert_eq!(Settings::default().install_logs_dir(), None);
     }
 
     #[test]
@@ -689,10 +792,7 @@ mod tests {
     #[test]
     fn windows_absolute_paths_are_not_joined_again() {
         let settings =
-            parse("plugins_dir = C:\\svcd\\plugins\n", Path::new("C:\\config")).expect("parse");
-        assert_eq!(
-            settings.plugins_dir,
-            Some(PathBuf::from(r"C:\svcd\plugins"))
-        );
+            parse("data_dir = C:\\svcd\\data\n", Path::new("C:\\config")).expect("parse");
+        assert_eq!(settings.data_dir, Some(PathBuf::from(r"C:\svcd\data")));
     }
 }

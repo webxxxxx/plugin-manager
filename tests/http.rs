@@ -91,7 +91,6 @@ impl Sandbox {
             .env("SVCD_CONFIG_DIR", &self.config)
             .env("SVCD_DATA_DIR", &self.data)
             .env("SVCD_LOG_DIR", &self.logs)
-            .env("SVCD_TRUST_DIR", &self.trust)
             .env("SVCD_BIND", "127.0.0.1:0")
             .env("SVCD_BOOT_SCAN_WAIT_MS", "0")
             .env("SVCD_RESCAN_INTERVAL_MS", "0")
@@ -188,7 +187,6 @@ impl Sandbox {
             .env("SVCD_CONFIG_DIR", &self.config)
             .env("SVCD_DATA_DIR", &self.data)
             .env("SVCD_LOG_DIR", &self.logs)
-            .env("SVCD_TRUST_DIR", &self.trust)
             .env("SVCD_TEST_UNPRIVILEGED", "1")
             .env("SVCD_RESCAN_INTERVAL_MS", "0")
             .env("SVCD_BOOT_SCAN_WAIT_MS", "0");
@@ -211,7 +209,6 @@ impl Sandbox {
             .env("SVCD_CONFIG_DIR", &self.config)
             .env("SVCD_DATA_DIR", &self.data)
             .env("SVCD_LOG_DIR", &self.logs)
-            .env("SVCD_TRUST_DIR", &self.trust)
             .env("SVCD_TEST_UNPRIVILEGED", "1")
             .env("SVCD_RESCAN_INTERVAL_MS", "0")
             .env("SVCD_BOOT_SCAN_WAIT_MS", "0");
@@ -220,7 +217,7 @@ impl Sandbox {
 
     fn wait_for_http(&self) -> String {
         for _ in 0..200 {
-            if let Ok(address) = fs::read_to_string(self.config.join("http.port")) {
+            if let Ok(address) = fs::read_to_string(self.data.join("run").join("http.port")) {
                 let address = address.trim().to_string();
                 if TcpStream::connect(&address).is_ok() {
                     return address;
@@ -255,6 +252,12 @@ impl Sandbox {
         command.arg("shutdown");
         self.env(&mut command);
         command.env("SVCD_CONFIG_DIR", config);
+        // A different config is the "unreachable" probe: on Unix the control
+        // socket is under data/run and on Windows the pipe name is derived from
+        // config_dir, so move both. The normal stop keeps the sandbox roots.
+        if config != self.config {
+            command.env("SVCD_DATA_DIR", config.join("no-data"));
+        }
         support::stop_daemon(&mut child, &mut command, self.stop_timeout, || {
             fs::read_to_string(&log).unwrap_or_default()
         })
@@ -3699,71 +3702,29 @@ fn trust_upload_enables_a_signed_install() {
 
 #[test]
 fn explicit_conf_is_preferred_over_program_and_config() {
-    fn write_core(dir: &Path, id: &str) {
-        fs::create_dir_all(dir).expect("core dir");
-        let (exec, args) = if cfg!(windows) {
-            (
-                r"C:\Windows\System32\cmd.exe".to_string(),
-                json!(["/c", "exit", "0"]),
-            )
-        } else {
-            ("/bin/true".to_string(), json!([]))
-        };
-        fs::write(
-            dir.join(format!("{}.json", id)),
-            serde_json::to_vec(&json!({
-                "schema": 1,
-                "id": id,
-                "version": "1.0.0",
-                "desc": "conf precedence service",
-                "protocol": 1,
-                "exec": {"path": exec, "args": args, "ready": "exec"}
-            }))
-            .expect("core definition"),
-        )
-        .expect("write core definition");
-    }
-
     let mut sandbox = Sandbox::new();
-    let explicit_services = sandbox.root.join("explicit-services");
-    let decoy_services = sandbox.root.join("decoy-services");
-    write_core(&explicit_services, "explicit");
-    write_core(&decoy_services, "decoy");
-
     let explicit = sandbox.root.join("override.conf");
     fs::write(
         &explicit,
         format!(
-            "bind = 127.0.0.1:0\nplugins_dir = {}\nservices_dir = {}\n",
-            sandbox.root.join("explicit-plugins").display(),
-            explicit_services.display()
+            "bind = 127.0.0.1:0\ndata_dir = {}\n",
+            sandbox.root.join("explicit-data").display()
         ),
     )
     .expect("write explicit conf");
-    fs::write(
-        sandbox.root.join("svcd.conf"),
-        format!(
-            "bind = 127.0.0.1:0\nplugins_dir = {}\nservices_dir = {}\n",
-            sandbox.root.join("decoy-plugins").display(),
-            decoy_services.display()
-        ),
-    )
-    .expect("write program-dir decoy conf");
+    // A broken program-dir document is the strongest decoy: choosing it would
+    // fail bootstrap instead of merely loading a different tree.
+    fs::write(sandbox.root.join("svcd.conf"), "bind = nope\n")
+        .expect("write program-dir decoy conf");
 
     sandbox.start_daemon_with_conf(&explicit);
     let address = sandbox.wait_for_http();
-    let services_response = request(&address, "GET", "/api/v1/services", "", b"");
-    assert_eq!(services_response.status, 200);
-    let ids: Vec<&str> = services_response.body["services"]
-        .as_array()
-        .expect("services")
-        .iter()
-        .filter_map(|service| service["id"].as_str())
-        .collect();
-    assert!(ids.contains(&"explicit"), "{ids:?}");
-    assert!(
-        !ids.contains(&"decoy"),
-        "explicit --conf must win over the program-dir config: {ids:?}"
+    let response = request(&address, "GET", "/api/v1/services", "", b"");
+    assert_eq!(
+        response.status,
+        200,
+        "explicit --conf must win over the program-dir config: {}",
+        sandbox.daemon_log()
     );
 }
 
@@ -3782,18 +3743,69 @@ fn default_conf_is_created_in_the_config_dir() {
         "{text}"
     );
     assert!(
-        text.contains(&format!(
-            "plugins_dir = {}",
-            sandbox.data.join("plugins").display()
-        )),
+        text.contains(&format!("data_dir = {}", sandbox.data.display())),
         "{text}"
     );
     assert!(
-        text.contains(&format!(
-            "services_dir = {}",
-            sandbox.config.join("services.d").display()
-        )),
+        text.contains(&format!("logs_dir = {}", sandbox.logs.display())),
         "{text}"
+    );
+    // Derived names are documented in comments, not written as keys.
+    assert!(text.contains("#   plugins    = "), "{text}");
+    assert!(text.contains("#   services.d = "), "{text}");
+    assert!(text.contains("#   run        = "), "{text}");
+    assert!(!text.contains("\nplugins_dir = "), "{text}");
+    assert!(!text.contains("\nservices_dir = "), "{text}");
+}
+
+#[test]
+fn existing_conf_without_roots_is_filled_and_used() {
+    let mut sandbox = Sandbox::new();
+    fs::write(
+        sandbox.config.join("svcd.conf"),
+        "bind = 127.0.0.1:0\nplugins_dir = /ignored/plugins\n",
+    )
+    .expect("write svcd.conf");
+
+    sandbox.start_daemon();
+    sandbox.wait_for_http();
+
+    let text = fs::read_to_string(sandbox.config.join("svcd.conf")).expect("filled conf");
+    assert!(
+        text.contains(&format!("config_dir = {}\n", sandbox.config.display())),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("data_dir = {}\n", sandbox.data.display())),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("logs_dir = {}\n", sandbox.logs.display())),
+        "{text}"
+    );
+    let log = sandbox.daemon_log();
+    assert!(log.contains("plugins_dir"), "{log}");
+    assert!(log.contains("ignored"), "{log}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stale_control_socket_under_data_run_is_replaced() {
+    let mut sandbox = Sandbox::new();
+    let run = sandbox.data.join("run");
+    fs::create_dir_all(&run).expect("run dir");
+    fs::write(run.join("svcd.sock"), b"stale").expect("stale socket");
+
+    sandbox.start_daemon();
+    sandbox.wait_for_http();
+
+    assert!(
+        run.join("svcd.sock").exists(),
+        "the control socket must bind under data/run"
+    );
+    assert!(
+        !sandbox.config.join("svcd.sock").exists(),
+        "config_dir must stay input-only"
     );
 }
 
@@ -4084,8 +4096,11 @@ fn unsigned_import_is_accepted_when_the_conf_switch_is_on() {
 #[test]
 fn configured_port_and_paths_come_from_svcd_conf() {
     let mut sandbox = Sandbox::new();
-    let plugins = sandbox.root.join("configured-plugins");
-    let services = sandbox.root.join("configured-services");
+    let data = sandbox.root.join("configured-data");
+    // The environment root wins over the document (and matches it here), so
+    // the daemon, its port file and the installed plugin all live in one tree.
+    sandbox.data = data.clone();
+    let services = sandbox.config.join("services.d");
     fs::create_dir_all(&services).expect("configured services");
     let (exec, args) = if cfg!(windows) {
         (r"C:\Windows\System32\cmd.exe", json!(["/c", "exit", "0"]))
@@ -4107,11 +4122,7 @@ fn configured_port_and_paths_come_from_svcd_conf() {
     .expect("write core definition");
     fs::write(
         sandbox.config.join("svcd.conf"),
-        format!(
-            "bind = 127.0.0.1:0\nplugins_dir = {}\nservices_dir = {}\n",
-            plugins.display(),
-            services.display()
-        ),
+        format!("bind = 127.0.0.1:0\ndata_dir = {}\n", data.display()),
     )
     .expect("write svcd.conf");
 
@@ -4145,12 +4156,17 @@ fn configured_port_and_paths_come_from_svcd_conf() {
     );
     assert_eq!(installed.status, 200, "{}", installed.body);
     assert!(
-        plugins.join("demo").join("1.0.0").is_dir(),
-        "plugin did not use plugins_dir"
+        data.join("plugins").join("demo").join("1.0.0").is_dir(),
+        "plugin did not use data_dir"
     );
     assert!(
-        !sandbox.data.join("plugins").join("demo").exists(),
-        "plugin used the default data directory"
+        !sandbox
+            .root
+            .join("data")
+            .join("plugins")
+            .join("demo")
+            .exists(),
+        "plugin used the old default data directory"
     );
 }
 
@@ -7192,7 +7208,8 @@ fn run_min_config_phase(phase: &str, streams: bool) {
 
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
-    let port_before = fs::read_to_string(sandbox.config.join("http.port")).expect("http.port");
+    let port_before =
+        fs::read_to_string(sandbox.data.join("run").join("http.port")).expect("http.port");
 
     // wait_for_http drops a bare TCP connection. With max_connections = 1 the
     // daemon can still count it when the first real request lands, so the first
@@ -7890,7 +7907,8 @@ fn run_min_config_phase(phase: &str, streams: bool) {
     }
 
     assert_daemon_alive(&mut sandbox, phase);
-    let port_after = fs::read_to_string(sandbox.config.join("http.port")).expect("http.port");
+    let port_after =
+        fs::read_to_string(sandbox.data.join("run").join("http.port")).expect("http.port");
     if port_after != port_before {
         regression_failure(
             &mut sandbox,
@@ -8116,8 +8134,8 @@ fn control_shutdown_reply_is_flushed_before_exit() {
     let mut sandbox = Sandbox::new();
     sandbox.start_daemon();
     let _address = sandbox.wait_for_http();
-    let mut stream =
-        UnixStream::connect(sandbox.config.join("svcd-admin.sock")).expect("admin connect");
+    let mut stream = UnixStream::connect(sandbox.data.join("run").join("svcd-admin.sock"))
+        .expect("admin connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("timeout");
@@ -8156,7 +8174,7 @@ fn control_channel_rejects_an_admin_method_on_the_user_endpoint() {
     sandbox.start_daemon();
     let _address = sandbox.wait_for_http();
     let mut stream =
-        UnixStream::connect(sandbox.config.join("svcd.sock")).expect("control connect");
+        UnixStream::connect(sandbox.data.join("run").join("svcd.sock")).expect("control connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("timeout");
@@ -8192,7 +8210,7 @@ fn http_mcp_stream_reports_an_unreachable_channel_as_an_sse_error() {
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
     set_password(&sandbox, TEST_PASSWORD);
-    fs::remove_file(sandbox.config.join("svcd.sock")).expect("remove control socket");
+    fs::remove_file(sandbox.data.join("run").join("svcd.sock")).expect("remove control socket");
 
     let body = serde_json::to_vec(&json!({
         "jsonrpc": "2.0",

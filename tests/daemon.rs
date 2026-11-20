@@ -342,7 +342,6 @@ impl Sandbox {
             .env("SVCD_CONFIG_DIR", &self.config)
             .env("SVCD_DATA_DIR", &self.data)
             .env("SVCD_LOG_DIR", &self.logs)
-            .env("SVCD_TRUST_DIR", &self.trust)
             .env("SVCD_TEST_UNPRIVILEGED", "1")
             // Tests drive definitions explicitly; the periodic rescan is opt-in
             // per test via `start_daemon_with_env`.
@@ -452,9 +451,9 @@ impl Sandbox {
         self.stop_daemon_at(&config)
     }
 
-    /// Stop, but target `config` instead of the sandbox's own. The control
-    /// socket (Unix) and the pipe name (Windows) both derive from this string,
-    /// so a dir no daemon bound makes the request genuinely unreachable.
+    /// Stop, but target `config` instead of the sandbox's own. The Unix
+    /// socket derives from data/run and the Windows pipe name from config, so
+    /// moving both makes the request genuinely unreachable on every host.
     fn stop_daemon_at(&mut self, config: &Path) -> Result<(), String> {
         let Some(mut child) = self.daemon.take() else {
             return Ok(());
@@ -464,6 +463,12 @@ impl Sandbox {
         command.arg("shutdown");
         self.env(&mut command);
         command.env("SVCD_CONFIG_DIR", config);
+        // A different config is the "unreachable" probe: on Unix the control
+        // socket is under data/run and on Windows the pipe name is derived from
+        // config_dir, so move both. The normal stop keeps the sandbox roots.
+        if config != self.config {
+            command.env("SVCD_DATA_DIR", config.join("no-data"));
+        }
         support::stop_daemon(&mut child, &mut command, self.stop_timeout, || {
             fs::read_to_string(&log).unwrap_or_default()
         })

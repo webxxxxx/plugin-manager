@@ -42,7 +42,7 @@ pub(crate) fn respond(config: &Config, request: &HttpRequest, lan: &Arc<Mutex<La
             Err(_) => return error(500, "internal", "auth state unavailable"),
         };
         return crate::server::mcp::transport::handle(
-            &|request| crate::face::mcp::serve_modern(&config.paths.config_dir, request),
+            &|request| crate::face::mcp::serve_modern(config.paths.control_dir(), request),
             &crate::server::mcp::transport::Request {
                 method: &request.method,
                 headers: &request.headers,
@@ -126,7 +126,7 @@ fn plugin_ui(
         return error(401, "unauthorized", "invalid or expired plugin token");
     }
     if ui.sub == "rpc" {
-        return ui_rpc(&config.paths.config_dir, request, ui.id, auth);
+        return ui_rpc(config.paths.control_dir(), request, ui.id, auth);
     }
     let base = format!("/plugin-ui/{}/{}/", ui.id, ui.token);
     serve_ui(request, &assets, ui.sub, &base)
