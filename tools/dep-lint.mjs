@@ -604,6 +604,49 @@ function assemblyViolations(sources) {
   );
 }
 
+/// V8：装配点不含业务。src/daemon/ 只许装配、协议投影与跨域编排；监督
+/// 状态机、slot 组装、运行态记录、进程派生都必须在 L3 / L0（#230）。
+const COMPOSE_RULES = [
+  { name: "监督状态机", pattern: /\bState::/ },
+  { name: "slot 内部状态", pattern: /\bmachine\./ },
+  { name: "slot 组装", pattern: /\bSlot::new\(/ },
+  { name: "依赖分层", pattern: /\bstart_layers\(/ },
+  { name: "运行态记录", pattern: /\bruntime::(?:save|remove)\(/ },
+  { name: "进程派生", pattern: /\bCommand::spawn\(|\bStdio::/ },
+  { name: "强杀槽", pattern: /\.signal_force\(/ },
+];
+
+function composeViolationsIn(file, text) {
+  if (!file.startsWith("src/daemon/")) return [];
+  const masked = stripComments(text);
+  const lineStarts = [0];
+  for (let index = 0; index < masked.length; index += 1) {
+    if (masked[index] === "\n") lineStarts.push(index + 1);
+  }
+  const tests = testRegions(masked);
+  const inTests = (offset) => tests.some(([start, end]) => offset >= start && offset <= end);
+  const out = [];
+  for (const rule of COMPOSE_RULES) {
+    const re = new RegExp(rule.pattern.source, "g");
+    for (let match = re.exec(masked); match; match = re.exec(masked)) {
+      if (inTests(match.index)) continue;
+      out.push({
+        file,
+        line: lineNumberAt(lineStarts, match.index),
+        rule: rule.name,
+        hint: "装配点只装配；监督逻辑放 supervise/ops（#230）。",
+      });
+    }
+  }
+  return out;
+}
+
+function composeViolations(sources) {
+  return sources.flatMap((source) =>
+    composeViolationsIn(source.file, readFileSync(source.full, "utf8")),
+  );
+}
+
 const SELFTEST_CASES = [
   {
     name: "生产里的 detail 分支",
@@ -770,6 +813,45 @@ const SELFTEST_ASSEMBLY = [
   },
 ];
 
+const SELFTEST_COMPOSE = [
+  {
+    name: "装配点里的监督状态机",
+    file: "src/daemon/driver.rs",
+    source: "fn project() {\n    let _ = State::Running;\n}\n",
+    expected: ["监督状态机"],
+  },
+  {
+    name: "装配点里的 slot 组装",
+    file: "src/daemon/plugins.rs",
+    source: "fn build() {\n    let _ = Slot::new(id, exec);\n}\n",
+    expected: ["slot 组装"],
+  },
+  {
+    name: "装配点里的进程派生",
+    file: "src/daemon/bootstrap.rs",
+    source: "fn spawn() {\n    Command::spawn(cmd);\n}\n",
+    expected: ["进程派生"],
+  },
+  {
+    name: "装配点里的正常编排不算",
+    file: "src/daemon/driver.rs",
+    source: "fn start(host: &mut Supervisor) {\n    host.start_service(\"x\", clock);\n}\n",
+    expected: [],
+  },
+  {
+    name: "测试文件里的状态机不算",
+    file: "src/daemon/tests.rs",
+    source: "#![cfg(test)]\n\nfn t() {\n    let _ = State::Running;\n}\n",
+    expected: [],
+  },
+  {
+    name: "L3 里的状态机不算",
+    file: "src/supervise/ops/host.rs",
+    source: "fn t() {\n    let _ = State::Running;\n}\n",
+    expected: [],
+  },
+];
+
 function selftest() {
   let total = 0;
   let failures = 0;
@@ -808,11 +890,16 @@ function selftest() {
     check(item.name, found, [...new Set(item.expected)].sort());
   }
 
+  for (const item of SELFTEST_COMPOSE) {
+    const found = [...new Set(composeViolationsIn(item.file, item.source).map((entry) => entry.rule))].sort();
+    check(item.name, found, [...new Set(item.expected)].sort());
+  }
+
   console.log(`selftest: ${total - failures}/${total} 通过`);
   return failures;
 }
 
-function report({ map, modules, sources, edges, unknown, stale, missingFiles, badFileModules, unmapped, layers, cycles, suffixes, seam, category, assembly }) {
+function report({ map, modules, sources, edges, unknown, stale, missingFiles, badFileModules, unmapped, layers, cycles, suffixes, seam, category, assembly, compose }) {
   const lines = [];
   lines.push("dep-lint · 观测基线（只读，不改代码）");
   lines.push(`模块 ${sources.length} 个源文件，引用边 ${edges.length} 条，映射 ${modules.size} 项`);
@@ -895,6 +982,13 @@ function report({ map, modules, sources, edges, unknown, stale, missingFiles, ba
   }
   if (assembly.length === 0) lines.push("  （无）");
 
+  lines.push("");
+  lines.push(`[V8] 装配点不含业务（${compose.length}）`);
+  for (const item of compose) {
+    lines.push(`  ${item.file}:${item.line}  ${item.rule}  —— ${item.hint}`);
+  }
+  if (compose.length === 0) lines.push("  （无）");
+
   const total =
     layers.length +
     cycles.length +
@@ -906,10 +1000,11 @@ function report({ map, modules, sources, edges, unknown, stale, missingFiles, ba
     unmapped.length +
     seam.length +
     category.length +
-    assembly.length;
+    assembly.length +
+    compose.length;
   lines.push("");
   lines.push(
-    `合计 ${total} 条违规（层方向 ${layers.length} · 循环分量 ${cycles.length} · 后缀 ${suffixes.errors.length} · 映射 ${mapCount} · seam ${seam.length} · 失败类别 ${category.length} · 单点组装 ${assembly.length}）`,
+    `合计 ${total} 条违规（层方向 ${layers.length} · 循环分量 ${cycles.length} · 后缀 ${suffixes.errors.length} · 映射 ${mapCount} · seam ${seam.length} · 失败类别 ${category.length} · 单点组装 ${assembly.length} · 装配点业务 ${compose.length}）`,
   );
   return { text: lines.join("\n"), total };
 }
@@ -935,10 +1030,11 @@ const suffixes = suffixViolations(sources, map);
 const seam = seamViolations(sources);
 const category = categoryViolations(sources);
 const assembly = assemblyViolations(sources);
-const { text, total } = report({ map, modules, sources, edges, unknown, stale, missingFiles, badFileModules, unmapped, layers, cycles, suffixes, seam, category, assembly });
+const compose = composeViolations(sources);
+const { text, total } = report({ map, modules, sources, edges, unknown, stale, missingFiles, badFileModules, unmapped, layers, cycles, suffixes, seam, category, assembly, compose });
 
 if (args.json) {
-  console.log(JSON.stringify({ total, layers, cycles, suffixes, seam, category, assembly, unknown, stale, missingFiles, badFileModules, unmapped, files: sources.length, edges: edges.length }, null, 2));
+  console.log(JSON.stringify({ total, layers, cycles, suffixes, seam, category, assembly, compose, unknown, stale, missingFiles, badFileModules, unmapped, files: sources.length, edges: edges.length }, null, 2));
 } else {
   console.log(text);
 }
