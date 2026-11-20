@@ -1,3 +1,4 @@
+use super::calls::{CallError, PendingCall};
 use super::*;
 use std::time::{Duration, Instant};
 
