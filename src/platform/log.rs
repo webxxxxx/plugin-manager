@@ -4,6 +4,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
+/// Anything that holds the single supervisor loop longer than this is logged.
+/// The loop is serial, so one slow phase delays every other caller; the 30 s
+/// management deadline then shows up as a 504 far from the real cause.
+const SLOW_LOOP_MS: u64 = 1_000;
+
+/// Log a loop phase that ran past [`SLOW_LOOP_MS`]. Shared by the compose loop
+/// and the supervisor so the threshold has one home.
+pub fn note_slow(what: &str, started: std::time::Instant) {
+    let elapsed = started.elapsed();
+    if elapsed >= std::time::Duration::from_millis(SLOW_LOOP_MS) {
+        svcd(&format!("svcd: {} held the loop for {:?}", what, elapsed));
+    }
+}
+
 /// Rotation threshold used when a caller does not have a configured limit
 /// (unit tests and the generated sample defaults).
 #[cfg(test)]
