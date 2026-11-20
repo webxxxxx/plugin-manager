@@ -104,7 +104,7 @@ preflight 默认只打一行（branch / ahead-behind / dirty / worktree 数）�
 - CI 失败先跑 `node tools/ci-failures.mjs <run-id>`（只打印失败测试、panic 上下文、daemon log 与
   HTTP 响应探针），拿到真实原因再改代码；不要用一轮 CI 验证一个猜测。
 - 同一个失败最多两轮修复；第二轮仍不绿就停下来重新诊断，而不是继续 push。
-- `tests/http.rs` 的 `wait_until` 类 helper 超时会带 daemon log；新增等待 helper 也走它。
+- `tests/http/checks.rs` 的 `wait_until` 类 helper 超时会带 daemon log；新增等待 helper 也走它。
 
 ## 本仓库 hook
 

@@ -1,5 +1,8 @@
 //! control http tests.
 
+#[cfg(unix)]
+use std::io::{BufRead, BufReader};
+
 use super::*;
 
 /// The suite used to wait on `child.wait()` forever when the shutdown request
