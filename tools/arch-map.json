@@ -316,6 +316,7 @@
     "src/face/plugin_streams/sse.rs": "face",
     "src/face/plugin_streams/ws.rs": "face",
     "src/face/plugin_ui.rs": "face",
+    "src/face/routes.rs": "face",
     "src/face/prebody.rs": "face",
     "src/face/support.rs": "face",
     "src/face/uichannel.rs": "uichannel",

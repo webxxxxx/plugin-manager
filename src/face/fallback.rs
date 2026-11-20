@@ -12,6 +12,7 @@ use serde_json::json;
 
 use crate::face::blob_routes;
 use crate::face::plugin_ui::{ui_path, unauthenticated, UiPath};
+use crate::face::routes::{self, Endpoint, Owner};
 use crate::face::support::{decode, error};
 use crate::face::webui;
 use crate::manage as package;
@@ -237,55 +238,33 @@ fn request_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
 /// session routes (#118/#119); every management route and every streamed
 /// transfer is claimed before this function runs.
 fn route(config: &Config, request: &HttpRequest) -> Vec<u8> {
-    let (path, _query) = request
-        .path
-        .split_once('?')
-        .unwrap_or((request.path.as_str(), ""));
-    let mut parts: Vec<&str> = path.trim_matches('/').split('/').collect();
-    if parts.get(2) == Some(&"files") {
-        parts[2] = "file";
-    }
-    if parts.len() < 3 || parts[0] != "api" || parts[1] != "v1" {
-        return error(404, "not_found", "unknown endpoint");
-    }
-
-    match (request.method.as_str(), parts.as_slice()) {
-        ("POST", ["api", "v1", "blobs", "uploads"]) => {
-            blob_routes::create_upload(&config.paths, blob::UploadKind::Blob)
+    let matched = match routes::resolve(&request.method, &request.path) {
+        routes::Match::Found(matched) if matched.spec.owner == Owner::Fallback => matched,
+        routes::Match::MethodNotAllowed { allow, .. } => return method_not_allowed(&allow),
+        _ => return error(404, "not_found", "unknown endpoint"),
+    };
+    let param = |name: &str| decode(matched.param(name).unwrap_or(""));
+    match matched.spec.endpoint {
+        Endpoint::BlobCreate => blob_routes::create_upload(&config.paths, blob::UploadKind::Blob),
+        Endpoint::BlobStatus => {
+            blob_routes::upload_status(&config.paths, blob::UploadKind::Blob, &param("id"))
         }
-        ("GET", ["api", "v1", "blobs", "uploads", id]) => {
-            blob_routes::upload_status(&config.paths, blob::UploadKind::Blob, &decode(id))
+        Endpoint::BlobComplete => {
+            blob_routes::complete_upload(&config.paths, &param("id"), &request.body)
         }
-        ("POST", ["api", "v1", "blobs", "uploads", id, "complete"]) => {
-            blob_routes::complete_upload(&config.paths, &decode(id), &request.body)
+        Endpoint::BlobAbort => {
+            blob_routes::abort_upload(&config.paths, blob::UploadKind::Blob, &param("id"))
         }
-        ("DELETE", ["api", "v1", "blobs", "uploads", id]) => {
-            blob_routes::abort_upload(&config.paths, blob::UploadKind::Blob, &decode(id))
+        Endpoint::FileCreate => blob_routes::create_upload(&config.paths, blob::UploadKind::File),
+        Endpoint::FileStatus => {
+            blob_routes::upload_status(&config.paths, blob::UploadKind::File, &param("id"))
         }
-        (_, ["api", "v1", "blobs"]) => method_not_allowed("POST"),
-        (_, ["api", "v1", "blobs", "uploads"]) => method_not_allowed("POST"),
-        (_, ["api", "v1", "blobs", "uploads", _]) => method_not_allowed("GET, DELETE"),
-        (_, ["api", "v1", "blobs", "uploads", _, "complete"]) => method_not_allowed("POST"),
-        (_, ["api", "v1", "blobs", "uploads", _, "parts", _]) => method_not_allowed("PUT"),
-        (_, ["api", "v1", "blobs", _]) => method_not_allowed("GET"),
-        ("POST", ["api", "v1", "file", "uploads"]) => {
-            blob_routes::create_upload(&config.paths, blob::UploadKind::File)
+        Endpoint::FileComplete => {
+            blob_routes::file_upload_complete(&config.paths, &param("id"), &request.body)
         }
-        ("GET", ["api", "v1", "file", "uploads", id]) => {
-            blob_routes::upload_status(&config.paths, blob::UploadKind::File, &decode(id))
+        Endpoint::FileAbort => {
+            blob_routes::abort_upload(&config.paths, blob::UploadKind::File, &param("id"))
         }
-        ("POST", ["api", "v1", "file", "uploads", id, "complete"]) => {
-            blob_routes::file_upload_complete(&config.paths, &decode(id), &request.body)
-        }
-        ("DELETE", ["api", "v1", "file", "uploads", id]) => {
-            blob_routes::abort_upload(&config.paths, blob::UploadKind::File, &decode(id))
-        }
-        (_, ["api", "v1", "file"]) => method_not_allowed("POST"),
-        (_, ["api", "v1", "file", "uploads"]) => method_not_allowed("POST"),
-        (_, ["api", "v1", "file", "uploads", _]) => method_not_allowed("GET, DELETE"),
-        (_, ["api", "v1", "file", "uploads", _, "complete"]) => method_not_allowed("POST"),
-        (_, ["api", "v1", "file", "uploads", _, "parts", _]) => method_not_allowed("PUT"),
-        (_, ["api", "v1", "file", _]) => method_not_allowed("GET"),
         _ => error(404, "not_found", "unknown endpoint"),
     }
 }

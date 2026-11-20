@@ -48,11 +48,7 @@ impl DownloadTarget {
 /// takeover: /api/v1/files/{id} is the historical alias for
 /// /api/v1/file/{id}.
 pub fn download_target(method: &str, path: &str) -> Option<DownloadTarget> {
-    let path = path.split_once('?').map(|(path, _)| path).unwrap_or(path);
-    let mut parts: Vec<&str> = path.trim_matches('/').split('/').collect();
-    if parts.get(2) == Some(&"files") {
-        parts[2] = "file";
-    }
+    let parts = super::routes::segments(path);
     let head_only = method == "HEAD";
     match (method, parts.as_slice()) {
         ("GET" | "HEAD", ["api", "v1", "blobs", id]) => Some(DownloadTarget::Blob {

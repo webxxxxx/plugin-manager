@@ -6,6 +6,7 @@
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
+use crate::face::routes::{self, Endpoint};
 use crate::platform::config::Config;
 use crate::server::auth::lan::Lan;
 use crate::server::http::model as http;
@@ -39,6 +40,13 @@ impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
         head: &http::Head,
         lan: &Arc<Mutex<Lan>>,
     ) -> Option<Result<crate::server::http::Exchange, Vec<u8>>> {
+        let matched = routes::resolve(&head.method, &head.path).found()?;
+        if !matches!(
+            matched.spec.endpoint,
+            Endpoint::PackageInstall | Endpoint::PackageImport
+        ) {
+            return None;
+        }
         crate::face::install::target(head)?;
         Some(crate::face::install::exchange(
             head,
@@ -52,6 +60,13 @@ impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
         head: &http::Head,
         lan: &Arc<Mutex<Lan>>,
     ) -> Option<Result<crate::server::http::Exchange, Vec<u8>>> {
+        let matched = routes::resolve(&head.method, &head.path).found()?;
+        if !matches!(
+            matched.spec.endpoint,
+            Endpoint::BlobStream | Endpoint::FileStream | Endpoint::BlobPart | Endpoint::FilePart
+        ) {
+            return None;
+        }
         crate::face::blob_upload::upload_target(head)?;
         Some(crate::face::blob_upload::exchange(
             head,
@@ -92,6 +107,6 @@ impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
     }
 
     fn body_policy(&self, head: &http::Head) -> crate::server::http::BodyPolicy {
-        crate::server::http::server_body_policy(head, &self.config.limits)
+        routes::body_policy(head, &self.config.limits)
     }
 }
