@@ -197,6 +197,7 @@ mod tests {
     use crate::platform::limits::derive_with;
     use crate::platform::resources::{ResourceProfile, Workload};
     use crate::platform::settings::{self, Settings};
+    use std::path::{Path, PathBuf};
 
     fn derived(profile: ResourceProfile, settings: Settings) -> (Limits, ResourceReport) {
         let derived = derive_with(&settings, &profile);
@@ -212,6 +213,83 @@ mod tests {
             temp_free_disk: Some(10 * 1024 * 1024 * 1024),
             ..ResourceProfile::default()
         }
+    }
+
+    /// Records every volume the real probe asks about.
+    #[derive(Default)]
+    struct Recording {
+        disks: std::sync::Mutex<Vec<PathBuf>>,
+    }
+
+    impl Recording {
+        fn disks(&self) -> Vec<PathBuf> {
+            self.disks.lock().expect("recording").clone()
+        }
+    }
+
+    impl crate::platform::resources::Machine for Recording {
+        fn read(&self, _path: &Path) -> Option<String> {
+            None
+        }
+
+        fn physical_memory(&self) -> Option<(u64, u64)> {
+            Some((16 * 1024 * 1024 * 1024, 32 * 1024 * 1024 * 1024))
+        }
+
+        fn cpu_count(&self) -> Option<usize> {
+            Some(4)
+        }
+
+        fn free_disk(&self, path: &Path) -> Option<u64> {
+            self.disks
+                .lock()
+                .expect("recording")
+                .push(path.to_path_buf());
+            Some(10 * 1024 * 1024 * 1024)
+        }
+    }
+
+    #[test]
+    fn materialized_roots_probe_data_dir_and_data_temp_for_both_views() {
+        let root = crate::test_support::temp_dir().join(format!(
+            "svcd-probe-paths-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let mut settings = Settings {
+            install_dir: Some(root.join("prefix")),
+            ..Settings::default()
+        };
+        crate::platform::config_file::fill_missing(&mut settings);
+        let data = settings.data_dir.clone().expect("data root");
+        let logs = settings.logs_dir.clone().expect("logs root");
+        let recording = Recording::default();
+        let config = crate::platform::config::Config::bootstrap_with(&settings, None, &recording)
+            .expect("bootstrap");
+
+        assert_eq!(config.paths.data_dir, data);
+        assert_eq!(config.paths.temp_dir, data.join("temp"));
+        assert_eq!(
+            recording.disks(),
+            vec![data.clone(), data.join("temp")],
+            "the install figure uses <data>, the temp figure uses <data>/temp"
+        );
+        assert!(
+            !recording.disks().iter().any(|path| path.starts_with(&logs)),
+            "logs_dir must not be a probe root"
+        );
+
+        let tuned = config_text(&config.limits, &config.resources);
+        assert!(tuned.contains("# temp volume:"), "{tuned}");
+        let status = resources_text(
+            &config.resources.to_json(),
+            "this process",
+            &settings.probe_overrides(),
+        );
+        assert!(status.contains("this process"), "{status}");
     }
 
     #[test]
