@@ -239,7 +239,7 @@
     "face": {
       "concept": "face/api",
       "layer": "face",
-      "note": "#113 起承载已迁移的 /api/v1 端点；install/import 在 face/install.rs（#121）；控制通道/错误映射 helper 在 face/support.rs（#131）"
+      "note": "#113 起承载已迁移的 /api/v1 端点；install/import 在 face/install/（入口 + upload/install_flow/import_flow/backup，#121/#235）；控制通道/错误映射 helper 在 face/support.rs（#131）"
     },
     "mcp": {
       "concept": "face/mcp_tools",
@@ -330,6 +330,10 @@
     "src/face/export.rs": "face",
     "src/face/fallback.rs": "face",
     "src/face/install.rs": "face",
+    "src/face/install/backup.rs": "face",
+    "src/face/install/import_flow.rs": "face",
+    "src/face/install/install_flow.rs": "face",
+    "src/face/install/upload.rs": "face",
     "src/face/mcp.rs": "mcp",
     "src/face/mcp_tools.rs": "mcp",
     "src/face/mod.rs": "face",
