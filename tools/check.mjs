@@ -6,6 +6,7 @@
 //   node tools/check.mjs quick            cargo check --all-targets
 //   node tools/check.mjs lint             cargo clippy --all-targets -- -D warnings
 //   node tools/check.mjs fmt              rustfmt --check on every src/ and tests/ file
+//   node tools/check.mjs size             src/**/*.rs 文件行数预算（size-lint.mjs）
 //   node tools/check.mjs no-default       cargo check --no-default-features --bin svcd
 //   node tools/check.mjs cross [target]   cargo check --target <target> --all-targets
 //   node tools/check.mjs linux [filter]   Windows 宿主：在 WSL2 里跑 Linux 全量（或一个 filter）
@@ -249,7 +250,7 @@ if (tier === "linux") {
 }
 
 if (tier === "--help" || tier === "-h") {
-  console.log("usage: node tools/check.mjs quick|lint|no-default|fmt|cross [target]|linux [filter]|full|test <filter>");
+  console.log("usage: node tools/check.mjs quick|lint|no-default|fmt|size|cross [target]|linux [filter]|full|test <filter>");
   process.exit(0);
 }
 
@@ -330,6 +331,28 @@ if (tier === "fmt") {
   console.log("check: FAILED (fmt)");
   console.log(failureTail(result));
   process.exit(1);
+}
+
+if (tier === "size") {
+  // 文件预算棘轮（#239）：新文件 ≤ 700 生产 / 1,200 总行；白名单只降不升。
+  console.log("check: running size-lint (src/**/*.rs)");
+  const result = spawnSync(process.execPath, [join(HERE, "size-lint.mjs")], {
+    cwd: REPO,
+    encoding: "utf8",
+    timeout: COMPILE_TIMEOUT_MS,
+  });
+  if (result.error && result.error.code !== "ETIMEDOUT") {
+    console.error("check: cannot run size-lint.mjs: " + result.error.message);
+    process.exit(2);
+  }
+  if (timedOut(result)) {
+    reportTimeout(result);
+    process.exit(124);
+  }
+  for (const line of lines(result.stdout).concat(lines(result.stderr))) console.log(line);
+  if (result.status === 0) console.log("check: ok (size)");
+  else console.log("check: FAILED (size)");
+  process.exit(result.status ?? 1);
 }
 
 if (tier === "no-default") {
