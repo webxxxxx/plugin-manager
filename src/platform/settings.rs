@@ -248,10 +248,11 @@ fn environment_document(env: impl Fn(&str) -> Option<String>) -> Result<String, 
 /// One call resolves the file *and* parses it, so the composition root
 /// ([`crate::platform::config::Config::bootstrap`]) gets both values from a single read.
 /// Precedence: an explicit `--conf` (which must exist), then
-/// `SVCD_CONFIG_DIR`, then `<program dir>/svcd.conf`, then the platform config
-/// directory. A missing file in a discovered location is an empty document,
-/// not an error; a broken one is an error. There is no process cache: every
-/// caller decides once and passes the value down.
+/// `SVCD_CONFIG_DIR`, then `<program dir>/config/svcd.conf`, then
+/// `<program dir>/svcd.conf`, then the platform config directory. A
+/// missing file in a discovered location is an empty document, not an error; a
+/// broken one is an error. There is no process cache: every caller decides once
+/// and passes the value down.
 pub(crate) fn load(conf: Option<&Path>) -> Result<(Settings, Option<PathBuf>), String> {
     if let Some(path) = conf {
         if !path.is_file() {
@@ -263,12 +264,14 @@ pub(crate) fn load(conf: Option<&Path>) -> Result<(Settings, Option<PathBuf>), S
         let path = PathBuf::from(dir).join("svcd.conf");
         return Ok((load_from(&path)?, Some(path)));
     }
-    let program_conf = std::env::current_exe()
+    if let Some(dir) = std::env::current_exe()
         .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join("svcd.conf")));
-    if let Some(path) = program_conf {
-        if path.is_file() {
-            return Ok((load_from(&path)?, Some(path)));
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+    {
+        for path in [dir.join("config").join("svcd.conf"), dir.join("svcd.conf")] {
+            if path.is_file() {
+                return Ok((load_from(&path)?, Some(path)));
+            }
         }
     }
     let path = crate::platform::host::dirs::default_config_dir().join("svcd.conf");
