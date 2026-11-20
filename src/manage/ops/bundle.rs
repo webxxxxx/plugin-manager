@@ -50,7 +50,7 @@ pub struct Options {
     pub unsigned: bool,
 }
 
-struct SourceFile {
+pub(super) struct SourceFile {
     path: String,
     data: Vec<u8>,
     mode: u32,
@@ -173,7 +173,7 @@ pub fn bundle(options: &Options) -> Result<PathBuf, ProblemError> {
     Ok(path)
 }
 
-fn assemble_manifest(
+pub(super) fn assemble_manifest(
     dir: &Path,
     sources: &mut [SourceFile],
     mut manifest: Map<String, Value>,
@@ -511,7 +511,7 @@ fn absolute_output(path: &Path) -> Result<PathBuf, ProblemError> {
     })
 }
 
-fn collect(root: &Path) -> Result<Vec<SourceFile>, ProblemError> {
+pub(super) fn collect(root: &Path) -> Result<Vec<SourceFile>, ProblemError> {
     let mut sources = Vec::new();
     walk(root, root, &mut sources)?;
     sources.sort_by(|left, right| left.path.cmp(&right.path));
@@ -532,7 +532,7 @@ fn collect(root: &Path) -> Result<Vec<SourceFile>, ProblemError> {
 /// plain file would look like an all-hole one. The per-file size cap in `walk`
 /// already bounds what a hole can cost.
 #[cfg(unix)]
-fn is_sparse(len: u64, allocated_blocks: u64) -> bool {
+pub(super) fn is_sparse(len: u64, allocated_blocks: u64) -> bool {
     allocated_blocks > 0 && allocated_blocks.saturating_mul(512) < len
 }
 
@@ -695,7 +695,7 @@ fn raw_mode(_metadata: &fs::Metadata, _path: &Path) -> Result<u32, ProblemError>
     Ok(0)
 }
 
-fn effective_mode(
+pub(super) fn effective_mode(
     path: &str,
     raw: u32,
     exec: &str,
@@ -746,7 +746,7 @@ fn effective_mode(
 /// name. It matches the shape `tools/check_spk.mjs` accepts (three or four
 /// `[a-z0-9_]+` components) and keeps path separators and whitespace out of the
 /// default output name.
-fn valid_platform(platform: &str) -> bool {
+pub(super) fn valid_platform(platform: &str) -> bool {
     let parts: Vec<&str> = platform.split('-').collect();
     (3..=4).contains(&parts.len())
         && parts.iter().all(|part| {
@@ -757,13 +757,13 @@ fn valid_platform(platform: &str) -> bool {
         })
 }
 
-fn normalize_exec(value: &str) -> Result<String, ProblemError> {
+pub(super) fn normalize_exec(value: &str) -> Result<String, ProblemError> {
     let value = value.strip_prefix("./").unwrap_or(value);
     package::check_path(value)?;
     Ok(value.to_string())
 }
 
-fn detect_exec(sources: &[SourceFile], accept_scripts: bool) -> Result<String, ProblemError> {
+pub(super) fn detect_exec(sources: &[SourceFile], accept_scripts: bool) -> Result<String, ProblemError> {
     let mut candidates: Vec<String> = sources
         .iter()
         .filter(|source| {
@@ -812,7 +812,7 @@ fn looks_executable(source: &SourceFile, accept_scripts: bool) -> bool {
     }
 }
 
-fn read_skeleton(dir: &Path) -> Result<Option<Map<String, Value>>, ProblemError> {
+pub(super) fn read_skeleton(dir: &Path) -> Result<Option<Map<String, Value>>, ProblemError> {
     let path = dir.join("manifest.json");
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -837,7 +837,7 @@ fn read_skeleton(dir: &Path) -> Result<Option<Map<String, Value>>, ProblemError>
     }
 }
 
-fn default_key_id(path: &Path) -> Result<String, ProblemError> {
+pub(super) fn default_key_id(path: &Path) -> Result<String, ProblemError> {
     path.file_stem()
         .and_then(|stem| stem.to_str())
         .map(str::to_string)
@@ -846,7 +846,7 @@ fn default_key_id(path: &Path) -> Result<String, ProblemError> {
         })
 }
 
-fn read_private_key(path: &Path) -> Result<SigningKey, ProblemError> {
+pub(super) fn read_private_key(path: &Path) -> Result<SigningKey, ProblemError> {
     let bytes = fs::read(path).map_err(|error| {
         Problem::Internal.error(format!("read key {}: {}", path.display(), error))
     })?;

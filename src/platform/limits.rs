@@ -26,7 +26,7 @@ pub const BUDGET_CAP: u64 = 512 * 1024 * 1024;
 #[cfg(mem_high)]
 pub const BUDGET_CAP: u64 = 2 * 1024 * 1024 * 1024;
 
-const MIB: u64 = 1024 * 1024;
+pub(super) const MIB: u64 = 1024 * 1024;
 
 /// What the process costs before any buffer: allocator, registry, the two
 /// loops, log sinks. Deliberately pessimistic; a measured baseline replaces it
@@ -35,15 +35,15 @@ pub const RESIDENT_BASELINE_BYTES: u64 = 32 * MIB;
 
 /// Threads that exist in every topology: the supervisor loop (which polls
 /// plugin stdio) and the server loop.
-const LOOP_THREADS: usize = 2;
+pub(super) const LOOP_THREADS: usize = 2;
 
 /// The invariant never shrinks concurrency below this. Eight clients is the
 /// practical floor for a management service.
-const CONNECTION_FLOOR: usize = 8;
+pub(super) const CONNECTION_FLOOR: usize = 8;
 
 /// The control channel's frame limit. A queued management request holds at most
 /// one frame.
-const IPC_FRAME_MAX: u64 = 64 * 1024;
+pub(super) const IPC_FRAME_MAX: u64 = 64 * 1024;
 
 /// Default blocking-pool workers.
 pub const DEFAULT_BLOCKING_THREADS: usize = 2;
@@ -92,9 +92,9 @@ enum Basis {
 
 /// One row of the derivation table.
 #[derive(Debug, Clone, Copy)]
-struct KeySpec {
-    key: &'static str,
-    min: u64,
+pub(super) struct KeySpec {
+    pub(super) key: &'static str,
+    pub(super) min: u64,
     max: u64,
     basis: Basis,
 }
@@ -120,7 +120,7 @@ impl KeySpec {
 
     /// The value this key gets when the document does not name it: the shape's
     /// share applied to the budget actually in force.
-    fn default_value(&self, workload: Workload, budget: u64) -> u64 {
+    pub(super) fn default_value(&self, workload: Workload, budget: u64) -> u64 {
         let raw = match self.basis {
             Basis::Share(shares) => shares[workload.index()].at(budget),
             Basis::Fixed(values) => values[workload.index()],
@@ -132,12 +132,12 @@ impl KeySpec {
     /// at the budget actually in force, not the ceiling and not the number a
     /// larger build would have used. A typo therefore returns to a sane
     /// number rather than to the largest one that happens to fit.
-    fn fallback_value(&self, workload: Workload, budget: u64) -> u64 {
+    pub(super) fn fallback_value(&self, workload: Workload, budget: u64) -> u64 {
         self.default_value(workload, budget)
     }
 
     /// The largest value a document may name and still be taken as written.
-    fn upper_bound(&self, workload: Workload, budget: u64) -> u64 {
+    pub(super) fn upper_bound(&self, workload: Workload, budget: u64) -> u64 {
         match self.basis {
             Basis::Share(shares) => shares[workload.index()]
                 .at(budget)
@@ -470,19 +470,19 @@ impl Derivation<'_> {
 // reproduces the historical table within one order of magnitude.
 // ---------------------------------------------------------------------------
 
-const REQUEST_STACK: KeySpec = KeySpec::fixed(
+pub(super) const REQUEST_STACK: KeySpec = KeySpec::fixed(
     "request_stack_bytes",
     64 * 1024,
     8 * MIB,
     [128 * 1024, 192 * 1024, 256 * 1024],
 );
-const IO_STACK: KeySpec = KeySpec::fixed(
+pub(super) const IO_STACK: KeySpec = KeySpec::fixed(
     "io_stack_bytes",
     32 * 1024,
     4 * MIB,
     [64 * 1024, 96 * 1024, 128 * 1024],
 );
-const BLOCKING_THREADS: KeySpec = KeySpec::fixed(
+pub(super) const BLOCKING_THREADS: KeySpec = KeySpec::fixed(
     "blocking_threads",
     MIN_BLOCKING_THREADS as u64,
     MAX_BLOCKING_THREADS as u64,
@@ -494,13 +494,13 @@ const BLOCKING_THREADS: KeySpec = KeySpec::fixed(
 );
 /// The wire-level request cap. Complete bodies beyond `max_complete_body` are
 /// spooled, so this one is a protocol bound and not a resident buffer.
-const MAX_BODY: KeySpec = KeySpec::share(
+pub(super) const MAX_BODY: KeySpec = KeySpec::share(
     "max_body_bytes",
     64 * 1024,
     1024 * MIB,
     [Share::of(1, 16), Share::of(1, 8), Share::of(1, 4)],
 );
-const MAX_JSON_BODY: KeySpec = KeySpec::share(
+pub(super) const MAX_JSON_BODY: KeySpec = KeySpec::share(
     "max_json_body_bytes",
     4 * 1024,
     64 * MIB,
@@ -508,20 +508,20 @@ const MAX_JSON_BODY: KeySpec = KeySpec::share(
 );
 /// The per-connection resident body: this is the term the invariant charges for
 /// every connection. It must stay small enough that connections × it fits.
-const MAX_COMPLETE_BODY: KeySpec = KeySpec::share(
+pub(super) const MAX_COMPLETE_BODY: KeySpec = KeySpec::share(
     "max_complete_body_bytes",
     16 * 1024,
     128 * MIB,
     [Share::of(1, 2048), Share::of(1, 512), Share::of(1, 1024)],
 );
-const MAX_HEADER: KeySpec = KeySpec::fixed(
+pub(super) const MAX_HEADER: KeySpec = KeySpec::fixed(
     "max_header_bytes",
     1024,
     MIB,
     [8 * 1024, 16 * 1024, 64 * 1024],
 );
-const MAX_STREAMS: KeySpec = KeySpec::fixed("max_streams", 1, 1024, [8, 16, 64]);
-const STREAM_BUFFER: KeySpec = KeySpec::share(
+pub(super) const MAX_STREAMS: KeySpec = KeySpec::fixed("max_streams", 1, 1024, [8, 16, 64]);
+pub(super) const STREAM_BUFFER: KeySpec = KeySpec::share(
     "stream_buffer_bytes",
     4 * 1024,
     MIB,
@@ -533,7 +533,7 @@ const STREAM_BUFFER: KeySpec = KeySpec::share(
 );
 /// One connection slot may claim this much budget. The three shares are strictly
 /// ordered, so the shapes stay distinguishable at any budget.
-const MAX_CONNECTIONS: KeySpec = KeySpec::share(
+pub(super) const MAX_CONNECTIONS: KeySpec = KeySpec::share(
     "max_connections",
     1,
     4096,
@@ -543,41 +543,41 @@ const MAX_CONNECTIONS: KeySpec = KeySpec::share(
         Share::per(3 * MIB),
     ],
 );
-const MAX_CONNECTIONS_PER_IP: KeySpec =
+pub(super) const MAX_CONNECTIONS_PER_IP: KeySpec =
     KeySpec::fixed("max_connections_per_ip", 1, 1024, [8, 32, 64]);
-const MAX_SUBSCRIPTIONS: KeySpec = KeySpec::fixed("max_subscriptions", 0, 4096, [4, 16, 64]);
-const MAX_SUBSCRIBERS_PER_PLUGIN: KeySpec =
+pub(super) const MAX_SUBSCRIPTIONS: KeySpec = KeySpec::fixed("max_subscriptions", 0, 4096, [4, 16, 64]);
+pub(super) const MAX_SUBSCRIBERS_PER_PLUGIN: KeySpec =
     KeySpec::fixed("max_subscribers_per_plugin", 0, 1024, [4, 16, 64]);
-const IDLE_TIMEOUT: KeySpec = KeySpec::fixed("http_idle_timeout_secs", 1, 3600, [30, 60, 120]);
-const LOG_MAX_BYTES: KeySpec = KeySpec::fixed(
+pub(super) const IDLE_TIMEOUT: KeySpec = KeySpec::fixed("http_idle_timeout_secs", 1, 3600, [30, 60, 120]);
+pub(super) const LOG_MAX_BYTES: KeySpec = KeySpec::fixed(
     "log_max_bytes",
     4 * 1024,
     16 * MIB,
     [64 * 1024, 64 * 1024, 64 * 1024],
 );
-const LOG_ROTATIONS: KeySpec = KeySpec::fixed("log_rotations", 1, 10, [3, 3, 3]);
-const MAX_PACKAGE_BYTES: KeySpec = KeySpec::fixed(
+pub(super) const LOG_ROTATIONS: KeySpec = KeySpec::fixed("log_rotations", 1, 10, [3, 3, 3]);
+pub(super) const MAX_PACKAGE_BYTES: KeySpec = KeySpec::fixed(
     "max_package_bytes",
     MIB,
     1024 * MIB,
     [8 * MIB, 64 * MIB, 512 * MIB],
 );
-const TRANSFER_TIMEOUT: KeySpec =
+pub(super) const TRANSFER_TIMEOUT: KeySpec =
     KeySpec::fixed("transfer_timeout_secs", 10, 3600, [120, 120, 120]);
-const CONTROL_TIMEOUT: KeySpec = KeySpec::fixed("control_timeout_secs", 1, 300, [30, 30, 30]);
-const DEFAULT_TIMEOUT: KeySpec =
+pub(super) const CONTROL_TIMEOUT: KeySpec = KeySpec::fixed("control_timeout_secs", 1, 300, [30, 30, 30]);
+pub(super) const DEFAULT_TIMEOUT: KeySpec =
     KeySpec::fixed("default_timeout", 100, 300_000, [30_000, 30_000, 30_000]);
-const MAX_TIMEOUT: KeySpec =
+pub(super) const MAX_TIMEOUT: KeySpec =
     KeySpec::fixed("max_timeout", 100, 600_000, [300_000, 300_000, 300_000]);
-const WS_MAX_MESSAGE: KeySpec =
+pub(super) const WS_MAX_MESSAGE: KeySpec =
     KeySpec::fixed("ws_max_message_bytes", 1024, 16 * MIB, [MIB, MIB, MIB]);
-const WS_INFLIGHT_BYTES: KeySpec = KeySpec::share(
+pub(super) const WS_INFLIGHT_BYTES: KeySpec = KeySpec::share(
     "ws_inflight_bytes",
     64 * 1024,
     1024 * MIB,
     [Share::of(1, 64), Share::of(1, 64), Share::of(1, 32)],
 );
-const WS_INFLIGHT_REQUESTS: KeySpec = KeySpec::share(
+pub(super) const WS_INFLIGHT_REQUESTS: KeySpec = KeySpec::share(
     "ws_inflight_requests",
     1,
     4096,
@@ -587,14 +587,14 @@ const WS_INFLIGHT_REQUESTS: KeySpec = KeySpec::share(
         Share::per(16 * MIB),
     ],
 );
-const WS_BUFFER_SHRINK: KeySpec = KeySpec::fixed(
+pub(super) const WS_BUFFER_SHRINK: KeySpec = KeySpec::fixed(
     "ws_buffer_shrink_bytes",
     4 * 1024,
     16 * MIB,
     [64 * 1024, 64 * 1024, 64 * 1024],
 );
-const WS_RAW_MAX: KeySpec = KeySpec::fixed("ws_raw_max_bytes", 1024, 16 * MIB, [MIB, MIB, MIB]);
-const WS_RAW_QUEUE: KeySpec = KeySpec::share(
+pub(super) const WS_RAW_MAX: KeySpec = KeySpec::fixed("ws_raw_max_bytes", 1024, 16 * MIB, [MIB, MIB, MIB]);
+pub(super) const WS_RAW_QUEUE: KeySpec = KeySpec::share(
     "ws_raw_queue",
     4,
     4096,
@@ -604,7 +604,7 @@ const WS_RAW_QUEUE: KeySpec = KeySpec::share(
         Share::per(16 * MIB),
     ],
 );
-const PENDING_QUEUE: KeySpec = KeySpec::share(
+pub(super) const PENDING_QUEUE: KeySpec = KeySpec::share(
     "pending_queue",
     8,
     4096,
@@ -614,7 +614,7 @@ const PENDING_QUEUE: KeySpec = KeySpec::share(
         Share::per(4 * MIB),
     ],
 );
-const PROGRESS_QUEUE: KeySpec = KeySpec::share(
+pub(super) const PROGRESS_QUEUE: KeySpec = KeySpec::share(
     "progress_queue",
     4,
     1024,
