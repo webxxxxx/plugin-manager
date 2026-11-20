@@ -238,7 +238,9 @@ src/
     mcp_tools.rs     能力面 → tools/list；MCP 的 envelope 投影（工具结果、拒绝）
     mcp.rs           `mcp` 入口：MCP 客户端 ↔ svcd 的 stdio 桥（era 装饰、分页渲染、legacy 握手）
     routes.rs        method/path → owner、405 Allow、body policy 的唯一来源
-    blob.rs  blob_upload.rs  install.rs  export.rs
+    blob.rs  blob_upload.rs  export.rs
+    install.rs       /api/v1/plugins 与 /api/v1/import 的入口与共享响应（#121）
+    install/         upload.rs  install_flow.rs  import_flow.rs  backup.rs（#235）
 
   cli/                        L5 对外面：命令行
     mod.rs  svc.rs  plugin.rs  status.rs

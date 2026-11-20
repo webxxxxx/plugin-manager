@@ -1,3 +1,11 @@
+#![cfg(test)]
+
+use super::calls::{test_reply_sink, CallError, PendingCall};
+use std::collections::BTreeMap;
+
+use crate::kernel::contract::Wire;
+use crate::kernel::registry::{Hook, Interpreter};
+
 use super::*;
 use std::time::{Duration, Instant};
 

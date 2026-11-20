@@ -18,6 +18,14 @@ use crate::platform::log;
 use crate::platform::paths::Paths;
 use crate::supervise::ops::hook;
 
+mod keep_old;
+mod replace;
+mod space;
+
+use keep_old::{install_keep_old, install_keep_old_staged};
+use replace::{install_replace, install_replace_staged};
+use space::{directory_size, free_space, out_of_space};
+
 /// Preflight a package that has already been streamed into a staging directory.
 /// This mirrors [`verify_package`] but never holds the payload in memory.
 pub fn prepare_staged(
@@ -82,102 +90,6 @@ pub fn install_staged(
             host_interpreter.as_ref(),
             poll,
         ),
-    }
-}
-
-#[allow(clippy::too_many_arguments)] // The strategy split already carries every install input.
-fn install_keep_old_staged(
-    paths: &Paths,
-    limits: &crate::platform::limits::Limits,
-    staged: package::StagedPackage,
-    id: &str,
-    plugin_dir: &Path,
-    was_installed: bool,
-    interpreter: Option<&Interpreter>,
-    poll: &mut dyn FnMut(),
-) -> Result<Service, ProblemError> {
-    let manifest = staged.manifest.clone();
-    let (version_dir, enabled) = commit_staged(staged, plugin_dir, was_installed)?;
-    copy_config_staged(&manifest, plugin_dir, &version_dir)?;
-    let service = service_from_manifest(
-        paths,
-        limits,
-        id,
-        &version_dir,
-        &manifest,
-        enabled,
-        interpreter,
-    )?;
-    run_post_install_manifest(paths, limits, &manifest, id, &version_dir, poll)?;
-    Ok(service)
-}
-
-#[allow(clippy::too_many_arguments)] // The strategy split already carries every install input.
-fn install_replace_staged(
-    paths: &Paths,
-    limits: &crate::platform::limits::Limits,
-    staged: package::StagedPackage,
-    id: &str,
-    plugin_dir: &Path,
-    was_installed: bool,
-    interpreter: Option<&Interpreter>,
-    poll: &mut dyn FnMut(),
-) -> Result<Service, ProblemError> {
-    let manifest = staged.manifest.clone();
-    let old_version =
-        current_version(paths, id).filter(|version| plugin_dir.join(version).is_dir());
-    let old_dir = old_version.as_ref().map(|version| plugin_dir.join(version));
-    let backup = old_version
-        .as_ref()
-        .map(|version| plugin_dir.join(format!(".backup-{}.{}", version, std::process::id())));
-    if let (Some(old_dir), Some(backup)) = (&old_dir, &backup) {
-        if backup.exists() {
-            fs::remove_dir_all(backup).map_err(|error| {
-                Problem::Internal.error(format!("remove {}: {}", backup.display(), error))
-            })?;
-        }
-        fs::rename(old_dir, backup).map_err(|error| {
-            Problem::Invalid.error(format!("backup {}: {}", old_dir.display(), error))
-        })?;
-    }
-    let enabled_existed = plugin_dir.join("enabled").exists();
-    let result = (|| {
-        let (version_dir, enabled) = commit_staged(staged, plugin_dir, was_installed)?;
-        copy_config_staged(&manifest, plugin_dir, &version_dir)?;
-        let service = service_from_manifest(
-            paths,
-            limits,
-            id,
-            &version_dir,
-            &manifest,
-            enabled,
-            interpreter,
-        )?;
-        run_post_install_manifest(paths, limits, &manifest, id, &version_dir, poll)?;
-        Ok(service)
-    })();
-    match result {
-        Ok(service) => {
-            if let Some(backup) = backup {
-                let _ = fs::remove_dir_all(backup);
-            }
-            let _ = remove_versions(plugin_dir, Some(&manifest.version));
-            Ok(service)
-        }
-        Err(error) => {
-            let new_version = plugin_dir.join(&manifest.version);
-            let _ = fs::remove_dir_all(&new_version);
-            if !enabled_existed {
-                let _ = fs::remove_file(plugin_dir.join("enabled"));
-            }
-            if let (Some(backup), Some(old_dir), Some(old_version)) =
-                (&backup, &old_dir, &old_version)
-            {
-                let _ = fs::rename(backup, old_dir);
-                let _ = write_current(plugin_dir, old_version);
-            }
-            Err(error)
-        }
     }
 }
 
@@ -400,46 +312,6 @@ pub fn install_package(
     }
 }
 
-#[allow(clippy::too_many_arguments)] // The strategy split already carries every install input.
-fn install_keep_old(
-    paths: &Paths,
-    limits: &crate::platform::limits::Limits,
-    package: &Package,
-    id: &str,
-    plugin_dir: &Path,
-    was_installed: bool,
-    interpreter: Option<&Interpreter>,
-    poll: &mut dyn FnMut(),
-) -> Result<Service, InstallFailure> {
-    // No hook-specific rollback here: keep-old keeps the previous version and
-    // switches `current`, so a failing post-install just reports the error.
-    // A replace install rolls back through its own strategy handling.
-    //
-    // The new version lives next to the old one until `current` switches, so
-    // the old version's bytes cannot be reclaimed: the plan is the same as a
-    // first install. Running out is the one refusal the caller can retry as
-    // `replace`, so it leaves with its own category.
-    let free = free_space(plugin_dir)?;
-    if replace_plan(free, None, package.unpacked_size()) == ReplacePlan::NoSpace {
-        return Err(InstallFailure::OutOfSpace(out_of_space(
-            package, free, None,
-        )));
-    }
-    let (version_dir, enabled) = write_version(package, plugin_dir, was_installed)?;
-    copy_config(package, plugin_dir)?;
-    let service = service_from_manifest(
-        paths,
-        limits,
-        id,
-        &version_dir,
-        &package.manifest,
-        enabled,
-        interpreter,
-    )?;
-    run_post_install(paths, limits, package, id, &version_dir, poll)?;
-    Ok(service)
-}
-
 fn run_post_install(
     paths: &Paths,
     limits: &crate::platform::limits::Limits,
@@ -475,145 +347,6 @@ fn run_post_install(
             format!("post-install hook failed: {}", error),
         )
     })
-}
-
-#[allow(clippy::too_many_arguments)] // The strategy split already carries every install input.
-fn install_replace(
-    paths: &Paths,
-    limits: &crate::platform::limits::Limits,
-    package: &Package,
-    id: &str,
-    plugin_dir: &Path,
-    was_installed: bool,
-    interpreter: Option<&Interpreter>,
-    poll: &mut dyn FnMut(),
-) -> Result<Service, ProblemError> {
-    let old_version =
-        current_version(paths, id).filter(|version| plugin_dir.join(version).is_dir());
-    let old_dir = old_version.as_ref().map(|version| plugin_dir.join(version));
-    let old_size = match &old_dir {
-        Some(path) => Some(directory_size(path)?),
-        None => None,
-    };
-    let new_size = package.unpacked_size();
-    let free = free_space(plugin_dir)?;
-    let plan = replace_plan(free, old_size, new_size);
-    if plan == ReplacePlan::NoSpace {
-        return Err(out_of_space(package, free, old_size));
-    }
-
-    let backup = if plan == ReplacePlan::Backup {
-        let old_dir = old_dir.as_ref().expect("backup implies an old version");
-        let old_version = old_version.as_ref().expect("backup implies an old version");
-        let backup = plugin_dir.join(format!(".backup-{}.{}", old_version, std::process::id()));
-        if backup.exists() {
-            fs::remove_dir_all(&backup).map_err(|error| {
-                Problem::Internal.error(format!("remove {}: {}", backup.display(), error))
-            })?;
-        }
-        fs::rename(old_dir, &backup).map_err(|error| {
-            Problem::Invalid.error(format!("backup {}: {}", old_dir.display(), error))
-        })?;
-        Some(backup)
-    } else {
-        if plan == ReplacePlan::Reclaim {
-            if let Some(old_dir) = &old_dir {
-                fs::remove_dir_all(old_dir).map_err(|error| {
-                    Problem::Internal.error(format!("remove {}: {}", old_dir.display(), error))
-                })?;
-            }
-            let _ = fs::remove_file(plugin_dir.join("current"));
-        }
-        None
-    };
-
-    let snapshot = ConfigSnapshot::capture(plugin_dir);
-    let enabled_existed = plugin_dir.join("enabled").exists();
-    let result =
-        write_version(package, plugin_dir, was_installed).and_then(|(version_dir, enabled)| {
-            copy_config(package, plugin_dir)?;
-            let service = service_from_manifest(
-                paths,
-                limits,
-                id,
-                &version_dir,
-                &package.manifest,
-                enabled,
-                interpreter,
-            )?;
-            run_post_install(paths, limits, package, id, &version_dir, poll)?;
-            Ok(service)
-        });
-
-    match result {
-        Ok(service) => {
-            if let Some(backup) = backup {
-                if let Err(error) = fs::remove_dir_all(&backup) {
-                    log::svcd(&format!(
-                        "svcd: plugin {}: installed, but cannot remove backup {}: {}",
-                        id,
-                        backup.display(),
-                        error
-                    ));
-                }
-            }
-            if let Err(error) = remove_versions(plugin_dir, Some(&package.manifest.version)) {
-                log::svcd(&format!(
-                    "svcd: plugin {}: installed, but cannot prune old versions: {}",
-                    id, error
-                ));
-            }
-            Ok(service)
-        }
-        Err(error) => {
-            let mut rollback = Vec::new();
-            let new_version = plugin_dir.join(&package.manifest.version);
-            if let Err(remove) = fs::remove_dir_all(&new_version) {
-                if remove.kind() != std::io::ErrorKind::NotFound {
-                    rollback.push(format!("remove {}: {}", new_version.display(), remove));
-                }
-            }
-            if !enabled_existed {
-                let marker = plugin_dir.join("enabled");
-                if let Err(remove) = fs::remove_file(&marker) {
-                    if remove.kind() != std::io::ErrorKind::NotFound {
-                        rollback.push(format!("remove {}: {}", marker.display(), remove));
-                    }
-                }
-            }
-            rollback.extend(snapshot.restore(plugin_dir));
-            if let (Some(backup), Some(old_dir), Some(old_version)) =
-                (&backup, &old_dir, &old_version)
-            {
-                match fs::rename(backup, old_dir) {
-                    Ok(()) => {
-                        if let Err(restore) = write_current(plugin_dir, old_version) {
-                            rollback.push(restore.detail().to_string());
-                        }
-                    }
-                    Err(restore) => {
-                        rollback.push(format!("restore {}: {}", old_dir.display(), restore));
-                    }
-                }
-            } else if backup.is_none() {
-                let current = plugin_dir.join("current");
-                if let Err(remove) = fs::remove_file(&current) {
-                    if remove.kind() != std::io::ErrorKind::NotFound {
-                        rollback.push(format!("remove {}: {}", current.display(), remove));
-                    }
-                }
-            }
-            if rollback.is_empty() {
-                Err(error)
-            } else {
-                Err(Problem::Internal.error(format!(
-                    "{} (rollback incomplete: {})",
-                    error,
-                    rollback.join("; ")
-                )))
-            }
-        }
-    }
 }
 
 fn write_version(
@@ -743,90 +476,6 @@ fn restore_file(path: &Path, content: &Option<Vec<u8>>, config: bool) -> Result<
                 Err(Problem::Internal.error(format!("remove {}: {}", path.display(), error)))
             }
         },
-    }
-}
-
-/// The failure a full disk produces. One message shape for both strategies.
-fn out_of_space(package: &Package, free: u64, old_size: Option<u64>) -> ProblemError {
-    Problem::Internal.error(format!(
-        "not enough space to install {} {}: need {} bytes, {} free{}",
-        package.manifest.name,
-        package.manifest.version,
-        package.unpacked_size(),
-        free,
-        old_size
-            .map(|size| format!(", current version uses {size} bytes"))
-            .unwrap_or_default()
-    ))
-}
-
-fn directory_size(path: &Path) -> Result<u64, ProblemError> {
-    let mut total = 0u64;
-    let entries = fs::read_dir(path)
-        .map_err(|error| Problem::Internal.error(format!("read {}: {}", path.display(), error)))?;
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            Problem::Internal.error(format!("read {}: {}", path.display(), error))
-        })?;
-        let metadata = entry.metadata().map_err(|error| {
-            Problem::Internal.error(format!("stat {}: {}", entry.path().display(), error))
-        })?;
-        if metadata.is_dir() {
-            total = total.saturating_add(directory_size(&entry.path())?);
-        } else {
-            total = total.saturating_add(metadata.len());
-        }
-    }
-    Ok(total)
-}
-
-fn free_space(path: &Path) -> Result<u64, ProblemError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-
-        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-            Problem::Internal.error(format!("free space: invalid path {}", path.display()))
-        })?;
-        // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
-        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-        // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
-        if unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) } != 0 {
-            return Err(Problem::Internal.error(format!(
-                "free space {}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            )));
-        }
-        Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-
-        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-        wide.push(0);
-        let mut available = 0u64;
-        let mut total = 0u64;
-        let mut total_free = 0u64;
-        // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
-        if unsafe {
-            GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut total_free)
-        } == 0
-        {
-            return Err(Problem::Internal.error(format!(
-                "free space {}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            )));
-        }
-        Ok(available)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = path;
-        Err(Problem::Internal.error("free space is not supported on this platform"))
     }
 }
 
