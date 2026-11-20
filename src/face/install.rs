@@ -19,9 +19,9 @@ use crate::platform::config::Config;
 use serde_json::{json, Value};
 
 use crate::kernel::failure::{Problem, ProblemError};
+use crate::manage as package;
+use crate::manage as plugin;
 use crate::manage::ops::transfer;
-use crate::manage::package;
-use crate::manage::plugin;
 use crate::platform::paths::Paths;
 use crate::server::auth::lan::{AuthKind, Lan};
 use crate::server::http::model as http;
@@ -304,6 +304,7 @@ enum Outcome {
     Response(Vec<u8>),
 }
 
+#[allow(clippy::large_enum_variant)] // Per-upload state; boxing would add an allocation to every request.
 enum Flow {
     Install(InstallFlow),
     Import(ImportFlow),
@@ -334,6 +335,7 @@ struct ImportParams {
     force: bool,
 }
 
+#[allow(clippy::large_enum_variant)] // Per-upload staging state; the small variants are the hot path.
 enum ImportStage {
     /// Fewer than 512 bytes have arrived; the first tar header decides between
     /// a package, a backup and a bare config.
@@ -433,12 +435,12 @@ impl PackageUploadStream {
     }
 
     fn on_writable(&mut self, out: &mut OutBuffer<'_>) -> StreamStep {
-        if !self.continue_sent && self.expect_continue {
-            if out.write(b"HTTP/1.1 100 Continue\r\n\r\n") {
-                self.continue_sent = true;
-                return StreamStep::wait(StreamAction::NeedRead);
-            }
-            return StreamStep::wait(StreamAction::NeedWrite);
+        if let Some(step) = crate::face::support::expect_continue(
+            out,
+            &mut self.continue_sent,
+            self.expect_continue,
+        ) {
+            return step;
         }
         if self.response_sent < self.response.len() {
             let take = (self.response.len() - self.response_sent).min(out.remaining());
@@ -1164,9 +1166,8 @@ fn install_staged(
         }),
         budget,
     )
-    .map_err(|response| {
+    .inspect_err(|_| {
         let _ = std::fs::remove_dir_all(root);
-        response
     })
 }
 

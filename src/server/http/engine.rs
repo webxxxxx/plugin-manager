@@ -143,11 +143,10 @@ pub enum PreRequest {
     Handled,
 }
 
-/// The server's connection state machine. The loop owns the connection and the
-/// buffers; this trait only lets the full HTTP server and the control-only
-/// build share the same reactor. It is not a product seam.
+/// The connection state machine. The loop owns the connection and the
+/// buffers; this half only decides what one event means.
 #[cfg(unix)]
-pub trait ServerLoop {
+pub trait ConnectionOps {
     type State;
 
     fn new_state(&mut self, id: u64, peer: IpAddr) -> Self::State;
@@ -167,33 +166,45 @@ pub trait ServerLoop {
     fn on_error(&mut self, connection: &mut Connection<Self::State>, response: Vec<u8>);
     fn on_readable(&mut self, connection: &mut Connection<Self::State>) -> bool;
     fn on_writable(&mut self, connection: &mut Connection<Self::State>) -> bool;
-    fn on_tick(&mut self, table: &mut Table<Self::State>);
     fn interest(&self, connection: &Connection<Self::State>) -> i16;
     fn is_idle(&self, connection: &Connection<Self::State>, now: Instant, idle: Duration) -> bool;
     fn on_close(&mut self, connection: &mut Connection<Self::State>);
 
-    /// The loop is about to drop a connection after `POLLERR` / `POLLHUP`
-    /// (or Linux's `POLLRDHUP`). Handlers use this for protocol-specific
-    /// diagnostics.
+    /// The loop is about to drop a connection after POLLERR / POLLHUP
+    /// (or Linux's POLLRDHUP). Handlers use this for protocol diagnostics.
     fn on_poll_error(&mut self, connection: &mut Connection<Self::State>, _revents: i16) {
         let _ = connection;
     }
+}
 
+/// Per-tick work (idle sweep, blocking completions, control replies).
+#[cfg(unix)]
+pub trait TimerOps {
+    type State;
+
+    fn on_tick(&mut self, table: &mut Table<Self::State>);
+}
+
+/// Sources the loop should poll besides the listener and the connections.
+#[cfg(unix)]
+pub trait ExtraOps {
     /// The blocking pool and control client wake the loop through this fd; the
-    /// loop only uses it to leave poll early, the handler drains it in `on_tick`.
+    /// loop only uses it to leave poll early, the handler drains it in on_tick.
     fn wake_fd(&self) -> Option<RawFd> {
         None
     }
 
-    /// Append the server-loop's extra poll sources (the control listener,
-    /// control connections, outbound management streams). The handler keeps
-    /// the same order for `on_extra_ready`; indices are stable for one pass.
+    /// Append the server-loop's extra poll sources. The handler keeps the same
+    /// order for on_extra_ready; indices are stable for one pass.
     fn prepare_extra(&mut self, _out: &mut Vec<(RawFd, i16)>) {}
 
-    /// One extra source became ready. `index` is the offset in the vector
-    /// `prepare_extra` filled for this pass.
+    /// One extra source became ready.
     fn on_extra_ready(&mut self, _index: usize, _revents: i16) {}
+}
 
+/// Shutdown handshake with the composition root.
+#[cfg(unix)]
+pub trait LifecycleOps {
     /// The composition root asked the loop to flush and return.
     fn should_stop(&self) -> bool {
         false
@@ -203,13 +214,20 @@ pub trait ServerLoop {
     fn on_stop(&mut self) {}
 }
 
+/// Marker for a complete loop implementation. It adds no methods; the four
+/// capability traits are the actual seams.
+#[cfg(unix)]
+pub trait ServerLoop: ConnectionOps + TimerOps + ExtraOps + LifecycleOps {}
+#[cfg(unix)]
+impl<T: ConnectionOps + TimerOps + ExtraOps + LifecycleOps> ServerLoop for T {}
+
 #[cfg(unix)]
 pub fn run<S, H>(
     listener: Option<TcpListener>,
     handler: &mut H,
     limits: &crate::platform::limits::Limits,
 ) where
-    H: ServerLoop<State = S>,
+    H: ServerLoop + ConnectionOps<State = S> + TimerOps<State = S>,
 {
     if let Some(listener) = &listener {
         let _ = listener.set_nonblocking(true);
@@ -279,18 +297,8 @@ pub fn run<S, H>(
             });
         }
 
-        let ready = unsafe {
-            libc::poll(
-                descriptors.as_mut_ptr(),
-                descriptors.len() as libc::nfds_t,
-                100,
-            )
-        };
-        if ready < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
-                crate::platform::log::svcd(&format!("svcd: server loop poll failed: {}", error));
-            }
+        if let Err(error) = crate::platform::host::poll::poll(&mut descriptors, 100) {
+            crate::platform::log::svcd(&format!("svcd: server loop poll failed: {}", error));
             continue;
         }
         if descriptors[1].revents & libc::POLLIN != 0 {

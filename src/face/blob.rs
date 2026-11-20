@@ -760,7 +760,6 @@ fn etag_matches(header: &str, etag: &str, strong: bool) -> bool {
 mod tests {
     use super::*;
     use crate::server::auth::lan::AuthKind;
-    use std::io::{Read, Seek, SeekFrom};
 
     fn request(method: &str, path: &str, headers: &[(&str, &str)]) -> Request {
         Request {
@@ -783,16 +782,7 @@ mod tests {
     fn test_paths() -> &'static Paths {
         static PATHS: std::sync::OnceLock<Paths> = std::sync::OnceLock::new();
         PATHS.get_or_init(|| {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let root = crate::test_support::temp_dir().join(format!(
-                "svcd-blob-face-{}-{}",
-                std::process::id(),
-                nanos
-            ));
-            let paths = Paths::under(&root);
+            let paths = crate::platform::test_support::paths("blob-face");
             std::fs::create_dir_all(&paths.temp_dir).expect("content store");
             paths
         })
@@ -808,39 +798,12 @@ mod tests {
     /// buffer, the submitted open job run inline, file sends performed, then a
     /// fresh Writable event.
     fn drive(mut handler: DownloadStream, limit: usize) -> (Vec<u8>, CloseReason) {
-        let mut all = Vec::new();
-        let mut out = Vec::new();
-        let mut step =
-            handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
-        for _ in 0..10_000 {
-            assert!(
-                out.len() <= limit,
-                "a writable event must respect the output buffer limit"
-            );
-            all.extend_from_slice(&out);
-            out.clear();
-            match step.action {
-                StreamAction::Close(reason) => return (all, reason),
-                StreamAction::SendFile(mut send) => {
-                    send.file
-                        .seek(SeekFrom::Start(send.offset))
-                        .expect("seek file send");
-                    let mut reader = (&mut send.file).take(send.length);
-                    reader.read_to_end(&mut all).expect("read file send");
-                }
-                StreamAction::SubmitBlocking(job) => {
-                    let outcome = job(crate::server::http::JobBudget::for_test());
-                    step = handler.on_event(
-                        StreamEvent::BlockingDone(outcome),
-                        &mut OutBuffer::new(&mut out, limit),
-                    );
-                    continue;
-                }
-                StreamAction::Continue | StreamAction::NeedRead | StreamAction::NeedWrite => {}
-            }
-            step = handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
-        }
-        panic!("the handler never finished");
+        crate::server::http::test_support::drive_stream(
+            &mut handler,
+            limit,
+            crate::server::http::test_support::SendFilePolicy::Continue,
+            true,
+        )
     }
 
     fn body(bytes: &[u8]) -> &[u8] {

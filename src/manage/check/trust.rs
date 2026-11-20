@@ -11,7 +11,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::kernel::failure::{Problem, ProblemError};
-use crate::manage::package;
+use crate::manage as package;
 use crate::platform::paths::Paths;
 
 /// Public keys are tiny; a larger file is a mistake, not a key.
@@ -20,7 +20,7 @@ pub const MAX_KEY_BYTES: u64 = 16 * 1024;
 /// Sorted key ids present in `trust.d`; a missing directory means "none".
 pub fn keys(paths: &Paths) -> Result<Vec<String>, ProblemError> {
     let directory = &paths.trust_dir;
-    let entries = match fs::read_dir(&directory) {
+    let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
@@ -61,10 +61,10 @@ pub fn add(paths: &Paths, key_id: &str, pem: &[u8]) -> Result<PathBuf, ProblemEr
     }
     package::validate_public_key(pem)?;
     let directory = &paths.trust_dir;
-    fs::create_dir_all(&directory).map_err(|error| {
+    fs::create_dir_all(directory).map_err(|error| {
         Problem::Internal.error(format!("create {}: {}", directory.display(), error))
     })?;
-    set_dir_mode(&directory);
+    set_dir_mode(directory);
     let target = key_path(paths, key_id);
     fs::write(&target, pem).map_err(|error| {
         Problem::Internal.error(format!("write {}: {}", target.display(), error))

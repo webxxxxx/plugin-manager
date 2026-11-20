@@ -245,12 +245,12 @@ impl BlobUploadStream {
     }
 
     fn on_writable(&mut self, out: &mut OutBuffer<'_>) -> StreamStep {
-        if !self.continue_sent && self.expect_continue {
-            if out.write(b"HTTP/1.1 100 Continue\r\n\r\n") {
-                self.continue_sent = true;
-                return StreamStep::wait(StreamAction::NeedRead);
-            }
-            return StreamStep::wait(StreamAction::NeedWrite);
+        if let Some(step) = crate::face::support::expect_continue(
+            out,
+            &mut self.continue_sent,
+            self.expect_continue,
+        ) {
+            return step;
         }
         if self.response_sent < self.response.len() {
             let take = (self.response.len() - self.response_sent).min(out.remaining());
@@ -308,7 +308,7 @@ impl BlobUploadStream {
                         self.on_writable(out)
                     }
                     Some(Err(failure)) => {
-                        self.respond(failure_response(failure.status(), &failure.detail()));
+                        self.respond(failure_response(failure.status(), failure.detail()));
                         self.on_writable(out)
                     }
                     None => {
@@ -786,16 +786,7 @@ mod tests {
     fn test_paths() -> &'static Paths {
         static PATHS: std::sync::OnceLock<Paths> = std::sync::OnceLock::new();
         PATHS.get_or_init(|| {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let root = crate::test_support::temp_dir().join(format!(
-                "svcd-blob-upload-face-{}-{}",
-                std::process::id(),
-                nanos
-            ));
-            let paths = Paths::under(&root);
+            let paths = crate::platform::test_support::paths("blob-upload-face");
             std::fs::create_dir_all(&paths.temp_dir).expect("content store");
             paths
         })

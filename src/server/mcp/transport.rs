@@ -108,9 +108,7 @@ pub fn prepare_streaming(
             "cross-origin calls are not allowed",
         ));
     }
-    if let Err(response) = authorize(request.headers, password_hash) {
-        return Err(response);
-    }
+    authorize(request.headers, password_hash)?;
     let accept = http::header(request.headers, "accept").unwrap_or("");
     if !accept.to_ascii_lowercase().contains("text/event-stream") {
         return Ok(None);
@@ -171,6 +169,7 @@ fn reply(status: u16, response: rpc::Response) -> Vec<u8> {
     )
 }
 
+#[allow(clippy::result_large_err)] // Same protocol-value error path as validate_meta.
 fn validate_headers(
     headers: &[(String, String)],
     request: &rpc::Request,

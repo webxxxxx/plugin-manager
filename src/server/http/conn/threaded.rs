@@ -1,7 +1,7 @@
 //! Per-connection thread driver: one thread per accepted socket, with the
 //! admission caps applied before the thread exists.
 //!
-//! The accept loop, admission and framing live in `server/http/threads.rs`;
+//! The accept loop, admission and framing live in `server/http/thread_loop.rs`;
 //! this adapter is the seam between [`super::ConnectionDriver`] and that loop
 //! (#140). Since #205 it also owns the thread's lifetime: the connection
 //! handler arrives as data in [`StartInput`], so the composition root writes no
@@ -14,7 +14,7 @@ use std::sync::Arc;
 use crate::platform::host::threads as host_threads;
 use crate::platform::log;
 use crate::server::http::conn::{ConnectionDriver, ServerHandle, StartInput};
-use crate::server::http::threads::{admission, serve, Connection};
+use crate::server::http::thread_loop::{admission, serve, Connection};
 
 /// Thread-per-connection driver.
 pub(crate) struct Driver;

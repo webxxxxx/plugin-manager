@@ -5,6 +5,8 @@
 //! writes them across consecutive writable events; it never replaces the
 //! server's buffer with an unbounded one.
 
+use std::collections::VecDeque;
+
 use crate::server::http::OutBuffer;
 use crate::wire::ws::frame;
 
@@ -45,4 +47,61 @@ impl PendingFrame {
         self.payload_at += take;
         self.payload_at >= self.payload.len()
     }
+}
+
+/// What one writable event managed to drain from the head, the queued frames
+/// and the close frame.
+pub(crate) enum QueuedWrite {
+    /// The output buffer filled up; ask for another writable event.
+    NeedWrite,
+    /// The close frame is queued but an oversized inbound frame is still being
+    /// drained, so keep reading.
+    NeedRead,
+    /// Everything, including the close frame, was written.
+    Closed,
+    /// The head and every queued frame fitted.
+    Complete,
+}
+
+/// The shared head/frame/close drain used by the raw-WS and plugin-UI WS
+/// handlers. `discard` is the handler's remaining oversized-frame byte count.
+pub(crate) fn write_queued(
+    head: &[u8],
+    head_at: &mut usize,
+    frames: &mut VecDeque<PendingFrame>,
+    close: &mut Option<Vec<u8>>,
+    closing: bool,
+    discard: usize,
+    out: &mut OutBuffer<'_>,
+) -> QueuedWrite {
+    if *head_at < head.len() {
+        let take = (head.len() - *head_at).min(out.remaining());
+        out.write(&head[*head_at..*head_at + take]);
+        *head_at += take;
+        if *head_at < head.len() {
+            return QueuedWrite::NeedWrite;
+        }
+    }
+    while let Some(frame) = frames.front_mut() {
+        if !frame.write(out) {
+            return QueuedWrite::NeedWrite;
+        }
+        frames.pop_front();
+    }
+    if closing {
+        if let Some(payload) = close.take() {
+            let mut frame = PendingFrame::new(0x8, payload);
+            if !frame.write(out) {
+                frames.push_front(frame);
+                return QueuedWrite::NeedWrite;
+            }
+        }
+        if discard > 0 {
+            return QueuedWrite::NeedRead;
+        }
+        if frames.is_empty() {
+            return QueuedWrite::Closed;
+        }
+    }
+    QueuedWrite::Complete
 }

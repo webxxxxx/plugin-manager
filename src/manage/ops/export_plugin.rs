@@ -3,8 +3,8 @@ use std::fs;
 use std::path::Path;
 
 use crate::kernel::failure::{Problem, ProblemError};
+use crate::manage as package;
 use crate::manage::model::layout::{active_config, current_version, plugin_dir};
-use crate::manage::package;
 use crate::platform::paths::Paths;
 
 #[derive(Debug, serde::Deserialize)]

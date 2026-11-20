@@ -31,6 +31,7 @@ impl Served {
     }
 }
 
+#[allow(clippy::result_large_err)] // JSON-RPC error responses are the protocol value, not a boxed exception.
 pub(crate) fn validate_meta(id: Option<Value>, params: &Value) -> Result<(), rpc::Response> {
     let Some(meta) = params.get("_meta").and_then(Value::as_object) else {
         return Err(rpc::err(id, -32602, "missing _meta"));

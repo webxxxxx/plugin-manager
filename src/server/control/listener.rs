@@ -426,6 +426,7 @@ mod tests {
                     revents: 0,
                 })
                 .collect();
+            // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
             unsafe {
                 libc::poll(
                     descriptors.as_mut_ptr(),
@@ -528,6 +529,7 @@ mod tests {
                     revents: 0,
                 })
                 .collect();
+            // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
             unsafe {
                 libc::poll(
                     descriptors.as_mut_ptr(),

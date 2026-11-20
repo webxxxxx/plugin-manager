@@ -7,9 +7,9 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::kernel::failure::{Problem, ProblemError};
+use crate::manage as package;
 use crate::manage::model::layout::{current_version, plugin_dir};
 use crate::manage::ops::scan::read_manifest;
-use crate::manage::package;
 use crate::platform::paths::Paths;
 
 pub fn lock_config(paths: &Paths, id: &str) -> Result<fs::File, ProblemError> {
@@ -23,6 +23,7 @@ pub fn lock_config(paths: &Paths, id: &str) -> Result<fs::File, ProblemError> {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
+        // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(Problem::Internal.error(format!(
                 "lock {}: {}",

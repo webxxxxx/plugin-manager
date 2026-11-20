@@ -82,6 +82,7 @@ fn linux_try_sendfile(
     // Linux caps one sendfile call at 0x7ffff000 bytes.
     let chunk = std::cmp::min(length, 0x7fff_f000) as usize;
     let sent =
+        // SAFETY: The file descriptor and offset come from the live download stream; the kernel validates the range.
         unsafe { libc::sendfile(stream.as_raw_fd(), file.as_raw_fd(), &mut position, chunk) };
     if sent < 0 {
         let error = io::Error::last_os_error();
@@ -121,6 +122,7 @@ fn windows_transmit_file(
     while remaining > 0 {
         file.seek(SeekFrom::Start(position))?;
         let chunk = std::cmp::min(remaining, u32::MAX as u64) as u32;
+        // SAFETY: The file descriptor and offset come from the live download stream; the kernel validates the range.
         let sent = unsafe {
             TransmitFile(
                 socket,

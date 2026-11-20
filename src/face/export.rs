@@ -22,8 +22,9 @@ use std::fs::File;
 use std::sync::Arc;
 
 use crate::kernel::failure::{Problem, ProblemError};
-use crate::manage::package::{self, TarPart, TarPlan};
-use crate::manage::plugin;
+use crate::manage as package;
+use crate::manage as plugin;
+use crate::manage::{TarPart, TarPlan};
 use crate::platform::paths::Paths;
 use crate::server::http::model as http;
 use crate::server::http::{
@@ -191,10 +192,8 @@ impl ExportStream {
     fn on_writable(&mut self, out: &mut OutBuffer<'_>) -> StreamStep {
         self.begin();
         loop {
-            if self.head_sent < self.head.len() {
-                if !drain(out, &self.head, &mut self.head_sent) {
-                    return StreamStep::wait(StreamAction::NeedWrite);
-                }
+            if self.head_sent < self.head.len() && !drain(out, &self.head, &mut self.head_sent) {
+                return StreamStep::wait(StreamAction::NeedWrite);
             }
             let Some(part) = self.plan.parts().get(self.index) else {
                 return StreamStep::wait(StreamAction::Close(CloseReason::Completed));
@@ -297,7 +296,6 @@ mod tests {
     use super::*;
     use serde_json::{json, Value};
     use std::fs;
-    use std::io::{Read, Seek, SeekFrom};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -375,31 +373,12 @@ mod tests {
     /// Drive the handler the way the server driver does: one bounded output
     /// buffer, server-side file sends performed, then a fresh Writable event.
     fn drive(mut handler: ExportStream, limit: usize) -> (Vec<u8>, CloseReason) {
-        let mut all = Vec::new();
-        let mut out = Vec::new();
-        for _ in 0..100_000 {
-            let step =
-                handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
-            assert!(
-                out.len() <= limit,
-                "a writable event must respect the output buffer limit"
-            );
-            all.extend_from_slice(&out);
-            out.clear();
-            match step.action {
-                StreamAction::Close(reason) => return (all, reason),
-                StreamAction::SendFile(mut send) => {
-                    send.file
-                        .seek(SeekFrom::Start(send.offset))
-                        .expect("seek file send");
-                    let mut reader = (&mut send.file).take(send.length);
-                    reader.read_to_end(&mut all).expect("read file send");
-                }
-                StreamAction::Continue | StreamAction::NeedRead | StreamAction::NeedWrite => {}
-                StreamAction::SubmitBlocking(_) => panic!("an export submits no blocking job"),
-            }
-        }
-        panic!("the handler never finished");
+        crate::server::http::test_support::drive_stream(
+            &mut handler,
+            limit,
+            crate::server::http::test_support::SendFilePolicy::Continue,
+            false,
+        )
     }
 
     fn text(bytes: &[u8]) -> String {
@@ -454,7 +433,7 @@ mod tests {
     }
 
     fn test_paths() -> Arc<Paths> {
-        Arc::new(Paths::under(&temp_dir()))
+        Arc::new(crate::platform::test_support::paths("export"))
     }
 
     fn spk(version_dir: &Path, name: &str) -> ExportStream {

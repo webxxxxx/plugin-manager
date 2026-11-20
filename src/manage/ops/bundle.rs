@@ -20,7 +20,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{Map, Value};
 
 use crate::kernel::failure::{Problem, ProblemError};
-use crate::manage::package::{self, Manifest};
+use crate::manage as package;
+use crate::manage::Manifest;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Options {
@@ -656,7 +657,9 @@ fn windows_file_info(
         FileStandardInfo, GetFileInformationByHandleEx, FILE_STANDARD_INFO,
     };
 
+    // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
     let mut info: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
     let ok = unsafe {
         GetFileInformationByHandleEx(
             file.as_raw_handle() as _,

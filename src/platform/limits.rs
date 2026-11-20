@@ -9,16 +9,6 @@ use std::time::Duration;
 
 use crate::platform::settings;
 
-#[allow(dead_code)]
-#[cfg(mem_low)]
-pub const LEVEL: &str = "low";
-#[allow(dead_code)]
-#[cfg(mem_middle)]
-pub const LEVEL: &str = "middle";
-#[allow(dead_code)]
-#[cfg(mem_high)]
-pub const LEVEL: &str = "high";
-
 #[cfg(mem_low)]
 mod defaults {
     pub const MAX_BODY: u64 = 8 * 1024 * 1024;

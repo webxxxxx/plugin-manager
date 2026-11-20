@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::face::plugin_ui::{PluginUiStream, UiPath};
 use crate::face::uichannel;
-use crate::manage::package;
-use crate::manage::plugin;
+use crate::manage as package;
+use crate::manage as plugin;
 use crate::platform::paths::Paths;
 use crate::server::auth::lan::{AuthKind, Lan};
 use crate::server::http::model as http;
@@ -113,6 +113,42 @@ fn too_many_subscribers() -> Refusal {
     )
 }
 
+/// The one admission pipeline for the three realtime transports. Each protocol
+/// only writes its policy row; the auth order lives here once.
+struct StreamPolicy {
+    require_assets: bool,
+    require_raw: bool,
+    cookie_origin: Option<&'static str>,
+    websocket: bool,
+}
+
+fn admit(
+    ui: &UiPath<'_>,
+    request: &Request,
+    lan: &Arc<Mutex<Lan>>,
+    context: &StreamContext,
+    policy: StreamPolicy,
+) -> Result<Option<String>, Refusal> {
+    valid_ui(&context.paths, ui, policy.require_assets)?;
+    if policy.require_raw && !context.limits.ws_raw_enabled {
+        return Err(http::json_error(
+            403,
+            "forbidden",
+            "raw transport is disabled",
+        ));
+    }
+    valid_token(lan, ui)?;
+    same_origin(&request.headers)?;
+    if let Some(message) = policy.cookie_origin {
+        cookie_origin(request.principal, &request.headers, message)?;
+    }
+    if policy.websocket {
+        handshake(&request.headers).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 /// `/plugin-ui/{id}/{token}/events`: subscribe before returning the handler so
 /// a replay ring failure is a normal HTTP error, not a stream that dies later.
 pub(crate) fn open_sse(
@@ -121,13 +157,13 @@ pub(crate) fn open_sse(
     lan: &Arc<Mutex<Lan>>,
     context: &StreamContext,
 ) -> Box<dyn StreamHandler> {
-    if let Err(response) = valid_ui(&context.paths, ui, true) {
-        return boxed(response);
-    }
-    if let Err(response) = valid_token(lan, ui) {
-        return boxed(response);
-    }
-    if let Err(response) = same_origin(&request.headers) {
+    let policy = StreamPolicy {
+        require_assets: true,
+        require_raw: false,
+        cookie_origin: None,
+        websocket: false,
+    };
+    if let Err(response) = admit(ui, request, lan, context, policy) {
         return boxed(response);
     }
     let last_event_id = http::header(&request.headers, "last-event-id")
@@ -149,24 +185,15 @@ pub(crate) fn open_ws(
     lan: &Arc<Mutex<Lan>>,
     context: &StreamContext,
 ) -> Box<dyn StreamHandler> {
-    if let Err(response) = valid_ui(&context.paths, ui, true) {
-        return boxed(response);
-    }
-    if let Err(response) = valid_token(lan, ui) {
-        return boxed(response);
-    }
-    if let Err(response) = same_origin(&request.headers) {
-        return boxed(response);
-    }
-    if let Err(response) = cookie_origin(
-        request.principal,
-        &request.headers,
-        "Origin is required for cookie-authenticated WebSocket calls",
-    ) {
-        return boxed(response);
-    }
-    let accept = match handshake(&request.headers) {
-        Ok(accept) => accept,
+    let policy = StreamPolicy {
+        require_assets: true,
+        require_raw: false,
+        cookie_origin: Some("Origin is required for cookie-authenticated WebSocket calls"),
+        websocket: true,
+    };
+    let accept = match admit(ui, request, lan, context, policy) {
+        Ok(Some(accept)) => accept,
+        Ok(None) => return boxed(http::json_error(500, "internal", "missing handshake")),
         Err(response) => return boxed(response),
     };
     match uichannel::bus().subscribe(ui.id, &context.limits) {
@@ -190,31 +217,15 @@ pub(crate) fn open_raw(
     lan: &Arc<Mutex<Lan>>,
     context: &StreamContext,
 ) -> Box<dyn StreamHandler> {
-    if let Err(response) = valid_ui(&context.paths, ui, false) {
-        return boxed(response);
-    }
-    if !context.limits.ws_raw_enabled {
-        return boxed(http::json_error(
-            403,
-            "forbidden",
-            "raw transport is disabled",
-        ));
-    }
-    if let Err(response) = valid_token(lan, ui) {
-        return boxed(response);
-    }
-    if let Err(response) = same_origin(&request.headers) {
-        return boxed(response);
-    }
-    if let Err(response) = cookie_origin(
-        request.principal,
-        &request.headers,
-        "Origin is required for cookie-authenticated calls",
-    ) {
-        return boxed(response);
-    }
-    let accept = match handshake(&request.headers) {
-        Ok(accept) => accept,
+    let policy = StreamPolicy {
+        require_assets: false,
+        require_raw: true,
+        cookie_origin: Some("Origin is required for cookie-authenticated calls"),
+        websocket: true,
+    };
+    let accept = match admit(ui, request, lan, context, policy) {
+        Ok(Some(accept)) => accept,
+        Ok(None) => return boxed(http::json_error(500, "internal", "missing handshake")),
         Err(response) => return boxed(response),
     };
     let Some(hub) = &context.raw_hub else {

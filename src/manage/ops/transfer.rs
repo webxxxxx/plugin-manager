@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::json;
 
 use crate::kernel::failure::{Problem, ProblemError};
-use crate::manage::package;
-use crate::manage::plugin;
+use crate::manage as package;
+use crate::manage as plugin;
 use crate::platform::paths::Paths;
 use crate::wire::control::channel;
 use crate::wire::message::rpc;

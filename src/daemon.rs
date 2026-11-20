@@ -30,14 +30,16 @@ use crate::kernel::failure::{Class, Failure, Problem, ProblemError, Retry};
 use crate::kernel::projection::{anchored_mono_ms, anchored_secs, anchored_secs_opt, Status};
 use crate::kernel::registry::{Hook, Kind, Registry, Service, State, RESERVED_ID};
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
-use crate::manage::package;
-use crate::manage::plugin::{self, Strategy};
+use crate::manage as package;
+use crate::manage as plugin;
+use crate::manage::Strategy;
 use crate::platform::clock::{Clock, Now};
 use crate::platform::compat;
 use crate::platform::config::Config;
 use crate::platform::host::wake::Wake;
 use crate::platform::log;
 use crate::platform::paths::Paths;
+#[cfg(feature = "http")]
 use crate::platform::settings;
 #[cfg(feature = "http")]
 use crate::server::auth::lan::Lan;
@@ -125,7 +127,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
             return 1;
         }
     }
-    crate::manage::plugin::cleanup_staging(&config.paths);
+    crate::manage::cleanup_staging(&config.paths);
     // The channel no longer uses a token: authorization is the endpoint ACL.
     // Remove whatever the previous version left behind so nothing keeps reading
     // a stale secret.
@@ -496,6 +498,7 @@ fn install_shutdown_signal() {
     extern "C" fn handle(_: libc::c_int) {
         request_shutdown();
     }
+    // SAFETY: The handle is owned by the daemon for its whole lifetime; the pointer is used only for this call.
     unsafe {
         libc::signal(libc::SIGTERM, handle as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, handle as *const () as libc::sighandler_t);
@@ -511,6 +514,7 @@ fn install_shutdown_signal() {
         1
     }
 
+    // SAFETY: The handle is owned by the daemon for its whole lifetime; the pointer is used only for this call.
     unsafe {
         SetConsoleCtrlHandler(Some(handle), 1);
     }
@@ -692,7 +696,7 @@ impl Daemon {
                 slot.set_remain_after_exit(service.remain_after_exit);
                 slot.set_initial_state(service.state);
                 slot.set_wake(wake.clone());
-                configure_slot(&mut slot, &service, &config.limits);
+                configure_slot(&mut slot, service, &config.limits);
                 slots.insert(service.id.clone(), slot);
             }
         }
@@ -1111,7 +1115,7 @@ impl Daemon {
         let request = match rpc::parse(&incoming.line) {
             Ok(request) => request,
             Err(response) => {
-                let _ = incoming.reply.send(rpc::to_line(&response));
+                incoming.reply.send(rpc::to_line(&response));
                 return;
             }
         };
@@ -1125,14 +1129,14 @@ impl Daemon {
                 "unauthorized",
                 Problem::Internal.error_data(),
             );
-            let _ = incoming.reply.send(rpc::to_line(&response));
+            incoming.reply.send(rpc::to_line(&response));
             return;
         }
         match method.as_str() {
             "registry.call" | "tools/call" => self.handle_tool_call(clock, request, incoming.reply),
             _ => {
                 let response = self.dispatch(clock, request);
-                let _ = incoming.reply.send(rpc::to_line(&response));
+                incoming.reply.send(rpc::to_line(&response));
             }
         }
         self.note_slow(&format!("request {}", method), started);
@@ -2625,7 +2629,7 @@ fn projected_done(
             )),
             Err(failure) => Err(failure),
         };
-        let _ = reply.send(project(external_id, outcome));
+        reply.send(project(external_id, outcome));
     })
 }
 
@@ -2634,10 +2638,10 @@ fn projected_done(
 fn configure_slot(slot: &mut Slot, service: &Service, limits: &crate::platform::limits::Limits) {
     slot.set_contract(service.contract.clone());
     slot.set_call_timeout(limits.default_timeout);
-    let id = service.id.clone();
+    let _id = service.id.clone();
     slot.set_notifier(Arc::new(move |method, params| {
         #[cfg(feature = "http")]
-        crate::face::uichannel::publish(&id, method, params);
+        crate::face::uichannel::publish(&_id, method, params);
         #[cfg(not(feature = "http"))]
         {
             let _ = (method, params);
@@ -2762,6 +2766,7 @@ fn status_detail(output: &str, status: Option<std::process::ExitStatus>) -> Stri
     }
 }
 
+#[allow(clippy::result_large_err)] // The response is the wire value; boxing it would only move the cost.
 fn param_id(request: &rpc::Request) -> Result<String, rpc::Response> {
     request
         .params
@@ -4329,11 +4334,11 @@ while ($null -ne [Console]::In.ReadLine()) { }
             receiver,
             None,
         );
-        let dir = package::tempdir::TempDir::new();
+        let dir = crate::manage::package::tempdir::TempDir::new();
         let path = dir.path().join("svc.spk");
         std::fs::write(
             &path,
-            package::test_signed_package("svc", crate::platform::target()),
+            crate::manage::package::test_signed_package("svc", crate::platform::target()),
         )
         .expect("write package");
 
@@ -4354,10 +4359,13 @@ while ($null -ne [Console]::In.ReadLine()) { }
             receiver,
             None,
         );
-        let dir = package::tempdir::TempDir::new();
+        let dir = crate::manage::package::tempdir::TempDir::new();
         let path = dir.path().join("other.spk");
-        std::fs::write(&path, package::test_signed_package("other", "other-triple"))
-            .expect("write package");
+        std::fs::write(
+            &path,
+            crate::manage::package::test_signed_package("other", "other-triple"),
+        )
+        .expect("write package");
 
         let response = send_on(
             &mut daemon,
@@ -4429,7 +4437,7 @@ while ($null -ne [Console]::In.ReadLine()) { }
         // success. Without the slow peer the layer would settle on `Running`
         // in the same millisecond the peer left.
         let (_sender, receiver) = mpsc::channel();
-        let dir = package::tempdir::TempDir::new();
+        let dir = crate::manage::package::tempdir::TempDir::new();
         let dead = peer_plugin("dead", ping_once_agent(dir.path()), 1);
         let slow = peer_plugin("slow", slow_ping_agent(dir.path()), 1);
         let mut daemon = Daemon::new(registry(vec![dead, slow]), receiver, None);
@@ -4460,7 +4468,7 @@ while ($null -ne [Console]::In.ReadLine()) { }
         // on `Running` at spawn. The slow peer is what lets a later pass observe
         // the raw peer's clean exit, exactly like the notify case.
         let (_sender, receiver) = mpsc::channel();
-        let dir = package::tempdir::TempDir::new();
+        let dir = crate::manage::package::tempdir::TempDir::new();
         let raw = peer_plugin("raw", exit_zero_exec(), 3);
         let slow = peer_plugin("slow", slow_ping_agent(dir.path()), 1);
         let mut daemon = Daemon::new(registry(vec![raw, slow]), receiver, None);

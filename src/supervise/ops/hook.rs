@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::kernel::failure::{Problem, ProblemError};
-use crate::manage::package;
+use crate::manage as package;
 use crate::platform::log::{self, LogSink};
 use crate::platform::paths::Paths;
 
@@ -179,6 +179,7 @@ pub fn poll_this_loop() {
 /// daemon-wide job covers the tree, and the leader is what we can stop now.
 pub(crate) fn kill(child: &mut Child) {
     #[cfg(unix)]
+    // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
     unsafe {
         libc::kill(-(child.id() as i32), libc::SIGKILL);
     }
@@ -274,15 +275,7 @@ mod tests {
     /// Every hook test owns a temporary directory set; nothing reads the
     /// process environment.
     fn test_paths() -> Paths {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        Paths::under(&crate::test_support::temp_dir().join(format!(
-            "svcd-hook-unit-{}-{}",
-            std::process::id(),
-            nanos
-        )))
+        crate::platform::test_support::paths("hook-unit")
     }
 
     fn run(spec: &Invocation<'_>, poll: &mut dyn FnMut()) -> Result<(), ProblemError> {

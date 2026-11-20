@@ -67,8 +67,8 @@ impl From<FrameError> for io::Error {
 
 /// Read exactly one LF-terminated frame. The returned string excludes the LF
 /// but keeps every other byte, including a trailing CR.
-#[allow(dead_code)]
-pub fn read_frame<R: BufRead + ?Sized>(reader: &mut R) -> Result<Option<String>, FrameError> {
+#[cfg(test)]
+fn read_frame<R: BufRead + ?Sized>(reader: &mut R) -> Result<Option<String>, FrameError> {
     read_frame_limit(reader, MAX_FRAME_BYTES)
 }
 

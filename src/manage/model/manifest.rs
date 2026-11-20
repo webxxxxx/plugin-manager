@@ -157,6 +157,9 @@ pub struct Package {
 /// host fact, so a signature whose key is unknown is reported as `unknown-key`
 /// rather than `valid`: claiming validity without having verified anything is
 /// exactly the hole a CI gate would fall into. The caller decides what to do.
+pub(crate) const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_FILES: usize = 4096;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignatureInfo {
     /// `valid`, `unknown-key`, `missing`, or `unverified` (malformed signatures

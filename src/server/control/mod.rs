@@ -20,7 +20,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::thread;
 
-use crate::server::http::engine::{self, Connection, HttpRequest, PreRequest, ServerLoop, Table};
+use crate::server::http::engine::{
+    self, Connection, ConnectionOps, ExtraOps, HttpRequest, LifecycleOps, PreRequest, Table,
+    TimerOps,
+};
 
 use self::handle::LoopHandle;
 use self::listener::{ControlServer, Source};
@@ -63,7 +66,7 @@ struct ControlOnly {
     keys: Vec<Source>,
 }
 
-impl ServerLoop for ControlOnly {
+impl ConnectionOps for ControlOnly {
     type State = ();
 
     fn new_state(&mut self, _id: u64, _peer: std::net::IpAddr) {}
@@ -91,12 +94,6 @@ impl ServerLoop for ControlOnly {
     fn on_writable(&mut self, _connection: &mut Connection<()>) -> bool {
         true
     }
-    fn on_tick(&mut self, _connections: &mut Table<()>) {
-        let mut drain = [0u8; 64];
-        while std::io::Read::read(&mut self.notify_rx, &mut drain).is_ok() {}
-        self.control.drain_replies();
-        self.control.flush();
-    }
     fn interest(&self, _connection: &Connection<()>) -> i16 {
         0
     }
@@ -109,6 +106,19 @@ impl ServerLoop for ControlOnly {
         false
     }
     fn on_close(&mut self, _connection: &mut Connection<()>) {}
+}
+
+impl TimerOps for ControlOnly {
+    type State = ();
+    fn on_tick(&mut self, _connections: &mut Table<()>) {
+        let mut drain = [0u8; 64];
+        while std::io::Read::read(&mut self.notify_rx, &mut drain).is_ok() {}
+        self.control.drain_replies();
+        self.control.flush();
+    }
+}
+
+impl ExtraOps for ControlOnly {
     fn wake_fd(&self) -> Option<RawFd> {
         Some(std::os::unix::io::AsRawFd::as_raw_fd(&self.notify_rx))
     }
@@ -121,9 +131,13 @@ impl ServerLoop for ControlOnly {
             self.control.ready(source, revents);
         }
     }
+}
+
+impl LifecycleOps for ControlOnly {
     fn should_stop(&self) -> bool {
         self.stop.load(std::sync::atomic::Ordering::SeqCst)
     }
+
     fn on_stop(&mut self) {
         self.control.drain_for_shutdown();
     }

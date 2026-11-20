@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::platform::paths::Paths;
 
@@ -11,6 +11,25 @@ use sha2::{Digest, Sha256};
 use super::path::{hex, next_temp, replace_file, touch, upload_dir};
 use super::upload::{require_upload_kind, UploadKind};
 use super::{Error, Result, MAX_FILE_PART_BYTES, MAX_PART_NUMBER};
+
+/// The one bounded chunk write shared by the blob upload and a resumable part:
+/// append, enforce the per-part ceiling, and report the write error against the
+/// temp path.
+pub(super) fn write_chunk(
+    file: &mut fs::File,
+    size: &mut u64,
+    bytes: &[u8],
+    temp: &Path,
+) -> Result<()> {
+    let next = size.saturating_add(bytes.len() as u64);
+    if next > MAX_FILE_PART_BYTES {
+        return Err(Error::too_large("blob is too large"));
+    }
+    file.write_all(bytes)
+        .map_err(|error| Error::internal(format!("write {}: {}", temp.display(), error)))?;
+    *size = next;
+    Ok(())
+}
 
 /// One committed part of a resumable upload session.
 #[cfg(feature = "http")]
@@ -123,15 +142,8 @@ impl PartWriter {
     }
 
     pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        let size = self.size.saturating_add(bytes.len() as u64);
-        if size > MAX_FILE_PART_BYTES {
-            return Err(Error::too_large("blob is too large"));
-        }
-        self.file.write_all(bytes).map_err(|error| {
-            Error::internal(format!("write {}: {}", self.temp.display(), error))
-        })?;
+        write_chunk(&mut self.file, &mut self.size, bytes, &self.temp)?;
         self.hasher.update(bytes);
-        self.size = size;
         Ok(())
     }
 

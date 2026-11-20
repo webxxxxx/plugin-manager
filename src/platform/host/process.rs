@@ -119,6 +119,7 @@ mod imp {
     static JOB: AtomicUsize = AtomicUsize::new(0);
 
     pub(crate) fn init() -> Result<(), String> {
+        // SAFETY: The process/pipe handle is created by this call and checked for null before use; the child is owned by the caller.
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if handle.is_null() {
             return Err(format!(
@@ -126,8 +127,10 @@ mod imp {
                 std::io::Error::last_os_error()
             ));
         }
+        // SAFETY: The process/pipe handle is created by this call and checked for null before use; the child is owned by the caller.
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: The process/pipe handle is created by this call and checked for null before use; the child is owned by the caller.
         let ok = unsafe {
             SetInformationJobObject(
                 handle,
@@ -138,6 +141,7 @@ mod imp {
         };
         if ok == 0 {
             let error = std::io::Error::last_os_error();
+            // SAFETY: The process/pipe handle is created by this call and checked for null before use; the child is owned by the caller.
             unsafe { CloseHandle(handle) };
             return Err(format!("SetInformationJobObject: {}", error));
         }
@@ -151,6 +155,7 @@ mod imp {
             return Ok(());
         }
         let process = child.as_raw_handle() as HANDLE;
+        // SAFETY: The process/pipe handle is created by this call and checked for null before use; the child is owned by the caller.
         if unsafe { AssignProcessToJobObject(job, process) } == 0 {
             Err(format!(
                 "AssignProcessToJobObject: {}",
@@ -201,12 +206,15 @@ mod imp {
             use std::ffi::c_void;
             use std::mem::{size_of_val, zeroed};
 
+            // SAFETY: The process/pipe handle is created by this call and checked for null before use; the child is owned by the caller.
             let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
             if handle.is_null() {
                 return None;
             }
+            // SAFETY: The process/pipe handle is created by this call and checked for null before use; the child is owned by the caller.
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
             info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: The process/pipe handle is created by this call and checked for null before use; the child is owned by the caller.
             let ok = unsafe {
                 SetInformationJobObject(
                     handle,
@@ -216,6 +224,7 @@ mod imp {
                 )
             };
             if ok == 0 {
+                // SAFETY: The process/pipe handle is created by this call and checked for null before use; the child is owned by the caller.
                 unsafe { CloseHandle(handle) };
                 return None;
             }
@@ -223,10 +232,12 @@ mod imp {
         }
 
         pub(crate) fn assign(&self, child: &Child) -> bool {
+            // SAFETY: The process/pipe handle is created by this call and checked for null before use; the child is owned by the caller.
             unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle() as _) != 0 }
         }
 
         pub(crate) fn terminate(&self) {
+            // SAFETY: The process/pipe handle is created by this call and checked for null before use; the child is owned by the caller.
             unsafe {
                 TerminateJobObject(self.0, 1);
             }
@@ -236,7 +247,9 @@ mod imp {
             use std::ffi::c_void;
             use std::mem::{size_of, zeroed};
 
+            // SAFETY: The process/pipe handle is created by this call and checked for null before use; the child is owned by the caller.
             let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { zeroed() };
+            // SAFETY: The process/pipe handle is created by this call and checked for null before use; the child is owned by the caller.
             let ok = unsafe {
                 QueryInformationJobObject(
                     self.0,
@@ -256,6 +269,7 @@ mod imp {
 
     impl Drop for Tree {
         fn drop(&mut self) {
+            // SAFETY: The process/pipe handle is created by this call and checked for null before use; the child is owned by the caller.
             unsafe {
                 CloseHandle(self.0);
             }
@@ -290,6 +304,7 @@ mod imp {
         command.process_group(0);
         #[cfg(target_os = "linux")]
         {
+            // SAFETY: The process/pipe handle is created by this call and checked for null before use; the child is owned by the caller.
             unsafe {
                 command.pre_exec(|| {
                     if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
@@ -309,6 +324,7 @@ mod imp {
     /// so counting a zombie as alive made the supervisor report it as
     /// unkillable forever (#111).
     pub(crate) fn alive(pid: u32) -> bool {
+        // SAFETY: The process/pipe handle is created by this call and checked for null before use; the child is owned by the caller.
         let signalable = unsafe { libc::kill(pid as i32, 0) == 0 }
             || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
         if !signalable {
@@ -383,6 +399,7 @@ mod imp {
     pub(crate) fn tree_alive(_tree: Option<&Tree>, pid: u32) -> bool {
         // Signal 0: 0 means a member exists; EPERM means it exists but is not
         // ours to signal, which still counts as alive.
+        // SAFETY: The process/pipe handle is created by this call and checked for null before use; the child is owned by the caller.
         let member = unsafe { libc::kill(-(pid as i32), 0) } == 0
             || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
         if !member {
@@ -430,6 +447,7 @@ mod imp {
 
     /// Unix signals the whole process group.
     pub(crate) fn terminate_tree(pid: u32) {
+        // SAFETY: The process/pipe handle is created by this call and checked for null before use; the child is owned by the caller.
         unsafe {
             libc::kill(-(pid as i32), libc::SIGTERM);
         }

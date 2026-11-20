@@ -4,21 +4,15 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::cli::client::{
+    self, EXIT_DAEMON_UNREACHABLE, EXIT_NOT_FOUND, EXIT_OK, EXIT_SERVICE_ERROR, EXIT_USAGE,
+};
 use crate::cli::status;
 use crate::kernel::projection::Status;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::platform::config::Config;
 use crate::platform::log;
 use crate::wire::control::channel;
-use crate::wire::message::rpc;
-
-pub const EXIT_OK: i32 = 0;
-pub const EXIT_NOT_FOUND: i32 = 1;
-/// The status contract only reserves 0/1/2/64; start/stop failures use 1 as the
-/// generic service error, while `EXIT_NOT_FOUND` is kept for unknown ids.
-pub const EXIT_SERVICE_ERROR: i32 = 1;
-pub const EXIT_DAEMON_UNREACHABLE: i32 = 2;
-pub const EXIT_USAGE: i32 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DaemonVerb {
@@ -27,18 +21,6 @@ enum DaemonVerb {
     Restart,
     Enable,
     Disable,
-}
-
-impl DaemonVerb {
-    fn as_str(self) -> &'static str {
-        match self {
-            DaemonVerb::Start => "start",
-            DaemonVerb::Stop => "stop",
-            DaemonVerb::Restart => "restart",
-            DaemonVerb::Enable => "enable",
-            DaemonVerb::Disable => "disable",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,32 +335,13 @@ fn live_list(config: &Config) -> Result<Vec<Status>, ListError> {
 /// `svc status` reads live state only, for the same reason as `svc list`: the
 /// offline fallback made an unreachable daemon look like a stopped service.
 fn show_status(config: &Config, id: &str, json: bool) -> i32 {
-    let response = match channel::request(
-        &config.paths.config_dir,
-        "svc.status",
-        json!({ "id": id, "probe": true }),
-    ) {
-        Ok(response) => response,
-        Err(error) => {
-            eprintln!("svc: svcd unreachable: {}", error);
-            explain_unreachable(config);
-            return EXIT_DAEMON_UNREACHABLE;
-        }
-    };
-    match response {
-        rpc::Response {
-            error: Some(error), ..
-        } => {
-            eprintln!("svc: {}", error.message);
-            EXIT_NOT_FOUND
-        }
-        rpc::Response {
-            result: Some(result),
-            ..
-        } => print_status_value(result, json),
-        _ => {
-            eprintln!("svc: empty status response");
-            EXIT_NOT_FOUND
+    match client::status(config, id, true, "svc") {
+        Ok(status) => client::print_status(status, json, "svc"),
+        Err(code) => {
+            if code == EXIT_DAEMON_UNREACHABLE {
+                explain_unreachable(config);
+            }
+            code
         }
     }
 }
@@ -391,24 +354,13 @@ fn daemon_command(config: &Config, verb: DaemonVerb, id: &str) -> i32 {
         DaemonVerb::Enable => "svc.enable",
         DaemonVerb::Disable => "svc.disable",
     };
-    match channel::request(&config.paths.config_dir, method, json!({ "id": id })) {
-        Ok(response) => match response.error {
-            Some(error) => {
-                eprintln!("svc: {}", error.message);
-                EXIT_SERVICE_ERROR
+    match client::request(config, method, json!({ "id": id }), "svc") {
+        Ok(status) => client::print_status(status, false, "svc"),
+        Err(code) => {
+            if code == EXIT_DAEMON_UNREACHABLE {
+                explain_unreachable(config);
             }
-            None => match response.result {
-                Some(result) => print_status_value(result, false),
-                None => {
-                    eprintln!("svc: empty {} response", verb.as_str());
-                    EXIT_SERVICE_ERROR
-                }
-            },
-        },
-        Err(error) => {
-            eprintln!("svc: svcd unreachable: {}", error);
-            explain_unreachable(config);
-            EXIT_DAEMON_UNREACHABLE
+            code
         }
     }
 }
@@ -487,7 +439,7 @@ fn compat_show(config: &Config, json: bool) -> i32 {
 }
 
 fn compat_init(config: &Config, device: &str, dry_run: bool) -> i32 {
-    if let Err(error) = crate::manage::plugin::root_required() {
+    if let Err(error) = crate::manage::root_required() {
         eprintln!("svc: {}", error);
         return EXIT_SERVICE_ERROR;
     }
@@ -695,31 +647,6 @@ fn follow_log(path: &Path, mut offset: u64) -> ! {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-}
-
-fn print_status_value(value: Value, json: bool) -> i32 {
-    match serde_json::from_value::<Status>(value) {
-        Ok(status) => print_status(status, json),
-        Err(error) => {
-            eprintln!("svc: invalid status response: {}", error);
-            EXIT_SERVICE_ERROR
-        }
-    }
-}
-
-fn print_status(status: Status, json: bool) -> i32 {
-    if json {
-        match serde_json::to_string_pretty(&status) {
-            Ok(rendered) => println!("{}", rendered),
-            Err(error) => {
-                eprintln!("svc: cannot encode status: {}", error);
-                return EXIT_SERVICE_ERROR;
-            }
-        }
-    } else {
-        println!("{}", status::text(&status));
-    }
-    EXIT_OK
 }
 
 // Only the verbs not implemented by #29 reach this helper.

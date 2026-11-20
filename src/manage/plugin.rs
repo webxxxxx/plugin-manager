@@ -4,10 +4,8 @@
 //! plugin tree. Versions live under `<data>/plugins/<id>/<version>/`; `current`
 //! is a version text file and `enabled` is a marker.
 
-use std::path::Path;
 #[cfg(test)]
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 use crate::kernel::contract::Effect;
@@ -26,33 +24,9 @@ use crate::platform::paths::Paths;
 use crate::kernel::failure::Problem;
 pub use crate::manage::check::plugin::*;
 pub use crate::manage::model::layout::*;
-pub(crate) use crate::manage::ops::config::config_lock;
 pub use crate::manage::ops::config::*;
-pub use crate::manage::ops::export_plugin::*;
 pub use crate::manage::ops::install_plugin::*;
 pub use crate::manage::ops::scan::*;
-pub use crate::manage::ops::uninstall::*;
-
-#[cfg(windows)]
-fn check_command(program: &Path) -> Command {
-    let extension = program
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if extension == "cmd" || extension == "bat" {
-        let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
-        let mut command = Command::new(shell);
-        command.arg("/C").arg(program);
-        return command;
-    }
-    Command::new(program)
-}
-
-#[cfg(not(windows))]
-fn check_command(program: &Path) -> Command {
-    Command::new(program)
-}
 
 #[cfg(test)]
 mod tests {

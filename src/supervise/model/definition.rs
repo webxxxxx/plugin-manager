@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::kernel::registry::{
     Exec, Hook, Kind, Lifecycle, Ready, Registry, Restart, Service, State, RESERVED_ID,
 };
-use crate::manage::package::valid_name;
+use crate::manage::valid_name;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadIssue {

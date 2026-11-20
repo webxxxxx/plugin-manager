@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+#[cfg(feature = "http")]
 use crate::manage::ops::scan::read_manifest;
 use crate::platform::paths::Paths;
 

@@ -242,10 +242,13 @@ pub fn write_device(path: &Path, device: &str) -> Result<(), String> {
 
 #[cfg(unix)]
 fn uname_release() -> Option<String> {
+    // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
     let mut buffer: libc::utsname = unsafe { std::mem::zeroed() };
+    // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
     if unsafe { libc::uname(&mut buffer) } != 0 {
         return None;
     }
+    // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
     let release = unsafe { std::ffi::CStr::from_ptr(buffer.release.as_ptr()) };
     release
         .to_str()

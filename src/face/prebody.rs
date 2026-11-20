@@ -60,6 +60,37 @@ impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
         ))
     }
 
+    fn mcp(
+        &self,
+        request: &crate::server::http::engine::HttpRequest,
+        lan: &Arc<Mutex<Lan>>,
+    ) -> Option<Result<crate::server::mcp::transport::StreamingCall, Vec<u8>>> {
+        let path = request
+            .path
+            .split_once('?')
+            .map(|(path, _)| path)
+            .unwrap_or(request.path.as_str());
+        if path != "/mcp" {
+            return None;
+        }
+        let password_hash = lan
+            .lock()
+            .ok()
+            .and_then(|state| state.password_hash().map(str::to_string));
+        match crate::server::mcp::transport::prepare_streaming(
+            &crate::server::mcp::transport::Request {
+                method: &request.method,
+                headers: &request.headers,
+                body: &request.body,
+            },
+            password_hash.as_deref(),
+        ) {
+            Ok(Some(call)) => Some(Ok(call)),
+            Ok(None) => None,
+            Err(response) => Some(Err(response)),
+        }
+    }
+
     fn body_policy(&self, head: &http::Head) -> crate::server::http::BodyPolicy {
         crate::server::http::server_body_policy(head, &self.config.limits)
     }

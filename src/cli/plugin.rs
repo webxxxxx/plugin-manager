@@ -9,22 +9,19 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
+use crate::cli::client::{self, EXIT_OK, EXIT_SERVICE_ERROR, EXIT_USAGE};
 use crate::cli::status;
 use crate::kernel::projection::Status;
 use crate::kernel::registry::Kind;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
+use crate::manage as package;
+use crate::manage as plugin;
 use crate::manage::ops::transfer;
-use crate::manage::package;
-use crate::manage::plugin;
 use crate::platform::compat;
 use crate::platform::config::Config;
 use crate::wire::control::channel;
 
-const EXIT_OK: i32 = 0;
-const EXIT_SERVICE_ERROR: i32 = 1;
-const EXIT_DAEMON_UNREACHABLE: i32 = 2;
-const EXIT_USAGE: i32 = 64;
-
+#[allow(clippy::large_enum_variant)] // Parse-only command AST; the large Bundle/Import variants are cold.
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     List,
@@ -524,7 +521,7 @@ fn parse(args: &[String]) -> Result<Command, ()> {
 fn list(config: &Config) -> i32 {
     let response = match channel::request(&config.paths.config_dir, "svc.list", json!({})) {
         Ok(response) => response,
-        Err(error) => return unreachable(&error),
+        Err(error) => return client::unreachable(&error, "plugin"),
     };
     if let Some(error) = response.error {
         eprintln!("plugin: {}", error.message);
@@ -696,7 +693,7 @@ fn verify_host(config: &Config, inspection: &package::Inspection) -> VerifyHost 
     VerifyHost {
         matches_host: inspection.package.manifest.platform == host.platform,
         device: host.device,
-        interpreter: crate::manage::plugin::prepare(&inspection.package)
+        interpreter: crate::manage::prepare(&inspection.package)
             .ok()
             .flatten()
             .map(|interpreter| interpreter.path),
@@ -780,7 +777,7 @@ fn uninstall(config: &Config, id: &str, purge: bool) -> i32 {
                 EXIT_OK
             }
         },
-        Err(error) => unreachable(&error),
+        Err(error) => client::unreachable(&error, "plugin"),
     }
 }
 
@@ -1006,45 +1003,11 @@ fn fetch_status(config: &Config, id: &str, probe: bool) -> Result<Status, i32> {
 }
 
 fn request(config: &Config, method: &str, params: Value) -> Result<Status, i32> {
-    let response = match channel::request(&config.paths.config_dir, method, params) {
-        Ok(response) => response,
-        Err(error) => return Err(unreachable(&error)),
-    };
-    if let Some(error) = response.error {
-        eprintln!("plugin: {}", error.message);
-        return Err(EXIT_SERVICE_ERROR);
-    }
-    let result = match response.result {
-        Some(result) => result,
-        None => {
-            eprintln!("plugin: empty response");
-            return Err(EXIT_SERVICE_ERROR);
-        }
-    };
-    serde_json::from_value(result).map_err(|error| {
-        eprintln!("plugin: invalid status response: {}", error);
-        EXIT_SERVICE_ERROR
-    })
+    client::request(config, method, params, "plugin")
 }
 
 fn print_status(status: Status, json: bool) -> i32 {
-    if json {
-        match serde_json::to_string_pretty(&status) {
-            Ok(text) => println!("{}", text),
-            Err(error) => {
-                eprintln!("plugin: cannot encode status: {}", error);
-                return EXIT_SERVICE_ERROR;
-            }
-        }
-    } else {
-        println!("{}", status::text(&status));
-    }
-    EXIT_OK
-}
-
-fn unreachable(error: &std::io::Error) -> i32 {
-    eprintln!("plugin: svcd unreachable: {}", error);
-    EXIT_DAEMON_UNREACHABLE
+    client::print_status(status, json, "plugin")
 }
 
 fn usage() {

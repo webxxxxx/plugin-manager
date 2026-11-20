@@ -17,6 +17,8 @@ pub mod log;
 pub mod paths;
 pub mod settings;
 pub mod storage;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use host::privilege::is_privileged;
 pub use host::target::target;

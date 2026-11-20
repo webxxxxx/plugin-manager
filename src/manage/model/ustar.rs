@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use sha2::{Digest, Sha256};
 
 use crate::kernel::failure::{Problem, ProblemError};
-use crate::manage::package::{check_path, hex_bytes};
+use crate::manage::model::hex::hex_bytes;
+use crate::manage::model::path::check_path;
 
 #[derive(Debug, Clone)]
 pub struct TarEntry {

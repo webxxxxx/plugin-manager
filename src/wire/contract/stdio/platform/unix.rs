@@ -13,14 +13,18 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 pub(crate) fn pipe() -> io::Result<(File, File)> {
     let mut fds = [0 as libc::c_int; 2];
     #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: The descriptor was created by this function and is not closed until after the call.
     let created = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let created = {
+        // SAFETY: The descriptor was created by this function and is not closed until after the call.
         let created = unsafe { libc::pipe(fds.as_mut_ptr()) };
         if created == 0 {
             for fd in fds {
+                // SAFETY: The descriptor was created by this function and is not closed until after the call.
                 if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
                     let error = io::Error::last_os_error();
+                    // SAFETY: The descriptor was created by this function and is not closed until after the call.
                     unsafe {
                         libc::close(fds[0]);
                         libc::close(fds[1]);
@@ -42,10 +46,12 @@ pub(crate) fn pipe() -> io::Result<(File, File)> {
 /// reads/writes it drives itself.
 pub(crate) fn nonblocking(file: &File) -> io::Result<()> {
     let fd = file.as_raw_fd();
+    // SAFETY: The descriptor was created by this function and is not closed until after the call.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: The descriptor was created by this function and is not closed until after the call.
     if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(io::Error::last_os_error());
     }

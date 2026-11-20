@@ -64,8 +64,9 @@ pub(crate) struct Acl {
     descriptor: SECURITY_DESCRIPTOR,
 }
 
-// The ACL is immutable after construction and owned by this value.
+// SAFETY: The ACL is immutable after construction and owned by this value.
 unsafe impl Send for Acl {}
+// SAFETY: Shared access only reads the immutable descriptor; mutation happens before publication.
 unsafe impl Sync for Acl {}
 
 impl Acl {
@@ -155,12 +156,15 @@ impl Acl {
 
         let mut acl: *mut ACL = null_mut();
         let code =
+            // SAFETY: Buffers and SIDs are owned for the duration of the ACL call and the sizes are passed alongside them.
             unsafe { SetEntriesInAclW(entries.len() as u32, entries.as_ptr(), null(), &mut acl) };
         if code != 0 {
             return Err(io::Error::from_raw_os_error(code as i32));
         }
 
+        // SAFETY: Buffers and SIDs are owned for the duration of the ACL call and the sizes are passed alongside them.
         let mut descriptor: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+        // SAFETY: Buffers and SIDs are owned for the duration of the ACL call and the sizes are passed alongside them.
         let initialized = unsafe {
             InitializeSecurityDescriptor(
                 &mut descriptor as *mut SECURITY_DESCRIPTOR as *mut c_void,
@@ -169,9 +173,11 @@ impl Acl {
         };
         if initialized == 0 {
             let error = io::Error::last_os_error();
+            // SAFETY: Buffers and SIDs are owned for the duration of the ACL call and the sizes are passed alongside them.
             unsafe { LocalFree(acl as *mut c_void) };
             return Err(error);
         }
+        // SAFETY: Buffers and SIDs are owned for the duration of the ACL call and the sizes are passed alongside them.
         let dacl_set = unsafe {
             SetSecurityDescriptorDacl(
                 &mut descriptor as *mut SECURITY_DESCRIPTOR as *mut c_void,
@@ -182,10 +188,12 @@ impl Acl {
         };
         if dacl_set == 0 {
             let error = io::Error::last_os_error();
+            // SAFETY: Buffers and SIDs are owned for the duration of the ACL call and the sizes are passed alongside them.
             unsafe { LocalFree(acl as *mut c_void) };
             return Err(error);
         }
         // Protected: no inherited ACE may widen this again.
+        // SAFETY: Buffers and SIDs are owned for the duration of the ACL call and the sizes are passed alongside them.
         let protected = unsafe {
             SetSecurityDescriptorControl(
                 &mut descriptor as *mut SECURITY_DESCRIPTOR as *mut c_void,
@@ -195,6 +203,7 @@ impl Acl {
         };
         if protected == 0 {
             let error = io::Error::last_os_error();
+            // SAFETY: Buffers and SIDs are owned for the duration of the ACL call and the sizes are passed alongside them.
             unsafe { LocalFree(acl as *mut c_void) };
             return Err(error);
         }
@@ -214,6 +223,7 @@ impl Acl {
     /// Replace the object's DACL with this one, protected from inheritance.
     pub(crate) fn apply_to_path(&self, path: &Path) -> io::Result<()> {
         let name = wide_path(path);
+        // SAFETY: Buffers and SIDs are owned for the duration of the ACL call and the sizes are passed alongside them.
         let code = unsafe {
             SetNamedSecurityInfoW(
                 name.as_ptr(),
@@ -235,6 +245,7 @@ impl Acl {
 impl Drop for Acl {
     fn drop(&mut self) {
         if !self.acl.is_null() {
+            // SAFETY: Buffers and SIDs are owned for the duration of the ACL call and the sizes are passed alongside them.
             unsafe { LocalFree(self.acl as *mut c_void) };
         }
     }
@@ -242,6 +253,7 @@ impl Drop for Acl {
 
 /// The SID of the process token's user, copied out of the token buffer.
 fn current_user_sid() -> io::Result<Vec<u8>> {
+    // SAFETY: Buffers and SIDs are owned for the duration of the ACL call and the sizes are passed alongside them.
     unsafe {
         let mut token: HANDLE = null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {

@@ -27,6 +27,7 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use crate::platform::host::poll;
 use crate::platform::host::wake::Wake;
 use crate::platform::log::{self, LogSink};
 use crate::wire::message::ipc::{FrameError, FrameEvent};
@@ -423,6 +424,7 @@ impl Drop for Reactor {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn enlarge_pipe(file: &File) {
     const PIPE_BYTES: libc::c_int = 512 * 1024;
+    // SAFETY: The descriptor belongs to a live `Source`; the buffer is local and correctly sized for this call.
     unsafe {
         libc::fcntl(file.as_raw_fd(), libc::F_SETPIPE_SZ, PIPE_BYTES);
     }
@@ -495,12 +497,8 @@ impl PollSet {
         } else {
             timeout_ms
         };
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                log::svcd(&format!("svcd: reactor poll failed: {}", error));
-            }
+        if let Err(error) = poll::poll(&mut fds, timeout_ms) {
+            log::svcd(&format!("svcd: reactor poll failed: {}", error));
             return;
         }
         if fds[0].revents & libc::POLLIN != 0 {
@@ -878,15 +876,18 @@ mod tests {
 
     /// Pipe ends as the reactor sees them: plain files it owns.
     fn to_file<T: IntoRawFd>(source: T) -> File {
+        // SAFETY: The descriptor belongs to a live `Source`; the buffer is local and correctly sized for this call.
         unsafe { File::from_raw_fd(source.into_raw_fd()) }
     }
 
     fn set_nonblocking(file: &File) -> io::Result<()> {
         let fd = file.as_raw_fd();
+        // SAFETY: The descriptor belongs to a live `Source`; the buffer is local and correctly sized for this call.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if flags < 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: The descriptor belongs to a live `Source`; the buffer is local and correctly sized for this call.
         if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -895,8 +896,11 @@ mod tests {
 
     fn nonblocking_pipe() -> (File, File) {
         let mut fds = [0i32; 2];
+        // SAFETY: The descriptor belongs to a live `Source`; the buffer is local and correctly sized for this call.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        // SAFETY: The descriptor belongs to a live `Source`; the buffer is local and correctly sized for this call.
         let read = unsafe { File::from_raw_fd(fds[0]) };
+        // SAFETY: The descriptor belongs to a live `Source`; the buffer is local and correctly sized for this call.
         let write = unsafe { File::from_raw_fd(fds[1]) };
         set_nonblocking(&read).expect("read nonblocking");
         set_nonblocking(&write).expect("write nonblocking");

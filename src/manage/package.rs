@@ -13,43 +13,15 @@ use std::path::{Path, PathBuf};
 use base64::engine::general_purpose::STANDARD as BASE64;
 #[cfg(test)]
 use base64::Engine;
-use sha2::{Digest, Sha256};
 
 use crate::kernel::failure::{Problem, ProblemError};
 
-pub(crate) const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
-pub(crate) const MAX_FILES: usize = 4096;
-
 pub use crate::manage::check::verify::*;
+pub(crate) use crate::manage::model::hex::hex_sha256;
 pub use crate::manage::model::manifest::*;
 pub use crate::manage::model::ustar::*;
 pub use crate::manage::ops::export::*;
 pub use crate::manage::ops::install::*;
-
-pub(crate) fn check_path(p: &str) -> Result<(), ProblemError> {
-    if p.starts_with('/') || p.contains('\\') || p.contains('\0') {
-        return Err(Problem::Invalid.error(format!("unsafe path: {}", p)));
-    }
-    if p.split('/')
-        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
-    {
-        return Err(Problem::Invalid.error(format!("unsafe path: {}", p)));
-    }
-    Ok(())
-}
-
-pub fn hex_sha256(bytes: &[u8]) -> String {
-    hex_bytes(&Sha256::digest(bytes))
-}
-
-pub(crate) fn hex_bytes(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{:02x}", byte);
-    }
-    out
-}
 
 /// Reproduce a package in memory for tests and the future bundler.
 #[cfg(test)]
@@ -210,6 +182,35 @@ mod tests {
     fn package_for(key: &SigningKey, platform: &str) -> Vec<u8> {
         let (manifest, files) = manifest(platform);
         package_from(key, "test", &manifest, &files)
+    }
+
+    #[test]
+    fn declared_files_reject_more_than_the_file_ceiling() {
+        let files: Vec<Value> = (0..=MAX_FILES)
+            .map(|index| {
+                json!({
+                    "path": format!("payload/f{index}"),
+                    "size": 0,
+                    "sha256": hex_sha256(b""),
+                    "mode": 0o644,
+                })
+            })
+            .collect();
+        let value = json!({
+            "schema": 1,
+            "name": "many",
+            "version": "1.0.0",
+            "desc": "many",
+            "platform": crate::platform::target(),
+            "protocol": 1,
+            "exec": {"path": "payload/bin/demo"},
+            "files": files,
+        });
+        let manifest: Manifest = serde_json::from_value(value).expect("manifest");
+
+        let error = validate_declared_files(&manifest).expect_err("over the ceiling");
+
+        assert_eq!(error.problem, Problem::TooLarge);
     }
 
     fn package_from(

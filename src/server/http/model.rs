@@ -704,7 +704,7 @@ pub fn parse_http_date(text: &str) -> Option<SystemTime> {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    let mut parts = text.trim().split_whitespace();
+    let mut parts = text.split_whitespace();
     let _weekday = parts.next()?;
     let day: u32 = parts.next()?.trim_end_matches(',').parse().ok()?;
     let month_name = parts.next()?;

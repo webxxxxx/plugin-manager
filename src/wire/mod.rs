@@ -10,6 +10,9 @@
 pub mod contract;
 pub mod control;
 pub mod message;
+/// Server-Sent Events text framing shared by the HTTP faces and the MCP
+/// progress stream; it has no HTTP dependency of its own.
+pub(crate) mod sse;
 /// WebSocket frame shape and opening handshake. Only the HTTP feature has a
 /// consumer (the plugin UI streams), so the minimal build does not compile it —
 /// same visibility as the `server/http` module it moved out of (#206).

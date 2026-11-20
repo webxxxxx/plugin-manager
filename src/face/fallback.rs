@@ -11,11 +11,11 @@ use std::sync::{Arc, Mutex};
 use serde_json::json;
 
 use crate::face::blob_routes;
-use crate::face::plugin_ui::{ui_path, UiPath};
+use crate::face::plugin_ui::{ui_path, unauthenticated, UiPath};
 use crate::face::support::{decode, error};
 use crate::face::webui;
-use crate::manage::package;
-use crate::manage::plugin;
+use crate::manage as package;
+use crate::manage as plugin;
 use crate::platform::config::Config;
 use crate::platform::storage as blob;
 use crate::server::auth::admission::{Admission, Rejected};
@@ -56,23 +56,10 @@ pub(crate) fn respond(config: &Config, request: &HttpRequest, lan: &Arc<Mutex<La
         Ok(auth) => auth,
         Err(Rejected::Unavailable) => return error(500, "internal", "LAN state unavailable"),
         Err(Rejected::Unauthorized) => {
-            // A browser navigation to a plugin UI should land on the
-            // console login instead of raw JSON. API clients keep the 401.
-            if request.method == "GET"
-                && path.starts_with("/plugin-ui/")
-                && request_header(request, "accept")
-                    .map(|value| value.contains("text/html"))
-                    .unwrap_or(false)
-            {
-                return http::response_with_headers(
-                    303,
-                    "text/plain; charset=utf-8",
-                    &[(
-                        "Location".to_string(),
-                        format!("/?next={}", webui::encode_query_value(path)),
-                    )],
-                    b"",
-                );
+            // One redirect projection for both the buffered and the streamed
+            // plugin UI face (#219); API clients keep the 401.
+            if request.method == "GET" && path.starts_with("/plugin-ui/") {
+                return unauthenticated(&request.headers, path);
             }
             return error(401, "unauthorized", "authentication required");
         }
@@ -322,6 +309,37 @@ mod tests {
                 .unwrap_or_default(),
             body: Vec::new(),
         }
+    }
+
+    #[test]
+    fn an_uppercase_html_accept_redirects_from_the_fallback_face() {
+        let config = Config::with_paths(
+            crate::platform::settings::Settings::default(),
+            None,
+            crate::platform::paths::Paths::under(&crate::test_support::temp_dir()),
+        );
+        let lan = Arc::new(Mutex::new(Lan::new(
+            "127.0.0.1:0".parse().expect("addr"),
+            "127.0.0.1:0".parse().expect("addr"),
+            true,
+            Some("not-a-real-hash".into()),
+        )));
+        let request = HttpRequest {
+            method: "GET".into(),
+            path: "/plugin-ui/demo/".into(),
+            version: "HTTP/1.1".into(),
+            headers: vec![("Accept".into(), "TEXT/HTML".into())],
+            body: Vec::new(),
+        };
+
+        let response = respond(&config, &request, &lan);
+
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 303 See Other"), "{text}");
+        assert!(
+            text.contains("Location: /?next=/plugin-ui/demo/\r\n"),
+            "{text}"
+        );
     }
 
     /// The buffered face answers 304 from the same projection the streamed

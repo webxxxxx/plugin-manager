@@ -148,7 +148,7 @@ impl EventBus {
         ))
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn subscribe_with(
         self: &Arc<Self>,
         plugin: &str,
@@ -273,7 +273,7 @@ impl EventBus {
             });
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn subscriber_count(&self, plugin: &str) -> usize {
         self.lock()
             .get(plugin)
@@ -281,7 +281,7 @@ impl EventBus {
             .unwrap_or(0)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn history_len(&self, plugin: &str) -> usize {
         self.lock()
             .get(plugin)
@@ -303,10 +303,9 @@ impl Default for EventBus {
 }
 
 pub fn sse_event(event: &Event) -> String {
-    format!(
-        "id: {}\nevent: message\ndata: {}\n\n",
-        event.seq, event.json
-    )
+    crate::wire::sse::SseEvent::new("message", &event.json)
+        .with_id(event.seq)
+        .encode()
 }
 
 #[cfg(test)]

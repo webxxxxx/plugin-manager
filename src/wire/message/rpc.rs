@@ -30,6 +30,7 @@ pub struct Response {
     pub error: Option<Error>,
 }
 
+#[allow(clippy::result_large_err)] // Error paths are rare; boxing would allocate on every malformed frame.
 pub fn parse(line: &str) -> Result<Request, Response> {
     let request =
         serde_json::from_str::<Request>(line).map_err(|e| err(None, -32700, &e.to_string()))?;

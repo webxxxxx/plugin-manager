@@ -12,11 +12,15 @@ use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
-use crate::manage::model::manifest::{FileData, Manifest, SignatureCheck, SignatureFile};
-use crate::manage::model::ustar::Tar;
-use crate::manage::package::{
-    check_path, hex_sha256, Inspection, Package, SignatureInfo, MAX_FILES, MAX_PACKAGE_BYTES,
+use crate::manage::model::hex::hex_sha256;
+use crate::manage::model::manifest::{
+    FileData, FileEntry, Manifest, SignatureCheck, SignatureFile,
 };
+use crate::manage::model::manifest::{
+    Inspection, Package, SignatureInfo, MAX_FILES, MAX_PACKAGE_BYTES,
+};
+use crate::manage::model::path::check_path;
+use crate::manage::model::ustar::Tar;
 use crate::wire::contract::RAW_PROTOCOL;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,34 +139,10 @@ fn verify_bytes_mode(
     // Inspection deliberately skips the host-platform gate: a package built
     // for another target is still a well-formed package, and the caller gets
     // `host.matchesHost` as a fact.
-    if mode != SignatureMode::Inspect && manifest.platform != crate::platform::target() {
-        return Err(Problem::UnsupportedPlatform.error(format!(
-            "platform mismatch: package {}, host {}",
-            manifest.platform,
-            crate::platform::target()
-        )));
+    if mode != SignatureMode::Inspect {
+        check_platform(&manifest)?;
     }
-    let mut declared = BTreeMap::new();
-    for entry in &manifest.files {
-        check_path(&entry.path)?;
-        if entry.path == "manifest.json" || entry.path == "signature.json" {
-            return Err(Problem::Invalid.error("manifest.json/signature.json cannot be in files[]"));
-        }
-        if declared.insert(entry.path.clone(), entry.clone()).is_some() {
-            return Err(Problem::Invalid.error(format!("duplicate files[] entry: {}", entry.path)));
-        }
-        if entry.mode & 0o6000 != 0 {
-            return Err(
-                Problem::Invalid.error(format!("setuid/setgid is not allowed: {}", entry.path))
-            );
-        }
-        if declared.len() > MAX_FILES {
-            return Err(Problem::TooLarge.error("too many files"));
-        }
-    }
-
-    check_manifest_paths(&manifest)?;
-    check_hooks(&manifest)?;
+    let declared = validate_declared_files(&manifest)?;
 
     let mut files = Vec::new();
     let mut seen = BTreeMap::new();
@@ -312,6 +292,47 @@ pub(crate) fn check_hook_shebangs(
         }
     }
     Ok(())
+}
+
+/// The host-platform gate. `Inspect` deliberately skips it: a package built
+/// for another target is still well-formed, and the caller gets
+/// `host.matchesHost` as a fact.
+pub(crate) fn check_platform(manifest: &Manifest) -> Result<(), ProblemError> {
+    if manifest.platform != crate::platform::target() {
+        return Err(Problem::UnsupportedPlatform.error(format!(
+            "platform mismatch: package {}, host {}",
+            manifest.platform,
+            crate::platform::target()
+        )));
+    }
+    Ok(())
+}
+
+/// The one `files[]` rule: reserved names, duplicate paths, setuid/setgid and
+/// the file-count ceiling. Every install path calls this after
+/// [`validate_manifest`], so `load_staged` cannot drift from `verify`.
+pub(crate) fn validate_declared_files(
+    manifest: &Manifest,
+) -> Result<BTreeMap<String, FileEntry>, ProblemError> {
+    let mut declared = BTreeMap::new();
+    for entry in &manifest.files {
+        check_path(&entry.path)?;
+        if entry.path == "manifest.json" || entry.path == "signature.json" {
+            return Err(Problem::Invalid.error("manifest.json/signature.json cannot be in files[]"));
+        }
+        if declared.insert(entry.path.clone(), entry.clone()).is_some() {
+            return Err(Problem::Invalid.error(format!("duplicate files[] entry: {}", entry.path)));
+        }
+        if entry.mode & 0o6000 != 0 {
+            return Err(
+                Problem::Invalid.error(format!("setuid/setgid is not allowed: {}", entry.path))
+            );
+        }
+        if declared.len() > MAX_FILES {
+            return Err(Problem::TooLarge.error("too many files"));
+        }
+    }
+    Ok(declared)
 }
 
 /// Validate every cross-reference a manifest makes, including the hook and

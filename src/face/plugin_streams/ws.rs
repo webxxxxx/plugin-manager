@@ -23,7 +23,7 @@ use crate::wire::control::channel;
 use crate::wire::message::rpc;
 use crate::wire::ws::frame;
 
-use super::frame::PendingFrame;
+use super::frame::{write_queued, PendingFrame, QueuedWrite};
 
 const WS_PING: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(100);
@@ -138,41 +138,21 @@ impl WsStream {
     fn on_writable(&mut self, out: &mut OutBuffer<'_>) -> StreamStep {
         let now = Instant::now();
         loop {
-            if self.head_at < self.head.len() {
-                let take = (self.head.len() - self.head_at).min(out.remaining());
-                out.write(&self.head[self.head_at..self.head_at + take]);
-                self.head_at += take;
-                if self.head_at < self.head.len() {
-                    return self.step(StreamAction::NeedWrite, now);
+            match write_queued(
+                &self.head,
+                &mut self.head_at,
+                &mut self.frames,
+                &mut self.close,
+                self.closing,
+                self.discard,
+                out,
+            ) {
+                QueuedWrite::NeedWrite => return self.step(StreamAction::NeedWrite, now),
+                QueuedWrite::NeedRead => return self.step(StreamAction::NeedRead, now),
+                QueuedWrite::Closed => {
+                    return StreamStep::wait(StreamAction::Close(CloseReason::Completed))
                 }
-            }
-            loop {
-                let complete = match self.frames.front_mut() {
-                    Some(frame) => frame.write(out),
-                    None => break,
-                };
-                if !complete {
-                    return self.step(StreamAction::NeedWrite, now);
-                }
-                self.frames.pop_front();
-            }
-            if self.closing {
-                if let Some(payload) = self.close.take() {
-                    let mut frame = PendingFrame::new(0x8, payload);
-                    if !frame.write(out) {
-                        self.frames.push_front(frame);
-                        return self.step(StreamAction::NeedWrite, now);
-                    }
-                }
-                if self.discard > 0 {
-                    // The peer is still writing an oversized frame. Keep
-                    // reading and dropping it so the close frame is the next
-                    // thing it sees, not a TCP reset from our close.
-                    return self.step(StreamAction::NeedRead, now);
-                }
-                if self.frames.is_empty() {
-                    return StreamStep::wait(StreamAction::Close(CloseReason::Completed));
-                }
+                QueuedWrite::Complete => {}
             }
             // Do not move a bus event into handler memory unless the socket
             // buffer has room to accept it; the bounded bus channel is the
@@ -484,7 +464,7 @@ mod tests {
     use std::sync::Arc;
 
     fn test_limits() -> Arc<crate::platform::limits::Limits> {
-        Arc::new(crate::platform::limits::test_default())
+        crate::platform::test_support::limits()
     }
 
     fn harness() -> (Arc<EventBus>, WsStream) {

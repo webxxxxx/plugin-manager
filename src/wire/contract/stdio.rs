@@ -260,6 +260,7 @@ impl Target {
 
     /// Deliver `stdout` to `sender` as JSON-RPC frames (length-prefixed from
     /// protocol 2 on, line-delimited before) and `stderr` to the service log.
+    #[allow(clippy::too_many_arguments)] // The arguments are the wiring seam; a struct would only rename them.
     pub(crate) fn frames(
         &self,
         id: String,

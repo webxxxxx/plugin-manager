@@ -3,6 +3,8 @@
 #[cfg(windows)]
 pub mod acl;
 pub mod dirs;
+#[cfg(unix)]
+pub mod poll;
 pub mod privilege;
 pub mod process;
 pub mod target;

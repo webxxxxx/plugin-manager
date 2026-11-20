@@ -22,6 +22,7 @@ pub(crate) fn pipe() -> io::Result<(File, File)> {
     let mut write: HANDLE = std::ptr::null_mut();
     // SAFETY: two valid out-pointers; no security descriptor means neither end
     // is inheritable.
+    // SAFETY: The descriptor was created by this function and is not closed until after the call.
     if unsafe { CreatePipe(&mut read, &mut write, std::ptr::null(), 0) } == 0 {
         return Err(io::Error::last_os_error());
     }

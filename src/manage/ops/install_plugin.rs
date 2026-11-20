@@ -4,13 +4,13 @@ use std::path::{Path, PathBuf};
 
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::registry::{Interpreter, Service, RESERVED_ID};
+use crate::manage as package;
 use crate::manage::check::interpreter;
 use crate::manage::model::layout::{current_version, plugin_dir};
 use crate::manage::model::manifest::Package;
 use crate::manage::ops::config::{write_config, write_hash};
 use crate::manage::ops::scan::{resolve_interpreter, service_from_manifest};
-use crate::manage::package;
-use crate::manage::plugin::{
+use crate::manage::{
     ensure_hooks_allowed, ensure_hooks_allowed_manifest, remove_versions, replace_plan,
     ReplacePlan, Strategy,
 };
@@ -310,24 +310,6 @@ pub fn cleanup_staging(paths: &Paths) {
             }
         }
     }
-}
-
-/// Allocate a unique staging directory under the plugin's own tree so the
-/// final commit is a same-filesystem rename.
-#[allow(dead_code)]
-pub fn staging_dir(paths: &Paths, id: &str) -> Result<PathBuf, ProblemError> {
-    if !package::valid_name(id) {
-        return Err(Problem::Invalid.error(format!("invalid plugin id: {}", id)));
-    }
-    let directory = plugin_dir(paths, id);
-    fs::create_dir_all(&directory).map_err(|error| {
-        Problem::Internal.error(format!("create {}: {}", directory.display(), error))
-    })?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    Ok(directory.join(format!(".staging-{}-{}", std::process::id(), nanos)))
 }
 
 /// What an install rejection implies for its caller.
@@ -790,7 +772,9 @@ fn free_space(path: &Path) -> Result<u64, ProblemError> {
         let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
             Problem::Internal.error(format!("free space: invalid path {}", path.display()))
         })?;
+        // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
         let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
         if unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) } != 0 {
             return Err(Problem::Internal.error(format!(
                 "free space {}: {}",
@@ -810,6 +794,7 @@ fn free_space(path: &Path) -> Result<u64, ProblemError> {
         let mut available = 0u64;
         let mut total = 0u64;
         let mut total_free = 0u64;
+        // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
         if unsafe {
             GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut total_free)
         } == 0

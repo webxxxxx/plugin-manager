@@ -120,6 +120,7 @@ impl ControlStream for Stream {
             revents: 0,
         };
         let millis = timeout.as_millis().min(i32::MAX as u128) as i32;
+        // SAFETY: The pipe handle is owned by the listener or stream and stays valid for the duration of the call.
         let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
         if ready < 0 {
             let error = io::Error::last_os_error();

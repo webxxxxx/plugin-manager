@@ -8,8 +8,8 @@
 
 use crate::face::plugin_streams::{self, StreamContext};
 use crate::face::webui;
-use crate::manage::package;
-use crate::manage::plugin;
+use crate::manage as package;
+use crate::manage as plugin;
 use crate::platform::config::Config;
 use crate::server::auth::lan::Lan;
 use crate::server::http::model as http;
@@ -493,36 +493,12 @@ mod tests {
     }
 
     fn drive(mut handler: PluginUiStream, limit: usize) -> (Vec<u8>, CloseReason) {
-        use std::io::{Read, Seek, SeekFrom};
-
-        let mut all = Vec::new();
-        let mut out = Vec::new();
-        for _ in 0..10_000 {
-            let step =
-                handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
-            assert!(
-                out.len() <= limit,
-                "a writable event must respect the buffer limit"
-            );
-            all.extend_from_slice(&out);
-            out.clear();
-            match step.action {
-                StreamAction::Close(reason) => return (all, reason),
-                StreamAction::NeedWrite | StreamAction::Continue | StreamAction::NeedRead => {}
-                StreamAction::SendFile(mut send) => {
-                    // The server would send this range on the socket. Read it
-                    // back so the test can assert the exact response bytes.
-                    send.file
-                        .seek(SeekFrom::Start(send.offset))
-                        .expect("seek asset");
-                    let mut reader = (&mut send.file).take(send.length);
-                    reader.read_to_end(&mut all).expect("read asset remainder");
-                    return (all, CloseReason::Completed);
-                }
-                StreamAction::SubmitBlocking(_) => panic!("a static asset submits no job"),
-            }
-        }
-        panic!("the handler never finished");
+        crate::server::http::test_support::drive_stream(
+            &mut handler,
+            limit,
+            crate::server::http::test_support::SendFilePolicy::Finish,
+            false,
+        )
     }
 
     #[test]
@@ -738,6 +714,17 @@ mod tests {
         let mut file = send.file;
         std::io::Read::read_to_end(&mut file, &mut content).expect("read the sent file");
         assert_eq!(content, script);
+    }
+
+    #[test]
+    fn an_uppercase_html_accept_still_redirects_to_login() {
+        let response = unauthenticated(&headers(&[("Accept", "TEXT/HTML")]), "/plugin-ui/demo/");
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 303 See Other"), "{text}");
+        assert!(
+            text.contains("Location: /?next=/plugin-ui/demo/\r\n"),
+            "{text}"
+        );
     }
 
     #[test]

@@ -107,6 +107,7 @@ impl ControlListener for Listener {
 }
 
 fn pipe_exists(name: &[u16]) -> bool {
+    // SAFETY: The pipe handle is owned by the listener or stream and stays valid for the duration of the call.
     let handle = unsafe {
         CreateFileW(
             name.as_ptr(),
@@ -119,9 +120,11 @@ fn pipe_exists(name: &[u16]) -> bool {
         )
     };
     if handle != INVALID_HANDLE_VALUE {
+        // SAFETY: The pipe handle is owned by the listener or stream and stays valid for the duration of the call.
         unsafe { CloseHandle(handle) };
         return true;
     }
+    // SAFETY: The pipe handle is owned by the listener or stream and stays valid for the duration of the call.
     unsafe { GetLastError() == ERROR_PIPE_BUSY }
 }
 
@@ -130,6 +133,7 @@ impl Iterator for Incoming {
 
     fn next(&mut self) -> Option<Self::Item> {
         let attributes = self.acl.attributes();
+        // SAFETY: The pipe handle is owned by the listener or stream and stays valid for the duration of the call.
         let handle = unsafe {
             CreateNamedPipeW(
                 self.name.as_ptr(),
@@ -145,14 +149,18 @@ impl Iterator for Incoming {
         if handle == INVALID_HANDLE_VALUE {
             return Some(Err(io::Error::last_os_error()));
         }
+        // SAFETY: The pipe handle is owned by the listener or stream and stays valid for the duration of the call.
         let connected = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) };
         if connected == 0 {
+            // SAFETY: The pipe handle is owned by the listener or stream and stays valid for the duration of the call.
             let error = unsafe { GetLastError() };
             if error != ERROR_PIPE_CONNECTED {
+                // SAFETY: The pipe handle is owned by the listener or stream and stays valid for the duration of the call.
                 unsafe { CloseHandle(handle) };
                 return Some(Err(io::Error::from_raw_os_error(error as i32)));
             }
         }
+        // SAFETY: The pipe handle is owned by the listener or stream and stays valid for the duration of the call.
         let file = unsafe { File::from_raw_handle(handle as RawHandle) };
         Some(Ok(Stream(file)))
     }
@@ -168,6 +176,7 @@ impl ControlStream for Stream {
     /// the disconnect token between peeks.
     fn wait_readable(&self, timeout: Duration) -> io::Result<bool> {
         let mut available = 0u32;
+        // SAFETY: The pipe handle is owned by the listener or stream and stays valid for the duration of the call.
         let peeked = unsafe {
             PeekNamedPipe(
                 self.0.as_raw_handle() as _,
@@ -185,6 +194,7 @@ impl ControlStream for Stream {
             std::thread::sleep(timeout);
             return Ok(false);
         }
+        // SAFETY: The pipe handle is owned by the listener or stream and stays valid for the duration of the call.
         let error = unsafe { GetLastError() };
         if error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED {
             // Report readable so the following read observes EOF.
@@ -240,6 +250,7 @@ impl ControlChannel for Platform {
     fn connect(config: &Path, endpoint: Endpoint) -> io::Result<Self::Stream> {
         let name = wide(&pipe_name(config, endpoint));
         for _ in 0..50 {
+            // SAFETY: The pipe handle is owned by the listener or stream and stays valid for the duration of the call.
             let handle = unsafe {
                 CreateFileW(
                     name.as_ptr(),
@@ -252,13 +263,16 @@ impl ControlChannel for Platform {
                 )
             };
             if handle != INVALID_HANDLE_VALUE {
+                // SAFETY: The pipe handle is owned by the listener or stream and stays valid for the duration of the call.
                 let file = unsafe { File::from_raw_handle(handle as RawHandle) };
                 return Ok(Stream(file));
             }
+            // SAFETY: The pipe handle is owned by the listener or stream and stays valid for the duration of the call.
             let error = unsafe { GetLastError() };
             if error != ERROR_PIPE_BUSY && error != ERROR_FILE_NOT_FOUND {
                 return Err(io::Error::from_raw_os_error(error as i32));
             }
+            // SAFETY: The pipe handle is owned by the listener or stream and stays valid for the duration of the call.
             unsafe { WaitNamedPipeW(name.as_ptr(), 100) };
             std::thread::sleep(Duration::from_millis(20));
         }

@@ -10,12 +10,12 @@ use crate::kernel::failure::{Problem, ProblemError};
 #[cfg(unix)]
 use crate::manage::check::verify::check_hook_shebangs;
 use crate::manage::check::verify::{
-    check_hooks, check_manifest_paths, check_signature, parse_manifest, validate_manifest,
+    check_platform, check_signature, parse_manifest, validate_declared_files, validate_manifest,
     validate_script_payload, SignatureMode,
 };
+use crate::manage::model::hex::hex_bytes;
 use crate::manage::model::manifest::{FileData, FileEntry, Manifest, Package};
 use crate::manage::model::ustar::{StreamEntry, TarFeed, TarSink};
-use crate::manage::package::{check_path, hex_bytes, MAX_FILES};
 
 impl Package {
     pub fn write_to(&self, root: &Path) -> Result<(), ProblemError> {
@@ -354,35 +354,8 @@ impl TarSink for SpkSink {
             Current::Manifest(bytes) => {
                 let manifest = parse_manifest(&bytes)?;
                 validate_manifest(&manifest)?;
-                if manifest.platform != crate::platform::target() {
-                    return Err(Problem::UnsupportedPlatform.error(format!(
-                        "platform mismatch: package {}, host {}",
-                        manifest.platform,
-                        crate::platform::target()
-                    )));
-                }
-                let mut declared = BTreeMap::new();
-                for entry in &manifest.files {
-                    check_path(&entry.path)?;
-                    if entry.path == "manifest.json" || entry.path == "signature.json" {
-                        return Err(Problem::Invalid
-                            .error("manifest.json/signature.json cannot be in files[]"));
-                    }
-                    if declared.insert(entry.path.clone(), entry.clone()).is_some() {
-                        return Err(Problem::Invalid
-                            .error(format!("duplicate files[] entry: {}", entry.path)));
-                    }
-                    if entry.mode & 0o6000 != 0 {
-                        return Err(Problem::Invalid
-                            .error(format!("setuid/setgid is not allowed: {}", entry.path)));
-                    }
-                    if declared.len() > MAX_FILES {
-                        return Err(Problem::TooLarge.error("too many files"));
-                    }
-                }
-                check_manifest_paths(&manifest)?;
-                check_hooks(&manifest)?;
-                self.declared = declared;
+                check_platform(&manifest)?;
+                self.declared = validate_declared_files(&manifest)?;
                 self.manifest_bytes = bytes;
                 self.manifest = Some(manifest);
                 Ok(())
@@ -509,30 +482,8 @@ pub fn load_staged(
     })?;
     let manifest = parse_manifest(&manifest_bytes)?;
     validate_manifest(&manifest)?;
-    if manifest.platform != crate::platform::target() {
-        return Err(Problem::UnsupportedPlatform.error(format!(
-            "platform mismatch: package {}, host {}",
-            manifest.platform,
-            crate::platform::target()
-        )));
-    }
-    let mut declared = BTreeMap::new();
-    for entry in &manifest.files {
-        check_path(&entry.path)?;
-        if entry.path == "manifest.json" || entry.path == "signature.json" {
-            return Err(Problem::Invalid.error("manifest.json/signature.json cannot be in files[]"));
-        }
-        if declared.insert(entry.path.clone(), entry.clone()).is_some() {
-            return Err(Problem::Invalid.error(format!("duplicate files[] entry: {}", entry.path)));
-        }
-        if entry.mode & 0o6000 != 0 {
-            return Err(
-                Problem::Invalid.error(format!("setuid/setgid is not allowed: {}", entry.path))
-            );
-        }
-    }
-    check_manifest_paths(&manifest)?;
-    check_hooks(&manifest)?;
+    check_platform(&manifest)?;
+    let _declared = validate_declared_files(&manifest)?;
 
     let signature_path = root.join("signature.json");
     let signature_bytes = match fs::read(&signature_path) {

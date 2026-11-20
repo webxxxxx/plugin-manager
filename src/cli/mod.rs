@@ -2,6 +2,7 @@
 //!
 //! 只做「命令 → 能力」的翻译，不写流程（§9）。
 
+pub(crate) mod client;
 pub mod plugin;
 pub mod status;
 pub mod svc;

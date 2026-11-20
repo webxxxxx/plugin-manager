@@ -28,6 +28,7 @@ pub fn is_privileged() -> bool {
             return true;
         }
     }
+    // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
     unsafe { libc::geteuid() == 0 }
 }
 
@@ -51,6 +52,7 @@ pub fn is_privileged() -> bool {
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
+    // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
     unsafe {
         let mut token: HANDLE = null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {

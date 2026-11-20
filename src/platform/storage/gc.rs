@@ -90,10 +90,8 @@ pub(crate) fn cleanup_dir(
             .metadata()
             .and_then(|metadata| metadata.modified())
             .unwrap_or(UNIX_EPOCH);
-        if modified <= cutoff {
-            if fs::remove_file(&path).is_ok() {
-                *removed += 1;
-            }
+        if modified <= cutoff && fs::remove_file(&path).is_ok() {
+            *removed += 1;
         }
     }
     Ok(())

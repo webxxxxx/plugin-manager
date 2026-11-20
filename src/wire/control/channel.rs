@@ -182,8 +182,10 @@ pub fn bind_server(
 
 const POOL_MAX: usize = 8;
 
-fn pool() -> &'static Mutex<HashMap<(PathBuf, Endpoint), Vec<Stream>>> {
-    static POOL: OnceLock<Mutex<HashMap<(PathBuf, Endpoint), Vec<Stream>>>> = OnceLock::new();
+type PoolMap = HashMap<(PathBuf, Endpoint), Vec<Stream>>;
+
+fn pool() -> &'static Mutex<PoolMap> {
+    static POOL: OnceLock<Mutex<PoolMap>> = OnceLock::new();
     POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 

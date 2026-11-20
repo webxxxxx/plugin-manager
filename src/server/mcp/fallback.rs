@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use crate::server::http::threads::{client_gone, write_http};
+use crate::server::http::blocking::{client_gone, write_http};
 use crate::server::mcp::transport;
 use crate::wire::control::channel;
 use crate::wire::message::rpc;
@@ -115,9 +115,6 @@ pub(crate) fn serve_mcp_sse(
 }
 
 fn write_sse_line(stream: &mut TcpStream, line: &str) -> std::io::Result<()> {
-    let payload = format!("event: message\ndata: {}\n\n", line);
-    stream.write_all(format!("{:x}\r\n", payload.len()).as_bytes())?;
-    stream.write_all(payload.as_bytes())?;
-    stream.write_all(b"\r\n")?;
+    stream.write_all(&crate::wire::sse::SseEvent::new("message", line).chunked())?;
     stream.flush()
 }

@@ -3,6 +3,8 @@
 //! See `docs/adr/0016-s4-request-handover.md`.
 
 #[cfg(feature = "http")]
+pub(crate) mod blocking;
+#[cfg(feature = "http")]
 pub mod budget;
 #[cfg(feature = "http")]
 pub(crate) mod conn;
@@ -23,8 +25,10 @@ pub mod pool;
 #[cfg(all(unix, feature = "http"))]
 pub mod server;
 pub mod stream;
+#[cfg(all(test, feature = "http"))]
+pub(crate) mod test_support;
 #[cfg(feature = "http")]
-pub(crate) mod threads;
+pub(crate) mod thread_loop;
 
 // The S4 contract is deliberately available to the minimal build (parent spec
 // #112) even when no HTTP endpoint is compiled in. Re-exports are allowed to

@@ -33,12 +33,13 @@ pub(crate) mod threaded;
 ///
 /// Contract:
 ///
-/// - the driver owns the listener, its accept loop and the per-connection
-///   lifetime; the caller only keeps the returned [`ServerHandle`];
+/// - the adapter owns the listener and returns a [`ServerHandle`]; the accept
+///   loop and per-connection lifetime live in `server/http/thread_loop.rs`
+///   (threaded) or `server/http/server.rs` (poll), not in the adapter;
 /// - `StartInput::control` is consumed by drivers that can merge the control
 ///   channel into their wait set; a driver that cannot must ignore it;
-/// - `shutdown` semantics belong to the driver: the poll loop stops and drains
-///   queued control replies, the thread driver only stops accepting (a thread
+/// - `shutdown` semantics belong to the loop: the poll loop stops and drains
+///   queued control replies, the thread loop only stops accepting (a thread
 ///   already blocked in `accept` ends with the process).
 pub(crate) trait ConnectionDriver {
     /// Take the listener and serve connections until `ServerHandle::shutdown`.

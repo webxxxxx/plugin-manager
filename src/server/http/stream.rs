@@ -217,8 +217,8 @@ impl<'a> OutBuffer<'a> {
         self.limit.saturating_sub(self.bytes.len())
     }
 
-    #[allow(dead_code)] // handlers may branch on a full buffer explicitly.
-    pub fn is_full(&self) -> bool {
+    #[cfg(test)]
+    fn is_full(&self) -> bool {
         self.remaining() == 0
     }
 

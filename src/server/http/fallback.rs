@@ -200,12 +200,8 @@ fn send_blocking(stream: &mut TcpStream, send: FileSend) {
     // module compiles on both so the composition root needs no platform
     // branch (#139).
     #[cfg(windows)]
-    let sent =
-        match crate::platform::host::zerocopy::send_file_range(&mut file, stream, offset, length) {
-            Ok(sent) => sent,
-            // Keep the old Windows behaviour on error: give up on this range.
-            Err(_) => true,
-        };
+    let sent = crate::platform::host::zerocopy::send_file_range(&mut file, stream, offset, length)
+        .unwrap_or(true);
     #[cfg(not(windows))]
     let sent = false;
     if !sent && file.seek(SeekFrom::Start(offset)).is_ok() {

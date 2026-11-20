@@ -35,6 +35,8 @@ pub(crate) const FRAME_QUEUE: usize = 256;
 
 /// One supervised service: the pure state machine plus the OS handles and
 /// deadlines the machine's actions drive.
+type NotifySink = Arc<dyn Fn(&str, &Value) + Send + Sync>;
+
 pub(crate) struct Slot {
     id: String,
     /// The directory set this slot uses for its log, its child environment and
@@ -84,7 +86,7 @@ pub(crate) struct Slot {
     /// Default timeout for a call that does not carry its own.
     call_timeout: std::time::Duration,
     /// Face-side projection of a plugin notification (progress/logging).
-    notify_sink: Option<Arc<dyn Fn(&str, &Value) + Send + Sync>>,
+    notify_sink: Option<NotifySink>,
     /// Requests submitted by callers, drained on the event loop.
     request_tx: mpsc::SyncSender<SlotRequest>,
     request_rx: Receiver<SlotRequest>,
@@ -348,7 +350,7 @@ impl Slot {
         self.call_timeout = timeout;
     }
 
-    pub(crate) fn set_notifier(&mut self, notify: Arc<dyn Fn(&str, &Value) + Send + Sync>) {
+    pub(crate) fn set_notifier(&mut self, notify: NotifySink) {
         self.notify_sink = Some(notify);
     }
 
@@ -1440,6 +1442,7 @@ impl Slot {
         #[cfg(unix)]
         {
             if let Some(pid) = self.machine.pid {
+                // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
                 unsafe {
                     libc::kill(-(pid as i32), libc::SIGTERM);
                 }
@@ -1485,6 +1488,7 @@ impl Slot {
         #[cfg(unix)]
         {
             if let Some(pid) = self.machine.pid {
+                // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
                 unsafe {
                     libc::kill(-(pid as i32), libc::SIGKILL);
                 }
@@ -1727,7 +1731,7 @@ mod tests {
     }
 
     fn test_limits() -> Arc<crate::platform::limits::Limits> {
-        Arc::new(crate::platform::limits::test_default())
+        crate::platform::test_support::limits()
     }
 
     fn slot() -> Slot {

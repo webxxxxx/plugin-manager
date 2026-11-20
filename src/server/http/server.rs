@@ -10,7 +10,6 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -28,8 +27,8 @@ use crate::server::control::listener::{ControlServer, Source};
 use crate::server::http::budget::StreamPermit;
 use crate::server::http::driver::{StreamAdmission, StreamDriver};
 use crate::server::http::engine::{
-    self, keep_alive_response, wants_keep_alive, Connection as EngineConnection, HttpRequest,
-    PreRequest, ServerLoop, Table,
+    self, keep_alive_response, wants_keep_alive, Connection as EngineConnection, ConnectionOps,
+    ExtraOps, HttpRequest, LifecycleOps, PreRequest, Table, TimerOps,
 };
 use crate::server::http::model as http;
 use crate::server::http::{
@@ -39,7 +38,6 @@ use crate::server::http::{
     StreamHandler,
 };
 use crate::server::mcp::progress::{McpSseStream, PROGRESS_QUEUE_SLOTS};
-use crate::server::mcp::transport;
 use crate::wire::control::channel::PendingCall;
 
 use crate::server::http::hooks::{FallbackHandler, PreBodyRoutes};
@@ -197,7 +195,7 @@ struct Server {
     next_stream_job: u64,
 }
 
-impl ServerLoop for Server {
+impl ConnectionOps for Server {
     type State = ConnState;
 
     fn new_state(&mut self, _id: u64, _peer: IpAddr) -> ConnState {
@@ -285,27 +283,9 @@ impl ServerLoop for Server {
             self.serve_face(connection, prepared, request.body, keep_alive);
             return;
         }
-        let path = request
-            .path
-            .split_once('?')
-            .map(|(path, _)| path)
-            .unwrap_or(request.path.as_str());
-        if path == "/mcp" {
-            let password_hash = self
-                .lan
-                .lock()
-                .ok()
-                .and_then(|state| state.password_hash().map(str::to_string));
-            let prepared = transport::prepare_streaming(
-                &transport::Request {
-                    method: &request.method,
-                    headers: &request.headers,
-                    body: &request.body,
-                },
-                password_hash.as_deref(),
-            );
+        if let Some(prepared) = self.routes.mcp(&request, &self.lan) {
             match prepared {
-                Ok(Some(call)) => {
+                Ok(call) => {
                     // Reserve the long-lived slot before starting the plugin
                     // call: a full budget must refuse the request without a
                     // side effect on the service.
@@ -353,7 +333,6 @@ impl ServerLoop for Server {
                     );
                     return;
                 }
-                Ok(None) => {}
                 Err(response) => {
                     write_response(connection, response, false);
                     return;
@@ -414,6 +393,59 @@ impl ServerLoop for Server {
         }
     }
 
+    fn interest(&self, connection: &Connection) -> i16 {
+        let mut events = match &connection.state {
+            ConnState::Reading => libc::POLLIN,
+            ConnState::Writing => libc::POLLOUT,
+            ConnState::Stream(driver) => {
+                if driver.wants_read() {
+                    libc::POLLIN
+                } else if driver.has_job() {
+                    // A stream job in flight still has to notice a client FIN
+                    // so it can be cancelled; the engine owns the platform's
+                    // half-close flag. A stream merely blocked on write keeps
+                    // the old behaviour and may still deliver its response.
+                    engine::paused_stream_interest()
+                } else {
+                    0
+                }
+            }
+            ConnState::Processing => 0,
+        };
+        if connection.out_at < connection.out.len() || stream_has_file(connection) {
+            events |= libc::POLLOUT;
+        }
+        events
+    }
+
+    fn is_idle(&self, connection: &Connection, now: Instant, idle: Duration) -> bool {
+        matches!(connection.state, ConnState::Reading | ConnState::Writing)
+            && now.saturating_duration_since(connection.last_active) > idle
+    }
+
+    fn on_close(&mut self, connection: &mut Connection) {
+        // A plan is resolved per request and consumed by `serve_face`; a
+        // connection that dies while waiting for its body leaves it behind.
+        self.face_plans.remove(&connection.id);
+        // Replacing or dropping ConnState::Stream drops the driver, which
+        // delivers the handler's `Closed` event.
+        if let Some(pending) = self.blocking_pending.remove(&connection.id) {
+            // Seal the slot first: a job that finishes after this point writes
+            // into a sealed slot and is ignored. Then free a queued slot or
+            // flip a running job's cancellation token.
+            pending.slot.take();
+            self.blocking.cancel(connection.id);
+        } else if let Some(key) = self.stream_jobs.remove(&connection.id) {
+            // Same contract for a stream job: the connection is gone, so a
+            // queued job is dropped and a running one learns it was cancelled.
+            self.stream_job_keys.remove(&key);
+            self.blocking.cancel(key);
+        }
+    }
+}
+
+impl TimerOps for Server {
+    type State = ConnState;
     fn on_tick(&mut self, connections: &mut Table<ConnState>) {
         let mut drain = [0u8; 64];
         while self.notify.read(&mut drain).is_ok() {}
@@ -536,57 +568,9 @@ impl ServerLoop for Server {
             }
         }
     }
+}
 
-    fn interest(&self, connection: &Connection) -> i16 {
-        let mut events = match &connection.state {
-            ConnState::Reading => libc::POLLIN,
-            ConnState::Writing => libc::POLLOUT,
-            ConnState::Stream(driver) => {
-                if driver.wants_read() {
-                    libc::POLLIN
-                } else if driver.has_job() {
-                    // A stream job in flight still has to notice a client FIN
-                    // so it can be cancelled; the engine owns the platform's
-                    // half-close flag. A stream merely blocked on write keeps
-                    // the old behaviour and may still deliver its response.
-                    engine::paused_stream_interest()
-                } else {
-                    0
-                }
-            }
-            ConnState::Processing => 0,
-        };
-        if connection.out_at < connection.out.len() || stream_has_file(connection) {
-            events |= libc::POLLOUT;
-        }
-        events
-    }
-
-    fn is_idle(&self, connection: &Connection, now: Instant, idle: Duration) -> bool {
-        matches!(connection.state, ConnState::Reading | ConnState::Writing)
-            && now.saturating_duration_since(connection.last_active) > idle
-    }
-
-    fn on_close(&mut self, connection: &mut Connection) {
-        // A plan is resolved per request and consumed by `serve_face`; a
-        // connection that dies while waiting for its body leaves it behind.
-        self.face_plans.remove(&connection.id);
-        // Replacing or dropping ConnState::Stream drops the driver, which
-        // delivers the handler's `Closed` event.
-        if let Some(pending) = self.blocking_pending.remove(&connection.id) {
-            // Seal the slot first: a job that finishes after this point writes
-            // into a sealed slot and is ignored. Then free a queued slot or
-            // flip a running job's cancellation token.
-            pending.slot.take();
-            self.blocking.cancel(connection.id);
-        } else if let Some(key) = self.stream_jobs.remove(&connection.id) {
-            // Same contract for a stream job: the connection is gone, so a
-            // queued job is dropped and a running one learns it was cancelled.
-            self.stream_job_keys.remove(&key);
-            self.blocking.cancel(key);
-        }
-    }
-
+impl ExtraOps for Server {
     fn wake_fd(&self) -> Option<RawFd> {
         Some(self.notify.as_raw_fd())
     }
@@ -612,7 +596,9 @@ impl ServerLoop for Server {
             None => {}
         }
     }
+}
 
+impl LifecycleOps for Server {
     fn should_stop(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
     }
@@ -1010,6 +996,7 @@ fn peer_closed(connection: &Connection) -> bool {
 
 fn socket_closed(fd: RawFd) -> bool {
     let mut byte = 0u8;
+    // SAFETY: The fd comes from a live connection/listener owned by the loop; the pollfd array is local to the call.
     let read = unsafe {
         libc::recv(
             fd,

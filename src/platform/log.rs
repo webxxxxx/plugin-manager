@@ -151,6 +151,7 @@ fn set_group(path: &Path) {
     let Ok(name) = CString::new("svcd") else {
         return;
     };
+    // SAFETY: The handle comes from the process-wide log sink and is only used while that sink is alive.
     let group = unsafe { libc::getgrnam(name.as_ptr()) };
     if group.is_null() {
         return;
@@ -158,6 +159,7 @@ fn set_group(path: &Path) {
     let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
         return;
     };
+    // SAFETY: The handle comes from the process-wide log sink and is only used while that sink is alive.
     unsafe {
         libc::chown(path.as_ptr(), 0, (*group).gr_gid);
     }

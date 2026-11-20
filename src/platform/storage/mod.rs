@@ -129,16 +129,7 @@ mod tests {
     /// Each test derives its own tree from a temporary root, so no process
     /// environment is read and two tests cannot race.
     fn test_paths() -> Paths {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let root = crate::test_support::temp_dir().join(format!(
-            "svcd-blob-{}-{}",
-            std::process::id(),
-            nanos
-        ));
-        let paths = Paths::under(&root);
+        let paths = crate::platform::test_support::paths("blob-store");
         std::fs::create_dir_all(&paths.temp_dir).expect("blob root");
         paths
     }

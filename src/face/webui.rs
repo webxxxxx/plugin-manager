@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::manage::package;
+use crate::manage as package;
 use crate::wire::message::rpc;
 
 /// The page-facing JSON-RPC bridge for `/plugin-ui/{id}/rpc`.

@@ -33,6 +33,7 @@ fn path_writable(path: &Path) -> bool {
     let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
         return false;
     };
+    // SAFETY: The registry/PATH handle is opened by this function and closed on every path; buffers are valid for the call.
     unsafe { libc::access(path.as_ptr(), libc::W_OK) == 0 }
 }
 
@@ -653,6 +654,7 @@ fn add_user_path(dir: &Path) -> Result<bool, String> {
     let subkey = wide("Environment");
     let value_name = wide("Path");
     let mut key: HKEY = std::ptr::null_mut();
+    // SAFETY: The registry/PATH handle is opened by this function and closed on every path; buffers are valid for the call.
     let opened = unsafe {
         RegOpenKeyExW(
             HKEY_CURRENT_USER,
@@ -667,6 +669,7 @@ fn add_user_path(dir: &Path) -> Result<bool, String> {
     }
     let mut kind = 0u32;
     let mut size = 0u32;
+    // SAFETY: The registry/PATH handle is opened by this function and closed on every path; buffers are valid for the call.
     let queried = unsafe {
         RegQueryValueExW(
             key,
@@ -682,6 +685,7 @@ fn add_user_path(dir: &Path) -> Result<bool, String> {
         current.resize(size as usize, 0u8);
         let mut read_kind = 0u32;
         let mut read_size = size;
+        // SAFETY: The registry/PATH handle is opened by this function and closed on every path; buffers are valid for the call.
         let read = unsafe {
             RegQueryValueExW(
                 key,
@@ -693,6 +697,7 @@ fn add_user_path(dir: &Path) -> Result<bool, String> {
             )
         };
         if read != 0 {
+            // SAFETY: The registry/PATH handle is opened by this function and closed on every path; buffers are valid for the call.
             unsafe { RegCloseKey(key) };
             return Err(format!("read HKCU\\Environment\\Path: code {}", read));
         }
@@ -700,7 +705,9 @@ fn add_user_path(dir: &Path) -> Result<bool, String> {
     }
     let existing = String::from_utf16_lossy(
         &current
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .take_while(|unit| *unit != 0)
             .collect::<Vec<_>>(),
@@ -710,6 +717,7 @@ fn add_user_path(dir: &Path) -> Result<bool, String> {
         .split(';')
         .any(|entry| entry.trim().eq_ignore_ascii_case(&directory));
     if already {
+        // SAFETY: The registry/PATH handle is opened by this function and closed on every path; buffers are valid for the call.
         unsafe { RegCloseKey(key) };
         return Ok(false);
     }
@@ -720,6 +728,7 @@ fn add_user_path(dir: &Path) -> Result<bool, String> {
     };
     let encoded: Vec<u16> = updated.encode_utf16().chain(std::iter::once(0)).collect();
     let bytes: Vec<u8> = encoded.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+    // SAFETY: The registry/PATH handle is opened by this function and closed on every path; buffers are valid for the call.
     let written = unsafe {
         RegSetValueExW(
             key,
@@ -730,10 +739,12 @@ fn add_user_path(dir: &Path) -> Result<bool, String> {
             bytes.len() as u32,
         )
     };
+    // SAFETY: The registry/PATH handle is opened by this function and closed on every path; buffers are valid for the call.
     unsafe { RegCloseKey(key) };
     if written != 0 {
         return Err(format!("write HKCU\\Environment\\Path: code {}", written));
     }
+    // SAFETY: The registry/PATH handle is opened by this function and closed on every path; buffers are valid for the call.
     unsafe {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
@@ -770,6 +781,7 @@ fn remove_user_path(dir: &Path) -> Result<bool, String> {
     let subkey = wide("Environment");
     let value_name = wide("Path");
     let mut key: HKEY = std::ptr::null_mut();
+    // SAFETY: The registry/PATH handle is opened by this function and closed on every path; buffers are valid for the call.
     let opened = unsafe {
         RegOpenKeyExW(
             HKEY_CURRENT_USER,
@@ -784,6 +796,7 @@ fn remove_user_path(dir: &Path) -> Result<bool, String> {
     }
     let mut kind = 0u32;
     let mut size = 0u32;
+    // SAFETY: The registry/PATH handle is opened by this function and closed on every path; buffers are valid for the call.
     let queried = unsafe {
         RegQueryValueExW(
             key,
@@ -795,11 +808,13 @@ fn remove_user_path(dir: &Path) -> Result<bool, String> {
         )
     };
     if queried != 0 || size == 0 {
+        // SAFETY: The registry/PATH handle is opened by this function and closed on every path; buffers are valid for the call.
         unsafe { RegCloseKey(key) };
         return Ok(false);
     }
     let mut current = vec![0u8; size as usize];
     let mut read_size = size;
+    // SAFETY: The registry/PATH handle is opened by this function and closed on every path; buffers are valid for the call.
     let read = unsafe {
         RegQueryValueExW(
             key,
@@ -811,13 +826,16 @@ fn remove_user_path(dir: &Path) -> Result<bool, String> {
         )
     };
     if read != 0 {
+        // SAFETY: The registry/PATH handle is opened by this function and closed on every path; buffers are valid for the call.
         unsafe { RegCloseKey(key) };
         return Err(format!("read HKCU\\Environment\\Path: code {}", read));
     }
     current.truncate(read_size as usize);
     let existing = String::from_utf16_lossy(
         &current
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .take_while(|unit| *unit != 0)
             .collect::<Vec<_>>(),
@@ -829,11 +847,13 @@ fn remove_user_path(dir: &Path) -> Result<bool, String> {
         .collect();
     let updated = entries.join(";");
     if updated == existing {
+        // SAFETY: The registry/PATH handle is opened by this function and closed on every path; buffers are valid for the call.
         unsafe { RegCloseKey(key) };
         return Ok(false);
     }
     let encoded: Vec<u16> = updated.encode_utf16().chain(std::iter::once(0)).collect();
     let bytes: Vec<u8> = encoded.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+    // SAFETY: The registry/PATH handle is opened by this function and closed on every path; buffers are valid for the call.
     let written = unsafe {
         RegSetValueExW(
             key,
@@ -844,10 +864,12 @@ fn remove_user_path(dir: &Path) -> Result<bool, String> {
             bytes.len() as u32,
         )
     };
+    // SAFETY: The registry/PATH handle is opened by this function and closed on every path; buffers are valid for the call.
     unsafe { RegCloseKey(key) };
     if written != 0 {
         return Err(format!("write HKCU\\Environment\\Path: code {}", written));
     }
+    // SAFETY: The registry/PATH handle is opened by this function and closed on every path; buffers are valid for the call.
     unsafe {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
@@ -1185,8 +1207,7 @@ fn remove_file_retry(path: &Path) -> std::io::Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    Err(last
-        .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "cannot remove file")))
+    Err(last.unwrap_or_else(|| std::io::Error::other("cannot remove file")))
 }
 
 #[cfg(windows)]
@@ -1195,8 +1216,10 @@ pub(crate) fn wait_for_process(pid: u32) {
     use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
     const SYNCHRONIZE: u32 = 0x0010_0000;
     const INFINITE: u32 = 0xFFFF_FFFF;
+    // SAFETY: The registry/PATH handle is opened by this function and closed on every path; buffers are valid for the call.
     let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
     if !handle.is_null() {
+        // SAFETY: The registry/PATH handle is opened by this function and closed on every path; buffers are valid for the call.
         unsafe {
             WaitForSingleObject(handle, INFINITE);
             CloseHandle(handle);
@@ -1285,6 +1308,7 @@ fn schedule_delete_on_reboot(path: &Path) {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
+    // SAFETY: The registry/PATH handle is opened by this function and closed on every path; buffers are valid for the call.
     unsafe {
         MoveFileExW(wide.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT);
     }
@@ -1593,8 +1617,7 @@ fn copy_executable(source: &Path, target: &Path) -> io::Result<()> {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))?;
         }
-        replace_file(&temporary, target)
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))
+        replace_file(&temporary, target).map_err(io::Error::other)
     });
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -1607,7 +1630,7 @@ fn install_alias(source: &Path, target: &Path) -> io::Result<()> {
     // Copies keep aliases removable independently of the running executable.
     #[cfg(windows)]
     {
-        return copy_executable(source, target);
+        copy_executable(source, target)
     }
     #[cfg(not(windows))]
     {

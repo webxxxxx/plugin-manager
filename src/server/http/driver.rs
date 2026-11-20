@@ -503,7 +503,7 @@ fn read_file_chunk(send: &mut FileSend, out: &mut Vec<u8>, limit: usize) -> std:
 #[cfg(test)]
 mod tests {
     fn test_limits() -> std::sync::Arc<crate::platform::limits::Limits> {
-        std::sync::Arc::new(crate::platform::limits::test_default())
+        crate::platform::test_support::limits()
     }
 
     use super::*;

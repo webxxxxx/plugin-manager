@@ -38,6 +38,15 @@ pub(crate) trait PreBodyRoutes: Send + Sync {
         head: &http::Head,
         lan: &Arc<Mutex<Lan>>,
     ) -> Option<Result<Exchange, Vec<u8>>>;
+    /// The `/mcp` stream plan, if this request is a `tools/call` that asked
+    /// for SSE. Both the poll loop and the thread loop ask this one hook, so
+    /// the path, origin, bearer and `_meta` checks are not written twice.
+    fn mcp(
+        &self,
+        request: &HttpRequest,
+        lan: &Arc<Mutex<Lan>>,
+    ) -> Option<Result<crate::server::mcp::transport::StreamingCall, Vec<u8>>>;
+
     /// Body policy for the server-owned routes the face leaves alone (MCP,
     /// blob/file session metadata). The composition root owns this last legacy
     /// table; a new endpoint declares its policy in `Face::route` instead.

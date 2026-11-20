@@ -4,10 +4,10 @@ use std::time::Duration;
 
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::registry::RESERVED_ID;
+use crate::manage as package;
 use crate::manage::model::layout::{current_version, plugin_dir};
 use crate::manage::ops::export_plugin::remove_versions;
 use crate::manage::ops::scan::read_manifest;
-use crate::manage::package;
 use crate::platform::log;
 use crate::platform::paths::Paths;
 use crate::supervise::ops::hook;

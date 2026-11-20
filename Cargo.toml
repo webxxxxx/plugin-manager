@@ -4,6 +4,13 @@ version = "0.1.1"
 edition = "2021"
 description = "svcd core: service supervisor, registry and local CLI"
 
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
 [features]
 default = ["http"]
 # HTTP management API, embedded console, plugin web UI, LAN auth and MCP HTTP.

@@ -13,7 +13,7 @@ use std::time::Instant;
 use serde_json::{json, Value};
 
 use crate::kernel::failure::{Class, Problem, ProblemError};
-use crate::manage::package;
+use crate::manage as package;
 use crate::server::http::model as http;
 use crate::server::http::{CancelToken, JobBudget, Request};
 use crate::wire::control::channel;
@@ -236,6 +236,28 @@ pub(crate) use crate::server::http::model::code_for;
 
 pub(crate) fn error(status: u16, code: &str, message: &str) -> Vec<u8> {
     http::json_error(status, code, message)
+}
+
+/// The `Expect: 100-continue` step shared by the package and blob upload
+/// streams: send the interim response once, then ask for either a read (it
+/// fitted) or another writable event (the output buffer was full).
+pub(crate) fn expect_continue(
+    out: &mut crate::server::http::OutBuffer<'_>,
+    sent: &mut bool,
+    expected: bool,
+) -> Option<crate::server::http::StreamStep> {
+    if *sent || !expected {
+        return None;
+    }
+    if out.write(b"HTTP/1.1 100 Continue\r\n\r\n") {
+        *sent = true;
+        return Some(crate::server::http::StreamStep::wait(
+            crate::server::http::StreamAction::NeedRead,
+        ));
+    }
+    Some(crate::server::http::StreamStep::wait(
+        crate::server::http::StreamAction::NeedWrite,
+    ))
 }
 
 pub(crate) fn decode(value: &str) -> String {

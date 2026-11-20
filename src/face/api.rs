@@ -15,8 +15,8 @@ use serde_json::{json, Value};
 
 use crate::kernel::failure::ProblemError;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
-use crate::manage::package;
-use crate::manage::plugin;
+use crate::manage as package;
+use crate::manage as plugin;
 use crate::platform::config::Config;
 use crate::platform::log;
 use crate::platform::paths::Paths;
@@ -573,7 +573,7 @@ fn project_service(status: &Value, paths: &Paths) -> Option<Value> {
         .get("summary")
         .and_then(|summary| summary.get("id"))
         .and_then(Value::as_str)
-        .map(|id| crate::manage::plugin::web_assets(paths, id).is_some())
+        .map(|id| crate::manage::web_assets(paths, id).is_some())
         .unwrap_or(false);
     let mut summary = status.get("summary").cloned()?;
     if let Some(object) = summary.as_object_mut() {

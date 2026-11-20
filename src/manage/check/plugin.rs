@@ -4,10 +4,10 @@ use std::path::Path;
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::registry::Interpreter;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
+use crate::manage as package;
 use crate::manage::check::interpreter;
 use crate::manage::model::manifest::Package;
 use crate::manage::ops::scan::resolve_interpreter;
-use crate::manage::package;
 use crate::platform::compat;
 use crate::platform::paths::Paths;
 

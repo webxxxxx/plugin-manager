@@ -105,10 +105,12 @@ pub fn run_if_service(
     ];
 
     // Blocks on the main thread until the last service reports STOPPED.
+    // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
     let attached = unsafe { StartServiceCtrlDispatcherW(table.as_ptr()) };
     if attached != 0 {
         return Some(EXIT_CODE.load(Ordering::SeqCst));
     }
+    // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
     let error = unsafe { GetLastError() };
     if error == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT {
         return None;
@@ -122,7 +124,10 @@ pub fn run_if_service(
 
 unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core::PWSTR) {
     let name = wide(&service_name());
-    let handle = RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(control_handler), null_mut());
+    // SAFETY: `name` is NUL-terminated and lives until the call returns; the
+    // handler pointer is a valid `extern "system"` function for the process.
+    let handle =
+        unsafe { RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(control_handler), null_mut()) };
     if handle.is_null() {
         EXIT_CODE.store(1, Ordering::SeqCst);
         return;
@@ -256,6 +261,7 @@ fn report(
         dwCheckPoint: checkpoint,
         dwWaitHint: wait_hint,
     };
+    // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
     unsafe { SetServiceStatus(handle, &status) };
 }
 

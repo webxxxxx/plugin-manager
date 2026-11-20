@@ -225,11 +225,7 @@ impl Drop for McpSseStream {
 }
 
 fn sse_chunk(line: &str) -> Vec<u8> {
-    let payload = format!("event: message\ndata: {}\n\n", line);
-    let mut bytes = format!("{:x}\r\n", payload.len()).into_bytes();
-    bytes.extend_from_slice(payload.as_bytes());
-    bytes.extend_from_slice(b"\r\n");
-    bytes
+    crate::wire::sse::SseEvent::new("message", line).chunked()
 }
 
 fn final_chunk(id: Option<Value>, response: rpc::Response) -> Vec<u8> {

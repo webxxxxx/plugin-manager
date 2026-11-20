@@ -223,7 +223,7 @@ fn user_start(config: &crate::platform::config::Config) -> i32 {
         eprintln!("svcd: create {}: {}", config_dir.display(), error);
         return 1;
     }
-    if let Err(error) = std::fs::create_dir_all(&logs) {
+    if let Err(error) = std::fs::create_dir_all(logs) {
         eprintln!("svcd: create {}: {}", logs.display(), error);
         return 1;
     }
@@ -263,6 +263,7 @@ fn user_start(config: &crate::platform::config::Config) -> i32 {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
         unsafe {
             command.pre_exec(|| {
                 if libc::setsid() < 0 {

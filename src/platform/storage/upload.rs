@@ -1,7 +1,7 @@
 //! 上传会话：创建、分片提交与两种 commit 模式（内容寻址 blob / 清单文件）。
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -10,9 +10,9 @@ use sha2::{Digest, Sha256};
 use crate::platform::paths::Paths;
 
 use super::meta::{default_mime, FileManifest, FileMeta, FilePart, Meta};
-use super::part::{upload_parts, PartInfo};
+use super::part::{upload_parts, write_chunk, PartInfo};
 use super::path::{blob_path, file_dir, files_dir, hex, next_temp, random_id, upload_dir};
-use super::{Error, Result, MAX_BLOB_BYTES, MAX_FILE_BYTES, MAX_FILE_PART_BYTES, MAX_PART_NUMBER};
+use super::{Error, Result, MAX_BLOB_BYTES, MAX_FILE_BYTES, MAX_PART_NUMBER};
 
 #[cfg(feature = "http")]
 static SESSION_LOCK: Mutex<()> = Mutex::new(());
@@ -52,15 +52,8 @@ impl Upload {
     }
 
     pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        let size = self.size.saturating_add(bytes.len() as u64);
-        if size > MAX_FILE_PART_BYTES {
-            return Err(Error::too_large("blob is too large"));
-        }
-        self.file.write_all(bytes).map_err(|error| {
-            Error::internal(format!("write {}: {}", self.temp.display(), error))
-        })?;
+        write_chunk(&mut self.file, &mut self.size, bytes, &self.temp)?;
         self.hasher.update(bytes);
-        self.size = size;
         Ok(())
     }
 

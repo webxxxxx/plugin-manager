@@ -9,9 +9,9 @@ use crate::kernel::registry::{
     Exec, Hook, Interpreter, Kind, Lifecycle, Ready, Restart, Service, State, RESERVED_ID,
 };
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
+use crate::manage as package;
 use crate::manage::check::interpreter;
-use crate::manage::package;
-use crate::manage::plugin::{current_version, plugin_dir};
+use crate::manage::{current_version, plugin_dir};
 use crate::platform::paths::Paths;
 
 pub fn scan(
@@ -22,7 +22,7 @@ pub fn scan(
     let host = crate::platform::compat::detect(paths, MAX_SCHEMA, MAX_PROTOCOL);
     let mut services = Vec::new();
     let mut warnings = Vec::new();
-    let entries = match fs::read_dir(&root) {
+    let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (services, warnings),
         Err(error) => {
