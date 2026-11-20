@@ -584,6 +584,7 @@ mod tests {
     fn driver(wait: Duration) -> StreamDriver {
         match StreamDriver::admit(
             Box::new(IdleWaiter { ticks: 0, wait }),
+            &StreamBudget::new(),
             usize::MAX,
             test_limits(),
         ) {
@@ -692,7 +693,7 @@ mod tests {
     #[test]
     fn a_submitted_job_is_taken_once_and_resumed_with_its_outcome() {
         let StreamAdmission::Admitted(mut driver) =
-            StreamDriver::admit(Box::new(JobHandler), 8, test_limits())
+            StreamDriver::admit(Box::new(JobHandler), &StreamBudget::new(), 8, test_limits())
         else {
             panic!("the stream fits the cap");
         };
@@ -762,9 +763,12 @@ mod tests {
                 }
             }
         }
-        let StreamAdmission::Admitted(mut driver) =
-            StreamDriver::admit(Box::new(TwoJobs { calls: 0 }), 8, test_limits())
-        else {
+        let StreamAdmission::Admitted(mut driver) = StreamDriver::admit(
+            Box::new(TwoJobs { calls: 0 }),
+            &StreamBudget::new(),
+            8,
+            test_limits(),
+        ) else {
             panic!("the stream fits the cap");
         };
         let mut out = Vec::new();
@@ -807,7 +811,7 @@ mod tests {
     #[test]
     fn a_paused_job_still_closes_at_the_transfer_bound() {
         let StreamAdmission::Admitted(mut driver) =
-            StreamDriver::admit(Box::new(PauseOnce), 1, test_limits())
+            StreamDriver::admit(Box::new(PauseOnce), &StreamBudget::new(), 1, test_limits())
         else {
             panic!("the stream fits the cap");
         };
