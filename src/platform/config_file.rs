@@ -12,21 +12,25 @@ use crate::platform::host::dirs;
 use crate::platform::settings::{self, Settings};
 
 /// Fill the three roots that are absent. `install_dir` is folded in here and
-/// nowhere else: it supplies the data/logs defaults, while `config_dir` keeps
-/// its own default (ADR-0004 rejects binding config to the install prefix).
+/// nowhere else: it supplies `<install_dir>/{config,data,logs}`, so a prefixed
+/// install is self-contained. Explicit roots still win.
 ///
 /// Returns the keys that were filled, in document order. The caller writes
 /// exactly those keys back; explicit roots are never rewritten.
 pub fn fill_missing(settings: &mut Settings) -> Vec<&'static str> {
-    let data = match settings.install_dir.as_ref() {
-        Some(prefix) => prefix.join("data"),
-        None => dirs::default_data_dir(),
+    let (config, data, logs) = match settings.install_dir.as_ref() {
+        Some(prefix) => (
+            prefix.join("config"),
+            prefix.join("data"),
+            prefix.join("logs"),
+        ),
+        None => (
+            dirs::default_config_dir(),
+            dirs::default_data_dir(),
+            dirs::default_logs_dir(),
+        ),
     };
-    let logs = match settings.install_dir.as_ref() {
-        Some(prefix) => prefix.join("logs"),
-        None => dirs::default_logs_dir(),
-    };
-    fill_missing_with(settings, dirs::default_config_dir(), data, logs)
+    fill_missing_with(settings, config, data, logs)
 }
 
 /// The same fill with the caller's already-resolved defaults.
@@ -59,19 +63,30 @@ pub fn fill_missing_with(
 /// The defaults a caller should pass to [`fill_missing_with`].
 ///
 /// The already-resolved paths carry the `SVCD_*` overrides; a variable that is
-/// set is the actual root. Otherwise `install_dir` supplies the data/logs
-/// default, and finally the path resolver's default.
+/// set is the actual root. Otherwise `install_dir` supplies the missing
+/// config/data/logs defaults, and finally the path resolver's default.
 pub fn defaults_from_paths(
     settings: &Settings,
     paths: &crate::platform::paths::Paths,
     env: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> (PathBuf, PathBuf, PathBuf) {
+    let config = if env("SVCD_CONFIG_DIR").is_some() {
+        paths.config_dir.clone()
+    } else {
+        settings
+            .install_dir
+            .as_ref()
+            .filter(|_| settings.config_dir.is_none())
+            .map(|prefix| prefix.join("config"))
+            .unwrap_or_else(|| paths.config_dir.clone())
+    };
     let data = if env("SVCD_DATA_DIR").is_some() {
         paths.data_dir.clone()
     } else {
         settings
             .install_dir
             .as_ref()
+            .filter(|_| settings.data_dir.is_none())
             .map(|prefix| prefix.join("data"))
             .unwrap_or_else(|| paths.data_dir.clone())
     };
@@ -81,10 +96,11 @@ pub fn defaults_from_paths(
         settings
             .install_dir
             .as_ref()
+            .filter(|_| settings.logs_dir.is_none())
             .map(|prefix| prefix.join("logs"))
             .unwrap_or_else(|| paths.logs_dir.clone())
     };
-    (paths.config_dir.clone(), data, logs)
+    (config, data, logs)
 }
 
 /// Write the filled roots back to an existing document, preserving comments
@@ -294,13 +310,17 @@ mod tests {
     }
 
     #[test]
-    fn fill_uses_the_install_prefix_for_data_and_logs() {
+    fn fill_uses_the_install_prefix_for_all_three_roots() {
         let mut settings = Settings {
             install_dir: Some(std::path::PathBuf::from("/srv/svcd")),
             ..Settings::default()
         };
         let filled = fill_missing(&mut settings);
         assert_eq!(filled, vec!["config_dir", "data_dir", "logs_dir"]);
+        assert_eq!(
+            settings.config_dir,
+            Some(std::path::PathBuf::from("/srv/svcd/config"))
+        );
         assert_eq!(
             settings.data_dir,
             Some(std::path::PathBuf::from("/srv/svcd/data"))
@@ -309,6 +329,32 @@ mod tests {
             settings.logs_dir,
             Some(std::path::PathBuf::from("/srv/svcd/logs"))
         );
+    }
+
+    #[test]
+    fn defaults_from_paths_maps_the_install_prefix_until_a_root_is_explicit() {
+        let settings = Settings {
+            install_dir: Some(std::path::PathBuf::from("/srv/svcd")),
+            ..Settings::default()
+        };
+        let paths = crate::platform::paths::Paths::resolve_with(&settings, |_| None);
+        let (config, data, logs) = defaults_from_paths(&settings, &paths, |_| None);
+        assert_eq!(config, std::path::PathBuf::from("/srv/svcd/config"));
+        assert_eq!(data, std::path::PathBuf::from("/srv/svcd/data"));
+        assert_eq!(logs, std::path::PathBuf::from("/srv/svcd/logs"));
+
+        let explicit = Settings {
+            config_dir: Some(std::path::PathBuf::from("/etc/svcd")),
+            data_dir: Some(std::path::PathBuf::from("/var/lib/svcd")),
+            logs_dir: Some(std::path::PathBuf::from("/var/log/svcd")),
+            install_dir: Some(std::path::PathBuf::from("/srv/svcd")),
+            ..Settings::default()
+        };
+        let paths = crate::platform::paths::Paths::resolve_with(&explicit, |_| None);
+        let (config, data, logs) = defaults_from_paths(&explicit, &paths, |_| None);
+        assert_eq!(config, std::path::PathBuf::from("/etc/svcd"));
+        assert_eq!(data, std::path::PathBuf::from("/var/lib/svcd"));
+        assert_eq!(logs, std::path::PathBuf::from("/var/log/svcd"));
     }
 
     #[test]

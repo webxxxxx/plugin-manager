@@ -15,7 +15,7 @@ Accepted。细化 [docs/architecture.md](../architecture.md) §8 的 S7 行；�
 
 - **运行配置是一个只读值，名字叫 `Config`**：`Settings`（解析后的 `svcd.conf`）+ `settings_path`（这次实际加载的配置文件；没有则 `None`）+ `Paths`（目录集）+ `Limits`（由前两者派生）。术语见 `GLOSSARY.md`。
 - **传值，不传 trait。** 进程启动后配置就是常量（`limits` 的既有注释已说明改文件需重启）；文件与 env 的差异收敛在 bootstrap 一处，不需要动态分发，也不需要「懒绑定」。
-- **两个构造入口。** `Paths::resolve(&Settings)` 用于生产：平台默认 → `SVCD_*` → `config_dir`/`install_dir` 覆盖，一次算完，字段全是 `PathBuf`，没有 `Option`、没有 getter 里的 fallback。`Paths::under(root)` 用于测试：同一组目录结构落在一个临时根下，不读进程环境。
+- **两个构造入口。** `Paths::resolve(&Settings)` 用于生产：平台默认 → `SVCD_*` → 配置根（未写时由 `install_dir` 折算）覆盖，一次算完，字段全是 `PathBuf`，没有 `Option`、没有 getter 里的 fallback。`Paths::under(root)` 用于测试：同一组目录结构落在一个临时根下，不读进程环境。
 - **注入深度：类型持有、函数收窄。** 组合根把 `&Config`（或 `Arc<Config>`）交给各子系统；`paths::config_dir()` 这类自由函数消失，调用点改读 `config.paths.config_dir`；一个函数只需要目录就只收 `&Paths`，不需要整个 `Config`。
 - **env 只在 bootstrap 读。** `paths` 的 6 处与 `settings` 的 1 处收进 bootstrap；模块内部不再读进程 env。删掉 `SVCD_*` 覆盖是另一件事（集成测试有 20/19/16 处依赖 `SVCD_DATA_DIR`/`CONFIG_DIR`/`LOG_DIR`），另开票。`install.rs` 的 `SVCD_TEST_*` 是 CLI 自己的测试钩子，不在本决定范围。
 - **bootstrap 按需调用、失败硬错。** 四个进程入口（`daemon` / `svc` / `plugin` / `mcp`）在真正需要目录时调同一个 `Config::bootstrap(conf)`；配置损坏就退出，不静默回退默认值。`--help` / `--version` / `uninstall` 这类不需要目录的命令不 bootstrap。
@@ -37,7 +37,7 @@ Accepted。细化 [docs/architecture.md](../architecture.md) §8 的 S7 行；�
 
 - `settings::{SETTINGS, CONFIG_PATH}` and `limits::LIMITS` are gone. `settings::load(conf)` resolves and parses the document once and returns `(Settings, Option<PathBuf>)`; `Config::bootstrap` is its only caller (the daemon resolves its pre-`ensure_conf` `Config` through that same entry). `Limits` is a pure projection (`limits::derive`) and carries no cache.
 - Readers receive the value through construction: a subsystem that already holds `Config` reads `config.limits` / `config.settings`; a function that needs only one of them takes `&Limits` (or the already-derived value) as a parameter. `settings_path` write-back (`svc lan passwd`) uses that field instead of guessing `config_dir/svcd.conf`.
-- The daemon still needs the config directory before `ensure_conf` can report the path it settled on. It bootstraps once before `ensure_conf` and keeps that document for the whole run; `ensure_conf` only chooses or creates the file the service unit and the next start use. This preserves the old cache's precedence (`SVCD_CONFIG_DIR` > program dir > platform default) instead of letting `ensure_conf`'s fallback silently switch documents mid-start, and it removes the second parse S7a still had on first start.
+- The daemon still needs the config directory before `ensure_conf` can report the path it settled on. It bootstraps once before `ensure_conf` and keeps that document for the whole run; `ensure_conf` only chooses or creates the file the service unit and the next start use. This preserves the old cache's precedence (`SVCD_CONFIG_DIR` > program-dir `config/svcd.conf` > program-dir `svcd.conf` > platform default) instead of letting `ensure_conf`'s fallback silently switch documents mid-start, and it removes the second parse S7a still had on first start.
 - `config::ambient_paths(conf)` remains the single tolerant entry for phases that must outlive a broken config; it now takes the explicit `--conf` (when it exists) so the Windows SCM probe and the daemon agree.
 
 ## Consequences

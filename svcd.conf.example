@@ -48,14 +48,15 @@ bind = 127.0.0.1:8787
 # Installation root, recorded by `svcd --install --prefix <dir>` and also
 # honored when written by hand: reinstalls without `--prefix` and
 # `--uninstall` use it. It is only an install prefix: at configuration
-# initialization it supplies <install_dir>/data and <install_dir>/logs when
-# those roots are absent, then the roots above are written into this file.
-# Runtime never derives paths from it. `--prefix` still wins over it. On
-# read-only-rootfs hosts (for example SR6110) install with
+# initialization it supplies <install_dir>/config, <install_dir>/data and
+# <install_dir>/logs when those roots are absent, then the roots above are
+# written into this file. An explicit config_dir/data_dir/logs_dir still wins,
+# and runtime never derives paths from install_dir. `--prefix` still wins over
+# it. On read-only-rootfs hosts (for example SR6110) install with
 # `svcd --install --manual` to skip init registration and generate
 # `svcd_daemon.sh` (Unix) or `svcd_daemon.bat` (Windows).
-# Changing the recorded root does not move an existing materialized data_dir or
-# logs_dir; edit those roots to move them.
+# Changing the recorded root does not move an existing materialized root; edit
+# that root to move it.
 # install_dir = /etc/sr/svcd
 
 # Web/API password hash. Never put the plaintext here; set it with:

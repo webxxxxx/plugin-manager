@@ -1116,6 +1116,100 @@ fn installed_conf(sandbox: &Sandbox) -> String {
 }
 
 #[test]
+fn prefixed_install_places_all_three_roots_under_the_install_dir() {
+    let sandbox = Sandbox::new();
+    let install_root = sandbox.root.join("persist").join("svcd");
+
+    let output = sandbox.run_with(
+        &[
+            "--install",
+            "--prefix",
+            install_root.to_str().expect("utf8"),
+            "--no-service",
+        ],
+        |command| {
+            command
+                .env_remove("SVCD_CONFIG_DIR")
+                .env_remove("SVCD_DATA_DIR")
+                .env_remove("SVCD_LOG_DIR");
+        },
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    let config_dir = install_root.join("config");
+    let data_dir = install_root.join("data");
+    let logs_dir = install_root.join("logs");
+    for dir in [&config_dir, &data_dir, &logs_dir] {
+        assert!(dir.is_dir(), "{} was not created", dir.display());
+    }
+    let conf_path = config_dir.join("svcd.conf");
+    let conf = fs::read_to_string(&conf_path).expect("installed conf");
+    for (key, value) in [
+        ("config_dir", &config_dir),
+        ("data_dir", &data_dir),
+        ("logs_dir", &logs_dir),
+        ("install_dir", &install_root),
+    ] {
+        assert!(
+            conf.contains(&format!("{} = {}\n", key, value.display())),
+            "{} missing from:\n{}",
+            key,
+            conf
+        );
+    }
+
+    // Uninstall must find the config and the recorded prefix the same way.
+    let dry_uninstall = Command::new(install_root.join(executable_name()))
+        .args(["--uninstall", "--no-service", "--purge", "--dry-run"])
+        .env_remove("SVCD_CONFIG_DIR")
+        .env_remove("SVCD_DATA_DIR")
+        .env_remove("SVCD_LOG_DIR")
+        .env_remove("SVCD_USER")
+        .env("SVCD_TEST_PRIVILEGE", "privileged")
+        .output()
+        .expect("run installed svcd --uninstall --dry-run");
+    assert_eq!(
+        dry_uninstall.status.code(),
+        Some(0),
+        "{}",
+        stderr(&dry_uninstall)
+    );
+    let planned = stdout(&dry_uninstall);
+    assert!(
+        planned.contains(&format!("uninstall {}", install_root.display())),
+        "{}",
+        planned
+    );
+    assert!(
+        planned.contains(&format!(
+            "purge: {}, {}, {}",
+            config_dir.display(),
+            data_dir.display(),
+            logs_dir.display()
+        )),
+        "{}",
+        planned
+    );
+
+    // The installed alias must find the config next to the program without
+    // SVCD_CONFIG_DIR, and resolve logs to the prefixed root.
+    let log = logs_dir.join("svcd.log");
+    fs::write(&log, "hello-from-prefix\n").expect("seed log");
+    let svc = install_root.join(alias_file_names()[0]);
+    let listed = Command::new(&svc)
+        .args(["logs", "svcd"])
+        .env_remove("SVCD_CONFIG_DIR")
+        .env_remove("SVCD_DATA_DIR")
+        .env_remove("SVCD_LOG_DIR")
+        .env_remove("SVCD_USER")
+        .env("SVCD_TEST_PRIVILEGE", "privileged")
+        .output()
+        .expect("run installed svc");
+    assert_eq!(listed.status.code(), Some(0), "{}", stderr(&listed));
+    assert_eq!(stdout(&listed), "hello-from-prefix\n");
+}
+
+#[test]
 fn prefix_is_recorded_as_install_dir_and_owns_data_and_logs() {
     let sandbox = Sandbox::new();
     let install_root = sandbox.root.join("persist").join("svcd");

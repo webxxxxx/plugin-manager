@@ -57,14 +57,14 @@ _Avoid_: settings.json、通用“配置文件”
 _Avoid_: lan-token、管理员 token
 
 **config_dir**:
-三个目录根之一，只放输入：`svcd.conf`、`services.d`、`trust.d`、`compat.conf`。默认 Linux `/etc/svcd`、Windows 系统模式 `%ProgramData%\svcd\config`；`SVCD_CONFIG_DIR` 优先级更高。控制 socket、`http.port`、上传暂存都不在这里。
+三个目录根之一，只放输入：`svcd.conf`、`services.d`、`trust.d`、`compat.conf`。默认 Linux `/etc/svcd`、Windows 系统模式 `%ProgramData%\svcd\config`；指定 `install_dir` 时默认 `<install_dir>/config`；`SVCD_CONFIG_DIR` 与显式 `config_dir` 优先级更高。控制 socket、`http.port`、上传暂存都不在这里。
 
 **安装计划（Install plan）**:
 一组有序的宿主操作（写文件、跑命令、改 PATH）加上由它生成的服务定义文本；`--dry-run` 打印的和实际执行的是同一份。计划是输入的纯函数：同一份布局、探测结果与请求，输出逐字节相同；读环境、探文件、发命令都在执行侧。
 _Avoid_: 安装步骤脚本（计划不是脚本，由执行器逐条施加）
 
 **install_dir**:
-`svcd.conf` 里记录的安装前缀：`svcd --install --prefix <dir>` 会把 `<dir>` 写回这里；之后不带 `--prefix` 的重装和 `--uninstall` 都以它为准。它只在配置初始化时折算成 data/logs 的默认根，运行期不再从它推路径。手工写在 conf 里也有效，`--prefix` 优先于它；未记录时走平台默认。
+`svcd.conf` 里记录的安装前缀：`svcd --install --prefix <dir>` 会把 `<dir>` 写回这里；之后不带 `--prefix` 的重装和 `--uninstall` 都以它为准。它只在配置初始化时折算成三个根的默认值（`<dir>/config`、`<dir>/data`、`<dir>/logs`），显式根仍优先；运行期不再从它推路径。手工写在 conf 里也有效，`--prefix` 优先于它；未记录时走平台默认。
 _Avoid_: 安装前缀（那是命令行 `--prefix`）、数据目录
 
 **运行配置（Config）**:

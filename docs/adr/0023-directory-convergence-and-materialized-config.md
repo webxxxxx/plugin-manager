@@ -63,3 +63,17 @@ Accepted（2026-11-18）。收窄 [ADR-0019](0019-config-is-derived-once-at-the-
 `SVCD_TEMP_DIR` / `SVCD_RUN_DIR` / `SVCD_TRUST_DIR` 仍是告警并忽略的旧变量，
 不是新键的别名。
 
+2026-11-20（#179 后续）：用户要求指定 `install_dir` 时三个根全部挂在它下面。
+配置初始化补缺根时，`install_dir` 现在同时提供：
+
+- `config_dir = <install_dir>/config`
+- `data_dir = <install_dir>/data`
+- `logs_dir = <install_dir>/logs`
+
+显式根（文件里的 `config_dir`/`data_dir`/`logs_dir`）和 `SVCD_*` 仍然优先；
+`install_dir` 只补缺失值，不会覆盖已写死的根。安装后的服务定义与 CLI 除了
+`<program dir>/svcd.conf` 外，也按 `<program dir>/config/svcd.conf` 发现配置，
+所以带前缀的安装不依赖 `SVCD_CONFIG_DIR` 也能自包含。该 Amendment 收窄
+ADR-0004 原先“不让 `install_dir` 决定 `config_dir`”的结论：现在它决定默认值，
+但 `config_dir` 仍可单独配置到别处。
+
