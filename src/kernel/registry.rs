@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -7,7 +7,7 @@ use crate::kernel::contract::{
     Capability as KernelCapability, CapabilityName, Contract, Effect, ImplRef,
     Limits as KernelLimits, Obligations, ServiceId,
 };
-use crate::kernel::failure::Class;
+use crate::kernel::failure::{Class, Problem, ProblemError};
 
 /// The built-in core service id; reserved against `services.d` definitions.
 pub const RESERVED_ID: &str = "svc";
@@ -477,6 +477,68 @@ impl Registry {
         }
         None
     }
+
+    /// The dependency closure of `ids`, cut into start layers (dependencies
+    /// first, independent services in the same layer). Missing dependencies are
+    /// named in one error; `find_cycle` should have rejected cycles already, but
+    /// the defensive branch reports one instead of looping.
+    pub fn start_layers(&self, ids: &[String]) -> Result<Vec<Vec<String>>, ProblemError> {
+        let (closure, missing) = self.dependency_closure(ids);
+        if !missing.is_empty() {
+            return Err(ProblemError::new(
+                Problem::MissingDependency,
+                format!("missing dependencies: {}", missing.join(", ")),
+            ));
+        }
+
+        let mut remaining = closure;
+        let mut layers = Vec::new();
+        while !remaining.is_empty() {
+            let layer: Vec<String> = remaining
+                .iter()
+                .filter(|id| {
+                    self.get(id)
+                        .map(|service| service.deps.iter().all(|dep| !remaining.contains(dep)))
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            if layer.is_empty() {
+                return Err(ProblemError::new(Problem::Internal, "dependency cycle"));
+            }
+            for id in &layer {
+                remaining.remove(id);
+            }
+            layers.push(layer);
+        }
+        Ok(layers)
+    }
+
+    /// Every dependency of `id` that is absent from the registry, transitively.
+    pub fn missing_dependencies(&self, id: &str) -> Vec<String> {
+        self.dependency_closure(&[id.to_string()]).1
+    }
+
+    fn dependency_closure(&self, ids: &[String]) -> (BTreeSet<String>, Vec<String>) {
+        let mut closure = BTreeSet::new();
+        let mut stack = ids.to_vec();
+        let mut missing = BTreeSet::new();
+        while let Some(id) = stack.pop() {
+            if !closure.insert(id.clone()) {
+                continue;
+            }
+            if let Some(service) = self.get(&id) {
+                for dependency in &service.deps {
+                    if self.get(dependency).is_none() {
+                        missing.insert(dependency.clone());
+                    } else {
+                        stack.push(dependency.clone());
+                    }
+                }
+            }
+        }
+        (closure, missing.into_iter().collect())
+    }
 }
 
 #[cfg(test)]
@@ -718,6 +780,82 @@ mod tests {
         assert_eq!(
             registry.get("core").map(Service::carrier),
             Some(Ok(Carrier::Slot))
+        );
+    }
+
+    fn with_deps(id: &str, deps: &[&str]) -> Service {
+        let mut service = slot_backed(id);
+        service.deps = deps.iter().map(|dep| dep.to_string()).collect();
+        service
+    }
+
+    fn registry_of(services: Vec<Service>) -> Registry {
+        let mut registry = Registry::new();
+        for service in services {
+            registry.insert(service).expect("insert");
+        }
+        registry
+    }
+
+    #[test]
+    fn start_layers_puts_dependencies_in_earlier_layers() {
+        let registry = registry_of(vec![
+            with_deps("app", &["base"]),
+            with_deps("base", &[]),
+            with_deps("independent", &[]),
+        ]);
+
+        assert_eq!(
+            registry.start_layers(&["app".into()]).expect("layers"),
+            vec![vec!["base".to_string()], vec!["app".to_string()],]
+        );
+    }
+
+    #[test]
+    fn start_layers_groups_independent_services_together() {
+        let registry = registry_of(vec![with_deps("a", &[]), with_deps("b", &[])]);
+
+        assert_eq!(
+            registry
+                .start_layers(&["a".into(), "b".into()])
+                .expect("layers"),
+            vec![vec!["a".to_string(), "b".to_string()]]
+        );
+    }
+
+    #[test]
+    fn start_layers_names_every_missing_dependency() {
+        let registry = registry_of(vec![with_deps("app", &["first", "second"])]);
+
+        let error = registry.start_layers(&["app".into()]).expect_err("missing");
+
+        assert_eq!(error.problem, Problem::MissingDependency);
+        assert!(error.detail().contains("missing dependencies:"), "{error}");
+        assert!(error.detail().contains("first"), "{error}");
+        assert!(error.detail().contains("second"), "{error}");
+    }
+
+    #[test]
+    fn missing_dependencies_lists_only_absent_ids() {
+        let mut registry = registry_of(vec![with_deps("app", &["base", "missing"])]);
+        registry.insert(with_deps("base", &[])).expect("base");
+
+        assert_eq!(
+            registry.missing_dependencies("app"),
+            vec!["missing".to_string()]
+        );
+    }
+
+    #[test]
+    fn missing_dependencies_walks_transitively() {
+        let registry = registry_of(vec![
+            with_deps("app", &["middle"]),
+            with_deps("middle", &["missing"]),
+        ]);
+
+        assert_eq!(
+            registry.missing_dependencies("app"),
+            vec!["missing".to_string()]
         );
     }
 }

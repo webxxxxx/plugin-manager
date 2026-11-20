@@ -319,6 +319,28 @@ fn wide_path(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
 
+/// The daemon runs `services.d` scripts and plugin payloads as LocalSystem, so
+/// those directories must not be writable by anyone but SYSTEM, Administrators
+/// and the `svcd` group. Without this a local user could drop a `.cmd` into
+/// `services.d` and have it executed as SYSTEM.
+pub(crate) fn harden_directories(paths: &crate::platform::paths::Paths) -> std::io::Result<()> {
+    for dir in [
+        paths.config_dir.clone(),
+        paths.services_dir.clone(),
+        paths.plugins_dir.clone(),
+    ] {
+        // Create first: a first start has no `services.d` / `plugins` yet, and a
+        // directory created later would inherit `C:\ProgramData`'s Users-write
+        // ACE instead of getting the protected DACL below.
+        std::fs::create_dir_all(&dir)?;
+        // Group members may read the config and inspect the tree, but they must
+        // not be able to replace a `services.d` script or plugin payload that
+        // this daemon executes as SYSTEM.
+        Acl::shared_read_only(true)?.apply_to_path(&dir)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

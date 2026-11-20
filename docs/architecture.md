@@ -176,7 +176,9 @@ daemon 只递交调用，不等待；slot 事件循环在完成/超时时调用 
 ```
 src/
   main.rs                     多入口分派（argv[0]）
-  daemon.rs                   装配点：装配所有模块 + 事件循环 + 关停
+  daemon/                     装配点：装配所有模块 + 事件循环 + 关停（#228 起）
+    mod.rs
+    tests.rs                  装配点的行为测试（只在 cfg(test) 下编译）
 
   kernel/                     L2 内核（四动词共用，只有定义与判定）
     mod.rs
@@ -238,7 +240,7 @@ src/
   platform/                   L0 平台：宿主资源与 OS 能力
     mod.rs
     paths.rs  config.rs  config_file.rs  log.rs  compat.rs
-    host/  proc.rs  threads.rs  wake.rs  zerocopy.rs
+    host/  proc.rs  threads.rs  wake.rs  zerocopy.rs  notify.rs  signal.rs
     storage/  meta.rs  path.rs  upload.rs  part.rs  gc.rs    内容寻址存储（原 blob）
 
   selfinstall/                特例：宿主领域（注册服务、PATH、卸载器）
@@ -377,7 +379,7 @@ flowchart TD
 | 已搬（#170） | `install.rs` `service_win.rs` | `selfinstall/` | plan / execute |
 | 已搬（#170） | `paths.rs` `log.rs` `settings.rs` `limits.rs` `proc.rs` `threads.rs` `wake.rs` `zerocopy.rs` `compat.rs` `auth.rs` | `platform/` | 技术底座 |
 | 新增（#161） | `platform/resources.rs` | 原地 | 启动探测 + 内存预算 + 形状（[ADR-0026](adr/0026-the-memory-budget-is-the-truth.md)）；OS 读只经注入的 `Machine`，派生仍在 `limits.rs` |
-| 已搬（#170） | `main.rs` `daemon.rs` | 原地 | 装配点 |
+| 已搬（#170） | `main.rs` `daemon.rs` | 原地 | 装配点；`daemon.rs` 于 #228 变为 `daemon/` |
 
 ## 12. 迁移顺序
 

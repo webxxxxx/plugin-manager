@@ -416,6 +416,9 @@ const CATEGORY_RULES = [
 /// `#[cfg(test)]` 覆盖的字节区间。属性修饰 mod 时吃到配对的 `}`，修饰单个条目时
 /// 吃到 `;`。调用方传的是遮罩过字符串与注释的文本，所以括号计数永远安全。
 function testRegions(text) {
+  // A test-only file (declared by `#[cfg(test)] mod tests;` in its parent) cannot
+  // carry a per-item attribute, so it marks itself with an inner `#![cfg(test)]`.
+  if (text.trimStart().startsWith("#![cfg(test)]")) return [[0, text.length]];
   const regions = [];
   let index = 0;
   for (;;) {
@@ -529,7 +532,7 @@ const ASSEMBLY_RULES = [
     members: [/start_time\(/],
     allow: [
       { file: "src/platform/host/process.rs" },
-      { file: "src/daemon.rs", item: "process_probe" },
+      { file: "src/daemon/mod.rs", item: "process_probe" },
     ],
     hint: "starttime 只在 process_probe 里探；判定走 runtime::pid_state（#217）。",
   },
@@ -638,6 +641,12 @@ const SELFTEST_CASES = [
     name: "字符串与注释不算",
     source:
       'fn build() {\n    // error.detail().contains("x")\n    let note = "error.detail().contains";\n    let _ = note;\n}\n',
+    expected: [],
+  },
+  {
+    name: "整个文件标了 #![cfg(test)]",
+    source:
+      '#![cfg(test)]\n\nfn helper(error: &ProblemError) -> bool {\n    error.detail().contains("x")\n}\n',
     expected: [],
   },
   {
