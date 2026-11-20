@@ -18,26 +18,34 @@ use crate::server::http::{BodyPolicy, Exchange};
 pub(crate) type FallbackHandler =
     Arc<dyn Fn(&HttpRequest, &Arc<Mutex<Lan>>) -> Vec<u8> + Send + Sync>;
 
+/// One pre-body claim: the face's answer plus how the driver must carry it.
+///
+/// The three pre-body routes do not share a stream policy: the plugin UI keeps
+/// the connection's idle timeout, while package and blob uploads switch to the
+/// transfer timeout. Keeping that bit with the claim is what lets both drivers
+/// call one ordered hook without learning which face answered.
+pub(crate) struct PreBodyClaim {
+    pub(crate) exchange: Result<Exchange, Vec<u8>>,
+    /// True for the upload paths that need the transfer timeout.
+    pub(crate) transfer: bool,
+}
+
 /// The pre-body stream hooks. Composition owns the concrete faces; the server
-/// only asks each hook whether it claims the head and, if so, for the handler.
+/// only asks the one ordered claim hook and, if it says no, the remaining
+/// server-owned routes.
 pub(crate) trait PreBodyRoutes: Send + Sync {
-    fn plugin_ui(
+    /// The first pre-body face that claims this head.
+    ///
+    /// The order (plugin UI, package upload, blob upload) is endpoint
+    /// precedence owned by the face layer; a driver must not re-spell it.
+    fn claim(
         &self,
         head: &http::Head,
         peer: IpAddr,
         lan: &Arc<Mutex<Lan>>,
         raw_hub: Arc<crate::wire::contract::rawhub::RawHub>,
-    ) -> Option<Result<Exchange, Vec<u8>>>;
-    fn package_upload(
-        &self,
-        head: &http::Head,
-        lan: &Arc<Mutex<Lan>>,
-    ) -> Option<Result<Exchange, Vec<u8>>>;
-    fn blob_upload(
-        &self,
-        head: &http::Head,
-        lan: &Arc<Mutex<Lan>>,
-    ) -> Option<Result<Exchange, Vec<u8>>>;
+    ) -> Option<PreBodyClaim>;
+
     /// The `/mcp` stream plan, if this request is a `tools/call` that asked
     /// for SSE. Both the poll loop and the thread loop ask this one hook, so
     /// the path, origin, bearer and `_meta` checks are not written twice.
