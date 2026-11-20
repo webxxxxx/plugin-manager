@@ -20,6 +20,10 @@ use crate::wire::contract::RAW_PROTOCOL;
 use crate::wire::message::ipc::{self, FrameError, FrameEvent};
 use crate::wire::message::rpc;
 
+use self::calls::PendingCalls;
+use self::frames::Frames;
+use self::stop::{HookEnd, HookRun, StopFlow};
+
 /// Per-plugin in-flight cap from ticket #31. The full spec also describes a
 /// 128-slot queue behind this cap; the ticket scopes this tracer bullet to the
 /// in-flight cap, so a 65th concurrent call is rejected as busy instead.
@@ -45,32 +49,21 @@ pub(crate) struct Slot {
     limits: Arc<crate::platform::limits::Limits>,
     pub(crate) machine: Machine,
     exec: Exec,
-    protocol: u32,
     lifecycle: Option<Lifecycle>,
     child: Option<Child>,
     stdin: Option<stdio::WriteEnd>,
-    frames: Option<Receiver<FrameEvent>>,
+    frames: Frames,
     wake: Option<Arc<Wake>>,
     /// Who reads this service's stdout/stderr: the supervisor's poll set on
     /// Unix, reader threads elsewhere.
     stdio: Target,
     raw_hub: Option<Arc<crate::wire::contract::rawhub::RawHub>>,
     log: Option<Arc<Mutex<LogSink>>>,
-    /// Plugins must keep stdout protocol-only; core scripts may still print
-    /// human-readable output, which is logged for diagnosis.
-    protocol_only: bool,
-    pending: BTreeMap<u64, PendingCall>,
-    next_id: u64,
+    pending: PendingCalls,
     start_deadline: Option<u64>,
     stop_deadline: Option<u64>,
     kill_deadline: Option<u64>,
-    stop_hook: Option<HookRun>,
-    stop_hook_started: bool,
-    /// The backoff elapsed while the pre-retry stop hook was still running;
-    /// spawn as soon as it finishes.
-    backoff_pending: bool,
-    /// A stable crash is running the stop action; spawn when it finishes.
-    cleanup_then_spawn: bool,
+    stop: StopFlow,
     /// The whole service tree; on Unix the process group is the tree and this
     /// stays `None` (the platform returns no handle there).
     tree: Option<crate::platform::host::process::Tree>,
@@ -250,11 +243,6 @@ impl Wire for SlotWire {
     }
 }
 
-struct HookRun {
-    child: Child,
-    deadline: u64,
-}
-
 struct PendingCall {
     capability: String,
     deadline: u64,
@@ -302,29 +290,23 @@ impl Slot {
             limits,
             machine: Machine::new(restart),
             exec,
-            protocol: 1,
             lifecycle,
             child: None,
             stdin: None,
-            frames: None,
+            frames: Frames::new(),
             wake: None,
             stdio: Target::threaded(),
             raw_hub: None,
             log: None,
-            protocol_only: false,
-            pending: BTreeMap::new(),
-            next_id: 1,
+            pending: PendingCalls::new(),
             start_deadline: None,
             stop_deadline: None,
             kill_deadline: None,
-            stop_hook: None,
-            stop_hook_started: false,
+            stop: StopFlow::new(),
             tree: None,
             pending_exit: None,
             ping_id: 1,
             adopted: false,
-            backoff_pending: false,
-            cleanup_then_spawn: false,
             contract: None,
             call_timeout: DEFAULT_CALL_TIMEOUT,
             notify_sink: None,
@@ -423,14 +405,14 @@ impl Slot {
     }
 
     pub(crate) fn set_protocol(&mut self, protocol: u32) {
-        self.protocol = protocol;
+        self.frames.set_protocol(protocol);
     }
 
     /// Whether callers depend on this service's stdio channel staying open.
     /// The rule itself lives in `check::peer` so the definition loader and the
     /// runtime cannot drift apart.
     pub(crate) fn is_channel_peer(&self) -> bool {
-        crate::supervise::check::peer::is_channel_peer(self.exec.ready, self.protocol)
+        crate::supervise::check::peer::is_channel_peer(self.exec.ready, self.frames.protocol())
     }
 
     /// Seed the state for a service that was already unhealthy at scan time
@@ -444,7 +426,7 @@ impl Slot {
     }
 
     pub(crate) fn set_protocol_only(&mut self, protocol_only: bool) {
-        self.protocol_only = protocol_only;
+        self.frames.set_protocol_only(protocol_only);
     }
 
     pub(crate) fn set_wake(&mut self, wake: Arc<Wake>) {
@@ -471,7 +453,7 @@ impl Slot {
         // nothing left to wait for.
         if self.machine.state == State::Stopping
             && self.machine.pid.is_none()
-            && self.stop_hook.is_none()
+            && !self.stop.running()
         {
             self.apply(Event::StopSettled, now);
         }
@@ -597,8 +579,7 @@ impl Slot {
             Some(contract) => invocation.timeout.min(contract.limits.max_timeout),
             None => invocation.timeout,
         };
-        let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
+        let id = self.pending.allocate();
         let mut params = json!({
             "name": invocation.capability.as_str(),
             "arguments": invocation.arguments,
@@ -647,9 +628,7 @@ impl Slot {
             match action {
                 Action::Spawn => {
                     self.abort_stop_hook();
-                    self.stop_hook_started = false;
-                    self.backoff_pending = false;
-                    self.cleanup_then_spawn = false;
+                    self.stop.reset();
                     self.fail_pending("service is restarting");
                     match self.spawn() {
                         Ok(pid) => {
@@ -701,7 +680,7 @@ impl Slot {
                 // before the replacement starts.
                 Action::Cleanup => {
                     if self.ensure_stop_hook(now) {
-                        self.cleanup_then_spawn = true;
+                        self.stop.defer_cleanup();
                     } else {
                         self.apply(Event::RestartReady, now);
                     }
@@ -740,7 +719,7 @@ impl Slot {
         command.env("SVCD_TEMP_DIR", &blob_dir);
         let plan = match self.exec.ready {
             Ready::Notify => Plan::notify(),
-            Ready::Exec => Plan::exec(self.protocol),
+            Ready::Exec => Plan::exec(self.frames.protocol()),
         };
         let (mut child, streams) =
             stdio::spawn(command, plan).map_err(|error| error.to_string())?;
@@ -791,7 +770,7 @@ impl Slot {
             };
             if let Err(error) = self.stdio.frames(
                 self.id.clone(),
-                self.protocol,
+                self.frames.protocol(),
                 stdout,
                 Some(stderr),
                 sender,
@@ -803,8 +782,8 @@ impl Slot {
             }
 
             self.stdin = stdin;
-            self.frames = Some(receiver);
-            self.next_id = 1;
+            self.frames.attach(receiver);
+            self.pending.reset();
             self.ping_id = 1;
         } else {
             self.stdin = None;
@@ -815,7 +794,7 @@ impl Slot {
                 return abandon(&mut child, "piped stderr is missing");
             };
 
-            if self.protocol == RAW_PROTOCOL {
+            if self.frames.protocol() == RAW_PROTOCOL {
                 let Some(stdin) = stdin else {
                     return abandon(&mut child, "piped stdin is missing");
                 };
@@ -833,7 +812,7 @@ impl Slot {
                 ) {
                     return abandon(&mut child, error);
                 }
-                self.frames = None;
+                self.frames.detach();
                 self.child = Some(child);
                 self.adopted = false;
                 return Ok(pid);
@@ -848,7 +827,7 @@ impl Slot {
             ) {
                 return abandon(&mut child, error.to_string());
             }
-            self.frames = None;
+            self.frames.detach();
         }
 
         self.child = Some(child);
@@ -857,8 +836,7 @@ impl Slot {
     }
 
     fn send_ping(&mut self) {
-        let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
+        let id = self.pending.allocate();
         self.ping_id = id;
         let line = json!({
             "jsonrpc": "2.0",
@@ -890,7 +868,7 @@ impl Slot {
             } else {
                 "closed"
             },
-            if self.frames.is_some() {
+            if self.frames.attached() {
                 "attached"
             } else {
                 "none"
@@ -900,7 +878,7 @@ impl Slot {
     }
 
     fn write_json_frame(&mut self, frame: &str, max: usize) -> std::io::Result<()> {
-        let protocol = self.protocol;
+        let protocol = self.frames.protocol();
         let Some(stdin) = self.stdin.as_mut() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -915,12 +893,7 @@ impl Slot {
     }
 
     fn drain_frames(&mut self, now: u64) {
-        let mut events = Vec::new();
-        if let Some(frames) = &self.frames {
-            while let Ok(event) = frames.try_recv() {
-                events.push(event);
-            }
-        }
+        let events = self.frames.drain();
         for event in events {
             match event {
                 FrameEvent::Frame(Ok(line)) => self.handle_frame(&line, now),
@@ -943,7 +916,7 @@ impl Slot {
         let message = match serde_json::from_str::<Value>(line) {
             Ok(Value::Object(message)) => message,
             _ => {
-                if self.protocol_only {
+                if self.frames.protocol_only() {
                     self.protocol_violation("stdout frame is not a JSON object");
                 } else {
                     // Core scripts may print to stdout; keep those lines in the
@@ -967,7 +940,7 @@ impl Slot {
             return;
         }
         let Some(id) = id.and_then(Value::as_u64) else {
-            if self.protocol_only {
+            if self.frames.protocol_only() {
                 self.protocol_violation("stdout frame has no method or response id");
             } else {
                 self.note_frame_during_start("no method or response id", line);
@@ -1047,7 +1020,7 @@ impl Slot {
     }
 
     fn complete_pending(&mut self, id: u64, message: &serde_json::Map<String, Value>) {
-        let Some(pending) = self.pending.remove(&id) else {
+        let Some(pending) = self.pending.remove(id) else {
             log::svcd(&format!(
                 "svcd: {}: ignoring response for unknown request {}",
                 self.id, id
@@ -1100,18 +1073,13 @@ impl Slot {
     }
 
     fn expire_pending(&mut self, now: u64) {
-        let expired: Vec<u64> = self
-            .pending
-            .iter()
-            .filter(|(_, call)| call.deadline <= now)
-            .map(|(id, _)| *id)
-            .collect();
+        let expired = self.pending.expired(now);
         for id in expired {
             self.write_notification(
                 "notifications/cancelled",
                 json!({ "requestId": id, "reason": "timeout" }),
             );
-            let Some(pending) = self.pending.remove(&id) else {
+            let Some(pending) = self.pending.remove(id) else {
                 continue;
             };
             log::svcd(&format!(
@@ -1130,7 +1098,7 @@ impl Slot {
     }
 
     fn fail_pending(&mut self, reason: &str) {
-        let pending = std::mem::take(&mut self.pending);
+        let pending = self.pending.take_all();
         for (_, call) in pending {
             let failure = Failure::new(
                 Class::NotRunning,
@@ -1293,8 +1261,8 @@ impl Slot {
                 if now >= next_at {
                     // Wait for the pre-retry stop hook so the next attempt
                     // starts from a clean slate.
-                    if self.stop_hook.is_some() {
-                        self.backoff_pending = true;
+                    if self.stop.running() {
+                        self.stop.defer_backoff();
                     } else {
                         self.apply(Event::BackoffElapsed, now);
                     }
@@ -1304,13 +1272,12 @@ impl Slot {
     }
 
     fn ensure_stop_hook(&mut self, now: u64) -> bool {
-        if self.stop_hook.is_some() {
+        if self.stop.running() {
             return true;
         }
-        if self.stop_hook_started {
+        if !self.stop.claim() {
             return false;
         }
-        self.stop_hook_started = true;
         let Some(hook) = self
             .lifecycle
             .as_ref()
@@ -1347,10 +1314,8 @@ impl Slot {
                     "svcd: {}: stop hook started ({})",
                     self.id, hook.path
                 ));
-                self.stop_hook = Some(HookRun {
-                    child,
-                    deadline: now.saturating_add(hook.timeout_ms),
-                });
+                self.stop
+                    .install(HookRun::new(child, now.saturating_add(hook.timeout_ms)));
                 true
             }
             Err(error) => {
@@ -1364,30 +1329,18 @@ impl Slot {
     }
 
     fn check_stop_hook(&mut self, now: u64) {
-        let Some(run) = self.stop_hook.as_mut() else {
+        let Some(outcome) = self.stop.poll(now) else {
             return;
         };
-        let deadline = run.deadline;
-        let outcome = match run.child.try_wait() {
-            Ok(Some(status)) => Some(Ok(status)),
-            Ok(None) if now >= deadline => {
-                let _ = run.child.kill();
-                let _ = run.child.wait();
-                Some(Err("timed out"))
-            }
-            _ => None,
-        };
-        let Some(outcome) = outcome else {
-            return;
-        };
-        self.stop_hook = None;
         match outcome {
-            Ok(status) => log::svcd(&format!("svcd: {}: stop hook exited {}", self.id, status)),
-            Err(reason) => log::svcd(&format!("svcd: {}: stop hook {}", self.id, reason)),
+            HookEnd::Exited(status) => {
+                log::svcd(&format!("svcd: {}: stop hook exited {}", self.id, status))
+            }
+            HookEnd::TimedOut => log::svcd(&format!("svcd: {}: stop hook timed out", self.id)),
         }
         // A stop preempted the pending restart: finish the stop, not the spawn.
         if self.machine.state == State::Stopping {
-            self.cleanup_then_spawn = false;
+            self.stop.clear_cleanup();
             // A finished one-shot has no process to signal: the hook finishing
             // is the whole stop.
             if self.machine.pid.is_none() {
@@ -1406,22 +1359,18 @@ impl Slot {
             return;
         }
         // A stable crash was cleaning up before its replacement.
-        if self.cleanup_then_spawn {
-            self.cleanup_then_spawn = false;
+        if self.stop.take_cleanup() {
             self.apply(Event::RestartReady, now);
             return;
         }
         // A retry was waiting for this cleanup: start the next attempt now.
-        if self.machine.state == State::Backoff && self.backoff_pending {
-            self.backoff_pending = false;
+        if self.machine.state == State::Backoff && self.stop.take_backoff() {
             self.apply(Event::BackoffElapsed, now);
         }
     }
 
     fn abort_stop_hook(&mut self) {
-        if let Some(mut run) = self.stop_hook.take() {
-            let _ = run.child.kill();
-            let _ = run.child.wait();
+        if self.stop.abort() {
             log::svcd(&format!("svcd: {}: stop hook aborted", self.id));
         }
     }
@@ -1521,9 +1470,9 @@ impl Slot {
         }
         self.child = None;
         self.adopted = false;
-        self.cleanup_then_spawn = false;
+        self.stop.clear_cleanup();
         self.stdin = None;
-        self.frames = None;
+        self.frames.detach();
         self.start_deadline = None;
         self.stop_deadline = None;
         self.kill_deadline = None;
@@ -1697,6 +1646,10 @@ fn test_reply_sink(
         reply.send(line);
     })
 }
+
+mod calls;
+mod frames;
+mod stop;
 
 #[cfg(test)]
 mod tests;
