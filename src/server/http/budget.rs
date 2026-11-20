@@ -1,16 +1,17 @@
 //! The shared `max_streams` admission counter for stream-handler transfers.
 //!
 //! Long-lived stream handlers (downloads, uploads, SSE and WebSocket) draw
-//! from one budget; one-shot static assets are exempt. The Unix server loop uses
-//! it via `driver::StreamDriver`, the Windows thread fallback via
+//! from one budget; one-shot static assets are exempt. The composition root
+//! constructs exactly one budget and hands it to the server drivers, so a test
+//! can build a second one without sharing process state. The Unix server loop
+//! uses it via `driver::StreamDriver`, the Windows thread fallback via
 //! `fallback::drive`. Downloads, uploads, package install/import and export
 //! all count here; one-shot static assets do not.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use super::stream::StreamClass;
-
-static ACTIVE_STREAMS: AtomicUsize = AtomicUsize::new(0);
 
 /// Why a stream was refused before its headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,7 +20,7 @@ pub struct Busy;
 /// A `max_streams` slot held by one long-lived stream. One-shot responses do
 /// not acquire one, so a page's static assets never trip the long-lived cap.
 pub struct StreamPermit {
-    active: &'static AtomicUsize,
+    active: Arc<AtomicUsize>,
 }
 
 impl Drop for StreamPermit {
@@ -29,20 +30,18 @@ impl Drop for StreamPermit {
 }
 
 /// The shared admission counter behind `max_streams`.
+#[derive(Clone)]
 pub struct StreamBudget {
-    active: &'static AtomicUsize,
+    active: Arc<AtomicUsize>,
 }
 
 impl StreamBudget {
-    pub fn global() -> StreamBudget {
+    /// One independent budget. The composition root calls this once per
+    /// process; tests call it per case so two budgets never interfere.
+    pub fn new() -> StreamBudget {
         StreamBudget {
-            active: &ACTIVE_STREAMS,
+            active: Arc::new(AtomicUsize::new(0)),
         }
-    }
-
-    #[cfg(test)]
-    fn for_counter(active: &'static AtomicUsize) -> StreamBudget {
-        StreamBudget { active }
     }
 
     /// `Ok(None)` for an exempt one-shot response; `Err(Busy)` when the cap
@@ -64,7 +63,7 @@ impl StreamBudget {
             ) {
                 Ok(_) => {
                     return Ok(Some(StreamPermit {
-                        active: self.active,
+                        active: self.active.clone(),
                     }))
                 }
                 Err(actual) => current = actual,
@@ -73,18 +72,19 @@ impl StreamBudget {
     }
 }
 
+impl Default for StreamBudget {
+    fn default() -> Self {
+        StreamBudget::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // One counter per test: the tests run in parallel and a shared store(0)
-    // would race a permit drop in the other test.
-    static ONE_SHOT_COUNTER: AtomicUsize = AtomicUsize::new(0);
-    static RELEASE_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
     #[test]
     fn a_one_shot_response_never_consumes_the_long_lived_cap() {
-        let budget = StreamBudget::for_counter(&ONE_SHOT_COUNTER);
+        let budget = StreamBudget::new();
         let held = budget
             .acquire(StreamClass::LongLived, 1)
             .expect("the first long-lived stream fits")
@@ -93,12 +93,11 @@ mod tests {
         assert!(matches!(budget.acquire(StreamClass::OneShot, 1), Ok(None)));
         drop(held);
         assert!(budget.acquire(StreamClass::LongLived, 1).is_ok());
-        assert_eq!(ONE_SHOT_COUNTER.load(Ordering::SeqCst), 0);
     }
 
     #[test]
     fn a_long_lived_permit_is_released_exactly_once() {
-        let budget = StreamBudget::for_counter(&RELEASE_COUNTER);
+        let budget = StreamBudget::new();
         let first = budget
             .acquire(StreamClass::LongLived, 2)
             .expect("fits")
@@ -111,11 +110,26 @@ mod tests {
         drop(first);
         let third = budget
             .acquire(StreamClass::LongLived, 2)
-            .expect("a released slot is reusable")
+            .expect("fits")
             .expect("holds a slot");
         drop(second);
-        assert_eq!(RELEASE_COUNTER.load(Ordering::SeqCst), 1);
         drop(third);
-        assert_eq!(RELEASE_COUNTER.load(Ordering::SeqCst), 0);
+        assert!(budget.acquire(StreamClass::LongLived, 1).is_ok());
+    }
+
+    #[test]
+    fn two_budgets_do_not_share_a_counter() {
+        let first = StreamBudget::new();
+        let second = StreamBudget::new();
+        let held = first
+            .acquire(StreamClass::LongLived, 1)
+            .expect("first fits")
+            .expect("holds");
+        assert!(first.acquire(StreamClass::LongLived, 1).is_err());
+        assert!(
+            second.acquire(StreamClass::LongLived, 1).is_ok(),
+            "a second budget must not see the first budget's permit"
+        );
+        drop(held);
     }
 }

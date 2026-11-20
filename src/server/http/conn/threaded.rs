@@ -29,6 +29,7 @@ impl ConnectionDriver for Driver {
             face,
             routes,
             fallback,
+            budget,
             ..
         } = input;
         let Some(listener) = listener else {
@@ -40,6 +41,7 @@ impl ConnectionDriver for Driver {
             face,
             routes,
             fallback,
+            budget,
             raw_hub,
         });
         let admission = admission(limits.max_connections, limits.max_connections_per_ip);

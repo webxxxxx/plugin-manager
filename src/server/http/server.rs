@@ -24,7 +24,7 @@ use crate::server::auth::lan::Lan;
 use crate::server::control::client::StreamingClient;
 use crate::server::control::handle::LoopHandle;
 use crate::server::control::listener::{ControlServer, Source};
-use crate::server::http::budget::StreamPermit;
+use crate::server::http::budget::{StreamBudget, StreamPermit};
 use crate::server::http::driver::{StreamAdmission, StreamDriver};
 use crate::server::http::engine::{
     self, keep_alive_response, wants_keep_alive, Connection as EngineConnection, ConnectionOps,
@@ -79,6 +79,7 @@ pub(crate) fn start(
     face: Arc<dyn Face>,
     routes: Arc<dyn PreBodyRoutes>,
     fallback: FallbackHandler,
+    budget: StreamBudget,
 ) -> std::io::Result<LoopHandle> {
     let (results_tx, results_rx) = mpsc::channel();
     let (notify_rx, notify_tx) = UnixStream::pair()?;
@@ -131,6 +132,7 @@ pub(crate) fn start(
                 face,
                 routes,
                 fallback,
+                budget,
                 face_plans: HashMap::new(),
                 blocking,
                 blocking_pending: HashMap::new(),
@@ -178,6 +180,8 @@ struct Server {
     face: Arc<dyn Face>,
     routes: Arc<dyn PreBodyRoutes>,
     fallback: FallbackHandler,
+    /// The one long-lived stream budget built by the composition root.
+    budget: StreamBudget,
     /// The route and principal resolved before this request's body was read.
     /// Present only for requests the face claims; the server-owned routes use
     /// `routes.body_policy`.
@@ -272,7 +276,14 @@ impl ConnectionOps for Server {
         };
         let initial = connection.buffer.split_off(body_start);
         connection.buffer.clear();
-        attach_stream(connection, handler, &initial, None, &self.config.limits);
+        attach_stream(
+            connection,
+            handler,
+            &initial,
+            None,
+            &self.budget,
+            &self.config.limits,
+        );
         self.service_stream_job(connection);
         PreRequest::Handled
     }
@@ -289,7 +300,8 @@ impl ConnectionOps for Server {
                     // Reserve the long-lived slot before starting the plugin
                     // call: a full budget must refuse the request without a
                     // side effect on the service.
-                    let Ok(Some(permit)) = crate::server::http::budget::StreamBudget::global()
+                    let Ok(Some(permit)) = self
+                        .budget
                         .acquire(StreamClass::LongLived, self.config.limits.max_streams)
                     else {
                         write_response(
@@ -329,6 +341,7 @@ impl ConnectionOps for Server {
                         Box::new(handler),
                         &[],
                         Some(permit),
+                        &self.budget,
                         &self.config.limits,
                     );
                     return;
@@ -745,7 +758,14 @@ impl Server {
                         // A streamed response is not a keep-alive response: its
                         // handler may own a file range and the wire head says
                         // `Connection: close`.
-                        attach_stream(connection, handler, &[], None, &self.config.limits);
+                        attach_stream(
+                            connection,
+                            handler,
+                            &[],
+                            None,
+                            &self.budget,
+                            &self.config.limits,
+                        );
                         self.service_stream_job(connection);
                     }
                     Err(cause) => {
@@ -816,12 +836,13 @@ fn attach_stream(
     handler: Box<dyn StreamHandler>,
     initial: &[u8],
     reserved: Option<StreamPermit>,
+    budget: &StreamBudget,
     limits: &std::sync::Arc<crate::platform::limits::Limits>,
 ) {
     connection.keep_alive = false;
     let mut driver = match reserved {
         Some(permit) => StreamDriver::admit_reserved(handler, permit, limits.clone()),
-        None => match StreamDriver::admit(handler, limits.max_streams, limits.clone()) {
+        None => match StreamDriver::admit(handler, budget, limits.max_streams, limits.clone()) {
             StreamAdmission::Admitted(driver) => driver,
             StreamAdmission::Busy => {
                 write_response(

@@ -58,10 +58,11 @@ impl StreamDriver {
     /// Admit a handler under `max_streams`. A one-shot response is exempt.
     pub fn admit(
         handler: Box<dyn StreamHandler>,
+        budget: &StreamBudget,
         max_streams: usize,
         limits: std::sync::Arc<crate::platform::limits::Limits>,
     ) -> StreamAdmission {
-        match StreamBudget::global().acquire(handler.stream_class(), max_streams) {
+        match budget.acquire(handler.stream_class(), max_streams) {
             Ok(permit) => StreamAdmission::Admitted(StreamDriver::new(handler, permit, limits)),
             Err(Busy) => StreamAdmission::Busy,
         }
