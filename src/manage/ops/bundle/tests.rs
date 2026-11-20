@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use crate::manage::test_support::tempdir::TempDir;
 use ed25519_dalek::Signature;
