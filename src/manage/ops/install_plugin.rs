@@ -837,3 +837,120 @@ pub fn root_required() -> Result<(), ProblemError> {
         Err(Problem::Internal.error("root / Administrator is required"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manage::check::plugin::Strategy;
+    use crate::manage::model::layout::{current_version, plugin_dir};
+    use crate::manage::model::manifest::Package;
+    use crate::platform::paths::Paths;
+
+    /// An in-memory package with one payload file, enough for the layout
+    /// strategies to run without a daemon.
+    fn layout_package(name: &str, version: &str) -> Package {
+        let manifest_json = serde_json::json!({
+            "schema": 1,
+            "name": name,
+            "version": version,
+            "desc": "layout test",
+            "platform": crate::platform::target(),
+            "protocol": 1,
+            "exec": {"path": "payload/bin/demo"},
+            "files": [{
+                "path": "payload/bin/demo",
+                "size": 5,
+                "sha256": package::hex_sha256(b"hello"),
+                "mode": 493
+            }]
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest_json).expect("manifest json");
+        let manifest = package::parse_manifest(&manifest_bytes).expect("manifest");
+        Package {
+            manifest,
+            manifest_bytes,
+            signature_bytes: Vec::new(),
+            files: vec![package::FileData {
+                path: "payload/bin/demo".into(),
+                data: b"hello".to_vec(),
+                mode: 0o755,
+            }],
+        }
+    }
+
+    /// The daemon's keep-old fallback reads this signal, never the detail text.
+    #[test]
+    fn an_install_failure_keeps_its_retry_signal_and_its_category() {
+        let refused: InstallFailure = Problem::Conflict.error("reserved").into();
+        assert!(matches!(refused, InstallFailure::Refused(_)));
+        assert_eq!(refused.into_problem().problem, Problem::Conflict);
+
+        let full = InstallFailure::OutOfSpace(Problem::Internal.error("not enough space"));
+        assert!(matches!(full, InstallFailure::OutOfSpace(_)));
+        assert_eq!(full.into_problem().problem, Problem::Internal);
+    }
+
+    #[test]
+    fn keep_old_keeps_both_versions_and_replace_drops_the_old_one() {
+        let root = crate::test_support::temp_dir().join(format!(
+            "svcd-plugin-layout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let paths = Paths::under(&root);
+
+        install_package(
+            &paths,
+            &crate::platform::limits::test_default(),
+            &layout_package("layout-demo", "1.0.0"),
+            Strategy::KeepOld,
+            false,
+            None,
+            &mut || {},
+        )
+        .expect("first install");
+        install_package(
+            &paths,
+            &crate::platform::limits::test_default(),
+            &layout_package("layout-demo", "1.1.0"),
+            Strategy::KeepOld,
+            false,
+            None,
+            &mut || {},
+        )
+        .expect("keep-old install");
+
+        let directory = plugin_dir(&paths, "layout-demo");
+        assert!(directory.join("1.0.0").is_dir());
+        assert!(directory.join("1.1.0").is_dir());
+        assert_eq!(
+            current_version(&paths, "layout-demo").as_deref(),
+            Some("1.1.0")
+        );
+        assert!(directory.join("current").is_file());
+
+        install_package(
+            &paths,
+            &crate::platform::limits::test_default(),
+            &layout_package("layout-demo", "1.1.0"),
+            Strategy::Replace,
+            false,
+            None,
+            &mut || {},
+        )
+        .expect("replace install");
+        assert!(
+            !directory.join("1.0.0").exists(),
+            "replace keeps only the new version"
+        );
+        assert!(directory.join("1.1.0").is_dir());
+        assert_eq!(
+            current_version(&paths, "layout-demo").as_deref(),
+            Some("1.1.0")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
