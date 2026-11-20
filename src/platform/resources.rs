@@ -409,8 +409,9 @@ impl Workload {
         }
     }
 
-    /// [`Workload::suggested`] for a budget alone, used by the threshold tests
-    /// and by any caller without a machine description.
+    /// [`Workload::suggested`] for a budget alone: the threshold tests use it,
+    /// and so does anything that holds a budget without a profile.
+    #[cfg(test)]
     pub fn of_budget(quantized: u64) -> Workload {
         Workload::suggested(quantized, None)
     }

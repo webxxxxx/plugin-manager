@@ -217,20 +217,6 @@ impl OverrideReason {
             OverrideReason::BuildCap => "build-cap",
         }
     }
-
-    /// The human half of the note: what happened and why.
-    pub fn detail(self) -> &'static str {
-        match self {
-            OverrideReason::AboveUpperBound => {
-                "above this budget's share; fell back to the workload's reference value"
-            }
-            OverrideReason::BelowFloor => "below the absolute floor; raised to it",
-            OverrideReason::InvariantShrink => {
-                "lowered so the worst-case memory invariant fits the budget"
-            }
-            OverrideReason::BuildCap => "clamped by the compile-time budget ceiling",
-        }
-    }
 }
 
 /// One readable rewrite: `key: configured -> effective (reason)`.
@@ -1553,7 +1539,7 @@ mod tests {
             note.to_string(),
             "max_body_bytes: 1024 -> 8192 (above-upper-bound)"
         );
-        assert!(note.reason.detail().contains("reference value"));
+        assert_eq!(note.reason.as_str(), "above-upper-bound");
     }
 
     #[test]
