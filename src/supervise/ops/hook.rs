@@ -361,18 +361,28 @@ mod tests {
 
     #[test]
     fn a_hook_wait_pumps_the_injected_poll() {
+        // The hook waits for a marker only the poll closure writes, so it
+        // cannot finish before `poll` has run at least once. Neither the
+        // hook's body nor the test depends on how long an external program
+        // takes to start: the budget below only fires when the pump is
+        // genuinely missing, which is the failure this test is about.
         let dir = TempDir::new();
         #[cfg(windows)]
         let path = write_hook(
             &dir.0,
             "pump",
-            "@echo off\npowershell -NoProfile -Command \"Start-Sleep -Milliseconds 300\"\n",
+            "@echo off\n:wait\nif exist go goto done\ngoto wait\n:done\n",
         );
         #[cfg(unix)]
-        let path = write_hook(&dir.0, "pump", "#!/bin/sh\nsleep 0.2\n");
+        let path = write_hook(&dir.0, "pump", "#!/bin/sh\nwhile [ ! -f go ]; do :; done\n");
+        let marker = dir.0.join("go");
 
         let mut polls = 0u32;
-        run(&spec(&dir, &path, 5_000), &mut || polls += 1).expect("hook runs");
+        run(&spec(&dir, &path, 5_000), &mut || {
+            polls += 1;
+            let _ = fs::write(&marker, b"");
+        })
+        .expect("hook runs");
         assert!(
             polls >= 1,
             "the synchronous wait must call the poll closure it was given"
