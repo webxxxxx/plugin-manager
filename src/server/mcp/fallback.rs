@@ -19,13 +19,14 @@ pub(crate) fn serve_mcp_sse(
     call: transport::StreamingCall,
     config: &Path,
     head_only: bool,
+    budget: &crate::server::http::budget::StreamBudget,
     limits: &crate::platform::limits::Limits,
 ) -> std::io::Result<()> {
     // The Windows fallback has no stream driver, but the long-lived budget is
     // still server policy: reserve it before the head and before the plugin
     // call starts. The permit lives until this blocking response ends, and a
     // client disconnect ends it below (#135).
-    let _permit = match crate::server::http::budget::StreamBudget::global().acquire(
+    let _permit = match budget.acquire(
         crate::server::http::StreamClass::LongLived,
         limits.max_streams,
     ) {

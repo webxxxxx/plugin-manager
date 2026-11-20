@@ -92,6 +92,8 @@ pub(crate) struct StartInput {
     pub face: Arc<dyn Face>,
     pub routes: Arc<dyn PreBodyRoutes>,
     pub fallback: FallbackHandler,
+    /// The one long-lived stream budget built by the composition root.
+    pub budget: crate::server::http::budget::StreamBudget,
     /// The bound control channel. The poll loop merges its listener into the
     /// wait set; the thread driver ignores it because the channel already runs
     /// its own accept thread on that host.

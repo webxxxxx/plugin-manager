@@ -1,5 +1,6 @@
+#![cfg_attr(not(feature = "http"), allow(dead_code))]
 #![cfg_attr(all(unix, not(test)), allow(dead_code))]
-//! UI ↔ plugin realtime channel: process-local event bus, SSE and WebSocket.
+//! UI ↔ plugin realtime channel: injected event bus, SSE and WebSocket.
 //!
 //! Plugin stdout stays a JSON-RPC NDJSON control channel. A plugin's
 //! `notifications/*` frames are mirrored to UI subscribers; requests from the
@@ -10,7 +11,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
@@ -64,22 +65,6 @@ pub struct Replay {
     pub reset: bool,
     /// How many historical events were queued for this subscription.
     pub replayed: usize,
-}
-
-static BUS: OnceLock<Arc<EventBus>> = OnceLock::new();
-
-/// The daemon-wide bus. The daemon and HTTP listener are in one process.
-pub fn bus() -> &'static Arc<EventBus> {
-    BUS.get_or_init(|| Arc::new(EventBus::new()))
-}
-
-pub fn publish(plugin: &str, method: &str, params: &Value) {
-    bus().publish(plugin, method, params);
-}
-
-/// Forget a purged plugin's history and subscribers.
-pub fn forget(plugin: &str) {
-    bus().forget(plugin);
 }
 
 impl EventBus {
@@ -344,6 +329,22 @@ mod tests {
             Err(SubscribeError::TooMany)
         ));
         drop(held);
+    }
+
+    #[test]
+    fn two_event_buses_do_not_share_history_or_subscribers() {
+        let first = Arc::new(EventBus::new());
+        let second = Arc::new(EventBus::new());
+        let limits = crate::platform::limits::test_default();
+        let (receiver, subscription) = second.subscribe("demo", &limits).expect("subscribe");
+        first.publish("demo", "notifications/message", &json!({"data": "one"}));
+        assert_eq!(first.history_len("demo"), 1);
+        assert_eq!(second.history_len("demo"), 0);
+        assert!(
+            receiver.try_recv().is_err(),
+            "the first bus must not wake a subscriber of the second"
+        );
+        drop(subscription);
     }
 
     #[test]

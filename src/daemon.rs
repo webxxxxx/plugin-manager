@@ -24,6 +24,7 @@ use crate::face::fallback::respond;
 use crate::face::mcp_tools;
 #[cfg(feature = "http")]
 use crate::face::prebody::PreBodyFaces;
+use crate::face::uichannel::EventBus;
 use crate::kernel::contract::{CapabilityName, Instance, Invocation, Launchers, Reply, ReplySink};
 use crate::kernel::failure::{Class, Failure, Problem, ProblemError, Retry};
 use crate::kernel::projection::{anchored_mono_ms, anchored_secs, anchored_secs_opt, Status};
@@ -197,8 +198,17 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     let raw_hub = crate::wire::contract::rawhub::RawHub::new(config.limits.clone());
     // The driver picks itself inside `server::http::entry`; the composition
     // root only hands over the control plumbing it owns.
+    let bus = Arc::new(EventBus::new());
     #[cfg(feature = "http")]
-    let api = match spawn_http(config.clone(), raw_hub.clone(), control) {
+    let stream_budget = crate::server::http::budget::StreamBudget::new();
+    #[cfg(feature = "http")]
+    let api = match spawn_http(
+        config.clone(),
+        raw_hub.clone(),
+        control,
+        bus.clone(),
+        stream_budget,
+    ) {
         Ok(api) => Some(api),
         Err(error) => {
             #[cfg(unix)]
@@ -240,6 +250,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         api.clone(),
         raw_hub.clone(),
         config.clone(),
+        bus,
     );
     daemon.set_raw_hub(raw_hub.clone());
     daemon.set_wake(wake);
@@ -335,6 +346,8 @@ fn spawn_http(
     config: Arc<Config>,
     raw_hub: Arc<crate::wire::contract::rawhub::RawHub>,
     control: crate::wire::control::channel::ControlBinding,
+    bus: Arc<EventBus>,
+    budget: crate::server::http::budget::StreamBudget,
 ) -> std::io::Result<Arc<Api>> {
     let configured = config.settings.bind;
     let requested = resolve_bind(std::env::var("SVCD_BIND").ok().as_deref(), configured);
@@ -391,6 +404,7 @@ fn spawn_http(
         Arc::new(crate::face::api::ApiFace::new(config.clone(), lan.clone()));
     let routes: Arc<dyn crate::server::http::hooks::PreBodyRoutes> = Arc::new(PreBodyFaces {
         config: config.clone(),
+        bus: bus.clone(),
     });
     let fallback: crate::server::http::hooks::FallbackHandler =
         Arc::new(move |request, lan| respond(&fallback_config, request, lan));
@@ -404,6 +418,7 @@ fn spawn_http(
         routes,
         fallback,
         control,
+        budget,
     })?;
     Ok(Arc::new(Api { lan, driver }))
 }
@@ -638,6 +653,8 @@ struct Daemon {
     /// after the poll set started.
     stdio: crate::wire::contract::stdio::Target,
     raw_hub: Arc<crate::wire::contract::rawhub::RawHub>,
+    /// The one UI event bus built by the composition root.
+    bus: Arc<EventBus>,
 }
 
 impl Daemon {
@@ -667,6 +684,7 @@ impl Daemon {
             api,
             crate::wire::contract::rawhub::RawHub::new(config.limits.clone()),
             config,
+            Arc::new(EventBus::new()),
         )
     }
 
@@ -676,6 +694,7 @@ impl Daemon {
         api: Option<Arc<Api>>,
         raw_hub: Arc<crate::wire::contract::rawhub::RawHub>,
         config: Arc<Config>,
+        bus: Arc<EventBus>,
     ) -> Self {
         let wake = Arc::new(Wake::new());
         let rescan_interval_ms = config.settings.rescan_interval_ms();
@@ -695,7 +714,7 @@ impl Daemon {
                 slot.set_remain_after_exit(service.remain_after_exit);
                 slot.set_initial_state(service.state);
                 slot.set_wake(wake.clone());
-                configure_slot(&mut slot, service, &config.limits);
+                configure_slot(&mut slot, service, &config.limits, &bus);
                 slots.insert(service.id.clone(), slot);
             }
         }
@@ -732,6 +751,7 @@ impl Daemon {
             reactor: None,
             stdio: crate::wire::contract::stdio::Target::threaded(),
             raw_hub,
+            bus,
         }
     }
 
@@ -1682,7 +1702,7 @@ impl Daemon {
                         slot.set_wake(self.wake.clone());
                         slot.set_stdio(self.stdio.clone());
                         slot.set_raw_hub(Some(self.raw_hub.clone()));
-                        configure_slot(&mut slot, &service, &self.config.limits);
+                        configure_slot(&mut slot, &service, &self.config.limits, &self.bus);
                         self.slots.insert(id.clone(), slot);
                     }
                     // A rejected service must not leave a slot with no registry
@@ -2038,7 +2058,7 @@ impl Daemon {
                 // gives it. Without this the plugin answers calls but its
                 // notifications never reach the UI bus, and default_timeout is
                 // not applied to its calls.
-                configure_slot(&mut slot, &service, &self.config.limits);
+                configure_slot(&mut slot, &service, &self.config.limits, &self.bus);
                 self.slots.insert(id.clone(), slot);
             }
         }
@@ -2181,7 +2201,7 @@ impl Daemon {
                 // gives it. Without this the plugin answers calls but its
                 // notifications never reach the UI bus, and default_timeout is
                 // not applied to its calls.
-                configure_slot(&mut slot, &service, &self.config.limits);
+                configure_slot(&mut slot, &service, &self.config.limits, &self.bus);
                 self.slots.insert(id.clone(), slot);
             }
         }
@@ -2241,7 +2261,7 @@ impl Daemon {
         if purge {
             plugin::remove_logs(&self.config.paths, id);
             #[cfg(feature = "http")]
-            crate::face::uichannel::forget(id);
+            self.bus.forget(id);
         }
         log::svcd(&format!("svcd: plugin {} uninstalled", id));
         Ok(())
@@ -2536,16 +2556,22 @@ fn projected_done(
 
 /// Give a slot its contract and the face-side projections. The slot itself no
 /// longer knows MCP or the UI bus.
-fn configure_slot(slot: &mut Slot, service: &Service, limits: &crate::platform::limits::Limits) {
+fn configure_slot(
+    slot: &mut Slot,
+    service: &Service,
+    limits: &crate::platform::limits::Limits,
+    bus: &Arc<EventBus>,
+) {
     slot.set_contract(service.contract.clone());
     slot.set_call_timeout(limits.default_timeout);
     let _id = service.id.clone();
+    let bus = bus.clone();
     slot.set_notifier(Arc::new(move |method, params| {
         #[cfg(feature = "http")]
-        crate::face::uichannel::publish(&_id, method, params);
+        bus.publish(&_id, method, params);
         #[cfg(not(feature = "http"))]
         {
-            let _ = (method, params);
+            let _ = (&bus, method, params);
         }
     }));
 }

@@ -18,7 +18,6 @@ pub mod ws;
 use std::sync::{Arc, Mutex};
 
 use crate::face::plugin_ui::{PluginUiStream, UiPath};
-use crate::face::uichannel;
 use crate::manage as package;
 use crate::manage as plugin;
 use crate::platform::paths::Paths;
@@ -34,6 +33,8 @@ pub(crate) struct StreamContext {
     pub paths: Arc<Paths>,
     pub raw_hub: Option<Arc<crate::wire::contract::rawhub::RawHub>>,
     pub limits: Arc<crate::platform::limits::Limits>,
+    /// The daemon-wide UI event bus, injected by the composition root.
+    pub bus: Arc<crate::face::uichannel::EventBus>,
 }
 
 /// Why a realtime request was refused before its first handler byte.
@@ -168,7 +169,10 @@ pub(crate) fn open_sse(
     }
     let last_event_id = http::header(&request.headers, "last-event-id")
         .and_then(|value| value.trim().parse::<u64>().ok());
-    match uichannel::bus().subscribe_from(ui.id, last_event_id, &context.limits) {
+    match context
+        .bus
+        .subscribe_from(ui.id, last_event_id, &context.limits)
+    {
         Ok((receiver, subscription, replay)) => {
             Box::new(sse::SseStream::new(receiver, subscription, replay))
         }
@@ -196,7 +200,7 @@ pub(crate) fn open_ws(
         Ok(None) => return boxed(http::json_error(500, "internal", "missing handshake")),
         Err(response) => return boxed(response),
     };
-    match uichannel::bus().subscribe(ui.id, &context.limits) {
+    match context.bus.subscribe(ui.id, &context.limits) {
         Ok((receiver, subscription)) => Box::new(ws::WsStream::new(
             context.paths.config_dir.clone(),
             ui.id.to_string(),

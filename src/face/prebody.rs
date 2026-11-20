@@ -15,6 +15,8 @@ pub(crate) struct PreBodyFaces {
     /// Read through the trait object by both drivers: the poll loop on Unix and
     /// the thread-per-connection driver elsewhere (#205).
     pub(crate) config: Arc<Config>,
+    /// The daemon-wide UI event bus, injected by the composition root.
+    pub(crate) bus: Arc<crate::face::uichannel::EventBus>,
 }
 
 impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
@@ -32,6 +34,7 @@ impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
             lan,
             self.config.clone(),
             crate::wire::contract::rawhub::RawHub::ui_hub(raw_hub),
+            self.bus.clone(),
         ))
     }
 

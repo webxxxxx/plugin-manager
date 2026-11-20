@@ -27,9 +27,10 @@ pub fn drive(
     stream: &mut TcpStream,
     mut handler: Box<dyn StreamHandler>,
     initial: &[u8],
+    budget: &StreamBudget,
     limits: &crate::platform::limits::Limits,
 ) -> Result<(), Busy> {
-    let permit = StreamBudget::global().acquire(handler.stream_class(), limits.max_streams)?;
+    let permit = budget.acquire(handler.stream_class(), limits.max_streams)?;
     let result = drive_loop(stream, handler.as_mut(), initial, limits);
     // The Unix driver delivers this from its Drop; the fallback owns the
     // handler directly, so it must deliver the same final event here.
@@ -260,6 +261,7 @@ mod tests {
             &mut server,
             Box::new(BudgetHandler { captured: Some(tx) }),
             &[],
+            &StreamBudget::new(),
             &crate::platform::limits::test_default(),
         )
         .expect("drive");

@@ -86,6 +86,7 @@ impl PluginUiFace {
         lan: Arc<Mutex<Lan>>,
         config: Arc<Config>,
         raw_hub: Option<Arc<crate::wire::contract::rawhub::RawHub>>,
+        bus: Arc<crate::face::uichannel::EventBus>,
     ) -> PluginUiFace {
         PluginUiFace {
             lan,
@@ -93,6 +94,7 @@ impl PluginUiFace {
                 paths: config.paths.clone(),
                 raw_hub,
                 limits: config.limits.clone(),
+                bus,
             }),
         }
     }
@@ -124,6 +126,7 @@ impl PluginUiFace {
         lan: &Arc<Mutex<Lan>>,
         config: Arc<Config>,
         raw_hub: Option<Arc<crate::wire::contract::rawhub::RawHub>>,
+        bus: Arc<crate::face::uichannel::EventBus>,
     ) -> Result<Exchange, Vec<u8>> {
         let Some(route) = PluginUiFace::route_for(&head.method, &head.path) else {
             return Err(http::json_error(404, "not_found", "not a plugin UI path"));
@@ -155,7 +158,7 @@ impl PluginUiFace {
             deadline: None,
             cancel: None,
         };
-        let face = PluginUiFace::with_streams(lan.clone(), config, raw_hub);
+        let face = PluginUiFace::with_streams(lan.clone(), config, raw_hub, bus);
         dispatch_inline(&face, &route, request)
             .map_err(|error| http::json_error(500, "internal", &error.message()))
     }

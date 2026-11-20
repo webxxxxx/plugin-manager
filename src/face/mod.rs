@@ -36,7 +36,6 @@ pub mod prebody;
 pub mod routes;
 #[cfg(feature = "http")]
 pub mod support;
-#[cfg(feature = "http")]
 pub mod uichannel;
 #[cfg(feature = "http")]
 pub mod webui;

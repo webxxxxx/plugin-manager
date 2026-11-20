@@ -115,6 +115,7 @@ pub(crate) struct Connection {
     pub(crate) face: Arc<dyn crate::server::http::Face>,
     pub(crate) routes: Arc<dyn PreBodyRoutes>,
     pub(crate) fallback: FallbackHandler,
+    pub(crate) budget: crate::server::http::budget::StreamBudget,
     pub(crate) raw_hub: Arc<RawHub>,
 }
 
@@ -289,7 +290,13 @@ impl Connection {
                         // closes. The fallback writes the shared 503 if the
                         // stream budget is full before any handler bytes go
                         // out.
-                        drive_fallback(&mut stream, handler, head_only, &config.limits);
+                        drive_fallback(
+                            &mut stream,
+                            handler,
+                            head_only,
+                            &self.budget,
+                            &config.limits,
+                        );
                         return;
                     }
                     result => {
@@ -320,6 +327,7 @@ impl Connection {
                     claim,
                     &initial,
                     head_only,
+                    &self.budget,
                     &config.limits,
                     false,
                 );
@@ -331,6 +339,7 @@ impl Connection {
                     claim,
                     &initial,
                     head_only,
+                    &self.budget,
                     &config.limits,
                     true,
                 );
@@ -342,6 +351,7 @@ impl Connection {
                     claim,
                     &initial,
                     head_only,
+                    &self.budget,
                     &config.limits,
                     true,
                 );
@@ -371,6 +381,7 @@ impl Connection {
                             call,
                             &config.paths.config_dir,
                             head_only,
+                            &self.budget,
                             &config.limits,
                         );
                         return;
@@ -405,6 +416,7 @@ fn serve_claimed(
     claim: Result<Exchange, Vec<u8>>,
     initial: &[u8],
     head_only: bool,
+    budget: &crate::server::http::budget::StreamBudget,
     limits: &crate::platform::limits::Limits,
     transfer: bool,
 ) {
@@ -437,7 +449,7 @@ fn serve_claimed(
         let _ = stream.set_nonblocking(false);
         let _ = stream.set_read_timeout(Some(limits.transfer_timeout));
         let _ = stream.set_write_timeout(Some(limits.transfer_timeout));
-        if crate::server::http::fallback::drive(stream, handler, initial, limits).is_err() {
+        if crate::server::http::fallback::drive(stream, handler, initial, budget, limits).is_err() {
             let _ = write_http(
                 stream,
                 &crate::server::http::stream_busy_response(),
@@ -445,7 +457,7 @@ fn serve_claimed(
             );
         }
     } else {
-        drive_fallback(stream, handler, head_only, limits);
+        drive_fallback(stream, handler, head_only, budget, limits);
     }
 }
 
@@ -456,11 +468,12 @@ pub(crate) fn drive_fallback(
     stream: &mut TcpStream,
     handler: Box<dyn crate::server::http::StreamHandler>,
     head_only: bool,
+    budget: &crate::server::http::budget::StreamBudget,
     limits: &crate::platform::limits::Limits,
 ) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_write_timeout(Some(limits.transfer_timeout));
-    if crate::server::http::fallback::drive(stream, handler, &[], limits).is_err() {
+    if crate::server::http::fallback::drive(stream, handler, &[], budget, limits).is_err() {
         let _ = write_http(
             stream,
             &crate::server::http::stream_busy_response(),
