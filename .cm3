@@ -1,0 +1,11 @@
+fix(daemon): 修正 http 关闭与 Linux 的 cfg 边界 (#230)
+
+- assembly：`default_bind` 与四个只在 spawn_http 里用的 import 加 `cfg(http)`，
+  no-default 构建重新通过。
+- bootstrap：`Api` 只在 no-http 分支需要，按特征导入；`spawn_http` 同样只在 http 下。
+- Supervisor::reactor 改为 `pub(crate)`：probe 的 hook 轮询在 Linux 下要读它，
+  Windows 的 cfg(unix) 分支不编译这条路径，之前的全量测试没有覆盖到。
+- new_with_raw 在 no-http 下显式忽略 bus，压住 no-default 的 unused 变量。
+
+验证：Windows `cargo check --all-targets` 与 `--no-default-features --bin svcd`
+0 error；WSL `cargo check --all-targets` 0 error；随后 Linux 全量 7 target 绿。
