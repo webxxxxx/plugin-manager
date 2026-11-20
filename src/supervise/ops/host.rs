@@ -49,7 +49,7 @@ pub(crate) struct Supervisor {
     /// Set whenever the registry projection changed; compose drains it.
     pub(crate) catalog_dirty: bool,
     #[cfg(unix)]
-    reactor: Option<Arc<Reactor>>,
+    pub(crate) reactor: Option<Arc<Reactor>>,
     /// One place that turns a definition into a slot.
     pub(crate) factory: SlotFactory,
 }

@@ -1,6 +1,8 @@
+#[cfg(feature = "http")]
 use std::fs;
 #[cfg(feature = "http")]
 use std::net::{SocketAddr, TcpListener};
+#[cfg(feature = "http")]
 use std::sync::Arc;
 #[cfg(feature = "http")]
 use std::sync::Mutex;
@@ -9,14 +11,19 @@ use std::sync::Mutex;
 use crate::face::fallback::respond;
 #[cfg(feature = "http")]
 use crate::face::prebody::PreBodyFaces;
+#[cfg(feature = "http")]
 use crate::face::uichannel::EventBus;
+#[cfg(feature = "http")]
 use crate::platform::config::Config;
+#[cfg(feature = "http")]
 use crate::platform::log;
 #[cfg(feature = "http")]
 use crate::server::auth::lan::Lan;
 
+#[cfg(feature = "http")]
 use super::Api;
 
+#[cfg(feature = "http")]
 pub(super) fn default_bind() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 8787))
 }

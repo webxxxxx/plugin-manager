@@ -123,6 +123,8 @@ impl Daemon {
         config: Arc<Config>,
         bus: Arc<EventBus>,
     ) -> Self {
+        #[cfg(not(feature = "http"))]
+        let _ = &bus;
         let notifier: Notifier = {
             let bus = bus.clone();
             Arc::new(move |id: &str, method: &str, params: &Value| {
