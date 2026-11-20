@@ -64,35 +64,76 @@ bind = 127.0.0.1:8787
 # `log_max_bytes` is the rotation threshold for one file; `log_rotations` is
 # how many old files are kept. `log_to_file = off` keeps stderr/syslog only.
 #
-# Compile-time MEM_LEVEL supplies the defaults (high is the default):
-#   key                    low        middle      high
-#   log_max_bytes          65536      65536       65536
-#   log_rotations          3          3           3
-#   request_stack_bytes    131072     196608      262144
-#   io_stack_bytes         65536      98304       131072
-#   max_body_bytes         8388608    67108864    536870912
-#   max_json_body_bytes    65536      262144      1048576
-#   max_complete_body_bytes 131072    1048576     8388608
-#   max_header_bytes       8192       16384       65536
-#   max_streams            8          16          64
-#   stream_buffer_bytes    16384      32768       65536
-#   max_connections        32         128         512
-#   max_connections_per_ip 8          32          64
-#   max_subscriptions      4          16          64
-#   max_subscribers_per_plugin 4      16          64
-#   http_idle_timeout_secs 30         60          120
-#   max_package_bytes      8388608    67108864    536870912
-#   transfer_timeout_secs  120        120         120
-#   control_timeout_secs   30         30          30
-#   default_timeout        30000      30000       30000
-#   max_timeout            300000     300000      300000
-#   ws_max_message_bytes   1048576    1048576     1048576
-#   ws_inflight_bytes      2097152    8388608     67108864
-#   ws_inflight_requests   4          16          64
-#   ws_buffer_shrink_bytes 65536      65536       65536
-#   ws_raw_enabled         on         on          on
-#   ws_raw_max_bytes       1048576    1048576     1048576
-#   ws_raw_queue           16         64          128
+# ---------------------------------------------------------------------------
+# Memory budget, workload shape and derived limits (#161)
+# ---------------------------------------------------------------------------
+#
+# The resource keys below are not a table of defaults any more. On every start
+# svcd reads this machine (free memory, the cgroup v2 limit of the container,
+# CPU count) and derives one **memory budget**: the peak memory this process may
+# plan for. `MEM_LEVEL=low|middle|high` (build time) is the ceiling that budget
+# can never exceed: 128 MiB / 512 MiB / 2 GiB. It only tightens.
+#
+#   mem_budget_bytes = auto      # default; 25% of free memory, capped by the build
+#   mem_budget_bytes = 268435456 # a number is taken as written (floor 64 MiB)
+#
+# The **workload shape** decides how the budget is spent, not how big it is:
+#
+#   tiny         a small device with a handful of clients
+#   interactive  a general-purpose host with a few browser sessions  (default
+#                below 2 GiB of budget)
+#   streaming    many long-lived streams and large in-flight payloads
+#
+#   workload = tiny | interactive | streaming   # default: derived from the budget
+#
+# The default is only a suggestion: `svc config tune` prints (or writes) the
+# configuration it recommends for this machine, one key per line with the
+# derivation in the trailing comment. `svc status --resources` shows what the
+# last start actually ran with, including every rewritten value.
+#
+# Each key gets its value from `[absolute floor, min(share x budget, absolute
+# ceiling)]`. Inside that band an explicit value is taken as written. Above the
+# band it falls back to the shape's reference value (not to the ceiling); below
+# the floor it is raised. Every rewrite is logged at startup as
+#
+#   override: max_connections: 4096 -> 682 (above-upper-bound)
+#
+# and kept in `svc status --resources` until the next start. The worst case is
+# also checked against the budget:
+#
+#   baseline + threads x stack + connections x (resident body + stream buffer)
+#     + streams x stream buffer + in-flight raw bytes + queued frames x frame
+#
+# When it does not fit, the resident body shrinks first, then the concurrency
+# (floor 8); a configuration that still cannot fit refuses to start with the
+# offending terms in the message. It never runs until the OOM killer decides.
+#
+# The historical three-level table is now the **expected value at the shape's
+# reference budget** (tiny at 128 MiB, interactive at 512 MiB, streaming at
+# 2 GiB); it is a calibration anchor, not a runtime constant:
+#   key                          tiny@128MiB  interactive@512MiB  streaming@2GiB
+#   max_body_bytes               8388608      67108864            536870912
+#   max_json_body_bytes          65536        262144              1048576
+#   max_complete_body_bytes      65536        1048576             2097152
+#   max_connections              24           128                 682
+#   max_connections_per_ip       8            32                  64
+#   max_streams                  8            16                  64
+#   stream_buffer_bytes          8192         32768               131072
+#   ws_inflight_bytes            2097152      8388608             67108864
+#   ws_inflight_requests         4            16                  128
+#   ws_raw_queue                 8            32                  128
+#   pending_queue                32           128                 512
+#   progress_queue               16           64                  256
+#   request_stack_bytes          131072       196608              262144
+#   io_stack_bytes               65536        98304               131072
+#   http_idle_timeout_secs       30           60                  120
+#   max_package_bytes            8388608      67108864            536870912
+#
+# Keys that cannot cost memory (timeouts, thread stacks, log sizes, package
+# size) keep their shape value instead of scaling with RAM.
+#
+# A trailing `# comment` is allowed after a value when the hash is preceded by
+# whitespace, which is what `svc config tune` writes.
 #
 # The blocking pool runs face handlers that cannot run on the server loop
 # (control-channel round trips and disk work). It starts a fixed number of
@@ -111,8 +152,8 @@ bind = 127.0.0.1:8787
 # Requires a daemon restart.
 #
 # On Windows the HTTP listener keeps one thread per admitted connection, so
-# max_connections is also the connection-thread cap; the final Unix
-# four-thread default budget does not apply there.
+# max_connections is also the connection-thread cap and the invariant charges a
+# stack for every one of them.
 #
 # max_streams caps long-lived and transfer streams: SSE, WebSocket, raw
 # WebSocket, MCP SSE, blob/file upload and download, export, import and install.
@@ -133,40 +174,50 @@ bind = 127.0.0.1:8787
 # the in-flight limits when the workload legitimately has many large frames in
 # flight. On Windows the route answers 501 not_supported.
 #
-# Explicit values below override the MEM_LEVEL defaults. They are clamped to a
-# safe range; changing them requires a daemon restart.
+# `pending_queue` bounds the management requests queued between the server loop
+# and the supervisor loop; `progress_queue` bounds the progress events queued
+# between the reactor and one MCP stream. Both are derived from the budget; a
+# full queue is a visible busy error, never memory growth.
+#
+# Explicit values below override the derivation. Changing any of them requires a
+# daemon restart; `svc config tune --write` maintains them as one block.
 # logs_dir = /var/log/svcd
 # log_max_bytes = 65536
 # log_rotations = 3
 # log_to_file = on
-# request_stack_bytes = 131072
-# io_stack_bytes = 65536
+# mem_budget_bytes = auto
+# workload = interactive
+# request_stack_bytes = 196608
+# io_stack_bytes = 98304
 # blocking_threads = 2
-# max_body_bytes = 8388608
-# max_json_body_bytes = 65536
-# max_complete_body_bytes = 131072
-# max_header_bytes = 8192
-# max_streams = 8
-# stream_buffer_bytes = 16384
-# max_connections = 32
-# max_connections_per_ip = 8
-# max_subscriptions = 4
-# max_subscribers_per_plugin = 4
-# http_idle_timeout_secs = 30
-# max_package_bytes = 8388608
+# max_body_bytes = 67108864
+# max_json_body_bytes = 262144
+# max_complete_body_bytes = 1048576
+# max_header_bytes = 16384
+# max_streams = 16
+# stream_buffer_bytes = 32768
+# max_connections = 128
+# max_connections_per_ip = 32
+# max_subscriptions = 16
+# max_subscribers_per_plugin = 16
+# http_idle_timeout_secs = 60
+# max_package_bytes = 67108864
 # transfer_timeout_secs = 120
 # control_timeout_secs = 30
 # Call timeout in milliseconds: default_timeout is the per-call budget,
-# max_timeout is the hard ceiling the kernel clamps to.
+# max_timeout is the hard ceiling the kernel clamps to. These are the call
+# budget of the invocation envelope, not the memory budget.
 # default_timeout = 30000
 # max_timeout = 300000
 # ws_max_message_bytes = 1048576
-# ws_inflight_bytes = 2097152
-# ws_inflight_requests = 4
+# ws_inflight_bytes = 8388608
+# ws_inflight_requests = 16
 # ws_buffer_shrink_bytes = 65536
 # ws_raw_enabled = on
 # ws_raw_max_bytes = 1048576
-# ws_raw_queue = 16
+# ws_raw_queue = 32
+# pending_queue = 128
+# progress_queue = 64
 
 # Absolute paths (the generated default uses the platform locations):
 # Linux:
