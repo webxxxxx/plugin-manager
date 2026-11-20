@@ -89,7 +89,7 @@ MCP 不是 W3C，不要用 WPT 套；官方 SDK + 规范逐条向量就是这一
      编译期上限——这条不依赖机器，是保留 `MEM_LEVEL` 成上限的直接收益。
 4. **平台补充分测**：Linux `/proc/meminfo` + cgroup v2（`memory.max` 为 `max` 时忽略、
    v1 层级忽略）与 Windows `GlobalMemoryStatusEx` 各一条，只验证取数正确，不替代主路径。
-5. **端到端**：`tests/daemon.rs` 的 sandbox 启动真实 daemon，读 `run/resources.json`
+5. **端到端**：`tests/daemon.rs` 的 sandbox 启动真实 daemon，读 `run/resources/startup.json`
    与 `svc status --resources`，断言覆盖说明条数与四个字段；`svc config tune` 的输出
    必须能被 `settings::parse` 读回并派生出同一组限额。
 

@@ -5,10 +5,12 @@
 //! derived from the document, and the report that explains the derivation (the
 //! memory budget, the workload shape and every rewritten value).
 //!
-//! The machine is probed exactly here: [`Config::bootstrap`] reads the host
-//! once, [`Config::with_paths`] takes no probe and derives from the
-//! compile-time ceiling instead, which is what keeps a test independent of the
-//! machine it runs on.
+//! The machine is probed exactly here, once: [`Config::bootstrap`] reads the
+//! host (unless `svcd.conf` states an item with a `probe_*` key, in which case
+//! that item is taken as written and not read), and [`Config::with_paths`]
+//! takes no probe at all and derives from the compile-time ceiling, which is
+//! what keeps a test independent of the machine it runs on. [`Config::inspect`]
+//! is the same bootstrap without the refuse-to-start gate.
 //!
 //! Shape and rationale:
 //! [`docs/adr/0019-config-is-derived-once-at-the-composition-root.md`](../../docs/adr/0019-config-is-derived-once-at-the-composition-root.md)

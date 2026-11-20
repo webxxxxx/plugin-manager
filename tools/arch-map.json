@@ -66,7 +66,7 @@
     "resources": {
       "concept": "platform/resources",
       "layer": "platform",
-      "note": "S9（#161）：启动探测 + 内存预算 + 形状；读 OS 只经注入的 Machine，派生在 limits 里"
+      "note": "（#161 新文件）：启动探测 + 内存预算 + 形状；读 OS 只经注入的 Machine，配置里的 probe_* 可以逐项取代探测，派生在 limits 里"
     },
     "config": {
       "concept": "platform/config",
@@ -269,7 +269,7 @@
     "tune": {
       "concept": "cli/status",
       "layer": "cli",
-      "note": "S9（#161）：svc config tune 与 svc status --resources 的文本投影；只读派生结果，不重新派生"
+      "note": "（#161 新文件）：svc config tune 与 svc status --resources 的文本投影；只把 limits 的派生结果与启动快照渲染出来，不重新派生"
     },
     "status": {
       "concept": "cli/status",

@@ -117,15 +117,9 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     ));
     // The derivation report comes after the log is open: the budget, the shape
     // and every rewritten value are the first thing a support engineer needs.
+    // `lines()` already renders the override list, so it is not printed twice.
     for line in config.resources.lines() {
         log::svcd(&format!("svcd: {}", line));
-    }
-    for note in &config.resources.notes {
-        log::svcd(&format!(
-            "svcd: override: {} ({})",
-            note,
-            note.reason.detail()
-        ));
     }
     let stated = config.settings.probe_overrides().stated_names();
     log::svcd(&format!(

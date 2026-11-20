@@ -663,6 +663,47 @@ mod tests {
         assert_eq!(value["error"]["data"]["kind"], "internal");
     }
 
+    /// The depth is derived now (`pending_queue`), so the queue the daemon
+    /// builds from a derived limit must still answer busy when it is full
+    /// instead of waiting for room.
+    #[test]
+    fn a_derived_one_slot_queue_answers_busy_on_the_second_request() {
+        let mut limits = crate::platform::limits::test_default();
+        limits.pending_queue = 1;
+        let (tx, mut rx) = mpsc::sync_channel(limits.pending_queue);
+        let notify = Arc::new(UnixStream::pair().expect("notify").1);
+        let wake = Arc::new(Wake::new());
+
+        let mut connection = |tx: &mpsc::SyncSender<PendingCall>| {
+            let (stream, _peer) = UnixStream::pair().expect("pair");
+            Connection {
+                stream,
+                buffer: b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"svcd.ping\"}\n".to_vec(),
+                out: Vec::new(),
+                out_at: 0,
+                pending: None,
+                close_after_write: false,
+                endpoint: Endpoint::User,
+            }
+        };
+
+        let mut first = connection(&tx);
+        assert!(drain_requests(&mut first, &tx, &wake, notify.clone()));
+        assert!(!first.close_after_write, "one slot is not full yet");
+
+        let mut second = connection(&tx);
+        assert!(drain_requests(&mut second, &tx, &wake, notify));
+        assert!(second.close_after_write);
+        let text = String::from_utf8_lossy(&second.out);
+        assert!(text.contains("control queue is full"), "{text}");
+        let value: serde_json::Value = serde_json::from_str(text.trim()).expect("error frame");
+        assert_eq!(value["error"]["code"], -32000);
+
+        // The first request was still queued; the second never grew the queue.
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err(), "the queue did not grow");
+    }
+
     /// An oversized control frame is a JSON-RPC parse error and carries the
     /// `invalid` kind, so the face never has to parse the message.
     #[test]

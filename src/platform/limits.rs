@@ -360,7 +360,7 @@ pub fn derive_with(settings: &settings::Settings, profile: &ResourceProfile) -> 
     let budget = budget(settings.mem_budget_bytes, profile, BUDGET_CAP);
     let workload = settings
         .workload
-        .unwrap_or_else(|| Workload::of_budget(budget.quantized));
+        .unwrap_or_else(|| Workload::suggested(budget.quantized, profile.cpus));
     let workload_source = match settings.workload {
         Some(_) => WorkloadSource::Configured,
         None => WorkloadSource::Derived,
@@ -1132,6 +1132,131 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_boundary_matrix_holds_for_every_shape() {
+        // {shape} x {in band, below floor, above upper bound}, at the shape's
+        // own reference budget. The fourth column, "over budget", is
+        // `every_shape_refuses_when_the_fixed_terms_alone_do_not_fit` below.
+        for workload in Workload::ALL {
+            let budget = workload.reference_budget();
+
+            let in_band = derive_for(
+                budget,
+                Some(workload),
+                Settings {
+                    max_connections: Some(8),
+                    ..Settings::default()
+                },
+            );
+            assert_eq!(in_band.limits.max_connections, 8, "{}", workload.as_str());
+            assert!(
+                in_band.report.notes.is_empty(),
+                "{}: {:?}",
+                workload.as_str(),
+                in_band.report.notes
+            );
+
+            let below = derive_for(
+                budget,
+                Some(workload),
+                Settings {
+                    max_streams: Some(0),
+                    ..Settings::default()
+                },
+            );
+            assert_eq!(below.limits.max_streams, 1, "{}", workload.as_str());
+            assert_eq!(
+                note(&below.report, "max_streams").map(|note| note.reason),
+                Some(OverrideReason::BelowFloor),
+                "{}",
+                workload.as_str()
+            );
+
+            let above = derive_for(
+                budget,
+                Some(workload),
+                Settings {
+                    max_connections: Some(4096),
+                    ..Settings::default()
+                },
+            );
+            let default = derive_for(budget, Some(workload), Settings::default());
+            assert_eq!(
+                above.limits.max_connections,
+                default.limits.max_connections,
+                "{} falls back to its own shape's value",
+                workload.as_str()
+            );
+            assert_eq!(
+                note(&above.report, "max_connections").map(|note| note.reason),
+                Some(OverrideReason::AboveUpperBound),
+                "{}",
+                workload.as_str()
+            );
+
+            for derived in [in_band, below, above] {
+                assert_eq!(derived.report.refusal, None, "{}", workload.as_str());
+                assert!(
+                    derived.limits.worst_case_bytes() <= budget,
+                    "{}",
+                    workload.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_shape_refuses_when_the_fixed_terms_alone_do_not_fit() {
+        // 16 MiB frames at the floor budget: the queue term alone is larger
+        // than the budget, and it is not a term the shrink order may touch, so
+        // every shape has to refuse rather than run until the OOM killer.
+        for workload in Workload::ALL {
+            let derived = derive_for(
+                MIN_BUDGET,
+                Some(workload),
+                Settings {
+                    ws_raw_max_bytes: Some(16 * MIB as usize),
+                    ws_raw_queue: Some(4),
+                    ..Settings::default()
+                },
+            );
+            let reason = derived
+                .report
+                .refusal
+                .unwrap_or_else(|| panic!("{} must refuse", workload.as_str()));
+            assert!(reason.contains("does not fit"), "{reason}");
+            assert!(reason.contains("queued frames"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_single_core_suggests_the_tiny_shape_whatever_the_budget() {
+        // Cores are part of the suggestion: one core cannot drive the
+        // concurrency a larger shape asks for (user story 1).
+        let settings = Settings::default();
+        let profile = ResourceProfile {
+            available_memory: Some(16 * GIB),
+            cpus: Some(1),
+            ..ResourceProfile::default()
+        };
+        let derived = derive_with(&settings, &profile);
+
+        assert_eq!(derived.report.budget.quantized, BUDGET_CAP.min(4 * GIB));
+        assert_eq!(derived.report.workload, Workload::Tiny);
+        assert_eq!(
+            derived.report.workload_source,
+            crate::platform::resources::WorkloadSource::Derived
+        );
+
+        // Many cores, same budget: the budget decides.
+        let profile = ResourceProfile {
+            cpus: Some(16),
+            ..profile
+        };
+        let derived = derive_with(&settings, &profile);
+        assert_eq!(derived.report.workload, Workload::Streaming);
     }
 
     #[test]

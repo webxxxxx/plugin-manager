@@ -390,11 +390,17 @@ impl Workload {
         }
     }
 
-    /// The shape a budget suggests. This is only a suggestion: `svc config
-    /// tune` writes it into `svcd.conf`, and the running process always follows
-    /// the document (user story 21).
-    pub fn of_budget(quantized: u64) -> Workload {
-        if quantized < 512 * 1024 * 1024 {
+    /// The shape a machine suggests: the budget says how much there is, the
+    /// core count says whether one core could ever spend it.
+    ///
+    /// This is only a suggestion: `svc config tune` writes it into
+    /// `svcd.conf`, and the running process always follows the document
+    /// (user story 21).
+    pub fn suggested(quantized: u64, cpus: Option<usize>) -> Workload {
+        // A single-core host cannot drive the concurrency a larger shape asks
+        // for, whatever its RAM says (user story 1: the shape follows the cores
+        // *and* the memory).
+        if quantized < 512 * 1024 * 1024 || cpus == Some(1) {
             Workload::Tiny
         } else if quantized < 2 * 1024 * 1024 * 1024 {
             Workload::Interactive
@@ -403,8 +409,18 @@ impl Workload {
         }
     }
 
+    /// [`Workload::suggested`] for a budget alone, used by the threshold tests
+    /// and by any caller without a machine description.
+    pub fn of_budget(quantized: u64) -> Workload {
+        Workload::suggested(quantized, None)
+    }
+
     /// The budget this shape's shipped numbers were calibrated at. The old
     /// three-level table becomes the expected value *at this budget*.
+    ///
+    /// These are calibration anchors, not the compile-time ceilings: a `low`
+    /// build caps the budget at 128 MiB whatever the shape's reference says, and
+    /// a value falling back to a reference is bounded by the budget in force.
     pub fn reference_budget(self) -> u64 {
         match self {
             Workload::Tiny => 128 * 1024 * 1024,

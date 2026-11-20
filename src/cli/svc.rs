@@ -475,10 +475,13 @@ fn resources_command(config: &Config, json: bool) -> i32 {
 fn config_tune(config: &Config, write: bool) -> i32 {
     let mut body = tune::config_text(&config.limits, &config.resources);
     if let Some(reason) = &config.resources.refusal {
+        // Writing this block does not by itself make the document runnable: the
+        // terms in the message are what must change.
         body.push_str(&format!(
-            "#\n# WARNING: the daemon refuses to start with the current document.\n\
-             # Writing this configuration pins the budget, which is what makes it fit.\n\
-             # {}\n",
+            "#\n# WARNING: the daemon refuses to start with the current document:\n\
+             #   {}\n\
+             # The values below are what this machine can use. Reduce the largest term\n\
+             # named above (usually request_stack_bytes) before restarting.\n",
             reason
         ));
     }
