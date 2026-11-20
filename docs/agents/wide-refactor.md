@@ -101,6 +101,36 @@ node tools/fmt.mjs --check src/manage/package.rs
 
 全仓是否干净由 gate 检查：`node tools/check.mjs fmt`（CI `guardrails` 同款，156 个文件）。
 
+## 文件预算：700 生产 / 1,200 总行
+
+`src/**/*.rs` 的预算由 `node tools/size-lint.mjs` 守（`node tools/check.mjs size` 同款）：
+
+- **生产行 ≤ 700**：生产行 = 文件总行数减去内联测试模块（`#[cfg(test)] mod tests`，含
+  `#[cfg(all(test, ...))]` 形式）及其后的全部内容。
+- **总行数 ≤ 1,200**：测试也计入；外置测试文件（父模块写 `#[cfg(test)] mod tests;`）生产行按 0 计，总行数照常计入。
+- 存量超预算文件登记在 `tools/size-budget.json`，记录当前 `production` / `total`。
+  **白名单只降不升**：文件变大即红；文件变小后把记录改小（降到预算内就直接删掉整条）。
+- 未登记的新文件超预算直接红。`--report` 只打印当前分布，不设门。
+- CI 的 `guardrails` job 跑 `node tools/check.mjs size`；本地按上面的门顺序跑。
+
+**不设最小行数**：这个门只防文件无限长。小文件不是问题，给行数设下限会逼实现加样板、
+塞注释或造无意义的抽象；一个 10 行的模块和一个 700 行的模块都可以是好的。
+
+### 注入测试（改 guardrail 时必须跑）
+
+`node tools/size-lint.mjs --selftest` 用临时目录注入坏输入，验证先红后绿：
+
+1. 新增文件 701 行 → 红，改回 700 行 → 绿；
+2. 白名单文件 710 → 711 行 → 红，改回 710 → 绿；
+3. 总行数 1,303 → 红，降到 1,103 → 绿；
+4. 生产 700 + 测试 403 行 → 绿（生产不吃测试行）；
+5. 外置 `tests.rs` 800 行 → 绿（生产按 0 计），1,301 行 → 按总预算红；
+6. 真实 CLI：坏输入退出 1，`--report` 退出 0，恢复后退出 0。
+
+在真实仓库上做一次手工注入：给白名单文件末尾加一行（例如在
+`src/cli/svc.rs` 追加一个空行或注释），`node tools/check.mjs size` 必须红；删掉这一行后
+必须绿。注入过的行不要提交。
+
 ## 反例（#151 实录）
 
 - 手写 `str.replace` 全局替换，一次把 `Result<T, String>` 改成了 `Result<T>`，66 个签名丢掉

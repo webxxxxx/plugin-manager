@@ -1,0 +1,33 @@
+{
+  "$comment": "存量超预算文件白名单；值只能降不能升（#239）。新增文件超过 700 生产行 / 1,200 总行直接红；外置 tests.rs 的生产行按 0 计。",
+  "files": {
+    "src/cli/svc.rs": {
+      "production": 771,
+      "total": 993
+    },
+    "src/daemon/tests.rs": {
+      "production": 0,
+      "total": 1704
+    },
+    "src/face/blob.rs": {
+      "production": 754,
+      "total": 1249
+    },
+    "src/face/blob_upload.rs": {
+      "production": 736,
+      "total": 1037
+    },
+    "src/face/routes.rs": {
+      "production": 1106,
+      "total": 1330
+    },
+    "src/selfinstall/plan.rs": {
+      "production": 889,
+      "total": 891
+    },
+    "src/server/http/model.rs": {
+      "production": 760,
+      "total": 951
+    }
+  }
+}
