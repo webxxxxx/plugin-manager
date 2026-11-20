@@ -3073,3 +3073,70 @@ fn status_text_shows_summary_and_details() {
         "state missing:\n{text}"
     );
 }
+
+/// #161: the daemon writes what it derived at startup, and `svc status
+/// --resources` shows it back. The daemon's own log carries the same lines, so
+/// a support engineer sees the budget, the shape and every rewritten value
+/// without reading the source.
+#[test]
+fn the_daemon_reports_the_memory_budget_it_derived() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon_ready();
+
+    let snapshot = sandbox
+        .data
+        .join("run")
+        .join("resources")
+        .join("startup.json");
+    let text = wait_for_file(&snapshot);
+    let report: Value = serde_json::from_str(&text).expect("resource snapshot");
+    for key in [
+        "budget_raw",
+        "budget_quantized",
+        "budget_source",
+        "build_cap",
+        "workload",
+        "workload_source",
+        "worst_case",
+        "notes",
+    ] {
+        assert!(report.get(key).is_some(), "snapshot misses {key}: {text}");
+    }
+    assert!(
+        report["worst_case"].as_u64().unwrap() <= report["budget_quantized"].as_u64().unwrap(),
+        "the derivation must fit its own budget: {text}"
+    );
+
+    let output = sandbox.run_svc(&["status", "--resources"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    for needle in ["source:  last start", "memory:", "workload:", "worst case:"] {
+        assert!(text.contains(needle), "missing {needle} in:\n{text}");
+    }
+
+    let log = sandbox.daemon_log();
+    assert!(log.contains("svcd: memory:"), "log misses the budget:\n{log}");
+    assert!(log.contains("svcd: workload:"), "log misses the shape:\n{log}");
+}
+
+/// The snapshot appears after the daemon has logged; ask for it with a bound
+/// instead of sleeping.
+fn wait_for_file(path: &Path) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(text) = fs::read_to_string(path) {
+            return text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}

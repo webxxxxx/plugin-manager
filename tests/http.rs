@@ -6476,6 +6476,8 @@ const MINIMAL_LIMITS: &[(&str, &str)] = &[
     ("ws_buffer_shrink_bytes", "1"),
     ("ws_raw_max_bytes", "1"),
     ("ws_raw_queue", "0"),
+    ("pending_queue", "0"),
+    ("progress_queue", "0"),
 ];
 
 const NO_OVERRIDES: &[(&str, &str)] = &[];
