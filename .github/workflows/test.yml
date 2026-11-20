@@ -28,9 +28,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-${{ matrix.os }}
+      - name: Clippy
+        run: node tools/check.mjs lint
       - name: Run integration and unit tests
         run: cargo test --no-fail-fast -- --test-threads=1
       - name: Check minimal build without HTTP

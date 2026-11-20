@@ -335,11 +335,13 @@ mod tests {
         }
     }
 
-    fn finished_channel() -> (Sender<(u64, JobOutcome)>, Receiver<(u64, JobOutcome)>) {
+    type JobEvent = (u64, JobOutcome);
+
+    fn finished_channel() -> (Sender<JobEvent>, Receiver<JobEvent>) {
         mpsc::channel()
     }
 
-    fn recv(receiver: &Receiver<(u64, JobOutcome)>) -> (u64, JobOutcome) {
+    fn recv(receiver: &Receiver<JobEvent>) -> JobEvent {
         receiver
             .recv_timeout(Duration::from_secs(5))
             .expect("a finished job")

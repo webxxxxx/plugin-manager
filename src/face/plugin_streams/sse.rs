@@ -221,10 +221,7 @@ mod tests {
             .unwrap_or(0);
         let mut body = &stream[body_start..];
         let mut decoded = Vec::new();
-        loop {
-            let Some(line_end) = body.windows(2).position(|window| window == b"\r\n") else {
-                break;
-            };
+        while let Some(line_end) = body.windows(2).position(|window| window == b"\r\n") {
             let size = std::str::from_utf8(&body[..line_end]).expect("chunk size");
             let size = usize::from_str_radix(size, 16).expect("hex");
             body = &body[line_end + 2..];

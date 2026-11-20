@@ -4,6 +4,7 @@
 // printed, capped.
 //
 //   node tools/check.mjs quick            cargo check --all-targets
+//   node tools/check.mjs lint             cargo clippy --all-targets -- -D warnings
 //   node tools/check.mjs fmt              rustfmt --check on every src/ and tests/ file
 //   node tools/check.mjs no-default       cargo check --no-default-features --bin svcd
 //   node tools/check.mjs cross [target]   cargo check --target <target> --all-targets
@@ -248,7 +249,7 @@ if (tier === "linux") {
 }
 
 if (tier === "--help" || tier === "-h") {
-  console.log("usage: node tools/check.mjs quick|no-default|fmt|cross [target]|linux [filter]|full|test <filter>");
+  console.log("usage: node tools/check.mjs quick|lint|no-default|fmt|cross [target]|linux [filter]|full|test <filter>");
   process.exit(0);
 }
 
@@ -264,6 +265,28 @@ if (tier === "quick") {
     console.log("check: FAILED");
     console.log(failureTail(result));
   }
+  process.exit(result.status ?? 1);
+}
+
+if (tier === "lint") {
+  // A separate tier from `quick`: clippy is the semantic gate, but it is
+  // deliberately not part of every test run. CI runs it on Windows and Linux so
+  // the `cfg(unix)` half and the Win32 half are both linted.
+  console.log("check: running cargo clippy --all-targets -- -D warnings");
+  const result = cargo(
+    ["clippy", "--all-targets", "--message-format", "short", "--", "-D", "warnings"],
+    COMPILE_TIMEOUT_MS,
+  );
+  if (timedOut(result)) {
+    reportTimeout(result);
+    process.exit(124);
+  }
+  if (result.status === 0) {
+    console.log("check: ok (clippy; all targets)");
+    process.exit(0);
+  }
+  console.log("check: FAILED (clippy)");
+  console.log(failureTail(result));
   process.exit(result.status ?? 1);
 }
 

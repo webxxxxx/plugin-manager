@@ -573,14 +573,14 @@ mod tests {
         reply: Value,
     }
 
+    type RecordingHandle = (
+        Box<dyn Wire>,
+        Arc<AtomicUsize>,
+        Arc<std::sync::Mutex<Option<Duration>>>,
+    );
+
     impl RecordingWire {
-        fn boxed(
-            reply: Value,
-        ) -> (
-            Box<dyn Wire>,
-            Arc<AtomicUsize>,
-            Arc<std::sync::Mutex<Option<Duration>>>,
-        ) {
+        fn boxed(reply: Value) -> RecordingHandle {
             let calls = Arc::new(AtomicUsize::new(0));
             let last_timeout = Arc::new(std::sync::Mutex::new(None));
             let wire = RecordingWire {

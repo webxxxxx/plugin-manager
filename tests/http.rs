@@ -591,10 +591,7 @@ fn multipart_body(boundary: &str, filename: &str, content: &[u8]) -> Vec<u8> {
 fn decode_chunked(body: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut rest = body;
-    loop {
-        let Some(line_end) = rest.windows(2).position(|window| window == b"\r\n") else {
-            break;
-        };
+    while let Some(line_end) = rest.windows(2).position(|window| window == b"\r\n") {
         let size_text = String::from_utf8_lossy(&rest[..line_end]);
         let size = usize::from_str_radix(size_text.trim(), 16).unwrap_or(0);
         rest = &rest[line_end + 2..];
@@ -2511,7 +2508,7 @@ fn wait_for_staging(sandbox: &Sandbox, dir: &Path) {
         sandbox,
         &format!("upload staging file did not appear under {}", dir.display()),
         || has_staging(dir),
-        || String::new(),
+        String::new,
     );
 }
 
@@ -2523,7 +2520,7 @@ fn wait_for_no_staging(sandbox: &Sandbox, dir: &Path) {
             dir.display()
         ),
         || !has_staging(dir),
-        || String::new(),
+        String::new,
     );
 }
 
@@ -2554,8 +2551,9 @@ where
     );
 }
 
+#[cfg_attr(windows, allow(dead_code))] // only the Unix thread-budget test drives it
 fn wait_for_package_staging(sandbox: &Sandbox, plugins: &Path) {
-    wait_for_package_staging_with(sandbox, plugins, || String::new());
+    wait_for_package_staging_with(sandbox, plugins, String::new);
 }
 
 fn wait_for_no_package_staging(sandbox: &Sandbox, plugins: &Path) {
@@ -2566,7 +2564,7 @@ fn wait_for_no_package_staging(sandbox: &Sandbox, plugins: &Path) {
             plugins.display()
         ),
         || !has_package_staging(plugins),
-        || String::new(),
+        String::new,
     );
 }
 
@@ -6207,24 +6205,22 @@ fn an_idle_connection_is_closed_without_a_response() {
     idle.set_read_timeout(Some(Duration::from_secs(8)))
         .expect("timeout");
     let mut sink = [0u8; 64];
-    loop {
-        match idle.read(&mut sink) {
-            Ok(0) => break,
-            Ok(read) => panic!(
-                "an idle connection must be closed, not answered: {:?}",
-                String::from_utf8_lossy(&sink[..read])
-            ),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                panic!("the daemon did not close an idle connection within 8 s")
-            }
-            // A reset from the server's close is still a close, not a response.
-            Err(_) => break,
+    match idle.read(&mut sink) {
+        Ok(0) => {}
+        Ok(read) => panic!(
+            "an idle connection must be closed, not answered: {:?}",
+            String::from_utf8_lossy(&sink[..read])
+        ),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            panic!("the daemon did not close an idle connection within 8 s")
         }
+        // A reset from the server's close is still a close, not a response.
+        Err(_) => {}
     }
 }
 
@@ -6973,7 +6969,8 @@ fn assert_concurrent_connections(sandbox: &mut Sandbox, address: &str, streams: 
                             // The first socket was refused too: a fresh pair
                             // may still see the released slot.
                             Ok(503) => {
-                                last = format!("first (admitted) concurrent connection: status 503")
+                                last =
+                                    "first (admitted) concurrent connection: status 503".to_string()
                             }
                             Ok(status) => regression_failure(
                                 sandbox,
@@ -7436,8 +7433,7 @@ fn run_min_config_phase(phase: &str, streams: bool) {
         address
     );
     let idle_deadline = Instant::now() + ADMISSION_WAIT;
-    let mut idle_last = String::from("no attempt");
-    let (mut idle, kept) = loop {
+    let (mut idle, _kept) = loop {
         let mut stream = connect_for_probe(
             &mut sandbox,
             "http_idle_timeout_secs",
@@ -7456,14 +7452,11 @@ fn run_min_config_phase(phase: &str, streams: bool) {
         let kept = match stream.write_all(idle_request.as_bytes()) {
             Ok(()) => read_one_response(&mut stream),
             // A refused connection can be reset on write: not admitted yet.
-            Err(error) => {
-                idle_last = format!("write: {error}");
-                RawResponse {
-                    status: 0,
-                    body: Vec::new(),
-                    headers: Vec::new(),
-                }
-            }
+            Err(_) => RawResponse {
+                status: 0,
+                body: Vec::new(),
+                headers: Vec::new(),
+            },
         };
         if kept.status == 200 {
             break (stream, kept);
@@ -7479,14 +7472,13 @@ fn run_min_config_phase(phase: &str, streams: bool) {
                 &format!("status {}", kept.status),
             );
         }
-        idle_last = format!("status {}", kept.status);
         if Instant::now() >= idle_deadline || !daemon_state(&mut sandbox).starts_with("running") {
             regression_failure(
                 &mut sandbox,
                 "http_idle_timeout_secs",
                 "keep-alive GET /api/v1/services",
                 "status 200 on the keep-alive connection",
-                &idle_last,
+                &format!("status {}", kept.status),
             );
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -8363,7 +8355,7 @@ fn a_stuck_supervisor_answers_504_and_the_worker_recovers() {
         "the stop hook never started",
         Duration::from_secs(2),
         || entered.exists(),
-        || String::new(),
+        String::new,
     );
     let list_address = address.clone();
     let list = std::thread::spawn(move || {
@@ -8395,7 +8387,7 @@ fn a_stuck_supervisor_answers_504_and_the_worker_recovers() {
         "the daemon did not recover after the stop hook",
         Duration::from_secs(10),
         || request(&address, "GET", "/api/v1/services", "", b"").status == 200,
-        || String::new(),
+        String::new,
     );
 }
 
@@ -8434,7 +8426,7 @@ fn a_disconnected_install_job_cancels_its_control_round_trip() {
         "the post-install hook did not start",
         Duration::from_secs(3),
         || marker.exists(),
-        || String::new(),
+        String::new,
     );
     install
         .shutdown(std::net::Shutdown::Both)

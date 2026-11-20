@@ -97,6 +97,8 @@ pub(crate) struct StartInput {
     /// The bound control channel. The poll loop merges its listener into the
     /// wait set; the thread driver ignores it because the channel already runs
     /// its own accept thread on that host.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    // read by the Unix poll driver; the thread driver owns its own accept thread.
     pub control: crate::wire::control::channel::ControlBinding,
 }
 

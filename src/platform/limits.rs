@@ -976,6 +976,139 @@ fn stack_per_connection(limits: &Limits) -> u64 {
     }
 }
 
+/// The file the daemon writes at startup and `svc status --resources` reads
+/// back.
+///
+/// It lives under the run directory in its own subdirectory: `run/` also holds
+/// one `<id>.json` runtime record per service, and those are scanned as
+/// `*.json`, so the snapshot must not be a sibling of them. It describes the
+/// last start, it is not a second configuration source, and it is allowed to
+/// disappear on reboot.
+pub fn snapshot_path(paths: &crate::platform::paths::Paths) -> std::path::PathBuf {
+    paths.run_dir.join("resources").join("startup.json")
+}
+
+/// Persist the report of the current start.
+///
+/// Written through a temporary file in the same directory and renamed, so a
+/// reader never sees a half-written document.
+pub fn write_snapshot(
+    paths: &crate::platform::paths::Paths,
+    report: &ResourceReport,
+) -> Result<(), String> {
+    let path = snapshot_path(paths);
+    let directory = path
+        .parent()
+        .ok_or_else(|| format!("no directory for {}", path.display()))?;
+    std::fs::create_dir_all(directory)
+        .map_err(|error| format!("create {}: {}", directory.display(), error))?;
+    let text = serde_json::to_string_pretty(&report.to_json())
+        .map_err(|error| format!("serialize the resource report: {}", error))?;
+    let temporary = directory.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("resources.json"),
+        std::process::id()
+    ));
+    std::fs::write(&temporary, text)
+        .map_err(|error| format!("write {}: {}", temporary.display(), error))?;
+    std::fs::rename(&temporary, &path).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        format!("rename {}: {}", path.display(), error)
+    })
+}
+
+/// Read the snapshot of the last start.
+pub fn read_snapshot(paths: &crate::platform::paths::Paths) -> Result<serde_json::Value, String> {
+    let path = snapshot_path(paths);
+    let text = std::fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "no resource snapshot at {} ({error}); start the daemon first",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&text).map_err(|error| format!("parse {}: {}", path.display(), error))
+}
+
+/// Render the startup snapshot (live or from the file `svc status
+/// --resources` reads) as the lines the daemon logs.
+pub fn describe_snapshot(snapshot: &serde_json::Value) -> Vec<String> {
+    let bytes = |key: &str| snapshot.get(key).and_then(serde_json::Value::as_u64);
+    let text = crate::platform::resources::bytes_text;
+    let show = |key: &str| bytes(key).map(text).unwrap_or_else(|| "unknown".into());
+    let mut free = show("available_memory");
+    if let Some(remaining) = bytes("cgroup_remaining") {
+        free.push_str(&format!(", cgroup {}", text(remaining)));
+    }
+    let cpus = bytes("cpus").map(|cpus| format!(", {cpus} cpus"));
+    let mut lines = vec![format!(
+        "probe:    free memory {}{}",
+        free,
+        cpus.unwrap_or_default()
+    )];
+    lines.push(format!(
+        "memory:   {} usable, from {} raw ({}), build cap {}",
+        show("budget_quantized"),
+        show("budget_raw"),
+        snapshot
+            .get("budget_source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown"),
+        show("build_cap")
+    ));
+    lines.push(format!(
+        "workload: {} ({})",
+        snapshot
+            .get("workload")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown"),
+        snapshot
+            .get("workload_source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+    ));
+    lines.push(format!(
+        "worst case: {} of {}",
+        show("worst_case"),
+        show("budget_quantized")
+    ));
+    if let Some(reason) = snapshot
+        .get("refusal")
+        .and_then(serde_json::Value::as_str)
+        .filter(|reason| !reason.is_empty())
+    {
+        lines.push(format!("refused: {}", reason));
+    }
+    match snapshot
+        .get("notes")
+        .and_then(serde_json::Value::as_array)
+        .filter(|notes| !notes.is_empty())
+    {
+        None => lines.push("overrides: none".into()),
+        Some(notes) => {
+            for note in notes {
+                lines.push(format!(
+                    "override: {}: {} -> {} ({})",
+                    note.get("key")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?"),
+                    note.get("configured")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    note.get("effective")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    note.get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?")
+                ));
+            }
+        }
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1466,29 +1599,29 @@ mod tests {
         assert_eq!(limits.max_body, 64 * KIB);
         assert_eq!(limits.max_json_body, 4 * KIB);
         assert_eq!(limits.max_complete_body, 16 * KIB);
-        assert_eq!(limits.max_header, 1024 as usize);
-        assert_eq!(limits.max_streams, 1 as usize);
+        assert_eq!(limits.max_header, 1024_usize);
+        assert_eq!(limits.max_streams, 1_usize);
         assert_eq!(limits.stream_buffer, 4 * KIB as usize);
-        assert_eq!(limits.max_connections, 1 as usize);
-        assert_eq!(limits.max_connections_per_ip, 1 as usize);
-        assert_eq!(limits.max_subscriptions, 0 as usize);
-        assert_eq!(limits.max_subscribers_per_plugin, 0 as usize);
+        assert_eq!(limits.max_connections, 1_usize);
+        assert_eq!(limits.max_connections_per_ip, 1_usize);
+        assert_eq!(limits.max_subscriptions, 0_usize);
+        assert_eq!(limits.max_subscribers_per_plugin, 0_usize);
         assert_eq!(limits.idle_timeout, Duration::from_secs(1));
         assert_eq!(limits.log_max_bytes, 4 * KIB);
-        assert_eq!(limits.log_rotations, 1 as usize);
+        assert_eq!(limits.log_rotations, 1_usize);
         assert_eq!(limits.max_package_bytes, MIB);
         assert_eq!(limits.transfer_timeout, Duration::from_secs(10));
         assert_eq!(limits.control_timeout, Duration::from_secs(1));
         assert_eq!(limits.default_timeout, Duration::from_millis(100));
         assert_eq!(limits.max_timeout, Duration::from_millis(100));
-        assert_eq!(limits.ws_max_message_bytes, 1024 as usize);
+        assert_eq!(limits.ws_max_message_bytes, 1024_usize);
         assert_eq!(limits.ws_inflight_bytes, 64 * KIB as usize);
-        assert_eq!(limits.ws_inflight_requests, 1 as usize);
+        assert_eq!(limits.ws_inflight_requests, 1_usize);
         assert_eq!(limits.ws_buffer_shrink_bytes, 4 * KIB as usize);
-        assert_eq!(limits.ws_raw_max_bytes, 1024 as usize);
-        assert_eq!(limits.ws_raw_queue, 4 as usize);
-        assert_eq!(limits.pending_queue, 8 as usize);
-        assert_eq!(limits.progress_queue, 4 as usize);
+        assert_eq!(limits.ws_raw_max_bytes, 1024_usize);
+        assert_eq!(limits.ws_raw_queue, 4_usize);
+        assert_eq!(limits.pending_queue, 8_usize);
+        assert_eq!(limits.progress_queue, 4_usize);
     }
 
     #[test]
@@ -1642,137 +1775,4 @@ mod tests {
             assert_eq!(limits.threads(), LOOP_THREADS + limits.blocking_threads);
         }
     }
-}
-
-/// The file the daemon writes at startup and `svc status --resources` reads
-/// back.
-///
-/// It lives under the run directory in its own subdirectory: `run/` also holds
-/// one `<id>.json` runtime record per service, and those are scanned as
-/// `*.json`, so the snapshot must not be a sibling of them. It describes the
-/// last start, it is not a second configuration source, and it is allowed to
-/// disappear on reboot.
-pub fn snapshot_path(paths: &crate::platform::paths::Paths) -> std::path::PathBuf {
-    paths.run_dir.join("resources").join("startup.json")
-}
-
-/// Persist the report of the current start.
-///
-/// Written through a temporary file in the same directory and renamed, so a
-/// reader never sees a half-written document.
-pub fn write_snapshot(
-    paths: &crate::platform::paths::Paths,
-    report: &ResourceReport,
-) -> Result<(), String> {
-    let path = snapshot_path(paths);
-    let directory = path
-        .parent()
-        .ok_or_else(|| format!("no directory for {}", path.display()))?;
-    std::fs::create_dir_all(directory)
-        .map_err(|error| format!("create {}: {}", directory.display(), error))?;
-    let text = serde_json::to_string_pretty(&report.to_json())
-        .map_err(|error| format!("serialize the resource report: {}", error))?;
-    let temporary = directory.join(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("resources.json"),
-        std::process::id()
-    ));
-    std::fs::write(&temporary, text)
-        .map_err(|error| format!("write {}: {}", temporary.display(), error))?;
-    std::fs::rename(&temporary, &path).map_err(|error| {
-        let _ = std::fs::remove_file(&temporary);
-        format!("rename {}: {}", path.display(), error)
-    })
-}
-
-/// Read the snapshot of the last start.
-pub fn read_snapshot(paths: &crate::platform::paths::Paths) -> Result<serde_json::Value, String> {
-    let path = snapshot_path(paths);
-    let text = std::fs::read_to_string(&path).map_err(|error| {
-        format!(
-            "no resource snapshot at {} ({error}); start the daemon first",
-            path.display()
-        )
-    })?;
-    serde_json::from_str(&text).map_err(|error| format!("parse {}: {}", path.display(), error))
-}
-
-/// Render the startup snapshot (live or from the file `svc status
-/// --resources` reads) as the lines the daemon logs.
-pub fn describe_snapshot(snapshot: &serde_json::Value) -> Vec<String> {
-    let bytes = |key: &str| snapshot.get(key).and_then(serde_json::Value::as_u64);
-    let text = crate::platform::resources::bytes_text;
-    let show = |key: &str| bytes(key).map(text).unwrap_or_else(|| "unknown".into());
-    let mut free = show("available_memory");
-    if let Some(remaining) = bytes("cgroup_remaining") {
-        free.push_str(&format!(", cgroup {}", text(remaining)));
-    }
-    let cpus = bytes("cpus").map(|cpus| format!(", {cpus} cpus"));
-    let mut lines = vec![format!(
-        "probe:    free memory {}{}",
-        free,
-        cpus.unwrap_or_default()
-    )];
-    lines.push(format!(
-        "memory:   {} usable, from {} raw ({}), build cap {}",
-        show("budget_quantized"),
-        show("budget_raw"),
-        snapshot
-            .get("budget_source")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown"),
-        show("build_cap")
-    ));
-    lines.push(format!(
-        "workload: {} ({})",
-        snapshot
-            .get("workload")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown"),
-        snapshot
-            .get("workload_source")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown")
-    ));
-    lines.push(format!(
-        "worst case: {} of {}",
-        show("worst_case"),
-        show("budget_quantized")
-    ));
-    if let Some(reason) = snapshot
-        .get("refusal")
-        .and_then(serde_json::Value::as_str)
-        .filter(|reason| !reason.is_empty())
-    {
-        lines.push(format!("refused: {}", reason));
-    }
-    match snapshot
-        .get("notes")
-        .and_then(serde_json::Value::as_array)
-        .filter(|notes| !notes.is_empty())
-    {
-        None => lines.push("overrides: none".into()),
-        Some(notes) => {
-            for note in notes {
-                lines.push(format!(
-                    "override: {}: {} -> {} ({})",
-                    note.get("key")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("?"),
-                    note.get("configured")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0),
-                    note.get("effective")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0),
-                    note.get("reason")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("?")
-                ));
-            }
-        }
-    }
-    lines
 }
