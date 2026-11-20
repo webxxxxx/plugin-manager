@@ -837,7 +837,7 @@ pub(crate) struct SelfInstallPlan {
 pub(crate) struct SelfInstallInputs<'a> {
     pub(crate) install_root: &'a Path,
     pub(crate) runtime: RuntimeDirs,
-    pub(crate) config_source: Option<&'a Path>,
+    pub(crate) config_path: Option<&'a Path>,
     pub(crate) manual: bool,
     pub(crate) no_service: bool,
     pub(crate) record_install_dir: bool,
@@ -869,7 +869,7 @@ pub(crate) fn plan_self_install(input: SelfInstallInputs<'_>) -> SelfInstallPlan
         program: target.clone(),
         data_dir: input.runtime.data.clone(),
         config_dir: input.runtime.config.clone(),
-        conf: input.config_source.map(Path::to_path_buf),
+        conf: input.config_path.map(Path::to_path_buf),
     };
     let service = register_service
         .then(|| service_plan(Action::Install, input.service_target, &layout, false));
@@ -1002,6 +1002,31 @@ mod tests {
         assert!(text.contains("temp_retention_secs = 7200"), "{text}");
         assert!(text.contains("temp_cleanup_interval_secs = 300"), "{text}");
         assert!(text.contains("control_timeout_secs = 30"), "{text}");
+    }
+
+    #[test]
+    fn self_install_services_use_the_installed_conf() {
+        let install_root = PathBuf::from("/opt/svcd");
+        let runtime = RuntimeDirs {
+            config: install_root.join("config"),
+            data: install_root.join("data"),
+            logs: install_root.join("logs"),
+        };
+        let installed = runtime.conf();
+        let plan = plan_self_install(SelfInstallInputs {
+            install_root: &install_root,
+            runtime,
+            config_path: Some(installed.as_path()),
+            manual: false,
+            no_service: false,
+            record_install_dir: true,
+            service_target: Target::Systemd,
+        });
+        let text = plan_text(plan.service.as_ref().expect("service plan"));
+        assert!(
+            text.contains(&format!("--conf \"{}\"", installed.display())),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1379,7 +1404,7 @@ mod tests {
             plan_self_install(SelfInstallInputs {
                 install_root: root,
                 runtime: runtime(),
-                config_source: None,
+                config_path: None,
                 manual,
                 no_service,
                 record_install_dir: true,

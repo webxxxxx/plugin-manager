@@ -61,9 +61,10 @@ impl Layout {
 
 /// Resolve the config used by the daemon service.
 ///
-/// Precedence: the path passed at install/startup, then `<program dir>/svcd.conf`,
-/// then `<config>/svcd.conf` (legacy), then a generated default written into
-/// the config directory (falling back to the program directory when the config
+/// Precedence: the path passed at install/startup, then
+/// `<program dir>/config/svcd.conf`, then `<program dir>/svcd.conf`, then
+/// `<config>/svcd.conf` (legacy), then a generated default written into the
+/// config directory (falling back to the program directory when the config
 /// directory is not writable).
 ///
 /// A chosen document is the one this process runs with: missing roots are
@@ -74,13 +75,17 @@ pub fn ensure_conf(
     settings: &mut crate::platform::settings::Settings,
     paths: &crate::platform::paths::Paths,
 ) -> Result<PathBuf, String> {
-    let program_conf = std::env::current_exe()
+    let program = std::env::current_exe()
         .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join("svcd.conf")));
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let program_conf = program.as_ref().map(|parent| parent.join("svcd.conf"));
+    let program_config_conf = program
+        .as_ref()
+        .map(|parent| parent.join("config").join("svcd.conf"));
     let config_conf = paths.config_dir.join("svcd.conf");
     // The initial paths already applied the SVCD_* overrides. Prefer them when
-    // the variable is set; otherwise an install prefix supplies the data/logs
-    // defaults (ADR-0023 folding), and finally the platform default.
+    // the variable is set; otherwise an install prefix supplies the missing
+    // roots (ADR-0023 folding), and finally the platform default.
     let (config_default, data_default, logs_default) =
         crate::platform::config_file::defaults_from_paths(settings, paths, |name| {
             std::env::var_os(name)
@@ -100,6 +105,12 @@ pub fn ensure_conf(
     } else {
         None
     }
+    .or_else(|| {
+        program_config_conf
+            .as_ref()
+            .filter(|path| path.is_file())
+            .cloned()
+    })
     .or_else(|| program_conf.as_ref().filter(|path| path.is_file()).cloned())
     .or_else(|| config_conf.is_file().then_some(config_conf.clone()));
 
@@ -203,15 +214,68 @@ fn record_install_dir(path: &Path, install_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Parse the installed `svcd.conf`, if there is one, so `--uninstall` can find
-/// an `install_dir` without a `--conf` argument (uninstall does not accept one).
+/// Parse the installed `svcd.conf`, if there is one, so reinstall and
+/// `--uninstall` can find an `install_dir` without a `--conf` argument
+/// (uninstall does not accept one). Uses the same discovery as every other
+/// process, including `<program dir>/config/svcd.conf`, so a prefixed install
+/// is found without environment variables.
 fn installed_conf_settings() -> Option<crate::platform::settings::Settings> {
-    let path = ambient_paths(None).config_dir.join("svcd.conf");
+    // Discover with the normal precedence, then parse the document itself:
+    // install and uninstall follow the roots recorded in the file, not the
+    // operator's shell environment (ADR-0004).
+    let (_, path) = crate::platform::settings::load(None).ok()?;
+    let path = path?;
+    if !path.is_file() {
+        return None;
+    }
     let text = fs::read_to_string(&path).ok()?;
     let mut settings =
         crate::platform::settings::parse(&text, path.parent().unwrap_or(Path::new("."))).ok()?;
     crate::platform::config_file::fill_missing(&mut settings);
     Some(settings)
+}
+
+/// The installed document for a known prefix.
+///
+/// The Windows uninstall helper runs from the temp directory, so
+/// current_exe() no longer points at the install tree. The caller passes
+/// --prefix to the helper; read the document from the prefixed layout directly
+/// before falling back to the normal discovery.
+fn installed_conf_settings_for(
+    prefix: Option<&Path>,
+) -> Option<crate::platform::settings::Settings> {
+    if let Some(prefix) = prefix {
+        for path in [
+            prefix.join("config").join("svcd.conf"),
+            prefix.join("svcd.conf"),
+        ] {
+            if !path.is_file() {
+                continue;
+            }
+            let text = fs::read_to_string(&path).ok()?;
+            let mut settings =
+                crate::platform::settings::parse(&text, path.parent().unwrap_or(Path::new(".")))
+                    .ok()?;
+            crate::platform::config_file::fill_missing(&mut settings);
+            return Some(settings);
+        }
+    }
+    installed_conf_settings()
+}
+
+/// Keep a discovered install prefix across the Windows helper process.
+fn helper_args(args: &[String], prefix: Option<&Path>) -> Vec<String> {
+    let mut helper = args.to_vec();
+    let has_prefix = args
+        .iter()
+        .any(|arg| arg == "--prefix" || arg.starts_with("--prefix="));
+    if !has_prefix {
+        if let Some(prefix) = prefix {
+            helper.push("--prefix".into());
+            helper.push(prefix.display().to_string());
+        }
+    }
+    helper
 }
 
 /// `svcd start`: start the installed system service. User mode is handled by
@@ -478,11 +542,14 @@ pub fn self_install(args: &[String]) -> i32 {
     settings.data_dir = Some(runtime.data.clone());
     settings.logs_dir = Some(runtime.logs.clone());
     let record_root = prefix_requested || (prepared.is_some() && settings.install_dir.is_some());
+    // The service and the launcher must use the installed document, not the
+    // --conf source it was copied from: the source may be temporary.
+    let installed_conf = runtime.conf();
     // One plan decides for both the dry run and the real run (#207).
     let plan = plan_self_install(SelfInstallInputs {
         install_root: &install_root,
         runtime,
-        config_source: prepared.as_ref().map(|(_, _, source)| source.as_path()),
+        config_path: Some(installed_conf.as_path()),
         manual: request.manual,
         no_service: request.no_service,
         record_install_dir: record_root,
@@ -1428,12 +1495,20 @@ fn spawn_uninstall_helper(args: &[String]) -> i32 {
     }
 }
 
-fn self_uninstall_user(request: SelfRequest, stop_daemon: &dyn Fn()) -> i32 {
-    let ambient = ambient_paths(None);
-    let data = std::env::var_os("SVCD_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or(ambient.data_dir.clone());
-    let install_root = request.prefix.clone().unwrap_or_else(|| data.join("bin"));
+fn self_uninstall_user(
+    request: SelfRequest,
+    installed: Option<&crate::platform::settings::Settings>,
+    stop_daemon: &dyn Fn(),
+) -> i32 {
+    let runtime = installed
+        .map(|settings| {
+            crate::platform::paths::Paths::resolve_with(settings, |name| std::env::var_os(name))
+        })
+        .unwrap_or_else(|| ambient_paths(None));
+    let install_root = request
+        .prefix
+        .clone()
+        .unwrap_or_else(|| runtime.data_dir.join("bin"));
     let target_name = if cfg!(windows) { "svcd.exe" } else { "svcd" };
     let target = install_root.join(target_name);
     if request.dry_run {
@@ -1517,17 +1592,9 @@ fn self_uninstall_user(request: SelfRequest, stop_daemon: &dyn Fn()) -> i32 {
     let launcher = install_root.join(launcher_name());
     let _ = fs::remove_file(launcher);
     if request.purge {
-        for dir in [
-            std::env::var_os("SVCD_CONFIG_DIR")
-                .map(PathBuf::from)
-                .unwrap_or(ambient.config_dir),
-            data,
-            std::env::var_os("SVCD_LOG_DIR")
-                .map(PathBuf::from)
-                .unwrap_or(ambient.logs_dir),
-        ] {
+        for dir in [&runtime.config_dir, &runtime.data_dir, &runtime.logs_dir] {
             if dir.exists() {
-                let _ = fs::remove_dir_all(&dir);
+                let _ = fs::remove_dir_all(dir);
                 println!("removed {}", dir.display());
             }
         }
@@ -1538,7 +1605,7 @@ fn self_uninstall_user(request: SelfRequest, stop_daemon: &dyn Fn()) -> i32 {
 }
 
 pub fn self_uninstall(args: &[String], stop_daemon: &dyn Fn()) -> i32 {
-    let request = match parse_self(args, true) {
+    let mut request = match parse_self(args, true) {
         Ok(request) => request,
         Err(message) => {
             eprintln!("svcd: {}", message);
@@ -1546,29 +1613,32 @@ pub fn self_uninstall(args: &[String], stop_daemon: &dyn Fn()) -> i32 {
             return EXIT_USAGE;
         }
     };
+    let installed = installed_conf_settings_for(request.prefix.as_deref());
+    if request.prefix.is_none() {
+        request.prefix = installed
+            .as_ref()
+            .and_then(|settings| settings.install_dir.clone());
+    }
+    // A Windows helper may run from the temp directory, so carry the prefix
+    // explicitly instead of relying on program-directory discovery.
+    let child_args = helper_args(args, request.prefix.as_deref());
     #[cfg(windows)]
     if crate::platform::paths::user_mode()
         && !request.dry_run
         && self_uninstall_current(&request)
         && !current_is_uninstaller(&request)
     {
-        if let Some(code) = spawn_dedicated_uninstaller(&request, args) {
+        if let Some(code) = spawn_dedicated_uninstaller(&request, &child_args) {
             return code;
         }
-        return spawn_uninstall_helper(args);
+        return spawn_uninstall_helper(&child_args);
     }
     if crate::platform::paths::user_mode() {
-        return self_uninstall_user(request, stop_daemon);
+        return self_uninstall_user(request, installed.as_ref(), stop_daemon);
     }
-    let installed = installed_conf_settings();
     let install_root = request
         .prefix
         .clone()
-        .or_else(|| {
-            installed
-                .as_ref()
-                .and_then(|settings| settings.install_dir.clone())
-        })
         .unwrap_or_else(default_install_prefix);
     let runtime = current_runtime_dirs(installed.as_ref());
     let target_name = if cfg!(windows) { "svcd.exe" } else { "svcd" };
