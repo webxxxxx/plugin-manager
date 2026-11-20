@@ -186,3 +186,50 @@ mod tests {
         assert!(page.next_cursor.is_none());
     }
 }
+/// The tool snapshot and the version a cursor is minted from.
+///
+/// The snapshot is built by the composition root (it needs the live registry)
+/// but the cache and its version live here, next to the pagination rules that
+/// depend on them. A bump invalidates the snapshot; a page cut from an older
+/// version is rejected by [`page`].
+#[derive(Debug, Default)]
+pub struct Catalog {
+    version: u64,
+    cache: Option<(u64, Vec<Value>)>,
+}
+
+impl Catalog {
+    pub fn new() -> Self {
+        Catalog {
+            version: 1,
+            cache: None,
+        }
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Invalidate the snapshot and move the version forward.
+    pub fn bump(&mut self) {
+        self.version = self.version.wrapping_add(1);
+        self.cache = None;
+    }
+
+    pub fn is_fresh(&self) -> bool {
+        self.cache
+            .as_ref()
+            .map(|(version, _)| *version == self.version)
+            .unwrap_or(false)
+    }
+
+    pub fn store(&mut self, tools: Vec<Value>) {
+        self.cache = Some((self.version, tools));
+    }
+
+    /// The snapshot [`store`] just wrote. Panics only if called before a store
+    /// in the current version, which the caller's freshness check rules out.
+    pub fn cached(&self) -> &[Value] {
+        &self.cache.as_ref().expect("the catalog was just stored").1
+    }
+}
