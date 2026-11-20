@@ -98,6 +98,16 @@ pub struct Settings {
     /// How the budget is spent. Absent derives the shape from the budget:
     /// below 512 MiB `tiny`, below 2 GiB `interactive`, otherwise `streaming`.
     pub workload: Option<Workload>,
+    /// Probe inputs stated by the document. Each one is taken as written and
+    /// the matching OS read is skipped, which is how a container with an
+    /// unhelpful `/proc` — or a reproduction of someone else's machine — states
+    /// its resources without an environment override.
+    pub probe_available_memory: Option<u64>,
+    /// What the memory cgroup still allows (`memory.max - memory.current`).
+    pub probe_cgroup_remaining: Option<u64>,
+    pub probe_cpus: Option<usize>,
+    pub probe_install_free_disk: Option<u64>,
+    pub probe_temp_free_disk: Option<u64>,
     /// Relocated installation root for hosts whose `/usr` is read-only and
     /// whose writable tree is limited (SR6110: only `/etc` persists). When
     /// set, `--install` puts the binary, aliases and `svcd_daemon.sh` here;
@@ -117,6 +127,17 @@ impl Settings {
     /// Runtime log directory implied by `install_dir`, if that key is set.
     pub fn install_logs_dir(&self) -> Option<PathBuf> {
         self.install_dir.as_ref().map(|dir| dir.join("logs"))
+    }
+
+    /// The probe inputs this document states; every other item is probed.
+    pub fn probe_overrides(&self) -> crate::platform::resources::ProbeOverrides {
+        crate::platform::resources::ProbeOverrides {
+            available_memory: self.probe_available_memory,
+            cgroup_remaining: self.probe_cgroup_remaining,
+            cpus: self.probe_cpus,
+            install_free_disk: self.probe_install_free_disk,
+            temp_free_disk: self.probe_temp_free_disk,
+        }
     }
 
     pub fn temp_retention(&self) -> std::time::Duration {
@@ -386,6 +407,23 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
                     "auto" => None,
                     _ => Some(parse_u64(value, "mem_budget_bytes", index)?),
                 }
+            }
+            "probe_available_memory" => {
+                settings.probe_available_memory =
+                    Some(parse_u64(value, "probe_available_memory", index)?)
+            }
+            "probe_cgroup_remaining" => {
+                settings.probe_cgroup_remaining =
+                    Some(parse_u64(value, "probe_cgroup_remaining", index)?)
+            }
+            "probe_cpus" => settings.probe_cpus = Some(parse_usize(value, "probe_cpus", index)?),
+            "probe_install_free_disk" => {
+                settings.probe_install_free_disk =
+                    Some(parse_u64(value, "probe_install_free_disk", index)?)
+            }
+            "probe_temp_free_disk" => {
+                settings.probe_temp_free_disk =
+                    Some(parse_u64(value, "probe_temp_free_disk", index)?)
             }
             "workload" => {
                 settings.workload = Some(Workload::parse(value).ok_or_else(|| {
@@ -873,6 +911,36 @@ mod document_tests {
         let error =
             parse("mem_budget_bytes = lots\n", Path::new("/etc/svcd")).expect_err("invalid");
         assert!(error.contains("mem_budget_bytes"), "{error}");
+    }
+
+    #[test]
+    fn the_probe_inputs_parse_and_become_overrides() {
+        let settings = parse(
+            "probe_available_memory = 34359738368\n\
+             probe_cgroup_remaining = 1073741824\n\
+             probe_cpus = 2\n\
+             probe_install_free_disk = 10737418240\n\
+             probe_temp_free_disk = 5368709120\n",
+            Path::new("/etc/svcd"),
+        )
+        .expect("parse");
+        let overrides = settings.probe_overrides();
+
+        assert_eq!(overrides.available_memory, Some(32 * 1024 * 1024 * 1024));
+        assert_eq!(overrides.cgroup_remaining, Some(1024 * 1024 * 1024));
+        assert_eq!(overrides.cpus, Some(2));
+        assert_eq!(overrides.install_free_disk, Some(10 * 1024 * 1024 * 1024));
+        assert_eq!(overrides.temp_free_disk, Some(5 * 1024 * 1024 * 1024));
+        assert_eq!(overrides.stated_names().len(), 5);
+
+        // Nothing stated: the probe reads every item.
+        assert!(Settings::default()
+            .probe_overrides()
+            .stated_names()
+            .is_empty());
+
+        let error = parse("probe_cpus = many\n", Path::new("/etc/svcd")).expect_err("invalid");
+        assert!(error.contains("probe_cpus"), "{error}");
     }
 
     #[test]

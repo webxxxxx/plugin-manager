@@ -94,7 +94,10 @@ MCP 不是 W3C，不要用 WPT 套；官方 SDK + 规范逐条向量就是这一
    必须能被 `settings::parse` 读回并派生出同一组限额。
 
 沙箱里的限额是**确定的**：`Config::with_paths` / `Config::with_resources` 不探测本机，
-`B` 等于编译期上限；只有 `Config::bootstrap` 读真实机器。
+`B` 等于编译期上限；只有 `Config::bootstrap` 读真实机器。集成 sandbox 里的 daemon 确实探测，
+所以断言**绝对**限额的用例必须自己钉住：要么写死那个键（`max_json_body_bytes = 1048576`），
+要么钉住探测输入（`probe_available_memory = 8589934592` → 2 GiB 预算，等价于旧的 `high`
+形状）。`tests/mcp.rs` 的 sandbox 就是后者。
 
 已覆盖的坑：`max_streams=0`、`request_stack_bytes=1`、`io_stack_bytes=1`、`idle_timeout=0`、
 `u64::MAX` 超时、`workload=huge`、`mem_budget_bytes=lots`。

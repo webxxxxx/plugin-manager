@@ -132,6 +132,17 @@ bind = 127.0.0.1:8787
 # Keys that cannot cost memory (timeouts, thread stacks, log sizes, package
 # size) keep their shape value instead of scaling with RAM.
 #
+# Every probe input can be stated instead of read. A stated item wins and the
+# matching OS read is skipped, which is how a container whose /proc lies — or a
+# reproduction of a user's machine — states its resources without an
+# environment override. `0` means "unknown" and does not fall back to a probe.
+#
+#   probe_available_memory      free memory, in bytes (also suppresses the total)
+#   probe_cgroup_remaining      what the memory cgroup still allows, in bytes
+#   probe_cpus                  online CPUs
+#   probe_install_free_disk     free space on the installation volume, in bytes
+#   probe_temp_free_disk        free space on the temporary volume, in bytes
+#
 # A trailing `# comment` is allowed after a value when the hash is preceded by
 # whitespace, which is what `svc config tune` writes.
 #
@@ -187,6 +198,11 @@ bind = 127.0.0.1:8787
 # log_to_file = on
 # mem_budget_bytes = auto
 # workload = interactive
+# probe_available_memory = 8589934592
+# probe_cgroup_remaining = 1073741824
+# probe_cpus = 4
+# probe_install_free_disk = 10737418240
+# probe_temp_free_disk = 5368709120
 # request_stack_bytes = 196608
 # io_stack_bytes = 98304
 # blocking_threads = 2

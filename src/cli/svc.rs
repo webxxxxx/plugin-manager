@@ -463,7 +463,10 @@ fn resources_command(config: &Config, json: bool) -> i32 {
         }
         return EXIT_OK;
     }
-    print!("{}", tune::resources_text(&snapshot, origin));
+    print!(
+        "{}",
+        tune::resources_text(&snapshot, origin, &config.settings.probe_overrides())
+    );
     EXIT_OK
 }
 

@@ -137,12 +137,25 @@ pub fn config_text(limits: &Limits, report: &ResourceReport) -> String {
 }
 
 /// `svc status --resources`: the last start's snapshot, explained.
-pub fn resources_text(snapshot: &Value, origin: &str) -> String {
+pub fn resources_text(
+    snapshot: &Value,
+    origin: &str,
+    stated: &crate::platform::resources::ProbeOverrides,
+) -> String {
     let mut out = format!("source:  {}\n", origin);
     for line in describe_snapshot(snapshot) {
         out.push_str(&line);
         out.push('\n');
     }
+    let names = stated.stated_names();
+    out.push_str(&format!(
+        "stated:  {}\n",
+        if names.is_empty() {
+            "none (every input was probed)".to_string()
+        } else {
+            names.join(", ")
+        }
+    ));
     out
 }
 
@@ -254,11 +267,28 @@ mod tests {
     #[test]
     fn the_status_text_comes_from_the_snapshot() {
         let (_limits, report) = derived(machine(), Settings::default());
-        let text = resources_text(&report.to_json(), "last start");
+        let text = resources_text(
+            &report.to_json(),
+            "last start",
+            &crate::platform::resources::ProbeOverrides::default(),
+        );
 
         assert!(text.contains("source:  last start"));
         assert!(text.contains("workload: interactive (derived)"));
         assert!(text.contains("overrides: none"));
+        assert!(text.contains("stated:  none"));
+    }
+
+    #[test]
+    fn a_stated_probe_input_is_named_in_the_status_text() {
+        let (_limits, report) = derived(machine(), Settings::default());
+        let stated = crate::platform::resources::ProbeOverrides {
+            available_memory: Some(4 * 1024 * 1024 * 1024),
+            ..Default::default()
+        };
+        let text = resources_text(&report.to_json(), "last start", &stated);
+
+        assert!(text.contains("stated:  probe_available_memory"), "{text}");
     }
 
     #[test]
@@ -268,7 +298,11 @@ mod tests {
             ..Settings::default()
         };
         let (_limits, report) = derived(machine(), settings);
-        let text = resources_text(&report.to_json(), "last start");
+        let text = resources_text(
+            &report.to_json(),
+            "last start",
+            &crate::platform::resources::ProbeOverrides::default(),
+        );
 
         assert!(text.contains("override: max_body_bytes: 1073741824 ->"));
         assert!(text.contains("(above-upper-bound)"));

@@ -179,6 +179,10 @@ pub(crate) fn default_conf_text(layout: &Layout) -> String {
          # mem_budget_bytes = auto (25% of free memory, capped by MEM_LEVEL)\n\
          # workload = tiny | interactive | streaming (default: from the budget,\n\
          #   below 2 GiB of budget is interactive, below 512 MiB is tiny)\n\
+         # Every probe input may be stated instead of read; a stated item wins\n\
+         # and the matching OS read is skipped (0 means unknown):\n\
+         # probe_available_memory / probe_cgroup_remaining / probe_cpus /\n\
+         # probe_install_free_disk / probe_temp_free_disk\n\
          # request_stack_bytes = 131072 / 196608 / 262144\n\
          # io_stack_bytes = 65536 / 98304 / 131072\n\
          # blocking_threads = 2 (default; clamped 2..8). The blocking pool\n\

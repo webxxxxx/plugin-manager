@@ -138,7 +138,7 @@ impl Config {
     ) -> Config {
         let paths = Paths::resolve(settings);
         let probe_paths = ProbePaths::host(&paths.data_dir, &paths.temp_dir);
-        let profile = resources::probe(machine, &probe_paths);
+        let profile = resources::probe(machine, &probe_paths, &settings.probe_overrides());
         Self::with_resources(settings.clone(), settings_path, paths, &profile)
     }
 
@@ -284,6 +284,22 @@ mod tests {
             config.resources.profile.install_free_disk,
             Some(10 * 1024 * 1024 * 1024)
         );
+    }
+
+    #[test]
+    fn a_stated_probe_input_decides_the_budget_instead_of_this_machine() {
+        // The user's requirement: a configured resource is the truth, and the
+        // matching OS read does not happen. The injected machine says "64 GiB";
+        // the document says 1 GiB and that is what the derivation uses.
+        let settings = Settings {
+            probe_available_memory: Some(1024 * 1024 * 1024),
+            ..Settings::default()
+        };
+        let config = Config::bootstrap_with(&settings, None, &Fixed(Some(64 * 1024 * 1024 * 1024)))
+            .expect("bootstrap");
+
+        assert_eq!(config.resources.budget.raw, 256 * 1024 * 1024);
+        assert_eq!(config.resources.workload, Workload::Tiny);
     }
 
     #[test]

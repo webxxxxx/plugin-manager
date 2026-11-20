@@ -127,6 +127,15 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
             note.reason.detail()
         ));
     }
+    let stated = config.settings.probe_overrides().stated_names();
+    log::svcd(&format!(
+        "svcd: probe inputs stated by svcd.conf: {}",
+        if stated.is_empty() {
+            "none".to_string()
+        } else {
+            stated.join(", ")
+        }
+    ));
     match crate::platform::limits::write_snapshot(&config.paths, &config.resources) {
         Ok(()) => {}
         Err(error) => log::svcd(&format!(

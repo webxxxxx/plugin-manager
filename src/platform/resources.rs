@@ -115,26 +115,100 @@ impl ProbePaths {
     }
 }
 
-/// Read the machine through `machine`.
+/// Resource facts the document states instead of the OS.
 ///
-/// Pure: the same injected reads always produce the same profile, so the
-/// derivation above it is reproducible from a resource description
-/// (user story 14).
-pub fn probe(machine: &dyn Machine, paths: &ProbePaths) -> ResourceProfile {
-    let meminfo = machine.read(&paths.meminfo);
-    let physical = machine.physical_memory();
-    let (available_memory, total_memory) = match physical {
-        Some((available, total)) => (Some(available), Some(total)),
-        // Linux has no cheap "available memory" API; `MemAvailable` is it.
-        None => (meminfo.as_deref().and_then(parse_mem_available), None),
+/// Every field is independent: a configured item is taken as written and the
+/// matching OS read is skipped, so a container with a wrong `/proc` — or a
+/// reproduction of a user's machine — needs no environment override. An item
+/// that is absent falls through to [`Machine`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProbeOverrides {
+    pub available_memory: Option<u64>,
+    pub cgroup_remaining: Option<u64>,
+    pub cpus: Option<usize>,
+    pub install_free_disk: Option<u64>,
+    pub temp_free_disk: Option<u64>,
+}
+
+impl ProbeOverrides {
+    /// The keys the document states, in table order, for the log and
+    /// `svc status --resources`. Provenance matters: "3 GiB" means something
+    /// different when an operator wrote it than when `/proc` did.
+    pub fn stated_names(&self) -> Vec<&'static str> {
+        [
+            ("probe_available_memory", self.available_memory.is_some()),
+            ("probe_cgroup_remaining", self.cgroup_remaining.is_some()),
+            ("probe_cpus", self.cpus.is_some()),
+            ("probe_install_free_disk", self.install_free_disk.is_some()),
+            ("probe_temp_free_disk", self.temp_free_disk.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, stated)| stated.then_some(name))
+        .collect()
+    }
+}
+
+/// Read the machine through `machine`, unless the document already states the
+/// answer.
+///
+/// Pure: the same injected reads (and the same [`ProbeOverrides`]) always
+/// produce the same profile, so the derivation above it is reproducible from a
+/// resource description (user story 14).
+pub fn probe(
+    machine: &dyn Machine,
+    paths: &ProbePaths,
+    overrides: &ProbeOverrides,
+) -> ResourceProfile {
+    let (available_memory, total_memory) = match overrides.available_memory {
+        // A stated 0 means "unknown", and still never falls back to a probe.
+        Some(0) => (None, None),
+        // A stated budget input wins, and the total is not probed either: the
+        // two come from one OS call and a mixed pair would misreport the
+        // percentage.
+        Some(configured) => (Some(configured), None),
+        None => available_from_the_os(machine, paths),
     };
     ResourceProfile {
         available_memory: available_memory.filter(|bytes| *bytes > 0),
         total_memory: total_memory.filter(|bytes| *bytes > 0),
-        cgroup_remaining: cgroup_remaining(machine, paths),
-        cpus: machine.cpu_count().filter(|cpus| *cpus > 0),
-        install_free_disk: machine.free_disk(&paths.install_dir),
-        temp_free_disk: machine.free_disk(&paths.temp_dir),
+        cgroup_remaining: stated(overrides.cgroup_remaining, || {
+            cgroup_remaining(machine, paths)
+        }),
+        cpus: stated(overrides.cpus, || machine.cpu_count()),
+        install_free_disk: stated(overrides.install_free_disk, || {
+            machine.free_disk(&paths.install_dir)
+        }),
+        temp_free_disk: stated(overrides.temp_free_disk, || {
+            machine.free_disk(&paths.temp_dir)
+        }),
+    }
+}
+
+/// One probe item: a stated value wins (and `0` means "unknown"), an unstated
+/// one asks the machine.
+fn stated<T: Default + PartialEq>(
+    stated: Option<T>,
+    probed: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    match stated {
+        Some(value) if value != T::default() => Some(value),
+        Some(_) => None,
+        None => probed(),
+    }
+}
+
+/// `(available, total)` from the OS: the Windows API reports both, Linux has
+/// only `MemAvailable` in `/proc/meminfo`.
+fn available_from_the_os(machine: &dyn Machine, paths: &ProbePaths) -> (Option<u64>, Option<u64>) {
+    match machine.physical_memory() {
+        Some((available, total)) => (Some(available), Some(total)),
+        None => (
+            machine
+                .read(&paths.meminfo)
+                .as_deref()
+                .and_then(parse_mem_available),
+            None,
+        ),
     }
 }
 
@@ -526,7 +600,7 @@ mod tests {
                 "/sys/fs/cgroup/system.slice/svcd.service/memory.current",
                 "268435456\n",
             );
-        let profile = probe(&machine, &paths());
+        let profile = probe(&machine, &paths(), &ProbeOverrides::default());
 
         assert_eq!(profile.available_memory, Some(GIB));
         assert_eq!(profile.cgroup_remaining, Some(768 * MIB));
@@ -539,7 +613,7 @@ mod tests {
             .with_file("/proc/meminfo", "MemAvailable: 1048576 kB\n")
             .with_file("/proc/self/cgroup", "0::/\n")
             .with_file("/sys/fs/cgroup/memory.max", "max\n");
-        let profile = probe(&machine, &paths());
+        let profile = probe(&machine, &paths(), &ProbeOverrides::default());
 
         assert_eq!(profile.cgroup_remaining, None);
         assert_eq!(profile.headroom(), Some(GIB));
@@ -551,14 +625,14 @@ mod tests {
             "/proc/self/cgroup",
             "4:memory:/user.slice\n2:cpu:/user.slice\n",
         );
-        let profile = probe(&machine, &paths());
+        let profile = probe(&machine, &paths(), &ProbeOverrides::default());
 
         assert_eq!(profile.cgroup_remaining, None);
     }
 
     #[test]
     fn a_probe_that_reads_nothing_yields_an_empty_profile() {
-        let profile = probe(&Fake::default(), &paths());
+        let profile = probe(&Fake::default(), &paths(), &ProbeOverrides::default());
 
         assert_eq!(profile, ResourceProfile::default());
         assert!(profile.describe().contains("unknown"));
@@ -571,7 +645,7 @@ mod tests {
             ..Fake::default()
         }
         .with_file("/proc/meminfo", "MemAvailable: 1048576 kB\n");
-        let profile = probe(&machine, &paths());
+        let profile = probe(&machine, &paths(), &ProbeOverrides::default());
 
         assert_eq!(profile.available_memory, Some(3 * GIB));
         assert_eq!(profile.total_memory, Some(8 * GIB));
@@ -690,6 +764,84 @@ mod tests {
         assert_eq!(Workload::of_budget(2 * GIB), Workload::Streaming);
     }
 
+    /// A machine that refuses to answer: any read here is a bug, because the
+    /// document stated every input.
+    struct NoProbe;
+
+    impl Machine for NoProbe {
+        fn read(&self, path: &Path) -> Option<String> {
+            panic!("read {}: the document states this input", path.display());
+        }
+
+        fn physical_memory(&self) -> Option<(u64, u64)> {
+            panic!("physical memory: the document states it");
+        }
+
+        fn cpu_count(&self) -> Option<usize> {
+            panic!("cpu count: the document states it");
+        }
+
+        fn free_disk(&self, path: &Path) -> Option<u64> {
+            panic!("free disk {}: the document states it", path.display());
+        }
+    }
+
+    fn overrides() -> ProbeOverrides {
+        ProbeOverrides {
+            available_memory: Some(3 * GIB),
+            cgroup_remaining: Some(GIB),
+            cpus: Some(2),
+            install_free_disk: Some(9 * GIB),
+            temp_free_disk: Some(5 * GIB),
+        }
+    }
+
+    #[test]
+    fn a_configured_probe_input_is_taken_as_written_and_the_os_is_not_read() {
+        let profile = probe(&NoProbe, &paths(), &overrides());
+
+        assert_eq!(profile.available_memory, Some(3 * GIB));
+        // The total comes from the same call as the availability, so stating
+        // one must not leave a real total behind: the percentage would lie.
+        assert_eq!(profile.total_memory, None);
+        assert_eq!(profile.cgroup_remaining, Some(GIB));
+        assert_eq!(profile.cpus, Some(2));
+        assert_eq!(profile.install_free_disk, Some(9 * GIB));
+        assert_eq!(profile.temp_free_disk, Some(5 * GIB));
+    }
+
+    #[test]
+    fn a_stated_zero_is_unknown_and_still_does_not_probe() {
+        let overrides = ProbeOverrides {
+            available_memory: Some(0),
+            cgroup_remaining: Some(0),
+            cpus: Some(0),
+            install_free_disk: Some(0),
+            temp_free_disk: Some(0),
+        };
+        let profile = probe(&NoProbe, &paths(), &overrides);
+
+        assert_eq!(profile, ResourceProfile::default());
+    }
+
+    #[test]
+    fn an_unstated_input_still_falls_through_to_the_machine() {
+        let machine = Fake::default()
+            .with_file("/proc/meminfo", "MemAvailable: 2097152 kB\n")
+            .with_file("/proc/self/cgroup", "0::/\n")
+            .with_file("/sys/fs/cgroup/memory.max", "1073741824\n");
+        let overrides = ProbeOverrides {
+            cpus: Some(2),
+            ..ProbeOverrides::default()
+        };
+        let profile = probe(&machine, &paths(), &overrides);
+
+        assert_eq!(profile.available_memory, Some(2 * GIB));
+        assert_eq!(profile.cgroup_remaining, Some(GIB));
+        // Stated: the fake has no cpu count of its own, and 2 is what we get.
+        assert_eq!(profile.cpus, Some(2));
+    }
+
     /// Supplementary only: the fake-file tests above are the main path on both
     /// platforms. This one proves the real host read works at all.
     #[cfg(target_os = "linux")]
@@ -697,7 +849,11 @@ mod tests {
     fn the_host_reads_this_kernels_memory_facts() {
         let machine = Host;
         let root = crate::test_support::temp_dir();
-        let profile = probe(&machine, &ProbePaths::host(&root, &root));
+        let profile = probe(
+            &machine,
+            &ProbePaths::host(&root, &root),
+            &ProbeOverrides::default(),
+        );
 
         assert!(profile.cpus.is_some(), "cpus: {:?}", profile);
         if Path::new("/proc/meminfo").is_file() {
@@ -714,7 +870,11 @@ mod tests {
     fn the_host_reads_this_machines_physical_memory() {
         let machine = Host;
         let root = crate::test_support::temp_dir();
-        let profile = probe(&machine, &ProbePaths::host(&root, &root));
+        let profile = probe(
+            &machine,
+            &ProbePaths::host(&root, &root),
+            &ProbeOverrides::default(),
+        );
 
         let available = profile.available_memory.expect("GlobalMemoryStatusEx");
         let total = profile.total_memory.expect("GlobalMemoryStatusEx");
