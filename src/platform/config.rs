@@ -169,6 +169,8 @@ impl Config {
         machine: &dyn Machine,
     ) -> Config {
         let paths = Paths::resolve(settings);
+        // Packages are installed under data_dir, so that root is the "install"
+        // volume; temp is its derived data/temp child. logs_dir is not probed.
         let probe_paths = ProbePaths::host(&paths.data_dir, &paths.temp_dir);
         let profile = resources::probe(machine, &probe_paths, &settings.probe_overrides());
         Self::with_resources(settings.clone(), settings_path, paths, &profile)
