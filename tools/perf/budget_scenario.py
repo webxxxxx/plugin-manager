@@ -403,36 +403,65 @@ for line in sys.stdin:
 """
 
 
-def write_fixture(root):
+SHELL_AGENT = """#!/bin/bash
+# NDJSON agent with no interpreter: the Linux fixture should not pay for a
+# Python process per plugin. Bash parameter expansion keeps the id parse cheap.
+while IFS= read -r line; do
+  rest=${line#*id*:}
+  id=${rest%%[!0-9]*}
+  if [ -z "$id" ]; then id=1; fi
+  case "$line" in
+    *svcd.ping*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+      ;;
+    *tools/call*)
+      printf '{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":{"tick":1}}}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok"}],"isError":false}}\n' "$id"
+      ;;
+    *)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+      ;;
+  esac
+done
+"""
+
+
+def write_fixture(root, runtime="python"):
     fixture = root / "plugin"
     (fixture / "payload" / "bin").mkdir(parents=True, exist_ok=True)
     (fixture / "payload" / "web").mkdir(parents=True, exist_ok=True)
-    (fixture / "payload" / "bin" / "agent.py").write_text(AGENT, encoding="utf-8")
     manifest = {
         "schema": 1,
         "name": "budget",
         "version": "1.0.0",
         "desc": "budget scenario fixture",
         "protocol": 1,
-        "exec": {
-            "path": "payload/bin/agent.cmd" if WIN else "payload/bin/agent.sh",
-            "ready": "notify",
-        },
+        "exec": {"path": "payload/bin/agent.sh", "ready": "notify"},
         "capabilities": [{"name": "echo", "desc": "echo", "inputSchema": {"type": "object"}}],
         "ui": {"type": "web", "entry": "index.html"},
     }
+    if runtime == "shell":
+        if WIN:
+            raise SystemExit("the shell plugin runtime is Unix-only")
+        script = fixture / "payload" / "bin" / "agent.sh"
+        script.write_text(SHELL_AGENT, encoding="utf-8")
+        script.chmod(0o755)
+    else:
+        (fixture / "payload" / "bin" / "agent.py").write_text(AGENT, encoding="utf-8")
+        if WIN:
+            manifest["exec"]["path"] = "payload/bin/agent.cmd"
+        else:
+            script = fixture / "payload" / "bin" / "agent.sh"
+            script.write_text('#!/bin/sh\nexec python3 "$(dirname "$0")/agent.py"\n', encoding="utf-8")
+            script.chmod(0o755)
     (fixture / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     (fixture / "payload" / "web" / "index.html").write_text(
         "<!doctype html><html><body>budget</body></html>\n", encoding="utf-8"
     )
-    if WIN:
+    if runtime != "shell" and WIN:
         (fixture / "payload" / "bin" / "agent.cmd").write_text(
             '@echo off\r\npython "%~dp0agent.py"\r\n', encoding="utf-8", newline=""
         )
-    else:
-        script = fixture / "payload" / "bin" / "agent.sh"
-        script.write_text('#!/bin/sh\nexec python3 "$(dirname "$0")/agent.py"\n', encoding="utf-8")
-        script.chmod(0o755)
     return fixture
 
 
@@ -835,8 +864,10 @@ def op_ws(address, plugin_id, sequence, tokens):
 
 
 def op_upload(address, plugin_id, sequence, blobs):
-    seed = ("%s:%d:" % (plugin_id, sequence)).encode("ascii")
-    body = seed + b"x" * (8192 - len(seed))
+    # One constant body per plugin: the blob store dedupes it, so a 60 s run at
+    # 1000 workers cannot fill the disk, while the write path is still exercised.
+    seed = ("%s:" % plugin_id).encode("ascii")
+    body = seed + b"x" * (4096 - len(seed))
     status, headers, _ = http_request(
         address, "POST", "/api/v1/blobs",
         {"content-type": "application/octet-stream"}, body, timeout=15,
@@ -871,13 +902,20 @@ def execute(address, token, plugin_id, op, sequence, blobs, tokens):
     return op_download(address, plugin_id, sequence, blobs)
 
 
-def run_traffic(address, token, plugins, duration, concurrency):
-    schedule = [(plugin, op) for plugin in plugins for op in OPS]
-    cursor = [0]
+def run_traffic(address, token, plugins, duration, global_concurrency, per_plugin, think_ms):
+    """Drive every plugin through all five surfaces.
+
+    per_plugin > 0 pins that many workers to each plugin (10 x 50 = 500, 10 x
+    100 = 1000); otherwise global_concurrency workers share one round-robin
+    schedule. Peak in-flight counts are tracked per surface, which is the
+    connection concurrency the daemon actually admitted.
+    """
     guard = threading.Lock()
     deadline = time.monotonic() + duration
     blobs = {}
     tokens = {}
+    for plugin in plugins:
+        plugin_token(address, plugin, tokens)
     results = {
         plugin: {
             op: {
@@ -888,6 +926,26 @@ def run_traffic(address, token, plugins, duration, concurrency):
         }
         for plugin in plugins
     }
+    active = {op: 0 for op in OPS}
+    peak = {op: 0 for op in OPS}
+    peak_total = [0]
+    global_ = {
+        op: {"attempts": 0, "ok": 0, "errors": 0, "statuses": {}, "latencies": []}
+        for op in OPS
+    }
+
+    def enter(op):
+        with guard:
+            active[op] += 1
+            if active[op] > peak[op]:
+                peak[op] = active[op]
+            total = sum(active.values())
+            if total > peak_total[0]:
+                peak_total[0] = total
+
+    def leave(op):
+        with guard:
+            active[op] -= 1
 
     def record(plugin, op, ok, status, elapsed, detail):
         bucket = results[plugin][op]
@@ -895,32 +953,89 @@ def run_traffic(address, token, plugins, duration, concurrency):
             bucket["attempts"] += 1
             bucket["statuses"][str(status)] = bucket["statuses"].get(str(status), 0) + 1
             bucket["details"][str(detail)] = bucket["details"].get(str(detail), 0) + 1
+            overall = global_[op]
+            overall["attempts"] += 1
+            overall["statuses"][str(status)] = overall["statuses"].get(str(status), 0) + 1
             if ok:
                 bucket["ok"] += 1
+                bucket["latencies"].append(elapsed * 1000)
+                overall["ok"] += 1
+                overall["latencies"].append(elapsed * 1000)
             else:
                 bucket["errors"] += 1
-            bucket["latencies"].append(elapsed * 1000)
+                overall["errors"] += 1
 
-    def worker():
+    def run_one(plugin, op, sequence):
+        enter(op)
+        began = time.monotonic()
+        try:
+            ok, status, detail = execute(address, token, plugin, op, sequence, blobs, tokens)
+        except Exception as error:  # noqa: BLE001 - reported, not swallowed
+            ok, status, detail = False, type(error).__name__, str(error)
+        elapsed = time.monotonic() - began
+        leave(op)
+        record(plugin, op, ok, status, elapsed, detail)
+        if think_ms > 0:
+            time.sleep(think_ms / 1000.0)
+
+    def plugin_worker(plugin):
+        sequence = 0
+        while time.monotonic() < deadline:
+            op = OPS[sequence % len(OPS)]
+            sequence += 1
+            run_one(plugin, op, sequence)
+
+    schedule = [(plugin, op) for plugin in plugins for op in OPS]
+    cursor = [0]
+
+    def global_worker():
         while time.monotonic() < deadline:
             with guard:
                 index = cursor[0]
                 cursor[0] += 1
             plugin, op = schedule[index % len(schedule)]
-            began = time.monotonic()
-            try:
-                ok, status, detail = execute(address, token, plugin, op, index, blobs, tokens)
-            except Exception as error:  # noqa: BLE001 - reported, not swallowed
-                ok, status, detail = False, type(error).__name__, str(error)
-            record(plugin, op, ok, status, time.monotonic() - began, detail)
-            time.sleep(0.005)
+            run_one(plugin, op, index)
 
-    threads = [threading.Thread(target=worker, daemon=True) for _ in range(concurrency)]
+    if per_plugin > 0:
+        workers = per_plugin * len(plugins)
+        threads = []
+        for plugin in plugins:
+            for _ in range(per_plugin):
+                threads.append(threading.Thread(target=plugin_worker, args=(plugin,), daemon=True))
+    else:
+        workers = global_concurrency
+        threads = [threading.Thread(target=global_worker, daemon=True) for _ in range(global_concurrency)]
+    if workers > 200:
+        try:
+            threading.stack_size(256 * 1024)
+        except (ValueError, RuntimeError):
+            pass
+    began = time.monotonic()
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
-    return results
+    elapsed = time.monotonic() - began
+    for plugin in plugins:
+        for op in OPS:
+            bucket = results[plugin][op]
+            bucket["latency"] = summarize(bucket.pop("latencies"))
+    for op in OPS:
+        overall = global_[op]
+        overall["latency"] = summarize(overall.pop("latencies"))
+        overall["rps"] = overall["ok"] / elapsed if elapsed else 0
+    total_ok = sum(global_[op]["ok"] for op in OPS)
+    total_attempts = sum(global_[op]["attempts"] for op in OPS)
+    return results, {
+        "elapsed_seconds": elapsed,
+        "workers": workers,
+        "peak_active": peak,
+        "peak_total": peak_total[0],
+        "summary": global_,
+        "total_ok": total_ok,
+        "total_attempts": total_attempts,
+        "total_rps": total_ok / elapsed if elapsed else 0,
+    }
 
 
 def oversubscribe(address, plugins, hold=1.5):
@@ -989,20 +1104,27 @@ def render_report(result):
     effective = result.get("effective") or {}
     traffic = result.get("traffic") or {}
     resource = result.get("resources") or {}
+    requested = result.get("requested") or {}
+    meta = result.get("traffic_meta") or {}
+    summary = meta.get("summary") or {}
     lines = []
     lines.append("# Memory-budget scenario: %d plugins, B=%s" % (
-        result["requested"]["plugins"], result["requested"]["budget_text"]))
+        requested.get("plugins"), requested.get("budget_text")))
     lines.append("")
     lines.append("Generated: " + result["generated_at"])
     lines.append("")
     lines.append("- OS: %s" % result["environment"]["os"])
     lines.append("- CPU: %s x%d" % (result["environment"]["cpu"], result["environment"]["cpus"]))
     lines.append("- Requested budget: %d bytes (%s)" % (
-        result["requested"]["budget_bytes"], result["requested"]["budget_text"]))
+        requested.get("budget_bytes"), requested.get("budget_text")))
     lines.append("- Effective budget: %s bytes, workload %s, worst case %s bytes" % (
         effective.get("budget_quantized"), effective.get("workload"), effective.get("worst_case")))
-    lines.append("- Duration: %ss, concurrency %s" % (
-        result["requested"]["duration"], result["requested"]["concurrency"]))
+    lines.append("- Plugin runtime: %s" % requested.get("plugin_runtime", "auto"))
+    lines.append("- Duration: %.2fs, workers %s (per plugin %s), think %sms" % (
+        meta.get("elapsed_seconds", 0), meta.get("workers", 0),
+        requested.get("per_plugin_concurrency", 0), requested.get("think_ms", 0)))
+    lines.append("- Ops: %s ok / %s attempts, %.1f ops/s" % (
+        meta.get("total_ok", 0), meta.get("total_attempts", 0), meta.get("total_rps", 0)))
     lines.append("")
     lines.append("## Derived limits")
     lines.append("")
@@ -1013,7 +1135,7 @@ def render_report(result):
                 "max_complete_body_bytes", "max_body_bytes"):
         lines.append("| %s | %s |" % (key, result["limits"].get(key, "")))
     lines.append("")
-    lines.append("## Traffic")
+    lines.append("## Traffic per plugin (ok/attempts)")
     lines.append("")
     lines.append("| plugin | " + " | ".join(OPS) + " |")
     lines.append("| --- | " + " | ".join("---:" for _ in OPS) + " |")
@@ -1024,7 +1146,57 @@ def render_report(result):
             cells.append("%d/%d" % (bucket["ok"], bucket["attempts"]))
         lines.append("| %s | %s |" % (plugin, " | ".join(cells)))
     lines.append("")
-    lines.append("Cells are ok/attempts.")
+    lines.append("## Throughput and latency")
+    lines.append("")
+    lines.append("| surface | attempts | ok | errors | rps | p50 ms | p95 ms | p99 ms | max ms | peak concurrent |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    peak = meta.get("peak_active") or {}
+    for op in OPS:
+        item = summary.get(op) or {}
+        latency = item.get("latency") or {}
+        lines.append("| %s | %s | %s | %s | %.1f | %.1f | %.1f | %.1f | %.1f | %s |" % (
+            op, item.get("attempts", 0), item.get("ok", 0), item.get("errors", 0),
+            item.get("rps", 0), latency.get("p50", 0), latency.get("p95", 0),
+            latency.get("p99", 0), latency.get("max", 0), peak.get(op, 0)))
+    lines.append("")
+    lines.append("## Connections")
+    lines.append("")
+    lines.append("| item | value |")
+    lines.append("| --- | ---: |")
+    lines.append("| peak in-flight total | %s |" % meta.get("peak_total", 0))
+    for op in OPS:
+        lines.append("| peak %s | %s |" % (op, peak.get(op, 0)))
+    lines.append("| max_connections | %s |" % result["limits"].get("max_connections", ""))
+    lines.append("| max_connections_per_ip | %s |" % result["limits"].get("max_connections_per_ip", ""))
+    lines.append("| max_streams | %s |" % result["limits"].get("max_streams", ""))
+    lines.append("| max_subscriptions | %s |" % result["limits"].get("max_subscriptions", ""))
+    lines.append("")
+    lines.append("## Resources")
+    lines.append("")
+    lines.append("| sample | avg | max |")
+    lines.append("| --- | ---: | ---: |")
+    for key, label, unit in (
+        ("daemon_rss", "daemon RSS MB", MIB),
+        ("spk_rss", "spk RSS MB", MIB),
+        ("tree_rss", "process tree RSS MB", MIB),
+        ("daemon_threads", "daemon threads", 1),
+        ("tree_threads", "process tree threads", 1),
+        ("processes", "processes", 1),
+    ):
+        item = resource.get(key) or {"avg": 0, "max": 0}
+        lines.append("| %s | %.2f | %.2f |" % (
+            label, item["avg"] / unit, item["max"] / unit))
+    lines.append("")
+    lines.append("- daemon CPU (one core): %.2f%%" % resource.get("daemon_cpu_percent", 0))
+    lines.append("- process tree CPU (one core): %.2f%%" % resource.get("tree_cpu_percent", 0))
+    lines.append("- RSS samples: %s (every 2s)" % resource.get("samples", 0))
+    if result.get("oversubscription", {}).get("sse"):
+        lines.append("")
+        lines.append("## Oversubscription")
+        lines.append("")
+        lines.append("- SSE probes: %s" % result["oversubscription"]["sse"])
+        lines.append("- WS probes: %s" % result["oversubscription"]["ws"])
+        lines.append("- recovery invoke: %s" % result["oversubscription"]["recovery"])
     failures = []
     for plugin in traffic:
         for op in OPS:
@@ -1039,36 +1211,14 @@ def render_report(result):
         lines.append("")
         lines.extend(failures)
     lines.append("")
-    lines.append("## Resources")
-    lines.append("")
-    lines.append("| sample | avg MB | max MB |")
-    lines.append("| --- | ---: | ---: |")
-    daemon_rss = resource.get("daemon_rss") or {"avg": 0, "max": 0}
-    tree_rss = resource.get("tree_rss") or {"avg": 0, "max": 0}
-    lines.append("| daemon RSS | %.2f | %.2f |" % (
-        daemon_rss["avg"] / MIB, daemon_rss["max"] / MIB))
-    lines.append("| process tree RSS | %.2f | %.2f |" % (
-        tree_rss["avg"] / MIB, tree_rss["max"] / MIB))
-    lines.append("")
-    lines.append("- daemon threads max: %s" % resource.get("daemon_threads_max"))
-    lines.append("- daemon CPU (one core): %.2f%%" % resource.get("daemon_cpu_percent", 0))
-    lines.append("- process tree CPU (one core): %.2f%%" % resource.get("tree_cpu_percent", 0))
-    lines.append("")
-    lines.append("## Oversubscription")
-    lines.append("")
-    lines.append("- SSE probes: %s" % result["oversubscription"]["sse"])
-    lines.append("- WS probes: %s" % result["oversubscription"]["ws"])
-    lines.append("- recovery invoke: %s" % result["oversubscription"]["recovery"])
-    lines.append("")
     lines.append("## Health")
     lines.append("")
     health = result.get("health") or {}
     lines.append("- daemon alive at end: %s" % health.get("daemon_alive"))
     lines.append("- services running: %s/%s" % (
         health.get("running"), health.get("expected")))
-    coverage = health.get("coverage")
-    lines.append("- coverage complete (every plugin x op): %s" % (
-        "n/a (idle)" if coverage is None else coverage))
+    lines.append("- coverage: %s (strict every plugin x op: %s)" % (
+        health.get("coverage"), health.get("coverage_strict")))
     lines.append("- statuses: %s" % json.dumps(health.get("statuses") or {}, sort_keys=True))
     lines.append("")
     return "\n".join(lines)
@@ -1098,7 +1248,14 @@ def main():
     parser.add_argument("--budget-text", default=None, help="label for the requested budget")
     parser.add_argument("--plugins", type=int, default=10)
     parser.add_argument("--duration", type=float, default=60.0)
-    parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument("--concurrency", type=int, default=4,
+                        help="shared workers when --per-plugin-concurrency is 0")
+    parser.add_argument("--per-plugin-concurrency", type=int, default=0,
+                        help="workers pinned to each plugin (10 plugins x 50 = 500)")
+    parser.add_argument("--think-ms", type=float, default=20.0,
+                        help="pause after each operation, to keep a refused run from spinning")
+    parser.add_argument("--plugin-runtime", choices=("auto", "python", "shell"), default="auto",
+                        help="shell uses a bash NDJSON agent on Linux; python is the Windows fixture")
     parser.add_argument("--traffic", choices=("all", "idle"), default="all",
                         help="all drives every surface; idle only boots the plugins and samples")
     parser.add_argument("--no-oversubscribe", action="store_true")
@@ -1140,8 +1297,10 @@ def main():
     plugins = ["p%02d" % index for index in range(args.plugins)]
     budget_text = args.budget_text or ("%gmb" % (args.budget / MIB))
     log("workdir %s" % root)
-    log("requested budget %d bytes (%s), %d plugins, %ss, concurrency %d" % (
-        args.budget, budget_text, args.plugins, args.duration, args.concurrency))
+    log("requested budget %d bytes (%s), %d plugins, %ss, workers %d" % (
+        args.budget, budget_text, args.plugins, args.duration,
+        args.per_plugin_concurrency * args.plugins
+        if args.per_plugin_concurrency else args.concurrency))
 
     daemon = None
     samples = []
@@ -1160,6 +1319,13 @@ def main():
             "plugins": args.plugins,
             "duration": args.duration,
             "concurrency": args.concurrency,
+            "per_plugin_concurrency": args.per_plugin_concurrency,
+            "workers": (
+                args.per_plugin_concurrency * args.plugins
+                if args.per_plugin_concurrency else args.concurrency
+            ),
+            "think_ms": args.think_ms,
+            "plugin_runtime": args.plugin_runtime,
             "traffic": args.traffic,
         },
         "effective": None,
@@ -1171,7 +1337,12 @@ def main():
     }
     exit_code = 1
     try:
-        fixture = write_fixture(root)
+        runtime = args.plugin_runtime
+        if runtime == "auto":
+            runtime = "shell" if not WIN else "python"
+        fixture = write_fixture(root, runtime)
+        result["requested"]["plugin_runtime"] = runtime
+        log("plugin runtime %s" % runtime)
         if args.bootstrap == "direct":
             target = detect_platform()
             write_direct_layout(root, fixture, plugins, target)
@@ -1220,29 +1391,51 @@ def main():
         sampler_thread.start()
         began = time.monotonic()
         if args.traffic == "all":
-            traffic = run_traffic(
-                daemon["address"], daemon["token"], plugins, args.duration, args.concurrency
+            traffic, traffic_meta = run_traffic(
+                daemon["address"], daemon["token"], plugins, args.duration,
+                args.concurrency, args.per_plugin_concurrency, args.think_ms,
             )
         else:
             while time.monotonic() - began < args.duration:
                 time.sleep(0.5)
             traffic = {}
-        elapsed = time.monotonic() - began
+            traffic_meta = {
+                "elapsed_seconds": time.monotonic() - began,
+                "workers": 0,
+                "peak_active": {op: 0 for op in OPS},
+                "peak_total": 0,
+                "summary": {},
+                "total_ok": 0,
+                "total_attempts": 0,
+                "total_rps": 0,
+            }
+        elapsed = traffic_meta["elapsed_seconds"]
         stop.set()
         sampler_thread.join(timeout=3)
         result["traffic"] = traffic
-        log("%s window done in %.1fs" % (args.traffic, elapsed))
+        result["traffic_meta"] = traffic_meta
+        log("%s window done in %.1fs, %d ops, %.1f ops/s" % (
+            args.traffic, elapsed, traffic_meta["total_ok"], traffic_meta["total_rps"]))
 
         daemon_rss = [sample["daemon"]["rss"] for sample in samples if sample["daemon"]]
         tree_rss = [sample["tree"]["rss"] for sample in samples if sample["tree"]]
+        spk_rss = [
+            max(0, sample["tree"]["rss"] - sample["daemon"]["rss"])
+            for sample in samples if sample["daemon"] and sample["tree"]
+        ]
+        processes = [sample["tree"]["processes"] for sample in samples if sample["tree"]]
         daemon_cpu = [sample["daemon"]["cpu"] for sample in samples if sample["daemon"]]
         tree_cpu = [sample["tree"]["cpu"] for sample in samples if sample["tree"]]
         daemon_threads = [sample["daemon"]["threads"] for sample in samples if sample["daemon"]]
+        tree_threads = [sample["tree"]["threads"] for sample in samples if sample["tree"]]
         result["resources"] = {
             "samples": len(samples),
             "daemon_rss": summarize(daemon_rss),
+            "spk_rss": summarize(spk_rss),
             "tree_rss": summarize(tree_rss),
-            "daemon_threads_max": max(daemon_threads) if daemon_threads else 0,
+            "daemon_threads": summarize(daemon_threads),
+            "tree_threads": summarize(tree_threads),
+            "processes": summarize(processes),
             "daemon_cpu_percent": (
                 (daemon_cpu[-1] - daemon_cpu[0]) / elapsed * 100 if len(daemon_cpu) >= 2 else 0
             ),
@@ -1250,11 +1443,15 @@ def main():
                 (tree_cpu[-1] - tree_cpu[0]) / elapsed * 100 if len(tree_cpu) >= 2 else 0
             ),
         }
-        log("daemon RSS avg %.1f MB max %.1f MB; tree avg %.1f MB max %.1f MB" % (
+        log("daemon RSS %.1f/%.1f MB, spk RSS %.1f/%.1f MB, tree %.1f/%.1f MB, threads %d/%d" % (
             result["resources"]["daemon_rss"]["avg"] / MIB,
             result["resources"]["daemon_rss"]["max"] / MIB,
+            result["resources"]["spk_rss"]["avg"] / MIB,
+            result["resources"]["spk_rss"]["max"] / MIB,
             result["resources"]["tree_rss"]["avg"] / MIB,
             result["resources"]["tree_rss"]["max"] / MIB,
+            result["resources"]["daemon_threads"]["max"],
+            result["resources"]["tree_threads"]["max"],
         ))
 
         recovery_ok = True
@@ -1287,10 +1484,22 @@ def main():
             running = sum(
                 1 for plugin in plugins if str(states.get(plugin, "")).lower() == "running"
             )
-        coverage = None if args.traffic == "idle" else all(
-            traffic[plugin][op]["ok"] > 0
-            for plugin in plugins for op in OPS
-        )
+        strict_coverage = None
+        if args.traffic == "all":
+            strict_coverage = all(
+                traffic[plugin][op]["ok"] > 0
+                for plugin in plugins for op in OPS
+            )
+        stress = args.per_plugin_concurrency > 0
+        if args.traffic == "idle":
+            coverage = True
+        elif stress:
+            # Above the budget's derived caps the point is not "every plugin got
+            # every surface" but "the daemon stayed up and kept serving whatever
+            # the limits admitted".
+            coverage = traffic_meta["total_ok"] > 0
+        else:
+            coverage = strict_coverage
         status_counts = count_statuses(traffic)
         health = {
             "daemon_alive": daemon["process"].poll() is None,
@@ -1298,18 +1507,25 @@ def main():
             "running": running,
             "expected": len(plugins),
             "coverage": coverage,
+            "coverage_strict": strict_coverage,
+            "stress": stress,
             "statuses": status_counts,
             "recovery_ok": recovery_ok,
         }
         result["health"] = health
-        log("health alive=%s running=%d/%d coverage=%s" % (
-            health["daemon_alive"], running, len(plugins), coverage))
+        log("health alive=%s running=%d/%d coverage=%s strict=%s" % (
+            health["daemon_alive"], running, len(plugins), coverage, strict_coverage))
 
-        server_errors = [code for code in status_counts if code.startswith("5")]
+        # 503 is the expected refusal when the requested concurrency exceeds the
+        # derived caps; 500 or a crash is not.
+        server_errors = [
+            code for code in status_counts
+            if code.startswith("5") and (not stress or code != "503")
+        ]
         ok = (
             health["daemon_alive"]
             and running == len(plugins)
-            and coverage is not False
+            and coverage
             and recovery_ok
             and not server_errors
         )

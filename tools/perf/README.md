@@ -23,7 +23,8 @@ node tools/perf/run.mjs --perf     # HTTP/MCP/WS/SSE + mixed workload
 node tools/perf/run.mjs --all      # both
 node tools/perf/run.mjs --scale    # 0/5/10/30 plugins, process-tree RSS/CPU
 python3 tools/perf/budget_scenario.py \
-  --budget 50mb --plugins 10 --duration 60   # fixed mem_budget_bytes, all five faces
+  --budget 50mb --plugins 10 --duration 60 \
+  --per-plugin-concurrency 100               # 10 plugins x 100 workers, all five faces
 ```
 
 Outputs:
@@ -125,7 +126,10 @@ PowerShell 7 and a release binary; they are **not** part of `run.mjs` or
 - `budget_scenario.py` requests an explicit `mem_budget_bytes` and drives every
   plugin through invoke (MCP `tools/call`), SSE, WebSocket, blob upload and blob
   download, then opens more streams than the budget admits to check that the
-  refusals are 429/503 rather than a crash. `--traffic idle` only boots the
-  plugins and samples RSS/CPU. `--bootstrap direct` writes the registry layout
-  before boot for hosts whose control channel is unavailable; it skips signature
-  verification and staging, so leave it off on a normal host.
+  refusals are 429/503 rather than a crash. `--per-plugin-concurrency N` pins N
+  workers to each plugin (10 x 100 = 1000); `--traffic idle` only boots the
+  plugins and samples RSS/CPU. `--plugin-runtime shell` uses a bash NDJSON agent
+  on Linux (the default there; Python stays the Windows fixture).
+  `--bootstrap direct` writes the registry layout before boot for hosts whose
+  control channel is unavailable; it skips signature verification and staging,
+  so leave it off on a normal host.
