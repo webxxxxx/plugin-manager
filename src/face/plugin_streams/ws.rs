@@ -8,12 +8,11 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::face::uichannel::{Event, Subscription};
+use crate::face::uichannel::{Polled, Subscription};
 use crate::face::webui;
 use crate::server::http::{
     BlockingJob, BlockingOutcome, CloseReason, OutBuffer, StreamAction, StreamEvent, StreamHandler,
@@ -31,8 +30,7 @@ const POLL: Duration = Duration::from_millis(100);
 pub(crate) struct WsStream {
     config: PathBuf,
     plugin: String,
-    receiver: Receiver<Event>,
-    _subscription: Subscription,
+    subscription: Subscription,
     head: Vec<u8>,
     head_at: usize,
     /// Server frames waiting for the output buffer.
@@ -63,7 +61,6 @@ impl WsStream {
         config: PathBuf,
         plugin: String,
         accept: String,
-        receiver: Receiver<Event>,
         subscription: Subscription,
         limits: std::sync::Arc<crate::platform::limits::Limits>,
     ) -> WsStream {
@@ -75,8 +72,7 @@ impl WsStream {
         WsStream {
             config,
             plugin,
-            receiver,
-            _subscription: subscription,
+            subscription,
             head,
             head_at: 0,
             frames: VecDeque::new(),
@@ -160,16 +156,22 @@ impl WsStream {
             if out.remaining() == 0 {
                 return self.step(StreamAction::NeedWrite, now);
             }
-            match self.receiver.try_recv() {
-                Ok(event) => {
+            match self.subscription.poll() {
+                Polled::Event(event) => {
                     self.frames.push_back(PendingFrame::text(event.json));
                     continue;
                 }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {
-                    self.queue_close(1000, "");
+                Polled::Reset => {
+                    // The subscriber fell behind the shared ring. A page that
+                    // resumes from the front is better than a silent gap, so
+                    // tell it why the ids jump.
+                    self.frames.push_back(PendingFrame::text(
+                        r#"{"jsonrpc":"2.0","method":"notifications/reset","params":{"reason":"replay-unavailable"}}"#
+                            .to_string(),
+                    ));
                     continue;
                 }
+                Polled::Empty => {}
             }
             if self.frames.is_empty() && self.heartbeat.elapsed() >= WS_PING {
                 self.heartbeat = now;
@@ -469,12 +471,11 @@ mod tests {
 
     fn harness() -> (Arc<EventBus>, WsStream) {
         let bus = Arc::new(EventBus::new());
-        let (receiver, subscription) = bus.subscribe("demo", &test_limits()).expect("subscribe");
+        let subscription = bus.subscribe("demo", &test_limits()).expect("subscribe");
         let stream = WsStream::new(
             PathBuf::from("."),
             "demo".to_string(),
             "accept-key".to_string(),
-            receiver,
             subscription,
             test_limits(),
         );

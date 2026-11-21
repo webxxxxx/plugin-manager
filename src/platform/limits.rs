@@ -107,6 +107,13 @@ fn threads_for(max_connections: usize, blocking_threads: usize) -> usize {
     }
 }
 
+/// The one bounded UI event ring behind every plugin stream. Charged once:
+/// subscribers hold a cursor instead of a queue, so this does not grow with
+/// subscriber or plugin count.
+pub const UI_RING_BYTES: u64 = 2 * 1024 * 1024;
+/// Resident cost of one subscriber's cursor in the ring's list.
+pub const SUBSCRIBER_BYTES: u64 = 128;
+
 impl Limits {
     /// Threads the invariant charges a stack for.
     pub fn threads(&self) -> usize {
@@ -135,12 +142,14 @@ impl Limits {
         let inflight = self.ws_inflight_bytes as u64;
         let queues = (self.pending_queue as u64 + self.progress_queue as u64) * IPC_FRAME_MAX
             + self.ws_raw_queue as u64 * self.ws_raw_max_bytes as u64;
+        let ui = UI_RING_BYTES + self.max_subscriptions as u64 * SUBSCRIBER_BYTES;
         RESIDENT_BASELINE_BYTES
             .saturating_add(threads)
             .saturating_add(connections)
             .saturating_add(streams)
             .saturating_add(inflight)
             .saturating_add(queues)
+            .saturating_add(ui)
     }
 
     /// One row per term of [`Self::worst_case_bytes`], for the refusal message.
@@ -164,6 +173,10 @@ impl Limits {
                 "queued frames",
                 (self.pending_queue as u64 + self.progress_queue as u64) * IPC_FRAME_MAX
                     + self.ws_raw_queue as u64 * self.ws_raw_max_bytes as u64,
+            ),
+            (
+                "ui event ring",
+                UI_RING_BYTES + self.max_subscriptions as u64 * SUBSCRIBER_BYTES,
             ),
         ]
     }

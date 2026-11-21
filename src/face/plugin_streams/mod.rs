@@ -145,9 +145,7 @@ pub(crate) fn open_sse(
         .bus
         .subscribe_from(ui.id, last_event_id, &context.limits)
     {
-        Ok((receiver, subscription, replay)) => {
-            Box::new(sse::SseStream::new(receiver, subscription, replay))
-        }
+        Ok((subscription, replay)) => Box::new(sse::SseStream::new(subscription, replay)),
         Err(_) => boxed(too_many_subscribers()),
     }
 }
@@ -173,11 +171,10 @@ pub(crate) fn open_ws(
         Err(response) => return boxed(response),
     };
     match context.bus.subscribe(ui.id, &context.limits) {
-        Ok((receiver, subscription)) => Box::new(ws::WsStream::new(
+        Ok(subscription) => Box::new(ws::WsStream::new(
             context.paths.control_dir().to_path_buf(),
             ui.id.to_string(),
             accept,
-            receiver,
             subscription,
             context.limits.clone(),
         )),
