@@ -47,6 +47,8 @@
 - 帧：分片、控制帧、ping/pong、close code、掩码、超长消息 1009；
 - **Autobahn TestSuite** 作为完整一致性套件（Docker `crossbario/autobahn-testsuite`），只跑 `wstest` 的 fuzzingclient；
 - 对 `/plugin-ui/.../ws` 与原始 WS 通道分别跑，不能只测一个端点。
+- 2026-11-21 实测（WSL Docker）：Autobahn fuzzingclient 对 `/plugin-ui/.../ws` 的二进制探测路径跑 85 个非文本用例（排除 `1.*`/`6.*`/`9.*`/`10.*`/`12.*`/`13.*`），63 OK、19 FAILED、3 INFORMATIONAL；19 个 FAILED 全部是文本消息用例（端点按 JSON-RPC 处理文本，不回声），不是 framing 缺陷。该轮同时暴露并修复了 close code/UTF-8 校验：`7.3.2`、`7.5.1`、`7.9.1`–`7.9.9` 从 FAILED 转 OK。
+- 文本全量 Autobahn 需要一个专用 echo 测试端点/进程；`/ws`（JSON-RPC）和 `/raw`（binary-only）都不是通用 echo server，不能把文本用例的 FAILED 当实现回归。
 
 ### 3.3 SSE（WHATWG HTML §9.2）
 
@@ -128,7 +130,7 @@ Windows 走每连接线程回退，但上面的连接数、每 IP 与 idle 探�
 建议的 CI 策略：
 
 - **PR**：不跑真实网络性能（噪声大），只保留 `spk_smoke.py`；
-- **兼容**：`compat.yml` 每晚 / 手动跑 `--compat`，失败上传报告；Autobahn 与 WHATWG SSE 向量待接；
+- **兼容**：`compat.yml` 每晚 / 手动跑 `--compat`，失败上传报告；Autobahn 二进制/协议子集已在 WSL Docker 跑过，文本全量需 echo harness；WHATWG SSE 向量待接；
 - **每晚 / 手动**：跑 `--perf`，上传 `target/perf-report.md` 与 JSON；
 - **基线**：先记录同一 runner 的 p50/p95/p99、RSS、线程数；稳定后对 p95 与 RSS 设 20% 回归阈值，超过才失败；
 - **内存预算**：用 `workload = tiny|interactive|streaming`（而不是 `MEM_LEVEL` 档位）各跑一次空载 RSS，确认三种形状确实不同，且没有 OOM/重启。脚本：
@@ -256,6 +258,6 @@ MCP SSE 的 handler 由 `cargo test --bin svcd server::mcp::progress` 覆盖：S
 | `test.yml` guardrails | PR / main | `tools/closed-tickets-merged.mjs --map 112`：已关闭子票必须有提交在 base |
 | `perf.yml` | 每周 / 手动 | `--perf`，上传报告与 JSON |
 | `compat.yml` | 每晚 / 手动 | `--compat`（Linux，34 条向量）；失败上传 `perf-report.md`、`perf-results.json` 与 daemon stderr |
-| Autobahn / WHATWG SSE（待接） | — | WS fuzzingclient 与 SSE 表驱动向量；尚无工作流 |
+| Autobahn 文本全量 / WHATWG SSE（待接） | — | 文本全量需专用 echo 测试端点；SSE 表驱动向量尚无工作流 |
 
 性能与兼容的完整套件不要塞进 PR：PR 只保留可确定、分钟级的检查。
