@@ -446,6 +446,12 @@ pub(crate) fn web_event_plugin_bundle(key: &SigningKey, id: &str) -> Vec<u8> {
 }
 
 pub(crate) fn daemon_with_web_event_plugin(key_byte: u8) -> (Sandbox, String) {
+    daemon_with_web_event_plugin_conf(key_byte, "")
+}
+
+/// [`daemon_with_web_event_plugin`] with extra document lines, so a test can pin
+/// a setting whose value would otherwise follow the host's derived shape.
+pub(crate) fn daemon_with_web_event_plugin_conf(key_byte: u8, extra: &str) -> (Sandbox, String) {
     let mut sandbox = Sandbox::new();
     // This UI test holds 16 keep-alive connections, 8 SSE streams and 16
     // concurrent page requests, all from 127.0.0.1, and its probes retry. State
@@ -454,7 +460,7 @@ pub(crate) fn daemon_with_web_event_plugin(key_byte: u8) -> (Sandbox, String) {
     // page load for a reason this test is not about.
     fs::write(
         sandbox.config.join("svcd.conf"),
-        "max_connections_per_ip = 128\n",
+        format!("max_connections_per_ip = 128\n{extra}"),
     )
     .expect("write svcd.conf");
     let key = SigningKey::from_bytes(&[key_byte; 32]);

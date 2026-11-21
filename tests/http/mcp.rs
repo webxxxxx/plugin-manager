@@ -4,7 +4,9 @@ use super::*;
 
 #[test]
 fn http_mcp_streams_progress_for_tools_call() {
-    let (sandbox, address) = daemon_with_web_event_plugin(61);
+    // One JSON body is the default; an SSE progress stream is the opt-in, so
+    // this test states it in the document instead of inferring it from Accept.
+    let (sandbox, address) = daemon_with_web_event_plugin_conf(61, "mcp_streaming = on\n");
     set_password(&sandbox, TEST_PASSWORD);
 
     let body = serde_json::to_vec(&json!({
