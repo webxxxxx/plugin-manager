@@ -84,6 +84,7 @@ pub(crate) fn start(
     fallback: FallbackHandler,
     budget: StreamBudget,
     bus: Arc<crate::face::uichannel::EventBus>,
+    governor: Option<Arc<crate::server::http::governor::CpuGovernor>>,
 ) -> std::io::Result<LoopHandle> {
     let (results_tx, results_rx) = mpsc::channel();
     let (notify_rx, notify_tx) = UnixStream::pair()?;
@@ -147,6 +148,7 @@ pub(crate) fn start(
                 results_tx: results_tx.clone(),
                 notify: notify_rx,
                 bus_wake,
+                governor,
                 face,
                 routes,
                 fallback,
@@ -210,6 +212,8 @@ struct Server {
     face_plans: HashMap<u64, PreparedFace>,
     blocking: BlockingPool,
     blocking_pending: HashMap<u64, PendingBlocking>,
+    /// The CPU budget; absent when the document does not set one.
+    governor: Option<Arc<crate::server::http::governor::CpuGovernor>>,
     /// Connection -> the unique pool key of its in-flight stream job. Stream
     /// jobs do not use the connection id as their key: the handler can submit
     /// the next job from `StreamJobDone` before the worker clears the previous

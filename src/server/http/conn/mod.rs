@@ -99,6 +99,9 @@ pub(crate) struct StartInput {
     /// it alone and relies on the handler's own cadence.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub bus: Arc<crate::face::uichannel::EventBus>,
+    /// The CPU budget, when the document sets one. Both drivers refuse new
+    /// connections while it is exceeded.
+    pub governor: Option<Arc<crate::server::http::governor::CpuGovernor>>,
     /// The bound control channel. The poll loop merges its listener into the
     /// wait set; the thread driver ignores it because the channel already runs
     /// its own accept thread on that host.

@@ -17,6 +17,7 @@ pub mod engine;
 pub mod entry;
 #[cfg(feature = "http")]
 pub mod fallback;
+pub mod governor;
 #[cfg(feature = "http")]
 pub(crate) mod hooks;
 pub mod model;

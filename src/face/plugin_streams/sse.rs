@@ -9,9 +9,7 @@
 use std::time::{Duration, Instant};
 
 use crate::face::uichannel::{Polled, Replay, Subscription};
-use crate::server::http::{
-    CloseReason, OutBuffer, StreamAction, StreamEvent, StreamHandler, StreamStep,
-};
+use crate::server::http::{OutBuffer, StreamAction, StreamEvent, StreamHandler, StreamStep};
 
 const HEAD: &[u8] = b"HTTP/1.1 200 OK\r\n\
 Content-Type: text/event-stream\r\n\
@@ -180,6 +178,7 @@ impl StreamHandler for SseStream {
 mod tests {
     use super::*;
     use crate::face::uichannel::EventBus;
+    use crate::server::http::CloseReason;
     use serde_json::json;
     use std::sync::Arc;
 

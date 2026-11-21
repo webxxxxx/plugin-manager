@@ -84,6 +84,9 @@ pub struct Limits {
     pub pending_queue: usize,
     /// Progress events queued between the reactor and one MCP stream.
     pub progress_queue: usize,
+    /// Share of the machine's CPU the daemon may use (0 = no cap). Read by the
+    /// admission governor; the memory invariant does not spend it.
+    pub cpu_budget_percent: u8,
 }
 
 /// The derived value of everything, plus the report that explains it.

@@ -109,6 +109,34 @@ pub(super) fn spawn_http(
     let fallback: crate::server::http::hooks::FallbackHandler =
         Arc::new(move |request, lan| respond(&fallback_config, request, lan));
 
+    // One CPU budget for this process: the kernel cap is installed once here,
+    // and the governor is what both drivers consult when they refuse a new
+    // connection. A budget of 0 installs neither.
+    let cores = config
+        .resources
+        .profile
+        .cpus
+        .filter(|cores| *cores > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    let governor =
+        crate::server::http::governor::CpuGovernor::new(config.limits.cpu_budget_percent, cores);
+    if let Some(governor) = &governor {
+        let mode = match crate::platform::host::cpu::install_hard_cap(
+            governor.target_percent(),
+            governor.cores(),
+        ) {
+            Ok(installed) => installed,
+            Err(why) => format!("admission shedding only ({why})"),
+        };
+        log::svcd(&format!(
+            "svcd: cpu: budget {}% of {} cores, {}",
+            governor.target_percent(),
+            governor.cores(),
+            mode
+        ));
+        governor.start();
+    }
+
     let driver = crate::server::http::entry::start(crate::server::http::entry::StartInput {
         config,
         lan: lan.clone(),
@@ -120,6 +148,7 @@ pub(super) fn spawn_http(
         control,
         budget,
         bus,
+        governor,
     })?;
     Ok(Arc::new(Api { lan, driver }))
 }

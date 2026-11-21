@@ -2,6 +2,7 @@
 
 #[cfg(windows)]
 pub mod acl;
+pub mod cpu;
 pub mod dirs;
 pub mod notify;
 #[cfg(unix)]

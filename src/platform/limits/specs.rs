@@ -242,6 +242,12 @@ pub(super) const MAX_SUBSCRIPTIONS: KeySpec =
 pub(super) const MAX_SUBSCRIBERS_PER_PLUGIN: KeySpec =
     KeySpec::fixed("max_subscribers_per_plugin", 0, 1024, [16, 32, 64]);
 
+/// Share of the machine's CPU the daemon may use. 0 disables the governor.
+/// Unlike the memory keys this is a live policy, not a reservation: the
+/// governor sheds new connections once its own measured use stays above it.
+pub(super) const CPU_BUDGET_PERCENT: KeySpec =
+    KeySpec::fixed("cpu_budget_percent", 0, 100, [0, 0, 0]);
+
 pub(super) const IDLE_TIMEOUT: KeySpec =
     KeySpec::fixed("http_idle_timeout_secs", 1, 3600, [30, 60, 120]);
 

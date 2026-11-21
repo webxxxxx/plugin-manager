@@ -30,6 +30,7 @@ impl ConnectionDriver for Driver {
             routes,
             fallback,
             budget,
+            governor,
             ..
         } = input;
         let Some(listener) = listener else {
@@ -43,6 +44,7 @@ impl ConnectionDriver for Driver {
             fallback,
             budget,
             raw_hub,
+            governor,
         });
         let admission = admission(limits.max_connections, limits.max_connections_per_ip);
         let stop = Arc::new(AtomicBool::new(false));

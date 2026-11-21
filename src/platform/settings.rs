@@ -102,6 +102,11 @@ pub struct Settings {
     /// Progress events queued between the reactor and one MCP stream. Derived
     /// from the memory budget; clamped 4..1024.
     pub progress_queue: Option<usize>,
+    /// The share of this machine's CPU the daemon may use, 0..100. 0 (the
+    /// default) means no cap. Above 0 the daemon installs the platform's hard
+    /// cap when it can (a cgroup cpu.max on Linux) and always sheds new
+    /// connections once its own CPU use stays above the target.
+    pub cpu_budget_percent: Option<usize>,
     /// The peak memory this process may plan for, in bytes. `auto` (or absent)
     /// discounts the probed free memory; a number is taken as written and only
     /// clamped by the floor and the compile-time ceiling. See
@@ -209,6 +214,7 @@ pub(crate) const ENV_KEYS: &[&str] = &[
     "ws_raw_queue",
     "pending_queue",
     "progress_queue",
+    "cpu_budget_percent",
     "mem_budget_bytes",
     "workload",
     "probe_available_memory",
@@ -484,6 +490,9 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
             }
             "pending_queue" => {
                 settings.pending_queue = Some(parse_usize(value, "pending_queue", index)?)
+            }
+            "cpu_budget_percent" => {
+                settings.cpu_budget_percent = Some(parse_usize(value, "cpu_budget_percent", index)?)
             }
             "progress_queue" => {
                 settings.progress_queue = Some(parse_usize(value, "progress_queue", index)?)
