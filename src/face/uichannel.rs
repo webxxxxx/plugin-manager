@@ -106,7 +106,7 @@ impl Subscription {
     /// this from its writable path; there is no queue to drain, so a subscriber
     /// that stops reading costs nothing but its cursor.
     pub fn poll(&mut self) -> Polled {
-        let mut inner = self.bus.lock();
+        let inner = self.bus.lock();
         let Some(front) = inner.front_seq() else {
             return Polled::Empty;
         };

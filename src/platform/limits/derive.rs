@@ -57,6 +57,7 @@ pub fn derive_with(settings: &settings::Settings, profile: &ResourceProfile) -> 
         notes: &mut notes,
     };
     let mut limits = Limits::from_settings(SettingsView::from(settings), &mut derivation);
+    solve_connections(&mut limits, budget.quantized, settings);
     let refusal = apply_invariant(&mut limits, budget.quantized, &mut notes);
     let worst_case = limits.worst_case_bytes();
     Derived {
@@ -326,6 +327,50 @@ impl Limits {
     }
 }
 
+/// When the document names no connection count, the budget does.
+///
+/// A connection slot used to be an arbitrary share of the budget (16 MiB/3 at
+/// tiny, which stopped a 50 MiB budget at 9 connections while one connection's
+/// worst case is 29 KiB). The slot is now what the rest of the worst case
+/// leaves over, which is the same rule every other count follows. An explicit
+/// number still wins, and the invariant still shrinks it when it does not fit.
+///
+/// The per-IP cap defaults to the same number: a per-IP cap below the global
+/// one makes the global cap unreachable for every single-host deployment (the
+/// console, the CLI and a reverse proxy all arrive from one address). The key
+/// stays available for operators who want shares between many clients.
+fn solve_connections(limits: &mut Limits, budget: u64, settings: &settings::Settings) {
+    if settings.max_connections.is_none() {
+        let slots = limits.fitting_concurrency(budget);
+        limits.max_connections = slots;
+        if settings.max_streams.is_none() {
+            limits.max_streams = slots.min(STREAM_CEILING);
+        }
+        if settings.max_subscriptions.is_none() {
+            limits.max_subscriptions = slots.min(SUBSCRIPTION_CEILING);
+        }
+    } else {
+        // A stream lives on a connection and a UI subscription on a stream, so
+        // an unconfigured cap above the connection count cannot be reached
+        // anyway. Tying the three to one number keeps a small budget from
+        // advertising capacity it can never hand out.
+        if settings.max_streams.is_none() {
+            limits.max_streams = limits.max_connections.min(STREAM_CEILING);
+        }
+        if settings.max_subscriptions.is_none() {
+            limits.max_subscriptions = limits.max_connections.min(SUBSCRIPTION_CEILING);
+        }
+    }
+    if settings.max_connections_per_ip.is_none() {
+        limits.max_connections_per_ip = limits.max_connections;
+    }
+}
+
+/// The absolute ceiling for a solved stream count (the spec's upper bound).
+const STREAM_CEILING: usize = 1024;
+/// The absolute ceiling for a solved subscription count.
+const SUBSCRIPTION_CEILING: usize = 4096;
+
 /// Check `worst_case(shape, budget) <= budget` and shrink until it holds.
 ///
 /// The order is fixed by the spec: shrink the single-request buffers first,
@@ -410,7 +455,7 @@ fn apply_invariant(limits: &mut Limits, budget: u64, notes: &mut Vec<Override>) 
 }
 
 /// The stack a connection adds on a host where connections own threads.
-fn stack_per_connection(limits: &Limits) -> u64 {
+pub(super) fn stack_per_connection(limits: &Limits) -> u64 {
     if cfg!(windows) {
         // Charged again per connection by `threads_for`, so the solver must
         // account for it or it would stop one iteration too early.

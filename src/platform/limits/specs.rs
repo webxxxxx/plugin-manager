@@ -216,20 +216,13 @@ pub(super) const STREAM_BUFFER: KeySpec = KeySpec::share(
 
 /// One connection slot may claim this much budget. The three shares are strictly
 /// ordered, so the shapes stay distinguishable at any budget.
-pub(super) const MAX_CONNECTIONS: KeySpec = KeySpec::share(
-    "max_connections",
-    1,
-    4096,
-    [
-        // 4.5 MiB: at the 50 MiB budget this is 11 connections, which is one
-        // full-function worker per installed plugin for a ten-plugin host. The
-        // old 16 MiB/3 share stopped at 9 and could not serve ten plugins at
-        // single concurrency at all.
-        Share::per(4_718_592),
-        Share::per(4 * MIB),
-        Share::per(3 * MIB),
-    ],
-);
+/// The connection count is solved against the budget instead of being a share
+/// of it (see `Limits::fitting_connections`): one slot's worst case is tens of
+/// kilobytes, not megabytes, so a share only ever under-filled the budget.
+/// This spec bounds an explicit value; an unconfigured one starts at the
+/// ceiling and is replaced by the solved count before the invariant runs.
+pub(super) const MAX_CONNECTIONS: KeySpec =
+    KeySpec::fixed("max_connections", 1, 4096, [4096, 4096, 4096]);
 
 pub(super) const MAX_CONNECTIONS_PER_IP: KeySpec =
     KeySpec::fixed("max_connections_per_ip", 1, 1024, [16, 32, 64]);

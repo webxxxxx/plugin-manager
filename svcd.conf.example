@@ -123,7 +123,11 @@ bind = 127.0.0.1:8787
 # last start actually ran with, including every rewritten value.
 #
 # Each key gets its value from `[absolute floor, min(share x budget, absolute
-# ceiling)]`. Inside that band an explicit value is taken as written. Above the
+# ceiling)]`. Inside that band an explicit value is taken as written. The
+# connection count is the exception: an unconfigured one is solved from what the
+# rest of the worst case leaves over (one slot costs the resident body plus the
+# stream buffer, tens of kilobytes rather than megabytes); an explicit one is
+# used as written and then shrunk by the invariant. Above the
 # band it falls back to the shape's reference value (not to the ceiling); below
 # the floor it is raised. Every rewrite is logged at startup as
 #
@@ -146,9 +150,9 @@ bind = 127.0.0.1:8787
 #   max_body_bytes               8388608      67108864            536870912
 #   max_json_body_bytes          65536        262144              1048576
 #   max_complete_body_bytes      65536        1048576             2097152
-#   max_connections              24           128                 682
-#   max_connections_per_ip       6            32                  170
-#   max_streams                  8            16                  64
+#   max_connections              solved from the budget, not tabulated here
+#   max_connections_per_ip       same as max_connections unless set
+#   max_streams                  24           48                  96
 #   stream_buffer_bytes          8192         32768               131072
 #   ws_inflight_bytes            2097152      8388608             67108864
 #   ws_inflight_requests         4            16                  128
