@@ -120,3 +120,20 @@ node tools/install-hooks.mjs
 票里写“留给 #NNN”或“后续切片”时，在 `## Handoff` 逐条记 `项 | 目标票 | 关闭前核对`。
 **没有目标票的，先建 tracking issue**（无主 deferral 总表见 #128），把票号写进 Handoff；
 不允许只写 `no-ticket` 留在正文。目标票关闭前用 `closed-tickets-merged.mjs` 验一遍。
+## 发版（bump + tag + push）
+
+```sh
+node tools/release.mjs patch --dry-run    # 只打印计划，不动文件
+node tools/release.mjs patch --check      # 0.1.2 -> 0.1.3，先跑一遍 quick 再提交
+node tools/release.mjs 0.2.0              # 指定版本
+node tools/release.mjs patch --no-push    # 只做本地的 commit + tag
+```
+
+七步，任何一步失败就停：前置检查（在 main、工作区干净、目标版本与 `vX` 未被用过、
+`origin/main` 与本地一致）→ 改 `Cargo.toml` 与 `Cargo.lock` 里的 `svcd` 版本 →
+`cargo metadata --locked --offline` 验证两文件一致 → 可选 `node tools/check.mjs quick` →
+在 main 上提交 `chore(release): bump version to X`（脚本自己带 `SVCD_ALLOW_MAIN_COMMIT=1`）→
+打 annotated tag `vX` → 推送 main 与 tag。
+
+推送失败时本地 commit 与 tag 都还在，脚本会打印剩下的两条命令；不需要重跑整个流程。
+改版本前的写操作全部可回退：验证或检查失败会把两个文件 `git checkout --` 还原。
