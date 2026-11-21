@@ -214,6 +214,11 @@ bind = 127.0.0.1:8787
 # handler's output buffer; a slow reader stops input at that high-water mark
 # instead of growing memory.
 #
+# The upper bound of max_streams is the connection ceiling (4096): one plugin
+# UI panel holds one WebSocket, so a stream cap below the connection count
+# would make most of a large connection budget unreachable for the workload
+# that needs it most. Set it lower only when streams really should be scarce.
+#
 # `ws_raw_*` control the protocol-3 raw transport
 # (`/plugin-ui/{id}/{token}/raw`): a plugin that declares `protocol: 3`
 # exchanges length-framed binary payloads on stdin/stdout.
@@ -230,6 +235,20 @@ bind = 127.0.0.1:8787
 # and the supervisor loop; `progress_queue` bounds the progress events queued
 # between the reactor and one MCP stream. Both are derived from the budget; a
 # full queue is a visible busy error, never memory growth.
+#
+# A farm of plugin UI panels is the one shape the derivation handles poorly: the
+# single-request body grows with the budget and is charged per connection, so
+# the slots pay for a body a UI stream never sends. Pin the body and let the
+# budget go to slots instead:
+#
+#   mem_budget_percent = 90
+#   workload = tiny
+#   max_complete_body_bytes = 65536
+#
+# On a 5 GiB host that solves the connection ceiling (4096) instead of 1024-ish;
+# the real limit then becomes the plugin processes themselves (a shell plugin
+# costs ~3.4 MiB of RAM, so ~1500 fit in 5 GiB). See
+# docs/perf/2026-11-21-ws-plugin-capacity.md.
 #
 # Explicit values below override the derivation. Changing any of them requires a
 # daemon restart; `svc config tune --write` maintains them as one block.

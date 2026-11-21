@@ -10,7 +10,7 @@ use crate::platform::settings;
 
 use super::report::{Override, OverrideReason, ResourceReport};
 use super::specs::*;
-use super::{Derived, Limits};
+use super::{Derived, Limits, MAX_CONNECTIONS_CEILING};
 
 /// Derive from a document with no machine description: the budget is the build
 /// ceiling and the workload follows it.
@@ -406,8 +406,14 @@ fn solve_connections(limits: &mut Limits, budget: u64, settings: &settings::Sett
 /// was the wall at fifty workers per plugin.
 const MAX_BLOCKING_QUEUE: usize = 4096;
 
-/// The absolute ceiling for a solved stream count (the spec's upper bound).
-const STREAM_CEILING: usize = 1024;
+/// The absolute ceiling for a solved stream count: the connection ceiling.
+///
+/// A stream lives on a connection, and the common realtime shape is one stream
+/// per connection (a plugin UI WebSocket). While this sat at 1024, a budget
+/// that solved to 1459 connections could still only hand out 1024 streams, so
+/// three quarters of the connection capacity was unreachable for exactly the
+/// workload that needs it most.
+const STREAM_CEILING: usize = MAX_CONNECTIONS_CEILING;
 /// The absolute ceiling for a solved subscription count.
 const SUBSCRIPTION_CEILING: usize = 4096;
 

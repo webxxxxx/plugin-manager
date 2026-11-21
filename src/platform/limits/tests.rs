@@ -604,7 +604,7 @@ fn a_huge_value_is_clamped_to_the_ceiling_and_kept_legal() {
     // ceiling, record it, and let the invariant keep the result legal. Streams
     // follow the connection count now, so the shape's solved value is not a
     // fallback any more.
-    assert!(derived.limits.max_streams <= 1024);
+    assert!(derived.limits.max_streams <= 4096);
     assert_eq!(
         note(&derived.report, "max_streams").map(|note| note.reason),
         Some(OverrideReason::AboveUpperBound)

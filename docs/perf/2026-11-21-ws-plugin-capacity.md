@@ -103,17 +103,17 @@ python3 tools/perf/ws_plugin_capacity.py \
 | 做法 | 命令要点 | 结果 |
 | --- | --- | --- |
 | 钉住单体，不让它随预算涨 | `max_complete_body_bytes=8192`（50 MB 档被地板抬到 16 KB） | 50 MB：288 → **396** 条，100% 成功，RSS 48.1 MB |
-| 同上，512 MB 档 | `max_complete_body_bytes=65536` | 派生 `max_connections=3389`，但撞上 **1024 流上限**，实测开 1024 条（1200 个插件里 176 个 503），RSS 93.9 MB |
+| 同上，512 MB 档（改动前） | `max_complete_body_bytes=65536` | 派生 `max_connections=3389`，但撞上当时的 **1024 流上限**，实测只开 1024 条（1200 个插件里 176 个 503），RSS 93.9 MB |
 | 提高预算 | `--budget-percent 90`（4.46 GiB）+ `tiny` | **1000/1000** 全开，派生 1459 槽，RSS 78.8 MB |
 
 三面墙的先后顺序（撞到一个就停）：
 
 1. **预算派生**：`每槽记账 = 单体 + 2×流缓冲 + 128 B`，单体随预算涨，所以 50 MB 是 288、2 GB 是 786；
-2. **流上限 1024**（`STREAM_CEILING`）：一条 WS 是一个流，钉住单体后连接数可以到 3389，流还是 1024；
+2. **流上限**（`STREAM_CEILING`）：一条 WS 是一个流，钉住单体后连接数可以到 3389，而当时流还是 1024；
 3. **连接上限 4096**（`MAX_CONNECTIONS_CEILING`）：到顶后不论预算多大都只有 4096 条；
 4. **插件进程内存**（本机真上限）：bash 夹具 3.4 MB/个，5.2 GiB 可用内存 ≈ **1500 个**。
    实测 50 MB 预算 idle 装 800 个：800/800 运行，daemon 60.3 MB、整树 2.65 GB；1200 个时整树 4.1 GB。
-   连接数给得再多，这一层也过不去。
+   连接数给得再多，这一层也过不去。（流上限已按下一节改动提到 4096。）
 
 所以「插件数还能提升」的路径按性价比排：
 
@@ -130,6 +130,51 @@ python3 tools/perf/ws_plugin_capacity.py \
   跨插件复用需要新增一条 console 级多路复用路由）。做到之后插件数就不再等于连接数，
   上限回到「进程内存」那一层。
 
+## 改一版：把插件数顶到本机上限
+
+两处改动（`src/platform/limits/`）：
+
+- `STREAM_CEILING` 从 1024 提到 `MAX_CONNECTIONS_CEILING`（4096），`MAX_STREAMS` 的键上界同步到 4096。
+  理由是一条 WS 就是一个流：插件 UI 面板每个占一条，流上限压在 1024 时，连接预算再大也只能兑现 1024 条——
+  正好卡住「很多插件 UI」这种主场景。
+- 单请求体与预算解耦（配置层，不写代码）：`max_complete_body_bytes` 钉到 64 KiB，预算交给槽位。
+  派生把 `单体` 当成每连接成本，而 UI 帧只有几百字节，不钉住它就是在给永远不会发的包留钱。
+
+实测（同一台 WSL：8 vCPU / 5.8 GiB）：
+
+| 配置 | 派生槽位 / 流 | 实际同时运行 | daemon RSS | 整树 RSS |
+| --- | ---: | ---: | ---: | ---: |
+| 512 MB + 单体 64 KiB（改前：流上限 1024 卡死） | 3389 / **3389** | **1100 / 1100** | 87.1 MB | 3736 MB |
+| 90% 预算（4.34 GiB）+ 默认派生 | 1459 / 1459 | **1300 / 1300** | 101.6 MB | 4412 MB |
+| 90% 预算（4.45 GiB）+ 单体 64 KiB | **4096 / 4096** | **1400 / 1400** | 108.9 MB | 4745 MB |
+
+三组都是 100% 成功（每个连接都 101，所有调用都有结果，没有 503/超时）。
+
+**现在卡在哪**：不是 daemon，是插件进程本身。bash 夹具每个 3.39 MB，5.1 GiB 可用内存 ≈ **1500 个**；
+1400 个已经把整树推到 4.7 GB。daemon 侧 1400 条连接只用了 108.9 MB，4096 个槽位还空着 2/3。
+要在这台机器上再多，只有两条路：插件更便宜（编译型 / 共享运行时），或者换更大的机器。
+
+50 MB 档没有跟着变多，原因是另一个：32 MiB 的固定基线（`RESIDENT_BASELINE_BYTES`）占掉预算的 64%，
+而实测 idle daemon 只有 3.4 MB。这一项的替换写在 `specs.rs` 的注释里（#107「measured baseline」），
+属于要重新标定不变量的活：不是简单调小常量——实测每条连接的真实占用约 78 KB，比账面 34 KB 高，
+两者要一起重算，否则账面上放得下、物理上放不下。
+
+配好这一版的 `svcd.conf` 片段：
+
+```ini
+mem_budget_percent = 90
+workload = tiny
+max_complete_body_bytes = 65536
+```
+
+复现：
+
+```sh
+python3 tools/perf/ws_plugin_capacity.py --binary /tmp/wt-1013-target/release/svcd \
+  --budget-percent 90 --workload tiny --plugins 1400 --duration 20 --think-ms 1000 \
+  --config max_complete_body_bytes=65536 \
+  --work /tmp/ws-max-1400 --out .scratch/ws/max-90pct-64k-1400.json
+```
 ## 结论
 
 - 三档能同时跑的 WebSocket 插件数：**50 MB → 288、512 MB → 399、2 GB → 786**，全部 100% 成功；

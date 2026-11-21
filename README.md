@@ -216,7 +216,9 @@ flowchart TB
 | 512 MB | 399 | 399 | 400 个起 1 条 503 | 34.2 MB |
 | 2 GB | 786 | 786 | 787 个起 1 条 503 | 63.3 MB |
 
-一条连接就是一个名额，插件数就等于派生连接数；每插件在 daemon 里约 77 KB，插件进程自己的 3.4 MB（bash）不算在预算内。详见 [docs/perf/2026-11-21-ws-plugin-capacity.md](docs/perf/2026-11-21-ws-plugin-capacity.md)。
+一条连接就是一个名额，插件数就等于派生连接数；每插件在 daemon 里约 77 KB，插件进程自己的 3.4 MB（bash）不算在预算内。
+
+把单请求体钉到 64 KiB、预算按可用内存给（`mem_budget_percent = 90` + `workload = tiny`），同一台 5.8 GiB 的机器能同时跑 **1400 个** WebSocket 插件（daemon 只占 108.9 MB，派生上限是 4096 条连接/流）；512 MB 档同样配置是 **1100 个**。再往上卡的不是 daemon，是插件进程本身——bash 夹具每个 3.39 MB，5 GiB 约装 1500 个。详见 [docs/perf/2026-11-21-ws-plugin-capacity.md](docs/perf/2026-11-21-ws-plugin-capacity.md)。
 
 ### 90% 可用内存 + interactive
 

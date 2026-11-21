@@ -208,9 +208,12 @@ pub(super) const MAX_HEADER: KeySpec = KeySpec::fixed(
 );
 
 /// Streams are cheap (one stream buffer each) and they are the realtime
-/// admission path, so the cap follows the subscriber cap rather than the
-/// connection count: a UI page holds one SSE plus one WS.
-pub(super) const MAX_STREAMS: KeySpec = KeySpec::fixed("max_streams", 1, 1024, [24, 48, 96]);
+/// admission path. The upper bound matches the connection ceiling: a UI page
+/// holds one WS per plugin panel, so a stream cap below the connection count
+/// makes most of the connection budget unreachable for the dominant realtime
+/// workload (many plugin UIs, one stream each). The reference values stay the
+/// shape defaults for an explicit smaller number.
+pub(super) const MAX_STREAMS: KeySpec = KeySpec::fixed("max_streams", 1, 4096, [24, 48, 96]);
 
 pub(super) const STREAM_BUFFER: KeySpec = KeySpec::share(
     "stream_buffer_bytes",
