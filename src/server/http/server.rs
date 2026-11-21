@@ -9,8 +9,8 @@ mod conns;
 mod poll;
 
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
-use std::net::{IpAddr, TcpListener};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{IpAddr, Shutdown, TcpListener};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -170,6 +170,11 @@ enum ConnState {
     Reading,
     Processing,
     Writing,
+    /// The final response is written and the write half is shut down; keep
+    /// draining the peer's bytes until its FIN or the grace deadline, then
+    /// close. Closing a socket with unread data makes the stack send RST,
+    /// which can discard a status line the client has not read yet (#106).
+    Draining(Instant),
     /// A sans-IO handler plus the server-side deadline, file send and
     /// `max_streams` slot (see `server::http::driver`).
     Stream(crate::server::http::driver::StreamDriver),

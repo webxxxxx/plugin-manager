@@ -11,11 +11,11 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{IpAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::platform::config::Config;
 use crate::platform::host::threads as host_threads;
@@ -232,7 +232,7 @@ impl Connection {
                 Ok(head) => head,
                 Err(HeadFailure::Closed) => return,
                 Err(HeadFailure::Response(response)) => {
-                    let _ = stream.write_all(&response);
+                    write_and_close(&mut stream, &response, false);
                     return;
                 }
             };
@@ -256,11 +256,12 @@ impl Connection {
                     } else {
                         response
                     };
-                    let _ = write_http(&mut stream, &response, head_only);
-                    if !keep_alive {
-                        return;
+                    if keep_alive {
+                        let _ = write_http(&mut stream, &response, head_only);
+                        continue;
                     }
-                    continue;
+                    write_and_close(&mut stream, &response, head_only);
+                    return;
                 }
             };
             if let Some(prepared) = planned {
@@ -268,14 +269,14 @@ impl Connection {
                 let body = match read_body(&mut stream, &head, &initial, prepared.route.body) {
                     Ok(body) => body,
                     Err(response) => {
-                        let _ = write_http(&mut stream, &response, head_only);
+                        write_and_close(&mut stream, &response, head_only);
                         return;
                     }
                 };
                 let prepared = match crate::server::http::attach_face_body(prepared, &body) {
                     Ok(prepared) => prepared,
                     Err(response) => {
-                        let _ = write_http(&mut stream, &response, head_only);
+                        write_and_close(&mut stream, &response, head_only);
                         return;
                     }
                 };
@@ -318,6 +319,7 @@ impl Connection {
                             return;
                         }
                         if !keep_alive {
+                            drain_and_close(&mut stream);
                             return;
                         }
                         continue;
@@ -342,7 +344,7 @@ impl Connection {
             let body = match read_body(&mut stream, &head, &initial, body_policy) {
                 Ok(body) => body,
                 Err(response) => {
-                    let _ = write_http(&mut stream, &response, head_only);
+                    write_and_close(&mut stream, &response, head_only);
                     return;
                 }
             };
@@ -368,7 +370,7 @@ impl Connection {
                         return;
                     }
                     Err(response) => {
-                        let _ = write_http(&mut stream, &response, head_only);
+                        write_and_close(&mut stream, &response, head_only);
                         return;
                     }
                 }
@@ -381,6 +383,7 @@ impl Connection {
                 return;
             }
             if !keep_alive {
+                drain_and_close(&mut stream);
                 return;
             }
         }
@@ -403,17 +406,17 @@ fn serve_claimed(
     let transfer = claim.transfer;
     let handler = match claim.exchange {
         Err(response) => {
-            let _ = write_http(stream, &response, head_only);
+            write_and_close(stream, &response, head_only);
             return;
         }
         Ok(Exchange::Response(response)) if !transfer => {
-            let _ = write_http(stream, &response.into_bytes(), head_only);
+            write_and_close(stream, &response.into_bytes(), head_only);
             return;
         }
         Ok(Exchange::Response(_)) => {
             // A streamed route must not answer with a memory response; the
             // Unix loop renders the same 500 before any handler bytes go out.
-            let _ = write_http(
+            write_and_close(
                 stream,
                 &http::json_error(
                     500,
@@ -463,6 +466,38 @@ pub(crate) fn drive_fallback(
     }
 }
 
+/// After the final response, how long this connection keeps draining the
+/// peer before it closes. Closing with unread request bytes sends RST, which
+/// can discard a status line the client has not read yet; the grace bounds how
+/// long a silent peer can pin the connection thread (#106).
+const CLOSE_DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+/// Stop sending, then read and discard until the peer's FIN or the grace.
+fn drain_and_close(stream: &mut TcpStream) {
+    let _ = stream.shutdown(Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(CLOSE_DRAIN_GRACE));
+    let deadline = Instant::now() + CLOSE_DRAIN_GRACE;
+    let mut junk = [0u8; 4096];
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+        match stream.read(&mut junk) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+}
+
+/// Write a final response and close without losing it to the reset an abortive
+/// close causes when the request still has unread bytes.
+fn write_and_close(stream: &mut TcpStream, response: &[u8], head_only: bool) {
+    if write_http(stream, response, head_only).is_ok() {
+        drain_and_close(stream);
+    }
+}
+
 /// Refuse one accepted connection with the same busy response the Unix reactor
 /// sends, instead of starting a thread that would exceed the connection cap.
 fn reject_connection(mut stream: TcpStream) {
@@ -488,8 +523,8 @@ pub(crate) fn read_head(
     loop {
         if buffer.len() > max_header {
             return Err(HeadFailure::Response(http::json_error(
-                400,
-                "bad_request",
+                431,
+                "headers_too_large",
                 "header is too large",
             )));
         }
@@ -504,8 +539,8 @@ pub(crate) fn read_head(
         if let Some(position) = http::header_end(&buffer) {
             if position > max_header {
                 return Err(HeadFailure::Response(http::json_error(
-                    400,
-                    "bad_request",
+                    431,
+                    "headers_too_large",
                     "header is too large",
                 )));
             }

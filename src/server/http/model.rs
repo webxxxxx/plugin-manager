@@ -535,6 +535,7 @@ pub fn response_head(
         416 => "Range Not Satisfiable",
         426 => "Upgrade Required",
         429 => "Too Many Requests",
+        431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         501 => "Not Implemented",
         503 => "Service Unavailable",
@@ -609,6 +610,7 @@ pub(crate) fn code_for(status: u16) -> &'static str {
         404 => "not_found",
         409 => "conflict",
         413 => "payload_too_large",
+        431 => "headers_too_large",
         504 => "timeout",
         _ => "internal",
     }
@@ -761,6 +763,17 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_headers_get_the_rfc_9110_status_and_code() {
+        assert_eq!(code_for(431), "headers_too_large");
+        let head = String::from_utf8(response(431, "application/json", b"{}")).expect("utf8");
+        assert!(
+            head.starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"),
+            "{head}"
+        );
+        assert!(head.contains("Connection: close\r\n"), "{head}");
+    }
 
     #[test]
     fn content_type_is_chosen_by_extension() {

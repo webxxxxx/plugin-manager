@@ -515,11 +515,9 @@ pub(crate) fn run_min_config_phase(phase: &str, streams: bool) {
         &under_header,
     );
 
-    // ...and one just over it is refused. The whole request fits in one read,
-    // so nothing is left unread and the status line survives the close.
+    // ...and one just over it is refused with the RFC 9110 §15.5.20 status.
     // 8/16/64 KiB (the compile-time defaults) would accept ~1.1 KiB, so this is
-    // the clamp in action. RFC 9110 asks for 431; the current code answers 400,
-    // and #106 owns that conformance change.
+    // the clamp in action (#106).
     let just_over = "a".repeat(1000);
     let over_header = exchange_admitted(
         &mut sandbox,
@@ -538,16 +536,22 @@ pub(crate) fn run_min_config_phase(phase: &str, streams: bool) {
         &mut sandbox,
         "max_header_bytes",
         "GET /api/v1/services with a ~1.1 KiB header block (clamp is 1024)",
-        &[400, 431],
+        &[431],
+        &over_header,
+    );
+    expect_error_code(
+        &mut sandbox,
+        "max_header_bytes",
+        "GET /api/v1/services with a ~1.1 KiB header block (clamp is 1024)",
+        "headers_too_large",
         &over_header,
     );
 
     // A much larger header block is the abortive-close case: the daemon answers
-    // and closes while the request is still arriving, so the reset can discard
-    // the status line before the client reads it (Windows keeps 1 byte of it).
-    // The regression only requires that the daemon survives this input; the
-    // status code is pinned by the probe above and #106 owns the RFC 9110
-    // 431/graceful-close conformance.
+    // and closes while the request is still arriving, so an abortive close can
+    // discard the status line before the client reads it. The rejection path
+    // now half-closes and drains, so the 431 and its error code must survive
+    // this input (#106).
     let big = "a".repeat(4 * 1024);
     let huge_head = request_head(
         &address,
@@ -568,15 +572,22 @@ pub(crate) fn run_min_config_phase(phase: &str, streams: bool) {
         std::thread::sleep(Duration::from_millis(25));
         huge_header = exchange(&address, &huge_head, b"");
     }
-    if huge_header.status != 0 && !matches!(huge_header.status, 400 | 431) {
+    if huge_header.status != 431 {
         regression_failure(
             &mut sandbox,
             "max_header_bytes",
             "GET /api/v1/services with a 4 KiB header block",
-            "an aborted connection or a 400/431 status",
+            "431 with a readable status line",
             &huge_header.describe(),
         );
     }
+    expect_error_code(
+        &mut sandbox,
+        "max_header_bytes",
+        "GET /api/v1/services with a 4 KiB header block",
+        "headers_too_large",
+        &huge_header,
+    );
     assert_daemon_alive(&mut sandbox, phase);
 
     // Concurrent connections: the floor admits one connection and refuses the
