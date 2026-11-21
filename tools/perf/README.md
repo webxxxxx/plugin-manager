@@ -143,7 +143,10 @@ PowerShell 7 and a release binary; they are **not** part of `run.mjs` or
 
   Exit code 0 means all N connected and every call answered; 2 means a refusal
   or an error. `--fixture samples/spk-tests/ws-panel --capability status` drives
-  the packaged Python sample instead of the bash fixture.
+  the packaged Python sample instead of the bash fixture. `--config KEY=VALUE`
+  (repeatable) writes extra `svcd.conf` lines, so a run can pin the
+  single-request buffer or the connection count and compare against the derived
+  value, for example `--config max_complete_body_bytes=65536`.
 - `budget_scenario.py` requests an explicit `mem_budget_bytes` and drives every
   plugin through invoke (MCP `tools/call`), SSE, WebSocket, blob upload and blob
   download, then opens more streams than the budget admits to check that the

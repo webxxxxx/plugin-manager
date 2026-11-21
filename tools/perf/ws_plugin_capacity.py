@@ -406,6 +406,8 @@ def main():
     parser.add_argument("--capability", default="echo", help="capability the held call invokes")
     parser.add_argument("--key", default=os.path.join("samples", "keys", "sample-2026.key"))
     parser.add_argument("--pub", default=os.path.join("samples", "keys", "sample-2026.pub"))
+    parser.add_argument("--config", action="append", default=[], metavar="KEY=VALUE",
+                        help="extra svcd.conf line (repeatable), e.g. max_complete_body_bytes=8192")
     parser.add_argument("--work", default=None)
     parser.add_argument("--out", default=None)
     parser.add_argument("--report", default=None)
@@ -438,6 +440,7 @@ def main():
         "workdir": str(root),
         "environment": {"os": os.uname().sysname + " " + os.uname().machine,
                         "cpus": os.cpu_count() or 1},
+        "overrides": list(args.config),
         "requested": {
             "budget_bytes": args.budget,
             "budget_percent": args.budget_percent,
@@ -474,7 +477,7 @@ def main():
             log("direct layout for %d plugins (platform %s)" % (len(plugins), target))
         daemon = bs.start_daemon(
             root, binary, args.budget, pub, args.cpu_budget_percent,
-            args.budget_percent, args.workload)
+            args.budget_percent, args.workload, extra=args.config)
         log("daemon on %s, pid %d" % (daemon["address"], daemon["process"].pid))
         result["effective"] = bs.startup_report(root)
         svc = root / "bin" / ("svc" + bs.EXE)

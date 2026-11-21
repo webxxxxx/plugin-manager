@@ -490,7 +490,8 @@ def write_fixture(root, runtime="python"):
     return fixture
 
 
-def start_daemon(root, binary, budget_bytes, trust_pub, cpu_percent=0, budget_percent=0, workload=""):
+def start_daemon(root, binary, budget_bytes, trust_pub, cpu_percent=0, budget_percent=0, workload="",
+                 extra=()):
     config = root / "config"
     (config / "trust.d").mkdir(parents=True, exist_ok=True)
     (root / "data").mkdir(parents=True, exist_ok=True)
@@ -517,6 +518,10 @@ def start_daemon(root, binary, budget_bytes, trust_pub, cpu_percent=0, budget_pe
     if cpu_percent:
         document.append("cpu_budget_percent = %d" % cpu_percent)
     document.append("auth_passwd = %s" % password_hash)
+    # A run that wants to hold one key at a value the derivation would not pick
+    # (a smaller single-request buffer, an explicit connection count) passes it
+    # here; the invariant still shrinks whatever does not fit the budget.
+    document.extend(str(line) for line in extra)
     (config / "svcd.conf").write_text("\n".join(document) + "\n", encoding="utf-8")
     env = os.environ.copy()
     env.update({
