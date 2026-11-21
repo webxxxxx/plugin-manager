@@ -1,5 +1,45 @@
 use super::*;
 
+/// After the final response, keep draining the peer for this long before
+/// closing. Closing with unread request bytes sends RST, which can discard a
+/// status line the client has not read yet; the grace bounds how long a silent
+/// peer can pin the connection.
+const CLOSE_DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+/// Cap one drain turn so a peer that keeps sending cannot hold the reactor
+/// inside a read; the loop re-enters and the grace deadline still closes it.
+const DRAIN_BUDGET: usize = 64 * 1024;
+
+/// Read and discard whatever the peer has already sent. Returns true when the
+/// connection should stay in the loop (it is still open with more to drain),
+/// false when it reached EOF or failed and can be closed now.
+fn drain_available(connection: &mut Connection) -> bool {
+    let mut junk = [0u8; 4096];
+    let mut budget = DRAIN_BUDGET;
+    loop {
+        if budget == 0 {
+            return true;
+        }
+        match connection.stream.read(&mut junk) {
+            Ok(0) => return false,
+            Ok(read) => budget = budget.saturating_sub(read),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return true,
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Half-close the response side, drain what is already queued, and hand the
+/// socket back to the loop for the rest of the peer's bytes.
+fn begin_close(connection: &mut Connection) -> bool {
+    let _ = connection.stream.shutdown(Shutdown::Write);
+    if !drain_available(connection) {
+        return false;
+    }
+    connection.state = ConnState::Draining(Instant::now() + CLOSE_DRAIN_GRACE);
+    true
+}
+
 impl ConnectionOps for Server {
     type State = ConnState;
 
@@ -168,6 +208,9 @@ impl ConnectionOps for Server {
     }
 
     fn on_readable(&mut self, connection: &mut Connection) -> bool {
+        if matches!(connection.state, ConnState::Draining(_)) {
+            return drain_available(connection);
+        }
         if matches!(&connection.state, ConnState::Stream(_)) {
             let keep = stream_readable(connection);
             if keep {
@@ -196,7 +239,7 @@ impl ConnectionOps for Server {
                         connection.state = ConnState::Reading;
                         true
                     } else {
-                        false
+                        begin_close(connection)
                     }
                 } else {
                     true
@@ -209,6 +252,9 @@ impl ConnectionOps for Server {
         let mut events = match &connection.state {
             ConnState::Reading => libc::POLLIN,
             ConnState::Writing => libc::POLLOUT,
+            // A closing connection only waits for the peer's remaining bytes
+            // (or its FIN); the response side is already shut down.
+            ConnState::Draining(_) => libc::POLLIN,
             ConnState::Stream(driver) => {
                 if driver.wants_read() {
                     libc::POLLIN
@@ -231,8 +277,13 @@ impl ConnectionOps for Server {
     }
 
     fn is_idle(&self, connection: &Connection, now: Instant, idle: Duration) -> bool {
-        matches!(connection.state, ConnState::Reading | ConnState::Writing)
-            && now.saturating_duration_since(connection.last_active) > idle
+        match &connection.state {
+            ConnState::Draining(deadline) => now >= *deadline,
+            ConnState::Reading | ConnState::Writing => {
+                now.saturating_duration_since(connection.last_active) > idle
+            }
+            ConnState::Processing | ConnState::Stream(_) => false,
+        }
     }
 
     fn on_close(&mut self, connection: &mut Connection) {

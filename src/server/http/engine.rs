@@ -463,8 +463,8 @@ pub fn advance_request<S>(
         let Some(header_end) = http::header_end(&connection.buffer) else {
             if connection.buffer.len() > max_header {
                 return Err(crate::server::http::model::json_error(
-                    400,
-                    "bad_request",
+                    431,
+                    "headers_too_large",
                     "request headers are too large",
                 ));
             }
@@ -472,8 +472,8 @@ pub fn advance_request<S>(
         };
         if header_end > max_header {
             return Err(crate::server::http::model::json_error(
-                400,
-                "bad_request",
+                431,
+                "headers_too_large",
                 "request headers are too large",
             ));
         }

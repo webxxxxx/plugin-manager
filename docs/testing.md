@@ -37,6 +37,8 @@
 - `413` / `414` / `431` 的边界与 `Connection: close`；
 - HTTP/1.0 与 `Connection: keep-alive`、pipelining 的响应顺序。
 
+2026-11-21 现状：`431` 已落地（拒绝路径写完响应后半关闭并 drain 到对端 FIN 或截止时间，避免 RST 吞掉状态行，见 #106）；`414` 与严格解析仍未做。
+
 **不引入 h2spec**：当前实现是 HTTP/1.1，没有 HTTP/2；加 HTTP/2 时再引入。
 
 ### 3.2 WebSocket（RFC 6455）
@@ -105,7 +107,7 @@ MCP 不是 W3C，不要用 WPT 套；官方 SDK + 规范逐条向量就是这一
 `tests/http.rs::minimal_svcd_conf_keeps_the_daemon_alive` 仍然用两份 `svcd.conf` 驱动真实
 daemon，比纯 `Limits` 单测更接近用户报的「设置过小崩溃」。
 
-- **floor**：每个键都取解析器接受的最小值（0/1）。断言夹取真的到了运行期（超长 header 400、超 body 413、零订阅 429、超连接 503），进程不退出、不 panic、不重启。
+- **floor**：每个键都取解析器接受的最小值（0/1）。断言夹取真的到了运行期（超长 header 431、超 body 413、零订阅 429、超连接 503），进程不退出、不 panic、不重启。
 - **usable**：同样的下限，只把「0 等于关掉功能」的键抬到最小可用值（连接 2、订阅 1、`default_timeout` 1000 ms），让 HTTP / MCP / WebSocket / SSE 各完成一次真实往返：WS ping/pong 与 1009、SSE 投递与 `Last-Event-ID` 重连、`/mcp` 的 `tools/list`/`tools/call` 与 stdio bridge 的 `initialize`。
 
 每条探针都归属一个 `svcd.conf` 键，失败时打印该键、原始请求、响应和 daemon 输出。

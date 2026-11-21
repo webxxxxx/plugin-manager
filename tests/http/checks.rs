@@ -409,7 +409,7 @@ pub(crate) fn open_keep_alive(address: &str) -> TcpStream {
 //
 //   floor  - every key at the smallest value the parser accepts (0 where zero
 //            is meaningful, 1 elsewhere). Every surface must answer with a
-//            defined status (413 / 400-or-431 / 429 / 503) instead of dying.
+//            defined status (413 / 431 / 429 / 503) instead of dying.
 //   usable - the same floors except the keys whose raw floor cannot carry one
 //            live stream plus the request that feeds it:
 //            max_connections / max_connections_per_ip 1 -> 2,
