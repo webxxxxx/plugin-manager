@@ -536,6 +536,13 @@ const ASSEMBLY_RULES = [
     ],
     hint: "starttime 只在 process_probe 里探；判定走 runtime::pid_state（#217）。",
   },
+  {
+    name: "导入成功响应的组装",
+    members: [/\bconfigApplied\b/, /\bwarnings\b/, /\bsummary\.get\(/],
+    min: 2,
+    allow: [{ file: "src/face/install.rs", item: "import_success" }],
+    hint: "导入成功响应只在 face/install.rs 的 import_success 里拼（#247）。",
+  },
 ];
 
 /// 生产 fn 的正文区间（入参是 `stripComments` 遮罩过的文本）。`#[cfg(test)]`
@@ -809,6 +816,20 @@ const SELFTEST_ASSEMBLY = [
     file: "src/face/other.rs",
     source:
       '#[cfg(test)]\nmod tests {\n    fn t() {\n        let tag = etag(m, 1);\n        let _ = web_headers(&tag);\n    }\n}\n',
+    expected: [],
+  },
+  {
+    name: "导入成功响应在第二个函数里组装算违规",
+    file: "src/face/import_copy.rs",
+    source:
+      'fn render(status: &Value, warnings: Vec<String>) -> Value {\n    let id = status.get("summary").and_then(|summary| summary.get("id"));\n    json!({"configApplied": true, "id": id, "warnings": warnings})\n}\n',
+    expected: ["导入成功响应的组装"],
+  },
+  {
+    name: "允许的导入成功组装点不算",
+    file: "src/face/install.rs",
+    source:
+      'fn import_success(summary: Value, warnings: Vec<String>) -> Vec<u8> {\n    let id = summary.get("id");\n    json!({"configApplied": true, "id": id, "warnings": warnings})\n}\n',
     expected: [],
   },
 ];

@@ -78,13 +78,17 @@ fn staging_path(paths: &Paths) -> PathBuf {
     plugins.join(format!(".staging-{}-{}", std::process::id(), nanos))
 }
 
-fn import_response(
-    status: Value,
+/// The one success body both import routes answer with. The package/backup
+/// route (`import_response`) and the bare-config route (`import_outcome_json`)
+/// only project their input into these four values; the JSON keys, their order,
+/// the summary-then-config-id fallback and the empty-warnings omission live
+/// here and nowhere else (#247).
+fn import_success(
+    summary: Value,
     config_id: Option<String>,
     config_applied: bool,
     warnings: Vec<String>,
 ) -> Vec<u8> {
-    let summary = status.get("summary").cloned().unwrap_or(Value::Null);
     let mut body = json!({
         "ok": true,
         "configApplied": config_applied,
@@ -106,27 +110,36 @@ fn import_response(
     )
 }
 
-fn import_outcome_json(outcome: transfer::Outcome) -> Vec<u8> {
-    let mut body = json!({
-        "ok": true,
-        "configApplied": outcome.config.is_some(),
-    });
-    if let Some(status) = outcome.status {
-        let summary = &status["summary"];
-        body["id"] = summary.get("id").cloned().unwrap_or(Value::Null);
-        body["version"] = summary.get("version").cloned().unwrap_or(Value::Null);
-        body["state"] = summary.get("state").cloned().unwrap_or(Value::Null);
-    } else if let Some(id) = outcome.config {
-        body["id"] = json!(id);
-    }
-    if !outcome.warnings.is_empty() {
-        body["warnings"] = json!(outcome.warnings);
-    }
-    http::response(
-        200,
-        "application/json",
-        &serde_json::to_vec(&body).unwrap_or_default(),
+/// A daemon install status carries the summary under one key; both routes use
+/// this projection so neither re-implements the lookup.
+fn import_status_summary(status: &Value) -> Value {
+    status.get("summary").cloned().unwrap_or(Value::Null)
+}
+
+/// The package and backup imports know the daemon status they just installed.
+fn import_response(
+    status: Value,
+    config_id: Option<String>,
+    config_applied: bool,
+    warnings: Vec<String>,
+) -> Vec<u8> {
+    import_success(
+        import_status_summary(&status),
+        config_id,
+        config_applied,
+        warnings,
     )
+}
+
+/// The bare-config import knows only a transfer outcome.
+fn import_outcome_json(outcome: transfer::Outcome) -> Vec<u8> {
+    let summary = outcome
+        .status
+        .as_ref()
+        .map(import_status_summary)
+        .unwrap_or(Value::Null);
+    let config_applied = outcome.config.is_some();
+    import_success(summary, outcome.config, config_applied, outcome.warnings)
 }
 
 #[cfg(test)]
@@ -220,6 +233,100 @@ mod tests {
         assert_eq!(config_id.as_deref(), Some("demo"));
         assert!(no_config);
         assert!(force);
+    }
+
+    /// The HTTP body after the status line and headers; the assembler is the
+    /// only thing under test, so the head must not mask a body difference.
+    fn body_of(response: Vec<u8>) -> Vec<u8> {
+        let end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("response header terminator");
+        response[end + 4..].to_vec()
+    }
+
+    /// #247: package, backup and bare-config imports project into the same four
+    /// inputs, so equal inputs must answer byte-identical JSON from both
+    /// assembly points.
+    #[test]
+    fn both_import_paths_answer_the_same_success_body() {
+        let summary = json!({"id": "demo", "version": "1.0.0", "state": "stopped"});
+        let cases = [
+            // Package import: the summary, no config applied.
+            (Some(summary.clone()), None, false, Vec::new()),
+            // Backup import with a config and a warning.
+            (
+                Some(summary.clone()),
+                Some("demo".to_string()),
+                true,
+                vec!["replaced an older installed version".to_string()],
+            ),
+            // Backup import with an empty warning list.
+            (
+                Some(summary.clone()),
+                Some("demo".to_string()),
+                true,
+                Vec::new(),
+            ),
+            // Bare config import: no summary, only the config id.
+            (None, Some("demo".to_string()), true, Vec::new()),
+        ];
+        for (summary, config_id, config_applied, warnings) in cases {
+            let status = summary
+                .map(|summary| json!({ "summary": summary }))
+                .unwrap_or(Value::Null);
+            let via_status = import_response(
+                status.clone(),
+                config_id.clone(),
+                config_applied,
+                warnings.clone(),
+            );
+            let via_outcome = import_outcome_json(transfer::Outcome {
+                status: (!status.is_null()).then_some(status),
+                config: config_id,
+                warnings,
+            });
+            assert_eq!(
+                body_of(via_outcome),
+                body_of(via_status),
+                "the two import paths must assemble the same body"
+            );
+        }
+    }
+
+    /// #247: the shared assembler keeps the wire contract: field order,
+    /// summary-before-config-id priority and the empty-warnings omission.
+    #[test]
+    fn import_success_keeps_field_order_and_omits_empty_warnings() {
+        let summary = json!({"id": "demo", "version": "1.0.0", "state": "stopped"});
+        // serde_json keeps its default BTreeMap here, so the wire order is the
+        // sorted key order; the assertion locks the bytes both routes send.
+        assert_eq!(
+            body_of(import_success(summary.clone(), None, false, Vec::new())),
+            br#"{"configApplied":false,"id":"demo","ok":true,"state":"stopped","version":"1.0.0"}"#
+                .to_vec()
+        );
+        // The summary id wins over the config id.
+        assert_eq!(
+            body_of(import_success(
+                summary,
+                Some("other".to_string()),
+                true,
+                vec!["older version replaced".to_string()],
+            )),
+            br#"{"configApplied":true,"id":"demo","ok":true,"state":"stopped","version":"1.0.0","warnings":["older version replaced"]}"#
+                .to_vec()
+        );
+        // The bare-config import falls back to the config id.
+        assert_eq!(
+            body_of(import_success(
+                Value::Null,
+                Some("demo".to_string()),
+                true,
+                Vec::new(),
+            )),
+            br#"{"configApplied":true,"id":"demo","ok":true}"#.to_vec()
+        );
     }
 
     fn test_config() -> Arc<Config> {
