@@ -4,6 +4,7 @@
 平台：Windows x86_64（Win11）+ WSL2 Debian x86_64  
 构建：`cargo build --release`；含 2026-11-21 的显式预算修订（`mem_budget_bytes` 写多少就是多少）  
 矩阵：2 平台 × 3 档位 × 3 并发 = **18 格**；每格 10 个 `.spk`、60 秒、五面全功能
+后续（本文件之后的三次吞吐改造）：[2026-11-21-throughput-after.md](2026-11-21-throughput-after.md)
 
 ## 方法
 
