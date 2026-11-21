@@ -438,12 +438,20 @@ fn apply_invariant(limits: &mut Limits, budget: u64, notes: &mut Vec<Override>) 
     let configured_body = limits.max_complete_body;
     if configured_body > MAX_COMPLETE_BODY.min {
         let stream_buffer = limits.stream_buffer as u64;
+        // Subtract what the connections cost *now*, including the measured
+        // resident floor: that part does not shrink when the body does.
         let others = limits.worst_case_bytes()
-            - limits.max_connections as u64 * (configured_body + stream_buffer);
+            - limits.max_connections as u64 * limits.per_connection_bytes();
         let per_connection = budget.saturating_sub(others) / limits.max_connections.max(1) as u64;
-        let body = per_connection
-            .saturating_sub(stream_buffer)
-            .clamp(MAX_COMPLETE_BODY.min, configured_body);
+        // Below the measured floor the slot costs the same whatever the body
+        // is, so shrinking it would buy nothing: go straight to concurrency.
+        let body = if per_connection <= CONNECTION_RESIDENT_BYTES {
+            configured_body
+        } else {
+            per_connection
+                .saturating_sub(stream_buffer)
+                .clamp(MAX_COMPLETE_BODY.min, configured_body)
+        };
         if body < configured_body {
             notes.push(Override::new(
                 MAX_COMPLETE_BODY.key,
@@ -463,7 +471,8 @@ fn apply_invariant(limits: &mut Limits, budget: u64, notes: &mut Vec<Override>) 
     //    cost is not just the buffers.
     let configured_connections = limits.max_connections;
     let floor = CONNECTION_FLOOR.min(configured_connections);
-    let per_connection = (limits.max_complete_body + limits.stream_buffer as u64)
+    let per_connection = limits
+        .per_connection_bytes()
         .saturating_add(stack_per_connection(limits));
     let others = limits.worst_case_bytes() - limits.max_connections as u64 * per_connection.max(1);
     let fits = budget.saturating_sub(others) / per_connection.max(1);

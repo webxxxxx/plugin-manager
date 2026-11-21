@@ -488,6 +488,32 @@ fn a_maxed_out_legal_configuration_is_shrunk_until_the_invariant_holds() {
 }
 
 #[test]
+fn a_pinned_huge_connection_count_is_shrunk_without_collapsing_the_body() {
+    // The tiny shape's single-request body (25 KiB) is below the measured
+    // connection floor (80 KiB), so shrinking the body cannot pay for a
+    // connection. The oversized pinned count has to come down instead, and the
+    // body must keep the value the shape would have derived on its own.
+    let settings = Settings {
+        max_connections: Some(4000),
+        ..Settings::default()
+    };
+    let derived = derive_for(64 * MIB, Some(Workload::Tiny), settings);
+    let default = derive_for(64 * MIB, Some(Workload::Tiny), Settings::default());
+
+    assert_eq!(derived.report.refusal, None);
+    assert!(derived.limits.worst_case_bytes() <= 64 * MIB);
+    assert!(derived.limits.max_connections < 4000);
+    assert_eq!(
+        derived.limits.max_complete_body,
+        default.limits.max_complete_body,
+        "the body was shrunk although the connection floor, not the body, set the cost"
+    );
+    assert_eq!(
+        note(&derived.report, "max_connections").map(|note| note.reason),
+        Some(OverrideReason::InvariantShrink)
+    );
+}
+#[test]
 fn the_blocking_queue_follows_the_connection_count_and_can_be_lowered() {
     // Unconfigured: the connection count (a queued job belongs to one).
     let defaults = derive_for(2 * GIB, Some(Workload::Streaming), Settings::default()).limits;
