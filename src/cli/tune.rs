@@ -81,6 +81,7 @@ pub fn config_text(limits: &Limits, report: &ResourceReport) -> String {
 
     let count_keys: &[(&str, u64)] = &[
         ("blocking_threads", limits.blocking_threads as u64),
+        ("blocking_queue", limits.blocking_queue as u64),
         ("max_streams", limits.max_streams as u64),
         ("max_connections", limits.max_connections as u64),
         (

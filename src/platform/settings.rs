@@ -102,6 +102,10 @@ pub struct Settings {
     /// Progress events queued between the reactor and one MCP stream. Derived
     /// from the memory budget; clamped 4..1024.
     pub progress_queue: Option<usize>,
+    /// Jobs the blocking pool may queue before it answers 503 busy. Derived
+    /// from the connection count (a queued job belongs to an admitted
+    /// connection, so a larger queue can never be used); clamped to 1..1024.
+    pub blocking_queue: Option<usize>,
     /// The share of this machine's CPU the daemon may use, 0..100. 0 (the
     /// default) means no cap. Above 0 the daemon installs the platform's hard
     /// cap when it can (a cgroup cpu.max on Linux) and always sheds new
@@ -189,6 +193,7 @@ pub(crate) const ENV_KEYS: &[&str] = &[
     "request_stack_bytes",
     "io_stack_bytes",
     "blocking_threads",
+    "blocking_queue",
     "max_body_bytes",
     "max_json_body_bytes",
     "max_complete_body_bytes",
@@ -408,6 +413,9 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
             }
             "blocking_threads" => {
                 settings.blocking_threads = Some(parse_usize(value, "blocking_threads", index)?)
+            }
+            "blocking_queue" => {
+                settings.blocking_queue = Some(parse_usize(value, "blocking_queue", index)?)
             }
             "max_body_bytes" => {
                 settings.max_body_bytes = Some(parse_u64(value, "max_body_bytes", index)?)

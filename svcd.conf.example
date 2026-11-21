@@ -153,6 +153,8 @@ bind = 127.0.0.1:8787
 #   max_connections              solved from the budget, not tabulated here
 #   max_connections_per_ip       same as max_connections unless set
 #   max_streams                  24           48                  96
+#   blocking_threads             4            8                   16
+#   blocking_queue               min(max_connections, 256)
 #   stream_buffer_bytes          8192         32768               131072
 #   ws_inflight_bytes            2097152      8388608             67108864
 #   ws_inflight_requests         4            16                  128
