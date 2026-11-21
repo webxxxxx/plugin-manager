@@ -58,4 +58,13 @@ The harness writes `dep-base-*.spk`, `dep-app-*.spk`, `mcp-echo-*.spk`,
 tree, runs the checks and prints the web UI URLs. Use `--serve` to keep them
 running for the browser; see `samples/spk-tests/README.md`.
 
+A `.spk` in this directory is build output, not a fixture. Bundles made before
+the plugin UI path carried its token target `/plugin-ui/{id}/ws`; the daemon
+answers that with a 3xx, which a browser cannot follow for a WebSocket
+handshake, so the page reports `WebSocket error` and closes with code 1006.
+The token path is `/plugin-ui/{id}/{token}/ws` now, and current bundles are
+named with the full target triple, so they never overwrite an older
+`<name>-<version>-<arch>.spk`. Rebuild instead of reusing an older file — the
+harness above rebuilds on every run.
+
 The legacy `samples/out/` directory is kept ignored for older builds.

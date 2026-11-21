@@ -426,6 +426,11 @@ class Smoke:
         self.work = new_work_root()
         self.config = os.path.join(self.work, "config")
         self.data = os.path.join(self.work, "data")
+        # The daemon writes its actual port under <data>/run (Platform::Paths
+        # derives run_dir from the data root; SVCD_RUN_DIR is deliberately
+        # ignored there). Reading it from the config dir was the pre-#170
+        # layout and silently broke this harness when run_dir moved.
+        self.run_dir = os.path.join(self.data, "run")
         self.logs = os.path.join(self.work, "logs")
         self.trust = os.path.join(self.config, "trust.d")
         self.bin = os.path.join(self.work, "bin")
@@ -546,7 +551,7 @@ class Smoke:
             self._wait_for_http()
 
     def _wait_for_http(self):
-        port_file = os.path.join(self.config, "http.port")
+        port_file = os.path.join(self.run_dir, "http.port")
         deadline = time.time() + 20
         while time.time() < deadline:
             if self.daemon.poll() is not None:
@@ -560,7 +565,10 @@ class Smoke:
                 return
             except (OSError, ValueError, IndexError):
                 time.sleep(0.05)
-        fail("daemon never opened its HTTP port:\n" + self.daemon_log())
+        fail(
+            "daemon never opened its HTTP port (no %s in 20s):\n%s"
+            % (port_file, self.daemon_log())
+        )
 
     def daemon_log(self):
         try:
