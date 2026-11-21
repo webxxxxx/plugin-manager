@@ -113,11 +113,17 @@ function parseJson(response) {
   return JSON.parse(response.body.toString('utf8'));
 }
 
-async function waitForHttp(configDir, timeoutMs) {
+async function waitForHttp(root, timeoutMs) {
   const deadline = Date.now() + (timeoutMs || 15000);
+  // ADR-0023 put the run artifacts under <data>/run; an older layout wrote the
+  // address next to the config, so accept both.
+  const candidates = [
+    path.join(root, 'data', 'run', 'http.port'),
+    path.join(root, 'config', 'http.port'),
+  ];
   while (Date.now() < deadline) {
-    const portFile = path.join(configDir, 'http.port');
-    if (existsSync(portFile)) {
+    const portFile = candidates.find(function (candidate) { return existsSync(candidate); });
+    if (portFile) {
       const address = readFileSync(portFile, 'utf8').trim();
       const connected = await new Promise(function (resolve) {
         const socket = net.connect(Number(address.split(':').pop()), '127.0.0.1');
@@ -162,7 +168,7 @@ async function startDaemon(root) {
     windowsHide: true,
   });
   child.on('exit', function () { try { closeSync(logFd); } catch (_) {} });
-  const address = await waitForHttp(env.SVCD_CONFIG_DIR);
+  const address = await waitForHttp(root);
   return { child: child, env: env, address: address, logPath: logPath, token: token };
 }
 
