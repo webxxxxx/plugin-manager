@@ -32,6 +32,121 @@ use super::blob;
 use super::export;
 use super::support::{self, CallBudget};
 
+/// One ordinary API handler: the macro table stores a function pointer, so
+/// dispatch is a table lookup instead of a `match` arm per endpoint.
+#[derive(Clone, Copy)]
+enum HandlerKind {
+    Response(fn(&ApiFace, &ApiCall<'_>) -> Response),
+}
+
+/// Everything a handler needs from the matched request. This is the one place
+/// that turns a path parameter, query string, body and budget into values, so
+/// handlers do not repeat the closure plumbing the old per-endpoint dispatch carried.
+pub(crate) struct ApiCall<'a> {
+    request: &'a Request,
+    matched: &'a routes::Matched<'a>,
+    budget: CallBudget,
+}
+
+impl<'a> ApiCall<'a> {
+    fn new(request: &'a Request, matched: &'a routes::Matched<'a>) -> ApiCall<'a> {
+        ApiCall {
+            request,
+            matched,
+            budget: CallBudget::from_request(request),
+        }
+    }
+
+    pub(crate) fn param(&self, name: &str) -> String {
+        self.matched.param(name).map(decode).unwrap_or_default()
+    }
+
+    pub(crate) fn query(&self) -> &'a str {
+        routes::split_query(&self.request.path).1
+    }
+
+    pub(crate) fn body(&self) -> &'a [u8] {
+        &self.request.body
+    }
+
+    pub(crate) fn budget(&self) -> &CallBudget {
+        &self.budget
+    }
+}
+
+/// The ordinary `/api/v1` rows. A method miss is a 405; historical 404 rows
+/// use `api_quiet_routes!` below. Only method, path and handler are written.
+macro_rules! api_routes {
+    ($($method:ident $path:literal => $handler:ident),* $(,)?) => {
+        static API_CLAIM_ROUTES: &[crate::face::routes::ApiRouteDef] = &[
+            $(crate::face::routes::ApiRouteDef {
+                method: stringify!($method),
+                path: $path,
+                handler: stringify!($handler),
+                quiet: false,
+            },)*
+        ];
+        static API_CLAIM_HANDLERS: &[(&str, HandlerKind)] = &[
+            $((stringify!($handler), HandlerKind::Response(ApiFace::$handler)),)*
+        ];
+    };
+}
+
+/// The historical 404-on-method-miss rows. Same line shape as `api_routes!`.
+macro_rules! api_quiet_routes {
+    ($($method:ident $path:literal => $handler:ident),* $(,)?) => {
+        static API_QUIET_ROUTES: &[crate::face::routes::ApiRouteDef] = &[
+            $(crate::face::routes::ApiRouteDef {
+                method: stringify!($method),
+                path: $path,
+                handler: stringify!($handler),
+                quiet: true,
+            },)*
+        ];
+        static API_QUIET_HANDLERS: &[(&str, HandlerKind)] = &[
+            $((stringify!($handler), HandlerKind::Response(ApiFace::$handler)),)*
+        ];
+    };
+}
+
+api_routes! {
+    GET    "/api/v1/config/{id}"              => config_get,
+    PUT    "/api/v1/config/{id}"              => config_put,
+    POST   "/api/v1/config/{id}/reset"        => config_reset,
+    GET    "/api/v1/export/{id}/config"       => export_config,
+    GET    "/api/v1/trust"                    => trust_list,
+    POST   "/api/v1/trust"                    => trust_add,
+    DELETE "/api/v1/trust/{key}"              => trust_remove,
+    GET    "/api/v1/logs/{id}"                => logs,
+    POST   "/api/v1/plugins/{id}/ui-token"    => plugin_ui_token,
+}
+
+api_quiet_routes! {
+    GET    "/api/v1/version"                  => version,
+    GET    "/api/v1/compat"                   => compat,
+    GET    "/api/v1/auth"                     => auth,
+    GET    "/api/v1/services"                 => services,
+    GET    "/api/v1/services/{id}"            => service_status,
+    POST   "/api/v1/services/{id}/start"      => service_start,
+    POST   "/api/v1/services/{id}/stop"       => service_stop,
+    POST   "/api/v1/services/{id}/enable"     => service_enable,
+    POST   "/api/v1/services/{id}/disable"    => service_disable,
+    DELETE "/api/v1/plugins/{id}"             => plugin_uninstall,
+}
+
+/// Every macro-declared row, in table order.
+pub(crate) fn route_defs() -> impl Iterator<Item = &'static crate::face::routes::ApiRouteDef> {
+    API_CLAIM_ROUTES.iter().chain(API_QUIET_ROUTES)
+}
+
+fn handler_for(name: &str) -> Option<HandlerKind> {
+    API_CLAIM_HANDLERS
+        .iter()
+        .chain(API_QUIET_HANDLERS)
+        .find(|(candidate, _)| *candidate == name)
+        .map(|(_, handler)| *handler)
+}
+
 /// The management API face.
 pub struct ApiFace {
     config: Arc<Config>,
@@ -54,7 +169,7 @@ impl ApiFace {
     }
 
     /// Project `svc.list` into the summaries the console consumes.
-    fn list_services(&self, budget: &CallBudget) -> Response {
+    fn list_services_rpc(&self, budget: &CallBudget) -> Response {
         match self.rpc(budget, "svc.list", json!({})) {
             Ok(value) => {
                 let services: Vec<Value> = value
@@ -73,7 +188,7 @@ impl ApiFace {
         }
     }
 
-    fn service_status(&self, budget: &CallBudget, id: &str) -> Response {
+    fn service_status_rpc(&self, budget: &CallBudget, id: &str) -> Response {
         match self.rpc(budget, "svc.status", json!({ "id": id })) {
             Ok(status) => Response::json(200, &status),
             Err(response) => response,
@@ -87,7 +202,7 @@ impl ApiFace {
         }
     }
 
-    fn plugin_ui_token(&self, id: &str) -> Response {
+    fn plugin_ui_token_rpc(&self, id: &str) -> Response {
         if crate::face::plugin_ui::web_assets_for(&self.config.paths, id).is_none() {
             if package::valid_name(id) {
                 return error_response(404, "not_found", &format!("plugin {} has no web UI", id));
@@ -108,7 +223,7 @@ impl ApiFace {
         )
     }
 
-    fn uninstall_plugin(&self, budget: &CallBudget, id: &str, purge: bool) -> Response {
+    fn uninstall_plugin_rpc(&self, budget: &CallBudget, id: &str, purge: bool) -> Response {
         match self.rpc(
             budget,
             "plugin.uninstall",
@@ -119,7 +234,7 @@ impl ApiFace {
         }
     }
 
-    fn get_config(&self, budget: &CallBudget, id: &str) -> Response {
+    fn get_config_rpc(&self, budget: &CallBudget, id: &str) -> Response {
         if let Err(response) = self.require_plugin(budget, id) {
             return response;
         }
@@ -132,7 +247,7 @@ impl ApiFace {
         }
     }
 
-    fn put_config(&self, budget: &CallBudget, id: &str, body: &[u8]) -> Response {
+    fn put_config_rpc(&self, budget: &CallBudget, id: &str, body: &[u8]) -> Response {
         if let Err(response) = self.require_plugin(budget, id) {
             return response;
         }
@@ -147,7 +262,7 @@ impl ApiFace {
         }
     }
 
-    fn reset_config(&self, budget: &CallBudget, id: &str) -> Response {
+    fn reset_config_rpc(&self, budget: &CallBudget, id: &str) -> Response {
         if let Err(response) = self.require_plugin(budget, id) {
             return response;
         }
@@ -169,7 +284,7 @@ impl ApiFace {
         }
     }
 
-    fn export_config(&self, budget: &CallBudget, id: &str) -> Response {
+    fn export_config_rpc(&self, budget: &CallBudget, id: &str) -> Response {
         if let Err(response) = self.require_plugin(budget, id) {
             return response;
         }
@@ -182,7 +297,7 @@ impl ApiFace {
         }
     }
 
-    fn trust_list(&self) -> Response {
+    fn trust_list(&self, _call: &ApiCall<'_>) -> Response {
         match crate::manage::check::trust::keys(&self.config.paths) {
             Ok(keys) => Response::json(
                 200,
@@ -195,7 +310,7 @@ impl ApiFace {
         }
     }
 
-    fn trust_add(&self, body: &[u8], query: &str) -> Response {
+    fn trust_add_rpc(&self, body: &[u8], query: &str) -> Response {
         let Some(key_id) = support::query_value(query, "key_id") else {
             return error_response(400, "bad_request", "key_id is required");
         };
@@ -214,7 +329,7 @@ impl ApiFace {
         }
     }
 
-    fn trust_remove(&self, key_id: &str) -> Response {
+    fn trust_remove_rpc(&self, key_id: &str) -> Response {
         match crate::manage::check::trust::remove(&self.config.paths, key_id) {
             Ok(true) => Response::json(200, &json!({ "keyId": key_id, "removed": true })),
             Ok(false) => error_response(
@@ -226,7 +341,7 @@ impl ApiFace {
         }
     }
 
-    fn logs(&self, budget: &CallBudget, id: &str, query: &str) -> Response {
+    fn logs_rpc(&self, budget: &CallBudget, id: &str, query: &str) -> Response {
         if let Err(response) = self.require_plugin(budget, id) {
             return response;
         }
@@ -255,6 +370,112 @@ impl ApiFace {
             }
             Err(cause) => error_response(500, "internal", &format!("cannot read log: {}", cause)),
         }
+    }
+
+    fn compat(&self, _call: &ApiCall<'_>) -> Response {
+        Response::json(
+            200,
+            &serde_json::to_value(crate::platform::compat::detect(
+                &self.config.paths,
+                MAX_SCHEMA,
+                MAX_PROTOCOL,
+            ))
+            .unwrap_or(Value::Null),
+        )
+    }
+
+    fn auth(&self, _call: &ApiCall<'_>) -> Response {
+        match self.lan.lock() {
+            Ok(state) => {
+                // One face-neutral value, two renderers: auth.status and this
+                // route both read LanStatus, so password_set has a single
+                // derivation. The renderer still spells this protocol's keys;
+                // the cross-surface test keeps the two shapes honest.
+                let status = state.status();
+                Response::json(
+                    200,
+                    &json!({
+                        "bind": status.bind.to_string(),
+                        "requestedBind": status.requested_bind.to_string(),
+                        "authRequired": status.require_auth,
+                        "passwordSet": status.password_set,
+                    }),
+                )
+            }
+            Err(_) => error_response(500, "internal", "auth state unavailable"),
+        }
+    }
+
+    fn version(&self, _call: &ApiCall<'_>) -> Response {
+        Response::json(
+            200,
+            &json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "protocol": 1,
+                "platform": crate::platform::target(),
+            }),
+        )
+    }
+
+    fn services(&self, call: &ApiCall<'_>) -> Response {
+        self.list_services_rpc(call.budget())
+    }
+
+    fn service_status(&self, call: &ApiCall<'_>) -> Response {
+        self.service_status_rpc(call.budget(), &call.param("id"))
+    }
+
+    fn service_start(&self, call: &ApiCall<'_>) -> Response {
+        self.service_action(call.budget(), "svc.start", &call.param("id"))
+    }
+
+    fn service_stop(&self, call: &ApiCall<'_>) -> Response {
+        self.service_action(call.budget(), "svc.stop", &call.param("id"))
+    }
+
+    fn service_enable(&self, call: &ApiCall<'_>) -> Response {
+        self.service_action(call.budget(), "svc.enable", &call.param("id"))
+    }
+
+    fn service_disable(&self, call: &ApiCall<'_>) -> Response {
+        self.service_action(call.budget(), "svc.disable", &call.param("id"))
+    }
+
+    fn plugin_ui_token(&self, call: &ApiCall<'_>) -> Response {
+        self.plugin_ui_token_rpc(&call.param("id"))
+    }
+
+    fn plugin_uninstall(&self, call: &ApiCall<'_>) -> Response {
+        let purge = support::query_bool(call.query(), "purge").unwrap_or(false);
+        self.uninstall_plugin_rpc(call.budget(), &call.param("id"), purge)
+    }
+
+    fn config_reset(&self, call: &ApiCall<'_>) -> Response {
+        self.reset_config_rpc(call.budget(), &call.param("id"))
+    }
+
+    fn config_get(&self, call: &ApiCall<'_>) -> Response {
+        self.get_config_rpc(call.budget(), &call.param("id"))
+    }
+
+    fn config_put(&self, call: &ApiCall<'_>) -> Response {
+        self.put_config_rpc(call.budget(), &call.param("id"), call.body())
+    }
+
+    fn export_config(&self, call: &ApiCall<'_>) -> Response {
+        self.export_config_rpc(call.budget(), &call.param("id"))
+    }
+
+    fn trust_add(&self, call: &ApiCall<'_>) -> Response {
+        self.trust_add_rpc(call.body(), call.query())
+    }
+
+    fn trust_remove(&self, call: &ApiCall<'_>) -> Response {
+        self.trust_remove_rpc(&call.param("key"))
+    }
+
+    fn logs(&self, call: &ApiCall<'_>) -> Response {
+        self.logs_rpc(call.budget(), &call.param("id"), call.query())
     }
 
     fn login(&self, request: &Request) -> Response {
@@ -299,77 +520,6 @@ impl ApiFace {
             response = response.with_header(name, value);
         }
         response
-    }
-
-    fn handle_api(&self, request: &Request) -> Response {
-        let budget = CallBudget::from_request(request);
-        let (_, query) = routes::split_query(&request.path);
-        let matched = match routes::resolve(&request.method, &request.path) {
-            routes::Match::Found(matched) => matched,
-            routes::Match::MethodNotAllowed { allow, .. } => return method_not_allowed(&allow),
-            routes::Match::NotFound => return error_response(404, "not_found", "unknown endpoint"),
-        };
-        let param = |name: &str| matched.param(name).map(decode).unwrap_or_default();
-        match matched.spec.endpoint {
-            Endpoint::Compat => Response::json(
-                200,
-                &serde_json::to_value(crate::platform::compat::detect(
-                    &self.config.paths,
-                    MAX_SCHEMA,
-                    MAX_PROTOCOL,
-                ))
-                .unwrap_or(Value::Null),
-            ),
-            Endpoint::Auth => match self.lan.lock() {
-                Ok(state) => {
-                    // One face-neutral value, two renderers: auth.status and
-                    // this route both read LanStatus, so password_set has a
-                    // single derivation. The renderer still spells this
-                    // protocol's keys; the cross-surface test keeps the two
-                    // shapes honest.
-                    let status = state.status();
-                    Response::json(
-                        200,
-                        &json!({
-                            "bind": status.bind.to_string(),
-                            "requestedBind": status.requested_bind.to_string(),
-                            "authRequired": status.require_auth,
-                            "passwordSet": status.password_set,
-                        }),
-                    )
-                }
-                Err(_) => error_response(500, "internal", "auth state unavailable"),
-            },
-            Endpoint::Version => Response::json(
-                200,
-                &json!({
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "protocol": 1,
-                    "platform": crate::platform::target(),
-                }),
-            ),
-            Endpoint::ServiceList => self.list_services(&budget),
-            Endpoint::ServiceStatus => self.service_status(&budget, &param("id")),
-            Endpoint::ServiceStart => self.service_action(&budget, "svc.start", &param("id")),
-            Endpoint::ServiceStop => self.service_action(&budget, "svc.stop", &param("id")),
-            Endpoint::ServiceEnable => self.service_action(&budget, "svc.enable", &param("id")),
-            Endpoint::ServiceDisable => self.service_action(&budget, "svc.disable", &param("id")),
-            Endpoint::PluginUiToken => self.plugin_ui_token(&param("id")),
-            Endpoint::PluginUninstall => {
-                let purge = support::query_bool(query, "purge").unwrap_or(false);
-                self.uninstall_plugin(&budget, &param("id"), purge)
-            }
-            Endpoint::ConfigReset => self.reset_config(&budget, &param("id")),
-            Endpoint::ConfigGet => self.get_config(&budget, &param("id")),
-            Endpoint::ConfigPut => self.put_config(&budget, &param("id"), &request.body),
-            Endpoint::ExportConfig => self.export_config(&budget, &param("id")),
-            Endpoint::TrustList => self.trust_list(),
-            Endpoint::TrustAdd => self.trust_add(&request.body, query),
-            Endpoint::TrustRemove => self.trust_remove(&param("key")),
-            Endpoint::Logs => self.logs(&budget, &param("id"), query),
-            Endpoint::UnknownApi => error_response(404, "not_found", "unknown endpoint"),
-            _ => error_response(500, "internal", "face handled a route it did not claim"),
-        }
     }
 }
 
@@ -554,7 +704,7 @@ impl Face for ApiFace {
                     "unknown endpoint",
                 )));
             }
-            _ => {
+            Endpoint::Api(name) => {
                 if request.principal == AuthKind::Cookie
                     && http::is_write_method(&request.method)
                     && !http::csrf_ok(&request.headers)
@@ -564,9 +714,29 @@ impl Face for ApiFace {
                         "forbidden",
                         "cookie writes require Origin and X-Svcd-Csrf",
                     )));
-                } else {
-                    done.complete(Exchange::Response(self.handle_api(&request)));
+                    return;
                 }
+                let Some(handler) = handler_for(name) else {
+                    done.complete(Exchange::Response(error_response(
+                        500,
+                        "internal",
+                        "no handler for route",
+                    )));
+                    return;
+                };
+                let call = ApiCall::new(&request, &matched);
+                match handler {
+                    HandlerKind::Response(handle) => {
+                        done.complete(Exchange::Response(handle(self, &call)));
+                    }
+                }
+            }
+            _ => {
+                done.complete(Exchange::Response(error_response(
+                    500,
+                    "internal",
+                    "face handled a route it did not claim",
+                )));
             }
         }
     }
@@ -575,7 +745,7 @@ impl Face for ApiFace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::http::dispatch_inline;
+    use crate::server::http::{dispatch_blocking_now, dispatch_inline};
     use crate::server::http::{BodyPolicy, Dispatch};
     use crate::server::http::{CompletionSlot, Exchange};
 
@@ -833,8 +1003,13 @@ mod tests {
     fn version_is_served_through_the_face_with_the_original_payload() {
         let face = face();
         let route = face.route("GET", "/api/v1/version").expect("route");
-        let exchange = dispatch_inline(&face, &route, request("GET", "/api/v1/version"))
-            .expect("version must complete");
+        let exchange = dispatch_blocking_now(
+            &face,
+            &route,
+            request("GET", "/api/v1/version"),
+            face.config.limits.control_timeout,
+        )
+        .expect("version must complete");
         let Exchange::Response(response) = exchange else {
             panic!("version returns a memory response");
         };
@@ -844,6 +1019,17 @@ mod tests {
         assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(body["protocol"], 1);
         assert_eq!(body["platform"], crate::platform::target());
+    }
+
+    #[test]
+    fn every_macro_route_has_a_handler() {
+        for def in route_defs() {
+            assert!(
+                handler_for(def.handler).is_some(),
+                "{} has no handler",
+                def.handler
+            );
+        }
     }
 
     #[test]

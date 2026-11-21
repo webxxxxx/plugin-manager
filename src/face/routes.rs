@@ -10,6 +10,8 @@
 //! match returns MethodNotAllowed with Allow derived from the rows at the same
 //! specificity, so a new method cannot silently fall through.
 
+use std::sync::OnceLock;
+
 use crate::platform::limits::Limits;
 use crate::server::http::model as http;
 use crate::server::http::{BodyPolicy, Route};
@@ -28,27 +30,10 @@ pub(crate) enum Endpoint {
     Console,
     Login,
     Logout,
-    Compat,
-    Auth,
-    Version,
-    ServiceList,
-    ServiceStatus,
-    ServiceStart,
-    ServiceStop,
-    ServiceEnable,
-    ServiceDisable,
-    PluginUiToken,
-    PluginUninstall,
-    ConfigGet,
-    ConfigPut,
-    ConfigReset,
-    ExportConfig,
+    /// A macro-declared API route, identified by its handler name.
+    Api(&'static str),
     ExportSpk,
     ExportBundle,
-    TrustList,
-    TrustAdd,
-    TrustRemove,
-    Logs,
     /// A /api/v1/import path that must answer 405, not 404.
     ImportClaim,
     /// An unclaimed /api/v1 path: the API face keeps its 404 projection.
@@ -123,7 +108,7 @@ enum Miss {
     Ignore,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct RouteSpec {
     pub(crate) endpoint: Endpoint,
     pub(crate) owner: Owner,
@@ -213,6 +198,94 @@ impl RouteSpec {
             route
         }
     }
+}
+
+/// One ordinary `/api/v1` row declared by the API face's macro table.
+///
+/// The macro supplies only the method, the path and the handler name. Owner,
+/// public, priority, body policy and run mode are derived here; the historical
+/// 404-on-method-miss rows set `quiet`.
+pub(crate) struct ApiRouteDef {
+    pub(crate) method: &'static str,
+    pub(crate) path: &'static str,
+    pub(crate) handler: &'static str,
+    pub(crate) quiet: bool,
+}
+
+impl ApiRouteDef {
+    fn spec(&self) -> RouteSpec {
+        RouteSpec {
+            endpoint: Endpoint::Api(self.handler),
+            owner: Owner::Api,
+            methods: Box::leak(vec![self.method].into_boxed_slice()),
+            pattern: compile_pattern(self.path),
+            body: body_for(self.method),
+            run: Run::Blocking,
+            public: false,
+            priority: 0,
+            miss: if self.quiet {
+                Miss::Ignore
+            } else {
+                Miss::Claim
+            },
+        }
+    }
+}
+
+/// A normal JSON API route buffers a JSON body; reads, deletes and the
+/// body-less management writes keep the empty policy.
+fn body_for(method: &str) -> Body {
+    match method {
+        "POST" | "PUT" | "PATCH" => Body::Json,
+        _ => Body::Empty,
+    }
+}
+
+/// Compile one macro path such as `/api/v1/services/{id}` into segments.
+///
+/// This runs once when the table is built, not per request. A malformed path
+/// is a programming error: fail loudly instead of silently returning 404.
+fn compile_pattern(path: &'static str) -> Pattern {
+    assert!(
+        path.starts_with('/'),
+        "API route path must start with /: {path}"
+    );
+    let trimmed = path.trim_matches('/');
+    let mut segments = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    if !trimmed.is_empty() {
+        for part in trimmed.split('/') {
+            assert!(!part.is_empty(), "empty segment in API route: {path}");
+            if part == "*" {
+                segments.push(Segment::Rest);
+                continue;
+            }
+            if let Some(name) = part.strip_prefix('{').and_then(|p| p.strip_suffix('}')) {
+                assert!(!name.is_empty(), "empty parameter in API route: {path}");
+                assert!(names.insert(name), "duplicate parameter '{name}' in {path}");
+                segments.push(Segment::Param(name));
+                continue;
+            }
+            assert!(
+                !part.contains('{') && !part.contains('}'),
+                "malformed parameter segment '{part}' in {path}"
+            );
+            segments.push(Segment::Lit(part));
+        }
+    }
+    Pattern::Segments(Box::leak(segments.into_boxed_slice()))
+}
+
+/// The complete route table: hand-written protocol rows plus the API face's
+/// macro rows. Built once; every request reads the leaked slice.
+fn specs() -> &'static [RouteSpec] {
+    static BUILT: OnceLock<&'static [RouteSpec]> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let mut rows: Vec<RouteSpec> = MANUAL_SPECS.to_vec();
+        rows.extend(crate::face::api::route_defs().map(ApiRouteDef::spec));
+        let leaked: &'static [RouteSpec] = Box::leak(rows.into_boxed_slice());
+        leaked
+    })
 }
 
 /// The matched row plus the decoded-name path parameters.
@@ -311,7 +384,7 @@ pub(crate) fn split_query(path: &str) -> (&str, &str) {
 pub(crate) fn resolve<'a>(method: &str, path: &'a str) -> Match<'a> {
     let (path, _) = split_query(path);
     let parts = segments(path);
-    let mut candidates: Vec<(&'static RouteSpec, u32)> = SPECS
+    let mut candidates: Vec<(&'static RouteSpec, u32)> = specs()
         .iter()
         .filter(|spec| spec.matches(path, &parts))
         .filter(|spec| spec.method_matches(method) || spec.miss == Miss::Claim)
@@ -457,32 +530,6 @@ const fn row(
     }
 }
 
-/// A named route with no 405 claim: a method miss falls through to the
-/// catch-all 404 the API face has always projected for these paths.
-#[allow(clippy::too_many_arguments)] // Same columns as row, minus the claim.
-const fn quiet(
-    endpoint: Endpoint,
-    owner: Owner,
-    methods: &'static [&'static str],
-    pattern: Pattern,
-    body: Body,
-    run: Run,
-    public: bool,
-    _priority: u8,
-) -> RouteSpec {
-    RouteSpec {
-        endpoint,
-        owner,
-        methods,
-        pattern,
-        body,
-        run,
-        public,
-        priority: 0,
-        miss: Miss::Ignore,
-    }
-}
-
 const fn ignore(
     endpoint: Endpoint,
     owner: Owner,
@@ -513,9 +560,10 @@ const fn param(name: &'static str) -> Segment {
     Segment::Param(name)
 }
 
-/// Every management route. Rows are grouped by owner; specificity, not order,
-/// decides the match, so inserting a row cannot shadow a longer path.
-static SPECS: &[RouteSpec] = &[
+/// Hand-written protocol rows: console/login, streamed exports and downloads,
+/// pre-body uploads, the fallback's blob/file sessions, the import claim and the
+/// `/api/v1` catch-all. Ordinary API rows live in `api::route_defs()`.
+static MANUAL_SPECS: &[RouteSpec] = &[
     // Public console surface.
     row(
         Endpoint::Console,
@@ -545,200 +593,7 @@ static SPECS: &[RouteSpec] = &[
         Run::Blocking,
         true,
     ),
-    // API reads.
-    quiet(
-        Endpoint::Version,
-        Owner::Api,
-        GET,
-        Pattern::Segments(&[lit("api"), lit("v1"), lit("version")]),
-        Body::Empty,
-        Run::Inline,
-        false,
-        0,
-    ),
-    quiet(
-        Endpoint::Compat,
-        Owner::Api,
-        GET,
-        Pattern::Segments(&[lit("api"), lit("v1"), lit("compat")]),
-        Body::Empty,
-        Run::Blocking,
-        false,
-        0,
-    ),
-    quiet(
-        Endpoint::Auth,
-        Owner::Api,
-        GET,
-        Pattern::Segments(&[lit("api"), lit("v1"), lit("auth")]),
-        Body::Empty,
-        Run::Blocking,
-        false,
-        0,
-    ),
-    quiet(
-        Endpoint::ServiceList,
-        Owner::Api,
-        GET,
-        Pattern::Segments(&[lit("api"), lit("v1"), lit("services")]),
-        Body::Empty,
-        Run::Blocking,
-        false,
-        0,
-    ),
-    quiet(
-        Endpoint::ServiceStatus,
-        Owner::Api,
-        GET,
-        Pattern::Segments(&[lit("api"), lit("v1"), lit("services"), param("id")]),
-        Body::Empty,
-        Run::Blocking,
-        false,
-        0,
-    ),
-    quiet(
-        Endpoint::ServiceStart,
-        Owner::Api,
-        POST,
-        Pattern::Segments(&[
-            lit("api"),
-            lit("v1"),
-            lit("services"),
-            param("id"),
-            lit("start"),
-        ]),
-        Body::Empty,
-        Run::Blocking,
-        false,
-        0,
-    ),
-    quiet(
-        Endpoint::ServiceStop,
-        Owner::Api,
-        POST,
-        Pattern::Segments(&[
-            lit("api"),
-            lit("v1"),
-            lit("services"),
-            param("id"),
-            lit("stop"),
-        ]),
-        Body::Empty,
-        Run::Blocking,
-        false,
-        0,
-    ),
-    quiet(
-        Endpoint::ServiceEnable,
-        Owner::Api,
-        POST,
-        Pattern::Segments(&[
-            lit("api"),
-            lit("v1"),
-            lit("services"),
-            param("id"),
-            lit("enable"),
-        ]),
-        Body::Empty,
-        Run::Blocking,
-        false,
-        0,
-    ),
-    quiet(
-        Endpoint::ServiceDisable,
-        Owner::Api,
-        POST,
-        Pattern::Segments(&[
-            lit("api"),
-            lit("v1"),
-            lit("services"),
-            param("id"),
-            lit("disable"),
-        ]),
-        Body::Empty,
-        Run::Blocking,
-        false,
-        0,
-    ),
-    // API writes and settings.
-    row(
-        Endpoint::PluginUiToken,
-        Owner::Api,
-        POST,
-        Pattern::Segments(&[
-            lit("api"),
-            lit("v1"),
-            lit("plugins"),
-            param("id"),
-            lit("ui-token"),
-        ]),
-        Body::Empty,
-        Run::Blocking,
-        false,
-        0,
-    ),
-    quiet(
-        Endpoint::PluginUninstall,
-        Owner::Api,
-        DELETE,
-        Pattern::Segments(&[lit("api"), lit("v1"), lit("plugins"), param("id")]),
-        Body::Empty,
-        Run::Blocking,
-        false,
-        0,
-    ),
-    row(
-        Endpoint::ConfigReset,
-        Owner::Api,
-        POST,
-        Pattern::Segments(&[
-            lit("api"),
-            lit("v1"),
-            lit("config"),
-            param("id"),
-            lit("reset"),
-        ]),
-        Body::Empty,
-        Run::Blocking,
-        false,
-        0,
-    ),
-    row(
-        Endpoint::ConfigGet,
-        Owner::Api,
-        GET,
-        Pattern::Segments(&[lit("api"), lit("v1"), lit("config"), param("id")]),
-        Body::Empty,
-        Run::Blocking,
-        false,
-        0,
-    ),
-    row(
-        Endpoint::ConfigPut,
-        Owner::Api,
-        PUT,
-        Pattern::Segments(&[lit("api"), lit("v1"), lit("config"), param("id")]),
-        Body::Json,
-        Run::Blocking,
-        false,
-        0,
-    ),
-    row(
-        Endpoint::ExportConfig,
-        Owner::Api,
-        GET,
-        Pattern::Segments(&[
-            lit("api"),
-            lit("v1"),
-            lit("export"),
-            param("id"),
-            lit("config"),
-        ]),
-        Body::Empty,
-        Run::Blocking,
-        false,
-        0,
-    ),
+    // Streamed exports stay on the face's own dispatch.
     row(
         Endpoint::ExportSpk,
         Owner::Api,
@@ -762,46 +617,6 @@ static SPECS: &[RouteSpec] = &[
         Pattern::Segments(&[lit("api"), lit("v1"), lit("export"), param("id")]),
         Body::Streamed,
         Run::Inline,
-        false,
-        0,
-    ),
-    row(
-        Endpoint::TrustList,
-        Owner::Api,
-        GET,
-        Pattern::Segments(&[lit("api"), lit("v1"), lit("trust")]),
-        Body::Empty,
-        Run::Blocking,
-        false,
-        0,
-    ),
-    row(
-        Endpoint::TrustAdd,
-        Owner::Api,
-        POST,
-        Pattern::Segments(&[lit("api"), lit("v1"), lit("trust")]),
-        Body::Json,
-        Run::Blocking,
-        false,
-        0,
-    ),
-    row(
-        Endpoint::TrustRemove,
-        Owner::Api,
-        DELETE,
-        Pattern::Segments(&[lit("api"), lit("v1"), lit("trust"), param("key")]),
-        Body::Empty,
-        Run::Blocking,
-        false,
-        0,
-    ),
-    row(
-        Endpoint::Logs,
-        Owner::Api,
-        GET,
-        Pattern::Segments(&[lit("api"), lit("v1"), lit("logs"), param("id")]),
-        Body::Empty,
-        Run::Blocking,
         false,
         0,
     ),
@@ -1090,8 +905,8 @@ static SPECS: &[RouteSpec] = &[
         false,
         3,
     ),
-    // Any other /api/v1 path stays on the API face: its handle_api owns the
-    // 404 shape, and the catch-all score keeps it below every named row.
+    // Any other /api/v1 path stays on the API face: its UnknownApi arm owns
+    // the 404 shape, and the catch-all score keeps it below every named row.
     row(
         Endpoint::UnknownApi,
         Owner::Api,
@@ -1128,7 +943,7 @@ mod tests {
 
     #[test]
     fn every_row_is_reachable_by_its_own_methods() {
-        for spec in SPECS {
+        for spec in specs() {
             if spec.methods.is_empty() {
                 continue;
             }
@@ -1155,7 +970,7 @@ mod tests {
 
     #[test]
     fn one_method_has_one_owner() {
-        for spec in SPECS {
+        for spec in specs() {
             let path = path_of(spec);
             for method in spec.methods {
                 if *method == "*" {
@@ -1242,6 +1057,18 @@ mod tests {
     }
 
     #[test]
+    fn quiet_api_rows_keep_their_404_on_a_method_miss() {
+        let Match::Found(matched) = resolve("POST", "/api/v1/version") else {
+            panic!("the /api/v1 catch-all must answer, not 405");
+        };
+        assert_eq!(matched.spec.endpoint, Endpoint::UnknownApi);
+        assert!(matches!(
+            resolve("PATCH", "/api/v1/config/demo"),
+            Match::MethodNotAllowed { .. }
+        ));
+    }
+
+    #[test]
     fn exact_public_paths_do_not_claim_a_method_miss() {
         assert!(matches!(resolve("GET", "/login"), Match::NotFound));
         assert!(matches!(resolve("GET", "/logout"), Match::NotFound));
@@ -1281,14 +1108,14 @@ mod tests {
 
     #[test]
     fn a_method_has_no_ambiguous_row() {
-        for spec in SPECS {
+        for spec in specs() {
             for method in spec.methods {
                 if *method == "*" {
                     continue;
                 }
                 let path = path_of(spec);
                 let parts = segments(&path);
-                let matches: Vec<&RouteSpec> = SPECS
+                let matches: Vec<&RouteSpec> = specs()
                     .iter()
                     .filter(|candidate| candidate.matches(&path, &parts))
                     .filter(|candidate| candidate.method_matches(method))
