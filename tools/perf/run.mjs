@@ -168,6 +168,11 @@ async function startDaemon(root) {
     SVCD_TEST_UNPRIVILEGED: '1',
   });
   mkdirSync(env.SVCD_CONFIG_DIR, { recursive: true });
+  // svcd run waits up to boot_scan_wait_ms for services.d to appear, so a
+  // mounted config volume can settle. The harness owns the tree and starts the
+  // daemon before the first install; create it up front or every run pays the
+  // full wait before HTTP binds and the startup metric measures the wait.
+  mkdirSync(path.join(env.SVCD_CONFIG_DIR, 'services.d'), { recursive: true });
   mkdirSync(env.SVCD_TRUST_DIR, { recursive: true });
   mkdirSync(env.SVCD_DATA_DIR, { recursive: true });
   mkdirSync(env.SVCD_LOG_DIR, { recursive: true });
@@ -1421,9 +1426,15 @@ function renderReport(results) {
   lines.push('- Compatibility HTTP checks use one-shot connections; performance HTTP/MCP workers use HTTP/1.1 keep-alive.');
   lines.push('- MCP Streamable HTTP is modern-only (2026-07-28), one JSON response per POST.');
   lines.push('- The Python plugin adds JSON encode/decode and interpreter scheduling overhead to MCP/WS/SSE call paths.');
-  lines.push('- Numbers are from one Windows machine, not a production benchmark.');
+  lines.push('- Numbers are from one ' + platformName() + ' machine, not a production benchmark.');
   lines.push('');
   return lines.join('\n');
+}
+
+function platformName() {
+  if (process.platform === 'win32') return 'Windows';
+  if (process.platform === 'darwin') return 'macOS';
+  return 'Linux';
 }
 
 function environmentInfo() {
