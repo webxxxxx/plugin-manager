@@ -46,7 +46,8 @@ loopback-only and unauthenticated.
 ## Coverage
 
 - HTTP: JSON/headers/length, keep-alive, 405 Allow, malformed request, chunked
-  request rejection
+  request rejection, undersized/oversized header blocks (431 with a readable
+  status line and `headers_too_large`)
 - MCP: modern `server/discover` / `tools/list` / `tools/call`, Bearer 401/403,
   missing `_meta`, and the official SDK over the stdio bridge
 - WebSocket: tools/call + notification, ping/pong/close, fragmentation,

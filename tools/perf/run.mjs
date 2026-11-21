@@ -593,6 +593,30 @@ async function runCompat(daemon, token) {
   });
 
 
+  await check('HTTP header block under the limit is served', async function () {
+    const response = await httpRequest(daemon.address, 'GET', '/api/v1/services', { 'X-Pad': 'a'.repeat(700) }, null);
+    assert.equal(response.status, 200, response.body.toString());
+    return '200 with a ~800 B header block';
+  });
+
+  await check('HTTP oversized header block returns 431 with a readable status line', async function () {
+    // 128 KiB is above every shape's max_header_bytes and is written in one
+    // call, so the reject path also has unread bytes to drain before close
+    // (#106). A reset would lose the status line and fail here.
+    const pad = 'a'.repeat(128 * 1024);
+    let response;
+    try {
+      response = await httpRequest(daemon.address, 'GET', '/api/v1/services', { 'X-Pad': pad }, null, 10000);
+    } catch (error) {
+      throw new Error('no HTTP status line before the reset: ' + error.message);
+    }
+    const body = response.body.toString();
+    assert.equal(response.status, 431, 'expected 431, got ' + response.status + ': ' + body.slice(0, 120));
+    assert.equal(parseJson(response).error.code, 'headers_too_large', body.slice(0, 200));
+    assert.equal(String(response.headers.connection).toLowerCase(), 'close');
+    return '431 headers_too_large';
+  });
+
   await check('HTTP chunked request body is rejected', async function () {
     let data = '';
     await new Promise(function (resolve, reject) {
