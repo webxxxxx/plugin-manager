@@ -79,13 +79,8 @@ impl VerifyCache {
         entries.push((key, now));
     }
 
-    pub fn clear(&self) {
-        self.entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-    }
-
+    /// Entry count. Test-only: production only asks whether a credential hits.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries
             .lock()
@@ -93,6 +88,7 @@ impl VerifyCache {
             .len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

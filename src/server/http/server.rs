@@ -83,7 +83,7 @@ pub(crate) fn start(
     routes: Arc<dyn PreBodyRoutes>,
     fallback: FallbackHandler,
     budget: StreamBudget,
-    install_bus_wake: Option<Arc<dyn Fn(Arc<dyn Fn() + Send + Sync>) + Send + Sync>>,
+    install_bus_wake: Option<crate::server::http::conn::BusWakeInstall>,
     governor: Option<Arc<crate::server::http::governor::CpuGovernor>>,
 ) -> std::io::Result<LoopHandle> {
     let (results_tx, results_rx) = mpsc::channel();

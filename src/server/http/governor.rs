@@ -100,11 +100,6 @@ impl CpuGovernor {
     }
 
     #[cfg(test)]
-    pub(crate) fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
-    }
-
-    #[cfg(test)]
     pub(crate) fn set_over(&self, over: bool) {
         self.over.store(over, Ordering::Relaxed);
     }

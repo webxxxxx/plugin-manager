@@ -572,8 +572,6 @@ fn a_huge_value_is_clamped_to_the_ceiling_and_kept_legal() {
         ..Settings::default()
     };
     let derived = derive_for(2 * GIB, Some(Workload::Streaming), settings);
-    let default = derive_for(2 * GIB, Some(Workload::Streaming), Settings::default());
-
     // The contract for a value above its upper bound: clamp to the absolute
     // ceiling, record it, and let the invariant keep the result legal. Streams
     // follow the connection count now, so the shape's solved value is not a
