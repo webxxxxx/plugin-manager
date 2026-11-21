@@ -583,6 +583,13 @@ const ASSEMBLY_RULES = [
     allow: [{ file: "src/face/blob_routes.rs", item: "parse_parts" }],
     hint: "complete 的 parts[] 解码只经 face/blob_routes.rs 的 parse_parts（#246）。",
   },
+  {
+    name: "导入成功响应的组装",
+    members: [/\bconfigApplied\b/, /\bwarnings\b/, /\bsummary\.get\(/],
+    min: 2,
+    allow: [{ file: "src/face/install.rs", item: "import_success" }],
+    hint: "导入成功响应只在 face/install.rs 的 import_success 里拼（#247）。",
+  },
 ];
 
 /// 生产 fn 的正文区间（入参是 `stripComments` 遮罩过的文本）。`#[cfg(test)]`
@@ -940,6 +947,20 @@ const SELFTEST_ASSEMBLY = [
     file: "src/face/blob_routes.rs",
     source:
       'fn parse_parts(body: &[u8], required: bool) -> Option<usize> {\n    let value: Value = serde_json::from_slice(body).ok()?;\n    let parts = value.get("parts")?.as_array()?;\n    let _ = required;\n    Some(parts.len())\n}\n',
+    expected: [],
+  },
+  {
+    name: "导入成功响应在第二个函数里组装算违规",
+    file: "src/face/import_copy.rs",
+    source:
+      'fn render(status: &Value, warnings: Vec<String>) -> Value {\n    let id = status.get("summary").and_then(|summary| summary.get("id"));\n    json!({"configApplied": true, "id": id, "warnings": warnings})\n}\n',
+    expected: ["导入成功响应的组装"],
+  },
+  {
+    name: "允许的导入成功组装点不算",
+    file: "src/face/install.rs",
+    source:
+      'fn import_success(summary: Value, warnings: Vec<String>) -> Vec<u8> {\n    let id = summary.get("id");\n    json!({"configApplied": true, "id": id, "warnings": warnings})\n}\n',
     expected: [],
   },
 ];
