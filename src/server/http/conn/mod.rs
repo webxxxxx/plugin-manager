@@ -29,6 +29,11 @@ pub(crate) mod poll;
 #[cfg_attr(unix, allow(dead_code))]
 pub(crate) mod threaded;
 
+/// How the composition root hands the UI bus its wake-up hook: the installer
+/// receives a closure the bus calls when it publishes. Naming it once keeps the
+/// driver's input type readable and keeps this layer from naming the face.
+pub type BusWakeInstall = Arc<dyn Fn(Arc<dyn Fn() + Send + Sync>) + Send + Sync>;
+
 /// One connection driver.
 ///
 /// Contract:
@@ -98,7 +103,7 @@ pub(crate) struct StartInput {
     /// installer instead of the bus keeps this layer from naming the face
     /// module: the composition root owns the wire between the two.
     #[cfg_attr(not(unix), allow(dead_code))]
-    pub install_bus_wake: Option<Arc<dyn Fn(Arc<dyn Fn() + Send + Sync>) + Send + Sync>>,
+    pub install_bus_wake: Option<BusWakeInstall>,
     /// The CPU budget, when the document sets one. Both drivers refuse new
     /// connections while it is exceeded.
     pub governor: Option<Arc<crate::server::http::governor::CpuGovernor>>,

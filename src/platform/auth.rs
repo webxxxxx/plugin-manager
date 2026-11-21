@@ -79,13 +79,8 @@ impl VerifyCache {
         entries.push((key, now));
     }
 
-    pub fn clear(&self) {
-        self.entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-    }
-
+    /// Entry count. Test-only: production only asks whether a credential hits.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries
             .lock()
@@ -93,6 +88,7 @@ impl VerifyCache {
             .len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -110,6 +106,13 @@ static BEARER_CACHE: VerifyCache = VerifyCache::new();
 /// Verify a Bearer credential through the process-wide cache.
 pub fn verify_password_cached(password: &str, encoded: &str) -> bool {
     BEARER_CACHE.verify(password, encoded)
+}
+
+/// Whether this exact credential is in the process-wide cache. Test-only: it is
+/// how a caller proves it went through the cache instead of re-deriving the KDF.
+#[cfg(test)]
+pub(crate) fn credential_is_cached(password: &str, encoded: &str) -> bool {
+    BEARER_CACHE.hit(&cache_key(password, encoded))
 }
 
 fn cache_key(password: &str, encoded: &str) -> [u8; 32] {

@@ -572,8 +572,6 @@ fn a_huge_value_is_clamped_to_the_ceiling_and_kept_legal() {
         ..Settings::default()
     };
     let derived = derive_for(2 * GIB, Some(Workload::Streaming), settings);
-    let default = derive_for(2 * GIB, Some(Workload::Streaming), Settings::default());
-
     // The contract for a value above its upper bound: clamp to the absolute
     // ceiling, record it, and let the invariant keep the result legal. Streams
     // follow the connection count now, so the shape's solved value is not a
@@ -583,22 +581,33 @@ fn a_huge_value_is_clamped_to_the_ceiling_and_kept_legal() {
         note(&derived.report, "max_streams").map(|note| note.reason),
         Some(OverrideReason::AboveUpperBound)
     );
-    assert_eq!(
-        derived.limits.max_connections,
-        crate::platform::limits::MAX_CONNECTIONS_CEILING
-    );
+    assert!(derived.limits.max_connections <= crate::platform::limits::MAX_CONNECTIONS_CEILING);
     assert_eq!(
         note(&derived.report, "max_connections").map(|note| note.reason),
         Some(OverrideReason::AboveUpperBound)
     );
+    // The ceiling is only reachable when this build may plan for the requested
+    // budget: a lower MEM_LEVEL caps the budget below 2 GiB and the invariant
+    // legitimately solves fewer connections than the ceiling.
+    if crate::platform::limits::BUDGET_CAP >= 2 * GIB {
+        assert_eq!(
+            derived.limits.max_connections,
+            crate::platform::limits::MAX_CONNECTIONS_CEILING
+        );
+    }
     assert!(derived.limits.worst_case_bytes() <= 2 * GIB);
 }
 
 #[test]
 fn blocking_threads_scale_with_the_shape_and_stay_in_two_through_thirty_two() {
-    // streaming at 2 GiB: the default is the largest of the three shapes.
+    // Streaming at 2 GiB would default to 16, but a lower MEM_LEVEL caps the
+    // budget and the budget selects the shape: compare against the shape the
+    // binary really derives instead of the one the reference names.
+    let effective = reference_budget(Workload::Streaming);
+    let default =
+        specs::BLOCKING_THREADS.default_value(Workload::of_budget(effective), effective) as usize;
     let defaults = derive_for(2 * GIB, None, Settings::default()).limits;
-    assert_eq!(defaults.blocking_threads, 16);
+    assert_eq!(defaults.blocking_threads, default);
 
     for (configured, expected) in [
         (0, 2),
@@ -607,8 +616,8 @@ fn blocking_threads_scale_with_the_shape_and_stay_in_two_through_thirty_two() {
         (5, 5),
         (16, 16),
         (32, 32),
-        (33, 16),
-        (64, 16),
+        (33, default),
+        (64, default),
     ] {
         let settings = Settings {
             blocking_threads: Some(configured),
