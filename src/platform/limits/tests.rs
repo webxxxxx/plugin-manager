@@ -363,7 +363,7 @@ fn the_build_cap_only_tightens_the_budget() {
         cpus: Some(64),
         ..ResourceProfile::default()
     };
-    for configured in [None, Some(1), Some(64 * GIB), Some(u64::MAX)] {
+    for configured in [None, Some(64 * GIB), Some(u64::MAX)] {
         let settings = Settings {
             mem_budget_bytes: configured,
             ..Settings::default()
@@ -378,6 +378,15 @@ fn the_build_cap_only_tightens_the_budget() {
         );
         assert!(derived.limits.worst_case_bytes() <= BUDGET_CAP);
     }
+
+    // A deliberately tiny explicit budget is taken as written, so the
+    // invariant refuses startup instead of silently raising it to 64 MiB.
+    let settings = Settings {
+        mem_budget_bytes: Some(1),
+        ..Settings::default()
+    };
+    let derived = derive_with(&settings, &profile);
+    assert!(derived.report.refusal.is_some());
 
     // An explicit budget above the ceiling is reported, not silently
     // rewritten.

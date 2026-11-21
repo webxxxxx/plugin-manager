@@ -66,7 +66,7 @@ MCP 不是 W3C，不要用 WPT 套；官方 SDK + 规范逐条向量就是这一
 
 ## 4. 内存预算、形状与 `svcd.conf` 边界
 
-`MEM_LEVEL=low|middle|high` 现在是**编译期预算上限**（128 MiB / 512 MiB / 2 GiB，只收紧），`svcd.conf` 的 `mem_budget_bytes` / `workload` 与其余键是运行期输入；派生全部落在 [limits.rs](../src/platform/limits.rs)，探测落在 [resources.rs](../src/platform/resources.rs)。测试分五段：
+`MEM_LEVEL=low|middle|high` 现在是**编译期预算上限**（128 MiB / 512 MiB / 2 GiB，只收紧），`svcd.conf` 的 `mem_budget_bytes` / `workload` 与其余键是运行期输入；显式 `mem_budget_bytes` 按原值生效（只受编译期上限约束），`auto` 才受 64 MiB 下限与量化台阶约束；派生全部落在 [limits.rs](../src/platform/limits.rs)，探测落在 [resources.rs](../src/platform/resources.rs)。测试分五段：
 
 1. **档位矩阵**：CI 用 `low/middle/high` 各编译并跑 `limits::tests`
    （`cargo test --bin svcd platform::limits`）。断言的是不变量恒成立或启动被拒，

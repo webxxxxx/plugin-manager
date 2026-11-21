@@ -37,8 +37,9 @@ pub fn derive_with(settings: &settings::Settings, profile: &ResourceProfile) -> 
     };
 
     let mut notes = Vec::new();
-    // The ceiling only tightens, and the floor only raises: both are rewrites of
-    // the number the document named, so both are reported.
+    // The ceiling still tightens an explicit number; the floor and the
+    // quantization step apply to `auto` only, so there is no below-floor
+    // rewrite of `mem_budget_bytes` to report here.
     if let Some(configured) = settings.mem_budget_bytes {
         if configured > BUDGET_CAP {
             notes.push(Override::new(
@@ -46,13 +47,6 @@ pub fn derive_with(settings: &settings::Settings, profile: &ResourceProfile) -> 
                 configured,
                 BUDGET_CAP,
                 OverrideReason::BuildCap,
-            ));
-        } else if configured < budget.raw {
-            notes.push(Override::new(
-                "mem_budget_bytes",
-                configured,
-                budget.raw,
-                OverrideReason::BelowFloor,
             ));
         }
     }
