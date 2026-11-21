@@ -279,6 +279,7 @@ fn installed_conf_settings_for(
 }
 
 /// Keep a discovered install prefix across the Windows helper process.
+#[cfg(windows)]
 fn helper_args(args: &[String], prefix: Option<&Path>) -> Vec<String> {
     let mut helper = args.to_vec();
     let has_prefix = args

@@ -10,8 +10,6 @@ use crate::kernel::registry::Hook;
 use crate::platform::paths::Paths;
 use crate::supervise::ops::host::Supervisor;
 use crate::supervise::ops::slot::hook_command;
-#[cfg(unix)]
-use crate::wire::contract::reactor::Reactor;
 
 impl Supervisor {
     /// Run the optional status hook. This is only called when the caller asks

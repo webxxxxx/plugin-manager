@@ -263,22 +263,8 @@ fn drain_requests(
     wake: &Arc<Wake>,
     notify: Arc<UnixStream>,
 ) -> bool {
-    loop {
-        let Some(position) = connection.buffer.iter().position(|byte| *byte == b'\n') else {
-            if connection.buffer.len() > ipc::LOCAL_FRAME_MAX {
-                connection.out = rpc::to_line(&rpc::err_data(
-                    None,
-                    -32700,
-                    "management frame exceeds the local limit",
-                    Problem::Invalid.error_data(),
-                ))
-                .into_bytes();
-                connection.out.push(b'\n');
-                connection.close_after_write = true;
-            }
-            return true;
-        };
-        if position > ipc::LOCAL_FRAME_MAX {
+    let Some(position) = connection.buffer.iter().position(|byte| *byte == b'\n') else {
+        if connection.buffer.len() > ipc::LOCAL_FRAME_MAX {
             connection.out = rpc::to_line(&rpc::err_data(
                 None,
                 -32700,
@@ -288,38 +274,50 @@ fn drain_requests(
             .into_bytes();
             connection.out.push(b'\n');
             connection.close_after_write = true;
-            return true;
         }
-        let line: Vec<u8> = connection.buffer.drain(..=position).collect();
-        let line = String::from_utf8_lossy(&line[..line.len().saturating_sub(1)]).to_string();
-        let (sender, receiver) = mpsc::channel();
-        let reply = Reply::with_notify(sender, Notify::new(notify));
-        match tx.try_send(PendingCall {
-            line,
-            reply,
-            endpoint: connection.endpoint,
-        }) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                // Bounded backpressure: answer this connection with a visible
-                // error and close it instead of growing the supervisor queue.
-                connection.out = rpc::to_line(&rpc::err_data(
-                    None,
-                    -32000,
-                    "control queue is full; retry later",
-                    Problem::Internal.error_data(),
-                ))
-                .into_bytes();
-                connection.out.push(b'\n');
-                connection.close_after_write = true;
-                return true;
-            }
-            Err(TrySendError::Disconnected(_)) => return false,
-        }
-        wake.notify();
-        connection.pending = Some(receiver);
+        return true;
+    };
+    if position > ipc::LOCAL_FRAME_MAX {
+        connection.out = rpc::to_line(&rpc::err_data(
+            None,
+            -32700,
+            "management frame exceeds the local limit",
+            Problem::Invalid.error_data(),
+        ))
+        .into_bytes();
+        connection.out.push(b'\n');
+        connection.close_after_write = true;
         return true;
     }
+    let line: Vec<u8> = connection.buffer.drain(..=position).collect();
+    let line = String::from_utf8_lossy(&line[..line.len().saturating_sub(1)]).to_string();
+    let (sender, receiver) = mpsc::channel();
+    let reply = Reply::with_notify(sender, Notify::new(notify));
+    match tx.try_send(PendingCall {
+        line,
+        reply,
+        endpoint: connection.endpoint,
+    }) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            // Bounded backpressure: answer this connection with a visible
+            // error and close it instead of growing the supervisor queue.
+            connection.out = rpc::to_line(&rpc::err_data(
+                None,
+                -32000,
+                "control queue is full; retry later",
+                Problem::Internal.error_data(),
+            ))
+            .into_bytes();
+            connection.out.push(b'\n');
+            connection.close_after_write = true;
+            return true;
+        }
+        Err(TrySendError::Disconnected(_)) => return false,
+    }
+    wake.notify();
+    connection.pending = Some(receiver);
+    true
 }
 
 fn write_connection(connections: &mut HashMap<u64, Connection>, id: u64) {
@@ -385,7 +383,7 @@ mod tests {
                 let value: serde_json::Value = serde_json::from_str(&call.line).expect("request");
                 let id = value.get("id").cloned();
                 let reply = rpc::to_line(&rpc::ok(id, serde_json::json!({ "ok": true })));
-                let _ = call.reply.send(reply);
+                call.reply.send(reply);
             }
         });
 
@@ -483,7 +481,7 @@ mod tests {
             for call in rx {
                 let value: serde_json::Value = serde_json::from_str(&call.line).expect("request");
                 let id = value.get("id").cloned();
-                let _ = call.reply.send(rpc::to_line(&rpc::ok(
+                call.reply.send(rpc::to_line(&rpc::ok(
                     id,
                     serde_json::json!({ "ok": true }),
                 )));
@@ -670,11 +668,11 @@ mod tests {
     fn a_derived_one_slot_queue_answers_busy_on_the_second_request() {
         let mut limits = crate::platform::limits::test_default();
         limits.pending_queue = 1;
-        let (tx, mut rx) = mpsc::sync_channel(limits.pending_queue);
+        let (tx, rx) = mpsc::sync_channel(limits.pending_queue);
         let notify = Arc::new(UnixStream::pair().expect("notify").1);
         let wake = Arc::new(Wake::new());
 
-        let mut connection = |tx: &mpsc::SyncSender<PendingCall>| {
+        let connection = |_tx: &mpsc::SyncSender<PendingCall>| {
             let (stream, _peer) = UnixStream::pair().expect("pair");
             Connection {
                 stream,

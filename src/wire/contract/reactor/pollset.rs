@@ -143,6 +143,9 @@ fn poll_events(source: &Source) -> i16 {
     }
 }
 
+/// One raw plugin being told why its transport closed: id, hub handle, reason.
+type ClosingEntry = (String, Option<(Weak<dyn RawStopSink>, u64)>, RawFailure);
+
 /// Drop every source marked dead and tell the raw hub which plugins lost
 /// their transport.
 fn retire(sources: &mut Vec<Source>) {
@@ -150,7 +153,7 @@ fn retire(sources: &mut Vec<Source>) {
         return;
     }
     let mut kept = Vec::with_capacity(sources.len());
-    let mut closing: Vec<(String, Option<(Weak<dyn RawStopSink>, u64)>, RawFailure)> = Vec::new();
+    let mut closing: Vec<ClosingEntry> = Vec::new();
     let mut closed = HashSet::new();
     for source in sources.drain(..) {
         match source.stop {

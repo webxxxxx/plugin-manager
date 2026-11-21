@@ -13,8 +13,6 @@ use crate::platform::log;
 use crate::supervise::check::start;
 use crate::supervise::model::supervisor::{self, Event};
 use crate::supervise::ops::host::Supervisor;
-#[cfg(unix)]
-use crate::wire::contract::reactor::Reactor;
 
 impl Supervisor {
     pub(crate) fn start_service(

@@ -223,7 +223,7 @@ pub(super) fn effective_mode(
             if raw & 0o111 == 0 {
                 return Err(Problem::Invalid.error(format!("{} is not executable", path)));
             }
-            return Ok(raw);
+            Ok(raw)
         }
         #[cfg(not(unix))]
         {

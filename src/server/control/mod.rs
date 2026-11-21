@@ -172,7 +172,7 @@ mod tests {
             for call in rx {
                 let value: serde_json::Value = serde_json::from_str(&call.line).expect("request");
                 let id = value.get("id").cloned();
-                let _ = call.reply.send(rpc::to_line(&rpc::ok(
+                call.reply.send(rpc::to_line(&rpc::ok(
                     id,
                     serde_json::json!({ "ok": true }),
                 )));

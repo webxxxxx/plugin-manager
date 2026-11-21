@@ -119,6 +119,9 @@ pub(crate) trait ControlChannel {
 pub(crate) trait ControlListener {
     type Stream: ControlStream;
 
+    /// Only the Windows accept-thread half calls this; a poll host hands the
+    /// listener to its own loop instead.
+    #[cfg_attr(unix, allow(dead_code))]
     fn incoming(&self) -> impl Iterator<Item = io::Result<Self::Stream>> + '_;
 }
 

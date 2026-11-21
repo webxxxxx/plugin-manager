@@ -521,6 +521,8 @@ fn free_disk(path: &Path) -> Option<u64> {
     let cpath = CString::new(path.as_os_str().as_bytes()).ok()?;
     // SAFETY: `statvfs` is a plain C struct and the call only writes into it.
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `cpath` is a live NUL-terminated string and `stat` is a local the
+    // call only writes into.
     if unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) } != 0 {
         return None;
     }

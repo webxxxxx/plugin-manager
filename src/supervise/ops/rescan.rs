@@ -15,8 +15,6 @@ use crate::supervise::check::reconcile;
 use crate::supervise::model::definition;
 use crate::supervise::model::runtime::{self};
 use crate::supervise::ops::host::Supervisor;
-#[cfg(unix)]
-use crate::wire::contract::reactor::Reactor;
 
 impl Supervisor {
     /// Re-scan `services.d` plus the plugin store and reconcile the registry.

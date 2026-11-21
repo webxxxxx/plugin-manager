@@ -67,6 +67,7 @@ impl Api {
 /// Ask the running daemon to shut down. The event loop checks this flag on
 /// every wake, so a caller on any thread (the Windows SCM control handler,
 /// for example) can stop it without touching daemon state.
+#[cfg(windows)]
 pub use crate::platform::host::signal::request_shutdown;
 
 struct Daemon {
