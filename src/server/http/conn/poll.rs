@@ -22,7 +22,7 @@ impl ConnectionDriver for Driver {
             routes,
             fallback,
             budget,
-            bus,
+            install_bus_wake,
             governor,
             control,
         } = input;
@@ -40,7 +40,7 @@ impl ConnectionDriver for Driver {
             routes,
             fallback,
             budget,
-            bus,
+            install_bus_wake,
             governor,
         )?;
         Ok(ServerHandle::poll(loop_handle))

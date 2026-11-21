@@ -94,11 +94,11 @@ pub(crate) struct StartInput {
     pub fallback: FallbackHandler,
     /// The one long-lived stream budget built by the composition root.
     pub budget: crate::server::http::budget::StreamBudget,
-    /// The UI event bus. The poll driver installs a wake-up so a published
-    /// event is written on the next loop iteration; the thread driver leaves
-    /// it alone and relies on the handler's own cadence.
+    /// How the driver tells the UI bus where to write its wake-up. Passing an
+    /// installer instead of the bus keeps this layer from naming the face
+    /// module: the composition root owns the wire between the two.
     #[cfg_attr(not(unix), allow(dead_code))]
-    pub bus: Arc<crate::face::uichannel::EventBus>,
+    pub install_bus_wake: Option<Arc<dyn Fn(Arc<dyn Fn() + Send + Sync>) + Send + Sync>>,
     /// The CPU budget, when the document sets one. Both drivers refuse new
     /// connections while it is exceeded.
     pub governor: Option<Arc<crate::server::http::governor::CpuGovernor>>,

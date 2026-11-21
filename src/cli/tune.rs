@@ -115,6 +115,13 @@ pub fn config_text(limits: &Limits, report: &ResourceReport) -> String {
         ));
     }
 
+    out.push_str(&count_line(
+        "cpu_budget_percent",
+        limits.cpu_budget_percent as u64,
+        "0 disables the CPU governor; 1..100 caps this process with a kernel \
+         cap plus admission shedding",
+    ));
+
     out.push_str("#\n");
     out.push_str("# disk (does not enter the memory budget):\n");
     out.push_str(&format!(
@@ -307,6 +314,25 @@ mod tests {
         assert!(text.contains("% of the 1.0 GiB budget"));
         assert!(text.contains("# disk (does not enter the memory budget):"));
         assert!(text.contains("# install volume: 20.0 GiB"));
+    }
+
+    #[test]
+    fn the_tuning_output_names_the_cpu_budget_and_the_blocking_queue() {
+        // Both keys were added after the first version of this output; naming
+        // them here keeps the block complete as new limits land.
+        let (limits, report) = derived(machine(), Settings::default());
+        let text = config_text(&limits, &report);
+        assert!(
+            text.contains(&format!(
+                "cpu_budget_percent = {}",
+                limits.cpu_budget_percent
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("blocking_queue = {}", limits.blocking_queue)),
+            "{text}"
+        );
     }
 
     #[test]
