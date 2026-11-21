@@ -587,10 +587,13 @@ fn status_resources_reports_the_last_start_and_falls_back_without_one() {
 fn an_unrunnable_document_is_still_inspectable() {
     let sandbox = Sandbox::new();
     fs::create_dir_all(sandbox.config_dir()).expect("config dir");
-    // A 64 MiB budget with an 8 MiB stack on ten threads cannot be planned.
+    // A budget equal to the resident baseline cannot be planned on any host:
+    // the invariant has to find room for connection buffers, the raw in-flight
+    // allowance and the UI ring on top, and the baseline is a constant, so the
+    // refusal does not depend on how many threads a platform charges stacks for.
     fs::write(
         sandbox.config_dir().join("svcd.conf"),
-        "mem_budget_bytes = 67108864\nrequest_stack_bytes = 8388608\nblocking_threads = 8\n",
+        "mem_budget_bytes = 33554432\nrequest_stack_bytes = 8388608\nblocking_threads = 8\n",
     )
     .expect("write conf");
 

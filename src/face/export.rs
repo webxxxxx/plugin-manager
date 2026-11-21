@@ -162,8 +162,8 @@ impl ExportStream {
         };
         let filename = format!(
             "{}-{}.{}",
-            super::api::safe_filename(&id),
-            super::api::safe_filename(&version),
+            super::reply::safe_filename(&id),
+            super::reply::safe_filename(&version),
             extension
         );
         let plan = match target {

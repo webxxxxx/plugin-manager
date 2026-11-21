@@ -106,6 +106,8 @@ fn the_daemon_reports_the_memory_budget_it_derived() {
         log.contains("svcd: workload: streaming (derived)"),
         "log misses the shape:\n{log}"
     );
-    let overrides = log.matches("svcd: override: max_complete_body_bytes:").count();
+    let overrides = log
+        .matches("svcd: override: max_complete_body_bytes:")
+        .count();
     assert_eq!(overrides, 1, "each override is logged once:\n{log}");
 }

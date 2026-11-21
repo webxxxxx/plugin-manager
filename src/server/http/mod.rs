@@ -9,6 +9,7 @@ pub mod budget;
 #[cfg(feature = "http")]
 pub(crate) mod conn;
 pub mod contract;
+pub mod date;
 pub mod dispatch;
 #[cfg(all(unix, feature = "http"))]
 pub mod driver;
