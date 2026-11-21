@@ -147,7 +147,7 @@ pub(super) fn spawn_http(
         fallback,
         control,
         budget,
-        bus,
+        install_bus_wake: Some(Arc::new(move |wake| bus.set_wake(wake))),
         governor,
     })?;
     Ok(Arc::new(Api { lan, driver }))

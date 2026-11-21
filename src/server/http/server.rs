@@ -83,7 +83,7 @@ pub(crate) fn start(
     routes: Arc<dyn PreBodyRoutes>,
     fallback: FallbackHandler,
     budget: StreamBudget,
-    bus: Arc<crate::face::uichannel::EventBus>,
+    install_bus_wake: Option<Arc<dyn Fn(Arc<dyn Fn() + Send + Sync>) + Send + Sync>>,
     governor: Option<Arc<crate::server::http::governor::CpuGovernor>>,
 ) -> std::io::Result<LoopHandle> {
     let (results_tx, results_rx) = mpsc::channel();
@@ -98,10 +98,10 @@ pub(crate) fn start(
     // deadline (up to 100 ms). The pipe is non-blocking: a full pipe already
     // means a wake-up is pending.
     let bus_wake = Arc::new(AtomicBool::new(false));
-    {
+    if let Some(install) = install_bus_wake {
         let notify = notify_tx.clone();
         let bus_wake = bus_wake.clone();
-        bus.set_wake(Arc::new(move || {
+        install(Arc::new(move || {
             bus_wake.store(true, Ordering::SeqCst);
             let _ = (&*notify).write(&[1]);
         }));
