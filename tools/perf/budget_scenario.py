@@ -277,7 +277,26 @@ else:
             if line.startswith(("VmRSS:", "Threads:")):
                 key, value = line.split(":", 1)
                 values[key] = int(value.split()[0])
-        return {"rss": values.get("VmRSS", 0) * 1024, "threads": values.get("Threads", 0)}
+        return {
+            "rss": values.get("VmRSS", 0) * 1024,
+            "threads": values.get("Threads", 0),
+            "pss": _read_pss(pid),
+        }
+
+    def _read_pss(pid):
+        """Proportional set size: shared pages split across their owners.
+
+        Summed RSS counts one libc page once per plugin process, which is why a
+        plugin count read off RSS looks far more expensive than it is.
+        """
+        try:
+            text = Path("/proc/%d/smaps_rollup" % pid).read_text()
+        except OSError:
+            return 0
+        for line in text.splitlines():
+            if line.startswith("Pss:"):
+                return int(line.split()[1]) * 1024
+        return 0
 
     def _read_stat(pid):
         try:
@@ -315,15 +334,19 @@ else:
             pending.extend([
                 child for child, info in table.items() if info["ppid"] == current
             ])
-        rss = private = cpu = 0
+        rss = private = pss = cpu = 0
         threads = 0
         for current in seen:
             info = table[current]
             rss += info["rss"]
             private += info["rss"]
+            pss += info.get("pss", 0)
             cpu += info["cpu"]
             threads += info["threads"]
-        return {"processes": len(seen), "rss": rss, "private": private, "cpu": cpu, "threads": threads}
+        return {
+            "processes": len(seen), "rss": rss, "private": private, "pss": pss,
+            "cpu": cpu, "threads": threads,
+        }
 
 
 def percentile(samples, percent):
@@ -1016,9 +1039,11 @@ def run_traffic(address, token, plugins, duration, global_concurrency, per_plugi
     for thread in threads:
         thread.join()
     elapsed = time.monotonic() - began
+    merged = []
     for plugin in plugins:
         for op in OPS:
             bucket = results[plugin][op]
+            merged.extend(bucket["latencies"])
             bucket["latency"] = summarize(bucket.pop("latencies"))
     for op in OPS:
         overall = global_[op]
@@ -1032,6 +1057,9 @@ def run_traffic(address, token, plugins, duration, global_concurrency, per_plugi
         "peak_active": peak,
         "peak_total": peak_total[0],
         "summary": global_,
+        # Every surface in one distribution: a single latency answer for the run,
+        # next to the per-surface ones a slow individual surface would hide in.
+        "overall_latency": summarize(merged),
         "total_ok": total_ok,
         "total_attempts": total_attempts,
         "total_rps": total_ok / elapsed if elapsed else 0,
@@ -1152,6 +1180,13 @@ def render_report(result):
     lines.append("| surface | attempts | ok | errors | rps | p50 ms | p95 ms | p99 ms | max ms | peak concurrent |")
     lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     peak = meta.get("peak_active") or {}
+    overall = meta.get("overall_latency") or {}
+    if overall:
+        lines.append("| all surfaces | %s | %s | %s | %.1f | %.1f | %.1f | %.1f | %.1f | %s |" % (
+            meta.get("total_attempts", 0), meta.get("total_ok", 0),
+            meta.get("total_attempts", 0) - meta.get("total_ok", 0),
+            meta.get("total_rps", 0), overall.get("p50", 0), overall.get("p95", 0),
+            overall.get("p99", 0), overall.get("max", 0), meta.get("peak_total", 0)))
     for op in OPS:
         item = summary.get(op) or {}
         latency = item.get("latency") or {}
@@ -1176,6 +1211,9 @@ def render_report(result):
     lines.append("")
     lines.append("| sample | avg | max |")
     lines.append("| --- | ---: | ---: |")
+    if (resource.get("tree_pss") or {}).get("max", 0) > 0:
+        item = resource["tree_pss"]
+        lines.append("| process tree PSS MB | %.2f | %.2f |" % (item["avg"] / MIB, item["max"] / MIB))
     for key, label, unit in (
         ("daemon_rss", "daemon RSS MB", MIB),
         ("spk_rss", "spk RSS MB", MIB),
@@ -1427,6 +1465,9 @@ def main():
             max(0, sample["tree"]["rss"] - sample["daemon"]["rss"])
             for sample in samples if sample["daemon"] and sample["tree"]
         ]
+        tree_pss = [
+            sample["tree"].get("pss", 0) for sample in samples if sample["tree"]
+        ]
         processes = [sample["tree"]["processes"] for sample in samples if sample["tree"]]
         daemon_cpu = [sample["daemon"]["cpu"] for sample in samples if sample["daemon"]]
         tree_cpu = [sample["tree"]["cpu"] for sample in samples if sample["tree"]]
@@ -1437,6 +1478,7 @@ def main():
             "daemon_rss": summarize(daemon_rss),
             "spk_rss": summarize(spk_rss),
             "tree_rss": summarize(tree_rss),
+            "tree_pss": summarize(tree_pss),
             "daemon_threads": summarize(daemon_threads),
             "tree_threads": summarize(tree_threads),
             "processes": summarize(processes),
