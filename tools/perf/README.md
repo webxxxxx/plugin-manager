@@ -22,6 +22,8 @@ node tools/perf/run.mjs --compat   # protocol/client compatibility only
 node tools/perf/run.mjs --perf     # HTTP/MCP/WS/SSE + mixed workload
 node tools/perf/run.mjs --all      # both
 node tools/perf/run.mjs --scale    # 0/5/10/30 plugins, process-tree RSS/CPU
+python3 tools/perf/budget_scenario.py \
+  --budget 50mb --plugins 10 --duration 60   # fixed mem_budget_bytes, all five faces
 ```
 
 Outputs:
@@ -29,6 +31,9 @@ Outputs:
 - `target/perf-results.json` — raw compatibility checks and latency samples
 - `target/perf-report.md` — tables for the current run
 - `target/scale-results.json` / `target/scale-report.md` — 0/5/10/30 plugin scale run
+- `target/budget-results.json` / `target/budget-report.md` — fixed-budget run:
+  requested vs effective budget, derived limits, per-plugin per-surface traffic,
+  RSS/CPU samples and the oversubscription probe
 
 The harness creates `target/perf-run-<timestamp>/` with config, data, logs and
 the bundled `perf.spk`. It writes a test token into `config/lan-token` before
@@ -117,3 +122,10 @@ PowerShell 7 and a release binary; they are **not** part of `run.mjs` or
   HTTP/1.1 keep-alive, so their numbers include connection reuse.
 - Numbers are machine-specific and intended for relative comparison and
   bottleneck discovery, not as production capacity claims.
+- `budget_scenario.py` requests an explicit `mem_budget_bytes` and drives every
+  plugin through invoke (MCP `tools/call`), SSE, WebSocket, blob upload and blob
+  download, then opens more streams than the budget admits to check that the
+  refusals are 429/503 rather than a crash. `--traffic idle` only boots the
+  plugins and samples RSS/CPU. `--bootstrap direct` writes the registry layout
+  before boot for hosts whose control channel is unavailable; it skips signature
+  verification and staging, so leave it off on a normal host.

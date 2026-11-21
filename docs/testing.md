@@ -126,7 +126,9 @@ Windows 走每连接线程回退，但上面的连接数、每 IP 与 idle 探�
 - **PR**：不跑真实网络性能（噪声大），只保留 `spk_smoke.py`；
 - **每晚 / 手动**：跑 `--perf`，上传 `target/perf-report.md` 与 JSON；
 - **基线**：先记录同一 runner 的 p50/p95/p99、RSS、线程数；稳定后对 p95 与 RSS 设 20% 回归阈值，超过才失败；
-- **内存预算**：用 `workload = tiny|interactive|streaming`（而不是 `MEM_LEVEL` 档位）各跑一次空载 RSS，确认三种形状确实不同，且没有 OOM/重启。
+- **内存预算**：用 `workload = tiny|interactive|streaming`（而不是 `MEM_LEVEL` 档位）各跑一次空载 RSS，确认三种形状确实不同，且没有 OOM/重启。脚本：
+  `python tools/perf/budget_scenario.py --traffic idle --budget 50mb|512mb|2gb --plugins 10 --duration 60`；
+  五面流量去掉 `--traffic idle` 即可（invoke / SSE / WS / upload / download 都会被逐插件驱动）。
 
 性能数字是机器相关的；不要拿不同 runner 的绝对值当门槛，只做同机相对比较。
 
