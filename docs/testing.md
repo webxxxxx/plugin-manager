@@ -66,6 +66,8 @@
 
 MCP 不是 W3C，不要用 WPT 套；官方 SDK + 规范逐条向量就是这一层的「一致性测试」。
 
+2026-11-21 现状：`--compat` 已覆盖 401/403、`-32602`、`-32020`、`-32022`、`404/-32601`、202 notification、405 GET、413 body cap 与 `-32700`；官方 SDK 仍走 stdio，Streamable HTTP 的旧 era 不扩展。
+
 ## 4. 内存预算、形状与 `svcd.conf` 边界
 
 `MEM_LEVEL=low|middle|high` 现在是**编译期预算上限**（128 MiB / 512 MiB / 2 GiB，只收紧），`svcd.conf` 的 `mem_budget_bytes` / `workload` 与其余键是运行期输入；显式 `mem_budget_bytes` 按原值生效（只受编译期上限约束），`auto` 才受 64 MiB 下限与量化台阶约束；派生全部落在 [limits.rs](../src/platform/limits.rs)，探测落在 [resources.rs](../src/platform/resources.rs)。测试分五段：
@@ -253,7 +255,7 @@ MCP SSE 的 handler 由 `cargo test --bin svcd server::mcp::progress` 覆盖：S
 | `test.yml` | PR / main | `cargo test`、`--no-default-features`、`.spk` smoke、`MEM_LEVEL` 三档 |
 | `test.yml` guardrails | PR / main | `tools/closed-tickets-merged.mjs --map 112`：已关闭子票必须有提交在 base |
 | `perf.yml` | 每周 / 手动 | `--perf`，上传报告与 JSON |
-| `compat.yml` | 每晚 / 手动 | `--compat`（Linux，22 条向量）；失败上传 `perf-report.md`、`perf-results.json` 与 daemon stderr |
+| `compat.yml` | 每晚 / 手动 | `--compat`（Linux，33 条向量）；失败上传 `perf-report.md`、`perf-results.json` 与 daemon stderr |
 | Autobahn / WHATWG SSE（待接） | — | WS fuzzingclient 与 SSE 表驱动向量；尚无工作流 |
 
 性能与兼容的完整套件不要塞进 PR：PR 只保留可确定、分钟级的检查。
