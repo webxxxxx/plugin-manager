@@ -424,11 +424,11 @@ pub fn run<S, H>(
             let Some(connection) = connections.get_mut(&id) else {
                 continue;
             };
-            if revents & libc::POLLOUT != 0 || connection.out_at < connection.out.len() {
-                if !handler.on_writable(connection) {
-                    if let Some(mut connection) = connections.remove(&id) {
-                        handler.on_close(&mut connection);
-                    }
+            if (revents & libc::POLLOUT != 0 || connection.out_at < connection.out.len())
+                && !handler.on_writable(connection)
+            {
+                if let Some(mut connection) = connections.remove(&id) {
+                    handler.on_close(&mut connection);
                 }
             }
         }

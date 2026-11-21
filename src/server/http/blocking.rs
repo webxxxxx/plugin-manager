@@ -4,7 +4,9 @@
 //! blocking MCP fallback both need; keeping them here breaks the old
 //! `thread_loop` ↔ `mcp::fallback` cycle.
 
-use std::io::{Read, Write};
+#[cfg(not(unix))]
+use std::io::Read;
+use std::io::Write;
 use std::net::TcpStream;
 
 use crate::server::http::model as http;

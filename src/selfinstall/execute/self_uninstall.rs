@@ -306,6 +306,7 @@ pub fn self_uninstall(args: &[String], stop_daemon: &dyn Fn()) -> i32 {
     }
     // A Windows helper may run from the temp directory, so carry the prefix
     // explicitly instead of relying on program-directory discovery.
+    #[cfg(windows)]
     let child_args = helper_args(args, request.prefix.as_deref());
     #[cfg(windows)]
     if crate::platform::paths::user_mode()

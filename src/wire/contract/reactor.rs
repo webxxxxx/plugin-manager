@@ -288,6 +288,9 @@ impl Reactor {
     /// them and the caller asked for the ends. The poll set owns them from here
     /// on; they are blocking, and one read per readiness event is what keeps
     /// the supervisor loop from ever sitting in `read`.
+    // One call per plugin start; every argument is a distinct pipe or sink the
+    // caller already owns, and a struct would hide which pipe is which.
+    #[allow(clippy::too_many_arguments)]
     pub fn register(
         &self,
         id: String,
@@ -341,6 +344,8 @@ impl Reactor {
     /// The raw transport drains in bursts, so `WouldBlock` is its "empty"
     /// signal; `enlarge_pipe` gives one poll pass room to hand a whole frame
     /// to the plugin.
+    // Same shape as `register`, with the raw hub that owns the queue.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_raw(
         &self,
         id: String,

@@ -88,7 +88,7 @@ pub(super) fn add_user_path(dir: &Path) -> Result<Vec<PathBuf>, String> {
         }
         let text = fs::read_to_string(&path)
             .map_err(|error| format!("read {}: {}", path.display(), error))?;
-        if text.contains(&format!("# svcd user path\n")) && text.contains(&escaped) {
+        if text.contains("# svcd user path\n") && text.contains(&escaped) {
             files.push(path);
             continue;
         }

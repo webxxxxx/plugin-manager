@@ -332,9 +332,9 @@ mod imp {
         }
         #[cfg(target_os = "linux")]
         {
-            return process_state(pid)
+            process_state(pid)
                 .map(|state| state != 'Z' && state != 'X')
-                .unwrap_or(true);
+                .unwrap_or(true)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -469,10 +469,6 @@ mod imp {
         }
 
         pub(crate) fn terminate(&self) {}
-
-        pub(crate) fn active(&self) -> u32 {
-            0
-        }
     }
 }
 

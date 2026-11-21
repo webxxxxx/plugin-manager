@@ -70,6 +70,9 @@ struct PendingBlocking {
     keep_alive: bool,
 }
 
+// The composition root supplies every one of these exactly once; grouping them
+// would only move the list into a struct with the same fields.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn start(
     http: Option<TcpListener>,
     control_user: UnixListener,
@@ -379,6 +382,8 @@ fn blocking_busy(busy: Busy) -> Vec<u8> {
 
 /// Submit one server-owned buffered route. Kept as a free function so a
 /// queue-full test can drive it without building a whole connection table.
+// A free function so the queue-full test can drive one job without a server.
+#[allow(clippy::too_many_arguments)]
 fn submit_rendered_job(
     pool: &BlockingPool,
     connection: u64,

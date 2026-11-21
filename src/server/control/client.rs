@@ -192,7 +192,6 @@ impl StreamingClient {
             match connection.stream.read(&mut chunk) {
                 Ok(0) => {
                     self.connections.remove(&id);
-                    return;
                 }
                 Ok(read) => {
                     connection.buffer.extend_from_slice(&chunk[..read]);
