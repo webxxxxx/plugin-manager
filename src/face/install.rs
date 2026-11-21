@@ -84,7 +84,7 @@ fn staging_path(paths: &Paths) -> PathBuf {
 /// the summary-then-config-id fallback and the empty-warnings omission live
 /// here and nowhere else (#247).
 fn import_success(
-    summary: Value,
+    summary: Option<Value>,
     config_id: Option<String>,
     config_applied: bool,
     warnings: Vec<String>,
@@ -93,7 +93,7 @@ fn import_success(
         "ok": true,
         "configApplied": config_applied,
     });
-    if !summary.is_null() {
+    if let Some(summary) = summary {
         body["id"] = summary.get("id").cloned().unwrap_or(Value::Null);
         body["version"] = summary.get("version").cloned().unwrap_or(Value::Null);
         body["state"] = summary.get("state").cloned().unwrap_or(Value::Null);
@@ -123,8 +123,9 @@ fn import_response(
     config_applied: bool,
     warnings: Vec<String>,
 ) -> Vec<u8> {
+    let summary = import_status_summary(&status);
     import_success(
-        import_status_summary(&status),
+        (!summary.is_null()).then_some(summary),
         config_id,
         config_applied,
         warnings,
@@ -133,11 +134,7 @@ fn import_response(
 
 /// The bare-config import knows only a transfer outcome.
 fn import_outcome_json(outcome: transfer::Outcome) -> Vec<u8> {
-    let summary = outcome
-        .status
-        .as_ref()
-        .map(import_status_summary)
-        .unwrap_or(Value::Null);
+    let summary = outcome.status.as_ref().map(import_status_summary);
     let config_applied = outcome.config.is_some();
     import_success(summary, outcome.config, config_applied, outcome.warnings)
 }
@@ -302,14 +299,19 @@ mod tests {
         // serde_json keeps its default BTreeMap here, so the wire order is the
         // sorted key order; the assertion locks the bytes both routes send.
         assert_eq!(
-            body_of(import_success(summary.clone(), None, false, Vec::new())),
+            body_of(import_success(
+                Some(summary.clone()),
+                None,
+                false,
+                Vec::new()
+            )),
             br#"{"configApplied":false,"id":"demo","ok":true,"state":"stopped","version":"1.0.0"}"#
                 .to_vec()
         );
         // The summary id wins over the config id.
         assert_eq!(
             body_of(import_success(
-                summary,
+                Some(summary),
                 Some("other".to_string()),
                 true,
                 vec!["older version replaced".to_string()],
@@ -320,12 +322,23 @@ mod tests {
         // The bare-config import falls back to the config id.
         assert_eq!(
             body_of(import_success(
-                Value::Null,
+                None,
                 Some("demo".to_string()),
                 true,
                 Vec::new(),
             )),
             br#"{"configApplied":true,"id":"demo","ok":true}"#.to_vec()
+        );
+        // A transfer status that is present without a summary keeps the old
+        // null fields; it must not fall back to the config id.
+        assert_eq!(
+            body_of(import_success(
+                Some(Value::Null),
+                Some("demo".to_string()),
+                false,
+                Vec::new(),
+            )),
+            br#"{"configApplied":false,"id":null,"ok":true,"state":null,"version":null}"#.to_vec()
         );
     }
 
