@@ -92,10 +92,14 @@ bind = 127.0.0.1:8787
 # svcd reads this machine (free memory, the cgroup v2 limit of the container,
 # CPU count) and derives one **memory budget**: the peak memory this process may
 # plan for. `MEM_LEVEL=low|middle|high` (build time) is the ceiling that budget
-# can never exceed: 128 MiB / 512 MiB / 2 GiB. It only tightens.
+# can never exceed: 128 MiB / 512 MiB / 8 GiB. It only tightens.
 #
 #   mem_budget_bytes = auto      # default; 25% of free memory, capped by the build
 #   mem_budget_bytes = 268435456 # a number is taken as written (only the build cap lowers it)
+#   mem_budget_percent = 50      # the same decision as a share of free memory,
+#                                # 1..100; resolved at every start and then
+#                                # treated exactly like a number. Mutually
+#                                # exclusive with mem_budget_bytes.
 #
 # The **workload shape** decides how the budget is spent, not how big it is:
 #

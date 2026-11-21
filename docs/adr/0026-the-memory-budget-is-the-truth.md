@@ -20,7 +20,7 @@ Accepted（2026-11-20）。取代 `MEM_LEVEL` 作为"默认值选择器"的用�
    - 磁盘可用空间只进 `svc config tune` 的建议与状态展示，不进入派生与不变量（磁盘不是内存）。
    - **探测的每一项都可以被配置取代**（`probe_available_memory` / `probe_cgroup_remaining` / `probe_cpus` / `probe_install_free_disk` / `probe_temp_free_disk`）：写了的项以配置为准，并且**不再读 OS**；`0` 表示"未知"，也不回落到探测。理由是同一份配置要能在另一台机器上复现（story 14），而容器的 `/proc` 未必说真话；逐项覆盖而不是整块跳过，是为了只钉住需要钉的那一项。
 
-2. **`MEM_LEVEL` 从"默认值选择器"改成"预算硬上限"，只收紧不放宽。** 128 MiB / 512 MiB / 2 GiB 分别是 low / middle / high 的上限。删除它会让"发给受限 SKU 的二进制在此机器上最多规划多少"重新变成不可验证的运行时事实；保留成上限后，这个承诺对任意注入 profile 都成立，也因此可以写一条不依赖机器的测试（story 9/10/19）。
+2. **`MEM_LEVEL` 从"默认值选择器"改成"预算硬上限"，只收紧不放宽。** 128 MiB / 512 MiB / 8 GiB 分别是 low / middle / high 的上限（`high` 于 2026-11-21 由 2 GiB 抬到 8 GiB，见修订三）。删除它会让"发给受限 SKU 的二进制在此机器上最多规划多少"重新变成不可验证的运行时事实；保留成上限后，这个承诺对任意注入 profile 都成立，也因此可以写一条不依赖机器的测试（story 9/10/19）。
    - 它不再作用于任何单个键：单个键的上界来自份额 × 预算，编译期上限只作用于 `B`。
 
 3. **形状用份额，不用绝对值。** `workload: tiny | interactive | streaming` 决定预算**怎么花**（每连接占多少预算、单体占多少、流与在途占多少），不决定花多少。每键上界 = `min(绝对上限, 份额 × 量化后的 B 反解)`；形状基准 = 该形状在**参考预算**下的期望值（tiny@128 MiB、interactive@512 MiB、streaming@2 GiB）。旧三档表降级为校准锚点与回归观察，不再是运行时常量。
@@ -28,7 +28,8 @@ Accepted（2026-11-20）。取代 `MEM_LEVEL` 作为"默认值选择器"的用�
    - 绝对值表会被不变量压平，份额不会：收缩按同一比例作用在份额上，三个形状在任何预算下仍严格可区分。**唯一的例外**是"并发"与"单体"不可能同时随形状单调上升——`连接数 × 单体` 是乘积，在 2 GiB 上给 streaming 768 连接就不允许 8 MiB 的单体。本文的选择：**单体在 interactive 达到峰值、streaming 用更小的单体换更多长连接**；测试 `the_shapes_never_collapse_into_one_result` 固定这一点（2026-11-21 修订二把「并发严格单调上升」换成「按余量反推」，见下）。
 
    - **2026-11-21 修订（二）：连接数不再是一份份额，而是不变量剩下的余量。** 一槽的最坏成本是 `单体驻留 + 流缓冲 + 线程栈`（tiny 在 50 MiB 预算下是 29 KiB），旧份额 `16 MiB/3` 把它高估了约 150 倍：50 MiB 只派生出 9 条连接，10 个插件各 1 个并发都装不下，实测第 5 个插件就撞 503。现在未显式配置时按 `(预算 - 其余各项) / 每槽成本` 解出条数（`Limits::fitting_connections`，上限 4096），显式值优先、随后照旧被不变量收缩。于是「预算即真值」对并发也成立：50 MiB 能放数百条连接，而不是 9 条。
-     - 形状的顺序随之反过来：**单体越小，同样预算放下的连接越多**，tiny 最多、interactive 单体最大；`the_shapes_never_collapse_into_one_result` 改为断言这个方向，`the_reference_values_stay_close_to_the_historical_table` 不再为连接数设锚点（它已经是派生量，不是常量）。
+     - **2026-11-21 修订（三）：`high` 的上限从 2 GiB 抬到 8 GiB，并新增 `mem_budget_percent`。** `auto` 取可用内存的 25%，2 GiB 的上限在可用内存 ≥ 8 GiB 的机器上让 `auto` 饱和：预算不再跟着机器走，而这正是本 ADR 第 1 条要避免的失败模式。8 GiB 让 `auto` 在可用内存 ≤ 32 GiB 的机器上仍然是真的 25%；`low`/`middle` 与级别名不变，CI 的三档矩阵不变。百分比键（1..100）把显式尺寸写成「可用内存的份额」，解析成字节之后与显式数字同路：只受上限约束、不做量化、仍过不变量；与 `mem_budget_bytes` 互斥，两者同时出现是配置错误。被上限夹住时报告里记一行 `mem_budget_percent: 90 -> <上限>`（左是配置值、右是生效预算的字节数），不静默改写。
+   - 形状的顺序随之反过来：**单体越小，同样预算放下的连接越多**，tiny 最多、interactive 单体最大；`the_shapes_never_collapse_into_one_result` 改为断言这个方向，`the_reference_values_stay_close_to_the_historical_table` 不再为连接数设锚点（它已经是派生量，不是常量）。
      - `max_connections_per_ip` 未显式配置时等于连接数：控制台、CLI 和反向代理都从同一个地址来，低于全局上限的每 IP 上限会让全局上限永远用不满。
      - 代价：50 MiB 的 daemon 现在可能接受数百条连接。CPU 不再是隐形的——`cpu_budget_percent` 提供内核硬限与准入闸门，让「接多少」与「吃多少 CPU」分别可限。
 

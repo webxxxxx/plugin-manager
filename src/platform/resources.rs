@@ -299,17 +299,44 @@ pub struct Budget {
 
 /// Derive the memory budget.
 ///
-/// * `configured` is the document's `mem_budget_bytes`; `None` means `auto`.
+/// * `configured` is the document's `mem_budget_bytes`; `None` means `auto`
+///   (or a percentage, see below).
+/// * `configured_percent` is the document's `mem_budget_percent`, a share of
+///   the same available-memory probe `auto` uses. It is resolved here because
+///   only this function sees the profile; the parse keeps the two keys
+///   mutually exclusive.
 /// * `cap` is the compile-time ceiling; the result never exceeds it (user
 ///   story 10), so a `MEM_LEVEL=low` build plans for at most 128 MiB even on a
 ///   64 GiB host (user story 9).
-pub fn budget(configured: Option<u64>, profile: &ResourceProfile, cap: u64) -> Budget {
+pub fn budget(
+    configured: Option<u64>,
+    configured_percent: Option<usize>,
+    profile: &ResourceProfile,
+    cap: u64,
+) -> Budget {
     // An explicit number is the operator's decision: take it as written, bounded
     // only by the compile-time cap. The floor and the quantization step exist to
     // keep a noisy probe stable, so they apply to `auto` only — silently
     // rewriting a configured 50 MiB to 64 MiB would make the document lie.
     if let Some(value) = configured {
         let raw = cap.min(value);
+        return Budget {
+            raw,
+            quantized: raw,
+            source: BudgetSource::Configured,
+        };
+    }
+    // A percentage is the same decision, stated against this machine instead of
+    // in bytes: it is resolved from the probe, then treated exactly like a
+    // number (cap only, no floor, no quantization). Without a probe there is
+    // nothing to take a percentage of, so the ceiling stands in — the same
+    // degradation `auto` uses when the probe fails.
+    if let Some(percent) = configured_percent {
+        let requested = profile
+            .available_memory
+            .map(|available| available.saturating_mul(percent as u64) / 100)
+            .unwrap_or(cap);
+        let raw = cap.min(requested);
         return Budget {
             raw,
             quantized: raw,
@@ -682,7 +709,7 @@ mod tests {
             available_memory: Some(4 * GIB),
             ..ResourceProfile::default()
         };
-        let budget = budget(None, &profile, 8 * GIB);
+        let budget = budget(None, None, &profile, 8 * GIB);
 
         assert_eq!(budget.raw, GIB);
         assert_eq!(budget.source, BudgetSource::Auto);
@@ -695,7 +722,7 @@ mod tests {
             ..ResourceProfile::default()
         };
         for value in [50 * MIB, 256 * MIB, 500 * MIB] {
-            let budget = budget(Some(value), &profile, 8 * GIB);
+            let budget = budget(Some(value), None, &profile, 8 * GIB);
 
             // Neither the 64 MiB floor nor the quantization step rewrites an
             // explicit number: 50 MiB stays 50 MiB and 500 MiB does not fall
@@ -704,6 +731,38 @@ mod tests {
             assert_eq!(budget.quantized, value);
             assert_eq!(budget.source, BudgetSource::Configured);
         }
+    }
+
+    #[test]
+    fn a_percentage_budget_claims_that_share_of_available_memory() {
+        let profile = ResourceProfile {
+            available_memory: Some(4 * GIB),
+            ..ResourceProfile::default()
+        };
+        for percent in [1, 50, 90] {
+            let budget = budget(None, Some(percent), &profile, 8 * GIB);
+
+            assert_eq!(budget.raw, 4 * GIB * percent as u64 / 100, "{percent}%");
+            assert_eq!(
+                budget.quantized, budget.raw,
+                "an explicit ask is not quantized: {percent}%"
+            );
+            assert_eq!(budget.source, BudgetSource::Configured);
+        }
+    }
+
+    #[test]
+    fn a_percentage_budget_is_capped_and_degrades_without_a_probe() {
+        let huge = ResourceProfile {
+            available_memory: Some(64 * GIB),
+            ..ResourceProfile::default()
+        };
+        assert_eq!(budget(None, Some(90), &huge, 8 * GIB).raw, 8 * GIB);
+
+        // Nothing to take a share of: the ceiling stands in, the same way
+        // `auto` degrades when the probe fails.
+        let empty = ResourceProfile::default();
+        assert_eq!(budget(None, Some(50), &empty, 8 * GIB).raw, 8 * GIB);
     }
 
     #[test]
@@ -716,7 +775,7 @@ mod tests {
         // The budget can never exceed the cap, whatever the machine reports or
         // the document asks for (user stories 9 and 10).
         for configured in [None, Some(16 * GIB), Some(GIB)] {
-            let budget = budget(configured, &huge, 128 * MIB);
+            let budget = budget(configured, None, &huge, 128 * MIB);
             assert_eq!(budget.raw, 128 * MIB, "configured {configured:?}");
         }
     }
@@ -725,19 +784,19 @@ mod tests {
     fn the_auto_budget_never_goes_below_the_floor() {
         let empty = ResourceProfile::default();
         // With no input at all the build ceiling is the budget (user story 8).
-        assert_eq!(budget(None, &empty, 2 * GIB).raw, 2 * GIB);
+        assert_eq!(budget(None, None, &empty, 2 * GIB).raw, 2 * GIB);
 
         let tiny_machine = ResourceProfile {
             available_memory: Some(16 * MIB),
             ..ResourceProfile::default()
         };
-        assert_eq!(budget(None, &tiny_machine, 2 * GIB).raw, MIN_BUDGET);
+        assert_eq!(budget(None, None, &tiny_machine, 2 * GIB).raw, MIN_BUDGET);
     }
 
     #[test]
     fn a_configured_budget_below_the_floor_is_taken_as_written() {
         let empty = ResourceProfile::default();
-        let budget = budget(Some(1), &empty, 2 * GIB);
+        let budget = budget(Some(1), None, &empty, 2 * GIB);
 
         assert_eq!(budget.raw, 1);
         assert_eq!(budget.quantized, 1);
@@ -751,7 +810,7 @@ mod tests {
             ..ResourceProfile::default()
         };
 
-        assert_eq!(budget(None, &profile, 8 * GIB).raw, GIB);
+        assert_eq!(budget(None, None, &profile, 8 * GIB).raw, GIB);
     }
 
     #[test]
@@ -777,6 +836,7 @@ mod tests {
         let shape = |available: u64| {
             Workload::of_budget(quantize(
                 budget(
+                    None,
                     None,
                     &ResourceProfile {
                         available_memory: Some(available),

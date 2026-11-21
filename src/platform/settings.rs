@@ -120,6 +120,12 @@ pub struct Settings {
     /// clamped by the floor and the compile-time ceiling. See
     /// [`crate::platform::limits`].
     pub mem_budget_bytes: Option<u64>,
+    /// The peak memory this process may plan for, as a percentage of the same
+    /// probe `auto` uses (available memory). Mutually exclusive with
+    /// `mem_budget_bytes`: the document asks for a size one way or the other.
+    /// Resolved against the probe at startup and only clamped by the
+    /// compile-time ceiling, like an explicit number.
+    pub mem_budget_percent: Option<usize>,
     /// How the budget is spent. Absent derives the shape from the budget:
     /// below 512 MiB `tiny`, below 2 GiB `interactive`, otherwise `streaming`.
     pub workload: Option<Workload>,
@@ -226,6 +232,7 @@ pub(crate) const ENV_KEYS: &[&str] = &[
     "progress_queue",
     "cpu_budget_percent",
     "mem_budget_bytes",
+    "mem_budget_percent",
     "workload",
     "probe_available_memory",
     "probe_cgroup_remaining",
@@ -522,6 +529,16 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
                     _ => Some(parse_u64(value, "mem_budget_bytes", index)?),
                 }
             }
+            "mem_budget_percent" => {
+                let percent = parse_usize(value, "mem_budget_percent", index)?;
+                if !(1..=100).contains(&percent) {
+                    return Err(format!(
+                        "line {}: mem_budget_percent must be 1..=100, got {percent}",
+                        index + 1
+                    ));
+                }
+                settings.mem_budget_percent = Some(percent);
+            }
             "probe_available_memory" => {
                 settings.probe_available_memory =
                     Some(parse_u64(value, "probe_available_memory", index)?)
@@ -551,6 +568,13 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
             }
             other => return Err(format!("line {}: unknown key {:?}", index + 1, other)),
         }
+    }
+    // One size, stated one way. Both keys in one document is ambiguous — the
+    // percentage would silently lose to the number, or the other way round.
+    if settings.mem_budget_bytes.is_some() && settings.mem_budget_percent.is_some() {
+        return Err(
+            "mem_budget_bytes and mem_budget_percent are mutually exclusive; keep one".to_string(),
+        );
     }
     Ok(settings)
 }
@@ -1029,6 +1053,30 @@ mod document_tests {
 
         let settings = parse("config_dir = /srv/svcd#1\n", Path::new("/")).expect("parse");
         assert_eq!(settings.config_dir, Some(PathBuf::from("/srv/svcd#1")));
+    }
+
+    #[test]
+    fn a_percentage_budget_parses_and_is_kept_apart_from_a_number() {
+        let settings = parse("mem_budget_percent = 90\n", Path::new("/etc/svcd")).expect("percent");
+        assert_eq!(settings.mem_budget_percent, Some(90));
+        assert_eq!(settings.mem_budget_bytes, None);
+
+        for value in ["0", "101", "-5"] {
+            let error = parse(
+                &format!("mem_budget_percent = {value}\n"),
+                Path::new("/etc/svcd"),
+            )
+            .expect_err("out of range");
+            assert!(error.contains("mem_budget_percent"), "{error}");
+        }
+
+        // One size, stated one way.
+        let error = parse(
+            "mem_budget_bytes = 52428800\nmem_budget_percent = 50\n",
+            Path::new("/etc/svcd"),
+        )
+        .expect_err("both keys");
+        assert!(error.contains("mutually exclusive"), "{error}");
     }
 
     #[test]
