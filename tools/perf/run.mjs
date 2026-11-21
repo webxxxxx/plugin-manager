@@ -442,7 +442,7 @@ async function sseRaw(daemon, lastEventId, trigger) {
             return;
           }
           response.destroy();
-          settle(resolve, { id: idMatch ? Number(idMatch[1]) : null, data: data });
+          settle(resolve, { id: idMatch ? Number(idMatch[1]) : null, data: data, raw: event });
           return;
         }
       });
@@ -779,6 +779,18 @@ async function runCompat(daemon, token) {
     } finally {
       source.close();
     }
+  });
+
+  await check('SSE raw frame carries id, event and data fields', async function () {
+    const event = await sseRaw(daemon, null, async function () {
+      const call = await uiRpc(daemon, 'perf.echo', 51);
+      assert.equal(call.status, 200, call.body.toString());
+    });
+    assert.ok(event.id > 0, 'expected an id');
+    assert.match(event.raw, /^id: \d+$/m);
+    assert.match(event.raw, /^event: message$/m);
+    assert.match(event.raw, /^data: .+$/m);
+    return 'id=' + event.id;
   });
 
   await check('SSE Last-Event-ID replays a missed event', async function () {
