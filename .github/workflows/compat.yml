@@ -1,0 +1,58 @@
+name: compat
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly at 04:17 UTC; off the hour to avoid the top-of-hour queue.
+    - cron: '17 4 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compat
+  cancel-in-progress: true
+
+jobs:
+  compat:
+    name: compat / ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The workspace path is deep enough to approach the ~108-byte sun_path
+      # limit for the control socket; the runner temp root stays short.
+      PERF_WORK_ROOT: ${{ runner.temp }}/svcd-perf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: compat
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Build the release daemon
+        run: cargo build --release
+      - name: Install the harness dependencies
+        working-directory: tools/perf
+        run: npm ci
+      - name: Run the compatibility suite
+        run: node tools/perf/run.mjs --compat
+      - name: Collect daemon logs
+        if: always()
+        run: |
+          mkdir -p target/compat-logs
+          find "$PERF_WORK_ROOT" -name daemon.stderr -exec cp {} target/compat-logs/ \; 2>/dev/null || true
+      - name: Upload the compatibility report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-report
+          path: |
+            target/perf-report.md
+            target/perf-results.json
+            target/compat-logs/daemon.stderr
+          if-no-files-found: warn
