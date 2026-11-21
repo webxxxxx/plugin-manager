@@ -518,13 +518,16 @@ fn an_idle_connection_is_closed_without_a_response() {
 #[cfg(target_os = "linux")]
 #[test]
 fn unix_idle_thread_count_has_no_per_request_or_per_stream_threads() {
-    let (sandbox, address) = daemon_with_web_event_plugin(55);
+    // Pin the pool: the derivation scales it with the host's shape (tiny 4,
+    // interactive 8, streaming 16), and this test is about threads per request,
+    // not about how many workers the host earns.
+    let (sandbox, address) = daemon_with_web_event_plugin_conf(55, "blocking_threads = 2\n");
     let pid = sandbox.daemon.as_ref().expect("running daemon").id();
 
     let idle = stable_thread_count(pid);
     assert_eq!(
         idle, IDLE_DAEMON_THREADS,
-        "idle daemon uses {idle} threads; the default S4 baseline is {IDLE_DAEMON_THREADS}, so this is a thread-budget regression"
+        "idle daemon uses {idle} threads; with the pinned two-worker pool the S4 baseline is {IDLE_DAEMON_THREADS}, so this is a thread-budget regression"
     );
     let names = daemon_thread_names(pid);
     assert!(

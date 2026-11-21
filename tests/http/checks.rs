@@ -334,8 +334,9 @@ pub(crate) fn rpc_body(id: u64, name: &str) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 /// The default S4 topology: supervisor (which also polls plugin stdio), server
-/// loop and the two blocking workers. Update this pin in the slice that changes
-/// the baseline.
+/// loop and the two blocking workers the thread test pins with
+/// `blocking_threads = 2`. Update this pin in the slice that changes the
+/// baseline.
 #[cfg(target_os = "linux")]
 pub(crate) const IDLE_DAEMON_THREADS: usize = 4;
 

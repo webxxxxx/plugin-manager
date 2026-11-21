@@ -10,7 +10,9 @@ use super::*;
 fn the_daemon_reports_the_memory_budget_it_derived() {
     let mut sandbox = Sandbox::new();
     // 8 GiB of free memory -> a 2 GiB budget (the build ceiling), i.e. the
-    // streaming shape. The two explicit values are above that shape's share.
+    // streaming shape. The body is above that shape's share; 4096 connections
+    // sit on the spec's own ceiling, so the invariant shrinks the resident
+    // single-request body instead of the connection count.
     fs::write(
         sandbox.config.join("svcd.conf"),
         "probe_available_memory = 8589934592\nmax_connections = 4096\nmax_body_bytes = 1073741824\n",
@@ -62,8 +64,8 @@ fn the_daemon_reports_the_memory_budget_it_derived() {
     assert!(
         summary
             .iter()
-            .any(|line| line.starts_with("max_connections 4096 ")
-                && line.ends_with("above-upper-bound")),
+            .any(|line| line.starts_with("max_complete_body_bytes ")
+                && line.ends_with("invariant-shrink")),
         "{summary:?}"
     );
     assert!(
@@ -87,7 +89,7 @@ fn the_daemon_reports_the_memory_budget_it_derived() {
         "memory:",
         "workload: streaming (derived)",
         "worst case:",
-        "override: max_connections: 4096 ->",
+        "override: max_complete_body_bytes:",
         "override: max_body_bytes: 1073741824 ->",
         "stated:  probe_available_memory",
     ] {
@@ -104,6 +106,6 @@ fn the_daemon_reports_the_memory_budget_it_derived() {
         log.contains("svcd: workload: streaming (derived)"),
         "log misses the shape:\n{log}"
     );
-    let overrides = log.matches("svcd: override: max_connections:").count();
+    let overrides = log.matches("svcd: override: max_complete_body_bytes:").count();
     assert_eq!(overrides, 1, "each override is logged once:\n{log}");
 }
