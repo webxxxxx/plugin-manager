@@ -112,6 +112,13 @@ pub fn verify_password_cached(password: &str, encoded: &str) -> bool {
     BEARER_CACHE.verify(password, encoded)
 }
 
+/// Whether this exact credential is in the process-wide cache. Test-only: it is
+/// how a caller proves it went through the cache instead of re-deriving the KDF.
+#[cfg(test)]
+pub(crate) fn credential_is_cached(password: &str, encoded: &str) -> bool {
+    BEARER_CACHE.hit(&cache_key(password, encoded))
+}
+
 fn cache_key(password: &str, encoded: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(encoded.as_bytes());

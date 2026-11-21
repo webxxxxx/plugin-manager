@@ -289,7 +289,9 @@ fn authorize(headers: &[(String, String)], password_hash: Option<&str>) -> Resul
         return Err(unauthorized("Bearer authorization is required"));
     };
     match password_hash {
-        Some(hash) if crate::platform::auth::verify_password(bearer, hash) => Ok(()),
+        // Every MCP request carries the same Bearer, so the KDF runs once per
+        // 300 s window instead of once per request (see VerifyCache).
+        Some(hash) if crate::platform::auth::verify_password_cached(bearer, hash) => Ok(()),
         _ => Err(http::json_error(
             403,
             "forbidden",
@@ -338,6 +340,35 @@ mod tests {
             true
         ));
         assert!(!stream_requested("application/json", true));
+    }
+
+    #[test]
+    fn an_authorized_request_leaves_the_bearer_in_the_cache() {
+        // The KDF must run once per cache window, not once per request: a
+        // tenth of a second per MCP call is what the uncached path cost.
+        let password = "mcp-cache-probe-password";
+        let hash = crate::platform::auth::hash_password(password).expect("hash");
+        let headers = [("authorization".to_string(), format!("Bearer {}", password))];
+        assert!(authorize(&headers, Some(&hash)).is_ok());
+        assert!(
+            crate::platform::auth::credential_is_cached(password, &hash),
+            "an authorized MCP request must verify through the cache"
+        );
+    }
+
+    #[test]
+    fn a_rejected_bearer_is_not_cached() {
+        let password = "mcp-cache-good-password";
+        let hash = crate::platform::auth::hash_password(password).expect("hash");
+        let headers = [(
+            "authorization".to_string(),
+            "Bearer not-the-password".to_string(),
+        )];
+        assert!(authorize(&headers, Some(&hash)).is_err());
+        assert!(!crate::platform::auth::credential_is_cached(
+            "not-the-password",
+            &hash
+        ));
     }
 
     #[test]
