@@ -7,15 +7,6 @@ use crate::manage as package;
 use crate::manage::model::layout::{active_config, current_version, plugin_dir};
 use crate::platform::paths::Paths;
 
-#[derive(Debug, serde::Deserialize)]
-pub struct Backup {
-    pub schema: u32,
-    pub id: String,
-    pub version: String,
-    #[serde(rename = "configSha256")]
-    pub config_sha256: Option<String>,
-}
-
 pub fn export_config(paths: &Paths, id: &str) -> Result<(String, Vec<u8>), ProblemError> {
     let version = current_version(paths, id)
         .ok_or_else(|| Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)))?;

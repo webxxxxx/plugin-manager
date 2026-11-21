@@ -10,8 +10,10 @@ pub mod ops;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub use check::backup::{parse_backup, BackupRules};
 pub use check::plugin::*;
 pub use check::verify::*;
+pub use model::backup::*;
 pub(crate) use model::hex::hex_sha256;
 pub use model::layout::*;
 pub use model::manifest::*;

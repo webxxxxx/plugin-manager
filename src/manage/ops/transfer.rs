@@ -2,8 +2,9 @@
 //!
 //! Three inputs are recognised, in this order: a `.spkb` backup (first entry
 //! `backup.json`), a `.spk` package (first entry `manifest.json`), and a bare
-//! config. Keeping the classification, validation and install call here means
-//! the CLI and the HTTP surface cannot drift apart.
+//! config. The classification, buffered tar read and install call stay here;
+//! the .spkb validation rules live in `manage::check::backup`, and the
+//! streaming import path calls the same rules.
 //!
 //! A failure carries the [`Problem`] raised by the layer that rejected the
 //! input (#151); the HTTP face projects the category to a status and never
@@ -106,14 +107,7 @@ fn import_backup(
         .iter()
         .find(|entry| entry.path == "backup.json")
         .ok_or_else(|| Error::Failed(Problem::Invalid.error("backup.json is missing")))?;
-    let backup: plugin::Backup = serde_json::from_slice(&backup.data).map_err(|error| {
-        Error::Failed(Problem::Invalid.error(format!("invalid backup.json: {}", error)))
-    })?;
-    if backup.schema != 1 {
-        return Err(Error::Failed(
-            Problem::Invalid.error(format!("unsupported backup schema {}", backup.schema)),
-        ));
-    }
+    let backup = plugin::parse_backup(&backup.data).map_err(Error::Failed)?;
     let spk = entries
         .iter()
         .find(|entry| entry.path == "plugin.spk")
@@ -121,50 +115,21 @@ fn import_backup(
     let (package, _) =
         package::verify_bytes_with_fallback(&spk.data, allow_insecure, &paths.trust_dir)
             .map_err(Error::Failed)?;
-    if package.manifest.name != backup.id {
-        return Err(Error::Failed(Problem::Invalid.error(format!(
-            "backup id {} does not match package id {}",
-            backup.id, package.manifest.name
-        ))));
-    }
-    if package.manifest.version != backup.version {
-        return Err(Error::Failed(Problem::Invalid.error(format!(
-            "backup version {} does not match package version {}",
-            backup.version, package.manifest.version
-        ))));
-    }
-    if let Some(expected) = &backup.config_sha256 {
-        let config = entries
-            .iter()
-            .find(|entry| entry.path == "config")
-            .ok_or_else(|| {
-                Error::Failed(
-                    Problem::Invalid.error("backup declares a config hash but config is missing"),
-                )
-            })?;
-        if &package::hex_sha256(&config.data) != expected {
-            return Err(Error::Failed(
-                Problem::Invalid.error("backup config hash does not match"),
-            ));
-        }
-    }
-
-    let mut warnings = Vec::new();
-    if let Some(current) = plugin::current_version(paths, &backup.id) {
-        if current != backup.version {
-            warnings.push(format!(
-                "installed {} is {}, importing {}",
-                backup.id, current, backup.version
-            ));
-        } else if !force {
-            return Err(Error::Failed(Problem::Conflict.error(format!(
-                "{} {} is already installed; use --force",
-                backup.id, backup.version
-            ))));
-        }
-    }
 
     let config = entries.iter().find(|entry| entry.path == "config");
+    let current = plugin::current_version(paths, &backup.id);
+    let plan = plugin::BackupRules {
+        backup: &backup,
+        package_id: &package.manifest.name,
+        package_version: &package.manifest.version,
+        config: config.map(|entry| entry.data.as_slice()),
+        current_version: current.as_deref(),
+        force,
+    }
+    .plan()
+    .map_err(Error::Failed)?;
+    let warnings = plan.warnings;
+
     let with_config = !no_config && config.is_some();
     if with_config && require_root {
         plugin::root_required().map_err(Error::Failed)?;
