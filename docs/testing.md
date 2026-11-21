@@ -118,7 +118,7 @@ Windows 走每连接线程回退，但上面的连接数、每 IP 与 idle 探�
 
 `tools/perf` 已经是完整的兼容 + 性能 harness，但**不在 CI**：
 
-- `--compat`：协议/客户端兼容；
+- `--compat`：协议/客户端兼容；启动后经 `svc lan passwd` 设置 `/mcp` 的 Bearer，并经 `POST /api/v1/plugins/{id}/ui-token` 取得实时端点的 token；每个 case 有 20 s 上限，失败以非零退出；
 - `--perf`：HTTP / MCP / WS / SSE 在并发 1/8/32 下的延迟与吞吐；
 - `--scale`：0/5/10/30 插件的进程树 RSS/CPU；
 - `reactor_scale*.py`：20/1000 连接与 soak。

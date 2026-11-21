@@ -37,8 +37,11 @@ Outputs:
   RSS/CPU samples and the oversubscription probe
 
 The harness creates `target/perf-run-<timestamp>/` with config, data, logs and
-the bundled `perf.spk`. It writes a test token into `config/lan-token` before
-start so `/mcp` works without root; LAN stays disabled.
+the bundled `perf.spk`. After start it sets `auth_passwd` through
+`svc lan passwd`, so `/mcp` accepts `Bearer <password>`; it then mints a
+`/plugin-ui/perf/{token}/` base through `POST /api/v1/plugins/perf/ui-token`
+for the WS, SSE and `/rpc` checks. LAN stays disabled; the HTTP API remains
+loopback-only and unauthenticated.
 
 ## Coverage
 
