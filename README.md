@@ -82,6 +82,20 @@ svc start demo
 svc list
 ```
 
+> **注意：还没有官方插件商城，也就没有对外颁发的受信公钥。** `svc trust add` 只能加你自己的公钥；
+> 要装**未签名**的 `.spk`（自己用 `plugin bundle --unsigned` 打的、或从源码构建的样例包），
+> 先在本机配置里打开开关，再重启 daemon：
+>
+> ```ini
+> # ~/.config/svcd/svcd.conf（Windows: %APPDATA%\svcd\svcd.conf）
+> allow_insecure_install = true
+> ```
+>
+> 它只影响「验签」这一步：有签名的包照常验签，未签名的包才走回退接受；结构校验（manifest、平台三元组、
+> 路径、大小）不因此放松。开关关着时装未签名包会被直接拒绝（报 `signature.json must be the second entry`）。
+> 没有单次安装的命令行开关，控制台也不给这个选项——开关必须留在配置里，事后可查。装完记得改回 `false`；
+> 正式分发仍然应该签名，然后用 `svc trust add` 加信任根。
+
 然后在浏览器打开 `http://127.0.0.1:8787/`，用控制台点「打开」——控制台会现签一个 1 小时有效的插件 UI token，地址形如 `/plugin-ui/demo/<token>/`。
 
 ### 接入 MCP 客户端
