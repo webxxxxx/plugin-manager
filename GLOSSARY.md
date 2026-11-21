@@ -121,7 +121,7 @@ svcd 可占用本机 CPU 的比例，键是 `cpu_budget_percent`（0..100，默�
 _Avoid_: CPU 配额（那是 cgroup 的量）、限速（那是调用级别的）、线程数
 
 **负载形状（Workload shape）**:
-`tiny | interactive | streaming`，决定内存预算怎么花（并发份额、单体份额、流与在途份额），不决定花多少。默认由量化后的预算推导（< 512 MiB → tiny，< 2 GiB → interactive，否则 streaming），`svcd.conf` 的 `workload` 可以显式覆盖；状态里标明它是「推导得到」还是「人工指定」。形状在收缩之后仍保持区分：并发严格单调上升，单体在 interactive 达到峰值，streaming 用更小的单体换更多长连接。
+`tiny | interactive | streaming`，决定内存预算怎么花（并发份额、单体份额、流与在途份额），不决定花多少。默认由量化后的预算推导（< 512 MiB → tiny，< 2 GiB → interactive，否则 streaming），`svcd.conf` 的 `workload` 可以显式覆盖；状态里标明它是「推导得到」还是「人工指定」。形状在收缩之后仍保持区分：连接数不再是份额，而是按不变量剩下的余量反推，所以**单体越小、同样预算放下的连接越多**（tiny 最多，interactive 单体最大），streaming 用更小的单体换更多长连接。
 _Avoid_: 资源档位、模式、profile
 
 **派生覆盖说明（Override note）**:

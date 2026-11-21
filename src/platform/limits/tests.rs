@@ -77,22 +77,22 @@ fn every_shape_fits_the_floor_budget() {
 #[test]
 fn the_shapes_never_collapse_into_one_result() {
     // The old absolute table was flattened by the invariant: after the
-    // same shrink, the three levels looked alike. Concurrency is the axis
-    // the problem statement names, so it stays strictly ordered at every
-    // budget; the shapes are also pairwise distinct, and streaming pays for
-    // its concurrency with a smaller resident body than interactive.
+    // same shrink, the three levels looked alike. Connections are now solved
+    // against the budget instead of being a share of it, so the axis is the
+    // resident body: the smaller the body, the more slots the same budget
+    // holds. The shapes stay pairwise distinct and tiny always leads.
     for budget in [64 * MIB, 128 * MIB, 256 * MIB, 512 * MIB, GIB, 2 * GIB] {
         let tiny = derive_for(budget, Some(Workload::Tiny), Settings::default());
         let interactive = derive_for(budget, Some(Workload::Interactive), Settings::default());
         let streaming = derive_for(budget, Some(Workload::Streaming), Settings::default());
 
         assert!(
-            tiny.limits.max_connections < interactive.limits.max_connections,
+            tiny.limits.max_connections > interactive.limits.max_connections,
             "tiny/interactive at {budget}"
         );
         assert!(
-            interactive.limits.max_connections < streaming.limits.max_connections,
-            "interactive/streaming at {budget}"
+            tiny.limits.max_connections > streaming.limits.max_connections,
+            "tiny/streaming at {budget}"
         );
         for (left, right) in [
             (&tiny, &interactive),
@@ -123,11 +123,11 @@ fn the_reference_values_stay_close_to_the_historical_table() {
         // Historical 128 KiB / 1 MiB / 8 MiB. Streaming drops to 2 MiB:
         // 512 connections at 8 MiB each never fit a 2 GiB budget.
         ("max_complete_body_bytes", [128 * KIB, MIB, 8 * MIB]),
-        ("max_connections", [32, 128, 512]),
-        // Historical 8 / 32 / 64. The relationship (a quarter of the
-        // connection budget) is what survived; the numbers follow it.
-        ("max_connections_per_ip", [8, 32, 64]),
-        ("max_streams", [8, 16, 64]),
+        // Connections are not on this list: they are solved against the
+        // budget now (Limits::fitting_connections), so there is no historical
+        // anchor to stay close to. The budget bound below is the anchor.
+        // max_streams is solved from the connection count now, so it has no
+        // historical anchor either.
         ("ws_raw_queue", [16, 64, 128]),
     ];
     for (key, row) in historical {
@@ -143,9 +143,6 @@ fn the_reference_values_stay_close_to_the_historical_table() {
                 "max_body_bytes" => derived.limits.max_body,
                 "max_json_body_bytes" => derived.limits.max_json_body,
                 "max_complete_body_bytes" => derived.limits.max_complete_body,
-                "max_connections" => derived.limits.max_connections as u64,
-                "max_connections_per_ip" => derived.limits.max_connections_per_ip as u64,
-                "max_streams" => derived.limits.max_streams as u64,
                 "ws_raw_queue" => derived.limits.ws_raw_queue as u64,
                 other => panic!("no accessor for {other}"),
             };
@@ -205,15 +202,16 @@ fn the_boundary_matrix_holds_for_every_shape() {
             budget,
             Some(workload),
             Settings {
-                max_connections: Some(4096),
+                max_connections: Some(usize::MAX),
                 ..Settings::default()
             },
         );
-        let default = derive_for(budget, Some(workload), Settings::default());
-        assert_eq!(
-            above.limits.max_connections,
-            default.limits.max_connections,
-            "{} falls back to its own shape's value",
+        // Above the ceiling the value is clamped to it, then the invariant
+        // shrinks it to what the budget holds; it no longer falls back to the
+        // shape's solved count, which is not an upper bound any more.
+        assert!(
+            above.limits.max_connections <= crate::platform::limits::MAX_CONNECTIONS_CEILING,
+            "{}",
             workload.as_str()
         );
         assert_eq!(
@@ -405,9 +403,13 @@ fn the_build_cap_only_tightens_the_budget() {
 fn a_configuration_that_cannot_fit_is_refused_with_the_terms() {
     // The stack term is fixed per shape and cannot be shrunk, so a large
     // stack on a small budget has no legal answer.
+    // Pinned connections keep the solver from absorbing the overshoot: with
+    // an unconfigured count the budget would simply hold fewer slots, which is
+    // the intended answer, not a refusal.
     let settings = Settings {
         request_stack_bytes: Some(8 * MIB as usize),
         blocking_threads: Some(8),
+        max_connections: Some(64),
         ..Settings::default()
     };
     let derived = derive_for(MIN_BUDGET, Some(Workload::Streaming), settings);
@@ -415,7 +417,6 @@ fn a_configuration_that_cannot_fit_is_refused_with_the_terms() {
     let reason = derived.report.refusal.expect("refuses");
     assert!(reason.contains("does not fit"), "{reason}");
     assert!(reason.contains("thread stacks"), "{reason}");
-    assert!(reason.contains("64.0 MiB"), "{reason}");
 }
 
 /// Not in a `mem_low` build: the fixed terms alone (128 × 2 MiB of queued
@@ -428,12 +429,15 @@ fn a_maxed_out_legal_configuration_is_shrunk_until_the_invariant_holds() {
     // Every value here is inside its band, but together they cannot fit:
     // the derivation shrinks the single request body first, then the
     // concurrency, and reports both.
+    // The connection count is pinned: an unconfigured one is solved to fit,
+    // which would shrink the answer instead of the configuration.
     let settings = Settings {
         max_streams: Some(1024),
         ws_raw_max_bytes: Some(2 * MIB as usize),
         ws_raw_queue: Some(128),
         request_stack_bytes: Some(8 * MIB as usize),
         blocking_threads: Some(8),
+        max_connections: Some(2048),
         ..Settings::default()
     };
     let derived = derive_for(2 * GIB, Some(Workload::Streaming), settings);
@@ -523,7 +527,7 @@ fn every_limit_has_a_floor() {
 }
 
 #[test]
-fn a_huge_value_falls_back_instead_of_clamping_to_the_ceiling() {
+fn a_huge_value_is_clamped_to_the_ceiling_and_kept_legal() {
     let settings = Settings {
         max_streams: Some(usize::MAX),
         max_connections: Some(usize::MAX),
@@ -532,17 +536,24 @@ fn a_huge_value_falls_back_instead_of_clamping_to_the_ceiling() {
     let derived = derive_for(2 * GIB, Some(Workload::Streaming), settings);
     let default = derive_for(2 * GIB, Some(Workload::Streaming), Settings::default());
 
-    // The new contract: over the upper bound means "back to the shape's
-    // reference", not "up to the absolute ceiling".
-    assert_eq!(derived.limits.max_streams, default.limits.max_streams);
+    // The contract for a value above its upper bound: clamp to the absolute
+    // ceiling, record it, and let the invariant keep the result legal. Streams
+    // follow the connection count now, so the shape's solved value is not a
+    // fallback any more.
+    assert!(derived.limits.max_streams <= 1024);
+    assert_eq!(
+        note(&derived.report, "max_streams").map(|note| note.reason),
+        Some(OverrideReason::AboveUpperBound)
+    );
     assert_eq!(
         derived.limits.max_connections,
-        default.limits.max_connections
+        crate::platform::limits::MAX_CONNECTIONS_CEILING
     );
     assert_eq!(
         note(&derived.report, "max_connections").map(|note| note.reason),
         Some(OverrideReason::AboveUpperBound)
     );
+    assert!(derived.limits.worst_case_bytes() <= 2 * GIB);
 }
 
 #[test]
@@ -578,16 +589,25 @@ fn a_large_default_never_exceeds_the_max_timeout() {
 
 #[test]
 fn a_lower_budget_never_raises_a_derived_value() {
-    let mut previous: Option<Limits> = None;
-    for budget in [2 * GIB, GIB, 512 * MIB, 256 * MIB, 128 * MIB, 64 * MIB] {
-        let limits = derive_for(budget, None, Settings::default()).limits;
-        if let Some(previous) = previous {
-            assert!(limits.max_connections <= previous.max_connections);
-            assert!(limits.max_body <= previous.max_body);
-            assert!(limits.ws_inflight_bytes <= previous.ws_inflight_bytes);
-            assert!(limits.pending_queue <= previous.pending_queue);
+    // Per shape: the unconfigured budget also picks the shape, and a shape
+    // change legitimately moves the connection count (a smaller body holds
+    // more slots), so comparing across shapes would test the wrong thing.
+    for workload in Workload::ALL {
+        let mut previous: Option<Limits> = None;
+        for budget in [2 * GIB, GIB, 512 * MIB, 256 * MIB, 128 * MIB, 64 * MIB] {
+            let limits = derive_for(budget, Some(workload), Settings::default()).limits;
+            if let Some(previous) = previous {
+                assert!(
+                    limits.max_connections <= previous.max_connections,
+                    "{} at {budget}",
+                    workload.as_str()
+                );
+                assert!(limits.max_body <= previous.max_body);
+                assert!(limits.ws_inflight_bytes <= previous.ws_inflight_bytes);
+                assert!(limits.pending_queue <= previous.pending_queue);
+            }
+            previous = Some(limits);
         }
-        previous = Some(limits);
     }
 }
 

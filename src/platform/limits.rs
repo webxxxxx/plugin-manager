@@ -117,10 +117,38 @@ pub const UI_RING_BYTES: u64 = 2 * 1024 * 1024;
 /// Resident cost of one subscriber's cursor in the ring's list.
 pub const SUBSCRIBER_BYTES: u64 = 128;
 
+/// The absolute ceiling on a derived connection count. It matches the spec's
+/// upper bound; the invariant normally stops far below it.
+pub const MAX_CONNECTIONS_CEILING: usize = 4096;
+
 impl Limits {
     /// Threads the invariant charges a stack for.
     pub fn threads(&self) -> usize {
         threads_for(self.max_connections, self.blocking_threads)
+    }
+
+    /// How many connection slots (and streams, one per slot) the rest of this
+    /// worst case leaves over.
+    ///
+    /// The connection count stops being a share of the budget and becomes what
+    /// actually fits: every other term (baseline, thread stacks, stream
+    /// buffers, in-flight bytes, queues, the UI ring) is already known, so the
+    /// remainder divided by one slot's worst case is the answer.
+    pub fn fitting_concurrency(&self, budget: u64) -> usize {
+        let per = (self.max_complete_body + self.stream_buffer as u64)
+            .saturating_add(derive::stack_per_connection(self))
+            .max(1);
+        // One slot carries one stream and one subscriber cursor, so both are
+        // part of the slot's cost when the three counts are solved together.
+        let per_slot = per
+            .saturating_add(self.stream_buffer as u64)
+            .saturating_add(SUBSCRIBER_BYTES);
+        let others = self
+            .worst_case_bytes()
+            .saturating_sub(self.max_connections as u64 * per)
+            .saturating_sub(self.max_streams as u64 * self.stream_buffer as u64);
+        let fits = budget.saturating_sub(others) / per_slot;
+        (fits as usize).clamp(1, MAX_CONNECTIONS_CEILING)
     }
 
     /// The peak memory this configuration may reach, by the spec's formula:

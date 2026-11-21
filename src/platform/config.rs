@@ -365,12 +365,15 @@ mod tests {
 
     #[test]
     fn a_config_that_cannot_fit_its_budget_refuses_to_start() {
-        // A 64 MiB budget with a 8 MiB stack on ten threads cannot be planned:
-        // the stack term alone is larger than the whole budget.
+        // A 64 MiB budget with an 8 MiB stack on 32 pinned connections cannot
+        // be planned: the stack term alone is larger than the whole budget.
+        // The connection count is pinned because an unconfigured one is solved
+        // to fit, which is the intended answer rather than a refusal.
         let settings = Settings {
             mem_budget_bytes: Some(64 * 1024 * 1024),
             request_stack_bytes: Some(8 * 1024 * 1024),
             blocking_threads: Some(8),
+            max_connections: Some(32),
             ..Settings::default()
         };
 

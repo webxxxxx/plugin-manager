@@ -238,8 +238,9 @@ pub fn generated(settings: &Settings) -> String {
          # max_header_bytes = 8192 / 16384 / 65536\n\
          # max_streams = 24 / 48 / 96\n\
          # stream_buffer_bytes = 8192 / 32768 / 131072\n\
-         # max_connections = 28 / 128 / 682\n\
-         # max_connections_per_ip = 16 / 32 / 64\n\
+         # max_connections = solved from the budget (one slot costs the\n\
+         # resident body plus the stream buffer, not a share of it)\n\
+         # max_connections_per_ip = max_connections unless set explicitly\n\
          # max_subscriptions = 64 / 128 / 256\n\
          # max_subscribers_per_plugin = 16 / 32 / 64\n\
          # cpu_budget_percent = 0 (default; 0..100). 0 disables the governor.\n\
