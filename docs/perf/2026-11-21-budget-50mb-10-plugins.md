@@ -5,6 +5,10 @@
 构建：`cargo build --release`，main `f71f7d7` + 本地 perf 场景脚本  
 插件：10 个（Python NDJSON fixture，带 `echo` 能力与 WebUI）
 
+> **2026-11-21 修订**：显式 `mem_budget_bytes` 现在按原值生效（不再被 64 MiB 下限抬升）。
+> 本文的 50 MB 数据是修订前（生效 64 MiB）的历史记录；修订后的 18 格矩阵见
+> [2026-11-21-budget-matrix-win11-wsl.md](2026-11-21-budget-matrix-win11-wsl.md)。
+
 ## 方法
 
 - 每次启动一个全新的 `svcd`；`svcd.conf` 只写 `bind`、`mem_budget_bytes`
