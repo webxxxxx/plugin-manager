@@ -33,6 +33,8 @@ pub mod plugin_ui;
 #[cfg(feature = "http")]
 pub mod prebody;
 #[cfg(feature = "http")]
+pub mod reply;
+#[cfg(feature = "http")]
 pub mod routes;
 #[cfg(feature = "http")]
 pub mod support;

@@ -13,17 +13,19 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use crate::kernel::failure::ProblemError;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::manage as package;
 use crate::manage as plugin;
 use crate::platform::config::Config;
 use crate::platform::log;
-use crate::platform::paths::Paths;
 use crate::server::auth::lan::{self, AuthKind, Lan};
 use crate::server::http::model as http;
 use crate::server::http::{Completion, Exchange, Face, Request, Response, Route};
 
+use super::reply::{
+    cap_log, decode, download_response, error_response, method_not_allowed, problem_error_response,
+    project_service, rpc_error, safe_filename, summary_response,
+};
 use super::routes::{self, Endpoint};
 
 const UI: &str = include_str!("../web/index.html");
@@ -547,108 +549,6 @@ impl ApiFace {
     }
 }
 
-fn decode(value: &str) -> String {
-    http::percent_decode(value, true)
-}
-
-fn cap_log(mut text: String, log_max_bytes: u64) -> String {
-    if text.len() <= log_max_bytes as usize {
-        return text;
-    }
-    let mut start = text.len() - log_max_bytes as usize;
-    while start < text.len() && !text.is_char_boundary(start) {
-        start += 1;
-    }
-    if let Some(newline) = text[start..].find('\n') {
-        // Keep complete lines when possible; a single line longer than the
-        // budget keeps its tail rather than becoming empty.
-        let candidate = start + newline + 1;
-        if candidate < text.len() {
-            start = candidate;
-        }
-    }
-    text.drain(..start);
-    text
-}
-
-fn error_response(status: u16, code: &str, message: &str) -> Response {
-    Response::json(
-        status,
-        &json!({ "error": { "code": code, "message": message } }),
-    )
-}
-
-fn rpc_error(failure: support::RpcFailure) -> Response {
-    let (status, code, message) = failure;
-    error_response(status, code, &message)
-}
-
-/// One projection for every typed management failure: the category raised
-/// where the operation failed decides the status (#151).
-fn problem_error_response(error: &ProblemError) -> Response {
-    let status = support::status_for_problem_error(error);
-    error_response(status, support::code_for(status), error.detail())
-}
-
-fn method_not_allowed(allow: &str) -> Response {
-    Response::json(
-        405,
-        &json!({
-            "error": {
-                "code": "method_not_allowed",
-                "message": format!("method not allowed; use {}", allow),
-            }
-        }),
-    )
-    .with_header("Allow", allow)
-}
-
-fn summary_response(status: Value) -> Response {
-    Response::json(
-        200,
-        &json!({
-            "summary": status.get("summary").cloned().unwrap_or(Value::Null)
-        }),
-    )
-}
-
-fn download_response(filename: &str, data: &[u8]) -> Response {
-    Response::new(200, "application/octet-stream", data)
-        .with_header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .with_header("Cache-Control", "no-store")
-}
-
-pub(crate) fn safe_filename(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
-        })
-        .collect()
-}
-
-fn project_service(status: &Value, paths: &Paths) -> Option<Value> {
-    let has_config = status
-        .pointer("/details/config")
-        .and_then(Value::as_str)
-        .is_some();
-    let has_ui = status
-        .get("summary")
-        .and_then(|summary| summary.get("id"))
-        .and_then(Value::as_str)
-        .map(|id| crate::manage::web_assets(paths, id).is_some())
-        .unwrap_or(false);
-    let mut summary = status.get("summary").cloned()?;
-    if let Some(object) = summary.as_object_mut() {
-        object.insert("hasConfig".into(), Value::Bool(has_config));
-        object.insert("hasUI".into(), Value::Bool(has_ui));
-    }
-    Some(summary)
-}
-
 impl Face for ApiFace {
     fn route(&self, method: &str, path: &str) -> Option<Route> {
         match routes::resolve(method, path) {
@@ -769,6 +669,7 @@ impl Face for ApiFace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::paths::Paths;
     use crate::server::http::{dispatch_blocking_now, dispatch_inline};
     use crate::server::http::{BodyPolicy, Dispatch};
     use crate::server::http::{CompletionSlot, Exchange};
