@@ -1343,6 +1343,8 @@ def main():
                              "is unavailable")
     parser.add_argument("--key", default=os.path.join("samples", "keys", "sample-2026.key"))
     parser.add_argument("--pub", default=os.path.join("samples", "keys", "sample-2026.pub"))
+    parser.add_argument("--config", action="append", default=[], metavar="KEY=VALUE",
+                        help="extra svcd.conf line (repeatable), e.g. max_complete_body_bytes=65536")
     parser.add_argument("--work", default=None)
     parser.add_argument("--out", default=os.path.join("target", "budget-results.json"))
     parser.add_argument("--report", default=os.path.join("target", "budget-report.md"))
@@ -1436,7 +1438,7 @@ def main():
             log("direct layout for %d plugins (platform %s)" % (len(plugins), target))
         daemon = start_daemon(
             root, binary, args.budget, pub, args.cpu_budget_percent,
-            args.budget_percent, args.workload,
+            args.budget_percent, args.workload, extra=args.config,
         )
         log("daemon on %s, pid %d" % (daemon["address"], daemon["process"].pid))
         result["effective"] = startup_report(root)
