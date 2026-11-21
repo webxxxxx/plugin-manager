@@ -536,6 +536,13 @@ const ASSEMBLY_RULES = [
     ],
     hint: "starttime 只在 process_probe 里探；判定走 runtime::pid_state（#217）。",
   },
+  {
+    name: "pre-body 认领顺序",
+    members: [/\.plugin_ui\(/, /\.package_upload\(/, /\.blob_upload\(/],
+    min: 2,
+    allow: [{ file: "src/face/prebody.rs", item: "claim" }],
+    hint: "三条 pre-body 认领顺序只在 face/prebody.rs 的 claim 里排（#244）。",
+  },
 ];
 
 /// 生产 fn 的正文区间（入参是 `stripComments` 遮罩过的文本）。`#[cfg(test)]`
@@ -809,6 +816,20 @@ const SELFTEST_ASSEMBLY = [
     file: "src/face/other.rs",
     source:
       '#[cfg(test)]\nmod tests {\n    fn t() {\n        let tag = etag(m, 1);\n        let _ = web_headers(&tag);\n    }\n}\n',
+    expected: [],
+  },
+  {
+    name: "pre-body 认领顺序在 claim 外算违规",
+    file: "src/daemon/assembly.rs",
+    source:
+      "fn wire(routes: &Routes) {\n    let _ = routes.plugin_ui(&head);\n    let _ = routes.package_upload(&head);\n}\n",
+    expected: ["pre-body 认领顺序"],
+  },
+  {
+    name: "pre-body 认领顺序留在 claim 里不算",
+    file: "src/face/prebody.rs",
+    source:
+      "fn claim(&self) {\n    let _ = self.plugin_ui(&head);\n    let _ = self.package_upload(&head);\n}\n",
     expected: [],
   },
 ];

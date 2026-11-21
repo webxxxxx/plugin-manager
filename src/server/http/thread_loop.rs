@@ -26,7 +26,7 @@ use crate::server::http::engine;
 use crate::server::http::engine::{
     keep_alive_response, wants_keep_alive, wants_keep_alive_head, HttpRequest,
 };
-use crate::server::http::hooks::{FallbackHandler, PreBodyRoutes};
+use crate::server::http::hooks::{FallbackHandler, PreBodyClaim, PreBodyRoutes};
 use crate::server::http::model as http;
 use crate::server::http::Exchange;
 use crate::wire::contract::rawhub::RawHub;
@@ -315,13 +315,9 @@ impl Connection {
                 }
             }
             // The face leaves these pre-body stream routes to their own faces.
-            // Every driver claims them through the same table, so a new
-            // pre-body endpoint is one `PreBodyRoutes` method, not an `if` in
-            // a driver.
-            if let Some(claim) = self
-                .routes
-                .plugin_ui(&head, peer, &lan, self.raw_hub.clone())
-            {
+            // Every driver asks the same ordered claim hook, so endpoint
+            // precedence is not re-spelled here.
+            if let Some(claim) = self.routes.claim(&head, peer, &lan, self.raw_hub.clone()) {
                 serve_claimed(
                     &mut stream,
                     claim,
@@ -329,31 +325,6 @@ impl Connection {
                     head_only,
                     &self.budget,
                     &config.limits,
-                    false,
-                );
-                return;
-            }
-            if let Some(claim) = self.routes.package_upload(&head, &lan) {
-                serve_claimed(
-                    &mut stream,
-                    claim,
-                    &initial,
-                    head_only,
-                    &self.budget,
-                    &config.limits,
-                    true,
-                );
-                return;
-            }
-            if let Some(claim) = self.routes.blob_upload(&head, &lan) {
-                serve_claimed(
-                    &mut stream,
-                    claim,
-                    &initial,
-                    head_only,
-                    &self.budget,
-                    &config.limits,
-                    true,
                 );
                 return;
             }
@@ -413,14 +384,14 @@ impl Connection {
 /// connection's idle timeout and needs neither.
 fn serve_claimed(
     stream: &mut TcpStream,
-    claim: Result<Exchange, Vec<u8>>,
+    claim: PreBodyClaim,
     initial: &[u8],
     head_only: bool,
     budget: &crate::server::http::budget::StreamBudget,
     limits: &crate::platform::limits::Limits,
-    transfer: bool,
 ) {
-    let handler = match claim {
+    let transfer = claim.transfer;
+    let handler = match claim.exchange {
         Err(response) => {
             let _ = write_http(stream, &response, head_only);
             return;
