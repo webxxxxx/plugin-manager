@@ -259,14 +259,13 @@ impl RawWsStream {
     fn handle_frame(&mut self, frame: &frame::Frame) {
         if frame.opcode >= 0x8 {
             match frame.opcode {
-                0x8 => {
-                    let code = if frame.payload.len() >= 2 {
-                        u16::from_be_bytes([frame.payload[0], frame.payload[1]])
-                    } else {
-                        1000
-                    };
-                    self.queue_close(code, "");
-                }
+                0x8 => match frame::close_code(&frame.payload) {
+                    Ok(code) => self.queue_close(code.unwrap_or(1000), ""),
+                    Err(frame::CloseError::InvalidUtf8) => {
+                        self.queue_close(1007, "close reason is not utf-8")
+                    }
+                    Err(frame::CloseError::Protocol(reason)) => self.queue_close(1002, reason),
+                },
                 0x9 => self.queue_frame(0xA, frame.payload.clone()),
                 0xA => {}
                 _ => self.queue_close(1002, "unknown control frame"),
@@ -464,6 +463,38 @@ mod tests {
             &mut OutBuffer::new(&mut out, 4096),
         );
         assert_eq!(sent.recv().expect("sent"), b"raw\x00\xff");
+    }
+
+    #[test]
+    fn invalid_close_frames_are_rejected_instead_of_echoed() {
+        let cases: Vec<(Vec<u8>, u16, &str)> = vec![
+            (vec![0x03], 1002, "close frame payload length 1"),
+            (1004u16.to_be_bytes().to_vec(), 1002, "invalid close code"),
+            (
+                {
+                    let mut payload = 1000u16.to_be_bytes().to_vec();
+                    payload.push(0xFF);
+                    payload
+                },
+                1007,
+                "close reason is not utf-8",
+            ),
+        ];
+        for (payload, code, reason) in cases {
+            let (mut stream, _sent, _events) = harness();
+            let _ = drive(&mut stream, 4096);
+            let mut out = Vec::new();
+            stream.on_event(
+                StreamEvent::Data(&client_frame(0x8, &payload)),
+                &mut OutBuffer::new(&mut out, 4096),
+            );
+            let (_, frames) = server_frames(&out);
+            assert_eq!(
+                frames,
+                vec![(0x8, frame::close_payload(code, reason))],
+                "{payload:?}"
+            );
+        }
     }
 
     #[test]

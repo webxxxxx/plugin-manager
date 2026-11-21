@@ -92,6 +92,38 @@ pub fn close_payload(code: u16, reason: &str) -> Vec<u8> {
     payload
 }
 
+/// Why a peer's close payload is not a valid close frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseError {
+    /// A one-byte payload or a reserved/unassigned status code.
+    Protocol(&'static str),
+    /// The optional reason is not valid UTF-8.
+    InvalidUtf8,
+}
+
+/// Extract the status code from a close payload.
+///
+/// An empty payload means no code (1005 locally) and is accepted. A one-byte
+/// payload is malformed. Reserved codes 1004/1005/1006/1015, codes below 1000,
+/// and the unassigned 1016..=2999 range are rejected; 3000..=4999 are
+/// application codes and accepted.
+pub fn close_code(payload: &[u8]) -> Result<Option<u16>, CloseError> {
+    match payload.len() {
+        0 => Ok(None),
+        1 => Err(CloseError::Protocol("close frame payload length 1")),
+        _ => {
+            let code = u16::from_be_bytes([payload[0], payload[1]]);
+            if !matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999) {
+                return Err(CloseError::Protocol("invalid close code"));
+            }
+            if std::str::from_utf8(&payload[2..]).is_err() {
+                return Err(CloseError::InvalidUtf8);
+            }
+            Ok(Some(code))
+        }
+    }
+}
+
 /// Encode the frame header for `payload`.
 pub fn frame_header(opcode: u8, length: usize) -> Vec<u8> {
     let mut header = Vec::with_capacity(10);
@@ -184,6 +216,31 @@ mod tests {
         assert_eq!(
             close_payload(1009, "too large"),
             vec![0x03, 0xF1, b't', b'o', b'o', b' ', b'l', b'a', b'r', b'g', b'e']
+        );
+    }
+
+    #[test]
+    fn close_codes_are_validated() {
+        assert_eq!(close_code(&[]), Ok(None));
+        assert_eq!(close_code(&1000u16.to_be_bytes()), Ok(Some(1000)));
+        assert_eq!(close_code(&[0x03, 0xE8, b'b', b'y', b'e']), Ok(Some(1000)));
+        for code in [999u16, 1004, 1005, 1006, 1015, 1016, 2999] {
+            assert_eq!(
+                close_code(&code.to_be_bytes()),
+                Err(CloseError::Protocol("invalid close code")),
+                "{code}"
+            );
+        }
+        for code in [1000u16, 1001, 1002, 1003, 1007, 1014, 3000, 4999] {
+            assert_eq!(close_code(&code.to_be_bytes()), Ok(Some(code)), "{code}");
+        }
+        assert_eq!(
+            close_code(&[0x03]),
+            Err(CloseError::Protocol("close frame payload length 1"))
+        );
+        assert_eq!(
+            close_code(&[0x03, 0xE8, 0xFF]),
+            Err(CloseError::InvalidUtf8)
         );
     }
 
