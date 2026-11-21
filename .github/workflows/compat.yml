@@ -18,10 +18,6 @@ jobs:
     name: compat / ubuntu-latest
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      # The workspace path is deep enough to approach the ~108-byte sun_path
-      # limit for the control socket; the runner temp root stays short.
-      PERF_WORK_ROOT: ${{ runner.temp }}/svcd-perf
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -40,9 +36,15 @@ jobs:
         working-directory: tools/perf
         run: npm ci
       - name: Run the compatibility suite
+        env:
+          # The workspace path is deep enough to approach the ~108-byte sun_path
+          # limit for the control socket; the runner temp root stays short.
+          PERF_WORK_ROOT: ${{ runner.temp }}/svcd-perf
         run: node tools/perf/run.mjs --compat
       - name: Collect daemon logs
         if: always()
+        env:
+          PERF_WORK_ROOT: ${{ runner.temp }}/svcd-perf
         run: |
           mkdir -p target/compat-logs
           find "$PERF_WORK_ROOT" -name daemon.stderr -exec cp {} target/compat-logs/ \; 2>/dev/null || true
