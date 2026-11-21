@@ -3,8 +3,9 @@
 Compatibility and performance harness for svcd's HTTP, MCP, WebSocket and SSE
 surfaces. This is intentionally **not** part of `cargo test`: it starts a
 release daemon, a Python echo plugin and real network clients. Performance runs
-in `.github/workflows/perf.yml` (weekly/manual); the standards-based
-compatibility suite is tracked in #106. See [docs/testing.md](../../docs/testing.md).
+in `.github/workflows/perf.yml` (weekly/manual); compatibility runs in
+`.github/workflows/compat.yml` (nightly/manual). The remaining standards-based
+vectors are tracked in #106. See [docs/testing.md](../../docs/testing.md).
 
 ## Requirements
 
