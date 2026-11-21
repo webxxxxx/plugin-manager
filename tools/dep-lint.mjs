@@ -536,6 +536,13 @@ const ASSEMBLY_RULES = [
     ],
     hint: "starttime 只在 process_probe 里探；判定走 runtime::pid_state（#217）。",
   },
+  {
+    name: "complete 端点的 parts 请求体解析",
+    members: [/partNumber/, /\bfrom_slice\(/, /\bas_array\(/],
+    min: 2,
+    allow: [{ file: "src/face/blob_routes.rs", item: "parse_parts" }],
+    hint: "complete 的 parts[] 解码只经 face/blob_routes.rs 的 parse_parts（#246）。",
+  },
 ];
 
 /// 生产 fn 的正文区间（入参是 `stripComments` 遮罩过的文本）。`#[cfg(test)]`
@@ -809,6 +816,20 @@ const SELFTEST_ASSEMBLY = [
     file: "src/face/other.rs",
     source:
       '#[cfg(test)]\nmod tests {\n    fn t() {\n        let tag = etag(m, 1);\n        let _ = web_headers(&tag);\n    }\n}\n',
+    expected: [],
+  },
+  {
+    name: "complete 端点的 parts 解析在名单外算违规",
+    file: "src/face/other.rs",
+    source:
+      'fn decode(body: &[u8]) -> Option<usize> {\n    let value: Value = serde_json::from_slice(body).unwrap();\n    value.get("parts").and_then(|parts| parts.as_array()).map(|parts| parts.len())\n}\n',
+    expected: ["complete 端点的 parts 请求体解析"],
+  },
+  {
+    name: "parse_parts 的 parts 解析不算",
+    file: "src/face/blob_routes.rs",
+    source:
+      'fn parse_parts(body: &[u8], required: bool) -> Option<usize> {\n    let value: Value = serde_json::from_slice(body).ok()?;\n    let parts = value.get("parts")?.as_array()?;\n    let _ = required;\n    Some(parts.len())\n}\n',
     expected: [],
   },
 ];

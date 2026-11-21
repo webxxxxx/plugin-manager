@@ -1193,3 +1193,219 @@ fn unix_blob_download_has_no_takeover_thread() {
     );
     drop(stalled);
 }
+
+/// Both complete endpoints decode the same `parts[]` list, so the same
+/// non-empty body must produce the same status, error code and message. Empty
+/// bodies are the deliberate exception: they keep their pre-existing paths
+/// (blob 400 when it has no parts, file 200 after a part upload), and an
+/// explicit body without `parts` follows the same optional/required split.
+#[test]
+fn blob_and_file_complete_share_the_parts_input_table() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let blob_with_part = |content: &[u8]| -> String {
+        let created = request(&address, "POST", "/api/v1/blobs/uploads", "", b"");
+        assert_eq!(created.status, 200, "{}", created.body);
+        let id = created.body["uploadId"]
+            .as_str()
+            .expect("blob upload id")
+            .to_string();
+        let part = raw_request(
+            &address,
+            "PUT",
+            &format!("/api/v1/blobs/uploads/{}/parts/1", id),
+            "application/octet-stream",
+            content,
+        );
+        assert_eq!(part.status, 200, "{:?}", part.body);
+        id
+    };
+    let blob_without_parts = || -> String {
+        let created = request(&address, "POST", "/api/v1/blobs/uploads", "", b"");
+        assert_eq!(created.status, 200, "{}", created.body);
+        created.body["uploadId"]
+            .as_str()
+            .expect("blob upload id")
+            .to_string()
+    };
+    let file_with_part = |content: &[u8]| -> String {
+        let created = request(&address, "POST", "/api/v1/file/uploads", "", b"");
+        assert_eq!(created.status, 200, "{}", created.body);
+        let id = created.body["uploadId"]
+            .as_str()
+            .expect("file upload id")
+            .to_string();
+        let part = raw_request(
+            &address,
+            "PUT",
+            &format!("/api/v1/file/uploads/{}/parts/1", id),
+            "application/octet-stream",
+            content,
+        );
+        assert_eq!(part.status, 200, "{:?}", part.body);
+        id
+    };
+
+    let malformed: &[(&str, &[u8], &str)] = &[
+        ("not JSON", b"not json", "body must be JSON"),
+        (
+            "parts is not an array",
+            br#"{"parts":7}"#,
+            "parts must be an array",
+        ),
+        (
+            "partNumber missing",
+            br#"{"parts":[{"etag":"x"}]}"#,
+            "partNumber is required",
+        ),
+        (
+            "partNumber zero",
+            br#"{"parts":[{"partNumber":0}]}"#,
+            "partNumber must be between 1 and 10000",
+        ),
+        (
+            "partNumber above the range",
+            br#"{"parts":[{"partNumber":10001}]}"#,
+            "partNumber must be between 1 and 10000",
+        ),
+    ];
+    for &(label, body, message) in malformed {
+        let blob_id = blob_with_part(b"payload");
+        let file_id = file_with_part(b"payload");
+        let blob = request(
+            &address,
+            "POST",
+            &format!("/api/v1/blobs/uploads/{}/complete", blob_id),
+            "application/json",
+            body,
+        );
+        let file = request(
+            &address,
+            "POST",
+            &format!("/api/v1/file/uploads/{}/complete", file_id),
+            "application/json",
+            body,
+        );
+        for (endpoint, response) in [("blob", &blob), ("file", &file)] {
+            assert_eq!(
+                response.status, 400,
+                "{label} ({endpoint}) status: {:?}",
+                response.body
+            );
+            assert_eq!(
+                response.body["error"]["code"], "bad_request",
+                "{label} ({endpoint}) code"
+            );
+            assert_eq!(
+                response.body["error"]["message"], message,
+                "{label} ({endpoint}) message"
+            );
+        }
+        assert_eq!(blob.body, file.body, "{label}: endpoints disagree");
+    }
+
+    // Empty body: the blob has no parts to select, while the file selects the
+    // part that was uploaded. Both are today's paths, not parser behavior.
+    let blob_id = blob_without_parts();
+    let blob = request(
+        &address,
+        "POST",
+        &format!("/api/v1/blobs/uploads/{}/complete", blob_id),
+        "application/json",
+        b"",
+    );
+    assert_eq!(blob.status, 400, "{:?}", blob.body);
+    assert_eq!(blob.body["error"]["code"], "bad_request");
+    assert_eq!(blob.body["error"]["message"], "no parts uploaded");
+
+    let file_id = file_with_part(b"empty-body-file");
+    let file = request(
+        &address,
+        "POST",
+        &format!("/api/v1/file/uploads/{}/complete", file_id),
+        "application/json",
+        b"",
+    );
+    assert_eq!(file.status, 200, "{}", file.body);
+    let expected = format!("sha256:{}", hex_sha256(b"empty-body-file"));
+    assert_eq!(file.body["id"], expected);
+    assert_eq!(
+        header_values(&file, "etag"),
+        vec![format!("\"{}\"", expected).as_str()]
+    );
+    assert_eq!(
+        header_values(&file, "location"),
+        vec![format!("/api/v1/file/{}", expected).as_str()]
+    );
+
+    // A non-empty body without `parts` is the required/optional split the
+    // shared parser exists for.
+    let blob_id = blob_with_part(b"missing-parts-blob");
+    let blob = request(
+        &address,
+        "POST",
+        &format!("/api/v1/blobs/uploads/{}/complete", blob_id),
+        "application/json",
+        br#"{}"#,
+    );
+    assert_eq!(blob.status, 400, "{:?}", blob.body);
+    assert_eq!(blob.body["error"]["code"], "bad_request");
+    assert_eq!(blob.body["error"]["message"], "parts is required");
+
+    let file_id = file_with_part(b"missing-parts-file");
+    let file = request(
+        &address,
+        "POST",
+        &format!("/api/v1/file/uploads/{}/complete", file_id),
+        "application/json",
+        br#"{}"#,
+    );
+    assert_eq!(file.status, 200, "{}", file.body);
+
+    // The valid list completes both endpoints with the same input, and the
+    // success headers stay what they were before the refactor.
+    let blob_id = blob_with_part(b"payload");
+    let file_id = file_with_part(b"payload");
+    let body = br#"{"parts":[{"partNumber":1}]}"#;
+    let blob = request(
+        &address,
+        "POST",
+        &format!("/api/v1/blobs/uploads/{}/complete", blob_id),
+        "application/json",
+        body,
+    );
+    let file = request(
+        &address,
+        "POST",
+        &format!("/api/v1/file/uploads/{}/complete", file_id),
+        "application/json",
+        body,
+    );
+    let expected = format!("sha256:{}", hex_sha256(b"payload"));
+    assert_eq!(blob.status, 200, "{}", blob.body);
+    assert_eq!(file.status, 200, "{}", file.body);
+    assert_eq!(blob.body["id"], expected);
+    assert_eq!(blob.body["size"], 7);
+    assert_eq!(file.body["id"], expected);
+    assert_eq!(file.body["size"], 7);
+    assert_eq!(file.body["name"], "file");
+    assert_eq!(file.body["mimeType"], "application/octet-stream");
+    assert_eq!(
+        header_values(&blob, "etag"),
+        vec![format!("\"{}\"", expected).as_str()]
+    );
+    assert_eq!(
+        header_values(&blob, "location"),
+        vec![format!("/api/v1/blobs/{}", expected).as_str()]
+    );
+    assert_eq!(
+        header_values(&file, "etag"),
+        vec![format!("\"{}\"", expected).as_str()]
+    );
+    assert_eq!(
+        header_values(&file, "location"),
+        vec![format!("/api/v1/file/{}", expected).as_str()]
+    );
+}
