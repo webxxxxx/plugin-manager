@@ -24,10 +24,6 @@
     "src/selfinstall/plan.rs": {
       "production": 889,
       "total": 891
-    },
-    "src/server/http/model.rs": {
-      "production": 760,
-      "total": 951
     }
   }
 }
