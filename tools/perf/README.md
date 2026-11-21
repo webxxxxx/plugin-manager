@@ -52,7 +52,8 @@ loopback-only and unauthenticated.
 - MCP: modern `server/discover` / `tools/list` / `tools/call`, Bearer 401/403,
   mirrored headers (`-32020`), unsupported version (`-32022`), unknown method
   (`404 / -32601`), 202 notification, 405 GET, 413 body cap, `-32700` parse
-  error, missing `_meta`, and the official SDK over the stdio bridge
+  error, missing `_meta`, progress over SSE before the final result, and the
+  official SDK over the stdio bridge
 - WebSocket: tools/call + notification, ping/pong/close, fragmentation,
   cross-origin 403, oversized close 1009
 - SSE: EventSource delivery, raw frame fields (`id` / `event` / `data`) and

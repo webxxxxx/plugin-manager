@@ -253,6 +253,10 @@ function writeFixture(root) {
     '        send({"jsonrpc": "2.0", "id": request_id, "result": {"ok": True}})',
     '    elif method == "tools/call":',
     '        event += 1',
+    '        meta = request.get("params", {}).get("_meta", {})',
+    '        token = meta.get("progressToken") if isinstance(meta, dict) else None',
+    '        if token:',
+    '            send({"jsonrpc": "2.0", "method": "notifications/progress", "params": {"progress": 1, "progressToken": token}})',
     '        send({"jsonrpc": "2.0", "method": "notifications/message", "params": {"level": "info", "data": {"event": event}}})',
     '        send({"jsonrpc": "2.0", "id": request_id, "result": {"content": [{"type": "text", "text": "ok"}], "isError": False}})',
     '    elif request_id is not None:',
@@ -358,7 +362,9 @@ async function mcpSend(daemon, token, payload, keepAlive, extraHeaders) {
   const headers = Object.assign({}, payload.headers, { Authorization: 'Bearer ' + token }, extraHeaders || {});
   const response = await httpRequest(daemon.address, 'POST', '/mcp', headers, JSON.stringify(payload.request), 10000, keepAlive);
   const body = response.body.toString();
-  return { status: response.status, json: body ? parseJson(response) : null, body: body };
+  const contentType = String(response.headers['content-type'] || '');
+  const json = body && contentType.includes('application/json') ? parseJson(response) : null;
+  return { status: response.status, json: json, body: body, headers: response.headers };
 }
 
 async function mcpPost(daemon, token, method, params, id, name, keepAlive) {
@@ -753,6 +759,19 @@ async function runCompat(daemon, token) {
     const payload = mcpPayload('tools/call', { name: 'perf.echo', arguments: { blob: 'x'.repeat(1024 * 1024) } }, 108, 'perf.echo');
     const result = await mcpSend(daemon, token, payload);
     assert.equal(result.status, 413, JSON.stringify(result.json));
+  });
+
+  await check('MCP tools/call streams progress before the final result', async function () {
+    const payload = mcpPayload('tools/call', { name: 'perf.echo', arguments: {} }, 201, 'perf.echo');
+    payload.request.params._meta.progressToken = 'perf-progress-1';
+    const result = await mcpSend(daemon, token, payload, false, { Accept: 'text/event-stream' });
+    assert.equal(result.status, 200, result.body.slice(0, 200));
+    assert.match(String(result.headers['content-type']), /text\/event-stream/);
+    const progressAt = result.body.indexOf('notifications/progress');
+    const finalAt = result.body.indexOf('"resultType":"complete"');
+    assert.ok(progressAt >= 0, 'progress event missing: ' + result.body.slice(0, 300));
+    assert.ok(finalAt > progressAt, 'final result must follow progress: ' + result.body.slice(-300));
+    return 'progress then final';
   });
 
   await check('MCP stdio official SDK: initialize, list, call', async function () {
