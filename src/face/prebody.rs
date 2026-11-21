@@ -168,6 +168,7 @@ impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
                 body: &request.body,
             },
             password_hash.as_deref(),
+            self.config.settings.mcp_streaming.unwrap_or(false),
         ) {
             Ok(Some(call)) => Some(Ok(call)),
             Ok(None) => None,

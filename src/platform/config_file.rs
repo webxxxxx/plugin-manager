@@ -265,6 +265,10 @@ pub fn generated(settings: &Settings) -> String {
          # ws_inflight_requests = 4 / 16 / 128\n\
          # ws_buffer_shrink_bytes = 65536\n\
          # ws_raw_enabled = on\n\
+         # mcp_streaming = off (default). on: an MCP client that accepts both\n\
+         # JSON and SSE gets a stream; off answers with one JSON body, which\n\
+         # skips a stream slot and a reactor hop. An SSE-only client always\n\
+         # streams.\n\
          # ws_raw_max_bytes = 1048576\n\
          # ws_raw_queue = 8 / 32 / 128\n\
          # pending_queue = 32 / 128 / 512 (management requests queued between\n\

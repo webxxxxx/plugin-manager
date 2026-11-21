@@ -287,10 +287,8 @@ impl Limits {
             derivation.count(&PENDING_QUEUE, settings.pending_queue.map(|v| v as u64));
         let progress_queue =
             derivation.count(&PROGRESS_QUEUE, settings.progress_queue.map(|v| v as u64));
-        let blocking_queue = derivation.count(
-            &BLOCKING_QUEUE,
-            settings.blocking_queue.map(|v| v as u64),
-        );
+        let blocking_queue =
+            derivation.count(&BLOCKING_QUEUE, settings.blocking_queue.map(|v| v as u64));
         let cpu_budget_percent = derivation.count(
             &CPU_BUDGET_PERCENT,
             settings.cpu_budget_percent.map(|v| v as u64),
@@ -381,7 +379,10 @@ fn solve_connections(limits: &mut Limits, budget: u64, settings: &settings::Sett
 }
 
 /// The largest queue the solver hands out when the document stays silent.
-const MAX_BLOCKING_QUEUE: usize = 256;
+/// It matches the connection ceiling: a queued job belongs to an admitted
+/// connection, so the queue can never be longer than that anyway. The old 256
+/// was the wall at fifty workers per plugin.
+const MAX_BLOCKING_QUEUE: usize = 4096;
 
 /// The absolute ceiling for a solved stream count (the spec's upper bound).
 const STREAM_CEILING: usize = 1024;
