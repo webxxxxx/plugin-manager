@@ -490,7 +490,7 @@ def write_fixture(root, runtime="python"):
     return fixture
 
 
-def start_daemon(root, binary, budget_bytes, trust_pub, cpu_percent=0):
+def start_daemon(root, binary, budget_bytes, trust_pub, cpu_percent=0, budget_percent=0, workload=""):
     config = root / "config"
     (config / "trust.d").mkdir(parents=True, exist_ok=True)
     (root / "data").mkdir(parents=True, exist_ok=True)
@@ -505,7 +505,15 @@ def start_daemon(root, binary, budget_bytes, trust_pub, cpu_percent=0):
     digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 10000)
     encode = lambda value: base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
     password_hash = "pbkdf2-sha256$10000$%s$%s" % (encode(salt), encode(digest))
-    document = ["bind = 127.0.0.1:0", "mem_budget_bytes = %d" % budget_bytes]
+    document = ["bind = 127.0.0.1:0"]
+    if budget_percent:
+        # The percentage is resolved against the probe by the daemon, so a run
+        # can ask for a share of the machine instead of a number.
+        document.append("mem_budget_percent = %d" % budget_percent)
+    else:
+        document.append("mem_budget_bytes = %d" % budget_bytes)
+    if workload:
+        document.append("workload = %s" % workload)
     if cpu_percent:
         document.append("cpu_budget_percent = %d" % cpu_percent)
     document.append("auth_passwd = %s" % password_hash)
@@ -1071,7 +1079,7 @@ def run_traffic(address, token, plugins, duration, global_concurrency, per_plugi
     }
 
 
-def oversubscribe(address, plugins, hold=1.5):
+def oversubscribe(address, plugins, hold=1.5, per_plugin=1):
     host, port = address.rsplit(":", 1)
     outcomes = {"sse": [], "ws": []}
     release = threading.Event()
@@ -1111,8 +1119,9 @@ def oversubscribe(address, plugins, hold=1.5):
 
     threads = []
     for plugin_id in plugins:
-        threads.append(threading.Thread(target=sse_probe, args=(plugin_id,), daemon=True))
-        threads.append(threading.Thread(target=ws_probe, args=(plugin_id,), daemon=True))
+        for _ in range(per_plugin):
+            threads.append(threading.Thread(target=sse_probe, args=(plugin_id,), daemon=True))
+            threads.append(threading.Thread(target=ws_probe, args=(plugin_id,), daemon=True))
     for thread in threads:
         thread.start()
     time.sleep(hold)
@@ -1120,6 +1129,14 @@ def oversubscribe(address, plugins, hold=1.5):
     for thread in threads:
         thread.join(timeout=10)
     return outcomes
+
+
+def _counts(values):
+    """Status counts for one probe list, keyed by status or exception name."""
+    counts = {}
+    for value in values:
+        counts[str(value)] = counts.get(str(value), 0) + 1
+    return counts
 
 
 def parse_tune(text):
@@ -1148,8 +1165,11 @@ def render_report(result):
     lines.append("")
     lines.append("- OS: %s" % result["environment"]["os"])
     lines.append("- CPU: %s x%d" % (result["environment"]["cpu"], result["environment"]["cpus"]))
-    lines.append("- Requested budget: %d bytes (%s)" % (
-        requested.get("budget_bytes"), requested.get("budget_text")))
+    lines.append("- Requested budget: %s%s" % (
+        requested.get("budget_text"),
+        " of available memory" if requested.get("budget_percent") else ""))
+    if requested.get("workload"):
+        lines.append("- Workload shape: %s (stated)" % requested["workload"])
     lines.append("- Effective budget: %s bytes, workload %s, worst case %s bytes" % (
         effective.get("budget_quantized"), effective.get("workload"), effective.get("worst_case")))
     lines.append("- CPU budget: %s%%" % (requested.get("cpu_budget_percent") or "off"))
@@ -1238,8 +1258,9 @@ def render_report(result):
         lines.append("")
         lines.append("## Oversubscription")
         lines.append("")
-        lines.append("- SSE probes: %s" % result["oversubscription"]["sse"])
-        lines.append("- WS probes: %s" % result["oversubscription"]["ws"])
+        lines.append("- probes per plugin: %s" % result["oversubscription"].get("per_plugin", 1))
+        lines.append("- SSE probes: %s" % _counts(result["oversubscription"]["sse"]))
+        lines.append("- WS probes: %s" % _counts(result["oversubscription"]["ws"]))
         lines.append("- recovery invoke: %s" % result["oversubscription"]["recovery"])
     failures = []
     for plugin in traffic:
@@ -1287,8 +1308,12 @@ def count_statuses(traffic):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default=os.path.join("target", "release", "svcd" + EXE))
-    parser.add_argument("--budget", type=parse_size, default=parse_size("50mb"),
+    parser.add_argument("--budget", type=parse_size, default=None,
                         help="mem_budget_bytes to request (default 50mb)")
+    parser.add_argument("--budget-percent", type=int, default=0,
+                        help="mem_budget_percent to request instead of --budget")
+    parser.add_argument("--workload", choices=("", "tiny", "interactive", "streaming"),
+                        default="", help="workload shape; empty derives it")
     parser.add_argument("--budget-text", default=None, help="label for the requested budget")
     parser.add_argument("--plugins", type=int, default=10)
     parser.add_argument("--duration", type=float, default=60.0)
@@ -1305,6 +1330,8 @@ def main():
     parser.add_argument("--cpu-budget-percent", type=int, default=0,
                         help="cpu_budget_percent in the document (0 disables the governor)")
     parser.add_argument("--no-oversubscribe", action="store_true")
+    parser.add_argument("--oversubscribe-per-plugin", type=int, default=1,
+                        help="concurrent SSE+WS probes per plugin (the admission probe)")
     parser.add_argument("--bootstrap", choices=("api", "direct"), default="api",
                         help="api installs through the management API; direct writes the "
                              "registry layout before boot for hosts whose control channel "
@@ -1341,7 +1368,13 @@ def main():
     root = work_root / ("budget-run-" + time.strftime("%Y%m%d-%H%M%S"))
     root.mkdir(parents=True, exist_ok=False)
     plugins = ["p%02d" % index for index in range(args.plugins)]
-    budget_text = args.budget_text or ("%gmb" % (args.budget / MIB))
+    if args.budget is not None and args.budget_percent:
+        raise SystemExit("choose one: --budget or --budget-percent")
+    args.budget = args.budget if args.budget is not None else parse_size("50mb")
+    budget_text = args.budget_text or (
+        "%d%%" % args.budget_percent if args.budget_percent
+        else "%gmb" % (args.budget / MIB)
+    )
     log("workdir %s" % root)
     log("requested budget %d bytes (%s), %d plugins, %ss, workers %d" % (
         args.budget, budget_text, args.plugins, args.duration,
@@ -1361,6 +1394,8 @@ def main():
         },
         "requested": {
             "budget_bytes": args.budget,
+            "budget_percent": args.budget_percent,
+            "workload": args.workload,
             "budget_text": budget_text,
             "plugins": args.plugins,
             "duration": args.duration,
@@ -1394,7 +1429,10 @@ def main():
             target = detect_platform()
             write_direct_layout(root, fixture, plugins, target)
             log("direct layout for %d plugins (platform %s)" % (len(plugins), target))
-        daemon = start_daemon(root, binary, args.budget, pub, args.cpu_budget_percent)
+        daemon = start_daemon(
+            root, binary, args.budget, pub, args.cpu_budget_percent,
+            args.budget_percent, args.workload,
+        )
         log("daemon on %s, pid %d" % (daemon["address"], daemon["process"].pid))
         result["effective"] = startup_report(root)
         svc = root / "bin" / ("svc" + EXE)
@@ -1513,12 +1551,19 @@ def main():
         ))
 
         recovery_ok = True
+        # The admission probe opens concurrent streams and reports what the
+        # daemon did with each; it needs no background traffic, so it also runs
+        # for an idle window (that is how the connection cap is measured).
+        if not args.no_oversubscribe:
+            outcomes = oversubscribe(
+                daemon["address"], plugins, per_plugin=args.oversubscribe_per_plugin
+            )
+            result["oversubscription"]["sse"] = outcomes["sse"]
+            result["oversubscription"]["ws"] = outcomes["ws"]
+            result["oversubscription"]["per_plugin"] = args.oversubscribe_per_plugin
+            log("oversubscription sse=%s ws=%s" % (
+                _counts(outcomes["sse"]), _counts(outcomes["ws"])))
         if args.traffic == "all":
-            if not args.no_oversubscribe:
-                outcomes = oversubscribe(daemon["address"], plugins)
-                result["oversubscription"]["sse"] = outcomes["sse"]
-                result["oversubscription"]["ws"] = outcomes["ws"]
-                log("oversubscription sse=%s ws=%s" % (outcomes["sse"], outcomes["ws"]))
             recovery_ok, recovery_status, _ = op_invoke(
                 daemon["address"], daemon["token"], plugins[0], 0
             )

@@ -121,6 +121,39 @@ CPU 列是**占单个核的百分比**（`daemon CPU` 60.2% 即 0.60 个核）�
 **每插件 12 个（480）**、2 GB 档**每插件 26 个以上（≥1040，规划上限 786 个连接）**；
 三档都是 100% 成功，再往上就是准入的 503，不是超时。
 
+## 90% 可用内存 + `interactive`：最大并发 = 429
+
+同一个 40 插件夹具，预算改成「可用内存的 90%」，形状显式写 `workload = interactive`
+（剩下的一档配置见 [ADR-0026](../../docs/adr/0026-the-memory-budget-is-the-truth.md) 修订三与
+`svcd.conf.example`）：
+
+| 项 | 值 |
+| --- | ---: |
+| 预算 | 4.7 GiB（5.2 GiB 可用 × 90%，没被 8 GiB 上限夹到） |
+| max_connections / max_streams / blocking_queue | **429 / 429 / 429** |
+| max_complete_body | 9.8 MiB |
+| stream_buffer | 300 KiB |
+| blocking_threads | 8 |
+
+**准入探测（idle 起 40 个插件，每插件 11 条 SSE + 11 条 WS，共 880 条并发连接）**：
+
+| 面 | 200/101（接纳） | 503（拒绝） |
+| --- | ---: | ---: |
+| SSE | 215 | 225 |
+| WebSocket | 214 | 226 |
+| 合计 | **429** | 451 |
+
+429 正好等于派生的 `max_connections` / `max_streams`：**这一档的最大并发就是 429 条连接/流**，
+再多一条就是 503（准入拒绝，不是超时）。
+
+混流压测（五面轮询）在同一档下：每插件 20 个客户端（共 800 个）仍然 100% 成功，
+客户端 in-flight 峰值 503 —— 因为每个请求只花 ~1 ms，客户端一侧同时真正压在 daemon 上的连接
+远没有 429，只有「把流一直开着」的准入探测才能把这个上限顶满。这也解释了为什么低档位能压出
+503（288 条的上限更容易被突发顶到）。
+
+对照：同样 4.7 GiB 预算，默认形状（streaming）派生 796 条连接、单体 4.9 MiB；显式 `interactive`
+只有 429 条、单体 9.8 MiB。**形状买的是单体大小，不是并发**。
+
 ## 复现
 
 ```sh
@@ -142,6 +175,12 @@ for P in 8 9 12 13; do
     --duration 20 --think-ms 10 --no-oversubscribe --bootstrap direct --plugin-runtime shell \
     --work /tmp/conc-512-$P --out .scratch/conc/512-$P.json
 done
+
+# 90% + interactive：不跑流量，只把流打开，看准入接纳多少条
+python3 tools/perf/budget_scenario.py --binary /tmp/svcd \
+  --budget-percent 90 --workload interactive --plugins 40 --traffic idle --duration 3 \
+  --oversubscribe-per-plugin 11 --bootstrap direct --plugin-runtime shell \
+  --work /tmp/probe-90i --out .scratch/conc90/90i-probe11.json
 ```
 
 `--cpu-budget-percent`、`traffic_meta.overall_latency`、`resources.tree_pss` 是本票给
