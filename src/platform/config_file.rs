@@ -225,7 +225,9 @@ pub fn generated(settings: &Settings) -> String {
          # probe_install_free_disk / probe_temp_free_disk\n\
          # request_stack_bytes = 131072 / 196608 / 262144\n\
          # io_stack_bytes = 65536 / 98304 / 131072\n\
-         # blocking_threads = 2 (default; clamped 2..8). The blocking pool\n\
+         # blocking_threads = 4 / 8 / 16 (clamped 2..32). The blocking pool\n\
+         # blocking_queue = min(max_connections, 256); a queued job belongs\n\
+         # to an admitted connection, so a larger queue can never fill.\n\
          # runs face handlers that cannot run on the server loop; a full\n\
          # queue answers 503 busy. Unix only in this slice; Windows keeps\n\
          # the per-connection fallback. The default Unix topology is four\n\

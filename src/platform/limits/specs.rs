@@ -37,15 +37,19 @@ pub(super) const CONNECTION_FLOOR: usize = 8;
 /// one frame.
 pub(super) const IPC_FRAME_MAX: u64 = 64 * 1024;
 
-/// Default blocking-pool workers.
-pub const DEFAULT_BLOCKING_THREADS: usize = 2;
+/// Default blocking-pool workers at the interactive shape.
+pub const DEFAULT_BLOCKING_THREADS: usize = 8;
 
 /// A pool smaller than two workers cannot run a slow job and keep a second one
 /// moving.
 pub const MIN_BLOCKING_THREADS: usize = 2;
 
-/// Upper bound so a typo cannot turn a small host into a thread farm.
-pub const MAX_BLOCKING_THREADS: usize = 8;
+/// Upper bound so a typo cannot turn a small host into a thread farm. The
+/// default scales with the shape instead of sitting at two: the pool runs the
+/// management routes (install, upload, download, the API), and two workers
+/// plus a 64-slot queue refused a fifty-client host that the memory budget
+/// had already admitted.
+pub const MAX_BLOCKING_THREADS: usize = 32;
 
 /// A fraction of the quantized budget: `budget * num / den`.
 ///
@@ -159,12 +163,16 @@ pub(super) const BLOCKING_THREADS: KeySpec = KeySpec::fixed(
     "blocking_threads",
     MIN_BLOCKING_THREADS as u64,
     MAX_BLOCKING_THREADS as u64,
-    [
-        DEFAULT_BLOCKING_THREADS as u64,
-        DEFAULT_BLOCKING_THREADS as u64,
-        DEFAULT_BLOCKING_THREADS as u64,
-    ],
+    // tiny / interactive / streaming
+    [4, DEFAULT_BLOCKING_THREADS as u64, 16],
 );
+
+/// Jobs the blocking pool may queue. The solved default is the smaller of the
+/// connection count and 256; the invariant needs no term for it because a
+/// queued job belongs to an already-admitted connection and its body was
+/// already charged there.
+pub(super) const BLOCKING_QUEUE: KeySpec =
+    KeySpec::fixed("blocking_queue", 1, 1024, [8, 16, 24]);
 
 /// The wire-level request cap. Complete bodies beyond `max_complete_body` are
 /// spooled, so this one is a protocol bound and not a resident buffer.

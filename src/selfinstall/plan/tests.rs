@@ -97,7 +97,7 @@ fn generated_conf_uses_the_materialized_roots() {
         "{text}"
     );
     assert!(text.contains("svc lan passwd"), "{text}");
-    assert!(text.contains("blocking_threads = 2"), "{text}");
+    assert!(text.contains("blocking_threads = 4 / 8 / 16"), "{text}");
     assert!(
         text.contains(&format!("data_dir = {}", layout.data_dir.display())),
         "{text}"

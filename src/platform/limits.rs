@@ -84,6 +84,8 @@ pub struct Limits {
     pub pending_queue: usize,
     /// Progress events queued between the reactor and one MCP stream.
     pub progress_queue: usize,
+    /// Jobs the blocking pool may queue before it answers 503 busy.
+    pub blocking_queue: usize,
     /// Share of the machine's CPU the daemon may use (0 = no cap). Read by the
     /// admission governor; the memory invariant does not spend it.
     pub cpu_budget_percent: u8,

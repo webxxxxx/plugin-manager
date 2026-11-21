@@ -22,7 +22,12 @@ use crate::platform::log;
 
 /// Maximum jobs waiting for a worker. The queue never grows past this; a full
 /// queue is a visible busy result, not an unbounded allocation.
-pub const QUEUE_LIMIT: usize = 64;
+///
+/// A queued job holds a complete request body that was already resident on its
+/// connection, so the queue does not add a memory term of its own as long as
+/// it cannot exceed the connection count; the server passes the smaller of the
+/// two.
+pub const MAX_QUEUE: usize = 256;
 
 /// Why the pool refused a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

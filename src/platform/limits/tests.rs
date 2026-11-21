@@ -460,6 +460,46 @@ fn a_maxed_out_legal_configuration_is_shrunk_until_the_invariant_holds() {
 }
 
 #[test]
+fn the_blocking_queue_follows_the_connection_count_and_can_be_lowered() {
+    // Unconfigured: the smaller of the connection count and 256.
+    let defaults = derive_for(2 * GIB, Some(Workload::Streaming), Settings::default()).limits;
+    assert_eq!(
+        defaults.blocking_queue,
+        defaults.max_connections.min(256),
+        "queue {} connections {}",
+        defaults.blocking_queue,
+        defaults.max_connections
+    );
+
+    // A queue larger than the admitted connections can never fill, so it is
+    // clamped instead of being advertised (900 is inside its band; above the
+    // band the key falls back to the shape default like every other key).
+    let huge = derive_for(
+        128 * MIB,
+        Some(Workload::Tiny),
+        Settings {
+            blocking_queue: Some(900),
+            ..Settings::default()
+        },
+    )
+    .limits;
+    assert_eq!(huge.blocking_queue, huge.max_connections.min(900));
+
+    // An explicit smaller queue is taken as written: an operator may want the
+    // pool to refuse earlier than the connection cap.
+    let small = derive_for(
+        2 * GIB,
+        Some(Workload::Streaming),
+        Settings {
+            blocking_queue: Some(8),
+            ..Settings::default()
+        },
+    )
+    .limits;
+    assert_eq!(small.blocking_queue, 8);
+}
+
+#[test]
 fn every_limit_has_a_floor() {
     let settings = Settings {
         request_stack_bytes: Some(0),
@@ -557,11 +597,13 @@ fn a_huge_value_is_clamped_to_the_ceiling_and_kept_legal() {
 }
 
 #[test]
-fn blocking_threads_default_to_two_and_stay_in_two_through_eight() {
+fn blocking_threads_scale_with_the_shape_and_stay_in_two_through_thirty_two() {
+    // streaming at 2 GiB: the default is the largest of the three shapes.
     let defaults = derive_for(2 * GIB, None, Settings::default()).limits;
-    assert_eq!(defaults.blocking_threads, 2);
+    assert_eq!(defaults.blocking_threads, 16);
 
-    for (configured, expected) in [(0, 2), (1, 2), (2, 2), (5, 5), (8, 8), (9, 2), (64, 2)] {
+    for (configured, expected) in
+        [(0, 2), (1, 2), (2, 2), (5, 5), (16, 16), (32, 32), (33, 16), (64, 16)] {
         let settings = Settings {
             blocking_threads: Some(configured),
             ..Settings::default()

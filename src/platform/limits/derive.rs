@@ -172,6 +172,7 @@ struct SettingsView {
     ws_raw_queue: Option<usize>,
     pending_queue: Option<usize>,
     progress_queue: Option<usize>,
+    blocking_queue: Option<usize>,
     cpu_budget_percent: Option<usize>,
 }
 
@@ -209,6 +210,7 @@ impl SettingsView {
             ws_raw_queue: settings.ws_raw_queue,
             pending_queue: settings.pending_queue,
             progress_queue: settings.progress_queue,
+            blocking_queue: settings.blocking_queue,
             cpu_budget_percent: settings.cpu_budget_percent,
         }
     }
@@ -285,6 +287,10 @@ impl Limits {
             derivation.count(&PENDING_QUEUE, settings.pending_queue.map(|v| v as u64));
         let progress_queue =
             derivation.count(&PROGRESS_QUEUE, settings.progress_queue.map(|v| v as u64));
+        let blocking_queue = derivation.count(
+            &BLOCKING_QUEUE,
+            settings.blocking_queue.map(|v| v as u64),
+        );
         let cpu_budget_percent = derivation.count(
             &CPU_BUDGET_PERCENT,
             settings.cpu_budget_percent.map(|v| v as u64),
@@ -322,6 +328,7 @@ impl Limits {
             ws_raw_queue,
             pending_queue,
             progress_queue,
+            blocking_queue,
             cpu_budget_percent,
         }
     }
@@ -364,7 +371,17 @@ fn solve_connections(limits: &mut Limits, budget: u64, settings: &settings::Sett
     if settings.max_connections_per_ip.is_none() {
         limits.max_connections_per_ip = limits.max_connections;
     }
+    // A queued blocking job belongs to an admitted connection, so a queue
+    // larger than the connection count can never fill and only misleads.
+    if settings.blocking_queue.is_none() {
+        limits.blocking_queue = limits.max_connections.min(MAX_BLOCKING_QUEUE);
+    } else {
+        limits.blocking_queue = limits.blocking_queue.min(limits.max_connections);
+    }
 }
+
+/// The largest queue the solver hands out when the document stays silent.
+const MAX_BLOCKING_QUEUE: usize = 256;
 
 /// The absolute ceiling for a solved stream count (the spec's upper bound).
 const STREAM_CEILING: usize = 1024;

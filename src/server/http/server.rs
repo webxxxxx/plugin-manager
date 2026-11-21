@@ -122,7 +122,7 @@ pub(crate) fn start(
         let notify = notify_tx.try_clone()?;
         BlockingPool::start(
             config.limits.blocking_threads,
-            crate::server::http::pool::QUEUE_LIMIT,
+            config.limits.blocking_queue,
             crate::platform::host::threads::transfer_stack(&config.limits),
             move |key, outcome| {
                 let _ = results.send(WorkResult::BlockingDone { key, outcome });
