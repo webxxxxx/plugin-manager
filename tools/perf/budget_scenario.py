@@ -465,7 +465,7 @@ def write_fixture(root, runtime="python"):
     return fixture
 
 
-def start_daemon(root, binary, budget_bytes, trust_pub):
+def start_daemon(root, binary, budget_bytes, trust_pub, cpu_percent=0):
     config = root / "config"
     (config / "trust.d").mkdir(parents=True, exist_ok=True)
     (root / "data").mkdir(parents=True, exist_ok=True)
@@ -480,11 +480,11 @@ def start_daemon(root, binary, budget_bytes, trust_pub):
     digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 10000)
     encode = lambda value: base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
     password_hash = "pbkdf2-sha256$10000$%s$%s" % (encode(salt), encode(digest))
-    (config / "svcd.conf").write_text(
-        "bind = 127.0.0.1:0\nmem_budget_bytes = %d\nauth_passwd = %s\n"
-        % (budget_bytes, password_hash),
-        encoding="utf-8",
-    )
+    document = ["bind = 127.0.0.1:0", "mem_budget_bytes = %d" % budget_bytes]
+    if cpu_percent:
+        document.append("cpu_budget_percent = %d" % cpu_percent)
+    document.append("auth_passwd = %s" % password_hash)
+    (config / "svcd.conf").write_text("\n".join(document) + "\n", encoding="utf-8")
     env = os.environ.copy()
     env.update({
         "SVCD_CONFIG_DIR": str(config),
@@ -1119,6 +1119,7 @@ def render_report(result):
         requested.get("budget_bytes"), requested.get("budget_text")))
     lines.append("- Effective budget: %s bytes, workload %s, worst case %s bytes" % (
         effective.get("budget_quantized"), effective.get("workload"), effective.get("worst_case")))
+    lines.append("- CPU budget: %s%%" % (requested.get("cpu_budget_percent") or "off"))
     lines.append("- Plugin runtime: %s" % requested.get("plugin_runtime", "auto"))
     lines.append("- Duration: %.2fs, workers %s (per plugin %s), think %sms" % (
         meta.get("elapsed_seconds", 0), meta.get("workers", 0),
@@ -1258,6 +1259,8 @@ def main():
                         help="shell uses a bash NDJSON agent on Linux; python is the Windows fixture")
     parser.add_argument("--traffic", choices=("all", "idle"), default="all",
                         help="all drives every surface; idle only boots the plugins and samples")
+    parser.add_argument("--cpu-budget-percent", type=int, default=0,
+                        help="cpu_budget_percent in the document (0 disables the governor)")
     parser.add_argument("--no-oversubscribe", action="store_true")
     parser.add_argument("--bootstrap", choices=("api", "direct"), default="api",
                         help="api installs through the management API; direct writes the "
@@ -1325,6 +1328,7 @@ def main():
                 if args.per_plugin_concurrency else args.concurrency
             ),
             "think_ms": args.think_ms,
+            "cpu_budget_percent": args.cpu_budget_percent,
             "plugin_runtime": args.plugin_runtime,
             "traffic": args.traffic,
         },
@@ -1347,7 +1351,7 @@ def main():
             target = detect_platform()
             write_direct_layout(root, fixture, plugins, target)
             log("direct layout for %d plugins (platform %s)" % (len(plugins), target))
-        daemon = start_daemon(root, binary, args.budget, pub)
+        daemon = start_daemon(root, binary, args.budget, pub, args.cpu_budget_percent)
         log("daemon on %s, pid %d" % (daemon["address"], daemon["process"].pid))
         result["effective"] = startup_report(root)
         svc = root / "bin" / ("svc" + EXE)
