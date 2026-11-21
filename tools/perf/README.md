@@ -53,7 +53,8 @@ loopback-only and unauthenticated.
   missing `_meta`, and the official SDK over the stdio bridge
 - WebSocket: tools/call + notification, ping/pong/close, fragmentation,
   cross-origin 403, oversized close 1009
-- SSE: EventSource delivery and `Last-Event-ID` replay
+- SSE: EventSource delivery, raw frame fields (`id` / `event` / `data`) and
+  `Last-Event-ID` replay
 - Performance: HTTP/MCP list/call at concurrency 1/8/32 with a keep-alive agent,
   WS at 1/8/32 connections, SSE event throughput, 10s mixed workload, CPU/RSS
   sampling

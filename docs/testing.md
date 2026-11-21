@@ -55,7 +55,7 @@
 - 重连：`Last-Event-ID` 回放；无 `id` 的事件不改变 last id；
 - 非法 UTF-8 替换为 U+FFFD，不中断流。
 
-现有 `run.mjs --compat` 只测 EventSource 投递与 `Last-Event-ID`，上面这些要补成表驱动向量。
+现有 `run.mjs --compat` 测 EventSource 投递、原始帧字段（`id` / `event` / `data`）与 `Last-Event-ID` 回放；多行 `data`、心跳、`retry` 仍要补。
 
 ### 3.4 MCP
 
@@ -253,7 +253,7 @@ MCP SSE 的 handler 由 `cargo test --bin svcd server::mcp::progress` 覆盖：S
 | `test.yml` | PR / main | `cargo test`、`--no-default-features`、`.spk` smoke、`MEM_LEVEL` 三档 |
 | `test.yml` guardrails | PR / main | `tools/closed-tickets-merged.mjs --map 112`：已关闭子票必须有提交在 base |
 | `perf.yml` | 每周 / 手动 | `--perf`，上传报告与 JSON |
-| `compat.yml` | 每晚 / 手动 | `--compat`（Linux，21 条向量）；失败上传 `perf-report.md`、`perf-results.json` 与 daemon stderr |
+| `compat.yml` | 每晚 / 手动 | `--compat`（Linux，22 条向量）；失败上传 `perf-report.md`、`perf-results.json` 与 daemon stderr |
 | Autobahn / WHATWG SSE（待接） | — | WS fuzzingclient 与 SSE 表驱动向量；尚无工作流 |
 
 性能与兼容的完整套件不要塞进 PR：PR 只保留可确定、分钟级的检查。
