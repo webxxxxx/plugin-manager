@@ -25,6 +25,8 @@ pub(crate) use scenarios::*;
 
 #[path = "http/auth.rs"]
 mod auth;
+#[path = "http/backup_rules.rs"]
+mod backup_rules;
 #[path = "http/config.rs"]
 mod config;
 #[path = "http/control.rs"]

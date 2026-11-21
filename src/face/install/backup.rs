@@ -20,9 +20,9 @@ use super::{import_response, install_staged};
 /// inner package reuses package::StagingInstaller.
 ///
 /// transfer::import_backup is the buffered twin used by the CLI and the legacy
-/// whole-body import. The rules (schema, id/version match, config hash,
-/// force/warning policy, config application) must stay in step; a change here
-/// belongs there too.
+/// whole-body import. The validation and force/warning rules live in
+/// manage::check::backup; both paths call them instead of keeping a copy. This
+/// type keeps only the streaming tar state machine and the staging cleanup.
 pub(super) struct BackupImport {
     tar: package::TarFeed,
     sink: BackupSink,
@@ -68,7 +68,6 @@ struct BackupSink {
     installer: Option<package::StagingInstaller>,
     staged: Option<package::StagedPackage>,
     config_data: Option<Vec<u8>>,
-    warnings: Vec<String>,
     stage: BackupStage,
     current: Option<BackupCurrent>,
 }
@@ -106,7 +105,6 @@ impl BackupSink {
             installer: None,
             staged: None,
             config_data: None,
-            warnings: Vec::new(),
             stage: BackupStage::ExpectBackup,
             current: None,
         }
@@ -184,14 +182,7 @@ impl package::TarSink for BackupSink {
         };
         match current {
             BackupCurrent::Backup(bytes) => {
-                let backup: plugin::Backup = serde_json::from_slice(&bytes).map_err(|error| {
-                    Problem::Invalid.error(format!("invalid backup.json: {}", error))
-                })?;
-                if backup.schema != 1 {
-                    return Err(Problem::Invalid
-                        .error(format!("unsupported backup schema {}", backup.schema)));
-                }
-                self.backup = Some(backup);
+                self.backup = Some(plugin::parse_backup(&bytes)?);
                 self.stage = BackupStage::ExpectSpk;
                 Ok(())
             }
@@ -201,38 +192,11 @@ impl package::TarSink for BackupSink {
                     .take()
                     .ok_or_else(|| Problem::Invalid.error("plugin.spk is missing"))?;
                 let staged = installer.finish()?;
-                // A later config check may fail; keep the staged tree in
+                // A later rule check may fail; keep the staged tree in
                 // self.staged so the sink's Drop removes it.
                 self.staged = Some(staged);
-                let staged = self.staged.as_ref().expect("staged package");
-                let Some(backup) = self.backup.as_ref() else {
+                if self.backup.is_none() {
                     return Err(Problem::Invalid.error("backup.json is missing"));
-                };
-                if staged.manifest.name != backup.id {
-                    return Err(Problem::Invalid.error(format!(
-                        "backup id {} does not match package id {}",
-                        backup.id, staged.manifest.name
-                    )));
-                }
-                if staged.manifest.version != backup.version {
-                    return Err(Problem::Invalid.error(format!(
-                        "backup version {} does not match package version {}",
-                        backup.version, staged.manifest.version
-                    )));
-                }
-                self.warnings.clear();
-                if let Some(current) = plugin::current_version(&self.paths, &backup.id) {
-                    if current != backup.version {
-                        self.warnings.push(format!(
-                            "installed {} is {}, importing {}",
-                            backup.id, current, backup.version
-                        ));
-                    } else if !self.force {
-                        return Err(Problem::Conflict.error(format!(
-                            "{} {} is already installed; use --force",
-                            backup.id, backup.version
-                        )));
-                    }
                 }
                 self.stage = BackupStage::ExpectConfig;
                 Ok(())
@@ -252,22 +216,23 @@ impl BackupSink {
             .backup
             .take()
             .ok_or_else(|| Problem::Invalid.error("backup.json is missing"))?;
-        // Check the config hash before taking the staged tree: an error here
-        // must leave it in self.staged so Drop removes the directory.
-        if let Some(expected) = &backup.config_sha256 {
-            let Some(config_data) = self.config_data.as_ref() else {
-                return Err(
-                    Problem::Invalid.error("backup declares a config hash but config is missing")
-                );
-            };
-            if &package::hex_sha256(config_data) != expected {
-                return Err(Problem::Invalid.error("backup config hash does not match"));
-            }
-        }
+        // The rules may fail; keep the staged tree in self.staged so Drop
+        // removes the directory.
         let staged = self
             .staged
-            .take()
+            .as_ref()
             .ok_or_else(|| Problem::Invalid.error("plugin.spk is missing"))?;
+        let current = plugin::current_version(&self.paths, &backup.id);
+        let plan = plugin::BackupRules {
+            backup: &backup,
+            package_id: &staged.manifest.name,
+            package_version: &staged.manifest.version,
+            config: self.config_data.as_deref(),
+            current_version: current.as_deref(),
+            force: self.force,
+        }
+        .plan()?;
+        let staged = self.staged.take().expect("staged package");
         let applied = !self.no_config && self.config_data.is_some();
         let status = match install_staged(
             config,
@@ -297,7 +262,7 @@ impl BackupSink {
             status,
             Some(backup.id),
             applied,
-            std::mem::take(&mut self.warnings),
+            plan.warnings,
         ))
     }
 }
