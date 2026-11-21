@@ -32,6 +32,8 @@ pub(crate) enum Endpoint {
     Logout,
     /// A macro-declared API route, identified by its handler name.
     Api(&'static str),
+    /// A macro-declared pre-body route, identified by its handler name.
+    PreBody(&'static str),
     ExportSpk,
     ExportBundle,
     /// A /api/v1/import path that must answer 405, not 404.
@@ -40,12 +42,6 @@ pub(crate) enum Endpoint {
     UnknownApi,
     BlobDownload,
     FileDownload,
-    BlobStream,
-    FileStream,
-    BlobPart,
-    FilePart,
-    PackageInstall,
-    PackageImport,
     BlobCreate,
     BlobStatus,
     BlobComplete,
@@ -206,23 +202,77 @@ impl RouteSpec {
 /// public, priority, body policy and run mode are derived here; the historical
 /// 404-on-method-miss rows set `quiet`.
 pub(crate) struct ApiRouteDef {
+    kind: RouteKind,
     pub(crate) method: &'static str,
     pub(crate) path: &'static str,
     pub(crate) handler: &'static str,
     pub(crate) quiet: bool,
 }
 
+#[derive(Clone, Copy)]
+enum RouteKind {
+    /// An ordinary JSON API route handled by `ApiFace`.
+    Api,
+    /// A streamed upload claimed before the body is read by `PreBodyFaces`.
+    PreBody,
+}
+
 impl ApiRouteDef {
+    pub(crate) const fn api(
+        method: &'static str,
+        path: &'static str,
+        handler: &'static str,
+        quiet: bool,
+    ) -> ApiRouteDef {
+        ApiRouteDef {
+            kind: RouteKind::Api,
+            method,
+            path,
+            handler,
+            quiet,
+        }
+    }
+
+    pub(crate) const fn prebody(
+        method: &'static str,
+        path: &'static str,
+        handler: &'static str,
+    ) -> ApiRouteDef {
+        ApiRouteDef {
+            kind: RouteKind::PreBody,
+            method,
+            path,
+            handler,
+            quiet: false,
+        }
+    }
+
     fn spec(&self) -> RouteSpec {
+        let (endpoint, owner, body, run, priority) = match self.kind {
+            RouteKind::Api => (
+                Endpoint::Api(self.handler),
+                Owner::Api,
+                body_for(self.method),
+                Run::Blocking,
+                0,
+            ),
+            RouteKind::PreBody => (
+                Endpoint::PreBody(self.handler),
+                Owner::PreBody,
+                Body::Streamed,
+                Run::Inline,
+                2,
+            ),
+        };
         RouteSpec {
-            endpoint: Endpoint::Api(self.handler),
-            owner: Owner::Api,
+            endpoint,
+            owner,
             methods: Box::leak(vec![self.method].into_boxed_slice()),
             pattern: compile_pattern(self.path),
-            body: body_for(self.method),
-            run: Run::Blocking,
+            body,
+            run,
             public: false,
-            priority: 0,
+            priority,
             miss: if self.quiet {
                 Miss::Ignore
             } else {
@@ -283,6 +333,7 @@ fn specs() -> &'static [RouteSpec] {
     BUILT.get_or_init(|| {
         let mut rows: Vec<RouteSpec> = MANUAL_SPECS.to_vec();
         rows.extend(crate::face::api::route_defs().map(ApiRouteDef::spec));
+        rows.extend(crate::face::prebody::route_defs().map(ApiRouteDef::spec));
         let leaked: &'static [RouteSpec] = Box::leak(rows.into_boxed_slice());
         leaked
     })
@@ -502,7 +553,6 @@ pub(crate) fn body_policy(head: &http::Head, limits: &Limits) -> BodyPolicy {
 const GET: &[&str] = &["GET"];
 const GET_HEAD: &[&str] = &["GET", "HEAD"];
 const POST: &[&str] = &["POST"];
-const PUT: &[&str] = &["PUT"];
 const DELETE: &[&str] = &["DELETE"];
 const ANY: &[&str] = &["*"];
 
@@ -620,84 +670,8 @@ static MANUAL_SPECS: &[RouteSpec] = &[
         false,
         0,
     ),
-    // Pre-body streams own their POST/PUT methods; the fallback owns the
-    // 405 projection for every other method on the same shape.
-    row(
-        Endpoint::PackageInstall,
-        Owner::PreBody,
-        POST,
-        Pattern::Segments(&[lit("api"), lit("v1"), lit("plugins")]),
-        Body::Streamed,
-        Run::Inline,
-        false,
-        2,
-    ),
-    row(
-        Endpoint::PackageImport,
-        Owner::PreBody,
-        POST,
-        Pattern::Segments(&[lit("api"), lit("v1"), lit("import")]),
-        Body::Streamed,
-        Run::Inline,
-        false,
-        2,
-    ),
-    row(
-        Endpoint::BlobStream,
-        Owner::PreBody,
-        POST,
-        Pattern::Segments(&[lit("api"), lit("v1"), lit("blobs")]),
-        Body::Streamed,
-        Run::Inline,
-        false,
-        2,
-    ),
-    row(
-        Endpoint::FileStream,
-        Owner::PreBody,
-        POST,
-        Pattern::Segments(&[lit("api"), lit("v1"), lit("file")]),
-        Body::Streamed,
-        Run::Inline,
-        false,
-        2,
-    ),
-    row(
-        Endpoint::BlobPart,
-        Owner::PreBody,
-        PUT,
-        Pattern::Segments(&[
-            lit("api"),
-            lit("v1"),
-            lit("blobs"),
-            lit("uploads"),
-            param("upload"),
-            lit("parts"),
-            param("part"),
-        ]),
-        Body::Streamed,
-        Run::Inline,
-        false,
-        2,
-    ),
-    row(
-        Endpoint::FilePart,
-        Owner::PreBody,
-        PUT,
-        Pattern::Segments(&[
-            lit("api"),
-            lit("v1"),
-            lit("file"),
-            lit("uploads"),
-            param("upload"),
-            lit("parts"),
-            param("part"),
-        ]),
-        Body::Streamed,
-        Run::Inline,
-        false,
-        2,
-    ),
+    // Pre-body upload rows are declared in face/prebody.rs.
+
     // The API keeps its 404 for a bare /api/v1/plugins of any non-POST method;
     // the POST row above wins on priority.
     row(
@@ -886,7 +860,7 @@ static MANUAL_SPECS: &[RouteSpec] = &[
     ),
     // Fallback 405 claims for the shapes whose streaming method lives above.
     row(
-        Endpoint::BlobStream,
+        Endpoint::PreBody("blob_stream"),
         Owner::Fallback,
         &[],
         Pattern::Segments(&[lit("api"), lit("v1"), lit("blobs")]),
@@ -896,7 +870,7 @@ static MANUAL_SPECS: &[RouteSpec] = &[
         3,
     ),
     row(
-        Endpoint::FileStream,
+        Endpoint::PreBody("file_stream"),
         Owner::Fallback,
         &[],
         Pattern::Segments(&[lit("api"), lit("v1"), lit("file")]),
@@ -1051,7 +1025,7 @@ mod tests {
         let Match::Found(matched) = resolve("PUT", "/api/v1/files/uploads/u/parts/1") else {
             panic!("files alias should match a file part");
         };
-        assert_eq!(matched.spec.endpoint, Endpoint::FilePart);
+        assert_eq!(matched.spec.endpoint, Endpoint::PreBody("file_part"));
         assert_eq!(matched.param("upload"), Some("u"));
         assert_eq!(matched.param("part"), Some("1"));
     }

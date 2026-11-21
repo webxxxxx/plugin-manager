@@ -11,6 +11,34 @@ use crate::platform::config::Config;
 use crate::server::auth::lan::Lan;
 use crate::server::http::model as http;
 
+/// Pre-body rows. Same line shape as the API macro: method, path, handler.
+/// These routes own the request body before it is buffered, so their table
+/// derives `Owner::PreBody`, `Body::Streamed`, inline dispatch and priority 2.
+macro_rules! prebody {
+    ($($method:ident $path:literal => $handler:ident),* $(,)?) => {
+        static PREBODY_ROUTES: &[crate::face::routes::ApiRouteDef] = &[
+            $(crate::face::routes::ApiRouteDef::prebody(
+                stringify!($method),
+                $path,
+                stringify!($handler),
+            ),)*
+        ];
+    };
+}
+
+prebody! {
+    POST "/api/v1/plugins"                              => package_install,
+    POST "/api/v1/import"                               => package_import,
+    POST "/api/v1/blobs"                                => blob_stream,
+    POST "/api/v1/file"                                 => file_stream,
+    PUT  "/api/v1/blobs/uploads/{upload}/parts/{part}"  => blob_part,
+    PUT  "/api/v1/file/uploads/{upload}/parts/{part}"   => file_part,
+}
+
+pub(crate) fn route_defs() -> impl Iterator<Item = &'static crate::face::routes::ApiRouteDef> {
+    PREBODY_ROUTES.iter()
+}
+
 pub(crate) struct PreBodyFaces {
     /// Read through the trait object by both drivers: the poll loop on Unix and
     /// the thread-per-connection driver elsewhere (#205).
@@ -48,7 +76,7 @@ impl PreBodyFaces {
         let matched = routes::resolve(&head.method, &head.path).found()?;
         if !matches!(
             matched.spec.endpoint,
-            Endpoint::PackageInstall | Endpoint::PackageImport
+            Endpoint::PreBody("package_install") | Endpoint::PreBody("package_import")
         ) {
             return None;
         }
@@ -69,7 +97,10 @@ impl PreBodyFaces {
         let matched = routes::resolve(&head.method, &head.path).found()?;
         if !matches!(
             matched.spec.endpoint,
-            Endpoint::BlobStream | Endpoint::FileStream | Endpoint::BlobPart | Endpoint::FilePart
+            Endpoint::PreBody("blob_stream")
+                | Endpoint::PreBody("file_stream")
+                | Endpoint::PreBody("blob_part")
+                | Endpoint::PreBody("file_part")
         ) {
             return None;
         }
@@ -209,6 +240,7 @@ mod tests {
         for (method, path, transfer) in [
             ("GET", "/plugin-ui/demo/", false),
             ("POST", "/api/v1/plugins", true),
+            ("POST", "/api/v1/import", true),
             ("POST", "/api/v1/blobs", true),
         ] {
             let claim = faces

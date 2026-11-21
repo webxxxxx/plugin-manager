@@ -79,12 +79,12 @@ impl<'a> ApiCall<'a> {
 macro_rules! api_routes {
     ($($method:ident $path:literal => $handler:ident),* $(,)?) => {
         static API_CLAIM_ROUTES: &[crate::face::routes::ApiRouteDef] = &[
-            $(crate::face::routes::ApiRouteDef {
-                method: stringify!($method),
-                path: $path,
-                handler: stringify!($handler),
-                quiet: false,
-            },)*
+            $(crate::face::routes::ApiRouteDef::api(
+                stringify!($method),
+                $path,
+                stringify!($handler),
+                false,
+            ),)*
         ];
         static API_CLAIM_HANDLERS: &[(&str, HandlerKind)] = &[
             $((stringify!($handler), HandlerKind::Response(ApiFace::$handler)),)*
@@ -96,12 +96,12 @@ macro_rules! api_routes {
 macro_rules! api_quiet_routes {
     ($($method:ident $path:literal => $handler:ident),* $(,)?) => {
         static API_QUIET_ROUTES: &[crate::face::routes::ApiRouteDef] = &[
-            $(crate::face::routes::ApiRouteDef {
-                method: stringify!($method),
-                path: $path,
-                handler: stringify!($handler),
-                quiet: true,
-            },)*
+            $(crate::face::routes::ApiRouteDef::api(
+                stringify!($method),
+                $path,
+                stringify!($handler),
+                true,
+            ),)*
         ];
         static API_QUIET_HANDLERS: &[(&str, HandlerKind)] = &[
             $((stringify!($handler), HandlerKind::Response(ApiFace::$handler)),)*
