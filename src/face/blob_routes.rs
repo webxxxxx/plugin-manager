@@ -75,7 +75,10 @@ pub fn file_upload_complete(paths: &Paths, id: &str, body: &[u8]) -> Vec<u8> {
     if let Some(response) = kind_rejection(paths, id, blob::UploadKind::File) {
         return response;
     }
-    let mut requested = None;
+    let requested = match parse_parts(body, false) {
+        Ok(requested) => requested,
+        Err(response) => return response,
+    };
     let mut name = None;
     let mut mime_type = None;
     if !body.is_empty() {
@@ -83,27 +86,6 @@ pub fn file_upload_complete(paths: &Paths, id: &str, body: &[u8]) -> Vec<u8> {
             Ok(value) => value,
             Err(_) => return http::json_error(400, "bad_request", "body must be JSON"),
         };
-        if let Some(parts) = value.get("parts") {
-            let Some(parts) = parts.as_array() else {
-                return http::json_error(400, "bad_request", "parts must be an array");
-            };
-            let mut list = Vec::with_capacity(parts.len());
-            for part in parts {
-                let Some(number) = part.get("partNumber").and_then(Value::as_u64) else {
-                    return http::json_error(400, "bad_request", "partNumber is required");
-                };
-                if number == 0 || number > blob::MAX_PART_NUMBER as u64 {
-                    return http::json_error(
-                        400,
-                        "bad_request",
-                        "partNumber must be between 1 and 10000",
-                    );
-                }
-                let etag = part.get("etag").and_then(Value::as_str).map(str::to_string);
-                list.push((number as u32, etag));
-            }
-            requested = Some(list);
-        }
         name = value
             .get("name")
             .and_then(Value::as_str)
@@ -184,6 +166,57 @@ fn kind_rejection(paths: &Paths, id: &str, kind: blob::UploadKind) -> Option<Vec
     }
 }
 
+/// Decode the optional `parts` list shared by both complete endpoints.
+///
+/// `required` is the only difference between them: a non-empty blob completion
+/// must name its parts, while a file completion may send an empty body or omit
+/// `parts` and let storage select every uploaded part. An empty body is never a
+/// parse error here; both callers keep their pre-existing empty-body behavior.
+#[allow(clippy::type_complexity)] // The return shape is the shared decoder contract (#246).
+fn parse_parts(body: &[u8], required: bool) -> Result<Option<Vec<(u32, Option<String>)>>, Vec<u8>> {
+    if body.is_empty() {
+        return Ok(None);
+    }
+    let value: Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(_) => return Err(http::json_error(400, "bad_request", "body must be JSON")),
+    };
+    let Some(parts) = value.get("parts") else {
+        return if required {
+            Err(http::json_error(400, "bad_request", "parts is required"))
+        } else {
+            Ok(None)
+        };
+    };
+    let Some(parts) = parts.as_array() else {
+        return Err(http::json_error(
+            400,
+            "bad_request",
+            "parts must be an array",
+        ));
+    };
+    let mut list = Vec::with_capacity(parts.len());
+    for part in parts {
+        let Some(number) = part.get("partNumber").and_then(Value::as_u64) else {
+            return Err(http::json_error(
+                400,
+                "bad_request",
+                "partNumber is required",
+            ));
+        };
+        if number == 0 || number > blob::MAX_PART_NUMBER as u64 {
+            return Err(http::json_error(
+                400,
+                "bad_request",
+                "partNumber must be between 1 and 10000",
+            ));
+        }
+        let etag = part.get("etag").and_then(Value::as_str).map(str::to_string);
+        list.push((number as u32, etag));
+    }
+    Ok(Some(list))
+}
+
 pub fn complete_upload(paths: &Paths, id: &str, body: &[u8]) -> Vec<u8> {
     if !blob::valid_upload_id(id) {
         return http::json_error(400, "bad_request", "invalid upload id");
@@ -191,32 +224,9 @@ pub fn complete_upload(paths: &Paths, id: &str, body: &[u8]) -> Vec<u8> {
     if let Some(response) = kind_rejection(paths, id, blob::UploadKind::Blob) {
         return response;
     }
-    let requested = if body.is_empty() {
-        None
-    } else {
-        let value: Value = match serde_json::from_slice(body) {
-            Ok(value) => value,
-            Err(_) => return http::json_error(400, "bad_request", "body must be JSON"),
-        };
-        let Some(parts) = value.get("parts").and_then(Value::as_array) else {
-            return http::json_error(400, "bad_request", "parts is required");
-        };
-        let mut requested = Vec::with_capacity(parts.len());
-        for part in parts {
-            let Some(number) = part.get("partNumber").and_then(Value::as_u64) else {
-                return http::json_error(400, "bad_request", "partNumber is required");
-            };
-            if number == 0 || number > blob::MAX_PART_NUMBER as u64 {
-                return http::json_error(
-                    400,
-                    "bad_request",
-                    "partNumber must be between 1 and 10000",
-                );
-            }
-            let etag = part.get("etag").and_then(Value::as_str).map(str::to_string);
-            requested.push((number as u32, etag));
-        }
-        Some(requested)
+    let requested = match parse_parts(body, true) {
+        Ok(requested) => requested,
+        Err(response) => return response,
     };
     match blob::complete_upload(paths, id, requested) {
         Ok(meta) => {

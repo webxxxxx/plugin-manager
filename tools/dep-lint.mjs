@@ -576,6 +576,13 @@ const ASSEMBLY_RULES = [
     ],
     hint: "install 收尾（install / bump_catalog / 日志 / status）只经 daemon/plugins.rs 的 finish_install（#245）。",
   },
+  {
+    name: "complete 端点的 parts 请求体解析",
+    members: [/partNumber/, /\bfrom_slice\(/, /\bas_array\(/],
+    min: 2,
+    allow: [{ file: "src/face/blob_routes.rs", item: "parse_parts" }],
+    hint: "complete 的 parts[] 解码只经 face/blob_routes.rs 的 parse_parts（#246）。",
+  },
 ];
 
 /// 生产 fn 的正文区间（入参是 `stripComments` 遮罩过的文本）。`#[cfg(test)]`
@@ -919,6 +926,20 @@ const SELFTEST_ASSEMBLY = [
     file: "src/daemon/plugins.rs",
     source:
       'fn finish_install(host: &mut Supervisor, service: Service, clock: &Clock) {\n    host.install(service, false);\n    host.bump_catalog();\n    let _ = host.status_for_id("demo", clock.now());\n}\n',
+    expected: [],
+  },
+  {
+    name: "complete 端点的 parts 解析在名单外算违规",
+    file: "src/face/other.rs",
+    source:
+      'fn decode(body: &[u8]) -> Option<usize> {\n    let value: Value = serde_json::from_slice(body).unwrap();\n    value.get("parts").and_then(|parts| parts.as_array()).map(|parts| parts.len())\n}\n',
+    expected: ["complete 端点的 parts 请求体解析"],
+  },
+  {
+    name: "parse_parts 的 parts 解析不算",
+    file: "src/face/blob_routes.rs",
+    source:
+      'fn parse_parts(body: &[u8], required: bool) -> Option<usize> {\n    let value: Value = serde_json::from_slice(body).ok()?;\n    let parts = value.get("parts")?.as_array()?;\n    let _ = required;\n    Some(parts.len())\n}\n',
     expected: [],
   },
 ];
