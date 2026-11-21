@@ -2,7 +2,9 @@
 //!
 //! Byte keys express their share as a fraction of the budget; count keys
 //! express it as the budget one slot may claim. The three columns are the
-//! reference budgets (128 MiB / 512 MiB / 2 GiB).
+//! reference budgets (128 MiB / 512 MiB / 2 GiB). The `high` ceiling is 8 GiB:
+//! `auto` is a quarter of available memory, so a 2 GiB ceiling stopped tracking
+//! the machine on any host with 8 GiB free (ADR-0026, 2026-11-21 修订三).
 
 use crate::platform::resources::Workload;
 
@@ -16,7 +18,7 @@ pub const BUDGET_CAP: u64 = 128 * 1024 * 1024;
 pub const BUDGET_CAP: u64 = 512 * 1024 * 1024;
 
 #[cfg(mem_high)]
-pub const BUDGET_CAP: u64 = 2 * 1024 * 1024 * 1024;
+pub const BUDGET_CAP: u64 = 8 * 1024 * 1024 * 1024;
 
 pub(super) const MIB: u64 = 1024 * 1024;
 

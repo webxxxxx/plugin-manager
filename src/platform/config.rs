@@ -309,11 +309,12 @@ mod tests {
         let config = Config::bootstrap_with(
             &settings,
             Some(PathBuf::from("/etc/svcd/svcd.conf")),
-            &Fixed(Some(16 * 1024 * 1024 * 1024)),
+            &Fixed(Some(128 * 1024 * 1024 * 1024)),
         )
         .expect("bootstrap");
 
-        // 25% of 16 GiB is 4 GiB, which the build ceiling still caps.
+        // 25% of 128 GiB is 32 GiB, which every build ceiling still caps: the
+        // machine is bigger than any level, so the cap is what decides.
         assert_eq!(config.resources.budget.raw, limits::BUDGET_CAP);
         assert_eq!(config.resources.profile.cpus, Some(4));
         assert_eq!(

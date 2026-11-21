@@ -27,7 +27,12 @@ pub fn derive(settings: &settings::Settings) -> Derived {
 ///
 /// Pure: same document plus same profile, same result (user story 14).
 pub fn derive_with(settings: &settings::Settings, profile: &ResourceProfile) -> Derived {
-    let budget = budget(settings.mem_budget_bytes, profile, BUDGET_CAP);
+    let budget = budget(
+        settings.mem_budget_bytes,
+        settings.mem_budget_percent,
+        profile,
+        BUDGET_CAP,
+    );
     let workload = settings
         .workload
         .unwrap_or_else(|| Workload::suggested(budget.quantized, profile.cpus));
@@ -45,6 +50,23 @@ pub fn derive_with(settings: &settings::Settings, profile: &ResourceProfile) -> 
             notes.push(Override::new(
                 "mem_budget_bytes",
                 configured,
+                BUDGET_CAP,
+                OverrideReason::BuildCap,
+            ));
+        }
+    }
+    // A percentage is resolved against the probe before the ceiling can tighten
+    // it, so the row keeps the key the operator wrote and shows the effective
+    // budget in bytes on the right: `mem_budget_percent: 90 -> 2147483648`.
+    if let Some(percent) = settings.mem_budget_percent {
+        let requested = profile
+            .available_memory
+            .map(|available| available.saturating_mul(percent as u64) / 100)
+            .unwrap_or(BUDGET_CAP);
+        if requested > BUDGET_CAP {
+            notes.push(Override::new(
+                "mem_budget_percent",
+                percent as u64,
                 BUDGET_CAP,
                 OverrideReason::BuildCap,
             ));

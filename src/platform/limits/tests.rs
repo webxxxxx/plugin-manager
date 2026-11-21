@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use crate::platform::resources::MIN_BUDGET;
+use crate::platform::resources::{BudgetSource, MIN_BUDGET};
 use crate::platform::settings::Settings;
 
 const KIB: u64 = 1024;
@@ -16,6 +16,34 @@ fn derive_for(budget: u64, workload: Option<Workload>, settings: Settings) -> De
     derive_with(&settings, &ResourceProfile::default())
 }
 
+/// A percentage is resolved from the probe, so what the ceiling tightens is
+/// the resolved number — and the report still names the key the operator wrote.
+#[test]
+fn a_capped_percentage_is_reported_under_the_key_it_was_written_as() {
+    let settings = Settings {
+        mem_budget_percent: Some(90),
+        ..Settings::default()
+    };
+    let profile = ResourceProfile {
+        available_memory: Some(64 * GIB),
+        ..ResourceProfile::default()
+    };
+
+    let derived = derive_with(&settings, &profile);
+
+    // 90% of 64 GiB is 57.6 GiB; every level caps it.
+    assert_eq!(derived.report.budget.raw, BUDGET_CAP);
+    assert_eq!(derived.report.budget.source, BudgetSource::Configured);
+    let note = derived
+        .report
+        .notes
+        .iter()
+        .find(|note| note.key == "mem_budget_percent")
+        .expect("a build-cap row for the percentage");
+    assert_eq!(note.configured, 90);
+    assert_eq!(note.effective, BUDGET_CAP);
+    assert_eq!(note.reason, OverrideReason::BuildCap);
+}
 /// A shape's reference budget, clipped to what this build may spend. A
 /// `mem_low` binary cannot express the streaming shape's 2 GiB reference,
 /// so its tests compare against the budget the binary really gets.

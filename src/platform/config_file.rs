@@ -210,13 +210,15 @@ pub fn generated(settings: &Settings) -> String {
          # budget from this machine (free memory, the cgroup v2 limit, CPU\n\
          # count) and spends it according to a workload shape. MEM_LEVEL\n\
          # (low|middle|high, default high) is the ceiling the budget can never\n\
-         # exceed: 128 MiB / 512 MiB / 2 GiB. Values below are comments only;\n\
+         # exceed: 128 MiB / 512 MiB / 8 GiB. Values below are comments only;\n\
          # uncomment to override. Expected values at each shape's reference\n\
          # budget (tiny@128MiB, interactive@512MiB, streaming@2GiB):\n\
          # log_max_bytes = 65536 / 65536 / 65536\n\
          # log_rotations = 3 / 3 / 3\n\
          # log_to_file = on\n\
          # mem_budget_bytes = auto (25% of free memory, capped by MEM_LEVEL)\n\
+         # mem_budget_percent = 1..100 (the same, as a share of free memory;\n\
+         #   mutually exclusive with mem_budget_bytes)\n\
          # workload = tiny | interactive | streaming (default: from the budget,\n\
          #   below 2 GiB of budget is interactive, below 512 MiB is tiny)\n\
          # Every probe input may be stated instead of read; a stated item wins\n\

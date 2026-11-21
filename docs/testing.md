@@ -72,7 +72,7 @@ MCP 不是 W3C，不要用 WPT 套；官方 SDK + 规范逐条向量就是这一
 
 ## 4. 内存预算、形状与 `svcd.conf` 边界
 
-`MEM_LEVEL=low|middle|high` 现在是**编译期预算上限**（128 MiB / 512 MiB / 2 GiB，只收紧），`svcd.conf` 的 `mem_budget_bytes` / `workload` 与其余键是运行期输入；显式 `mem_budget_bytes` 按原值生效（只受编译期上限约束），`auto` 才受 64 MiB 下限与量化台阶约束；派生全部落在 [limits.rs](../src/platform/limits.rs)，探测落在 [resources.rs](../src/platform/resources.rs)。测试分五段：
+`MEM_LEVEL=low|middle|high` 现在是**编译期预算上限**（128 MiB / 512 MiB / 8 GiB，只收紧），`svcd.conf` 的 `mem_budget_bytes` / `mem_budget_percent` / `workload` 与其余键是运行期输入；显式 `mem_budget_bytes` 与 `mem_budget_percent`（可用内存的百分比，解析成字节后同样只受上限约束）按原值生效，`auto` 才受 64 MiB 下限与量化台阶约束；派生全部落在 [limits.rs](../src/platform/limits.rs)，探测落在 [resources.rs](../src/platform/resources.rs)。测试分五段：
 
 1. **档位矩阵**：CI 用 `low/middle/high` 各编译并跑 `limits::tests`
    （`cargo test --bin svcd platform::limits`）。断言的是不变量恒成立或启动被拒，
@@ -102,8 +102,8 @@ MCP 不是 W3C，不要用 WPT 套；官方 SDK + 规范逐条向量就是这一
 沙箱里的限额是**确定的**：`Config::with_paths` / `Config::with_resources` 不探测本机，
 `B` 等于编译期上限；只有 `Config::bootstrap` 读真实机器。集成 sandbox 里的 daemon 确实探测，
 所以断言**绝对**限额的用例必须自己钉住：要么写死那个键（`max_json_body_bytes = 1048576`），
-要么钉住探测输入（`probe_available_memory = 8589934592` → 2 GiB 预算，等价于旧的 `high`
-形状）。`tests/mcp.rs` 的 sandbox 就是后者。
+要么钉住探测输入（`probe_available_memory = 8589934592` → `auto` 的 2 GiB 预算，
+曾是 `high` 的上限，现在只是它的一半）。`tests/mcp.rs` 的 sandbox 就是后者。
 
 已覆盖的坑：`max_streams=0`、`request_stack_bytes=1`、`io_stack_bytes=1`、`idle_timeout=0`、
 `u64::MAX` 超时、`workload=huge`、`mem_budget_bytes=lots`。
