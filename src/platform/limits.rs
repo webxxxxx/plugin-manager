@@ -129,6 +129,12 @@ impl Limits {
         threads_for(self.max_connections, self.blocking_threads)
     }
 
+    /// What one admitted connection costs: its worst-case buffers, or the
+    /// measured resident floor when the buffers are smaller than reality.
+    pub fn per_connection_bytes(&self) -> u64 {
+        (self.max_complete_body + self.stream_buffer as u64).max(CONNECTION_RESIDENT_BYTES)
+    }
+
     /// How many connection slots (and streams, one per slot) the rest of this
     /// worst case leaves over.
     ///
@@ -137,7 +143,8 @@ impl Limits {
     /// buffers, in-flight bytes, queues, the UI ring) is already known, so the
     /// remainder divided by one slot's worst case is the answer.
     pub fn fitting_concurrency(&self, budget: u64) -> usize {
-        let per = (self.max_complete_body + self.stream_buffer as u64)
+        let per = self
+            .per_connection_bytes()
             .saturating_add(derive::stack_per_connection(self))
             .max(1);
         // One slot carries one stream and one subscriber cursor, so both are
@@ -169,8 +176,7 @@ impl Limits {
     /// (user story 15).
     pub fn worst_case_bytes(&self) -> u64 {
         let threads = self.threads() as u64 * self.request_stack_bytes as u64;
-        let connections =
-            self.max_connections as u64 * (self.max_complete_body + self.stream_buffer as u64);
+        let connections = self.max_connections as u64 * self.per_connection_bytes();
         let streams = self.max_streams as u64 * self.stream_buffer as u64;
         let inflight = self.ws_inflight_bytes as u64;
         let queues = (self.pending_queue as u64 + self.progress_queue as u64) * IPC_FRAME_MAX
@@ -194,8 +200,8 @@ impl Limits {
                 self.threads() as u64 * self.request_stack_bytes as u64,
             ),
             (
-                "connection buffers",
-                self.max_connections as u64 * (self.max_complete_body + self.stream_buffer as u64),
+                "connections (buffers or measured floor)",
+                self.max_connections as u64 * self.per_connection_bytes(),
             ),
             (
                 "stream buffers",

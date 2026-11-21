@@ -23,9 +23,22 @@ pub const BUDGET_CAP: u64 = 8 * 1024 * 1024 * 1024;
 pub(super) const MIB: u64 = 1024 * 1024;
 
 /// What the process costs before any buffer: allocator, registry, the two
-/// loops, log sinks. Deliberately pessimistic; a measured baseline replaces it
-/// in #107.
-pub const RESIDENT_BASELINE_BYTES: u64 = 32 * MIB;
+/// loops, log sinks.
+///
+/// Measured on the WSL reference host (2026-11-21, #107): an idle daemon with
+/// no plugins settles at 3.4 MiB. The reserve is that measured floor with room
+/// to spare, not the old 32 MiB guess that ate two thirds of a 50 MiB budget.
+pub const RESIDENT_BASELINE_BYTES: u64 = 8 * MIB;
+
+/// What one admitted connection costs in resident memory.
+///
+/// Measured on the same host: a plugin holding one WebSocket connection adds
+/// 75-77 KiB to the daemon (100 -> 11.7 MiB, 200 -> 19.3, 300 -> 26.7,
+/// 396 -> 33.7), and a plugin with no connection adds ~71 KiB, so most of this
+/// is the supervision entry rather than the socket. The slot is charged the
+/// larger of this floor and its worst-case buffers: buffers alone (29 KiB at
+/// the tiny shape) under-state a real connection by more than half.
+pub(super) const CONNECTION_RESIDENT_BYTES: u64 = 80 * 1024;
 
 /// Threads that exist in every topology: the supervisor loop (which polls
 /// plugin stdio) and the server loop.
