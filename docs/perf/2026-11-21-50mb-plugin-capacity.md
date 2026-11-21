@@ -87,6 +87,40 @@ CPU 列是**占单个核的百分比**（`daemon CPU` 60.2% 即 0.60 个核）�
   **13–14 个**全功能插件（按 5 的位数：10 个稳、15 个越线）；按 PSS 口径 40 个都还不到一半。
 - 90% CPU 预算在 16 核机器上等于 14.4 个核，本次全量点都没碰到；真正的延迟增长来自压测客户端。
 
+## 40 个插件：三档预算各自的并发上限（只认 100% 成功）
+
+同一套流量，`--plugins 40`，把每插件客户端并发 P 从低往上加，一个点 20 s。
+判据只有一条：该点 `errors = 0`（五面全部 200）。三档的规划值先摆出来：
+
+| 预算 | workload | max_connections | max_streams | blocking_queue | blocking_threads | max_subscribers_per_plugin |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 50 MB | tiny | 288 | 288 | 288 | 4 | 16 |
+| 512 MB | interactive | 399 | 399 | 399 | 8 | 32 |
+| 2 GB | streaming | 786 | 786 | 786 | 16 | 64 |
+
+实测（100% 成功点 + 它的下一个点）：
+
+| 档 | 100% 成功的最大并发 | 总客户端 | 实测 peak in-flight | ops/s | p50 | p99 | 再往上一步 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 50 MB | 每插件 8 | 320 | 300 | 1080 | 193 ms | 676 ms | P=9（360 个）：41 × 503 + 35 个 broken pipe |
+| 512 MB | 每插件 12 | 480 | 417 | 912 | 251 ms | 1054 ms | P=13（520 个）：4 × 503 + 7 个 broken pipe |
+| 2 GB | 每插件 ≥26 | ≥1040 | 500 | 1274 | 208 ms | 858 ms | 未出现失败（见下） |
+
+- **回落点就在派生的并发数附近**：50 MB 的 288、512 MB 的 399 就是 `max_connections` /
+  `blocking_queue` / `max_streams` 那一组数。客户端数的 peak in-flight 比服务端真正的并发高
+  约 15%（请求在客户端排队时也算「in-flight」），所以 320 个客户端还能全过，360 个就开始有 503。
+- **503 是准入拒绝，不是超时**：`statuses` 里就是 503，伴生的 `BrokenPipeError` 是连接被 drain
+  后关闭的后果；没有任何一个点出现 timeout/429（429 只出现在 20 秒内 960 个线程的极端点）。
+- **2 GB 档没测到上限**：这个压测客户端的 in-flight 峰值封顶在 ~500（单进程 Python 线程池，一个 GIL），
+  786 的连接上限够不到。所以这一档的上限是规划值：**786 个并发连接**；再往上要换异步客户端才测得动。
+- **p50/p99 是端到端，含客户端排队**：320 个客户端时每个线程只分到 ~3.4 ops/s，光排队就 ~200 ms。
+  daemon 自己的服务时间在 P=1、40 个插件时是 p50 1.42 ms / p99 4.6 ms（前一节的表），
+  `daemon CPU` 在 1.4k ops/s 时才 0.56 个核——瓶颈从来不是 daemon 的单次延迟。
+
+一句话：40 个全功能插件时，50 MB 档按**每插件 8 个并发客户端（共 320）**规划、512 MB 档
+**每插件 12 个（480）**、2 GB 档**每插件 26 个以上（≥1040，规划上限 786 个连接）**；
+三档都是 100% 成功，再往上就是准入的 503，不是超时。
+
 ## 复现
 
 ```sh
@@ -99,6 +133,14 @@ for N in 0 5 10 15 20 25 30 35 40; do
     --per-plugin-concurrency 1 --think-ms 10 --no-oversubscribe \
     --bootstrap direct --plugin-runtime shell \
     --work /tmp/sweep-$N --out .scratch/sweep/$N.json --report .scratch/sweep/$N.md
+done
+
+# 三档并发上限：40 个插件，每插件 P 个客户端，取 100% 成功的那一点
+for P in 8 9 12 13; do
+  python3 tools/perf/budget_scenario.py --binary /tmp/wt-plugin-manager-target/release/svcd \
+    --budget 512mb --cpu-budget-percent 90 --plugins 40 --per-plugin-concurrency $P \
+    --duration 20 --think-ms 10 --no-oversubscribe --bootstrap direct --plugin-runtime shell \
+    --work /tmp/conc-512-$P --out .scratch/conc/512-$P.json
 done
 ```
 

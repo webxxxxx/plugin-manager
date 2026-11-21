@@ -305,6 +305,8 @@ else:
             return None
         close = text.rfind(")")
         fields = text[close + 2:].split()
+        if len(fields) < 13:
+            return None
         return {
             "ppid": int(fields[1]),
             "cpu": (int(fields[11]) + int(fields[12])) / CLK_TCK,
@@ -712,7 +714,10 @@ def op_invoke(address, token, plugin_id, sequence):
     )
     payload = read_json(body) or {}
     if status != 200:
-        return False, status, "http-%s" % status
+        # Name the refusal: "503 http-503" cannot tell a saturated blocking
+        # pool from the connection cap, and the answer differs per tier.
+        code = (payload.get("error") or {}).get("code") or "http-%s" % status
+        return False, status, code
     if "error" in payload:
         return False, status, "rpc-%s" % (payload["error"] or {}).get("code")
     ok = "result" in payload and not (payload.get("result") or {}).get("isError", False)
@@ -1421,8 +1426,15 @@ def main():
 
         def sampler():
             while not stop.wait(2.0):
-                daemon_sample = sample_process(daemon["process"].pid)
-                tree_sample = process_tree(daemon["process"].pid)
+                # A plugin child can exit between the /proc listing and the read;
+                # one vanished pid must not end the sampler (the run then reports
+                # CPU 0 and one RSS sample, which reads like a healthy daemon).
+                try:
+                    daemon_sample = sample_process(daemon["process"].pid)
+                    tree_sample = process_tree(daemon["process"].pid)
+                except Exception as error:  # noqa: BLE001 - sampled, not swallowed
+                    log("sample skipped: %r" % (error,))
+                    continue
                 samples.append({
                     "at": time.time(),
                     "daemon": daemon_sample,
