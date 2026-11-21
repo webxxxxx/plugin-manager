@@ -11,12 +11,11 @@ use std::sync::{Arc, Mutex};
 use serde_json::json;
 
 use crate::face::blob_routes;
-use crate::face::plugin_ui::{ui_path, unauthenticated, UiPath};
+use crate::face::plugin_ui::{static_assets, ui_path, unauthenticated, web_assets_for, UiPath};
 use crate::face::routes::{self, Endpoint, Owner};
 use crate::face::support::{decode, error};
 use crate::face::webui;
-use crate::manage as package;
-use crate::manage as plugin;
+use crate::manage::WebAssets;
 use crate::platform::config::Config;
 use crate::platform::storage as blob;
 use crate::server::auth::admission::{Admission, Rejected};
@@ -83,10 +82,7 @@ pub(crate) fn respond(config: &Config, request: &HttpRequest, lan: &Arc<Mutex<La
         // Canonicalise `/plugin-ui/{id}` to `/plugin-ui/{id}/` after auth so
         // relative asset URLs resolve against the plugin root; the session
         // check stays authoritative and only reachable pages redirect.
-        if request.method == "GET"
-            && ui.slashless
-            && package::valid_name(ui.id)
-            && plugin::web_assets(&config.paths, ui.id).is_some()
+        if request.method == "GET" && ui.slashless && web_assets_for(&config.paths, ui.id).is_some()
         {
             let location = if ui.token.is_empty() {
                 format!("/plugin-ui/{}/", ui.id)
@@ -116,15 +112,10 @@ fn plugin_ui(
     auth: AuthKind,
     lan: &Arc<Mutex<Lan>>,
 ) -> Vec<u8> {
-    if !package::valid_name(ui.id) {
-        return error(404, "not_found", "unknown plugin UI");
-    }
-    let Some(assets) = plugin::web_assets(&config.paths, ui.id) else {
-        return error(404, "not_found", &format!("plugin {} has no web UI", ui.id));
+    let assets = match static_assets(&config.paths, lan, ui) {
+        Ok(assets) => assets,
+        Err(response) => return response,
     };
-    if !token_valid(lan, ui.token, ui.id) {
-        return error(401, "unauthorized", "invalid or expired plugin token");
-    }
     if ui.sub == "rpc" {
         return ui_rpc(config.paths.control_dir(), request, ui.id, auth);
     }
@@ -132,28 +123,14 @@ fn plugin_ui(
     serve_ui(request, &assets, ui.sub, &base)
 }
 
-fn token_valid(lan: &Arc<Mutex<Lan>>, token: &str, plugin: &str) -> bool {
-    crate::server::auth::admission::plugin_token_valid(lan, token, plugin)
-}
-
-fn serve_ui(request: &HttpRequest, assets: &plugin::WebAssets, sub: &str, base: &str) -> Vec<u8> {
+fn serve_ui(request: &HttpRequest, assets: &WebAssets, sub: &str, base: &str) -> Vec<u8> {
     if request.method != "GET" {
         return method_not_allowed("GET");
     }
-    let Some(relative) = webui::relative_path(sub, &assets.entry) else {
+    let Some((path, metadata)) = webui::resolve_asset(assets, sub, &request.headers) else {
         return error(404, "not_found", "not found");
     };
-    if let Some((path, metadata)) = webui::web_file(&assets.root, &relative) {
-        return serve_web_file(request, &path, &metadata, base);
-    }
-    // SPA fallback: only an HTML navigation falls back to the entry. A missing
-    // script must stay a 404 so the browser reports it instead of running HTML.
-    if wants_html(request) {
-        if let Some((path, metadata)) = webui::web_file(&assets.root, &assets.entry) {
-            return serve_web_file(request, &path, &metadata, base);
-        }
-    }
-    error(404, "not_found", "not found")
+    serve_web_file(request, &path, &metadata, base)
 }
 
 pub(crate) fn serve_web_file(
@@ -177,10 +154,6 @@ pub(crate) fn serve_web_file(
         data
     };
     http::response_with_headers(200, mime, validators.headers(), &body)
-}
-
-fn wants_html(request: &HttpRequest) -> bool {
-    webui::wants_html(&request.headers)
 }
 
 fn ui_rpc(config: &Path, request: &HttpRequest, id: &str, auth: AuthKind) -> Vec<u8> {

@@ -543,6 +543,27 @@ const ASSEMBLY_RULES = [
     allow: [{ file: "src/face/prebody.rs", item: "claim" }],
     hint: "三条 pre-body 认领顺序只在 face/prebody.rs 的 claim 里排（#244）。",
   },
+  {
+    name: "插件 UI 静态准入",
+    members: [/\bvalid_name\(/, /\bweb_assets\(/],
+    min: 2,
+    allow: [{ file: "src/face/plugin_ui.rs", item: "web_assets_for" }],
+    hint: "valid_name + web_assets 只在 face/plugin_ui.rs 的 web_assets_for 里组合（#243）。",
+  },
+  {
+    name: "插件 UI token 准入",
+    members: [/\bweb_assets_for\(/, /\bvalid_token\(/],
+    min: 2,
+    allow: [{ file: "src/face/plugin_ui.rs", item: "static_assets" }],
+    hint: "静态面的资产 + token 准入只在 face/plugin_ui.rs 的 static_assets 里组合（#243）。",
+  },
+  {
+    name: "插件 UI 资产解析",
+    members: [/\brelative_path\(/, /\bweb_file\(/, /\bwants_html\(/],
+    min: 3,
+    allow: [{ file: "src/face/webui.rs", item: "resolve_asset" }],
+    hint: "relative_path + web_file + SPA 回退只在 face/webui.rs 的 resolve_asset 里组合（#243）。",
+  },
 ];
 
 /// 生产 fn 的正文区间（入参是 `stripComments` 遮罩过的文本）。`#[cfg(test)]`
@@ -830,6 +851,48 @@ const SELFTEST_ASSEMBLY = [
     file: "src/face/prebody.rs",
     source:
       "fn claim(&self) {\n    let _ = self.plugin_ui(&head);\n    let _ = self.package_upload(&head);\n}\n",
+    expected: [],
+  },
+  {
+    name: "插件 UI 静态准入在允许点外算违规",
+    file: "src/face/fallback.rs",
+    source:
+      'fn plugin_ui(id: &str) {\n    if !valid_name(id) { return; }\n    let _ = web_assets(paths, id);\n}\n',
+    expected: ["插件 UI 静态准入"],
+  },
+  {
+    name: "插件 UI 静态准入留在 web_assets_for 里不算",
+    file: "src/face/plugin_ui.rs",
+    source:
+      'fn web_assets_for(id: &str) {\n    if !valid_name(id) { return None; }\n    web_assets(paths, id)\n}\n',
+    expected: [],
+  },
+  {
+    name: "插件 UI token 准入在允许点外算违规",
+    file: "src/face/other.rs",
+    source:
+      'fn admit(id: &str) {\n    let _ = web_assets_for(paths, id);\n    let _ = valid_token(lan, ui);\n}\n',
+    expected: ["插件 UI token 准入"],
+  },
+  {
+    name: "插件 UI token 准入留在 static_assets 里不算",
+    file: "src/face/plugin_ui.rs",
+    source:
+      'fn static_assets(id: &str) {\n    let _ = web_assets_for(paths, id);\n    let _ = valid_token(lan, ui);\n}\n',
+    expected: [],
+  },
+  {
+    name: "插件 UI 资产解析在允许点外算违规",
+    file: "src/face/other.rs",
+    source:
+      'fn asset(sub: &str) {\n    let r = relative_path(sub, entry);\n    let _ = web_file(root, &r);\n    if wants_html(headers) {}\n}\n',
+    expected: ["插件 UI 资产解析"],
+  },
+  {
+    name: "插件 UI 资产解析留在 resolve_asset 里不算",
+    file: "src/face/webui.rs",
+    source:
+      'fn resolve_asset(sub: &str) {\n    let r = relative_path(sub, entry);\n    let _ = web_file(root, &r);\n    if wants_html(headers) {}\n}\n',
     expected: [],
   },
 ];
