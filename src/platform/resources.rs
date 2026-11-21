@@ -304,31 +304,33 @@ pub struct Budget {
 ///   story 10), so a `MEM_LEVEL=low` build plans for at most 128 MiB even on a
 ///   64 GiB host (user story 9).
 pub fn budget(configured: Option<u64>, profile: &ResourceProfile, cap: u64) -> Budget {
+    // An explicit number is the operator's decision: take it as written, bounded
+    // only by the compile-time cap. The floor and the quantization step exist to
+    // keep a noisy probe stable, so they apply to `auto` only — silently
+    // rewriting a configured 50 MiB to 64 MiB would make the document lie.
+    if let Some(value) = configured {
+        let raw = cap.min(value);
+        return Budget {
+            raw,
+            quantized: raw,
+            source: BudgetSource::Configured,
+        };
+    }
     let mut candidate = cap;
-    match configured {
-        Some(value) => {
-            candidate = candidate.min(value);
-        }
-        None => {
-            // Only the free-memory input is discounted; a cgroup limit is
-            // already a hard ceiling and is taken as written.
-            if let Some(available) = profile.available_memory {
-                candidate = candidate.min(available.saturating_mul(AUTO_PERCENT) / 100);
-            }
-            if let Some(remaining) = profile.cgroup_remaining {
-                candidate = candidate.min(remaining);
-            }
-        }
+    // Only the free-memory input is discounted; a cgroup limit is already a
+    // hard ceiling and is taken as written.
+    if let Some(available) = profile.available_memory {
+        candidate = candidate.min(available.saturating_mul(AUTO_PERCENT) / 100);
+    }
+    if let Some(remaining) = profile.cgroup_remaining {
+        candidate = candidate.min(remaining);
     }
     let floor = MIN_BUDGET.min(cap);
     let raw = candidate.max(floor);
     Budget {
         raw,
         quantized: quantize(raw),
-        source: match configured {
-            Some(_) => BudgetSource::Configured,
-            None => BudgetSource::Auto,
-        },
+        source: BudgetSource::Auto,
     }
 }
 
@@ -690,10 +692,16 @@ mod tests {
             available_memory: Some(4 * GIB),
             ..ResourceProfile::default()
         };
-        let budget = budget(Some(256 * MIB), &profile, 8 * GIB);
+        for value in [50 * MIB, 256 * MIB, 500 * MIB] {
+            let budget = budget(Some(value), &profile, 8 * GIB);
 
-        assert_eq!(budget.raw, 256 * MIB);
-        assert_eq!(budget.source, BudgetSource::Configured);
+            // Neither the 64 MiB floor nor the quantization step rewrites an
+            // explicit number: 50 MiB stays 50 MiB and 500 MiB does not fall
+            // back to 256 MiB.
+            assert_eq!(budget.raw, value);
+            assert_eq!(budget.quantized, value);
+            assert_eq!(budget.source, BudgetSource::Configured);
+        }
     }
 
     #[test]
@@ -712,18 +720,26 @@ mod tests {
     }
 
     #[test]
-    fn the_budget_never_goes_below_the_floor() {
+    fn the_auto_budget_never_goes_below_the_floor() {
         let empty = ResourceProfile::default();
-        // With no input at all the build ceiling is the budget (user story 8);
-        // an explicit number below the floor is raised to it.
+        // With no input at all the build ceiling is the budget (user story 8).
         assert_eq!(budget(None, &empty, 2 * GIB).raw, 2 * GIB);
-        assert_eq!(budget(Some(1), &empty, 2 * GIB).raw, MIN_BUDGET);
 
         let tiny_machine = ResourceProfile {
             available_memory: Some(16 * MIB),
             ..ResourceProfile::default()
         };
         assert_eq!(budget(None, &tiny_machine, 2 * GIB).raw, MIN_BUDGET);
+    }
+
+    #[test]
+    fn a_configured_budget_below_the_floor_is_taken_as_written() {
+        let empty = ResourceProfile::default();
+        let budget = budget(Some(1), &empty, 2 * GIB);
+
+        assert_eq!(budget.raw, 1);
+        assert_eq!(budget.quantized, 1);
+        assert_eq!(budget.source, BudgetSource::Configured);
     }
 
     #[test]

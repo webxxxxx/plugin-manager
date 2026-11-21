@@ -112,7 +112,7 @@ _Avoid_: 请求、request（那是协议层的报文）
 _Avoid_: 返回值、回调函数
 
 **内存预算（Memory budget）**:
-svcd 每次启动从本机推导出的**进程峰值内存上限**：可用内存（auto 时打 25% 折扣）、容器 cgroup v2 额度、编译期上限三者取小，再受 64 MiB 下限约束，并向下量化到固定台阶后供形状分配。与调用信封里的「调用预算」不是同一个词：调用预算是一次调用的时间与限流额度，内存预算属于整个进程。`MEM_LEVEL=low|middle|high` 只做它的天花板（128 MiB / 512 MiB / 2 GiB），不再为任何单个键选默认值。见 [ADR-0026](docs/adr/0026-the-memory-budget-is-the-truth.md)。
+svcd 每次启动从本机推导出的**进程峰值内存上限**：`auto` 取可用内存（打 25% 折扣）、容器 cgroup v2 额度、编译期上限三者最小，再受 64 MiB 下限约束并向下量化到固定台阶；显式 `mem_budget_bytes` 写多少就是多少，只受编译期上限约束，不做下限抬升与量化。与调用信封里的「调用预算」不是同一个词：调用预算是一次调用的时间与限流额度，内存预算属于整个进程。`MEM_LEVEL=low|middle|high` 只做它的天花板（128 MiB / 512 MiB / 2 GiB），不再为任何单个键选默认值。见 [ADR-0026](docs/adr/0026-the-memory-budget-is-the-truth.md)。
 探测的每一项都可以被 `svcd.conf` 的 `probe_*` 键取代：写了的项以配置为准，且不再读 OS（`0` 表示未知）。
 _Avoid_: 资源档位、MEM_LEVEL 档位、调用预算（那是另一件事）
 

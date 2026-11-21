@@ -95,7 +95,7 @@ bind = 127.0.0.1:8787
 # can never exceed: 128 MiB / 512 MiB / 2 GiB. It only tightens.
 #
 #   mem_budget_bytes = auto      # default; 25% of free memory, capped by the build
-#   mem_budget_bytes = 268435456 # a number is taken as written (floor 64 MiB)
+#   mem_budget_bytes = 268435456 # a number is taken as written (only the build cap lowers it)
 #
 # The **workload shape** decides how the budget is spent, not how big it is:
 #
