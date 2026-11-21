@@ -536,6 +536,18 @@ const ASSEMBLY_RULES = [
     ],
     hint: "starttime 只在 process_probe 里探；判定走 runtime::pid_state（#217）。",
   },
+  {
+    name: "插件安装收尾",
+    members: [/\bhook_pump\(/, /\.install\(service/, /\bbump_catalog\(/, /\bstatus_for_id\(/],
+    min: 2,
+    allow: [
+      { file: "src/daemon/plugins.rs", item: "finish_install" },
+      // uninstall 的收尾是 forget + bump_catalog，只和 install 共用 hook_pump
+      // 与 bump_catalog；install 的收尾单点在 finish_install。
+      { file: "src/daemon/plugins.rs", item: "uninstall_plugin" },
+    ],
+    hint: "install 收尾（install / bump_catalog / 日志 / status）只经 daemon/plugins.rs 的 finish_install（#245）。",
+  },
 ];
 
 /// 生产 fn 的正文区间（入参是 `stripComments` 遮罩过的文本）。`#[cfg(test)]`
@@ -809,6 +821,20 @@ const SELFTEST_ASSEMBLY = [
     file: "src/face/other.rs",
     source:
       '#[cfg(test)]\nmod tests {\n    fn t() {\n        let tag = etag(m, 1);\n        let _ = web_headers(&tag);\n    }\n}\n',
+    expected: [],
+  },
+  {
+    name: "install 收尾在收尾函数外再拼一次算违规",
+    file: "src/daemon/plugins.rs",
+    source:
+      'fn install_again(host: &mut Supervisor, service: Service, clock: &Clock) {\n    let mut poll = host.hook_pump();\n    host.install(service, false);\n    host.bump_catalog();\n    let _ = host.status_for_id("demo", clock.now());\n}\n',
+    expected: ["插件安装收尾"],
+  },
+  {
+    name: "收尾函数里的 install 组装不算",
+    file: "src/daemon/plugins.rs",
+    source:
+      'fn finish_install(host: &mut Supervisor, service: Service, clock: &Clock) {\n    host.install(service, false);\n    host.bump_catalog();\n    let _ = host.status_for_id("demo", clock.now());\n}\n',
     expected: [],
   },
 ];

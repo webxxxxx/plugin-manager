@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::face::control;
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::projection::Status;
-use crate::kernel::registry::Kind;
+use crate::kernel::registry::{Kind, Service};
 use crate::manage as package;
 use crate::manage as plugin;
 use crate::manage::Strategy;
@@ -12,7 +12,76 @@ use crate::platform::log;
 
 use super::Daemon;
 
+/// The one install log line. Only two facts vary between the direct and staged
+/// paths: whether a running process keeps the old files until its next start,
+/// and whether the signature check was skipped. Both paths spell them here so
+/// the text cannot drift apart (#245).
+fn install_log_line(
+    id: &str,
+    version: &str,
+    still_running: bool,
+    signature_verified: bool,
+) -> String {
+    format!(
+        "svcd: plugin {} {} installed ({}){}",
+        id,
+        version,
+        if still_running {
+            "running; next start uses"
+        } else {
+            "now"
+        },
+        if signature_verified {
+            ""
+        } else {
+            "; signature was NOT verified (allow_insecure_install)"
+        }
+    )
+}
+
 impl Daemon {
+    /// The same core-service guard on both install paths: a package may replace
+    /// a plugin, never a service the daemon itself owns. It runs after the id is
+    /// known and before anything is stopped or written.
+    fn reject_core_service(&self, id: &str) -> Result<(), ProblemError> {
+        match self.host.registry.get(id) {
+            Some(existing) if existing.kind != Kind::Plugin => Err(ProblemError::new(
+                Problem::CoreService,
+                format!("id is a core service: {}", id),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// The tail both install paths share once they hold the final `Service`:
+    /// commit it to the supervisor, invalidate the tool catalog, write the one
+    /// install line, then project the status the caller returns. Keeping these
+    /// four steps here is what makes the direct and staged paths end the same
+    /// way (#245).
+    fn finish_install(
+        &mut self,
+        id: &str,
+        version: &str,
+        signature_verified: bool,
+        service: Service,
+        still_running: bool,
+        clock: &Clock,
+    ) -> Result<Status, ProblemError> {
+        self.host
+            .install(service, still_running)
+            .map_err(|detail| ProblemError::new(Problem::Internal, detail))?;
+        self.bump_catalog();
+        log::svcd(&install_log_line(
+            id,
+            version,
+            still_running,
+            signature_verified,
+        ));
+        self.host.status_for_id(id, clock.now()).ok_or_else(|| {
+            ProblemError::new(Problem::UnknownPlugin, format!("unknown plugin: {}", id))
+        })
+    }
+
     pub(super) fn install_plugin(
         &mut self,
         install: control::Install,
@@ -38,14 +107,7 @@ impl Daemon {
             interpreter: host_interpreter,
         } = verified;
         let id = package.manifest.name.clone();
-        if let Some(existing) = self.host.registry.get(&id) {
-            if existing.kind != Kind::Plugin {
-                return Err(ProblemError::new(
-                    Problem::CoreService,
-                    format!("id is a core service: {}", id),
-                ));
-            }
-        }
+        self.reject_core_service(&id)?;
 
         if self.host.is_running(&id) && strategy == Strategy::Replace {
             self.host.stop_service(&id, clock)?;
@@ -89,28 +151,14 @@ impl Daemon {
             }
             Err(failure) => return Err(failure.into_problem()),
         };
-        self.host
-            .install(service, still_running)
-            .map_err(|detail| ProblemError::new(Problem::Internal, detail))?;
-        self.bump_catalog();
-        log::svcd(&format!(
-            "svcd: plugin {} {} installed ({}){}",
-            id,
-            package.manifest.version,
-            if still_running {
-                "running; next start uses"
-            } else {
-                "now"
-            },
-            if signature_verified {
-                ""
-            } else {
-                "; signature was NOT verified (allow_insecure_install)"
-            }
-        ));
-        self.host.status_for_id(&id, clock.now()).ok_or_else(|| {
-            ProblemError::new(Problem::UnknownPlugin, format!("unknown plugin: {}", id))
-        })
+        self.finish_install(
+            &id,
+            &package.manifest.version,
+            signature_verified,
+            service,
+            still_running,
+            clock,
+        )
     }
 
     pub(super) fn install_staged(
@@ -171,14 +219,7 @@ impl Daemon {
                 ));
             }
         }
-        if let Some(existing) = self.host.registry.get(&id) {
-            if existing.kind != Kind::Plugin {
-                return Err(ProblemError::new(
-                    Problem::CoreService,
-                    format!("id is a core service: {}", id),
-                ));
-            }
-        }
+        self.reject_core_service(&id)?;
         let host_interpreter = plugin::prepare_staged(&staged, allow_hooks)?;
         let signature_verified = staged.signature_verified;
 
@@ -196,28 +237,14 @@ impl Daemon {
             host_interpreter,
             &mut poll,
         )?;
-        self.host
-            .install(service, still_running)
-            .map_err(|detail| ProblemError::new(Problem::Internal, detail))?;
-        self.bump_catalog();
-        log::svcd(&format!(
-            "svcd: plugin {} {} installed ({}){}",
-            id,
-            version,
-            if still_running {
-                "running; next start uses"
-            } else {
-                "now"
-            },
-            if signature_verified {
-                ""
-            } else {
-                "; signature was NOT verified (allow_insecure_install)"
-            }
-        ));
-        self.host.status_for_id(&id, clock.now()).ok_or_else(|| {
-            ProblemError::new(Problem::UnknownPlugin, format!("unknown plugin: {}", id))
-        })
+        self.finish_install(
+            &id,
+            &version,
+            signature_verified,
+            service,
+            still_running,
+            clock,
+        )
     }
 
     pub(super) fn uninstall_plugin(
@@ -255,5 +282,106 @@ impl Daemon {
         }
         log::svcd(&format!("svcd: plugin {} uninstalled", id));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::mpsc;
+
+    use crate::face::control;
+    use crate::kernel::registry::{Registry, State};
+    use crate::manage::Strategy;
+    use crate::platform::clock::Clock;
+    use crate::platform::limits;
+
+    use super::{install_log_line, Daemon};
+
+    fn daemon() -> Daemon {
+        let (_sender, receiver) = mpsc::channel();
+        Daemon::new(
+            Registry::with_builtin(&limits::test_default()),
+            receiver,
+            None,
+        )
+    }
+
+    fn request(path: &Path) -> control::Install {
+        control::Install {
+            path: path.to_string_lossy().into_owned(),
+            strategy: Strategy::Replace,
+            allow_hooks: false,
+            expected_id: None,
+            expected_version: None,
+        }
+    }
+
+    #[test]
+    fn the_install_log_line_pins_every_running_and_signature_combination() {
+        for (still_running, signature_verified, expected) in [
+            (
+                true,
+                true,
+                "svcd: plugin demo 1.0.0 installed (running; next start uses)",
+            ),
+            (
+                true,
+                false,
+                "svcd: plugin demo 1.0.0 installed (running; next start uses); signature was NOT verified (allow_insecure_install)",
+            ),
+            (false, true, "svcd: plugin demo 1.0.0 installed (now)"),
+            (
+                false,
+                false,
+                "svcd: plugin demo 1.0.0 installed (now); signature was NOT verified (allow_insecure_install)",
+            ),
+        ] {
+            assert_eq!(
+                install_log_line("demo", "1.0.0", still_running, signature_verified),
+                expected,
+                "still_running={still_running} signature_verified={signature_verified}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_install_paths_finish_with_the_same_status() {
+        let package =
+            crate::manage::test_support::test_signed_package("demo", crate::platform::target());
+        let clock = Clock::boot();
+        // One daemon owns one config root, so a status difference cannot come
+        // from two different plugin/config paths.
+        let mut daemon = daemon();
+        std::fs::create_dir_all(&daemon.config.paths.plugins_dir).expect("plugins dir");
+
+        // The direct path installs the .spk through verify + install_package.
+        let files = crate::manage::test_support::tempdir::TempDir::new();
+        let spk = files.path().join("demo.spk");
+        std::fs::write(&spk, &package).expect("write package");
+        let direct_status = daemon
+            .install_plugin(request(&spk), &clock)
+            .expect("direct install");
+
+        // The staged path installs the same package from a staging directory
+        // inside the plugin tree, the way the HTTP uploader leaves it.
+        let staging = daemon.config.paths.plugins_dir.join(".staging-245");
+        let mut installer = crate::manage::StagingInstaller::new(
+            staging.clone(),
+            false,
+            8 * 1024 * 1024,
+            &daemon.config.paths.trust_dir,
+        );
+        installer.feed(&package).expect("feed package");
+        installer.finish().expect("finish staging");
+        let staged_status = daemon
+            .install_staged(request(&staging), &clock)
+            .expect("staged install");
+
+        assert_eq!(direct_status, staged_status);
+        assert_eq!(direct_status.summary.id, "demo");
+        assert_eq!(direct_status.summary.version, "1.0.0");
+        assert_eq!(direct_status.summary.state, State::Stopped);
+        assert!(!direct_status.summary.enabled);
     }
 }
