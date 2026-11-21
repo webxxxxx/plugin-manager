@@ -97,6 +97,7 @@ pub struct StreamingCall {
 pub fn prepare_streaming(
     request: &Request<'_>,
     password_hash: Option<&str>,
+    prefer_streaming: bool,
 ) -> Result<Option<StreamingCall>, Vec<u8>> {
     if request.method != "POST" {
         return Ok(None);
@@ -109,8 +110,10 @@ pub fn prepare_streaming(
         ));
     }
     authorize(request.headers, password_hash)?;
-    let accept = http::header(request.headers, "accept").unwrap_or("");
-    if !accept.to_ascii_lowercase().contains("text/event-stream") {
+    if !stream_requested(
+        http::header(request.headers, "accept").unwrap_or(""),
+        prefer_streaming,
+    ) {
         return Ok(None);
     }
     let Ok(text) = std::str::from_utf8(request.body) else {
@@ -159,6 +162,20 @@ pub fn prepare_streaming(
         arguments,
         progress_token,
     }))
+}
+
+/// Whether one Accept header should get a stream.
+///
+/// A client that can take a single JSON body gets one unless the operator
+/// asked for streams: that body skips the stream slot and the reactor hop.
+/// A client that only accepts text/event-stream always streams, so the
+/// protocol stays usable from SSE-only clients.
+fn stream_requested(accept: &str, prefer_streaming: bool) -> bool {
+    let accept = accept.to_ascii_lowercase();
+    let wants_stream = accept.contains("text/event-stream");
+    let can_take_json =
+        accept.is_empty() || accept.contains("application/json") || accept.contains("*/*");
+    wants_stream && (prefer_streaming || !can_take_json)
 }
 
 fn reply(status: u16, response: rpc::Response) -> Vec<u8> {
@@ -296,6 +313,32 @@ fn unauthorized(message: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_json_body_is_the_default_even_when_the_client_accepts_sse() {
+        // MCP clients send both per spec; the buffered body is cheaper.
+        assert!(!stream_requested(
+            "application/json, text/event-stream",
+            false
+        ));
+        assert!(!stream_requested("application/json", false));
+        assert!(!stream_requested("", false));
+        assert!(!stream_requested("*/*", false));
+    }
+
+    #[test]
+    fn an_sse_only_client_still_streams() {
+        assert!(stream_requested("text/event-stream", false));
+    }
+
+    #[test]
+    fn the_operator_can_prefer_streaming() {
+        assert!(stream_requested(
+            "application/json, text/event-stream",
+            true
+        ));
+        assert!(!stream_requested("application/json", true));
+    }
 
     #[test]
     fn mcp_name_decodes_the_base64_sentinel() {

@@ -269,6 +269,10 @@ bind = 127.0.0.1:8787
 # ws_inflight_requests = 16
 # ws_buffer_shrink_bytes = 65536
 # ws_raw_enabled = on
+# mcp_streaming = off   # on: an MCP client that accepts both JSON and SSE gets
+#                       # a stream. off (default): it gets one JSON body, which
+#                       # skips a stream slot and a reactor hop. A client that
+#                       # only accepts text/event-stream always streams.
 # ws_raw_max_bytes = 1048576
 # ws_raw_queue = 32
 # pending_queue = 128

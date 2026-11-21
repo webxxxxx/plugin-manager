@@ -102,6 +102,10 @@ pub struct Settings {
     /// Progress events queued between the reactor and one MCP stream. Derived
     /// from the memory budget; clamped 4..1024.
     pub progress_queue: Option<usize>,
+    /// Whether an MCP client that accepts both JSON and SSE gets a stream.
+    /// Default false: the one-JSON body is the cheaper path (no stream slot,
+    /// no reactor hop), and a client that only accepts SSE still streams.
+    pub mcp_streaming: Option<bool>,
     /// Jobs the blocking pool may queue before it answers 503 busy. Derived
     /// from the connection count (a queued job belongs to an admitted
     /// connection, so a larger queue can never be used); clamped to 1..1024.
@@ -194,6 +198,7 @@ pub(crate) const ENV_KEYS: &[&str] = &[
     "io_stack_bytes",
     "blocking_threads",
     "blocking_queue",
+    "mcp_streaming",
     "max_body_bytes",
     "max_json_body_bytes",
     "max_complete_body_bytes",
@@ -413,6 +418,12 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
             }
             "blocking_threads" => {
                 settings.blocking_threads = Some(parse_usize(value, "blocking_threads", index)?)
+            }
+            "mcp_streaming" => {
+                settings.mcp_streaming =
+                    Some(parse_bool(value).ok_or_else(|| {
+                        format!("line {}: mcp_streaming must be on or off", index)
+                    })?)
             }
             "blocking_queue" => {
                 settings.blocking_queue = Some(parse_usize(value, "blocking_queue", index)?)

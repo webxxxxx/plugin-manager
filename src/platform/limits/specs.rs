@@ -171,8 +171,7 @@ pub(super) const BLOCKING_THREADS: KeySpec = KeySpec::fixed(
 /// connection count and 256; the invariant needs no term for it because a
 /// queued job belongs to an already-admitted connection and its body was
 /// already charged there.
-pub(super) const BLOCKING_QUEUE: KeySpec =
-    KeySpec::fixed("blocking_queue", 1, 1024, [8, 16, 24]);
+pub(super) const BLOCKING_QUEUE: KeySpec = KeySpec::fixed("blocking_queue", 1, 1024, [8, 16, 24]);
 
 /// The wire-level request cap. Complete bodies beyond `max_complete_body` are
 /// spooled, so this one is a protocol bound and not a resident buffer.

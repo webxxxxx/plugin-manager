@@ -8,6 +8,9 @@
 //! administrative credential and Bearer verification runs on every request
 //! from a machine client.
 
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use base64::Engine;
 use sha2::{Digest, Sha256};
@@ -15,6 +18,107 @@ use sha2::{Digest, Sha256};
 const PREFIX: &str = "pbkdf2-sha256";
 const ITERATIONS: u32 = 10_000;
 const SALT_LEN: usize = 16;
+/// How long a successful Bearer check is remembered.
+const CACHE_TTL: Duration = Duration::from_secs(300);
+/// Upper bound on remembered credentials.
+const CACHE_CAP: usize = 32;
+
+/// A bounded set of recently verified credentials.
+///
+/// This exists because Bearer verification runs on every machine request and
+/// re-deriving the KDF there costs more CPU than the request itself. Keys are
+/// SHA-256 of (stored hash, presented password): only digests are kept, never
+/// the secret, and every entry ages out.
+pub struct VerifyCache {
+    entries: Mutex<Vec<([u8; 32], Instant)>>,
+}
+
+impl VerifyCache {
+    pub const fn new() -> Self {
+        Self {
+            entries: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Verify, reusing a recent success. A miss costs the full KDF; a hit
+    /// costs one SHA-256.
+    pub fn verify(&self, password: &str, encoded: &str) -> bool {
+        let key = cache_key(password, encoded);
+        if self.hit(&key) {
+            return true;
+        }
+        if !verify_password(password, encoded) {
+            return false;
+        }
+        self.store(key);
+        true
+    }
+
+    pub fn hit(&self, key: &[u8; 32]) -> bool {
+        let now = Instant::now();
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries.retain(|(_, at)| now.duration_since(*at) < CACHE_TTL);
+        entries
+            .iter()
+            .any(|(stored, _)| constant_time_eq(stored, key))
+    }
+
+    pub fn store(&self, key: [u8; 32]) {
+        let now = Instant::now();
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries.retain(|(_, at)| now.duration_since(*at) < CACHE_TTL);
+        if entries.len() >= CACHE_CAP {
+            entries.remove(0);
+        }
+        entries.push((key, now));
+    }
+
+    pub fn clear(&self) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Default for VerifyCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The process-wide cache every Bearer check uses.
+static BEARER_CACHE: VerifyCache = VerifyCache::new();
+
+/// Verify a Bearer credential through the process-wide cache.
+pub fn verify_password_cached(password: &str, encoded: &str) -> bool {
+    BEARER_CACHE.verify(password, encoded)
+}
+
+fn cache_key(password: &str, encoded: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(encoded.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(password.as_bytes());
+    hasher.finalize().into()
+}
 
 pub fn hash_password(password: &str) -> Result<String, String> {
     if password.is_empty() {
@@ -152,5 +256,45 @@ mod tests {
             assert!(!verify_password("x", value), "{value}");
         }
         assert!(hash_password("").is_err());
+    }
+
+    #[test]
+    fn a_verified_credential_is_remembered() {
+        let cache = VerifyCache::new();
+        let encoded = hash_password("secret").expect("hash");
+        assert!(cache.verify("secret", &encoded));
+        assert_eq!(cache.len(), 1);
+        assert!(cache.verify("secret", &encoded));
+        assert_eq!(cache.len(), 1, "a hit must not add a second entry");
+    }
+
+    #[test]
+    fn the_hit_path_answers_without_the_kdf() {
+        let cache = VerifyCache::new();
+        let encoded = hash_password("secret").expect("hash");
+        let key = cache_key("secret", &encoded);
+        assert!(!cache.hit(&key));
+        cache.store(key);
+        assert!(cache.hit(&key), "a stored key must verify on lookup alone");
+        assert!(!cache.hit(&cache_key("other", &encoded)));
+    }
+
+    #[test]
+    fn a_wrong_password_is_not_cached() {
+        let cache = VerifyCache::new();
+        let encoded = hash_password("secret").expect("hash");
+        assert!(!cache.verify("wrong", &encoded));
+        assert!(!cache.verify("wrong", &encoded));
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn a_success_does_not_validate_another_credential() {
+        let cache = VerifyCache::new();
+        let encoded = hash_password("secret").expect("hash");
+        assert!(cache.verify("secret", &encoded));
+        let other = hash_password("different").expect("hash");
+        assert!(!cache.verify("secret", &other));
+        assert!(!verify_password("secret", &other));
     }
 }

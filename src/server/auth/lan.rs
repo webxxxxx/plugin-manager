@@ -131,7 +131,7 @@ impl Lan {
             if self
                 .password_hash
                 .as_deref()
-                .map(|hash| crate::platform::auth::verify_password(bearer, hash))
+                .map(|hash| crate::platform::auth::verify_password_cached(bearer, hash))
                 .unwrap_or(false)
             {
                 return Ok(AuthKind::Bearer);

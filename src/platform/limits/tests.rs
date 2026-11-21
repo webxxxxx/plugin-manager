@@ -461,14 +461,12 @@ fn a_maxed_out_legal_configuration_is_shrunk_until_the_invariant_holds() {
 
 #[test]
 fn the_blocking_queue_follows_the_connection_count_and_can_be_lowered() {
-    // Unconfigured: the smaller of the connection count and 256.
+    // Unconfigured: the connection count (a queued job belongs to one).
     let defaults = derive_for(2 * GIB, Some(Workload::Streaming), Settings::default()).limits;
     assert_eq!(
-        defaults.blocking_queue,
-        defaults.max_connections.min(256),
+        defaults.blocking_queue, defaults.max_connections,
         "queue {} connections {}",
-        defaults.blocking_queue,
-        defaults.max_connections
+        defaults.blocking_queue, defaults.max_connections
     );
 
     // A queue larger than the admitted connections can never fill, so it is
@@ -602,8 +600,16 @@ fn blocking_threads_scale_with_the_shape_and_stay_in_two_through_thirty_two() {
     let defaults = derive_for(2 * GIB, None, Settings::default()).limits;
     assert_eq!(defaults.blocking_threads, 16);
 
-    for (configured, expected) in
-        [(0, 2), (1, 2), (2, 2), (5, 5), (16, 16), (32, 32), (33, 16), (64, 16)] {
+    for (configured, expected) in [
+        (0, 2),
+        (1, 2),
+        (2, 2),
+        (5, 5),
+        (16, 16),
+        (32, 32),
+        (33, 16),
+        (64, 16),
+    ] {
         let settings = Settings {
             blocking_threads: Some(configured),
             ..Settings::default()
