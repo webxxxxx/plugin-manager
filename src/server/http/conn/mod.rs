@@ -94,6 +94,11 @@ pub(crate) struct StartInput {
     pub fallback: FallbackHandler,
     /// The one long-lived stream budget built by the composition root.
     pub budget: crate::server::http::budget::StreamBudget,
+    /// The UI event bus. The poll driver installs a wake-up so a published
+    /// event is written on the next loop iteration; the thread driver leaves
+    /// it alone and relies on the handler's own cadence.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub bus: Arc<crate::face::uichannel::EventBus>,
     /// The bound control channel. The poll loop merges its listener into the
     /// wait set; the thread driver ignores it because the channel already runs
     /// its own accept thread on that host.

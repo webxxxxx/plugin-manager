@@ -119,6 +119,7 @@ pub(super) fn spawn_http(
         fallback,
         control,
         budget,
+        bus,
     })?;
     Ok(Arc::new(Api { lan, driver }))
 }

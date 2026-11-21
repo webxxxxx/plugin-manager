@@ -27,11 +27,19 @@ pub struct Event {
     pub json: String,
 }
 
+/// What a reactor installs so a published event does not wait for the loop's
+/// poll cadence. Called from the publishing thread, never from the loop.
+pub type Wake = Arc<dyn Fn() + Send + Sync>;
+
 pub struct EventBus {
     inner: Mutex<HashMap<String, PluginState>>,
     next_seq: AtomicU64,
     next_sub: AtomicU64,
     total_subscribers: AtomicU64,
+    /// Installed by the host's connection driver. Absent on a driver that
+    /// cannot be woken (the thread-per-connection fallback), where the
+    /// handler's own poll cadence delivers the event instead.
+    wake: Mutex<Option<Wake>>,
 }
 
 #[derive(Default)]
@@ -74,6 +82,7 @@ impl EventBus {
             next_seq: AtomicU64::new(0),
             next_sub: AtomicU64::new(0),
             total_subscribers: AtomicU64::new(0),
+            wake: Mutex::new(None),
         }
     }
 
@@ -250,12 +259,43 @@ impl EventBus {
             };
             state.history_bytes = state.history_bytes.saturating_sub(expired.json.len());
         }
+        let watching = !state.subscribers.is_empty();
         state
             .subscribers
             .retain(|(_, sender)| match sender.try_send(event.clone()) {
                 Ok(()) => true,
                 Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
             });
+        drop(inner);
+        // The subscriber's handler is serviced by the connection driver, which
+        // otherwise only looks at the bus on its poll deadline. Waking it here
+        // turns a delivered event into one loop iteration instead of one
+        // cadence period; without a wake (thread driver) nothing changes.
+        if watching {
+            self.wake();
+        }
+    }
+
+    /// Install the driver's wake-up. Called once, when the driver starts.
+    /// The thread-per-connection host cannot be woken, so nothing calls it
+    /// there and the handler's own poll cadence delivers the event.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn set_wake(&self, wake: Wake) {
+        *self
+            .wake
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(wake);
+    }
+
+    fn wake(&self) {
+        let wake = self
+            .wake
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(wake) = wake {
+            wake();
+        }
     }
 
     #[cfg(test)]
@@ -406,6 +446,31 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("replay");
         assert_eq!(first.seq, 6);
+        drop(subscription);
+    }
+
+    #[test]
+    fn a_published_event_wakes_the_installed_driver() {
+        use std::sync::atomic::AtomicUsize;
+
+        let bus = Arc::new(EventBus::new());
+        let limits = crate::platform::limits::test_default();
+        let (_receiver, subscription) = bus.subscribe("demo", &limits).expect("subscribe");
+        let wakes = Arc::new(AtomicUsize::new(0));
+        {
+            let wakes = wakes.clone();
+            bus.set_wake(Arc::new(move || {
+                wakes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
+
+        bus.publish("demo", "notifications/message", &json!({"data": "one"}));
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // A plugin nobody watches must not pay a wake-up.
+        bus.publish("quiet", "notifications/message", &json!({"data": "one"}));
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 1);
+
         drop(subscription);
     }
 

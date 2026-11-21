@@ -22,6 +22,7 @@ impl ConnectionDriver for Driver {
             routes,
             fallback,
             budget,
+            bus,
             control,
         } = input;
         let (control_user, control_admin, pending, wake) = control.into_parts();
@@ -38,6 +39,7 @@ impl ConnectionDriver for Driver {
             routes,
             fallback,
             budget,
+            bus,
         )?;
         Ok(ServerHandle::poll(loop_handle))
     }

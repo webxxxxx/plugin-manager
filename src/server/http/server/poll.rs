@@ -261,6 +261,10 @@ impl TimerOps for Server {
     fn on_tick(&mut self, connections: &mut Table<ConnState>) {
         let mut drain = [0u8; 64];
         while self.notify.read(&mut drain).is_ok() {}
+        // A UI event wake is "some handler may have output waiting", not a
+        // deadline: polling every stream here is what turns a published event
+        // into one loop iteration.
+        let bus_wake = self.bus_wake.swap(false, Ordering::SeqCst);
         // The same wake pipe carries blocking-pool completions, control
         // replies, and outbound progress retries.
         self.control.drain_replies();
@@ -365,7 +369,11 @@ impl TimerOps for Server {
         for id in stream_ids {
             let keep = match connections.get_mut(&id) {
                 Some(connection) => {
-                    let keep = stream_tick(connection, now);
+                    let keep = if bus_wake {
+                        stream_writable(connection)
+                    } else {
+                        stream_tick(connection, now)
+                    };
                     if keep {
                         self.service_stream_job(connection);
                     }
