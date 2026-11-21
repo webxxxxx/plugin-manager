@@ -253,6 +253,10 @@ function writeFixture(root) {
     '        send({"jsonrpc": "2.0", "id": request_id, "result": {"ok": True}})',
     '    elif method == "tools/call":',
     '        event += 1',
+    '        meta = request.get("params", {}).get("_meta", {})',
+    '        token = meta.get("progressToken") if isinstance(meta, dict) else None',
+    '        if token:',
+    '            send({"jsonrpc": "2.0", "method": "notifications/progress", "params": {"progress": 1, "progressToken": token}})',
     '        send({"jsonrpc": "2.0", "method": "notifications/message", "params": {"level": "info", "data": {"event": event}}})',
     '        send({"jsonrpc": "2.0", "id": request_id, "result": {"content": [{"type": "text", "text": "ok"}], "isError": False}})',
     '    elif request_id is not None:',
@@ -332,32 +336,39 @@ function tokenFor(daemon) {
   return match[1];
 }
 
-function mcpPayload(method, params, id, name) {
+function mcpPayload(method, params, id, name, version) {
+  const protocolVersion = version || '2026-07-28';
   const request = {
     jsonrpc: '2.0',
     id: id,
     method: method,
     params: Object.assign({}, params || {}, {
       _meta: {
-        'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+        'io.modelcontextprotocol/protocolVersion': protocolVersion,
         'io.modelcontextprotocol/clientCapabilities': {},
       },
     }),
   };
   const headers = {
     'content-type': 'application/json',
-    'MCP-Protocol-Version': '2026-07-28',
+    'MCP-Protocol-Version': protocolVersion,
     'Mcp-Method': method,
   };
   if (name) headers['Mcp-Name'] = name;
   return { request: request, headers: headers };
 }
 
+async function mcpSend(daemon, token, payload, keepAlive, extraHeaders) {
+  const headers = Object.assign({}, payload.headers, { Authorization: 'Bearer ' + token }, extraHeaders || {});
+  const response = await httpRequest(daemon.address, 'POST', '/mcp', headers, JSON.stringify(payload.request), 10000, keepAlive);
+  const body = response.body.toString();
+  const contentType = String(response.headers['content-type'] || '');
+  const json = body && contentType.includes('application/json') ? parseJson(response) : null;
+  return { status: response.status, json: json, body: body, headers: response.headers };
+}
+
 async function mcpPost(daemon, token, method, params, id, name, keepAlive) {
-  const payload = mcpPayload(method, params, id, name);
-  payload.headers.Authorization = 'Bearer ' + token;
-  const response = await httpRequest(daemon.address, 'POST', '/mcp', payload.headers, JSON.stringify(payload.request), 10000, keepAlive);
-  return { status: response.status, json: parseJson(response) };
+  return mcpSend(daemon, token, mcpPayload(method, params, id, name), keepAlive);
 }
 
 function wsOpen(url, headers) {
@@ -550,6 +561,13 @@ async function runCompat(daemon, token) {
     }
   }
 
+  async function expectMcpFailure(payload, status, code, extraHeaders) {
+    const result = await mcpSend(daemon, token, payload, false, extraHeaders);
+    assert.equal(result.status, status, JSON.stringify(result.json));
+    assert.equal(result.json && result.json.error.code, code, JSON.stringify(result.json));
+    return result;
+  }
+
   await check('HTTP GET /api/v1/services: 200, JSON, Content-Length, Connection close', async function () {
     const response = await httpRequest(daemon.address, 'GET', '/api/v1/services', {}, null);
     assert.equal(response.status, 200);
@@ -675,6 +693,85 @@ async function runCompat(daemon, token) {
     const response = await httpRequest(daemon.address, 'POST', '/mcp', payload.headers, JSON.stringify(payload.request));
     assert.equal(response.status, 400);
     assert.equal(parseJson(response).error.code, -32602);
+  });
+
+  await check('MCP rejects a missing protocol-version header (-32020)', async function () {
+    const payload = mcpPayload('tools/list', {}, 101);
+    delete payload.headers['MCP-Protocol-Version'];
+    await expectMcpFailure(payload, 400, -32020);
+  });
+
+  await check('MCP rejects a version header that disagrees with _meta (-32020)', async function () {
+    const payload = mcpPayload('tools/list', {}, 102);
+    payload.headers['MCP-Protocol-Version'] = '2025-11-25';
+    await expectMcpFailure(payload, 400, -32020);
+  });
+
+  await check('MCP rejects a missing Mcp-Method header (-32020)', async function () {
+    const payload = mcpPayload('tools/list', {}, 103);
+    delete payload.headers['Mcp-Method'];
+    await expectMcpFailure(payload, 400, -32020);
+  });
+
+  await check('MCP rejects tools/call without Mcp-Name (-32020)', async function () {
+    await expectMcpFailure(mcpPayload('tools/call', { name: 'perf.echo', arguments: {} }, 104), 400, -32020);
+  });
+
+  await check('MCP rejects an unsupported protocol version (-32022)', async function () {
+    const result = await expectMcpFailure(mcpPayload('tools/list', {}, 105, null, '1900-01-01'), 400, -32022);
+    assert.deepEqual(result.json.error.data.supported, ['2026-07-28']);
+  });
+
+  await check('MCP unknown method is 404 -32601', async function () {
+    await expectMcpFailure(mcpPayload('subscriptions/listen', {}, 106), 404, -32601);
+  });
+
+  await check('MCP notification POST is 202 with no body', async function () {
+    const result = await mcpSend(daemon, token, mcpPayload('notifications/initialized', {}, undefined));
+    assert.equal(result.status, 202);
+    assert.equal(result.body, '');
+  });
+
+  await check('MCP GET is 405 with Allow POST', async function () {
+    const response = await httpRequest(daemon.address, 'GET', '/mcp', {}, null);
+    assert.equal(response.status, 405);
+    assert.equal(String(response.headers.allow), 'POST');
+  });
+
+  await check('MCP cross-origin is 403', async function () {
+    const result = await mcpSend(daemon, token, mcpPayload('tools/list', {}, 107), false, { Origin: 'http://evil.example' });
+    assert.equal(result.status, 403);
+  });
+
+  await check('MCP malformed JSON is 400 -32700', async function () {
+    const headers = {
+      'content-type': 'application/json',
+      'MCP-Protocol-Version': '2026-07-28',
+      'Mcp-Method': 'tools/list',
+      Authorization: 'Bearer ' + token,
+    };
+    const response = await httpRequest(daemon.address, 'POST', '/mcp', headers, '{not json', 10000);
+    assert.equal(response.status, 400);
+    assert.equal(parseJson(response).error.code, -32700);
+  });
+
+  await check('MCP body over 1 MiB is 413', async function () {
+    const payload = mcpPayload('tools/call', { name: 'perf.echo', arguments: { blob: 'x'.repeat(1024 * 1024) } }, 108, 'perf.echo');
+    const result = await mcpSend(daemon, token, payload);
+    assert.equal(result.status, 413, JSON.stringify(result.json));
+  });
+
+  await check('MCP tools/call streams progress before the final result', async function () {
+    const payload = mcpPayload('tools/call', { name: 'perf.echo', arguments: {} }, 201, 'perf.echo');
+    payload.request.params._meta.progressToken = 'perf-progress-1';
+    const result = await mcpSend(daemon, token, payload, false, { Accept: 'text/event-stream' });
+    assert.equal(result.status, 200, result.body.slice(0, 200));
+    assert.match(String(result.headers['content-type']), /text\/event-stream/);
+    const progressAt = result.body.indexOf('notifications/progress');
+    const finalAt = result.body.indexOf('"resultType":"complete"');
+    assert.ok(progressAt >= 0, 'progress event missing: ' + result.body.slice(0, 300));
+    assert.ok(finalAt > progressAt, 'final result must follow progress: ' + result.body.slice(-300));
+    return 'progress then final';
   });
 
   await check('MCP stdio official SDK: initialize, list, call', async function () {
