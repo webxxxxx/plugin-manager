@@ -92,6 +92,27 @@ macro_rules! api_routes {
     };
 }
 
+/// The rare POST that reads a JSON body. Same line shape; the block name is
+/// the body policy, so callers never pass a body flag.
+macro_rules! api_json_routes {
+    ($($method:ident $path:literal => $handler:ident),* $(,)?) => {
+        static API_JSON_ROUTES: &[crate::face::routes::ApiRouteDef] = &[
+            $(crate::face::routes::ApiRouteDef::json(
+                stringify!($method),
+                $path,
+                stringify!($handler),
+            ),)*
+        ];
+        static API_JSON_HANDLERS: &[(&str, HandlerKind)] = &[
+            $((stringify!($handler), HandlerKind::Response(ApiFace::$handler)),)*
+        ];
+    };
+}
+
+api_json_routes! {
+    POST   "/api/v1/trust"                    => trust_add,
+}
+
 /// The historical 404-on-method-miss rows. Same line shape as `api_routes!`.
 macro_rules! api_quiet_routes {
     ($($method:ident $path:literal => $handler:ident),* $(,)?) => {
@@ -115,7 +136,6 @@ api_routes! {
     POST   "/api/v1/config/{id}/reset"        => config_reset,
     GET    "/api/v1/export/{id}/config"       => export_config,
     GET    "/api/v1/trust"                    => trust_list,
-    POST   "/api/v1/trust"                    => trust_add,
     DELETE "/api/v1/trust/{key}"              => trust_remove,
     GET    "/api/v1/logs/{id}"                => logs,
     POST   "/api/v1/plugins/{id}/ui-token"    => plugin_ui_token,
@@ -136,12 +156,16 @@ api_quiet_routes! {
 
 /// Every macro-declared row, in table order.
 pub(crate) fn route_defs() -> impl Iterator<Item = &'static crate::face::routes::ApiRouteDef> {
-    API_CLAIM_ROUTES.iter().chain(API_QUIET_ROUTES)
+    API_CLAIM_ROUTES
+        .iter()
+        .chain(API_JSON_ROUTES)
+        .chain(API_QUIET_ROUTES)
 }
 
 fn handler_for(name: &str) -> Option<HandlerKind> {
     API_CLAIM_HANDLERS
         .iter()
+        .chain(API_JSON_HANDLERS)
         .chain(API_QUIET_HANDLERS)
         .find(|(candidate, _)| *candidate == name)
         .map(|(_, handler)| *handler)

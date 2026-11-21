@@ -207,6 +207,9 @@ pub(crate) struct ApiRouteDef {
     pub(crate) path: &'static str,
     pub(crate) handler: &'static str,
     pub(crate) quiet: bool,
+    /// True only for the rare POST that reads a JSON body. PUT/PATCH derive
+    /// JSON from the method; most management POSTs are body-less actions.
+    json_body: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -230,6 +233,22 @@ impl ApiRouteDef {
             path,
             handler,
             quiet,
+            json_body: false,
+        }
+    }
+
+    pub(crate) const fn json(
+        method: &'static str,
+        path: &'static str,
+        handler: &'static str,
+    ) -> ApiRouteDef {
+        ApiRouteDef {
+            kind: RouteKind::Api,
+            method,
+            path,
+            handler,
+            quiet: false,
+            json_body: true,
         }
     }
 
@@ -244,6 +263,7 @@ impl ApiRouteDef {
             path,
             handler,
             quiet: false,
+            json_body: false,
         }
     }
 
@@ -252,7 +272,11 @@ impl ApiRouteDef {
             RouteKind::Api => (
                 Endpoint::Api(self.handler),
                 Owner::Api,
-                body_for(self.method),
+                if self.json_body {
+                    Body::Json
+                } else {
+                    body_for(self.method)
+                },
                 Run::Blocking,
                 0,
             ),
@@ -282,11 +306,11 @@ impl ApiRouteDef {
     }
 }
 
-/// A normal JSON API route buffers a JSON body; reads, deletes and the
-/// body-less management writes keep the empty policy.
+/// PUT/PATCH carry a JSON representation; POST is a body-less action unless
+/// the row explicitly uses `ApiRouteDef::json` (the trust key add).
 fn body_for(method: &str) -> Body {
     match method {
-        "POST" | "PUT" | "PATCH" => Body::Json,
+        "PUT" | "PATCH" => Body::Json,
         _ => Body::Empty,
     }
 }
