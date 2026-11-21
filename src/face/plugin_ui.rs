@@ -11,6 +11,7 @@ use crate::face::webui;
 use crate::manage as package;
 use crate::manage as plugin;
 use crate::platform::config::Config;
+use crate::platform::paths::Paths;
 use crate::server::auth::lan::Lan;
 use crate::server::http::model as http;
 use crate::server::http::{
@@ -70,6 +71,75 @@ fn is_realtime(path: &str) -> bool {
     ui_path(path)
         .map(|ui| matches!(ui.sub, "events" | "ws" | "raw"))
         .unwrap_or(false)
+}
+
+fn unknown_ui() -> Vec<u8> {
+    http::json_error(404, "not_found", "unknown plugin UI")
+}
+
+/// A valid plugin id with a browser-loadable web UI.
+///
+/// This is the only production place that combines `valid_name` with
+/// `web_assets`; the slashless redirect, the static faces and the realtime
+/// admission all ask this question here.
+pub(crate) fn web_assets_for(paths: &Paths, id: &str) -> Option<plugin::WebAssets> {
+    if !package::valid_name(id) {
+        return None;
+    }
+    plugin::web_assets(paths, id)
+}
+
+/// The static-asset admission: a valid id, a web UI, and a token minted for
+/// that same plugin. Failures are the complete 404/401 bytes both static faces
+/// send, so their status, code and message cannot drift.
+pub(crate) fn static_assets(
+    paths: &Paths,
+    lan: &Arc<Mutex<Lan>>,
+    ui: &UiPath<'_>,
+) -> Result<plugin::WebAssets, Vec<u8>> {
+    let Some(assets) = web_assets_for(paths, ui.id) else {
+        if package::valid_name(ui.id) {
+            return Err(http::json_error(
+                404,
+                "not_found",
+                &format!("plugin {} has no web UI", ui.id),
+            ));
+        }
+        return Err(unknown_ui());
+    };
+    valid_token(lan, ui)?;
+    Ok(assets)
+}
+
+/// The realtime admission's id/assets primitive. Realtime handlers use one
+/// 404 for both an unknown id and a plugin without assets; that is why this
+/// helper cannot simply return `web_assets_for`.
+pub(crate) fn valid_ui(
+    paths: &Paths,
+    ui: &UiPath<'_>,
+    require_assets: bool,
+) -> Result<(), Vec<u8>> {
+    if require_assets {
+        web_assets_for(paths, ui.id).ok_or_else(unknown_ui)?;
+        return Ok(());
+    }
+    if !package::valid_name(ui.id) {
+        return Err(unknown_ui());
+    }
+    Ok(())
+}
+
+/// The token half of both admissions.
+pub(crate) fn valid_token(lan: &Arc<Mutex<Lan>>, ui: &UiPath<'_>) -> Result<(), Vec<u8>> {
+    if crate::server::auth::admission::plugin_token_valid(lan, ui.token, ui.id) {
+        Ok(())
+    } else {
+        Err(http::json_error(
+            401,
+            "unauthorized",
+            "invalid or expired plugin token",
+        ))
+    }
 }
 
 /// The face for everything under `/plugin-ui`: static assets, SSE, the page
@@ -179,23 +249,10 @@ impl PluginUiFace {
             "raw" => return plugin_streams::open_raw(&ui, request, &self.lan, &self.streams),
             _ => {}
         }
-        if !package::valid_name(ui.id) {
-            return Box::new(PluginUiStream::error(404, "not_found", "unknown plugin UI"));
-        }
-        let Some(assets) = plugin::web_assets(&self.streams.paths, ui.id) else {
-            return Box::new(PluginUiStream::error(
-                404,
-                "not_found",
-                &format!("plugin {} has no web UI", ui.id),
-            ));
+        let assets = match static_assets(&self.streams.paths, &self.lan, &ui) {
+            Ok(assets) => assets,
+            Err(response) => return Box::new(PluginUiStream::response(response)),
         };
-        if !crate::server::auth::admission::plugin_token_valid(&self.lan, ui.token, ui.id) {
-            return Box::new(PluginUiStream::error(
-                401,
-                "unauthorized",
-                "invalid or expired plugin token",
-            ));
-        }
         let base = format!("/plugin-ui/{}/{}/", ui.id, ui.token);
         Box::new(PluginUiStream::asset(
             &request.headers,
@@ -273,20 +330,7 @@ impl PluginUiStream {
         assets: &plugin::WebAssets,
         base: &str,
     ) -> PluginUiStream {
-        let Some(relative) = webui::relative_path(sub, &assets.entry) else {
-            return PluginUiStream::error(404, "not_found", "not found");
-        };
-        // SPA fallback: only an HTML navigation falls back to the entry. A
-        // missing script must stay a 404 so the browser reports it instead of
-        // running HTML.
-        let file = webui::web_file(&assets.root, &relative).or_else(|| {
-            if webui::wants_html(headers) {
-                webui::web_file(&assets.root, &assets.entry)
-            } else {
-                None
-            }
-        });
-        let Some((path, _)) = file else {
+        let Some((path, metadata)) = webui::resolve_asset(assets, sub, headers) else {
             return PluginUiStream::error(404, "not_found", "not found");
         };
         let mime = http::content_type(&path.to_string_lossy());
@@ -294,12 +338,6 @@ impl PluginUiStream {
             Ok(file) => file,
             Err(error) => {
                 return PluginUiStream::error(500, "internal", &format!("open UI asset: {}", error))
-            }
-        };
-        let metadata = match file.metadata() {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                return PluginUiStream::error(500, "internal", &format!("stat UI asset: {}", error))
             }
         };
         let validators = webui::asset_validators(&metadata, http::header(headers, "if-none-match"));
@@ -767,5 +805,87 @@ mod tests {
     fn the_asset_handler_is_a_one_shot_stream() {
         let handler = PluginUiStream::response(Vec::new());
         assert_eq!(handler.stream_class(), StreamClass::OneShot);
+    }
+    fn installed_ui(dir: &TempDir, id: &str) -> Paths {
+        let paths = Paths::under(&dir.0);
+        let plugin = paths.plugins_dir.join(id);
+        let version = plugin.join("1.0.0");
+        fs::create_dir_all(version.join("payload/web")).expect("web root");
+        fs::write(version.join("payload/web/index.html"), PAGE).expect("page");
+        fs::write(plugin.join("current"), "1.0.0").expect("current");
+        let manifest = serde_json::json!({
+            "schema": 1,
+            "name": id,
+            "version": "1.0.0",
+            "desc": "admission test",
+            "platform": crate::platform::target(),
+            "protocol": 1,
+            "exec": {"path": "payload/bin/demo"},
+            "files": [],
+            "ui": {"type": "web", "entry": "index.html"}
+        });
+        fs::write(
+            version.join("manifest.json"),
+            serde_json::to_vec(&manifest).expect("manifest"),
+        )
+        .expect("write manifest");
+        paths
+    }
+
+    #[test]
+    fn static_admission_distinguishes_id_ui_and_token() {
+        let dir = TempDir::new();
+        let paths = installed_ui(&dir, "demo");
+        let bind = "127.0.0.1:0".parse().expect("bind");
+        let lan = Arc::new(Mutex::new(Lan::new(bind, bind, false, None)));
+
+        let bad_id = UiPath {
+            id: "Bad",
+            token: "tok",
+            sub: "",
+            slashless: false,
+        };
+        let response = static_assets(&paths, &lan, &bad_id).expect_err("invalid id");
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 404 Not Found"), "{text}");
+        assert!(text.contains("unknown plugin UI"), "{text}");
+
+        let missing = UiPath {
+            id: "missing",
+            token: "tok",
+            sub: "",
+            slashless: false,
+        };
+        let response = static_assets(&paths, &lan, &missing).expect_err("no web UI");
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 404 Not Found"), "{text}");
+        assert!(text.contains("plugin missing has no web UI"), "{text}");
+
+        let bad_token = UiPath {
+            id: "demo",
+            token: "tok",
+            sub: "",
+            slashless: false,
+        };
+        let response = static_assets(&paths, &lan, &bad_token).expect_err("bad token");
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 401 Unauthorized"), "{text}");
+        assert!(text.contains("invalid or expired plugin token"), "{text}");
+
+        let token = {
+            let mut state = lan.lock().expect("lan");
+            state.issue_plugin_token("demo")
+        };
+        let good = UiPath {
+            id: "demo",
+            token: &token,
+            sub: "",
+            slashless: false,
+        };
+        let assets = static_assets(&paths, &lan, &good).expect("valid admission");
+        assert_eq!(
+            assets.root,
+            paths.plugins_dir.join("demo/1.0.0/payload/web")
+        );
     }
 }

@@ -88,11 +88,11 @@ impl ApiFace {
     }
 
     fn plugin_ui_token(&self, id: &str) -> Response {
-        if !package::valid_name(id) {
+        if crate::face::plugin_ui::web_assets_for(&self.config.paths, id).is_none() {
+            if package::valid_name(id) {
+                return error_response(404, "not_found", &format!("plugin {} has no web UI", id));
+            }
             return error_response(404, "not_found", &format!("unknown plugin UI: {}", id));
-        }
-        if plugin::web_assets(&self.config.paths, id).is_none() {
-            return error_response(404, "not_found", &format!("plugin {} has no web UI", id));
         }
         let token = match self.lan.lock() {
             Ok(mut state) => state.issue_plugin_token(id),

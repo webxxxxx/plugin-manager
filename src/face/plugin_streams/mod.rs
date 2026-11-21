@@ -17,9 +17,7 @@ pub mod ws;
 
 use std::sync::{Arc, Mutex};
 
-use crate::face::plugin_ui::{PluginUiStream, UiPath};
-use crate::manage as package;
-use crate::manage as plugin;
+use crate::face::plugin_ui::{valid_token, valid_ui, PluginUiStream, UiPath};
 use crate::platform::paths::Paths;
 use crate::server::auth::lan::{AuthKind, Lan};
 use crate::server::http::model as http;
@@ -42,32 +40,6 @@ type Refusal = Vec<u8>;
 
 fn boxed(response: Vec<u8>) -> Box<dyn StreamHandler> {
     Box::new(PluginUiStream::response(response))
-}
-
-fn unknown_ui() -> Refusal {
-    http::json_error(404, "not_found", "unknown plugin UI")
-}
-
-fn valid_ui(paths: &Paths, ui: &UiPath<'_>, require_assets: bool) -> Result<(), Refusal> {
-    if !package::valid_name(ui.id) {
-        return Err(unknown_ui());
-    }
-    if require_assets && plugin::web_assets(paths, ui.id).is_none() {
-        return Err(unknown_ui());
-    }
-    Ok(())
-}
-
-fn valid_token(lan: &Arc<Mutex<Lan>>, ui: &UiPath<'_>) -> Result<(), Refusal> {
-    if crate::server::auth::admission::plugin_token_valid(lan, ui.token, ui.id) {
-        Ok(())
-    } else {
-        Err(http::json_error(
-            401,
-            "unauthorized",
-            "invalid or expired plugin token",
-        ))
-    }
 }
 
 fn same_origin(headers: &[(String, String)]) -> Result<(), Refusal> {

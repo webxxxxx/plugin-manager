@@ -105,6 +105,29 @@ pub fn relative_path(subpath: &str, entry: &str) -> Option<String> {
     }
 }
 
+/// Resolve one URL sub-path to a file under the plugin's web root, including
+/// the SPA fallback.
+///
+/// This is the only production place that combines the URL-to-relative
+/// conversion, the rooted file lookup and the HTML-navigation fallback. A
+/// missing script stays `None`; only a navigation that accepts HTML falls
+/// back to the manifest entry.
+pub(crate) fn resolve_asset(
+    assets: &crate::manage::WebAssets,
+    sub: &str,
+    headers: &[(String, String)],
+) -> Option<(PathBuf, std::fs::Metadata)> {
+    let relative = relative_path(sub, &assets.entry)?;
+    if let Some(found) = web_file(&assets.root, &relative) {
+        return Some(found);
+    }
+    if wants_html(headers) {
+        web_file(&assets.root, &assets.entry)
+    } else {
+        None
+    }
+}
+
 /// A strong ETag from the file's modification time and size. Changing the file
 /// (even within the same second, thanks to sub-second precision) invalidates it.
 pub fn etag(modified: std::time::SystemTime, size: u64) -> String {
