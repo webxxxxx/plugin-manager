@@ -171,6 +171,7 @@ struct SettingsView {
     ws_raw_queue: Option<usize>,
     pending_queue: Option<usize>,
     progress_queue: Option<usize>,
+    cpu_budget_percent: Option<usize>,
 }
 
 impl SettingsView {
@@ -207,6 +208,7 @@ impl SettingsView {
             ws_raw_queue: settings.ws_raw_queue,
             pending_queue: settings.pending_queue,
             progress_queue: settings.progress_queue,
+            cpu_budget_percent: settings.cpu_budget_percent,
         }
     }
 }
@@ -282,6 +284,10 @@ impl Limits {
             derivation.count(&PENDING_QUEUE, settings.pending_queue.map(|v| v as u64));
         let progress_queue =
             derivation.count(&PROGRESS_QUEUE, settings.progress_queue.map(|v| v as u64));
+        let cpu_budget_percent = derivation.count(
+            &CPU_BUDGET_PERCENT,
+            settings.cpu_budget_percent.map(|v| v as u64),
+        ) as u8;
 
         Limits {
             request_stack_bytes,
@@ -315,6 +321,7 @@ impl Limits {
             ws_raw_queue,
             pending_queue,
             progress_queue,
+            cpu_budget_percent,
         }
     }
 }

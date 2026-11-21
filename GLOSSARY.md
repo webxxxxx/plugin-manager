@@ -116,6 +116,10 @@ svcd 每次启动从本机推导出的**进程峰值内存上限**：`auto` 取�
 探测的每一项都可以被 `svcd.conf` 的 `probe_*` 键取代：写了的项以配置为准，且不再读 OS（`0` 表示未知）。
 _Avoid_: 资源档位、MEM_LEVEL 档位、调用预算（那是另一件事）
 
+**CPU 预算（CPU budget）**:
+svcd 可占用本机 CPU 的比例，键是 `cpu_budget_percent`（0..100，默认 0 表示不设上限）。它是**活策略**，不是预留：>0 时先装内核硬限（Linux 写自己 cgroup v2 的 `cpu.max`，Windows 给自己建带 CPU 速率控制的 job object），装不上就退回准入闸门——按 250 ms 采样自己的 CPU 时间做指数平均，超过目标就拒绝**新连接**（503 + `Retry-After`），在飞的请求照常跑完，掉到线下再放开。它只统计 svcd 进程自己的 CPU；插件子进程只在硬限生效时被一并限住。注意 90% 不是「90% 的容量」：该利用率下排队延迟约为空闲时的 9 倍。
+_Avoid_: CPU 配额（那是 cgroup 的量）、限速（那是调用级别的）、线程数
+
 **负载形状（Workload shape）**:
 `tiny | interactive | streaming`，决定内存预算怎么花（并发份额、单体份额、流与在途份额），不决定花多少。默认由量化后的预算推导（< 512 MiB → tiny，< 2 GiB → interactive，否则 streaming），`svcd.conf` 的 `workload` 可以显式覆盖；状态里标明它是「推导得到」还是「人工指定」。形状在收缩之后仍保持区分：并发严格单调上升，单体在 interactive 达到峰值，streaming 用更小的单体换更多长连接。
 _Avoid_: 资源档位、模式、profile

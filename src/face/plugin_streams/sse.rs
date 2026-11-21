@@ -6,13 +6,10 @@
 //! a shorter deadline so a heartbeat is written even when no plugin event
 //! arrives.
 
-use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use crate::face::uichannel::{Event, Replay, Subscription};
-use crate::server::http::{
-    CloseReason, OutBuffer, StreamAction, StreamEvent, StreamHandler, StreamStep,
-};
+use crate::face::uichannel::{Polled, Replay, Subscription};
+use crate::server::http::{OutBuffer, StreamAction, StreamEvent, StreamHandler, StreamStep};
 
 const HEAD: &[u8] = b"HTTP/1.1 200 OK\r\n\
 Content-Type: text/event-stream\r\n\
@@ -33,8 +30,7 @@ const MIN_FREE: usize = 32;
 const POLL: Duration = Duration::from_millis(100);
 
 pub(crate) struct SseStream {
-    receiver: Receiver<Event>,
-    _subscription: Subscription,
+    subscription: Subscription,
     replay: Replay,
     heartbeat: Instant,
     head_at: usize,
@@ -45,14 +41,9 @@ pub(crate) struct SseStream {
 }
 
 impl SseStream {
-    pub(crate) fn new(
-        receiver: Receiver<Event>,
-        subscription: Subscription,
-        replay: Replay,
-    ) -> SseStream {
+    pub(crate) fn new(subscription: Subscription, replay: Replay) -> SseStream {
         SseStream {
-            receiver,
-            _subscription: subscription,
+            subscription,
             replay,
             heartbeat: Instant::now(),
             head_at: 0,
@@ -107,15 +98,18 @@ impl SseStream {
                 self.set_pending(RESET.to_vec());
                 continue;
             }
-            match self.receiver.try_recv() {
-                Ok(event) => {
+            match self.subscription.poll() {
+                Polled::Event(event) => {
                     self.set_pending(crate::face::uichannel::sse_event(&event).into_bytes());
                     continue;
                 }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {
-                    return StreamStep::wait(StreamAction::Close(CloseReason::Completed));
+                Polled::Reset => {
+                    // The subscriber fell behind the shared ring; the next
+                    // pass writes the reset marker and resumes at the front.
+                    self.replay.reset = true;
+                    continue;
                 }
+                Polled::Empty => {}
             }
             if self.heartbeat.elapsed() >= HEARTBEAT {
                 self.heartbeat = now;
@@ -184,15 +178,16 @@ impl StreamHandler for SseStream {
 mod tests {
     use super::*;
     use crate::face::uichannel::EventBus;
+    use crate::server::http::CloseReason;
     use serde_json::json;
     use std::sync::Arc;
 
     fn harness() -> (Arc<EventBus>, SseStream) {
         let bus = Arc::new(EventBus::new());
-        let (receiver, subscription, replay) = bus
+        let (subscription, replay) = bus
             .subscribe_from("demo", None, &crate::platform::limits::test_default())
             .expect("subscribe");
-        (bus, SseStream::new(receiver, subscription, replay))
+        (bus, SseStream::new(subscription, replay))
     }
 
     fn drive(stream: &mut SseStream, limit: usize, events: usize) -> Vec<u8> {
@@ -256,11 +251,10 @@ mod tests {
     #[test]
     fn a_replay_gap_writes_the_reset_event_first() {
         let bus = Arc::new(EventBus::new());
-        let (receiver, subscription, _replay) = bus
+        let (subscription, _replay) = bus
             .subscribe_from("demo", None, &crate::platform::limits::test_default())
             .expect("subscribe");
         let mut stream = SseStream::new(
-            receiver,
             subscription,
             Replay {
                 reset: true,

@@ -83,6 +83,8 @@ pub(crate) fn start(
     routes: Arc<dyn PreBodyRoutes>,
     fallback: FallbackHandler,
     budget: StreamBudget,
+    bus: Arc<crate::face::uichannel::EventBus>,
+    governor: Option<Arc<crate::server::http::governor::CpuGovernor>>,
 ) -> std::io::Result<LoopHandle> {
     let (results_tx, results_rx) = mpsc::channel();
     let (notify_rx, notify_tx) = UnixStream::pair()?;
@@ -91,6 +93,19 @@ pub(crate) fn start(
     let notify_tx = Arc::new(notify_tx);
     let loop_handle = LoopHandle::new(notify_tx.clone());
     let stop = loop_handle.stop_flag();
+    // A published UI event writes one byte here, so the loop services the SSE
+    // handler on its next iteration instead of waiting for the handler's poll
+    // deadline (up to 100 ms). The pipe is non-blocking: a full pipe already
+    // means a wake-up is pending.
+    let bus_wake = Arc::new(AtomicBool::new(false));
+    {
+        let notify = notify_tx.clone();
+        let bus_wake = bus_wake.clone();
+        bus.set_wake(Arc::new(move || {
+            bus_wake.store(true, Ordering::SeqCst);
+            let _ = (&*notify).write(&[1]);
+        }));
+    }
     let control = ControlServer::new(
         control_user,
         control_admin,
@@ -132,6 +147,8 @@ pub(crate) fn start(
                 results: results_rx,
                 results_tx: results_tx.clone(),
                 notify: notify_rx,
+                bus_wake,
+                governor,
                 face,
                 routes,
                 fallback,
@@ -180,6 +197,10 @@ struct Server {
     /// delivered to the handler, not to a completion slot.
     results_tx: Sender<WorkResult>,
     notify: UnixStream,
+    /// Set by the UI bus wake-up. The loop then re-checks every stream
+    /// handler as if it were writable, instead of waiting for the handler's
+    /// own poll deadline (which would hold a published event for one cadence).
+    bus_wake: Arc<AtomicBool>,
     face: Arc<dyn Face>,
     routes: Arc<dyn PreBodyRoutes>,
     fallback: FallbackHandler,
@@ -191,6 +212,8 @@ struct Server {
     face_plans: HashMap<u64, PreparedFace>,
     blocking: BlockingPool,
     blocking_pending: HashMap<u64, PendingBlocking>,
+    /// The CPU budget; absent when the document does not set one.
+    governor: Option<Arc<crate::server::http::governor::CpuGovernor>>,
     /// Connection -> the unique pool key of its in-flight stream job. Stream
     /// jobs do not use the connection id as their key: the handler can submit
     /// the next job from `StreamJobDone` before the worker clears the previous

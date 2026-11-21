@@ -117,6 +117,8 @@ pub(crate) struct Connection {
     pub(crate) fallback: FallbackHandler,
     pub(crate) budget: crate::server::http::budget::StreamBudget,
     pub(crate) raw_hub: Arc<RawHub>,
+    /// The CPU budget; absent when the document does not set one.
+    pub(crate) governor: Option<Arc<crate::server::http::governor::CpuGovernor>>,
 }
 
 /// The bounded admission caps for this driver: one lease is one connection and
@@ -151,6 +153,14 @@ pub(crate) fn serve(
         match active.accept() {
             Ok((stream, peer)) => {
                 let ip = peer.ip();
+                if connection
+                    .governor
+                    .as_ref()
+                    .is_some_and(|governor| governor.should_shed())
+                {
+                    reject_connection(stream);
+                    continue;
+                }
                 // Admit before spawning: a refused connection must not create
                 // a thread, and an admitted one stays accounted for until its
                 // handler returns and drops the lease.

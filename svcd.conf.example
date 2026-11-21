@@ -106,6 +106,17 @@ bind = 127.0.0.1:8787
 #
 #   workload = tiny | interactive | streaming   # default: derived from the budget
 #
+# The **CPU budget** is a live policy, not a reservation. 0 (the default) means
+# no cap. Above 0 svcd installs the platform's hard cap when it can (a cgroup
+# v2 cpu.max on Linux, a job object CPU rate on Windows) and always refuses new
+# connections once its own measured CPU use stays above the target; existing
+# requests finish. Note that 90% is not "90% of capacity": queueing delay at 90%
+# utilization is roughly nine times the idle latency, so 70-80% is the calmer
+# choice.
+#
+#   cpu_budget_percent = 0    # default; 0..100, 0 disables the governor
+#   cpu_budget_percent = 80   # shed new connections above 80% of this machine
+#
 # The default is only a suggestion: `svc config tune` prints (or writes) the
 # configuration it recommends for this machine, one key per line with the
 # derivation in the trailing comment. `svc status --resources` shows what the

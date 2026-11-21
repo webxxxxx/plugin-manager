@@ -236,12 +236,18 @@ pub fn generated(settings: &Settings) -> String {
          # max_json_body_bytes = 65536 / 262144 / 1048576\n\
          # max_complete_body_bytes = 65536 / 1048576 / 2097152\n\
          # max_header_bytes = 8192 / 16384 / 65536\n\
-         # max_streams = 8 / 16 / 64\n\
+         # max_streams = 24 / 48 / 96\n\
          # stream_buffer_bytes = 8192 / 32768 / 131072\n\
-         # max_connections = 24 / 128 / 682\n\
-         # max_connections_per_ip = 6 / 32 / 170\n\
-         # max_subscriptions = 4 / 16 / 64\n\
-         # max_subscribers_per_plugin = 4 / 16 / 64\n\
+         # max_connections = 28 / 128 / 682\n\
+         # max_connections_per_ip = 16 / 32 / 64\n\
+         # max_subscriptions = 64 / 128 / 256\n\
+         # max_subscribers_per_plugin = 16 / 32 / 64\n\
+         # cpu_budget_percent = 0 (default; 0..100). 0 disables the governor.\n\
+         # Above 0 the daemon installs a kernel CPU cap when the host allows\n\
+         # it (Linux cgroup cpu.max, Windows job object CPU rate) and always\n\
+         # refuses new connections while its own measured use stays above\n\
+         # the target, so a small budget cannot starve the host. 90% is not\n\
+         # 90% of capacity: queueing delay there is about nine times idle.\n\
          # http_idle_timeout_secs = 30 / 60 / 120\n\
          # max_package_bytes = 8388608 / 67108864 / 536870912\n\
          # transfer_timeout_secs = 120 / 120 / 120\n\

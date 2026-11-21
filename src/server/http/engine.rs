@@ -212,6 +212,12 @@ pub trait LifecycleOps {
 
     /// Final drain before the loop returns. No further tick runs.
     fn on_stop(&mut self) {}
+
+    /// True when new connections must be refused for a while: the CPU budget
+    /// measured this process above its target.
+    fn should_shed(&self) -> bool {
+        false
+    }
 }
 
 /// Marker for a complete loop implementation. It adds no methods; the four
@@ -311,6 +317,10 @@ pub fn run<S, H>(
                 loop {
                     match listener.accept() {
                         Ok((stream, peer)) => {
+                            if handler.should_shed() {
+                                reject_connection(stream);
+                                continue;
+                            }
                             let ip = peer.ip();
                             let per_ip = connections.values().filter(|c| c.peer == ip).count();
                             if connections.len() >= limits.max_connections

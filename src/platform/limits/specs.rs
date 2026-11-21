@@ -198,7 +198,10 @@ pub(super) const MAX_HEADER: KeySpec = KeySpec::fixed(
     [8 * 1024, 16 * 1024, 64 * 1024],
 );
 
-pub(super) const MAX_STREAMS: KeySpec = KeySpec::fixed("max_streams", 1, 1024, [8, 16, 64]);
+/// Streams are cheap (one stream buffer each) and they are the realtime
+/// admission path, so the cap follows the subscriber cap rather than the
+/// connection count: a UI page holds one SSE plus one WS.
+pub(super) const MAX_STREAMS: KeySpec = KeySpec::fixed("max_streams", 1, 1024, [24, 48, 96]);
 
 pub(super) const STREAM_BUFFER: KeySpec = KeySpec::share(
     "stream_buffer_bytes",
@@ -218,20 +221,32 @@ pub(super) const MAX_CONNECTIONS: KeySpec = KeySpec::share(
     1,
     4096,
     [
-        Share::per(16 * MIB / 3),
+        // 4.5 MiB: at the 50 MiB budget this is 11 connections, which is one
+        // full-function worker per installed plugin for a ten-plugin host. The
+        // old 16 MiB/3 share stopped at 9 and could not serve ten plugins at
+        // single concurrency at all.
+        Share::per(4_718_592),
         Share::per(4 * MIB),
         Share::per(3 * MIB),
     ],
 );
 
 pub(super) const MAX_CONNECTIONS_PER_IP: KeySpec =
-    KeySpec::fixed("max_connections_per_ip", 1, 1024, [8, 32, 64]);
+    KeySpec::fixed("max_connections_per_ip", 1, 1024, [16, 32, 64]);
 
+/// One subscriber costs a cursor, not a queue: the bound lives in the single
+/// UI ring (see UI_RING_BYTES), so the count can follow the stream cap.
 pub(super) const MAX_SUBSCRIPTIONS: KeySpec =
-    KeySpec::fixed("max_subscriptions", 0, 4096, [4, 16, 64]);
+    KeySpec::fixed("max_subscriptions", 0, 4096, [64, 128, 256]);
 
 pub(super) const MAX_SUBSCRIBERS_PER_PLUGIN: KeySpec =
-    KeySpec::fixed("max_subscribers_per_plugin", 0, 1024, [4, 16, 64]);
+    KeySpec::fixed("max_subscribers_per_plugin", 0, 1024, [16, 32, 64]);
+
+/// Share of the machine's CPU the daemon may use. 0 disables the governor.
+/// Unlike the memory keys this is a live policy, not a reservation: the
+/// governor sheds new connections once its own measured use stays above it.
+pub(super) const CPU_BUDGET_PERCENT: KeySpec =
+    KeySpec::fixed("cpu_budget_percent", 0, 100, [0, 0, 0]);
 
 pub(super) const IDLE_TIMEOUT: KeySpec =
     KeySpec::fixed("http_idle_timeout_secs", 1, 3600, [30, 60, 120]);

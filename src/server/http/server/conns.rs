@@ -37,6 +37,12 @@ impl LifecycleOps for Server {
         self.control.drain_for_shutdown();
         self.client.close();
     }
+
+    fn should_shed(&self) -> bool {
+        self.governor
+            .as_ref()
+            .is_some_and(|governor| governor.should_shed())
+    }
 }
 
 impl Server {
