@@ -45,6 +45,23 @@ function log(message) {
   console.log('[perf] ' + message);
 }
 
+/// One hung client must fail the case instead of stalling the whole run. The
+/// case still owns its sockets and closes them in its own `finally`; this is
+/// the backstop that turns an unanswered await into a named failure.
+const CHECK_TIMEOUT_MS = 20000;
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise(function (_, reject) {
+    timer = setTimeout(function () {
+      reject(new Error(label + ': timed out after ' + ms + ' ms'));
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(function () {
+    clearTimeout(timer);
+  });
+}
+
 function runSync(file, args, env, cwd) {
   return execFileSync(file, args, {
     cwd: cwd || ROOT,
@@ -155,8 +172,10 @@ async function startDaemon(root) {
   mkdirSync(env.SVCD_DATA_DIR, { recursive: true });
   mkdirSync(env.SVCD_LOG_DIR, { recursive: true });
   copyFileSync(PUB, path.join(env.SVCD_TRUST_DIR, KEY_ID + '.pub'));
-  // Release builds reject `svc lan token rotate` for non-root; seed the token
-  // file before start instead. /mcp reads it even while LAN is disabled.
+  // Keep a management bearer seed for hosts that enable LAN auth. `/mcp`
+  // authenticates against `auth_passwd`, which is set after start through
+  // `svc lan passwd` (see `setMcpPassword`), so the seed is not the MCP
+  // credential.
   const token = randomBytes(32).toString('hex');
   writeFileSync(path.join(env.SVCD_CONFIG_DIR, 'lan-token'), token);
   const logPath = path.join(root, 'daemon.stderr');
@@ -169,7 +188,30 @@ async function startDaemon(root) {
   });
   child.on('exit', function () { try { closeSync(logFd); } catch (_) {} });
   const address = await waitForHttp(root);
-  return { child: child, env: env, address: address, logPath: logPath, token: token };
+  const daemon = { child: child, env: env, address: address, logPath: logPath, token: token };
+  daemon.password = await setMcpPassword(daemon);
+  return daemon;
+}
+
+/// `/mcp` validates the configured password hash, not the management bearer.
+/// Set it through the control channel after the socket exists; the control
+/// socket and HTTP bind finish together, but the CLI may briefly race them.
+async function setMcpPassword(daemon) {
+  const svc = ensureAlias('svc');
+  const password = 'perf-compat-password';
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    try {
+      runSync(svc, ['lan', 'passwd', password], daemon.env);
+      return password;
+    } catch (error) {
+      if (Date.now() >= deadline) {
+        const detail = (error && error.stderr) ? String(error.stderr).trim() : String(error && error.message);
+        throw new Error('svc lan passwd failed: ' + detail);
+      }
+      await new Promise(function (resolve) { setTimeout(resolve, 50); });
+    }
+  }
 }
 
 async function stopDaemon(daemon) {
@@ -263,6 +305,25 @@ async function installAndStart(daemon, packageBytes) {
   return { status: parseJson(status), install_ms: installMs, start_ms: startMs };
 }
 
+/// ADR-0010 moved the realtime endpoints behind a per-plugin token. Mint one
+/// through the management API and keep the returned base (ends in `/`) so
+/// `/ws`, `/events` and `/rpc` all use the same authenticated path.
+async function issueUiToken(daemon) {
+  const response = await httpRequest(
+    daemon.address,
+    'POST',
+    '/api/v1/plugins/perf/ui-token',
+    { 'content-length': '0' },
+    null,
+    10000,
+  );
+  assert.equal(response.status, 200, response.body.toString());
+  const body = parseJson(response);
+  assert.ok(body.url && body.token, 'ui-token response: ' + response.body.toString());
+  daemon.uiBase = body.url.endsWith('/') ? body.url : body.url + '/';
+  return daemon.uiBase;
+}
+
 function tokenFor(daemon) {
   const svc = ensureAlias('svc');
   const output = runSync(svc, ['lan', 'token', 'rotate'], daemon.env);
@@ -345,29 +406,55 @@ function wsCollector(socket) {
   };
 }
 
-async function sseRaw(address, lastEventId, trigger) {
-  const url = new URL('http://' + address + '/plugin-ui/perf/events');
+async function sseRaw(daemon, lastEventId, trigger) {
+  const url = new URL(uiHttpUrl(daemon, 'events'));
   return new Promise(function (resolve, reject) {
+    let settled = false;
+    function settle(fn, value) {
+      if (settled) return;
+      settled = true;
+      fn(value);
+    }
     const headers = { Accept: 'text/event-stream', Connection: 'close' };
     if (lastEventId !== undefined && lastEventId !== null) headers['Last-Event-ID'] = String(lastEventId);
     const request = http.request({ hostname: url.hostname, port: url.port, path: url.pathname, headers: headers }, function (response) {
+      if (response.statusCode !== 200) {
+        response.resume();
+        settle(reject, new Error('SSE handshake HTTP ' + response.statusCode));
+        return;
+      }
       let buffer = '';
       response.setEncoding('utf8');
       response.on('data', function (chunk) {
         buffer += chunk;
-        const blocks = buffer.split('\n\n');
-        if (blocks.length < 2) return;
-        const event = blocks[0];
-        const idMatch = event.match(/^id: (\d+)$/m);
-        const dataMatch = event.match(/^data: (.+)$/m);
-        if (dataMatch) {
+        let split;
+        while ((split = buffer.indexOf('\n\n')) >= 0) {
+          const event = buffer.slice(0, split);
+          buffer = buffer.slice(split + 2);
+          const idMatch = event.match(/^id: (\d+)$/m);
+          const dataMatch = event.match(/^data: (.*)$/m);
+          if (!dataMatch) continue;
+          let data;
+          try {
+            data = JSON.parse(dataMatch[1]);
+          } catch (error) {
+            settle(reject, new Error('SSE data is not JSON: ' + dataMatch[1]));
+            return;
+          }
           response.destroy();
-          resolve({ id: idMatch ? Number(idMatch[1]) : null, data: JSON.parse(dataMatch[1]) });
+          settle(resolve, { id: idMatch ? Number(idMatch[1]) : null, data: data });
+          return;
         }
       });
-      if (trigger) trigger().catch(reject);
+      response.on('end', function () {
+        settle(reject, new Error('SSE stream ended before an event'));
+      });
+      response.on('error', function (error) {
+        settle(reject, error);
+      });
+      if (trigger) trigger().catch(function (error) { settle(reject, error); });
     });
-    request.on('error', reject);
+    request.on('error', function (error) { settle(reject, error); });
     request.setTimeout(5000, function () { request.destroy(new Error('sse timeout')); });
     request.end();
   });
@@ -436,15 +523,25 @@ function rpcBody(name, id) {
   return JSON.stringify({ jsonrpc: '2.0', id: id || 1, method: 'tools/call', params: { name: name, arguments: {} } });
 }
 
+function uiHttpUrl(daemon, suffix) {
+  return 'http://' + daemon.address + daemon.uiBase + suffix;
+}
+
+function uiWsUrl(daemon, suffix) {
+  return 'ws://' + daemon.address + daemon.uiBase + suffix;
+}
+
 async function uiRpc(daemon, name, id) {
-  return httpRequest(daemon.address, 'POST', '/plugin-ui/perf/rpc', { 'content-type': 'application/json' }, rpcBody(name, id), 10000);
+  return httpRequest(daemon.address, 'POST', daemon.uiBase + 'rpc', { 'content-type': 'application/json' }, rpcBody(name, id), 10000);
 }
 
 async function runCompat(daemon, token) {
   const checks = [];
   async function check(name, fn) {
     try {
-      const detail = await fn();
+      // A client that never answers must fail this named case, not hang the
+      // process before the report is written.
+      const detail = await withTimeout(fn(), CHECK_TIMEOUT_MS, name);
       checks.push({ name: name, ok: true, detail: detail || '' });
       log('PASS ' + name);
     } catch (error) {
@@ -578,7 +675,7 @@ async function runCompat(daemon, token) {
   });
 
   await check('WebSocket tools/call + notification', async function () {
-    const socket = await wsOpen('ws://' + daemon.address + '/plugin-ui/perf/ws');
+    const socket = await wsOpen(uiWsUrl(daemon, 'ws'));
     try {
       const collector = wsCollector(socket);
       socket.send(JSON.stringify({ jsonrpc: '2.0', id: 21, method: 'tools/call', params: { name: 'perf.echo', arguments: {} } }));
@@ -593,7 +690,7 @@ async function runCompat(daemon, token) {
   });
 
   await check('WebSocket ping/pong and close', async function () {
-    const socket = await wsOpen('ws://' + daemon.address + '/plugin-ui/perf/ws');
+    const socket = await wsOpen(uiWsUrl(daemon, 'ws'));
     const pong = new Promise(function (resolve) { socket.once('pong', resolve); });
     socket.ping('compat');
     await Promise.race([pong, new Promise(function (_, reject) { setTimeout(function () { reject(new Error('pong timeout')); }, 3000); })]);
@@ -603,7 +700,7 @@ async function runCompat(daemon, token) {
   });
 
   await check('WebSocket fragmented text is reassembled', async function () {
-    const socket = await wsOpen('ws://' + daemon.address + '/plugin-ui/perf/ws');
+    const socket = await wsOpen(uiWsUrl(daemon, 'ws'));
     try {
       const collector = wsCollector(socket);
       const message = JSON.stringify({ jsonrpc: '2.0', id: 22, method: 'tools/call', params: { name: 'perf.echo', arguments: {} } });
@@ -619,7 +716,7 @@ async function runCompat(daemon, token) {
 
   await check('WebSocket cross-origin is rejected', async function () {
     try {
-      const socket = await wsOpen('ws://' + daemon.address + '/plugin-ui/perf/ws', { Origin: 'http://evil.example' });
+      const socket = await wsOpen(uiWsUrl(daemon, 'ws'), { Origin: 'http://evil.example' });
       socket.terminate();
       throw new Error('cross-origin handshake unexpectedly succeeded');
     } catch (error) {
@@ -628,7 +725,7 @@ async function runCompat(daemon, token) {
   });
 
   await check('WebSocket >1 MiB closes with 1009', async function () {
-    const socket = await wsOpen('ws://' + daemon.address + '/plugin-ui/perf/ws');
+    const socket = await wsOpen(uiWsUrl(daemon, 'ws'));
     const closed = new Promise(function (resolve) { socket.once('close', function (code) { resolve(code); }); });
     socket.send('x'.repeat(1024 * 1024 + 1));
     const code = await Promise.race([closed, new Promise(function (_, reject) { setTimeout(function () { reject(new Error('close timeout')); }, 5000); })]);
@@ -636,7 +733,7 @@ async function runCompat(daemon, token) {
   });
 
   await check('SSE EventSource receives notifications', async function () {
-    const source = new EventSource('http://' + daemon.address + '/plugin-ui/perf/events');
+    const source = new EventSource(uiHttpUrl(daemon, 'events'));
     try {
       await new Promise(function (resolve, reject) {
         const timer = setTimeout(function () { reject(new Error('sse open timeout')); }, 5000);
@@ -650,7 +747,8 @@ async function runCompat(daemon, token) {
           resolve(event);
         });
       });
-      await uiRpc(daemon, 'perf.echo', 31);
+      const call = await uiRpc(daemon, 'perf.echo', 31);
+      assert.equal(call.status, 200, call.body.toString());
       const event = await message;
       assert.ok(event.data.includes('notifications/message'));
       return 'id=' + event.lastEventId;
@@ -660,11 +758,11 @@ async function runCompat(daemon, token) {
   });
 
   await check('SSE Last-Event-ID replays a missed event', async function () {
-    const first = await sseRaw(daemon.address, null, function () { return uiRpc(daemon, 'perf.echo', 41); });
+    const first = await sseRaw(daemon, null, function () { return uiRpc(daemon, 'perf.echo', 41); });
     assert.ok(first.id > 0);
     const secondCall = await uiRpc(daemon, 'perf.echo', 42);
-    assert.equal(secondCall.status, 200);
-    const replayed = await sseRaw(daemon.address, first.id, null);
+    assert.equal(secondCall.status, 200, secondCall.body.toString());
+    const replayed = await sseRaw(daemon, first.id, null);
     assert.ok(replayed.id > first.id, 'expected replay after ' + first.id + ', got ' + replayed.id);
     return 'first=' + first.id + ' replay=' + replayed.id;
   });
@@ -727,7 +825,7 @@ async function benchWs(daemon, connections, perConnection) {
   await Promise.all(Array.from({ length: connections }, async function (_, connection) {
     let socket;
     try {
-      socket = await wsOpen('ws://' + daemon.address + '/plugin-ui/perf/ws');
+      socket = await wsOpen(uiWsUrl(daemon, 'ws'));
       const collector = wsCollector(socket);
       for (let index = 0; index < perConnection; index++) {
         const id = 10000 + connection * perConnection + index;
@@ -748,7 +846,7 @@ async function benchWs(daemon, connections, perConnection) {
 }
 
 async function benchSse(daemon, total) {
-  const source = new EventSource('http://' + daemon.address + '/plugin-ui/perf/events');
+  const source = new EventSource(uiHttpUrl(daemon, 'events'));
   let count = 0;
   const start = performance.now();
   try {
@@ -777,7 +875,7 @@ async function benchMixed(daemon, token, durationSeconds) {
   const latencies = { http: [], mcp: [], ws: [] };
   const ops = { http: 0, mcp: 0, ws: 0, sse: 0 };
   let errors = 0;
-  const source = new EventSource('http://' + daemon.address + '/plugin-ui/perf/events');
+  const source = new EventSource(uiHttpUrl(daemon, 'events'));
   await new Promise(function (resolve, reject) {
     const timer = setTimeout(function () { reject(new Error('sse open timeout')); }, 5000);
     source.onopen = function () { clearTimeout(timer); resolve(); };
@@ -809,7 +907,7 @@ async function benchMixed(daemon, token, durationSeconds) {
   async function wsWorker() {
     let socket;
     try {
-      socket = await wsOpen('ws://' + daemon.address + '/plugin-ui/perf/ws');
+      socket = await wsOpen(uiWsUrl(daemon, 'ws'));
       const collector = wsCollector(socket);
       let id = 40000;
       while (Date.now() < end) {
@@ -1238,6 +1336,7 @@ async function main() {
   const daemon = await startDaemon(root);
   const daemonMs = performance.now() - daemonStart;
   let token;
+  let compatFailed = false;
   let status;
   let bundle;
   try {
@@ -1248,7 +1347,11 @@ async function main() {
     status = installResult.status;
     const installMs = installResult.install_ms;
     const startMs = installResult.start_ms;
-    token = daemon.token;
+    // Mint the per-plugin realtime token only after the plugin's web assets
+    // are installed; WS, SSE and /rpc all ride this authenticated base.
+    await issueUiToken(daemon);
+    // /mcp authenticates against auth_passwd, set by setMcpPassword after start.
+    token = daemon.password;
     const pluginPid = status.summary && status.summary.pid ? status.summary.pid : null;
     const daemonPid = daemon.child.pid;
     const daemonBefore = processInfo(daemonPid);
@@ -1277,6 +1380,7 @@ async function main() {
       const failed = results.compat.filter(function (item) { return !item.ok; });
       log('compatibility: ' + (results.compat.length - failed.length) + '/' + results.compat.length + ' passed');
       if (failed.length > 0) {
+        compatFailed = true;
         for (const item of failed) log('FAIL ' + item.name + ': ' + item.detail);
       }
     }
@@ -1288,6 +1392,10 @@ async function main() {
     await stopDaemon(daemon);
     KEEP_ALIVE_AGENT.destroy();
   }
+  // A failed compatibility case is a failed run: CI and callers read the exit
+  // status, not just the log line. Force the exit so a client abandoned by the
+  // case timeout cannot keep the process alive.
+  if (compatFailed) process.exit(1);
 }
 
 main().catch(function (error) {
