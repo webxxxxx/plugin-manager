@@ -184,7 +184,7 @@ flowchart TB
 
 ## 性能
 
-数据来自 [docs/perf/](docs/perf/)，测试工具是 [tools/perf/budget_scenario.py](tools/perf/budget_scenario.py)：10–40 个全功能插件、invoke / SSE / WebSocket / upload / download 五面同时压，只认 100% 成功。
+数据来自 [docs/perf/](docs/perf/)，测试工具是 [tools/perf/budget_scenario.py](tools/perf/budget_scenario.py)（五面同时压）与 [tools/perf/ws_plugin_capacity.py](tools/perf/ws_plugin_capacity.py)（只开 WebSocket 一面），只认 100% 成功。
 
 ### 50 MB 预算能跑几个插件（容量阶梯）
 
@@ -205,6 +205,18 @@ flowchart TB
 | 2 GB | ≥26 | ≥1040 | 1274 | 208 / 858 ms | 客户端封顶，未压出上限 |
 
 回落点就在派生的 `max_connections` 附近（288 / 399 / 786），503 是准入拒绝，不是超时。
+
+### 只开 WebSocket 的插件：三档同时能跑多少个
+
+每个插件一条常驻 WS 连接、同一时刻一个在飞请求（单并发）：
+
+| 预算 | max_connections | 100% 成功的插件数 | 再上一个 | daemon RSS |
+| ---: | ---: | ---: | --- | ---: |
+| 50 MB | 288 | 288 | 289 个起 1 条 503 | 25.8 MB |
+| 512 MB | 399 | 399 | 400 个起 1 条 503 | 34.2 MB |
+| 2 GB | 786 | 786 | 787 个起 1 条 503 | 63.3 MB |
+
+一条连接就是一个名额，插件数就等于派生连接数；每插件在 daemon 里约 77 KB，插件进程自己的 3.4 MB（bash）不算在预算内。详见 [docs/perf/2026-11-21-ws-plugin-capacity.md](docs/perf/2026-11-21-ws-plugin-capacity.md)。
 
 ### 90% 可用内存 + interactive
 

@@ -132,6 +132,18 @@ PowerShell 7 and a release binary; they are **not** part of `run.mjs` or
   HTTP/1.1 keep-alive, so their numbers include connection reuse.
 - Numbers are machine-specific and intended for relative comparison and
   bottleneck discovery, not as production capacity claims.
+- `ws_plugin_capacity.py` answers the WebSocket-only question: every plugin
+  holds exactly one WS connection (`/plugin-ui/<id>/<token>/ws`) with a single
+  call in flight, so the plugin count that fits is the derived connection count.
+
+  ```sh
+  python3 tools/perf/ws_plugin_capacity.py --binary target/release/svcd \
+    --budget 50mb --plugins 288 --duration 20 --work /tmp/ws-288
+  ```
+
+  Exit code 0 means all N connected and every call answered; 2 means a refusal
+  or an error. `--fixture samples/spk-tests/ws-panel --capability status` drives
+  the packaged Python sample instead of the bash fixture.
 - `budget_scenario.py` requests an explicit `mem_budget_bytes` and drives every
   plugin through invoke (MCP `tools/call`), SSE, WebSocket, blob upload and blob
   download, then opens more streams than the budget admits to check that the
