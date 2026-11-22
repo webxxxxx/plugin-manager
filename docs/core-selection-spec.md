@@ -178,8 +178,8 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 - 验证顺序：读 manifest → 验签 → 校验 schema / platform / 路径 → 逐文件验 hash 后落盘；清单外条目直接拒；流式、逐文件可验。
 - `plugin verify <file.spk> [--json]` 只做包自身校验（清单 / 文件哈希 / 签名结构；不要求平台匹配、不要求 key 在 trust.d、不解析解释器），不落盘。`--json` 输出 `{ok, file, name, version, platform, schema, size, sha256, capabilities, compat, signature:{state,keyId,trusted}, host:{matchesHost,device,interpreter}, files}`；`ok` 只表示包自身完整，`signature.trusted` 与 `host.*` 是交给调用方判断的事实。`install` 仍走 `plugin::verify` 的严格策略，二者不共用“是否可安装”的结论。
 - 信任根：`<config>/trust.d/<keyId>.pub`（**PEM SPKI**）；未知 keyId 默认拒绝。未签名安装只由 `svcd.conf` 的 `allow_insecure_install` 控制：开启后安装路径先严格验签，失败才降级接受缺 `signature.json` 或未信任 key 的包，并在日志中标注未验签；CLI/HTTP/Web 都没有逐次 insecure 参数或勾选项。
-- 信任根只能由管理员显式添加：`svc trust list|add <file.pub>|remove <keyId>`，或 Web 控制台的 `POST /api/v1/trust?key_id=<id>` 上传；包内永不携带自己的信任根（自签自证没有意义）。
-- 当前没有编译期 store 公钥，商城/发布接入时内置；`SVCD_TRUST_DIR` 可覆盖 trust.d，供测试与非 root 开发。
+- 信任根由管理员管理：`svc trust list|add <file.pub>|remove <keyId>`，或 Web 控制台的 `POST /api/v1/trust?key_id=<id>` 上传；`svcd --install` 会写入内置的 store 发布钥，同名文件已存在时不覆盖。包内永不携带自己的信任根（自签自证没有意义）。
+- `svcd --install` 把内置的 store 发布公钥写到 `<config>/trust.d/signing.pub`；已存在的同名文件不覆盖，便于管理员轮换。`SVCD_TRUST_DIR` 可覆盖 trust.d，供测试与非 root 开发。
 - 不签整个 tar、不做分离 `.sig`、不只靠商城 TLS。
 
 ### 2.4 安装布局与策略
@@ -534,7 +534,8 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 - 2026-11-12（补）：脚本服务 drop-in——`services.d/<id>.sh|bat|cmd|ps1`，`start/stop/status` 参数入口；同 id JSON 优先；`.ps1` 走 ExecutionPolicy Bypass。
 - 2026-11-13（补）：脚本动作改为可选——脚本声明哪个动作，svcd 才调用哪个；缺 `start` 从头执行、缺 `stop` 由框架终止进程、`status` 只把 stdout 作为 `details.probe` 的细节补充。
 - 2026-11-13（补）：服务树即进程组——Unix 独立进程组、Windows per-service job object；组内任一进程存活即 `Running`，stop 终止整棵树。
-- 2026-11-13（补）：信任根可管理——`svc trust list|add|remove`、`GET/POST/DELETE /api/v1/trust`、Web 控制台上传 `.pub`；包内不携带信任根，编译期 store 公钥仍未内置。
+- 2026-11-13（补）：信任根可管理——`svc trust list|add|remove`、`GET/POST/DELETE /api/v1/trust`、Web 控制台上传 `.pub`；包内不携带信任根。
+- 2026-11-22（补）：安装器内置 store 发布钥，`svcd --install` 写入 `trust.d/signing.pub`；商城不再自己分发公钥。
 - 2026-11-13（补）：脚本插件——`schema: 2` 增加 `lifecycle` / `interpreter`；脚本 payload 必须声明解释器（版本可空），安装时解析并校验，运行时统一经解释器执行；core drop-in 脚本可原样加 manifest 转成 plugin；`plugin bundle --from-core` 自动生成 lifecycle；老 daemon 拒绝 schema 2。
 - 2026-11-17：控制通道删除 `svcd.token`，鉴权改为端点 ACL；本地两档由 `svcd` / `svcd-admin` 两个端点实施；C8 改为两端点各一条显式 protected DACL。
 

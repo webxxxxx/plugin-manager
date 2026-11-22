@@ -423,6 +423,28 @@ fn install_alias(source: &Path, target: &Path) -> io::Result<()> {
     }
 }
 
+/// The store's release key, embedded in the installer so a fresh svcd
+/// --install seeds <config>/trust.d/signing.pub before any package is
+/// installed. An existing file wins: the operator may have rotated the root.
+const STORE_KEY_ID: &str = "signing";
+const STORE_PUBLIC_KEY: &str = include_str!("../assets/signing.pub");
+
+/// Validate the embedded key, then write it unless the operator already put a
+/// key with the same id there. Returns the path written, or `None` when an
+/// existing file won.
+fn seed_store_trust(config_dir: &Path) -> Result<Option<PathBuf>, String> {
+    crate::manage::validate_public_key(STORE_PUBLIC_KEY.as_bytes())
+        .map_err(|error| format!("embedded store key is invalid: {}", error))?;
+    let target = config_dir
+        .join("trust.d")
+        .join(format!("{STORE_KEY_ID}.pub"));
+    if target.exists() {
+        return Ok(None);
+    }
+    write_file(&target, STORE_PUBLIC_KEY, 0o644)?;
+    Ok(Some(target))
+}
+
 fn write_file(path: &Path, content: &str, mode: u32) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -758,5 +780,36 @@ mod tests {
 
         let error = execute(&plan).expect_err("assertion fails");
         assert!(error.contains("Type=notify"), "{}", error);
+    }
+
+    #[test]
+    fn store_trust_key_is_seeded_once() {
+        let directory = TempDir::new();
+        let key = directory.0.join("trust.d").join("signing.pub");
+        assert_eq!(
+            seed_store_trust(&directory.0).expect("seed"),
+            Some(key.clone())
+        );
+        assert_eq!(
+            fs::read_to_string(&key).expect("read key"),
+            STORE_PUBLIC_KEY
+        );
+        assert_eq!(seed_store_trust(&directory.0).expect("second seed"), None);
+    }
+
+    #[test]
+    fn an_existing_store_key_is_not_overwritten() {
+        let directory = TempDir::new();
+        seed_store_trust(&directory.0).expect("seed");
+        let key = directory.0.join("trust.d").join("signing.pub");
+        fs::write(&key, "operator key").expect("replace key");
+        assert_eq!(seed_store_trust(&directory.0).expect("keep existing"), None);
+        assert_eq!(fs::read_to_string(&key).expect("read key"), "operator key");
+    }
+
+    #[test]
+    fn the_embedded_store_key_is_an_ed25519_spki() {
+        crate::manage::validate_public_key(STORE_PUBLIC_KEY.as_bytes())
+            .expect("the embedded store key must parse");
     }
 }

@@ -75,14 +75,16 @@ svcd status
 
 ### 装第一个插件
 
+`svcd --install` 会把插件商店的发布公钥写到 `<config>/trust.d/signing.pub`；装商店里的包不需要再手动 `svc trust add`。自己签的包仍然要加自己的公钥：
+
 ```sh
-svc trust add my-key.pub        # 信任签名公钥（一次）
+svc trust add my-key.pub        # 信任自己的签名公钥（一次）
 plugin install demo-1.0.0.spk
 svc start demo
 svc list
 ```
 
-> **注意：还没有官方插件商城，也就没有对外颁发的受信公钥。** `svc trust add` 只能加你自己的公钥；
+> 目前还没有官方插件目录服务，只有发布钥这一把默认信任根。
 > 要装**未签名**的 `.spk`（自己用 `plugin bundle --unsigned` 打的、或从源码构建的样例包），
 > 先在本机配置里打开开关，再重启 daemon：
 >
@@ -94,7 +96,7 @@ svc list
 > 它只影响「验签」这一步：有签名的包照常验签，未签名的包才走回退接受；结构校验（manifest、平台三元组、
 > 路径、大小）不因此放松。开关关着时装未签名包会被直接拒绝（报 `signature.json must be the second entry`）。
 > 没有单次安装的命令行开关，控制台也不给这个选项——开关必须留在配置里，事后可查。装完记得改回 `false`；
-> 正式分发仍然应该签名，然后用 `svc trust add` 加信任根。
+> 正式分发仍然应该签名；商店发布钥已经由安装器写入 `trust.d`。
 
 然后在浏览器打开 `http://127.0.0.1:8787/`，用控制台点「打开」——控制台会现签一个 1 小时有效的插件 UI token，地址形如 `/plugin-ui/demo/<token>/`。
 
@@ -331,7 +333,7 @@ Windows 的差来自不变量为「每连接一条线程」记账（`request_sta
 | **集群** cluster | 方向，无票 | 决定服务在哪台机器上跑；对编排透明——编排只认契约，不知道背后是本机还是远程 | 契约的 `ImplRef` 只差一个远程 adapter；远程节点的注册、健康、调度、跨机调用都还没有 |
 | **AI agent** | 方向，无票 | 两层：① 运维 agent——查状态、启停、读日志、定位失败、按预算调整；② 按需求生成插件——产出 manifest + payload，签好名再走安装 | ① 的地基已经在了：`/mcp`（modern Streamable HTTP）已暴露 `tools/list`、`tools/call` 和每个服务的 `<id>.start`，接一个 agent 就能用；② 的地基是 `plugin verify` + `plugin install` 的校验链 |
 | **插件 GUI** | 部分有票 [#41](https://github.com/webxxxxx/plugin-manager/issues/41) | 插件自带的状态面板、配置表单、能力调用界面；桌面侧用 WebView 窗口承载 | web 侧已实现：`.spk` 里的 `ui: {type: web, entry}` 由 daemon 托管在 `/plugin-ui/{id}/{token}/`，SSE / WebSocket / rpc 都通，浏览器侧 toolkit 在 [plugins/sdk/web](https://github.com/webxxxxx/plugins)；桌面 `svc ui` 只定了入口，内容还没定（#41） |
-| **插件商城** | 方向，无票 | 按 `platform` 三元组过滤、签名分发、更新与审核；桌面/网页都能逛 | 分发地基齐了：`.spk` 签名 + `svc trust` 信任根 + `plugin verify` / `export` / `bundle` + 全三元组平台校验；缺目录服务、元数据、更新协议与内置 store 公钥 |
+| **插件商城** | 方向，无票 | 按 `platform` 三元组过滤、签名分发、更新与审核；桌面/网页都能逛 | 分发地基齐了：`.spk` 签名 + `svc trust` 信任根 + `plugin verify` / `export` / `bundle` + 全三元组平台校验；缺目录服务、元数据与更新协议 |
 | **OpenWrt ipk → spk** | 方向，无票 | 把 OpenWrt 的 opkg/apk 包转成 `.spk`：`depends` → `dependencies`、init 脚本 → `lifecycle`、架构 → `platform` 三元组，让现有插件生态能直接装 | `.spk` 就是 ustar tar + manifest，`plugin verify` 已能独立做结构校验；嵌入式发行（svcd 自己打成 ipk/apk、targets.toml、overlay 约束）在 [#43](https://github.com/webxxxxx/plugin-manager/issues/43)，与这个转换器是两件事 |
 
 建议的先后顺序（判断，不是既定计划）：

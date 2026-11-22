@@ -109,6 +109,7 @@ pub fn self_install(args: &[String]) -> i32 {
         println!("install {} -> {}", current.display(), target.display());
         println!("  aliases: {}", alias_names().join(", "));
         println!("  config:  {}", runtime.config.display());
+        println!("  trust:   {}", runtime.config.join("trust.d").display());
         println!("  data:    {}", runtime.data.display());
         println!("  logs:    {}", runtime.logs.display());
         if prepared.is_some() {
@@ -193,6 +194,15 @@ pub fn self_install(args: &[String]) -> i32 {
         for warning in crate::platform::config_file::update_filled(&conf_path, &settings, &missing)
         {
             eprintln!("svcd: warning: {}", warning);
+        }
+    }
+
+    match seed_store_trust(&runtime.config) {
+        Ok(Some(path)) => println!("  store key: {}", path.display()),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("svcd: cannot seed store trust root: {}", error);
+            return EXIT_ERROR;
         }
     }
 
@@ -328,6 +338,7 @@ fn self_install_user(request: SelfRequest) -> i32 {
         println!("install {} -> {}", current.display(), target.display());
         println!("  aliases: {}", alias_names().join(", "));
         println!("  config:  {}", runtime.config.display());
+        println!("  trust:   {}", runtime.config.join("trust.d").display());
         println!("  data:    {}", runtime.data.display());
         println!("  logs:    {}", runtime.logs.display());
         if let Some(path) = &request.conf {
@@ -402,6 +413,15 @@ fn self_install_user(request: SelfRequest) -> i32 {
         for warning in crate::platform::config_file::update_filled(&conf_path, &settings, &missing)
         {
             eprintln!("svcd: warning: {}", warning);
+        }
+    }
+
+    match seed_store_trust(&runtime.config) {
+        Ok(Some(path)) => println!("  store key: {}", path.display()),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("svcd: cannot seed store trust root: {}", error);
+            return EXIT_ERROR;
         }
     }
 
