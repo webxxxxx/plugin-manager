@@ -72,6 +72,10 @@ const RAW_BUFFER_SHRINK: usize = 64 * 1024;
 /// fast producer from holding the queue lock or starving other sources.
 #[cfg(unix)]
 const RAW_WRITE_BUDGET: usize = 256 * 1024;
+/// Longest wait when a source is paused on a full consumer queue. The paused
+/// source is retried on the next pass, so neither backend may sit out the
+/// caller's full timeout; both use this constant so the resume latency matches.
+const BLOCKED_RETRY: Duration = Duration::from_millis(10);
 
 pub struct Reactor {
     tx: Sender<Command>,
@@ -199,7 +203,7 @@ impl RawOutQueue {
 
     /// Queue one complete frame (header + payload) for the plugin's stdin.
     pub fn push(&self, frame: Vec<u8>) -> Result<(), RawFailure> {
-        let was_empty = {
+        let idle = {
             let mut state = self.state.lock().map_err(|_| RawFailure::WriterClosed)?;
             if state.frames.len() >= self.capacity {
                 return Err(RawFailure::WriterQueueFull);
@@ -210,7 +214,7 @@ impl RawOutQueue {
         };
         // Only the idle -> busy transition needs a wake-up: otherwise the host
         // is already writing this queue.
-        if was_empty {
+        if idle {
             (self.wake)();
         }
         Ok(())

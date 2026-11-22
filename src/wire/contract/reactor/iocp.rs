@@ -16,7 +16,7 @@ use std::io;
 use std::os::windows::io::AsRawHandle;
 use std::ptr;
 use std::sync::mpsc::Receiver;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED,
@@ -43,9 +43,6 @@ pub(super) struct IocpSet {
     /// `Vec` reallocation must not move a slot while operations are pending.
     #[allow(clippy::vec_box)]
     slots: Vec<Box<Slot>>,
-    /// Plugin keys whose transport failure was already reported. One stop can
-    /// cover three sources; the hub hears it once.
-    reported: HashSet<String>,
 }
 
 struct Slot {
@@ -91,7 +88,6 @@ impl IocpSet {
                 port,
                 rx,
                 slots: Vec::new(),
-                reported: HashSet::new(),
             },
             interrupt,
         ))
@@ -127,6 +123,14 @@ impl IocpSet {
         self.retire_stopped();
         self.pump();
 
+        // A blocked source is retried on the next pass, so its wait must not
+        // run the caller's full timeout; Unix caps the same wait with the same
+        // constant in the readiness backend.
+        let timeout = if self.blocked_any() {
+            timeout.min(super::BLOCKED_RETRY)
+        } else {
+            timeout
+        };
         let timeout_ms = if timeout.is_zero() {
             0
         } else {
@@ -503,7 +507,17 @@ impl IocpSet {
         self.retire_stopped();
     }
 
+    fn blocked_any(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| !slot.retire && slot.source.as_ref().is_some_and(|source| source.blocked))
+    }
+
     fn retire_stopped(&mut self) {
+        // One stop can cover every pipe a plugin owns, so the report is
+        // deduplicated within this pass only: a plugin that restarts with the
+        // same key must report its next transport failure too.
+        let mut reported = HashSet::new();
         for index in 0..self.slots.len() {
             if self.slots[index].retire {
                 continue;
@@ -513,13 +527,13 @@ impl IocpSet {
                 .as_ref()
                 .is_some_and(|source| source.stop.is_some());
             if stopped {
-                self.retire_slot(index);
+                self.retire_slot(index, &mut reported);
             }
         }
         self.retire_done();
     }
 
-    fn retire_slot(&mut self, index: usize) {
+    fn retire_slot(&mut self, index: usize, reported: &mut HashSet<String>) {
         let slot = &mut self.slots[index];
         if slot.retire {
             return;
@@ -533,7 +547,7 @@ impl IocpSet {
         let Some((key, hub, reason)) = closing else {
             return;
         };
-        if self.reported.insert(key.clone()) {
+        if reported.insert(key.clone()) {
             report_closing(&key, &hub, reason);
         }
         // One plugin's transport covers every pipe it owns.
@@ -565,6 +579,48 @@ impl IocpSet {
             }
         }
     }
+
+    /// Dequeue every cancelled operation so no OVERLAPPED outlives its slot.
+    ///
+    /// Bounded on purpose: a driver that never completes a cancelled operation
+    /// must not hang daemon shutdown. A timeout is logged; the caller closes
+    /// the handles right after, which is the only remaining way to stop it.
+    fn drain_pending(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.slots.iter().any(|slot| slot.pending > 0) {
+            let now = Instant::now();
+            if now >= deadline {
+                let left: usize = self.slots.iter().map(|slot| slot.pending).sum();
+                error!("reactor IOCP shutdown left {} operations pending", left);
+                return;
+            }
+            let wait = (deadline - now).min(Duration::from_millis(100));
+            let timeout_ms = u32::try_from(wait.as_millis()).unwrap_or(100);
+            // SAFETY: an all-zero OVERLAPPED_ENTRY is valid (integers and
+            // pointers) and the array is live for the call below.
+            let mut entries: [OVERLAPPED_ENTRY; 64] = unsafe { std::mem::zeroed() };
+            let mut count = 0u32;
+            // SAFETY: the port is live, the array holds 64 writable entries and
+            // the count pointer is a valid out-pointer.
+            let ok = unsafe {
+                GetQueuedCompletionStatusEx(
+                    self.port,
+                    entries.as_mut_ptr(),
+                    entries.len() as u32,
+                    &mut count,
+                    timeout_ms,
+                    0,
+                )
+            };
+            if ok == 0 {
+                continue;
+            }
+            for entry in entries.iter().take(count as usize) {
+                self.complete(entry.lpCompletionKey, entry.lpOverlapped);
+            }
+            self.retire_done();
+        }
+    }
 }
 
 // SAFETY: every field is only touched while the reactor's mutex is held (or at
@@ -583,10 +639,17 @@ fn cancel(handle: &HANDLE) {
 
 impl Drop for IocpSet {
     fn drop(&mut self) {
-        for slot in &self.slots {
+        for slot in &mut self.slots {
+            slot.retire = true;
             cancel(&slot.handle);
         }
-        // SAFETY: the port is owned by this backend and the loop is gone.
+        // Cancellation is asynchronous: the completion packet and the
+        // OVERLAPPED it carries still belong to the kernel until it is
+        // dequeued. Closing the port first would free the slot and its buffer
+        // underneath an operation that is still writing into them.
+        self.drain_pending();
+        // SAFETY: the port is owned by this backend, the loop is gone and every
+        // issued operation has completed, so no slot is referenced any more.
         unsafe {
             let _ = windows_sys::Win32::Foundation::CloseHandle(self.port);
         }
@@ -633,10 +696,16 @@ mod tests {
     #[derive(Default)]
     struct TestSink {
         delivered: Mutex<Vec<(String, u32, Vec<u8>)>>,
+        failures: Mutex<Vec<(RawFailure, String)>>,
     }
 
     impl RawStopSink for TestSink {
-        fn note_transport_failure(&self, _failure: RawFailure, _plugin: &str) {}
+        fn note_transport_failure(&self, failure: RawFailure, plugin: &str) {
+            self.failures
+                .lock()
+                .expect("sink")
+                .push((failure, plugin.to_string()));
+        }
         fn unregister_generation(&self, _id: &str, _generation: u64) {}
         fn deliver(&self, id: &str, stream: u32, payload: Vec<u8>) {
             self.delivered
@@ -714,6 +783,129 @@ mod tests {
             }
             drop(delivered);
             assert!(Instant::now() < deadline, "stdout frame never arrived");
+        }
+    }
+
+    /// A stopped plugin still owns every operation the kernel has not finished.
+    /// The slot (and the pipe handle inside it) must survive until the cancel
+    /// completion is dequeued, so nothing frees a buffer mid-write.
+    #[test]
+    fn a_stopped_source_keeps_its_slot_until_the_cancelled_io_completes() {
+        use std::io::Read;
+
+        let (mut child_read, parent_write) =
+            crate::wire::contract::stdio::test_write_pipe().expect("stdin pair");
+        let (parent_read, _child_write) =
+            crate::wire::contract::stdio::test_pipe().expect("stdout pair");
+        let sink = Arc::new(TestSink::default());
+        let dyn_sink: Arc<dyn RawStopSink> = sink;
+        let weak = Arc::downgrade(&dyn_sink);
+        let reactor = Reactor::start().expect("reactor");
+        let queue = reactor
+            .register_raw(
+                "demo".into(),
+                parent_write,
+                parent_read.into_file(),
+                None,
+                None,
+                weak,
+                1,
+                1024,
+                4,
+            )
+            .expect("register");
+        queue.push(vec![1, 2, 3]).expect("push");
+        reactor.poll_once(Duration::ZERO);
+        {
+            let backend = reactor.backend.lock().expect("backend");
+            assert_eq!(backend.slots.len(), 2, "both pipes are registered");
+            let stdout = backend
+                .slots
+                .iter()
+                .find(|slot| {
+                    matches!(
+                        slot.source.as_ref().map(|source| &source.kind),
+                        Some(SourceKind::RawStdout { .. })
+                    )
+                })
+                .expect("stdout slot");
+            assert!(
+                stdout.read.is_some() && stdout.pending > 0,
+                "the child wrote nothing, so the stdout read must still be pending"
+            );
+        }
+
+        reactor.unregister("demo");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            reactor.poll_once(Duration::from_millis(20));
+            if reactor.backend.lock().expect("backend").slots.is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "cancelled slots never drained");
+        }
+
+        // The parent end lived in the slot: once the slot is gone its handle is
+        // closed, so the child side reaches EOF instead of staying open.
+        let mut total = 0usize;
+        let mut buffer = [0u8; 8];
+        loop {
+            match child_read.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => total += read,
+                Err(error) => panic!("child read: {}", error),
+            }
+        }
+        assert!(total <= 3, "the cancelled write cannot duplicate bytes");
+    }
+
+    /// One stop reports once, but a plugin that restarts under the same key
+    /// must report its next failure: the report set is per stop, not per life.
+    #[test]
+    fn a_restarted_plugin_reports_its_next_transport_failure() {
+        let sink = Arc::new(TestSink::default());
+        let dyn_sink: Arc<dyn RawStopSink> = sink.clone();
+        let reactor = Reactor::start().expect("reactor");
+
+        for round in 0..2usize {
+            let (_child_read, parent_write) =
+                crate::wire::contract::stdio::test_write_pipe().expect("stdin pair");
+            let (parent_read, child_write) =
+                crate::wire::contract::stdio::test_pipe().expect("stdout pair");
+            let _queue = reactor
+                .register_raw(
+                    "demo".into(),
+                    parent_write,
+                    parent_read.into_file(),
+                    None,
+                    None,
+                    Arc::downgrade(&dyn_sink),
+                    1,
+                    1024,
+                    4,
+                )
+                .expect("register");
+            // The child exits: its stdout end closes and the parent read sees EOF.
+            drop(child_write);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                reactor.poll_once(Duration::from_millis(20));
+                if sink.failures.lock().expect("sink").len() > round {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "failure {} was never reported",
+                    round + 1
+                );
+            }
+        }
+
+        let failures = sink.failures.lock().expect("sink");
+        assert_eq!(failures.len(), 2, "each stop reports exactly once");
+        for (failure, plugin) in failures.iter() {
+            assert_eq!(*failure, RawFailure::PluginEof);
+            assert_eq!(plugin, "demo");
         }
     }
 }

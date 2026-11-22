@@ -114,7 +114,7 @@ impl PollSet {
         // A blocked source is retried on the next pass, so it must not wait for
         // the caller's full timeout. A caller that is already busy passes 0.
         let timeout_ms = if blocked_any {
-            timeout_ms.min(10)
+            timeout_ms.min(super::BLOCKED_RETRY.as_millis() as i32)
         } else {
             timeout_ms
         };
