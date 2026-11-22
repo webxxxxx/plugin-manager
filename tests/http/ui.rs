@@ -24,9 +24,19 @@ fn serves_the_embedded_console() {
         html.contains("/api/v1/services"),
         "console does not call the management API"
     );
+    // The trust upload moved into the ⋮ menu after 退出; there is no direct
+    // toolbar button any more.
+    assert!(
+        !html.contains("上传公钥"),
+        "the trust upload must stay out of the toolbar"
+    );
+    assert!(
+        html.contains("id=\"morebtn\"") && html.contains("aria-haspopup=\"menu\""),
+        "console missing the overflow menu"
+    );
     for needle in [
         "上传安装",
-        "上传公钥",
+        "添加公钥",
         "自动刷新（3s）",
         "hasConfig",
         "hasUI",

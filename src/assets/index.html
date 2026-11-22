@@ -17,6 +17,12 @@
   button.ghost { background:#fff; color:var(--blue); }
   button.danger { border-color:#d9534f; background:#d9534f; }
   button:disabled { opacity:.5; cursor:not-allowed; }
+  .menu-wrap { position:relative; display:inline-flex; }
+  .menu-btn { padding:5px 10px; font-size:18px; line-height:1; }
+  .menu { position:absolute; right:0; top:calc(100% + 6px); min-width:150px; background:#fff; border:1px solid var(--line); border-radius:6px; box-shadow:0 8px 24px rgba(0,0,0,.14); padding:4px; z-index:1001; }
+  .menu button { display:block; width:100%; text-align:left; border:0; background:#fff; color:var(--text); padding:8px 12px; border-radius:4px; font-size:13px; }
+  .menu button:hover { background:#f0f5fb; }
+  button#morebtn { border: none; }
   input[type=password], input[type=text], select { border:1px solid var(--line); border-radius:4px; padding:6px 10px; font-size:13px; }
   table { width:100%; border-collapse:collapse; }
   th, td { text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); font-size:13px; vertical-align:middle; }
@@ -75,9 +81,14 @@
     <div class="card">
       <div class="row">
         <h1 class="grow" style="margin:0">svcd 控制台</h1>
-        <button class="ghost" onclick="pickTrust()">上传公钥</button>
         <button class="ghost" onclick="load()">刷新</button>
         <button class="ghost" onclick="logout()">退出</button>
+        <span class="menu-wrap">
+          <button class="ghost menu-btn" id="morebtn" onclick="toggleMore(event)" aria-haspopup="menu" aria-expanded="false" aria-label="更多操作" title="更多">⋮</button>
+          <div class="menu hidden" id="moremenu" role="menu">
+            <button role="menuitem" onclick="pickTrust()">添加公钥</button>
+          </div>
+        </span>
       </div>
       <p class="muted" style="margin:8px 0 0">管理本机插件：安装、启停、自启、配置、日志、导出。</p>
     </div>
@@ -123,7 +134,22 @@ const RETURN_TO = safeReturnTo(new URLSearchParams(location.search).get('next'))
 function $(id) { return document.getElementById(id); }
 
 function pickInstall() { if (!BUSY) $('file').click(); }
-function pickTrust() { if (!BUSY) $('trustfile').click(); }
+function pickTrust() { closeMore(); if (!BUSY) $('trustfile').click(); }
+
+function toggleMore(event) {
+  if (event) event.stopPropagation();
+  const menu = $('moremenu');
+  const open = menu.classList.contains('hidden');
+  menu.classList.toggle('hidden', !open);
+  $('morebtn').setAttribute('aria-expanded', String(open));
+}
+
+function closeMore() {
+  const menu = $('moremenu');
+  if (!menu || menu.classList.contains('hidden')) return;
+  menu.classList.add('hidden');
+  $('morebtn').setAttribute('aria-expanded', 'false');
+}
 
 async function openPluginUI(id) {
   if (BUSY) return;
@@ -615,6 +641,12 @@ function exportPlugin(id, kind) {
 
 $('file').addEventListener('change', install);
 $('trustfile').addEventListener('change', addTrust);
+document.addEventListener('click', function (event) {
+  if (!event.target.closest('.menu-wrap')) closeMore();
+});
+document.addEventListener('keydown', function (event) {
+  if (event.key === 'Escape') closeMore();
+});
 boot();
 </script>
 </body>

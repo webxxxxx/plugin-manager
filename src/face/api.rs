@@ -28,7 +28,7 @@ use super::reply::{
 };
 use super::routes::{self, Endpoint};
 
-const UI: &str = include_str!("../web/index.html");
+const UI: &str = include_str!("../assets/index.html");
 
 use super::blob;
 use super::export;
