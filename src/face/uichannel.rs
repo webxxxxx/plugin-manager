@@ -286,7 +286,7 @@ impl EventBus {
         // The subscriber's handler is serviced by the connection driver, which
         // otherwise only looks at the bus on its poll deadline. Waking it here
         // turns a delivered event into one loop iteration instead of one
-        // cadence period; without a wake (thread driver) nothing changes.
+        // cadence period; without a wake the event waits for that deadline.
         if watching {
             self.wake();
         }

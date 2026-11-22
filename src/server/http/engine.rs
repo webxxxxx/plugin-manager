@@ -4,8 +4,7 @@
 //!
 //! The loop runs on both hosts: Unix waits with `poll(2)` and Windows with
 //! `WSAPoll` over the same non-blocking sockets (see `platform/host/poll`).
-//! Neither host runs a thread per connection; the thread driver in
-//! `conn/threaded.rs` stays only as the seam for a host with no wait set.
+//! Neither host runs a thread per connection (ADR-0027).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -74,8 +73,8 @@ pub struct Connection<S> {
     pub head_only: bool,
     pub pending: Option<PendingRequest>,
     /// The handler took the socket out of the loop (a Windows MCP SSE response
-    /// runs on its own thread, matching the thread driver's budget). The loop
-    /// drops its entry without closing the socket.
+    /// runs on its own thread, bounded by `max_streams`). The loop drops its
+    /// entry without closing the socket.
     pub handed_off: bool,
     pub state: S,
 }

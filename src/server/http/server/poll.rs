@@ -194,8 +194,8 @@ impl ConnectionOps for Server {
                     }
                     // Windows has no wait-set integration for the named-pipe
                     // control stream, so the blocking SSE response runs on its
-                    // own thread (the same code the thread driver uses). The
-                    // loop hands the socket over and stops touching it.
+                    // own thread. The loop hands the socket over and stops
+                    // touching it.
                     #[cfg(not(unix))]
                     {
                         match crate::server::mcp::fallback::spawn_mcp_sse(

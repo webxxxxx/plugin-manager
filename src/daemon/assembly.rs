@@ -66,8 +66,8 @@ pub(super) fn spawn_http(
     }
     let require_auth = !bind.ip().is_loopback();
     let mut state = Lan::new(bind, requested, require_auth, password_hash);
-    // A failed bind disables HTTP only: the Unix loop still serves the CLI,
-    // and the thread driver reports the same failure through `entry::start`.
+    // A failed bind disables HTTP only: the control channel still serves the
+    // CLI, so the daemon stays manageable.
     let listener = match TcpListener::bind(bind) {
         Ok(listener) => match listener.local_addr() {
             Ok(local) => {

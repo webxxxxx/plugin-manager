@@ -1,36 +1,17 @@
 //! Kernel-assisted transfers where the platform provides them.
 //!
 //! The Unix server loop uses `try_send_file_range` after a stream handler asks
-//! for a file send; the Windows thread fallback uses the blocking
-//! `send_file_range`. Callers keep a read/write path for platforms without an
+//! for a file send. Callers keep a read/write path for platforms without an
 //! incremental kernel call, so embedded targets and unusual sockets still
 //! work.
 
 use std::fs::File;
 use std::io;
-#[cfg(windows)]
-use std::io::{Seek, SeekFrom};
 use std::net::TcpStream;
-
-/// Blockingly send exactly `length` bytes from `file` at `offset` to
-/// `stream`. Only the Windows per-connection fallback uses this; the Unix loop
-/// must never block and uses `try_send_file_range` instead.
-#[cfg(windows)]
-pub fn send_file_range(
-    file: &mut File,
-    stream: &mut TcpStream,
-    offset: u64,
-    length: u64,
-) -> io::Result<bool> {
-    if length == 0 {
-        return Ok(true);
-    }
-    windows_transmit_file(file, stream, offset, length)
-}
 
 /// One step of a non-blocking kernel file send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(unix), allow(dead_code))] // the Windows fallback sends blocking.
+#[cfg_attr(not(unix), allow(dead_code))] // used by the Unix server loop.
 pub enum FileSendProgress {
     /// Some bytes went out; the caller retries from the new offset.
     Sent(u64),
@@ -103,42 +84,4 @@ fn linux_try_sendfile(
     } else {
         Ok(FileSendProgress::Sent(sent))
     }
-}
-
-#[cfg(windows)]
-fn windows_transmit_file(
-    file: &mut File,
-    stream: &mut TcpStream,
-    offset: u64,
-    length: u64,
-) -> io::Result<bool> {
-    use std::os::windows::io::{AsRawHandle, AsRawSocket};
-    use windows_sys::Win32::Networking::WinSock::TransmitFile;
-
-    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-    let socket = stream.as_raw_socket() as windows_sys::Win32::Networking::WinSock::SOCKET;
-    let mut position = offset;
-    let mut remaining = length;
-    while remaining > 0 {
-        file.seek(SeekFrom::Start(position))?;
-        let chunk = std::cmp::min(remaining, u32::MAX as u64) as u32;
-        // SAFETY: The file descriptor and offset come from the live download stream; the kernel validates the range.
-        let sent = unsafe {
-            TransmitFile(
-                socket,
-                handle,
-                chunk,
-                0,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                0,
-            )
-        };
-        if sent == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        position += chunk as u64;
-        remaining -= chunk as u64;
-    }
-    Ok(true)
 }

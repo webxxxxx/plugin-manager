@@ -75,12 +75,6 @@ impl JobBudget {
         JobBudget { cancel, deadline }
     }
 
-    /// The Windows inline fallback owns the connection thread, so it has no
-    /// disconnect signal to flip; the deadline still bounds a stuck round trip.
-    pub fn for_fallback(timeout: std::time::Duration) -> JobBudget {
-        JobBudget::at(CancelToken::never(), Instant::now() + timeout)
-    }
-
     /// A clean budget for a handler unit test that drives the job inline.
     #[cfg(test)]
     pub fn for_test() -> JobBudget {
@@ -102,8 +96,7 @@ pub enum BlockingOutcome {
     Ok(Vec<u8>),
     /// The queue refused the job before it ran: a full pool, a connection that
     /// already owns a job, or a shutdown. Retryable backpressure, not a job
-    /// failure. Only the Unix server loop owns a pool; the thread driver has
-    /// no queue to refuse into.
+    /// failure. A host without a blocking pool has no queue to refuse into.
     #[cfg_attr(not(unix), allow(dead_code))]
     Busy,
     /// The job ran and failed. The status was decided where the failure was
