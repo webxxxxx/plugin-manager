@@ -369,10 +369,12 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 ### 5.4 logs
 
 - 落点：`<logs>/<id>.log`；svcd 自身 `svcd.log`；hooks `<id>-hooks.log`。
-- 轮转：1 MiB × 3（`.log`、`.log.1`、`.log.2`），丢最旧，不压缩，不引 logrotate。
+- 行形状：`<RFC3339 UTC 毫秒> <LEVEL 5> <source> <message>`；source 为 `svcd` / `plugin:<id>` / `hook:<id>`，消息内 CR/LF 落成字面 `\\n`（ADR-0022）。
+- 级别：`error` / `warn` / `info` / `debug` / `trace`，默认 `info`；低于阈值的行在写侧丢弃、不落盘。`log_level` 配置，非法值启动即错；`log = off` 关掉全部日志（文件与 stderr）。
+- 轮转：64 KiB × 3（`.log`、`.log.1`、`.log.2`），丢最旧，不压缩，不引 logrotate；`log_max_bytes` 仍可覆盖。
 - 权限：0640 root:svcd；`svcd` 组只读；插件 stdout/stderr 由 svcd 捕获后写，插件不能改。
-- `svc logs <id> [--follow] [--lines N]`；组可读；不做远程 syslog、不做 JSON lines。
-- 嵌入式同一策略，`/var` 落 overlay，1 MiB × 3 控制 flash 写放大；掉电丢当前缓冲可接受。
+- `svc logs <id> [--follow|-f] [--lines N] [--level L]`；`svc logs --all` 按时间戳合并日志文件；组可读；不做远程 syslog、不做 JSON lines。老格式行原样透出、不参与级别过滤。
+- 嵌入式同一策略，`/var` 落 overlay，64 KiB × 3 控制 flash 写放大；掉电丢当前缓冲可接受。
 - 不做日志汇聚、远程推送、journald / Event Log 双写。
 
 ## 6. 安全与权限

@@ -12,7 +12,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::platform::host::threads as host_threads;
-use crate::platform::log;
 use crate::server::http::conn::{ConnectionDriver, ServerHandle, StartInput};
 use crate::server::http::thread_loop::{admission, serve, Connection};
 
@@ -64,7 +63,7 @@ impl ConnectionDriver for Driver {
                 )
             });
         if let Err(error) = spawned {
-            log::svcd(&format!("svcd: HTTP listener thread failed: {}", error));
+            error!("HTTP listener thread failed: {}", error);
         }
         Ok(ServerHandle::thread(stop))
     }

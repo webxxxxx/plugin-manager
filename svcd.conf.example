@@ -83,6 +83,9 @@ bind = 127.0.0.1:8787
 # used only when the file does not name it.
 # `log_max_bytes` is the rotation threshold for one file; `log_rotations` is
 # how many old files are kept. `log_to_file = off` keeps stderr/syslog only.
+# `log_level` is the minimum level written anywhere: error, warn, info (the
+# default), debug or trace. A lower level is dropped before it reaches a file.
+# `log = off` is the master switch: no log file and no stderr at all.
 #
 # ---------------------------------------------------------------------------
 # Memory budget, workload shape and derived limits (#161)
@@ -256,6 +259,8 @@ bind = 127.0.0.1:8787
 # log_max_bytes = 65536
 # log_rotations = 3
 # log_to_file = on
+# log_level = info
+# log = on
 # mem_budget_bytes = auto
 # workload = interactive
 # cpu_budget_percent = 0

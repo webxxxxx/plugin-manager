@@ -17,7 +17,7 @@ use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::manage as package;
 use crate::manage as plugin;
 use crate::platform::config::Config;
-use crate::platform::log;
+use crate::platform::log::{self, Level};
 use crate::server::auth::lan::{self, AuthKind, Lan};
 use crate::server::http::model as http;
 use crate::server::http::{Completion, Exchange, Face, Request, Response, Route};
@@ -384,13 +384,32 @@ impl ApiFace {
                 }
             },
         };
+        let level = match support::query_value(query, "level") {
+            None => None,
+            Some(value) => match Level::parse(&value) {
+                Some(level) => Some(level),
+                None => {
+                    return error_response(
+                        400,
+                        "bad_request",
+                        "level must be one of error, warn, info, debug, trace",
+                    )
+                }
+            },
+        };
         let path = self.config.paths.logs_dir.join(format!("{}.log", id));
         match log::tail(&path, lines) {
-            Ok(text) => Response::new(
-                200,
-                "text/plain; charset=utf-8",
-                cap_log(text, self.config.limits.log_max_bytes).into_bytes(),
-            ),
+            Ok(text) => {
+                let text = match level {
+                    Some(threshold) => log::filter_text(&text, threshold),
+                    None => text,
+                };
+                Response::new(
+                    200,
+                    "text/plain; charset=utf-8",
+                    cap_log(text, self.config.limits.log_max_bytes).into_bytes(),
+                )
+            }
             Err(cause) if cause.kind() == io::ErrorKind::NotFound => {
                 error_response(404, "not_found", &format!("no log for {}", id))
             }

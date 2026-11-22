@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use crate::platform::host::poll;
 use crate::platform::host::wake::Wake;
-use crate::platform::log::{self, LogSink};
+use crate::platform::log::{self, LogWriter};
 use crate::wire::message::ipc::{FrameError, FrameEvent};
 use crate::wire::message::ipc::{RawFailure, RawStopSink};
 
@@ -115,7 +115,7 @@ struct Source {
     kind: SourceKind,
     buffer: Vec<u8>,
     blocked: bool,
-    log: Option<Arc<Mutex<LogSink>>>,
+    log: Option<Arc<Mutex<LogWriter>>>,
     /// Set for protocol-3 sources; the reactor reports the stop reason there
     /// together with the transport generation it registered.
     hub: Option<(Weak<dyn RawStopSink>, u64)>,
@@ -136,7 +136,7 @@ impl Source {
         }
     }
 
-    fn with_log(mut self, log: Option<Arc<Mutex<LogSink>>>) -> Self {
+    fn with_log(mut self, log: Option<Arc<Mutex<LogWriter>>>) -> Self {
         self.log = log;
         self
     }
@@ -298,7 +298,7 @@ impl Reactor {
         stderr: Option<File>,
         sender: SyncSender<FrameEvent>,
         wake: Option<Arc<Wake>>,
-        log: Option<Arc<Mutex<LogSink>>>,
+        log: Option<Arc<Mutex<LogWriter>>>,
         max: usize,
         framing: Framing,
     ) -> io::Result<()> {
@@ -327,7 +327,7 @@ impl Reactor {
         id: String,
         stdout: File,
         stderr: Option<File>,
-        log: Option<Arc<Mutex<LogSink>>>,
+        log: Option<Arc<Mutex<LogWriter>>>,
     ) -> io::Result<()> {
         let mut sources =
             vec![Source::new(id.clone(), stdout, SourceKind::Log).with_log(log.clone())];
@@ -352,7 +352,7 @@ impl Reactor {
         stdin: File,
         stdout: File,
         stderr: Option<File>,
-        log: Option<Arc<Mutex<LogSink>>>,
+        log: Option<Arc<Mutex<LogWriter>>>,
         hub: Weak<dyn RawStopSink>,
         generation: u64,
         max_frame: usize,

@@ -59,49 +59,49 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     // from the value `ensure_conf` just materialized keeps the first start on
     // the same roots as every later start (ADR-0023).
     let config = Arc::new(preloaded.rebind(settings, Some(config_path.clone())));
-    if let Err(error) = log::init_svcd(&config.limits, &config.paths.logs_dir) {
+    // One clock for the whole run: the log writer keeps a copy for its time
+    // column, the supervisor loop keeps the `Now` pairs (ADR-0022).
+    let clock = Clock::boot();
+    if let Err(error) = log::init_svcd(&config.limits, &config.paths.logs_dir, clock) {
         eprintln!("svcd: cannot open log directory: {}", error);
     }
-    log::svcd("svcd starting");
+    info!("starting");
     for warning in &config.warnings {
-        log::svcd(&format!("svcd: warning: {}", warning));
+        warn!("warning: {}", warning);
     }
     // Runtime state no longer lives in the config tree: Unix sockets and the
     // HTTP port file need data/run to exist before the channel binds.
     for dir in [&config.paths.run_dir, &config.paths.temp_dir] {
         if let Err(error) = fs::create_dir_all(dir) {
-            log::svcd(&format!("svcd: cannot create {}: {}", dir.display(), error));
+            error!("cannot create {}: {}", dir.display(), error);
         }
     }
-    log::svcd(&format!(
-        "svcd: config: {}",
+    info!(
+        "config: {}",
         config
             .settings_path
             .as_deref()
             .unwrap_or(config_path.as_path())
             .display()
-    ));
+    );
     // The derivation report comes after the log is open: the budget, the shape
     // and every rewritten value are the first thing a support engineer needs.
     // `lines()` already renders the override list, so it is not printed twice.
     for line in config.resources.lines() {
-        log::svcd(&format!("svcd: {}", line));
+        info!("{}", line);
     }
     let stated = config.settings.probe_overrides().stated_names();
-    log::svcd(&format!(
-        "svcd: probe inputs stated by svcd.conf: {}",
+    info!(
+        "probe inputs stated by svcd.conf: {}",
         if stated.is_empty() {
             "none".to_string()
         } else {
             stated.join(", ")
         }
-    ));
+    );
     match crate::platform::limits::write_snapshot(&config.paths, &config.resources) {
         Ok(()) => {}
-        Err(error) => log::svcd(&format!(
-            "svcd: cannot write the resource snapshot: {}",
-            error
-        )),
+        Err(error) => warn!("cannot write the resource snapshot: {}", error),
     }
     // An explicit --conf may set config_dir to a different directory.
     let config_dir = &config.paths.config_dir;
@@ -122,7 +122,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     let legacy_token = config_dir.join("svcd.token");
     if legacy_token.exists() {
         let _ = fs::remove_file(&legacy_token);
-        log::svcd("svcd: removed the legacy control token (endpoint ACLs authorize now)");
+        info!("removed the legacy control token (endpoint ACLs authorize now)");
     }
     #[cfg(windows)]
     if crate::platform::host::acl::is_machine_wide(config_dir) {
@@ -132,10 +132,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         }
     }
     if let Err(error) = crate::platform::host::process::init() {
-        log::svcd(&format!(
-            "svcd: parent-death protection unavailable: {}",
-            error
-        ));
+        warn!("parent-death protection unavailable: {}", error);
     }
 
     wait_for_services_dir(
@@ -145,23 +142,23 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
 
     let mut loaded = definition::load_services(&config.paths.services_dir, &config.limits);
     for issue in &loaded.issues {
-        log::svcd(&format!("svcd: warning: {}", issue));
+        warn!("warning: {}", issue);
     }
 
     let (plugins, warnings) = plugin::scan(&config.paths, &config.limits);
     for warning in warnings {
-        log::svcd(&format!("svcd: plugin: {}", warning));
+        warn!("plugin: {}", warning);
     }
     for service in plugins {
         if loaded.registry.get(&service.id).is_some() {
-            log::svcd(&format!(
-                "svcd: plugin {} conflicts with an existing service; skipped",
+            warn!(
+                "plugin {} conflicts with an existing service; skipped",
                 service.id
-            ));
+            );
             continue;
         }
         if let Err(error) = loaded.registry.insert(service) {
-            log::svcd(&format!("svcd: plugin: {}", error));
+            warn!("plugin: {}", error);
         }
     }
 
@@ -181,7 +178,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     ) {
         Ok(control) => control,
         Err(error) => {
-            log::svcd(&format!("svcd: cannot bind control channel: {}", error));
+            error!("cannot bind control channel: {}", error);
             return 1;
         }
     };
@@ -206,12 +203,12 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
             {
                 // The server loop now owns the control channel; failing to
                 // start it is fatal, not an HTTP-only degradation.
-                log::svcd(&format!("svcd: cannot start server loop: {}", error));
+                error!("cannot start server loop: {}", error);
                 return 1;
             }
             #[cfg(not(unix))]
             {
-                log::svcd(&format!("svcd: HTTP API disabled: {}", error));
+                warn!("HTTP API disabled: {}", error);
                 None
             }
         }
@@ -221,7 +218,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         match crate::server::control::spawn_control_only(control, config.limits.clone()) {
             Ok(handle) => handle,
             Err(error) => {
-                log::svcd(&format!("svcd: cannot start server loop: {}", error));
+                error!("cannot start server loop: {}", error);
                 return 1;
             }
         };
@@ -250,10 +247,10 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         let reactor = match Reactor::start() {
             Ok(reactor) => Some(reactor),
             Err(error) => {
-                log::svcd(&format!(
-                    "svcd: reactor unavailable; using per-plugin reader threads: {}",
+                warn!(
+                    "reactor unavailable; using per-plugin reader threads: {}",
                     error
-                ));
+                );
                 None
             }
         };
@@ -262,7 +259,6 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         }
         daemon.host.set_reactor(reactor);
     }
-    let clock = Clock::boot();
     daemon.host.adopt_runtime(clock.now());
     daemon.host.sweep_runtime_records();
     crate::platform::host::signal::install();
@@ -278,7 +274,7 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     #[cfg(all(unix, not(feature = "http")))]
     control_loop.shutdown();
     #[cfg(feature = "http")]
-    log::svcd(&format!("svcd: raw stats: {}", raw_hub.stats.summary()));
+    info!("raw stats: {}", raw_hub.stats.summary());
     crate::platform::host::notify::systemd("STOPPING=1");
     channel::remove_socket(config.paths.control_dir());
     0
@@ -291,19 +287,19 @@ fn wait_for_services_dir(dir: &Path, budget: u64) {
     let started = Instant::now();
     loop {
         if dir.is_dir() {
-            log::svcd(&format!(
-                "svcd: service directory appeared after {}ms: {}",
+            info!(
+                "service directory appeared after {}ms: {}",
                 started.elapsed().as_millis(),
                 dir.display()
-            ));
+            );
             return;
         }
         if started.elapsed().as_millis() as u64 >= budget {
-            log::svcd(&format!(
-                "svcd: service directory still missing after {}ms: {} (use `svc reload`)",
+            warn!(
+                "service directory still missing after {}ms: {} (use `svc reload`)",
                 started.elapsed().as_millis(),
                 dir.display()
-            ));
+            );
             return;
         }
         thread::sleep(Duration::from_millis(200));

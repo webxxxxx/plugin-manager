@@ -102,15 +102,15 @@ impl RawWsStream {
     }
 
     fn log(&self, reason: &str) {
-        crate::platform::log::svcd(&format!(
-            "svcd: raw ws closed: plugin={} stream={} reason={} read={} parsed={} frames={}",
+        info!(
+            "raw ws closed: plugin={} stream={} reason={} read={} parsed={} frames={}",
             self.link.plugin(),
             self.link.stream(),
             reason,
             self.bytes_read,
             self.bytes_parsed,
             self.frames_read
-        ));
+        );
     }
 
     fn deadline(&self, now: Instant) -> Instant {

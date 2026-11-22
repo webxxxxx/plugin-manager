@@ -50,12 +50,12 @@ pub fn load(id: &str, paths: &Paths) -> Option<Record> {
     match serde_json::from_slice::<Record>(&bytes) {
         Ok(record) => Some(record),
         Err(error) => {
-            crate::platform::log::svcd(&format!(
-                "svcd: {}: unreadable runtime record {}: {}",
+            warn!(
+                "{}: unreadable runtime record {}: {}",
                 id,
                 path.display(),
                 error
-            ));
+            );
             None
         }
     }
@@ -82,12 +82,7 @@ pub fn remove(id: &str, paths: &Paths) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            crate::platform::log::svcd(&format!(
-                "svcd: {}: cannot remove {}: {}",
-                id,
-                target.display(),
-                error
-            ));
+            warn!("{}: cannot remove {}: {}", id, target.display(), error);
         }
     }
 }

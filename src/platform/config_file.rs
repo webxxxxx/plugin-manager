@@ -216,6 +216,9 @@ pub fn generated(settings: &Settings) -> String {
          # log_max_bytes = 65536 / 65536 / 65536\n\
          # log_rotations = 3 / 3 / 3\n\
          # log_to_file = on\n\
+         # log_level = error | warn | info | debug | trace (default info;\n\
+         #   lower levels are dropped before they reach a file)\n\
+         # log = on | off (master switch: off writes no file and no stderr)\n\
          # mem_budget_bytes = auto (25% of free memory, capped by MEM_LEVEL)\n\
          # mem_budget_percent = 1..100 (the same, as a share of free memory;\n\
          #   mutually exclusive with mem_budget_bytes)\n\

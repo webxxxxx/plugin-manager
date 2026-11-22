@@ -175,6 +175,8 @@ fn example_conf_file_documents_the_keys() {
         "log_max_bytes",
         "log_rotations",
         "log_to_file",
+        "log_level",
+        "log = on",
         "request_stack_bytes",
         "io_stack_bytes",
         "blocking_threads",

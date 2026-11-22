@@ -8,7 +8,6 @@ use crate::manage as package;
 use crate::manage as plugin;
 use crate::manage::Strategy;
 use crate::platform::clock::Clock;
-use crate::platform::log;
 
 use super::Daemon;
 
@@ -23,7 +22,7 @@ fn install_log_line(
     signature_verified: bool,
 ) -> String {
     format!(
-        "svcd: plugin {} {} installed ({}){}",
+        "plugin {} {} installed ({}){}",
         id,
         version,
         if still_running {
@@ -71,12 +70,10 @@ impl Daemon {
             .install(service, still_running)
             .map_err(|detail| ProblemError::new(Problem::Internal, detail))?;
         self.bump_catalog();
-        log::svcd(&install_log_line(
-            id,
-            version,
-            still_running,
-            signature_verified,
-        ));
+        info!(
+            "{}",
+            install_log_line(id, version, still_running, signature_verified,)
+        );
         self.host.status_for_id(id, clock.now()).ok_or_else(|| {
             ProblemError::new(Problem::UnknownPlugin, format!("unknown plugin: {}", id))
         })
@@ -134,10 +131,10 @@ impl Daemon {
                         ),
                     ));
                 }
-                log::svcd(&format!(
-                    "svcd: plugin {}: keep-old ran out of space; falling back to replace",
+                warn!(
+                    "plugin {}: keep-old ran out of space; falling back to replace",
                     id
-                ));
+                );
                 plugin::install_package(
                     &self.config.paths,
                     &self.config.limits,
@@ -280,7 +277,7 @@ impl Daemon {
             #[cfg(feature = "http")]
             self.bus.forget(id);
         }
-        log::svcd(&format!("svcd: plugin {} uninstalled", id));
+        info!("plugin {} uninstalled", id);
         Ok(())
     }
 }
@@ -323,18 +320,18 @@ mod tests {
             (
                 true,
                 true,
-                "svcd: plugin demo 1.0.0 installed (running; next start uses)",
+                "plugin demo 1.0.0 installed (running; next start uses)",
             ),
             (
                 true,
                 false,
-                "svcd: plugin demo 1.0.0 installed (running; next start uses); signature was NOT verified (allow_insecure_install)",
+                "plugin demo 1.0.0 installed (running; next start uses); signature was NOT verified (allow_insecure_install)",
             ),
-            (false, true, "svcd: plugin demo 1.0.0 installed (now)"),
+            (false, true, "plugin demo 1.0.0 installed (now)"),
             (
                 false,
                 false,
-                "svcd: plugin demo 1.0.0 installed (now); signature was NOT verified (allow_insecure_install)",
+                "plugin demo 1.0.0 installed (now); signature was NOT verified (allow_insecure_install)",
             ),
         ] {
             assert_eq!(

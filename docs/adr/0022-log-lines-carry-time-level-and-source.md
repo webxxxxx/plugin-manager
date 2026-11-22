@@ -6,7 +6,7 @@ Accepted（2026-11-18）。细化 `docs/architecture.md` §5 的 `platform/log`�
 
 ## Context
 
-- `log::svcd(&str)` 是 svcd 唯一的日志写入口（`src/platform/log.rs:173`）。109 处调用、19 个模块，消息是自由文本（`"svcd: {}: spawn failed: {}"` 之类），没有时间戳、级别、来源。
+- 日志写入口是 `log::svcd(&str)`（后由 `error!/warn!/info!/debug!/trace!` 宏族接替）。116 处调用、19 个模块，消息是自由文本（`"svcd: {}: spawn failed: {}"` 之类），没有时间戳、级别、来源。
 - 两类写入者写两个文件：daemon 自己的行写 `svcd.log`，插件与钩子的 stdout/stderr 原样写 `<id>.log` / `<id>-hooks.log`（`src/wire/contract/stdio.rs:227`、`src/wire/contract/reactor.rs:819`）。两边都没有时间戳，一次故障里「插件先挂还是 svcd 先报错」无法判断。
 - 插件行在 Unix 有 64 KiB 上限（`reactor.rs:36`）；一行无换行且超限时 `drain_lines` 返回 false → `Stop::Single`（`reactor.rs:589`），**整个 log source 被静默丢弃**，之后该插件的输出全部消失，也没有一行日志说明。Windows 与钩子走 `log_lines` 线程（`stdio.rs:210`），那条路径完全没有上限。
 - 写失败一律 `let _ = sink.line(...)`（`reactor.rs:882`、`stdio.rs:230`、`log.rs:177`），静默丢弃；`line()` 每行同步 `flush`（`log.rs:80-82`），写盘发生在监督循环线程上。
@@ -40,7 +40,8 @@ Accepted（2026-11-18）。细化 `docs/architecture.md` §5 的 `platform/log`�
 
 - 两份文件有了共同时间轴，`svc logs --all` 能按毫秒合并；复盘不再靠猜顺序。
 - 老日志文件没有时间戳与级别：读取侧必须容忍不匹配行契约的行，按原样显示、不参与 `--level` 过滤。
-- `LogSink::line` 仍是「哑写一行」，log.rs 的五个单元测试断言不变；格式化与过滤在它上面一层。
-- 写侧过滤意味着 `DEBUG` 默认不落盘；要看 debug 必须改配置并重启。运行时开关与写入背压是后续票，不在本决定内。
+- `LogSink::line` 仍是「哑写一行」，原有单元测试断言不变；格式化、过滤与截断在 `LogWriter` 一层。
+- 写侧过滤意味着 `DEBUG` 默认不落盘；要看 debug 必须改配置并重启。运行时改级别与写入背压不在本决定内；静态总开关是 `log = off`。
+- 落地：`log_level` 与 `log` 进 `Settings`/`Limits`；`LogWriter` 负责时间戳、级别、来源、8 KiB 截断；插件与钩子管道共用它。
 - 8 KiB 截断会丢掉单行超长内容的尾部；多行栈不受影响（每行独立），受影响的是把整个 JSON 打进一行的插件。
 - 不在本轮：日志写入背压（同步 flush 卡循环）、syslog / Event Log 汇适配、审计日志、`log_level` 的 per-source 覆盖。

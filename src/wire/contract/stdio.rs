@@ -35,7 +35,7 @@ use std::thread;
 use super::RAW_PROTOCOL;
 use crate::platform::host::threads;
 use crate::platform::host::wake::Wake;
-use crate::platform::log::LogSink;
+use crate::platform::log::{Level, LogWriter};
 use crate::wire::message::ipc::{self, FrameEvent};
 
 /// Whether one standard stream is piped to the parent or opened on `/dev/null`.
@@ -211,7 +211,7 @@ pub(crate) fn poll_write(end: WriteEnd) -> io::Result<File> {
 pub(crate) fn log_lines(
     name: String,
     stream: ReadEnd,
-    log: Option<Arc<Mutex<LogSink>>>,
+    log: Option<Arc<Mutex<LogWriter>>>,
     limits: &crate::platform::limits::Limits,
 ) -> io::Result<()> {
     thread::Builder::new()
@@ -225,10 +225,10 @@ pub(crate) fn log_lines(
         .map(|_| ())
 }
 
-fn log_line(log: &Option<Arc<Mutex<LogSink>>>, line: &str) {
-    if let Some(sink) = log {
-        if let Ok(mut sink) = sink.lock() {
-            let _ = sink.line(line);
+fn log_line(log: &Option<Arc<Mutex<LogWriter>>>, line: &str) {
+    if let Some(writer) = log {
+        if let Ok(mut writer) = writer.lock() {
+            let _ = writer.record(Level::Info, line);
         }
     }
 }
@@ -269,7 +269,7 @@ impl Target {
         stderr: Option<ReadEnd>,
         sender: SyncSender<FrameEvent>,
         wake: Option<Arc<Wake>>,
-        log: Option<Arc<Mutex<LogSink>>>,
+        log: Option<Arc<Mutex<LogWriter>>>,
         limits: &crate::platform::limits::Limits,
     ) -> io::Result<()> {
         #[cfg(unix)]
@@ -321,7 +321,7 @@ impl Target {
         id: String,
         stdout: ReadEnd,
         stderr: Option<ReadEnd>,
-        log: Option<Arc<Mutex<LogSink>>>,
+        log: Option<Arc<Mutex<LogWriter>>>,
         limits: &crate::platform::limits::Limits,
     ) -> io::Result<()> {
         #[cfg(unix)]

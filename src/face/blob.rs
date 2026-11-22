@@ -217,9 +217,7 @@ impl DownloadStream {
                 let Some(opened) = opened else {
                     // Unreachable: the job stores the Opened before it returns
                     // Ok. Never write a half response; log and close instead.
-                    crate::platform::log::svcd(
-                        "svcd: download open job returned no result; closing the connection",
-                    );
+                    error!("download open job returned no result; closing the connection");
                     self.phase = Phase::Done;
                     return StreamStep::wait(StreamAction::Close(CloseReason::Failed(
                         "download open job returned no result".into(),

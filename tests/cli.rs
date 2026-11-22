@@ -375,6 +375,65 @@ fn logs_read_svcd_log_and_missing_logs_exit_one() {
     assert!(stderr(&missing).contains("no log"));
 }
 
+#[test]
+fn logs_filter_by_level_and_pass_unlevelled_lines_through() {
+    let sandbox = Sandbox::new();
+    fs::write(
+        sandbox.logs_dir().join("demo.log"),
+        "2023-11-14T22:13:20.000Z INFO  svcd quiet\n\
+         2023-11-14T22:13:21.000Z WARN  svcd careful\n\
+         2023-11-14T22:13:22.000Z ERROR svcd boom\n\
+         old format line\n",
+    )
+    .expect("write log");
+
+    let output = sandbox.run(&["logs", "demo", "--level", "warn"]);
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        "2023-11-14T22:13:21.000Z WARN  svcd careful\n\
+         2023-11-14T22:13:22.000Z ERROR svcd boom\n\
+         old format line\n"
+    );
+
+    let invalid = sandbox.run(&["logs", "demo", "--level", "loud"]);
+    assert_eq!(
+        invalid.status.code(),
+        Some(64),
+        "stderr: {}",
+        stderr(&invalid)
+    );
+}
+
+#[test]
+fn logs_all_merges_files_by_timestamp() {
+    let sandbox = Sandbox::new();
+    fs::write(
+        sandbox.logs_dir().join("svcd.log"),
+        "2023-11-14T22:13:20.000Z INFO  svcd one\n\
+         2023-11-14T22:13:23.000Z INFO  svcd four\n",
+    )
+    .expect("write svcd log");
+    fs::write(
+        sandbox.logs_dir().join("demo.log"),
+        "2023-11-14T22:13:21.000Z INFO  plugin:demo two\n\
+         2023-11-14T22:13:22.000Z INFO  plugin:demo three\n",
+    )
+    .expect("write demo log");
+
+    let output = sandbox.run(&["logs", "--all"]);
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        "2023-11-14T22:13:20.000Z INFO  svcd one\n\
+         2023-11-14T22:13:21.000Z INFO  plugin:demo two\n\
+         2023-11-14T22:13:22.000Z INFO  plugin:demo three\n\
+         2023-11-14T22:13:23.000Z INFO  svcd four\n"
+    );
+}
+
 /// Test-only Ed25519 public key. `samples/keys/` is generated locally by
 /// `tools/gen_sample_key.mjs` and never committed, so tests must not read it.
 const SAMPLE_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\n\

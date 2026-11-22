@@ -195,6 +195,9 @@ fn drain_lines(source: &mut Source) -> bool {
             SourceKind::Log => {
                 let line: Vec<u8> = source.buffer.drain(..=position).collect();
                 let line = &line[..line.len().saturating_sub(1)];
+                // A CRLF terminator is still one line; only a bare CR is
+                // message content and gets escaped by the writer.
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
                 log_line(&source.log, &String::from_utf8_lossy(line));
             }
             SourceKind::RawStdin { .. } | SourceKind::RawStdout { .. } => return true,
@@ -253,10 +256,10 @@ fn drain_length_frames(source: &mut Source) -> bool {
     }
 }
 
-fn log_line(log: &Option<Arc<Mutex<LogSink>>>, line: &str) {
-    if let Some(sink) = log {
-        if let Ok(mut sink) = sink.lock() {
-            let _ = sink.line(line);
+fn log_line(log: &Option<Arc<Mutex<LogWriter>>>, line: &str) {
+    if let Some(writer) = log {
+        if let Ok(mut writer) = writer.lock() {
+            let _ = writer.record(crate::platform::log::Level::Info, line);
         }
     }
 }

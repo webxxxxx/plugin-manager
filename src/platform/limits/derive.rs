@@ -180,6 +180,8 @@ struct SettingsView {
     log_max_bytes: Option<u64>,
     log_rotations: Option<usize>,
     log_to_file: Option<bool>,
+    log_level: Option<crate::platform::log::Level>,
+    log: Option<bool>,
     max_package_bytes: Option<u64>,
     transfer_timeout_secs: Option<u64>,
     control_timeout_secs: Option<u64>,
@@ -218,6 +220,8 @@ impl SettingsView {
             log_max_bytes: settings.log_max_bytes,
             log_rotations: settings.log_rotations,
             log_to_file: settings.log_to_file,
+            log_level: settings.log_level,
+            log: settings.log,
             max_package_bytes: settings.max_package_bytes,
             transfer_timeout_secs: settings.transfer_timeout_secs,
             control_timeout_secs: settings.control_timeout_secs,
@@ -273,6 +277,10 @@ impl Limits {
         let log_rotations =
             derivation.count(&LOG_ROTATIONS, settings.log_rotations.map(|v| v as u64));
         let log_to_file = settings.log_to_file.unwrap_or(true);
+        let log_level = settings
+            .log_level
+            .unwrap_or(crate::platform::log::Level::Info);
+        let log_enabled = settings.log.unwrap_or(true);
         let max_package_bytes = derivation.bytes(&MAX_PACKAGE_BYTES, settings.max_package_bytes);
         let transfer_timeout = derivation.secs(&TRANSFER_TIMEOUT, settings.transfer_timeout_secs);
         let control_timeout = derivation.secs(&CONTROL_TIMEOUT, settings.control_timeout_secs);
@@ -334,6 +342,8 @@ impl Limits {
             log_max_bytes,
             log_rotations,
             log_to_file,
+            log_level,
+            log_enabled,
             max_package_bytes,
             transfer_timeout,
             control_timeout,

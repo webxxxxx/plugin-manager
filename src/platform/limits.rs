@@ -62,6 +62,9 @@ pub struct Limits {
     pub log_max_bytes: u64,
     pub log_rotations: usize,
     pub log_to_file: bool,
+    pub log_level: crate::platform::log::Level,
+    /// Master switch: `false` suppresses every log line (file and stderr).
+    pub log_enabled: bool,
     pub max_package_bytes: u64,
     pub transfer_timeout: Duration,
     /// Bound for one management route's control-channel round trip.

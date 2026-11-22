@@ -304,7 +304,7 @@ pub fn run<S, H>(
         }
 
         if let Err(error) = crate::platform::host::poll::poll(&mut descriptors, 100) {
-            crate::platform::log::svcd(&format!("svcd: server loop poll failed: {}", error));
+            error!("server loop poll failed: {}", error);
             continue;
         }
         if descriptors[1].revents & libc::POLLIN != 0 {
@@ -350,10 +350,7 @@ pub fn run<S, H>(
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(error) => {
-                            crate::platform::log::svcd(&format!(
-                                "svcd: server loop accept failed: {}",
-                                error
-                            ));
+                            error!("server loop accept failed: {}", error);
                             break;
                         }
                     }

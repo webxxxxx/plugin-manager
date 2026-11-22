@@ -4,7 +4,6 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::platform::log;
 use crate::server::auth::admission::{Admission, Rejected};
 use crate::server::auth::lan::Lan;
 use crate::server::http::model as http;
@@ -180,17 +179,17 @@ fn dispatch_now(
     let (slot, done) = CompletionSlot::new(endpoint.clone());
     face.handle(request, done);
     let Some(exchange) = slot.take() else {
-        log::svcd(&format!("svcd: face did not complete {}", endpoint));
+        error!("face did not complete {}", endpoint);
         return Err(DispatchError::MissingCompletion);
     };
     match check_exchange(route.body, exchange) {
         Ok(exchange) => Ok(exchange),
         Err(error) => {
-            log::svcd(&format!(
-                "svcd: face violated the exchange contract for {}: {}",
+            error!(
+                "face violated the exchange contract for {}: {}",
                 endpoint,
                 error.message()
-            ));
+            );
             Err(error)
         }
     }

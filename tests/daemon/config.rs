@@ -111,3 +111,31 @@ fn the_daemon_reports_the_memory_budget_it_derived() {
         .count();
     assert_eq!(overrides, 1, "each override is logged once:\n{log}");
 }
+
+/// `log = off` is the master switch: the daemon writes no log file at all.
+#[test]
+fn log_off_writes_no_log_file() {
+    let mut sandbox = Sandbox::new();
+    fs::write(sandbox.config.join("svcd.conf"), "log = off\n").expect("write svcd.conf");
+    sandbox.start_daemon_ready();
+
+    let log = sandbox.logs.join("svcd.log");
+    assert!(!log.exists(), "log = off still created {}", log.display());
+    let stderr = fs::read_to_string(&sandbox.daemon_stderr).unwrap_or_default();
+    assert!(stderr.is_empty(), "log = off still wrote stderr: {stderr}");
+}
+
+/// The write-side filter drops INFO records before they reach the file.
+#[test]
+fn log_level_error_drops_info_lines() {
+    let mut sandbox = Sandbox::new();
+    fs::write(sandbox.config.join("svcd.conf"), "log_level = error\n").expect("write svcd.conf");
+    sandbox.start_daemon_ready();
+
+    let text = fs::read_to_string(sandbox.logs.join("svcd.log")).expect("read svcd.log");
+    assert!(
+        !text.contains(" INFO "),
+        "INFO leaked past the filter: {text}"
+    );
+    assert!(!text.contains("starting"), "startup line leaked: {text}");
+}

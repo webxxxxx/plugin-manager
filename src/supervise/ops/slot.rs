@@ -11,7 +11,7 @@ use crate::kernel::contract::{Contract, Invocation, Reply, ReplySink, Settled};
 use crate::kernel::failure::{Class, Failure, Rejection, Retry};
 use crate::kernel::registry::{Exec, Lifecycle, Ready, Restart, State};
 use crate::platform::host::wake::Wake;
-use crate::platform::log::{self, LogSink};
+use crate::platform::log::{self, LogWriter};
 use crate::platform::paths::Paths;
 use crate::supervise::model::supervisor::{self, Action, Event, Machine};
 use crate::wire::contract::stdio::{self, Plan, Streams, Target};
@@ -62,7 +62,7 @@ pub(crate) struct Slot {
     /// Unix, reader threads elsewhere.
     stdio: Target,
     raw_hub: Option<Arc<crate::wire::contract::rawhub::RawHub>>,
-    log: Option<Arc<Mutex<LogSink>>>,
+    log: Option<Arc<Mutex<LogWriter>>>,
     pending: PendingCalls,
     start_deadline: Option<u64>,
     stop_deadline: Option<u64>,
@@ -196,10 +196,7 @@ impl Slot {
         self.machine.next_at_ms = None;
         self.machine.last_exit = last_exit;
         self.adopted = false;
-        log::svcd(&format!(
-            "svcd: {}: restored finished one-shot state (no pid)",
-            self.id
-        ));
+        info!("{}: restored finished one-shot state (no pid)", self.id);
     }
 
     /// Reconnect this slot to a process that outlived the previous daemon.
@@ -227,7 +224,7 @@ impl Slot {
             State::Running | State::Starting | State::Stopping => {
                 self.machine.state = State::Running;
                 self.machine.since_ms = since_ms;
-                log::svcd(&format!("svcd: {}: adopted pid {}", self.id, pid));
+                info!("{}: adopted pid {}", self.id, pid);
             }
             _ => {
                 self.machine.pid = None;
@@ -333,7 +330,7 @@ impl Slot {
                             }
                         }
                         Err(error) => {
-                            log::svcd(&format!("svcd: {}: spawn failed: {}", self.id, error));
+                            error!("{}: spawn failed: {}", self.id, error);
                             let actions = self.machine.step(Event::SpawnFailed, now);
                             self.run_actions(actions, now);
                         }
@@ -391,10 +388,10 @@ impl Slot {
         if self.tree.is_none() {
             self.tree = crate::platform::host::process::Tree::new();
             if self.tree.is_none() {
-                log::svcd(&format!(
-                    "svcd: {}: process job unavailable; stop only terminates the leader",
+                warn!(
+                    "{}: process job unavailable; stop only terminates the leader",
                     self.id
-                ));
+                );
             }
         }
         let start = self
@@ -415,31 +412,32 @@ impl Slot {
         let (mut child, streams) =
             stdio::spawn(command, plan).map_err(|error| error.to_string())?;
         if let Err(error) = crate::platform::host::process::adopt(&child) {
-            log::svcd(&format!(
-                "svcd: {}: parent-death protection: {}",
-                self.id, error
-            ));
+            warn!("{}: parent-death protection: {}", self.id, error);
         }
         if let Some(tree) = &self.tree {
             if !tree.assign(&child) {
-                log::svcd(&format!(
-                    "svcd: {}: cannot assign the process job; stop only terminates the leader",
+                warn!(
+                    "{}: cannot assign the process job; stop only terminates the leader",
                     self.id
-                ));
+                );
             }
         }
         let pid = child.id();
-        log::svcd(&format!(
-            "svcd: {}: spawned pid {} (ready={:?})",
+        info!(
+            "{}: spawned pid {} (ready={:?})",
             self.id, pid, self.exec.ready
-        ));
-        let log = match LogSink::open(&self.paths.logs_dir, &self.id, &self.limits) {
+        );
+        let log = match LogWriter::open(
+            &self.paths.logs_dir,
+            &self.id,
+            &format!("plugin:{}", self.id),
+            &self.limits,
+            log::clock(),
+            false,
+        ) {
             Ok(sink) => Some(Arc::new(Mutex::new(sink))),
             Err(error) => {
-                log::svcd(&format!(
-                    "svcd: {}: cannot open service log: {}",
-                    self.id, error
-                ));
+                error!("{}: cannot open service log: {}", self.id, error);
                 None
             }
         };
@@ -537,10 +535,7 @@ impl Slot {
         })
         .to_string();
         if let Err(error) = self.write_json_frame(&line, ipc::CONTROL_FRAME_MAX) {
-            log::svcd(&format!(
-                "svcd: {}: ready ping {} write failed: {}",
-                self.id, id, error
-            ));
+            error!("{}: ready ping {} write failed: {}", self.id, id, error);
         }
     }
     fn check_exit(&mut self, now: u64) {
@@ -601,10 +596,10 @@ impl Slot {
     /// One line per settled exit: the code decides restart vs stop, so the
     /// daemon log must carry it instead of only the resulting state.
     fn note_exit(&self, pid: u32, code: Option<i32>, how: &str) {
-        log::svcd(&format!(
-            "svcd: {}: exit pid {} code {:?} while {:?} ({})",
+        info!(
+            "{}: exit pid {} code {:?} while {:?} ({})",
             self.id, pid, code, self.machine.state, how
-        ));
+        );
     }
 
     /// True while any process of the service (not just the leader) is alive.
@@ -654,10 +649,10 @@ impl Slot {
         }
     }
     fn clear_process(&mut self) {
-        log::svcd(&format!(
-            "svcd: {}: clear process (state {:?}, pid {:?})",
+        debug!(
+            "{}: clear process (state {:?}, pid {:?})",
             self.id, self.machine.state, self.machine.pid
-        ));
+        );
         self.fail_pending("service exited");
         self.stdio.unregister(&self.id);
         if let Some(hub) = &self.raw_hub {

@@ -8,7 +8,6 @@ use crate::manage as package;
 use crate::manage::model::layout::{current_version, plugin_dir};
 use crate::manage::ops::export_plugin::remove_versions;
 use crate::manage::ops::scan::read_manifest;
-use crate::platform::log;
 use crate::platform::paths::Paths;
 use crate::supervise::ops::hook;
 
@@ -92,10 +91,7 @@ fn run_pre_remove(
     let manifest = match read_manifest(&version_dir) {
         Ok(manifest) => manifest,
         Err(error) => {
-            log::svcd(&format!(
-                "svcd: plugin {}: skipped pre-remove hook: {}",
-                id, error
-            ));
+            warn!("plugin {}: skipped pre-remove hook: {}", id, error);
             return;
         }
     };
@@ -120,9 +116,9 @@ fn run_pre_remove(
         poll,
     );
     if let Err(error) = result {
-        log::svcd(&format!(
-            "svcd: plugin {}: pre-remove hook failed; continuing uninstall: {}",
+        warn!(
+            "plugin {}: pre-remove hook failed; continuing uninstall: {}",
             id, error
-        ));
+        );
     }
 }
