@@ -1,9 +1,7 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
 
 use crate::face::uichannel::EventBus;
 use crate::manage as plugin;
@@ -134,10 +132,13 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         warn!("parent-death protection unavailable: {}", error);
     }
 
-    wait_for_services_dir(
-        &config.paths.services_dir,
-        config.settings.boot_scan_wait_ms(),
-    );
+    // The boot wait for a late-mounted `services.d` was removed: it stalled
+    // every fresh start for the full budget, and a late mount is reconciled by
+    // the periodic rescan (`svc reload` for an immediate pass). The key is
+    // still parsed so an old document boots, but it has no effect.
+    if config.settings.boot_scan_wait_ms.is_some() {
+        warn!("boot_scan_wait_ms is ignored: services.d is scanned at boot without waiting");
+    }
 
     let mut loaded = definition::load_services(&config.paths.services_dir, &config.limits);
     for issue in &loaded.issues {
@@ -276,30 +277,4 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     crate::platform::host::notify::systemd("STOPPING=1");
     channel::remove_socket(config.paths.control_dir());
     0
-}
-
-fn wait_for_services_dir(dir: &Path, budget: u64) {
-    if dir.is_dir() {
-        return;
-    }
-    let started = Instant::now();
-    loop {
-        if dir.is_dir() {
-            info!(
-                "service directory appeared after {}ms: {}",
-                started.elapsed().as_millis(),
-                dir.display()
-            );
-            return;
-        }
-        if started.elapsed().as_millis() as u64 >= budget {
-            warn!(
-                "service directory still missing after {}ms: {} (use `svc reload`)",
-                started.elapsed().as_millis(),
-                dir.display()
-            );
-            return;
-        }
-        thread::sleep(Duration::from_millis(200));
-    }
 }
