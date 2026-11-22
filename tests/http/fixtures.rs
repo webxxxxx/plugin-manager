@@ -810,6 +810,186 @@ pub(crate) fn raw_plugin_bundle(key: &SigningKey, id: &str) -> Vec<u8> {
     signed_package(key, manifest, &files)
 }
 
+/// A protocol-3 agent: JSON-RPC on stream 0 (ping, capability calls, one
+/// notification) and raw echo on every other stream. Python on Unix,
+/// PowerShell on Windows; both speak `u32 len | u32 stream`.
+pub(crate) fn raw_json_agent(garbage: bool) -> (&'static str, Vec<u8>, Value) {
+    if cfg!(windows) {
+        let script = r#"$ErrorActionPreference = 'Stop'
+$in = [Console]::OpenStandardInput()
+$out = [Console]::OpenStandardOutput()
+$garbage = __GARBAGE__
+function Send-Frame([byte[]]$payload, [uint32]$stream) {
+  $n = [uint32]$payload.Length
+  $hdr = [byte[]]@(
+    (($n -shr 24) -band 255), (($n -shr 16) -band 255), (($n -shr 8) -band 255), ($n -band 255),
+    (($stream -shr 24) -band 255), (($stream -shr 16) -band 255), (($stream -shr 8) -band 255), ($stream -band 255))
+  $out.Write($hdr, 0, 8)
+  if ($payload.Length -gt 0) { $out.Write($payload, 0, $payload.Length) }
+  $out.Flush()
+}
+function Read-Exact([int]$n) {
+  $buf = New-Object byte[] $n
+  $got = 0
+  while ($got -lt $n) {
+    $r = $in.Read($buf, $got, $n - $got)
+    if ($r -le 0) { return $null }
+    $got += $r
+  }
+  return ,$buf
+}
+while ($true) {
+  $head = Read-Exact 8
+  if ($null -eq $head) { break }
+  $size = ([uint32]$head[0] -shl 24) -bor ([uint32]$head[1] -shl 16) -bor ([uint32]$head[2] -shl 8) -bor [uint32]$head[3]
+  $stream = ([uint32]$head[4] -shl 24) -bor ([uint32]$head[5] -shl 16) -bor ([uint32]$head[6] -shl 8) -bor [uint32]$head[7]
+  $body = Read-Exact ([int]$size)
+  if ($null -eq $body) { break }
+  if ($stream -eq 0) {
+    if ($garbage) {
+      Send-Frame ([Text.Encoding]::UTF8.GetBytes('not json')) 0
+      $garbage = $false
+      continue
+    }
+    $text = [Text.Encoding]::UTF8.GetString($body)
+    if ($text -match '"id"\s*:\s*(\d+)') {
+      $id = [int]$Matches[1]
+      Send-Frame ([Text.Encoding]::UTF8.GetBytes('{"jsonrpc":"2.0","id":' + $id + ',"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}')) 0
+      Send-Frame ([Text.Encoding]::UTF8.GetBytes('{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"panel-event"}}')) 0
+    }
+  } else {
+    Send-Frame $body $stream
+  }
+}
+"#;
+        let text = script.replace("__GARBAGE__", if garbage { "$true" } else { "$false" });
+        (
+            "agent.ps1",
+            text.into_bytes(),
+            json!({"name": "powershell", "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]}),
+        )
+    } else {
+        let script = r#"#!/usr/bin/env python3
+import json, struct, sys
+
+inp, out = sys.stdin.buffer, sys.stdout.buffer
+GARBAGE = __GARBAGE__
+
+
+def send(stream, payload):
+    out.write(struct.pack(">II", len(payload), stream))
+    out.write(payload)
+    out.flush()
+
+
+def reply(message):
+    rid = message.get("id")
+    if rid is None:
+        return
+    send(0, json.dumps({
+        "jsonrpc": "2.0",
+        "id": rid,
+        "result": {"content": [{"type": "text", "text": "pong"}], "isError": False},
+    }).encode())
+    send(0, json.dumps({
+        "jsonrpc": "2.0",
+        "method": "notifications/message",
+        "params": {"level": "info", "data": "panel-event"},
+    }).encode())
+
+
+while True:
+    head = inp.read(8)
+    if len(head) < 8:
+        break
+    size, stream = struct.unpack(">II", head)
+    body = inp.read(size)
+    if len(body) < size:
+        break
+    if stream == 0:
+        if GARBAGE:
+            send(0, b"not json")
+            GARBAGE = False
+            continue
+        try:
+            reply(json.loads(body))
+        except ValueError:
+            pass
+    else:
+        send(stream, body)
+"#;
+        (
+            "agent.py",
+            script
+                .replace("__GARBAGE__", if garbage { "True" } else { "False" })
+                .into_bytes(),
+            json!({"name": "python3", "version": ">=3.8"}),
+        )
+    }
+}
+
+/// A protocol-3 plugin that speaks JSON-RPC and raw at the same time (#265).
+pub(crate) fn raw_json_plugin_bundle(key: &SigningKey, id: &str, garbage: bool) -> Vec<u8> {
+    let (name, agent, interpreter) = raw_json_agent(garbage);
+    let exec_path = format!("payload/bin/{}", name);
+    let mut files: Vec<(String, Vec<u8>, u32)> = vec![
+        (exec_path.clone(), agent, 0o755),
+        (
+            "payload/web/index.html".to_string(),
+            b"<!doctype html>\n<html><body>raw json</body></html>".to_vec(),
+            0o644,
+        ),
+    ];
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let manifest = json!({
+        "schema": 1,
+        "id": id,
+        "name": id,
+        "version": "1.0.0",
+        "desc": "protocol 3 with JSON and raw",
+        "platform": target(),
+        "protocol": 3,
+        "exec": {"path": exec_path, "args": [], "ready": "notify"},
+        "interpreter": interpreter,
+        "capabilities": [{"name": "echo", "desc": "echo", "inputSchema": {}}],
+        "ui": {"type": "web", "entry": "index.html"},
+    });
+    signed_package(key, manifest, &files)
+}
+
+/// Install and start the mixed-channel plugin. A 200 here already proves the
+/// ready ping crossed stream 0.
+pub(crate) fn daemon_with_raw_json_plugin(key_byte: u8, id: &str) -> (Sandbox, String) {
+    let mut sandbox = Sandbox::new();
+    sandbox.allow_insecure_install_with("");
+    let key = SigningKey::from_bytes(&[key_byte; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let package = raw_json_plugin_bundle(&key, id, false);
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let installed = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(installed.status, 200, "{}", installed.body);
+    let started = request(
+        &address,
+        "POST",
+        &format!("/api/v1/services/{}/start", id),
+        "",
+        b"",
+    );
+    assert_eq!(started.status, 200, "{}", started.body);
+    (sandbox, address)
+}
+
 /// A running daemon with a protocol-3 plugin named `echo`.
 #[cfg(unix)]
 pub(crate) fn daemon_with_raw_plugin(key_byte: u8) -> (Sandbox, String) {
