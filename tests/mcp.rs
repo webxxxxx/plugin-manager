@@ -192,6 +192,7 @@ done
 
         let manifest = json!({
             "schema": 1,
+            "id": "demo",
             "name": "demo",
             "version": "1.0.0",
             "desc": "mcp bridge test plugin",

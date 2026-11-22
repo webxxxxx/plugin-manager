@@ -70,7 +70,7 @@ impl InstallFlow {
             Err(error) => return support::problem_response(&error),
         };
         let root = staged.root.clone();
-        let id = staged.manifest.name.clone();
+        let id = staged.manifest.id().to_string();
         let version = staged.manifest.version.clone();
         match install_staged(
             config,

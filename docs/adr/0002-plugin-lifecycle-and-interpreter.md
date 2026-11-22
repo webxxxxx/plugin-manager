@@ -26,3 +26,16 @@ core drop-in 脚本已经有 `start/stop/status` 与「从脚本声明推导生�
 - Windows 没有 SIGTERM 的 polite 路径：`stop` 钩子结束后直接终止进程树，不再空等 10 秒停止窗口。
 - 纯 native 插件仍不需要解释器；混合包按文件判定，native 直接执行、脚本走解释器。
 - 未来若要给原生二进制也声明 lifecycle 或按 hook 覆盖解释器，可以在 schema 2 内加法扩展，不需要再动执行器。
+
+## 修订（2026-11-23，#260）
+
+manifest 格式重编号为唯一的 `schema: 1`，本 ADR 的两条结论随之调整：
+
+- **`lifecycle` 与 `interpreter` 不再是 schema 2 的专利**：字段本身、语义与执行路径不变，只是不
+  再挂在版本号分级上；「脚本 payload 必须声明解释器」这条**取消**。理由：执行侧本来就支持两条路
+  ——带 shebang 的脚本在 Unix 直接 exec、`.cmd` / `.bat` 在 Windows 经 `COMSPEC`——强制声明会
+  拒绝本来能跑的包。声明了解释器就仍然统一走 `interp + args + [script] + action_args`，并且此时
+  必须真有脚本可跑（否则是无效声明，拒装）。
+- **没有「老 daemon 拒绝」这道门了**：旧线的包（任何版本）都缺必填的 `id`，验包阶段直接拒绝并
+  提示用 `plugin bundle` 重打包；不做读入兼容。
+- shebang 权威与解释器权威的分叉仍在：声明了就用声明的解释器，不声明就走 shebang / `.cmd`。

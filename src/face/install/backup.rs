@@ -225,7 +225,7 @@ impl BackupSink {
         let current = plugin::current_version(&self.paths, &backup.id);
         let plan = plugin::BackupRules {
             backup: &backup,
-            package_id: &staged.manifest.name,
+            package_id: staged.manifest.id(),
             package_version: &staged.manifest.version,
             config: self.config_data.as_deref(),
             current_version: current.as_deref(),
@@ -237,7 +237,7 @@ impl BackupSink {
         let status = match install_staged(
             config,
             &staged.root,
-            &staged.manifest.name,
+            staged.manifest.id(),
             &staged.manifest.version,
             "replace",
             false,

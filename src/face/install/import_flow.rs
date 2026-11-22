@@ -125,7 +125,7 @@ impl ImportFlow {
                     return match install_staged(
                         config,
                         &root,
-                        &staged.manifest.name,
+                        staged.manifest.id(),
                         &staged.manifest.version,
                         "replace",
                         false,

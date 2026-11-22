@@ -149,6 +149,10 @@ pub struct Service {
     /// （`svc describe` 尚未做）。
     #[allow(dead_code)]
     pub desc: String,
+    /// Human-facing name from a plugin manifest (`name`); `None` for core
+    /// services and for plugins that only ship an id. Never used for lookup:
+    /// every path, tool name and log file keys off [`Service::id`].
+    pub display_name: Option<String>,
     pub deps: Vec<String>,
     /// The only description of the service's callable surface. Built at load;
     /// runtime code reads this instead of a second capability vector.
@@ -284,6 +288,7 @@ impl Service {
                 name: CapabilityName::new("version"),
                 desc: "svcd version".into(),
                 input_schema: Some(json!({"type": "object", "properties": {}})),
+                output_schema: None,
                 effect: Effect::Read,
                 idempotent: true,
             },
@@ -291,6 +296,7 @@ impl Service {
                 name: CapabilityName::new("health"),
                 desc: "svcd health".into(),
                 input_schema: Some(json!({"type": "object", "properties": {}})),
+                output_schema: None,
                 effect: Effect::Read,
                 idempotent: true,
             },
@@ -301,6 +307,7 @@ impl Service {
             version: env!("CARGO_PKG_VERSION").into(),
             protocol: 1,
             desc: "core service management".into(),
+            display_name: None,
             deps: Vec::new(),
             contract: contract_for(
                 RESERVED_ID,
@@ -354,8 +361,22 @@ impl Registry {
     /// so the carrier invariant is enforced once and cannot be bypassed by a new
     /// loader.
     pub fn insert(&mut self, service: Service) -> Result<(), String> {
-        if self.services.contains_key(&service.id) {
-            return Err(format!("duplicate service id \"{}\"", service.id));
+        if let Some(existing) = self.services.get(&service.id) {
+            // The display name is what an operator recognizes in the console, so
+            // the collision has to name it — the two plugins may look identical
+            // by id alone (#260).
+            let label = |name: &Option<String>| {
+                name.as_deref()
+                    .map(|name| format!(" (display name {})", name))
+                    .unwrap_or_default()
+            };
+            return Err(format!(
+                "duplicate service id \"{}\"{} conflicts with \"{}\"{}",
+                service.id,
+                label(&service.display_name),
+                existing.id,
+                label(&existing.display_name)
+            ));
         }
         self.check_carrier(&service)?;
         self.check_identity(&service)?;
@@ -578,6 +599,7 @@ mod tests {
             name: CapabilityName::new("run"),
             desc: "run it".into(),
             input_schema: None,
+            output_schema: None,
             effect: Effect::Write,
             idempotent: false,
         };
@@ -651,13 +673,17 @@ mod tests {
     #[test]
     fn duplicate_insert_is_rejected() {
         let mut registry = Registry::new();
-        registry.insert(slot_backed("demo")).expect("first insert");
+        let mut first = slot_backed("demo");
+        first.display_name = Some("示例插件".into());
+        registry.insert(first).expect("first insert");
 
-        let error = registry
-            .insert(slot_backed("demo"))
-            .expect_err("duplicate id");
+        let mut second = slot_backed("demo");
+        second.display_name = Some("另一个插件".into());
+        let error = registry.insert(second).expect_err("duplicate id");
 
         assert!(error.contains("duplicate service id"));
+        assert!(error.contains("示例插件"), "{error}");
+        assert!(error.contains("另一个插件"), "{error}");
     }
 
     #[test]

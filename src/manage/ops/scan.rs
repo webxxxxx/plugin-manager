@@ -33,7 +33,7 @@ pub fn scan(
 
     for entry in entries.flatten() {
         let id = entry.file_name().to_string_lossy().to_string();
-        if !package::valid_name(&id) || id == RESERVED_ID {
+        if !package::valid_id(&id) || id == RESERVED_ID {
             warnings.push(format!("ignoring plugin directory {}", id));
             continue;
         }
@@ -54,6 +54,18 @@ pub fn scan(
             }
         };
         let enabled = directory.join("enabled").exists();
+        // The directory name is what the installer derived from `manifest.id`,
+        // so a disagreement means the tree was edited behind the daemon's back.
+        // Using either id would split the identity (log file, config, UI path)
+        // from the tool prefix, so the plugin is skipped instead.
+        if manifest.id() != id {
+            warnings.push(format!(
+                "{}: manifest id {} does not match the directory name",
+                id,
+                manifest.id()
+            ));
+            continue;
+        }
         let interpreter = match resolve_interpreter(&manifest, interpreter::lookup) {
             Ok(interpreter) => interpreter,
             Err(error) => {
@@ -64,7 +76,6 @@ pub fn scan(
         match service_from_manifest(
             paths,
             limits,
-            &id,
             &version_dir,
             &manifest,
             enabled,
@@ -97,12 +108,12 @@ pub fn scan(
 pub(crate) fn service_from_manifest(
     paths: &Paths,
     limits: &crate::platform::limits::Limits,
-    id: &str,
     version_dir: &Path,
     manifest: &package::Manifest,
     enabled: bool,
     interpreter: Option<&Interpreter>,
 ) -> Result<Service, ProblemError> {
+    let id = manifest.id();
     if manifest.platform != crate::platform::target() {
         return Err(Problem::UnsupportedPlatform.error(format!(
             "platform mismatch: package {}, host {}",
@@ -135,6 +146,7 @@ pub(crate) fn service_from_manifest(
             name: CapabilityName::new(capability.name.clone()),
             desc: capability.desc.clone(),
             input_schema: Some(capability.input_schema.clone()),
+            output_schema: capability.output_schema.clone(),
             effect: Effect::Write,
             idempotent: false,
         });
@@ -151,15 +163,8 @@ pub(crate) fn service_from_manifest(
         limits,
     );
 
-    let schema_two = manifest.schema >= 2;
     let exec_is_script = !is_native_file(&exec_path)?;
     let mut any_script = exec_is_script;
-    if schema_two && exec_is_script && interpreter.is_none() {
-        return Err(Problem::Invalid.error(format!(
-            "plugin {} runs a script but the manifest declares no interpreter",
-            id
-        )));
-    }
 
     let lifecycle = match &manifest.lifecycle {
         None => None,
@@ -198,7 +203,7 @@ pub(crate) fn service_from_manifest(
             })
         }
     };
-    if schema_two && !any_script && interpreter.is_some() {
+    if !any_script && interpreter.is_some() {
         return Err(Problem::Invalid.error(format!(
             "plugin {} declares an interpreter but has no script payload",
             id
@@ -216,6 +221,7 @@ pub(crate) fn service_from_manifest(
         version: manifest.version.clone(),
         protocol: manifest.protocol,
         desc: manifest.desc.clone(),
+        display_name: Some(manifest.name.clone()),
         deps: manifest.dependencies.clone(),
         contract,
         impl_ref: None,
@@ -224,7 +230,7 @@ pub(crate) fn service_from_manifest(
             args: manifest.exec.args.clone(),
             env: manifest.exec.env.clone(),
             ready,
-            interpreter: if schema_two && exec_is_script {
+            interpreter: if exec_is_script {
                 interpreter.cloned()
             } else {
                 None
@@ -366,7 +372,8 @@ mod tests {
         std::fs::create_dir_all(exec_path.parent().expect("parent")).expect("script dir");
         std::fs::write(&exec_path, data).expect("script");
         let mut value = serde_json::json!({
-            "schema": 2,
+            "schema": 1,
+            "id": id,
             "name": id,
             "version": "1.0.0",
             "desc": "script test",
@@ -427,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_a_schema_two_script_lifecycle_and_interpreter() {
+    fn maps_a_script_lifecycle_and_interpreter() {
         let host = Interpreter {
             path: "/bin/sh".into(),
             args: Vec::new(),
@@ -447,7 +454,6 @@ mod tests {
         let service = service_from_manifest(
             paths(),
             &crate::platform::limits::test_default(),
-            "scripted",
             &version_dir,
             &manifest,
             true,
@@ -481,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn a_schema_two_script_requires_an_interpreter() {
+    fn a_script_without_an_interpreter_runs_directly() {
         let (version_dir, manifest) = script_manifest(
             "no-interpreter",
             "payload/actions.sh",
@@ -490,32 +496,27 @@ mod tests {
             None,
         );
 
-        let error = service_from_manifest(
+        let service = service_from_manifest(
             paths(),
             &crate::platform::limits::test_default(),
-            "no-interpreter",
             &version_dir,
             &manifest,
             true,
             None,
         )
-        .expect_err("missing interpreter");
+        .expect("direct exec");
 
-        assert!(
-            error.detail().contains("declares no interpreter"),
-            "{error}"
-        );
+        assert!(service.exec.as_ref().expect("exec").interpreter.is_none());
     }
 
     #[test]
-    fn a_native_schema_two_payload_runs_directly() {
+    fn a_native_payload_runs_directly() {
         let (version_dir, manifest) =
             script_manifest("native", "payload/bin/tool", b"\x7fELFdemo", None, None);
 
         let service = service_from_manifest(
             paths(),
             &crate::platform::limits::test_default(),
-            "native",
             &version_dir,
             &manifest,
             true,
@@ -544,7 +545,6 @@ mod tests {
         let error = service_from_manifest(
             paths(),
             &crate::platform::limits::test_default(),
-            "dangling",
             &version_dir,
             &manifest,
             true,

@@ -61,7 +61,6 @@ pub(super) fn install_replace(
             let service = service_from_manifest(
                 paths,
                 limits,
-                id,
                 &version_dir,
                 &package.manifest,
                 enabled,
@@ -174,15 +173,8 @@ pub(super) fn install_replace_staged(
     let result = (|| {
         let (version_dir, enabled) = commit_staged(staged, plugin_dir, was_installed)?;
         copy_config_staged(&manifest, plugin_dir, &version_dir)?;
-        let service = service_from_manifest(
-            paths,
-            limits,
-            id,
-            &version_dir,
-            &manifest,
-            enabled,
-            interpreter,
-        )?;
+        let service =
+            service_from_manifest(paths, limits, &version_dir, &manifest, enabled, interpreter)?;
         run_post_install_manifest(paths, limits, &manifest, id, &version_dir, poll)?;
         Ok(service)
     })();

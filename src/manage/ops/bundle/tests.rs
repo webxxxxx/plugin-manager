@@ -5,6 +5,14 @@ use crate::manage::test_support::tempdir::TempDir;
 use ed25519_dalek::Signature;
 use std::fs;
 
+/// A fake native payload: bundling only reads `is_native_binary`'s magic bytes,
+/// so a packaging fixture never needs a host interpreter.
+fn exec_payload(text: &[u8]) -> Vec<u8> {
+    let mut data = vec![0x7f, b'E', b'L', b'F', 0x02, 0x01, 0x01, 0x00];
+    data.extend_from_slice(text);
+    data
+}
+
 fn write(dir: &Path, path: &str, data: &[u8], mode: u32) {
     let path = dir.join(path);
     if let Some(parent) = path.parent() {
@@ -108,7 +116,7 @@ fn a_kernel_module_requires_and_records_the_device_list() {
     let bytes = fs::read(path).expect("read package");
     let entries = entries(&bytes);
     let manifest = package::parse_manifest(&entries[0].data).expect("manifest");
-    assert_eq!(manifest.schema, 3);
+    assert_eq!(manifest.schema, 1);
     assert_eq!(manifest.platform, "aarch64-unknown-linux-musl");
     assert_eq!(
         manifest.compat.expect("compat").devices,
@@ -154,7 +162,8 @@ fn builds_a_canonical_signed_package_from_a_directory() {
     } else {
         "payload/bin/agent"
     };
-    write(source.path(), exec_path, b"#!/bin/sh\n", 0o755);
+    let script = exec_payload(b"#!/bin/sh\n");
+    write(source.path(), exec_path, &script, 0o755);
     write(
         source.path(),
         "payload/web/index.html",
@@ -195,6 +204,7 @@ fn builds_a_canonical_signed_package_from_a_directory() {
         "\"desc\"",
         "\"exec\"",
         "\"files\"",
+        "\"id\"",
         "\"name\"",
         "\"platform\"",
         "\"protocol\"",
@@ -229,8 +239,8 @@ fn builds_a_canonical_signed_package_from_a_directory() {
         .find(|file| file.path == exec_path)
         .expect("exec file");
     assert_eq!(agent.mode, 0o755);
-    assert_eq!(agent.size, b"#!/bin/sh\n".len() as u64);
-    assert_eq!(agent.sha256, package::hex_sha256(b"#!/bin/sh\n"));
+    assert_eq!(agent.size, script.len() as u64);
+    assert_eq!(agent.sha256, package::hex_sha256(&script));
 
     let signature: Value = serde_json::from_slice(&entries[1].data).expect("signature");
     assert_eq!(signature["alg"], "ed25519");
@@ -254,7 +264,7 @@ fn generates_a_minimal_manifest_and_detects_the_only_executable() {
     let work = TempDir::new();
     let exec_name = if cfg!(windows) { "tool.cmd" } else { "tool" };
     let exec_path = format!("payload/bin/{}", exec_name);
-    write(&source, &exec_path, b"tool", 0o755);
+    write(&source, &exec_path, &exec_payload(b"tool"), 0o755);
     write(&source, "README.md", b"readme", 0o644);
     write(&source, "hooks/post-install", b"#!/bin/sh\n", 0o755);
     let key_path = key_file(&work, 22);
@@ -265,6 +275,7 @@ fn generates_a_minimal_manifest_and_detects_the_only_executable() {
     bundle(&options).expect("bundle");
     let entries = entries(&fs::read(&out).expect("read"));
     let manifest = package::parse_manifest(&entries[0].data).expect("manifest");
+    assert_eq!(manifest.id(), "renamed");
     assert_eq!(manifest.name, "renamed");
     assert_eq!(manifest.version, "0.1.0");
     assert_eq!(manifest.desc, "minimal");
@@ -290,7 +301,7 @@ fn requires_a_key_and_does_not_write_a_package() {
     } else {
         "payload/bin/tool"
     };
-    write(source.path(), exec_path, b"tool", 0o755);
+    write(source.path(), exec_path, &exec_payload(b"tool"), 0o755);
     let out = work.path().join("out.spk");
     let mut options = bundle_options(source.path(), &out, &work.path().join("missing.pem"));
     options.id = Some("demo".into());
@@ -310,7 +321,7 @@ fn unsigned_packages_carry_no_signature_and_need_the_insecure_switch() {
     } else {
         "payload/bin/tool"
     };
-    write(source.path(), exec_path, b"tool", 0o755);
+    write(source.path(), exec_path, &exec_payload(b"tool"), 0o755);
 
     let out = work.path().join("unsigned.spk");
     let options = Options {
@@ -352,8 +363,8 @@ fn reports_ambiguous_or_missing_exec_candidates() {
     } else {
         ("payload/bin/one", "payload/bin/two")
     };
-    write(source.path(), one, b"one", 0o755);
-    write(source.path(), two, b"two", 0o755);
+    write(source.path(), one, &exec_payload(b"one"), 0o755);
+    write(source.path(), two, &exec_payload(b"two"), 0o755);
     let mut ambiguous = bundle_options(source.path(), &work.path().join("a.spk"), &key_path);
     ambiguous.id = Some("ambiguous".into());
     let error = bundle(&ambiguous).expect_err("ambiguous");
@@ -377,7 +388,12 @@ fn reports_ambiguous_or_missing_exec_candidates() {
 fn overrides_author_fields_and_recomputes_files_from_a_manifest() {
     let source = TempDir::new();
     let work = TempDir::new();
-    write(source.path(), "payload/bin/agent", b"agent", 0o755);
+    write(
+        source.path(),
+        "payload/bin/agent",
+        &exec_payload(b"agent"),
+        0o755,
+    );
     write(
         source.path(),
         "payload/web/index.html",
@@ -387,6 +403,7 @@ fn overrides_author_fields_and_recomputes_files_from_a_manifest() {
     write(source.path(), "config/config", b"{}", 0o644);
     let skeleton = serde_json::json!({
         "schema": 1,
+        "id": "old",
         "name": "old",
         "version": "9.9.9",
         "desc": "old",
@@ -406,13 +423,15 @@ fn overrides_author_fields_and_recomputes_files_from_a_manifest() {
     let out = work.path().join("out.spk");
     let mut options = bundle_options(source.path(), &out, &key_path);
     options.id = Some("fresh".into());
+    options.name = Some("新插件".into());
     options.version = Some("2.0.0".into());
     options.desc = Some("fresh desc".into());
 
     bundle(&options).expect("bundle");
     let entries = entries(&fs::read(&out).expect("read"));
     let manifest = package::parse_manifest(&entries[0].data).expect("manifest");
-    assert_eq!(manifest.name, "fresh");
+    assert_eq!(manifest.id(), "fresh");
+    assert_eq!(manifest.name, "新插件");
     assert_eq!(manifest.version, "2.0.0");
     assert_eq!(manifest.desc, "fresh desc");
     assert_eq!(manifest.platform, crate::platform::target());
@@ -440,7 +459,12 @@ fn overrides_author_fields_and_recomputes_files_from_a_manifest() {
 fn rejects_an_exec_path_outside_files_and_unsafe_paths() {
     let source = TempDir::new();
     let work = TempDir::new();
-    write(source.path(), "payload/bin/tool", b"tool", 0o755);
+    write(
+        source.path(),
+        "payload/bin/tool",
+        &exec_payload(b"tool"),
+        0o755,
+    );
     let key_path = key_file(&work, 26);
     let out = work.path().join("out.spk");
     let mut options = bundle_options(source.path(), &out, &key_path);
@@ -469,9 +493,14 @@ fn rejects_an_exec_path_outside_files_and_unsafe_paths() {
 fn rejects_a_declared_hook_that_is_not_in_files() {
     let source = TempDir::new();
     let work = TempDir::new();
-    write(source.path(), "payload/bin/tool", b"tool", 0o755);
+    write(
+        source.path(),
+        "payload/bin/tool",
+        &exec_payload(b"tool"),
+        0o755,
+    );
     let skeleton = serde_json::json!({
-        "schema": 1, "name": "demo", "version": "1.0.0", "desc": "demo",
+        "schema": 1, "id": "demo", "name": "demo", "version": "1.0.0", "desc": "demo",
         "platform": "x86_64-unknown-linux-musl", "protocol": 1,
         "exec": {"path": "payload/bin/tool"},
         "hooks": {"postInstall": "hooks/post-install"}
@@ -494,7 +523,12 @@ fn rejects_a_declared_hook_that_is_not_in_files() {
 fn rejects_a_platform_that_is_not_a_target_triple() {
     let source = TempDir::new();
     let work = TempDir::new();
-    write(source.path(), "payload/bin/tool", b"tool", 0o755);
+    write(
+        source.path(),
+        "payload/bin/tool",
+        &exec_payload(b"tool"),
+        0o755,
+    );
     let key_path = key_file(&work, 30);
     let mut options = bundle_options(source.path(), &work.path().join("a.spk"), &key_path);
     options.id = Some("demo".into());
@@ -519,7 +553,7 @@ fn refuses_to_write_the_package_inside_the_bundle_directory() {
     } else {
         "payload/bin/tool"
     };
-    write(source.path(), exec_path, b"tool", 0o755);
+    write(source.path(), exec_path, &exec_payload(b"tool"), 0o755);
     let key_path = key_file(&work, 32);
     let out = source.path().join("inside.spk");
     let mut options = bundle_options(source.path(), &out, &key_path);
@@ -552,7 +586,7 @@ fn an_output_directory_receives_the_versioned_default_name() {
     } else {
         "payload/bin/tool"
     };
-    write(source.path(), exec_path, b"tool", 0o755);
+    write(source.path(), exec_path, &exec_payload(b"tool"), 0o755);
     let key_path = key_file(&work, 34);
     // `-o` naming an existing directory keeps the default artifact name, so an
     // output directory cannot collect unversioned files that overwrite each
@@ -565,7 +599,9 @@ fn an_output_directory_receives_the_versioned_default_name() {
     let manifest = package::parse_manifest(&entries[0].data).expect("manifest");
     let expected = format!(
         "{}-{}-{}.spk",
-        manifest.name, manifest.version, manifest.platform
+        manifest.id(),
+        manifest.version,
+        manifest.platform
     );
     assert_eq!(
         path.file_name().and_then(|name| name.to_str()),
@@ -612,7 +648,7 @@ fn refuses_a_signing_key_inside_the_bundle_directory() {
     } else {
         "payload/bin/tool"
     };
-    write(source.path(), exec_path, b"tool", 0o755);
+    write(source.path(), exec_path, &exec_payload(b"tool"), 0o755);
     let key_path = source.path().join("signing.key");
     fs::write(&key_path, pem_from_private(&[31u8; 32])).expect("key");
     let out = source.path().join("out.spk");
@@ -646,7 +682,12 @@ fn rejects_a_non_executable_exec_file() {
 fn rejects_windows_hard_links() {
     let source = TempDir::new();
     let work = TempDir::new();
-    write(source.path(), "payload/bin/tool.cmd", b"tool", 0o755);
+    write(
+        source.path(),
+        "payload/bin/tool.cmd",
+        &exec_payload(b"tool"),
+        0o755,
+    );
     fs::hard_link(
         source.path().join("payload/bin/tool.cmd"),
         source.path().join("payload/bin/copy.cmd"),
@@ -672,7 +713,12 @@ fn rejects_symlinks_and_hard_links() {
     let key_path = key_file(&work, 28);
 
     let source = TempDir::new();
-    write(source.path(), "payload/bin/tool", b"tool", 0o755);
+    write(
+        source.path(),
+        "payload/bin/tool",
+        &exec_payload(b"tool"),
+        0o755,
+    );
     fs::create_dir_all(source.path().join("payload/web")).expect("web");
     symlink("payload/bin/tool", source.path().join("payload/web/alias")).expect("symlink");
     let mut options = bundle_options(source.path(), &work.path().join("a.spk"), &key_path);
@@ -684,7 +730,12 @@ fn rejects_symlinks_and_hard_links() {
     );
 
     let source = TempDir::new();
-    write(source.path(), "payload/bin/tool", b"tool", 0o755);
+    write(
+        source.path(),
+        "payload/bin/tool",
+        &exec_payload(b"tool"),
+        0o755,
+    );
     fs::hard_link(
         source.path().join("payload/bin/tool"),
         source.path().join("payload/bin/copy"),
@@ -707,7 +758,12 @@ fn rejects_setuid_files() {
 
     let source = TempDir::new();
     let work = TempDir::new();
-    write(source.path(), "payload/bin/tool", b"tool", 0o755);
+    write(
+        source.path(),
+        "payload/bin/tool",
+        &exec_payload(b"tool"),
+        0o755,
+    );
     fs::set_permissions(
         source.path().join("payload/bin/tool"),
         fs::Permissions::from_mode(0o4755),
@@ -810,7 +866,7 @@ fn script_options(source: &Path, out: &Path, key: &Path, exec: &str) -> Options 
 }
 
 #[test]
-fn from_core_emits_lifecycle_and_schema_two() {
+fn from_core_emits_lifecycle() {
     let source = TempDir::new();
     let work = TempDir::new();
     let (exec_path, body) = script_service();
@@ -824,7 +880,7 @@ fn from_core_emits_lifecycle_and_schema_two() {
     let entries = entries(&fs::read(&out).expect("read"));
     let manifest = package::parse_manifest(&entries[0].data).expect("manifest");
 
-    assert_eq!(manifest.schema, 2);
+    assert_eq!(manifest.schema, 1);
     assert_eq!(manifest.exec.ready.as_deref(), Some("exec"));
     assert_eq!(
         manifest.interpreter.as_ref().expect("interpreter").name,
@@ -864,7 +920,7 @@ fn detects_a_script_without_an_exec_bit_when_an_interpreter_is_declared() {
     let manifest = package::parse_manifest(&entries[0].data).expect("manifest");
 
     assert_eq!(manifest.exec.path, "payload/bin/service.py");
-    assert_eq!(manifest.schema, 2);
+    assert_eq!(manifest.schema, 1);
     assert!(manifest.lifecycle.is_none());
     assert_eq!(
         manifest
@@ -922,4 +978,86 @@ fn an_interpreter_on_a_native_payload_is_rejected() {
     let error = bundle(&options).expect_err("no script payload");
 
     assert!(error.detail().contains("no script"), "{error}");
+}
+
+#[test]
+fn the_bundler_always_writes_schema_one() {
+    let source = TempDir::new();
+    let work = TempDir::new();
+    write(
+        source.path(),
+        "payload/bin/tool",
+        &exec_payload(b"tool"),
+        0o755,
+    );
+    fs::write(
+        source.path().join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema": 3,
+            "name": "演示",
+            "version": "1.0.0",
+            "desc": "authored as schema three",
+            "platform": crate::platform::target(),
+            "protocol": 1
+        }))
+        .expect("skeleton"),
+    )
+    .expect("manifest");
+    let key_path = key_file(&work, 45);
+    let out = work.path().join("demo.spk");
+    let mut options = bundle_options(source.path(), &out, &key_path);
+    options.id = Some("demo".into());
+    options.exec = Some("payload/bin/tool".into());
+
+    bundle(&options).expect("bundle");
+    let bytes = fs::read(&out).expect("read");
+    let manifest = package::parse_manifest(&entries(&bytes)[0].data).expect("manifest");
+
+    assert_eq!(manifest.schema, 1);
+    assert_eq!(manifest.id(), "demo");
+    assert_eq!(manifest.name, "演示");
+}
+
+#[test]
+fn the_display_name_defaults_to_the_id() {
+    let source = TempDir::new();
+    let work = TempDir::new();
+    write(
+        source.path(),
+        "payload/bin/tool",
+        &exec_payload(b"tool"),
+        0o755,
+    );
+    let key_path = key_file(&work, 46);
+    let out = work.path().join("demo.spk");
+    let mut options = bundle_options(source.path(), &out, &key_path);
+    options.id = Some("demo".into());
+    options.exec = Some("payload/bin/tool".into());
+
+    bundle(&options).expect("bundle");
+    let bytes = fs::read(&out).expect("read");
+    let manifest = package::parse_manifest(&entries(&bytes)[0].data).expect("manifest");
+
+    assert_eq!(manifest.name, "demo");
+}
+
+#[test]
+fn an_id_that_cannot_be_derived_is_rejected() {
+    let source = TempDir::new();
+    let work = TempDir::new();
+    write(
+        source.path(),
+        "payload/bin/tool",
+        &exec_payload(b"tool"),
+        0o755,
+    );
+    let key_path = key_file(&work, 47);
+    let out = work.path().join("demo.spk");
+    let mut options = bundle_options(source.path(), &out, &key_path);
+    // The directory name is the only id source here, and the caller supplied
+    // four bytes of it through `--id`.
+    options.id = Some("Not An Id".into());
+
+    let error = bundle(&options).expect_err("bad id");
+    assert!(error.detail().contains("invalid plugin id"), "{error}");
 }

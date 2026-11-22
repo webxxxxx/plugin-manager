@@ -1,7 +1,8 @@
 {
-  "schema": 2,
+  "schema": 1,
+  "id": "mcp-echo",
   "protocol": 1,
-  "name": "mcp-echo",
+  "name": "MCP 回声",
   "version": "1.0.0",
   "platform": "x86_64-unknown-linux-gnu",
   "desc": "MCP smoke test: echo/add/status capabilities exposed as MCP tools",

@@ -103,7 +103,7 @@ impl Daemon {
             signature_verified,
             interpreter: host_interpreter,
         } = verified;
-        let id = package.manifest.name.clone();
+        let id = package.manifest.id().to_string();
         self.reject_core_service(&id)?;
 
         if self.host.is_running(&id) && strategy == Strategy::Replace {
@@ -198,7 +198,7 @@ impl Daemon {
             self.config.settings.allow_insecure_install,
             &self.config.paths.trust_dir,
         )?;
-        let id = staged.manifest.name.clone();
+        let id = staged.manifest.id().to_string();
         let version = staged.manifest.version.clone();
         if let Some(requested) = install.expected_id.as_deref() {
             if requested != id {

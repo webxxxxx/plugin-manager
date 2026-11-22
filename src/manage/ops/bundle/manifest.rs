@@ -23,6 +23,8 @@ pub struct Options {
     pub key: Option<PathBuf>,
     pub key_id: Option<String>,
     pub id: Option<String>,
+    /// Display name written into `name`; defaults to the id.
+    pub name: Option<String>,
     pub version: Option<String>,
     pub exec: Option<String>,
     pub desc: Option<String>,
@@ -53,10 +55,10 @@ pub(super) fn assemble_manifest(
         .file_name()
         .and_then(|name| name.to_str())
         .map(str::to_string);
-    let name = match &options.id {
+    let id = match &options.id {
         Some(id) => id.clone(),
         None => manifest
-            .get("name")
+            .get("id")
             .and_then(Value::as_str)
             .map(str::to_string)
             .or_else(|| directory_name.clone())
@@ -65,11 +67,26 @@ pub(super) fn assemble_manifest(
                     .error("cannot derive the plugin id from the directory name; pass --id")
             })?,
     };
-    if !package::valid_name(&name) {
+    if !package::valid_id(&id) {
         return Err(Problem::Invalid.error(format!(
             "invalid plugin id: {} (expected [a-z0-9][a-z0-9_-]{{0,63}}; pass --id)",
-            name
+            id
         )));
+    }
+    // `name` is the display name from here on: any UTF-8, defaults to the id.
+    let name = match &options.name {
+        Some(name) => name.clone(),
+        None => manifest
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| id.clone()),
+    };
+    if !package::valid_display_name(&name) {
+        return Err(Problem::Invalid.error(
+            "invalid display name: it must be non-empty, at most 128 characters and free of \
+             control characters (pass --name)",
+        ));
     }
     let version = match &options.version {
         Some(version) => version.clone(),
@@ -92,7 +109,7 @@ pub(super) fn assemble_manifest(
             .and_then(Value::as_str)
             .map(str::to_string)
             .or_else(|| directory_name.clone())
-            .unwrap_or_else(|| name.clone()),
+            .unwrap_or_else(|| id.clone()),
     };
     if desc.is_empty() {
         return Err(Problem::Invalid.error("desc must not be empty (pass --desc)"));
@@ -304,21 +321,14 @@ pub(super) fn assemble_manifest(
         ));
     }
 
-    let needs_three = declared_compat || has_kernel_module;
-    let needs_two = manifest.contains_key("lifecycle") || manifest.contains_key("interpreter");
-    let computed_schema = if needs_three {
-        3
-    } else if needs_two {
-        2
-    } else {
-        1
-    };
-    let authored_schema = manifest.get("schema").and_then(Value::as_u64).unwrap_or(0) as u32;
+    // One manifest format: the bundler always writes schema 1, whatever the
+    // authored skeleton says. Anything else is not a package this daemon reads.
     manifest.insert(
         "schema".into(),
-        Value::from(computed_schema.max(authored_schema)),
+        Value::from(crate::kernel::schema::MAX_SCHEMA),
     );
     manifest.entry("protocol").or_insert_with(|| Value::from(1));
+    manifest.insert("id".into(), Value::String(id));
     manifest.insert("name".into(), Value::String(name));
     manifest.insert("version".into(), Value::String(version));
     manifest.insert("desc".into(), Value::String(desc));
@@ -361,6 +371,7 @@ pub(super) fn assemble_manifest(
         .map(|source| (source.path.as_str(), source.data.as_slice()))
         .collect();
     package::validate_script_payload(&parsed, &borrowed)?;
+    package::check_icon_magic(&parsed, &borrowed)?;
     Ok((manifest_bytes, parsed))
 }
 

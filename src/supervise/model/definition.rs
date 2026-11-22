@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::kernel::registry::{
     Exec, Hook, Kind, Lifecycle, Ready, Registry, Restart, Service, State, RESERVED_ID,
 };
-use crate::manage::valid_name;
+use crate::manage::valid_id;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadIssue {
@@ -188,7 +188,7 @@ fn load_scripts(
             issues.push(fail(&id, format!("id \"{}\" is reserved", RESERVED_ID)));
             continue;
         }
-        if !valid_name(&id) {
+        if !valid_id(&id) {
             issues.push(fail(
                 &id,
                 format!(
@@ -273,6 +273,7 @@ fn load_scripts(
             version: "1.0.0".into(),
             protocol: 1,
             desc: format!("script service: {}", file.clone().unwrap_or_default()),
+            display_name: None,
             deps: Vec::new(),
             contract,
             impl_ref: None,
@@ -441,7 +442,7 @@ fn validate(
             RESERVED_ID
         ));
     }
-    if !valid_name(&definition.id) {
+    if !valid_id(&definition.id) {
         return Err(format!(
             "id \"{}\" is invalid; expected [a-z0-9][a-z0-9_-]{{0,63}}",
             definition.id
@@ -533,7 +534,7 @@ fn validate(
     };
 
     for dep in &definition.dependencies {
-        if !valid_name(dep) {
+        if !valid_id(dep) {
             return Err(format!("dependency \"{}\" is not a valid service id", dep));
         }
     }
@@ -551,6 +552,7 @@ fn validate(
         version: definition.version,
         protocol: definition.protocol,
         desc: definition.desc,
+        display_name: None,
         deps: definition.dependencies,
         contract,
         impl_ref: None,

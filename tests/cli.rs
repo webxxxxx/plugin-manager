@@ -453,7 +453,7 @@ fn compat_reports_and_provisions_the_device_id() {
     let json = sandbox.run(&["compat", "--json"]);
     assert_eq!(json.status.code(), Some(0));
     let value: Value = serde_json::from_str(&stdout(&json)).expect("compat json");
-    assert_eq!(value["schema_max"], 3);
+    assert_eq!(value["schema_max"], 1);
     assert!(value["device"].is_null(), "{value}");
 
     let init = sandbox.run(&["compat", "init", "--device", "sr6110"]);

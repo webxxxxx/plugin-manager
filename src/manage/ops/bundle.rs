@@ -1,9 +1,9 @@
 //! `plugin bundle`: pack a local directory into a signed, canonical `.spk`.
 //!
-//! The artifact defaults to `<name>-<version>-<platform>.spk`: the whole target
+//! The artifact defaults to `<id>-<version>-<platform>.spk`: the whole target
 //! triple, because the architecture prefix alone cannot distinguish musl from
 //! gnu (or other ABIs sharing an arch). A device-restricted package (one with
-//! `compat.devices`) appends the first id: `<name>-<version>-<platform>-<device>`
+//! `compat.devices`) appends the first id: `<id>-<version>-<platform>-<device>`
 //! — a label for humans, not the authority; the signed manifest keeps the whole
 //! list. An `--out` directory keeps that name; an `--out` file path is used
 //! verbatim.
@@ -114,9 +114,12 @@ pub fn bundle(options: &Options) -> Result<PathBuf, ProblemError> {
     let default_name = match device {
         Some(device) => format!(
             "{}-{}-{}-{}.spk",
-            parsed.name, parsed.version, parsed.platform, device
+            parsed.id(),
+            parsed.version,
+            parsed.platform,
+            device
         ),
-        None => format!("{}-{}-{}.spk", parsed.name, parsed.version, parsed.platform),
+        None => format!("{}-{}-{}.spk", parsed.id(), parsed.version, parsed.platform),
     };
     let path = match &options.out {
         Some(out) if out.is_dir() => out.join(&default_name),

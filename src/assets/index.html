@@ -287,10 +287,13 @@ function render(plugins) {
 
     const name = document.createElement('td');
     const strong = document.createElement('div');
-    strong.textContent = plugin.id;
+    // Primary line is the display name; the id stays visible because every
+    // command, log file and tool prefix uses it.
+    const display = plugin.displayName || plugin.id;
+    strong.textContent = display;
     const kind = document.createElement('div');
     kind.className = 'muted';
-    kind.textContent = 'plugin';
+    kind.textContent = display === plugin.id ? 'plugin' : plugin.id;
     name.appendChild(strong);
     name.appendChild(kind);
     tr.appendChild(name);

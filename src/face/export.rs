@@ -89,7 +89,7 @@ impl ExportStream {
     pub fn open(target: ExportTarget, paths: Arc<Paths>) -> ExportStream {
         let id = target.id();
         // Validate before touching the filesystem: plugin_dir joins the id.
-        let version = if package::valid_name(id) {
+        let version = if package::valid_id(id) {
             plugin::current_version(&paths, id)
         } else {
             None
@@ -344,6 +344,7 @@ mod tests {
         }
         let manifest = json!({
             "schema": 1,
+            "id": name,
             "name": name,
             "version": "1.0.0",
             "desc": "export unit test",

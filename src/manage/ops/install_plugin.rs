@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::kernel::failure::{Problem, ProblemError};
-use crate::kernel::registry::{Interpreter, Service, RESERVED_ID};
+use crate::kernel::registry::{Interpreter, Service};
 use crate::manage as package;
 use crate::manage::check::interpreter;
 use crate::manage::model::layout::{current_version, plugin_dir};
@@ -48,13 +48,9 @@ pub fn install_staged(
     host_interpreter: Option<Interpreter>,
     poll: &mut dyn FnMut(),
 ) -> Result<Service, ProblemError> {
-    let id = staged.manifest.name.clone();
-    if id == RESERVED_ID {
-        return Err(Problem::Conflict.error("the built-in svc id is reserved"));
-    }
-    if !package::valid_name(&id) {
-        return Err(Problem::Invalid.error(format!("invalid plugin id: {}", id)));
-    }
+    // The id, its charset and the reserved `svc` name were already rejected by
+    // `parse_manifest`; the only conflict left to check is a core service.
+    let id = staged.manifest.id().to_string();
     ensure_hooks_allowed_manifest(&staged.manifest, opt_in_hooks)?;
     if paths.services_dir.join(format!("{}.json", id)).exists() {
         return Err(
@@ -158,7 +154,7 @@ fn copy_config_staged(
             write_hash(&hash_path, &hash)?;
             info!(
                 "plugin {}: template changed; wrote config.new",
-                manifest.name
+                manifest.id()
             );
         }
         Some(_) => {}
@@ -267,12 +263,9 @@ pub fn install_package(
     host_interpreter: Option<Interpreter>,
     poll: &mut dyn FnMut(),
 ) -> Result<Service, InstallFailure> {
-    let id = package.manifest.name.clone();
-    if id == RESERVED_ID {
-        return Err(Problem::Conflict
-            .error("the built-in svc id is reserved")
-            .into());
-    }
+    // The id and the reserved `svc` name are already rejected by
+    // `parse_manifest`; a core service with the same id is the remaining clash.
+    let id = package.manifest.id().to_string();
     ensure_hooks_allowed(package, opt_in_hooks)?;
     if paths.services_dir.join(format!("{}.json", id)).exists() {
         return Err(Problem::Conflict
@@ -420,7 +413,7 @@ fn copy_config(package: &Package, plugin_dir: &Path) -> Result<(), ProblemError>
             write_hash(&hash_path, &hash)?;
             info!(
                 "plugin {}: template changed; wrote config.new",
-                package.manifest.name
+                package.manifest.id()
             );
         }
         Some(_) => {}
@@ -497,8 +490,10 @@ mod tests {
     /// An in-memory package with one payload file, enough for the layout
     /// strategies to run without a daemon.
     fn layout_package(name: &str, version: &str) -> Package {
+        let exec = crate::manage::test_support::native_payload();
         let manifest_json = serde_json::json!({
             "schema": 1,
+            "id": name,
             "name": name,
             "version": version,
             "desc": "layout test",
@@ -507,8 +502,8 @@ mod tests {
             "exec": {"path": "payload/bin/demo"},
             "files": [{
                 "path": "payload/bin/demo",
-                "size": 5,
-                "sha256": package::hex_sha256(b"hello"),
+                "size": exec.len(),
+                "sha256": package::hex_sha256(&exec),
                 "mode": 493
             }]
         });
@@ -520,7 +515,7 @@ mod tests {
             signature_bytes: Vec::new(),
             files: vec![package::FileData {
                 path: "payload/bin/demo".into(),
-                data: b"hello".to_vec(),
+                data: exec,
                 mode: 0o755,
             }],
         }

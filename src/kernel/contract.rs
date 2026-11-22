@@ -62,6 +62,10 @@ pub struct Capability {
     pub desc: String,
     /// 入参的 JSON Schema（可选：没声明就不校验）。
     pub input_schema: Option<Value>,
+    /// 出参的 JSON Schema（可选：`None` = 未声明，输出原样透传）。
+    ///
+    /// 只做声明与投影：内核不按它校验返回值（见 #260 的 Out of Scope）。
+    pub output_schema: Option<Value>,
     pub effect: Effect,
     /// 同一 `idempotency` 键重复调用是否等价于一次（决定能不能自动重试）。
     pub idempotent: bool,
@@ -613,6 +617,7 @@ mod tests {
                 name: CapabilityName::new("status"),
                 desc: "sample".into(),
                 input_schema: None,
+                output_schema: None,
                 effect: Effect::Read,
                 idempotent: true,
             }],
@@ -640,6 +645,7 @@ mod tests {
             name: CapabilityName::new(name),
             desc: String::new(),
             input_schema: None,
+            output_schema: None,
             effect: Effect::Pure,
             idempotent: true,
         };

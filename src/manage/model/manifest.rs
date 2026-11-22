@@ -21,6 +21,17 @@ pub enum SignatureCheck {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
     pub schema: u32,
+    /// Plugin identity: the directory name, log file name, `/plugin-ui/` segment
+    /// and `<id>.<cap>` tool prefix. Structurally optional only so a package
+    /// without it fails with a repack hint instead of a bare serde error;
+    /// [`parse_manifest`](crate::manage::parse_manifest) rejects it.
+    ///
+    /// Absent means "not a schema-1 package" — never fall back to `name` or the
+    /// directory name.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Display name. Human-facing only; may be any UTF-8 including Chinese, and
+    /// may repeat across plugins. Defaults to `id` when a package omits it.
     pub name: String,
     pub version: String,
     pub desc: String,
@@ -38,16 +49,30 @@ pub struct Manifest {
     #[serde(default)]
     pub capabilities: Vec<Capability>,
     pub ui: Option<Ui>,
+    /// Package icons for desktop shells and packagers (`png` / `ico` / `icns`).
+    #[serde(default)]
+    pub icons: Option<Icons>,
     #[serde(default)]
     pub files: Vec<FileEntry>,
     pub hooks: Option<Hooks>,
     pub config: Option<String>,
     #[serde(rename = "configCheck")]
     pub config_check: Option<ConfigCheck>,
-    /// Device compatibility list (schema 3). Absent means universal for this
-    /// platform; present means the host id must be listed.
+    /// Device compatibility list. Absent means universal for this platform;
+    /// present means the host id must be listed.
     #[serde(default)]
     pub compat: Option<CompatSpec>,
+}
+
+impl Manifest {
+    /// The plugin id. A manifest that reached this point came through
+    /// `parse_manifest`, which rejects a missing `id`; there is deliberately no
+    /// fallback to `name` or to the install directory.
+    pub fn id(&self) -> &str {
+        self.id
+            .as_deref()
+            .expect("manifest id: parse_manifest rejects a manifest without id")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -96,6 +121,37 @@ pub struct Capability {
     pub desc: String,
     #[serde(rename = "inputSchema")]
     pub input_schema: serde_json::Value,
+    /// Declarative output contract. Absent = undeclared: the result is passed
+    /// through unchanged and no schema is projected. `{}` = declared-any.
+    /// Schema 1 only declares and projects it; nothing validates results yet.
+    #[serde(rename = "outputSchema", default)]
+    pub output_schema: Option<serde_json::Value>,
+}
+
+/// Package icons: one package-relative path per format. Unknown keys are
+/// rejected so a typo cannot silently ship an icon nobody reads.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Icons {
+    #[serde(default)]
+    pub png: Option<String>,
+    #[serde(default)]
+    pub ico: Option<String>,
+    #[serde(default)]
+    pub icns: Option<String>,
+}
+
+impl Icons {
+    /// Every declared `(format, path)` pair, in a stable order.
+    pub fn entries(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        [
+            ("png", self.png.as_deref()),
+            ("ico", self.ico.as_deref()),
+            ("icns", self.icns.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(format, path)| path.map(|path| (format, path)))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

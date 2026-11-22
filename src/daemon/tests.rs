@@ -26,6 +26,7 @@ fn capability(name: &str) -> KernelCapability {
         name: CapabilityName::new(name),
         desc: format!("{} description", name),
         input_schema: Some(json!({"type": "object"})),
+        output_schema: None,
         effect: Effect::Write,
         idempotent: false,
     }
@@ -60,6 +61,7 @@ fn service(id: &str, deps: &[&str]) -> Service {
         version: "1.0.0".into(),
         protocol: 1,
         desc: "test".into(),
+        display_name: None,
         deps: deps.iter().map(|dep| dep.to_string()).collect(),
         contract,
         impl_ref: None,
@@ -218,36 +220,18 @@ while ($null -ne ($line = $reader.ReadLine())) {
 
 fn tool_service(id: &str, kind: Kind, caps: &[&str], root: &Path) -> Service {
     let caps = caps.iter().map(|cap| capability(cap)).collect();
-    let contract = crate::kernel::registry::contract_for(
-        id,
-        "1.0.0",
-        caps,
-        crate::kernel::registry::Carrier::Slot,
-        &crate::platform::limits::test_default(),
-    );
     Service {
-        id: id.into(),
         kind,
-        version: "1.0.0".into(),
-        protocol: 1,
         desc: "tools".into(),
-        deps: Vec::new(),
-        contract,
-        impl_ref: None,
+        contract: crate::kernel::registry::contract_for(
+            id,
+            "1.0.0",
+            caps,
+            crate::kernel::registry::Carrier::Slot,
+            &crate::platform::limits::test_default(),
+        ),
         exec: Some(tool_agent(root)),
-        lifecycle: None,
-        enabled: true,
-        restart: crate::kernel::registry::Restart::OnFailure,
-        remain_after_exit: false,
-        compat: None,
-        state: State::Stopped,
-        pid: None,
-        since: None,
-        ready_since: None,
-        next_at: None,
-        failures: 0,
-        last_exit: None,
-        config: None,
+        ..service(id, &[])
     }
 }
 
@@ -1463,7 +1447,7 @@ fn a_start_with_a_missing_dependency_reports_missing_dependency() {
 }
 
 #[test]
-fn installing_a_package_named_after_a_core_service_reports_core_service() {
+fn installing_a_package_with_the_reserved_id_is_invalid() {
     let (_sender, receiver) = mpsc::channel();
     let mut daemon = Daemon::new(
         Registry::with_builtin(&crate::platform::limits::test_default()),
@@ -1484,7 +1468,7 @@ fn installing_a_package_named_after_a_core_service_reports_core_service() {
         "plugin.install",
         json!({"path": path.to_string_lossy(), "strategy": "replace"}),
     );
-    assert_error_kind(&response, -32006, "core_service");
+    assert_error_kind(&response, -32006, "invalid");
 }
 
 #[test]

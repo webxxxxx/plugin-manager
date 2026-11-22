@@ -202,8 +202,8 @@ fn a_failed_install_removes_its_staging_directory() {
         pem_from_public(&key.verifying_key().to_bytes()),
     )
     .expect("trust key");
-    // "svc" is the reserved core service id: the daemon refuses the staged
-    // package after the HTTP layer has already written its staging directory.
+    // "svc" is the reserved id: the package is refused after the HTTP layer has
+    // already written its staging directory, so the cleanup path still runs.
     let package = plugin_bundle(&key, "svc", "1.0.0", None, false);
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
@@ -216,7 +216,7 @@ fn a_failed_install_removes_its_staging_directory() {
     );
     assert_eq!(
         response.status,
-        404,
+        400,
         "{}",
         String::from_utf8_lossy(&response.body)
     );

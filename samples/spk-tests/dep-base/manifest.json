@@ -1,7 +1,8 @@
 {
-  "schema": 2,
+  "schema": 1,
+  "id": "dep-base",
   "protocol": 1,
-  "name": "dep-base",
+  "name": "依赖演示·基础",
   "version": "1.0.0",
   "platform": "x86_64-unknown-linux-gnu",
   "desc": "Dependency smoke test: the base service dep-app depends on",
