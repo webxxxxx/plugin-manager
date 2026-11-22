@@ -575,6 +575,36 @@ fn an_output_directory_receives_the_versioned_default_name() {
 }
 
 #[test]
+fn a_device_restricted_default_name_carries_the_first_device() {
+    let source = TempDir::new();
+    let work = TempDir::new();
+    let exec_path = if cfg!(windows) {
+        "payload/bin/tool.cmd"
+    } else {
+        "payload/bin/tool"
+    };
+    write(source.path(), exec_path, b"\x7fELF", 0o755);
+    let key_path = key_file(&work, 35);
+    let mut options = bundle_options(source.path(), work.path(), &key_path);
+    options.id = Some("demo".into());
+    options.version = Some("1.2.3".into());
+    options.platform = Some("aarch64-unknown-linux-musl".into());
+    options.compat = vec!["sr6110".into(), "sr6110-v2".into()];
+    let path = bundle(&options).expect("bundle for a device");
+    // The suffix is the first id only; the manifest keeps every id.
+    assert_eq!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("demo-1.2.3-aarch64-unknown-linux-musl-sr6110.spk")
+    );
+    let manifest = package::parse_manifest(&entries(&fs::read(&path).expect("read"))[0].data)
+        .expect("manifest");
+    assert_eq!(
+        manifest.compat.expect("compat").devices,
+        ["sr6110", "sr6110-v2"]
+    );
+}
+
+#[test]
 fn refuses_a_signing_key_inside_the_bundle_directory() {
     let source = TempDir::new();
     let exec_path = if cfg!(windows) {

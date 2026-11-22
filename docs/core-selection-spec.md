@@ -167,7 +167,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 | `config` | string | 否 | 配置模板在包内的相对路径，默认 `config/config`；必须在 `files[]` |
 | `configCheck` | object | 否 | `{path, args?}`；校验命令，path 在 `files[]`、可执行；声明 check 却没有 config → 安装失败 |
 
-- 文件名是 `<name>-<version>-<platform>.spk`，带**完整目标三元组**（只写 arch 无法区分 musl 与 gnu）；`platform` 字段本身仍不带 `arch` 字段（见 §11）。
+- 文件名是 `<name>-<version>-<platform>.spk`，带**完整目标三元组**（只写 arch 无法区分 musl 与 gnu）；声明了 `compat.devices` 的包再追加列表**第一个** id（`<name>-<version>-<platform>-<device>.spk`），这个后缀只是人读提示，完整列表仍以 manifest 为准；`platform` 字段本身仍不带 `arch` 字段（见 §11）。
 - **canonical manifest**：打包器必须产出「排序键 + 紧凑 + 无尾换行 + 无 BOM」的 `manifest.json`；签名覆盖原样字节。
 - 未知字段忽略；未知 `schema` 主版本拒绝；主版本内加法兼容。
 - `arch` 不是合法字段；v1 不提供 `arch` 兼容层（见 §11）。
