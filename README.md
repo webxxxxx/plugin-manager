@@ -127,6 +127,96 @@ cpu_budget_percent = 90             # 软闸 + cgroup / Job Object 硬限
 
 预算决定一切：`svc config tune` 打印派生结果（连接数、流数、订阅数、阻塞线程、单体上限），`svc status --resources` 看当前实际占用。
 
+### `svcd.conf` 配置项
+
+`svcd.conf` 的每个 live 键都在下表里。默认值写的是**派生规则**：预算是每次启动按本机算出来的，表里给的是参照预算下的期望值（tiny 128 MiB / interactive 512 MiB / streaming 2 GiB，参见 `limits/specs.rs`）；显式写的值只在允许范围内原样生效，越界会回落到本 shape 的期望值并在日志里记一条 `override:`。`svc config tune` 打印本机的派生结果，`svc status --resources` 看上次实际用的值。
+
+改完都要重启 daemon（服务管理器重启，或 user mode 下重跑 `svcd run`）；例外是 `auth_passwd`，用 `svc lan passwd <password>` 写它并立即生效。已删除的键（`plugins_dir`、`services_dir`、`temp_dir`、`boot_scan_wait_ms`）不再有任何作用，出现在旧文档里只会得到一条告警。
+
+#### 资源与形状
+
+| 键 | 默认 | 干什么 | 改完怎么生效 |
+| --- | --- | --- | --- |
+| `mem_budget_bytes` | auto（可用内存 25%，受构建上限约束） | 本进程可规划的峰值内存。`auto` 按可用内存折扣；写数字则按原样（只被构建上限压低）。 | 重启 daemon |
+| `mem_budget_percent` | 未设（与 mem_budget_bytes 二选一） | 用可用内存的百分比表达同一件事，1..100，每次启动重新解析。 | 重启 daemon |
+| `workload` | 由预算派生（<512 MiB tiny，<2 GiB interactive，否则 streaming） | 预算怎么花：tiny / interactive / streaming。它决定各键的派生份额，不决定预算大小。 | 重启 daemon |
+| `cpu_budget_percent` | 0（不设限） | 本进程可用的 CPU 份额，0..100；>0 时装平台硬限（cgroup cpu.max / Job Object）并在超限时拒绝新连接。 | 重启 daemon |
+| `request_stack_bytes` | 128/192/256 KiB（tiny/interactive/streaming） | 每个请求线程的栈。不随预算变，只随 shape 变。 | 重启 daemon |
+| `io_stack_bytes` | 64/96/128 KiB（tiny/interactive/streaming） | 每个 IO 线程的栈。 | 重启 daemon |
+| `blocking_threads` | 4/8/16（tiny/interactive/streaming），2..32 | 阻塞池线程数（安装、上传、下载、API 等慢路由）。 | 重启 daemon |
+| `blocking_queue` | 由连接数解算（min(max_connections,256)），1..1024 | 阻塞池可排队的作业数；满了回 503 busy + Retry-After。 | 重启 daemon |
+| `max_body_bytes` | 8/64/512 MiB（tiny/interactive/streaming） | 请求体在内存里的上限；更大的完整请求体会走落盘。 | 重启 daemon |
+| `max_json_body_bytes` | 64 KiB/256 KiB/1 MiB | JSON 请求体的上限，超出回 413。 | 重启 daemon |
+| `max_complete_body_bytes` | 64 KiB/1 MiB/2 MiB | 每个连接常驻的请求体预算，是容量公式里的一项。 | 重启 daemon |
+| `max_header_bytes` | 8/16/64 KiB | 请求头上限，超出回 431。 | 重启 daemon |
+| `max_streams` | 24/48/96，1..4096 | 长连接与传输流的上限：SSE、WS、raw WS、MCP SSE、上传/下载、导入导出；一次性静态资源不计。 | 重启 daemon |
+| `stream_buffer_bytes` | 8/32/128 KiB | 单个处理器的输出缓冲高水位；慢读者到点就停止输入而不是继续涨内存。 | 重启 daemon |
+| `max_connections` | 由预算解算（下限 8，上限 4096） | 同时准入的连接数。显式值会被容量公式再压一次。 | 重启 daemon |
+| `max_connections_per_ip` | 16/32/64 | 单个来源 IP 的连接上限。 | 重启 daemon |
+| `max_subscriptions` | 64/128/256 | 整个 daemon 的订阅数上限（每个订阅只花一个游标）。 | 重启 daemon |
+| `max_subscribers_per_plugin` | 16/32/64 | 单个插件的订阅者上限。 | 重启 daemon |
+| `pending_queue` | 32/128/512（预算/4 MiB） | 服务器循环到监督循环之间排队的管理请求数。 | 重启 daemon |
+| `progress_queue` | 16/64/256（预算/8 MiB） | reactor 到单个 MCP 流之间排队的进度事件数。 | 重启 daemon |
+| `max_package_bytes` | 8/64/512 MiB | 可安装 .spk 的体积上限。 | 重启 daemon |
+| `probe_available_memory` | 未设（读操作系统） | 声明可用内存，跳过 OS 读取；0 表示未知且不回退探测。 | 重启 daemon |
+| `probe_cgroup_remaining` | 未设（读 cgroup v2） | 声明内存 cgroup 剩余额度，跳过 OS 读取。 | 重启 daemon |
+| `probe_cpus` | 未设（读 OS） | 声明在线 CPU 数，跳过 OS 读取。 | 重启 daemon |
+| `probe_install_free_disk` | 未设（读 OS） | 声明安装卷剩余空间，跳过 OS 读取。 | 重启 daemon |
+| `probe_temp_free_disk` | 未设（读 OS） | 声明临时卷剩余空间，跳过 OS 读取。 | 重启 daemon |
+
+#### 网络
+
+| 键 | 默认 | 干什么 | 改完怎么生效 |
+| --- | --- | --- | --- |
+| `bind` | 127.0.0.1:8787 | HTTP 监听地址。绑定非回环地址时必须有 auth_passwd，否则回退到 127.0.0.1。 | 重启 daemon |
+| `http_idle_timeout_secs` | 30/60/120 秒 | 空闲连接的超时。 | 重启 daemon |
+| `transfer_timeout_secs` | 120 秒 | 单次传输（上传/下载/导入导出）的超时。 | 重启 daemon |
+| `control_timeout_secs` | 30 秒，1..300 | 一条管理路由等控制通道回包的时限，超时回 504。 | 重启 daemon |
+| `default_timeout` | 30000 毫秒 | 一次能力调用的默认预算（毫秒）。 | 重启 daemon |
+| `max_timeout` | 300000 毫秒 | 调用预算的硬上限（毫秒），内核按它截断。 | 重启 daemon |
+| `ws_max_message_bytes` | 1 MiB | 单条 WebSocket 消息的上限，超出以 1009 关闭。 | 重启 daemon |
+| `ws_inflight_bytes` | 2/8/64 MiB | 所有插件未确认的 raw 字节总量。 | 重启 daemon |
+| `ws_inflight_requests` | 4/16/128 | 所有插件未确认的 raw 帧数。 | 重启 daemon |
+| `ws_buffer_shrink_bytes` | 64 KiB | WebSocket 缓冲区回缩阈值。 | 重启 daemon |
+| `ws_raw_enabled` | on | 是否启用协议 3 的 raw 通道（/plugin-ui/{id}/{token}/raw）。 | 重启 daemon |
+| `ws_raw_max_bytes` | 1 MiB | 单帧 raw 数据的上限。 | 重启 daemon |
+| `ws_raw_queue` | 8/32/128 | 单个插件 stdin 上排队的 raw 帧数。 | 重启 daemon |
+| `mcp_streaming` | off | 同时接受 JSON 与 SSE 的 MCP 客户端是否走流。off 时给一条 JSON（更省一个流槽与一次 reactor 跳转）。 | 重启 daemon |
+
+#### 日志
+
+| 键 | 默认 | 干什么 | 改完怎么生效 |
+| --- | --- | --- | --- |
+| `log_max_bytes` | 64 KiB，4 KiB..16 MiB | 单个日志文件的轮转阈值。 | 重启 daemon |
+| `log_rotations` | 3（1..10） | 保留几个轮转文件。 | 重启 daemon |
+| `log_to_file` | on | 是否写日志文件；off 时只留 stderr/syslog。 | 重启 daemon |
+| `log_level` | info | 写入任何去处的最低级别：error / warn / info / debug / trace。 | 重启 daemon |
+| `log` | on | 总开关：off 时既不写文件也不写 stderr。 | 重启 daemon |
+| `temp_retention_secs` | 7200 秒（2 小时） | data/temp 下临时文件保留多久；0 关闭清理线程。 | 重启 daemon |
+| `temp_cleanup_interval_secs` | 300 秒 | 清理线程的扫描间隔。 | 重启 daemon |
+
+#### 生命周期
+
+| 键 | 默认 | 干什么 | 改完怎么生效 |
+| --- | --- | --- | --- |
+| `rescan_interval_ms` | 5000 毫秒（0 = 不周期重扫） | 监督循环比对 services.d 指纹并收敛的周期；`svc reload` 仍可手动触发。 | 重启 daemon |
+
+#### 安全
+
+| 键 | 默认 | 干什么 | 改完怎么生效 |
+| --- | --- | --- | --- |
+| `auth_passwd` | 未设（用 `svc lan passwd` 设置） | 网页/API 的口令哈希。永远不要写明文。 | `svc lan passwd` 立即生效 |
+| `allow_insecure_install` | off | 允许安装验签失败时降级接受未签名包。 | 重启 daemon |
+
+#### 路径
+
+| 键 | 默认 | 干什么 | 改完怎么生效 |
+| --- | --- | --- | --- |
+| `config_dir` | 平台默认（Linux /etc/svcd） | 输入根：svcd.conf、services.d、trust.d、compat.conf。 | 重启 daemon |
+| `data_dir` | 平台默认（Linux /var/lib/svcd） | 运行状态根：plugins、temp、run。 | 重启 daemon |
+| `logs_dir` | 平台默认（Linux /var/log/svcd） | 日志根：svcd.log、<id>.log、<id>-hooks.log。 | 重启 daemon |
+| `install_dir` | 未设（由 `svcd --install --prefix` 记录） | 安装前缀：初始化时补 config/data/logs 默认值，运行时不再从它推路径。 | 重启 daemon |
+
 ## 架构
 
 ### 分层

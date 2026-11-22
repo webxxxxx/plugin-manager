@@ -11,6 +11,7 @@ pub mod auth;
 pub mod clock;
 pub mod compat;
 pub mod config;
+pub mod config_doc;
 pub mod config_file;
 pub mod host;
 pub mod limits;
