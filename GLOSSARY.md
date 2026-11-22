@@ -17,7 +17,7 @@ _Avoid_: 内置服务、系统服务
 _Avoid_: 内置插件、系统插件、core plugin
 
 **插件（Plugin）**:
-从 .spk 安装、`kind=plugin` 的服务；能力由 manifest 声明，schema 2 起也可声明生命周期动作。
+从 .spk 安装、`kind=plugin` 的服务；身份是 manifest 的 `id`，`name` 只是显示名（可中文）；能力与生命周期动作都由 manifest 声明。
 _Avoid_: PluginManager、PM（已退役）
 
 **未签名安装（Insecure install）**:
@@ -277,7 +277,7 @@ _Avoid_: 聚合、join、reduce
 _Avoid_: 调度（「调度」同时会被触发器占用，两个意思一律不用这个词）
 
 **兼容标识（device / compat）**:
-设备侧 `<config>/compat.conf` 里的单一 `device = <id>`（如 `sr6110`、`sr6110-v2`）；id 标识「内核/固件兼容代」，不是型号。插件在 schema 3 的 manifest 用 `compat.devices` 列出支持的 id：不写即通用，写了必须精确命中。含 `.ko` 的包必须声明。
+设备侧 `<config>/compat.conf` 里的单一 `device = <id>`（如 `sr6110`、`sr6110-v2`）；id 标识「内核/固件兼容代」，不是型号。插件在 manifest 用 `compat.devices` 列出支持的 id：不写即通用，写了必须精确命中。含 `.ko` 的包必须声明。
 _Avoid_: 设备型号、arch、ABI 版本号、白名单
 
 **reload（`svc reload`）**:

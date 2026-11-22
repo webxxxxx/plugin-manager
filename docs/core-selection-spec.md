@@ -53,7 +53,7 @@
 
 ### 1.6 core 服务与 plugin 的边界
 
-**core 服务是「直接声明的启动脚本或可执行文件」；plugin 是「标准 .spk 包」。两者是不同来源，不是同一包格式的两种模式。** 执行路径是共用的：schema 2 的 plugin 可以声明与 core 同形的 `lifecycle`，由同一个监督器跑 `start/stop/status`；区别仍在来源、信任与安装/配置 verbs，而不是「谁能有生命周期」。
+**core 服务是「直接声明的启动脚本或可执行文件」；plugin 是「标准 .spk 包」。两者是不同来源，不是同一包格式的两种模式。** 执行路径是共用的：plugin 可以在 manifest 里声明与 core 同形的 `lifecycle`，由同一个监督器跑 `start/stop/status`；区别仍在来源、信任与安装/配置 verbs，而不是「谁能有生命周期」。
 
 | | core 服务 | plugin |
 | --- | --- | --- |
@@ -61,7 +61,7 @@
 | 信任 | 无包签名；root 所有的定义文件 + 本机管理员 | Ed25519 manifest 签名 + `files[]` + `trust.d` |
 | 安装/升级 | 由 OS 包管理器 / 管理员管文件；svcd 不安装、不升级 | `svc install`（升级同）/ `uninstall` |
 | 配置 | 脚本/bin 自己管；svcd 不提供 `config` / `editconfig` / `export` | `config` / `configCheck` / `editconfig` / `.spkb` |
-| 生命周期 | `start/stop/status`（JSON 定义或 drop-in 脚本） | schema 2 manifest 可声明同形 `lifecycle`；执行路径共用 |
+| 生命周期 | `start/stop/status`（JSON 定义或 drop-in 脚本） | manifest 可声明同形 `lifecycle`；执行路径共用 |
 | hooks | 无 | post-install / pre-remove |
 | UI | 无 `ui`、无能力面 | `ui` + `/plugin-ui/{id}` |
 | 注册表 | 启动时扫 `services.d/*.json` + 内置 `svc` | 扫 `<data>/plugins/*/current` |
@@ -126,12 +126,13 @@ case "$action" in start|stop|status) "$action" ;; *) exit 64 ;; esac
 
 core drop-in 脚本可以原样放进 `.spk` 变成 plugin：脚本不改，补 manifest。转换后执行路径与 §1.7 相同，但来源与信任换成签名包，并额外获得版本、热安装/卸载、config/export 与 Web UI。
 
-- manifest 用 `schema: 2`，`exec.ready: "exec"`，按脚本声明写 `lifecycle.start/stop/status`（路径是包内相对路径，且必须在 `files[]`）。
-- payload 不是 native 可执行文件（ELF / Mach-O / PE）时必须声明 `interpreter`：`{name, args?, version?}`。`name` 是 PATH 上的裸名；`version` 是数字约束，**为空/省略只校验存在**，不执行版本探测。Windows 上只解析 `.exe` / `.com`，不接受 `.cmd` / `.bat` shim。
+- manifest 用 `schema: 1`，`exec.ready: "exec"`，按脚本声明写 `lifecycle.start/stop/status`（路径是包内相对路径，且必须在 `files[]`）。
+- payload 不是 native 可执行文件（ELF / Mach-O / PE）时可以声明 `interpreter`：`{name, args?, version?}`。`name` 是 PATH 上的裸名；`version` 是数字约束，**为空/省略只校验存在**，不执行版本探测。Windows 上只解析 `.exe` / `.com`，不接受 `.cmd` / `.bat` shim。声明了就一定要有脚本可跑（否则拒装）。
+- 不声明也能跑：带 shebang 的脚本在 Unix 直接 exec，`.cmd` / `.bat` 在 Windows 经 `COMSPEC`；要锁定解释器版本或跑 `.py` / `.ps1` 时才声明。
 - 安装时解析解释器到绝对路径并校验版本，失败不落盘；扫描时只重新解析路径。运行时统一 `interp + args + [script] + action_args`，`exec` 与 lifecycle 共用同一结果。Windows 没有 SIGTERM 的 polite 路径，`stop` 钩子结束后直接终止进程树。
 - 脚本插件通常 `capabilities: []`，MCP 面只剩 `<id>.start`；会讲 MCP 的脚本可以 `ready: "notify"` 并声明能力。
 - `plugin bundle --from-core --interpreter <name>` 会按脚本声明的 `start/stop/status` 自动生成 lifecycle；lifecycle 指向的其它脚本也要一起进 `files[]`。`hooks` / `config` / `ui` 仍按插件规则。
-- `schema: 2` 是兼容门禁：老 daemon 在验包阶段拒绝，避免静默忽略 `lifecycle` / `interpreter`。
+- 没有版本门禁：`lifecycle` / `interpreter` / `compat` 与普通字段一样只在 `schema: 1` 内校验。
 
 ## 2. .spk 包格式
 
@@ -146,28 +147,30 @@ core drop-in 脚本可以原样放进 `.spk` 变成 plugin：脚本不改，补 
 
 ### 2.2 manifest
 
-JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，见 §1.8）。字段：
+JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 与 §13 变更记录）。字段：
 
 | 字段 | 类型 | 必需 | 语义 |
 | --- | --- | --- | --- |
-| `schema` | int | 是 | 1 或 2；2 增加 `lifecycle` / `interpreter`；未知主版本拒绝；老 daemon 拒绝 2 |
-| `name` | string | 是 | 服务 id：`[a-z0-9][a-z0-9_-]{0,63}` |
+| `schema` | int | 是 | 只能是 `1`；其它值一律拒绝（旧线的包同时缺 `id`，不会被误接受） |
+| `id` | string | 是 | 插件身份：`[a-z0-9][a-z0-9_-]{0,63}`，不能是 `svc`；目录名、日志名、`/plugin-ui/` 段、`<id>.<cap>` 工具前缀都用它 |
+| `name` | string | 是 | 显示名：任意 UTF-8（可中文），≤128 字符，无控制字符；缺省等于 `id`；只给人看，命令与 API 不按它解析 |
 | `version` | string | 是 | semver |
 | `desc` | string | 是 | 一句话 |
 | `platform` | string | 是 | 规范目标三元组，如 `x86_64-unknown-linux-musl`；设备与 `TARGET` 字符串精确相等，安装 + 加载双检 |
 | `protocol` | int | 是 | 1；不匹配安装拒绝、加载再检 |
 | `exec` | object | 是 | `{path, args?, env?, ready?}`；`ready` 默认 `notify`，可 `exec` |
-| `interpreter` | object | 否 | schema 2：`{name, args?, version?}`；脚本 payload 必需，版本可空（只校验存在） |
-| `lifecycle` | object | 否 | schema 2：`{start?, stop?, status?}`，路径包内相对且在 `files[]` |
+| `interpreter` | object | 否 | `{name, args?, version?}`；声明了就必须有脚本 payload，不声明则直接 exec（见 §1.8） |
+| `lifecycle` | object | 否 | `{start?, stop?, status?}`，路径包内相对且在 `files[]` |
 | `dependencies` | [string] | 否 | 服务 id 列表，**无版本约束** |
-| `capabilities` | array | 否 | `{name, desc, inputSchema}`；name 插件内唯一，`svc.` 禁用；只允许 `ready=notify` |
+| `capabilities` | array | 否 | `{name, desc, inputSchema, outputSchema?}`；name 插件内唯一，`svc.` 禁用；只允许 `ready=notify`；`outputSchema` 只做声明与 MCP 投影，不校验结果（省略 = 未声明，`{}` = 任意） |
 | `ui` | object | 否 | `{type: web / gui / headerless, entry?}`；`entry` 相对 `payload/web/`，默认 `index.html` |
+| `icons` | object | 否 | `{png?, ico?, icns?}`，值必须是 `files[]` 里的包内路径；每项 ≤1 MiB、合计 ≤2 MiB、按魔数校验；至少一项；未知键拒绝 |
 | `files` | array | 是 | 除两个清单外的全部文件：`{path, size, sha256, mode}` |
 | `hooks` | object | 否 | `{postInstall?, preRemove?}`，指向 `hooks/` 内可执行 |
 | `config` | string | 否 | 配置模板在包内的相对路径，默认 `config/config`；必须在 `files[]` |
 | `configCheck` | object | 否 | `{path, args?}`；校验命令，path 在 `files[]`、可执行；声明 check 却没有 config → 安装失败 |
 
-- 文件名是 `<name>-<version>-<platform>.spk`，带**完整目标三元组**（只写 arch 无法区分 musl 与 gnu）；声明了 `compat.devices` 的包再追加列表**第一个** id（`<name>-<version>-<platform>-<device>.spk`），这个后缀只是人读提示，完整列表仍以 manifest 为准；`platform` 字段本身仍不带 `arch` 字段（见 §11）。
+- 文件名是 `<id>-<version>-<platform>.spk`，带**完整目标三元组**（只写 arch 无法区分 musl 与 gnu）；声明了 `compat.devices` 的包再追加列表**第一个** id（`<id>-<version>-<platform>-<device>.spk`），这个后缀只是人读提示，完整列表仍以 manifest 为准；`platform` 字段本身仍不带 `arch` 字段（见 §11）。
 - **canonical manifest**：打包器必须产出「排序键 + 紧凑 + 无尾换行 + 无 BOM」的 `manifest.json`；签名覆盖原样字节。
 - 未知字段忽略；未知 `schema` 主版本拒绝；主版本内加法兼容。
 - `arch` 不是合法字段；v1 不提供 `arch` 兼容层（见 §11）。
@@ -176,7 +179,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 
 - 包内 `signature.json`：`{"alg":"ed25519","keyId":"...","sig":"base64"}`，签 `manifest.json` 的原样字节；`files[]` 钉每个文件的 sha256/size/mode。
 - 验证顺序：读 manifest → 验签 → 校验 schema / platform / 路径 → 逐文件验 hash 后落盘；清单外条目直接拒；流式、逐文件可验。
-- `plugin verify <file.spk> [--json]` 只做包自身校验（清单 / 文件哈希 / 签名结构；不要求平台匹配、不要求 key 在 trust.d、不解析解释器），不落盘。`--json` 输出 `{ok, file, name, version, platform, schema, size, sha256, capabilities, compat, signature:{state,keyId,trusted}, host:{matchesHost,device,interpreter}, files}`；`ok` 只表示包自身完整，`signature.trusted` 与 `host.*` 是交给调用方判断的事实。`install` 仍走 `plugin::verify` 的严格策略，二者不共用“是否可安装”的结论。
+- `plugin verify <file.spk> [--json]` 只做包自身校验（清单 / 文件哈希 / 签名结构；不要求平台匹配、不要求 key 在 trust.d、不解析解释器），不落盘。`--json` 输出 `{ok, file, id, name, displayName, version, platform, schema, size, sha256, capabilities, compat, signature:{state,keyId,trusted}, host:{matchesHost,device,interpreter}, files}`；`ok` 只表示包自身完整，`signature.trusted` 与 `host.*` 是交给调用方判断的事实。`install` 仍走 `plugin::verify` 的严格策略，二者不共用“是否可安装”的结论。
 - 信任根：`<config>/trust.d/<keyId>.pub`（**PEM SPKI**）；未知 keyId 默认拒绝。未签名安装只由 `svcd.conf` 的 `allow_insecure_install` 控制：开启后安装路径先严格验签，失败才降级接受缺 `signature.json` 或未信任 key 的包，并在日志中标注未验签；CLI/HTTP/Web 都没有逐次 insecure 参数或勾选项。
 - 信任根由管理员管理：`svc trust list|add <file.pub>|remove <keyId>`，或 Web 控制台的 `POST /api/v1/trust?key_id=<id>` 上传；`svcd --install` 会写入内置的 store 发布钥，同名文件已存在时不覆盖。包内永不携带自己的信任根（自签自证没有意义）。
 - `svcd --install` 把内置的 store 发布公钥写到 `<config>/trust.d/signing.pub`；已存在的同名文件不覆盖，便于管理员轮换。`SVCD_TRUST_DIR` 可覆盖 trust.d，供测试与非 root 开发。
@@ -445,7 +448,8 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 - `protocol: 1` 精确匹配；主版本内加法兼容；未知方法 `-32601`，未知字段忽略。
 - `config` / `configCheck` 为加法字段；旧 svcd 忽略它们（版本偏斜，文档写明）。
 - `arch` 不是合法字段：v1 的 `schema: 1` 已重写为只含 `platform`；不提供 arch 兼容层。
-- `schema: 2` 只增加 `lifecycle` / `interpreter`；老 daemon 在验包阶段拒绝 2，避免静默忽略导致脚本以错误参数启动。schema 1 的旧包行为不变。
+- manifest 格式已重编号（#260）：只有 `schema: 1`，`lifecycle` / `interpreter` / `compat` / `icons` / `capabilities[].outputSchema` 全在 1 内；旧线任何版本的包都缺必填 `id`，会在验包阶段被拒绝并提示重打包。不提供读入兼容或 id 迁移。
+- `id` 变了就是新插件：按 `id` 落目录，旧目录不迁移；改 `id` 前先 `plugin uninstall`。显示名允许重复。
 - 插件升级：默认 `replace` 采用 §2.4 的「空间检查 → 备份/还原或删旧」语义；显式 `--strategy keep-old` 走原子并存；活动配置在版本目录外，先删旧版本不会丢。
 
 ## 12. 票与笔记索引
@@ -537,6 +541,7 @@ JSON，`schema: 1` 或 `schema: 2`（2 只增加 `lifecycle` / `interpreter`，�
 - 2026-11-13（补）：信任根可管理——`svc trust list|add|remove`、`GET/POST/DELETE /api/v1/trust`、Web 控制台上传 `.pub`；包内不携带信任根。
 - 2026-11-22（补）：安装器内置 store 发布钥，`svcd --install` 写入 `trust.d/signing.pub`；商城不再自己分发公钥。
 - 2026-11-13（补）：脚本插件——`schema: 2` 增加 `lifecycle` / `interpreter`；脚本 payload 必须声明解释器（版本可空），安装时解析并校验，运行时统一经解释器执行；core drop-in 脚本可原样加 manifest 转成 plugin；`plugin bundle --from-core` 自动生成 lifecycle；老 daemon 拒绝 schema 2。
+- 2026-11-23（#260）：manifest 格式重编号为 `schema: 1`（唯一版本、不读旧线任何版本）。新增必填 `id`（身份）与 `name`（显示名，可中文）、`capabilities[].outputSchema`、顶层 `icons`；`lifecycle` / `interpreter` / `compat` 并入 1，取消 1/2/3 分级门禁；`interpreter` 由「脚本必需」改为「可选，声明了就必须有脚本」。`plugin bundle` 恒写 `schema: 1`，`--id` 写身份、`--name` 写显示名。
 - 2026-11-17：控制通道删除 `svcd.token`，鉴权改为端点 ACL；本地两档由 `svcd` / `svcd-admin` 两个端点实施；C8 改为两端点各一条显式 protected DACL。
 
 ## 16. 实施票（2026-11-12 拆出）
