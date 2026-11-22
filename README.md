@@ -32,21 +32,7 @@
 | 全功能（默认 features） | `x86_64-pc-windows-msvc` | 1,138,176 B ≈ 1.1 MiB（基线，[ci/size-baseline.json](ci/size-baseline.json)） |
 | 嵌入式 lean（`--no-default-features`） | `x86_64-unknown-linux-musl` | **1,616,928 B ≈ 1.5 MiB** |
 
-门禁写在 [ci/README.md](ci/README.md)：嵌入式 ≤ 2,000,000 B、桌面 ≤ 30,000,000 B，超限直接 fail。
-全功能版比嵌入式门禁高 3.7%，所以嵌入式档走 lean；桌面档离 30 MB 还有 28 MB 余量。
-
-### 体积是怎么压下来的
-
-- **一个二进制、三个别名入口**：`svc` / `plugin` / `mcp` 是同一个文件的硬链接，装一份、量一次。
-- **一个特性闸门装下所有网络面**：`http` feature 同时管管理 API、内嵌控制台、插件 UI、LAN 认证与 MCP HTTP；`--no-default-features` 一次砍掉，留纯监督器。
-- **release 配置按体积调**：`opt-level = "z"`、fat LTO、`codegen-units = 1`、`panic = "abort"`、`strip = "symbols"`（[Cargo.toml](Cargo.toml)）。
-- **无 async runtime、无 TLS**：直接依赖只有 6 个（serde、serde_json、ed25519-dalek、sha2、base64、getrandom）；不链 tokio / hyper / OpenSSL，TLS 由部署侧终结。
-- **musl 静态链接**：一个文件扔进任意 rootfs；x86_64 / aarch64 / armv7 用 cargo-zigbuild 交叉，CI 同时出三份。
-- **插件不进二进制**：`.spk` 按需安装、按需启动，二进制不随插件数增长。
-- **内存走同一条不变量**：`MEM_LEVEL=low` 把预算上限定在 128 MiB；空闲 3.1–3.4 MiB RSS；线程数固定为 2 + 阻塞池（tiny / interactive / streaming = 6 / 10 / 18 条），不随连接数增长；50 MiB 预算下跑 40 个插件，daemon 也只到 7.4 MiB。
-- **两道尺寸门禁**：`size.yml` 量 stripped 二进制（嵌入式 2 MB / 桌面 30 MB），`size-lint` 管 `src/**/*.rs` 单文件行数；基线在 [ci/size-baseline.json](ci/size-baseline.json)，涨 2% 出警告。
-
-嵌入式上的取舍说清楚：lean 构建没有 HTTP 面（也就没有网页控制台、插件 UI、MCP HTTP），只保留 CLI + 监督 + 契约线；要远程管理就装全功能版，2.0 MiB 对 16 MB 的 rootfs 也只占 12%。
+嵌入式的取舍说清楚：lean 构建没有 HTTP 面（也就没有网页控制台、插件 UI、MCP HTTP），只保留 CLI + 监督 + 契约线；要远程管理就装全功能版，2.0 MiB 对 16 MB 的 rootfs 也只占 12%。
 
 ## 快速开始
 
@@ -84,7 +70,7 @@ svc start demo
 svc list
 ```
 
-> 目前还没有官方插件目录服务，只有发布钥这一把默认信任根。
+> 还没有官方目录服务、审核和更新协议：今天只有发布钥这一把默认信任根，加上一个读静态发布表的初版商店（见下）。
 > 要装**未签名**的 `.spk`（自己用 `plugin bundle --unsigned` 打的、或从源码构建的样例包），
 > 先在本机配置里打开开关，再重启 daemon：
 >
@@ -99,6 +85,24 @@ svc list
 > 正式分发仍然应该签名；商店发布钥已经由安装器写入 `trust.d`。
 
 然后在浏览器打开 `http://127.0.0.1:8787/`，用控制台点「打开」——控制台会现签一个 1 小时有效的插件 UI token，地址形如 `/plugin-ui/demo/<token>/`。
+
+### 插件商店
+
+初版商店已经开源，它就是一个普通插件：读发布表、只列本机 `platform` 能装的包，下载后经 `$blob` 与 `POST /api/v1/plugins` 交给宿主安装——签名与平台校验仍由 svcd 做。
+
+- 商店源码：[webxxxxx/plugins · plugins/plugin-store](https://github.com/webxxxxx/plugins/tree/main/plugins/plugin-store)
+- 插件列表：[docs/plugins.md](https://github.com/webxxxxx/plugins/blob/main/docs/plugins.md)——CI 生成，只列每个插件 / 平台的最新稳定版，预发布与历史版本在 [Releases](https://github.com/webxxxxx/plugins/releases)
+
+商店自己也是插件，从 `plugin-store-v*` 的 Releases 里取本机平台的包；列表里的包同样直接装，发布钥就是 `svcd --install` 写进 `trust.d` 的那把：
+
+```sh
+plugin install plugin-store-0.1.6-x86_64-pc-windows-msvc.spk   # 版本与三元组按最新的换
+svc start plugin-store             # 首装不自启
+plugin install meow-1.0.1-x86_64-unknown-linux-musl.spk
+svc start meow
+```
+
+装好商店在控制台点「打开」：按本机 platform 过滤、每页 50 条、已装版本低于目录版本时操作列显示「升级」。这是网页商城的第一版，不是目录服务——列表仍是一份 CI 生成的静态 Markdown。
 
 ### 接入 MCP 客户端
 
@@ -271,7 +275,7 @@ Windows 的差来自不变量为「每连接一条线程」记账（`request_sta
 
 ## 协议一致性矩阵
 
-协议栈是自己写的（没有 hyper / tokio / tungstenite），每条线都要和标准逐项对。下表来自
+没有依赖三方库，协议栈也是（没有 hyper / tokio / tungstenite），每条线都要和标准逐项对。下表来自
 [#106 的协议一致性审计](https://github.com/webxxxxx/plugin-manager/issues/106#issuecomment-7055759922)（2026-11-21），
 图例：✅ 线格式测试通过（raw socket / 独立客户端）；🟡 已实现，但只有仓内测试或实现偏宽松；❌ 未实现或不符合规范；— 明确不在范围。
 带 † 的行是审计之后 main 有变化、已按当前代码校正的。
@@ -325,7 +329,7 @@ Windows 的差来自不变量为「每连接一条线程」记账（`request_sta
 
 ## 路线图
 
-架构文档把系统对服务的四件事定为 manage / supervise / orchestrate / cluster；今天**只有前两件是跑通的**（[docs/architecture.md §3](docs/architecture.md#L83-L92)）。下面这些是方向，不是承诺，按「现在有什么地基」排序。
+架构文档把系统对服务的四件事定为 manage / supervise / orchestrate / cluster；今天**只有前两件是跑通的**（[docs/architecture.md §3](docs/architecture.md#L83-L92)）。下面这些是方向，不是承诺。
 
 | 方向 | 状态 | 要做成什么 | 现在的地基 |
 | --- | --- | --- | --- |
@@ -333,15 +337,8 @@ Windows 的差来自不变量为「每连接一条线程」记账（`request_sta
 | **集群** cluster | 方向，无票 | 决定服务在哪台机器上跑；对编排透明——编排只认契约，不知道背后是本机还是远程 | 契约的 `ImplRef` 只差一个远程 adapter；远程节点的注册、健康、调度、跨机调用都还没有 |
 | **AI agent** | 方向，无票 | 两层：① 运维 agent——查状态、启停、读日志、定位失败、按预算调整；② 按需求生成插件——产出 manifest + payload，签好名再走安装 | ① 的地基已经在了：`/mcp`（modern Streamable HTTP）已暴露 `tools/list`、`tools/call` 和每个服务的 `<id>.start`，接一个 agent 就能用；② 的地基是 `plugin verify` + `plugin install` 的校验链 |
 | **插件 GUI** | 部分有票 [#41](https://github.com/webxxxxx/plugin-manager/issues/41) | 插件自带的状态面板、配置表单、能力调用界面；桌面侧用 WebView 窗口承载 | web 侧已实现：`.spk` 里的 `ui: {type: web, entry}` 由 daemon 托管在 `/plugin-ui/{id}/{token}/`，SSE / WebSocket / rpc 都通，浏览器侧 toolkit 在 [plugins/sdk/web](https://github.com/webxxxxx/plugins)；桌面 `svc ui` 只定了入口，内容还没定（#41） |
-| **插件商城** | 方向，无票 | 按 `platform` 三元组过滤、签名分发、更新与审核；桌面/网页都能逛 | 分发地基齐了：`.spk` 签名 + `svc trust` 信任根 + `plugin verify` / `export` / `bundle` + 全三元组平台校验；缺目录服务、元数据与更新协议 |
+| **插件商城** | 网页侧初版已开源（[plugin-store](https://github.com/webxxxxx/plugins/tree/main/plugins/plugin-store)），无票 | 按 `platform` 三元组过滤、签名分发、更新与审核；桌面/网页都能逛 | 分发地基齐了：`.spk` 签名 + `svc trust` 信任根 + `plugin verify` / `export` / `bundle` + 全三元组平台校验；初版商店已跑通「列表 → 下载 → 安装」，还缺远端目录服务、审核与更新协议 |
 | **OpenWrt ipk → spk** | 方向，无票 | 把 OpenWrt 的 opkg/apk 包转成 `.spk`：`depends` → `dependencies`、init 脚本 → `lifecycle`、架构 → `platform` 三元组，让现有插件生态能直接装 | `.spk` 就是 ustar tar + manifest，`plugin verify` 已能独立做结构校验；嵌入式发行（svcd 自己打成 ipk/apk、targets.toml、overlay 约束）在 [#43](https://github.com/webxxxxx/plugin-manager/issues/43)，与这个转换器是两件事 |
-
-建议的先后顺序（判断，不是既定计划）：
-
-1. **编排先于集群**：集群只是把编排的执行点换到另一台机器，契约和编排语法不变；先有单机编排，集群才有一个可搬运的单位。
-2. **商城先于 AI 生成**：生成出来的包必须过 `verify`、过签名、过平台过滤，还得有人审；商城是这条链的分发面。
-3. **插件 GUI 先于商城**：插件页面就是商城的展示面，先把 `ui` 的约定（入口、token、能力调用）打磨稳，商城才有东西可陈列。
-4. **AI 运维先于 AI 生成**：前者只需要把 MCP 工具面从今天的「只有 `start`」补到 status / logs / diagnostics，就能落地；后者要动代码生成与审核，风险高一个量级。
 
 这些方向都**不在核心层规格里**（[core-selection-spec.md](docs/core-selection-spec.md#L5) 明确把商城、ipk2spk、AI 建插件流水线列为 out of scope），所以上面没有给时间表；要动哪个，先拆票。
 
@@ -373,12 +370,12 @@ cd plugins/wireguard && plugin-tools build   # 构建 + 打包；不带 --key �
 | 文档 | 内容 |
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | 分层总图、监督状态机、契约与一次调用的路径 |
-| [GLOSSARY.md](GLOSSARY.md) | 词表（服务、槽、契约、预算…） |
-| [docs/adr/](docs/adr/) | 已定决策：预算即真相、契约接口、S4 请求交接… |
 | [docs/testing.md](docs/testing.md) | 测试分层与 WSL 真跑方式 |
 | [docs/user-mode.md](docs/user-mode.md) | 用户模式安装、目录、安全边界 |
 | [docs/perf/](docs/perf/) | 全部性能矩阵与复现命令 |
 | [webxxxxx/plugins](https://github.com/webxxxxx/plugins) | 插件模板、四语言 SDK、`plugin-tools`、四份样例 |
+| [plugins/plugin-store](https://github.com/webxxxxx/plugins/tree/main/plugins/plugin-store) | 初版插件商店：读发布表、平台过滤、下载后交给宿主安装 |
+| [docs/plugins.md](https://github.com/webxxxxx/plugins/blob/main/docs/plugins.md) | 插件下载列表，CI 生成，只列每平台最新稳定版 |
 | [samples/spk-tests/](samples/spk-tests/README.md) | 五个 WSL 冒烟包：依赖、MCP、WS、SSE |
 
 ## 测试
