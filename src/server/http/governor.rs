@@ -65,10 +65,10 @@ impl CpuGovernor {
         if let Err(error) = spawned {
             // Without a sampler the gate stays closed, which would refuse every
             // connection: log and leave it open instead.
-            crate::platform::log::svcd(&format!(
-                "svcd: cpu governor thread failed: {}; admission stays open",
+            error!(
+                "cpu governor thread failed: {}; admission stays open",
                 error
-            ));
+            );
             self.stop.store(true, Ordering::Relaxed);
         }
     }

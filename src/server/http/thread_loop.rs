@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 
 use crate::platform::config::Config;
 use crate::platform::host::threads as host_threads;
-use crate::platform::log;
 use crate::server::auth::lan::Lan;
 use crate::server::http::blocking::write_http;
 use crate::server::http::engine;
@@ -182,11 +181,11 @@ pub(crate) fn serve(
                     // The failed spawn drops the closure, and with it the
                     // lease, so the slot is released even though no handler
                     // ever ran.
-                    log::svcd(&format!("svcd: HTTP connection thread failed: {}", error));
+                    error!("HTTP connection thread failed: {}", error);
                 }
             }
             Err(error) => {
-                log::svcd(&format!("svcd: HTTP accept failed: {}", error));
+                error!("HTTP accept failed: {}", error);
                 return;
             }
         }
@@ -212,10 +211,7 @@ impl Connection {
         // the socket back before installing the read timeout. Otherwise a body
         // that has not arrived yet becomes a WouldBlock "read" error.
         if let Err(error) = stream.set_nonblocking(false) {
-            log::svcd(&format!(
-                "svcd: HTTP connection: cannot switch to blocking mode: {}",
-                error
-            ));
+            error!("HTTP connection: cannot switch to blocking mode: {}", error);
         }
         // The configured `http_idle_timeout_secs` replaces the old hard-coded
         // 60 s. It covers any wait for request bytes: the first request, the

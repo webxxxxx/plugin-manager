@@ -144,14 +144,37 @@ fn drain_lines(source: &mut Source) -> bool {
             return drain_length_frames(source);
         }
     }
+    if matches!(source.kind, SourceKind::Log) && source.discarding {
+        match source.buffer.iter().position(|byte| *byte == b'\n') {
+            Some(position) => {
+                source.buffer.drain(..=position);
+                source.discarding = false;
+            }
+            None => {
+                source.buffer.clear();
+                return true;
+            }
+        }
+    }
     loop {
         let Some(position) = source.buffer.iter().position(|byte| *byte == b'\n') else {
             let max = match &source.kind {
                 SourceKind::Frames { max, .. } => *max,
-                SourceKind::Log => MAX_LOG_LINE,
-                SourceKind::RawStdin { .. } | SourceKind::RawStdout { .. } => MAX_LOG_LINE,
+                SourceKind::Log => crate::platform::log::MAX_LINE_BYTES,
+                SourceKind::RawStdin { .. } | SourceKind::RawStdout { .. } => {
+                    crate::platform::log::MAX_LINE_BYTES
+                }
             };
             if source.buffer.len() > max {
+                if matches!(source.kind, SourceKind::Log) {
+                    // The write side truncates and marks this record; the
+                    // source keeps reading instead of being dropped (#174).
+                    let line = String::from_utf8_lossy(&source.buffer).into_owned();
+                    log_line(&source.log, &line);
+                    source.buffer.clear();
+                    source.discarding = true;
+                    return true;
+                }
                 if let SourceKind::Frames { sender, .. } = &source.kind {
                     let _ = sender.try_send(FrameEvent::Frame(Err(FrameError::TooLarge { max })));
                 }
@@ -195,6 +218,9 @@ fn drain_lines(source: &mut Source) -> bool {
             SourceKind::Log => {
                 let line: Vec<u8> = source.buffer.drain(..=position).collect();
                 let line = &line[..line.len().saturating_sub(1)];
+                // A CRLF terminator is still one line; only a bare CR is
+                // message content and gets escaped by the writer.
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
                 log_line(&source.log, &String::from_utf8_lossy(line));
             }
             SourceKind::RawStdin { .. } | SourceKind::RawStdout { .. } => return true,
@@ -253,10 +279,10 @@ fn drain_length_frames(source: &mut Source) -> bool {
     }
 }
 
-fn log_line(log: &Option<Arc<Mutex<LogSink>>>, line: &str) {
-    if let Some(sink) = log {
-        if let Ok(mut sink) = sink.lock() {
-            let _ = sink.line(line);
+fn log_line(log: &Option<Arc<Mutex<LogWriter>>>, line: &str) {
+    if let Some(writer) = log {
+        if let Ok(mut writer) = writer.lock() {
+            let _ = writer.record(crate::platform::log::Level::Info, line);
         }
     }
 }

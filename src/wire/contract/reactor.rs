@@ -33,12 +33,11 @@ use std::time::Duration;
 
 use crate::platform::host::poll;
 use crate::platform::host::wake::Wake;
-use crate::platform::log::{self, LogSink};
+use crate::platform::log::{self, LogWriter};
 use crate::wire::message::ipc::{FrameError, FrameEvent};
 use crate::wire::message::ipc::{RawFailure, RawStopSink};
 
 const READ_CHUNK: usize = 8 * 1024;
-const MAX_LOG_LINE: usize = 64 * 1024;
 /// Protocol-3 raw frame header: `u32 payload_len (BE) + u32 stream_id (BE)`.
 const RAW_HEADER: usize = 8;
 /// Raw stdout is read in large non-blocking bursts: a 512 KiB plugin frame
@@ -115,7 +114,10 @@ struct Source {
     kind: SourceKind,
     buffer: Vec<u8>,
     blocked: bool,
-    log: Option<Arc<Mutex<LogSink>>>,
+    log: Option<Arc<Mutex<LogWriter>>>,
+    /// A log line crossed the per-line bound: the rest of that physical line
+    /// is discarded until its newline, so the source is never closed.
+    discarding: bool,
     /// Set for protocol-3 sources; the reactor reports the stop reason there
     /// together with the transport generation it registered.
     hub: Option<(Weak<dyn RawStopSink>, u64)>,
@@ -131,12 +133,13 @@ impl Source {
             buffer: Vec::new(),
             blocked: false,
             log: None,
+            discarding: false,
             hub: None,
             stop: None,
         }
     }
 
-    fn with_log(mut self, log: Option<Arc<Mutex<LogSink>>>) -> Self {
+    fn with_log(mut self, log: Option<Arc<Mutex<LogWriter>>>) -> Self {
         self.log = log;
         self
     }
@@ -298,7 +301,7 @@ impl Reactor {
         stderr: Option<File>,
         sender: SyncSender<FrameEvent>,
         wake: Option<Arc<Wake>>,
-        log: Option<Arc<Mutex<LogSink>>>,
+        log: Option<Arc<Mutex<LogWriter>>>,
         max: usize,
         framing: Framing,
     ) -> io::Result<()> {
@@ -327,7 +330,7 @@ impl Reactor {
         id: String,
         stdout: File,
         stderr: Option<File>,
-        log: Option<Arc<Mutex<LogSink>>>,
+        log: Option<Arc<Mutex<LogWriter>>>,
     ) -> io::Result<()> {
         let mut sources =
             vec![Source::new(id.clone(), stdout, SourceKind::Log).with_log(log.clone())];
@@ -352,7 +355,7 @@ impl Reactor {
         stdin: File,
         stdout: File,
         stderr: Option<File>,
-        log: Option<Arc<Mutex<LogSink>>>,
+        log: Option<Arc<Mutex<LogWriter>>>,
         hub: Weak<dyn RawStopSink>,
         generation: u64,
         max_frame: usize,
@@ -637,5 +640,64 @@ mod tests {
         queue.push(vec![4, 5, 6]).expect("second frame");
         let delivered = pump(&queue, &mut read, &mut write);
         assert_eq!(delivered, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn an_overlong_log_line_is_truncated_and_the_source_keeps_reading() {
+        use std::process::{Command, Stdio};
+
+        let reactor = Reactor::start().expect("reactor");
+        let root = crate::test_support::temp_dir()
+            .join(format!("svcd-reactor-long-log-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("temp dir");
+        let mut limits = crate::platform::limits::test_default();
+        limits.log_max_bytes = 1024 * 1024;
+        limits.log_rotations = 1;
+        limits.log_level = crate::platform::log::Level::Trace;
+        let writer = LogWriter::open(
+            &root,
+            "demo",
+            "plugin:demo",
+            &limits,
+            crate::platform::clock::Clock::fixed(1_700_000_000_000),
+            false,
+        )
+        .expect("log");
+        let log = Arc::new(Mutex::new(writer));
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("head -c 70000 /dev/zero | tr '\\0' 'x'; printf '\\nafter\\n'")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("child");
+        let stdout = to_file(child.stdout.take().expect("stdout"));
+        reactor
+            .register_log("demo".into(), stdout, None, Some(log))
+            .expect("register");
+
+        let path = root.join("demo.log");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let text = loop {
+            reactor.poll_once(Duration::from_millis(50));
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            if text.contains("after") {
+                break text;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "log did not advance: {text:?}"
+            );
+        };
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(text.contains("…(truncated"), "{text:?}");
+        assert!(
+            text.lines().any(|line| line.ends_with(" after")),
+            "the line after the overlong one must be logged: {text:?}"
+        );
+        assert!(text.contains(" INFO  plugin:demo "), "{text:?}");
     }
 }

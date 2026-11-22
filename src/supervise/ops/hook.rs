@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::manage as package;
-use crate::platform::log::{self, LogSink};
+use crate::platform::log::{self, LogWriter};
 use crate::platform::paths::Paths;
 
 /// Both hook actions share the same 60-second budget.
@@ -83,13 +83,20 @@ pub fn run(
 
     // Per the log contract, hook output goes to `<logs>/<id>-hooks.log`, not the
     // service log; `svc logs` keeps showing only the supervised process.
-    let log = match LogSink::open(&paths.logs_dir, &format!("{}-hooks", spec.id), limits) {
+    let log = match LogWriter::open(
+        &paths.logs_dir,
+        &format!("{}-hooks", spec.id),
+        &format!("hook:{}", spec.id),
+        limits,
+        log::clock(),
+        false,
+    ) {
         Ok(sink) => Some(Arc::new(Mutex::new(sink))),
         Err(error) => {
-            log::svcd(&format!(
-                "svcd: plugin {}: cannot open {} hook log: {}",
+            error!(
+                "plugin {}: cannot open {} hook log: {}",
                 spec.id, spec.action, error
-            ));
+            );
             None
         }
     };
@@ -110,10 +117,10 @@ pub fn run(
             log.clone(),
             limits,
         ) {
-            log::svcd(&format!(
-                "svcd: plugin {}: {} hook stdout reader: {}",
+            error!(
+                "plugin {}: {} hook stdout reader: {}",
                 spec.id, spec.action, error
-            ));
+            );
         }
     }
     if let Some(stderr) = streams.stderr {
@@ -123,10 +130,10 @@ pub fn run(
             log,
             limits,
         ) {
-            log::svcd(&format!(
-                "svcd: plugin {}: {} hook stderr reader: {}",
+            error!(
+                "plugin {}: {} hook stderr reader: {}",
                 spec.id, spec.action, error
-            ));
+            );
         }
     }
 
@@ -135,10 +142,7 @@ pub fn run(
         match child.try_wait() {
             Ok(Some(status)) => {
                 if status.success() {
-                    log::svcd(&format!(
-                        "svcd: plugin {}: {} hook ok",
-                        spec.id, spec.action
-                    ));
+                    info!("plugin {}: {} hook ok", spec.id, spec.action);
                     return Ok(());
                 }
                 return Err(

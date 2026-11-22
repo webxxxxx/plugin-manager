@@ -134,10 +134,10 @@ impl Supervisor {
                 ));
             }
             if self.slots[id].machine.state == State::Starting {
-                log::svcd(&format!(
-                    "svcd: {}: start requested while already Starting; no new spawn for this call",
+                info!(
+                    "{}: start requested while already Starting; no new spawn for this call",
                     id
-                ));
+                );
             }
             let now = clock.now().mono_ms;
             self.slots
@@ -159,10 +159,7 @@ impl Supervisor {
                         // pass looked (`ready: exec` one-shots do exactly that).
                         // Waiting for Running burns the whole window and reports
                         // a timeout for a start that did succeed.
-                        log::svcd(&format!(
-                            "svcd: {}: exited cleanly during start; the start is complete",
-                            id
-                        ));
+                        info!("{}: exited cleanly during start; the start is complete", id);
                     }
                     start::Step::Waiting => all_settled = false,
                     start::Step::Failed => {
@@ -180,10 +177,10 @@ impl Supervisor {
                             .last_exit
                             .map(|code| code.to_string())
                             .unwrap_or_else(|| "unknown".into());
-                        log::svcd(&format!(
-                            "svcd: {}: exited during start (exit code {}); the start failed",
+                        error!(
+                            "{}: exited during start (exit code {}); the start failed",
                             id, code
-                        ));
+                        );
                         return Err(ProblemError::new(
                             Problem::Internal,
                             format!("service {} exited during start (exit code {})", id, code),
@@ -196,11 +193,11 @@ impl Supervisor {
             }
             if clock.now().mono_ms >= deadline {
                 for id in &pending {
-                    log::svcd(&format!(
-                        "svcd: {}: start timed out waiting for ready ({})",
+                    error!(
+                        "{}: start timed out waiting for ready ({})",
                         id,
                         self.slots[id].handshake_snapshot()
-                    ));
+                    );
                 }
                 return Err(ProblemError::new(
                     Problem::Timeout,
@@ -441,10 +438,7 @@ fn shutdown_layers(registry: &Registry, ids: Vec<String>) -> (Vec<Vec<String>>, 
     match registry.start_layers(&ids) {
         Ok(layers) => (layers, false),
         Err(error) => {
-            log::svcd(&format!(
-                "svcd: shutdown: {}; stopping every service in one layer",
-                error
-            ));
+            warn!("shutdown: {}; stopping every service in one layer", error);
             (vec![ids], true)
         }
     }

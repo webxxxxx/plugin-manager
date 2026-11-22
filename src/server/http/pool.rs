@@ -18,8 +18,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 
-use crate::platform::log;
-
 /// Why the pool refused a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Busy {
@@ -284,7 +282,7 @@ fn run_worker(inner: Arc<Inner>) {
         };
 
         if outcome.is_err() {
-            log::svcd(&format!("svcd: blocking job {} panicked", key));
+            error!("blocking job {} panicked", key);
         }
         let finished = &inner.finished;
         let outcome = if cancelled {

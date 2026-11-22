@@ -16,7 +16,6 @@ use crate::face::uichannel::EventBus;
 #[cfg(feature = "http")]
 use crate::platform::config::Config;
 #[cfg(feature = "http")]
-use crate::platform::log;
 #[cfg(feature = "http")]
 use crate::server::auth::lan::Lan;
 
@@ -58,11 +57,11 @@ pub(super) fn spawn_http(
     // `svc lan passwd`, then restart to pick up the requested bind.
     let mut bind = requested;
     if !requested.ip().is_loopback() && password_hash.is_none() {
-        log::svcd(&format!(
-            "svcd: bind {} requires auth_passwd; falling back to 127.0.0.1:{}",
+        warn!(
+            "bind {} requires auth_passwd; falling back to 127.0.0.1:{}",
             requested,
             requested.port()
-        ));
+        );
         bind = SocketAddr::from(([127, 0, 0, 1], requested.port()));
     }
     let require_auth = !bind.ip().is_loopback();
@@ -75,25 +74,18 @@ pub(super) fn spawn_http(
                 state.bind = local;
                 let port_file = config.paths.run_dir.join("http.port");
                 if let Err(error) = fs::write(&port_file, format!("127.0.0.1:{}", local.port())) {
-                    log::svcd(&format!(
-                        "svcd: cannot write {}: {}",
-                        port_file.display(),
-                        error
-                    ));
+                    error!("cannot write {}: {}", port_file.display(), error);
                 }
-                log::svcd(&format!(
-                    "svcd: HTTP API on {} (auth required: {})",
-                    local, require_auth
-                ));
+                info!("HTTP API on {} (auth required: {})", local, require_auth);
                 Some(listener)
             }
             Err(error) => {
-                log::svcd(&format!("svcd: HTTP API disabled: {}", error));
+                warn!("HTTP API disabled: {}", error);
                 None
             }
         },
         Err(error) => {
-            log::svcd(&format!("svcd: HTTP API disabled: {}", error));
+            warn!("HTTP API disabled: {}", error);
             None
         }
     };
@@ -128,12 +120,12 @@ pub(super) fn spawn_http(
             Ok(installed) => installed,
             Err(why) => format!("admission shedding only ({why})"),
         };
-        log::svcd(&format!(
-            "svcd: cpu: budget {}% of {} cores, {}",
+        info!(
+            "cpu: budget {}% of {} cores, {}",
             governor.target_percent(),
             governor.cores(),
             mode
-        ));
+        );
         governor.start();
     }
 

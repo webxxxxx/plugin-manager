@@ -10,7 +10,6 @@ use crate::kernel::failure::ProblemError;
 use crate::kernel::registry::{Service, State};
 use crate::manage as plugin;
 use crate::platform::clock::Clock;
-use crate::platform::log;
 use crate::supervise::check::reconcile;
 use crate::supervise::model::definition;
 use crate::supervise::model::runtime::{self};
@@ -41,10 +40,10 @@ impl Supervisor {
                         .unwrap_or(false)
                 });
                 if changed {
-                    log::svcd(&format!("svcd: rescan: {}", summary));
+                    info!("rescan: {}", summary);
                 }
             }
-            Err(error) => log::svcd(&format!("svcd: rescan failed: {}", error)),
+            Err(error) => error!("rescan failed: {}", error),
         }
     }
 
@@ -62,11 +61,11 @@ impl Supervisor {
         let loaded =
             definition::load_services(&self.config.paths.services_dir, &self.config.limits);
         for issue in &loaded.issues {
-            log::svcd(&format!("svcd: reload: warning: {}", issue));
+            warn!("reload: warning: {}", issue);
         }
         let (plugins, warnings) = plugin::scan(&self.config.paths, &self.config.limits);
         for warning in warnings {
-            log::svcd(&format!("svcd: reload: plugin: {}", warning));
+            warn!("reload: plugin: {}", warning);
         }
         // Core definitions win; an installed plugin still lands in `desired` so
         // the stale sweep below does not unregister it on every reload.
@@ -97,7 +96,7 @@ impl Supervisor {
             self.registry.remove(&id);
             runtime::remove(&id, &self.config.paths);
             self.persisted.remove(&id);
-            log::svcd(&format!("svcd: reload: removed {}", id));
+            info!("reload: removed {}", id);
             removed.push(id);
         }
 
@@ -113,7 +112,7 @@ impl Supervisor {
                 .unwrap_or(false);
             if enabled {
                 if let Err(error) = self.start_service(id, clock) {
-                    log::svcd(&format!("svcd: reload: cannot start {}: {}", id, error));
+                    error!("reload: cannot start {}: {}", id, error);
                 }
             }
         }
@@ -144,10 +143,10 @@ impl Supervisor {
                     // entry: undo the cheap insert.
                     if let Err(reason) = self.registry.insert(service) {
                         self.slots.remove(&id);
-                        log::svcd(&format!("svcd: reload: rejecting {}: {}", id, reason));
+                        warn!("reload: rejecting {}: {}", id, reason);
                         continue;
                     }
-                    log::svcd(&format!("svcd: reload: added {}", id));
+                    info!("reload: added {}", id);
                     added.push(id);
                 }
                 reconcile::Action::Update => {
@@ -171,7 +170,7 @@ impl Supervisor {
                     // enforced here too; a rejected definition keeps the live
                     // service and its slot untouched.
                     if let Err(reason) = self.registry.replace(next) {
-                        log::svcd(&format!("svcd: reload: rejecting {}: {}", id, reason));
+                        warn!("reload: rejecting {}: {}", id, reason);
                         continue;
                     }
                     if let Some(slot) = self.slots.get_mut(&id) {
@@ -183,7 +182,7 @@ impl Supervisor {
                         slot.set_remain_after_exit(remain_after_exit);
                         slot.set_protocol(protocol);
                     }
-                    log::svcd(&format!("svcd: reload: updated {}", id));
+                    info!("reload: updated {}", id);
                     updated.push(id);
                 }
             }

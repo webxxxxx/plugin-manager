@@ -25,7 +25,7 @@ use std::thread;
 #[cfg(unix)]
 use std::sync::Weak;
 
-use crate::platform::log::LogSink;
+use crate::platform::log::LogWriter;
 use crate::wire::contract::stdio::{self, ReadEnd, Streams, WriteEnd};
 use crate::wire::message::ipc::{RawFailure, RawStopSink};
 
@@ -71,14 +71,14 @@ impl RawStats {
             } else {
                 format!(" ({})", detail)
             };
-            crate::platform::log::svcd(&format!(
-                "svcd: raw {}: plugin={} stream={} total={}{}",
+            error!(
+                "raw {}: plugin={} stream={} total={}{}",
                 failure.as_str(),
                 plugin,
                 stream,
                 total,
                 detail
-            ));
+            );
         }
         total
     }
@@ -302,7 +302,7 @@ impl RawHub {
         self: &Arc<Self>,
         id: String,
         streams: Streams,
-        log: Option<Arc<Mutex<LogSink>>>,
+        log: Option<Arc<Mutex<LogWriter>>>,
     ) -> Result<(), String> {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let Streams {
@@ -354,7 +354,7 @@ impl RawHub {
         mut stdin: WriteEnd,
         mut stdout: ReadEnd,
         stderr: Option<ReadEnd>,
-        log: Option<Arc<Mutex<LogSink>>>,
+        log: Option<Arc<Mutex<LogWriter>>>,
     ) -> Result<(), String> {
         let (writer_tx, writer_rx) = sync_channel::<Vec<u8>>(self.writer_queue);
         let plugin = Arc::new(RawPlugin::new(id.clone(), generation));

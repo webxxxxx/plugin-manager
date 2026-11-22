@@ -82,7 +82,7 @@ impl PollSet {
             timeout_ms
         };
         if let Err(error) = poll::poll(&mut fds, timeout_ms) {
-            log::svcd(&format!("svcd: reactor poll failed: {}", error));
+            error!("reactor poll failed: {}", error);
             return;
         }
         if fds[0].revents & libc::POLLIN != 0 {

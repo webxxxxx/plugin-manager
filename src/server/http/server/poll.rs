@@ -347,10 +347,7 @@ impl TimerOps for Server {
                             && outcome == JobOutcome::Finished
                             && connections.contains_key(&key)
                         {
-                            log::svcd(&format!(
-                                "svcd: blocking completion for connection {} lost its slot",
-                                key
-                            ));
+                            error!("blocking completion for connection {} lost its slot", key);
                         }
                         continue;
                     };

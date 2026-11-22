@@ -401,7 +401,7 @@ impl StreamDriver {
                             return true;
                         }
                         Err(error) => {
-                            log::svcd(&format!("svcd: plugin UI asset read failed: {}", error));
+                            error!("plugin UI asset read failed: {}", error);
                             self.closing =
                                 Some(CloseReason::Failed(format!("read UI asset: {}", error)));
                             return true;
@@ -409,7 +409,7 @@ impl StreamDriver {
                     }
                 }
                 Err(error) => {
-                    log::svcd(&format!("svcd: plugin UI file send failed: {}", error));
+                    error!("plugin UI file send failed: {}", error);
                     self.closing = Some(CloseReason::Failed(format!("send UI asset: {}", error)));
                     return true;
                 }

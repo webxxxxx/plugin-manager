@@ -62,6 +62,8 @@ pub struct Settings {
     pub log_rotations: Option<usize>,
     /// `false` keeps logs on stderr/syslog only. Default: true.
     pub log_to_file: Option<bool>,
+    pub log_level: Option<crate::platform::log::Level>,
+    pub log: Option<bool>,
     /// Explicit thread stack sizes. The workload shape supplies the defaults.
     pub request_stack_bytes: Option<usize>,
     pub io_stack_bytes: Option<usize>,
@@ -200,6 +202,8 @@ pub(crate) const ENV_KEYS: &[&str] = &[
     "log_max_bytes",
     "log_rotations",
     "log_to_file",
+    "log_level",
+    "log",
     "request_stack_bytes",
     "io_stack_bytes",
     "blocking_threads",
@@ -414,6 +418,26 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
             "log_to_file" => {
                 settings.log_to_file = Some(parse_bool(value).ok_or_else(|| {
                     format!("line {}: invalid log_to_file {:?}", index + 1, value)
+                })?)
+            }
+            "log_level" => {
+                settings.log_level =
+                    Some(crate::platform::log::Level::parse(value).ok_or_else(|| {
+                        let names: Vec<&str> = crate::platform::log::Level::ALL
+                            .iter()
+                            .map(|level| level.as_str().trim())
+                            .collect();
+                        format!(
+                            "line {}: invalid log_level {:?} ({})",
+                            index + 1,
+                            value,
+                            names.join("|")
+                        )
+                    })?)
+            }
+            "log" => {
+                settings.log = Some(parse_bool(value).ok_or_else(|| {
+                    format!("line {}: log must be on or off, got {:?}", index + 1, value)
                 })?)
             }
             "request_stack_bytes" => {
@@ -787,7 +811,6 @@ mod tests {
         assert!(text.contains("allow_insecure_install = yes"), "{text}");
         let _ = fs::remove_dir_all(&directory);
     }
-
     #[test]
     fn parses_runtime_limit_and_log_keys() {
         let settings = parse(
@@ -795,6 +818,8 @@ mod tests {
              log_max_bytes = 65536\n\
              log_rotations = 2\n\
              log_to_file = off\n\
+             log_level = warn\n\
+             log = off\n\
              request_stack_bytes = 131072\n\
              io_stack_bytes = 65536\n\
              blocking_threads = 4\n\
@@ -821,6 +846,8 @@ mod tests {
         assert_eq!(settings.log_max_bytes, Some(65536));
         assert_eq!(settings.log_rotations, Some(2));
         assert_eq!(settings.log_to_file, Some(false));
+        assert_eq!(settings.log_level, Some(crate::platform::log::Level::Warn));
+        assert_eq!(settings.log, Some(false));
         assert_eq!(settings.request_stack_bytes, Some(131072));
         assert_eq!(settings.io_stack_bytes, Some(65536));
         assert_eq!(settings.blocking_threads, Some(4));
@@ -897,7 +924,6 @@ mod tests {
 
         let _ = fs::remove_dir_all(&directory);
     }
-
     #[test]
     fn false_spellings_are_false() {
         for value in ["false", "0", "off", "no", "FALSE"] {
@@ -931,13 +957,14 @@ mod tests {
             "bind = nope\n",
             "bind = 127.0.0.1\n",
             "allow_insecure_install = maybe\n",
+            "log_level = loud\n",
+            "log = maybe\n",
             "bind 127.0.0.1:8787\n",
             "= 1\n",
         ] {
             assert!(parse(text, Path::new("/etc/svcd")).is_err(), "{text:?}");
         }
     }
-
     #[cfg(windows)]
     #[test]
     fn windows_absolute_paths_are_not_joined_again() {

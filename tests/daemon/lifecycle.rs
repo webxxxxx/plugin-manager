@@ -62,11 +62,11 @@ fn service_stdout_and_stderr_are_logged() {
     );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
+    let text = loop {
         let output = sandbox.run_svc(&["logs", "demo", "--lines", "20"]);
-        let text = String::from_utf8_lossy(&output.stdout);
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
         if text.contains("hello-stdout") && text.contains("hello-stderr") {
-            break;
+            break text;
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -74,14 +74,25 @@ fn service_stdout_and_stderr_are_logged() {
             text
         );
         std::thread::sleep(Duration::from_millis(25));
+    };
+    // ADR-0022: both pipes land in the one line shape, labelled `plugin:demo`
+    // and stamped before the level column.
+    for needle in ["hello-stdout", "hello-stderr"] {
+        let line = text
+            .lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no {needle} line in {text:?}"));
+        assert!(line.contains(" INFO  plugin:demo "), "{line}");
+        assert_eq!(&line[10..11], "T", "timestamp column: {line}");
+        assert!(line.starts_with("20"), "timestamp column: {line}");
     }
 
     let svcd = sandbox.run_svc(&["logs", "svcd"]);
     assert_eq!(svcd.status.code(), Some(0));
+    let svcd_text = String::from_utf8_lossy(&svcd.stdout);
     assert!(
-        String::from_utf8_lossy(&svcd.stdout).contains("svcd starting"),
-        "svcd log: {}",
-        String::from_utf8_lossy(&svcd.stdout)
+        svcd_text.contains(" INFO  svcd starting"),
+        "svcd log: {svcd_text}"
     );
 
     let missing = sandbox.run_svc(&["logs", "missing"]);

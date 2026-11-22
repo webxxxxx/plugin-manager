@@ -173,10 +173,7 @@ impl Supervisor {
                 continue;
             };
             if !runtime::same_boot(&record, boot.as_deref()) {
-                log::svcd(&format!(
-                    "svcd: {}: discarding runtime record from another boot",
-                    id
-                ));
+                info!("{}: discarding runtime record from another boot", id);
                 runtime::remove(&id, &self.config.paths);
                 continue;
             }
@@ -216,10 +213,10 @@ impl Supervisor {
                     continue;
                 }
                 runtime::PidState::Reused { expected, actual } => {
-                    log::svcd(&format!(
-                        "svcd: {}: pid {} was reused (starttime {} != {}); not adopting",
+                    warn!(
+                        "{}: pid {} was reused (starttime {} != {}); not adopting",
                         id, pid, actual, expected
-                    ));
+                    );
                     runtime::remove(&id, &self.config.paths);
                     continue;
                 }
@@ -278,7 +275,7 @@ impl Supervisor {
                 }
                 runtime::remove(id, &self.config.paths);
                 self.persisted.remove(id);
-                log::svcd(&format!("svcd: dropped orphan runtime record {}", id));
+                warn!("dropped orphan runtime record {}", id);
             }
         }
     }
@@ -316,7 +313,7 @@ impl Supervisor {
                 Ok(()) => {
                     self.persisted.insert(id, (state, pid, failures));
                 }
-                Err(error) => log::svcd(&format!("svcd: {}: cannot persist state: {}", id, error)),
+                Err(error) => error!("{}: cannot persist state: {}", id, error),
             }
         }
     }
@@ -342,10 +339,10 @@ impl Supervisor {
                 // Without the self-pipe the loop still polls, so requests are
                 // served; they just wait for the poll timeout instead of
                 // interrupting it.
-                Err(error) => log::svcd(&format!(
-                    "svcd: cannot bind the plugin-stdio poll wake; requests wait for the poll timeout: {}",
+                Err(error) => warn!(
+                    "cannot bind the plugin-stdio poll wake; requests wait for the poll timeout: {}",
                     error
-                )),
+                ),
             }
         }
         self.reactor = reactor.clone();
@@ -401,7 +398,7 @@ impl Supervisor {
         let layers = match self.registry.start_layers(&eligible) {
             Ok(layers) => layers,
             Err(error) => {
-                log::svcd(&format!("svcd: start enabled: {}", error));
+                error!("start enabled: {}", error);
                 log::note_slow("start_enabled", started);
                 return;
             }
@@ -412,7 +409,7 @@ impl Supervisor {
                 .mono_ms
                 .saturating_add(supervisor::START_TIMEOUT_MS);
             if let Err(error) = self.start_layer(&layer, deadline, clock) {
-                log::svcd(&format!("svcd: start enabled: {}", error));
+                error!("start enabled: {}", error);
             }
         }
         log::note_slow("start_enabled", started);
@@ -438,9 +435,9 @@ impl Supervisor {
             match crate::platform::storage::cleanup(&self.config.paths, self.temp_retention) {
                 Ok(0) => {}
                 Ok(removed) => {
-                    log::svcd(&format!("svcd: temp cleanup removed {} file(s)", removed))
+                    info!("temp cleanup removed {} file(s)", removed)
                 }
-                Err(error) => log::svcd(&format!("svcd: temp cleanup failed: {}", error)),
+                Err(error) => warn!("temp cleanup failed: {}", error),
             }
             log::note_slow("temp cleanup", started);
         }

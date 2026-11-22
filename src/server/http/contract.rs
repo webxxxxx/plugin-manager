@@ -11,7 +11,6 @@ use std::time::Instant;
 
 use serde_json::Value;
 
-use crate::platform::log;
 use crate::server::auth::lan::AuthKind;
 use crate::server::http::model as http;
 
@@ -342,10 +341,10 @@ impl Completion {
             state.rejected = state.rejected.saturating_add(1);
             let endpoint = state.endpoint.clone();
             drop(state);
-            log::svcd(&format!(
-                "svcd: face completed {} more than once; the extra completion is ignored",
+            warn!(
+                "face completed {} more than once; the extra completion is ignored",
                 endpoint
-            ));
+            );
             return CompletionOutcome::AlreadyCompleted;
         }
         state.exchange = Some(exchange);

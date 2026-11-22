@@ -53,25 +53,52 @@ impl Now {
 /// clock on every `now()`. Reading the wall clock per call keeps a system time
 /// adjustment visible to the projection; capturing both fields once keeps the
 /// two domains consistent for all conversions that follow.
+///
+/// `Clock` is `Copy`: the logger holds its own copy so a log line never needs
+/// the supervisor's `Now` (ADR-0022). A fixed clock exists for tests that
+/// assert the exact bytes of a log line.
+#[derive(Clone, Copy)]
 pub(crate) struct Clock {
     origin: Instant,
+    fixed_epoch_ms: Option<u64>,
 }
 
 impl Clock {
     pub(crate) fn boot() -> Self {
         Clock {
             origin: Instant::now(),
+            fixed_epoch_ms: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixed(epoch_ms: u64) -> Self {
+        Clock {
+            origin: Instant::now(),
+            fixed_epoch_ms: Some(epoch_ms),
         }
     }
 
     pub(crate) fn now(&self) -> Now {
         Now {
             mono_ms: self.origin.elapsed().as_millis() as u64,
-            epoch_secs: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_secs())
-                .unwrap_or(0),
+            epoch_secs: self.epoch_ms() / 1000,
         }
+    }
+
+    /// Wall-clock milliseconds since the Unix epoch.
+    ///
+    /// This is the log line's time column (ADR-0022). It is I/O metadata, not a
+    /// state input, which is why it is a projection on the injected clock
+    /// instead of another `Now` field every caller has to thread through.
+    pub(crate) fn epoch_ms(&self) -> u64 {
+        if let Some(fixed) = self.fixed_epoch_ms {
+            return fixed;
+        }
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0)
     }
 }
 #[cfg(test)]

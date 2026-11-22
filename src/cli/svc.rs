@@ -1,6 +1,4 @@
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -12,9 +10,11 @@ use crate::cli::tune;
 use crate::kernel::projection::Status;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::platform::config::Config;
-use crate::platform::log;
+use crate::platform::log::Level;
 use crate::platform::settings;
 use crate::wire::control::channel;
+
+mod logs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DaemonVerb {
@@ -58,9 +58,11 @@ enum Command {
         dry_run: bool,
     },
     Logs {
-        id: String,
+        id: Option<String>,
         follow: bool,
         lines: usize,
+        level: Option<Level>,
+        all: bool,
     },
     Auth {
         action: AuthAction,
@@ -100,7 +102,13 @@ pub fn run(args: Vec<String>) -> i32 {
         Command::Reload => reload(&config),
         Command::Compat { json } => compat_show(&config, json),
         Command::CompatInit { device, dry_run } => compat_init(&config, &device, dry_run),
-        Command::Logs { id, follow, lines } => show_logs(&config, &id, follow, lines),
+        Command::Logs {
+            id,
+            follow,
+            lines,
+            level,
+            all,
+        } => logs::show_logs(&config, id.as_deref(), follow, lines, level, all),
         Command::Auth { action } => auth_command(&config, action),
         Command::Trust { action } => trust_command(&config, action),
         Command::Resources { json } => resources_command(&config, json),
@@ -258,17 +266,26 @@ fn parse_logs(args: &[String]) -> Result<Command, ()> {
     let mut id = None;
     let mut follow = false;
     let mut lines = 200usize;
+    let mut level = None;
+    let mut all = false;
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
-        if arg == "--follow" {
+        if arg == "--follow" || arg == "-f" {
             follow = true;
+        } else if arg == "--all" {
+            all = true;
         } else if arg == "--lines" {
             index += 1;
             let value = args.get(index).ok_or(())?;
             lines = parse_lines(value)?;
         } else if let Some(value) = arg.strip_prefix("--lines=") {
             lines = parse_lines(value)?;
+        } else if arg == "--level" {
+            index += 1;
+            level = Some(parse_level(args.get(index).ok_or(())?)?);
+        } else if let Some(value) = arg.strip_prefix("--level=") {
+            level = Some(parse_level(value)?);
         } else if arg.starts_with('-') || id.is_some() {
             return Err(());
         } else {
@@ -276,8 +293,23 @@ fn parse_logs(args: &[String]) -> Result<Command, ()> {
         }
         index += 1;
     }
-    let id = id.ok_or(())?;
-    Ok(Command::Logs { id, follow, lines })
+    if all && (id.is_some() || follow) {
+        return Err(());
+    }
+    if !all && id.is_none() {
+        return Err(());
+    }
+    Ok(Command::Logs {
+        id,
+        follow,
+        lines,
+        level,
+        all,
+    })
+}
+
+fn parse_level(value: &str) -> Result<Level, ()> {
+    Level::parse(value).ok_or(())
 }
 
 fn parse_lines(value: &str) -> Result<usize, ()> {
@@ -705,54 +737,6 @@ fn require_root_for_trust() -> Result<(), String> {
     }
 }
 
-fn show_logs(config: &Config, id: &str, follow: bool, lines: usize) -> i32 {
-    let path = if id == "svcd" {
-        config.paths.logs_dir.join("svcd.log")
-    } else {
-        config.paths.logs_dir.join(format!("{}.log", id))
-    };
-    let tail = match log::tail(&path, lines) {
-        Ok(tail) => tail,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("svc: no log for {}", id);
-            return EXIT_NOT_FOUND;
-        }
-        Err(error) => {
-            eprintln!("svc: cannot read {}: {}", path.display(), error);
-            return EXIT_SERVICE_ERROR;
-        }
-    };
-    print!("{}", tail);
-    if follow {
-        let offset = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-        follow_log(&path, offset);
-    }
-    EXIT_OK
-}
-
-fn follow_log(path: &Path, mut offset: u64) -> ! {
-    use std::io::{Read, Seek, SeekFrom};
-
-    loop {
-        if let Ok(metadata) = std::fs::metadata(path) {
-            if metadata.len() < offset {
-                offset = 0;
-            }
-        }
-        if let Ok(mut file) = std::fs::File::open(path) {
-            if file.seek(SeekFrom::Start(offset)).is_ok() {
-                let mut buffer = String::new();
-                if file.read_to_string(&mut buffer).is_ok() && !buffer.is_empty() {
-                    print!("{}", buffer);
-                    let _ = std::io::stdout().flush();
-                    offset = offset.saturating_add(buffer.len() as u64);
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
 // Only the verbs not implemented by #29 reach this helper.
 fn usage() {
     eprintln!("usage: svc list");
@@ -761,7 +745,8 @@ fn usage() {
     eprintln!("       svc reload");
     eprintln!("       svc compat [--json]");
     eprintln!("       svc compat init --device <id> [--dry-run]");
-    eprintln!("       svc logs <id> [--follow] [--lines N]");
+    eprintln!("       svc logs <id> [--follow|-f] [--lines N] [--level L]");
+    eprintln!("       svc logs --all [--lines N] [--level L]");
     eprintln!("       svc lan status|passwd <password>");
     eprintln!("       svc auth ...  (deprecated alias of svc lan)");
     eprintln!("       svc trust list|add <file.pub>|remove <keyId>");
@@ -899,37 +884,6 @@ mod tests {
         assert!(parse(&args(&["compat", "--json", "init"])).is_err());
         assert!(parse(&args(&["compat", "init", "--device"])).is_err());
         assert!(parse(&args(&["compat", "bogus"])).is_err());
-    }
-
-    #[test]
-    fn parses_logs_with_flags_and_a_default_tail() {
-        assert_eq!(
-            parse(&args(&["logs", "demo"])).expect("logs"),
-            Command::Logs {
-                id: "demo".into(),
-                follow: false,
-                lines: 200
-            }
-        );
-        assert_eq!(
-            parse(&args(&["logs", "--follow", "demo", "--lines", "5"])).expect("logs"),
-            Command::Logs {
-                id: "demo".into(),
-                follow: true,
-                lines: 5
-            }
-        );
-        assert_eq!(
-            parse(&args(&["logs", "demo", "--lines=7"])).expect("logs"),
-            Command::Logs {
-                id: "demo".into(),
-                follow: false,
-                lines: 7
-            }
-        );
-        assert!(parse(&args(&["logs"])).is_err());
-        assert!(parse(&args(&["logs", "demo", "--lines", "nope"])).is_err());
-        assert!(parse(&args(&["logs", "demo", "--lines", "2001"])).is_err());
     }
 
     #[test]

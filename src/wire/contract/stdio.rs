@@ -26,7 +26,7 @@
 mod platform;
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
@@ -35,7 +35,7 @@ use std::thread;
 use super::RAW_PROTOCOL;
 use crate::platform::host::threads;
 use crate::platform::host::wake::Wake;
-use crate::platform::log::LogSink;
+use crate::platform::log::{Level, LogWriter};
 use crate::wire::message::ipc::{self, FrameEvent};
 
 /// Whether one standard stream is piped to the parent or opened on `/dev/null`.
@@ -207,28 +207,88 @@ pub(crate) fn poll_write(end: WriteEnd) -> io::Result<File> {
 /// Read `stream` line by line into `log` on a thread of its own.
 ///
 /// This is the consumer for pipes that are not part of a protocol channel: a
-/// hook's output, an exec-ready service's log, a raw plugin's stderr.
+/// hook's output, an exec-ready service's log, a raw plugin's stderr. One
+/// physical line is bounded by `log::MAX_LINE_BYTES`; the writer truncates the
+/// message to 8 KiB afterwards (ADR-0022).
 pub(crate) fn log_lines(
     name: String,
     stream: ReadEnd,
-    log: Option<Arc<Mutex<LogSink>>>,
+    log: Option<Arc<Mutex<LogWriter>>>,
     limits: &crate::platform::limits::Limits,
 ) -> io::Result<()> {
     thread::Builder::new()
         .name(name)
         .stack_size(threads::io_stack(limits))
         .spawn(move || {
-            for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                log_line(&log, &line);
+            let mut reader = BufReader::new(stream);
+            let mut pending = Vec::new();
+            let mut discarding = false;
+            let mut chunk = [0u8; 8 * 1024];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        pending.extend_from_slice(&chunk[..count]);
+                        for line in take_log_lines(
+                            &mut pending,
+                            &mut discarding,
+                            crate::platform::log::MAX_LINE_BYTES,
+                        ) {
+                            log_line(&log, &line);
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            if !discarding && !pending.is_empty() {
+                log_line(&log, &String::from_utf8_lossy(&pending));
             }
         })
         .map(|_| ())
 }
 
-fn log_line(log: &Option<Arc<Mutex<LogSink>>>, line: &str) {
-    if let Some(sink) = log {
-        if let Ok(mut sink) = sink.lock() {
-            let _ = sink.line(line);
+/// Split one read chunk into complete lines. A line longer than `max` is
+/// handed over once (the writer truncates and marks it) and the rest of that
+/// physical line is discarded; the source keeps reading (ADR-0022).
+fn take_log_lines(pending: &mut Vec<u8>, discarding: &mut bool, max: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    loop {
+        if *discarding {
+            match pending.iter().position(|byte| *byte == b'\n') {
+                Some(position) => {
+                    pending.drain(..=position);
+                    *discarding = false;
+                }
+                None => {
+                    pending.clear();
+                    break;
+                }
+            }
+            continue;
+        }
+        if let Some(position) = pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = pending.drain(..=position).collect();
+            let line = &line[..line.len() - 1];
+            // CRLF is one terminator; a bare CR is message content.
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            lines.push(String::from_utf8_lossy(line).into_owned());
+            continue;
+        }
+        if pending.len() > max {
+            lines.push(String::from_utf8_lossy(pending).into_owned());
+            pending.clear();
+            *discarding = true;
+        }
+        break;
+    }
+    lines
+}
+
+fn log_line(log: &Option<Arc<Mutex<LogWriter>>>, line: &str) {
+    if let Some(writer) = log {
+        if let Ok(mut writer) = writer.lock() {
+            let _ = writer.record(Level::Info, line);
         }
     }
 }
@@ -269,7 +329,7 @@ impl Target {
         stderr: Option<ReadEnd>,
         sender: SyncSender<FrameEvent>,
         wake: Option<Arc<Wake>>,
-        log: Option<Arc<Mutex<LogSink>>>,
+        log: Option<Arc<Mutex<LogWriter>>>,
         limits: &crate::platform::limits::Limits,
     ) -> io::Result<()> {
         #[cfg(unix)]
@@ -321,7 +381,7 @@ impl Target {
         id: String,
         stdout: ReadEnd,
         stderr: Option<ReadEnd>,
-        log: Option<Arc<Mutex<LogSink>>>,
+        log: Option<Arc<Mutex<LogWriter>>>,
         limits: &crate::platform::limits::Limits,
     ) -> io::Result<()> {
         #[cfg(unix)]
@@ -520,5 +580,39 @@ mod tests {
         drop(write);
         let mut buffer = [0u8; 8];
         assert_eq!(end.read(&mut buffer).expect("EOF"), 0);
+    }
+
+    #[test]
+    fn an_overlong_line_is_handed_over_once_and_the_source_keeps_reading() {
+        let mut pending = vec![b'x'; 70 * 1024];
+        let mut discarding = false;
+        let lines = take_log_lines(&mut pending, &mut discarding, 64 * 1024);
+        assert_eq!(lines.len(), 1, "the overlong line must still be recorded");
+        assert_eq!(lines[0].len(), 70 * 1024);
+        assert!(discarding);
+        assert!(pending.is_empty());
+
+        // The rest of the same physical line is dropped, not turned into a
+        // second record.
+        pending.extend_from_slice(b"tail-without-newline");
+        assert!(take_log_lines(&mut pending, &mut discarding, 64 * 1024).is_empty());
+        assert!(pending.is_empty());
+        assert!(discarding);
+
+        // Its newline ends the discard; the next line is read normally.
+        pending.extend_from_slice(b"\nafter\nnext");
+        assert_eq!(
+            take_log_lines(&mut pending, &mut discarding, 64 * 1024),
+            vec!["after".to_string()]
+        );
+        assert!(!discarding);
+        assert_eq!(pending, b"next");
+        // The trailing partial line arrives with the next chunk.
+        pending.push(b'\n');
+        assert_eq!(
+            take_log_lines(&mut pending, &mut discarding, 64 * 1024),
+            vec!["next".to_string()]
+        );
+        assert!(pending.is_empty());
     }
 }

@@ -14,7 +14,6 @@ use crate::manage::{
     ensure_hooks_allowed, ensure_hooks_allowed_manifest, remove_versions, replace_plan,
     ReplacePlan, Strategy,
 };
-use crate::platform::log;
 use crate::platform::paths::Paths;
 use crate::supervise::ops::hook;
 
@@ -157,10 +156,10 @@ fn copy_config_staged(
         Some(stored) if stored != hash => {
             write_config(&plugin_dir.join("config.new"), &template)?;
             write_hash(&hash_path, &hash)?;
-            log::svcd(&format!(
-                "svcd: plugin {}: template changed; wrote config.new",
+            info!(
+                "plugin {}: template changed; wrote config.new",
                 manifest.name
-            ));
+            );
         }
         Some(_) => {}
     }
@@ -419,10 +418,10 @@ fn copy_config(package: &Package, plugin_dir: &Path) -> Result<(), ProblemError>
         Some(stored) if stored != hash => {
             write_config(&plugin_dir.join("config.new"), &template.data)?;
             write_hash(&hash_path, &hash)?;
-            log::svcd(&format!(
-                "svcd: plugin {}: template changed; wrote config.new",
+            info!(
+                "plugin {}: template changed; wrote config.new",
                 package.manifest.name
-            ));
+            );
         }
         Some(_) => {}
     }

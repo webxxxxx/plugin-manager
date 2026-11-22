@@ -422,10 +422,10 @@ impl WsStream {
         if matches!(reason, CloseReason::Completed | CloseReason::PeerClosed) {
             return;
         }
-        crate::platform::log::svcd(&format!(
-            "svcd: plugin ui ws closed: plugin={} reason={:?} bytes={} frames={}",
+        info!(
+            "plugin ui ws closed: plugin={} reason={:?} bytes={} frames={}",
             self.plugin, reason, self.bytes_read, self.frames_read
-        ));
+        );
     }
 }
 

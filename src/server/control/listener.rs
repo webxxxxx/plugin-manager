@@ -127,7 +127,7 @@ impl ControlServer {
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => {
-                    crate::platform::log::svcd(&format!("svcd: control accept failed: {}", error));
+                    error!("control accept failed: {}", error);
                     break;
                 }
             }

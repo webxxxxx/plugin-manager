@@ -504,8 +504,7 @@ fn a_pinned_huge_connection_count_is_shrunk_without_collapsing_the_body() {
     assert!(derived.limits.worst_case_bytes() <= 64 * MIB);
     assert!(derived.limits.max_connections < 4000);
     assert_eq!(
-        derived.limits.max_complete_body,
-        default.limits.max_complete_body,
+        derived.limits.max_complete_body, default.limits.max_complete_body,
         "the body was shrunk although the connection floor, not the body, set the cost"
     );
     assert_eq!(

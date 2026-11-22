@@ -515,8 +515,20 @@ function showLogsModal(id, text) {
   check.type = 'checkbox';
   auto.appendChild(check);
   auto.appendChild(document.createTextNode('自动刷新（3s）'));
+  const levelLabel = document.createElement('label');
+  levelLabel.className = 'check';
+  levelLabel.appendChild(document.createTextNode('级别'));
+  const levelSelect = document.createElement('select');
+  [['', '全部'], ['error', 'ERROR'], ['warn', 'WARN+'], ['info', 'INFO+'], ['debug', 'DEBUG+'], ['trace', 'TRACE']].forEach(function (option) {
+    const item = document.createElement('option');
+    item.value = option[0];
+    item.textContent = option[1];
+    levelSelect.appendChild(item);
+  });
+  levelLabel.appendChild(levelSelect);
   head.appendChild(title);
   head.appendChild(auto);
+  head.appendChild(levelLabel);
   const hint = document.createElement('p');
   hint.className = 'muted';
   hint.textContent = '最近 200 行。';
@@ -529,12 +541,16 @@ function showLogsModal(id, text) {
   actions.style.marginTop = '12px';
 
   let timer = null;
+  let level = '';
+  function logUrl() {
+    return '/api/v1/logs/' + encodeURIComponent(id) + '?lines=200' + (level ? '&level=' + encodeURIComponent(level) : '');
+  }
   function stop() {
     if (timer) { clearInterval(timer); timer = null; }
   }
   async function refresh() {
     try {
-      const response = await fetch('/api/v1/logs/' + encodeURIComponent(id) + '?lines=200', { credentials: 'same-origin', headers: authHeaders() });
+      const response = await fetch(logUrl(), { credentials: 'same-origin', headers: authHeaders() });
       if (response.status === 401) { stop(); showLogin(); return; }
       if (response.status === 404) { pre.textContent = '还没有日志'; return; }
       if (!response.ok) throw new Error(await errorText(response));
@@ -547,6 +563,10 @@ function showLogsModal(id, text) {
     }
   }
   function close() { stop(); modal.remove(); }
+  levelSelect.onchange = function () {
+    level = levelSelect.value;
+    refresh();
+  };
   check.onchange = function () {
     stop();
     if (check.checked) {

@@ -1,3 +1,56 @@
+// The five-entry family is the call-site contract for internal lines. Their
+// source column is always `svcd` (ADR-0022); a module path is not a column in
+// the file contract, so the macros do not fabricate a `target`.
+#[allow(unused_macros)]
+macro_rules! error {
+    ($($arg:tt)*) => {
+        $crate::platform::log::record(
+            $crate::platform::log::Level::Error,
+            &format!($($arg)*),
+        )
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! warn {
+    ($($arg:tt)*) => {
+        $crate::platform::log::record(
+            $crate::platform::log::Level::Warn,
+            &format!($($arg)*),
+        )
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! info {
+    ($($arg:tt)*) => {
+        $crate::platform::log::record(
+            $crate::platform::log::Level::Info,
+            &format!($($arg)*),
+        )
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        $crate::platform::log::record(
+            $crate::platform::log::Level::Debug,
+            &format!($($arg)*),
+        )
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        $crate::platform::log::record(
+            $crate::platform::log::Level::Trace,
+            &format!($($arg)*),
+        )
+    };
+}
+
 mod cli;
 mod daemon;
 mod face;
@@ -235,31 +288,40 @@ fn user_start(config: &crate::platform::config::Config) -> i32 {
         }
     };
     let log_path = logs.join("svcd.log");
-    let stdout = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
-        Ok(file) => file,
-        Err(error) => {
-            eprintln!("svcd: open {}: {}", log_path.display(), error);
-            return 1;
-        }
-    };
-    let stderr = match stdout.try_clone() {
-        Ok(file) => file,
-        Err(error) => {
-            eprintln!("svcd: clone log handle: {}", error);
-            return 1;
-        }
+    // `log = off` is a master switch: do not even create the redirect target.
+    let (stdout, stderr) = if config.limits.log_enabled {
+        let stdout = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!("svcd: open {}: {}", log_path.display(), error);
+                return 1;
+            }
+        };
+        let stderr = match stdout.try_clone() {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!("svcd: clone log handle: {}", error);
+                return 1;
+            }
+        };
+        (
+            std::process::Stdio::from(stdout),
+            std::process::Stdio::from(stderr),
+        )
+    } else {
+        (std::process::Stdio::null(), std::process::Stdio::null())
     };
     let mut command = std::process::Command::new(&executable);
     command
         .args(["run", "--foreground"])
         .env("SVCD_USER", "1")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(stdout))
-        .stderr(std::process::Stdio::from(stderr));
+        .stdout(stdout)
+        .stderr(stderr);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

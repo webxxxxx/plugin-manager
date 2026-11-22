@@ -1415,14 +1415,14 @@ fn hook_body(kind: &str) -> Vec<u8> {
     #[cfg(windows)]
     {
         format!(
-            "@echo off\r\necho %SVCD_PLUGIN_ID% %SVCD_PLUGIN_VERSION% %SVCD_ACTION%>\"%SVCD_DATA_DIR%\\{kind}.txt\"\r\n"
+            "@echo off\r\necho %SVCD_PLUGIN_ID% %SVCD_PLUGIN_VERSION% %SVCD_ACTION%>\"%SVCD_DATA_DIR%\\{kind}.txt\"\r\necho hook-stdout\r\n"
         )
         .into_bytes()
     }
     #[cfg(unix)]
     {
         format!(
-            "#!/bin/sh\nprintf '%s %s %s\\n' \"$SVCD_PLUGIN_ID\" \"$SVCD_PLUGIN_VERSION\" \"$SVCD_ACTION\" > \"$SVCD_DATA_DIR/{kind}.txt\"\n"
+            "#!/bin/sh\nprintf '%s %s %s\\n' \"$SVCD_PLUGIN_ID\" \"$SVCD_PLUGIN_VERSION\" \"$SVCD_ACTION\" > \"$SVCD_DATA_DIR/{kind}.txt\"\necho hook-stdout\n"
         )
         .into_bytes()
     }
@@ -1544,6 +1544,27 @@ fn install_and_uninstall_run_the_declared_hooks() {
     assert_eq!(
         read_marker(&sandbox, "post-install.txt").trim(),
         "demo 1.0.0 post-install"
+    );
+    // ADR-0022: hook output is labelled `hook:<id>` in `<id>-hooks.log`.
+    let hooks_log = sandbox.logs.join("demo-hooks.log");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let text = loop {
+        let text = fs::read_to_string(&hooks_log).unwrap_or_default();
+        if text.contains("hook-stdout") {
+            break text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "hook output did not reach {}: {}",
+            hooks_log.display(),
+            text
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        text.lines()
+            .any(|line| line.contains(" INFO  hook:demo ") && line.ends_with("hook-stdout")),
+        "{text}"
     );
 
     let removed = sandbox.run_plugin(&["uninstall", "demo"]);

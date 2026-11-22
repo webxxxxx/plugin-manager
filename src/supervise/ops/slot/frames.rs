@@ -173,24 +173,21 @@ impl Slot {
             if id == self.ping_id {
                 match self.machine.pid {
                     Some(pid) => {
-                        log::svcd(&format!(
-                            "svcd: {}: ready ping {} answered by pid {}",
-                            self.id, id, pid
-                        ));
+                        debug!("{}: ready ping {} answered by pid {}", self.id, id, pid);
                         self.apply(Event::Ready { pid }, now);
                     }
-                    None => log::svcd(&format!(
-                        "svcd: {}: ready ping {} answered before the pid was known; dropped",
+                    None => warn!(
+                        "{}: ready ping {} answered before the pid was known; dropped",
                         self.id, id
-                    )),
+                    ),
                 }
                 return;
             }
             // Not the ready reply; the pending-call path below keeps its own log.
-            log::svcd(&format!(
-                "svcd: {}: frame id {} during Starting is not the ready ping {}",
+            warn!(
+                "{}: frame id {} during Starting is not the ready ping {}",
                 self.id, id, self.ping_id
-            ));
+            );
         }
         self.complete_pending(id, &message);
     }
@@ -249,19 +246,16 @@ impl Slot {
     /// force the process down and let the supervisor withdraw its capabilities.
     pub(super) fn stdout_closed(&mut self) {
         if matches!(self.machine.state, State::Starting | State::Running) {
-            log::svcd(&format!(
-                "svcd: {}: stdout closed; treating the plugin as exited",
-                self.id
-            ));
+            info!("{}: stdout closed; treating the plugin as exited", self.id);
             self.signal_force("stdout closed");
         }
     }
 
     pub(super) fn protocol_violation(&mut self, reason: &str) {
-        log::svcd(&format!(
-            "svcd: {}: protocol violation: {}; killing process",
+        error!(
+            "{}: protocol violation: {}; killing process",
             self.id, reason
-        ));
+        );
         self.log_service(&format!("protocol violation: {}", reason));
         self.fail_pending("plugin protocol violation");
         self.signal_force("protocol violation");
@@ -276,16 +270,16 @@ impl Slot {
             return;
         }
         let excerpt: String = line.chars().take(200).collect();
-        log::svcd(&format!(
-            "svcd: {}: stdout during Starting is not usable for ready ({}): {}",
+        warn!(
+            "{}: stdout during Starting is not usable for ready ({}): {}",
             self.id, reason, excerpt
-        ));
+        );
     }
 
     pub(super) fn log_service(&self, line: &str) {
-        if let Some(sink) = &self.log {
-            if let Ok(mut sink) = sink.lock() {
-                let _ = sink.line(line);
+        if let Some(writer) = &self.log {
+            if let Ok(mut writer) = writer.lock() {
+                let _ = writer.record(crate::platform::log::Level::Info, line);
             }
         }
     }

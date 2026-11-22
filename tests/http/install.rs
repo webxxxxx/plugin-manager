@@ -918,6 +918,25 @@ fn export_import_and_logs() {
     let no_log = raw_request(&address, "GET", "/api/v1/logs/plain", "", b"");
     assert_eq!(no_log.status, 404);
 
+    fs::write(
+        sandbox.logs.join("demo.log"),
+        "2023-11-14T22:13:20.000Z INFO  svcd quiet\n\
+         2023-11-14T22:13:21.000Z WARN  svcd careful\n\
+         2023-11-14T22:13:22.000Z ERROR svcd boom\n\
+         old format line\n",
+    )
+    .expect("write levelled log");
+    let warn = raw_request(&address, "GET", "/api/v1/logs/demo?level=warn", "", b"");
+    assert_eq!(warn.status, 200);
+    assert_eq!(
+        warn.body,
+        b"2023-11-14T22:13:21.000Z WARN  svcd careful\n\
+          2023-11-14T22:13:22.000Z ERROR svcd boom\n\
+          old format line\n"
+    );
+    let bad_level = raw_request(&address, "GET", "/api/v1/logs/demo?level=loud", "", b"");
+    assert_eq!(bad_level.status, 400);
+
     let big = "x".repeat(1024 * 1024 + 100);
     fs::write(sandbox.logs.join("demo.log"), &big).expect("write big log");
     let capped = raw_request(&address, "GET", "/api/v1/logs/demo?lines=200", "", b"");

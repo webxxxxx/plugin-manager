@@ -75,19 +75,19 @@ pub(super) fn install_replace(
         Ok(service) => {
             if let Some(backup) = backup {
                 if let Err(error) = fs::remove_dir_all(&backup) {
-                    log::svcd(&format!(
-                        "svcd: plugin {}: installed, but cannot remove backup {}: {}",
+                    warn!(
+                        "plugin {}: installed, but cannot remove backup {}: {}",
                         id,
                         backup.display(),
                         error
-                    ));
+                    );
                 }
             }
             if let Err(error) = remove_versions(plugin_dir, Some(&package.manifest.version)) {
-                log::svcd(&format!(
-                    "svcd: plugin {}: installed, but cannot prune old versions: {}",
+                warn!(
+                    "plugin {}: installed, but cannot prune old versions: {}",
                     id, error
-                ));
+                );
             }
             Ok(service)
         }

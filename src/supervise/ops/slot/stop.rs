@@ -151,9 +151,16 @@ impl Slot {
                     // The stop action's own children belong to the service tree.
                     tree.assign(&child);
                 }
-                let log = LogSink::open(&self.paths.logs_dir, &self.id, &self.limits)
-                    .ok()
-                    .map(|sink| Arc::new(Mutex::new(sink)));
+                let log = LogWriter::open(
+                    &self.paths.logs_dir,
+                    &format!("{}-hooks", self.id),
+                    &format!("hook:{}", self.id),
+                    &self.limits,
+                    crate::platform::log::clock(),
+                    false,
+                )
+                .ok()
+                .map(|sink| Arc::new(Mutex::new(sink)));
                 if let Some(stderr) = streams.stderr {
                     let log = log.clone();
                     if let Err(error) = stdio::log_lines(
@@ -162,25 +169,16 @@ impl Slot {
                         log,
                         &self.limits,
                     ) {
-                        log::svcd(&format!(
-                            "svcd: {}: stop hook stderr reader: {}",
-                            self.id, error
-                        ));
+                        error!("{}: stop hook stderr reader: {}", self.id, error);
                     }
                 }
-                log::svcd(&format!(
-                    "svcd: {}: stop hook started ({})",
-                    self.id, hook.path
-                ));
+                info!("{}: stop hook started ({})", self.id, hook.path);
                 self.stop
                     .install(HookRun::new(child, now.saturating_add(hook.timeout_ms)));
                 true
             }
             Err(error) => {
-                log::svcd(&format!(
-                    "svcd: {}: stop hook spawn failed: {}",
-                    self.id, error
-                ));
+                error!("{}: stop hook spawn failed: {}", self.id, error);
                 false
             }
         }
@@ -192,9 +190,9 @@ impl Slot {
         };
         match outcome {
             HookEnd::Exited(status) => {
-                log::svcd(&format!("svcd: {}: stop hook exited {}", self.id, status))
+                info!("{}: stop hook exited {}", self.id, status)
             }
-            HookEnd::TimedOut => log::svcd(&format!("svcd: {}: stop hook timed out", self.id)),
+            HookEnd::TimedOut => error!("{}: stop hook timed out", self.id),
         }
         // A stop preempted the pending restart: finish the stop, not the spawn.
         if self.machine.state == State::Stopping {
@@ -229,21 +227,21 @@ impl Slot {
 
     pub(super) fn abort_stop_hook(&mut self) {
         if self.stop.abort() {
-            log::svcd(&format!("svcd: {}: stop hook aborted", self.id));
+            warn!("{}: stop hook aborted", self.id);
         }
     }
 
     pub(super) fn signal_polite(&mut self) {
         let line = rpc::notification("svcd.shutdown", json!({}));
         match self.write_json_frame(&line, ipc::CONTROL_FRAME_MAX) {
-            Ok(()) => log::svcd(&format!(
-                "svcd: {}: polite stop: shutdown frame written, stdin closed",
+            Ok(()) => info!(
+                "{}: polite stop: shutdown frame written, stdin closed",
                 self.id
-            )),
-            Err(error) => log::svcd(&format!(
-                "svcd: {}: polite stop: shutdown frame failed ({}), stdin closed",
+            ),
+            Err(error) => warn!(
+                "{}: polite stop: shutdown frame failed ({}), stdin closed",
                 self.id, error
-            )),
+            ),
         }
         self.stdin = None;
         #[cfg(unix)]
@@ -270,8 +268,8 @@ impl Slot {
     }
 
     pub(crate) fn signal_force(&mut self, reason: &str) {
-        log::svcd(&format!(
-            "svcd: {}: force stop ({}): state {:?}, pid {:?}, stdin {}, child {}",
+        info!(
+            "{}: force stop ({}): state {:?}, pid {:?}, stdin {}, child {}",
             self.id,
             reason,
             self.machine.state,
@@ -282,7 +280,7 @@ impl Slot {
                 "closed"
             },
             if self.child.is_some() { "held" } else { "none" },
-        ));
+        );
         self.abort_stop_hook();
         // The leader may already be gone; the tree guard still owns the rest
         // (on Unix that is the process group handled below).
@@ -305,12 +303,12 @@ impl Slot {
 
     pub(super) fn give_up(&mut self) {
         if self.machine.unkillable {
-            log::svcd(&format!("svcd: {}: unkillable after stop timeout", self.id));
+            error!("{}: unkillable after stop timeout", self.id);
         } else {
-            log::svcd(&format!(
-                "svcd: {}: failed after {} consecutive failures",
+            error!(
+                "{}: failed after {} consecutive failures",
                 self.id, self.machine.failures
-            ));
+            );
         }
         self.signal_force("give up");
         self.clear_process();

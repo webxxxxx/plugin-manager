@@ -212,10 +212,7 @@ impl Slot {
 
     pub(super) fn complete_pending(&mut self, id: u64, message: &serde_json::Map<String, Value>) {
         let Some(pending) = self.pending.remove(id) else {
-            log::svcd(&format!(
-                "svcd: {}: ignoring response for unknown request {}",
-                self.id, id
-            ));
+            warn!("{}: ignoring response for unknown request {}", self.id, id);
             return;
         };
         let outcome = if let Some(error) = message.get("error") {
@@ -273,10 +270,7 @@ impl Slot {
             let Some(pending) = self.pending.remove(id) else {
                 continue;
             };
-            log::svcd(&format!(
-                "svcd: {}: tools/call {} timed out",
-                self.id, pending.capability
-            ));
+            error!("{}: tools/call {} timed out", self.id, pending.capability);
             let failure = Failure::new(
                 Class::Timeout,
                 Retry::After(std::time::Duration::from_secs(1)),
