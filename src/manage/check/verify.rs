@@ -21,7 +21,6 @@ use crate::manage::model::manifest::{
 };
 use crate::manage::model::path::check_path;
 use crate::manage::model::ustar::Tar;
-use crate::wire::contract::RAW_PROTOCOL;
 
 mod manifest;
 mod signature;
@@ -409,24 +408,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_protocol_mismatch() {
+    fn rejects_a_protocol_out_of_range() {
         let key = setup();
-        let data = b"payload".to_vec();
-        let value = json!({
-            "schema": 1, "id": "demo", "name": "demo", "version": "1.0.0", "desc": "demo",
-            "platform": crate::platform::target(), "protocol": 3,
-            "exec": {"path": "payload/bin/demo"},
-            "files": [{"path": "payload/bin/demo", "size": data.len(), "sha256": hex_sha256(&data), "mode": 0o755}]
-        });
-        let manifest = serde_json::to_vec(&value).expect("manifest");
-        let bytes = package_from(
-            &key,
-            "test",
-            &manifest,
-            &[("payload/bin/demo", data, 0o755)],
-        );
-        let error = verify_bytes(&bytes).expect_err("protocol");
-        assert!(error.detail().contains("protocol"), "{error}");
+        for protocol in [0u32, 4] {
+            let data = native_payload();
+            let value = json!({
+                "schema": 1, "id": "demo", "name": "demo", "version": "1.0.0", "desc": "demo",
+                "platform": crate::platform::target(), "protocol": protocol,
+                "exec": {"path": "payload/bin/demo"},
+                "files": [{"path": "payload/bin/demo", "size": data.len(), "sha256": hex_sha256(&data), "mode": 0o755}]
+            });
+            let manifest = serde_json::to_vec(&value).expect("manifest");
+            let bytes = package_from(
+                &key,
+                "test",
+                &manifest,
+                &[("payload/bin/demo", data, 0o755)],
+            );
+            let error = verify_bytes(&bytes).expect_err("protocol");
+            assert!(error.detail().contains("protocol"), "{protocol}: {error}");
+        }
     }
 
     #[test]
@@ -877,14 +878,20 @@ mod tests {
     }
 
     #[test]
-    fn accepts_a_protocol_three_package() {
+    fn protocol_three_may_be_a_channel_peer_with_capabilities() {
         let (manifest, files) = manifest(crate::platform::target());
         let mut value: Value = serde_json::from_slice(&manifest).expect("json");
         value["protocol"] = json!(3);
-        value["exec"]["ready"] = json!("exec");
+        // Stream 0 carries JSON-RPC, so a protocol-3 plugin can answer the ready
+        // ping and expose capabilities next to its raw streams (#265).
+        value["exec"]["ready"] = json!("notify");
+        value["capabilities"] = json!([
+            {"name": "echo", "desc": "echo", "inputSchema": {}}
+        ]);
         let manifest = serde_json::to_vec(&value).expect("json");
         let package = verify_bytes(&package_from(&setup(), "test", &manifest, &files))
-            .expect("raw protocol package");
+            .expect("raw protocol package with capabilities");
         assert_eq!(package.manifest.protocol, 3);
+        assert_eq!(package.manifest.capabilities.len(), 1);
     }
 }

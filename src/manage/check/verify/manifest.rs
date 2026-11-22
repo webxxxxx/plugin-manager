@@ -16,14 +16,6 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, ProblemError> {
     if m.protocol == 0 || m.protocol > MAX_PROTOCOL {
         return Err(Problem::Invalid.error(format!("unsupported protocol {}", m.protocol)));
     }
-    if m.protocol == RAW_PROTOCOL {
-        if m.exec.ready.as_deref() != Some("exec") {
-            return Err(Problem::Invalid.error("protocol 3 requires exec.ready=exec"));
-        }
-        if !m.capabilities.is_empty() {
-            return Err(Problem::Invalid.error("protocol 3 cannot declare JSON-RPC capabilities"));
-        }
-    }
     if !m.platform.contains('-') {
         return Err(Problem::UnsupportedPlatform.error("platform must be a target triple"));
     }

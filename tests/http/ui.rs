@@ -485,8 +485,9 @@ fn plugin_ui_raw_requires_a_raw_capable_plugin() {
     let mut body = Vec::new();
     let _ = stream.read_to_end(&mut body);
     let body = String::from_utf8_lossy(&body).to_ascii_lowercase();
-    assert_eq!(status, 503, "{head}");
+    assert_eq!(status, 409, "{head}");
     assert!(body.contains("raw_unavailable"), "{head}{body}");
+    assert!(body.contains("protocol 3"), "{head}{body}");
 }
 
 #[cfg(unix)]

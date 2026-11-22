@@ -364,12 +364,20 @@ pub enum RawFailure {
     PluginWriteError,
     WsWriteError,
     PluginReplaced,
+    /// The plugin's stream-0 queue is full: it kept answering after the slot's
+    /// bounded queue filled, which is a JSON-channel protocol violation.
+    JsonChannelFull,
+    /// A stream-0 frame exceeded the JSON frame limit.
+    JsonFrameTooLarge,
+    /// The plugin wrote stream-0 frames while no JSON channel was attached
+    /// (an exec-ready instance or a torn-down slot).
+    JsonChannelClosed,
 }
 
 impl RawFailure {
     /// Every failure, in counter order. `index` is the position in this table,
     /// so adding a variant cannot silently reuse another one's slot.
-    pub const ALL: [RawFailure; 14] = [
+    pub const ALL: [RawFailure; 17] = [
         RawFailure::FrameTooLarge,
         RawFailure::StreamNotSubscribed,
         RawFailure::StreamConflict,
@@ -384,6 +392,9 @@ impl RawFailure {
         RawFailure::PluginWriteError,
         RawFailure::WsWriteError,
         RawFailure::PluginReplaced,
+        RawFailure::JsonChannelFull,
+        RawFailure::JsonFrameTooLarge,
+        RawFailure::JsonChannelClosed,
     ];
 
     /// Stable counter/log name.
@@ -403,6 +414,9 @@ impl RawFailure {
             RawFailure::PluginWriteError => "plugin_write_error",
             RawFailure::WsWriteError => "ws_write_error",
             RawFailure::PluginReplaced => "plugin_replaced",
+            RawFailure::JsonChannelFull => "json_channel_full",
+            RawFailure::JsonFrameTooLarge => "json_frame_too_large",
+            RawFailure::JsonChannelClosed => "json_channel_closed",
         }
     }
 
@@ -422,6 +436,9 @@ impl RawFailure {
             RawFailure::PluginWriteError => "raw plugin stdin is closed",
             RawFailure::WsWriteError => "raw websocket write failed",
             RawFailure::PluginReplaced => "raw plugin transport was replaced",
+            RawFailure::JsonChannelFull => "stream 0 (JSON-RPC) queue is full",
+            RawFailure::JsonFrameTooLarge => "stream 0 (JSON-RPC) frame is too large",
+            RawFailure::JsonChannelClosed => "stream 0 has no attached JSON channel",
         }
     }
 

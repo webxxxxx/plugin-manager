@@ -1,13 +1,21 @@
 //! Raw plugin transport (protocol 3).
 #![allow(dead_code)]
 //!
-//! A protocol-3 plugin exchanges length-prefixed raw frames on stdin/stdout:
+//! A protocol-3 plugin exchanges length-prefixed frames on stdin/stdout:
 //!
 //! ```text
 //!   u32 payload_len (big endian)
 //!   u32 stream_id  (big endian)
 //!   payload
 //! ```
+//!
+//! **Stream 0 is the JSON-RPC channel**: the payload is one JSON-RPC message
+//! (call, result, notification, `svcd.ping`, progress) and the outer length is
+//! its framing, so a protocol-3 plugin has the same call channel as protocol 2
+//! *and* raw streams at the same time. Streams >= 1 are opaque binary payloads
+//! owned by `/raw` subscribers. A notify-ready protocol-3 plugin may therefore
+//! declare capabilities, serve SSE and page WebSockets, and still push raw
+//! frames (#265).
 //!
 //! The hub owns the stream table, the subscriber channels and the global
 //! in-flight budget. The I/O itself belongs to [`crate::wire::contract::reactor`]:
@@ -26,7 +34,9 @@ use std::sync::Weak;
 
 use crate::platform::log::LogWriter;
 use crate::wire::contract::stdio::{self, ReadEnd, Streams, WriteEnd};
-use crate::wire::message::ipc::{RawFailure, RawStopSink};
+
+mod json;
+use crate::wire::message::ipc::{FrameError, FrameEvent, RawFailure, RawStopSink};
 
 pub const HEADER: usize = 8;
 const SUBSCRIBER_QUEUE: usize = 4;
@@ -51,12 +61,18 @@ const FAILURES: usize = RawFailure::ALL.len();
 /// of rejections costs O(log n) log lines while still reporting the totals.
 pub struct RawStats {
     counts: [AtomicU64; FAILURES],
+    /// Stream-0 traffic: JSON-RPC frames and bytes, so an operator can tell the
+    /// call channel apart from the raw streams.
+    json_frames: AtomicU64,
+    json_bytes: AtomicU64,
 }
 
 impl Default for RawStats {
     fn default() -> Self {
         Self {
             counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            json_frames: AtomicU64::new(0),
+            json_bytes: AtomicU64::new(0),
         }
     }
 }
@@ -154,10 +170,13 @@ struct RawPlugin {
     out: OnceLock<Arc<crate::wire::contract::reactor::RawOutQueue>>,
     /// Fallback writer-thread queue.
     writer: OnceLock<SyncSender<Vec<u8>>>,
+    /// Stream-0 frames for the slot's JSON state machine. `None` when the
+    /// instance has no JSON channel (exec-ready).
+    json: Option<SyncSender<FrameEvent>>,
 }
 
 impl RawPlugin {
-    fn new(id: String, generation: u64) -> Self {
+    fn new(id: String, generation: u64, json: Option<SyncSender<FrameEvent>>) -> Self {
         Self {
             id,
             generation,
@@ -166,6 +185,7 @@ impl RawPlugin {
             closed: AtomicBool::new(false),
             out: OnceLock::new(),
             writer: OnceLock::new(),
+            json,
         }
     }
 
@@ -176,6 +196,18 @@ impl RawPlugin {
     }
 
     fn publish(&self, stream: u32, payload: Vec<u8>, hub: &RawHub) {
+        // Stream 0 is the JSON-RPC channel; everything else is a raw stream.
+        if stream == 0 {
+            hub.json_frame(self, payload);
+            return;
+        }
+        // The transport caps allocation at the larger of the two limits; a raw
+        // stream over its own limit loses that frame, not the instance.
+        if payload.len() > hub.max_frame {
+            hub.stats
+                .record(RawFailure::FrameTooLarge, &self.id, stream, "plugin frame");
+            return;
+        }
         let sender = self
             .subscribers
             .lock()
@@ -206,6 +238,9 @@ impl RawPlugin {
 
     fn close(&self, hub: &RawHub) {
         self.closed.store(true, Ordering::SeqCst);
+        if let Some(json) = &self.json {
+            let _ = json.try_send(FrameEvent::Closed);
+        }
         if let Ok(mut subscribers) = self.subscribers.lock() {
             for sender in subscribers.values() {
                 let _ = sender.try_send(RawEvent::Closed);
@@ -222,6 +257,13 @@ impl RawPlugin {
     }
 }
 
+/// The optional observers of a protocol-3 transport: the plugin log and the
+/// stream-0 JSON channel. Grouped so `register` keeps a readable arity.
+pub struct Observers {
+    pub log: Option<Arc<Mutex<LogWriter>>>,
+    pub json: Option<SyncSender<FrameEvent>>,
+}
+
 pub struct RawHub {
     plugins: Mutex<HashMap<String, Arc<RawPlugin>>>,
     next_stream: AtomicU32,
@@ -229,6 +271,8 @@ pub struct RawHub {
     max_inflight_bytes: usize,
     max_inflight_requests: usize,
     writer_queue: usize,
+    /// Stream-0 frame ceiling (the JSON call limit, independent of the raw cap).
+    json_max: usize,
     limits: Arc<crate::platform::limits::Limits>,
     inflight_bytes: AtomicUsize,
     inflight_requests: AtomicUsize,
@@ -247,6 +291,8 @@ impl RawHub {
             max_inflight_bytes: limits.ws_inflight_bytes,
             max_inflight_requests: limits.ws_inflight_requests,
             writer_queue: limits.ws_raw_queue.max(1),
+            json_max: (limits.max_complete_body as usize)
+                .min(crate::wire::message::ipc::CALL_FRAME_MAX),
             limits,
             inflight_bytes: AtomicUsize::new(0),
             inflight_requests: AtomicUsize::new(0),
@@ -276,7 +322,7 @@ impl RawHub {
         self: &Arc<Self>,
         id: String,
         streams: Streams,
-        log: Option<Arc<Mutex<LogWriter>>>,
+        observers: Observers,
     ) -> Result<(), String> {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let Streams {
@@ -287,6 +333,7 @@ impl RawHub {
         let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
             return Err("raw stdio is not piped".into());
         };
+        let Observers { log, json } = observers;
         if let Some(reactor) = self.reactor() {
             let stdin =
                 stdio::poll_write(stdin).map_err(|error| format!("raw reactor: {}", error))?;
@@ -305,15 +352,22 @@ impl RawHub {
                     log,
                     Arc::downgrade(self) as Weak<dyn RawStopSink>,
                     generation,
-                    self.max_frame,
+                    self.max_frame.max(self.json_max),
                     self.writer_queue,
                 )
                 .map_err(|error| format!("raw reactor: {}", error))?;
-            let plugin = Arc::new(RawPlugin::new(id.clone(), generation));
+            let plugin = Arc::new(RawPlugin::new(id.clone(), generation, json.clone()));
             let _ = plugin.out.set(queue);
             return self.install(id, plugin);
         }
-        self.register_threads(id, generation, stdin, stdout, stderr, log)
+        self.register_threads(
+            id,
+            generation,
+            stdin,
+            stdout,
+            stderr,
+            Observers { log, json },
+        )
     }
 
     /// Fallback when the reactor failed to start: one writer thread, one reader
@@ -327,10 +381,11 @@ impl RawHub {
         mut stdin: WriteEnd,
         mut stdout: ReadEnd,
         stderr: Option<ReadEnd>,
-        log: Option<Arc<Mutex<LogWriter>>>,
+        observers: Observers,
     ) -> Result<(), String> {
+        let Observers { log, json } = observers;
         let (writer_tx, writer_rx) = sync_channel::<Vec<u8>>(self.writer_queue);
-        let plugin = Arc::new(RawPlugin::new(id.clone(), generation));
+        let plugin = Arc::new(RawPlugin::new(id.clone(), generation, json));
         let _ = plugin.writer.set(writer_tx);
 
         let writer_plugin = plugin.clone();
@@ -359,7 +414,9 @@ impl RawHub {
         let reader_plugin = plugin.clone();
         let reader_hub = self.clone();
         let reader_id = id.clone();
-        let max_frame = self.max_frame;
+        // Allocation cap for both channels: stream 0 has its own (larger) JSON
+        // limit, and `publish` enforces the raw cap per stream.
+        let max_frame = self.max_frame.max(self.json_max);
         thread::Builder::new()
             .name(format!("svcd-{}-raw-read", id))
             .stack_size(crate::platform::host::threads::io_stack(&self.limits))
@@ -615,6 +672,105 @@ impl RawHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hub with one installed protocol-3 plugin that has a JSON channel and
+    /// a writer queue we can read.
+    fn hub_with_json(
+        settings: &crate::platform::settings::Settings,
+    ) -> (Arc<RawHub>, Receiver<FrameEvent>, Receiver<Vec<u8>>) {
+        let hub = RawHub::new(Arc::new(crate::platform::limits::derive(settings).limits));
+        let (json_tx, json_rx) = std::sync::mpsc::sync_channel(8);
+        let plugin = Arc::new(RawPlugin::new("p".to_string(), 1, Some(json_tx)));
+        let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(8);
+        let _ = plugin.writer.set(writer_tx);
+        hub.install("p".to_string(), plugin).expect("install");
+        (hub, json_rx, writer_rx)
+    }
+
+    #[test]
+    fn stream_zero_feeds_the_json_channel_not_a_subscriber() {
+        let (hub, json_rx, _writer) =
+            hub_with_json(&crate::platform::settings::Settings::default());
+        let line = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
+
+        hub.deliver("p", 0, line.to_vec());
+
+        match json_rx.try_recv() {
+            Ok(FrameEvent::Frame(Ok(got))) => assert_eq!(got.as_bytes(), line),
+            other => panic!("stream 0 did not reach the JSON channel: {other:?}"),
+        }
+        assert_eq!(hub.stats.json_frames.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            hub.stats.json_bytes.load(Ordering::Relaxed),
+            line.len() as u64
+        );
+    }
+
+    #[test]
+    fn stream_zero_without_a_json_channel_is_counted() {
+        let hub = RawHub::new(Arc::new(
+            crate::platform::limits::derive(&crate::platform::settings::Settings::default()).limits,
+        ));
+        let plugin = Arc::new(RawPlugin::new("p".to_string(), 1, None));
+        hub.install("p".to_string(), plugin).expect("install");
+
+        hub.deliver("p", 0, b"{}".to_vec());
+
+        assert_eq!(hub.stats.count(RawFailure::JsonChannelClosed), 1);
+    }
+
+    #[test]
+    fn raw_streams_keep_going_to_their_subscriber() {
+        let (hub, json_rx, _writer) =
+            hub_with_json(&crate::platform::settings::Settings::default());
+        let subscription = hub.subscribe("p").expect("subscribe");
+
+        hub.deliver("p", subscription.stream(), b"raw".to_vec());
+
+        match subscription.try_recv() {
+            Ok(RawEvent::Frame(payload)) => assert_eq!(payload, b"raw"),
+            other => panic!("raw stream did not reach its subscriber: {other:?}"),
+        }
+        assert!(
+            json_rx.try_recv().is_err(),
+            "raw data must not reach stream 0"
+        );
+        assert_eq!(hub.stats.json_frames.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn an_oversized_json_frame_is_a_channel_failure() {
+        let (hub, json_rx, _writer) =
+            hub_with_json(&crate::platform::settings::Settings::default());
+        let max = hub.json_max;
+
+        hub.deliver("p", 0, vec![b'x'; max + 1]);
+
+        assert_eq!(hub.stats.count(RawFailure::JsonFrameTooLarge), 1);
+        match json_rx.try_recv() {
+            Ok(FrameEvent::Frame(Err(FrameError::TooLarge { max: reported }))) => {
+                assert_eq!(reported, max)
+            }
+            other => panic!("expected a TooLarge frame error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_json_wraps_the_payload_in_a_stream_zero_frame() {
+        let (hub, _json_rx, writer_rx) =
+            hub_with_json(&crate::platform::settings::Settings::default());
+
+        hub.send_json("p", b"{\"id\":1}").expect("send");
+
+        let frame = writer_rx.try_recv().expect("frame");
+        assert_eq!(&frame[..4], &8u32.to_be_bytes(), "payload length");
+        assert_eq!(&frame[4..8], &0u32.to_be_bytes(), "stream 0");
+        assert_eq!(&frame[8..], b"{\"id\":1}");
+        assert!(
+            hub.send_json("missing", b"{}").is_err(),
+            "no plugin, no write"
+        );
+    }
 
     #[test]
     fn stats_count_each_failure_and_summarise() {
