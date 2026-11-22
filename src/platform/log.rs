@@ -136,7 +136,7 @@ fn valid_stamp(bytes: &[u8]) -> bool {
 /// compares levels: an old-format line has no level and always passes
 /// (ADR-0022).
 pub fn keep(line: &str, threshold: Level) -> bool {
-    parse_level(line).map_or(true, |level| level <= threshold)
+    parse_level(line).is_none_or(|level| level <= threshold)
 }
 
 /// Keep the lines at or above `threshold`.
@@ -370,7 +370,7 @@ fn set_group(path: &Path) {
 /// message is cut at [`MAX_MESSAGE_BYTES`] on a UTF-8 boundary with the dropped
 /// byte count appended.
 pub fn format_line(epoch_ms: u64, level: Level, source: &str, message: &str) -> String {
-    let escaped = message.replace('\r', "\\n").replace('\n', "\\n");
+    let escaped = message.replace(['\r', '\n'], "\\n");
     let body = truncate_message(&escaped);
     format!("{} {} {} {}", stamp(epoch_ms), level.as_str(), source, body)
 }
