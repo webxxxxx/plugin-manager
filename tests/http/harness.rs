@@ -160,6 +160,13 @@ impl Sandbox {
     }
 
     pub(crate) fn start_daemon_with_bind(&mut self, bind: &str) {
+        self.start_daemon_with_env(bind, &[]);
+    }
+
+    /// `start_daemon_with_bind` plus extra environment. The restart tests pin the
+    /// privilege role here: the default sandbox env forces `SVCD_TEST_UNPRIVILEGED`,
+    /// which makes the daemon look like a system service to the restart policy.
+    pub(crate) fn start_daemon_with_env(&mut self, bind: &str, extra: &[(&str, &str)]) {
         let stderr = fs::File::create(&self.daemon_stderr).expect("daemon stderr");
         let mut command = Command::new(&self.svcd);
         command
@@ -169,6 +176,9 @@ impl Sandbox {
             .stderr(Stdio::from(stderr));
         self.env(&mut command);
         command.env("SVCD_BIND", bind);
+        for (key, value) in extra {
+            command.env(key, value);
+        }
         self.daemon = Some(command.spawn().expect("spawn daemon"));
     }
 

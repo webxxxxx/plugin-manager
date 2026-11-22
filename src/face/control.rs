@@ -68,6 +68,8 @@ pub enum Command {
     LogsClear {
         service: Option<String>,
     },
+    /// Restart the daemon itself (user mode) or answer how to restart it.
+    RestartDaemon,
     ToolCall(ToolCall),
 }
 
@@ -160,6 +162,7 @@ pub fn parse(request: rpc::Request) -> Result<Call, rpc::Response> {
             }
         }
         "auth.status" => Command::AuthStatus,
+        "svcd.restart" => Command::RestartDaemon,
         "svc.logs.clear" => Command::LogsClear {
             service: params.get("id").and_then(Value::as_str).map(str::to_string),
         },

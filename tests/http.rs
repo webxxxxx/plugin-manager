@@ -41,6 +41,8 @@ mod logs;
 mod mcp;
 #[path = "http/protocol.rs"]
 mod protocol;
+#[path = "http/settings.rs"]
+mod settings;
 #[path = "http/transfer.rs"]
 mod transfer;
 #[path = "http/ui.rs"]

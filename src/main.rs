@@ -109,7 +109,12 @@ fn svcd_run(args: Vec<String>) -> i32 {
         Some("uninstall-service") => selfinstall::uninstall_service(&args[1..]),
         Some("start") => start_command(),
         Some("stop") => stop_command(),
+        Some("restart") if args.len() == 1 => restart_command(),
         Some("status") => status_command(),
+        // Internal: spawned by `svcd restart` / a settings save. It waits for
+        // its parent to exit (the control socket and HTTP port are still held),
+        // then starts the daemon the same way a background user daemon starts.
+        Some("restart-helper") => restart_helper(&args[1..]),
         Some("user") => user_command(&args[1..]),
         _ => {
             usage();
@@ -280,34 +285,40 @@ fn user_start(config: &crate::platform::config::Config) -> i32 {
         eprintln!("svcd: create {}: {}", logs.display(), error);
         return 1;
     }
-    let executable = match std::env::current_exe() {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("svcd: current executable: {}", error);
-            return 1;
+    match spawn_foreground_daemon(config) {
+        Ok(pid) => {
+            println!("svcd user daemon started (pid {})", pid);
+            println!("config: {}", config_dir.display());
+            println!(
+                "logs:   {}",
+                config.paths.logs_dir.join("svcd.log").display()
+            );
+            0
         }
-    };
-    let log_path = logs.join("svcd.log");
-    // `log = off` is a master switch: do not even create the redirect target.
+        Err(error) => {
+            eprintln!("svcd: start user daemon: {}", error);
+            1
+        }
+    }
+}
+
+/// Spawn `svcd run --foreground` detached, with stdout/stderr appended to
+/// `svcd.log` (or discarded when the master log switch is off). Shared by
+/// `svcd user start`, `svcd restart` and the restart helper so all three start
+/// the daemon identically.
+fn spawn_foreground_daemon(config: &crate::platform::config::Config) -> Result<u32, String> {
+    // The daemon outlives its starter; it must not inherit the starter's pipes.
+    crate::platform::host::process::detach_stdio();
+    let log_path = config.paths.logs_dir.join("svcd.log");
     let (stdout, stderr) = if config.limits.log_enabled {
-        let stdout = match std::fs::OpenOptions::new()
+        let stdout = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&log_path)
-        {
-            Ok(file) => file,
-            Err(error) => {
-                eprintln!("svcd: open {}: {}", log_path.display(), error);
-                return 1;
-            }
-        };
-        let stderr = match stdout.try_clone() {
-            Ok(file) => file,
-            Err(error) => {
-                eprintln!("svcd: clone log handle: {}", error);
-                return 1;
-            }
-        };
+            .map_err(|error| format!("open {}: {}", log_path.display(), error))?;
+        let stderr = stdout
+            .try_clone()
+            .map_err(|error| format!("clone log handle: {}", error))?;
         (
             std::process::Stdio::from(stdout),
             std::process::Stdio::from(stderr),
@@ -315,6 +326,8 @@ fn user_start(config: &crate::platform::config::Config) -> i32 {
     } else {
         (std::process::Stdio::null(), std::process::Stdio::null())
     };
+    let executable =
+        std::env::current_exe().map_err(|error| format!("current executable: {}", error))?;
     let mut command = std::process::Command::new(&executable);
     command
         .args(["run", "--foreground"])
@@ -341,15 +354,98 @@ fn user_start(config: &crate::platform::config::Config) -> i32 {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    match command.spawn() {
-        Ok(child) => {
-            println!("svcd user daemon started (pid {})", child.id());
-            println!("config: {}", config_dir.display());
-            println!("logs:   {}", log_path.display());
+    command
+        .spawn()
+        .map(|child| child.id())
+        .map_err(|error| format!("spawn: {}", error))
+}
+
+/// Restart the daemon. A user-mode daemon is restarted here; a system service
+/// belongs to its service manager, which owns its lifetime.
+fn restart_command() -> i32 {
+    if !crate::platform::paths::user_mode() {
+        eprintln!(
+            "svcd: this daemon runs as a service; restart it with the service manager \
+             (systemctl restart svcd / launchctl kickstart -k / sc stop svcd && sc start svcd)"
+        );
+        return 1;
+    }
+    let Some(config) = crate::platform::config::Config::bootstrap_or_report("svcd") else {
+        return 1;
+    };
+    if user_running(&config) {
+        if crate::daemon::shutdown() != 0 {
+            eprintln!("svcd: the running daemon did not accept the shutdown request");
+            return 1;
+        }
+        for _ in 0..200 {
+            if !user_running(&config) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+    // Start the replacement from the detached helper rather than from this
+    // process: the helper runs with null stdio, so the daemon it starts cannot
+    // inherit whatever pipes the caller of `svcd restart` holds.
+    match crate::daemon::restart::spawn_helper() {
+        Ok(helper) => {
+            println!("svcd restarting (helper pid {})", helper);
             0
         }
         Err(error) => {
-            eprintln!("svcd: start user daemon: {}", error);
+            eprintln!("svcd: restart: {}", error);
+            1
+        }
+    }
+}
+
+/// Wait for the process named in `pid` to exit, then start the daemon again.
+/// This is the detached half of a settings save: the daemon cannot rebind its
+/// control socket or HTTP port while it is still running.
+fn restart_helper(args: &[String]) -> i32 {
+    let Some(_pid) = args.first().and_then(|value| value.parse::<u32>().ok()) else {
+        eprintln!("svcd: restart-helper expects a pid");
+        return 64;
+    };
+    // Grace period: the save that spawned this helper still has an HTTP reply
+    // in flight, and that response must reach the browser before the daemon
+    // closes the listener.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Liveness is "does the control channel answer", not "does the pid exist":
+    // process liveness has no portable Windows implementation, and the control
+    // channel is exactly the resource the replacement must be able to rebind.
+    let paths = crate::platform::config::ambient_paths(None);
+    let control = paths.control_dir();
+    let ping = |control: &std::path::Path| {
+        crate::wire::control::channel::request(control, "svcd.ping", serde_json::json!({})).is_ok()
+    };
+    for _ in 0..40 {
+        if !ping(control) {
+            break;
+        }
+        let _ = crate::daemon::shutdown_quiet();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    for _ in 0..200 {
+        if !ping(control) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    // The ping fails as soon as the channel is gone; give the OS a moment to
+    // release the socket/pipe name before the replacement binds it.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let Some(config) = crate::platform::config::Config::bootstrap_or_report("svcd") else {
+        return 1;
+    };
+    match spawn_foreground_daemon(&config) {
+        Ok(child) => {
+            println!("svcd restarted (pid {})", child);
+            0
+        }
+        Err(error) => {
+            eprintln!("svcd: restart helper: {}", error);
             1
         }
     }

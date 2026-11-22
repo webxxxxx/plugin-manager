@@ -168,6 +168,10 @@ impl Daemon {
                 Ok(status) => rpc::ok(id, auth_json(&status)),
                 Err(error) => problem_response(id, -32008, error),
             },
+            control::Command::RestartDaemon => match self.restart_daemon() {
+                Ok(value) => rpc::ok(id, value),
+                Err(error) => problem_response(id, -32013, error),
+            },
             control::Command::LogsClear { service } => match self.clear_logs(service) {
                 Ok(value) => rpc::ok(id, value),
                 Err(error) => problem_response(id, -32013, error),
@@ -185,6 +189,24 @@ impl Daemon {
                 Problem::Internal.error_data(),
             ),
         }
+    }
+
+    /// Restart the daemon after a settings save. A system service belongs to
+    /// its service manager, so this only says how to restart it.
+    pub(super) fn restart_daemon(&mut self) -> Result<serde_json::Value, ProblemError> {
+        if !crate::platform::paths::user_mode() {
+            return Ok(json!({
+                "restarting": false,
+                "hint": "saved; restart the service with the service manager \
+                         (systemctl restart svcd / launchctl kickstart -k / sc stop svcd && sc start svcd)",
+            }));
+        }
+        // The helper stops this daemon itself, after a short grace period that
+        // lets the HTTP response carrying `restarting: true` flush. Shutting
+        // down here could kill the process before the reply reaches the browser.
+        let helper = crate::daemon::restart::spawn_helper()
+            .map_err(|error| Problem::Internal.error(format!("spawn restart helper: {}", error)))?;
+        Ok(json!({"restarting": true, "helper": helper}))
     }
 
     /// Clear the daemon log or one plugin's logs. The daemon log goes through
