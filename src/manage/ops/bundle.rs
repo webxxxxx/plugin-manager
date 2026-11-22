@@ -2,7 +2,8 @@
 //!
 //! The artifact defaults to `<name>-<version>-<platform>.spk`: the whole target
 //! triple, because the architecture prefix alone cannot distinguish musl from
-//! gnu (or other ABIs sharing an arch).
+//! gnu (or other ABIs sharing an arch). An `--out` directory keeps that name;
+//! an `--out` file path is used verbatim.
 //!
 //! The directory is the source of truth for `files[]`: every regular file is
 //! hashed, sized and mode-checked here, then the manifest is serialized with
@@ -93,15 +94,17 @@ pub fn bundle(options: &Options) -> Result<PathBuf, ProblemError> {
     let (manifest_bytes, parsed) =
         assemble_manifest(&dir, &mut sources, skeleton.unwrap_or_default(), options)?;
 
-    // The filename carries the whole target triple: `x86_64` alone is shared by
-    // the musl and gnu packages, so an arch-only name cannot identify which
-    // host may install the file.
-    let path = options.out.clone().unwrap_or_else(|| {
-        PathBuf::from(format!(
-            "{}-{}-{}.spk",
-            parsed.name, parsed.version, parsed.platform
-        ))
-    });
+    // The filename carries the version and the whole target triple: `x86_64`
+    // alone is shared by the musl and gnu packages, so an arch-only name
+    // cannot identify which host may install the file. A directory passed to
+    // `-o` keeps that default name, so an output directory can never collect
+    // unversioned artifacts that overwrite each other.
+    let default_name = format!("{}-{}-{}.spk", parsed.name, parsed.version, parsed.platform);
+    let path = match &options.out {
+        Some(out) if out.is_dir() => out.join(&default_name),
+        Some(out) => out.clone(),
+        None => PathBuf::from(&default_name),
+    };
     let absolute = absolute_output(&path)?;
     if absolute.starts_with(&dir) {
         return Err(Problem::Invalid.error("package output must be outside the bundle directory"));

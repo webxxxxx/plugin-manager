@@ -530,6 +530,48 @@ fn refuses_to_write_the_package_inside_the_bundle_directory() {
         "{error}"
     );
     assert!(!out.exists());
+
+    // A directory target resolves to the same default name, so it has to hit
+    // the same guard instead of writing the package into the source tree.
+    let mut options = bundle_options(source.path(), source.path(), &key_path);
+    options.id = Some("demo".into());
+    let error = bundle(&options).expect_err("output directory inside");
+    assert!(
+        error.detail().contains("outside the bundle directory"),
+        "{error}"
+    );
+    assert_eq!(fs::read_dir(source.path()).expect("read source").count(), 1);
+}
+
+#[test]
+fn an_output_directory_receives_the_versioned_default_name() {
+    let source = TempDir::new();
+    let work = TempDir::new();
+    let exec_path = if cfg!(windows) {
+        "payload/bin/tool.cmd"
+    } else {
+        "payload/bin/tool"
+    };
+    write(source.path(), exec_path, b"tool", 0o755);
+    let key_path = key_file(&work, 34);
+    // `-o` naming an existing directory keeps the default artifact name, so an
+    // output directory cannot collect unversioned files that overwrite each
+    // other.
+    let mut options = bundle_options(source.path(), work.path(), &key_path);
+    options.id = Some("demo".into());
+    let path = bundle(&options).expect("bundle into a directory");
+    let bytes = fs::read(&path).expect("read package");
+    let entries = entries(&bytes);
+    let manifest = package::parse_manifest(&entries[0].data).expect("manifest");
+    let expected = format!(
+        "{}-{}-{}.spk",
+        manifest.name, manifest.version, manifest.platform
+    );
+    assert_eq!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(expected.as_str())
+    );
+    assert!(path.is_file(), "{}", path.display());
 }
 
 #[test]

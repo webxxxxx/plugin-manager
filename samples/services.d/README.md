@@ -69,7 +69,7 @@ Windows:
 plugin bundle samples\services.d --exec clock.bat --from-core `
   --interpreter cmd --interpreter-arg /C `
   --key samples\keys\sample-2026.key --id clock --desc "clock service" `
-  -o samples\spk\clock.spk
+  -o samples\spk
 ```
 
 Linux/macOS:
@@ -77,8 +77,12 @@ Linux/macOS:
 ```sh
 plugin bundle samples/services.d --exec clock.sh --from-core --interpreter sh \
   --key samples/keys/sample-2026.key --id clock --desc "clock service" \
-  -o samples/spk/clock.spk
+  -o samples/spk
 ```
+
+`-o` may name a file or an existing directory. A directory gets the default
+name, so both commands above write `clock-1.0.0-<target-triple>.spk` (name,
+version, and the whole target triple); a file name is used verbatim.
 
 Then trust `samples/keys/sample-2026.pub` once and install the package with
 `plugin install`. See [../spk/README.md](../spk/README.md) for the key and

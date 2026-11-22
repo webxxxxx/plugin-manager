@@ -24,7 +24,8 @@ Windows clock sample:
 ```powershell
 plugin bundle samples\clock --from-core --interpreter cmd --interpreter-arg /C `
   --key samples\keys\sample-2026.key --version 0.1.0 `
-  -o samples\spk\clock-0.1.0-x86_64-pc-windows-msvc.spk
+  -o samples\spk
+# -> samples\spk\clock-0.1.0-x86_64-pc-windows-msvc.spk
 ```
 
 The wireguard sample targets `x86_64-unknown-linux-musl`; the package will be

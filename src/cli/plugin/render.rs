@@ -95,6 +95,6 @@ pub(super) fn usage() {
     eprintln!("       plugin export <id> [--config-only] [--out <path>]");
     eprintln!("       plugin import <file> [--config <id>] [--no-config] [--force]");
     eprintln!(
-        "       plugin bundle <dir> --key <pem> [-o <out>] [--id <id>] [--version <semver>] [--exec <path>] [--desc <text>] [--key-id <id>] [--from-core] [--interpreter <name>] [--interpreter-version <constraint>] [--interpreter-arg <arg>] [--compat <device[,device...]>] [--platform <triple>] [--unsigned]"
+        "       plugin bundle <dir> --key <pem> [-o <file|dir>] [--id <id>] [--version <semver>] [--exec <path>] [--desc <text>] [--key-id <id>] [--from-core] [--interpreter <name>] [--interpreter-version <constraint>] [--interpreter-arg <arg>] [--compat <device[,device...]>] [--platform <triple>] [--unsigned]"
     );
 }
