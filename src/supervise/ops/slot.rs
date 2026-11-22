@@ -157,6 +157,21 @@ impl Slot {
         }
     }
 
+    /// Clear this slot's service log. A running slot owns an open writer, so
+    /// the truncation goes through it; a stopped slot has no handle and the
+    /// files are removed directly.
+    pub(crate) fn clear_logs(&mut self) -> std::io::Result<usize> {
+        match self.log.as_mut() {
+            Some(writer) => match writer.lock() {
+                Ok(mut writer) => writer.reset(),
+                Err(_) => Ok(0),
+            },
+            None => {
+                log::remove_log_files(&self.paths.logs_dir, &self.id, self.limits.log_rotations)
+            }
+        }
+    }
+
     pub(crate) fn set_contract(&mut self, contract: Contract) {
         self.contract = Some(contract);
     }

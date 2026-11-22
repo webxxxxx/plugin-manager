@@ -239,6 +239,24 @@ impl LogSink {
         Ok(())
     }
 
+    /// Truncate this sink's file and drop every rotated sibling, then reopen so
+    /// the next line lands in a fresh file. The handle is closed first: on
+    /// Windows, deleting a file this process still holds open leaves the write
+    /// side appending to an invisible file (#262).
+    pub fn reset(&mut self) -> io::Result<usize> {
+        self.file.take();
+        let mut removed = 0;
+        for number in 1..self.rotations {
+            removed += remove_if_exists(&rotated(&self.path, number))?;
+        }
+        removed += remove_if_exists(&self.path)?;
+        self.size = 0;
+        if self.enabled {
+            self.file = Some(open_append(&self.path)?);
+        }
+        Ok(removed)
+    }
+
     fn rotate(&mut self) -> io::Result<()> {
         self.file.take();
         let newest = self.path.clone();
@@ -303,6 +321,13 @@ impl LogWriter {
             stderr,
             clock,
         })
+    }
+
+    /// Clear this writer's files (current plus rotations). The writer object
+    /// stays the same, so a thread that already holds it keeps writing into the
+    /// new file.
+    pub fn reset(&mut self) -> io::Result<usize> {
+        self.sink.reset()
     }
 
     /// Format, filter and truncate one record, then hand it to the sink.
@@ -482,6 +507,38 @@ pub fn record(level: Level, message: &str) {
         "{}",
         format_line(clock().epoch_ms(), level, "svcd", message)
     );
+}
+
+/// Truncate the daemon's own `svcd.log` (and its rotations) through the writer
+/// that holds the handle. Returns how many files were removed.
+pub fn reset_svcd() -> io::Result<usize> {
+    match SVCD_LOG.get().and_then(|log| log.lock().ok()) {
+        Some(mut writer) => writer.reset(),
+        // No writer yet (an early error path) or a poisoned lock: there is
+        // nothing this process is writing to.
+        None => Ok(0),
+    }
+}
+
+/// Delete `<base>.log` and its rotated siblings where no writer is reachable:
+/// a stopped plugin, or the hooks log whose writer lives only for the duration
+/// of one hook run.
+pub fn remove_log_files(dir: &Path, base: &str, rotations: usize) -> io::Result<usize> {
+    let path = dir.join(format!("{}.log", base));
+    let mut removed = 0;
+    for number in 1..rotations.max(1) {
+        removed += remove_if_exists(&rotated(&path, number))?;
+    }
+    removed += remove_if_exists(&path)?;
+    Ok(removed)
+}
+
+fn remove_if_exists(path: &Path) -> io::Result<usize> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(1),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error),
+    }
 }
 
 /// Return the last `lines` lines of `path`, each terminated by a newline.
@@ -733,6 +790,31 @@ mod tests {
         let current = fs::metadata(dir.0.join("demo.log")).expect("meta").len();
         assert!(current > 0);
         assert!(current <= limit);
+    }
+
+    #[test]
+    fn reset_drops_rotations_and_reopens_the_same_path() {
+        let dir = TempDir::new();
+        let mut sink = LogSink::open_with(&dir.0, "demo", 8, 3, true).expect("open");
+        sink.line("one").expect("line");
+        sink.line("two").expect("line");
+        sink.line("three").expect("line");
+        assert!(
+            dir.0.join("demo.log.1").exists(),
+            "the limit forces a rotation"
+        );
+
+        let removed = sink.reset().expect("reset");
+
+        assert_eq!(removed, 2, "the current file and its one rotation");
+        assert!(!dir.0.join("demo.log.1").exists());
+        assert!(dir.0.join("demo.log").is_file(), "reset reopens the path");
+        assert_eq!(fs::read_to_string(dir.0.join("demo.log")).unwrap(), "");
+        sink.line("after").expect("line");
+        assert_eq!(
+            fs::read_to_string(dir.0.join("demo.log")).unwrap(),
+            "after\n"
+        );
     }
 
     #[test]

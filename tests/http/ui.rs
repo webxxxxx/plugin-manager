@@ -37,6 +37,9 @@ fn serves_the_embedded_console() {
     for needle in [
         "上传安装",
         "添加公钥",
+        "查看日志",
+        "清空",
+        "确认清空？",
         "自动刷新（3s）",
         "hasConfig",
         "hasUI",

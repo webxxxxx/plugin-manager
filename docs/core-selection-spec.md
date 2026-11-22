@@ -288,7 +288,9 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
   - `GET /api/v1/config/{id}`：活动配置原始字节（`text/plain`；无配置 404）
   - `PUT /api/v1/config/{id}`：body 为候选配置；跑 `configCheck`，原子替换，保留 last-good；校验失败 409
   - `POST /api/v1/config/{id}/reset`：模板覆盖
-  - `GET /api/v1/logs/{id}?lines=200`：返回文本尾部；`lines` 上限 2000；不提供 follow / SSE
+  - `GET /api/v1/logs?lines=200`：daemon 自己的 `<logs>/svcd.log` 文本尾部（与插件日志同一套 `lines` / `level` 参数）；`lines` 上限 2000；不提供 follow / SSE
+  - `GET /api/v1/logs/{id}?lines=200`：插件 `<id>.log` 的文本尾部；同一套参数
+  - `DELETE /api/v1/logs` / `DELETE /api/v1/logs/{id}`：清空 daemon 日志或插件日志（`<id>.log` + `<id>-hooks.log` + 两者轮转）。清空走写侧 `LogSink::reset()`（关句柄 → 删文件 → 重开），不靠 HTTP 删文件：Windows 上删一个仍被写的文件会变成 delete-pending，写侧继续往看不见的旧文件追加。审计行 `logs cleared: <id> (N files)` 写进 daemon 日志；没有可清文件时 404
   - `GET /api/v1/auth`：`{bind,requestedBind,authRequired,passwordSet}`
   - `POST /api/v1/auth/enable`（body `{bind}`）/ `POST /api/v1/auth/disable`
 - `plugins` / `export` / `config` / `import` 端点只对 plugin；core 服务不能经 HTTP 安装、卸载、导出或编辑配置；`GET /services` 两者都返回。
