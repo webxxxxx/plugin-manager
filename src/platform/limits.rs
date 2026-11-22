@@ -103,16 +103,11 @@ pub struct Derived {
 
 /// Threads the invariant charges for a stack.
 ///
-/// Unix runs the supervisor loop, the server loop and the blocking pool; the
-/// per-connection HTTP fallback does not exist there. Windows keeps one thread
-/// per admitted connection, so the connection cap *is* the thread cap and
-/// `min(derived threads, max_connections)` is simply `max_connections`.
-fn threads_for(max_connections: usize, blocking_threads: usize) -> usize {
-    if cfg!(windows) {
-        max_connections
-    } else {
-        LOOP_THREADS + blocking_threads
-    }
+/// Every host runs the same topology: the supervisor loop, the server loop and
+/// the blocking pool. A connection is a wait-set entry, not a thread, on both
+/// Unix and Windows, so the thread term does not grow with the connection cap.
+fn threads_for(blocking_threads: usize) -> usize {
+    LOOP_THREADS + blocking_threads
 }
 
 /// The one bounded UI event ring behind every plugin stream. Charged once:
@@ -129,7 +124,7 @@ pub const MAX_CONNECTIONS_CEILING: usize = 4096;
 impl Limits {
     /// Threads the invariant charges a stack for.
     pub fn threads(&self) -> usize {
-        threads_for(self.max_connections, self.blocking_threads)
+        threads_for(self.blocking_threads)
     }
 
     /// What one admitted connection costs: its worst-case buffers, or the
@@ -146,10 +141,7 @@ impl Limits {
     /// buffers, in-flight bytes, queues, the UI ring) is already known, so the
     /// remainder divided by one slot's worst case is the answer.
     pub fn fitting_concurrency(&self, budget: u64) -> usize {
-        let per = self
-            .per_connection_bytes()
-            .saturating_add(derive::stack_per_connection(self))
-            .max(1);
+        let per = self.per_connection_bytes().max(1);
         // One slot carries one stream and one subscriber cursor, so both are
         // part of the slot's cost when the three counts are solved together.
         let per_slot = per
