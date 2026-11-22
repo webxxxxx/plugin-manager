@@ -16,6 +16,10 @@ const SLOW_LOOP_MS: u64 = 1_000;
 /// reading (ADR-0022).
 pub const MAX_MESSAGE_BYTES: usize = 8 * 1024;
 
+/// Bound for one physical log line before the writer sees it. The reactor and
+/// the thread reader both use this, so the two paths cannot disagree.
+pub const MAX_LINE_BYTES: usize = 64 * 1024;
+
 /// Log a loop phase that ran past [`SLOW_LOOP_MS`]. Shared by the compose loop
 /// and the supervisor so the threshold has one home.
 pub fn note_slow(what: &str, started: std::time::Instant) {

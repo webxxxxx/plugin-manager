@@ -144,14 +144,37 @@ fn drain_lines(source: &mut Source) -> bool {
             return drain_length_frames(source);
         }
     }
+    if matches!(source.kind, SourceKind::Log) && source.discarding {
+        match source.buffer.iter().position(|byte| *byte == b'\n') {
+            Some(position) => {
+                source.buffer.drain(..=position);
+                source.discarding = false;
+            }
+            None => {
+                source.buffer.clear();
+                return true;
+            }
+        }
+    }
     loop {
         let Some(position) = source.buffer.iter().position(|byte| *byte == b'\n') else {
             let max = match &source.kind {
                 SourceKind::Frames { max, .. } => *max,
-                SourceKind::Log => MAX_LOG_LINE,
-                SourceKind::RawStdin { .. } | SourceKind::RawStdout { .. } => MAX_LOG_LINE,
+                SourceKind::Log => crate::platform::log::MAX_LINE_BYTES,
+                SourceKind::RawStdin { .. } | SourceKind::RawStdout { .. } => {
+                    crate::platform::log::MAX_LINE_BYTES
+                }
             };
             if source.buffer.len() > max {
+                if matches!(source.kind, SourceKind::Log) {
+                    // The write side truncates and marks this record; the
+                    // source keeps reading instead of being dropped (#174).
+                    let line = String::from_utf8_lossy(&source.buffer).into_owned();
+                    log_line(&source.log, &line);
+                    source.buffer.clear();
+                    source.discarding = true;
+                    return true;
+                }
                 if let SourceKind::Frames { sender, .. } = &source.kind {
                     let _ = sender.try_send(FrameEvent::Frame(Err(FrameError::TooLarge { max })));
                 }
