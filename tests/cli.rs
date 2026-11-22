@@ -646,13 +646,14 @@ fn status_resources_reports_the_last_start_and_falls_back_without_one() {
 fn an_unrunnable_document_is_still_inspectable() {
     let sandbox = Sandbox::new();
     fs::create_dir_all(sandbox.config_dir()).expect("config dir");
-    // A budget equal to the resident baseline cannot be planned on any host:
-    // the invariant has to find room for connection buffers, the raw in-flight
-    // allowance and the UI ring on top, and the baseline is a constant, so the
-    // refusal does not depend on how many threads a platform charges stacks for.
+    // The connection floor is eight, and eight 8 MiB stacks already exceed a
+    // 32 MiB budget: Unix charges the two loop threads on top, Windows charges
+    // one thread per connection, so both thread models refuse this document.
+    // Leaving the connection count unconfigured would instead let the solver
+    // pick a count that fits, which is a runnable plan and not this test.
     fs::write(
         sandbox.config_dir().join("svcd.conf"),
-        "mem_budget_bytes = 33554432\nrequest_stack_bytes = 8388608\nblocking_threads = 8\n",
+        "mem_budget_bytes = 33554432\nrequest_stack_bytes = 8388608\nblocking_threads = 8\nmax_connections = 64\n",
     )
     .expect("write conf");
 
@@ -668,6 +669,11 @@ fn an_unrunnable_document_is_still_inspectable() {
     assert!(
         stdout(&output).contains("refused:"),
         "the refusal must be visible:\n{}",
+        stdout(&output)
+    );
+    assert!(
+        stdout(&output).contains("thread stacks"),
+        "the refusal must name the stacks that do not fit:\n{}",
         stdout(&output)
     );
 
