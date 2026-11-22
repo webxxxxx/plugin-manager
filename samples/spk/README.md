@@ -31,6 +31,10 @@ plugin bundle samples\clock --from-core --interpreter cmd --interpreter-arg /C `
 The wireguard sample targets `x86_64-unknown-linux-musl`; the package will be
 rejected on other platforms by the normal platform check.
 
+A package built with `--compat` appends the first device id to the default
+name, e.g. `meow-1.0.0-aarch64-unknown-linux-musl-sr6110.spk`; the signed
+manifest still lists every id, and that list is what the daemon enforces.
+
 To try a package locally, trust its signing key once (as Administrator):
 
 ```powershell

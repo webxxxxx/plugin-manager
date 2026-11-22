@@ -2,8 +2,11 @@
 //!
 //! The artifact defaults to `<name>-<version>-<platform>.spk`: the whole target
 //! triple, because the architecture prefix alone cannot distinguish musl from
-//! gnu (or other ABIs sharing an arch). An `--out` directory keeps that name;
-//! an `--out` file path is used verbatim.
+//! gnu (or other ABIs sharing an arch). A device-restricted package (one with
+//! `compat.devices`) appends the first id: `<name>-<version>-<platform>-<device>`
+//! — a label for humans, not the authority; the signed manifest keeps the whole
+//! list. An `--out` directory keeps that name; an `--out` file path is used
+//! verbatim.
 //!
 //! The directory is the source of truth for `files[]`: every regular file is
 //! hashed, sized and mode-checked here, then the manifest is serialized with
@@ -94,12 +97,27 @@ pub fn bundle(options: &Options) -> Result<PathBuf, ProblemError> {
     let (manifest_bytes, parsed) =
         assemble_manifest(&dir, &mut sources, skeleton.unwrap_or_default(), options)?;
 
-    // The filename carries the version and the whole target triple: `x86_64`
-    // alone is shared by the musl and gnu packages, so an arch-only name
-    // cannot identify which host may install the file. A directory passed to
-    // `-o` keeps that default name, so an output directory can never collect
-    // unversioned artifacts that overwrite each other.
-    let default_name = format!("{}-{}-{}.spk", parsed.name, parsed.version, parsed.platform);
+    // The filename carries the version, the whole target triple and, for a
+    // device-restricted package, the first `compat.devices` id. `x86_64` alone
+    // is shared by the musl and gnu packages, so an arch-only name cannot
+    // identify which host may install the file; and without the device id two
+    // builds that differ only in their compat list (`sr6110` vs `sr6110-v2`)
+    // would default to the same name and silently overwrite each other. The
+    // suffix is only the first id: the signed manifest stays authoritative for
+    // the full list. A directory passed to `-o` keeps that default name, so an
+    // output directory can never collect unversioned artifacts that overwrite
+    // each other.
+    let device = parsed
+        .compat
+        .as_ref()
+        .and_then(|compat| compat.devices.first());
+    let default_name = match device {
+        Some(device) => format!(
+            "{}-{}-{}-{}.spk",
+            parsed.name, parsed.version, parsed.platform, device
+        ),
+        None => format!("{}-{}-{}.spk", parsed.name, parsed.version, parsed.platform),
+    };
     let path = match &options.out {
         Some(out) if out.is_dir() => out.join(&default_name),
         Some(out) => out.clone(),

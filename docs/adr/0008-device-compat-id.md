@@ -13,7 +13,7 @@
 - **校验位置**：安装（验签/结构校验之后、停任何服务之前）、daemon 启动扫描（把已装包标成 `Failed`）、`svc start` 前（防御性）。不匹配的安装不落盘、不停旧版本。
 - **含 `.ko` 的包必须写非空列表且用 schema 3**：schema 1/2 的包老 daemon 会忽略列表；含内核模块却不声明设备的包直接拒装。
 - **`svc compat` 导出事实**：文本或 `--json`；`svc compat init --device <id>` 给没有 marker 的存量设备补写（原子写、root、0644）。`GET /api/v1/compat` 返回同一结构，供页面/商城做本地筛选。
-- **打包侧**：`plugin bundle --compat <device[,device...]>` 写入列表并提升 schema；含 `.ko` 却没给 `--compat` 直接报错。
+- **打包侧**：`plugin bundle --compat <device[,device...]>` 写入列表并提升 schema；含 `.ko` 却没给 `--compat` 直接报错。默认包名在 `<name>-<version>-<platform>.spk` 之后追加列表**第一个** id（`<name>-<version>-<platform>-<device>.spk`），多值不展开；文件名只是人读提示，安装校验一律以 manifest 里的完整列表为准。
 - 匹配只做精确字符串比较：**没有通配符、前缀、范围或 any-of 交叉**。
 
 ## Considered Options
