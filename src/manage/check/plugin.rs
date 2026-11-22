@@ -66,7 +66,7 @@ pub fn ensure_hooks_allowed_manifest(
     if package::declares_hooks(manifest) && !hooks_allowed(opt_in_hooks) {
         return Err(Problem::Invalid.error(format!(
             "package {} declares hooks; this build requires --allow-hooks",
-            manifest.name
+            manifest.id()
         )));
     }
     Ok(())

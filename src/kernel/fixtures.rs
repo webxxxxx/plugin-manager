@@ -16,6 +16,7 @@ pub(crate) fn test_service() -> Service {
         version: "1.2.3".into(),
         protocol: 1,
         desc: "demo service".into(),
+        display_name: None,
         deps: vec!["base".into()],
         contract: contract_for(
             "demo",

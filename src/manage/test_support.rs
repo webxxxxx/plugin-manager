@@ -35,6 +35,14 @@ pub fn pem_from_public(key: &[u8; 32]) -> Vec<u8> {
     pem.into_bytes()
 }
 
+/// A fake native payload: `is_native_binary` only reads the magic bytes, so a
+/// fixture that exercises install/scan never needs a host interpreter.
+pub(crate) fn native_payload() -> Vec<u8> {
+    let mut data = vec![0x7f, b'E', b'L', b'F', 0x02, 0x01, 0x01, 0x00];
+    data.extend_from_slice(b"fixture");
+    data
+}
+
 /// The one signing key every unit test that verifies a package shares. It is a
 /// deterministic value, not process state: a test that needs it derives it.
 pub(crate) fn test_signing_key() -> ed25519_dalek::SigningKey {
@@ -57,8 +65,9 @@ pub(crate) fn install_test_trust(trust_dir: &Path) {
 pub(crate) fn test_signed_package(name: &str, platform: &str) -> Vec<u8> {
     use ed25519_dalek::Signer;
 
+    let exec = native_payload();
     let files: Vec<(&str, &[u8], u32)> = vec![
-        ("payload/bin/demo", b"hello", 0o755),
+        ("payload/bin/demo", exec.as_slice(), 0o755),
         ("config/config", b"{}", 0o644),
     ];
     let entries: Vec<serde_json::Value> = files
@@ -74,6 +83,7 @@ pub(crate) fn test_signed_package(name: &str, platform: &str) -> Vec<u8> {
         .collect();
     let manifest = serde_json::to_vec(&serde_json::json!({
         "schema": 1,
+        "id": name,
         "name": name,
         "version": "1.0.0",
         "desc": "test package",
@@ -119,7 +129,7 @@ pub(crate) type TestFiles = Vec<(&'static str, Vec<u8>, u32)>;
 
 pub(crate) fn manifest(platform: &str) -> (Vec<u8>, TestFiles) {
     let files = vec![
-        ("payload/bin/demo", b"hello".to_vec(), 0o755),
+        ("payload/bin/demo", native_payload(), 0o755),
         ("config/config", b"{}".to_vec(), 0o644),
     ];
     let entries: Vec<serde_json::Value> = files
@@ -130,6 +140,7 @@ pub(crate) fn manifest(platform: &str) -> (Vec<u8>, TestFiles) {
         .collect();
     let value = json!({
         "schema": 1,
+        "id": "demo",
         "name": "demo",
         "version": "1.0.0",
         "desc": "demo",
@@ -199,7 +210,6 @@ pub(crate) fn header(path: &str, size: usize, mode: u32) -> [u8; 512] {
 }
 
 pub(crate) fn compat_manifest_value(
-    schema: u32,
     compat: Option<serde_json::Value>,
     extra_file: Option<&str>,
 ) -> serde_json::Value {
@@ -211,7 +221,8 @@ pub(crate) fn compat_manifest_value(
         files.push(json!({"path": path, "size": 1, "sha256": hex_sha256(b"k"), "mode": 0o644}));
     }
     let mut value = json!({
-        "schema": schema,
+        "schema": 1,
+        "id": "demo",
         "name": "demo",
         "version": "1.0.0",
         "desc": "demo",
@@ -266,7 +277,7 @@ pub(crate) fn hook_package_with_body(
     hook_mode: u32,
     hook: Vec<u8>,
 ) -> Vec<u8> {
-    let exec = b"hello".to_vec();
+    let exec = native_payload();
     let files = [
         ("payload/bin/demo", exec, 0o755),
         (hook_path, hook, hook_mode),
@@ -283,7 +294,7 @@ pub(crate) fn hook_package_with_body(
         })
         .collect();
     let value = json!({
-        "schema": 1, "name": "demo", "version": "1.0.0", "desc": "demo",
+        "schema": 1, "id": "demo", "name": "demo", "version": "1.0.0", "desc": "demo",
         "platform": crate::platform::target(), "protocol": 1,
         "exec": {"path": "payload/bin/demo"},
         "hooks": {"postInstall": hook_path},
@@ -293,7 +304,7 @@ pub(crate) fn hook_package_with_body(
     package_from(key, "test", &manifest, &files)
 }
 
-pub(crate) fn script_manifest(schema: u32) -> (Vec<u8>, TestFiles) {
+pub(crate) fn script_manifest() -> (Vec<u8>, TestFiles) {
     let files: TestFiles = vec![("payload/bin/clock.sh", b"#!/bin/sh\n".to_vec(), 0o755)];
     let entries: Vec<Value> = files
         .iter()
@@ -302,7 +313,8 @@ pub(crate) fn script_manifest(schema: u32) -> (Vec<u8>, TestFiles) {
         })
         .collect();
     let value = json!({
-        "schema": schema,
+        "schema": 1,
+        "id": "clock",
         "name": "clock",
         "version": "1.0.0",
         "desc": "clock service",
@@ -389,14 +401,18 @@ pub(crate) fn make_plugin(id: &str, config: &str, check: bool) {
     std::fs::write(directory.join("current"), "1.0.0").expect("current");
     std::fs::write(version_dir.join("config/config"), config).expect("template");
     write_config(&directory.join("config"), config.as_bytes()).expect("active");
+    let exec = version_dir.join("payload/bin/demo");
+    std::fs::create_dir_all(exec.parent().expect("exec dir")).expect("payload");
+    std::fs::write(&exec, native_payload()).expect("exec");
     let mut manifest = serde_json::json!({
         "schema": 1,
+        "id": id,
         "name": id,
         "version": "1.0.0",
         "desc": "config test",
         "platform": crate::platform::target(),
         "protocol": 1,
-        "exec": {"path": "config/config"},
+        "exec": {"path": "payload/bin/demo"},
         "files": []
     });
     if check {

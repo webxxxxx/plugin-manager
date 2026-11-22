@@ -509,7 +509,7 @@ class Smoke:
             with tarfile.open(staged) as archive:
                 manifest = json.load(archive.extractfile("manifest.json"))
             platform = str(manifest["platform"])
-            final = os.path.join(self.out, "%s-%s-%s.spk" % (manifest["name"], manifest["version"], platform))
+            final = os.path.join(self.out, "%s-%s-%s.spk" % (manifest["id"], manifest["version"], platform))
             os.replace(staged, final)
             self.artifacts[name] = final
             print("  built %s" % final)

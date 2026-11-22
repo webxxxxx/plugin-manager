@@ -121,6 +121,7 @@ pub(super) fn verify_bytes_mode(
         .map(|file| (file.path.as_str(), file.data.as_slice()))
         .collect();
     validate_script_payload(&manifest, &borrowed)?;
+    check_icon_magic(&manifest, &borrowed)?;
 
     Ok((
         Package {
@@ -193,13 +194,15 @@ pub fn is_native_binary(bytes: &[u8]) -> bool {
     MAGICS.iter().any(|magic| bytes.starts_with(magic))
 }
 
-/// Schema-2 packages must name a host interpreter for every script payload and
-/// must not carry a dangling interpreter declaration for a native-only payload.
+/// A declared interpreter needs a script to run: a native-only payload is
+/// spawned directly, so the declaration would be silently ignored. The reverse
+/// is not an error — a shebang script or a `.cmd` payload starts without an
+/// interpreter block (ADR-0002, revised when the schema tiers collapsed).
 pub fn validate_script_payload(
     manifest: &Manifest,
     files: &[(&str, &[u8])],
 ) -> Result<(), ProblemError> {
-    if manifest.schema < 2 {
+    if manifest.interpreter.is_none() {
         return Ok(());
     }
     let mut executables = vec![manifest.exec.path.as_str()];
@@ -221,16 +224,44 @@ pub fn validate_script_payload(
             scripts.push(path.to_string());
         }
     }
-    if !scripts.is_empty() && manifest.interpreter.is_none() {
-        return Err(Problem::Invalid.error(format!(
-            "script payload {} requires an interpreter declaration",
-            scripts.join(", ")
-        )));
-    }
-    if scripts.is_empty() && manifest.interpreter.is_some() {
+    if scripts.is_empty() {
         return Err(
             Problem::Invalid.error("interpreter is declared but the payload has no script to run")
         );
+    }
+    Ok(())
+}
+
+/// The icon formats a package may ship, checked by magic bytes: the daemon has
+/// no image library and no reason to decode a bitmap, only to refuse a file
+/// whose bytes are not what the manifest calls them.
+fn icon_magic(format: &str) -> Option<[u8; 4]> {
+    match format {
+        "png" => Some([0x89, b'P', b'N', b'G']),
+        "ico" => Some([0x00, 0x00, 0x01, 0x00]),
+        "icns" => Some(*b"icns"),
+        _ => None,
+    }
+}
+
+/// `icons` paths are checked against `files[]` by the manifest rules; the magic
+/// bytes can only be checked where the payload exists.
+pub fn check_icon_magic(manifest: &Manifest, files: &[(&str, &[u8])]) -> Result<(), ProblemError> {
+    let Some(icons) = &manifest.icons else {
+        return Ok(());
+    };
+    for (format, path) in icons.entries() {
+        let Some((_, data)) = files.iter().find(|(candidate, _)| *candidate == path) else {
+            // A missing payload file is reported by the declaration checks.
+            continue;
+        };
+        let magic = icon_magic(format).expect("icons.entries only yields png/ico/icns");
+        if !data.starts_with(&magic) {
+            return Err(Problem::Invalid.error(format!(
+                "icons.{} is not a {} file: magic bytes mismatch in {}",
+                format, format, path
+            )));
+        }
     }
     Ok(())
 }

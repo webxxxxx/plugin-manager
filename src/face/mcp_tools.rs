@@ -51,11 +51,18 @@ where
                     cap.desc.clone()
                 };
                 let input_schema = cap.input_schema.clone().unwrap_or(Value::Null);
-                out.push(json!({
+                let mut tool = json!({
                     "name": format!("{}.{}", svc.id, name),
                     "description": description,
                     "inputSchema": input_schema
-                }));
+                });
+                // Undeclared stays absent: a `null` outputSchema would claim the
+                // capability has no output, which is a different statement
+                // (#260).
+                if let Some(output_schema) = &cap.output_schema {
+                    tool["outputSchema"] = output_schema.clone();
+                }
+                out.push(tool);
             }
         }
     }
@@ -155,6 +162,7 @@ mod tests {
             input_schema: Some(
                 json!({"type": "object", "properties": {"input": {"type": "string"}}}),
             ),
+            output_schema: None,
             effect: Effect::Write,
             idempotent: false,
         }
@@ -175,6 +183,7 @@ mod tests {
             version: "1.0.0".into(),
             protocol: 1,
             desc: "test".into(),
+            display_name: None,
             deps: Vec::new(),
             contract,
             impl_ref: None,
@@ -266,6 +275,45 @@ mod tests {
         let names = names(&tools(&registry, |_| false));
 
         assert_eq!(names, vec!["plug.start".to_string()]);
+    }
+
+    #[test]
+    fn output_schema_is_projected_only_when_the_capability_declares_one() {
+        let mut registry = Registry::new();
+        let mut declared = capability("declared");
+        declared.output_schema =
+            Some(json!({"type": "object", "properties": {"ok": {"type": "boolean"}}}));
+        let contract = crate::kernel::registry::contract_for(
+            "plug",
+            "1.0.0",
+            vec![declared, capability("bare")],
+            crate::kernel::registry::Carrier::Slot,
+            &crate::platform::limits::test_default(),
+        );
+        let mut plugin = service("plug", Kind::Plugin, &[]);
+        plugin.contract = contract;
+        registry.insert(plugin).expect("plugin");
+
+        let projected = tools(&registry, |_| true);
+        let tool = |name: &str| {
+            projected
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"))
+                .clone()
+        };
+        assert_eq!(
+            tool("plug.declared")["outputSchema"],
+            json!({"type": "object", "properties": {"ok": {"type": "boolean"}}})
+        );
+        // Undeclared is absent, not `null`: `null` would claim "no output".
+        assert!(tool("plug.bare").get("outputSchema").is_none());
+
+        // The builtin `svc` has no output contract either.
+        let registry = Registry::with_builtin(&crate::platform::limits::test_default());
+        for tool in tools(&registry, |_| true) {
+            assert!(tool.get("outputSchema").is_none(), "{tool}");
+        }
     }
 
     #[test]

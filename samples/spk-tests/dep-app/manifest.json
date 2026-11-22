@@ -1,7 +1,8 @@
 {
-  "schema": 2,
+  "schema": 1,
+  "id": "dep-app",
   "protocol": 1,
-  "name": "dep-app",
+  "name": "依赖演示·应用",
   "version": "1.0.0",
   "platform": "x86_64-unknown-linux-gnu",
   "desc": "Dependency smoke test: starts only after dep-base is installed and running",

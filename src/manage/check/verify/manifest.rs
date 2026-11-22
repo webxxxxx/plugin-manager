@@ -3,10 +3,16 @@
 
 use super::*;
 
+/// Icon ceilings: one file per format, and the whole icon set stays small
+/// enough that it never competes with the payload budget.
+pub(crate) const MAX_ICON_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_ICONS_TOTAL_BYTES: u64 = 2 * 1024 * 1024;
+
 pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, ProblemError> {
     let m: Manifest =
         serde_json::from_slice(bytes).map_err(|error| Problem::Invalid.error(error.to_string()))?;
     check_schema(&m)?;
+    check_identity(&m)?;
     if m.protocol == 0 || m.protocol > MAX_PROTOCOL {
         return Err(Problem::Invalid.error(format!("unsupported protocol {}", m.protocol)));
     }
@@ -18,9 +24,6 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, ProblemError> {
             return Err(Problem::Invalid.error("protocol 3 cannot declare JSON-RPC capabilities"));
         }
     }
-    if !valid_name(&m.name) {
-        return Err(Problem::Invalid.error("invalid service id"));
-    }
     if !m.platform.contains('-') {
         return Err(Problem::UnsupportedPlatform.error("platform must be a target triple"));
     }
@@ -28,7 +31,36 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, ProblemError> {
     Ok(m)
 }
 
-pub fn valid_name(s: &str) -> bool {
+/// `id` is the plugin identity and `name` is only a display name. A package
+/// without `id` predates schema 1 or was hand-assembled; either way the fix is
+/// the bundler, so the error says so instead of guessing an id.
+fn check_identity(manifest: &Manifest) -> Result<(), ProblemError> {
+    let Some(id) = manifest.id.as_deref() else {
+        return Err(Problem::Invalid
+            .error("schema 1 requires an id; repack with `plugin bundle --id <id>`"));
+    };
+    if !valid_id(id) {
+        return Err(Problem::Invalid.error(format!(
+            "invalid plugin id: {} (expected [a-z0-9][a-z0-9_-]{{0,63}})",
+            id
+        )));
+    }
+    if id == crate::kernel::registry::RESERVED_ID {
+        return Err(Problem::Invalid
+            .error("the built-in svc id is reserved and cannot be used as a plugin id"));
+    }
+    if !valid_display_name(&manifest.name) {
+        return Err(Problem::Invalid.error(
+            "name is the display name: it must be non-empty, at most 128 characters and free of \
+             control characters",
+        ));
+    }
+    Ok(())
+}
+
+/// The plugin id charset. The identity ends up in directory names, file names,
+/// URL path segments and MCP tool names, so it stays ASCII and lower case.
+pub fn valid_id(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && s.chars()
@@ -37,6 +69,12 @@ pub fn valid_name(s: &str) -> bool {
             .unwrap_or(false)
         && s.chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// The display name may be any UTF-8 (Chinese included); only emptiness, the
+/// length ceiling and control characters are rejected.
+pub fn valid_display_name(s: &str) -> bool {
+    !s.is_empty() && s.chars().count() <= 128 && !s.chars().any(char::is_control)
 }
 
 pub fn valid_version(value: &str) -> bool {
@@ -66,6 +104,7 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), ProblemError> {
         return Err(Problem::Invalid.error("package has no payload files"));
     }
     check_manifest_paths(manifest)?;
+    check_icons(manifest)?;
     check_hooks(manifest)?;
     check_lifecycle(manifest)?;
     check_interpreter(manifest)?;
@@ -104,22 +143,49 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), ProblemError> {
 }
 
 fn check_schema(manifest: &Manifest) -> Result<(), ProblemError> {
-    if manifest.schema == 0 || manifest.schema > MAX_SCHEMA {
+    if manifest.schema != MAX_SCHEMA {
         return Err(Problem::Invalid.error(format!(
-            "unsupported schema {} (max {})",
+            "unsupported manifest schema {}: this daemon reads schema {} only (packages written \
+             for the old 1/2/3 line also lack the required `id`); repack with `plugin bundle`",
             manifest.schema, MAX_SCHEMA
         )));
     }
-    if manifest.schema == 1 && (manifest.interpreter.is_some() || manifest.lifecycle.is_some()) {
-        return Err(Problem::Invalid.error(
-            "lifecycle and interpreter require schema 2; old daemons would silently ignore them",
-        ));
+    Ok(())
+}
+
+/// Package icons: `icons` names one payload file per format. The size ceilings
+/// keep a package from smuggling a 100 MiB bitmap through the icon field; the
+/// bytes themselves are magic-checked where the payload is available.
+fn check_icons(manifest: &Manifest) -> Result<(), ProblemError> {
+    let Some(icons) = &manifest.icons else {
+        return Ok(());
+    };
+    if icons.entries().next().is_none() {
+        return Err(Problem::Invalid.error("icons must declare at least one of png, ico or icns"));
     }
-    if manifest.schema < 3 && manifest.compat.is_some() {
-        return Err(Problem::Invalid.error(
-            "compat requires schema 3; old daemons would ignore the device list and install a \
-             package that does not run here",
-        ));
+    let mut total = 0u64;
+    for (format, path) in icons.entries() {
+        check_path(path)?;
+        let entry = manifest
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .ok_or_else(|| {
+                Problem::Invalid.error(format!("icons.{} is not in files[]: {}", format, path))
+            })?;
+        if entry.size > MAX_ICON_BYTES {
+            return Err(Problem::TooLarge.error(format!(
+                "icons.{} is {} bytes; the per-icon ceiling is {}",
+                format, entry.size, MAX_ICON_BYTES
+            )));
+        }
+        total += entry.size;
+    }
+    if total > MAX_ICONS_TOTAL_BYTES {
+        return Err(Problem::TooLarge.error(format!(
+            "icons total {} bytes; the ceiling is {}",
+            total, MAX_ICONS_TOTAL_BYTES
+        )));
     }
     Ok(())
 }
@@ -159,11 +225,6 @@ fn check_compat(manifest: &Manifest) -> Result<(), ProblemError> {
                 ));
             }
         }
-    }
-    if kernel_module && manifest.schema < 3 {
-        return Err(
-            Problem::Invalid.error("kernel modules require schema 3 so old daemons reject them")
-        );
     }
     Ok(())
 }

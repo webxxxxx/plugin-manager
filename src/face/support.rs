@@ -128,7 +128,7 @@ pub fn require_plugin_result(
     id: &str,
     budget: &CallBudget,
 ) -> Result<(), (u16, &'static str, String)> {
-    if !package::valid_name(id) {
+    if !package::valid_id(id) {
         return Err((404, "not_found", format!("unknown plugin: {}", id)));
     }
     let status = rpc_result(config, "svc.status", json!({ "id": id }), budget)?;

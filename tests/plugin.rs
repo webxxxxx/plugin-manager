@@ -366,6 +366,7 @@ fn package_config(key: &SigningKey, version: &str, config: &[u8]) -> Vec<u8> {
     ];
     let manifest = json!({
         "schema": 1,
+        "id": "demo",
         "name": "demo",
         "version": version,
         "desc": "test plugin",
@@ -446,7 +447,8 @@ fn clock_manifest(exec: &str, data: &[u8]) -> Value {
         json!({"name": "sh"})
     };
     json!({
-        "schema": 2,
+        "schema": 1,
+        "id": "clock",
         "name": "clock",
         "version": "1.0.0",
         "desc": "clock service",
@@ -1163,7 +1165,8 @@ fn verify_reports_capabilities_and_compat() {
         json!({"name": "sh"})
     };
     let manifest = json!({
-        "schema": 3,
+        "schema": 1,
+        "id": "caps",
         "name": "caps",
         "version": "1.0.0",
         "desc": "capability package",
@@ -1189,9 +1192,12 @@ fn verify_reports_capabilities_and_compat() {
     let output = sandbox.run_plugin(&["verify", package.to_str().expect("package"), "--json"]);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     let value: Value = serde_json::from_slice(&output.stdout).expect("verify json");
+    assert_eq!(value["id"], "caps");
+    assert_eq!(value["name"], "caps");
+    assert_eq!(value["displayName"], "caps");
     assert_eq!(value["capabilities"], json!(["status", "up"]));
     assert_eq!(value["compat"], json!(["sr6110"]));
-    assert_eq!(value["schema"], 3u64);
+    assert_eq!(value["schema"], 1u64);
     assert_eq!(value["signature"]["trusted"], true);
     assert_eq!(value["host"]["matchesHost"], true);
     assert_eq!(value["host"]["device"], "sr6110");
@@ -1303,6 +1309,7 @@ fn verify_reports_a_foreign_platform_as_a_host_fact() {
     let files = [(path.as_str(), data.as_slice(), 0o755u32)];
     let manifest = json!({
         "schema": 1,
+        "id": "foreign",
         "name": "foreign",
         "version": "1.0.0",
         "desc": "other platform",
@@ -1477,6 +1484,7 @@ fn package_with_hooks(
         .collect();
     let mut manifest = json!({
         "schema": 1,
+        "id": "demo",
         "name": "demo",
         "version": version,
         "desc": "test plugin",
@@ -1795,4 +1803,66 @@ fn a_failing_pre_remove_hook_does_not_block_uninstall() {
         .join("demo")
         .join("current")
         .exists());
+}
+
+#[test]
+fn the_manifest_id_is_the_identity_and_the_name_is_the_display_name() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[29u8; 32]);
+    sandbox.write_key(&key);
+    let (name, data) = script();
+    let path = format!("payload/bin/{}", name);
+    let manifest = json!({
+        "schema": 1,
+        "id": "identity",
+        "name": "身份插件",
+        "version": "1.0.0",
+        "desc": "identity plugin",
+        "platform": target(),
+        "protocol": 1,
+        "exec": {"path": path, "args": [], "ready": "notify"},
+        "capabilities": [
+            {"name": "echo", "desc": "echo", "inputSchema": {"type": "object"},
+             "outputSchema": {"type": "object", "properties": {"ok": {"type": "boolean"}}}}
+        ],
+        "files": [{"path": path, "size": data.len(), "sha256": hex_sha256(&data), "mode": 0o755}]
+    });
+    let bytes = package_with_manifest(&key, &manifest, &[(path.as_str(), &data, 0o755)]);
+    let package = sandbox.write_package("identity-1.0.0.spk", &bytes);
+
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+
+    let installed = sandbox.run_plugin(&["install", package.to_str().expect("package")]);
+    assert_eq!(installed.status.code(), Some(0), "{}", stderr(&installed));
+
+    // The id is the identity: the tree, the log file and every command key on it.
+    assert!(sandbox
+        .data
+        .join("plugins")
+        .join("identity")
+        .join("current")
+        .is_file());
+
+    let status = sandbox.run_plugin(&["status", "identity", "--json"]);
+    assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
+    let value = json(&status);
+    assert_eq!(value["summary"]["id"], "identity");
+    assert_eq!(value["summary"]["displayName"], "身份插件");
+
+    // Commands do not resolve the display name.
+    let by_name = sandbox.run_plugin(&["status", "身份插件", "--json"]);
+    assert_ne!(by_name.status.code(), Some(0), "{}", stderr(&by_name));
+
+    let started = sandbox.run_plugin(&["start", "identity"]);
+    assert_eq!(started.status.code(), Some(0), "{}", stderr(&started));
+    assert!(
+        sandbox.logs.join("identity.log").is_file(),
+        "the plugin log must be named after the id"
+    );
+
+    let text =
+        String::from_utf8_lossy(&sandbox.run_plugin(&["status", "identity"]).stdout).into_owned();
+    assert!(text.contains("name:"), "{text}");
+    assert!(text.contains("身份插件"), "{text}");
 }

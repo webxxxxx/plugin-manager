@@ -65,6 +65,9 @@ pub fn text(status: &Status) -> String {
     let mut out = String::new();
     out.push_str("summary:\n");
     field(&mut out, "id", &status.summary.id);
+    if let Some(name) = &status.summary.display_name {
+        field(&mut out, "name", name);
+    }
     field(&mut out, "kind", status.summary.kind.as_str());
     field(&mut out, "state", status.summary.state.as_str());
     field(&mut out, "enabled", status.summary.enabled);

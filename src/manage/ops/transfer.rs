@@ -120,7 +120,7 @@ fn import_backup(
     let current = plugin::current_version(paths, &backup.id);
     let plan = plugin::BackupRules {
         backup: &backup,
-        package_id: &package.manifest.name,
+        package_id: package.manifest.id(),
         package_version: &package.manifest.version,
         config: config.map(|entry| entry.data.as_slice()),
         current_version: current.as_deref(),
@@ -157,7 +157,7 @@ pub(crate) fn apply_config(
     if require_root {
         plugin::root_required().map_err(Error::Failed)?;
     }
-    if !package::valid_name(id) || plugin::current_version(paths, id).is_none() {
+    if !package::valid_id(id) || plugin::current_version(paths, id).is_none() {
         return Err(Error::Failed(
             Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)),
         ));

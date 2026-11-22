@@ -261,6 +261,7 @@ pub(super) fn parse(args: &[String]) -> Result<Command, ()> {
             let mut key = None;
             let mut key_id = None;
             let mut id = None;
+            let mut name = None;
             let mut version = None;
             let mut exec = None;
             let mut desc = None;
@@ -291,6 +292,10 @@ pub(super) fn parse(args: &[String]) -> Result<Command, ()> {
                     "--id" => {
                         index += 1;
                         id = Some(args.get(index).ok_or(())?.clone());
+                    }
+                    "--name" => {
+                        index += 1;
+                        name = Some(args.get(index).ok_or(())?.clone());
                     }
                     "--version" => {
                         index += 1;
@@ -351,6 +356,13 @@ pub(super) fn parse(args: &[String]) -> Result<Command, ()> {
                     _ if arg.starts_with("--id=") => {
                         id = Some(
                             arg.strip_prefix("--id=")
+                                .expect("matched prefix")
+                                .to_string(),
+                        );
+                    }
+                    _ if arg.starts_with("--name=") => {
+                        name = Some(
+                            arg.strip_prefix("--name=")
                                 .expect("matched prefix")
                                 .to_string(),
                         );
@@ -426,6 +438,7 @@ pub(super) fn parse(args: &[String]) -> Result<Command, ()> {
                     key,
                     key_id,
                     id,
+                    name,
                     version,
                     exec,
                     desc,

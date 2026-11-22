@@ -79,11 +79,11 @@ fn unknown_ui() -> Vec<u8> {
 
 /// A valid plugin id with a browser-loadable web UI.
 ///
-/// This is the only production place that combines `valid_name` with
+/// This is the only production place that combines `valid_id` with
 /// `web_assets`; the slashless redirect, the static faces and the realtime
 /// admission all ask this question here.
 pub(crate) fn web_assets_for(paths: &Paths, id: &str) -> Option<plugin::WebAssets> {
-    if !package::valid_name(id) {
+    if !package::valid_id(id) {
         return None;
     }
     plugin::web_assets(paths, id)
@@ -98,7 +98,7 @@ pub(crate) fn static_assets(
     ui: &UiPath<'_>,
 ) -> Result<plugin::WebAssets, Vec<u8>> {
     let Some(assets) = web_assets_for(paths, ui.id) else {
-        if package::valid_name(ui.id) {
+        if package::valid_id(ui.id) {
             return Err(http::json_error(
                 404,
                 "not_found",
@@ -123,7 +123,7 @@ pub(crate) fn valid_ui(
         web_assets_for(paths, ui.id).ok_or_else(unknown_ui)?;
         return Ok(());
     }
-    if !package::valid_name(ui.id) {
+    if !package::valid_id(ui.id) {
         return Err(unknown_ui());
     }
     Ok(())
@@ -815,6 +815,7 @@ mod tests {
         fs::write(plugin.join("current"), "1.0.0").expect("current");
         let manifest = serde_json::json!({
             "schema": 1,
+            "id": id,
             "name": id,
             "version": "1.0.0",
             "desc": "admission test",

@@ -198,7 +198,10 @@ fn verify(config: &Config, path: &Path, json: bool, pubkey: Option<&Path>) -> i3
         };
     }
     let manifest = &inspection.package.manifest;
+    // Human output leads with the display name and keeps the id visible: the
+    // id is what every later command takes (#260).
     println!("{} {}", manifest.name, manifest.version);
+    println!("id: {}", manifest.id());
     println!(
         "platform: {} (host match: {})",
         manifest.platform,

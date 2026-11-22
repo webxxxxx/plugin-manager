@@ -43,7 +43,7 @@ pub fn uninstall(
     purge: bool,
     poll: &mut dyn FnMut(),
 ) -> Result<(), ProblemError> {
-    if !package::valid_name(id) || id == RESERVED_ID {
+    if !package::valid_id(id) || id == RESERVED_ID {
         return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
     }
     let directory = plugin_dir(paths, id);

@@ -177,6 +177,7 @@ pub(crate) fn plugin_parts(
 
     let mut manifest = json!({
         "schema": 1,
+        "id": id,
         "name": id,
         "version": version,
         "desc": "http plugin",
@@ -332,6 +333,7 @@ pub(crate) fn web_plugin_bundle(key: &SigningKey, id: &str, ui: bool) -> Vec<u8>
     files.sort_by(|left, right| left.0.cmp(&right.0));
     let mut manifest = json!({
         "schema": 1,
+        "id": id,
         "name": id,
         "version": "1.0.0",
         "desc": "web ui plugin",
@@ -430,6 +432,7 @@ pub(crate) fn web_event_plugin_bundle(key: &SigningKey, id: &str) -> Vec<u8> {
     files.sort_by(|left, right| left.0.cmp(&right.0));
     let manifest = json!({
         "schema": 1,
+        "id": id,
         "name": id,
         "version": "1.0.0",
         "desc": "event ui plugin",
@@ -499,6 +502,7 @@ pub(crate) fn slow_hook_plugin_bundle(key: &SigningKey, marker: &Path) -> Vec<u8
     ];
     let manifest = json!({
         "schema": 1,
+        "id": "slowhook",
         "name": "slowhook",
         "version": "1.0.0",
         "desc": "slow post-install hook",
@@ -760,6 +764,7 @@ pub(crate) fn raw_plugin_bundle(key: &SigningKey, id: &str) -> Vec<u8> {
     files.sort_by(|left, right| left.0.cmp(&right.0));
     let manifest = json!({
         "schema": 1,
+        "id": id,
         "name": id,
         "version": "1.0.0",
         "desc": "raw echo plugin",

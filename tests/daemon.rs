@@ -1025,7 +1025,8 @@ done
             json!({"name": "sh"})
         };
         let manifest = json!({
-            "schema": 3,
+            "schema": 1,
+            "id": id,
             "name": id,
             "version": "1.0.0",
             "desc": "device restricted plugin",
@@ -1110,6 +1111,7 @@ esac
         let files = vec![(exec_path.clone(), agent_bytes, 0o755)];
         let manifest = json!({
             "schema": 1,
+            "id": id,
             "name": id,
             "version": "1.0.0",
             "desc": "lifecycle plugin",

@@ -68,11 +68,22 @@ const manifest = JSON.parse(manifestBytes.toString('utf8'));
 const errors = [];
 function must(cond, msg) { if (!cond) errors.push(msg); }
 
-must([1, 2, 3].includes(manifest.schema), 'schema must be 1, 2 or 3');
-must(typeof manifest.name === 'string' && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(manifest.name), 'bad name');
-must(typeof manifest.version === 'string' && /^[0-9]+\.[0-9]+\.[0-9]+/.test(manifest.version), 'bad version');
+must(manifest.schema === 1, 'schema must be 1');
+// `id` is the identity: directory name, log file, /plugin-ui/ segment and the
+// `<id>.<cap>` tool prefix. `name` is only a display name and may be Chinese.
+must(typeof manifest.id === 'string' && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(manifest.id), 'bad id ([a-z0-9][a-z0-9_-]{0,63})');
+must(manifest.id !== 'svc', 'the built-in svc id is reserved');
+must(
+  typeof manifest.name === 'string' && manifest.name.length > 0 && Array.from(manifest.name).length <= 128 && !/[\u0000-\u001f\u007f]/.test(manifest.name),
+  'bad display name (non-empty, <=128 characters, no control characters)'
+);
+must(typeof manifest.version === 'string' && /^[0-9]+\.[0-9]+\.[0-9]+$/.test(manifest.version), 'bad version');
 must(typeof manifest.platform === 'string' && /^[a-z0-9_]+(-[a-z0-9_]+){2,3}$/.test(manifest.platform), 'bad platform (expected <arch>-<vendor>-<os>-<abi>)');
-must(manifest.protocol === 1, 'protocol must be 1');
+must([1, 2, 3].includes(manifest.protocol), 'protocol must be 1, 2 or 3');
+if (manifest.protocol === 3) {
+  must(manifest.exec && manifest.exec.ready === 'exec', 'protocol 3 requires exec.ready=exec');
+  must(!(manifest.capabilities || []).length, 'protocol 3 cannot declare JSON-RPC capabilities');
+}
 must(Array.isArray(manifest.files) && manifest.files.length > 0, 'files[] required');
 
 const byName = new Map();
@@ -90,30 +101,24 @@ for (const f of manifest.files) {
 }
 for (const n of byName.keys()) must(seen.has(n), 'extra file not in manifest: ' + n);
 
-if (manifest.schema >= 2) {
-  if (manifest.interpreter !== undefined) {
-    must(
-      manifest.interpreter && typeof manifest.interpreter.name === 'string' && /^[A-Za-z0-9._-]+$/.test(manifest.interpreter.name),
-      'bad interpreter name'
-    );
-    must(
-      manifest.interpreter.version === undefined || typeof manifest.interpreter.version === 'string',
-      'bad interpreter version'
-    );
-  }
-  const lifecycle = manifest.lifecycle || {};
-  for (const action of ['start', 'stop', 'status']) {
-    const hook = lifecycle[action];
-    if (!hook) continue;
-    must(typeof hook.path === 'string' && seen.has(hook.path), 'lifecycle.' + action + ' not in files[]');
-  }
-} else {
-  must(!manifest.interpreter, 'interpreter requires schema 2');
-  must(!manifest.lifecycle, 'lifecycle requires schema 2');
+if (manifest.interpreter !== undefined) {
+  must(
+    manifest.interpreter && typeof manifest.interpreter.name === 'string' && /^[A-Za-z0-9._-]+$/.test(manifest.interpreter.name),
+    'bad interpreter name'
+  );
+  must(
+    manifest.interpreter.version === undefined || typeof manifest.interpreter.version === 'string',
+    'bad interpreter version'
+  );
+}
+const lifecycle = manifest.lifecycle || {};
+for (const action of ['start', 'stop', 'status']) {
+  const hook = lifecycle[action];
+  if (!hook) continue;
+  must(typeof hook.path === 'string' && seen.has(hook.path), 'lifecycle.' + action + ' not in files[]');
 }
 const kernelModule = [...seen].some(function (p) { return /\.ko$/i.test(p); });
 if (manifest.compat !== undefined) {
-  must(manifest.schema === 3, 'compat requires schema 3');
   const devices = manifest.compat && manifest.compat.devices;
   must(Array.isArray(devices) && devices.length > 0, 'compat.devices must be a non-empty array');
   if (Array.isArray(devices)) {
@@ -126,21 +131,38 @@ if (manifest.compat !== undefined) {
   }
 }
 if (kernelModule) {
-  must(manifest.schema === 3, 'kernel modules require schema 3');
   must(manifest.compat && Array.isArray(manifest.compat.devices) && manifest.compat.devices.length > 0,
     'kernel modules require compat.devices');
 }
-if (manifest.exec && manifest.exec.ready === 'exec' && (manifest.capabilities || []).length) {
-  errors.push('exec.ready=exec cannot declare capabilities');
+// Package icons: one payload file per format, magic-checked, <=1 MiB each and
+// <=2 MiB in total.
+const iconFormats = { png: Buffer.from([0x89, 0x50, 0x4e, 0x47]), ico: Buffer.from([0, 0, 1, 0]), icns: Buffer.from('icns') };
+if (manifest.icons !== undefined) {
+  const keys = Object.keys(manifest.icons);
+  must(keys.length > 0, 'icons must declare at least one of png, ico or icns');
+  let total = 0;
+  for (const key of keys) {
+    const magic = iconFormats[key];
+    must(!!magic, 'icons has an unknown format: ' + key);
+    const path = manifest.icons[key];
+    must(typeof path === 'string' && seen.has(path), 'icons.' + key + ' is not in files[]: ' + path);
+    const entry = byName.get(path);
+    if (!entry || !magic) continue;
+    must(entry.size <= 1024 * 1024, 'icons.' + key + ' is larger than 1 MiB');
+    total += entry.size;
+    must(entry.data.subarray(0, magic.length).equals(magic), 'icons.' + key + ' is not a ' + key + ' file');
+  }
+  must(total <= 2 * 1024 * 1024, 'icons total larger than 2 MiB');
 }
-
 const capNames = new Set();
 for (const c of manifest.capabilities || []) {
-  must(typeof c.name === 'string' && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(c.name), 'bad capability name');
+  must(typeof c.name === 'string' && c.name.length > 0, 'bad capability name');
   must(!String(c.name).startsWith('svc.'), 'capability may not use the svc. prefix: ' + c.name);
+  must(c.name !== 'start', 'capability name "start" is reserved for the lifecycle tool');
   must(!capNames.has(c.name), 'duplicate capability: ' + c.name);
   capNames.add(c.name);
   must(c.inputSchema && typeof c.inputSchema === 'object', 'missing inputSchema: ' + c.name);
+  must(c.outputSchema === undefined || (c.outputSchema && typeof c.outputSchema === 'object'), 'bad outputSchema: ' + c.name);
 }
 must(manifest.exec && seen.has(manifest.exec.path), 'exec.path not in files[]');
 if (manifest.ui && manifest.ui.type === 'web') {
@@ -179,7 +201,7 @@ if (extractDir) {
 
 console.log('spk: ' + resolve(spk));
 console.log('entries: ' + entries.length + ' (manifest + signature + ' + (entries.length - 2) + ' files)');
-console.log('name: ' + manifest.name);
+console.log('id: ' + manifest.id + '  name: ' + manifest.name);
 console.log('version: ' + manifest.version + '  platform: ' + manifest.platform + '  arch: ' + String(manifest.platform).split('-')[0] + '  protocol: ' + manifest.protocol);
 console.log('capabilities: ' + (manifest.capabilities || []).map(c => c.name).join(', '));
 console.log('signature: OK (ed25519, keyId=' + sig.keyId + ')');

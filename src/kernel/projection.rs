@@ -53,6 +53,14 @@ pub struct Summary {
     pub pid: Option<u32>,
     pub since: Option<u64>,
     pub version: String,
+    /// Plugin display name (`name`); absent for core services. Display only —
+    /// every lookup and path keys off `id`.
+    #[serde(
+        rename = "displayName",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +94,7 @@ impl Status {
                 pid: service.pid,
                 since: service.since,
                 version: service.version.clone(),
+                display_name: service.display_name.clone(),
             },
             details: Details {
                 dependencies: service.deps.clone(),
@@ -197,6 +206,21 @@ mod tests {
         assert_eq!(object.len(), 2);
         assert!(object.contains_key("summary"));
         assert!(object.contains_key("details"));
+    }
+
+    #[test]
+    fn a_display_name_is_projected_only_for_a_plugin_that_has_one() {
+        let mut service = test_service();
+        let value = serde_json::to_value(Status::of(&service)).expect("serialize");
+        assert!(!value["summary"]
+            .as_object()
+            .expect("summary")
+            .contains_key("displayName"));
+
+        service.display_name = Some("示例插件".into());
+        let value = serde_json::to_value(Status::of(&service)).expect("serialize");
+        assert_eq!(value["summary"]["displayName"], "示例插件");
+        assert_eq!(value["summary"]["id"], "demo");
     }
 
     #[test]

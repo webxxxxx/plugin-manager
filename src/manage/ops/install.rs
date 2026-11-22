@@ -586,11 +586,11 @@ mod tests {
         let bytes = package(&key);
         let root = tempdir::TempDir::new();
         let staged = install_bytes(&bytes, root.path()).expect("stream install");
-        assert_eq!(staged.manifest.name, "demo");
+        assert_eq!(staged.manifest.id(), "demo");
         assert!(staged.signature_verified);
         assert_eq!(
             std::fs::read(root.path().join("payload/bin/demo")).expect("read"),
-            b"hello"
+            native_payload()
         );
 
         let truncated = &bytes[..bytes.len() / 2];
@@ -613,11 +613,11 @@ mod tests {
             let staged = installer
                 .finish()
                 .unwrap_or_else(|error| panic!("chunk {}: {}", chunk, error));
-            assert_eq!(staged.manifest.name, "demo");
+            assert_eq!(staged.manifest.id(), "demo");
             assert!(staged.signature_verified);
             assert_eq!(
                 std::fs::read(root.path().join("payload/bin/demo")).expect("read"),
-                b"hello"
+                native_payload()
             );
         }
     }
@@ -644,7 +644,8 @@ mod tests {
     fn a_streamed_payload_is_hashed_against_the_manifest() {
         let key = setup();
         let mut bytes = package(&key);
-        let needle = b"hello";
+        let payload = native_payload();
+        let needle = payload.as_slice();
         let position = bytes
             .windows(needle.len())
             .position(|window| window == needle)

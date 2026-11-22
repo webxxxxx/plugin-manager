@@ -38,6 +38,7 @@ pub fn sample_contract(limits: Limits) -> Contract {
             name: CapabilityName::new("status"),
             desc: "conformance sample".into(),
             input_schema: None,
+            output_schema: None,
             effect: Effect::Read,
             idempotent: true,
         }],

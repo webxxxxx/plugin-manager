@@ -77,7 +77,7 @@ pub(super) fn directory_size(path: &Path) -> Result<u64, ProblemError> {
 pub(super) fn out_of_space(package: &Package, free: u64, old_size: Option<u64>) -> ProblemError {
     Problem::Internal.error(format!(
         "not enough space to install {} {}: need {} bytes, {} free{}",
-        package.manifest.name,
+        package.manifest.id(),
         package.manifest.version,
         package.unpacked_size(),
         free,

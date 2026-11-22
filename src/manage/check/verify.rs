@@ -28,7 +28,9 @@ mod signature;
 mod tar;
 
 pub(crate) use manifest::check_platform;
-pub use manifest::{declares_hooks, parse_manifest, valid_name, valid_version, validate_manifest};
+pub use manifest::{
+    declares_hooks, parse_manifest, valid_display_name, valid_id, valid_version, validate_manifest,
+};
 use signature::parse_public_key;
 pub(crate) use signature::{check_signature, SignatureMode};
 pub use signature::{valid_key_id, validate_public_key};
@@ -36,7 +38,7 @@ pub use signature::{valid_key_id, validate_public_key};
 pub(crate) use tar::check_hook_shebangs;
 pub(crate) use tar::validate_declared_files;
 use tar::verify_bytes_mode;
-pub use tar::{is_native_binary, validate_script_payload};
+pub use tar::{check_icon_magic, is_native_binary, validate_script_payload};
 
 pub fn verify_package(path: &Path, trust_dir: &Path) -> Result<Package, ProblemError> {
     verify_package_with(path, SignatureCheck::Required, trust_dir)
@@ -168,6 +170,7 @@ mod tests {
             .collect();
         let value = json!({
             "schema": 1,
+            "id": "many",
             "name": "many",
             "version": "1.0.0",
             "desc": "many",
@@ -187,13 +190,13 @@ mod tests {
     fn verifies_a_signed_package_and_extracts_it() {
         let key = setup();
         let package = verify_bytes(&package(&key)).expect("verify");
-        assert_eq!(package.manifest.name, "demo");
+        assert_eq!(package.manifest.id(), "demo");
         assert_eq!(package.files.len(), 2);
         let root = tempdir::TempDir::new();
         package.write_to(root.path()).expect("write");
         assert_eq!(
             std::fs::read(root.path().join("payload/bin/demo")).expect("read"),
-            b"hello"
+            native_payload()
         );
     }
 
@@ -249,7 +252,8 @@ mod tests {
     fn rejects_a_tampered_file() {
         let key = setup();
         let mut bytes = package(&key);
-        let needle = b"hello";
+        let payload = native_payload();
+        let needle = payload.as_slice();
         let position = bytes
             .windows(needle.len())
             .position(|w| w == needle)
@@ -294,9 +298,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_three_accepts_a_device_list() {
+    fn schema_one_accepts_a_device_list() {
         let manifest = parse_and_validate(compat_manifest_value(
-            3,
             Some(json!({"devices": ["sr6110", "sr1010-v1"]})),
             None,
         ))
@@ -308,28 +311,12 @@ mod tests {
     }
 
     #[test]
-    fn compat_requires_schema_three() {
-        let error = parse_and_validate(compat_manifest_value(
-            2,
-            Some(json!({"devices": ["sr6110"]})),
-            None,
-        ))
-        .expect_err("schema gate");
-        assert!(
-            error.detail().contains("compat requires schema 3"),
-            "{error}"
-        );
-    }
-
-    #[test]
     fn a_device_list_must_be_non_empty_and_unique() {
-        let empty =
-            parse_and_validate(compat_manifest_value(3, Some(json!({"devices": []})), None))
-                .expect_err("empty");
+        let empty = parse_and_validate(compat_manifest_value(Some(json!({"devices": []})), None))
+            .expect_err("empty");
         assert!(empty.detail().contains("must not be empty"), "{empty}");
 
         let duplicate = parse_and_validate(compat_manifest_value(
-            3,
             Some(json!({"devices": ["sr6110", "sr6110"]})),
             None,
         ))
@@ -337,7 +324,6 @@ mod tests {
         assert!(duplicate.detail().contains("duplicate"), "{duplicate}");
 
         let invalid = parse_and_validate(compat_manifest_value(
-            3,
             Some(json!({"devices": ["SR6110"]})),
             None,
         ))
@@ -347,24 +333,16 @@ mod tests {
 
     #[test]
     fn a_kernel_module_requires_a_device_list() {
-        let error = parse_and_validate(compat_manifest_value(3, None, Some("payload/driver.ko")))
+        let error = parse_and_validate(compat_manifest_value(None, Some("payload/driver.ko")))
             .expect_err("kernel module without compat");
         assert!(error.detail().contains("kernel module"), "{error}");
 
         let ok = parse_and_validate(compat_manifest_value(
-            3,
             Some(json!({"devices": ["sr6110"]})),
             Some("payload/driver.ko"),
         ))
         .expect("kernel module with compat");
         assert!(ok.compat.is_some());
-    }
-
-    #[test]
-    fn a_kernel_module_cannot_use_an_old_schema() {
-        let error = parse_and_validate(compat_manifest_value(2, None, Some("payload/driver.ko")))
-            .expect_err("old schema kernel module");
-        assert!(error.detail().contains("kernel module"), "{error}");
     }
 
     #[test]
@@ -383,7 +361,7 @@ mod tests {
         let key = setup();
         let data = b"payload".to_vec();
         let value = json!({
-            "schema": 1, "name": "demo", "version": "1.0.0", "desc": "demo",
+            "schema": 1, "id": "demo", "name": "demo", "version": "1.0.0", "desc": "demo",
             "platform": crate::platform::target(), "protocol": 1,
             "exec": {"path": "../escape"},
             "files": [{"path": "../escape", "size": data.len(), "sha256": hex_sha256(&data), "mode": 0o755}]
@@ -414,7 +392,7 @@ mod tests {
         let key = setup();
         let data = b"payload".to_vec();
         let value = json!({
-            "schema": 1, "name": "demo", "version": "1.0.0", "desc": "demo",
+            "schema": 1, "id": "demo", "name": "demo", "version": "1.0.0", "desc": "demo",
             "platform": crate::platform::target(), "protocol": 1,
             "exec": {"path": "payload/bin/demo"},
             "files": [{"path": "payload/bin/demo", "size": data.len(), "sha256": hex_sha256(&data), "mode": 0o4755}]
@@ -435,7 +413,7 @@ mod tests {
         let key = setup();
         let data = b"payload".to_vec();
         let value = json!({
-            "schema": 1, "name": "demo", "version": "1.0.0", "desc": "demo",
+            "schema": 1, "id": "demo", "name": "demo", "version": "1.0.0", "desc": "demo",
             "platform": crate::platform::target(), "protocol": 3,
             "exec": {"path": "payload/bin/demo"},
             "files": [{"path": "payload/bin/demo", "size": data.len(), "sha256": hex_sha256(&data), "mode": 0o755}]
@@ -454,9 +432,9 @@ mod tests {
     #[test]
     fn accepts_length_prefixed_protocol_two() {
         let key = setup();
-        let data = b"payload".to_vec();
+        let data = native_payload();
         let value = json!({
-            "schema": 1, "name": "demo", "version": "1.0.0", "desc": "demo",
+            "schema": 1, "id": "demo", "name": "demo", "version": "1.0.0", "desc": "demo",
             "platform": crate::platform::target(), "protocol": 2,
             "exec": {"path": "payload/bin/demo"},
             "files": [{"path": "payload/bin/demo", "size": data.len(), "sha256": hex_sha256(&data), "mode": 0o755}]
@@ -571,15 +549,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_lifecycle_or_interpreter_under_schema_one() {
-        let (bytes, _) = script_manifest(1);
-        let error = parse_manifest(&bytes).expect_err("schema gate");
-        assert!(error.detail().contains("schema 2"), "{error}");
-    }
-
-    #[test]
-    fn accepts_lifecycle_and_interpreter_under_schema_two() {
-        let (bytes, _) = script_manifest(2);
+    fn accepts_lifecycle_and_interpreter() {
+        let (bytes, _) = script_manifest();
         let manifest = parse_manifest(&bytes).expect("parse");
         validate_manifest(&manifest).expect("validate");
         assert_eq!(
@@ -607,7 +578,7 @@ mod tests {
                 "mode": 0o755
             })];
             json!({
-                "schema": 2, "name": "clock", "version": "1.0.0", "desc": "clock",
+                "schema": 1, "id": "clock", "name": "clock", "version": "1.0.0", "desc": "clock",
                 "platform": crate::platform::target(), "protocol": 1,
                 "exec": {"path": "payload/bin/clock.sh", "ready": "exec"},
                 "interpreter": {"name": "sh"},
@@ -634,7 +605,7 @@ mod tests {
 
     #[test]
     fn rejects_capabilities_on_an_exec_ready_plugin() {
-        let (bytes, _) = script_manifest(2);
+        let (bytes, _) = script_manifest();
         let mut value: Value = serde_json::from_slice(&bytes).expect("json");
         value["capabilities"] = json!([{
             "name": "status", "desc": "status", "inputSchema": {}
@@ -647,7 +618,7 @@ mod tests {
 
     #[test]
     fn rejects_a_bad_interpreter_name_or_constraint() {
-        let (bytes, _) = script_manifest(2);
+        let (bytes, _) = script_manifest();
         let mut value: Value = serde_json::from_slice(&bytes).expect("json");
         value["interpreter"]["name"] = json!("py -3");
         let bytes = serde_json::to_vec(&value).expect("json");
@@ -655,7 +626,7 @@ mod tests {
             validate_manifest(&parse_manifest(&bytes).expect("parse")).expect_err("bad name");
         assert!(error.detail().contains("bare name"), "{error}");
 
-        let mut value: Value = serde_json::from_slice(&script_manifest(2).0).expect("json");
+        let mut value: Value = serde_json::from_slice(&script_manifest().0).expect("json");
         value["interpreter"]["version"] = json!("3.10");
         let bytes = serde_json::to_vec(&value).expect("json");
         let error =
@@ -665,27 +636,42 @@ mod tests {
     }
 
     #[test]
-    fn verify_bytes_enforces_the_schema_two_gate() {
+    fn rejects_a_package_without_an_id() {
         let key = setup();
-        let (manifest, files) = script_manifest(1);
-        let bytes = package_from(&key, "test", &manifest, &files);
-        let error = verify_bytes(&bytes).expect_err("schema one");
-        assert!(error.detail().contains("schema 2"), "{error}");
+        let (manifest, files) = manifest(crate::platform::target());
+        let mut value: Value = serde_json::from_slice(&manifest).expect("json");
+        value.as_object_mut().expect("object").remove("id");
+        let manifest = serde_json::to_vec(&value).expect("json");
+        let error = verify_bytes(&package_from(&key, "test", &manifest, &files)).expect_err("id");
+        assert!(error.detail().contains("requires an id"), "{error}");
+        assert!(error.detail().contains("plugin bundle --id"), "{error}");
     }
 
     #[test]
-    fn schema_two_scripts_require_an_interpreter() {
+    fn rejects_a_package_with_another_schema_version() {
+        let (bytes, _) = script_manifest();
+        let base: Value = serde_json::from_slice(&bytes).expect("json");
+        for schema in [0, 2, 3] {
+            let mut value = base.clone();
+            value["schema"] = json!(schema);
+            let bytes = serde_json::to_vec(&value).expect("json");
+            let error = parse_manifest(&bytes).expect_err("schema gate");
+            assert!(
+                error.detail().contains("repack with `plugin bundle`"),
+                "schema {schema}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_script_without_an_interpreter_is_still_a_valid_package() {
         let key = setup();
-        let (manifest, files) = script_manifest(2);
+        let (manifest, files) = script_manifest();
         let mut value: Value = serde_json::from_slice(&manifest).expect("json");
         value.as_object_mut().expect("object").remove("interpreter");
         let manifest = serde_json::to_vec(&value).expect("json");
-        let error = verify_bytes(&package_from(&key, "test", &manifest, &files))
-            .expect_err("missing interpreter");
-        assert!(
-            error.detail().contains("requires an interpreter"),
-            "{error}"
-        );
+        verify_bytes(&package_from(&key, "test", &manifest, &files))
+            .expect("a shebang script needs no interpreter block");
     }
 
     #[test]
@@ -699,7 +685,8 @@ mod tests {
             })
             .collect();
         let value = json!({
-            "schema": 2,
+            "schema": 1,
+            "id": "native",
             "name": "native",
             "version": "1.0.0",
             "desc": "native",
@@ -716,33 +703,9 @@ mod tests {
     }
 
     #[test]
-    fn schema_one_scripts_keep_the_legacy_direct_exec_path() {
+    fn verifies_a_script_package() {
         let key = setup();
-        let files: TestFiles = vec![("payload/bin/demo", b"#!/bin/sh\n".to_vec(), 0o755)];
-        let entries: Vec<Value> = files
-            .iter()
-            .map(|(path, data, mode)| {
-                json!({"path": path, "size": data.len(), "sha256": hex_sha256(data), "mode": mode})
-            })
-            .collect();
-        let value = json!({
-            "schema": 1,
-            "name": "legacy",
-            "version": "1.0.0",
-            "desc": "legacy",
-            "platform": crate::platform::target(),
-            "protocol": 1,
-            "exec": {"path": "payload/bin/demo"},
-            "files": entries
-        });
-        let manifest = serde_json::to_vec(&value).expect("manifest");
-        verify_bytes(&package_from(&key, "test", &manifest, &files)).expect("legacy package");
-    }
-
-    #[test]
-    fn verifies_a_schema_two_script_package() {
-        let key = setup();
-        let (manifest, files) = script_manifest(2);
+        let (manifest, files) = script_manifest();
         let package =
             verify_bytes(&package_from(&key, "test", &manifest, &files)).expect("script package");
         assert_eq!(
@@ -754,5 +717,174 @@ mod tests {
                 .map(|hook| hook.path.as_str()),
             Some("payload/bin/clock.sh")
         );
+    }
+    /// A package whose `files[]` is exactly `files` (the first entry is the
+    /// exec and gets 0o755) with `icons` spliced into the manifest.
+    fn package_with_icons(icons: Option<Value>, files: &[(&'static str, &[u8])]) -> Vec<u8> {
+        let key = setup();
+        let entries: Vec<Value> = files
+            .iter()
+            .enumerate()
+            .map(|(index, (path, data))| {
+                json!({
+                    "path": path,
+                    "size": data.len(),
+                    "sha256": hex_sha256(data),
+                    "mode": if index == 0 { 0o755 } else { 0o644 },
+                })
+            })
+            .collect();
+        let mut value = json!({
+            "schema": 1,
+            "id": "demo",
+            "name": "示例插件",
+            "version": "1.0.0",
+            "desc": "icons",
+            "platform": crate::platform::target(),
+            "protocol": 1,
+            "exec": {"path": files[0].0, "ready": "exec"},
+            "files": entries,
+        });
+        if let Some(icons) = icons {
+            value["icons"] = icons;
+        }
+        let manifest = serde_json::to_vec(&value).expect("manifest");
+        let tar: TestFiles = files
+            .iter()
+            .enumerate()
+            .map(|(index, (path, data))| {
+                (*path, data.to_vec(), if index == 0 { 0o755 } else { 0o644 })
+            })
+            .collect();
+        package_from(&key, "test", &manifest, &tar)
+    }
+
+    const PNG_HEAD: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+
+    fn native_with_icon(icon: &[u8]) -> Vec<u8> {
+        let exec = native_payload();
+        package_with_icons(
+            Some(json!({"png": "payload/icon.png"})),
+            &[
+                ("payload/bin/demo", exec.as_slice()),
+                ("payload/icon.png", icon),
+            ],
+        )
+    }
+
+    #[test]
+    fn accepts_a_chinese_display_name_and_a_png_icon() {
+        let package = verify_bytes(&native_with_icon(&PNG_HEAD)).expect("icon package");
+        assert_eq!(package.manifest.id(), "demo");
+        assert_eq!(package.manifest.name, "示例插件");
+        assert_eq!(
+            package
+                .manifest
+                .icons
+                .as_ref()
+                .and_then(|icons| icons.png.as_deref()),
+            Some("payload/icon.png")
+        );
+    }
+
+    #[test]
+    fn icons_are_optional() {
+        let exec = native_payload();
+        let package = package_with_icons(None, &[("payload/bin/demo", exec.as_slice())]);
+        verify_bytes(&package).expect("no icons");
+    }
+
+    #[test]
+    fn rejects_an_unknown_icon_format() {
+        let (manifest, _) = manifest(crate::platform::target());
+        let mut value: Value = serde_json::from_slice(&manifest).expect("json");
+        value["icons"] = json!({"svg": "payload/bin/demo"});
+        let bytes = serde_json::to_vec(&value).expect("json");
+        let error = parse_manifest(&bytes).expect_err("unknown format");
+        assert!(error.detail().contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn rejects_an_icon_that_is_not_declared_or_not_a_png() {
+        let exec = native_payload();
+        let missing = package_with_icons(
+            Some(json!({"png": "payload/missing.png"})),
+            &[("payload/bin/demo", exec.as_slice())],
+        );
+        let error = verify_bytes(&missing).expect_err("missing icon");
+        assert!(error.detail().contains("not in files[]"), "{error}");
+
+        let wrong_magic = native_with_icon(b"not a png at all");
+        let error = verify_bytes(&wrong_magic).expect_err("bad magic");
+        assert!(error.detail().contains("magic bytes mismatch"), "{error}");
+    }
+
+    #[test]
+    fn rejects_an_icon_over_the_size_ceiling() {
+        // One byte over the per-icon ceiling (1 MiB).
+        let big = vec![0xffu8; 1024 * 1024 + 1];
+        let error = verify_bytes(&native_with_icon(&big)).expect_err("oversized icon");
+        assert_eq!(error.problem, Problem::TooLarge);
+        assert!(error.detail().contains("per-icon ceiling"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_bad_or_reserved_id() {
+        let (manifest, _) = manifest(crate::platform::target());
+        for (id, needle) in [
+            ("Bad", "invalid plugin id"),
+            ("", "invalid plugin id"),
+            ("svc", "reserved"),
+        ] {
+            let mut value: Value = serde_json::from_slice(&manifest).expect("json");
+            value["id"] = json!(id);
+            let bytes = serde_json::to_vec(&value).expect("json");
+            let error = parse_manifest(&bytes).expect_err("bad id");
+            assert!(error.detail().contains(needle), "id {id:?}: {error}");
+        }
+        let mut value: Value = serde_json::from_slice(&manifest).expect("json");
+        value["name"] = json!("bad\u{0000}name");
+        let bytes = serde_json::to_vec(&value).expect("json");
+        let error = parse_manifest(&bytes).expect_err("control character");
+        assert!(error.detail().contains("display name"), "{error}");
+    }
+
+    #[test]
+    fn output_schema_is_optional_and_accepts_any_json() {
+        let (manifest, files) = manifest(crate::platform::target());
+        let mut value: Value = serde_json::from_slice(&manifest).expect("json");
+        value["capabilities"] = json!([
+            {"name": "any", "desc": "declared-any", "inputSchema": {}, "outputSchema": {}},
+            {"name": "shaped", "desc": "declared", "inputSchema": {},
+             "outputSchema": {"type": "object", "properties": {"ok": {"type": "boolean"}}}},
+            {"name": "bare", "desc": "undeclared", "inputSchema": {}}
+        ]);
+        let manifest = serde_json::to_vec(&value).expect("json");
+        let package =
+            verify_bytes(&package_from(&setup(), "test", &manifest, &files)).expect("caps");
+        let schemas: Vec<Option<Value>> = package
+            .manifest
+            .capabilities
+            .iter()
+            .map(|capability| capability.output_schema.clone())
+            .collect();
+        assert_eq!(schemas[0], Some(json!({})));
+        assert_eq!(
+            schemas[1],
+            Some(json!({"type": "object", "properties": {"ok": {"type": "boolean"}}}))
+        );
+        assert_eq!(schemas[2], None);
+    }
+
+    #[test]
+    fn accepts_a_protocol_three_package() {
+        let (manifest, files) = manifest(crate::platform::target());
+        let mut value: Value = serde_json::from_slice(&manifest).expect("json");
+        value["protocol"] = json!(3);
+        value["exec"]["ready"] = json!("exec");
+        let manifest = serde_json::to_vec(&value).expect("json");
+        let package = verify_bytes(&package_from(&setup(), "test", &manifest, &files))
+            .expect("raw protocol package");
+        assert_eq!(package.manifest.protocol, 3);
     }
 }

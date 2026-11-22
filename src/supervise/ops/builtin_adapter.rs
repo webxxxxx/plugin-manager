@@ -174,6 +174,7 @@ mod tests {
             name: CapabilityName::new(name),
             desc: String::new(),
             input_schema: None,
+            output_schema: None,
             effect: Effect::Read,
             idempotent: true,
         };
@@ -218,6 +219,7 @@ mod tests {
             name: CapabilityName::new("missing"),
             desc: String::new(),
             input_schema: None,
+            output_schema: None,
             effect: Effect::Read,
             idempotent: true,
         };

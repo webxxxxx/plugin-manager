@@ -1,7 +1,8 @@
 {
-  "schema": 2,
+  "schema": 1,
+  "id": "sse-panel",
   "protocol": 1,
-  "name": "sse-panel",
+  "name": "SSE 面板",
   "version": "1.0.0",
   "platform": "x86_64-unknown-linux-gnu",
   "desc": "SSE smoke test: EventSource downlink with Last-Event-ID replay",
