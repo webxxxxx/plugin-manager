@@ -3,19 +3,25 @@
 use super::*;
 
 /// #161: the daemon writes what it derived at startup, and `svc status
-/// --resources` shows it back. The resource description is injected through the
+/// --resources` shows it back. Memory and cores are both injected through the
 /// document, so the assertions do not depend on the machine running the suite;
-/// two over-the-band values produce exactly two readable overrides.
+/// the workload shape is derived, not stated.
+///
+/// The configuration is over budget on both thread models: Unix charges one
+/// stack per loop/blocking thread, so the invariant pays with the resident
+/// single-request body; Windows keeps one thread per admitted connection, so
+/// the pinned 4096 connections are too many threads and it pays with
+/// concurrency instead. Either way the report has exactly two overrides: the
+/// body's upper bound and one invariant shrink.
 #[test]
 fn the_daemon_reports_the_memory_budget_it_derived() {
     let mut sandbox = Sandbox::new();
-    // 8 GiB of free memory -> a 2 GiB budget (the build ceiling), i.e. the
-    // streaming shape. The body is above that shape's share; 4096 connections
-    // sit on the spec's own ceiling, so the invariant shrinks the resident
-    // single-request body instead of the connection count.
+    // 8 GiB of free memory -> a 2 GiB budget (auto takes a quarter), i.e. the
+    // streaming shape. The body is above that shape's share and the pinned
+    // 4096 connections sit on the spec's own ceiling.
     fs::write(
         sandbox.config.join("svcd.conf"),
-        "probe_available_memory = 8589934592\nmax_connections = 4096\nmax_body_bytes = 1073741824\n",
+        "probe_available_memory = 8589934592\nprobe_cpus = 4\nmax_connections = 4096\nmax_body_bytes = 1073741824\n",
     )
     .expect("write svcd.conf");
     sandbox.start_daemon_ready();
@@ -64,15 +70,19 @@ fn the_daemon_reports_the_memory_budget_it_derived() {
     assert!(
         summary
             .iter()
-            .any(|line| line.starts_with("max_complete_body_bytes ")
-                && line.ends_with("invariant-shrink")),
-        "{summary:?}"
-    );
-    assert!(
-        summary
-            .iter()
             .any(|line| line.starts_with("max_body_bytes 1073741824 ")
                 && line.ends_with("above-upper-bound")),
+        "{summary:?}"
+    );
+    // The second override is the invariant's: the body where threads are fixed
+    // (Unix), the connection count where a connection owns a thread (Windows).
+    let mut invariant = summary
+        .iter()
+        .filter(|line| line.ends_with("invariant-shrink"));
+    let shrink = invariant.next().unwrap_or_else(|| panic!("{summary:?}"));
+    assert!(invariant.next().is_none(), "{summary:?}");
+    assert!(
+        shrink.starts_with("max_complete_body_bytes ") || shrink.starts_with("max_connections "),
         "{summary:?}"
     );
 
@@ -89,27 +99,33 @@ fn the_daemon_reports_the_memory_budget_it_derived() {
         "memory:",
         "workload: streaming (derived)",
         "worst case:",
-        "override: max_complete_body_bytes:",
-        "override: max_body_bytes: 1073741824 ->",
-        "stated:  probe_available_memory",
+        "override: max_body_bytes: 1073741824 -> 536870912 (above-upper-bound)",
+        "stated:  probe_available_memory, probe_cpus",
     ] {
         assert!(shown.contains(needle), "missing {needle} in:\n{shown}");
     }
+    assert_eq!(shown.matches("override: ").count(), 2, "{shown}");
+    assert!(shown.contains("(invariant-shrink)"), "{shown}");
 
-    // The same report is in the startup log, once.
+    // The same report is in the startup log, once per override.
     let log = sandbox.daemon_log();
     assert!(
-        log.contains("svcd: memory:"),
+        log.contains("svcd memory:"),
         "log misses the budget:\n{log}"
     );
     assert!(
-        log.contains("svcd: workload: streaming (derived)"),
+        log.contains("svcd workload: streaming (derived)"),
         "log misses the shape:\n{log}"
     );
-    let overrides = log
-        .matches("svcd: override: max_complete_body_bytes:")
-        .count();
-    assert_eq!(overrides, 1, "each override is logged once:\n{log}");
+    assert_eq!(
+        log.matches("svcd override: ").count(),
+        2,
+        "each override is logged once:\n{log}"
+    );
+    assert!(
+        log.contains("(invariant-shrink)"),
+        "log misses the invariant shrink:\n{log}"
+    );
 }
 
 /// `log = off` is the master switch: the daemon writes no log file at all.
