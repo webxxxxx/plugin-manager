@@ -2,47 +2,26 @@
 //! request buffers and the pending-request table. A `ServerLoop` implements
 //! the per-connection state machine; the loop itself never knows an endpoint.
 //!
-//! The loop is Unix-only for now. Windows keeps the per-connection thread
-//! fallback (ADR-0016); moving that to IOCP belongs to S3/S6.
+//! The loop runs on both hosts: Unix waits with `poll(2)` and Windows with
+//! `WSAPoll` over the same non-blocking sockets (see `platform/host/poll`).
+//! Neither host runs a thread per connection (ADR-0027).
 
-#[cfg(unix)]
 use std::collections::HashMap;
-#[cfg(unix)]
 use std::io::{Read, Write};
-#[cfg(unix)]
 use std::net::{IpAddr, TcpListener, TcpStream};
-#[cfg(unix)]
 use std::time::{Duration, Instant};
 
+use crate::platform::host::poll::{self, PollFd};
+use crate::server::http::contract::BodyPolicy;
 use crate::server::http::model as http;
 
-#[cfg(unix)]
-use crate::server::http::contract::BodyPolicy;
-#[cfg(unix)]
-use std::os::unix::io::{AsRawFd, RawFd};
-
-/// Poll flags that mean the peer is gone. Linux reports a half-close as
-/// `POLLRDHUP` even when the socket still has unread bytes; without it a
-/// paused stream (a job in flight, so no read interest) never sees the client
-/// FIN and cannot cancel that job.
-#[cfg(all(unix, target_os = "linux"))]
-const POLL_CLOSE: i16 = libc::POLLERR | libc::POLLHUP | libc::POLLRDHUP;
-#[cfg(all(unix, not(target_os = "linux")))]
-const POLL_CLOSE: i16 = libc::POLLERR | libc::POLLHUP;
-
-/// What a paused stream asks poll for. It must not ask to read (the handler is
-/// applying backpressure), but Linux only reports a half-close through
-/// `POLLRDHUP`; other Unixes keep `POLLHUP`, which the loop already handles.
-#[cfg(unix)]
+/// What a paused stream asks the wait set for. A handler applying backpressure
+/// must not ask to read; on Linux a half-close is still reported through
+/// `POLLRDHUP`, so that bit is the only interest. Windows has no half-close
+/// flag but reports a whole peer close as `POLLHUP` with zero interest, so the
+/// same disconnect path works there (see `platform/host/poll/windows.rs`).
 pub(crate) fn paused_stream_interest() -> i16 {
-    #[cfg(target_os = "linux")]
-    {
-        libc::POLLRDHUP
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        0
-    }
+    poll::RDHUP
 }
 
 /// The busy response for a connection refused by the loop. Both engines send
@@ -61,7 +40,6 @@ pub struct HttpRequest {
     pub body: Vec<u8>,
 }
 
-#[cfg(unix)]
 pub struct PendingRequest {
     method: String,
     path: String,
@@ -71,7 +49,6 @@ pub struct PendingRequest {
     framing: PendingFraming,
 }
 
-#[cfg(unix)]
 pub enum PendingFraming {
     None,
     Length(u64),
@@ -80,7 +57,6 @@ pub enum PendingFraming {
 
 /// One accepted connection. The loop owns the socket and the two buffers; the
 /// handler owns only the protocol state `S`.
-#[cfg(unix)]
 pub struct Connection<S> {
     pub id: u64,
     pub stream: TcpStream,
@@ -96,10 +72,13 @@ pub struct Connection<S> {
     /// the request it belongs to.
     pub head_only: bool,
     pub pending: Option<PendingRequest>,
+    /// The handler took the socket out of the loop (a Windows MCP SSE response
+    /// runs on its own thread, bounded by `max_streams`). The loop drops its
+    /// entry without closing the socket.
+    pub handed_off: bool,
     pub state: S,
 }
 
-#[cfg(unix)]
 impl<S> Connection<S> {
     /// Flush the connection's output buffer. Returns false when the peer is
     /// gone. Responses and stream frames both use this one write path.
@@ -126,13 +105,11 @@ impl<S> Connection<S> {
     }
 }
 
-#[cfg(unix)]
 pub type Table<S> = HashMap<u64, Connection<S>>;
 
 /// What a handler wants the loop to do after it inspected the request head but
 /// before the body is read. Stream handlers that consume the raw body need
 /// this window.
-#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreRequest {
     /// Not a stream route; let the loop parse and buffer the request.
@@ -145,7 +122,6 @@ pub enum PreRequest {
 
 /// The connection state machine. The loop owns the connection and the
 /// buffers; this half only decides what one event means.
-#[cfg(unix)]
 pub trait ConnectionOps {
     type State;
 
@@ -170,15 +146,15 @@ pub trait ConnectionOps {
     fn is_idle(&self, connection: &Connection<Self::State>, now: Instant, idle: Duration) -> bool;
     fn on_close(&mut self, connection: &mut Connection<Self::State>);
 
-    /// The loop is about to drop a connection after POLLERR / POLLHUP
-    /// (or Linux's POLLRDHUP). Handlers use this for protocol diagnostics.
+    /// The loop is about to drop a connection after a close bit
+    /// (`poll::CLOSE`: error, hangup, or Linux's half-close). Handlers use
+    /// this for protocol diagnostics.
     fn on_poll_error(&mut self, connection: &mut Connection<Self::State>, _revents: i16) {
         let _ = connection;
     }
 }
 
 /// Per-tick work (idle sweep, blocking completions, control replies).
-#[cfg(unix)]
 pub trait TimerOps {
     type State;
 
@@ -186,24 +162,23 @@ pub trait TimerOps {
 }
 
 /// Sources the loop should poll besides the listener and the connections.
-#[cfg(unix)]
 pub trait ExtraOps {
-    /// The blocking pool and control client wake the loop through this fd; the
-    /// loop only uses it to leave poll early, the handler drains it in on_tick.
-    fn wake_fd(&self) -> Option<RawFd> {
+    /// The blocking pool and control client wake the loop through this socket;
+    /// the loop only uses it to leave the wait early, the handler drains it in
+    /// on_tick.
+    fn wake_key(&self) -> Option<poll::Key> {
         None
     }
 
     /// Append the server-loop's extra poll sources. The handler keeps the same
     /// order for on_extra_ready; indices are stable for one pass.
-    fn prepare_extra(&mut self, _out: &mut Vec<(RawFd, i16)>) {}
+    fn prepare_extra(&mut self, _out: &mut Vec<PollFd>) {}
 
     /// One extra source became ready.
     fn on_extra_ready(&mut self, _index: usize, _revents: i16) {}
 }
 
 /// Shutdown handshake with the composition root.
-#[cfg(unix)]
 pub trait LifecycleOps {
     /// The composition root asked the loop to flush and return.
     fn should_stop(&self) -> bool {
@@ -222,12 +197,9 @@ pub trait LifecycleOps {
 
 /// Marker for a complete loop implementation. It adds no methods; the four
 /// capability traits are the actual seams.
-#[cfg(unix)]
 pub trait ServerLoop: ConnectionOps + TimerOps + ExtraOps + LifecycleOps {}
-#[cfg(unix)]
 impl<T: ConnectionOps + TimerOps + ExtraOps + LifecycleOps> ServerLoop for T {}
 
-#[cfg(unix)]
 pub fn run<S, H>(
     listener: Option<TcpListener>,
     handler: &mut H,
@@ -262,57 +234,43 @@ pub fn run<S, H>(
 
         let mut descriptors = Vec::with_capacity(connections.len() + 2);
         let mut keys = Vec::with_capacity(connections.len() + 2);
-        descriptors.push(libc::pollfd {
-            fd: listener
-                .as_ref()
-                .map(|listener| listener.as_raw_fd())
-                .unwrap_or(-1),
-            events: if listener.is_some() { libc::POLLIN } else { 0 },
-            revents: 0,
-        });
+        descriptors.push(PollFd::new(
+            listener.as_ref().map(poll::key_of).unwrap_or(poll::NONE),
+            if listener.is_some() { poll::READ } else { 0 },
+        ));
         keys.push(0);
-        let wake = handler.wake_fd();
-        descriptors.push(libc::pollfd {
-            fd: wake.unwrap_or(-1),
-            events: if wake.is_some() { libc::POLLIN } else { 0 },
-            revents: 0,
-        });
+        let wake = handler.wake_key();
+        descriptors.push(PollFd::new(
+            wake.unwrap_or(poll::NONE),
+            if wake.is_some() { poll::READ } else { 0 },
+        ));
         keys.push(1);
         for (id, connection) in &connections {
             let mut events = handler.interest(connection);
             if connection.out_at < connection.out.len() {
-                events |= libc::POLLOUT;
+                events |= poll::WRITE;
             }
-            descriptors.push(libc::pollfd {
-                fd: connection.stream.as_raw_fd(),
-                events,
-                revents: 0,
-            });
+            descriptors.push(PollFd::new(poll::key_of(&connection.stream), events));
             keys.push(*id);
         }
 
         let connection_end = descriptors.len();
-        let mut extra_fds: Vec<(RawFd, i16)> = Vec::new();
+        let mut extra_fds: Vec<PollFd> = Vec::new();
         handler.prepare_extra(&mut extra_fds);
         let extra_start = descriptors.len();
-        for (fd, events) in &extra_fds {
-            descriptors.push(libc::pollfd {
-                fd: *fd,
-                events: *events,
-                revents: 0,
-            });
-        }
+        descriptors.extend_from_slice(&extra_fds);
 
-        if let Err(error) = crate::platform::host::poll::poll(&mut descriptors, 100) {
+        if let Err(error) = poll::poll(&mut descriptors, 100) {
             error!("server loop poll failed: {}", error);
             continue;
         }
-        if descriptors[1].revents & libc::POLLIN != 0 {
-            // The handler drains the wake fd in on_tick; poll just returned early.
+        if descriptors[1].revents & poll::READ != 0 {
+            // The handler drains the wake socket in on_tick; the wait only
+            // returned early.
             handler.on_tick(&mut connections);
         }
 
-        if descriptors[0].revents & libc::POLLIN != 0 {
+        if descriptors[0].revents & poll::READ != 0 {
             if let Some(listener) = &listener {
                 loop {
                     match listener.accept() {
@@ -343,6 +301,7 @@ pub fn run<S, H>(
                                 keep_alive: false,
                                 head_only: false,
                                 pending: None,
+                                handed_off: false,
                                 state: handler.new_state(id, ip),
                             };
                             handler.on_accept(&mut connection);
@@ -364,14 +323,14 @@ pub fn run<S, H>(
                 continue;
             };
             let revents = descriptors[index].revents;
-            if revents & POLL_CLOSE != 0 {
+            if revents & poll::CLOSE != 0 {
                 if let Some(mut connection) = connections.remove(&id) {
                     handler.on_poll_error(&mut connection, revents);
                     handler.on_close(&mut connection);
                 }
                 continue;
             }
-            if revents & libc::POLLIN != 0 {
+            if revents & poll::READ != 0 {
                 if handler.reads_request(connection) {
                     let mut chunk = [0u8; 8 * 1024];
                     match connection.stream.read(&mut chunk) {
@@ -421,12 +380,18 @@ pub fn run<S, H>(
             let Some(connection) = connections.get_mut(&id) else {
                 continue;
             };
-            if (revents & libc::POLLOUT != 0 || connection.out_at < connection.out.len())
+            if (revents & poll::WRITE != 0 || connection.out_at < connection.out.len())
                 && !handler.on_writable(connection)
             {
                 if let Some(mut connection) = connections.remove(&id) {
                     handler.on_close(&mut connection);
                 }
+                continue;
+            }
+            if connection.handed_off {
+                // The handler moved this socket to its own thread; the loop
+                // must not poll or close it.
+                connections.remove(&id);
             }
         }
 
@@ -439,14 +404,12 @@ pub fn run<S, H>(
     }
 }
 
-#[cfg(unix)]
 fn reject_connection(mut stream: TcpStream) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
     let _ = std::io::Write::write_all(&mut stream, BUSY_CONNECTION_RESPONSE);
 }
 
-#[cfg(unix)]
 pub fn advance_request<S>(
     connection: &mut Connection<S>,
     max_header: usize,
@@ -639,7 +602,7 @@ pub fn keep_alive_response(mut response: Vec<u8>) -> Vec<u8> {
     response
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     // Large enough for the request heads these cases build.
     const M: usize = 64 * 1024;
@@ -663,6 +626,7 @@ mod tests {
             keep_alive: false,
             head_only: false,
             pending: None,
+            handed_off: false,
             state: (),
         };
         connection.buffer.extend_from_slice(buffer);

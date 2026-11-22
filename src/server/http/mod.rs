@@ -3,34 +3,29 @@
 //! See `docs/adr/0016-s4-request-handover.md`.
 
 #[cfg(feature = "http")]
-pub(crate) mod blocking;
-#[cfg(feature = "http")]
 pub mod budget;
+// The connection drivers describe a running loop; the minimal build has none.
 #[cfg(feature = "http")]
 pub(crate) mod conn;
 pub mod contract;
 pub mod date;
 pub mod dispatch;
-#[cfg(all(unix, feature = "http"))]
+#[cfg(feature = "http")]
 pub mod driver;
 pub mod engine;
 #[cfg(feature = "http")]
 pub mod entry;
-#[cfg(feature = "http")]
-pub mod fallback;
 pub mod governor;
 #[cfg(feature = "http")]
 pub(crate) mod hooks;
 pub mod model;
 #[cfg_attr(not(unix), allow(dead_code))]
 pub mod pool;
-#[cfg(all(unix, feature = "http"))]
+#[cfg(feature = "http")]
 pub mod server;
 pub mod stream;
 #[cfg(all(test, feature = "http"))]
 pub(crate) mod test_support;
-#[cfg(feature = "http")]
-pub(crate) mod thread_loop;
 
 // The S4 contract is deliberately available to the minimal build (parent spec
 // #112) even when no HTTP endpoint is compiled in. Re-exports are allowed to
@@ -40,10 +35,12 @@ pub use contract::{
     body_for, BodyError, BodyPolicy, Completion, CompletionSlot, Dispatch, Exchange, Face,
     Principal, Request, Response, Route,
 };
+#[cfg(test)]
+pub use dispatch::dispatch_blocking_now;
 #[allow(unused_imports)]
 pub(crate) use dispatch::{attach_face_body, render_exchange, route_face_request, PreparedFace};
 #[allow(unused_imports)]
-pub use dispatch::{complete_blocking, dispatch_blocking_now, dispatch_inline, DispatchError};
+pub use dispatch::{complete_blocking, dispatch_inline, DispatchError};
 #[allow(unused_imports)]
 pub use pool::{BlockingPool, Busy, CancelToken, JobOutcome};
 #[allow(unused_imports)]

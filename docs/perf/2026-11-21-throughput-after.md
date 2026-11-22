@@ -36,6 +36,8 @@ python tools/perf/budget_scenario.py --binary <svcd> --budget <50mb|512mb|2gb> \
 
 Windows 的同预算连接数更低，因为不变量为「每连接一条线程」记账（tiny 的线程栈 128 KiB/条）。
 
+> 2026-11-22 起 Windows 也跑同一个 poll loop（[ADR-0027](../adr/0027-windows-runs-the-same-poll-loop.md)），不再按连接记线程栈；这张表的 Windows 连接数是改造前的值，当前两端同价。
+
 ## 结果
 
 ### Windows 11（Python 插件）
@@ -120,4 +122,4 @@ Windows 的同预算连接数更低，因为不变量为「每连接一条线程
 
 - 预算不再是容量瓶颈：50 MB 从 11 条连接变成 288（Linux）/ 64（Windows）；满可用边界从 4 个并发 worker 变成 **120 个**（10 插件 × c12）。
 - 目前的三个真实上限：**连接数**（50 MB Windows 64 条）、**阻断池队列**（256 槽）、**客户端**（1000 线程 / 串行 shell 插件）。
-- 下一步排序：① Windows 端把线程栈换成 reactor（或按核数放宽 50 MB 的连接记账），② 客户端改 asyncio 才能测满 500/1000 并发，③ WSL fixture 换成能并行的插件（多进程或 asyncio），否则 c50 测的是插件而不是 daemon。
+- 下一步排序：① Windows 端把线程栈换成 reactor（或按核数放宽 50 MB 的连接记账）——已由 ADR-0027 完成（Windows 跑同一个 poll loop），② 客户端改 asyncio 才能测满 500/1000 并发，③ WSL fixture 换成能并行的插件（多进程或 asyncio），否则 c50 测的是插件而不是 daemon。

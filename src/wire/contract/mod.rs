@@ -6,6 +6,5 @@
 pub(crate) const RAW_PROTOCOL: u32 = 3;
 
 pub mod rawhub;
-#[cfg(unix)]
 pub mod reactor;
 pub mod stdio;

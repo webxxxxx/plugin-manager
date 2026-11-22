@@ -7,6 +7,10 @@
 //! changing the config requires a daemon restart.
 
 /// HTTP/WS request handlers that parse JSON and serve a response.
+///
+/// Only the connection loops and the blocking pool create these threads; a
+/// Windows build without HTTP has neither.
+#[cfg(any(unix, feature = "http"))]
 pub(crate) fn request_stack(limits: &crate::platform::limits::Limits) -> usize {
     limits.request_stack_bytes
 }
@@ -19,6 +23,7 @@ pub(crate) fn io_stack(limits: &crate::platform::limits::Limits) -> usize {
 /// Streaming package/asset handlers need more headroom than a plain I/O loop:
 /// they parse tar/JSON and write through the HTTP layer. Keep a floor even in
 /// the low profile, where `request_stack` can be 128 KiB.
+#[cfg(any(unix, feature = "http"))]
 pub(crate) fn transfer_stack(limits: &crate::platform::limits::Limits) -> usize {
     request_stack(limits).max(256 * 1024)
 }

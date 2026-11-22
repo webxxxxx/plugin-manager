@@ -1,41 +1,60 @@
-//! Unix I/O reactor for plugin stdio.
+//! The I/O reactor for plugin stdio.
 //!
 //! Each notify plugin used to own two OS threads (stdout and stderr readers).
-//! This module owns all those pipes from one poll set instead, keeping the
+//! This module owns all those pipes from one wait set instead, keeping the
 //! process isolation boundary intact while removing the per-plugin thread cost.
-//! Windows keeps the existing reader-thread path because anonymous child pipes
-//! are not IOCP-ready.
 //!
-//! The poll set has no thread of its own: the supervisor loop owns it and
-//! drives one pass with Reactor::poll_once on its own thread, so plugin stdio
-//! costs no daemon thread (#126). Producers (a slot starting a plugin, the raw
-//! hub queueing a frame) only send commands and poke the self-pipe.
+//! The reactor has no thread of its own: the supervisor loop owns it and drives
+//! one pass with Reactor::poll_once on its own thread, so plugin stdio costs no
+//! daemon thread (#126). Producers (a slot starting a plugin, the raw hub
+//! queueing a frame) only send commands and poke the interrupt.
 //!
-//! Protocol-3 raw plugins are part of the same poll set: their stdout carries
+//! The host backend is the only platform branch: Unix waits for readiness with
+//! `poll(2)`, Windows completes overlapped named-pipe I/O through an IOCP. The
+//! framing, the bounded queues and the stop reasons are one implementation.
+//!
+//! Protocol-3 raw plugins are part of the same wait set: their stdout carries
 //! `u32 payload_len + u32 stream_id + payload` frames and their stdin is fed
 //! from a bounded per-plugin queue, so a raw plugin costs no threads at all.
 
-#![cfg(unix)]
-
 mod dispatch;
+#[cfg(windows)]
+mod iocp;
+#[cfg(unix)]
 mod pollset;
 
+#[cfg(unix)]
 use pollset::enlarge_pipe;
 
-use std::collections::{HashSet, VecDeque};
+/// No pipe-size knob on Windows: the named pipe buffer is chosen at creation.
+#[cfg(windows)]
+fn enlarge_pipe(_file: &File) {}
+
+#[cfg(unix)]
+use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{self, Read, Write};
-use std::os::unix::io::AsRawFd;
-use std::os::unix::net::UnixStream;
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
+use std::io;
+#[cfg(unix)]
+use std::io::{Read, Write};
+use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use crate::platform::host::poll;
 use crate::platform::host::wake::Wake;
 use crate::platform::log::LogWriter;
 use crate::wire::message::ipc::{FrameError, FrameEvent};
 use crate::wire::message::ipc::{RawFailure, RawStopSink};
+
+/// One way to wake the loop that owns this reactor: the Unix self-pipe write or
+/// an IOCP completion packet. Held by producers (the raw hub queue, the command
+/// channel) and by the loop's wake latch.
+pub type Interrupt = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(unix)]
+type Backend = pollset::PollSet;
+#[cfg(windows)]
+type Backend = iocp::IocpSet;
 
 const READ_CHUNK: usize = 8 * 1024;
 /// Protocol-3 raw frame header: `u32 payload_len (BE) + u32 stream_id (BE)`.
@@ -45,27 +64,25 @@ const RAW_HEADER: usize = 8;
 const RAW_READ_CHUNK: usize = 64 * 1024;
 /// Bounds how much one plugin can move per poll pass: a pass that drains one
 /// plugin greedily starves every other plugin's stdin.
+#[cfg(unix)]
 const RAW_READ_BUDGET: usize = 256 * 1024;
 /// Keep a drained raw read buffer from pinning a large frame allocation.
 const RAW_BUFFER_SHRINK: usize = 64 * 1024;
 /// Bytes one poll pass writes to a single plugin stdin. Bounding this keeps a
 /// fast producer from holding the queue lock or starving other sources.
+#[cfg(unix)]
 const RAW_WRITE_BUDGET: usize = 256 * 1024;
+/// Longest wait when a source is paused on a full consumer queue. The paused
+/// source is retried on the next pass, so neither backend may sit out the
+/// caller's full timeout; both use this constant so the resume latency matches.
+const BLOCKED_RETRY: Duration = Duration::from_millis(10);
 
 pub struct Reactor {
     tx: Sender<Command>,
-    /// Self-pipe: commands and raw payloads wake the poll immediately instead
-    /// of waiting for the timeout.
-    wake: UnixStream,
-    /// The poll set. The supervisor loop drives it; producers only enqueue
-    /// commands through tx and poke wake.
-    poll_set: Mutex<PollSet>,
-}
-
-struct PollSet {
-    rx: Receiver<Command>,
-    wake: UnixStream,
-    sources: Vec<Source>,
+    interrupt: Interrupt,
+    /// The host wait set. The supervisor loop drives it; producers only enqueue
+    /// commands through tx and poke the interrupt.
+    backend: Mutex<Backend>,
 }
 
 enum Command {
@@ -158,23 +175,26 @@ impl Source {
 /// instead of a blocked thread.
 pub struct RawOutQueue {
     state: Mutex<RawOutState>,
-    wake: UnixStream,
+    wake: Interrupt,
     capacity: usize,
 }
 
 struct RawOutState {
     frames: VecDeque<Vec<u8>>,
     current: Vec<u8>,
-    at: usize,
+    /// One owned chunk is out with the host (an overlapped write, or a poll
+    /// pass writing the same chunk). Producers keep queueing into `frames`;
+    /// they never touch `current` while this is set.
+    inflight: bool,
 }
 
 impl RawOutQueue {
-    fn new(capacity: usize, wake: UnixStream) -> Arc<Self> {
+    fn new(capacity: usize, wake: Interrupt) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(RawOutState {
                 frames: VecDeque::new(),
                 current: Vec::new(),
-                at: 0,
+                inflight: false,
             }),
             wake,
             capacity: capacity.max(1),
@@ -183,65 +203,102 @@ impl RawOutQueue {
 
     /// Queue one complete frame (header + payload) for the plugin's stdin.
     pub fn push(&self, frame: Vec<u8>) -> Result<(), RawFailure> {
-        let was_empty = {
+        let idle = {
             let mut state = self.state.lock().map_err(|_| RawFailure::WriterClosed)?;
             if state.frames.len() >= self.capacity {
                 return Err(RawFailure::WriterQueueFull);
             }
-            let idle = state.frames.is_empty() && state.at >= state.current.len();
+            let idle = state.frames.is_empty() && state.current.is_empty() && !state.inflight;
             state.frames.push_back(frame);
             idle
         };
-        // Only the idle -> busy transition needs a wake-up: otherwise the pipe
-        // is already polled for POLLOUT.
-        if was_empty {
-            let mut handle = &self.wake;
-            let _ = handle.write(&[1]);
+        // Only the idle -> busy transition needs a wake-up: otherwise the host
+        // is already writing this queue.
+        if idle {
+            (self.wake)();
         }
         Ok(())
     }
 
+    #[cfg(unix)]
     pub fn has_pending(&self) -> bool {
         match self.state.lock() {
-            Ok(state) => !state.frames.is_empty() || state.at < state.current.len(),
+            Ok(state) => !state.frames.is_empty() || !state.current.is_empty() || state.inflight,
             Err(_) => false,
         }
     }
 
-    /// Write what the pipe accepts. `Ok(())` means "poll again later"; an
-    /// error means the plugin's stdin is gone.
-    fn flush(&self, file: &mut File) -> io::Result<()> {
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(_) => return Err(io::Error::other("raw write queue poisoned")),
+    /// Take the next chunk to write. The caller owns it until `finish_write`
+    /// reports how much the host accepted.
+    pub(super) fn begin_write(&self) -> Option<Vec<u8>> {
+        let mut state = self.state.lock().ok()?;
+        if state.inflight {
+            return None;
+        }
+        if state.current.is_empty() {
+            state.current = state.frames.pop_front()?;
+        }
+        if state.current.is_empty() {
+            return None;
+        }
+        state.inflight = true;
+        Some(std::mem::take(&mut state.current))
+    }
+
+    /// Return the part of `sent` the host did not take.
+    pub(super) fn finish_write(&self, sent: Vec<u8>, written: usize) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
         };
+        state.inflight = false;
+        if written < sent.len() {
+            let mut rest = sent;
+            rest.drain(..written);
+            debug_assert!(
+                state.current.is_empty(),
+                "queue current changed while writing"
+            );
+            state.current = rest;
+        }
+    }
+
+    /// Unix readiness write: write what the pipe accepts. `Ok(())` means "poll
+    /// again later"; an error means the plugin's stdin is gone.
+    #[cfg(unix)]
+    fn flush(&self, file: &mut File) -> io::Result<()> {
         let mut written = 0usize;
-        loop {
-            if state.at >= state.current.len() {
-                match state.frames.pop_front() {
-                    Some(frame) => {
-                        state.current = frame;
-                        state.at = 0;
-                        continue;
-                    }
-                    None => return Ok(()),
+        while written < RAW_WRITE_BUDGET {
+            let Some(chunk) = self.begin_write() else {
+                return Ok(());
+            };
+            let len = chunk.len();
+            match file.write(&chunk) {
+                Ok(0) => {
+                    self.finish_write(chunk, 0);
+                    return Ok(());
                 }
-            }
-            let rest = &state.current[state.at..];
-            match file.write(rest) {
-                Ok(0) => return Ok(()),
                 Ok(count) => {
-                    state.at += count;
+                    self.finish_write(chunk, count);
                     written += count;
-                    if written >= RAW_WRITE_BUDGET {
+                    if count < len {
                         return Ok(());
                     }
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.finish_write(chunk, 0);
+                    return Ok(());
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    self.finish_write(chunk, 0);
+                    continue;
+                }
+                Err(error) => {
+                    self.finish_write(chunk, 0);
+                    return Err(error);
+                }
             }
         }
+        Ok(())
     }
 }
 
@@ -249,39 +306,32 @@ impl Reactor {
     /// Build the poll set and its handle. No thread is started: the caller's
     /// loop owns the polling, which is the supervisor loop in the daemon.
     pub fn start() -> io::Result<Arc<Self>> {
-        let (wake_rx, wake) = UnixStream::pair()?;
-        wake_rx.set_nonblocking(true)?;
-        wake.set_nonblocking(true)?;
         let (tx, rx) = mpsc::channel();
+        let (backend, interrupt) = Backend::start(rx)?;
         Ok(Arc::new(Reactor {
             tx,
-            wake,
-            poll_set: Mutex::new(PollSet {
-                rx,
-                wake: wake_rx,
-                sources: Vec::new(),
-            }),
+            interrupt,
+            backend: Mutex::new(backend),
         }))
     }
 
-    /// A writable clone of the self-pipe. A loop that owns this reactor attaches
-    /// it to its wake latch, so a management request interrupts the poll instead
-    /// of waiting for the timeout.
-    pub fn interrupt_handle(&self) -> io::Result<UnixStream> {
-        self.wake.try_clone()
+    /// The interrupt a loop that owns this reactor attaches to its wake latch,
+    /// so a management request ends the wait instead of waiting out the timeout.
+    pub fn interrupt_handle(&self) -> Interrupt {
+        self.interrupt.clone()
     }
 
-    /// Drive one poll pass on the caller's thread. Registration changes queued
+    /// Drive one wait pass on the caller's thread. Registration changes queued
     /// since the last pass are applied first; `timeout` bounds the wait, and
     /// `Duration::ZERO` turns the pass into a non-blocking drain for a caller
     /// that is already busy (a synchronous start/stop wait).
     pub fn poll_once(&self, timeout: Duration) {
-        let mut poll_set = match self.poll_set.lock() {
-            Ok(poll_set) => poll_set,
+        let mut backend = match self.backend.lock() {
+            Ok(backend) => backend,
             Err(poisoned) => poisoned.into_inner(),
         };
-        poll_set.apply_commands();
-        poll_set.poll(timeout);
+        backend.apply_commands();
+        backend.poll(timeout);
     }
 
     /// Register one notify plugin. A later registration with the same key
@@ -343,10 +393,11 @@ impl Reactor {
     /// Register a protocol-3 plugin's stdin/stdout/stderr with the poll set
     /// and return the queue the hub feeds frames into.
     ///
-    /// `stdin`/`stdout` are already non-blocking (see [`crate::wire::contract::stdio::poll_read`]).
-    /// The raw transport drains in bursts, so `WouldBlock` is its "empty"
-    /// signal; `enlarge_pipe` gives one poll pass room to hand a whole frame
-    /// to the plugin.
+    /// `stdin`/`stdout` are ready for the host backend: non-blocking on Unix,
+    /// overlapped named pipes on Windows (see
+    /// [`crate::wire::contract::stdio::poll_read`]). The raw transport drains in
+    /// bursts, so `WouldBlock` is its "empty" signal on Unix; `enlarge_pipe`
+    /// gives one poll pass room to hand a whole frame to the plugin.
     // Same shape as `register`, with the raw hub that owns the queue.
     #[allow(clippy::too_many_arguments)]
     pub fn register_raw(
@@ -362,7 +413,7 @@ impl Reactor {
         capacity: usize,
     ) -> io::Result<Arc<RawOutQueue>> {
         enlarge_pipe(&stdin);
-        let queue = RawOutQueue::new(capacity, self.wake.try_clone()?);
+        let queue = RawOutQueue::new(capacity, self.interrupt.clone());
         let mut sources = vec![
             Source::new(id.clone(), stdout, SourceKind::RawStdout { max_frame })
                 .with_log(log.clone())
@@ -391,26 +442,70 @@ impl Reactor {
         self.tx
             .send(command)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "reactor is not running"))?;
-        let mut handle = &self.wake;
-        let _ = handle.write(&[1]);
+        (self.interrupt)();
         Ok(())
     }
 }
 
-impl Drop for Reactor {
-    fn drop(&mut self) {
-        // The owning loop is going away; dropping the sources closes every
-        // plugin pipe this reactor held.
-        if let Ok(mut poll_set) = self.poll_set.lock() {
-            poll_set.sources.clear();
+/// One raw plugin being told why its transport closed: id, hub handle, reason.
+#[cfg(unix)]
+type ClosingEntry = (String, Option<(Weak<dyn RawStopSink>, u64)>, RawFailure);
+
+/// Drop every source marked dead and tell the raw hub which plugins lost their
+/// transport. The readiness backend drops sources in place; the completion
+/// backend reports a stop as soon as it cancels the slot.
+#[cfg(unix)]
+fn retire(sources: &mut Vec<Source>) {
+    if !sources.iter().any(|source| source.stop.is_some()) {
+        return;
+    }
+    let mut kept = Vec::with_capacity(sources.len());
+    let mut closing: Vec<ClosingEntry> = Vec::new();
+    let mut closed = HashSet::new();
+    for source in sources.drain(..) {
+        match source.stop {
+            None => kept.push(source),
+            Some(Stop::Single) => {}
+            Some(Stop::Plugin(reason)) => {
+                if closed.insert(source.key.clone()) {
+                    closing.push((source.key.clone(), source.hub.clone(), reason));
+                }
+            }
         }
+    }
+    kept.retain(|source| !closed.contains(&source.key));
+    *sources = kept;
+    for (key, hub, reason) in closing {
+        report_closing(&key, &hub, reason);
     }
 }
 
-#[cfg(test)]
+/// Tell the raw hub that one plugin's transport is gone.
+fn report_closing(key: &str, hub: &Option<(Weak<dyn RawStopSink>, u64)>, reason: RawFailure) {
+    let Some((hub, generation)) = hub else {
+        return;
+    };
+    let Some(hub) = hub.upgrade() else {
+        return;
+    };
+    hub.note_transport_failure(reason, key);
+    hub.unregister_generation(key, *generation);
+}
+
+/// The stop a source reports when it dies for `reason`.
+fn stop_for(source: &Source, reason: RawFailure) -> Stop {
+    match &source.kind {
+        SourceKind::RawStdin { .. } | SourceKind::RawStdout { .. } => Stop::Plugin(reason),
+        _ => Stop::Single,
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
+    use std::sync::mpsc::Receiver;
+
     use super::*;
-    use std::os::unix::io::{FromRawFd, IntoRawFd};
+    use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 
     /// Pipe ends as the reactor sees them: plain files it owns.
     fn to_file<T: IntoRawFd>(source: T) -> File {
@@ -445,10 +540,8 @@ mod tests {
         (read, write)
     }
 
-    fn wake_pair() -> UnixStream {
-        let (read, write) = UnixStream::pair().expect("wake pair");
-        drop(read);
-        write
+    fn no_wake() -> Interrupt {
+        Arc::new(|| {})
     }
 
     /// Alternate flushes and reads until the queue is empty, returning every
@@ -476,7 +569,7 @@ mod tests {
 
     #[test]
     fn raw_queue_bounds_the_frames_queued_for_one_plugin() {
-        let queue = RawOutQueue::new(2, wake_pair());
+        let queue = RawOutQueue::new(2, no_wake());
         assert!(!queue.has_pending());
         queue.push(vec![1]).expect("first frame");
         queue.push(vec![2]).expect("second frame");
@@ -487,7 +580,7 @@ mod tests {
     #[test]
     fn raw_queue_keeps_a_partial_write_for_the_next_poll() {
         let (mut read, mut write) = nonblocking_pipe();
-        let queue = RawOutQueue::new(1, wake_pair());
+        let queue = RawOutQueue::new(1, no_wake());
         // Bigger than any default pipe buffer, so one flush cannot finish it.
         let frame = vec![7u8; 256 * 1024];
         queue.push(frame.clone()).expect("push");
@@ -575,7 +668,7 @@ mod tests {
 
         let reactor = Reactor::start().expect("reactor");
         let wake = Wake::new();
-        wake.set_interrupt(reactor.interrupt_handle().expect("interrupt"));
+        wake.set_interrupt(reactor.interrupt_handle());
         wake.notify();
 
         let started = Instant::now();
@@ -635,7 +728,7 @@ mod tests {
     #[test]
     fn raw_queue_preserves_frame_order_across_passes() {
         let (mut read, mut write) = nonblocking_pipe();
-        let queue = RawOutQueue::new(4, wake_pair());
+        let queue = RawOutQueue::new(4, no_wake());
         queue.push(vec![1, 2, 3]).expect("first frame");
         queue.push(vec![4, 5, 6]).expect("second frame");
         let delivered = pump(&queue, &mut read, &mut write);

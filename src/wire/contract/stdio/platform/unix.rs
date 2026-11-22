@@ -42,6 +42,16 @@ pub(crate) fn pipe() -> io::Result<(File, File)> {
     Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
 }
 
+/// A pipe whose parent end is the read side: `(parent_read, child_write)`.
+pub(crate) fn parent_read_pipe() -> io::Result<(File, File)> {
+    pipe()
+}
+
+/// A pipe whose parent end is the write side: `(child_read, parent_write)`.
+pub(crate) fn parent_write_pipe() -> io::Result<(File, File)> {
+    pipe()
+}
+
 /// Put `file` in non-blocking mode. The poll set calls this on the ends whose
 /// reads/writes it drives itself.
 pub(crate) fn nonblocking(file: &File) -> io::Result<()> {

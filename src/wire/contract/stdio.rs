@@ -5,18 +5,20 @@
 //! plugin log, a hook's output — and this module owns two things instead:
 //!
 //! - **Which pipes exist.** [`Plan`] answers that from `Ready` and the
-//!   protocol; [`arm`] creates the anonymous pipes and puts their child ends on
+//!   protocol; [`arm`] creates the pipe pairs and puts their child ends on
 //!   the `Command` before the spawn. The parent ends come back as
 //!   [`ReadEnd`] / [`WriteEnd`], and every stream a plan does not pipe is
 //!   `/dev/null`, never an inherited daemon handle.
-//! - **Who reads them.** [`Target`] is either the supervisor's poll set (Unix,
-//!   no thread per pipe) or one reader thread per pipe (Windows, and Unix when
-//!   the poll set could not start). Callers never choose by `cfg`.
+//! - **Who reads them.** [`Target`] is either the supervisor's reactor (both
+//!   hosts: Unix `poll(2)`, Windows overlapped named pipes + IOCP) or one
+//!   reader thread per pipe when the reactor could not start. Callers never
+//!   choose by `cfg`.
 //!
-//! The host half is `stdio/platform/{unix,windows}.rs`: Unix creates the pipe
-//! with `O_CLOEXEC` and can put an end in non-blocking mode for the poll set;
-//! Windows uses `CreatePipe` and lets `Command::spawn` mark exactly the child's
-//! end inheritable (see that file for why the parent ends must not be).
+//! The host half is `stdio/platform/{unix,windows}.rs`: Unix creates an
+//! anonymous pipe with `O_CLOEXEC` and can put an end in non-blocking mode;
+//! Windows creates an overlapped named-pipe pair for the parent end and lets
+//! `Command::spawn` mark exactly the child's end inheritable (see that file for
+//! why the parent ends must not be).
 //!
 //! Non-blocking is for the poll set's raw transport only: it drains in bursts
 //! and needs `WouldBlock` as "empty". The frame/log reader takes one read per
@@ -128,8 +130,7 @@ impl Write for WriteEnd {
 }
 
 impl ReadEnd {
-    /// The poll set owns its handles as plain files.
-    #[cfg(unix)]
+    /// The reactor owns its handles as plain files.
     pub(crate) fn into_file(self) -> File {
         self.0
     }
@@ -160,21 +161,21 @@ fn arm(plan: Plan, command: &mut Command) -> io::Result<Streams> {
     let (stdin_child, stdin_parent) = match plan.stdin {
         Open::Null => (None, None),
         Open::Pipe => {
-            let (read, write) = platform::pipe()?;
+            let (read, write) = platform::parent_write_pipe()?;
             (Some(read), Some(WriteEnd(write)))
         }
     };
     let (stdout_child, stdout_parent) = match plan.stdout {
         Open::Null => (None, None),
         Open::Pipe => {
-            let (read, write) = platform::pipe()?;
+            let (read, write) = platform::parent_read_pipe()?;
             (Some(write), Some(ReadEnd(read)))
         }
     };
     let (stderr_child, stderr_parent) = match plan.stderr {
         Open::Null => (None, None),
         Open::Pipe => {
-            let (read, write) = platform::pipe()?;
+            let (read, write) = platform::parent_read_pipe()?;
             (Some(write), Some(ReadEnd(read)))
         }
     };
@@ -190,16 +191,30 @@ fn arm(plan: Plan, command: &mut Command) -> io::Result<Streams> {
     })
 }
 
-/// Hand a read end to a poll set: non-blocking where the host has `O_NONBLOCK`.
-#[cfg(unix)]
+/// A connected pair for tests that need the reactor without a child process.
+#[cfg(all(test, windows))]
+pub(crate) fn test_pipe() -> io::Result<(ReadEnd, WriteEnd)> {
+    let (read, write) = platform::parent_read_pipe()?;
+    Ok((ReadEnd(read), WriteEnd(write)))
+}
+
+/// The write-oriented pair for tests: (child_read, parent_write).
+#[cfg(all(test, windows))]
+pub(crate) fn test_write_pipe() -> io::Result<(File, File)> {
+    platform::parent_write_pipe()
+}
+
+/// Hand a read end to the reactor. Unix needs `O_NONBLOCK`; Windows named
+/// pipes are overlapped and need no mode change.
 pub(crate) fn poll_read(end: ReadEnd) -> io::Result<File> {
+    #[cfg(unix)]
     platform::nonblocking(&end.0)?;
     Ok(end.0)
 }
 
-/// Hand a write end to a poll set, same contract as [`poll_read`].
-#[cfg(unix)]
+/// Hand a write end to the reactor, same contract as [`poll_read`].
 pub(crate) fn poll_write(end: WriteEnd) -> io::Result<File> {
+    #[cfg(unix)]
     platform::nonblocking(&end.0)?;
     Ok(end.0)
 }
@@ -299,19 +314,17 @@ fn log_line(log: &Option<Arc<Mutex<LogWriter>>>, line: &str) {
 /// one so a slot created after the reactor started inherits the same target.
 #[derive(Clone, Default)]
 pub(crate) struct Target {
-    #[cfg(unix)]
     reactor: Option<Arc<crate::wire::contract::reactor::Reactor>>,
 }
 
 impl Target {
-    /// One reader thread per pipe: Windows always, and Unix when the poll set
-    /// failed to start.
+    /// One reader thread per pipe: only when no reactor was installed (it
+    /// failed to start, or this build has none).
     pub(crate) fn threaded() -> Self {
         Self::default()
     }
 
-    /// The supervisor loop's poll set: no per-plugin threads.
-    #[cfg(unix)]
+    /// The supervisor loop's wait set: no per-plugin threads.
     pub(crate) fn polled(reactor: Arc<crate::wire::contract::reactor::Reactor>) -> Self {
         Self {
             reactor: Some(reactor),
@@ -332,7 +345,6 @@ impl Target {
         log: Option<Arc<Mutex<LogWriter>>>,
         limits: &crate::platform::limits::Limits,
     ) -> io::Result<()> {
-        #[cfg(unix)]
         if let Some(reactor) = &self.reactor {
             let framing = if protocol >= 2 {
                 crate::wire::contract::reactor::Framing::Length
@@ -384,7 +396,6 @@ impl Target {
         log: Option<Arc<Mutex<LogWriter>>>,
         limits: &crate::platform::limits::Limits,
     ) -> io::Result<()> {
-        #[cfg(unix)]
         if let Some(reactor) = &self.reactor {
             return reactor.register_log(
                 id,
@@ -403,19 +414,15 @@ impl Target {
     /// Drop every source of `id` from the poll set (a no-op for reader
     /// threads, which end on their own when the pipes close).
     pub(crate) fn unregister(&self, id: &str) {
-        #[cfg(unix)]
         if let Some(reactor) = &self.reactor {
             reactor.unregister(id);
         }
-        #[cfg(not(unix))]
-        let _ = id;
     }
 
     /// One non-blocking pass. The supervisor loop calls this while it is busy
     /// in a synchronous wait (an install hook) so plugin pipes keep moving;
     /// reader threads need no equivalent.
     pub(crate) fn pump(&self) {
-        #[cfg(unix)]
         if let Some(reactor) = &self.reactor {
             reactor.poll_once(std::time::Duration::ZERO);
         }

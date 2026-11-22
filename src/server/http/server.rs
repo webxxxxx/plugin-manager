@@ -1,4 +1,4 @@
-//! The Unix server loop state machine.
+//! The server loop state machine (Unix and Windows).
 //!
 //! The loop in `server::http::engine` owns the listener, the sockets and the
 //! request buffers. This module owns the connection state, the face dispatch,
@@ -9,22 +9,23 @@ mod conns;
 mod poll;
 
 use std::collections::{HashMap, HashSet};
-use std::io::{ErrorKind, Read, Write};
-use std::net::{IpAddr, Shutdown, TcpListener};
-use std::os::unix::io::{AsRawFd, RawFd};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::{ErrorKind, Read};
+use std::net::{IpAddr, Shutdown, TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::json;
-
+#[cfg(unix)]
 use crate::platform::host::wake::Wake;
+use crate::platform::host::wake_pipe::{self, Reader as WakeReader, Writer as WakeWriter};
 use crate::server::auth::lan::Lan;
+#[cfg(unix)]
 use crate::server::control::client::StreamingClient;
-use crate::server::control::handle::LoopHandle;
+#[cfg(unix)]
 use crate::server::control::listener::{ControlServer, Source};
 use crate::server::http::budget::{StreamBudget, StreamPermit};
 use crate::server::http::driver::{StreamAdmission, StreamDriver};
@@ -39,9 +40,12 @@ use crate::server::http::{
     CompletionSlot, Dispatch, Exchange, Face, JobBudget, JobOutcome, PreparedFace, StreamClass,
     StreamHandler,
 };
+#[cfg(unix)]
 use crate::server::mcp::progress::McpSseStream;
+#[cfg(unix)]
 use crate::wire::control::channel::PendingCall;
 
+use crate::server::handle::LoopHandle;
 use crate::server::http::hooks::{FallbackHandler, PreBodyRoutes};
 
 enum WorkResult {
@@ -69,15 +73,28 @@ struct PendingBlocking {
     keep_alive: bool,
 }
 
+/// The control channel's server half, as far as this loop is concerned.
+///
+/// Unix hands the bound listeners to the loop so one wait set covers HTTP and
+/// control. Windows already runs the named-pipe accept thread from
+/// `bind_server`, so the value only crosses the seam and is dropped here.
+#[cfg(unix)]
+pub(crate) struct ControlWiring {
+    pub(crate) user: UnixListener,
+    pub(crate) admin: UnixListener,
+    pub(crate) pending: mpsc::SyncSender<PendingCall>,
+    pub(crate) wake: Arc<Wake>,
+}
+
+#[cfg(not(unix))]
+pub(crate) struct ControlWiring;
+
 // The composition root supplies every one of these exactly once; grouping them
 // would only move the list into a struct with the same fields.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start(
     http: Option<TcpListener>,
-    control_user: UnixListener,
-    control_admin: UnixListener,
-    pending: mpsc::SyncSender<PendingCall>,
-    wake: Arc<Wake>,
+    control: ControlWiring,
     lan: Arc<Mutex<Lan>>,
     config: Arc<crate::platform::config::Config>,
     raw_hub: Arc<crate::wire::contract::rawhub::RawHub>,
@@ -88,11 +105,12 @@ pub(crate) fn start(
     install_bus_wake: Option<crate::server::http::conn::BusWakeInstall>,
     governor: Option<Arc<crate::server::http::governor::CpuGovernor>>,
 ) -> std::io::Result<LoopHandle> {
+    // Windows' control accept thread already owns the binding; the marker is
+    // only here so both hosts take the same `StartInput`.
+    #[cfg(not(unix))]
+    let _ = control;
     let (results_tx, results_rx) = mpsc::channel();
-    let (notify_rx, notify_tx) = UnixStream::pair()?;
-    let _ = notify_rx.set_nonblocking(true);
-    let _ = notify_tx.set_nonblocking(true);
-    let notify_tx = Arc::new(notify_tx);
+    let (notify_rx, notify_tx) = wake_pipe::pair()?;
     let loop_handle = LoopHandle::new(notify_tx.clone());
     let stop = loop_handle.stop_flag();
     // A published UI event writes one byte here, so the loop services the SSE
@@ -105,14 +123,15 @@ pub(crate) fn start(
         let bus_wake = bus_wake.clone();
         install(Arc::new(move || {
             bus_wake.store(true, Ordering::SeqCst);
-            let _ = (&*notify).write(&[1]);
+            notify.notify();
         }));
     }
+    #[cfg(unix)]
     let control = ControlServer::new(
-        control_user,
-        control_admin,
-        pending,
-        wake,
+        control.user,
+        control.admin,
+        control.pending,
+        control.wake,
         notify_tx.clone(),
     )?;
 
@@ -121,14 +140,14 @@ pub(crate) fn start(
     // of silently disabling every route after start().
     let blocking = {
         let results = results_tx.clone();
-        let notify = notify_tx.try_clone()?;
+        let notify = notify_tx.clone();
         BlockingPool::start(
             config.limits.blocking_threads,
             config.limits.blocking_queue,
             crate::platform::host::threads::transfer_stack(&config.limits),
             move |key, outcome| {
                 let _ = results.send(WorkResult::BlockingDone { key, outcome });
-                let _ = (&notify).write(&[1]);
+                notify.notify();
             },
         )?
     };
@@ -142,13 +161,17 @@ pub(crate) fn start(
                 lan,
                 config,
                 raw_hub,
+                #[cfg(unix)]
                 control,
+                #[cfg(unix)]
                 client: StreamingClient::new(),
+                #[cfg(unix)]
                 extra_keys: Vec::new(),
                 stop,
                 results: results_rx,
                 results_tx: results_tx.clone(),
                 notify: notify_rx,
+                notify_tx,
                 bus_wake,
                 governor,
                 face,
@@ -185,6 +208,7 @@ enum ConnState {
 type Connection = EngineConnection<ConnState>;
 
 /// One extra poll source in the order the engine dispatched it.
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 enum ExtraSource {
     Control(Source),
@@ -195,15 +219,21 @@ struct Server {
     lan: Arc<Mutex<Lan>>,
     config: Arc<crate::platform::config::Config>,
     raw_hub: Arc<crate::wire::contract::rawhub::RawHub>,
+    #[cfg(unix)]
     control: ControlServer,
+    #[cfg(unix)]
     client: StreamingClient,
+    #[cfg(unix)]
     extra_keys: Vec<ExtraSource>,
     stop: Arc<AtomicBool>,
     results: Receiver<WorkResult>,
     /// A sender kept for stream-handler blocking jobs; their result is
     /// delivered to the handler, not to a completion slot.
     results_tx: Sender<WorkResult>,
-    notify: UnixStream,
+    notify: WakeReader,
+    /// The write side of the wake pipe, kept for blocking jobs that finish on a
+    /// pool thread and must end the loop's wait.
+    notify_tx: Arc<WakeWriter>,
     /// Set by the UI bus wake-up. The loop then re-checks every stream
     /// handler as if it were writable, instead of waiting for the handler's
     /// own poll deadline (which would hold a published event for one cadence).
@@ -390,7 +420,7 @@ fn submit_rendered_job(
     fallback: FallbackHandler,
     lan: Arc<Mutex<Lan>>,
     results: Sender<WorkResult>,
-    notify: Option<UnixStream>,
+    notify: Option<Arc<WakeWriter>>,
     request: HttpRequest,
     keep_alive: bool,
 ) -> Result<(), Busy> {
@@ -410,7 +440,7 @@ fn submit_rendered_job(
             keep_alive,
         });
         if let Some(notify) = &notify {
-            let _ = (&*notify).write(&[1]);
+            notify.notify();
         }
     })
 }
@@ -419,29 +449,22 @@ fn submit_rendered_job(
 /// socket (that data is the next pipelined request). Called only for a
 /// `Processing` connection; the normal read path detects EOF itself.
 fn peer_closed(connection: &Connection) -> bool {
-    socket_closed(connection.stream.as_raw_fd())
+    socket_closed(&connection.stream)
 }
 
-fn socket_closed(fd: RawFd) -> bool {
-    let mut byte = 0u8;
-    // SAFETY: The fd comes from a live connection/listener owned by the loop; the pollfd array is local to the call.
-    let read = unsafe {
-        libc::recv(
-            fd,
-            &mut byte as *mut u8 as *mut libc::c_void,
-            1,
-            libc::MSG_PEEK,
-        )
-    };
-    if read == 0 {
-        return true;
+/// Whether the peer sent FIN, without consuming data already buffered in the
+/// socket (that data is the next pipelined request). `peek` is non-blocking on
+/// this socket; a `WouldBlock` means the peer is still there.
+fn socket_closed(stream: &TcpStream) -> bool {
+    let mut byte = [0u8; 1];
+    match stream.peek(&mut byte) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(error) => {
+            error.kind() != std::io::ErrorKind::WouldBlock
+                && error.kind() != std::io::ErrorKind::Interrupted
+        }
     }
-    if read < 0 {
-        let error = std::io::Error::last_os_error();
-        return error.kind() != std::io::ErrorKind::WouldBlock
-            && error.kind() != std::io::ErrorKind::Interrupted;
-    }
-    false
 }
 
 #[cfg(test)]
@@ -465,7 +488,7 @@ mod tests {
 
         let bind: std::net::SocketAddr = "127.0.0.1:0".parse().expect("bind");
         let lan = Arc::new(Mutex::new(Lan::new(bind, bind, false, None)));
-        let (notify, _peer) = UnixStream::pair().expect("pair");
+        let (_notify_rx, notify) = wake_pipe::pair().expect("pair");
         let fallback: FallbackHandler =
             Arc::new(|_, _| http::json_error(500, "internal", "unused"));
         let request = HttpRequest {
@@ -493,25 +516,37 @@ mod tests {
 
     #[test]
     fn a_graceful_peer_close_is_detected_without_consuming_bytes() {
-        let (mut reader, mut writer) = UnixStream::pair().expect("pair");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let mut writer =
+            TcpStream::connect(listener.local_addr().expect("address")).expect("client");
+        let (mut reader, _peer) = listener.accept().expect("accept");
         reader.set_nonblocking(true).expect("nonblocking");
-        assert!(!socket_closed(reader.as_raw_fd()));
+        assert!(!socket_closed(&reader));
 
         writer.write_all(b"next").expect("write");
-        assert!(
-            !socket_closed(reader.as_raw_fd()),
-            "pending data is not a close"
-        );
+        // Wait for the bytes to arrive; a non-blocking peek reports WouldBlock
+        // until the stack has them.
+        let deadline = Instant::now() + Duration::from_secs(2);
         let mut buffered = [0u8; 4];
-        assert_eq!(reader.read(&mut buffered).expect("read"), 4);
-        assert_eq!(&buffered, b"next", "MSG_PEEK must not consume the bytes");
+        loop {
+            match reader.read(&mut buffered) {
+                Ok(4) => break,
+                Ok(read) => panic!("short read: {read}"),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "data never arrived");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("read failed: {error}"),
+            }
+        }
+        assert_eq!(&buffered, b"next", "peek must not consume the bytes");
 
         drop(writer);
-        reader.set_nonblocking(false).expect("blocking");
-        let mut eof = [0u8; 1];
-        assert_eq!(reader.read(&mut eof).expect("eof"), 0);
-        reader.set_nonblocking(true).expect("nonblocking");
-        assert!(socket_closed(reader.as_raw_fd()));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !socket_closed(&reader) {
+            assert!(Instant::now() < deadline, "FIN was never observed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
@@ -530,6 +565,7 @@ mod tests {
             keep_alive: false,
             head_only: true,
             pending: None,
+            handed_off: false,
             state: ConnState::Reading,
         };
         let full = blocking_busy(Busy::QueueFull);

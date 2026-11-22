@@ -7,12 +7,10 @@ use super::*;
 /// document, so the assertions do not depend on the machine running the suite;
 /// the workload shape is derived, not stated.
 ///
-/// The configuration is over budget on both thread models: Unix charges one
-/// stack per loop/blocking thread, so the invariant pays with the resident
-/// single-request body; Windows keeps one thread per admitted connection, so
-/// the pinned 4096 connections are too many threads and it pays with
-/// concurrency instead. Either way the report has exactly two overrides: the
-/// body's upper bound and one invariant shrink.
+/// The configuration is over budget: the invariant charges a stack per loop and
+/// blocking thread, never per connection, so the pinned 4096 connections are a
+/// memory cost and the report has exactly two overrides: the body's upper bound
+/// and one invariant shrink.
 #[test]
 fn the_daemon_reports_the_memory_budget_it_derived() {
     let mut sandbox = Sandbox::new();
@@ -74,8 +72,7 @@ fn the_daemon_reports_the_memory_budget_it_derived() {
                 && line.ends_with("above-upper-bound")),
         "{summary:?}"
     );
-    // The second override is the invariant's: the body where threads are fixed
-    // (Unix), the connection count where a connection owns a thread (Windows).
+    // The second override is the invariant's: it pays with the connection count.
     let mut invariant = summary
         .iter()
         .filter(|line| line.ends_with("invariant-shrink"));

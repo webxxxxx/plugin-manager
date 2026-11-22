@@ -194,11 +194,10 @@ bind = 127.0.0.1:8787
 # (control-channel round trips and disk work). It starts a fixed number of
 # worker threads and never spawns a temporary one. A full queue or a second job
 # on one connection answers 503 busy with Retry-After.
-# `blocking_threads` defaults to 2 and is clamped to 2..8. The default Unix
-# topology is four daemon threads: the supervisor loop (which also polls plugin
-# stdio), the server loop and these two workers. Raising the value is an
-# operator choice, not a regression. The pool is Unix-only in this slice;
-# Windows keeps the per-connection fallback. Requires a daemon restart.
+# `blocking_threads` defaults to 2 and is clamped to 2..8. The default
+# topology is four daemon threads on both hosts: the supervisor loop (which
+# also polls plugin stdio), the server loop and these two workers. Raising the
+# value is an operator choice, not a regression. Requires a daemon restart.
 #
 # control_timeout_secs bounds one management route's control-channel round
 # trip. A supervisor that does not answer within it releases the blocking
@@ -206,9 +205,9 @@ bind = 127.0.0.1:8787
 # blocking-queue-full signal. Defaults to 30 and is clamped to 1..300.
 # Requires a daemon restart.
 #
-# On Windows the HTTP listener keeps one thread per admitted connection, so
-# max_connections is also the connection-thread cap and the invariant charges a
-# stack for every one of them.
+# A connection is a wait-set entry, not a thread, on both hosts: the invariant
+# charges a stack for the loops and the blocking workers, never for one
+# connection, so max_connections costs memory but not threads.
 #
 # max_streams caps long-lived and transfer streams: SSE, WebSocket, raw
 # WebSocket, MCP SSE, blob/file upload and download, export, import and install.
@@ -229,10 +228,11 @@ bind = 127.0.0.1:8787
 #   ws_inflight_bytes       unacknowledged raw bytes across all plugins
 #   ws_inflight_requests    unacknowledged raw frames across all plugins
 #   ws_raw_queue            frames queued for one plugin's stdin
-# On Unix the supervisor loop polls the raw pipes, so a raw plugin adds no
-# threads; a slow plugin fills its queue instead of blocking a thread. Raise
-# the in-flight limits when the workload legitimately has many large frames in
-# flight. On Windows the route answers 501 not_supported.
+# The supervisor loop polls the raw pipes on both hosts (Unix poll(2), Windows
+# IOCP), so a raw plugin adds no threads; a slow plugin fills its queue instead
+# of blocking a thread. Raise the in-flight limits when the workload
+# legitimately has many large frames in flight. A plugin that did not declare
+# protocol 3 answers 503 raw_unavailable.
 #
 # `pending_queue` bounds the management requests queued between the server loop
 # and the supervisor loop; `progress_queue` bounds the progress events queued

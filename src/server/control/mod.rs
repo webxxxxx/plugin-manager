@@ -11,11 +11,11 @@
 
 #[cfg_attr(not(feature = "http"), allow(dead_code))]
 pub mod client;
-pub mod handle;
 pub mod listener;
 
-use std::os::unix::io::RawFd;
-use std::os::unix::net::UnixStream;
+use crate::platform::host::poll;
+use crate::platform::host::wake_pipe::{self, Reader as WakeReader};
+use crate::server::handle::LoopHandle;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::thread;
@@ -25,7 +25,6 @@ use crate::server::http::engine::{
     TimerOps,
 };
 
-use self::handle::LoopHandle;
 use self::listener::{ControlServer, Source};
 
 /// Start the server loop for the minimal (no HTTP) build: control channel only.
@@ -35,10 +34,7 @@ pub fn spawn_control_only(
     limits: std::sync::Arc<crate::platform::limits::Limits>,
 ) -> std::io::Result<LoopHandle> {
     let (user, admin, tx, wake) = control.into_parts();
-    let (notify_rx, notify_tx) = UnixStream::pair()?;
-    notify_rx.set_nonblocking(true)?;
-    notify_tx.set_nonblocking(true)?;
-    let notify_tx = Arc::new(notify_tx);
+    let (notify_rx, notify_tx) = wake_pipe::pair()?;
     let handle = LoopHandle::new(notify_tx.clone());
     let stop = handle.stop_flag();
     let control = ControlServer::new(user, admin, tx, wake, notify_tx)?;
@@ -62,7 +58,7 @@ pub fn spawn_control_only(
 struct ControlOnly {
     control: ControlServer,
     stop: Arc<AtomicBool>,
-    notify_rx: UnixStream,
+    notify_rx: WakeReader,
     keys: Vec<Source>,
 }
 
@@ -111,18 +107,17 @@ impl ConnectionOps for ControlOnly {
 impl TimerOps for ControlOnly {
     type State = ();
     fn on_tick(&mut self, _connections: &mut Table<()>) {
-        let mut drain = [0u8; 64];
-        while std::io::Read::read(&mut self.notify_rx, &mut drain).is_ok() {}
+        self.notify_rx.drain();
         self.control.drain_replies();
         self.control.flush();
     }
 }
 
 impl ExtraOps for ControlOnly {
-    fn wake_fd(&self) -> Option<RawFd> {
-        Some(std::os::unix::io::AsRawFd::as_raw_fd(&self.notify_rx))
+    fn wake_key(&self) -> Option<poll::Key> {
+        Some(self.notify_rx.key())
     }
-    fn prepare_extra(&mut self, out: &mut Vec<(RawFd, i16)>) {
+    fn prepare_extra(&mut self, out: &mut Vec<crate::platform::host::poll::PollFd>) {
         self.keys.clear();
         self.control.poll_sources(out, &mut self.keys);
     }
@@ -150,6 +145,7 @@ mod tests {
     use crate::wire::control::channel::PendingCall;
     use crate::wire::message::rpc;
     use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
     use std::sync::mpsc;
     use std::time::Duration;
 

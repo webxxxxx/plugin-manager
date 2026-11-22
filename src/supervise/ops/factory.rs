@@ -52,7 +52,6 @@ impl SlotFactory {
         self.wake = wake;
     }
 
-    #[cfg(unix)]
     pub(crate) fn set_stdio(&mut self, stdio: Target) {
         self.stdio = stdio;
     }

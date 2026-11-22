@@ -224,12 +224,16 @@ _Avoid_: 编码、格式化
 服务器把「已解析的请求 + 恰好一次完成槽」交给对外面，自己保留连接、缓冲、deadline 与背压；对外面用内存响应或 sans-IO stream handler 作答，不接触 socket。见 [ADR-0016](docs/adr/0016-s4-request-handover.md)。
 _Avoid_: 接管、takeover、handler 调用
 
+**服务器循环（Server loop）**:
+拥有 HTTP listener、所有连接、pending 表、blocking 完成与 stream driver 的那个单线程循环（`server/http/engine.rs` + `server.rs`）。Unix 用 `poll(2)`、Windows 用 `WSAPoll`（ADR-0027）；连接是 wait set 条目而不是线程，唤醒走 `platform::host::wake_pipe`。控制通道在 Unix 并进同一个 wait set，在 Windows 留在自己的命名管道线程；MCP SSE 在 Windows 交接给一条受 `max_streams` 约束的线程。
+_Avoid_: 用 reactor 指这个循环（reactor 专指插件 stdio 反应器）、HTTP 线程池
+
 **插件 stdio 反应器（Plugin stdio reactor）**:
-Unix 上拥有插件管道的那个 poll 集：通知型插件的 stdout/stderr、exec 型插件的日志、协议 3 插件的 stdin/stdout/stderr 都由它读写，所以每个插件不再自带线程。它没有自己的线程——supervisor loop 在自己的循环里驱动它（`Reactor::poll_once`），注册与唤醒走命令通道加 self-pipe。超时/背压由每条管道自己的队列决定，不是线程阻塞。反应器不存在（或非 Unix 构建）时才退回「每插件读写线程」的降级路径。
+拥有插件管道的那个 wait 集：通知型插件的 stdout/stderr、exec 型插件的日志、协议 3 插件的 stdin/stdout/stderr 都由它读写，所以每个插件不自带线程。Unix 用 `poll(2)`，Windows 用 IOCP + overlapped 命名管道（ADR-0028）。它没有自己的线程——supervisor loop 在自己的循环里驱动它（`Reactor::poll_once`），注册与唤醒走命令通道加中断（Unix self-pipe、Windows 完成包）。超时/背压由每条管道自己的队列决定，不是线程阻塞。反应器启动失败时才退回「每插件读写线程」的降级路径。
 _Avoid_: IO 线程池、epoll 管理器、反应器线程
 
 **raw 传输（Raw transport）**:
-协议 3 插件与 UI 之间的二进制通道：插件 stdin/stdout 上是 `u32 长度 + u32 stream_id + payload` 帧，UI 侧是 `/plugin-ui/{id}/{token}/raw` 上的 binary WebSocket。daemon 只做 stream 映射、全局在途预算与失败分类，不解析 payload。非 Unix 构建没有这条 WebSocket 桥（匿名子管道不可 poll），`/raw` 明确回 `501 not_supported`；协议 3 插件本身仍能启动，只是没人能订阅。
+协议 3 插件与 UI 之间的二进制通道：插件 stdin/stdout 上是 `u32 长度 + u32 stream_id + payload` 帧，UI 侧是 `/plugin-ui/{id}/{token}/raw` 上的 binary WebSocket。daemon 只做 stream 映射、全局在途预算与失败分类，不解析 payload。两端都提供这条 WebSocket 桥，插件管道由插件 stdio 反应器驱动（Unix `poll(2)`、Windows IOCP，ADR-0028）。插件没声明协议 3 时 `/raw` 回 `503 raw_unavailable`；协议 3 插件本身仍能启动，只是没人能订阅。
 _Avoid_: 二进制插件、直通 WebSocket
 
 **重启策略（restart）**:

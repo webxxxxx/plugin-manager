@@ -234,11 +234,10 @@ pub fn generated(settings: &Settings) -> String {
          # blocking_queue = min(max_connections, 256); a queued job belongs\n\
          # to an admitted connection, so a larger queue can never fill.\n\
          # runs face handlers that cannot run on the server loop; a full\n\
-         # queue answers 503 busy. Unix only in this slice; Windows keeps\n\
-         # the per-connection fallback. The default Unix topology is four\n\
-         # daemon threads: the supervisor loop (which also polls plugin\n\
-         # stdio), the server loop and these two workers. Raising the value\n\
-         # is an operator choice.\n\
+         # queue answers 503 busy. The default topology is four daemon\n\
+         # threads on both hosts: the supervisor loop (which also polls\n\
+         # plugin stdio), the server loop and these two workers. Raising the\n\
+         # value is an operator choice.\n\
          # max_body_bytes = 8388608 / 67108864 / 536870912\n\
          # max_json_body_bytes = 65536 / 262144 / 1048576\n\
          # max_complete_body_bytes = 65536 / 1048576 / 2097152\n\

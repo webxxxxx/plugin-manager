@@ -794,12 +794,13 @@ fn the_worst_case_is_what_the_report_says_it_is() {
 }
 
 #[test]
-fn the_thread_term_follows_the_hosts_topology() {
+fn the_thread_term_counts_the_loops_not_the_connections() {
+    // Both hosts run the poll loop: a connection is a wait-set entry, so the
+    // thread term must not grow with `max_connections`.
     let limits = at_reference(Workload::Interactive).limits;
 
-    if cfg!(windows) {
-        assert_eq!(limits.threads(), limits.max_connections);
-    } else {
-        assert_eq!(limits.threads(), LOOP_THREADS + limits.blocking_threads);
-    }
+    assert_eq!(limits.threads(), LOOP_THREADS + limits.blocking_threads);
+    let mut more = limits.clone();
+    more.max_connections += 64;
+    assert_eq!(more.threads(), limits.threads());
 }

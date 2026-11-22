@@ -441,12 +441,9 @@ impl RawFailure {
 /// `RawHub` implements it; the poll set only knows this interface, which is
 /// why `reactor` never names the hub type (no reactor ↔ hub cycle, #138).
 pub trait RawStopSink: Send + Sync {
-    #[cfg_attr(not(unix), allow(dead_code))] // driven by the Unix reactor only
     fn note_transport_failure(&self, failure: RawFailure, plugin: &str);
-    #[cfg_attr(not(unix), allow(dead_code))] // driven by the Unix reactor only
     fn unregister_generation(&self, id: &str, generation: u64);
     /// Hand one complete frame read from the plugin's stdout to the hub.
-    #[cfg_attr(not(unix), allow(dead_code))] // driven by the Unix reactor only
     fn deliver(&self, id: &str, stream: u32, payload: Vec<u8>);
 }
 

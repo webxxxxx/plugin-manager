@@ -1,8 +1,8 @@
 //! Hooks the composition root injects into a connection driver.
 //!
-//! They live here rather than in `server.rs` (#139) because the types have to
-//! exist on every host: the thread driver is built by the composition root on
-//! hosts that have no poll loop, and it uses the same hooks.
+//! They live here rather than in `server.rs` (#139) because the composition
+//! root builds them before any loop exists, and the unix control channel uses
+//! the same hooks.
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -18,16 +18,10 @@ use crate::server::http::{BodyPolicy, Exchange};
 pub(crate) type FallbackHandler =
     Arc<dyn Fn(&HttpRequest, &Arc<Mutex<Lan>>) -> Vec<u8> + Send + Sync>;
 
-/// One pre-body claim: the face's answer plus how the driver must carry it.
-///
-/// The three pre-body routes do not share a stream policy: the plugin UI keeps
-/// the connection's idle timeout, while package and blob uploads switch to the
-/// transfer timeout. Keeping that bit with the claim is what lets both drivers
-/// call one ordered hook without learning which face answered.
+/// One pre-body claim: the face's answer, so the loop can run it without
+/// learning which face answered.
 pub(crate) struct PreBodyClaim {
     pub(crate) exchange: Result<Exchange, Vec<u8>>,
-    /// True for the upload paths that need the transfer timeout.
-    pub(crate) transfer: bool,
 }
 
 /// The pre-body stream hooks. Composition owns the concrete faces; the server

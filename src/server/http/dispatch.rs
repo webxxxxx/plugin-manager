@@ -2,6 +2,7 @@
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
 use std::time::Instant;
 
 use crate::server::auth::admission::{Admission, Rejected};
@@ -148,11 +149,11 @@ pub fn dispatch_inline(
     dispatch_now(face, route, request, Dispatch::Inline)
 }
 
-/// Run one blocking route on the calling thread. The Unix server loop hands
-/// `Blocking` routes to the blocking pool instead; the Windows per-connection
-/// fallback uses this because its connection thread is already the dedicated
-/// worker for one request.
-#[cfg_attr(unix, allow(dead_code))] // Unix uses BlockingPool instead.
+/// Run one blocking route on the calling thread.
+///
+/// The server loop hands `Blocking` routes to the blocking pool; this helper is
+/// only for tests that need the same dispatch without a pool.
+#[cfg(test)]
 pub fn dispatch_blocking_now(
     face: &dyn Face,
     route: &Route,

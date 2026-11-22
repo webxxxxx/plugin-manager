@@ -10,10 +10,10 @@
 //! ```
 //!
 //! The hub owns the stream table, the subscriber channels and the global
-//! in-flight budget. The I/O itself belongs to [`crate::wire::contract::reactor`] on Unix: a
-//! raw plugin costs no extra thread there. When the reactor is unavailable
-//! (and on Windows, where anonymous child pipes are not pollable) the hub
-//! falls back to one writer thread and one reader thread per plugin.
+//! in-flight budget. The I/O itself belongs to [`crate::wire::contract::reactor`]:
+//! Unix `poll(2)`, Windows IOCP, so a raw plugin costs no extra thread. When the
+//! reactor is unavailable the hub falls back to one writer thread and one reader
+//! thread per plugin.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -22,7 +22,6 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
-#[cfg(unix)]
 use std::sync::Weak;
 
 use crate::platform::log::LogWriter;
@@ -152,7 +151,6 @@ struct RawPlugin {
     inflight: Mutex<HashMap<u32, usize>>,
     closed: AtomicBool,
     /// Reactor-owned stdin queue once the reactor has adopted this plugin.
-    #[cfg(unix)]
     out: OnceLock<Arc<crate::wire::contract::reactor::RawOutQueue>>,
     /// Fallback writer-thread queue.
     writer: OnceLock<SyncSender<Vec<u8>>>,
@@ -166,7 +164,6 @@ impl RawPlugin {
             subscribers: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
-            #[cfg(unix)]
             out: OnceLock::new(),
             writer: OnceLock::new(),
         }
@@ -237,31 +234,11 @@ pub struct RawHub {
     inflight_requests: AtomicUsize,
     next_generation: AtomicU64,
     /// Weak so the daemon's `Arc<Reactor>` stays the single owner.
-    #[cfg(unix)]
     reactor: OnceLock<Weak<crate::wire::contract::reactor::Reactor>>,
     pub stats: RawStats,
 }
 
 impl RawHub {
-    /// The hub a plugin UI raw stream may attach to on this host.
-    ///
-    /// Raw plugin streams are driven by the stdio reactor, which exists only on
-    /// Unix. Elsewhere the face must answer 501 `not_supported` instead of
-    /// claiming a channel it cannot serve — that per-host answer used to live
-    /// in the Windows-only pre-body path; since both connection drivers share
-    /// one table (#205) it lives here, next to the reactor it depends on.
-    pub(crate) fn ui_hub(hub: Arc<RawHub>) -> Option<Arc<RawHub>> {
-        #[cfg(unix)]
-        {
-            Some(hub)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = hub;
-            None
-        }
-    }
-
     pub fn new(limits: Arc<crate::platform::limits::Limits>) -> Arc<Self> {
         Arc::new(Self {
             plugins: Mutex::new(HashMap::new()),
@@ -274,7 +251,6 @@ impl RawHub {
             inflight_bytes: AtomicUsize::new(0),
             inflight_requests: AtomicUsize::new(0),
             next_generation: AtomicU64::new(1),
-            #[cfg(unix)]
             reactor: OnceLock::new(),
             stats: RawStats::default(),
         })
@@ -282,12 +258,10 @@ impl RawHub {
 
     /// Adopt the plugin-stdio reactor. Plugins registered after this call run
     /// without per-plugin threads.
-    #[cfg(unix)]
     pub fn set_reactor(&self, reactor: &Arc<crate::wire::contract::reactor::Reactor>) {
         let _ = self.reactor.set(Arc::downgrade(reactor));
     }
 
-    #[cfg(unix)]
     fn reactor(&self) -> Option<Arc<crate::wire::contract::reactor::Reactor>> {
         self.reactor.get().and_then(|reactor| reactor.upgrade())
     }
@@ -313,7 +287,6 @@ impl RawHub {
         let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
             return Err("raw stdio is not piped".into());
         };
-        #[cfg(unix)]
         if let Some(reactor) = self.reactor() {
             let stdin =
                 stdio::poll_write(stdin).map_err(|error| format!("raw reactor: {}", error))?;
@@ -343,10 +316,10 @@ impl RawHub {
         self.register_threads(id, generation, stdin, stdout, stderr, log)
     }
 
-    /// Fallback when there is no reactor (reactor startup failed, or a
-    /// non-Unix build): one writer thread, one reader thread and one stderr
-    /// thread per plugin. Protocol-3 plugins still start this way on Windows,
-    /// but the `/raw` UI route answers 501 there, so nothing can subscribe.
+    /// Fallback when the reactor failed to start: one writer thread, one reader
+    /// thread and one stderr thread per plugin. Protocol-3 plugins still start
+    /// this way, but the `/raw` UI route is served by the reactor's hub, so a
+    /// fallback transport cannot be subscribed to.
     fn register_threads(
         self: &Arc<Self>,
         id: String,
@@ -626,7 +599,6 @@ impl RawHub {
     }
 
     fn write_frame(&self, plugin: &RawPlugin, frame: Vec<u8>) -> Result<(), RawFailure> {
-        #[cfg(unix)]
         if let Some(queue) = plugin.out.get() {
             return queue.push(frame);
         }

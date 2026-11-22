@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::platform::host::wake::Wake;
+use crate::platform::host::wake_pipe::Writer as WakeWriter;
 use crate::wire::control::channel::{
     ControlChannel, ControlListener, ControlStream, Endpoint, PendingCall,
 };
@@ -49,15 +50,15 @@ impl ControlBinding {
 /// Wake pipe shared with `Reply::with_notify`: the supervisor writes one byte
 /// after queueing a reply so the server loop can write it immediately.
 #[derive(Clone)]
-pub(crate) struct Notify(Arc<UnixStream>);
+pub(crate) struct Notify(Arc<WakeWriter>);
 
 impl Notify {
-    pub(crate) fn new(stream: Arc<UnixStream>) -> Self {
+    pub(crate) fn new(stream: Arc<WakeWriter>) -> Self {
         Notify(stream)
     }
 
     pub(crate) fn wake(&self) {
-        let _ = (&*self.0).write(&[1]);
+        self.0.notify();
     }
 }
 

@@ -476,14 +476,12 @@ fn apply_invariant(limits: &mut Limits, budget: u64, notes: &mut Vec<Override>) 
         return None;
     }
 
-    // 2. Concurrency, down to the floor. The stack term follows the connection
-    //    count where the host runs one thread per connection, so the per-slot
-    //    cost is not just the buffers.
+    // 2. Concurrency, down to the floor. A connection is buffers only: no host
+    //    charges a per-connection thread stack (see ADR-0027), so the per-slot
+    //    cost is its worst-case buffers.
     let configured_connections = limits.max_connections;
     let floor = CONNECTION_FLOOR.min(configured_connections);
-    let per_connection = limits
-        .per_connection_bytes()
-        .saturating_add(stack_per_connection(limits));
+    let per_connection = limits.per_connection_bytes();
     let others = limits.worst_case_bytes() - limits.max_connections as u64 * per_connection.max(1);
     let fits = budget.saturating_sub(others) / per_connection.max(1);
     let next = (fits as usize).clamp(floor, configured_connections);
@@ -517,15 +515,4 @@ fn apply_invariant(limits: &mut Limits, budget: u64, notes: &mut Vec<Override>) 
         crate::platform::resources::bytes_text(worst),
         terms
     ))
-}
-
-/// The stack a connection adds on a host where connections own threads.
-pub(super) fn stack_per_connection(limits: &Limits) -> u64 {
-    if cfg!(windows) {
-        // Charged again per connection by `threads_for`, so the solver must
-        // account for it or it would stop one iteration too early.
-        limits.request_stack_bytes as u64
-    } else {
-        0
-    }
 }

@@ -7,14 +7,16 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::kernel::failure::Problem;
+use crate::platform::host::poll;
 use crate::platform::host::wake::Wake;
+use crate::platform::host::wake_pipe::Writer as WakeWriter;
 use crate::wire::control::channel::{Endpoint, Notify, PendingCall, Reply};
 use crate::wire::message::ipc;
 use crate::wire::message::rpc;
@@ -47,7 +49,7 @@ pub struct ControlServer {
     wake: Arc<Wake>,
     /// Shared with `Reply::with_notify`: the supervisor writes one byte after
     /// it queues a reply so the server loop can write it immediately.
-    notify: Arc<UnixStream>,
+    notify: Arc<WakeWriter>,
 }
 
 impl ControlServer {
@@ -56,7 +58,7 @@ impl ControlServer {
         admin: UnixListener,
         tx: SyncSender<PendingCall>,
         wake: Arc<Wake>,
-        notify: Arc<UnixStream>,
+        notify: Arc<WakeWriter>,
     ) -> io::Result<ControlServer> {
         user.set_nonblocking(true)?;
         admin.set_nonblocking(true)?;
@@ -73,23 +75,23 @@ impl ControlServer {
 
     /// Append this server's poll entries. The offset in `out` is the index
     /// passed to `ready`; `keys` carries the stable source for that index.
-    pub fn poll_sources(&self, out: &mut Vec<(RawFd, i16)>, keys: &mut Vec<Source>) {
-        out.push((self.user.as_raw_fd(), libc::POLLIN));
+    pub fn poll_sources(&self, out: &mut Vec<poll::PollFd>, keys: &mut Vec<Source>) {
+        out.push(poll::PollFd::new(self.user.as_raw_fd(), poll::READ));
         keys.push(Source::Listener(Endpoint::User));
-        out.push((self.admin.as_raw_fd(), libc::POLLIN));
+        out.push(poll::PollFd::new(self.admin.as_raw_fd(), poll::READ));
         keys.push(Source::Listener(Endpoint::Admin));
         for (id, connection) in &self.connections {
             let mut events = 0;
             if connection.pending.is_none() && connection.out.is_empty() {
-                events |= libc::POLLIN;
+                events |= poll::READ;
             }
             if !connection.out.is_empty() {
-                events |= libc::POLLOUT;
+                events |= poll::WRITE;
             }
             // A waiting connection still enters poll with zero events so a
             // POLLHUP from a client that gave up is observed; otherwise the
             // reply slot would leak until the supervisor answers.
-            out.push((connection.stream.as_raw_fd(), events));
+            out.push(poll::PollFd::new(connection.stream.as_raw_fd(), events));
             keys.push(Source::Connection(*id));
         }
     }
@@ -138,12 +140,11 @@ impl ControlServer {
         let Some(connection) = self.connections.get_mut(&id) else {
             return;
         };
-        if revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+        if revents & poll::CLOSE != 0 {
             self.connections.remove(&id);
             return;
         }
-        if revents & libc::POLLIN != 0 && connection.pending.is_none() && connection.out.is_empty()
-        {
+        if revents & poll::READ != 0 && connection.pending.is_none() && connection.out.is_empty() {
             let mut chunk = [0u8; 8 * 1024];
             match connection.stream.read(&mut chunk) {
                 Ok(0) => {
@@ -166,7 +167,7 @@ impl ControlServer {
                 }
             }
         }
-        if revents & libc::POLLOUT != 0 {
+        if revents & poll::WRITE != 0 {
             write_connection(&mut self.connections, id);
         }
     }
@@ -261,7 +262,7 @@ fn drain_requests(
     connection: &mut Connection,
     tx: &SyncSender<PendingCall>,
     wake: &Arc<Wake>,
-    notify: Arc<UnixStream>,
+    notify: Arc<WakeWriter>,
 ) -> bool {
     let Some(position) = connection.buffer.iter().position(|byte| *byte == b'\n') else {
         if connection.buffer.len() > ipc::LOCAL_FRAME_MAX {
@@ -354,6 +355,7 @@ fn write_connection(connections: &mut HashMap<u64, Connection>, id: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::host::wake_pipe;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::time::Instant;
 
@@ -373,8 +375,7 @@ mod tests {
         let path = root.join("svcd.sock");
         let listener = UnixListener::bind(&path).expect("listener");
         let admin = UnixListener::bind(root.join("svcd-admin.sock")).expect("admin listener");
-        let (notify_tx, _notify_rx) = UnixStream::pair().expect("notify");
-        let notify_tx = Arc::new(notify_tx);
+        let (_notify_rx, notify_tx) = wake_pipe::pair().expect("notify");
         let (tx, rx) = mpsc::sync_channel::<PendingCall>(8);
         let mut server = ControlServer::new(listener, admin, tx, Arc::new(Wake::new()), notify_tx)
             .expect("server");
@@ -413,25 +414,10 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut replies = Vec::new();
         while replies.len() < 2 && Instant::now() < deadline {
-            let mut fds = Vec::new();
+            let mut descriptors = Vec::new();
             let mut keys = Vec::new();
-            server.poll_sources(&mut fds, &mut keys);
-            let mut descriptors: Vec<libc::pollfd> = fds
-                .iter()
-                .map(|(fd, events)| libc::pollfd {
-                    fd: *fd,
-                    events: *events,
-                    revents: 0,
-                })
-                .collect();
-            // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
-            unsafe {
-                libc::poll(
-                    descriptors.as_mut_ptr(),
-                    descriptors.len() as libc::nfds_t,
-                    50,
-                )
-            };
+            server.poll_sources(&mut descriptors, &mut keys);
+            let _ = poll::poll(&mut descriptors, 50);
             for (index, key) in keys.iter().enumerate() {
                 if descriptors[index].revents != 0 {
                     server.ready(*key, descriptors[index].revents);
@@ -471,8 +457,7 @@ mod tests {
         let path = root.join("svcd.sock");
         let listener = UnixListener::bind(&path).expect("listener");
         let admin = UnixListener::bind(root.join("svcd-admin.sock")).expect("admin listener");
-        let (notify_tx, _notify_rx) = UnixStream::pair().expect("notify");
-        let notify_tx = Arc::new(notify_tx);
+        let (_notify_rx, notify_tx) = wake_pipe::pair().expect("notify");
         let (tx, rx) = mpsc::sync_channel::<PendingCall>(8);
         let mut server = ControlServer::new(listener, admin, tx, Arc::new(Wake::new()), notify_tx)
             .expect("server");
@@ -516,25 +501,10 @@ mod tests {
                 queued = true;
                 break;
             }
-            let mut fds = Vec::new();
+            let mut descriptors = Vec::new();
             let mut keys = Vec::new();
-            server.poll_sources(&mut fds, &mut keys);
-            let mut descriptors: Vec<libc::pollfd> = fds
-                .iter()
-                .map(|(fd, events)| libc::pollfd {
-                    fd: *fd,
-                    events: *events,
-                    revents: 0,
-                })
-                .collect();
-            // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
-            unsafe {
-                libc::poll(
-                    descriptors.as_mut_ptr(),
-                    descriptors.len() as libc::nfds_t,
-                    50,
-                )
-            };
+            server.poll_sources(&mut descriptors, &mut keys);
+            let _ = poll::poll(&mut descriptors, 50);
             for (index, key) in keys.iter().enumerate() {
                 if descriptors[index].revents != 0 {
                     server.ready(*key, descriptors[index].revents);
@@ -566,22 +536,16 @@ mod tests {
         let path = root.join("svcd.sock");
         let listener = UnixListener::bind(&path).expect("listener");
         let admin = UnixListener::bind(root.join("svcd-admin.sock")).expect("admin listener");
-        let (notify_tx, _notify_rx) = UnixStream::pair().expect("notify");
+        let (_notify_rx, notify_tx) = wake_pipe::pair().expect("notify");
         let (tx, rx) = mpsc::sync_channel::<PendingCall>(8);
-        let mut server = ControlServer::new(
-            listener,
-            admin,
-            tx,
-            Arc::new(Wake::new()),
-            Arc::new(notify_tx),
-        )
-        .expect("server");
+        let mut server = ControlServer::new(listener, admin, tx, Arc::new(Wake::new()), notify_tx)
+            .expect("server");
 
         let mut client = UnixStream::connect(&path).expect("connect");
         client
             .set_read_timeout(Some(Duration::from_secs(3)))
             .expect("timeout");
-        server.ready(Source::Listener(Endpoint::User), libc::POLLIN);
+        server.ready(Source::Listener(Endpoint::User), poll::READ);
         client
             .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"registry.call\"}\n")
             .expect("write");
@@ -594,7 +558,7 @@ mod tests {
             server.poll_sources(&mut fds, &mut keys);
             for source in keys {
                 if let Source::Connection(id) = source {
-                    server.ready(Source::Connection(id), libc::POLLIN);
+                    server.ready(Source::Connection(id), poll::READ);
                 }
             }
             if let Ok(next) = rx.try_recv() {
@@ -635,8 +599,7 @@ mod tests {
     fn a_full_control_queue_answers_an_error_instead_of_growing() {
         let (stream, _peer) = UnixStream::pair().expect("pair");
         let (tx, _rx) = mpsc::sync_channel(0);
-        let (_notify_tx, notify_rx) = UnixStream::pair().expect("notify");
-        let notify = Arc::new(notify_rx);
+        let (_notify_rx, notify) = wake_pipe::pair().expect("notify");
         let mut connection = Connection {
             stream,
             buffer: b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"svcd.ping\"}\n".to_vec(),
@@ -669,7 +632,7 @@ mod tests {
         let mut limits = crate::platform::limits::test_default();
         limits.pending_queue = 1;
         let (tx, rx) = mpsc::sync_channel(limits.pending_queue);
-        let notify = Arc::new(UnixStream::pair().expect("notify").1);
+        let notify = wake_pipe::pair().expect("notify").1;
         let wake = Arc::new(Wake::new());
 
         let connection = |_tx: &mpsc::SyncSender<PendingCall>| {
@@ -708,7 +671,7 @@ mod tests {
     fn an_oversized_control_frame_carries_the_invalid_kind() {
         let (stream, _peer) = UnixStream::pair().expect("pair");
         let (tx, _rx) = mpsc::sync_channel(0);
-        let (_notify_tx, notify_rx) = UnixStream::pair().expect("notify");
+        let (_notify_rx, notify) = wake_pipe::pair().expect("notify");
         let mut connection = Connection {
             stream,
             buffer: vec![b'x'; ipc::LOCAL_FRAME_MAX + 1],
@@ -718,12 +681,7 @@ mod tests {
             close_after_write: false,
             endpoint: Endpoint::Admin,
         };
-        let keep = drain_requests(
-            &mut connection,
-            &tx,
-            &Arc::new(Wake::new()),
-            Arc::new(notify_rx),
-        );
+        let keep = drain_requests(&mut connection, &tx, &Arc::new(Wake::new()), notify);
         assert!(keep);
         assert!(connection.close_after_write);
         let text = String::from_utf8_lossy(&connection.out);

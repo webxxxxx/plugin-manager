@@ -62,7 +62,7 @@ impl PreBodyFaces {
             peer,
             lan,
             self.config.clone(),
-            crate::wire::contract::rawhub::RawHub::ui_hub(raw_hub),
+            Some(raw_hub),
             self.bus.clone(),
         ))
     }
@@ -121,25 +121,16 @@ impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
         lan: &Arc<Mutex<Lan>>,
         raw_hub: Arc<crate::wire::contract::rawhub::RawHub>,
     ) -> Option<crate::server::http::hooks::PreBodyClaim> {
-        // Endpoint precedence lives here, in the face layer. Both drivers call
-        // this one method; the first Some wins.
+        // Endpoint precedence lives here, in the face layer. The loop calls this
+        // one method; the first Some wins.
         if let Some(exchange) = self.plugin_ui(head, peer, lan, raw_hub) {
-            return Some(crate::server::http::hooks::PreBodyClaim {
-                exchange,
-                transfer: false,
-            });
+            return Some(crate::server::http::hooks::PreBodyClaim { exchange });
         }
         if let Some(exchange) = self.package_upload(head, lan) {
-            return Some(crate::server::http::hooks::PreBodyClaim {
-                exchange,
-                transfer: true,
-            });
+            return Some(crate::server::http::hooks::PreBodyClaim { exchange });
         }
         if let Some(exchange) = self.blob_upload(head, lan) {
-            return Some(crate::server::http::hooks::PreBodyClaim {
-                exchange,
-                transfer: true,
-            });
+            return Some(crate::server::http::hooks::PreBodyClaim { exchange });
         }
         None
     }
@@ -238,19 +229,15 @@ mod tests {
         let raw = RawHub::new(faces.config.limits.clone());
         let peer: IpAddr = "127.0.0.1".parse().expect("peer");
 
-        for (method, path, transfer) in [
-            ("GET", "/plugin-ui/demo/", false),
-            ("POST", "/api/v1/plugins", true),
-            ("POST", "/api/v1/import", true),
-            ("POST", "/api/v1/blobs", true),
+        for (method, path) in [
+            ("GET", "/plugin-ui/demo/"),
+            ("POST", "/api/v1/plugins"),
+            ("POST", "/api/v1/import"),
+            ("POST", "/api/v1/blobs"),
         ] {
-            let claim = faces
+            faces
                 .claim(&head(method, path), peer, &lan, raw.clone())
                 .unwrap_or_else(|| panic!("{method} {path} must be claimed"));
-            assert_eq!(
-                claim.transfer, transfer,
-                "{method} {path} has the wrong stream policy"
-            );
         }
 
         assert!(faces

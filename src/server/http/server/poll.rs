@@ -1,5 +1,9 @@
 use super::*;
 
+use crate::platform::host::poll;
+#[cfg(unix)]
+use serde_json::json;
+
 /// After the final response, keep draining the peer for this long before
 /// closing. Closing with unread request bytes sends RST, which can discard a
 /// status line the client has not read yet; the grace bounds how long a silent
@@ -150,40 +154,65 @@ impl ConnectionOps for Server {
                         );
                         return;
                     };
-                    let (sender, receiver) = mpsc::sync_channel(self.config.limits.progress_queue);
-                    let request = json!({
-                        "name": call.name,
-                        "arguments": call.arguments,
-                        "progressToken": call.progress_token,
-                    });
                     // A token/connect failure becomes the stream's first
                     // progress event, so the client still sees the -32603
                     // channel error instead of an HTTP 500 before the SSE
                     // headers.
-                    let stream = self.client.open(
-                        self.config.paths.control_dir(),
-                        "registry.call",
-                        request,
-                        sender,
-                    );
-                    let cancel = self.client.canceller();
-                    let handler = McpSseStream::new(
-                        receiver,
-                        call.id,
-                        stream,
-                        Box::new(move |id| cancel.cancel(id)),
-                    );
-                    // The slot reserved above becomes the driver's
-                    // `max_streams` permit.
-                    attach_stream(
-                        connection,
-                        Box::new(handler),
-                        &[],
-                        Some(permit),
-                        &self.budget,
-                        &self.config.limits,
-                    );
-                    return;
+                    #[cfg(unix)]
+                    {
+                        let (sender, receiver) =
+                            mpsc::sync_channel(self.config.limits.progress_queue);
+                        let request = json!({
+                            "name": call.name,
+                            "arguments": call.arguments,
+                            "progressToken": call.progress_token,
+                        });
+                        let stream = self.client.open(
+                            self.config.paths.control_dir(),
+                            "registry.call",
+                            request,
+                            sender,
+                        );
+                        let cancel = self.client.canceller();
+                        let handler = McpSseStream::new(
+                            receiver,
+                            call.id,
+                            stream,
+                            Box::new(move |id| cancel.cancel(id)),
+                        );
+                        // The slot reserved above becomes the driver's
+                        // `max_streams` permit.
+                        attach_stream(
+                            connection,
+                            Box::new(handler),
+                            &[],
+                            Some(permit),
+                            &self.budget,
+                            &self.config.limits,
+                        );
+                        return;
+                    }
+                    // Windows has no wait-set integration for the named-pipe
+                    // control stream, so the blocking SSE response runs on its
+                    // own thread. The loop hands the socket over and stops
+                    // touching it.
+                    #[cfg(not(unix))]
+                    {
+                        match crate::server::mcp::fallback::spawn_mcp_sse(
+                            &connection.stream,
+                            call,
+                            self.config.clone(),
+                            Some(permit),
+                        ) {
+                            Ok(()) => connection.handed_off = true,
+                            Err(_) => write_response(
+                                connection,
+                                crate::server::http::stream_busy_response(),
+                                false,
+                            ),
+                        }
+                        return;
+                    }
                 }
                 Err(response) => {
                     write_response(connection, response, false);
@@ -250,14 +279,14 @@ impl ConnectionOps for Server {
 
     fn interest(&self, connection: &Connection) -> i16 {
         let mut events = match &connection.state {
-            ConnState::Reading => libc::POLLIN,
-            ConnState::Writing => libc::POLLOUT,
+            ConnState::Reading => poll::READ,
+            ConnState::Writing => poll::WRITE,
             // A closing connection only waits for the peer's remaining bytes
             // (or its FIN); the response side is already shut down.
-            ConnState::Draining(_) => libc::POLLIN,
+            ConnState::Draining(_) => poll::READ,
             ConnState::Stream(driver) => {
                 if driver.wants_read() {
-                    libc::POLLIN
+                    poll::READ
                 } else if driver.has_job() {
                     // A stream job in flight still has to notice a client FIN
                     // so it can be cancelled; the engine owns the platform's
@@ -271,7 +300,7 @@ impl ConnectionOps for Server {
             ConnState::Processing => 0,
         };
         if connection.out_at < connection.out.len() || stream_has_file(connection) {
-            events |= libc::POLLOUT;
+            events |= poll::WRITE;
         }
         events
     }
@@ -310,18 +339,20 @@ impl ConnectionOps for Server {
 impl TimerOps for Server {
     type State = ConnState;
     fn on_tick(&mut self, connections: &mut Table<ConnState>) {
-        let mut drain = [0u8; 64];
-        while self.notify.read(&mut drain).is_ok() {}
+        self.notify.drain();
         // A UI event wake is "some handler may have output waiting", not a
         // deadline: polling every stream here is what turns a published event
         // into one loop iteration.
         let bus_wake = self.bus_wake.swap(false, Ordering::SeqCst);
         // The same wake pipe carries blocking-pool completions, control
         // replies, and outbound progress retries.
-        self.control.drain_replies();
-        self.control.flush();
-        self.client.drain_cancels();
-        self.client.tick();
+        #[cfg(unix)]
+        {
+            self.control.drain_replies();
+            self.control.flush();
+            self.client.drain_cancels();
+            self.client.tick();
+        }
 
         while let Ok(result) = self.results.try_recv() {
             match result {

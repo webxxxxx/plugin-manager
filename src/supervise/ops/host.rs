@@ -14,7 +14,6 @@ use crate::supervise::model::runtime::{self, Record};
 use crate::supervise::model::supervisor::{self};
 use crate::supervise::ops::factory::{Notifier, SlotFactory};
 use crate::supervise::ops::slot::Slot;
-#[cfg(unix)]
 use crate::wire::contract::reactor::Reactor;
 
 /// The supervisor loop's bounded wait when it has no earlier deadline. With a
@@ -48,7 +47,6 @@ pub(crate) struct Supervisor {
     stdio: crate::wire::contract::stdio::Target,
     /// Set whenever the registry projection changed; compose drains it.
     pub(crate) catalog_dirty: bool,
-    #[cfg(unix)]
     pub(crate) reactor: Option<Arc<Reactor>>,
     /// One place that turns a definition into a slot.
     pub(crate) factory: SlotFactory,
@@ -95,7 +93,6 @@ impl Supervisor {
             wake,
             stdio: crate::wire::contract::stdio::Target::threaded(),
             catalog_dirty: false,
-            #[cfg(unix)]
             reactor: None,
             factory,
         }
@@ -326,7 +323,6 @@ impl Supervisor {
         }
     }
 
-    #[cfg(unix)]
     pub(crate) fn set_reactor(&mut self, reactor: Option<Arc<Reactor>>) {
         // The supervisor loop polls plugin stdio itself. Attaching the poll's
         // self-pipe to the shared wake latch means a management request or a
@@ -334,16 +330,7 @@ impl Supervisor {
         if let Some(reactor) = &reactor {
             // Synchronous waits on this thread (an install hook, a status
             // hook) get an explicit poll closure from hook_pump.
-            match reactor.interrupt_handle() {
-                Ok(interrupt) => self.wake.set_interrupt(interrupt),
-                // Without the self-pipe the loop still polls, so requests are
-                // served; they just wait for the poll timeout instead of
-                // interrupting it.
-                Err(error) => warn!(
-                    "cannot bind the plugin-stdio poll wake; requests wait for the poll timeout: {}",
-                    error
-                ),
-            }
+            self.wake.set_interrupt(reactor.interrupt_handle());
         }
         self.reactor = reactor.clone();
         self.stdio = match reactor {
@@ -461,10 +448,9 @@ impl Supervisor {
     /// Bounded wait for the next event. With a reactor this wait *is* the
     /// plugin poll: the supervisor loop owns plugin stdio, and the shared wake
     /// latch writes to the poll's self-pipe so a management request returns at
-    /// once. Without one (Windows, or a reactor that failed to start) the
-    /// condvar latch is the wake source.
+    /// once. Without one (no reactor was installed) the condvar latch is the
+    /// wake source.
     pub(crate) fn wait_for_work(&self, timeout: Duration) {
-        #[cfg(unix)]
         if let Some(reactor) = &self.reactor {
             reactor.poll_once(timeout);
             return;

@@ -1,11 +1,15 @@
 use super::*;
 
 impl ExtraOps for Server {
-    fn wake_fd(&self) -> Option<RawFd> {
-        Some(self.notify.as_raw_fd())
+    fn wake_key(&self) -> Option<crate::platform::host::poll::Key> {
+        Some(self.notify.key())
     }
 
-    fn prepare_extra(&mut self, out: &mut Vec<(RawFd, i16)>) {
+    /// Unix merges the control channel and its outbound streaming clients into
+    /// the one wait set. Windows runs the control channel on its own
+    /// named-pipe accept thread, so this loop has no extra sources.
+    #[cfg(unix)]
+    fn prepare_extra(&mut self, out: &mut Vec<crate::platform::host::poll::PollFd>) {
         self.extra_keys.clear();
         let mut control_keys = Vec::new();
         self.control.poll_sources(out, &mut control_keys);
@@ -19,6 +23,7 @@ impl ExtraOps for Server {
         }
     }
 
+    #[cfg(unix)]
     fn on_extra_ready(&mut self, index: usize, revents: i16) {
         match self.extra_keys.get(index).copied() {
             Some(ExtraSource::Control(source)) => self.control.ready(source, revents),
@@ -34,8 +39,11 @@ impl LifecycleOps for Server {
     }
 
     fn on_stop(&mut self) {
-        self.control.drain_for_shutdown();
-        self.client.close();
+        #[cfg(unix)]
+        {
+            self.control.drain_for_shutdown();
+            self.client.close();
+        }
     }
 
     fn should_shed(&self) -> bool {
@@ -64,7 +72,7 @@ impl Server {
             self.fallback.clone(),
             self.lan.clone(),
             self.results_tx.clone(),
-            self.notify.try_clone().ok(),
+            Some(self.notify_tx.clone()),
             request,
             keep_alive,
         );
@@ -106,7 +114,7 @@ impl Server {
         };
         let key = self.next_job_key();
         let results = self.results_tx.clone();
-        let notify = self.notify.try_clone().ok();
+        let notify = Some(self.notify_tx.clone());
         // Stamp the deadline at submission, the same instant the driver starts
         // its no-progress clock. A job that waits in the queue must not get a
         // fresh budget after the connection has already been given up on.
@@ -121,7 +129,7 @@ impl Server {
                 outcome,
             });
             if let Some(notify) = &notify {
-                let _ = (&*notify).write(&[1]);
+                notify.notify();
             }
         });
         match submitted {

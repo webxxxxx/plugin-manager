@@ -58,8 +58,8 @@ pub(crate) struct Slot {
     stdin: Option<stdio::WriteEnd>,
     frames: Frames,
     wake: Option<Arc<Wake>>,
-    /// Who reads this service's stdout/stderr: the supervisor's poll set on
-    /// Unix, reader threads elsewhere.
+    /// Who reads this service's stdout/stderr: the supervisor's poll set (Unix
+    /// readiness, Windows IOCP), or reader threads when no reactor was installed.
     stdio: Target,
     raw_hub: Option<Arc<crate::wire::contract::rawhub::RawHub>>,
     log: Option<Arc<Mutex<LogWriter>>>,

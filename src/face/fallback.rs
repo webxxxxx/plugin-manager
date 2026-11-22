@@ -1,8 +1,8 @@
-//! S4 回退路由：线程驱动把解析后的 request 交给这里。
+//! S4 回退路由：回退处理器把解析后的 request 交给这里。
 //!
 //! 这些是 face 的端点投影与请求谓词（MCP 之外的路由、插件 UI 的静态资源与
-//! rpc、blob/file 会话路由、CSRF/Origin 判断）。连接与 socket 归 `api.rs` 的
-//! 回退 loop；这里只拿到 request 值，不拥有连接。
+//! rpc、blob/file 会话路由、CSRF/Origin 判断）。连接与 socket 归服务器循环；
+//! 这里只拿到 request 值，不拥有连接。
 
 use std::fs;
 use std::path::Path;

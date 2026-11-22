@@ -12,7 +12,6 @@ use crate::platform::config::Config;
 use crate::platform::host::wake::Wake;
 use crate::platform::log;
 use crate::supervise::model::definition;
-#[cfg(unix)]
 use crate::wire::contract::reactor::Reactor;
 use crate::wire::control::channel;
 
@@ -242,7 +241,6 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
     );
     daemon.host.set_raw_hub(raw_hub.clone());
     daemon.host.set_wake(wake);
-    #[cfg(unix)]
     {
         let reactor = match Reactor::start() {
             Ok(reactor) => Some(reactor),
