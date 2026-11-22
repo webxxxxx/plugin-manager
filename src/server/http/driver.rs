@@ -8,8 +8,6 @@ use std::io::{Read, Seek, SeekFrom};
 use std::net::TcpStream;
 use std::time::Instant;
 
-use crate::platform::log;
-
 use super::budget::{Busy, StreamBudget, StreamPermit};
 use super::stream::{
     BlockingJob, BlockingOutcome, CloseReason, FileSend, OutBuffer, StreamAction, StreamEvent,

@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use crate::platform::host::wake::Wake;
-use crate::platform::log;
 use crate::server::auth::lan::Lan;
 use crate::server::control::client::StreamingClient;
 use crate::server::control::handle::LoopHandle;

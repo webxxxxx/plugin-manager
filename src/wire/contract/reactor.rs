@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use crate::platform::host::poll;
 use crate::platform::host::wake::Wake;
-use crate::platform::log::{self, LogWriter};
+use crate::platform::log::LogWriter;
 use crate::wire::message::ipc::{FrameError, FrameEvent};
 use crate::wire::message::ipc::{RawFailure, RawStopSink};
 
