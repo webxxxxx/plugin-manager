@@ -141,14 +141,16 @@ pub(crate) fn spawn_mcp_sse(
     permit: Option<crate::server::http::budget::StreamPermit>,
 ) -> std::io::Result<()> {
     let mut owned = stream.try_clone()?;
-    // The loop's socket is non-blocking; the SSE writer needs blocking writes
-    // now that the loop no longer polls it.
-    owned.set_nonblocking(false)?;
     let limits = config.limits.clone();
     std::thread::Builder::new()
         .name("svcd-mcp-sse".into())
         .stack_size(crate::platform::host::threads::transfer_stack(&limits))
         .spawn(move || {
+            // The loop's socket is non-blocking and the SSE writer needs a
+            // blocking one. Switch the shared socket only after the thread
+            // exists: a failed spawn would otherwise leave the loop's socket
+            // blocking while the loop still polls it.
+            let _ = owned.set_nonblocking(false);
             let _ = serve_mcp_sse_admitted(
                 &mut owned,
                 call,
