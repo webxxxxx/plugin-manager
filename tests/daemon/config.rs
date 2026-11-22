@@ -2,6 +2,31 @@
 
 use super::*;
 
+/// The boot wait for a late-mounted `services.d` was removed (ADR-0005
+/// amendment): a fresh config tree must not stall every start. Before the
+/// change this test failed after the daemon burned the budget.
+#[test]
+fn a_missing_services_dir_does_not_stall_boot() {
+    let mut sandbox = Sandbox::new();
+    fs::remove_dir_all(sandbox.config.join("services.d")).expect("remove services.d");
+    // A stale document still names the removed key; it must be inert.
+    fs::write(
+        sandbox.config.join("svcd.conf"),
+        "boot_scan_wait_ms = 30000\n",
+    )
+    .expect("write svcd.conf");
+
+    let started = Instant::now();
+    sandbox.start_daemon_ready();
+
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "boot waited for a services.d that will never appear: {:?}\n{}",
+        started.elapsed(),
+        sandbox.daemon_log()
+    );
+}
+
 /// #161: the daemon writes what it derived at startup, and `svc status
 /// --resources` shows it back. Memory and cores are both injected through the
 /// document, so the assertions do not depend on the machine running the suite;

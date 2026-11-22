@@ -10,7 +10,7 @@ svcd 被 kill -9、崩溃或被系统重新拉起时，旧实现的处理是「�
 - **孤儿记录清理**：启动时和 `svc reload` 末尾扫描 `<data>/run`，删掉 registry 里已不存在的 `<id>.json`。若记录里的 pid 仍有效（pid + starttime 校验通过），先对进程组发 SIGTERM 再删，覆盖「daemon 停机期间定义被删」的情况。
 - **运行期重扫**：`services.d` 的指纹（名字 + mtime + size）每 `rescan_interval_ms`（默认 5000ms，0 关闭；`SVCD_RESCAN_INTERVAL_MS` 仍在 bootstrap 作覆盖，见 ADR-0020）比对一次，变了就复用 `reload` 的 reconcile：新增定义按 `enabled` 启动、删除定义停掉并遗忘。`svc reload` 仍保留，用于手动立即触发。
 - **Unix 不再给服务进程挂 parent-death 信号**（`proc::configure_service`），服务在 daemon 死后继续运行，等下一个 daemon 接管；**hooks 仍保留** `PR_SET_PDEATHSIG`，它们不该比 daemon 活得久。Windows 保持不变：Job Object 随 daemon 关闭而终止整棵树，没有可接管的进程（记录只用于清理）。
-- **开机等待 + reload**：daemon 启动时若 `services.d` 还不存在，最多等 10 秒（`boot_scan_wait_ms`，0 关闭；`SVCD_BOOT_SCAN_WAIT_MS` 仍在 bootstrap 作覆盖，见 ADR-0020），覆盖只读 rootfs 上 overlay 晚挂载；之后仍可用 `svc reload` 重新扫描并对账（新增/删除/修改定义）。
+- **开机等待 + reload**：daemon 启动时若 `services.d` 还不存在，最多等 10 秒（`boot_scan_wait_ms`，0 关闭；`SVCD_BOOT_SCAN_WAIT_MS` 仍在 bootstrap 作覆盖，见 ADR-0020），覆盖只读 rootfs 上 overlay 晚挂载；之后仍可用 `svc reload` 重新扫描并对账（新增/删除/修改定义）。（**2026-11-22 删除**，见文末 Amendment）
 - **策略与自启解耦**：`enabled` 只决定开机是否启动；崩溃是否重启由服务级 `restart=always|on-failure|never` 决定（core 定义字段，drop-in 脚本用 `RESTART=` / `TYPE=oneshot` 声明，插件默认 `on-failure`）。
 
 ## Considered Options
@@ -27,3 +27,18 @@ svcd 被 kill -9、崩溃或被系统重新拉起时，旧实现的处理是「�
 - `ready=notify` 的插件被接管后没有可用的 stdin 管道：状态显示 `Running`，但 `tools/call` 会因通道不可用而失败，直到下一次显式 restart。这是「进程存活但协议已断」的已知限制。
 - Windows 行为：活进程仍由 Job Object 随 daemon 终止，重启后按 `enabled` 重拉，不接管；但「完成态」记录（无进程）在所有平台都会恢复成 `running`/无 pid，避免 daemon 重启导致一次性服务重跑。
 - 优雅停机（`svcd shutdown` / SCM stop）仍会先停所有服务再退出，记录随之清空，不会留下需要接管的进程。
+
+## Amendment
+
+2026-11-22：删除开机等待。判据是“目录不存在”，而安装器从不创建
+`services.d`，于是新装机器、user mode、只装插件的部署每次启动都要吃完
+10 秒预算；这段时间控制通道还没绑定，`svc` / `plugin` 全部不可用，
+systemd / SCM 的启动请求也被拖住。
+
+- 启动时直接扫描 `services.d`，不存在就按空树处理；晚挂载的宿主依赖周期
+  rescan（`rescan_interval_ms`，默认 5 秒）或 `svc reload` 收敛。
+- `boot_scan_wait_ms` / `SVCD_BOOT_SCAN_WAIT_MS` 仍被解析，只是不再产生
+  行为：旧文档照常启动，bootstrap 打一行 `WARN` 说明该键被忽略。从
+  `svcd.conf.example` 中删除。
+- 放弃的是“定义在第一次扫描前就可见”的保证；代价是晚挂载后最多一个
+  rescan 周期的启动延迟，换来所有场景的启动不再固定延迟。

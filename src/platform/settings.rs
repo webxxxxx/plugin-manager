@@ -48,9 +48,9 @@ pub struct Settings {
     /// reconciles. Milliseconds; `0` disables the periodic rescan. Default:
     /// 5000.
     pub rescan_interval_ms: Option<u64>,
-    /// How long the daemon waits at boot for `services.d` to appear before
-    /// scanning an empty tree. Milliseconds; `0` disables the wait. Default:
-    /// 10000.
+    /// Removed on 2026-11-22 (ADR-0005 amendment): the daemon no longer waits
+    /// for `services.d` at boot. The key is still parsed so an old document
+    /// boots, but the bootstrap warns and ignores the value.
     pub boot_scan_wait_ms: Option<u64>,
     /// Per-service log directory. Empty/absent uses the platform or
     /// `install_dir/logs` default.
@@ -174,11 +174,6 @@ impl Settings {
     pub fn rescan_interval_ms(&self) -> u64 {
         self.rescan_interval_ms.unwrap_or(5_000)
     }
-
-    /// How long boot waits for `services.d`. `0` means "do not wait".
-    pub fn boot_scan_wait_ms(&self) -> u64 {
-        self.boot_scan_wait_ms.unwrap_or(10_000)
-    }
 }
 
 /// Every `svcd.conf` key that an environment variable can override.
@@ -198,6 +193,8 @@ pub(crate) const ENV_KEYS: &[&str] = &[
     "temp_retention_secs",
     "temp_cleanup_interval_secs",
     "rescan_interval_ms",
+    // Removed from behavior (ADR-0005 amendment); kept so an existing
+    // environment cannot turn an unknown key into a startup error.
     "boot_scan_wait_ms",
     "log_max_bytes",
     "log_rotations",
@@ -406,6 +403,8 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
                 settings.rescan_interval_ms = Some(parse_u64(value, "rescan_interval_ms", index)?)
             }
             "boot_scan_wait_ms" => {
+                // Removed from behavior (ADR-0005 amendment); parsing it keeps
+                // an old document bootable. The bootstrap warns and ignores it.
                 settings.boot_scan_wait_ms = Some(parse_u64(value, "boot_scan_wait_ms", index)?)
             }
             "logs_dir" => settings.logs_dir = Some(resolve(base, value)),
@@ -772,9 +771,9 @@ mod tests {
         assert_eq!(settings.temp_retention_secs, Some(3600));
         assert_eq!(settings.temp_cleanup_interval_secs, Some(60));
         assert_eq!(settings.rescan_interval_ms, Some(250));
+        // Removed from behavior but still accepted so an old document boots.
         assert_eq!(settings.boot_scan_wait_ms, Some(0));
         assert_eq!(settings.rescan_interval_ms(), 250);
-        assert_eq!(settings.boot_scan_wait_ms(), 0);
         assert_eq!(settings.temp_retention().as_secs(), 3600);
         assert_eq!(settings.temp_cleanup_interval().as_secs(), 60);
     }
@@ -878,15 +877,16 @@ mod tests {
     }
 
     #[test]
-    fn loop_cadences_default_to_five_and_ten_seconds() {
+    fn the_rescan_cadence_defaults_to_five_seconds() {
         let settings = Settings::default();
         assert_eq!(settings.rescan_interval_ms(), 5_000);
-        assert_eq!(settings.boot_scan_wait_ms(), 10_000);
+        // The boot wait was removed (ADR-0005 amendment): no default exists.
+        assert_eq!(settings.boot_scan_wait_ms, None);
     }
 
     /// Without an env override the document value survives the bootstrap pass;
     /// the override path itself is covered end to end by the tests that start a
-    /// daemon with `SVCD_RESCAN_INTERVAL_MS` / `SVCD_BOOT_SCAN_WAIT_MS`.
+    /// daemon with `SVCD_RESCAN_INTERVAL_MS`.
     #[test]
     fn relative_install_dir_resolves_against_the_conf_directory() {
         let settings = parse("install_dir = sr/svcd\n", Path::new("/etc/svcd")).expect("parse");
