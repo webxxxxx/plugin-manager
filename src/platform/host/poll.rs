@@ -9,12 +9,15 @@
 //! A caller writes `READ`/`WRITE`/`CLOSE`; a backend hands its array straight to
 //! the host call, so the hot path has no bit translation. `PollFd` is `repr(C)`
 //! with the same layout as the host's wait-a-set entry (asserted in each
-//! backend), which also lets Windows compact absent slots without rebuilding
-//! events.
+//! backend). Winsock has no "ignore this slot" value, so the Windows backend
+//! compacts absent slots into a scratch array each pass and copies the ready
+//! bits back by index.
 //!
-//! The plugin-stdio reactor stays Unix-only (`wire/contract/reactor.rs`): its
-//! sources are child pipes, which `WSAPoll` cannot watch. Windows keeps the
-//! reader-thread path there.
+//! Only the server loop uses this seam on both hosts. The plugin-stdio reactor
+//! waits through `poll(2)` on Unix (`wire/contract/reactor/pollset.rs`) but
+//! completes overlapped named-pipe I/O through an IOCP on Windows
+//! (`wire/contract/reactor/iocp.rs`, ADR-0028): child pipe handles cannot enter
+//! a readiness set there.
 
 #[cfg(unix)]
 mod unix;

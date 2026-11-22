@@ -233,7 +233,7 @@ _Avoid_: 用 reactor 指这个循环（reactor 专指插件 stdio 反应器）�
 _Avoid_: IO 线程池、epoll 管理器、反应器线程
 
 **raw 传输（Raw transport）**:
-协议 3 插件与 UI 之间的二进制通道：插件 stdin/stdout 上是 `u32 长度 + u32 stream_id + payload` 帧，UI 侧是 `/plugin-ui/{id}/{token}/raw` 上的 binary WebSocket。daemon 只做 stream 映射、全局在途预算与失败分类，不解析 payload。非 Unix 构建没有这条 WebSocket 桥（匿名子管道不可 poll），`/raw` 明确回 `501 not_supported`；协议 3 插件本身仍能启动，只是没人能订阅。
+协议 3 插件与 UI 之间的二进制通道：插件 stdin/stdout 上是 `u32 长度 + u32 stream_id + payload` 帧，UI 侧是 `/plugin-ui/{id}/{token}/raw` 上的 binary WebSocket。daemon 只做 stream 映射、全局在途预算与失败分类，不解析 payload。两端都提供这条 WebSocket 桥，插件管道由插件 stdio 反应器驱动（Unix `poll(2)`、Windows IOCP，ADR-0028）。插件没声明协议 3 时 `/raw` 回 `503 raw_unavailable`；协议 3 插件本身仍能启动，只是没人能订阅。
 _Avoid_: 二进制插件、直通 WebSocket
 
 **重启策略（restart）**:

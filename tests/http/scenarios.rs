@@ -591,14 +591,14 @@ pub(crate) fn run_min_config_phase(phase: &str, streams: bool) {
     assert_daemon_alive(&mut sandbox, phase);
 
     // Concurrent connections: the floor admits one connection and refuses the
-    // second with 503 at accept time; the usable config admits two. Both
-    // engines enforce this: the Unix reactor counts its connection table, the
-    // Windows fallback admits before it spawns the per-connection thread.
+    // second with 503 at accept time; the usable config admits two. Both hosts
+    // enforce this: the poll loop counts its connection table before it admits
+    // a socket.
     assert_concurrent_connections(&mut sandbox, &address, streams);
 
-    // http_idle_timeout_secs clamps to 1 s: the Unix reactor's idle sweep and
-    // the Windows fallback's per-socket read timeout both close a keep-alive
-    // connection instead of idling for the compile-time default (30/60/120 s).
+    // http_idle_timeout_secs clamps to 1 s: the poll loop's idle sweep closes a
+    // keep-alive connection instead of idling for the compile-time default
+    // (30/60/120 s).
     // The keep-alive probe needs an admitted slot too, so retry the handshake
     // against the admission wait.
     let idle_request = format!(

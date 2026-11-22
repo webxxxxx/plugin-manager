@@ -225,7 +225,8 @@ src/
 
   server/                     L4 服务器：协议会话
     mod.rs
-    control/  listener.rs  client.rs  handle.rs   命令行通道与出站管理流也是服务器（#124）
+    handle.rs       服务器循环的停止/唤醒句柄（两种宿主共用）
+    control/  listener.rs  client.rs   命令行通道与出站管理流也是服务器（#124）
     http/     contract.rs  dispatch.rs  engine.rs  server.rs  stream.rs  driver.rs  pool.rs  budget.rs  wire.rs
     mcp/      session.rs  transport.rs  progress.rs
     auth/     gate.rs  token.rs  session.rs

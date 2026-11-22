@@ -647,8 +647,8 @@ fn an_unrunnable_document_is_still_inspectable() {
     let sandbox = Sandbox::new();
     fs::create_dir_all(sandbox.config_dir()).expect("config dir");
     // The connection floor is eight, and eight 8 MiB stacks already exceed a
-    // 32 MiB budget: Unix charges the two loop threads on top, Windows charges
-    // one thread per connection, so both thread models refuse this document.
+    // 32 MiB budget: the invariant adds the two loop threads on top, so the
+    // document is refused on every host.
     // Leaving the connection count unconfigured would instead let the solver
     // pick a count that fits, which is a runnable plan and not this test.
     fs::write(

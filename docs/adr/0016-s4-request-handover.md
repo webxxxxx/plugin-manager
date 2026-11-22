@@ -46,10 +46,10 @@ Accepted。细化 [ADR-0012](0012-protocol-is-server-plus-face.md)；切片见 #
 ## Consequences
 
 - face 的测试不再需要 socket：内存 `Request` + `CompletionSlot` 就能断言响应、恰好一次、缺失完成和二次完成。
-- 服务器可以替换（Unix poll reactor、Windows 线程回退、将来的 IOCP），face 与端点测试不变。
+- 服务器可以替换（Unix `poll(2)`、Windows `WSAPoll`；插件管道的 Windows 后端是 IOCP），face 与端点测试不变。
 - `StreamHandler` 出现后，ADR-0012 原来说的「交出连接」只表示「交出一个 sans-IO 状态机」，不再表示连接所有权转移；连接始终归服务器。
 - #125 删除了 legacy bridge 与它的 HTTP 队列。阻塞池队列仍是有界 64，满时 503；池关闭时排队任务以 `Dropped` 回报（server loop 若还在运行会回 503），运行中的任务让它跑完并把结果写入已封的槽后丢弃。插件 UI 的 WS 任务已随 #122 从 legacy worker 队列删除；页面 WebSocket 的 in-flight 限额改为 handler 内的 `ws_inflight_requests` / `ws_inflight_bytes`，阻塞 job 走池。插件 UI takeover 已在 #115 删除；blob 下载与上传 takeover 已在 #118/#119 删除；export takeover 已在 #120 删除；import/install 两个 takeover 已在 #121 删除，包上传与下载/导出共用同一个 stream driver、预算与阻塞池。临时文件清理不再有自己的线程：supervisor loop 按 `temp_cleanup_interval_secs` 调 `blob::cleanup`。
-- 本 spec 的最终线程目标（#126 合并插件 stdio 反应器后：「两条循环 + 两条阻塞线程，默认 4 条」）是 Unix 的默认拓扑。（2026-11-22：Windows 也跑同一个 server loop，线程目标两端一致；见 [ADR-0027](0027-windows-runs-the-same-poll-loop.md)。）迁移期：#116 后 12 条，#124 去掉两条 reactor 后 10 条，#125 删除 legacy 后 5 条，#126 把插件 reactor 并入 supervisor loop 后 4 条（已达成）。Windows 本轮保留每连接一条线程的回退：它执行 `max_connections` / `max_connections_per_ip` / `http_idle_timeout_secs`，线程上限由 `max_connections` 约束，但不承诺 4 条线程；IOCP 留给 S3/S6。
+- 本 spec 的最终线程目标（#126 合并插件 stdio 反应器后：「两条循环 + 两条阻塞线程，默认 4 条」）是默认拓扑。（2026-11-22：Windows 也跑同一个 server loop 与插件 stdio 反应器，连接与插件管道都不再各占一条线程，线程目标两端一致；见 [ADR-0027](0027-windows-runs-the-same-poll-loop.md) 与 [ADR-0028](0028-windows-plugin-stdio-reactor.md)。）迁移期：#116 后 12 条，#124 去掉两条 reactor 后 10 条，#125 删除 legacy 后 5 条，#126 把插件 reactor 并入 supervisor loop 后 4 条（已达成）。
 - 完成槽封住后迟到的完成只能记日志，不能写回一个已经结束的请求；这消除 use-after-response 的竞态。
 - `Blocking` 任务在派发前检查 cancellation token；#131 起 job 还带 `control_timeout_secs`（默认 30，clamp 1..300）deadline，控制往返以短轮询读并同时检查断开 token。卡死的 supervisor 让 worker 在 deadline 内返回 504（`timeout`），连接随之释放；503 仍只表示阻塞队列满。超时/取消的连接不回到连接池，迟到的回包不会污染下一次请求。Unix 用零超时 `poll`、Windows 用 `PeekNamedPipe` 在每次读之前判断是否有字节，所以半帧之后的 `fill_buf` 立即返回 `WouldBlock` 而不是阻塞到下一块数据；等待间隔由外层 20 ms 轮询承担，两种平台都能在轮询周期内观察断开。install/import 是不同的 seam：它们跑在 stream job 里，控制往返仍是 CLI 式无 deadline（安装 hook 可以合法超过 30 s），由 stream driver 的传输超时约束连接，不在本切片的 Blocking deadline 内。
 - #117 的 face 曾复用 `api.rs` 的 control-channel / 错误映射 / `require_plugin` helper；#131 把这些 helper 下沉到 `face/support.rs`，`api` 只保留组合根与 Windows 回退并从上方调用。face 不再 `use crate::api`，`arch-map.json` 把 `api` 记为 compose 层。

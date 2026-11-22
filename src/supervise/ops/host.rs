@@ -448,8 +448,8 @@ impl Supervisor {
     /// Bounded wait for the next event. With a reactor this wait *is* the
     /// plugin poll: the supervisor loop owns plugin stdio, and the shared wake
     /// latch writes to the poll's self-pipe so a management request returns at
-    /// once. Without one (Windows, or a reactor that failed to start) the
-    /// condvar latch is the wake source.
+    /// once. Without one (no reactor was installed) the condvar latch is the
+    /// wake source.
     pub(crate) fn wait_for_work(&self, timeout: Duration) {
         if let Some(reactor) = &self.reactor {
             reactor.poll_once(timeout);
