@@ -86,6 +86,7 @@
         <span class="menu-wrap">
           <button class="ghost menu-btn" id="morebtn" onclick="toggleMore(event)" aria-haspopup="menu" aria-expanded="false" aria-label="更多操作" title="更多">⋮</button>
           <div class="menu hidden" id="moremenu" role="menu">
+            <button role="menuitem" onclick="openDaemonLogs()">查看日志</button>
             <button role="menuitem" onclick="pickTrust()">添加公钥</button>
           </div>
         </span>
@@ -511,22 +512,41 @@ function showConfigModal(id, text) {
 }
 
 function openLogs(id) {
+  loadLogs({ kind: 'plugin', id: id });
+}
+
+function openDaemonLogs() {
+  closeMore();
+  loadLogs({ kind: 'daemon' });
+}
+
+function logName(target) {
+  return target.kind === 'daemon' ? 'svcd' : target.id;
+}
+
+function logUrl(target) {
+  return target.kind === 'daemon'
+    ? '/api/v1/logs'
+    : '/api/v1/logs/' + encodeURIComponent(target.id);
+}
+
+function loadLogs(target) {
   if (BUSY) return;
   lock(true);
-  fetch('/api/v1/logs/' + encodeURIComponent(id) + '?lines=200', { credentials: 'same-origin', headers: authHeaders() }).then(async function (response) {
+  fetch(logUrl(target) + '?lines=200', { credentials: 'same-origin', headers: authHeaders() }).then(async function (response) {
     if (response.status === 404) throw new Error('还没有日志');
     if (!response.ok) throw new Error(await errorText(response));
     return response.text();
   }).then(function (text) {
     lock(false);
-    showLogsModal(id, text);
+    showLogsModal(target, text);
   }).catch(function (error) {
     lock(false);
     toast('读取日志失败：' + error.message, 'err');
   });
 }
 
-function showLogsModal(id, text) {
+function showLogsModal(target, text) {
   const modal = document.createElement('div');
   modal.className = 'modal';
   const panel = document.createElement('div');
@@ -537,7 +557,7 @@ function showLogsModal(id, text) {
   title.style.fontSize = '16px';
   title.style.margin = '0';
   title.style.flex = '1';
-  title.textContent = '日志：' + id;
+  title.textContent = '日志：' + logName(target);
   const auto = document.createElement('label');
   auto.className = 'check';
   const check = document.createElement('input');
@@ -571,15 +591,15 @@ function showLogsModal(id, text) {
 
   let timer = null;
   let level = '';
-  function logUrl() {
-    return '/api/v1/logs/' + encodeURIComponent(id) + '?lines=200' + (level ? '&level=' + encodeURIComponent(level) : '');
+  function currentUrl() {
+    return logUrl(target) + '?lines=200' + (level ? '&level=' + encodeURIComponent(level) : '');
   }
   function stop() {
     if (timer) { clearInterval(timer); timer = null; }
   }
   async function refresh() {
     try {
-      const response = await fetch(logUrl(), { credentials: 'same-origin', headers: authHeaders() });
+      const response = await fetch(currentUrl(), { credentials: 'same-origin', headers: authHeaders() });
       if (response.status === 401) { stop(); showLogin(); return; }
       if (response.status === 404) { pre.textContent = '还没有日志'; return; }
       if (!response.ok) throw new Error(await errorText(response));
@@ -604,6 +624,33 @@ function showLogsModal(id, text) {
     }
   };
   modal.onclick = function (event) { if (event.target === modal) close(); };
+  // Two-step clear: the first click asks, the second one deletes. A log is
+  // cheap to lose but expensive to explain away, so no one-click path exists.
+  let confirming = false;
+  const clear = button('清空', 'ghost', function () {
+    if (!confirming) {
+      confirming = true;
+      clear.textContent = '确认清空？';
+      clear.classList.remove('ghost');
+      clear.classList.add('danger');
+      return;
+    }
+    confirming = false;
+    clear.disabled = true;
+    clear.textContent = '清空';
+    clear.classList.remove('danger');
+    clear.classList.add('ghost');
+    fetch(logUrl(target), { method: 'DELETE', credentials: 'same-origin', headers: authHeaders() })
+      .then(async function (response) {
+        if (response.status === 404) throw new Error('没有可清空的日志');
+        if (!response.ok) throw new Error(await errorText(response));
+        toast('日志已清空', 'ok');
+        refresh();
+      })
+      .catch(function (error) { toast('清空失败：' + error.message, 'err'); })
+      .finally(function () { clear.disabled = false; });
+  });
+  actions.appendChild(clear);
   actions.appendChild(button('关闭', 'ghost', close));
   panel.appendChild(head);
   panel.appendChild(hint);

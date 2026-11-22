@@ -28,6 +28,8 @@ use super::reply::{
 };
 use super::routes::{self, Endpoint};
 
+mod logs;
+
 const UI: &str = include_str!("../assets/index.html");
 
 use super::blob;
@@ -139,7 +141,10 @@ api_routes! {
     GET    "/api/v1/export/{id}/config"       => export_config,
     GET    "/api/v1/trust"                    => trust_list,
     DELETE "/api/v1/trust/{key}"              => trust_remove,
+    GET    "/api/v1/logs"                     => daemon_logs,
+    DELETE "/api/v1/logs"                     => daemon_logs_clear,
     GET    "/api/v1/logs/{id}"                => logs,
+    DELETE "/api/v1/logs/{id}"                => logs_clear,
     POST   "/api/v1/plugins/{id}/ui-token"    => plugin_ui_token,
 }
 
@@ -367,56 +372,6 @@ impl ApiFace {
         }
     }
 
-    fn logs_rpc(&self, budget: &CallBudget, id: &str, query: &str) -> Response {
-        if let Err(response) = self.require_plugin(budget, id) {
-            return response;
-        }
-        let lines = match support::query_value(query, "lines") {
-            None => 200,
-            Some(value) => match value.parse::<usize>() {
-                Ok(lines) if lines <= 2000 => lines,
-                _ => {
-                    return error_response(
-                        400,
-                        "bad_request",
-                        "lines must be an integer between 0 and 2000",
-                    )
-                }
-            },
-        };
-        let level = match support::query_value(query, "level") {
-            None => None,
-            Some(value) => match Level::parse(&value) {
-                Some(level) => Some(level),
-                None => {
-                    return error_response(
-                        400,
-                        "bad_request",
-                        "level must be one of error, warn, info, debug, trace",
-                    )
-                }
-            },
-        };
-        let path = self.config.paths.logs_dir.join(format!("{}.log", id));
-        match log::tail(&path, lines) {
-            Ok(text) => {
-                let text = match level {
-                    Some(threshold) => log::filter_text(&text, threshold),
-                    None => text,
-                };
-                Response::new(
-                    200,
-                    "text/plain; charset=utf-8",
-                    cap_log(text, self.config.limits.log_max_bytes).into_bytes(),
-                )
-            }
-            Err(cause) if cause.kind() == io::ErrorKind::NotFound => {
-                error_response(404, "not_found", &format!("no log for {}", id))
-            }
-            Err(cause) => error_response(500, "internal", &format!("cannot read log: {}", cause)),
-        }
-    }
-
     fn compat(&self, _call: &ApiCall<'_>) -> Response {
         Response::json(
             200,
@@ -517,10 +472,6 @@ impl ApiFace {
 
     fn trust_remove(&self, call: &ApiCall<'_>) -> Response {
         self.trust_remove_rpc(&call.param("key"))
-    }
-
-    fn logs(&self, call: &ApiCall<'_>) -> Response {
-        self.logs_rpc(call.budget(), &call.param("id"), call.query())
     }
 
     fn login(&self, request: &Request) -> Response {

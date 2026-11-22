@@ -109,6 +109,40 @@ pub(crate) fn script() -> (&'static str, Vec<u8>) {
     }
 }
 
+/// A notify agent that announces itself on stderr once, so its service log is
+/// known to be live before a clear removes it (#262).
+fn chatty_script() -> (&'static str, Vec<u8>) {
+    if cfg!(windows) {
+        (
+            "chatty.cmd",
+            b"@echo off\r\necho chatty ready 1>&2\r\n:loop\r\nset \"line=\"\r\nset /p line=\r\nif errorlevel 1 goto end\r\necho {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\r\ngoto loop\r\n:end\r\n".to_vec(),
+        )
+    } else {
+        (
+            "chatty.sh",
+            b"#!/bin/sh\nprintf 'chatty ready\\n' >&2\nwhile IFS= read -r line; do\n  printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\\n'\ndone\n".to_vec(),
+        )
+    }
+}
+
+/// The chatty agent as a signed package.
+pub(crate) fn chatty_plugin_bundle(key: &SigningKey, id: &str) -> Vec<u8> {
+    let (name, data) = chatty_script();
+    let exec_path = format!("payload/bin/{}", name);
+    let files = vec![(exec_path.clone(), data, 0o755)];
+    let manifest = json!({
+        "schema": 1,
+        "id": id,
+        "name": id,
+        "version": "1.0.0",
+        "desc": "chatty plugin",
+        "platform": target(),
+        "protocol": 1,
+        "exec": {"path": exec_path, "args": [], "ready": "notify"},
+    });
+    signed_package(key, manifest, &files)
+}
+
 pub(crate) fn plugin_package(key: &SigningKey) -> Vec<u8> {
     plugin_bundle(key, "demo", "1.0.0", None, false)
 }

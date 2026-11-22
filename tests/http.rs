@@ -35,6 +35,8 @@ mod control;
 mod install;
 #[path = "http/lifecycle.rs"]
 mod lifecycle;
+#[path = "http/logs.rs"]
+mod logs;
 #[path = "http/mcp.rs"]
 mod mcp;
 #[path = "http/protocol.rs"]

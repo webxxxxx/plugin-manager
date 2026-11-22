@@ -109,6 +109,20 @@ impl Supervisor {
             .unwrap_or(false)
     }
 
+    /// Clear one plugin's log files: the service log (through the live writer
+    /// when the plugin is running) plus the hooks log, which has no persistent
+    /// writer because it exists only for the duration of one hook run.
+    pub(crate) fn clear_logs(&mut self, id: &str) -> std::io::Result<usize> {
+        let rotations = self.config.limits.log_rotations;
+        let logs_dir = self.config.paths.logs_dir.clone();
+        let mut removed = match self.slots.get_mut(id) {
+            Some(slot) => slot.clear_logs()?,
+            None => log::remove_log_files(&logs_dir, id, rotations)?,
+        };
+        removed += log::remove_log_files(&logs_dir, &format!("{}-hooks", id), rotations)?;
+        Ok(removed)
+    }
+
     /// Replace one definition and, when it is not running, its slot. The caller
     /// (compose) decides whether to stop the service first.
     pub(crate) fn install(&mut self, service: Service, running: bool) -> Result<(), String> {

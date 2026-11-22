@@ -168,6 +168,10 @@ impl Daemon {
                 Ok(status) => rpc::ok(id, auth_json(&status)),
                 Err(error) => problem_response(id, -32008, error),
             },
+            control::Command::LogsClear { service } => match self.clear_logs(service) {
+                Ok(value) => rpc::ok(id, value),
+                Err(error) => problem_response(id, -32013, error),
+            },
             control::Command::AuthPasswd { password } => match self.auth_passwd(&password) {
                 Ok(status) => rpc::ok(id, auth_json(&status)),
                 Err(error) => problem_response(id, -32008, error),
@@ -181,6 +185,39 @@ impl Daemon {
                 Problem::Internal.error_data(),
             ),
         }
+    }
+
+    /// Clear the daemon log or one plugin's logs. The daemon log goes through
+    /// its writer because that writer holds the open handle; a plugin's service
+    /// log goes through the slot for the same reason, and its hooks log is
+    /// removed directly (no hook writer outlives the hook).
+    pub(super) fn clear_logs(
+        &mut self,
+        service: Option<String>,
+    ) -> Result<serde_json::Value, ProblemError> {
+        let Some(id) = service else {
+            let files = log::reset_svcd()
+                .map_err(|error| Problem::Internal.error(format!("clear svcd.log: {}", error)))?;
+            log::record(
+                log::Level::Info,
+                &format!("logs cleared: svcd ({} files)", files),
+            );
+            return Ok(json!({"cleared": "svcd", "files": files}));
+        };
+        if self.host.service(&id).is_none() {
+            return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
+        }
+        let files = self
+            .host
+            .clear_logs(&id)
+            .map_err(|error| Problem::Internal.error(format!("clear {} logs: {}", id, error)))?;
+        if files > 0 {
+            log::record(
+                log::Level::Info,
+                &format!("logs cleared: {} ({} files)", id, files),
+            );
+        }
+        Ok(json!({"cleared": id, "files": files}))
     }
 
     #[cfg(feature = "http")]

@@ -64,6 +64,10 @@ pub enum Command {
     AuthPasswd {
         password: String,
     },
+    /// Clear the daemon log (`None`) or one plugin's logs.
+    LogsClear {
+        service: Option<String>,
+    },
     ToolCall(ToolCall),
 }
 
@@ -156,6 +160,9 @@ pub fn parse(request: rpc::Request) -> Result<Call, rpc::Response> {
             }
         }
         "auth.status" => Command::AuthStatus,
+        "svc.logs.clear" => Command::LogsClear {
+            service: params.get("id").and_then(Value::as_str).map(str::to_string),
+        },
         "auth.passwd" => Command::AuthPasswd {
             password: params
                 .get("password")
