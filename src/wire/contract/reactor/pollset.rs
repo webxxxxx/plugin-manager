@@ -54,23 +54,18 @@ impl PollSet {
         }
         retire(sources);
 
-        let mut fds: Vec<libc::pollfd> = Vec::with_capacity(sources.len() + 1);
-        fds.push(libc::pollfd {
-            fd: self.wake.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        });
+        let mut fds: Vec<poll::PollFd> = Vec::with_capacity(sources.len() + 1);
+        fds.push(poll::PollFd::new(self.wake.as_raw_fd(), poll::READ));
         for source in sources.iter() {
             let events = poll_events(source);
-            fds.push(libc::pollfd {
-                fd: if events == 0 {
-                    -1
+            fds.push(poll::PollFd::new(
+                if events == 0 {
+                    poll::NONE
                 } else {
                     source.file.as_raw_fd()
                 },
                 events,
-                revents: 0,
-            });
+            ));
         }
         let blocked_any = sources.iter().any(|source| source.blocked);
         let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
@@ -85,7 +80,7 @@ impl PollSet {
             error!("reactor poll failed: {}", error);
             return;
         }
-        if fds[0].revents & libc::POLLIN != 0 {
+        if fds[0].revents & poll::READ != 0 {
             drain_wake(&self.wake);
         }
 
@@ -97,7 +92,7 @@ impl PollSet {
                 continue;
             }
             let revents = fds[index + 1].revents;
-            if revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) != 0 {
+            if revents & (poll::WRITE | poll::ERROR | poll::HUP) != 0 {
                 write_raw(&mut sources[index]);
             }
         }
@@ -106,7 +101,7 @@ impl PollSet {
                 continue;
             }
             let revents = fds[index + 1].revents;
-            if revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
+            if revents & (poll::READ | poll::ERROR | poll::HUP) != 0 {
                 read_source(&mut sources[index]);
             }
         }
@@ -134,12 +129,12 @@ fn poll_events(source: &Source) -> i16 {
     match &source.kind {
         SourceKind::RawStdin { queue } => {
             if queue.has_pending() {
-                libc::POLLOUT
+                poll::WRITE
             } else {
                 0
             }
         }
-        _ => libc::POLLIN,
+        _ => poll::READ,
     }
 }
 

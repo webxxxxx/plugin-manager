@@ -26,7 +26,7 @@ pub(crate) fn serve_mcp_sse(
     // still server policy: reserve it before the head and before the plugin
     // call starts. The permit lives until this blocking response ends, and a
     // client disconnect ends it below (#135).
-    let _permit = match budget.acquire(
+    let permit = match budget.acquire(
         crate::server::http::StreamClass::LongLived,
         limits.max_streams,
     ) {
@@ -40,6 +40,20 @@ pub(crate) fn serve_mcp_sse(
             return Ok(());
         }
     };
+    serve_mcp_sse_admitted(stream, call, config, limits, permit)
+}
+
+/// The SSE body, for a caller that already holds the long-lived permit.
+///
+/// The poll loop reserves the slot before it decides where the response runs,
+/// so the Windows hand-off must not acquire a second permit.
+pub(crate) fn serve_mcp_sse_admitted(
+    stream: &mut TcpStream,
+    call: transport::StreamingCall,
+    config: &Path,
+    limits: &crate::platform::limits::Limits,
+    _permit: Option<crate::server::http::budget::StreamPermit>,
+) -> std::io::Result<()> {
     stream.write_all(
         b"HTTP/1.1 200 OK\r\n\
           Content-Type: text/event-stream\r\n\
@@ -112,6 +126,37 @@ pub(crate) fn serve_mcp_sse(
         let _ = stream.write_all(b"0\r\n\r\n");
         let _ = stream.flush();
     }
+    Ok(())
+}
+
+/// Run the admitted SSE body on its own thread after the poll loop hands the
+/// socket over. Windows has no wait-set integration for the named-pipe control
+/// stream, so the blocking response cannot run on the loop thread; a dedicated
+/// thread matches the thread driver's cost and is bounded by `max_streams`.
+#[cfg(windows)]
+pub(crate) fn spawn_mcp_sse(
+    stream: &TcpStream,
+    call: transport::StreamingCall,
+    config: Arc<crate::platform::config::Config>,
+    permit: Option<crate::server::http::budget::StreamPermit>,
+) -> std::io::Result<()> {
+    let mut owned = stream.try_clone()?;
+    // The loop's socket is non-blocking; the SSE writer needs blocking writes
+    // now that the loop no longer polls it.
+    owned.set_nonblocking(false)?;
+    let limits = config.limits.clone();
+    std::thread::Builder::new()
+        .name("svcd-mcp-sse".into())
+        .stack_size(crate::platform::host::threads::transfer_stack(&limits))
+        .spawn(move || {
+            let _ = serve_mcp_sse_admitted(
+                &mut owned,
+                call,
+                config.paths.control_dir(),
+                &limits,
+                permit,
+            );
+        })?;
     Ok(())
 }
 

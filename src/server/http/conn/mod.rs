@@ -4,14 +4,14 @@
 //! connection it accepted. Two implementations exist because hosts differ in
 //! what they can wait on:
 //!
-//! - [`poll`] — one poll loop over the listener, the sockets and the control
-//!   channel (Unix);
+//! - [`poll`] — one poll loop over the listener and the sockets (Unix
+//!   `poll(2)`, Windows `WSAPoll`); on Unix it also owns the control channel;
 //! - [`threaded`] — one thread per accepted connection, with the admission
-//!   caps applied before the thread exists (every other host).
+//!   caps applied before the thread exists (a host with no wait set).
 //!
 //! Everything a driver needs arrives in one [`StartInput`]; nothing above this
-//! module branches on the platform, and adding a third driver later (IOCP)
-//! means one more `impl ConnectionDriver` plus one line in `entry`.
+//! module branches on the platform, and adding another driver means one more
+//! `impl ConnectionDriver` plus one line in `entry`.
 
 use std::io;
 use std::net::TcpListener;
@@ -24,9 +24,9 @@ use crate::server::http::hooks::{FallbackHandler, PreBodyRoutes};
 use crate::server::http::Face;
 use crate::wire::contract::rawhub::RawHub;
 
-#[cfg(unix)]
 pub(crate) mod poll;
-#[cfg_attr(unix, allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(any(unix, windows), allow(dead_code))]
 pub(crate) mod threaded;
 
 /// How the composition root hands the UI bus its wake-up hook: the installer
@@ -53,24 +53,19 @@ pub(crate) trait ConnectionDriver {
 
 /// Handle over the running driver.
 pub(crate) struct ServerHandle {
-    #[cfg(unix)]
-    inner: Option<crate::server::control::handle::LoopHandle>,
+    inner: Option<crate::server::http::server::handle::LoopHandle>,
     stop: Arc<AtomicBool>,
 }
 
 impl ServerHandle {
     /// Handle for a driver the caller runs itself (the thread driver).
+    #[cfg_attr(any(unix, windows), allow(dead_code))]
     pub(crate) fn thread(stop: Arc<AtomicBool>) -> Self {
-        Self {
-            #[cfg(unix)]
-            inner: None,
-            stop,
-        }
+        Self { inner: None, stop }
     }
 
     /// Handle over a poll loop that is already running.
-    #[cfg(unix)]
-    pub(crate) fn poll(inner: crate::server::control::handle::LoopHandle) -> Self {
+    pub(crate) fn poll(inner: crate::server::http::server::handle::LoopHandle) -> Self {
         Self {
             inner: Some(inner),
             stop: Arc::new(AtomicBool::new(false)),
@@ -79,7 +74,6 @@ impl ServerHandle {
 
     /// Ask the driver to shut down. Safe to call once.
     pub(crate) fn shutdown(&self) {
-        #[cfg(unix)]
         if let Some(inner) = &self.inner {
             inner.shutdown();
         }
@@ -126,9 +120,9 @@ mod tests {
 
     #[test]
     fn the_host_driver_implements_the_seam() {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         assert_driver::<poll::Driver>();
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         assert_driver::<threaded::Driver>();
     }
 }

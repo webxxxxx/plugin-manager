@@ -11,7 +11,7 @@ pub(crate) mod conn;
 pub mod contract;
 pub mod date;
 pub mod dispatch;
-#[cfg(all(unix, feature = "http"))]
+#[cfg(feature = "http")]
 pub mod driver;
 pub mod engine;
 #[cfg(feature = "http")]
@@ -24,7 +24,7 @@ pub(crate) mod hooks;
 pub mod model;
 #[cfg_attr(not(unix), allow(dead_code))]
 pub mod pool;
-#[cfg(all(unix, feature = "http"))]
+#[cfg(feature = "http")]
 pub mod server;
 pub mod stream;
 #[cfg(all(test, feature = "http"))]
