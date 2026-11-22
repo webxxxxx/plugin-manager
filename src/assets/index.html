@@ -87,6 +87,7 @@
           <button class="ghost menu-btn" id="morebtn" onclick="toggleMore(event)" aria-haspopup="menu" aria-expanded="false" aria-label="更多操作" title="更多">⋮</button>
           <div class="menu hidden" id="moremenu" role="menu">
             <button role="menuitem" onclick="openSettings()">设置</button>
+            <button role="menuitem" onclick="openUpgrade()">检查更新</button>
             <button role="menuitem" onclick="openDaemonLogs()">查看日志</button>
             <button role="menuitem" onclick="pickTrust()">添加公钥</button>
           </div>
@@ -923,6 +924,100 @@ function showSettingsModal(data) {
   modal.onclick = function (event) { if (event.target === modal) close(); };
   actions.appendChild(close);
   actions.appendChild(save);
+  panel.appendChild(actions);
+  modal.appendChild(panel);
+  document.body.appendChild(modal);
+}
+
+function openUpgrade() {
+  if (BUSY) return;
+  closeMore();
+  lock(true);
+  api('/api/v1/upgrade/check').then(function (data) {
+    lock(false);
+    showUpgradeModal(data);
+  }).catch(function (error) {
+    lock(false);
+    toast('检查更新失败：' + error.message, 'err');
+  });
+}
+
+function showUpgradeModal(data) {
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  const panel = document.createElement('div');
+  panel.className = 'panel';
+  panel.style.width = '460px';
+  panel.style.maxWidth = '90vw';
+  const title = document.createElement('h1');
+  title.textContent = '检查更新';
+  title.style.fontSize = '16px';
+  title.style.margin = '0 0 10px';
+  panel.appendChild(title);
+
+  const status = document.createElement('p');
+  if (!data.store) {
+    status.textContent = '没有安装 plugin-store，无法在线检查更新。先安装插件商店，或用 `svcd upgrade --file <归档>` 离线升级。';
+  } else {
+    status.textContent = '当前 svcd ' + data.current + ' → 最新 ' + (data.latest || '未知') +
+      (data.newer ? '（有新版本）' : (data.latest === data.current ? '（已是最新）' : '（当前比线上新，可降级）'));
+  }
+  panel.appendChild(status);
+
+  const actions = document.createElement('div');
+  actions.className = 'row';
+  actions.style.justifyContent = 'flex-end';
+  actions.style.gap = '8px';
+  actions.style.marginTop = '12px';
+  let timer = null;
+  function close() {
+    if (timer) { clearInterval(timer); timer = null; }
+    modal.remove();
+  }
+  if (data.store && data.newer) {
+    const apply = button('升级并重启', '', function () {
+      apply.disabled = true;
+      status.textContent = '正在下载并校验升级包…';
+      fetch('/api/v1/upgrade/apply', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: authHeaders()
+      }).then(async function (response) {
+        if (!response.ok) throw new Error(await errorText(response));
+        return response.json();
+      }).then(function (result) {
+        if (!result.restarting) {
+          status.textContent = result.hint || '已升级，重启 daemon 后生效'; 
+          return;
+        }
+        status.textContent = '正在重启…新版本 ' + result.version;
+        const started = Date.now();
+        timer = setInterval(function () {
+          fetch('/api/v1/version', { credentials: 'same-origin', headers: authHeaders() })
+            .then(function (response) { return response.ok ? response.json() : null; })
+            .then(function (value) {
+              if (value && value.version === result.version) {
+                clearInterval(timer);
+                timer = null;
+                location.reload();
+              }
+            })
+            .catch(function () {});
+          if (Date.now() - started > 120000) {
+            clearInterval(timer);
+            timer = null;
+            status.textContent = '升级后 2 分钟内没有回来；检查 `svcd status` 与日志。';
+          }
+        }, 500);
+      }).catch(function (error) {
+        apply.disabled = false;
+        status.textContent = '升级失败：' + error.message;
+      });
+    });
+    actions.appendChild(apply);
+  }
+  actions.appendChild(button('关闭', 'ghost', close));
+  modal.onclick = function (event) { if (event.target === modal) close(); };
   panel.appendChild(actions);
   modal.appendChild(panel);
   document.body.appendChild(modal);

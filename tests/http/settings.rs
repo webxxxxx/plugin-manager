@@ -2,14 +2,6 @@
 
 use super::*;
 
-impl Sandbox {
-    /// A daemon that reports the unprivileged (user) role, which is what the
-    /// restart policy keys on. The default sandbox env forces the service role.
-    fn start_daemon_as_user(&mut self) {
-        self.start_daemon_with_env("127.0.0.1:0", &[("SVCD_TEST_PRIVILEGE", "unprivileged")]);
-    }
-}
-
 fn user_command(sandbox: &Sandbox) -> std::process::Command {
     let mut command = std::process::Command::new(&sandbox.svcd);
     sandbox.env(&mut command);
