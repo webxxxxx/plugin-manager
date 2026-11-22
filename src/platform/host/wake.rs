@@ -3,26 +3,20 @@
 //! waits with a timeout only to service timers/shutdown, so an idle service
 //! does not spin on a fixed polling tick.
 //!
-//! The supervisor loop may instead wait inside a poll set (it owns plugin
-//! stdio, #126). `set_interrupt` attaches the poll's self-pipe, so `notify`
-//! also pokes that pipe and a management request returns at once instead of at
-//! the poll timeout. The latch stays for the paths without a poll set (Windows).
+//! The supervisor loop may instead wait inside the reactor (it owns plugin
+//! stdio, #126). `set_interrupt` attaches the reactor's interrupt, so `notify`
+//! also ends that wait and a management request returns at once instead of at
+//! the timeout. The latch stays for the paths without a reactor.
 
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
-
-#[cfg(unix)]
-use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
 
 pub(crate) struct Wake {
     pending: Mutex<bool>,
     condvar: Condvar,
-    /// Write end of a poll loop's self-pipe. `None` keeps the condvar-only
-    /// behaviour of the thread-per-connection paths.
-    #[cfg(unix)]
-    interrupt: Mutex<Option<UnixStream>>,
+    /// Poke for a wait set that owns this latch: the Unix self-pipe write or
+    /// the Windows IOCP completion. `None` keeps the condvar-only behaviour.
+    interrupt: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Wake {
@@ -30,14 +24,12 @@ impl Wake {
         Wake {
             pending: Mutex::new(false),
             condvar: Condvar::new(),
-            #[cfg(unix)]
             interrupt: Mutex::new(None),
         }
     }
 
-    /// Attach the self-pipe of the poll set that now owns this latch.
-    #[cfg(unix)]
-    pub(crate) fn set_interrupt(&self, interrupt: UnixStream) {
+    /// Attach the wait set's interrupt to this latch.
+    pub(crate) fn set_interrupt(&self, interrupt: Arc<dyn Fn() + Send + Sync>) {
         let mut slot = self
             .interrupt
             .lock()
@@ -52,18 +44,15 @@ impl Wake {
             .unwrap_or_else(|error| error.into_inner());
         *pending = true;
         self.condvar.notify_one();
-        #[cfg(unix)]
-        {
-            // One byte per notify, never coalesced: a poll pass drains the pipe
-            // before waking, so coalescing here could swallow the only byte a
-            // later producer needed and leave its work waiting for the timeout.
-            let mut slot = self
-                .interrupt
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if let Some(interrupt) = slot.as_mut() {
-                let _ = interrupt.write(&[1]);
-            }
+        // One poke per notify, never coalesced: the wait set drains its own
+        // interrupt before returning, so coalescing here could swallow the only
+        // wake a later producer needed.
+        let slot = self
+            .interrupt
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(interrupt) = slot.as_ref() {
+            interrupt();
         }
     }
 

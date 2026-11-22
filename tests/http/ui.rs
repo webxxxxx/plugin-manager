@@ -467,13 +467,8 @@ fn plugin_ui_raw_requires_a_raw_capable_plugin() {
     let mut body = Vec::new();
     let _ = stream.read_to_end(&mut body);
     let body = String::from_utf8_lossy(&body).to_ascii_lowercase();
-    if cfg!(windows) {
-        assert_eq!(status, 501, "{head}");
-        assert!(body.contains("not_supported"), "{head}{body}");
-    } else {
-        assert_eq!(status, 503, "{head}");
-        assert!(body.contains("raw_unavailable"), "{head}{body}");
-    }
+    assert_eq!(status, 503, "{head}");
+    assert!(body.contains("raw_unavailable"), "{head}{body}");
 }
 
 #[cfg(unix)]

@@ -518,6 +518,7 @@
     "src/wire/contract/rawhub.rs": "rawhub",
     "src/wire/contract/reactor.rs": "reactor",
     "src/wire/contract/reactor/dispatch.rs": "reactor",
+    "src/wire/contract/reactor/iocp.rs": "reactor",
     "src/wire/contract/reactor/pollset.rs": "reactor",
     "src/wire/contract/stdio.rs": "stdio",
     "src/wire/contract/stdio/platform.rs": "stdio",

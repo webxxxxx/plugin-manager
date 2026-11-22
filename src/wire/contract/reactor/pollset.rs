@@ -1,5 +1,24 @@
+//! Unix readiness backend: one `poll(2)` set for every plugin pipe.
+//!
+//! The reactor owns no thread; `poll` is called by the supervisor loop. The
+//! self-pipe is the interrupt: producers write one byte, the pass drains it and
+//! returns to the caller.
+
+use std::io::Write;
+use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream;
+use std::sync::mpsc::Receiver;
+
 use super::dispatch::{drain_source, read_source, write_raw};
 use super::*;
+use crate::platform::host::poll;
+
+/// The Unix wait set: the sources plus the interrupt pipe.
+pub(super) struct PollSet {
+    rx: Receiver<Command>,
+    wake: UnixStream,
+    sources: Vec<Source>,
+}
 
 /// Ask for a larger pipe so one poll pass can hand a whole raw frame to the
 /// plugin instead of trickling it in 64 KiB slices. Best effort: the kernel
@@ -18,6 +37,29 @@ pub(super) fn enlarge_pipe(file: &File) {
 pub(super) fn enlarge_pipe(_file: &File) {}
 
 impl PollSet {
+    /// Build the wait set and its interrupt. No thread is started.
+    pub(super) fn start(rx: Receiver<Command>) -> io::Result<(Self, Interrupt)> {
+        let (wake_rx, wake) = UnixStream::pair()?;
+        wake_rx.set_nonblocking(true)?;
+        wake.set_nonblocking(true)?;
+        let wake = Arc::new(wake);
+        let interrupt: Interrupt = {
+            let wake = wake.clone();
+            Arc::new(move || {
+                let mut handle = &*wake;
+                let _ = handle.write(&[1]);
+            })
+        };
+        Ok((
+            PollSet {
+                rx,
+                wake: wake_rx,
+                sources: Vec::new(),
+            },
+            interrupt,
+        ))
+    }
+
     /// Apply every registration change queued since the last pass.
     pub(super) fn apply_commands(&mut self) {
         loop {
@@ -135,48 +177,6 @@ fn poll_events(source: &Source) -> i16 {
             }
         }
         _ => poll::READ,
-    }
-}
-
-/// One raw plugin being told why its transport closed: id, hub handle, reason.
-type ClosingEntry = (String, Option<(Weak<dyn RawStopSink>, u64)>, RawFailure);
-
-/// Drop every source marked dead and tell the raw hub which plugins lost
-/// their transport.
-fn retire(sources: &mut Vec<Source>) {
-    if !sources.iter().any(|source| source.stop.is_some()) {
-        return;
-    }
-    let mut kept = Vec::with_capacity(sources.len());
-    let mut closing: Vec<ClosingEntry> = Vec::new();
-    let mut closed = HashSet::new();
-    for source in sources.drain(..) {
-        match source.stop {
-            None => kept.push(source),
-            Some(Stop::Single) => {}
-            Some(Stop::Plugin(reason)) => {
-                if closed.insert(source.key.clone()) {
-                    closing.push((source.key.clone(), source.hub.clone(), reason));
-                }
-            }
-        }
-    }
-    kept.retain(|source| !closed.contains(&source.key));
-    *sources = kept;
-    for (key, hub, reason) in closing {
-        let Some((hub, generation)) = hub else {
-            continue;
-        };
-        let Some(hub) = hub.upgrade() else { continue };
-        hub.note_transport_failure(reason, &key);
-        hub.unregister_generation(&key, generation);
-    }
-}
-
-pub(super) fn stop_for(source: &Source, reason: RawFailure) -> Stop {
-    match &source.kind {
-        SourceKind::RawStdin { .. } | SourceKind::RawStdout { .. } => Stop::Plugin(reason),
-        _ => Stop::Single,
     }
 }
 

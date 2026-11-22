@@ -38,8 +38,9 @@ Accepted（2026-11-22）。细化 [docs/architecture.md](../architecture.md) §8
 - **线程记账跟随拓扑**：连接是 wait set 条目不是线程，所以删掉
   `stack_per_connection`，`Limits::threads()` 两端都是 loop 线程 + blocking 线程；
   同一预算、同一 `ResourceProfile` 下 Windows 与 Linux 派生出的连接数相同。
-- **插件 stdio 反应器保持 Unix-only**：子进程匿名管道不能进 `WSAPoll`，Windows 仍走
-  每管道读线程（S6 的 stdio seam）；`/raw` 在非 Unix 上仍明确回 501。
+- **插件 stdio 反应器不在本 ADR 内**：它的 Windows 后端由
+  [ADR-0028](0028-windows-plugin-stdio-reactor.md) 补齐（overlapped 命名管道 + IOCP），
+  Windows 上同样零线程，`/raw` 也不再回 501。
 
 ## Considered options
 

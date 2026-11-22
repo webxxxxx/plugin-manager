@@ -1,6 +1,6 @@
-use super::pollset::stop_for;
 use super::*;
 
+#[cfg(unix)]
 pub(super) fn write_raw(source: &mut Source) {
     let SourceKind::RawStdin { queue } = &source.kind else {
         return;
@@ -13,6 +13,7 @@ pub(super) fn write_raw(source: &mut Source) {
 
 /// Returns false when the source hit EOF or a protocol violation and must be
 /// removed. The reactor owns the file; dropping it closes the descriptor.
+#[cfg(unix)]
 pub(super) fn read_source(source: &mut Source) {
     if matches!(source.kind, SourceKind::RawStdout { .. }) {
         read_raw(source);
@@ -23,19 +24,19 @@ pub(super) fn read_source(source: &mut Source) {
 
 /// Drain a non-blocking raw stdout until the kernel reports it empty. The
 /// budget bounds how much one plugin can move per poll pass.
+#[cfg(unix)]
 fn read_raw(source: &mut Source) {
     let mut chunk = vec![0u8; RAW_READ_CHUNK];
     let mut budget = RAW_READ_BUDGET;
     loop {
         match source.file.read(&mut chunk) {
             Ok(0) => {
-                source.stop = Some(Stop::Plugin(RawFailure::PluginEof));
+                on_raw_eof(source);
                 return;
             }
             Ok(read) => {
-                source.buffer.extend_from_slice(&chunk[..read]);
-                if !drain_raw_frames(source) {
-                    source.stop = Some(Stop::Plugin(RawFailure::FrameTooLarge));
+                on_raw_bytes(source, &chunk[..read]);
+                if source.stop.is_some() {
                     return;
                 }
                 budget = budget.saturating_sub(read);
@@ -46,36 +47,57 @@ fn read_raw(source: &mut Source) {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => {
-                source.stop = Some(Stop::Plugin(RawFailure::PluginEof));
+                on_raw_eof(source);
                 return;
             }
         }
     }
 }
 
+#[cfg(unix)]
 fn read_stream(source: &mut Source) {
     let mut chunk = [0u8; READ_CHUNK];
     match source.file.read(&mut chunk) {
-        Ok(0) => {
-            if let SourceKind::Frames { sender, .. } = &source.kind {
-                let _ = sender.try_send(FrameEvent::Closed);
-            }
-            source.stop = Some(stop_for(source, RawFailure::PluginEof));
-        }
-        Ok(read) => {
-            source.buffer.extend_from_slice(&chunk[..read]);
-            if !drain_source(source) {
-                source.stop = Some(stop_for(source, RawFailure::FrameTooLarge));
-            }
-        }
+        Ok(0) => on_stream_eof(source),
+        Ok(read) => on_stream_bytes(source, &chunk[..read]),
         Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-        Err(error) => {
-            if let SourceKind::Frames { sender, .. } = &source.kind {
-                let _ = sender.try_send(FrameEvent::Frame(Err(FrameError::Io(error))));
-            }
-            source.stop = Some(stop_for(source, RawFailure::PluginEof));
-        }
+        Err(error) => on_stream_error(source, error),
     }
+}
+
+/// Bytes arrived for a framed or log source. Shared with the completion
+/// backend: both hosts only differ in how the bytes were read.
+pub(super) fn on_stream_bytes(source: &mut Source, chunk: &[u8]) {
+    source.buffer.extend_from_slice(chunk);
+    if !drain_source(source) {
+        source.stop = Some(stop_for(source, RawFailure::FrameTooLarge));
+    }
+}
+
+pub(super) fn on_stream_eof(source: &mut Source) {
+    if let SourceKind::Frames { sender, .. } = &source.kind {
+        let _ = sender.try_send(FrameEvent::Closed);
+    }
+    source.stop = Some(stop_for(source, RawFailure::PluginEof));
+}
+
+pub(super) fn on_stream_error(source: &mut Source, error: io::Error) {
+    if let SourceKind::Frames { sender, .. } = &source.kind {
+        let _ = sender.try_send(FrameEvent::Frame(Err(FrameError::Io(error))));
+    }
+    source.stop = Some(stop_for(source, RawFailure::PluginEof));
+}
+
+/// Bytes arrived for a protocol-3 command's stdout.
+pub(super) fn on_raw_bytes(source: &mut Source, chunk: &[u8]) {
+    source.buffer.extend_from_slice(chunk);
+    if !drain_raw_frames(source) {
+        source.stop = Some(Stop::Plugin(RawFailure::FrameTooLarge));
+    }
+}
+
+pub(super) fn on_raw_eof(source: &mut Source) {
+    source.stop = Some(Stop::Plugin(RawFailure::PluginEof));
 }
 
 pub(super) fn drain_source(source: &mut Source) -> bool {

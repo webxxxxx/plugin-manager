@@ -229,7 +229,7 @@ _Avoid_: 接管、takeover、handler 调用
 _Avoid_: 用 reactor 指这个循环（reactor 专指插件 stdio 反应器）、HTTP 线程池
 
 **插件 stdio 反应器（Plugin stdio reactor）**:
-Unix 上拥有插件管道的那个 poll 集：通知型插件的 stdout/stderr、exec 型插件的日志、协议 3 插件的 stdin/stdout/stderr 都由它读写，所以每个插件不再自带线程。它没有自己的线程——supervisor loop 在自己的循环里驱动它（`Reactor::poll_once`），注册与唤醒走命令通道加 self-pipe。超时/背压由每条管道自己的队列决定，不是线程阻塞。反应器不存在（或非 Unix 构建）时才退回「每插件读写线程」的降级路径。
+拥有插件管道的那个 wait 集：通知型插件的 stdout/stderr、exec 型插件的日志、协议 3 插件的 stdin/stdout/stderr 都由它读写，所以每个插件不自带线程。Unix 用 `poll(2)`，Windows 用 IOCP + overlapped 命名管道（ADR-0028）。它没有自己的线程——supervisor loop 在自己的循环里驱动它（`Reactor::poll_once`），注册与唤醒走命令通道加中断（Unix self-pipe、Windows 完成包）。超时/背压由每条管道自己的队列决定，不是线程阻塞。反应器启动失败时才退回「每插件读写线程」的降级路径。
 _Avoid_: IO 线程池、epoll 管理器、反应器线程
 
 **raw 传输（Raw transport）**:
