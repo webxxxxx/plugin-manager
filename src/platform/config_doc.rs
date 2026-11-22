@@ -53,6 +53,20 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// The machine-readable form the console maps to an input control.
+    pub fn code(self) -> &'static str {
+        match self {
+            Kind::Enum => "enum",
+            Kind::Bytes => "bytes",
+            Kind::Seconds => "seconds",
+            Kind::Count => "count",
+            Kind::Bool => "bool",
+            Kind::SocketAddr => "socket-addr",
+            Kind::Path => "path",
+            Kind::PasswordHash => "password-hash",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Kind::Enum => "枚举",

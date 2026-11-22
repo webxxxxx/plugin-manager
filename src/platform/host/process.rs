@@ -65,6 +65,34 @@ pub(crate) fn configure(command: &mut Command, kind: Kind) {
     }
 }
 
+/// Stop this process's standard handles from being inherited by new children.
+///
+/// Rust spawns Windows children with `bInheritHandles = TRUE` and only marks the
+/// handles it passes inheritable; any *already* inheritable handle (the pipes a
+/// caller gave this process) still flows into the child. A daemon started by a
+/// helper must not keep its caller's stdout pipe open, or a reader waiting for
+/// EOF blocks until the daemon dies (#263).
+#[cfg(windows)]
+pub(crate) fn detach_stdio() {
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
+        let handle = unsafe { GetStdHandle(id) };
+        if !handle.is_null() {
+            // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
+            unsafe {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn detach_stdio() {}
+
 /// Attach a child to the daemon-wide guard (parent-death protection).
 pub(crate) fn adopt(child: &Child) -> Result<(), String> {
     imp::adopt(child)

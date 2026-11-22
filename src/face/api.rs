@@ -29,6 +29,7 @@ use super::reply::{
 use super::routes::{self, Endpoint};
 
 mod logs;
+mod settings;
 
 const UI: &str = include_str!("../assets/index.html");
 
@@ -141,6 +142,8 @@ api_routes! {
     GET    "/api/v1/export/{id}/config"       => export_config,
     GET    "/api/v1/trust"                    => trust_list,
     DELETE "/api/v1/trust/{key}"              => trust_remove,
+    GET    "/api/v1/settings"                 => settings,
+    PUT    "/api/v1/settings"                 => settings_put,
     GET    "/api/v1/logs"                     => daemon_logs,
     DELETE "/api/v1/logs"                     => daemon_logs_clear,
     GET    "/api/v1/logs/{id}"                => logs,

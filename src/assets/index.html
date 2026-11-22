@@ -86,6 +86,7 @@
         <span class="menu-wrap">
           <button class="ghost menu-btn" id="morebtn" onclick="toggleMore(event)" aria-haspopup="menu" aria-expanded="false" aria-label="更多操作" title="更多">⋮</button>
           <div class="menu hidden" id="moremenu" role="menu">
+            <button role="menuitem" onclick="openSettings()">设置</button>
             <button role="menuitem" onclick="openDaemonLogs()">查看日志</button>
             <button role="menuitem" onclick="pickTrust()">添加公钥</button>
           </div>
@@ -659,6 +660,272 @@ function showLogsModal(target, text) {
   modal.appendChild(panel);
   document.body.appendChild(modal);
   pre.scrollTop = pre.scrollHeight;
+}
+
+function openSettings() {
+  if (BUSY) return;
+  closeMore();
+  lock(true);
+  api('/api/v1/settings').then(function (data) {
+    lock(false);
+    showSettingsModal(data);
+  }).catch(function (error) {
+    lock(false);
+    toast('读取设置失败：' + error.message, 'err');
+  });
+}
+
+function settingsValueText(value) {
+  if (value === null || value === undefined) return '-';
+  if (typeof value === 'boolean') return value ? '开' : '关';
+  return String(value);
+}
+
+function showSettingsModal(data) {
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  const panel = document.createElement('div');
+  panel.className = 'panel';
+  panel.style.maxHeight = '82vh';
+  panel.style.overflowY = 'auto';
+  panel.style.width = '640px';
+  panel.style.maxWidth = '92vw';
+
+  const head = document.createElement('div');
+  head.className = 'row';
+  const title = document.createElement('h1');
+  title.textContent = '设置';
+  title.style.fontSize = '16px';
+  title.style.margin = '0';
+  title.style.flex = '1';
+  head.appendChild(title);
+  panel.appendChild(head);
+
+  const hint = document.createElement('p');
+  hint.className = 'muted';
+  hint.textContent = '写入 ' + (data.path || '（未找到 svcd.conf）') +
+    '。鼠标悬停参数名看作用、推荐值与默认值；保存后 daemon 会自动重启（系统服务模式下由服务管理器重启）。';
+  panel.appendChild(hint);
+
+  const changes = {};
+  const groups = [];
+  const byGroup = {};
+  data.keys.forEach(function (entry) {
+    if (!byGroup[entry.group]) {
+      byGroup[entry.group] = [];
+      groups.push(entry.group);
+    }
+    byGroup[entry.group].push(entry);
+  });
+
+  function note(text) {
+    const line = document.createElement('div');
+    line.className = 'muted';
+    line.textContent = text;
+    return line;
+  }
+
+  function mark(key, value) {
+    changes[key] = value;
+  }
+
+  function field(entry) {
+    const row = document.createElement('div');
+    row.style.margin = '10px 0';
+    const label = document.createElement('div');
+    label.style.display = 'flex';
+    label.style.gap = '8px';
+    label.style.alignItems = 'baseline';
+    const name = document.createElement('strong');
+    name.textContent = entry.key;
+    name.style.fontSize = '13px';
+    name.title = '作用：' + entry.doc + '\n推荐：' + entry.recommend + '\n默认：' + entry.default;
+    label.appendChild(name);
+    const source = document.createElement('span');
+    source.className = 'muted';
+    source.textContent = entry.source === 'env' ? '环境变量覆盖' : (entry.source === 'file' ? '来自文件' : '默认/派生');
+    label.appendChild(source);
+    row.appendChild(label);
+
+    if (!entry.editable) {
+      const value = document.createElement('div');
+      value.style.fontSize = '13px';
+      value.textContent = settingsValueText(entry.effective) + '（只读：' + entry.recommend + '）';
+      row.appendChild(value);
+      return row;
+    }
+
+    if (entry.kind === 'bool') {
+      const select = document.createElement('select');
+      [['on', '开'], ['off', '关']].forEach(function (option) {
+        const item = document.createElement('option');
+        item.value = option[0];
+        item.textContent = option[1];
+        select.appendChild(item);
+      });
+      select.value = (entry.value === 'off' ? 'off' : 'on');
+      select.onchange = function () { mark(entry.key, select.value); };
+      row.appendChild(select);
+    } else if (entry.kind === 'enum') {
+      const options = entry.key === 'workload'
+        ? ['tiny', 'interactive', 'streaming']
+        : ['error', 'warn', 'info', 'debug', 'trace'];
+      const select = document.createElement('select');
+      options.forEach(function (option) {
+        const item = document.createElement('option');
+        item.value = option;
+        item.textContent = option;
+        select.appendChild(item);
+      });
+      select.value = entry.value || entry.effective || options[0];
+      select.onchange = function () { mark(entry.key, select.value); };
+      row.appendChild(select);
+    } else {
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.style.width = '100%';
+      input.value = entry.value === null || entry.value === undefined ? '' : entry.value;
+      input.placeholder = String(entry.effective === null ? '' : settingsValueText(entry.effective));
+      input.oninput = function () { mark(entry.key, input.value === '' ? null : input.value); };
+      row.appendChild(input);
+    }
+    row.appendChild(note('推荐：' + entry.recommend));
+    return row;
+  }
+
+  function passwordField() {
+    const row = document.createElement('div');
+    row.style.margin = '10px 0';
+    const label = document.createElement('div');
+    const name = document.createElement('strong');
+    name.textContent = 'auth_passwd';
+    name.style.fontSize = '13px';
+    name.title = '作用：网页/API 口令哈希。永远不写明文。\n推荐：至少 12 位随机字符。\n默认：未设。';
+    label.appendChild(name);
+    row.appendChild(label);
+    const first = document.createElement('input');
+    first.type = 'password';
+    first.placeholder = '新密码';
+    first.style.marginRight = '6px';
+    const second = document.createElement('input');
+    second.type = 'password';
+    second.placeholder = '确认密码';
+    row.appendChild(first);
+    row.appendChild(second);
+    const clearLabel = document.createElement('label');
+    clearLabel.className = 'check';
+    const clear = document.createElement('input');
+    clear.type = 'checkbox';
+    clearLabel.appendChild(clear);
+    clearLabel.appendChild(document.createTextNode('清除密码'));
+    row.appendChild(clearLabel);
+    row.appendChild(note('改密码后旧登录会话失效；清除密码后非回环监听会退回 127.0.0.1。'));
+    function refresh() {
+      if (clear.checked) {
+        mark('auth_passwd', null);
+        return;
+      }
+      if (!first.value) {
+        delete changes.auth_passwd;
+        return;
+      }
+      if (first.value !== second.value) {
+        mark('auth_passwd', undefined);
+        return;
+      }
+      mark('auth_passwd', first.value);
+    }
+    first.oninput = refresh;
+    second.oninput = refresh;
+    clear.onchange = refresh;
+    return row;
+  }
+
+  groups.forEach(function (group) {
+    const heading = document.createElement('div');
+    heading.style.marginTop = '16px';
+    heading.style.fontWeight = '600';
+    heading.style.fontSize = '13px';
+    heading.textContent = group;
+    panel.appendChild(heading);
+    byGroup[group].forEach(function (entry) {
+      if (entry.kind === 'password-hash') {
+        panel.appendChild(passwordField());
+      } else {
+        panel.appendChild(field(entry));
+      }
+    });
+  });
+
+  const actions = document.createElement('div');
+  actions.className = 'row';
+  actions.style.justifyContent = 'flex-end';
+  actions.style.marginTop = '16px';
+  actions.style.gap = '8px';
+  let restartTimer = null;
+  let elapsed = 0;
+  function stopPolling() {
+    if (restartTimer) { clearInterval(restartTimer); restartTimer = null; }
+  }
+  function waitForRestart() {
+    hint.textContent = '正在重启…保存的值在 daemon 回来之后生效。';
+    stopPolling();
+    restartTimer = setInterval(function () {
+      elapsed += 500;
+      fetch('/api/v1/version', { credentials: 'same-origin', headers: authHeaders() })
+        .then(function (response) {
+          if (response.ok) {
+            stopPolling();
+            location.reload();
+          }
+        })
+        .catch(function () {});
+      if (elapsed > 30000) {
+        stopPolling();
+        hint.textContent = '重启后 30 秒内没有回来；检查日志或用服务管理器手动重启。';
+      }
+    }, 500);
+  }
+  const save = button('保存', '', function () {
+    if (changes.auth_passwd === undefined) {
+      toast('两次输入的密码不一致', 'err');
+      return;
+    }
+    const values = {};
+    Object.keys(changes).forEach(function (key) { values[key] = changes[key]; });
+    if (Object.keys(values).length === 0) {
+      toast('没有改动');
+      return;
+    }
+    save.disabled = true;
+    fetch('/api/v1/settings', {
+      method: 'PUT',
+      credentials: 'same-origin',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ values: values })
+    }).then(async function (response) {
+      if (!response.ok) throw new Error(await errorText(response));
+      return response.json();
+    }).then(function (result) {
+      save.disabled = false;
+      if (result.restarting) {
+        waitForRestart();
+      } else {
+        toast(result.hint || '已保存，重启 daemon 后生效', 'ok');
+        modal.remove();
+      }
+    }).catch(function (error) {
+      save.disabled = false;
+      toast('保存失败：' + error.message, 'err');
+    });
+  });
+  const close = button('关闭', 'ghost', function () { stopPolling(); modal.remove(); });
+  modal.onclick = function (event) { if (event.target === modal) close(); };
+  actions.appendChild(close);
+  actions.appendChild(save);
+  panel.appendChild(actions);
+  modal.appendChild(panel);
+  document.body.appendChild(modal);
 }
 
 function exportPlugin(id, kind) {
