@@ -464,6 +464,22 @@ impl Slot {
             stderr,
         } = streams;
 
+        // Protocol 3 always runs over the raw transport: the hub owns stdio,
+        // stream 0 carries JSON-RPC when the instance is a channel peer, and
+        // streams >= 1 carry raw payloads. Below is the JSON-only path.
+        if self.frames.protocol() == RAW_PROTOCOL {
+            self.stdin = None;
+            let (Some(stdin), Some(stdout), Some(stderr)) = (stdin, stdout, stderr) else {
+                return abandon(&mut child, "protocol 3 needs piped stdio");
+            };
+            if let Err(error) = self.start_raw_transport(stdin, stdout, stderr, log.clone()) {
+                return abandon(&mut child, error);
+            }
+            self.child = Some(child);
+            self.adopted = false;
+            return Ok(pid);
+        }
+
         if self.exec.ready == Ready::Notify {
             let (sender, receiver) = mpsc::sync_channel(FRAME_QUEUE);
             let Some(stdout) = stdout else {
@@ -497,30 +513,6 @@ impl Slot {
             let Some(stderr) = stderr else {
                 return abandon(&mut child, "piped stderr is missing");
             };
-
-            if self.frames.protocol() == RAW_PROTOCOL {
-                let Some(stdin) = stdin else {
-                    return abandon(&mut child, "piped stdin is missing");
-                };
-                let Some(hub) = self.raw_hub.clone() else {
-                    return abandon(&mut child, "raw transport is unavailable");
-                };
-                if let Err(error) = hub.register(
-                    self.id.clone(),
-                    Streams {
-                        stdin: Some(stdin),
-                        stdout: Some(stdout),
-                        stderr: Some(stderr),
-                    },
-                    log.clone(),
-                ) {
-                    return abandon(&mut child, error);
-                }
-                self.frames.detach();
-                self.child = Some(child);
-                self.adopted = false;
-                return Ok(pid);
-            }
 
             if let Err(error) = self.stdio.logs(
                 self.id.clone(),

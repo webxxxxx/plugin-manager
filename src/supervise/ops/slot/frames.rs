@@ -100,6 +100,23 @@ impl Slot {
 
     pub(super) fn write_json_frame(&mut self, frame: &str, max: usize) -> std::io::Result<()> {
         let protocol = self.frames.protocol();
+        if protocol == RAW_PROTOCOL {
+            if frame.len() > max {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("JSON frame exceeds {} bytes", max),
+                ));
+            }
+            let hub = self.raw_hub.clone().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "raw transport is unavailable",
+                )
+            })?;
+            return hub
+                .send_json(&self.id, frame.as_bytes())
+                .map_err(std::io::Error::other);
+        }
         let Some(stdin) = self.stdin.as_mut() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -111,6 +128,48 @@ impl Slot {
         } else {
             ipc::write_frame_limit(stdin, frame, max)
         }
+    }
+
+    /// Hand this instance's pipes to the raw hub and, for a notify instance,
+    /// attach the stream-0 JSON channel. The slot keeps no stdin: every write,
+    /// JSON or raw, goes through the hub.
+    pub(super) fn start_raw_transport(
+        &mut self,
+        stdin: crate::wire::contract::stdio::WriteEnd,
+        stdout: crate::wire::contract::stdio::ReadEnd,
+        stderr: crate::wire::contract::stdio::ReadEnd,
+        log: Option<Arc<Mutex<LogWriter>>>,
+    ) -> Result<(), String> {
+        let Some(hub) = self.raw_hub.clone() else {
+            return Err("raw transport is unavailable".to_string());
+        };
+        // A notify instance gets the JSON channel; an exec-ready one keeps only
+        // the raw streams.
+        let (json_tx, json_rx) = match self.exec.ready {
+            Ready::Notify => {
+                let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
+                (Some(tx), Some(rx))
+            }
+            Ready::Exec => (None, None),
+        };
+        hub.register(
+            self.id.clone(),
+            Streams {
+                stdin: Some(stdin),
+                stdout: Some(stdout),
+                stderr: Some(stderr),
+            },
+            crate::wire::contract::rawhub::Observers { log, json: json_tx },
+        )?;
+        match json_rx {
+            Some(receiver) => {
+                self.frames.attach(receiver);
+                self.pending.reset();
+                self.ping_id = 1;
+            }
+            None => self.frames.detach(),
+        }
+        Ok(())
     }
 
     pub(super) fn drain_frames(&mut self, now: u64) {

@@ -215,10 +215,15 @@ pub(crate) fn open_raw(
             Some(hub.clone()),
             context.limits.clone(),
         )),
+        // A plugin without a raw transport speaks protocol 1 or 2: the request
+        // conflicts with the plugin's protocol, it is not a transient condition.
         Err(message) => boxed(http::json_error(
-            503,
+            409,
             "raw_unavailable",
-            &format!("raw transport unavailable: {}", message),
+            &format!(
+                "raw transport unavailable (protocol 3 required): {}",
+                message
+            ),
         )),
     }
 }

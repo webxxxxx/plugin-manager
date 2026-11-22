@@ -485,8 +485,9 @@ fn plugin_ui_raw_requires_a_raw_capable_plugin() {
     let mut body = Vec::new();
     let _ = stream.read_to_end(&mut body);
     let body = String::from_utf8_lossy(&body).to_ascii_lowercase();
-    assert_eq!(status, 503, "{head}");
+    assert_eq!(status, 409, "{head}");
     assert!(body.contains("raw_unavailable"), "{head}{body}");
+    assert!(body.contains("protocol 3"), "{head}{body}");
 }
 
 #[cfg(unix)]
@@ -602,4 +603,42 @@ fn plugin_ui_websocket_rejects_oversized_messages_with_1009() {
     let (opcode, payload) = ws_read(&mut ws);
     assert_eq!(opcode, 0x8);
     assert_eq!(u16::from_be_bytes([payload[0], payload[1]]), 1009);
+}
+
+/// #265: one protocol-3 plugin serves JSON-RPC (stream 0) and raw (stream >= 1)
+/// at the same time. The ready ping, a capability call, its notification and a
+/// `/raw` echo all cross the same pipes.
+#[test]
+fn protocol_three_plugin_serves_json_and_raw_together() {
+    let (_sandbox, address) = daemon_with_raw_json_plugin(64, "rawjson");
+    let base = plugin_ui_base(&address, "rawjson");
+
+    let mut sse = sse_connect(&address, &format!("{}events", base));
+    let call = request(
+        &address,
+        "POST",
+        &format!("{}rpc", base),
+        "application/json",
+        br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"echo","arguments":{}}}"#,
+    );
+    assert_eq!(call.status, 200, "{}", call.body);
+    assert_eq!(
+        call.body["result"]["content"][0]["text"], "pong",
+        "{}",
+        call.body
+    );
+
+    let event = sse_wait_for_data(&mut sse, "panel-event");
+    assert!(
+        event.contains("\"method\":\"notifications/message\""),
+        "{event}"
+    );
+
+    // The same instance still echoes raw frames on its own stream.
+    let (mut ws, status, head) = ws_handshake(&address, &format!("{}raw", base), &[]);
+    assert_eq!(status, 101, "{head}");
+    ws_send(&mut ws, 0x2, b"raw-bytes");
+    let (opcode, payload) = ws_read(&mut ws);
+    assert_eq!(opcode, 0x2);
+    assert_eq!(payload, b"raw-bytes");
 }
