@@ -12,9 +12,8 @@
 //! The hub owns the stream table, the subscriber channels and the global
 //! in-flight budget. The I/O itself belongs to [`crate::wire::contract::reactor`]:
 //! Unix `poll(2)`, Windows IOCP, so a raw plugin costs no extra thread. When the
-//! reactor is unavailable
-//! (and on Windows, where anonymous child pipes are not pollable) the hub
-//! falls back to one writer thread and one reader thread per plugin.
+//! reactor is unavailable the hub falls back to one writer thread and one reader
+//! thread per plugin.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};

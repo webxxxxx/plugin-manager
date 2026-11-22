@@ -20,8 +20,9 @@ Accepted（2026-11-22）。补齐 [ADR-0027](0027-windows-runs-the-same-poll-loo
 - **父端换成 overlapped 命名管道**：`stdio/platform/windows.rs` 用
   `CreateNamedPipeW(PIPE_ACCESS_INBOUND/OUTBOUND | FILE_FLAG_OVERLAPPED)` 建父端，用
   `CreateFileW` 在进程内建子端，再交给 `Stdio`（`Command::spawn` 仍只把子端复制成
-  可继承）。方向与匿名管道一致：stdout/stderr 父读、stdin 父写。匿名 `pipe()` 只留给
-  测试和线程回退。
+  可继承）。方向与匿名管道一致：stdout/stderr 父读、stdin 父写。Windows 上不再有
+  匿名管道：反应器没起来时的线程回退拿到的也是同一对命名管道句柄，只是不走
+  overlapped 语义。
 - **IOCP 后端**（`reactor/iocp.rs`）：每个 Source 最多一个 pending read 和一个 pending
   write；`OVERLAPPED` 放在堆上的 slot 里，slot 地址就是 completion key；
   `Reactor::poll_once` 就是 `GetQueuedCompletionStatusEx`，中断是

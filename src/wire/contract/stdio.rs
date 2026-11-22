@@ -5,7 +5,7 @@
 //! plugin log, a hook's output — and this module owns two things instead:
 //!
 //! - **Which pipes exist.** [`Plan`] answers that from `Ready` and the
-//!   protocol; [`arm`] creates the anonymous pipes and puts their child ends on
+//!   protocol; [`arm`] creates the pipe pairs and puts their child ends on
 //!   the `Command` before the spawn. The parent ends come back as
 //!   [`ReadEnd`] / [`WriteEnd`], and every stream a plan does not pipe is
 //!   `/dev/null`, never an inherited daemon handle.
