@@ -291,6 +291,8 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
   - `GET /api/v1/logs?lines=200`：daemon 自己的 `<logs>/svcd.log` 文本尾部（与插件日志同一套 `lines` / `level` 参数）；`lines` 上限 2000；不提供 follow / SSE
   - `GET /api/v1/logs/{id}?lines=200`：插件 `<id>.log` 的文本尾部；同一套参数
   - `DELETE /api/v1/logs` / `DELETE /api/v1/logs/{id}`：清空 daemon 日志或插件日志（`<id>.log` + `<id>-hooks.log` + 两者轮转）。清空走写侧 `LogSink::reset()`（关句柄 → 删文件 → 重开），不靠 HTTP 删文件：Windows 上删一个仍被写的文件会变成 delete-pending，写侧继续往看不见的旧文件追加。审计行 `logs cleared: <id> (N files)` 写进 daemon 日志；没有可清文件时 404
+  - `GET /api/v1/upgrade/check`：`{store,current,latest,asset,sumsAsset,newer}`。`store=false` 表示没装 plugin-store（响应仍是 200，控制台据此提示两条出路）。
+  - `POST /api/v1/upgrade/apply`：无 body。检查 → 下载归档与 `SHA256SUMS`（两次 `release_asset`，一次一个 blob）→ sha256 校验 → 用平台 `tar` 解包 → 替换 `svcd`/`svc`/`plugin`/`mcp` → user mode 重启、服务模式只提示。失败返回 400 并带原因（没装 store、hash 不符、归档里没有二进制、开发树拒绝升级）。`svcd upgrade --file <归档> [--sum <SHA256SUMS>]` 是离线同一条链。
   - `GET /api/v1/settings`：`{path, keys:[{key,group,kind,default,doc,recommend,editable,needsRestart,source,value,effective}]}`。`source` 是 `file` / `env` / `derived`；`effective` 是**当前 daemon 实际在用的值**（派生数字来自 `limits`，路径来自目录集，密码只报 `true`/`false`）。
   - `PUT /api/v1/settings`：body `{values:{"<key>":"<value>"|null}}`，`null` 表示删除该键回到默认。只接受控制台可改的键；未知键、只读键（路径与 probe 输入）、`mem_budget_bytes`/`mem_budget_percent` 同时存在、值不能解析，都返回 400 且**不写盘**。写盘是一次「读-改-写」：只动点名的键，注释与其它手写行逐字节保留；`auth_passwd` 收明文、落盘前派生 pbkdf2 哈希。成功后按角色重启：user mode 返回 `{saved,restarting:true}` 并启动 detached helper（先让 HTTP 响应发出，再停旧进程、等控制通道释放、用同一份环境拉起新进程）；系统服务模式返回 `{saved,restarting:false,hint}`，提示用服务管理器重启。
   - `GET /api/v1/auth`：`{bind,requestedBind,authRequired,passwordSet}`
@@ -536,6 +538,7 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
 
 ## 15. 修订记录
 
+- 2026-11-23（#264）：`svcd version` 与 `svcd upgrade`（离线 `--file` / 在线经 plugin-store 的 `release_asset`，校验 `SHA256SUMS`，不验签）；控制台「检查更新」；Windows 自替换用「运行中的 exe 改名 `.old` → 落新文件 → 下次启动清理」，Unix 直接 rename。
 - 2026-11-23（#263）：控制台设置面——`GET/PUT /api/v1/settings`（每项带来源与生效值、只写改动过的键、校验后写盘）、`svcd restart`（user mode 经 detached helper 换进程；系统服务模式拒绝并提示服务管理器）、保存后自动重启。
 
 - 2026-11-12：C1 `platform` only、删除 `arch`，`schema: 1` 重写；C2 推迟；C3 增加 `POST /mcp`；C4 增加 `/api/v1` 管理 API（覆盖全部 `svc` 命令）；C5 明确 v1 不支持 TLS。

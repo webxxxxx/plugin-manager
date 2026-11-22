@@ -30,6 +30,7 @@ use super::routes::{self, Endpoint};
 
 mod logs;
 mod settings;
+mod upgrade;
 
 const UI: &str = include_str!("../assets/index.html");
 
@@ -142,6 +143,8 @@ api_routes! {
     GET    "/api/v1/export/{id}/config"       => export_config,
     GET    "/api/v1/trust"                    => trust_list,
     DELETE "/api/v1/trust/{key}"              => trust_remove,
+    GET    "/api/v1/upgrade/check"            => upgrade_check,
+    POST   "/api/v1/upgrade/apply"            => upgrade_apply,
     GET    "/api/v1/settings"                 => settings,
     PUT    "/api/v1/settings"                 => settings_put,
     GET    "/api/v1/logs"                     => daemon_logs,

@@ -11,9 +11,15 @@ use std::process::{Command, Stdio};
 /// Spawn the detached helper and return its pid. The caller still has to stop
 /// the daemon; the helper waits for exactly that.
 pub(crate) fn spawn_helper() -> std::io::Result<u32> {
+    spawn_helper_from(&std::env::current_exe()?)
+}
+
+/// Spawn the helper with an explicit executable path. An upgrade calls this
+/// with the freshly installed binary: this process may be the image that was
+/// just renamed aside on Windows.
+pub(crate) fn spawn_helper_from(executable: &std::path::Path) -> std::io::Result<u32> {
     // The helper and the daemon it starts must not hold this process's stdio.
     crate::platform::host::process::detach_stdio();
-    let executable = std::env::current_exe()?;
     let mut command = Command::new(executable);
     command
         .args(["restart-helper", &std::process::id().to_string()])

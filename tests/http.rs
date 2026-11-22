@@ -47,3 +47,5 @@ mod settings;
 mod transfer;
 #[path = "http/ui.rs"]
 mod ui;
+#[path = "http/upgrade.rs"]
+mod upgrade;

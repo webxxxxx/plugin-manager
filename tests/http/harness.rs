@@ -163,6 +163,32 @@ impl Sandbox {
         self.start_daemon_with_env(bind, &[]);
     }
 
+    /// A daemon that reports the unprivileged (user) role, which is what the
+    /// restart and upgrade policies key on. The default sandbox env forces the
+    /// service role.
+    pub(crate) fn start_daemon_as_user(&mut self) {
+        self.start_daemon_with_env("127.0.0.1:0", &[("SVCD_TEST_PRIVILEGE", "unprivileged")]);
+    }
+
+    /// Start the daemon from an arbitrary binary path. The upgrade tests run it
+    /// from the install tree so a Windows self-replace renames the *running*
+    /// image, which is the path that has to work.
+    pub(crate) fn start_daemon_from(&mut self, binary: &std::path::Path, extra: &[(&str, &str)]) {
+        let stderr = fs::File::create(&self.daemon_stderr).expect("daemon stderr");
+        let mut command = Command::new(binary);
+        command
+            .args(["run", "--foreground"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr));
+        self.env(&mut command);
+        command.env("SVCD_BIND", "127.0.0.1:0");
+        for (key, value) in extra {
+            command.env(key, value);
+        }
+        self.daemon = Some(command.spawn().expect("spawn daemon"));
+    }
+
     /// `start_daemon_with_bind` plus extra environment. The restart tests pin the
     /// privilege role here: the default sandbox env forces `SVCD_TEST_UNPRIVILEGED`,
     /// which makes the daemon look like a system service to the restart policy.
