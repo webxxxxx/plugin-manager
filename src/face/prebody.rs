@@ -62,7 +62,7 @@ impl PreBodyFaces {
             peer,
             lan,
             self.config.clone(),
-            crate::wire::contract::rawhub::RawHub::ui_hub(raw_hub),
+            Some(raw_hub),
             self.bus.clone(),
         ))
     }

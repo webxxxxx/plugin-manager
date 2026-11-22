@@ -106,10 +106,6 @@ pub struct Derived {
 /// Every host runs the same topology: the supervisor loop, the server loop and
 /// the blocking pool. A connection is a wait-set entry, not a thread, on both
 /// Unix and Windows, so the thread term does not grow with the connection cap.
-fn threads_for(blocking_threads: usize) -> usize {
-    LOOP_THREADS + blocking_threads
-}
-
 /// The one bounded UI event ring behind every plugin stream. Charged once:
 /// subscribers hold a cursor instead of a queue, so this does not grow with
 /// subscriber or plugin count.
@@ -124,7 +120,7 @@ pub const MAX_CONNECTIONS_CEILING: usize = 4096;
 impl Limits {
     /// Threads the invariant charges a stack for.
     pub fn threads(&self) -> usize {
-        threads_for(self.blocking_threads)
+        LOOP_THREADS + self.blocking_threads
     }
 
     /// What one admitted connection costs: its worst-case buffers, or the
