@@ -192,14 +192,14 @@ fn arm(plan: Plan, command: &mut Command) -> io::Result<Streams> {
 }
 
 /// A connected pair for tests that need the reactor without a child process.
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(crate) fn test_pipe() -> io::Result<(ReadEnd, WriteEnd)> {
     let (read, write) = platform::parent_read_pipe()?;
     Ok((ReadEnd(read), WriteEnd(write)))
 }
 
 /// The write-oriented pair for tests: (child_read, parent_write).
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(crate) fn test_write_pipe() -> io::Result<(File, File)> {
     platform::parent_write_pipe()
 }
@@ -318,8 +318,8 @@ pub(crate) struct Target {
 }
 
 impl Target {
-    /// One reader thread per pipe: Windows always, and Unix when the poll set
-    /// failed to start.
+    /// One reader thread per pipe: only when no reactor was installed (it
+    /// failed to start, or this build has none).
     pub(crate) fn threaded() -> Self {
         Self::default()
     }

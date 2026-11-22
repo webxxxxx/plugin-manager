@@ -15,7 +15,7 @@ pub mod listener;
 
 use crate::platform::host::poll;
 use crate::platform::host::wake_pipe::{self, Reader as WakeReader};
-use crate::server::http::server::handle::LoopHandle;
+use crate::server::handle::LoopHandle;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::thread;
@@ -117,7 +117,7 @@ impl ExtraOps for ControlOnly {
     fn wake_key(&self) -> Option<poll::Key> {
         Some(self.notify_rx.key())
     }
-    fn prepare_extra(&mut self, out: &mut Vec<(poll::Key, i16)>) {
+    fn prepare_extra(&mut self, out: &mut Vec<crate::platform::host::poll::PollFd>) {
         self.keys.clear();
         self.control.poll_sources(out, &mut self.keys);
     }

@@ -4,8 +4,8 @@
 //!
 //! The loop runs on both hosts: Unix waits with `poll(2)` and Windows with
 //! `WSAPoll` over the same non-blocking sockets (see `platform/host/poll`).
-//! Windows keeps the per-connection thread driver only as the fallback for
-//! hosts without a poll loop.
+//! Neither host runs a thread per connection; the thread driver in
+//! `conn/threaded.rs` stays only as the seam for a host with no wait set.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -173,7 +173,7 @@ pub trait ExtraOps {
 
     /// Append the server-loop's extra poll sources. The handler keeps the same
     /// order for on_extra_ready; indices are stable for one pass.
-    fn prepare_extra(&mut self, _out: &mut Vec<(poll::Key, i16)>) {}
+    fn prepare_extra(&mut self, _out: &mut Vec<PollFd>) {}
 
     /// One extra source became ready.
     fn on_extra_ready(&mut self, _index: usize, _revents: i16) {}
@@ -256,12 +256,10 @@ pub fn run<S, H>(
         }
 
         let connection_end = descriptors.len();
-        let mut extra_fds: Vec<(poll::Key, i16)> = Vec::new();
+        let mut extra_fds: Vec<PollFd> = Vec::new();
         handler.prepare_extra(&mut extra_fds);
         let extra_start = descriptors.len();
-        for (fd, events) in &extra_fds {
-            descriptors.push(PollFd::new(*fd, *events));
-        }
+        descriptors.extend_from_slice(&extra_fds);
 
         if let Err(error) = poll::poll(&mut descriptors, 100) {
             error!("server loop poll failed: {}", error);

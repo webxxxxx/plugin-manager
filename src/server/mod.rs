@@ -6,6 +6,10 @@
 pub mod auth;
 #[cfg(unix)]
 pub mod control;
+// The control-only loop is Unix-only, so a Windows build without HTTP has no
+// loop that could hold this handle.
+#[cfg(any(unix, feature = "http"))]
+pub(crate) mod handle;
 #[cfg_attr(not(feature = "http"), allow(dead_code))]
 pub mod http;
 #[cfg_attr(not(all(feature = "http", unix)), allow(dead_code))]

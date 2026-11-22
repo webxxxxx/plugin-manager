@@ -472,7 +472,7 @@
     "src/server/http/pool.rs": "server",
     "src/server/http/server.rs": "server",
     "src/server/http/server/conns.rs": "server",
-    "src/server/http/server/handle.rs": "server",
+    "src/server/handle.rs": "server",
     "src/server/http/server/poll.rs": "server",
     "src/server/http/stream.rs": "server",
     "src/server/http/thread_loop.rs": "server",

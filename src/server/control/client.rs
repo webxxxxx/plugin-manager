@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
+use crate::platform::host::poll;
 use crate::wire::control::channel::ProgressEvent;
 use crate::wire::message::ipc;
 
@@ -148,7 +149,7 @@ impl StreamingClient {
     /// `ready`. A stream whose request is still being written waits for
     /// POLLOUT; a blocked stream is still polled with zero events so a peer
     /// close is observed, but its upstream is not read.
-    pub fn poll_sources(&self, out: &mut Vec<(RawFd, i16)>, keys: &mut Vec<u64>) {
+    pub fn poll_sources(&self, out: &mut Vec<poll::PollFd>, keys: &mut Vec<u64>) {
         for (id, connection) in &self.connections {
             let events = if connection.request_at < connection.request.len() {
                 libc::POLLOUT
@@ -157,7 +158,7 @@ impl StreamingClient {
             } else {
                 libc::POLLIN
             };
-            out.push((connection.stream.as_raw_fd(), events));
+            out.push(poll::PollFd::new(connection.stream.as_raw_fd(), events));
             keys.push(*id);
         }
     }

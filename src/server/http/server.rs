@@ -6,7 +6,6 @@
 //! per-request worker: blocking work goes to the shared pool.
 
 mod conns;
-pub(crate) mod handle;
 mod poll;
 
 use std::collections::{HashMap, HashSet};
@@ -46,7 +45,7 @@ use crate::server::mcp::progress::McpSseStream;
 #[cfg(unix)]
 use crate::wire::control::channel::PendingCall;
 
-use self::handle::LoopHandle;
+use crate::server::handle::LoopHandle;
 use crate::server::http::hooks::{FallbackHandler, PreBodyRoutes};
 
 enum WorkResult {

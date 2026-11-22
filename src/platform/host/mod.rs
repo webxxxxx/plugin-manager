@@ -12,6 +12,9 @@ pub mod signal;
 pub mod target;
 pub mod threads;
 pub mod wake;
+// Only a connection loop owns a wake pipe, and the control-only loop that uses
+// it exists on Unix only.
+#[cfg(any(unix, feature = "http"))]
 pub mod wake_pipe;
 #[cfg(feature = "http")]
 pub mod zerocopy;

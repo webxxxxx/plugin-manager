@@ -7,6 +7,8 @@ pub(crate) mod blocking;
 #[cfg(feature = "http")]
 pub mod budget;
 #[cfg(feature = "http")]
+// The connection drivers describe a running loop; the minimal build has none.
+#[cfg(feature = "http")]
 pub(crate) mod conn;
 pub mod contract;
 pub mod date;

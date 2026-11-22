@@ -9,7 +9,7 @@ impl ExtraOps for Server {
     /// the one wait set. Windows runs the control channel on its own
     /// named-pipe accept thread, so this loop has no extra sources.
     #[cfg(unix)]
-    fn prepare_extra(&mut self, out: &mut Vec<(crate::platform::host::poll::Key, i16)>) {
+    fn prepare_extra(&mut self, out: &mut Vec<crate::platform::host::poll::PollFd>) {
         self.extra_keys.clear();
         let mut control_keys = Vec::new();
         self.control.poll_sources(out, &mut control_keys);

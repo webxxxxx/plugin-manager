@@ -25,7 +25,8 @@ use crate::server::http::Face;
 use crate::wire::contract::rawhub::RawHub;
 
 pub(crate) mod poll;
-#[cfg_attr(not(windows), allow(dead_code))]
+// No host in the build matrix reaches this driver (both run the poll loop,
+// ADR-0027); it stays as the documented seam for a host with no wait set.
 #[cfg_attr(any(unix, windows), allow(dead_code))]
 pub(crate) mod threaded;
 
@@ -53,7 +54,7 @@ pub(crate) trait ConnectionDriver {
 
 /// Handle over the running driver.
 pub(crate) struct ServerHandle {
-    inner: Option<crate::server::http::server::handle::LoopHandle>,
+    inner: Option<crate::server::handle::LoopHandle>,
     stop: Arc<AtomicBool>,
 }
 
@@ -65,7 +66,7 @@ impl ServerHandle {
     }
 
     /// Handle over a poll loop that is already running.
-    pub(crate) fn poll(inner: crate::server::http::server::handle::LoopHandle) -> Self {
+    pub(crate) fn poll(inner: crate::server::handle::LoopHandle) -> Self {
         Self {
             inner: Some(inner),
             stop: Arc::new(AtomicBool::new(false)),

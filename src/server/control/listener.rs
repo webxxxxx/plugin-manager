@@ -75,10 +75,10 @@ impl ControlServer {
 
     /// Append this server's poll entries. The offset in `out` is the index
     /// passed to `ready`; `keys` carries the stable source for that index.
-    pub fn poll_sources(&self, out: &mut Vec<(poll::Key, i16)>, keys: &mut Vec<Source>) {
-        out.push((self.user.as_raw_fd(), poll::READ));
+    pub fn poll_sources(&self, out: &mut Vec<poll::PollFd>, keys: &mut Vec<Source>) {
+        out.push(poll::PollFd::new(self.user.as_raw_fd(), poll::READ));
         keys.push(Source::Listener(Endpoint::User));
-        out.push((self.admin.as_raw_fd(), poll::READ));
+        out.push(poll::PollFd::new(self.admin.as_raw_fd(), poll::READ));
         keys.push(Source::Listener(Endpoint::Admin));
         for (id, connection) in &self.connections {
             let mut events = 0;
@@ -91,7 +91,7 @@ impl ControlServer {
             // A waiting connection still enters poll with zero events so a
             // POLLHUP from a client that gave up is observed; otherwise the
             // reply slot would leak until the supervisor answers.
-            out.push((connection.stream.as_raw_fd(), events));
+            out.push(poll::PollFd::new(connection.stream.as_raw_fd(), events));
             keys.push(Source::Connection(*id));
         }
     }
@@ -414,13 +414,9 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut replies = Vec::new();
         while replies.len() < 2 && Instant::now() < deadline {
-            let mut fds = Vec::new();
+            let mut descriptors = Vec::new();
             let mut keys = Vec::new();
-            server.poll_sources(&mut fds, &mut keys);
-            let mut descriptors: Vec<poll::PollFd> = fds
-                .iter()
-                .map(|(key, events)| poll::PollFd::new(*key, *events))
-                .collect();
+            server.poll_sources(&mut descriptors, &mut keys);
             let _ = poll::poll(&mut descriptors, 50);
             for (index, key) in keys.iter().enumerate() {
                 if descriptors[index].revents != 0 {
@@ -505,13 +501,9 @@ mod tests {
                 queued = true;
                 break;
             }
-            let mut fds = Vec::new();
+            let mut descriptors = Vec::new();
             let mut keys = Vec::new();
-            server.poll_sources(&mut fds, &mut keys);
-            let mut descriptors: Vec<poll::PollFd> = fds
-                .iter()
-                .map(|(key, events)| poll::PollFd::new(*key, *events))
-                .collect();
+            server.poll_sources(&mut descriptors, &mut keys);
             let _ = poll::poll(&mut descriptors, 50);
             for (index, key) in keys.iter().enumerate() {
                 if descriptors[index].revents != 0 {
