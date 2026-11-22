@@ -195,12 +195,13 @@ flowchart TB
 
 ### 连接驱动
 
-同一份 sans-IO 连接状态机，两种驱动：
+同一份 sans-IO 连接状态机，一个 poll seam、两个后端（[ADR-0027](docs/adr/0027-windows-runs-the-same-poll-loop.md)）：
 
-- **Unix**：单 poll 循环，listener、连接、控制通道共用一个等待集；阻塞工作交给固定大小的阻塞池
-- **Windows**：每连接一线程（ADR-0016），阻塞工作在该连接线程内联执行
+- **Unix**：`poll(2)`；listener、连接、控制通道共用一个等待集，阻塞工作交给固定大小的阻塞池
+- **Windows**：`WSAPoll`；连接状态机、stream 背压、阻塞池、deadline 与 Unix 是同一份代码，唤醒管道换成两条连通的 loopback TCP socket
+- **各自的边角**：控制通道是命名管道，进不了 Windows 的等待集，仍是每连接一条 accept/读线程；MCP SSE 在 Windows 交给一条线程跑 blocking fallback，线程数受 `max_streams` 兜底
 
-差异只体现在资源形态：同样 2 GB 预算，Unix 派生 786 条连接，线程数是固定的（循环线程 + 阻塞池）；Windows 派生 709 条，线程数随连接数走（2 GB、c50 时实测 996 条）。
+差异只剩这些边角：同样 2 GB 预算两端都派生 797 条连接，线程只跟循环、阻塞池、控制通道和 SSE 交接走。改造前 Windows 是每连接一条线程（ADR-0016），2 GB 只派生 709 条，2 GB、c50 时实测 996 条线程。
 
 ## 性能
 
@@ -260,16 +261,20 @@ flowchart TB
 
 把 880 条 SSE/WS 一直开着做准入探测：**接纳 431 条（216 SSE + 215 WS），其余 449 条 503**，正好等于派生值。同样预算下默认形状（streaming）是 800 条连接、单体 4.7 MiB——**形状买的是单体大小，不是并发**。
 
-### 平台差异（同一预算的派生连接数）
+### 平台差异：两端已经同价
 
-| 预算 | WSL（reactor） | Win11（每连接线程，标定前测的） | 差 |
-| ---: | ---: | ---: | ---: |
-| 50 MB | 405 | 64 | 6.3× |
-| 512 MB | 421 | 340 | 24% |
-| 2 GB | 797 | 709 | 12% |
-| 4.67 GiB / interactive | 431 | 421 | 2% |
+同一预算、同一形状下，Windows 与 WSL 派生出同一组名额——连接是 wait set 条目而不是线程：
 
-Windows 的差来自不变量为「每连接一条线程」记账（`request_stack_bytes` 128–256 KiB/条），预算越大占比越小。吞吐上 Windows 反而更高（512 MB、c10：777 vs 329 ops/s，Windows 用 Python 插件、WSL 用 bash 插件），代价是 176 线程 / 8.9 核，而 WSL 是 10 线程 / 2 核。
+| 预算 | 形状 | WSL（poll） | Win11（WSAPoll） |
+| ---: | --- | ---: | ---: |
+| 50 MB | tiny | 405 | 405 |
+| 512 MB | interactive | 421 | 421 |
+| 2 GB | streaming | 797 | 797 |
+| 4.67 GiB | interactive | 431 | 431 |
+
+2026-11-22 起两端跑同一个 poll loop（[ADR-0027](docs/adr/0027-windows-runs-the-same-poll-loop.md)）：`stack_per_connection` 已删，`threads()` 只剩循环线程 + 阻塞池，Windows 不再因为「每连接一条线程」（128 KiB 栈/条）少拿名额。改造前那一列是 64 / 340 / 709 / 421，50 MB 差 6.3 倍。上表四个数是在 Windows 本机用 `svc config tune` 现跑的（0.1.5 的二进制）；WSL 一列是 2026-11-21 标定时的值——两端本来就是同一份派生。
+
+吞吐上 Windows 反而更高（512 MB、c10：777 vs 329 ops/s，Windows 用 Python 插件、WSL 用 bash 插件），这是改造前的数据，「176 线程 / 8.9 核」也属于旧的线程模型；两端同 loop 之后的吞吐还没有重测。
 
 > 口径提醒：压测客户端是 Python 线程（一个 GIL），高并发点的 p50/p99 含客户端排队；daemon 自己单次服务时间在 1.4 ms p50，1.4k ops/s 时只用 0.55 个核。
 
