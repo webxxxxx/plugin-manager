@@ -71,6 +71,8 @@ impl Kind {
 #[derive(Debug, Clone, Copy)]
 pub struct ConfKey {
     pub key: &'static str,
+    /// 控制台设置表单显示的中文短名；英文键留在悬浮说明里。
+    pub label: &'static str,
     pub group: Group,
     pub kind: Kind,
     /// 默认值或派生规则；写规则不写死数字（预算是运行期算出来的）。
@@ -100,6 +102,7 @@ pub const REMOVED_PATH_KEYS: &[&str] = &["plugins_dir", "services_dir", "temp_di
 pub const CONF_KEYS: &[ConfKey] = &[
     ConfKey {
         key: "mem_budget_bytes",
+        label: "内存预算",
         group: Group::Resources,
         kind: Kind::Bytes,
         default: "auto（可用内存 25%，受构建上限约束）",
@@ -110,6 +113,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "mem_budget_percent",
+        label: "内存预算百分比",
         group: Group::Resources,
         kind: Kind::Count,
         default: "未设（与 mem_budget_bytes 二选一）",
@@ -120,6 +124,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "workload",
+        label: "负载形状",
         group: Group::Resources,
         kind: Kind::Enum,
         default: "由预算派生（<512 MiB tiny，<2 GiB interactive，否则 streaming）",
@@ -130,6 +135,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "cpu_budget_percent",
+        label: "CPU 预算百分比",
         group: Group::Resources,
         kind: Kind::Count,
         default: "0（不设限）",
@@ -140,6 +146,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "request_stack_bytes",
+        label: "请求线程栈",
         group: Group::Resources,
         kind: Kind::Bytes,
         default: "128/192/256 KiB（tiny/interactive/streaming）",
@@ -150,6 +157,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "io_stack_bytes",
+        label: "IO 线程栈",
         group: Group::Resources,
         kind: Kind::Bytes,
         default: "64/96/128 KiB（tiny/interactive/streaming）",
@@ -160,6 +168,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "blocking_threads",
+        label: "阻塞线程数",
         group: Group::Resources,
         kind: Kind::Count,
         default: "4/8/16（tiny/interactive/streaming），2..32",
@@ -170,6 +179,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "blocking_queue",
+        label: "阻塞队列长度",
         group: Group::Resources,
         kind: Kind::Count,
         default: "由连接数解算（min(max_connections,256)），1..1024",
@@ -180,6 +190,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "max_body_bytes",
+        label: "请求体上限",
         group: Group::Resources,
         kind: Kind::Bytes,
         default: "8/64/512 MiB（tiny/interactive/streaming）",
@@ -190,6 +201,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "max_json_body_bytes",
+        label: "JSON 请求体上限",
         group: Group::Resources,
         kind: Kind::Bytes,
         default: "64 KiB/256 KiB/1 MiB",
@@ -200,6 +212,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "max_complete_body_bytes",
+        label: "连接常驻请求体",
         group: Group::Resources,
         kind: Kind::Bytes,
         default: "64 KiB/1 MiB/2 MiB",
@@ -210,6 +223,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "max_header_bytes",
+        label: "请求头上限",
         group: Group::Resources,
         kind: Kind::Bytes,
         default: "8/16/64 KiB",
@@ -220,6 +234,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "max_streams",
+        label: "长连接流上限",
         group: Group::Resources,
         kind: Kind::Count,
         default: "24/48/96，1..4096",
@@ -230,6 +245,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "stream_buffer_bytes",
+        label: "输出缓冲水位",
         group: Group::Resources,
         kind: Kind::Bytes,
         default: "8/32/128 KiB",
@@ -240,6 +256,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "max_connections",
+        label: "最大连接数",
         group: Group::Resources,
         kind: Kind::Count,
         default: "由预算解算（下限 8，上限 4096）",
@@ -250,6 +267,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "max_connections_per_ip",
+        label: "单 IP 连接上限",
         group: Group::Resources,
         kind: Kind::Count,
         default: "16/32/64",
@@ -260,6 +278,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "max_subscriptions",
+        label: "订阅总数上限",
         group: Group::Resources,
         kind: Kind::Count,
         default: "64/128/256",
@@ -270,6 +289,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "max_subscribers_per_plugin",
+        label: "单插件订阅上限",
         group: Group::Resources,
         kind: Kind::Count,
         default: "16/32/64",
@@ -280,6 +300,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "pending_queue",
+        label: "管理请求队列",
         group: Group::Resources,
         kind: Kind::Count,
         default: "32/128/512（预算/4 MiB）",
@@ -290,6 +311,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "progress_queue",
+        label: "进度事件队列",
         group: Group::Resources,
         kind: Kind::Count,
         default: "16/64/256（预算/8 MiB）",
@@ -300,6 +322,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "max_package_bytes",
+        label: "安装包体积上限",
         group: Group::Resources,
         kind: Kind::Bytes,
         default: "8/64/512 MiB",
@@ -310,6 +333,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "probe_available_memory",
+        label: "可用内存探测",
         group: Group::Resources,
         kind: Kind::Bytes,
         default: "未设（读操作系统）",
@@ -320,6 +344,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "probe_cgroup_remaining",
+        label: "cgroup 内存探测",
         group: Group::Resources,
         kind: Kind::Bytes,
         default: "未设（读 cgroup v2）",
@@ -330,6 +355,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "probe_cpus",
+        label: "CPU 数探测",
         group: Group::Resources,
         kind: Kind::Count,
         default: "未设（读 OS）",
@@ -340,6 +366,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "probe_install_free_disk",
+        label: "安装卷空间探测",
         group: Group::Resources,
         kind: Kind::Bytes,
         default: "未设（读 OS）",
@@ -350,6 +377,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "probe_temp_free_disk",
+        label: "临时卷空间探测",
         group: Group::Resources,
         kind: Kind::Bytes,
         default: "未设（读 OS）",
@@ -360,6 +388,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "bind",
+        label: "监听地址",
         group: Group::Network,
         kind: Kind::SocketAddr,
         default: "127.0.0.1:8787",
@@ -370,6 +399,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "http_idle_timeout_secs",
+        label: "空闲连接超时",
         group: Group::Network,
         kind: Kind::Seconds,
         default: "30/60/120 秒",
@@ -380,6 +410,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "transfer_timeout_secs",
+        label: "传输超时",
         group: Group::Network,
         kind: Kind::Seconds,
         default: "120 秒",
@@ -390,6 +421,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "control_timeout_secs",
+        label: "控制通道超时",
         group: Group::Network,
         kind: Kind::Seconds,
         default: "30 秒，1..300",
@@ -400,6 +432,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "default_timeout",
+        label: "默认调用预算",
         group: Group::Network,
         kind: Kind::Count,
         default: "30000 毫秒",
@@ -410,6 +443,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "max_timeout",
+        label: "调用预算上限",
         group: Group::Network,
         kind: Kind::Count,
         default: "300000 毫秒",
@@ -420,6 +454,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "ws_max_message_bytes",
+        label: "WS 单条消息上限",
         group: Group::Network,
         kind: Kind::Bytes,
         default: "1 MiB",
@@ -430,6 +465,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "ws_inflight_bytes",
+        label: "WS 未确认字节",
         group: Group::Network,
         kind: Kind::Bytes,
         default: "2/8/64 MiB",
@@ -440,6 +476,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "ws_inflight_requests",
+        label: "WS 未确认帧数",
         group: Group::Network,
         kind: Kind::Count,
         default: "4/16/128",
@@ -450,6 +487,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "ws_buffer_shrink_bytes",
+        label: "WS 缓冲回缩阈值",
         group: Group::Network,
         kind: Kind::Bytes,
         default: "64 KiB",
@@ -460,6 +498,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "ws_raw_enabled",
+        label: "原始二进制通道",
         group: Group::Network,
         kind: Kind::Bool,
         default: "on",
@@ -470,6 +509,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "ws_raw_max_bytes",
+        label: "原始帧大小上限",
         group: Group::Network,
         kind: Kind::Bytes,
         default: "1 MiB",
@@ -480,6 +520,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "ws_raw_queue",
+        label: "原始帧队列长度",
         group: Group::Network,
         kind: Kind::Count,
         default: "8/32/128",
@@ -490,6 +531,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "mcp_streaming",
+        label: "MCP 流式响应",
         group: Group::Network,
         kind: Kind::Bool,
         default: "off",
@@ -500,6 +542,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "log_max_bytes",
+        label: "日志轮转大小",
         group: Group::Logs,
         kind: Kind::Bytes,
         default: "64 KiB，4 KiB..16 MiB",
@@ -510,6 +553,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "log_rotations",
+        label: "日志保留份数",
         group: Group::Logs,
         kind: Kind::Count,
         default: "3（1..10）",
@@ -520,6 +564,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "log_to_file",
+        label: "写日志文件",
         group: Group::Logs,
         kind: Kind::Bool,
         default: "on",
@@ -530,6 +575,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "log_level",
+        label: "日志级别",
         group: Group::Logs,
         kind: Kind::Enum,
         default: "info",
@@ -540,6 +586,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "log",
+        label: "日志总开关",
         group: Group::Logs,
         kind: Kind::Bool,
         default: "on",
@@ -550,6 +597,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "temp_retention_secs",
+        label: "临时文件保留时长",
         group: Group::Logs,
         kind: Kind::Seconds,
         default: "7200 秒（2 小时）",
@@ -560,6 +608,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "temp_cleanup_interval_secs",
+        label: "临时文件清理间隔",
         group: Group::Logs,
         kind: Kind::Seconds,
         default: "300 秒",
@@ -570,6 +619,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "rescan_interval_ms",
+        label: "服务目录重扫间隔",
         group: Group::Lifecycle,
         kind: Kind::Count,
         default: "5000 毫秒（0 = 不周期重扫）",
@@ -580,6 +630,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "auth_passwd",
+        label: "登录口令",
         group: Group::Security,
         kind: Kind::PasswordHash,
         default: "未设（用 `svc lan passwd` 设置）",
@@ -590,6 +641,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "allow_insecure_install",
+        label: "允许未签名安装",
         group: Group::Security,
         kind: Kind::Bool,
         default: "off",
@@ -600,6 +652,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "config_dir",
+        label: "配置目录",
         group: Group::Paths,
         kind: Kind::Path,
         default: "平台默认（Linux /etc/svcd）",
@@ -610,6 +663,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "data_dir",
+        label: "数据目录",
         group: Group::Paths,
         kind: Kind::Path,
         default: "平台默认（Linux /var/lib/svcd）",
@@ -620,6 +674,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "logs_dir",
+        label: "日志目录",
         group: Group::Paths,
         kind: Kind::Path,
         default: "平台默认（Linux /var/log/svcd）",
@@ -630,6 +685,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
     },
     ConfKey {
         key: "install_dir",
+        label: "安装目录",
         group: Group::Paths,
         kind: Kind::Path,
         default: "未设（由 `svcd --install --prefix` 记录）",
@@ -730,6 +786,33 @@ mod tests {
                     entry.key
                 );
             }
+        }
+    }
+
+    #[test]
+    fn every_key_has_a_unique_chinese_label() {
+        let mut labels = BTreeSet::new();
+        for entry in CONF_KEYS {
+            assert!(
+                !entry.label.trim().is_empty(),
+                "{} has no console label",
+                entry.key
+            );
+            assert!(
+                entry
+                    .label
+                    .chars()
+                    .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+                "{} label is not Chinese: {}",
+                entry.key,
+                entry.label
+            );
+            assert!(
+                labels.insert(entry.label),
+                "{} reuses the label {}",
+                entry.key,
+                entry.label
+            );
         }
     }
 

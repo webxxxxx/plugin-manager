@@ -99,7 +99,15 @@ fn settings_get_reports_values_sources_and_metadata() {
     assert_eq!(log_level["value"], "info");
     assert_eq!(log_level["kind"], "enum");
     assert_eq!(log_level["editable"], true);
+    assert_eq!(log_level["label"], "日志级别");
     assert!(log_level["doc"].as_str().unwrap_or("").contains("级别"));
+    // The console renders a Chinese label and puts the English key in the
+    // tooltip, so every row has to carry both.
+    assert!(
+        keys.iter()
+            .all(|entry| !entry["label"].as_str().unwrap_or("").is_empty()),
+        "every key carries its console label"
+    );
 
     // An environment override wins over the file and says so.
     assert_eq!(by_key("rescan_interval_ms")["source"], "env");

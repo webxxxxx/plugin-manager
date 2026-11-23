@@ -57,6 +57,16 @@ fn serves_the_embedded_console() {
     ] {
         assert!(html.contains(needle), "console missing {}", needle);
     }
+    // The settings sheet keeps its actions outside the scrolling body, and the
+    // English key plus the docs live in the hover tip, not in the row.
+    assert!(
+        html.contains("panel sheet") && html.contains("sheet-foot"),
+        "settings dialog must keep a fixed footer"
+    );
+    assert!(
+        html.contains("id=\"tip\"") && html.contains("entry.label || entry.key"),
+        "settings dialog shows Chinese labels and the English key in a hover tip"
+    );
     let index = raw_request(&address, "GET", "/index.html", "", b"");
     assert_eq!(index.status, 200);
 
