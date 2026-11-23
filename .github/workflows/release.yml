@@ -65,3 +65,39 @@ jobs:
           else
             gh release create "$TAG" dist/* --title "$TAG" --generate-notes
           fi
+
+  # The plugin mirror (webxxxxx/plugins) copies these archives into a Qiniu
+  # bucket so the store can fetch the daemon quickly in mainland China. It has
+  # no way to see this repository's tags, so a release has to say so; otherwise
+  # the mirror only catches up when the plugins repository publishes next.
+  notify-mirror:
+    name: tell the plugin mirror to pick this up
+    needs: publish
+    if: |
+      !cancelled()
+      && needs.publish.result == 'success'
+      && !contains(github.ref_name, '-')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: repository_dispatch to webxxxxx/plugins
+        env:
+          TOKEN: ${{ secrets.PLUGINS_MIRROR_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # GITHUB_TOKEN cannot reach another repository, so this needs a token
+          # that may dispatch there: fine-grained with "Contents: read and
+          # write" on webxxxxx/plugins, or a classic token with `repo`.
+          if [ -z "${TOKEN:-}" ]; then
+            echo "::warning::PLUGINS_MIRROR_TOKEN is not set; the Qiniu mirror will catch up on the next plugins release"
+            exit 0
+          fi
+          payload=$(printf '{"event_type":"svcd-released","client_payload":{"tag":"%s"}}' "$TAG")
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/webxxxxx/plugins/dispatches" \
+            -d "$payload"
+          echo "dispatched svcd-released for $TAG"
