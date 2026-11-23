@@ -145,7 +145,7 @@ daemon，比纯 `Limits` 单测更接近用户报的「设置过小崩溃」。
 # L1 + L4（摘要输出：每个 target 一行，失败才打印尾部）
 node tools/check.mjs quick
 node tools/check.mjs test <filter>          # 默认 --test-threads=1，与 CI 同参
-node tools/check.mjs full                   # 单测并行（4/8 线程），集成串行；--parallel 才全并行
+node tools/check.mjs full                   # 单测 8 线程、http 4 线程、其余集成串行；--parallel 才全并行
 node tools/check.mjs fmt                    # rustfmt --check 全仓（CI guardrails 同款）
 
 # 跨平台编译（Windows 宿主机必须跑一次：`cfg(unix)` 的代码在本机根本不编译，
@@ -193,10 +193,11 @@ node tools/perf/run.mjs --scale
 符号链接指向多调用二进制（分派只看 argv[0] 的文件名），没有「复制后立即 exec」的 `ETXTBSY` 窗口；
 Windows 保留副本（建符号链接需要权限）。`tests/cli.rs` 对并发的 `ETXTBSY`（复制 multicall 二进制后立即 exec）
 做有限重试；不要把它当成测试失败。运行时记录的单测通过 `runtime::tests::with_root` 注入 root，**不要**再在测试里设
-`SVCD_RUN_DIR`（进程级 env + 全局缓存会让并行测试互相踩）。CI 的集成测试用 `--test-threads=1`；
+`SVCD_RUN_DIR`（进程级 env + 全局缓存会让并行测试互相踩）。CI 的集成测试用 `--test-threads=1`，
+只有 http 套件用 4 线程（临时端口 + 独立 sandbox，连续 5 次全绿；`SVCD_HTTP_THREADS` 覆盖）；
 单测没有 sandbox，默认并行（`SVCD_UNIT_THREADS` 覆盖，本机 8、CI 4）。`node tools/check.mjs full`
-默认就是「单测并行 + 集成串行」，本地红与 CI 红同义，不需要判断「是不是环境噪声」。只有显式
-`--parallel` 才让集成测试也并发，那时执行顺序不由工具承诺。
+默认就是「单测并行 + http 并行 + 其余集成串行」，本地红与 CI 红同义，不需要判断「是不是环境噪声」。
+只有显式 `--parallel` 才让全部集成测试并发，那时执行顺序不由工具承诺。
 
 ### 并行档（`--parallel`）的定位
 

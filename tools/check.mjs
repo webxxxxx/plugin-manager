@@ -12,17 +12,18 @@
 //   node tools/check.mjs cross [target]   cargo check --target <target> --all-targets
 //   node tools/check.mjs linux [filter]   Windows 宿主：在 WSL2 里跑 Linux 全量（或一个 filter）
 //   node tools/check.mjs test <filter>    cargo test <filter> --no-fail-fast -- --test-threads=1
-//   node tools/check.mjs full             unit tests parallel; integration tests serial
+//   node tools/check.mjs full             unit + http parallel; other integration serial
 //   ... --parallel                        drop the serial knob for every target (one-off debugging)
 //
 // `cross` exists because a Windows host never compiles `cfg(unix)` code:
 // a green `quick`/`full` says nothing about the Linux build (#139).
 //
-// Integration tiers keep the same knob CI uses (`--test-threads=1`), so a red
-// run means the same thing locally and in CI. Unit tests have no sandbox and
-// run in parallel: 826 of them shrank from 19 s to 3 s on a 16-core host. The
-// integration suites still spawn daemons, so they stay serial until each one
-// proves it is order-independent (#153).
+// Integration tiers keep the same serial knob CI uses (`--test-threads=1`)
+// except the HTTP suite, which is isolated enough to run four-wide (5
+// consecutive green runs). Unit tests have no sandbox and run in parallel:
+// 826 of them shrank from 19 s to 3 s on a 16-core host. The daemon suite
+// still spawns crash loops that share pid assumptions, so it stays serial
+// until it proves order-independence (#153).
 //
 // Every tier has a wall-clock cap: a hung test prints TIMEOUT and the last
 // lines instead of looking like a slow compile. Override with
@@ -473,7 +474,10 @@ if (tier === "test" || tier === "full") {
   const filter = tier === "test" ? rest.filter((arg) => arg !== "--parallel") : [];
   if (tier === "full" && !parallel) {
     // Unit tests are in-process and isolated per root; integration suites
-    // spawn daemons and stay serial until each one is proven order-independent.
+    // spawn daemons. The HTTP suite uses ephemeral ports and per-sandbox
+    // directories, so it is proven to run four-wide (5 consecutive green
+    // runs, 86 s -> 25 s). The rest stay serial until each one proves the
+    // same; the daemon crash-loop tests still share pid assumptions.
     const unitThreads = process.env.SVCD_UNIT_THREADS || "8";
     const unit = runTestTier([
       "test",
@@ -484,8 +488,20 @@ if (tier === "test" || tier === "full") {
       "--test-threads=" + unitThreads,
     ]);
     if (unit !== 0) process.exit(unit);
+    const httpThreads = process.env.SVCD_HTTP_THREADS || "4";
+    const http = runTestTier([
+      "test",
+      "--test",
+      "http",
+      "--no-fail-fast",
+      "--",
+      "--test-threads=" + httpThreads,
+    ]);
+    if (http !== 0) process.exit(http);
     const integration = ["test", "--no-fail-fast"];
-    for (const target of integrationTargets()) integration.push("--test", target);
+    for (const target of integrationTargets()) {
+      if (target !== "http") integration.push("--test", target);
+    }
     integration.push("--", "--test-threads=1");
     process.exit(runTestTier(integration));
   }
