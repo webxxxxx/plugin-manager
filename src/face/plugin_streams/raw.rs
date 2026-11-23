@@ -357,6 +357,7 @@ impl StreamHandler for RawWsStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::ws::frame::server_frames;
     use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 
     struct FakeLink {
@@ -424,33 +425,6 @@ mod tests {
         let mut out = Vec::new();
         stream.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
         out
-    }
-
-    fn server_frames(bytes: &[u8]) -> (String, Vec<(u8, Vec<u8>)>) {
-        let head_end = bytes.windows(4).position(|window| window == b"\r\n\r\n");
-        let head = head_end
-            .map(|end| String::from_utf8_lossy(&bytes[..end + 4]).to_string())
-            .unwrap_or_default();
-        let mut body = head_end.map(|end| &bytes[end + 4..]).unwrap_or(bytes);
-        let mut frames = Vec::new();
-        while body.len() >= 2 {
-            let opcode = body[0] & 0x0F;
-            let mut length = u64::from(body[1] & 0x7F);
-            let mut at = 2;
-            if length == 126 {
-                length = u64::from(u16::from_be_bytes([body[at], body[at + 1]]));
-                at += 2;
-            } else if length == 127 {
-                let mut extended = [0u8; 8];
-                extended.copy_from_slice(&body[at..at + 8]);
-                length = u64::from_be_bytes(extended);
-                at += 8;
-            }
-            let payload = body[at..at + length as usize].to_vec();
-            frames.push((opcode, payload));
-            body = &body[at + length as usize..];
-        }
-        (head, frames)
     }
 
     #[test]
