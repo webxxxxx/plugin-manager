@@ -62,14 +62,8 @@ impl Package {
 /// `signature_verified` is false for the insecure fallback.
 pub struct StagedPackage {
     pub manifest: Manifest,
-    #[allow(dead_code)]
-    pub manifest_bytes: Vec<u8>,
-    #[allow(dead_code)]
-    pub signature_bytes: Vec<u8>,
     pub signature_verified: bool,
     pub root: std::path::PathBuf,
-    #[allow(dead_code)]
-    pub unpacked_size: u64,
 }
 
 /// A package installer driven by body chunks instead of a blocking reader.
@@ -272,20 +266,10 @@ impl SpkSink {
             return Err(Problem::Invalid.error("package has no payload files"));
         }
         validate_staged_payload(&manifest, &self.staging)?;
-        let unpacked_size = manifest
-            .files
-            .iter()
-            .map(|file| file.size)
-            .sum::<u64>()
-            .saturating_add(self.manifest_bytes.len() as u64)
-            .saturating_add(self.signature_bytes.len() as u64);
         Ok(StagedPackage {
             manifest,
-            manifest_bytes: std::mem::take(&mut self.manifest_bytes),
-            signature_bytes: std::mem::take(&mut self.signature_bytes),
             signature_verified: self.signature_verified,
             root: self.staging.clone(),
-            unpacked_size,
         })
     }
 }
@@ -522,20 +506,10 @@ pub fn load_staged(
         true
     };
     validate_staged_payload(&manifest, root)?;
-    let unpacked_size = manifest
-        .files
-        .iter()
-        .map(|file| file.size)
-        .sum::<u64>()
-        .saturating_add(manifest_bytes.len() as u64)
-        .saturating_add(signature_bytes.len() as u64);
     Ok(StagedPackage {
         manifest,
-        manifest_bytes,
-        signature_bytes,
         signature_verified,
         root: root.to_path_buf(),
-        unpacked_size,
     })
 }
 

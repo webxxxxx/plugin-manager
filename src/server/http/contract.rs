@@ -5,7 +5,6 @@
 //! pool's cancellation token, but owns no timer. A face gets a [`Request`] and
 //! answers through a [`Completion`], exactly once.
 
-use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -149,8 +148,6 @@ pub struct Request {
     pub path: String,
     #[allow(dead_code)] // #117 endpoint policy reads headers.
     pub headers: Vec<(String, String)>,
-    #[allow(dead_code)] // #117 endpoint policy reads peer.
-    pub peer: IpAddr,
     #[allow(dead_code)] // #117 endpoint policy reads the resolved auth context.
     pub principal: Principal,
     /// Complete body for `Buffered` routes; empty for `Empty` and `Streamed`.
@@ -484,7 +481,6 @@ mod tests {
             method: "GET".into(),
             path: "/api/v1/version?x=a%2Fb".into(),
             headers: Vec::new(),
-            peer: "127.0.0.1".parse().expect("peer"),
             principal: Principal::None,
             body: Vec::new(),
             deadline: None,

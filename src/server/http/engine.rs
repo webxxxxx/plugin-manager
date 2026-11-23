@@ -134,7 +134,6 @@ pub trait ConnectionOps {
     fn route_request(
         &mut self,
         id: u64,
-        peer: IpAddr,
         head: &http::Head,
     ) -> Result<BodyPolicy, Vec<u8>>;
     fn pre_request(&mut self, connection: &mut Connection<Self::State>) -> PreRequest;
@@ -346,9 +345,8 @@ pub fn run<S, H>(
                             match handler.pre_request(connection) {
                                 PreRequest::Continue => {
                                     let id = connection.id;
-                                    let peer = connection.peer;
                                     match advance_request(connection, limits.max_header, |head| {
-                                        handler.route_request(id, peer, head)
+                                        handler.route_request(id, head)
                                     }) {
                                         Ok(None) => {}
                                         Ok(Some(request)) => {

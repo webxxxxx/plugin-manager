@@ -70,7 +70,6 @@ impl ConnectionOps for ControlOnly {
     fn route_request(
         &mut self,
         _id: u64,
-        _peer: std::net::IpAddr,
         _head: &crate::server::http::model::Head,
     ) -> Result<crate::server::http::BodyPolicy, Vec<u8>> {
         // The control-only loop never reads HTTP requests.

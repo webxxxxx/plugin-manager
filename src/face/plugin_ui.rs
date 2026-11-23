@@ -192,7 +192,7 @@ impl PluginUiFace {
     /// one implementation; the caller owns the socket.
     pub(crate) fn exchange(
         head: &http::Head,
-        peer: IpAddr,
+        _peer: IpAddr,
         lan: &Arc<Mutex<Lan>>,
         config: Arc<Config>,
         raw_hub: Option<Arc<crate::wire::contract::rawhub::RawHub>>,
@@ -222,7 +222,6 @@ impl PluginUiFace {
             method: head.method.clone(),
             path: head.path.clone(),
             headers: head.headers.clone(),
-            peer,
             principal,
             body: Vec::new(),
             deadline: None,

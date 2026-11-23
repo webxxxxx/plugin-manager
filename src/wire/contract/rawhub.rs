@@ -1,5 +1,5 @@
 //! Raw plugin transport (protocol 3).
-#![allow(dead_code)]
+#![cfg_attr(not(feature = "http"), allow(dead_code))]
 //!
 //! A protocol-3 plugin exchanges length-prefixed frames on stdin/stdout:
 //!
