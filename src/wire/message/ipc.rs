@@ -372,12 +372,14 @@ pub enum RawFailure {
     /// The plugin wrote stream-0 frames while no JSON channel was attached
     /// (an exec-ready instance or a torn-down slot).
     JsonChannelClosed,
+    /// A control-stream payload was not one of the known operations.
+    ControlFrameInvalid,
 }
 
 impl RawFailure {
     /// Every failure, in counter order. `index` is the position in this table,
     /// so adding a variant cannot silently reuse another one's slot.
-    pub const ALL: [RawFailure; 17] = [
+    pub const ALL: [RawFailure; 18] = [
         RawFailure::FrameTooLarge,
         RawFailure::StreamNotSubscribed,
         RawFailure::StreamConflict,
@@ -395,6 +397,7 @@ impl RawFailure {
         RawFailure::JsonChannelFull,
         RawFailure::JsonFrameTooLarge,
         RawFailure::JsonChannelClosed,
+        RawFailure::ControlFrameInvalid,
     ];
 
     /// Stable counter/log name.
@@ -417,6 +420,7 @@ impl RawFailure {
             RawFailure::JsonChannelFull => "json_channel_full",
             RawFailure::JsonFrameTooLarge => "json_frame_too_large",
             RawFailure::JsonChannelClosed => "json_channel_closed",
+            RawFailure::ControlFrameInvalid => "control_frame_invalid",
         }
     }
 
@@ -439,6 +443,7 @@ impl RawFailure {
             RawFailure::JsonChannelFull => "stream 0 (JSON-RPC) queue is full",
             RawFailure::JsonFrameTooLarge => "stream 0 (JSON-RPC) frame is too large",
             RawFailure::JsonChannelClosed => "stream 0 has no attached JSON channel",
+            RawFailure::ControlFrameInvalid => "control stream payload is not a known operation",
         }
     }
 

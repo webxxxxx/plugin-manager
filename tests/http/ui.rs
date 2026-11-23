@@ -642,3 +642,33 @@ fn protocol_three_plugin_serves_json_and_raw_together() {
     assert_eq!(opcode, 0x2);
     assert_eq!(payload, b"raw-bytes");
 }
+
+/// #266: a plugin can end a raw stream, and it hears about a subscriber that
+/// left instead of writing into a dead stream.
+#[test]
+fn a_plugin_ends_a_raw_stream_and_hears_about_a_subscriber_leaving() {
+    let (_sandbox, address) = daemon_with_raw_json_plugin(66, "rawjson");
+    let base = plugin_ui_base(&address, "rawjson");
+    let mut sse = sse_connect(&address, &format!("{}events", base));
+
+    // Plugin -> subscriber: the close frame becomes a clean WebSocket close.
+    let (mut ws, status, head) = ws_handshake(&address, &format!("{}raw", base), &[]);
+    assert_eq!(status, 101, "{head}");
+    ws_send(&mut ws, 0x2, b"close-me");
+    let (opcode, payload) = ws_read(&mut ws);
+    assert_eq!(opcode, 0x2);
+    assert_eq!(payload, b"close-me");
+    let (opcode, _) = ws_read(&mut ws);
+    assert_eq!(opcode, 0x8, "the plugin's close must reach the WebSocket");
+
+    // Subscriber -> plugin: dropping the socket makes the hub tell the plugin.
+    {
+        let (_second, status, head) = ws_handshake(&address, &format!("{}raw", base), &[]);
+        assert_eq!(status, 101, "{head}");
+    }
+    let event = sse_wait_for_data(&mut sse, "stream-closed");
+    assert!(
+        event.contains("\"method\":\"notifications/message\""),
+        "{event}"
+    );
+}

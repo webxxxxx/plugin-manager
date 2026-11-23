@@ -845,6 +845,13 @@ while ($true) {
   $stream = ([uint32]$head[4] -shl 24) -bor ([uint32]$head[5] -shl 16) -bor ([uint32]$head[6] -shl 8) -bor [uint32]$head[7]
   $body = Read-Exact ([int]$size)
   if ($null -eq $body) { break }
+  if ($stream -eq 4294967295) {
+    $text = [Text.Encoding]::UTF8.GetString($body)
+    if ($text -match '"op"\s*:\s*"close"') {
+      Send-Frame ([Text.Encoding]::UTF8.GetBytes('{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"stream-closed"}}')) 0
+    }
+    continue
+  }
   if ($stream -eq 0) {
     if ($garbage) {
       Send-Frame ([Text.Encoding]::UTF8.GetBytes('not json')) 0
@@ -859,6 +866,9 @@ while ($true) {
     }
   } else {
     Send-Frame $body $stream
+    if ([Text.Encoding]::UTF8.GetString($body) -eq 'close-me') {
+      Send-Frame ([Text.Encoding]::UTF8.GetBytes('{"op":"close","stream":' + $stream + '}')) 4294967295
+    }
   }
 }
 "#;
@@ -874,6 +884,7 @@ import json, struct, sys
 
 inp, out = sys.stdin.buffer, sys.stdout.buffer
 GARBAGE = __GARBAGE__
+CONTROL = 0xFFFFFFFF
 
 
 def send(stream, payload):
@@ -906,6 +917,18 @@ while True:
     body = inp.read(size)
     if len(body) < size:
         break
+    if stream == CONTROL:
+        try:
+            message = json.loads(body)
+        except ValueError:
+            continue
+        if message.get("op") == "close":
+            send(0, json.dumps({
+                "jsonrpc": "2.0",
+                "method": "notifications/message",
+                "params": {"level": "info", "data": "stream-closed"},
+            }).encode())
+        continue
     if stream == 0:
         if GARBAGE:
             send(0, b"not json")
@@ -917,6 +940,8 @@ while True:
             pass
     else:
         send(stream, body)
+        if body == b"close-me":
+            send(CONTROL, json.dumps({"op": "close", "stream": stream}).encode())
 "#;
         (
             "agent.py",

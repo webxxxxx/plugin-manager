@@ -516,7 +516,7 @@ fn restart(binary: &Path) -> Result<(bool, Option<String>), String> {
             ),
         ));
     }
-    crate::daemon::restart::spawn_helper_from(binary)
+    crate::supervise::ops::restart::spawn_helper_from(binary)
         .map(|pid| (true, Some(format!("restart helper {}", pid))))
         .map_err(|error| format!("spawn restart helper: {}", error))
 }

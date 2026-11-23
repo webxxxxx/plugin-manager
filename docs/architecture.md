@@ -204,7 +204,7 @@ src/
     mod.rs
     model/  entry.rs  machine.rs  record.rs  definition.rs
     check/  restart.rs  backoff.rs  oneshot.rs  reconcile.rs
-    ops/    host.rs  lifecycle.rs  rescan.rs  probe.rs  invoke.rs  factory.rs  slot.rs  hook.rs  script.rs
+    ops/    host.rs  lifecycle.rs  rescan.rs  probe.rs  invoke.rs  factory.rs  slot.rs  hook.rs  script.rs  restart.rs
 
   orchestrate/                L3 领域·编排（第一个文件出现时才创建）
     model/  step.rs  flow.rs  trigger.rs  fanin.rs

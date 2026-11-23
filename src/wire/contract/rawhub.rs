@@ -9,6 +9,11 @@
 //!   payload
 //! ```
 //!
+//! **Stream `u32::MAX` is the transport control stream** (#266): one small JSON
+//! object per frame, today `{"op":"close","stream":N}` in both directions. It
+//! is how a `/raw` subscriber going away reaches the plugin, and how a plugin
+//! ending a stream reaches the subscriber.
+//!
 //! **Stream 0 is the JSON-RPC channel**: the payload is one JSON-RPC message
 //! (call, result, notification, `svcd.ping`, progress) and the outer length is
 //! its framing, so a protocol-3 plugin has the same call channel as protocol 2
@@ -35,8 +40,12 @@ use std::sync::Weak;
 use crate::platform::log::LogWriter;
 use crate::wire::contract::stdio::{self, ReadEnd, Streams, WriteEnd};
 
+mod control;
 mod json;
+
 use crate::wire::message::ipc::{FrameError, FrameEvent, RawFailure, RawStopSink};
+use control::ClosedBy;
+pub use control::CONTROL_STREAM;
 
 pub const HEADER: usize = 8;
 const SUBSCRIBER_QUEUE: usize = 4;
@@ -65,6 +74,8 @@ pub struct RawStats {
     /// call channel apart from the raw streams.
     json_frames: AtomicU64,
     json_bytes: AtomicU64,
+    /// Streams ended by either side through a control frame.
+    streams_closed: AtomicU64,
 }
 
 impl Default for RawStats {
@@ -73,6 +84,7 @@ impl Default for RawStats {
             counts: std::array::from_fn(|_| AtomicU64::new(0)),
             json_frames: AtomicU64::new(0),
             json_bytes: AtomicU64::new(0),
+            streams_closed: AtomicU64::new(0),
         }
     }
 }
@@ -110,6 +122,10 @@ impl RawStats {
             if count > 0 {
                 parts.push(format!("{}={}", failure.as_str(), count));
             }
+        }
+        let closed = self.streams_closed.load(Ordering::Relaxed);
+        if closed > 0 {
+            parts.push(format!("streams_closed={}", closed));
         }
         if parts.is_empty() {
             "none".to_string()
@@ -152,8 +168,8 @@ impl RawSubscription {
 
 impl Drop for RawSubscription {
     fn drop(&mut self) {
-        self.plugin.remove_subscriber(self.stream);
-        self.hub.release_stream(&self.plugin, self.stream);
+        self.hub
+            .close_stream(&self.plugin, self.stream, ClosedBy::Subscriber);
     }
 }
 
@@ -196,7 +212,11 @@ impl RawPlugin {
     }
 
     fn publish(&self, stream: u32, payload: Vec<u8>, hub: &RawHub) {
-        // Stream 0 is the JSON-RPC channel; everything else is a raw stream.
+        // Control frames and the JSON channel are not subscriber streams.
+        if stream == CONTROL_STREAM {
+            hub.control_frame(self, payload);
+            return;
+        }
         if stream == 0 {
             hub.json_frame(self, payload);
             return;
@@ -214,6 +234,7 @@ impl RawPlugin {
             .ok()
             .and_then(|subscribers| subscribers.get(&stream).cloned());
         let Some(sender) = sender else {
+            hub.late_stream_write(self, stream);
             return;
         };
         match sender.try_send(RawEvent::Frame(payload)) {
@@ -587,9 +608,12 @@ impl RawHub {
             .get(id)
             .cloned()
             .ok_or_else(|| format!("plugin {} has no raw transport", id))?;
-        let stream = self.next_stream.fetch_add(1, Ordering::Relaxed);
-        if stream == 0 {
-            return Err("raw stream id exhausted".into());
+        let mut stream = self.next_stream.fetch_add(1, Ordering::Relaxed);
+        if stream == 0 || stream == CONTROL_STREAM {
+            stream = self.next_stream.fetch_add(1, Ordering::Relaxed);
+            if stream == 0 || stream == CONTROL_STREAM {
+                return Err("raw stream id exhausted".into());
+            }
         }
         let (sender, receiver) = sync_channel(SUBSCRIBER_QUEUE);
         plugin
@@ -672,6 +696,8 @@ impl RawHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use serde_json::Value;
 
     /// A hub with one installed protocol-3 plugin that has a JSON channel and
     /// a writer queue we can read.
@@ -770,6 +796,114 @@ mod tests {
             hub.send_json("missing", b"{}").is_err(),
             "no plugin, no write"
         );
+    }
+
+    /// Read one control frame out of the writer queue.
+    fn control_close(writer: &Receiver<Vec<u8>>) -> (u32, Value) {
+        let frame = writer.try_recv().expect("control frame");
+        let stream = u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]);
+        let payload: Value = serde_json::from_slice(&frame[8..]).expect("control json");
+        (stream, payload)
+    }
+
+    #[test]
+    fn a_leaving_subscriber_tells_the_plugin() {
+        let (hub, _json, writer) = hub_with_json(&crate::platform::settings::Settings::default());
+        let subscription = hub.subscribe("p").expect("subscribe");
+        let stream = subscription.stream();
+
+        drop(subscription);
+
+        let (control, payload) = control_close(&writer);
+        assert_eq!(control, CONTROL_STREAM);
+        assert_eq!(payload["op"], "close");
+        assert_eq!(payload["stream"], stream);
+        assert!(hub.stats.summary().contains("streams_closed=1"));
+    }
+
+    #[test]
+    fn a_plugin_close_reaches_the_subscriber() {
+        let (hub, _json, writer) = hub_with_json(&crate::platform::settings::Settings::default());
+        let subscription = hub.subscribe("p").expect("subscribe");
+        let stream = subscription.stream();
+
+        hub.deliver(
+            "p",
+            CONTROL_STREAM,
+            format!(r#"{{"op":"close","stream":{}}}"#, stream).into_bytes(),
+        );
+
+        match subscription.try_recv() {
+            Ok(RawEvent::Closed) => {}
+            other => panic!("the subscriber did not see the close: {other:?}"),
+        }
+        assert!(
+            writer.try_recv().is_err(),
+            "a plugin-initiated close must not be echoed back"
+        );
+        assert!(hub.stats.summary().contains("streams_closed=1"));
+    }
+
+    #[test]
+    fn late_data_is_reported_and_answered() {
+        let (hub, _json, writer) = hub_with_json(&crate::platform::settings::Settings::default());
+        let subscription = hub.subscribe("p").expect("subscribe");
+        let stream = subscription.stream();
+        drop(subscription);
+        let _ = control_close(&writer);
+
+        hub.deliver("p", stream, b"late".to_vec());
+
+        assert_eq!(hub.stats.count(RawFailure::StreamNotSubscribed), 1);
+        let (control, payload) = control_close(&writer);
+        assert_eq!(control, CONTROL_STREAM);
+        assert_eq!(payload["stream"], stream);
+    }
+
+    #[test]
+    fn an_invalid_control_frame_is_counted() {
+        let (hub, _json, _writer) = hub_with_json(&crate::platform::settings::Settings::default());
+
+        hub.deliver("p", CONTROL_STREAM, b"not json".to_vec());
+        hub.deliver(
+            "p",
+            CONTROL_STREAM,
+            br#"{"op":"close","stream":0}"#.to_vec(),
+        );
+        hub.deliver("p", CONTROL_STREAM, br#"{"op":"nope","stream":1}"#.to_vec());
+
+        assert_eq!(hub.stats.count(RawFailure::ControlFrameInvalid), 3);
+        assert_eq!(hub.stats.count(RawFailure::StreamNotSubscribed), 0);
+    }
+
+    #[test]
+    fn an_empty_data_payload_is_still_a_frame() {
+        let (hub, _json, _writer) = hub_with_json(&crate::platform::settings::Settings::default());
+        let subscription = hub.subscribe("p").expect("subscribe");
+
+        hub.deliver("p", subscription.stream(), Vec::new());
+
+        match subscription.try_recv() {
+            Ok(RawEvent::Frame(payload)) => assert!(payload.is_empty()),
+            other => panic!("empty data became something else: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_close_for_an_unknown_stream_is_a_no_op() {
+        let (hub, _json, writer) = hub_with_json(&crate::platform::settings::Settings::default());
+
+        hub.deliver(
+            "p",
+            CONTROL_STREAM,
+            br#"{"op":"close","stream":42}"#.to_vec(),
+        );
+
+        assert!(
+            writer.try_recv().is_err(),
+            "nothing to close, nothing to write"
+        );
+        assert_eq!(hub.stats.count(RawFailure::ControlFrameInvalid), 0);
     }
 
     #[test]

@@ -204,7 +204,7 @@ impl Daemon {
         // The helper stops this daemon itself, after a short grace period that
         // lets the HTTP response carrying `restarting: true` flush. Shutting
         // down here could kill the process before the reply reaches the browser.
-        let helper = crate::daemon::restart::spawn_helper()
+        let helper = crate::supervise::ops::restart::spawn_helper()
             .map_err(|error| Problem::Internal.error(format!("spawn restart helper: {}", error)))?;
         Ok(json!({"restarting": true, "helper": helper}))
     }

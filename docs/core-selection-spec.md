@@ -157,7 +157,7 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
 | `version` | string | 是 | semver |
 | `desc` | string | 是 | 一句话 |
 | `platform` | string | 是 | 规范目标三元组，如 `x86_64-unknown-linux-musl`；设备与 `TARGET` 字符串精确相等，安装 + 加载双检 |
-| `protocol` | int | 是 | 1 / 2 / 3；1 = 行分帧 JSON-RPC，2 = 长度前缀 JSON-RPC，3 = 多路复用帧（stream 0 是 JSON-RPC，stream ≥1 是 raw 数据流）。不匹配安装拒绝、加载再检 |
+| `protocol` | int | 是 | 1 / 2 / 3；1 = 行分帧 JSON-RPC，2 = 长度前缀 JSON-RPC，3 = 多路复用帧（stream 0 是 JSON-RPC，stream 1..=0xFFFF_FFFE 是 raw 数据流，stream 0xFFFF_FFFF 是控制流）。不匹配安装拒绝、加载再检 |
 | `exec` | object | 是 | `{path, args?, env?, ready?}`；`ready` 默认 `notify`，可 `exec` |
 | `interpreter` | object | 否 | `{name, args?, version?}`；声明了就必须有脚本 payload，不声明则直接 exec（见 §1.8） |
 | `lifecycle` | object | 否 | `{start?, stop?, status?}`，路径包内相对且在 `files[]` |
@@ -538,6 +538,7 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
 
 ## 15. 修订记录
 
+- 2026-11-23（#266）：协议 3 增加**控制流** `0xFFFF_FFFF`，payload 是一个 JSON 对象，目前只有 `{"op":"close","stream":N}`。`/raw` 订阅者断开时宿主给插件发 close；插件发 close 时宿主给该流的 WebSocket 发干净关闭（1000）并释放订阅与在途预算；插件在已关闭的流上再写数据记 `stream_not_subscribed` 并回一个 close（不再静默丢弃）。数据流 payload 语义不变（空 payload 仍是空数据帧），控制帧 ≤128 字节，非法控制帧记 `control_frame_invalid`，不占用 stream 表、不计入 raw 数据字节。
 - 2026-11-23（#265）：协议 3 变成多路复用传输——`u32 len | u32 stream | payload` 的 **stream 0 就是 JSON-RPC 通道**（payload 是一条 JSON-RPC 消息，外层长度即帧界），stream ≥1 仍是 raw 二进制流。于是协议 3 插件可以 `ready: notify`、应答 `svcd.ping`、声明 capabilities，并同时提供 SSE、页面 WS 与 `/raw`；`ready` 与 capabilities 的既有关系（`ready=exec` 不能声明能力）不变。协议 1/2 不变。非协议 3 插件请求 `/raw` 现在返回 409 `raw_unavailable` 并指明需要协议 3；stream 0 超限/非 UTF-8/队列满记 JSON 通道失败（`json_frame_too_large` / `json_channel_full`），单条 raw 流超限只丢该流的帧。`ws_raw_enabled` 仍是最外层开关。
 
 - 2026-11-23（#264）：`svcd version` 与 `svcd upgrade`（离线 `--file` / 在线经 plugin-store 的 `release_asset`，校验 `SHA256SUMS`，不验签）；控制台「检查更新」；Windows 自替换用「运行中的 exe 改名 `.old` → 落新文件 → 下次启动清理」，Unix 直接 rename。
