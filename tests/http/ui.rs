@@ -672,3 +672,71 @@ fn a_plugin_ends_a_raw_stream_and_hears_about_a_subscriber_leaving() {
         "{event}"
     );
 }
+
+/// #260: a protocol-2 plugin (length-prefixed JSON) installs and answers a call.
+#[test]
+fn a_protocol_two_plugin_installs_and_calls() {
+    let (_sandbox, address) = daemon_with_protocol_two_plugin(65, "ptwo");
+    let base = plugin_ui_base(&address, "ptwo");
+
+    let call = request(
+        &address,
+        "POST",
+        &format!("{}rpc", base),
+        "application/json",
+        br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"echo","arguments":{}}}"#,
+    );
+
+    assert_eq!(call.status, 200, "{}", call.body);
+    assert_eq!(
+        call.body["result"]["content"][0]["text"], "pong",
+        "{}",
+        call.body
+    );
+}
+
+/// #265: a non-JSON frame on stream 0 is a protocol violation; the instance is
+/// stopped (and the fixture, which misbehaves once, can start again).
+#[test]
+fn a_non_json_stream_zero_frame_stops_the_instance() {
+    let (sandbox, address) = install_raw_json_plugin(67, "garbled", true);
+    let started = request(&address, "POST", "/api/v1/services/garbled/start", "", b"");
+    assert_eq!(started.status, 200, "{}", started.body);
+    let base = plugin_ui_base(&address, "garbled");
+
+    // The ready ping is answered properly (the fixture only misbehaves on a
+    // call); the call gets a non-JSON frame and must take the instance down.
+    let _ = request(
+        &address,
+        "POST",
+        &format!("{}rpc", base),
+        "application/json",
+        br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"echo","arguments":{}}}"#,
+    );
+
+    let log = sandbox.logs.join("garbled.log");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut text = String::new();
+    while Instant::now() < deadline {
+        text = fs::read_to_string(&log).unwrap_or_default();
+        if text.contains("protocol violation") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        text.contains("protocol violation"),
+        "the violation was not logged: {text}"
+    );
+
+    // The fixture only answers garbage once: a second start proves the first
+    // instance was stopped, not merely left waiting.
+    let restarted = request(&address, "POST", "/api/v1/services/garbled/start", "", b"");
+    assert_eq!(restarted.status, 200, "{}", restarted.body);
+    let status = request(&address, "GET", "/api/v1/services/garbled", "", b"");
+    assert_eq!(
+        status.body["summary"]["state"], "running",
+        "{}",
+        status.body
+    );
+}

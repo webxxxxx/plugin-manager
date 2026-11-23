@@ -7,6 +7,7 @@
 //   node tools/check.mjs lint             cargo clippy --all-targets -- -D warnings
 //   node tools/check.mjs fmt              rustfmt --check on every src/ and tests/ file
 //   node tools/check.mjs size             src/**/*.rs 文件行数预算（size-lint.mjs）
+//   node tools/check.mjs guardrail        tools/check_spk.mjs --self-test（校验器注入测试）
 //   node tools/check.mjs no-default       cargo check --no-default-features --bin svcd
 //   node tools/check.mjs cross [target]   cargo check --target <target> --all-targets
 //   node tools/check.mjs linux [filter]   Windows 宿主：在 WSL2 里跑 Linux 全量（或一个 filter）
@@ -355,6 +356,27 @@ if (tier === "size") {
   process.exit(result.status ?? 1);
 }
 
+if (tier === "guardrail") {
+  console.log("check: running node tools/check_spk.mjs --self-test");
+  const result = spawnSync(process.execPath, [join(HERE, "check_spk.mjs"), "--self-test"], {
+    cwd: REPO,
+    encoding: "utf8",
+    env: process.env,
+    timeout: COMPILE_TIMEOUT_MS,
+  });
+  if (result.error && result.error.code !== "ETIMEDOUT") {
+    console.error("check: cannot run check_spk.mjs: " + result.error.message);
+    process.exit(2);
+  }
+  if (timedOut(result)) {
+    reportTimeout(result);
+    process.exit(124);
+  }
+  for (const line of lines(result.stdout).concat(lines(result.stderr))) console.log(line);
+  console.log(result.status === 0 ? "check: ok (guardrail)" : "check: FAILED (guardrail)");
+  process.exit(result.status ?? 1);
+}
+
 if (tier === "no-default") {
   console.log("check: running cargo check --no-default-features --bin svcd");
   const result = cargo(
@@ -405,6 +427,21 @@ if (tier === "cross") {
 }
 
 if (tier === "test" || tier === "full") {
+  if (tier === "full") {
+    // Guardrail injection tests run before the suite: a checker that silently
+    // stopped rejecting bad input is a failure, not a warning.
+    const guard = spawnSync(process.execPath, [join(HERE, "check_spk.mjs"), "--self-test"], {
+      cwd: REPO,
+      encoding: "utf8",
+      env: process.env,
+      timeout: COMPILE_TIMEOUT_MS,
+    });
+    for (const line of lines(guard.stdout).concat(lines(guard.stderr))) console.log(line);
+    if (guard.status !== 0) {
+      console.log("check: FAILED (guardrail)");
+      process.exit(guard.status ?? 1);
+    }
+  }
   const parallel = rest.includes("--parallel");
   const filter = tier === "test" ? rest.filter((arg) => arg !== "--parallel") : [];
   const args = ["test", ...filter, "--no-fail-fast"];
