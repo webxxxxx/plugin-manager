@@ -23,7 +23,9 @@
 | 大对象 | `$blob` 引用：大参数/结果不进帧，上传、下载、断点续传 | `POST /api/v1/blobs`、blob 下载 |
 | 资源 | 内存预算（字节、百分比、自动）、CPU 预算（软闸 + 内核硬限）、workload 形状 | `svcd.conf`、`svc config tune` |
 
-## 体积与嵌入式
+## 体积与小内存设备
+
+目标是路由器这类小内存设备：rootfs 常见 16/32 MB，体积直接决定能不能装。
 
 ### 实测（stripped，十进制字节）
 
@@ -31,9 +33,9 @@
 | --- | --- | ---: |
 | 全功能（默认 features） | `x86_64-unknown-linux-musl` | **2,073,568 B ≈ 2.0 MiB** |
 | 全功能（默认 features） | `x86_64-pc-windows-msvc` | 1,138,176 B ≈ 1.1 MiB（基线，[ci/size-baseline.json](ci/size-baseline.json)） |
-| 嵌入式 lean（`--no-default-features`） | `x86_64-unknown-linux-musl` | **1,616,928 B ≈ 1.5 MiB** |
+| 小内存设备 lean（如路由器，`--no-default-features`） | `x86_64-unknown-linux-musl` | **1,616,928 B ≈ 1.5 MiB** |
 
-嵌入式的取舍说清楚：lean 构建没有 HTTP 面（也就没有网页控制台、插件 UI、MCP HTTP），只保留 CLI + 监督 + 契约线；要远程管理就装全功能版，2.0 MiB 对 16 MB 的 rootfs 也只占 12%。
+小内存设备（如路由器）的取舍说清楚：lean 构建没有 HTTP 面（也就没有网页控制台、插件 UI、MCP HTTP），只保留 CLI + 监督 + 契约线；要远程管理就装全功能版，2.0 MiB 对 16 MB 的 rootfs 也只占 12%。
 
 ## 快速开始
 
@@ -452,7 +454,7 @@ flowchart TB
 | **AI agent** | 方向，无票 | 两层：① 运维 agent——查状态、启停、读日志、定位失败、按预算调整；② 按需求生成插件——产出 manifest + payload，签好名再走安装 | ① 的地基已经在了：`/mcp`（modern Streamable HTTP）已暴露 `tools/list`、`tools/call` 和每个服务的 `<id>.start`，接一个 agent 就能用；② 的地基是 `plugin verify` + `plugin install` 的校验链 |
 | **插件 GUI** | 部分有票 [#41](https://github.com/webxxxxx/plugin-manager/issues/41) | 插件自带的状态面板、配置表单、能力调用界面；桌面侧用 WebView 窗口承载 | web 侧已实现：`.spk` 里的 `ui: {type: web, entry}` 由 daemon 托管在 `/plugin-ui/{id}/{token}/`，SSE / WebSocket / rpc 都通，浏览器侧 toolkit 在 [plugins/sdk/web](https://github.com/webxxxxx/plugins)；桌面 `svc ui` 只定了入口，内容还没定（#41） |
 | **插件商城** | 网页侧初版已开源（[plugin-store](https://github.com/webxxxxx/plugins/tree/main/plugins/plugin-store)），无票 | 按 `platform` 三元组过滤、签名分发、更新与审核；桌面/网页都能逛 | 分发地基齐了：`.spk` 签名 + `svc trust` 信任根 + `plugin verify` / `export` / `bundle` + 全三元组平台校验；初版商店已跑通「列表 → 下载 → 安装」，还缺远端目录服务、审核与更新协议 |
-| **OpenWrt ipk → spk** | 方向，无票 | 把 OpenWrt 的 opkg/apk 包转成 `.spk`：`depends` → `dependencies`、init 脚本 → `lifecycle`、架构 → `platform` 三元组，让现有插件生态能直接装 | `.spk` 就是 ustar tar + manifest，`plugin verify` 已能独立做结构校验；嵌入式发行（svcd 自己打成 ipk/apk、targets.toml、overlay 约束）在 [#43](https://github.com/webxxxxx/plugin-manager/issues/43)，与这个转换器是两件事 |
+| **OpenWrt ipk → spk** | 方向，无票 | 把 OpenWrt 的 opkg/apk 包转成 `.spk`：`depends` → `dependencies`、init 脚本 → `lifecycle`、架构 → `platform` 三元组，让现有插件生态能直接装 | `.spk` 就是 ustar tar + manifest，`plugin verify` 已能独立做结构校验；小内存设备发行（路由器；svcd 自己打成 ipk/apk、targets.toml、overlay 约束）在 [#43](https://github.com/webxxxxx/plugin-manager/issues/43)，与这个转换器是两件事 |
 
 这些方向都**不在核心层规格里**（[core-selection-spec.md](docs/core-selection-spec.md#L5) 明确把商城、ipk2spk、AI 建插件流水线列为 out of scope），所以上面没有给时间表；要动哪个，先拆票。
 
