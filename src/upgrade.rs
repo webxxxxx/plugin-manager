@@ -102,12 +102,18 @@ pub fn check(config: &Config) -> Result<Check, String> {
         });
     }
     start_store(config)?;
-    let listing = tool_call(config, json!({ "download": false }))?;
+    let result = tool_call(config, json!({ "download": false }))?;
+    let listing = payload(&result).ok_or_else(|| {
+        format!(
+            "{}: release_asset(download=false) returned no JSON listing (is the store up to date?)",
+            STORE_TOOL
+        )
+    })?;
     let latest = listing
         .get("version")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| "release_asset(download=false) did not return a version".to_string())?;
+        .ok_or_else(|| format!("{}: the listing carries no version", STORE_TOOL))?;
     let asset = pick_asset(&listing, &latest).ok_or_else(|| {
         format!(
             "release {} has no archive for {}",
@@ -341,6 +347,25 @@ fn download(config: &Config, asset: &str) -> Result<Vec<u8>, String> {
     fs::read(&path).map_err(|error| format!("read blob {}: {}", path.display(), error))
 }
 
+/// The capability's JSON payload.
+///
+/// `plugin-store` answers through the MCP content block: its `release_asset`
+/// result is `{"content":[{"type":"text","text":"<json>"}],"isError":false}`,
+/// so the listing lives in `content[0].text`. A protocol-2 stand-in (and any
+/// future plugin that predates the wrapper) hands the payload back as the raw
+/// result instead; both shapes are accepted. A blob result never reaches this
+/// point: the host rewrites it into `structuredContent` before the call
+/// returns.
+fn payload(result: &Value) -> Option<Value> {
+    if let Some(text) = result.pointer("/content/0/text").and_then(Value::as_str) {
+        return serde_json::from_str(text).ok();
+    }
+    if result.get("content").is_some() {
+        return None;
+    }
+    Some(result.clone())
+}
+
 fn pick_asset(listing: &Value, version: &str) -> Option<String> {
     let target = crate::platform::target();
     let wanted = [format!("-{}.zip", target), format!("-{}.tar.gz", target)];
@@ -561,6 +586,40 @@ fn version_from_archive(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The store answers through the MCP content block; reading `version` off
+    /// the envelope is what broke "check for updates" in the field.
+    #[test]
+    fn the_listing_comes_out_of_the_content_block() {
+        let listing = serde_json::json!({
+            "tag": "v0.1.5",
+            "version": "0.1.5",
+            "assets": [{"name": "SHA256SUMS", "size": 7}],
+            "sumsAsset": "SHA256SUMS"
+        });
+        let envelope = serde_json::json!({
+            "content": [{"type": "text", "text": listing.to_string()}],
+            "isError": false
+        });
+        assert_eq!(payload(&envelope).unwrap(), listing);
+
+        // A protocol-2 stand-in returns the payload as the raw result.
+        assert_eq!(payload(&listing).unwrap(), listing);
+
+        // An envelope whose text is not JSON is a broken answer, not a listing.
+        let broken = serde_json::json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "isError": false
+        });
+        assert!(payload(&broken).is_none());
+
+        // A blob result was already rewritten into structuredContent.
+        let blob = serde_json::json!({
+            "content": [{"type": "text", "text": "blob abc"}],
+            "structuredContent": {"$blob": "abc", "size": 3}
+        });
+        assert!(payload(&blob).is_none());
+    }
 
     #[test]
     fn versions_compare_numerically() {
