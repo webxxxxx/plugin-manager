@@ -192,8 +192,8 @@
       "layer": "domain"
     },
     "script": {
-      "concept": "supervise/hook",
-      "layer": "domain"
+      "concept": "kernel/script",
+      "layer": "kernel"
     },
     "blob": {
       "concept": "storage",
@@ -379,6 +379,7 @@
     "src/kernel/projection.rs": "kernel",
     "src/kernel/registry.rs": "registry",
     "src/kernel/schema.rs": "kernel",
+    "src/kernel/script.rs": "script",
     "src/main.rs": "main",
     "src/manage/check/backup.rs": "transfer",
     "src/manage/check/interpreter.rs": "interpreter",
@@ -523,7 +524,6 @@
     "src/supervise/ops/probe.rs": "supervise",
     "src/supervise/ops/rescan.rs": "supervise",
     "src/supervise/ops/restart.rs": "supervise",
-    "src/supervise/ops/script.rs": "script",
     "src/supervise/ops/slot.rs": "slot",
     "src/supervise/ops/slot/calls.rs": "slot",
     "src/supervise/ops/slot/commands.rs": "slot",
