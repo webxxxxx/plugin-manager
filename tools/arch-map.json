@@ -327,6 +327,7 @@
     "src/cli/svc.rs": "svc",
     "src/cli/svc/logs.rs": "svc",
     "src/cli/tune.rs": "tune",
+    "src/cli/upgrade.rs": "cli",
     "src/daemon/assembly.rs": "daemon",
     "src/daemon/bootstrap.rs": "daemon",
     "src/daemon/driver.rs": "daemon",

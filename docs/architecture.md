@@ -249,7 +249,7 @@ src/
     install/         upload.rs  install_flow.rs  import_flow.rs  backup.rs（#235）
 
   cli/                        L5 对外面：命令行
-    mod.rs  svc.rs  plugin.rs  status.rs
+    mod.rs  svc.rs  plugin.rs  status.rs  upgrade.rs
 
   platform/                   L0 平台：宿主资源与 OS 能力
     mod.rs
