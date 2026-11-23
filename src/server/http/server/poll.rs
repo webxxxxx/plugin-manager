@@ -53,11 +53,7 @@ impl ConnectionOps for Server {
 
     fn on_accept(&mut self, _connection: &mut Connection) {}
 
-    fn route_request(
-        &mut self,
-        id: u64,
-        head: &http::Head,
-    ) -> Result<BodyPolicy, Vec<u8>> {
+    fn route_request(&mut self, id: u64, head: &http::Head) -> Result<BodyPolicy, Vec<u8>> {
         match route_face_request(self.face.as_ref(), head, &self.lan) {
             Ok(Some(prepared)) => {
                 let body = prepared.route.body;

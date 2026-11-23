@@ -337,8 +337,9 @@ fn unsigned_packages_carry_no_signature_and_need_the_insecure_switch() {
     let names: Vec<&str> = parsed.iter().map(|entry| entry.path.as_str()).collect();
     assert_eq!(names, ["manifest.json", exec_path]);
 
-    let inspection = package::inspect_bytes_with(&bytes, None, &crate::platform::test_support::temp_dir())
-        .expect("inspect");
+    let inspection =
+        package::inspect_bytes_with(&bytes, None, &crate::platform::test_support::temp_dir())
+            .expect("inspect");
     assert_eq!(inspection.signature.state, "missing");
 
     // A strict install refuses it; only the host-level switch accepts it,

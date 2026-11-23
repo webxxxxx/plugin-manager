@@ -804,8 +804,8 @@ mod tests {
 
     #[test]
     fn update_value_collapses_duplicate_keys() {
-        let directory =
-            crate::platform::test_support::temp_dir().join(format!("svcd-settings-{}", std::process::id()));
+        let directory = crate::platform::test_support::temp_dir()
+            .join(format!("svcd-settings-{}", std::process::id()));
         fs::create_dir_all(&directory).expect("temp dir");
         let path = directory.join("svcd.conf");
         fs::write(

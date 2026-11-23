@@ -1,7 +1,7 @@
 //! Upgrade http tests (#264).
 
-use super::*;
 use super::support::target;
+use super::*;
 
 use std::path::{Path, PathBuf};
 

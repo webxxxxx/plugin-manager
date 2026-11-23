@@ -543,7 +543,6 @@ fn wait_for_marker(marker: &Path, needle: &str) {
 // Lifecycle matrix fixtures: all three service sources, crash control and PIDs.
 // ---------------------------------------------------------------------------
 
-
 fn pid_alive(pid: u32) -> bool {
     #[cfg(windows)]
     {

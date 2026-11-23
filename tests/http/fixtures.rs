@@ -70,7 +70,6 @@ pub(crate) fn tool_names(tools: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-
 pub(crate) fn script() -> (&'static str, Vec<u8>) {
     if cfg!(windows) {
         (

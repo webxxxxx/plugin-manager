@@ -131,11 +131,7 @@ pub trait ConnectionOps {
     fn reads_request(&self, connection: &Connection<Self::State>) -> bool;
     /// Resolve the request's route (once) and authentication, and return the
     /// body policy the loop must apply before reading a single body byte.
-    fn route_request(
-        &mut self,
-        id: u64,
-        head: &http::Head,
-    ) -> Result<BodyPolicy, Vec<u8>>;
+    fn route_request(&mut self, id: u64, head: &http::Head) -> Result<BodyPolicy, Vec<u8>>;
     fn pre_request(&mut self, connection: &mut Connection<Self::State>) -> PreRequest;
     fn on_request(&mut self, connection: &mut Connection<Self::State>, request: HttpRequest);
     fn on_error(&mut self, connection: &mut Connection<Self::State>, response: Vec<u8>);
