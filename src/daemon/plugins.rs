@@ -42,13 +42,14 @@ impl Daemon {
     /// The same core-service guard on both install paths: a package may replace
     /// a plugin, never a service the daemon itself owns. It runs after the id is
     /// known and before anything is stopped or written.
-    fn reject_core_service(&self, id: &str) -> Result<(), ProblemError> {
-        match self.host.registry.get(id) {
-            Some(existing) if existing.kind != Kind::Plugin => Err(ProblemError::new(
-                Problem::CoreService,
-                format!("id is a core service: {}", id),
-            )),
-            _ => Ok(()),
+    fn reject_core_service(
+        &self,
+        id: &str,
+        display_name: Option<&str>,
+    ) -> Result<(), ProblemError> {
+        match self.host.registry.core_conflict(id, display_name) {
+            Some(message) => Err(ProblemError::new(Problem::Conflict, message)),
+            None => Ok(()),
         }
     }
 
@@ -66,9 +67,7 @@ impl Daemon {
         still_running: bool,
         clock: &Clock,
     ) -> Result<Status, ProblemError> {
-        self.host
-            .install(service, still_running)
-            .map_err(|detail| ProblemError::new(Problem::Internal, detail))?;
+        self.host.install(service, still_running)?;
         self.bump_catalog();
         info!(
             "{}",
@@ -104,7 +103,7 @@ impl Daemon {
             interpreter: host_interpreter,
         } = verified;
         let id = package.manifest.id().to_string();
-        self.reject_core_service(&id)?;
+        self.reject_core_service(&id, Some(&package.manifest.name))?;
 
         if self.host.is_running(&id) && strategy == Strategy::Replace {
             self.host.stop_service(&id, clock)?;
@@ -216,7 +215,7 @@ impl Daemon {
                 ));
             }
         }
-        self.reject_core_service(&id)?;
+        self.reject_core_service(&id, Some(&staged.manifest.name))?;
         let host_interpreter = plugin::prepare_staged(&staged, allow_hooks)?;
         let signature_verified = staged.signature_verified;
 

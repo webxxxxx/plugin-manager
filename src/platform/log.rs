@@ -520,6 +520,20 @@ pub fn reset_svcd() -> io::Result<usize> {
     }
 }
 
+/// Append one already-formatted line to a plugin log (#262). Used for the
+/// "logs cleared" audit line, which has to land in the file the clear just
+/// recreated; the running slot keeps its own writer and both append.
+pub fn append_plugin_line(
+    dir: &Path,
+    id: &str,
+    limits: &crate::platform::limits::Limits,
+    level: Level,
+    message: &str,
+) -> io::Result<()> {
+    let mut sink = LogSink::open(dir, id, limits)?;
+    sink.line(&format_line(clock().epoch_ms(), level, "svcd", message))
+}
+
 /// Delete `<base>.log` and its rotated siblings where no writer is reachable:
 /// a stopped plugin, or the hooks log whose writer lives only for the duration
 /// of one hook run.

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::kernel::contract::Launchers;
+use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::projection::{anchored_mono_ms, anchored_secs, anchored_secs_opt, Status};
 use crate::kernel::registry::{Registry, Service, State, RESERVED_ID};
 use crate::platform::clock::{Clock, Now};
@@ -120,22 +121,39 @@ impl Supervisor {
             None => log::remove_log_files(&logs_dir, id, rotations)?,
         };
         removed += log::remove_log_files(&logs_dir, &format!("{}-hooks", id), rotations)?;
+        if removed > 0 {
+            // The audit line belongs to the plugin's own (freshly recreated) log,
+            // not the daemon log: whoever reads `<id>.log` sees who cleared it.
+            log::append_plugin_line(
+                &logs_dir,
+                id,
+                &self.config.limits,
+                log::Level::Info,
+                &format!("logs cleared: {} ({} files)", id, removed),
+            )?;
+        }
         Ok(removed)
     }
 
     /// Replace one definition and, when it is not running, its slot. The caller
     /// (compose) decides whether to stop the service first.
-    pub(crate) fn install(&mut self, service: Service, running: bool) -> Result<(), String> {
+    pub(crate) fn install(&mut self, service: Service, running: bool) -> Result<(), ProblemError> {
         if let Err(error) = service.carrier() {
-            return Err(format!("plugin {}: {}", service.id, error));
+            return Err(Problem::Internal.error(format!("plugin {}: {}", service.id, error)));
         }
+        // The registry decides id collisions (and names both display names);
+        // it must run before the slot table is touched so a rejected install
+        // leaves the running service alone.
+        self.registry
+            .insert_or_replace(service.clone())
+            .map_err(|detail| Problem::Conflict.error(detail))?;
         if !running {
             self.slots.remove(&service.id);
             if let Some(slot) = self.factory.build(&service) {
                 self.slots.insert(service.id.clone(), slot);
             }
         }
-        self.registry.replace(service)
+        Ok(())
     }
 
     /// Whether the tool catalog changed since the last check. Compose owns the

@@ -338,6 +338,28 @@ impl Service {
     }
 }
 
+/// The collision message both insert paths use. The display name is what an
+/// operator recognizes in the console, so it has to be named — the two
+/// services may look identical by id alone (#260).
+fn duplicate_id(incoming: &Service, existing: &Service) -> String {
+    duplicate_message(&incoming.id, &incoming.display_name, existing)
+}
+
+fn duplicate_message(id: &str, display_name: &Option<String>, existing: &Service) -> String {
+    let label = |name: &Option<String>| {
+        name.as_deref()
+            .map(|name| format!(" (display name {})", name))
+            .unwrap_or_default()
+    };
+    format!(
+        "duplicate service id \"{}\"{} conflicts with \"{}\"{}",
+        id,
+        label(display_name),
+        existing.id,
+        label(&existing.display_name)
+    )
+}
+
 #[derive(Default)]
 pub struct Registry {
     services: BTreeMap<String, Service>,
@@ -362,26 +384,38 @@ impl Registry {
     /// loader.
     pub fn insert(&mut self, service: Service) -> Result<(), String> {
         if let Some(existing) = self.services.get(&service.id) {
-            // The display name is what an operator recognizes in the console, so
-            // the collision has to name it — the two plugins may look identical
-            // by id alone (#260).
-            let label = |name: &Option<String>| {
-                name.as_deref()
-                    .map(|name| format!(" (display name {})", name))
-                    .unwrap_or_default()
-            };
-            return Err(format!(
-                "duplicate service id \"{}\"{} conflicts with \"{}\"{}",
-                service.id,
-                label(&service.display_name),
-                existing.id,
-                label(&existing.display_name)
-            ));
+            return Err(duplicate_id(&service, existing));
         }
         self.check_carrier(&service)?;
         self.check_identity(&service)?;
         self.services.insert(service.id.clone(), service);
         Ok(())
+    }
+
+    /// Insert a service, or replace one this loader owns. A plugin may replace
+    /// a plugin on upgrade, but it never takes over a core service (or the
+    /// builtin): that collision is the registry's `duplicate service id`
+    /// verdict, with display names for both sides (#260).
+    /// The collision message an install shows when the id belongs to a service
+    /// the daemon owns. The incoming display name comes from the package, so
+    /// the check runs before the `Service` exists.
+    pub fn core_conflict(&self, id: &str, display_name: Option<&str>) -> Option<String> {
+        self.services
+            .get(id)
+            .filter(|existing| existing.kind != Kind::Plugin)
+            .map(|existing| {
+                let display = display_name.filter(|name| *name != id).map(str::to_string);
+                duplicate_message(id, &display, existing)
+            })
+    }
+
+    pub fn insert_or_replace(&mut self, service: Service) -> Result<(), String> {
+        if let Some(existing) = self.services.get(&service.id) {
+            if existing.kind != Kind::Plugin || service.kind != Kind::Plugin {
+                return Err(duplicate_id(&service, existing));
+            }
+        }
+        self.replace(service)
     }
 
     /// Replace an existing service with the same validation as insert. The
@@ -684,6 +718,47 @@ mod tests {
         assert!(error.contains("duplicate service id"));
         assert!(error.contains("示例插件"), "{error}");
         assert!(error.contains("另一个插件"), "{error}");
+    }
+
+    #[test]
+    fn a_plugin_replaces_a_plugin_but_never_a_core_service() {
+        let mut registry = Registry::new();
+        let mut core = slot_backed("demo");
+        core.kind = Kind::Core;
+        registry.insert(core).expect("core");
+
+        let mut plugin = slot_backed("demo");
+        plugin.kind = Kind::Plugin;
+        plugin.display_name = Some("中文名".into());
+        let message = registry
+            .core_conflict("demo", Some("中文名"))
+            .expect("a core id is a conflict");
+        assert!(
+            message.starts_with("duplicate service id \"demo\""),
+            "{message}"
+        );
+        assert!(message.contains("中文名"), "{message}");
+        let error = registry
+            .insert_or_replace(plugin)
+            .expect_err("a plugin cannot take over a core id");
+        assert!(error.contains("duplicate service id"), "{error}");
+        assert_eq!(
+            registry.get("demo").map(|service| service.kind),
+            Some(Kind::Core)
+        );
+
+        let mut first = slot_backed("panel");
+        first.kind = Kind::Plugin;
+        registry.insert(first).expect("first plugin");
+        let mut second = slot_backed("panel");
+        second.kind = Kind::Plugin;
+        registry
+            .insert_or_replace(second)
+            .expect("an upgrade replaces the plugin");
+        assert_eq!(
+            registry.get("panel").map(|service| service.kind),
+            Some(Kind::Plugin)
+        );
     }
 
     #[test]

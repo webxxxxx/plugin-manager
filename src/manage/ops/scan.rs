@@ -54,18 +54,6 @@ pub fn scan(
             }
         };
         let enabled = directory.join("enabled").exists();
-        // The directory name is what the installer derived from `manifest.id`,
-        // so a disagreement means the tree was edited behind the daemon's back.
-        // Using either id would split the identity (log file, config, UI path)
-        // from the tool prefix, so the plugin is skipped instead.
-        if manifest.id() != id {
-            warnings.push(format!(
-                "{}: manifest id {} does not match the directory name",
-                id,
-                manifest.id()
-            ));
-            continue;
-        }
         let interpreter = match resolve_interpreter(&manifest, interpreter::lookup) {
             Ok(interpreter) => interpreter,
             Err(error) => {
