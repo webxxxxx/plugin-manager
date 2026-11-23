@@ -235,6 +235,8 @@ src/
     mod.rs
     api.rs           /api/v1
     plugin_ui.rs     /plugin-ui 静态资源与实时路由的入口（#115/#122）
+    static_site.rs   /static 静态站点：配置根、目录重定向、点文件与越界拒绝
+    asset.rs         静态资源文件的 sans-IO 响应（ETag/304、file send；plugin UI 与 static 共用）
     plugin_streams/  /plugin-ui SSE · WS · raw 的 sans-IO handler（#122）
     mcp_tools.rs     能力面 → tools/list；MCP 的 envelope 投影（工具结果、拒绝）
     mcp.rs           `mcp` 入口：MCP 客户端 ↔ svcd 的 stdio 桥（era 装饰、分页渲染、legacy 握手）
@@ -445,6 +447,7 @@ flowchart LR
 | 0023 目录收敛与配置物化 | `platform/paths` + `platform/config_file` + `selfinstall/execute` |
 | 0027 Windows 跑同一个 server loop | `platform/host/poll` + `platform/host/wake_pipe` + `server/http/{engine,server}` |
 | 0028 Windows 插件 stdio 反应器 | `wire/contract/reactor/{iocp,dispatch}` + `stdio/platform/windows` |
+| 0029 静态站点挂在 `/static/` | `face/static_site` + `face/asset` + `platform/settings` |
 
 ## 15. 已定的命名与决策
 

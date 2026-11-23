@@ -90,6 +90,17 @@ pub(super) fn spawn_http(
         }
     };
 
+    if let Some(root) = config.settings.static_root.as_deref() {
+        if root.is_dir() {
+            info!("static site: {} at /static/", root.display());
+        } else {
+            warn!(
+                "static_root {} is not a directory; /static/ will answer 404 until it exists",
+                root.display()
+            );
+        }
+    }
+
     let lan = Arc::new(Mutex::new(state));
     let fallback_config = config.clone();
     let face: Arc<dyn crate::server::http::Face> =

@@ -198,6 +198,8 @@ pub fn generated(settings: &Settings) -> String {
          data_dir = {data_dir}\n\
          logs_dir = {logs_dir}\n\
          {install}\
+         # Optional read-only static site under /static/ (GET/HEAD only):\n\
+         # static_root = /srv/www/public\n\
          temp_retention_secs = 7200\n\
          temp_cleanup_interval_secs = 300\n\
          # Derived, read-only layout:\n\

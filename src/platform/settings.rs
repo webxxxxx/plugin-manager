@@ -55,6 +55,10 @@ pub struct Settings {
     /// Per-service log directory. Empty/absent uses the platform or
     /// `install_dir/logs` default.
     pub logs_dir: Option<PathBuf>,
+    /// Optional read-only static site root. When set, the daemon serves files
+    /// under this directory at `/static/`. Relative values resolve against the
+    /// directory containing `svcd.conf`, like the other paths.
+    pub static_root: Option<PathBuf>,
     /// Rotation threshold for one log file. Default is chosen by the workload
     /// shape (it does not scale with the memory budget).
     pub log_max_bytes: Option<u64>,
@@ -188,6 +192,7 @@ pub(crate) const ENV_KEYS: &[&str] = &[
     "config_dir",
     "data_dir",
     "logs_dir",
+    "static_root",
     "install_dir",
     "auth_passwd",
     "temp_retention_secs",
@@ -359,6 +364,7 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
             }
             "config_dir" => settings.config_dir = Some(resolve(base, value)),
             "data_dir" => settings.data_dir = Some(resolve(base, value)),
+            "static_root" => settings.static_root = Some(resolve(base, value)),
             "install_dir" => settings.install_dir = Some(resolve(base, value)),
             "auth_passwd" => settings.auth_passwd = Some(value.to_string()),
             // Removed in ADR-0023. Parsing them lets an old document boot; the
@@ -743,7 +749,7 @@ mod tests {
     #[test]
     fn parses_all_keys_and_resolves_relative_paths() {
         let settings = parse(
-            "\u{feff}# svcd runtime\nbind = 0.0.0.0:8787\nallow_insecure_install = on\nconfig_dir = /srv/svcd\ndata_dir = state\nlogs_dir = logs\ninstall_dir = /etc/sr/svcd\nauth_passwd = pbkdf2-sha256$10000$c2FsdA$aGFzaA\nplugins_dir = plugins\nservices_dir = /var/lib/svcd/services.d\ntemp_dir = /var/tmp/svcd\ntemp_retention_secs = 3600\ntemp_cleanup_interval_secs = 60\nrescan_interval_ms = 250\nboot_scan_wait_ms = 0\n",
+            "\u{feff}# svcd runtime\nbind = 0.0.0.0:8787\nallow_insecure_install = on\nconfig_dir = /srv/svcd\ndata_dir = state\nlogs_dir = logs\nstatic_root = public\ninstall_dir = /etc/sr/svcd\nauth_passwd = pbkdf2-sha256$10000$c2FsdA$aGFzaA\nplugins_dir = plugins\nservices_dir = /var/lib/svcd/services.d\ntemp_dir = /var/tmp/svcd\ntemp_retention_secs = 3600\ntemp_cleanup_interval_secs = 60\nrescan_interval_ms = 250\nboot_scan_wait_ms = 0\n",
             Path::new("/etc/svcd"),
         )
         .expect("parse");
@@ -755,6 +761,10 @@ mod tests {
         assert_eq!(settings.config_dir, Some(PathBuf::from("/srv/svcd")));
         assert_eq!(settings.data_dir, Some(PathBuf::from("/etc/svcd/state")));
         assert_eq!(settings.logs_dir, Some(PathBuf::from("/etc/svcd/logs")));
+        assert_eq!(
+            settings.static_root,
+            Some(PathBuf::from("/etc/svcd/public"))
+        );
         assert_eq!(settings.install_dir, Some(PathBuf::from("/etc/sr/svcd")));
         assert_eq!(
             settings.auth_passwd.as_deref(),

@@ -294,6 +294,10 @@ fn effective(config: &crate::platform::config::Config, key: &str, bind: Option<&
         "config_dir" => json!(paths.config_dir.to_string_lossy()),
         "data_dir" => json!(paths.data_dir.to_string_lossy()),
         "logs_dir" => json!(paths.logs_dir.to_string_lossy()),
+        "static_root" => json!(settings
+            .static_root
+            .as_ref()
+            .map(|path| path.to_string_lossy())),
         "install_dir" => json!(settings
             .install_dir
             .as_ref()

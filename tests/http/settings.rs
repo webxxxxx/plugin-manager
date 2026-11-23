@@ -85,9 +85,9 @@ fn settings_get_reports_values_sources_and_metadata() {
     let response = request(&address, "GET", "/api/v1/settings", "", b"");
     assert_eq!(response.status, 200, "{:?}", response.body);
     let keys = response.body["keys"].as_array().expect("keys");
-    // 54 live keys; `config_doc`'s own guard keeps the table honest, this pins
+    // 55 live keys; `config_doc`'s own guard keeps the table honest, this pins
     // that the route projects all of them.
-    assert_eq!(keys.len(), 54, "the screen shows every documented key");
+    assert_eq!(keys.len(), 55, "the screen shows every documented key");
     let by_key = |key: &str| {
         keys.iter()
             .find(|entry| entry["key"] == key)
@@ -123,10 +123,14 @@ fn settings_get_reports_values_sources_and_metadata() {
         assert_eq!(entry["editable"], false, "{entry}");
         assert!(entry["effective"].is_string(), "{entry}");
     }
-    // The install prefix is optional: null until an install records one.
+    // The install prefix and the static-site root are optional: null until set.
     let install = by_key("install_dir");
     assert_eq!(install["kind"], "path");
     assert_eq!(install["editable"], false);
+    let static_root = by_key("static_root");
+    assert_eq!(static_root["kind"], "path");
+    assert_eq!(static_root["editable"], false);
+    assert!(static_root["effective"].is_null(), "{static_root}");
     let password = by_key("auth_passwd");
     assert_eq!(password["kind"], "password-hash");
     assert_eq!(password["editable"], true);

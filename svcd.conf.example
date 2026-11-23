@@ -40,6 +40,15 @@ bind = 127.0.0.1:8787
 # data_dir = /var/lib/svcd
 # logs_dir = /var/log/svcd
 #
+# Optional read-only static site. When set, files under this directory are
+# served at /static/ (GET/HEAD only): /static/ and /static/<dir>/ answer that
+# directory's index.html, a directory without a trailing slash redirects to it,
+# and missing files are a plain 404. Dotfiles, path traversal and directory
+# listings are refused. Static files follow the daemon's authentication, so a
+# loopback bind without a password needs none. Relative values resolve against
+# the directory containing this file. Requires a daemon restart.
+# static_root = /srv/www/public
+#
 # Removed keys and variables are ignored with a warning that names the derived
 # path: plugins_dir, services_dir, temp_dir, SVCD_TEMP_DIR, SVCD_RUN_DIR,
 # SVCD_TRUST_DIR. Every live key instead has an SVCD_<KEY> override (see the

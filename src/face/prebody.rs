@@ -67,6 +67,21 @@ impl PreBodyFaces {
         ))
     }
 
+    /// The static-site claim. Only a configured root is claimed; the face
+    /// answers auth, the slash redirect, 404 and 405 itself.
+    fn static_site(
+        &self,
+        head: &http::Head,
+        lan: &Arc<Mutex<Lan>>,
+    ) -> Option<Result<crate::server::http::Exchange, Vec<u8>>> {
+        if self.config.settings.static_root.is_none()
+            || !crate::face::static_site::is_path(&head.path)
+        {
+            return None;
+        }
+        Some(crate::face::static_site::exchange(&self.config, head, lan))
+    }
+
     /// The package upload claim. The stream switches to the transfer timeout.
     fn package_upload(
         &self,
@@ -123,6 +138,9 @@ impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
     ) -> Option<crate::server::http::hooks::PreBodyClaim> {
         // Endpoint precedence lives here, in the face layer. The loop calls this
         // one method; the first Some wins.
+        if let Some(exchange) = self.static_site(head, lan) {
+            return Some(crate::server::http::hooks::PreBodyClaim { exchange });
+        }
         if let Some(exchange) = self.plugin_ui(head, peer, lan, raw_hub) {
             return Some(crate::server::http::hooks::PreBodyClaim { exchange });
         }

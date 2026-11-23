@@ -19,6 +19,7 @@
 | 包管理 | 签名 `.spk` 的安装、校验、导出、卸载；信任根管理；包内配置与 hooks | `plugin install/verify/export/uninstall`、`svc trust` |
 | 控制面 | JSON HTTP API、内嵌网页控制台、MCP（Streamable HTTP + stdio）、命令行 | `http://127.0.0.1:8787`、`/mcp`、`mcp` |
 | 插件 UI | `/plugin-ui/{id}/{token}/` 托管插件的静态页面，并把 SSE / WebSocket 桥到插件进程 | 控制台「打开」按钮 |
+| 静态站点 | 把一个本地目录只读地托管在 `/static/`；HTML / JS / CSS / 图片 / 图标按扩展名给 MIME，带 ETag/304 | `svcd.conf` 的 `static_root` |
 | 大对象 | `$blob` 引用：大参数/结果不进帧，上传、下载、断点续传 | `POST /api/v1/blobs`、blob 下载 |
 | 资源 | 内存预算（字节、百分比、自动）、CPU 预算（软闸 + 内核硬限）、workload 形状 | `svcd.conf`、`svc config tune` |
 
@@ -85,6 +86,23 @@ svc list
 > 正式分发仍然应该签名；商店发布钥已经由安装器写入 `trust.d`。
 
 然后在浏览器打开 `http://127.0.0.1:8787/`，用控制台点「打开」——控制台会现签一个 1 小时有效的插件 UI token，地址形如 `/plugin-ui/demo/<token>/`。
+
+### 静态文件服务器
+
+把一个目录写进 `svcd.conf`，重启 daemon，它就会以只读方式托管在 `/static/` 下：
+
+```ini
+# ~/.config/svcd/svcd.conf（路径相对 svcd.conf 所在目录）
+static_root = ./public
+```
+
+```sh
+# public/index.html、public/assets/app.js、public/icon.png
+curl http://127.0.0.1:8787/static/
+curl http://127.0.0.1:8787/static/assets/app.js
+```
+
+`/static/` 与 `/static/<目录>/` 返回该目录的 `index.html`；`/static/<目录>`（无尾斜杠）会 308 到带斜杠形式，保证相对链接能正确解析。缺失文件严格 404，不做 SPA fallback；只接受 `GET` / `HEAD`，不提供目录列表，点文件与越界路径一律 404。静态资源跟着 daemon 的认证走：默认只监听回环地址时无需登录；绑定 LAN 且设了口令时，HTML 导航会先跳登录，拿到会话后即可访问。
 
 ### 插件商店
 
@@ -215,6 +233,7 @@ cpu_budget_percent = 90             # 软闸 + cgroup / Job Object 硬限
 | `config_dir` | 平台默认（Linux /etc/svcd） | 输入根：svcd.conf、services.d、trust.d、compat.conf。 | 重启 daemon |
 | `data_dir` | 平台默认（Linux /var/lib/svcd） | 运行状态根：plugins、temp、run。 | 重启 daemon |
 | `logs_dir` | 平台默认（Linux /var/log/svcd） | 日志根：svcd.log、<id>.log、<id>-hooks.log。 | 重启 daemon |
+| `static_root` | 未设（关闭） | 只读静态站点根：目录下的文件通过 `/static/` 访问；带尾部斜杠的目录取 `index.html`。 | 重启 daemon |
 | `install_dir` | 未设（由 `svcd --install --prefix` 记录） | 安装前缀：初始化时补 config/data/logs 默认值，运行时不再从它推路径。 | 重启 daemon |
 
 ## 架构

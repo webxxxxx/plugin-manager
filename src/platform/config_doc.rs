@@ -684,6 +684,17 @@ pub const CONF_KEYS: &[ConfKey] = &[
         needs_restart: true,
     },
     ConfKey {
+        key: "static_root",
+        label: "静态站点根目录",
+        group: Group::Paths,
+        kind: Kind::Path,
+        default: "未设（关闭）",
+        doc: "只读静态站点根：目录下的文件通过 `/static/` 访问（`/static/` 与 `/static/<dir>/` 取 `index.html`）。",
+        recommend: "把构建产物目录写在这里；相对路径按 svcd.conf 所在目录解析。",
+        editable_in_console: false,
+        needs_restart: true,
+    },
+    ConfKey {
         key: "install_dir",
         label: "安装目录",
         group: Group::Paths,
@@ -866,7 +877,13 @@ mod tests {
 
     #[test]
     fn path_keys_are_the_read_only_roots() {
-        let roots = ["config_dir", "data_dir", "logs_dir", "install_dir"];
+        let roots = [
+            "config_dir",
+            "data_dir",
+            "logs_dir",
+            "static_root",
+            "install_dir",
+        ];
         for entry in CONF_KEYS {
             if entry.kind == Kind::Path {
                 assert!(
