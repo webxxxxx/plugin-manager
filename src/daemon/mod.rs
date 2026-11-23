@@ -28,7 +28,6 @@ mod assembly;
 mod bootstrap;
 mod driver;
 mod plugins;
-pub(crate) mod restart;
 mod shutdown;
 mod tools;
 

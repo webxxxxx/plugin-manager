@@ -8,5 +8,6 @@ pub mod invoke;
 pub mod lifecycle;
 pub mod probe;
 pub mod rescan;
+pub mod restart;
 pub mod script;
 pub mod slot;

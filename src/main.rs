@@ -397,7 +397,7 @@ fn restart_command() -> i32 {
     // Start the replacement from the detached helper rather than from this
     // process: the helper runs with null stdio, so the daemon it starts cannot
     // inherit whatever pipes the caller of `svcd restart` holds.
-    match crate::daemon::restart::spawn_helper() {
+    match crate::supervise::ops::restart::spawn_helper() {
         Ok(helper) => {
             println!("svcd restarting (helper pid {})", helper);
             0
