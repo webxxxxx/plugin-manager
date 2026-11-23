@@ -9,9 +9,16 @@
 use std::env;
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use flate2::{Compression, GzBuilder};
+
+// The console tree walker and the extension table are shared with the crate so
+// the build and the runtime answer "is this a text asset?" the same way.
+#[path = "src/face/console_tree.rs"]
+mod console_tree;
+#[path = "src/server/http/media.rs"]
+mod media;
 
 fn main() {
     let target = env::var("TARGET").expect("cargo sets TARGET for build scripts");
@@ -41,9 +48,12 @@ fn main() {
     let console_dir = out_dir.join("console");
     fs::create_dir_all(&console_dir).expect("create console asset directory");
     println!("cargo:rerun-if-changed=src/assets/static");
+    // Files included with `#[path]` are outside Cargo's build-script inputs.
+    println!("cargo:rerun-if-changed=src/face/console_tree.rs");
+    println!("cargo:rerun-if-changed=src/server/http/media.rs");
 
     let mut sources = Vec::new();
-    collect_console_assets(&source_dir, "", &mut sources);
+    console_tree::collect(&source_dir, "", &mut sources);
     sources.sort_by(|left, right| left.0.cmp(&right.0));
     assert!(
         sources.iter().any(|(relative, _)| relative == "index.html"),
@@ -54,7 +64,7 @@ fn main() {
     generated.push_str("static GENERATED: &[GeneratedAsset] = &[\n");
     for (relative, source) in &sources {
         println!("cargo:rerun-if-changed={}", source.display());
-        let gzip = is_text_asset(relative);
+        let gzip = media::for_path(relative).compressible;
         let output = if gzip {
             format!("{relative}.gz")
         } else {
@@ -86,61 +96,4 @@ fn main() {
     }
     generated.push_str("];\n");
     fs::write(out_dir.join("console_manifest.rs"), generated).expect("write console manifest");
-}
-
-/// Collect regular files below `src/assets/static/` with `/`-separated
-/// relative paths. Dot files and dot directories stay out of the console.
-fn collect_console_assets(directory: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) {
-    let entries = fs::read_dir(directory)
-        .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()));
-    for entry in entries {
-        let entry = entry.expect("console asset directory entry");
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str().map(str::to_string) else {
-            panic!(
-                "console asset name is not UTF-8: {}",
-                entry.path().display()
-            );
-        };
-        if name.starts_with('.') {
-            continue;
-        }
-        let relative = if prefix.is_empty() {
-            name
-        } else {
-            format!("{prefix}/{name}")
-        };
-        let path = entry.path();
-        let file_type = entry.file_type().expect("console asset file type");
-        if file_type.is_dir() {
-            collect_console_assets(&path, &relative, out);
-        } else if file_type.is_file() {
-            out.push((relative, path));
-        }
-    }
-}
-
-/// Whether a console asset is worth gzipping. Images, fonts and other
-/// already-compressed formats are stored exactly as they are.
-fn is_text_asset(relative: &str) -> bool {
-    let extension = Path::new(relative)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    matches!(
-        extension.as_str(),
-        "html"
-            | "htm"
-            | "css"
-            | "js"
-            | "mjs"
-            | "json"
-            | "map"
-            | "svg"
-            | "xml"
-            | "txt"
-            | "md"
-            | "wasm"
-    )
 }

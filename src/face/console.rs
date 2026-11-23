@@ -1,9 +1,9 @@
 //! The console's embedded assets.
 //!
-//! `build.rs` walks `src/assets/static/`, gzips the text formats, copies the
-//! binary ones, and generates `console_manifest.rs`; this module is the only
-//! runtime view of that tree. Every file is served under `/assets/`, while `/`
-//! serves `index.html`.
+//! `build.rs` walks `src/assets/static/`, gzips the formats the media table
+//! marks compressible, copies the rest, and generates `console_manifest.rs`;
+//! this module is the only runtime view of that tree. `/` serves `index.html`
+//! and refers to every other file through `/assets/`.
 //!
 //! Serving the bytes from the binary keeps the console immutable: nothing
 //! writable under the data directory can inject a script into the page that
@@ -11,9 +11,13 @@
 
 use std::sync::OnceLock;
 
-use crate::server::http::{model as http, Response};
+use crate::server::http::{media, model as http, Response};
 
 use super::webui;
+
+#[cfg(test)]
+#[path = "console_tree.rs"]
+mod console_tree;
 
 /// How one embedded asset is stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,12 +53,15 @@ pub(crate) fn assets() -> &'static [Asset] {
     ASSETS.get_or_init(|| {
         GENERATED
             .iter()
-            .map(|(path, encoding, body)| Asset {
-                path,
-                mime: http::content_type(path),
-                cache: cache_for(path),
-                encoding: *encoding,
-                body,
+            .map(|(path, encoding, body)| {
+                let policy = media::for_path(path);
+                Asset {
+                    path,
+                    mime: policy.mime,
+                    cache: policy.cache,
+                    encoding: *encoding,
+                    body,
+                }
             })
             .collect()
     })
@@ -63,32 +70,21 @@ pub(crate) fn assets() -> &'static [Asset] {
 /// Resolve a URL path to its embedded asset.
 ///
 /// `/` serves `index.html`; every other console URL must carry the `/assets/`
-/// prefix. Percent escapes are decoded before the exact table lookup, so a
-/// name with a space works while `..` can only miss.
+/// prefix, and the page has no second URL there (its links would resolve from
+/// the wrong directory). Query strings select a representation, not an asset.
+/// Percent escapes are decoded before the exact table lookup, so a name with a
+/// space works while `..` can only miss.
 pub(crate) fn find(url_path: &str) -> Option<&'static Asset> {
-    let relative = if url_path == "/" {
-        "index.html"
-    } else {
-        url_path.strip_prefix("/assets/")?
-    };
-    let relative = http::percent_decode(relative, false);
-    assets().iter().find(|asset| asset.path == relative)
-}
-
-/// The page is never cached; text assets revalidate with the ETag; images and
-/// fonts may sit in the browser cache for a day.
-fn cache_for(path: &str) -> &'static str {
-    let extension = std::path::Path::new(path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    match extension.as_str() {
-        "html" | "htm" => "no-store",
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "ico" | "woff" | "woff2" | "ttf"
-        | "otf" => "public, max-age=86400",
-        _ => "no-cache",
+    let url_path = url_path.split_once('?').map_or(url_path, |(path, _)| path);
+    if url_path == "/" {
+        return assets().iter().find(|asset| asset.path == "index.html");
     }
+    let relative = url_path.strip_prefix("/assets/")?;
+    let relative = http::percent_decode(relative, false);
+    if relative == "index.html" {
+        return None;
+    }
+    assets().iter().find(|asset| asset.path == relative)
 }
 
 /// Build the response for one asset, including the conditional GET.
@@ -140,21 +136,64 @@ mod tests {
     }
 
     #[test]
-    fn cache_policy_follows_the_extension() {
-        assert_eq!(cache_for("index.html"), "no-store");
-        assert_eq!(cache_for("app.css"), "no-cache");
-        assert_eq!(cache_for("app.js"), "no-cache");
-        assert_eq!(cache_for("logo.svg"), "no-cache");
-        assert_eq!(cache_for("logo.png"), "public, max-age=86400");
-        assert_eq!(cache_for("font.woff2"), "public, max-age=86400");
+    fn embedded_manifest_matches_the_media_table() {
+        for asset in assets() {
+            let policy = media::for_path(asset.path);
+            assert_eq!(asset.mime, policy.mime, "{}", asset.path);
+            assert_eq!(asset.cache, policy.cache, "{}", asset.path);
+            assert_eq!(
+                asset.encoding == Encoding::Gzip,
+                policy.compressible,
+                "the build and the runtime disagree on gzip for {}",
+                asset.path
+            );
+        }
     }
 
     #[test]
-    fn find_decodes_escapes_and_refuses_paths_outside_the_table() {
-        assert!(find("/assets/index.html").is_some());
-        assert!(find("/assets/%69ndex.html").is_some());
+    fn every_file_in_the_static_tree_is_embedded() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/assets/static");
+        let mut collected = Vec::new();
+        console_tree::collect(&root, "", &mut collected);
+        let mut expected: Vec<String> = collected.into_iter().map(|(path, _)| path).collect();
+        expected.sort();
+
+        let mut embedded: Vec<String> = assets()
+            .iter()
+            .map(|asset| asset.path.to_string())
+            .collect();
+        embedded.sort();
+        assert_eq!(
+            embedded, expected,
+            "build.rs must embed every file under src/assets/static"
+        );
+    }
+
+    #[test]
+    fn find_decodes_escapes_ignores_the_query_and_keeps_one_page_url() {
+        assert!(find("/").is_some());
+        assert!(
+            find("/?next=%2Fstatic%2Findex.html").is_some(),
+            "the login redirect lands on /?next=…"
+        );
+        assert!(find("/assets/favicon.svg?v=1").is_some());
+        assert!(
+            find("/assets/%66avicon.svg").is_some(),
+            "percent escapes decode before the lookup"
+        );
         assert!(find("/assets/../Cargo.toml").is_none());
         assert!(find("/assets/missing.png").is_none());
-        assert!(find("/index.html").is_none());
+        assert!(
+            find("/index.html").is_none(),
+            "the page has no /index.html URL"
+        );
+        assert!(
+            find("/assets/index.html").is_none(),
+            "the page has one URL only"
+        );
+        assert!(
+            find("/assets/%69ndex.html").is_none(),
+            "the escaped page name is not a second URL"
+        );
     }
 }

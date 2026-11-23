@@ -276,7 +276,8 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
   - `POST /api/v1/services/{id}/stop` → 返回 `{summary}`
   - `POST /api/v1/services/{id}/enable` / `disable` → 切换开机自启，返回 `{summary}`
   - `GET /api/v1/version` → `{version, protocol, platform}`
-  - `GET /` / `GET /index.html` → 内嵌 Web 控制台（静态 HTML；页面本身不需要认证，API 调用仍走同一鉴权）
+  - `GET /` → 内嵌 Web 控制台（静态 HTML；页面本身不需要认证，API 调用仍走同一鉴权）
+  - `GET /assets/{*path}` → 控制台的其余静态文件（同样免认证；页面只在 `/`）
   - `POST /api/v1/plugins`：body 为 `.spk` 原始字节（`application/octet-stream`），query `strategy` / `enable` / `allow_hooks`；流式写临时文件，512 MiB 上限；返回 `{id,version,state}`
   - `POST /api/v1/plugins/{id}/ui-token`：签发 1 小时、绑定该 plugin id 的 UI token；返回 `{token,url,expiresIn}`，`url` 形如 `/plugin-ui/{id}/{token}/`
   - `GET /api/v1/trust` → `{keys:[keyId], directory}`；`POST /api/v1/trust?key_id=<id>`：body 为 PEM SPKI 公钥，写入 `<config>/trust.d/<id>.pub`；`DELETE /api/v1/trust/{keyId}` 撤销
