@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::kernel::registry::valid_id;
 use crate::kernel::registry::{
     Exec, Hook, Kind, Lifecycle, Ready, Registry, Restart, Service, State, RESERVED_ID,
 };
-use crate::manage::valid_id;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadIssue {

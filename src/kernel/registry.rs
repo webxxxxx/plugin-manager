@@ -12,6 +12,20 @@ use crate::kernel::failure::{Class, Problem, ProblemError};
 /// The built-in core service id; reserved against `services.d` definitions.
 pub const RESERVED_ID: &str = "svc";
 
+/// The service/plugin id charset. The identity ends up in directory names,
+/// file names, URL path segments and MCP tool names, so it stays ASCII and
+/// lower case.
+pub fn valid_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .next()
+            .map(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            .unwrap_or(false)
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
