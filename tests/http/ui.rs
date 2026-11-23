@@ -67,6 +67,10 @@ fn serves_the_embedded_console() {
         html.contains("id=\"tip\"") && html.contains("entry.label || entry.key"),
         "settings dialog shows Chinese labels and the English key in a hover tip"
     );
+    assert!(
+        html.contains("settingsTipLine('来源'"),
+        "settings dialog keeps provenance in the hover tip"
+    );
     let index = raw_request(&address, "GET", "/index.html", "", b"");
     assert_eq!(index.status, 200);
 
