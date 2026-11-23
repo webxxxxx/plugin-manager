@@ -409,9 +409,6 @@ fn restart_command() -> i32 {
     }
 }
 
-/// Wait for the process named in `pid` to exit, then start the daemon again.
-/// This is the detached half of a settings save: the daemon cannot rebind its
-/// control socket or HTTP port while it is still running.
 /// `svcd upgrade`: check, or apply a local/remote release. The download half
 /// lives in `plugin-store`; this command only orchestrates and reports.
 fn upgrade_command(args: &[String]) -> i32 {
@@ -530,6 +527,9 @@ fn report_applied(applied: &crate::upgrade::Applied, json: bool) -> i32 {
     0
 }
 
+/// Wait for the process named in `pid` to exit, then start the daemon again.
+/// This is the detached half of a settings save: the daemon cannot rebind its
+/// control socket or HTTP port while it is still running.
 fn restart_helper(args: &[String]) -> i32 {
     let Some(_pid) = args.first().and_then(|value| value.parse::<u32>().ok()) else {
         eprintln!("svcd: restart-helper expects a pid");

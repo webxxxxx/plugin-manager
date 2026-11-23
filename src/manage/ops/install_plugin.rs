@@ -49,14 +49,10 @@ pub fn install_staged(
     poll: &mut dyn FnMut(),
 ) -> Result<Service, ProblemError> {
     // The id, its charset and the reserved `svc` name were already rejected by
-    // `parse_manifest`; the only conflict left to check is a core service.
+    // `parse_manifest`; a clash with a core service is refused by the registry
+    // when the service is committed, so both paths report the same verdict.
     let id = staged.manifest.id().to_string();
     ensure_hooks_allowed_manifest(&staged.manifest, opt_in_hooks)?;
-    if paths.services_dir.join(format!("{}.json", id)).exists() {
-        return Err(
-            Problem::Conflict.error(format!("plugin id conflicts with a core service: {}", id))
-        );
-    }
 
     let plugin_dir = plugin_dir(paths, &id);
     let was_installed = current_version(paths, &id).is_some();
@@ -264,14 +260,10 @@ pub fn install_package(
     poll: &mut dyn FnMut(),
 ) -> Result<Service, InstallFailure> {
     // The id and the reserved `svc` name are already rejected by
-    // `parse_manifest`; a core service with the same id is the remaining clash.
+    // `parse_manifest`; a core service with the same id is refused by the
+    // registry when the service is committed.
     let id = package.manifest.id().to_string();
     ensure_hooks_allowed(package, opt_in_hooks)?;
-    if paths.services_dir.join(format!("{}.json", id)).exists() {
-        return Err(Problem::Conflict
-            .error(format!("plugin id conflicts with a core service: {}", id))
-            .into());
-    }
 
     let plugin_dir = plugin_dir(paths, &id);
     let was_installed = current_version(paths, &id).is_some();

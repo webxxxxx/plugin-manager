@@ -253,6 +253,7 @@ impl Sandbox {
             "id": id,
             "version": "1.0.0",
             "desc": "core",
+            "protocol": 1,
             "exec": {"path": path, "args": args, "ready": "exec"}
         });
         fs::write(
@@ -920,8 +921,9 @@ fn rejects_a_plugin_id_that_belongs_to_a_core_service() {
 
     let output = sandbox.run_plugin(&["install", package.to_str().expect("utf8")]);
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    // The registry owns the collision and names both sides (#260).
     assert!(
-        stderr(&output).contains("core service") || stderr(&output).contains("conflicts"),
+        stderr(&output).contains("duplicate service id"),
         "{}",
         stderr(&output)
     );

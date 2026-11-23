@@ -182,7 +182,12 @@ fn invalid_read_only_and_conflicting_values_are_rejected_without_writing() {
             r#"{"values":{"mem_budget_bytes":"1"}}"#,
             "mutually exclusive",
         ),
-        (r#"{"values":{"max_streams":true}}"#, "string or null"),
+        (r#"{"values":{"log_level":true}}"#, "string or null"),
+        (r#"{"values":{"max_streams":"48"}}"#, "read-only"),
+        (
+            r#"{"values":{"log_level":"info\ninstall_dir = /tmp/x"}}"#,
+            "single line",
+        ),
     ] {
         let response = request(
             &address,

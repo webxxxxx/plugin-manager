@@ -322,9 +322,16 @@ fn config_endpoints_are_plugin_only_and_enforce_methods() {
         "application/octet-stream",
         &core_package,
     );
+    // A package may not take over a core service id: the registry decides (#260)
+    // and the message names both sides.
     assert_eq!(
         core_import.status,
-        404,
+        409,
+        "{}",
+        String::from_utf8_lossy(&core_import.body)
+    );
+    assert!(
+        String::from_utf8_lossy(&core_import.body).contains("duplicate service id"),
         "{}",
         String::from_utf8_lossy(&core_import.body)
     );

@@ -30,6 +30,9 @@ const CONTROL_MAX: usize = 128;
 pub(super) enum ClosedBy {
     Subscriber,
     Plugin,
+    /// A raw stream produced a frame over `ws_raw_max_bytes`; only that stream
+    /// ends, the instance keeps running.
+    Oversized,
 }
 
 impl RawStats {
@@ -123,6 +126,13 @@ impl RawHub {
             }
             ClosedBy::Plugin => {
                 info!("{}: raw stream {} closed by the plugin", plugin.id, stream);
+            }
+            ClosedBy::Oversized => {
+                warn!(
+                    "{}: raw stream {} closed: frame over the size limit",
+                    plugin.id, stream
+                );
+                self.send_control_close(plugin, stream);
             }
         }
     }

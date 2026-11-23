@@ -7,7 +7,7 @@
     },
     "src/daemon/tests.rs": {
       "production": 0,
-      "total": 1704
+      "total": 1688
     },
     "src/face/blob.rs": {
       "production": 754,

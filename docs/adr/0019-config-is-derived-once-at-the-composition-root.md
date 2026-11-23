@@ -40,6 +40,10 @@ Accepted。细化 [docs/architecture.md](../architecture.md) §8 的 S7 行；�
 - The daemon still needs the config directory before `ensure_conf` can report the path it settled on. It bootstraps once before `ensure_conf` and keeps that document for the whole run; `ensure_conf` only chooses or creates the file the service unit and the next start use. This preserves the old cache's precedence (`SVCD_CONFIG_DIR` > program-dir `config/svcd.conf` > program-dir `svcd.conf` > platform default) instead of letting `ensure_conf`'s fallback silently switch documents mid-start, and it removes the second parse S7a still had on first start.
 - `config::ambient_paths(conf)` remains the single tolerant entry for phases that must outlive a broken config; it now takes the explicit `--conf` (when it exists) so the Windows SCM probe and the daemon agree.
 
+## 修订（2026-11-23，#267）
+
+`Config` 在组装时把 `SVCD_<key>` 快照成 `env: BTreeMap<&'static str, String>` 一并带走；`GET /api/v1/settings` 报来源时读这份快照，不再每个请求 `std::env::var`。环境变量的读取仍然只发生在组合根，与本文的「派生一次」一致。
+
 ## Consequences
 
 - 模块级测试可以直接构造 `Config`（或 `Paths::under(tmp)`）+ 临时根，不再 spawn 进程；测试之间不再通过进程 env 互相踩。

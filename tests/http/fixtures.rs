@@ -810,6 +810,138 @@ pub(crate) fn raw_plugin_bundle(key: &SigningKey, id: &str) -> Vec<u8> {
     signed_package(key, manifest, &files)
 }
 
+/// A protocol-2 agent: one `u32 len | json` frame per message. Python on Unix,
+/// PowerShell on Windows. Answers the ready ping and every call with a pong
+/// result, so an install+call proves the length-prefixed transport end to end.
+pub(crate) fn length_prefixed_agent() -> (&'static str, Vec<u8>, Value) {
+    if cfg!(windows) {
+        let script = r#"$ErrorActionPreference = 'Stop'
+$in = [Console]::OpenStandardInput()
+$out = [Console]::OpenStandardOutput()
+$len = [byte[]]::new(4)
+while ($true) {
+  $got = 0
+  while ($got -lt 4) {
+    $r = $in.Read($len, $got, 4 - $got)
+    if ($r -le 0) { exit 0 }
+    $got += $r
+  }
+  $size = ([uint32]$len[0] -shl 24) -bor ([uint32]$len[1] -shl 16) -bor ([uint32]$len[2] -shl 8) -bor [uint32]$len[3]
+  $body = New-Object byte[] $size
+  $got = 0
+  while ($got -lt $size) {
+    $r = $in.Read($body, $got, $size - $got)
+    if ($r -le 0) { exit 0 }
+    $got += $r
+  }
+  $text = [Text.Encoding]::UTF8.GetString($body)
+  $id = 1
+  if ($text -match '"id"\s*:\s*(\d+)') { $id = [int]$Matches[1] }
+  $reply = [Text.Encoding]::UTF8.GetBytes('{"jsonrpc":"2.0","id":' + $id + ',"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}')
+  $n = [uint32]$reply.Length
+  $head = [byte[]]@(
+    (($n -shr 24) -band 255), (($n -shr 16) -band 255), (($n -shr 8) -band 255), ($n -band 255))
+  $out.Write($head, 0, 4)
+  $out.Write($reply, 0, $reply.Length)
+  $out.Flush()
+}
+"#;
+        (
+            "agent.ps1",
+            script.as_bytes().to_vec(),
+            json!({"name": "powershell", "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]}),
+        )
+    } else {
+        let script = r#"#!/usr/bin/env python3
+import json, struct, sys
+
+inp, out = sys.stdin.buffer, sys.stdout.buffer
+while True:
+    head = inp.read(4)
+    if len(head) < 4:
+        break
+    size = struct.unpack(">I", head)[0]
+    body = inp.read(size)
+    if len(body) < size:
+        break
+    try:
+        message = json.loads(body)
+    except ValueError:
+        continue
+    reply = json.dumps({
+        "jsonrpc": "2.0",
+        "id": message.get("id", 1),
+        "result": {"content": [{"type": "text", "text": "pong"}], "isError": False},
+    }).encode()
+    out.write(struct.pack(">I", len(reply)))
+    out.write(reply)
+    out.flush()
+"#;
+        (
+            "agent.py",
+            script.as_bytes().to_vec(),
+            json!({"name": "python3", "version": ">=3.8"}),
+        )
+    }
+}
+
+/// Install and start a protocol-2 plugin; a 200 proves the length-prefixed
+/// channel carried the ready ping (#260).
+pub(crate) fn daemon_with_protocol_two_plugin(key_byte: u8, id: &str) -> (Sandbox, String) {
+    let mut sandbox = Sandbox::new();
+    sandbox.allow_insecure_install_with("");
+    let key = SigningKey::from_bytes(&[key_byte; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let (name, agent, interpreter) = length_prefixed_agent();
+    let exec_path = format!("payload/bin/{}", name);
+    let mut files: Vec<(String, Vec<u8>, u32)> = vec![
+        (exec_path.clone(), agent, 0o755),
+        (
+            "payload/web/index.html".to_string(),
+            b"<!doctype html>\n<html><body>protocol two</body></html>".to_vec(),
+            0o644,
+        ),
+    ];
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let manifest = json!({
+        "schema": 1,
+        "id": id,
+        "name": id,
+        "version": "1.0.0",
+        "desc": "protocol 2 agent",
+        "platform": target(),
+        "protocol": 2,
+        "exec": {"path": exec_path, "args": [], "ready": "notify"},
+        "interpreter": interpreter,
+        "capabilities": [{"name": "echo", "desc": "echo", "inputSchema": {}}],
+        "ui": {"type": "web", "entry": "index.html"},
+    });
+    let package = signed_package(&key, manifest, &files);
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let installed = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(installed.status, 200, "{}", installed.body);
+    let started = request(
+        &address,
+        "POST",
+        &format!("/api/v1/services/{}/start", id),
+        "",
+        b"",
+    );
+    assert_eq!(started.status, 200, "{}", started.body);
+    (sandbox, address)
+}
+
 /// A protocol-3 agent: JSON-RPC on stream 0 (ping, capability calls, one
 /// notification) and raw echo on every other stream. Python on Unix,
 /// PowerShell on Windows; both speak `u32 len | u32 stream`.
@@ -853,12 +985,12 @@ while ($true) {
     continue
   }
   if ($stream -eq 0) {
-    if ($garbage) {
+    $text = [Text.Encoding]::UTF8.GetString($body)
+    if ($garbage -and ($text -notmatch '"method"\s*:\s*"svcd\.ping"')) {
       Send-Frame ([Text.Encoding]::UTF8.GetBytes('not json')) 0
       $garbage = $false
       continue
     }
-    $text = [Text.Encoding]::UTF8.GetString($body)
     if ($text -match '"id"\s*:\s*(\d+)') {
       $id = [int]$Matches[1]
       Send-Frame ([Text.Encoding]::UTF8.GetBytes('{"jsonrpc":"2.0","id":' + $id + ',"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}')) 0
@@ -930,12 +1062,16 @@ while True:
             }).encode())
         continue
     if stream == 0:
-        if GARBAGE:
+        try:
+            message = json.loads(body)
+        except ValueError:
+            message = None
+        if GARBAGE and (not message or message.get("method") != "svcd.ping"):
             send(0, b"not json")
             GARBAGE = False
             continue
         try:
-            reply(json.loads(body))
+            reply(message)
         except ValueError:
             pass
     else:
@@ -982,9 +1118,10 @@ pub(crate) fn raw_json_plugin_bundle(key: &SigningKey, id: &str, garbage: bool) 
     signed_package(key, manifest, &files)
 }
 
-/// Install and start the mixed-channel plugin. A 200 here already proves the
-/// ready ping crossed stream 0.
-pub(crate) fn daemon_with_raw_json_plugin(key_byte: u8, id: &str) -> (Sandbox, String) {
+/// Install the mixed-channel plugin and leave it stopped. `garbage` makes the
+/// first stream-0 answer non-JSON, which is how the protocol-violation test
+/// drives a real instance into the stop path.
+pub(crate) fn install_raw_json_plugin(key_byte: u8, id: &str, garbage: bool) -> (Sandbox, String) {
     let mut sandbox = Sandbox::new();
     sandbox.allow_insecure_install_with("");
     let key = SigningKey::from_bytes(&[key_byte; 32]);
@@ -993,7 +1130,7 @@ pub(crate) fn daemon_with_raw_json_plugin(key_byte: u8, id: &str) -> (Sandbox, S
         pem_from_public(&key.verifying_key().to_bytes()),
     )
     .expect("trust key");
-    let package = raw_json_plugin_bundle(&key, id, false);
+    let package = raw_json_plugin_bundle(&key, id, garbage);
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
     let installed = request(
@@ -1004,6 +1141,13 @@ pub(crate) fn daemon_with_raw_json_plugin(key_byte: u8, id: &str) -> (Sandbox, S
         &package,
     );
     assert_eq!(installed.status, 200, "{}", installed.body);
+    (sandbox, address)
+}
+
+/// Install and start the mixed-channel plugin. A 200 here already proves the
+/// ready ping crossed stream 0.
+pub(crate) fn daemon_with_raw_json_plugin(key_byte: u8, id: &str) -> (Sandbox, String) {
+    let (sandbox, address) = install_raw_json_plugin(key_byte, id, false);
     let started = request(
         &address,
         "POST",

@@ -108,10 +108,13 @@ fn clearing_a_running_plugin_log_keeps_the_writer_on_the_visible_file() {
     // The writer reopens the path. Deleting the file instead would leave a
     // delete-pending path on Windows: gone from the namespace, still written to.
     assert!(log.is_file(), "the cleared log must still be the live path");
-    // The reopened file is empty, not missing: a 200 with no lines.
+    // The reopened file carries only the audit line (#262): the plugin's own log
+    // says who cleared it, instead of that line living in svcd.log.
     let empty = raw_request(&address, "GET", "/api/v1/logs/chatty", "", b"");
     assert_eq!(empty.status, 200);
-    assert!(empty.body.is_empty(), "{:?}", empty.body);
+    let text = String::from_utf8_lossy(&empty.body);
+    assert!(text.contains("logs cleared: chatty (1 files)"), "{text}");
+    assert!(!text.contains("chatty line"), "{text}");
 
     // A second clear proves the reopened path is a real file the writer holds:
     // a deleted-but-still-open file reports zero files instead.
@@ -120,7 +123,9 @@ fn clearing_a_running_plugin_log_keeps_the_writer_on_the_visible_file() {
     assert_eq!(again.body["files"], 1, "{:?}", again.body);
     let tail = raw_request(&address, "GET", "/api/v1/logs/chatty", "", b"");
     assert_eq!(tail.status, 200);
-    assert!(tail.body.is_empty(), "{:?}", tail.body);
+    let text = String::from_utf8_lossy(&tail.body);
+    assert!(text.contains("logs cleared: chatty (1 files)"), "{text}");
+    assert!(!text.contains("chatty line"), "{text}");
 }
 
 #[test]
@@ -155,15 +160,33 @@ fn clearing_removes_hooks_and_rotations_and_404s_when_empty() {
     let cleared = request(&address, "DELETE", "/api/v1/logs/demo", "", b"");
     assert_eq!(cleared.status, 200, "{:?}", cleared.body);
     assert_eq!(cleared.body["files"], 4, "{:?}", cleared.body);
-    for name in files {
+    for name in ["demo.log.1", "demo-hooks.log", "demo-hooks.log.1"] {
         assert!(
             !sandbox.logs.join(name).exists(),
             "{name} survived the clear"
         );
     }
+    // The clear writes its audit line into the plugin's own new file (#262).
+    let audit = fs::read_to_string(sandbox.logs.join("demo.log")).expect("demo.log");
+    assert!(audit.contains("logs cleared: demo (4 files)"), "{audit}");
+    assert!(!audit.contains("line"), "{audit}");
 
+    // A second clear removes that file (and recreates it with a new audit line).
+    let again = request(&address, "DELETE", "/api/v1/logs/demo", "", b"");
+    assert_eq!(again.status, 200, "{:?}", again.body);
+    assert_eq!(again.body["files"], 1, "{:?}", again.body);
+
+    // A plugin that never wrote anything has nothing to clear.
+    let installed = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &plugin_bundle(&key, "quiet", "1.0.0", None, false),
+    );
+    assert_eq!(installed.status, 200, "{:?}", installed.body);
     assert_eq!(
-        request(&address, "DELETE", "/api/v1/logs/demo", "", b"").status,
+        request(&address, "DELETE", "/api/v1/logs/quiet", "", b"").status,
         404,
         "nothing left to clear is a 404"
     );

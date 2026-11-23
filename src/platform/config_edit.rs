@@ -4,11 +4,6 @@
 //! keeps the document *text*: which keys it states, which environment override
 //! wins, and how to change a few keys while preserving every other line.
 
-use std::fs;
-use std::path::Path;
-
-use crate::platform::settings;
-
 /// The raw `key = value` pairs a document states, comments stripped. The
 /// settings screen needs the text (and where it came from) rather than the
 /// parsed [`Settings`], which cannot say whether a value was written or defaulted.
@@ -32,36 +27,30 @@ pub fn file_values(text: &str) -> std::collections::BTreeMap<String, String> {
     values
 }
 
-/// The `SVCD_<KEY>` override for a live key, if the environment sets one. Only
-/// [`ENV_KEYS`] are consulted, so a stray `SVCD_*` variable stays unknown.
-pub fn env_value(key: &str) -> Option<String> {
-    if !settings::ENV_KEYS.contains(&key) {
-        return None;
-    }
-    let name = format!("SVCD_{}", key.to_ascii_uppercase());
-    let value = std::env::var(&name).ok()?;
-    (!value.is_empty()).then_some(value)
-}
-
-/// Set and unset several keys in one read-modify-write. Comment lines and keys
-/// the caller did not name are preserved byte for byte, which is what makes the
-/// settings screen safe to use on a hand-edited document.
-pub fn rewrite(
-    path: &Path,
+/// The document text after `set` and `unset`, with every line the caller did
+/// not name preserved byte for byte — including its line ending and a missing
+/// final newline. A duplicate assignment of a set key collapses to one line.
+pub fn rewrite_text(
+    text: &str,
     set: &std::collections::BTreeMap<String, String>,
     unset: &[String],
-) -> Result<(), String> {
-    // A missing document is empty, not an error: the settings screen may be the
-    // first thing to create it.
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(format!("read {}: {}", path.display(), error)),
+) -> String {
+    let (bom, body) = match text.strip_prefix('\u{feff}') {
+        Some(rest) => ("\u{feff}", rest),
+        None => ("", text),
     };
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let newline = if body.contains("\r\n") { "\r\n" } else { "\n" };
     let mut output = String::with_capacity(text.len() + 64);
+    output.push_str(bom);
     let mut written = std::collections::BTreeSet::new();
-    for line in text.lines() {
+    for segment in body.split_inclusive('\n') {
+        let (line, terminator) = if let Some(rest) = segment.strip_suffix("\r\n") {
+            (rest, "\r\n")
+        } else if let Some(rest) = segment.strip_suffix('\n') {
+            (rest, "\n")
+        } else {
+            (segment, "")
+        };
         let trimmed = line.trim();
         let key = (!trimmed.starts_with('#') && !trimmed.is_empty())
             .then(|| trimmed.split_once('=').map(|(left, _)| left.trim()))
@@ -69,29 +58,32 @@ pub fn rewrite(
         match key {
             Some(key) if unset.iter().any(|candidate| candidate == key) => {}
             Some(key) => match set.get(key) {
-                // A duplicate assignment is dropped: one key, one line.
                 Some(value) if written.insert(key.to_string()) => {
-                    output.push_str(&format!("{} = {}\n", key, value));
+                    output.push_str(&format!("{} = {}", key, value));
+                    output.push_str(terminator);
                 }
                 Some(_) => {}
                 None => {
                     output.push_str(line);
-                    output.push('\n');
+                    output.push_str(terminator);
                 }
             },
             None => {
                 output.push_str(line);
-                output.push('\n');
+                output.push_str(terminator);
             }
         }
     }
     for (key, value) in set {
         if written.insert(key.clone()) {
-            output.push_str(&format!("{} = {}\n", key, value));
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push_str(newline);
+            }
+            output.push_str(&format!("{} = {}", key, value));
+            output.push_str(newline);
         }
     }
-    fs::write(path, output).map_err(|error| format!("write {}: {}", path.display(), error))?;
-    Ok(())
+    output
 }
 
 /// `strip a trailing " # comment"` — the same rule the parser applies.
@@ -99,5 +91,67 @@ fn strip_comment(value: &str) -> &str {
     match value.find(" #") {
         Some(index) => value[..index].trim_end(),
         None => value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn an_edit_preserves_comments_crlf_and_unknown_keys() {
+        let text = "# header\r\nbind = 127.0.0.1:8787\r\n\r\nlog_level = info\r\nother = 1\r\n";
+
+        let next = rewrite_text(text, &map(&[("log_level", "debug")]), &[]);
+
+        assert_eq!(
+            next,
+            "# header\r\nbind = 127.0.0.1:8787\r\n\r\nlog_level = debug\r\nother = 1\r\n"
+        );
+    }
+
+    #[test]
+    fn an_edit_keeps_a_missing_trailing_newline() {
+        let text = "log_level = info";
+
+        let next = rewrite_text(text, &map(&[("log_level", "warn")]), &[]);
+
+        assert_eq!(next, "log_level = warn");
+    }
+
+    #[test]
+    fn a_new_key_starts_on_its_own_line() {
+        let text = "log_level = info";
+        let next = rewrite_text(text, &map(&[("bind", "127.0.0.1:0")]), &[]);
+        assert_eq!(next, "log_level = info\nbind = 127.0.0.1:0\n");
+
+        let next = rewrite_text("", &map(&[("bind", "127.0.0.1:0")]), &[]);
+        assert_eq!(next, "bind = 127.0.0.1:0\n");
+    }
+
+    #[test]
+    fn an_unset_key_disappears_and_duplicates_collapse() {
+        let text = "a = 1\nb = 2\na = 3\n";
+
+        let next = rewrite_text(text, &map(&[("a", "9")]), &["b".to_string()]);
+
+        assert_eq!(next, "a = 9\n");
+        assert_eq!(file_values(&next).get("a").map(String::as_str), Some("9"));
+        assert!(!file_values(&next).contains_key("b"));
+    }
+
+    #[test]
+    fn comments_and_blank_lines_are_not_values() {
+        let values = file_values("# a = 1\n\nb = 2 # trailing\n");
+        assert_eq!(values.len(), 1);
+        assert_eq!(values.get("b").map(String::as_str), Some("2"));
     }
 }

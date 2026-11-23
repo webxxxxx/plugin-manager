@@ -233,12 +233,6 @@ impl Daemon {
             .host
             .clear_logs(&id)
             .map_err(|error| Problem::Internal.error(format!("clear {} logs: {}", id, error)))?;
-        if files > 0 {
-            log::record(
-                log::Level::Info,
-                &format!("logs cleared: {} ({} files)", id, files),
-            );
-        }
         Ok(json!({"cleared": id, "files": files}))
     }
 
