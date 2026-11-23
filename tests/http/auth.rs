@@ -80,7 +80,7 @@ fn password_auth_bearer_cookie_csrf() {
     let page = raw_request(&address, "GET", "/", "", b"");
     assert_eq!(page.status, 200, "console must load before login");
 
-    let icon = raw_request(&address, "GET", "/favicon.svg", "", b"");
+    let icon = raw_request(&address, "GET", "/assets/favicon.svg", "", b"");
     assert_eq!(icon.status, 200, "the tab icon must load before login");
     assert_eq!(
         raw_header_values(&icon, "content-type"),

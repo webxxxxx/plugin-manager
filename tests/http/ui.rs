@@ -39,8 +39,8 @@ fn serves_the_embedded_console() {
         "console missing the overflow menu"
     );
     assert!(
-        html.contains("<link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\">"),
-        "the console must point the tab at /favicon.svg"
+        html.contains("<link rel=\"icon\" type=\"image/svg+xml\" href=\"assets/favicon.svg\">"),
+        "the console must point the tab at assets/favicon.svg"
     );
     for needle in [
         "上传安装",
@@ -99,8 +99,15 @@ fn serves_the_embedded_console() {
         html.contains("function sessionExpired") && html.matches("sessionExpired();").count() >= 2,
         "settings and upgrade polls must share the expired-session handler"
     );
-    let index = raw_request(&address, "GET", "/index.html", "", b"");
+    let index = raw_request(&address, "GET", "/assets/index.html", "", b"");
     assert_eq!(index.status, 200);
+    let alias = raw_request(&address, "GET", "/index.html", "", b"");
+    assert_eq!(alias.status, 404, "the console owns / only");
+    let missing = raw_request(&address, "GET", "/assets/missing.css", "", b"");
+    assert_eq!(
+        missing.status, 404,
+        "the asset table has no directory index"
+    );
 
     let post = raw_request(&address, "POST", "/", "", b"");
     assert_eq!(post.status, 405);
@@ -140,17 +147,14 @@ fn favicon_is_public_and_cacheable() {
     let address = sandbox.wait_for_http();
 
     let source = include_bytes!("../../src/assets/static/favicon.svg");
-    let icon = raw_request(&address, "GET", "/favicon.svg", "", b"");
+    let icon = raw_request(&address, "GET", "/assets/favicon.svg", "", b"");
     assert_eq!(icon.status, 200);
     assert_eq!(
         raw_header_values(&icon, "content-type"),
         vec!["image/svg+xml"]
     );
     assert_eq!(raw_header_values(&icon, "content-encoding"), vec!["gzip"]);
-    assert_eq!(
-        raw_header_values(&icon, "cache-control"),
-        vec!["public, max-age=86400"]
-    );
+    assert_eq!(raw_header_values(&icon, "cache-control"), vec!["no-cache"]);
     assert_eq!(
         raw_header_values(&icon, "x-content-type-options"),
         vec!["nosniff"]
@@ -164,7 +168,7 @@ fn favicon_is_public_and_cacheable() {
     assert_eq!(etag.len(), 1, "the icon needs one strong validator");
 
     let length = icon.body.len().to_string();
-    let head = raw_request(&address, "HEAD", "/favicon.svg", "", b"");
+    let head = raw_request(&address, "HEAD", "/assets/favicon.svg", "", b"");
     assert_eq!(head.status, 200);
     assert!(head.body.is_empty(), "HEAD must not carry a body");
     assert_eq!(
@@ -175,7 +179,7 @@ fn favicon_is_public_and_cacheable() {
     let revalidated = raw_request_with(
         &address,
         "GET",
-        "/favicon.svg",
+        "/assets/favicon.svg",
         "",
         b"",
         &[("If-None-Match", etag[0])],
@@ -183,9 +187,12 @@ fn favicon_is_public_and_cacheable() {
     assert_eq!(revalidated.status, 304);
     assert!(revalidated.body.is_empty(), "a 304 carries no body");
 
-    let post = raw_request(&address, "POST", "/favicon.svg", "", b"");
+    let post = raw_request(&address, "POST", "/assets/favicon.svg", "", b"");
     assert_eq!(post.status, 405);
     assert_eq!(raw_header_values(&post, "allow"), vec!["GET"]);
+
+    let alias = raw_request(&address, "GET", "/favicon.svg", "", b"");
+    assert_eq!(alias.status, 404, "assets only live under /assets/");
 }
 
 #[test]
