@@ -4,7 +4,7 @@
 //! each face test exercises the same event sequence.
 
 use crate::server::http::{
-    CloseReason, JobBudget, OutBuffer, StreamAction, StreamEvent, StreamHandler,
+    BlockingOutcome, CloseReason, JobBudget, OutBuffer, StreamAction, StreamEvent, StreamHandler,
 };
 
 /// Whether a `SendFile` action ends the drive or the handler continues with
@@ -63,4 +63,24 @@ pub(crate) fn drive_stream<S: StreamHandler>(
         step = handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
     }
     panic!("the handler never finished");
+}
+
+/// Drive the exact sequence a full blocking queue produces: one writable
+/// event, one body chunk, then `Busy`. Both upload handlers answer 503; this
+/// keeps the event order in one place instead of copying it per test.
+pub(crate) fn drive_busy(handler: &mut dyn StreamHandler, body: &[u8], limit: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let step = handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
+    assert!(matches!(step.action, StreamAction::NeedRead));
+    let step = handler.on_event(
+        StreamEvent::Data(body),
+        &mut OutBuffer::new(&mut out, limit),
+    );
+    assert!(matches!(step.action, StreamAction::SubmitBlocking(_)));
+    let step = handler.on_event(
+        StreamEvent::BlockingDone(BlockingOutcome::Busy),
+        &mut OutBuffer::new(&mut out, limit),
+    );
+    assert!(matches!(step.action, StreamAction::Close(_)));
+    out
 }
