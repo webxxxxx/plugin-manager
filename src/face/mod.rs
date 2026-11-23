@@ -11,6 +11,8 @@
 #[cfg(feature = "http")]
 pub mod api;
 #[cfg(feature = "http")]
+pub mod asset;
+#[cfg(feature = "http")]
 pub mod blob;
 #[cfg(feature = "http")]
 pub mod blob_routes;
@@ -36,6 +38,8 @@ pub mod prebody;
 pub mod reply;
 #[cfg(feature = "http")]
 pub mod routes;
+#[cfg(feature = "http")]
+pub mod static_site;
 #[cfg(feature = "http")]
 pub mod support;
 pub mod uichannel;

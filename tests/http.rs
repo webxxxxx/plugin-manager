@@ -43,6 +43,8 @@ mod mcp;
 mod protocol;
 #[path = "http/settings.rs"]
 mod settings;
+#[path = "http/static_site.rs"]
+mod static_site;
 #[path = "http/transfer.rs"]
 mod transfer;
 #[path = "http/ui.rs"]

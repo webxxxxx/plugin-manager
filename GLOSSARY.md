@@ -49,8 +49,12 @@ _Avoid_: IPC（那是插件 stdio 与控制通道的统称）、管理端口
 _Avoid_: 插件管理器、PluginManager（那是已退役的进程）
 
 **svcd.conf**:
-`<config>` 下的运行时配置文件，由 `svcd --install --conf <file>` 写入；承载 HTTP 端口、三个目录根（`config_dir` / `data_dir` / `logs_dir`）、`install_dir` 安装前缀与 `auth_passwd` 哈希。派生的 `services.d` / `trust.d` / `plugins` / `temp` / `run` 不写进文件，只出现在注释里。每个键都可用 `SVCD_<KEY>`（键名大写）覆盖，环境变量优先于文件。
+`<config>` 下的运行时配置文件，由 `svcd --install --conf <file>` 写入；承载 HTTP 端口、三个目录根（`config_dir` / `data_dir` / `logs_dir`）、可选的静态站点根 `static_root`、`install_dir` 安装前缀与 `auth_passwd` 哈希。派生的 `services.d` / `trust.d` / `plugins` / `temp` / `run` 不写进文件，只出现在注释里。每个键都可用 `SVCD_<KEY>`（键名大写）覆盖，环境变量优先于文件。
 _Avoid_: settings.json、通用“配置文件”
+
+**静态站点（Static site）**:
+`static_root` 指向的本地目录，以只读方式挂在 `/static/`：只接受 `GET`/`HEAD`，`/static/` 与 `/static/<dir>/` 取 `index.html`，无尾斜杠目录 308 到带斜杠形式，缺失文件严格 404；不列目录、不服务点文件、不做 SPA fallback。它跟随 daemon 的认证与内存预算，静态文件走零拷贝、不占 `max_streams`。见 [ADR-0029](docs/adr/0029-static-site-under-static.md)。
+_Avoid_: 文件服务器（它不提供写、列目录或独立端口）、插件 UI（那是 `/plugin-ui/{id}/{token}/`）
 
 **auth_passwd**:
 `svcd.conf` 里的 PBKDF2-HMAC-SHA256 口令哈希；明文只经过 `svc lan passwd <password>`，不落盘。网页登录、`/api/v1` 与 `/mcp` 的 Bearer 都用同一密码。

@@ -237,20 +237,33 @@ fn doctype_end(html: &[u8]) -> Option<usize> {
         .map(|pos| index + pos + 1)
 }
 
-/// Resolve a relative path under the web root and make sure it stays inside it
-/// (the installer rejects symlinks, but this is cheap defence in depth).
-pub(crate) fn web_file(root: &Path, relative: &str) -> Option<(PathBuf, std::fs::Metadata)> {
+/// Resolve a relative path under a web root and make sure it stays inside it
+/// after canonicalization (the installer rejects symlinks, but this is cheap
+/// defence in depth). The path need not exist.
+pub(crate) fn web_path(root: &Path, relative: &str) -> Option<PathBuf> {
     let mut path = root.to_path_buf();
     for segment in relative.split('/') {
         path.push(segment);
     }
     let root = root.canonicalize().ok()?;
     let path = path.canonicalize().ok()?;
-    if !path.starts_with(&root) {
-        return None;
-    }
+    path.starts_with(&root).then_some(path)
+}
+
+/// [`web_path`] narrowed to a regular file.
+pub(crate) fn web_file(root: &Path, relative: &str) -> Option<(PathBuf, std::fs::Metadata)> {
+    let path = web_path(root, relative)?;
     let metadata = std::fs::metadata(&path).ok()?;
     metadata.is_file().then_some((path, metadata))
+}
+
+/// [`web_path`] narrowed to a directory. Used by the static site's
+/// slashless-directory redirect.
+pub(crate) fn web_dir(root: &Path, relative: &str) -> bool {
+    web_path(root, relative)
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
 }
 
 /// The response headers every plugin UI asset carries.
