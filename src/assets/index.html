@@ -243,6 +243,14 @@ function showLogin() {
   $('main').classList.add('hidden');
 }
 
+// A changed password (settings) or a restart that drops the session (upgrade)
+// leaves every subsequent poll answering 401; one handler closes the surface
+// and asks for a fresh login.
+function sessionExpired() {
+  showLogin();
+  toast('登录会话已失效，请重新登录', 'info');
+}
+
 function showMain() {
   $('login').classList.add('hidden');
   $('main').classList.remove('hidden');
@@ -969,8 +977,7 @@ function showSettingsModal(data) {
             stopPolling();
             hideSettingsTip();
             modal.remove();
-            showLogin();
-            toast('登录会话已失效，请重新登录', 'info');
+            sessionExpired();
             return;
           }
           if (response.ok) {
@@ -1083,9 +1090,15 @@ function showUpgradeModal(data) {
         credentials: 'same-origin',
         headers: authHeaders()
       }).then(async function (response) {
+        if (response.status === 401) {
+          close();
+          sessionExpired();
+          return null;
+        }
         if (!response.ok) throw new Error(await errorText(response));
         return response.json();
       }).then(function (result) {
+        if (!result) return;
         if (!result.restarting) {
           status.textContent = result.hint || '已升级，重启 daemon 后生效'; 
           return;
@@ -1094,7 +1107,16 @@ function showUpgradeModal(data) {
         const started = Date.now();
         timer = setInterval(function () {
           fetch('/api/v1/version', { credentials: 'same-origin', headers: authHeaders() })
-            .then(function (response) { return response.ok ? response.json() : null; })
+            .then(function (response) {
+              if (response.status === 401) {
+                // An upgrade restart can drop the session just like a
+                // settings restart; stop instead of answering 401 every 500ms.
+                close();
+                sessionExpired();
+                return null;
+              }
+              return response.ok ? response.json() : null;
+            })
             .then(function (value) {
               if (value && value.version === result.version) {
                 clearInterval(timer);

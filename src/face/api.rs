@@ -33,6 +33,41 @@ mod settings;
 mod upgrade;
 
 const UI: &str = include_str!("../assets/index.html");
+/// Precompressed at build time by `build.rs`; see `accepts_gzip` for when it is
+/// used. The raw `UI` remains the fallback for clients without gzip support.
+const UI_GZIP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/index.html.gz"));
+
+/// Whether the client accepts a gzip representation. An explicit `gzip;q=0`
+/// refuses it; `*` accepts it only when gzip is not named explicitly.
+fn accepts_gzip(headers: &[(String, String)]) -> bool {
+    let Some(value) = http::header(headers, "accept-encoding") else {
+        return false;
+    };
+    let mut wildcard = None;
+    for item in value.split(',') {
+        let mut parts = item.split(';');
+        let coding = parts.next().unwrap_or("").trim();
+        if coding.is_empty() {
+            continue;
+        }
+        let mut quality = 1.0_f32;
+        for parameter in parts {
+            let Some((name, value)) = parameter.trim().split_once('=') else {
+                continue;
+            };
+            if name.trim().eq_ignore_ascii_case("q") {
+                quality = value.trim().parse().unwrap_or(0.0);
+            }
+        }
+        if coding.eq_ignore_ascii_case("gzip") {
+            return quality > 0.0;
+        }
+        if coding == "*" {
+            wildcard = Some(quality > 0.0);
+        }
+    }
+    wildcard.unwrap_or(false)
+}
 
 use super::blob;
 use super::export;
@@ -591,11 +626,16 @@ impl Face for ApiFace {
                 done.complete(Exchange::Response(self.logout(&request)));
             }
             Endpoint::Console => {
-                done.complete(Exchange::Response(
-                    Response::new(200, "text/html; charset=utf-8", UI.as_bytes())
-                        .with_header("Cache-Control", "no-store")
-                        .with_header("X-Content-Type-Options", "nosniff"),
-                ));
+                let gzip = accepts_gzip(&request.headers);
+                let body: &[u8] = if gzip { UI_GZIP } else { UI.as_bytes() };
+                let mut response = Response::new(200, "text/html; charset=utf-8", body)
+                    .with_header("Cache-Control", "no-store")
+                    .with_header("Vary", "Accept-Encoding")
+                    .with_header("X-Content-Type-Options", "nosniff");
+                if gzip {
+                    response = response.with_header("Content-Encoding", "gzip");
+                }
+                done.complete(Exchange::Response(response));
             }
             Endpoint::UnknownApi => {
                 done.complete(Exchange::Response(error_response(
@@ -644,6 +684,8 @@ impl Face for ApiFace {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+
     use super::*;
     use crate::platform::paths::Paths;
     use crate::server::http::{dispatch_blocking_now, dispatch_inline};
@@ -696,6 +738,33 @@ mod tests {
             deadline: None,
             cancel: None,
         }
+    }
+
+    fn encoding(value: &str) -> Vec<(String, String)> {
+        vec![("Accept-Encoding".to_string(), value.to_string())]
+    }
+
+    #[test]
+    fn console_gzip_is_negotiated_from_accept_encoding() {
+        for value in ["gzip", "GZip", "br, gzip", "gzip;q=0.5", "*", "*;q=0.5"] {
+            assert!(accepts_gzip(&encoding(value)), "{value}");
+        }
+        for value in ["identity", "br", "gzip;q=0", "gzip;q=0.0, *", "*;q=0"] {
+            assert!(!accepts_gzip(&encoding(value)), "{value}");
+        }
+        assert!(!accepts_gzip(&[]));
+    }
+
+    #[test]
+    fn embedded_console_gzip_is_deterministic_and_matches_the_source() {
+        assert_eq!(&UI_GZIP[..2], &[0x1f, 0x8b][..], "gzip magic");
+        assert!(UI_GZIP[4..8].iter().all(|byte| *byte == 0), "fixed mtime");
+        assert_eq!(UI_GZIP[9], 255, "fixed OS byte");
+        let mut decoded = String::new();
+        flate2::read::GzDecoder::new(UI_GZIP)
+            .read_to_string(&mut decoded)
+            .expect("gunzip embedded console");
+        assert_eq!(decoded, UI);
     }
 
     #[test]

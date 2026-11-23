@@ -25,6 +25,14 @@ sha2 = "0.10"
 base64 = "0.22"
 getrandom = "0.2"
 
+[build-dependencies]
+# Compresses the embedded console at build time; rust_backend keeps the build
+# pure Rust so every cross target produces the same bytes without system zlib.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[dev-dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

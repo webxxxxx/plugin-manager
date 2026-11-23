@@ -87,12 +87,68 @@ fn serves_the_embedded_console() {
         html.contains("登录会话已失效，请重新登录"),
         "the restart poll must stop when the changed password expires the session"
     );
+    assert!(
+        html.contains("function sessionExpired") && html.matches("sessionExpired();").count() >= 2,
+        "settings and upgrade polls must share the expired-session handler"
+    );
     let index = raw_request(&address, "GET", "/index.html", "", b"");
     assert_eq!(index.status, 200);
 
     let post = raw_request(&address, "POST", "/", "", b"");
     assert_eq!(post.status, 405);
     assert_eq!(raw_header_values(&post, "allow"), vec!["GET"]);
+}
+
+#[test]
+fn console_negotiates_precompressed_gzip() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let plain = raw_request(&address, "GET", "/", "", b"");
+    assert_eq!(plain.status, 200);
+    assert!(raw_header_values(&plain, "content-encoding").is_empty());
+    assert_eq!(raw_header_values(&plain, "vary"), vec!["Accept-Encoding"]);
+    let html = String::from_utf8_lossy(&plain.body).into_owned();
+    assert!(html.contains("id=\"rows\""), "plain console");
+
+    let gzipped = raw_request_with(
+        &address,
+        "GET",
+        "/",
+        "",
+        b"",
+        &[("Accept-Encoding", "gzip")],
+    );
+    assert_eq!(gzipped.status, 200);
+    assert_eq!(
+        raw_header_values(&gzipped, "content-encoding"),
+        vec!["gzip"]
+    );
+    assert_eq!(raw_header_values(&gzipped, "vary"), vec!["Accept-Encoding"]);
+    assert!(
+        gzipped.body.len() < plain.body.len(),
+        "gzip must be smaller ({} vs {})",
+        gzipped.body.len(),
+        plain.body.len()
+    );
+    let mut decoded = String::new();
+    flate2::read::GzDecoder::new(&gzipped.body[..])
+        .read_to_string(&mut decoded)
+        .expect("gunzip console");
+    assert_eq!(decoded, html, "gzip body must be the same console");
+
+    // A client that explicitly refuses gzip gets the source bytes.
+    let refused = raw_request_with(
+        &address,
+        "GET",
+        "/",
+        "",
+        b"",
+        &[("Accept-Encoding", "gzip;q=0, identity")],
+    );
+    assert!(raw_header_values(&refused, "content-encoding").is_empty());
+    assert_eq!(String::from_utf8_lossy(&refused.body), html);
 }
 
 #[test]
