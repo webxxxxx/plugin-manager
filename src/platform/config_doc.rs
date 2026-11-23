@@ -87,17 +87,6 @@ pub struct ConfKey {
     pub needs_restart: bool,
 }
 
-/// 已从行为里删除、但解析器仍然接受（启动时告警）的键。
-///
-/// 它们不进 README 表，也不许被重新加回 `CONF_KEYS`：出现在旧文档里时
-/// 只解释「现在实际用哪条路径」，不改任何行为。
-#[cfg(test)]
-pub const REMOVED_KEYS: &[&str] = &["boot_scan_wait_ms"];
-
-/// 已删除的旧路径键：解析器只把它们收集成 `IgnoredPathKey` 警告。
-#[cfg(test)]
-pub const REMOVED_PATH_KEYS: &[&str] = &["plugins_dir", "services_dir", "temp_dir"];
-
 /// `svcd.conf` 的全部 live 键，按分组与阅读顺序排列。
 pub const CONF_KEYS: &[ConfKey] = &[
     ConfKey {
@@ -713,6 +702,15 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    /// 已从行为里删除、但解析器仍然接受（启动时告警）的键。
+    ///
+    /// 它们不进 README 表，也不许被重新加回 `CONF_KEYS`：出现在旧文档里时
+    /// 只解释「现在实际用哪条路径」，不改任何行为。
+    const REMOVED_KEYS: &[&str] = &["boot_scan_wait_ms"];
+
+    /// 已删除的旧路径键：解析器只把它们收集成 `IgnoredPathKey` 警告。
+    const REMOVED_PATH_KEYS: &[&str] = &["plugins_dir", "services_dir", "temp_dir"];
 
     const EXAMPLE: &str = include_str!("../../svcd.conf.example");
     const README: &str = include_str!("../../README.md");

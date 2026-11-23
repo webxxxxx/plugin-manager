@@ -451,6 +451,7 @@
     "src/platform/paths.rs": "paths",
     "src/platform/resources.rs": "resources",
     "src/platform/settings.rs": "settings",
+    "src/platform/settings/document_tests.rs": "settings",
     "src/platform/storage/gc.rs": "blob",
     "src/platform/storage/meta.rs": "blob",
     "src/platform/storage/mod.rs": "blob",
