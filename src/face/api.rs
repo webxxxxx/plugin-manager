@@ -32,42 +32,10 @@ mod logs;
 mod settings;
 mod upgrade;
 
-const UI: &str = include_str!("../assets/index.html");
-/// Precompressed at build time by `build.rs`; see `accepts_gzip` for when it is
-/// used. The raw `UI` remains the fallback for clients without gzip support.
+/// The console is embedded only in its build-time gzip form. Shipping the raw
+/// source as a fallback would add ~46 KiB to every binary; browsers decode
+/// gzip, and CLI clients can use `curl --compressed`.
 const UI_GZIP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/index.html.gz"));
-
-/// Whether the client accepts a gzip representation. An explicit `gzip;q=0`
-/// refuses it; `*` accepts it only when gzip is not named explicitly.
-fn accepts_gzip(headers: &[(String, String)]) -> bool {
-    let Some(value) = http::header(headers, "accept-encoding") else {
-        return false;
-    };
-    let mut wildcard = None;
-    for item in value.split(',') {
-        let mut parts = item.split(';');
-        let coding = parts.next().unwrap_or("").trim();
-        if coding.is_empty() {
-            continue;
-        }
-        let mut quality = 1.0_f32;
-        for parameter in parts {
-            let Some((name, value)) = parameter.trim().split_once('=') else {
-                continue;
-            };
-            if name.trim().eq_ignore_ascii_case("q") {
-                quality = value.trim().parse().unwrap_or(0.0);
-            }
-        }
-        if coding.eq_ignore_ascii_case("gzip") {
-            return quality > 0.0;
-        }
-        if coding == "*" {
-            wildcard = Some(quality > 0.0);
-        }
-    }
-    wildcard.unwrap_or(false)
-}
 
 use super::blob;
 use super::export;
@@ -626,16 +594,12 @@ impl Face for ApiFace {
                 done.complete(Exchange::Response(self.logout(&request)));
             }
             Endpoint::Console => {
-                let gzip = accepts_gzip(&request.headers);
-                let body: &[u8] = if gzip { UI_GZIP } else { UI.as_bytes() };
-                let mut response = Response::new(200, "text/html; charset=utf-8", body)
-                    .with_header("Cache-Control", "no-store")
-                    .with_header("Vary", "Accept-Encoding")
-                    .with_header("X-Content-Type-Options", "nosniff");
-                if gzip {
-                    response = response.with_header("Content-Encoding", "gzip");
-                }
-                done.complete(Exchange::Response(response));
+                done.complete(Exchange::Response(
+                    Response::new(200, "text/html; charset=utf-8", UI_GZIP)
+                        .with_header("Content-Encoding", "gzip")
+                        .with_header("Cache-Control", "no-store")
+                        .with_header("X-Content-Type-Options", "nosniff"),
+                ));
             }
             Endpoint::UnknownApi => {
                 done.complete(Exchange::Response(error_response(
@@ -740,21 +704,6 @@ mod tests {
         }
     }
 
-    fn encoding(value: &str) -> Vec<(String, String)> {
-        vec![("Accept-Encoding".to_string(), value.to_string())]
-    }
-
-    #[test]
-    fn console_gzip_is_negotiated_from_accept_encoding() {
-        for value in ["gzip", "GZip", "br, gzip", "gzip;q=0.5", "*", "*;q=0.5"] {
-            assert!(accepts_gzip(&encoding(value)), "{value}");
-        }
-        for value in ["identity", "br", "gzip;q=0", "gzip;q=0.0, *", "*;q=0"] {
-            assert!(!accepts_gzip(&encoding(value)), "{value}");
-        }
-        assert!(!accepts_gzip(&[]));
-    }
-
     #[test]
     fn embedded_console_gzip_is_deterministic_and_matches_the_source() {
         assert_eq!(&UI_GZIP[..2], &[0x1f, 0x8b][..], "gzip magic");
@@ -764,7 +713,7 @@ mod tests {
         flate2::read::GzDecoder::new(UI_GZIP)
             .read_to_string(&mut decoded)
             .expect("gunzip embedded console");
-        assert_eq!(decoded, UI);
+        assert_eq!(decoded, include_str!("../assets/index.html"));
     }
 
     #[test]
@@ -964,7 +913,17 @@ mod tests {
         assert_eq!(response.status, 200);
         assert_eq!(response.content_type, "text/html; charset=utf-8");
         assert!(
-            String::from_utf8_lossy(&response.body).contains("id=\"rows\""),
+            response.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("content-encoding") && value == "gzip"
+            }),
+            "the console is served in its precompressed form"
+        );
+        let mut decoded = String::new();
+        flate2::read::GzDecoder::new(&response.body[..])
+            .read_to_string(&mut decoded)
+            .expect("gunzip console");
+        assert!(
+            decoded.contains("id=\"rows\""),
             "the console table is missing"
         );
     }

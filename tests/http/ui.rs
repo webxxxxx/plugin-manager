@@ -14,7 +14,11 @@ fn serves_the_embedded_console() {
         raw_header_values(&page, "content-type"),
         vec!["text/html; charset=utf-8"]
     );
-    let html = String::from_utf8_lossy(&page.body);
+    assert_eq!(raw_header_values(&page, "content-encoding"), vec!["gzip"]);
+    let mut html = String::new();
+    flate2::read::GzDecoder::new(&page.body[..])
+        .read_to_string(&mut html)
+        .expect("gunzip console");
     assert!(html.contains("id=\"rows\""), "console table missing");
     assert!(
         !html.contains("允许安装未签名包"),
@@ -100,55 +104,29 @@ fn serves_the_embedded_console() {
 }
 
 #[test]
-fn console_negotiates_precompressed_gzip() {
+fn console_is_served_precompressed() {
     let mut sandbox = Sandbox::new();
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
 
-    let plain = raw_request(&address, "GET", "/", "", b"");
-    assert_eq!(plain.status, 200);
-    assert!(raw_header_values(&plain, "content-encoding").is_empty());
-    assert_eq!(raw_header_values(&plain, "vary"), vec!["Accept-Encoding"]);
-    let html = String::from_utf8_lossy(&plain.body).into_owned();
-    assert!(html.contains("id=\"rows\""), "plain console");
-
-    let gzipped = raw_request_with(
-        &address,
-        "GET",
-        "/",
-        "",
-        b"",
-        &[("Accept-Encoding", "gzip")],
-    );
-    assert_eq!(gzipped.status, 200);
-    assert_eq!(
-        raw_header_values(&gzipped, "content-encoding"),
-        vec!["gzip"]
-    );
-    assert_eq!(raw_header_values(&gzipped, "vary"), vec!["Accept-Encoding"]);
-    assert!(
-        gzipped.body.len() < plain.body.len(),
-        "gzip must be smaller ({} vs {})",
-        gzipped.body.len(),
-        plain.body.len()
-    );
+    // The binary carries only the gzip representation; a client without
+    // Accept-Encoding still receives it. Browsers decode gzip, and CLI clients
+    // can use `curl --compressed`. Keeping the raw source would add ~46 KiB.
+    let page = raw_request(&address, "GET", "/", "", b"");
+    assert_eq!(page.status, 200);
+    assert_eq!(raw_header_values(&page, "content-encoding"), vec!["gzip"]);
+    assert!(raw_header_values(&page, "vary").is_empty());
     let mut decoded = String::new();
-    flate2::read::GzDecoder::new(&gzipped.body[..])
+    flate2::read::GzDecoder::new(&page.body[..])
         .read_to_string(&mut decoded)
         .expect("gunzip console");
-    assert_eq!(decoded, html, "gzip body must be the same console");
-
-    // A client that explicitly refuses gzip gets the source bytes.
-    let refused = raw_request_with(
-        &address,
-        "GET",
-        "/",
-        "",
-        b"",
-        &[("Accept-Encoding", "gzip;q=0, identity")],
+    assert_eq!(decoded, include_str!("../../src/assets/index.html"));
+    assert!(
+        page.body.len() < decoded.len(),
+        "gzip must be smaller ({} vs {})",
+        page.body.len(),
+        decoded.len()
     );
-    assert!(raw_header_values(&refused, "content-encoding").is_empty());
-    assert_eq!(String::from_utf8_lossy(&refused.body), html);
 }
 
 #[test]
