@@ -297,55 +297,15 @@ pub(crate) use crate::face::asset::AssetStream as PluginUiStream;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::test_support::TempDir;
     use crate::server::http::engine::HttpRequest;
     use crate::server::http::{
         BodyPolicy, CloseReason, OutBuffer, StreamAction, StreamClass, StreamEvent,
     };
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, UNIX_EPOCH};
 
     const PAGE: &[u8] =
         b"<!doctype html>\n<html><head><title>demo</title></head><body>plugin page</body></html>";
-
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> TempDir {
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let id = NEXT.fetch_add(1, Ordering::Relaxed);
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_nanos())
-                .unwrap_or(0);
-            let name = format!("svcd-plugin-ui-{}-{}-{}", std::process::id(), id, nanos);
-            // The integration suite already uses `.scratch/tmp`; a read-only
-            // checkout still falls back to the OS temp directory.
-            let mut bases = vec![
-                std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join(".scratch")
-                    .join("tmp"),
-                std::env::temp_dir(),
-            ];
-            while let Some(base) = bases.pop() {
-                if fs::create_dir_all(&base).is_err() {
-                    continue;
-                }
-                let path = base.join(&name);
-                if fs::create_dir_all(&path).is_ok() {
-                    return TempDir(path);
-                }
-            }
-            panic!("cannot create a temporary web root for the plugin UI test");
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
 
     fn assets(dir: &TempDir) -> plugin::WebAssets {
         plugin::WebAssets {

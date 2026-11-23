@@ -153,35 +153,7 @@ fn not_found() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> TempDir {
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_nanos())
-                .unwrap_or(0);
-            let name = format!(
-                "svcd-static-site-{}-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed),
-                nanos
-            );
-            let path = crate::platform::test_support::temp_dir().join(name);
-            fs::create_dir_all(&path).expect("temp dir");
-            TempDir(path)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::platform::test_support::TempDir;
 
     fn write(root: &Path, relative: &str, bytes: &[u8]) {
         let path = root.join(relative);

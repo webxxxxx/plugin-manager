@@ -21,6 +21,46 @@ pub(crate) fn temp_dir() -> std::path::PathBuf {
     base
 }
 
+/// A unique directory removed on drop. `prefix` names the test module so a
+/// leaked directory still tells you where it came from.
+pub(crate) struct TempDir(pub(crate) std::path::PathBuf);
+
+impl TempDir {
+    pub(crate) fn new() -> Self {
+        Self::with_prefix("test")
+    }
+
+    pub(crate) fn with_prefix(prefix: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = temp_dir().join(format!(
+            "svcd-{}-{}-{}-{}",
+            prefix,
+            std::process::id(),
+            nanos,
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        TempDir(path)
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// The one test `Limits` value: every module's wrapper delegates here so a
 /// change to the test profile cannot drift between suites.
 pub(crate) fn limits() -> std::sync::Arc<crate::platform::limits::Limits> {

@@ -635,35 +635,7 @@ fn run_command(argv: &[String], allow_codes: Option<&[i32]>) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos();
-            let path = crate::platform::test_support::temp_dir().join(format!(
-                "svcd-install-{}-{}-{}",
-                std::process::id(),
-                nanos,
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir_all(&path).expect("create temp dir");
-            TempDir(path)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::platform::test_support::TempDir;
 
     #[test]
     fn file_operations_are_idempotent_and_remove_is_optional() {

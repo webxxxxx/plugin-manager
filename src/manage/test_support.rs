@@ -332,41 +332,8 @@ pub(crate) fn script_manifest() -> (Vec<u8>, TestFiles) {
     (serde_json::to_vec(&value).expect("manifest"), files)
 }
 
-pub mod tempdir {
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-
-    pub struct TempDir(PathBuf);
-
-    impl TempDir {
-        pub fn new() -> Self {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos();
-            let path = crate::platform::test_support::temp_dir().join(format!(
-                "svcd-package-{}-{}-{}",
-                std::process::id(),
-                nanos,
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&path).expect("temp dir");
-            TempDir(path)
-        }
-
-        pub fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+pub(crate) mod tempdir {
+    pub(crate) use crate::platform::test_support::TempDir;
 }
 
 pub(crate) static ROOT: OnceLock<PathBuf> = OnceLock::new();
