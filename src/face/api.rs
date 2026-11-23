@@ -32,16 +32,8 @@ mod logs;
 mod settings;
 mod upgrade;
 
-/// The console is embedded only in its build-time gzip form. Shipping the raw
-/// source as a fallback would add ~46 KiB to every binary; browsers decode
-/// gzip, and CLI clients can use `curl --compressed`.
-const UI_GZIP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/index.html.gz"));
-
-/// The console's tab icon. It is small enough to embed uncompressed: browsers
-/// cache it for a day, and every client can read it without decoding.
-const FAVICON: &[u8] = include_bytes!("../assets/favicon.svg");
-
 use super::blob;
+use super::console;
 use super::export;
 use super::support::{self, CallBudget};
 
@@ -189,6 +181,14 @@ fn handler_for(name: &str) -> Option<HandlerKind> {
         .chain(API_QUIET_HANDLERS)
         .find(|(candidate, _)| *candidate == name)
         .map(|(_, handler)| *handler)
+}
+
+/// The console page and its tab icon share one embedded-asset table.
+fn console_response(request: &Request) -> Response {
+    match console::find(&request.path) {
+        Some(asset) => console::response(asset, http::header(&request.headers, "if-none-match")),
+        None => error_response(404, "not_found", "console asset not found"),
+    }
 }
 
 /// The management API face.
@@ -597,31 +597,8 @@ impl Face for ApiFace {
             Endpoint::Logout => {
                 done.complete(Exchange::Response(self.logout(&request)));
             }
-            Endpoint::Console => {
-                done.complete(Exchange::Response(
-                    Response::new(200, "text/html; charset=utf-8", UI_GZIP)
-                        .with_header("Content-Encoding", "gzip")
-                        .with_header("Cache-Control", "no-store")
-                        .with_header("X-Content-Type-Options", "nosniff"),
-                ));
-            }
-            Endpoint::Favicon => {
-                let etag = format!("\"{}\"", package::hex_sha256(FAVICON));
-                let unchanged = super::webui::not_modified(
-                    http::header(&request.headers, "if-none-match"),
-                    &etag,
-                );
-                let (status, body): (u16, &[u8]) = if unchanged {
-                    (304, &[])
-                } else {
-                    (200, FAVICON)
-                };
-                done.complete(Exchange::Response(
-                    Response::new(status, "image/svg+xml", body)
-                        .with_header("ETag", etag)
-                        .with_header("Cache-Control", "public, max-age=86400")
-                        .with_header("X-Content-Type-Options", "nosniff"),
-                ));
+            Endpoint::Console | Endpoint::Favicon => {
+                done.complete(Exchange::Response(console_response(&request)));
             }
             Endpoint::UnknownApi => {
                 done.complete(Exchange::Response(error_response(
@@ -728,14 +705,46 @@ mod tests {
 
     #[test]
     fn embedded_console_gzip_is_deterministic_and_matches_the_source() {
-        assert_eq!(&UI_GZIP[..2], &[0x1f, 0x8b][..], "gzip magic");
-        assert!(UI_GZIP[4..8].iter().all(|byte| *byte == 0), "fixed mtime");
-        assert_eq!(UI_GZIP[9], 255, "fixed OS byte");
-        let mut decoded = String::new();
-        flate2::read::GzDecoder::new(UI_GZIP)
-            .read_to_string(&mut decoded)
-            .expect("gunzip embedded console");
-        assert_eq!(decoded, include_str!("../assets/index.html"));
+        for (asset, source) in [
+            (
+                console::find("/index.html").expect("console page"),
+                include_str!("../assets/static/index.html"),
+            ),
+            (
+                console::find("/favicon.svg").expect("tab icon"),
+                include_str!("../assets/static/favicon.svg"),
+            ),
+        ] {
+            assert_eq!(&asset.gzip[..2], &[0x1f, 0x8b][..], "gzip magic");
+            assert!(
+                asset.gzip[4..8].iter().all(|byte| *byte == 0),
+                "fixed mtime"
+            );
+            assert_eq!(asset.gzip[9], 255, "fixed OS byte");
+            let mut decoded = String::new();
+            flate2::read::GzDecoder::new(asset.gzip)
+                .read_to_string(&mut decoded)
+                .expect("gunzip embedded console asset");
+            assert_eq!(decoded, source, "{}", asset.path);
+        }
+    }
+
+    #[test]
+    fn console_asset_paths_are_unique_and_root_shares_the_page() {
+        for (index, asset) in console::ASSETS.iter().enumerate() {
+            assert!(
+                !console::ASSETS[..index]
+                    .iter()
+                    .any(|other| other.path == asset.path),
+                "duplicate console asset path {}",
+                asset.path
+            );
+        }
+        assert_eq!(
+            console::find("/").map(|asset| asset.path),
+            Some("/index.html")
+        );
+        assert!(console::find("/missing").is_none());
     }
 
     #[test]
@@ -965,6 +974,7 @@ mod tests {
             "a HEAD probe must reach the icon"
         );
 
+        let asset = console::find("/favicon.svg").expect("icon asset");
         let (slot, done) = CompletionSlot::new("GET /favicon.svg");
         face.handle(request("GET", "/favicon.svg"), done);
         let Some(Exchange::Response(first)) = slot.take() else {
@@ -972,7 +982,7 @@ mod tests {
         };
         assert_eq!(first.status, 200);
         assert_eq!(first.content_type, "image/svg+xml");
-        assert_eq!(first.body, FAVICON);
+        assert_eq!(first.body, asset.gzip);
         let etag = first
             .headers
             .iter()
@@ -981,10 +991,11 @@ mod tests {
             .expect("the icon needs a validator");
         assert_eq!(
             etag,
-            format!("\"{}\"", package::hex_sha256(FAVICON)),
+            format!("\"{}\"", package::hex_sha256(asset.gzip)),
             "the validator is the content hash, so an upgrade invalidates it"
         );
         for (name, value) in [
+            ("Content-Encoding", "gzip"),
             ("Cache-Control", "public, max-age=86400"),
             ("X-Content-Type-Options", "nosniff"),
         ] {

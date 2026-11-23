@@ -29,23 +29,29 @@ fn main() {
         Ok(other) => panic!("MEM_LEVEL must be one of low|middle|high, got {other:?}"),
     }
 
-    // The console is embedded as a gzip stream so the browser gets ~12 KiB
-    // instead of the ~46 KiB source. The source stays the single readable
+    // The console is embedded as gzip streams so the browser gets ~12 KiB of
+    // HTML instead of the ~46 KiB source. The sources stay the single readable
     // artifact; this step only runs at build time. A fixed mtime and OS byte
     // keep the embedded bytes deterministic across machines and targets.
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("cargo sets manifest dir"));
-    let source = manifest.join("src/assets/index.html");
-    println!("cargo:rerun-if-changed=src/assets/index.html");
-    let html = fs::read(&source).expect("read src/assets/index.html");
-    let compressed =
-        PathBuf::from(env::var("OUT_DIR").expect("cargo sets OUT_DIR")).join("index.html.gz");
-    let file = File::create(&compressed).expect("create compressed console asset");
-    let mut encoder = GzBuilder::new()
-        .mtime(0)
-        .operating_system(255)
-        .write(file, Compression::best());
-    encoder
-        .write_all(&html)
-        .expect("write compressed console asset");
-    encoder.finish().expect("finish compressed console asset");
+    let console_dir =
+        PathBuf::from(env::var("OUT_DIR").expect("cargo sets OUT_DIR")).join("console");
+    fs::create_dir_all(&console_dir).expect("create console asset directory");
+    for name in ["index.html", "favicon.svg"] {
+        let relative = format!("src/assets/static/{name}");
+        println!("cargo:rerun-if-changed={relative}");
+        let source = manifest.join(&relative);
+        let bytes =
+            fs::read(&source).unwrap_or_else(|error| panic!("read {}: {error}", source.display()));
+        let file = File::create(console_dir.join(format!("{name}.gz")))
+            .expect("create compressed console asset");
+        let mut encoder = GzBuilder::new()
+            .mtime(0)
+            .operating_system(255)
+            .write(file, Compression::best());
+        encoder
+            .write_all(&bytes)
+            .expect("write compressed console asset");
+        encoder.finish().expect("finish compressed console asset");
+    }
 }
