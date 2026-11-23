@@ -18,6 +18,7 @@ pub mod entry;
 pub mod governor;
 #[cfg(feature = "http")]
 pub(crate) mod hooks;
+pub(crate) mod media;
 pub mod model;
 #[cfg_attr(not(unix), allow(dead_code))]
 pub mod pool;

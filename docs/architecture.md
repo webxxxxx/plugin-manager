@@ -238,6 +238,7 @@ src/
     static_site.rs   /static 静态站点：配置根、目录重定向、点文件与越界拒绝
     asset.rs         静态资源文件的 sans-IO 响应（ETag/304、file send；plugin UI 与 static 共用）
     console.rs       控制台内嵌资产表（构建期递归清单；`/` 与 `/assets/*`）
+    console_tree.rs  `src/assets/static/` 的构建期遍历器（build.rs 与测试共用）
     plugin_streams/  /plugin-ui SSE · WS · raw 的 sans-IO handler（#122）
     mcp_tools.rs     能力面 → tools/list；MCP 的 envelope 投影（工具结果、拒绝）
     mcp.rs           `mcp` 入口：MCP 客户端 ↔ svcd 的 stdio 桥（era 装饰、分页渲染、legacy 握手）

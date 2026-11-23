@@ -645,32 +645,7 @@ pub fn method_not_allowed(allow: &str) -> Vec<u8> {
 /// `application/octet-stream` so an unfamiliar file is never interpreted as a
 /// document (the UI also sends `X-Content-Type-Options: nosniff`).
 pub fn content_type(path: &str) -> &'static str {
-    let extension = std::path::Path::new(path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    match extension.as_str() {
-        "html" | "htm" => "text/html; charset=utf-8",
-        "js" | "mjs" => "text/javascript",
-        "css" => "text/css",
-        "json" | "map" => "application/json",
-        "svg" => "image/svg+xml",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "ico" => "image/x-icon",
-        "wasm" => "application/wasm",
-        "woff" => "font/woff",
-        "woff2" => "font/woff2",
-        "ttf" => "font/ttf",
-        "otf" => "font/otf",
-        "txt" | "md" => "text/plain; charset=utf-8",
-        "xml" => "application/xml",
-        "pdf" => "application/pdf",
-        _ => "application/octet-stream",
-    }
+    super::media::for_path(path).mime
 }
 
 #[cfg(test)]
@@ -703,6 +678,7 @@ mod tests {
             ("photo.jpeg", "image/jpeg"),
             ("anim.gif", "image/gif"),
             ("image.webp", "image/webp"),
+            ("photo.avif", "image/avif"),
             ("favicon.ico", "image/x-icon"),
             ("app.wasm", "application/wasm"),
             ("font.woff2", "font/woff2"),

@@ -39,8 +39,8 @@ fn serves_the_embedded_console() {
         "console missing the overflow menu"
     );
     assert!(
-        html.contains("<link rel=\"icon\" type=\"image/svg+xml\" href=\"assets/favicon.svg\">"),
-        "the console must point the tab at assets/favicon.svg"
+        html.contains("<link rel=\"icon\" type=\"image/svg+xml\" href=\"/assets/favicon.svg\">"),
+        "the console must point the tab at /assets/favicon.svg"
     );
     for needle in [
         "上传安装",
@@ -99,8 +99,17 @@ fn serves_the_embedded_console() {
         html.contains("function sessionExpired") && html.matches("sessionExpired();").count() >= 2,
         "settings and upgrade polls must share the expired-session handler"
     );
-    let index = raw_request(&address, "GET", "/assets/index.html", "", b"");
-    assert_eq!(index.status, 200);
+    let page_again = raw_request(&address, "GET", "/?next=%2Fstatic%2Findex.html", "", b"");
+    assert_eq!(
+        page_again.status, 200,
+        "a login redirect must not turn the console into a 404"
+    );
+    assert_eq!(
+        page_again.body, page.body,
+        "the query string must not change the page"
+    );
+    let duplicate = raw_request(&address, "GET", "/assets/index.html", "", b"");
+    assert_eq!(duplicate.status, 404, "the page has one URL only");
     let alias = raw_request(&address, "GET", "/index.html", "", b"");
     assert_eq!(alias.status, 404, "the console owns / only");
     let missing = raw_request(&address, "GET", "/assets/missing.css", "", b"");
@@ -141,7 +150,7 @@ fn console_is_served_precompressed() {
 }
 
 #[test]
-fn favicon_is_public_and_cacheable() {
+fn favicon_is_public_and_revalidates() {
     let mut sandbox = Sandbox::new();
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
@@ -190,6 +199,12 @@ fn favicon_is_public_and_cacheable() {
     let post = raw_request(&address, "POST", "/assets/favicon.svg", "", b"");
     assert_eq!(post.status, 405);
     assert_eq!(raw_header_values(&post, "allow"), vec!["GET"]);
+
+    let versioned = raw_request(&address, "GET", "/assets/favicon.svg?v=1", "", b"");
+    assert_eq!(
+        versioned.status, 200,
+        "a cache-busting query string must not 404"
+    );
 
     let alias = raw_request(&address, "GET", "/favicon.svg", "", b"");
     assert_eq!(alias.status, 404, "assets only live under /assets/");

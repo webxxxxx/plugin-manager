@@ -185,7 +185,7 @@ fn handler_for(name: &str) -> Option<HandlerKind> {
 
 /// The console page and its tab icon share one embedded-asset table.
 fn console_response(request: &Request) -> Response {
-    match console::find(&request.path) {
+    match console::find(request.path_only()) {
         Some(asset) => console::response(asset, http::header(&request.headers, "if-none-match")),
         None => error_response(404, "not_found", "console asset not found"),
     }
@@ -707,7 +707,7 @@ mod tests {
     fn embedded_console_gzip_is_deterministic_and_matches_the_source() {
         for (asset, source) in [
             (
-                console::find("/assets/index.html").expect("console page"),
+                console::find("/").expect("console page"),
                 include_str!("../assets/static/index.html"),
             ),
             (
@@ -745,7 +745,10 @@ mod tests {
             console::find("/").map(|asset| asset.path),
             Some("index.html")
         );
-        assert!(console::find("/assets/index.html").is_some());
+        assert!(
+            console::find("/assets/index.html").is_none(),
+            "the page has one URL only"
+        );
         assert!(
             console::find("/index.html").is_none(),
             "the page has no /index.html alias"
@@ -976,10 +979,28 @@ mod tests {
             "the console table is missing"
         );
         assert!(
-            decoded
-                .contains("<link rel=\"icon\" type=\"image/svg+xml\" href=\"assets/favicon.svg\">"),
-            "the console must point the tab at assets/favicon.svg"
+            decoded.contains(
+                "<link rel=\"icon\" type=\"image/svg+xml\" href=\"/assets/favicon.svg\">"
+            ),
+            "the console must point the tab at /assets/favicon.svg"
         );
+    }
+
+    #[test]
+    fn console_lookup_ignores_the_query_string() {
+        let face = face();
+        for (path, expected) in [
+            ("/?next=%2Fstatic%2Findex.html", 200),
+            ("/assets/favicon.svg?v=1", 200),
+            ("/assets/index.html", 404),
+        ] {
+            let (slot, done) = CompletionSlot::new(path);
+            face.handle(request("GET", path), done);
+            let Some(Exchange::Response(response)) = slot.take() else {
+                panic!("{path} must answer");
+            };
+            assert_eq!(response.status, expected, "{path}");
+        }
     }
 
     #[test]
