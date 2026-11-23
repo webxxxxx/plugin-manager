@@ -38,6 +38,10 @@ fn serves_the_embedded_console() {
         html.contains("id=\"morebtn\"") && html.contains("aria-haspopup=\"menu\""),
         "console missing the overflow menu"
     );
+    assert!(
+        html.contains("<link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\">"),
+        "the console must point the tab at /favicon.svg"
+    );
     for needle in [
         "上传安装",
         "添加公钥",
@@ -127,6 +131,56 @@ fn console_is_served_precompressed() {
         page.body.len(),
         decoded.len()
     );
+}
+
+#[test]
+fn favicon_is_public_and_cacheable() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let source = include_bytes!("../../src/assets/favicon.svg");
+    let icon = raw_request(&address, "GET", "/favicon.svg", "", b"");
+    assert_eq!(icon.status, 200);
+    assert_eq!(
+        raw_header_values(&icon, "content-type"),
+        vec!["image/svg+xml"]
+    );
+    assert_eq!(
+        raw_header_values(&icon, "cache-control"),
+        vec!["public, max-age=86400"]
+    );
+    assert_eq!(
+        raw_header_values(&icon, "x-content-type-options"),
+        vec!["nosniff"]
+    );
+    assert_eq!(&icon.body[..], &source[..]);
+    let etag = raw_header_values(&icon, "etag");
+    assert_eq!(etag.len(), 1, "the icon needs one strong validator");
+
+    let length = source.len().to_string();
+    let head = raw_request(&address, "HEAD", "/favicon.svg", "", b"");
+    assert_eq!(head.status, 200);
+    assert!(head.body.is_empty(), "HEAD must not carry a body");
+    assert_eq!(
+        raw_header_values(&head, "content-length"),
+        vec![length.as_str()]
+    );
+
+    let revalidated = raw_request_with(
+        &address,
+        "GET",
+        "/favicon.svg",
+        "",
+        b"",
+        &[("If-None-Match", etag[0])],
+    );
+    assert_eq!(revalidated.status, 304);
+    assert!(revalidated.body.is_empty(), "a 304 carries no body");
+
+    let post = raw_request(&address, "POST", "/favicon.svg", "", b"");
+    assert_eq!(post.status, 405);
+    assert_eq!(raw_header_values(&post, "allow"), vec!["GET"]);
 }
 
 #[test]

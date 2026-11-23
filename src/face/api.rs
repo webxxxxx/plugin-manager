@@ -37,6 +37,10 @@ mod upgrade;
 /// gzip, and CLI clients can use `curl --compressed`.
 const UI_GZIP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/index.html.gz"));
 
+/// The console's tab icon. It is small enough to embed uncompressed: browsers
+/// cache it for a day, and every client can read it without decoding.
+const FAVICON: &[u8] = include_bytes!("../assets/favicon.svg");
+
 use super::blob;
 use super::export;
 use super::support::{self, CallBudget};
@@ -601,6 +605,24 @@ impl Face for ApiFace {
                         .with_header("X-Content-Type-Options", "nosniff"),
                 ));
             }
+            Endpoint::Favicon => {
+                let etag = format!("\"{}\"", package::hex_sha256(FAVICON));
+                let unchanged = super::webui::not_modified(
+                    http::header(&request.headers, "if-none-match"),
+                    &etag,
+                );
+                let (status, body): (u16, &[u8]) = if unchanged {
+                    (304, &[])
+                } else {
+                    (200, FAVICON)
+                };
+                done.complete(Exchange::Response(
+                    Response::new(status, "image/svg+xml", body)
+                        .with_header("ETag", etag)
+                        .with_header("Cache-Control", "public, max-age=86400")
+                        .with_header("X-Content-Type-Options", "nosniff"),
+                ));
+            }
             Endpoint::UnknownApi => {
                 done.complete(Exchange::Response(error_response(
                     404,
@@ -926,6 +948,66 @@ mod tests {
             decoded.contains("id=\"rows\""),
             "the console table is missing"
         );
+        assert!(
+            decoded.contains("<link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\">"),
+            "the console must point the tab at /favicon.svg"
+        );
+    }
+
+    #[test]
+    fn favicon_is_public_and_answers_304_for_a_matching_etag() {
+        let face = face();
+        let route = face.route("GET", "/favicon.svg").expect("favicon route");
+        assert!(route.public, "the icon must load before login");
+        assert_eq!(route.dispatch, Dispatch::Inline);
+        assert!(
+            face.route("HEAD", "/favicon.svg").is_some(),
+            "a HEAD probe must reach the icon"
+        );
+
+        let (slot, done) = CompletionSlot::new("GET /favicon.svg");
+        face.handle(request("GET", "/favicon.svg"), done);
+        let Some(Exchange::Response(first)) = slot.take() else {
+            panic!("the icon must answer");
+        };
+        assert_eq!(first.status, 200);
+        assert_eq!(first.content_type, "image/svg+xml");
+        assert_eq!(first.body, FAVICON);
+        let etag = first
+            .headers
+            .iter()
+            .find(|(name, _)| name == "ETag")
+            .map(|(_, value)| value.clone())
+            .expect("the icon needs a validator");
+        assert_eq!(
+            etag,
+            format!("\"{}\"", package::hex_sha256(FAVICON)),
+            "the validator is the content hash, so an upgrade invalidates it"
+        );
+        for (name, value) in [
+            ("Cache-Control", "public, max-age=86400"),
+            ("X-Content-Type-Options", "nosniff"),
+        ] {
+            assert!(
+                first
+                    .headers
+                    .iter()
+                    .any(|(header, actual)| header == name && actual == value),
+                "missing {name}: {value}"
+            );
+        }
+
+        let mut revalidated = request("GET", "/favicon.svg");
+        revalidated
+            .headers
+            .push(("If-None-Match".to_string(), etag));
+        let (slot, done) = CompletionSlot::new("GET /favicon.svg");
+        face.handle(revalidated, done);
+        let Some(Exchange::Response(second)) = slot.take() else {
+            panic!("the revalidation must answer");
+        };
+        assert_eq!(second.status, 304);
+        assert!(second.body.is_empty(), "a 304 carries no body");
     }
 
     #[test]
