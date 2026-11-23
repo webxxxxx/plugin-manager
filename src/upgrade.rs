@@ -46,6 +46,7 @@ impl Check {
             "asset": self.asset,
             "sumsAsset": self.sums_asset,
             "newer": self.newer,
+            "prerelease": self.latest.as_deref().map(is_prerelease).unwrap_or(false),
         })
     }
 }
@@ -118,7 +119,7 @@ pub fn check(config: &Config) -> Result<Check, String> {
         .get("sumsAsset")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let newer = compare_versions(&latest, &current_version()) > 0;
+    let newer = update_available(&latest, &current_version());
     Ok(Check {
         store: true,
         current: current_version(),
@@ -521,6 +522,16 @@ fn restart(binary: &Path) -> Result<(bool, Option<String>), String> {
         .map_err(|error| format!("spawn restart helper: {}", error))
 }
 
+/// A tag with a `-` suffix (`0.2.0-rc1`) is a prerelease: the console never
+/// offers it, and `svcd upgrade` does not pick it up on its own.
+pub fn is_prerelease(version: &str) -> bool {
+    version.contains('-')
+}
+
+fn update_available(latest: &str, current: &str) -> bool {
+    !is_prerelease(latest) && compare_versions(latest, current) > 0
+}
+
 fn compare_versions(left: &str, right: &str) -> i8 {
     let parse = |value: &str| -> Vec<u64> {
         value
@@ -557,6 +568,15 @@ mod tests {
         assert_eq!(compare_versions("0.1.10", "0.1.9"), 1);
         assert_eq!(compare_versions("0.1.5", "0.1.5"), 0);
         assert_eq!(compare_versions("0.1.5", "0.2.0"), -1);
+    }
+
+    #[test]
+    fn a_prerelease_is_never_an_update() {
+        assert!(update_available("0.2.0", "0.1.9"));
+        assert!(!update_available("0.2.0-rc1", "0.1.9"));
+        assert!(!update_available("0.1.5", "0.1.5"));
+        assert!(is_prerelease("0.2.0-rc1"));
+        assert!(!is_prerelease("0.2.0"));
     }
 
     #[test]
