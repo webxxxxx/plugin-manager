@@ -2,16 +2,13 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 mod support;
 use support::target;
-
-static NEXT: AtomicU64 = AtomicU64::new(0);
 
 struct Sandbox {
     root: PathBuf,
@@ -29,53 +26,27 @@ struct Sandbox {
 
 impl Sandbox {
     fn new() -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = support::sandbox_base().join(format!(
-            "svcd-mcp-{}-{}-{}",
-            std::process::id(),
-            nanos,
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let config = root.join("config");
-        let data = root.join("data");
-        let logs = root.join("logs");
-        fs::create_dir_all(&config).expect("config");
-        fs::create_dir_all(&data).expect("data");
-        fs::create_dir_all(&logs).expect("logs");
+        let dirs = support::sandbox_dirs("mcp");
         // The derived limits follow the memory budget, and the budget follows
         // the machine running the suite. Stating the probe input keeps every
         // test in this file on the same 2 GiB budget — the shape the historical
         // `high` build produced — instead of depending on this host's RAM.
         fs::write(
-            config.join("svcd.conf"),
+            dirs.config.join("svcd.conf"),
             "probe_available_memory = 8589934592\n",
         )
         .expect("pin the probe");
 
-        let binary = env!("CARGO_BIN_EXE_svcd");
-        let names = if cfg!(windows) {
-            ("svcd.exe", "svc.exe", "mcp.exe")
-        } else {
-            ("svcd", "svc", "mcp")
-        };
-        let svcd = root.join(names.0);
-        let svc = root.join(names.1);
-        let mcp = root.join(names.2);
-        support::install_multicall(Path::new(binary), &[&svcd, &svc, &mcp]);
-
         let sandbox = Sandbox {
-            daemon_stderr: root.join("daemon.stderr"),
-            root,
-            config,
-            data,
-            logs,
-            svcd,
-            svc,
-            mcp,
+            root: dirs.root,
+            config: dirs.config,
+            data: dirs.data,
+            logs: dirs.logs,
+            svcd: dirs.svcd,
+            svc: dirs.svc,
+            mcp: dirs.mcp,
             daemon: None,
+            daemon_stderr: dirs.daemon_stderr,
             stop_timeout: support::STOP_TIMEOUT,
         };
         sandbox.write_plugin();

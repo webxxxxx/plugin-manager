@@ -9,9 +9,82 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
+
+/// One sandbox's directories and multicall entry points.
+///
+/// Every suite needs the same four roots and a `svcd`/`svc`/`plugin`/`mcp`
+/// set linked to the cargo-built binary; the extra entries are harmless when a
+/// suite only dispatches through two of them.
+pub struct SandboxDirs {
+    pub root: PathBuf,
+    pub config: PathBuf,
+    pub data: PathBuf,
+    pub logs: PathBuf,
+    pub trust: PathBuf,
+    pub svcd: PathBuf,
+    pub svc: PathBuf,
+    pub plugin: PathBuf,
+    pub mcp: PathBuf,
+    pub daemon_stderr: PathBuf,
+}
+
+pub fn sandbox_root(prefix: &str) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let root = sandbox_base().join(format!(
+        "svcd-{}-{}-{}-{}",
+        prefix,
+        std::process::id(),
+        nanos,
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).expect("create sandbox root");
+    root
+}
+
+pub fn sandbox_dirs(prefix: &str) -> SandboxDirs {
+    let root = sandbox_root(prefix);
+    let config = root.join("config");
+    let data = root.join("data");
+    let logs = root.join("logs");
+    let trust = config.join("trust.d");
+    std::fs::create_dir_all(config.join("services.d")).expect("create sandbox");
+    std::fs::create_dir_all(&data).expect("create data");
+    std::fs::create_dir_all(&logs).expect("create logs");
+    std::fs::create_dir_all(&trust).expect("create trust.d");
+
+    let binary = env!("CARGO_BIN_EXE_svcd");
+    let (svcd_name, svc_name, plugin_name, mcp_name) = if cfg!(windows) {
+        ("svcd.exe", "svc.exe", "plugin.exe", "mcp.exe")
+    } else {
+        ("svcd", "svc", "plugin", "mcp")
+    };
+    let svcd = root.join(svcd_name);
+    let svc = root.join(svc_name);
+    let plugin = root.join(plugin_name);
+    let mcp = root.join(mcp_name);
+    install_multicall(Path::new(binary), &[&svcd, &svc, &plugin, &mcp]);
+
+    SandboxDirs {
+        daemon_stderr: root.join("daemon.stderr"),
+        root,
+        config,
+        data,
+        logs,
+        trust,
+        svcd,
+        svc,
+        plugin,
+        mcp,
+    }
+}
 
 /// The root every integration sandbox creates its unique directory under.
 ///

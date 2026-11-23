@@ -7,13 +7,10 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde_json::{json, Value};
-
-pub(crate) static NEXT: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct Sandbox {
     pub(crate) root: PathBuf,
@@ -32,42 +29,18 @@ pub(crate) struct Sandbox {
 
 impl Sandbox {
     pub(crate) fn new() -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = support::sandbox_base().join(format!(
-            "svcd-http-{}-{}-{}",
-            std::process::id(),
-            nanos,
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let config = root.join("config");
-        let data = root.join("data");
-        let logs = root.join("logs");
-        let trust = config.join("trust.d");
-        fs::create_dir_all(&trust).expect("create sandbox");
-        fs::create_dir_all(config.join("services.d")).expect("services.d");
-        fs::create_dir_all(&data).expect("data");
-        fs::create_dir_all(&logs).expect("logs");
-
-        let binary = env!("CARGO_BIN_EXE_svcd");
-        let svcd = root.join(if cfg!(windows) { "svcd.exe" } else { "svcd" });
-        let svc = root.join(if cfg!(windows) { "svc.exe" } else { "svc" });
-        let mcp = root.join(if cfg!(windows) { "mcp.exe" } else { "mcp" });
-        support::install_multicall(Path::new(binary), &[&svcd, &svc, &mcp]);
-
+        let dirs = support::sandbox_dirs("http");
         Sandbox {
-            daemon_stderr: root.join("daemon.stderr"),
-            root,
-            config,
-            data,
-            logs,
-            trust,
-            svcd,
-            svc,
-            mcp,
+            root: dirs.root,
+            config: dirs.config,
+            data: dirs.data,
+            logs: dirs.logs,
+            trust: dirs.trust,
+            svcd: dirs.svcd,
+            svc: dirs.svc,
+            mcp: dirs.mcp,
             daemon: None,
+            daemon_stderr: dirs.daemon_stderr,
             stop_timeout: support::STOP_TIMEOUT,
         }
     }

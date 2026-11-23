@@ -2,8 +2,7 @@ use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -26,8 +25,6 @@ mod reload;
 mod support;
 use support::target;
 
-static NEXT: AtomicU64 = AtomicU64::new(0);
-
 struct Sandbox {
     root: PathBuf,
     config: PathBuf,
@@ -45,47 +42,18 @@ struct Sandbox {
 
 impl Sandbox {
     fn new() -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = support::sandbox_base().join(format!(
-            "svcd-daemon-{}-{}-{}",
-            std::process::id(),
-            nanos,
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let config = root.join("config");
-        let data = root.join("data");
-        let logs = root.join("logs");
-        let trust = config.join("trust.d");
-        fs::create_dir_all(config.join("services.d")).expect("create sandbox");
-        fs::create_dir_all(&data).expect("create data");
-        fs::create_dir_all(&logs).expect("create logs");
-        fs::create_dir_all(&trust).expect("create trust.d");
-
-        let binary = env!("CARGO_BIN_EXE_svcd");
-        let (svcd_name, svc_name, plugin_name) = if cfg!(windows) {
-            ("svcd.exe", "svc.exe", "plugin.exe")
-        } else {
-            ("svcd", "svc", "plugin")
-        };
-        let svcd = root.join(svcd_name);
-        let svc = root.join(svc_name);
-        let plugin = root.join(plugin_name);
-        support::install_multicall(Path::new(binary), &[&svcd, &svc, &plugin]);
-
+        let dirs = support::sandbox_dirs("daemon");
         Sandbox {
-            daemon_stderr: root.join("daemon.stderr"),
-            root,
-            config,
-            data,
-            logs,
-            trust,
-            svcd,
-            svc,
-            plugin,
+            root: dirs.root,
+            config: dirs.config,
+            data: dirs.data,
+            logs: dirs.logs,
+            trust: dirs.trust,
+            svcd: dirs.svcd,
+            svc: dirs.svc,
+            plugin: dirs.plugin,
             daemon: None,
+            daemon_stderr: dirs.daemon_stderr,
             stop_timeout: support::STOP_TIMEOUT,
         }
     }

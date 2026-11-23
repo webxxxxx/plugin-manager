@@ -1,12 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 mod support;
-
-static NEXT: AtomicU64 = AtomicU64::new(0);
 
 struct Sandbox {
     root: PathBuf,
@@ -14,18 +10,9 @@ struct Sandbox {
 
 impl Sandbox {
     fn new() -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = support::sandbox_base().join(format!(
-            "svcd-install-cli-{}-{}-{}",
-            std::process::id(),
-            nanos,
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&root).expect("create sandbox");
-        Sandbox { root }
+        Sandbox {
+            root: support::sandbox_root("install-cli"),
+        }
     }
 
     fn data_dir(&self) -> PathBuf {
