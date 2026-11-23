@@ -51,6 +51,7 @@ impl ApiFace {
                 let value = env.or_else(|| file.get(entry.key).cloned());
                 json!({
                     "key": entry.key,
+                    "label": entry.label,
                     "group": entry.group.title(),
                     "kind": entry.kind.code(),
                     "default": entry.default,

@@ -54,18 +54,44 @@
   .modal textarea { width:100%; height:360px; font-family:monospace; font-size:12px; border:1px solid var(--line); border-radius:4px; padding:8px; }
   .modal pre { background:#f7f8fa; border:1px solid var(--line); border-radius:4px; padding:10px; max-height:50vh; overflow:auto; font-size:12px; white-space:pre-wrap; word-break:break-all; }
   .modal pre.logs { height:382px; max-height:none; overflow:auto; line-height:1.5; }
+  /* Settings uses the log dialog shell: a fixed head/foot, the body scrolls. */
+  .modal .panel.sheet { display:flex; flex-direction:column; max-height:90vh; overflow:hidden; padding:0; min-width:0; }
+  .sheet .sheet-head { flex:none; padding:16px 16px 0; min-width:0; }
+  .sheet .sheet-head h1 { font-size:16px; margin:0; }
+  .sheet .sheet-head .muted { overflow-wrap:anywhere; }
+  .sheet .sheet-body { flex:1 1 auto; min-height:0; min-width:0; overflow:auto; padding:0 16px 4px; }
+  .sheet .sheet-foot { flex:none; display:flex; justify-content:flex-end; gap:8px; padding:12px 16px 16px; border-top:1px solid var(--line); min-width:0; }
+  .setting-group { margin:16px 0 0; font-size:13px; font-weight:600; }
+  .setting-group:first-child { margin-top:4px; }
+  .setting { display:grid; grid-template-columns:minmax(170px,240px) minmax(0,1fr); align-items:center; gap:4px 12px; padding:9px 0; border-bottom:1px solid #f1f3f6; }
+  .setting:last-child { border-bottom:0; }
+  .setting-label { display:flex; align-items:center; gap:6px; min-width:0; }
+  .setting-name { font-size:13px; font-weight:600; }
+  .setting-source { font-size:11px; color:var(--muted); white-space:nowrap; }
+  .setting-control { display:flex; align-items:center; gap:6px; flex-wrap:wrap; min-width:0; }
+  .setting-control > input[type=text] { width:100%; }
+  .setting-control .readonly { font-size:13px; word-break:break-all; }
+  .help { flex:none; width:17px; height:17px; padding:0; border:1px solid #c7d0da; border-radius:50%; background:#fff; color:#7b8794; font-size:11px; line-height:1; cursor:help; }
+  .help:hover, .help:focus-visible { border-color:var(--blue); color:var(--blue); }
+  #tip { position:fixed; z-index:1002; max-width:min(360px, calc(100vw - 24px)); padding:10px 12px; border-radius:6px; background:#2b3038; color:#fff; font-size:12px; line-height:1.6; box-shadow:0 8px 28px rgba(0,0,0,.28); pointer-events:none; }
+  #tip .tip-key { font-family:monospace; color:#9ecbff; margin-bottom:2px; word-break:break-all; }
+  #tip .tip-line { margin-top:3px; }
+  #tip .tip-tag { color:#aeb8c4; }
   @media (max-width:760px) {
     .wrap { padding:12px; }
     h1 { font-size:18px; }
     .card { padding:12px 14px; }
     #toasts { left:8px; right:8px; transform:none; align-items:stretch; }
     .toast { max-width:none; min-width:0; }
+    .sheet .sheet-head, .sheet .sheet-body, .sheet .sheet-foot { padding-left:14px; padding-right:14px; }
+    .setting { grid-template-columns:1fr; gap:4px; }
   }
 </style>
 </head>
 <body>
 <div id="busymask"><div id="waitspin"></div></div>
 <div id="toasts"></div>
+<div id="tip" role="tooltip" hidden></div>
 <div class="wrap">
   <div id="login" class="card hidden">
     <h1>svcd 控制台</h1>
@@ -682,31 +708,110 @@ function settingsValueText(value) {
   return String(value);
 }
 
+const SETTINGS_SOURCE_TEXT = {
+  env: '环境变量覆盖',
+  file: '来自文件',
+  derived: '默认/派生'
+};
+
+function settingsTipLine(label, text) {
+  const line = document.createElement('div');
+  line.className = 'tip-line';
+  const tag = document.createElement('span');
+  tag.className = 'tip-tag';
+  tag.textContent = label + '：';
+  line.appendChild(tag);
+  line.appendChild(document.createTextNode(text || '-'));
+  return line;
+}
+
+function hideSettingsTip() {
+  const tip = $('tip');
+  tip.hidden = true;
+  tip.textContent = '';
+}
+
+function showSettingsTip(anchor, entry, extra) {
+  const tip = $('tip');
+  tip.textContent = '';
+  const key = document.createElement('div');
+  key.className = 'tip-key';
+  key.textContent = entry.key;
+  tip.appendChild(key);
+  tip.appendChild(settingsTipLine('说明', entry.doc));
+  tip.appendChild(settingsTipLine('推荐', entry.recommend));
+  tip.appendChild(settingsTipLine('默认', entry.default));
+  if (extra) tip.appendChild(settingsTipLine('注意', extra));
+  tip.hidden = false;
+  const gap = 8;
+  const rect = anchor.getBoundingClientRect();
+  const width = tip.offsetWidth;
+  const height = tip.offsetHeight;
+  let left = rect.left + rect.width / 2 - width / 2;
+  left = Math.max(gap, Math.min(left, window.innerWidth - width - gap));
+  let top = rect.bottom + gap;
+  if (top + height > window.innerHeight - gap) top = rect.top - height - gap;
+  tip.style.left = left + 'px';
+  tip.style.top = Math.max(gap, top) + 'px';
+}
+
+function settingsHelp(entry, extra) {
+  const help = document.createElement('button');
+  help.type = 'button';
+  help.className = 'help';
+  help.textContent = '?';
+  help.setAttribute('aria-label', (entry.label || entry.key) + '（' + entry.key + '）的说明');
+  help.setAttribute('aria-describedby', 'tip');
+  help.addEventListener('mouseenter', function () { showSettingsTip(help, entry, extra); });
+  help.addEventListener('mouseleave', hideSettingsTip);
+  help.addEventListener('focus', function () { showSettingsTip(help, entry, extra); });
+  help.addEventListener('blur', hideSettingsTip);
+  help.addEventListener('click', function (event) {
+    event.stopPropagation();
+    showSettingsTip(help, entry, extra);
+  });
+  return help;
+}
+
+function settingsLabel(entry, extra) {
+  const label = document.createElement('div');
+  label.className = 'setting-label';
+  const name = document.createElement('span');
+  name.className = 'setting-name';
+  name.textContent = entry.label || entry.key;
+  label.appendChild(name);
+  label.appendChild(settingsHelp(entry, extra));
+  // Provenance is only worth a badge when it is not the derived default; the
+  // common case keeps the label column quiet.
+  if (entry.source !== 'derived') {
+    const source = document.createElement('span');
+    source.className = 'setting-source';
+    source.textContent = SETTINGS_SOURCE_TEXT[entry.source] || SETTINGS_SOURCE_TEXT.derived;
+    label.appendChild(source);
+  }
+  return label;
+}
+
 function showSettingsModal(data) {
   const modal = document.createElement('div');
   modal.className = 'modal';
   const panel = document.createElement('div');
-  panel.className = 'panel';
-  panel.style.maxHeight = '82vh';
-  panel.style.overflowY = 'auto';
-  panel.style.width = '640px';
-  panel.style.maxWidth = '92vw';
+  panel.className = 'panel sheet';
 
   const head = document.createElement('div');
-  head.className = 'row';
+  head.className = 'sheet-head';
   const title = document.createElement('h1');
   title.textContent = '设置';
-  title.style.fontSize = '16px';
-  title.style.margin = '0';
-  title.style.flex = '1';
-  head.appendChild(title);
-  panel.appendChild(head);
-
   const hint = document.createElement('p');
   hint.className = 'muted';
+  hint.style.margin = '4px 0 0';
   hint.textContent = '写入 ' + (data.path || '（未找到 svcd.conf）') +
-    '。鼠标悬停参数名看作用、推荐值与默认值；保存后 daemon 会自动重启（系统服务模式下由服务管理器重启）。';
-  panel.appendChild(hint);
+    '。悬停参数名后的 ? 查看英文名、说明、推荐值与默认值；保存后 daemon 会自动重启（系统服务模式下由服务管理器重启）。';
+  head.appendChild(title);
+  head.appendChild(hint);
+
+  const body = document.createElement('div');
+  body.className = 'sheet-body';
 
   const changes = {};
   const groups = [];
@@ -719,44 +824,27 @@ function showSettingsModal(data) {
     byGroup[entry.group].push(entry);
   });
 
-  function note(text) {
-    const line = document.createElement('div');
-    line.className = 'muted';
-    line.textContent = text;
-    return line;
-  }
-
   function mark(key, value) {
     changes[key] = value;
   }
 
   function field(entry) {
     const row = document.createElement('div');
-    row.style.margin = '10px 0';
-    const label = document.createElement('div');
-    label.style.display = 'flex';
-    label.style.gap = '8px';
-    label.style.alignItems = 'baseline';
-    const name = document.createElement('strong');
-    name.textContent = entry.key;
-    name.style.fontSize = '13px';
-    name.title = '作用：' + entry.doc + '\n推荐：' + entry.recommend + '\n默认：' + entry.default;
-    label.appendChild(name);
-    const source = document.createElement('span');
-    source.className = 'muted';
-    source.textContent = entry.source === 'env' ? '环境变量覆盖' : (entry.source === 'file' ? '来自文件' : '默认/派生');
-    label.appendChild(source);
-    row.appendChild(label);
+    row.className = 'setting';
+    row.appendChild(settingsLabel(entry));
 
+    const control = document.createElement('div');
+    control.className = 'setting-control';
     if (!entry.editable) {
-      const value = document.createElement('div');
-      value.style.fontSize = '13px';
-      value.textContent = settingsValueText(entry.effective) + '（只读：' + entry.recommend + '）';
-      row.appendChild(value);
-      return row;
-    }
-
-    if (entry.kind === 'bool') {
+      const value = document.createElement('span');
+      value.className = 'readonly';
+      value.textContent = settingsValueText(entry.effective);
+      control.appendChild(value);
+      const readOnly = document.createElement('span');
+      readOnly.className = 'setting-source';
+      readOnly.textContent = '只读';
+      control.appendChild(readOnly);
+    } else if (entry.kind === 'bool') {
       const select = document.createElement('select');
       [['on', '开'], ['off', '关']].forEach(function (option) {
         const item = document.createElement('option');
@@ -766,7 +854,7 @@ function showSettingsModal(data) {
       });
       select.value = (entry.value === 'off' ? 'off' : 'on');
       select.onchange = function () { mark(entry.key, select.value); };
-      row.appendChild(select);
+      control.appendChild(select);
     } else if (entry.kind === 'enum') {
       const options = entry.key === 'workload'
         ? ['tiny', 'interactive', 'streaming']
@@ -780,47 +868,45 @@ function showSettingsModal(data) {
       });
       select.value = entry.value || entry.effective || options[0];
       select.onchange = function () { mark(entry.key, select.value); };
-      row.appendChild(select);
+      control.appendChild(select);
     } else {
       const input = document.createElement('input');
       input.type = 'text';
-      input.style.width = '100%';
       input.value = entry.value === null || entry.value === undefined ? '' : entry.value;
       input.placeholder = String(entry.effective === null ? '' : settingsValueText(entry.effective));
       input.oninput = function () { mark(entry.key, input.value === '' ? null : input.value); };
-      row.appendChild(input);
+      control.appendChild(input);
     }
-    row.appendChild(note('推荐：' + entry.recommend));
+    row.appendChild(control);
     return row;
   }
 
-  function passwordField() {
+  function passwordField(entry) {
     const row = document.createElement('div');
-    row.style.margin = '10px 0';
-    const label = document.createElement('div');
-    const name = document.createElement('strong');
-    name.textContent = 'auth_passwd';
-    name.style.fontSize = '13px';
-    name.title = '作用：网页/API 口令哈希。永远不写明文。\n推荐：至少 12 位随机字符。\n默认：未设。';
-    label.appendChild(name);
-    row.appendChild(label);
+    row.className = 'setting';
+    row.appendChild(settingsLabel(entry, '改密码后旧登录会话失效；清除密码后非回环监听会退回 127.0.0.1。'));
+
+    const control = document.createElement('div');
+    control.className = 'setting-control';
     const first = document.createElement('input');
     first.type = 'password';
     first.placeholder = '新密码';
-    first.style.marginRight = '6px';
+    first.style.width = '150px';
     const second = document.createElement('input');
     second.type = 'password';
     second.placeholder = '确认密码';
-    row.appendChild(first);
-    row.appendChild(second);
+    second.style.width = '150px';
     const clearLabel = document.createElement('label');
     clearLabel.className = 'check';
     const clear = document.createElement('input');
     clear.type = 'checkbox';
     clearLabel.appendChild(clear);
     clearLabel.appendChild(document.createTextNode('清除密码'));
-    row.appendChild(clearLabel);
-    row.appendChild(note('改密码后旧登录会话失效；清除密码后非回环监听会退回 127.0.0.1。'));
+    control.appendChild(first);
+    control.appendChild(second);
+    control.appendChild(clearLabel);
+    row.appendChild(control);
+
     function refresh() {
       if (clear.checked) {
         mark('auth_passwd', null);
@@ -844,25 +930,16 @@ function showSettingsModal(data) {
 
   groups.forEach(function (group) {
     const heading = document.createElement('div');
-    heading.style.marginTop = '16px';
-    heading.style.fontWeight = '600';
-    heading.style.fontSize = '13px';
+    heading.className = 'setting-group';
     heading.textContent = group;
-    panel.appendChild(heading);
+    body.appendChild(heading);
     byGroup[group].forEach(function (entry) {
-      if (entry.kind === 'password-hash') {
-        panel.appendChild(passwordField());
-      } else {
-        panel.appendChild(field(entry));
-      }
+      body.appendChild(entry.kind === 'password-hash' ? passwordField(entry) : field(entry));
     });
   });
 
   const actions = document.createElement('div');
-  actions.className = 'row';
-  actions.style.justifyContent = 'flex-end';
-  actions.style.marginTop = '16px';
-  actions.style.gap = '8px';
+  actions.className = 'sheet-foot';
   let restartTimer = null;
   let elapsed = 0;
   function stopPolling() {
@@ -920,10 +997,12 @@ function showSettingsModal(data) {
       toast('保存失败：' + error.message, 'err');
     });
   });
-  const close = button('关闭', 'ghost', function () { stopPolling(); modal.remove(); });
+  const close = button('关闭', 'ghost', function () { stopPolling(); hideSettingsTip(); modal.remove(); });
   modal.onclick = function (event) { if (event.target === modal) close(); };
   actions.appendChild(close);
   actions.appendChild(save);
+  panel.appendChild(head);
+  panel.appendChild(body);
   panel.appendChild(actions);
   modal.appendChild(panel);
   document.body.appendChild(modal);
@@ -1055,10 +1134,15 @@ $('file').addEventListener('change', install);
 $('trustfile').addEventListener('change', addTrust);
 document.addEventListener('click', function (event) {
   if (!event.target.closest('.menu-wrap')) closeMore();
+  if (!event.target.closest('.help')) hideSettingsTip();
 });
 document.addEventListener('keydown', function (event) {
-  if (event.key === 'Escape') closeMore();
+  if (event.key === 'Escape') {
+    closeMore();
+    hideSettingsTip();
+  }
 });
+window.addEventListener('scroll', hideSettingsTip, true);
 boot();
 </script>
 </body>
