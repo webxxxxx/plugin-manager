@@ -15,18 +15,6 @@ use serde_json::{json, Value};
 
 pub(crate) static NEXT: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) fn sandbox_base() -> std::path::PathBuf {
-    // Unix domain sockets cap the whole path at ~108 bytes, so Unix keeps the
-    // short system temp. Windows needs a target-local directory: a restricted
-    // %TEMP% ACL made sandbox creation fail there.
-    if cfg!(windows) {
-        return std::env::var_os("CARGO_TARGET_TMPDIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")));
-    }
-    std::env::temp_dir()
-}
-
 pub(crate) struct Sandbox {
     pub(crate) root: PathBuf,
     pub(crate) config: PathBuf,
@@ -48,7 +36,7 @@ impl Sandbox {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root = sandbox_base().join(format!(
+        let root = support::sandbox_base().join(format!(
             "svcd-http-{}-{}-{}",
             std::process::id(),
             nanos,

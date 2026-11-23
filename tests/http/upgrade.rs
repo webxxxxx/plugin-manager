@@ -1,6 +1,7 @@
 //! Upgrade http tests (#264).
 
 use super::*;
+use super::support::target;
 
 use std::path::{Path, PathBuf};
 
@@ -28,14 +29,6 @@ fn exe_suffix() -> &'static str {
         ".exe"
     } else {
         ""
-    }
-}
-
-fn target() -> &'static str {
-    if cfg!(windows) {
-        "x86_64-pc-windows-msvc"
-    } else {
-        "x86_64-unknown-linux-gnu"
     }
 }
 

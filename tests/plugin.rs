@@ -11,20 +11,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 mod support;
+use support::target;
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
-
-fn sandbox_base() -> std::path::PathBuf {
-    // Unix domain sockets cap the whole path at ~108 bytes, so Unix keeps the
-    // short system temp. Windows needs a target-local directory: a restricted
-    // %TEMP% ACL made sandbox creation fail there.
-    if cfg!(windows) {
-        return std::env::var_os("CARGO_TARGET_TMPDIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")));
-    }
-    std::env::temp_dir()
-}
 
 struct Sandbox {
     root: PathBuf,
@@ -47,7 +36,7 @@ impl Sandbox {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root = sandbox_base().join(format!(
+        let root = support::sandbox_base().join(format!(
             "svcd-plugin-{}-{}-{}",
             std::process::id(),
             nanos,
@@ -268,32 +257,6 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         self.shutdown();
         let _ = fs::remove_dir_all(&self.root);
-    }
-}
-
-fn target() -> &'static str {
-    if cfg!(all(windows, target_arch = "x86_64")) {
-        "x86_64-pc-windows-msvc"
-    } else if cfg!(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        target_env = "musl"
-    )) {
-        "x86_64-unknown-linux-musl"
-    } else if cfg!(all(
-        target_os = "linux",
-        target_arch = "aarch64",
-        target_env = "musl"
-    )) {
-        "aarch64-unknown-linux-musl"
-    } else if cfg!(all(
-        target_os = "linux",
-        target_arch = "arm",
-        target_env = "musl"
-    )) {
-        "armv7-unknown-linux-musleabihf"
-    } else {
-        "x86_64-unknown-linux-gnu"
     }
 }
 

@@ -4,19 +4,9 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-static NEXT: AtomicU64 = AtomicU64::new(0);
+mod support;
 
-fn sandbox_base() -> std::path::PathBuf {
-    // Unix domain sockets cap the whole path at ~108 bytes, so Unix keeps the
-    // short system temp. Windows needs a target-local directory: a restricted
-    // %TEMP% ACL made sandbox creation fail there.
-    if cfg!(windows) {
-        return std::env::var_os("CARGO_TARGET_TMPDIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")));
-    }
-    std::env::temp_dir()
-}
+static NEXT: AtomicU64 = AtomicU64::new(0);
 
 struct Sandbox {
     root: PathBuf,
@@ -28,7 +18,7 @@ impl Sandbox {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root = sandbox_base().join(format!(
+        let root = support::sandbox_base().join(format!(
             "svcd-install-cli-{}-{}-{}",
             std::process::id(),
             nanos,
