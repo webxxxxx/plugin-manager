@@ -310,8 +310,8 @@
       "note": "#263：svcd.conf 文档文本的读/改助手（保留注释的读-改-写）"
     },
     "upgrade": {
-      "concept": "compose",
-      "layer": "server",
+      "concept": "selfinstall/upgrade",
+      "layer": "domain",
       "note": "#264：检查更新/升级编排（经控制通道调 plugin-store、校验 SHA256SUMS、替换二进制）；CLI 与 /api/v1/upgrade 共用"
     }
   },
@@ -531,7 +531,7 @@
     "src/supervise/ops/slot/handle.rs": "slot",
     "src/supervise/ops/slot/stop.rs": "slot",
     "src/supervise/ops/slot/tests.rs": "slot",
-    "src/upgrade.rs": "upgrade",
+    "src/selfinstall/upgrade.rs": "upgrade",
     "src/wire/contract/mod.rs": "wire",
     "src/wire/contract/rawhub.rs": "rawhub",
     "src/wire/contract/rawhub/control.rs": "rawhub",

@@ -60,7 +60,6 @@ mod platform;
 mod selfinstall;
 mod server;
 mod supervise;
-mod upgrade;
 mod wire;
 
 fn main() {
@@ -73,7 +72,7 @@ fn main() {
     }
     // A Windows self-replace renames the running image aside; the next start
     // removes the leftovers.
-    crate::upgrade::cleanup_old_files();
+    crate::selfinstall::upgrade::cleanup_old_files();
     let arg0 = std::env::args().next().unwrap_or_default();
     // Installed entries are hardlinks/symlinks named `svc`, `plugin`, `mcp`
     // (and `.exe` variants on Windows); dispatch on the stem, not the suffix.
@@ -110,7 +109,7 @@ fn svcd_run(args: Vec<String>) -> i32 {
         Some("install-service") => selfinstall::install_service(&args[1..]),
         Some("uninstall-service") => selfinstall::uninstall_service(&args[1..]),
         Some("version") if args.len() == 1 => {
-            println!("{}", crate::upgrade::version_line());
+            println!("{}", crate::selfinstall::upgrade::version_line());
             0
         }
         Some("upgrade") => upgrade_command(&args[1..]),
@@ -450,7 +449,7 @@ fn upgrade_command(args: &[String]) -> i32 {
         return 1;
     };
     if let Some(path) = file {
-        return match crate::upgrade::apply_file(&config, &path, sum.as_deref()) {
+        return match crate::selfinstall::upgrade::apply_file(&config, &path, sum.as_deref()) {
             Ok(applied) => report_applied(&applied, json),
             Err(error) => {
                 eprintln!("svcd: upgrade: {}", error);
@@ -459,7 +458,7 @@ fn upgrade_command(args: &[String]) -> i32 {
         };
     }
     if check {
-        return match crate::upgrade::check(&config) {
+        return match crate::selfinstall::upgrade::check(&config) {
             Ok(found) => report_check(&found, json),
             Err(error) => {
                 eprintln!("svcd: upgrade check: {}", error);
@@ -467,7 +466,7 @@ fn upgrade_command(args: &[String]) -> i32 {
             }
         };
     }
-    match crate::upgrade::apply_remote(&config) {
+    match crate::selfinstall::upgrade::apply_remote(&config) {
         Ok(applied) => report_applied(&applied, json),
         Err(error) => {
             eprintln!("svcd: upgrade: {}", error);
@@ -476,7 +475,7 @@ fn upgrade_command(args: &[String]) -> i32 {
     }
 }
 
-fn report_check(found: &crate::upgrade::Check, json: bool) -> i32 {
+fn report_check(found: &crate::selfinstall::upgrade::Check, json: bool) -> i32 {
     if json {
         println!(
             "{}",
@@ -504,7 +503,7 @@ fn report_check(found: &crate::upgrade::Check, json: bool) -> i32 {
     0
 }
 
-fn report_applied(applied: &crate::upgrade::Applied, json: bool) -> i32 {
+fn report_applied(applied: &crate::selfinstall::upgrade::Applied, json: bool) -> i32 {
     if json {
         println!(
             "{}",
