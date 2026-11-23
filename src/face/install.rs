@@ -148,7 +148,7 @@ mod tests {
     use crate::server::auth::lan::Lan;
     use crate::server::http::model as http;
     use crate::server::http::{
-        BlockingOutcome, CloseReason, Exchange, OutBuffer, StreamAction, StreamEvent, StreamHandler,
+        CloseReason, Exchange, OutBuffer, StreamAction, StreamEvent, StreamHandler,
     };
 
     use super::*;
@@ -440,19 +440,7 @@ mod tests {
         let mut handler = stream_handler(
             b"POST /api/v1/plugins HTTP/1.1\r\nHost: x\r\nContent-Type: application/octet-stream\r\nContent-Length: 4\r\n\r\n",
         );
-        let mut out = Vec::new();
-        let step = handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, 4096));
-        assert!(matches!(step.action, StreamAction::NeedRead));
-        let step = handler.on_event(
-            StreamEvent::Data(b"body"),
-            &mut OutBuffer::new(&mut out, 4096),
-        );
-        assert!(matches!(step.action, StreamAction::SubmitBlocking(_)));
-        let step = handler.on_event(
-            StreamEvent::BlockingDone(BlockingOutcome::Busy),
-            &mut OutBuffer::new(&mut out, 4096),
-        );
-        assert!(matches!(step.action, StreamAction::Close(_)));
+        let out = crate::server::http::test_support::drive_busy(&mut *handler, b"body", 4096);
         let text = String::from_utf8_lossy(&out);
         assert!(
             text.starts_with("HTTP/1.1 503 Service Unavailable"),
