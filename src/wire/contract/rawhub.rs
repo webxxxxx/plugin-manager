@@ -222,10 +222,12 @@ impl RawPlugin {
             return;
         }
         // The transport caps allocation at the larger of the two limits; a raw
-        // stream over its own limit loses that frame, not the instance.
+        // stream over its own limit ends that stream (its subscriber sees the
+        // close), and the instance keeps running.
         if payload.len() > hub.max_frame {
             hub.stats
                 .record(RawFailure::FrameTooLarge, &self.id, stream, "plugin frame");
+            hub.close_stream(self, stream, ClosedBy::Oversized);
             return;
         }
         let sender = self
@@ -904,6 +906,55 @@ mod tests {
             "nothing to close, nothing to write"
         );
         assert_eq!(hub.stats.count(RawFailure::ControlFrameInvalid), 0);
+    }
+
+    #[test]
+    fn a_full_json_channel_drops_frames_without_killing_the_instance() {
+        let hub = RawHub::new(Arc::new(
+            crate::platform::limits::derive(&crate::platform::settings::Settings::default()).limits,
+        ));
+        let (json_tx, json_rx) = std::sync::mpsc::sync_channel(1);
+        let plugin = Arc::new(RawPlugin::new("p".to_string(), 1, Some(json_tx)));
+        let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(8);
+        let _ = plugin.writer.set(writer_tx);
+        hub.install("p".to_string(), plugin).expect("install");
+
+        hub.deliver("p", 0, b"{}".to_vec());
+        hub.deliver("p", 0, b"{}".to_vec());
+
+        assert_eq!(hub.stats.count(RawFailure::JsonChannelFull), 1);
+        // Dropping the reply is backpressure, not a reason to end the instance:
+        // it still answers and its transport is still usable.
+        assert!(json_rx.try_recv().is_ok());
+        assert!(hub.send_json("p", b"{}").is_ok());
+        assert!(writer_rx.try_recv().is_ok());
+        assert_eq!(hub.stats.count(RawFailure::JsonChannelClosed), 0);
+    }
+
+    #[test]
+    fn an_oversized_raw_frame_closes_only_that_stream() {
+        let (hub, _json, writer) = hub_with_json(&crate::platform::settings::Settings::default());
+        let doomed = hub.subscribe("p").expect("subscribe");
+        let healthy = hub.subscribe("p").expect("subscribe");
+        let max = hub.max_frame;
+
+        hub.deliver("p", doomed.stream(), vec![b'x'; max + 1]);
+
+        match doomed.try_recv() {
+            Ok(RawEvent::Closed) => {}
+            other => panic!("the oversized stream did not close: {other:?}"),
+        }
+        assert_eq!(hub.stats.count(RawFailure::FrameTooLarge), 1);
+        // The healthy stream is untouched and the plugin is told about the one
+        // that ended.
+        hub.deliver("p", healthy.stream(), b"still here".to_vec());
+        match healthy.try_recv() {
+            Ok(RawEvent::Frame(payload)) => assert_eq!(payload, b"still here"),
+            other => panic!("the healthy stream broke: {other:?}"),
+        }
+        let (control, payload) = control_close(&writer);
+        assert_eq!(control, CONTROL_STREAM);
+        assert_eq!(payload["stream"], doomed.stream());
     }
 
     #[test]

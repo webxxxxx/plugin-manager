@@ -54,9 +54,13 @@ impl RawHub {
         match sender.try_send(event) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
+                // Backpressure, not a protocol violation: the slot drains this
+                // queue every tick, so a full queue means the caller side is
+                // busy. Dropping the frame keeps the instance alive; the call
+                // waiting for it is bounded by the slot's pending table and its
+                // call timeout (the same 503 path protocol 1/2 uses).
                 self.stats
                     .record(RawFailure::JsonChannelFull, &plugin.id, 0, "");
-                plugin.close(self);
             }
             Err(TrySendError::Disconnected(_)) => {}
         }
