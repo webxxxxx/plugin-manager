@@ -71,6 +71,22 @@ fn serves_the_embedded_console() {
         html.contains("settingsTipLine('来源'"),
         "settings dialog keeps provenance in the hover tip"
     );
+    // Regression guards for the settings form: false spellings are "关", an
+    // untouched password is not a mismatch, and a restart that expires the
+    // session stops the poll instead of producing a stream of 401s.
+    assert!(
+        html.contains("function settingsBool"),
+        "boolean settings need on/off/true/false normalization"
+    );
+    assert!(
+        html.contains("if (passwordMismatch)")
+            && !html.contains("changes.auth_passwd === undefined"),
+        "saving a non-password setting must not trip the password mismatch check"
+    );
+    assert!(
+        html.contains("登录会话已失效，请重新登录"),
+        "the restart poll must stop when the changed password expires the session"
+    );
     let index = raw_request(&address, "GET", "/index.html", "", b"");
     assert_eq!(index.status, 200);
 

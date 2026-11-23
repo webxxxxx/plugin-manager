@@ -708,6 +708,22 @@ function settingsValueText(value) {
   return String(value);
 }
 
+// The document accepts all of these spellings for a boolean (see parse_bool in
+// platform/settings.rs); the form must not treat "false" as "on".
+function settingsBool(value) {
+  if (typeof value === 'boolean') return value;
+  const text = String(value === null || value === undefined ? '' : value).trim().toLowerCase();
+  if (text === 'true' || text === '1' || text === 'on' || text === 'yes') return true;
+  if (text === 'false' || text === '0' || text === 'off' || text === 'no') return false;
+  return null;
+}
+
+function settingsBoolValue(entry) {
+  const current = settingsBool(entry.value);
+  const effective = settingsBool(entry.effective);
+  return (current === null ? effective : current) === false ? 'off' : 'on';
+}
+
 const SETTINGS_SOURCE_TEXT = {
   env: '环境变量覆盖',
   file: '来自文件',
@@ -809,6 +825,7 @@ function showSettingsModal(data) {
   body.className = 'sheet-body';
 
   const changes = {};
+  let passwordMismatch = false;
   const groups = [];
   const byGroup = {};
   data.keys.forEach(function (entry) {
@@ -847,7 +864,7 @@ function showSettingsModal(data) {
         item.textContent = option[1];
         select.appendChild(item);
       });
-      select.value = (entry.value === 'off' ? 'off' : 'on');
+      select.value = settingsBoolValue(entry);
       select.onchange = function () { mark(entry.key, select.value); };
       control.appendChild(select);
     } else if (entry.kind === 'enum') {
@@ -903,16 +920,15 @@ function showSettingsModal(data) {
     row.appendChild(control);
 
     function refresh() {
+      delete changes.auth_passwd;
+      passwordMismatch = false;
       if (clear.checked) {
         mark('auth_passwd', null);
         return;
       }
-      if (!first.value) {
-        delete changes.auth_passwd;
-        return;
-      }
+      if (!first.value && !second.value) return;
       if (first.value !== second.value) {
-        mark('auth_passwd', undefined);
+        passwordMismatch = true;
         return;
       }
       mark('auth_passwd', first.value);
@@ -947,6 +963,16 @@ function showSettingsModal(data) {
       elapsed += 500;
       fetch('/api/v1/version', { credentials: 'same-origin', headers: authHeaders() })
         .then(function (response) {
+          if (response.status === 401) {
+            // The restart applied a new password: this session is gone. Stop
+            // polling instead of hammering the endpoint with 401s.
+            stopPolling();
+            hideSettingsTip();
+            modal.remove();
+            showLogin();
+            toast('登录会话已失效，请重新登录', 'info');
+            return;
+          }
           if (response.ok) {
             stopPolling();
             location.reload();
@@ -960,7 +986,7 @@ function showSettingsModal(data) {
     }, 500);
   }
   const save = button('保存', '', function () {
-    if (changes.auth_passwd === undefined) {
+    if (passwordMismatch) {
       toast('两次输入的密码不一致', 'err');
       return;
     }
