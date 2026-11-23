@@ -295,7 +295,8 @@ while ($true) {
     $path = $dest.Replace('\', '\\')
     $result = '{"$blobPath":"' + $path + '"}'
   } elseif ($text -match '"method"\s*:\s*"tools/call"') {
-    $result = $listing
+    $payload = $listing -replace '"', '\"'
+    $result = '{"content":[{"type":"text","text":"' + $payload + '"}],"isError":false}'
   } else {
     $result = '{"content":[{"type":"text","text":"ok"}],"isError":false}'
   }
@@ -351,7 +352,9 @@ def main():
                 shutil.copyfile(source, destination)
                 result = {"$blobPath": destination}
             else:
-                result = LISTING
+                # The real store answers inside an MCP content block; the host
+                # must unwrap it before reading `version`.
+                result = {"content": [{"type": "text", "text": json.dumps(LISTING)}], "isError": False}
         reply = json.dumps({"jsonrpc": "2.0", "id": message.get("id", 1), "result": result}).encode()
         out.write(struct.pack(">I", len(reply)))
         out.write(reply)
