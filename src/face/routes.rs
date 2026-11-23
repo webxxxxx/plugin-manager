@@ -27,9 +27,10 @@ pub(crate) enum Owner {
 /// What runs after the route is matched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Endpoint {
+    /// The console page at `/`.
     Console,
-    /// The console's tab icon; public like the console page.
-    Favicon,
+    /// A file under `/assets/`; public like the console page.
+    ConsoleAsset,
     Login,
     Logout,
     /// A macro-declared API route, identified by its handler name.
@@ -184,8 +185,8 @@ impl RouteSpec {
     /// consume it. Keep the representative row's dispatch and visibility.
     pub(crate) fn route_for_405(&self) -> Route {
         // Every management 405 runs on the blocking pool except the console
-        // and its icon, which were inline before the table existed.
-        let route = if matches!(self.endpoint, Endpoint::Console | Endpoint::Favicon) {
+        // and its assets, which are inline.
+        let route = if matches!(self.endpoint, Endpoint::Console | Endpoint::ConsoleAsset) {
             Route::inline(BodyPolicy::Empty)
         } else {
             Route::blocking(BodyPolicy::Empty)
@@ -640,24 +641,23 @@ const fn param(name: &'static str) -> Segment {
 /// pre-body uploads, the fallback's blob/file sessions, the import claim and the
 /// `/api/v1` catch-all. Ordinary API rows live in `api::route_defs()`.
 static MANUAL_SPECS: &[RouteSpec] = &[
-    // Public console surface.
+    // Public console surface. `/` is the page; every file it references lives
+    // under `/assets/`, so adding an image or stylesheet needs no route row.
     row(
         Endpoint::Console,
         Owner::Api,
         GET,
-        Pattern::Exact(&["/", "/index.html"]),
+        Pattern::Exact(&["/"]),
         Body::Empty,
         Run::Inline,
         true,
         0,
     ),
-    // The tab icon is public for the same reason as the console: it carries
-    // no data, and the login page needs it before a session exists.
     row(
-        Endpoint::Favicon,
+        Endpoint::ConsoleAsset,
         Owner::Api,
         GET_HEAD,
-        Pattern::Exact(&["/favicon.svg"]),
+        Pattern::Segments(&[lit("assets"), Segment::Rest]),
         Body::Empty,
         Run::Inline,
         true,

@@ -597,7 +597,7 @@ impl Face for ApiFace {
             Endpoint::Logout => {
                 done.complete(Exchange::Response(self.logout(&request)));
             }
-            Endpoint::Console | Endpoint::Favicon => {
+            Endpoint::Console | Endpoint::ConsoleAsset => {
                 done.complete(Exchange::Response(console_response(&request)));
             }
             Endpoint::UnknownApi => {
@@ -707,22 +707,23 @@ mod tests {
     fn embedded_console_gzip_is_deterministic_and_matches_the_source() {
         for (asset, source) in [
             (
-                console::find("/index.html").expect("console page"),
+                console::find("/assets/index.html").expect("console page"),
                 include_str!("../assets/static/index.html"),
             ),
             (
-                console::find("/favicon.svg").expect("tab icon"),
+                console::find("/assets/favicon.svg").expect("tab icon"),
                 include_str!("../assets/static/favicon.svg"),
             ),
         ] {
-            assert_eq!(&asset.gzip[..2], &[0x1f, 0x8b][..], "gzip magic");
+            assert_eq!(asset.encoding, console::Encoding::Gzip);
+            assert_eq!(&asset.body[..2], &[0x1f, 0x8b][..], "gzip magic");
             assert!(
-                asset.gzip[4..8].iter().all(|byte| *byte == 0),
+                asset.body[4..8].iter().all(|byte| *byte == 0),
                 "fixed mtime"
             );
-            assert_eq!(asset.gzip[9], 255, "fixed OS byte");
+            assert_eq!(asset.body[9], 255, "fixed OS byte");
             let mut decoded = String::new();
-            flate2::read::GzDecoder::new(asset.gzip)
+            flate2::read::GzDecoder::new(asset.body)
                 .read_to_string(&mut decoded)
                 .expect("gunzip embedded console asset");
             assert_eq!(decoded, source, "{}", asset.path);
@@ -731,9 +732,9 @@ mod tests {
 
     #[test]
     fn console_asset_paths_are_unique_and_root_shares_the_page() {
-        for (index, asset) in console::ASSETS.iter().enumerate() {
+        for (index, asset) in console::assets().iter().enumerate() {
             assert!(
-                !console::ASSETS[..index]
+                !console::assets()[..index]
                     .iter()
                     .any(|other| other.path == asset.path),
                 "duplicate console asset path {}",
@@ -742,9 +743,18 @@ mod tests {
         }
         assert_eq!(
             console::find("/").map(|asset| asset.path),
-            Some("/index.html")
+            Some("index.html")
         );
-        assert!(console::find("/missing").is_none());
+        assert!(console::find("/assets/index.html").is_some());
+        assert!(
+            console::find("/index.html").is_none(),
+            "the page has no /index.html alias"
+        );
+        assert!(
+            console::find("/favicon.svg").is_none(),
+            "assets only live under /assets/"
+        );
+        assert!(console::find("/assets/missing").is_none());
     }
 
     #[test]
@@ -760,11 +770,19 @@ mod tests {
         assert_eq!(logout.dispatch, Dispatch::Blocking);
         assert_eq!(logout.body, BodyPolicy::Empty);
 
-        for path in ["/", "/index.html"] {
+        for path in ["/", "/assets/app.css"] {
             let route = face.route("GET", path).expect("console route");
             assert!(route.public, "{path}");
-            assert_eq!(route.dispatch, Dispatch::Inline);
+            assert_eq!(route.dispatch, Dispatch::Inline, "{path}");
         }
+        assert!(
+            face.route("GET", "/index.html").is_none(),
+            "the page has no /index.html alias"
+        );
+        assert!(
+            face.route("GET", "/favicon.svg").is_none(),
+            "console assets only live under /assets/"
+        );
 
         let auth = face.route("GET", "/api/v1/auth").expect("auth route");
         assert!(!auth.public);
@@ -958,31 +976,34 @@ mod tests {
             "the console table is missing"
         );
         assert!(
-            decoded.contains("<link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\">"),
-            "the console must point the tab at /favicon.svg"
+            decoded
+                .contains("<link rel=\"icon\" type=\"image/svg+xml\" href=\"assets/favicon.svg\">"),
+            "the console must point the tab at assets/favicon.svg"
         );
     }
 
     #[test]
-    fn favicon_is_public_and_answers_304_for_a_matching_etag() {
+    fn console_asset_is_public_and_answers_304_for_a_matching_etag() {
         let face = face();
-        let route = face.route("GET", "/favicon.svg").expect("favicon route");
+        let route = face
+            .route("GET", "/assets/favicon.svg")
+            .expect("console asset route");
         assert!(route.public, "the icon must load before login");
         assert_eq!(route.dispatch, Dispatch::Inline);
         assert!(
-            face.route("HEAD", "/favicon.svg").is_some(),
+            face.route("HEAD", "/assets/favicon.svg").is_some(),
             "a HEAD probe must reach the icon"
         );
 
-        let asset = console::find("/favicon.svg").expect("icon asset");
-        let (slot, done) = CompletionSlot::new("GET /favicon.svg");
-        face.handle(request("GET", "/favicon.svg"), done);
+        let asset = console::find("/assets/favicon.svg").expect("icon asset");
+        let (slot, done) = CompletionSlot::new("GET /assets/favicon.svg");
+        face.handle(request("GET", "/assets/favicon.svg"), done);
         let Some(Exchange::Response(first)) = slot.take() else {
             panic!("the icon must answer");
         };
         assert_eq!(first.status, 200);
         assert_eq!(first.content_type, "image/svg+xml");
-        assert_eq!(first.body, asset.gzip);
+        assert_eq!(first.body, asset.body);
         let etag = first
             .headers
             .iter()
@@ -991,12 +1012,12 @@ mod tests {
             .expect("the icon needs a validator");
         assert_eq!(
             etag,
-            format!("\"{}\"", package::hex_sha256(asset.gzip)),
+            format!("\"{}\"", package::hex_sha256(asset.body)),
             "the validator is the content hash, so an upgrade invalidates it"
         );
         for (name, value) in [
             ("Content-Encoding", "gzip"),
-            ("Cache-Control", "public, max-age=86400"),
+            ("Cache-Control", "no-cache"),
             ("X-Content-Type-Options", "nosniff"),
         ] {
             assert!(
@@ -1008,11 +1029,11 @@ mod tests {
             );
         }
 
-        let mut revalidated = request("GET", "/favicon.svg");
+        let mut revalidated = request("GET", "/assets/favicon.svg");
         revalidated
             .headers
             .push(("If-None-Match".to_string(), etag));
-        let (slot, done) = CompletionSlot::new("GET /favicon.svg");
+        let (slot, done) = CompletionSlot::new("GET /assets/favicon.svg");
         face.handle(revalidated, done);
         let Some(Exchange::Response(second)) = slot.take() else {
             panic!("the revalidation must answer");

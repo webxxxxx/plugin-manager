@@ -31,4 +31,4 @@ Accepted（2026-11-23）。新增一个只读 HTTP 面；不改变 S4 的连接�
 - 新配置键出现在 README、`svcd.conf.example`、`config_doc` 与设置界面（只读），改完需要重启 daemon。
 - 静态站点的文件读写都发生在每次请求：根目录不存在时 `/static/` 回答 404，启动日志给一条警告；不在启动期缓存目录清单。
 - 没有 Range、目录列表、SPA fallback 与自定义 404 页面；需要这些语义时应由前置反向代理或专门的文件服务承担。
-- 控制台资产（`src/assets/static/`）仍编译期内嵌并 gzip，由 `face/console` 在 `/`、`/index.html`、`/favicon.svg` 送出；不解压到 `data_dir`，也不与 `static_root` 共用目录：控制台必须公开，而可写目录里的同源脚本会把本地写权限升级成管理员会话。`static_root` 只承载用户自己的静态站点。
+- 控制台资产（`src/assets/static/`）仍编译期内嵌：`build.rs` 递归扫描，文本类 gzip、图片/字体原样，由 `face/console` 在 `/`（页面）与 `/assets/{*rest}`（其余文件）送出；不解压到 `data_dir`，也不与 `static_root` 共用目录：控制台必须公开，而可写目录里的同源脚本会把本地写权限升级成管理员会话。`static_root` 只承载用户自己的静态站点。
