@@ -28,6 +28,8 @@ pub(crate) enum Owner {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Endpoint {
     Console,
+    /// The console's tab icon; public like the console page.
+    Favicon,
     Login,
     Logout,
     /// A macro-declared API route, identified by its handler name.
@@ -181,9 +183,9 @@ impl RouteSpec {
     /// A 405 never reads a body: the method did not match, so no handler will
     /// consume it. Keep the representative row's dispatch and visibility.
     pub(crate) fn route_for_405(&self) -> Route {
-        // Every management 405 runs on the blocking pool except the console,
-        // which was inline before the table existed.
-        let route = if self.endpoint == Endpoint::Console {
+        // Every management 405 runs on the blocking pool except the console
+        // and its icon, which were inline before the table existed.
+        let route = if matches!(self.endpoint, Endpoint::Console | Endpoint::Favicon) {
             Route::inline(BodyPolicy::Empty)
         } else {
             Route::blocking(BodyPolicy::Empty)
@@ -644,6 +646,18 @@ static MANUAL_SPECS: &[RouteSpec] = &[
         Owner::Api,
         GET,
         Pattern::Exact(&["/", "/index.html"]),
+        Body::Empty,
+        Run::Inline,
+        true,
+        0,
+    ),
+    // The tab icon is public for the same reason as the console: it carries
+    // no data, and the login page needs it before a session exists.
+    row(
+        Endpoint::Favicon,
+        Owner::Api,
+        GET_HEAD,
+        Pattern::Exact(&["/favicon.svg"]),
         Body::Empty,
         Run::Inline,
         true,
