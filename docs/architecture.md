@@ -199,13 +199,13 @@ src/
     mod.rs                      唯一对外接口
     model/  manifest.rs  ustar.rs  layout.rs  hooks.rs
     check/  verify.rs  trust.rs  compat.rs  interpreter.rs
-    ops/    install.rs  uninstall.rs  import.rs  export.rs  bundle.rs  scan.rs
+    ops/    install.rs  uninstall.rs  import.rs  export.rs  bundle.rs  scan.rs  hook.rs
 
   supervise/                  L3 领域·监督
     mod.rs
     model/  entry.rs  machine.rs  record.rs  definition.rs
     check/  restart.rs  backoff.rs  oneshot.rs  reconcile.rs
-    ops/    host.rs  lifecycle.rs  rescan.rs  probe.rs  invoke.rs  factory.rs  slot.rs  hook.rs  restart.rs
+    ops/    host.rs  lifecycle.rs  rescan.rs  probe.rs  invoke.rs  factory.rs  slot.rs  restart.rs
 
   orchestrate/                L3 领域·编排（第一个文件出现时才创建）
     model/  step.rs  flow.rs  trigger.rs  fanin.rs

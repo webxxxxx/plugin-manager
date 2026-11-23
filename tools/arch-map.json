@@ -188,7 +188,7 @@
       "layer": "domain"
     },
     "hook": {
-      "concept": "supervise/hook",
+      "concept": "manage/hook",
       "layer": "domain"
     },
     "script": {
@@ -406,6 +406,7 @@
     "src/manage/ops/config.rs": "plugin",
     "src/manage/ops/export.rs": "package",
     "src/manage/ops/export_plugin.rs": "plugin",
+    "src/manage/ops/hook.rs": "hook",
     "src/manage/ops/install.rs": "package",
     "src/manage/ops/install_plugin.rs": "plugin",
     "src/manage/ops/install_plugin/keep_old.rs": "plugin",
@@ -516,7 +517,6 @@
     "src/supervise/model/supervisor.rs": "supervisor",
     "src/supervise/ops/builtin_adapter.rs": "builtin_adapter",
     "src/supervise/ops/factory.rs": "supervise",
-    "src/supervise/ops/hook.rs": "hook",
     "src/supervise/ops/host.rs": "supervise",
     "src/supervise/ops/invoke.rs": "supervise",
     "src/supervise/ops/lifecycle.rs": "supervise",

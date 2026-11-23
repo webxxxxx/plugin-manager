@@ -303,7 +303,7 @@ fn looks_executable(source: &SourceFile, accept_scripts: bool) -> bool {
     {
         source.mode & 0o111 != 0
             || (accept_scripts
-                && crate::supervise::ops::script::looks_like_script(&source.path, &source.data))
+                && crate::kernel::script::looks_like_script(&source.path, &source.data))
     }
     #[cfg(not(unix))]
     {
@@ -316,6 +316,6 @@ fn looks_executable(source: &SourceFile, accept_scripts: bool) -> bool {
         };
         native
             || (accept_scripts
-                && crate::supervise::ops::script::looks_like_script(&source.path, &source.data))
+                && crate::kernel::script::looks_like_script(&source.path, &source.data))
     }
 }

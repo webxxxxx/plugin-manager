@@ -7,9 +7,9 @@ use crate::kernel::registry::RESERVED_ID;
 use crate::manage as package;
 use crate::manage::model::layout::{current_version, plugin_dir};
 use crate::manage::ops::export_plugin::remove_versions;
+use crate::manage::ops::hook;
 use crate::manage::ops::scan::read_manifest;
 use crate::platform::paths::Paths;
-use crate::supervise::ops::hook;
 
 /// Remove the service and install-hook logs for a purged plugin. The slot is
 /// already gone, but its reader threads may still be closing the file on

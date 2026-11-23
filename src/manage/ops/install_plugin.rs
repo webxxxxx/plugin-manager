@@ -9,13 +9,13 @@ use crate::manage::check::interpreter;
 use crate::manage::model::layout::{current_version, plugin_dir};
 use crate::manage::model::manifest::Package;
 use crate::manage::ops::config::{write_config, write_hash};
+use crate::manage::ops::hook;
 use crate::manage::ops::scan::{resolve_interpreter, service_from_manifest};
 use crate::manage::{
     ensure_hooks_allowed, ensure_hooks_allowed_manifest, remove_versions, replace_plan,
     ReplacePlan, Strategy,
 };
 use crate::platform::paths::Paths;
-use crate::supervise::ops::hook;
 
 mod keep_old;
 mod replace;
