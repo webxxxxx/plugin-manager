@@ -40,7 +40,7 @@ impl ApiFace {
         let keys: Vec<Value> = crate::platform::config_doc::CONF_KEYS
             .iter()
             .map(|entry| {
-                let env = conf::env_value(entry.key);
+                let env = self.config.env.get(entry.key).cloned();
                 let source = if env.is_some() {
                     "env"
                 } else if file.contains_key(entry.key) {
@@ -138,6 +138,16 @@ impl ApiFace {
                     }
                 }
                 Some(text) => {
+                    // A value is one document line; a newline would smuggle a
+                    // second assignment (including a read-only key) past the
+                    // per-key validation below.
+                    if text.contains(['\n', '\r', '\0']) {
+                        return error_response(
+                            400,
+                            "bad_request",
+                            &format!("{} must be a single line", key),
+                        );
+                    }
                     if let Err(error) = settings::parse(&format!("{} = {}", key, text), base) {
                         return error_response(400, "bad_request", &error);
                     }
@@ -165,8 +175,39 @@ impl ApiFace {
                 "mem_budget_bytes and mem_budget_percent are mutually exclusive; clear one first",
             );
         }
-        if let Err(error) = conf::rewrite(&path, &set, &unset) {
-            return error_response(500, "internal", &error);
+        // Build the next document before writing it: only the named keys may
+        // change, and the result must still parse as the same document.
+        let current = fs::read_to_string(&path).unwrap_or_default();
+        let next = conf::rewrite_text(&current, &set, &unset);
+        if let Err(error) = settings::parse(&next, base) {
+            return error_response(400, "bad_request", &error);
+        }
+        let before = conf::file_values(&current);
+        let after = conf::file_values(&next);
+        let only_named = before.iter().all(|(key, value)| {
+            if unset.iter().any(|candidate| candidate == key) {
+                !after.contains_key(key)
+            } else if set.contains_key(key) {
+                true
+            } else {
+                after.get(key) == Some(value)
+            }
+        }) && after
+            .keys()
+            .all(|key| before.contains_key(key) || set.contains_key(key));
+        if !only_named {
+            return error_response(
+                400,
+                "bad_request",
+                "the edit would change a key the request did not name",
+            );
+        }
+        if let Err(error) = fs::write(&path, &next) {
+            return error_response(
+                500,
+                "internal",
+                &format!("write {}: {}", path.display(), error),
+            );
         }
         let saved: Vec<&String> = saved.iter().collect();
         // Every file-backed change needs a restart (nothing is hot except

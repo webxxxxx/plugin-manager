@@ -46,6 +46,9 @@ pub struct Config {
     /// Migration messages for removed path keys and variables. The
     /// composition root logs them after the log sink exists.
     pub warnings: Vec<String>,
+    /// The `SVCD_<key>` overrides visible at bootstrap, by live key (#263).
+    /// Faces read provenance from here; nothing re-reads the environment.
+    pub env: std::collections::BTreeMap<&'static str, String>,
 }
 
 impl Config {
@@ -57,7 +60,13 @@ impl Config {
     /// ceiling). Production goes through [`Config::bootstrap`].
     #[cfg(test)]
     pub fn with_paths(settings: Settings, settings_path: Option<PathBuf>, paths: Paths) -> Config {
-        Self::assemble(settings, settings_path, paths, &ResourceProfile::default())
+        Self::assemble(
+            settings,
+            settings_path,
+            paths,
+            &ResourceProfile::default(),
+            std::collections::BTreeMap::new(),
+        )
     }
 
     /// The same value with an explicit resource description. A test that wants
@@ -68,7 +77,29 @@ impl Config {
         paths: Paths,
         profile: &ResourceProfile,
     ) -> Config {
-        Self::assemble(settings, settings_path, paths, profile)
+        Self::assemble(
+            settings,
+            settings_path,
+            paths,
+            profile,
+            Self::env_overrides(),
+        )
+    }
+
+    /// The `SVCD_<KEY>` values this process saw at bootstrap. Read once by the
+    /// composition root (ADR-0019); faces report provenance from this snapshot
+    /// instead of re-reading the process environment per request.
+    fn env_overrides() -> std::collections::BTreeMap<&'static str, String> {
+        let mut values = std::collections::BTreeMap::new();
+        for key in crate::platform::settings::ENV_KEYS {
+            let name = format!("SVCD_{}", key.to_ascii_uppercase());
+            if let Ok(value) = std::env::var(&name) {
+                if !value.is_empty() {
+                    values.insert(*key, value);
+                }
+            }
+        }
+        values
     }
 
     fn assemble(
@@ -76,6 +107,7 @@ impl Config {
         settings_path: Option<PathBuf>,
         paths: Paths,
         profile: &ResourceProfile,
+        env: std::collections::BTreeMap<&'static str, String>,
     ) -> Config {
         let Derived { limits, report } = limits::derive_with(&settings, profile);
         Config {
@@ -85,6 +117,7 @@ impl Config {
             limits: Arc::new(limits),
             resources: Arc::new(report),
             warnings: Vec::new(),
+            env,
         }
     }
 

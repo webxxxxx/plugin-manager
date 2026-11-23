@@ -13,7 +13,6 @@
 
 // 生产代码里今天只有测试守卫在读这张表；控制台设置表单（#263）落地后删掉这条
 // allow，让编译器继续盯着「谁在用」。
-#![allow(dead_code)]
 
 /// README 与设置表单里的分组，按阅读顺序排列。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,19 +65,6 @@ impl Kind {
             Kind::PasswordHash => "password-hash",
         }
     }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Kind::Enum => "枚举",
-            Kind::Bytes => "字节",
-            Kind::Seconds => "秒",
-            Kind::Count => "计数",
-            Kind::Bool => "开关",
-            Kind::SocketAddr => "地址",
-            Kind::Path => "路径",
-            Kind::PasswordHash => "密码哈希",
-        }
-    }
 }
 
 /// 一行配置项元数据。
@@ -103,9 +89,11 @@ pub struct ConfKey {
 ///
 /// 它们不进 README 表，也不许被重新加回 `CONF_KEYS`：出现在旧文档里时
 /// 只解释「现在实际用哪条路径」，不改任何行为。
+#[cfg(test)]
 pub const REMOVED_KEYS: &[&str] = &["boot_scan_wait_ms"];
 
 /// 已删除的旧路径键：解析器只把它们收集成 `IgnoredPathKey` 警告。
+#[cfg(test)]
 pub const REMOVED_PATH_KEYS: &[&str] = &["plugins_dir", "services_dir", "temp_dir"];
 
 /// `svcd.conf` 的全部 live 键，按分组与阅读顺序排列。
@@ -157,7 +145,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
         default: "128/192/256 KiB（tiny/interactive/streaming）",
         doc: "每个请求线程的栈。不随预算变，只随 shape 变。",
         recommend: "默认即可；递归深的插件处理再调大。",
-        editable_in_console: true,
+        editable_in_console: false,
         needs_restart: true,
     },
     ConfKey {
@@ -167,7 +155,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
         default: "64/96/128 KiB（tiny/interactive/streaming）",
         doc: "每个 IO 线程的栈。",
         recommend: "默认即可。",
-        editable_in_console: true,
+        editable_in_console: false,
         needs_restart: true,
     },
     ConfKey {
@@ -187,7 +175,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
         default: "由连接数解算（min(max_connections,256)），1..1024",
         doc: "阻塞池可排队的作业数；满了回 503 busy + Retry-After。",
         recommend: "默认即可；排队的作业属于已准入连接，不需要为它额外调大。",
-        editable_in_console: true,
+        editable_in_console: false,
         needs_restart: true,
     },
     ConfKey {
@@ -197,7 +185,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
         default: "8/64/512 MiB（tiny/interactive/streaming）",
         doc: "请求体在内存里的上限；更大的完整请求体会走落盘。",
         recommend: "默认即可；只在确有超大上传时调大，并同时看 max_package_bytes。",
-        editable_in_console: true,
+        editable_in_console: false,
         needs_restart: true,
     },
     ConfKey {
@@ -207,7 +195,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
         default: "64 KiB/256 KiB/1 MiB",
         doc: "JSON 请求体的上限，超出回 413。",
         recommend: "默认即可。",
-        editable_in_console: true,
+        editable_in_console: false,
         needs_restart: true,
     },
     ConfKey {
@@ -217,7 +205,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
         default: "64 KiB/1 MiB/2 MiB",
         doc: "每个连接常驻的请求体预算，是容量公式里的一项。",
         recommend: "面板很多时把它钉小（如 65536），预算让给连接数。",
-        editable_in_console: true,
+        editable_in_console: false,
         needs_restart: true,
     },
     ConfKey {
@@ -227,7 +215,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
         default: "8/16/64 KiB",
         doc: "请求头上限，超出回 431。",
         recommend: "默认即可。",
-        editable_in_console: true,
+        editable_in_console: false,
         needs_restart: true,
     },
     ConfKey {
@@ -237,7 +225,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
         default: "24/48/96，1..4096",
         doc: "长连接与传输流的上限：SSE、WS、raw WS、MCP SSE、上传/下载、导入导出；一次性静态资源不计。",
         recommend: "默认即可；插件面板多时调到接近连接数。",
-        editable_in_console: true,
+        editable_in_console: false,
         needs_restart: true,
     },
     ConfKey {
@@ -257,7 +245,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
         default: "由预算解算（下限 8，上限 4096）",
         doc: "同时准入的连接数。显式值会被容量公式再压一次。",
         recommend: "默认让预算解算；只有要人为压并发时才写死。",
-        editable_in_console: true,
+        editable_in_console: false,
         needs_restart: true,
     },
     ConfKey {
@@ -267,7 +255,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
         default: "16/32/64",
         doc: "单个来源 IP 的连接上限。",
         recommend: "默认即可；反向代理后面调大。",
-        editable_in_console: true,
+        editable_in_console: false,
         needs_restart: true,
     },
     ConfKey {
@@ -277,7 +265,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
         default: "64/128/256",
         doc: "整个 daemon 的订阅数上限（每个订阅只花一个游标）。",
         recommend: "默认即可。",
-        editable_in_console: true,
+        editable_in_console: false,
         needs_restart: true,
     },
     ConfKey {
@@ -287,7 +275,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
         default: "16/32/64",
         doc: "单个插件的订阅者上限。",
         recommend: "默认即可。",
-        editable_in_console: true,
+        editable_in_console: false,
         needs_restart: true,
     },
     ConfKey {
@@ -297,7 +285,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
         default: "32/128/512（预算/4 MiB）",
         doc: "服务器循环到监督循环之间排队的管理请求数。",
         recommend: "默认即可。",
-        editable_in_console: true,
+        editable_in_console: false,
         needs_restart: true,
     },
     ConfKey {
@@ -307,7 +295,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
         default: "16/64/256（预算/8 MiB）",
         doc: "reactor 到单个 MCP 流之间排队的进度事件数。",
         recommend: "默认即可。",
-        editable_in_console: true,
+        editable_in_console: false,
         needs_restart: true,
     },
     ConfKey {
@@ -317,7 +305,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
         default: "8/64/512 MiB",
         doc: "可安装 .spk 的体积上限。",
         recommend: "默认即可；交叉编译的大包再调大。",
-        editable_in_console: true,
+        editable_in_console: false,
         needs_restart: true,
     },
     ConfKey {
@@ -427,7 +415,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
         default: "300000 毫秒",
         doc: "调用预算的硬上限（毫秒），内核按它截断。",
         recommend: "默认即可。",
-        editable_in_console: true,
+        editable_in_console: false,
         needs_restart: true,
     },
     ConfKey {
@@ -447,7 +435,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
         default: "2/8/64 MiB",
         doc: "所有插件未确认的 raw 字节总量。",
         recommend: "默认即可；大帧场景调大。",
-        editable_in_console: true,
+        editable_in_console: false,
         needs_restart: true,
     },
     ConfKey {
@@ -457,7 +445,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
         default: "4/16/128",
         doc: "所有插件未确认的 raw 帧数。",
         recommend: "默认即可。",
-        editable_in_console: true,
+        editable_in_console: false,
         needs_restart: true,
     },
     ConfKey {
@@ -497,7 +485,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
         default: "8/32/128",
         doc: "单个插件 stdin 上排队的 raw 帧数。",
         recommend: "默认即可；慢插件会填满队列而不是占线程。",
-        editable_in_console: true,
+        editable_in_console: false,
         needs_restart: true,
     },
     ConfKey {
@@ -724,6 +712,25 @@ mod tests {
             "these ConfKey rows name keys the parser does not have: {extra:?}"
         );
         live.clear();
+    }
+
+    #[test]
+    fn derived_detail_keys_are_read_only() {
+        // #263: budget-derived detail (max_*, queue sizes, stacks, raw in-flight
+        // budgets) is shown in the settings screen but never editable there.
+        for entry in CONF_KEYS {
+            let derived = entry.key.starts_with("max_")
+                || entry.key.ends_with("_queue")
+                || entry.key.ends_with("_stack_bytes")
+                || entry.key.starts_with("ws_inflight_");
+            if derived {
+                assert!(
+                    !entry.editable_in_console,
+                    "{} is derived and must stay read-only",
+                    entry.key
+                );
+            }
+        }
     }
 
     #[test]
