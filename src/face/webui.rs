@@ -401,7 +401,7 @@ mod tests {
 
     #[test]
     fn one_projection_decides_the_304_and_the_headers_of_both_paths() {
-        let root = crate::test_support::temp_dir().join(format!(
+        let root = crate::platform::test_support::temp_dir().join(format!(
             "svcd-webui-validators-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

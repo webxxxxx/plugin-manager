@@ -337,17 +337,18 @@ fn unsigned_packages_carry_no_signature_and_need_the_insecure_switch() {
     let names: Vec<&str> = parsed.iter().map(|entry| entry.path.as_str()).collect();
     assert_eq!(names, ["manifest.json", exec_path]);
 
-    let inspection = package::inspect_bytes_with(&bytes, None, &crate::test_support::temp_dir())
-        .expect("inspect");
+    let inspection =
+        package::inspect_bytes_with(&bytes, None, &crate::platform::test_support::temp_dir())
+            .expect("inspect");
     assert_eq!(inspection.signature.state, "missing");
 
     // A strict install refuses it; only the host-level switch accepts it,
     // which is exactly the local-development contract of `--unsigned`.
-    assert!(package::verify_bytes(&bytes, &crate::test_support::temp_dir()).is_err());
+    assert!(package::verify_bytes(&bytes, &crate::platform::test_support::temp_dir()).is_err());
     package::verify_bytes_with(
         &bytes,
         package::SignatureCheck::AllowUnsigned,
-        &crate::test_support::temp_dir(),
+        &crate::platform::test_support::temp_dir(),
     )
     .expect("insecure acceptance");
 }

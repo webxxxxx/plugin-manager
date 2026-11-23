@@ -1,6 +1,5 @@
 //! Inline dispatch and exchange validation for the S4 seam.
 
-use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::time::Instant;
@@ -69,7 +68,6 @@ pub(crate) struct PreparedFace {
 pub(crate) fn route_face_request(
     face: &dyn Face,
     head: &http::Head,
-    peer: IpAddr,
     lan: &Arc<Mutex<Lan>>,
 ) -> Result<Option<PreparedFace>, Vec<u8>> {
     let Some(route) = face.route(&head.method, &head.path) else {
@@ -98,7 +96,6 @@ pub(crate) fn route_face_request(
             method: head.method.clone(),
             path: head.path.clone(),
             headers: head.headers.clone(),
-            peer,
             principal,
             body: Vec::new(),
             deadline: None,
@@ -291,7 +288,6 @@ mod tests {
             method: "GET".into(),
             path: "/api/v1/version".into(),
             headers: Vec::new(),
-            peer: "127.0.0.1".parse().expect("peer"),
             principal: crate::server::auth::lan::AuthKind::None,
             body: Vec::new(),
             deadline: None,
@@ -337,8 +333,7 @@ mod tests {
             headers: Vec::new(),
         };
 
-        let result = route_face_request(&face, &head, "127.0.0.1".parse().expect("peer"), &lan)
-            .expect("route");
+        let result = route_face_request(&face, &head, &lan).expect("route");
         assert!(result.is_none());
         assert_eq!(
             face.calls.load(std::sync::atomic::Ordering::SeqCst),

@@ -18,6 +18,7 @@ pub mod failure;
 pub mod projection;
 pub mod registry;
 pub mod schema;
+pub mod script;
 
 #[cfg(test)]
 pub(crate) mod conformance;

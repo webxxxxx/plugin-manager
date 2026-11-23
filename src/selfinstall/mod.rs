@@ -6,6 +6,7 @@
 
 mod execute;
 mod plan;
+pub(crate) mod upgrade;
 
 #[cfg(windows)]
 pub(crate) use execute::wait_for_process;

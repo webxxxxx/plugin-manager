@@ -188,12 +188,12 @@
       "layer": "domain"
     },
     "hook": {
-      "concept": "supervise/hook",
+      "concept": "manage/hook",
       "layer": "domain"
     },
     "script": {
-      "concept": "supervise/hook",
-      "layer": "domain"
+      "concept": "kernel/script",
+      "layer": "kernel"
     },
     "blob": {
       "concept": "storage",
@@ -258,11 +258,6 @@
       "layer": "face",
       "note": "事件总线、replay 与握手；SSE/WS transport 已迁到 face/plugin_streams"
     },
-    "test_support": {
-      "concept": "test_support",
-      "layer": "platform",
-      "note": "仅测试编译的临时根 helper；除 std 外无依赖，按最低层计"
-    },
     "svc": {
       "concept": "cli/svc",
       "layer": "cli"
@@ -315,8 +310,8 @@
       "note": "#263：svcd.conf 文档文本的读/改助手（保留注释的读-改-写）"
     },
     "upgrade": {
-      "concept": "compose",
-      "layer": "server",
+      "concept": "selfinstall/upgrade",
+      "layer": "domain",
       "note": "#264：检查更新/升级编排（经控制通道调 plugin-store、校验 SHA256SUMS、替换二进制）；CLI 与 /api/v1/upgrade 共用"
     }
   },
@@ -332,6 +327,7 @@
     "src/cli/svc.rs": "svc",
     "src/cli/svc/logs.rs": "svc",
     "src/cli/tune.rs": "tune",
+    "src/cli/upgrade.rs": "cli",
     "src/daemon/assembly.rs": "daemon",
     "src/daemon/bootstrap.rs": "daemon",
     "src/daemon/driver.rs": "daemon",
@@ -384,6 +380,7 @@
     "src/kernel/projection.rs": "kernel",
     "src/kernel/registry.rs": "registry",
     "src/kernel/schema.rs": "kernel",
+    "src/kernel/script.rs": "script",
     "src/main.rs": "main",
     "src/manage/check/backup.rs": "transfer",
     "src/manage/check/interpreter.rs": "interpreter",
@@ -410,6 +407,7 @@
     "src/manage/ops/config.rs": "plugin",
     "src/manage/ops/export.rs": "package",
     "src/manage/ops/export_plugin.rs": "plugin",
+    "src/manage/ops/hook.rs": "hook",
     "src/manage/ops/install.rs": "package",
     "src/manage/ops/install_plugin.rs": "plugin",
     "src/manage/ops/install_plugin/keep_old.rs": "plugin",
@@ -520,7 +518,6 @@
     "src/supervise/model/supervisor.rs": "supervisor",
     "src/supervise/ops/builtin_adapter.rs": "builtin_adapter",
     "src/supervise/ops/factory.rs": "supervise",
-    "src/supervise/ops/hook.rs": "hook",
     "src/supervise/ops/host.rs": "supervise",
     "src/supervise/ops/invoke.rs": "supervise",
     "src/supervise/ops/lifecycle.rs": "supervise",
@@ -528,7 +525,6 @@
     "src/supervise/ops/probe.rs": "supervise",
     "src/supervise/ops/rescan.rs": "supervise",
     "src/supervise/ops/restart.rs": "supervise",
-    "src/supervise/ops/script.rs": "script",
     "src/supervise/ops/slot.rs": "slot",
     "src/supervise/ops/slot/calls.rs": "slot",
     "src/supervise/ops/slot/commands.rs": "slot",
@@ -536,8 +532,7 @@
     "src/supervise/ops/slot/handle.rs": "slot",
     "src/supervise/ops/slot/stop.rs": "slot",
     "src/supervise/ops/slot/tests.rs": "slot",
-    "src/test_support.rs": "test_support",
-    "src/upgrade.rs": "upgrade",
+    "src/selfinstall/upgrade.rs": "upgrade",
     "src/wire/contract/mod.rs": "wire",
     "src/wire/contract/rawhub.rs": "rawhub",
     "src/wire/contract/rawhub/control.rs": "rawhub",

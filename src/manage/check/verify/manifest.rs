@@ -3,6 +3,8 @@
 
 use super::*;
 
+pub use crate::kernel::registry::valid_id;
+
 /// Icon ceilings: one file per format, and the whole icon set stays small
 /// enough that it never competes with the payload budget.
 pub(crate) const MAX_ICON_BYTES: u64 = 1024 * 1024;
@@ -48,19 +50,6 @@ fn check_identity(manifest: &Manifest) -> Result<(), ProblemError> {
         ));
     }
     Ok(())
-}
-
-/// The plugin id charset. The identity ends up in directory names, file names,
-/// URL path segments and MCP tool names, so it stays ASCII and lower case.
-pub fn valid_id(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 64
-        && s.chars()
-            .next()
-            .map(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-            .unwrap_or(false)
-        && s.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
 /// The display name may be any UTF-8 (Chinese included); only emptiness, the

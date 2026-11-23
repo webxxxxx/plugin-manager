@@ -1,7 +1,6 @@
 //! HTTP primitives shared by the management API, plugin UI and `/mcp`.
 
-#![allow(dead_code)]
-
+#[cfg(test)]
 use std::io::Read;
 
 use serde_json::json;
@@ -194,6 +193,7 @@ impl ChunkedDecoder {
         self.state == ChunkState::Done
     }
 
+    #[cfg(test)]
     pub fn total(&self) -> u64 {
         self.total
     }
@@ -350,6 +350,7 @@ fn find_crlf(bytes: &[u8]) -> Option<usize> {
 
 /// Stream a request body into `sink`. `initial` is whatever the caller read
 /// after the head; any extra bytes beyond the declared length are ignored.
+#[cfg(test)]
 pub fn copy_body<R: Read>(
     reader: &mut R,
     framing: Framing,
@@ -399,22 +400,6 @@ pub fn copy_body<R: Read>(
             Ok(decoder.total())
         }
     }
-}
-
-/// Buffer a body in memory. Only for small management JSON requests; blobs are
-/// streamed with `copy_body` instead.
-pub fn collect_body<R: Read>(
-    reader: &mut R,
-    framing: Framing,
-    max: u64,
-    initial: &[u8],
-) -> Result<Vec<u8>, BodyError> {
-    let mut body = Vec::new();
-    copy_body(reader, framing, max, initial, &mut |chunk| {
-        body.extend_from_slice(chunk);
-        Ok(())
-    })?;
-    Ok(body)
 }
 
 /// Percent-decode one URL component. `plus_as_space` is set for query values;

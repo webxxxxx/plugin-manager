@@ -8,13 +8,12 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::kernel::failure::{Problem, ProblemError};
-use crate::manage as package;
 use crate::platform::log::{self, LogWriter};
 use crate::platform::paths::Paths;
 
@@ -42,7 +41,7 @@ pub fn run(
     limits: &crate::platform::limits::Limits,
     poll: &mut dyn FnMut(),
 ) -> Result<(), ProblemError> {
-    package::check_path(spec.path)?;
+    crate::manage::check_path(spec.path)?;
     let program = spec.version_dir.join(spec.path);
     let metadata = fs::metadata(&program).map_err(|error| {
         Problem::Invalid.error(format!(
@@ -159,7 +158,7 @@ pub fn run(
             if let Some(tree) = &tree {
                 tree.terminate();
             }
-            kill(&mut child);
+            crate::platform::host::process::kill_now(&mut child);
             let _ = child.wait();
             return Err(Problem::Timeout.error(format!(
                 "{} hook timed out after {}s",
@@ -168,23 +167,6 @@ pub fn run(
             )));
         }
         thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// Kill a hook and, on Unix, the process group it leads.
-///
-/// `process::configure` puts every hook in a group of its own, so killing the
-/// leader alone would leave its children behind. Windows has no group here; the
-/// daemon-wide job covers the tree, and the leader is what we can stop now.
-pub(crate) fn kill(child: &mut Child) {
-    #[cfg(unix)]
-    // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
-    }
-    #[cfg(windows)]
-    {
-        let _ = child.kill();
     }
 }
 
@@ -285,37 +267,8 @@ mod tests {
             poll,
         )
     }
+    use crate::platform::test_support::TempDir;
     use std::fs;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos();
-            let path = crate::test_support::temp_dir().join(format!(
-                "svcd-hook-{}-{}-{}",
-                std::process::id(),
-                nanos,
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir_all(&path).expect("temp dir");
-            TempDir(path)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
 
     #[cfg(windows)]
     fn write_hook(dir: &Path, name: &str, body: &str) -> String {

@@ -665,7 +665,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = crate::test_support::temp_dir().join(format!(
+        let root = crate::platform::test_support::temp_dir().join(format!(
             "svcd-face-unit-{}-{}",
             std::process::id(),
             nanos
@@ -695,7 +695,6 @@ mod tests {
             method: method.to_string(),
             path: path.to_string(),
             headers: Vec::new(),
-            peer: "127.0.0.1".parse().expect("peer"),
             principal: AuthKind::None,
             body: Vec::new(),
             deadline: None,
@@ -1166,7 +1165,6 @@ mod tests {
         let bind = "127.0.0.1:0".parse().expect("bind");
         let lan = Arc::new(Mutex::new(Lan::new(bind, bind, true, Some("hash".into()))));
         let face = ApiFace::new(test_config(), lan.clone());
-        let peer = "127.0.0.1".parse().expect("peer");
 
         assert!(face.route("POST", "/login").expect("route").public);
         let login = http::Head {
@@ -1175,7 +1173,7 @@ mod tests {
             version: "HTTP/1.1".into(),
             headers: Vec::new(),
         };
-        let prepared = route_face_request(&face, &login, peer, &lan)
+        let prepared = route_face_request(&face, &login, &lan)
             .expect("a public route must not fail authentication")
             .expect("the face claims login");
         assert_eq!(prepared.request.principal, AuthKind::None);
@@ -1187,7 +1185,7 @@ mod tests {
             headers: Vec::new(),
         };
         assert!(
-            route_face_request(&face, &protected, peer, &lan).is_err(),
+            route_face_request(&face, &protected, &lan).is_err(),
             "a protected route still requires a principal"
         );
     }

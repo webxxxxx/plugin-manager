@@ -8,6 +8,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::harness::*;
+use super::support::target;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
@@ -67,32 +68,6 @@ pub(crate) fn tool_names(tools: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-pub(crate) fn target() -> &'static str {
-    if cfg!(all(windows, target_arch = "x86_64")) {
-        "x86_64-pc-windows-msvc"
-    } else if cfg!(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        target_env = "musl"
-    )) {
-        "x86_64-unknown-linux-musl"
-    } else if cfg!(all(
-        target_os = "linux",
-        target_arch = "aarch64",
-        target_env = "musl"
-    )) {
-        "aarch64-unknown-linux-musl"
-    } else if cfg!(all(
-        target_os = "linux",
-        target_arch = "arm",
-        target_env = "musl"
-    )) {
-        "armv7-unknown-linux-musleabihf"
-    } else {
-        "x86_64-unknown-linux-gnu"
-    }
 }
 
 pub(crate) fn script() -> (&'static str, Vec<u8>) {

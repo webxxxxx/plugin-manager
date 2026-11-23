@@ -15,7 +15,7 @@ impl TempDir {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path = crate::test_support::temp_dir().join(format!(
+        let path = crate::platform::test_support::temp_dir().join(format!(
             "svcd-definition-{}-{}-{}",
             std::process::id(),
             nanos,

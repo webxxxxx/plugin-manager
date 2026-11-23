@@ -190,7 +190,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn config_dir(tag: &str) -> std::path::PathBuf {
-        let directory = crate::test_support::temp_dir().join(format!(
+        let directory = crate::platform::test_support::temp_dir().join(format!(
             "svcd-channel-mode-{}-{}-{}",
             tag,
             std::process::id(),

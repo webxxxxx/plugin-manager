@@ -60,9 +60,6 @@ mod platform;
 mod selfinstall;
 mod server;
 mod supervise;
-#[cfg(test)]
-mod test_support;
-mod upgrade;
 mod wire;
 
 fn main() {
@@ -75,7 +72,7 @@ fn main() {
     }
     // A Windows self-replace renames the running image aside; the next start
     // removes the leftovers.
-    crate::upgrade::cleanup_old_files();
+    crate::selfinstall::upgrade::cleanup_old_files();
     let arg0 = std::env::args().next().unwrap_or_default();
     // Installed entries are hardlinks/symlinks named `svc`, `plugin`, `mcp`
     // (and `.exe` variants on Windows); dispatch on the stem, not the suffix.
@@ -112,10 +109,10 @@ fn svcd_run(args: Vec<String>) -> i32 {
         Some("install-service") => selfinstall::install_service(&args[1..]),
         Some("uninstall-service") => selfinstall::uninstall_service(&args[1..]),
         Some("version") if args.len() == 1 => {
-            println!("{}", crate::upgrade::version_line());
+            println!("{}", crate::selfinstall::upgrade::version_line());
             0
         }
-        Some("upgrade") => upgrade_command(&args[1..]),
+        Some("upgrade") => cli::upgrade::run(&args[1..], usage),
         Some("start") => start_command(),
         Some("stop") => stop_command(),
         Some("restart") if args.len() == 1 => restart_command(),
@@ -407,124 +404,6 @@ fn restart_command() -> i32 {
             1
         }
     }
-}
-
-/// `svcd upgrade`: check, or apply a local/remote release. The download half
-/// lives in `plugin-store`; this command only orchestrates and reports.
-fn upgrade_command(args: &[String]) -> i32 {
-    let mut check = false;
-    let mut json = false;
-    let mut file: Option<std::path::PathBuf> = None;
-    let mut sum: Option<std::path::PathBuf> = None;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        match arg.as_str() {
-            "--check" => check = true,
-            "--json" => json = true,
-            "--file" | "--sum" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    eprintln!("svcd: {} needs a path", arg);
-                    return 64;
-                };
-                if arg == "--file" {
-                    file = Some(std::path::PathBuf::from(value));
-                } else {
-                    sum = Some(std::path::PathBuf::from(value));
-                }
-            }
-            _ if arg.starts_with("--file=") => {
-                file = Some(std::path::PathBuf::from(&arg["--file=".len()..]));
-            }
-            _ if arg.starts_with("--sum=") => {
-                sum = Some(std::path::PathBuf::from(&arg["--sum=".len()..]));
-            }
-            other => {
-                eprintln!("svcd: unknown upgrade argument: {}", other);
-                usage();
-                return 64;
-            }
-        }
-        index += 1;
-    }
-    let Some(config) = crate::platform::config::Config::bootstrap_or_report("svcd") else {
-        return 1;
-    };
-    if let Some(path) = file {
-        return match crate::upgrade::apply_file(&config, &path, sum.as_deref()) {
-            Ok(applied) => report_applied(&applied, json),
-            Err(error) => {
-                eprintln!("svcd: upgrade: {}", error);
-                1
-            }
-        };
-    }
-    if check {
-        return match crate::upgrade::check(&config) {
-            Ok(found) => report_check(&found, json),
-            Err(error) => {
-                eprintln!("svcd: upgrade check: {}", error);
-                1
-            }
-        };
-    }
-    match crate::upgrade::apply_remote(&config) {
-        Ok(applied) => report_applied(&applied, json),
-        Err(error) => {
-            eprintln!("svcd: upgrade: {}", error);
-            1
-        }
-    }
-}
-
-fn report_check(found: &crate::upgrade::Check, json: bool) -> i32 {
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&found.to_json()).unwrap_or_default()
-        );
-        return 0;
-    }
-    if !found.store {
-        eprintln!(
-            "svcd {} is installed, but plugin-store is not: install it from the plugin store, \
-             or upgrade offline with `svcd upgrade --file <archive>`",
-            found.current
-        );
-        return 1;
-    }
-    let latest = found.latest.clone().unwrap_or_default();
-    println!("svcd {} -> {}", found.current, latest);
-    if found.newer {
-        println!("a newer release is available; run `svcd upgrade`");
-    } else if latest == found.current {
-        println!("already at the latest release");
-    } else {
-        println!("the latest release is older than the running build (downgrade is allowed)");
-    }
-    0
-}
-
-fn report_applied(applied: &crate::upgrade::Applied, json: bool) -> i32 {
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&applied.to_json()).unwrap_or_default()
-        );
-        return 0;
-    }
-    println!(
-        "upgraded to {} ({})",
-        applied.version,
-        applied.binary.display()
-    );
-    match (&applied.restarting, &applied.hint) {
-        (true, _) => println!("restarting the daemon"),
-        (false, Some(hint)) => println!("{}", hint),
-        (false, None) => println!("restart the daemon for this to take effect"),
-    }
-    0
 }
 
 /// Wait for the process named in `pid` to exit, then start the daemon again.

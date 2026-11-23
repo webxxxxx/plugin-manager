@@ -150,7 +150,7 @@ pub(super) fn assemble_manifest(
             .and_then(|extension| extension.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        let actions = crate::supervise::ops::script::declared_actions(
+        let actions = crate::kernel::script::declared_actions(
             &String::from_utf8_lossy(&source.data),
             &extension,
         );

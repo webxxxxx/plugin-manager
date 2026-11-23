@@ -11,15 +11,6 @@ impl RawStats {
         self.json_frames.fetch_add(1, Ordering::Relaxed);
         self.json_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
     }
-
-    /// `frames=N bytes=N` for stream 0, appended to the raw summary.
-    pub(super) fn json_summary(&self) -> String {
-        format!(
-            "json-frames={} json-bytes={}",
-            self.json_frames.load(Ordering::Relaxed),
-            self.json_bytes.load(Ordering::Relaxed)
-        )
-    }
 }
 
 impl RawHub {

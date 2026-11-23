@@ -9,14 +9,14 @@ use super::*;
 
 impl ApiFace {
     pub(super) fn upgrade_check(&self, _call: &ApiCall<'_>) -> Response {
-        match crate::upgrade::check(&self.config) {
+        match crate::selfinstall::upgrade::check(&self.config) {
             Ok(found) => Response::json(200, &found.to_json()),
             Err(error) => error_response(400, "upgrade_check_failed", &error),
         }
     }
 
     pub(super) fn upgrade_apply(&self, _call: &ApiCall<'_>) -> Response {
-        match crate::upgrade::apply_remote(&self.config) {
+        match crate::selfinstall::upgrade::apply_remote(&self.config) {
             Ok(applied) => Response::json(200, &applied.to_json()),
             Err(error) => error_response(400, "upgrade_failed", &error),
         }

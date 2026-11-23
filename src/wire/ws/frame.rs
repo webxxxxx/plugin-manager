@@ -140,6 +140,38 @@ pub fn frame_header(opcode: u8, length: usize) -> Vec<u8> {
     header
 }
 
+/// Split a written stream into the HTTP head and its server frames.
+///
+/// Shared by the raw and WS stream handler tests; both write a 101 head and
+/// then unmasked server frames into the same buffer.
+#[cfg(test)]
+pub(crate) fn server_frames(bytes: &[u8]) -> (String, Vec<(u8, Vec<u8>)>) {
+    let head_end = bytes.windows(4).position(|window| window == b"\r\n\r\n");
+    let head = head_end
+        .map(|end| String::from_utf8_lossy(&bytes[..end + 4]).to_string())
+        .unwrap_or_default();
+    let mut body = head_end.map(|end| &bytes[end + 4..]).unwrap_or(bytes);
+    let mut frames = Vec::new();
+    while body.len() >= 2 {
+        let opcode = body[0] & 0x0F;
+        let mut length = u64::from(body[1] & 0x7F);
+        let mut at = 2;
+        if length == 126 {
+            length = u64::from(u16::from_be_bytes([body[at], body[at + 1]]));
+            at += 2;
+        } else if length == 127 {
+            let mut extended = [0u8; 8];
+            extended.copy_from_slice(&body[at..at + 8]);
+            length = u64::from_be_bytes(extended);
+            at += 8;
+        }
+        let payload = body[at..at + length as usize].to_vec();
+        frames.push((opcode, payload));
+        body = &body[at + length as usize..];
+    }
+    (head, frames)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

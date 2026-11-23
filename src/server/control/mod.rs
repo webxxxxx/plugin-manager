@@ -70,7 +70,6 @@ impl ConnectionOps for ControlOnly {
     fn route_request(
         &mut self,
         _id: u64,
-        _peer: std::net::IpAddr,
         _head: &crate::server::http::model::Head,
     ) -> Result<crate::server::http::BodyPolicy, Vec<u8>> {
         // The control-only loop never reads HTTP requests.
@@ -153,7 +152,7 @@ mod tests {
     /// request must still be answered and the loop must stop on the handle.
     #[test]
     fn the_control_only_loop_answers_a_request_and_stops() {
-        let root = crate::test_support::temp_dir().join(format!(
+        let root = crate::platform::test_support::temp_dir().join(format!(
             "svcd-control-only-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

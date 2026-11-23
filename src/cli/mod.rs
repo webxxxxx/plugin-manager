@@ -7,3 +7,4 @@ pub mod plugin;
 pub mod status;
 pub mod svc;
 pub mod tune;
+pub(crate) mod upgrade;

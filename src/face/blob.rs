@@ -763,7 +763,6 @@ mod tests {
                 .iter()
                 .map(|(name, value)| (name.to_string(), value.to_string()))
                 .collect(),
-            peer: "127.0.0.1".parse().expect("peer"),
             principal: AuthKind::None,
             body: Vec::new(),
             deadline: None,

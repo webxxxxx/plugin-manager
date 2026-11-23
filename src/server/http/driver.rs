@@ -516,7 +516,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path = crate::test_support::temp_dir().join(format!(
+        let path = crate::platform::test_support::temp_dir().join(format!(
             "svcd-driver-chunk-{}-{}",
             std::process::id(),
             nanos

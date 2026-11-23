@@ -127,6 +127,11 @@ pub(crate) fn terminate_tree(pid: u32) {
     imp::terminate_tree(pid)
 }
 
+/// Kill one child immediately, including its process group on Unix.
+pub(crate) fn kill_now(child: &mut Child) {
+    imp::kill_now(child)
+}
+
 #[cfg(windows)]
 mod imp {
     use std::os::windows::io::AsRawHandle;
@@ -221,6 +226,10 @@ mod imp {
 
     /// The job object already took the tree down when its handle closed.
     pub(crate) fn terminate_tree(_pid: u32) {}
+
+    pub(crate) fn kill_now(child: &mut Child) {
+        let _ = child.kill();
+    }
 
     /// A per-service job object: the whole process tree of one service.
     ///
@@ -478,6 +487,14 @@ mod imp {
         // SAFETY: The process/pipe handle is created by this call and checked for null before use; the child is owned by the caller.
         unsafe {
             libc::kill(-(pid as i32), libc::SIGTERM);
+        }
+    }
+
+    pub(crate) fn kill_now(child: &mut Child) {
+        // SAFETY: `id()` is the live child's pid; the group was armed by
+        // `configure_hook`, so a negative pid signals that group.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
         }
     }
 

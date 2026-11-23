@@ -623,7 +623,7 @@ fn a_live_plugin_routes_tool_calls_and_fails_them_on_a_crash() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let root = crate::test_support::temp_dir().join(format!(
+    let root = crate::platform::test_support::temp_dir().join(format!(
         "svcd-tools-unit-{}-{}",
         std::process::id(),
         nanos
@@ -673,7 +673,7 @@ fn a_core_service_with_capabilities_is_callable_through_the_slot_path() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let root = crate::test_support::temp_dir().join(format!(
+    let root = crate::platform::test_support::temp_dir().join(format!(
         "svcd-tools-unit-{}-{}",
         std::process::id(),
         nanos
@@ -714,7 +714,7 @@ fn an_exec_core_service_forwards_progress_and_cleans_up_its_child() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let root = crate::test_support::temp_dir().join(format!(
+    let root = crate::platform::test_support::temp_dir().join(format!(
         "svcd-tools-unit-{}-{}",
         std::process::id(),
         nanos

@@ -7,7 +7,7 @@ fn temp_file(name: &str, text: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let dir = crate::test_support::temp_dir().join(format!(
+    let dir = crate::platform::test_support::temp_dir().join(format!(
         "svcd-settings-{}-{}-{}",
         std::process::id(),
         nanos,

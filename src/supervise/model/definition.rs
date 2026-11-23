@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::kernel::registry::valid_id;
 use crate::kernel::registry::{
     Exec, Hook, Kind, Lifecycle, Ready, Registry, Restart, Service, State, RESERVED_ID,
 };
-use crate::manage::valid_id;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadIssue {
@@ -143,9 +143,7 @@ fn load_scripts(
             path.extension()
                 .and_then(|extension| extension.to_str())
                 .map(|extension| {
-                    crate::supervise::ops::script::extension_supported(
-                        &extension.to_ascii_lowercase(),
-                    )
+                    crate::kernel::script::extension_supported(&extension.to_ascii_lowercase())
                 })
                 .unwrap_or(false)
         })
@@ -230,11 +228,11 @@ fn load_scripts(
                 continue;
             }
         };
-        let declarations = crate::supervise::ops::script::declared_actions(
+        let declarations = crate::kernel::script::declared_actions(
             &String::from_utf8_lossy(&contents),
             &extension,
         );
-        let restart = crate::supervise::ops::script::declared_restart(
+        let restart = crate::kernel::script::declared_restart(
             &String::from_utf8_lossy(&contents),
             &extension,
         );

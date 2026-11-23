@@ -315,7 +315,7 @@ mod tests {
     use crate::platform::settings::Settings;
 
     fn temp(name: &str) -> std::path::PathBuf {
-        let dir = crate::test_support::temp_dir().join(format!(
+        let dir = crate::platform::test_support::temp_dir().join(format!(
             "svcd-config-file-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

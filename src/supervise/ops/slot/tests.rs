@@ -26,7 +26,7 @@ fn test_paths() -> Arc<Paths> {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let root = crate::test_support::temp_dir().join(format!(
+    let root = crate::platform::test_support::temp_dir().join(format!(
         "svcd-slot-unit-{}-{}",
         std::process::id(),
         nanos
@@ -354,7 +354,7 @@ fn a_plugin_serves_ping_and_tool_calls_then_loses_its_pending_call_on_crash() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let root = crate::test_support::temp_dir().join(format!(
+    let root = crate::platform::test_support::temp_dir().join(format!(
         "svcd-ipc-unit-{}-{}",
         std::process::id(),
         nanos

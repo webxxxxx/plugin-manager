@@ -363,7 +363,7 @@ mod tests {
     /// to the connection that asked, never to whichever socket is first.
     #[test]
     fn replies_go_back_to_the_connection_that_sent_the_request() {
-        let root = crate::test_support::temp_dir().join(format!(
+        let root = crate::platform::test_support::temp_dir().join(format!(
             "svcd-control-route-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -445,7 +445,7 @@ mod tests {
     /// a normal writable/tick pass. This is exactly the last shutdown response.
     #[test]
     fn shutdown_drains_a_reply_that_was_queued_but_not_flushed() {
-        let root = crate::test_support::temp_dir().join(format!(
+        let root = crate::platform::test_support::temp_dir().join(format!(
             "svcd-control-drain-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -524,7 +524,7 @@ mod tests {
     /// closes instead of leaving the client waiting forever.
     #[test]
     fn a_sender_that_disappears_without_a_final_frame_flushes_then_closes() {
-        let root = crate::test_support::temp_dir().join(format!(
+        let root = crate::platform::test_support::temp_dir().join(format!(
             "svcd-control-progress-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

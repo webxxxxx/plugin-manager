@@ -193,18 +193,19 @@ src/
     invoke.rs                   一次调用：超时、重试、取消、预算
     failure.rs                  失败类别 + 可重试性 + 汇合聚合
     projection.rs               状态与运行面 → 各对外面的唯一来源（值投影；协议投影在面）
+    script.rs                   脚本动作与重启策略的文本判定（manage 与 supervise 共用）
 
   manage/                     L3 领域·管理
     mod.rs                      唯一对外接口
     model/  manifest.rs  ustar.rs  layout.rs  hooks.rs
     check/  verify.rs  trust.rs  compat.rs  interpreter.rs
-    ops/    install.rs  uninstall.rs  import.rs  export.rs  bundle.rs  scan.rs
+    ops/    install.rs  uninstall.rs  import.rs  export.rs  bundle.rs  scan.rs  hook.rs
 
   supervise/                  L3 领域·监督
     mod.rs
     model/  entry.rs  machine.rs  record.rs  definition.rs
     check/  restart.rs  backoff.rs  oneshot.rs  reconcile.rs
-    ops/    host.rs  lifecycle.rs  rescan.rs  probe.rs  invoke.rs  factory.rs  slot.rs  hook.rs  script.rs  restart.rs
+    ops/    host.rs  lifecycle.rs  rescan.rs  probe.rs  invoke.rs  factory.rs  slot.rs  restart.rs
 
   orchestrate/                L3 领域·编排（第一个文件出现时才创建）
     model/  step.rs  flow.rs  trigger.rs  fanin.rs
@@ -248,7 +249,7 @@ src/
     install/         upload.rs  install_flow.rs  import_flow.rs  backup.rs（#235）
 
   cli/                        L5 对外面：命令行
-    mod.rs  svc.rs  plugin.rs  status.rs
+    mod.rs  svc.rs  plugin.rs  status.rs  upgrade.rs
 
   platform/                   L0 平台：宿主资源与 OS 能力
     mod.rs
@@ -258,6 +259,7 @@ src/
 
   selfinstall/                特例：宿主领域（注册服务、PATH、卸载器）
     mod.rs  plan.rs  execute.rs  service_win.rs
+    upgrade.rs               检查更新与替换二进制（#264）；CLI 与 /api/v1/upgrade 共用
 ```
 
 **step 6（#170）已按本树整文件搬迁**：文件进了对应目录但内容没切。`api.rs` 已在 #173 拆完端点、#205 整文件溶解（连接驱动与每连接循环 → `server/http/thread_loop.rs`，装配 → `daemon.rs`，目标树里不再有它）；`platform/storage` 的五文件已在 #175 拆完（`meta` / `path` / `upload` / `part` / `gc`）；`supervise` 的 `model/` 与 `ops/` 已整文件落位（#176）；`check/` 已落 `backoff` / `restart`（#178）、`oneshot`（#191）与 `reconcile` 的纯判定（#192）；`manage` 的 `check/` 与 `ops/` 已整文件落位（#177）；`plugin.rs` 的第一、二切片已落地（扫描 → `manage/ops/scan.rs` #186；布局 → `manage/model/layout.rs`、config → `manage/ops/config.rs` #187；安装生命周期 → `manage/ops/install_plugin.rs` #188；check 段 → `manage/check/plugin.rs` #189；导出与 uninstall → `manage/ops/{export_plugin,uninstall}.rs` #190）；`package.rs` 三段已拆完：清单类型 → `model/manifest.rs`（#181）、tar 编解码 → `model/ustar.rs`（#182）、校验与 manifest 解析 → `check/verify.rs`（#184）、staging 与导出计划 → `ops/{install,export}.rs`（#185）。两个壳已在 #227 溶解：`package.rs` 与 `plugin.rs` 的 54 个测试按被测模块落回 `check/verify.rs` / `ops/install.rs` / `model/ustar.rs` / `ops/scan.rs` / `check/plugin.rs` / `ops/config.rs` / `ops/install_plugin.rs`，共用的包与插件树构造器收进 `manage/test_support.rs`（与 `platform/test_support.rs` 同构），`src/manage/{package,plugin}.rs` 不再存在。`wire/ws/{frame,accept}.rs` 已从 `server/http/wire.rs` 与 `face/uichannel.rs` 收进 L1（#206：帧与握手是字节格式，L4/L5 不再持有）。`selfinstall/` 已拆成 `plan.rs`（纯决定：`InstallPlan` / `SelfInstallPlan` 与五个平台的计划构造）与 `execute.rs`（输入构造、副作用、平台分派），`mod.rs` 只做显式再导出（#207）。装配点也不再是一个文件：#228–#230 把 4543 行的 `daemon.rs` 拆成 `daemon/` 的八个文件，监督逻辑（接管、落盘、重扫、启停、探针、载体选择）进 `supervise/ops`，`daemon/` 只剩装配、控制通道循环、MCP 投影与跨域编排，`dep-lint` V8 守住这条线。

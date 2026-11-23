@@ -5,7 +5,7 @@
 //! shell function, PowerShell function, cmd label or shell `case` branch counts
 //! as an action. Comments are ignored.
 
-use crate::kernel::registry::Restart;
+use super::registry::Restart;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Actions {

@@ -12,15 +12,18 @@
 //   node tools/check.mjs cross [target]   cargo check --target <target> --all-targets
 //   node tools/check.mjs linux [filter]   Windows 宿主：在 WSL2 里跑 Linux 全量（或一个 filter）
 //   node tools/check.mjs test <filter>    cargo test <filter> --no-fail-fast -- --test-threads=1
-//   node tools/check.mjs full             cargo test --no-fail-fast -- --test-threads=1
-//   ... --parallel                        drop `--test-threads=1` (one-off debugging)
+//   node tools/check.mjs full             unit + http parallel; other integration serial
+//   ... --parallel                        drop the serial knob for every target (one-off debugging)
 //
 // `cross` exists because a Windows host never compiles `cfg(unix)` code:
 // a green `quick`/`full` says nothing about the Linux build (#139).
 //
-// The test tiers default to the same knob CI uses (`--test-threads=1`), so a
-// red run means the same thing locally and in CI. Parallel runs share process
-// state and have always needed a human to judge "noise" (#153).
+// Integration tiers keep the same serial knob CI uses (`--test-threads=1`)
+// except the HTTP suite, which is isolated enough to run four-wide (5
+// consecutive green runs). Unit tests have no sandbox and run in parallel:
+// 826 of them shrank from 19 s to 3 s on a 16-core host. The daemon suite
+// still spawns crash loops that share pid assumptions, so it stays serial
+// until it proves order-independence (#153).
 //
 // Every tier has a wall-clock cap: a hung test prints TIMEOUT and the last
 // lines instead of looking like a slow compile. Override with
@@ -38,13 +41,14 @@ const REPO = resolve(HERE, "..");
 const COMPILE_TIMEOUT_MS = Number(process.env.SVCD_CHECK_TIMEOUT_MS) || 10 * 60 * 1000;
 const TEST_TIMEOUT_MS = Number(process.env.SVCD_CHECK_TIMEOUT_MS) || 20 * 60 * 1000;
 
-/// `no-default` 的警告预算，棘轮语义：只许降不许升。两个值都是恢复
-/// `server/auth/lan.rs` 的 `cfg_attr(allow(dead_code))` 之后的实测基线（#194/#201）：
-/// Windows 36、Linux 35（`cfg(unix)` 那半的 dead_code 计数不同）。rustc 升级让计数
-/// 变化时，先跑 `cargo check --no-default-features --message-format short | grep -c ': warning:'`
+/// `no-default` 的警告预算，棘轮语义：只许降不许升。2026-11-24 用 rustc 1.99.1
+/// 重新实测：Windows 45、Linux 44（`cfg(unix)` 那半的 dead_code 计数不同）。
+/// #194/#201 时的 36/35 已随编译器新 lint 失效；要再降就把无 HTTP 时确实不用的
+/// 项按 `cfg_attr(not(feature = "http"), allow(dead_code))` 收窄。rustc 升级让
+/// 计数变化时，先跑 `cargo check --no-default-features --message-format short | grep -c ': warning:'`
 /// 判断新警告是否合理，再改这个数；`SVCD_NO_DEFAULT_BUDGET` 可临时覆盖（调试用）。
 const NO_DEFAULT_WARNING_BUDGET = Number(process.env.SVCD_NO_DEFAULT_BUDGET) ||
-  (process.platform === "win32" ? 36 : 35);
+  (process.platform === "win32" ? 45 : 44);
 
 function cargo(args, timeoutMs) {
   const started = Date.now();
@@ -149,6 +153,30 @@ function summarizeTests(result) {
     console.log("failures:");
     for (const line of failures) console.log("  " + line);
   }
+}
+
+/// Every top-level `tests/*.rs` file is one integration test target. Cargo's
+/// `--tests` also reruns the bin/lib unit harness, so the serial half names
+/// each integration target explicitly instead.
+function integrationTargets() {
+  return readdirSync(join(REPO, "tests"), { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".rs"))
+    .map((entry) => entry.name.slice(0, -3))
+    .sort();
+}
+
+/// Run one cargo test invocation, print its summary and return its exit code.
+/// `full` uses this twice: unit tests run in parallel, integration tests keep
+/// the serial gate. A timeout is 124, matching the other tiers.
+function runTestTier(args) {
+  console.log("check: running cargo " + args.join(" "));
+  const result = cargo(args, TEST_TIMEOUT_MS);
+  if (timedOut(result)) {
+    reportTimeout(result);
+    return 124;
+  }
+  summarizeTests(result);
+  return result.status ?? 1;
 }
 
 const argv = process.argv.slice(2);
@@ -444,16 +472,42 @@ if (tier === "test" || tier === "full") {
   }
   const parallel = rest.includes("--parallel");
   const filter = tier === "test" ? rest.filter((arg) => arg !== "--parallel") : [];
+  if (tier === "full" && !parallel) {
+    // Unit tests are in-process and isolated per root; integration suites
+    // spawn daemons. The HTTP suite uses ephemeral ports and per-sandbox
+    // directories, so it is proven to run four-wide (5 consecutive green
+    // runs, 86 s -> 25 s). The rest stay serial until each one proves the
+    // same; the daemon crash-loop tests still share pid assumptions.
+    const unitThreads = process.env.SVCD_UNIT_THREADS || "8";
+    const unit = runTestTier([
+      "test",
+      "--bin",
+      "svcd",
+      "--no-fail-fast",
+      "--",
+      "--test-threads=" + unitThreads,
+    ]);
+    if (unit !== 0) process.exit(unit);
+    const httpThreads = process.env.SVCD_HTTP_THREADS || "4";
+    const http = runTestTier([
+      "test",
+      "--test",
+      "http",
+      "--no-fail-fast",
+      "--",
+      "--test-threads=" + httpThreads,
+    ]);
+    if (http !== 0) process.exit(http);
+    const integration = ["test", "--no-fail-fast"];
+    for (const target of integrationTargets()) {
+      if (target !== "http") integration.push("--test", target);
+    }
+    integration.push("--", "--test-threads=1");
+    process.exit(runTestTier(integration));
+  }
   const args = ["test", ...filter, "--no-fail-fast"];
   if (!parallel) args.push("--", "--test-threads=1");
-  console.log("check: running cargo " + args.join(" "));
-  const result = cargo(args, TEST_TIMEOUT_MS);
-  if (timedOut(result)) {
-    reportTimeout(result);
-    process.exit(124);
-  }
-  summarizeTests(result);
-  process.exit(result.status ?? 1);
+  process.exit(runTestTier(args));
 }
 
 console.error(

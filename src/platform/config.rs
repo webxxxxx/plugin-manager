@@ -266,7 +266,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let dir = crate::test_support::temp_dir().join(format!(
+        let dir = crate::platform::test_support::temp_dir().join(format!(
             "svcd-config-{}-{}-{}",
             std::process::id(),
             nanos,
@@ -442,7 +442,7 @@ mod tests {
 
     #[test]
     fn ambient_paths_honours_an_explicit_document() {
-        let root = crate::test_support::temp_dir().join(format!(
+        let root = crate::platform::test_support::temp_dir().join(format!(
             "svcd-config-ambient-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn a_missing_explicit_document_is_a_hard_error() {
-        let path = crate::test_support::temp_dir().join("svcd-config-missing.conf");
+        let path = crate::platform::test_support::temp_dir().join("svcd-config-missing.conf");
         let error = Config::bootstrap(Some(&path)).expect_err("missing conf");
         assert!(error.contains("config not found"), "{error}");
     }
