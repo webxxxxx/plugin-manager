@@ -124,7 +124,7 @@ fn console_is_served_precompressed() {
     flate2::read::GzDecoder::new(&page.body[..])
         .read_to_string(&mut decoded)
         .expect("gunzip console");
-    assert_eq!(decoded, include_str!("../../src/assets/index.html"));
+    assert_eq!(decoded, include_str!("../../src/assets/static/index.html"));
     assert!(
         page.body.len() < decoded.len(),
         "gzip must be smaller ({} vs {})",
@@ -139,13 +139,14 @@ fn favicon_is_public_and_cacheable() {
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
 
-    let source = include_bytes!("../../src/assets/favicon.svg");
+    let source = include_bytes!("../../src/assets/static/favicon.svg");
     let icon = raw_request(&address, "GET", "/favicon.svg", "", b"");
     assert_eq!(icon.status, 200);
     assert_eq!(
         raw_header_values(&icon, "content-type"),
         vec!["image/svg+xml"]
     );
+    assert_eq!(raw_header_values(&icon, "content-encoding"), vec!["gzip"]);
     assert_eq!(
         raw_header_values(&icon, "cache-control"),
         vec!["public, max-age=86400"]
@@ -154,11 +155,15 @@ fn favicon_is_public_and_cacheable() {
         raw_header_values(&icon, "x-content-type-options"),
         vec!["nosniff"]
     );
-    assert_eq!(&icon.body[..], &source[..]);
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(&icon.body[..])
+        .read_to_end(&mut decoded)
+        .expect("gunzip favicon");
+    assert_eq!(&decoded[..], &source[..]);
     let etag = raw_header_values(&icon, "etag");
     assert_eq!(etag.len(), 1, "the icon needs one strong validator");
 
-    let length = source.len().to_string();
+    let length = icon.body.len().to_string();
     let head = raw_request(&address, "HEAD", "/favicon.svg", "", b"");
     assert_eq!(head.status, 200);
     assert!(head.body.is_empty(), "HEAD must not carry a body");

@@ -349,6 +349,7 @@
     "src/face/blob_routes.rs": "face",
     "src/face/blob_upload.rs": "face",
     "src/face/catalog.rs": "catalog",
+    "src/face/console.rs": "face",
     "src/face/control.rs": "face",
     "src/face/export.rs": "face",
     "src/face/fallback.rs": "face",
