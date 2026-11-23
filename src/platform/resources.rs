@@ -947,7 +947,7 @@ mod tests {
     #[test]
     fn the_host_reads_this_kernels_memory_facts() {
         let machine = Host;
-        let root = crate::test_support::temp_dir();
+        let root = crate::platform::test_support::temp_dir();
         let profile = probe(
             &machine,
             &ProbePaths::host(&root, &root),
@@ -968,7 +968,7 @@ mod tests {
     #[test]
     fn the_host_reads_this_machines_physical_memory() {
         let machine = Host;
-        let root = crate::test_support::temp_dir();
+        let root = crate::platform::test_support::temp_dir();
         let profile = probe(
             &machine,
             &ProbePaths::host(&root, &root),

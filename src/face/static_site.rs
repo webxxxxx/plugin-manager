@@ -171,7 +171,7 @@ mod tests {
                 NEXT.fetch_add(1, Ordering::Relaxed),
                 nanos
             );
-            let path = crate::test_support::temp_dir().join(name);
+            let path = crate::platform::test_support::temp_dir().join(name);
             fs::create_dir_all(&path).expect("temp dir");
             TempDir(path)
         }

@@ -60,8 +60,6 @@ mod platform;
 mod selfinstall;
 mod server;
 mod supervise;
-#[cfg(test)]
-mod test_support;
 mod upgrade;
 mod wire;
 

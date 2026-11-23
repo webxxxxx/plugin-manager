@@ -516,7 +516,7 @@ mod tests {
                     .duration_since(UNIX_EPOCH)
                     .expect("clock")
                     .as_nanos();
-                let path = crate::test_support::temp_dir().join(format!(
+                let path = crate::platform::test_support::temp_dir().join(format!(
                     "svcd-interpreter-{}-{}-{}",
                     std::process::id(),
                     nanos,
@@ -668,7 +668,7 @@ mod tests {
                     .duration_since(UNIX_EPOCH)
                     .expect("clock")
                     .as_nanos();
-                let path = crate::test_support::temp_dir().join(format!(
+                let path = crate::platform::test_support::temp_dir().join(format!(
                     "svcd-interpreter-win-{}-{}-{}",
                     std::process::id(),
                     nanos,

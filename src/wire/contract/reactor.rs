@@ -740,7 +740,7 @@ mod tests {
         use std::process::{Command, Stdio};
 
         let reactor = Reactor::start().expect("reactor");
-        let root = crate::test_support::temp_dir()
+        let root = crate::platform::test_support::temp_dir()
             .join(format!("svcd-reactor-long-log-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("temp dir");
         let mut limits = crate::platform::limits::test_default();

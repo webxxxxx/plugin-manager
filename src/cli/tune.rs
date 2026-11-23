@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn materialized_roots_probe_data_dir_and_data_temp_for_both_views() {
-        let root = crate::test_support::temp_dir().join(format!(
+        let root = crate::platform::test_support::temp_dir().join(format!(
             "svcd-probe-paths-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

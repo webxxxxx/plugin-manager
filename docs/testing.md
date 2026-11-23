@@ -189,7 +189,7 @@ node tools/perf/run.mjs --scale
 集成测试的 sandbox 根目录在 Windows 使用 Cargo 提供的 `CARGO_TARGET_TMPDIR`（在 `target/tmp`
 下），不再用系统 `%TEMP%`：受限的 TEMP ACL 曾让 `create sandbox` 直接 `PermissionDenied`，target
 目录始终可写。Unix 保持系统临时目录，因为 Unix domain socket 对整条路径有 ~108 字节上限，target 下
-的深路径会直接 `cannot bind control channel`。单测写入临时目录的地方统一走 `src/test_support.rs::temp_dir()`（Windows 下是 `target/<profile>/tmp`，Unix 仍是系统 temp）。四个集成 sandbox（`tests/plugin.rs` / `tests/http.rs` / `tests/mcp.rs` / `tests/daemon.rs`）在 Unix 用
+的深路径会直接 `cannot bind control channel`。单测写入临时目录的地方统一走 `src/platform/test_support.rs::temp_dir()`（Windows 下是 `target/<profile>/tmp`，Unix 仍是系统 temp）。四个集成 sandbox（`tests/plugin.rs` / `tests/http.rs` / `tests/mcp.rs` / `tests/daemon.rs`）在 Unix 用
 符号链接指向多调用二进制（分派只看 argv[0] 的文件名），没有「复制后立即 exec」的 `ETXTBSY` 窗口；
 Windows 保留副本（建符号链接需要权限）。`tests/cli.rs` 对并发的 `ETXTBSY`（复制 multicall 二进制后立即 exec）
 做有限重试；不要把它当成测试失败。运行时记录的单测通过 `runtime::tests::with_root` 注入 root，**不要**再在测试里设

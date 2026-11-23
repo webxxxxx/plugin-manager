@@ -268,7 +268,7 @@ mod tests {
         let config = Config::with_paths(
             crate::platform::settings::Settings::default(),
             None,
-            crate::platform::paths::Paths::under(&crate::test_support::temp_dir()),
+            crate::platform::paths::Paths::under(&crate::platform::test_support::temp_dir()),
         );
         let lan = Arc::new(Mutex::new(Lan::new(
             "127.0.0.1:0".parse().expect("addr"),
@@ -298,7 +298,7 @@ mod tests {
     /// face uses, and both paths carry the projection's whole header set.
     #[test]
     fn the_buffered_asset_path_answers_304_with_the_shared_projection_headers() {
-        let root = crate::test_support::temp_dir().join(format!(
+        let root = crate::platform::test_support::temp_dir().join(format!(
             "svcd-fallback-asset-{}-{}",
             std::process::id(),
             SystemTime::now()

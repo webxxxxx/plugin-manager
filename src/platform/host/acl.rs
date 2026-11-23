@@ -346,7 +346,7 @@ mod tests {
     use super::*;
 
     fn scratch(tag: &str) -> std::path::PathBuf {
-        let dir = crate::test_support::temp_dir().join(format!(
+        let dir = crate::platform::test_support::temp_dir().join(format!(
             "svcd-acl-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

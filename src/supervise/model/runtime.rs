@@ -150,7 +150,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let base = crate::test_support::temp_dir();
+        let base = crate::platform::test_support::temp_dir();
         base.join(format!("svcd-runtime-{}-{}", std::process::id(), nanos))
     }
 

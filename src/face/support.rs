@@ -424,7 +424,7 @@ mod tests {
     fn an_expired_stream_budget_projects_504() {
         use std::os::unix::net::UnixListener;
 
-        let root = crate::test_support::temp_dir().join(format!(
+        let root = crate::platform::test_support::temp_dir().join(format!(
             "svcd-support-budget-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

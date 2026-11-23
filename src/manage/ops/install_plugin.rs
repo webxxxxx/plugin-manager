@@ -527,7 +527,7 @@ mod tests {
 
     #[test]
     fn keep_old_keeps_both_versions_and_replace_drops_the_old_one() {
-        let root = crate::test_support::temp_dir().join(format!(
+        let root = crate::platform::test_support::temp_dir().join(format!(
             "svcd-plugin-layout-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

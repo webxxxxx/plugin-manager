@@ -375,7 +375,7 @@ mod tests {
     /// stream id and the error is a progress event, not an HTTP failure.
     #[test]
     fn an_unreachable_channel_is_reported_as_a_progress_error() {
-        let root = crate::test_support::temp_dir().join(format!(
+        let root = crate::platform::test_support::temp_dir().join(format!(
             "svcd-missing-channel-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
