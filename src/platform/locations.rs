@@ -74,6 +74,22 @@ pub(crate) fn dir_of(paths: &Paths, id: &str) -> PathBuf {
         .join(id)
 }
 
+/// Free bytes on the volume that holds `path`. The directory may not exist yet
+/// (a root that has never been used), so walk up to the nearest ancestor: the
+/// filesystem answers for the mount, not for the leaf.
+pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
+    use crate::platform::resources::{Host, Machine};
+
+    let mut candidate = Some(path);
+    while let Some(directory) = candidate {
+        if directory.is_dir() {
+            return Host.free_disk(directory);
+        }
+        candidate = directory.parent();
+    }
+    None
+}
+
 /// Every plugin id under one root: a directory with a `current` pointer. The
 /// pointer is what makes it an installed plugin rather than a leftover
 /// directory, a staging tree or the operator's notes.
@@ -105,10 +121,9 @@ pub(crate) fn discover(roots: &[PathBuf]) -> Discovery {
             // A root may live on a volume that is not mounted right now. Its
             // plugins keep their index entries; nothing here deletes them.
             if root.exists() {
-                discovery.warnings.push(format!(
-                    "plugin root {} is not a directory",
-                    root.display()
-                ));
+                discovery
+                    .warnings
+                    .push(format!("plugin root {} is not a directory", root.display()));
             }
             continue;
         }
@@ -152,7 +167,8 @@ pub(crate) fn save(paths: &Paths, map: &BTreeMap<String, PathBuf>) -> Result<(),
             .map_err(|error| format!("create {}: {}", parent.display(), error))?;
     }
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(&temporary, &body).map_err(|error| format!("write {}: {}", temporary.display(), error))?;
+    fs::write(&temporary, &body)
+        .map_err(|error| format!("write {}: {}", temporary.display(), error))?;
     fs::rename(&temporary, &path).map_err(|error| {
         let _ = fs::remove_file(&temporary);
         format!("replace {}: {}", path.display(), error)
@@ -187,7 +203,11 @@ fn read(path: &Path) -> (BTreeMap<String, PathBuf>, Vec<String>) {
         Err(error) => {
             return (
                 map,
-                vec![format!("{} is not valid JSON: {}; rebuilding", path.display(), error)],
+                vec![format!(
+                    "{} is not valid JSON: {}; rebuilding",
+                    path.display(),
+                    error
+                )],
             )
         }
     };
@@ -246,8 +266,14 @@ mod tests {
         assert_eq!(
             discovery.found,
             vec![
-                Found { id: "alpha".into(), root: first },
-                Found { id: "beta".into(), root: second },
+                Found {
+                    id: "alpha".into(),
+                    root: first
+                },
+                Found {
+                    id: "beta".into(),
+                    root: second
+                },
             ]
         );
         assert_eq!(discovery.map().len(), 2);
@@ -327,6 +353,10 @@ mod tests {
         let missing = root.0.join("not-mounted/plugins");
         let discovery = discover(&[missing]);
         assert!(discovery.found.is_empty());
-        assert_eq!(discovery.warnings, Vec::<String>::new(), "a missing root is not an error");
+        assert_eq!(
+            discovery.warnings,
+            Vec::<String>::new(),
+            "a missing root is not an error"
+        );
     }
 }

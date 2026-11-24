@@ -90,7 +90,7 @@ pub(super) fn usage() {
     eprintln!("       plugin status [--json] <id>");
     eprintln!("       plugin start|stop|restart <id>");
     eprintln!("       plugin enable|disable <id>");
-    eprintln!("       plugin install <file.spk> [--strategy keep-old|replace] [--allow-hooks] (default: replace)");
+    eprintln!("       plugin install <file.spk> [--strategy keep-old|replace] [--allow-hooks] [--root <dir>] (default: replace, root: smallest that fits)");
     eprintln!("       plugin verify <file.spk> [--json] [--pubkey <pem>]");
     eprintln!("       plugin uninstall <id> [--purge]");
     eprintln!("       plugin editconfig <id> [--print|--file <path>|--reset]");

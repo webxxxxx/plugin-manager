@@ -83,6 +83,9 @@ pub struct Install {
     /// package whose manifest disagrees; a plain install does not read them.
     pub expected_id: Option<String>,
     pub expected_version: Option<String>,
+    /// An explicit install root (`--root` / `?root=`). The daemon checks it
+    /// against `plugins_dir`; `None` lets the size rule decide (ADR-0030).
+    pub root: Option<String>,
 }
 
 /// A parsed tools/call / registry.call.
@@ -250,6 +253,10 @@ fn install(id: Option<Value>, params: &Value, staged: bool) -> Result<Install, r
         allow_hooks,
         expected_id,
         expected_version,
+        root: params
+            .get("root")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 

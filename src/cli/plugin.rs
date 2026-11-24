@@ -85,7 +85,8 @@ mod tests {
             Command::Install {
                 path: PathBuf::from("demo.spk"),
                 strategy: "replace".into(),
-                allow_hooks: false
+                allow_hooks: false,
+                root: None
             }
         );
         assert_eq!(
@@ -108,7 +109,8 @@ mod tests {
             Command::Install {
                 path: PathBuf::from("demo.spk"),
                 strategy: "replace".into(),
-                allow_hooks: false
+                allow_hooks: false,
+                root: None
             }
         );
         assert_eq!(
@@ -116,7 +118,8 @@ mod tests {
             Command::Install {
                 path: PathBuf::from("demo.spk"),
                 strategy: "replace".into(),
-                allow_hooks: true
+                allow_hooks: true,
+                root: None
             }
         );
         assert_eq!(

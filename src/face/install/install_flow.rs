@@ -13,10 +13,13 @@ use crate::platform::config::Config;
 use crate::platform::paths::Paths;
 use crate::server::http::model as http;
 
-use super::{install_staged, staging_path};
+use super::install_staged;
 
 pub(super) struct InstallFlow {
     paths: Arc<Paths>,
+    /// The root the operator asked for (`?root=`), if any. `None` means the
+    /// size rule decides (ADR-0030).
+    requested_root: Option<std::path::PathBuf>,
     limits: Arc<crate::platform::limits::Limits>,
     allow_insecure: bool,
     strategy: String,
@@ -35,9 +38,11 @@ impl InstallFlow {
         strategy: String,
         enable: bool,
         allow_hooks: bool,
+        requested_root: Option<std::path::PathBuf>,
     ) -> InstallFlow {
         InstallFlow {
             paths: config.paths.clone(),
+            requested_root,
             limits: config.limits.clone(),
             allow_insecure: config.settings.allow_insecure_install,
             strategy,
@@ -56,10 +61,10 @@ impl InstallFlow {
     fn installer(&mut self) -> Result<&mut package::StagingInstaller, ProblemError> {
         if self.installer.is_none() {
             self.installer = Some(package::StagingInstaller::new(
-                staging_path(&self.paths),
+                self.paths.as_ref().clone(),
                 self.allow_insecure,
                 self.limits.max_package_bytes,
-                &self.paths.trust_dir,
+                self.requested_root.clone(),
             ));
         }
         Ok(self

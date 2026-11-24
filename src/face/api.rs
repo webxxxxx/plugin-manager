@@ -179,10 +179,7 @@ pub(crate) fn route_defs() -> impl Iterator<Item = &'static crate::face::routes:
 /// Free space on the volume that holds `path`. The directory itself may not
 /// exist yet (a fresh install has no `plugins/`), so walk up to the nearest
 /// ancestor: statvfs answers for the mount, not the leaf.
-fn free_disk_at(
-    host: crate::platform::resources::Host,
-    path: &std::path::Path,
-) -> Option<u64> {
+fn free_disk_at(host: crate::platform::resources::Host, path: &std::path::Path) -> Option<u64> {
     use crate::platform::resources::Machine;
 
     let mut candidate = Some(path);

@@ -27,6 +27,8 @@ pub(super) enum Command {
         path: PathBuf,
         strategy: String,
         allow_hooks: bool,
+        /// An explicit plugin root; must be one listed in `plugins_dir`.
+        root: Option<PathBuf>,
     },
     Verify {
         path: PathBuf,
@@ -97,6 +99,7 @@ pub(super) fn parse(args: &[String]) -> Result<Command, ()> {
             let mut path = None;
             let mut strategy = "replace".to_string();
             let mut allow_hooks = false;
+            let mut root = None;
             let mut index = 1;
             while index < args.len() {
                 let arg = &args[index];
@@ -107,6 +110,11 @@ pub(super) fn parse(args: &[String]) -> Result<Command, ()> {
                     strategy = value.to_string();
                 } else if arg == "--allow-hooks" {
                     allow_hooks = true;
+                } else if arg == "--root" {
+                    index += 1;
+                    root = Some(PathBuf::from(args.get(index).ok_or(())?));
+                } else if let Some(value) = arg.strip_prefix("--root=") {
+                    root = Some(PathBuf::from(value));
                 } else if arg.starts_with('-') || path.is_some() {
                     return Err(());
                 } else {
@@ -121,6 +129,7 @@ pub(super) fn parse(args: &[String]) -> Result<Command, ()> {
                 path,
                 strategy,
                 allow_hooks,
+                root,
             })
             .ok_or(())
         }

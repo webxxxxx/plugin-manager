@@ -237,7 +237,10 @@ mod tests {
         assert_eq!(paths.config_dir, PathBuf::from("/conf-from-file"));
         assert_eq!(paths.data_dir, PathBuf::from("/data-from-file"));
         assert_eq!(paths.logs_dir, PathBuf::from("/logs-from-file"));
-        assert_eq!(paths.plugin_roots, vec![PathBuf::from("/data-from-file/plugins")]);
+        assert_eq!(
+            paths.plugin_roots,
+            vec![PathBuf::from("/data-from-file/plugins")]
+        );
         assert_eq!(paths.run_dir, PathBuf::from("/data-from-file/run"));
         assert_eq!(paths.temp_dir, PathBuf::from("/data-from-file/temp"));
         assert_eq!(paths.trust_dir, PathBuf::from("/conf-from-file/trust.d"));
@@ -373,7 +376,9 @@ mod tests {
         };
         let (_, warnings) = Paths::resolve_reporting(&settings, |_| None);
         assert!(
-            !warnings.iter().any(|warning| warning.contains("will not be discovered")),
+            !warnings
+                .iter()
+                .any(|warning| warning.contains("will not be discovered")),
             "{warnings:?}"
         );
     }

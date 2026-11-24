@@ -206,6 +206,7 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
 - 环境清空后只给 `PATH`、`SVCD_PLUGIN_ID`、`SVCD_PLUGIN_VERSION`、`SVCD_ACTION`、`SVCD_DATA_DIR`、`SVCD_CONFIG_DIR`；Windows 额外给 `SystemRoot` / `WINDIR`（启动 `cmd.exe` 必需）；cwd = 版本目录；stdout/stderr 进 `<logs>/<id>-hooks.log`；60s 超时杀进程组。
 - post-install 失败 → 报错；是否回滚由安装策略决定：replace 走既有回滚，keep-old 保留新旧两个版本（current 已切到新版本）。pre-remove 失败 → 记日志但继续卸载。
 - 嵌入式构建（`--no-default-features`）默认拒绝带 hooks 的包，`plugin install --allow-hooks` / HTTP `allow_hooks=true` 放行；桌面构建（默认 features）默认放行。
+- 多根安装（ADR-0030）：`plugin install --root <dir>` 与 HTTP `?root=` 都是"必须出现在 `plugins_dir` 里"的偏好；不给就按空闲字节升序挑第一个装得下的根。已装插件只在它被记录的根上升级，换根要先 `uninstall`（配置默认保留）。
 - 桌面交互安装应先列出 hooks 再确认（`--yes` 跳过）：**尚未实现**——当前 CLI/HTTP 安装默认放行且没有交互确认步骤。
 - **hooks 权限 = 安装者权限（root）**；信任只来自签名。
 - **实现状态**：hook runner 已实现（`src/hook.rs`）：60s 超时、环境清空、Unix 进程组 / Windows 每 hook job 对象杀进程树、`<id>-hooks.log`；post-install 失败只返回错误，回滚完全由 keep-old / replace 策略处理；pre-remove 失败只记日志。
@@ -280,7 +281,7 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
   - `GET /api/v1/disk[?id=<插件 id>]` → `{roots:[{root,freeBytes,default,plugin}], tempFreeBytes}`：`roots` 是**列表**，每个插件根一行，按优先级排列（`default=true` 是默认安装根）；目录还不存在时向上找最近的存在祖先再取 statvfs（新装没有 `plugins/`），拿不到数字的卷给 `null`。`?id=` 让每行多一个 `plugin` 字段（`{id,version,directory}`，没装为 `null`），调用方据此区分「原地升级」（这个根已经有它）和「新装」（挑一个装得下的根）；id 不合法 400，未知 id 不是错误。多根配置下每行就是一个候选根（ADR-0030）。`tempFreeBytes` 是 `<data>/temp` 的空闲字节，装包要经过它
   - `GET /` → 内嵌 Web 控制台（静态 HTML；页面本身不需要认证，API 调用仍走同一鉴权）
   - `GET /assets/{*path}` → 控制台的其余静态文件（同样免认证；页面只在 `/`）
-  - `POST /api/v1/plugins`：body 为 `.spk` 原始字节（`application/octet-stream`），query `strategy` / `enable` / `allow_hooks`；流式写临时文件，512 MiB 上限；返回 `{id,version,state}`
+  - `POST /api/v1/plugins`：body 为 `.spk` 原始字节（`application/octet-stream`），query `strategy` / `enable` / `allow_hooks` / `root`；流式解包到**选中的插件根**（`root` 显式指定，否则装得下且剩余空间最小的根，ADR-0030），512 MiB 上限；返回 `{id,version,state}`。`root` 不在 `plugins_dir` 里 → 400 并列出可选根；同一 id 已装在别的根 → 409（先卸载）；都装不下 → 500，消息里带每个根的空闲字节
   - `POST /api/v1/plugins/{id}/ui-token`：签发 1 小时、绑定该 plugin id 的 UI token；返回 `{token,url,expiresIn}`，`url` 形如 `/plugin-ui/{id}/{token}/`
   - `GET /api/v1/trust` → `{keys:[keyId], directory}`；`POST /api/v1/trust?key_id=<id>`：body 为 PEM SPKI 公钥，写入 `<config>/trust.d/<id>.pub`；`DELETE /api/v1/trust/{keyId}` 撤销
   - `DELETE /api/v1/plugins/{id}?purge=false`：卸载；`purge=true` 删除版本、配置、状态与 `<id>.log` / `<id>-hooks.log`（含轮转），Web 控制台使用 `purge=true`
