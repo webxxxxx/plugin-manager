@@ -1502,3 +1502,41 @@ fn blob_and_file_complete_share_the_parts_input_table() {
         vec![format!("/api/v1/file/{}", expected).as_str()]
     );
 }
+
+/// ADR-0030: one row per plugin root, in priority order, and the default flag
+/// only on the first. The store picks a, install target from these rows, so a
+/// second root has to appear without a new response shape.
+#[test]
+fn the_disk_route_lists_every_configured_root_in_priority_order() {
+    let mut sandbox = Sandbox::new();
+    let second = sandbox.root.join("sd/plugins");
+    fs::create_dir_all(&second).expect("second root");
+    fs::write(
+        sandbox.config.join("svcd.conf"),
+        format!(
+            "bind = 127.0.0.1:0\nplugins_dir = {},{}\n",
+            second.display(),
+            sandbox.data.join("plugins").display()
+        ),
+    )
+    .expect("write svcd.conf");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let disk = raw_request(&address, "GET", "/api/v1/disk", "", b"");
+    assert_eq!(disk.status, 200, "{:?}", disk.body);
+    let body = json_body(&disk);
+    let roots = body["roots"].as_array().expect("roots list");
+    assert_eq!(roots.len(), 2, "{body}");
+    assert_eq!(
+        roots[0]["root"].as_str().expect("root"),
+        second.display().to_string()
+    );
+    assert_eq!(roots[0]["default"], true);
+    assert_eq!(roots[1]["default"], false);
+    assert!(
+        roots[0]["freeBytes"].as_u64().unwrap_or(0) > 0
+            && roots[1]["freeBytes"].as_u64().unwrap_or(0) > 0,
+        "both roots report bytes: {body}"
+    );
+}

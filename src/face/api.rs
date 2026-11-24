@@ -196,11 +196,13 @@ fn free_disk_at(
 }
 
 /// The rows `GET /api/v1/disk` reports: every place a plugin may live, in
-/// priority order. ADR-0030 turns this into the configured root list; a
-/// single-root install is a one-element list, so the response shape does not
-/// change when that lands.
+/// priority order (`plugin_roots[0]` is the default install root, ADR-0030).
 fn plugin_roots(paths: &crate::platform::paths::Paths) -> Vec<&std::path::Path> {
-    vec![paths.plugins_dir.as_path()]
+    paths
+        .plugin_roots
+        .iter()
+        .map(std::path::PathBuf::as_path)
+        .collect()
 }
 
 /// The installed copy of `id` in one root: a `current` pointer is what makes
