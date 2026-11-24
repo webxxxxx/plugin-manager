@@ -98,7 +98,16 @@ fn commit_staged(
             .map(|path| staged.root.starts_with(path))
             .unwrap_or(false)
     {
-        return Err(Problem::Invalid.error("staging directory is outside the plugin tree"));
+        // The rename that commits a package cannot cross filesystems, so the
+        // staged tree has to sit in the root the plugin lives in. Staging is
+        // created in the default root; a plugin whose recorded root is another
+        // one is refused here instead of being copied across volumes. Choosing
+        // the root before the bytes arrive closes this (#293).
+        return Err(Problem::Invalid.error(format!(
+            "staged tree {} is not in the plugin root {}: a plugin that lives on another root is upgraded there once install chooses its root (#293)",
+            staged.root.display(),
+            staging_root.display()
+        )));
     }
     let version_dir = plugin_dir.join(&staged.manifest.version);
     if version_dir.exists() {
