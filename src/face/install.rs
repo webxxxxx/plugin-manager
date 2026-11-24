@@ -509,6 +509,45 @@ mod tests {
         );
     }
 
+    /// #289: an oversized package is refused before the install flow exists,
+    /// so `InstallFlow::drop` never runs. The drain itself must release the
+    /// blob the store imported for those exact bytes — otherwise the entry
+    /// sits in `<data>/temp` until `temp_retention_secs`.
+    #[test]
+    fn a_refused_oversized_package_releases_the_temp_blob_it_drained() {
+        let config = small_package_config();
+        let body = vec![0xAAu8; 2 * 1024 * 1024];
+        let staged = crate::platform::storage::put(&config.paths, &body).expect("stage the blob");
+        let unrelated =
+            crate::platform::storage::put(&config.paths, b"not this package").expect("other blob");
+        let head = parse_head(
+            format!(
+                "POST /api/v1/plugins HTTP/1.1\r\nHost: x\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let handler = match exchange(&head, &lan(), config.clone()).expect("streamed exchange") {
+            Exchange::Stream(handler) => handler,
+            Exchange::Response(_) => panic!("a package route must stream"),
+        };
+        let (response, reason, consumed) = drive(handler, &body, 64 * 1024);
+        assert_eq!(reason, CloseReason::Completed);
+        assert_eq!(consumed, body.len(), "the refused body must be drained");
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 413 Payload Too Large"), "{text}");
+
+        let staged_path =
+            crate::platform::storage::locate(&config.paths, &staged.id).expect("blob path");
+        assert!(
+            !staged_path.exists(),
+            "the drained package must release its temp blob"
+        );
+        let unrelated_path =
+            crate::platform::storage::locate(&config.paths, &unrelated.id).expect("other path");
+        assert!(unrelated_path.exists(), "another transfer's blob must survive");
+    }
+
     #[test]
     fn a_full_blocking_queue_turns_into_503_busy() {
         let mut handler = stream_handler(
