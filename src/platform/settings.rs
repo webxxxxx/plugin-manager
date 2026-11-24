@@ -643,6 +643,29 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+/// Parse a byte size the way an operator writes it: digits, or a count with a
+/// binary suffix (`K`/`M`/`G`, optionally `iB`), case-insensitive and with or
+/// without a space. The document itself only ever holds digits; this is the
+/// console's convenient form for byte fields (#290).
+pub fn parse_byte_size(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let digits_end = text
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(text.len());
+    if digits_end == 0 {
+        return None;
+    }
+    let count: u64 = text[..digits_end].parse().ok()?;
+    let multiplier = match text[digits_end..].trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    count.checked_mul(multiplier)
+}
+
 fn parse_u64(value: &str, key: &str, index: usize) -> Result<u64, String> {
     value
         .parse::<u64>()
@@ -697,6 +720,19 @@ pub fn update_value(path: &Path, key: &str, value: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_byte_size_accepts_digits_and_binary_suffixes() {
+        assert_eq!(parse_byte_size("33554432"), Some(33_554_432));
+        assert_eq!(parse_byte_size("32 MiB"), Some(33_554_432));
+        assert_eq!(parse_byte_size("32mib"), Some(33_554_432));
+        assert_eq!(parse_byte_size("512 KiB"), Some(524_288));
+        assert_eq!(parse_byte_size("1G"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_byte_size(" 16 M "), Some(16 * 1024 * 1024));
+        for rejected in ["", "MiB", "12 apples", "1.5 MiB", "-1 MiB", "18446744073709551616"] {
+            assert_eq!(parse_byte_size(rejected), None, "{rejected:?}");
+        }
+    }
     use super::*;
 
     #[test]
