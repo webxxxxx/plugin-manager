@@ -36,24 +36,31 @@ fn current_address(sandbox: &Sandbox) -> Option<String> {
 /// Wait until a daemon answers again, identify it by the post-restart state the
 /// caller expects, and return its address. "Some address answers" is not enough:
 /// the old process is still serving while it shuts down, and the OS may hand the
-/// replacement the same ephemeral port.
+/// replacement the same ephemeral port. The probe returns `None` while the
+/// address cannot be reached yet (the old listener is being dropped, which
+/// Windows reports as a refused connect or a reset): that is "not ready", not a
+/// failure, and the deadline bounds the wait (#285).
 fn wait_for_restarted<F>(sandbox: &Sandbox, before: usize, ready: F) -> String
 where
-    F: Fn(&str) -> bool,
+    F: Fn(&str) -> Option<bool>,
 {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut seen = String::from("no address");
     while Instant::now() < deadline {
         if daemon_starts(sandbox) > before {
             if let Some(address) = current_address(sandbox) {
-                if ready(&address) {
-                    return address;
+                match ready(&address) {
+                    Some(true) => return address,
+                    Some(false) => {
+                        let auth = try_request(&address, "GET", "/api/v1/auth", "", b"")
+                            .map(|response| response.body["passwordSet"].clone());
+                        seen = format!(
+                            "{address}: log_level={:?} auth={auth:?}",
+                            try_effective(&address, "log_level")
+                        );
+                    }
+                    None => seen = format!("{address}: not answering yet"),
                 }
-                seen = format!(
-                    "{address}: log_level={} auth={}",
-                    effective(&address, "log_level"),
-                    request(&address, "GET", "/api/v1/auth", "", b"").body["passwordSet"]
-                );
             }
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -65,14 +72,19 @@ where
     );
 }
 
-/// The effective value of one key as the answering daemon reports it.
-fn effective(address: &str, key: &str) -> Value {
-    let settings = request(address, "GET", "/api/v1/settings", "", b"");
-    settings.body["keys"]
-        .as_array()
-        .and_then(|keys| keys.iter().find(|entry| entry["key"] == key))
+/// The effective value of one key, or `None` while the daemon is not reachable:
+/// a restart probe treats "no answer yet" as "not ready", not as a regression.
+fn try_effective(address: &str, key: &str) -> Option<Value> {
+    let settings = try_request(address, "GET", "/api/v1/settings", "", b"").ok()?;
+    key_value(&settings.body, key)
+}
+
+fn key_value(body: &Value, key: &str) -> Option<Value> {
+    body["keys"]
+        .as_array()?
+        .iter()
+        .find(|entry| entry["key"] == key)
         .map(|entry| entry["effective"].clone())
-        .unwrap_or(Value::Null)
 }
 
 #[test]
@@ -111,6 +123,13 @@ fn settings_get_reports_values_sources_and_metadata() {
 
     // An environment override wins over the file and says so.
     assert_eq!(by_key("rescan_interval_ms")["source"], "env");
+    // The http sandbox pins the memory probe (`Sandbox::env`), so the derived
+    // budget — and `max_package_bytes` with it — does not follow the host's
+    // free memory. Removing the pin makes the export-transfer cases 413 on a
+    // loaded host (#285).
+    let probe = by_key("probe_available_memory");
+    assert_eq!(probe["source"], "env");
+    assert_eq!(probe["effective"], json!(8589934592u64));
     // Derived keys have no value of their own but do have a running number.
     let streams = by_key("max_streams");
     assert_eq!(streams["source"], "derived");
@@ -163,7 +182,7 @@ fn a_save_rewrites_only_the_named_key_and_restarts_the_daemon() {
     assert_eq!(text.matches("log_level").count(), 1, "{text}");
 
     let address = wait_for_restarted(&sandbox, before, |address| {
-        effective(address, "log_level") == json!("debug")
+        try_effective(address, "log_level").map(|value| value == json!("debug"))
     });
     let settings = request(&address, "GET", "/api/v1/settings", "", b"");
     let debug = settings.body["keys"]
@@ -281,7 +300,7 @@ fn the_password_can_be_set_and_cleared_over_the_settings_route() {
     sandbox.start_daemon_as_user();
     let address = sandbox.wait_for_http();
 
-    let set = request(
+    let set = request_when_ready(
         &address,
         "PUT",
         "/api/v1/settings",
@@ -296,10 +315,12 @@ fn the_password_can_be_set_and_cleared_over_the_settings_route() {
         "the hash is the only form on disk"
     );
     let address = wait_for_restarted(&sandbox, 1, |address| {
-        request(address, "GET", "/api/v1/auth", "", b"").body["passwordSet"] == json!(true)
+        try_request(address, "GET", "/api/v1/auth", "", b"")
+            .ok()
+            .map(|response| response.body["passwordSet"] == json!(true))
     });
 
-    let cleared = request(
+    let cleared = request_when_ready(
         &address,
         "PUT",
         "/api/v1/settings",
@@ -310,7 +331,9 @@ fn the_password_can_be_set_and_cleared_over_the_settings_route() {
     let text = fs::read_to_string(sandbox.config.join("svcd.conf")).expect("conf");
     assert!(!text.contains("auth_passwd"), "{text}");
     wait_for_restarted(&sandbox, 2, |address| {
-        request(address, "GET", "/api/v1/auth", "", b"").body["passwordSet"] == json!(false)
+        try_request(address, "GET", "/api/v1/auth", "", b"")
+            .ok()
+            .map(|response| response.body["passwordSet"] == json!(false))
     });
 }
 
@@ -334,7 +357,9 @@ fn svcd_restart_replaces_the_user_daemon() {
     );
 
     let address = wait_for_restarted(&sandbox, 1, |address| {
-        request(address, "GET", "/api/v1/version", "", b"").status == 200
+        try_request(address, "GET", "/api/v1/version", "", b"")
+            .ok()
+            .map(|response| response.status == 200)
     });
     let version = request(&address, "GET", "/api/v1/version", "", b"");
     assert_eq!(version.status, 200, "{:?}", version.body);
@@ -385,7 +410,7 @@ fn the_effective_budget_matches_the_running_snapshot() {
     );
     assert_eq!(saved.status, 200, "{:?}", saved.body);
     let address = wait_for_restarted(&sandbox, 1, |address| {
-        effective(address, "mem_budget_bytes").as_u64().unwrap_or(0) > 0
+        try_effective(address, "mem_budget_bytes").map(|value| value.as_u64().unwrap_or(0) > 0)
     });
 
     let settings = request(&address, "GET", "/api/v1/settings", "", b"");

@@ -212,6 +212,15 @@ http 与 daemon 各用 4 线程（都是进程重活：临时端口 + 独立 san
 只有显式 `--parallel` 才让全部集成测试并发，那时执行顺序不由工具承诺。
 `tools/check.mjs --selftest` 会用一个临时 tests 目录证明发现逻辑，并用空目录证明它会红。
 
+http sandbox 在 `Sandbox::env` 里固定 `SVCD_PROBE_AVAILABLE_MEMORY`（8 GiB）：预算与
+`max_package_bytes` 都由 probe 推导，宿主空闲内存掉到 ~1.8 GiB 时 36 MiB 的导出包会被 413
+拒绝（#285）。固定的只是 probe 输入，`mem_budget_bytes` / `mem_budget_percent` 仍由 settings
+用例自己写；`settings_get_reports_values_sources_and_metadata` 断言 probe 的来源是 `env`，
+把这条钉住。重启探针（`settings.rs::wait_for_restarted`）按 `ADMISSION_WAIT` 有界重试连不上
+的连接：旧进程还在关监听时端口文件可能仍指向它，Windows 会报 refused / reset，那属于「还没
+就绪」而不是回归（#285）。`tests/cli.rs` 的 sandbox 同样固定该 probe：`svc config tune`
+打印的文档写回后要再推导一次，两次之间宿主空闲内存变化会让 `mem_budget_bytes` 所在行漂移。
+
 ### 并行档（`--parallel`）的定位
 
 `--parallel` 只用于调试：它去掉 `--test-threads=1`，让同一个 target 的用例并发跑，更容易把

@@ -8,7 +8,7 @@ use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -50,6 +50,13 @@ impl Sandbox {
             .env("SVCD_BIND", "127.0.0.1:0")
             .env("SVCD_BOOT_SCAN_WAIT_MS", "0")
             .env("SVCD_RESCAN_INTERVAL_MS", "0")
+            // The memory budget is derived from the probe, and `max_package_bytes`
+            // follows it: an idle host would accept the 36 MiB export bundle that
+            // a host with ~1.8 GiB free rejects with 413. Pin the probe so the
+            // suite does not change behavior with whatever else the machine is
+            // running. `mem_budget_bytes` / `mem_budget_percent` stay free for
+            // the settings tests; only the probe input is fixed.
+            .env("SVCD_PROBE_AVAILABLE_MEMORY", "8589934592")
             .env("SVCD_TEST_UNPRIVILEGED", "1");
     }
 
@@ -354,6 +361,72 @@ pub(crate) fn request_with(
         status: raw.status,
         body,
         headers: raw.headers,
+    }
+}
+
+/// One exchange over a fresh connection, with transport failures returned as
+/// errors instead of panics. A response is parsed normally: a malformed one is
+/// still a protocol bug, not a transport race.
+pub(crate) fn try_request(
+    address: &str,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Result<Response, String> {
+    let mut stream =
+        TcpStream::connect(address).map_err(|error| format!("connect {address}: {error}"))?;
+    // A daemon that accepts but never answers must not block the retry loop:
+    // the read itself is bounded by the same admission window.
+    stream
+        .set_read_timeout(Some(ADMISSION_WAIT))
+        .map_err(|error| format!("set read timeout on {address}: {error}"))?;
+    let head = request_head(address, method, path, content_type, body.len(), &[]);
+    stream
+        .write_all(head.as_bytes())
+        .map_err(|error| format!("write {method} {path} head: {error}"))?;
+    stream
+        .write_all(body)
+        .map_err(|error| format!("write {method} {path} body: {error}"))?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|error| format!("read {method} {path} response: {error}"))?;
+    let raw = parse_raw_response(response);
+    let body = serde_json::from_slice(&raw.body)
+        .map_err(|error| format!("parse {method} {path} body: {error}"))?;
+    Ok(Response {
+        status: raw.status,
+        body,
+        headers: raw.headers,
+    })
+}
+
+/// A request against a daemon that may still be coming up after a restart.
+///
+/// The port file can still name the old process while its listener is being
+/// dropped, and Windows reports a connect or a dropped response as refused or
+/// reset rather than as a clean close. Retry those against [`ADMISSION_WAIT`],
+/// with no shorter fixed cap. A response — even a 5xx — is final, so a real
+/// routing bug still fails immediately.
+pub(crate) fn request_when_ready(
+    address: &str,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Response {
+    let deadline = Instant::now() + ADMISSION_WAIT;
+    loop {
+        match try_request(address, method, path, content_type, body) {
+            Ok(response) => return response,
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    panic!("{method} {path} never answered on {address}: {error}");
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 

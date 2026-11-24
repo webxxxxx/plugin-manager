@@ -84,6 +84,10 @@ impl Sandbox {
             .env("SVCD_CONFIG_DIR", self.config_dir())
             .env("SVCD_DATA_DIR", self.data_dir())
             .env("SVCD_LOG_DIR", self.logs_dir())
+            // The tune document derives its numbers from the memory probe; pin
+            // it so writing the document back cannot drift when the host's free
+            // memory changes between the two runs (#285).
+            .env("SVCD_PROBE_AVAILABLE_MEMORY", "8589934592")
             .env("SVCD_TEST_UNPRIVILEGED", "1");
         command.output().expect("run alias")
     }
@@ -96,6 +100,7 @@ impl Sandbox {
             .args(args)
             .env("SVCD_CONFIG_DIR", self.config_dir())
             .env("SVCD_LOG_DIR", self.logs_dir())
+            .env("SVCD_PROBE_AVAILABLE_MEMORY", "8589934592")
             .env("SVCD_TEST_UNPRIVILEGED", "1");
         for (key, value) in envs {
             command.env(key, value);
@@ -110,6 +115,7 @@ impl Sandbox {
             .env("SVCD_CONFIG_DIR", self.config_dir())
             .env("SVCD_DATA_DIR", self.data_dir())
             .env("SVCD_LOG_DIR", self.logs_dir())
+            .env("SVCD_PROBE_AVAILABLE_MEMORY", "8589934592")
             .env("SVCD_TEST_UNPRIVILEGED", "1");
         // Parallel tests can briefly hit ETXTBSY while another sandbox copies
         // the multicall binary on a shared filesystem. Retry the exec only.
