@@ -59,6 +59,9 @@ pub enum Command {
     Uninstall {
         service: String,
         purge: bool,
+        /// Forget the record even when the plugin's root is not available
+        /// (`uninstall --force`); the volume is left untouched.
+        force: bool,
     },
     AuthStatus,
     AuthPasswd {
@@ -160,6 +163,10 @@ pub fn parse(request: rpc::Request) -> Result<Call, rpc::Response> {
                 service,
                 purge: params
                     .get("purge")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                force: params
+                    .get("force")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
             }
@@ -402,7 +409,8 @@ mod tests {
             command("plugin.uninstall", json!({"id": "alpha", "purge": true})),
             Command::Uninstall {
                 ref service,
-                purge: true
+                purge: true,
+                force: false
             } if service == "alpha"
         ));
     }

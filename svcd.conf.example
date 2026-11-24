@@ -57,7 +57,9 @@ bind = 127.0.0.1:8787
 # <data_dir>/plugin-locations.json, so an upgrade stays there and
 # uninstall/export/config keep finding it even after this list changes.
 # Duplicates are dropped; an empty entry is an error. A root on another volume
-# is fine, but check that the volume is mounted before the daemon starts.
+# is fine; if its volume is missing when the daemon starts, the plugins recorded
+# there stay recorded and hidden (the boot log names them, `plugin where <id>`
+# shows the root), and they come back when the volume does.
 # plugins_dir = /mnt/sd/svcd/plugins,/var/lib/svcd/plugins
 
 # Removed keys and variables are ignored with a warning that names the derived

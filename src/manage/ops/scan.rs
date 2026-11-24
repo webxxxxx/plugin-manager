@@ -23,12 +23,14 @@ pub fn scan(
     let mut warnings = Vec::new();
     // The roots are the truth and the location index is a hint, so one walk
     // does both: it finds every installed plugin (any root) and leaves the
-    // index agreeing with the disk (ADR-0030). A root that is missing right
-    // now keeps its entries; nothing here deletes what it cannot see.
+    // index agreeing with the disk (ADR-0030). Entries whose root is not
+    // available right now are kept: a pulled card must not uninstall its
+    // plugins by accident.
     let discovery = crate::platform::locations::discover(&paths.plugin_roots);
     warnings.extend(discovery.warnings.iter().cloned());
     warnings.extend(discovery.conflicts.iter().cloned());
-    let found = discovery.map();
+    let found =
+        crate::platform::locations::rebuild(&discovery, crate::platform::locations::load(paths));
     if crate::platform::locations::load(paths) != found {
         if let Err(error) = crate::platform::locations::save(paths, &found) {
             warnings.push(format!("plugin locations: {}", error));

@@ -124,6 +124,21 @@ impl Paths {
                 ));
             }
         }
+        // A plugin root on a volume that is not mounted keeps its index
+        // entries (nobody loses a plugin because a card is out), but those
+        // plugins are hidden from the list. Say which ones, once per boot.
+        let hidden = crate::platform::locations::hidden(&paths);
+        if !hidden.is_empty() {
+            let rows: Vec<String> = hidden
+                .iter()
+                .map(|(id, root)| format!("{} ({})", id, root.display()))
+                .collect();
+            warnings.push(format!(
+                "plugin root not available; {} plugin(s) stay hidden until the volume is back: {}",
+                hidden.len(),
+                rows.join(", ")
+            ));
+        }
         for (variable, actual) in [
             ("SVCD_TEMP_DIR", &paths.temp_dir),
             ("SVCD_RUN_DIR", &paths.run_dir),

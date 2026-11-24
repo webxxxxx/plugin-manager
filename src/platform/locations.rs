@@ -90,6 +90,57 @@ pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
     None
 }
 
+/// Whether a root can be read right now. A root on a volume that was pulled
+/// out looks absent, not empty: that difference is what keeps its index
+/// entries instead of discarding them (see [`rebuild`]).
+pub(crate) fn available(root: &Path) -> bool {
+    root.is_dir()
+}
+
+/// Plugins the index records on roots that are not available right now.
+///
+/// They are not errors: the volume may be a card that is out of its slot, and
+/// the plugin comes back when it returns. Naming them is what lets an operator
+/// tell "hidden because the volume is gone" from "uninstalled".
+pub(crate) fn hidden(paths: &Paths) -> Vec<(String, PathBuf)> {
+    let mut hidden: Vec<(String, PathBuf)> = load(paths)
+        .into_iter()
+        .filter(|(_, root)| !available(root))
+        .collect();
+    hidden.sort();
+    hidden
+}
+
+/// The index after a scan: what the roots show, plus the entries whose root is
+/// not available right now. Deleting those would forget a plugin that still
+/// exists on a card somebody unplugged, so a rebuild only ever adds or
+/// corrects.
+pub(crate) fn rebuild(
+    discovery: &Discovery,
+    recorded: BTreeMap<String, PathBuf>,
+) -> BTreeMap<String, PathBuf> {
+    let mut map = discovery.map();
+    for (id, root) in recorded {
+        if map.contains_key(&id) {
+            continue;
+        }
+        if !available(&root) {
+            map.insert(id, root);
+        }
+    }
+    map
+}
+
+/// Drop one plugin's record without touching any volume (`uninstall --force`
+/// when its root is not available).
+pub(crate) fn forget(paths: &Paths, id: &str) -> Result<(), String> {
+    let mut map = load(paths);
+    if map.remove(id).is_none() {
+        return Ok(());
+    }
+    save(paths, &map)
+}
+
 /// Every plugin id under one root: a directory with a `current` pointer. The
 /// pointer is what makes it an installed plugin rather than a leftover
 /// directory, a staging tree or the operator's notes.
@@ -358,5 +409,56 @@ mod tests {
             Vec::<String>::new(),
             "a missing root is not an error"
         );
+    }
+    /// A pulled card must not uninstall its plugins: the rebuild keeps the
+    /// entries of roots it cannot read, and `hidden` names them.
+    #[test]
+    fn a_rebuild_keeps_entries_whose_root_is_not_available() {
+        let root = TempDir::new();
+        let available = root.0.join("internal/plugins");
+        let pulled = root.0.join("sd/plugins");
+        plugin_dir(&available, "alpha");
+        let paths = paths_with(&root.0, vec![available.clone(), pulled.clone()]);
+        record(&paths, "alpha", &available).expect("record alpha");
+        record(&paths, "beta", &pulled).expect("record beta");
+
+        let discovery = discover(&paths.plugin_roots);
+        let rebuilt = rebuild(&discovery, load(&paths));
+        assert_eq!(rebuilt.get("alpha"), Some(&available));
+        assert_eq!(
+            rebuilt.get("beta"),
+            Some(&pulled),
+            "an entry on a root that is not there stays"
+        );
+        assert_eq!(hidden(&paths), vec![("beta".to_string(), pulled.clone())]);
+    }
+
+    /// The disk still wins for a root that is readable: a plugin directory that
+    /// was deleted without an uninstall leaves no record behind.
+    #[test]
+    fn a_rebuild_drops_an_entry_whose_readable_root_no_longer_has_it() {
+        let root = TempDir::new();
+        let available = root.0.join("internal/plugins");
+        plugin_dir(&available, "alpha");
+        let paths = paths_with(&root.0, vec![available.clone()]);
+        record(&paths, "alpha", &available).expect("record alpha");
+        record(&paths, "ghost", &available).expect("record ghost");
+
+        let rebuilt = rebuild(&discover(&paths.plugin_roots), load(&paths));
+        assert_eq!(rebuilt.get("alpha"), Some(&available));
+        assert_eq!(rebuilt.get("ghost"), None);
+        assert!(hidden(&paths).is_empty());
+    }
+
+    #[test]
+    fn forget_drops_one_record_and_keeps_the_rest() {
+        let root = TempDir::new();
+        let paths = paths_with(&root.0, vec![root.0.join("a")]);
+        record(&paths, "alpha", &root.0.join("a")).expect("record");
+        record(&paths, "beta", &root.0.join("a")).expect("record");
+        forget(&paths, "alpha").expect("forget");
+        assert_eq!(root_of(&paths, "alpha"), None);
+        assert_eq!(root_of(&paths, "beta"), Some(root.0.join("a")));
+        forget(&paths, "alpha").expect("a second forget is a no-op");
     }
 }

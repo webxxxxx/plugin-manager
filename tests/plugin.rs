@@ -1953,3 +1953,97 @@ fn an_explicit_root_installs_there_and_an_upgrade_stays_on_the_recorded_root() {
     assert!(message.contains("installed in"), "{message}");
     assert!(!default_root.join("demo").exists(), "nothing was written");
 }
+
+/// #294 / ADR-0030: when a plugin's volume is out, the record survives, `where`
+/// says which root it wants, an uninstall refuses to guess, and `--force`
+/// forgets only the record — the files come back with the card.
+#[test]
+fn an_unavailable_root_is_reported_and_force_only_forgets_the_record() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[5u8; 32]);
+    sandbox.write_key(&key);
+    let package = sandbox.write_package("demo-1.0.0.spk", &package(&key, "1.0.0"));
+    let second = sandbox.root.join("sd").join("plugins");
+    fs::create_dir_all(&second).expect("second root");
+    fs::write(
+        sandbox.config.join("svcd.conf"),
+        format!(
+            "bind = 127.0.0.1:0\nplugins_dir = {},{}\n",
+            sandbox.data.join("plugins").display(),
+            second.display()
+        ),
+    )
+    .expect("write svcd.conf");
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    let installed = sandbox.run_plugin(&[
+        "install",
+        package.to_str().expect("utf8"),
+        "--root",
+        second.to_str().expect("utf8"),
+    ]);
+    assert_eq!(
+        installed.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&installed)
+    );
+
+    // The card comes out: the root is gone when the daemon boots.
+    let pulled = sandbox.root.join("sd-pulled");
+    fs::rename(&second, &pulled).expect("pull the card");
+    sandbox.shutdown();
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+
+    let where_is = sandbox.run_plugin(&["where", "demo", "--json"]);
+    let value = json(&where_is);
+    assert_eq!(value["root"], json!(second.display().to_string()));
+    assert_eq!(value["available"], false, "{value}");
+    assert_eq!(value["installed"], true, "{value}");
+    let log = sandbox.daemon_log();
+    assert!(
+        log.contains("stay hidden"),
+        "the boot must say which plugins are hidden: {log}"
+    );
+
+    let listed = sandbox.run_plugin(&["list"]);
+    assert!(
+        !String::from_utf8_lossy(&listed.stdout).contains("demo"),
+        "a plugin on a missing root is not listed"
+    );
+
+    let refused = sandbox.run_plugin(&["uninstall", "demo"]);
+    assert_ne!(
+        refused.status.code(),
+        Some(0),
+        "uninstalling a missing root"
+    );
+    let message = stderr(&refused);
+    assert!(message.contains("not available"), "{message}");
+    assert!(message.contains("--force"), "{message}");
+
+    let forced = sandbox.run_plugin(&["uninstall", "demo", "--force"]);
+    assert_eq!(forced.status.code(), Some(0), "stderr: {}", stderr(&forced));
+    assert!(
+        pulled.join("demo/current").is_file(),
+        "force must not touch the volume"
+    );
+    assert_eq!(
+        sandbox.run_plugin(&["where", "demo"]).status.code(),
+        Some(1),
+        "the record is gone"
+    );
+
+    // Plug it back in: the scan finds the plugin again on the volume.
+    fs::rename(&pulled, &second).expect("plug the card back");
+    sandbox.shutdown();
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    let listed = sandbox.run_plugin(&["list"]);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("demo"),
+        "the plugin is discovered again once the root returns: {}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+}

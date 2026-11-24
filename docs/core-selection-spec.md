@@ -284,11 +284,11 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
   - `POST /api/v1/plugins`：body 为 `.spk` 原始字节（`application/octet-stream`），query `strategy` / `enable` / `allow_hooks` / `root`；流式解包到**选中的插件根**（`root` 显式指定，否则装得下且剩余空间最小的根，ADR-0030），512 MiB 上限；返回 `{id,version,state}`。`root` 不在 `plugins_dir` 里 → 400 并列出可选根；同一 id 已装在别的根 → 409（先卸载）；都装不下 → 500，消息里带每个根的空闲字节
   - `POST /api/v1/plugins/{id}/ui-token`：签发 1 小时、绑定该 plugin id 的 UI token；返回 `{token,url,expiresIn}`，`url` 形如 `/plugin-ui/{id}/{token}/`
   - `GET /api/v1/trust` → `{keys:[keyId], directory}`；`POST /api/v1/trust?key_id=<id>`：body 为 PEM SPKI 公钥，写入 `<config>/trust.d/<id>.pub`；`DELETE /api/v1/trust/{keyId}` 撤销
-  - `DELETE /api/v1/plugins/{id}?purge=false`：卸载；`purge=true` 删除版本、配置、状态与 `<id>.log` / `<id>-hooks.log`（含轮转），Web 控制台使用 `purge=true`
+  - `DELETE /api/v1/plugins/{id}?purge=false&force=false`：卸载；`purge=true` 删除版本、配置、状态与 `<id>.log` / `<id>-hooks.log`（含轮转），Web 控制台使用 `purge=true`。插件所在的根不可用（SD 卡拔了）时返回 409 并带上该路径与 `--force` 提示；`force=true` 只删位置索引里的那条记录、不碰任何卷，审计日志写明
   - `DELETE /api/v1/blobs/{id}` / `DELETE /api/v1/file/{id}`：立刻释放一个传输产物（单个 blob，或整包 `files/<id>` 的清单与分片），返回 `{removed:true}`；本来就不存在返回 404。商店在浏览器取完包字节后调用它，把一次安装的磁盘峰值压到**一份包**；不定时依赖 `temp_retention_secs`
   - `POST /api/v1/import?config_id=<id>&no_config=false&force=false`：body 为 `.spk` / `.spkb` / 裸配置，自动识别，语义同 CLI
-  - `GET /api/v1/export/{id}/spk`：从已安装版本重建的可安装、已签名 `.spk`（`application/octet-stream`；Web 控制台“导出”使用它）
-  - `GET /api/v1/export/{id}`：整包 `.spkb` 备份容器（`backup.json` + `plugin.spk` + 配置；供备份/导入）
+  - `GET /api/v1/export/{id}/spk`：从已安装版本重建的可安装、已签名 `.spk`（`application/octet-stream`；Web 控制台“导出”使用它）。根不可用时 409 `root_unavailable`（带路径），不是 404——插件在，只是它的卷不在
+  - `GET /api/v1/export/{id}`：整包 `.spkb` 备份容器（`backup.json` + `plugin.spk` + 配置；供备份/导入）；根不可用同样 409 `root_unavailable`
   - `GET /api/v1/export/{id}/config`：单配置
   - `GET /api/v1/config/{id}`：活动配置原始字节（`text/plain`；无配置 404）
   - `PUT /api/v1/config/{id}`：body 为候选配置；跑 `configCheck`，原子替换，保留 last-good；校验失败 409
@@ -349,7 +349,7 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
 
 - `svcd`：守护进程；`svcd run --foreground`、`svcd install-service / uninstall-service`、`svcd --install [--conf <file>] / --uninstall`。
 - `svc`：服务 CLI，接受任意服务 id（core 或 plugin）：`list / status / start / stop / enable / disable / logs / lan / version`。
-- `plugin`：插件 CLI，**只接受 `kind=plugin` 的 id**；动词与 `svc` 同源，另加 `install / uninstall / editconfig / export / import`。传 core 服务 id 报错「不是插件」。
+- `plugin`：插件 CLI，**只接受 `kind=plugin` 的 id**；动词与 `svc` 同源，另加 `install / uninstall / editconfig / export / import / where`。传 core 服务 id 报错「不是插件」。`plugin where <id>` 读位置索引回答「在哪个根、那卷在不在」（不依赖守护进程）；`plugin uninstall --force` 在根不可用时只删记录、不碰卷。
 - `mcp`：stdio MCP 桥，每个客户端一个进程。
 - `svc ui`：桌面 GUI 入口，客户端；关窗不退 svcd。
 

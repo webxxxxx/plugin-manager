@@ -92,7 +92,8 @@ pub(super) fn usage() {
     eprintln!("       plugin enable|disable <id>");
     eprintln!("       plugin install <file.spk> [--strategy keep-old|replace] [--allow-hooks] [--root <dir>] (default: replace, root: smallest that fits)");
     eprintln!("       plugin verify <file.spk> [--json] [--pubkey <pem>]");
-    eprintln!("       plugin uninstall <id> [--purge]");
+    eprintln!("       plugin uninstall <id> [--purge] [--force]");
+    eprintln!("       plugin where <id> [--json]");
     eprintln!("       plugin editconfig <id> [--print|--file <path>|--reset]");
     eprintln!("       plugin export <id> [--config-only] [--out <path>]");
     eprintln!("       plugin import <file> [--config <id>] [--no-config] [--force]");
