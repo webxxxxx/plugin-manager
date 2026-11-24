@@ -112,8 +112,25 @@ pub(crate) fn default_logs_dir() -> PathBuf {
     }
 }
 
-#[cfg(target_os = "windows")]
+/// The machine-wide config directory.
+///
+/// A debug build can point it at a sandbox with
+/// `SVCD_TEST_SYSTEM_CONFIG_DIR`: an install test that starts *without* a
+/// document must not depend on the host never having been installed, and the
+/// real `/etc/svcd` / `%ProgramData%\svcd\config` is not ours to touch
+/// (docs/testing.md §6).
 pub(crate) fn platform_config_dir() -> PathBuf {
+    #[cfg(debug_assertions)]
+    {
+        if let Some(dir) = std::env::var_os("SVCD_TEST_SYSTEM_CONFIG_DIR") {
+            return PathBuf::from(dir);
+        }
+    }
+    system_config_dir()
+}
+
+#[cfg(target_os = "windows")]
+fn system_config_dir() -> PathBuf {
     // System mode is machine-wide: the SCM service runs as LocalSystem, whose
     // `%USERPROFILE%` is a different, ACL-private profile from the admin's.
     // A per-profile config path would give the service and the elevated CLI
@@ -126,12 +143,12 @@ pub(crate) fn platform_config_dir() -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn platform_config_dir() -> PathBuf {
+fn system_config_dir() -> PathBuf {
     PathBuf::from("/Library/Application Support/svcd/config")
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-pub(crate) fn platform_config_dir() -> PathBuf {
+fn system_config_dir() -> PathBuf {
     PathBuf::from("/etc/svcd")
 }
 

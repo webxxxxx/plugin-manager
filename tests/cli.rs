@@ -605,7 +605,16 @@ fn status_resources_reports_the_last_start_and_falls_back_without_one() {
         assert!(text.contains(needle), "missing {needle} in:\n{text}");
     }
 
-    let plain = sandbox.run_env(&["status", "--resources"], &[]);
+    // Without a snapshot the command still answers and says where the numbers
+    // came from. This sandbox runs in system mode, so the machine-wide data dir
+    // is not ours to assume empty: a host that really runs svcd leaves
+    // `run/resources/startup.json` there and the answer becomes "last start".
+    // An empty sandbox data dir is the same "no snapshot yet" state without
+    // depending on the host.
+    let empty = sandbox.root.join("empty-data");
+    fs::create_dir_all(&empty).expect("empty data dir");
+    let plain = sandbox.run_env(&["status", "--resources"], &[("SVCD_DATA_DIR", &empty)]);
+    assert_eq!(plain.status.code(), Some(0), "{}", stderr(&plain));
     assert!(
         stdout(&plain).contains("this process"),
         "without a snapshot the source must say so:\n{}",
