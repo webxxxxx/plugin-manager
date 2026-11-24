@@ -89,7 +89,7 @@ impl ExportStream {
     pub fn open(target: ExportTarget, paths: Arc<Paths>) -> ExportStream {
         let id = target.id();
         // Validate before touching the filesystem: plugin_dir joins the id.
-        let version = if package::valid_id(id) {
+        let version = if crate::kernel::registry::valid_id(id) {
             plugin::current_version(&paths, id)
         } else {
             None
@@ -155,7 +155,7 @@ impl ExportStream {
             return;
         };
         let id = target.id().to_string();
-        let version_dir = plugin::plugin_dir(&self.paths, &id).join(&version);
+        let version_dir = crate::kernel::layout::plugin_dir(&self.paths, &id).join(&version);
         let extension = match &target {
             ExportTarget::Spk { .. } => "spk",
             ExportTarget::Spkb { .. } => "spkb",
@@ -510,7 +510,6 @@ mod tests {
             "the plugin.spk entry is the signed package of the current version"
         );
         assert_eq!(entries[2].data, config);
-        assert_eq!(entries[2].mode, 0o600, "the config keeps its private mode");
     }
 
     #[test]

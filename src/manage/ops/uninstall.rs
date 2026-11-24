@@ -3,12 +3,10 @@ use std::fs;
 use std::time::Duration;
 
 use crate::kernel::failure::{Problem, ProblemError};
+use crate::kernel::hook::{HookSpec, Hooks, TIMEOUT_MS};
+use crate::kernel::layout::plugin_dir;
 use crate::kernel::registry::RESERVED_ID;
-use crate::manage as package;
-use crate::manage::model::layout::{current_version, plugin_dir};
 use crate::manage::ops::export_plugin::remove_versions;
-use crate::manage::ops::hook;
-use crate::manage::ops::scan::read_manifest;
 use crate::platform::paths::Paths;
 
 /// Remove the service and install-hook logs for a purged plugin. The slot is
@@ -38,19 +36,18 @@ pub fn remove_logs(paths: &Paths, id: &str) {
 
 pub fn uninstall(
     paths: &Paths,
-    limits: &crate::platform::limits::Limits,
     id: &str,
     purge: bool,
-    poll: &mut dyn FnMut(),
+    hooks: &mut dyn Hooks,
 ) -> Result<(), ProblemError> {
-    if !package::valid_id(id) || id == RESERVED_ID {
+    if !crate::kernel::registry::valid_id(id) || id == RESERVED_ID {
         return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
     }
     let directory = plugin_dir(paths, id);
     if !directory.is_dir() {
         return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
     }
-    run_pre_remove(paths, limits, id, poll);
+    run_pre_remove(paths, id, hooks);
     if purge {
         fs::remove_dir_all(&directory).map_err(|error| {
             Problem::Internal.error(format!("remove {}: {}", directory.display(), error))
@@ -76,19 +73,14 @@ pub fn uninstall(
     Ok(())
 }
 
-/// A failing pre-remove hook must not block uninstall; the spec only requires a
-/// log line so a broken package can still be removed.
-fn run_pre_remove(
-    paths: &Paths,
-    limits: &crate::platform::limits::Limits,
-    id: &str,
-    poll: &mut dyn FnMut(),
-) {
-    let Some(version) = current_version(paths, id) else {
+/// A failing pre-remove hook must not block uninstall; the contract only
+/// requires a log line so a broken package can still be removed.
+fn run_pre_remove(paths: &Paths, id: &str, hooks: &mut dyn Hooks) {
+    let Some(version) = crate::manage::current_version(paths, id) else {
         return;
     };
     let version_dir = plugin_dir(paths, id).join(&version);
-    let manifest = match read_manifest(&version_dir) {
+    let manifest = match crate::manage::ops::scan::read_manifest(&version_dir) {
         Ok(manifest) => manifest,
         Err(error) => {
             warn!("plugin {}: skipped pre-remove hook: {}", id, error);
@@ -102,20 +94,14 @@ fn run_pre_remove(
     else {
         return;
     };
-    let result = hook::run(
-        &hook::Invocation {
-            id,
-            version: &version,
-            action: "pre-remove",
-            version_dir: &version_dir,
-            path,
-            timeout_ms: hook::TIMEOUT_MS,
-        },
-        paths,
-        limits,
-        poll,
-    );
-    if let Err(error) = result {
+    if let Err(error) = hooks.run(&HookSpec {
+        id,
+        version: &version,
+        action: "pre-remove",
+        version_dir: &version_dir,
+        path,
+        timeout_ms: TIMEOUT_MS,
+    }) {
         warn!(
             "plugin {}: pre-remove hook failed; continuing uninstall: {}",
             id, error

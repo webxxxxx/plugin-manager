@@ -13,34 +13,25 @@ mod support;
 use support::target;
 
 struct Sandbox {
-    root: PathBuf,
-    config: PathBuf,
-    data: PathBuf,
-    logs: PathBuf,
-    trust: PathBuf,
-    svcd: PathBuf,
-    svc: PathBuf,
-    plugin: PathBuf,
+    dirs: support::SandboxDirs,
     daemon: Option<Child>,
-    daemon_stderr: PathBuf,
     /// Overridable so the bounded-wait test does not spend the production bound.
     stop_timeout: Duration,
 }
 
+impl std::ops::Deref for Sandbox {
+    type Target = support::SandboxDirs;
+
+    fn deref(&self) -> &Self::Target {
+        &self.dirs
+    }
+}
+
 impl Sandbox {
     fn new() -> Self {
-        let dirs = support::sandbox_dirs("plugin");
         Sandbox {
-            root: dirs.root,
-            config: dirs.config,
-            data: dirs.data,
-            logs: dirs.logs,
-            trust: dirs.trust,
-            svcd: dirs.svcd,
-            svc: dirs.svc,
-            plugin: dirs.plugin,
+            dirs: support::sandbox_dirs("plugin"),
             daemon: None,
-            daemon_stderr: dirs.daemon_stderr,
             stop_timeout: support::STOP_TIMEOUT,
         }
     }

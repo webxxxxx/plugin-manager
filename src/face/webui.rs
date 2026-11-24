@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::manage as package;
 use crate::wire::message::rpc;
 
 /// The page-facing JSON-RPC bridge for `/plugin-ui/{id}/rpc`.
@@ -97,7 +96,7 @@ pub fn relative_path(subpath: &str, entry: &str) -> Option<String> {
             return entry_path(entry);
         }
     }
-    package::check_path(path).ok()?;
+    crate::kernel::layout::check_path(path).ok()?;
     if directory {
         Some(format!("{}/index.html", path))
     } else {
@@ -341,7 +340,7 @@ pub(crate) fn inject_base_prefix<R: Read + Seek>(
 }
 
 fn entry_path(entry: &str) -> Option<String> {
-    package::check_path(entry).ok()?;
+    crate::kernel::layout::check_path(entry).ok()?;
     Some(entry.to_string())
 }
 

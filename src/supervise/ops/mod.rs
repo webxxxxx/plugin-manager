@@ -2,6 +2,7 @@
 
 pub mod builtin_adapter;
 pub mod factory;
+pub mod hook;
 pub mod host;
 pub mod invoke;
 pub mod lifecycle;

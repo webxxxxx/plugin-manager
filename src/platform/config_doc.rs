@@ -11,6 +11,7 @@
 //! 表格里给的是「参照预算下的期望值」（tiny@128 MiB / interactive@512 MiB /
 //! streaming@2 GiB），与 `limits/specs.rs` 的标定值一致。
 
+#![cfg_attr(not(feature = "http"), allow(dead_code))]
 // 生产代码里今天只有测试守卫在读这张表；控制台设置表单（#263）落地后删掉这条
 // allow，让编译器继续盯着「谁在用」。
 

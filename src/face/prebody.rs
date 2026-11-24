@@ -3,7 +3,6 @@
 //! server 的 poll loop 持有 [`PreBodyRoutes`] trait object，所以 trait 由
 //! `server/http` 定义、face 实现、compose 构造。
 
-use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
 use crate::face::routes::{self, Endpoint};
@@ -52,14 +51,12 @@ impl PreBodyFaces {
     fn plugin_ui(
         &self,
         head: &http::Head,
-        peer: IpAddr,
         lan: &Arc<Mutex<Lan>>,
         raw_hub: Arc<crate::wire::contract::rawhub::RawHub>,
     ) -> Option<Result<crate::server::http::Exchange, Vec<u8>>> {
         crate::face::plugin_ui::PluginUiFace::route_for(&head.method, &head.path)?;
         Some(crate::face::plugin_ui::PluginUiFace::exchange(
             head,
-            peer,
             lan,
             self.config.clone(),
             Some(raw_hub),
@@ -132,7 +129,6 @@ impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
     fn claim(
         &self,
         head: &http::Head,
-        peer: IpAddr,
         lan: &Arc<Mutex<Lan>>,
         raw_hub: Arc<crate::wire::contract::rawhub::RawHub>,
     ) -> Option<crate::server::http::hooks::PreBodyClaim> {
@@ -141,7 +137,7 @@ impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
         if let Some(exchange) = self.static_site(head, lan) {
             return Some(crate::server::http::hooks::PreBodyClaim { exchange });
         }
-        if let Some(exchange) = self.plugin_ui(head, peer, lan, raw_hub) {
+        if let Some(exchange) = self.plugin_ui(head, lan, raw_hub) {
             return Some(crate::server::http::hooks::PreBodyClaim { exchange });
         }
         if let Some(exchange) = self.package_upload(head, lan) {
@@ -192,7 +188,6 @@ impl crate::server::http::hooks::PreBodyRoutes for PreBodyFaces {
 
 #[cfg(test)]
 mod tests {
-    use std::net::IpAddr;
     use std::sync::{Arc, Mutex};
 
     use crate::face::uichannel::EventBus;
@@ -245,7 +240,6 @@ mod tests {
         let faces = faces();
         let lan = lan();
         let raw = RawHub::new(faces.config.limits.clone());
-        let peer: IpAddr = "127.0.0.1".parse().expect("peer");
 
         for (method, path) in [
             ("GET", "/plugin-ui/demo/"),
@@ -254,12 +248,12 @@ mod tests {
             ("POST", "/api/v1/blobs"),
         ] {
             faces
-                .claim(&head(method, path), peer, &lan, raw.clone())
+                .claim(&head(method, path), &lan, raw.clone())
                 .unwrap_or_else(|| panic!("{method} {path} must be claimed"));
         }
 
         assert!(faces
-            .claim(&head("GET", "/api/v1/version"), peer, &lan, raw)
+            .claim(&head("GET", "/api/v1/version"), &lan, raw)
             .is_none());
     }
 }

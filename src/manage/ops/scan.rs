@@ -5,13 +5,14 @@ use std::path::Path;
 
 use crate::kernel::contract::{Capability as KernelCapability, CapabilityName, Effect};
 use crate::kernel::failure::{Problem, ProblemError};
+use crate::kernel::layout::plugin_dir;
 use crate::kernel::registry::{
     Exec, Hook, Interpreter, Kind, Lifecycle, Ready, Restart, Service, State, RESERVED_ID,
 };
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::manage as package;
 use crate::manage::check::interpreter;
-use crate::manage::{current_version, plugin_dir};
+use crate::manage::current_version;
 use crate::platform::paths::Paths;
 
 pub fn scan(
@@ -33,7 +34,7 @@ pub fn scan(
 
     for entry in entries.flatten() {
         let id = entry.file_name().to_string_lossy().to_string();
-        if !package::valid_id(&id) || id == RESERVED_ID {
+        if !crate::kernel::registry::valid_id(&id) || id == RESERVED_ID {
             warnings.push(format!("ignoring plugin directory {}", id));
             continue;
         }
@@ -109,7 +110,7 @@ pub(crate) fn service_from_manifest(
             crate::platform::target()
         )));
     }
-    package::check_path(&manifest.exec.path)?;
+    crate::kernel::layout::check_path(&manifest.exec.path)?;
     let exec_path = version_dir.join(&manifest.exec.path);
     if !exec_path.is_file() {
         return Err(Problem::Invalid.error(format!("exec is missing: {}", exec_path.display())));

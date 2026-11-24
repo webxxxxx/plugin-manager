@@ -194,18 +194,20 @@ src/
     failure.rs                  失败类别 + 可重试性 + 汇合聚合
     projection.rs               状态与运行面 → 各对外面的唯一来源（值投影；协议投影在面）
     script.rs                   脚本动作与重启策略的文本判定（manage 与 supervise 共用）
+    layout.rs                   插件目录与 manifest 路径规则（manage 与 supervise 共用）
+    hook.rs                     hook 端口：manage 声明、supervise 执行
 
   manage/                     L3 领域·管理
     mod.rs                      唯一对外接口
     model/  manifest.rs  ustar.rs  layout.rs  hooks.rs
     check/  verify.rs  trust.rs  compat.rs  interpreter.rs
-    ops/    install.rs  uninstall.rs  import.rs  export.rs  bundle.rs  scan.rs  hook.rs
+    ops/    install.rs  uninstall.rs  import.rs  export.rs  bundle.rs  scan.rs
 
   supervise/                  L3 领域·监督
     mod.rs
     model/  entry.rs  machine.rs  record.rs  definition.rs
     check/  restart.rs  backoff.rs  oneshot.rs  reconcile.rs
-    ops/    host.rs  lifecycle.rs  rescan.rs  probe.rs  invoke.rs  factory.rs  slot.rs  restart.rs
+    ops/    host.rs  lifecycle.rs  rescan.rs  probe.rs  invoke.rs  factory.rs  slot.rs  hook.rs  restart.rs
 
   orchestrate/                L3 领域·编排（第一个文件出现时才创建）
     model/  step.rs  flow.rs  trigger.rs  fanin.rs
@@ -249,7 +251,7 @@ src/
     install/         upload.rs  install_flow.rs  import_flow.rs  backup.rs（#235）
 
   cli/                        L5 对外面：命令行
-    mod.rs  svc.rs  plugin.rs  status.rs  upgrade.rs
+    mod.rs  svc.rs  plugin.rs  status.rs  upgrade.rs  svcd.rs
 
   platform/                   L0 平台：宿主资源与 OS 能力
     mod.rs

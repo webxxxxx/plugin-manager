@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+use crate::kernel::layout::plugin_dir;
 #[cfg(feature = "http")]
 use crate::manage::ops::scan::read_manifest;
 use crate::platform::paths::Paths;
@@ -15,10 +16,6 @@ pub struct WebAssets {
     pub root: PathBuf,
     /// Entry file relative to `root`; defaults to `index.html`.
     pub entry: String,
-}
-
-pub fn plugin_dir(paths: &Paths, id: &str) -> PathBuf {
-    paths.plugins_dir.join(id)
 }
 
 pub fn current_version(paths: &Paths, id: &str) -> Option<String> {

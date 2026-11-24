@@ -8,7 +8,6 @@
 
 use crate::face::plugin_streams::{self, StreamContext};
 use crate::face::webui;
-use crate::manage as package;
 use crate::manage as plugin;
 use crate::platform::config::Config;
 use crate::platform::paths::Paths;
@@ -19,7 +18,6 @@ use crate::server::http::{
 };
 #[cfg(test)]
 use std::fs;
-use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
 /// One parsed `/plugin-ui/{id}/{token}/...` path.
@@ -83,7 +81,7 @@ fn unknown_ui() -> Vec<u8> {
 /// `web_assets`; the slashless redirect, the static faces and the realtime
 /// admission all ask this question here.
 pub(crate) fn web_assets_for(paths: &Paths, id: &str) -> Option<plugin::WebAssets> {
-    if !package::valid_id(id) {
+    if !crate::kernel::registry::valid_id(id) {
         return None;
     }
     plugin::web_assets(paths, id)
@@ -98,7 +96,7 @@ pub(crate) fn static_assets(
     ui: &UiPath<'_>,
 ) -> Result<plugin::WebAssets, Vec<u8>> {
     let Some(assets) = web_assets_for(paths, ui.id) else {
-        if package::valid_id(ui.id) {
+        if crate::kernel::registry::valid_id(ui.id) {
             return Err(http::json_error(
                 404,
                 "not_found",
@@ -123,7 +121,7 @@ pub(crate) fn valid_ui(
         web_assets_for(paths, ui.id).ok_or_else(unknown_ui)?;
         return Ok(());
     }
-    if !package::valid_id(ui.id) {
+    if !crate::kernel::registry::valid_id(ui.id) {
         return Err(unknown_ui());
     }
     Ok(())
@@ -192,7 +190,6 @@ impl PluginUiFace {
     /// one implementation; the caller owns the socket.
     pub(crate) fn exchange(
         head: &http::Head,
-        _peer: IpAddr,
         lan: &Arc<Mutex<Lan>>,
         config: Arc<Config>,
         raw_hub: Option<Arc<crate::wire::contract::rawhub::RawHub>>,

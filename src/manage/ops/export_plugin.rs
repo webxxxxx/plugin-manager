@@ -3,8 +3,9 @@ use std::fs;
 use std::path::Path;
 
 use crate::kernel::failure::{Problem, ProblemError};
+use crate::kernel::layout::plugin_dir;
 use crate::manage as package;
-use crate::manage::model::layout::{active_config, current_version, plugin_dir};
+use crate::manage::model::layout::{active_config, current_version};
 use crate::platform::paths::Paths;
 
 pub fn export_config(paths: &Paths, id: &str) -> Result<(String, Vec<u8>), ProblemError> {

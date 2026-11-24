@@ -11,6 +11,7 @@ use base64::Engine;
 use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::kernel::failure::{Problem, ProblemError};
+use crate::kernel::layout::check_path;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::manage::model::hex::hex_sha256;
 use crate::manage::model::manifest::{
@@ -19,7 +20,6 @@ use crate::manage::model::manifest::{
 use crate::manage::model::manifest::{
     Inspection, Package, SignatureInfo, MAX_FILES, MAX_PACKAGE_BYTES,
 };
-use crate::manage::model::path::check_path;
 use crate::manage::model::ustar::Tar;
 
 mod manifest;
@@ -28,7 +28,7 @@ mod tar;
 
 pub(crate) use manifest::check_platform;
 pub use manifest::{
-    declares_hooks, parse_manifest, valid_display_name, valid_id, valid_version, validate_manifest,
+    declares_hooks, parse_manifest, valid_display_name, valid_version, validate_manifest,
 };
 use signature::parse_public_key;
 pub(crate) use signature::{check_signature, SignatureMode};
@@ -136,6 +136,7 @@ mod tests {
     use super::*;
     use crate::manage::ops::export::plan_installed_spk;
     use crate::manage::test_support::*;
+    use crate::platform::test_support::TempDir;
     use serde_json::{json, Value};
 
     // The tests call the production entry points without repeating the trust
@@ -191,7 +192,7 @@ mod tests {
         let package = verify_bytes(&package(&key)).expect("verify");
         assert_eq!(package.manifest.id(), "demo");
         assert_eq!(package.files.len(), 2);
-        let root = tempdir::TempDir::new();
+        let root = TempDir::new();
         package.write_to(root.path()).expect("write");
         assert_eq!(
             std::fs::read(root.path().join("payload/bin/demo")).expect("read"),
@@ -215,7 +216,7 @@ mod tests {
         assert!(fallback.signature_bytes.is_empty());
         assert!(verify_bytes_with_fallback(&bytes, false).is_err());
 
-        let root = tempdir::TempDir::new();
+        let root = TempDir::new();
         package.write_to(root.path()).expect("write");
         assert!(!root.path().join("signature.json").exists());
         let error = match plan_installed_spk(root.path()) {

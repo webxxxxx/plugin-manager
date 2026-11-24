@@ -17,18 +17,32 @@ use crate::kernel::failure::{Problem, ProblemError};
 use crate::platform::log::{self, LogWriter};
 use crate::platform::paths::Paths;
 
-/// Both hook actions share the same 60-second budget.
-pub const TIMEOUT_MS: u64 = 60_000;
+/// The process side of [`crate::kernel::hook::Hooks`]: the composition root
+/// supplies the paths, limits and reactor pump once per install/remove.
+pub struct Runner<'a> {
+    paths: &'a Paths,
+    limits: &'a crate::platform::limits::Limits,
+    poll: &'a mut dyn FnMut(),
+}
 
-pub struct Invocation<'a> {
-    pub id: &'a str,
-    pub version: &'a str,
-    /// `post-install` or `pre-remove`; also exported as `SVCD_ACTION`.
-    pub action: &'a str,
-    pub version_dir: &'a Path,
-    /// Package-relative hook path taken from the manifest.
-    pub path: &'a str,
-    pub timeout_ms: u64,
+impl<'a> Runner<'a> {
+    pub fn new(
+        paths: &'a Paths,
+        limits: &'a crate::platform::limits::Limits,
+        poll: &'a mut dyn FnMut(),
+    ) -> Self {
+        Runner {
+            paths,
+            limits,
+            poll,
+        }
+    }
+}
+
+impl crate::kernel::hook::Hooks for Runner<'_> {
+    fn run(&mut self, spec: &crate::kernel::hook::HookSpec<'_>) -> Result<(), ProblemError> {
+        run(spec, self.paths, self.limits, self.poll)
+    }
 }
 
 /// Run the hook, calling `poll` before every wait step. The supervisor loop
@@ -36,12 +50,12 @@ pub struct Invocation<'a> {
 /// the composition root passes a closure over its reactor, and a caller with
 /// no reactor passes a no-op.
 pub fn run(
-    spec: &Invocation<'_>,
+    spec: &crate::kernel::hook::HookSpec<'_>,
     paths: &Paths,
     limits: &crate::platform::limits::Limits,
     poll: &mut dyn FnMut(),
 ) -> Result<(), ProblemError> {
-    crate::manage::check_path(spec.path)?;
+    crate::kernel::layout::check_path(spec.path)?;
     let program = spec.version_dir.join(spec.path);
     let metadata = fs::metadata(&program).map_err(|error| {
         Problem::Invalid.error(format!(
@@ -259,7 +273,10 @@ mod tests {
         crate::platform::test_support::paths("hook-unit")
     }
 
-    fn run(spec: &Invocation<'_>, poll: &mut dyn FnMut()) -> Result<(), ProblemError> {
+    fn run(
+        spec: &crate::kernel::hook::HookSpec<'_>,
+        poll: &mut dyn FnMut(),
+    ) -> Result<(), ProblemError> {
         super::run(
             spec,
             &test_paths(),
@@ -287,8 +304,12 @@ mod tests {
         name.to_string()
     }
 
-    fn spec<'a>(dir: &'a TempDir, path: &'a str, timeout_ms: u64) -> Invocation<'a> {
-        Invocation {
+    fn spec<'a>(
+        dir: &'a TempDir,
+        path: &'a str,
+        timeout_ms: u64,
+    ) -> crate::kernel::hook::HookSpec<'a> {
+        crate::kernel::hook::HookSpec {
             id: "demo",
             version: "1.2.3",
             action: "post-install",
@@ -307,7 +328,11 @@ mod tests {
         let body = "#!/bin/sh\nprintf '%s %s %s\\n' \"$SVCD_PLUGIN_ID\" \"$SVCD_PLUGIN_VERSION\" \"$SVCD_ACTION\" > marker.txt\npwd > cwd.txt\n";
         let path = write_hook(&dir.0, "env", body);
 
-        run(&spec(&dir, &path, TIMEOUT_MS), &mut || {}).expect("hook runs");
+        run(
+            &spec(&dir, &path, crate::kernel::hook::TIMEOUT_MS),
+            &mut || {},
+        )
+        .expect("hook runs");
 
         let marker = fs::read_to_string(dir.0.join("marker.txt")).expect("marker");
         assert_eq!(marker.trim(), "demo 1.2.3 post-install");
@@ -354,7 +379,11 @@ mod tests {
         #[cfg(unix)]
         let path = write_hook(&dir.0, "fail", "#!/bin/sh\nexit 3\n");
 
-        let error = run(&spec(&dir, &path, TIMEOUT_MS), &mut || {}).expect_err("hook fails");
+        let error = run(
+            &spec(&dir, &path, crate::kernel::hook::TIMEOUT_MS),
+            &mut || {},
+        )
+        .expect_err("hook fails");
 
         assert!(error.detail().contains("exited"), "{error}");
     }
@@ -413,7 +442,11 @@ mod tests {
         let polls = Cell::new(0);
         let mut poll = || polls.set(polls.get() + 1);
 
-        run(&spec(&dir, &path, TIMEOUT_MS), &mut poll).expect("hook runs");
+        run(
+            &spec(&dir, &path, crate::kernel::hook::TIMEOUT_MS),
+            &mut poll,
+        )
+        .expect("hook runs");
 
         assert!(
             polls.get() > 1,
@@ -426,7 +459,11 @@ mod tests {
     fn rejects_a_path_that_escapes_the_version_directory() {
         let dir = TempDir::new();
 
-        let error = run(&spec(&dir, "../outside", TIMEOUT_MS), &mut || {}).expect_err("escape");
+        let error = run(
+            &spec(&dir, "../outside", crate::kernel::hook::TIMEOUT_MS),
+            &mut || {},
+        )
+        .expect_err("escape");
 
         assert!(error.detail().contains("unsafe path"), "{error}");
     }
@@ -435,7 +472,11 @@ mod tests {
     fn rejects_a_missing_hook_file() {
         let dir = TempDir::new();
 
-        let error = run(&spec(&dir, "hooks/missing", TIMEOUT_MS), &mut || {}).expect_err("missing");
+        let error = run(
+            &spec(&dir, "hooks/missing", crate::kernel::hook::TIMEOUT_MS),
+            &mut || {},
+        )
+        .expect_err("missing");
 
         assert!(error.detail().contains("post-install hook"), "{error}");
     }
@@ -450,7 +491,11 @@ mod tests {
         fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write hook");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
 
-        let error = run(&spec(&dir, "not-executable", TIMEOUT_MS), &mut || {}).expect_err("mode");
+        let error = run(
+            &spec(&dir, "not-executable", crate::kernel::hook::TIMEOUT_MS),
+            &mut || {},
+        )
+        .expect_err("mode");
 
         assert!(error.detail().contains("not executable"), "{error}");
     }
@@ -464,7 +509,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
 
-        let error = run(&spec(&dir, "no-shebang", TIMEOUT_MS), &mut || {}).expect_err("shebang");
+        let error = run(
+            &spec(&dir, "no-shebang", crate::kernel::hook::TIMEOUT_MS),
+            &mut || {},
+        )
+        .expect_err("shebang");
 
         assert!(error.detail().contains("shebang"), "{error}");
     }
@@ -475,7 +524,11 @@ mod tests {
         let dir = TempDir::new();
         fs::write(dir.0.join("hook.sh"), "@echo off\r\n").expect("write hook");
 
-        let error = run(&spec(&dir, "hook.sh", TIMEOUT_MS), &mut || {}).expect_err("extension");
+        let error = run(
+            &spec(&dir, "hook.sh", crate::kernel::hook::TIMEOUT_MS),
+            &mut || {},
+        )
+        .expect_err("extension");
 
         assert!(error.detail().contains(".exe, .cmd or .bat"), "{error}");
     }

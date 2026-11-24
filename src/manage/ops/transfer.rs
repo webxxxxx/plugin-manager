@@ -157,7 +157,7 @@ pub(crate) fn apply_config(
     if require_root {
         plugin::root_required().map_err(Error::Failed)?;
     }
-    if !package::valid_id(id) || plugin::current_version(paths, id).is_none() {
+    if !crate::kernel::registry::valid_id(id) || plugin::current_version(paths, id).is_none() {
         return Err(Error::Failed(
             Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)),
         ));
@@ -273,7 +273,6 @@ mod tests {
     fn a_missing_backup_entry_is_invalid() {
         let entries = vec![package::TarEntry {
             path: "backup.json".to_string(),
-            mode: 0o644,
             data: b"{\"schema\":1,\"id\":\"demo\",\"version\":\"1.0.0\"}".to_vec(),
         }];
         match import_backup(

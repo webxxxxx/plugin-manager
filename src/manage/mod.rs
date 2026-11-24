@@ -17,7 +17,6 @@ pub use model::backup::*;
 pub(crate) use model::hex::hex_sha256;
 pub use model::layout::*;
 pub use model::manifest::*;
-pub(crate) use model::path::check_path;
 pub use model::ustar::*;
 #[cfg(feature = "http")]
 pub(crate) use ops::config::config_lock;

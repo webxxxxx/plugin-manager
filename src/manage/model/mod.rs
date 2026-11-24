@@ -7,5 +7,4 @@ pub mod backup;
 pub mod hex;
 pub mod layout;
 pub mod manifest;
-pub mod path;
 pub mod ustar;

@@ -1,8 +1,5 @@
 //! HTTP primitives shared by the management API, plugin UI and `/mcp`.
 
-#[cfg(test)]
-use std::io::Read;
-
 use serde_json::json;
 
 pub use super::date::{http_date, parse_http_date};
@@ -193,11 +190,6 @@ impl ChunkedDecoder {
         self.state == ChunkState::Done
     }
 
-    #[cfg(test)]
-    pub fn total(&self) -> u64 {
-        self.total
-    }
-
     pub fn feed<F>(&mut self, mut input: &[u8], sink: &mut F) -> Result<(), BodyError>
     where
         F: FnMut(&[u8]) -> Result<(), String> + ?Sized,
@@ -346,60 +338,6 @@ impl ChunkedDecoder {
 
 fn find_crlf(bytes: &[u8]) -> Option<usize> {
     bytes.windows(2).position(|window| window == b"\r\n")
-}
-
-/// Stream a request body into `sink`. `initial` is whatever the caller read
-/// after the head; any extra bytes beyond the declared length are ignored.
-#[cfg(test)]
-pub fn copy_body<R: Read>(
-    reader: &mut R,
-    framing: Framing,
-    max: u64,
-    initial: &[u8],
-    sink: &mut dyn FnMut(&[u8]) -> Result<(), String>,
-) -> Result<u64, BodyError> {
-    match framing {
-        Framing::None => Ok(0),
-        Framing::Length(length) => {
-            if length > max {
-                return Err(BodyError::TooLarge("request body is too large".into()));
-            }
-            let mut total = 0u64;
-            let take = std::cmp::min(initial.len() as u64, length) as usize;
-            if take > 0 {
-                sink(&initial[..take]).map_err(BodyError::Malformed)?;
-                total += take as u64;
-            }
-            let mut buffer = [0u8; 64 * 1024];
-            while total < length {
-                let want = std::cmp::min(buffer.len() as u64, length - total) as usize;
-                let read = reader.read(&mut buffer[..want]).map_err(|error| {
-                    BodyError::Malformed(format!("read request body: {}", error))
-                })?;
-                if read == 0 {
-                    return Err(BodyError::Malformed("truncated request body".into()));
-                }
-                sink(&buffer[..read]).map_err(BodyError::Malformed)?;
-                total += read as u64;
-            }
-            Ok(total)
-        }
-        Framing::Chunked => {
-            let mut decoder = ChunkedDecoder::new(max);
-            decoder.feed(initial, sink)?;
-            let mut buffer = [0u8; 64 * 1024];
-            while !decoder.is_done() {
-                let read = reader.read(&mut buffer).map_err(|error| {
-                    BodyError::Malformed(format!("read request body: {}", error))
-                })?;
-                if read == 0 {
-                    return Err(BodyError::Malformed("truncated chunked body".into()));
-                }
-                decoder.feed(&buffer[..read], sink)?;
-            }
-            Ok(decoder.total())
-        }
-    }
 }
 
 /// Percent-decode one URL component. `plus_as_space` is set for query values;
@@ -724,7 +662,6 @@ mod tests {
         }
         assert!(decoder.is_done());
         assert_eq!(body, b"hello world");
-        assert_eq!(decoder.total(), 11);
     }
 
     #[test]
@@ -737,39 +674,6 @@ mod tests {
         assert!(decoder.feed(b"zz\r\n", &mut |_| Ok(())).is_err());
         let mut decoder = ChunkedDecoder::new(1024);
         assert!(decoder.feed(b"5\r\nhelloX\r\n", &mut |_| Ok(())).is_err());
-    }
-
-    #[test]
-    fn copy_body_reads_length_and_chunked_from_initial_and_reader() {
-        let mut reader = std::io::Cursor::new(b"world".to_vec());
-        let mut body = Vec::new();
-        copy_body(
-            &mut reader,
-            Framing::Length(11),
-            64,
-            b"hello ",
-            &mut |chunk| {
-                body.extend_from_slice(chunk);
-                Ok(())
-            },
-        )
-        .expect("length");
-        assert_eq!(body, b"hello world");
-
-        let mut reader = std::io::Cursor::new(b" world\r\n0\r\n\r\n".to_vec());
-        let mut body = Vec::new();
-        copy_body(
-            &mut reader,
-            Framing::Chunked,
-            64,
-            b"5\r\nhello\r\n6\r\n",
-            &mut |chunk| {
-                body.extend_from_slice(chunk);
-                Ok(())
-            },
-        )
-        .expect("chunked");
-        assert_eq!(body, b"hello world");
     }
 
     #[test]

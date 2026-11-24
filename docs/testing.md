@@ -141,11 +141,17 @@ daemon，比纯 `Limits` 单测更接近用户报的「设置过小崩溃」。
 
 ## 6. 命令
 
+> `[profile.test] debug = 0` 试过：cargo 的 test profile 本来就不带 debuginfo（输出 `[unoptimized]`），
+> 二进制仍是 3.3 MB，串行/并行耗时没有可测变化，因此不保留该配置。
+
+
 ```sh
 # L1 + L4（摘要输出：每个 target 一行，失败才打印尾部）
 node tools/check.mjs quick
 node tools/check.mjs test <filter>          # 默认 --test-threads=1，与 CI 同参
-node tools/check.mjs full                   # 单测 8 线程、http 4 线程、其余集成串行；--parallel 才全并行
+node tools/check.mjs integration            # 每个 tests/*.rs 一个 cargo、各自墙钟上限；http 4 线程
+node tools/check.mjs full                   # 单测 8 线程，然后跑 integration；--parallel 才全并行
+node tools/check.mjs --selftest             # target 发现 + 空目录守卫的注入测试
 node tools/check.mjs fmt                    # rustfmt --check 全仓（CI guardrails 同款）
 
 # 跨平台编译（Windows 宿主机必须跑一次：`cfg(unix)` 的代码在本机根本不编译，
@@ -191,13 +197,15 @@ node tools/perf/run.mjs --scale
 目录始终可写。Unix 保持系统临时目录，因为 Unix domain socket 对整条路径有 ~108 字节上限，target 下
 的深路径会直接 `cannot bind control channel`。单测写入临时目录的地方统一走 `src/platform/test_support.rs::temp_dir()`（Windows 下是 `target/<profile>/tmp`，Unix 仍是系统 temp）。四个集成 sandbox（`tests/plugin.rs` / `tests/http.rs` / `tests/mcp.rs` / `tests/daemon.rs`）在 Unix 用
 符号链接指向多调用二进制（分派只看 argv[0] 的文件名），没有「复制后立即 exec」的 `ETXTBSY` 窗口；
-Windows 保留副本（建符号链接需要权限）。`tests/cli.rs` 对并发的 `ETXTBSY`（复制 multicall 二进制后立即 exec）
+Windows 优先硬链接（建符号链接需要权限；硬链接失败时回退复制）。`tests/cli.rs` 对并发的 `ETXTBSY`（复制 multicall 二进制后立即 exec）
 做有限重试；不要把它当成测试失败。运行时记录的单测通过 `runtime::tests::with_root` 注入 root，**不要**再在测试里设
-`SVCD_RUN_DIR`（进程级 env + 全局缓存会让并行测试互相踩）。CI 的集成测试用 `--test-threads=1`，
-只有 http 套件用 4 线程（临时端口 + 独立 sandbox，连续 5 次全绿；`SVCD_HTTP_THREADS` 覆盖）；
-单测没有 sandbox，默认并行（`SVCD_UNIT_THREADS` 覆盖，本机 8、CI 4）。`node tools/check.mjs full`
-默认就是「单测并行 + http 并行 + 其余集成串行」，本地红与 CI 红同义，不需要判断「是不是环境噪声」。
+`SVCD_RUN_DIR`（进程级 env + 全局缓存会让并行测试互相踩）。CI 的集成测试走 `node tools/check.mjs integration`：
+它从 `tests/*.rs` 自动发现 target，每个 target 单独一次 cargo 调用、各自吃一个墙钟上限；
+http 套件用 4 线程（临时端口 + 独立 sandbox，连续 5 次全绿；`SVCD_HTTP_THREADS` 覆盖），
+其余串行。单测没有 sandbox，默认并行（`SVCD_UNIT_THREADS` 覆盖，本机 8、CI 4）。
+`node tools/check.mjs full` 默认就是「单测 8 线程 + integration」，本地红与 CI 红同义。
 只有显式 `--parallel` 才让全部集成测试并发，那时执行顺序不由工具承诺。
+`tools/check.mjs --selftest` 会用一个临时 tests 目录证明发现逻辑，并用空目录证明它会红。
 
 ### 并行档（`--parallel`）的定位
 

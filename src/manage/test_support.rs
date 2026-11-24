@@ -2,6 +2,7 @@
 //!
 //! 只服务本层的单元测试（`#[cfg(test)]`），不属于生产接口。
 
+use crate::platform::test_support::TempDir;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -111,10 +112,10 @@ pub(crate) fn test_signed_package(name: &str, platform: &str) -> Vec<u8> {
 
 /// One trust root per test binary, with the shared test key installed.
 pub(crate) fn trust_dir() -> &'static std::path::Path {
-    static TRUST: std::sync::OnceLock<tempdir::TempDir> = std::sync::OnceLock::new();
+    static TRUST: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
     TRUST
         .get_or_init(|| {
-            let dir = tempdir::TempDir::new();
+            let dir = TempDir::new();
             install_test_trust(dir.path());
             dir
         })
@@ -330,10 +331,6 @@ pub(crate) fn script_manifest() -> (Vec<u8>, TestFiles) {
         "files": entries
     });
     (serde_json::to_vec(&value).expect("manifest"), files)
-}
-
-pub(crate) mod tempdir {
-    pub(crate) use crate::platform::test_support::TempDir;
 }
 
 pub(crate) static ROOT: OnceLock<PathBuf> = OnceLock::new();

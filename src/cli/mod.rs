@@ -6,5 +6,6 @@ pub(crate) mod client;
 pub mod plugin;
 pub mod status;
 pub mod svc;
+pub(crate) mod svcd;
 pub mod tune;
 pub(crate) mod upgrade;

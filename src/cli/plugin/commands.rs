@@ -324,7 +324,7 @@ fn edit_with_editor(config: &Config, id: &str) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("read config: {}", error))?
         .or_else(|| plugin::config_template(&config.paths, id).map(|(data, _)| data))
         .ok_or_else(|| format!("plugin {} has no config", id))?;
-    let directory = plugin::plugin_dir(&config.paths, id);
+    let directory = crate::kernel::layout::plugin_dir(&config.paths, id);
     let temporary = directory.join(format!("config.edit.{}", std::process::id()));
     plugin::write_config(&temporary, &initial).map_err(|error| error.detail().to_string())?;
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());

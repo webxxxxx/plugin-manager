@@ -67,7 +67,7 @@ pub(super) fn assemble_manifest(
                     .error("cannot derive the plugin id from the directory name; pass --id")
             })?,
     };
-    if !package::valid_id(&id) {
+    if !crate::kernel::registry::valid_id(&id) {
         return Err(Problem::Invalid.error(format!(
             "invalid plugin id: {} (expected [a-z0-9][a-z0-9_-]{{0,63}}; pass --id)",
             id
@@ -131,7 +131,7 @@ pub(super) fn assemble_manifest(
     if !sources.iter().any(|source| source.path == exec_path) {
         return Err(Problem::Invalid.error(format!("exec.path is not in files[]: {}", exec_path)));
     }
-    package::check_path(&exec_path)?;
+    crate::kernel::layout::check_path(&exec_path)?;
 
     if options.from_core {
         let source = sources

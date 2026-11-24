@@ -142,21 +142,32 @@ pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// A filesystem without hardlinks (or a target dir on another volume) falls
 /// back to a copy.
 ///
-/// A link makes `current_exe()` resolve to the cargo-built binary instead of the
-/// sandbox entry. None of the sandboxed suites self-installs — that path lives in
-/// `install.rs` and is covered by the suites that exec the cargo binary directly
-/// — so only argv[0] dispatch is under test here.
+/// On Unix a symlink makes `current_exe()` resolve to the cargo-built binary;
+/// on Windows the entry is a hardlink, so `current_exe()` keeps the sandbox
+/// path. None of the sandboxed suites self-installs — that path lives in
+/// `install.rs` and is covered by the suites that exec the cargo binary
+/// directly — so only argv[0] dispatch is under test here.
 pub fn install_multicall(binary: &Path, entries: &[&Path]) {
     for path in entries {
         #[cfg(unix)]
         std::os::unix::fs::symlink(binary, path).expect("link multicall");
         #[cfg(not(unix))]
-        {
-            if std::fs::hard_link(binary, path).is_err() {
-                std::fs::copy(binary, path).expect("copy multicall");
-            }
-        }
+        link_or_copy_with(binary, path, |source, destination| {
+            std::fs::hard_link(source, destination)
+        })
+        .expect("link or copy multicall");
     }
+}
+
+/// Link `binary` at `path`, falling back to a copy. Split from
+/// [`install_multicall`] so the fallback can be tested with an injected
+/// failure instead of relying on a filesystem that cannot hardlink.
+pub(crate) fn link_or_copy_with(
+    binary: &Path,
+    path: &Path,
+    link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    link(binary, path).or_else(|_| std::fs::copy(binary, path).map(|_| ()))
 }
 
 /// Run one shutdown request with a bounded wait. `Command::output()` has none:

@@ -87,10 +87,7 @@ impl ConnectionOps for Server {
         // record the method here as well. advance_request resets it for the
         // requests that continue to the buffered path.
         connection.head_only = http::is_head(&head.method);
-        let Some(claim) =
-            self.routes
-                .claim(&head, connection.peer, &self.lan, self.raw_hub.clone())
-        else {
+        let Some(claim) = self.routes.claim(&head, &self.lan, self.raw_hub.clone()) else {
             return PreRequest::Continue;
         };
         let exchange = match claim.exchange {
