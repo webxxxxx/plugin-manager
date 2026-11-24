@@ -51,6 +51,11 @@
       "concept": "platform/paths",
       "layer": "platform"
     },
+    "locations": {
+      "concept": "plugin/locations",
+      "layer": "platform",
+      "note": "插件位置索引（ADR-0030）：多根下每个已装插件在哪个根上"
+    },
     "log": {
       "concept": "platform/log",
       "layer": "platform"
@@ -457,6 +462,7 @@
     "src/platform/limits/report.rs": "limits",
     "src/platform/limits/specs.rs": "limits",
     "src/platform/limits/tests.rs": "limits",
+    "src/platform/locations.rs": "locations",
     "src/platform/log.rs": "log",
     "src/platform/mod.rs": "platform",
     "src/platform/paths.rs": "paths",

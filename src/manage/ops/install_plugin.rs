@@ -61,7 +61,7 @@ pub fn install_staged(
         Problem::Internal.error(format!("create {}: {}", plugin_dir.display(), error))
     })?;
 
-    match strategy {
+    let result = match strategy {
         Strategy::KeepOld => install_keep_old_staged(
             paths,
             limits,
@@ -82,7 +82,9 @@ pub fn install_staged(
             host_interpreter.as_ref(),
             hooks,
         ),
-    }
+    };
+    record_location(paths, &id, &plugin_dir, result.is_ok());
+    result
 }
 
 fn commit_staged(
@@ -96,7 +98,16 @@ fn commit_staged(
             .map(|path| staged.root.starts_with(path))
             .unwrap_or(false)
     {
-        return Err(Problem::Invalid.error("staging directory is outside the plugin tree"));
+        // The rename that commits a package cannot cross filesystems, so the
+        // staged tree has to sit in the root the plugin lives in. Staging is
+        // created in the default root; a plugin whose recorded root is another
+        // one is refused here instead of being copied across volumes. Choosing
+        // the root before the bytes arrive closes this (#293).
+        return Err(Problem::Invalid.error(format!(
+            "staged tree {} is not in the plugin root {}: a plugin that lives on another root is upgraded there once install chooses its root (#293)",
+            staged.root.display(),
+            staging_root.display()
+        )));
     }
     let version_dir = plugin_dir.join(&staged.manifest.version);
     if version_dir.exists() {
@@ -221,29 +232,34 @@ fn run_post_install(
 }
 
 /// Remove stale staging directories. Called once at daemon startup.
+///
+/// A crash can leave a `.staging-*` tree in any plugin root: staging lives in
+/// the root it will be renamed into (ADR-0030), so every root is swept.
 pub fn cleanup_staging(paths: &Paths) {
-    let Ok(root) = fs::read_dir(&paths.plugins_dir) else {
-        return;
-    };
-    for entry in root.flatten() {
-        let Ok(file_type) = entry.file_type() else {
+    for root in &paths.plugin_roots {
+        let Ok(entries) = fs::read_dir(root) else {
             continue;
         };
-        let name = entry.file_name();
-        if name.to_string_lossy().starts_with(".staging-") {
-            let _ = fs::remove_dir_all(entry.path());
-            continue;
-        }
-        if !file_type.is_dir() {
-            continue;
-        }
-        let Ok(children) = fs::read_dir(entry.path()) else {
-            continue;
-        };
-        for child in children.flatten() {
-            let name = child.file_name();
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name();
             if name.to_string_lossy().starts_with(".staging-") {
-                let _ = fs::remove_dir_all(child.path());
+                let _ = fs::remove_dir_all(entry.path());
+                continue;
+            }
+            if !file_type.is_dir() {
+                continue;
+            }
+            let Ok(children) = fs::read_dir(entry.path()) else {
+                continue;
+            };
+            for child in children.flatten() {
+                let name = child.file_name();
+                if name.to_string_lossy().starts_with(".staging-") {
+                    let _ = fs::remove_dir_all(child.path());
+                }
             }
         }
     }
@@ -297,7 +313,7 @@ pub fn install_package(
         Problem::Internal.error(format!("create {}: {}", plugin_dir.display(), error))
     })?;
 
-    match strategy {
+    let result: Result<Service, InstallFailure> = match strategy {
         Strategy::KeepOld => install_keep_old(
             paths,
             limits,
@@ -319,6 +335,31 @@ pub fn install_package(
             hooks,
         )
         .map_err(InstallFailure::from),
+    };
+    record_location(paths, &id, &plugin_dir, result.is_ok());
+    result
+}
+
+/// Remember which root holds this plugin, so uninstall, export and config
+/// keep finding it after a restart (ADR-0030).
+///
+/// A written install without a written record is still usable: the next scan
+/// rebuilds the index from the roots. So a failed write is a warning, not a
+/// failed install — the files are already committed at this point.
+fn record_location(paths: &Paths, id: &str, plugin_dir: &Path, installed: bool) {
+    if !installed {
+        return;
+    }
+    let Some(root) = plugin_dir.parent() else {
+        return;
+    };
+    if let Err(error) = crate::platform::locations::record(paths, id, root) {
+        warn!(
+            "plugin {}: installed, but cannot record its root {}: {}",
+            id,
+            root.display(),
+            error
+        );
     }
 }
 

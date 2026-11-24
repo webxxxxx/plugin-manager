@@ -16,6 +16,7 @@ pub mod config_edit;
 pub mod config_file;
 pub mod host;
 pub mod limits;
+pub mod locations;
 pub mod log;
 pub mod paths;
 pub mod resources;

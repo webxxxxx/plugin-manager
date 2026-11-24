@@ -36,6 +36,12 @@ pub struct Settings {
     pub config_dir: Option<PathBuf>,
     /// Root for runtime state: `plugins`, `temp`, `run`.
     pub data_dir: Option<PathBuf>,
+    /// Plugin roots, in priority order; a comma-separated list in the file.
+    /// Empty means `<data_dir>/plugins`. A configured list may span volumes:
+    /// the first root is the default install target, and every installed
+    /// plugin records the root it lives on (`plugin-locations.json`,
+    /// ADR-0030).
+    pub plugins_dir: Vec<PathBuf>,
     pub auth_passwd: Option<String>,
     /// Removed path keys found in the document. They are never read as paths;
     /// the bootstrap warns about them and uses the derived value instead.
@@ -191,6 +197,7 @@ pub(crate) const ENV_KEYS: &[&str] = &[
     "allow_insecure_install",
     "config_dir",
     "data_dir",
+    "plugins_dir",
     "logs_dir",
     "static_root",
     "install_dir",
@@ -375,15 +382,20 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
             "static_root" => settings.static_root = Some(resolve(base, value)),
             "install_dir" => settings.install_dir = Some(resolve(base, value)),
             "auth_passwd" => settings.auth_passwd = Some(value.to_string()),
+            // One or more plugin roots, comma-separated, in priority order
+            // (ADR-0030). The first root is where a new plugin goes by default.
+            "plugins_dir" => {
+                settings.plugins_dir = parse_plugin_roots(base, value, index)?;
+            }
             // Removed in ADR-0023. Parsing them lets an old document boot; the
             // resolver ignores the value and the bootstrap warns with the
             // derived path. A syntax error in the line is still an error.
-            "plugins_dir" | "services_dir" | "temp_dir" => {
+            "services_dir" | "temp_dir" => {
                 settings.ignored_path_keys.push(IgnoredPathKey {
-                    key: match key {
-                        "plugins_dir" => "plugins_dir",
-                        "services_dir" => "services_dir",
-                        _ => "temp_dir",
+                    key: if key == "services_dir" {
+                        "services_dir"
+                    } else {
+                        "temp_dir"
                     },
                     value: resolve(base, value),
                 })
@@ -625,6 +637,27 @@ fn resolve(base: &Path, value: &str) -> PathBuf {
     }
 }
 
+/// A plugin-root list: comma-separated, relative entries resolved like every
+/// other path, duplicates dropped, order kept. An empty entry is a typo that
+/// would silently widen the list, so it is an error rather than a skip.
+fn parse_plugin_roots(base: &Path, value: &str, index: usize) -> Result<Vec<PathBuf>, String> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(format!(
+                "line {}: plugins_dir has an empty entry; expected a comma-separated list such as /mnt/sd/svcd/plugins,<data>/plugins",
+                index + 1
+            ));
+        }
+        let root = resolve(base, part);
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    Ok(roots)
+}
+
 /// A trailing `# ...` comment is allowed after a value when the hash is
 /// preceded by whitespace. `svc config tune` writes the derivation on the same
 /// line, and a hand-edited file may do the same.
@@ -814,13 +847,19 @@ mod tests {
             settings.auth_passwd.as_deref(),
             Some("pbkdf2-sha256$10000$c2FsdA$aGFzaA")
         );
+        // `plugins_dir` is live again (ADR-0030); a relative entry resolves
+        // against the document's directory like every other path key.
+        assert_eq!(
+            settings.plugins_dir,
+            vec![PathBuf::from("/etc/svcd/plugins")]
+        );
         assert_eq!(
             settings
                 .ignored_path_keys
                 .iter()
                 .map(|ignored| ignored.key)
                 .collect::<Vec<_>>(),
-            vec!["plugins_dir", "services_dir", "temp_dir"]
+            vec!["services_dir", "temp_dir"]
         );
         assert_eq!(settings.temp_retention_secs, Some(3600));
         assert_eq!(settings.temp_cleanup_interval_secs, Some(60));
@@ -830,6 +869,28 @@ mod tests {
         assert_eq!(settings.rescan_interval_ms(), 250);
         assert_eq!(settings.temp_retention().as_secs(), 3600);
         assert_eq!(settings.temp_cleanup_interval().as_secs(), 60);
+    }
+
+    #[test]
+    fn a_plugin_root_list_keeps_order_drops_duplicates_and_rejects_empty_entries() {
+        let settings = parse(
+            "plugins_dir = /mnt/sd/svcd/plugins, plugins, /mnt/sd/svcd/plugins\n",
+            Path::new("/etc/svcd"),
+        )
+        .expect("parse");
+        assert_eq!(
+            settings.plugins_dir,
+            vec![
+                PathBuf::from("/mnt/sd/svcd/plugins"),
+                PathBuf::from("/etc/svcd/plugins"),
+            ]
+        );
+
+        // An empty entry is a typo that would silently widen the list, so it
+        // is refused instead of skipped.
+        let error = parse("plugins_dir = /one,,/two\n", Path::new("/etc/svcd"))
+            .expect_err("empty entry");
+        assert!(error.contains("empty entry"), "{error}");
     }
 
     #[test]

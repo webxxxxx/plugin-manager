@@ -29,7 +29,11 @@ pub struct Paths {
     pub services_dir: PathBuf,
     pub temp_dir: PathBuf,
     pub run_dir: PathBuf,
-    pub plugins_dir: PathBuf,
+    /// Plugin roots in priority order, never empty. The first root is the
+    /// default install target; a plugin may live on any of them, which is why
+    /// its own directory is resolved through `plugin-locations.json`
+    /// (ADR-0030) instead of being guessed from this list.
+    pub plugin_roots: Vec<PathBuf>,
     pub trust_dir: PathBuf,
     pub logs_dir: PathBuf,
     pub data_dir: PathBuf,
@@ -74,14 +78,21 @@ impl Paths {
         let services_dir = config_dir.join("services.d");
         let temp_dir = data_dir.join("temp");
         let run_dir = data_dir.join("run");
-        let plugins_dir = data_dir.join("plugins");
+        // ADR-0023 derived this from `data_dir`; ADR-0030 lets a document list
+        // more roots, in priority order. An unset list is exactly the old
+        // single-root layout.
+        let plugin_roots = if settings.plugins_dir.is_empty() {
+            vec![data_dir.join("plugins")]
+        } else {
+            settings.plugins_dir.clone()
+        };
         let trust_dir = config_dir.join("trust.d");
         let paths = Paths {
             config_dir,
             services_dir,
             temp_dir,
             run_dir,
-            plugins_dir,
+            plugin_roots,
             trust_dir,
             logs_dir,
             data_dir,
@@ -89,7 +100,6 @@ impl Paths {
         let mut warnings = Vec::new();
         for ignored in &settings.ignored_path_keys {
             let actual = match ignored.key {
-                "plugins_dir" => &paths.plugins_dir,
                 "services_dir" => &paths.services_dir,
                 _ => &paths.temp_dir,
             };
@@ -99,6 +109,20 @@ impl Paths {
                 ignored.value.display(),
                 actual.display()
             ));
+        }
+        // A multi-root list may omit the directory ADR-0023 used, and then the
+        // plugins living there would silently stop being discovered. Say it
+        // once at boot with the count; never move or delete anything.
+        let legacy = paths.data_dir.join("plugins");
+        if !paths.plugin_roots.contains(&legacy) {
+            let installed = crate::platform::locations::installed_in(&legacy).len();
+            if installed > 0 {
+                warnings.push(format!(
+                    "svcd.conf: plugins_dir does not include {}; {} installed plugin(s) there will not be discovered; add it to the list or move them",
+                    legacy.display(),
+                    installed
+                ));
+            }
         }
         for (variable, actual) in [
             ("SVCD_TEMP_DIR", &paths.temp_dir),
@@ -131,6 +155,13 @@ impl Paths {
         }
     }
 
+    /// The root a new plugin goes to when nothing else decides. Root selection
+    /// by free space (ADR-0030) starts from the whole list, not from this.
+    pub fn default_plugin_root(&self) -> &Path {
+        // The constructor never builds an empty list; the index is `[0]`.
+        &self.plugin_roots[0]
+    }
+
     /// Test construction: the same relative layout as a system install, with
     /// no environment or settings input. `root/config` holds the config tree
     /// and `root/data` the data tree; logs live in `root/logs`.
@@ -141,7 +172,7 @@ impl Paths {
         Paths {
             services_dir: config_dir.join("services.d"),
             trust_dir: config_dir.join("trust.d"),
-            plugins_dir: data_dir.join("plugins"),
+            plugin_roots: vec![data_dir.join("plugins")],
             temp_dir: data_dir.join("temp"),
             run_dir: data_dir.join("run"),
             logs_dir: root.join("logs"),
@@ -194,7 +225,7 @@ mod tests {
         assert_eq!(paths.logs_dir, PathBuf::from("/logs-from-env"));
         assert_eq!(paths.services_dir, paths.config_dir.join("services.d"));
         assert_eq!(paths.trust_dir, paths.config_dir.join("trust.d"));
-        assert_eq!(paths.plugins_dir, paths.data_dir.join("plugins"));
+        assert_eq!(paths.plugin_roots, vec![paths.data_dir.join("plugins")]);
         assert_eq!(paths.temp_dir, paths.data_dir.join("temp"));
         assert_eq!(paths.run_dir, paths.data_dir.join("run"));
     }
@@ -206,7 +237,7 @@ mod tests {
         assert_eq!(paths.config_dir, PathBuf::from("/conf-from-file"));
         assert_eq!(paths.data_dir, PathBuf::from("/data-from-file"));
         assert_eq!(paths.logs_dir, PathBuf::from("/logs-from-file"));
-        assert_eq!(paths.plugins_dir, PathBuf::from("/data-from-file/plugins"));
+        assert_eq!(paths.plugin_roots, vec![PathBuf::from("/data-from-file/plugins")]);
         assert_eq!(paths.run_dir, PathBuf::from("/data-from-file/run"));
         assert_eq!(paths.temp_dir, PathBuf::from("/data-from-file/temp"));
         assert_eq!(paths.trust_dir, PathBuf::from("/conf-from-file/trust.d"));
@@ -231,7 +262,7 @@ mod tests {
         assert_eq!(paths.services_dir, paths.config_dir.join("services.d"));
         assert_eq!(paths.trust_dir, paths.config_dir.join("trust.d"));
         assert_eq!(paths.data_dir, dirs::default_data_dir());
-        assert_eq!(paths.plugins_dir, paths.data_dir.join("plugins"));
+        assert_eq!(paths.plugin_roots, vec![paths.data_dir.join("plugins")]);
         assert_eq!(paths.temp_dir, paths.data_dir.join("temp"));
         assert_eq!(paths.run_dir, paths.data_dir.join("run"));
         assert_eq!(paths.logs_dir, dirs::default_logs_dir());
@@ -243,10 +274,6 @@ mod tests {
             config_dir: Some(PathBuf::from("/conf")),
             data_dir: Some(PathBuf::from("/data")),
             ignored_path_keys: vec![
-                IgnoredPathKey {
-                    key: "plugins_dir",
-                    value: PathBuf::from("/old/plugins"),
-                },
                 IgnoredPathKey {
                     key: "services_dir",
                     value: PathBuf::from("/old/services"),
@@ -264,13 +291,12 @@ mod tests {
             ("SVCD_TRUST_DIR", "/env/trust"),
         ]);
         let (paths, warnings) = Paths::resolve_reporting(&settings, |name| env.get(name));
-        assert_eq!(paths.plugins_dir, PathBuf::from("/data/plugins"));
-        assert_eq!(warnings.len(), 6, "{warnings:?}");
+        assert_eq!(paths.plugin_roots, vec![PathBuf::from("/data/plugins")]);
+        assert_eq!(warnings.len(), 5, "{warnings:?}");
         for warning in &warnings {
             assert!(warning.contains("ignored"), "{warning}");
         }
         let actual = [
-            paths.plugins_dir.display().to_string(),
             paths.services_dir.display().to_string(),
             paths.temp_dir.display().to_string(),
             paths.run_dir.display().to_string(),
@@ -285,6 +311,74 @@ mod tests {
     }
 
     #[test]
+    fn a_plugin_root_list_keeps_its_order_and_its_first_root_is_the_default() {
+        let settings = Settings {
+            plugins_dir: vec![
+                PathBuf::from("/mnt/sd/svcd/plugins"),
+                PathBuf::from("/data/plugins"),
+            ],
+            data_dir: Some(PathBuf::from("/data")),
+            ..Settings::default()
+        };
+        let paths = Paths::resolve_with(&settings, |_| None);
+        assert_eq!(
+            paths.plugin_roots,
+            vec![
+                PathBuf::from("/mnt/sd/svcd/plugins"),
+                PathBuf::from("/data/plugins")
+            ]
+        );
+        assert_eq!(
+            paths.default_plugin_root(),
+            Path::new("/mnt/sd/svcd/plugins")
+        );
+    }
+
+    /// A list that omits the ADR-0023 directory must not make the plugins
+    /// there disappear quietly: the boot warning names the directory and the
+    /// count, and nothing on disk is touched.
+    #[test]
+    fn dropping_the_derived_root_from_the_list_warns_about_the_plugins_left_there() {
+        let root = crate::platform::test_support::TempDir::new();
+        let data_dir = root.0.join("data");
+        for id in ["alpha", "beta"] {
+            let version = data_dir.join("plugins").join(id);
+            std::fs::create_dir_all(&version).expect("plugin dir");
+            std::fs::write(version.join("current"), "1.0.0").expect("current");
+        }
+        let settings = Settings {
+            data_dir: Some(data_dir.clone()),
+            plugins_dir: vec![PathBuf::from("/mnt/sd/svcd/plugins")],
+            ..Settings::default()
+        };
+        let (paths, warnings) = Paths::resolve_reporting(&settings, |_| None);
+        assert_eq!(
+            paths.plugin_roots,
+            vec![PathBuf::from("/mnt/sd/svcd/plugins")]
+        );
+        let warning = warnings
+            .iter()
+            .find(|warning| warning.contains(&data_dir.join("plugins").display().to_string()))
+            .unwrap_or_else(|| panic!("no warning names the dropped root: {warnings:?}"));
+        assert!(warning.contains('2'), "{warning}");
+
+        // The same list plus the derived root is quiet: nothing is stranded.
+        let settings = Settings {
+            data_dir: Some(data_dir.clone()),
+            plugins_dir: vec![
+                PathBuf::from("/mnt/sd/svcd/plugins"),
+                data_dir.join("plugins"),
+            ],
+            ..Settings::default()
+        };
+        let (_, warnings) = Paths::resolve_reporting(&settings, |_| None);
+        assert!(
+            !warnings.iter().any(|warning| warning.contains("will not be discovered")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
     fn under_mirrors_the_system_layout_under_a_temporary_root() {
         let root = Path::new("/tmp/svcd-test-root");
         let under = Paths::under(root);
@@ -292,7 +386,7 @@ mod tests {
         assert_eq!(under.services_dir, root.join("config/services.d"));
         assert_eq!(under.trust_dir, root.join("config/trust.d"));
         assert_eq!(under.data_dir, root.join("data"));
-        assert_eq!(under.plugins_dir, root.join("data/plugins"));
+        assert_eq!(under.plugin_roots, vec![root.join("data/plugins")]);
         assert_eq!(under.temp_dir, root.join("data/temp"));
         assert_eq!(under.run_dir, root.join("data/run"));
         assert_eq!(under.logs_dir, root.join("logs"));

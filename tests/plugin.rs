@@ -1791,3 +1791,88 @@ fn the_manifest_id_is_the_identity_and_the_name_is_the_display_name() {
     assert!(text.contains("name:"), "{text}");
     assert!(text.contains("身份插件"), "{text}");
 }
+
+/// ADR-0030: who lives where is a recorded fact, not the list order.
+///
+/// A plugin moved onto a second root is still listed, its recorded root lands
+/// in `plugin-locations.json`, and the same id sitting in two roots is
+/// reported as a conflict instead of one copy silently winning.
+#[test]
+fn plugins_on_a_second_root_are_listed_and_a_duplicate_is_a_conflict() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[6u8; 32]);
+    sandbox.write_key(&key);
+    let package = sandbox.write_package("demo-1.0.0.spk", &package(&key, "1.0.0"));
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    let installed = sandbox.run_plugin(&["install", package.to_str().expect("utf8")]);
+    assert_eq!(
+        installed.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&installed)
+    );
+    sandbox.shutdown();
+
+    // The plugin now lives on a second root; the list names both roots in
+    // priority order, so the second root is the default install root.
+    let second_root = sandbox.root.join("sd/plugins");
+    fs::create_dir_all(second_root.join("demo").parent().expect("parent")).expect("sd root");
+    fs::rename(sandbox.data.join("plugins/demo"), second_root.join("demo")).expect("move demo");
+    let default_root = sandbox.data.join("plugins");
+    fs::write(
+        sandbox.config.join("svcd.conf"),
+        format!(
+            "bind = 127.0.0.1:0\nplugins_dir = {},{}\n",
+            second_root.display(),
+            default_root.display()
+        ),
+    )
+    .expect("write svcd.conf");
+
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    let listed = sandbox.run_plugin(&["list"]);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("demo"),
+        "a plugin on the second root must still be listed: {}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+    let locations = fs::read_to_string(sandbox.data.join("plugin-locations.json"))
+        .expect("the install root is recorded");
+    let locations: Value = serde_json::from_str(&locations).expect("locations json");
+    assert_eq!(
+        locations["plugins"]["demo"],
+        json!(second_root.display().to_string()),
+        "the record must name the root the plugin actually lives on"
+    );
+    sandbox.shutdown();
+
+    // The same id in both roots: one row, one conflict naming both paths.
+    fs::create_dir_all(&default_root).expect("default root");
+    copy_tree(&second_root.join("demo"), &default_root.join("demo"));
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    let log = sandbox.daemon_log();
+    assert!(log.contains("installed in both"), "{log}");
+    assert!(log.contains("demo"), "{log}");
+    let listed = sandbox.run_plugin(&["list"]);
+    let text = String::from_utf8_lossy(&listed.stdout);
+    let rows = text
+        .lines()
+        .filter(|line| line.split_whitespace().any(|field| field == "demo"))
+        .count();
+    assert_eq!(rows, 1, "a duplicate id is one row, not two: {text}");
+}
+
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    fs::create_dir_all(to).expect("copy root");
+    for entry in fs::read_dir(from).expect("read source").flatten() {
+        let target = to.join(entry.file_name());
+        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).expect("copy file");
+        }
+    }
+}

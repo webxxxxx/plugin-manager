@@ -652,6 +652,17 @@ pub const CONF_KEYS: &[ConfKey] = &[
         needs_restart: true,
     },
     ConfKey {
+        key: "plugins_dir",
+        label: "插件根",
+        group: Group::Paths,
+        kind: Kind::Path,
+        default: "未设（派生 `<data_dir>/plugins`）",
+        doc: "插件根列表，逗号分隔，顺序即优先级：第一个是默认安装根，每个已装插件的实际落点记在 `<data_dir>/plugin-locations.json`。相对路径按 svcd.conf 所在目录解析；重复项去重，空项报错。",
+        recommend: "只读：多根装在不同的卷上，改这里要保证已有插件还在列表里（否则启动会告警哪些插件找不到）。",
+        editable_in_console: false,
+        needs_restart: true,
+    },
+    ConfKey {
         key: "data_dir",
         label: "数据目录",
         group: Group::Paths,
@@ -711,7 +722,7 @@ mod tests {
     const REMOVED_KEYS: &[&str] = &["boot_scan_wait_ms"];
 
     /// 已删除的旧路径键：解析器只把它们收集成 `IgnoredPathKey` 警告。
-    const REMOVED_PATH_KEYS: &[&str] = &["plugins_dir", "services_dir", "temp_dir"];
+    const REMOVED_PATH_KEYS: &[&str] = &["services_dir", "temp_dir"];
 
     const EXAMPLE: &str = include_str!("../../svcd.conf.example");
     const README: &str = include_str!("../../README.md");
@@ -881,6 +892,7 @@ mod tests {
     fn path_keys_are_the_read_only_roots() {
         let roots = [
             "config_dir",
+            "plugins_dir",
             "data_dir",
             "logs_dir",
             "static_root",

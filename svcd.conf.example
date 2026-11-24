@@ -31,7 +31,8 @@ bind = 127.0.0.1:8787
 
 # The three roots. Everything else derives from them:
 #   config_dir -> svcd.conf, services.d/, trust.d/, compat.conf
-#   data_dir   -> plugins/, temp/, run/ (control socket and http.port)
+#   data_dir   -> temp/, run/ (control socket and http.port), and plugins/
+#                 unless plugins_dir below lists other roots
 #   logs_dir   -> svcd.log, <id>.log, <id>-hooks.log, stats.log
 # Defaults: /etc/svcd (Linux config), /Library/Application Support/svcd/config
 # (macOS), %ProgramData%\svcd\config (Windows system mode), and the matching
@@ -49,10 +50,19 @@ bind = 127.0.0.1:8787
 # the directory containing this file. Requires a daemon restart.
 # static_root = /srv/www/public
 #
+# Plugin roots, comma-separated, in priority order. Default: <data_dir>/plugins.
+# The first root is where a new plugin goes when nothing else decides; every
+# installed plugin records the root it actually lives on in
+# <data_dir>/plugin-locations.json, so uninstall/export/config keep finding it
+# even after this list changes. Duplicates are dropped; an empty entry is an
+# error. A root on another volume is fine, but check that the volume is mounted
+# before the daemon starts.
+# plugins_dir = /mnt/sd/svcd/plugins,/var/lib/svcd/plugins
+
 # Removed keys and variables are ignored with a warning that names the derived
-# path: plugins_dir, services_dir, temp_dir, SVCD_TEMP_DIR, SVCD_RUN_DIR,
-# SVCD_TRUST_DIR. Every live key instead has an SVCD_<KEY> override (see the
-# top of this file); the removed names are not aliases for them.
+# path: services_dir, temp_dir, SVCD_TEMP_DIR, SVCD_RUN_DIR, SVCD_TRUST_DIR.
+# Every live key instead has an SVCD_<KEY> override (see the top of this file);
+# the removed names are not aliases for them.
 
 # Installation root, recorded by `svcd --install --prefix <dir>` and also
 # honored when written by hand: reinstalls without `--prefix` and
@@ -318,10 +328,11 @@ bind = 127.0.0.1:8787
 # Absolute paths (the generated default uses the platform locations):
 # Linux:
 # plugins_dir = /var/lib/svcd/plugins
-# services_dir = /etc/svcd/services.d
 # macOS:
 # plugins_dir = /Library/Application Support/svcd/plugins
-# services_dir = /Library/Application Support/svcd/config/services.d
 # Windows:
 # plugins_dir = C:\ProgramData\svcd\plugins
-# services_dir = C:\Users\<user>\.svcd\services.d
+# services_dir is derived from config_dir and cannot be set: on Linux it is
+# /etc/svcd/services.d, on macOS
+# /Library/Application Support/svcd/config/services.d, on Windows
+# C:\ProgramData\svcd\config\services.d.

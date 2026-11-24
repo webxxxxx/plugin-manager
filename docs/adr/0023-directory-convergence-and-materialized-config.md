@@ -77,3 +77,4 @@ Accepted（2026-11-18）。收窄 [ADR-0019](0019-config-is-derived-once-at-the-
 ADR-0004 原先“不让 `install_dir` 决定 `config_dir`”的结论：现在它决定默认值，
 但 `config_dir` 仍可单独配置到别处。
 
+2026-11-25（ADR-0030）：`plugins_dir` 恢复为可配的逗号分隔根列表，`Paths` 的对应字段改成 `plugin_roots: Vec<PathBuf>`，并加一份位置索引 `<data_dir>/plugin-locations.json` 记录每个已装插件实际在哪个根上。被删除的 `services_dir` / `temp_dir` 与 `SVCD_TEMP_DIR` / `SVCD_RUN_DIR` / `SVCD_TRUST_DIR` 仍然只告警并忽略；“配置键只剩四个”收窄为“路径键是三个根加一个根列表”。

@@ -1,7 +1,7 @@
 //! 插件在磁盘上的布局：版本目录、`current` 指针与 Web 资产入口。
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::kernel::layout::plugin_dir;
 #[cfg(feature = "http")]
@@ -19,7 +19,15 @@ pub struct WebAssets {
 }
 
 pub fn current_version(paths: &Paths, id: &str) -> Option<String> {
-    let text = fs::read_to_string(plugin_dir(paths, id).join("current")).ok()?;
+    current_version_at(&plugin_dir(paths, id))
+}
+
+/// The `current` pointer of one plugin directory.
+///
+/// Scanning already holds the directory it walked (`<root>/<id>` for any
+/// root), so it must not re-derive the path from the default root.
+pub(crate) fn current_version_at(directory: &Path) -> Option<String> {
+    let text = fs::read_to_string(directory.join("current")).ok()?;
     let version = text.trim();
     if version.is_empty()
         || version.split('.').count() != 3

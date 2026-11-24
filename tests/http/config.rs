@@ -87,7 +87,7 @@ fn existing_conf_without_roots_is_filled_and_used() {
     let mut sandbox = Sandbox::new();
     fs::write(
         sandbox.config.join("svcd.conf"),
-        "bind = 127.0.0.1:0\nplugins_dir = /ignored/plugins\n",
+        "bind = 127.0.0.1:0\nservices_dir = /ignored/services\n",
     )
     .expect("write svcd.conf");
 
@@ -108,7 +108,7 @@ fn existing_conf_without_roots_is_filled_and_used() {
         "{text}"
     );
     let log = sandbox.daemon_log();
-    assert!(log.contains("plugins_dir"), "{log}");
+    assert!(log.contains("services_dir"), "{log}");
     assert!(log.contains("ignored"), "{log}");
 }
 
