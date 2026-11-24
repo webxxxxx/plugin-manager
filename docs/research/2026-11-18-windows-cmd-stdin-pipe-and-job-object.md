@@ -51,3 +51,18 @@ cmd/job 语义里哪些是文档保证的、哪些是没保证的。
 - 「子进程没 ready」：握手基线 22–36 ms，需要约 1000 倍异常；子进程消失会留下 `stdout closed` 日志。
 - 「实现丢通知」：需要 spawn 的 pid、ping 写入结果、每帧的采纳/丢弃原因；这三处现在都不打日志。
 - 因此外部文档不足以定性 #159；先把上面两处观测点补上，再谈修哪一侧。
+
+## 5. 2026-11-24 补记：job 复用已实测，#281 实为测试误诊
+
+#281 的诊断把 §4 的假设做成了可执行实验（Windows 本机，`Tree` 单测）：
+
+- `Tree::new()` → 第一个子进程 `assign` → 100 ms 后 `Tree::terminate()` → 第一个子进程退出；
+- 再 spawn 第二个子进程 → `AssignProcessToJobObject` 返回**成功** → 500 ms 后第二个子进程仍存活。
+
+结论：已终止的 job 句柄可以继续接收新进程，**不会**杀掉后续 assign 的进程；§4 的「强制停止后 start 必超时」
+不成立。`TerminateJobObject` 的退出码是 1，这解释了旧实例的 `last_exit: 1`。
+
+#281 的「强制 kill 后立刻手工 start，新实例 200 ms 内以 1 退出」实际是测试等待谓词读错字段：
+状态投影里 `pid` 只在 `Summary`，`Details` 没有 `pid`，于是 `details.pid.is_null()` 恒真、等待立即返回，
+手工 start 落在旧实例仍 `Running` 的窗口里被内核当作 no-op，返回的是旧 pid；随后旧实例的退出落到
+`on-failure` backoff。修法见 #281（已改为测试修复票）。
