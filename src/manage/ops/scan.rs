@@ -12,34 +12,37 @@ use crate::kernel::registry::{
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::manage as package;
 use crate::manage::check::interpreter;
-use crate::manage::current_version;
 use crate::platform::paths::Paths;
 
 pub fn scan(
     paths: &Paths,
     limits: &crate::platform::limits::Limits,
 ) -> (Vec<Service>, Vec<String>) {
-    let root = &paths.plugins_dir;
     let host = crate::platform::compat::detect(paths, MAX_SCHEMA, MAX_PROTOCOL);
     let mut services = Vec::new();
     let mut warnings = Vec::new();
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (services, warnings),
-        Err(error) => {
-            warnings.push(format!("cannot read {}: {}", root.display(), error));
-            return (services, warnings);
+    // The roots are the truth and the location index is a hint, so one walk
+    // does both: it finds every installed plugin (any root) and leaves the
+    // index agreeing with the disk (ADR-0030). A root that is missing right
+    // now keeps its entries; nothing here deletes what it cannot see.
+    let discovery = crate::platform::locations::discover(&paths.plugin_roots);
+    warnings.extend(discovery.warnings.iter().cloned());
+    warnings.extend(discovery.conflicts.iter().cloned());
+    let found = discovery.map();
+    if crate::platform::locations::load(paths) != found {
+        if let Err(error) = crate::platform::locations::save(paths, &found) {
+            warnings.push(format!("plugin locations: {}", error));
         }
-    };
+    }
 
-    for entry in entries.flatten() {
-        let id = entry.file_name().to_string_lossy().to_string();
-        if !crate::kernel::registry::valid_id(&id) || id == RESERVED_ID {
+    for entry in &discovery.found {
+        let id = entry.id.as_str();
+        if !crate::kernel::registry::valid_id(id) || id == RESERVED_ID {
             warnings.push(format!("ignoring plugin directory {}", id));
             continue;
         }
-        let directory = entry.path();
-        let version = match current_version(paths, &id) {
+        let directory = entry.root.join(id);
+        let version = match crate::manage::model::layout::current_version_at(&directory) {
             Some(version) => version,
             None => {
                 warnings.push(format!("{}: missing current pointer", id));

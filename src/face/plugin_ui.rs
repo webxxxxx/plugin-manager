@@ -593,7 +593,7 @@ mod tests {
     }
     fn installed_ui(dir: &TempDir, id: &str) -> Paths {
         let paths = Paths::under(&dir.0);
-        let plugin = paths.plugins_dir.join(id);
+        let plugin = paths.default_plugin_root().join(id);
         let version = plugin.join("1.0.0");
         fs::create_dir_all(version.join("payload/web")).expect("web root");
         fs::write(version.join("payload/web/index.html"), PAGE).expect("page");
@@ -671,7 +671,7 @@ mod tests {
         let assets = static_assets(&paths, &lan, &good).expect("valid admission");
         assert_eq!(
             assets.root,
-            paths.plugins_dir.join("demo/1.0.0/payload/web")
+            paths.default_plugin_root().join("demo/1.0.0/payload/web")
         );
     }
 }

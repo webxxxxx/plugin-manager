@@ -66,10 +66,15 @@ fn install_staged(
 }
 
 fn staging_path(paths: &Paths) -> PathBuf {
+    // Staging must share a filesystem with the plugin tree it is renamed into,
+    // so it lives in the default root. Choosing the install root before the
+    // package bytes arrive is #293; until then a plugin that lives on another
+    // root is refused by the commit check instead of being copied across
+    // volumes.
     let plugins = paths
-        .plugins_dir
+        .default_plugin_root()
         .canonicalize()
-        .unwrap_or_else(|_| paths.plugins_dir.clone());
+        .unwrap_or_else(|_| paths.default_plugin_root().to_path_buf());
     let _ = std::fs::create_dir_all(&plugins);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -10,8 +10,12 @@ use crate::kernel::failure::{Problem, ProblemError};
 use crate::platform::paths::Paths;
 
 /// The directory that holds one plugin's versions, config and markers.
+///
+/// A plugin root is a list, so the directory is looked up in the location
+/// index first (ADR-0030); a plugin the index does not know falls back to the
+/// default root, which keeps the single-root behaviour of ADR-0023.
 pub fn plugin_dir(paths: &Paths, id: &str) -> PathBuf {
-    paths.plugins_dir.join(id)
+    crate::platform::locations::dir_of(paths, id)
 }
 
 /// A manifest-declared payload path must stay inside the package: relative,

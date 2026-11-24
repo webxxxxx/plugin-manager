@@ -324,11 +324,11 @@ fn wide_path(path: &Path) -> Vec<u16> {
 /// and the `svcd` group. Without this a local user could drop a `.cmd` into
 /// `services.d` and have it executed as SYSTEM.
 pub(crate) fn harden_directories(paths: &crate::platform::paths::Paths) -> std::io::Result<()> {
-    for dir in [
-        paths.config_dir.clone(),
-        paths.services_dir.clone(),
-        paths.plugins_dir.clone(),
-    ] {
+    let mut directories = vec![paths.config_dir.clone(), paths.services_dir.clone()];
+    // Every plugin root holds payloads this daemon executes as SYSTEM, so each
+    // one gets the same protected DACL.
+    directories.extend(paths.plugin_roots.iter().cloned());
+    for dir in directories {
         // Create first: a first start has no `services.d` / `plugins` yet, and a
         // directory created later would inherit `C:\ProgramData`'s Users-write
         // ACE instead of getting the protected DACL below.

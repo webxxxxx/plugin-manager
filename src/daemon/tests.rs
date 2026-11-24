@@ -1748,7 +1748,7 @@ fn a_temp_payload_is_removed_after_a_successful_install() {
         "an installed package must not keep its temp payload"
     );
     assert!(
-        daemon.config.paths.plugins_dir.join("demo").is_dir(),
+        daemon.config.paths.default_plugin_root().join("demo").is_dir(),
         "the install itself must still have happened"
     );
 }

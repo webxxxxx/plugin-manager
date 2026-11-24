@@ -234,6 +234,7 @@ cpu_budget_percent = 90             # 软闸 + cgroup / Job Object 硬限
 | --- | --- | --- | --- |
 | `config_dir` | 平台默认（Linux /etc/svcd） | 输入根：svcd.conf、services.d、trust.d、compat.conf。 | 重启 daemon |
 | `data_dir` | 平台默认（Linux /var/lib/svcd） | 运行状态根：plugins、temp、run。 | 重启 daemon |
+| `plugins_dir` | 未设（派生 `<data_dir>/plugins`） | 插件根列表，逗号分隔、顺序即优先级：第一个是默认安装根；每个已装插件的落点记在 `<data_dir>/plugin-locations.json`。 | 重启 daemon |
 | `logs_dir` | 平台默认（Linux /var/log/svcd） | 日志根：svcd.log、<id>.log、<id>-hooks.log。 | 重启 daemon |
 | `static_root` | 未设（关闭） | 只读静态站点根：目录下的文件通过 `/static/` 访问；带尾部斜杠的目录取 `index.html`。 | 重启 daemon |
 | `install_dir` | 未设（由 `svcd --install --prefix` 记录） | 安装前缀：初始化时补 config/data/logs 默认值，运行时不再从它推路径。 | 重启 daemon |

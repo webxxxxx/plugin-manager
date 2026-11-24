@@ -256,6 +256,7 @@ src/
   platform/                   L0 平台：宿主资源与 OS 能力
     mod.rs
     paths.rs  config.rs  config_file.rs  log.rs  compat.rs
+    locations.rs  插件位置索引（ADR-0030：多根下每个插件在哪个根上）
     host/  proc.rs  threads.rs  wake.rs  zerocopy.rs  notify.rs  signal.rs
     storage/  meta.rs  path.rs  upload.rs  part.rs  gc.rs    内容寻址存储（原 blob）
 
@@ -454,6 +455,7 @@ flowchart LR
 | 0027 Windows 跑同一个 server loop | `platform/host/poll` + `platform/host/wake_pipe` + `server/http/{engine,server}` |
 | 0028 Windows 插件 stdio 反应器 | `wire/contract/reactor/{iocp,dispatch}` + `stdio/platform/windows` |
 | 0029 静态站点挂在 `/static/` | `face/static_site` + `face/asset` + `platform/settings` |
+| 0030 插件根与位置索引 | `platform/paths` + `platform/locations` + `kernel/layout` + `manage/ops/scan` |
 
 ## 15. 已定的命名与决策
 

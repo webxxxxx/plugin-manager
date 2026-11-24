@@ -200,15 +200,18 @@ impl Daemon {
                 format!("staging path {}: {}", path, error),
             )
         })?;
-        let plugins = self
-            .config
-            .paths
-            .plugins_dir
-            .canonicalize()
-            .map_err(|error| {
-                ProblemError::new(Problem::Internal, format!("plugins dir: {}", error))
-            })?;
-        if !staging.starts_with(&plugins)
+        // A staged tree may be in any plugin root (ADR-0030); what matters is
+        // that it is a `.staging-*` directory inside one of them, so the
+        // commit's rename stays on one filesystem.
+        let mut inside_a_root = false;
+        for root in &self.config.paths.plugin_roots {
+            let root = root.canonicalize().unwrap_or_else(|_| root.clone());
+            if staging.starts_with(&root) {
+                inside_a_root = true;
+                break;
+            }
+        }
+        if !inside_a_root
             || !staging
                 .file_name()
                 .map(|name| name.to_string_lossy().starts_with(".staging-"))
@@ -440,7 +443,7 @@ mod tests {
         // One daemon owns one config root, so a status difference cannot come
         // from two different plugin/config paths.
         let mut daemon = daemon();
-        std::fs::create_dir_all(&daemon.config.paths.plugins_dir).expect("plugins dir");
+        std::fs::create_dir_all(daemon.config.paths.default_plugin_root()).expect("plugins dir");
 
         // The direct path installs the .spk through verify + install_package.
         let files = crate::platform::test_support::TempDir::new();
@@ -452,7 +455,7 @@ mod tests {
 
         // The staged path installs the same package from a staging directory
         // inside the plugin tree, the way the HTTP uploader leaves it.
-        let staging = daemon.config.paths.plugins_dir.join(".staging-245");
+        let staging = daemon.config.paths.default_plugin_root().join(".staging-245");
         let mut installer = crate::manage::StagingInstaller::new(
             staging.clone(),
             false,
