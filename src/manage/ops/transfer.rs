@@ -273,7 +273,6 @@ mod tests {
     fn a_missing_backup_entry_is_invalid() {
         let entries = vec![package::TarEntry {
             path: "backup.json".to_string(),
-            mode: 0o644,
             data: b"{\"schema\":1,\"id\":\"demo\",\"version\":\"1.0.0\"}".to_vec(),
         }];
         match import_backup(

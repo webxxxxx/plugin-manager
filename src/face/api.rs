@@ -14,7 +14,6 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
-use crate::manage as package;
 use crate::manage as plugin;
 use crate::platform::config::Config;
 use crate::platform::log::{self, Level};
@@ -248,7 +247,7 @@ impl ApiFace {
 
     fn plugin_ui_token_rpc(&self, id: &str) -> Response {
         if crate::face::plugin_ui::web_assets_for(&self.config.paths, id).is_none() {
-            if package::valid_id(id) {
+            if crate::kernel::registry::valid_id(id) {
                 return error_response(404, "not_found", &format!("plugin {} has no web UI", id));
             }
             return error_response(404, "not_found", &format!("unknown plugin UI: {}", id));
@@ -1032,7 +1031,7 @@ mod tests {
             .expect("the icon needs a validator");
         assert_eq!(
             etag,
-            format!("\"{}\"", package::hex_sha256(asset.body)),
+            format!("\"{}\"", crate::manage::hex_sha256(asset.body)),
             "the validator is the content hash, so an upgrade invalidates it"
         );
         for (name, value) in [

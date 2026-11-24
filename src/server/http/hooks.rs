@@ -4,7 +4,6 @@
 //! root builds them before any loop exists, and the unix control channel uses
 //! the same hooks.
 
-use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
 use crate::server::auth::lan::Lan;
@@ -35,7 +34,6 @@ pub(crate) trait PreBodyRoutes: Send + Sync {
     fn claim(
         &self,
         head: &http::Head,
-        peer: IpAddr,
         lan: &Arc<Mutex<Lan>>,
         raw_hub: Arc<crate::wire::contract::rawhub::RawHub>,
     ) -> Option<PreBodyClaim>;

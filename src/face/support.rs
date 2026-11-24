@@ -13,7 +13,6 @@ use std::time::Instant;
 use serde_json::{json, Value};
 
 use crate::kernel::failure::{Class, Problem, ProblemError};
-use crate::manage as package;
 use crate::server::http::model as http;
 use crate::server::http::{CancelToken, JobBudget, Request};
 use crate::wire::control::channel;
@@ -128,7 +127,7 @@ pub fn require_plugin_result(
     id: &str,
     budget: &CallBudget,
 ) -> Result<(), (u16, &'static str, String)> {
-    if !package::valid_id(id) {
+    if !crate::kernel::registry::valid_id(id) {
         return Err((404, "not_found", format!("unknown plugin: {}", id)));
     }
     let status = rpc_result(config, "svc.status", json!({ "id": id }), budget)?;

@@ -3,6 +3,7 @@
 //! 只做字节 ⇄ 条目，不做校验判定；`Problem` 只用于把 I/O 与格式错误投影成
 //! 已有的失败类别。
 
+#![cfg_attr(not(feature = "http"), allow(dead_code))]
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -10,15 +11,13 @@ use std::path::PathBuf;
 use sha2::{Digest, Sha256};
 
 use crate::kernel::failure::{Problem, ProblemError};
+use crate::kernel::layout::check_path;
 use crate::manage::model::hex::hex_bytes;
-use crate::manage::model::path::check_path;
 
 #[derive(Debug, Clone)]
 pub struct TarEntry {
     pub path: String,
     pub data: Vec<u8>,
-    #[allow(dead_code)]
-    pub mode: u32,
 }
 
 pub fn read_tar(bytes: &[u8]) -> Result<Vec<TarEntry>, ProblemError> {
@@ -34,7 +33,6 @@ pub fn read_tar(bytes: &[u8]) -> Result<Vec<TarEntry>, ProblemError> {
         entries.push(TarEntry {
             path: header.path,
             data: data.to_vec(),
-            mode: header.mode & 0o777,
         });
     }
     Ok(entries)
