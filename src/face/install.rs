@@ -462,6 +462,53 @@ mod tests {
         }
     }
 
+    /// #288: the package bytes the store imported into temp as a blob (its
+    /// `package_blob` hands the browser a `svdc://blob/...` link) come back as
+    /// the install body. When the attempt ends — here it is refused because no
+    /// daemon answers — that entry must be released instead of pinning 15 MiB
+    /// on the volume for `temp_retention_secs`.
+    #[test]
+    fn an_install_releases_the_temp_blob_it_consumed() {
+        let config = test_config();
+        let body =
+            crate::manage::test_support::test_signed_package("demo", crate::platform::target());
+        let staged = crate::platform::storage::put(&config.paths, &body).expect("stage the blob");
+        let unrelated =
+            crate::platform::storage::put(&config.paths, b"not this install").expect("other blob");
+
+        let head = parse_head(
+            format!(
+                "POST /api/v1/plugins HTTP/1.1\r\nHost: x\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let handler = match exchange(&head, &lan(), config.clone()).expect("streamed exchange") {
+            Exchange::Stream(handler) => handler,
+            Exchange::Response(_) => panic!("a package route must stream"),
+        };
+        let (response, reason, consumed) = drive(handler, &body, 64 * 1024);
+        assert_eq!(reason, CloseReason::Completed);
+        assert_eq!(consumed, body.len(), "the whole body is the package");
+        assert!(
+            !String::from_utf8_lossy(&response).starts_with("HTTP/1.1 2"),
+            "this unit test has no daemon to install into: {}",
+            String::from_utf8_lossy(&response)
+        );
+        let staged_path = crate::platform::storage::locate(&config.paths, &staged.id)
+            .expect("staged blob path");
+        assert!(
+            !staged_path.exists(),
+            "the installed package must release its temp blob"
+        );
+        let unrelated_path =
+            crate::platform::storage::locate(&config.paths, &unrelated.id).expect("other path");
+        assert!(
+            unrelated_path.exists(),
+            "another transfer's blob is not ours to delete"
+        );
+    }
+
     #[test]
     fn a_full_blocking_queue_turns_into_503_busy() {
         let mut handler = stream_handler(
