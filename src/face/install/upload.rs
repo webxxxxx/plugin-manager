@@ -3,9 +3,12 @@
 
 use std::sync::{Arc, Mutex};
 
+use sha2::{Digest, Sha256};
+
 use crate::face::support::{self, CallBudget};
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::platform::config::Config;
+use crate::platform::paths::Paths;
 use crate::server::auth::lan::{AuthKind, Lan};
 use crate::server::http::model as http;
 use crate::server::http::{
@@ -114,6 +117,7 @@ pub fn exchange(
                     ),
                     framing,
                     limits.max_package_bytes,
+                    config.paths.clone(),
                 ));
             }
             if strategy != "keep-old" && strategy != "replace" {
@@ -121,6 +125,7 @@ pub fn exchange(
                     http::json_error(400, "bad_request", "strategy must be keep-old or replace"),
                     framing,
                     limits.max_package_bytes,
+                    config.paths.clone(),
                 ));
             }
             match framing {
@@ -137,6 +142,7 @@ pub fn exchange(
                         http::json_error(413, "payload_too_large", "package is too large"),
                         framing,
                         limits.max_package_bytes,
+                        config.paths.clone(),
                     ));
                 }
                 _ => {}
@@ -152,6 +158,7 @@ pub fn exchange(
                     http::json_error(413, "payload_too_large", "import is too large"),
                     framing,
                     limits.max_package_bytes,
+                    config.paths.clone(),
                 ));
             }
             _ => {}
@@ -175,12 +182,19 @@ fn expects_continue(head: &http::Head) -> bool {
         && head.version.eq_ignore_ascii_case("HTTP/1.1")
 }
 
-fn reject_after_drain(response: Vec<u8>, framing: http::Framing, limit: u64) -> Exchange {
+fn reject_after_drain(
+    response: Vec<u8>,
+    framing: http::Framing,
+    limit: u64,
+    paths: Arc<Paths>,
+) -> Exchange {
     Exchange::Stream(Box::new(RejectAfterDrain {
         framing: BodyFraming::new(framing, limit),
         response,
         response_sent: 0,
         body_done: false,
+        digest: Sha256::new(),
+        paths,
     }))
 }
 
@@ -194,6 +208,11 @@ struct RejectAfterDrain {
     response: Vec<u8>,
     response_sent: usize,
     body_done: bool,
+    /// sha256 of the drained body. A package over `max_package_bytes` is
+    /// refused here, before `InstallFlow` exists, so this handler is the only
+    /// place that can release the blob the store imported for it (#289).
+    digest: Sha256,
+    paths: Arc<Paths>,
 }
 
 impl RejectAfterDrain {
@@ -214,7 +233,8 @@ impl RejectAfterDrain {
 
     fn on_data(&mut self, data: &[u8]) -> StreamStep {
         match self.framing.feed(data) {
-            Ok((_, done)) => {
+            Ok((chunk, done)) => {
+                self.digest.update(&chunk);
                 if done {
                     self.body_done = true;
                 }
@@ -230,6 +250,20 @@ impl RejectAfterDrain {
             return StreamStep::wait(StreamAction::NeedWrite);
         }
         StreamStep::wait(StreamAction::NeedRead)
+    }
+}
+
+/// A complete refusal body that matches a content-addressed temp entry is the
+/// package the store imported for this transfer: release it, or the entry sits
+/// in `<data>/temp` until `temp_retention_secs` (#289). A body that never
+/// finished hashes to nothing that exists, so the release is a no-op.
+impl Drop for RejectAfterDrain {
+    fn drop(&mut self) {
+        if !self.body_done {
+            return;
+        }
+        let digest = self.digest.clone().finalize();
+        crate::platform::storage::release(&self.paths, &digest);
     }
 }
 
