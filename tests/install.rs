@@ -1020,6 +1020,52 @@ fn invalid_svcd_conf_is_rejected_without_overwriting_the_installed_one() {
     );
 }
 
+/// An older svcd wrote `http_port`; this build rejects it (ADR-0010), so the
+/// daemon exits 1 and systemd gives up after five retries. The installer must
+/// name that document instead of upgrading around it and reporting only that
+/// service registration failed.
+#[test]
+fn install_refuses_an_installed_conf_this_build_cannot_load() {
+    let sandbox = Sandbox::new();
+    let prefix = sandbox.root.join("prefix");
+    let prefix_arg = prefix.to_str().expect("utf8");
+
+    let first = sandbox.run(&["--install", "--prefix", prefix_arg, "--no-service"]);
+    assert_eq!(first.status.code(), Some(0), "{}", stderr(&first));
+    let conf = sandbox.config_dir().join("svcd.conf");
+    let good = fs::read_to_string(&conf).expect("generated conf");
+    assert!(good.contains("bind = "), "{good}");
+
+    let stale = format!(
+        "# written by a pre-ADR-0010 svcd\nhttp_port = 8787\nlan_default = false\nconfig_dir = {}\n",
+        sandbox.config_dir().display()
+    );
+    fs::write(&conf, &stale).expect("write stale conf");
+
+    let refused = sandbox.run(&["--install", "--prefix", prefix_arg, "--no-service"]);
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    let message = stderr(&refused);
+    assert!(
+        message.contains("http_port"),
+        "the message names the key: {message}"
+    );
+    assert!(
+        message.contains("bind"),
+        "the message names the replacement: {message}"
+    );
+    assert_eq!(
+        fs::read_to_string(&conf).expect("conf after the refusal"),
+        stale,
+        "a refused install must leave the document alone"
+    );
+}
+
 #[test]
 fn install_service_plan_passes_conf() {
     let sandbox = Sandbox::new();
