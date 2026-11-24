@@ -294,16 +294,21 @@ impl Daemon {
         &mut self,
         id: &str,
         purge: bool,
+        force: bool,
         clock: &Clock,
     ) -> Result<(), ProblemError> {
-        let service = self.host.registry.get(id).ok_or_else(|| {
-            ProblemError::new(Problem::UnknownPlugin, format!("unknown plugin: {}", id))
-        })?;
-        if service.kind != Kind::Plugin {
-            return Err(ProblemError::new(
-                Problem::NotAPlugin,
-                format!("not a plugin: {}", id),
-            ));
+        // A plugin on a root that is not available right now is not in the
+        // registry either, and the record is the only thing that knows it
+        // exists. So a missing id is handed to the manager: it answers 409
+        // with the volume path, or "unknown plugin" when there is no record.
+        let registered = self.host.registry.get(id).map(|service| service.kind);
+        if let Some(kind) = registered {
+            if kind != Kind::Plugin {
+                return Err(ProblemError::new(
+                    Problem::NotAPlugin,
+                    format!("not a plugin: {}", id),
+                ));
+            }
         }
         if self.host.is_running(id) {
             self.host.stop_service(id, clock)?;
@@ -315,7 +320,7 @@ impl Daemon {
                 &self.config.limits,
                 &mut poll,
             );
-            plugin::uninstall(&self.config.paths, id, purge, &mut hooks)?;
+            plugin::uninstall(&self.config.paths, id, purge, force, &mut hooks)?;
         }
         self.host.forget(id);
         self.bump_catalog();

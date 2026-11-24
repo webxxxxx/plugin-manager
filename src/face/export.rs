@@ -80,6 +80,24 @@ pub struct ExportStream {
     at: usize,
 }
 
+/// 404 when nothing is installed; 409 with the recorded root when the plugin
+/// exists but its volume is not there. The difference is what tells an operator
+/// to plug a card back in instead of re-installing (ADR-0030).
+fn missing_plugin(paths: &Paths, id: &str) -> Vec<u8> {
+    match crate::platform::locations::root_of(paths, id) {
+        Some(root) if !crate::platform::locations::available(&root) => http::json_error(
+            409,
+            "root_unavailable",
+            &format!(
+                "plugin {} lives in {}, which is not available right now; put the volume back to export it",
+                id,
+                root.display()
+            ),
+        ),
+        _ => http::json_error(404, "not_found", &format!("unknown plugin: {}", id)),
+    }
+}
+
 struct Pending {
     target: ExportTarget,
     version: String,
@@ -104,10 +122,7 @@ impl ExportStream {
                 index: 0,
                 at: 0,
             },
-            None => ExportStream::response(
-                http::json_error(404, "not_found", &format!("unknown plugin: {}", id)),
-                paths,
-            ),
+            None => ExportStream::response(missing_plugin(&paths, id), paths),
         }
     }
 

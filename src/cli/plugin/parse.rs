@@ -41,6 +41,14 @@ pub(super) enum Command {
     Uninstall {
         id: String,
         purge: bool,
+        /// Forget the record of a plugin whose root is not available; the
+        /// volume is left untouched.
+        force: bool,
+    },
+    /// Where a plugin's directory is, and whether that volume is there now.
+    Where {
+        id: String,
+        json: bool,
     },
     EditConfig {
         id: String,
@@ -160,16 +168,34 @@ pub(super) fn parse(args: &[String]) -> Result<Command, ()> {
         "uninstall" => {
             let mut id = None;
             let mut purge = false;
+            let mut force = false;
             for arg in &args[1..] {
                 if arg == "--purge" {
                     purge = true;
+                } else if arg == "--force" {
+                    force = true;
                 } else if arg.starts_with('-') || id.is_some() {
                     return Err(());
                 } else {
                     id = Some(arg.clone());
                 }
             }
-            id.map(|id| Command::Uninstall { id, purge }).ok_or(())
+            id.map(|id| Command::Uninstall { id, purge, force })
+                .ok_or(())
+        }
+        "where" => {
+            let mut id = None;
+            let mut json = false;
+            for arg in &args[1..] {
+                if arg == "--json" {
+                    json = true;
+                } else if arg.starts_with('-') || id.is_some() {
+                    return Err(());
+                } else {
+                    id = Some(arg.clone());
+                }
+            }
+            id.map(|id| Command::Where { id, json }).ok_or(())
         }
         "editconfig" => {
             let mut id = None;

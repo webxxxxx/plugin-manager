@@ -311,11 +311,17 @@ impl ApiFace {
         )
     }
 
-    fn uninstall_plugin_rpc(&self, budget: &CallBudget, id: &str, purge: bool) -> Response {
+    fn uninstall_plugin_rpc(
+        &self,
+        budget: &CallBudget,
+        id: &str,
+        purge: bool,
+        force: bool,
+    ) -> Response {
         match self.rpc(
             budget,
             "plugin.uninstall",
-            json!({ "id": id, "purge": purge }),
+            json!({ "id": id, "purge": purge, "force": force }),
         ) {
             Ok(_) => Response::json(200, &json!({ "ok": true })),
             Err(response) => response,
@@ -562,7 +568,10 @@ impl ApiFace {
 
     fn plugin_uninstall(&self, call: &ApiCall<'_>) -> Response {
         let purge = support::query_bool(call.query(), "purge").unwrap_or(false);
-        self.uninstall_plugin_rpc(call.budget(), &call.param("id"), purge)
+        // `force=true` forgets the record of a plugin whose root is not
+        // available; without it the daemon answers 409 with the volume path.
+        let force = support::query_bool(call.query(), "force").unwrap_or(false);
+        self.uninstall_plugin_rpc(call.budget(), &call.param("id"), purge, force)
     }
 
     fn config_reset(&self, call: &ApiCall<'_>) -> Response {

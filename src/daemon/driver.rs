@@ -158,12 +158,14 @@ impl Daemon {
                 Ok(status) => rpc::ok(id, status_json(status)),
                 Err(error) => problem_response(id, -32006, error),
             },
-            control::Command::Uninstall { service, purge } => {
-                match self.uninstall_plugin(&service, purge, clock) {
-                    Ok(()) => rpc::ok(id, json!({ "ok": true })),
-                    Err(error) => problem_response(id, -32007, error),
-                }
-            }
+            control::Command::Uninstall {
+                service,
+                purge,
+                force,
+            } => match self.uninstall_plugin(&service, purge, force, clock) {
+                Ok(()) => rpc::ok(id, json!({ "ok": true })),
+                Err(error) => problem_response(id, -32007, error),
+            },
             control::Command::AuthStatus => match self.auth_status() {
                 Ok(status) => rpc::ok(id, auth_json(&status)),
                 Err(error) => problem_response(id, -32008, error),

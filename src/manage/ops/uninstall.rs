@@ -38,10 +38,34 @@ pub fn uninstall(
     paths: &Paths,
     id: &str,
     purge: bool,
+    force: bool,
     hooks: &mut dyn Hooks,
 ) -> Result<(), ProblemError> {
     if !crate::kernel::registry::valid_id(id) || id == RESERVED_ID {
         return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
+    }
+    // The plugin may sit on a volume that is not there right now. Removing the
+    // record without the files would leave an orphan copy that reappears when
+    // the card comes back, so the default answer is "put the volume back";
+    // `--force` is the operator saying they know the volume is gone.
+    if let Some(root) = crate::platform::locations::root_of(paths, id) {
+        if !crate::platform::locations::available(&root) {
+            if !force {
+                return Err(Problem::Conflict.error(format!(
+                    "plugin {} lives in {}, which is not available right now; put the volume back, or `plugin uninstall --force {}` to forget the record and leave the volume untouched",
+                    id,
+                    root.display(),
+                    id
+                )));
+            }
+            if let Err(error) = crate::platform::locations::forget(paths, id) {
+                warn!(
+                    "plugin {}: cannot forget the location record: {}",
+                    id, error
+                );
+            }
+            return Ok(());
+        }
     }
     let directory = plugin_dir(paths, id);
     if !directory.is_dir() {

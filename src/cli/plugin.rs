@@ -154,7 +154,30 @@ mod tests {
             parse(&args(&["uninstall", "demo", "--purge"])).expect("uninstall"),
             Command::Uninstall {
                 id: "demo".into(),
-                purge: true
+                purge: true,
+                force: false
+            }
+        );
+        assert_eq!(
+            parse(&args(&["uninstall", "demo", "--force"])).expect("force uninstall"),
+            Command::Uninstall {
+                id: "demo".into(),
+                purge: false,
+                force: true
+            }
+        );
+        assert_eq!(
+            parse(&args(&["where", "demo"])).expect("where"),
+            Command::Where {
+                id: "demo".into(),
+                json: false
+            }
+        );
+        assert_eq!(
+            parse(&args(&["where", "demo", "--json"])).expect("where json"),
+            Command::Where {
+                id: "demo".into(),
+                json: true
             }
         );
         assert!(parse(&args(&["install", "demo.spk", "--strategy", "nope"])).is_err());

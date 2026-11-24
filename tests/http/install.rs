@@ -1039,3 +1039,83 @@ fn a_streamed_install_lands_on_the_root_the_request_names() {
         String::from_utf8_lossy(&unknown.body)
     );
 }
+
+/// #294: a plugin whose volume is out is not "unknown". Export and uninstall
+/// say which root it needs, and only an explicit `force` forgets the record —
+/// without touching the volume.
+#[test]
+fn a_plugin_on_an_unavailable_root_is_a_conflict_not_a_missing_plugin() {
+    let mut sandbox = Sandbox::new();
+    let package = signed_demo_package(&sandbox, 23);
+    let second = sandbox.root.join("sd").join("plugins");
+    fs::create_dir_all(&second).expect("second root");
+    fs::write(
+        sandbox.config.join("svcd.conf"),
+        format!(
+            "bind = 127.0.0.1:0\nplugins_dir = {},{}\n",
+            sandbox.data.join("plugins").display(),
+            second.display()
+        ),
+    )
+    .expect("write svcd.conf");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let installed = raw_request(
+        &address,
+        "POST",
+        &format!(
+            "/api/v1/plugins?root={}",
+            second.display().to_string().replace('/', "%2F")
+        ),
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(
+        installed.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&installed.body)
+    );
+
+    let pulled = sandbox.root.join("sd-pulled");
+    fs::rename(&second, &pulled).expect("pull the card");
+
+    let export = raw_request(&address, "GET", "/api/v1/export/demo/spk", "", b"");
+    assert_eq!(
+        export.status,
+        409,
+        "{}",
+        String::from_utf8_lossy(&export.body)
+    );
+    let text = String::from_utf8_lossy(&export.body);
+    assert!(text.contains("root_unavailable"), "{text}");
+    assert!(text.contains("sd"), "{text}");
+
+    let refused = raw_request(&address, "DELETE", "/api/v1/plugins/demo", "", b"");
+    assert_eq!(
+        refused.status,
+        409,
+        "{}",
+        String::from_utf8_lossy(&refused.body)
+    );
+    let text = String::from_utf8_lossy(&refused.body);
+    assert!(text.contains("not available"), "{text}");
+
+    let forced = raw_request(
+        &address,
+        "DELETE",
+        "/api/v1/plugins/demo?force=true",
+        "",
+        b"",
+    );
+    assert_eq!(
+        forced.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&forced.body)
+    );
+    assert!(
+        pulled.join("demo/current").is_file(),
+        "force must leave the volume alone"
+    );
+}

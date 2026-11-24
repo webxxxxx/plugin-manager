@@ -34,7 +34,8 @@ pub fn run(args: Vec<String>) -> i32 {
             root,
         } => install(&config, &path, &strategy, allow_hooks, root.as_deref()),
         Command::Verify { path, json, pubkey } => verify(&config, &path, json, pubkey.as_deref()),
-        Command::Uninstall { id, purge } => uninstall(&config, &id, purge),
+        Command::Uninstall { id, purge, force } => uninstall(&config, &id, purge, force),
+        Command::Where { id, json } => where_is(&config, &id, json),
         Command::EditConfig {
             id,
             print,
@@ -230,11 +231,11 @@ fn verify(config: &Config, path: &Path, json: bool, pubkey: Option<&Path>) -> i3
     EXIT_OK
 }
 
-fn uninstall(config: &Config, id: &str, purge: bool) -> i32 {
+fn uninstall(config: &Config, id: &str, purge: bool, force: bool) -> i32 {
     match channel::request(
         config.paths.control_dir(),
         "plugin.uninstall",
-        json!({ "id": id, "purge": purge }),
+        json!({ "id": id, "purge": purge, "force": force }),
     ) {
         Ok(response) => match response.error {
             Some(error) => {
@@ -248,6 +249,54 @@ fn uninstall(config: &Config, id: &str, purge: bool) -> i32 {
         },
         Err(error) => client::unreachable(&error, "plugin"),
     }
+}
+
+/// `plugin where <id>`: the root the index recorded and whether that volume is
+/// there right now. Read from this process's own paths, not the control
+/// channel: the usual reason to ask is that the volume (or the daemon) is down.
+fn where_is(config: &Config, id: &str, json: bool) -> i32 {
+    if !crate::kernel::registry::valid_id(id) {
+        eprintln!("plugin: invalid plugin id: {}", id);
+        return EXIT_USAGE;
+    }
+    let Some(root) = crate::platform::locations::root_of(&config.paths, id) else {
+        if json {
+            println!("{}", json!({ "id": id, "installed": false }));
+        } else {
+            eprintln!("plugin: unknown plugin: {}", id);
+        }
+        return EXIT_SERVICE_ERROR;
+    };
+    let available = crate::platform::locations::available(&root);
+    let version = plugin::current_version(&config.paths, id);
+    if json {
+        println!(
+            "{}",
+            json!({
+                "id": id,
+                "installed": true,
+                "root": root.to_string_lossy(),
+                "available": available,
+                "version": version,
+            })
+        );
+        return EXIT_OK;
+    }
+    println!("{}", id);
+    println!("  root:      {}", root.display());
+    println!("  available: {}", if available { "yes" } else { "no" });
+    match version {
+        Some(version) => println!("  version:   {}", version),
+        None => println!("  version:   (unknown)"),
+    }
+    if !available {
+        println!(
+            "  the volume holding this root is not there; plug it back in, or `plugin uninstall --force {}` to forget the record",
+            id
+        );
+        return EXIT_SERVICE_ERROR;
+    }
+    EXIT_OK
 }
 
 fn edit_config(config: &Config, id: &str, print: bool, file: Option<&Path>, reset: bool) -> i32 {
