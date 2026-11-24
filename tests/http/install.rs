@@ -947,3 +947,95 @@ fn export_import_and_logs() {
         capped.body.len()
     );
 }
+
+/// ADR-0030: the streamed upload decides the root before writing the first
+/// payload byte, so the tree is staged where it will be renamed into.
+#[test]
+fn a_streamed_install_lands_on_the_root_the_request_names() {
+    let mut sandbox = Sandbox::new();
+    let package = signed_demo_package(&sandbox, 19);
+    let default_root = sandbox.data.join("plugins");
+    let second = sandbox.root.join("sd").join("plugins");
+    fs::create_dir_all(&second).expect("second root");
+    fs::write(
+        sandbox.config.join("svcd.conf"),
+        format!(
+            "bind = 127.0.0.1:0\nplugins_dir = {},{}\n",
+            default_root.display(),
+            second.display()
+        ),
+    )
+    .expect("write svcd.conf");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let installed = raw_request(
+        &address,
+        "POST",
+        &format!(
+            "/api/v1/plugins?root={}",
+            second.display().to_string().replace('/', "%2F")
+        ),
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(
+        installed.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&installed.body)
+    );
+    assert!(
+        second.join("demo/current").is_file(),
+        "the plugin must land on the requested root"
+    );
+    assert!(
+        !default_root.join("demo").exists(),
+        "staging and install must not touch the other root"
+    );
+    let locations: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(sandbox.data.join("plugin-locations.json"))
+            .expect("the root is recorded"),
+    )
+    .expect("locations json");
+    assert_eq!(
+        locations["plugins"]["demo"],
+        serde_json::json!(second.display().to_string()),
+        "the record names the root the plugin landed on"
+    );
+
+    // The same id cannot be installed into a different root: that is the state
+    // the location index exists to prevent.
+    let refused = raw_request(
+        &address,
+        "POST",
+        &format!(
+            "/api/v1/plugins?root={}",
+            default_root.display().to_string().replace('/', "%2F")
+        ),
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(
+        refused.status,
+        409,
+        "{}",
+        String::from_utf8_lossy(&refused.body)
+    );
+    assert!(!default_root.join("demo").exists(), "no second copy");
+
+    // A root that is not in plugins_dir is a typo, not a request to create it.
+    let unknown = raw_request(
+        &address,
+        "POST",
+        "/api/v1/plugins?root=%2Ftmp%2Fnowhere",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(
+        unknown.status,
+        400,
+        "{}",
+        String::from_utf8_lossy(&unknown.body)
+    );
+}

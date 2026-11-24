@@ -33,9 +33,16 @@ Accepted（2026-11-25）。给 [ADR-0023](0023-directory-convergence-and-materia
 - 安装成功后写索引。写失败只告警：文件已经提交，下一次扫描会把它补回来。
 - 列表漏掉 `<data>/plugins`、而那里确实有插件时，启动告警给出目录与插件数。不自动搬，
   也不改用户的文件。
-- **已知缺口**：staging 仍在默认根（`<root>[0]`），`commit_staged` 要求 staging 与目标根
-  同卷。装在非默认根上的插件在这次改动后升级会被**明确拒绝**（提示跨卷安装需要 #293），
-  而不是偷偷跨卷拷贝。选根与同卷 staging 在 #293 落地。
+- **选根规则**（唯一一处实现，`manage/ops/install_plugin/root`）：
+  1. 已装插件留在索引记录的根上，请求里给了另一个根就是 `409`，不是悄悄装第二份；
+  2. 显式根（`--root` / `?root=`）必须出现在 `plugins_dir` 里，否则 `400` 并列出可选根；
+  3. 其余情况按"**装得下且剩余空间最小**"挑：实测空闲字节升序，取第一个 `free >= needed`；
+     量不到的根（没挂载、没权限）不参与比较，也不会被猜成"空";
+  4. 都不够时拒绝，并把每个根的空闲字节写进消息。
+- **staging 落在选中根里**：`StagingInstaller` 在拿到 manifest（id 与总大小已知）之后才
+  创建 `<root>/.staging-…`，因为上传前还不知道 id。`commit_staged` 的 `rename` 因此
+  永远同卷；`plugin.install_staged` 从 staged 树的父目录**读回**这个根，不重新选一次。
+- `.spkb` 备份包不再需要外层暂存目录：`plugin.spk` 与配置都在内存里，内层包自己选根。
 
 ## Considered options
 
@@ -54,7 +61,9 @@ Accepted（2026-11-25）。给 [ADR-0023](0023-directory-convergence-and-materia
 
 - `Paths` 的每个调用点要么用 `plugin_roots`（扫描、staging、Windows ACL），要么用
   `default_plugin_root()`；"按 id 找目录"继续走 `kernel::layout::plugin_dir`，它现在读索引。
-- 一个 id 只能落在一个根上；往另一个根装同一个 id 会被拒绝（#293）。
+- 一个 id 只能落在一个根上；往另一个根装同一个 id 会被拒绝（409）。
+- 新装默认去剩空间最小的根，所以设备上 15.7 MB 的包装进 17.5 MiB 的 `/data`，
+  SD 卡留给更大的包；升级仍在原根上，装不下就明确拒绝，由调用方决定先卸载。
 - 根不可用（SD 卡拔了）时：列表里少一行、日志里一条告警；卸载/导出要给出可操作的错误
   （#294），索引条目保留，插回卡后照旧。
 - 索引文件是缓存，不进备份；删了只会让下一次启动重建。

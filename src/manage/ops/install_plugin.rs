@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::hook::{HookSpec, Hooks, TIMEOUT_MS};
-use crate::kernel::layout::plugin_dir;
 use crate::kernel::registry::{Interpreter, Service};
 use crate::manage as package;
 use crate::manage::check::interpreter;
@@ -20,11 +19,14 @@ use crate::platform::paths::Paths;
 
 mod keep_old;
 mod replace;
+mod root;
 mod space;
 
 use keep_old::{install_keep_old, install_keep_old_staged};
 use replace::{install_replace, install_replace_staged};
 use space::{directory_size, free_space, out_of_space};
+
+pub(crate) use root::install_root;
 
 /// Preflight a package that has already been streamed into a staging directory.
 /// This mirrors [`verify_package`] but never holds the payload in memory.
@@ -55,7 +57,16 @@ pub fn install_staged(
     let id = staged.manifest.id().to_string();
     ensure_hooks_allowed_manifest(&staged.manifest, opt_in_hooks)?;
 
-    let plugin_dir = plugin_dir(paths, &id);
+    // The staged tree already sits in the root it will be renamed into: the
+    // uploader chose that root before writing the first payload byte, so the
+    // one decision is made in one place and the commit only reads it back.
+    let Some(root) = staged.root.parent() else {
+        return Err(Problem::Internal.error(format!(
+            "staged tree {} has no parent directory",
+            staged.root.display()
+        )));
+    };
+    let plugin_dir = root.join(&id);
     let was_installed = current_version(paths, &id).is_some();
     fs::create_dir_all(&plugin_dir).map_err(|error| {
         Problem::Internal.error(format!("create {}: {}", plugin_dir.display(), error))
@@ -98,13 +109,13 @@ fn commit_staged(
             .map(|path| staged.root.starts_with(path))
             .unwrap_or(false)
     {
-        // The rename that commits a package cannot cross filesystems, so the
-        // staged tree has to sit in the root the plugin lives in. Staging is
-        // created in the default root; a plugin whose recorded root is another
-        // one is refused here instead of being copied across volumes. Choosing
-        // the root before the bytes arrive closes this (#293).
+        // The rename that commits a package cannot cross filesystems. Staging
+        // is created in the root the uploader chose, and `install_staged`
+        // derives that same root from this tree, so reaching here means a
+        // caller handed over a tree from somewhere else: refuse it rather than
+        // copy a package across volumes.
         return Err(Problem::Invalid.error(format!(
-            "staged tree {} is not in the plugin root {}: a plugin that lives on another root is upgraded there once install chooses its root (#293)",
+            "staged tree {} is not inside the plugin root {}",
             staged.root.display(),
             staging_root.display()
         )));
@@ -292,6 +303,7 @@ impl From<ProblemError> for InstallFailure {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // The strategy split already carries every install input.
 pub fn install_package(
     paths: &Paths,
     limits: &crate::platform::limits::Limits,
@@ -299,6 +311,7 @@ pub fn install_package(
     strategy: Strategy,
     opt_in_hooks: bool,
     host_interpreter: Option<Interpreter>,
+    requested_root: Option<&Path>,
     hooks: &mut dyn Hooks,
 ) -> Result<Service, InstallFailure> {
     // The id and the reserved `svc` name are already rejected by
@@ -307,7 +320,10 @@ pub fn install_package(
     let id = package.manifest.id().to_string();
     ensure_hooks_allowed(package, opt_in_hooks)?;
 
-    let plugin_dir = plugin_dir(paths, &id);
+    // Which root this lands on: an installed plugin keeps its recorded root, a
+    // new one goes to the smallest volume that fits (ADR-0030).
+    let root = root::install_root(paths, &id, requested_root, package.unpacked_size())?;
+    let plugin_dir = root.join(&id);
     let was_installed = current_version(paths, &id).is_some();
     fs::create_dir_all(&plugin_dir).map_err(|error| {
         Problem::Internal.error(format!("create {}: {}", plugin_dir.display(), error))
@@ -512,7 +528,6 @@ mod tests {
     }
 
     use super::*;
-    use crate::kernel::layout::plugin_dir;
     use crate::manage::check::plugin::Strategy;
     use crate::manage::model::layout::current_version;
     use crate::manage::model::manifest::Package;
@@ -583,6 +598,7 @@ mod tests {
             Strategy::KeepOld,
             false,
             None,
+            None,
             &mut NoHooks,
         )
         .expect("first install");
@@ -593,11 +609,12 @@ mod tests {
             Strategy::KeepOld,
             false,
             None,
+            None,
             &mut NoHooks,
         )
         .expect("keep-old install");
 
-        let directory = plugin_dir(&paths, "layout-demo");
+        let directory = paths.default_plugin_root().join("layout-demo");
         assert!(directory.join("1.0.0").is_dir());
         assert!(directory.join("1.1.0").is_dir());
         assert_eq!(
@@ -612,6 +629,7 @@ mod tests {
             &layout_package("layout-demo", "1.1.0"),
             Strategy::Replace,
             false,
+            None,
             None,
             &mut NoHooks,
         )

@@ -1876,3 +1876,80 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
         }
     }
 }
+
+/// ADR-0030: an explicit root places a new plugin there, and an upgrade keeps
+/// the root the index recorded — even when another root is listed first and
+/// has room. A second copy of one id is refused, not silently created.
+#[test]
+fn an_explicit_root_installs_there_and_an_upgrade_stays_on_the_recorded_root() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[8u8; 32]);
+    sandbox.write_key(&key);
+    let v1 = sandbox.write_package("demo-1.0.0.spk", &package(&key, "1.0.0"));
+    let v2 = sandbox.write_package("demo-1.1.0.spk", &package(&key, "1.1.0"));
+    let default_root = sandbox.data.join("plugins");
+    let second = sandbox.root.join("sd").join("plugins");
+    fs::create_dir_all(&second).expect("second root");
+    fs::write(
+        sandbox.config.join("svcd.conf"),
+        format!(
+            "bind = 127.0.0.1:0\nplugins_dir = {},{}\n",
+            default_root.display(),
+            second.display()
+        ),
+    )
+    .expect("write svcd.conf");
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+
+    let installed = sandbox.run_plugin(&[
+        "install",
+        v1.to_str().expect("utf8"),
+        "--root",
+        second.to_str().expect("utf8"),
+    ]);
+    assert_eq!(
+        installed.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&installed)
+    );
+    assert!(
+        second.join("demo/current").is_file(),
+        "the plugin must land on the requested root"
+    );
+    assert!(
+        !default_root.join("demo").exists(),
+        "the other root must stay untouched"
+    );
+
+    let upgraded = sandbox.run_plugin(&["install", v2.to_str().expect("utf8")]);
+    assert_eq!(
+        upgraded.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&upgraded)
+    );
+    assert_eq!(
+        fs::read_to_string(second.join("demo/current"))
+            .expect("current")
+            .trim(),
+        "1.1.0",
+        "an upgrade stays on the recorded root"
+    );
+    assert!(
+        !default_root.join("demo").exists(),
+        "no copy on the other root"
+    );
+
+    let refused = sandbox.run_plugin(&[
+        "install",
+        v1.to_str().expect("utf8"),
+        "--root",
+        default_root.to_str().expect("utf8"),
+    ]);
+    assert_ne!(refused.status.code(), Some(0), "a second copy is refused");
+    let message = stderr(&refused);
+    assert!(message.contains("installed in"), "{message}");
+    assert!(!default_root.join("demo").exists(), "nothing was written");
+}

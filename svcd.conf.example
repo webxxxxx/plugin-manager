@@ -51,12 +51,13 @@ bind = 127.0.0.1:8787
 # static_root = /srv/www/public
 #
 # Plugin roots, comma-separated, in priority order. Default: <data_dir>/plugins.
-# The first root is where a new plugin goes when nothing else decides; every
-# installed plugin records the root it actually lives on in
-# <data_dir>/plugin-locations.json, so uninstall/export/config keep finding it
-# even after this list changes. Duplicates are dropped; an empty entry is an
-# error. A root on another volume is fine, but check that the volume is mounted
-# before the daemon starts.
+# A new plugin goes to the smallest volume that can hold it (ties keep this
+# order); `--root` / `?root=` names one explicitly and must be in this list.
+# Every installed plugin records the root it actually lives on in
+# <data_dir>/plugin-locations.json, so an upgrade stays there and
+# uninstall/export/config keep finding it even after this list changes.
+# Duplicates are dropped; an empty entry is an error. A root on another volume
+# is fine, but check that the volume is mounted before the daemon starts.
 # plugins_dir = /mnt/sd/svcd/plugins,/var/lib/svcd/plugins
 
 # Removed keys and variables are ignored with a warning that names the derived

@@ -27,6 +27,9 @@ pub enum PackageTarget {
         strategy: String,
         enable: bool,
         allow_hooks: bool,
+        /// Explicit install root (`?root=`), validated against `plugins_dir`
+        /// by the daemon so the upload face does not read the config again.
+        root: Option<String>,
     },
     Import {
         config_id: Option<String>,
@@ -57,6 +60,7 @@ pub fn target(head: &http::Head) -> Option<PackageTarget> {
             strategy: support::query_value(query, "strategy").unwrap_or_else(|| "replace".into()),
             enable: support::query_bool(query, "enable").unwrap_or(true),
             allow_hooks: support::query_bool(query, "allow_hooks").unwrap_or(false),
+            root: support::query_value(query, "root"),
         }),
         "/api/v1/import" => Some(PackageTarget::Import {
             config_id: support::query_value(query, "config_id"),
@@ -387,7 +391,14 @@ impl PackageUploadStream {
                 strategy,
                 enable,
                 allow_hooks,
-            } => Flow::Install(InstallFlow::new(&config, strategy, enable, allow_hooks)),
+                root,
+            } => Flow::Install(InstallFlow::new(
+                &config,
+                strategy,
+                enable,
+                allow_hooks,
+                root.map(std::path::PathBuf::from),
+            )),
             PackageTarget::Import {
                 config_id,
                 no_config,

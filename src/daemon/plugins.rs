@@ -107,6 +107,10 @@ impl Daemon {
         let path = install.path.as_str();
         let strategy = install.strategy;
         let allow_hooks = install.allow_hooks;
+        // An explicit root is only a preference; `install_package` refuses one
+        // that is not in `plugins_dir`, and refuses to move an installed
+        // plugin to a different root (ADR-0030).
+        let requested_root = install.root.clone();
 
         // Everything that can reject the package runs before anything is
         // stopped or written: a bad package must leave the installed version
@@ -144,6 +148,7 @@ impl Daemon {
                 strategy,
                 allow_hooks,
                 host_interpreter.clone(),
+                requested_root.as_deref().map(Path::new),
                 &mut hooks,
             ) {
                 Ok(service) => service,
@@ -168,6 +173,7 @@ impl Daemon {
                         Strategy::Replace,
                         allow_hooks,
                         host_interpreter,
+                        requested_root.as_deref().map(Path::new),
                         &mut hooks,
                     )
                     .map_err(plugin::InstallFailure::into_problem)?
@@ -223,8 +229,11 @@ impl Daemon {
             ));
         }
 
+        // Load from the path as the caller spelled it, not the canonicalized
+        // one: the canonical form is only the containment check, and its
+        // Windows `\\?\` spelling would be recorded as the plugin's root.
         let staged = package::load_staged(
-            &staging,
+            Path::new(path),
             self.config.settings.allow_insecure_install,
             &self.config.paths.trust_dir,
         )?;
@@ -404,6 +413,7 @@ mod tests {
             allow_hooks: false,
             expected_id: None,
             expected_version: None,
+            root: None,
         }
     }
 
@@ -455,15 +465,14 @@ mod tests {
 
         // The staged path installs the same package from a staging directory
         // inside the plugin tree, the way the HTTP uploader leaves it.
-        let staging = daemon.config.paths.default_plugin_root().join(".staging-245");
         let mut installer = crate::manage::StagingInstaller::new(
-            staging.clone(),
+            daemon.config.paths.as_ref().clone(),
             false,
             8 * 1024 * 1024,
-            &daemon.config.paths.trust_dir,
+            None,
         );
         installer.feed(&package).expect("feed package");
-        installer.finish().expect("finish staging");
+        let staging = installer.finish().expect("finish staging").root;
         let staged_status = daemon
             .install_staged(request(&staging), &clock)
             .expect("staged install");

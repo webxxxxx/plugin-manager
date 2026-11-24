@@ -390,16 +390,14 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
             // Removed in ADR-0023. Parsing them lets an old document boot; the
             // resolver ignores the value and the bootstrap warns with the
             // derived path. A syntax error in the line is still an error.
-            "services_dir" | "temp_dir" => {
-                settings.ignored_path_keys.push(IgnoredPathKey {
-                    key: if key == "services_dir" {
-                        "services_dir"
-                    } else {
-                        "temp_dir"
-                    },
-                    value: resolve(base, value),
-                })
-            }
+            "services_dir" | "temp_dir" => settings.ignored_path_keys.push(IgnoredPathKey {
+                key: if key == "services_dir" {
+                    "services_dir"
+                } else {
+                    "temp_dir"
+                },
+                value: resolve(base, value),
+            }),
             "temp_retention_secs" => {
                 let seconds = value.parse::<u64>().map_err(|_| {
                     format!(
@@ -762,7 +760,14 @@ mod tests {
         assert_eq!(parse_byte_size("512 KiB"), Some(524_288));
         assert_eq!(parse_byte_size("1G"), Some(1024 * 1024 * 1024));
         assert_eq!(parse_byte_size(" 16 M "), Some(16 * 1024 * 1024));
-        for rejected in ["", "MiB", "12 apples", "1.5 MiB", "-1 MiB", "18446744073709551616"] {
+        for rejected in [
+            "",
+            "MiB",
+            "12 apples",
+            "1.5 MiB",
+            "-1 MiB",
+            "18446744073709551616",
+        ] {
             assert_eq!(parse_byte_size(rejected), None, "{rejected:?}");
         }
     }
@@ -888,8 +893,8 @@ mod tests {
 
         // An empty entry is a typo that would silently widen the list, so it
         // is refused instead of skipped.
-        let error = parse("plugins_dir = /one,,/two\n", Path::new("/etc/svcd"))
-            .expect_err("empty entry");
+        let error =
+            parse("plugins_dir = /one,,/two\n", Path::new("/etc/svcd")).expect_err("empty entry");
         assert!(error.contains("empty entry"), "{error}");
     }
 

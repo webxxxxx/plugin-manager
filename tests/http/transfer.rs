@@ -55,7 +55,10 @@ fn a_blob_can_be_released_with_delete() {
     assert_eq!(gone.status, 404, "a released blob must not be downloadable");
 
     let again = raw_request(&address, "DELETE", &format!("/api/v1/blobs/{id}"), "", b"");
-    assert_eq!(again.status, 404, "a second release is not an error to invent");
+    assert_eq!(
+        again.status, 404,
+        "a second release is not an error to invent"
+    );
 }
 
 /// The upgrade pre-check reads every plugin root plus the temp volume. The

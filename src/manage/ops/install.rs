@@ -80,15 +80,20 @@ pub struct StagingInstaller {
 }
 
 impl StagingInstaller {
+    /// `paths` decides where the tree goes: staging is created inside the root
+    /// the package will be renamed into, and that root is only known once the
+    /// manifest has been parsed (ADR-0030). `requested_root` is the operator's
+    /// explicit choice (`--root` / `?root=`), which must be one of
+    /// `plugins_dir`.
     pub fn new(
-        staging: PathBuf,
+        paths: crate::platform::paths::Paths,
         allow_insecure: bool,
         max_bytes: u64,
-        trust_dir: &Path,
+        requested_root: Option<PathBuf>,
     ) -> StagingInstaller {
         StagingInstaller {
             tar: TarFeed::new(max_bytes),
-            sink: SpkSink::new(staging, allow_insecure, trust_dir.to_path_buf()),
+            sink: SpkSink::new(paths, allow_insecure, requested_root),
             finished: false,
         }
     }
@@ -117,13 +122,20 @@ impl Drop for StagingInstaller {
         // A rejected, disconnected or half-fed package must not leave a
         // staging directory behind. A finished install owns its directory and
         // the caller removes it if the daemon did not commit it.
-        if !self.finished {
+        if !self.finished && !self.sink.staging.as_os_str().is_empty() {
             let _ = fs::remove_dir_all(&self.sink.staging);
         }
     }
 }
 
 struct SpkSink {
+    /// The resolved paths: the roots it may stage into, plus the location
+    /// index that says where an installed plugin already lives.
+    paths: crate::platform::paths::Paths,
+    /// The operator's explicit root, if the request named one.
+    requested_root: Option<PathBuf>,
+    /// Chosen at the first payload entry, when the manifest (and so the id and
+    /// the package size) is known; empty before that.
     staging: PathBuf,
     allow_insecure: bool,
     /// Where signature verification looks up `<keyId>.pub`.
@@ -154,9 +166,16 @@ enum Current {
 }
 
 impl SpkSink {
-    fn new(staging: PathBuf, allow_insecure: bool, trust_dir: PathBuf) -> SpkSink {
+    fn new(
+        paths: crate::platform::paths::Paths,
+        allow_insecure: bool,
+        requested_root: Option<PathBuf>,
+    ) -> SpkSink {
+        let trust_dir = paths.trust_dir.clone();
         SpkSink {
-            staging,
+            paths,
+            requested_root,
+            staging: PathBuf::new(),
             allow_insecure,
             trust_dir,
             manifest: None,
@@ -172,10 +191,31 @@ impl SpkSink {
         }
     }
 
+    /// The root this package lands on. An installed plugin keeps its recorded
+    /// root; a new one goes to the smallest volume that fits; an explicit root
+    /// wins over the size rule but must be listed in `plugins_dir`.
+    fn chosen_root(&self) -> Result<PathBuf, ProblemError> {
+        let manifest = self.manifest.as_ref().ok_or_else(|| {
+            Problem::Invalid.error("manifest.json must be the first entry of a package")
+        })?;
+        crate::manage::ops::install_plugin::install_root(
+            &self.paths,
+            manifest.id(),
+            self.requested_root.as_deref(),
+            staged_size(
+                manifest,
+                self.manifest_bytes.len(),
+                self.signature_bytes.len(),
+            ),
+        )
+    }
+
     fn prepare_staging(&mut self) -> Result<(), ProblemError> {
         if self.staging_ready {
             return Ok(());
         }
+        let root = self.chosen_root()?;
+        self.staging = staging_dir(&root);
         if self.staging.exists() {
             fs::remove_dir_all(&self.staging).map_err(|error| {
                 Problem::Internal.error(format!("remove {}: {}", self.staging.display(), error))
@@ -539,6 +579,26 @@ fn set_mode(_path: &Path, _mode: u32) -> Result<(), ProblemError> {
     Ok(())
 }
 
+/// A fresh staging directory inside `root`. The name is the marker the daemon
+/// and the startup sweep look for; being inside the root is what keeps the
+/// commit's `rename` on one filesystem.
+fn staging_dir(root: &Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    root.join(format!(".staging-{}-{}", std::process::id(), nanos))
+}
+
+/// What a package will write to disk, known as soon as the manifest is read:
+/// the declared payload plus the two metadata files.
+fn staged_size(manifest: &Manifest, manifest_bytes: usize, signature_bytes: usize) -> u64 {
+    let files: u64 = manifest.files.iter().map(|file| file.size).sum();
+    files
+        .saturating_add(manifest_bytes as u64)
+        .saturating_add(signature_bytes as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,12 +606,32 @@ mod tests {
     use crate::platform::test_support::TempDir;
     use std::path::PathBuf;
 
-    fn stager(staging: PathBuf, allow_insecure: bool, max_bytes: u64) -> StagingInstaller {
-        StagingInstaller::new(staging, allow_insecure, max_bytes, trust_dir())
+    /// A stager whose plugin root is `root/plugins`, so the chosen staging
+    /// directory is observable and the cleanup assertion can list the root.
+    fn stager(root: &Path, allow_insecure: bool, max_bytes: u64) -> StagingInstaller {
+        let mut paths = crate::platform::paths::Paths::under(root);
+        paths.trust_dir = trust_dir().to_path_buf();
+        paths.plugin_roots = vec![root.join("plugins")];
+        std::fs::create_dir_all(root.join("plugins")).expect("plugin root");
+        StagingInstaller::new(paths, allow_insecure, max_bytes, None)
     }
 
-    fn install_bytes(bytes: &[u8], staging: &Path) -> Result<StagedPackage, ProblemError> {
-        let mut installer = stager(staging.to_path_buf(), false, 1024 * 1024);
+    /// Directories a crash or a rejection would leave in the plugin root.
+    fn staging_leftovers(root: &Path) -> Vec<PathBuf> {
+        fs::read_dir(root.join("plugins"))
+            .expect("plugin root")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().starts_with(".staging-"))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    fn install_bytes(bytes: &[u8], root: &Path) -> Result<StagedPackage, ProblemError> {
+        let mut installer = stager(root, false, 1024 * 1024);
         installer.feed(bytes)?;
         installer.finish()
     }
@@ -565,13 +645,14 @@ mod tests {
         assert_eq!(staged.manifest.id(), "demo");
         assert!(staged.signature_verified);
         assert_eq!(
-            std::fs::read(root.path().join("payload/bin/demo")).expect("read"),
+            std::fs::read(staged.root.join("payload/bin/demo")).expect("read"),
             native_payload()
         );
 
         let truncated = &bytes[..bytes.len() / 2];
         let broken = TempDir::new();
         assert!(install_bytes(truncated, broken.path()).is_err());
+        assert!(staging_leftovers(broken.path()).is_empty());
     }
 
     #[test]
@@ -580,7 +661,7 @@ mod tests {
         let bytes = package(&key);
         for chunk in [1usize, 3, 7, 511, 512, 513, 1000] {
             let root = TempDir::new();
-            let mut installer = stager(root.path().to_path_buf(), false, 1024 * 1024);
+            let mut installer = stager(root.path(), false, 1024 * 1024);
             for part in bytes.chunks(chunk) {
                 installer
                     .feed(part)
@@ -592,7 +673,7 @@ mod tests {
             assert_eq!(staged.manifest.id(), "demo");
             assert!(staged.signature_verified);
             assert_eq!(
-                std::fs::read(root.path().join("payload/bin/demo")).expect("read"),
+                std::fs::read(staged.root.join("payload/bin/demo")).expect("read"),
                 native_payload()
             );
         }
@@ -603,15 +684,18 @@ mod tests {
         let key = setup();
         let bytes = package(&key);
         let root = TempDir::new();
-        let staging = root.path().join("staged");
-        let mut installer = stager(staging.clone(), false, 1024 * 1024);
+        let mut installer = stager(root.path(), false, 1024 * 1024);
         installer
             .feed(&bytes[..bytes.len() / 2])
             .expect("prefix feed");
+        assert!(
+            !staging_leftovers(root.path()).is_empty(),
+            "staging started"
+        );
         assert!(installer.finish().is_err());
         drop(installer);
         assert!(
-            !staging.exists(),
+            staging_leftovers(root.path()).is_empty(),
             "a rejected package must not leave a staging directory"
         );
     }
@@ -628,12 +712,14 @@ mod tests {
             .expect("payload");
         bytes[position] = b'j';
         let root = TempDir::new();
-        let staging = root.path().join("staged");
-        let error = match install_bytes(&bytes, &staging) {
+        let error = match install_bytes(&bytes, root.path()) {
             Ok(_) => panic!("a tampered payload is rejected"),
             Err(error) => error,
         };
         assert!(error.detail().contains("sha256"), "{error}");
-        assert!(!staging.exists(), "staging survives a rejected payload");
+        assert!(
+            staging_leftovers(root.path()).is_empty(),
+            "staging survives a rejected payload"
+        );
     }
 }

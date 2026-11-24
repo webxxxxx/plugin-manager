@@ -1,7 +1,6 @@
 //! A .spkb backup arriving inside an import upload: backup.json, the nested
 //! .spk and an optional config entry, parsed as they stream in.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::face::support::CallBudget;
@@ -29,9 +28,11 @@ pub(super) struct BackupImport {
 }
 
 impl BackupImport {
+    /// A `.spkb` bundle is held in memory (it is a handful of files), so the
+    /// bundle needs no scratch tree: the inner `.spk` gets its own staging
+    /// directory in the root it will live on.
     pub(super) fn new(
         params: &ImportParams,
-        staging: PathBuf,
         paths: Arc<Paths>,
         limits: Arc<crate::platform::limits::Limits>,
         allow_insecure: bool,
@@ -39,7 +40,7 @@ impl BackupImport {
         let max = limits.max_package_bytes;
         BackupImport {
             tar: package::TarFeed::new(max),
-            sink: BackupSink::new(params, staging, paths, limits, allow_insecure),
+            sink: BackupSink::new(params, paths, limits, allow_insecure),
         }
     }
 
@@ -58,7 +59,6 @@ impl BackupImport {
 }
 
 struct BackupSink {
-    staging: PathBuf,
     paths: Arc<Paths>,
     limits: Arc<crate::platform::limits::Limits>,
     allow_insecure: bool,
@@ -89,13 +89,11 @@ enum BackupCurrent {
 impl BackupSink {
     fn new(
         params: &ImportParams,
-        staging: PathBuf,
         paths: Arc<Paths>,
         limits: Arc<crate::platform::limits::Limits>,
         allow_insecure: bool,
     ) -> BackupSink {
         BackupSink {
-            staging,
             paths,
             limits,
             allow_insecure,
@@ -134,11 +132,13 @@ impl package::TarSink for BackupSink {
                         Problem::Invalid.error(format!("{} is not a regular file", entry.path))
                     );
                 }
+                // The inner .spk chooses its own root; the bundle's scratch
+                // tree above is only extraction space.
                 self.installer = Some(package::StagingInstaller::new(
-                    self.staging.clone(),
+                    self.paths.as_ref().clone(),
                     self.allow_insecure,
                     self.limits.max_package_bytes,
-                    &self.paths.trust_dir,
+                    None,
                 ));
                 self.current = Some(BackupCurrent::Spk);
             }

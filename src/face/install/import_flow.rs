@@ -11,7 +11,7 @@ use crate::platform::config::Config;
 use crate::platform::paths::Paths;
 
 use super::backup::BackupImport;
-use super::{import_outcome_json, import_response, install_staged, staging_path};
+use super::{import_outcome_json, import_response, install_staged};
 
 pub(super) struct ImportParams {
     pub(super) config_id: Option<String>,
@@ -76,11 +76,13 @@ impl ImportFlow {
         let first = package::tar_header_path(&data).ok().flatten();
         match first.as_deref() {
             Some("manifest.json") => {
+                // An import asks for no particular root: the size rule picks
+                // one, unless the plugin is already installed somewhere.
                 let mut installer = package::StagingInstaller::new(
-                    staging_path(&self.paths),
+                    self.paths.as_ref().clone(),
                     self.allow_insecure,
                     self.limits.max_package_bytes,
-                    &self.paths.trust_dir,
+                    None,
                 );
                 installer.feed(&data)?;
                 self.stage = ImportStage::Package { installer };
@@ -88,7 +90,6 @@ impl ImportFlow {
             Some("backup.json") => {
                 let mut import = BackupImport::new(
                     &self.params,
-                    staging_path(&self.paths),
                     self.paths.clone(),
                     self.limits.clone(),
                     self.allow_insecure,

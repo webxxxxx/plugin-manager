@@ -15,14 +15,12 @@
 //! body states; `backup` owns the .spkb sink. This entry module keeps the
 //! staged-install handoff and the response shapes both flows share.
 
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
 use serde_json::{json, Value};
 
 use crate::manage::ops::transfer;
 use crate::platform::config::Config;
-use crate::platform::paths::Paths;
 use crate::server::http::model as http;
 
 use super::support::{self, CallBudget};
@@ -63,24 +61,6 @@ fn install_staged(
     .inspect_err(|_| {
         let _ = std::fs::remove_dir_all(root);
     })
-}
-
-fn staging_path(paths: &Paths) -> PathBuf {
-    // Staging must share a filesystem with the plugin tree it is renamed into,
-    // so it lives in the default root. Choosing the install root before the
-    // package bytes arrive is #293; until then a plugin that lives on another
-    // root is refused by the commit check instead of being copied across
-    // volumes.
-    let plugins = paths
-        .default_plugin_root()
-        .canonicalize()
-        .unwrap_or_else(|_| paths.default_plugin_root().to_path_buf());
-    let _ = std::fs::create_dir_all(&plugins);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    plugins.join(format!(".staging-{}-{}", std::process::id(), nanos))
 }
 
 /// The one success body both import routes answer with. The package/backup
@@ -193,6 +173,7 @@ mod tests {
             strategy,
             enable,
             allow_hooks,
+            root,
         }) = target_of("POST", "/api/v1/plugins")
         else {
             panic!("install route");
@@ -200,11 +181,13 @@ mod tests {
         assert_eq!(strategy, "replace");
         assert!(enable);
         assert!(!allow_hooks);
+        assert_eq!(root, None, "no query means the size rule picks the root");
 
         let Some(PackageTarget::Install {
             strategy,
             enable,
             allow_hooks,
+            root,
         }) = target_of(
             "POST",
             "/api/v1/plugins?strategy=keep-old&enable=false&allow_hooks=true",
@@ -215,6 +198,14 @@ mod tests {
         assert_eq!(strategy, "keep-old");
         assert!(!enable);
         assert!(allow_hooks);
+        assert_eq!(root, None, "only an explicit ?root= names a root");
+
+        let Some(PackageTarget::Install { root, .. }) =
+            target_of("POST", "/api/v1/plugins?root=/mnt/sd/svcd/plugins")
+        else {
+            panic!("install route");
+        };
+        assert_eq!(root.as_deref(), Some("/mnt/sd/svcd/plugins"));
     }
 
     #[test]
@@ -500,8 +491,8 @@ mod tests {
             "this unit test has no daemon to install into: {}",
             String::from_utf8_lossy(&response)
         );
-        let staged_path = crate::platform::storage::locate(&config.paths, &staged.id)
-            .expect("staged blob path");
+        let staged_path =
+            crate::platform::storage::locate(&config.paths, &staged.id).expect("staged blob path");
         assert!(
             !staged_path.exists(),
             "the installed package must release its temp blob"
@@ -550,7 +541,10 @@ mod tests {
         );
         let unrelated_path =
             crate::platform::storage::locate(&config.paths, &unrelated.id).expect("other path");
-        assert!(unrelated_path.exists(), "another transfer's blob must survive");
+        assert!(
+            unrelated_path.exists(),
+            "another transfer's blob must survive"
+        );
     }
 
     #[test]
@@ -575,6 +569,7 @@ mod tests {
                 strategy: "replace".into(),
                 enable: true,
                 allow_hooks: false,
+                root: None,
             },
             http::Framing::Chunked,
             false,

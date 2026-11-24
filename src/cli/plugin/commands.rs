@@ -31,7 +31,8 @@ pub fn run(args: Vec<String>) -> i32 {
             path,
             strategy,
             allow_hooks,
-        } => install(&config, &path, &strategy, allow_hooks),
+            root,
+        } => install(&config, &path, &strategy, allow_hooks, root.as_deref()),
         Command::Verify { path, json, pubkey } => verify(&config, &path, json, pubkey.as_deref()),
         Command::Uninstall { id, purge } => uninstall(&config, &id, purge),
         Command::EditConfig {
@@ -115,7 +116,13 @@ fn lifecycle(config: &Config, verb: &str, id: &str) -> i32 {
     }
 }
 
-fn install(config: &Config, path: &PathBuf, strategy: &str, allow_hooks: bool) -> i32 {
+fn install(
+    config: &Config,
+    path: &PathBuf,
+    strategy: &str,
+    allow_hooks: bool,
+    root: Option<&Path>,
+) -> i32 {
     // The daemon runs `plugin::verify` before it touches the plugin tree; the
     // same function backs `plugin verify`. Checking here as well would read
     // trust.d and svcd.conf in the caller's environment instead of the
@@ -134,6 +141,7 @@ fn install(config: &Config, path: &PathBuf, strategy: &str, allow_hooks: bool) -
             "path": path.to_string_lossy(),
             "strategy": strategy,
             "allowHooks": allow_hooks,
+            "root": root.map(|root| root.to_string_lossy().into_owned()),
         }),
     ) {
         Ok(status) => print_status(status, false),
