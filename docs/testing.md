@@ -203,11 +203,12 @@ Windows 优先硬链接（建符号链接需要权限；硬链接失败时回退
 做有限重试；不要把它当成测试失败。运行时记录的单测通过 `runtime::tests::with_root` 注入 root，**不要**再在测试里设
 `SVCD_RUN_DIR`（进程级 env + 全局缓存会让并行测试互相踩）。CI 的集成测试走 `node tools/check.mjs integration`：
 它从 `tests/*.rs` 自动发现 target，每个 target 单独一次 cargo 调用、各自吃一个墙钟上限；
-http 套件用 4 线程（临时端口 + 独立 sandbox，连续 5 次全绿；`SVCD_HTTP_THREADS` 覆盖），
+http 与 daemon 各用 4 线程（都是进程重活：临时端口 + 独立 sandbox，各自连续 5 次全绿；
+`SVCD_HTTP_THREADS` / `SVCD_DAEMON_THREADS` 覆盖），
 其余串行。单测没有 sandbox，默认并行（`SVCD_UNIT_THREADS` 覆盖，本机 8、CI 4）。
 `node tools/check.mjs full` 默认就是「单测 8 线程 + integration」，本地红与 CI 红同义。
 `node tools/check.mjs linux` 跑的是同一份步骤：WSL 里每个 target 一次 `wsl.exe` + cargo，
-http 同样 4 线程，所以 WSL 的墙钟与 Windows 同一量级（见 §6 顶部注释）。
+线程口径与 Windows 完全一致，所以 WSL 的墙钟与 Windows 同一量级（见 §6 顶部注释）。
 只有显式 `--parallel` 才让全部集成测试并发，那时执行顺序不由工具承诺。
 `tools/check.mjs --selftest` 会用一个临时 tests 目录证明发现逻辑，并用空目录证明它会红。
 
