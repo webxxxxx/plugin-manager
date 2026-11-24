@@ -109,13 +109,13 @@ fn commit_staged(
             .map(|path| staged.root.starts_with(path))
             .unwrap_or(false)
     {
-        // The rename that commits a package cannot cross filesystems, so the
-        // staged tree has to sit in the root the plugin lives in. Staging is
-        // created in the default root; a plugin whose recorded root is another
-        // one is refused here instead of being copied across volumes. Choosing
-        // the root before the bytes arrive closes this (#293).
+        // The rename that commits a package cannot cross filesystems. Staging
+        // is created in the root the uploader chose, and `install_staged`
+        // derives that same root from this tree, so reaching here means a
+        // caller handed over a tree from somewhere else: refuse it rather than
+        // copy a package across volumes.
         return Err(Problem::Invalid.error(format!(
-            "staged tree {} is not in the plugin root {}: a plugin that lives on another root is upgraded there once install chooses its root (#293)",
+            "staged tree {} is not inside the plugin root {}",
             staged.root.display(),
             staging_root.display()
         )));
