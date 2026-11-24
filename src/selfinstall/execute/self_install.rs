@@ -2,6 +2,30 @@ use super::plan_exec::usage_self;
 use super::user_path::{add_user_path, user_path_update_skipped};
 use super::*;
 
+/// Refuse an install that would wrap a document this binary cannot load.
+///
+/// The failure this replaces was silent: the files were upgraded, the unit was
+/// enabled, systemd retried five times, and the operator only saw
+/// "service registration failed" while the daemon's `invalid config` line sat
+/// in the journal.
+/// Reuse the installed document unless this binary cannot load it.
+fn installed_conf_or_refuse() -> Result<Option<crate::platform::settings::Settings>, i32> {
+    match installed_conf() {
+        InstalledConf::Loaded(settings) => Ok(Some(*settings)),
+        InstalledConf::Absent => Ok(None),
+        InstalledConf::Invalid(message) => Err(refuse_invalid_conf(&message)),
+    }
+}
+
+fn refuse_invalid_conf(message: &str) -> i32 {
+    eprintln!("svcd: config {}", message);
+    eprintln!(
+        "svcd: refusing to install: the daemon exits 1 on this document; fix the key, or replace a pre-ADR-0010 `http_port`/`lan_default` pair with `bind = <ip>:<port>`"
+    );
+    eprintln!("svcd: rerun with --conf <file> to install a different document instead");
+    EXIT_ERROR
+}
+
 pub fn self_install(args: &[String]) -> i32 {
     let request = match parse_self(args, false) {
         Ok(request) => request,
@@ -42,7 +66,10 @@ pub fn self_install(args: &[String]) -> i32 {
     // Without `--conf`, reuse the installed config so a reinstall keeps the
     // recorded `install_dir` instead of falling back to /usr/sbin.
     let installed = if prepared.is_none() {
-        installed_conf_settings()
+        match installed_conf_or_refuse() {
+            Ok(settings) => settings,
+            Err(code) => return code,
+        }
     } else {
         None
     };
@@ -302,10 +329,18 @@ fn self_install_user(request: SelfRequest) -> i32 {
         },
         None => None,
     };
+    let installed = if prepared.is_none() {
+        match installed_conf_or_refuse() {
+            Ok(settings) => settings,
+            Err(code) => return code,
+        }
+    } else {
+        None
+    };
     let mut settings = prepared
         .as_ref()
         .map(|(_, settings)| settings.clone())
-        .or_else(installed_conf_settings)
+        .or(installed)
         .unwrap_or_default();
     let prefix = request.prefix.as_ref().map(|prefix| {
         if prefix.is_absolute() {

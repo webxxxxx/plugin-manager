@@ -229,25 +229,60 @@ fn record_install_dir(path: &Path, install_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Parse the installed `svcd.conf`, if there is one, so reinstall and
-/// `--uninstall` can find an `install_dir` without a `--conf` argument
-/// (uninstall does not accept one). Uses the same discovery as every other
-/// process, including `<program dir>/config/svcd.conf`, so a prefixed install
-/// is found without environment variables.
-fn installed_conf_settings() -> Option<crate::platform::settings::Settings> {
-    // Discover with the normal precedence, then parse the document itself:
-    // install and uninstall follow the roots recorded in the file, not the
-    // operator's shell environment (ADR-0004).
-    let (_, path) = crate::platform::settings::load(None).ok()?;
-    let path = path?;
+/// The document an install reuses when `--conf` is not passed, including the
+/// reason it cannot be read.
+///
+/// `--install` must not upgrade the binary and register a service around a
+/// document the daemon refuses: systemd would retry five times, land in
+/// `failed`, and the installer would only report that registration failed
+/// (ADR-0010 makes removed keys errors, not warnings).
+pub(super) enum InstalledConf {
+    /// No document exists in any discovered location.
+    Absent,
+    Loaded(Box<crate::platform::settings::Settings>),
+    /// A document exists but this binary will not load it.
+    Invalid(String),
+}
+
+/// Read the installed document as the daemon will read it.
+///
+/// The environment overrides are deliberately not applied: the service starts
+/// without the installer's shell, so a `SVCD_*` variable must not make a
+/// document look valid here that the unit cannot load.
+pub(super) fn installed_conf() -> InstalledConf {
+    let path = crate::platform::settings::discovered_conf();
     if !path.is_file() {
-        return None;
+        return InstalledConf::Absent;
     }
-    let text = fs::read_to_string(&path).ok()?;
-    let mut settings =
-        crate::platform::settings::parse(&text, path.parent().unwrap_or(Path::new("."))).ok()?;
-    crate::platform::config_file::fill_missing(&mut settings);
-    Some(settings)
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) => {
+            return InstalledConf::Invalid(format!("cannot read {}: {}", path.display(), error))
+        }
+    };
+    match crate::platform::settings::parse(&text, path.parent().unwrap_or(Path::new("."))) {
+        Ok(mut settings) => {
+            crate::platform::config_file::fill_missing(&mut settings);
+            InstalledConf::Loaded(Box::new(settings))
+        }
+        Err(error) => InstalledConf::Invalid(format!("{}: {}", path.display(), error)),
+    }
+}
+
+/// The installed document's recorded settings, when one exists and parses.
+///
+/// Reinstall and `--uninstall` use it to find an `install_dir` without a
+/// `--conf` argument (uninstall does not accept one). Discovery covers
+/// `<program dir>/config/svcd.conf`, so a prefixed install is found without
+/// environment variables.
+fn installed_conf_settings() -> Option<crate::platform::settings::Settings> {
+    // A document this binary cannot load is "no usable document" for callers
+    // that only need the recorded roots (uninstall must still work on a broken
+    // install); `--install` uses `installed_conf` and refuses it instead.
+    match installed_conf() {
+        InstalledConf::Loaded(settings) => Some(*settings),
+        InstalledConf::Absent | InstalledConf::Invalid(_) => None,
+    }
 }
 
 /// The installed document for a known prefix.

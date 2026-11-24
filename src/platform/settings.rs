@@ -289,9 +289,18 @@ pub(crate) fn load(conf: Option<&Path>) -> Result<(Settings, Option<PathBuf>), S
         }
         return Ok((load_from(path)?, Some(path.to_path_buf())));
     }
+    let path = discovered_conf();
+    Ok((load_from(&path)?, Some(path)))
+}
+
+/// The document a process without `--conf` resolves to.
+///
+/// Discovery is separate from parsing so a caller that reads the document
+/// without the environment overrides (the installer, which reports the file as
+/// the daemon will read it) names the same path.
+pub(crate) fn discovered_conf() -> PathBuf {
     if let Some(dir) = std::env::var_os("SVCD_CONFIG_DIR") {
-        let path = PathBuf::from(dir).join("svcd.conf");
-        return Ok((load_from(&path)?, Some(path)));
+        return PathBuf::from(dir).join("svcd.conf");
     }
     if let Some(dir) = std::env::current_exe()
         .ok()
@@ -299,12 +308,11 @@ pub(crate) fn load(conf: Option<&Path>) -> Result<(Settings, Option<PathBuf>), S
     {
         for path in [dir.join("config").join("svcd.conf"), dir.join("svcd.conf")] {
             if path.is_file() {
-                return Ok((load_from(&path)?, Some(path)));
+                return path;
             }
         }
     }
-    let path = crate::platform::host::dirs::default_config_dir().join("svcd.conf");
-    Ok((load_from(&path)?, Some(path)))
+    crate::platform::host::dirs::default_config_dir().join("svcd.conf")
 }
 
 fn load_from(path: &Path) -> Result<Settings, String> {
