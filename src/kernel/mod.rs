@@ -15,6 +15,8 @@
 
 pub mod contract;
 pub mod failure;
+pub mod hook;
+pub mod layout;
 pub mod projection;
 pub mod registry;
 pub mod schema;

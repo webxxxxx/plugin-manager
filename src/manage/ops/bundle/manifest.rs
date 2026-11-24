@@ -131,7 +131,7 @@ pub(super) fn assemble_manifest(
     if !sources.iter().any(|source| source.path == exec_path) {
         return Err(Problem::Invalid.error(format!("exec.path is not in files[]: {}", exec_path)));
     }
-    package::check_path(&exec_path)?;
+    crate::kernel::layout::check_path(&exec_path)?;
 
     if options.from_core {
         let source = sources

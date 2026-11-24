@@ -3,13 +3,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::kernel::failure::{Problem, ProblemError};
+use crate::kernel::hook::{HookSpec, Hooks, TIMEOUT_MS};
+use crate::kernel::layout::plugin_dir;
 use crate::kernel::registry::{Interpreter, Service};
 use crate::manage as package;
 use crate::manage::check::interpreter;
-use crate::manage::model::layout::{current_version, plugin_dir};
+use crate::manage::model::layout::current_version;
 use crate::manage::model::manifest::Package;
 use crate::manage::ops::config::{write_config, write_hash};
-use crate::manage::ops::hook;
 use crate::manage::ops::scan::{resolve_interpreter, service_from_manifest};
 use crate::manage::{
     ensure_hooks_allowed, ensure_hooks_allowed_manifest, remove_versions, replace_plan,
@@ -46,7 +47,7 @@ pub fn install_staged(
     strategy: Strategy,
     opt_in_hooks: bool,
     host_interpreter: Option<Interpreter>,
-    poll: &mut dyn FnMut(),
+    hooks: &mut dyn Hooks,
 ) -> Result<Service, ProblemError> {
     // The id, its charset and the reserved `svc` name were already rejected by
     // `parse_manifest`; a clash with a core service is refused by the registry
@@ -69,7 +70,7 @@ pub fn install_staged(
             &plugin_dir,
             was_installed,
             host_interpreter.as_ref(),
-            poll,
+            hooks,
         ),
         Strategy::Replace => install_replace_staged(
             paths,
@@ -79,7 +80,7 @@ pub fn install_staged(
             &plugin_dir,
             was_installed,
             host_interpreter.as_ref(),
-            poll,
+            hooks,
         ),
     }
 }
@@ -159,12 +160,10 @@ fn copy_config_staged(
 }
 
 fn run_post_install_manifest(
-    paths: &Paths,
-    limits: &crate::platform::limits::Limits,
     manifest: &package::Manifest,
     id: &str,
     version_dir: &Path,
-    poll: &mut dyn FnMut(),
+    hooks: &mut dyn Hooks,
 ) -> Result<(), ProblemError> {
     let Some(path) = manifest
         .hooks
@@ -173,25 +172,52 @@ fn run_post_install_manifest(
     else {
         return Ok(());
     };
-    hook::run(
-        &hook::Invocation {
+    hooks
+        .run(&HookSpec {
             id,
             version: &manifest.version,
             action: "post-install",
             version_dir,
             path,
-            timeout_ms: hook::TIMEOUT_MS,
-        },
-        paths,
-        limits,
-        poll,
-    )
-    .map_err(|error| {
-        ProblemError::new(
-            error.problem,
-            format!("post-install hook failed: {}", error),
-        )
-    })
+            timeout_ms: TIMEOUT_MS,
+        })
+        .map_err(|error| {
+            ProblemError::new(
+                error.problem,
+                format!("post-install hook failed: {}", error),
+            )
+        })
+}
+
+fn run_post_install(
+    package: &Package,
+    id: &str,
+    version_dir: &Path,
+    hooks: &mut dyn Hooks,
+) -> Result<(), ProblemError> {
+    let Some(path) = package
+        .manifest
+        .hooks
+        .as_ref()
+        .and_then(|hooks| hooks.post_install.as_deref())
+    else {
+        return Ok(());
+    };
+    hooks
+        .run(&HookSpec {
+            id,
+            version: &package.manifest.version,
+            action: "post-install",
+            version_dir,
+            path,
+            timeout_ms: TIMEOUT_MS,
+        })
+        .map_err(|error| {
+            ProblemError::new(
+                error.problem,
+                format!("post-install hook failed: {}", error),
+            )
+        })
 }
 
 /// Remove stale staging directories. Called once at daemon startup.
@@ -257,7 +283,7 @@ pub fn install_package(
     strategy: Strategy,
     opt_in_hooks: bool,
     host_interpreter: Option<Interpreter>,
-    poll: &mut dyn FnMut(),
+    hooks: &mut dyn Hooks,
 ) -> Result<Service, InstallFailure> {
     // The id and the reserved `svc` name are already rejected by
     // `parse_manifest`; a core service with the same id is refused by the
@@ -280,7 +306,7 @@ pub fn install_package(
             &plugin_dir,
             was_installed,
             host_interpreter.as_ref(),
-            poll,
+            hooks,
         ),
         Strategy::Replace => install_replace(
             paths,
@@ -290,47 +316,10 @@ pub fn install_package(
             &plugin_dir,
             was_installed,
             host_interpreter.as_ref(),
-            poll,
+            hooks,
         )
         .map_err(InstallFailure::from),
     }
-}
-
-fn run_post_install(
-    paths: &Paths,
-    limits: &crate::platform::limits::Limits,
-    package: &Package,
-    id: &str,
-    version_dir: &Path,
-    poll: &mut dyn FnMut(),
-) -> Result<(), ProblemError> {
-    let Some(path) = package
-        .manifest
-        .hooks
-        .as_ref()
-        .and_then(|hooks| hooks.post_install.as_deref())
-    else {
-        return Ok(());
-    };
-    hook::run(
-        &hook::Invocation {
-            id,
-            version: &package.manifest.version,
-            action: "post-install",
-            version_dir,
-            path,
-            timeout_ms: hook::TIMEOUT_MS,
-        },
-        paths,
-        limits,
-        poll,
-    )
-    .map_err(|error| {
-        ProblemError::new(
-            error.problem,
-            format!("post-install hook failed: {}", error),
-        )
-    })
 }
 
 fn write_version(
@@ -473,9 +462,18 @@ pub fn root_required() -> Result<(), ProblemError> {
 
 #[cfg(test)]
 mod tests {
+    struct NoHooks;
+
+    impl crate::kernel::hook::Hooks for NoHooks {
+        fn run(&mut self, _spec: &crate::kernel::hook::HookSpec<'_>) -> Result<(), ProblemError> {
+            Ok(())
+        }
+    }
+
     use super::*;
+    use crate::kernel::layout::plugin_dir;
     use crate::manage::check::plugin::Strategy;
-    use crate::manage::model::layout::{current_version, plugin_dir};
+    use crate::manage::model::layout::current_version;
     use crate::manage::model::manifest::Package;
     use crate::platform::paths::Paths;
 
@@ -544,7 +542,7 @@ mod tests {
             Strategy::KeepOld,
             false,
             None,
-            &mut || {},
+            &mut NoHooks,
         )
         .expect("first install");
         install_package(
@@ -554,7 +552,7 @@ mod tests {
             Strategy::KeepOld,
             false,
             None,
-            &mut || {},
+            &mut NoHooks,
         )
         .expect("keep-old install");
 
@@ -574,7 +572,7 @@ mod tests {
             Strategy::Replace,
             false,
             None,
-            &mut || {},
+            &mut NoHooks,
         )
         .expect("replace install");
         assert!(

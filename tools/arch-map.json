@@ -109,6 +109,16 @@
       "layer": "kernel",
       "note": "src/kernel/：契约、失败类别、conformance（#102 新建）"
     },
+    "layout": {
+      "concept": "kernel/layout",
+      "layer": "kernel",
+      "note": "插件目录与 manifest 路径规则；manage 与 supervise 共用"
+    },
+    "hook_port": {
+      "concept": "kernel/hook",
+      "layer": "kernel",
+      "note": "manage 声明 hook 端口，supervise 实现；manage 不再 spawn hook"
+    },
     "auth": {
       "concept": "platform/auth",
       "layer": "platform"
@@ -188,7 +198,7 @@
       "layer": "domain"
     },
     "hook": {
-      "concept": "manage/hook",
+      "concept": "supervise/hook",
       "layer": "domain"
     },
     "script": {
@@ -325,6 +335,7 @@
     "src/cli/plugin/render.rs": "plugin_cli",
     "src/cli/status.rs": "status",
     "src/cli/svc.rs": "svc",
+    "src/cli/svcd.rs": "cli",
     "src/cli/svc/logs.rs": "svc",
     "src/cli/tune.rs": "tune",
     "src/cli/upgrade.rs": "cli",
@@ -377,6 +388,8 @@
     "src/kernel/fixtures.rs": "kernel",
     "src/kernel/memory.rs": "kernel",
     "src/kernel/mod.rs": "kernel",
+    "src/kernel/hook.rs": "hook_port",
+    "src/kernel/layout.rs": "layout",
     "src/kernel/projection.rs": "kernel",
     "src/kernel/registry.rs": "registry",
     "src/kernel/schema.rs": "kernel",
@@ -397,7 +410,6 @@
     "src/manage/model/layout.rs": "plugin",
     "src/manage/model/manifest.rs": "package",
     "src/manage/model/mod.rs": "manage",
-    "src/manage/model/path.rs": "package",
     "src/manage/model/ustar.rs": "package",
     "src/manage/ops/bundle.rs": "bundle",
     "src/manage/ops/bundle/manifest.rs": "bundle",
@@ -407,7 +419,6 @@
     "src/manage/ops/config.rs": "plugin",
     "src/manage/ops/export.rs": "package",
     "src/manage/ops/export_plugin.rs": "plugin",
-    "src/manage/ops/hook.rs": "hook",
     "src/manage/ops/install.rs": "package",
     "src/manage/ops/install_plugin.rs": "plugin",
     "src/manage/ops/install_plugin/keep_old.rs": "plugin",
@@ -518,6 +529,7 @@
     "src/supervise/model/supervisor.rs": "supervisor",
     "src/supervise/ops/builtin_adapter.rs": "builtin_adapter",
     "src/supervise/ops/factory.rs": "supervise",
+    "src/supervise/ops/hook.rs": "hook",
     "src/supervise/ops/host.rs": "supervise",
     "src/supervise/ops/invoke.rs": "supervise",
     "src/supervise/ops/lifecycle.rs": "supervise",

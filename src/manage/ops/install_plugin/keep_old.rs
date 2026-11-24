@@ -12,7 +12,7 @@ pub(super) fn install_keep_old(
     plugin_dir: &Path,
     was_installed: bool,
     interpreter: Option<&Interpreter>,
-    poll: &mut dyn FnMut(),
+    hooks: &mut dyn Hooks,
 ) -> Result<Service, InstallFailure> {
     // No hook-specific rollback here: keep-old keeps the previous version and
     // switches `current`, so a failing post-install just reports the error.
@@ -38,7 +38,7 @@ pub(super) fn install_keep_old(
         enabled,
         interpreter,
     )?;
-    run_post_install(paths, limits, package, id, &version_dir, poll)?;
+    run_post_install(package, id, &version_dir, hooks)?;
     Ok(service)
 }
 
@@ -51,13 +51,13 @@ pub(super) fn install_keep_old_staged(
     plugin_dir: &Path,
     was_installed: bool,
     interpreter: Option<&Interpreter>,
-    poll: &mut dyn FnMut(),
+    hooks: &mut dyn Hooks,
 ) -> Result<Service, ProblemError> {
     let manifest = staged.manifest.clone();
     let (version_dir, enabled) = commit_staged(staged, plugin_dir, was_installed)?;
     copy_config_staged(&manifest, plugin_dir, &version_dir)?;
     let service =
         service_from_manifest(paths, limits, &version_dir, &manifest, enabled, interpreter)?;
-    run_post_install_manifest(paths, limits, &manifest, id, &version_dir, poll)?;
+    run_post_install_manifest(&manifest, id, &version_dir, hooks)?;
     Ok(service)
 }

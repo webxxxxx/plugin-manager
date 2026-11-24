@@ -12,7 +12,7 @@ pub(super) fn install_replace(
     plugin_dir: &Path,
     was_installed: bool,
     interpreter: Option<&Interpreter>,
-    poll: &mut dyn FnMut(),
+    hooks: &mut dyn Hooks,
 ) -> Result<Service, ProblemError> {
     let old_version =
         current_version(paths, id).filter(|version| plugin_dir.join(version).is_dir());
@@ -66,7 +66,7 @@ pub(super) fn install_replace(
                 enabled,
                 interpreter,
             )?;
-            run_post_install(paths, limits, package, id, &version_dir, poll)?;
+            run_post_install(package, id, &version_dir, hooks)?;
             Ok(service)
         });
 
@@ -150,7 +150,7 @@ pub(super) fn install_replace_staged(
     plugin_dir: &Path,
     was_installed: bool,
     interpreter: Option<&Interpreter>,
-    poll: &mut dyn FnMut(),
+    hooks: &mut dyn Hooks,
 ) -> Result<Service, ProblemError> {
     let manifest = staged.manifest.clone();
     let old_version =
@@ -175,7 +175,7 @@ pub(super) fn install_replace_staged(
         copy_config_staged(&manifest, plugin_dir, &version_dir)?;
         let service =
             service_from_manifest(paths, limits, &version_dir, &manifest, enabled, interpreter)?;
-        run_post_install_manifest(paths, limits, &manifest, id, &version_dir, poll)?;
+        run_post_install_manifest(&manifest, id, &version_dir, hooks)?;
         Ok(service)
     })();
     match result {

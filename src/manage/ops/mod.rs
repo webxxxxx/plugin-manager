@@ -4,7 +4,6 @@ pub mod bundle;
 pub mod config;
 pub mod export;
 pub mod export_plugin;
-pub mod hook;
 pub mod install;
 pub mod install_plugin;
 pub mod scan;

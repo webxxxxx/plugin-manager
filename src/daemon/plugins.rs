@@ -110,42 +110,49 @@ impl Daemon {
         }
         let still_running = self.host.is_running(&id);
         let mut poll = self.host.hook_pump();
-        let service = match plugin::install_package(
-            &self.config.paths,
-            &self.config.limits,
-            &package,
-            strategy,
-            allow_hooks,
-            host_interpreter.clone(),
-            &mut poll,
-        ) {
-            Ok(service) => service,
-            Err(plugin::InstallFailure::OutOfSpace(error)) if strategy == Strategy::KeepOld => {
-                if still_running {
-                    return Err(ProblemError::new(
+        let service = {
+            let mut hooks = crate::supervise::ops::hook::Runner::new(
+                &self.config.paths,
+                &self.config.limits,
+                &mut poll,
+            );
+            match plugin::install_package(
+                &self.config.paths,
+                &self.config.limits,
+                &package,
+                strategy,
+                allow_hooks,
+                host_interpreter.clone(),
+                &mut hooks,
+            ) {
+                Ok(service) => service,
+                Err(plugin::InstallFailure::OutOfSpace(error)) if strategy == Strategy::KeepOld => {
+                    if still_running {
+                        return Err(ProblemError::new(
                         Problem::Internal,
                         format!(
                             "not enough space for keep-old; stop the plugin and retry with replace: {}",
                             error
                         ),
                     ));
+                    }
+                    warn!(
+                        "plugin {}: keep-old ran out of space; falling back to replace",
+                        id
+                    );
+                    plugin::install_package(
+                        &self.config.paths,
+                        &self.config.limits,
+                        &package,
+                        Strategy::Replace,
+                        allow_hooks,
+                        host_interpreter,
+                        &mut hooks,
+                    )
+                    .map_err(plugin::InstallFailure::into_problem)?
                 }
-                warn!(
-                    "plugin {}: keep-old ran out of space; falling back to replace",
-                    id
-                );
-                plugin::install_package(
-                    &self.config.paths,
-                    &self.config.limits,
-                    &package,
-                    Strategy::Replace,
-                    allow_hooks,
-                    host_interpreter,
-                    &mut poll,
-                )
-                .map_err(plugin::InstallFailure::into_problem)?
+                Err(failure) => return Err(failure.into_problem()),
             }
-            Err(failure) => return Err(failure.into_problem()),
         };
         self.finish_install(
             &id,
@@ -224,15 +231,22 @@ impl Daemon {
         }
         let still_running = self.host.is_running(&id);
         let mut poll = self.host.hook_pump();
-        let service = plugin::install_staged(
-            &self.config.paths,
-            &self.config.limits,
-            staged,
-            strategy,
-            allow_hooks,
-            host_interpreter,
-            &mut poll,
-        )?;
+        let service = {
+            let mut hooks = crate::supervise::ops::hook::Runner::new(
+                &self.config.paths,
+                &self.config.limits,
+                &mut poll,
+            );
+            plugin::install_staged(
+                &self.config.paths,
+                &self.config.limits,
+                staged,
+                strategy,
+                allow_hooks,
+                host_interpreter,
+                &mut hooks,
+            )?
+        };
         self.finish_install(
             &id,
             &version,
@@ -262,13 +276,14 @@ impl Daemon {
             self.host.stop_service(id, clock)?;
         }
         let mut poll = self.host.hook_pump();
-        plugin::uninstall(
-            &self.config.paths,
-            &self.config.limits,
-            id,
-            purge,
-            &mut poll,
-        )?;
+        {
+            let mut hooks = crate::supervise::ops::hook::Runner::new(
+                &self.config.paths,
+                &self.config.limits,
+                &mut poll,
+            );
+            plugin::uninstall(&self.config.paths, id, purge, &mut hooks)?;
+        }
         self.host.forget(id);
         self.bump_catalog();
         if purge {
@@ -352,7 +367,7 @@ mod tests {
         std::fs::create_dir_all(&daemon.config.paths.plugins_dir).expect("plugins dir");
 
         // The direct path installs the .spk through verify + install_package.
-        let files = crate::manage::test_support::tempdir::TempDir::new();
+        let files = crate::platform::test_support::TempDir::new();
         let spk = files.path().join("demo.spk");
         std::fs::write(&spk, &package).expect("write package");
         let direct_status = daemon

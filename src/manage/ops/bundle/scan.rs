@@ -264,7 +264,7 @@ pub(super) fn valid_platform(platform: &str) -> bool {
 
 pub(super) fn normalize_exec(value: &str) -> Result<String, ProblemError> {
     let value = value.strip_prefix("./").unwrap_or(value);
-    package::check_path(value)?;
+    crate::kernel::layout::check_path(value)?;
     Ok(value.to_string())
 }
 

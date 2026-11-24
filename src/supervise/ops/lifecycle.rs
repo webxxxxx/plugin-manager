@@ -6,7 +6,6 @@ use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::projection::Status;
 use crate::kernel::registry::{Kind, Registry, State, RESERVED_ID};
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
-use crate::manage as plugin;
 use crate::platform::clock::Clock;
 use crate::platform::compat;
 use crate::platform::log;
@@ -235,7 +234,7 @@ impl Supervisor {
             })?;
         let (marker, create) = match kind {
             Kind::Plugin => (
-                plugin::plugin_dir(&self.config.paths, id).join("enabled"),
+                crate::kernel::layout::plugin_dir(&self.config.paths, id).join("enabled"),
                 enabled,
             ),
             Kind::Core => (

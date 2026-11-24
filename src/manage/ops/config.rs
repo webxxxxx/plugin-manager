@@ -7,8 +7,9 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::kernel::failure::{Problem, ProblemError};
+use crate::kernel::layout::plugin_dir;
 use crate::manage as package;
-use crate::manage::model::layout::{current_version, plugin_dir};
+use crate::manage::model::layout::current_version;
 use crate::manage::ops::scan::read_manifest;
 use crate::platform::paths::Paths;
 
@@ -66,7 +67,7 @@ pub fn config_check(paths: &Paths, id: &str, candidate: &Path) -> Result<(), Pro
     let Some(check) = manifest.config_check else {
         return Ok(());
     };
-    package::check_path(&check.path)?;
+    crate::kernel::layout::check_path(&check.path)?;
     let program = version_dir.join(&check.path);
     if !program.is_file() {
         return Err(
@@ -204,7 +205,8 @@ pub(crate) fn config_lock() -> MutexGuard<'static, ()> {
 mod tests {
     use super::*;
     use crate::kernel::failure::Problem;
-    use crate::manage::model::layout::{active_config, plugin_dir};
+    use crate::kernel::layout::plugin_dir;
+    use crate::manage::model::layout::active_config;
     use crate::manage::test_support::*;
 
     #[test]
