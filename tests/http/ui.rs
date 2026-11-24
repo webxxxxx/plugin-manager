@@ -858,6 +858,12 @@ fn a_non_json_stream_zero_frame_stops_the_instance() {
         "application/json",
         br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"echo","arguments":{}}}"#,
     );
+    let original_pid = started.body["summary"]["pid"].clone();
+    assert!(
+        original_pid.is_number(),
+        "the first instance never got a pid: {}",
+        started.body
+    );
 
     let log = sandbox.logs.join("garbled.log");
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -875,16 +881,16 @@ fn a_non_json_stream_zero_frame_stops_the_instance() {
     );
 
     // The violation is logged before the killed process is reaped, so the slot
-    // is still `running` with a pid when the log appears. A start in that
-    // window is a no-op — the kernel never spawns a second process — and the
-    // exit then lands as an on-failure backoff. Wait for the forced stop to
-    // settle before asking for the instance again.
+    // is still `running` with its old pid when the log appears. A start in that
+    // window is a no-op and would make this test pass without proving a new
+    // instance started, so wait for the forced stop to settle: the pid leaves
+    // `summary` only when the kernel has applied the exit.
     wait_until(
         &sandbox,
         "the violated instance never left running",
         || {
             let live = request(&address, "GET", "/api/v1/services/garbled", "", b"");
-            live.body["details"]["pid"].is_null()
+            live.body["summary"]["pid"].is_null()
         },
         || {
             let live = request(&address, "GET", "/api/v1/services/garbled", "", b"");
@@ -892,26 +898,28 @@ fn a_non_json_stream_zero_frame_stops_the_instance() {
         },
     );
 
-    // A manual start works here on unix. On Windows the instance it returns
-    // exits 1 within the same second (#281), so the portable proof that the
-    // first instance was stopped is the `restart = on-failure` come-back that
-    // both platforms share.
-    #[cfg(unix)]
-    {
-        let restarted = request(&address, "POST", "/api/v1/services/garbled/start", "", b"");
-        assert_eq!(restarted.status, 200, "{}", restarted.body);
-    }
-    wait_until_within(
-        &sandbox,
-        "the violated instance never came back",
-        Duration::from_secs(10),
-        || {
-            let live = request(&address, "GET", "/api/v1/services/garbled", "", b"");
-            live.body["summary"]["state"] == "running"
-        },
-        || {
-            let live = request(&address, "GET", "/api/v1/services/garbled", "", b"");
-            format!("last status: {}", live.body)
-        },
+    // A stopped slot must spawn a new instance on an explicit start, and the
+    // new pid proves the kernel did not hand back the old one.
+    let restarted = request(&address, "POST", "/api/v1/services/garbled/start", "", b"");
+    assert_eq!(restarted.status, 200, "{}", restarted.body);
+    let new_pid = restarted.body["summary"]["pid"].clone();
+    assert!(
+        new_pid.is_number(),
+        "the manual start returned no pid: {}",
+        restarted.body
     );
+    assert_ne!(
+        new_pid, original_pid,
+        "the manual start returned the old pid: {}",
+        restarted.body
+    );
+
+    // The replacement must survive the first moments: a teardown of the old
+    // instance must not take the new one down. Backoff is one second, so a
+    // death inside this window is still observable here instead of being
+    // masked by the `on-failure` restart.
+    std::thread::sleep(Duration::from_millis(300));
+    let live = request(&address, "GET", "/api/v1/services/garbled", "", b"");
+    assert_eq!(live.body["summary"]["state"], "running", "{}", live.body);
+    assert_eq!(live.body["summary"]["pid"], new_pid, "{}", live.body);
 }
