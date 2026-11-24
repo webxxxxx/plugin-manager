@@ -185,31 +185,68 @@ function requiredTargets() {
   return targets;
 }
 
-/// Run every integration target in its own cargo invocation, so each one gets
-/// its own wall-clock cap. HTTP runs four-wide (proven with five consecutive
-/// green runs); the rest stay serial until they prove order-independence.
-function runIntegration() {
+/// HTTP 用例四条并发（本地连续五次全绿的口径，`SVCD_HTTP_THREADS` 覆盖）；
+/// 其余 target 串行，直到它们各自证明与顺序无关。
+function httpThreads() {
+  return process.env.SVCD_HTTP_THREADS || "4";
+}
+
+/// 单测没有 sandbox，默认并行（本机 8、CI 4，`SVCD_UNIT_THREADS` 覆盖）。
+function unitThreads() {
+  return process.env.SVCD_UNIT_THREADS || "8";
+}
+
+/// 单测步骤。`full`、`linux` 与集成档共用同一份线程数口径。
+function unitStep() {
+  return {
+    args: [
+      "test",
+      "--bin",
+      "svcd",
+      "--no-fail-fast",
+      "--",
+      "--test-threads=" + unitThreads(),
+    ],
+  };
+}
+
+/// 每个 target 一次 cargo 调用，各自吃一个墙钟上限；发现不到 target 时返回
+/// null 并报错，而不是退回一次不带 `--test` 的 `cargo test`。
+function integrationSteps() {
   let targets;
   try {
     targets = requiredTargets();
   } catch (error) {
     console.error("check: " + error.message);
-    return 2;
+    return null;
   }
-  const httpThreads = process.env.SVCD_HTTP_THREADS || "4";
-  for (const target of targets) {
-    const threads = target === "http" ? httpThreads : "1";
-    const code = runTestTier([
+  const http = httpThreads();
+  return targets.map((target) => ({
+    args: [
       "test",
       "--test",
       target,
       "--no-fail-fast",
       "--",
-      "--test-threads=" + threads,
-    ]);
+      "--test-threads=" + (target === "http" ? http : "1"),
+    ],
+  }));
+}
+
+/// 按顺序跑步骤，第一个失败就停：一个 hung target 只花掉它自己的上限。
+function runSteps(steps, run) {
+  for (const step of steps) {
+    const code = run(step.args);
     if (code !== 0) return code;
   }
   return 0;
+}
+
+/// Run every integration target in its own cargo invocation.
+function runIntegration() {
+  const steps = integrationSteps();
+  if (!steps) return 2;
+  return runSteps(steps, (args) => runTestTier(args));
 }
 
 /// Guardrail injection test: a temp tests dir with two files must discover both,
@@ -312,34 +349,14 @@ function shellQuote(value) {
   return "'" + String(value).replace(/'/g, "'\\''") + "'";
 }
 
-/// Windows 宿主的 Linux 半：`cfg(unix)` 测试只能在 WSL2 里真跑（docs/testing.md §6）。
-/// 用票自己的 worktree，target 放 Linux 文件系统，避免与 Windows 的 target 抢锁。
-if (tier === "linux") {
-  if (rest.length > 1) {
-    console.error("check: linux takes at most one test-name filter; use the raw runbook in docs/testing.md §6 for --exact/--test");
-    process.exit(2);
-  }
-  const filter = rest[0] || "";
-  const args = filter
-    ? ["test", filter, "--no-fail-fast", "--", "--test-threads=1"]
-    : ["test", "--no-fail-fast", "--", "--test-threads=1"];
-  if (process.platform !== "win32") {
-    console.log("check: running cargo " + args.join(" ") + " (Linux host)");
-    const result = cargo(args, TEST_TIMEOUT_MS);
-    if (timedOut(result)) {
-      reportTimeout(result);
-      process.exit(124);
-    }
-    summarizeTests(result);
-    process.exit(result.status ?? 1);
-  }
-  const distro = process.env.SVCD_WSL_DISTRO || "Debian";
-  const target = "/tmp/wt-" + basename(REPO) + "-target";
-  const where = wslPath(REPO);
+/// One cargo invocation inside WSL, with the same summary and timeout contract
+/// as [`runTestTier`]: each target gets its own wsl.exe call, so a hung target
+/// only spends its own cap and the run stops at the first failure.
+function runCargoInWsl(args, distro, target, where) {
   const script = `cd ${shellQuote(where)} && CARGO_TARGET_DIR=${shellQuote(target)} cargo ${args
     .map(shellQuote)
     .join(" ")}`;
-  console.log(`check: running Linux tests in WSL (${distro}) at ${where}`);
+  console.log(`check: running cargo ${args.join(" ")} in WSL (${distro}) at ${where}`);
   const result = spawnSync("wsl.exe", ["-d", distro, "--", "bash", "-lc", script], {
     cwd: REPO,
     encoding: "utf8",
@@ -353,14 +370,42 @@ if (tier === "linux") {
         result.error.message +
         " (WSL2 与发行版见 docs/testing.md §6；发行版用 SVCD_WSL_DISTRO 覆盖)",
     );
-    process.exit(2);
+    return 2;
   }
   if (timedOut(result)) {
     reportTimeout(result);
-    process.exit(124);
+    return 124;
   }
   summarizeTests(result);
-  process.exit(result.status ?? 1);
+  return result.status ?? 1;
+}
+
+/// Windows 宿主的 Linux 半：`cfg(unix)` 测试只能在 WSL2 里真跑（docs/testing.md §6）。
+/// 与 `full` 同形——单测并行，然后逐 target 各一次 cargo（http 四条并发，其余串行），
+/// 失败即停。target 放 Linux 文件系统，避免与 Windows 的 target 抢锁。
+if (tier === "linux") {
+  if (rest.length > 1) {
+    console.error("check: linux takes at most one test-name filter; use the raw runbook in docs/testing.md §6 for --exact/--test");
+    process.exit(2);
+  }
+  const filter = rest[0] || "";
+  const distro = process.env.SVCD_WSL_DISTRO || "Debian";
+  const wslTarget = "/tmp/wt-" + basename(REPO) + "-target";
+  const where = wslPath(REPO);
+  const runCargo =
+    process.platform === "win32"
+      ? (args) => runCargoInWsl(args, distro, wslTarget, where)
+      : (args) => runTestTier(args);
+  // A filter keeps the single-invocation shape: it is a debugging probe, and
+  // one cargo over every target is what `cargo test <filter>` means.
+  if (filter) {
+    process.exit(
+      runCargo(["test", filter, "--no-fail-fast", "--", "--test-threads=1"]),
+    );
+  }
+  const integration = integrationSteps();
+  if (!integration) process.exit(2);
+  process.exit(runSteps([unitStep(), ...integration], runCargo));
 }
 
 if (tier === "--help" || tier === "-h") {
@@ -561,18 +606,12 @@ if (tier === "test" || tier === "full" || tier === "integration") {
   if (tier === "full" && !parallel) {
     // Unit tests are in-process and isolated per root; the integration half
     // runs each target in its own cargo invocation so one hung target only
-    // spends its own timeout.
-    const unitThreads = process.env.SVCD_UNIT_THREADS || "8";
-    const unit = runTestTier([
-      "test",
-      "--bin",
-      "svcd",
-      "--no-fail-fast",
-      "--",
-      "--test-threads=" + unitThreads,
-    ]);
-    if (unit !== 0) process.exit(unit);
-    process.exit(runIntegration());
+    // spends its own timeout. The Linux tier runs the same steps in WSL.
+    const integration = integrationSteps();
+    if (!integration) process.exit(2);
+    process.exit(
+      runSteps([unitStep(), ...integration], (args) => runTestTier(args)),
+    );
   }
   const args = ["test", ...filter, "--no-fail-fast"];
   if (!parallel) args.push("--", "--test-threads=1");
