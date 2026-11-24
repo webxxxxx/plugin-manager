@@ -1,4 +1,5 @@
 //! 安装：把校验通过的包写进版本目录、流式 staging 与读取。
+#![cfg_attr(not(feature = "http"), allow(dead_code))]
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Write;
@@ -542,6 +543,7 @@ fn set_mode(_path: &Path, _mode: u32) -> Result<(), ProblemError> {
 mod tests {
     use super::*;
     use crate::manage::test_support::*;
+    use crate::platform::test_support::TempDir;
     use std::path::PathBuf;
 
     fn stager(staging: PathBuf, allow_insecure: bool, max_bytes: u64) -> StagingInstaller {
@@ -558,7 +560,7 @@ mod tests {
     fn streaming_install_matches_the_in_memory_path() {
         let key = setup();
         let bytes = package(&key);
-        let root = tempdir::TempDir::new();
+        let root = TempDir::new();
         let staged = install_bytes(&bytes, root.path()).expect("stream install");
         assert_eq!(staged.manifest.id(), "demo");
         assert!(staged.signature_verified);
@@ -568,7 +570,7 @@ mod tests {
         );
 
         let truncated = &bytes[..bytes.len() / 2];
-        let broken = tempdir::TempDir::new();
+        let broken = TempDir::new();
         assert!(install_bytes(truncated, broken.path()).is_err());
     }
 
@@ -577,7 +579,7 @@ mod tests {
         let key = setup();
         let bytes = package(&key);
         for chunk in [1usize, 3, 7, 511, 512, 513, 1000] {
-            let root = tempdir::TempDir::new();
+            let root = TempDir::new();
             let mut installer = stager(root.path().to_path_buf(), false, 1024 * 1024);
             for part in bytes.chunks(chunk) {
                 installer
@@ -600,7 +602,7 @@ mod tests {
     fn a_truncated_streamed_install_removes_its_staging_directory() {
         let key = setup();
         let bytes = package(&key);
-        let root = tempdir::TempDir::new();
+        let root = TempDir::new();
         let staging = root.path().join("staged");
         let mut installer = stager(staging.clone(), false, 1024 * 1024);
         installer
@@ -625,7 +627,7 @@ mod tests {
             .position(|window| window == needle)
             .expect("payload");
         bytes[position] = b'j';
-        let root = tempdir::TempDir::new();
+        let root = TempDir::new();
         let staging = root.path().join("staged");
         let error = match install_bytes(&bytes, &staging) {
             Ok(_) => panic!("a tampered payload is rejected"),

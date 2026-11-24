@@ -784,45 +784,10 @@ mod tests {
         })
     }
 
-    /// Drive the handler the way the server does: write, read body chunks,
-    /// run submitted jobs inline, then write the final response.
     fn drive(mut handler: BlobUploadStream, body: &[u8], chunk: usize) -> (Vec<u8>, CloseReason) {
-        let mut out = Vec::new();
-        let mut all = Vec::new();
-        let mut offset = 0;
-        let limit = 64;
-        let mut step =
-            handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
-        loop {
-            all.extend_from_slice(&out);
-            out.clear();
-            match step.action {
-                StreamAction::Close(reason) => return (all, reason),
-                StreamAction::SubmitBlocking(job) => {
-                    let outcome = job(crate::server::http::JobBudget::for_test());
-                    step = handler.on_event(
-                        StreamEvent::BlockingDone(outcome),
-                        &mut OutBuffer::new(&mut out, limit),
-                    );
-                }
-                StreamAction::NeedWrite => {
-                    step = handler
-                        .on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
-                }
-                StreamAction::NeedRead | StreamAction::Continue => {
-                    if offset >= body.len() {
-                        panic!("handler still wants body after all bytes");
-                    }
-                    let end = (offset + chunk).min(body.len());
-                    step = handler.on_event(
-                        StreamEvent::Data(&body[offset..end]),
-                        &mut OutBuffer::new(&mut out, limit),
-                    );
-                    offset = end;
-                }
-                StreamAction::SendFile(_) => panic!("an upload sends no file"),
-            }
-        }
+        let (all, reason, _) =
+            crate::server::http::test_support::drive_body(&mut handler, 64, body, chunk);
+        (all, reason)
     }
 
     fn final_body(bytes: &[u8]) -> &[u8] {

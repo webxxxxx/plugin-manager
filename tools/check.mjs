@@ -12,25 +12,28 @@
 //   node tools/check.mjs cross [target]   cargo check --target <target> --all-targets
 //   node tools/check.mjs linux [filter]   Windows 宿主：在 WSL2 里跑 Linux 全量（或一个 filter）
 //   node tools/check.mjs test <filter>    cargo test <filter> --no-fail-fast -- --test-threads=1
-//   node tools/check.mjs full             unit + http parallel; other integration serial
+//   node tools/check.mjs integration      all tests/*.rs, one cap per target (CI's integration step)
+//   node tools/check.mjs full             unit parallel, then `integration`
 //   ... --parallel                        drop the serial knob for every target (one-off debugging)
+//   node tools/check.mjs --selftest       discovery + empty-target-dir guard injection test
 //
 // `cross` exists because a Windows host never compiles `cfg(unix)` code:
 // a green `quick`/`full` says nothing about the Linux build (#139).
 //
-// Integration tiers keep the same serial knob CI uses (`--test-threads=1`)
-// except the HTTP suite, which is isolated enough to run four-wide (5
-// consecutive green runs). Unit tests have no sandbox and run in parallel:
-// 826 of them shrank from 19 s to 3 s on a 16-core host. The daemon suite
-// still spawns crash loops that share pid assumptions, so it stays serial
-// until it proves order-independence (#153).
+// Integration tiers run one cargo invocation per tests/*.rs target, so each
+// gets its own wall-clock cap. Except the HTTP suite, which is isolated enough
+// to run four-wide (5 consecutive green runs), targets stay serial. Unit tests
+// have no sandbox and run in parallel: 826 of them shrank from 19 s to 3 s on a
+// 16-core host. The daemon suite still spawns crash loops that share pid
+// assumptions, so it stays serial until it proves order-independence (#153).
 //
 // Every tier has a wall-clock cap: a hung test prints TIMEOUT and the last
 // lines instead of looking like a slow compile. Override with
 // `SVCD_CHECK_TIMEOUT_MS` while debugging.
 
-import { readdirSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -42,13 +45,13 @@ const COMPILE_TIMEOUT_MS = Number(process.env.SVCD_CHECK_TIMEOUT_MS) || 10 * 60 
 const TEST_TIMEOUT_MS = Number(process.env.SVCD_CHECK_TIMEOUT_MS) || 20 * 60 * 1000;
 
 /// `no-default` 的警告预算，棘轮语义：只许降不许升。2026-11-24 用 rustc 1.99.1
-/// 重新实测：Windows 45、Linux 44（`cfg(unix)` 那半的 dead_code 计数不同）。
-/// #194/#201 时的 36/35 已随编译器新 lint 失效；要再降就把无 HTTP 时确实不用的
-/// 项按 `cfg_attr(not(feature = "http"), allow(dead_code))` 收窄。rustc 升级让
-/// 计数变化时，先跑 `cargo check --no-default-features --message-format short | grep -c ': warning:'`
+/// 实测：Windows 24、Linux 23。上一轮 45/44 是靠 `ustar`/`install`/`config_doc`
+/// 三个模块的 `cfg_attr(not(feature = "http"), allow(dead_code))` 收窄下来的，
+/// 不是整体豁免：默认构建仍会检查这三个文件。rustc 升级让计数变化时，先跑
+/// `cargo check --no-default-features --message-format short | grep -c ': warning:'`
 /// 判断新警告是否合理，再改这个数；`SVCD_NO_DEFAULT_BUDGET` 可临时覆盖（调试用）。
 const NO_DEFAULT_WARNING_BUDGET = Number(process.env.SVCD_NO_DEFAULT_BUDGET) ||
-  (process.platform === "win32" ? 45 : 44);
+  (process.platform === "win32" ? 24 : 23);
 
 function cargo(args, timeoutMs) {
   const started = Date.now();
@@ -155,14 +158,95 @@ function summarizeTests(result) {
   }
 }
 
+/// Directory that owns `tests/*.rs`; the override exists so `--selftest` can
+/// prove the empty-directory guard without moving the real suite.
+function testsDir() {
+  return process.env.SVCD_CHECK_TESTS_DIR || join(REPO, "tests");
+}
+
 /// Every top-level `tests/*.rs` file is one integration test target. Cargo's
 /// `--tests` also reruns the bin/lib unit harness, so the serial half names
-/// each integration target explicitly instead.
+/// each integration target explicitly instead. The `support/` directory is not
+/// a target and is skipped.
 function integrationTargets() {
-  return readdirSync(join(REPO, "tests"), { withFileTypes: true })
+  return readdirSync(testsDir(), { withFileTypes: true })
     .filter((entry) => entry.isFile() && entry.name.endsWith(".rs"))
     .map((entry) => entry.name.slice(0, -3))
     .sort();
+}
+
+/// The discovered list, with an explicit failure when discovery finds nothing.
+/// A silently empty list used to fall back to an unfiltered `cargo test`.
+function requiredTargets() {
+  const targets = integrationTargets();
+  if (targets.length === 0) {
+    throw new Error("no integration targets under " + testsDir());
+  }
+  return targets;
+}
+
+/// Run every integration target in its own cargo invocation, so each one gets
+/// its own wall-clock cap. HTTP runs four-wide (proven with five consecutive
+/// green runs); the rest stay serial until they prove order-independence.
+function runIntegration() {
+  let targets;
+  try {
+    targets = requiredTargets();
+  } catch (error) {
+    console.error("check: " + error.message);
+    return 2;
+  }
+  const httpThreads = process.env.SVCD_HTTP_THREADS || "4";
+  for (const target of targets) {
+    const threads = target === "http" ? httpThreads : "1";
+    const code = runTestTier([
+      "test",
+      "--test",
+      target,
+      "--no-fail-fast",
+      "--",
+      "--test-threads=" + threads,
+    ]);
+    if (code !== 0) return code;
+  }
+  return 0;
+}
+
+/// Guardrail injection test: a temp tests dir with two files must discover both,
+/// and an empty dir must make `requiredTargets` throw. The real tree is the
+/// positive case exercised by every `full`/`integration` run.
+function selftest() {
+  const root = mkdtempSync(join(tmpdir(), "svcd-check-"));
+  const empty = mkdtempSync(join(tmpdir(), "svcd-check-empty-"));
+  const previous = process.env.SVCD_CHECK_TESTS_DIR;
+  try {
+    writeFileSync(join(root, "cli.rs"), "");
+    writeFileSync(join(root, "http.rs"), "");
+    mkdirSync(join(root, "support"));
+    process.env.SVCD_CHECK_TESTS_DIR = root;
+    const found = integrationTargets();
+    if (found.join(",") !== "cli,http") {
+      throw new Error("discovery returned " + JSON.stringify(found));
+    }
+    process.env.SVCD_CHECK_TESTS_DIR = empty;
+    let rejected = false;
+    try {
+      requiredTargets();
+    } catch {
+      rejected = true;
+    }
+    if (!rejected) throw new Error("an empty tests dir was accepted");
+    console.log("selftest: ok (discovery, empty-dir guard)");
+    return 0;
+  } catch (error) {
+    console.error("selftest: FAILED " + error.message);
+    return 1;
+  } finally {
+    if (previous === undefined) delete process.env.SVCD_CHECK_TESTS_DIR;
+    else process.env.SVCD_CHECK_TESTS_DIR = previous;
+    rmSync(root, { recursive: true, force: true });
+    rmSync(empty, { recursive: true, force: true });
+  }
 }
 
 /// Run one cargo test invocation, print its summary and return its exit code.
@@ -180,6 +264,7 @@ function runTestTier(args) {
 }
 
 const argv = process.argv.slice(2);
+if (argv.includes("--selftest")) process.exit(selftest());
 const tier = argv[0] || "quick";
 const rest = argv.slice(1);
 
@@ -454,7 +539,7 @@ if (tier === "cross") {
   process.exit(result.status ?? 1);
 }
 
-if (tier === "test" || tier === "full") {
+if (tier === "test" || tier === "full" || tier === "integration") {
   if (tier === "full") {
     // Guardrail injection tests run before the suite: a checker that silently
     // stopped rejecting bad input is a failure, not a warning.
@@ -472,12 +557,11 @@ if (tier === "test" || tier === "full") {
   }
   const parallel = rest.includes("--parallel");
   const filter = tier === "test" ? rest.filter((arg) => arg !== "--parallel") : [];
+  if (tier === "integration") process.exit(runIntegration());
   if (tier === "full" && !parallel) {
-    // Unit tests are in-process and isolated per root; integration suites
-    // spawn daemons. The HTTP suite uses ephemeral ports and per-sandbox
-    // directories, so it is proven to run four-wide (5 consecutive green
-    // runs, 86 s -> 25 s). The rest stay serial until each one proves the
-    // same; the daemon crash-loop tests still share pid assumptions.
+    // Unit tests are in-process and isolated per root; the integration half
+    // runs each target in its own cargo invocation so one hung target only
+    // spends its own timeout.
     const unitThreads = process.env.SVCD_UNIT_THREADS || "8";
     const unit = runTestTier([
       "test",
@@ -488,22 +572,7 @@ if (tier === "test" || tier === "full") {
       "--test-threads=" + unitThreads,
     ]);
     if (unit !== 0) process.exit(unit);
-    const httpThreads = process.env.SVCD_HTTP_THREADS || "4";
-    const http = runTestTier([
-      "test",
-      "--test",
-      "http",
-      "--no-fail-fast",
-      "--",
-      "--test-threads=" + httpThreads,
-    ]);
-    if (http !== 0) process.exit(http);
-    const integration = ["test", "--no-fail-fast"];
-    for (const target of integrationTargets()) {
-      if (target !== "http") integration.push("--test", target);
-    }
-    integration.push("--", "--test-threads=1");
-    process.exit(runTestTier(integration));
+    process.exit(runIntegration());
   }
   const args = ["test", ...filter, "--no-fail-fast"];
   if (!parallel) args.push("--", "--test-threads=1");
@@ -511,6 +580,8 @@ if (tier === "test" || tier === "full") {
 }
 
 console.error(
-  "check: unknown tier " + tier + "; use quick|no-default|cross [target]|linux [filter]|full [--parallel]|test <filter> [--parallel]",
+  "check: unknown tier " +
+    tier +
+    "; use quick|no-default|cross [target]|linux [filter]|integration|full [--parallel]|test <filter> [--parallel]",
 );
 process.exit(2);

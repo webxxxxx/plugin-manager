@@ -37,16 +37,9 @@ jobs:
         run: node tools/check.mjs lint
       - name: Unit tests (parallel)
         run: cargo test --bin svcd --no-fail-fast -- --test-threads=4
-      - name: HTTP tests (parallel)
-        run: cargo test --test http --no-fail-fast -- --test-threads=4
-      - name: Integration tests (serial)
-        # Keep in sync with tests/*.rs; `cargo test --tests` would rerun the
-        # bin unit harness a second time.
-        run: >-
-          cargo test --no-fail-fast
-          --test cli --test daemon --test install
-          --test mcp --test plugin --test service_win
-          -- --test-threads=1
+      - name: Integration tests (one cap per target)
+        # The tier discovers tests/*.rs itself; no second hardcoded list.
+        run: node tools/check.mjs integration
       - name: Check minimal build without HTTP
         if: matrix.os == 'ubuntu-latest'
         run: cargo check --no-default-features

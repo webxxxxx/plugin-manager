@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
@@ -19,13 +19,7 @@ impl Sandbox {
 
         let binary_name = if cfg!(windows) { "svc.exe" } else { "svc" };
         let binary = root.join(binary_name);
-        fs::copy(env!("CARGO_BIN_EXE_svcd"), &binary).expect("copy multicall binary");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
-                .expect("make svc executable");
-        }
+        support::install_multicall(Path::new(env!("CARGO_BIN_EXE_svcd")), &[&binary]);
 
         Sandbox { root, binary }
     }
@@ -676,5 +670,20 @@ fn an_unrunnable_document_is_still_inspectable() {
         stderr(&output).contains("does not fit"),
         "{}",
         stderr(&output)
+    );
+}
+
+#[test]
+fn multicall_falls_back_to_copy_when_link_fails() {
+    let root = support::sandbox_root("multicall-fallback");
+    let copy = root.join("svc-copy");
+    let source = Path::new(env!("CARGO_BIN_EXE_svcd"));
+    support::link_or_copy_with(source, &copy, |_, _| {
+        Err(std::io::Error::other("injected link failure"))
+    })
+    .expect("the fallback copies when the link fails");
+    assert_eq!(
+        fs::read(&copy).expect("read fallback copy"),
+        fs::read(source).expect("read source binary")
     );
 }

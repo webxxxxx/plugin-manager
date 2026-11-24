@@ -147,9 +147,7 @@ mod tests {
     use crate::platform::paths::Paths;
     use crate::server::auth::lan::Lan;
     use crate::server::http::model as http;
-    use crate::server::http::{
-        CloseReason, Exchange, OutBuffer, StreamAction, StreamEvent, StreamHandler,
-    };
+    use crate::server::http::{CloseReason, Exchange, StreamHandler};
 
     use super::*;
 
@@ -373,50 +371,12 @@ mod tests {
         }
     }
 
-    /// Drive the handler the way the server does: write, read body chunks, run
-    /// submitted jobs inline, then write the final response. Returns the bytes
-    /// written, the close reason and how much of the body the handler consumed.
     fn drive(
         mut handler: Box<dyn StreamHandler>,
         body: &[u8],
         chunk: usize,
     ) -> (Vec<u8>, CloseReason, usize) {
-        let limit = 4096;
-        let mut out = Vec::new();
-        let mut all = Vec::new();
-        let mut offset = 0;
-        let mut step =
-            handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
-        loop {
-            all.extend_from_slice(&out);
-            out.clear();
-            match step.action {
-                StreamAction::Close(reason) => return (all, reason, offset),
-                StreamAction::SubmitBlocking(job) => {
-                    let outcome = job(crate::server::http::JobBudget::for_test());
-                    step = handler.on_event(
-                        StreamEvent::BlockingDone(outcome),
-                        &mut OutBuffer::new(&mut out, limit),
-                    );
-                }
-                StreamAction::NeedWrite => {
-                    step = handler
-                        .on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
-                }
-                StreamAction::NeedRead | StreamAction::Continue => {
-                    if offset >= body.len() {
-                        panic!("handler still wants body after {} bytes", offset);
-                    }
-                    let end = (offset + chunk).min(body.len());
-                    step = handler.on_event(
-                        StreamEvent::Data(&body[offset..end]),
-                        &mut OutBuffer::new(&mut out, limit),
-                    );
-                    offset = end;
-                }
-                StreamAction::SendFile(_) => panic!("a package upload sends no file"),
-            }
-        }
+        crate::server::http::test_support::drive_body(&mut *handler, 4096, body, chunk)
     }
 
     #[test]

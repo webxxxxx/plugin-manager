@@ -1454,7 +1454,7 @@ fn installing_a_package_with_the_reserved_id_is_invalid() {
         receiver,
         None,
     );
-    let dir = crate::manage::test_support::tempdir::TempDir::new();
+    let dir = crate::platform::test_support::TempDir::new();
     let path = dir.path().join("svc.spk");
     std::fs::write(
         &path,
@@ -1479,7 +1479,7 @@ fn installing_a_package_for_another_platform_reports_unsupported_platform() {
         receiver,
         None,
     );
-    let dir = crate::manage::test_support::tempdir::TempDir::new();
+    let dir = crate::platform::test_support::TempDir::new();
     let path = dir.path().join("other.spk");
     std::fs::write(
         &path,
@@ -1564,7 +1564,7 @@ fn a_peer_that_dies_while_the_layer_is_still_starting_fails_the_layer() {
     // success. Without the slow peer the layer would settle on `Running`
     // in the same millisecond the peer left.
     let (_sender, receiver) = mpsc::channel();
-    let dir = crate::manage::test_support::tempdir::TempDir::new();
+    let dir = crate::platform::test_support::TempDir::new();
     let dead = peer_plugin("dead", ping_once_agent(dir.path()), 1);
     let slow = peer_plugin("slow", slow_ping_agent(dir.path()), 1);
     let mut daemon = Daemon::new(registry(vec![dead, slow]), receiver, None);
@@ -1596,7 +1596,7 @@ fn a_raw_peer_that_dies_while_the_layer_is_still_starting_loses_the_channel() {
     // on `Running` at spawn. The slow peer is what lets a later pass observe
     // the raw peer's clean exit, exactly like the notify case.
     let (_sender, receiver) = mpsc::channel();
-    let dir = crate::manage::test_support::tempdir::TempDir::new();
+    let dir = crate::platform::test_support::TempDir::new();
     let raw = peer_plugin("raw", exit_zero_exec(), 3);
     let slow = peer_plugin("slow", slow_ping_agent(dir.path()), 1);
     let mut daemon = Daemon::new(registry(vec![raw, slow]), receiver, None);

@@ -1,64 +1,36 @@
 #![cfg(test)]
 
 use super::*;
+use crate::platform::test_support::TempDir;
 use serde_json::json;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-static NEXT: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let path = crate::platform::test_support::temp_dir().join(format!(
-            "svcd-definition-{}-{}-{}",
-            std::process::id(),
-            nanos,
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&path).expect("create temp dir");
-        TempDir(path)
-    }
-
-    fn services_dir(&self) -> PathBuf {
-        self.0.join("services.d")
-    }
-
-    fn write(&self, name: &str, definition: Value) {
-        fs::create_dir_all(self.services_dir()).expect("create services.d");
-        fs::write(
-            self.services_dir().join(format!("{}.json", name)),
-            serde_json::to_vec_pretty(&definition).expect("serialize definition"),
-        )
-        .expect("write definition");
-    }
-
-    fn disable(&self, id: &str) {
-        fs::create_dir_all(self.services_dir()).expect("create services.d");
-        fs::write(self.services_dir().join(format!("{}.disabled", id)), "")
-            .expect("write disabled marker");
-    }
-
-    fn write_script(&self, name: &str, body: &str) {
-        fs::create_dir_all(self.services_dir()).expect("create services.d");
-        let path = self.services_dir().join(name);
-        fs::write(&path, body).expect("write script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod script");
-        }
-    }
+fn services_dir(dir: &TempDir) -> PathBuf {
+    dir.0.join("services.d")
 }
 
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+fn write_definition(dir: &TempDir, name: &str, definition: Value) {
+    fs::create_dir_all(services_dir(dir)).expect("create services.d");
+    fs::write(
+        services_dir(dir).join(format!("{}.json", name)),
+        serde_json::to_vec_pretty(&definition).expect("serialize definition"),
+    )
+    .expect("write definition");
+}
+
+fn disable_definition(dir: &TempDir, id: &str) {
+    fs::create_dir_all(services_dir(dir)).expect("create services.d");
+    fs::write(services_dir(dir).join(format!("{}.disabled", id)), "")
+        .expect("write disabled marker");
+}
+
+fn write_script(dir: &TempDir, name: &str, body: &str) {
+    fs::create_dir_all(services_dir(dir)).expect("create services.d");
+    let path = services_dir(dir).join(name);
+    fs::write(&path, body).expect("write script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod script");
     }
 }
 
@@ -132,10 +104,10 @@ fn load_issue_display_names_the_file_or_the_directory() {
 #[test]
 fn loads_a_core_definition_next_to_the_builtin_svc() {
     let dir = TempDir::new();
-    dir.write("demo", definition("demo"));
+    write_definition(&dir, "demo", definition("demo"));
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -169,7 +141,7 @@ fn loads_a_core_definition_next_to_the_builtin_svc() {
 fn a_missing_services_dir_still_loads_the_builtin() {
     let dir = TempDir::new();
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -181,11 +153,11 @@ fn a_missing_services_dir_still_loads_the_builtin() {
 #[test]
 fn a_disabled_marker_turns_off_enabled() {
     let dir = TempDir::new();
-    dir.write("demo", definition("demo"));
-    dir.disable("demo");
+    write_definition(&dir, "demo", definition("demo"));
+    disable_definition(&dir, "demo");
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -198,10 +170,10 @@ fn ignores_unknown_fields() {
     let dir = TempDir::new();
     let mut body = definition("demo");
     body["future_field"] = json!({"anything": true});
-    dir.write("demo", body);
+    write_definition(&dir, "demo", body);
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -215,10 +187,10 @@ fn rejects_every_spk_only_field() {
         let dir = TempDir::new();
         let mut body = definition("demo");
         body[field] = json!("anything");
-        dir.write("demo", body);
+        write_definition(&dir, "demo", body);
 
         let loaded = load_services(
-            &dir.services_dir(),
+            &services_dir(&dir),
             &crate::platform::limits::test_default(),
         );
 
@@ -246,10 +218,10 @@ fn rejects_every_spk_only_field() {
 #[test]
 fn rejects_the_reserved_svc_id() {
     let dir = TempDir::new();
-    dir.write(RESERVED_ID, definition(RESERVED_ID));
+    write_definition(&dir, RESERVED_ID, definition(RESERVED_ID));
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -271,10 +243,10 @@ fn rejects_the_reserved_svc_id() {
 #[test]
 fn trusts_the_json_id_over_the_file_name() {
     let dir = TempDir::new();
-    dir.write("some-file", definition("demo"));
+    write_definition(&dir, "some-file", definition("demo"));
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -285,11 +257,11 @@ fn trusts_the_json_id_over_the_file_name() {
 #[test]
 fn rejects_two_files_that_claim_the_same_id() {
     let dir = TempDir::new();
-    dir.write("a", definition("demo"));
-    dir.write("b", definition("demo"));
+    write_definition(&dir, "a", definition("demo"));
+    write_definition(&dir, "b", definition("demo"));
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -304,10 +276,10 @@ fn rejects_a_relative_exec_path() {
     let dir = TempDir::new();
     let mut body = definition("demo");
     body["exec"]["path"] = json!("payload/demo");
-    dir.write("demo", body);
+    write_definition(&dir, "demo", body);
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -324,10 +296,10 @@ fn rejects_bad_schema_protocol_and_ready() {
         let dir = TempDir::new();
         let mut body = definition("demo");
         body[field] = value;
-        dir.write("demo", body);
+        write_definition(&dir, "demo", body);
 
         let loaded = load_services(
-            &dir.services_dir(),
+            &services_dir(&dir),
             &crate::platform::limits::test_default(),
         );
 
@@ -343,10 +315,10 @@ fn rejects_bad_schema_protocol_and_ready() {
     let dir = TempDir::new();
     let mut body = definition("demo");
     body["exec"]["ready"] = json!("later");
-    dir.write("demo", body);
+    write_definition(&dir, "demo", body);
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -358,10 +330,10 @@ fn rejects_core_capabilities() {
     let dir = TempDir::new();
     let mut body = definition("demo");
     body["capabilities"] = json!([{ "name": "status", "desc": "a", "inputSchema": {} }]);
-    dir.write("demo", body);
+    write_definition(&dir, "demo", body);
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -378,10 +350,10 @@ fn parses_lifecycle_hooks_and_defaults_their_timeouts() {
         "stop": { "path": absolute_exec(), "args": ["stop"] },
         "status": { "path": absolute_exec(), "args": ["status"] }
     });
-    dir.write("demo", body);
+    write_definition(&dir, "demo", body);
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -404,10 +376,10 @@ fn rejects_a_relative_lifecycle_path() {
     let dir = TempDir::new();
     let mut body = definition("demo");
     body["lifecycle"] = json!({"stop": {"path": "scripts/stop"}});
-    dir.write("demo", body);
+    write_definition(&dir, "demo", body);
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -420,10 +392,10 @@ fn allows_a_dependency_that_is_not_installed_yet() {
     let dir = TempDir::new();
     let mut body = definition("demo");
     body["dependencies"] = json!(["not-installed"]);
-    dir.write("demo", body);
+    write_definition(&dir, "demo", body);
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -436,14 +408,14 @@ fn rejects_a_dependency_cycle_and_drops_only_its_members() {
     let dir = TempDir::new();
     let mut a = definition("a");
     a["dependencies"] = json!(["b"]);
-    dir.write("a", a);
+    write_definition(&dir, "a", a);
     let mut b = definition("b");
     b["dependencies"] = json!(["a"]);
-    dir.write("b", b);
-    dir.write("c", definition("c"));
+    write_definition(&dir, "b", b);
+    write_definition(&dir, "c", definition("c"));
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -463,17 +435,19 @@ fn rejects_a_dependency_cycle_and_drops_only_its_members() {
 #[test]
 fn a_script_declares_its_restart_policy() {
     let dir = TempDir::new();
-    dir.write_script(
+    write_script(
+        &dir,
         &script_name("oneshot"),
         "#!/bin/sh\nTYPE=oneshot\nstart() { :; }\n",
     );
-    dir.write_script(
+    write_script(
+        &dir,
         &script_name("always"),
         "#!/bin/sh\nRESTART=always\nstart() { :; }\n",
     );
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -506,16 +480,16 @@ fn a_script_declares_its_restart_policy() {
 #[test]
 fn a_json_definition_defaults_to_on_failure_and_honours_restart() {
     let dir = TempDir::new();
-    dir.write("plain", definition("plain"));
+    write_definition(&dir, "plain", definition("plain"));
     let mut never = definition("never");
     never["restart"] = serde_json::json!("never");
-    dir.write("never", never);
+    write_definition(&dir, "never", never);
     let mut one_shot = definition("one-shot");
     one_shot["remain_after_exit"] = serde_json::json!(true);
-    dir.write("one-shot", one_shot);
+    write_definition(&dir, "one-shot", one_shot);
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -564,10 +538,10 @@ fn rejects_remain_after_exit_for_a_notify_ready_definition() {
             }
         }
         body["remain_after_exit"] = json!(true);
-        dir.write("odd", body);
+        write_definition(&dir, "odd", body);
 
         let loaded = load_services(
-            &dir.services_dir(),
+            &services_dir(&dir),
             &crate::platform::limits::test_default(),
         );
 
@@ -598,13 +572,13 @@ fn keeps_notify_services_and_exec_one_shots_loadable() {
     let dir = TempDir::new();
     let mut notify = definition("notify");
     notify["exec"]["ready"] = json!("notify");
-    dir.write("notify", notify);
+    write_definition(&dir, "notify", notify);
     let mut one_shot = definition("one-shot");
     one_shot["remain_after_exit"] = json!(true);
-    dir.write("one-shot", one_shot);
+    write_definition(&dir, "one-shot", one_shot);
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -624,10 +598,10 @@ fn keeps_notify_services_and_exec_one_shots_loadable() {
 #[test]
 fn loads_a_drop_in_script_as_a_core_service() {
     let dir = TempDir::new();
-    dir.write_script(&script_name("demo"), all_actions_body());
+    write_script(&dir, &script_name("demo"), all_actions_body());
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -652,10 +626,10 @@ fn loads_a_drop_in_script_as_a_core_service() {
 #[test]
 fn a_script_without_actions_runs_from_the_top() {
     let dir = TempDir::new();
-    dir.write_script(&script_name("demo"), "#!/bin/sh\r\n");
+    write_script(&dir, &script_name("demo"), "#!/bin/sh\r\n");
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -669,10 +643,10 @@ fn a_script_without_actions_runs_from_the_top() {
 #[test]
 fn only_declared_actions_become_lifecycle_hooks() {
     let dir = TempDir::new();
-    dir.write_script(&script_name("demo"), start_only_body());
+    write_script(&dir, &script_name("demo"), start_only_body());
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -691,10 +665,10 @@ fn actions_in_comments_are_not_declared() {
     let body = "@echo off\r\nrem :start\r\n:: :stop\r\n";
     #[cfg(not(windows))]
     let body = "#!/bin/sh\n# start() { :; }\n# stop() { :; }\n# status() { :; }\n";
-    dir.write_script(&script_name("demo"), body);
+    write_script(&dir, &script_name("demo"), body);
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -707,13 +681,14 @@ fn actions_in_comments_are_not_declared() {
 #[test]
 fn a_case_branch_declares_a_shell_action() {
     let dir = TempDir::new();
-    dir.write_script(
+    write_script(
+        &dir,
         &script_name("demo"),
         "#!/bin/sh\ncase \"$1\" in\n  start)\n    :;;\n  status)\n    :;;\nesac\n",
     );
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -728,11 +703,11 @@ fn a_case_branch_declares_a_shell_action() {
 #[test]
 fn a_disabled_marker_turns_off_a_script() {
     let dir = TempDir::new();
-    dir.write_script(&script_name("demo"), "");
-    dir.disable("demo");
+    write_script(&dir, &script_name("demo"), "");
+    disable_definition(&dir, "demo");
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -742,11 +717,11 @@ fn a_disabled_marker_turns_off_a_script() {
 #[test]
 fn a_json_definition_wins_over_a_script_with_the_same_id() {
     let dir = TempDir::new();
-    dir.write("demo", definition("demo"));
-    dir.write_script(&script_name("demo"), "");
+    write_definition(&dir, "demo", definition("demo"));
+    write_script(&dir, &script_name("demo"), "");
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -765,11 +740,11 @@ fn a_json_definition_wins_over_a_script_with_the_same_id() {
 #[test]
 fn rejects_invalid_and_reserved_script_ids() {
     let dir = TempDir::new();
-    dir.write_script(&script_name("bad.name"), "");
-    dir.write_script(&script_name("svc"), "");
+    write_script(&dir, &script_name("bad.name"), "");
+    write_script(&dir, &script_name("svc"), "");
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -788,10 +763,14 @@ fn rejects_invalid_and_reserved_script_ids() {
 #[test]
 fn loads_a_powershell_script() {
     let dir = TempDir::new();
-    dir.write_script("demo.ps1", "function Start { }\r\nfunction Stop { }\r\n");
+    write_script(
+        &dir,
+        "demo.ps1",
+        "function Start { }\r\nfunction Stop { }\r\n",
+    );
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -811,12 +790,12 @@ fn rejects_a_non_executable_script() {
 
     let dir = TempDir::new();
     let name = script_name("demo");
-    dir.write_script(&name, "");
-    let path = dir.services_dir().join(&name);
+    write_script(&dir, &name, "");
+    let path = services_dir(&dir).join(&name);
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 
@@ -830,11 +809,11 @@ fn rejects_a_symlinked_script() {
     let dir = TempDir::new();
     let target = dir.0.join("target.sh");
     fs::write(&target, "").expect("target");
-    fs::create_dir_all(dir.services_dir()).expect("services.d");
-    std::os::unix::fs::symlink(&target, dir.services_dir().join("demo.sh")).expect("symlink");
+    fs::create_dir_all(services_dir(&dir)).expect("services.d");
+    std::os::unix::fs::symlink(&target, services_dir(&dir).join("demo.sh")).expect("symlink");
 
     let loaded = load_services(
-        &dir.services_dir(),
+        &services_dir(&dir),
         &crate::platform::limits::test_default(),
     );
 

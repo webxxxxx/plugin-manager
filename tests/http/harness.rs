@@ -5,7 +5,7 @@ use super::support;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -13,34 +13,31 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 pub(crate) struct Sandbox {
-    pub(crate) root: PathBuf,
-    pub(crate) config: PathBuf,
-    pub(crate) data: PathBuf,
-    pub(crate) logs: PathBuf,
-    pub(crate) trust: PathBuf,
-    pub(crate) svcd: PathBuf,
-    pub(crate) svc: PathBuf,
-    pub(crate) mcp: PathBuf,
+    dirs: support::SandboxDirs,
     pub(crate) daemon: Option<Child>,
-    pub(crate) daemon_stderr: PathBuf,
     /// Overridable so the bounded-wait test does not spend the production bound.
     pub(crate) stop_timeout: Duration,
 }
 
+impl std::ops::Deref for Sandbox {
+    type Target = support::SandboxDirs;
+
+    fn deref(&self) -> &Self::Target {
+        &self.dirs
+    }
+}
+
+impl std::ops::DerefMut for Sandbox {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.dirs
+    }
+}
+
 impl Sandbox {
     pub(crate) fn new() -> Self {
-        let dirs = support::sandbox_dirs("http");
         Sandbox {
-            root: dirs.root,
-            config: dirs.config,
-            data: dirs.data,
-            logs: dirs.logs,
-            trust: dirs.trust,
-            svcd: dirs.svcd,
-            svc: dirs.svc,
-            mcp: dirs.mcp,
+            dirs: support::sandbox_dirs("http"),
             daemon: None,
-            daemon_stderr: dirs.daemon_stderr,
             stop_timeout: support::STOP_TIMEOUT,
         }
     }

@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use crate::manage::test_support::tempdir::TempDir;
+use crate::platform::test_support::TempDir;
 use ed25519_dalek::Signature;
 use std::fs;
 

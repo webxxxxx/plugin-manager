@@ -84,3 +84,49 @@ pub(crate) fn drive_busy(handler: &mut dyn StreamHandler, body: &[u8], limit: us
     assert!(matches!(step.action, StreamAction::Close(_)));
     out
 }
+
+/// Drive a handler that consumes a request body: writable, then body chunks on
+/// every read request, with submitted jobs run inline. Returns the bytes
+/// written, the close reason and how much of `body` was consumed.
+pub(crate) fn drive_body(
+    handler: &mut dyn StreamHandler,
+    limit: usize,
+    body: &[u8],
+    chunk: usize,
+) -> (Vec<u8>, CloseReason, usize) {
+    let mut out = Vec::new();
+    let mut all = Vec::new();
+    let mut offset = 0;
+    let mut step = handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
+    loop {
+        all.extend_from_slice(&out);
+        out.clear();
+        match step.action {
+            StreamAction::Close(reason) => return (all, reason, offset),
+            StreamAction::SubmitBlocking(job) => {
+                let outcome = job(JobBudget::for_test());
+                step = handler.on_event(
+                    StreamEvent::BlockingDone(outcome),
+                    &mut OutBuffer::new(&mut out, limit),
+                );
+            }
+            StreamAction::SendFile(_) => panic!("drive_body does not serve files"),
+            StreamAction::NeedWrite => {
+                step =
+                    handler.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
+            }
+            StreamAction::NeedRead | StreamAction::Continue => {
+                if offset >= body.len() {
+                    panic!("handler still wants body after {} bytes", offset);
+                }
+                let end = (offset + chunk).min(body.len());
+                let slice = &body[offset..end];
+                offset = end;
+                step = handler.on_event(
+                    StreamEvent::Data(slice),
+                    &mut OutBuffer::new(&mut out, limit),
+                );
+            }
+        }
+    }
+}
