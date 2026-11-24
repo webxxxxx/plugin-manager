@@ -160,10 +160,12 @@ node tools/check.mjs cross                   # x86_64-unknown-linux-musl
 node tools/check.mjs cross <target>
 
 # 跨平台行为（Windows 宿主，WSL2）：cross 只编译；Linux 的 reactor、线程预算与
-# cfg(unix) 测试在 WSL 里真跑。一条命令：从当前 worktree（或仓库根）推 WSL 路径与
+# cfg(unix) 测试在 WSL 里真跑。与 `full` 同形：单测按 SVCD_UNIT_THREADS 并行，
+# 然后逐 target 各一次 cargo（http 用 SVCD_HTTP_THREADS=4、其余串行），每个 target
+# 一次 wsl.exe，失败即停。从当前 worktree（或仓库根）推 WSL 路径与
 # /tmp/wt-<目录名>-target，发行版默认 Debian（SVCD_WSL_DISTRO 覆盖）。
 node tools/check.mjs linux                    # 全量；非 Windows 宿主上等价 full
-node tools/check.mjs linux <filter>           # 单条/单组用例（--exact 语义同 cargo test）
+node tools/check.mjs linux <filter>           # 单条/单组用例（一次 cargo 覆盖全部 target，串行）
 
 # 原始命令（排查时用）：cd /mnt/d/<repo>/<repo>/.worktrees/<ticket> &&
 #   CARGO_TARGET_DIR=/tmp/wt-<ticket>-target cargo test --no-fail-fast -- --test-threads=1
@@ -204,6 +206,8 @@ Windows 优先硬链接（建符号链接需要权限；硬链接失败时回退
 http 套件用 4 线程（临时端口 + 独立 sandbox，连续 5 次全绿；`SVCD_HTTP_THREADS` 覆盖），
 其余串行。单测没有 sandbox，默认并行（`SVCD_UNIT_THREADS` 覆盖，本机 8、CI 4）。
 `node tools/check.mjs full` 默认就是「单测 8 线程 + integration」，本地红与 CI 红同义。
+`node tools/check.mjs linux` 跑的是同一份步骤：WSL 里每个 target 一次 `wsl.exe` + cargo，
+http 同样 4 线程，所以 WSL 的墙钟与 Windows 同一量级（见 §6 顶部注释）。
 只有显式 `--parallel` 才让全部集成测试并发，那时执行顺序不由工具承诺。
 `tools/check.mjs --selftest` 会用一个临时 tests 目录证明发现逻辑，并用空目录证明它会红。
 
