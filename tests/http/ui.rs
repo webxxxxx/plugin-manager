@@ -874,14 +874,44 @@ fn a_non_json_stream_zero_frame_stops_the_instance() {
         "the violation was not logged: {text}"
     );
 
-    // The fixture only answers garbage once: a second start proves the first
-    // instance was stopped, not merely left waiting.
-    let restarted = request(&address, "POST", "/api/v1/services/garbled/start", "", b"");
-    assert_eq!(restarted.status, 200, "{}", restarted.body);
-    let status = request(&address, "GET", "/api/v1/services/garbled", "", b"");
-    assert_eq!(
-        status.body["summary"]["state"], "running",
-        "{}",
-        status.body
+    // The violation is logged before the killed process is reaped, so the slot
+    // is still `running` with a pid when the log appears. A start in that
+    // window is a no-op — the kernel never spawns a second process — and the
+    // exit then lands as an on-failure backoff. Wait for the forced stop to
+    // settle before asking for the instance again.
+    wait_until(
+        &sandbox,
+        "the violated instance never left running",
+        || {
+            let live = request(&address, "GET", "/api/v1/services/garbled", "", b"");
+            live.body["details"]["pid"].is_null()
+        },
+        || {
+            let live = request(&address, "GET", "/api/v1/services/garbled", "", b"");
+            format!("last status: {}", live.body)
+        },
+    );
+
+    // A manual start works here on unix. On Windows the instance it returns
+    // exits 1 within the same second (#281), so the portable proof that the
+    // first instance was stopped is the `restart = on-failure` come-back that
+    // both platforms share.
+    #[cfg(unix)]
+    {
+        let restarted = request(&address, "POST", "/api/v1/services/garbled/start", "", b"");
+        assert_eq!(restarted.status, 200, "{}", restarted.body);
+    }
+    wait_until_within(
+        &sandbox,
+        "the violated instance never came back",
+        Duration::from_secs(10),
+        || {
+            let live = request(&address, "GET", "/api/v1/services/garbled", "", b"");
+            live.body["summary"]["state"] == "running"
+        },
+        || {
+            let live = request(&address, "GET", "/api/v1/services/garbled", "", b"");
+            format!("last status: {}", live.body)
+        },
     );
 }
