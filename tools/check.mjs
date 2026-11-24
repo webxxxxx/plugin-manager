@@ -185,15 +185,18 @@ function requiredTargets() {
   return targets;
 }
 
-/// HTTP 用例四条并发（本地连续五次全绿的口径，`SVCD_HTTP_THREADS` 覆盖）；
-/// 其余 target 串行，直到它们各自证明与顺序无关。
-function httpThreads() {
-  return process.env.SVCD_HTTP_THREADS || "4";
-}
-
 /// 单测没有 sandbox，默认并行（本机 8、CI 4，`SVCD_UNIT_THREADS` 覆盖）。
 function unitThreads() {
   return process.env.SVCD_UNIT_THREADS || "8";
+}
+
+/// 一个 target 的并发度。http 与 daemon 都是进程重活，四条并发，各自以本机
+/// 连续五次全绿为准（`SVCD_HTTP_THREADS` / `SVCD_DAEMON_THREADS` 覆盖）；
+/// 其余 target 串行，直到它们各自证明与顺序无关。
+function targetThreads(target) {
+  if (target === "http") return process.env.SVCD_HTTP_THREADS || "4";
+  if (target === "daemon") return process.env.SVCD_DAEMON_THREADS || "4";
+  return "1";
 }
 
 /// 单测步骤。`full`、`linux` 与集成档共用同一份线程数口径。
@@ -220,7 +223,6 @@ function integrationSteps() {
     console.error("check: " + error.message);
     return null;
   }
-  const http = httpThreads();
   return targets.map((target) => ({
     args: [
       "test",
@@ -228,7 +230,7 @@ function integrationSteps() {
       target,
       "--no-fail-fast",
       "--",
-      "--test-threads=" + (target === "http" ? http : "1"),
+      "--test-threads=" + targetThreads(target),
     ],
   }));
 }
