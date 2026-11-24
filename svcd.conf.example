@@ -75,7 +75,9 @@ bind = 127.0.0.1:8787
 # Transient plugin data (blob arguments/results) lives in <data>/temp. It is
 # derived, not configured; upload staging and status hooks use the same tree.
 # Files older than temp_retention_secs are deleted; 0 disables the cleanup
-# thread entirely. Defaults: retention 7200s (2h), scan every 300s.
+# thread entirely. Defaults: retention 7200s (2h), scan every 300s. A package
+# payload the store staged here is removed as soon as the install finishes,
+# successfully or not, so retention only covers blobs nothing consumed.
 # temp_retention_secs = 7200
 # temp_cleanup_interval_secs = 300
 
