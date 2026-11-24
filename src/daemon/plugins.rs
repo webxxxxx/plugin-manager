@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 
 use crate::face::control;
 use crate::kernel::failure::{Problem, ProblemError};
@@ -8,6 +9,7 @@ use crate::manage as package;
 use crate::manage as plugin;
 use crate::manage::Strategy;
 use crate::platform::clock::Clock;
+use crate::platform::paths::Paths;
 
 use super::Daemon;
 
@@ -78,7 +80,26 @@ impl Daemon {
         })
     }
 
+    /// Install one package the caller staged on disk.
+    ///
+    /// The payload is a one-shot input: the store downloads it into
+    /// `<data>/temp`, hands the path over, and only the installed tree has to
+    /// survive. A refused package used to leave those bytes for
+    /// `temp_retention_secs` (two hours), which is what filled the 34 MB
+    /// OpenWrt volume in #286 — so the source is dropped on success *and* on
+    /// refusal, as long as it lives inside the temp area the daemon owns.
     pub(super) fn install_plugin(
+        &mut self,
+        install: control::Install,
+        clock: &Clock,
+    ) -> Result<Status, ProblemError> {
+        let source = PathBuf::from(&install.path);
+        let result = self.install_package(install, clock);
+        cleanup_temp_payload(&self.config.paths, &source);
+        result
+    }
+
+    fn install_package(
         &mut self,
         install: control::Install,
         clock: &Clock,
@@ -294,6 +315,61 @@ impl Daemon {
         info!("plugin {} uninstalled", id);
         Ok(())
     }
+}
+
+pub(super) fn cleanup_temp_payload(paths: &Paths, source: &Path) {
+    let Ok(temp) = fs::canonicalize(&paths.temp_dir) else {
+        // No temp area yet: nothing of ours can be in it.
+        return;
+    };
+    let Ok(source) = fs::canonicalize(source) else {
+        // Already gone (the CLI removes its own import, then calls here).
+        return;
+    };
+    let Some(entry) = temp_entry(&temp, &source) else {
+        return;
+    };
+    let result = match fs::symlink_metadata(&entry) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&entry),
+        Ok(_) => fs::remove_file(&entry),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = result {
+        warn!(
+            "temp payload {} not removed after install: {}",
+            entry.display(),
+            error
+        );
+    }
+}
+
+/// Which temp entry a source path belongs to.
+///
+/// `files/<id>/...` and `uploads/<id>/...` are bundles: the whole id directory
+/// is the unit, or a deleted part would leave the manifest behind. Everything
+/// else in temp is a single file (a content-addressed blob) or one
+/// `incoming/` result.
+fn temp_entry(temp: &Path, source: &Path) -> Option<PathBuf> {
+    let relative = source.strip_prefix(temp).ok()?;
+    let mut parts = relative.components();
+    let Component::Normal(first) = parts.next()? else {
+        return None;
+    };
+    if first == "files" || first == "uploads" {
+        let Component::Normal(id) = parts.next()? else {
+            // The store directory itself is not a payload.
+            return None;
+        };
+        return Some(temp.join(first).join(id));
+    }
+    if first == "incoming" {
+        let Component::Normal(file) = parts.next()? else {
+            return None;
+        };
+        return Some(temp.join("incoming").join(file));
+    }
+    Some(temp.join(first))
 }
 
 #[cfg(test)]

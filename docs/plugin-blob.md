@@ -308,6 +308,8 @@ temp_cleanup_interval_secs = 300
 
 `SVCD_TEMP_DIR` 环境变量优先于 `svcd.conf` 的 `temp_dir`，主要用于测试和隔离运行。
 
+安装包不算「未访问文件」：`plugin.install` 的来源落在 `temp_dir` 里时（blob、`files/<id>` 文件包或 `incoming/` 里的一个文件），**安装成功和失败都会立刻删掉这份来源**（#286）。内容寻址存储的语义是「用完即弃的输入」，安装后的版本目录才是要留下的东西；这样小容量卷不会因为一次失败的 15 MiB 安装被占到 TTL 到期。
+
 > 升级提示：旧版本默认目录是 `<data>/blobs`，改名为 `<data>/temp` 后旧文件不会自动迁移。需要保留旧 blob 时，可以手工把目录改名为 `temp`，或在 `svcd.conf` 里把 `temp_dir` 指回旧目录（插件环境变量仍会变成 `SVCD_TEMP_DIR`）。
 
 ## 4. 参数：`$blob`
