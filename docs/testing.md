@@ -235,6 +235,7 @@ http 套件用 4 线程（临时端口 + 独立 sandbox，连续 5 次全绿；`
 - 用户模式的默认目录用 `HOME` / `XDG_*`（Unix）或 `APPDATA` / `LOCALAPPDATA`（Windows）重定向到 sandbox；Unix 用临时 `HOME` 验证 `.profile` 的 PATH 块在安装时写入、卸载时删除。
 - 系统模式的 Windows 配置目录用 `ProgramData` / `USERPROFILE` 重定向；`the_service_account_and_an_elevated_admin_share_one_config_directory` 断言 LocalSystem 视图与管理员视图解析出同一个 `%ProgramData%\svcd\config`，因为控制管道名就是配置目录的哈希。
 - Windows 用户安装会写 `HKCU\Environment\Path`；测试设置 `SVCD_TEST_NO_USER_PATH=1` 跳过，避免污染开发者环境。
+- `SVCD_TEST_SYSTEM_CONFIG_DIR`（仅 debug）把系统模式的配置目录指到 sandbox：装了真 svcd 的宿主上也能测「机器上没有已安装文档」这条路径，不读也不写 `/etc/svcd`、`%ProgramData%\svcd\config`。`--install --prefix` 遇到宿主已有文档时会沿用文档里的显式根（ADR-0023 Amendment），所以需要该前提的用例必须用它隔离。
 - SCM 的 `net localgroup svcd /add` 用退出码 2 表示“已存在”，Win32 1379 只在消息里；计划先容忍 2，再跑一次 `net localgroup svcd` 证明组确实存在。`tests/install.rs` 与 `install::tests` 都锁住这组顺序。
 
 ### 异步等待与失败诊断

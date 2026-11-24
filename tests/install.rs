@@ -1151,7 +1151,16 @@ fn prefixed_install_places_all_three_roots_under_the_install_dir() {
             "--no-service",
         ],
         |command| {
+            // A prefix install derives all three roots when no document is
+            // installed. A host that really runs svcd has one (`/etc/svcd` or
+            // `%ProgramData%\svcd\config`), and its explicit roots win over
+            // `--prefix` by design (ADR-0023 Amendment): point the machine-wide
+            // document at the sandbox so this case is the same on every host.
             command
+                .env(
+                    "SVCD_TEST_SYSTEM_CONFIG_DIR",
+                    sandbox.root.join("system-config"),
+                )
                 .env_remove("SVCD_CONFIG_DIR")
                 .env_remove("SVCD_DATA_DIR")
                 .env_remove("SVCD_LOG_DIR");
@@ -1230,6 +1239,67 @@ fn prefixed_install_places_all_three_roots_under_the_install_dir() {
         .expect("run installed svc");
     assert_eq!(listed.status.code(), Some(0), "{}", stderr(&listed));
     assert_eq!(stdout(&listed), "hello-from-prefix\n");
+}
+
+/// ADR-0023 Amendment: explicit roots in a document win over `--prefix`, so a
+/// prefixed install on a host that already has a document puts its binaries
+/// under the prefix but keeps the recorded roots. The machine-wide document is
+/// the sandbox's `SVCD_TEST_SYSTEM_CONFIG_DIR`, which is also the only way to
+/// exercise this without root or a host that was really installed.
+#[test]
+fn a_recorded_document_keeps_its_explicit_roots_over_a_prefix() {
+    let sandbox = Sandbox::new();
+    let machine_config = sandbox.root.join("system-config");
+    fs::create_dir_all(&machine_config).expect("system config dir");
+    let recorded = [
+        sandbox.root.join("recorded-config"),
+        sandbox.root.join("recorded-data"),
+        sandbox.root.join("recorded-logs"),
+    ];
+    let machine_conf = machine_config.join("svcd.conf");
+    let text = format!(
+        "config_dir = {}\ndata_dir = {}\nlogs_dir = {}\n",
+        recorded[0].display(),
+        recorded[1].display(),
+        recorded[2].display()
+    );
+    fs::write(&machine_conf, &text).expect("machine-wide document");
+
+    let install_root = sandbox.root.join("persist").join("svcd");
+    let output = sandbox.run_with(
+        &[
+            "--install",
+            "--prefix",
+            install_root.to_str().expect("utf8"),
+            "--no-service",
+        ],
+        |command| {
+            command
+                .env("SVCD_TEST_SYSTEM_CONFIG_DIR", &machine_config)
+                .env_remove("SVCD_CONFIG_DIR")
+                .env_remove("SVCD_DATA_DIR")
+                .env_remove("SVCD_LOG_DIR");
+        },
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(install_root.join(executable_name()).is_file());
+    assert!(
+        !install_root.join("config").exists(),
+        "the recorded config_dir wins, so the prefix owns no config"
+    );
+    assert_eq!(
+        fs::read_to_string(&machine_conf).expect("machine-wide document"),
+        text,
+        "the discovered document must keep its roots"
+    );
+    let used = fs::read_to_string(recorded[0].join("svcd.conf")).expect("recorded document");
+    assert!(
+        used.contains(&format!("install_dir = {}", install_root.display())),
+        "the prefix is recorded in the document the install actually uses:\n{used}"
+    );
+    for dir in [&recorded[1], &recorded[2]] {
+        assert!(dir.is_dir(), "{} was not created", dir.display());
+    }
 }
 
 #[test]
