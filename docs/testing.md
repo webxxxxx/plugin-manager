@@ -141,6 +141,10 @@ daemon，比纯 `Limits` 单测更接近用户报的「设置过小崩溃」。
 
 ## 6. 命令
 
+> `[profile.test] debug = 0` 试过：cargo 的 test profile 本来就不带 debuginfo（输出 `[unoptimized]`），
+> 二进制仍是 3.3 MB，串行/并行耗时没有可测变化，因此不保留该配置。
+
+
 ```sh
 # L1 + L4（摘要输出：每个 target 一行，失败才打印尾部）
 node tools/check.mjs quick
