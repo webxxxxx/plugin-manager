@@ -22,6 +22,41 @@ pub(crate) fn cleanup(paths: &Paths, retention: Duration) -> std::io::Result<usi
     Ok(removed)
 }
 
+/// Release the content-addressed entries a consumed transfer created.
+///
+/// A package install is a one-shot input: the plugin store copies the package
+/// into `<temp>/incoming`, the host imports it as the `sha256:<hex>` blob the
+/// browser downloads, and then the install POST carries the same bytes back.
+/// Once the attempt ends nothing references that entry, so waiting for
+/// `temp_retention_secs` (two hours) pins the package on a small volume
+/// (#288). A missing entry is already clean, not an error.
+pub(crate) fn release(paths: &Paths, digest: &[u8]) -> usize {
+    let id = format!("sha256:{}", text_hex(digest));
+    let mut removed = 0;
+    if let Ok(blob) = super::path::blob_path(paths, &id) {
+        if fs::remove_file(&blob).is_ok() {
+            removed += 1;
+        }
+    }
+    #[cfg(feature = "http")]
+    if let Ok(directory) = super::path::file_dir(paths, &id) {
+        if directory.is_dir() && fs::remove_dir_all(&directory).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn text_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
 pub(crate) fn cleanup_dir(
     root: &Path,
     directory: &Path,

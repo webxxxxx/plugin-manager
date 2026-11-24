@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::face::support::{self, CallBudget};
 use crate::kernel::failure::{Problem, ProblemError};
@@ -22,6 +23,10 @@ pub(super) struct InstallFlow {
     enable: bool,
     allow_hooks: bool,
     installer: Option<package::StagingInstaller>,
+    /// sha256 of the package body. The store's `package_blob` imports the same
+    /// bytes into `<temp>` as `sha256:<hex>`, so the install can release that
+    /// entry when the attempt ends (#288).
+    digest: Sha256,
 }
 
 impl InstallFlow {
@@ -39,10 +44,12 @@ impl InstallFlow {
             enable,
             allow_hooks,
             installer: None,
+            digest: Sha256::new(),
         }
     }
 
     pub(super) fn feed(&mut self, data: &[u8]) -> Result<(), ProblemError> {
+        self.digest.update(data);
         self.installer()?.feed(data)
     }
 
@@ -100,6 +107,24 @@ impl InstallFlow {
                 http::response(200, "application/json", &body)
             }
             Err(response) => response,
+        }
+    }
+}
+
+/// The upload is a one-shot transfer, so the blob the store imported for it is
+/// garbage whichever way the attempt ended: installed, refused, or the client
+/// vanished mid-body. `Drop` covers all three, so no finish path has to
+/// remember (#288).
+impl Drop for InstallFlow {
+    fn drop(&mut self) {
+        let digest = self.digest.clone().finalize();
+        let removed = crate::platform::storage::release(&self.paths, &digest);
+        if removed > 0 {
+            debug!(
+                "install released the {} temp entr{} it consumed",
+                removed,
+                if removed == 1 { "y" } else { "ies" }
+            );
         }
     }
 }

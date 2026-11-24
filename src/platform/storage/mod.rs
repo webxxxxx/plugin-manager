@@ -13,7 +13,7 @@ mod path;
 #[cfg(feature = "http")]
 mod upload;
 
-pub(crate) use gc::cleanup;
+pub(crate) use gc::{cleanup, release};
 #[cfg(any(feature = "http", test))]
 pub(crate) use meta::Meta;
 pub(crate) use meta::{materialize_result, resolve_args};
