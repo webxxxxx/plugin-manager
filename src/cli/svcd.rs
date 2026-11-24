@@ -45,8 +45,67 @@ pub(crate) fn status() -> i32 {
             None => 1,
         }
     } else {
-        crate::selfinstall::service_status()
+        match crate::selfinstall::service_status() {
+            crate::selfinstall::ServiceStatus::Managed(code) => code,
+            crate::selfinstall::ServiceStatus::Unmanaged(unmanaged) => unmanaged_status(&unmanaged),
+        }
     }
+}
+
+/// `svcd status` where no init system can be asked (`--manual`, BusyBox).
+///
+/// The command used to run `systemctl is-active svcd` on every Unix host, so
+/// the manual install on OpenWrt answered with `systemctl: No such file or
+/// directory` (#286). Nothing supervises the daemon there, so the control
+/// channel answers instead — and a configuration that was not found is
+/// `unknown`, never `stopped`: the default paths would otherwise report the
+/// wrong tree.
+fn unmanaged_status(unmanaged: &crate::selfinstall::Unmanaged) -> i32 {
+    println!("mode:     service");
+    match unmanaged.supervisor {
+        crate::selfinstall::Supervisor::Busybox => {
+            println!("manager:  busybox /etc/inittab (::respawn:)")
+        }
+        _ => println!("manager:  none (installed with --manual)"),
+    }
+    println!("launcher: {}", unmanaged.launcher.display());
+    let Some(config) = Config::bootstrap_or_report("svcd") else {
+        println!("state:    unknown (the configuration is invalid)");
+        return 1;
+    };
+    // Discovery always names a path, even when no document exists there; the
+    // paths would then be defaults, and pinging them would report the wrong
+    // tree as `stopped`.
+    let Some(document) = found_conf(&config) else {
+        println!("state:    unknown (no svcd.conf found; set SVCD_CONFIG_DIR)");
+        return 1;
+    };
+    println!("config:   {}", document.display());
+    if control_answers(&config) {
+        println!("state:    running");
+        0
+    } else {
+        println!("state:    stopped");
+        1
+    }
+}
+
+/// The `svcd.conf` this process actually read, or `None` when discovery only
+/// named a path that does not exist.
+fn found_conf(config: &Config) -> Option<&Path> {
+    config
+        .settings_path
+        .as_deref()
+        .filter(|path| path.is_file())
+}
+
+fn control_answers(config: &Config) -> bool {
+    crate::wire::control::channel::request(
+        config.paths.control_dir(),
+        "svcd.ping",
+        serde_json::json!({}),
+    )
+    .is_ok()
 }
 
 pub(crate) fn user(host: &dyn Host, args: &[String]) -> i32 {
@@ -291,4 +350,48 @@ fn user_status(config: &Config) -> i32 {
 
 fn user_install() -> i32 {
     crate::selfinstall::self_install(&[])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::paths::Paths;
+    use crate::platform::settings::Settings;
+
+    fn config_with(document: Option<std::path::PathBuf>) -> Config {
+        let root = crate::platform::test_support::temp_dir().join(format!(
+            "svcd-status-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        Config::with_paths(Settings::default(), document, Paths::under(&root))
+    }
+
+    /// #286: discovery names a default path even when no document is there.
+    /// Reporting `stopped` from those paths would point at the wrong tree.
+    #[test]
+    fn a_discovered_path_without_a_document_is_not_a_found_configuration() {
+        let missing = crate::platform::test_support::temp_dir().join("svcd-status-absent.conf");
+        let _ = std::fs::remove_file(&missing);
+        assert!(found_conf(&config_with(Some(missing))).is_none());
+        assert!(found_conf(&config_with(None)).is_none());
+    }
+
+    #[test]
+    fn an_existing_document_is_the_found_configuration() {
+        let document = crate::platform::test_support::temp_dir().join(format!(
+            "svcd-status-{}-{}.conf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::write(&document, "bind = 127.0.0.1:0\n").expect("write conf");
+        let config = config_with(Some(document.clone()));
+        assert_eq!(found_conf(&config), Some(document.as_path()));
+    }
 }

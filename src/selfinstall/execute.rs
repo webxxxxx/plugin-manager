@@ -26,7 +26,8 @@ pub use self_uninstall::self_uninstall;
 #[cfg(windows)]
 pub(crate) use self_uninstall::wait_for_process;
 pub use service::{
-    install_service, service_start, service_status, service_stop, uninstall_service,
+    install_service, service_start, service_status, service_stop, uninstall_service, ServiceStatus,
+    Supervisor, Unmanaged,
 };
 
 impl Probe {

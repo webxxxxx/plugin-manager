@@ -12,7 +12,7 @@ pub(crate) mod upgrade;
 pub(crate) use execute::wait_for_process;
 pub use execute::{
     ensure_conf, install_service, self_install, self_uninstall, service_start, service_status,
-    service_stop, uninstall_service,
+    service_stop, uninstall_service, ServiceStatus, Supervisor, Unmanaged,
 };
 #[cfg(windows)]
 pub(crate) use plan::SCM_NAME;
