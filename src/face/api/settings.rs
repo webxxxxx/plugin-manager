@@ -149,6 +149,26 @@ impl ApiFace {
                             &format!("{} must be a single line", key),
                         );
                     }
+                    // A byte field takes the human form (`32 MiB`) and stores
+                    // the canonical digits, so the document has one shape
+                    // whichever way the value arrived (#290).
+                    let text = if entry.kind == crate::platform::config_doc::Kind::Bytes {
+                        match settings::parse_byte_size(&text) {
+                            Some(bytes) => bytes.to_string(),
+                            None => {
+                                return error_response(
+                                    400,
+                                    "bad_request",
+                                    &format!(
+                                        "{} must be a byte size such as 33554432 or 32 MiB",
+                                        key
+                                    ),
+                                )
+                            }
+                        }
+                    } else {
+                        text
+                    };
                     if let Err(error) = settings::parse(&format!("{} = {}", key, text), base) {
                         return error_response(400, "bad_request", &error);
                     }

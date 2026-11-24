@@ -315,10 +315,10 @@ pub const CONF_KEYS: &[ConfKey] = &[
         label: "安装包体积上限",
         group: Group::Resources,
         kind: Kind::Bytes,
-        default: "8/64/512 MiB",
-        doc: "可安装 .spk 的体积上限。",
-        recommend: "默认即可；交叉编译的大包再调大。",
-        editable_in_console: false,
+        default: "8/64/512 MiB（tiny/interactive/streaming）",
+        doc: "可安装 .spk 的体积上限。超出这个值的包在上传阶段就被 413 拒绝。",
+        recommend: "低内存宿主默认 8 MiB，装十几 MiB 的插件时调到 32 MiB（可写 32 MiB 或字节数）。",
+        editable_in_console: true,
         needs_restart: true,
     },
     ConfKey {
@@ -785,7 +785,10 @@ mod tests {
         // #263: budget-derived detail (max_*, queue sizes, stacks, raw in-flight
         // budgets) is shown in the settings screen but never editable there.
         for entry in CONF_KEYS {
-            let derived = entry.key.starts_with("max_")
+            // `max_package_bytes` is a policy cap the operator may raise (a
+            // package over it can never be installed), not detail derived from
+            // the memory budget (#290).
+            let derived = (entry.key.starts_with("max_") && entry.key != "max_package_bytes")
                 || entry.key.ends_with("_queue")
                 || entry.key.ends_with("_stack_bytes")
                 || entry.key.starts_with("ws_inflight_");

@@ -196,6 +196,79 @@ fn a_save_rewrites_only_the_named_key_and_restarts_the_daemon() {
     assert_eq!(debug["source"], "file");
 }
 
+/// #290: the package cap is an operator policy, not derived detail, so the
+/// console shows it as a field; a byte field takes the human form and stores
+/// the canonical digits.
+#[test]
+fn the_console_raises_max_package_bytes_with_a_byte_size() {
+    let mut sandbox = Sandbox::new();
+    write_conf(&sandbox, "mem_budget_bytes = auto\n");
+    sandbox.start_daemon_as_user();
+    let address = sandbox.wait_for_http();
+
+    let settings = request(&address, "GET", "/api/v1/settings", "", b"");
+    assert_eq!(settings.status, 200, "{:?}", settings.body);
+    let cap = settings.body["keys"]
+        .as_array()
+        .expect("keys")
+        .iter()
+        .find(|entry| entry["key"] == "max_package_bytes")
+        .expect("max_package_bytes")
+        .clone();
+    assert_eq!(cap["editable"], true, "{cap}");
+
+    let before = daemon_starts(&sandbox);
+    let response = request(
+        &address,
+        "PUT",
+        "/api/v1/settings",
+        "application/json",
+        br#"{"values":{"max_package_bytes":"32 MiB"}}"#,
+    );
+    assert_eq!(response.status, 200, "{:?}", response.body);
+    let text = fs::read_to_string(sandbox.config.join("svcd.conf")).expect("conf");
+    assert!(text.contains("max_package_bytes = 33554432"), "{text}");
+
+    let address = wait_for_restarted(&sandbox, before, |address| {
+        try_effective(address, "max_package_bytes").map(|value| value == json!(33_554_432))
+    });
+    let settings = request(&address, "GET", "/api/v1/settings", "", b"");
+    let cap = settings.body["keys"]
+        .as_array()
+        .expect("keys")
+        .iter()
+        .find(|entry| entry["key"] == "max_package_bytes")
+        .expect("max_package_bytes")
+        .clone();
+    assert_eq!(cap["value"], "33554432", "{cap}");
+    assert_eq!(cap["effective"], json!(33_554_432), "{cap}");
+    assert_eq!(cap["source"], "file", "{cap}");
+}
+
+/// A byte field that cannot be read as a size is a 400, and the document is
+/// left alone.
+#[test]
+fn an_unreadable_byte_size_is_rejected_without_writing() {
+    let mut sandbox = Sandbox::new();
+    write_conf(&sandbox, "mem_budget_bytes = auto\n");
+    sandbox.start_daemon_as_user();
+    let address = sandbox.wait_for_http();
+    let path = sandbox.config.join("svcd.conf");
+    let before = fs::read_to_string(&path).expect("conf");
+
+    let response = request(
+        &address,
+        "PUT",
+        "/api/v1/settings",
+        "application/json",
+        br#"{"values":{"max_package_bytes":"thirty two megs"}}"#,
+    );
+    assert_eq!(response.status, 400, "{:?}", response.body);
+    let message = response.body["error"]["message"].as_str().unwrap_or("");
+    assert!(message.contains("byte size"), "{message}");
+    assert_eq!(fs::read_to_string(&path).expect("conf"), before);
+}
+
 #[test]
 fn invalid_read_only_and_conflicting_values_are_rejected_without_writing() {
     let mut sandbox = Sandbox::new();
