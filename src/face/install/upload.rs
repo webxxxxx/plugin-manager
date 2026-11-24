@@ -128,11 +128,16 @@ pub fn exchange(
                     return Err(http::json_error(400, "bad_request", "empty package body"))
                 }
                 http::Framing::Length(length) if length > limits.max_package_bytes => {
-                    return Err(http::json_error(
-                        413,
-                        "payload_too_large",
-                        "package is too large",
-                    ))
+                    // #286: answer, then drain. Closing while the client is
+                    // still sending a 15 MiB body makes the kernel answer with
+                    // RST, and the browser shows `TypeError: Failed to fetch`
+                    // instead of this 413 — the same drain the content-type
+                    // and strategy refusals below already do.
+                    return Ok(reject_after_drain(
+                        http::json_error(413, "payload_too_large", "package is too large"),
+                        framing,
+                        limits.max_package_bytes,
+                    ));
                 }
                 _ => {}
             }
@@ -142,11 +147,12 @@ pub fn exchange(
                 return Err(http::json_error(400, "bad_request", "empty import body"))
             }
             http::Framing::Length(length) if length > limits.max_package_bytes => {
-                return Err(http::json_error(
-                    413,
-                    "payload_too_large",
-                    "import is too large",
-                ))
+                // Same drain as the install route (#286).
+                return Ok(reject_after_drain(
+                    http::json_error(413, "payload_too_large", "import is too large"),
+                    framing,
+                    limits.max_package_bytes,
+                ));
             }
             _ => {}
         },

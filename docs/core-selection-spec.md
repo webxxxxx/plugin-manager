@@ -17,6 +17,7 @@
 - 桌面另有 `svc ui` 子命令作为 GUI 入口，不单独占入口名。
 - **PluginManager 不再存在**：不是进程、不是服务、不是保留名。插件管理是 svcd 的内部功能。
 - `svcd run --foreground` 供服务管理器拉起；`svcd install-service / uninstall-service` 向宿主注册自身（systemd / launchd / SCM / BusyBox inittab / procd 五份计划）。
+- `svcd start` / `stop` / `status` 按宿主实际 init 分派，不写死 systemd：`/etc/init.d/svcd` 存在走 procd 脚本，有 `systemctl` 走 systemd，只认 `/etc/inittab` 的 `::respawn:` 或 `--manual`（没有注册）时不再调用 `systemctl`——`status` 改问控制通道，找不到 `svcd.conf` 时报 `unknown` 而不是 `stopped`（#286）。
 ### 1.2 服务与能力面
 
 - 每个服务有 id、kind（core / plugin）、生命周期、依赖与能力面。注册表 = 内置 `svc` + `services.d/*.json` 的 core + `<data>/plugins/*/current` 的 plugin；没有第二份清单。core 与 plugin 的来源、信任、安装方式见 §1.6。**能力面只归 plugin**：core 是生命周期单元，不参与 `tools/call`。

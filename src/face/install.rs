@@ -357,6 +357,25 @@ mod tests {
         ))
     }
 
+    /// A configuration whose derived `max_package_bytes` is the floor (1 MiB),
+    /// so a 2 MiB body is over the line on every machine.
+    fn small_package_config() -> Arc<Config> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = crate::platform::test_support::temp_dir().join(format!(
+            "svcd-install-small-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        let settings = crate::platform::settings::Settings {
+            max_package_bytes: Some(1024 * 1024),
+            ..crate::platform::settings::Settings::default()
+        };
+        Arc::new(Config::with_paths(settings, None, Paths::under(&root)))
+    }
+
     fn lan() -> Arc<Mutex<Lan>> {
         use std::net::SocketAddr;
         let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
@@ -393,6 +412,54 @@ mod tests {
             text.contains("Content-Type must be application/octet-stream"),
             "{text}"
         );
+    }
+
+    /// #286: a package over `max_package_bytes` is refused before the body is
+    /// read, so the old code answered and closed while the client was still
+    /// sending. The kernel turned that into an RST and the browser showed
+    /// `TypeError: Failed to fetch`. The refusal must answer *and* drain.
+    #[test]
+    fn an_over_limit_body_is_answered_413_and_drained() {
+        let over = 2 * 1024 * 1024usize;
+        for (path, message) in [
+            ("/api/v1/plugins", "package is too large"),
+            ("/api/v1/import", "import is too large"),
+        ] {
+            let head = parse_head(
+                format!(
+                    "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/octet-stream\r\nContent-Length: {over}\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            let mut handler =
+                match exchange(&head, &lan(), small_package_config()).expect("streamed exchange") {
+                    Exchange::Stream(handler) => handler,
+                    Exchange::Response(_) => panic!("a package route must stream"),
+                };
+            let body = vec![0u8; over];
+            let (response, reason, consumed) = crate::server::http::test_support::drive_body(
+                &mut *handler,
+                4096,
+                &body,
+                64 * 1024,
+            );
+            assert_eq!(reason, CloseReason::Completed, "{path}");
+            assert_eq!(
+                consumed,
+                body.len(),
+                "{path}: the refused body must be drained, not reset"
+            );
+            let text = String::from_utf8_lossy(&response);
+            assert!(
+                text.starts_with("HTTP/1.1 413 Payload Too Large"),
+                "{path}: {text}"
+            );
+            assert!(text.contains(message), "{path}: {text}");
+            assert!(
+                text.contains("\"code\":\"payload_too_large\""),
+                "{path}: {text}"
+            );
+        }
     }
 
     #[test]
