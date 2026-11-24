@@ -157,7 +157,7 @@ pub(crate) fn apply_config(
     if require_root {
         plugin::root_required().map_err(Error::Failed)?;
     }
-    if !package::valid_id(id) || plugin::current_version(paths, id).is_none() {
+    if !crate::kernel::registry::valid_id(id) || plugin::current_version(paths, id).is_none() {
         return Err(Error::Failed(
             Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)),
         ));

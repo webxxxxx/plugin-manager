@@ -34,7 +34,7 @@ pub fn scan(
 
     for entry in entries.flatten() {
         let id = entry.file_name().to_string_lossy().to_string();
-        if !package::valid_id(&id) || id == RESERVED_ID {
+        if !crate::kernel::registry::valid_id(&id) || id == RESERVED_ID {
             warnings.push(format!("ignoring plugin directory {}", id));
             continue;
         }

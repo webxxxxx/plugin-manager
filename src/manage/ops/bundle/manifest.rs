@@ -67,7 +67,7 @@ pub(super) fn assemble_manifest(
                     .error("cannot derive the plugin id from the directory name; pass --id")
             })?,
     };
-    if !package::valid_id(&id) {
+    if !crate::kernel::registry::valid_id(&id) {
         return Err(Problem::Invalid.error(format!(
             "invalid plugin id: {} (expected [a-z0-9][a-z0-9_-]{{0,63}}; pass --id)",
             id

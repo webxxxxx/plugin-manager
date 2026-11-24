@@ -3,7 +3,7 @@
 
 use super::*;
 
-pub use crate::kernel::registry::valid_id;
+use crate::kernel::registry::valid_id;
 
 /// Icon ceilings: one file per format, and the whole icon set stays small
 /// enough that it never competes with the payload budget.

@@ -6,7 +6,6 @@ use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::hook::{HookSpec, Hooks, TIMEOUT_MS};
 use crate::kernel::layout::plugin_dir;
 use crate::kernel::registry::RESERVED_ID;
-use crate::manage as package;
 use crate::manage::ops::export_plugin::remove_versions;
 use crate::platform::paths::Paths;
 
@@ -41,7 +40,7 @@ pub fn uninstall(
     purge: bool,
     hooks: &mut dyn Hooks,
 ) -> Result<(), ProblemError> {
-    if !package::valid_id(id) || id == RESERVED_ID {
+    if !crate::kernel::registry::valid_id(id) || id == RESERVED_ID {
         return Err(Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)));
     }
     let directory = plugin_dir(paths, id);
