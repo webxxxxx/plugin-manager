@@ -47,6 +47,25 @@ pub(crate) fn release(paths: &Paths, digest: &[u8]) -> usize {
     removed
 }
 
+/// Remove one blob entry by id. `false` when nothing was there, so the route
+/// can answer 404 without inventing an error (#291).
+pub(crate) fn forget_blob(paths: &Paths, id: &str) -> bool {
+    match super::path::blob_path(paths, id) {
+        Ok(path) => fs::remove_file(path).is_ok(),
+        // A malformed id names nothing, which is the same answer as absent.
+        Err(_) => false,
+    }
+}
+
+/// Remove one `files/<id>` bundle. The manifest and its parts are one unit.
+#[cfg(feature = "http")]
+pub(crate) fn forget_file(paths: &Paths, id: &str) -> bool {
+    match super::path::file_dir(paths, id) {
+        Ok(directory) if directory.is_dir() => fs::remove_dir_all(directory).is_ok(),
+        _ => false,
+    }
+}
+
 fn text_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 

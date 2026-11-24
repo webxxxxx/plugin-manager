@@ -28,6 +28,99 @@ fn blobs_upload_and_download_round_trip() {
     assert_eq!(missing.status, 404);
 }
 
+/// #291: a transfer artifact can be released on purpose instead of waiting for
+/// `temp_retention_secs`. The store calls this once the browser has the bytes,
+/// so an install's disk peak is one package, not two.
+#[test]
+fn a_blob_can_be_released_with_delete() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let put = raw_request(
+        &address,
+        "POST",
+        "/api/v1/blobs",
+        "application/octet-stream",
+        b"throwaway package",
+    );
+    assert_eq!(put.status, 200, "{:?}", put.body);
+    let id = json_body(&put)["id"].as_str().expect("blob id").to_string();
+
+    let removed = raw_request(&address, "DELETE", &format!("/api/v1/blobs/{id}"), "", b"");
+    assert_eq!(removed.status, 200, "{:?}", removed.body);
+    assert_eq!(json_body(&removed)["removed"], true);
+
+    let gone = raw_request(&address, "GET", &format!("/api/v1/blobs/{id}"), "", b"");
+    assert_eq!(gone.status, 404, "a released blob must not be downloadable");
+
+    let again = raw_request(&address, "DELETE", &format!("/api/v1/blobs/{id}"), "", b"");
+    assert_eq!(again.status, 404, "a second release is not an error to invent");
+}
+
+/// The upgrade pre-check reads every plugin root plus the temp volume. The
+/// rows are a list so a multi-root install can ask "where can this go" (#291).
+#[test]
+fn the_disk_route_lists_roots_and_the_temp_volume() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let disk = raw_request(&address, "GET", "/api/v1/disk", "", b"");
+    assert_eq!(disk.status, 200, "{:?}", disk.body);
+    let body = json_body(&disk);
+    let roots = body["roots"].as_array().expect("roots is a list");
+    assert_eq!(roots.len(), 1, "{body}");
+    assert_eq!(roots[0]["default"], true);
+    assert!(
+        roots[0]["root"]
+            .as_str()
+            .is_some_and(|root| root.ends_with("plugins")),
+        "{body}"
+    );
+    assert!(
+        roots[0]["freeBytes"].as_u64().unwrap_or(0) > 0,
+        "a root the daemon can write must report bytes: {body}"
+    );
+    assert!(
+        roots[0]["plugin"].is_null(),
+        "without ?id there is no plugin column: {body}"
+    );
+    assert!(
+        body["tempFreeBytes"].as_u64().unwrap_or(0) > 0,
+        "the temp volume is reported beside the roots: {body}"
+    );
+}
+
+/// `?id=` marks the root that already holds that plugin, which is what tells
+/// a caller to upgrade in place instead of picking a fresh root.
+#[test]
+fn the_disk_route_marks_the_root_that_holds_the_asked_plugin() {
+    let mut sandbox = Sandbox::new();
+    let plugin = sandbox.data.join("plugins/demo");
+    std::fs::create_dir_all(plugin.join("1.0.0")).expect("version dir");
+    std::fs::write(plugin.join("current"), "1.0.0").expect("current");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let disk = raw_request(&address, "GET", "/api/v1/disk?id=demo", "", b"");
+    assert_eq!(disk.status, 200, "{:?}", disk.body);
+    let body = json_body(&disk);
+    let row = &body["roots"][0];
+    assert_eq!(row["plugin"]["id"], "demo", "{body}");
+    assert_eq!(row["plugin"]["version"], "1.0.0", "{body}");
+
+    let ghost = raw_request(&address, "GET", "/api/v1/disk?id=ghost", "", b"");
+    assert_eq!(ghost.status, 200, "{:?}", ghost.body);
+    assert!(
+        json_body(&ghost)["roots"][0]["plugin"].is_null(),
+        "an unknown id is not installed in any root"
+    );
+
+    let invalid = raw_request(&address, "GET", "/api/v1/disk?id=bad%2Fid", "", b"");
+    assert_eq!(invalid.status, 400, "{:?}", invalid.body);
+}
+
 #[test]
 fn blob_upload_accepts_chunked_and_multipart_bodies() {
     let mut sandbox = Sandbox::new();

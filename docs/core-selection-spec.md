@@ -277,12 +277,14 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
   - `POST /api/v1/services/{id}/stop` → 返回 `{summary}`
   - `POST /api/v1/services/{id}/enable` / `disable` → 切换开机自启，返回 `{summary}`
   - `GET /api/v1/version` → `{version, protocol, platform}`
+  - `GET /api/v1/disk[?id=<插件 id>]` → `{roots:[{root,freeBytes,default,plugin}], tempFreeBytes}`：`roots` 是**列表**，每个插件根一行，按优先级排列（`default=true` 是默认安装根）；目录还不存在时向上找最近的存在祖先再取 statvfs（新装没有 `plugins/`），拿不到数字的卷给 `null`。`?id=` 让每行多一个 `plugin` 字段（`{id,version,directory}`，没装为 `null`），调用方据此区分「原地升级」（这个根已经有它）和「新装」（挑一个装得下的根）；id 不合法 400，未知 id 不是错误。多根配置下每行就是一个候选根（ADR-0030）。`tempFreeBytes` 是 `<data>/temp` 的空闲字节，装包要经过它
   - `GET /` → 内嵌 Web 控制台（静态 HTML；页面本身不需要认证，API 调用仍走同一鉴权）
   - `GET /assets/{*path}` → 控制台的其余静态文件（同样免认证；页面只在 `/`）
   - `POST /api/v1/plugins`：body 为 `.spk` 原始字节（`application/octet-stream`），query `strategy` / `enable` / `allow_hooks`；流式写临时文件，512 MiB 上限；返回 `{id,version,state}`
   - `POST /api/v1/plugins/{id}/ui-token`：签发 1 小时、绑定该 plugin id 的 UI token；返回 `{token,url,expiresIn}`，`url` 形如 `/plugin-ui/{id}/{token}/`
   - `GET /api/v1/trust` → `{keys:[keyId], directory}`；`POST /api/v1/trust?key_id=<id>`：body 为 PEM SPKI 公钥，写入 `<config>/trust.d/<id>.pub`；`DELETE /api/v1/trust/{keyId}` 撤销
   - `DELETE /api/v1/plugins/{id}?purge=false`：卸载；`purge=true` 删除版本、配置、状态与 `<id>.log` / `<id>-hooks.log`（含轮转），Web 控制台使用 `purge=true`
+  - `DELETE /api/v1/blobs/{id}` / `DELETE /api/v1/file/{id}`：立刻释放一个传输产物（单个 blob，或整包 `files/<id>` 的清单与分片），返回 `{removed:true}`；本来就不存在返回 404。商店在浏览器取完包字节后调用它，把一次安装的磁盘峰值压到**一份包**；不定时依赖 `temp_retention_secs`
   - `POST /api/v1/import?config_id=<id>&no_config=false&force=false`：body 为 `.spk` / `.spkb` / 裸配置，自动识别，语义同 CLI
   - `GET /api/v1/export/{id}/spk`：从已安装版本重建的可安装、已签名 `.spk`（`application/octet-stream`；Web 控制台“导出”使用它）
   - `GET /api/v1/export/{id}`：整包 `.spkb` 备份容器（`backup.json` + `plugin.spk` + 配置；供备份/导入）

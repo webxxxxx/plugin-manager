@@ -155,6 +155,7 @@ api_routes! {
 api_quiet_routes! {
     GET    "/api/v1/version"                  => version,
     GET    "/api/v1/compat"                   => compat,
+    GET    "/api/v1/disk"                     => disk,
     GET    "/api/v1/auth"                     => auth,
     GET    "/api/v1/services"                 => services,
     GET    "/api/v1/services/{id}"            => service_status,
@@ -163,6 +164,8 @@ api_quiet_routes! {
     POST   "/api/v1/services/{id}/enable"     => service_enable,
     POST   "/api/v1/services/{id}/disable"    => service_disable,
     DELETE "/api/v1/plugins/{id}"             => plugin_uninstall,
+    DELETE "/api/v1/blobs/{id}"               => blob_delete,
+    DELETE "/api/v1/file/{id}"                => file_delete,
 }
 
 /// Every macro-declared row, in table order.
@@ -171,6 +174,49 @@ pub(crate) fn route_defs() -> impl Iterator<Item = &'static crate::face::routes:
         .iter()
         .chain(API_JSON_ROUTES)
         .chain(API_QUIET_ROUTES)
+}
+
+/// Free space on the volume that holds `path`. The directory itself may not
+/// exist yet (a fresh install has no `plugins/`), so walk up to the nearest
+/// ancestor: statvfs answers for the mount, not the leaf.
+fn free_disk_at(
+    host: crate::platform::resources::Host,
+    path: &std::path::Path,
+) -> Option<u64> {
+    use crate::platform::resources::Machine;
+
+    let mut candidate = Some(path);
+    while let Some(directory) = candidate {
+        if directory.is_dir() {
+            return host.free_disk(directory);
+        }
+        candidate = directory.parent();
+    }
+    None
+}
+
+/// The rows `GET /api/v1/disk` reports: every place a plugin may live, in
+/// priority order. ADR-0030 turns this into the configured root list; a
+/// single-root install is a one-element list, so the response shape does not
+/// change when that lands.
+fn plugin_roots(paths: &crate::platform::paths::Paths) -> Vec<&std::path::Path> {
+    vec![paths.plugins_dir.as_path()]
+}
+
+/// The installed copy of `id` in one root: a `current` pointer is what makes
+/// the directory an installation rather than a leftover.
+fn installed_plugin(root: &std::path::Path, id: &str) -> Option<Value> {
+    let directory = root.join(id);
+    let version = std::fs::read_to_string(directory.join("current")).ok()?;
+    let version = version.trim();
+    if version.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "id": id,
+        "version": version,
+        "directory": directory.to_string_lossy(),
+    }))
 }
 
 fn handler_for(name: &str) -> Option<HandlerKind> {
@@ -455,6 +501,64 @@ impl ApiFace {
 
     fn plugin_ui_token(&self, call: &ApiCall<'_>) -> Response {
         self.plugin_ui_token_rpc(&call.param("id"))
+    }
+
+    /// `GET /api/v1/disk[?id=<plugin id>]`: one row per plugin root, plus the
+    /// temp volume as a sibling because a package passes through it. A row's
+    /// `plugin` field answers "does this root already hold the plugin named by
+    /// `?id`", which is what lets a caller tell an in-place upgrade from a
+    /// fresh install that may go anywhere with room (#291).
+    fn disk(&self, call: &ApiCall<'_>) -> Response {
+        use crate::platform::resources::Host;
+
+        let paths = &self.config.paths;
+        let wanted = support::query_value(call.query(), "id").unwrap_or_default();
+        if !wanted.is_empty() && !crate::kernel::registry::valid_id(&wanted) {
+            return error_response(400, "invalid", "invalid plugin id");
+        }
+        let roots: Vec<Value> = plugin_roots(paths)
+            .iter()
+            .enumerate()
+            .map(|(index, root)| {
+                json!({
+                    "root": root.to_string_lossy(),
+                    "freeBytes": free_disk_at(Host, root),
+                    "default": index == 0,
+                    "plugin": (!wanted.is_empty())
+                        .then(|| installed_plugin(root, &wanted))
+                        .flatten(),
+                })
+            })
+            .collect();
+        Response::json(
+            200,
+            &json!({
+                "roots": roots,
+                "tempFreeBytes": free_disk_at(Host, &paths.temp_dir),
+            }),
+        )
+    }
+
+    /// `DELETE /api/v1/blobs/{id}`: release a transfer artifact instead of
+    /// waiting for `temp_retention_secs`. The store calls this right after the
+    /// browser has the package bytes, which is what makes an install's disk
+    /// peak one package instead of two (#291).
+    fn blob_delete(&self, call: &ApiCall<'_>) -> Response {
+        if crate::platform::storage::forget_blob(&self.config.paths, &call.param("id")) {
+            Response::json(200, &json!({ "removed": true }))
+        } else {
+            error_response(404, "not_found", "no such blob")
+        }
+    }
+
+    /// `DELETE /api/v1/file/{id}` (and the `/files/` alias): the manifest and
+    /// its parts are one unit, so the whole bundle goes.
+    fn file_delete(&self, call: &ApiCall<'_>) -> Response {
+        if crate::platform::storage::forget_file(&self.config.paths, &call.param("id")) {
+            Response::json(200, &json!({ "removed": true }))
+        } else {
+            error_response(404, "not_found", "no such file")
+        }
     }
 
     fn plugin_uninstall(&self, call: &ApiCall<'_>) -> Response {
