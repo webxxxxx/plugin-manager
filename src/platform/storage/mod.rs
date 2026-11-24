@@ -14,6 +14,8 @@ mod path;
 mod upload;
 
 pub(crate) use gc::{cleanup, release};
+#[cfg(feature = "http")]
+pub(crate) use gc::{forget_blob, forget_file};
 #[cfg(any(feature = "http", test))]
 pub(crate) use meta::Meta;
 pub(crate) use meta::{materialize_result, resolve_args};

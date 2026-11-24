@@ -98,6 +98,20 @@ GET /api/v1/blobs/sha256:9f2c...e1
 - `If-Match` / `If-Unmodified-Since` 不命中 → 412；
 - `If-Range` 的校验器不匹配时忽略 Range，返回 200 整段。
 
+### 主动释放：`DELETE`
+
+传输产物默认按 `temp_retention_secs`（默认 7200 秒）过期清理；需要立刻腾出空间时用 DELETE 显式释放，不等清理周期：
+
+```http
+DELETE /api/v1/blobs/sha256:9f2c...e1
+DELETE /api/v1/file/<id>
+```
+
+- 成功 `200 {"removed":true}`；同一个 id 第二次删除返回 `404`（没有东西可删不是错误，也不隐藏答案）；
+- `/api/v1/file/{id}` 删的是整包：清单与它的分片同属一个单元；
+- 插件商店装包走的就是这条路：浏览器 `GET /api/v1/blobs/{id}` 拿到字节后立刻 DELETE，**安装期的磁盘峰值是一份包，不是两份**；安装入口自己也会在成功/失败后清掉 `temp` 里的源包（见 §4 的 `plugin.install`）。空间仍然不够时（单卷峰值 > 空闲），只有先卸旧版再装新版这一条路，导出备份是流式的、不占设备磁盘。
+- 装之前问一句"装得下吗"用 `GET /api/v1/disk[?id=<插件 id>]`：`roots` 列表给出每个插件根的空闲字节、哪一个是默认根、这个 id 是否已经装在该根上（用来决定原地升级还是换根），`tempFreeBytes` 是同一次安装会经过的临时卷。
+
 ### 断点续传 / 分片上传 / 并行上传
 
 一次整体上传适合几十 MB 到 512 MiB 的文件；需要断点续传、重传失败分片或并行上传时，使用 S3 风格的 part 会话（JSON 变体）。所有分片先落在 `temp_dir/uploads/<uploadId>/`，`complete` 时按顺序拼装并计算最终 SHA-256。
