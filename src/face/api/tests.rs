@@ -543,3 +543,21 @@ fn a_public_face_route_skips_transport_auth() {
         "a protected route still requires a principal"
     );
 }
+#[test]
+fn a_probe_row_reports_the_measured_value_unless_the_document_states_one() {
+    assert_eq!(
+        super::settings::probe_reported(None, Some(512)),
+        serde_json::json!(512),
+        "an unstated probe row shows what this process measured"
+    );
+    assert_eq!(
+        super::settings::probe_reported(Some(64), Some(512)),
+        serde_json::json!(64),
+        "a stated value wins over the probe"
+    );
+    assert_eq!(
+        super::settings::probe_reported(None, None),
+        serde_json::Value::Null,
+        "an unreadable probe stays unknown, not zero"
+    );
+}
