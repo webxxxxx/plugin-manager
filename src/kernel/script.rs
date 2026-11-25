@@ -23,11 +23,6 @@ impl Actions {
             _ => {}
         }
     }
-
-    #[cfg(test)]
-    pub fn any(self) -> bool {
-        self.start || self.stop || self.status
-    }
 }
 
 const ACTIONS: [&str; 3] = ["start", "stop", "status"];
@@ -207,7 +202,11 @@ mod tests {
         let text = "#!/bin/sh\n# start() { :; }\n# stop() { :; }\n";
         let extension = if cfg!(windows) { "cmd" } else { "sh" };
         let actions = declared_actions(text, extension);
-        assert!(!actions.any(), "{:?}", actions);
+        assert!(
+            !actions.start && !actions.stop && !actions.status,
+            "{:?}",
+            actions
+        );
     }
 
     #[cfg(windows)]
@@ -227,7 +226,11 @@ mod tests {
     #[test]
     fn unsupported_languages_declare_nothing() {
         let actions = declared_actions("def start():\n    pass\n", "py");
-        assert!(!actions.any(), "{:?}", actions);
+        assert!(
+            !actions.start && !actions.stop && !actions.status,
+            "{:?}",
+            actions
+        );
     }
 
     #[test]
