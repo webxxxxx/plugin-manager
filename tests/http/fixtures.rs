@@ -118,6 +118,42 @@ pub(crate) fn chatty_plugin_bundle(key: &SigningKey, id: &str) -> Vec<u8> {
     signed_package(key, manifest, &files)
 }
 
+/// An agent that reports its environment on stderr once. `data_dir` and
+/// `config_dir` print as `none` when they are absent, so one assertion covers
+/// "not injected" on both hosts (%VAR% stays literal in cmd.exe, which is
+/// exactly the absence being proven).
+fn env_report_script() -> (&'static str, Vec<u8>) {
+    if cfg!(windows) {
+        (
+            "env-report.cmd",
+            b"@echo off\r\necho env plugin_dir=%SVCD_PLUGIN_DIR% 1>&2\r\necho env log_dir=%SVCD_LOG_DIR% 1>&2\r\necho env temp_dir=%SVCD_TEMP_DIR% 1>&2\r\nif defined SVCD_DATA_DIR (echo env data_dir=%SVCD_DATA_DIR% 1>&2) else (echo env data_dir=none 1>&2)\r\nif defined SVCD_CONFIG_DIR (echo env config_dir=%SVCD_CONFIG_DIR% 1>&2) else (echo env config_dir=none 1>&2)\r\n:loop\r\nset \"line=\"\r\nset /p line=\r\nif errorlevel 1 goto end\r\necho {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\r\ngoto loop\r\n:end\r\n".to_vec(),
+        )
+    } else {
+        (
+            "env-report.sh",
+            b"#!/bin/sh\nprintf 'env plugin_dir=%s\\n' \"$SVCD_PLUGIN_DIR\" >&2\nprintf 'env log_dir=%s\\n' \"$SVCD_LOG_DIR\" >&2\nprintf 'env temp_dir=%s\\n' \"$SVCD_TEMP_DIR\" >&2\nprintf 'env data_dir=%s\\n' \"${SVCD_DATA_DIR:-none}\" >&2\nprintf 'env config_dir=%s\\n' \"${SVCD_CONFIG_DIR:-none}\" >&2\nwhile IFS= read -r line; do\n  printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\\n'\ndone\n".to_vec(),
+        )
+    }
+}
+
+/// The env-reporting agent as a signed package (#312).
+pub(crate) fn env_report_plugin_bundle(key: &SigningKey, id: &str) -> Vec<u8> {
+    let (name, data) = env_report_script();
+    let exec_path = format!("payload/bin/{}", name);
+    let files = vec![(exec_path.clone(), data, 0o755)];
+    let manifest = json!({
+        "schema": 1,
+        "id": id,
+        "name": id,
+        "version": "1.0.0",
+        "desc": "env report plugin",
+        "platform": target(),
+        "protocol": 1,
+        "exec": {"path": exec_path, "args": [], "ready": "notify"},
+    });
+    signed_package(key, manifest, &files)
+}
+
 pub(crate) fn plugin_package(key: &SigningKey) -> Vec<u8> {
     plugin_bundle(key, "demo", "1.0.0", None, false)
 }

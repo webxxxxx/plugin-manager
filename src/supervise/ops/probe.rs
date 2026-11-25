@@ -24,8 +24,18 @@ impl Supervisor {
         else {
             return;
         };
+        let plugin_dir = self
+            .registry
+            .get(id)
+            .and_then(|service| service.install_dir.clone());
         let mut poll = self.hook_pump();
-        status.details.probe = Some(run_status_hook(id, &hook, &self.config.paths, &mut poll));
+        status.details.probe = Some(run_status_hook(
+            id,
+            &hook,
+            &self.config.paths,
+            plugin_dir.as_deref().map(Path::new),
+            &mut poll,
+        ));
     }
 
     /// A one-pass poll for a synchronous hook wait. The closure owns the
@@ -51,7 +61,13 @@ impl Supervisor {
 /// becomes the `probe` text (capped), and a non-zero exit only appends the
 /// status word. Capture goes through a temp file so a hook that leaves a child
 /// holding stdout cannot block the daemon's event loop.
-fn run_status_hook(id: &str, hook: &Hook, paths: &Paths, poll: &mut dyn FnMut()) -> String {
+fn run_status_hook(
+    id: &str,
+    hook: &Hook,
+    paths: &Paths,
+    plugin_dir: Option<&Path>,
+    poll: &mut dyn FnMut(),
+) -> String {
     let output_path = status_output_path(id, paths);
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -64,7 +80,7 @@ fn run_status_hook(id: &str, hook: &Hook, paths: &Paths, poll: &mut dyn FnMut())
         Ok(file) => file,
         Err(error) => return format!("cannot create status output: {}", error),
     };
-    let mut command = hook_command(id, "status", hook, paths);
+    let mut command = hook_command(id, "status", hook, paths, plugin_dir);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::from(file))

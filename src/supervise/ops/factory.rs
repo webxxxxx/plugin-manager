@@ -77,6 +77,7 @@ impl SlotFactory {
             self.limits.clone(),
         );
         slot.set_protocol(service.protocol);
+        slot.set_plugin_dir(service.install_dir.as_ref().map(std::path::PathBuf::from));
         slot.set_protocol_only(service.kind == Kind::Plugin);
         slot.set_remain_after_exit(service.remain_after_exit);
         slot.set_initial_state(service.state);

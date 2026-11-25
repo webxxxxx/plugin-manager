@@ -25,7 +25,7 @@ use self::frames::Frames;
 use self::handle::SlotRequest;
 use self::stop::StopFlow;
 
-pub(crate) use self::commands::hook_command;
+pub(crate) use self::commands::{apply_plugin_child_env, hook_command};
 pub(crate) use self::handle::{SlotHandle, SlotWire};
 
 /// Per-plugin in-flight cap from ticket #31. The full spec also describes a
@@ -50,6 +50,9 @@ pub(crate) struct Slot {
     /// The directory set this slot uses for its log, its child environment and
     /// the blob store. Resolved once at the composition root.
     paths: Arc<Paths>,
+    /// Where this plugin was installed (`<root>/<id>`), from the definition;
+    /// `None` for a core service. Exported as `SVCD_PLUGIN_DIR` (#312).
+    plugin_dir: Option<std::path::PathBuf>,
     limits: Arc<crate::platform::limits::Limits>,
     pub(crate) machine: Machine,
     exec: Exec,
@@ -119,6 +122,7 @@ impl Slot {
         let (request_tx, request_rx) = mpsc::sync_channel(CALL_QUEUE);
         Slot {
             id,
+            plugin_dir: None,
             paths,
             limits,
             machine: Machine::new(restart),
@@ -251,6 +255,11 @@ impl Slot {
 
     pub(crate) fn set_protocol(&mut self, protocol: u32) {
         self.frames.set_protocol(protocol);
+    }
+
+    /// From the definition, not the location index: both describe the same tree.
+    pub(crate) fn set_plugin_dir(&mut self, plugin_dir: Option<std::path::PathBuf>) {
+        self.plugin_dir = plugin_dir;
     }
 
     /// Whether callers depend on this service's stdio channel staying open.
@@ -413,10 +422,12 @@ impl Slot {
             .lifecycle
             .as_ref()
             .and_then(|lifecycle| lifecycle.start.as_ref());
+        let plugin_dir = self.plugin_dir.as_deref();
         let mut command = match start {
-            Some(hook) => service_hook_command(&self.id, "start", hook, &self.paths),
+            Some(hook) => service_hook_command(&self.id, "start", hook, &self.paths, plugin_dir),
             None => command_for(&self.exec),
         };
+        apply_plugin_child_env(&mut command, plugin_dir, &self.paths);
         let blob_dir = self.paths.temp_dir.clone();
         let _ = std::fs::create_dir_all(crate::platform::storage::incoming_dir(&self.paths));
         command.env("SVCD_TEMP_DIR", &blob_dir);
