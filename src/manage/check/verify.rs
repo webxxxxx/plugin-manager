@@ -63,6 +63,27 @@ pub fn verify_bytes(bytes: &[u8], trust_dir: &Path) -> Result<Package, ProblemEr
     verify_bytes_with(bytes, SignatureCheck::Required, trust_dir)
 }
 
+/// The error a strict install gets when the package carries no signature.
+///
+/// The tar rule ("signature.json is the second entry") is how the format
+/// enforces it, not what the caller needs to hear: an unsigned package is the
+/// fact, and there are exactly two ways forward — sign it, or allow unsigned
+/// installs. Both the in-memory and the streamed path report through here so
+/// they cannot drift (#309).
+pub(crate) fn unsigned_package_message(second_entry: Option<&str>) -> String {
+    let seen = match second_entry {
+        Some(path) => format!(
+            "the entry after manifest.json is {}, not signature.json",
+            path
+        ),
+        None => "signature.json is missing".to_string(),
+    };
+    format!(
+        "package is not signed: {}; sign it with a key in trust.d, or set allow_insecure_install = on to install it unsigned",
+        seen
+    )
+}
+
 pub fn verify_bytes_with(
     bytes: &[u8],
     check: SignatureCheck,
@@ -206,7 +227,12 @@ mod tests {
         let bytes = unsigned_package_from(&manifest, &files);
 
         let error = verify_bytes(&bytes).expect_err("strict mode");
-        assert!(error.detail().contains("signature.json"), "{error}");
+        assert!(error.detail().contains("package is not signed"), "{error}");
+        assert!(error.detail().contains("allow_insecure_install"), "{error}");
+        assert!(
+            error.detail().contains("payload") && error.detail().contains("not signature.json"),
+            "the message names what the second entry actually is: {error}"
+        );
         let package =
             verify_bytes_with(&bytes, SignatureCheck::AllowUnsigned).expect("insecure mode");
         assert!(package.signature_bytes.is_empty());

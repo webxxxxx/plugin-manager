@@ -11,8 +11,8 @@ use crate::kernel::failure::{Problem, ProblemError};
 #[cfg(unix)]
 use crate::manage::check::verify::check_hook_shebangs;
 use crate::manage::check::verify::{
-    check_platform, check_signature, parse_manifest, validate_declared_files, validate_manifest,
-    validate_script_payload, SignatureMode,
+    check_platform, check_signature, parse_manifest, unsigned_package_message,
+    validate_declared_files, validate_manifest, validate_script_payload, SignatureMode,
 };
 use crate::manage::model::hex::hex_bytes;
 use crate::manage::model::manifest::{FileData, FileEntry, Manifest, Package};
@@ -293,7 +293,7 @@ impl SpkSink {
             .clone()
             .ok_or_else(|| Problem::Invalid.error("manifest.json is missing"))?;
         if !self.signature_checked && !self.allow_insecure {
-            return Err(Problem::Invalid.error("signature.json is missing"));
+            return Err(Problem::Invalid.error(unsigned_package_message(None)));
         }
         self.prepare_staging()?;
         if self.seen.len() != self.declared.len() {
@@ -338,7 +338,7 @@ impl TarSink for SpkSink {
                 return Ok(());
             }
             if !self.allow_insecure {
-                return Err(Problem::Invalid.error("signature.json must be the second entry"));
+                return Err(Problem::Invalid.error(unsigned_package_message(Some(&entry.path))));
             }
             // The operator opted into unsigned packages: the first payload is
             // the second entry, exactly like the blocking install path.
@@ -526,7 +526,7 @@ pub fn load_staged(
     };
     let signature_verified = if signature_bytes.is_empty() {
         if !allow_insecure {
-            return Err(Problem::Invalid.error("signature.json is missing"));
+            return Err(Problem::Invalid.error(unsigned_package_message(None)));
         }
         false
     } else if allow_insecure {
@@ -680,6 +680,23 @@ mod tests {
         let broken = TempDir::new();
         assert!(install_bytes(truncated, broken.path()).is_err());
         assert!(staging_leftovers(broken.path()).is_empty());
+    }
+
+    #[test]
+    fn an_unsigned_stream_says_the_package_is_not_signed() {
+        let (manifest, files) = manifest(crate::platform::target());
+        let bytes = unsigned_package_from(&manifest, &files);
+        let root = TempDir::new();
+
+        let error = match install_bytes(&bytes, root.path()) {
+            Ok(_) => panic!("an unsigned stream must be refused"),
+            Err(error) => error,
+        };
+        let detail = error.detail();
+        assert!(detail.contains("package is not signed"), "{detail}");
+        assert!(detail.contains("allow_insecure_install"), "{detail}");
+        assert!(!detail.contains("must be the second entry"), "{detail}");
+        assert!(staging_leftovers(root.path()).is_empty());
     }
 
     #[test]
