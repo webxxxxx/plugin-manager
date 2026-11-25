@@ -58,12 +58,14 @@ pub fn uninstall(
                     id
                 )));
             }
-            if let Err(error) = crate::platform::locations::forget(paths, id) {
-                warn!(
-                    "plugin {}: cannot forget the location record: {}",
-                    id, error
-                );
-            }
+            forget_location(paths, id);
+            // Audit line: nothing on the volume changed, and the next scan will
+            // not re-add this plugin because the record is what said it exists.
+            info!(
+                "plugin {}: location record forgotten (root {} is not available); the volume was left untouched",
+                id,
+                root.display()
+            );
             return Ok(());
         }
     }
@@ -76,6 +78,7 @@ pub fn uninstall(
         fs::remove_dir_all(&directory).map_err(|error| {
             Problem::Internal.error(format!("remove {}: {}", directory.display(), error))
         })?;
+        forget_location(paths, id);
         return Ok(());
     }
 
@@ -94,7 +97,22 @@ pub fn uninstall(
             }
         }
     }
+    // The record is what makes a plugin "installed" for `plugin where` and for
+    // root selection; an uninstalled plugin must not keep pinning a root.
+    forget_location(paths, id);
     Ok(())
+}
+
+/// Drop one plugin's location record. A failure only means the next scan keeps
+/// a stale entry for a moment, so it warns instead of failing an uninstall that
+/// already removed the files.
+fn forget_location(paths: &Paths, id: &str) {
+    if let Err(error) = crate::platform::locations::forget(paths, id) {
+        warn!(
+            "plugin {}: cannot forget the location record: {}",
+            id, error
+        );
+    }
 }
 
 /// A failing pre-remove hook must not block uninstall; the contract only

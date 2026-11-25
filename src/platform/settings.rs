@@ -186,73 +186,9 @@ impl Settings {
     }
 }
 
-/// Every `svcd.conf` key that an environment variable can override.
-///
-/// The name is `SVCD_` + the key upper-cased (`max_streams` ->
-/// `SVCD_MAX_STREAMS`). Keeping one list makes the override surface explicit:
-/// an unknown `SVCD_*` variable (a test hook or a typo) is not silently
-/// treated as a config key.
-pub(crate) const ENV_KEYS: &[&str] = &[
-    "bind",
-    "allow_insecure_install",
-    "config_dir",
-    "data_dir",
-    "plugins_dir",
-    "logs_dir",
-    "static_root",
-    "install_dir",
-    "auth_passwd",
-    "temp_retention_secs",
-    "temp_cleanup_interval_secs",
-    "rescan_interval_ms",
-    // Removed from behavior (ADR-0005 amendment); kept so an existing
-    // environment cannot turn an unknown key into a startup error.
-    "boot_scan_wait_ms",
-    "log_max_bytes",
-    "log_rotations",
-    "log_to_file",
-    "log_level",
-    "log",
-    "request_stack_bytes",
-    "io_stack_bytes",
-    "blocking_threads",
-    "blocking_queue",
-    "mcp_streaming",
-    "max_body_bytes",
-    "max_json_body_bytes",
-    "max_complete_body_bytes",
-    "max_header_bytes",
-    "max_streams",
-    "stream_buffer_bytes",
-    "max_connections",
-    "max_connections_per_ip",
-    "max_subscriptions",
-    "max_subscribers_per_plugin",
-    "http_idle_timeout_secs",
-    "max_package_bytes",
-    "transfer_timeout_secs",
-    "control_timeout_secs",
-    "default_timeout",
-    "max_timeout",
-    "ws_max_message_bytes",
-    "ws_inflight_bytes",
-    "ws_inflight_requests",
-    "ws_buffer_shrink_bytes",
-    "ws_raw_enabled",
-    "ws_raw_max_bytes",
-    "ws_raw_queue",
-    "pending_queue",
-    "progress_queue",
-    "cpu_budget_percent",
-    "mem_budget_bytes",
-    "mem_budget_percent",
-    "workload",
-    "probe_available_memory",
-    "probe_cgroup_remaining",
-    "probe_cpus",
-    "probe_install_free_disk",
-    "probe_temp_free_disk",
-];
+mod env;
+
+pub(crate) use env::ENV_KEYS;
 
 /// Build a document from the environment and append it after the file, so the
 /// normal parser sees the override last and every validation rule stays in one

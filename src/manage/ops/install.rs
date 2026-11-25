@@ -198,15 +198,17 @@ impl SpkSink {
         let manifest = self.manifest.as_ref().ok_or_else(|| {
             Problem::Invalid.error("manifest.json must be the first entry of a package")
         })?;
+        let fresh = staged_size(
+            manifest,
+            self.manifest_bytes.len(),
+            self.signature_bytes.len(),
+        );
+        let needed = needed_for(&self.paths, manifest.id(), fresh);
         crate::manage::ops::install_plugin::install_root(
             &self.paths,
             manifest.id(),
             self.requested_root.as_deref(),
-            staged_size(
-                manifest,
-                self.manifest_bytes.len(),
-                self.signature_bytes.len(),
-            ),
+            needed,
         )
     }
 
@@ -579,6 +581,13 @@ fn set_mode(_path: &Path, _mode: u32) -> Result<(), ProblemError> {
     Ok(())
 }
 
+/// What an install needs: the package, plus whatever the installed copy still
+/// occupies. An upgrade stages the new copy beside the old one, so both have to
+/// fit; a fresh install has no old copy and this is just the package.
+fn needed_for(paths: &crate::platform::paths::Paths, id: &str, fresh: u64) -> u64 {
+    fresh.saturating_add(crate::manage::installed_version_bytes(paths, id))
+}
+
 /// A fresh staging directory inside `root`. The name is the marker the daemon
 /// and the startup sweep look for; being inside the root is what keeps the
 /// commit's `rename` on one filesystem.
@@ -634,6 +643,24 @@ mod tests {
         let mut installer = stager(root, false, 1024 * 1024);
         installer.feed(bytes)?;
         installer.finish()
+    }
+
+    /// The arithmetic behind "an upgrade needs both copies": the package plus
+    /// what the installed version occupies right now.
+    #[test]
+    fn the_room_an_install_needs_counts_the_installed_copy() {
+        let root = TempDir::new();
+        let paths = crate::platform::paths::Paths::under(root.path());
+        crate::platform::locations::record(&paths, "demo", paths.default_plugin_root())
+            .expect("record");
+        let plugin = paths.default_plugin_root().join("demo");
+        std::fs::create_dir_all(plugin.join("1.0.0")).expect("version");
+        std::fs::write(plugin.join("current"), "1.0.0").expect("current");
+        std::fs::write(plugin.join("1.0.0/payload.bin"), vec![0u8; 4096]).expect("payload");
+
+        assert_eq!(needed_for(&paths, "demo", 1000), 1000 + 4096);
+        // Nothing installed: the package is the whole need.
+        assert_eq!(needed_for(&paths, "fresh", 1000), 1000);
     }
 
     #[test]

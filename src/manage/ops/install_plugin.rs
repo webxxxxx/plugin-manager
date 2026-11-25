@@ -33,6 +33,18 @@ pub(crate) fn installed_bytes(directory: &Path) -> Option<u64> {
     directory_size(directory).ok()
 }
 
+/// What the installed copy of `id` occupies right now (0 when there is none).
+///
+/// Staging the new copy happens while the old one is still on the volume, so
+/// the room an upgrade needs is this plus the package.
+pub(crate) fn installed_version_bytes(paths: &Paths, id: &str) -> u64 {
+    let Some(version) = current_version(paths, id) else {
+        return 0;
+    };
+    let directory = crate::kernel::layout::plugin_dir(paths, id);
+    installed_bytes(&directory.join(version)).unwrap_or(0)
+}
+
 pub(crate) use root::install_root;
 
 /// Preflight a package that has already been streamed into a staging directory.

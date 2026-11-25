@@ -74,20 +74,22 @@ pub(crate) fn dir_of(paths: &Paths, id: &str) -> PathBuf {
         .join(id)
 }
 
-/// Free bytes on the volume that holds `path`. The directory may not exist yet
-/// (a root that has never been used), so walk up to the nearest ancestor: the
-/// filesystem answers for the mount, not for the leaf.
-pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
+/// Free bytes on the volume that holds `root`, or `None` when the root is not
+/// there.
+///
+/// Walking up to an ancestor would answer with the space of whatever
+/// filesystem the parent happens to be on, and a root on a volume that is not
+/// mounted (a pulled card, its mount point still empty) would then look like it
+/// has room — an install could land on the wrong disk. A root that does not
+/// exist is unmeasurable, not empty. The daemon creates its default root at
+/// boot, so a first install still has a measurable root.
+pub(crate) fn free_bytes(root: &Path) -> Option<u64> {
     use crate::platform::resources::{Host, Machine};
 
-    let mut candidate = Some(path);
-    while let Some(directory) = candidate {
-        if directory.is_dir() {
-            return Host.free_disk(directory);
-        }
-        candidate = directory.parent();
+    if !root.is_dir() {
+        return None;
     }
-    None
+    Host.free_disk(root)
 }
 
 /// Whether a root can be read right now. A root on a volume that was pulled
