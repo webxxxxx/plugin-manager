@@ -1527,7 +1527,7 @@ fn blob_and_file_complete_share_the_parts_input_table() {
 #[test]
 fn the_disk_route_lists_every_configured_root_in_priority_order() {
     let mut sandbox = Sandbox::new();
-    let second = sandbox.root.join("sd/plugins");
+    let second = sandbox.root.join("sd").join("plugins");
     fs::create_dir_all(&second).expect("second root");
     fs::write(
         sandbox.config.join("svcd.conf"),

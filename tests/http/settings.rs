@@ -531,8 +531,8 @@ fn the_effective_budget_matches_the_running_snapshot() {
 fn a_plugin_root_that_holds_plugins_cannot_be_removed_from_the_settings_screen() {
     let mut sandbox = Sandbox::new();
     let internal = sandbox.data.join("plugins");
-    let card = sandbox.data.join("card/plugins");
-    let spare = sandbox.data.join("spare/plugins");
+    let card = sandbox.data.join("card").join("plugins");
+    let spare = sandbox.data.join("spare").join("plugins");
     // The card root is deliberately *not* created: a root whose volume is not
     // mounted is the case the index has to speak for.
     for root in [&internal, &spare] {
