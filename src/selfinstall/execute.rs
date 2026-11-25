@@ -25,6 +25,7 @@ pub use self_install::self_install;
 pub use self_uninstall::self_uninstall;
 #[cfg(windows)]
 pub(crate) use self_uninstall::wait_for_process;
+pub(crate) use service::service_can_restart_itself;
 pub use service::{
     install_service, service_start, service_status, service_stop, uninstall_service, ServiceStatus,
     Supervisor, Unmanaged,

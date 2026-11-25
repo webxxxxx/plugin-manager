@@ -138,6 +138,49 @@ pub(crate) fn supervisor() -> Supervisor {
     )
 }
 
+/// Whether this host can bring the daemon back after a self-restart.
+///
+/// The three init systems all restart a process that exits on their own: procd
+/// respawns the instance, an inittab `::respawn:` line respawns it, and
+/// systemd's `Restart=on-failure` covers the explicit `systemctl start` the
+/// helper issues afterwards. `Manual` registered nothing, so there is nobody to
+/// bring it back.
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+pub(crate) fn can_self_restart(supervisor: Supervisor) -> bool {
+    matches!(
+        supervisor,
+        Supervisor::Systemd | Supervisor::Procd | Supervisor::Busybox
+    )
+}
+
+/// Whether a service-mode save may restart the daemon itself.
+///
+/// `SVCD_TEST_NO_SERVICE_RESTART` pins the "no supervisor to lean on" path: the
+/// integration sandbox runs on a host that has a `systemctl` binary but no
+/// service to start, so the decision must not depend on what happens to be in
+/// `PATH` there.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn service_can_restart_itself() -> bool {
+    if std::env::var_os("SVCD_TEST_NO_SERVICE_RESTART").is_some() {
+        return false;
+    }
+    can_self_restart(supervisor())
+}
+
+/// launchd keeps the daemon alive (`KeepAlive`), and `kickstart -k` is itself a
+/// restart, so the helper has an init system to hand over to.
+#[cfg(target_os = "macos")]
+pub(crate) fn service_can_restart_itself() -> bool {
+    true
+}
+
+/// Windows: the SCM owns the process lifetime and its recovery actions are not
+/// ours to rely on, so a save still points at `sc stop svcd && sc start svcd`.
+#[cfg(windows)]
+pub(crate) fn service_can_restart_itself() -> bool {
+    false
+}
+
 /// The order is the installer's: an existing init registration wins over a
 /// binary that merely happens to be in `PATH`.
 #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
@@ -292,6 +335,17 @@ mod tests {
         );
         assert_eq!(detect_supervisor(false, false, true), Supervisor::Busybox);
         assert_eq!(detect_supervisor(false, false, false), Supervisor::Manual);
+    }
+
+    /// #306: a save in service mode may restart the daemon only where an init
+    /// system will bring it back; a `--manual` install has nobody to lean on.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn only_a_supervisor_that_respawns_may_restart_the_daemon() {
+        assert!(can_self_restart(Supervisor::Systemd));
+        assert!(can_self_restart(Supervisor::Procd));
+        assert!(can_self_restart(Supervisor::Busybox));
+        assert!(!can_self_restart(Supervisor::Manual));
     }
 
     /// The launcher a manual install tells the operator to start.

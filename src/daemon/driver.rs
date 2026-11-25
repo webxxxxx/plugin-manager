@@ -193,15 +193,27 @@ impl Daemon {
         }
     }
 
-    /// Restart the daemon after a settings save. A system service belongs to
-    /// its service manager, so this only says how to restart it.
+    /// Restart the daemon after a settings save.
+    ///
+    /// A system service belongs to its init system, so this is only offered
+    /// where that init system will bring the daemon back: the helper stops this
+    /// process and the supervisor starts it again (#306). A `--manual` install
+    /// or a Windows SCM service has nothing to lean on, and then the answer is
+    /// how to restart it by hand.
     pub(super) fn restart_daemon(&mut self) -> Result<serde_json::Value, ProblemError> {
         if !crate::platform::paths::user_mode() {
-            return Ok(json!({
-                "restarting": false,
-                "hint": "saved; restart the service with the service manager \
-                         (systemctl restart svcd / launchctl kickstart -k / sc stop svcd && sc start svcd)",
-            }));
+            if !crate::selfinstall::service_can_restart_itself() {
+                return Ok(json!({
+                    "restarting": false,
+                    "hint": "saved; restart the service with the service manager \
+                             (systemctl restart svcd / launchctl kickstart -k / sc stop svcd && sc start svcd)",
+                }));
+            }
+            let helper =
+                crate::supervise::ops::restart::spawn_service_helper().map_err(|error| {
+                    Problem::Internal.error(format!("spawn service restart helper: {}", error))
+                })?;
+            return Ok(json!({"restarting": true, "helper": helper}));
         }
         // The helper stops this daemon itself, after a short grace period that
         // lets the HTTP response carrying `restarting: true` flush. Shutting
