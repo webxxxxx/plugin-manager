@@ -29,9 +29,9 @@ pub fn scan(
     let discovery = crate::platform::locations::discover(&paths.plugin_roots);
     warnings.extend(discovery.warnings.iter().cloned());
     warnings.extend(discovery.conflicts.iter().cloned());
-    let found =
-        crate::platform::locations::rebuild(&discovery, crate::platform::locations::load(paths));
-    if crate::platform::locations::load(paths) != found {
+    let recorded = crate::platform::locations::load(paths);
+    let found = crate::platform::locations::rebuild(&discovery, recorded.clone());
+    if recorded != found {
         if let Err(error) = crate::platform::locations::save(paths, &found) {
             warnings.push(format!("plugin locations: {}", error));
         }

@@ -145,6 +145,19 @@ pub fn run(conf: Option<PathBuf>) -> i32 {
         warn!("warning: {}", issue);
     }
 
+    // The default plugin root is created here so its volume can be measured
+    // before the first install. A configured root on a volume that is not
+    // mounted stays missing on purpose: an unmeasurable root must not borrow
+    // the free space of whatever filesystem its parent is on.
+    let default_root = config.paths.default_plugin_root().to_path_buf();
+    if let Err(error) = std::fs::create_dir_all(&default_root) {
+        warn!(
+            "plugin root {}: cannot create it: {}",
+            default_root.display(),
+            error
+        );
+    }
+
     let (plugins, warnings) = plugin::scan(&config.paths, &config.limits);
     for warning in warnings {
         warn!("plugin: {}", warning);

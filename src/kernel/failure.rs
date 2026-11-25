@@ -177,7 +177,7 @@ impl Rejection {
     }
 }
 
-/// 管理失败的封闭类别。恰好十二类。
+/// 管理失败的封闭类别。恰好十三类。
 ///
 /// 与 [`Class`] 不同，`Problem` 描述的是**管理层**的失败（未知服务、冲突、
 /// 平台不支持），不是一次尝试的结果；`ProblemError` 只携带类别与给人看的
@@ -194,6 +194,10 @@ pub enum Problem {
     UnsupportedPlatform,
     MissingDependency,
     TooLarge,
+    /// The operation needs more space than the volume has. Its own category
+    /// because a caller can act on it (free space, uninstall an old version),
+    /// unlike a generic internal failure.
+    InsufficientSpace,
     Timeout,
     Internal,
 }
@@ -219,7 +223,7 @@ impl Problem {
         serde_json::json!({ "kind": self.as_str() })
     }
 
-    pub const ALL: [Problem; 12] = [
+    pub const ALL: [Problem; 13] = [
         Problem::UnknownService,
         Problem::UnknownPlugin,
         Problem::UnknownStrategy,
@@ -230,6 +234,7 @@ impl Problem {
         Problem::UnsupportedPlatform,
         Problem::MissingDependency,
         Problem::TooLarge,
+        Problem::InsufficientSpace,
         Problem::Timeout,
         Problem::Internal,
     ];
@@ -254,6 +259,7 @@ impl Problem {
             Problem::UnsupportedPlatform => "unsupported_platform",
             Problem::MissingDependency => "missing_dependency",
             Problem::TooLarge => "too_large",
+            Problem::InsufficientSpace => "insufficient_space",
             Problem::Timeout => "timeout",
             Problem::Internal => "internal",
         }
@@ -398,7 +404,7 @@ mod tests {
             .map(|problem| problem.as_str())
             .collect();
         let total = names.len();
-        assert_eq!(total, 12);
+        assert_eq!(total, 13);
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), total, "two problems share a name");
@@ -431,6 +437,7 @@ mod tests {
                 "unsupported_platform",
                 "missing_dependency",
                 "too_large",
+                "insufficient_space",
                 "timeout",
                 "internal",
             ]

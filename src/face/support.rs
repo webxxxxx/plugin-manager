@@ -182,6 +182,9 @@ fn status_for_problem(problem: Problem) -> u16 {
         Problem::NotAPlugin | Problem::Conflict => 409,
         Problem::Invalid | Problem::UnsupportedPlatform | Problem::MissingDependency => 400,
         Problem::TooLarge => 413,
+        // WebDAV's code for "the volume cannot hold it": an operator action
+        // (free space, uninstall an old version), not a server bug.
+        Problem::InsufficientSpace => 507,
         Problem::Timeout => 504,
         Problem::Internal => 500,
     }

@@ -59,7 +59,10 @@ bind = 127.0.0.1:8787
 # Duplicates are dropped; an empty entry is an error. A root on another volume
 # is fine; if its volume is missing when the daemon starts, the plugins recorded
 # there stay recorded and hidden (the boot log names them, `plugin where <id>`
-# shows the root), and they come back when the volume does.
+# shows the root), and they come back when the volume does. The daemon creates
+# only its default root: every other root has to exist (a mounted card provides
+# it), because a root that is not there is not measurable and is never chosen
+# for a new install.
 # plugins_dir = /mnt/sd/svcd/plugins,/var/lib/svcd/plugins
 
 # Removed keys and variables are ignored with a warning that names the derived

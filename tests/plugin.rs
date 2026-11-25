@@ -641,6 +641,11 @@ fn installs_lists_starts_and_uninstalls_a_plugin() {
     );
     let removed = sandbox.run_plugin(&["uninstall", "demo"]);
     assert_eq!(removed.status.code(), Some(0), "{}", stderr(&removed));
+    assert_eq!(
+        sandbox.run_plugin(&["where", "demo"]).status.code(),
+        Some(1),
+        "an uninstalled plugin keeps no location record"
+    );
     assert!(!sandbox
         .run_plugin(&["list"])
         .stdout
@@ -2025,6 +2030,11 @@ fn an_unavailable_root_is_reported_and_force_only_forgets_the_record() {
 
     let forced = sandbox.run_plugin(&["uninstall", "demo", "--force"]);
     assert_eq!(forced.status.code(), Some(0), "stderr: {}", stderr(&forced));
+    let log = sandbox.daemon_log();
+    assert!(
+        log.contains("location record forgotten"),
+        "the audit line must say the volume was left alone: {log}"
+    );
     assert!(
         pulled.join("demo/current").is_file(),
         "force must not touch the volume"

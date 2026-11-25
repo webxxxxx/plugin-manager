@@ -1548,3 +1548,67 @@ fn the_disk_route_lists_every_configured_root_in_priority_order() {
         "both roots report bytes: {body}"
     );
 }
+
+/// `DELETE /api/v1/file/{id}` is the bundle counterpart of the blob release:
+/// the manifest and its parts are one unit, so the whole directory goes.
+#[test]
+fn a_file_bundle_can_be_released_with_delete() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    // A file bundle id is `sha256:<64 hex>`, the same shape as a blob id.
+    let id = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let hex = id.trim_start_matches("sha256:");
+    let bundle = sandbox.data.join("temp/files").join(hex);
+    fs::create_dir_all(&bundle).expect("bundle dir");
+    fs::write(bundle.join("manifest.json"), b"{}").expect("manifest");
+
+    let removed = raw_request(&address, "DELETE", &format!("/api/v1/file/{id}"), "", b"");
+    assert_eq!(removed.status, 200, "{:?}", removed.body);
+    assert_eq!(json_body(&removed)["removed"], true);
+    assert!(!bundle.exists(), "the whole bundle goes");
+
+    let again = raw_request(&address, "DELETE", &format!("/api/v1/file/{id}"), "", b"");
+    assert_eq!(
+        again.status, 404,
+        "a second release is not an error to invent"
+    );
+}
+
+/// A root whose volume is not there reports `null`, never the free space of
+/// whatever filesystem its parent happens to be on.
+#[test]
+fn disk_reports_null_for_a_root_that_is_not_there() {
+    let mut sandbox = Sandbox::new();
+    let missing = sandbox.root.join("not-mounted").join("plugins");
+    fs::write(
+        sandbox.config.join("svcd.conf"),
+        format!(
+            "bind = 127.0.0.1:0\nplugins_dir = {},{}\n",
+            sandbox.data.join("plugins").display(),
+            missing.display()
+        ),
+    )
+    .expect("write svcd.conf");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let disk = raw_request(&address, "GET", "/api/v1/disk", "", b"");
+    assert_eq!(disk.status, 200, "{:?}", disk.body);
+    let body = json_body(&disk);
+    let roots = body["roots"].as_array().expect("roots list");
+    assert_eq!(roots.len(), 2, "{body}");
+    assert_eq!(
+        roots[1]["root"].as_str().expect("root"),
+        missing.display().to_string()
+    );
+    assert!(
+        roots[1]["freeBytes"].is_null(),
+        "an absent root is unmeasurable, not empty: {body}"
+    );
+    assert!(
+        roots[0]["freeBytes"].as_u64().unwrap_or(0) > 0,
+        "the default root is measured: {body}"
+    );
+}

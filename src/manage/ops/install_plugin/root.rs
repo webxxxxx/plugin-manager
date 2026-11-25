@@ -48,15 +48,47 @@ pub(crate) fn install_root(
                 )));
             }
         }
+        // The old copy stays on the volume while the new one is staged, so a
+        // root that cannot hold `needed` (the caller counts both) is refused
+        // here with numbers instead of failing halfway through a staging tree.
+        require_room(&recorded, needed)?;
         return Ok(recorded);
     }
 
     if let Some(requested) = requested {
+        require_room(&requested, needed)?;
         return Ok(requested);
     }
 
     let candidates = candidates(paths);
-    choose_root(&candidates, needed).ok_or_else(|| insufficient(&candidates, needed))
+    choose_root(&candidates, needed).ok_or_else(|| insufficient(&candidates, needed, None))
+}
+
+/// `root` needs `needed` bytes of room, or the install is refused with the
+/// numbers. A root the platform cannot measure is left to fail on its own
+/// write: refusing here would block a root that is simply not readable yet.
+fn require_room(root: &Path, needed: u64) -> Result<(), ProblemError> {
+    require_room_at(root, needed, crate::platform::locations::free_bytes)
+}
+
+/// The check with the measurement injected, so the refusal is testable without
+/// filling a real volume.
+fn require_room_at(
+    root: &Path,
+    needed: u64,
+    free: impl Fn(&Path) -> Option<u64>,
+) -> Result<(), ProblemError> {
+    let Some(free) = free(root) else {
+        return Ok(());
+    };
+    if free < needed {
+        return Err(insufficient(
+            &[(root.to_path_buf(), Some(free))],
+            needed,
+            Some(root),
+        ));
+    }
+    Ok(())
 }
 
 /// The configured spelling of `requested`, so the caller's `--root` and the
@@ -77,7 +109,12 @@ fn configured(paths: &Paths, requested: &Path) -> Result<PathBuf, ProblemError> 
 }
 
 /// Every root with its free bytes, in priority order.
+///
+/// The default root is created here: it lives under `data_dir`, the host owns
+/// it, and a first install needs something to measure. A configured extra root
+/// is left alone — if its volume is not mounted, it must stay unmeasurable.
 pub(crate) fn candidates(paths: &Paths) -> Vec<Candidate> {
+    let _ = fs::create_dir_all(paths.default_plugin_root());
     paths
         .plugin_roots
         .iter()
@@ -100,18 +137,30 @@ pub(crate) fn choose_root(candidates: &[Candidate], needed: u64) -> Option<PathB
         .map(|(root, _)| root.clone())
 }
 
-fn insufficient(candidates: &[Candidate], needed: u64) -> ProblemError {
+/// The structured space refusal: its own category (HTTP 507) so a caller can
+/// offer "uninstall the old version and retry" instead of showing a server
+/// error, and the message carries the numbers.
+fn insufficient(candidates: &[Candidate], needed: u64, recorded: Option<&Path>) -> ProblemError {
     let rows: Vec<String> = candidates
         .iter()
         .map(|(root, free)| match free {
             Some(free) => format!("{} has {} bytes", root.display(), free),
-            None => format!("{} is not measurable", root.display()),
+            None => format!("{} is not available", root.display()),
         })
         .collect();
-    Problem::Internal.error(format!(
-        "not enough space to install: need {} bytes and no plugin root can take it ({}); free space on the volume or uninstall an old version first",
+    let old = recorded
+        .map(|root| {
+            format!(
+                "; the installed version in {} still takes room",
+                root.display()
+            )
+        })
+        .unwrap_or_default();
+    Problem::InsufficientSpace.error(format!(
+        "not enough space to install: need {} bytes, {}; free space on the volume or uninstall the old version first{}",
         needed,
-        rows.join(", ")
+        rows.join(", "),
+        old
     ))
 }
 
@@ -230,12 +279,35 @@ mod tests {
         assert!(error.detail().contains("uninstall"), "{error}");
     }
 
+    /// An upgrade stages the new copy while the old one still sits on the
+    /// volume; when both do not fit, the answer is the structured space
+    /// refusal, not a half-written staging tree.
+    #[test]
+    fn a_recorded_root_that_cannot_hold_old_and_new_is_a_space_refusal() {
+        let error = require_room_at(Path::new("/data/plugins"), 31_400_000, |_| Some(17_500_000))
+            .expect_err("no room for both copies");
+        assert_eq!(error.problem, Problem::InsufficientSpace);
+        assert!(error.detail().contains("31400000"), "{error}");
+        assert!(error.detail().contains("17500000"), "{error}");
+        assert!(error.detail().contains("/data/plugins"), "{error}");
+
+        // Enough room, or an unmeasurable root, is not a refusal.
+        assert!(require_room_at(Path::new("/data"), 10, |_| Some(11)).is_ok());
+        assert!(require_room_at(Path::new("/mnt/sd"), 10, |_| None).is_ok());
+    }
+
     #[test]
     fn the_refusal_names_every_root_and_what_it_measured() {
-        let error = insufficient(&[candidate("/tiny", Some(1)), candidate("/gone", None)], 10);
+        let error = insufficient(
+            &[candidate("/tiny", Some(1)), candidate("/gone", None)],
+            10,
+            Some(Path::new("/tiny")),
+        );
         let text = error.detail();
         assert!(text.contains("need 10"), "{text}");
         assert!(text.contains("/tiny has 1 bytes"), "{text}");
-        assert!(text.contains("/gone is not measurable"), "{text}");
+        assert!(text.contains("/gone is not available"), "{text}");
+        assert!(text.contains("/tiny still takes room"), "{text}");
+        assert_eq!(error.problem, Problem::InsufficientSpace);
     }
 }
