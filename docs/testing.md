@@ -281,14 +281,16 @@ MCP SSE 的 handler 由 `cargo test --bin svcd server::mcp::progress` 覆盖：S
 |---|---|---|
 | `test.yml` | PR / main（发布提交除外） | `cargo test`、`--no-default-features`、`.spk` smoke、`MEM_LEVEL` 三档 |
 | `test.yml` guardrails | PR / main（发布提交除外） | `tools/closed-tickets-merged.mjs --map 112`：已关闭子票必须有提交在 base |
-| `build.yml` | PR / main（发布提交除外）；tag 时由 `release.yml` 复用 | 发布矩阵：5 个 Linux target（musl 静态 + glibc 2.35）、windows-msvc、macOS universal2，逐个校验产物后打包 |
-| `size.yml` | PR / main（发布提交除外）/ 每晚 | 三个嵌入式 target + Windows 的体积门（2 MB / 30 MB，基线 `ci/size-baseline.json`）；macOS 只在每晚跑 |
+| `build.yml` | PR / 手动；tag 时由 `release.yml` 复用 | 发布矩阵：5 个 Linux target（musl 静态 + glibc 2.35）、windows-msvc、macOS universal2，逐个校验产物后打包 |
+| `size.yml` | PR / 手动 / 每晚 | 三个嵌入式 target + Windows 的体积门（2 MB / 30 MB，基线 `ci/size-baseline.json`）；macOS 只在每晚跑 |
 | `release.yml` | tag `v*` | 复用 `build.yml` 的矩阵，签名并发布归档，再更新插件列表 |
 | `perf.yml` | 每周 / 手动 | `--perf`，上传报告与 JSON |
 | `compat.yml` | 每晚 / 手动 | `--compat`（Linux，34 条向量）；失败上传 `perf-report.md`、`perf-results.json` 与 daemon stderr |
 | Autobahn 文本全量 / WHATWG SSE（待接） | — | 文本全量需专用 echo 测试端点；SSE 表驱动向量尚无工作流 |
 
-`chore(release): bump version to X` 这条 main push 不触发 `test` / `build` / `size`：它只改版本号，
-而紧随其后的 tag 会让 `release.yml` 把同一棵树再建一遍。普通合并提交照旧全跑，PR 与每晚不受影响。
+main 的 push 只跑 `test`，而且 `chore(release): bump version to X` 这条连 `test` 也不跑（#319）：
+它只改版本号，紧随其后的 tag 会让 `release.yml` 把同一棵树建一遍。`build` 与 `size` 不在 main 上跑
+（#320）——本仓的合并是本地 `--no-ff` 后直接推 main，矩阵改为每次发版跑一次、体积门交给每晚；
+代价是打包问题要到打 tag 时才暴露（`publish` `needs: build`，坏包不会发出去）。
 
 性能与兼容的完整套件不要塞进 PR：PR 只保留可确定、分钟级的检查。

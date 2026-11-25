@@ -1,15 +1,14 @@
 name: build
 
-# Builds and packages the release matrix. Runs on its own for pull requests and
-# main, and is called by release.yml on a version tag. Keeping the matrix here
-# means a release always builds exactly what PR CI verified. A release bump push
-# to main is skipped (#319): the tag pushed right after it runs this matrix.
+# Builds and packages the release matrix. It runs for pull requests and by hand,
+# and is called by release.yml on a version tag. Keeping the matrix here means a
+# release always builds exactly what PR CI verified. Merges into main no longer
+# start it (#320): this repository merges locally and pushes main, so the matrix
+# runs once per release instead of twice.
 on:
   workflow_call:
   workflow_dispatch:
   pull_request:
-  push:
-    branches: [main]
 
 permissions:
   contents: read
@@ -20,10 +19,6 @@ env:
 jobs:
   preflight:
     name: preflight
-    # A release bump commit only changes the version string, and the tag pushed
-    # right after it runs the same matrix through release.yml. `ref_type` keeps
-    # that tag call running: only a branch push is skipped (#319).
-    if: ${{ github.event_name != 'push' || github.ref_type != 'branch' || !startsWith(github.event.head_commit.message, 'chore(release):') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
