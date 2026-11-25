@@ -1,7 +1,10 @@
 //! `GET /api/v1/disk`: the volumes a package touches (#291).
 //!
 //! One row per plugin root, plus the temp volume as a sibling because a package
-//! passes through it. A row's `plugin` field answers "does this root already
+//! passes through it. Rows carry their volume id: a caller deciding whether a
+//! download and its hand-off copy compete for space has to know whether they
+//! are on one filesystem (`volume` / `tempVolume`), not just how much is free.
+//! A row's `plugin` field answers "does this root already
 //! hold the plugin named by `?id`", which is what lets a caller tell an
 //! in-place upgrade from a fresh install that may go anywhere with room. The
 //! numbers come from `locations`, the same helper root selection uses, so the
@@ -29,6 +32,10 @@ impl ApiFace {
                     // `null` when the root is not there: an unmounted volume
                     // must not borrow its parent's free space.
                     "freeBytes": crate::platform::locations::free_bytes(root),
+                    // Which filesystem the root is on. Two rows with the same
+                    // volume share one budget, and a package moved between them
+                    // costs nothing extra.
+                    "volume": crate::platform::locations::volume_id(root),
                     "default": index == 0,
                     // What the root already holds: the install picker shows it,
                     // and it is the same count the settings screen locks a root
@@ -45,6 +52,10 @@ impl ApiFace {
             &json!({
                 "roots": roots,
                 "tempFreeBytes": temp_free_bytes(paths),
+                // Whether the package's trip through temp copies it: the same
+                // volume as the download means a rename, another volume means a
+                // second copy of the whole package.
+                "tempVolume": temp_volume(paths),
                 // Whether an install offers the roots or takes what the host
                 // picks (#299). Upload and the plugin store read the same flag,
                 // so the two surfaces cannot disagree.
@@ -59,6 +70,14 @@ impl ApiFace {
 fn temp_free_bytes(paths: &crate::platform::paths::Paths) -> Option<u64> {
     crate::platform::locations::free_bytes(&paths.temp_dir)
         .or_else(|| crate::platform::locations::free_bytes(&paths.data_dir))
+}
+
+/// The volume the temp files pass through; before the first transfer the
+/// directory may not exist yet, and then the data root answers for the same
+/// volume. Same rule as [`temp_free_bytes`].
+fn temp_volume(paths: &crate::platform::paths::Paths) -> Option<String> {
+    crate::platform::locations::volume_id(&paths.temp_dir)
+        .or_else(|| crate::platform::locations::volume_id(&paths.data_dir))
 }
 
 /// The installed copy of `id` in one root. `current_version_at` is the shared

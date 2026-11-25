@@ -103,6 +103,16 @@ fn the_disk_route_lists_roots_and_the_temp_volume() {
         body["tempFreeBytes"].as_u64().unwrap_or(0) > 0,
         "the temp volume is reported beside the roots: {body}"
     );
+    assert!(
+        roots[0]["volume"]
+            .as_str()
+            .is_some_and(|volume| !volume.is_empty()),
+        "a root names the volume it lives on: {body}"
+    );
+    assert_eq!(
+        body["tempVolume"], roots[0]["volume"],
+        "here the temp directory sits on the default root's volume: {body}"
+    );
 }
 
 /// `?id=` marks the root that already holds that plugin, which is what tells
