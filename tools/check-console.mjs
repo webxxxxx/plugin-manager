@@ -82,16 +82,54 @@ const CHECKS = [
     },
   },
   {
-    id: "tab-strip-scrolls",
+    id: "tab-strip-wraps",
     run(page) {
       const strip = cssRule(page, ".sheet-tabs");
-      if (!strip || !/overflow-x:\s*auto/.test(strip)) {
-        throw new Error("the tab strip must scroll sideways on a narrow screen");
+      if (!strip || !/flex-wrap:\s*wrap/.test(strip)) {
+        throw new Error("the tab strip must wrap instead of scrolling sideways");
       }
-      return "the tab strip scrolls horizontally";
+      if (/overflow-x:\s*(auto|scroll)/.test(strip)) {
+        throw new Error("a sideways scrollbar hides tabs with no hint that they exist");
+      }
+      return "the tab strip wraps instead of scrolling sideways";
     },
     mutate(page) {
-      return page.replace(/(\.sheet-tabs \{[^}]*?)overflow-x:auto;/s, "$1overflow-x:hidden;");
+      return page.replace(/(\.sheet-tabs \{[^}]*?)flex-wrap:wrap;/s, "$1overflow-x:auto;");
+    },
+  },
+  {
+    id: "sheet-fixed-height",
+    run(page) {
+      const sheet = cssRule(page, ".modal .panel.sheet");
+      if (!sheet || !/height:\s*min\(/.test(sheet)) {
+        throw new Error("the settings sheet needs a fixed height: tabs hold different row counts");
+      }
+      const body = cssRule(page, ".sheet .sheet-body");
+      if (!body || !/overflow:\s*auto/.test(body)) {
+        throw new Error("only the body may scroll inside a fixed-height sheet");
+      }
+      return "the sheet keeps one height while the body scrolls";
+    },
+    mutate(page) {
+      return page.replace("height:min(720px,90vh); ", "");
+    },
+  },
+  {
+    id: "no-readonly-badge",
+    run(page) {
+      if (page.includes("'只读'") || page.includes('"只读"')) {
+        throw new Error("a read-only value is already styled; the badge is noise");
+      }
+      if (page.includes("setting-source")) {
+        throw new Error("the read-only badge class must be gone");
+      }
+      return "read-only values carry no badge";
+    },
+    mutate(page) {
+      return page.replace(
+        "      control.appendChild(value);",
+        "      control.appendChild(value);\n      control.appendChild(document.createTextNode('只读'));",
+      );
     },
   },
   {
@@ -170,38 +208,63 @@ const CHECKS = [
     },
   },
   {
-    id: "roots-locked",
+    id: "roots-not-editable",
     run(page) {
       const body = functionBody(page, "pluginRootsField");
-      if (!body.includes("root.default || plugins > 0")) {
-        throw new Error("the default root and roots with plugins must be locked");
+      if (/input\.readOnly/.test(body) || /item\.input/.test(body)) {
+        throw new Error("a root must not be editable in place: re-typing an occupied path is a refused move");
       }
-      if (!body.includes("input.readOnly = locked") || !body.includes("remove.disabled = locked")) {
-        throw new Error("a locked root must be uneditable and undeletable");
+      if (!body.includes("root-row-path")) {
+        throw new Error("a root row must show its path as text");
       }
-      return "the default root and every occupied root are locked";
+      if (!body.includes("root.default") || !body.includes("plugins > 0")) {
+        throw new Error("the default root and roots with plugins must not be removable");
+      }
+      if (!body.includes("remove.disabled = locked")) {
+        throw new Error("a root that cannot be removed must disable its button");
+      }
+      return "roots are paths: added or removed, never rewritten";
     },
     mutate(page) {
       return page.replace(
-        "input.value = path;\n    input.readOnly = locked;",
-        "input.value = path;\n    input.readOnly = false;",
+        "const text = document.createElement('span');",
+        "const input = document.createElement('input');\n    input.readOnly = false;\n    const text = input;",
       );
+    },
+  },
+  {
+    id: "roots-added-from-a-field",
+    run(page) {
+      const body = functionBody(page, "pluginRootsField");
+      if (!body.includes("'+ 新增根'") || !body.includes("root-add")) {
+        throw new Error("a new root must come from the add field, not from editing a row");
+      }
+      if (!body.includes("addRow(path, 0, false)")) {
+        throw new Error("the add button must turn the typed path into a row");
+      }
+      return "a typed path becomes a row only when it is added";
+    },
+    mutate(page) {
+      return page.replace("addRow(path, 0, false);", "");
     },
   },
   {
     id: "roots-save-one-line",
     run(page) {
       const body = functionBody(page, "pluginRootsField");
-      if (!body.includes("if (value) paths.push(value);")) {
-        throw new Error("an empty row must not become an empty list entry");
+      if (!body.includes("const joined = rows.map(function (item) { return item.path; }).join(',')")) {
+        throw new Error("the roots must save as one comma-separated line built from the rows");
       }
-      if (!body.includes("paths.join(',')") || !body.includes("mark(entry.key, joined)")) {
-        throw new Error("the roots must save as one comma-separated line");
+      if (!body.includes("mark(entry.key, joined)")) {
+        throw new Error("a changed list must mark the key");
       }
       return "the roots save as one comma-separated line";
     },
     mutate(page) {
-      return page.replace("if (value) paths.push(value);", "paths.push(value);");
+      return page.replace(
+        "const joined = rows.map(function (item) { return item.path; }).join(',')",
+        "const joined = rows.map(function (item) { return item.path; }).join(';')",
+      );
     },
   },
   {

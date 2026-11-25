@@ -86,12 +86,31 @@ fn serves_the_embedded_console() {
         html.contains("function showTab") && !html.contains("heading.className = 'setting-group'"),
         "the flat list of groups must be gone"
     );
-    // Plugin roots are edited as rows: the default root and every root that
-    // still holds a plugin are locked in the UI, and the host refuses the same
-    // removal server-side (#298).
+    // Plugin roots are added or removed, never rewritten: re-typing an occupied
+    // path is the move the host refuses, and the default root plus every
+    // occupied root stay (#298/#305).
     assert!(
-        html.contains("function pluginRootsField") && html.contains("default || plugins > 0"),
-        "plugins_dir must render the row editor with its locks"
+        html.contains("function pluginRootsField")
+            && html.contains("root-row-path")
+            && html.contains("remove.disabled = locked")
+            && !html.contains("input.readOnly"),
+        "plugins_dir must render the list editor, not editable rows"
+    );
+    assert!(
+        html.contains("+ 新增根") && html.contains("root-add"),
+        "a new root comes from the add field"
+    );
+    // A fixed-height sheet keeps the dialog from resizing as tabs change, and
+    // the tab strip wraps instead of hiding tabs behind a scrollbar (#305).
+    assert!(
+        html.contains("height:min(720px,90vh)")
+            && html.contains(".sheet-tabs")
+            && html.contains("flex-wrap:wrap"),
+        "the settings sheet keeps one height and its tab strip wraps"
+    );
+    assert!(
+        !html.contains(">只读<") && !html.contains("setting-source"),
+        "a read-only value needs no badge"
     );
     // The upload install asks which root when the switch is on and there is
     // more than one; the plugin store reads the same flag (#299).
