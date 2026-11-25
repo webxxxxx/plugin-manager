@@ -1,6 +1,6 @@
 [package]
 name = "svcd"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2021"
 description = "svcd core: service supervisor, registry and local CLI"
 
