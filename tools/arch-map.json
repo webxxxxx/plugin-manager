@@ -485,6 +485,7 @@
     "src/selfinstall/execute.rs": "execute",
     "src/selfinstall/execute/path_env.rs": "execute",
     "src/selfinstall/execute/plan_exec.rs": "execute",
+    "src/selfinstall/execute/restart_route.rs": "execute",
     "src/selfinstall/execute/self_install.rs": "execute",
     "src/selfinstall/execute/self_uninstall.rs": "execute",
     "src/selfinstall/execute/service.rs": "execute",

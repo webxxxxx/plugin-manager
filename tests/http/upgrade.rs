@@ -209,8 +209,12 @@ fn upgrading_from_a_file_replaces_the_binaries_and_restarts() {
     );
 }
 
+/// #317: a service host with no init system to lean on (`SVCD_TEST_NO_SERVICE_RESTART`
+/// stands in for a `--manual` install or a Windows SCM service) installs the new
+/// binaries, leaves the old daemon running, and prints the command a person has
+/// to run. The upgrade itself is a success, so the exit code is 0.
 #[test]
-fn a_service_mode_upgrade_installs_but_does_not_restart() {
+fn a_service_upgrade_without_a_restart_program_installs_and_says_so() {
     let mut sandbox = Sandbox::new();
     let install = install_tree(&sandbox);
     sandbox.start_daemon_from(
@@ -225,6 +229,7 @@ fn a_service_mode_upgrade_installs_but_does_not_restart() {
     let mut command = std::process::Command::new(&sandbox.svcd);
     sandbox.env(&mut command);
     command.env("SVCD_TEST_PRIVILEGE", "privileged");
+    command.env("SVCD_TEST_NO_SERVICE_RESTART", "1");
     command.arg("upgrade").arg("--file").arg(&archive);
     let output = support::run_bounded(&mut command, Duration::from_secs(60))
         .expect("svcd upgrade --file must finish");
@@ -234,7 +239,7 @@ fn a_service_mode_upgrade_installs_but_does_not_restart() {
         String::from_utf8_lossy(&output.stderr)
     );
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("service manager"), "{text}");
+    assert!(text.contains("restart the svcd service yourself"), "{text}");
     let bytes = fs::read(installed_in(&install, "svcd")).expect("installed binary");
     assert!(bytes.ends_with(marker.as_bytes()));
     assert_eq!(

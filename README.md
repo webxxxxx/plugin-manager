@@ -151,7 +151,7 @@ cpu_budget_percent = 90             # 软闸 + cgroup / Job Object 硬限
 
 `svcd.conf` 的每个 live 键都在下表里。默认值写的是**派生规则**：预算是每次启动按本机算出来的，表里给的是参照预算下的期望值（tiny 128 MiB / interactive 512 MiB / streaming 2 GiB，参见 `limits/specs.rs`）；显式写的值只在允许范围内原样生效，越界会回落到本 shape 的期望值并在日志里记一条 `override:`。`svc config tune` 打印本机的派生结果，`svc status --resources` 看上次实际用的值。
 
-改完都要重启 daemon（服务管理器重启，或 user mode 下重跑 `svcd run`）；例外是 `auth_passwd`，用 `svc lan passwd <password>` 写它并立即生效。已删除的键（`plugins_dir`、`services_dir`、`temp_dir`、`boot_scan_wait_ms`）不再有任何作用，出现在旧文档里只会得到一条告警。
+改完都要重启 daemon（`svcd restart` 两种安装模式都管用：user mode 用 detached helper，服务模式交给 init 系统）；例外是 `auth_passwd`，用 `svc lan passwd <password>` 写它并立即生效。已删除的键（`plugins_dir`、`services_dir`、`temp_dir`、`boot_scan_wait_ms`）不再有任何作用，出现在旧文档里只会得到一条告警。
 
 #### 资源与形状
 
