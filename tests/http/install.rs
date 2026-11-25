@@ -526,7 +526,12 @@ fn unsigned_install_requires_the_conf_switch() {
     let message = rejected.body["error"]["message"]
         .as_str()
         .unwrap_or_default();
-    assert!(message.contains("signature.json"), "{message}");
+    // #309: the answer names the fact (unsigned) and both ways forward, not the
+    // tar rule the installer happens to enforce.
+    assert!(message.contains("package is not signed"), "{message}");
+    assert!(message.contains("allow_insecure_install"), "{message}");
+    assert!(message.contains("not signature.json"), "{message}");
+    assert!(!message.contains("must be the second entry"), "{message}");
 }
 
 #[test]

@@ -37,15 +37,15 @@ pub(super) fn verify_bytes_mode(
             signature = check_signature(&manifest_bytes, data, mode, explicit, trust_dir)?;
             signature_bytes = data.to_vec();
         }
-        Some(_) if mode == SignatureMode::Required => {
-            return Err(Problem::Invalid.error("signature.json must be the second entry"));
+        Some(header) if mode == SignatureMode::Required => {
+            return Err(Problem::Invalid.error(unsigned_package_message(Some(&header.path))));
         }
         // Insecure installs and inspection accept a package whose second entry
         // is already a payload file; it stays in the archive and is validated
         // like any other `files[]` entry below.
         Some(header) => first_file = Some(header),
         None if mode == SignatureMode::Required => {
-            return Err(Problem::Invalid.error("signature.json is missing"));
+            return Err(Problem::Invalid.error(unsigned_package_message(None)));
         }
         None => {}
     }
