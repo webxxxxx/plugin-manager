@@ -20,9 +20,10 @@ use crate::wire::message::ipc;
 use crate::wire::message::rpc;
 
 use self::calls::PendingCalls;
-use self::commands::{abandon, command_for, service_hook_command};
+use self::commands::{abandon, apply_core_child_env, command_for};
 use self::frames::Frames;
 use self::handle::SlotRequest;
+use self::hook::{HookEnd, HookRun};
 use self::stop::StopFlow;
 
 pub(crate) use self::commands::{apply_plugin_child_env, hook_command};
@@ -71,6 +72,12 @@ pub(crate) struct Slot {
     stop_deadline: Option<u64>,
     kill_deadline: Option<u64>,
     stop: StopFlow,
+    /// The start action (`lifecycle.start`) running before the process spawns.
+    /// It is a preparation step: the process only starts once it exits.
+    prelude: Option<HookRun>,
+    /// The process exited while the stop action was still owed. The exit is
+    /// applied once that action ends, so `Stopped` means the cleanup finished.
+    exit_after_hook: Option<(u32, Option<i32>)>,
     /// The whole service tree; on Unix the process group is the tree and this
     /// stays `None` (the platform returns no handle there).
     tree: Option<crate::platform::host::process::Tree>,
@@ -140,6 +147,8 @@ impl Slot {
             stop_deadline: None,
             kill_deadline: None,
             stop: StopFlow::new(),
+            prelude: None,
+            exit_after_hook: None,
             tree: None,
             pending_exit: None,
             ping_id: 1,
@@ -297,25 +306,27 @@ impl Slot {
         self.raw_hub = hub;
     }
 
-    /// Start the stop hook before the state machine begins stopping. The hook
-    /// runs in the background; SignalPolite waits for it (or its timeout)
-    /// before touching the supervised process.
+    /// Ask the service to stop. The host terminates the process; the stop
+    /// action runs after it is gone, so a stop during the start action cancels
+    /// that action instead of waiting for it.
     pub(crate) fn request_stop(&mut self, now: u64) {
-        self.ensure_stop_hook(now);
+        self.abort_prelude();
         self.apply(Event::Stop, now);
-        // A finished one-shot has no process; without a stop hook there is
-        // nothing left to wait for.
-        if self.machine.state == State::Stopping
-            && self.machine.pid.is_none()
-            && !self.stop.running()
-        {
-            self.apply(Event::StopSettled, now);
+        // A service with no supervised process (a finished one-shot, or a
+        // definition whose process was never a child) has nothing to signal:
+        // the stop action is the whole stop.
+        if self.machine.state == State::Stopping && self.machine.pid.is_none() {
+            self.ensure_stop_hook(now);
+            if !self.stop.running() {
+                self.apply(Event::StopSettled, now);
+            }
         }
     }
 
     pub(crate) fn pump(&mut self, now: u64) {
         self.drain_requests(now);
         self.drain_frames(now);
+        self.check_prelude(now);
         self.check_exit(now);
         self.check_stop_hook(now);
         self.check_timers(now);
@@ -340,41 +351,15 @@ impl Slot {
             match action {
                 Action::Spawn => {
                     self.abort_stop_hook();
+                    self.abort_prelude();
                     self.stop.reset();
                     self.fail_pending("service is restarting");
-                    match self.spawn() {
-                        Ok(pid) => {
-                            let actions = self.machine.step(Event::Spawned { pid }, now);
-                            self.run_actions(actions, now);
-                            if self.exec.ready == Ready::Exec {
-                                let actions = self.machine.step(Event::Ready { pid }, now);
-                                self.run_actions(actions, now);
-                            } else {
-                                self.send_ping();
-                            }
-                        }
-                        Err(error) => {
-                            error!("{}: spawn failed: {}", self.id, error);
-                            let actions = self.machine.step(Event::SpawnFailed, now);
-                            self.run_actions(actions, now);
-                        }
-                    }
+                    self.begin_start(now);
                 }
                 Action::ArmStart => {
                     self.start_deadline = Some(now.saturating_add(supervisor::START_TIMEOUT_MS));
                 }
-                Action::SignalPolite => {
-                    let has_stop_hook = self
-                        .lifecycle
-                        .as_ref()
-                        .and_then(|lifecycle| lifecycle.stop.as_ref())
-                        .is_some();
-                    if !has_stop_hook {
-                        self.stop_without_hook();
-                    } else if !self.ensure_stop_hook(now) {
-                        self.signal_polite();
-                    }
-                }
+                Action::SignalPolite => self.stop_now(),
                 Action::SignalForce => self.signal_force("stop timeout"),
                 Action::ArmStop => {
                     self.stop_deadline = Some(now.saturating_add(supervisor::STOP_TIMEOUT_MS));
@@ -400,14 +385,17 @@ impl Slot {
                 Action::Publish => {}
                 Action::Withdraw => self.fail_pending("service is not available"),
                 Action::GiveUp => {
-                    self.abort_stop_hook();
+                    // The start action is preparation for a process that will
+                    // never run; a stop action already cleaning up is allowed
+                    // to finish (it is bounded by its own timeout).
+                    self.abort_prelude();
                     self.give_up();
                 }
             }
         }
     }
 
-    fn spawn(&mut self) -> Result<u32, String> {
+    fn spawn_process(&mut self) -> Result<u32, String> {
         self.pending_exit = None;
         if self.tree.is_none() {
             self.tree = crate::platform::host::process::Tree::new();
@@ -418,16 +406,14 @@ impl Slot {
                 );
             }
         }
-        let start = self
-            .lifecycle
-            .as_ref()
-            .and_then(|lifecycle| lifecycle.start.as_ref());
         let plugin_dir = self.plugin_dir.as_deref();
-        let mut command = match start {
-            Some(hook) => service_hook_command(&self.id, "start", hook, &self.paths, plugin_dir),
-            None => command_for(&self.exec),
-        };
-        apply_plugin_child_env(&mut command, plugin_dir, &self.paths);
+        let mut command = command_for(&self.exec);
+        match plugin_dir {
+            // A core service is written by the operator and keeps the old
+            // environment surface (#312). The process is its start action.
+            None => apply_core_child_env(&mut command, &self.id, "start", &self.paths),
+            Some(_) => apply_plugin_child_env(&mut command, plugin_dir, &self.paths),
+        }
         let blob_dir = self.paths.temp_dir.clone();
         let _ = std::fs::create_dir_all(crate::platform::storage::incoming_dir(&self.paths));
         command.env("SVCD_TEMP_DIR", &blob_dir);
@@ -567,8 +553,7 @@ impl Slot {
             }
             // An adopted process is not our child, so there is no exit status.
             self.note_exit(pid, None, "adopted, group gone");
-            self.clear_process();
-            self.apply(Event::Exited { pid, code: None }, now);
+            self.settle_exit(pid, None, now);
             return;
         }
         if let Some(child) = self.child.as_mut() {
@@ -586,14 +571,7 @@ impl Slot {
             }
             if let Some(pid) = pid {
                 self.note_exit(pid, status.code(), "try_wait");
-                self.clear_process();
-                self.apply(
-                    Event::Exited {
-                        pid,
-                        code: status.code(),
-                    },
-                    now,
-                );
+                self.settle_exit(pid, status.code(), now);
             }
             return;
         }
@@ -606,9 +584,30 @@ impl Slot {
         self.pending_exit = None;
         if let Some(pid) = self.machine.pid {
             self.note_exit(pid, code, "pending exit");
-            self.clear_process();
-            self.apply(Event::Exited { pid, code }, now);
+            self.settle_exit(pid, code, now);
         }
+    }
+
+    /// Apply a settled exit. A stop action still owed runs first, so the exit
+    /// that reports `Stopped` arrives after the cleanup, not before it.
+    fn settle_exit(&mut self, pid: u32, code: Option<i32>, now: u64) {
+        let owes_stop = self.machine.state == State::Stopping
+            && self
+                .lifecycle
+                .as_ref()
+                .and_then(|lifecycle| lifecycle.stop.as_ref())
+                .is_some()
+            && !self.stop.claimed();
+        if owes_stop {
+            self.exit_after_hook = Some((pid, code));
+            if self.ensure_stop_hook(now) {
+                return;
+            }
+            // The action could not run; do not hold the stop hostage to it.
+            self.exit_after_hook = None;
+        }
+        self.clear_process();
+        self.apply(Event::Exited { pid, code }, now);
     }
 
     /// One line per settled exit: the code decides restart vs stop, so the
@@ -630,7 +629,9 @@ impl Slot {
 
     fn check_timers(&mut self, now: u64) {
         self.expire_pending(now);
-        if self.machine.state == State::Starting {
+        // The start action has its own deadline; the process window opens once
+        // it finishes.
+        if self.machine.state == State::Starting && self.prelude.is_none() {
             if let Some(deadline) = self.start_deadline {
                 if now >= deadline {
                     self.start_deadline = None;
@@ -685,6 +686,7 @@ impl Slot {
         self.stop_deadline = None;
         self.kill_deadline = None;
         self.pending_exit = None;
+        self.exit_after_hook = None;
     }
 }
 
@@ -692,6 +694,8 @@ mod calls;
 mod commands;
 mod frames;
 mod handle;
+mod hook;
+mod prelude;
 mod stop;
 
 #[cfg(test)]

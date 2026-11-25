@@ -615,10 +615,11 @@ fn loads_a_drop_in_script_as_a_core_service() {
     assert_eq!(exec.ready, Ready::Exec);
     assert_eq!(exec.args, ["start"]);
     let lifecycle = demo.lifecycle.as_ref().expect("lifecycle");
-    assert_eq!(lifecycle.start.as_ref().expect("start").args, ["start"]);
+    // The declared start action is the process itself, so it lives in
+    // `exec.args`; the lifecycle only carries the actions that run around it.
+    assert!(lifecycle.start.is_none());
     assert_eq!(lifecycle.stop.as_ref().expect("stop").args, ["stop"]);
     assert_eq!(lifecycle.status.as_ref().expect("status").args, ["status"]);
-    assert_eq!(lifecycle.start.as_ref().expect("start").timeout_ms, 30_000);
     assert_eq!(lifecycle.stop.as_ref().expect("stop").timeout_ms, 10_000);
     assert_eq!(lifecycle.status.as_ref().expect("status").timeout_ms, 5_000);
 }
@@ -652,10 +653,9 @@ fn only_declared_actions_become_lifecycle_hooks() {
 
     let demo = loaded.registry.get("demo").expect("demo");
     assert_eq!(demo.exec.as_ref().expect("exec").args, ["start"]);
-    let lifecycle = demo.lifecycle.as_ref().expect("lifecycle");
-    assert!(lifecycle.start.is_some());
-    assert!(lifecycle.stop.is_none());
-    assert!(lifecycle.status.is_none());
+    // A start-only script has no actions around the process: it *is* the
+    // process, so there is no lifecycle left.
+    assert!(demo.lifecycle.is_none());
 }
 
 #[test]
@@ -695,7 +695,8 @@ fn a_case_branch_declares_a_shell_action() {
     let demo = loaded.registry.get("demo").expect("demo");
     assert_eq!(demo.exec.as_ref().expect("exec").args, ["start"]);
     let lifecycle = demo.lifecycle.as_ref().expect("lifecycle");
-    assert!(lifecycle.start.is_some());
+    // The declared start action is the process (#323), so only status remains.
+    assert!(lifecycle.start.is_none());
     assert!(lifecycle.status.is_some());
     assert!(lifecycle.stop.is_none());
 }
@@ -778,7 +779,7 @@ fn loads_a_powershell_script() {
     let demo = loaded.registry.get("demo").expect("demo");
     assert_eq!(demo.exec.as_ref().expect("exec").args, ["start"]);
     let lifecycle = demo.lifecycle.as_ref().expect("lifecycle");
-    assert!(lifecycle.start.is_some());
+    assert!(lifecycle.start.is_none());
     assert!(lifecycle.stop.is_some());
     assert!(lifecycle.status.is_none());
 }

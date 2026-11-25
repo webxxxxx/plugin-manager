@@ -100,8 +100,12 @@ impl Supervisor {
                 _ => {}
             }
         }
-        let deadline = now.mono_ms.saturating_add(supervisor::START_TIMEOUT_MS);
         for layer in layers {
+            let deadline = clock
+                .now()
+                .mono_ms
+                .saturating_add(supervisor::START_TIMEOUT_MS)
+                .saturating_add(self.start_hook_budget(layer.iter().map(String::as_str)));
             self.start_layer(&layer, deadline, clock)?;
         }
 
@@ -300,6 +304,28 @@ impl Supervisor {
         self.start_service(id, clock)
     }
 
+    /// How long the start actions of these services may take before their
+    /// process windows even open.
+    pub(super) fn start_hook_budget<'a>(&self, ids: impl Iterator<Item = &'a str>) -> u64 {
+        ids.filter_map(|id| self.registry.get(id))
+            .filter_map(|service| service.lifecycle.as_ref())
+            .filter_map(|lifecycle| lifecycle.start.as_ref())
+            .map(|hook| hook.timeout_ms)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// How long the stop action of this service may take after its process is
+    /// gone.
+    fn stop_hook_budget(&self, id: &str) -> u64 {
+        self.registry
+            .get(id)
+            .and_then(|service| service.lifecycle.as_ref())
+            .and_then(|lifecycle| lifecycle.stop.as_ref())
+            .map(|hook| hook.timeout_ms)
+            .unwrap_or(0)
+    }
+
     pub(crate) fn stop_service(&mut self, id: &str, clock: &Clock) -> Result<Status, ProblemError> {
         if self.registry.get(id).is_none() {
             return Err(ProblemError::new(
@@ -330,6 +356,7 @@ impl Supervisor {
             .mono_ms
             .saturating_add(supervisor::STOP_TIMEOUT_MS)
             .saturating_add(supervisor::KILL_TIMEOUT_MS)
+            .saturating_add(self.stop_hook_budget(id))
             .saturating_add(1_000);
         loop {
             self.pump(clock.now());
@@ -398,6 +425,13 @@ impl Supervisor {
                 .mono_ms
                 .saturating_add(supervisor::STOP_TIMEOUT_MS)
                 .saturating_add(supervisor::KILL_TIMEOUT_MS)
+                .saturating_add(
+                    active
+                        .iter()
+                        .map(|id| self.stop_hook_budget(id))
+                        .max()
+                        .unwrap_or(0),
+                )
                 .min(global_deadline);
             loop {
                 self.pump(clock.now());

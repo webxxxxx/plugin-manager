@@ -3,11 +3,14 @@
 These are drop-in `svcd` core services. svcd only calls the actions a script
 declares:
 
-- `start` — declared: svcd runs `<script> start`. Not declared: svcd runs the
-  script from the top with no action argument.
-- `stop` — declared: svcd runs `<script> stop` before stopping. Not declared:
-  svcd terminates the process instead (SIGTERM on Unix; the Windows
-  force-kill for an exec-ready script).
+- `start` — declared: svcd runs `<script> start` and supervises it. The action
+  *is* the service process, so it must stay in the foreground (it may `exec`
+  the real process). Not declared: svcd runs the script from the top with no
+  action argument.
+- `stop` — declared: svcd runs `<script> stop` after the process is gone, to
+  clean up (it must not assume the process can still be signalled). Not
+  declared: nothing else happens — svcd already terminated the process
+  (SIGTERM then SIGKILL on Unix; the Windows force-kill).
 - `status` — optional detail only: `svc status` runs `<script> status` and
   shows its stdout as `details.probe`. It never changes the supervised state.
 

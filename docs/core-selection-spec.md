@@ -79,7 +79,7 @@
   "exec": { "path": "/usr/local/bin/my-core", "args": [], "env": {}, "ready": "notify" },
   "dependencies": [],
   "lifecycle": {
-    "start":  { "path": "/usr/local/bin/my-core", "args": ["start"],  "timeout": 30 },
+    "start":  { "path": "/usr/local/bin/my-core", "args": ["prepare"], "timeout": 30 },
     "stop":   { "path": "/usr/local/bin/my-core", "args": ["stop"],   "timeout": 10 },
     "status": { "path": "/usr/local/bin/my-core", "args": ["status"], "timeout": 5 }
   }
@@ -87,7 +87,7 @@
 ```
 
 - `exec.path` 必须是绝对路径；Unix 可以是 shebang 脚本，Windows 是 `.exe` / `.cmd` / `.bat`；`ready` 同 plugin（默认 `notify`，脚本不讲话就用 `exec`）。
-- `lifecycle` 全部可选；`start` 存在时它就是被监督的前台进程（替换 `exec`，`ready` 仍按 `exec.ready`；不讲话的脚本把 `exec.ready` 设为 `exec`），不得自行 daemonize；`stop` 在 SIGTERM 之前运行用于释放资源，超时/非零只记日志后继续停止序列；`status` 由 `svc status` 按需探测，stdout 作为 `details.probe` 的细节补充，退出码不改变服务状态。钩子 `path` 必须绝对，环境继承 daemon 并附加 `SVCD_SERVICE_ID` / `SVCD_ACTION` / `SVCD_DATA_DIR` / `SVCD_CONFIG_DIR` / `SVCD_LOG_DIR`；插件包（`kind=plugin`）的 `exec` 进程与 `lifecycle` 钩子只拿 `SVCD_PLUGIN_DIR`（安装目录 `<根>/<id>`）/ `SVCD_LOG_DIR` / `SVCD_TEMP_DIR` —— 插件是第三方代码，不给守护进程的配置根（`svcd.conf` 的密码散列、`trust.d`）与数据根，动作仍靠参数传。
+- `exec` 是被监督进程。`lifecycle` 全部可选：`start` 是**前置准备**——每次 spawn `exec` 之前运行、必须退出，非零或超时即本次启动失败且 `exec` 不 spawn，崩溃重试会重跑（幂等）；`stop` 是**收尾**——被监督进程消失之后运行一次（主动停、崩溃不重启、崩溃重启前、启动失败），跑的时候进程已经不在了，不要假设还能对它发信号；非零/超时只记日志。宿主负责终止（Unix 进程组 `SIGTERM` → 10 秒 → `SIGKILL`；Windows 直接强杀），`Stopped` 以 `stop` 返回为准（#323）。`status` 由 `svc status` 按需探测，stdout 作为 `details.probe` 的细节补充，退出码不改变服务状态。钩子 `path` 必须绝对，环境继承 daemon 并附加 `SVCD_SERVICE_ID` / `SVCD_ACTION` / `SVCD_DATA_DIR` / `SVCD_CONFIG_DIR` / `SVCD_LOG_DIR`；插件包（`kind=plugin`）的 `exec` 进程与 `lifecycle` 钩子只拿 `SVCD_PLUGIN_DIR`（安装目录 `<根>/<id>`）/ `SVCD_LOG_DIR` / `SVCD_TEMP_DIR` —— 插件是第三方代码，不给守护进程的配置根（`svcd.conf` 的密码散列、`trust.d`）与数据根，动作仍靠参数传。
 - 文件 root 所有、0640；启动时读取，改定义后重启 svcd 生效（v1 不做热加载）。
 - 不接受 `.spk` 专属字段：`platform` / `files` / `hooks` / `config` / `ui` 出现即定义非法；其他未知字段忽略。
 - `id` 不能是 `svc`（保留给内置 core），且不能与 plugin id 冲突；冲突时 plugin 安装拒绝、core 定义加载拒绝。
@@ -106,9 +106,9 @@
 - 脚本第一个参数是 `start|stop|status`，同时注入 `SVCD_ACTION`；**每个动作都是可选的**，脚本声明哪个，svcd 才调用哪个。
 - 声明方式：`.sh` 的 shell 函数（`start()` / `function start`）或 `case` 分支（`start)`）；`.ps1` 的 `function start`；`.bat` / `.cmd` 的 `:start` 标签（大小写不敏感）。注释里的同名不计。
 - 未声明的动作由框架兜底：缺 `start` → `exec.args` 为空，svcd 从头执行脚本；缺 `stop` → 不跑 stop 钩子，直接进入普通停止序列（Unix SIGTERM；Windows 对没有停止钩子的 `exec` 脚本立即结束进程）；缺 `status` → `svc status` 不追加 probe。
-- 已声明的 `start` 必须前台运行（可申请资源后 `exec` 真正的进程），不得 daemonize；`stop` 在 SIGTERM 前释放资源；`status` 是**细节补充**：stdout 作为 `details.probe`（截断到 8 KiB、多行以 `; ` 连接），退出码只追加到文本、不改变服务状态。
+- 声明的 `start` 就是被监督进程（写进 `exec.args`），必须前台运行（可申请资源后 `exec` 真正的进程），不得 daemonize；`stop` 在进程消失之后跑，负责收尾而不是终止；`status` 是**细节补充**：stdout 作为 `details.probe`（截断到 8 KiB、多行以 `; ` 连接），退出码只追加到文本、不改变服务状态。
 - 脚本派生的后台进程留在同一进程组（Unix）/ job object（Windows），停止时一起终止；组内任一进程存活时服务仍是 `Running`，整组退出才结束。
-- svcd 把脚本合成为 core 服务：`exec.ready = Exec`，`lifecycle` 只为声明了的动作生成钩子；默认 `version = 1.0.0`，无 dependencies / capabilities / config。
+- svcd 把脚本合成为 core 服务：`exec.ready = Exec`，声明的 `start` 写进 `exec.args`，`lifecycle` 只为 `stop` / `status` 生成钩子；默认 `version = 1.0.0`，无 dependencies / capabilities / config。
 - 同 id 的 JSON 定义优先；脚本跳过并告警。脚本必须非 symlink；Unix 还要求 exec 位；改脚本后重启 svcd 生效（v1 不做热加载）。
 - `.ps1` 在 Windows 通过 `powershell -NoProfile -ExecutionPolicy Bypass -File <script> <action>` 调用。
 
@@ -127,12 +127,12 @@ case "$action" in start|stop|status) "$action" ;; *) exit 64 ;; esac
 
 core drop-in 脚本可以原样放进 `.spk` 变成 plugin：脚本不改，补 manifest。转换后执行路径与 §1.7 相同，但来源与信任换成签名包，并额外获得版本、热安装/卸载、config/export 与 Web UI。
 
-- manifest 用 `schema: 1`，`exec.ready: "exec"`，按脚本声明写 `lifecycle.start/stop/status`（路径是包内相对路径，且必须在 `files[]`）。
+- manifest 用 `schema: 1`，`exec.ready: "exec"`，脚本声明的 `start` 写进 `exec.args`，`stop` / `status` 写进 `lifecycle`（路径是包内相对路径，且必须在 `files[]`）。
 - payload 不是 native 可执行文件（ELF / Mach-O / PE）时可以声明 `interpreter`：`{name, args?, version?}`。`name` 是 PATH 上的裸名；`version` 是数字约束，**为空/省略只校验存在**，不执行版本探测。Windows 上只解析 `.exe` / `.com`，不接受 `.cmd` / `.bat` shim。声明了就一定要有脚本可跑（否则拒装）。
 - 不声明也能跑：带 shebang 的脚本在 Unix 直接 exec，`.cmd` / `.bat` 在 Windows 经 `COMSPEC`；要锁定解释器版本或跑 `.py` / `.ps1` 时才声明。
-- 安装时解析解释器到绝对路径并校验版本，失败不落盘；扫描时只重新解析路径。运行时统一 `interp + args + [script] + action_args`，`exec` 与 lifecycle 共用同一结果。Windows 没有 SIGTERM 的 polite 路径，`stop` 钩子结束后直接终止进程树。
+- 安装时解析解释器到绝对路径并校验版本，失败不落盘；扫描时只重新解析路径。运行时统一 `interp + args + [script] + action_args`，`exec` 与 lifecycle 共用同一结果。Windows 没有 SIGTERM 的 polite 路径：进程被直接强杀，之后 `stop` 照常运行。
 - 脚本插件通常 `capabilities: []`，MCP 面只剩 `<id>.start`；会讲 MCP 的脚本可以 `ready: "notify"` 并声明能力。
-- `plugin bundle --from-core --interpreter <name>` 会按脚本声明的 `start/stop/status` 自动生成 lifecycle；lifecycle 指向的其它脚本也要一起进 `files[]`。`hooks` / `config` / `ui` 仍按插件规则。
+- `plugin bundle --from-core --interpreter <name>` 会把声明的 `start` 写进 `exec.args`，为 `stop` / `status` 生成 lifecycle；lifecycle 指向的其它脚本也要一起进 `files[]`。`hooks` / `config` / `ui` 仍按插件规则。
 - 没有版本门禁：`lifecycle` / `interpreter` / `compat` 与普通字段一样只在 `schema: 1` 内校验。
 
 ## 2. .spk 包格式
@@ -161,7 +161,7 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
 | `protocol` | int | 是 | 1 / 2 / 3；1 = 行分帧 JSON-RPC，2 = 长度前缀 JSON-RPC，3 = 多路复用帧（stream 0 是 JSON-RPC，stream 1..=0xFFFF_FFFE 是 raw 数据流，stream 0xFFFF_FFFF 是控制流）。不匹配安装拒绝、加载再检 |
 | `exec` | object | 是 | `{path, args?, env?, ready?}`；`ready` 默认 `notify`，可 `exec` |
 | `interpreter` | object | 否 | `{name, args?, version?}`；声明了就必须有脚本 payload，不声明则直接 exec（见 §1.8） |
-| `lifecycle` | object | 否 | `{start?, stop?, status?}`，路径包内相对且在 `files[]` |
+| `lifecycle` | object | 否 | `{start?, stop?, status?}`；`start` 是前置准备（必须退出），`stop` 在进程消失后运行；路径包内相对且在 `files[]` |
 | `dependencies` | [string] | 否 | 服务 id 列表，**无版本约束** |
 | `capabilities` | array | 否 | `{name, desc, inputSchema, outputSchema?}`；name 插件内唯一，`svc.` 禁用；只允许 `ready=notify`；`outputSchema` 只做声明与 MCP 投影，不校验结果（省略 = 未声明，`{}` = 任意） |
 | `ui` | object | 否 | `{type: web / gui / headerless, entry?}`；`entry` 相对 `payload/web/`，默认 `index.html` |
@@ -561,6 +561,7 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
 - 2026-11-13（补）：脚本插件——`schema: 2` 增加 `lifecycle` / `interpreter`；脚本 payload 必须声明解释器（版本可空），安装时解析并校验，运行时统一经解释器执行；core drop-in 脚本可原样加 manifest 转成 plugin；`plugin bundle --from-core` 自动生成 lifecycle；老 daemon 拒绝 schema 2。
 - 2026-11-23（#260）：manifest 格式重编号为 `schema: 1`（唯一版本、不读旧线任何版本）。新增必填 `id`（身份）与 `name`（显示名，可中文）、`capabilities[].outputSchema`、顶层 `icons`；`lifecycle` / `interpreter` / `compat` 并入 1，取消 1/2/3 分级门禁；`interpreter` 由「脚本必需」改为「可选，声明了就必须有脚本」。`plugin bundle` 恒写 `schema: 1`，`--id` 写身份、`--name` 写显示名。
 - 2026-11-17：控制通道删除 `svcd.token`，鉴权改为端点 ACL；本地两档由 `svcd` / `svcd-admin` 两个端点实施；C8 改为两端点各一条显式 protected DACL。
+- 2026-11-26（#323）：生命周期语义翻转——`exec` 成为唯一的被监督进程，`lifecycle.start` 改为前置准备（必须退出，失败即启动失败），`lifecycle.stop` 改为进程消失后的收尾（`Stopped` 以它返回为准），终止权归宿主。core 脚本声明的 `start` 改为写进 `exec.args`，`plugin bundle --from-core` 同步。老包（`start` 是常驻进程）会以「start 动作超时」启动失败，错误日志指明把进程移到 `exec.args`。
 
 ## 16. 实施票（2026-11-12 拆出）
 

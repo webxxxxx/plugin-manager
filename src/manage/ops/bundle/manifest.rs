@@ -154,35 +154,34 @@ pub(super) fn assemble_manifest(
             &String::from_utf8_lossy(&source.data),
             &extension,
         );
-        if actions.any() {
-            let mut lifecycle = Map::new();
-            if actions.start {
-                lifecycle.insert(
-                    "start".into(),
-                    serde_json::json!({"path": exec_path, "args": ["start"]}),
-                );
-            }
-            if actions.stop {
-                lifecycle.insert(
-                    "stop".into(),
-                    serde_json::json!({"path": exec_path, "args": ["stop"]}),
-                );
-            }
-            if actions.status {
-                lifecycle.insert(
-                    "status".into(),
-                    serde_json::json!({"path": exec_path, "args": ["status"]}),
-                );
-            }
-            manifest.insert("lifecycle".into(), Value::Object(lifecycle));
-        } else {
+        // The script's start action runs the script itself; it is the process,
+        // not a preparation step (#323).
+        let mut lifecycle = Map::new();
+        if actions.stop {
+            lifecycle.insert(
+                "stop".into(),
+                serde_json::json!({"path": exec_path, "args": ["stop"]}),
+            );
+        }
+        if actions.status {
+            lifecycle.insert(
+                "status".into(),
+                serde_json::json!({"path": exec_path, "args": ["status"]}),
+            );
+        }
+        if lifecycle.is_empty() {
             manifest.remove("lifecycle");
+        } else {
+            manifest.insert("lifecycle".into(), Value::Object(lifecycle));
         }
         let mut exec = manifest
             .get("exec")
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
+        if actions.start {
+            exec.insert("args".into(), serde_json::json!(["start"]));
+        }
         exec.insert("ready".into(), Value::String("exec".into()));
         manifest.insert("exec".into(), Value::Object(exec));
     }

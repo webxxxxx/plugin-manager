@@ -426,7 +426,8 @@ impl Supervisor {
             let deadline = clock
                 .now()
                 .mono_ms
-                .saturating_add(supervisor::START_TIMEOUT_MS);
+                .saturating_add(supervisor::START_TIMEOUT_MS)
+                .saturating_add(self.start_hook_budget(layer.iter().map(String::as_str)));
             if let Err(error) = self.start_layer(&layer, deadline, clock) {
                 error!("start enabled: {}", error);
             }

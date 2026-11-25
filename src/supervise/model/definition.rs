@@ -248,9 +248,12 @@ fn load_scripts(
             timeout_ms,
             interpreter: None,
         };
-        let lifecycle = if declarations.start || declarations.stop || declarations.status {
+        // A script's start action is not a preparation step: it is the process
+        // itself, so it becomes the `exec` arguments (#323). `stop` runs after
+        // that process is gone.
+        let lifecycle = if declarations.stop || declarations.status {
             Some(Lifecycle {
-                start: declarations.start.then(|| hook("start", 30_000)),
+                start: None,
                 stop: declarations.stop.then(|| hook("stop", 10_000)),
                 status: declarations.status.then(|| hook("status", 5_000)),
             })
