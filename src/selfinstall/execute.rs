@@ -631,14 +631,31 @@ fn assert_file_contains(path: &Path, needle: &str) -> Result<(), String> {
     }
 }
 
+/// Does this step already accept "the init system says there is nothing here"?
+///
+/// A step that allows a non-zero exit code — `procd`'s stop answering 1, `sc`'s
+/// 1060 "no such service" — means the same thing when the program is absent
+/// entirely, which is the `--manual` case: no init script was ever written, so
+/// `--uninstall` has nothing to talk to (#303). A strict step (only exit 0
+/// accepted) still reports a missing program.
+fn tolerates_absence(allow_codes: Option<&[i32]>) -> bool {
+    match allow_codes {
+        None => true,
+        Some(codes) => codes.iter().any(|code| *code != 0),
+    }
+}
+
 fn run_command(argv: &[String], allow_codes: Option<&[i32]>) -> Result<(), String> {
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| "empty command".to_string())?;
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|error| format!("cannot run {}: {}", argv.join(" "), error))?;
+    let output = match Command::new(program).args(args).output() {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound && tolerates_absence(allow_codes) => {
+            return Ok(());
+        }
+        Err(error) => return Err(format!("cannot run {}: {}", argv.join(" "), error)),
+    };
     if output.status.success() {
         return Ok(());
     }
@@ -672,6 +689,37 @@ fn run_command(argv: &[String], allow_codes: Option<&[i32]>) -> Result<(), Strin
 mod tests {
     use super::*;
     use crate::platform::test_support::TempDir;
+
+    /// #303: `--uninstall` on a `--manual` host has no init script to stop.
+    /// The step already tolerates the init system answering "not running", so a
+    /// program that is not there at all is the same answer.
+    #[test]
+    fn a_tolerant_step_skips_a_program_that_is_not_there() {
+        let absent = [
+            "/nonexistent/svcd-init-script".to_string(),
+            "stop".to_string(),
+        ];
+        assert!(
+            run_command(&absent, Some(&[0, 1])).is_ok(),
+            "an accepted non-zero exit code also accepts an absent program"
+        );
+        assert!(run_command(&absent, None).is_ok(), "best effort");
+    }
+
+    /// The other half of the rule: a step that only accepts exit 0 is asking
+    /// for something that must work, so a missing program stays a failure.
+    #[test]
+    fn a_strict_step_still_reports_a_program_that_is_not_there() {
+        let absent = [
+            "/nonexistent/svcd-init-script".to_string(),
+            "enable".to_string(),
+        ];
+        let error = run_command(&absent, Some(&[0])).expect_err("missing program");
+        assert!(
+            error.starts_with("cannot run /nonexistent/svcd-init-script enable"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn file_operations_are_idempotent_and_remove_is_optional() {
