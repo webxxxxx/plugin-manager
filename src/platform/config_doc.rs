@@ -593,6 +593,17 @@ pub const CONF_KEYS: &[ConfKey] = &[
         needs_restart: true,
     },
     ConfKey {
+        key: "manual_install_root",
+        label: "手动选择安装位置",
+        group: Group::Paths,
+        kind: Kind::Bool,
+        default: "开",
+        doc: "安装插件时是否让用户挑插件根。开：只在可选根多于一个时弹选择器（列空闲空间与已装插件数）；关：宿主自己选装得下的最小根，不弹任何选择框。上传安装与插件商店共用这个开关。",
+        recommend: "只有一块盘时开不开都一样；多块盘、想按插件大小自己分配时保持打开。",
+        editable_in_console: true,
+        needs_restart: true,
+    },
+    ConfKey {
         key: "data_dir",
         label: "数据目录",
         group: Group::Paths,

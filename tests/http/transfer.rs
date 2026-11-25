@@ -89,6 +89,16 @@ fn the_disk_route_lists_roots_and_the_temp_volume() {
         roots[0]["plugin"].is_null(),
         "without ?id there is no plugin column: {body}"
     );
+    assert_eq!(
+        roots[0]["plugins"],
+        json!(0),
+        "the picker shows how many plugins a root already holds: {body}"
+    );
+    assert_eq!(
+        body["manualInstallRoot"],
+        json!(true),
+        "asking for a root is the default (#299): {body}"
+    );
     assert!(
         body["tempFreeBytes"].as_u64().unwrap_or(0) > 0,
         "the temp volume is reported beside the roots: {body}"

@@ -233,6 +233,41 @@ const CHECKS = [
     },
   },
   {
+    id: "install-root-asked-when-enabled",
+    run(page) {
+      const body = functionBody(page, "install");
+      if (!body.includes("disk.manualInstallRoot") || !body.includes("roots.length < 2")) {
+        throw new Error("the picker must depend on the switch and on more than one root");
+      }
+      if (!body.includes("chooseInstallRoot(file, roots)")) {
+        throw new Error("install must ask for a root when the switch is on");
+      }
+      return "the picker only appears when the switch is on and roots > 1";
+    },
+    mutate(page) {
+      return page.replace(
+        "if (!disk.manualInstallRoot || roots.length < 2) {",
+        "if (roots.length < 2) {",
+      );
+    },
+  },
+  {
+    id: "install-root-passed-explicitly",
+    run(page) {
+      const body = functionBody(page, "uploadInstall");
+      if (!body.includes("'?root=' + encodeURIComponent(root)")) {
+        throw new Error("an explicit root must reach the install endpoint");
+      }
+      return "the chosen root travels as ?root=";
+    },
+    mutate(page) {
+      return page.replace(
+        "'/api/v1/plugins' + (root ? '?root=' + encodeURIComponent(root) : '')",
+        "'/api/v1/plugins'",
+      );
+    },
+  },
+  {
     id: "no-flat-list",
     run(page) {
       if (page.includes("heading.className = 'setting-group'")) {

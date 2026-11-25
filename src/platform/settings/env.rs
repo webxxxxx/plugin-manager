@@ -13,6 +13,7 @@ pub(crate) const ENV_KEYS: &[&str] = &[
     "config_dir",
     "data_dir",
     "plugins_dir",
+    "manual_install_root",
     "logs_dir",
     "static_root",
     "install_dir",

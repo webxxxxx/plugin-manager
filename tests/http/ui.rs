@@ -93,6 +93,12 @@ fn serves_the_embedded_console() {
         html.contains("function pluginRootsField") && html.contains("default || plugins > 0"),
         "plugins_dir must render the row editor with its locks"
     );
+    // The upload install asks which root when the switch is on and there is
+    // more than one; the plugin store reads the same flag (#299).
+    assert!(
+        html.contains("function chooseInstallRoot") && html.contains("manualInstallRoot"),
+        "the upload page must offer the install-root picker"
+    );
     assert!(
         html.contains("settingsTipLine('来源'"),
         "settings dialog keeps provenance in the hover tip"

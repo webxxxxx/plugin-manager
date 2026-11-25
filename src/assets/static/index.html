@@ -85,6 +85,7 @@
   .root-row { display:flex; align-items:center; gap:6px; min-width:0; }
   .root-row input[type=text] { flex:1 1 auto; min-width:0; }
   .root-row .roots-note { flex:none; font-size:11px; color:var(--muted); }
+  .root-row .root-row-path { flex:0 1 auto; min-width:0; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .root-row.locked input[type=text] { background:#f7f8fa; color:var(--muted); }
   .root-row button { flex:none; padding:3px 8px; font-size:12px; }
   .root-row button:disabled { opacity:.45; cursor:not-allowed; }
@@ -430,8 +431,126 @@ function install() {
   const file = $('file').files[0];
   if (!file) { toast('请先选择 .spk 或 .spkb 文件', 'err'); return; }
   const backup = /\.spkb$/i.test(file.name);
+  if (backup) {
+    uploadInstall(file, true, null);
+    return;
+  }
+  // A backup is not a package: it always goes back where it came from, so the
+  // root question only applies to `.spk` (#299).
   lock(true);
-  fetch(backup ? '/api/v1/import?force=true' : '/api/v1/plugins', {
+  fetch('/api/v1/disk', { credentials: 'same-origin', headers: authHeaders() })
+    .then(async function (response) {
+      if (!response.ok) throw new Error(await errorText(response));
+      return response.json();
+    })
+    .then(function (disk) {
+      lock(false);
+      const roots = disk.roots || [];
+      if (!disk.manualInstallRoot || roots.length < 2) {
+        uploadInstall(file, false, null);
+        return;
+      }
+      chooseInstallRoot(file, roots);
+    })
+    .catch(function (error) {
+      lock(false);
+      toast('读取插件根失败：' + error.message, 'err');
+    });
+}
+
+// Which root a package goes to, when the operator asked to choose (#299).
+//
+// Preselecting what the host would pick keeps "just press 安装" the same as the
+// automatic path: the smallest root that still fits. A root without room is
+// offered but disabled, so the reason is visible instead of coming back as a
+// 507 after the upload.
+function chooseInstallRoot(file, roots) {
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  const panel = document.createElement('div');
+  panel.className = 'panel';
+  panel.style.width = '520px';
+  panel.style.maxWidth = '92vw';
+
+  const title = document.createElement('h1');
+  title.textContent = '装到哪个插件根？';
+  title.style.fontSize = '16px';
+  title.style.margin = '0 0 6px';
+  panel.appendChild(title);
+
+  const hint = document.createElement('p');
+  hint.className = 'muted';
+  hint.style.margin = '0 0 10px';
+  hint.textContent = '包 ' + file.name + '（' + settingsBytesText(file.size) +
+    '）。默认选中宿主本来会选的那个根；可以在设置里关掉“手动选择安装位置”。';
+  panel.appendChild(hint);
+
+  const fits = roots.filter(function (root) {
+    return root.freeBytes === null || root.freeBytes >= file.size;
+  });
+  const smallest = fits.reduce(function (best, root) {
+    if (best === null) return root;
+    if (root.freeBytes === null) return best;
+    return root.freeBytes < best.freeBytes ? root : best;
+  }, null);
+  const preselected = smallest ? smallest.root : (roots[0] || {}).root;
+
+  const list = document.createElement('div');
+  list.className = 'roots';
+  let chosen = preselected;
+  roots.forEach(function (root) {
+    const row = document.createElement('label');
+    row.className = 'root-row';
+    const radio = document.createElement('input');
+    radio.type = 'radio';
+    radio.name = 'install-root';
+    radio.value = root.root;
+    radio.checked = root.root === preselected;
+    const room = root.freeBytes === null ? '空间未知（卷可能没挂上）' : settingsBytesText(root.freeBytes) + ' 空闲';
+    const usable = root.freeBytes === null || root.freeBytes >= file.size;
+    radio.disabled = !usable;
+    radio.onchange = function () { chosen = root.root; };
+    row.appendChild(radio);
+    const path = document.createElement('span');
+    path.className = 'root-row-path';
+    path.textContent = root.root + (root.default ? '（默认）' : '');
+    row.appendChild(path);
+    const note = document.createElement('span');
+    note.className = 'roots-note';
+    note.textContent = room + ' · 已装 ' + (root.plugins || 0) + ' 个' + (usable ? '' : ' · 放不下');
+    row.appendChild(note);
+    list.appendChild(row);
+  });
+  panel.appendChild(list);
+
+  const actions = document.createElement('div');
+  actions.className = 'row';
+  actions.style.justifyContent = 'flex-end';
+  actions.style.gap = '8px';
+  actions.style.marginTop = '12px';
+  const cancel = button('取消', 'ghost', function () {
+    modal.remove();
+    $('file').value = '';
+  });
+  const confirm = button('安装到这个根', '', function () {
+    modal.remove();
+    uploadInstall(file, false, chosen);
+  });
+  actions.appendChild(cancel);
+  actions.appendChild(confirm);
+  panel.appendChild(actions);
+
+  modal.onclick = function (event) { if (event.target === modal) cancel.onclick(); };
+  modal.appendChild(panel);
+  document.body.appendChild(modal);
+}
+
+function uploadInstall(file, backup, root) {
+  const path = backup
+    ? '/api/v1/import?force=true'
+    : '/api/v1/plugins' + (root ? '?root=' + encodeURIComponent(root) : '');
+  lock(true);
+  fetch(path, {
     method: 'POST',
     credentials: 'same-origin',
     headers: authHeaders({ 'Content-Type': 'application/octet-stream' }),
