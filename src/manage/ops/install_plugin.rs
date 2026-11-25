@@ -93,7 +93,6 @@ pub fn install_staged(
 
     let result = match strategy {
         Strategy::KeepOld => install_keep_old_staged(
-            paths,
             limits,
             staged,
             &id,
@@ -350,7 +349,6 @@ pub fn install_package(
 
     let result: Result<Service, InstallFailure> = match strategy {
         Strategy::KeepOld => install_keep_old(
-            paths,
             limits,
             package,
             &id,

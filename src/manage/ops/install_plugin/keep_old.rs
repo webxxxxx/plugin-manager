@@ -5,7 +5,6 @@ use super::*;
 
 #[allow(clippy::too_many_arguments)] // The strategy split already carries every install input.
 pub(super) fn install_keep_old(
-    paths: &Paths,
     limits: &crate::platform::limits::Limits,
     package: &Package,
     id: &str,
@@ -31,7 +30,6 @@ pub(super) fn install_keep_old(
     let (version_dir, enabled) = write_version(package, plugin_dir, was_installed)?;
     copy_config(package, plugin_dir)?;
     let service = service_from_manifest(
-        paths,
         limits,
         &version_dir,
         &package.manifest,
@@ -44,7 +42,6 @@ pub(super) fn install_keep_old(
 
 #[allow(clippy::too_many_arguments)] // The strategy split already carries every install input.
 pub(super) fn install_keep_old_staged(
-    paths: &Paths,
     limits: &crate::platform::limits::Limits,
     staged: package::StagedPackage,
     id: &str,
@@ -56,8 +53,7 @@ pub(super) fn install_keep_old_staged(
     let manifest = staged.manifest.clone();
     let (version_dir, enabled) = commit_staged(staged, plugin_dir, was_installed)?;
     copy_config_staged(&manifest, plugin_dir, &version_dir)?;
-    let service =
-        service_from_manifest(paths, limits, &version_dir, &manifest, enabled, interpreter)?;
+    let service = service_from_manifest(limits, &version_dir, &manifest, enabled, interpreter)?;
     run_post_install_manifest(&manifest, id, &version_dir, hooks)?;
     Ok(service)
 }

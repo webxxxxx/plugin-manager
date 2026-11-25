@@ -5,7 +5,6 @@ use std::path::Path;
 
 use crate::kernel::contract::{Capability as KernelCapability, CapabilityName, Effect};
 use crate::kernel::failure::{Problem, ProblemError};
-use crate::kernel::layout::plugin_dir;
 use crate::kernel::registry::{
     Exec, Hook, Interpreter, Kind, Lifecycle, Ready, Restart, Service, State, RESERVED_ID,
 };
@@ -68,7 +67,6 @@ pub fn scan(
             }
         };
         match service_from_manifest(
-            paths,
             limits,
             &version_dir,
             &manifest,
@@ -100,7 +98,6 @@ pub fn scan(
 }
 
 pub(crate) fn service_from_manifest(
-    paths: &Paths,
     limits: &crate::platform::limits::Limits,
     version_dir: &Path,
     manifest: &package::Manifest,
@@ -205,7 +202,13 @@ pub(crate) fn service_from_manifest(
     }
 
     let config = {
-        let path = plugin_dir(paths, id).join("config");
+        // The tree the manifest was read from, not what the location index
+        // says: an install builds this service *before* it records its root, so
+        // asking the index at that moment answered the default root and a
+        // non-default install came out without a config path — no
+        // `SVCD_CONFIG`, and the console hid the 配置 button (#307).
+        let directory = version_dir.parent().unwrap_or(version_dir);
+        let path = directory.join("config");
         path.is_file().then(|| path.to_string_lossy().to_string())
     };
 
@@ -427,6 +430,56 @@ mod tests {
             .contains(&crate::kernel::failure::Class::Cancelled));
     }
 
+    /// #307: an install to a second root builds the service before the root is
+    /// recorded, so the config path must come from the version directory it was
+    /// reading, not from the index (which still answers the default root).
+    #[test]
+    fn the_config_path_follows_the_version_directory() {
+        let temp = crate::platform::test_support::TempDir::with_prefix("svcd-scan");
+        let card = temp.path().join("card");
+        let version_dir = card.join("demo").join("1.0.0");
+        std::fs::create_dir_all(version_dir.join("payload")).expect("payload");
+        std::fs::write(version_dir.join("payload/run.sh"), b"#!/bin/sh\n").expect("script");
+        std::fs::write(card.join("demo").join("config"), b"{\"a\":1}\n").expect("config");
+        let value = serde_json::json!({
+            "schema": 1,
+            "id": "demo",
+            "name": "demo",
+            "version": "1.0.0",
+            "desc": "config test",
+            "platform": crate::platform::target(),
+            "protocol": 1,
+            "exec": {"path": "payload/run.sh", "ready": "exec"},
+            "interpreter": {"name": "sh"},
+            "files": []
+        });
+        let manifest =
+            package::parse_manifest(&serde_json::to_vec(&value).expect("manifest")).expect("parse");
+        // The card root is configured but not default, and the index has no
+        // entry for `demo` yet — exactly the state a fresh install is in.
+        let mut paths = Paths::under(temp.path());
+        paths.plugin_roots = vec![temp.path().join("data").join("plugins"), card.clone()];
+        let interpreter = Interpreter {
+            path: "/bin/sh".into(),
+            args: Vec::new(),
+        };
+
+        let service = service_from_manifest(
+            &crate::platform::limits::test_default(),
+            &version_dir,
+            &manifest,
+            true,
+            Some(&interpreter),
+        )
+        .expect("service");
+
+        assert_eq!(
+            service.config.as_deref(),
+            Some(card.join("demo").join("config").to_string_lossy().as_ref()),
+            "the config must be the one next to the installed version"
+        );
+    }
+
     #[test]
     fn maps_a_script_lifecycle_and_interpreter() {
         let host = Interpreter {
@@ -446,7 +499,6 @@ mod tests {
         );
 
         let service = service_from_manifest(
-            paths(),
             &crate::platform::limits::test_default(),
             &version_dir,
             &manifest,
@@ -491,7 +543,6 @@ mod tests {
         );
 
         let service = service_from_manifest(
-            paths(),
             &crate::platform::limits::test_default(),
             &version_dir,
             &manifest,
@@ -509,7 +560,6 @@ mod tests {
             script_manifest("native", "payload/bin/tool", b"\x7fELFdemo", None, None);
 
         let service = service_from_manifest(
-            paths(),
             &crate::platform::limits::test_default(),
             &version_dir,
             &manifest,
@@ -537,7 +587,6 @@ mod tests {
         );
 
         let error = service_from_manifest(
-            paths(),
             &crate::platform::limits::test_default(),
             &version_dir,
             &manifest,
