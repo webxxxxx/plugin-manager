@@ -18,11 +18,26 @@ pub(crate) fn spawn_helper() -> std::io::Result<u32> {
 /// with the freshly installed binary: this process may be the image that was
 /// just renamed aside on Windows.
 pub(crate) fn spawn_helper_from(executable: &std::path::Path) -> std::io::Result<u32> {
+    spawn_detached(
+        executable,
+        &["restart-helper", &std::process::id().to_string()],
+    )
+}
+
+/// Spawn the helper that restarts a *service* daemon (#306).
+///
+/// It cannot start a replacement itself: the init system owns this process, so
+/// the helper asks this daemon to stop and lets the supervisor bring it back.
+pub(crate) fn spawn_service_helper() -> std::io::Result<u32> {
+    spawn_detached(&std::env::current_exe()?, &["service-restart-helper"])
+}
+
+fn spawn_detached(executable: &std::path::Path, args: &[&str]) -> std::io::Result<u32> {
     // The helper and the daemon it starts must not hold this process's stdio.
     crate::platform::host::process::detach_stdio();
     let mut command = Command::new(executable);
     command
-        .args(["restart-helper", &std::process::id().to_string()])
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

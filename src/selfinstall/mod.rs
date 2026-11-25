@@ -8,6 +8,7 @@ mod execute;
 mod plan;
 pub(crate) mod upgrade;
 
+pub(crate) use execute::service_can_restart_itself;
 #[cfg(windows)]
 pub(crate) use execute::wait_for_process;
 pub use execute::{

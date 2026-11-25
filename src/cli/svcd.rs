@@ -334,6 +334,59 @@ pub(crate) fn restart_helper(host: &dyn Host, args: &[String]) -> i32 {
     }
 }
 
+/// The detached half of a settings save in *service* mode (#306).
+///
+/// The init system owns this daemon, so the helper cannot start a replacement
+/// the way the user-mode helper does. It asks the daemon to stop and gives the
+/// supervisor the first chance to bring it back — procd, an inittab
+/// `::respawn:` line and launchd all do. Only when nothing came back does it
+/// start the service itself, which is what a systemd unit with
+/// `Restart=on-failure` needs: a clean exit stays stopped there.
+pub(crate) fn service_restart_helper(host: &dyn Host) -> i32 {
+    // The save that spawned this helper still has an HTTP reply in flight, and
+    // that response ("正在重启…") must reach the browser first.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let paths = crate::platform::config::ambient_paths(None);
+    let control = paths.control_dir();
+    let ping = |control: &Path| {
+        crate::wire::control::channel::request(control, "svcd.ping", serde_json::json!({})).is_ok()
+    };
+    for _ in 0..40 {
+        if !ping(control) {
+            break;
+        }
+        host.shutdown_quiet();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    for _ in 0..400 {
+        if !ping(control) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    // A respawning supervisor needs a moment; starting a second instance while
+    // it is bringing one up would race it for the control socket.
+    for _ in 0..150 {
+        if ping(control) {
+            return 0;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // Nobody brought it back: ask the service manager, and wait for the daemon
+    // to answer again before reporting success.
+    crate::selfinstall::service_start();
+    for _ in 0..100 {
+        if ping(control) {
+            return 0;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    eprintln!(
+        "svcd: the service did not come back after a restart; start it with the service manager"
+    );
+    1
+}
+
 fn user_status(config: &Config) -> i32 {
     println!("mode:   user");
     println!("config: {}", config.paths.config_dir.display());

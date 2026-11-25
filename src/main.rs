@@ -138,6 +138,9 @@ fn svcd_run(args: Vec<String>) -> i32 {
         // its parent to exit (the control socket and HTTP port are still held),
         // then starts the daemon the same way a background user daemon starts.
         Some("restart-helper") => cli::svcd::restart_helper(&MainHost, &args[1..]),
+        // Internal: the service-mode half of a settings save (#306). It stops
+        // this daemon and lets the init system start it again.
+        Some("service-restart-helper") => cli::svcd::service_restart_helper(&MainHost),
         Some("user") => cli::svcd::user(&MainHost, &args[1..]),
         _ => {
             usage();

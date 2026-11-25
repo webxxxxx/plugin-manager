@@ -444,11 +444,21 @@ fn svcd_restart_replaces_the_user_daemon() {
     assert_eq!(version.status, 200, "{:?}", version.body);
 }
 
+/// A service-mode save restarts the daemon through its init system — except on
+/// a host with no supervisor to lean on (#306). The hook pins that branch: this
+/// machine has a `systemctl` binary but no `svcd` service, so the real decision
+/// would spawn a helper that stops the daemon the assertions then talk to.
 #[test]
 fn a_save_in_service_mode_saves_without_restarting() {
     let mut sandbox = Sandbox::new();
     write_conf(&sandbox, "");
-    sandbox.start_daemon_with_env("127.0.0.1:0", &[("SVCD_TEST_PRIVILEGE", "privileged")]);
+    sandbox.start_daemon_with_env(
+        "127.0.0.1:0",
+        &[
+            ("SVCD_TEST_PRIVILEGE", "privileged"),
+            ("SVCD_TEST_NO_SERVICE_RESTART", "1"),
+        ],
+    );
     let address = sandbox.wait_for_http();
 
     let response = request(

@@ -1074,7 +1074,7 @@ function showSettingsModal(data) {
   hint.className = 'muted';
   hint.style.margin = '4px 0 0';
   hint.textContent = '写入 ' + (data.path || '（未找到 svcd.conf）') +
-    '。悬停参数名后的 ? 查看英文名、说明、推荐值与默认值；保存后 daemon 会自动重启（系统服务模式下由服务管理器重启）。';
+    '。悬停参数名后的 ? 查看英文名、说明、推荐值与默认值；保存后 daemon 会自己重启，30 秒没回来就用服务管理器手动重启。';
   head.appendChild(title);
   head.appendChild(hint);
 
