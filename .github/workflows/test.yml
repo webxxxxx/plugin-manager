@@ -15,6 +15,10 @@ concurrency:
 jobs:
   test:
     name: test / ${{ matrix.os }}
+    # A release bump commit only changes the version string, and the tag pushed
+    # right after it runs the same matrix through release.yml. `ref_type` keeps
+    # that tag call running: only a branch push is skipped (#319).
+    if: ${{ github.event_name != 'push' || github.ref_type != 'branch' || !startsWith(github.event.head_commit.message, 'chore(release):') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -54,6 +58,10 @@ jobs:
 
   guardrails:
     name: guardrails / closed tickets merged
+    # A release bump commit only changes the version string, and the tag pushed
+    # right after it runs the same matrix through release.yml. `ref_type` keeps
+    # that tag call running: only a branch push is skipped (#319).
+    if: ${{ github.event_name != 'push' || github.ref_type != 'branch' || !startsWith(github.event.head_commit.message, 'chore(release):') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -81,6 +89,10 @@ jobs:
 
   mem-levels:
     name: mem-level / ${{ matrix.level }}
+    # A release bump commit only changes the version string, and the tag pushed
+    # right after it runs the same matrix through release.yml. `ref_type` keeps
+    # that tag call running: only a branch push is skipped (#319).
+    if: ${{ github.event_name != 'push' || github.ref_type != 'branch' || !startsWith(github.event.head_commit.message, 'chore(release):') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:

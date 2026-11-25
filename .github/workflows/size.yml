@@ -13,6 +13,10 @@ permissions:
 jobs:
   embedded:
     name: embedded / ${{ matrix.target }}
+    # A release bump commit only changes the version string, and the tag pushed
+    # right after it runs the same matrix through release.yml. `ref_type` keeps
+    # that tag call running: only a branch push is skipped (#319).
+    if: ${{ github.event_name != 'push' || github.ref_type != 'branch' || !startsWith(github.event.head_commit.message, 'chore(release):') }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -53,6 +57,10 @@ jobs:
 
   desktop-windows:
     name: desktop / x86_64-pc-windows-msvc
+    # A release bump commit only changes the version string, and the tag pushed
+    # right after it runs the same matrix through release.yml. `ref_type` keeps
+    # that tag call running: only a branch push is skipped (#319).
+    if: ${{ github.event_name != 'push' || github.ref_type != 'branch' || !startsWith(github.event.head_commit.message, 'chore(release):') }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
