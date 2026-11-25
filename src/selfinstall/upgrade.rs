@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use super::execute::install_alias;
 use crate::platform::config::Config;
 #[cfg(feature = "http")]
 use crate::platform::paths::Paths;
@@ -557,28 +558,63 @@ fn install_files(dir: &Path, unpacked: &Path) -> Result<(), String> {
     if !source.is_file() {
         return Err(format!("{} is missing from the archive", binary));
     }
-    let mut staged = Vec::new();
-    for name in &names {
-        let from = unpacked.join(name);
-        // A release always ships the aliases; an archive with only the main
-        // binary still installs, with every alias a copy of it.
-        let from = if from.is_file() { from } else { source.clone() };
-        let to = dir.join(format!("{}.new", name));
-        fs::copy(&from, &to).map_err(|error| format!("stage {}: {}", to.display(), error))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&to, fs::Permissions::from_mode(0o755));
-        }
-        staged.push((to, dir.join(name.clone()), name.clone()));
+    let target = dir.join(binary);
+    // Stage the main binary once and let the aliases share it: staging all four
+    // names cost four binaries — 5.7 MB of a 30 MB `/data` (#304).
+    let staged = dir.join(format!("{}.new", binary));
+    stage_file(&source, &staged)?;
+    replace_file(&staged, &target, binary)?;
+    if !target.is_file() {
+        return Err(format!("{} did not land at {}", binary, target.display()));
     }
-    for (staged_path, target, name) in staged {
-        replace_file(&staged_path, &target, &name)?;
-        if !target.is_file() {
-            return Err(format!("{} did not land at {}", name, target.display()));
+    for name in &names[1..] {
+        let path = dir.join(name);
+        let from = unpacked.join(name);
+        // A release ships the aliases as hard links to `svcd`; an archive that
+        // expanded them carries independent files, installed as they are. An
+        // archive with no alias still installs, every alias a link to `svcd`.
+        if from.is_file() && !shares_inode_with(&from, &source) {
+            let staged = dir.join(format!("{}.new", name));
+            stage_file(&from, &staged)?;
+            replace_file(&staged, &path, name)?;
+        } else {
+            install_alias(&target, &path)
+                .map_err(|error| format!("cannot install {}: {}", path.display(), error))?;
+        }
+        if !path.is_file() {
+            return Err(format!("{} did not land at {}", name, path.display()));
         }
     }
     Ok(())
+}
+
+/// Copy `from` to a sibling that [`replace_file`] can rename into place.
+fn stage_file(from: &Path, staged: &Path) -> Result<(), String> {
+    fs::copy(from, staged).map_err(|error| format!("stage {}: {}", staged.display(), error))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(staged, fs::Permissions::from_mode(0o755));
+    }
+    Ok(())
+}
+
+/// Whether `tar` restored `alias` as a hard link to `main`, which is how the
+/// release archive ships the three names.
+#[cfg(unix)]
+fn shares_inode_with(alias: &Path, main: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::metadata(alias), fs::metadata(main)) {
+        (Ok(alias), Ok(main)) => alias.dev() == main.dev() && alias.ino() == main.ino(),
+        _ => false,
+    }
+}
+
+/// Windows keeps the aliases as separate files and `install_alias` copies
+/// there, so what the archive shipped is what gets installed.
+#[cfg(not(unix))]
+fn shares_inode_with(_alias: &Path, _main: &Path) -> bool {
+    false
 }
 
 #[cfg(windows)]
@@ -837,6 +873,22 @@ mod tests {
         let install_dir = config.settings.install_dir.clone().expect("install dir");
         let installed = install_dir.join(executable_names()[0].clone());
         assert!(installed.is_file(), "{} is missing", installed.display());
+        for name in executable_names() {
+            let path = install_dir.join(name);
+            assert!(
+                path.is_file(),
+                "{} is missing after an upgrade",
+                path.display()
+            );
+        }
+        // #304: the four names are one inode, the way the release archive and
+        // `svcd --install` both leave them (`stat -c '%h %s'` shows `4 <size>`).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let links = fs::metadata(&installed).expect("metadata");
+            assert_eq!(links.nlink(), 4, "the archive's hard links did not survive");
+        }
         let work: Vec<_> = fs::read_dir(&config.paths.temp_dir)
             .expect("temp dir")
             .map(|entry| {
@@ -855,17 +907,23 @@ mod tests {
     /// `tar` the upgrade path calls.
     #[cfg(feature = "http")]
     fn gzipped_release(config: &Config) -> Vec<u8> {
-        let binary = executable_names()[0].clone();
+        let names = executable_names();
+        let binary = names[0].clone();
         let staging = config.paths.temp_dir.join("staging");
         fs::create_dir_all(&staging).expect("staging");
         fs::write(staging.join(&binary), b"pretend binary").expect("binary");
+        // The release ships the aliases as hard links to the binary
+        // (`tools/package_release.py`), and `tar` restores them as links.
+        for name in &names[1..] {
+            link_or_copy(&staging.join(&binary), &staging.join(name));
+        }
         let archive = config.paths.temp_dir.join("release.tar.gz");
         let status = Command::new("tar")
             .arg("-czf")
             .arg(&archive)
             .arg("-C")
             .arg(&staging)
-            .arg(&binary)
+            .args(&names)
             .status()
             .expect("run tar");
         assert!(status.success(), "tar could not create the archive");
@@ -873,6 +931,81 @@ mod tests {
         let _ = fs::remove_dir_all(&staging);
         let _ = fs::remove_file(&archive);
         bytes
+    }
+
+    /// #304: the archive ships the aliases as hard links, and an upgrade must
+    /// land that shape. Copying every name left four independent binaries
+    /// (~5.7 MB on the device's 30 MB `/data`) and no relationship to the
+    /// archive at all.
+    #[test]
+    fn an_upgrade_keeps_the_aliases_sharing_the_binary() {
+        let temp = crate::platform::test_support::TempDir::with_prefix("svcd-upgrade");
+        let unpacked = temp.path().join("unpacked");
+        let dir = temp.path().join("install");
+        fs::create_dir_all(&unpacked).expect("unpacked");
+        fs::create_dir_all(&dir).expect("install dir");
+        let names = executable_names();
+        let main = unpacked.join(&names[0]);
+        fs::write(&main, b"binary").expect("archive binary");
+        for name in &names[1..] {
+            link_or_copy(&main, &unpacked.join(name));
+        }
+        // The tree the previous (copying) upgrade left behind: four names,
+        // four copies.
+        for name in &names {
+            fs::write(dir.join(name), b"old binary").expect("previous install");
+        }
+
+        install_files(&dir, &unpacked).expect("install");
+
+        for name in &names {
+            let path = dir.join(name);
+            assert!(path.is_file(), "{} is missing", path.display());
+        }
+        // Content written through the main binary shows through an alias only
+        // when the two share an inode. Unix links; Windows copies, because a
+        // running image cannot lose its last hard link.
+        fs::write(dir.join(&names[0]), b"binary+marker").expect("marker");
+        let through_alias = fs::read(dir.join(&names[1])).expect("read alias");
+        #[cfg(unix)]
+        assert_eq!(
+            through_alias, b"binary+marker",
+            "the alias is a second copy of the binary"
+        );
+        #[cfg(not(unix))]
+        assert_eq!(
+            through_alias, b"binary",
+            "a copy must not follow the main binary"
+        );
+    }
+
+    /// Some `tar` implementations expand the archive's hard links. The alias
+    /// then carries its own bytes and is installed as shipped — never linked to
+    /// a binary it may not match.
+    #[test]
+    fn an_alias_the_archive_left_unlinked_is_installed_as_shipped() {
+        let temp = crate::platform::test_support::TempDir::with_prefix("svcd-upgrade");
+        let unpacked = temp.path().join("unpacked");
+        let dir = temp.path().join("install");
+        fs::create_dir_all(&unpacked).expect("unpacked");
+        fs::create_dir_all(&dir).expect("install dir");
+        let names = executable_names();
+        fs::write(unpacked.join(&names[0]), b"main").expect("archive binary");
+        fs::write(unpacked.join(&names[1]), b"own bytes").expect("expanded alias");
+
+        install_files(&dir, &unpacked).expect("install");
+
+        let alias = fs::read(dir.join(&names[1])).expect("read alias");
+        assert_eq!(alias, b"own bytes");
+        let main = fs::read(dir.join(&names[0])).expect("read main");
+        assert_eq!(main, b"main");
+    }
+
+    /// The release archive's own shape: three names hard-linked to the binary.
+    fn link_or_copy(from: &Path, to: &Path) {
+        if fs::hard_link(from, to).is_err() {
+            fs::copy(from, to).expect("copy alias");
+        }
     }
 
     #[test]
