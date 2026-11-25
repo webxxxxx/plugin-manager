@@ -1836,7 +1836,9 @@ fn plugins_on_a_second_root_are_listed_and_a_duplicate_is_a_conflict() {
 
     // The plugin now lives on a second root; the list names both roots in
     // priority order, so the second root is the default install root.
-    let second_root = sandbox.root.join("sd/plugins");
+    // Two components, so the configured root and the path the daemon reports
+    // back use one spelling on every host (#310).
+    let second_root = sandbox.root.join("sd").join("plugins");
     fs::create_dir_all(second_root.join("demo").parent().expect("parent")).expect("sd root");
     fs::rename(sandbox.data.join("plugins/demo"), second_root.join("demo")).expect("move demo");
     let default_root = sandbox.data.join("plugins");

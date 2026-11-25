@@ -33,8 +33,23 @@ impl Sandbox {
             // CI and the WSL runbook both exercise this suite as root.
             .env("SVCD_TEST_PRIVILEGE", "privileged")
             .env_remove("SVCD_TEST_UNPRIVILEGED")
-            .env_remove("SVCD_USER");
+            .env_remove("SVCD_USER")
+            // #311: a system install edits the machine PATH. Point both forms
+            // (profile directory, registry key) at the sandbox.
+            .env("SVCD_TEST_SYSTEM_ROOT", self.root.join("system"))
+            .env(
+                "SVCD_TEST_SYSTEM_PATH_KEY",
+                format!("HKCU:Software\\svcd-tests\\{}", self.key_name()),
+            );
         command
+    }
+
+    /// One registry subkey per sandbox, so parallel tests never share a value.
+    fn key_name(&self) -> String {
+        self.root
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default()
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -836,6 +851,42 @@ fn windows_user_install_stays_in_localappdata_and_uninstall_removes_it() {
     }
 }
 
+/// Where a POSIX host keeps the profile entry the installer writes.
+#[cfg(unix)]
+fn system_path_file(sandbox: &Sandbox) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        sandbox.root.join("system").join("paths.d").join("svcd")
+    } else {
+        sandbox
+            .root
+            .join("system")
+            .join("profile.d")
+            .join("svcd.sh")
+    }
+}
+
+/// `--manual` starts from an init script; the launcher carries its own PATH, so
+/// the machine environment stays untouched (#311).
+#[test]
+fn a_manual_install_leaves_the_machine_path_alone() {
+    let sandbox = Sandbox::new();
+    let prefix = sandbox.root.join("manual-prefix");
+    let output = sandbox.run(&[
+        "--install",
+        "--manual",
+        "--prefix",
+        prefix.to_str().expect("utf8"),
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        !stdout(&output).contains("system PATH"),
+        "{}",
+        stdout(&output)
+    );
+    #[cfg(unix)]
+    assert!(!system_path_file(&sandbox).exists(), "no profile entry");
+}
+
 #[test]
 fn self_install_copies_aliases_and_uninstalls_without_touching_the_host() {
     let sandbox = Sandbox::new();
@@ -861,10 +912,36 @@ fn self_install_copies_aliases_and_uninstalls_without_touching_the_host() {
         stderr(&service_dry)
     );
     assert!(stdout(&service_dry).contains("service: program"));
+    // #311: every mode except `--manual` puts the prefix on the machine PATH;
+    // the dry run says so before touching anything.
+    assert!(
+        stdout(&service_dry).contains("to the system PATH"),
+        "{}",
+        stdout(&service_dry)
+    );
     assert!(!prefix.exists());
 
     let installed = sandbox.run(&["--install", "--prefix", prefix_arg, "--no-service"]);
     assert_eq!(installed.status.code(), Some(0), "{}", stderr(&installed));
+    // The development sandbox denies registry writes from every process it
+    // starts, so on Windows the installer may only be able to report the
+    // failure; the stored value is asserted where the host lets it write.
+    let install_out = stdout(&installed);
+    let install_err = stderr(&installed);
+    assert!(
+        install_out.contains("path: added")
+            || install_out.contains("path: updated")
+            || install_err.contains("could not update the system PATH"),
+        "{install_out}\nstderr: {install_err}"
+    );
+    #[cfg(unix)]
+    {
+        let file = system_path_file(&sandbox);
+        let text = fs::read_to_string(&file).unwrap_or_else(|error| {
+            panic!("{error}: {}", file.display());
+        });
+        assert!(text.contains(prefix_arg), "{text}");
+    }
     let exe = if cfg!(windows) { "svcd.exe" } else { "svcd" };
     assert!(prefix.join(exe).is_file());
     for alias in ["svc", "plugin", "mcp"] {
@@ -896,6 +973,18 @@ fn self_install_copies_aliases_and_uninstalls_without_touching_the_host() {
     let removed = sandbox.run(&["--uninstall", "--prefix", prefix_arg, "--no-service"]);
     assert_eq!(removed.status.code(), Some(0), "{}", stderr(&removed));
     assert!(!prefix.join(exe).exists());
+    #[cfg(unix)]
+    {
+        assert!(
+            !system_path_file(&sandbox).exists(),
+            "uninstall must take the entry back out"
+        );
+        assert!(
+            stdout(&removed).contains("path: removed from"),
+            "{}",
+            stdout(&removed)
+        );
+    }
     assert!(
         sandbox.config_dir().exists(),
         "default uninstall keeps config"
