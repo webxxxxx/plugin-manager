@@ -159,6 +159,10 @@ pub struct Settings {
     /// Allow installs to fall back to accepting a package whose signature
     /// cannot be verified. Default `false`: unsigned packages are rejected.
     pub allow_insecure_install: bool,
+    /// Ask which plugin root a package goes to (#299). Off means the host picks
+    /// the smallest root with room, which is what it did before the switch
+    /// existed. Unset counts as on: the console offers the choice.
+    pub manual_install_root: Option<bool>,
 }
 
 impl Settings {
@@ -303,6 +307,11 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
                         .parse::<SocketAddr>()
                         .map_err(|_| format!("line {}: invalid bind {:?}", index + 1, value))?,
                 );
+            }
+            "manual_install_root" => {
+                settings.manual_install_root = Some(parse_bool(value).ok_or_else(|| {
+                    format!("line {}: manual_install_root must be on or off", index)
+                })?)
             }
             "allow_insecure_install" => {
                 settings.allow_insecure_install = parse_bool(value).ok_or_else(|| {

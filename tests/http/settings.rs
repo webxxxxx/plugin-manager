@@ -97,10 +97,10 @@ fn settings_get_reports_values_sources_and_metadata() {
     let response = request(&address, "GET", "/api/v1/settings", "", b"");
     assert_eq!(response.status, 200, "{:?}", response.body);
     let keys = response.body["keys"].as_array().expect("keys");
-    // 56 live keys; `config_doc`'s own guard keeps the table honest, this pins
-    // that the route projects all of them (56 since `plugins_dir` came back as
-    // a configurable root list, ADR-0030).
-    assert_eq!(keys.len(), 56, "the screen shows every documented key");
+    // 57 live keys; `config_doc`'s own guard keeps the table honest, this pins
+    // that the route projects all of them (57 since `manual_install_root` was
+    // added beside the root list, #299).
+    assert_eq!(keys.len(), 57, "the screen shows every documented key");
     let by_key = |key: &str| {
         keys.iter()
             .find(|entry| entry["key"] == key)
@@ -613,4 +613,62 @@ fn a_plugin_root_that_holds_plugins_cannot_be_removed_from_the_settings_screen()
     let kept = save(&format!("{}, {}", internal.display(), card.display()));
     assert_eq!(kept.status, 200, "{:?}", kept.body);
     assert_eq!(kept.body["saved"], json!(["plugins_dir"]));
+}
+
+/// #299: the install-root switch is one host setting, and both surfaces read it
+/// from the host — the upload page through `/api/v1/settings`, the plugin store
+/// through `/api/v1/disk`. A save restarts the daemon like every other
+/// file-backed key, so the two cannot disagree after it comes back.
+#[test]
+fn the_install_root_switch_reaches_the_upload_page_and_the_store() {
+    let mut sandbox = Sandbox::new();
+    write_conf(&sandbox, "mem_budget_bytes = auto\n");
+    sandbox.start_daemon_as_user();
+    let address = sandbox.wait_for_http();
+
+    let before = request(&address, "GET", "/api/v1/disk", "", b"");
+    assert_eq!(
+        before.body["manualInstallRoot"],
+        json!(true),
+        "{:?}",
+        before.body
+    );
+
+    let started = daemon_starts(&sandbox);
+    let saved = request(
+        &address,
+        "PUT",
+        "/api/v1/settings",
+        "application/json",
+        br#"{"values":{"manual_install_root":"off"}}"#,
+    );
+    assert_eq!(saved.status, 200, "{:?}", saved.body);
+    assert_eq!(saved.body["saved"], json!(["manual_install_root"]));
+    assert_eq!(saved.body["restarting"], json!(true));
+
+    let address = wait_for_restarted(&sandbox, started, |address| {
+        try_request(address, "GET", "/api/v1/disk", "", b"")
+            .ok()
+            .map(|response| response.body["manualInstallRoot"] == json!(false))
+    });
+    let disk = request(&address, "GET", "/api/v1/disk", "", b"");
+    assert_eq!(
+        disk.body["manualInstallRoot"],
+        json!(false),
+        "{:?}",
+        disk.body
+    );
+    let settings = request(&address, "GET", "/api/v1/settings", "", b"");
+    let entry = settings.body["keys"]
+        .as_array()
+        .expect("keys")
+        .iter()
+        .find(|entry| entry["key"] == "manual_install_root")
+        .expect("manual_install_root")
+        .clone();
+    assert_eq!(entry["kind"], "bool", "{entry}");
+    assert_eq!(entry["editable"], true, "{entry}");
+    assert_eq!(entry["effective"], json!(false), "{entry}");
+    let text = fs::read_to_string(sandbox.config.join("svcd.conf")).expect("conf");
+    assert!(text.contains("manual_install_root = off"), "{text}");
 }

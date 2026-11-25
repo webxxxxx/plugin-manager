@@ -64,6 +64,13 @@ bind = 127.0.0.1:8787
 # it), because a root that is not there is not measurable and is never chosen
 # for a new install.
 # plugins_dir = /mnt/sd/svcd/plugins,/var/lib/svcd/plugins
+#
+# Whether an install asks which plugin root to use. On (default): the console
+# and the plugin store show a picker when more than one root is configured,
+# listing free space and how many plugins each root already holds. Off: the
+# host picks the smallest root with room and nothing is asked. Applies to both
+# upload installs and the plugin store.
+# manual_install_root = on
 
 # Removed keys and variables are ignored with a warning that names the derived
 # path: services_dir, temp_dir, SVCD_TEMP_DIR, SVCD_RUN_DIR, SVCD_TRUST_DIR.

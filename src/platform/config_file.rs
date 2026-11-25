@@ -212,6 +212,9 @@ pub fn generated(settings: &Settings) -> String {
          # default install root, and each installed plugin records its own root\n\
          # in {locations}:\n\
          # plugins_dir = {plugins},/mnt/sd/svcd/plugins\n\
+         # Ask which root a package goes to (on) or let the host pick the\n\
+         # smallest root with room (off). Upload and the plugin store share it.\n\
+         # manual_install_root = on\n\
          # Optional resource limits. On every start svcd derives a memory\n\
          # budget from this machine (free memory, the cgroup v2 limit, CPU\n\
          # count) and spends it according to a workload shape. MEM_LEVEL\n\

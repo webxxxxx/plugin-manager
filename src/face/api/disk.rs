@@ -30,6 +30,10 @@ impl ApiFace {
                     // must not borrow its parent's free space.
                     "freeBytes": crate::platform::locations::free_bytes(root),
                     "default": index == 0,
+                    // What the root already holds: the install picker shows it,
+                    // and it is the same count the settings screen locks a root
+                    // with (#298/#299).
+                    "plugins": crate::platform::locations::ids_in(paths, root).len(),
                     "plugin": (!wanted.is_empty())
                         .then(|| installed_plugin(root, &wanted))
                         .flatten(),
@@ -41,6 +45,10 @@ impl ApiFace {
             &json!({
                 "roots": roots,
                 "tempFreeBytes": temp_free_bytes(paths),
+                // Whether an install offers the roots or takes what the host
+                // picks (#299). Upload and the plugin store read the same flag,
+                // so the two surfaces cannot disagree.
+                "manualInstallRoot": self.config.settings.manual_install_root.unwrap_or(true),
             }),
         )
     }

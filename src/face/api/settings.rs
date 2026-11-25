@@ -347,6 +347,7 @@ fn effective(config: &crate::platform::config::Config, key: &str, bind: Option<&
         "bind" => json!(bind),
         "mcp_streaming" => json!(settings.mcp_streaming.unwrap_or(false)),
         "allow_insecure_install" => json!(settings.allow_insecure_install),
+        "manual_install_root" => json!(settings.manual_install_root.unwrap_or(true)),
         "auth_passwd" => json!(settings.auth_passwd.is_some()),
         "config_dir" => json!(paths.config_dir.to_string_lossy()),
         "data_dir" => json!(paths.data_dir.to_string_lossy()),
