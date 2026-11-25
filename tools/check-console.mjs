@@ -371,6 +371,34 @@ const CHECKS = [
       );
     },
   },
+  {
+    id: "login-submits-on-enter",
+    run(page) {
+      // The login card has one field and one button; a phone keyboard covers
+      // the button, so the field itself has to submit on Enter.
+      const handler =
+        /\$\('pass'\)\.addEventListener\('keydown', function \(event\) \{([\s\S]*?)\n\}\);/.exec(page);
+      if (!handler) {
+        throw new Error("the password field only submits through the button");
+      }
+      if (!/event\.key [!=]== 'Enter'/.test(handler[1])) {
+        throw new Error("the keydown handler must look at the Enter key");
+      }
+      if (!/preventDefault\(\)/.test(handler[1])) {
+        throw new Error("Enter must not fall through to the default action");
+      }
+      if (!/login\(\);/.test(handler[1])) {
+        throw new Error("Enter must call login(), the path the button takes");
+      }
+      return "the password field submits on Enter";
+    },
+    mutate(page) {
+      return page.replace(
+        "$('pass').addEventListener('keydown'",
+        "$('pass').addEventListener('keyup'",
+      );
+    },
+  },
 ];
 
 function runAll(page) {

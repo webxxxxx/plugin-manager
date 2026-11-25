@@ -1474,6 +1474,13 @@ function exportPlugin(id, kind) {
   }).finally(function () { lock(false); });
 }
 
+// Enter in the password field logs in, the same way the button does: on a
+// phone the keyboard covers the button, and this is the only field on the page.
+$('pass').addEventListener('keydown', function (event) {
+  if (event.key !== 'Enter') return;
+  event.preventDefault();
+  login();
+});
 $('file').addEventListener('change', install);
 $('trustfile').addEventListener('change', addTrust);
 document.addEventListener('click', function (event) {
