@@ -1004,6 +1004,25 @@ fn a_streamed_install_lands_on_the_root_the_request_names() {
         "the record names the root the plugin landed on"
     );
 
+    // #307: the install answered from a service built before the root was
+    // recorded, so the config path must come from the tree the package landed
+    // in — otherwise the console hides the 配置 button for a second root.
+    let services = request(&address, "GET", "/api/v1/services", "", b"");
+    let demo = services.body["services"]
+        .as_array()
+        .expect("services")
+        .iter()
+        .find(|item| item["id"] == "demo")
+        .expect("demo is listed");
+    assert_eq!(demo["hasConfig"], true, "{demo}");
+    let config = raw_request(&address, "GET", "/api/v1/config/demo", "", b"");
+    assert_eq!(
+        config.status,
+        200,
+        "the active config is on the root the plugin was installed to: {}",
+        String::from_utf8_lossy(&config.body)
+    );
+
     // The same id cannot be installed into a different root: that is the state
     // the location index exists to prevent.
     let refused = raw_request(
