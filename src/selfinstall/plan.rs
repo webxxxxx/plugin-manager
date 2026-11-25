@@ -853,8 +853,8 @@ pub(crate) fn resolve_install_root(
     default_prefix: PathBuf,
 ) -> PathBuf {
     prefix
-        .map(Path::to_path_buf)
-        .or_else(|| recorded.map(Path::to_path_buf))
+        .map(crate::platform::paths::normalize)
+        .or_else(|| recorded.map(crate::platform::paths::normalize))
         .unwrap_or(default_prefix)
 }
 

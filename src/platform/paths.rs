@@ -4,8 +4,13 @@ use std::path::{Path, PathBuf};
 use crate::platform::host::dirs;
 use crate::platform::settings::Settings;
 
-pub(crate) use crate::platform::host::dirs::platform_config_dir;
 pub use crate::platform::host::dirs::user_mode;
+pub(crate) use crate::platform::host::dirs::{normalize_text, platform_config_dir};
+
+/// [`normalize_text`] for a value that is already a path.
+pub(crate) fn normalize(path: &Path) -> PathBuf {
+    PathBuf::from(normalize_text(&path.to_string_lossy()))
+}
 
 /// Every directory the process uses, resolved once at the composition root.
 ///

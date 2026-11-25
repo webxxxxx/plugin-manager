@@ -572,7 +572,7 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
 }
 
 fn resolve(base: &Path, value: &str) -> PathBuf {
-    let path = PathBuf::from(value);
+    let path = PathBuf::from(crate::platform::host::dirs::normalize_text(value));
     if path.is_absolute() {
         path
     } else {
@@ -952,6 +952,30 @@ mod tests {
     /// Without an env override the document value survives the bootstrap pass;
     /// the override path itself is covered end to end by the tests that start a
     /// daemon with `SVCD_RESCAN_INTERVAL_MS`.
+    #[test]
+    fn a_configured_path_keeps_its_separators_on_other_hosts() {
+        let settings = parse("install_dir = /opt/svcd\n", Path::new("/etc/svcd")).expect("parse");
+        assert_eq!(settings.install_dir, Some(PathBuf::from("/opt/svcd")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_path_is_stored_with_backslashes() {
+        let settings = parse(
+            "install_dir = d:/svcd\nplugins_dir = d:/a/plugins,d:/b/plugins\n",
+            Path::new("C:\\config"),
+        )
+        .expect("parse");
+        assert_eq!(settings.install_dir, Some(PathBuf::from(r"d:\svcd")));
+        assert_eq!(
+            settings.plugins_dir,
+            vec![
+                PathBuf::from(r"d:\a\plugins"),
+                PathBuf::from(r"d:\b\plugins")
+            ]
+        );
+    }
+
     #[test]
     fn relative_install_dir_resolves_against_the_conf_directory() {
         let settings = parse("install_dir = sr/svcd\n", Path::new("/etc/svcd")).expect("parse");

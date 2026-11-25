@@ -2,6 +2,24 @@
 
 use super::*;
 
+#[test]
+fn an_install_root_is_spelled_the_way_this_host_writes_it() {
+    let expected = if cfg!(windows) {
+        PathBuf::from(r"d:\svcd")
+    } else {
+        PathBuf::from("d:/svcd")
+    };
+    assert_eq!(
+        resolve_install_root(Some(Path::new("d:/svcd")), None, PathBuf::from("/opt/svcd")),
+        expected
+    );
+    // The recorded `install_dir` takes the same path through the normalizer.
+    assert_eq!(
+        resolve_install_root(None, Some(Path::new("d:/svcd")), PathBuf::from("/opt/svcd")),
+        expected
+    );
+}
+
 fn args(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| value.to_string()).collect()
 }

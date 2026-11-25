@@ -7,6 +7,21 @@
 
 use std::path::PathBuf;
 
+/// Turn a configured path into the spelling this host uses.
+///
+/// Windows accepts `/` and `\` for the same directory, so a configured
+/// `d:/svcd` and the `d:/svcd\config` that a join produces read as two
+/// different trees in the settings sheet (#310). Every path crosses this
+/// boundary once, where text becomes a `PathBuf`; other hosts keep the text
+/// exactly as written.
+pub(crate) fn normalize_text(text: &str) -> String {
+    if cfg!(windows) {
+        text.replace('/', "\\")
+    } else {
+        text.to_string()
+    }
+}
+
 /// Mode 1: a non-root process uses its own profile. Root (or an explicit
 /// `SVCD_USER=0`) keeps the system-wide profile.
 pub fn user_mode() -> bool {
@@ -181,6 +196,37 @@ pub(crate) fn platform_data_dir() -> PathBuf {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_is_spelled_the_way_this_host_writes_it() {
+        assert_eq!(
+            normalize_text("d:/svcd"),
+            if cfg!(windows) { "d:\\svcd" } else { "d:/svcd" }
+        );
+        // A UNC share keeps its own spelling on every host.
+        assert_eq!(normalize_text("\\\\server\\share"), "\\\\server\\share");
+        assert_eq!(
+            normalize_text("\\\\?\\D:/x"),
+            if cfg!(windows) {
+                "\\\\?\\D:\\x"
+            } else {
+                "\\\\?\\D:/x"
+            }
+        );
+        // A single leading separator means "root of the current drive" on
+        // Windows, so it becomes a backslash like any other separator; running
+        // the normalizer twice changes nothing.
+        let once = normalize_text("/data/plugins");
+        assert_eq!(
+            once,
+            if cfg!(windows) {
+                "\\data\\plugins"
+            } else {
+                "/data/plugins"
+            }
+        );
+        assert_eq!(normalize_text(&once), once);
+    }
 
     #[test]
     fn system_config_is_machine_wide_and_not_in_a_user_profile() {
