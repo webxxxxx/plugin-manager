@@ -2,13 +2,13 @@
 //! restart work a stop can preempt. The action runs after the supervised
 //! process is gone, so the service is reported stopped only once it ends.
 
-use super::hook::{HookEnd, HookRun};
+use super::action::{ActionEnd, ActionRun};
 use super::*;
 
 /// The stop action's state. A stop can preempt a restart or a crash cleanup,
 /// so the flow remembers which of those events must resume once the hook ends.
 pub(super) struct StopFlow {
-    hook: Option<HookRun>,
+    hook: Option<ActionRun>,
     /// The stop action was already attempted for this process; a spawn failure
     /// is not retried.
     started: bool,
@@ -42,13 +42,13 @@ impl StopFlow {
         true
     }
 
-    pub(super) fn install(&mut self, run: HookRun) {
+    pub(super) fn install(&mut self, run: ActionRun) {
         self.hook = Some(run);
     }
 
     /// Poll the running hook; `None` while it is still alive. A hook past its
     /// deadline is killed here so the stop window cannot outlive it.
-    pub(super) fn poll(&mut self, now: u64) -> Option<HookEnd> {
+    pub(super) fn poll(&mut self, now: u64) -> Option<ActionEnd> {
         let run = self.hook.as_mut()?;
         let outcome = run.poll(now);
         if outcome.is_some() {
@@ -105,18 +105,14 @@ impl StopFlow {
 }
 
 impl Slot {
-    pub(super) fn ensure_stop_hook(&mut self, now: u64) -> bool {
+    pub(super) fn ensure_stop_action(&mut self, now: u64) -> bool {
         if self.stop.running() {
             return true;
         }
         if !self.stop.claim() {
             return false;
         }
-        let Some(hook) = self
-            .lifecycle
-            .as_ref()
-            .and_then(|lifecycle| lifecycle.stop.as_ref())
-        else {
+        let Some(hook) = self.stop_action() else {
             return false;
         };
         let command = hook_command(
@@ -126,8 +122,8 @@ impl Slot {
             &self.paths,
             self.plugin_dir.as_deref(),
         );
-        match stdio::spawn(command, Plan::stop_hook()) {
-            Ok((child, streams)) => {
+        match stdio::spawn(command, Plan::action()) {
+            Ok((mut child, streams)) => {
                 let _ = crate::platform::host::process::adopt(&child);
                 if let Some(tree) = &self.tree {
                     // The stop action's own children belong to the service tree.
@@ -151,36 +147,53 @@ impl Slot {
                         log,
                         &self.limits,
                     ) {
-                        error!("{}: stop hook stderr reader: {}", self.id, error);
+                        // Without a reader the action's stderr pipe fills and
+                        // blocks: drop the attempt instead of leaking a process
+                        // nobody holds.
+                        error!("{}: stop action stderr reader: {}", self.id, error);
+                        let _ = abandon(&mut child, error.to_string());
+                        return false;
                     }
                 }
-                info!("{}: stop hook started ({})", self.id, hook.path);
+                info!("{}: stop action started ({})", self.id, hook.path);
                 self.stop
-                    .install(HookRun::new(child, now.saturating_add(hook.timeout_ms)));
+                    .install(ActionRun::new(child, now.saturating_add(hook.timeout_ms)));
                 true
             }
             Err(error) => {
-                error!("{}: stop hook spawn failed: {}", self.id, error);
+                error!("{}: stop action spawn failed: {}", self.id, error);
                 false
             }
         }
     }
 
-    pub(super) fn check_stop_hook(&mut self, now: u64) {
+    pub(super) fn check_stop_action(&mut self, now: u64) {
         let Some(outcome) = self.stop.poll(now) else {
             return;
         };
         match outcome {
-            HookEnd::Exited(status) => {
+            ActionEnd::Exited(status) => {
                 info!("{}: stop action exited {}", self.id, status)
             }
-            HookEnd::TimedOut => error!("{}: stop action timed out", self.id),
+            ActionEnd::TimedOut => error!("{}: stop action timed out", self.id),
         }
         // The process exited first: apply that exit now. `Stopped` means the
         // stop action finished, not merely that the leader is gone.
-        if let Some((pid, code)) = self.exit_after_hook.take() {
+        if let Some((pid, code)) = self.exit_awaiting_action.take() {
             self.clear_process();
             self.apply(Event::Exited { pid, code }, now);
+            return;
+        }
+        // A stop arrived while the crash cleanup was still running: now that
+        // it is over, the stop can settle (the action already ran).
+        if std::mem::take(&mut self.stop_after_action) {
+            self.apply(Event::Stop, now);
+            if self.machine.state == State::Stopping && self.machine.pid.is_none() {
+                self.ensure_stop_action(now);
+                if !self.stop.running() {
+                    self.apply(Event::StopSettled, now);
+                }
+            }
             return;
         }
         // A stop preempted the pending restart: finish the stop, not the spawn.
@@ -213,9 +226,9 @@ impl Slot {
         }
     }
 
-    pub(super) fn abort_stop_hook(&mut self) {
+    pub(super) fn abort_stop_action(&mut self) {
         if self.stop.abort() {
-            warn!("{}: stop hook aborted", self.id);
+            warn!("{}: stop action aborted", self.id);
         }
     }
 
@@ -243,9 +256,53 @@ impl Slot {
         }
     }
 
-    /// No `stop` action was declared. Unix already has SIGTERM as the polite
-    /// signal; Windows has no signal for an exec-ready script, so kill directly
-    /// instead of burning the whole stop window waiting for nothing.
+    /// Ask the service to stop. The host terminates the process; the stop
+    /// action runs after it is gone, so a stop during the start action cancels
+    /// that action instead of waiting for it.
+    pub(crate) fn request_stop(&mut self, now: u64) {
+        self.abort_prelude();
+        // A stop action from the previous attempt may still be running (crash
+        // or pre-retry cleanup). Finishing it is part of the stop, so hold the
+        // settlement instead of letting the next start abort it.
+        if self.stop.running() && self.machine.state == State::Backoff {
+            self.stop_after_action = true;
+            return;
+        }
+        self.apply(Event::Stop, now);
+        // A service with no supervised process (a finished one-shot, or a
+        // definition whose process was never a child) has nothing to signal:
+        // the stop action is the whole stop.
+        if self.machine.state == State::Stopping && self.machine.pid.is_none() {
+            self.ensure_stop_action(now);
+            if !self.stop.running() {
+                self.apply(Event::StopSettled, now);
+            }
+        }
+    }
+
+    /// Apply a settled exit. A stop action still owed runs first, so the exit
+    /// that reports `Stopped` arrives after the cleanup, not before it.
+    pub(super) fn settle_exit(&mut self, pid: u32, code: Option<i32>, now: u64) {
+        let owes_stop = self.machine.state == State::Stopping
+            && self.stop_action().is_some()
+            && !self.stop.claimed();
+        if owes_stop {
+            self.exit_awaiting_action = Some((pid, code));
+            if self.ensure_stop_action(now) {
+                // The process is gone; only the action's own deadline applies.
+                // A kill window left armed here would fire StopTimeout and
+                // abort the cleanup it is supposed to bound (#324).
+                self.stop_deadline = None;
+                self.kill_deadline = None;
+                return;
+            }
+            // The action could not run; do not hold the stop hostage to it.
+            self.exit_awaiting_action = None;
+        }
+        self.clear_process();
+        self.apply(Event::Exited { pid, code }, now);
+    }
+
     /// Host-side termination. The stop action does not run here: it runs once
     /// the process is gone, so no plugin ever has to be the one that kills.
     pub(super) fn stop_now(&mut self) {
@@ -271,7 +328,7 @@ impl Slot {
             },
             if self.child.is_some() { "held" } else { "none" },
         );
-        self.abort_stop_hook();
+        self.abort_stop_action();
         // The leader may already be gone; the tree guard still owns the rest
         // (on Unix that is the process group handled below).
         if let Some(tree) = &self.tree {

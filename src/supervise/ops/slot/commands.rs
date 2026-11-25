@@ -63,12 +63,7 @@ fn build_action_command(
 
 /// The `SVCD_*` surface a core service process receives. Core services are
 /// written by the operator, so they keep the daemon's directory roots.
-pub(crate) fn apply_core_child_env(
-    command: &mut Command,
-    id: &str,
-    action: &str,
-    paths: &Paths,
-) {
+pub(crate) fn apply_core_child_env(command: &mut Command, id: &str, action: &str, paths: &Paths) {
     command
         .env("SVCD_SERVICE_ID", id)
         .env("SVCD_ACTION", action)

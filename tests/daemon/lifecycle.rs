@@ -451,20 +451,11 @@ fn a_failing_start_action_keeps_the_process_from_spawning() {
     assert_ne!(sandbox.status("demo")["summary"]["state"], "running");
 }
 
-/// #323: the stop action runs after the process is gone, and `Stopped` waits
-/// for it. Returning earlier would let the next start abort the cleanup.
-#[test]
-fn stopping_waits_for_the_stop_action() {
-    let mut sandbox = Sandbox::new();
-    let marker = sandbox.root.join("slow-stop.txt");
-    let runner = write_runner(
-        &sandbox,
-        if cfg!(windows) {
-            "runner.cmd"
-        } else {
-            "runner.sh"
-        },
-    );
+/// A definition whose process never exits on its own and whose stop action
+/// takes about a second: the settle-order tests need the action to outlive a
+/// quick `svc stop`.
+fn slow_stop_definition(sandbox: &Sandbox, marker: &Path, runner: &str, stop: &str) -> Value {
+    let runner = write_runner(sandbox, runner);
     #[cfg(windows)]
     let stop_body = format!(
         "@echo off\r\nping -n 2 127.0.0.1 >nul\r\necho stop>>\"{}\"\r\n",
@@ -475,16 +466,8 @@ fn stopping_waits_for_the_stop_action() {
         "#!/bin/sh\nsleep 1\necho stop >> \"{}\"\n",
         marker.display()
     );
-    let stop = write_hook(
-        &sandbox,
-        if cfg!(windows) {
-            "slow-stop.cmd"
-        } else {
-            "slow-stop.sh"
-        },
-        &stop_body,
-    );
-    let definition = json!({
+    let stop = write_hook(sandbox, stop, &stop_body);
+    json!({
         "schema": 1,
         "id": "demo",
         "version": "1.0.0",
@@ -493,7 +476,29 @@ fn stopping_waits_for_the_stop_action() {
         "exec": exec_ready(&runner),
         "restart": "never",
         "lifecycle": {"stop": {"path": stop.to_string_lossy(), "args": []}}
-    });
+    })
+}
+
+/// #323: the stop action runs after the process is gone, and `Stopped` waits
+/// for it. Returning earlier would let the next start abort the cleanup.
+#[test]
+fn stopping_waits_for_the_stop_action() {
+    let mut sandbox = Sandbox::new();
+    let marker = sandbox.root.join("slow-stop.txt");
+    let definition = slow_stop_definition(
+        &sandbox,
+        &marker,
+        if cfg!(windows) {
+            "runner.cmd"
+        } else {
+            "runner.sh"
+        },
+        if cfg!(windows) {
+            "slow-stop.cmd"
+        } else {
+            "slow-stop.sh"
+        },
+    );
     write_json_definition(&sandbox, "demo", &definition);
     sandbox.start_daemon();
 
@@ -521,43 +526,20 @@ fn stopping_waits_for_the_stop_action() {
 fn a_restart_does_not_abort_the_stop_action() {
     let mut sandbox = Sandbox::new();
     let marker = sandbox.root.join("restart-stop.txt");
-    let runner = write_runner(
+    let definition = slow_stop_definition(
         &sandbox,
+        &marker,
         if cfg!(windows) {
             "restart-runner.cmd"
         } else {
             "restart-runner.sh"
         },
-    );
-    #[cfg(windows)]
-    let stop_body = format!(
-        "@echo off\r\nping -n 2 127.0.0.1 >nul\r\necho stop>>\"{}\"\r\n",
-        marker.display()
-    );
-    #[cfg(unix)]
-    let stop_body = format!(
-        "#!/bin/sh\nsleep 1\necho stop >> \"{}\"\n",
-        marker.display()
-    );
-    let stop = write_hook(
-        &sandbox,
         if cfg!(windows) {
             "restart-stop.cmd"
         } else {
             "restart-stop.sh"
         },
-        &stop_body,
     );
-    let definition = json!({
-        "schema": 1,
-        "id": "demo",
-        "version": "1.0.0",
-        "desc": "restart cleanup",
-        "protocol": 1,
-        "exec": exec_ready(&runner),
-        "restart": "never",
-        "lifecycle": {"stop": {"path": stop.to_string_lossy(), "args": []}}
-    });
     write_json_definition(&sandbox, "demo", &definition);
     sandbox.start_daemon();
 
@@ -633,6 +615,231 @@ fn the_stop_action_runs_after_the_process_is_gone() {
         "gone",
         "the stop action saw a live process: {text}"
     );
+}
+
+/// The Windows counterpart of the ordering proof: the runner holds the file
+/// exclusively, so the stop action can only open it once the process is gone.
+#[cfg(windows)]
+#[test]
+fn the_stop_action_sees_an_exited_process_on_windows() {
+    let mut sandbox = Sandbox::new();
+    let marker = sandbox.root.join("win-exit.txt");
+    let lock = sandbox.root.join("win-lock.tmp");
+    let runner = sandbox.root.join("win-runner.ps1");
+    fs::write(
+        &runner,
+        format!(
+            "$f=[IO.File]::Open('{}','OpenOrCreate','ReadWrite','None')\nStart-Sleep -Seconds 60\n",
+            lock.display()
+        ),
+    )
+    .expect("runner");
+    let stop = sandbox.root.join("win-stop.cmd");
+    fs::write(
+        &stop,
+        format!(
+            "@echo off\r\npowershell -NoProfile -Command \"try {{ $f=[IO.File]::Open('{}','Open','ReadWrite','None'); $f.Dispose(); 'gone' }} catch {{ 'alive' }}\" > \"{}\"\r\n",
+            lock.display(),
+            marker.display()
+        ),
+    )
+    .expect("stop action");
+    let definition = json!({
+        "schema": 1,
+        "id": "demo",
+        "version": "1.0.0",
+        "desc": "windows stop order",
+        "protocol": 1,
+        "exec": {
+            "path": r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", runner.to_string_lossy()],
+            "ready": "exec"
+        },
+        "restart": "never",
+        "lifecycle": {"stop": {"path": stop.to_string_lossy(), "args": []}}
+    });
+    write_json_definition(&sandbox, "demo", &definition);
+    sandbox.start_daemon();
+
+    assert_eq!(
+        sandbox.start_when_ready("demo").status.code(),
+        Some(0),
+        "start failed"
+    );
+    wait_until("the runner lock", Duration::from_secs(15), || {
+        lock.is_file()
+    });
+    assert_eq!(sandbox.stop("demo").status.code(), Some(0), "stop failed");
+    wait_until("the stop action verdict", Duration::from_secs(15), || {
+        marker.is_file()
+    });
+    let verdict = fs::read_to_string(&marker).unwrap_or_default();
+    assert_eq!(
+        verdict.trim(),
+        "gone",
+        "the stop action saw a live process: {verdict}"
+    );
+}
+
+/// #324: an instance that will not be restarted still gets its stop action
+/// before the service settles.
+#[test]
+fn a_crash_without_restart_runs_the_stop_action() {
+    let mut sandbox = Sandbox::new();
+    let marker = sandbox.root.join("crash-stop.txt");
+    #[cfg(windows)]
+    let crash_body = "@echo off\r\nexit /b 1\r\n";
+    #[cfg(unix)]
+    let crash_body = "#!/bin/sh\nexit 1\n";
+    let crash = write_hook(
+        &sandbox,
+        if cfg!(windows) {
+            "crash.cmd"
+        } else {
+            "crash.sh"
+        },
+        crash_body,
+    );
+    let stop = sandbox.write_hook_script("crash-stop", &marker);
+    let definition = json!({
+        "schema": 1,
+        "id": "demo",
+        "version": "1.0.0",
+        "desc": "crashes without restart",
+        "protocol": 1,
+        "exec": exec_ready(&crash),
+        "restart": "never",
+        "lifecycle": {"stop": {"path": stop.to_string_lossy(), "args": []}}
+    });
+    write_json_definition(&sandbox, "demo", &definition);
+    sandbox.start_daemon();
+
+    let _ = sandbox.run_svc(&["start", "demo"]);
+    wait_until(
+        "the cleanup of the crashed instance",
+        Duration::from_secs(10),
+        || {
+            fs::read_to_string(&marker)
+                .map(|text| text.contains("stop"))
+                .unwrap_or(false)
+        },
+    );
+    wait_until("the settled state", Duration::from_secs(10), || {
+        sandbox.status("demo")["summary"]["state"] == "stopped"
+    });
+}
+
+/// #324: a clean one-shot exit keeps the service running without running the
+/// stop action; the action belongs to the explicit stop.
+#[test]
+fn a_finished_one_shot_keeps_its_stop_action_for_the_explicit_stop() {
+    let mut sandbox = Sandbox::new();
+    let marker = sandbox.root.join("once-stop.txt");
+    let stop = sandbox.write_hook_script("once-stop", &marker);
+    let (path, args) = if cfg!(windows) {
+        (r"C:\Windows\System32\cmd.exe", json!(["/c", "exit", "0"]))
+    } else {
+        ("/bin/true", json!([]))
+    };
+    let definition = json!({
+        "schema": 1,
+        "id": "once",
+        "version": "1.0.0",
+        "desc": "one shot",
+        "protocol": 1,
+        "exec": {"path": path, "args": args, "ready": "exec"},
+        "restart": "never",
+        "remain_after_exit": true,
+        "lifecycle": {"stop": {"path": stop.to_string_lossy(), "args": []}}
+    });
+    write_json_definition(&sandbox, "once", &definition);
+    sandbox.start_daemon_ready();
+
+    wait_until("the one-shot to finish", Duration::from_secs(15), || {
+        let status = sandbox.status("once");
+        status["summary"]["state"] == "running" && status["summary"]["pid"].is_null()
+    });
+    assert!(
+        !marker.exists(),
+        "the stop action ran when the one-shot finished"
+    );
+    assert_eq!(sandbox.stop_service("once")["summary"]["state"], "stopped");
+    assert!(
+        fs::read_to_string(&marker)
+            .map(|text| text.contains("stop"))
+            .unwrap_or(false),
+        "the explicit stop did not run the stop action"
+    );
+}
+
+/// #324: a stop that arrives while the pre-retry cleanup is running waits for
+/// that cleanup instead of settling early (the next start would abort it).
+#[test]
+fn a_stop_during_the_retry_cleanup_settles_after_the_action() {
+    let mut sandbox = Sandbox::new();
+    let marker = sandbox.root.join("retry-stop.txt");
+    #[cfg(windows)]
+    let crash_body = "@echo off\r\nexit /b 1\r\n";
+    #[cfg(unix)]
+    let crash_body = "#!/bin/sh\nexit 1\n";
+    let crash = write_hook(
+        &sandbox,
+        if cfg!(windows) {
+            "retry-crash.cmd"
+        } else {
+            "retry-crash.sh"
+        },
+        crash_body,
+    );
+    #[cfg(windows)]
+    let stop_body = format!(
+        "@echo off\r\nping -n 2 127.0.0.1 >nul\r\necho stop>>\"{}\"\r\n",
+        marker.display()
+    );
+    #[cfg(unix)]
+    let stop_body = format!(
+        "#!/bin/sh\nsleep 1\necho stop >> \"{}\"\n",
+        marker.display()
+    );
+    let stop = write_hook(
+        &sandbox,
+        if cfg!(windows) {
+            "retry-stop.cmd"
+        } else {
+            "retry-stop.sh"
+        },
+        &stop_body,
+    );
+    let definition = json!({
+        "schema": 1,
+        "id": "demo",
+        "version": "1.0.0",
+        "desc": "retry cleanup",
+        "protocol": 1,
+        "exec": exec_ready(&crash),
+        "restart": "on-failure",
+        "lifecycle": {"stop": {"path": stop.to_string_lossy(), "args": []}}
+    });
+    write_json_definition(&sandbox, "demo", &definition);
+    sandbox.start_daemon();
+
+    let _ = sandbox.run_svc(&["start", "demo"]);
+    // The crash schedules a retry; its pre-retry cleanup is a stop action.
+    wait_until("the pre-retry cleanup", Duration::from_secs(10), || {
+        sandbox.daemon_log().contains("stop action started")
+    });
+    let began = Instant::now();
+    let stopped = sandbox.stop("demo");
+    assert_eq!(stopped.status.code(), Some(0), "stop failed");
+    assert!(
+        began.elapsed() >= Duration::from_millis(400),
+        "stop returned after {:?}, before the running cleanup finished",
+        began.elapsed()
+    );
+    assert_eq!(sandbox.status("demo")["summary"]["state"], "stopped");
+    assert!(fs::read_to_string(&marker)
+        .map(|text| text.contains("stop"))
+        .unwrap_or(false));
 }
 
 #[test]

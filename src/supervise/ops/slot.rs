@@ -19,11 +19,11 @@ use crate::wire::contract::RAW_PROTOCOL;
 use crate::wire::message::ipc;
 use crate::wire::message::rpc;
 
+use self::action::{ActionEnd, ActionRun};
 use self::calls::PendingCalls;
 use self::commands::{abandon, apply_core_child_env, command_for};
 use self::frames::Frames;
 use self::handle::SlotRequest;
-use self::hook::{HookEnd, HookRun};
 use self::stop::StopFlow;
 
 pub(crate) use self::commands::{apply_plugin_child_env, hook_command};
@@ -74,16 +74,19 @@ pub(crate) struct Slot {
     stop: StopFlow,
     /// The start action (`lifecycle.start`) running before the process spawns.
     /// It is a preparation step: the process only starts once it exits.
-    prelude: Option<HookRun>,
+    prelude: Option<ActionRun>,
     /// The process exited while the stop action was still owed. The exit is
     /// applied once that action ends, so `Stopped` means the cleanup finished.
-    exit_after_hook: Option<(u32, Option<i32>)>,
+    exit_awaiting_action: Option<(u32, Option<i32>)>,
+    /// A stop request arrived while a stop action was still running; it is
+    /// applied when that action ends.
+    stop_after_action: bool,
     /// The whole service tree; on Unix the process group is the tree and this
     /// stays `None` (the platform returns no handle there).
     tree: Option<crate::platform::host::process::Tree>,
     /// The leader exited but other group members are still alive; the service
     /// stays `Running` until the whole group is gone.
-    pending_exit: Option<Option<i32>>,
+    exit_while_group_alive: Option<Option<i32>>,
     ping_id: u64,
     /// This slot was rebuilt from a runtime record after a daemon restart, so
     /// there is no `Child` handle: liveness is polled through the process group.
@@ -148,9 +151,10 @@ impl Slot {
             kill_deadline: None,
             stop: StopFlow::new(),
             prelude: None,
-            exit_after_hook: None,
+            exit_awaiting_action: None,
+            stop_after_action: false,
             tree: None,
-            pending_exit: None,
+            exit_while_group_alive: None,
             ping_id: 1,
             adopted: false,
             contract: None,
@@ -203,6 +207,20 @@ impl Slot {
 
     pub(crate) fn set_lifecycle(&mut self, lifecycle: Option<Lifecycle>) {
         self.lifecycle = lifecycle;
+    }
+
+    /// The definition's start action (a preparation step), if any.
+    fn start_action(&self) -> Option<&crate::kernel::registry::Hook> {
+        self.lifecycle
+            .as_ref()
+            .and_then(|lifecycle| lifecycle.start.as_ref())
+    }
+
+    /// The definition's stop action (cleanup after the process is gone), if any.
+    fn stop_action(&self) -> Option<&crate::kernel::registry::Hook> {
+        self.lifecycle
+            .as_ref()
+            .and_then(|lifecycle| lifecycle.stop.as_ref())
     }
 
     pub(crate) fn set_restart(&mut self, restart: Restart) {
@@ -306,29 +324,12 @@ impl Slot {
         self.raw_hub = hub;
     }
 
-    /// Ask the service to stop. The host terminates the process; the stop
-    /// action runs after it is gone, so a stop during the start action cancels
-    /// that action instead of waiting for it.
-    pub(crate) fn request_stop(&mut self, now: u64) {
-        self.abort_prelude();
-        self.apply(Event::Stop, now);
-        // A service with no supervised process (a finished one-shot, or a
-        // definition whose process was never a child) has nothing to signal:
-        // the stop action is the whole stop.
-        if self.machine.state == State::Stopping && self.machine.pid.is_none() {
-            self.ensure_stop_hook(now);
-            if !self.stop.running() {
-                self.apply(Event::StopSettled, now);
-            }
-        }
-    }
-
     pub(crate) fn pump(&mut self, now: u64) {
         self.drain_requests(now);
         self.drain_frames(now);
         self.check_prelude(now);
         self.check_exit(now);
-        self.check_stop_hook(now);
+        self.check_stop_action(now);
         self.check_timers(now);
         self.sync_health();
     }
@@ -350,7 +351,7 @@ impl Slot {
         for action in actions {
             match action {
                 Action::Spawn => {
-                    self.abort_stop_hook();
+                    self.abort_stop_action();
                     self.abort_prelude();
                     self.stop.reset();
                     self.fail_pending("service is restarting");
@@ -371,15 +372,23 @@ impl Slot {
                 // run the stop action before the next attempt, like the shell
                 // `svcd` worker does (`run_stop` before the retry sleep).
                 Action::ArmBackoff { .. } => {
-                    self.ensure_stop_hook(now);
+                    self.ensure_stop_action(now);
                 }
                 // A stable service that just crashed also gets its stop action
                 // before the replacement starts.
                 Action::Cleanup => {
-                    if self.ensure_stop_hook(now) {
+                    if self.ensure_stop_action(now) {
                         self.stop.defer_cleanup();
                     } else {
                         self.apply(Event::RestartReady, now);
+                    }
+                }
+                // The instance is not coming back: the stop action still owns
+                // its cleanup, and `Stopped` waits for it (`check_stop_action`
+                // sends StopSettled).
+                Action::CleanupThenStop => {
+                    if !self.ensure_stop_action(now) {
+                        self.apply(Event::StopSettled, now);
                     }
                 }
                 Action::Publish => {}
@@ -389,6 +398,12 @@ impl Slot {
                     // never run; a stop action already cleaning up is allowed
                     // to finish (it is bounded by its own timeout).
                     self.abort_prelude();
+                    // No process is left to settle, but the attempt may have
+                    // created resources: the stop action cleans them up, like
+                    // every other exit path.
+                    if self.machine.pid.is_none() && !self.stop.claimed() {
+                        self.ensure_stop_action(now);
+                    }
                     self.give_up();
                 }
             }
@@ -396,7 +411,7 @@ impl Slot {
     }
 
     fn spawn_process(&mut self) -> Result<u32, String> {
-        self.pending_exit = None;
+        self.exit_while_group_alive = None;
         if self.tree.is_none() {
             self.tree = crate::platform::host::process::Tree::new();
             if self.tree.is_none() {
@@ -566,7 +581,7 @@ impl Slot {
             if pid.is_some() && self.group_alive() {
                 // The leader is gone but the service tree is not. Keep the
                 // service Running and settle the exit once the group is empty.
-                self.pending_exit = Some(status.code());
+                self.exit_while_group_alive = Some(status.code());
                 return;
             }
             if let Some(pid) = pid {
@@ -575,39 +590,17 @@ impl Slot {
             }
             return;
         }
-        let Some(code) = self.pending_exit else {
+        let Some(code) = self.exit_while_group_alive else {
             return;
         };
         if self.group_alive() {
             return;
         }
-        self.pending_exit = None;
+        self.exit_while_group_alive = None;
         if let Some(pid) = self.machine.pid {
             self.note_exit(pid, code, "pending exit");
             self.settle_exit(pid, code, now);
         }
-    }
-
-    /// Apply a settled exit. A stop action still owed runs first, so the exit
-    /// that reports `Stopped` arrives after the cleanup, not before it.
-    fn settle_exit(&mut self, pid: u32, code: Option<i32>, now: u64) {
-        let owes_stop = self.machine.state == State::Stopping
-            && self
-                .lifecycle
-                .as_ref()
-                .and_then(|lifecycle| lifecycle.stop.as_ref())
-                .is_some()
-            && !self.stop.claimed();
-        if owes_stop {
-            self.exit_after_hook = Some((pid, code));
-            if self.ensure_stop_hook(now) {
-                return;
-            }
-            // The action could not run; do not hold the stop hostage to it.
-            self.exit_after_hook = None;
-        }
-        self.clear_process();
-        self.apply(Event::Exited { pid, code }, now);
     }
 
     /// One line per settled exit: the code decides restart vs stop, so the
@@ -685,16 +678,16 @@ impl Slot {
         self.start_deadline = None;
         self.stop_deadline = None;
         self.kill_deadline = None;
-        self.pending_exit = None;
-        self.exit_after_hook = None;
+        self.exit_while_group_alive = None;
+        self.exit_awaiting_action = None;
     }
 }
 
+mod action;
 mod calls;
 mod commands;
 mod frames;
 mod handle;
-mod hook;
 mod prelude;
 mod stop;
 
