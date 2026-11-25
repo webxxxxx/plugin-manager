@@ -56,16 +56,17 @@
   .modal pre { background:#f7f8fa; border:1px solid var(--line); border-radius:4px; padding:10px; max-height:50vh; overflow:auto; font-size:12px; white-space:pre-wrap; word-break:break-all; }
   .modal pre.logs { height:382px; max-height:none; overflow:auto; line-height:1.5; }
   /* Settings uses the log dialog shell: a fixed head/foot, the body scrolls. */
-  .modal .panel.sheet { display:flex; flex-direction:column; max-height:90vh; overflow:hidden; padding:0; min-width:0; }
+  .modal .panel.sheet { display:flex; flex-direction:column; height:min(720px,90vh); max-height:90vh; overflow:hidden; padding:0; min-width:0; }
   .sheet .sheet-head { flex:none; padding:16px 21px 0; min-width:0; }
   .sheet .sheet-head h1 { font-size:16px; margin:0; }
   .sheet .sheet-head .muted { overflow-wrap:anywhere; }
   .sheet .sheet-body { flex:1 1 auto; min-height:0; min-width:0; overflow:auto; padding:0 21px 4px; }
   .sheet .sheet-foot { flex:none; display:flex; justify-content:flex-end; gap:8px; padding:12px 21px 16px; border-top:1px solid var(--line); min-width:0; }
-  /* One page per setting group. The strip scrolls sideways on a phone instead
-     of wrapping into two rows; the active tab is the panel's own white so the
-     border below reads as an underline. */
-  .sheet-tabs { flex:none; display:flex; gap:4px; padding:10px 21px 0; overflow-x:auto; -webkit-overflow-scrolling:touch; border-bottom:1px solid var(--line); }
+  /* One page per setting group. The strip wraps instead of scrolling sideways:
+     a scrollbar on a six-tab strip hides tabs and says nothing about them. The
+     active tab is the panel's own white so the border below reads as an
+     underline. */
+  .sheet-tabs { flex:none; display:flex; flex-wrap:wrap; gap:4px; padding:10px 21px 0; border-bottom:1px solid var(--line); }
   .sheet-tabs button { flex:0 0 auto; padding:6px 10px; font-size:13px; border:1px solid transparent; border-radius:6px 6px 0 0; background:transparent; color:var(--muted); }
   .sheet-tabs button:hover { color:var(--blue); }
   .sheet-tabs button.active { background:#fff; color:var(--blue); font-weight:600; border-color:var(--line); border-bottom-color:#fff; margin-bottom:-1px; }
@@ -76,19 +77,18 @@
   .setting:last-child { border-bottom:0; }
   .setting-label { display:flex; align-items:center; gap:6px; min-width:0; }
   .setting-name { font-size:13px; font-weight:600; }
-  .setting-source { font-size:11px; color:var(--muted); white-space:nowrap; }
   .setting-control { display:flex; align-items:center; gap:6px; flex-wrap:wrap; min-width:0; }
   .setting-control > input[type=text] { width:100%; }
   .setting-control .readonly { font-size:13px; word-break:break-all; }
   /* Plugin roots are a list, not one path: a row per root, `x` per row. */
   .roots { display:flex; flex-direction:column; gap:4px; width:100%; }
-  .root-row { display:flex; align-items:center; gap:6px; min-width:0; }
-  .root-row input[type=text] { flex:1 1 auto; min-width:0; }
+  .root-row, .root-add { display:flex; align-items:center; gap:6px; min-width:0; }
+  .root-row .root-row-path { flex:1 1 auto; min-width:0; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .root-row .roots-note { flex:none; font-size:11px; color:var(--muted); }
-  .root-row .root-row-path { flex:0 1 auto; min-width:0; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .root-row.locked input[type=text] { background:#f7f8fa; color:var(--muted); }
-  .root-row button { flex:none; padding:3px 8px; font-size:12px; }
+  .root-row button, .root-add button { flex:none; padding:3px 8px; font-size:12px; }
   .root-row button:disabled { opacity:.45; cursor:not-allowed; }
+  .root-add { margin-top:2px; }
+  .root-add input[type=text] { flex:1 1 auto; min-width:0; }
   .help { flex:none; width:17px; height:17px; padding:0; border:1px solid #c7d0da; border-radius:50%; background:#fff; color:#7b8794; font-size:11px; line-height:1; cursor:help; }
   .help:hover, .help:focus-visible { border-color:var(--blue); color:var(--blue); }
   #tip { position:fixed; z-index:1002; max-width:min(360px, calc(100vw - 24px)); padding:10px 12px; border-radius:6px; background:#2b3038; color:#fff; font-size:12px; line-height:1.6; box-shadow:0 8px 28px rgba(0,0,0,.28); pointer-events:none; }
@@ -834,65 +834,55 @@ function showLogsModal(target, text) {
   pre.scrollTop = pre.scrollHeight;
 }
 
-// Plugin roots are a list, and the list *is* the priority order (#298): `+`
-// appends another volume, `x` stops using one. Two rows are locked — the default
-// install root (dropping or moving it would change where the host installs by
-// default) and any root that still holds plugins, which the host refuses too.
-// Empty rows only exist while being typed; they are dropped when saving.
+// Plugin roots are a list, and the list *is* the priority order (#298): a root
+// is added or removed, never rewritten. Re-typing an occupied path is the move
+// the host refuses with a 409, and a typo is corrected by removing the row and
+// adding the right one. The default root and every root that still holds
+// plugins cannot be removed; the host refuses the same removal server-side.
 function pluginRootsField(entry, mark, unmark) {
   const wrap = document.createElement('div');
   wrap.className = 'roots';
   const rows = [];
   const roots = Array.isArray(entry.roots) ? entry.roots : [];
   const initial = roots
-    .map(function (root) { return root.path.trim(); })
+    .map(function (root) { return String(root.path || '').trim(); })
     .filter(function (path) { return path; })
     .join(',');
 
   function sync() {
-    const paths = [];
-    rows.forEach(function (item) {
-      const value = item.input.value.trim();
-      if (value) paths.push(value);
-    });
-    const joined = paths.join(',');
+    const joined = rows.map(function (item) { return item.path; }).join(',');
     if (joined === initial) unmark(entry.key);
     else mark(entry.key, joined);
   }
 
-  function addRow(root) {
-    const path = root && root.path ? root.path : '';
-    const plugins = (root && root.plugins) || 0;
-    const locked = Boolean(root && (root.default || plugins > 0));
+  function addRow(path, plugins, locked) {
     const row = document.createElement('div');
-    row.className = 'root-row' + (locked ? ' locked' : '');
+    row.className = 'root-row';
 
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.value = path;
-    input.readOnly = locked;
-    input.placeholder = '/mnt/sd/svcd/plugins';
-    input.oninput = sync;
-    row.appendChild(input);
+    const text = document.createElement('span');
+    text.className = 'root-row-path';
+    text.textContent = path;
+    text.title = path;
+    row.appendChild(text);
 
-    const note = document.createElement('span');
-    note.className = 'roots-note';
-    if (root && root.default) note.textContent = '默认安装根';
-    else if (plugins > 0) note.textContent = plugins + ' 个插件';
-    row.appendChild(note);
+    if (plugins > 0) {
+      const note = document.createElement('span');
+      note.className = 'roots-note';
+      note.textContent = plugins + ' 个插件';
+      row.appendChild(note);
+    }
 
-    const item = { row: row, input: input, locked: locked };
+    const item = { row: row, path: path };
     const remove = button('x', 'ghost', function () {
-      if (item.locked) return;
+      if (locked) return;
       const at = rows.indexOf(item);
       if (at >= 0) rows.splice(at, 1);
       row.remove();
       sync();
     });
-    remove.textContent = 'x';
     remove.title = locked
-      ? (root && root.default ? '默认安装根，不能删' : '还有插件在这个根上，先移走或卸载')
-      : '删除这一行';
+      ? (plugins > 0 ? '还有插件在这个根上，先移走或卸载' : '宿主自己的根，不能删')
+      : '不再使用这个根';
     remove.disabled = locked;
     row.appendChild(remove);
 
@@ -901,13 +891,42 @@ function pluginRootsField(entry, mark, unmark) {
     return item;
   }
 
-  roots.forEach(function (root) { addRow(root); });
+  roots.forEach(function (root) {
+    const path = String(root.path || '').trim();
+    if (!path) return;
+    const plugins = Number(root.plugins || 0);
+    // The default root is the host's own: dropping it would silently change
+    // where an install lands when nothing is configured.
+    addRow(path, plugins, Boolean(root.default) || plugins > 0);
+  });
+
+  // A typed path becomes a row when it is added, and from then on it is a path
+  // like any other. Nothing half-typed can reach the document.
+  const draft = document.createElement('div');
+  draft.className = 'root-add';
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.placeholder = '/mnt/sd/svcd/plugins';
   const add = button('+ 新增根', 'ghost', function () {
-    const item = addRow(null);
-    item.input.focus();
+    const path = input.value.trim();
+    if (!path) return;
+    if (rows.some(function (item) { return item.path === path; })) {
+      toast('这个根已经在列表里');
+      return;
+    }
+    input.value = '';
+    addRow(path, 0, false);
     sync();
   });
-  wrap.appendChild(add);
+  input.onkeydown = function (event) {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      add.click();
+    }
+  };
+  draft.appendChild(input);
+  draft.appendChild(add);
+  wrap.appendChild(draft);
   return wrap;
 }
 
@@ -1098,10 +1117,6 @@ function showSettingsModal(data) {
       value.className = 'readonly';
       value.textContent = settingsValueText(entry.effective, entry.kind);
       control.appendChild(value);
-      const readOnly = document.createElement('span');
-      readOnly.className = 'setting-source';
-      readOnly.textContent = '只读';
-      control.appendChild(readOnly);
     } else if (entry.kind === 'bool') {
       const select = document.createElement('select');
       [['on', '开'], ['off', '关']].forEach(function (option) {
