@@ -1543,9 +1543,14 @@ fn the_disk_route_lists_every_configured_root_in_priority_order() {
     assert_eq!(roots[0]["default"], true);
     assert_eq!(roots[1]["default"], false);
     assert!(
-        roots[0]["freeBytes"].as_u64().unwrap_or(0) > 0
-            && roots[1]["freeBytes"].as_u64().unwrap_or(0) > 0,
-        "both roots report bytes: {body}"
+        roots[0]["freeBytes"].as_u64().unwrap_or(0) > 0,
+        "the default root exists, so it reports bytes: {body}"
+    );
+    // A configured root that does not exist is unmeasurable: reporting the
+    // parent filesystem's space would let an install land on the wrong disk.
+    assert!(
+        roots[1]["freeBytes"].is_null(),
+        "an absent root reports null, not its parent's bytes: {body}"
     );
 }
 
