@@ -180,6 +180,41 @@ fn spawn_uninstall_helper(args: &[String]) -> i32 {
     }
 }
 
+/// Take the install prefix back out of the machine PATH (#311).
+///
+/// A system install is `--manual`-less by construction (`--manual` is rejected
+/// on uninstall), so there is no flag to consult: a prefix that was never added
+/// makes this a no-op.
+fn remove_install_path(root: &Path) {
+    if super::system_path::skipped() {
+        println!("path: skipped (test hook)");
+        return;
+    }
+    #[cfg(windows)]
+    match super::system_path::machine_key() {
+        Some((hive, subkey)) => match super::system_path::remove_system_path(hive, &subkey, root) {
+            Ok(true) => println!("path: removed {} from the system PATH", root.display()),
+            Ok(false) => {}
+            Err(error) => eprintln!("svcd: warning: could not update the system PATH: {}", error),
+        },
+        None => eprintln!(
+            "svcd: warning: could not update the system PATH: SVCD_TEST_SYSTEM_PATH_KEY is malformed"
+        ),
+    }
+    #[cfg(unix)]
+    match super::system_path::remove_system_path(&super::system_path::base(), root) {
+        Ok(files) if !files.is_empty() => {
+            let names: Vec<String> = files
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
+            println!("path: removed from {}", names.join(", "));
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("svcd: warning: could not update the system PATH: {}", error),
+    }
+}
+
 fn self_uninstall_user(
     request: SelfRequest,
     installed: Option<&crate::platform::settings::Settings>,
@@ -335,6 +370,10 @@ pub fn self_uninstall(args: &[String], stop_daemon: &dyn Fn()) -> i32 {
         println!("  remove: {}", target.display());
         println!("  aliases: {}", alias_names().join(", "));
         println!("  launcher: {}", launcher.display());
+        println!(
+            "  path: remove {} from the system PATH",
+            install_root.display()
+        );
         if !request.no_service {
             println!("  service: remove");
         }
@@ -389,6 +428,7 @@ pub fn self_uninstall(args: &[String], stop_daemon: &dyn Fn()) -> i32 {
         }
     }
 
+    remove_install_path(&install_root);
     if request.purge {
         for dir in [runtime.config, runtime.data, runtime.logs] {
             let _ = fs::remove_dir_all(dir);

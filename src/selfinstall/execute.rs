@@ -14,10 +14,12 @@ use crate::platform::config::ambient_paths;
 
 use super::plan::*;
 
+mod path_env;
 mod plan_exec;
 mod self_install;
 mod self_uninstall;
 mod service;
+mod system_path;
 mod user_path;
 
 use plan_exec::execute;

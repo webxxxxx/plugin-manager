@@ -26,6 +26,44 @@ fn refuse_invalid_conf(message: &str) -> i32 {
     EXIT_ERROR
 }
 
+/// Add the install prefix to the machine PATH: every install except
+/// `--manual`, whose launcher is started by an init script (#311).
+///
+/// A failure is a warning. The daemon is installed and registered either way;
+/// the operator can add the directory by hand, and `--uninstall` still knows
+/// what to clean up.
+fn add_install_path(root: &Path) {
+    if super::system_path::skipped() {
+        println!("path: skipped (test hook)");
+        return;
+    }
+    #[cfg(windows)]
+    match super::system_path::machine_key() {
+        Some((hive, subkey)) => match super::system_path::add_system_path(hive, &subkey, root) {
+            Ok(true) => println!("path: added {} to the system PATH", root.display()),
+            Ok(false) => println!("path: {} is already in the system PATH", root.display()),
+            Err(error) => eprintln!("svcd: could not update the system PATH: {}", error),
+        },
+        None => eprintln!(
+            "svcd: could not update the system PATH: SVCD_TEST_SYSTEM_PATH_KEY is malformed"
+        ),
+    }
+    #[cfg(unix)]
+    match super::system_path::add_system_path(&super::system_path::base(), root) {
+        Ok(files) if files.is_empty() => {
+            println!("path: {} is already in the system PATH", root.display())
+        }
+        Ok(files) => {
+            let names: Vec<String> = files
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
+            println!("path: updated {}", names.join(", "));
+        }
+        Err(error) => eprintln!("svcd: could not update the system PATH: {}", error),
+    }
+}
+
 pub fn self_install(args: &[String]) -> i32 {
     let request = match parse_self(args, false) {
         Ok(request) => request,
@@ -165,6 +203,12 @@ pub fn self_install(args: &[String]) -> i32 {
                 println!("  note:     --target {} ignored (--manual)", target);
             }
         }
+        if !request.manual {
+            println!(
+                "  path:    add {} to the system PATH",
+                install_root.display()
+            );
+        }
         if register_service {
             println!("  service: program {}", target.display());
         } else if request.manual {
@@ -254,6 +298,10 @@ pub fn self_install(args: &[String]) -> i32 {
             eprintln!("svcd: cannot install {}: {}", path.display(), error);
             return EXIT_ERROR;
         }
+    }
+
+    if !request.manual {
+        add_install_path(&install_root);
     }
 
     if let Some(launcher) = &launcher {
