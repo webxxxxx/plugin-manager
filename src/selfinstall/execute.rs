@@ -437,26 +437,28 @@ fn copy_executable(source: &Path, target: &Path) -> io::Result<()> {
     result
 }
 
-fn install_alias(source: &Path, target: &Path) -> io::Result<()> {
-    // Windows cannot unlink the last hard link while the daemon is running.
-    // Copies keep aliases removable independently of the running executable.
-    #[cfg(windows)]
-    {
-        copy_executable(source, target)
-    }
+/// Give `target` a directory entry for `source`.
+///
+/// Unix links, so one copy of the binary serves all four names: that is the
+/// shape the release archive ships, and the only one that fits a small `/data`
+/// (#304). A file system without hard links falls back to a copy, and Windows
+/// always copies because it cannot unlink the last hard link of a running
+/// image. The link is built under a temporary name and renamed into place, so
+/// a name never disappears while an upgrade is replacing it.
+pub(super) fn install_alias(source: &Path, target: &Path) -> io::Result<()> {
     #[cfg(not(windows))]
     {
-        if target.exists() {
-            fs::remove_file(target)?;
+        if let Ok(staged) = temporary_path(target) {
+            let _ = fs::remove_file(&staged);
+            if fs::hard_link(source, &staged).is_ok() {
+                if replace_file(&staged, target).is_ok() {
+                    return Ok(());
+                }
+                let _ = fs::remove_file(&staged);
+            }
         }
-        match fs::hard_link(source, target) {
-            Ok(()) => {}
-            Err(_) => copy_executable(source, target)?,
-        }
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(target, fs::Permissions::from_mode(0o755))?;
-        Ok(())
     }
+    copy_executable(source, target)
 }
 
 /// The store's release key, embedded in the installer so a fresh svcd
