@@ -17,6 +17,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::platform::config::Config;
+#[cfg(feature = "http")]
+use crate::platform::paths::Paths;
 use crate::wire::control::channel;
 
 /// The plugin that owns the network half of an upgrade.
@@ -156,14 +158,13 @@ pub fn apply_remote(config: &Config) -> Result<Applied, String> {
         return Err(format!("already at the latest version ({})", check.current));
     }
     let asset = check.asset.clone().ok_or("no asset to download")?;
-    let archive_bytes = download(config, &asset)?;
+    let archive = download(config, &asset)?;
     let sums_asset = check
         .sums_asset
         .clone()
         .ok_or("the release has no SHA256SUMS asset; refusing to upgrade untrusted bytes")?;
     let sums = download(config, &sums_asset)?;
-    verify_archive(&archive_bytes, &String::from_utf8_lossy(&sums), &asset)?;
-    install_archive(config, &archive_bytes, &asset)?;
+    install_downloaded(config, &asset, archive, sums)?;
     let binary = installed_binary(config)?;
     let (restarting, hint) = restart(&binary)?;
     Ok(Applied {
@@ -336,15 +337,69 @@ fn start_store(config: &Config) -> Result<(), String> {
 }
 
 #[cfg(feature = "http")]
-fn download(config: &Config, asset: &str) -> Result<Vec<u8>, String> {
+fn download(config: &Config, asset: &str) -> Result<Handover, String> {
     let result = tool_call(config, json!({ "download": true, "asset": asset }))?;
     let id = result
         .pointer("/structuredContent/$blob")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("{} returned no blob for {}", STORE_TOOL, asset))?;
-    let path = crate::platform::storage::locate(&config.paths, id)
+    take(&config.paths, id)
+}
+
+/// The archive (or `SHA256SUMS`) the store handed over for this attempt.
+///
+/// The host materializes one temp blob per `download=true` call and nothing
+/// else references it, so the entry lives exactly as long as this guard.
+/// Dropping it — a verified install, a hash mismatch, a `tar` that cannot
+/// unpack, a target the process may not write — removes it from the temp store
+/// instead of leaving it to `temp_retention_secs` (two hours by default), which
+/// is how a failed upgrade pinned 15 MB on a 30 MB `/data` (#302).
+#[cfg(feature = "http")]
+struct Handover {
+    paths: Paths,
+    id: String,
+    bytes: Vec<u8>,
+}
+
+#[cfg(feature = "http")]
+impl Drop for Handover {
+    fn drop(&mut self) {
+        crate::platform::storage::release_id(&self.paths, &self.id);
+    }
+}
+
+/// Read one handover and arm its release.
+///
+/// The guard exists before the read, so a blob that cannot be read is still
+/// removed on the way out. A missing blob is not a leak, and a failed attempt
+/// stays retryable: the store downloads the archive again.
+#[cfg(feature = "http")]
+fn take(paths: &Paths, id: &str) -> Result<Handover, String> {
+    let mut handover = Handover {
+        paths: paths.clone(),
+        id: id.to_string(),
+        bytes: Vec::new(),
+    };
+    let path = crate::platform::storage::locate(paths, id)
         .map_err(|error| format!("locate blob {}: {}", id, error))?;
-    fs::read(&path).map_err(|error| format!("read blob {}: {}", path.display(), error))
+    handover.bytes =
+        fs::read(&path).map_err(|error| format!("read blob {}: {}", path.display(), error))?;
+    Ok(handover)
+}
+
+/// Verify and install one handed-over archive.
+///
+/// Both guards are owned here, so every exit path releases the blobs: the
+/// archive once it is unpacked, both after any error.
+#[cfg(feature = "http")]
+fn install_downloaded(
+    config: &Config,
+    asset: &str,
+    archive: Handover,
+    sums: Handover,
+) -> Result<(), String> {
+    verify_archive(&archive.bytes, &String::from_utf8_lossy(&sums.bytes), asset)?;
+    install_archive(config, &archive.bytes, asset)
 }
 
 /// The capability's JSON payload.
@@ -438,22 +493,46 @@ fn install_archive(config: &Config, bytes: &[u8], asset: &str) -> Result<(), Str
     fs::write(&archive, bytes)
         .map_err(|error| format!("write {}: {}", archive.display(), error))?;
 
-    let status = Command::new("tar")
-        .arg("-xf")
+    let output = Command::new("tar")
+        .arg(tar_mode(bytes))
         .arg(&archive)
         .arg("-C")
         .arg(&unpacked_dir)
-        .status()
+        .output()
         .map_err(|error| format!("run tar: {}", error))?;
-    if !status.success() {
+    if !output.status.success() {
         let _ = fs::remove_dir_all(&work);
-        return Err(format!("tar could not unpack {}", asset));
+        // The console shows the reason inline: a device user has no shell to
+        // read `tar`'s stderr from, and "invalid tar magic" is not something
+        // they can act on without seeing it (#302).
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let detail = detail.trim();
+        if detail.is_empty() {
+            return Err(format!("tar could not unpack {}", asset));
+        }
+        return Err(format!("tar could not unpack {}: {}", asset, detail));
     }
     fs::create_dir_all(dir).map_err(|error| format!("create {}: {}", dir.display(), error))?;
     let root = unpack_root(&unpacked_dir)?;
     let outcome = install_files(dir, &root);
     let _ = fs::remove_dir_all(&work);
     outcome
+}
+
+/// The flags that unpack these bytes.
+///
+/// BusyBox `tar` — the OpenWrt default — has no auto-detection: plain `-x` reads
+/// a gzip stream as a tar header and dies with `invalid tar magic`, so a device
+/// upgrade failed even though `tar` was installed and the archive was intact.
+/// GNU tar and Windows' bsdtar both accept the explicit `-z`; the check is on
+/// the content rather than the file name because `svcd upgrade --file` accepts
+/// any local archive.
+fn tar_mode(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        "-xzf"
+    } else {
+        "-xf"
+    }
 }
 
 fn unpack_root(dir: &Path) -> Result<PathBuf, String> {
@@ -654,6 +733,146 @@ mod tests {
         let sums = format!("{}  svcd-0.2.0-x.tar.gz\n", good);
         assert!(verify_archive(b"payload", &sums, "svcd-0.2.0-x.tar.gz").is_ok());
         assert!(verify_archive(b"payload", &sums, "svcd-0.3.0-x.tar.gz").is_err());
+    }
+
+    /// A staged handover the way the store leaves one: the bytes are imported
+    /// as a `sha256:` blob under `<temp>` and the caller only holds the id.
+    #[cfg(feature = "http")]
+    fn hand_over(config: &Config, bytes: &[u8]) -> (Handover, std::path::PathBuf) {
+        let meta = crate::platform::storage::put(&config.paths, bytes).expect("put blob");
+        let path = crate::platform::storage::locate(&config.paths, &meta.id).expect("blob path");
+        let handover = take(&config.paths, &meta.id).expect("take blob");
+        (handover, path)
+    }
+
+    /// A config that owns its whole tree and has a real install target, so
+    /// `install_archive` gets past the development-build refusal.
+    #[cfg(feature = "http")]
+    fn upgrade_config(root: &std::path::Path) -> Config {
+        let settings = crate::platform::settings::Settings {
+            install_dir: Some(root.join("install")),
+            ..Default::default()
+        };
+        Config::with_paths(settings, None, Paths::under(root))
+    }
+
+    /// #302: the handover is a one-shot input. It must not outlive the attempt,
+    /// because the retention sweep runs hours later.
+    #[cfg(feature = "http")]
+    #[test]
+    fn a_handover_is_released_when_it_ends() {
+        let temp = crate::platform::test_support::TempDir::with_prefix("svcd-upgrade");
+        let config = upgrade_config(temp.path());
+        let (handover, path) = hand_over(&config, b"archive bytes");
+        assert!(path.is_file());
+        drop(handover);
+        assert!(
+            !path.exists(),
+            "a consumed handover must not wait for the retention sweep"
+        );
+    }
+
+    /// The reported failure: `tar could not unpack` left the 15 MB archive in
+    /// `<temp>` for two hours.
+    #[cfg(feature = "http")]
+    #[test]
+    fn an_unpack_that_fails_releases_the_archive() {
+        let temp = crate::platform::test_support::TempDir::with_prefix("svcd-upgrade");
+        let config = upgrade_config(temp.path());
+        let asset = "svcd-0.9.0-x86_64-unknown-linux-gnu.tar.gz";
+        let bytes = b"this is not a tar archive";
+        let sums = format!("{}  {}\n", crate::manage::hex_sha256(bytes), asset);
+        let (archive, archive_path) = hand_over(&config, bytes);
+        let (sums, sums_path) = hand_over(&config, sums.as_bytes());
+        let error = install_downloaded(&config, asset, archive, sums)
+            .expect_err("tar cannot unpack a file that is not an archive");
+        assert!(error.contains("tar could not unpack"), "{error}");
+        assert!(!archive_path.exists(), "the archive stays in temp");
+        assert!(!sums_path.exists(), "SHA256SUMS stays in temp");
+    }
+
+    /// A hash that does not match the archive ends the attempt before anything
+    /// is written, and releases both handovers.
+    #[cfg(feature = "http")]
+    #[test]
+    fn a_rejected_hash_releases_both_handovers() {
+        let temp = crate::platform::test_support::TempDir::with_prefix("svcd-upgrade");
+        let config = upgrade_config(temp.path());
+        let asset = "svcd-0.9.0-x86_64-unknown-linux-gnu.tar.gz";
+        let (archive, archive_path) = hand_over(&config, b"the archive");
+        let wrong = format!("{}  {}\n", "0".repeat(64), asset);
+        let (sums, sums_path) = hand_over(&config, wrong.as_bytes());
+        let error = install_downloaded(&config, asset, archive, sums)
+            .expect_err("a hash that does not match the archive is refused");
+        assert!(error.contains("sha256 mismatch"), "{error}");
+        assert!(!archive_path.exists());
+        assert!(!sums_path.exists());
+    }
+
+    /// BusyBox `tar` answers `invalid tar magic` for a gzip stream read as a
+    /// plain tar, which is what a device upgrade hit (#302).
+    #[test]
+    fn a_gzipped_archive_is_unpacked_with_explicit_gzip() {
+        assert_eq!(tar_mode(&[0x1f, 0x8b, 0x08, 0x00]), "-xzf");
+        assert_eq!(tar_mode(b"PK\x03\x04"), "-xf", "a Windows zip asset");
+        assert_eq!(tar_mode(&[0u8; 512]), "-xf", "a plain tar");
+        assert_eq!(tar_mode(b""), "-xf");
+    }
+
+    /// The unpack path end to end: a real gzip archive, the platform `tar`, and
+    /// an install tree that receives the binary.
+    #[cfg(feature = "http")]
+    #[test]
+    fn a_gzipped_release_unpacks_and_installs() {
+        let temp = crate::platform::test_support::TempDir::with_prefix("svcd-upgrade");
+        let config = upgrade_config(temp.path());
+        let asset = "svcd-0.9.0-x86_64-unknown-linux-gnu.tar.gz";
+        let bytes = gzipped_release(&config);
+        let (archive, archive_path) = hand_over(&config, &bytes);
+        let sums = format!("{}  {}\n", crate::manage::hex_sha256(&bytes), asset);
+        let (sums, sums_path) = hand_over(&config, sums.as_bytes());
+        install_downloaded(&config, asset, archive, sums).expect("a verified release installs");
+        assert!(!archive_path.exists(), "the archive stays in temp");
+        assert!(!sums_path.exists(), "SHA256SUMS stays in temp");
+        let install_dir = config.settings.install_dir.clone().expect("install dir");
+        let installed = install_dir.join(executable_names()[0].clone());
+        assert!(installed.is_file(), "{} is missing", installed.display());
+        let work: Vec<_> = fs::read_dir(&config.paths.temp_dir)
+            .expect("temp dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with("upgrade-"))
+            .collect();
+        assert!(work.is_empty(), "the unpack tree stays behind: {work:?}");
+    }
+
+    /// Build the archive the release workflow ships, with the same platform
+    /// `tar` the upgrade path calls.
+    #[cfg(feature = "http")]
+    fn gzipped_release(config: &Config) -> Vec<u8> {
+        let binary = executable_names()[0].clone();
+        let staging = config.paths.temp_dir.join("staging");
+        fs::create_dir_all(&staging).expect("staging");
+        fs::write(staging.join(&binary), b"pretend binary").expect("binary");
+        let archive = config.paths.temp_dir.join("release.tar.gz");
+        let status = Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&staging)
+            .arg(&binary)
+            .status()
+            .expect("run tar");
+        assert!(status.success(), "tar could not create the archive");
+        let bytes = fs::read(&archive).expect("read archive");
+        let _ = fs::remove_dir_all(&staging);
+        let _ = fs::remove_file(&archive);
+        bytes
     }
 
     #[test]

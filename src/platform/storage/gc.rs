@@ -31,15 +31,23 @@ pub(crate) fn cleanup(paths: &Paths, retention: Duration) -> std::io::Result<usi
 /// `temp_retention_secs` (two hours) pins the package on a small volume
 /// (#288). A missing entry is already clean, not an error.
 pub(crate) fn release(paths: &Paths, digest: &[u8]) -> usize {
-    let id = format!("sha256:{}", text_hex(digest));
+    release_id(paths, &format!("sha256:{}", text_hex(digest)))
+}
+
+/// Remove one content-addressed entry by id: the single blob and the file
+/// bundle that shares its digest (a bundle is the directory, a blob the file).
+///
+/// The id is the same handle the caller was given, so a handover that never
+/// reached a consumer can be released without re-hashing the bytes (#302).
+pub(crate) fn release_id(paths: &Paths, id: &str) -> usize {
     let mut removed = 0;
-    if let Ok(blob) = super::path::blob_path(paths, &id) {
+    if let Ok(blob) = super::path::blob_path(paths, id) {
         if fs::remove_file(&blob).is_ok() {
             removed += 1;
         }
     }
     #[cfg(feature = "http")]
-    if let Ok(directory) = super::path::file_dir(paths, &id) {
+    if let Ok(directory) = super::path::file_dir(paths, id) {
         if directory.is_dir() && fs::remove_dir_all(&directory).is_ok() {
             removed += 1;
         }

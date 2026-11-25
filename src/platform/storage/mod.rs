@@ -13,7 +13,7 @@ mod path;
 #[cfg(feature = "http")]
 mod upload;
 
-pub(crate) use gc::{cleanup, release};
+pub(crate) use gc::{cleanup, release, release_id};
 #[cfg(feature = "http")]
 pub(crate) use gc::{forget_blob, forget_file};
 #[cfg(any(feature = "http", test))]
@@ -263,6 +263,36 @@ mod tests {
         .expect("old manifest mtime");
         let removed = cleanup(&paths, Duration::from_secs(2 * 60 * 60)).expect("cleanup");
         assert!(removed >= 1);
+        assert!(!directory.exists());
+    }
+
+    /// #302: a consumer that only holds the id releases the entry without
+    /// re-hashing it, and both shapes (a blob file, a bundle directory that
+    /// shares the digest) go away.
+    #[cfg(feature = "http")]
+    #[test]
+    fn release_by_id_removes_a_consumed_entry() {
+        let paths = test_paths();
+        let meta = put(&paths, b"one-shot").expect("put");
+        let blob = locate(&paths, &meta.id).expect("blob path");
+        assert!(blob.is_file());
+        assert_eq!(release_id(&paths, &meta.id), 1);
+        assert!(!blob.exists());
+        assert_eq!(
+            release_id(&paths, &meta.id),
+            0,
+            "a second release is a no-op"
+        );
+
+        let upload = create_upload(&paths, UploadKind::File).expect("file upload");
+        let mut writer =
+            PartWriter::begin(&paths, &upload, 1, UploadKind::File).expect("part writer");
+        writer.write(b"hello").expect("part write");
+        writer.finish().expect("part finish");
+        let bundle = complete_file(&paths, &upload, None, None, None).expect("complete file");
+        let directory = file_dir(&paths, &bundle.id).expect("file dir");
+        assert!(directory.is_dir());
+        assert_eq!(release_id(&paths, &bundle.id), 1);
         assert!(!directory.exists());
     }
 

@@ -324,6 +324,10 @@ temp_cleanup_interval_secs = 300
 
 安装包不算「未访问文件」：`plugin.install` 的来源落在 `temp_dir` 里时（blob、`files/<id>` 文件包或 `incoming/` 里的一个文件），**安装成功和失败都会立刻删掉这份来源**（#286）。内容寻址存储的语义是「用完即弃的输入」，安装后的版本目录才是要留下的东西；这样小容量卷不会因为一次失败的 15 MiB 安装被占到 TTL 到期。
 
+自升级也是同一个语义：`plugin-store.release_asset` 每 `download=true` 一次就物化一个 blob（归档、`SHA256SUMS` 各一个），宿主在 `selfinstall::upgrade` 里把它收成一次性交接（`Handover`），**校验失败、`tar` 解包失败、目标不可写、安装成功**都在离开作用域时立刻删掉这些条目（#302）。
+
+设备上的 `tar` 常是 BusyBox 版本，它不做压缩自动识别：`.tar.gz` 必须显式带 `-z`（`-xzf`），否则读到的就是「`invalid tar magic`」，跟「没装 tar」表现不同但同样解不开。因此解包按**内容头**（gzip magic `1f 8b`）选 `-xzf`/`-xf`，与文件名无关（`svcd upgrade --file` 接受任意本地归档）；解包失败时 `tar` 自己的 stderr 会拼进错误文本，控制台不必再让人 SSH 上去看。
+
 > 升级提示：旧版本默认目录是 `<data>/blobs`，改名为 `<data>/temp` 后旧文件不会自动迁移。需要保留旧 blob 时，可以手工把目录改名为 `temp`，或在 `svcd.conf` 里把 `temp_dir` 指回旧目录（插件环境变量仍会变成 `SVCD_TEMP_DIR`）。
 
 ## 4. 参数：`$blob`
