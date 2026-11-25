@@ -39,7 +39,8 @@
   .hidden { display:none; }
   .tablewrap { width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }
   .tablewrap table { min-width:640px; }
-  .install-dir { overflow-wrap:anywhere; }
+  .install-root { overflow-wrap:anywhere; }
+  .root-index { margin-left:2px; font-weight:600; }
   #busymask { position:fixed; inset:0; background:rgba(255,255,255,.55); z-index:998; display:none; align-items:center; justify-content:center; }
   #busymask.show { display:flex; }
   #waitspin { width:42px; height:42px; border:4px solid #d6e4f3; border-top-color:var(--blue); border-radius:50%; animation:spin .9s linear infinite; }
@@ -344,18 +345,21 @@ function render(plugins) {
 
     const name = document.createElement('td');
     const strong = document.createElement('div');
-    // The first line is the display name, the second is where the plugin is
-    // installed: with several plugin roots the id alone cannot tell one copy
-    // from another. The path ends in the id, which is what commands, log files
-    // and tool prefixes use.
     strong.textContent = plugin.displayName || plugin.id;
     name.appendChild(strong);
-    if (plugin.installDir) {
-      const where = document.createElement('div');
-      where.className = 'muted install-dir';
-      where.textContent = plugin.installDir;
-      name.appendChild(where);
-    }
+    // The second line is the id plus the plugin root it sits on: the number is
+    // its position in the configured root list (1-based, the order the settings
+    // page shows). The full path is long enough to ruin a row, so it only shows
+    // up in the tip.
+    const where = document.createElement('div');
+    where.className = 'muted install-root';
+    where.textContent = plugin.id;
+    const badge = document.createElement('sup');
+    badge.className = 'root-index';
+    badge.textContent = plugin.installRootIndex ? String(plugin.installRootIndex) : '';
+    where.appendChild(badge);
+    if (plugin.installDir) where.title = '安装位置：' + plugin.installDir;
+    name.appendChild(where);
     tr.appendChild(name);
 
     const version = document.createElement('td');

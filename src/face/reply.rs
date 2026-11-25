@@ -5,6 +5,8 @@
 //! (`face/api.rs`) and these builders are three separate jobs; keeping the
 //! builders here keeps each file inside the size budget.
 
+use std::path::Path;
+
 use serde_json::{json, Value};
 
 use crate::kernel::failure::ProblemError;
@@ -108,10 +110,31 @@ pub(crate) fn project_service(status: &Value, paths: &Paths) -> Option<Value> {
         .and_then(Value::as_str)
         .map(|id| crate::manage::web_assets(paths, id).is_some())
         .unwrap_or(false);
+    let root_index = status
+        .pointer("/summary/installDir")
+        .and_then(Value::as_str)
+        .and_then(|install_dir| root_index(paths, Path::new(install_dir)));
     let mut summary = status.get("summary").cloned()?;
     if let Some(object) = summary.as_object_mut() {
         object.insert("hasConfig".into(), Value::Bool(has_config));
         object.insert("hasUI".into(), Value::Bool(has_ui));
+        if let Some(index) = root_index {
+            object.insert("installRootIndex".into(), json!(index));
+        }
     }
     Some(summary)
+}
+
+/// The 1-based position of the configured root that holds `install_dir`, in the
+/// order the settings list shows (#313). Nested roots resolve to the most
+/// specific one, so `/data` listed before `/data/plugins` does not claim every
+/// plugin under the latter.
+fn root_index(paths: &Paths, install_dir: &Path) -> Option<usize> {
+    paths
+        .plugin_roots
+        .iter()
+        .enumerate()
+        .filter(|(_, root)| install_dir.starts_with(root))
+        .max_by_key(|(_, root)| root.components().count())
+        .map(|(index, _)| index + 1)
 }

@@ -520,6 +520,62 @@ fn service_summaries_carry_has_config_and_has_ui() {
 }
 
 #[test]
+fn a_plugin_summary_names_its_root_by_position() {
+    let mut paths = crate::platform::paths::Paths::under(std::path::Path::new("/svcd-unit"));
+    paths.plugin_roots = vec![
+        std::path::PathBuf::from("/svcd-unit/data/plugins"),
+        std::path::PathBuf::from("/svcd-unit/card/plugins"),
+    ];
+    let summary = |install_dir: &str| {
+        project_service(
+            &json!({
+                "summary": { "id": "demo", "kind": "plugin", "installDir": install_dir }
+            }),
+            &paths,
+        )
+        .expect("summary")
+    };
+
+    assert_eq!(
+        summary("/svcd-unit/data/plugins/demo")["installRootIndex"],
+        1
+    );
+    assert_eq!(
+        summary("/svcd-unit/card/plugins/demo")["installRootIndex"],
+        2
+    );
+    // A directory no configured root holds carries no position: the row falls
+    // back to the id alone.
+    assert!(summary("/elsewhere/demo").get("installRootIndex").is_none());
+    // A core service has no install directory at all.
+    let core = project_service(
+        &json!({ "summary": { "id": "svcd", "kind": "core" } }),
+        &paths,
+    )
+    .expect("summary");
+    assert!(core.get("installRootIndex").is_none());
+
+    // Nested roots: the specific one wins even though the parent is listed
+    // first, so `/data` cannot claim every plugin under `/data/plugins`.
+    paths.plugin_roots = vec![
+        std::path::PathBuf::from("/svcd-unit/data"),
+        std::path::PathBuf::from("/svcd-unit/data/plugins"),
+    ];
+    let nested = project_service(
+        &json!({
+            "summary": {
+                "id": "demo",
+                "kind": "plugin",
+                "installDir": "/svcd-unit/data/plugins/demo"
+            }
+        }),
+        &paths,
+    )
+    .expect("summary");
+    assert_eq!(nested["installRootIndex"], 2);
+}
+
+#[test]
 fn a_public_face_route_skips_transport_auth() {
     use crate::server::auth::lan::AuthKind;
     use crate::server::http::{route_face_request, Face};
