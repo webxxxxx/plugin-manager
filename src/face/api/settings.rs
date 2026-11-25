@@ -256,8 +256,20 @@ impl ApiFace {
     }
 }
 
+/// What a probe row reports. These keys are read-only facts on the settings
+/// screen: the document may state one (a container with a wrong `/proc`, or a
+/// reproduction of another machine), otherwise the value is what this process
+/// measured at startup. `null` means the probe could not read it at all, which
+/// the screen shows as `-`.
+pub(super) fn probe_reported(stated: Option<u64>, observed: Option<u64>) -> Value {
+    match stated.or(observed) {
+        Some(value) => json!(value),
+        None => Value::Null,
+    }
+}
+
 /// What the running daemon actually uses for one key. `null` means "this key is
-/// not a derived runtime value" (paths, probe inputs, the password hash).
+/// not a derived runtime value" (paths, the password hash).
 fn effective(config: &crate::platform::config::Config, key: &str, bind: Option<&str>) -> Value {
     let limits = &config.limits;
     let settings = &config.settings;
@@ -322,11 +334,26 @@ fn effective(config: &crate::platform::config::Config, key: &str, bind: Option<&
             .install_dir
             .as_ref()
             .map(|path| path.to_string_lossy())),
-        "probe_available_memory" => json!(settings.probe_available_memory),
-        "probe_cgroup_remaining" => json!(settings.probe_cgroup_remaining),
-        "probe_cpus" => json!(settings.probe_cpus),
-        "probe_install_free_disk" => json!(settings.probe_install_free_disk),
-        "probe_temp_free_disk" => json!(settings.probe_temp_free_disk),
+        "probe_available_memory" => probe_reported(
+            settings.probe_available_memory,
+            config.resources.profile.available_memory,
+        ),
+        "probe_cgroup_remaining" => probe_reported(
+            settings.probe_cgroup_remaining,
+            config.resources.profile.cgroup_remaining,
+        ),
+        "probe_cpus" => probe_reported(
+            settings.probe_cpus.map(|cpus| cpus as u64),
+            config.resources.profile.cpus.map(|cpus| cpus as u64),
+        ),
+        "probe_install_free_disk" => probe_reported(
+            settings.probe_install_free_disk,
+            config.resources.profile.install_free_disk,
+        ),
+        "probe_temp_free_disk" => probe_reported(
+            settings.probe_temp_free_disk,
+            config.resources.profile.temp_free_disk,
+        ),
         _ => Value::Null,
     }
 }

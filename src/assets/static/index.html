@@ -711,10 +711,26 @@ function openSettings() {
   });
 }
 
-function settingsValueText(value) {
+function settingsValueText(value, kind) {
   if (value === null || value === undefined) return '-';
   if (typeof value === 'boolean') return value ? '开' : '关';
+  if (kind === 'bytes') return settingsBytesText(value);
   return String(value);
+}
+
+// Byte facts read at a glance ("512.0 MiB"), not as raw counts. The probe rows
+// are read-only facts, and a count nobody can size up is not a fact you can use.
+function settingsBytesText(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes <= 0) return String(value);
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let size = bytes;
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  return (unit === 0 ? String(size) : size.toFixed(1)) + ' ' + units[unit];
 }
 
 // The document accepts all of these spellings for a boolean (see parse_bool in
@@ -859,7 +875,7 @@ function showSettingsModal(data) {
     if (!entry.editable) {
       const value = document.createElement('span');
       value.className = 'readonly';
-      value.textContent = settingsValueText(entry.effective);
+      value.textContent = settingsValueText(entry.effective, entry.kind);
       control.appendChild(value);
       const readOnly = document.createElement('span');
       readOnly.className = 'setting-source';
@@ -894,7 +910,7 @@ function showSettingsModal(data) {
       const input = document.createElement('input');
       input.type = 'text';
       input.value = entry.value === null || entry.value === undefined ? '' : entry.value;
-      input.placeholder = String(entry.effective === null ? '' : settingsValueText(entry.effective));
+      input.placeholder = String(entry.effective === null ? '' : settingsValueText(entry.effective, entry.kind));
       input.oninput = function () { mark(entry.key, input.value === '' ? null : input.value); };
       control.appendChild(input);
     }
