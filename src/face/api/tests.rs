@@ -561,3 +561,77 @@ fn a_probe_row_reports_the_measured_value_unless_the_document_states_one() {
         "an unreadable probe stays unknown, not zero"
     );
 }
+
+/// #298: the editor's first row is the default install root and only that row
+/// is marked default. With `plugins_dir` unset the list is exactly
+/// `<data_dir>/plugins`, which is what the console shows.
+#[test]
+fn the_plugin_root_editor_lists_the_default_root_first() {
+    let temp = crate::platform::test_support::TempDir::new();
+    let unset = Paths::under(&temp.0);
+    let rows = super::settings::plugin_root_rows(&unset);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["path"],
+        serde_json::json!(unset.data_dir.join("plugins").to_string_lossy()),
+        "an unset list is the single <data_dir>/plugins root"
+    );
+    assert_eq!(rows[0]["default"], serde_json::json!(true));
+
+    let mut paths = Paths::under(&temp.0);
+    let card = temp.0.join("card/plugins");
+    paths.plugin_roots = vec![paths.data_dir.join("plugins"), card.clone()];
+    let rows = super::settings::plugin_root_rows(&paths);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["default"], serde_json::json!(true));
+    assert_eq!(rows[1]["path"], serde_json::json!(card.to_string_lossy()));
+    assert_eq!(rows[1]["default"], serde_json::json!(false));
+}
+
+/// A root is occupied when a plugin is on it now *or* when the location index
+/// remembers one there; only the second case survives a pulled card, which is
+/// exactly the case the settings screen must not let an operator delete.
+#[test]
+fn a_root_that_still_holds_plugins_cannot_be_dropped() {
+    let temp = crate::platform::test_support::TempDir::new();
+    let internal = temp.0.join("data/plugins");
+    let card = temp.0.join("card/plugins");
+    let empty = temp.0.join("spare/plugins");
+    for root in [&internal, &card, &empty] {
+        std::fs::create_dir_all(root).expect("root");
+    }
+    let demo = internal.join("demo");
+    std::fs::create_dir_all(demo.join("1.0.0")).expect("version dir");
+    std::fs::write(demo.join("current"), "1.0.0").expect("current");
+    let mut paths = Paths::under(&temp.0);
+    paths.plugin_roots = vec![internal.clone(), card.clone(), empty.clone()];
+    crate::platform::locations::record(&paths, "weather", &card).expect("record");
+
+    let rows = super::settings::plugin_root_rows(&paths);
+    assert_eq!(rows[0]["pluginIds"], serde_json::json!(["demo"]));
+    assert_eq!(rows[1]["pluginIds"], serde_json::json!(["weather"]));
+
+    let all: Vec<std::path::PathBuf> = vec![internal.clone(), card.clone(), empty.clone()];
+    assert!(
+        super::settings::removed_with_plugins(&paths, &all).is_none(),
+        "keeping every root is never refused"
+    );
+
+    let on_disk = super::settings::removed_with_plugins(&paths, &[card.clone(), empty.clone()])
+        .expect("demo lives on the internal root");
+    assert!(on_disk.contains("demo"), "{on_disk}");
+    assert!(on_disk.contains("still holds 1 plugin"), "{on_disk}");
+
+    let index_only =
+        super::settings::removed_with_plugins(&paths, &[internal.clone(), empty.clone()])
+            .expect("weather is recorded on the card");
+    assert!(
+        index_only.contains("weather"),
+        "an unmounted root keeps its plugins: {index_only}"
+    );
+
+    assert!(
+        super::settings::removed_with_plugins(&paths, &[internal.clone(), card.clone()]).is_none(),
+        "an empty root may be dropped"
+    );
+}

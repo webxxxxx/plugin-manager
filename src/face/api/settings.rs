@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::*;
 
@@ -49,7 +49,7 @@ impl ApiFace {
                     "derived"
                 };
                 let value = env.or_else(|| file.get(entry.key).cloned());
-                json!({
+                let mut row = json!({
                     "key": entry.key,
                     "label": entry.label,
                     "group": entry.group.title(),
@@ -62,7 +62,14 @@ impl ApiFace {
                     "source": source,
                     "value": value,
                     "effective": effective(&self.config, entry.key, bind.as_deref()),
-                })
+                });
+                if entry.key == "plugins_dir" {
+                    // The row editor needs facts about every root, not just the
+                    // list: which one is the default and which ones already hold
+                    // plugins (#298).
+                    row["roots"] = json!(plugin_root_rows(&self.config.paths));
+                }
+                row
             })
             .collect();
         Response::json(
@@ -121,7 +128,17 @@ impl ApiFace {
                 }
             };
             match text {
-                None => unset.push(key.clone()),
+                None => {
+                    if key == "plugins_dir" {
+                        // Clearing the key falls back to the single default
+                        // root, which drops every configured root: same rule.
+                        let next = [self.config.paths.default_plugin_root().to_path_buf()];
+                        if let Some(problem) = removed_with_plugins(&self.config.paths, &next) {
+                            return error_response(409, "conflict", &problem);
+                        }
+                    }
+                    unset.push(key.clone())
+                }
                 Some(text) if key == "auth_passwd" => {
                     // The console sends the plaintext over the loopback API; the
                     // document only ever holds the pbkdf2 hash.
@@ -169,8 +186,16 @@ impl ApiFace {
                     } else {
                         text
                     };
-                    if let Err(error) = settings::parse(&format!("{} = {}", key, text), base) {
-                        return error_response(400, "bad_request", &error);
+                    let parsed = match settings::parse(&format!("{} = {}", key, text), base) {
+                        Ok(parsed) => parsed,
+                        Err(error) => return error_response(400, "bad_request", &error),
+                    };
+                    if key == "plugins_dir" {
+                        if let Some(problem) =
+                            removed_with_plugins(&self.config.paths, &parsed.plugins_dir)
+                        {
+                            return error_response(409, "conflict", &problem);
+                        }
                     }
                     set.insert(key.clone(), text);
                 }
@@ -326,6 +351,13 @@ fn effective(config: &crate::platform::config::Config, key: &str, bind: Option<&
         "config_dir" => json!(paths.config_dir.to_string_lossy()),
         "data_dir" => json!(paths.data_dir.to_string_lossy()),
         "logs_dir" => json!(paths.logs_dir.to_string_lossy()),
+        "plugins_dir" => json!(config
+            .paths
+            .plugin_roots
+            .iter()
+            .map(|root| root.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(", ")),
         "static_root" => json!(settings
             .static_root
             .as_ref()
@@ -356,4 +388,59 @@ fn effective(config: &crate::platform::config::Config, key: &str, bind: Option<&
         ),
         _ => Value::Null,
     }
+}
+
+/// The plugin-root editor's rows, in priority order.
+///
+/// The first row is the default install root — `plugin_roots[0]`, which is
+/// exactly `<data_dir>/plugins` when the document leaves `plugins_dir` unset —
+/// and the console locks it: dropping or moving it would change where the host
+/// installs by default.
+///
+/// `plugins` counts what lives on the root now plus what the location index
+/// remembers, so a root whose volume is not mounted still shows up as occupied
+/// and stays undeletable (#298).
+pub(super) fn plugin_root_rows(paths: &crate::platform::paths::Paths) -> Vec<Value> {
+    let default_root = paths.default_plugin_root();
+    paths
+        .plugin_roots
+        .iter()
+        .map(|root| {
+            let ids = crate::platform::locations::ids_in(paths, root);
+            json!({
+                "path": root.to_string_lossy(),
+                "default": root == default_root,
+                "plugins": ids.len(),
+                "pluginIds": ids,
+            })
+        })
+        .collect()
+}
+
+/// Why a new `plugins_dir` list is refused: every root the running daemon
+/// serves that the list drops, and that still holds plugins, is where those
+/// plugins live.
+///
+/// Removing it would leave them undiscovered without moving anything, so the
+/// console cannot do it by accident; moving or uninstalling them comes first.
+pub(super) fn removed_with_plugins(
+    paths: &crate::platform::paths::Paths,
+    next: &[PathBuf],
+) -> Option<String> {
+    for root in &paths.plugin_roots {
+        if next.contains(root) {
+            continue;
+        }
+        let ids = crate::platform::locations::ids_in(paths, root);
+        if ids.is_empty() {
+            continue;
+        }
+        return Some(format!(
+            "{} still holds {} plugin(s): {}; move or uninstall them before dropping the root",
+            root.display(),
+            ids.len(),
+            ids.join(", ")
+        ));
+    }
+    None
 }

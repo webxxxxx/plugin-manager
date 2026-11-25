@@ -587,9 +587,9 @@ pub const CONF_KEYS: &[ConfKey] = &[
         group: Group::Paths,
         kind: Kind::Path,
         default: "未设（派生 `<data_dir>/plugins`）",
-        doc: "插件根列表，逗号分隔，顺序即优先级：第一个是默认安装根，每个已装插件的实际落点记在 `<data_dir>/plugin-locations.json`。相对路径按 svcd.conf 所在目录解析；重复项去重，空项报错。",
-        recommend: "只读：多根装在不同的卷上，改这里要保证已有插件还在列表里（否则启动会告警哪些插件找不到）。",
-        editable_in_console: false,
+        doc: "插件根列表，逗号分隔，顺序即优先级：第一个是默认安装根，每个已装插件的实际落点记在 `<data_dir>/plugin-locations.json`。相对路径按 svcd.conf 所在目录解析；重复项去重，空项报错。控制台把第一项当默认安装根固定住，仍有插件的根不给删。",
+        recommend: "多根装在不同的卷上；删掉一个还装着插件的根会被拒绝，先把它上面的插件移走或卸载。",
+        editable_in_console: true,
         needs_restart: true,
     },
     ConfKey {
@@ -818,12 +818,13 @@ mod tests {
         }
     }
 
-    /// A path key is either a root the installer records (read-only: editing it
-    /// would point the daemon at a tree nothing prepared) or a content root the
-    /// operator owns. `static_root` is the second kind: it only names where
-    /// `/static/` reads from, so the console may write or clear it (#301).
+    /// A path key is a root the installer records (read-only: editing it would
+    /// point the daemon at a tree nothing prepared) or one the operator owns.
+    /// `static_root` only names where `/static/` reads from (#301), and
+    /// `plugins_dir` is a list the operator maintains — the console refuses to
+    /// drop a root that still holds plugins instead of hiding the key (#298).
     #[test]
-    fn path_keys_are_roots_and_only_the_install_roots_are_read_only() {
+    fn path_keys_are_roots_and_only_the_operator_owned_roots_are_editable() {
         let roots = [
             "config_dir",
             "plugins_dir",
@@ -832,7 +833,7 @@ mod tests {
             "static_root",
             "install_dir",
         ];
-        let content_roots = ["static_root"];
+        let editable_roots = ["plugins_dir", "static_root"];
         for entry in CONF_KEYS {
             if entry.kind == Kind::Path {
                 assert!(
@@ -842,7 +843,7 @@ mod tests {
                 );
                 assert_eq!(
                     entry.editable_in_console,
-                    content_roots.contains(&entry.key),
+                    editable_roots.contains(&entry.key),
                     "{} has the wrong console editability",
                     entry.key
                 );

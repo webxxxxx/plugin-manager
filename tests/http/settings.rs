@@ -143,14 +143,19 @@ fn settings_get_reports_values_sources_and_metadata() {
         assert_eq!(entry["editable"], false, "{entry}");
         assert!(entry["effective"].is_string(), "{entry}");
     }
-    // The install prefix and the static-site root are optional: null until set.
+    // The install prefix is read-only; the two operator-owned roots are not —
+    // `static_root` is a single path (#301), `plugins_dir` a list (#298).
     let install = by_key("install_dir");
     assert_eq!(install["kind"], "path");
     assert_eq!(install["editable"], false);
     let static_root = by_key("static_root");
     assert_eq!(static_root["kind"], "path");
-    assert_eq!(static_root["editable"], false);
+    assert_eq!(static_root["editable"], true);
     assert!(static_root["effective"].is_null(), "{static_root}");
+    let plugins_dir = by_key("plugins_dir");
+    assert_eq!(plugins_dir["kind"], "path");
+    assert_eq!(plugins_dir["editable"], true);
+    assert!(plugins_dir["roots"].is_array(), "{plugins_dir}");
     let password = by_key("auth_passwd");
     assert_eq!(password["kind"], "password-hash");
     assert_eq!(password["editable"], true);
@@ -507,4 +512,105 @@ fn the_effective_budget_matches_the_running_snapshot() {
         Some(budget),
         "{snapshot}"
     );
+}
+
+/// #298: the console edits the plugin-root list, but the host refuses to drop a
+/// root that still holds a plugin — whether the plugin is on disk right now or
+/// only remembered by the location index because its volume is not mounted.
+#[test]
+fn a_plugin_root_that_holds_plugins_cannot_be_removed_from_the_settings_screen() {
+    let mut sandbox = Sandbox::new();
+    let internal = sandbox.data.join("plugins");
+    let card = sandbox.data.join("card/plugins");
+    let spare = sandbox.data.join("spare/plugins");
+    // The card root is deliberately *not* created: a root whose volume is not
+    // mounted is the case the index has to speak for.
+    for root in [&internal, &spare] {
+        fs::create_dir_all(root).expect("root");
+    }
+    fs::create_dir_all(internal.join("demo")).expect("demo");
+    fs::write(internal.join("demo/current"), "1.0.0").expect("current");
+    fs::write(
+        sandbox.data.join("plugin-locations.json"),
+        json!({"version": 1, "plugins": {"weather": card.to_string_lossy()}}).to_string(),
+    )
+    .expect("location index");
+    // The default root comes first (the daemon creates it, so it is always
+    // available); the card root after it stays absent.
+    write_conf(
+        &sandbox,
+        &format!(
+            "plugins_dir = {}, {}, {}\n",
+            internal.display(),
+            card.display(),
+            spare.display()
+        ),
+    );
+    sandbox.start_daemon_as_user();
+    let address = sandbox.wait_for_http();
+
+    let settings = request(&address, "GET", "/api/v1/settings", "", b"");
+    assert_eq!(settings.status, 200, "{:?}", settings.body);
+    let entry = settings.body["keys"]
+        .as_array()
+        .expect("keys")
+        .iter()
+        .find(|entry| entry["key"] == "plugins_dir")
+        .expect("plugins_dir")
+        .clone();
+    assert_eq!(entry["editable"], true, "{entry}");
+    let rows = entry["roots"].as_array().expect("roots");
+    assert_eq!(rows.len(), 3, "{entry}");
+    assert_eq!(
+        rows[0]["path"],
+        json!(internal.to_string_lossy()),
+        "the first configured root is the default install root: {entry}"
+    );
+    assert_eq!(rows[0]["default"], true);
+    assert_eq!(rows[0]["pluginIds"], json!(["demo"]), "{entry}");
+    assert_eq!(rows[1]["path"], json!(card.to_string_lossy()), "{entry}");
+    assert_eq!(
+        rows[1]["pluginIds"],
+        json!(["weather"]),
+        "the index still speaks for an unmounted root: {entry}"
+    );
+    assert_eq!(rows[2]["plugins"], json!(0), "{entry}");
+
+    let save = |roots: &str| {
+        request(
+            &address,
+            "PUT",
+            "/api/v1/settings",
+            "application/json",
+            &serde_json::to_vec(&json!({"values": {"plugins_dir": roots}})).expect("body"),
+        )
+    };
+
+    let unmounted = save(&format!("{}, {}", internal.display(), spare.display()));
+    assert_eq!(unmounted.status, 409, "{:?}", unmounted.body);
+    let message = unmounted.body["error"]["message"].as_str().unwrap_or("");
+    assert!(message.contains("weather"), "{message}");
+    assert!(message.contains("still holds 1 plugin"), "{message}");
+
+    let on_disk = save(&format!("{}, {}", card.display(), spare.display()));
+    assert_eq!(on_disk.status, 409, "{:?}", on_disk.body);
+    let message = on_disk.body["error"]["message"].as_str().unwrap_or("");
+    assert!(message.contains("demo"), "{message}");
+
+    // Clearing the key falls back to the single default root, which drops the
+    // other two: the same rule applies to `null`.
+    let cleared = request(
+        &address,
+        "PUT",
+        "/api/v1/settings",
+        "application/json",
+        br#"{"values":{"plugins_dir":null}}"#,
+    );
+    assert_eq!(cleared.status, 409, "{:?}", cleared.body);
+
+    // A list that keeps every occupied root is accepted, even though it drops
+    // the empty one.
+    let kept = save(&format!("{}, {}", internal.display(), card.display()));
+    assert_eq!(kept.status, 200, "{:?}", kept.body);
+    assert_eq!(kept.body["saved"], json!(["plugins_dir"]));
 }
