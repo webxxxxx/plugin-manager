@@ -639,6 +639,10 @@ fn installs_lists_starts_and_uninstalls_a_plugin() {
         sandbox.run_plugin(&["start", "demo"]).status.code(),
         Some(0)
     );
+    // A plugin's own data lives inside the plugin tree (`<dir>/data`); an
+    // uninstall without --purge keeps it next to the config.
+    fs::create_dir_all(plugin_dir.join("data")).expect("data dir");
+    fs::write(plugin_dir.join("data").join("host_key"), b"key").expect("data file");
     let removed = sandbox.run_plugin(&["uninstall", "demo"]);
     assert_eq!(removed.status.code(), Some(0), "{}", stderr(&removed));
     assert_eq!(
@@ -654,6 +658,10 @@ fn installs_lists_starts_and_uninstalls_a_plugin() {
     assert!(
         plugin_dir.join("config").is_file(),
         "uninstall without --purge must keep config"
+    );
+    assert!(
+        plugin_dir.join("data").join("host_key").is_file(),
+        "uninstall without --purge must keep the plugin's data"
     );
 
     let reinstalled = sandbox.run_plugin(&["install", package.to_str().expect("utf8")]);

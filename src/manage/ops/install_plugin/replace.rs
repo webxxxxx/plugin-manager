@@ -82,7 +82,7 @@ pub(super) fn install_replace(
                     );
                 }
             }
-            if let Err(error) = remove_versions(plugin_dir, Some(&package.manifest.version)) {
+            if let Err(error) = remove_versions(plugin_dir, &[&package.manifest.version, "data"]) {
                 warn!(
                     "plugin {}: installed, but cannot prune old versions: {}",
                     id, error
@@ -183,7 +183,7 @@ pub(super) fn install_replace_staged(
             if let Some(backup) = backup {
                 let _ = fs::remove_dir_all(backup);
             }
-            let _ = remove_versions(plugin_dir, Some(&manifest.version));
+            let _ = remove_versions(plugin_dir, &[&manifest.version, "data"]);
             Ok(service)
         }
         Err(error) => {

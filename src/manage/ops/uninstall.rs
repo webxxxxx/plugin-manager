@@ -82,7 +82,10 @@ pub fn uninstall(
         return Ok(());
     }
 
-    remove_versions(&directory, Some("config"))?;
+    // Keep the user's config and the plugin's own data directory: reinstalling
+    // the same plugin finds its settings, host keys and geo files again. Only
+    // `--purge` (above) removes everything.
+    remove_versions(&directory, &["config", "data"])?;
     for name in ["current", "enabled"] {
         let path = directory.join(name);
         match fs::remove_file(&path) {

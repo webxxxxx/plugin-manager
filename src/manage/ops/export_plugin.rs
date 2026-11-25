@@ -79,7 +79,14 @@ pub(crate) fn backup_json(id: &str, version: &str, config: Option<&[u8]>) -> Vec
     .unwrap_or_default()
 }
 
-pub(crate) fn remove_versions(directory: &Path, keep: Option<&str>) -> Result<(), ProblemError> {
+/// Remove every directory under a plugin directory except the ones named here.
+///
+/// A plugin keeps its own data in `<plugin dir>/data`: its scripts derive that
+/// path from where they were installed and write nothing outside the plugin
+/// directory. Both the upgrade prune and the uninstall keep it — a dropbear host
+/// key, a hysteria certificate or a geo database has to survive a version change
+/// — so `data` rides along on every keep list next to the version being installed.
+pub(crate) fn remove_versions(directory: &Path, keep: &[&str]) -> Result<(), ProblemError> {
     let entries = fs::read_dir(directory).map_err(|error| {
         Problem::Internal.error(format!("read {}: {}", directory.display(), error))
     })?;
@@ -88,10 +95,8 @@ pub(crate) fn remove_versions(directory: &Path, keep: Option<&str>) -> Result<()
         if !path.is_dir() {
             continue;
         }
-        if keep
-            .map(|name| entry.file_name().to_string_lossy() == name)
-            .unwrap_or(false)
-        {
+        let name = entry.file_name();
+        if keep.iter().any(|keep| name.to_string_lossy() == *keep) {
             continue;
         }
         fs::remove_dir_all(&path).map_err(|error| {

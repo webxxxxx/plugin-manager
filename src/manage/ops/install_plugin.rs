@@ -642,6 +642,11 @@ mod tests {
         );
         assert!(directory.join("current").is_file());
 
+        // A plugin keeps its own state in `<plugin dir>/data` (a dropbear host key,
+        // a hysteria certificate, a geo database): an upgrade must not take it away.
+        std::fs::create_dir_all(directory.join("data")).expect("data dir");
+        std::fs::write(directory.join("data").join("host_key"), b"key").expect("data file");
+
         install_package(
             &paths,
             &crate::platform::limits::test_default(),
@@ -658,6 +663,10 @@ mod tests {
             "replace keeps only the new version"
         );
         assert!(directory.join("1.1.0").is_dir());
+        assert!(
+            directory.join("data").join("host_key").is_file(),
+            "replace must keep the plugin's data directory"
+        );
         assert_eq!(
             current_version(&paths, "layout-demo").as_deref(),
             Some("1.1.0")
