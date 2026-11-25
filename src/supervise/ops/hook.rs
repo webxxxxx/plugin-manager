@@ -81,6 +81,13 @@ pub fn run(
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("SVCD_PLUGIN_ID", spec.id)
         .env("SVCD_PLUGIN_VERSION", spec.version)
+        // The hook runs in the version directory; the plugin directory (which
+        // holds `data/` and `config`) is its parent, the same rule `config`
+        // follows (#307, #312).
+        .env(
+            "SVCD_PLUGIN_DIR",
+            spec.version_dir.parent().unwrap_or(spec.version_dir),
+        )
         .env("SVCD_ACTION", spec.action)
         .env("SVCD_DATA_DIR", &paths.data_dir)
         .env("SVCD_CONFIG_DIR", &paths.config_dir);

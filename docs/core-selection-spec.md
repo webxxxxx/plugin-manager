@@ -87,7 +87,7 @@
 ```
 
 - `exec.path` 必须是绝对路径；Unix 可以是 shebang 脚本，Windows 是 `.exe` / `.cmd` / `.bat`；`ready` 同 plugin（默认 `notify`，脚本不讲话就用 `exec`）。
-- `lifecycle` 全部可选；`start` 存在时它就是被监督的前台进程（替换 `exec`，`ready` 仍按 `exec.ready`；不讲话的脚本把 `exec.ready` 设为 `exec`），不得自行 daemonize；`stop` 在 SIGTERM 之前运行用于释放资源，超时/非零只记日志后继续停止序列；`status` 由 `svc status` 按需探测，stdout 作为 `details.probe` 的细节补充，退出码不改变服务状态。钩子 `path` 必须绝对，环境继承 daemon 并附加 `SVCD_SERVICE_ID` / `SVCD_ACTION` / `SVCD_DATA_DIR` / `SVCD_CONFIG_DIR` / `SVCD_LOG_DIR`。
+- `lifecycle` 全部可选；`start` 存在时它就是被监督的前台进程（替换 `exec`，`ready` 仍按 `exec.ready`；不讲话的脚本把 `exec.ready` 设为 `exec`），不得自行 daemonize；`stop` 在 SIGTERM 之前运行用于释放资源，超时/非零只记日志后继续停止序列；`status` 由 `svc status` 按需探测，stdout 作为 `details.probe` 的细节补充，退出码不改变服务状态。钩子 `path` 必须绝对，环境继承 daemon 并附加 `SVCD_SERVICE_ID` / `SVCD_ACTION` / `SVCD_DATA_DIR` / `SVCD_CONFIG_DIR` / `SVCD_LOG_DIR`；插件包（`kind=plugin`）的 `exec` 进程与 `lifecycle` 钩子只拿 `SVCD_PLUGIN_DIR`（安装目录 `<根>/<id>`）/ `SVCD_LOG_DIR` / `SVCD_TEMP_DIR` —— 插件是第三方代码，不给守护进程的配置根（`svcd.conf` 的密码散列、`trust.d`）与数据根，动作仍靠参数传。
 - 文件 root 所有、0640；启动时读取，改定义后重启 svcd 生效（v1 不做热加载）。
 - 不接受 `.spk` 专属字段：`platform` / `files` / `hooks` / `config` / `ui` 出现即定义非法；其他未知字段忽略。
 - `id` 不能是 `svc`（保留给内置 core），且不能与 plugin id 冲突；冲突时 plugin 安装拒绝、core 定义加载拒绝。
@@ -203,7 +203,7 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
 ### 2.5 hooks
 
 - 只接受 `hooks/` 下的可执行文件（Unix exec 位 + shebang，安装验包时校验；Windows `.exe` / `.cmd` / `.bat`，在执行 hook 时校验）；不解析内联命令。
-- 环境清空后只给 `PATH`、`SVCD_PLUGIN_ID`、`SVCD_PLUGIN_VERSION`、`SVCD_ACTION`、`SVCD_DATA_DIR`、`SVCD_CONFIG_DIR`；Windows 额外给 `SystemRoot` / `WINDIR`（启动 `cmd.exe` 必需）；cwd = 版本目录；stdout/stderr 进 `<logs>/<id>-hooks.log`；60s 超时杀进程组。
+- 环境清空后只给 `PATH`、`SVCD_PLUGIN_ID`、`SVCD_PLUGIN_VERSION`、`SVCD_PLUGIN_DIR`（版本目录的父目录，即插件目录）、`SVCD_ACTION`、`SVCD_DATA_DIR`、`SVCD_CONFIG_DIR`；Windows 额外给 `SystemRoot` / `WINDIR`（启动 `cmd.exe` 必需）；cwd = 版本目录；stdout/stderr 进 `<logs>/<id>-hooks.log`；60s 超时杀进程组。
 - post-install 失败 → 报错；是否回滚由安装策略决定：replace 走既有回滚，keep-old 保留新旧两个版本（current 已切到新版本）。pre-remove 失败 → 记日志但继续卸载。
 - 嵌入式构建（`--no-default-features`）默认拒绝带 hooks 的包，`plugin install --allow-hooks` / HTTP `allow_hooks=true` 放行；桌面构建（默认 features）默认放行。
 - 多根安装（ADR-0030）：`plugin install --root <dir>` 与 HTTP `?root=` 都是"必须出现在 `plugins_dir` 里"的偏好；不给就按空闲字节升序挑第一个装得下的根。已装插件只在它被记录的根上升级，换根要先 `uninstall`（配置默认保留）。

@@ -3,6 +3,7 @@
 //! parent-death configuration live here; `Slot` only spawns the result.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::process::{Child, Command};
 
 use crate::kernel::registry::{Exec, Hook, Interpreter};
@@ -17,22 +18,36 @@ pub(super) fn command_for(exec: &Exec) -> Command {
     }
 }
 
-pub(crate) fn hook_command(id: &str, action: &str, hook: &Hook, paths: &Paths) -> Command {
-    build_action_command(id, action, hook, true, paths)
+pub(crate) fn hook_command(
+    id: &str,
+    action: &str,
+    hook: &Hook,
+    paths: &Paths,
+    plugin_dir: Option<&Path>,
+) -> Command {
+    build_action_command(id, action, hook, true, paths, plugin_dir)
 }
 
 /// A `lifecycle.start` action *is* the supervised foreground process, so it is
 /// adoptable after a daemon restart just like `exec`.
-pub(super) fn service_hook_command(id: &str, action: &str, hook: &Hook, paths: &Paths) -> Command {
-    build_action_command(id, action, hook, false, paths)
+pub(super) fn service_hook_command(
+    id: &str,
+    action: &str,
+    hook: &Hook,
+    paths: &Paths,
+    plugin_dir: Option<&Path>,
+) -> Command {
+    build_action_command(id, action, hook, false, paths, plugin_dir)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_action_command(
     id: &str,
     action: &str,
     hook: &Hook,
     hook_lifetime: bool,
     paths: &Paths,
+    plugin_dir: Option<&Path>,
 ) -> Command {
     let mut command = match &hook.interpreter {
         Some(interpreter) => command_for_interpreter(
@@ -44,13 +59,56 @@ fn build_action_command(
         ),
         None => command_for_parts(&hook.path, &hook.args, &hook.env, hook_lifetime),
     };
+    // A plugin is third-party code: it only learns the three directories it
+    // needs to place its own files. `SVCD_CONFIG_DIR` would hand it
+    // `svcd.conf` (password hash) and `trust.d`, and `SVCD_DATA_DIR` the
+    // daemon's whole state tree. A core service is written by the operator and
+    // keeps the old environment (#312).
+    match plugin_dir {
+        Some(_) => apply_plugin_child_env(&mut command, plugin_dir, paths),
+        None => {
+            command
+                .env("SVCD_SERVICE_ID", id)
+                .env("SVCD_ACTION", action)
+                .env("SVCD_DATA_DIR", &paths.data_dir)
+                .env("SVCD_CONFIG_DIR", &paths.config_dir)
+                .env("SVCD_LOG_DIR", &paths.logs_dir);
+        }
+    }
     command
-        .env("SVCD_SERVICE_ID", id)
-        .env("SVCD_ACTION", action)
-        .env("SVCD_DATA_DIR", &paths.data_dir)
-        .env("SVCD_CONFIG_DIR", &paths.config_dir)
-        .env("SVCD_LOG_DIR", &paths.logs_dir);
+}
+
+/// The `SVCD_*` surface a plugin child receives.
+///
+/// Plugins are third-party code: they learn where to put their own files, not
+/// where the daemon keeps its config (`svcd.conf` holds the password hash,
+/// `trust.d` the accepted keys) or its data. Removing the rest matters because
+/// the daemon's own environment carries `SVCD_*` too — a service unit or the
+/// `--manual` launcher exports them, and children inherit them unless they are
+/// taken away here (#312).
+pub(crate) fn apply_plugin_child_env(
+    command: &mut Command,
+    plugin_dir: Option<&Path>,
+    paths: &Paths,
+) {
+    if let Some(plugin_dir) = plugin_dir {
+        plugin_child_env(command, plugin_dir, paths);
+    }
+}
+
+fn plugin_child_env(command: &mut Command, plugin_dir: &Path, paths: &Paths) {
+    for key in [
+        "SVCD_DATA_DIR",
+        "SVCD_CONFIG_DIR",
+        "SVCD_SERVICE_ID",
+        "SVCD_ACTION",
+    ] {
+        command.env_remove(key);
+    }
     command
+        .env("SVCD_PLUGIN_DIR", plugin_dir)
+        .env("SVCD_LOG_DIR", &paths.logs_dir)
+        .env("SVCD_TEMP_DIR", &paths.temp_dir);
 }
 
 /// A script payload is not executable on its own in every layout: the manifest

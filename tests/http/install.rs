@@ -534,6 +534,106 @@ fn unsigned_install_requires_the_conf_switch() {
     assert!(!message.contains("must be the second entry"), "{message}");
 }
 
+/// #312: a plugin installed on a second root is told that root, and it is not
+/// handed the daemon's config/data trees.
+#[test]
+fn a_plugin_on_a_second_root_learns_its_own_directory() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[57u8; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let package = env_report_plugin_bundle(&key, "envreported");
+    let default_root = sandbox.data.join("plugins");
+    let second = sandbox.root.join("sd").join("plugins");
+    fs::create_dir_all(&second).expect("second root");
+    let log_dir = sandbox.logs.clone();
+    let data_dir = sandbox.data.clone();
+    let config_dir = sandbox.config.clone();
+    fs::write(
+        sandbox.config.join("svcd.conf"),
+        format!(
+            "bind = 127.0.0.1:0\nplugins_dir = {},{}\n",
+            default_root.display(),
+            second.display()
+        ),
+    )
+    .expect("write svcd.conf");
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let installed = raw_request(
+        &address,
+        "POST",
+        &format!(
+            "/api/v1/plugins?root={}",
+            second.display().to_string().replace('/', "%2F")
+        ),
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(
+        installed.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&installed.body)
+    );
+    let started = request(
+        &address,
+        "POST",
+        "/api/v1/services/envreported/start",
+        "",
+        b"",
+    );
+    assert_eq!(started.status, 200, "{:?}", started.body);
+
+    let log = sandbox.logs.join("envreported.log");
+    wait_until(
+        &sandbox,
+        "the plugin reports its environment",
+        || {
+            fs::read_to_string(&log)
+                .map(|text| text.contains("env data_dir="))
+                .unwrap_or(false)
+        },
+        || format!("log: {:?}", fs::read_to_string(&log)),
+    );
+    let text = fs::read_to_string(&log).expect("read log");
+
+    assert!(
+        text.contains(&format!(
+            "env plugin_dir={}",
+            second.join("envreported").display()
+        )),
+        "the plugin must learn the root it landed on: {text}"
+    );
+    assert!(
+        text.contains(&format!("env log_dir={}", log_dir.display())),
+        "the log tree stays available: {text}"
+    );
+    assert!(
+        text.contains("env temp_dir="),
+        "the temp tree stays available: {text}"
+    );
+    assert!(
+        text.contains("env data_dir=none"),
+        "no daemon data root: {text}"
+    );
+    assert!(
+        text.contains("env config_dir=none"),
+        "no daemon config root (svcd.conf, trust.d): {text}"
+    );
+    // `temp_dir` lives under `data_dir`, so compare the reported lines rather
+    // than searching for the path as a substring.
+    assert!(
+        !text.contains(&format!("env data_dir={}", data_dir.display()))
+            && !text.contains(&format!("env config_dir={}", config_dir.display())),
+        "the plugin must not see the daemon roots: {text}"
+    );
+}
+
 #[test]
 fn installing_a_package_for_another_platform_is_400() {
     let mut sandbox = Sandbox::new();

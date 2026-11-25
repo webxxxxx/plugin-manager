@@ -352,13 +352,13 @@ fn clock_script() -> (&'static str, Vec<u8>) {
     if cfg!(windows) {
         (
             "payload/bin/clock.cmd",
-            b"@echo off\r\nif /I \"%~1\"==\"stop\" (\r\n  echo stopped>\"%SVCD_DATA_DIR%\\clock.stopped\"\r\n  exit /b 0\r\n)\r\nif /I \"%~1\"==\"status\" (\r\n  echo clock ok\r\n  exit /b 0\r\n)\r\n:loop\r\nping -n 2 127.0.0.1 >nul\r\ngoto loop\r\n"
+            b"@echo off\r\nif /I \"%~1\"==\"stop\" (\r\n  echo stopped>\"%SVCD_PLUGIN_DIR%\\clock.stopped\"\r\n  exit /b 0\r\n)\r\nif /I \"%~1\"==\"status\" (\r\n  echo clock ok\r\n  exit /b 0\r\n)\r\n:loop\r\nping -n 2 127.0.0.1 >nul\r\ngoto loop\r\n"
                 .to_vec(),
         )
     } else {
         (
             "payload/bin/clock.sh",
-            b"#!/bin/sh\ncase \"$1\" in\n  stop)\n    echo stopped > \"$SVCD_DATA_DIR/clock.stopped\"\n    ;;\n  status)\n    echo clock ok\n    ;;\n  *)\n    while :; do sleep 1; done\n    ;;\nesac\n"
+            b"#!/bin/sh\ncase \"$1\" in\n  stop)\n    echo stopped > \"$SVCD_PLUGIN_DIR/clock.stopped\"\n    ;;\n  status)\n    echo clock ok\n    ;;\n  *)\n    while :; do sleep 1; done\n    ;;\nesac\n"
                 .to_vec(),
         )
     }
@@ -1637,8 +1637,15 @@ fn installs_and_supervises_a_script_service_with_lifecycle() {
 
     let stopped = sandbox.run_plugin(&["stop", "clock"]);
     assert_eq!(stopped.status.code(), Some(0), "{}", stderr(&stopped));
+    // The stop action wrote next to itself: the install directory is the one
+    // tree a plugin is given (#312), not the daemon's data root.
     assert!(
-        sandbox.data.join("clock.stopped").is_file(),
+        sandbox
+            .data
+            .join("plugins")
+            .join("clock")
+            .join("clock.stopped")
+            .is_file(),
         "stop action did not run: {}",
         sandbox.daemon_log()
     );

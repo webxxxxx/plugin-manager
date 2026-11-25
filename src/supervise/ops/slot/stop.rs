@@ -143,7 +143,13 @@ impl Slot {
         else {
             return false;
         };
-        let command = hook_command(&self.id, "stop", hook, &self.paths);
+        let command = hook_command(
+            &self.id,
+            "stop",
+            hook,
+            &self.paths,
+            self.plugin_dir.as_deref(),
+        );
         match stdio::spawn(command, Plan::stop_hook()) {
             Ok((child, streams)) => {
                 let _ = crate::platform::host::process::adopt(&child);
