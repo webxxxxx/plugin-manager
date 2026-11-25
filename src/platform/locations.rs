@@ -161,6 +161,23 @@ pub(crate) fn installed_in(root: &Path) -> Vec<String> {
     ids
 }
 
+/// The plugin ids that live in `root`: what is on disk now plus what the index
+/// remembers.
+///
+/// The index is the only witness for a volume that is not mounted, and a root
+/// that holds a plugin must not look empty just because the card is out — that
+/// is what keeps it undeletable in the settings screen (#298).
+pub(crate) fn ids_in(paths: &Paths, root: &Path) -> Vec<String> {
+    let mut ids = installed_in(root);
+    for (id, recorded) in load(paths) {
+        if recorded == root && !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids.sort();
+    ids
+}
+
 /// Read the index, then reconcile it with the roots: the disk wins.
 ///
 /// Returns the map the index should hold, whether it differs from the file,
@@ -412,6 +429,26 @@ mod tests {
             "a missing root is not an error"
         );
     }
+    /// #298: "does this root hold a plugin" has to count the index too, or a
+    /// root whose volume is out would look empty and be deletable.
+    #[test]
+    fn a_root_holds_its_plugins_on_disk_or_in_the_index() {
+        let temp = TempDir::new();
+        let internal = temp.0.join("internal/plugins");
+        let card = temp.0.join("card/plugins");
+        let paths = paths_with(&temp.0, vec![internal.clone(), card.clone()]);
+        plugin_dir(&internal, "demo");
+        record(&paths, "weather", &card).expect("record");
+
+        assert_eq!(ids_in(&paths, &internal), vec!["demo".to_string()]);
+        assert_eq!(
+            ids_in(&paths, &card),
+            vec!["weather".to_string()],
+            "a root that is not mounted keeps its plugins"
+        );
+        assert!(ids_in(&paths, &temp.0.join("elsewhere")).is_empty());
+    }
+
     /// A pulled card must not uninstall its plugins: the rebuild keeps the
     /// entries of roots it cannot read, and `hidden` names them.
     #[test]

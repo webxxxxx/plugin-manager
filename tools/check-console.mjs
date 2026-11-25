@@ -170,6 +170,69 @@ const CHECKS = [
     },
   },
   {
+    id: "roots-locked",
+    run(page) {
+      const body = functionBody(page, "pluginRootsField");
+      if (!body.includes("root.default || plugins > 0")) {
+        throw new Error("the default root and roots with plugins must be locked");
+      }
+      if (!body.includes("input.readOnly = locked") || !body.includes("remove.disabled = locked")) {
+        throw new Error("a locked root must be uneditable and undeletable");
+      }
+      return "the default root and every occupied root are locked";
+    },
+    mutate(page) {
+      return page.replace(
+        "input.value = path;\n    input.readOnly = locked;",
+        "input.value = path;\n    input.readOnly = false;",
+      );
+    },
+  },
+  {
+    id: "roots-save-one-line",
+    run(page) {
+      const body = functionBody(page, "pluginRootsField");
+      if (!body.includes("if (value) paths.push(value);")) {
+        throw new Error("an empty row must not become an empty list entry");
+      }
+      if (!body.includes("paths.join(',')") || !body.includes("mark(entry.key, joined)")) {
+        throw new Error("the roots must save as one comma-separated line");
+      }
+      return "the roots save as one comma-separated line";
+    },
+    mutate(page) {
+      return page.replace("if (value) paths.push(value);", "paths.push(value);");
+    },
+  },
+  {
+    id: "roots-revert-unmarks",
+    run(page) {
+      const body = functionBody(page, "pluginRootsField");
+      if (!body.includes("if (joined === initial) unmark(entry.key);")) {
+        throw new Error("a list that ends where it started must not be saved");
+      }
+      return "returning to the starting list drops the pending change";
+    },
+    mutate(page) {
+      return page.replace(
+        "if (joined === initial) unmark(entry.key);\n    else mark(entry.key, joined);",
+        "mark(entry.key, joined);",
+      );
+    },
+  },
+  {
+    id: "roots-editor-wired",
+    run(page) {
+      if (!page.includes("entry.key === 'plugins_dir'")) {
+        throw new Error("the plugins_dir row is not bound to the list editor");
+      }
+      return "plugins_dir renders the list editor";
+    },
+    mutate(page) {
+      return page.replace("entry.key === 'plugins_dir'", "entry.key === 'plugins_dir_old'");
+    },
+  },
+  {
     id: "no-flat-list",
     run(page) {
       if (page.includes("heading.className = 'setting-group'")) {

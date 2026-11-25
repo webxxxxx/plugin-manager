@@ -80,6 +80,14 @@
   .setting-control { display:flex; align-items:center; gap:6px; flex-wrap:wrap; min-width:0; }
   .setting-control > input[type=text] { width:100%; }
   .setting-control .readonly { font-size:13px; word-break:break-all; }
+  /* Plugin roots are a list, not one path: a row per root, `x` per row. */
+  .roots { display:flex; flex-direction:column; gap:4px; width:100%; }
+  .root-row { display:flex; align-items:center; gap:6px; min-width:0; }
+  .root-row input[type=text] { flex:1 1 auto; min-width:0; }
+  .root-row .roots-note { flex:none; font-size:11px; color:var(--muted); }
+  .root-row.locked input[type=text] { background:#f7f8fa; color:var(--muted); }
+  .root-row button { flex:none; padding:3px 8px; font-size:12px; }
+  .root-row button:disabled { opacity:.45; cursor:not-allowed; }
   .help { flex:none; width:17px; height:17px; padding:0; border:1px solid #c7d0da; border-radius:50%; background:#fff; color:#7b8794; font-size:11px; line-height:1; cursor:help; }
   .help:hover, .help:focus-visible { border-color:var(--blue); color:var(--blue); }
   #tip { position:fixed; z-index:1002; max-width:min(360px, calc(100vw - 24px)); padding:10px 12px; border-radius:6px; background:#2b3038; color:#fff; font-size:12px; line-height:1.6; box-shadow:0 8px 28px rgba(0,0,0,.28); pointer-events:none; }
@@ -707,6 +715,83 @@ function showLogsModal(target, text) {
   pre.scrollTop = pre.scrollHeight;
 }
 
+// Plugin roots are a list, and the list *is* the priority order (#298): `+`
+// appends another volume, `x` stops using one. Two rows are locked — the default
+// install root (dropping or moving it would change where the host installs by
+// default) and any root that still holds plugins, which the host refuses too.
+// Empty rows only exist while being typed; they are dropped when saving.
+function pluginRootsField(entry, mark, unmark) {
+  const wrap = document.createElement('div');
+  wrap.className = 'roots';
+  const rows = [];
+  const roots = Array.isArray(entry.roots) ? entry.roots : [];
+  const initial = roots
+    .map(function (root) { return root.path.trim(); })
+    .filter(function (path) { return path; })
+    .join(',');
+
+  function sync() {
+    const paths = [];
+    rows.forEach(function (item) {
+      const value = item.input.value.trim();
+      if (value) paths.push(value);
+    });
+    const joined = paths.join(',');
+    if (joined === initial) unmark(entry.key);
+    else mark(entry.key, joined);
+  }
+
+  function addRow(root) {
+    const path = root && root.path ? root.path : '';
+    const plugins = (root && root.plugins) || 0;
+    const locked = Boolean(root && (root.default || plugins > 0));
+    const row = document.createElement('div');
+    row.className = 'root-row' + (locked ? ' locked' : '');
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = path;
+    input.readOnly = locked;
+    input.placeholder = '/mnt/sd/svcd/plugins';
+    input.oninput = sync;
+    row.appendChild(input);
+
+    const note = document.createElement('span');
+    note.className = 'roots-note';
+    if (root && root.default) note.textContent = '默认安装根';
+    else if (plugins > 0) note.textContent = plugins + ' 个插件';
+    row.appendChild(note);
+
+    const item = { row: row, input: input, locked: locked };
+    const remove = button('x', 'ghost', function () {
+      if (item.locked) return;
+      const at = rows.indexOf(item);
+      if (at >= 0) rows.splice(at, 1);
+      row.remove();
+      sync();
+    });
+    remove.textContent = 'x';
+    remove.title = locked
+      ? (root && root.default ? '默认安装根，不能删' : '还有插件在这个根上，先移走或卸载')
+      : '删除这一行';
+    remove.disabled = locked;
+    row.appendChild(remove);
+
+    wrap.appendChild(row);
+    rows.push(item);
+    return item;
+  }
+
+  roots.forEach(function (root) { addRow(root); });
+  const add = button('+ 新增根', 'ghost', function () {
+    const item = addRow(null);
+    item.input.focus();
+    sync();
+  });
+  wrap.appendChild(add);
+  return wrap;
+}
+
 function openSettings() {
   if (BUSY) return;
   closeMore();
@@ -875,6 +960,13 @@ function showSettingsModal(data) {
     markTabs();
   }
 
+  // A row editor can wander back to where it started; then there is nothing to
+  // save, and writing the line anyway would restart the daemon for no reason.
+  function unmark(key) {
+    delete changes[key];
+    markTabs();
+  }
+
   function field(entry) {
     const row = document.createElement('div');
     row.className = 'setting';
@@ -916,6 +1008,8 @@ function showSettingsModal(data) {
       select.value = entry.value || entry.effective || options[0];
       select.onchange = function () { mark(entry.key, select.value); };
       control.appendChild(select);
+    } else if (entry.key === 'plugins_dir') {
+      control.appendChild(pluginRootsField(entry, mark, unmark));
     } else {
       const input = document.createElement('input');
       input.type = 'text';

@@ -86,6 +86,13 @@ fn serves_the_embedded_console() {
         html.contains("function showTab") && !html.contains("heading.className = 'setting-group'"),
         "the flat list of groups must be gone"
     );
+    // Plugin roots are edited as rows: the default root and every root that
+    // still holds a plugin are locked in the UI, and the host refuses the same
+    // removal server-side (#298).
+    assert!(
+        html.contains("function pluginRootsField") && html.contains("default || plugins > 0"),
+        "plugins_dir must render the row editor with its locks"
+    );
     assert!(
         html.contains("settingsTipLine('来源'"),
         "settings dialog keeps provenance in the hover tip"
