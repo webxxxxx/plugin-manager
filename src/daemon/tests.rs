@@ -85,6 +85,7 @@ fn service(id: &str, deps: &[&str]) -> Service {
         failures: 0,
         last_exit: None,
         config: None,
+        install_dir: None,
     }
 }
 

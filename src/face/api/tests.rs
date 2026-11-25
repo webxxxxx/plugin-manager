@@ -496,12 +496,20 @@ fn a_download_route_returns_a_stream_even_when_the_blob_is_missing() {
 #[test]
 fn service_summaries_carry_has_config_and_has_ui() {
     let with_config = json!({
-        "summary": { "id": "unit-test-missing", "kind": "plugin" },
+        "summary": {
+            "id": "unit-test-missing",
+            "kind": "plugin",
+            "installDir": "/tmp/plugins/unit-test-missing"
+        },
         "details": { "config": "/tmp/config" }
     });
     let summary = project_service(&with_config, &test_config().paths).expect("summary");
     assert_eq!(summary["hasConfig"], true);
     assert_eq!(summary["hasUI"], false);
+    assert_eq!(
+        summary["installDir"], "/tmp/plugins/unit-test-missing",
+        "the install directory reaches the console list unchanged"
+    );
 
     let without_config = json!({
         "summary": { "id": "unit-test-missing", "kind": "core" }

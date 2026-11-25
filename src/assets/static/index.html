@@ -39,6 +39,7 @@
   .hidden { display:none; }
   .tablewrap { width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }
   .tablewrap table { min-width:640px; }
+  .install-dir { overflow-wrap:anywhere; }
   #busymask { position:fixed; inset:0; background:rgba(255,255,255,.55); z-index:998; display:none; align-items:center; justify-content:center; }
   #busymask.show { display:flex; }
   #waitspin { width:42px; height:42px; border:4px solid #d6e4f3; border-top-color:var(--blue); border-radius:50%; animation:spin .9s linear infinite; }
@@ -343,15 +344,18 @@ function render(plugins) {
 
     const name = document.createElement('td');
     const strong = document.createElement('div');
-    // Primary line is the display name; the id stays visible because every
-    // command, log file and tool prefix uses it.
-    const display = plugin.displayName || plugin.id;
-    strong.textContent = display;
-    const kind = document.createElement('div');
-    kind.className = 'muted';
-    kind.textContent = display === plugin.id ? 'plugin' : plugin.id;
+    // The first line is the display name, the second is where the plugin is
+    // installed: with several plugin roots the id alone cannot tell one copy
+    // from another. The path ends in the id, which is what commands, log files
+    // and tool prefixes use.
+    strong.textContent = plugin.displayName || plugin.id;
     name.appendChild(strong);
-    name.appendChild(kind);
+    if (plugin.installDir) {
+      const where = document.createElement('div');
+      where.className = 'muted install-dir';
+      where.textContent = plugin.installDir;
+      name.appendChild(where);
+    }
     tr.appendChild(name);
 
     const version = document.createElement('td');

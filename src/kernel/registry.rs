@@ -196,6 +196,10 @@ pub struct Service {
     pub failures: u32,
     pub last_exit: Option<i32>,
     pub config: Option<String>,
+    /// The directory of the installed plugin (`<root>/<id>`): it holds the
+    /// current version, the active `config` and the `enabled` marker. `None`
+    /// for a core service, which has no install tree.
+    pub install_dir: Option<String>,
 }
 
 /// The runtime carrier of a service: exactly one owner of its runtime
@@ -348,6 +352,7 @@ impl Service {
             failures: 0,
             last_exit: None,
             config: None,
+            install_dir: None,
         }
     }
 }

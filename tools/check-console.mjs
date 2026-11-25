@@ -331,6 +331,27 @@ const CHECKS = [
     },
   },
   {
+    id: "plugin-list-shows-install-dir",
+    run(page) {
+      const body = functionBody(page, "render");
+      if (!body.includes("where.textContent = plugin.installDir;")) {
+        throw new Error("the line under a plugin name must be where it is installed");
+      }
+      // The primary line may fall back to the id (a plugin without a name);
+      // the line under it may not — the install path already ends in the id.
+      if (/where\.textContent\s*=(?!\s*plugin\.installDir\s*;)/.test(body)) {
+        throw new Error("the install line must name the plugin directory, not the id");
+      }
+      return "the line under a plugin name is its install directory";
+    },
+    mutate(page) {
+      return page.replace(
+        "where.textContent = plugin.installDir;",
+        "where.textContent = plugin.id;",
+      );
+    },
+  },
+  {
     id: "no-flat-list",
     run(page) {
       if (page.includes("heading.className = 'setting-group'")) {

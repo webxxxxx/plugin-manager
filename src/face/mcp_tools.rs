@@ -207,6 +207,7 @@ mod tests {
             failures: 0,
             last_exit: None,
             config: None,
+            install_dir: None,
         }
     }
 

@@ -201,13 +201,13 @@ pub(crate) fn service_from_manifest(
         )));
     }
 
+    // The tree the manifest was read from, not what the location index says:
+    // an install builds this service *before* it records its root, so asking
+    // the index at that moment answered the default root and a non-default
+    // install came out without a config path — no `SVCD_CONFIG`, and the
+    // console hid the 配置 button (#307).
+    let directory = version_dir.parent().unwrap_or(version_dir);
     let config = {
-        // The tree the manifest was read from, not what the location index
-        // says: an install builds this service *before* it records its root, so
-        // asking the index at that moment answered the default root and a
-        // non-default install came out without a config path — no
-        // `SVCD_CONFIG`, and the console hid the 配置 button (#307).
-        let directory = version_dir.parent().unwrap_or(version_dir);
         let path = directory.join("config");
         path.is_file().then(|| path.to_string_lossy().to_string())
     };
@@ -248,6 +248,7 @@ pub(crate) fn service_from_manifest(
         failures: 0,
         last_exit: None,
         config,
+        install_dir: Some(directory.to_string_lossy().to_string()),
     })
 }
 
@@ -477,6 +478,11 @@ mod tests {
             service.config.as_deref(),
             Some(card.join("demo").join("config").to_string_lossy().as_ref()),
             "the config must be the one next to the installed version"
+        );
+        assert_eq!(
+            service.install_dir.as_deref(),
+            Some(card.join("demo").to_string_lossy().as_ref()),
+            "a plugin names the directory it was installed into, not the default root"
         );
     }
 

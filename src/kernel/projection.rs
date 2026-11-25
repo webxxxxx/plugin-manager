@@ -61,6 +61,13 @@ pub struct Summary {
         skip_serializing_if = "Option::is_none"
     )]
     pub display_name: Option<String>,
+    /// Where a plugin is installed (`<root>/<id>`); absent for core services.
+    #[serde(
+        rename = "installDir",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub install_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +102,7 @@ impl Status {
                 since: service.since,
                 version: service.version.clone(),
                 display_name: service.display_name.clone(),
+                install_dir: service.install_dir.clone(),
             },
             details: Details {
                 dependencies: service.deps.clone(),
@@ -220,6 +228,18 @@ mod tests {
         service.display_name = Some("示例插件".into());
         let value = serde_json::to_value(Status::of(&service)).expect("serialize");
         assert_eq!(value["summary"]["displayName"], "示例插件");
+        assert_eq!(value["summary"]["id"], "demo");
+    }
+
+    #[test]
+    fn an_installed_plugin_projects_its_install_directory() {
+        let mut service = test_service();
+        service.kind = Kind::Plugin;
+        service.install_dir = Some("/mnt/card/plugins/demo".into());
+
+        let value = serde_json::to_value(Status::of(&service)).expect("serialize");
+
+        assert_eq!(value["summary"]["installDir"], "/mnt/card/plugins/demo");
         assert_eq!(value["summary"]["id"], "demo");
     }
 

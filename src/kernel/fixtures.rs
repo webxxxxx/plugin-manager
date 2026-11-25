@@ -46,5 +46,6 @@ pub(crate) fn test_service() -> Service {
         failures: 0,
         last_exit: Some(3),
         config: Some("/var/lib/svcd/demo/config".into()),
+        install_dir: None,
     }
 }
