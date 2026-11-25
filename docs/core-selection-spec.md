@@ -278,7 +278,7 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
   - `POST /api/v1/services/{id}/stop` → 返回 `{summary}`
   - `POST /api/v1/services/{id}/enable` / `disable` → 切换开机自启，返回 `{summary}`
   - `GET /api/v1/version` → `{version, protocol, platform}`
-  - `GET /api/v1/disk[?id=<插件 id>]` → `{roots:[{root,freeBytes,default,plugin}], tempFreeBytes}`：`roots` 是**列表**，每个插件根一行，按优先级排列（`default=true` 是默认安装根）；目录还不存在时向上找最近的存在祖先再取 statvfs（新装没有 `plugins/`），拿不到数字的卷给 `null`。`?id=` 让每行多一个 `plugin` 字段（`{id,version,directory}`，没装为 `null`），调用方据此区分「原地升级」（这个根已经有它）和「新装」（挑一个装得下的根）；id 不合法 400，未知 id 不是错误。多根配置下每行就是一个候选根（ADR-0030）。`tempFreeBytes` 是 `<data>/temp` 的空闲字节，装包要经过它
+  - `GET /api/v1/disk[?id=<插件 id>]` → `{roots:[{root,freeBytes,default,plugin}], tempFreeBytes}`：`roots` 是**列表**，每个插件根一行，按优先级排列（`default=true` 是默认安装根）；目录还不存在时向上找最近的存在祖先再取 statvfs（新装没有 `plugins/`），拿不到数字的卷给 `null`。`?id=` 让每行多一个 `plugin` 字段（`{id,version,directory,bytes}`，没装为 `null`；`bytes` 是当前版本目录的实际占用，升级判断要用它，量不到给 `null`），调用方据此区分「原地升级」（这个根已经有它）和「新装」（挑一个装得下的根）；id 不合法 400，未知 id 不是错误。多根配置下每行就是一个候选根（ADR-0030）。`tempFreeBytes` 是 `<data>/temp` 的空闲字节，装包要经过它
   - `GET /` → 内嵌 Web 控制台（静态 HTML；页面本身不需要认证，API 调用仍走同一鉴权）
   - `GET /assets/{*path}` → 控制台的其余静态文件（同样免认证；页面只在 `/`）
   - `POST /api/v1/plugins`：body 为 `.spk` 原始字节（`application/octet-stream`），query `strategy` / `enable` / `allow_hooks` / `root`；流式解包到**选中的插件根**（`root` 显式指定，否则装得下且剩余空间最小的根，ADR-0030），512 MiB 上限；返回 `{id,version,state}`。`root` 不在 `plugins_dir` 里 → 400 并列出可选根；同一 id 已装在别的根 → 409（先卸载）；都装不下 → 500，消息里带每个根的空闲字节

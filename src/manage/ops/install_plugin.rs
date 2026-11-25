@@ -26,6 +26,13 @@ use keep_old::{install_keep_old, install_keep_old_staged};
 use replace::{install_replace, install_replace_staged};
 use space::{directory_size, free_space, out_of_space};
 
+/// What an installed plugin currently occupies on disk, for the install
+/// dialog's arithmetic: an upgrade needs room for the new copy *while* this one
+/// still exists.
+pub(crate) fn installed_bytes(directory: &Path) -> Option<u64> {
+    directory_size(directory).ok()
+}
+
 pub(crate) use root::install_root;
 
 /// Preflight a package that has already been streamed into a staging directory.
