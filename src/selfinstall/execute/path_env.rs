@@ -5,6 +5,10 @@
 //! which key they open: the parsing, the "already there" comparison and the
 //! `WM_SETTINGCHANGE` broadcast are one implementation.
 
+// Only the Windows PATH editors call these three; `cfg(test)` keeps them
+// compiled for the tests, which are platform-neutral. Without the gate the bare
+// Linux bin target reports dead_code for every one of them (#318).
+#[cfg(any(windows, test))]
 /// The one line-editing rule for a `PATH`-style value.
 ///
 /// Windows compares path entries case-insensitively and a trailing separator
@@ -21,6 +25,7 @@ pub(super) fn same_entry(left: &str, right: &str) -> bool {
 
 /// Append `dir` to a `;`-separated value. The bool is false when it was already
 /// there, so a reinstall does not grow the value.
+#[cfg(any(windows, test))]
 pub(super) fn add_entry(existing: &str, dir: &str) -> (String, bool) {
     let entries: Vec<&str> = existing
         .split(';')
@@ -38,6 +43,7 @@ pub(super) fn add_entry(existing: &str, dir: &str) -> (String, bool) {
 }
 
 /// Drop every entry that names `dir`. The bool is false when nothing matched.
+#[cfg(any(windows, test))]
 pub(super) fn remove_entry(existing: &str, dir: &str) -> (String, bool) {
     let entries: Vec<&str> = existing.split(';').collect();
     let kept: Vec<&str> = entries
