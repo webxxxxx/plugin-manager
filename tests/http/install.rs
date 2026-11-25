@@ -1125,6 +1125,10 @@ fn a_streamed_install_lands_on_the_root_the_request_names() {
         serde_json::json!(second.join("demo").display().to_string()),
         "the list names the directory the plugin was installed into"
     );
+    assert_eq!(
+        demo["installRootIndex"], 2,
+        "the console numbers the roots the way the settings list does: {demo}"
+    );
     let config = raw_request(&address, "GET", "/api/v1/config/demo", "", b"");
     assert_eq!(
         config.status,

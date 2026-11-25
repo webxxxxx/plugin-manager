@@ -331,23 +331,28 @@ const CHECKS = [
     },
   },
   {
-    id: "plugin-list-shows-install-dir",
+    id: "plugin-list-shows-root-index",
     run(page) {
       const body = functionBody(page, "render");
-      if (!body.includes("where.textContent = plugin.installDir;")) {
-        throw new Error("the line under a plugin name must be where it is installed");
+      if (!body.includes("where.textContent = plugin.id;")) {
+        throw new Error("the line under a plugin name is its id plus its root number");
       }
-      // The primary line may fall back to the id (a plugin without a name);
-      // the line under it may not — the install path already ends in the id.
-      if (/where\.textContent\s*=(?!\s*plugin\.installDir\s*;)/.test(body)) {
-        throw new Error("the install line must name the plugin directory, not the id");
+      if (!body.includes("badge.textContent = plugin.installRootIndex")) {
+        throw new Error("the number must be the plugin root index");
       }
-      return "the line under a plugin name is its install directory";
+      if (!body.includes("where.title = '安装位置：' + plugin.installDir")) {
+        throw new Error("the full install path belongs in the tip, not in the row");
+      }
+      // The path itself must never be printed: it is what made the row too wide.
+      if (/textContent = [^;]*plugin\.installDir/.test(body)) {
+        throw new Error("the install path must not be printed in the row");
+      }
+      return "the line under a plugin name is its id and its root number";
     },
     mutate(page) {
       return page.replace(
-        "where.textContent = plugin.installDir;",
-        "where.textContent = plugin.id;",
+        "badge.textContent = plugin.installRootIndex ? String(plugin.installRootIndex) : '';",
+        "badge.textContent = plugin.installDir;",
       );
     },
   },
