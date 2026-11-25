@@ -53,7 +53,7 @@ pub(super) fn free_space(path: &Path) -> Result<u64, ProblemError> {
     }
 }
 
-pub(super) fn directory_size(path: &Path) -> Result<u64, ProblemError> {
+pub(crate) fn directory_size(path: &Path) -> Result<u64, ProblemError> {
     let mut total = 0u64;
     let entries = fs::read_dir(path)
         .map_err(|error| Problem::Internal.error(format!("read {}: {}", path.display(), error)))?;

@@ -211,10 +211,15 @@ fn installed_plugin(root: &std::path::Path, id: &str) -> Option<Value> {
     if version.is_empty() {
         return None;
     }
+    // How much the installed copy occupies: a caller deciding whether an
+    // upgrade fits needs this, because the old tree stays until the new one is
+    // committed. `null` rather than 0 when it cannot be measured.
+    let bytes = crate::manage::installed_bytes(&directory.join(version));
     Some(json!({
         "id": id,
         "version": version,
         "directory": directory.to_string_lossy(),
+        "bytes": bytes,
     }))
 }
 

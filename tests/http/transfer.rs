@@ -102,6 +102,7 @@ fn the_disk_route_marks_the_root_that_holds_the_asked_plugin() {
     let mut sandbox = Sandbox::new();
     let plugin = sandbox.data.join("plugins/demo");
     std::fs::create_dir_all(plugin.join("1.0.0")).expect("version dir");
+    std::fs::write(plugin.join("1.0.0/payload.bin"), vec![0u8; 4096]).expect("payload");
     std::fs::write(plugin.join("current"), "1.0.0").expect("current");
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
@@ -112,6 +113,10 @@ fn the_disk_route_marks_the_root_that_holds_the_asked_plugin() {
     let row = &body["roots"][0];
     assert_eq!(row["plugin"]["id"], "demo", "{body}");
     assert_eq!(row["plugin"]["version"], "1.0.0", "{body}");
+    assert!(
+        row["plugin"]["bytes"].as_u64().unwrap_or(0) >= 4096,
+        "an upgrade's arithmetic needs what the old copy occupies: {body}"
+    );
 
     let ghost = raw_request(&address, "GET", "/api/v1/disk?id=ghost", "", b"");
     assert_eq!(ghost.status, 200, "{:?}", ghost.body);
