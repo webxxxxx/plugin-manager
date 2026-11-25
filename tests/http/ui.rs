@@ -122,6 +122,14 @@ fn serves_the_embedded_console() {
         html.contains("settingsTipLine('来源'"),
         "settings dialog keeps provenance in the hover tip"
     );
+    // The line under a plugin name names the directory it sits in; with
+    // several plugin roots the id alone cannot tell one root from another
+    // (#308).
+    assert!(
+        html.contains("where.textContent = plugin.installDir")
+            && !html.contains("kind.textContent"),
+        "the plugin list must show where a plugin is installed, not its id"
+    );
     // Regression guards for the settings form: false spellings are "关", an
     // untouched password is not a mismatch, and a restart that expires the
     // session stops the poll instead of producing a stream of 401s.

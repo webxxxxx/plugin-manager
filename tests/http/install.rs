@@ -1015,6 +1015,11 @@ fn a_streamed_install_lands_on_the_root_the_request_names() {
         .find(|item| item["id"] == "demo")
         .expect("demo is listed");
     assert_eq!(demo["hasConfig"], true, "{demo}");
+    assert_eq!(
+        demo["installDir"],
+        serde_json::json!(second.join("demo").display().to_string()),
+        "the list names the directory the plugin was installed into"
+    );
     let config = raw_request(&address, "GET", "/api/v1/config/demo", "", b"");
     assert_eq!(
         config.status,

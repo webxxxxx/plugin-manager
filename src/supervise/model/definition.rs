@@ -301,6 +301,7 @@ fn load_scripts(
             failures: 0,
             last_exit: None,
             config: None,
+            install_dir: None,
         };
         if let Err(reason) = registry.insert(service) {
             issues.push(fail(&id, reason));
@@ -576,6 +577,7 @@ fn validate(
         failures: 0,
         last_exit: None,
         config: None,
+        install_dir: None,
     })
 }
 
