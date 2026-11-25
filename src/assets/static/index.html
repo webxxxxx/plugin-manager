@@ -62,8 +62,16 @@
   .sheet .sheet-head .muted { overflow-wrap:anywhere; }
   .sheet .sheet-body { flex:1 1 auto; min-height:0; min-width:0; overflow:auto; padding:0 21px 4px; }
   .sheet .sheet-foot { flex:none; display:flex; justify-content:flex-end; gap:8px; padding:12px 21px 16px; border-top:1px solid var(--line); min-width:0; }
-  .setting-group { margin:16px 0 0; font-size:13px; font-weight:600; }
-  .setting-group:first-child { margin-top:4px; }
+  /* One page per setting group. The strip scrolls sideways on a phone instead
+     of wrapping into two rows; the active tab is the panel's own white so the
+     border below reads as an underline. */
+  .sheet-tabs { flex:none; display:flex; gap:4px; padding:10px 21px 0; overflow-x:auto; -webkit-overflow-scrolling:touch; border-bottom:1px solid var(--line); }
+  .sheet-tabs button { flex:0 0 auto; padding:6px 10px; font-size:13px; border:1px solid transparent; border-radius:6px 6px 0 0; background:transparent; color:var(--muted); }
+  .sheet-tabs button:hover { color:var(--blue); }
+  .sheet-tabs button.active { background:#fff; color:var(--blue); font-weight:600; border-color:var(--line); border-bottom-color:#fff; margin-bottom:-1px; }
+  .sheet-tabs button.changed::after { content:''; display:inline-block; width:6px; height:6px; margin-left:5px; border-radius:50%; background:var(--blue); vertical-align:middle; }
+  .settings-tab { display:none; }
+  .settings-tab.active { display:block; }
   .setting { display:grid; grid-template-columns:minmax(130px,150px) minmax(0,1fr); align-items:center; gap:4px 8px; padding:9px 0; border-bottom:1px solid #f1f3f6; }
   .setting:last-child { border-bottom:0; }
   .setting-label { display:flex; align-items:center; gap:6px; min-width:0; }
@@ -85,6 +93,7 @@
     #toasts { left:8px; right:8px; transform:none; align-items:stretch; }
     .toast { max-width:none; min-width:0; }
     .sheet .sheet-head, .sheet .sheet-body, .sheet .sheet-foot { padding-left:19px; padding-right:19px; }
+    .sheet-tabs { padding-left:19px; padding-right:19px; }
     .setting { grid-template-columns:1fr; gap:4px; }
   }
 </style>
@@ -863,6 +872,7 @@ function showSettingsModal(data) {
 
   function mark(key, value) {
     changes[key] = value;
+    markTabs();
   }
 
   function field(entry) {
@@ -964,15 +974,52 @@ function showSettingsModal(data) {
     return row;
   }
 
-  groups.forEach(function (group) {
-    const heading = document.createElement('div');
-    heading.className = 'setting-group';
-    heading.textContent = group;
-    body.appendChild(heading);
-    byGroup[group].forEach(function (entry) {
-      body.appendChild(entry.kind === 'password-hash' ? passwordField(entry) : field(entry));
+  // One page per group, all rendered up front and only shown or hidden: an
+  // unsaved edit in another tab survives every switch (#297). The strip keeps
+  // the order the payload gave, which is the Group order in config_doc.
+  const tabs = document.createElement('div');
+  tabs.className = 'sheet-tabs';
+  const pages = {};
+  const tabButtons = {};
+
+  function showTab(group) {
+    groups.forEach(function (name) {
+      tabButtons[name].classList.toggle('active', name === group);
+      pages[name].classList.toggle('active', name === group);
     });
+    // A tip pinned to a field on the tab we are leaving would float over this
+    // one.
+    hideSettingsTip();
+  }
+
+  // A dot on every tab that owns a pending edit: the sheet hides whole pages,
+  // so without it "保存" could commit something the operator never saw.
+  function markTabs() {
+    Object.keys(tabButtons).forEach(function (group) {
+      const dirty = byGroup[group].some(function (entry) {
+        return Object.prototype.hasOwnProperty.call(changes, entry.key);
+      });
+      tabButtons[group].classList.toggle('changed', dirty);
+    });
+  }
+
+  groups.forEach(function (group) {
+    const tab = document.createElement('button');
+    tab.type = 'button';
+    tab.textContent = group;
+    tab.onclick = function () { showTab(group); };
+    tabs.appendChild(tab);
+    tabButtons[group] = tab;
+
+    const page = document.createElement('div');
+    page.className = 'settings-tab';
+    byGroup[group].forEach(function (entry) {
+      page.appendChild(entry.kind === 'password-hash' ? passwordField(entry) : field(entry));
+    });
+    body.appendChild(page);
+    pages[group] = page;
   });
+  if (groups.length) showTab(groups[0]);
 
   const actions = document.createElement('div');
   actions.className = 'sheet-foot';
@@ -1047,6 +1094,7 @@ function showSettingsModal(data) {
   actions.appendChild(close);
   actions.appendChild(save);
   panel.appendChild(head);
+  panel.appendChild(tabs);
   panel.appendChild(body);
   panel.appendChild(actions);
   modal.appendChild(panel);

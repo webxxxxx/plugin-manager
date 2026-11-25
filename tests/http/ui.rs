@@ -75,6 +75,17 @@ fn serves_the_embedded_console() {
         html.contains("id=\"tip\"") && html.contains("entry.label || entry.key"),
         "settings dialog shows Chinese labels and the English key in a hover tip"
     );
+    // One page per group: a scrolling strip at the top of the sheet, one panel
+    // per group, and a switch that only toggles classes — rebuilding on switch
+    // would throw away an unsaved edit made in another tab (#297).
+    assert!(
+        html.contains("sheet-tabs") && html.contains(".settings-tab { display:none; }"),
+        "settings must render one tab per group"
+    );
+    assert!(
+        html.contains("function showTab") && !html.contains("heading.className = 'setting-group'"),
+        "the flat list of groups must be gone"
+    );
     assert!(
         html.contains("settingsTipLine('来源'"),
         "settings dialog keeps provenance in the hover tip"
