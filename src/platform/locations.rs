@@ -92,6 +92,73 @@ pub(crate) fn free_bytes(root: &Path) -> Option<u64> {
     Host.free_disk(root)
 }
 
+/// An opaque id for the volume that holds `root`, or `None` when the root is
+/// not there.
+///
+/// Two paths with the same id share one filesystem. That is the fact a
+/// pre-flight needs and `free_bytes` cannot give: a package downloaded on one
+/// volume and copied onto another competes for space twice, while the same
+/// package moved within one volume competes once.
+pub(crate) fn volume_id(root: &Path) -> Option<String> {
+    if !root.is_dir() {
+        return None;
+    }
+    volume_of(root)
+}
+
+#[cfg(unix)]
+fn volume_of(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.dev().to_string())
+}
+
+#[cfg(windows)]
+fn volume_of(path: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    // A directory needs BACKUP_SEMANTICS, and only its attributes are read: the
+    // volume serial number of that handle is the id.
+    // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
+    let ok = unsafe { GetFileInformationByHandle(handle, &mut info) } != 0;
+    // SAFETY: The handle/pointer is produced by the immediately preceding OS call and is valid for this call.
+    unsafe { CloseHandle(handle) };
+    ok.then(|| info.dwVolumeSerialNumber.to_string())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn volume_of(path: &Path) -> Option<String> {
+    let _ = path;
+    None
+}
+
 /// Whether a root can be read right now. A root on a volume that was pulled
 /// out looks absent, not empty: that difference is what keeps its index
 /// entries instead of discarding them (see [`rebuild`]).
@@ -347,6 +414,23 @@ mod tests {
             ]
         );
         assert_eq!(discovery.map().len(), 2);
+    }
+
+    #[test]
+    fn two_directories_on_one_volume_share_their_id_and_an_absent_one_has_none() {
+        let root = TempDir::new();
+        let first = root.0.join("internal");
+        let second = root.0.join("sd");
+        fs::create_dir_all(&first).expect("first");
+        fs::create_dir_all(&second).expect("second");
+
+        let volume = volume_id(&first).expect("a directory lives on a volume");
+        assert_eq!(
+            volume_id(&second).as_deref(),
+            Some(volume.as_str()),
+            "paths on one filesystem must answer with one id"
+        );
+        assert_eq!(volume_id(&root.0.join("absent")), None);
     }
 
     #[test]
