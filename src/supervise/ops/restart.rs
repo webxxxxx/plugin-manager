@@ -8,15 +8,12 @@
 
 use std::process::{Command, Stdio};
 
-/// Spawn the detached helper and return its pid. The caller still has to stop
-/// the daemon; the helper waits for exactly that.
-pub(crate) fn spawn_helper() -> std::io::Result<u32> {
-    spawn_helper_from(&std::env::current_exe()?)
-}
-
-/// Spawn the helper with an explicit executable path. An upgrade calls this
-/// with the freshly installed binary: this process may be the image that was
-/// just renamed aside on Windows.
+/// Spawn the detached `restart-helper` and return its pid. The caller still has
+/// to stop the daemon; the helper waits for exactly that.
+///
+/// The path is always explicit: an upgrade calls this with the freshly
+/// installed binary, because this process may be the image that was just
+/// renamed aside on Windows.
 pub(crate) fn spawn_helper_from(executable: &std::path::Path) -> std::io::Result<u32> {
     spawn_detached(
         executable,
@@ -28,8 +25,10 @@ pub(crate) fn spawn_helper_from(executable: &std::path::Path) -> std::io::Result
 ///
 /// It cannot start a replacement itself: the init system owns this process, so
 /// the helper asks this daemon to stop and lets the supervisor bring it back.
-pub(crate) fn spawn_service_helper() -> std::io::Result<u32> {
-    spawn_detached(&std::env::current_exe()?, &["service-restart-helper"])
+/// The caller passes the binary to run: an upgrade hands it the freshly
+/// installed file, everything else the running one.
+pub(crate) fn spawn_service_helper_from(executable: &std::path::Path) -> std::io::Result<u32> {
+    spawn_detached(executable, &["service-restart-helper"])
 }
 
 fn spawn_detached(executable: &std::path::Path, args: &[&str]) -> std::io::Result<u32> {

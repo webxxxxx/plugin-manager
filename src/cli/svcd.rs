@@ -244,44 +244,45 @@ fn spawn_foreground_daemon(config: &Config) -> Result<u32, String> {
         .map_err(|error| format!("spawn: {}", error))
 }
 
-/// Restart the daemon. A user-mode daemon is restarted here; a system service
-/// belongs to its service manager, which owns its lifetime.
+/// Restart the daemon.
+///
+/// The route is the one every restart point shares (#317): a user daemon is
+/// stopped here and started again by the detached helper; a service daemon is
+/// handed to its init system, which owns its lifetime; a host with neither gets
+/// the command to run by hand on stderr, with a failed exit code.
 pub(crate) fn restart(host: &dyn Host) -> i32 {
-    if !paths::user_mode() {
-        eprintln!(
-            "svcd: this daemon runs as a service; restart it with the service manager \
-             (systemctl restart svcd / launchctl kickstart -k / sc stop svcd && sc start svcd)"
-        );
-        return 1;
-    }
-    let Some(config) = Config::bootstrap_or_report("svcd") else {
-        return 1;
-    };
-    if user_running(&config) {
-        if host.shutdown() != 0 {
-            eprintln!("svcd: the running daemon did not accept the shutdown request");
+    if paths::user_mode() {
+        let Some(config) = Config::bootstrap_or_report("svcd") else {
             return 1;
-        }
-        for _ in 0..200 {
-            if !user_running(&config) {
-                break;
+        };
+        if user_running(&config) {
+            if host.shutdown() != 0 {
+                eprintln!("svcd: the running daemon did not accept the shutdown request");
+                return 1;
             }
-            std::thread::sleep(std::time::Duration::from_millis(25));
+            for _ in 0..200 {
+                if !user_running(&config) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
         }
     }
     // Start the replacement from the detached helper rather than from this
     // process: the helper runs with null stdio, so the daemon it starts cannot
     // inherit whatever pipes the caller of `svcd restart` holds.
-    match crate::supervise::ops::restart::spawn_helper() {
-        Ok(helper) => {
-            println!("svcd restarting (helper pid {})", helper);
-            0
-        }
-        Err(error) => {
-            eprintln!("svcd: restart: {}", error);
-            1
-        }
+    let restarted = crate::selfinstall::restart_now(None);
+    if let Some(helper) = restarted.helper {
+        println!("svcd restarting (helper pid {})", helper);
+        return 0;
     }
+    eprintln!(
+        "svcd: {}",
+        restarted
+            .hint
+            .unwrap_or_else(crate::selfinstall::manual_hint)
+    );
+    1
 }
 
 /// Wait for the old daemon to release the control channel, then start a new one.

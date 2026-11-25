@@ -8,13 +8,13 @@ mod execute;
 mod plan;
 pub(crate) mod upgrade;
 
-pub(crate) use execute::service_can_restart_itself;
 #[cfg(windows)]
 pub(crate) use execute::wait_for_process;
 pub use execute::{
     ensure_conf, install_service, self_install, self_uninstall, service_start, service_status,
     service_stop, uninstall_service, ServiceStatus, Supervisor, Unmanaged,
 };
+pub(crate) use execute::{manual_hint, restart_now};
 #[cfg(windows)]
 pub(crate) use plan::SCM_NAME;
 #[cfg(windows)]

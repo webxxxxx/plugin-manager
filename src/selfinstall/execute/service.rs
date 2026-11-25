@@ -181,6 +181,55 @@ pub(crate) fn service_can_restart_itself() -> bool {
     false
 }
 
+/// Hosts without an init system this code knows how to ask.
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn service_can_restart_itself() -> bool {
+    false
+}
+
+/// What the operator types when this host cannot restart the daemon itself.
+///
+/// Every restart site shows this command (#317); `restart_route` puts it behind
+/// the one sentence `restart the svcd service yourself: …`.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn manual_restart_command() -> String {
+    command_for(supervisor())
+}
+
+/// launchd keeps the daemon alive (`KeepAlive`), so `kickstart -k` restarts it.
+#[cfg(target_os = "macos")]
+pub(crate) fn manual_restart_command() -> String {
+    "launchctl kickstart -k system/com.webxxxxx.svcd".to_string()
+}
+
+/// The SCM owns the process lifetime; stop then start is the operator's move.
+#[cfg(windows)]
+pub(crate) fn manual_restart_command() -> String {
+    format!("sc stop {} && sc start {}", SCM_NAME, SCM_NAME)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn manual_restart_command() -> String {
+    "svcd start".to_string()
+}
+
+/// The command each init system answers to, kept pure so the matrix is testable.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn command_for(supervisor: Supervisor) -> String {
+    match supervisor {
+        Supervisor::Systemd => "systemctl restart svcd".to_string(),
+        Supervisor::Procd => format!("{} restart", PROCD_SCRIPT),
+        Supervisor::Busybox => format!(
+            "kill -HUP 1 (the ::respawn: line in {} starts it again)",
+            INITTAB
+        ),
+        Supervisor::Manual => format!(
+            "{} (the launcher `--manual` wrote)",
+            launcher_path().display()
+        ),
+    }
+}
+
 /// The order is the installer's: an existing init registration wins over a
 /// binary that merely happens to be in `PATH`.
 #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
@@ -346,6 +395,19 @@ mod tests {
         assert!(can_self_restart(Supervisor::Procd));
         assert!(can_self_restart(Supervisor::Busybox));
         assert!(!can_self_restart(Supervisor::Manual));
+    }
+
+    /// #317: the hint names the command this host's init system answers to, so
+    /// the operator never has to translate a generic sentence.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn the_manual_command_follows_the_init_system() {
+        assert_eq!(command_for(Supervisor::Systemd), "systemctl restart svcd");
+        assert_eq!(command_for(Supervisor::Procd), "/etc/init.d/svcd restart");
+        let busybox = command_for(Supervisor::Busybox);
+        assert!(busybox.contains(INITTAB), "{busybox}");
+        let manual = command_for(Supervisor::Manual);
+        assert!(manual.contains("launcher"), "{manual}");
     }
 
     /// The launcher a manual install tells the operator to start.

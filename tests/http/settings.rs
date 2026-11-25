@@ -471,7 +471,10 @@ fn a_save_in_service_mode_saves_without_restarting() {
     assert_eq!(response.status, 200, "{:?}", response.body);
     assert_eq!(response.body["restarting"], false, "{:?}", response.body);
     let hint = response.body["hint"].as_str().unwrap_or("");
-    assert!(hint.contains("service manager"), "{hint}");
+    // #317: the save and the upgrade share one sentence; the command after the
+    // colon is the one this host's init system answers to.
+    assert!(hint.starts_with("saved; "), "{hint}");
+    assert!(hint.contains("restart the svcd service yourself"), "{hint}");
     assert!(fs::read_to_string(sandbox.config.join("svcd.conf"))
         .expect("conf")
         .contains("log_level = debug"));

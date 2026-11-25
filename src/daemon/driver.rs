@@ -195,32 +195,24 @@ impl Daemon {
 
     /// Restart the daemon after a settings save.
     ///
-    /// A system service belongs to its init system, so this is only offered
-    /// where that init system will bring the daemon back: the helper stops this
-    /// process and the supervisor starts it again (#306). A `--manual` install
-    /// or a Windows SCM service has nothing to lean on, and then the answer is
-    /// how to restart it by hand.
+    /// The route is the one `svcd restart` and an upgrade take (#317): a user
+    /// daemon is replaced by a detached helper, a service daemon is handed to
+    /// the init system that will respawn it, and a host with neither gets the
+    /// command to run by hand. The save already happened, so a helper that
+    /// cannot start is a hint, not a failed request.
     pub(super) fn restart_daemon(&mut self) -> Result<serde_json::Value, ProblemError> {
-        if !crate::platform::paths::user_mode() {
-            if !crate::selfinstall::service_can_restart_itself() {
-                return Ok(json!({
-                    "restarting": false,
-                    "hint": "saved; restart the service with the service manager \
-                             (systemctl restart svcd / launchctl kickstart -k / sc stop svcd && sc start svcd)",
-                }));
-            }
-            let helper =
-                crate::supervise::ops::restart::spawn_service_helper().map_err(|error| {
-                    Problem::Internal.error(format!("spawn service restart helper: {}", error))
-                })?;
+        let restarted = crate::selfinstall::restart_now(None);
+        if let Some(helper) = restarted.helper {
+            // The helper stops this daemon itself, after a short grace period
+            // that lets the HTTP response carrying `restarting: true` flush.
+            // Shutting down here could kill the process before the reply
+            // reaches the browser.
             return Ok(json!({"restarting": true, "helper": helper}));
         }
-        // The helper stops this daemon itself, after a short grace period that
-        // lets the HTTP response carrying `restarting: true` flush. Shutting
-        // down here could kill the process before the reply reaches the browser.
-        let helper = crate::supervise::ops::restart::spawn_helper()
-            .map_err(|error| Problem::Internal.error(format!("spawn restart helper: {}", error)))?;
-        Ok(json!({"restarting": true, "helper": helper}))
+        let hint = restarted
+            .hint
+            .unwrap_or_else(crate::selfinstall::manual_hint);
+        Ok(json!({"restarting": false, "hint": format!("saved; {}", hint)}))
     }
 
     /// Clear the daemon log or one plugin's logs. The daemon log goes through

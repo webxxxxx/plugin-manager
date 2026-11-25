@@ -46,16 +46,16 @@ impl Sandbox {
         .expect("write definition");
     }
 
-    /// Run an installed alias (`svc` / `plugin` / `mcp` / `svcd`) from this
-    /// sandbox. The multicall binary dispatches on its file stem.
-    fn run_as(&self, name: &str, args: &[&str]) -> Output {
+    /// The path of one multicall alias in this sandbox, copied from the binary
+    /// `new` installed. Windows reports a sharing violation while another
+    /// sandbox's copy of the freshly written binary is still being scanned or
+    /// released, so the copy retries.
+    fn alias(&self, name: &str) -> PathBuf {
         let suffix = if cfg!(windows) { ".exe" } else { "" };
         let binary = self.root.join(format!("{}{}", name, suffix));
         if binary == self.binary {
-            return self.run(args);
+            return binary;
         }
-        // Windows reports a sharing violation while another sandbox's copy of
-        // the freshly written binary is still being scanned or released.
         let mut last = None;
         for _ in 0..50 {
             match fs::copy(&self.binary, &binary) {
@@ -78,6 +78,16 @@ impl Sandbox {
             fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
                 .expect("make alias executable");
         }
+        binary
+    }
+
+    /// Run an installed alias (`svc` / `plugin` / `mcp` / `svcd`) from this
+    /// sandbox. The multicall binary dispatches on its file stem.
+    fn run_as(&self, name: &str, args: &[&str]) -> Output {
+        let binary = self.alias(name);
+        if binary == self.binary {
+            return self.run(args);
+        }
         let mut command = Command::new(&binary);
         command
             .args(args)
@@ -90,6 +100,24 @@ impl Sandbox {
             .env("SVCD_PROBE_AVAILABLE_MEMORY", "8589934592")
             .env("SVCD_TEST_UNPRIVILEGED", "1");
         command.output().expect("run alias")
+    }
+
+    /// `svcd` (not the `svc` alias `run` uses) with string environment, for the
+    /// keys a test needs to force: `SVCD_USER=0` is service mode without
+    /// touching the host's privilege, `SVCD_TEST_NO_SERVICE_RESTART=1` pins a
+    /// host with no init system to lean on.
+    fn run_svcd_with_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Output {
+        let mut command = Command::new(self.alias("svcd"));
+        command
+            .args(args)
+            .env("SVCD_CONFIG_DIR", self.config_dir())
+            .env("SVCD_DATA_DIR", self.data_dir())
+            .env("SVCD_LOG_DIR", self.logs_dir())
+            .env("SVCD_PROBE_AVAILABLE_MEMORY", "8589934592");
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        command.output().expect("run svcd with env")
     }
 
     /// The same command with extra environment, for the keys a test needs to
@@ -325,6 +353,26 @@ fn daemon_commands_exit_two_until_the_channel_exists() {
         );
         assert!(stderr(&output).contains("unreachable"));
     }
+}
+
+/// #317: `svcd restart` takes the same route as a settings save and an upgrade.
+/// A host with no restart program does not pretend to have restarted: it prints
+/// the command to run and fails.
+#[test]
+fn restart_without_a_restart_program_prints_the_command() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run_svcd_with_env(
+        &["restart"],
+        &[("SVCD_USER", "0"), ("SVCD_TEST_NO_SERVICE_RESTART", "1")],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let text = stderr(&output);
+    assert!(text.contains("restart the svcd service yourself"), "{text}");
 }
 
 #[test]

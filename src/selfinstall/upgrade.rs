@@ -167,7 +167,7 @@ pub fn apply_remote(config: &Config) -> Result<Applied, String> {
     let sums = download(config, &sums_asset)?;
     install_downloaded(config, &asset, archive, sums)?;
     let binary = installed_binary(config)?;
-    let (restarting, hint) = restart(&binary)?;
+    let (restarting, hint) = restart(&binary);
     Ok(Applied {
         version: latest,
         binary,
@@ -201,7 +201,7 @@ pub fn apply_file(config: &Config, archive: &Path, sums: Option<&Path>) -> Resul
     let version = version_from_archive(name).unwrap_or_else(current_version);
     install_archive(config, &bytes, name)?;
     let binary = installed_binary(config)?;
-    let (restarting, hint) = restart(&binary)?;
+    let (restarting, hint) = restart(&binary);
     Ok(Applied {
         version,
         binary,
@@ -643,23 +643,15 @@ fn replace_file(staged: &Path, target: &Path, _name: &str) -> Result<(), String>
         .map_err(|error| format!("cannot install {}: {}", target.display(), error))
 }
 
-fn restart(binary: &Path) -> Result<(bool, Option<String>), String> {
-    // The daemon restarts through the same detached helper the settings screen
-    // uses, but from the *installed* path: this process may be the renamed
-    // image on Windows, and its own path already points at the new file.
-    if !crate::platform::paths::user_mode() {
-        return Ok((
-            false,
-            Some(
-                "upgraded; restart the service with the service manager \
-                 (systemctl restart svcd / launchctl kickstart -k / sc stop svcd && sc start svcd)"
-                    .to_string(),
-            ),
-        ));
-    }
-    crate::supervise::ops::restart::spawn_helper_from(binary)
-        .map(|pid| (true, Some(format!("restart helper {}", pid))))
-        .map_err(|error| format!("spawn restart helper: {}", error))
+/// Ask for the restart after the binaries were swapped.
+///
+/// The installed path is what the helper must run: this process may be the
+/// renamed image on Windows, and its own path already points at the new file.
+/// The route is the one every restart site takes (#317), so a host that cannot
+/// restart itself gets the manual command instead of a failed upgrade.
+fn restart(binary: &Path) -> (bool, Option<String>) {
+    let restarted = crate::selfinstall::restart_now(Some(binary));
+    (restarted.helper.is_some(), restarted.hint)
 }
 
 /// A tag with a `-` suffix (`0.2.0-rc1`) is a prerelease: the console never
