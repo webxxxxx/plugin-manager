@@ -58,3 +58,6 @@ manifest 格式重编号为唯一的 `schema: 1`，本 ADR 的两条结论随之
 
 `lifecycle.status` 与超时默认值不变；`plugin bundle --from-core` 与 core 脚本推导同步改成把声明的
 `start` 写进 `exec.args`。
+
+补充（#324）：`stop` 在「实例不会再回来」的每条路径上都跑——主动停、崩溃且不重启、崩溃且要重启、
+启动失败；服务只有在它返回之后才报 `Stopped`。

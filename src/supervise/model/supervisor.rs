@@ -53,6 +53,9 @@ pub enum Action {
     /// Run the stop action (if any) before spawning the replacement; the slot
     /// sends `RestartReady` when the cleanup finishes.
     Cleanup,
+    /// The instance is gone for good: run the stop action (if any), then the
+    /// slot sends `StopSettled` so `Stopped` still means the cleanup finished.
+    CleanupThenStop,
     Publish,
     Withdraw,
     GiveUp,
@@ -212,10 +215,14 @@ impl Machine {
                                 self.ready_since_ms = None;
                                 self.next_at_ms = None;
                             } else {
-                                self.state = S::Stopped;
+                                // The instance is not coming back, but its stop
+                                // action still has cleanup to do; settle only
+                                // after it runs (the slot sends StopSettled).
+                                self.state = S::Stopping;
                                 self.since_ms = now_ms;
                                 self.ready_since_ms = None;
                                 self.next_at_ms = None;
+                                out.push(CleanupThenStop);
                             }
                         } else {
                             let stable = is_stable(self.ready_since_ms, now_ms);
@@ -679,13 +686,18 @@ mod tests {
         let mut machine = Machine::new(Restart::Never);
         start(&mut machine, 1, 0);
         ready(&mut machine, 1, 5);
-        machine.step(
+        let actions = machine.step(
             Event::Exited {
                 pid: 1,
                 code: Some(1),
             },
             10,
         );
+        // The instance is gone for good, but its stop action still runs: the
+        // service is stopped once that cleanup settles (#324).
+        assert!(actions.contains(&Action::CleanupThenStop));
+        assert_eq!(machine.state, State::Stopping);
+        machine.step(Event::StopSettled, 11);
         assert_eq!(machine.state, State::Stopped);
         assert_eq!(machine.last_exit, Some(1));
         assert_eq!(machine.next_at_ms, None);
@@ -729,7 +741,7 @@ mod tests {
         start(&mut machine, 7, 0);
         ready(&mut machine, 7, 10);
 
-        machine.step(
+        let actions = machine.step(
             Event::Exited {
                 pid: 7,
                 code: Some(1),
@@ -737,6 +749,10 @@ mod tests {
             20,
         );
 
+        // A failed one-shot is not "kept": its stop action runs first.
+        assert!(actions.contains(&Action::CleanupThenStop));
+        assert_eq!(machine.state, State::Stopping);
+        machine.step(Event::StopSettled, 21);
         assert_eq!(machine.state, State::Stopped);
         assert_eq!(machine.pid, None);
     }
@@ -804,6 +820,9 @@ mod tests {
 
         assert!(actions.contains(&Action::Withdraw));
         assert!(!actions.contains(&Action::Spawn));
+        assert!(actions.contains(&Action::CleanupThenStop));
+        assert_eq!(machine.state, State::Stopping);
+        machine.step(Event::StopSettled, 21);
         assert_eq!(machine.state, State::Stopped);
         assert_eq!(machine.last_exit, Some(0));
     }

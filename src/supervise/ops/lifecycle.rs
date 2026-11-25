@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::projection::Status;
-use crate::kernel::registry::{Kind, Registry, State, RESERVED_ID};
+use crate::kernel::registry::{Kind, Registry, Service, State, RESERVED_ID};
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::platform::clock::Clock;
 use crate::platform::compat;
@@ -101,11 +101,7 @@ impl Supervisor {
             }
         }
         for layer in layers {
-            let deadline = clock
-                .now()
-                .mono_ms
-                .saturating_add(supervisor::START_TIMEOUT_MS)
-                .saturating_add(self.start_hook_budget(layer.iter().map(String::as_str)));
+            let deadline = self.start_deadline(clock, layer.iter().map(String::as_str));
             self.start_layer(&layer, deadline, clock)?;
         }
 
@@ -304,26 +300,30 @@ impl Supervisor {
         self.start_service(id, clock)
     }
 
+    /// The window a start request gets: the start actions, then the process
+    /// windows they precede.
+    pub(super) fn start_deadline<'a>(
+        &self,
+        clock: &Clock,
+        ids: impl Iterator<Item = &'a str>,
+    ) -> u64 {
+        clock
+            .now()
+            .mono_ms
+            .saturating_add(supervisor::START_TIMEOUT_MS)
+            .saturating_add(self.start_action_budget(ids))
+    }
+
     /// How long the start actions of these services may take before their
     /// process windows even open.
-    pub(super) fn start_hook_budget<'a>(&self, ids: impl Iterator<Item = &'a str>) -> u64 {
-        ids.filter_map(|id| self.registry.get(id))
-            .filter_map(|service| service.lifecycle.as_ref())
-            .filter_map(|lifecycle| lifecycle.start.as_ref())
-            .map(|hook| hook.timeout_ms)
-            .max()
-            .unwrap_or(0)
+    pub(super) fn start_action_budget<'a>(&self, ids: impl Iterator<Item = &'a str>) -> u64 {
+        start_action_budget(ids.filter_map(|id| self.registry.get(id)))
     }
 
     /// How long the stop action of this service may take after its process is
     /// gone.
-    fn stop_hook_budget(&self, id: &str) -> u64 {
-        self.registry
-            .get(id)
-            .and_then(|service| service.lifecycle.as_ref())
-            .and_then(|lifecycle| lifecycle.stop.as_ref())
-            .map(|hook| hook.timeout_ms)
-            .unwrap_or(0)
+    fn stop_action_budget(&self, id: &str) -> u64 {
+        stop_action_budget(self.registry.get(id))
     }
 
     pub(crate) fn stop_service(&mut self, id: &str, clock: &Clock) -> Result<Status, ProblemError> {
@@ -356,7 +356,7 @@ impl Supervisor {
             .mono_ms
             .saturating_add(supervisor::STOP_TIMEOUT_MS)
             .saturating_add(supervisor::KILL_TIMEOUT_MS)
-            .saturating_add(self.stop_hook_budget(id))
+            .saturating_add(self.stop_action_budget(id))
             .saturating_add(1_000);
         loop {
             self.pump(clock.now());
@@ -428,7 +428,7 @@ impl Supervisor {
                 .saturating_add(
                     active
                         .iter()
-                        .map(|id| self.stop_hook_budget(id))
+                        .map(|id| self.stop_action_budget(id))
                         .max()
                         .unwrap_or(0),
                 )
@@ -477,10 +477,79 @@ fn shutdown_layers(registry: &Registry, ids: Vec<String>) -> (Vec<Vec<String>>, 
     }
 }
 
+/// The longest start action among these services, or zero when none declares
+/// one. The process window only opens once a start action finishes, so a start
+/// request has to budget for it.
+fn start_action_budget<'a>(services: impl Iterator<Item = &'a Service>) -> u64 {
+    services
+        .filter_map(|service| service.lifecycle.as_ref())
+        .filter_map(|lifecycle| lifecycle.start.as_ref())
+        .map(|action| action.timeout_ms)
+        .max()
+        .unwrap_or(0)
+}
+
+/// The stop action's timeout, or zero when the service declares none. The
+/// service is stopped only after that action ends.
+fn stop_action_budget(service: Option<&Service>) -> u64 {
+    service
+        .and_then(|service| service.lifecycle.as_ref())
+        .and_then(|lifecycle| lifecycle.stop.as_ref())
+        .map(|action| action.timeout_ms)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::registry::{contract_for, Carrier, Exec, Ready, Restart, Service};
+    use crate::kernel::registry::{
+        contract_for, Carrier, Exec, Hook, Lifecycle, Ready, Restart, Service,
+    };
+
+    fn action(timeout_ms: u64) -> Hook {
+        Hook {
+            path: "/bin/true".into(),
+            args: Vec::new(),
+            env: Default::default(),
+            timeout_ms,
+            interpreter: None,
+        }
+    }
+
+    #[test]
+    fn the_start_budget_is_the_longest_start_action() {
+        let mut one = slot_backed("one", &[]);
+        one.lifecycle = Some(Lifecycle {
+            start: Some(action(30_000)),
+            stop: None,
+            status: None,
+        });
+        let mut two = slot_backed("two", &[]);
+        two.lifecycle = Some(Lifecycle {
+            start: Some(action(45_000)),
+            stop: None,
+            status: None,
+        });
+        let three = slot_backed("three", &[]);
+        assert_eq!(
+            start_action_budget([&one, &two, &three].into_iter()),
+            45_000
+        );
+        assert_eq!(start_action_budget([&three].into_iter()), 0);
+    }
+
+    #[test]
+    fn the_stop_budget_is_the_stop_action_timeout() {
+        let mut service = slot_backed("demo", &[]);
+        assert_eq!(stop_action_budget(Some(&service)), 0);
+        service.lifecycle = Some(Lifecycle {
+            start: None,
+            stop: Some(action(10_000)),
+            status: None,
+        });
+        assert_eq!(stop_action_budget(Some(&service)), 10_000);
+        assert_eq!(stop_action_budget(None), 0);
+    }
 
     fn slot_backed(id: &str, deps: &[&str]) -> Service {
         let limits = crate::platform::limits::test_default();

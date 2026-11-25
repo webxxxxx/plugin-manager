@@ -8,42 +8,41 @@
 use std::process::{Child, ExitStatus};
 
 /// A running lifecycle action.
-pub(super) struct HookRun {
+pub(super) struct ActionRun {
     child: Child,
     deadline: u64,
 }
 
 /// How a lifecycle action ended.
-pub(super) enum HookEnd {
+pub(super) enum ActionEnd {
     Exited(ExitStatus),
     /// The action outlived the timeout the definition declared.
     TimedOut,
 }
 
-impl HookRun {
-    pub(super) fn new(child: Child, deadline: u64) -> HookRun {
-        HookRun { child, deadline }
+impl ActionRun {
+    pub(super) fn new(child: Child, deadline: u64) -> ActionRun {
+        ActionRun { child, deadline }
     }
 
     /// Poll the running action; `None` while it is still alive. An action past
     /// its deadline is killed together with its process group, so a hook cannot
     /// leave children behind or outlive its window.
-    pub(super) fn poll(&mut self, now: u64) -> Option<HookEnd> {
+    pub(super) fn poll(&mut self, now: u64) -> Option<ActionEnd> {
         match self.child.try_wait() {
-            Ok(Some(status)) => Some(HookEnd::Exited(status)),
+            Ok(Some(status)) => Some(ActionEnd::Exited(status)),
             Ok(None) if now >= self.deadline => {
                 crate::platform::host::process::kill_now(&mut self.child);
                 let _ = self.child.wait();
-                Some(HookEnd::TimedOut)
+                Some(ActionEnd::TimedOut)
             }
             _ => None,
         }
     }
 
-    /// Kill and reap the action; true when one was running.
-    pub(super) fn abort(&mut self) -> bool {
+    /// Kill and reap the action.
+    pub(super) fn abort(&mut self) {
         crate::platform::host::process::kill_now(&mut self.child);
         let _ = self.child.wait();
-        true
     }
 }

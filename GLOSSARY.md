@@ -25,7 +25,7 @@ _Avoid_: PluginManager、PM（已退役）
 _Avoid_: 信任安装、跳过校验（默认路径不跳过）
 
 **脚本插件（Script plugin）**:
-payload 是脚本、由 manifest 的 `interpreter` 声明宿主解释器、并可用 `lifecycle` 声明前置准备（start）与收尾（stop/status）的插件；被监督进程始终是 `exec`，执行路径与 core 脚本共用，来源与信任仍是 .spk。
+payload 是脚本、由 manifest 的 `interpreter` 声明宿主解释器、并可用 `lifecycle` 声明前置准备（start）、进程退出后的收尾（stop）与按需探测（status）的插件；被监督进程始终是 `exec`，执行路径与 core 脚本共用，来源与信任仍是 .spk。
 _Avoid_: core plugin、系统插件
 
 **解释器（Interpreter）**:

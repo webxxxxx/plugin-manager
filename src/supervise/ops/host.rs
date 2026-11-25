@@ -12,7 +12,6 @@ use crate::platform::config::Config;
 use crate::platform::host::wake::Wake;
 use crate::platform::log;
 use crate::supervise::model::runtime::{self, Record};
-use crate::supervise::model::supervisor::{self};
 use crate::supervise::ops::factory::{Notifier, SlotFactory};
 use crate::supervise::ops::slot::Slot;
 use crate::wire::contract::reactor::Reactor;
@@ -423,11 +422,7 @@ impl Supervisor {
             }
         };
         for layer in layers {
-            let deadline = clock
-                .now()
-                .mono_ms
-                .saturating_add(supervisor::START_TIMEOUT_MS)
-                .saturating_add(self.start_hook_budget(layer.iter().map(String::as_str)));
+            let deadline = self.start_deadline(clock, layer.iter().map(String::as_str));
             if let Err(error) = self.start_layer(&layer, deadline, clock) {
                 error!("start enabled: {}", error);
             }

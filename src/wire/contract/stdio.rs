@@ -90,7 +90,7 @@ impl Plan {
     }
 
     /// The supervisor's stop action: only stderr is kept, stdout is dropped.
-    pub(crate) fn stop_hook() -> Self {
+    pub(crate) fn action() -> Self {
         Self {
             stdin: Open::Null,
             stdout: Open::Null,
@@ -519,8 +519,8 @@ mod tests {
         assert_eq!(Plan::hook().stdin, Open::Null);
         assert_eq!(Plan::hook().stdout, Open::Pipe);
         assert_eq!(Plan::hook().stderr, Open::Pipe);
-        assert_eq!(Plan::stop_hook().stdout, Open::Null);
-        assert_eq!(Plan::stop_hook().stderr, Open::Pipe);
+        assert_eq!(Plan::action().stdout, Open::Null);
+        assert_eq!(Plan::action().stderr, Open::Pipe);
     }
 
     /// The stdin pipe must be the child's real stdin: a line reaches it, and
