@@ -278,7 +278,7 @@ fn core_lifecycle_hooks_run_for_start_stop_and_status() {
     let mut sandbox = Sandbox::new();
     let marker = sandbox.root.join("marker.txt");
     let exec = sandbox.write_lifecycle_hook("exec", &marker, true);
-    let start = sandbox.write_lifecycle_hook("start", &marker, true);
+    let start = sandbox.write_lifecycle_hook("start", &marker, false);
     let stop = sandbox.write_lifecycle_hook("stop", &marker, false);
     let status = sandbox.write_lifecycle_hook("status", &marker, false);
     sandbox.write_lifecycle_service("demo", &exec, &start, &stop, &status, &marker);
@@ -292,10 +292,11 @@ fn core_lifecycle_hooks_run_for_start_stop_and_status() {
         String::from_utf8_lossy(&started.stderr)
     );
     let text = fs::read_to_string(&marker).expect("marker");
-    assert!(text.contains("start"), "start hook did not run: {text}");
-    assert!(
-        !text.contains("exec"),
-        "exec ran instead of the start hook: {text}"
+    // #323: the start action prepares first, the process runs after it.
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        ["start", "exec"],
+        "the start action must finish before the process exists: {text}"
     );
 
     let stopped = sandbox.stop("demo");
@@ -327,6 +328,310 @@ fn core_lifecycle_hooks_run_for_start_stop_and_status() {
         text.lines().filter(|line| *line == "stop").count(),
         2,
         "stop hook must run again after a restart: {text}"
+    );
+}
+
+/// Write a hook body next to the sandbox so it is not discovered as a service.
+fn write_hook(sandbox: &Sandbox, name: &str, body: &str) -> PathBuf {
+    let path = sandbox.root.join(name);
+    fs::write(&path, body).expect("write hook");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod hook");
+    }
+    path
+}
+
+/// A long-running process for the stop-ordering tests: it never answers a
+/// protocol handshake, so the definition declares `ready: exec`.
+fn write_runner(sandbox: &Sandbox, name: &str) -> PathBuf {
+    #[cfg(windows)]
+    let body = "@echo off\r\n:loop\r\nping -n 2 127.0.0.1 >nul\r\ngoto loop\r\n";
+    #[cfg(unix)]
+    let body = "#!/bin/sh\nwhile :; do sleep 1; done\n";
+    write_hook(sandbox, name, body)
+}
+
+fn write_json_definition(sandbox: &Sandbox, id: &str, definition: &Value) {
+    fs::write(
+        sandbox
+            .config
+            .join("services.d")
+            .join(format!("{}.json", id)),
+        serde_json::to_vec_pretty(definition).expect("definition"),
+    )
+    .expect("write definition");
+}
+
+fn exec_ready(path: &Path) -> Value {
+    #[cfg(windows)]
+    {
+        json!({
+            "path": r"C:\Windows\System32\cmd.exe",
+            "args": ["/c", path.to_string_lossy()],
+            "ready": "exec"
+        })
+    }
+    #[cfg(unix)]
+    {
+        json!({
+            "path": "/bin/sh",
+            "args": [path.to_string_lossy()],
+            "ready": "exec"
+        })
+    }
+}
+
+/// #323: a start action that fails keeps the process from starting, and the
+/// stop action still cleans up the attempt.
+#[test]
+fn a_failing_start_action_keeps_the_process_from_spawning() {
+    let mut sandbox = Sandbox::new();
+    let marker = sandbox.root.join("prelude-fail.txt");
+    let exec = sandbox.write_lifecycle_hook("exec", &marker, true);
+    #[cfg(windows)]
+    let start_body = "@echo off\r\necho start>>\"%SVCD_TEST_MARKER%\"\r\nexit /b 3\r\n";
+    #[cfg(unix)]
+    let start_body = "#!/bin/sh\necho start >> \"$SVCD_TEST_MARKER\"\nexit 3\n";
+    let start = write_hook(
+        &sandbox,
+        if cfg!(windows) {
+            "start-fail.cmd"
+        } else {
+            "start-fail.sh"
+        },
+        start_body,
+    );
+    let stop = sandbox.write_hook_script("failed-stop", &marker);
+    let env = json!({ "SVCD_TEST_MARKER": marker.to_string_lossy() });
+    let definition = json!({
+        "schema": 1,
+        "id": "demo",
+        "version": "1.0.0",
+        "desc": "start action fails",
+        "protocol": 1,
+        "exec": {
+            "path": exec.to_string_lossy(),
+            "args": [],
+            "ready": "notify",
+            "env": env
+        },
+        "restart": "never",
+        "lifecycle": {
+            "start": {"path": start.to_string_lossy(), "args": [], "env": env},
+            "stop": {"path": stop.to_string_lossy(), "args": []}
+        }
+    });
+    write_json_definition(&sandbox, "demo", &definition);
+    sandbox.start_daemon();
+
+    let started = sandbox.run_svc(&["start", "demo"]);
+    assert_ne!(
+        started.status.code(),
+        Some(0),
+        "start must fail when the start action fails: {}",
+        String::from_utf8_lossy(&started.stdout)
+    );
+    wait_until(
+        "the cleanup of the failed attempt",
+        Duration::from_secs(10),
+        || {
+            fs::read_to_string(&marker)
+                .map(|text| text.contains("stop"))
+                .unwrap_or(false)
+        },
+    );
+    let text = fs::read_to_string(&marker).unwrap_or_default();
+    assert!(text.contains("start"), "start action did not run: {text}");
+    assert!(
+        !text.contains("exec"),
+        "the process started although the start action failed: {text}"
+    );
+    assert_ne!(sandbox.status("demo")["summary"]["state"], "running");
+}
+
+/// #323: the stop action runs after the process is gone, and `Stopped` waits
+/// for it. Returning earlier would let the next start abort the cleanup.
+#[test]
+fn stopping_waits_for_the_stop_action() {
+    let mut sandbox = Sandbox::new();
+    let marker = sandbox.root.join("slow-stop.txt");
+    let runner = write_runner(
+        &sandbox,
+        if cfg!(windows) {
+            "runner.cmd"
+        } else {
+            "runner.sh"
+        },
+    );
+    #[cfg(windows)]
+    let stop_body = format!(
+        "@echo off\r\nping -n 2 127.0.0.1 >nul\r\necho stop>>\"{}\"\r\n",
+        marker.display()
+    );
+    #[cfg(unix)]
+    let stop_body = format!(
+        "#!/bin/sh\nsleep 1\necho stop >> \"{}\"\n",
+        marker.display()
+    );
+    let stop = write_hook(
+        &sandbox,
+        if cfg!(windows) {
+            "slow-stop.cmd"
+        } else {
+            "slow-stop.sh"
+        },
+        &stop_body,
+    );
+    let definition = json!({
+        "schema": 1,
+        "id": "demo",
+        "version": "1.0.0",
+        "desc": "slow cleanup",
+        "protocol": 1,
+        "exec": exec_ready(&runner),
+        "restart": "never",
+        "lifecycle": {"stop": {"path": stop.to_string_lossy(), "args": []}}
+    });
+    write_json_definition(&sandbox, "demo", &definition);
+    sandbox.start_daemon();
+
+    assert_eq!(
+        sandbox.start_when_ready("demo").status.code(),
+        Some(0),
+        "start failed"
+    );
+    let began = Instant::now();
+    let stopped = sandbox.stop("demo");
+    assert_eq!(stopped.status.code(), Some(0), "stop failed");
+    assert!(
+        began.elapsed() >= Duration::from_millis(800),
+        "stop returned after {:?}, before the stop action finished",
+        began.elapsed()
+    );
+    let text = fs::read_to_string(&marker).unwrap_or_default();
+    assert!(text.contains("stop"), "stop action did not run: {text}");
+    assert_eq!(sandbox.status("demo")["summary"]["state"], "stopped");
+}
+
+/// #323: a restart composes stop-then-start and must not abort the stop action
+/// halfway through.
+#[test]
+fn a_restart_does_not_abort_the_stop_action() {
+    let mut sandbox = Sandbox::new();
+    let marker = sandbox.root.join("restart-stop.txt");
+    let runner = write_runner(
+        &sandbox,
+        if cfg!(windows) {
+            "restart-runner.cmd"
+        } else {
+            "restart-runner.sh"
+        },
+    );
+    #[cfg(windows)]
+    let stop_body = format!(
+        "@echo off\r\nping -n 2 127.0.0.1 >nul\r\necho stop>>\"{}\"\r\n",
+        marker.display()
+    );
+    #[cfg(unix)]
+    let stop_body = format!(
+        "#!/bin/sh\nsleep 1\necho stop >> \"{}\"\n",
+        marker.display()
+    );
+    let stop = write_hook(
+        &sandbox,
+        if cfg!(windows) {
+            "restart-stop.cmd"
+        } else {
+            "restart-stop.sh"
+        },
+        &stop_body,
+    );
+    let definition = json!({
+        "schema": 1,
+        "id": "demo",
+        "version": "1.0.0",
+        "desc": "restart cleanup",
+        "protocol": 1,
+        "exec": exec_ready(&runner),
+        "restart": "never",
+        "lifecycle": {"stop": {"path": stop.to_string_lossy(), "args": []}}
+    });
+    write_json_definition(&sandbox, "demo", &definition);
+    sandbox.start_daemon();
+
+    assert_eq!(
+        sandbox.start_when_ready("demo").status.code(),
+        Some(0),
+        "start failed"
+    );
+    let restarted = sandbox.run_when_ready(&["restart", "demo"]);
+    assert_eq!(
+        restarted.status.code(),
+        Some(0),
+        "restart failed: {}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    let text = fs::read_to_string(&marker).unwrap_or_default();
+    assert!(
+        text.contains("stop"),
+        "the restart aborted the stop action: {text}"
+    );
+    assert_eq!(sandbox.status("demo")["summary"]["state"], "running");
+}
+
+/// The direct ordering proof: the stop action sees a dead process.
+#[cfg(unix)]
+#[test]
+fn the_stop_action_runs_after_the_process_is_gone() {
+    let mut sandbox = Sandbox::new();
+    let marker = sandbox.root.join("after-exit.txt");
+    let pidfile = sandbox.root.join("runner.pid");
+    let runner = write_hook(
+        &sandbox,
+        "after-exit-runner.sh",
+        &format!(
+            "#!/bin/sh\necho $$ > \"{}\"\nwhile :; do sleep 1; done\n",
+            pidfile.display()
+        ),
+    );
+    let stop = write_hook(
+        &sandbox,
+        "after-exit-stop.sh",
+        &format!(
+            "#!/bin/sh\nif kill -0 \"$(cat \\\"{}\\\")\" 2>/dev/null; then echo alive; else echo gone; fi > \"{}\"\n",
+            pidfile.display(),
+            marker.display()
+        ),
+    );
+    let definition = json!({
+        "schema": 1,
+        "id": "demo",
+        "version": "1.0.0",
+        "desc": "stop after exit",
+        "protocol": 1,
+        "exec": exec_ready(&runner),
+        "restart": "never",
+        "lifecycle": {"stop": {"path": stop.to_string_lossy(), "args": []}}
+    });
+    write_json_definition(&sandbox, "demo", &definition);
+    sandbox.start_daemon();
+
+    assert_eq!(
+        sandbox.start_when_ready("demo").status.code(),
+        Some(0),
+        "start failed"
+    );
+    wait_until("the runner pid file", Duration::from_secs(10), || {
+        pidfile.is_file()
+    });
+    assert_eq!(sandbox.stop("demo").status.code(), Some(0), "stop failed");
+    let text = fs::read_to_string(&marker).unwrap_or_default();
+    assert_eq!(
+        text.trim(),
+        "gone",
+        "the stop action saw a live process: {text}"
     );
 }
 

@@ -39,3 +39,22 @@ manifest 格式重编号为唯一的 `schema: 1`，本 ADR 的两条结论随之
 - **没有「老 daemon 拒绝」这道门了**：旧线的包（任何版本）都缺必填的 `id`，验包阶段直接拒绝并
   提示用 `plugin bundle` 重打包；不做读入兼容。
 - shebang 权威与解释器权威的分叉仍在：声明了就用声明的解释器，不声明就走 shebang / `.cmd`。
+
+## 修订（2026-11-26，#323）
+
+生命周期语义翻转，两条结论随之改写：
+
+- **`start` 不再是被监督进程。** `exec` 是唯一的被监督进程；`lifecycle.start` 改为「前置准备」：每次
+  spawn `exec` 之前运行，必须退出，非零或超时即本次启动失败、`exec` 不 spawn。理由：`start` 同时当
+  「进程」和「准备动作」用，逼着插件写一个永不执行的影子 `exec`（`sshd` 的 `exec.args` 为空，真跑起来
+  会打印 usage 并 `exit 2`），而且准备失败与进程崩溃无法区分——两者在 `ready: notify/exec` 上都表现为
+  「进程退出了」。
+- **`stop` 改为进程消失之后的收尾，不再在终止前运行。** 终止权归宿主（Unix 进程组 `SIGTERM` → 10 秒 →
+  `SIGKILL`；Windows 直接强杀），`stop` 跑的时候进程已经不在；`Stopped` 以它返回为准。理由：同一个
+  `stop` 之前在停止路径上当终止器、在崩溃路径上当清理器，两种契约迫使插件写两套防御；而且状态在
+  leader 退出时就结算，`svc stop` 会在钩子还没跑完时返回，紧接着的 `svc restart` 会把钩子掐死（#323）。
+  代价是 Windows 上没有「先问再杀」的优雅停机；当前生命周期插件都是 Linux 专用，真要支持应由 SCM
+  控制通道承担，而不是加回钩子。
+
+`lifecycle.status` 与超时默认值不变；`plugin bundle --from-core` 与 core 脚本推导同步改成把声明的
+`start` 写进 `exec.args`。

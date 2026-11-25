@@ -1,28 +1,9 @@
-//! The stop action (`lifecycle.stop`) of one slot: at most one hook run, its
-//! deadline, and the restart work a stop can preempt.
+//! The stop action (`lifecycle.stop`) of one slot: at most one run, and the
+//! restart work a stop can preempt. The action runs after the supervised
+//! process is gone, so the service is reported stopped only once it ends.
 
-use std::process::{Child, ExitStatus};
-
+use super::hook::{HookEnd, HookRun};
 use super::*;
-
-/// A running stop action.
-pub(super) struct HookRun {
-    child: Child,
-    deadline: u64,
-}
-
-impl HookRun {
-    pub(super) fn new(child: Child, deadline: u64) -> HookRun {
-        HookRun { child, deadline }
-    }
-}
-
-/// How a stop action ended.
-pub(super) enum HookEnd {
-    Exited(ExitStatus),
-    /// The hook outlived the timeout the definition declared.
-    TimedOut,
-}
 
 /// The stop action's state. A stop can preempt a restart or a crash cleanup,
 /// so the flow remembers which of those events must resume once the hook ends.
@@ -69,16 +50,7 @@ impl StopFlow {
     /// deadline is killed here so the stop window cannot outlive it.
     pub(super) fn poll(&mut self, now: u64) -> Option<HookEnd> {
         let run = self.hook.as_mut()?;
-        let deadline = run.deadline;
-        let outcome = match run.child.try_wait() {
-            Ok(Some(status)) => Some(HookEnd::Exited(status)),
-            Ok(None) if now >= deadline => {
-                let _ = run.child.kill();
-                let _ = run.child.wait();
-                Some(HookEnd::TimedOut)
-            }
-            _ => None,
-        };
+        let outcome = run.poll(now);
         if outcome.is_some() {
             self.hook = None;
         }
@@ -90,9 +62,13 @@ impl StopFlow {
         let Some(mut run) = self.hook.take() else {
             return false;
         };
-        let _ = run.child.kill();
-        let _ = run.child.wait();
+        run.abort();
         true
+    }
+
+    /// Whether this instance already ran the stop action.
+    pub(super) fn claimed(&self) -> bool {
+        self.started
     }
 
     /// A new process starts: the stop action is attempted again, and no
@@ -196,25 +172,31 @@ impl Slot {
         };
         match outcome {
             HookEnd::Exited(status) => {
-                info!("{}: stop hook exited {}", self.id, status)
+                info!("{}: stop action exited {}", self.id, status)
             }
-            HookEnd::TimedOut => error!("{}: stop hook timed out", self.id),
+            HookEnd::TimedOut => error!("{}: stop action timed out", self.id),
+        }
+        // The process exited first: apply that exit now. `Stopped` means the
+        // stop action finished, not merely that the leader is gone.
+        if let Some((pid, code)) = self.exit_after_hook.take() {
+            self.clear_process();
+            self.apply(Event::Exited { pid, code }, now);
+            return;
         }
         // A stop preempted the pending restart: finish the stop, not the spawn.
         if self.machine.state == State::Stopping {
             self.stop.clear_cleanup();
-            // A finished one-shot has no process to signal: the hook finishing
+            // A finished one-shot has no process to signal: the action running
             // is the whole stop.
             if self.machine.pid.is_none() {
                 self.apply(Event::StopSettled, now);
                 return;
             }
-            // Windows has no polite signal for an exec-ready service. Once the
-            // stop hook (the only graceful path) is done, terminate the tree
-            // instead of burning the whole stop window and force-killing anyway.
+            // Safety net for an old definition whose stop action terminated the
+            // service itself: the action is over, so terminate what is left.
             #[cfg(windows)]
             if self.stdin.is_none() {
-                self.signal_force("stop hook finished and stdin already closed");
+                self.signal_force("stop action finished and stdin already closed");
                 return;
             }
             self.signal_polite();
@@ -264,10 +246,12 @@ impl Slot {
     /// No `stop` action was declared. Unix already has SIGTERM as the polite
     /// signal; Windows has no signal for an exec-ready script, so kill directly
     /// instead of burning the whole stop window waiting for nothing.
-    pub(super) fn stop_without_hook(&mut self) {
+    /// Host-side termination. The stop action does not run here: it runs once
+    /// the process is gone, so no plugin ever has to be the one that kills.
+    pub(super) fn stop_now(&mut self) {
         #[cfg(windows)]
         if self.stdin.is_none() {
-            self.signal_force("no stop hook and stdin already closed");
+            self.signal_force("no polite signal on this platform");
             return;
         }
         self.signal_polite();
@@ -310,13 +294,16 @@ impl Slot {
     pub(super) fn give_up(&mut self) {
         if self.machine.unkillable {
             error!("{}: unkillable after stop timeout", self.id);
+            // Only an unkillable process still needs terminating here. A
+            // failed start has no process, and forcing would abort the stop
+            // action that is cleaning up after it.
+            self.signal_force("give up");
         } else {
             error!(
                 "{}: failed after {} consecutive failures",
                 self.id, self.machine.failures
             );
         }
-        self.signal_force("give up");
         self.clear_process();
     }
 }

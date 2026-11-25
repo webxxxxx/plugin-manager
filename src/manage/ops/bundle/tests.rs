@@ -887,8 +887,11 @@ fn from_core_emits_lifecycle() {
         manifest.interpreter.as_ref().expect("interpreter").name,
         if cfg!(windows) { "cmd" } else { "sh" }
     );
+    // The declared start action is the process: it moves into exec.args and
+    // the lifecycle keeps only the actions around it (#323).
+    assert_eq!(manifest.exec.args, ["start"]);
     let lifecycle = manifest.lifecycle.as_ref().expect("lifecycle");
-    assert_eq!(lifecycle.start.as_ref().expect("start").args, ["start"]);
+    assert!(lifecycle.start.is_none());
     assert_eq!(lifecycle.stop.as_ref().expect("stop").args, ["stop"]);
     assert_eq!(lifecycle.status.as_ref().expect("status").args, ["status"]);
     let exec = manifest

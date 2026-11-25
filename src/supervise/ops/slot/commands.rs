@@ -18,6 +18,8 @@ pub(super) fn command_for(exec: &Exec) -> Command {
     }
 }
 
+/// A `lifecycle.start` action is a preparation step: it must exit, and the
+/// supervised process only starts afterwards.
 pub(crate) fn hook_command(
     id: &str,
     action: &str,
@@ -26,18 +28,6 @@ pub(crate) fn hook_command(
     plugin_dir: Option<&Path>,
 ) -> Command {
     build_action_command(id, action, hook, true, paths, plugin_dir)
-}
-
-/// A `lifecycle.start` action *is* the supervised foreground process, so it is
-/// adoptable after a daemon restart just like `exec`.
-pub(super) fn service_hook_command(
-    id: &str,
-    action: &str,
-    hook: &Hook,
-    paths: &Paths,
-    plugin_dir: Option<&Path>,
-) -> Command {
-    build_action_command(id, action, hook, false, paths, plugin_dir)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -66,16 +56,25 @@ fn build_action_command(
     // keeps the old environment (#312).
     match plugin_dir {
         Some(_) => apply_plugin_child_env(&mut command, plugin_dir, paths),
-        None => {
-            command
-                .env("SVCD_SERVICE_ID", id)
-                .env("SVCD_ACTION", action)
-                .env("SVCD_DATA_DIR", &paths.data_dir)
-                .env("SVCD_CONFIG_DIR", &paths.config_dir)
-                .env("SVCD_LOG_DIR", &paths.logs_dir);
-        }
+        None => apply_core_child_env(&mut command, id, action, paths),
     }
     command
+}
+
+/// The `SVCD_*` surface a core service process receives. Core services are
+/// written by the operator, so they keep the daemon's directory roots.
+pub(crate) fn apply_core_child_env(
+    command: &mut Command,
+    id: &str,
+    action: &str,
+    paths: &Paths,
+) {
+    command
+        .env("SVCD_SERVICE_ID", id)
+        .env("SVCD_ACTION", action)
+        .env("SVCD_DATA_DIR", &paths.data_dir)
+        .env("SVCD_CONFIG_DIR", &paths.config_dir)
+        .env("SVCD_LOG_DIR", &paths.logs_dir);
 }
 
 /// The `SVCD_*` surface a plugin child receives.

@@ -200,7 +200,12 @@ impl Sandbox {
             "version": "1.0.0",
             "desc": "lifecycle test",
             "protocol": 1,
-            "exec": { "path": exec.to_string_lossy(), "args": [], "ready": "notify" },
+            "exec": {
+                "path": exec.to_string_lossy(),
+                "args": [],
+                "ready": "notify",
+                "env": { "SVCD_TEST_MARKER": marker.to_string_lossy() }
+            },
             "lifecycle": {
                 "start": hook(start),
                 "stop": stop_hook,

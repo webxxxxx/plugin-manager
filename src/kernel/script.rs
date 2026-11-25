@@ -24,6 +24,7 @@ impl Actions {
         }
     }
 
+    #[cfg(test)]
     pub fn any(self) -> bool {
         self.start || self.stop || self.status
     }

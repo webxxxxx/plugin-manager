@@ -378,10 +378,11 @@ fn clock_manifest(exec: &str, data: &[u8]) -> Value {
         "desc": "clock service",
         "platform": target(),
         "protocol": 1,
-        "exec": {"path": exec, "ready": "exec"},
+        // The start action is the process itself: it is the exec argv. Only
+        // the actions around it are lifecycle hooks (#323).
+        "exec": {"path": exec, "args": ["start"], "ready": "exec"},
         "interpreter": interpreter,
         "lifecycle": {
-            "start": {"path": exec, "args": ["start"]},
             "stop": {"path": exec, "args": ["stop"]},
             "status": {"path": exec, "args": ["status"]}
         },
