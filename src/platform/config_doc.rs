@@ -621,8 +621,8 @@ pub const CONF_KEYS: &[ConfKey] = &[
         kind: Kind::Path,
         default: "未设（关闭）",
         doc: "只读静态站点根：目录下的文件通过 `/static/` 访问（`/static/` 与 `/static/<dir>/` 取 `index.html`）。",
-        recommend: "把构建产物目录写在这里；相对路径按 svcd.conf 所在目录解析。",
-        editable_in_console: false,
+        recommend: "把构建产物目录写在这里；相对路径按 svcd.conf 所在目录解析，清空即关闭 `/static/`。",
+        editable_in_console: true,
         needs_restart: true,
     },
     ConfKey {
@@ -818,8 +818,12 @@ mod tests {
         }
     }
 
+    /// A path key is either a root the installer records (read-only: editing it
+    /// would point the daemon at a tree nothing prepared) or a content root the
+    /// operator owns. `static_root` is the second kind: it only names where
+    /// `/static/` reads from, so the console may write or clear it (#301).
     #[test]
-    fn path_keys_are_the_read_only_roots() {
+    fn path_keys_are_roots_and_only_the_install_roots_are_read_only() {
         let roots = [
             "config_dir",
             "plugins_dir",
@@ -828,6 +832,7 @@ mod tests {
             "static_root",
             "install_dir",
         ];
+        let content_roots = ["static_root"];
         for entry in CONF_KEYS {
             if entry.kind == Kind::Path {
                 assert!(
@@ -835,9 +840,10 @@ mod tests {
                     "{} is a path but not a root",
                     entry.key
                 );
-                assert!(
-                    !entry.editable_in_console,
-                    "{} is a path: the console shows it read-only",
+                assert_eq!(
+                    entry.editable_in_console,
+                    content_roots.contains(&entry.key),
+                    "{} has the wrong console editability",
                     entry.key
                 );
             }
