@@ -293,3 +293,9 @@ main 的 push 跑 `test` 与 `build`；`chore(release): bump version to X` 这�
 PR 与每晚——体积回归最晚到当晚发现。
 
 性能与兼容的完整套件不要塞进 PR：PR 只保留可确定、分钟级的检查。
+
+Windows 宿主上的 `node tools/check.mjs linux` 会在 WSL2 里跑同一套集成用例（`http` 档最重）。
+不要再同时开 Windows 侧的 `http` / `daemon`：两套并发会把宿主内存压得很低，2026-11-26 就是这样
+让 explorer 因 `0x8007000e`（E_OUTOFMEMORY，`Windows.UI.Xaml.dll`）重启了一次（同一天早些时候
+agent 宿主也被重启过，没有 WER 转储）。**一边跑完再跑另一边**；WSL 的 `vmmem` 跑完不会立刻把缓存
+还给 Windows（本机 `.wslconfig` 是 `memory=6GB`），空闲内存吃紧时先等它回落再开下一套。

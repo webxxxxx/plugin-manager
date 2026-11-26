@@ -12,6 +12,7 @@ pub mod clock;
 pub mod compat;
 pub mod config;
 pub mod config_doc;
+#[cfg(feature = "http")]
 pub mod config_edit;
 pub mod config_file;
 pub mod host;

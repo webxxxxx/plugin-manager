@@ -99,6 +99,7 @@ pub(crate) fn free_bytes(root: &Path) -> Option<u64> {
 /// pre-flight needs and `free_bytes` cannot give: a package downloaded on one
 /// volume and copied onto another competes for space twice, while the same
 /// package moved within one volume competes once.
+#[cfg_attr(not(feature = "http"), allow(dead_code))]
 pub(crate) fn volume_id(root: &Path) -> Option<String> {
     if !root.is_dir() {
         return None;
@@ -107,6 +108,7 @@ pub(crate) fn volume_id(root: &Path) -> Option<String> {
 }
 
 #[cfg(unix)]
+#[cfg_attr(not(feature = "http"), allow(dead_code))]
 fn volume_of(path: &Path) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
 
@@ -116,6 +118,7 @@ fn volume_of(path: &Path) -> Option<String> {
 }
 
 #[cfg(windows)]
+#[cfg_attr(not(feature = "http"), allow(dead_code))]
 fn volume_of(path: &Path) -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -154,6 +157,7 @@ fn volume_of(path: &Path) -> Option<String> {
 }
 
 #[cfg(not(any(unix, windows)))]
+#[cfg_attr(not(feature = "http"), allow(dead_code))]
 fn volume_of(path: &Path) -> Option<String> {
     let _ = path;
     None
@@ -234,6 +238,7 @@ pub(crate) fn installed_in(root: &Path) -> Vec<String> {
 /// The index is the only witness for a volume that is not mounted, and a root
 /// that holds a plugin must not look empty just because the card is out — that
 /// is what keeps it undeletable in the settings screen (#298).
+#[cfg_attr(not(feature = "http"), allow(dead_code))]
 pub(crate) fn ids_in(paths: &Paths, root: &Path) -> Vec<String> {
     let mut ids = installed_in(root);
     for (id, recorded) in load(paths) {
@@ -382,14 +387,6 @@ mod tests {
         directory
     }
 
-    fn paths_with(root: &Path, roots: Vec<PathBuf>) -> Paths {
-        let mut paths = Paths::under(root);
-        paths.plugin_roots = roots;
-        // `Paths::under` derives these names; the tree itself is the caller's.
-        fs::create_dir_all(&paths.data_dir).expect("data dir");
-        paths
-    }
-
     #[test]
     fn discovery_walks_every_root_and_keeps_root_order() {
         let root = TempDir::new();
@@ -465,7 +462,10 @@ mod tests {
     #[test]
     fn the_index_round_trips_and_a_second_root_survives_a_record() {
         let root = TempDir::new();
-        let paths = paths_with(&root.0, vec![root.0.join("a"), root.0.join("b")]);
+        let paths = crate::platform::test_support::paths_with_roots(
+            &root.0,
+            vec![root.0.join("a"), root.0.join("b")],
+        );
         record(&paths, "alpha", &root.0.join("b")).expect("record");
         record(&paths, "beta", &root.0.join("a")).expect("record");
 
@@ -478,7 +478,8 @@ mod tests {
     #[test]
     fn a_corrupt_index_reads_as_empty_instead_of_failing_the_process() {
         let root = TempDir::new();
-        let paths = paths_with(&root.0, vec![root.0.join("a")]);
+        let paths =
+            crate::platform::test_support::paths_with_roots(&root.0, vec![root.0.join("a")]);
         fs::write(index_path(&paths), b"{not json").expect("write");
         assert_eq!(root_of(&paths, "alpha"), None);
         let (map, warnings) = read(&index_path(&paths));
@@ -490,7 +491,8 @@ mod tests {
     #[test]
     fn a_future_index_version_is_rebuilt_rather_than_trusted() {
         let root = TempDir::new();
-        let paths = paths_with(&root.0, vec![root.0.join("a")]);
+        let paths =
+            crate::platform::test_support::paths_with_roots(&root.0, vec![root.0.join("a")]);
         fs::write(
             index_path(&paths),
             br#"{"version": 99, "plugins": {"alpha": "/elsewhere"}}"#,
@@ -520,7 +522,10 @@ mod tests {
         let temp = TempDir::new();
         let internal = temp.0.join("internal/plugins");
         let card = temp.0.join("card/plugins");
-        let paths = paths_with(&temp.0, vec![internal.clone(), card.clone()]);
+        let paths = crate::platform::test_support::paths_with_roots(
+            &temp.0,
+            vec![internal.clone(), card.clone()],
+        );
         plugin_dir(&internal, "demo");
         record(&paths, "weather", &card).expect("record");
 
@@ -541,7 +546,10 @@ mod tests {
         let available = root.0.join("internal/plugins");
         let pulled = root.0.join("sd/plugins");
         plugin_dir(&available, "alpha");
-        let paths = paths_with(&root.0, vec![available.clone(), pulled.clone()]);
+        let paths = crate::platform::test_support::paths_with_roots(
+            &root.0,
+            vec![available.clone(), pulled.clone()],
+        );
         record(&paths, "alpha", &available).expect("record alpha");
         record(&paths, "beta", &pulled).expect("record beta");
 
@@ -563,7 +571,8 @@ mod tests {
         let root = TempDir::new();
         let available = root.0.join("internal/plugins");
         plugin_dir(&available, "alpha");
-        let paths = paths_with(&root.0, vec![available.clone()]);
+        let paths =
+            crate::platform::test_support::paths_with_roots(&root.0, vec![available.clone()]);
         record(&paths, "alpha", &available).expect("record alpha");
         record(&paths, "ghost", &available).expect("record ghost");
 
@@ -576,7 +585,8 @@ mod tests {
     #[test]
     fn forget_drops_one_record_and_keeps_the_rest() {
         let root = TempDir::new();
-        let paths = paths_with(&root.0, vec![root.0.join("a")]);
+        let paths =
+            crate::platform::test_support::paths_with_roots(&root.0, vec![root.0.join("a")]);
         record(&paths, "alpha", &root.0.join("a")).expect("record");
         record(&paths, "beta", &root.0.join("a")).expect("record");
         forget(&paths, "alpha").expect("forget");

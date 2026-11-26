@@ -3,6 +3,7 @@
 use std::fs::{self, OpenOptions};
 use std::path::Path;
 use std::process::Command;
+#[cfg(feature = "http")]
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -193,8 +194,10 @@ fn check_command(program: &Path) -> Command {
 /// covers other processes on Unix; this mutex also covers Windows, where
 /// `flock` is a no-op, and keeps two threads from sharing the same
 /// `config.tmp.<pid>` path.
+#[cfg(feature = "http")]
 pub(crate) static CONFIG_WRITES: Mutex<()> = Mutex::new(());
 
+#[cfg(feature = "http")]
 pub(crate) fn config_lock() -> MutexGuard<'static, ()> {
     CONFIG_WRITES
         .lock()

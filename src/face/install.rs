@@ -130,6 +130,7 @@ mod tests {
 
     use crate::platform::config::Config;
     use crate::platform::paths::Paths;
+    use crate::platform::test_support::config as test_config;
     use crate::server::auth::lan::Lan;
     use crate::server::http::model as http;
     use crate::server::http::{CloseReason, Exchange, StreamHandler};
@@ -336,23 +337,6 @@ mod tests {
         );
     }
 
-    fn test_config() -> Arc<Config> {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let root = crate::platform::test_support::temp_dir().join(format!(
-            "svcd-install-face-{}-{}",
-            std::process::id(),
-            nanos
-        ));
-        Arc::new(Config::with_paths(
-            crate::platform::settings::Settings::default(),
-            None,
-            Paths::under(&root),
-        ))
-    }
-
     /// A configuration whose derived `max_package_bytes` is the floor (1 MiB),
     /// so a 2 MiB body is over the line on every machine.
     fn small_package_config() -> Arc<Config> {
@@ -380,7 +364,7 @@ mod tests {
 
     fn stream_handler(request: &[u8]) -> Box<dyn StreamHandler> {
         let head = parse_head(request);
-        match exchange(&head, &lan(), test_config()).expect("streamed exchange") {
+        match exchange(&head, &lan(), test_config("install-face")).expect("streamed exchange") {
             Exchange::Stream(handler) => handler,
             Exchange::Response(_) => panic!("a package route must stream"),
         }
@@ -465,7 +449,7 @@ mod tests {
     /// on the volume for `temp_retention_secs`.
     #[test]
     fn an_install_releases_the_temp_blob_it_consumed() {
-        let config = test_config();
+        let config = test_config("install-face");
         let body =
             crate::manage::test_support::test_signed_package("demo", crate::platform::target());
         let staged = crate::platform::storage::put(&config.paths, &body).expect("stage the blob");
@@ -573,7 +557,7 @@ mod tests {
             },
             http::Framing::Chunked,
             false,
-            test_config(),
+            test_config("install-face"),
             8,
         );
         // Two 5-byte chunks exceed the 8-byte decoded limit.

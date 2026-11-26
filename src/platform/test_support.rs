@@ -21,6 +21,47 @@ pub(crate) fn temp_dir() -> std::path::PathBuf {
     base
 }
 
+/// A directory set under `root` whose plugin roots are exactly `roots`.
+///
+/// `Paths::under` derives the other names; creating `data_dir` is what the
+/// install and location tests need before they can write an index (#326).
+pub(crate) fn paths_with_roots(
+    root: &std::path::Path,
+    roots: Vec<std::path::PathBuf>,
+) -> crate::platform::paths::Paths {
+    let mut paths = crate::platform::paths::Paths::under(root);
+    paths.plugin_roots = roots;
+    std::fs::create_dir_all(&paths.data_dir).expect("data dir");
+    paths
+}
+
+/// A `Config` on a fresh tree named with `tag`, using default settings.
+///
+/// The tree is deliberately not created: the tests that need files create the
+/// directories they touch, and nothing here reads the process environment.
+pub(crate) fn config(tag: &str) -> std::sync::Arc<crate::platform::config::Config> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let root = temp_dir().join(format!(
+        "svcd-{}-{}-{}-{}",
+        tag,
+        std::process::id(),
+        nanos,
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::sync::Arc::new(crate::platform::config::Config::with_paths(
+        crate::platform::settings::Settings::default(),
+        None,
+        crate::platform::paths::Paths::under(&root),
+    ))
+}
+
 /// A unique directory removed on drop. `prefix` names the test module so a
 /// leaked directory still tells you where it came from.
 pub(crate) struct TempDir(pub(crate) std::path::PathBuf);

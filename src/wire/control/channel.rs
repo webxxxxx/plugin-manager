@@ -334,6 +334,7 @@ enum ReadBound {
     /// Fail when no frame arrives for this long; every frame resets it.
     Idle(Duration),
     /// Fail at this absolute instant.
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     Deadline(Instant),
 }
 
@@ -439,6 +440,7 @@ where
 /// `cancelled` is checked once per short poll. A timed-out or cancelled socket
 /// is dropped, never returned to the pool: a late response would otherwise be
 /// mistaken for the next request's reply.
+#[cfg_attr(not(feature = "http"), allow(dead_code))]
 pub fn request_within<C: Fn() -> bool>(
     config: &Path,
     method: &str,

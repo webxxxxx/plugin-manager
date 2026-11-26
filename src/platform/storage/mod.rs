@@ -13,9 +13,9 @@ mod path;
 #[cfg(feature = "http")]
 mod upload;
 
-pub(crate) use gc::{cleanup, release, release_id};
+pub(crate) use gc::cleanup;
 #[cfg(feature = "http")]
-pub(crate) use gc::{forget_blob, forget_file};
+pub(crate) use gc::{forget_blob, forget_file, release, release_id};
 #[cfg(any(feature = "http", test))]
 pub(crate) use meta::Meta;
 pub(crate) use meta::{materialize_result, resolve_args};
@@ -49,8 +49,10 @@ pub(crate) use upload::read_upload_kind;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// The upload session or stored object the request named is not there.
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     NotFound,
     /// The request contradicts the session's commit mode.
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     Conflict,
     /// The request or the archive is malformed.
     Invalid,
@@ -78,10 +80,12 @@ impl Error {
         Error::new(Kind::Invalid, detail)
     }
 
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     pub fn not_found(detail: impl Into<String>) -> Error {
         Error::new(Kind::NotFound, detail)
     }
 
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     pub fn conflict(detail: impl Into<String>) -> Error {
         Error::new(Kind::Conflict, detail)
     }

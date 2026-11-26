@@ -48,6 +48,7 @@ pub struct Config {
     pub warnings: Vec<String>,
     /// The `SVCD_<key>` overrides visible at bootstrap, by live key (#263).
     /// Faces read provenance from here; nothing re-reads the environment.
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     pub env: std::collections::BTreeMap<&'static str, String>,
 }
 

@@ -52,6 +52,10 @@ impl<'a> Admission<'a> {
     }
 
     /// plugin token adapter：只对铸出它的那个插件 id 有效，锁中毒按拒绝处理。
+    ///
+    /// The plugin UI is an HTTP surface, so this adapter and the free function
+    /// below are only driven with that feature (#326).
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     pub(crate) fn admit_plugin(&self, token: &str, plugin: &str) -> bool {
         match self.lan.lock() {
             Ok(mut state) => state.validate_plugin_token(token, plugin),
@@ -62,6 +66,7 @@ impl<'a> Admission<'a> {
 
 /// 对外面的 plugin token 检查。face 只持有共享的 LAN 状态，所以保留自由函数，
 /// 内部仍走同一个 [`Admission`]。
+#[cfg_attr(not(feature = "http"), allow(dead_code))]
 pub(crate) fn plugin_token_valid(lan: &Mutex<Lan>, token: &str, plugin: &str) -> bool {
     Admission::new(lan).admit_plugin(token, plugin)
 }

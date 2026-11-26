@@ -98,6 +98,7 @@ enum Outcome {
 }
 
 /// Serve one modern request without a progress sink (HTTP).
+#[cfg_attr(not(feature = "http"), allow(dead_code))]
 pub fn serve_modern(config: &Path, request: &rpc::Request) -> Served {
     serve_modern_with(config, request, None)
 }
