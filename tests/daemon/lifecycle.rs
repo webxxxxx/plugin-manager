@@ -1156,7 +1156,7 @@ fn five_quick_crashes_enter_failed_and_explicit_start_resets() {
 
     let mut instance = ProcessInstance::capture(sandbox.running_pid("crashy"));
     for attempt in 1..=5 {
-        kill_pid(instance.pid);
+        kill_instance(&instance);
         if attempt < 5 {
             let restarted = sandbox.wait_for_restart("crashy", instance, Duration::from_secs(20));
             instance =
@@ -1185,7 +1185,7 @@ fn disable_keeps_the_crash_restart_policy() {
     );
 
     let instance = ProcessInstance::capture(sandbox.running_pid("off"));
-    kill_pid(instance.pid);
+    kill_instance(&instance);
     let backoff = sandbox.wait_for_state("off", "backoff", Duration::from_secs(5));
     assert!(
         backoff["details"]["failures"].as_u64().unwrap_or(0) >= 1,
@@ -1210,7 +1210,7 @@ fn a_never_policy_service_stops_without_restarting() {
     assert_eq!(running["details"]["restart"], "never", "{running}");
     let instance =
         ProcessInstance::capture(running["summary"]["pid"].as_u64().expect("pid") as u32);
-    kill_pid(instance.pid);
+    kill_instance(&instance);
 
     let stopped = sandbox.wait_for_state("once", "stopped", Duration::from_secs(10));
     assert!(stopped["summary"]["pid"].is_null(), "{stopped}");
