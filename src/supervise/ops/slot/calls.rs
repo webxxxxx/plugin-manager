@@ -338,11 +338,6 @@ pub(super) fn test_reply_sink(
     Box::new(move |outcome| {
         let line = match outcome {
             Ok(Reply::Value(value)) => rpc::to_line(&rpc::ok(external_id, value)),
-            Ok(Reply::Stream(_)) => rpc::to_line(&rpc::err(
-                external_id,
-                -32000,
-                "stream replies are not wired through the test slot",
-            )),
             Err(failure) => json!({
                 "jsonrpc": "2.0",
                 "id": external_id,

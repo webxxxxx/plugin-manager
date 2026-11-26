@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
-use crate::platform::clock::Clock;
+use crate::platform::clock::{civil_from_days, Clock};
 
 /// Anything that holds the single supervisor loop longer than this is logged.
 /// The loop is serial, so one slow phase delays every other caller; the 30 s
@@ -429,21 +429,6 @@ fn stamp(epoch_ms: u64) -> String {
         rest % 60,
         millis
     )
-}
-
-/// Howard Hinnant's `civil_from_days`: days since 1970-01-01 to Y/M/D.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let day_of_era = z - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    (year + i64::from(month <= 2), month as u32, day as u32)
 }
 
 /// The composition root's clock, kept here for writers created after

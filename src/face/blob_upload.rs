@@ -151,17 +151,10 @@ pub fn exchange(
         framing,
         multipart,
         limit,
-        expects_continue(head),
+        http::expects_continue(head),
         paths,
     );
     Ok(Exchange::Stream(Box::new(handler)))
-}
-
-fn expects_continue(head: &http::Head) -> bool {
-    http::header(&head.headers, "expect")
-        .map(|value| value.eq_ignore_ascii_case("100-continue"))
-        .unwrap_or(false)
-        && head.version.eq_ignore_ascii_case("HTTP/1.1")
 }
 
 /// One upload body as a sans-IO state machine. Response bytes are small JSON;
@@ -768,7 +761,7 @@ mod tests {
             framing(head),
             multipart,
             limit,
-            expects_continue(head),
+            http::expects_continue(head),
             Arc::new(test_paths().clone()),
         )
     }

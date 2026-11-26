@@ -72,27 +72,23 @@ pub struct Capability {
 }
 
 /// 健康探测方式。默认 `ExitOnly`：进程退出即不健康，不需要实现作答。
+///
+/// 义务模型里的「主动探测」（ping / status）两档已删（#325）：没有任何契约
+/// 构造它们，`Obligations` 的每个构造点都是 [`Obligations::default`]。将来要做
+/// 主动健康探测，在这里加回档位，并在构造点（`registry` / adapter）真正写入。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthCheck {
     ExitOnly,
-    /// 义务模型里「主动探测」的两档。今天没有任何契约构造它们（全部走
-    /// `Obligations::default()` 的 `ExitOnly`）；将来要做主动健康探测时从这里接。
-    #[allow(dead_code)]
-    Ping,
-    /// 见 [`HealthCheck::Ping`]。
-    #[allow(dead_code)]
-    Status,
 }
 
 /// 生命周期义务。默认 `Process`：进程在即生命周期，不需要实现声明动作。
+///
+/// 「由 hook 声明生命周期」那一档已删（#325）：manifest 的 `lifecycle` 是真的，
+/// 但没人把它写进 `Obligations`，而 ADR-0015 把 exec 服务的生命周期交给了监督
+/// 槽——槽对 `Ensure` / `Quiesce` 直接拒绝，动作由 daemon 执行，不经 Wire。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleObligation {
     Process,
-    /// 义务模型里「由 hook 声明生命周期」这一档。manifest 的 `lifecycle` 是真的，
-    /// 但没有人把它写进 `Obligations`（全部走 `default()` 的 `Process`）；
-    /// 要做这项接线时从这里接。
-    #[allow(dead_code)]
-    Hooks,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,16 +279,13 @@ impl Health {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct StreamId(pub u64);
-
+/// 一次调用的结果。
+///
+/// 只有值这一档。流式回复那一档已删（#325）：它没有任何构造点，两处匹配都只是
+/// 把收到它当实现错误拒绝。真做流式时在这里加回档位，并同时接上生产端。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
     Value(Value),
-    /// 流式结果的占位。今天没有任何实现构造它；`projected_done` 把收到
-    /// `Stream` 当实现错误处理。要真做流式时，从这里开始接。
-    #[allow(dead_code)]
-    Stream(StreamId),
 }
 
 /// 协作式取消：调用方置位，实现自行决定何时观察。取消后不得返回 `Ok`。
