@@ -31,7 +31,7 @@ fn a_reused_pid_is_not_the_old_instance() {
         assert!(live.is_replaced_by(reused));
     }
 
-    kill_pid(pid);
+    kill_instance(&live);
     let _ = child.wait();
     assert!(!live.is_alive(), "a reaped child is gone");
 
@@ -46,6 +46,39 @@ fn a_reused_pid_is_not_the_old_instance() {
     let absent = ProcessInstance::capture(pid);
     assert!(absent.gone, "a free pid must capture as gone: {absent:?}");
     assert!(!absent.is_alive());
+}
+
+/// `kill_instance` must not signal a pid that no longer belongs to the captured
+/// instance. Under this suite's churn a reused number would otherwise take down
+/// an unrelated process -- which is how one daemon run killed the agent host
+/// running the tests (#327).
+#[test]
+fn a_stale_instance_does_not_kill_the_pid_owner() {
+    let (mut child, pid) = spawn_sleeper();
+    let live = ProcessInstance::capture(pid);
+    assert!(live.is_alive(), "a live child is the instance we captured");
+
+    // Same number, different creation time: the "the pid was reused" state.
+    // A host that cannot report a creation time cannot state it, so skip there.
+    if let Some(start) = live.start {
+        let stale = ProcessInstance {
+            pid,
+            start: Some(start.wrapping_add(1)),
+            gone: false,
+        };
+        kill_instance(&stale);
+        assert!(
+            live.is_alive(),
+            "a stale instance must leave the process that owns the pid now"
+        );
+    }
+
+    kill_instance(&live);
+    let _ = child.wait();
+    assert!(
+        !live.is_alive(),
+        "the captured instance is gone after its own kill"
+    );
 }
 
 #[test]

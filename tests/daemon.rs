@@ -679,16 +679,61 @@ fn spawn_sleeper() -> (Child, u32) {
     (child, pid)
 }
 
-fn kill_pid(pid: u32) {
+/// Kill the process this instance names, and only that one.
+///
+/// The pid alone is not an identity: this suite starts and stops hundreds of
+/// daemons, and Windows hands a freed pid out again quickly. A blind
+/// `taskkill /F /PID <n>` therefore lands on whatever owns that number now --
+/// including the shell or the agent host running the tests, which is how one
+/// daemon run killed its own harness (#327). The handle pins the process
+/// object, so the creation time read *through* it still describes the captured
+/// instance and `TerminateProcess` is exact.
+fn kill_instance(instance: &ProcessInstance) {
+    if instance.gone {
+        return;
+    }
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
-            .output();
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+        use windows_sys::Win32::System::Threading::{
+            GetProcessTimes, OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_TERMINATE,
+        };
+        // SAFETY: the handle is closed on every path, every pointer below names
+        // a live `FILETIME`, and `TerminateProcess` only runs after the creation
+        // time read through this handle proved it is the captured instance.
+        unsafe {
+            let handle = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                0,
+                instance.pid,
+            );
+            if handle.is_null() {
+                return;
+            }
+            let mut creation: FILETIME = std::mem::zeroed();
+            let mut exit: FILETIME = std::mem::zeroed();
+            let mut kernel: FILETIME = std::mem::zeroed();
+            let mut user: FILETIME = std::mem::zeroed();
+            let ok = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
+            let start = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
+            if ok != 0 && instance.start == Some(start) {
+                TerminateProcess(handle, 1);
+            }
+            CloseHandle(handle);
+        }
     }
     #[cfg(unix)]
     {
-        let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+        // There is no handle to pin the process here, so read the creation time
+        // again immediately before signalling and stay away when it no longer
+        // matches. A host that cannot report a creation time keeps the old
+        // pid-only answer.
+        if process_start_time(instance.pid) == instance.start {
+            let _ = Command::new("kill")
+                .args(["-9", &instance.pid.to_string()])
+                .output();
+        }
     }
 }
 
@@ -1219,7 +1264,7 @@ fn assert_crash_restart(sandbox: &Sandbox, id: &str) {
     let running = sandbox.start_service(id);
     let old = ProcessInstance::capture(running["summary"]["pid"].as_u64().expect("pid") as u32);
 
-    kill_pid(old.pid);
+    kill_instance(&old);
     let backoff = sandbox.wait_for_state(id, "backoff", Duration::from_secs(5));
     assert!(
         backoff["details"]["failures"].as_u64().unwrap_or(0) >= 1,
