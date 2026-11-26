@@ -421,11 +421,7 @@ mod tests {
         bytes
     }
 
-    fn drive(stream: &mut RawWsStream, limit: usize) -> Vec<u8> {
-        let mut out = Vec::new();
-        stream.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
-        out
-    }
+    use super::super::drive_writable as drive;
 
     #[test]
     fn a_binary_frame_reaches_the_plugin_byte_for_byte() {

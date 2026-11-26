@@ -7,6 +7,7 @@ use super::*;
 use std::io::Read;
 
 use crate::platform::paths::Paths;
+use crate::platform::test_support::config as test_config;
 use crate::server::http::{dispatch_blocking_now, dispatch_inline};
 use crate::server::http::{BodyPolicy, Dispatch};
 use crate::server::http::{CompletionSlot, Exchange};
@@ -16,32 +17,15 @@ fn lan() -> Arc<Mutex<Lan>> {
     Arc::new(Mutex::new(Lan::new(bind, bind, false, None)))
 }
 
-fn test_config() -> Arc<Config> {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let root = crate::platform::test_support::temp_dir().join(format!(
-        "svcd-face-unit-{}-{}",
-        std::process::id(),
-        nanos
-    ));
-    Arc::new(Config::with_paths(
-        crate::platform::settings::Settings::default(),
-        None,
-        Paths::under(&root),
-    ))
-}
-
 fn face() -> ApiFace {
-    ApiFace::new(test_config(), lan())
+    ApiFace::new(test_config("face-unit"), lan())
 }
 
 fn face_with_password() -> ApiFace {
     let bind = "127.0.0.1:0".parse().expect("bind");
     let hash = crate::platform::auth::hash_password("secret").expect("hash");
     ApiFace::new(
-        test_config(),
+        test_config("face-unit"),
         Arc::new(Mutex::new(Lan::new(bind, bind, true, Some(hash)))),
     )
 }
@@ -503,7 +487,7 @@ fn service_summaries_carry_has_config_and_has_ui() {
         },
         "details": { "config": "/tmp/config" }
     });
-    let summary = project_service(&with_config, &test_config().paths).expect("summary");
+    let summary = project_service(&with_config, &test_config("face-unit").paths).expect("summary");
     assert_eq!(summary["hasConfig"], true);
     assert_eq!(summary["hasUI"], false);
     assert_eq!(
@@ -514,7 +498,8 @@ fn service_summaries_carry_has_config_and_has_ui() {
     let without_config = json!({
         "summary": { "id": "unit-test-missing", "kind": "core" }
     });
-    let summary = project_service(&without_config, &test_config().paths).expect("summary");
+    let summary =
+        project_service(&without_config, &test_config("face-unit").paths).expect("summary");
     assert_eq!(summary["hasConfig"], false);
     assert_eq!(summary["hasUI"], false);
 }
@@ -582,7 +567,7 @@ fn a_public_face_route_skips_transport_auth() {
 
     let bind = "127.0.0.1:0".parse().expect("bind");
     let lan = Arc::new(Mutex::new(Lan::new(bind, bind, true, Some("hash".into()))));
-    let face = ApiFace::new(test_config(), lan.clone());
+    let face = ApiFace::new(test_config("face-unit"), lan.clone());
 
     assert!(face.route("POST", "/login").expect("route").public);
     let login = http::Head {

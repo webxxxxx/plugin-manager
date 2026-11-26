@@ -241,17 +241,11 @@ mod tests {
         ];
         assert_eq!(choose_root(&roots, 1), Some(PathBuf::from("/first")));
     }
-    fn paths_at(root: &Path, roots: Vec<PathBuf>) -> Paths {
-        let mut paths = Paths::under(root);
-        paths.plugin_roots = roots;
-        fs::create_dir_all(&paths.data_dir).expect("data dir");
-        paths
-    }
-
     #[test]
     fn a_root_outside_the_list_is_a_bad_request() {
         let temp = crate::platform::test_support::TempDir::new();
-        let paths = paths_at(&temp.0, vec![temp.0.join("a")]);
+        let paths =
+            crate::platform::test_support::paths_with_roots(&temp.0, vec![temp.0.join("a")]);
         let error = install_root(&paths, "demo", Some(Path::new("/elsewhere")), 1)
             .expect_err("not configured");
         assert!(error.detail().contains("plugins_dir"), "{error}");
@@ -263,7 +257,10 @@ mod tests {
         let temp = crate::platform::test_support::TempDir::new();
         let first = temp.0.join("a");
         let second = temp.0.join("b");
-        let paths = paths_at(&temp.0, vec![first.clone(), second.clone()]);
+        let paths = crate::platform::test_support::paths_with_roots(
+            &temp.0,
+            vec![first.clone(), second.clone()],
+        );
         crate::platform::locations::record(&paths, "demo", &second).expect("record");
 
         assert_eq!(

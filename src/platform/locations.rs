@@ -462,7 +462,10 @@ mod tests {
     #[test]
     fn the_index_round_trips_and_a_second_root_survives_a_record() {
         let root = TempDir::new();
-        let paths = crate::platform::test_support::paths_with_roots(&root.0, vec![root.0.join("a"), root.0.join("b")]);
+        let paths = crate::platform::test_support::paths_with_roots(
+            &root.0,
+            vec![root.0.join("a"), root.0.join("b")],
+        );
         record(&paths, "alpha", &root.0.join("b")).expect("record");
         record(&paths, "beta", &root.0.join("a")).expect("record");
 
@@ -475,7 +478,8 @@ mod tests {
     #[test]
     fn a_corrupt_index_reads_as_empty_instead_of_failing_the_process() {
         let root = TempDir::new();
-        let paths = crate::platform::test_support::paths_with_roots(&root.0, vec![root.0.join("a")]);
+        let paths =
+            crate::platform::test_support::paths_with_roots(&root.0, vec![root.0.join("a")]);
         fs::write(index_path(&paths), b"{not json").expect("write");
         assert_eq!(root_of(&paths, "alpha"), None);
         let (map, warnings) = read(&index_path(&paths));
@@ -487,7 +491,8 @@ mod tests {
     #[test]
     fn a_future_index_version_is_rebuilt_rather_than_trusted() {
         let root = TempDir::new();
-        let paths = crate::platform::test_support::paths_with_roots(&root.0, vec![root.0.join("a")]);
+        let paths =
+            crate::platform::test_support::paths_with_roots(&root.0, vec![root.0.join("a")]);
         fs::write(
             index_path(&paths),
             br#"{"version": 99, "plugins": {"alpha": "/elsewhere"}}"#,
@@ -517,7 +522,10 @@ mod tests {
         let temp = TempDir::new();
         let internal = temp.0.join("internal/plugins");
         let card = temp.0.join("card/plugins");
-        let paths = crate::platform::test_support::paths_with_roots(&temp.0, vec![internal.clone(), card.clone()]);
+        let paths = crate::platform::test_support::paths_with_roots(
+            &temp.0,
+            vec![internal.clone(), card.clone()],
+        );
         plugin_dir(&internal, "demo");
         record(&paths, "weather", &card).expect("record");
 
@@ -538,7 +546,10 @@ mod tests {
         let available = root.0.join("internal/plugins");
         let pulled = root.0.join("sd/plugins");
         plugin_dir(&available, "alpha");
-        let paths = crate::platform::test_support::paths_with_roots(&root.0, vec![available.clone(), pulled.clone()]);
+        let paths = crate::platform::test_support::paths_with_roots(
+            &root.0,
+            vec![available.clone(), pulled.clone()],
+        );
         record(&paths, "alpha", &available).expect("record alpha");
         record(&paths, "beta", &pulled).expect("record beta");
 
@@ -560,7 +571,8 @@ mod tests {
         let root = TempDir::new();
         let available = root.0.join("internal/plugins");
         plugin_dir(&available, "alpha");
-        let paths = crate::platform::test_support::paths_with_roots(&root.0, vec![available.clone()]);
+        let paths =
+            crate::platform::test_support::paths_with_roots(&root.0, vec![available.clone()]);
         record(&paths, "alpha", &available).expect("record alpha");
         record(&paths, "ghost", &available).expect("record ghost");
 
@@ -573,7 +585,8 @@ mod tests {
     #[test]
     fn forget_drops_one_record_and_keeps_the_rest() {
         let root = TempDir::new();
-        let paths = crate::platform::test_support::paths_with_roots(&root.0, vec![root.0.join("a")]);
+        let paths =
+            crate::platform::test_support::paths_with_roots(&root.0, vec![root.0.join("a")]);
         record(&paths, "alpha", &root.0.join("a")).expect("record");
         record(&paths, "beta", &root.0.join("a")).expect("record");
         forget(&paths, "alpha").expect("forget");

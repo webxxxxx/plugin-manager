@@ -23,6 +23,19 @@ use crate::server::auth::lan::{AuthKind, Lan};
 use crate::server::http::model as http;
 use crate::server::http::{Request, StreamHandler};
 
+/// Drain whatever the handler wants to write for one writable event.
+///
+/// The realtime handlers (`raw`, `ws`) produce their handshake and frame bytes
+/// this way; one helper keeps the two test modules from drifting (#326).
+#[cfg(test)]
+pub(super) fn drive_writable(stream: &mut impl StreamHandler, limit: usize) -> Vec<u8> {
+    use crate::server::http::{OutBuffer, StreamEvent};
+
+    let mut out = Vec::new();
+    stream.on_event(StreamEvent::Writable, &mut OutBuffer::new(&mut out, limit));
+    out
+}
+
 /// Everything the realtime handlers need that is not the request itself. The
 /// legacy engine always has it; a build without a raw transport has `None`.
 pub(crate) struct StreamContext {

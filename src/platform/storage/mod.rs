@@ -80,12 +80,12 @@ impl Error {
         Error::new(Kind::Invalid, detail)
     }
 
-#[cfg_attr(not(feature = "http"), allow(dead_code))]
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     pub fn not_found(detail: impl Into<String>) -> Error {
         Error::new(Kind::NotFound, detail)
     }
 
-#[cfg_attr(not(feature = "http"), allow(dead_code))]
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     pub fn conflict(detail: impl Into<String>) -> Error {
         Error::new(Kind::Conflict, detail)
     }
