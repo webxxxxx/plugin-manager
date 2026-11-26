@@ -16,7 +16,11 @@ use base64::Engine;
 use sha2::{Digest, Sha256};
 
 const PREFIX: &str = "pbkdf2-sha256";
+// Only the login surface mints hashes; the minimal build keeps the constants
+// for the tests that still hash a password (#326).
+#[cfg_attr(not(feature = "http"), allow(dead_code))]
 const ITERATIONS: u32 = 10_000;
+#[cfg_attr(not(feature = "http"), allow(dead_code))]
 const SALT_LEN: usize = 16;
 /// How long a successful Bearer check is remembered.
 const CACHE_TTL: Duration = Duration::from_secs(300);
@@ -123,6 +127,7 @@ fn cache_key(password: &str, encoded: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+#[cfg_attr(not(feature = "http"), allow(dead_code))]
 pub fn hash_password(password: &str) -> Result<String, String> {
     if password.is_empty() {
         return Err("password must not be empty".into());

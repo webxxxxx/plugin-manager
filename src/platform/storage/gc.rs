@@ -30,6 +30,7 @@ pub(crate) fn cleanup(paths: &Paths, retention: Duration) -> std::io::Result<usi
 /// Once the attempt ends nothing references that entry, so waiting for
 /// `temp_retention_secs` (two hours) pins the package on a small volume
 /// (#288). A missing entry is already clean, not an error.
+#[cfg(feature = "http")]
 pub(crate) fn release(paths: &Paths, digest: &[u8]) -> usize {
     release_id(paths, &format!("sha256:{}", text_hex(digest)))
 }
@@ -39,6 +40,7 @@ pub(crate) fn release(paths: &Paths, digest: &[u8]) -> usize {
 ///
 /// The id is the same handle the caller was given, so a handover that never
 /// reached a consumer can be released without re-hashing the bytes (#302).
+#[cfg(feature = "http")]
 pub(crate) fn release_id(paths: &Paths, id: &str) -> usize {
     let mut removed = 0;
     if let Ok(blob) = super::path::blob_path(paths, id) {
@@ -46,7 +48,6 @@ pub(crate) fn release_id(paths: &Paths, id: &str) -> usize {
             removed += 1;
         }
     }
-    #[cfg(feature = "http")]
     if let Ok(directory) = super::path::file_dir(paths, id) {
         if directory.is_dir() && fs::remove_dir_all(&directory).is_ok() {
             removed += 1;
@@ -57,6 +58,7 @@ pub(crate) fn release_id(paths: &Paths, id: &str) -> usize {
 
 /// Remove one blob entry by id. `false` when nothing was there, so the route
 /// can answer 404 without inventing an error (#291).
+#[cfg(feature = "http")]
 pub(crate) fn forget_blob(paths: &Paths, id: &str) -> bool {
     match super::path::blob_path(paths, id) {
         Ok(path) => fs::remove_file(path).is_ok(),
@@ -74,6 +76,7 @@ pub(crate) fn forget_file(paths: &Paths, id: &str) -> bool {
     }
 }
 
+#[cfg(feature = "http")]
 fn text_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 

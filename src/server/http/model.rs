@@ -2,6 +2,7 @@
 
 use serde_json::json;
 
+#[cfg(feature = "http")]
 pub use super::date::{http_date, parse_http_date};
 
 pub struct Request<'a> {

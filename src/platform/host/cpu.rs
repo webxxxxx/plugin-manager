@@ -14,6 +14,12 @@ pub(crate) fn own_cpu_ms() -> Option<u64> {
 /// Returns a short description of the mechanism on success, or why it could
 /// not be installed. A failure is not fatal: the caller falls back to the
 /// admission gate, which is the portable half of the same policy.
+///
+/// # The HTTP feature installs the cap
+///
+/// The soft governor lives in the HTTP layer, so the cap is part of that
+/// surface: a minimal build has no governor to install it for (#326).
+#[cfg(feature = "http")]
 pub(crate) fn install_hard_cap(percent: u8, cores: usize) -> Result<String, String> {
     imp::install_hard_cap(percent, cores)
 }
@@ -21,6 +27,7 @@ pub(crate) fn install_hard_cap(percent: u8, cores: usize) -> Result<String, Stri
 #[cfg(unix)]
 mod imp {
     use std::fs;
+    #[cfg(feature = "http")]
     use std::io::Write;
 
     pub(super) fn own_cpu_ms() -> Option<u64> {
@@ -41,6 +48,7 @@ mod imp {
 
     /// cgroup v2: this process's own group, then a cpu.max write. The quota is
     /// per 100 ms period across every CPU the group may use.
+    #[cfg(feature = "http")]
     pub(super) fn install_hard_cap(percent: u8, cores: usize) -> Result<String, String> {
         let quoted = percent.min(100) as u64 * cores.max(1) as u64;
         if quoted == 0 {
@@ -78,9 +86,13 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
+    #[cfg(feature = "http")]
     use std::mem::size_of;
 
-    use windows_sys::Win32::Foundation::{GetLastError, FILETIME, HANDLE};
+    use windows_sys::Win32::Foundation::FILETIME;
+    #[cfg(feature = "http")]
+    use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
+    #[cfg(feature = "http")]
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectCpuRateControlInformation,
         SetInformationJobObject, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
@@ -120,6 +132,7 @@ mod imp {
 
     /// A job object with CPU rate control. The process assigns itself, so the
     /// plugins it spawns inherit the same ceiling.
+    #[cfg(feature = "http")]
     pub(super) fn install_hard_cap(percent: u8, cores: usize) -> Result<String, String> {
         let _ = cores;
         let rate = (percent.min(100) as u32).saturating_mul(100);
@@ -159,6 +172,7 @@ mod imp {
         Ok(format!("job object cpu rate {}%", percent))
     }
 
+    #[cfg(feature = "http")]
     fn last_error() -> u32 {
         // SAFETY: no arguments, reads the thread's last error.
         unsafe { GetLastError() }

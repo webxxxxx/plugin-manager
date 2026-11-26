@@ -13,6 +13,7 @@ pub(crate) mod test_support;
 pub use check::backup::{parse_backup, BackupRules};
 pub use check::plugin::*;
 pub use check::verify::*;
+#[cfg(feature = "http")]
 pub use model::backup::*;
 pub(crate) use model::hex::hex_sha256;
 pub use model::layout::*;

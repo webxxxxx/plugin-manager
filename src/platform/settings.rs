@@ -623,6 +623,7 @@ fn parse_bool(value: &str) -> Option<bool> {
 /// binary suffix (`K`/`M`/`G`, optionally `iB`), case-insensitive and with or
 /// without a space. The document itself only ever holds digits; this is the
 /// console's convenient form for byte fields (#290).
+#[cfg_attr(not(feature = "http"), allow(dead_code))]
 pub fn parse_byte_size(text: &str) -> Option<u64> {
     let text = text.trim();
     let digits_end = text

@@ -80,6 +80,7 @@ pub struct Limits {
     pub ws_inflight_requests: usize,
     #[cfg_attr(not(unix), allow(dead_code))]
     pub ws_buffer_shrink_bytes: usize,
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     pub ws_raw_enabled: bool,
     pub ws_raw_max_bytes: usize,
     pub ws_raw_queue: usize,

@@ -81,7 +81,9 @@ struct Daemon {
     pub(crate) api: Option<Arc<Api>>,
     pub(crate) shutdown: bool,
     pub(crate) catalog: crate::face::catalog::Catalog,
-    /// The one UI event bus built by the composition root.
+    /// The one UI event bus built by the composition root. Only the HTTP
+    /// surface publishes to it (#326).
+    #[cfg(feature = "http")]
     pub(crate) bus: Arc<EventBus>,
 }
 
@@ -127,6 +129,7 @@ impl Daemon {
         #[cfg(not(feature = "http"))]
         let _ = &bus;
         let notifier: Notifier = {
+            #[cfg(feature = "http")]
             let bus = bus.clone();
             Arc::new(move |id: &str, method: &str, params: &Value| {
                 #[cfg(feature = "http")]
@@ -145,6 +148,7 @@ impl Daemon {
             api,
             shutdown: false,
             catalog: crate::face::catalog::Catalog::new(),
+            #[cfg(feature = "http")]
             bus,
         }
     }
