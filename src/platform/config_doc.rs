@@ -12,8 +12,9 @@
 //! streaming@2 GiB），与 `limits/specs.rs` 的标定值一致。
 
 #![cfg_attr(not(feature = "http"), allow(dead_code))]
-// 生产代码里今天只有测试守卫在读这张表；控制台设置表单（#263）落地后删掉这条
-// allow，让编译器继续盯着「谁在用」。
+// `face/api/settings.rs` reads this table on the HTTP surface; the minimal build
+// compiles the table but no endpoint reads it, so the allow stays scoped to
+// `not(feature = "http")` instead of becoming crate-wide.
 
 mod model;
 

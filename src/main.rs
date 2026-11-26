@@ -1,7 +1,6 @@
 // The five-entry family is the call-site contract for internal lines. Their
 // source column is always `svcd` (ADR-0022); a module path is not a column in
 // the file contract, so the macros do not fabricate a `target`.
-#[allow(unused_macros)]
 macro_rules! error {
     ($($arg:tt)*) => {
         $crate::platform::log::record(
@@ -11,7 +10,6 @@ macro_rules! error {
     };
 }
 
-#[allow(unused_macros)]
 macro_rules! warn {
     ($($arg:tt)*) => {
         $crate::platform::log::record(
@@ -21,7 +19,6 @@ macro_rules! warn {
     };
 }
 
-#[allow(unused_macros)]
 macro_rules! info {
     ($($arg:tt)*) => {
         $crate::platform::log::record(
@@ -31,21 +28,10 @@ macro_rules! info {
     };
 }
 
-#[allow(unused_macros)]
 macro_rules! debug {
     ($($arg:tt)*) => {
         $crate::platform::log::record(
             $crate::platform::log::Level::Debug,
-            &format!($($arg)*),
-        )
-    };
-}
-
-#[allow(unused_macros)]
-macro_rules! trace {
-    ($($arg:tt)*) => {
-        $crate::platform::log::record(
-            $crate::platform::log::Level::Trace,
             &format!($($arg)*),
         )
     };
