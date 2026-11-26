@@ -7,11 +7,12 @@
 //!   exec 服务的生命周期交给监督槽），`Control` / `Wire::lifecycle` / `CallError`
 //!   就这样只由 `conformance` 与内核单测驱动。这类用
 //!   `#[cfg_attr(not(test), allow(dead_code))]`，测试构建里仍然会被检查。
-//! - **定义了但没有构造点**：`Obligations` 的 `Ping` / `Status` / `Hooks` 档、
-//!   `Reply::Stream`、`Invocation` 的 `idempotency` / `trace`、`Service::desc`。
-//!   这类在没有构造点之前用普通的 `#[allow(dead_code)]`。
+//! - **定义了但没有构造点**：`Invocation` 的 `idempotency` / `trace`、
+//!   `Service::desc`。这类在没有构造点之前用普通的 `#[allow(dead_code)]`。
 //!
-//! 没有标注又没有调用方的条目，就是真该删的。
+//! 没有标注又没有调用方的条目，就是真该删的。`Obligations` 的 `Ping` / `Status` /
+//! `Hooks` 档与 `Reply::Stream` 就是这样在 #325 删掉的：全仓除了定义处没有引用，
+//! 也没有任何构造点。
 
 pub mod contract;
 pub mod failure;

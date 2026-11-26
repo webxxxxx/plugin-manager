@@ -198,7 +198,6 @@ mod tests {
             .expect("version call")
         {
             Reply::Value(value) => assert_eq!(value["version"], env!("CARGO_PKG_VERSION")),
-            other => panic!("expected a value reply, got {other:?}"),
         }
         match instance
             .call_blocking(Invocation::new(
@@ -209,7 +208,6 @@ mod tests {
             .expect("health call")
         {
             Reply::Value(value) => assert_eq!(value["state"], "ready"),
-            other => panic!("expected a value reply, got {other:?}"),
         }
     }
 
@@ -257,7 +255,6 @@ mod tests {
             .expect("call");
         match version {
             Reply::Value(value) => assert_eq!(value["ok"], true),
-            other => panic!("expected a value reply, got {other:?}"),
         }
 
         assert_eq!(instance.lifecycle(Control::Quiesce), Ok(Settled::Stopped));

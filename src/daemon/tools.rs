@@ -4,7 +4,7 @@ use crate::face::catalog;
 use crate::face::control;
 use crate::face::mcp_tools;
 use crate::kernel::contract::{CapabilityName, Invocation, Reply, ReplySink};
-use crate::kernel::failure::{Class, Failure, Problem, ProblemError, Retry};
+use crate::kernel::failure::{Failure, Problem, ProblemError};
 use crate::kernel::registry::Kind;
 use crate::platform::clock::{Clock, Now};
 use crate::supervise::ops::invoke::{self, Outcome};
@@ -150,15 +150,9 @@ impl Daemon {
         let builtin_done = projected_done(
             reply.clone(),
             id.clone(),
-            "stream replies are not supported by the builtin adapter",
             mcp_tools::project_builtin_outcome,
         );
-        let slot_done = projected_done(
-            reply.clone(),
-            id.clone(),
-            "stream replies are not wired through SlotWire",
-            mcp_tools::project_slot_outcome,
-        );
+        let slot_done = projected_done(reply.clone(), id.clone(), mcp_tools::project_slot_outcome);
         match invoke::call(
             &mut self.host,
             &service,
@@ -185,22 +179,16 @@ impl Daemon {
     }
 }
 
-/// Build the completion sink for one tools/call: a stream reply is an
-/// implementation error, and the final value/failure is projected by the face.
+/// Build the completion sink for one tools/call; the final value/failure is
+/// projected by the face.
 pub(super) fn projected_done(
     reply: crate::wire::control::channel::Reply,
     external_id: Option<Value>,
-    stream_error: &'static str,
     project: fn(Option<Value>, Result<Value, Failure>) -> String,
 ) -> ReplySink {
     Box::new(move |outcome| {
         let outcome = match outcome {
             Ok(Reply::Value(value)) => Ok(value),
-            Ok(Reply::Stream(_)) => Err(Failure::new(
-                Class::ImplementationError,
-                Retry::Never,
-                stream_error,
-            )),
             Err(failure) => Err(failure),
         };
         reply.send(project(external_id, outcome));
