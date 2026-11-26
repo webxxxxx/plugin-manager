@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use base64::Engine;
 
+use crate::server::http::model::header;
+
 const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const PLUGIN_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
 const MAX_PLUGIN_TOKENS: usize = 256;
@@ -220,13 +222,6 @@ pub(crate) fn new_token() -> String {
         bytes[..16].copy_from_slice(&nanos.to_le_bytes());
     }
     BASE64.encode(bytes)
-}
-
-fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_str())
 }
 
 fn cookie_pairs(header: &str) -> impl Iterator<Item = (&str, &str)> {

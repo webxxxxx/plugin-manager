@@ -172,18 +172,11 @@ pub fn exchange(
     let handler = PackageUploadStream::new(
         target,
         framing,
-        expects_continue(head),
+        http::expects_continue(head),
         config,
         max_package_bytes,
     );
     Ok(Exchange::Stream(Box::new(handler)))
-}
-
-fn expects_continue(head: &http::Head) -> bool {
-    http::header(&head.headers, "expect")
-        .map(|value| value.eq_ignore_ascii_case("100-continue"))
-        .unwrap_or(false)
-        && head.version.eq_ignore_ascii_case("HTTP/1.1")
 }
 
 fn reject_after_drain(
