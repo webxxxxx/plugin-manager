@@ -44,14 +44,19 @@ const REPO = resolve(HERE, "..");
 const COMPILE_TIMEOUT_MS = Number(process.env.SVCD_CHECK_TIMEOUT_MS) || 10 * 60 * 1000;
 const TEST_TIMEOUT_MS = Number(process.env.SVCD_CHECK_TIMEOUT_MS) || 20 * 60 * 1000;
 
-/// `no-default` 的警告预算，棘轮语义：只许降不许升。2026-11-24 用 rustc 1.99.1
-/// 实测：Windows 24、Linux 23。上一轮 45/44 是靠 `ustar`/`install`/`config_doc`
-/// 三个模块的 `cfg_attr(not(feature = "http"), allow(dead_code))` 收窄下来的，
-/// 不是整体豁免：默认构建仍会检查这三个文件。rustc 升级让计数变化时，先跑
+/// `no-default` 的警告预算，棘轮语义：只许降不许升。
+///
+/// 2026-11-26（#326）：`cargo check --no-default-features --bin svcd` 在 Windows
+/// 与 Linux 都是 **0 条**。之前的 24/23 是同一类问题的积压——「只有 http 面会用、
+/// 但模块 lean 也要编」的函数/字段/import。现在按 feature 边界切开：整块能切的用
+/// `#[cfg(feature = "http")]`，会波及 lean 也要编的调用方或测试的用
+/// `cfg_attr(not(feature = "http"), allow(dead_code))` 逐条标注。
+///
+/// rustc 升级或新代码再引入警告时，先跑
 /// `cargo check --no-default-features --message-format short | grep -c ': warning:'`
-/// 判断新警告是否合理，再改这个数；`SVCD_NO_DEFAULT_BUDGET` 可临时覆盖（调试用）。
-const NO_DEFAULT_WARNING_BUDGET = Number(process.env.SVCD_NO_DEFAULT_BUDGET) ||
-  (process.platform === "win32" ? 24 : 23);
+/// 判断是否合理；任何一个警告都会让这个档变红，而不是被预算吃掉。
+/// `SVCD_NO_DEFAULT_BUDGET` 可临时覆盖（注入测试与调试用）。
+const NO_DEFAULT_WARNING_BUDGET = Number(process.env.SVCD_NO_DEFAULT_BUDGET) || 0;
 
 function cargo(args, timeoutMs) {
   const started = Date.now();
