@@ -14,6 +14,7 @@
 //! `Hooks` 档与 `Reply::Stream` 就是这样在 #325 删掉的：全仓除了定义处没有引用，
 //! 也没有任何构造点。
 
+pub mod call;
 pub mod contract;
 pub mod failure;
 pub mod hook;
