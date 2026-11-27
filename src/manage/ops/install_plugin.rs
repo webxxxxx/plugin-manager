@@ -35,8 +35,11 @@ pub(crate) fn installed_bytes(directory: &Path) -> Option<u64> {
 
 /// What the installed copy of `id` occupies right now (0 when there is none).
 ///
-/// Staging the new copy happens while the old one is still on the volume, so
-/// the room an upgrade needs is this plus the package.
+/// The room an upgrade asks for is the new tree alone: the old copy is still on
+/// the volume until the commit, but its bytes are already outside `free`, so
+/// adding them again would ask for room for two copies (#329). This number is
+/// what an uninstall would return instead, which is what the 507 refusal reports
+/// as `installed` (#328).
 pub(crate) fn installed_version_bytes(paths: &Paths, id: &str) -> u64 {
     let Some(version) = current_version(paths, id) else {
         return 0;
