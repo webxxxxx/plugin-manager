@@ -266,14 +266,7 @@ impl Slot {
         self.abort_prelude();
         // Before any signal goes out: what leaves the process group has to be
         // found while the leader is still its parent (#332, ADR-0031).
-        self.descendants = Descendants::capture(self.machine.pid);
-        if !self.descendants.is_empty() {
-            info!(
-                "{}: stop takes {} descendant process(es) outside the group",
-                self.id,
-                self.descendants.len()
-            );
-        }
+        self.capture_tree();
         // A stop action from the previous attempt may still be running (crash
         // or pre-retry cleanup). Finishing it is part of the stop, so hold the
         // settlement instead of letting the next start abort it.
@@ -319,6 +312,9 @@ impl Slot {
     /// Host-side termination. The stop action does not run here: it runs once
     /// the process is gone, so no plugin ever has to be the one that kills.
     pub(super) fn stop_now(&mut self) {
+        // A polite signal also arrives without a stop request (start timeout,
+        // stdout EOF): capture before the first signal (#334).
+        self.capture_tree();
         #[cfg(windows)]
         if self.stdin.is_none() {
             self.signal_force("no polite signal on this platform");
@@ -342,6 +338,11 @@ impl Slot {
             if self.child.is_some() { "held" } else { "none" },
         );
         self.abort_stop_action();
+        // A forced stop can arrive without a stop request: shutdown paths
+        // (`stop_all` on a dependency-graph error or past its budget) and
+        // stdout EOF both kill the tree directly, so the snapshot has to be
+        // taken here too, while the leader can still show its children (#334).
+        self.capture_tree();
         // The leader may already be gone; the tree guard still owns the rest
         // (on Unix that is the process group handled below).
         if let Some(tree) = &self.tree {

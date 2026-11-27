@@ -677,3 +677,63 @@ fn a_call_returns_before_the_slot_answers() {
     let outcome = rx.recv_timeout(Duration::from_secs(1)).expect("done");
     assert!(matches!(outcome, Ok(Reply::Value(value)) if value["ok"] == true));
 }
+
+/// A stop can be requested twice (a CLI stop on a `Stopping` service, shutdown
+/// after a timeout). The second request must keep the first snapshot: by then
+/// the leader may be gone, and recapturing would come back empty — leaving the
+/// escaped child neither counted nor killed (#334).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_second_stop_request_keeps_the_first_tree_snapshot() {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let mut slot = slot();
+    let mut leader = Command::new("sh")
+        .arg("-c")
+        .arg("setsid sleep 30 >/dev/null 2>&1 & wait")
+        // Its own group, like a supervised service: the group signal below has
+        // to reach the leader and miss the child that left that group.
+        .process_group(0)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the leader");
+    let pid = leader.id();
+    slot.machine.pid = Some(pid);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        slot.capture_tree();
+        if !slot.descendants.is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no descendant appeared");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let captured = slot.descendants.len();
+    assert!(slot.tree_alive(), "the setsid child keeps the tree alive");
+
+    // The leader dies first, exactly what the first stop's kill does; the
+    // second request must not trade the snapshot for an empty one.
+    crate::platform::host::process::terminate_tree(pid);
+    assert!(slot.machine.pid.is_some());
+    let _ = leader.wait();
+    slot.capture_tree();
+    assert_eq!(
+        slot.descendants.len(),
+        captured,
+        "the snapshot must survive"
+    );
+    assert!(
+        slot.tree_alive(),
+        "the escaped child is still alive after the leader is gone"
+    );
+
+    slot.descendants.kill();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while slot.tree_alive() {
+        assert!(Instant::now() < deadline, "the kill half must take it");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}

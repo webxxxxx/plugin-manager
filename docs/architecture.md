@@ -456,6 +456,7 @@ flowchart LR
 | 0028 Windows 插件 stdio 反应器 | `wire/contract/reactor/{iocp,dispatch}` + `stdio/platform/windows` |
 | 0029 静态站点挂在 `/static/` | `face/static_site` + `face/asset` + `platform/settings` |
 | 0030 插件根与位置索引 | `platform/paths` + `platform/locations` + `kernel/layout` + `manage/ops/scan` |
+| 0031 停止的树不只是进程组 | `platform/host/process` + `supervise/ops/slot/{tree,stop}` |
 
 ## 15. 已定的命名与决策
 

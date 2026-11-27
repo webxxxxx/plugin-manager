@@ -10,14 +10,35 @@ use crate::platform::host::process;
 use super::Slot;
 
 impl Slot {
-    /// True while any process of the service is alive. The captured
-    /// descendants count here too: a `setsid` child is outside the group, and a
-    /// stop is not finished while it still runs (#332).
-    pub(super) fn group_alive(&self) -> bool {
+    /// True while any process of the service is alive: the leader's group plus
+    /// the descendants that left it with `setsid` (#332).
+    pub(super) fn tree_alive(&self) -> bool {
         let Some(pid) = self.machine.pid else {
             return false;
         };
         process::tree_alive(self.tree.as_ref(), pid) || self.descendants.alive()
+    }
+
+    /// Snapshot the tree for this stop, once.
+    ///
+    /// A stop can be asked for twice (a CLI stop on a `Stopping` service,
+    /// shutdown after a timeout) and a forced stop can arrive without a stop
+    /// request at all (shutdown paths, stdout EOF). Capturing again would
+    /// overwrite a good snapshot with an empty one — by then the leader may be
+    /// gone and its children reparented — so the first capture wins (#332,
+    /// #334).
+    pub(super) fn capture_tree(&mut self) {
+        if !self.descendants.is_empty() {
+            return;
+        }
+        self.descendants = Descendants::capture(self.machine.pid);
+        if !self.descendants.is_empty() {
+            info!(
+                "{}: stop takes {} descendant process(es) outside the group",
+                self.id,
+                self.descendants.len()
+            );
+        }
     }
 }
 
@@ -50,9 +71,7 @@ impl Descendants {
 
     /// True while any captured process is still the one the snapshot saw.
     pub(super) fn alive(&self) -> bool {
-        self.pids
-            .iter()
-            .any(|(pid, start)| process::start_time(*pid) == Some(*start))
+        process::descendants_alive(&self.pids)
     }
 
     /// The polite half of the stop: ask them to exit with the group.
