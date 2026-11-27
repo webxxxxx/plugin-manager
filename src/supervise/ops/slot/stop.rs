@@ -254,6 +254,9 @@ impl Slot {
                 }
             }
         }
+        // The group does not reach a child that called `setsid`, and the polite
+        // window is where most of them leave: ask them too (#332).
+        self.descendants.polite();
     }
 
     /// Ask the service to stop. The host terminates the process; the stop
@@ -261,6 +264,16 @@ impl Slot {
     /// that action instead of waiting for it.
     pub(crate) fn request_stop(&mut self, now: u64) {
         self.abort_prelude();
+        // Before any signal goes out: what leaves the process group has to be
+        // found while the leader is still its parent (#332, ADR-0031).
+        self.descendants = Descendants::capture(self.machine.pid);
+        if !self.descendants.is_empty() {
+            info!(
+                "{}: stop takes {} descendant process(es) outside the group",
+                self.id,
+                self.descendants.len()
+            );
+        }
         // A stop action from the previous attempt may still be running (crash
         // or pre-retry cleanup). Finishing it is part of the stop, so hold the
         // settlement instead of letting the next start abort it.
@@ -346,6 +359,9 @@ impl Slot {
                 }
             }
         }
+        // Anything the group could not reach, and that ignored the polite
+        // signal, dies here so `Stopped` cannot be reported over it (#332).
+        self.descendants.kill();
     }
 
     pub(super) fn give_up(&mut self) {

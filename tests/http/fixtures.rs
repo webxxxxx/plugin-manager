@@ -353,7 +353,18 @@ done
 /// A plugin with \`payload/web/\` assets and one declared capability. \`ui\`
 /// controls whether \`manifest.ui\` declares a browser UI at all.
 pub(crate) fn web_plugin_bundle(key: &SigningKey, id: &str, ui: bool) -> Vec<u8> {
-    let (name, data) = web_agent();
+    web_plugin_bundle_with(key, id, ui, web_agent())
+}
+
+/// The same bundle with a different `exec` payload, for tests that need the
+/// plugin to spawn processes of its own (#332).
+pub(crate) fn web_plugin_bundle_with(
+    key: &SigningKey,
+    id: &str,
+    ui: bool,
+    agent: (&str, Vec<u8>),
+) -> Vec<u8> {
+    let (name, data) = agent;
     let exec_path = format!("payload/bin/{}", name);
     let mut files: Vec<(String, Vec<u8>, u32)> = vec![
         (exec_path.clone(), data, 0o755),
@@ -1261,6 +1272,31 @@ pub(crate) fn web_ui_sandbox(key_byte: u8) -> (Sandbox, String) {
     )
     .expect("trust key");
     let package = web_plugin_bundle(&key, "demo", true);
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+    let installed = request(
+        &address,
+        "POST",
+        "/api/v1/plugins",
+        "application/octet-stream",
+        &package,
+    );
+    assert_eq!(installed.status, 200, "{}", installed.body);
+    (sandbox, address)
+}
+
+/// A sandbox whose plugin runs `agent` instead of the demo script, for tests
+/// that need the plugin to spawn processes of its own (#332).
+#[cfg(unix)]
+pub(crate) fn sandbox_with_agent(key_byte: u8, agent: (&str, Vec<u8>)) -> (Sandbox, String) {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[key_byte; 32]);
+    fs::write(
+        sandbox.trust.join("test.pub"),
+        pem_from_public(&key.verifying_key().to_bytes()),
+    )
+    .expect("trust key");
+    let package = web_plugin_bundle_with(&key, "demo", true, agent);
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
     let installed = request(
