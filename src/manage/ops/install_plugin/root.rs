@@ -53,9 +53,11 @@ pub(crate) fn install_root(
                 )));
             }
         }
-        // The old copy stays on the volume while the new one is staged, so a
-        // root that cannot hold `needed` (the caller counts both) is refused
-        // here with numbers instead of failing halfway through a staging tree.
+        // Only the bytes this install writes are asked for: the old copy is
+        // still on the volume until the commit, but it is already outside
+        // `free`, so counting it again would refuse upgrades that fit (#329).
+        // A root that cannot hold `needed` is refused here with numbers
+        // instead of failing halfway through a staging tree.
         require_room(&recorded, id, needed, installed)?;
         return Ok(recorded);
     }

@@ -194,6 +194,12 @@ impl SpkSink {
     /// The root this package lands on. An installed plugin keeps its recorded
     /// root; a new one goes to the smallest volume that fits; an explicit root
     /// wins over the size rule but must be listed in `plugins_dir`.
+    ///
+    /// The question asked here is "does the **new tree** fit": the old copy is
+    /// still on the volume until the commit, but its bytes are already outside
+    /// the volume's free count, so adding them again would ask for two copies
+    /// and refuse an upgrade that fits (#328: 12.7 MB new + 12 MB installed
+    /// against 17.2 MB free).
     fn chosen_root(&self) -> Result<PathBuf, ProblemError> {
         let manifest = self.manifest.as_ref().ok_or_else(|| {
             Problem::Invalid.error("manifest.json must be the first entry of a package")
@@ -203,12 +209,11 @@ impl SpkSink {
             self.manifest_bytes.len(),
             self.signature_bytes.len(),
         );
-        let needed = needed_for(&self.paths, manifest.id(), fresh);
         crate::manage::ops::install_plugin::install_root(
             &self.paths,
             manifest.id(),
             self.requested_root.as_deref(),
-            needed,
+            fresh,
         )
     }
 
@@ -581,13 +586,6 @@ fn set_mode(_path: &Path, _mode: u32) -> Result<(), ProblemError> {
     Ok(())
 }
 
-/// What an install needs: the package, plus whatever the installed copy still
-/// occupies. An upgrade stages the new copy beside the old one, so both have to
-/// fit; a fresh install has no old copy and this is just the package.
-fn needed_for(paths: &crate::platform::paths::Paths, id: &str, fresh: u64) -> u64 {
-    fresh.saturating_add(crate::manage::installed_version_bytes(paths, id))
-}
-
 /// A fresh staging directory inside `root`. The name is the marker the daemon
 /// and the startup sweep look for; being inside the root is what keeps the
 /// commit's `rename` on one filesystem.
@@ -645,22 +643,51 @@ mod tests {
         installer.finish()
     }
 
-    /// The arithmetic behind "an upgrade needs both copies": the package plus
-    /// what the installed version occupies right now.
+    /// A staged upgrade asks the volume for the new tree only (#329). The old
+    /// copy is still on disk while the new one is staged, but its bytes already
+    /// came out of `free`; asking for them again refused upgrades that fit
+    /// (#328: 12.7 MB new + 12 MB installed against 17.2 MB free).
     #[test]
-    fn the_room_an_install_needs_counts_the_installed_copy() {
+    fn a_staged_upgrade_asks_for_the_new_tree_not_its_old_copy() {
+        let key = setup();
+        let bytes = package(&key);
         let root = TempDir::new();
-        let paths = crate::platform::paths::Paths::under(root.path());
+        let mut installer = stager(root.path(), false, 1024 * 1024);
+        installer.feed(&bytes).expect("feed");
+
+        // Put a copy of the plugin on the volume the installer would pick, so
+        // the refusal has an `installed` number to report.
+        let installed: u64 = 4096;
+        let paths = installer.sink.paths.clone();
         crate::platform::locations::record(&paths, "demo", paths.default_plugin_root())
             .expect("record");
         let plugin = paths.default_plugin_root().join("demo");
         std::fs::create_dir_all(plugin.join("1.0.0")).expect("version");
         std::fs::write(plugin.join("current"), "1.0.0").expect("current");
-        std::fs::write(plugin.join("1.0.0/payload.bin"), vec![0u8; 4096]).expect("payload");
+        std::fs::write(
+            plugin.join("1.0.0/payload.bin"),
+            vec![0u8; installed as usize],
+        )
+        .expect("payload");
 
-        assert_eq!(needed_for(&paths, "demo", 1000), 1000 + 4096);
-        // Nothing installed: the package is the whole need.
-        assert_eq!(needed_for(&paths, "fresh", 1000), 1000);
+        // The real package fits any volume; inflate the declared size so the
+        // check has to refuse, then read what it asked for. That number is the
+        // new tree (payload + the two metadata files), and re-adding the
+        // installed copy is the bug this pins.
+        let fresh = u64::MAX / 2;
+        let manifest = installer.sink.manifest.as_mut().expect("manifest");
+        manifest.files.first_mut().expect("declared file").size = fresh;
+        let declared: u64 = manifest.files.iter().map(|file| file.size).sum();
+        let metadata = installer.sink.manifest_bytes.len() as u64
+            + installer.sink.signature_bytes.len() as u64;
+        let error = installer
+            .sink
+            .chosen_root()
+            .expect_err("no volume is that big");
+        let data = error.data().expect("the refusal carries numbers");
+        assert_eq!(data["need"], declared + metadata);
+        assert_eq!(data["installed"], installed);
+        assert_ne!(data["need"], declared + metadata + installed);
     }
 
     #[test]
