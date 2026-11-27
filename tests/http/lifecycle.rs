@@ -43,6 +43,38 @@ fn services_version_start_and_stop() {
     assert!(missing.body["error"]["message"].is_string());
 }
 
+#[test]
+fn restart_reruns_the_whole_lifecycle() {
+    // The restart verb is what a plugin page uses after writing a config the
+    // process only reads at startup (#336).
+    let mut sandbox = Sandbox::new();
+    sandbox.write_core();
+    sandbox.start_daemon();
+    let address = sandbox.wait_for_http();
+
+    let started = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
+    assert_eq!(started.status, 200, "{}", started.body);
+    assert_eq!(started.body["summary"]["state"], "running");
+
+    let restarted = request(&address, "POST", "/api/v1/services/demo/restart", "", b"");
+    assert_eq!(restarted.status, 200, "{}", restarted.body);
+    assert_eq!(restarted.body["summary"]["state"], "running");
+
+    let missing = request(
+        &address,
+        "POST",
+        "/api/v1/services/missing/restart",
+        "",
+        b"",
+    );
+    assert_eq!(missing.status, 404, "{}", missing.body);
+    assert!(missing.body["error"]["code"].is_string());
+
+    let stopped = request(&address, "POST", "/api/v1/services/demo/stop", "", b"");
+    assert_eq!(stopped.status, 200, "{}", stopped.body);
+    assert_eq!(stopped.body["summary"]["state"], "stopped");
+}
+
 /// One installed plugin, exercised end to end across every surface this phase
 /// built: HTTP install -> start -> MCP (Streamable HTTP and the stdio bridge
 /// agree) -> config/reset -> Web UI -> logs -> stop shrinks the tool surface ->

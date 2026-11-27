@@ -162,6 +162,7 @@ api_quiet_routes! {
     GET    "/api/v1/services/{id}"            => service_status,
     POST   "/api/v1/services/{id}/start"      => service_start,
     POST   "/api/v1/services/{id}/stop"       => service_stop,
+    POST   "/api/v1/services/{id}/restart"    => service_restart,
     POST   "/api/v1/services/{id}/enable"     => service_enable,
     POST   "/api/v1/services/{id}/disable"    => service_disable,
     DELETE "/api/v1/plugins/{id}"             => plugin_uninstall,
@@ -453,6 +454,13 @@ impl ApiFace {
 
     fn service_stop(&self, call: &ApiCall<'_>) -> Response {
         self.service_action(call.budget(), "svc.stop", &call.param("id"))
+    }
+
+    /// The same sequence `svc restart` runs (stop action, tree termination,
+    /// start action, spawn, started action). A plugin's own page uses it after
+    /// writing a config the process only reads at startup.
+    fn service_restart(&self, call: &ApiCall<'_>) -> Response {
+        self.service_action(call.budget(), "svc.restart", &call.param("id"))
     }
 
     fn service_enable(&self, call: &ApiCall<'_>) -> Response {

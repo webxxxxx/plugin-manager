@@ -561,6 +561,7 @@
     "src/supervise/ops/slot/handle.rs": "slot",
     "src/supervise/ops/slot/action.rs": "slot",
     "src/supervise/ops/slot/prelude.rs": "slot",
+    "src/supervise/ops/slot/spawn.rs": "slot",
     "src/supervise/ops/slot/started.rs": "slot",
     "src/supervise/ops/slot/stop.rs": "slot",
     "src/supervise/ops/slot/tree.rs": "slot",
