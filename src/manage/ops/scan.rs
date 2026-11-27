@@ -120,8 +120,21 @@ pub(crate) fn service_from_manifest(
     let ready = match manifest.exec.ready.as_deref() {
         None | Some("notify") => Ready::Notify,
         Some("exec") => Ready::Exec,
+        Some("port") => Ready::Port(
+            crate::kernel::registry::probe_address(
+                manifest.exec.port,
+                manifest.exec.probe_addr.as_deref(),
+            )
+            .map_err(|error| Problem::Invalid.error(format!("exec: {}", error)))?,
+        ),
         Some(other) => return Err(Problem::Invalid.error(format!("unknown ready mode: {}", other))),
     };
+    if !matches!(ready, Ready::Port(_))
+        && (manifest.exec.port.is_some() || manifest.exec.probe_addr.is_some())
+    {
+        return Err(Problem::Invalid
+            .error("exec.port / exec.probe_addr are only used with exec.ready = \"port\""));
+    }
     let mut caps: Vec<KernelCapability> = Vec::new();
     for capability in &manifest.capabilities {
         if capability.name.is_empty()
@@ -142,9 +155,9 @@ pub(crate) fn service_from_manifest(
             idempotent: false,
         });
     }
-    if ready == Ready::Exec && !caps.is_empty() {
+    if matches!(ready, Ready::Exec | Ready::Port(_)) && !caps.is_empty() {
         return Err(Problem::Invalid
-            .error("exec.ready=exec cannot declare capabilities: no protocol channel"));
+            .error("exec.ready=exec/port cannot declare capabilities: no protocol channel"));
     }
     let contract = crate::kernel::registry::contract_for(
         id,

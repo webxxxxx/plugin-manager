@@ -422,6 +422,12 @@ struct ExecDefinition {
     env: BTreeMap<String, String>,
     #[serde(default)]
     ready: Option<String>,
+    /// Only with `ready: "port"`: the port the instance must accept on.
+    #[serde(default)]
+    port: Option<u16>,
+    /// Only with `ready: "port"`: the address to probe (default 127.0.0.1).
+    #[serde(default)]
+    probe_addr: Option<String>,
 }
 
 fn validate(
@@ -483,13 +489,25 @@ fn validate(
     let ready = match definition.exec.ready.as_deref() {
         None | Some("notify") => Ready::Notify,
         Some("exec") => Ready::Exec,
+        Some("port") => Ready::Port(
+            crate::kernel::registry::probe_address(
+                definition.exec.port,
+                definition.exec.probe_addr.as_deref(),
+            )
+            .map_err(|error| format!("exec: {}", error))?,
+        ),
         Some(other) => {
             return Err(format!(
-                "exec.ready \"{}\" is invalid; expected notify or exec",
+                "exec.ready \"{}\" is invalid; expected notify, exec or port",
                 other
             ))
         }
     };
+    if !matches!(ready, Ready::Port(_))
+        && (definition.exec.port.is_some() || definition.exec.probe_addr.is_some())
+    {
+        return Err("exec.port / exec.probe_addr are only used with exec.ready = \"port\"".into());
+    }
     // `protocol != 1` was rejected above, so `ready: notify` is the only
     // channel peer a core definition can declare. The predicate is shared with
     // the runtime slot so the two notions of "channel peer" cannot drift.

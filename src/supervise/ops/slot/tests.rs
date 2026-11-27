@@ -52,6 +52,51 @@ fn slot() -> Slot {
 }
 
 #[test]
+fn a_port_probe_settles_ready_when_the_address_accepts() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+    let addr = listener.local_addr().expect("addr");
+    let mut slot = slot();
+    let pid = 4242;
+    slot.machine.state = State::Starting;
+    slot.machine.pid = Some(pid);
+    slot.start_port_probe(pid, addr);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut now = 0u64;
+    loop {
+        now += 20;
+        slot.pump(now);
+        if slot.machine.state == State::Running {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the probe never settled a Ready");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(slot.port.is_none(), "a settled probe is dropped");
+}
+
+#[test]
+fn a_port_probe_keeps_waiting_while_nothing_accepts() {
+    // The listener is dropped before the probe starts: the address refuses
+    // connections, so the instance must not be reported ready.
+    let addr = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        listener.local_addr().expect("addr")
+    };
+    let mut slot = slot();
+    slot.machine.state = State::Starting;
+    slot.machine.pid = Some(7);
+    slot.start_port_probe(7, addr);
+
+    for now in (20..600).step_by(20) {
+        slot.pump(now);
+    }
+
+    assert_eq!(slot.machine.state, State::Starting);
+    assert!(slot.port.is_some(), "the probe is still waiting");
+}
+
+#[test]
 fn notify_and_raw_transport_services_are_channel_peers() {
     // #183: a channel peer must stay alive for callers; a clean exit is
     // death, not completion. Protocol 1/2 exec services own no channel.

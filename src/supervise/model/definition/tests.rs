@@ -565,6 +565,58 @@ fn rejects_remain_after_exit_for_a_notify_ready_definition() {
 }
 
 #[test]
+fn port_readiness_needs_a_port_and_only_uses_it_with_port_ready() {
+    // A port is what the host probes; without one there is no target.
+    let dir = TempDir::new();
+    let mut body = definition("port");
+    body["exec"]["ready"] = json!("port");
+    write_definition(&dir, "port", body);
+    let loaded = load_services(
+        &services_dir(&dir),
+        &crate::platform::limits::test_default(),
+    );
+    assert!(loaded.registry.get("port").is_none());
+    assert_eq!(loaded.issues.len(), 1, "{:?}", loaded.issues);
+    assert!(
+        loaded.issues[0].reason.contains("port"),
+        "{}",
+        loaded.issues[0].reason
+    );
+
+    // A port without `ready: port` is a definition error, not an ignored field.
+    let dir = TempDir::new();
+    let mut body = definition("port");
+    body["exec"]["port"] = json!(7893);
+    write_definition(&dir, "port", body);
+    let loaded = load_services(
+        &services_dir(&dir),
+        &crate::platform::limits::test_default(),
+    );
+    assert!(loaded.registry.get("port").is_none());
+    assert!(
+        loaded.issues[0].reason.contains("exec.port"),
+        "{}",
+        loaded.issues[0].reason
+    );
+
+    // The valid shape loads with the address the host will probe.
+    let dir = TempDir::new();
+    let mut body = definition("port");
+    body["exec"]["ready"] = json!("port");
+    body["exec"]["port"] = json!(7893);
+    write_definition(&dir, "port", body);
+    let loaded = load_services(
+        &services_dir(&dir),
+        &crate::platform::limits::test_default(),
+    );
+    let service = loaded.registry.get("port").expect("loaded");
+    assert_eq!(
+        service.exec.as_ref().expect("exec").ready,
+        Ready::Port("127.0.0.1:7893".parse().expect("addr"))
+    );
+}
+
+#[test]
 fn rejects_a_started_action_on_a_one_shot_definition() {
     // A one-shot keeps no process after its exit, so there is no ready
     // instance for the post-ready action to gate; accepting the pair would

@@ -118,16 +118,21 @@ impl Slot {
         match self.spawn_process() {
             Ok(pid) => {
                 self.apply(Event::Spawned { pid }, now);
-                if self.exec.ready == Ready::Exec {
+                match self.exec.ready {
                     // Through `apply`, so a declared started action gates this
                     // Ready exactly like a protocol peer's first response.
-                    self.apply(Event::Ready { pid }, now);
-                } else {
-                    self.send_ping();
+                    Ready::Exec => self.apply(Event::Ready { pid }, now),
+                    // The connection is the readiness signal; `check_port_ready`
+                    // settles it once the probe reports one.
+                    Ready::Port(addr) => self.start_port_probe(pid, addr),
+                    Ready::Notify => self.send_ping(),
                 }
             }
             Err(error) => {
                 error!("{}: spawn failed: {}", self.id, error);
+                // The reason travels back to the start request; a port that is
+                // already taken is otherwise only a log line.
+                self.note_start_failure(format!("spawn failed: {}", error));
                 // The start action may have created things the process never
                 // used; the stop action cleans them up.
                 self.ensure_stop_action(now);

@@ -83,6 +83,12 @@ pub struct Exec {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub ready: Option<String>,
+    /// Only with `ready: "port"`: the port the instance must accept on.
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Only with `ready: "port"`: the address to probe (default 127.0.0.1).
+    #[serde(default)]
+    pub probe_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
