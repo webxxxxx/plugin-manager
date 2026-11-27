@@ -202,3 +202,89 @@ fn minimal_svcd_conf_keeps_the_daemon_alive() {
     run_min_config_phase("floor", false);
     run_min_config_phase("usable", true);
 }
+
+/// A plugin that forks a child leaving the process group with `setsid`, the way
+/// dropbear's per-connection child does. The child outlives the group signal,
+/// so deleting the plugin while it runs has to take the tree, not the group
+/// (#332).
+#[cfg(unix)]
+const SETSID_AGENT: &[u8] = br#"#!/bin/sh
+set -u
+mkdir -p "$SVCD_PLUGIN_DIR/data"
+setsid sleep 300 >/dev/null 2>&1 &
+echo $! > "$SVCD_PLUGIN_DIR/data/child.pid"
+while IFS= read -r line; do
+  printf '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n'
+done
+"#;
+
+#[cfg(unix)]
+#[test]
+fn uninstalling_a_running_plugin_takes_the_tree_outside_its_group() {
+    let (sandbox, address) = sandbox_with_agent(41, ("agent.sh", SETSID_AGENT.to_vec()));
+    let started = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
+    assert_eq!(started.status, 200, "{}", started.body);
+
+    let pid_file = sandbox
+        .data
+        .join("plugins")
+        .join("demo")
+        .join("data")
+        .join("child.pid");
+    let child = wait_for_pid(&pid_file);
+    assert!(signallable(child), "the setsid child is running");
+
+    // No stop first: this is the uninstall path the report came from.
+    let deleted = request(&address, "DELETE", "/api/v1/plugins/demo", "", b"");
+    assert_eq!(deleted.status, 200, "{}", deleted.body);
+    assert!(
+        gone(child),
+        "pid {} survived the uninstall\n{}",
+        child,
+        sandbox.daemon_log()
+    );
+}
+
+#[cfg(unix)]
+fn wait_for_pid(file: &std::path::Path) -> u32 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(file) {
+            if let Ok(pid) = text.trim().parse::<u32>() {
+                return pid;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the plugin never recorded its child in {}",
+            file.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+fn signallable(pid: u32) -> bool {
+    // Signal 0 asks the kernel whether the pid exists without delivering
+    // anything; the test has no libc dependency of its own.
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn gone(pid: u32) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if !signallable(pid) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
+}

@@ -30,8 +30,8 @@
 - 状态机：`Stopped | Starting | Running | Stopping | Backoff | Failed`，事件带 pid，迟到事件按 pid 丢弃。
 - 退避：曾在 Running ≥ 10s → 清零 + 立即重启；否则 1/2/4/8/16/30s；连续 5 次进 `Failed`，只有显式 start 复位。
 - 就绪：默认 probe-on-spawn（发首个协议请求，首个合法响应 = Ready），`exec.ready = "exec"` 可跳过；start 超时 30s。
-- 停止：SIGTERM（进程组）→ 10s → SIGKILL → 5s → 记 unkillable；全局关机预算 30s，unit 侧 `TimeoutStopSec=40`。Windows：控制帧 + 关 stdin → 等 → `TerminateJobObject`（整个服务树）。
-- **服务树即进程组**：Unix 每次 spawn 建独立进程组，Windows 每个服务一个 job object；停止/重启用整组终止。组内任一进程仍存活时服务保持 `Running`，leader 退出不触发重启；整组退出后才按 leader 的退出码进入重启策略。`notify` 类服务的 stdout EOF 仍按控制端点消失处理（立即停止）。
+- 停止：SIGTERM（进程组 + 停止时快照到的 `setsid` 子孙）→ 10s → SIGKILL → 5s → 记 unkillable；全局关机预算 30s，unit 侧 `TimeoutStopSec=40`。Windows：控制帧 + 关 stdin → 等 → `TerminateJobObject`（整个服务树）。
+- **服务树 = 进程组 ∪ 停止时快照的 `setsid` 子孙**（#332，ADR-0031）：Unix 每次 spawn 建独立进程组，Windows 每个服务一个 job object；`setsid` 出去的子孙不在组里，停止开始的那一刻按 `/proc` 父链快照一次，之后对组与快照一起 SIGTERM/SIGKILL。树里任一进程仍存活时服务保持 `Running`，leader 退出不触发重启；整棵树退出后才按 leader 的退出码进入重启策略。`notify` 类服务的 stdout EOF 仍按控制端点消失处理（立即停止）。
 - **父进程死亡（2026-11-13，测试覆盖）**：svcd 异常退出（kill -9 / TerminateProcess）时子进程随父退出——Windows 用 Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，所有被监督进程加入该 job），Linux 在 child 里 `prctl(PR_SET_PDEATHSIG, SIGTERM)`；重启后按 enabled 重新拉起，不会再与上次运行的实例并存。macOS 没有等价的廉价原语，仍是已知缺口，待后续票。
 - 依赖：按层拓扑，同层并行、层间串行；依赖失败不级联停，只摘能力并拒绝新的 start；依赖恢复不自动拉起之前被挡住的依赖者。
 - 环：安装与加载都拒绝，带环路径。
@@ -87,7 +87,7 @@
 ```
 
 - `exec.path` 必须是绝对路径；Unix 可以是 shebang 脚本，Windows 是 `.exe` / `.cmd` / `.bat`；`ready` 同 plugin（默认 `notify`，脚本不讲话就用 `exec`）。
-- `exec` 是被监督进程。`lifecycle` 全部可选：`start` 是**前置准备**——每次 spawn `exec` 之前运行、必须退出，非零或超时即本次启动失败且 `exec` 不 spawn，崩溃重试会重跑（幂等）；`stop` 是**收尾**——被监督进程消失之后运行一次（主动停、崩溃不重启、崩溃重启前、启动失败），跑的时候进程已经不在了，不要假设还能对它发信号；非零/超时只记日志。宿主负责终止（Unix 进程组 `SIGTERM` → 10 秒 → `SIGKILL`；Windows 直接强杀），`Stopped` 以 `stop` 返回为准（#323）。`status` 由 `svc status` 按需探测，stdout 作为 `details.probe` 的细节补充，退出码不改变服务状态。钩子 `path` 必须绝对，环境继承 daemon 并附加 `SVCD_SERVICE_ID` / `SVCD_ACTION` / `SVCD_DATA_DIR` / `SVCD_CONFIG_DIR` / `SVCD_LOG_DIR`；插件包（`kind=plugin`）的 `exec` 进程与 `lifecycle` 钩子只拿 `SVCD_PLUGIN_DIR`（安装目录 `<根>/<id>`）/ `SVCD_LOG_DIR` / `SVCD_TEMP_DIR` —— 插件是第三方代码，不给守护进程的配置根（`svcd.conf` 的密码散列、`trust.d`）与数据根，动作仍靠参数传。
+- `exec` 是被监督进程。`lifecycle` 全部可选：`start` 是**前置准备**——每次 spawn `exec` 之前运行、必须退出，非零或超时即本次启动失败且 `exec` 不 spawn，崩溃重试会重跑（幂等）；`stop` 是**收尾**——被监督进程消失之后运行一次（主动停、崩溃不重启、崩溃重启前、启动失败），跑的时候进程已经不在了，不要假设还能对它发信号；非零/超时只记日志。宿主负责终止（Unix 进程组 + 停止时快照到的 `setsid` 子孙 `SIGTERM` → 10 秒 → `SIGKILL`；Windows 直接强杀），`Stopped` 以 `stop` 返回为准（#323）。`status` 由 `svc status` 按需探测，stdout 作为 `details.probe` 的细节补充，退出码不改变服务状态。钩子 `path` 必须绝对，环境继承 daemon 并附加 `SVCD_SERVICE_ID` / `SVCD_ACTION` / `SVCD_DATA_DIR` / `SVCD_CONFIG_DIR` / `SVCD_LOG_DIR`；插件包（`kind=plugin`）的 `exec` 进程与 `lifecycle` 钩子只拿 `SVCD_PLUGIN_DIR`（安装目录 `<根>/<id>`）/ `SVCD_LOG_DIR` / `SVCD_TEMP_DIR` —— 插件是第三方代码，不给守护进程的配置根（`svcd.conf` 的密码散列、`trust.d`）与数据根，动作仍靠参数传。
 - 文件 root 所有、0640；启动时读取，改定义后重启 svcd 生效（v1 不做热加载）。
 - 不接受 `.spk` 专属字段：`platform` / `files` / `hooks` / `config` / `ui` 出现即定义非法；其他未知字段忽略。
 - `id` 不能是 `svc`（保留给内置 core），且不能与 plugin id 冲突；冲突时 plugin 安装拒绝、core 定义加载拒绝。
@@ -107,7 +107,7 @@
 - 声明方式：`.sh` 的 shell 函数（`start()` / `function start`）或 `case` 分支（`start)`）；`.ps1` 的 `function start`；`.bat` / `.cmd` 的 `:start` 标签（大小写不敏感）。注释里的同名不计。
 - 未声明的动作由框架兜底：缺 `start` → `exec.args` 为空，svcd 从头执行脚本；缺 `stop` → 不跑 stop 钩子，直接进入普通停止序列（Unix SIGTERM；Windows 对没有停止钩子的 `exec` 脚本立即结束进程）；缺 `status` → `svc status` 不追加 probe。
 - 声明的 `start` 就是被监督进程（写进 `exec.args`），必须前台运行（可申请资源后 `exec` 真正的进程），不得 daemonize；`stop` 在进程消失之后跑，负责收尾而不是终止；`status` 是**细节补充**：stdout 作为 `details.probe`（截断到 8 KiB、多行以 `; ` 连接），退出码只追加到文本、不改变服务状态。
-- 脚本派生的后台进程留在同一进程组（Unix）/ job object（Windows），停止时一起终止；组内任一进程存活时服务仍是 `Running`，整组退出才结束。
+- 脚本派生的后台进程留在同一进程组（Unix）/ job object（Windows），停止时一起终止；调用 `setsid` 逃出进程组的子孙在停止那一刻按父链快照，同样一起终止（ADR-0031）。树里任一进程存活时服务仍是 `Running`，整棵树退出才结束。
 - svcd 把脚本合成为 core 服务：`exec.ready = Exec`，声明的 `start` 写进 `exec.args`，`lifecycle` 只为 `stop` / `status` 生成钩子；默认 `version = 1.0.0`，无 dependencies / capabilities / config。
 - 同 id 的 JSON 定义优先；脚本跳过并告警。脚本必须非 symlink；Unix 还要求 exec 位；改脚本后重启 svcd 生效（v1 不做热加载）。
 - `.ps1` 在 Windows 通过 `powershell -NoProfile -ExecutionPolicy Bypass -File <script> <action>` 调用。
@@ -562,6 +562,7 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
 - 2026-11-23（#260）：manifest 格式重编号为 `schema: 1`（唯一版本、不读旧线任何版本）。新增必填 `id`（身份）与 `name`（显示名，可中文）、`capabilities[].outputSchema`、顶层 `icons`；`lifecycle` / `interpreter` / `compat` 并入 1，取消 1/2/3 分级门禁；`interpreter` 由「脚本必需」改为「可选，声明了就必须有脚本」。`plugin bundle` 恒写 `schema: 1`，`--id` 写身份、`--name` 写显示名。
 - 2026-11-17：控制通道删除 `svcd.token`，鉴权改为端点 ACL；本地两档由 `svcd` / `svcd-admin` 两个端点实施；C8 改为两端点各一条显式 protected DACL。
 - 2026-11-26（#323）：生命周期语义翻转——`exec` 成为唯一的被监督进程，`lifecycle.start` 改为前置准备（必须退出，失败即启动失败），`lifecycle.stop` 改为进程消失后的收尾（`Stopped` 以它返回为准），终止权归宿主。core 脚本声明的 `start` 改为写进 `exec.args`，`plugin bundle --from-core` 同步。老包（`start` 是常驻进程）会以「start 动作超时」启动失败，错误日志指明把进程移到 `exec.args`。
+- 2026-11-27（#332，ADR-0031）：服务树不再只是进程组——停止开始时按 `/proc` 父链快照 `setsid` 出去的子孙，polite / kill 两段都对「组 + 快照」一起发信号；卸载一个正在跑的 sshd 不再留下 dropbear 连接子进程。
 
 ## 16. 实施票（2026-11-12 拆出）
 

@@ -127,6 +127,36 @@ pub(crate) fn terminate_tree(pid: u32) {
     imp::terminate_tree(pid)
 }
 
+/// One process of a service tree: its pid plus the start time that tells a
+/// recycled pid apart from the process a snapshot saw.
+pub(crate) type Descendant = (u32, u64);
+
+/// The tree a stop has to take with it, captured while its leader is alive.
+///
+/// The process group is not the whole tree. A child that calls `setsid` leaves
+/// the group, and dropbear's per-connection child does exactly that for every
+/// connection it accepts (`vendor/dropbear-2022.83/svr-main.c:334`), so
+/// signalling the group alone left sshd sessions and their `sftp-server`
+/// running after the plugin was stopped or uninstalled (#332).
+///
+/// Once the leader exits those children are reparented to init, so the only
+/// moment their parenthood is still readable is before it is signalled. Empty
+/// on hosts that guard the tree with a handle (Windows) or cannot enumerate it
+/// (macOS has no `/proc`); the caller keeps its group-only behaviour there.
+pub(crate) fn descendants(pid: u32) -> Vec<Descendant> {
+    imp::descendants(pid)
+}
+
+/// Ask every captured descendant to exit, alongside the group's polite signal.
+pub(crate) fn stop_descendants(descendants: &[Descendant]) {
+    imp::stop_descendants(descendants)
+}
+
+/// Kill every captured descendant that outlived the polite signal.
+pub(crate) fn kill_descendants(descendants: &[Descendant]) {
+    imp::kill_descendants(descendants)
+}
+
 /// Kill one child immediately, including its process group on Unix.
 pub(crate) fn kill_now(child: &mut Child) {
     imp::kill_now(child)
@@ -137,6 +167,8 @@ mod imp {
     use std::os::windows::io::AsRawHandle;
     use std::process::{Child, Command};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::Descendant;
 
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
@@ -215,6 +247,16 @@ mod imp {
     pub(crate) fn tree_alive(tree: Option<&Tree>, _pid: u32) -> bool {
         tree.map(|tree| tree.active() > 0).unwrap_or(false)
     }
+
+    /// The job object already owns every process of the service; there is no
+    /// parenthood to walk and nothing to signal one by one.
+    pub(crate) fn descendants(_pid: u32) -> Vec<Descendant> {
+        Vec::new()
+    }
+
+    pub(crate) fn stop_descendants(_descendants: &[Descendant]) {}
+
+    pub(crate) fn kill_descendants(_descendants: &[Descendant]) {}
 
     pub(crate) fn start_time(_pid: u32) -> Option<u64> {
         None
@@ -317,6 +359,8 @@ mod imp {
 #[cfg(not(windows))]
 mod imp {
     use std::process::{Child, Command};
+
+    use super::Descendant;
 
     pub(crate) fn init() -> Result<(), String> {
         Ok(())
@@ -450,6 +494,93 @@ mod imp {
         group_alive(pid)
     }
 
+    /// Walk `/proc/<pid>/stat`'s parent links from `pid` and return the running
+    /// processes below it.
+    ///
+    /// A descendant that called `setsid` left the process group, and one whose
+    /// parent has already exited was reparented to init; walking parenthood is
+    /// the only thing that keeps it reachable, and only while the leader is
+    /// still alive. Zombies are skipped: they are gone, and their own children
+    /// have been reparented away from this tree already.
+    pub(crate) fn descendants(pid: u32) -> Vec<Descendant> {
+        #[cfg(target_os = "linux")]
+        {
+            let Ok(entries) = std::fs::read_dir("/proc") else {
+                return Vec::new();
+            };
+            let mut rows: Vec<(u32, u32, u64, char)> = Vec::new();
+            for entry in entries.flatten() {
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                let Ok(child) = name.parse::<u32>() else {
+                    continue;
+                };
+                let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                    continue;
+                };
+                let Some((_, rest)) = stat.rsplit_once(") ") else {
+                    continue;
+                };
+                let mut fields = rest.split_whitespace();
+                let state = fields.next().and_then(|value| value.chars().next());
+                let parent = fields.next().and_then(|value| value.parse::<u32>().ok());
+                let start = rest
+                    .split_whitespace()
+                    .nth(19)
+                    .and_then(|value| value.parse::<u64>().ok());
+                let (Some(state), Some(parent), Some(start)) = (state, parent, start) else {
+                    // A process that vanished mid-scan: nothing to record.
+                    continue;
+                };
+                rows.push((child, parent, start, state));
+            }
+            let mut found = Vec::new();
+            let mut frontier = vec![pid];
+            while let Some(current) = frontier.pop() {
+                for (child, parent, start, state) in &rows {
+                    if *parent != current || *state == 'Z' || *state == 'X' {
+                        continue;
+                    }
+                    found.push((*child, *start));
+                    frontier.push(*child);
+                }
+            }
+            found
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // macOS has no /proc; enumerating through `ps` would be a second
+            // parser with its own tests. The group stays the whole answer.
+            let _ = pid;
+            Vec::new()
+        }
+    }
+
+    pub(crate) fn stop_descendants(descendants: &[Descendant]) {
+        signal_descendants(descendants, libc::SIGTERM);
+    }
+
+    pub(crate) fn kill_descendants(descendants: &[Descendant]) {
+        signal_descendants(descendants, libc::SIGKILL);
+    }
+
+    /// Signal the captured descendants that are still the same processes. The
+    /// start time is re-checked here: a pid recycled between the snapshot and
+    /// the kill would otherwise point at an unrelated process.
+    fn signal_descendants(descendants: &[Descendant], signal: libc::c_int) {
+        for (pid, start) in descendants {
+            if start_time(*pid) != Some(*start) {
+                continue;
+            }
+            // SAFETY: one pid, no group, and the start-time check proved it is
+            // still the process the snapshot saw.
+            unsafe {
+                libc::kill(*pid as i32, signal);
+            }
+        }
+    }
+
     /// Start time of `pid` in clock ticks since boot, as `/proc/<pid>/stat`
     /// field 22. Together with the boot id it is the pid-reuse guard.
     pub(crate) fn start_time(pid: u32) -> Option<u64> {
@@ -576,5 +707,92 @@ mod tests {
             wait_for_exit(&mut child),
             "terminate must kill the child while the handle is held"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// A child that called `setsid` leaves the process group, and the group
+    /// signal alone cannot reach it — dropbear's per-connection child does this
+    /// for every connection (#332). The snapshot taken before the signal is what
+    /// lets a stop take it along.
+    #[test]
+    fn a_setsid_child_escapes_the_group_and_the_snapshot_kills_it() {
+        let mut leader = spawn_leader();
+        let pid = leader.id();
+        let snapshot = wait_for_descendant(pid);
+        let (child, _) = snapshot[0];
+        assert!(super::alive(child), "the setsid child is running");
+
+        // What the stop path did before #332: the group, and nothing else.
+        super::terminate_tree(pid);
+        assert!(wait_for(&mut leader, 2_000), "the leader must exit");
+        assert!(
+            super::alive(child),
+            "the group signal cannot reach a setsid child"
+        );
+
+        super::kill_descendants(&snapshot);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while super::alive(child) {
+            assert!(Instant::now() < deadline, "the snapshot must kill it");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The snapshot carries the start time, so a recycled pid is skipped rather
+    /// than signalled: here the recorded start time is deliberately wrong.
+    #[test]
+    fn a_recycled_pid_is_not_signalled() {
+        let mut leader = spawn_leader();
+        let snapshot = wait_for_descendant(leader.id());
+        let (child, _) = snapshot[0];
+        let stale: Vec<super::Descendant> = vec![(child, 0)];
+        super::kill_descendants(&stale);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            super::alive(child),
+            "a stale snapshot must not kill anything"
+        );
+        super::kill_descendants(&snapshot);
+        assert!(wait_for(&mut leader, 2_000), "cleanup the leader");
+    }
+
+    fn spawn_leader() -> Child {
+        Command::new("sh")
+            .arg("-c")
+            .arg("setsid sleep 30 >/dev/null 2>&1 & wait")
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the leader")
+    }
+
+    fn wait_for_descendant(pid: u32) -> Vec<super::Descendant> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let found = super::descendants(pid);
+            if !found.is_empty() {
+                return found;
+            }
+            assert!(Instant::now() < deadline, "no descendant appeared");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_for(child: &mut Child, millis: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(millis);
+        while Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
     }
 }

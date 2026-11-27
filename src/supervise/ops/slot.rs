@@ -25,6 +25,7 @@ use self::commands::{abandon, apply_core_child_env, command_for};
 use self::frames::Frames;
 use self::handle::SlotRequest;
 use self::stop::StopFlow;
+use self::tree::Descendants;
 
 pub(crate) use self::commands::{apply_plugin_child_env, hook_command};
 pub(crate) use self::handle::{SlotHandle, SlotWire};
@@ -84,6 +85,8 @@ pub(crate) struct Slot {
     /// The whole service tree; on Unix the process group is the tree and this
     /// stays `None` (the platform returns no handle there).
     tree: Option<crate::platform::host::process::Tree>,
+    /// The descendants a stop has to take with it (#332, ADR-0031).
+    descendants: Descendants,
     /// The leader exited but other group members are still alive; the service
     /// stays `Running` until the whole group is gone.
     exit_while_group_alive: Option<Option<i32>>,
@@ -154,6 +157,7 @@ impl Slot {
             exit_awaiting_action: None,
             stop_after_action: false,
             tree: None,
+            descendants: Descendants::default(),
             exit_while_group_alive: None,
             ping_id: 1,
             adopted: false,
@@ -612,14 +616,6 @@ impl Slot {
         );
     }
 
-    /// True while any process of the service (not just the leader) is alive.
-    fn group_alive(&self) -> bool {
-        let Some(pid) = self.machine.pid else {
-            return false;
-        };
-        crate::platform::host::process::tree_alive(self.tree.as_ref(), pid)
-    }
-
     fn check_timers(&mut self, now: u64) {
         self.expire_pending(now);
         // The start action has its own deadline; the process window opens once
@@ -680,6 +676,7 @@ impl Slot {
         self.kill_deadline = None;
         self.exit_while_group_alive = None;
         self.exit_awaiting_action = None;
+        self.descendants.clear();
     }
 }
 
@@ -690,6 +687,7 @@ mod frames;
 mod handle;
 mod prelude;
 mod stop;
+mod tree;
 
 #[cfg(test)]
 mod tests;
