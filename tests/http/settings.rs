@@ -97,10 +97,10 @@ fn settings_get_reports_values_sources_and_metadata() {
     let response = request(&address, "GET", "/api/v1/settings", "", b"");
     assert_eq!(response.status, 200, "{:?}", response.body);
     let keys = response.body["keys"].as_array().expect("keys");
-    // 57 live keys; `config_doc`'s own guard keeps the table honest, this pins
+    // 58 live keys; `config_doc`'s own guard keeps the table honest, this pins
     // that the route projects all of them (57 since `manual_install_root` was
-    // added beside the root list, #299).
-    assert_eq!(keys.len(), 57, "the screen shows every documented key");
+    // added beside the root list (#299), 58 since `vendor_login`).
+    assert_eq!(keys.len(), 58, "the screen shows every documented key");
     let by_key = |key: &str| {
         keys.iter()
             .find(|entry| entry["key"] == key)
