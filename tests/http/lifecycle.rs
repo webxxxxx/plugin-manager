@@ -203,10 +203,14 @@ fn minimal_svcd_conf_keeps_the_daemon_alive() {
     run_min_config_phase("usable", true);
 }
 
+#[cfg(unix)]
+use super::checks::{wait_until, wait_until_within};
+#[cfg(unix)]
+use super::support::pid_alive;
+
 /// A plugin that forks a child leaving the process group with `setsid`, the way
 /// dropbear's per-connection child does. The child outlives the group signal,
-/// so deleting the plugin while it runs has to take the tree, not the group
-/// (#332).
+/// so stopping the plugin has to take the tree, not the group (#332).
 #[cfg(unix)]
 const SETSID_AGENT: &[u8] = br#"#!/bin/sh
 set -u
@@ -218,6 +222,61 @@ while IFS= read -r line; do
 done
 "#;
 
+/// The same child, but it ignores SIGTERM: only the kill half of the stop
+/// (`KillTimeout` after `STOP_TIMEOUT_MS`) can take it, so this is what proves
+/// the service still converges to `Stopped` instead of hanging or going
+/// unkillable (#334).
+#[cfg(unix)]
+const STUBBORN_AGENT: &[u8] = br#"#!/bin/sh
+set -u
+mkdir -p "$SVCD_PLUGIN_DIR/data"
+setsid sh -c 'trap "" TERM; while :; do sleep 1; done' >/dev/null 2>&1 &
+echo $! > "$SVCD_PLUGIN_DIR/data/child.pid"
+while IFS= read -r line; do
+  printf '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n'
+done
+"#;
+
+#[cfg(unix)]
+fn child_pid(sandbox: &Sandbox) -> Option<u32> {
+    let file = sandbox
+        .data
+        .join("plugins")
+        .join("demo")
+        .join("data")
+        .join("child.pid");
+    std::fs::read_to_string(file)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
+/// Wait until the plugin has recorded the pid of its `setsid` child.
+#[cfg(unix)]
+fn started_child(sandbox: &Sandbox) -> u32 {
+    wait_until(
+        sandbox,
+        "the plugin records the pid of its child",
+        || child_pid(sandbox).is_some(),
+        || "no data/child.pid".to_string(),
+    );
+    child_pid(sandbox).expect("child pid")
+}
+
+#[cfg(unix)]
+fn wait_gone(sandbox: &Sandbox, pid: u32, within: std::time::Duration) {
+    wait_until_within(
+        sandbox,
+        &format!("pid {pid} must be gone"),
+        within,
+        || !pid_alive(pid),
+        || format!("pid {pid} is still alive"),
+    );
+}
+
+/// Uninstall while the plugin runs: no stop first, the DELETE has to take the
+/// whole tree (#332).
 #[cfg(unix)]
 #[test]
 fn uninstalling_a_running_plugin_takes_the_tree_outside_its_group() {
@@ -225,66 +284,48 @@ fn uninstalling_a_running_plugin_takes_the_tree_outside_its_group() {
     let started = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
     assert_eq!(started.status, 200, "{}", started.body);
 
-    let pid_file = sandbox
-        .data
-        .join("plugins")
-        .join("demo")
-        .join("data")
-        .join("child.pid");
-    let child = wait_for_pid(&pid_file);
-    assert!(signallable(child), "the setsid child is running");
-
-    // No stop first: this is the uninstall path the report came from.
+    let child = started_child(&sandbox);
     let deleted = request(&address, "DELETE", "/api/v1/plugins/demo", "", b"");
     assert_eq!(deleted.status, 200, "{}", deleted.body);
+    wait_gone(&sandbox, child, Duration::from_secs(5));
+}
+
+/// The same promise for `svc stop`: the acceptance bullet was about stop, not
+/// only about uninstall (#334).
+#[cfg(unix)]
+#[test]
+fn stopping_a_plugin_takes_the_tree_outside_its_group() {
+    let (sandbox, address) = sandbox_with_agent(42, ("agent.sh", SETSID_AGENT.to_vec()));
+    let started = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
+    assert_eq!(started.status, 200, "{}", started.body);
+    let child = started_child(&sandbox);
+
+    let stopped = sandbox.run_svc(&["stop", "demo"]);
     assert!(
-        gone(child),
-        "pid {} survived the uninstall\n{}",
-        child,
-        sandbox.daemon_log()
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
     );
+    wait_gone(&sandbox, child, Duration::from_secs(5));
 }
 
+/// A descendant that ignores SIGTERM is not killed by the polite half, so the
+/// service has to stay `Stopping` until `KillTimeout` takes it, and then report
+/// `Stopped` — not `Failed` (unkillable) (#334).
 #[cfg(unix)]
-fn wait_for_pid(file: &std::path::Path) -> u32 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        if let Ok(text) = std::fs::read_to_string(file) {
-            if let Ok(pid) = text.trim().parse::<u32>() {
-                return pid;
-            }
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the plugin never recorded its child in {}",
-            file.display()
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-}
+#[test]
+fn a_descendant_that_ignores_sigterm_still_converges_to_stopped() {
+    let (sandbox, address) = sandbox_with_agent(43, ("agent.sh", STUBBORN_AGENT.to_vec()));
+    let started = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
+    assert_eq!(started.status, 200, "{}", started.body);
+    let child = started_child(&sandbox);
+    assert!(pid_alive(child), "the stubborn child is running");
 
-#[cfg(unix)]
-fn signallable(pid: u32) -> bool {
-    // Signal 0 asks the kernel whether the pid exists without delivering
-    // anything; the test has no libc dependency of its own.
-    std::process::Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-#[cfg(unix)]
-fn gone(pid: u32) -> bool {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if !signallable(pid) {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    false
+    let deleted = request(&address, "DELETE", "/api/v1/plugins/demo", "", b"");
+    assert_eq!(
+        deleted.status, 200,
+        "the stop must converge instead of going unkillable: {}",
+        deleted.body
+    );
+    wait_gone(&sandbox, child, Duration::from_secs(5));
 }

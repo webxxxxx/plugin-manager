@@ -135,8 +135,8 @@ pub(crate) type Descendant = (u32, u64);
 ///
 /// The process group is not the whole tree. A child that calls `setsid` leaves
 /// the group, and dropbear's per-connection child does exactly that for every
-/// connection it accepts (`vendor/dropbear-2022.83/svr-main.c:334`), so
-/// signalling the group alone left sshd sessions and their `sftp-server`
+/// connection it accepts (ssh 插件仓库的 `vendor/dropbear-2022.83/svr-main.c:334`),
+/// so signalling the group alone left sshd sessions and their `sftp-server`
 /// running after the plugin was stopped or uninstalled (#332).
 ///
 /// Once the leader exits those children are reparented to init, so the only
@@ -155,6 +155,16 @@ pub(crate) fn stop_descendants(descendants: &[Descendant]) {
 /// Kill every captured descendant that outlived the polite signal.
 pub(crate) fn kill_descendants(descendants: &[Descendant]) {
     imp::kill_descendants(descendants)
+}
+
+/// True while any captured descendant is still the process the snapshot saw.
+///
+/// The judgement lives here, next to [`alive`] and [`start_time`], because it
+/// needs both: a pid that exists but is a zombie has exited and only awaits
+/// reaping, and counting it would keep a stop waiting for it and end in
+/// "unkillable" (#111, #334).
+pub(crate) fn descendants_alive(descendants: &[Descendant]) -> bool {
+    imp::descendants_alive(descendants)
 }
 
 /// Kill one child immediately, including its process group on Unix.
@@ -257,6 +267,12 @@ mod imp {
     pub(crate) fn stop_descendants(_descendants: &[Descendant]) {}
 
     pub(crate) fn kill_descendants(_descendants: &[Descendant]) {}
+
+    /// The job object owns the tree, so there is no per-process judgement to
+    /// make: `tree_alive` already asks it.
+    pub(crate) fn descendants_alive(_descendants: &[Descendant]) -> bool {
+        false
+    }
 
     pub(crate) fn start_time(_pid: u32) -> Option<u64> {
         None
@@ -565,6 +581,12 @@ mod imp {
         signal_descendants(descendants, libc::SIGKILL);
     }
 
+    pub(crate) fn descendants_alive(descendants: &[Descendant]) -> bool {
+        descendants
+            .iter()
+            .any(|(pid, start)| alive(*pid) && start_time(*pid) == Some(*start))
+    }
+
     /// Signal the captured descendants that are still the same processes. The
     /// start time is re-checked here: a pid recycled between the snapshot and
     /// the kill would otherwise point at an unrelated process.
@@ -760,6 +782,42 @@ mod tests {
         );
         super::kill_descendants(&snapshot);
         assert!(wait_for(&mut leader, 2_000), "cleanup the leader");
+    }
+
+    /// A child that exited but was never reaped is a zombie: it still answers
+    /// `kill(pid, 0)`, but nothing is running. Counting it as alive would keep
+    /// a stop waiting for a process that is already gone (#111, #334).
+    #[test]
+    fn a_zombie_descendant_is_not_alive() {
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a short-lived child");
+        let pid = child.id();
+        let start = super::start_time(pid).expect("start time");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !zombie(pid) {
+            assert!(Instant::now() < deadline, "the child never became a zombie");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !super::descendants_alive(&[(pid, start)]),
+            "a zombie has exited and must not keep a stop waiting"
+        );
+        let _ = child.wait();
+    }
+
+    /// Whether `pid` is a zombie: `/proc/<pid>/stat` state `Z` (or `X`).
+    fn zombie(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", pid)) else {
+            return false;
+        };
+        let Some((_, rest)) = stat.rsplit_once(") ") else {
+            return false;
+        };
+        matches!(rest.chars().next(), Some('Z') | Some('X'))
     }
 
     fn spawn_leader() -> Child {

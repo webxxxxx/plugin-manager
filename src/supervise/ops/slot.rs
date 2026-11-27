@@ -82,14 +82,14 @@ pub(crate) struct Slot {
     /// A stop request arrived while a stop action was still running; it is
     /// applied when that action ends.
     stop_after_action: bool,
-    /// The whole service tree; on Unix the process group is the tree and this
-    /// stays `None` (the platform returns no handle there).
+    /// The whole service tree: a job object on Windows, `None` on Unix where
+    /// the group plus `descendants` answer for the tree.
     tree: Option<crate::platform::host::process::Tree>,
     /// The descendants a stop has to take with it (#332, ADR-0031).
     descendants: Descendants,
-    /// The leader exited but other group members are still alive; the service
-    /// stays `Running` until the whole group is gone.
-    exit_while_group_alive: Option<Option<i32>>,
+    /// The leader exited but the tree is still alive; the service stays
+    /// `Running` until it is gone.
+    exit_while_tree_alive: Option<Option<i32>>,
     ping_id: u64,
     /// This slot was rebuilt from a runtime record after a daemon restart, so
     /// there is no `Child` handle: liveness is polled through the process group.
@@ -158,7 +158,7 @@ impl Slot {
             stop_after_action: false,
             tree: None,
             descendants: Descendants::default(),
-            exit_while_group_alive: None,
+            exit_while_tree_alive: None,
             ping_id: 1,
             adopted: false,
             contract: None,
@@ -415,7 +415,7 @@ impl Slot {
     }
 
     fn spawn_process(&mut self) -> Result<u32, String> {
-        self.exit_while_group_alive = None;
+        self.exit_while_tree_alive = None;
         if self.tree.is_none() {
             self.tree = crate::platform::host::process::Tree::new();
             if self.tree.is_none() {
@@ -567,7 +567,7 @@ impl Slot {
                 self.adopted = false;
                 return;
             };
-            if self.group_alive() {
+            if self.tree_alive() {
                 return;
             }
             // An adopted process is not our child, so there is no exit status.
@@ -582,10 +582,10 @@ impl Slot {
             };
             let pid = self.machine.pid;
             self.child = None;
-            if pid.is_some() && self.group_alive() {
+            if pid.is_some() && self.tree_alive() {
                 // The leader is gone but the service tree is not. Keep the
                 // service Running and settle the exit once the group is empty.
-                self.exit_while_group_alive = Some(status.code());
+                self.exit_while_tree_alive = Some(status.code());
                 return;
             }
             if let Some(pid) = pid {
@@ -594,13 +594,13 @@ impl Slot {
             }
             return;
         }
-        let Some(code) = self.exit_while_group_alive else {
+        let Some(code) = self.exit_while_tree_alive else {
             return;
         };
-        if self.group_alive() {
+        if self.tree_alive() {
             return;
         }
-        self.exit_while_group_alive = None;
+        self.exit_while_tree_alive = None;
         if let Some(pid) = self.machine.pid {
             self.note_exit(pid, code, "pending exit");
             self.settle_exit(pid, code, now);
@@ -674,7 +674,7 @@ impl Slot {
         self.start_deadline = None;
         self.stop_deadline = None;
         self.kill_deadline = None;
-        self.exit_while_group_alive = None;
+        self.exit_while_tree_alive = None;
         self.exit_awaiting_action = None;
         self.descendants.clear();
     }

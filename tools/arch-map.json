@@ -560,6 +560,7 @@
     "src/supervise/ops/slot/action.rs": "slot",
     "src/supervise/ops/slot/prelude.rs": "slot",
     "src/supervise/ops/slot/stop.rs": "slot",
+    "src/supervise/ops/slot/tree.rs": "slot",
     "src/supervise/ops/slot/tests.rs": "slot",
     "src/selfinstall/upgrade.rs": "upgrade",
     "src/wire/contract/mod.rs": "wire",

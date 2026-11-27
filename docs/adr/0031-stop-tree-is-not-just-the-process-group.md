@@ -1,9 +1,9 @@
 # 停止的树不只是进程组：`setsid` 出去的子孙也要一起带走
 
 删掉一个**正在跑**的 sshd 插件之后，`ps` 里仍有 `dropbear` 与 `sftp-server`。原因是停止只对进程组发信号（`platform::host::process::terminate_tree` = `kill(-pid, SIGTERM)`；Unix 上的 `Tree` 是空实现，注释里写着「组就是树」），而 dropbear 每接受一个连接就 fork 一个子进程，这个子进程无条件 `setsid()`
-（`vendor/dropbear-2022.83/svr-main.c:334`，pty 会话在 `sshpty.c:284` 再 `setsid` 一次）。它因此离开了插件的进程组：leader（监听进程）被 SIGTERM 打死，连接子进程与它拉起的 shell / `sftp-server` 继续跑，还持有已经从磁盘删掉的插件文件。
+（ssh 插件仓库的 `vendor/dropbear-2022.83/svr-main.c:334`，pty 会话在 `sshpty.c:284` 再 `setsid` 一次）。它因此离开了插件的进程组：leader（监听进程）被 SIGTERM 打死，连接子进程与它拉起的 shell / `sftp-server` 继续跑，还持有已经从磁盘删掉的插件文件。
 
-这不是 sshd 特有：任何会 `setsid`（或双 fork 后脱离会话）的插件都一样。supervisor 已有的「组内任一进程仍存活时服务保持 `Running`」（`exit_while_group_alive`）也只看得见组。
+这不是 sshd 特有：任何会 `setsid`（或双 fork 后脱离会话）的插件都一样。supervisor 已有的「树里任一进程仍存活时服务保持 `Running`」（当时的 `exit_while_group_alive`，现在叫 `exit_while_tree_alive`）也只看得见组。
 
 ## Decision
 
