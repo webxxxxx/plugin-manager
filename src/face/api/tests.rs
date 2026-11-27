@@ -684,3 +684,45 @@ fn a_root_that_still_holds_plugins_cannot_be_dropped() {
         "an empty root may be dropped"
     );
 }
+
+/// The settings screen reads `effective` for every document key; a key with no
+/// arm projects `null`, and the screen renders a null toggle as "on". Every
+/// boolean key must therefore project a real bool, or a default-off key such as
+/// `vendor_login` shows up as enabled.
+#[test]
+fn every_bool_key_projects_a_boolean_value() {
+    let config = test_config("settings-effective-bools");
+    for entry in crate::platform::config_doc::CONF_KEYS {
+        if entry.kind != crate::platform::config_doc::Kind::Bool {
+            continue;
+        }
+        let value = super::settings::effective(&config, entry.key, None);
+        assert!(
+            value.is_boolean(),
+            "{} projects {value} instead of a bool",
+            entry.key
+        );
+    }
+}
+
+/// `vendor_login` defaults to false and follows the document when set.
+#[test]
+fn vendor_login_projects_the_document_value() {
+    let paths = Paths::under(
+        &crate::platform::test_support::temp_dir().join("svcd-vendor-login-projection"),
+    );
+    let settings = crate::platform::settings::Settings::default();
+    let off = Config::with_paths(settings.clone(), None, paths.clone());
+    assert_eq!(
+        super::settings::effective(&off, "vendor_login", None),
+        json!(false)
+    );
+
+    let mut settings = settings;
+    settings.vendor_login = true;
+    let on = Config::with_paths(settings, None, paths);
+    assert_eq!(
+        super::settings::effective(&on, "vendor_login", None),
+        json!(true)
+    );
+}

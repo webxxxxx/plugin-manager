@@ -295,7 +295,11 @@ pub(super) fn probe_reported(stated: Option<u64>, observed: Option<u64>) -> Valu
 
 /// What the running daemon actually uses for one key. `null` means "this key is
 /// not a derived runtime value" (paths, the password hash).
-fn effective(config: &crate::platform::config::Config, key: &str, bind: Option<&str>) -> Value {
+pub(super) fn effective(
+    config: &crate::platform::config::Config,
+    key: &str,
+    bind: Option<&str>,
+) -> Value {
     let limits = &config.limits;
     let settings = &config.settings;
     let paths = &config.paths;
@@ -347,6 +351,7 @@ fn effective(config: &crate::platform::config::Config, key: &str, bind: Option<&
         "bind" => json!(bind),
         "mcp_streaming" => json!(settings.mcp_streaming.unwrap_or(false)),
         "allow_insecure_install" => json!(settings.allow_insecure_install),
+        "vendor_login" => json!(settings.vendor_login),
         "manual_install_root" => json!(settings.manual_install_root.unwrap_or(true)),
         "auth_passwd" => json!(settings.auth_passwd.is_some()),
         "config_dir" => json!(paths.config_dir.to_string_lossy()),
