@@ -180,6 +180,9 @@ pub const HOOK_START_TIMEOUT_MS: u64 = 30_000;
 pub const HOOK_STARTED_TIMEOUT_MS: u64 = 15_000;
 pub const HOOK_STOP_TIMEOUT_MS: u64 = 10_000;
 pub const HOOK_STATUS_TIMEOUT_MS: u64 = 5_000;
+/// A capability hook is one call: the caller waits for it, so its default is
+/// the same order as a management request, not a lifecycle window.
+pub const HOOK_CALL_TIMEOUT_MS: u64 = 10_000;
 pub const HOOK_TIMEOUT_MAX_MS: u64 = 300_000;
 pub const HOOK_STATUS_TIMEOUT_MAX_MS: u64 = 30_000;
 
@@ -257,6 +260,14 @@ pub struct Service {
     pub exec: Option<Exec>,
     /// Optional lifecycle commands; core definitions and schema-2 plugins use them.
     pub lifecycle: Option<Lifecycle>,
+    /// Capabilities delivered by a one-shot hook instead of the protocol
+    /// channel, by capability name (#342).
+    ///
+    /// A plugin with `exec.ready = "exec"` or `"port"` has no channel, so a
+    /// capability can only be a short-lived action: the host runs the hook once
+    /// per call, `arguments` on stdin, the result JSON on stdout. A channel peer
+    /// never has this map: one capability has exactly one way in.
+    pub capability_hooks: std::collections::BTreeMap<String, Hook>,
     /// Boot-start flag (`[auto]` in `svc list`); not the crash-restart policy.
     pub enabled: bool,
     /// Crash-restart policy; independent of the boot flag.
@@ -419,6 +430,7 @@ impl Service {
             }),
             exec: None,
             lifecycle: None,
+            capability_hooks: Default::default(),
             enabled: true,
             restart: Restart::Never,
             remain_after_exit: false,

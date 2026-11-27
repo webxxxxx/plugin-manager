@@ -220,14 +220,50 @@ fn check_ready(manifest: &Manifest) -> Result<(), ProblemError> {
     Ok(())
 }
 
-/// A capabilities list requires a protocol channel, which neither an exec-ready
-/// process (stdin closed) nor a port-ready one (no channel at all) has.
+/// One capability has exactly one way in: the protocol channel for a
+/// `notify`-ready plugin, a one-shot hook for a plugin with no channel (#342).
 fn check_capabilities_with_exec(manifest: &Manifest) -> Result<(), ProblemError> {
     let no_channel = matches!(manifest.exec.ready.as_deref(), Some("exec") | Some("port"));
-    if !manifest.capabilities.is_empty() && no_channel {
-        return Err(Problem::Invalid.error(
-            "exec.ready=exec/port cannot declare capabilities: the plugin has no protocol channel",
-        ));
+    if manifest.capabilities.is_empty() {
+        return Ok(());
+    }
+    if !no_channel {
+        if manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability.hook.is_some())
+        {
+            return Err(Problem::Invalid.error(
+                "a capability hook is only for a plugin with no protocol channel; \
+                 exec.ready=notify already delivers the call",
+            ));
+        }
+        return Ok(());
+    }
+    // No channel: every capability has to bring its own action, or it would be
+    // listed as a tool that can never answer.
+    for capability in &manifest.capabilities {
+        let Some(hook) = capability.hook.as_ref() else {
+            return Err(Problem::Invalid.error(format!(
+                "exec.ready=exec/port has no protocol channel, so capability {} needs a hook",
+                capability.name
+            )));
+        };
+        check_path(&hook.path)?;
+        if !manifest.files.iter().any(|file| file.path == hook.path) {
+            return Err(Problem::Invalid.error(format!(
+                "capabilities[{}].hook is not in files[]: {}",
+                capability.name, hook.path
+            )));
+        }
+        if let Some(timeout) = hook.timeout {
+            if timeout == 0 || timeout > 300 {
+                return Err(Problem::Invalid.error(format!(
+                    "capabilities[{}].hook.timeout must be between 1 and 300 seconds",
+                    capability.name
+                )));
+            }
+        }
     }
     Ok(())
 }

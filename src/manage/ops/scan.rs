@@ -143,9 +143,28 @@ pub(crate) fn service_from_manifest(
             idempotent: false,
         });
     }
-    if matches!(ready, Ready::Exec | Ready::Port(_)) && !caps.is_empty() {
-        return Err(Problem::Invalid
-            .error("exec.ready=exec/port cannot declare capabilities: no protocol channel"));
+    if matches!(ready, Ready::Exec | Ready::Port(_)) {
+        // No channel: a capability can only be a one-shot hook, and one without
+        // it would be a tool that never answers (#342).
+        if let Some(missing) = manifest
+            .capabilities
+            .iter()
+            .find(|capability| capability.hook.is_none())
+        {
+            return Err(Problem::Invalid.error(format!(
+                "exec.ready=exec/port has no protocol channel, so capability {} needs a hook",
+                missing.name
+            )));
+        }
+    } else if manifest
+        .capabilities
+        .iter()
+        .any(|capability| capability.hook.is_some())
+    {
+        return Err(Problem::Invalid.error(
+            "a capability hook is only for a plugin with no protocol channel; \
+             exec.ready=notify already delivers the call",
+        ));
     }
     let contract = crate::kernel::registry::contract_for(
         id,
@@ -205,6 +224,27 @@ pub(crate) fn service_from_manifest(
             })
         }
     };
+
+    // Capability hooks are converted after `any_script` exists: a hook can be
+    // the only script in the package (#342).
+    let mut capability_hooks: std::collections::BTreeMap<String, Hook> = Default::default();
+    for capability in &manifest.capabilities {
+        let Some(hook) = capability.hook.as_ref() else {
+            continue;
+        };
+        let converted = convert_lifecycle_hook(
+            &format!("capabilities[{}].hook", capability.name),
+            version_dir,
+            Some(hook),
+            crate::kernel::registry::HOOK_CALL_TIMEOUT_MS,
+            crate::kernel::registry::HOOK_TIMEOUT_MAX_MS,
+            interpreter,
+            &mut any_script,
+        )?;
+        if let Some(hook) = converted {
+            capability_hooks.insert(capability.name.clone(), hook);
+        }
+    }
     if !any_script && interpreter.is_some() {
         return Err(Problem::Invalid.error(format!(
             "plugin {} declares an interpreter but has no script payload",
@@ -245,6 +285,7 @@ pub(crate) fn service_from_manifest(
             },
         }),
         lifecycle,
+        capability_hooks,
         enabled,
         // The manifest has no policy field yet; plugins keep the historical
         // on-failure behaviour and stop at Failed after the retry budget.
@@ -436,10 +477,54 @@ mod tests {
         assert_eq!(surface[0].desc, "run it");
         assert_eq!(surface[0].effect, Effect::Write);
         assert!(!surface[0].idempotent);
+        // A channel peer delivers the call itself: no hook map (#342).
+        assert!(service.capability_hooks.is_empty());
         assert!(!service
             .contract
             .failures
             .contains(&crate::kernel::failure::Class::Cancelled));
+    }
+
+    /// A plugin with no channel answers its capabilities with a one-shot hook,
+    /// so the loader has to keep the converted action next to the contract
+    /// surface (#342).
+    #[test]
+    fn scan_converts_a_capability_hook() {
+        let id = "contract-hook";
+        make_plugin(id, "", false);
+        let manifest_path = root()
+            .join("data/plugins")
+            .join(id)
+            .join("1.0.0")
+            .join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("manifest"))
+                .expect("manifest json");
+        manifest["exec"]["ready"] = serde_json::json!("exec");
+        manifest["capabilities"] = serde_json::json!([{
+            "name": "run",
+            "desc": "run it",
+            "inputSchema": {"type": "object"},
+            "hook": {"path": "payload/bin/demo", "args": ["mode"], "timeout": 4}
+        }]);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).expect("manifest"),
+        )
+        .expect("write manifest");
+
+        let (services, _) = scan(paths(), &crate::platform::limits::test_default());
+        let service = services
+            .iter()
+            .find(|service| service.id == id)
+            .expect("plugin is scanned");
+        let hook = service
+            .capability_hooks
+            .get("run")
+            .expect("the capability has its action");
+        assert!(hook.path.ends_with("payload/bin/demo"), "{}", hook.path);
+        assert_eq!(hook.args, vec!["mode".to_string()]);
+        assert_eq!(hook.timeout_ms, 4_000);
     }
 
     /// #307: an install to a second root builds the service before the root is

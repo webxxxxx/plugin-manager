@@ -293,6 +293,7 @@ fn load_scripts(
                 interpreter: None,
             }),
             lifecycle,
+            capability_hooks: Default::default(),
             enabled,
             restart,
             remain_after_exit,
@@ -591,6 +592,7 @@ fn validate(
             interpreter: None,
         }),
         lifecycle,
+        capability_hooks: Default::default(),
         // A definition declared in services.d is boot-start in v1; a marker-based
         // enable/disable override belongs to the lifecycle work (#29).
         enabled: true,

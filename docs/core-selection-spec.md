@@ -133,7 +133,7 @@ core drop-in 脚本可以原样放进 `.spk` 变成 plugin：脚本不改，补 
 - payload 不是 native 可执行文件（ELF / Mach-O / PE）时可以声明 `interpreter`：`{name, args?, version?}`。`name` 是 PATH 上的裸名；`version` 是数字约束，**为空/省略只校验存在**，不执行版本探测。Windows 上只解析 `.exe` / `.com`，不接受 `.cmd` / `.bat` shim。声明了就一定要有脚本可跑（否则拒装）。
 - 不声明也能跑：带 shebang 的脚本在 Unix 直接 exec，`.cmd` / `.bat` 在 Windows 经 `COMSPEC`；要锁定解释器版本或跑 `.py` / `.ps1` 时才声明。
 - 安装时解析解释器到绝对路径并校验版本，失败不落盘；扫描时只重新解析路径。运行时统一 `interp + args + [script] + action_args`，`exec` 与 lifecycle 共用同一结果。Windows 没有 SIGTERM 的 polite 路径：进程被直接强杀，之后 `stop` 照常运行。
-- 脚本插件通常 `capabilities: []`，MCP 面只剩 `<id>.start`；会讲 MCP 的脚本可以 `ready: "notify"` 并声明能力。
+- 脚本插件通常 `capabilities: []`，MCP 面只剩 `<id>.start`；会讲 MCP 的脚本可以 `ready: "notify"` 并声明能力；只有一个常驻进程、只偶尔被调一下的插件（`ready: "exec"` / `"port"`）把能力挂成一次性钩子（`capabilities[].hook`），不必为了通道再养一个 shell。
 - `plugin bundle --from-core --interpreter <name>` 会把声明的 `start` 写进 `exec.args`，为 `stop` / `status` 生成 lifecycle；lifecycle 指向的其它脚本也要一起进 `files[]`。`hooks` / `config` / `ui` 仍按插件规则。
 - 没有版本门禁：`lifecycle` / `interpreter` / `compat` 与普通字段一样只在 `schema: 1` 内校验。
 
@@ -165,7 +165,7 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
 | `interpreter` | object | 否 | `{name, args?, version?}`；声明了就必须有脚本 payload，不声明则直接 exec（见 §1.8） |
 | `lifecycle` | object | 否 | `{start?, started?, stop?, status?}`；`start` 是前置准备（必须退出），`started` 在就绪后、Running 之前跑一次（失败即启动失败），`stop` 在进程消失后运行并拿 `SVCD_STOP_REASON`；路径包内相对且在 `files[]` |
 | `dependencies` | [string] | 否 | 服务 id 列表，**无版本约束** |
-| `capabilities` | array | 否 | `{name, desc, inputSchema, outputSchema?}`；name 插件内唯一，`svc.` 禁用；只允许 `ready=notify`；`outputSchema` 只做声明与 MCP 投影，不校验结果（省略 = 未声明，`{}` = 任意） |
+| `capabilities` | array | 否 | `{name, desc, inputSchema, outputSchema?, hook?}`；name 插件内唯一，`svc.` 禁用；一个能力只有一种投递方式——`ready=notify` 走通道且不许声明 `hook`，`ready=exec`/`port` 没有通道，因此**每个**能力都必须带 `hook`（`{path, args?, env?, timeout?}`，包内相对且在 `files[]`）：每次 `tools/call` 起一次该动作，参数写 stdin，stdout 成为这次调用的文本结果；`outputSchema` 只做声明与 MCP 投影，不校验结果（省略 = 未声明，`{}` = 任意） |
 | `ui` | object | 否 | `{type: web / gui / headerless, entry?}`；`entry` 相对 `payload/web/`，默认 `index.html` |
 | `icons` | object | 否 | `{png?, ico?, icns?}`，值必须是 `files[]` 里的包内路径；每项 ≤1 MiB、合计 ≤2 MiB、按魔数校验；至少一项；未知键拒绝 |
 | `files` | array | 是 | 除两个清单外的全部文件：`{path, size, sha256, mode}` |
@@ -547,6 +547,7 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
 
 ## 15. 修订记录
 
+- 2026-11-28（#342）：能力可以挂一次性动作。manifest `capabilities[].hook = {path, args?, env?, timeout?}`：宿主每次 `tools/call` 起一次该动作，参数写 stdin，stdout 成为这次调用的文本结果（与通道那侧 handler 的 stdout 同形）。一个能力只有一种投递方式——`ready=notify` 不许声明 `hook`，`ready=exec`/`port` 必须给每个能力声明 `hook`。这样「一个常驻进程 + 偶尔被调一次」的插件不必为了能力面再养一个通道 shell（ADR-0002 同日记了这条修订）。
 - 2026-11-23（#267）：复审收口。`GET/PUT /api/v1/settings`：派生细项（`max_*`、队列、栈、`ws_inflight_*`）只读展示、PUT 拒绝；值必须是单行，写前先构造并解析整份文档、只允许点名的键变化（挡住「值里塞一行只读键」）。控制台失败直接落盘前校验。`svcd.conf` 编辑改成逐字节保留（CRLF、注释、缺尾换行）。`log clear` 的审计行写进被清空的插件日志（不再是 daemon 日志）。安装与 services.d 撞 id 由注册表给 `duplicate service id ... (display name ...)`，状态 409。`SVCD_*` 只在 bootstrap 读一次，面层报来源用快照（ADR-0019）。`svcd upgrade` 把预发布 tag（带 `-`）当不更新。协议 3：stream 0 队列满只丢帧不杀实例（调用侧按 pending 背压/超时收口），单条 raw 流超限关闭该流。`check_spk.mjs` 的 manifest 规则可注入自测（`--self-test`），协议 3 + capabilities 重新合法。
 - 2026-11-23（#266）：协议 3 增加**控制流** `0xFFFF_FFFF`，payload 是一个 JSON 对象，目前只有 `{"op":"close","stream":N}`。`/raw` 订阅者断开时宿主给插件发 close；插件发 close 时宿主给该流的 WebSocket 发干净关闭（1000）并释放订阅与在途预算；插件在已关闭的流上再写数据记 `stream_not_subscribed` 并回一个 close（不再静默丢弃）。数据流 payload 语义不变（空 payload 仍是空数据帧），控制帧 ≤128 字节，非法控制帧记 `control_frame_invalid`，不占用 stream 表、不计入 raw 数据字节。
 - 2026-11-23（#265）：协议 3 变成多路复用传输——`u32 len | u32 stream | payload` 的 **stream 0 就是 JSON-RPC 通道**（payload 是一条 JSON-RPC 消息，外层长度即帧界），stream ≥1 仍是 raw 二进制流。于是协议 3 插件可以 `ready: notify`、应答 `svcd.ping`、声明 capabilities，并同时提供 SSE、页面 WS 与 `/raw`；`ready` 与 capabilities 的既有关系（`ready=exec` 不能声明能力）不变。协议 1/2 不变。非协议 3 插件请求 `/raw` 现在返回 409 `raw_unavailable` 并指明需要协议 3；stream 0 超限/非 UTF-8/队列满记 JSON 通道失败（`json_frame_too_large` / `json_channel_full`），单条 raw 流超限会关闭该流（订阅者收到关闭事件，插件收到控制帧），实例继续运行。`ws_raw_enabled` 仍是最外层开关。

@@ -359,6 +359,11 @@ const SEAM_RULES = [
       // 已登记的直接调用方：seam 的同步 API 还没覆盖这两种用途。
       "src/manage/check/interpreter.rs",
       "src/manage/ops/config.rs",
+      // 能力钩子（#342）：stdout/stderr 去临时文件，只有 stdin 是一条管道。
+      // 走 Plan 会把 stdout 也从 seam 拿回来变成管道，而钩子留下一个占着
+      // stdout 的孙子进程时，那条管道要一个读线程一直陪着——probe.rs 的
+      // status 钩子为了同样的理由直接开文件。
+      "src/supervise/ops/slot/call_hook.rs",
       // reactor 的测试 fixture 自建管道。
       "src/wire/contract/reactor.rs",
     ],

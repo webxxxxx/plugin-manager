@@ -1193,3 +1193,153 @@ fn a_port_ready_instance_that_dies_before_listening_names_the_address() {
     assert_eq!(slot.machine.state, State::Backoff);
     reap_exec(&mut slot);
 }
+
+/// A hook script under this slot's temp dir plus the interpreter that runs it.
+/// Unix only: these three tests are the supplement, the cross-platform
+/// behaviour test lives in `tests/plugin.rs`.
+#[cfg(unix)]
+fn hook_script(slot: &Slot, body: &str) -> Hook {
+    let path = slot.paths.temp_dir.join(format!(
+        "hook-{}.sh",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&slot.paths.temp_dir).expect("temp dir");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("hook script");
+    Hook {
+        path: path.to_string_lossy().to_string(),
+        args: Vec::new(),
+        env: BTreeMap::new(),
+        timeout_ms: 5_000,
+        interpreter: Some(Interpreter {
+            path: "/bin/sh".into(),
+            args: Vec::new(),
+        }),
+    }
+}
+
+/// A capability with a hook answers the call with the hook's stdout, and the
+/// arguments arrive on its stdin (#342).
+#[cfg(unix)]
+#[test]
+fn a_capability_hook_answers_the_call_with_its_stdout() {
+    let mut slot = slot();
+    slot.machine.state = State::Running;
+    let hook = hook_script(&slot, "cat");
+    slot.set_capability_hooks(BTreeMap::from([("echo".to_string(), hook)]));
+
+    let (tx, rx) = mpsc::channel();
+    slot.request_capability(
+        "echo",
+        json!({"mode": "tproxy"}),
+        Some(json!(100)),
+        0,
+        None,
+        crate::wire::control::channel::Reply::plain(tx),
+    )
+    .expect("hook call is accepted");
+
+    let started = Instant::now();
+    let response = wait_response(&mut slot, &rx, &started);
+    let result = response.result.expect("hook result");
+    let text = result["content"][0]["text"].as_str().expect("text result");
+    let echoed: serde_json::Value =
+        serde_json::from_str(text).expect("the hook echoes its arguments");
+    assert_eq!(echoed["mode"], "tproxy");
+    assert_eq!(result["isError"], false);
+    // No channel frame was ever allocated: the hook path owns no pending call.
+    assert!(slot.pending.is_empty());
+    assert_eq!(slot.hook_calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hook_that_exits_non_zero_fails_the_call() {
+    let mut slot = slot();
+    slot.machine.state = State::Running;
+    let hook = hook_script(&slot, "echo boom >&2; exit 3");
+    slot.set_capability_hooks(BTreeMap::from([("mode".to_string(), hook)]));
+
+    let (tx, rx) = mpsc::channel();
+    slot.request_capability(
+        "mode",
+        json!({}),
+        Some(json!(101)),
+        0,
+        None,
+        crate::wire::control::channel::Reply::plain(tx),
+    )
+    .expect("hook call is accepted");
+
+    let started = Instant::now();
+    let response = wait_response(&mut slot, &rx, &started);
+    assert!(response.result.is_none(), "a failure is not a result");
+    assert_eq!(slot.hook_calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hook_that_overruns_its_timeout_fails_the_call() {
+    let mut slot = slot();
+    slot.machine.state = State::Running;
+    let mut hook = hook_script(&slot, "sleep 3");
+    hook.timeout_ms = 200;
+    let token = crate::kernel::contract::CancelToken::default();
+    slot.set_capability_hooks(BTreeMap::from([("slow".to_string(), hook)]));
+
+    let (tx, rx) = mpsc::channel();
+    slot.request_capability(
+        "slow",
+        json!({}),
+        Some(json!(102)),
+        0,
+        None,
+        crate::wire::control::channel::Reply::plain(tx),
+    )
+    .expect("hook call is accepted");
+    let _ = token;
+
+    let started = Instant::now();
+    let response = wait_response(&mut slot, &rx, &started);
+    assert!(response.result.is_none(), "a timeout is not a result");
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+/// The hook fan-out is bounded: each call forks a process, so a full set of
+/// in-flight hooks is backpressure, not a queue.
+#[test]
+fn a_full_set_of_hook_calls_reports_busy() {
+    let mut slot = slot();
+    slot.machine.state = State::Running;
+    slot.hook_calls
+        .store(call_hook::MAX_HOOK_CALLS, Ordering::SeqCst);
+    let hook = Hook {
+        path: "/nonexistent/hook".into(),
+        args: Vec::new(),
+        env: BTreeMap::new(),
+        timeout_ms: 1_000,
+        interpreter: None,
+    };
+    slot.set_capability_hooks(BTreeMap::from([("echo".to_string(), hook)]));
+
+    let (tx, rx) = mpsc::channel();
+    slot.request_capability(
+        "echo",
+        json!({}),
+        Some(json!(103)),
+        0,
+        None,
+        crate::wire::control::channel::Reply::plain(tx),
+    )
+    .expect("the request is accepted, then refused as busy");
+    let line = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a busy reply");
+    assert!(line.contains("in-flight"), "{line}");
+    assert_eq!(
+        slot.hook_calls.load(Ordering::SeqCst),
+        call_hook::MAX_HOOK_CALLS
+    );
+}

@@ -560,6 +560,7 @@
     "src/supervise/ops/restart.rs": "supervise",
     "src/supervise/ops/slot.rs": "slot",
     "src/supervise/ops/slot/calls.rs": "slot",
+    "src/supervise/ops/slot/call_hook.rs": "slot",
     "src/supervise/ops/slot/commands.rs": "slot",
     "src/supervise/ops/slot/frames.rs": "slot",
     "src/supervise/ops/slot/handle.rs": "slot",

@@ -135,6 +135,13 @@ pub struct Capability {
     /// Schema 1 only declares and projects it; nothing validates results yet.
     #[serde(rename = "outputSchema", default)]
     pub output_schema: Option<serde_json::Value>,
+    /// The one-shot action that answers a call to this capability (#342).
+    ///
+    /// Only for a plugin with no protocol channel (`exec.ready` = `exec` or
+    /// `port`): the host runs the hook once per call, `arguments` on stdin and
+    /// the result JSON on stdout. A channel peer leaves it out.
+    #[serde(default)]
+    pub hook: Option<Hook>,
 }
 
 /// Package icons: one package-relative path per format. Unknown keys are
