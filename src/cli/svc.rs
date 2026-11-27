@@ -441,7 +441,7 @@ fn reload(config: &Config) -> i32 {
         }
     };
     if let Some(error) = response.error {
-        eprintln!("svc: {}", error.message);
+        client::report_error("svc", &error);
         return EXIT_SERVICE_ERROR;
     }
     let result = response.result.unwrap_or(Value::Null);
@@ -616,7 +616,7 @@ fn auth_command(config: &Config, action: AuthAction) -> i32 {
         }
     };
     if let Some(error) = response.error {
-        eprintln!("svc: {}", error.message);
+        client::report_error("svc", &error);
         return EXIT_SERVICE_ERROR;
     }
     let result = response.result.unwrap_or(Value::Null);

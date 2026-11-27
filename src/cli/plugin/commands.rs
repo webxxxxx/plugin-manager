@@ -63,7 +63,7 @@ fn list(config: &Config) -> i32 {
         Err(error) => return client::unreachable(&error, "plugin"),
     };
     if let Some(error) = response.error {
-        eprintln!("plugin: {}", error.message);
+        client::report_error("plugin", &error);
         return EXIT_SERVICE_ERROR;
     }
     let result = match response.result {
@@ -248,7 +248,7 @@ fn uninstall(config: &Config, id: &str, purge: bool, force: bool) -> i32 {
     ) {
         Ok(response) => match response.error {
             Some(error) => {
-                eprintln!("plugin: {}", error.message);
+                client::report_error("plugin", &error);
                 EXIT_SERVICE_ERROR
             }
             None => {

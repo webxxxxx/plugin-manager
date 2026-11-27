@@ -40,7 +40,7 @@ pub(crate) fn request(
         Err(error) => return Err(unreachable(&error, label)),
     };
     if let Some(error) = response.error {
-        eprintln!("{}: {}", label, error.message);
+        report_error(label, &error);
         return Err(EXIT_SERVICE_ERROR);
     }
     let result = match response.result {
@@ -74,4 +74,64 @@ pub(crate) fn print_status(status: Status, json: bool, label: &str) -> i32 {
 pub(crate) fn unreachable(error: &std::io::Error, label: &str) -> i32 {
     eprintln!("{}: svcd unreachable: {}", label, error);
     EXIT_DAEMON_UNREACHABLE
+}
+
+/// Print one daemon error the way every CLI verb prints it.
+///
+/// The daemon stamps the request's call number into `error.data.call` (#343);
+/// carrying it on the same line is what makes `grep call=7 svcd.log` possible
+/// after a failed install. A response without that key renders exactly as it
+/// did before, so no existing output changes.
+pub(crate) fn report_error(label: &str, error: &crate::wire::message::rpc::Error) {
+    eprintln!("{}", error_line(label, error));
+}
+
+fn error_line(label: &str, error: &crate::wire::message::rpc::Error) -> String {
+    let call = error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("call"))
+        .and_then(Value::as_u64);
+    match call {
+        Some(call) => format!("{}: {} (call={})", label, error.message, call),
+        None => format!("{}: {}", label, error.message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_line;
+    use crate::wire::message::rpc;
+
+    #[test]
+    fn a_daemon_error_carries_the_call_number_on_the_same_line() {
+        let error = rpc::Error {
+            code: -32006,
+            message: "post-install hook failed".into(),
+            data: Some(serde_json::json!({ "call": 7, "kind": "internal" })),
+        };
+        assert_eq!(
+            error_line("plugin", &error),
+            "plugin: post-install hook failed (call=7)"
+        );
+    }
+
+    #[test]
+    fn an_error_without_a_call_number_renders_as_before() {
+        let error = rpc::Error {
+            code: -32006,
+            message: "post-install hook failed".into(),
+            data: Some(serde_json::json!({ "kind": "internal" })),
+        };
+        assert_eq!(
+            error_line("plugin", &error),
+            "plugin: post-install hook failed"
+        );
+        let bare = rpc::Error {
+            code: -32006,
+            message: "post-install hook failed".into(),
+            data: None,
+        };
+        assert_eq!(error_line("plugin", &bare), "plugin: post-install hook failed");
+    }
 }
