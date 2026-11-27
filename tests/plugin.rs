@@ -596,6 +596,26 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
+/// The call number the CLI printed: the daemon stamps it as `(call=7)` at the
+/// end of the error line (#343).
+fn printed_call(text: &str) -> u64 {
+    let opened = text
+        .rfind("(call=")
+        .unwrap_or_else(|| panic!("the error line carries no call: {text}"));
+    let rest = &text[opened + "(call=".len()..];
+    let (number, _) = rest
+        .split_once(')')
+        .unwrap_or_else(|| panic!("the call number is not closed: {text}"));
+    number.parse().expect("a decimal call number")
+}
+
+/// The call number a daemon log line starts its message with (`call=7 ...`).
+fn logged_call(line: &str) -> Option<u64> {
+    line.split_whitespace()
+        .find_map(|word| word.strip_prefix("call="))
+        .and_then(|number| number.parse().ok())
+}
+
 /// A shutdown request that never reaches the daemon used to block the suite
 /// forever in `child.wait()` (the failure inside `Sandbox::drop` after a
 /// panicking test). The wait is bounded now and names what failed.
@@ -1680,6 +1700,29 @@ fn a_failing_post_install_rolls_back_a_replace() {
         stderr(&failed).contains("post-install"),
         "{}",
         stderr(&failed)
+    );
+
+    // #343: the rejected install hands back a call number, and the daemon's
+    // log carries that same number on both ends of the attempt. The install
+    // just before it succeeded, so one request, one number, in arrival order.
+    let failed_call = printed_call(&stderr(&failed));
+    let svcd_log = fs::read_to_string(sandbox.logs.join("svcd.log")).unwrap_or_default();
+    let installed_line = svcd_log
+        .lines()
+        .find(|line| line.ends_with("plugin demo 1.0.0 installed (now)"))
+        .unwrap_or_else(|| panic!("no install line in svcd.log:\n{svcd_log}"));
+    let installed_call =
+        logged_call(installed_line).expect("the install line carries its call number");
+    assert_eq!(
+        failed_call,
+        installed_call + 1,
+        "consecutive requests get consecutive numbers:\n{svcd_log}"
+    );
+    assert!(
+        svcd_log.lines().any(|line| {
+            logged_call(line) == Some(failed_call) && line.contains("install failed:")
+        }),
+        "no `call={failed_call} install failed:` line in svcd.log:\n{svcd_log}"
     );
 
     let plugin = sandbox.data.join("plugins").join("demo");
