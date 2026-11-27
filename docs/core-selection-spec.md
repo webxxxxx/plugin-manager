@@ -278,6 +278,7 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
   - `GET /api/v1/services/{id}` → `{summary, details}`
   - `POST /api/v1/services/{id}/start` → 同步到 ready，返回 `{summary}`；超时 504
   - `POST /api/v1/services/{id}/stop` → 返回 `{summary}`
+  - `POST /api/v1/services/{id}/restart` → 等价 `svc restart`（stop 动作 → 组终止 → start 动作 → spawn → started 动作），同步返回 `{summary}`；插件页面改完启动期配置后用它重跑
   - `POST /api/v1/services/{id}/enable` / `disable` → 切换开机自启，返回 `{summary}`
   - `GET /api/v1/version` → `{version, protocol, platform}`
   - `GET /api/v1/disk[?id=<插件 id>]` → `{roots:[{root,freeBytes,default,plugin,volume}], tempFreeBytes, tempVolume}`：`roots` 是**列表**，每个插件根一行，按优先级排列（`default=true` 是默认安装根）；根目录不存在就当**量不到**、给 `null`（不向上找祖先：那会把父目录所在文件系统的容量算成未挂载卷的）；拿不到数字的卷同样给 `null`。`?id=` 让每行多一个 `plugin` 字段（`{id,version,directory,bytes}`，没装为 `null`；`bytes` 是当前版本目录的实际占用，升级判断要用它，量不到给 `null`），调用方据此区分「原地升级」（这个根已经有它）和「新装」（挑一个装得下的根）；id 不合法 400，未知 id 不是错误。多根配置下每行就是一个候选根（ADR-0030）。`tempFreeBytes` 是 `<data>/temp` 的空闲字节，装包要经过它；`volume` / `tempVolume` 是所在卷的不透明标识（同一文件系统相等，量不到为 `null`），装前预检用它判断「下载目录与 temp 是不是同一块卷」——同卷是一次 rename，跨卷是整包复制，占两份空间

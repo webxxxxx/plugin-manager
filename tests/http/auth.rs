@@ -171,6 +171,17 @@ fn password_auth_bearer_cookie_csrf() {
     );
     assert_eq!(no_csrf.status, 403);
 
+    // The restart verb rides the same cookie-write gate, no exemption.
+    let no_csrf_restart = request_with(
+        &address,
+        "POST",
+        "/api/v1/services/svc/restart",
+        "",
+        b"",
+        &[("Cookie", api_cookie.as_str())],
+    );
+    assert_eq!(no_csrf_restart.status, 403);
+
     // The blob upload face applies the same cookie-write CSRF policy as the
     // buffered management routes. Send only the head: the server rejects
     // before the body, and writing the body could race the close with a reset.
@@ -203,6 +214,20 @@ fn password_auth_bearer_cookie_csrf() {
         ],
     );
     assert_eq!(csrf.status, 200, "{}", csrf.body);
+
+    let csrf_restart = request_with(
+        &address,
+        "POST",
+        "/api/v1/services/svc/restart",
+        "",
+        b"",
+        &[
+            ("Cookie", api_cookie.as_str()),
+            ("Origin", origin.as_str()),
+            ("X-Svcd-Csrf", "1"),
+        ],
+    );
+    assert_eq!(csrf_restart.status, 200, "{}", csrf_restart.body);
 
     let auth_status = request_with(
         &address,
