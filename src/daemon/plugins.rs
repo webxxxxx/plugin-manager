@@ -61,6 +61,10 @@ impl Daemon {
     /// install line, then project the status the caller returns. Keeping these
     /// four steps here is what makes the direct and staged paths end the same
     /// way (#245).
+    // One more argument than clippy likes: the call number joined the two
+    // paths' facts. A struct would only rename them, the way the slot's
+    // `adopt` keeps its own allow.
+    #[allow(clippy::too_many_arguments)]
     fn finish_install(
         &mut self,
         call: CallId,
