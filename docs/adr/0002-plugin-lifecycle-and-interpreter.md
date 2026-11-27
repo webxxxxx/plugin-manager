@@ -61,3 +61,19 @@ manifest 格式重编号为唯一的 `schema: 1`，本 ADR 的两条结论随之
 
 补充（#324）：`stop` 在「实例不会再回来」的每条路径上都跑——主动停、崩溃且不重启、崩溃且要重启、
 启动失败；服务只有在它返回之后才报 `Stopped`。
+
+## 修订（2026-11-27，#335 / #337）
+
+生命周期多了一个窗口，就绪多了一种语义，结论随之补充：
+
+- **`lifecycle.started`**：Ready 之后、`Running` 之前跑一次，必须退出；非零或超时即本次启动失败
+  （停整组、跑 `stop`、按 `restart` 退避）。每次 spawn（`svc start`、`svc restart`、崩溃重试）都重跑，
+  所以它必须幂等。声明了它就不得同时声明 `remain_after_exit`：一次性服务的进程可能在门控期间退出，
+  没有可门控的实例（定义加载即拒绝）。它补的是 `start`（spawn 之前）与 `stop`（进程消失之后）之间的
+  空窗口；「每个状态一个回调」的形态仍然不做。
+- **`stop` 的停止原因**：`stop` 钩子额外拿 `SVCD_STOP_REASON`（`stop` / `shutdown` / `crash` / `exit` /
+  `start-failed`）与 `SVCD_LAST_EXIT`（只有 `crash` / `exit` 时是退出码）。一个钩子按原因分支，不再需要
+  为每个状态配一个回调。
+- **`exec.ready: "port"`**：就绪也可以是「宿主连得上声明的端口」；`exec.port` 必填、`exec.probe_addr`
+  默认 `127.0.0.1`。它和 `exec` 一样不建协议通道，因此不是通道对端，也不能声明 `capabilities`。spawn 前
+  宿主先试绑同一地址，端口被别人占着就直接失败；这是探测不是保证（预检与 connect 之间仍有 TOCTOU 窗口）。

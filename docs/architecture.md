@@ -100,7 +100,10 @@ stateDiagram-v2
     Failed --> Starting: Start
     Backoff --> Starting: BackoffElapsed
     Backoff --> Stopped: Stop
-    Starting --> Running: Ready
+    Starting --> Running: Ready（无 started 动作）
+    Starting --> Starting: Ready 被门控，started 运行中
+    Starting --> Running: started 退出 0
+    Starting --> Stopping: started 失败或超时
     Starting --> Backoff: SpawnFailed / 未就绪退出（可重试）
     Starting --> Failed: 同上且达到失败上限
     Starting --> Stopping: StartTimeout
@@ -114,7 +117,7 @@ stateDiagram-v2
     Stopping --> Failed: KillTimeout
 ```
 
-`Failed` 不是终点：显式 `Start` 仍可重新进入 `Starting`。daemon 重启后的接管直接把状态恢复到 `Running`，不是上面任何一条事件边。
+`Failed` 不是终点：显式 `Start` 仍可重新进入 `Starting`。`lifecycle.started` 声明后，Ready 不再直接进 `Running`：它被门控到钩子退出 0，钩子失败或超时走 `StartTimeout` 同一条停止路径。daemon 重启后的接管直接把状态恢复到 `Running`，不是上面任何一条事件边。
 
 ## 4. 契约：全系统唯一的连接点
 

@@ -11,6 +11,7 @@ use crate::platform::clock::{Clock, Now};
 use crate::platform::config::Config;
 use crate::platform::host::wake::Wake;
 use crate::platform::log;
+use crate::supervise::check::stop_reason::StopReason;
 use crate::supervise::model::runtime::{self, Record};
 use crate::supervise::ops::factory::{Notifier, SlotFactory};
 use crate::supervise::ops::slot::Slot;
@@ -264,10 +265,7 @@ impl Supervisor {
                     // window. Otherwise the service's cleanup would be lost.
                     // The record does not say who asked, so the action sees the
                     // plain `stop` reason rather than a guessed one.
-                    slot.request_stop(
-                        now.mono_ms,
-                        crate::supervise::check::stop_reason::StopReason::Stop,
-                    );
+                    slot.request_stop(now.mono_ms, StopReason::Stop);
                 }
                 let adopted = slot.machine.state;
                 let adopted_pid = slot.machine.pid;

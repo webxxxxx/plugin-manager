@@ -4,6 +4,7 @@
 //! with a message that names the fix.
 
 use super::*;
+use crate::supervise::check::stop_reason::StopReason;
 
 impl Slot {
     /// Start one attempt: the start action first when the definition declares
@@ -18,9 +19,11 @@ impl Slot {
             error!("{}: start action failed to spawn: {}", self.id, error);
             // The action never ran, but a retry must still start from a clean
             // slate: the stop action owns that cleanup.
-            self.ensure_stop_action(now);
-            let actions = self.machine.step(Event::SpawnFailed, now);
-            self.run_actions(actions, now);
+            self.fail_attempt(
+                now,
+                format!("start action failed to spawn: {}", error),
+                false,
+            );
             return;
         }
         info!("{}: start action running ({})", self.id, path);
@@ -42,7 +45,12 @@ impl Slot {
         match end {
             ActionEnd::Exited(status) if status.success() => {
                 self.spawn_after_prelude(now);
-                if self.machine.state == State::Starting {
+                // The process window opens when the preparation finishes, not
+                // when the start request did. A Ready that already settled
+                // synchronously (`ready: exec` with a `started` action) owns
+                // the window now, so it must not be re-armed underneath the
+                // action (#341).
+                if self.machine.state == State::Starting && !self.started.running() {
                     self.start_deadline = Some(now.saturating_add(supervisor::START_TIMEOUT_MS));
                 }
             }
@@ -51,20 +59,37 @@ impl Slot {
                     "{}: start action exited {}; the service was not started",
                     self.id, status
                 );
-                self.ensure_stop_action(now);
-                let actions = self.machine.step(Event::SpawnFailed, now);
-                self.run_actions(actions, now);
+                self.fail_attempt(now, format!("start action exited {}", status), false);
             }
             ActionEnd::TimedOut => {
                 error!(
                     "{}: start action did not exit within its timeout; if it is the service process, put it in exec.args and drop lifecycle.start",
                     self.id
                 );
-                self.ensure_stop_action(now);
-                let actions = self.machine.step(Event::SpawnFailed, now);
-                self.run_actions(actions, now);
+                self.fail_attempt(now, "start action timed out".into(), true);
             }
         }
+    }
+
+    /// One attempt that failed before the process was ever usable: record why,
+    /// make the stop action report the same reason, then let the machine settle
+    /// the failure.
+    ///
+    /// The stop action spawns *before* the machine settles, so its
+    /// `machine.cause` is still `None` at that point and cannot supply the
+    /// reason; set it here (#341).
+    fn fail_attempt(&mut self, now: u64, reason: String, timeout: bool) {
+        if timeout {
+            self.note_start_timeout(reason);
+        } else {
+            self.note_start_failure(reason);
+        }
+        self.stop.set_reason(StopReason::StartFailed);
+        // The attempt may have created things the process never used; the stop
+        // action cleans them up.
+        self.ensure_stop_action(now);
+        let actions = self.machine.step(Event::SpawnFailed, now);
+        self.run_actions(actions, now);
     }
 
     fn spawn_prelude(&mut self, now: u64) -> Result<(), String> {
@@ -132,12 +157,7 @@ impl Slot {
                 error!("{}: spawn failed: {}", self.id, error);
                 // The reason travels back to the start request; a port that is
                 // already taken is otherwise only a log line.
-                self.note_start_failure(format!("spawn failed: {}", error));
-                // The start action may have created things the process never
-                // used; the stop action cleans them up.
-                self.ensure_stop_action(now);
-                let actions = self.machine.step(Event::SpawnFailed, now);
-                self.run_actions(actions, now);
+                self.fail_attempt(now, format!("spawn failed: {}", error), false);
             }
         }
     }

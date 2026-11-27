@@ -228,6 +228,15 @@ fn verify(config: &Config, path: &Path, json: bool, pubkey: Option<&Path>) -> i3
     if let Some(interpreter) = &host.interpreter {
         println!("interpreter: {}", interpreter);
     }
+    // A manifest author cannot see the retry path from the file alone; say it
+    // where they look after authoring (#335).
+    if manifest
+        .lifecycle
+        .as_ref()
+        .is_some_and(|lifecycle| lifecycle.started.is_some())
+    {
+        println!("started action: re-runs on every spawn (crash retries included), so it must be idempotent");
+    }
     EXIT_OK
 }
 

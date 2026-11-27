@@ -33,3 +33,8 @@ core 服务里有一类"干完就退出"的：建隧道（`wg-start.sh`）、挂
 ## 补（2026-11-18，`#183`）
 
 启动收敛按「是否通道对端」区分：上文的「完成态」只属于**不欠活通道**的服务（`ready: exec` 的 protocol 1/2）。通知型插件或 `protocol: 3` 的服务在启动窗口内落到 `Stopped` 是**失去通道**，`svc start` 返回失败并点名退出码，而不是报成功。判定在 `check::start::start_step`，通道对端的定义见 `GLOSSARY.md`。
+
+## 修订（2026-11-27，#335）
+
+`lifecycle.started` 与 `remain_after_exit` 互斥：`started` 门控的是「就绪之后、Running 之前」，一次性
+服务的进程可能在门控期间退出，钩子失败也没有可表达的实例；定义加载即拒绝这对组合。

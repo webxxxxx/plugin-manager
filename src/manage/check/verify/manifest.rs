@@ -211,27 +211,12 @@ fn check_compat(manifest: &Manifest) -> Result<(), ProblemError> {
 }
 
 fn check_ready(manifest: &Manifest) -> Result<(), ProblemError> {
-    let ready = manifest.exec.ready.as_deref();
-    match ready {
-        None | Some("notify") | Some("exec") | Some("port") => {}
-        Some(other) => {
-            return Err(Problem::Invalid.error(format!(
-                "exec.ready {:?} is invalid; expected notify, exec or port",
-                other
-            )))
-        }
-    }
-    let declares_probe = manifest.exec.port.is_some() || manifest.exec.probe_addr.is_some();
-    if ready == Some("port") {
-        crate::kernel::registry::probe_address(
-            manifest.exec.port,
-            manifest.exec.probe_addr.as_deref(),
-        )
-        .map_err(|error| Problem::Invalid.error(format!("exec: {}", error)))?;
-    } else if declares_probe {
-        return Err(Problem::Invalid
-            .error("exec.port / exec.probe_addr are only used with exec.ready = \"port\""));
-    }
+    crate::kernel::registry::ready_from(
+        manifest.exec.ready.as_deref(),
+        manifest.exec.port,
+        manifest.exec.probe_addr.as_deref(),
+    )
+    .map_err(|error| Problem::Invalid.error(error.to_string()))?;
     Ok(())
 }
 

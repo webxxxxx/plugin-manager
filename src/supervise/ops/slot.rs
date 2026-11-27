@@ -380,7 +380,14 @@ impl Slot {
                     self.begin_start(now);
                 }
                 Action::ArmStart => {
-                    self.start_deadline = Some(now.saturating_add(supervisor::START_TIMEOUT_MS));
+                    // A Ready that settled inside `Spawn` (`ready: exec` with a
+                    // `started` action) already handed the window to the
+                    // action; arming it here would put the 30s cap back on it
+                    // (#341).
+                    if !self.started.running() {
+                        self.start_deadline =
+                            Some(now.saturating_add(supervisor::START_TIMEOUT_MS));
+                    }
                 }
                 Action::SignalPolite => self.stop_now(),
                 Action::SignalForce => self.signal_force("stop timeout"),
@@ -504,8 +511,12 @@ impl Slot {
     fn check_timers(&mut self, now: u64) {
         self.expire_pending(now);
         // The start action has its own deadline; the process window opens once
-        // it finishes.
-        if self.machine.state == State::Starting && self.prelude.is_none() {
+        // it finishes. The post-ready action owns the window while it runs: its
+        // own timeout is the only bound (#341).
+        if self.machine.state == State::Starting
+            && self.prelude.is_none()
+            && !self.started.running()
+        {
             if let Some(deadline) = self.start_deadline {
                 if now >= deadline {
                     self.start_deadline = None;

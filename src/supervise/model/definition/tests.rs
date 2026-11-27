@@ -624,11 +624,7 @@ fn rejects_a_started_action_on_a_one_shot_definition() {
     let dir = TempDir::new();
     let mut body = definition("odd");
     body["remain_after_exit"] = json!(true);
-    let hook = if cfg!(windows) {
-        r"C:\Windows\System32\true.cmd"
-    } else {
-        "/bin/true"
-    };
+    let hook = absolute_exec();
     body["lifecycle"] = json!({"started": {"path": hook}});
     write_definition(&dir, "odd", body);
 

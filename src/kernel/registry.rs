@@ -123,6 +123,54 @@ pub fn probe_address(port: Option<u16>, addr: Option<&str>) -> Result<SocketAddr
     Ok(SocketAddr::new(ip, port))
 }
 
+/// Why `exec.ready` (plus its probe fields) could not become a [`Ready`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadyError {
+    /// `exec.ready` names a mode this build does not know.
+    UnknownMode(String),
+    /// `exec.port` / `exec.probe_addr` without `exec.ready = "port"`.
+    ProbeWithoutPortMode,
+    /// `exec.ready = "port"` but the probe target is missing or invalid.
+    Probe(String),
+}
+
+impl std::fmt::Display for ReadyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadyError::UnknownMode(mode) => write!(
+                f,
+                "exec.ready \"{}\" is invalid; expected notify, exec or port",
+                mode
+            ),
+            ReadyError::ProbeWithoutPortMode => write!(
+                f,
+                "exec.port / exec.probe_addr are only used with exec.ready = \"port\""
+            ),
+            ReadyError::Probe(reason) => write!(f, "exec: {}", reason),
+        }
+    }
+}
+
+/// Read `exec.ready` and its probe fields into the runtime mode. The three
+/// loaders (core definition, manifest verification, manifest scan) share this
+/// so a new mode cannot land on one path only.
+pub fn ready_from(
+    ready: Option<&str>,
+    port: Option<u16>,
+    probe_addr: Option<&str>,
+) -> Result<Ready, ReadyError> {
+    let mode = match ready {
+        None | Some("notify") => Ready::Notify,
+        Some("exec") => Ready::Exec,
+        Some("port") => Ready::Port(probe_address(port, probe_addr).map_err(ReadyError::Probe)?),
+        Some(other) => return Err(ReadyError::UnknownMode(other.to_string())),
+    };
+    if !matches!(mode, Ready::Port(_)) && (port.is_some() || probe_addr.is_some()) {
+        return Err(ReadyError::ProbeWithoutPortMode);
+    }
+    Ok(mode)
+}
+
 /// Default and maximum budgets for a lifecycle action. The start action is
 /// supervised under the state machine's start timeout; its own `timeout` is
 /// kept for parity with a core definition and is not armed separately.
@@ -154,7 +202,7 @@ pub struct Exec {
     pub interpreter: Option<Interpreter>,
 }
 
-/// One lifecycle hook for a core service. `timeout_ms` bounds the action own
+/// One lifecycle hook for a core service. `timeout_ms` bounds the action's own
 /// window: the start action runs before the process exists, the started action
 /// runs after the process is ready, and stop/status bound themselves.
 #[derive(Clone, Debug, PartialEq, Eq)]

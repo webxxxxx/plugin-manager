@@ -41,7 +41,7 @@ pub struct Manifest {
     /// Host interpreter for script payloads; absent for native executables.
     #[serde(default)]
     pub interpreter: Option<Interpreter>,
-    /// Optional start/stop/status actions supervised like a core service.
+    /// Optional start/started/stop/status actions supervised like a core service.
     #[serde(default)]
     pub lifecycle: Option<Lifecycle>,
     #[serde(default)]

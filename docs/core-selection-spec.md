@@ -29,7 +29,7 @@
 
 - 状态机：`Stopped | Starting | Running | Stopping | Backoff | Failed`，事件带 pid，迟到事件按 pid 丢弃。
 - 退避：曾在 Running ≥ 10s → 清零 + 立即重启；否则 1/2/4/8/16/30s；连续 5 次进 `Failed`，只有显式 start 复位。
-- 就绪：默认 probe-on-spawn（发首个协议请求，首个合法响应 = Ready），`exec.ready = "exec"` 可跳过；`exec.ready = "port"`（配 `exec.port`，可选 `exec.probe_addr`，默认 `127.0.0.1`）由宿主连一次 loopback，能建连才算 Ready——适合「起了但还要等端口才真能接流量」的守护进程，只对 TCP 有效；start 超时 30s。
+- 就绪：默认 probe-on-spawn（发首个协议请求，首个合法响应 = Ready），`exec.ready = "exec"` 可跳过；`exec.ready = "port"`（配 `exec.port`，可选 `exec.probe_addr`，默认 `127.0.0.1`）由宿主连一次 loopback，能建连才算 Ready——适合「起了但还要等端口才真能接流量」的守护进程，只对 TCP 有效；start 超时 30s。spawn 前先 bind 预检端口是否已被别人占着；这是**探测不是保证**：预检与 connect 之间仍有 TOCTOU 窗口。
 - 停止：SIGTERM（进程组 + 停止时快照到的 `setsid` 子孙）→ 10s → SIGKILL → 5s → 记 unkillable；全局关机预算 30s，unit 侧 `TimeoutStopSec=40`。Windows：控制帧 + 关 stdin → 等 → `TerminateJobObject`（整个服务树）。
 - **服务树 = 进程组 ∪ 停止时快照的 `setsid` 子孙**（#332，ADR-0031）：Unix 每次 spawn 建独立进程组，Windows 每个服务一个 job object；`setsid` 出去的子孙不在组里，停止开始的那一刻按 `/proc` 父链快照一次，之后对组与快照一起 SIGTERM/SIGKILL。树里任一进程仍存活时服务保持 `Running`，leader 退出不触发重启；整棵树退出后才按 leader 的退出码进入重启策略。`notify` 类服务的 stdout EOF 仍按控制端点消失处理（立即停止）。
 - **父进程死亡（2026-11-13，测试覆盖）**：svcd 异常退出（kill -9 / TerminateProcess）时子进程随父退出——Windows 用 Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，所有被监督进程加入该 job），Linux 在 child 里 `prctl(PR_SET_PDEATHSIG, SIGTERM)`；重启后按 enabled 重新拉起，不会再与上次运行的实例并存。macOS 没有等价的廉价原语，仍是已知缺口，待后续票。
@@ -62,7 +62,7 @@
 | 信任 | 无包签名；root 所有的定义文件 + 本机管理员 | Ed25519 manifest 签名 + `files[]` + `trust.d` |
 | 安装/升级 | 由 OS 包管理器 / 管理员管文件；svcd 不安装、不升级 | `svc install`（升级同）/ `uninstall` |
 | 配置 | 脚本/bin 自己管；svcd 不提供 `config` / `editconfig` / `export` | `config` / `configCheck` / `editconfig` / `.spkb` |
-| 生命周期 | `start/stop/status`（JSON 定义或 drop-in 脚本） | manifest 可声明同形 `lifecycle`；执行路径共用 |
+| 生命周期 | `start/started/stop/status`（JSON 定义）；drop-in 脚本仍是 `start/stop/status` | manifest 可声明同形 `lifecycle`；执行路径共用 |
 | hooks | 无 | post-install / pre-remove |
 | UI | 无 `ui`、无能力面 | `ui` + `/plugin-ui/{id}` |
 | 注册表 | 启动时扫 `services.d/*.json` + 内置 `svc` | 扫 `<data>/plugins/*/current` |
@@ -278,7 +278,7 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
   - `GET /api/v1/services/{id}` → `{summary, details}`
   - `POST /api/v1/services/{id}/start` → 同步到 ready，返回 `{summary}`；超时 504
   - `POST /api/v1/services/{id}/stop` → 返回 `{summary}`
-  - `POST /api/v1/services/{id}/restart` → 等价 `svc restart`（stop 动作 → 组终止 → start 动作 → spawn → started 动作），同步返回 `{summary}`；插件页面改完启动期配置后用它重跑
+  - `POST /api/v1/services/{id}/restart` → 等价 `svc restart`（组终止 → stop 动作 → start 动作 → spawn → started 动作），同步返回 `{summary}`；插件页面改完启动期配置后用它重跑
   - `POST /api/v1/services/{id}/enable` / `disable` → 切换开机自启，返回 `{summary}`
   - `GET /api/v1/version` → `{version, protocol, platform}`
   - `GET /api/v1/disk[?id=<插件 id>]` → `{roots:[{root,freeBytes,default,plugin,volume}], tempFreeBytes, tempVolume}`：`roots` 是**列表**，每个插件根一行，按优先级排列（`default=true` 是默认安装根）；根目录不存在就当**量不到**、给 `null`（不向上找祖先：那会把父目录所在文件系统的容量算成未挂载卷的）；拿不到数字的卷同样给 `null`。`?id=` 让每行多一个 `plugin` 字段（`{id,version,directory,bytes}`，没装为 `null`；`bytes` 是当前版本目录的实际占用，升级判断要用它，量不到给 `null`），调用方据此区分「原地升级」（这个根已经有它）和「新装」（挑一个装得下的根）；id 不合法 400，未知 id 不是错误。多根配置下每行就是一个候选根（ADR-0030）。`tempFreeBytes` 是 `<data>/temp` 的空闲字节，装包要经过它；`volume` / `tempVolume` 是所在卷的不透明标识（同一文件系统相等，量不到为 `null`），装前预检用它判断「下载目录与 temp 是不是同一块卷」——同卷是一次 rename，跨卷是整包复制，占两份空间

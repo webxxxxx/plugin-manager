@@ -782,3 +782,414 @@ fn a_second_stop_request_keeps_the_first_tree_snapshot() {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+// --- lifecycle actions (#335/#337) -----------------------------------------
+//
+// A lifecycle action is a real process. These tests use the test binary itself
+// as the hook: it runs one named fixture test, which exits with a real status on
+// every platform and needs no shell. `current_exe` keeps the fixtures
+// platform-neutral.
+
+/// A hook that runs one fixture test of this binary.
+fn fixture_hook(test: &str, timeout_ms: u64, env: BTreeMap<String, String>) -> Hook {
+    let mut env = env;
+    env.insert("SVCD_HOOK_FIXTURE".into(), "1".into());
+    Hook {
+        path: std::env::current_exe()
+            .expect("test executable")
+            .to_string_lossy()
+            .into_owned(),
+        args: vec![test.into()],
+        env,
+        timeout_ms,
+        interpreter: None,
+    }
+}
+
+fn lifecycle(start: Option<Hook>, started: Option<Hook>, stop: Option<Hook>) -> Lifecycle {
+    Lifecycle {
+        start,
+        started,
+        stop,
+        status: None,
+    }
+}
+
+/// A stop action that records `SVCD_STOP_REASON` where the test can read it.
+fn recorder_hook(out: &std::path::Path) -> Hook {
+    fixture_hook(
+        "hook_fixture_records_the_stop_reason",
+        5_000,
+        BTreeMap::from([(
+            "SVCD_TEST_STOP_OUT".to_string(),
+            out.to_string_lossy().into_owned(),
+        )]),
+    )
+}
+
+fn temp_file(tag: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    crate::platform::test_support::temp_dir().join(format!(
+        "svcd-slot-{}-{}-{}.txt",
+        tag,
+        std::process::id(),
+        nanos
+    ))
+}
+
+/// A live process standing in for the supervised `exec`; the slot holds it, so
+/// `check_exit` can reap it like a real child.
+fn dummy_process() -> std::process::Child {
+    let mut command = std::process::Command::new(std::env::current_exe().expect("test executable"));
+    command
+        .arg("hook_fixture_sleeps")
+        .env("SVCD_HOOK_FIXTURE", "1");
+    command.spawn().expect("dummy process")
+}
+
+/// A slot in `Starting` with the dummy process as its exec, and the start
+/// deadline already armed as `Action::Start` does (Spawn + ArmStart).
+fn starting_slot(lifecycle: Option<Lifecycle>) -> (Slot, u32) {
+    let mut slot = slot();
+    slot.set_lifecycle(lifecycle);
+    let child = dummy_process();
+    let pid = child.id();
+    slot.machine.state = State::Starting;
+    slot.machine.pid = Some(pid);
+    slot.child = Some(child);
+    slot.start_deadline = Some(supervisor::START_TIMEOUT_MS);
+    slot.reset_started();
+    (slot, pid)
+}
+
+fn pump_until(slot: &mut Slot, timeout: Duration, done: impl Fn(&Slot) -> bool) {
+    let deadline = Instant::now() + timeout;
+    let mut now = 0u64;
+    loop {
+        now += 20;
+        slot.pump(now);
+        if done(slot) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "condition never held; state {:?}",
+            slot.machine.state
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Kill the dummy exec but keep the handle, so `check_exit` settles the exit.
+fn kill_exec(slot: &mut Slot) {
+    if let Some(child) = slot.child.as_mut() {
+        let _ = child.kill();
+    }
+}
+
+fn reap_exec(slot: &mut Slot) {
+    if let Some(mut child) = slot.child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+fn wait_for_reason(path: &std::path::Path, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if !text.is_empty() {
+                return text;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the stop action never recorded a reason"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_declared_started_action_withholds_ready_until_it_exits() {
+    let (mut slot, pid) = starting_slot(Some(lifecycle(
+        None,
+        Some(fixture_hook(
+            "hook_fixture_exits_zero",
+            5_000,
+            BTreeMap::new(),
+        )),
+        None,
+    )));
+    slot.apply(Event::Ready { pid }, 0);
+    assert_eq!(
+        slot.machine.state,
+        State::Starting,
+        "Ready must be withheld while the action runs"
+    );
+    assert!(slot.started.running());
+    pump_until(&mut slot, Duration::from_secs(10), |slot| {
+        slot.machine.state == State::Running
+    });
+    reap_exec(&mut slot);
+}
+
+#[test]
+fn ready_settles_directly_without_a_started_action() {
+    let (mut slot, pid) = starting_slot(None);
+    slot.apply(Event::Ready { pid }, 0);
+    assert_eq!(slot.machine.state, State::Running);
+    reap_exec(&mut slot);
+}
+
+#[test]
+fn a_failing_started_action_fails_the_start_and_stop_reports_start_failed() {
+    let out = temp_file("started-failed");
+    let (mut slot, pid) = starting_slot(Some(lifecycle(
+        None,
+        Some(fixture_hook(
+            "hook_fixture_exits_nonzero",
+            5_000,
+            BTreeMap::new(),
+        )),
+        Some(recorder_hook(&out)),
+    )));
+    slot.apply(Event::Ready { pid }, 0);
+    pump_until(&mut slot, Duration::from_secs(10), |slot| {
+        slot.machine.state == State::Stopping
+    });
+    let failure = slot.take_start_failure().expect("a reason for the start");
+    assert!(
+        failure.reason.contains("started action exited"),
+        "{}",
+        failure.reason
+    );
+    assert!(!failure.timeout, "a non-zero exit is not a timeout");
+
+    kill_exec(&mut slot);
+    pump_until(&mut slot, Duration::from_secs(10), |slot| {
+        slot.machine.state == State::Backoff
+    });
+    assert_eq!(
+        wait_for_reason(&out, Duration::from_secs(10)),
+        "start-failed"
+    );
+    reap_exec(&mut slot);
+}
+
+#[test]
+fn a_started_action_timeout_fails_the_start_as_a_timeout() {
+    let (mut slot, pid) = starting_slot(Some(lifecycle(
+        None,
+        Some(fixture_hook("hook_fixture_sleeps", 50, BTreeMap::new())),
+        None,
+    )));
+    slot.apply(Event::Ready { pid }, 0);
+    pump_until(&mut slot, Duration::from_secs(10), |slot| {
+        slot.machine.state == State::Stopping
+    });
+    let failure = slot.take_start_failure().expect("a reason for the start");
+    assert!(failure.timeout, "a window that ran out is a 504");
+    assert!(failure.reason.contains("timed out"), "{}", failure.reason);
+    reap_exec(&mut slot);
+}
+
+#[test]
+fn a_process_exit_during_the_started_action_fails_the_start() {
+    let (mut slot, pid) = starting_slot(Some(lifecycle(
+        None,
+        Some(fixture_hook("hook_fixture_sleeps", 5_000, BTreeMap::new())),
+        None,
+    )));
+    slot.apply(Event::Ready { pid }, 0);
+    kill_exec(&mut slot);
+    pump_until(&mut slot, Duration::from_secs(10), |slot| {
+        slot.machine.state == State::Backoff
+    });
+    let failure = slot.take_start_failure().expect("a reason for the start");
+    assert!(
+        failure.reason.contains("while the started action ran"),
+        "{}",
+        failure.reason
+    );
+    assert!(!failure.timeout);
+    reap_exec(&mut slot);
+}
+
+#[test]
+fn a_slow_started_action_is_bounded_by_its_own_timeout_not_the_start_window() {
+    // `Action::ArmStart` runs after `Spawn`, so a `ready: exec` Ready that
+    // settles inside the spawn used to get the 30s window re-armed underneath
+    // the action (#341).
+    let out = temp_file("slow-started");
+    let (mut slot, pid) = starting_slot(Some(lifecycle(
+        None,
+        Some(fixture_hook("hook_fixture_sleeps", 45_000, BTreeMap::new())),
+        Some(recorder_hook(&out)),
+    )));
+    slot.apply(Event::Ready { pid }, 0);
+    // Exactly what `ArmStart` did after the gate had already lifted the window.
+    slot.start_deadline = Some(30_000);
+    for now in (1_000..=30_000).step_by(1_000) {
+        slot.pump(now);
+    }
+    assert_eq!(
+        slot.machine.state,
+        State::Starting,
+        "the 30s start window must not cut the action"
+    );
+    assert!(slot.started.running());
+
+    // The action's own deadline still bounds it.
+    slot.pump(45_001);
+    assert_eq!(slot.machine.state, State::Stopping);
+    let failure = slot.take_start_failure().expect("a reason for the start");
+    assert!(failure.timeout);
+    reap_exec(&mut slot);
+}
+
+#[test]
+fn a_failed_start_action_reports_start_failed_to_the_stop_hook() {
+    // The stop action spawns before the machine settles the failure, so the
+    // reason cannot come from `machine.cause` yet (#341).
+    let out = temp_file("start-failed");
+    let mut slot = slot();
+    slot.set_lifecycle(Some(lifecycle(
+        Some(fixture_hook(
+            "hook_fixture_exits_nonzero",
+            5_000,
+            BTreeMap::new(),
+        )),
+        None,
+        Some(recorder_hook(&out)),
+    )));
+    slot.machine.state = State::Starting;
+    slot.begin_start(0);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut now = 0u64;
+    while slot.prelude.is_some() {
+        now += 20;
+        slot.check_prelude(now);
+        assert!(Instant::now() < deadline, "the start action never settled");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(slot.machine.state, State::Backoff);
+    let failure = slot.take_start_failure().expect("a reason for the start");
+    assert!(
+        failure.reason.contains("start action exited"),
+        "{}",
+        failure.reason
+    );
+    assert!(!failure.timeout);
+    assert_eq!(
+        wait_for_reason(&out, Duration::from_secs(10)),
+        "start-failed"
+    );
+}
+
+#[test]
+fn a_port_probe_from_an_older_instance_never_settles_ready() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+    let addr = listener.local_addr().expect("addr");
+    let mut slot = slot();
+    slot.machine.state = State::Starting;
+    slot.machine.pid = Some(7);
+    slot.start_port_probe(7, addr);
+
+    // The instance is gone before the probe connects; the verdict belongs to it.
+    slot.machine.state = State::Backoff;
+    slot.machine.pid = None;
+    for now in (20..400).step_by(20) {
+        slot.pump(now);
+    }
+    assert_eq!(slot.machine.state, State::Backoff);
+    assert!(slot.port.is_none(), "the stale probe is dropped");
+}
+
+// Fixtures below run only when the test binary is the hook; as ordinary tests
+// they pass without side effects.
+#[test]
+fn hook_fixture_exits_zero() {}
+
+#[test]
+fn hook_fixture_exits_nonzero() {
+    if std::env::var_os("SVCD_HOOK_FIXTURE").is_some() {
+        panic!("fixture: requested failure");
+    }
+}
+
+#[test]
+fn hook_fixture_sleeps() {
+    if std::env::var_os("SVCD_HOOK_FIXTURE").is_some() {
+        std::thread::sleep(Duration::from_secs(10));
+    }
+}
+
+#[test]
+fn hook_fixture_records_the_stop_reason() {
+    let Some(out) = std::env::var_os("SVCD_TEST_STOP_OUT") else {
+        return;
+    };
+    let reason = std::env::var("SVCD_STOP_REASON").unwrap_or_default();
+    std::fs::write(out, reason).expect("write the stop reason");
+}
+
+#[test]
+fn a_port_that_never_accepts_names_the_address_and_is_a_timeout() {
+    let addr = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        listener.local_addr().expect("addr")
+    };
+    let mut slot = slot();
+    slot.machine.state = State::Starting;
+    let child = dummy_process();
+    let pid = child.id();
+    slot.machine.pid = Some(pid);
+    slot.child = Some(child);
+    slot.start_deadline = Some(100);
+    slot.start_port_probe(pid, addr);
+
+    for now in (20..=100).step_by(20) {
+        slot.pump(now);
+    }
+
+    let failure = slot.take_start_failure().expect("a reason for the start");
+    assert!(failure.timeout, "a window that ran out is a 504");
+    assert!(
+        failure.reason.contains(&addr.to_string()),
+        "{}",
+        failure.reason
+    );
+    reap_exec(&mut slot);
+}
+
+#[test]
+fn a_port_ready_instance_that_dies_before_listening_names_the_address() {
+    let addr = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        listener.local_addr().expect("addr")
+    };
+    let mut slot = slot();
+    slot.machine.state = State::Starting;
+    let child = dummy_process();
+    let pid = child.id();
+    slot.machine.pid = Some(pid);
+    slot.child = Some(child);
+    slot.start_port_probe(pid, addr);
+
+    slot.apply(Event::Exited { pid, code: Some(1) }, 40);
+
+    let failure = slot.take_start_failure().expect("a reason for the start");
+    assert!(!failure.timeout, "an exit is not a timeout");
+    assert!(
+        failure.reason.contains(&addr.to_string()),
+        "{}",
+        failure.reason
+    );
+    assert_eq!(slot.machine.state, State::Backoff);
+    reap_exec(&mut slot);
+}

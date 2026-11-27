@@ -43,22 +43,140 @@ fn services_version_start_and_stop() {
     assert!(missing.body["error"]["message"].is_string());
 }
 
+/// Give the demo core service three lifecycle actions that append their name
+/// (or `stop:<reason>`) to `events`. A restart handler that only returned the
+/// current summary would leave the file unchanged (#341).
+fn write_core_with_hooks(sandbox: &Sandbox, events: &std::path::Path) {
+    let (script, text) = if cfg!(windows) {
+        (
+            sandbox.root.join("core-hooks.cmd"),
+            "@echo off\r\nif \"%~1\"==\"stop\" (\r\n  echo stop:%SVCD_STOP_REASON%>>\"%SVCD_TEST_MARKER%\"\r\n  exit /b 0\r\n)\r\necho %~1>>\"%SVCD_TEST_MARKER%\"\r\n"
+                .to_string(),
+        )
+    } else {
+        (
+            sandbox.root.join("core-hooks.sh"),
+            "#!/bin/sh\nif [ \"$1\" = stop ]; then\n  printf 'stop:%s\\n' \"$SVCD_STOP_REASON\" >> \"$SVCD_TEST_MARKER\"\nelse\n  printf '%s\\n' \"$1\" >> \"$SVCD_TEST_MARKER\"\nfi\n"
+                .to_string(),
+        )
+    };
+    fs::write(&script, text).expect("write hook script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod hook script");
+    }
+
+    let file = sandbox.config.join("services.d").join("demo.json");
+    let mut definition: Value = serde_json::from_slice(&fs::read(&file).expect("demo definition"))
+        .expect("demo definition json");
+    let hook = |action: &str| {
+        json!({
+            "path": script.to_string_lossy(),
+            "args": [action],
+            "env": { "SVCD_TEST_MARKER": events.to_string_lossy() },
+        })
+    };
+    definition["lifecycle"] = json!({
+        "start": hook("start"),
+        "started": hook("started"),
+        "stop": hook("stop"),
+    });
+    fs::write(
+        &file,
+        serde_json::to_vec(&definition).expect("definition json"),
+    )
+    .expect("write demo definition");
+}
+
+fn hook_lines(path: &std::path::Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn wait_for_hook_lines(path: &std::path::Path, count: usize, timeout: Duration) -> Vec<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let lines = hook_lines(path);
+        if lines.len() >= count {
+            return lines;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the lifecycle actions never reached {count} lines: {lines:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn restart_reruns_the_whole_lifecycle() {
     // The restart verb is what a plugin page uses after writing a config the
     // process only reads at startup (#336).
     let mut sandbox = Sandbox::new();
     sandbox.write_core();
+    let events = sandbox.root.join("hook-events.txt");
+    write_core_with_hooks(&sandbox, &events);
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
 
     let started = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
     assert_eq!(started.status, 200, "{}", started.body);
-    assert_eq!(started.body["summary"]["state"], "running");
+    let first_pid = started.body["summary"]["pid"].clone();
+    assert!(
+        first_pid.is_number(),
+        "a running service has a pid: {}",
+        started.body
+    );
+    let lines = wait_for_hook_lines(&events, 2, Duration::from_secs(10));
+    assert_eq!(&lines[..2], ["start", "started"], "{lines:?}");
 
     let restarted = request(&address, "POST", "/api/v1/services/demo/restart", "", b"");
     assert_eq!(restarted.status, 200, "{}", restarted.body);
     assert_eq!(restarted.body["summary"]["state"], "running");
+    let second_pid = restarted.body["summary"]["pid"].clone();
+    assert_ne!(
+        second_pid, first_pid,
+        "a restart must replace the process, not report the old one"
+    );
+    // stop half -> start half, in that order.
+    let lines = wait_for_hook_lines(&events, 5, Duration::from_secs(10));
+    assert_eq!(
+        &lines[..5],
+        ["start", "started", "stop:stop", "start", "started"],
+        "{lines:?}"
+    );
+
+    // Both entry points run `svc.restart` and project the same status; the
+    // restart response itself carries only `summary`, so compare the status the
+    // projection reports after each one (#336).
+    let live = request(&address, "GET", "/api/v1/services/demo", "", b"");
+    assert_eq!(live.body["summary"]["pid"], second_pid, "{}", live.body);
+    let http_last_exit = live.body["details"]["last_exit"].clone();
+    let cli = sandbox.run_svc(&["restart", "demo"]);
+    assert_eq!(
+        cli.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let status = sandbox.run_svc(&["status", "demo", "--json"]);
+    assert_eq!(
+        status.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let cli_status: Value = serde_json::from_slice(&status.stdout).expect("svc status --json");
+    assert_eq!(
+        cli_status["details"]["last_exit"], http_last_exit,
+        "the HTTP and CLI restarts must project the same last exit"
+    );
+    let lines = wait_for_hook_lines(&events, 8, Duration::from_secs(10));
+    assert_eq!(&lines[5..8], ["stop:stop", "start", "started"], "{lines:?}");
 
     let missing = request(
         &address,
@@ -73,6 +191,8 @@ fn restart_reruns_the_whole_lifecycle() {
     let stopped = request(&address, "POST", "/api/v1/services/demo/stop", "", b"");
     assert_eq!(stopped.status, 200, "{}", stopped.body);
     assert_eq!(stopped.body["summary"]["state"], "stopped");
+    let lines = wait_for_hook_lines(&events, 9, Duration::from_secs(10));
+    assert_eq!(lines[8], "stop:stop", "{lines:?}");
 }
 
 /// One installed plugin, exercised end to end across every surface this phase
