@@ -1,13 +1,11 @@
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
-use std::thread;
-use std::time::SystemTime;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::kernel::projection::Status;
 use crate::kernel::registry::Hook;
 use crate::platform::paths::Paths;
+use crate::supervise::ops::hook_proc::{self, Capture, Unfinished};
 use crate::supervise::ops::host::Supervisor;
 use crate::supervise::ops::slot::hook_command;
 
@@ -68,15 +66,11 @@ fn run_status_hook(
     plugin_dir: Option<&Path>,
     poll: &mut dyn FnMut(),
 ) -> String {
-    let output_path = status_output_path(id, paths);
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let file = match options.open(&output_path) {
+    let output = match Capture::new(id, "status", paths) {
+        Ok(capture) => capture,
+        Err(error) => return format!("cannot create status output: {}", error),
+    };
+    let file = match output.open() {
         Ok(file) => file,
         Err(error) => return format!("cannot create status output: {}", error),
     };
@@ -87,72 +81,35 @@ fn run_status_hook(
         .stderr(Stdio::null());
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(error) => {
-            let _ = fs::remove_file(&output_path);
-            return format!("spawn failed: {}", error);
-        }
+        Err(error) => return format!("spawn failed: {}", error),
     };
     let _ = crate::platform::host::process::adopt(&child);
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = read_status_output(&output_path);
-                let _ = fs::remove_file(&output_path);
-                return status_detail(&output, Some(status));
-            }
-            Ok(None) => {}
-            Err(error) => {
-                let output = read_status_output(&output_path);
-                let _ = fs::remove_file(&output_path);
-                let detail = status_detail(&output, None);
-                return format!("{} (error: {})", detail, error);
-            }
+    let outcome = hook_proc::wait(
+        &mut child,
+        Duration::from_millis(hook.timeout_ms),
+        None,
+        poll,
+        Duration::from_millis(50),
+    );
+    let (text, _) = output.read(8 * 1024);
+    match outcome {
+        Ok(status) => status_detail(&text, Some(status)),
+        // The probe never passes a cancel token, so a cancelled wait cannot
+        // happen here; report it like a stop, not like a health verdict.
+        Err(Unfinished::TimedOut) | Err(Unfinished::Cancelled) => timed_out(&text),
+        Err(Unfinished::Failed(error)) => {
+            format!("{} (error: {})", status_detail(&text, None), error)
         }
-        if started.elapsed() >= Duration::from_millis(hook.timeout_ms) {
-            // The probe runs in its own process group: stop the whole tree, not
-            // just the leader, or a status hook's children outlive the timeout.
-            crate::platform::host::process::kill_now(&mut child);
-            let _ = child.wait();
-            let output = read_status_output(&output_path);
-            let _ = fs::remove_file(&output_path);
-            let detail = status_detail(&output, None);
-            return if detail.is_empty() {
-                "timed out".into()
-            } else {
-                format!("{} (timed out)", detail)
-            };
-        }
-        // The supervisor loop owns plugin stdio; a probe must not freeze it.
-        poll();
-        thread::sleep(Duration::from_millis(50));
     }
 }
 
-fn status_output_path(id: &str, paths: &Paths) -> PathBuf {
-    let directory = paths.temp_dir.clone();
-    let _ = fs::create_dir_all(&directory);
-    let nanos = SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    directory.join(format!(
-        "status-{}-{}-{}.out",
-        id,
-        std::process::id(),
-        nanos
-    ))
-}
-
-fn read_status_output(path: &Path) -> String {
-    use std::io::Read;
-
-    let Ok(file) = fs::File::open(path) else {
-        return String::new();
-    };
-    let mut bytes = Vec::new();
-    let _ = file.take(8 * 1024).read_to_end(&mut bytes);
-    String::from_utf8_lossy(&bytes).to_string()
+fn timed_out(text: &str) -> String {
+    let detail = status_detail(text, None);
+    if detail.is_empty() {
+        "timed out".into()
+    } else {
+        format!("{} (timed out)", detail)
+    }
 }
 
 fn status_detail(output: &str, status: Option<std::process::ExitStatus>) -> String {

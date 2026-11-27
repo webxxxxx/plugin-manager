@@ -6,7 +6,7 @@ use std::path::Path;
 use crate::kernel::contract::{Capability as KernelCapability, CapabilityName, Effect};
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::registry::{
-    Exec, Hook, Interpreter, Kind, Lifecycle, Ready, Restart, Service, State, RESERVED_ID,
+    Exec, Hook, Interpreter, Kind, Lifecycle, Restart, Service, State, RESERVED_ID,
 };
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::manage as package;
@@ -143,29 +143,11 @@ pub(crate) fn service_from_manifest(
             idempotent: false,
         });
     }
-    if matches!(ready, Ready::Exec | Ready::Port(_)) {
-        // No channel: a capability can only be a one-shot hook, and one without
-        // it would be a tool that never answers (#342).
-        if let Some(missing) = manifest
-            .capabilities
-            .iter()
-            .find(|capability| capability.hook.is_none())
-        {
-            return Err(Problem::Invalid.error(format!(
-                "exec.ready=exec/port has no protocol channel, so capability {} needs a hook",
-                missing.name
-            )));
-        }
-    } else if manifest
-        .capabilities
-        .iter()
-        .any(|capability| capability.hook.is_some())
-    {
-        return Err(Problem::Invalid.error(
-            "a capability hook is only for a plugin with no protocol channel; \
-             exec.ready=notify already delivers the call",
-        ));
-    }
+    // One capability, one delivery path: the same decision the installer makes,
+    // so a package installed before #342 and one installed after it are judged
+    // by one function, not two copies of it. The package-only checks (action in
+    // `files[]`, timeout bounds) stay in verify: this reads an installed tree.
+    crate::manage::check::verify::check_capability_delivery(&manifest)?;
     let contract = crate::kernel::registry::contract_for(
         id,
         &manifest.version,
@@ -181,7 +163,7 @@ pub(crate) fn service_from_manifest(
         None => None,
         Some(lifecycle) => {
             let start = convert_lifecycle_hook(
-                "start",
+                "lifecycle.start",
                 version_dir,
                 lifecycle.start.as_ref(),
                 crate::kernel::registry::HOOK_START_TIMEOUT_MS,
@@ -190,7 +172,7 @@ pub(crate) fn service_from_manifest(
                 &mut any_script,
             )?;
             let started = convert_lifecycle_hook(
-                "started",
+                "lifecycle.started",
                 version_dir,
                 lifecycle.started.as_ref(),
                 crate::kernel::registry::HOOK_STARTED_TIMEOUT_MS,
@@ -199,7 +181,7 @@ pub(crate) fn service_from_manifest(
                 &mut any_script,
             )?;
             let stop = convert_lifecycle_hook(
-                "stop",
+                "lifecycle.stop",
                 version_dir,
                 lifecycle.stop.as_ref(),
                 crate::kernel::registry::HOOK_STOP_TIMEOUT_MS,
@@ -208,7 +190,7 @@ pub(crate) fn service_from_manifest(
                 &mut any_script,
             )?;
             let status = convert_lifecycle_hook(
-                "status",
+                "lifecycle.status",
                 version_dir,
                 lifecycle.status.as_ref(),
                 crate::kernel::registry::HOOK_STATUS_TIMEOUT_MS,
@@ -304,8 +286,12 @@ pub(crate) fn service_from_manifest(
     })
 }
 
+/// Turn a manifest hook into the runtime one. `label` is what the error messages
+/// call it — `lifecycle.start`, `capabilities[mode].hook` — so one function
+/// serves both places without a message that lies about where the hook came
+/// from.
 pub(crate) fn convert_lifecycle_hook(
-    name: &str,
+    label: &str,
     version_dir: &Path,
     hook: Option<&package::Hook>,
     default_timeout_ms: u64,
@@ -318,19 +304,15 @@ pub(crate) fn convert_lifecycle_hook(
     };
     let path = version_dir.join(&hook.path);
     if !path.is_file() {
-        return Err(Problem::Invalid.error(format!(
-            "lifecycle.{} is missing: {}",
-            name,
-            path.display()
-        )));
+        return Err(Problem::Invalid.error(format!("{} is missing: {}", label, path.display())));
     }
     let is_script = !is_native_file(&path)?;
     if is_script {
         *any_script = true;
         if interpreter.is_none() {
             return Err(Problem::Invalid.error(format!(
-                "lifecycle.{} is a script but the manifest declares no interpreter",
-                name
+                "{} is a script but the manifest declares no interpreter",
+                label
             )));
         }
     }
@@ -338,8 +320,8 @@ pub(crate) fn convert_lifecycle_hook(
         Some(seconds) if seconds >= 1 && seconds <= max_timeout_ms / 1000 => seconds * 1000,
         Some(seconds) => {
             return Err(Problem::Invalid.error(format!(
-                "lifecycle.{} timeout must be between 1 and {} seconds, got {}",
-                name,
+                "{} timeout must be between 1 and {} seconds, got {}",
+                label,
                 max_timeout_ms / 1000,
                 seconds
             )))

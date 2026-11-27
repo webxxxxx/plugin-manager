@@ -2,24 +2,24 @@
 //!
 //! A plugin with `exec.ready = "exec"` or `"port"` has no protocol channel, so
 //! a capability is one process per call: the arguments JSON on stdin, the
-//! result JSON on stdout. The work runs on its own short-lived thread — the slot
+//! result text on stdout. The work runs on its own short-lived thread — the slot
 //! event loop is single threaded and owns every plugin pipe — and hands the
 //! outcome straight to the caller's sink.
 //!
-//! Both pipes go to temp files instead of reader threads: a hook that leaves a
-//! grandchild holding stdout must not pin a thread of ours.
+//! stdout and stderr go to temp files instead of reader threads: a hook that
+//! leaves a grandchild holding stdout must not pin a thread of ours.
 
-use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::platform::log::Level;
+use crate::supervise::ops::hook_proc::{self, Capture, Unfinished};
 
 use super::*;
 
@@ -28,8 +28,7 @@ use super::*;
 /// here would fork the host to death.
 pub(super) const MAX_HOOK_CALLS: usize = 4;
 
-/// One call's inputs, moved to its worker thread. Dropping it releases the
-/// in-flight slot, whatever the outcome.
+/// One call's inputs, moved to its worker thread.
 pub(super) struct HookCall {
     pub(super) id: String,
     pub(super) hook: Hook,
@@ -39,12 +38,48 @@ pub(super) struct HookCall {
     pub(super) paths: Arc<Paths>,
     pub(super) plugin_dir: Option<PathBuf>,
     pub(super) limits: Arc<crate::platform::limits::Limits>,
-    pub(super) inflight: Arc<std::sync::atomic::AtomicUsize>,
+    /// A result may not exceed the contract's inline limit: it is the amount the
+    /// MCP face and a page can carry back in one reply. Over that it is a failed
+    /// call, not a truncated result that looks like a real answer.
+    pub(super) max_result: usize,
 }
 
-impl Drop for HookCall {
+/// One in-flight call: it holds the caller's sink and one unit of the in-flight
+/// budget. If the worker thread never starts, `Drop` does both things by itself —
+/// answer the caller and release the unit.
+///
+/// The sink and the budget live in one `Drop` because they are one ownership:
+/// incrementing here and decrementing somewhere else produced exactly the two
+/// bugs this shape removes — a double decrement (the budget wrapped, and every
+/// later call was refused) and a caller left without any reply.
+pub(super) struct Answer {
+    sink: Option<ReplySink>,
+    inflight: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Answer {
+    pub(super) fn new(sink: ReplySink, inflight: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        Answer {
+            sink: Some(sink),
+            inflight,
+        }
+    }
+
+    fn reply(&mut self, outcome: Result<Reply, Failure>) {
+        if let Some(sink) = self.sink.take() {
+            sink(outcome);
+        }
+    }
+}
+
+impl Drop for Answer {
     fn drop(&mut self) {
         self.inflight.fetch_sub(1, Ordering::SeqCst);
+        self.reply(Err(Failure::new(
+            Class::Busy,
+            Retry::After(Duration::from_millis(100)),
+            "cannot start a worker for the hook call",
+        )));
     }
 }
 
@@ -70,7 +105,7 @@ impl Slot {
                 sink,
                 Err(Failure::new(
                     Class::Busy,
-                    Retry::After(std::time::Duration::from_millis(100)),
+                    Retry::After(Duration::from_millis(100)),
                     "too many in-flight hook calls",
                 )),
             );
@@ -88,48 +123,51 @@ impl Slot {
             paths: self.paths.clone(),
             plugin_dir: self.plugin_dir.clone(),
             limits: self.limits.clone(),
-            inflight: self.hook_calls.clone(),
+            max_result: self.max_result(),
         };
+        let mut answer = Answer::new(sink, self.hook_calls.clone());
         let name = format!("svcd-{}-call-{}", self.id, capability);
         let spawned = std::thread::Builder::new()
             .name(name)
             .stack_size(crate::platform::host::threads::io_stack(&self.limits))
             .spawn(move || {
-                sink(run(&call).map(Reply::Value));
+                let outcome = run(&call).map(Reply::Value);
+                answer.reply(outcome);
             });
         if let Err(error) = spawned {
-            self.hook_calls.fetch_sub(1, Ordering::SeqCst);
+            // `spawn` dropped the closure, so `Answer::drop` already answered
+            // the caller and released the unit; there is nothing left to undo.
             error!(
                 "{}: cannot start a worker for a hook call: {}",
                 self.id, error
             );
         }
     }
+
+    /// How large a result may be: the contract's inline limit is what a `tools/call`
+    /// reply carries on both faces; a scripted wire with no contract falls back to
+    /// one call frame.
+    fn max_result(&self) -> usize {
+        self.contract
+            .as_ref()
+            .map(|contract| contract.limits.max_inline)
+            .unwrap_or(crate::wire::message::ipc::CALL_FRAME_MAX)
+    }
 }
 
 /// Run one hook call on the worker thread.
-fn run(call: &HookCall) -> Result<Value, Failure> {
-    let out_path = output_path(&call.id, &call.paths, "out");
-    let err_path = output_path(&call.id, &call.paths, "err");
-    let (out_file, err_file) = match (fs::File::create(&out_path), fs::File::create(&err_path)) {
-        (Ok(out), Ok(err)) => (out, err),
-        (out, err) => {
-            let detail = format!(
-                "cannot create the call's output files: {}",
-                out.err()
-                    .or_else(|| err.err())
-                    .map(|error| error.to_string())
-                    .unwrap_or_default()
-            );
-            let _ = fs::remove_file(&out_path);
-            let _ = fs::remove_file(&err_path);
-            return Err(Failure::new(
-                Class::ImplementationError,
-                Retry::Never,
-                detail,
-            ));
-        }
-    };
+pub(super) fn run(call: &HookCall) -> Result<Value, Failure> {
+    let out = Capture::new(&call.id, "call-out", &call.paths).map_err(|error| {
+        implementation(format!("cannot create the call's output file: {error}"))
+    })?;
+    let err = Capture::new(&call.id, "call-err", &call.paths)
+        .map_err(|error| implementation(format!("cannot create the call's error file: {error}")))?;
+    let out_file = out
+        .open()
+        .map_err(|error| implementation(format!("cannot open the call's output file: {error}")))?;
+    let err_file = err
+        .open()
+        .map_err(|error| implementation(format!("cannot open the call's error file: {error}")))?;
     let mut command = hook_command(
         &call.id,
         "call",
@@ -141,18 +179,9 @@ fn run(call: &HookCall) -> Result<Value, Failure> {
         .stdin(Stdio::piped())
         .stdout(Stdio::from(out_file))
         .stderr(Stdio::from(err_file));
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            let _ = fs::remove_file(&out_path);
-            let _ = fs::remove_file(&err_path);
-            return Err(Failure::new(
-                Class::ImplementationError,
-                Retry::Never,
-                format!("cannot start the hook: {error}"),
-            ));
-        }
-    };
+    let mut child = command
+        .spawn()
+        .map_err(|error| implementation(format!("cannot start the hook: {error}")))?;
     let _ = crate::platform::host::process::adopt(&child);
     // The arguments go in as one JSON object and then stdin closes: a hook that
     // reads to EOF must not wait for a caller who will never write again.
@@ -161,77 +190,71 @@ fn run(call: &HookCall) -> Result<Value, Failure> {
         if let Err(error) = stdin.write_all(body.as_bytes()) {
             crate::platform::host::process::kill_now(&mut child);
             let _ = child.wait();
-            let _ = fs::remove_file(&out_path);
-            let _ = fs::remove_file(&err_path);
-            return Err(Failure::new(
-                Class::ImplementationError,
-                Retry::Never,
-                format!("cannot send the arguments to the hook: {error}"),
-            ));
+            return Err(implementation(format!(
+                "cannot send the arguments to the hook: {error}"
+            )));
         }
     }
-    let deadline = Instant::now() + call.timeout;
-    let end = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) => {}
-            Err(error) => break Err(format!("wait failed: {error}")),
+    // No reactor pump here: the hook runs on its own thread, so the slot loop
+    // keeps draining plugin stdio while this waits.
+    let outcome = hook_proc::wait(
+        &mut child,
+        call.timeout,
+        Some(&call.cancel),
+        &mut || {},
+        Duration::from_millis(20),
+    );
+    let (output, overflow) = out.read(call.max_result);
+    let (stderr, _) = err.read(8 * 1024);
+    log_stderr(call, &stderr);
+    match outcome {
+        Ok(status) if status.success() => {
+            if overflow {
+                return Err(Failure::new(
+                    Class::FrameTooLarge,
+                    Retry::Never,
+                    format!(
+                        "the hook wrote more than {} bytes; a call result may not exceed the \
+                         contract's inline limit",
+                        call.max_result
+                    ),
+                ));
+            }
+            Ok(text_result(&output))
         }
-        if call.cancel.is_cancelled() {
-            break Err("cancelled".into());
-        }
-        if Instant::now() >= deadline {
-            break Err("timeout".into());
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    if end.is_err() {
-        crate::platform::host::process::kill_now(&mut child);
-        let _ = child.wait();
-    }
-    let output = read_output(&out_path);
-    log_stderr(call, &err_path);
-    let _ = fs::remove_file(&out_path);
-    let _ = fs::remove_file(&err_path);
-    match end {
-        Ok(status) if status.success() => Ok(text_result(&output)),
-        Ok(status) => Err(Failure::new(
-            Class::ImplementationError,
-            Retry::Never,
-            format!(
-                "the hook exited {}{}",
-                status,
-                if output.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(": {}", clip(output.trim()))
-                }
-            ),
-        )),
-        Err(reason) if reason == "cancelled" => Err(Failure::new(
+        Ok(status) => Err(implementation(format!(
+            "the hook exited {}{}",
+            status,
+            if output.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", clip(output.trim()))
+            }
+        ))),
+        Err(Unfinished::Cancelled) => Err(Failure::new(
             Class::Cancelled,
             Retry::Never,
             "the call was cancelled",
         )),
-        Err(reason) if reason == "timeout" => Err(Failure::new(
+        Err(Unfinished::TimedOut) => Err(Failure::new(
             Class::Timeout,
-            Retry::After(std::time::Duration::from_secs(1)),
+            Retry::After(Duration::from_secs(1)),
             format!(
                 "the hook call timed out after {}ms",
                 call.timeout.as_millis()
             ),
         )),
-        Err(reason) => Err(Failure::new(
-            Class::ImplementationError,
-            Retry::Never,
-            reason,
-        )),
+        Err(Unfinished::Failed(reason)) => Err(implementation(reason)),
     }
 }
 
-/// The hook's stderr belongs in the plugin's hook log, not in the result.
-fn log_stderr(call: &HookCall, path: &std::path::Path) {
-    let text = read_capped(path, 8 * 1024);
+fn implementation(detail: impl Into<String>) -> Failure {
+    Failure::new(Class::ImplementationError, Retry::Never, detail)
+}
+
+/// The hook's stderr belongs in the plugin's hook log, not in the result; stdout
+/// is the result and is not logged.
+fn log_stderr(call: &HookCall, text: &str) {
     if text.trim().is_empty() {
         return;
     }
@@ -250,25 +273,11 @@ fn log_stderr(call: &HookCall, path: &std::path::Path) {
     }
 }
 
-/// A result bigger than a call frame could never be delivered, so refuse it
-/// here instead of reading an unbounded file.
-fn read_output(path: &std::path::Path) -> String {
-    read_capped(path, crate::wire::message::ipc::CALL_FRAME_MAX + 1)
-}
-
-fn read_capped(path: &std::path::Path, limit: usize) -> String {
-    let Ok(file) = fs::File::open(path) else {
-        return String::new();
-    };
-    let mut bytes = Vec::new();
-    let _ = file.take(limit as u64).read_to_end(&mut bytes);
-    String::from_utf8_lossy(&bytes).to_string()
-}
-
 /// The channel path answers a `tools/call` with the handler's stdout wrapped as
 /// one text content part (the shell/PowerShell SDK does the same wrapping on the
 /// plugin side). A hook produces exactly that text, so the shape matches and a
-/// page's `invoke()` keeps meaning the same thing on both paths.
+/// page's `invoke()` keeps meaning the same thing on both paths. The text is not
+/// parsed: whatever the hook printed is the answer.
 fn text_result(output: &str) -> Value {
     let text = output.trim_end_matches(['\r', '\n']);
     serde_json::json!({
@@ -283,20 +292,4 @@ fn clip(text: &str) -> String {
         clipped.push('…');
     }
     clipped
-}
-
-fn output_path(id: &str, paths: &Paths, kind: &str) -> PathBuf {
-    let directory = paths.temp_dir.clone();
-    let _ = fs::create_dir_all(&directory);
-    let nanos = SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    directory.join(format!(
-        "call-{}-{}-{}.{}",
-        id,
-        std::process::id(),
-        nanos,
-        kind
-    ))
 }

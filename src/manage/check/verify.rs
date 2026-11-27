@@ -26,7 +26,7 @@ mod manifest;
 mod signature;
 mod tar;
 
-pub(crate) use manifest::check_platform;
+pub(crate) use manifest::{check_capability_delivery, check_platform};
 pub use manifest::{
     declares_hooks, parse_manifest, valid_display_name, valid_version, validate_manifest,
 };

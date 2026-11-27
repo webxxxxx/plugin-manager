@@ -551,6 +551,7 @@
     "src/supervise/ops/builtin_adapter.rs": "builtin_adapter",
     "src/supervise/ops/factory.rs": "supervise",
     "src/supervise/ops/hook.rs": "hook",
+    "src/supervise/ops/hook_proc.rs": "supervise",
     "src/supervise/ops/host.rs": "supervise",
     "src/supervise/ops/invoke.rs": "supervise",
     "src/supervise/ops/lifecycle.rs": "supervise",

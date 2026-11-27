@@ -220,14 +220,17 @@ fn check_ready(manifest: &Manifest) -> Result<(), ProblemError> {
     Ok(())
 }
 
-/// One capability has exactly one way in: the protocol channel for a
-/// `notify`-ready plugin, a one-shot hook for a plugin with no channel (#342).
-fn check_capabilities_with_exec(manifest: &Manifest) -> Result<(), ProblemError> {
-    let no_channel = matches!(manifest.exec.ready.as_deref(), Some("exec") | Some("port"));
+/// One capability has exactly one delivery path (#342): the protocol channel for
+/// a `notify`-ready plugin, a one-shot hook for a plugin with no channel.
+///
+/// The installer's verify step and the boot-time scan both read a manifest, so
+/// this decision lives here once: a second copy drifts, and the two paths start
+/// judging the same package differently.
+pub(crate) fn check_capability_delivery(manifest: &Manifest) -> Result<(), ProblemError> {
     if manifest.capabilities.is_empty() {
         return Ok(());
     }
-    if !no_channel {
+    if !no_channel(manifest) {
         if manifest
             .capabilities
             .iter()
@@ -242,12 +245,31 @@ fn check_capabilities_with_exec(manifest: &Manifest) -> Result<(), ProblemError>
     }
     // No channel: every capability has to bring its own action, or it would be
     // listed as a tool that can never answer.
+    if let Some(missing) = manifest
+        .capabilities
+        .iter()
+        .find(|capability| capability.hook.is_none())
+    {
+        return Err(Problem::Invalid.error(format!(
+            "exec.ready=exec/port has no protocol channel, so capability {} needs a hook",
+            missing.name
+        )));
+    }
+    Ok(())
+}
+
+/// The delivery rule plus the parts only a package can be held to: the action
+/// exists in `files[]`, its path is well formed, and its timeout is within the
+/// host's bounds. The scan cannot check these — it reads an installed tree, not
+/// a package — which is why they live beside the rule instead of inside it.
+fn check_capabilities_with_exec(manifest: &Manifest) -> Result<(), ProblemError> {
+    check_capability_delivery(manifest)?;
+    if !no_channel(manifest) {
+        return Ok(());
+    }
     for capability in &manifest.capabilities {
         let Some(hook) = capability.hook.as_ref() else {
-            return Err(Problem::Invalid.error(format!(
-                "exec.ready=exec/port has no protocol channel, so capability {} needs a hook",
-                capability.name
-            )));
+            continue;
         };
         check_path(&hook.path)?;
         if !manifest.files.iter().any(|file| file.path == hook.path) {
@@ -266,6 +288,10 @@ fn check_capabilities_with_exec(manifest: &Manifest) -> Result<(), ProblemError>
         }
     }
     Ok(())
+}
+
+fn no_channel(manifest: &Manifest) -> bool {
+    matches!(manifest.exec.ready.as_deref(), Some("exec") | Some("port"))
 }
 
 fn check_lifecycle(manifest: &Manifest) -> Result<(), ProblemError> {
