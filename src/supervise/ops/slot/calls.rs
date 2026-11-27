@@ -279,7 +279,10 @@ impl Slot {
             let Some(pending) = self.pending.remove(id) else {
                 continue;
             };
-            error!("{}: tools/call {} timed out", self.id, pending.capability);
+            error!(
+                "{}: tools/call #{} {} timed out",
+                self.id, id, pending.capability
+            );
             let failure = Failure::new(
                 Class::Timeout,
                 Retry::After(std::time::Duration::from_secs(1)),
