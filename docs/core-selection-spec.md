@@ -79,15 +79,17 @@
   "exec": { "path": "/usr/local/bin/my-core", "args": [], "env": {}, "ready": "notify" },
   "dependencies": [],
   "lifecycle": {
-    "start":  { "path": "/usr/local/bin/my-core", "args": ["prepare"], "timeout": 30 },
-    "stop":   { "path": "/usr/local/bin/my-core", "args": ["stop"],   "timeout": 10 },
-    "status": { "path": "/usr/local/bin/my-core", "args": ["status"], "timeout": 5 }
+    "start":   { "path": "/usr/local/bin/my-core", "args": ["prepare"], "timeout": 30 },
+    "started": { "path": "/usr/local/bin/my-core", "args": ["started"], "timeout": 15 },
+    "stop":    { "path": "/usr/local/bin/my-core", "args": ["stop"],   "timeout": 10 },
+    "status":  { "path": "/usr/local/bin/my-core", "args": ["status"], "timeout": 5 }
   }
 }
 ```
 
 - `exec.path` 必须是绝对路径；Unix 可以是 shebang 脚本，Windows 是 `.exe` / `.cmd` / `.bat`；`ready` 同 plugin（默认 `notify`，脚本不讲话就用 `exec`）。
-- `exec` 是被监督进程。`lifecycle` 全部可选：`start` 是**前置准备**——每次 spawn `exec` 之前运行、必须退出，非零或超时即本次启动失败且 `exec` 不 spawn，崩溃重试会重跑（幂等）；`stop` 是**收尾**——被监督进程消失之后运行一次（主动停、崩溃不重启、崩溃重启前、启动失败），跑的时候进程已经不在了，不要假设还能对它发信号；非零/超时只记日志。宿主负责终止（Unix 进程组 + 停止时快照到的 `setsid` 子孙 `SIGTERM` → 10 秒 → `SIGKILL`；Windows 直接强杀），`Stopped` 以 `stop` 返回为准（#323）。`status` 由 `svc status` 按需探测，stdout 作为 `details.probe` 的细节补充，退出码不改变服务状态。钩子 `path` 必须绝对，环境继承 daemon 并附加 `SVCD_SERVICE_ID` / `SVCD_ACTION` / `SVCD_DATA_DIR` / `SVCD_CONFIG_DIR` / `SVCD_LOG_DIR`；插件包（`kind=plugin`）的 `exec` 进程与 `lifecycle` 钩子只拿 `SVCD_PLUGIN_DIR`（安装目录 `<根>/<id>`）/ `SVCD_LOG_DIR` / `SVCD_TEMP_DIR` —— 插件是第三方代码，不给守护进程的配置根（`svcd.conf` 的密码散列、`trust.d`）与数据根，动作仍靠参数传。
+- `exec` 是被监督进程。`lifecycle` 全部可选：`start` 是**前置准备**——每次 spawn `exec` 之前运行、必须退出，非零或超时即本次启动失败且 `exec` 不 spawn，崩溃重试会重跑（幂等）；`started` 是**就绪之后、Running 之前**的动作——该次 spawn 达到 Ready 后运行一次、必须退出，非零或超时即本次启动失败（停整组、跑 `stop`、进退避重试），每次 spawn（`svc start`、`svc restart`、崩溃重试）都重跑，所以同样必须幂等，跑的过程中对外仍是 `starting`、`svc start` 尚未返回，声明了就不得配 `remain_after_exit`（一次性服务没有可门控的就绪实例）；`stop` 是**收尾**——被监督进程消失之后运行一次（主动停、崩溃不重启、崩溃重启前、启动失败），跑的时候进程已经不在了，不要假设还能对它发信号；非零/超时只记日志。宿主负责终止（Unix 进程组 + 停止时快照到的 `setsid` 子孙 `SIGTERM` → 10 秒 → `SIGKILL`；Windows 直接强杀），`Stopped` 以 `stop` 返回为准（#323）。`status` 由 `svc status` 按需探测，stdout 作为 `details.probe` 的细节补充，退出码不改变服务状态。钩子 `path` 必须绝对，环境继承 daemon 并附加 `SVCD_SERVICE_ID` / `SVCD_ACTION` / `SVCD_DATA_DIR` / `SVCD_CONFIG_DIR` / `SVCD_LOG_DIR`；插件包（`kind=plugin`）的 `exec` 进程与 `lifecycle` 钩子只拿 `SVCD_PLUGIN_DIR`（安装目录 `<根>/<id>`）/ `SVCD_LOG_DIR` / `SVCD_TEMP_DIR` —— 插件是第三方代码，不给守护进程的配置根（`svcd.conf` 的密码散列、`trust.d`）与数据根，动作仍靠参数传（插件钩子**不拿** `SVCD_ACTION`，那是 core 专属）。
+- `stop` 钩子额外拿两个变量，用来按「为什么结束」分支，而不是为每个状态配一个回调：`SVCD_STOP_REASON` = `stop`（显式 stop / restart 的停止半程）/ `shutdown`（daemon 整体退出）/ `crash`（进程非正常结束，含启动期崩溃）/ `exit`（进程正常结束且不重启）/ `start-failed`（start 或 started 动作失败、spawn 失败，进程可能从未产生）；`SVCD_LAST_EXIT` = 退出码或 `none`，**只有 `crash` / `exit` 时才是退出码**（停止时进程还活着；启动失败时上一代的码不算这一代的）。
 - 文件 root 所有、0640；启动时读取，改定义后重启 svcd 生效（v1 不做热加载）。
 - 不接受 `.spk` 专属字段：`platform` / `files` / `hooks` / `config` / `ui` 出现即定义非法；其他未知字段忽略。
 - `id` 不能是 `svc`（保留给内置 core），且不能与 plugin id 冲突；冲突时 plugin 安装拒绝、core 定义加载拒绝。
@@ -161,7 +163,7 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
 | `protocol` | int | 是 | 1 / 2 / 3；1 = 行分帧 JSON-RPC，2 = 长度前缀 JSON-RPC，3 = 多路复用帧（stream 0 是 JSON-RPC，stream 1..=0xFFFF_FFFE 是 raw 数据流，stream 0xFFFF_FFFF 是控制流）。不匹配安装拒绝、加载再检 |
 | `exec` | object | 是 | `{path, args?, env?, ready?}`；`ready` 默认 `notify`，可 `exec` |
 | `interpreter` | object | 否 | `{name, args?, version?}`；声明了就必须有脚本 payload，不声明则直接 exec（见 §1.8） |
-| `lifecycle` | object | 否 | `{start?, stop?, status?}`；`start` 是前置准备（必须退出），`stop` 在进程消失后运行；路径包内相对且在 `files[]` |
+| `lifecycle` | object | 否 | `{start?, started?, stop?, status?}`；`start` 是前置准备（必须退出），`started` 在就绪后、Running 之前跑一次（失败即启动失败），`stop` 在进程消失后运行并拿 `SVCD_STOP_REASON`；路径包内相对且在 `files[]` |
 | `dependencies` | [string] | 否 | 服务 id 列表，**无版本约束** |
 | `capabilities` | array | 否 | `{name, desc, inputSchema, outputSchema?}`；name 插件内唯一，`svc.` 禁用；只允许 `ready=notify`；`outputSchema` 只做声明与 MCP 投影，不校验结果（省略 = 未声明，`{}` = 任意） |
 | `ui` | object | 否 | `{type: web / gui / headerless, entry?}`；`entry` 相对 `payload/web/`，默认 `index.html` |
@@ -562,6 +564,7 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
 - 2026-11-23（#260）：manifest 格式重编号为 `schema: 1`（唯一版本、不读旧线任何版本）。新增必填 `id`（身份）与 `name`（显示名，可中文）、`capabilities[].outputSchema`、顶层 `icons`；`lifecycle` / `interpreter` / `compat` 并入 1，取消 1/2/3 分级门禁；`interpreter` 由「脚本必需」改为「可选，声明了就必须有脚本」。`plugin bundle` 恒写 `schema: 1`，`--id` 写身份、`--name` 写显示名。
 - 2026-11-17：控制通道删除 `svcd.token`，鉴权改为端点 ACL；本地两档由 `svcd` / `svcd-admin` 两个端点实施；C8 改为两端点各一条显式 protected DACL。
 - 2026-11-26（#323）：生命周期语义翻转——`exec` 成为唯一的被监督进程，`lifecycle.start` 改为前置准备（必须退出，失败即启动失败），`lifecycle.stop` 改为进程消失后的收尾（`Stopped` 以它返回为准），终止权归宿主。core 脚本声明的 `start` 改为写进 `exec.args`，`plugin bundle --from-core` 同步。老包（`start` 是常驻进程）会以「start 动作超时」启动失败，错误日志指明把进程移到 `exec.args`。
+- 2026-11-27（#335）：补上 spawn 之后、Running 之前的空窗口——`lifecycle.started` 在就绪后跑一次、失败即启动失败；`stop` 钩子新增 `SVCD_STOP_REASON` / `SVCD_LAST_EXIT`，让一个钩子按「为什么结束」分支。设计见 `docs/specs/2026-11-27-daemon-plugin-lifecycle-gaps.md`。
 - 2026-11-27（#332，ADR-0031）：服务树不再只是进程组——停止开始时按 `/proc` 父链快照 `setsid` 出去的子孙，polite / kill 两段都对「组 + 快照」一起发信号；卸载一个正在跑的 sshd 不再留下 dropbear 连接子进程。
 
 ## 16. 实施票（2026-11-12 拆出）

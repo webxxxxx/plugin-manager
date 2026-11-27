@@ -61,6 +61,18 @@ pub enum Action {
     GiveUp,
 }
 
+/// Why the current instance ended. The stop action carries it as
+/// `SVCD_STOP_REASON`, so one hook can branch instead of one hook per state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cause {
+    /// The process died on its own (non-zero, signal, or crash at startup).
+    Crash,
+    /// The process exited cleanly and is not coming back.
+    Exit,
+    /// The instance never became usable: start action, spawn, or started action.
+    StartFailed,
+}
+
 /// Pure six-state supervisor core. The shell owns processes, pipes and timers;
 /// this type owns only state, failure bookkeeping and the sequence of actions.
 #[derive(Clone, Debug)]
@@ -78,6 +90,9 @@ pub struct Machine {
     pub remain_after_exit: bool,
     /// A start timed out, so the following exit is a failed start, not a user stop.
     fail_after_stop: bool,
+    /// Why the current/most recent instance ended; cleared when a new attempt
+    /// begins.
+    pub cause: Option<Cause>,
     /// 最近一次调用失败留下的降级原因；Ready 时清空。
     degraded: Option<String>,
 }
@@ -96,6 +111,7 @@ impl Machine {
             restart,
             remain_after_exit: false,
             fail_after_stop: false,
+            cause: None,
             degraded: None,
         }
     }
@@ -156,6 +172,7 @@ impl Machine {
                 self.unkillable = false;
                 self.fail_after_stop = false;
                 self.degraded = None;
+                self.cause = None;
                 self.state = S::Starting;
                 self.since_ms = now_ms;
                 out.push(Spawn);
@@ -169,6 +186,7 @@ impl Machine {
             E::SpawnFailed => {
                 if self.state == S::Starting {
                     self.pid = None;
+                    self.cause = Some(Cause::StartFailed);
                     self.fail(now_ms, &mut out);
                 }
             }
@@ -191,6 +209,7 @@ impl Machine {
                 self.next_at_ms = None;
                 match self.state {
                     S::Starting => {
+                        self.cause = Some(Cause::Crash);
                         self.fail(now_ms, &mut out);
                     }
                     S::Running => {
@@ -201,6 +220,11 @@ impl Machine {
                         // A clean exit from a degraded service is still a
                         // failure: health, not just the exit code, decides.
                         let successful = exited_successfully(code, self.health().is_ready());
+                        self.cause = Some(if successful {
+                            Cause::Exit
+                        } else {
+                            Cause::Crash
+                        });
                         let restart = match self.restart {
                             Restart::Always => true,
                             Restart::OnFailure => !successful,
@@ -285,6 +309,7 @@ impl Machine {
             E::StartTimeout => {
                 if self.state == S::Starting {
                     self.fail_after_stop = true;
+                    self.cause = Some(Cause::StartFailed);
                     self.state = S::Stopping;
                     self.since_ms = now_ms;
                     self.ready_since_ms = None;
@@ -325,6 +350,7 @@ impl Machine {
                 if self.state == S::Backoff {
                     self.next_at_ms = None;
                     if self.restart != Restart::Never {
+                        self.cause = None;
                         self.state = S::Starting;
                         self.since_ms = now_ms;
                         out.push(Spawn);
@@ -893,5 +919,74 @@ mod tests {
 
         assert!(machine.health().is_ready());
         assert_eq!(machine.health().state(), &Settled::Ready);
+    }
+
+    #[test]
+    fn the_cause_says_how_the_instance_ended() {
+        // Clean exit: the stop action reports `exit`, not `crash`.
+        let mut clean = Machine::new(Restart::OnFailure);
+        start(&mut clean, 1, 0);
+        ready(&mut clean, 1, 10);
+        clean.step(
+            Event::Exited {
+                pid: 1,
+                code: Some(0),
+            },
+            20,
+        );
+        assert_eq!(clean.cause, Some(Cause::Exit));
+
+        // Non-zero exit is a crash.
+        let mut crash = Machine::new(Restart::OnFailure);
+        start(&mut crash, 2, 0);
+        ready(&mut crash, 2, 10);
+        crash.step(
+            Event::Exited {
+                pid: 2,
+                code: Some(1),
+            },
+            20,
+        );
+        assert_eq!(crash.cause, Some(Cause::Crash));
+
+        // A process that dies during startup is still a crash.
+        let mut early = Machine::new(Restart::OnFailure);
+        start(&mut early, 3, 0);
+        early.step(
+            Event::Exited {
+                pid: 3,
+                code: Some(1),
+            },
+            10,
+        );
+        assert_eq!(early.cause, Some(Cause::Crash));
+    }
+
+    #[test]
+    fn a_failed_start_says_start_failed() {
+        // The start action never produced a process.
+        let mut spawn_failed = Machine::new(Restart::OnFailure);
+        start(&mut spawn_failed, 1, 0);
+        spawn_failed.step(Event::SpawnFailed, 10);
+        assert_eq!(spawn_failed.cause, Some(Cause::StartFailed));
+
+        // The ready window (or the started action) ran out.
+        let mut timed_out = Machine::new(Restart::OnFailure);
+        start(&mut timed_out, 2, 0);
+        timed_out.step(Event::StartTimeout, 10);
+        assert_eq!(timed_out.cause, Some(Cause::StartFailed));
+    }
+
+    #[test]
+    fn a_new_attempt_forgets_the_previous_cause() {
+        let mut machine = Machine::new(Restart::OnFailure);
+        start(&mut machine, 1, 0);
+        machine.step(Event::SpawnFailed, 10);
+        assert_eq!(machine.cause, Some(Cause::StartFailed));
+
+        machine.step(Event::BackoffElapsed, 1_000);
+
+        assert_eq!(machine.state, State::Starting);
+        assert_eq!(machine.cause, None);
     }
 }

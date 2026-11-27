@@ -105,6 +105,15 @@ impl StopFlow {
 }
 
 impl Slot {
+    /// Why the stop action runs: the ended instance's cause wins over the
+    /// explicit request, so a crash inside `svc stop` still reports `crash`.
+    pub(super) fn stop_reason(&self) -> StopReason {
+        match self.machine.cause {
+            Some(cause) => StopReason::from_cause(Some(cause)),
+            None => self.stop_request,
+        }
+    }
+
     pub(super) fn ensure_stop_action(&mut self, now: u64) -> bool {
         if self.stop.running() {
             return true;
@@ -115,12 +124,29 @@ impl Slot {
         let Some(hook) = self.stop_action() else {
             return false;
         };
-        let command = hook_command(
+        let reason = self.stop_reason();
+        // Only a process that ended on its own has an exit code to report: on a
+        // stop/shutdown the process is still alive when this action spawns, and
+        // a failed start may never have produced one (its last_exit would
+        // belong to an older instance).
+        let last_exit = match reason {
+            StopReason::Crash | StopReason::Exit => self.machine.last_exit,
+            _ => None,
+        };
+        let mut command = hook_command(
             &self.id,
             "stop",
             hook,
             &self.paths,
             self.plugin_dir.as_deref(),
+        );
+        // One hook branches on this instead of one hook per state: the stop
+        // action runs on every path, and this says which one (#335).
+        command.env("SVCD_STOP_REASON", reason.as_str()).env(
+            "SVCD_LAST_EXIT",
+            last_exit
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "none".into()),
         );
         match stdio::spawn(command, Plan::action()) {
             Ok((mut child, streams)) => {
@@ -262,7 +288,8 @@ impl Slot {
     /// Ask the service to stop. The host terminates the process; the stop
     /// action runs after it is gone, so a stop during the start action cancels
     /// that action instead of waiting for it.
-    pub(crate) fn request_stop(&mut self, now: u64) {
+    pub(crate) fn request_stop(&mut self, now: u64, reason: StopReason) {
+        self.stop_request = reason;
         self.abort_prelude();
         // Before any signal goes out: what leaves the process group has to be
         // found while the leader is still its parent (#332, ADR-0031).

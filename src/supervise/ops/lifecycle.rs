@@ -10,6 +10,7 @@ use crate::platform::clock::Clock;
 use crate::platform::compat;
 use crate::platform::log;
 use crate::supervise::check::start;
+use crate::supervise::check::stop_reason::StopReason;
 use crate::supervise::model::supervisor::{self, Event};
 use crate::supervise::ops::host::Supervisor;
 
@@ -149,6 +150,19 @@ impl Supervisor {
             self.pump(clock.now());
             let mut all_settled = true;
             for id in &pending {
+                // A post-ready or preparation action failed: report the reason
+                // now instead of waiting out the whole window.
+                if let Some(reason) = self
+                    .slots
+                    .get_mut(id)
+                    .and_then(|slot| slot.take_start_failure())
+                {
+                    error!("{}: the start failed: {}", id, reason);
+                    return Err(ProblemError::new(
+                        Problem::Internal,
+                        format!("service {} failed to start: {}", id, reason),
+                    ));
+                }
                 let slot = &self.slots[id];
                 let state = slot.machine.state;
                 match start::start_step(state, slot.is_channel_peer()) {
@@ -346,7 +360,7 @@ impl Supervisor {
         self.slots
             .get_mut(id)
             .expect("slot")
-            .request_stop(now.mono_ms);
+            .request_stop(now.mono_ms, StopReason::Stop);
         if matches!(state, State::Stopped | State::Failed) {
             return self.status_for_id(id, clock.now()).ok_or_else(|| {
                 ProblemError::new(Problem::UnknownService, format!("unknown service: {}", id))
@@ -418,7 +432,10 @@ impl Supervisor {
             }
             for id in &active {
                 let now = clock.now().mono_ms;
-                self.slots.get_mut(id).expect("slot").request_stop(now);
+                self.slots
+                    .get_mut(id)
+                    .expect("slot")
+                    .request_stop(now, StopReason::Shutdown);
             }
             let deadline = clock
                 .now()
@@ -483,8 +500,16 @@ fn shutdown_layers(registry: &Registry, ids: Vec<String>) -> (Vec<Vec<String>>, 
 fn start_action_budget<'a>(services: impl Iterator<Item = &'a Service>) -> u64 {
     services
         .filter_map(|service| service.lifecycle.as_ref())
-        .filter_map(|lifecycle| lifecycle.start.as_ref())
-        .map(|action| action.timeout_ms)
+        .map(|lifecycle| {
+            // Both run inside one start request: `start` before the process
+            // exists, `started` after it is ready.
+            lifecycle.start.as_ref().map(|a| a.timeout_ms).unwrap_or(0)
+                + lifecycle
+                    .started
+                    .as_ref()
+                    .map(|a| a.timeout_ms)
+                    .unwrap_or(0)
+        })
         .max()
         .unwrap_or(0)
 }
@@ -521,12 +546,14 @@ mod tests {
         let mut one = slot_backed("one", &[]);
         one.lifecycle = Some(Lifecycle {
             start: Some(action(30_000)),
+            started: None,
             stop: None,
             status: None,
         });
         let mut two = slot_backed("two", &[]);
         two.lifecycle = Some(Lifecycle {
             start: Some(action(45_000)),
+            started: None,
             stop: None,
             status: None,
         });
@@ -544,6 +571,7 @@ mod tests {
         assert_eq!(stop_action_budget(Some(&service)), 0);
         service.lifecycle = Some(Lifecycle {
             start: None,
+            started: None,
             stop: Some(action(10_000)),
             status: None,
         });

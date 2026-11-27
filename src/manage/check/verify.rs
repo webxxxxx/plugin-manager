@@ -597,6 +597,36 @@ mod tests {
     }
 
     #[test]
+    fn a_started_action_is_validated_like_the_other_lifecycle_actions() {
+        let files = vec![
+            json!({"path": "payload/bin/clock.sh", "size": 10, "sha256": "00", "mode": 0o755}),
+            json!({"path": "payload/bin/clock-started.sh", "size": 10, "sha256": "00", "mode": 0o755}),
+        ];
+        let value = |path: &str, timeout: Option<u64>| {
+            json!({
+                "schema": 1, "id": "clock", "name": "clock", "version": "1.0.0", "desc": "clock",
+                "platform": crate::platform::target(), "protocol": 1,
+                "exec": {"path": "payload/bin/clock.sh", "ready": "exec"},
+                "interpreter": {"name": "sh"},
+                "lifecycle": {"started": {"path": path, "timeout": timeout}},
+                "files": files
+            })
+        };
+        let bytes = serde_json::to_vec(&value("payload/bin/clock-started.sh", None)).expect("json");
+        validate_manifest(&parse_manifest(&bytes).expect("parse")).expect("started is valid");
+
+        let bytes = serde_json::to_vec(&value("missing/started.sh", None)).expect("json");
+        let error = validate_manifest(&parse_manifest(&bytes).expect("parse")).expect_err("path");
+        assert!(error.detail().contains("not in files[]"), "{error}");
+
+        let bytes =
+            serde_json::to_vec(&value("payload/bin/clock-started.sh", Some(301))).expect("json");
+        let error =
+            validate_manifest(&parse_manifest(&bytes).expect("parse")).expect_err("too long");
+        assert!(error.detail().contains("between 1 and"), "{error}");
+    }
+
+    #[test]
     fn rejects_a_lifecycle_path_outside_files_and_bad_timeouts() {
         let value = |path: &str, timeout: Option<u64>| {
             let files = vec![json!({

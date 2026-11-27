@@ -13,6 +13,7 @@ use crate::kernel::registry::{Exec, Lifecycle, Ready, Restart, State};
 use crate::platform::host::wake::Wake;
 use crate::platform::log::{self, LogWriter};
 use crate::platform::paths::Paths;
+use crate::supervise::check::stop_reason::StopReason;
 use crate::supervise::model::supervisor::{self, Action, Event, Machine};
 use crate::wire::contract::stdio::{self, Plan, Streams, Target};
 use crate::wire::contract::RAW_PROTOCOL;
@@ -73,9 +74,22 @@ pub(crate) struct Slot {
     stop_deadline: Option<u64>,
     kill_deadline: Option<u64>,
     stop: StopFlow,
+    /// The explicit reason for the current stop request (`stop` vs the
+    /// daemon's own shutdown); a crash/exit cause wins when there is one.
+    stop_request: StopReason,
     /// The start action (`lifecycle.start`) running before the process spawns.
     /// It is a preparation step: the process only starts once it exits.
     prelude: Option<ActionRun>,
+    /// The post-ready action (`lifecycle.started`) for the current spawn.
+    started: Option<ActionRun>,
+    /// The next Ready event of this spawn must run the started action instead
+    /// of settling it.
+    started_owed: bool,
+    /// The pid whose Ready is withheld while the started action runs.
+    ready_pending: Option<u32>,
+    /// Why the current start attempt failed; read once by the start request so
+    /// it reports the reason instead of waiting out the whole window.
+    start_failure: Option<String>,
     /// The process exited while the stop action was still owed. The exit is
     /// applied once that action ends, so `Stopped` means the cleanup finished.
     exit_awaiting_action: Option<(u32, Option<i32>)>,
@@ -113,6 +127,8 @@ impl Drop for Slot {
         // calls. Complete both the in-flight and still-queued ones here instead
         // of dropping the 'FnOnce' sinks and leaving callers waiting forever.
         self.fail_pending("service runtime stopped");
+        // A hook still running belongs to a slot nobody will drive again.
+        self.abort_started();
         while let Ok(request) = self.request_rx.try_recv() {
             (request.done)(Err(Failure::new(
                 Class::NotRunning,
@@ -153,7 +169,12 @@ impl Slot {
             stop_deadline: None,
             kill_deadline: None,
             stop: StopFlow::new(),
+            stop_request: StopReason::Stop,
             prelude: None,
+            started: None,
+            started_owed: false,
+            ready_pending: None,
+            start_failure: None,
             exit_awaiting_action: None,
             stop_after_action: false,
             tree: None,
@@ -225,6 +246,19 @@ impl Slot {
         self.lifecycle
             .as_ref()
             .and_then(|lifecycle| lifecycle.stop.as_ref())
+    }
+
+    /// The definition's post-ready action, if any.
+    fn started_action(&self) -> Option<&crate::kernel::registry::Hook> {
+        self.lifecycle
+            .as_ref()
+            .and_then(|lifecycle| lifecycle.started.as_ref())
+    }
+
+    /// Why the last attempt of this service failed to start, consumed by the
+    /// start request so it fails fast instead of waiting out the window.
+    pub(crate) fn take_start_failure(&mut self) -> Option<String> {
+        self.start_failure.take()
     }
 
     pub(crate) fn set_restart(&mut self, restart: Restart) {
@@ -333,6 +367,7 @@ impl Slot {
         self.drain_frames(now);
         self.check_prelude(now);
         self.check_exit(now);
+        self.check_started(now);
         self.check_stop_action(now);
         self.check_timers(now);
         self.sync_health();
@@ -348,6 +383,27 @@ impl Slot {
     }
 
     pub(crate) fn apply(&mut self, event: Event, now: u64) {
+        if let Event::Ready { pid } = event {
+            if self.gate_ready(pid, now) {
+                return;
+            }
+        }
+        // Anything else that reaches the machine while the started action runs
+        // must not race it: a stop, an exit, a start timeout, a new attempt all
+        // kill the action first. The settle path clears the field before
+        // applying its own Ready, so a good run is never aborted here.
+        if self.started.is_some() {
+            if let Event::Exited { code, .. } = event {
+                if self.machine.state == State::Starting {
+                    self.start_failure = Some(format!(
+                        "service exited (code {}) while the started action ran",
+                        code.map(|code| code.to_string())
+                            .unwrap_or_else(|| "none".into())
+                    ));
+                }
+            }
+            self.abort_started();
+        }
         let actions = self.machine.step(event, now);
         self.run_actions(actions, now);
     }
@@ -357,7 +413,11 @@ impl Slot {
                 Action::Spawn => {
                     self.abort_stop_action();
                     self.abort_prelude();
+                    self.abort_started();
                     self.stop.reset();
+                    self.stop_request = StopReason::Stop;
+                    self.start_failure = None;
+                    self.started_owed = self.started_action().is_some();
                     self.fail_pending("service is restarting");
                     self.begin_start(now);
                 }
@@ -686,6 +746,7 @@ mod commands;
 mod frames;
 mod handle;
 mod prelude;
+mod started;
 mod stop;
 mod tree;
 

@@ -169,6 +169,15 @@ pub(crate) fn service_from_manifest(
                 interpreter,
                 &mut any_script,
             )?;
+            let started = convert_lifecycle_hook(
+                "started",
+                version_dir,
+                lifecycle.started.as_ref(),
+                crate::kernel::registry::HOOK_STARTED_TIMEOUT_MS,
+                crate::kernel::registry::HOOK_TIMEOUT_MAX_MS,
+                interpreter,
+                &mut any_script,
+            )?;
             let stop = convert_lifecycle_hook(
                 "stop",
                 version_dir,
@@ -189,6 +198,7 @@ pub(crate) fn service_from_manifest(
             )?;
             Some(Lifecycle {
                 start,
+                started,
                 stop,
                 status,
             })

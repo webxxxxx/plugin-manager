@@ -99,6 +99,9 @@ pub struct Interpreter {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Lifecycle {
     pub start: Option<Hook>,
+    /// The post-ready action: runs once the instance is ready and before it is
+    /// reported running; a failure fails this start.
+    pub started: Option<Hook>,
     pub stop: Option<Hook>,
     pub status: Option<Hook>,
 }
