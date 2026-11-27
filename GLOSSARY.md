@@ -25,7 +25,7 @@ _Avoid_: PluginManager、PM（已退役）
 _Avoid_: 信任安装、跳过校验（默认路径不跳过）
 
 **脚本插件（Script plugin）**:
-payload 是脚本、由 manifest 的 `interpreter` 声明宿主解释器、并可用 `lifecycle` 声明前置准备（start）、进程退出后的收尾（stop）与按需探测（status）的插件；被监督进程始终是 `exec`，执行路径与 core 脚本共用，来源与信任仍是 .spk。
+payload 是脚本、由 manifest 的 `interpreter` 声明宿主解释器、并可用 `lifecycle` 声明前置准备（start）、就绪之后的一次动作（started）、进程退出后的收尾（stop）与按需探测（status）的插件；被监督进程始终是 `exec`，执行路径与 core 脚本共用，来源与信任仍是 .spk。
 _Avoid_: core plugin、系统插件
 
 **解释器（Interpreter）**:
@@ -269,7 +269,7 @@ _Avoid_: 守护脚本、短命服务
 _Avoid_: 长驻服务、后台服务、守护进程（daemon 专指 svcd）、有状态服务
 
 **端口就绪（Port readiness）**:
-第三种就绪语义（`exec.ready: "port"` + `exec.port`）：宿主在 `exec.probe_addr`（默认 `127.0.0.1`）上连一次，能建连才算 Ready。它比 `exec`（spawn 即就绪）强、比 `notify`（能答协议）弱：证明进程在 accept，不证明业务可用；只对 TCP 有效，UDP/QUIC 探不到。spawn 前宿主先试绑一次同一个地址，端口被别人占着就直接启动失败——否则探测会把别人的监听当成自己的。
+第三种就绪语义（`exec.ready: "port"` + `exec.port`）：宿主在 `exec.probe_addr`（默认 `127.0.0.1`）上连一次，能建连才算 Ready。它比 `exec`（spawn 即就绪）强、比 `notify`（能答协议）弱：证明进程在 accept，不证明业务可用；只对 TCP 有效，UDP/QUIC 探不到。spawn 前宿主先试绑一次同一个地址，端口被别人占着就直接启动失败——否则探测会把别人的监听当成自己的。这是**探测不是保证**：预检与 connect 之间仍有 TOCTOU 窗口，别人的监听者恰好在这之间起来仍会被当成 Ready。
 _Avoid_: 端口探活、健康检查（那是 status/probe 的事）
 
 **流（Flow）**:

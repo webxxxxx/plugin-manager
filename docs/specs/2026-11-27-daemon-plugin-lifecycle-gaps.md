@@ -7,7 +7,7 @@
 
 ## 决定
 
-1. **T1：`lifecycle.started`**——spawn（且 `exec.ready` 满足）之后跑一次、必须退出、失败即本次启动失败；每次重启都重跑。等价 systemd 的 `ExecStartPost`。
+1. **T1：`lifecycle.started`**——spawn（且 `exec.ready` 满足）之后跑一次、必须退出、失败即本次启动失败；每次重启都重跑。这是 `start`（spawn 之前）与 `stop`（进程消失之后）之间的第三个窗口。
    同一票里加**停止原因**（`SVCD_STOP_REASON` / `SVCD_LAST_EXIT`），让已有的 `lifecycle.stop` 能按“为什么结束”分支——它替代了 `on_crash` / `on_backoff` / `on_stopping` 三个候选回调。
 2. **T2：`POST /api/v1/services/{id}/restart`**——插件页面改完配置点一下就能重跑，等价 `svc restart`。**不是** `/plugin-ui/{id}/{token}/restart`（原因见 T2）。
 3. **T3：`exec.ready: "port"`**——宿主等端口真的在听才算 Ready，让“就绪”有准确含义，也省掉 T1 里的轮询。**blocked by T1，可延后**。
