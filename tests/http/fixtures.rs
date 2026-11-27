@@ -407,6 +407,85 @@ pub(crate) fn web_plugin_bundle_with(
     signed_package(key, manifest, &files)
 }
 
+/// A plugin with one long-running process, a web page, and capabilities answered
+/// by one-shot hooks instead of a channel (#342). One hook answers, one fails:
+/// the page-facing `/rpc` bridge has to carry both the same way MCP does.
+pub(crate) fn hook_ui_bundle(key: &SigningKey, id: &str) -> Vec<u8> {
+    let (loop_name, loop_data, hook_name, hook_data, fail_name, fail_data) = if cfg!(windows) {
+        (
+            "agent.cmd",
+            b"@echo off\r\n:loop\r\ntimeout /t 1 >nul 2>&1\r\ngoto loop\r\n".to_vec(),
+            "hook-mode.cmd",
+            b"@echo off\r\necho {\"mode\":\"tproxy\"}\r\n".to_vec(),
+            "hook-fail.cmd",
+            b"@echo off\r\necho boom 1>&2\r\nexit /b 3\r\n".to_vec(),
+        )
+    } else {
+        (
+            "agent.sh",
+            b"#!/bin/sh\nwhile :; do sleep 1; done\n".to_vec(),
+            "hook-mode.sh",
+            br#"#!/bin/sh
+printf '{"mode":"tproxy"}'
+"#
+            .to_vec(),
+            "hook-fail.sh",
+            b"#!/bin/sh\necho boom >&2\nexit 3\n".to_vec(),
+        )
+    };
+    let exec_path = format!("payload/bin/{}", loop_name);
+    let hook_path = format!("payload/bin/{}", hook_name);
+    let fail_path = format!("payload/bin/{}", fail_name);
+    let mut files: Vec<(String, Vec<u8>, u32)> = vec![
+        (exec_path.clone(), loop_data, 0o755),
+        (hook_path.clone(), hook_data, 0o755),
+        (fail_path.clone(), fail_data, 0o755),
+        (
+            "payload/web/index.html".to_string(),
+            b"<!doctype html>\n<html><body>hook page</body></html>".to_vec(),
+            0o644,
+        ),
+    ];
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut manifest = json!({
+        "schema": 1,
+        "id": id,
+        "name": id,
+        "version": "1.0.0",
+        "desc": "hook capability ui plugin",
+        "platform": target(),
+        "protocol": 1,
+        "exec": {"path": exec_path, "args": [], "ready": "exec"},
+        "capabilities": [
+            {
+                "name": "mode",
+                "desc": "Proxy mode",
+                "inputSchema": {"type": "object"},
+                "hook": {"path": hook_path, "timeout": 10}
+            },
+            {
+                "name": "fail",
+                "desc": "Always fails",
+                "inputSchema": {"type": "object"},
+                "hook": {"path": fail_path, "timeout": 10}
+            }
+        ],
+    });
+    manifest["ui"] = json!({"type": "web", "entry": "index.html"});
+    // The payload and both hooks are scripts, so the package has to name the
+    // interpreter that runs them (the install path refuses a script without one).
+    manifest["interpreter"] = if cfg!(windows) {
+        json!({"name": "cmd", "args": ["/C"]})
+    } else {
+        json!({"name": "sh"})
+    };
+    signed_package(key, manifest, &files)
+}
+
+pub(crate) fn hook_ui_sandbox(key_byte: u8) -> (Sandbox, String) {
+    sandbox_with_package(key_byte, |key| hook_ui_bundle(key, "demo"))
+}
+
 /// A page larger than the default stream buffer. Serving it end to end
 /// proves the stream handler chunks its memory body instead of growing the
 /// output buffer to the whole response.
