@@ -200,7 +200,12 @@ pub(crate) fn status_for_problem_error(error: &ProblemError) -> u16 {
 /// writes. One implementation, so no route re-derives the status.
 pub(crate) fn problem_response(refusal: &ProblemError) -> Vec<u8> {
     let status = status_for_problem_error(refusal);
-    http::json_error_with_data(status, code_for(status), refusal.detail(), refusal.data())
+    http::json_error_with_data(
+        status,
+        code_for(status),
+        refusal.detail(),
+        refusal.shortfall(),
+    )
 }
 
 /// A storage refusal as the HTTP error envelope (see [`status_for_storage`]).
@@ -269,6 +274,7 @@ pub(crate) fn decode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::failure::{RootRoom, SpaceShortfall};
 
     /// The face-local HTTP table, one row per management category. These are
     /// the codes the old message matchers returned (#151); the category is now
@@ -308,22 +314,49 @@ mod tests {
     /// one, or turn an unmeasured root into zero bytes.
     #[test]
     fn a_space_refusal_body_is_pinned_byte_for_byte() {
-        let refusal = Problem::InsufficientSpace.error("need 10 bytes").with_data(json!({
-            "id": "demo",
-            "need": 10u64,
-            "installed": 4u64,
-            "root": "/data/plugins",
-            "roots": [
-                { "root": "/data/plugins", "free": 6u64 },
-                { "root": "/mnt/sd", "free": null }
-            ]
-        }));
+        let refusal = Problem::InsufficientSpace
+            .error("need 10 bytes")
+            .with_shortfall(SpaceShortfall {
+                id: "demo".into(),
+                need: 10,
+                installed: 4,
+                root: Some("/data/plugins".into()),
+                roots: vec![
+                    RootRoom {
+                        root: "/data/plugins".into(),
+                        free: Some(6),
+                    },
+                    RootRoom {
+                        root: "/mnt/sd".into(),
+                        free: None,
+                    },
+                ],
+            });
         let text = String::from_utf8(problem_response(&refusal)).expect("utf8");
         let (head, body) = text.split_once("\r\n\r\n").expect("a body");
         assert!(head.starts_with("HTTP/1.1 507 "), "{head}");
         assert_eq!(
             body,
             r#"{"error":{"code":"insufficient_space","data":{"id":"demo","installed":4,"need":10,"root":"/data/plugins","roots":[{"free":6,"root":"/data/plugins"},{"free":null,"root":"/mnt/sd"}]},"message":"need 10 bytes"}}"#
+        );
+
+        // A refusal that never picked a root (the automatic choice found no
+        // volume big enough) says `root: null`: there is nothing to uninstall,
+        // and the dialog must not offer one.
+        let fresh = Problem::InsufficientSpace
+            .error("need 10 bytes")
+            .with_shortfall(SpaceShortfall {
+                id: "demo".into(),
+                need: 10,
+                installed: 0,
+                root: None,
+                roots: Vec::new(),
+            });
+        let text = String::from_utf8(problem_response(&fresh)).expect("utf8");
+        let (_, body) = text.split_once("\r\n\r\n").expect("a body");
+        assert_eq!(
+            body,
+            r#"{"error":{"code":"insufficient_space","data":{"id":"demo","installed":0,"need":10,"root":null,"roots":[]},"message":"need 10 bytes"}}"#
         );
 
         // A refusal without a payload keeps the envelope it always had.

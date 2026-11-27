@@ -689,10 +689,10 @@ mod tests {
             .sink
             .chosen_root()
             .expect_err("no volume is that big");
-        let data = error.data().expect("the refusal carries numbers");
-        assert_eq!(data["need"], declared + metadata);
-        assert_eq!(data["installed"], installed);
-        assert_ne!(data["need"], declared + metadata + installed);
+        let shortfall = error.shortfall().expect("the refusal carries numbers");
+        assert_eq!(shortfall.need, declared + metadata);
+        assert_eq!(shortfall.installed, installed);
+        assert_ne!(shortfall.need, declared + metadata + installed);
     }
 
     #[test]
