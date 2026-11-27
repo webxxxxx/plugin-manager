@@ -150,7 +150,9 @@ impl Slot {
                 let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
                 (Some(tx), Some(rx))
             }
-            Ready::Exec => (None, None),
+            // A port-ready instance keeps only the raw streams too: readiness
+            // is a connection, not a message.
+            Ready::Exec | Ready::Port(_) => (None, None),
         };
         hub.register(
             self.id.clone(),

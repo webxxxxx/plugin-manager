@@ -24,6 +24,7 @@ use self::calls::PendingCalls;
 use self::commands::{abandon, apply_core_child_env, command_for};
 use self::frames::Frames;
 use self::handle::SlotRequest;
+use self::port::PortProbe;
 use self::started::StartedFlow;
 use self::stop::StopFlow;
 use self::tree::Descendants;
@@ -80,6 +81,8 @@ pub(crate) struct Slot {
     prelude: Option<ActionRun>,
     /// The post-ready action (`lifecycle.started`) and its gate state.
     started: StartedFlow,
+    /// The `ready: port` probe for the current spawn.
+    port: Option<PortProbe>,
     /// The process exited while the stop action was still owed. The exit is
     /// applied once that action ends, so `Stopped` means the cleanup finished.
     exit_awaiting_action: Option<(u32, Option<i32>)>,
@@ -161,6 +164,7 @@ impl Slot {
             stop: StopFlow::new(),
             prelude: None,
             started: StartedFlow::new(),
+            port: None,
             exit_awaiting_action: None,
             stop_after_action: false,
             tree: None,
@@ -341,6 +345,7 @@ impl Slot {
         self.check_prelude(now);
         self.check_exit(now);
         self.check_started(now);
+        self.check_port_ready(now);
         self.check_stop_action(now);
         self.check_timers(now);
         self.sync_health();
@@ -370,6 +375,7 @@ impl Slot {
                     self.abort_prelude();
                     self.stop.reset();
                     self.reset_started();
+                    self.abort_port();
                     self.fail_pending("service is restarting");
                     self.begin_start(now);
                 }
@@ -564,6 +570,7 @@ mod calls;
 mod commands;
 mod frames;
 mod handle;
+mod port;
 mod prelude;
 mod spawn;
 mod started;

@@ -1888,6 +1888,42 @@ fn a_clean_exit_reports_the_exit_reason() {
 }
 
 #[test]
+fn a_port_ready_service_refuses_a_port_someone_else_holds() {
+    // `ready: port` must not mistake a squatter for its own listener: the
+    // preflight bind fails the start before the probe could lie.
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[35u8; 32]);
+    sandbox.write_key(&key);
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+    let port = probe.local_addr().expect("addr").port();
+    let (exec, data) = clock_script();
+    let mut manifest = clock_manifest(exec, &data);
+    manifest["exec"]["ready"] = json!("port");
+    manifest["exec"]["port"] = json!(port);
+    let bytes = package_with_manifest(&key, &manifest, &[(exec, &data, 0o755)]);
+    let package = sandbox.write_package("clock-1.0.0.spk", &bytes);
+
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    let installed = sandbox.run_plugin(&["install", package.to_str().expect("package")]);
+    assert_eq!(installed.status.code(), Some(0), "{}", stderr(&installed));
+
+    let started_at = Instant::now();
+    let started = sandbox.run_plugin(&["start", "clock"]);
+    assert_ne!(started.status.code(), Some(0), "{}", stderr(&started));
+    assert!(
+        stderr(&started).contains(&port.to_string()),
+        "the failure must name the port: {}",
+        stderr(&started)
+    );
+    assert!(
+        started_at.elapsed() < Duration::from_secs(15),
+        "a taken port must fail the start at once"
+    );
+    drop(probe);
+}
+
+#[test]
 fn install_rejects_a_missing_interpreter() {
     let mut sandbox = Sandbox::new();
     let key = SigningKey::from_bytes(&[26u8; 32]);

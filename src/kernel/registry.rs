@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -92,11 +93,34 @@ impl State {
     }
 }
 
+/// How the host decides that one spawn is ready. The default is the protocol
+/// channel: a process that never answers is never ready.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Ready {
+    /// The first legal response on the protocol channel (#126).
     #[default]
     Notify,
+    /// The spawn itself.
     Exec,
+    /// A TCP connect to this address succeeds. Stronger than `Exec` (the
+    /// process accepts connections) and weaker than `Notify` (it answers no
+    /// message): the host probes instead of trusting the spawn.
+    Port(SocketAddr),
+}
+
+/// The probe address for `ready: port`: an explicit port and an optional
+/// address (loopback by default). Load-time validation, so the runtime never
+/// parses a definition again.
+pub fn probe_address(port: Option<u16>, addr: Option<&str>) -> Result<SocketAddr, String> {
+    let port = port.ok_or("port is required when ready = port")?;
+    if port == 0 {
+        return Err("port 0 is not a probe target".into());
+    }
+    let text = addr.unwrap_or("127.0.0.1");
+    let ip: std::net::IpAddr = text
+        .parse()
+        .map_err(|_| format!("probe address {:?} is not an IP address", text))?;
+    Ok(SocketAddr::new(ip, port))
 }
 
 /// Default and maximum budgets for a lifecycle action. The start action is
@@ -626,6 +650,24 @@ impl Registry {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_probe_address_needs_a_port_and_defaults_to_loopback() {
+        assert_eq!(
+            probe_address(Some(7893), None).expect("default"),
+            "127.0.0.1:7893".parse().expect("addr")
+        );
+        assert_eq!(
+            probe_address(Some(7893), Some("::1")).expect("v6"),
+            "[::1]:7893".parse().expect("addr")
+        );
+        // No port is not a probe target, and port 0 is not either.
+        assert!(probe_address(None, None).is_err());
+        assert!(probe_address(Some(0), None).is_err());
+        // A host name is not resolved at load time; the definition must be
+        // explicit.
+        assert!(probe_address(Some(7893), Some("localhost")).is_err());
+    }
 
     #[test]
     fn text_and_json_share_the_lowercase_names() {

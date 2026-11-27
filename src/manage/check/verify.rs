@@ -597,6 +597,43 @@ mod tests {
     }
 
     #[test]
+    fn port_readiness_needs_a_port_and_no_capabilities() {
+        let value = |ready: &str, port: Option<u16>| {
+            let mut exec = json!({"path": "payload/bin/clock.sh", "ready": ready});
+            if let Some(port) = port {
+                exec["port"] = json!(port);
+            }
+            json!({
+                "schema": 1, "id": "clock", "name": "clock", "version": "1.0.0", "desc": "clock",
+                "platform": crate::platform::target(), "protocol": 1,
+                "exec": exec,
+                "interpreter": {"name": "sh"},
+                "files": [{"path": "payload/bin/clock.sh", "size": 10, "sha256": "00", "mode": 0o755}]
+            })
+        };
+        let bytes = serde_json::to_vec(&value("port", Some(7893))).expect("json");
+        validate_manifest(&parse_manifest(&bytes).expect("parse")).expect("valid port readiness");
+
+        let bytes = serde_json::to_vec(&value("port", None)).expect("json");
+        let error =
+            validate_manifest(&parse_manifest(&bytes).expect("parse")).expect_err("no port");
+        assert!(error.detail().contains("port is required"), "{error}");
+
+        let bytes = serde_json::to_vec(&value("exec", Some(7893))).expect("json");
+        let error =
+            validate_manifest(&parse_manifest(&bytes).expect("parse")).expect_err("stray port");
+        assert!(error.detail().contains("exec.port"), "{error}");
+
+        // A port-ready plugin has no protocol channel for capabilities.
+        let mut with_caps = value("port", Some(7893));
+        with_caps["capabilities"] =
+            json!([{"name": "status", "desc": "status", "inputSchema": {}}]);
+        let bytes = serde_json::to_vec(&with_caps).expect("json");
+        let error = validate_manifest(&parse_manifest(&bytes).expect("parse")).expect_err("caps");
+        assert!(error.detail().contains("capabilities"), "{error}");
+    }
+
+    #[test]
     fn a_started_action_is_validated_like_the_other_lifecycle_actions() {
         let files = vec![
             json!({"path": "payload/bin/clock.sh", "size": 10, "sha256": "00", "mode": 0o755}),

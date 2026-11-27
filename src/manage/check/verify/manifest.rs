@@ -211,21 +211,37 @@ fn check_compat(manifest: &Manifest) -> Result<(), ProblemError> {
 }
 
 fn check_ready(manifest: &Manifest) -> Result<(), ProblemError> {
-    match manifest.exec.ready.as_deref() {
-        None | Some("notify") | Some("exec") => Ok(()),
-        Some(other) => Err(Problem::Invalid.error(format!(
-            "exec.ready {:?} is invalid; expected notify or exec",
-            other
-        ))),
+    let ready = manifest.exec.ready.as_deref();
+    match ready {
+        None | Some("notify") | Some("exec") | Some("port") => {}
+        Some(other) => {
+            return Err(Problem::Invalid.error(format!(
+                "exec.ready {:?} is invalid; expected notify, exec or port",
+                other
+            )))
+        }
     }
+    let declares_probe = manifest.exec.port.is_some() || manifest.exec.probe_addr.is_some();
+    if ready == Some("port") {
+        crate::kernel::registry::probe_address(
+            manifest.exec.port,
+            manifest.exec.probe_addr.as_deref(),
+        )
+        .map_err(|error| Problem::Invalid.error(format!("exec: {}", error)))?;
+    } else if declares_probe {
+        return Err(Problem::Invalid
+            .error("exec.port / exec.probe_addr are only used with exec.ready = \"port\""));
+    }
+    Ok(())
 }
 
-/// A capabilities list requires a protocol channel, which an exec-ready process
-/// does not have (stdin is closed).
+/// A capabilities list requires a protocol channel, which neither an exec-ready
+/// process (stdin closed) nor a port-ready one (no channel at all) has.
 fn check_capabilities_with_exec(manifest: &Manifest) -> Result<(), ProblemError> {
-    if !manifest.capabilities.is_empty() && manifest.exec.ready.as_deref() == Some("exec") {
+    let no_channel = matches!(manifest.exec.ready.as_deref(), Some("exec") | Some("port"));
+    if !manifest.capabilities.is_empty() && no_channel {
         return Err(Problem::Invalid.error(
-            "exec.ready=exec cannot declare capabilities: the plugin has no protocol channel",
+            "exec.ready=exec/port cannot declare capabilities: the plugin has no protocol channel",
         ));
     }
     Ok(())

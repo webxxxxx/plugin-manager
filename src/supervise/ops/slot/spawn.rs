@@ -7,6 +7,15 @@ use super::*;
 impl Slot {
     pub(super) fn spawn_process(&mut self) -> Result<u32, String> {
         self.exit_while_tree_alive = None;
+        // `ready: port` must know whether the port is ours to take: a squatter
+        // would satisfy the probe and make a broken start look ready.
+        if let Ready::Port(addr) = self.exec.ready {
+            match std::net::TcpListener::bind(addr) {
+                // Was free a moment ago; the instance gets its chance now.
+                Ok(listener) => drop(listener),
+                Err(error) => return Err(format!("{} is not available: {}", addr, error)),
+            }
+        }
         if self.tree.is_none() {
             self.tree = crate::platform::host::process::Tree::new();
             if self.tree.is_none() {
@@ -29,7 +38,7 @@ impl Slot {
         command.env("SVCD_TEMP_DIR", &blob_dir);
         let plan = match self.exec.ready {
             Ready::Notify => Plan::notify(),
-            Ready::Exec => Plan::exec(self.frames.protocol()),
+            Ready::Exec | Ready::Port(_) => Plan::exec(self.frames.protocol()),
         };
         let (mut child, streams) =
             stdio::spawn(command, plan).map_err(|error| error.to_string())?;

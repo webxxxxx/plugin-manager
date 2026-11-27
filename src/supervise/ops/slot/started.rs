@@ -74,6 +74,12 @@ impl Slot {
         self.started.failure.take()
     }
 
+    /// Record why this attempt is failing before the state machine settles it
+    /// (a spawn that found the port taken, a probe that never connected).
+    pub(super) fn note_start_failure(&mut self, reason: String) {
+        self.started.failure = Some(reason);
+    }
+
     /// Consume a Ready event into the started action when this spawn owes one.
     fn gate_ready(&mut self, pid: u32, now: u64) -> bool {
         if !crate::supervise::check::started::takes_ready(
