@@ -399,6 +399,64 @@ const CHECKS = [
       );
     },
   },
+  {
+    id: "space-recovery-is-conservative",
+    run(page) {
+      const recover = new Function("data", functionBody(page, "spaceRecovery"));
+      // Uninstalling returns `installed` to the volume; covering the whole
+      // `need` with it is the test that holds whether or not the host counts
+      // the old copy inside `need`.
+      const fits = recover({ id: "demo", need: 100, installed: 40, roots: [{ root: "/r", free: 70 }] });
+      if (!fits.canUninstall) {
+        throw new Error("a refusal that uninstalling resolves must offer it");
+      }
+      const short = recover({ id: "demo", need: 100, installed: 10, roots: [{ root: "/r", free: 70 }] });
+      if (short.canUninstall) {
+        throw new Error("offering an uninstall that cannot help is a dead end");
+      }
+      const fresh = recover({ id: "demo", need: 100, installed: 0, roots: [{ root: "/r", free: 70 }] });
+      if (fresh.canUninstall) {
+        throw new Error("a fresh install has nothing to uninstall");
+      }
+      const unknown = recover(null);
+      if (unknown.canUninstall || unknown.free !== null) {
+        throw new Error("no data means no offer");
+      }
+      return "the recovery offer follows the host's numbers";
+    },
+    mutate(page) {
+      return page.replace("free + installed >= need", "free >= need");
+    },
+  },
+  {
+    id: "space-refusal-asks-and-keeps-config",
+    run(page) {
+      const upload = functionBody(page, "uploadInstall");
+      if (!upload.includes("refusal.status === 507")) {
+        throw new Error("a 507 must be recognised by status, not by its message");
+      }
+      if (!upload.includes("askToUninstall(refusal, file, root)")) {
+        throw new Error("a 507 must open the recovery dialog");
+      }
+      if (upload.includes("errorText(response)")) {
+        throw new Error("the 507 body must be read as data, not flattened to a sentence");
+      }
+      const dialog = functionBody(page, "askToUninstall");
+      if (!dialog.includes("'DELETE'")) {
+        throw new Error("the recovery must uninstall the old version");
+      }
+      if (/purge/.test(dialog)) {
+        throw new Error("the uninstall must keep config/ and data/: no purge");
+      }
+      return "a 507 opens a dialog whose uninstall keeps the plugin's config";
+    },
+    mutate(page) {
+      return page.replace(
+        "'/api/v1/plugins/' + encodeURIComponent(plan.id)",
+        "'/api/v1/plugins/' + encodeURIComponent(plan.id) + '?purge=true'",
+      );
+    },
+  },
 ];
 
 function runAll(page) {

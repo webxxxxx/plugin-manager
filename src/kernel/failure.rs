@@ -272,10 +272,15 @@ impl Problem {
 /// 对外投影只读类别。类别在**抛出处**给定（#151 起 `package`/`plugin`/
 /// `trust`/`transfer`/`interpreter`/`hook`/`bundle` 都返回本类型），进入
 /// `ProblemError` 之后，上层不得再解析 `detail`。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProblemError {
     pub problem: Problem,
     pub detail: String,
+    /// 机读载荷：`detail` 给人看，这块给界面用（例如空间拒绝的
+    /// `need` / `installed` / `roots`，让调用方能弹一个「卸载再装」）。
+    ///
+    /// 上层照旧不得解析 `detail`；需要数字就加在这里，加在抛出处。
+    pub data: Option<serde_json::Value>,
 }
 
 impl ProblemError {
@@ -283,7 +288,18 @@ impl ProblemError {
         ProblemError {
             problem,
             detail: detail.into(),
+            data: None,
         }
+    }
+
+    /// 附上机读载荷。投影层有它才写 `error.data`，没有就不写这个键。
+    pub fn with_data(mut self, data: serde_json::Value) -> ProblemError {
+        self.data = Some(data);
+        self
+    }
+
+    pub fn data(&self) -> Option<&serde_json::Value> {
+        self.data.as_ref()
     }
 
     pub fn detail(&self) -> &str {

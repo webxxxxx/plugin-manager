@@ -200,7 +200,7 @@ pub(crate) fn status_for_problem_error(error: &ProblemError) -> u16 {
 /// writes. One implementation, so no route re-derives the status.
 pub(crate) fn problem_response(refusal: &ProblemError) -> Vec<u8> {
     let status = status_for_problem_error(refusal);
-    error(status, code_for(status), refusal.detail())
+    http::json_error_with_data(status, code_for(status), refusal.detail(), refusal.data())
 }
 
 /// A storage refusal as the HTTP error envelope (see [`status_for_storage`]).
@@ -286,6 +286,7 @@ mod tests {
             (Problem::UnsupportedPlatform, 400),
             (Problem::MissingDependency, 400),
             (Problem::TooLarge, 413),
+            (Problem::InsufficientSpace, 507),
             (Problem::Timeout, 504),
             (Problem::Internal, 500),
         ];
@@ -299,6 +300,25 @@ mod tests {
                 problem.as_str()
             );
         }
+    }
+
+    /// A refusal that carries numbers must project them into `error.data`: a
+    /// dialog cannot run on a sentence. A refusal without data keeps the
+    /// envelope it always had.
+    #[test]
+    fn a_refusal_payload_reaches_the_body() {
+        let refusal = Problem::InsufficientSpace
+            .error("need 10")
+            .with_data(serde_json::json!({ "need": 10, "installed": 4 }));
+        let text = String::from_utf8(problem_response(&refusal)).expect("utf8");
+        assert!(text.contains("HTTP/1.1 507"), "{text}");
+        assert!(text.contains("\"code\":\"insufficient_space\""), "{text}");
+        assert!(text.contains("\"need\":10"), "{text}");
+        assert!(text.contains("\"installed\":4"), "{text}");
+
+        let plain =
+            String::from_utf8(problem_response(&Problem::Invalid.error("no"))).expect("utf8");
+        assert!(!plain.contains("\"data\""), "a payload is opt-in: {plain}");
     }
 
     /// The storage taxonomy reuses the management table and adds exactly one

@@ -37,6 +37,11 @@ pub(crate) fn install_root(
         None => None,
     };
 
+    // One lookup for the refusal payload: how much an uninstall would return.
+    // It is 0 when nothing is installed, which is the whole answer for a fresh
+    // install.
+    let installed = crate::manage::installed_version_bytes(paths, id);
+
     if let Some(recorded) = crate::platform::locations::root_of(paths, id) {
         if let Some(requested) = &requested {
             if normalize(requested) != normalize(&recorded) {
@@ -51,31 +56,40 @@ pub(crate) fn install_root(
         // The old copy stays on the volume while the new one is staged, so a
         // root that cannot hold `needed` (the caller counts both) is refused
         // here with numbers instead of failing halfway through a staging tree.
-        require_room(&recorded, needed)?;
+        require_room(&recorded, id, needed, installed)?;
         return Ok(recorded);
     }
 
     if let Some(requested) = requested {
-        require_room(&requested, needed)?;
+        require_room(&requested, id, needed, installed)?;
         return Ok(requested);
     }
 
     let candidates = candidates(paths);
-    choose_root(&candidates, needed).ok_or_else(|| insufficient(&candidates, needed, None))
+    choose_root(&candidates, needed)
+        .ok_or_else(|| insufficient(&candidates, needed, id, installed, None))
 }
 
 /// `root` needs `needed` bytes of room, or the install is refused with the
 /// numbers. A root the platform cannot measure is left to fail on its own
 /// write: refusing here would block a root that is simply not readable yet.
-fn require_room(root: &Path, needed: u64) -> Result<(), ProblemError> {
-    require_room_at(root, needed, crate::platform::locations::free_bytes)
+fn require_room(root: &Path, id: &str, needed: u64, installed: u64) -> Result<(), ProblemError> {
+    require_room_at(
+        root,
+        id,
+        needed,
+        installed,
+        crate::platform::locations::free_bytes,
+    )
 }
 
 /// The check with the measurement injected, so the refusal is testable without
 /// filling a real volume.
 fn require_room_at(
     root: &Path,
+    id: &str,
     needed: u64,
+    installed: u64,
     free: impl Fn(&Path) -> Option<u64>,
 ) -> Result<(), ProblemError> {
     let Some(free) = free(root) else {
@@ -85,6 +99,8 @@ fn require_room_at(
         return Err(insufficient(
             &[(root.to_path_buf(), Some(free))],
             needed,
+            id,
+            installed,
             Some(root),
         ));
     }
@@ -140,7 +156,18 @@ pub(crate) fn choose_root(candidates: &[Candidate], needed: u64) -> Option<PathB
 /// The structured space refusal: its own category (HTTP 507) so a caller can
 /// offer "uninstall the old version and retry" instead of showing a server
 /// error, and the message carries the numbers.
-fn insufficient(candidates: &[Candidate], needed: u64, recorded: Option<&Path>) -> ProblemError {
+///
+/// The same numbers also go into `data`, because a caller cannot drive a
+/// dialog off a sentence: `id` says which plugin to uninstall, `installed`
+/// how much that returns, `need` what the check compared against, and `roots`
+/// what each candidate had free.
+fn insufficient(
+    candidates: &[Candidate],
+    needed: u64,
+    id: &str,
+    installed: u64,
+    recorded: Option<&Path>,
+) -> ProblemError {
     let rows: Vec<String> = candidates
         .iter()
         .map(|(root, free)| match free {
@@ -156,12 +183,30 @@ fn insufficient(candidates: &[Candidate], needed: u64, recorded: Option<&Path>) 
             )
         })
         .unwrap_or_default();
-    Problem::InsufficientSpace.error(format!(
-        "not enough space to install: need {} bytes, {}; free space on the volume or uninstall the old version first{}",
-        needed,
-        rows.join(", "),
-        old
-    ))
+    let roots: Vec<serde_json::Value> = candidates
+        .iter()
+        .map(|(root, free)| {
+            serde_json::json!({
+                "root": root.display().to_string(),
+                // A volume the platform could not measure stays `null`: the
+                // caller must not read "unknown" as "empty".
+                "free": free,
+            })
+        })
+        .collect();
+    Problem::InsufficientSpace
+        .error(format!(
+            "not enough space to install: need {} bytes, {}; free space on the volume or uninstall the old version first{}",
+            needed,
+            rows.join(", "),
+            old
+        ))
+        .with_data(serde_json::json!({
+            "id": id,
+            "need": needed,
+            "installed": installed,
+            "roots": roots,
+        }))
 }
 
 /// A lexical fallback for a root that does not exist yet: canonicalize answers
@@ -281,16 +326,31 @@ mod tests {
     /// refusal, not a half-written staging tree.
     #[test]
     fn a_recorded_root_that_cannot_hold_old_and_new_is_a_space_refusal() {
-        let error = require_room_at(Path::new("/data/plugins"), 31_400_000, |_| Some(17_500_000))
-            .expect_err("no room for both copies");
+        let error = require_room_at(
+            Path::new("/data/plugins"),
+            "demo",
+            31_400_000,
+            12_000_000,
+            |_| Some(17_500_000),
+        )
+        .expect_err("no room for both copies");
         assert_eq!(error.problem, Problem::InsufficientSpace);
         assert!(error.detail().contains("31400000"), "{error}");
         assert!(error.detail().contains("17500000"), "{error}");
         assert!(error.detail().contains("/data/plugins"), "{error}");
 
+        // The payload is what a dialog runs on: which plugin to uninstall,
+        // what the check needed, and how much an uninstall would return.
+        let data = error.data().expect("the refusal carries numbers");
+        assert_eq!(data["id"], "demo");
+        assert_eq!(data["need"], 31_400_000u64);
+        assert_eq!(data["installed"], 12_000_000u64);
+        assert_eq!(data["roots"][0]["root"], "/data/plugins");
+        assert_eq!(data["roots"][0]["free"], 17_500_000u64);
+
         // Enough room, or an unmeasurable root, is not a refusal.
-        assert!(require_room_at(Path::new("/data"), 10, |_| Some(11)).is_ok());
-        assert!(require_room_at(Path::new("/mnt/sd"), 10, |_| None).is_ok());
+        assert!(require_room_at(Path::new("/data"), "demo", 10, 0, |_| Some(11)).is_ok());
+        assert!(require_room_at(Path::new("/mnt/sd"), "demo", 10, 0, |_| None).is_ok());
     }
 
     #[test]
@@ -298,6 +358,8 @@ mod tests {
         let error = insufficient(
             &[candidate("/tiny", Some(1)), candidate("/gone", None)],
             10,
+            "demo",
+            4096,
             Some(Path::new("/tiny")),
         );
         let text = error.detail();
@@ -306,5 +368,11 @@ mod tests {
         assert!(text.contains("/gone is not available"), "{text}");
         assert!(text.contains("/tiny still takes room"), "{text}");
         assert_eq!(error.problem, Problem::InsufficientSpace);
+
+        // One row per candidate, and an unmeasured root stays null rather than
+        // being reported as empty.
+        let data = error.data().expect("the refusal carries numbers");
+        assert_eq!(data["roots"][1]["root"], "/gone");
+        assert!(data["roots"][1]["free"].is_null(), "{data}");
     }
 }

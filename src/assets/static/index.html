@@ -246,6 +246,20 @@ async function errorText(response) {
   return 'HTTP ' + response.status;
 }
 
+// A refusal as both halves: the sentence to show, and the `error.data` a
+// dialog can act on. A body that is not JSON keeps the status only (#328).
+async function refusalOf(response) {
+  const refusal = { status: response.status, message: 'HTTP ' + response.status, data: null };
+  try {
+    const body = await response.json();
+    if (body && body.error) {
+      refusal.message = body.error.message || body.error.code || refusal.message;
+      refusal.data = body.error.data || null;
+    }
+  } catch (_) {}
+  return refusal;
+}
+
 async function api(path, options) {
   options = options || {};
   const response = await fetch(path, Object.assign({ credentials: 'same-origin' }, options, {
@@ -564,9 +578,17 @@ function uploadInstall(file, backup, root) {
     headers: authHeaders({ 'Content-Type': 'application/octet-stream' }),
     body: file
   }).then(async function (response) {
-    if (!response.ok) throw new Error(await errorText(response));
-    return response.json();
+    if (response.ok) return response.json();
+    const refusal = await refusalOf(response);
+    // 507 carries the numbers a dialog runs on; every other refusal is just a
+    // sentence. A backup has nowhere else to go, so it keeps the plain toast.
+    if (refusal.status === 507 && !backup) {
+      askToUninstall(refusal, file, root);
+      return null;
+    }
+    throw new Error(refusal.message);
   }).then(function (body) {
+    if (!body) return;
     if (backup) {
       toast('已导入备份 ' + body.id + (body.configApplied ? '（含当前配置）' : ''), 'ok');
     } else {
@@ -579,6 +601,100 @@ function uploadInstall(file, backup, root) {
     lock(false);
     load();
   });
+}
+
+// What a space refusal justifies, as a value: the numbers come from the host
+// (`error.data`), never from the sentence. `canUninstall` is deliberately the
+// conservative test — freeing the old copy has to cover the whole `need`, so it
+// holds whether or not the host counts that copy inside `need` (#328).
+function spaceRecovery(data) {
+  const need = Number((data && data.need) || 0);
+  const installed = Number((data && data.installed) || 0);
+  const id = (data && data.id) || '';
+  const rows = (data && data.roots) || [];
+  let free = null;
+  rows.forEach(function (row) {
+    if (!row || typeof row.free !== 'number') return;
+    free = free === null ? row.free : Math.max(free, row.free);
+  });
+  return {
+    id: id,
+    need: need,
+    installed: installed,
+    free: free,
+    canUninstall: id !== '' && installed > 0 && free !== null && free + installed >= need
+  };
+}
+
+// The one action the host can offer for a 507: remove the version this install
+// replaces, then retry. The uninstall keeps `config/` and `data/` (no `purge`),
+// so the retry finds the plugin's settings again — the same promise the store's
+// dialog makes. Freeing space by hand stays the operator's job.
+function askToUninstall(refusal, file, root) {
+  const plan = spaceRecovery(refusal.data);
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  const panel = document.createElement('div');
+  panel.className = 'panel';
+  panel.style.width = '520px';
+  panel.style.maxWidth = '92vw';
+
+  const title = document.createElement('h1');
+  title.textContent = '空间不足';
+  title.style.fontSize = '16px';
+  title.style.margin = '0 0 6px';
+  panel.appendChild(title);
+
+  const rows = (refusal.data && refusal.data.roots) || [];
+  const room = rows.map(function (row) {
+    return row.root + (typeof row.free === 'number' ? ' ' + settingsBytesText(row.free) + ' 空闲' : ' 空间未知');
+  }).join('；');
+  const hint = document.createElement('p');
+  hint.className = 'muted';
+  hint.style.margin = '0 0 10px';
+  let text = refusal.message;
+  if (refusal.data) {
+    text = '这个包装不下：需要 ' + settingsBytesText(plan.need) + (room ? '，' + room : '') + '。';
+    if (plan.installed > 0) {
+      text += '已安装的 ' + plan.id + ' 占 ' + settingsBytesText(plan.installed) +
+        (plan.canUninstall ? '，卸载后可回收。' : '；即使卸载也不够，需要先腾出空间或换一个插件根。');
+    } else {
+      text += '请先腾出空间，或换一个插件根。';
+    }
+  }
+  hint.textContent = text;
+  panel.appendChild(hint);
+
+  const actions = document.createElement('div');
+  actions.className = 'row';
+  actions.style.justifyContent = 'flex-end';
+  actions.style.gap = '8px';
+  actions.style.marginTop = '12px';
+  const cancel = button('取消', 'ghost', function () { modal.remove(); });
+  actions.appendChild(cancel);
+  if (plan.canUninstall) {
+    actions.appendChild(button('卸载旧版并安装', '', function () {
+      modal.remove();
+      lock(true);
+      fetch('/api/v1/plugins/' + encodeURIComponent(plan.id), {
+        method: 'DELETE',
+        credentials: 'same-origin',
+        headers: authHeaders()
+      }).then(async function (response) {
+        if (!response.ok) throw new Error(await errorText(response));
+        // Same file, same root: the retry is the install that just failed.
+        uploadInstall(file, false, root);
+      }).catch(function (error) {
+        lock(false);
+        toast('卸载失败：' + error.message, 'err');
+      });
+    }));
+  }
+  panel.appendChild(actions);
+
+  modal.onclick = function (event) { if (event.target === modal) cancel.onclick(); };
+  modal.appendChild(panel);
+  document.body.appendChild(modal);
 }
 
 function addTrust() {

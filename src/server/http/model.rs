@@ -537,12 +537,31 @@ pub(crate) fn code_for(status: u16) -> &'static str {
         413 => "payload_too_large",
         431 => "headers_too_large",
         504 => "timeout",
+        // WebDAV's "the volume cannot hold it": an operator action, and the
+        // one refusal a caller can turn into a dialog. A client that keys on
+        // the code (not the message) needs this branch to see it at all.
+        507 => "insufficient_space",
         _ => "internal",
     }
 }
 
 pub fn json_error(status: u16, code: &str, message: &str) -> Vec<u8> {
-    let body = json!({ "error": { "code": code, "message": message } });
+    json_error_with_data(status, code, message, None)
+}
+
+/// The same envelope with the refusal's machine-readable payload. The key is
+/// absent when there is nothing to carry, so a caller checking `error.data`
+/// sees "not provided" rather than an empty object.
+pub fn json_error_with_data(
+    status: u16,
+    code: &str,
+    message: &str,
+    data: Option<&serde_json::Value>,
+) -> Vec<u8> {
+    let mut body = json!({ "error": { "code": code, "message": message } });
+    if let Some(data) = data {
+        body["error"]["data"] = data.clone();
+    }
     response(
         status,
         "application/json",
