@@ -9,13 +9,20 @@
 
 use super::*;
 
+/// Why the last attempt failed to start. `timeout` picks the API's 504 instead
+/// of a generic 500 (#341).
+pub(crate) struct StartFailure {
+    pub(crate) reason: String,
+    pub(crate) timeout: bool,
+}
+
 /// One spawn's post-ready phase: the action, whether this spawn still owes it,
 /// the pid whose Ready is withheld, and why the attempt failed.
 pub(super) struct StartedFlow {
     run: Option<ActionRun>,
     owed: bool,
     pending: Option<u32>,
-    failure: Option<String>,
+    failure: Option<StartFailure>,
 }
 
 impl StartedFlow {
@@ -26,6 +33,12 @@ impl StartedFlow {
             pending: None,
             failure: None,
         }
+    }
+
+    /// Whether the action is running: the start window is suspended while it
+    /// is, because its own timeout is the bound for this phase (#341).
+    pub(super) fn running(&self) -> bool {
+        self.run.is_some()
     }
 }
 
@@ -45,7 +58,7 @@ impl Slot {
         if self.started.run.is_some() {
             if let Event::Exited { code, .. } = event {
                 if self.machine.state == State::Starting {
-                    self.started.failure = Some(format!(
+                    self.note_start_failure(format!(
                         "service exited (code {}) while the started action ran",
                         code.map(|code| code.to_string())
                             .unwrap_or_else(|| "none".into())
@@ -53,6 +66,16 @@ impl Slot {
                 }
             }
             self.abort_started();
+        }
+        // A port-ready instance that dies before accepting leaves the start
+        // request waiting for a window it can no longer use: name the address
+        // so the failure is not a generic timeout (#341).
+        if let Event::Exited { .. } = event {
+            if self.machine.state == State::Starting {
+                if let Some(addr) = self.port.as_ref().map(|probe| probe.addr()) {
+                    self.note_start_failure(format!("port {} never accepted a connection", addr));
+                }
+            }
         }
         false
     }
@@ -70,14 +93,25 @@ impl Slot {
 
     /// Why the last attempt failed to start; the start request reads it once so
     /// it fails fast instead of waiting out the window.
-    pub(crate) fn take_start_failure(&mut self) -> Option<String> {
+    pub(crate) fn take_start_failure(&mut self) -> Option<StartFailure> {
         self.started.failure.take()
     }
 
     /// Record why this attempt is failing before the state machine settles it
-    /// (a spawn that found the port taken, a probe that never connected).
+    /// (a spawn that found the port taken, an action that exited non-zero).
     pub(super) fn note_start_failure(&mut self, reason: String) {
-        self.started.failure = Some(reason);
+        self.started.failure = Some(StartFailure {
+            reason,
+            timeout: false,
+        });
+    }
+
+    /// A start window that ran out: the caller maps it to a 504, not a 500.
+    pub(super) fn note_start_timeout(&mut self, reason: String) {
+        self.started.failure = Some(StartFailure {
+            reason,
+            timeout: true,
+        });
     }
 
     /// Consume a Ready event into the started action when this spawn owes one.
@@ -94,8 +128,9 @@ impl Slot {
         match self.spawn_started(now) {
             Ok(()) => {
                 self.started.pending = Some(pid);
-                // The start window now belongs to the action: its own deadline
-                // bounds it, so the ready window cannot fire underneath it.
+                // The start window is suspended while the action runs
+                // (`check_timers` skips it), so only the action's own deadline
+                // bounds this phase (#341).
                 self.start_deadline = None;
             }
             Err(error) => {
@@ -103,7 +138,7 @@ impl Slot {
                     "{}: started action failed to spawn: {}; the start fails",
                     self.id, error
                 );
-                self.started.failure = Some(format!("started action could not run: {error}"));
+                self.note_start_failure(format!("started action could not run: {error}"));
                 let actions = self.machine.step(Event::StartTimeout, now);
                 self.run_actions(actions, now);
             }
@@ -133,12 +168,12 @@ impl Slot {
             }
             ActionEnd::Exited(status) => {
                 self.started.pending = None;
-                self.started.failure = Some(format!("started action exited {status}"));
+                self.note_start_failure(format!("started action exited {status}"));
                 self.fail_started(now);
             }
             ActionEnd::TimedOut => {
                 self.started.pending = None;
-                self.started.failure = Some("started action timed out".into());
+                self.note_start_timeout("started action timed out".into());
                 self.fail_started(now);
             }
         }
@@ -156,8 +191,8 @@ impl Slot {
     }
 
     fn fail_started(&mut self, now: u64) {
-        if let Some(reason) = self.started.failure.as_deref() {
-            error!("{}: {}; the start fails", self.id, reason);
+        if let Some(failure) = self.started.failure.as_ref() {
+            error!("{}: {}; the start fails", self.id, failure.reason);
         }
         // The instance is already up but unusable: stop it the way a start
         // timeout does (polite signal, kill window, then the stop action).
@@ -171,7 +206,10 @@ impl Slot {
             .as_ref()
             .and_then(|lifecycle| lifecycle.started.clone())
         else {
-            return Ok(());
+            // `owed` only opens this gate when the definition declares the
+            // action, so a missing hook is a bug in that predicate, not a
+            // silent success: failing loudly beats a start with no deadline.
+            return Err("no started action".into());
         };
         let command = hook_command(
             &self.id,

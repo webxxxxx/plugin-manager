@@ -64,7 +64,7 @@ impl PortProbe {
         self.pid
     }
 
-    fn addr(&self) -> SocketAddr {
+    pub(super) fn addr(&self) -> SocketAddr {
         self.addr
     }
 }
@@ -91,7 +91,9 @@ impl Slot {
             // report something better than "timed out". The timeout itself is
             // applied by `check_timers` in this same tick.
             if self.start_deadline.is_some_and(|deadline| now >= deadline) {
-                self.note_start_failure(format!(
+                // A window that ran out is a 504 at the API, like every other
+                // start timeout (#341).
+                self.note_start_timeout(format!(
                     "port {} never accepted a connection",
                     probe.addr()
                 ));
@@ -104,7 +106,9 @@ impl Slot {
         self.apply(Event::Ready { pid }, now);
     }
 
-    /// Drop a pending probe (a new attempt or a stop owns the port now).
+    /// Drop a pending probe: a new attempt owns the port now. A stop or an exit
+    /// drops it through `check_port_ready`, whose state guard discards a verdict
+    /// that belongs to an older instance.
     pub(super) fn abort_port(&mut self) {
         self.port = None;
     }

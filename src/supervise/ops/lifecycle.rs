@@ -152,15 +152,22 @@ impl Supervisor {
             for id in &pending {
                 // A post-ready or preparation action failed: report the reason
                 // now instead of waiting out the whole window.
-                if let Some(reason) = self
+                if let Some(failure) = self
                     .slots
                     .get_mut(id)
                     .and_then(|slot| slot.take_start_failure())
                 {
-                    error!("{}: the start failed: {}", id, reason);
+                    error!("{}: the start failed: {}", id, failure.reason);
+                    // A window that ran out is the documented 504; a failed
+                    // action or spawn is a 500 that carries the same detail.
+                    let problem = if failure.timeout {
+                        Problem::Timeout
+                    } else {
+                        Problem::Internal
+                    };
                     return Err(ProblemError::new(
-                        Problem::Internal,
-                        format!("service {} failed to start: {}", id, reason),
+                        problem,
+                        format!("service {} failed to start: {}", id, failure.reason),
                     ));
                 }
                 let slot = &self.slots[id];
@@ -494,9 +501,10 @@ fn shutdown_layers(registry: &Registry, ids: Vec<String>) -> (Vec<Vec<String>>, 
     }
 }
 
-/// The longest start action among these services, or zero when none declares
-/// one. The process window only opens once a start action finishes, so a start
-/// request has to budget for it.
+/// The longest combined start + started action budget among these services, or
+/// zero when none declares one. The process window only opens once a start
+/// action finishes, and the started action runs inside the same request, so a
+/// start request has to budget for both.
 fn start_action_budget<'a>(services: impl Iterator<Item = &'a Service>) -> u64 {
     services
         .filter_map(|service| service.lifecycle.as_ref())
