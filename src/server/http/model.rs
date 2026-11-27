@@ -2,6 +2,8 @@
 
 use serde_json::json;
 
+use crate::kernel::failure::SpaceShortfall;
+
 #[cfg(feature = "http")]
 pub use super::date::{http_date, parse_http_date};
 
@@ -552,15 +554,21 @@ pub fn json_error(status: u16, code: &str, message: &str) -> Vec<u8> {
 /// The same envelope with the refusal's machine-readable payload. The key is
 /// absent when there is nothing to carry, so a caller checking `error.data`
 /// sees "not provided" rather than an empty object.
+///
+/// The shape belongs to the type (`kernel::failure::SpaceShortfall`); this is
+/// the only place it becomes JSON, so the wire keeps one encoder (#331).
 pub fn json_error_with_data(
     status: u16,
     code: &str,
     message: &str,
-    data: Option<&serde_json::Value>,
+    shortfall: Option<&SpaceShortfall>,
 ) -> Vec<u8> {
     let mut body = json!({ "error": { "code": code, "message": message } });
-    if let Some(data) = data {
-        body["error"]["data"] = data.clone();
+    if let Some(shortfall) = shortfall {
+        // The payload is strings, numbers and nulls, so this cannot fail; if it
+        // ever did, a response path degrades to `data: null` rather than
+        // panicking (the same choice as the `to_vec` below).
+        body["error"]["data"] = serde_json::to_value(shortfall).unwrap_or(serde_json::Value::Null);
     }
     response(
         status,

@@ -266,21 +266,58 @@ impl Problem {
     }
 }
 
+/// 一次空间拒绝的机读载荷（HTTP 507）。
+///
+/// `detail` 是给人看的一句话，这块是同一组事实的机读形状：调用方（控制台、
+/// 脚本）拿它决定卸载谁、腾多少。做成类型而不是无类型 JSON，是因为写端与
+/// 读端只靠字符串键对齐时，拼错一个键只会安静地少一个字段（#331）。
+///
+/// 线上形状由 `Serialize` 的字段名定，改名字等于改契约；它变成 JSON 只在
+/// `server::http::model::json_error_with_data` 一处。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SpaceShortfall {
+    /// 该卸载哪个插件：`installed` 的字节数来自它。
+    pub id: String,
+    /// 这次检查要求的字节数：只算这次要写入的新树，不含盘上已有的旧版
+    /// （旧版的字节已经不在 `free` 里，#329）。
+    pub need: u64,
+    /// 旧版目录的实际占用：卸载它能还回 `root` 的字节数；没装过就是 0。
+    pub installed: u64,
+    /// 检查跑在哪个根上：卸载只往这个根还空间。没选根（自动选根时全都装
+    /// 不下）为 `None`，线上是 `null`。
+    pub root: Option<String>,
+    /// 这次检查问过的根，和它们各自量到的空闲字节。`require_room*` 只问了
+    /// 一个根（记录根或显式 `--root`）时这里就一行；自动选根时是全部候选，
+    /// 顺序即配置顺序。
+    pub roots: Vec<RootRoom>,
+}
+
+/// `roots` 里的一行：一个根，和它还剩多少空闲字节。
+///
+/// `free` 为 `None`（线上 `null`）是「量不到」，不是 0：平台读不出这个卷的
+/// 剩余空间时，调用方不得把它当成已满或已空。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RootRoom {
+    pub root: String,
+    pub free: Option<u64>,
+}
+
 /// 一次管理操作的失败：类别 + 只给人看的细节。
 ///
 /// `detail` 会原样成为 JSON-RPC `error.message`；类别走 `error.data.kind`，
 /// 对外投影只读类别。类别在**抛出处**给定（#151 起 `package`/`plugin`/
 /// `trust`/`transfer`/`interpreter`/`hook`/`bundle` 都返回本类型），进入
 /// `ProblemError` 之后，上层不得再解析 `detail`。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProblemError {
     pub problem: Problem,
     pub detail: String,
     /// 机读载荷：`detail` 给人看，这块给界面用（例如空间拒绝的
     /// `need` / `installed` / `roots`，让调用方能弹一个「卸载再装」）。
     ///
+    /// 今天只有空间拒绝带载荷，所以是具体类型；出现第二种再换成和类型。
     /// 上层照旧不得解析 `detail`；需要数字就加在这里，加在抛出处。
-    pub data: Option<serde_json::Value>,
+    pub shortfall: Option<SpaceShortfall>,
 }
 
 impl ProblemError {
@@ -288,18 +325,21 @@ impl ProblemError {
         ProblemError {
             problem,
             detail: detail.into(),
-            data: None,
+            shortfall: None,
         }
     }
 
-    /// 附上机读载荷。投影层有它才写 `error.data`，没有就不写这个键。
-    pub fn with_data(mut self, data: serde_json::Value) -> ProblemError {
-        self.data = Some(data);
+    /// 附上 507 的机读载荷。投影层有它才写 `error.data`，没有就不写这个键。
+    pub fn with_shortfall(mut self, shortfall: SpaceShortfall) -> ProblemError {
+        self.shortfall = Some(shortfall);
         self
     }
 
-    pub fn data(&self) -> Option<&serde_json::Value> {
-        self.data.as_ref()
+    /// The payload only reaches the wire through the HTTP face, so a build
+    /// without that face has no reader for it (`--no-default-features`).
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
+    pub fn shortfall(&self) -> Option<&SpaceShortfall> {
+        self.shortfall.as_ref()
     }
 
     pub fn detail(&self) -> &str {
@@ -411,6 +451,42 @@ mod tests {
         }));
         assert_eq!(busy.class, Class::Busy);
         assert_eq!(busy.retry, Class::Busy.default_retry());
+    }
+
+    fn shortfall(need: u64) -> SpaceShortfall {
+        SpaceShortfall {
+            id: "demo".into(),
+            need,
+            installed: 4,
+            root: None,
+            roots: Vec::new(),
+        }
+    }
+
+    /// The 507 payload used to be a `serde_json::Value`, and `Value` is not
+    /// `Eq`, so `ProblemError` lost the bound (#328) and had to drop it (#331).
+    /// The typed payload brings it back: an implementation detail no longer
+    /// narrows what callers may assume about the public error type.
+    #[test]
+    fn a_problem_error_is_equality_comparable_again() {
+        fn is_eq<T: Eq>(left: &T, right: &T) -> bool {
+            left == right
+        }
+
+        let same = Problem::InsufficientSpace
+            .error("need 10")
+            .with_shortfall(shortfall(10));
+        let copy = Problem::InsufficientSpace
+            .error("need 10")
+            .with_shortfall(shortfall(10));
+        assert!(is_eq(&same, &copy));
+
+        // The payload takes part in equality: another shortfall is another
+        // refusal even when the sentence is the same.
+        let other = Problem::InsufficientSpace
+            .error("need 10")
+            .with_shortfall(shortfall(11));
+        assert!(!is_eq(&same, &other));
     }
 
     #[test]
