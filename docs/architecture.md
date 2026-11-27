@@ -460,6 +460,7 @@ flowchart LR
 | 0029 静态站点挂在 `/static/` | `face/static_site` + `face/asset` + `platform/settings` |
 | 0030 插件根与位置索引 | `platform/paths` + `platform/locations` + `kernel/layout` + `manage/ops/scan` |
 | 0031 停止的树不只是进程组 | `platform/host/process` + `supervise/ops/slot/{tree,stop}` |
+| 0032 厂商后台免登录 | `face/vendor_login` + `face/fallback` + `server/auth/lan` |
 
 ## 15. 已定的命名与决策
 

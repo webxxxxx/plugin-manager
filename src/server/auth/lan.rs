@@ -122,6 +122,17 @@ impl Lan {
         }
     }
 
+    /// Mint a session without a password check. Only the vendor-backend
+    /// handoff (`/vendor-login`) uses it: the caller has already established
+    /// that the browser's own router session is logged in, and this session is
+    /// shaped exactly like a password login.
+    pub fn issue_session(&mut self) -> String {
+        let session = new_token();
+        self.sessions
+            .insert(session.clone(), Instant::now() + SESSION_TTL);
+        session
+    }
+
     pub fn authenticate(&mut self, headers: &[(String, String)]) -> Result<AuthKind, ()> {
         if !self.require_auth {
             return Ok(AuthKind::None);

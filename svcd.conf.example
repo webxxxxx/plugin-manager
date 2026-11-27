@@ -29,6 +29,16 @@ bind = 127.0.0.1:8787
 # accepting an unsigned package. There is no per-install flag or console option.
 # allow_insecure_install = false
 
+# Vendor-backend login handoff (ADR-0032). Default false: the console always
+# requires auth_passwd. Set this to true on a device whose only management entry
+# is the vendor web UI on the same host (:80): a logged-in vendor session may
+# exchange itself for a svcd session through POST /vendor-login, so the console
+# on :8787 opens without a second login. The request must come from the device's
+# own web root (same host, port 80/443) and assert X-Vendor-OK. While it is on,
+# a non-browser client that can reach :8787 can forge those headers and mint an
+# admin session; leave it off unless the vendor UI is the device's perimeter.
+# vendor_login = false
+
 # The three roots. Everything else derives from them:
 #   config_dir -> svcd.conf, services.d/, trust.d/, compat.conf
 #   data_dir   -> temp/, run/ (control socket and http.port), and plugins/

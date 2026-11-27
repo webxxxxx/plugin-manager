@@ -159,6 +159,10 @@ pub struct Settings {
     /// Allow installs to fall back to accepting a package whose signature
     /// cannot be verified. Default `false`: unsigned packages are rejected.
     pub allow_insecure_install: bool,
+    /// Trust the vendor backend's own login for the console: `POST
+    /// /vendor-login` mints a session from the device's :80 web root instead of
+    /// `auth_passwd`. Off by default (ADR-0032).
+    pub vendor_login: bool,
     /// Ask which plugin root a package goes to (#299). Off means the host picks
     /// the smallest root with room, which is what it did before the switch
     /// existed. Unset counts as on: the console offers the choice.
@@ -191,6 +195,10 @@ impl Settings {
 }
 
 mod env;
+mod values;
+
+pub use values::parse_byte_size;
+use values::{parse_bool, parse_u64, parse_usize, strip_comment};
 
 pub(crate) use env::ENV_KEYS;
 
@@ -320,6 +328,11 @@ pub fn parse(text: &str, base: &Path) -> Result<Settings, String> {
                         index + 1,
                         value
                     )
+                })?;
+            }
+            "vendor_login" => {
+                settings.vendor_login = parse_bool(value).ok_or_else(|| {
+                    format!("line {}: invalid vendor_login {:?}", index + 1, value)
                 })?;
             }
             "config_dir" => settings.config_dir = Some(resolve(base, value)),
@@ -599,60 +612,6 @@ fn parse_plugin_roots(base: &Path, value: &str, index: usize) -> Result<Vec<Path
         }
     }
     Ok(roots)
-}
-
-/// A trailing `# ...` comment is allowed after a value when the hash is
-/// preceded by whitespace. `svc config tune` writes the derivation on the same
-/// line, and a hand-edited file may do the same.
-fn strip_comment(value: &str) -> &str {
-    match value.find(" #") {
-        Some(index) => value[..index].trim_end(),
-        None => value,
-    }
-}
-
-fn parse_bool(value: &str) -> Option<bool> {
-    match value.to_ascii_lowercase().as_str() {
-        "true" | "1" | "on" | "yes" => Some(true),
-        "false" | "0" | "off" | "no" => Some(false),
-        _ => None,
-    }
-}
-
-/// Parse a byte size the way an operator writes it: digits, or a count with a
-/// binary suffix (`K`/`M`/`G`, optionally `iB`), case-insensitive and with or
-/// without a space. The document itself only ever holds digits; this is the
-/// console's convenient form for byte fields (#290).
-#[cfg_attr(not(feature = "http"), allow(dead_code))]
-pub fn parse_byte_size(text: &str) -> Option<u64> {
-    let text = text.trim();
-    let digits_end = text
-        .find(|character: char| !character.is_ascii_digit())
-        .unwrap_or(text.len());
-    if digits_end == 0 {
-        return None;
-    }
-    let count: u64 = text[..digits_end].parse().ok()?;
-    let multiplier = match text[digits_end..].trim().to_ascii_lowercase().as_str() {
-        "" | "b" => 1,
-        "k" | "kb" | "kib" => 1024,
-        "m" | "mb" | "mib" => 1024 * 1024,
-        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
-        _ => return None,
-    };
-    count.checked_mul(multiplier)
-}
-
-fn parse_u64(value: &str, key: &str, index: usize) -> Result<u64, String> {
-    value
-        .parse::<u64>()
-        .map_err(|_| format!("line {}: invalid {} {:?}", index + 1, key, value))
-}
-
-fn parse_usize(value: &str, key: &str, index: usize) -> Result<usize, String> {
-    value
-        .parse::<usize>()
-        .map_err(|_| format!("line {}: invalid {} {:?}", index + 1, key, value))
 }
 
 /// Replace one key in an existing conf, preserving comments and other keys.

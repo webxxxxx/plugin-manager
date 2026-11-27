@@ -52,6 +52,15 @@ pub(crate) fn respond(config: &Config, request: &HttpRequest, lan: &Arc<Mutex<La
     }
 
     let ui = ui_path(path);
+    // The vendor-backend handoff is an authentication entry, like `/login`: it
+    // has to run before the admission it is meant to satisfy. Kept out of the
+    // route table because it answers a CORS preflight as well as the POST.
+    // Passwordless, so it exists only where the deployment opted in with
+    // `vendor_login = on` (ADR-0032); otherwise the path falls through to the
+    // normal admission and the entry does not exist at all.
+    if path == "/vendor-login" && config.settings.vendor_login {
+        return crate::face::vendor_login::respond(request, lan);
+    }
     let auth = match Admission::new(lan).admit(&request.headers) {
         Ok(auth) => auth,
         Err(Rejected::Unavailable) => return error(500, "internal", "LAN state unavailable"),
@@ -292,6 +301,55 @@ mod tests {
             text.contains("Location: /?next=/plugin-ui/demo/\r\n"),
             "{text}"
         );
+    }
+
+    /// `/vendor-login` is passwordless, so it only exists behind the
+    /// `vendor_login = on` opt-in; a stock daemon keeps normal admission on the
+    /// same path (a 401, not a special entry).
+    #[test]
+    fn the_vendor_handoff_requires_the_opt_in_key() {
+        let root = crate::platform::test_support::temp_dir().join(format!(
+            "svcd-fallback-vendor-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("config")).expect("temp config");
+        let lan = Arc::new(Mutex::new(Lan::new(
+            "127.0.0.1:0".parse().expect("addr"),
+            "127.0.0.1:0".parse().expect("addr"),
+            true,
+            Some(crate::platform::auth::hash_password("secret").expect("hash")),
+        )));
+        let request = HttpRequest {
+            method: "POST".into(),
+            path: "/vendor-login".into(),
+            version: "HTTP/1.1".into(),
+            headers: vec![
+                ("Host".into(), "192.168.5.1:8787".into()),
+                ("Origin".into(), "http://192.168.5.1".into()),
+                ("X-Vendor-OK".into(), "1".into()),
+            ],
+            body: Vec::new(),
+        };
+        let paths = crate::platform::paths::Paths::under(&root);
+
+        let closed = Config::with_paths(
+            crate::platform::settings::Settings::default(),
+            None,
+            paths.clone(),
+        );
+        let closed = String::from_utf8_lossy(&respond(&closed, &request, &lan)).to_string();
+        assert!(closed.starts_with("HTTP/1.1 401"), "{closed}");
+
+        let mut settings = crate::platform::settings::Settings::default();
+        settings.vendor_login = true;
+        let open = Config::with_paths(settings, None, paths);
+        let open = String::from_utf8_lossy(&respond(&open, &request, &lan)).to_string();
+        assert!(open.starts_with("HTTP/1.1 200"), "{open}");
+        assert!(open.contains("Set-Cookie: svcd_session="), "{open}");
     }
 
     /// The buffered face answers 304 from the same projection the streamed

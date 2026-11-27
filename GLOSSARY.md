@@ -60,6 +60,10 @@ _Avoid_: 文件服务器（它不提供写、列目录或独立端口）、插�
 `svcd.conf` 里的 PBKDF2-HMAC-SHA256 口令哈希；明文只经过 `svc lan passwd <password>`，不落盘。网页登录、`/api/v1` 与 `/mcp` 的 Bearer 都用同一密码。
 _Avoid_: lan-token、管理员 token
 
+**厂商免登录（vendor handoff）**:
+设备同主机的厂商后台（`:80`）已登录时，注入到厂商页面的菜单脚本用浏览器里的厂商会话调 `POST /vendor-login`，换一对与密码登录同形的 `svcd_session` / `svcd_api` cookie，`:8787` 的控制台因此不再要求密码。入口由宿主配置 `vendor_login = on` 打开（默认 off），跑在准入之前，只接受同主机（端口为空 / 80 / 443）的 `Origin` 加 `X-Vendor-OK: 1`；服务端不代查厂商 SID（厂商会话绑客户端 IP，只有浏览器里的页面能判断）。见 [ADR-0032](docs/adr/0032-vendor-console-handoff.md)。
+_Avoid_: 单点登录、SSO（它只覆盖“进入控制台”，不是通用身份提供方）、免密登录（密码本身没被删除）
+
 **config_dir**:
 三个目录根之一，只放输入：`svcd.conf`、`services.d`、`trust.d`、`compat.conf`。默认 Linux `/etc/svcd`、Windows 系统模式 `%ProgramData%\svcd\config`；指定 `install_dir` 时默认 `<install_dir>/config`；`SVCD_CONFIG_DIR` 与显式 `config_dir` 优先级更高。控制 socket、`http.port`、上传暂存都不在这里。
 

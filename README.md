@@ -227,6 +227,7 @@ cpu_budget_percent = 90             # 软闸 + cgroup / Job Object 硬限
 | --- | --- | --- | --- |
 | `auth_passwd` | 未设（用 `svc lan passwd` 设置） | 网页/API 的口令哈希。永远不要写明文。 | `svc lan passwd` 立即生效 |
 | `allow_insecure_install` | off | 允许安装验签失败时降级接受未签名包。 | 重启 daemon |
+| `vendor_login` | off | 同主机厂商后台（:80）已登录时，用浏览器里的厂商会话换 svcd 会话（`POST /vendor-login`），控制台不再要求密码；开着时能访问 :8787 的非浏览器客户端可伪造请求头拿到管理员会话。 | 重启 daemon |
 
 #### 路径
 

@@ -46,4 +46,6 @@ pub mod static_site;
 pub mod support;
 pub mod uichannel;
 #[cfg(feature = "http")]
+pub mod vendor_login;
+#[cfg(feature = "http")]
 pub mod webui;

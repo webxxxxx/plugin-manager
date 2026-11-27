@@ -572,6 +572,17 @@ pub const CONF_KEYS: &[ConfKey] = &[
         needs_restart: true,
     },
     ConfKey {
+        key: "vendor_login",
+        label: "厂商后台免登录",
+        group: Group::Security,
+        kind: Kind::Bool,
+        default: "off",
+        doc: "允许同主机的厂商后台（:80）已登录时，用浏览器里的厂商会话换一个 svcd 会话（`POST /vendor-login`），控制台不再要求密码。厂商会话绑客户端 IP，服务端不能代查，所以信任的是浏览器里厂商同源页面的断言。",
+        recommend: "只在“厂商后台是这台设备唯一管理入口”的镜像上开；开着时能访问 :8787 的非浏览器客户端可以伪造请求头拿到管理员会话，关着时控制台照常要密码。",
+        editable_in_console: true,
+        needs_restart: true,
+    },
+    ConfKey {
         key: "config_dir",
         label: "配置目录",
         group: Group::Paths,

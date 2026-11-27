@@ -10,6 +10,7 @@
 pub(crate) const ENV_KEYS: &[&str] = &[
     "bind",
     "allow_insecure_install",
+    "vendor_login",
     "config_dir",
     "data_dir",
     "plugins_dir",
