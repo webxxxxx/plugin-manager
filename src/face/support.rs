@@ -302,20 +302,31 @@ mod tests {
         }
     }
 
-    /// A refusal that carries numbers must project them into `error.data`: a
-    /// dialog cannot run on a sentence. A refusal without data keeps the
-    /// envelope it always had.
+    /// The 507 body is a contract, not a detail: the console keys its recovery
+    /// dialog on these exact fields (#328, #330). Pin the whole JSON, so a
+    /// refactor of how the payload is stored cannot quietly rename a key, drop
+    /// one, or turn an unmeasured root into zero bytes.
     #[test]
-    fn a_refusal_payload_reaches_the_body() {
-        let refusal = Problem::InsufficientSpace
-            .error("need 10")
-            .with_data(serde_json::json!({ "need": 10, "installed": 4 }));
+    fn a_space_refusal_body_is_pinned_byte_for_byte() {
+        let refusal = Problem::InsufficientSpace.error("need 10 bytes").with_data(json!({
+            "id": "demo",
+            "need": 10u64,
+            "installed": 4u64,
+            "root": "/data/plugins",
+            "roots": [
+                { "root": "/data/plugins", "free": 6u64 },
+                { "root": "/mnt/sd", "free": null }
+            ]
+        }));
         let text = String::from_utf8(problem_response(&refusal)).expect("utf8");
-        assert!(text.contains("HTTP/1.1 507"), "{text}");
-        assert!(text.contains("\"code\":\"insufficient_space\""), "{text}");
-        assert!(text.contains("\"need\":10"), "{text}");
-        assert!(text.contains("\"installed\":4"), "{text}");
+        let (head, body) = text.split_once("\r\n\r\n").expect("a body");
+        assert!(head.starts_with("HTTP/1.1 507 "), "{head}");
+        assert_eq!(
+            body,
+            r#"{"error":{"code":"insufficient_space","data":{"id":"demo","installed":4,"need":10,"root":"/data/plugins","roots":[{"free":6,"root":"/data/plugins"},{"free":null,"root":"/mnt/sd"}]},"message":"need 10 bytes"}}"#
+        );
 
+        // A refusal without a payload keeps the envelope it always had.
         let plain =
             String::from_utf8(problem_response(&Problem::Invalid.error("no"))).expect("utf8");
         assert!(!plain.contains("\"data\""), "a payload is opt-in: {plain}");
