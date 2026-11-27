@@ -212,6 +212,11 @@ http 与 daemon 各用 4 线程（都是进程重活：临时端口 + 独立 san
 只有显式 `--parallel` 才让全部集成测试并发，那时执行顺序不由工具承诺。
 `tools/check.mjs --selftest` 会用一个临时 tests 目录证明发现逻辑，并用空目录证明它会红。
 
+`ready: port` 的端到端用例需要一个自己 bind 端口的 payload：`.sh` / `.cmd` 开不了 TCP，
+测试进程自己持 listener 又会被 spawn 前的预检试绑判成端口被占。`tests/plugin.rs` 因此用
+`rustc` 把 `tests/fixtures/port_listener.rs` 编进 sandbox，再当普通 payload 打包（`TMP` /
+`TEMP` 指到编译目录，链接器的临时文件不跟系统 `%TEMP%` 抢）。
+
 http sandbox 在 `Sandbox::env` 里固定 `SVCD_PROBE_AVAILABLE_MEMORY`（8 GiB）：预算与
 `max_package_bytes` 都由 probe 推导，宿主空闲内存掉到 ~1.8 GiB 时 36 MiB 的导出包会被 413
 拒绝（#285）。固定的只是 probe 输入，`mem_budget_bytes` / `mem_budget_percent` 仍由 settings

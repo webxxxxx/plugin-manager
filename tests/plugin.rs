@@ -2066,6 +2066,148 @@ fn a_port_ready_service_refuses_a_port_someone_else_holds() {
     drop(probe);
 }
 
+// --- ready: port, success path (#340) ---------------------------------------
+//
+// The payload has to bind the declared port itself. A `.sh` / `.cmd` script
+// cannot bind TCP, and this process cannot hold the listener: the daemon's
+// preflight bind would rightly call the port taken. So the package carries a
+// tiny native helper compiled from `tests/fixtures/port_listener.rs`; the suite
+// needs no interpreter beyond the Rust compiler it is already running on.
+
+const PORT_LISTENER_SRC: &str = include_str!("fixtures/port_listener.rs");
+
+/// Compile the listener payload once into the sandbox and return the path it
+/// will have in the package plus its bytes.
+fn compile_port_listener(sandbox: &Sandbox) -> (&'static str, Vec<u8>) {
+    let directory = sandbox.root.join("port-listener-build");
+    fs::create_dir_all(&directory).expect("listener build dir");
+    let source = directory.join("port_listener.rs");
+    fs::write(&source, PORT_LISTENER_SRC).expect("write listener source");
+    let binary = directory.join(if cfg!(windows) {
+        "port-listener.exe"
+    } else {
+        "port-listener"
+    });
+    // `RUSTC` is set when cargo drives the suite; a direct `cargo`-less run
+    // falls back to PATH, exactly like the project's other tool invocations.
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output = Command::new(&rustc)
+        .args(["--edition", "2021", "-o"])
+        .arg(&binary)
+        .arg(&source)
+        // Keep the linker's scratch files next to the sandbox: %TEMP% is
+        // shared with whatever else runs on the machine, and a stray lock
+        // there must not fail a test that never asked for it.
+        .env("TMP", &directory)
+        .env("TEMP", &directory)
+        .output()
+        .unwrap_or_else(|error| {
+            panic!(
+                "run {:?}: the ready=port payload needs a Rust compiler: {error}",
+                rustc
+            )
+        });
+    assert!(
+        output.status.success(),
+        "rustc could not build the ready=port payload:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let in_package = if cfg!(windows) {
+        "payload/bin/port-listener.exe"
+    } else {
+        "payload/bin/port-listener"
+    };
+    (in_package, fs::read(&binary).expect("listener binary"))
+}
+
+/// A loopback port nothing is listening on right now.
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
+    let port = listener.local_addr().expect("reserved addr").port();
+    drop(listener);
+    port
+}
+
+#[test]
+fn a_port_ready_start_waits_for_the_port_and_then_runs_started() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[41u8; 32]);
+    sandbox.write_key(&key);
+    let (exec, data) = compile_port_listener(&sandbox);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let marker = sandbox.root.join("port-listening.txt");
+    let marker_arg = marker.to_string_lossy().into_owned();
+    let events = sandbox.root.join("port-events.txt");
+    let events_arg = events.to_string_lossy().into_owned();
+    let manifest = json!({
+        "schema": 1,
+        "id": "port",
+        "name": "port",
+        "version": "1.0.0",
+        "desc": "a service whose port opens one second after the spawn",
+        "platform": target(),
+        "protocol": 1,
+        "exec": {
+            "path": exec,
+            "args": ["--listen", addr, "1000", marker_arg],
+            "ready": "port",
+            "port": port
+        },
+        "lifecycle": {
+            // The action only exits zero when the port already accepts, so a
+            // start that ran it before Ready cannot succeed.
+            "started": {"path": exec, "args": ["--check", addr, events_arg]}
+        },
+        "files": [{
+            "path": exec,
+            "size": data.len(),
+            "sha256": hex_sha256(&data),
+            "mode": 0o755
+        }]
+    });
+    let bytes = package_with_manifest(&key, &manifest, &[(exec, data.as_slice(), 0o755)]);
+    let package = sandbox.write_package("port-1.0.0.spk", &bytes);
+
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    let installed = sandbox.run_plugin(&["install", package.to_str().expect("package")]);
+    assert_eq!(installed.status.code(), Some(0), "{}", stderr(&installed));
+
+    let started_at = Instant::now();
+    let start = sandbox.run_plugin(&["start", "port"]);
+    let elapsed = started_at.elapsed();
+    assert_eq!(
+        start.status.code(),
+        Some(0),
+        "start: {}\ndaemon log (tail):\n{}",
+        stderr(&start),
+        support::tail_lines(&sandbox.daemon_log(), 20)
+    );
+    // The port opens one second after the payload spawns. A start that
+    // returned earlier trusted the spawn instead of the probe.
+    assert!(
+        elapsed >= Duration::from_millis(1000),
+        "start returned after {elapsed:?}, before the port could accept"
+    );
+    let lines = event_lines(&events);
+    assert!(
+        lines.iter().any(|line| line == "started-after-listening"),
+        "started did not run after the port was live: {lines:?}"
+    );
+
+    let status = sandbox.status("port");
+    assert_eq!(status["summary"]["state"], "running", "{status}");
+    let marker_text = fs::read_to_string(&marker).expect("the payload did not write its marker");
+    assert!(
+        marker_text.contains(&addr),
+        "the payload did not bind {addr}: {marker_text}"
+    );
+
+    let stopped = sandbox.run_plugin(&["stop", "port"]);
+    assert_eq!(stopped.status.code(), Some(0), "{}", stderr(&stopped));
+}
+
 #[test]
 fn install_rejects_a_missing_interpreter() {
     let mut sandbox = Sandbox::new();
