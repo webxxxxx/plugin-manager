@@ -1262,8 +1262,11 @@ pub(crate) fn export_sandbox(key_byte: u8, extra: &str, payload: &[u8]) -> (Sand
     (sandbox, address)
 }
 
-/// A running daemon with the demo web-UI plugin installed.
-pub(crate) fn web_ui_sandbox(key_byte: u8) -> (Sandbox, String) {
+/// A running daemon with the plugin `build` produces installed.
+fn sandbox_with_package(
+    key_byte: u8,
+    build: impl FnOnce(&SigningKey) -> Vec<u8>,
+) -> (Sandbox, String) {
     let mut sandbox = Sandbox::new();
     let key = SigningKey::from_bytes(&[key_byte; 32]);
     fs::write(
@@ -1271,7 +1274,7 @@ pub(crate) fn web_ui_sandbox(key_byte: u8) -> (Sandbox, String) {
         pem_from_public(&key.verifying_key().to_bytes()),
     )
     .expect("trust key");
-    let package = web_plugin_bundle(&key, "demo", true);
+    let package = build(&key);
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
     let installed = request(
@@ -1285,29 +1288,18 @@ pub(crate) fn web_ui_sandbox(key_byte: u8) -> (Sandbox, String) {
     (sandbox, address)
 }
 
+/// A running daemon with the demo web-UI plugin installed.
+pub(crate) fn web_ui_sandbox(key_byte: u8) -> (Sandbox, String) {
+    sandbox_with_package(key_byte, |key| web_plugin_bundle(key, "demo", true))
+}
+
 /// A sandbox whose plugin runs `agent` instead of the demo script, for tests
 /// that need the plugin to spawn processes of its own (#332).
 #[cfg(unix)]
 pub(crate) fn sandbox_with_agent(key_byte: u8, agent: (&str, Vec<u8>)) -> (Sandbox, String) {
-    let mut sandbox = Sandbox::new();
-    let key = SigningKey::from_bytes(&[key_byte; 32]);
-    fs::write(
-        sandbox.trust.join("test.pub"),
-        pem_from_public(&key.verifying_key().to_bytes()),
-    )
-    .expect("trust key");
-    let package = web_plugin_bundle_with(&key, "demo", true, agent);
-    sandbox.start_daemon();
-    let address = sandbox.wait_for_http();
-    let installed = request(
-        &address,
-        "POST",
-        "/api/v1/plugins",
-        "application/octet-stream",
-        &package,
-    );
-    assert_eq!(installed.status, 200, "{}", installed.body);
-    (sandbox, address)
+    sandbox_with_package(key_byte, |key| {
+        web_plugin_bundle_with(key, "demo", true, agent)
+    })
 }
 
 /// Like `web_ui_sandbox`, with extra `svcd.conf` keys for one test.

@@ -23,6 +23,7 @@ mod lifecycle;
 #[path = "daemon/reload.rs"]
 mod reload;
 mod support;
+use support::pid_alive;
 use support::target;
 
 struct Sandbox {
@@ -506,39 +507,6 @@ fn wait_for_marker(marker: &Path, needle: &str) {
 // ---------------------------------------------------------------------------
 // Lifecycle matrix fixtures: all three service sources, crash control and PIDs.
 // ---------------------------------------------------------------------------
-
-fn pid_alive(pid: u32) -> bool {
-    #[cfg(windows)]
-    {
-        let output = Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {}", pid), "/NH", "/FO", "CSV"])
-            .output()
-            .expect("tasklist");
-        String::from_utf8_lossy(&output.stdout).contains(&format!("\"{}\"", pid))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        // kill -0 also succeeds for a zombie: the process has exited and only
-        // awaits reaping. An adopted pid is reaped by whoever spawned it, not
-        // by the daemon under test, so "gone" must mean "not running" (#111).
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", pid)) else {
-            return false;
-        };
-        let Some((_, rest)) = stat.rsplit_once(") ") else {
-            return false;
-        };
-        let state = rest.chars().next().unwrap_or('X');
-        state != 'Z' && state != 'X'
-    }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-    }
-}
 
 /// Creation time of `pid`, in the host's own units. A pid alone is not an
 /// identity: the OS hands a freed pid to an unrelated process, and a parallel

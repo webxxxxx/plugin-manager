@@ -325,3 +325,38 @@ pub fn wait_for_state(
         std::thread::sleep(Duration::from_millis(25));
     }
 }
+
+/// True while `pid` is a running process.
+///
+/// `kill -0` also succeeds for a zombie: the process has exited and only awaits
+/// reaping. An adopted pid is reaped by whoever spawned it, not by the daemon
+/// under test, so "gone" must mean "not running" (#111).
+pub fn pid_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let output = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/NH", "/FO", "CSV"])
+            .output()
+            .expect("tasklist");
+        String::from_utf8_lossy(&output.stdout).contains(&format!("\"{}\"", pid))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", pid)) else {
+            return false;
+        };
+        let Some((_, rest)) = stat.rsplit_once(") ") else {
+            return false;
+        };
+        let state = rest.chars().next().unwrap_or('X');
+        state != 'Z' && state != 'X'
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+}
