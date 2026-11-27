@@ -11,7 +11,7 @@
 - **快照时机是任何信号之前**。`Slot::request_stop` 在 `Exited` / SIGTERM 之前按 `/proc/<pid>/stat` 的父链递归收集子孙，记下 `(pid, start time)`。leader 一旦退出，它的孩子会被 init 接管，父子关系就再也读不出来了 —— 所以快照只能在停止开始时做。
 - **信号分两次，和已有的两段超时对齐**：polite 阶段对组与快照发 SIGTERM；`KillTimeout` 之后对组与快照发 SIGKILL。快照里的进程如果已经换成了别的进程（start time 对不上），跳过不发信号。
 - **快照只属于这一次停止**：进程清空时（`clear_process`）丢弃，下一次停止重新快照。
-- **只在能枚举父链的宿主上做**：Linux 走 `/proc`；Windows 的 job object 本来就是整棵树，`descendants` 返回空、行为不变；macOS 没有 `/proc`，`ps` 会引入第二套解析器与它的测试，暂不实现（已知缺口，见 #332 的结论）。
+- **枚举父链的宿主各自落地**：Linux 走 `/proc`；macOS 走 libproc（`proc_listpids` + `proc_pidinfo(PROC_PIDTBSDINFO)`，字段 `pbi_ppid` / `pbi_status` / `pbi_start_tvsec|tvusec`，#333）；Windows 的 job object 本来就是整棵树，`descendants` 返回空、行为不变。macOS 不走 `ps`：`lstart` 是 `strftime(3)` 的 `%c`，随 locale 变；也不走 `sysctl KERN_PROC`：`libc` 没有 `kinfo_proc` 的 Apple 绑定，要手写结构体布局。代价是 libproc 自称「private interfaces … subject to change」。
 
 ## Considered Options
 
@@ -22,7 +22,8 @@
 
 ## Consequences
 
-- `svc stop` / 卸载之后不会再留下插件的连接子进程；代价是停止时多一次 `/proc` 扫描（一次读取几百个 stat 文件，只发生在停止路径）。
+- `svc stop` / 卸载之后不会再留下插件的连接子进程；代价是停止时多一次进程表扫描（Linux 读几百个 `stat` 文件，macOS 一次 `proc_listpids` 加每个 pid 一次 `proc_pidinfo`，都只发生在停止路径）。
 - 杀子孙用的是同一个 SIGTERM→SIGKILL 阶梯：会话里的 shell 有机会在 SIGTERM 里退出，10 秒后仍在的才会被 SIGKILL。
 - 崩溃路径不在本 ADR 内：leader 崩溃时遗留的 `setsid` 子孙仍只受「组」约束，重启的是一个新 leader。
 - 停止期间的判定变成「树空了才算完」，插件若有一个赖着不走的子孙，服务会停在 `Stopping` 直到 `KillTimeout` 把它打死，日志会记下被带走的子孙数量。
+- macOS 上随之有了可比较的启动时间（libproc 的微秒级 `pbi_start_tvsec/usec`），接管（ADR-0005）的 pid 复用判定从 `Unknown`（信任）升到 `Same` / `Reused`：重启后一条陈旧的 runtime 记录不会再被一个复用了 pid 的无关进程接管。代价是 libproc 是私有 SPI，「subject to change」的字段漂移只能在编译或真机上发现。
