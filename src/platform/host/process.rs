@@ -112,7 +112,11 @@ pub(crate) fn tree_alive(tree: Option<&Tree>, pid: u32) -> bool {
     imp::tree_alive(tree.map(|tree| &tree.imp), pid)
 }
 
-/// Start time of `pid` in clock ticks since boot (pid-reuse guard).
+/// Start time of `pid` as this host counts it (pid-reuse guard).
+///
+/// The unit is the host's: Linux start ticks since boot, macOS microseconds
+/// since the epoch. It is only ever compared with another value from the same
+/// host, so callers must not mix the two.
 pub(crate) fn start_time(pid: u32) -> Option<u64> {
     imp::start_time(pid)
 }
@@ -131,6 +135,52 @@ pub(crate) fn terminate_tree(pid: u32) {
 /// recycled pid apart from the process a snapshot saw.
 pub(crate) type Descendant = (u32, u64);
 
+/// One row of a host's process table: what a snapshot needs about one process.
+///
+/// The row is the seam between "how a host enumerates its process table"
+/// (Linux `/proc`, macOS libproc) and the walk below, so the walk can be tested
+/// with fabricated rows on any host — including a host that cannot run the
+/// enumerator it compiles.
+#[cfg_attr(windows, allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProcRow {
+    pub(crate) pid: u32,
+    pub(crate) ppid: u32,
+    /// The host's pid-reuse guard for this process: comparable with another
+    /// observation on the same host, opaque anywhere else (Linux start ticks
+    /// since boot, macOS microseconds since the epoch).
+    pub(crate) start: u64,
+    /// A zombie has exited and only awaits reaping. It is not a process a stop
+    /// has to signal or wait for, and whatever it spawned was reparented away
+    /// when it exited (#111, #334).
+    pub(crate) zombie: bool,
+}
+
+/// Collect every running process below `root`, each with its start value.
+///
+/// Walking the parent links is what finds a `setsid` child: it left the process
+/// group, so the group signal cannot reach it (#332). A zombie is skipped with
+/// its subtree — it has exited, and its children were reparented to init when
+/// it did. `visited` keeps a malformed table (a cycle, a duplicate row) from
+/// making the walk spin; a real table contains neither.
+#[cfg_attr(windows, allow(dead_code))]
+fn tree_from_rows(rows: &[ProcRow], root: u32) -> Vec<Descendant> {
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(root);
+    let mut found = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(current) = frontier.pop() {
+        for row in rows {
+            if row.ppid != current || row.zombie || !visited.insert(row.pid) {
+                continue;
+            }
+            found.push((row.pid, row.start));
+            frontier.push(row.pid);
+        }
+    }
+    found
+}
+
 /// The tree a stop has to take with it, captured while its leader is alive.
 ///
 /// The process group is not the whole tree. A child that calls `setsid` leaves
@@ -140,9 +190,10 @@ pub(crate) type Descendant = (u32, u64);
 /// running after the plugin was stopped or uninstalled (#332).
 ///
 /// Once the leader exits those children are reparented to init, so the only
-/// moment their parenthood is still readable is before it is signalled. Empty
-/// on hosts that guard the tree with a handle (Windows) or cannot enumerate it
-/// (macOS has no `/proc`); the caller keeps its group-only behaviour there.
+/// moment their parenthood is still readable is before it is signalled. Each
+/// host that can enumerate its process table answers with [`ProcRow`]s (Linux
+/// `/proc`, macOS libproc); Windows guards the tree with a job object and
+/// returns none, so the caller keeps its group-only behaviour there.
 pub(crate) fn descendants(pid: u32) -> Vec<Descendant> {
     imp::descendants(pid)
 }
@@ -433,7 +484,13 @@ mod imp {
                 .map(|state| state != 'Z' && state != 'X')
                 .unwrap_or(true)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            // Same judgement as the Linux state read: a zombie has exited, and
+            // counting it would keep a stop waiting for it (#111, #334).
+            process(pid).map(|row| !row.zombie).unwrap_or(true)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             true
         }
@@ -510,64 +567,148 @@ mod imp {
         group_alive(pid)
     }
 
-    /// Walk `/proc/<pid>/stat`'s parent links from `pid` and return the running
+    /// Every process this host's table can describe, in one pass.
+    ///
+    /// A process that vanishes mid-scan is simply absent: the walk needs the
+    /// rows it can read, and a pid with no row is not reachable as a
+    /// descendant.
+    #[cfg(target_os = "linux")]
+    fn rows() -> Vec<super::ProcRow> {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let Ok(pid) = name.parse::<u32>() else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let Some((_, rest)) = stat.rsplit_once(") ") else {
+                continue;
+            };
+            let mut fields = rest.split_whitespace();
+            let state = fields.next().and_then(|value| value.chars().next());
+            let parent = fields.next().and_then(|value| value.parse::<u32>().ok());
+            let start = rest
+                .split_whitespace()
+                .nth(19)
+                .and_then(|value| value.parse::<u64>().ok());
+            let (Some(state), Some(ppid), Some(start)) = (state, parent, start) else {
+                // A process that vanished mid-scan: nothing to record.
+                continue;
+            };
+            rows.push(super::ProcRow {
+                pid,
+                ppid,
+                start,
+                zombie: state == 'Z' || state == 'X',
+            });
+        }
+        rows
+    }
+
+    /// Every process libproc can describe, in one pass.
+    ///
+    /// `proc_listpids` answers with the number of bytes it filled, and with a
+    /// null buffer it answers with the bytes a full table needs. The table
+    /// grows between the probe and the fetch, so the buffer carries slack; the
+    /// second call then reports how much of it is real.
+    #[cfg(target_os = "macos")]
+    fn rows() -> Vec<super::ProcRow> {
+        use std::mem::size_of;
+        use std::os::raw::c_void;
+
+        // `PROC_ALL_PIDS` from `sys/proc_info.h`; `libc` does not bind it.
+        const PROC_ALL_PIDS: u32 = 1;
+        let width = size_of::<libc::c_int>();
+        // SAFETY: a null buffer with size 0 asks for the required size only.
+        let needed = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
+        if needed <= 0 {
+            return Vec::new();
+        }
+        let capacity = needed as usize / width + 64;
+        let mut pids: Vec<libc::c_int> = vec![0; capacity];
+        // SAFETY: the buffer is `capacity * width` bytes and outlives the call.
+        let filled = unsafe {
+            libc::proc_listpids(
+                PROC_ALL_PIDS,
+                0,
+                pids.as_mut_ptr().cast::<c_void>(),
+                (capacity * width) as libc::c_int,
+            )
+        };
+        if filled <= 0 {
+            return Vec::new();
+        }
+        let count = (filled as usize / width).min(capacity);
+        let mut rows = Vec::with_capacity(count);
+        for &pid in &pids[..count] {
+            let Ok(pid) = u32::try_from(pid) else {
+                continue;
+            };
+            let Some(row) = process(pid) else {
+                continue;
+            };
+            rows.push(row);
+        }
+        rows
+    }
+
+    /// What libproc says about one process, or `None` when it vanished.
+    #[cfg(target_os = "macos")]
+    fn process(pid: u32) -> Option<super::ProcRow> {
+        use std::mem::{size_of, MaybeUninit};
+        use std::os::raw::c_void;
+
+        let size = size_of::<libc::proc_bsdinfo>();
+        let mut info = MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        // SAFETY: `info` is valid for `size` bytes and `proc_pidinfo` writes at
+        // most `size` bytes into it.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast::<c_void>(),
+                size as libc::c_int,
+            )
+        };
+        if written < size as libc::c_int {
+            // The process exited between the table and this call.
+            return None;
+        }
+        // SAFETY: the call reported writing the whole struct above.
+        let info = unsafe { info.assume_init() };
+        Some(super::ProcRow {
+            pid: info.pbi_pid,
+            ppid: info.pbi_ppid,
+            start: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+            zombie: info.pbi_status == libc::SZOMB,
+        })
+    }
+
+    /// Walk the host's process table from `pid` and return the running
     /// processes below it.
     ///
     /// A descendant that called `setsid` left the process group, and one whose
     /// parent has already exited was reparented to init; walking parenthood is
     /// the only thing that keeps it reachable, and only while the leader is
-    /// still alive. Zombies are skipped: they are gone, and their own children
-    /// have been reparented away from this tree already.
+    /// still alive. Zombies are skipped by the walk: they are gone, and their
+    /// own children have been reparented away from this tree already.
     pub(crate) fn descendants(pid: u32) -> Vec<Descendant> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let Ok(entries) = std::fs::read_dir("/proc") else {
-                return Vec::new();
-            };
-            let mut rows: Vec<(u32, u32, u64, char)> = Vec::new();
-            for entry in entries.flatten() {
-                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                    continue;
-                };
-                let Ok(child) = name.parse::<u32>() else {
-                    continue;
-                };
-                let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-                    continue;
-                };
-                let Some((_, rest)) = stat.rsplit_once(") ") else {
-                    continue;
-                };
-                let mut fields = rest.split_whitespace();
-                let state = fields.next().and_then(|value| value.chars().next());
-                let parent = fields.next().and_then(|value| value.parse::<u32>().ok());
-                let start = rest
-                    .split_whitespace()
-                    .nth(19)
-                    .and_then(|value| value.parse::<u64>().ok());
-                let (Some(state), Some(parent), Some(start)) = (state, parent, start) else {
-                    // A process that vanished mid-scan: nothing to record.
-                    continue;
-                };
-                rows.push((child, parent, start, state));
-            }
-            let mut found = Vec::new();
-            let mut frontier = vec![pid];
-            while let Some(current) = frontier.pop() {
-                for (child, parent, start, state) in &rows {
-                    if *parent != current || *state == 'Z' || *state == 'X' {
-                        continue;
-                    }
-                    found.push((*child, *start));
-                    frontier.push(*child);
-                }
-            }
-            found
+            super::tree_from_rows(&rows(), pid)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            // macOS has no /proc; enumerating through `ps` would be a second
-            // parser with its own tests. The group stays the whole answer.
+            // No portable way to read parenthood on this host: the group stays
+            // the whole answer, as it was for macOS before #333.
             let _ = pid;
             Vec::new()
         }
@@ -603,8 +744,11 @@ mod imp {
         }
     }
 
-    /// Start time of `pid` in clock ticks since boot, as `/proc/<pid>/stat`
-    /// field 22. Together with the boot id it is the pid-reuse guard.
+    /// Start time of `pid` as the host counts it, together with the boot id the
+    /// pid-reuse guard: Linux reads field 22 of `/proc/<pid>/stat` (start ticks),
+    /// macOS takes the microsecond start time libproc reports. The value is
+    /// opaque outside the host that produced it — see [`super::ProcRow::start`],
+    /// which has to use the same encoding for a snapshot to be comparable.
     pub(crate) fn start_time(pid: u32) -> Option<u64> {
         #[cfg(target_os = "linux")]
         {
@@ -612,7 +756,11 @@ mod imp {
             let rest = stat.split_once(") ")?.1;
             rest.split_whitespace().nth(19)?.parse().ok()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            process(pid).map(|row| row.start)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = pid;
             None
@@ -852,5 +1000,88 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         false
+    }
+}
+
+/// The tree walk and the pid-reuse judgement that rides on it.
+///
+/// The rows are fabricated on purpose: the walk is the part that must behave the
+/// same on every host, and the hosts that can enumerate a real table (Linux,
+/// macOS) cannot run their enumerator on every platform that builds this file.
+#[cfg(test)]
+mod tree_tests {
+    use super::{descendants_alive, tree_from_rows, ProcRow};
+
+    fn running(pid: u32, ppid: u32, start: u64) -> ProcRow {
+        ProcRow {
+            pid,
+            ppid,
+            start,
+            zombie: false,
+        }
+    }
+
+    fn exited(pid: u32, ppid: u32, start: u64) -> ProcRow {
+        ProcRow {
+            pid,
+            ppid,
+            start,
+            zombie: true,
+        }
+    }
+
+    /// The snapshot is the whole subtree below the leader — and the leader
+    /// never appears in its own snapshot.
+    #[test]
+    fn the_walk_takes_every_generation_of_this_tree_only() {
+        let rows = [
+            running(100, 99, 0),
+            running(101, 100, 1),
+            running(102, 101, 2),
+            running(103, 100, 3),
+            running(201, 200, 4),
+        ];
+        let mut found = tree_from_rows(&rows, 100);
+        found.sort_unstable();
+        assert_eq!(found, vec![(101, 1), (102, 2), (103, 3)]);
+    }
+
+    /// A zombie has exited; its children were reparented when it did, so the
+    /// walk must not descend through it and must not report it.
+    #[test]
+    fn a_zombie_is_skipped_with_its_subtree() {
+        let rows = [
+            running(101, 100, 1),
+            exited(102, 101, 2),
+            running(103, 102, 3),
+        ];
+        assert_eq!(tree_from_rows(&rows, 100), vec![(101, 1)]);
+    }
+
+    /// A cycle or a duplicate row cannot make a real table, and must not make
+    /// the walk spin when one shows up anyway.
+    #[test]
+    fn a_malformed_table_cannot_make_the_walk_spin() {
+        let rows = [
+            running(101, 100, 1),
+            running(100, 101, 2),
+            running(101, 100, 3),
+        ];
+        assert_eq!(tree_from_rows(&rows, 100), vec![(101, 1)]);
+    }
+
+    /// An empty table is what a host that cannot enumerate reports; the caller
+    /// keeps its group-only behaviour, not an error.
+    #[test]
+    fn no_rows_means_no_descendants() {
+        assert!(tree_from_rows(&[], 100).is_empty());
+    }
+
+    /// The snapshot carries a start value, so a pid whose start no longer
+    /// matches is not the process the snapshot saw: not alive, not signalled.
+    #[test]
+    fn a_snapshot_with_a_stale_start_is_not_alive() {
+        let me = std::process::id();
+        assert!(!descendants_alive(&[(me, 0)]));
     }
 }
