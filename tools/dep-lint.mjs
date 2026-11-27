@@ -817,6 +817,21 @@ const SELFTEST_SEAM = [
     source: "let stderr = Stdio::piped();\n",
     expected: [],
   },
+  // #342：能力钩子是这份名单里最容易被误放宽的一条（它只接一条 stdin 管道）。
+  // 同一个文件登记过算绿，同一段代码换个未登记的路径就红——这样「登记」与
+  // 「规则本身还认得违规」两件事各自都有注入用例。
+  {
+    name: "能力钩子的 stdin 管道已登记",
+    file: "src/supervise/ops/slot/call_hook.rs",
+    source: "command.stdin(Stdio::piped());\n",
+    expected: [],
+  },
+  {
+    name: "同一段管道代码不在名单里就算违规",
+    file: "src/supervise/ops/hook_proc.rs",
+    source: "command.stdin(Stdio::piped());\n",
+    expected: ["stdio 的调用方直接开管道"],
+  },
   {
     name: "stdio seam 自己不算",
     file: "src/wire/contract/stdio/platform/unix.rs",
