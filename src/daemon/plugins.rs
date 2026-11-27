@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use crate::face::control;
+use crate::kernel::call::CallId;
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::projection::Status;
 use crate::kernel::registry::{Kind, Service};
@@ -62,6 +63,7 @@ impl Daemon {
     /// way (#245).
     fn finish_install(
         &mut self,
+        call: CallId,
         id: &str,
         version: &str,
         signature_verified: bool,
@@ -72,7 +74,8 @@ impl Daemon {
         self.host.install(service, still_running)?;
         self.bump_catalog();
         info!(
-            "{}",
+            "call={} {}",
+            call,
             install_log_line(id, version, still_running, signature_verified,)
         );
         self.host.status_for_id(id, clock.now()).ok_or_else(|| {
@@ -91,10 +94,11 @@ impl Daemon {
     pub(super) fn install_plugin(
         &mut self,
         install: control::Install,
+        call: CallId,
         clock: &Clock,
     ) -> Result<Status, ProblemError> {
         let source = PathBuf::from(&install.path);
-        let result = self.install_package(install, clock);
+        let result = self.install_package(install, call, clock);
         cleanup_temp_payload(&self.config.paths, &source);
         result
     }
@@ -102,6 +106,7 @@ impl Daemon {
     fn install_package(
         &mut self,
         install: control::Install,
+        call: CallId,
         clock: &Clock,
     ) -> Result<Status, ProblemError> {
         let path = install.path.as_str();
@@ -163,8 +168,8 @@ impl Daemon {
                     ));
                     }
                     warn!(
-                        "plugin {}: keep-old ran out of space; falling back to replace",
-                        id
+                        "call={} plugin {}: keep-old ran out of space; falling back to replace",
+                        call, id
                     );
                     plugin::install_package(
                         &self.config.paths,
@@ -182,6 +187,7 @@ impl Daemon {
             }
         };
         self.finish_install(
+            call,
             &id,
             &package.manifest.version,
             signature_verified,
@@ -194,6 +200,7 @@ impl Daemon {
     pub(super) fn install_staged(
         &mut self,
         install: control::Install,
+        call: CallId,
         clock: &Clock,
     ) -> Result<Status, ProblemError> {
         let path = install.path.as_str();
@@ -281,6 +288,7 @@ impl Daemon {
             )?
         };
         self.finish_install(
+            call,
             &id,
             &version,
             signature_verified,
@@ -400,7 +408,7 @@ mod tests {
     use crate::platform::clock::Clock;
     use crate::platform::limits;
 
-    use super::{install_log_line, Daemon};
+    use super::{install_log_line, CallId, Daemon};
 
     fn daemon() -> Daemon {
         let (_sender, receiver) = mpsc::channel();
@@ -465,7 +473,7 @@ mod tests {
         let spk = files.path().join("demo.spk");
         std::fs::write(&spk, &package).expect("write package");
         let direct_status = daemon
-            .install_plugin(request(&spk), &clock)
+            .install_plugin(request(&spk), CallId::FIRST, &clock)
             .expect("direct install");
 
         // The staged path installs the same package from a staging directory
@@ -479,7 +487,7 @@ mod tests {
         installer.feed(&package).expect("feed package");
         let staging = installer.finish().expect("finish staging").root;
         let staged_status = daemon
-            .install_staged(request(&staging), &clock)
+            .install_staged(request(&staging), CallId::FIRST.next(), &clock)
             .expect("staged install");
 
         assert_eq!(direct_status, staged_status);

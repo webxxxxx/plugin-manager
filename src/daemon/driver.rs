@@ -4,6 +4,7 @@ use std::time::Instant;
 use serde_json::{json, Value};
 
 use crate::face::control;
+use crate::kernel::call::CallId;
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::projection::Status;
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
@@ -52,10 +53,14 @@ impl Daemon {
 
     pub(super) fn handle(&mut self, clock: &Clock, incoming: channel::PendingCall) {
         let started = Instant::now();
+        // One request, one number, allocated before anything can fail: a
+        // malformed frame and an unauthorized method are still this call, and
+        // the caller needs a name for whatever went wrong (#343).
+        let call = self.allocate_call();
         let request = match rpc::parse(&incoming.line) {
             Ok(request) => request,
             Err(response) => {
-                incoming.reply.send(rpc::to_line(&response));
+                incoming.reply.send(rpc::to_line(&stamp_call(response, call)));
                 return;
             }
         };
@@ -66,32 +71,33 @@ impl Daemon {
         {
             let response =
                 rpc::err_data(id, -32000, "unauthorized", Problem::Internal.error_data());
-            incoming.reply.send(rpc::to_line(&response));
+            incoming.reply.send(rpc::to_line(&stamp_call(response, call)));
             return;
         }
-        let call = match control::parse(request) {
-            Ok(call) => call,
+        let parsed = match control::parse(request) {
+            Ok(parsed) => parsed,
             Err(response) => {
-                incoming.reply.send(rpc::to_line(&response));
+                incoming.reply.send(rpc::to_line(&stamp_call(response, call)));
                 return;
             }
         };
-        match call.command {
+        match parsed.command {
             control::Command::ToolCall(tool) => {
-                self.handle_tool_call(clock, call.id, tool, incoming.reply)
+                self.handle_tool_call(clock, parsed.id, tool, incoming.reply)
             }
             command => {
-                let response = self.dispatch(clock, call.id, command);
-                incoming.reply.send(rpc::to_line(&response));
+                let response = self.dispatch(clock, call, parsed.id, command);
+                incoming.reply.send(rpc::to_line(&stamp_call(response, call)));
             }
         }
         self.sync_catalog();
-        log::note_slow(&format!("request {}", method), started);
+        log::note_slow(&format!("request {} call={}", method, call), started);
     }
 
     pub(super) fn dispatch(
         &mut self,
         clock: &Clock,
+        call: CallId,
         id: Option<Value>,
         command: control::Command,
     ) -> rpc::Response {
@@ -150,14 +156,22 @@ impl Daemon {
                 Ok(summary) => rpc::ok(id, summary),
                 Err(error) => problem_response(id, -32009, error),
             },
-            control::Command::Install(install) => match self.install_plugin(install, clock) {
+            control::Command::Install(install) => match self.install_plugin(install, call, clock) {
                 Ok(status) => rpc::ok(id, status_json(status)),
-                Err(error) => problem_response(id, -32006, error),
+                Err(error) => {
+                    warn!("call={} install failed: {}", call, error.detail());
+                    problem_response(id, -32006, error)
+                }
             },
-            control::Command::InstallStaged(install) => match self.install_staged(install, clock) {
-                Ok(status) => rpc::ok(id, status_json(status)),
-                Err(error) => problem_response(id, -32006, error),
-            },
+            control::Command::InstallStaged(install) => {
+                match self.install_staged(install, call, clock) {
+                    Ok(status) => rpc::ok(id, status_json(status)),
+                    Err(error) => {
+                        warn!("call={} install failed: {}", call, error.detail());
+                        problem_response(id, -32006, error)
+                    }
+                }
+            }
             control::Command::Uninstall {
                 service,
                 purge,
@@ -314,6 +328,23 @@ pub(super) fn status_response(
 /// through here keeps the `data.kind` and the code together.
 pub(super) fn problem_response(id: Option<Value>, code: i32, error: ProblemError) -> rpc::Response {
     rpc::err_data(id, code, error.detail(), error.problem.error_data())
+}
+
+/// Put the request's call number into the structured error payload.
+///
+/// Only errors carry it: a successful response has no request metadata, and
+/// the number exists to name a failure in the log (`call=7`). The category
+/// (`kind`) stays exactly where it was, so a reader that only knows the old
+/// shape keeps working.
+pub(super) fn stamp_call(mut response: rpc::Response, call: CallId) -> rpc::Response {
+    let Some(error) = response.error.as_mut() else {
+        return response;
+    };
+    let data = error.data.get_or_insert_with(|| json!({}));
+    if let Value::Object(map) = data {
+        map.insert("call".to_string(), json!(call));
+    }
+    response
 }
 
 pub(super) fn status_json(status: Status) -> Value {

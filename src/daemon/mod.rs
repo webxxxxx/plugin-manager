@@ -8,6 +8,7 @@ use serde_json::Value;
 #[cfg(not(feature = "http"))]
 type Api = ();
 use crate::face::uichannel::EventBus;
+use crate::kernel::call::CallId;
 use crate::kernel::registry::Registry;
 use crate::platform::config::Config;
 #[cfg(test)]
@@ -80,6 +81,9 @@ struct Daemon {
     #[cfg_attr(not(feature = "http"), allow(dead_code))]
     pub(crate) api: Option<Arc<Api>>,
     pub(crate) shutdown: bool,
+    /// The next call number to hand out (#343). In-memory only: a restart
+    /// starts again at one, and `starting` in `svcd.log` is the boundary.
+    pub(crate) next_call: CallId,
     pub(crate) catalog: crate::face::catalog::Catalog,
     /// The one UI event bus built by the composition root. Only the HTTP
     /// surface publishes to it (#326).
@@ -147,9 +151,19 @@ impl Daemon {
             rx,
             api,
             shutdown: false,
+            next_call: CallId::FIRST,
             catalog: crate::face::catalog::Catalog::new(),
             #[cfg(feature = "http")]
             bus,
         }
+    }
+
+    /// The one allocation point: one management request, one number. Every
+    /// way in (control channel, `/rpc`, the HTTP faces behind them) ends up in
+    /// [`Daemon::handle`], so a request cannot be counted twice or missed.
+    fn allocate_call(&mut self) -> CallId {
+        let call = self.next_call;
+        self.next_call = call.next();
+        call
     }
 }
