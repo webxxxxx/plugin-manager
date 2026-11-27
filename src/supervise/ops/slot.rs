@@ -13,7 +13,6 @@ use crate::kernel::registry::{Exec, Lifecycle, Ready, Restart, State};
 use crate::platform::host::wake::Wake;
 use crate::platform::log::{self, LogWriter};
 use crate::platform::paths::Paths;
-use crate::supervise::check::stop_reason::StopReason;
 use crate::supervise::model::supervisor::{self, Action, Event, Machine};
 use crate::wire::contract::stdio::{self, Plan, Streams, Target};
 use crate::wire::contract::RAW_PROTOCOL;
@@ -25,6 +24,7 @@ use self::calls::PendingCalls;
 use self::commands::{abandon, apply_core_child_env, command_for};
 use self::frames::Frames;
 use self::handle::SlotRequest;
+use self::started::StartedFlow;
 use self::stop::StopFlow;
 use self::tree::Descendants;
 
@@ -73,23 +73,13 @@ pub(crate) struct Slot {
     start_deadline: Option<u64>,
     stop_deadline: Option<u64>,
     kill_deadline: Option<u64>,
+    /// The stop action's own state, including the reason it runs for.
     stop: StopFlow,
-    /// The explicit reason for the current stop request (`stop` vs the
-    /// daemon's own shutdown); a crash/exit cause wins when there is one.
-    stop_request: StopReason,
     /// The start action (`lifecycle.start`) running before the process spawns.
     /// It is a preparation step: the process only starts once it exits.
     prelude: Option<ActionRun>,
-    /// The post-ready action (`lifecycle.started`) for the current spawn.
-    started: Option<ActionRun>,
-    /// The next Ready event of this spawn must run the started action instead
-    /// of settling it.
-    started_owed: bool,
-    /// The pid whose Ready is withheld while the started action runs.
-    ready_pending: Option<u32>,
-    /// Why the current start attempt failed; read once by the start request so
-    /// it reports the reason instead of waiting out the whole window.
-    start_failure: Option<String>,
+    /// The post-ready action (`lifecycle.started`) and its gate state.
+    started: StartedFlow,
     /// The process exited while the stop action was still owed. The exit is
     /// applied once that action ends, so `Stopped` means the cleanup finished.
     exit_awaiting_action: Option<(u32, Option<i32>)>,
@@ -169,12 +159,8 @@ impl Slot {
             stop_deadline: None,
             kill_deadline: None,
             stop: StopFlow::new(),
-            stop_request: StopReason::Stop,
             prelude: None,
-            started: None,
-            started_owed: false,
-            ready_pending: None,
-            start_failure: None,
+            started: StartedFlow::new(),
             exit_awaiting_action: None,
             stop_after_action: false,
             tree: None,
@@ -246,19 +232,6 @@ impl Slot {
         self.lifecycle
             .as_ref()
             .and_then(|lifecycle| lifecycle.stop.as_ref())
-    }
-
-    /// The definition's post-ready action, if any.
-    fn started_action(&self) -> Option<&crate::kernel::registry::Hook> {
-        self.lifecycle
-            .as_ref()
-            .and_then(|lifecycle| lifecycle.started.as_ref())
-    }
-
-    /// Why the last attempt of this service failed to start, consumed by the
-    /// start request so it fails fast instead of waiting out the window.
-    pub(crate) fn take_start_failure(&mut self) -> Option<String> {
-        self.start_failure.take()
     }
 
     pub(crate) fn set_restart(&mut self, restart: Restart) {
@@ -383,26 +356,8 @@ impl Slot {
     }
 
     pub(crate) fn apply(&mut self, event: Event, now: u64) {
-        if let Event::Ready { pid } = event {
-            if self.gate_ready(pid, now) {
-                return;
-            }
-        }
-        // Anything else that reaches the machine while the started action runs
-        // must not race it: a stop, an exit, a start timeout, a new attempt all
-        // kill the action first. The settle path clears the field before
-        // applying its own Ready, so a good run is never aborted here.
-        if self.started.is_some() {
-            if let Event::Exited { code, .. } = event {
-                if self.machine.state == State::Starting {
-                    self.start_failure = Some(format!(
-                        "service exited (code {}) while the started action ran",
-                        code.map(|code| code.to_string())
-                            .unwrap_or_else(|| "none".into())
-                    ));
-                }
-            }
-            self.abort_started();
+        if self.intercept(event, now) {
+            return;
         }
         let actions = self.machine.step(event, now);
         self.run_actions(actions, now);
@@ -413,11 +368,8 @@ impl Slot {
                 Action::Spawn => {
                     self.abort_stop_action();
                     self.abort_prelude();
-                    self.abort_started();
                     self.stop.reset();
-                    self.stop_request = StopReason::Stop;
-                    self.start_failure = None;
-                    self.started_owed = self.started_action().is_some();
+                    self.reset_started();
                     self.fail_pending("service is restarting");
                     self.begin_start(now);
                 }
@@ -472,139 +424,6 @@ impl Slot {
                 }
             }
         }
-    }
-
-    fn spawn_process(&mut self) -> Result<u32, String> {
-        self.exit_while_tree_alive = None;
-        if self.tree.is_none() {
-            self.tree = crate::platform::host::process::Tree::new();
-            if self.tree.is_none() {
-                warn!(
-                    "{}: process job unavailable; stop only terminates the leader",
-                    self.id
-                );
-            }
-        }
-        let plugin_dir = self.plugin_dir.as_deref();
-        let mut command = command_for(&self.exec);
-        match plugin_dir {
-            // A core service is written by the operator and keeps the old
-            // environment surface (#312). The process is its start action.
-            None => apply_core_child_env(&mut command, &self.id, "start", &self.paths),
-            Some(_) => apply_plugin_child_env(&mut command, plugin_dir, &self.paths),
-        }
-        let blob_dir = self.paths.temp_dir.clone();
-        let _ = std::fs::create_dir_all(crate::platform::storage::incoming_dir(&self.paths));
-        command.env("SVCD_TEMP_DIR", &blob_dir);
-        let plan = match self.exec.ready {
-            Ready::Notify => Plan::notify(),
-            Ready::Exec => Plan::exec(self.frames.protocol()),
-        };
-        let (mut child, streams) =
-            stdio::spawn(command, plan).map_err(|error| error.to_string())?;
-        if let Err(error) = crate::platform::host::process::adopt(&child) {
-            warn!("{}: parent-death protection: {}", self.id, error);
-        }
-        if let Some(tree) = &self.tree {
-            if !tree.assign(&child) {
-                warn!(
-                    "{}: cannot assign the process job; stop only terminates the leader",
-                    self.id
-                );
-            }
-        }
-        let pid = child.id();
-        info!(
-            "{}: spawned pid {} (ready={:?})",
-            self.id, pid, self.exec.ready
-        );
-        let log = match LogWriter::open(
-            &self.paths.logs_dir,
-            &self.id,
-            &format!("plugin:{}", self.id),
-            &self.limits,
-            log::clock(),
-            false,
-        ) {
-            Ok(sink) => Some(Arc::new(Mutex::new(sink))),
-            Err(error) => {
-                error!("{}: cannot open service log: {}", self.id, error);
-                None
-            }
-        };
-        self.log = log.clone();
-
-        let Streams {
-            stdin,
-            stdout,
-            stderr,
-        } = streams;
-
-        // Protocol 3 always runs over the raw transport: the hub owns stdio,
-        // stream 0 carries JSON-RPC when the instance is a channel peer, and
-        // streams >= 1 carry raw payloads. Below is the JSON-only path.
-        if self.frames.protocol() == RAW_PROTOCOL {
-            self.stdin = None;
-            let (Some(stdin), Some(stdout), Some(stderr)) = (stdin, stdout, stderr) else {
-                return abandon(&mut child, "protocol 3 needs piped stdio");
-            };
-            if let Err(error) = self.start_raw_transport(stdin, stdout, stderr, log.clone()) {
-                return abandon(&mut child, error);
-            }
-            self.child = Some(child);
-            self.adopted = false;
-            return Ok(pid);
-        }
-
-        if self.exec.ready == Ready::Notify {
-            let (sender, receiver) = mpsc::sync_channel(FRAME_QUEUE);
-            let Some(stdout) = stdout else {
-                return abandon(&mut child, "piped stdout is missing");
-            };
-            let Some(stderr) = stderr else {
-                return abandon(&mut child, "piped stderr is missing");
-            };
-            if let Err(error) = self.stdio.frames(
-                self.id.clone(),
-                self.frames.protocol(),
-                stdout,
-                Some(stderr),
-                sender,
-                self.wake.clone(),
-                log.clone(),
-                &self.limits,
-            ) {
-                return abandon(&mut child, error.to_string());
-            }
-
-            self.stdin = stdin;
-            self.frames.attach(receiver);
-            self.pending.reset();
-            self.ping_id = 1;
-        } else {
-            self.stdin = None;
-            let Some(stdout) = stdout else {
-                return abandon(&mut child, "piped stdout is missing");
-            };
-            let Some(stderr) = stderr else {
-                return abandon(&mut child, "piped stderr is missing");
-            };
-
-            if let Err(error) = self.stdio.logs(
-                self.id.clone(),
-                stdout,
-                Some(stderr),
-                log.clone(),
-                &self.limits,
-            ) {
-                return abandon(&mut child, error.to_string());
-            }
-            self.frames.detach();
-        }
-
-        self.child = Some(child);
-        self.adopted = false;
-        Ok(pid)
     }
 
     fn send_ping(&mut self) {
@@ -746,6 +565,7 @@ mod commands;
 mod frames;
 mod handle;
 mod prelude;
+mod spawn;
 mod started;
 mod stop;
 mod tree;

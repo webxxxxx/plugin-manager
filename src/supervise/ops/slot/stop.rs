@@ -4,11 +4,14 @@
 
 use super::action::{ActionEnd, ActionRun};
 use super::*;
+use crate::supervise::check::stop_reason::StopReason;
 
 /// The stop action's state. A stop can preempt a restart or a crash cleanup,
 /// so the flow remembers which of those events must resume once the hook ends.
 pub(super) struct StopFlow {
     hook: Option<ActionRun>,
+    /// Why this stop runs; the ended instance's cause wins over the request.
+    reason: StopReason,
     /// The stop action was already attempted for this process; a spawn failure
     /// is not retried.
     started: bool,
@@ -23,10 +26,19 @@ impl StopFlow {
     pub(super) fn new() -> StopFlow {
         StopFlow {
             hook: None,
+            reason: StopReason::Stop,
             started: false,
             backoff_pending: false,
             cleanup_then_spawn: false,
         }
+    }
+
+    pub(super) fn set_reason(&mut self, reason: StopReason) {
+        self.reason = reason;
+    }
+
+    pub(super) fn reason(&self) -> StopReason {
+        self.reason
     }
 
     pub(super) fn running(&self) -> bool {
@@ -75,6 +87,7 @@ impl StopFlow {
     /// pre-spawn work remains.
     pub(super) fn reset(&mut self) {
         self.started = false;
+        self.reason = StopReason::Stop;
         self.backoff_pending = false;
         self.cleanup_then_spawn = false;
     }
@@ -110,7 +123,7 @@ impl Slot {
     pub(super) fn stop_reason(&self) -> StopReason {
         match self.machine.cause {
             Some(cause) => StopReason::from_cause(Some(cause)),
-            None => self.stop_request,
+            None => self.stop.reason(),
         }
     }
 
@@ -289,7 +302,7 @@ impl Slot {
     /// action runs after it is gone, so a stop during the start action cancels
     /// that action instead of waiting for it.
     pub(crate) fn request_stop(&mut self, now: u64, reason: StopReason) {
-        self.stop_request = reason;
+        self.stop.set_reason(reason);
         self.abort_prelude();
         // Before any signal goes out: what leaves the process group has to be
         // found while the leader is still its parent (#332, ADR-0031).
