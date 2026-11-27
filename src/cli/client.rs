@@ -132,6 +132,9 @@ mod tests {
             message: "post-install hook failed".into(),
             data: None,
         };
-        assert_eq!(error_line("plugin", &bare), "plugin: post-install hook failed");
+        assert_eq!(
+            error_line("plugin", &bare),
+            "plugin: post-install hook failed"
+        );
     }
 }

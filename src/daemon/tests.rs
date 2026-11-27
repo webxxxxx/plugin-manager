@@ -485,8 +485,7 @@ fn a_malformed_frame_is_still_a_numbered_call() {
             reply: crate::wire::control::channel::Reply::plain(sender),
         },
     );
-    let reply: Value =
-        serde_json::from_str(&replies.recv().expect("reply")).expect("response");
+    let reply: Value = serde_json::from_str(&replies.recv().expect("reply")).expect("response");
     assert_eq!(reply["error"]["code"], -32700, "{reply}");
     assert_eq!(
         serde_json::to_string(&reply["error"]["data"]).expect("json"),

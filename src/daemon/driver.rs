@@ -60,7 +60,9 @@ impl Daemon {
         let request = match rpc::parse(&incoming.line) {
             Ok(request) => request,
             Err(response) => {
-                incoming.reply.send(rpc::to_line(&stamp_call(response, call)));
+                incoming
+                    .reply
+                    .send(rpc::to_line(&stamp_call(response, call)));
                 return;
             }
         };
@@ -71,13 +73,17 @@ impl Daemon {
         {
             let response =
                 rpc::err_data(id, -32000, "unauthorized", Problem::Internal.error_data());
-            incoming.reply.send(rpc::to_line(&stamp_call(response, call)));
+            incoming
+                .reply
+                .send(rpc::to_line(&stamp_call(response, call)));
             return;
         }
         let parsed = match control::parse(request) {
             Ok(parsed) => parsed,
             Err(response) => {
-                incoming.reply.send(rpc::to_line(&stamp_call(response, call)));
+                incoming
+                    .reply
+                    .send(rpc::to_line(&stamp_call(response, call)));
                 return;
             }
         };
@@ -87,7 +93,9 @@ impl Daemon {
             }
             command => {
                 let response = self.dispatch(clock, call, parsed.id, command);
-                incoming.reply.send(rpc::to_line(&stamp_call(response, call)));
+                incoming
+                    .reply
+                    .send(rpc::to_line(&stamp_call(response, call)));
             }
         }
         self.sync_catalog();
