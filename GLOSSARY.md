@@ -156,6 +156,10 @@ _Avoid_: 工具、方法、action
 一个服务在 MCP 工具面上的可见能力集合；死的只有 start，活的加上 manifest 能力。
 _Avoid_: 工具列表、API
 
+**钩子能力（Hook capability）**:
+一个能力由**一次短命动作**作答，而不是协议通道：宿主每次收到 `tools/call` 就起一个进程，参数写 stdin，stdout 就是这次调用的文本结果（与通道那侧 handler 的 stdout 同形）。只有没有通道的插件（`exec.ready` = `exec` / `port`）能声明它，而且它的每个能力都必须有——通道对端不许混用。它补的是与 `lifecycle.started` 同一类的位置：`started` 是「有一个窗口要跑一次性动作」，钩子能力是「有一次调用要跑一次性动作」。
+_Avoid_: 无通道能力、一次性能力（那指 oneshot 服务）、RPC 钩子
+
 **Era（协议代）**:
 MCP 客户端与服务器使用的协议形态：modern 用 `2026-07-28` 的每请求 `_meta`，legacy 用 `initialize` 握手（`2025-11-25` 及以前），dual-era 两者都支持。
 _Avoid_: 版本（具体版本号是日期；Era 是协议形态）

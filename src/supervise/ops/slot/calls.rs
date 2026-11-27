@@ -166,6 +166,15 @@ impl Slot {
             Some(contract) => invocation.timeout.min(contract.limits.max_timeout),
             None => invocation.timeout,
         };
+        // A capability with a hook has no channel behind it: the call is one
+        // short-lived process (#342). Everything the channel path validates
+        // (known capability, inline limit, running state) already passed.
+        if let Some(hook) = self.capability_hook(invocation.capability.as_str()) {
+            let capability = invocation.capability.as_str().to_string();
+            let sink = sink.take().expect("call sink must be present");
+            self.spawn_hook_call(&capability, hook, invocation, timeout, sink);
+            return Ok(());
+        }
         let id = self.pending.allocate();
         let mut params = json!({
             "name": invocation.capability.as_str(),

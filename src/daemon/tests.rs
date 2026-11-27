@@ -73,6 +73,7 @@ fn service(id: &str, deps: &[&str]) -> Service {
             interpreter: None,
         }),
         lifecycle: None,
+        capability_hooks: Default::default(),
         enabled: true,
         restart: crate::kernel::registry::Restart::OnFailure,
         remain_after_exit: false,

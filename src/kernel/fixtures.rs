@@ -34,6 +34,7 @@ pub(crate) fn test_service() -> Service {
             interpreter: None,
         }),
         lifecycle: None,
+        capability_hooks: Default::default(),
         enabled: true,
         restart: Restart::OnFailure,
         remain_after_exit: false,

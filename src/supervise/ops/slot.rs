@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use crate::kernel::contract::ProgressToken;
 use crate::kernel::contract::{Contract, Invocation, Reply, ReplySink, Settled};
 use crate::kernel::failure::{Class, Failure, Rejection, Retry};
-use crate::kernel::registry::{Exec, Lifecycle, Ready, Restart, State};
+use crate::kernel::registry::{Exec, Hook, Lifecycle, Ready, Restart, State};
 use crate::platform::host::wake::Wake;
 use crate::platform::log::{self, LogWriter};
 use crate::platform::paths::Paths;
@@ -103,6 +103,11 @@ pub(crate) struct Slot {
     adopted: bool,
     /// Optional contract used to validate capabilities and inline limits.
     contract: Option<Contract>,
+    /// Capabilities answered by a one-shot action instead of the channel (#342).
+    capability_hooks: std::collections::BTreeMap<String, Hook>,
+    /// Hook calls in flight. Bounded: each call is a process, so an unbounded
+    /// fan-out would fork the host to death.
+    hook_calls: Arc<std::sync::atomic::AtomicUsize>,
     /// Default timeout for a call that does not carry its own.
     call_timeout: std::time::Duration,
     /// Face-side projection of a plugin notification (progress/logging).
@@ -173,6 +178,8 @@ impl Slot {
             ping_id: 1,
             adopted: false,
             contract: None,
+            capability_hooks: Default::default(),
+            hook_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             call_timeout: DEFAULT_CALL_TIMEOUT,
             notify_sink: None,
             request_tx,
@@ -222,6 +229,12 @@ impl Slot {
 
     pub(crate) fn set_lifecycle(&mut self, lifecycle: Option<Lifecycle>) {
         self.lifecycle = lifecycle;
+    }
+
+    /// Capability hooks, by capability name. Only a plugin with no protocol
+    /// channel has them (the loader rejects the other combinations).
+    pub(crate) fn set_capability_hooks(&mut self, hooks: std::collections::BTreeMap<String, Hook>) {
+        self.capability_hooks = hooks;
     }
 
     /// The definition's start action (a preparation step), if any.
@@ -577,6 +590,7 @@ impl Slot {
 }
 
 mod action;
+mod call_hook;
 mod calls;
 mod commands;
 mod frames;

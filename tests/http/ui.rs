@@ -601,6 +601,52 @@ fn plugin_web_ui_rpc_bridges_tools_call() {
 }
 
 #[test]
+fn a_capability_hook_answers_the_plugin_ui_rpc() {
+    let (_sandbox, address) = hook_ui_sandbox(43);
+    let base = plugin_ui_base(&address, "demo");
+
+    let started = request(&address, "POST", "/api/v1/services/demo/start", "", b"");
+    assert_eq!(started.status, 200, "{}", started.body);
+
+    // The page's `invoke()` lands on the same sink MCP does, so a hook that
+    // answers MCP has to answer `/rpc` too (#342).
+    let call = request(
+        &address,
+        "POST",
+        &format!("{}rpc", base),
+        "application/json",
+        &rpc_body(7, "mode"),
+    );
+    assert_eq!(call.status, 200, "{}", call.body);
+    assert_eq!(call.body["jsonrpc"], "2.0");
+    assert_eq!(call.body["id"], 7);
+    assert_eq!(call.body["result"]["isError"], false, "{}", call.body);
+    assert_eq!(
+        call.body["result"]["content"][0]["text"], "{\"mode\":\"tproxy\"}",
+        "{}",
+        call.body
+    );
+
+    // A failing hook is a tool error inside the JSON-RPC envelope, and the one
+    // error it must not be is a timeout.
+    let failed = request(
+        &address,
+        "POST",
+        &format!("{}rpc", base),
+        "application/json",
+        &rpc_body(8, "fail"),
+    );
+    assert_eq!(failed.status, 200, "{}", failed.body);
+    assert_eq!(failed.body["result"]["isError"], true, "{}", failed.body);
+    let detail = failed.body["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(detail.contains("exited"), "{detail}");
+    assert!(!detail.contains("timed out"), "{detail}");
+}
+
+#[test]
 fn plugin_ui_sse_streams_plugin_notifications() {
     let (_sandbox, address) = daemon_with_web_event_plugin(51);
     let base = plugin_ui_base(&address, "demo");

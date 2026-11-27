@@ -26,7 +26,7 @@ mod manifest;
 mod signature;
 mod tar;
 
-pub(crate) use manifest::check_platform;
+pub(crate) use manifest::{check_capability_delivery, check_platform};
 pub use manifest::{
     declares_hooks, parse_manifest, valid_display_name, valid_version, validate_manifest,
 };
@@ -624,13 +624,14 @@ mod tests {
             validate_manifest(&parse_manifest(&bytes).expect("parse")).expect_err("stray port");
         assert!(error.detail().contains("exec.port"), "{error}");
 
-        // A port-ready plugin has no protocol channel for capabilities.
+        // A port-ready plugin has no protocol channel for capabilities, so a
+        // capability without a hook has nothing to answer it (#342).
         let mut with_caps = value("port", Some(7893));
         with_caps["capabilities"] =
             json!([{"name": "status", "desc": "status", "inputSchema": {}}]);
         let bytes = serde_json::to_vec(&with_caps).expect("json");
         let error = validate_manifest(&parse_manifest(&bytes).expect("parse")).expect_err("caps");
-        assert!(error.detail().contains("capabilities"), "{error}");
+        assert!(error.detail().contains("needs a hook"), "{error}");
     }
 
     #[test]
@@ -699,7 +700,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_capabilities_on_an_exec_ready_plugin() {
+    fn a_capability_on_an_exec_ready_plugin_needs_a_hook() {
+        // One capability has exactly one way in: the channel for `notify`, a
+        // one-shot hook for a plugin with no channel (#342).
         let (bytes, _) = script_manifest();
         let mut value: Value = serde_json::from_slice(&bytes).expect("json");
         value["capabilities"] = json!([{
@@ -707,8 +710,31 @@ mod tests {
         }]);
         let bytes = serde_json::to_vec(&value).expect("json");
         let error = validate_manifest(&parse_manifest(&bytes).expect("parse"))
-            .expect_err("capabilities need a channel");
-        assert!(error.detail().contains("no protocol channel"), "{error}");
+            .expect_err("a capability with no channel and no hook cannot answer");
+        assert!(error.detail().contains("needs a hook"), "{error}");
+
+        // With a hook it is a valid shape.
+        value["capabilities"] = json!([{
+            "name": "status", "desc": "status", "inputSchema": {},
+            "hook": {"path": "payload/bin/clock.sh", "timeout": 5}
+        }]);
+        let bytes = serde_json::to_vec(&value).expect("json");
+        validate_manifest(&parse_manifest(&bytes).expect("parse")).expect("hook capability");
+
+        // A hook that is not in files[] never reaches the installed tree.
+        value["capabilities"][0]["hook"]["path"] = json!("payload/bin/missing.sh");
+        let bytes = serde_json::to_vec(&value).expect("json");
+        let error = validate_manifest(&parse_manifest(&bytes).expect("parse"))
+            .expect_err("hook outside files[]");
+        assert!(error.detail().contains("not in files[]"), "{error}");
+
+        // A channel peer already delivers the call, so a hook is a second way in.
+        value["capabilities"][0]["hook"]["path"] = json!("payload/bin/clock.sh");
+        value["exec"]["ready"] = json!("notify");
+        let bytes = serde_json::to_vec(&value).expect("json");
+        let error = validate_manifest(&parse_manifest(&bytes).expect("parse"))
+            .expect_err("notify plugin with a capability hook");
+        assert!(error.detail().contains("already delivers"), "{error}");
     }
 
     #[test]

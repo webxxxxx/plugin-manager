@@ -195,6 +195,7 @@ mod tests {
                 interpreter: None,
             }),
             lifecycle: None,
+            capability_hooks: Default::default(),
             enabled: true,
             restart: crate::kernel::registry::Restart::Never,
             remain_after_exit: false,

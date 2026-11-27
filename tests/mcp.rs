@@ -230,6 +230,78 @@ done
         );
     }
 
+    /// A plugin with no protocol channel: `exec` is a process that just stays
+    /// up, and the one capability is answered by a one-shot hook (#342).
+    fn write_hook_plugin(&self) {
+        let plugin = self.data.join("plugins").join("hookplug");
+        let version = plugin.join("1.0.0");
+        let bin = version.join("payload").join("bin");
+        fs::create_dir_all(&bin).expect("hook plugin bin");
+        fs::write(plugin.join("current"), "1.0.0").expect("current");
+
+        let (exec_path, exec_data, hook_path, hook_data, fail_path, fail_data, interpreter) =
+            if cfg!(windows) {
+                (
+                    "payload/bin/hook.cmd",
+                    b"@echo off\r\n:loop\r\ntimeout /t 1 >nul 2>&1\r\ngoto loop\r\n".to_vec(),
+                    "payload/bin/hook-mode.cmd",
+                    b"@echo off\r\necho {\"mode\":\"tproxy\"}\r\n".to_vec(),
+                    "payload/bin/hook-fail.cmd",
+                    b"@echo off\r\necho boom 1>&2\r\nexit /b 3\r\n".to_vec(),
+                    json!({"name": "cmd", "args": ["/C"]}),
+                )
+            } else {
+                (
+                    "payload/bin/hook.sh",
+                    b"#!/bin/sh\nwhile :; do sleep 1; done\n".to_vec(),
+                    "payload/bin/hook-mode.sh",
+                    // The hook prints the answer; that the arguments reach its
+                    // stdin is pinned by the slot unit test, where it echoes them.
+                    br#"#!/bin/sh
+printf '{"mode":"tproxy"}'
+"#
+                    .to_vec(),
+                    "payload/bin/hook-fail.sh",
+                    b"#!/bin/sh\necho boom >&2\nexit 3\n".to_vec(),
+                    json!({"name": "sh"}),
+                )
+            };
+        fs::write(version.join(exec_path), &exec_data).expect("hook exec");
+        fs::write(version.join(hook_path), &hook_data).expect("hook action");
+        fs::write(version.join(fail_path), &fail_data).expect("failing hook action");
+        let manifest = json!({
+            "schema": 1,
+            "id": "hookplug",
+            "name": "hookplug",
+            "version": "1.0.0",
+            "desc": "hook capability test plugin",
+            "platform": target(),
+            "protocol": 1,
+            "exec": {"path": exec_path, "args": [], "ready": "exec"},
+            "interpreter": interpreter,
+            "capabilities": [
+                {
+                    "name": "mode",
+                    "desc": "Proxy mode",
+                    "inputSchema": {"type": "object"},
+                    "hook": {"path": hook_path, "timeout": 10}
+                },
+                {
+                    "name": "fail",
+                    "desc": "Always fails",
+                    "inputSchema": {"type": "object"},
+                    "hook": {"path": fail_path, "timeout": 10}
+                }
+            ],
+            "files": []
+        });
+        fs::write(
+            version.join("manifest.json"),
+            serde_json::to_vec(&manifest).expect("manifest"),
+        )
+        .expect("write hook manifest");
+    }
+
     fn stop_plugin(&self) {
         let output = self.run_svc(&["stop", "demo"]);
         assert_eq!(
@@ -1224,4 +1296,54 @@ fn http_mcp_caps_the_request_body_at_one_mib() {
     let exact = http(&address, "POST", "/mcp", &body, &headers);
     assert_eq!(exact.status, 400, "{:?}", exact.body);
     assert_eq!(exact.json()["error"]["code"], -32700);
+}
+
+/// A plugin with no protocol channel answers its capabilities with a one-shot
+/// hook (#342): the tool is still listed and callable over MCP, and the hook's
+/// stdout is the result.
+#[test]
+fn a_capability_hook_answers_tools_call() {
+    let mut sandbox = Sandbox::new();
+    sandbox.write_hook_plugin();
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    let started = sandbox.run_svc(&["start", "hookplug"]);
+    assert_eq!(
+        started.status.code(),
+        Some(0),
+        "svc start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+
+    let mut mcp = sandbox.spawn_mcp("hooked");
+    let listed = mcp.request(1, "tools/list", modern_params(json!({"limit": 100})));
+    let names = tool_names(&listed["result"]["tools"]);
+    assert!(names.contains(&"hookplug.mode"), "{names:?}");
+
+    let called = mcp.request(
+        2,
+        "tools/call",
+        modern_params(json!({"name": "hookplug.mode", "arguments": {}})),
+    );
+    let result = called.get("result").expect("call result");
+    assert_eq!(result["isError"], false, "{result}");
+    let text = result["content"][0]["text"].as_str().expect("text");
+    let value: Value = serde_json::from_str(text).expect("the hook prints JSON");
+    assert_eq!(value["mode"], "tproxy");
+
+    // A hook that fails is a tool error that names its exit, not a timeout and
+    // never a successful call with an empty answer.
+    let failed = mcp.request(
+        3,
+        "tools/call",
+        modern_params(json!({"name": "hookplug.fail", "arguments": {}})),
+    );
+    let failed = failed.get("result").expect("call result");
+    assert_eq!(failed["isError"], true, "{failed}");
+    let detail = failed["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(detail.contains("exited"), "{detail}");
+    assert!(!detail.contains("timed out"), "{detail}");
 }

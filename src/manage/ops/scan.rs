@@ -6,7 +6,7 @@ use std::path::Path;
 use crate::kernel::contract::{Capability as KernelCapability, CapabilityName, Effect};
 use crate::kernel::failure::{Problem, ProblemError};
 use crate::kernel::registry::{
-    Exec, Hook, Interpreter, Kind, Lifecycle, Ready, Restart, Service, State, RESERVED_ID,
+    Exec, Hook, Interpreter, Kind, Lifecycle, Restart, Service, State, RESERVED_ID,
 };
 use crate::kernel::schema::{MAX_PROTOCOL, MAX_SCHEMA};
 use crate::manage as package;
@@ -143,10 +143,11 @@ pub(crate) fn service_from_manifest(
             idempotent: false,
         });
     }
-    if matches!(ready, Ready::Exec | Ready::Port(_)) && !caps.is_empty() {
-        return Err(Problem::Invalid
-            .error("exec.ready=exec/port cannot declare capabilities: no protocol channel"));
-    }
+    // One capability, one delivery path: the same decision the installer makes,
+    // so a package installed before #342 and one installed after it are judged
+    // by one function, not two copies of it. The package-only checks (action in
+    // `files[]`, timeout bounds) stay in verify: this reads an installed tree.
+    crate::manage::check::verify::check_capability_delivery(&manifest)?;
     let contract = crate::kernel::registry::contract_for(
         id,
         &manifest.version,
@@ -162,7 +163,7 @@ pub(crate) fn service_from_manifest(
         None => None,
         Some(lifecycle) => {
             let start = convert_lifecycle_hook(
-                "start",
+                "lifecycle.start",
                 version_dir,
                 lifecycle.start.as_ref(),
                 crate::kernel::registry::HOOK_START_TIMEOUT_MS,
@@ -171,7 +172,7 @@ pub(crate) fn service_from_manifest(
                 &mut any_script,
             )?;
             let started = convert_lifecycle_hook(
-                "started",
+                "lifecycle.started",
                 version_dir,
                 lifecycle.started.as_ref(),
                 crate::kernel::registry::HOOK_STARTED_TIMEOUT_MS,
@@ -180,7 +181,7 @@ pub(crate) fn service_from_manifest(
                 &mut any_script,
             )?;
             let stop = convert_lifecycle_hook(
-                "stop",
+                "lifecycle.stop",
                 version_dir,
                 lifecycle.stop.as_ref(),
                 crate::kernel::registry::HOOK_STOP_TIMEOUT_MS,
@@ -189,7 +190,7 @@ pub(crate) fn service_from_manifest(
                 &mut any_script,
             )?;
             let status = convert_lifecycle_hook(
-                "status",
+                "lifecycle.status",
                 version_dir,
                 lifecycle.status.as_ref(),
                 crate::kernel::registry::HOOK_STATUS_TIMEOUT_MS,
@@ -205,6 +206,27 @@ pub(crate) fn service_from_manifest(
             })
         }
     };
+
+    // Capability hooks are converted after `any_script` exists: a hook can be
+    // the only script in the package (#342).
+    let mut capability_hooks: std::collections::BTreeMap<String, Hook> = Default::default();
+    for capability in &manifest.capabilities {
+        let Some(hook) = capability.hook.as_ref() else {
+            continue;
+        };
+        let converted = convert_lifecycle_hook(
+            &format!("capabilities[{}].hook", capability.name),
+            version_dir,
+            Some(hook),
+            crate::kernel::registry::HOOK_CALL_TIMEOUT_MS,
+            crate::kernel::registry::HOOK_TIMEOUT_MAX_MS,
+            interpreter,
+            &mut any_script,
+        )?;
+        if let Some(hook) = converted {
+            capability_hooks.insert(capability.name.clone(), hook);
+        }
+    }
     if !any_script && interpreter.is_some() {
         return Err(Problem::Invalid.error(format!(
             "plugin {} declares an interpreter but has no script payload",
@@ -245,6 +267,7 @@ pub(crate) fn service_from_manifest(
             },
         }),
         lifecycle,
+        capability_hooks,
         enabled,
         // The manifest has no policy field yet; plugins keep the historical
         // on-failure behaviour and stop at Failed after the retry budget.
@@ -263,8 +286,12 @@ pub(crate) fn service_from_manifest(
     })
 }
 
+/// Turn a manifest hook into the runtime one. `label` is what the error messages
+/// call it — `lifecycle.start`, `capabilities[mode].hook` — so one function
+/// serves both places without a message that lies about where the hook came
+/// from.
 pub(crate) fn convert_lifecycle_hook(
-    name: &str,
+    label: &str,
     version_dir: &Path,
     hook: Option<&package::Hook>,
     default_timeout_ms: u64,
@@ -277,19 +304,15 @@ pub(crate) fn convert_lifecycle_hook(
     };
     let path = version_dir.join(&hook.path);
     if !path.is_file() {
-        return Err(Problem::Invalid.error(format!(
-            "lifecycle.{} is missing: {}",
-            name,
-            path.display()
-        )));
+        return Err(Problem::Invalid.error(format!("{} is missing: {}", label, path.display())));
     }
     let is_script = !is_native_file(&path)?;
     if is_script {
         *any_script = true;
         if interpreter.is_none() {
             return Err(Problem::Invalid.error(format!(
-                "lifecycle.{} is a script but the manifest declares no interpreter",
-                name
+                "{} is a script but the manifest declares no interpreter",
+                label
             )));
         }
     }
@@ -297,8 +320,8 @@ pub(crate) fn convert_lifecycle_hook(
         Some(seconds) if seconds >= 1 && seconds <= max_timeout_ms / 1000 => seconds * 1000,
         Some(seconds) => {
             return Err(Problem::Invalid.error(format!(
-                "lifecycle.{} timeout must be between 1 and {} seconds, got {}",
-                name,
+                "{} timeout must be between 1 and {} seconds, got {}",
+                label,
                 max_timeout_ms / 1000,
                 seconds
             )))
@@ -436,10 +459,54 @@ mod tests {
         assert_eq!(surface[0].desc, "run it");
         assert_eq!(surface[0].effect, Effect::Write);
         assert!(!surface[0].idempotent);
+        // A channel peer delivers the call itself: no hook map (#342).
+        assert!(service.capability_hooks.is_empty());
         assert!(!service
             .contract
             .failures
             .contains(&crate::kernel::failure::Class::Cancelled));
+    }
+
+    /// A plugin with no channel answers its capabilities with a one-shot hook,
+    /// so the loader has to keep the converted action next to the contract
+    /// surface (#342).
+    #[test]
+    fn scan_converts_a_capability_hook() {
+        let id = "contract-hook";
+        make_plugin(id, "", false);
+        let manifest_path = root()
+            .join("data/plugins")
+            .join(id)
+            .join("1.0.0")
+            .join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("manifest"))
+                .expect("manifest json");
+        manifest["exec"]["ready"] = serde_json::json!("exec");
+        manifest["capabilities"] = serde_json::json!([{
+            "name": "run",
+            "desc": "run it",
+            "inputSchema": {"type": "object"},
+            "hook": {"path": "payload/bin/demo", "args": ["mode"], "timeout": 4}
+        }]);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).expect("manifest"),
+        )
+        .expect("write manifest");
+
+        let (services, _) = scan(paths(), &crate::platform::limits::test_default());
+        let service = services
+            .iter()
+            .find(|service| service.id == id)
+            .expect("plugin is scanned");
+        let hook = service
+            .capability_hooks
+            .get("run")
+            .expect("the capability has its action");
+        assert!(hook.path.ends_with("payload/bin/demo"), "{}", hook.path);
+        assert_eq!(hook.args, vec!["mode".to_string()]);
+        assert_eq!(hook.timeout_ms, 4_000);
     }
 
     /// #307: an install to a second root builds the service before the root is
