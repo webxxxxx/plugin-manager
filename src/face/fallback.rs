@@ -344,8 +344,10 @@ mod tests {
         let closed = String::from_utf8_lossy(&respond(&closed, &request, &lan)).to_string();
         assert!(closed.starts_with("HTTP/1.1 401"), "{closed}");
 
-        let mut settings = crate::platform::settings::Settings::default();
-        settings.vendor_login = true;
+        let settings = crate::platform::settings::Settings {
+            vendor_login: true,
+            ..Default::default()
+        };
         let open = Config::with_paths(settings, None, paths);
         let open = String::from_utf8_lossy(&respond(&open, &request, &lan)).to_string();
         assert!(open.starts_with("HTTP/1.1 200"), "{open}");

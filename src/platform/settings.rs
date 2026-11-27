@@ -197,6 +197,11 @@ impl Settings {
 mod env;
 mod values;
 
+// Re-exported for the two readers that need it directly: the config tests and
+// the settings face (`face/api/settings.rs`, http only). Without the http
+// feature nothing outside the tests uses it, and an unconditional re-export
+// warns under `--no-default-features`.
+#[cfg(any(test, feature = "http"))]
 pub use values::parse_byte_size;
 use values::{parse_bool, parse_u64, parse_usize, strip_comment};
 

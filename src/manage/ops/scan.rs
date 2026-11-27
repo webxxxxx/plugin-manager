@@ -147,7 +147,7 @@ pub(crate) fn service_from_manifest(
     // so a package installed before #342 and one installed after it are judged
     // by one function, not two copies of it. The package-only checks (action in
     // `files[]`, timeout bounds) stay in verify: this reads an installed tree.
-    crate::manage::check::verify::check_capability_delivery(&manifest)?;
+    crate::manage::check::verify::check_capability_delivery(manifest)?;
     let contract = crate::kernel::registry::contract_for(
         id,
         &manifest.version,

@@ -1674,4 +1674,5 @@ fn a_remain_after_exit_one_shot_keeps_running_after_start() {
     assert!(status["result"]["summary"]["pid"].is_null(), "{status}");
 }
 
+mod call;
 mod plugins;
