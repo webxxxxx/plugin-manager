@@ -103,6 +103,9 @@ pub enum Ready {
 /// supervised under the state machine's start timeout; its own `timeout` is
 /// kept for parity with a core definition and is not armed separately.
 pub const HOOK_START_TIMEOUT_MS: u64 = 30_000;
+/// The post-ready action gets a shorter default: the process is already up and
+/// a stuck hook keeps `starting` visible. The start request budgets for it.
+pub const HOOK_STARTED_TIMEOUT_MS: u64 = 15_000;
 pub const HOOK_STOP_TIMEOUT_MS: u64 = 10_000;
 pub const HOOK_STATUS_TIMEOUT_MS: u64 = 5_000;
 pub const HOOK_TIMEOUT_MAX_MS: u64 = 300_000;
@@ -127,8 +130,9 @@ pub struct Exec {
     pub interpreter: Option<Interpreter>,
 }
 
-/// One lifecycle hook for a core service. `timeout_ms` is only used by stop
-/// and status; the start command is supervised under the normal start timeout.
+/// One lifecycle hook for a core service. `timeout_ms` bounds the action own
+/// window: the start action runs before the process exists, the started action
+/// runs after the process is ready, and stop/status bound themselves.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hook {
     pub path: String,
@@ -139,15 +143,18 @@ pub struct Hook {
     pub interpreter: Option<Interpreter>,
 }
 
-/// Optional start/stop/status commands declared by a service definition or an
-/// `.spk` manifest.
+/// Optional actions around the supervised process, declared by a service
+/// definition or an `.spk` manifest.
 ///
-/// `start` replaces `exec` as the supervised foreground process; `stop` runs
-/// before the normal polite stop sequence; `status` is a probe run by
-/// `svc status`.
+/// `start` is preparation: it runs before every spawn, must exit, and a failure
+/// means the process is never spawned (#323). `started` is the post-ready step:
+/// it runs once the instance is ready and before the service is reported
+/// `running`, and a failure fails this start. `stop` runs after the process is
+/// gone, on every exit path. `status` is a probe run by `svc status`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Lifecycle {
     pub start: Option<Hook>,
+    pub started: Option<Hook>,
     pub stop: Option<Hook>,
     pub status: Option<Hook>,
 }

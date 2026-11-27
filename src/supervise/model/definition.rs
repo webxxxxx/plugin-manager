@@ -254,6 +254,7 @@ fn load_scripts(
         let lifecycle = if declarations.stop || declarations.status {
             Some(Lifecycle {
                 start: None,
+                started: None,
                 stop: declarations.stop.then(|| hook("stop", 10_000)),
                 status: declarations.status.then(|| hook("status", 5_000)),
             })
@@ -395,6 +396,7 @@ struct CoreDefinition {
 #[derive(Deserialize)]
 struct LifecycleDefinition {
     start: Option<HookDefinition>,
+    started: Option<HookDefinition>,
     stop: Option<HookDefinition>,
     status: Option<HookDefinition>,
 }
@@ -511,6 +513,16 @@ fn validate(
                     )
                 })
                 .transpose()?,
+            started: lifecycle
+                .started
+                .map(|hook| {
+                    convert_hook(
+                        hook,
+                        crate::kernel::registry::HOOK_STARTED_TIMEOUT_MS,
+                        crate::kernel::registry::HOOK_TIMEOUT_MAX_MS,
+                    )
+                })
+                .transpose()?,
             stop: lifecycle
                 .stop
                 .map(|hook| {
@@ -534,6 +546,17 @@ fn validate(
         }),
         None => None,
     };
+    // A one-shot is `running` with no pid after its process exits; a post-ready
+    // action would have nothing to gate and could race that exit.
+    if definition.remain_after_exit
+        && lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| lifecycle.started.is_some())
+    {
+        return Err(
+            "remain_after_exit is incompatible with lifecycle.started: a one-shot exits right after spawn, so there is no ready instance left for the started action to gate".into(),
+        );
+    }
 
     for dep in &definition.dependencies {
         if !valid_id(dep) {

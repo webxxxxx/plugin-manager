@@ -117,11 +117,11 @@ impl Slot {
     fn spawn_after_prelude(&mut self, now: u64) {
         match self.spawn_process() {
             Ok(pid) => {
-                let actions = self.machine.step(Event::Spawned { pid }, now);
-                self.run_actions(actions, now);
+                self.apply(Event::Spawned { pid }, now);
                 if self.exec.ready == Ready::Exec {
-                    let actions = self.machine.step(Event::Ready { pid }, now);
-                    self.run_actions(actions, now);
+                    // Through `apply`, so a declared started action gates this
+                    // Ready exactly like a protocol peer's first response.
+                    self.apply(Event::Ready { pid }, now);
                 } else {
                     self.send_ping();
                 }

@@ -452,9 +452,14 @@ impl TarSink for SpkSink {
 pub fn validate_staged_payload(manifest: &Manifest, root: &Path) -> Result<(), ProblemError> {
     let mut executables = vec![manifest.exec.path.as_str()];
     if let Some(lifecycle) = &manifest.lifecycle {
-        for hook in [&lifecycle.start, &lifecycle.stop, &lifecycle.status]
-            .into_iter()
-            .flatten()
+        for hook in [
+            &lifecycle.start,
+            &lifecycle.started,
+            &lifecycle.stop,
+            &lifecycle.status,
+        ]
+        .into_iter()
+        .flatten()
         {
             executables.push(hook.path.as_str());
         }

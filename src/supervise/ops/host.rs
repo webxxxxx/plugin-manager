@@ -262,7 +262,12 @@ impl Supervisor {
                     // Finish the interrupted stop the same way a live stop
                     // does: stop action first, then signals and the kill
                     // window. Otherwise the service's cleanup would be lost.
-                    slot.request_stop(now.mono_ms);
+                    // The record does not say who asked, so the action sees the
+                    // plain `stop` reason rather than a guessed one.
+                    slot.request_stop(
+                        now.mono_ms,
+                        crate::supervise::check::stop_reason::StopReason::Stop,
+                    );
                 }
                 let adopted = slot.machine.state;
                 let adopted_pid = slot.machine.pid;

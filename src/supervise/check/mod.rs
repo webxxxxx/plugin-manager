@@ -7,3 +7,5 @@ pub mod peer;
 pub mod reconcile;
 pub mod restart;
 pub mod start;
+pub mod started;
+pub mod stop_reason;

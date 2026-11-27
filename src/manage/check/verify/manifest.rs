@@ -238,6 +238,7 @@ fn check_lifecycle(manifest: &Manifest) -> Result<(), ProblemError> {
     let mut declared = false;
     for (name, hook, max_seconds) in [
         ("start", lifecycle.start.as_ref(), 300u64),
+        ("started", lifecycle.started.as_ref(), 300u64),
         ("stop", lifecycle.stop.as_ref(), 300u64),
         ("status", lifecycle.status.as_ref(), 30u64),
     ] {
@@ -269,7 +270,9 @@ fn check_lifecycle(manifest: &Manifest) -> Result<(), ProblemError> {
         }
     }
     if !declared {
-        return Err(Problem::Invalid.error("lifecycle declares no start, stop or status action"));
+        return Err(
+            Problem::Invalid.error("lifecycle declares no start, started, stop or status action")
+        );
     }
     Ok(())
 }

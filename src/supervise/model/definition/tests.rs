@@ -565,6 +565,33 @@ fn rejects_remain_after_exit_for_a_notify_ready_definition() {
 }
 
 #[test]
+fn rejects_a_started_action_on_a_one_shot_definition() {
+    // A one-shot keeps no process after its exit, so there is no ready
+    // instance for the post-ready action to gate; accepting the pair would
+    // make the action's outcome racy with the exit.
+    let dir = TempDir::new();
+    let mut body = definition("odd");
+    body["remain_after_exit"] = json!(true);
+    let hook = if cfg!(windows) {
+        r"C:\Windows\System32\true.cmd"
+    } else {
+        "/bin/true"
+    };
+    body["lifecycle"] = json!({"started": {"path": hook}});
+    write_definition(&dir, "odd", body);
+
+    let loaded = load_services(
+        &services_dir(&dir),
+        &crate::platform::limits::test_default(),
+    );
+
+    assert!(loaded.registry.get("odd").is_none());
+    assert_eq!(loaded.issues.len(), 1, "{:?}", loaded.issues);
+    let reason = &loaded.issues[0].reason;
+    assert!(reason.contains("started"), "{reason}");
+}
+
+#[test]
 fn keeps_notify_services_and_exec_one_shots_loadable() {
     // The rejection above must not narrow the two legitimate shapes: a
     // notify-ready long-running service, and an exec one-shot whose work

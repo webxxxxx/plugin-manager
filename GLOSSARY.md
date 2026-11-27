@@ -244,6 +244,14 @@ _Avoid_: 二进制插件、直通 WebSocket
 服务退出后怎么办的声明：`always`（任何退出都重启）、`on-failure`（仅失败退出重启，默认）、`never`（不重启，退出即 stopped）。它和 `enabled`（开机是否启动）是两个独立维度。
 _Avoid_: 自启、enabled、看护策略
 
+**started 钩子（Started hook）**:
+spawn 达到 Ready 之后、服务报 `Running` 之前跑一次的生命周期动作（`lifecycle.started`）：必须退出，非零或超时即本次启动失败；每次 spawn（`svc start`、`svc restart`、崩溃重试）都重跑，所以必须幂等。它补的是 `start`（spawn 之前）与 `stop`（进程消失之后）之间的空窗口——网关类插件用它「等端口 → 装 nat 规则」，因此不再需要看护 shell。
+_Avoid_: 启动后脚本、ready 钩子、ExecStartPost
+
+**停止原因（Stop reason）**:
+`stop` 动作拿到的 `SVCD_STOP_REASON`：`stop`（显式停 / restart 的停止半程）、`shutdown`（daemon 整体退出）、`crash`（进程非正常结束，含启动期崩溃）、`exit`（正常结束且不重启）、`start-failed`（start/started 动作失败或 spawn 失败）。原因由触发事件决定，不靠推断状态；`SVCD_LAST_EXIT` 只在 `crash` / `exit` 时是退出码，其余为 `none`。一个钩子按原因分支，替代「每个状态一个回调」。
+_Avoid_: 退出原因、失败原因
+
 **运行态记录（Runtime record）**:
 `<data>/run/<id>.json`：一个服务上一次已知的状态、pid 与 pid starttime。写入时带 boot id，用于 daemon 重启后校验并接管存活进程；不是第二份状态真相，接管后仍以监督槽为准。
 _Avoid_: 状态文件、pidfile、快照

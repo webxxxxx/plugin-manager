@@ -395,6 +395,102 @@ fn clock_manifest(exec: &str, data: &[u8]) -> Value {
     })
 }
 
+fn gate_scripts(failing_started: bool) -> (String, Vec<u8>, String, Vec<u8>) {
+    if cfg!(windows) {
+        let exec = "payload/bin/gate.cmd".to_string();
+        let started = "payload/bin/gate-started.cmd".to_string();
+        let exec_data = b"@echo off\r\nif \"%~1\"==\"stop\" (\r\n  echo stop:%SVCD_STOP_REASON%:%SVCD_LAST_EXIT%>>\"%SVCD_PLUGIN_DIR%\\events.txt\"\r\n  exit /b 0\r\n)\r\nif \"%~1\"==\"status\" (\r\n  echo gate ok\r\n  exit /b 0\r\n)\r\nif \"%~1\"==\"crash\" (\r\n  ping -n 2 127.0.0.1 >nul\r\n  exit /b 1\r\n)\r\nif \"%~1\"==\"exit\" (\r\n  ping -n 2 127.0.0.1 >nul\r\n  exit /b 0\r\n)\r\n:loop\r\nping -n 2 127.0.0.1 >nul\r\ngoto loop\r\n"
+            .to_vec();
+        let started_data = if failing_started {
+            b"@echo off\r\necho started-failed>>\"%SVCD_PLUGIN_DIR%\\events.txt\"\r\nexit /b 3\r\n"
+                .to_vec()
+        } else {
+            b"@echo off\r\necho started>>\"%SVCD_PLUGIN_DIR%\\events.txt\"\r\nexit /b 0\r\n"
+                .to_vec()
+        };
+        (exec, exec_data, started, started_data)
+    } else {
+        let exec = "payload/bin/gate.sh".to_string();
+        let started = "payload/bin/gate-started.sh".to_string();
+        let exec_data = b"#!/bin/sh\ncase \"$1\" in\n  stop)\n    printf 'stop:%s:%s\\n' \"$SVCD_STOP_REASON\" \"$SVCD_LAST_EXIT\" >> \"$SVCD_PLUGIN_DIR/events.txt\"\n    ;;\n  status)\n    echo 'gate ok'\n    ;;\n  crash)\n    sleep 1\n    exit 1\n    ;;\n  exit)\n    sleep 1\n    exit 0\n    ;;\n  *)\n    while :; do sleep 1; done\n    ;;\nesac\n"
+            .to_vec();
+        let started_data = if failing_started {
+            b"#!/bin/sh\necho started-failed >> \"$SVCD_PLUGIN_DIR/events.txt\"\nexit 3\n".to_vec()
+        } else {
+            b"#!/bin/sh\necho started >> \"$SVCD_PLUGIN_DIR/events.txt\"\n".to_vec()
+        };
+        (exec, exec_data, started, started_data)
+    }
+}
+
+/// A gateway-shaped plugin: one long-lived exec, a post-ready action, and a
+/// stop action that records why it ran (`SVCD_STOP_REASON:SVCD_LAST_EXIT`).
+fn gate_manifest(
+    exec: &str,
+    exec_data: &[u8],
+    started: &str,
+    started_data: &[u8],
+    mode: &str,
+) -> Value {
+    let interpreter = if cfg!(windows) {
+        json!({"name": "cmd", "args": ["/C"]})
+    } else {
+        json!({"name": "sh"})
+    };
+    json!({
+        "schema": 1,
+        "id": "gate",
+        "name": "gate",
+        "version": "1.0.0",
+        "desc": "gateway service",
+        "platform": target(),
+        "protocol": 1,
+        "exec": {"path": exec, "args": [mode], "ready": "exec"},
+        "interpreter": interpreter,
+        "lifecycle": {
+            "started": {"path": started, "args": []},
+            "stop": {"path": exec, "args": ["stop"]},
+            "status": {"path": exec, "args": ["status"]}
+        },
+        "files": [
+            {"path": exec, "size": exec_data.len(), "sha256": hex_sha256(exec_data), "mode": 0o755},
+            {"path": started, "size": started_data.len(), "sha256": hex_sha256(started_data), "mode": 0o755}
+        ]
+    })
+}
+
+/// The plugin's events file: `<data>/plugins/<id>/events.txt` (the install
+/// directory is the one tree a plugin is given).
+fn events_path(sandbox: &Sandbox) -> PathBuf {
+    sandbox.data.join("plugins").join("gate").join("events.txt")
+}
+
+fn event_lines(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Wait until one line satisfies `done`; returns the lines seen.
+fn wait_for_event(path: &Path, done: impl Fn(&[String]) -> bool, timeout: Duration) -> Vec<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let lines = event_lines(path);
+        if done(&lines) {
+            return lines;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} never reached the expected state: {:?}",
+            path.display(),
+            lines
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn header(path: &str, size: usize, mode: u32) -> [u8; 512] {
     let mut header = [0u8; 512];
     header[..path.len()].copy_from_slice(path.as_bytes());
@@ -1650,6 +1746,145 @@ fn installs_and_supervises_a_script_service_with_lifecycle() {
         "stop action did not run: {}",
         sandbox.daemon_log()
     );
+}
+
+fn install_gate(sandbox: &mut Sandbox, key: &SigningKey, mode: &str, failing_started: bool) {
+    let (exec, exec_data, started, started_data) = gate_scripts(failing_started);
+    let manifest = gate_manifest(&exec, &exec_data, &started, &started_data, mode);
+    let bytes = package_with_manifest(
+        key,
+        &manifest,
+        &[
+            (exec.as_str(), exec_data.as_slice(), 0o755),
+            (started.as_str(), started_data.as_slice(), 0o755),
+        ],
+    );
+    let package = sandbox.write_package("gate-1.0.0.spk", &bytes);
+    sandbox.start_daemon();
+    sandbox.wait_for_daemon();
+    let installed = sandbox.run_plugin(&["install", package.to_str().expect("package")]);
+    assert_eq!(installed.status.code(), Some(0), "{}", stderr(&installed));
+}
+
+#[test]
+fn the_started_action_runs_before_the_service_is_running() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[31u8; 32]);
+    sandbox.write_key(&key);
+    install_gate(&mut sandbox, &key, "start", false);
+    let events = events_path(&sandbox);
+
+    let started_at = Instant::now();
+    let start = sandbox.run_plugin(&["start", "gate"]);
+    assert_eq!(start.status.code(), Some(0), "{}", stderr(&start));
+    // The action gates the start: the call cannot return before it ended.
+    assert!(
+        started_at.elapsed() < Duration::from_secs(15),
+        "the start waited out its whole window"
+    );
+    let lines = event_lines(&events);
+    assert!(lines.iter().any(|line| line == "started"), "{lines:?}");
+    let value = sandbox.wait_for_state("gate", "running", Duration::from_secs(10));
+    assert_eq!(value["summary"]["state"], "running", "{value}");
+
+    // Every spawn runs it again, including an explicit restart.
+    let restarted = sandbox.run_plugin(&["restart", "gate"]);
+    assert_eq!(restarted.status.code(), Some(0), "{}", stderr(&restarted));
+    let lines = wait_for_event(
+        &events,
+        |lines| lines.iter().filter(|line| *line == "started").count() >= 2,
+        Duration::from_secs(10),
+    );
+    assert_eq!(
+        lines.iter().filter(|line| *line == "started").count(),
+        2,
+        "{lines:?}"
+    );
+
+    let stopped = sandbox.run_plugin(&["stop", "gate"]);
+    assert_eq!(stopped.status.code(), Some(0), "{}", stderr(&stopped));
+    // A user stop reports `stop`, and an instance that was alive has no exit
+    // code to report.
+    let lines = wait_for_event(
+        &events,
+        |lines| lines.iter().any(|line| line == "stop:stop:none"),
+        Duration::from_secs(10),
+    );
+    assert!(
+        lines.iter().any(|line| line == "stop:stop:none"),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn a_failing_started_action_fails_the_start_and_runs_stop() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[32u8; 32]);
+    sandbox.write_key(&key);
+    install_gate(&mut sandbox, &key, "start", true);
+
+    let started_at = Instant::now();
+    let start = sandbox.run_plugin(&["start", "gate"]);
+    assert_ne!(start.status.code(), Some(0), "{}", stderr(&start));
+    assert!(
+        stderr(&start).contains("started action"),
+        "the failure must name the action: {}",
+        stderr(&start)
+    );
+    // The reason comes back at once; the request does not wait out the window.
+    assert!(
+        started_at.elapsed() < Duration::from_secs(15),
+        "a failed start waited out its whole window"
+    );
+
+    let events = events_path(&sandbox);
+    let lines = wait_for_event(
+        &events,
+        |lines| lines.iter().any(|line| line == "stop:start-failed:none"),
+        Duration::from_secs(10),
+    );
+    assert!(
+        lines.iter().any(|line| line == "started-failed"),
+        "{lines:?}"
+    );
+    let status = sandbox.status("gate");
+    assert_ne!(status["summary"]["state"], "running", "{status}");
+}
+
+#[test]
+fn a_crash_reports_the_crash_reason() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[33u8; 32]);
+    sandbox.write_key(&key);
+    install_gate(&mut sandbox, &key, "crash", false);
+    let events = events_path(&sandbox);
+
+    let start = sandbox.run_plugin(&["start", "gate"]);
+    assert_eq!(start.status.code(), Some(0), "{}", stderr(&start));
+    let lines = wait_for_event(
+        &events,
+        |lines| lines.iter().any(|line| line == "stop:crash:1"),
+        Duration::from_secs(15),
+    );
+    assert!(lines.iter().any(|line| line == "stop:crash:1"), "{lines:?}");
+}
+
+#[test]
+fn a_clean_exit_reports_the_exit_reason() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[34u8; 32]);
+    sandbox.write_key(&key);
+    install_gate(&mut sandbox, &key, "exit", false);
+    let events = events_path(&sandbox);
+
+    let start = sandbox.run_plugin(&["start", "gate"]);
+    assert_eq!(start.status.code(), Some(0), "{}", stderr(&start));
+    let lines = wait_for_event(
+        &events,
+        |lines| lines.iter().any(|line| line == "stop:exit:0"),
+        Duration::from_secs(15),
+    );
+    assert!(lines.iter().any(|line| line == "stop:exit:0"), "{lines:?}");
 }
 
 #[test]
