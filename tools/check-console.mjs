@@ -435,7 +435,7 @@ const CHECKS = [
       if (!upload.includes("refusal.status === 507")) {
         throw new Error("a 507 must be recognised by status, not by its message");
       }
-      if (!upload.includes("askToUninstall(refusal, file, root)")) {
+      if (!upload.includes("askToUninstall(refusal, file, root, backup)")) {
         throw new Error("a 507 must open the recovery dialog");
       }
       if (upload.includes("errorText(response)")) {
@@ -445,7 +445,7 @@ const CHECKS = [
       if (!dialog.includes("'DELETE'")) {
         throw new Error("the recovery must uninstall the old version");
       }
-      if (/purge/.test(dialog)) {
+      if (/purge=true/.test(dialog)) {
         throw new Error("the uninstall must keep config/ and data/: no purge");
       }
       return "a 507 opens a dialog whose uninstall keeps the plugin's config";
@@ -455,6 +455,63 @@ const CHECKS = [
         "'/api/v1/plugins/' + encodeURIComponent(plan.id)",
         "'/api/v1/plugins/' + encodeURIComponent(plan.id) + '?purge=true'",
       );
+    },
+  },
+  {
+    id: "space-recovery-retries-the-same-install",
+    run(page) {
+      const upload = functionBody(page, "uploadInstall");
+      // A backup import runs the same room check, so it gets the same offer;
+      // `&& !backup` would hand it a toast while the dialog could have fixed it.
+      if (/!\s*backup/.test(upload)) {
+        throw new Error("a space refusal must offer recovery for a backup import too");
+      }
+      const dialog = functionBody(page, "askToUninstall");
+      if (!dialog.includes("uploadInstall(file, backup, root)")) {
+        throw new Error("the dialog must re-send the same file after the uninstall");
+      }
+      if (!dialog.includes("if (!response.ok) throw")) {
+        throw new Error("a failed uninstall must stop before the retry");
+      }
+      return "a 507 retries the install that just failed, backups included";
+    },
+    mutate(page) {
+      return page.replace("        uploadInstall(file, backup, root);\n", "");
+    },
+  },
+  {
+    id: "space-recovery-counts-the-checked-root",
+    run(page) {
+      const recover = new Function("data", functionBody(page, "spaceRecovery"));
+      // The uninstall returns the old copy's bytes to the root the check ran
+      // on; a roomier volume elsewhere must not turn a dead end into an offer.
+      const elsewhere = recover({
+        id: "demo",
+        need: 100,
+        installed: 20,
+        root: "/full",
+        roots: [{ root: "/full", free: 70 }, { root: "/roomy", free: 900 }],
+      });
+      if (elsewhere.free !== 70) {
+        throw new Error("the checked root's free bytes are the ones an uninstall refills");
+      }
+      if (elsewhere.canUninstall) {
+        throw new Error("another root's room cannot make the uninstall worth offering");
+      }
+      const same = recover({
+        id: "demo",
+        need: 100,
+        installed: 40,
+        root: "/full",
+        roots: [{ root: "/full", free: 70 }, { root: "/roomy", free: 900 }],
+      });
+      if (!same.canUninstall) {
+        throw new Error("the checked root's own numbers can still justify the offer");
+      }
+      return "the offer adds the uninstall to the root the check ran on";
+    },
+    mutate(page) {
+      return page.replace("row.root !== checked", "false");
     },
   },
 ];

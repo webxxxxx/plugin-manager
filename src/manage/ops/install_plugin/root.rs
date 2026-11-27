@@ -161,7 +161,8 @@ pub(crate) fn choose_root(candidates: &[Candidate], needed: u64) -> Option<PathB
 ///
 /// The same numbers also go into `data`, because a caller cannot drive a
 /// dialog off a sentence: `id` says which plugin to uninstall, `installed`
-/// how much that returns, `need` what the check compared against, and `roots`
+/// how much that returns, `need` what the check compared against, `root` the
+/// root the check ran on (the only volume an uninstall frees), and `roots`
 /// what each candidate had free.
 fn insufficient(
     candidates: &[Candidate],
@@ -207,6 +208,9 @@ fn insufficient(
             "id": id,
             "need": needed,
             "installed": installed,
+            // Which volume an uninstall would free. `null` when the root was
+            // not chosen yet: a fresh install has nothing to uninstall.
+            "root": recorded.map(|root| root.display().to_string()),
             "roots": roots,
         }))
 }
@@ -324,10 +328,11 @@ mod tests {
     }
 
     /// An upgrade stages the new copy while the old one still sits on the
-    /// volume; when both do not fit, the answer is the structured space
-    /// refusal, not a half-written staging tree.
+    /// volume, so the check asks for the new tree alone: the installed bytes
+    /// are already outside `free` (#329). When they do not fit, the answer is
+    /// the structured space refusal, not a half-written staging tree.
     #[test]
-    fn a_recorded_root_that_cannot_hold_old_and_new_is_a_space_refusal() {
+    fn a_recorded_root_that_cannot_hold_the_new_tree_is_a_space_refusal() {
         let error = require_room_at(
             Path::new("/data/plugins"),
             "demo",
@@ -335,20 +340,35 @@ mod tests {
             12_000_000,
             |_| Some(17_500_000),
         )
-        .expect_err("no room for both copies");
+        .expect_err("the new tree does not fit");
         assert_eq!(error.problem, Problem::InsufficientSpace);
         assert!(error.detail().contains("31400000"), "{error}");
         assert!(error.detail().contains("17500000"), "{error}");
         assert!(error.detail().contains("/data/plugins"), "{error}");
 
         // The payload is what a dialog runs on: which plugin to uninstall,
-        // what the check needed, and how much an uninstall would return.
+        // what the check needed, how much an uninstall would return, and the
+        // root it would return it to.
         let data = error.data().expect("the refusal carries numbers");
         assert_eq!(data["id"], "demo");
         assert_eq!(data["need"], 31_400_000u64);
         assert_eq!(data["installed"], 12_000_000u64);
+        assert_eq!(data["root"], "/data/plugins");
         assert_eq!(data["roots"][0]["root"], "/data/plugins");
         assert_eq!(data["roots"][0]["free"], 17_500_000u64);
+
+        // The installed copy is not room: 20 MB free plus the 12 MB an
+        // uninstall would return covers the 31.4 MB tree, but nothing is
+        // uninstalled before this check runs.
+        let error = require_room_at(
+            Path::new("/data/plugins"),
+            "demo",
+            31_400_000,
+            12_000_000,
+            |_| Some(20_000_000),
+        )
+        .expect_err("the old copy is not free space");
+        assert_eq!(error.problem, Problem::InsufficientSpace);
 
         // Enough room, or an unmeasurable root, is not a refusal.
         assert!(require_room_at(Path::new("/data"), "demo", 10, 0, |_| Some(11)).is_ok());
@@ -374,7 +394,14 @@ mod tests {
         // One row per candidate, and an unmeasured root stays null rather than
         // being reported as empty.
         let data = error.data().expect("the refusal carries numbers");
+        assert_eq!(data["root"], "/tiny");
         assert_eq!(data["roots"][1]["root"], "/gone");
         assert!(data["roots"][1]["free"].is_null(), "{data}");
+
+        // A refusal that never picked a root (fresh install into the smallest
+        // volume that fits) reports `root: null`: there is nothing to uninstall.
+        let picked = insufficient(&[candidate("/tiny", Some(1))], 10, "demo", 0, None);
+        let data = picked.data().expect("the refusal carries numbers");
+        assert!(data["root"].is_null(), "{data}");
     }
 }

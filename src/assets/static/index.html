@@ -238,12 +238,9 @@ function toast(message, kind) {
   setTimeout(function () { el.remove(); }, kind === 'err' ? 8000 : 3000);
 }
 
+// The sentence alone, for callers that only need something to show.
 async function errorText(response) {
-  try {
-    const body = await response.json();
-    if (body && body.error) return body.error.message || body.error.code || ('HTTP ' + response.status);
-  } catch (_) {}
-  return 'HTTP ' + response.status;
+  return (await refusalOf(response)).message;
 }
 
 // A refusal as both halves: the sentence to show, and the `error.data` a
@@ -581,9 +578,10 @@ function uploadInstall(file, backup, root) {
     if (response.ok) return response.json();
     const refusal = await refusalOf(response);
     // 507 carries the numbers a dialog runs on; every other refusal is just a
-    // sentence. A backup has nowhere else to go, so it keeps the plain toast.
-    if (refusal.status === 507 && !backup) {
-      askToUninstall(refusal, file, root);
+    // sentence. A backup import hits the same room check, so it gets the same
+    // offer: uninstall, then send the same file again.
+    if (refusal.status === 507) {
+      askToUninstall(refusal, file, root, backup);
       return null;
     }
     throw new Error(refusal.message);
@@ -604,17 +602,22 @@ function uploadInstall(file, backup, root) {
 }
 
 // What a space refusal justifies, as a value: the numbers come from the host
-// (`error.data`), never from the sentence. `canUninstall` is deliberately the
-// conservative test — freeing the old copy has to cover the whole `need`, so it
-// holds whether or not the host counts that copy inside `need` (#328).
+// (`error.data`), never from the sentence. An uninstall returns the old copy's
+// bytes to the root the check ran on, so only that root's free bytes count —
+// a roomier volume elsewhere would turn the offer into a dead end (#330).
+// `canUninstall` is deliberately the conservative test: freeing the old copy
+// has to cover the whole `need`, so it holds whether or not the host counts
+// that copy inside `need` (#328).
 function spaceRecovery(data) {
   const need = Number((data && data.need) || 0);
   const installed = Number((data && data.installed) || 0);
   const id = (data && data.id) || '';
+  const checked = (data && data.root) || '';
   const rows = (data && data.roots) || [];
   let free = null;
   rows.forEach(function (row) {
     if (!row || typeof row.free !== 'number') return;
+    if (checked !== '' && row.root !== checked) return;
     free = free === null ? row.free : Math.max(free, row.free);
   });
   return {
@@ -627,10 +630,11 @@ function spaceRecovery(data) {
 }
 
 // The one action the host can offer for a 507: remove the version this install
-// replaces, then retry. The uninstall keeps `config/` and `data/` (no `purge`),
-// so the retry finds the plugin's settings again — the same promise the store's
-// dialog makes. Freeing space by hand stays the operator's job.
-function askToUninstall(refusal, file, root) {
+// replaces, then send the same file again. The uninstall keeps `config/` and
+// `data/` (no `purge`), so the retry finds the plugin's settings again — the
+// same promise the store's dialog makes. Freeing space by hand stays the
+// operator's job.
+function askToUninstall(refusal, file, root, backup) {
   const plan = spaceRecovery(refusal.data);
   const modal = document.createElement('div');
   modal.className = 'modal';
@@ -655,11 +659,14 @@ function askToUninstall(refusal, file, root) {
   let text = refusal.message;
   if (refusal.data) {
     text = '这个包装不下：需要 ' + settingsBytesText(plan.need) + (room ? '，' + room : '') + '。';
+    // A backup goes back where it came from; the root question is not the
+    // operator's to answer there (#299).
+    const elsewhere = backup ? '' : '，或换一个插件根';
     if (plan.installed > 0) {
       text += '已安装的 ' + plan.id + ' 占 ' + settingsBytesText(plan.installed) +
-        (plan.canUninstall ? '，卸载后可回收。' : '；即使卸载也不够，需要先腾出空间或换一个插件根。');
+        (plan.canUninstall ? '，卸载后可回收。' : '；即使卸载也不够，需要先腾出空间' + elsewhere + '。');
     } else {
-      text += '请先腾出空间，或换一个插件根。';
+      text += '请先腾出空间' + elsewhere + '。';
     }
   }
   hint.textContent = text;
@@ -682,8 +689,9 @@ function askToUninstall(refusal, file, root) {
         headers: authHeaders()
       }).then(async function (response) {
         if (!response.ok) throw new Error(await errorText(response));
-        // Same file, same root: the retry is the install that just failed.
-        uploadInstall(file, false, root);
+        // Same file, same root, same kind: the retry is the install that just
+        // failed, not a different one.
+        uploadInstall(file, backup, root);
       }).catch(function (error) {
         lock(false);
         toast('卸载失败：' + error.message, 'err');
