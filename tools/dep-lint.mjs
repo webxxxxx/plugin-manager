@@ -531,7 +531,9 @@ const ASSEMBLY_RULES = [
     name: "pid 创建时间探针",
     members: [/start_time\(/],
     allow: [
-      { file: "src/platform/host/process.rs" },
+      { file: "src/platform/host/process/mod.rs" },
+      { file: "src/platform/host/process/unix.rs" },
+      { file: "src/platform/host/process/windows.rs" },
       { file: "src/supervise/ops/host.rs", item: "process_probe" },
     ],
     hint: "starttime 只在 process_probe 里探；判定走 runtime::pid_state（#217）。",
