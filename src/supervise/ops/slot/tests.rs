@@ -1275,7 +1275,15 @@ fn a_hook_that_exits_non_zero_fails_the_call() {
 
     let started = Instant::now();
     let response = wait_response(&mut slot, &rx, &started);
-    assert!(response.result.is_none(), "a failure is not a result");
+    let result = response.result.expect("a failed call still answers");
+    assert_eq!(result["isError"], true);
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("exited"),
+        "{result}"
+    );
     assert_eq!(slot.hook_calls.load(Ordering::SeqCst), 0);
 }
 
@@ -1303,7 +1311,15 @@ fn a_hook_that_overruns_its_timeout_fails_the_call() {
 
     let started = Instant::now();
     let response = wait_response(&mut slot, &rx, &started);
-    assert!(response.result.is_none(), "a timeout is not a result");
+    let result = response.result.expect("a timed-out call still answers");
+    assert_eq!(result["isError"], true);
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("timed out"),
+        "{result}"
+    );
     assert!(started.elapsed() < Duration::from_secs(3));
 }
 

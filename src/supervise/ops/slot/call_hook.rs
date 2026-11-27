@@ -79,9 +79,11 @@ impl Slot {
         self.hook_calls.fetch_add(1, Ordering::SeqCst);
         let call = HookCall {
             id: self.id.clone(),
-            hook,
+            hook: hook.clone(),
             arguments: invocation.arguments,
-            timeout,
+            // Both budgets apply: the hook declares how long its own action may
+            // take, the caller declares how long it will wait.
+            timeout: timeout.min(Duration::from_millis(hook.timeout_ms)),
             cancel: invocation.cancel,
             paths: self.paths.clone(),
             plugin_dir: self.plugin_dir.clone(),
