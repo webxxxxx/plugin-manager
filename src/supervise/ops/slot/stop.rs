@@ -122,7 +122,7 @@ impl Slot {
     /// explicit request, so a crash inside `svc stop` still reports `crash`.
     pub(super) fn stop_reason(&self) -> StopReason {
         match self.machine.cause {
-            Some(cause) => StopReason::from_cause(Some(cause)),
+            Some(cause) => StopReason::from_cause(cause),
             None => self.stop.reason(),
         }
     }

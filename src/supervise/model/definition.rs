@@ -486,28 +486,12 @@ fn validate(
         }
     }
 
-    let ready = match definition.exec.ready.as_deref() {
-        None | Some("notify") => Ready::Notify,
-        Some("exec") => Ready::Exec,
-        Some("port") => Ready::Port(
-            crate::kernel::registry::probe_address(
-                definition.exec.port,
-                definition.exec.probe_addr.as_deref(),
-            )
-            .map_err(|error| format!("exec: {}", error))?,
-        ),
-        Some(other) => {
-            return Err(format!(
-                "exec.ready \"{}\" is invalid; expected notify, exec or port",
-                other
-            ))
-        }
-    };
-    if !matches!(ready, Ready::Port(_))
-        && (definition.exec.port.is_some() || definition.exec.probe_addr.is_some())
-    {
-        return Err("exec.port / exec.probe_addr are only used with exec.ready = \"port\"".into());
-    }
+    let ready = crate::kernel::registry::ready_from(
+        definition.exec.ready.as_deref(),
+        definition.exec.port,
+        definition.exec.probe_addr.as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
     // `protocol != 1` was rejected above, so `ready: notify` is the only
     // channel peer a core definition can declare. The predicate is shared with
     // the runtime slot so the two notions of "channel peer" cannot drift.

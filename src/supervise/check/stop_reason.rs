@@ -32,13 +32,12 @@ impl StopReason {
         }
     }
 
-    /// 没有显式 stop 请求时，原因由结束方式决定。
-    pub(crate) fn from_cause(cause: Option<Cause>) -> StopReason {
+    /// 实例自己结束时，原因由结束方式决定。
+    pub(crate) fn from_cause(cause: Cause) -> StopReason {
         match cause {
-            Some(Cause::Crash) => StopReason::Crash,
-            Some(Cause::Exit) => StopReason::Exit,
-            Some(Cause::StartFailed) => StopReason::StartFailed,
-            None => StopReason::Stop,
+            Cause::Crash => StopReason::Crash,
+            Cause::Exit => StopReason::Exit,
+            Cause::StartFailed => StopReason::StartFailed,
         }
     }
 }
@@ -50,13 +49,12 @@ mod tests {
 
     #[test]
     fn every_cause_maps_to_one_spelling() {
-        assert_eq!(StopReason::from_cause(Some(Cause::Crash)).as_str(), "crash");
-        assert_eq!(StopReason::from_cause(Some(Cause::Exit)).as_str(), "exit");
+        assert_eq!(StopReason::from_cause(Cause::Crash).as_str(), "crash");
+        assert_eq!(StopReason::from_cause(Cause::Exit).as_str(), "exit");
         assert_eq!(
-            StopReason::from_cause(Some(Cause::StartFailed)).as_str(),
+            StopReason::from_cause(Cause::StartFailed).as_str(),
             "start-failed"
         );
-        assert_eq!(StopReason::from_cause(None).as_str(), "stop");
         assert_eq!(StopReason::Stop.as_str(), "stop");
         assert_eq!(StopReason::Shutdown.as_str(), "shutdown");
     }
