@@ -466,15 +466,22 @@ fn events_path(sandbox: &Sandbox) -> PathBuf {
 }
 
 fn event_lines(path: &Path) -> Vec<String> {
-    fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .map(str::to_string)
-        .collect()
+    match fs::read_to_string(path) {
+        Ok(text) => text.lines().map(str::to_string).collect(),
+        // The stop action creates the file on its first line; "not there yet"
+        // is a real wait state, every other read error is not.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("cannot read {}: {}", path.display(), error),
+    }
 }
 
 /// Wait until one line satisfies `done`; returns the lines seen.
-fn wait_for_event(path: &Path, done: impl Fn(&[String]) -> bool, timeout: Duration) -> Vec<String> {
+fn wait_for_event(
+    sandbox: &Sandbox,
+    path: &Path,
+    done: impl Fn(&[String]) -> bool,
+    timeout: Duration,
+) -> Vec<String> {
     let deadline = Instant::now() + timeout;
     loop {
         let lines = event_lines(path);
@@ -483,9 +490,10 @@ fn wait_for_event(path: &Path, done: impl Fn(&[String]) -> bool, timeout: Durati
         }
         assert!(
             Instant::now() < deadline,
-            "{} never reached the expected state: {:?}",
+            "{} never reached the expected state: {:?}\n{}",
             path.display(),
-            lines
+            lines,
+            support::tail_lines(&sandbox.daemon_log(), 20)
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1185,6 +1193,28 @@ fn verify_reports_a_signed_package_without_installing_it() {
 }
 
 #[test]
+fn verify_tells_a_manifest_author_that_started_must_be_idempotent() {
+    let sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[39u8; 32]);
+    sandbox.write_key(&key);
+    let (exec, exec_data, started, started_data) = gate_scripts(false);
+    let manifest = gate_manifest(&exec, &exec_data, &started, &started_data, "start");
+    let bytes = package_with_manifest(
+        &key,
+        &manifest,
+        &[
+            (exec.as_str(), exec_data.as_slice(), 0o755),
+            (started.as_str(), started_data.as_slice(), 0o755),
+        ],
+    );
+    let package = sandbox.write_package("gate-1.0.0.spk", &bytes);
+    let output = sandbox.run_plugin(&["verify", package.to_str().expect("package")]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("idempotent"), "{text}");
+}
+
+#[test]
 fn verify_reports_capabilities_and_compat() {
     let sandbox = Sandbox::new();
     let key = SigningKey::from_bytes(&[19u8; 32]);
@@ -1751,13 +1781,30 @@ fn installs_and_supervises_a_script_service_with_lifecycle() {
 fn install_gate(sandbox: &mut Sandbox, key: &SigningKey, mode: &str, failing_started: bool) {
     let (exec, exec_data, started, started_data) = gate_scripts(failing_started);
     let manifest = gate_manifest(&exec, &exec_data, &started, &started_data, mode);
-    let bytes = package_with_manifest(
+    install_gate_manifest(
+        sandbox,
         key,
         &manifest,
-        &[
-            (exec.as_str(), exec_data.as_slice(), 0o755),
-            (started.as_str(), started_data.as_slice(), 0o755),
-        ],
+        &exec,
+        &exec_data,
+        &started,
+        &started_data,
+    );
+}
+
+fn install_gate_manifest(
+    sandbox: &mut Sandbox,
+    key: &SigningKey,
+    manifest: &Value,
+    exec: &str,
+    exec_data: &[u8],
+    started: &str,
+    started_data: &[u8],
+) {
+    let bytes = package_with_manifest(
+        key,
+        manifest,
+        &[(exec, exec_data, 0o755), (started, started_data, 0o755)],
     );
     let package = sandbox.write_package("gate-1.0.0.spk", &bytes);
     sandbox.start_daemon();
@@ -1791,6 +1838,7 @@ fn the_started_action_runs_before_the_service_is_running() {
     let restarted = sandbox.run_plugin(&["restart", "gate"]);
     assert_eq!(restarted.status.code(), Some(0), "{}", stderr(&restarted));
     let lines = wait_for_event(
+        &sandbox,
         &events,
         |lines| lines.iter().filter(|line| *line == "started").count() >= 2,
         Duration::from_secs(10),
@@ -1806,6 +1854,7 @@ fn the_started_action_runs_before_the_service_is_running() {
     // A user stop reports `stop`, and an instance that was alive has no exit
     // code to report.
     let lines = wait_for_event(
+        &sandbox,
         &events,
         |lines| lines.iter().any(|line| line == "stop:stop:none"),
         Duration::from_secs(10),
@@ -1839,6 +1888,7 @@ fn a_failing_started_action_fails_the_start_and_runs_stop() {
 
     let events = events_path(&sandbox);
     let lines = wait_for_event(
+        &sandbox,
         &events,
         |lines| lines.iter().any(|line| line == "stop:start-failed:none"),
         Duration::from_secs(10),
@@ -1862,11 +1912,103 @@ fn a_crash_reports_the_crash_reason() {
     let start = sandbox.run_plugin(&["start", "gate"]);
     assert_eq!(start.status.code(), Some(0), "{}", stderr(&start));
     let lines = wait_for_event(
+        &sandbox,
         &events,
         |lines| lines.iter().any(|line| line == "stop:crash:1"),
         Duration::from_secs(15),
     );
     assert!(lines.iter().any(|line| line == "stop:crash:1"), "{lines:?}");
+}
+
+#[test]
+fn a_failed_start_action_reports_start_failed_to_the_stop_hook() {
+    // The stop action spawns before the machine settles the failure, so this
+    // reason cannot come from the machine's cause (#341).
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[36u8; 32]);
+    sandbox.write_key(&key);
+    let (exec, exec_data, started, started_data) = gate_scripts(true);
+    let mut manifest = gate_manifest(&exec, &exec_data, &started, &started_data, "start");
+    // The failing script doubles as the start action: it exits 3.
+    manifest["lifecycle"]["start"] = json!({"path": started, "args": []});
+    install_gate_manifest(
+        &mut sandbox,
+        &key,
+        &manifest,
+        &exec,
+        &exec_data,
+        &started,
+        &started_data,
+    );
+    let events = events_path(&sandbox);
+
+    let started_at = Instant::now();
+    let start = sandbox.run_plugin(&["start", "gate"]);
+    assert_ne!(start.status.code(), Some(0), "{}", stderr(&start));
+    assert!(
+        started_at.elapsed() < Duration::from_secs(15),
+        "a failed start action must fail the request at once"
+    );
+    let lines = wait_for_event(
+        &sandbox,
+        &events,
+        |lines| lines.iter().any(|line| line == "stop:start-failed:none"),
+        Duration::from_secs(10),
+    );
+    assert!(
+        lines.iter().any(|line| line == "stop:start-failed:none"),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn a_daemon_shutdown_reports_the_shutdown_reason() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[37u8; 32]);
+    sandbox.write_key(&key);
+    install_gate(&mut sandbox, &key, "start", false);
+    let events = events_path(&sandbox);
+
+    let start = sandbox.run_plugin(&["start", "gate"]);
+    assert_eq!(start.status.code(), Some(0), "{}", stderr(&start));
+    sandbox.stop_daemon().expect("the daemon must stop");
+    let lines = wait_for_event(
+        &sandbox,
+        &events,
+        |lines| lines.iter().any(|line| line == "stop:shutdown:none"),
+        Duration::from_secs(10),
+    );
+    assert!(
+        lines.iter().any(|line| line == "stop:shutdown:none"),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn a_crash_retry_runs_the_started_action_again() {
+    let mut sandbox = Sandbox::new();
+    let key = SigningKey::from_bytes(&[38u8; 32]);
+    sandbox.write_key(&key);
+    install_gate(&mut sandbox, &key, "crash", false);
+    let events = events_path(&sandbox);
+
+    let start = sandbox.run_plugin(&["start", "gate"]);
+    assert_eq!(start.status.code(), Some(0), "{}", stderr(&start));
+    // The first instance crashes; the retry spawns a second one, which owes
+    // the post-ready action again.
+    let lines = wait_for_event(
+        &sandbox,
+        &events,
+        |lines| lines.iter().filter(|line| *line == "started").count() >= 2,
+        Duration::from_secs(15),
+    );
+    assert!(
+        lines.iter().filter(|line| *line == "started").count() >= 2,
+        "{lines:?}"
+    );
+    assert!(lines.iter().any(|line| line == "stop:crash:1"), "{lines:?}");
+    let stopped = sandbox.run_plugin(&["stop", "gate"]);
+    assert_eq!(stopped.status.code(), Some(0), "{}", stderr(&stopped));
 }
 
 #[test]
@@ -1880,6 +2022,7 @@ fn a_clean_exit_reports_the_exit_reason() {
     let start = sandbox.run_plugin(&["start", "gate"]);
     assert_eq!(start.status.code(), Some(0), "{}", stderr(&start));
     let lines = wait_for_event(
+        &sandbox,
         &events,
         |lines| lines.iter().any(|line| line == "stop:exit:0"),
         Duration::from_secs(15),
