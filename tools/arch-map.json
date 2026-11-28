@@ -350,6 +350,7 @@
     "src/daemon/mod.rs": "daemon",
     "src/daemon/plugins.rs": "daemon",
     "src/daemon/shutdown.rs": "daemon",
+    "src/daemon/tests/call.rs": "daemon",
     "src/daemon/tests/plugins.rs": "daemon",
     "src/daemon/tests.rs": "daemon",
     "src/daemon/tools.rs": "daemon",

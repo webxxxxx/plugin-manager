@@ -551,6 +551,24 @@ pub fn json_error(status: u16, code: &str, message: &str) -> Vec<u8> {
     json_error_with_data(status, code, message, None)
 }
 
+/// The same error envelope with extra response headers. The install and import
+/// streams write their refusal as bytes, so this is how a header (the daemon's
+/// call number) reaches a caller that never sees a `Response` value (#346).
+pub fn json_error_with_headers(
+    status: u16,
+    code: &str,
+    message: &str,
+    headers: &[(String, String)],
+) -> Vec<u8> {
+    let body = json!({ "error": { "code": code, "message": message } });
+    response_with_headers(
+        status,
+        "application/json",
+        headers,
+        &serde_json::to_vec(&body).unwrap_or_default(),
+    )
+}
+
 /// The same envelope with the refusal's machine-readable payload. The key is
 /// absent when there is nothing to carry, so a caller checking `error.data`
 /// sees "not provided" rather than an empty object.

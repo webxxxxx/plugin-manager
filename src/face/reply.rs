@@ -48,8 +48,13 @@ pub(crate) fn error_response(status: u16, code: &str, message: &str) -> Response
 }
 
 pub(crate) fn rpc_error(failure: support::RpcFailure) -> Response {
-    let (status, code, message) = failure;
-    error_response(status, code, &message)
+    let response = error_response(failure.status, failure.code, &failure.message);
+    match failure.call {
+        // The body shape stays `{code, message}` (#346); the number that names
+        // this request in `svcd.log` travels in the header instead.
+        Some(call) => response.with_header(support::REQUEST_ID_HEADER, call.to_string()),
+        None => response,
+    }
 }
 
 /// One projection for every typed management failure: the category raised
@@ -137,4 +142,38 @@ fn root_index(paths: &Paths, install_dir: &Path) -> Option<usize> {
         .filter(|(_, root)| install_dir.starts_with(root))
         .max_by_key(|(_, root)| root.components().count())
         .map(|(index, _)| index + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::call::CallId;
+
+    fn named(call: Option<CallId>) -> Response {
+        rpc_error(support::RpcFailure {
+            status: 500,
+            code: "internal",
+            message: "boom".into(),
+            call,
+        })
+    }
+
+    #[test]
+    fn a_named_failure_carries_the_call_in_a_response_header() {
+        let response = named(Some(CallId::from_raw(7)));
+        assert_eq!(response.status, 500);
+        assert_eq!(
+            response.headers,
+            vec![(support::REQUEST_ID_HEADER.to_string(), "7".to_string())]
+        );
+        assert_eq!(
+            String::from_utf8(response.body).expect("utf8"),
+            r#"{"error":{"code":"internal","message":"boom"}}"#
+        );
+    }
+
+    #[test]
+    fn an_unnamed_failure_stays_headerless() {
+        assert!(named(None).headers.is_empty());
+    }
 }

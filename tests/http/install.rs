@@ -221,6 +221,17 @@ fn a_failed_install_removes_its_staging_directory() {
         String::from_utf8_lossy(&response.body)
     );
     wait_for_no_package_staging(&sandbox, &sandbox.data.join("plugins"));
+
+    // The reserved id is refused while parsing the manifest, inside the face:
+    // no control request happened, so there is no call number to name (#346).
+    assert!(
+        !response
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-request-id")),
+        "a face-local refusal names no call: {:?}",
+        response.headers
+    );
 }
 
 /// The install/import upload used to take the connection out of the loop and

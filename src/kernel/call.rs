@@ -23,6 +23,13 @@ impl CallId {
     pub const fn next(self) -> CallId {
         CallId(self.0.saturating_add(1))
     }
+
+    /// The number a peer sent back, e.g. the `call` key in `error.data`. Only
+    /// the HTTP face reads it back, so a build without that face sees it unused.
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
+    pub const fn from_raw(value: u64) -> CallId {
+        CallId(value)
+    }
 }
 
 impl fmt::Display for CallId {
