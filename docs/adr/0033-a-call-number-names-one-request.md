@@ -31,5 +31,7 @@ Accepted（2026-11-28）。落地 #343。
 
 - 失败的安装可以在 `svcd.log` 里按号读全：`call=3 install failed:`，以及同一号的成功行、慢请求行。
 - 重启后号会重复，`starting` 行是分界。
-- HTTP 面暂时拿不到号（`face/support::project_response` 把 `error.data` 丢掉），见 #343 的 Out of Scope。
+- HTTP 面把号放在失败响应的 `X-Request-Id` 头里（#346）：body 形状不动，`error.data` 仍然不进 HTTP 错误体。
+- MCP `tools/call` 的失败在 `_meta["io.svcd/call"]` 带号（`isError` 结果）；JSON-RPC 错误沿用 `error.data.call`，modern 收尾改为合并 `_meta` 而不是替换（#347）。
+- 号同时填进 `Invocation::trace`，所以插件的超时行（`call=7 demo: tools/call #3 read timed out`）与 hook 日志的起始行也能带同一个号；插件帧里看不到它（#348）。
 - 号不持久化，所以它不能当幂等键，也不能用来轮询一个已经结束的安装。

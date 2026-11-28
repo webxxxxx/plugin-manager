@@ -13,6 +13,19 @@ pub(super) struct PendingCalls {
     next_id: u64,
 }
 
+/// The timeout line's text. A named call leads with `call=7` so the line can
+/// be found from the number the caller was told (#348); an unnamed call keeps
+/// the shape it had before.
+fn timeout_line(service: &str, id: u64, capability: &str, trace: Option<&str>) -> String {
+    match trace {
+        Some(trace) => format!(
+            "call={} {}: tools/call #{} {} timed out",
+            trace, service, id, capability
+        ),
+        None => format!("{}: tools/call #{} {} timed out", service, id, capability),
+    }
+}
+
 impl PendingCalls {
     pub(super) fn new() -> PendingCalls {
         PendingCalls {
@@ -212,6 +225,7 @@ impl Slot {
                     .progress
                     .as_ref()
                     .map(|token| token.as_str().to_string()),
+                trace: invocation.trace,
                 client,
                 sink: sink.take().expect("call sink must be present"),
             },
@@ -280,8 +294,8 @@ impl Slot {
                 continue;
             };
             error!(
-                "{}: tools/call #{} {} timed out",
-                self.id, id, pending.capability
+                "{}",
+                timeout_line(&self.id, id, &pending.capability, pending.trace.as_deref())
             );
             let failure = Failure::new(
                 Class::Timeout,
@@ -312,6 +326,9 @@ pub(super) struct PendingCall {
     pub(super) capability: String,
     pub(super) deadline: u64,
     pub(super) progress_token: Option<String>,
+    /// The management request this call belongs to (`call=N`), when the caller
+    /// named one: the timeout line points back at `svcd.log` with it.
+    pub(super) trace: Option<String>,
     /// Progress notifications go here while the call is in flight.
     pub(super) client: Option<crate::wire::control::channel::Reply>,
     /// Final result, delivered to the caller's completion sink. The slot does
@@ -362,4 +379,25 @@ pub(super) fn test_reply_sink(
         };
         reply.send(line);
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::timeout_line;
+
+    #[test]
+    fn a_named_call_leads_the_timeout_line_with_its_number() {
+        assert_eq!(
+            timeout_line("demo", 3, "read", Some("7")),
+            "call=7 demo: tools/call #3 read timed out"
+        );
+    }
+
+    #[test]
+    fn an_unnamed_call_keeps_the_old_timeout_line() {
+        assert_eq!(
+            timeout_line("demo", 3, "read", None),
+            "demo: tools/call #3 read timed out"
+        );
+    }
 }

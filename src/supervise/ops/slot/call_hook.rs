@@ -32,6 +32,10 @@ pub(super) const MAX_HOOK_CALLS: usize = 4;
 pub(super) struct HookCall {
     pub(super) id: String,
     pub(super) hook: Hook,
+    /// The request this call belongs to (`call=N`) and the capability it asks
+    /// for; together they make the start line in the hook log (#348).
+    pub(super) trace: Option<String>,
+    pub(super) capability: String,
     pub(super) arguments: Value,
     pub(super) timeout: Duration,
     pub(super) cancel: crate::kernel::contract::CancelToken,
@@ -115,6 +119,8 @@ impl Slot {
         let call = HookCall {
             id: self.id.clone(),
             hook: hook.clone(),
+            trace: invocation.trace,
+            capability: capability.to_string(),
             arguments: invocation.arguments,
             // Both budgets apply: the hook declares how long its own action may
             // take, the caller declares how long it will wait.
@@ -157,6 +163,7 @@ impl Slot {
 
 /// Run one hook call on the worker thread.
 pub(super) fn run(call: &HookCall) -> Result<Value, Failure> {
+    note_start(call);
     let out = Capture::new(&call.id, "call-out", &call.paths).map_err(|error| {
         implementation(format!("cannot create the call's output file: {error}"))
     })?;
@@ -250,6 +257,27 @@ pub(super) fn run(call: &HookCall) -> Result<Value, Failure> {
 
 fn implementation(detail: impl Into<String>) -> Failure {
     Failure::new(Class::ImplementationError, Retry::Never, detail)
+}
+
+/// One line in the hook log names the request before the hook runs: the hook's
+/// own output is appended after it, so two runs of the same hook no longer run
+/// together with nothing in between (#348).
+fn note_start(call: &HookCall) {
+    let Ok(mut log) = LogWriter::open(
+        &call.paths.logs_dir,
+        &format!("{}-hooks", call.id),
+        &format!("hook:{}", call.id),
+        &call.limits,
+        log::clock(),
+        false,
+    ) else {
+        return;
+    };
+    let line = match call.trace.as_deref() {
+        Some(trace) => format!("call={} {} start", trace, call.capability),
+        None => format!("{} start", call.capability),
+    };
+    let _ = log.record(Level::Info, &line);
 }
 
 /// The hook's stderr belongs in the plugin's hook log, not in the result; stdout

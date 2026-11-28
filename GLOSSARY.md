@@ -116,7 +116,7 @@ _Avoid_: 接口、API、插件规范
 _Avoid_: 请求、request（那是协议层的报文）
 
 **调用号（CallId）**:
-svcd 收到一条管理请求时分配的进程内序号，从 1 起、重启归零。它出现在错误响应的 `error.data.call` 与这次请求写下的日志行（`call=7 ...`）里，用来把一次失败的安装或调用与日志对上。它不是幂等键，也不跨重启唯一：`svcd.log` 的 `starting` 行是归属边界。见 [ADR-0033](docs/adr/0033-a-call-number-names-one-request.md)。
+svcd 收到一条管理请求时分配的进程内序号，从 1 起、重启归零。它出现在错误响应的 `error.data.call`、HTTP 失败的 `X-Request-Id` 头、MCP 失败结果的 `_meta["io.svcd/call"]`，以及这次请求写下的日志行（`call=7 ...`）里，用来把一次失败的安装或调用与日志对上。`Daemon` 每次 `tools/call` 也把它填进 `Invocation::trace`，所以槽的超时行与 hook 日志的起始行带同一个号。它不是幂等键，也不跨重启唯一：`svcd.log` 的 `starting` 行是归属边界。见 [ADR-0033](docs/adr/0033-a-call-number-names-one-request.md)。
 _Avoid_: 请求 id（那是 JSON-RPC 的 `id`，由客户端决定）、trace id / span id（那是分布式追踪的词，本上下文没有采样、没有父子关系）、task id
 
 **完成回调（ReplySink）**:
