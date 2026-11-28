@@ -89,7 +89,7 @@ impl Daemon {
         };
         match parsed.command {
             control::Command::ToolCall(tool) => {
-                self.handle_tool_call(clock, parsed.id, tool, incoming.reply)
+                self.handle_tool_call(clock, call, parsed.id, tool, incoming.reply)
             }
             command => {
                 let response = self.dispatch(clock, call, parsed.id, command);

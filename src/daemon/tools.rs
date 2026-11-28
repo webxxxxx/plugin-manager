@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use crate::face::catalog;
 use crate::face::control;
 use crate::face::mcp_tools;
+use crate::kernel::call::CallId;
 use crate::kernel::contract::{CapabilityName, Invocation, Reply, ReplySink};
 use crate::kernel::failure::{Failure, Problem, ProblemError};
 use crate::kernel::registry::Kind;
@@ -74,12 +75,13 @@ impl Daemon {
     pub(super) fn handle_tool_call(
         &mut self,
         clock: &Clock,
+        call: CallId,
         id: Option<Value>,
-        call: control::ToolCall,
+        tool: control::ToolCall,
         reply: crate::wire::control::channel::Reply,
     ) {
-        let name = call.name;
-        let mut arguments = call.arguments;
+        let name = tool.name;
+        let mut arguments = tool.arguments;
 
         // Only a known plugin's <id>.start is the lifecycle tool. A capability
         // named "foo.start" falls through to the capability lookup below.
@@ -94,19 +96,21 @@ impl Daemon {
         });
         if let Some(service_id) = start_id {
             let response = match self.host.start_service(service_id, clock) {
-                Ok(status) => mcp_tools::tool_result(id, status_json(status).to_string(), false),
-                Err(error) => mcp_tools::tool_error(id, error.detail()),
+                Ok(status) => {
+                    mcp_tools::tool_result(id, status_json(status).to_string(), false, call)
+                }
+                Err(error) => mcp_tools::tool_error(id, error.detail(), call),
             };
             send(&reply, response);
             return;
         }
 
         let Some((service_id, capability)) = name.split_once('.') else {
-            send(&reply, unknown_tool(&id, &name));
+            send(&reply, unknown_tool(&id, &name, call));
             return;
         };
         let Some(service) = self.host.service(service_id) else {
-            send(&reply, unknown_tool(&id, &name));
+            send(&reply, unknown_tool(&id, &name, call));
             return;
         };
         // A service is callable when its contract declares the capability and
@@ -121,13 +125,18 @@ impl Daemon {
             || service.kind == Kind::Plugin
             || self.host.slots.contains_key(service_id);
         if !known || !callable {
-            send(&reply, unknown_tool(&id, &name));
+            send(&reply, unknown_tool(&id, &name, call));
             return;
         }
         if builtin.is_some() && !self.host.is_live(service_id, clock.now()) {
             send(
                 &reply,
-                mcp_tools::tool_result(id, format!("service {} is not running", service_id), true),
+                mcp_tools::tool_result(
+                    id,
+                    format!("service {} is not running", service_id),
+                    true,
+                    call,
+                ),
             );
             return;
         }
@@ -138,11 +147,15 @@ impl Daemon {
         {
             send(
                 &reply,
-                mcp_tools::tool_error(id, &format!("cannot resolve blob argument: {}", message)),
+                mcp_tools::tool_error(
+                    id,
+                    &format!("cannot resolve blob argument: {}", message),
+                    call,
+                ),
             );
             return;
         }
-        let progress_token = call.progress;
+        let progress_token = tool.progress;
         let mut invocation =
             Invocation::new(capability, arguments, self.config.limits.default_timeout);
         invocation.progress = progress_token;
@@ -150,9 +163,15 @@ impl Daemon {
         let builtin_done = projected_done(
             reply.clone(),
             id.clone(),
+            call,
             mcp_tools::project_builtin_outcome,
         );
-        let slot_done = projected_done(reply.clone(), id.clone(), mcp_tools::project_slot_outcome);
+        let slot_done = projected_done(
+            reply.clone(),
+            id.clone(),
+            call,
+            mcp_tools::project_slot_outcome,
+        );
         match invoke::call(
             &mut self.host,
             &service,
@@ -164,17 +183,22 @@ impl Daemon {
             Outcome::Started => {}
             Outcome::NoRuntime => send(
                 &reply,
-                mcp_tools::tool_result(id, format!("service {} has no runtime", service_id), true),
+                mcp_tools::tool_result(
+                    id,
+                    format!("service {} has no runtime", service_id),
+                    true,
+                    call,
+                ),
             ),
             Outcome::BuiltinFailed(failure) => {
-                reply.send(mcp_tools::project_builtin_outcome(id, Err(failure)))
+                reply.send(mcp_tools::project_builtin_outcome(id, Err(failure), call))
             }
             Outcome::SlotFailed(failure) => {
-                reply.send(mcp_tools::project_slot_outcome(id, Err(failure)))
+                reply.send(mcp_tools::project_slot_outcome(id, Err(failure), call))
             }
-            Outcome::Rejected(rejection) => {
-                reply.send(rpc::to_line(&mcp_tools::project_rejection(id, rejection)))
-            }
+            Outcome::Rejected(rejection) => reply.send(rpc::to_line(
+                &mcp_tools::project_rejection(id, rejection, call),
+            )),
         }
     }
 }
@@ -184,14 +208,15 @@ impl Daemon {
 pub(super) fn projected_done(
     reply: crate::wire::control::channel::Reply,
     external_id: Option<Value>,
-    project: fn(Option<Value>, Result<Value, Failure>) -> String,
+    call: CallId,
+    project: fn(Option<Value>, Result<Value, Failure>, CallId) -> String,
 ) -> ReplySink {
     Box::new(move |outcome| {
         let outcome = match outcome {
             Ok(Reply::Value(value)) => Ok(value),
             Err(failure) => Err(failure),
         };
-        reply.send(project(external_id, outcome));
+        reply.send(project(external_id, outcome, call));
     })
 }
 
@@ -199,6 +224,9 @@ fn send(reply: &crate::wire::control::channel::Reply, response: rpc::Response) {
     reply.send(rpc::to_line(&response));
 }
 
-fn unknown_tool(id: &Option<Value>, name: &str) -> rpc::Response {
-    rpc::err(id.clone(), -32602, &format!("unknown tool: {}", name))
+fn unknown_tool(id: &Option<Value>, name: &str, call: CallId) -> rpc::Response {
+    mcp_tools::named_error(
+        rpc::err(id.clone(), -32602, &format!("unknown tool: {}", name)),
+        call,
+    )
 }

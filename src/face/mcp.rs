@@ -1,5 +1,5 @@
 use crate::server::mcp::result::{
-    error_response, server_meta, tool_error_result, tool_result_object, SERVER_NAME,
+    error_response, merge_meta, server_meta, tool_error_result, tool_result_object, SERVER_NAME,
 };
 use crate::server::mcp::session::{validate_meta, Served, MODERN_VERSION};
 use crate::wire::control::channel;
@@ -294,7 +294,7 @@ fn tools_call(
             let mut result = tool_result_object(response.result.unwrap_or_else(|| json!({})));
             if era == Era::Modern {
                 result["resultType"] = json!("complete");
-                result["_meta"] = server_meta();
+                merge_meta(&mut result, server_meta());
             }
             (rpc::ok(id, result), false)
         }
@@ -303,7 +303,7 @@ fn tools_call(
             let mut result = tool_error_result(&format!("svcd unreachable: {}", error));
             if era == Era::Modern {
                 result["resultType"] = json!("complete");
-                result["_meta"] = server_meta();
+                merge_meta(&mut result, server_meta());
             }
             (rpc::ok(id, result), true)
         }
