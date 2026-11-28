@@ -348,10 +348,11 @@ pub struct Invocation {
     pub idempotency: Option<String>,
     /// 进度关联 token；`None` = 调用方不要进度。
     pub progress: Option<ProgressToken>,
-    /// 排障用的串联 id；实现可以忽略。
+    /// 这次调用所属管理请求的号（`call=N`）：槽的超时行与 hook 日志的起始行
+    /// 用它把一条失败接回 `svcd.log`。
     ///
-    /// ADR-0013 规定信封可带它；今天没有任何编排读它。
-    #[allow(dead_code)]
+    /// ADR-0013 规定信封可带它；#348 起 `Daemon` 在每次 `tools/call` 时填入调用
+    /// 号。它只停在宿主内部——插件帧的 `params._meta` 仍然只有 progressToken。
     pub trace: Option<String>,
     pub cancel: CancelToken,
 }

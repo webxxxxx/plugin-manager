@@ -1379,4 +1379,19 @@ fn a_capability_hook_answers_tools_call() {
         .to_string();
     assert!(detail.contains("exited"), "{detail}");
     assert!(!detail.contains("timed out"), "{detail}");
+
+    // The hook log names each run with the request number (#348), and the MCP
+    // failure carries the same number (#347): the chain closes end to end.
+    let failed_call = failed["_meta"]["io.svcd/call"]
+        .as_u64()
+        .expect("the failure names its call");
+    let log = fs::read_to_string(sandbox.logs.join("hookplug-hooks.log")).expect("hook log");
+    assert!(
+        log.contains(&format!("call={failed_call} fail start")),
+        "the hook log names the request; wanted call={failed_call} fail start in:\n{log}"
+    );
+    assert!(
+        log.contains("boom"),
+        "the hook's stderr stays in the log:\n{log}"
+    );
 }

@@ -159,6 +159,9 @@ impl Daemon {
         let mut invocation =
             Invocation::new(capability, arguments, self.config.limits.default_timeout);
         invocation.progress = progress_token;
+        // The call number rides with the invocation so the slot and the hook
+        // worker can name the request in their log lines (#348).
+        invocation.trace = Some(call.to_string());
 
         let builtin_done = projected_done(
             reply.clone(),

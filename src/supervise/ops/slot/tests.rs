@@ -131,6 +131,7 @@ fn queue(slot: &mut Slot, id: u64, deadline: u64) -> Receiver<String> {
             capability: "echo".into(),
             deadline,
             progress_token: None,
+            trace: None,
             client: Some(crate::wire::control::channel::Reply::plain(tx.clone())),
             sink: test_reply_sink(
                 crate::wire::control::channel::Reply::plain(tx),
@@ -350,6 +351,7 @@ fn a_timed_out_completion_sink_is_called() {
             capability: "echo".into(),
             deadline: 10,
             progress_token: None,
+            trace: Some("7".into()),
             client: None,
             sink: Box::new(move |outcome| {
                 let _ = tx.send(outcome);
@@ -1268,6 +1270,8 @@ fn call_for(
     call_hook::HookCall {
         id: slot.id.clone(),
         hook,
+        trace: Some("7".into()),
+        capability: "echo".into(),
         arguments: serde_json::json!({}),
         timeout: Duration::from_secs(5),
         cancel,
