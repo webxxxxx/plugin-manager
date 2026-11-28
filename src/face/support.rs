@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use serde_json::{json, Value};
 
+use crate::kernel::call::CallId;
 use crate::kernel::failure::{Class, Problem, ProblemError};
 use crate::server::http::model as http;
 use crate::server::http::{CancelToken, JobBudget, Request};
@@ -60,9 +61,45 @@ impl CallBudget {
     }
 }
 
-/// A daemon RPC failure: status, error code and message. The caller renders
-/// the wire envelope.
-pub type RpcFailure = (u16, &'static str, String);
+/// The response header that carries the daemon's call number on a failed HTTP
+/// request (#346). The body keeps its `{code, message}` shape.
+pub(crate) const REQUEST_ID_HEADER: &str = "X-Request-Id";
+
+/// A daemon RPC failure: status, error code, message, and the call number when
+/// the daemon named one. The caller renders the wire envelope.
+#[derive(Debug)]
+pub struct RpcFailure {
+    pub status: u16,
+    pub code: &'static str,
+    pub message: String,
+    /// The daemon's call number for this request (`error.data.call`). A timeout
+    /// or a disconnect has none: the request never reached the daemon's counter.
+    pub call: Option<CallId>,
+}
+
+impl RpcFailure {
+    /// A failure the daemon did not name.
+    fn unnamed(status: u16, code: &'static str, message: impl Into<String>) -> RpcFailure {
+        RpcFailure {
+            status,
+            code,
+            message: message.into(),
+            call: None,
+        }
+    }
+
+    /// The rendered error envelope, with the call number as a response header
+    /// when the daemon named one. The byte path (install and import streams)
+    /// uses this; the `Response` path renders the same header in
+    /// `reply::rpc_error`.
+    pub fn http_error(&self) -> Vec<u8> {
+        let headers = match self.call {
+            Some(call) => vec![(REQUEST_ID_HEADER.to_string(), call.to_string())],
+            None => Vec::new(),
+        };
+        http::json_error_with_headers(self.status, self.code, &self.message, &headers)
+    }
+}
 
 /// One control-channel round trip under \`budget\`. A timeout or a disconnect is
 /// a 504 \`timeout\`, never a 503: 503 stays reserved for the blocking queue
@@ -88,13 +125,13 @@ pub fn rpc_result(
             cause.kind(),
             std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted
         ) {
-            (
+            RpcFailure::unnamed(
                 504,
                 "timeout",
                 format!("svcd control request did not complete: {}", cause),
             )
         } else {
-            (500, "internal", format!("svcd unreachable: {}", cause))
+            RpcFailure::unnamed(500, "internal", format!("svcd unreachable: {}", cause))
         }
     })?;
     project_response(response)
@@ -103,11 +140,24 @@ pub fn rpc_result(
 fn project_response(response: rpc::Response) -> Result<Value, RpcFailure> {
     if let Some(error) = response.error {
         let status = status_for_rpc_error(&error);
-        return Err((status, code_for(status), error.message));
+        // The daemon names the request in `error.data.call`; the body stays
+        // `{code, message}` so the number travels in a response header (#346).
+        let call = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("call"))
+            .and_then(Value::as_u64)
+            .map(CallId::from_raw);
+        return Err(RpcFailure {
+            status,
+            code: code_for(status),
+            message: error.message,
+            call,
+        });
     }
     response
         .result
-        .ok_or_else(|| (500, "internal", "empty daemon response".to_string()))
+        .ok_or_else(|| RpcFailure::unnamed(500, "internal", "empty daemon response"))
 }
 
 /// The rendered-bytes form used by the legacy/fallback router and the install
@@ -118,17 +168,20 @@ pub fn rpc(
     params: Value,
     budget: &CallBudget,
 ) -> Result<Value, Vec<u8>> {
-    rpc_result(config, method, params, budget)
-        .map_err(|(status, code, message)| error(status, code, &message))
+    rpc_result(config, method, params, budget).map_err(|failure| failure.http_error())
 }
 
 pub fn require_plugin_result(
     config: &Path,
     id: &str,
     budget: &CallBudget,
-) -> Result<(), (u16, &'static str, String)> {
+) -> Result<(), RpcFailure> {
     if !crate::kernel::registry::valid_id(id) {
-        return Err((404, "not_found", format!("unknown plugin: {}", id)));
+        return Err(RpcFailure::unnamed(
+            404,
+            "not_found",
+            format!("unknown plugin: {}", id),
+        ));
     }
     let status = rpc_result(config, "svc.status", json!({ "id": id }), budget)?;
     let kind = status
@@ -138,7 +191,11 @@ pub fn require_plugin_result(
     if kind == "plugin" {
         Ok(())
     } else {
-        Err((404, "not_found", format!("not a plugin: {}", id)))
+        Err(RpcFailure::unnamed(
+            404,
+            "not_found",
+            format!("not a plugin: {}", id),
+        ))
     }
 }
 
@@ -411,6 +468,60 @@ mod tests {
         }
     }
 
+    fn failure_response(error: rpc::Error) -> rpc::Response {
+        rpc::Response {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(1)),
+            result: None,
+            error: Some(error),
+        }
+    }
+
+    #[test]
+    fn a_daemon_failure_carries_the_call_number_the_daemon_named() {
+        let failure = project_response(failure_response(rpc_error(
+            "install failed",
+            Some(json!({"call": 7, "kind": "internal"})),
+        )))
+        .expect_err("failure");
+        assert_eq!(failure.call, Some(CallId::from_raw(7)));
+        assert_eq!(failure.status, 500);
+        assert_eq!(failure.message, "install failed");
+    }
+
+    #[test]
+    fn a_failure_the_daemon_did_not_name_has_no_call_number() {
+        let failure =
+            project_response(failure_response(rpc_error("boom", None))).expect_err("failure");
+        assert_eq!(failure.call, None);
+    }
+
+    #[test]
+    fn a_named_failure_renders_the_call_in_the_request_id_header() {
+        let bytes = RpcFailure {
+            status: 500,
+            code: "internal",
+            message: "boom".into(),
+            call: Some(CallId::from_raw(7)),
+        }
+        .http_error();
+        let text = String::from_utf8(bytes).expect("utf8").to_ascii_lowercase();
+        assert!(text.contains("x-request-id: 7\r\n"), "{text}");
+    }
+
+    #[test]
+    fn an_unnamed_failure_renders_no_request_id_header() {
+        let bytes = RpcFailure {
+            status: 500,
+            code: "internal",
+            message: "boom".into(),
+            call: None,
+        }
+        .http_error();
+        let text = String::from_utf8(bytes).expect("utf8").to_ascii_lowercase();
+        assert!(!text.contains("x-request-id"), "{text}");
+    }
+
     #[test]
     fn the_control_projection_reads_the_wire_kind() {
         let response = |data: Option<Value>| rpc::Response {
@@ -425,12 +536,12 @@ mod tests {
         };
         let failure = project_response(response(Some(json!({"kind": "conflict"}))))
             .expect_err("structured conflict");
-        assert_eq!(failure.0, 409);
-        assert_eq!(failure.1, "conflict");
-        assert_eq!(failure.2, "start failed");
+        assert_eq!(failure.status, 409);
+        assert_eq!(failure.code, "conflict");
+        assert_eq!(failure.message, "start failed");
 
         let failure = project_response(response(None)).expect_err("missing data");
-        assert_eq!(failure.0, 500);
+        assert_eq!(failure.status, 500);
     }
 
     #[test]
@@ -510,9 +621,9 @@ mod tests {
         };
         let failure = rpc_result(&root, "svcd.ping", json!({}), &budget)
             .expect_err("an expired budget must fail");
-        assert_eq!(failure.0, 504);
-        assert_eq!(failure.1, "timeout");
-        assert!(failure.2.contains("timed out"), "{}", failure.2);
+        assert_eq!(failure.status, 504);
+        assert_eq!(failure.code, "timeout");
+        assert!(failure.message.contains("timed out"), "{}", failure.message);
         server.join().expect("server");
         let _ = std::fs::remove_dir_all(&root);
     }

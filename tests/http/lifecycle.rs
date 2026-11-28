@@ -41,6 +41,34 @@ fn services_version_start_and_stop() {
     assert_eq!(missing.status, 404);
     assert!(missing.body["error"]["code"].is_string());
     assert!(missing.body["error"]["message"].is_string());
+
+    // The daemon names every request it refuses: the number rides in a header
+    // and the body keeps its `{code, message}` shape (#346).
+    let call_number = |response: &Response| -> u64 {
+        response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-request-id"))
+            .map(|(_, value)| value.clone())
+            .expect("a daemon refusal names its call")
+            .parse()
+            .expect("the call number is a number")
+    };
+    let first = call_number(&missing);
+    assert!(first > 0);
+    let missing_again = request(&address, "GET", "/api/v1/services/missing", "", b"");
+    let second = call_number(&missing_again);
+    assert!(
+        second > first,
+        "the daemon counts up: {first} then {second}"
+    );
+    assert!(
+        !services
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-request-id")),
+        "a successful response carries no call number"
+    );
 }
 
 /// Give the demo core service three lifecycle actions that append their name

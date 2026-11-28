@@ -213,7 +213,7 @@ impl ApiFace {
 
     fn require_plugin(&self, budget: &CallBudget, id: &str) -> Result<(), Response> {
         support::require_plugin_result(self.config.paths.control_dir(), id, budget)
-            .map_err(|(status, code, message)| error_response(status, code, &message))
+            .map_err(rpc_error)
     }
 
     /// Project `svc.list` into the summaries the console consumes.
