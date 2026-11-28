@@ -234,7 +234,8 @@ pub fn validate_script_payload(
 
 /// The icon formats a package may ship, checked by magic bytes: the daemon has
 /// no image library and no reason to decode a bitmap, only to refuse a file
-/// whose bytes are not what the manifest calls them.
+/// whose bytes are not what the manifest calls them. An SVG is text, so its
+/// check is a prefix rather than a fixed magic.
 fn icon_magic(format: &str) -> Option<[u8; 4]> {
     match format {
         "png" => Some([0x89, b'P', b'N', b'G']),
@@ -242,6 +243,18 @@ fn icon_magic(format: &str) -> Option<[u8; 4]> {
         "icns" => Some(*b"icns"),
         _ => None,
     }
+}
+
+fn icon_bytes_match(format: &str, data: &[u8]) -> bool {
+    if format == "svg" {
+        let data = data.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(data);
+        let mut data = data;
+        while data.first().is_some_and(u8::is_ascii_whitespace) {
+            data = &data[1..];
+        }
+        return data.starts_with(b"<svg") || data.starts_with(b"<?xml");
+    }
+    icon_magic(format).is_some_and(|magic| data.starts_with(&magic))
 }
 
 /// `icons` paths are checked against `files[]` by the manifest rules; the magic
@@ -255,8 +268,7 @@ pub fn check_icon_magic(manifest: &Manifest, files: &[(&str, &[u8])]) -> Result<
             // A missing payload file is reported by the declaration checks.
             continue;
         };
-        let magic = icon_magic(format).expect("icons.entries only yields png/ico/icns");
-        if !data.starts_with(&magic) {
+        if !icon_bytes_match(format, data) {
             return Err(Problem::Invalid.error(format!(
                 "icons.{} is not a {} file: magic bytes mismatch in {}",
                 format, format, path

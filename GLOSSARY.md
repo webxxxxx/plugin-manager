@@ -20,6 +20,18 @@ _Avoid_: 内置插件、系统插件、core plugin
 从 .spk 安装、`kind=plugin` 的服务；身份是 manifest 的 `id`，`name` 只是显示名（可中文）；能力与生命周期动作都由 manifest 声明。
 _Avoid_: PluginManager、PM（已退役）
 
+**作者（Author）**:
+manifest 的 `author` 字段声明的归属（名字，可选网址），只用于商店展示。它不是验证过的身份，也不参与安装或验签；与「发布者」是两个事实。
+_Avoid_: 发布者、维护者（除非确实指发布 key）
+
+**发布者（Publisher）**:
+包 `signature.json` 里 `keyId` 对应的供应商。目录展示的发布者由发布 CI 按签名 key 归属；设备安装时仍由 `trust.d` 验签，两者不互相替代。目前只有官方一家。
+_Avoid_: 作者、厂商（「厂商」在 ADR-0032 里指设备厂商）
+
+**详情地址（detailUrl）**:
+manifest 里的 https 地址，网页商店抓取该 Markdown 后在详情页渲染；正文不写进清单，所以改文档不需要重打包。
+_Avoid_: 描述（`desc` 是一句话简介）
+
 **未签名安装（Insecure install）**:
 只由 `svcd.conf` 的 `allow_insecure_install` 控制的安装模式，默认关闭。开启后普通安装先严格验签，验签失败才降级接受未签名或未信任 key 的包；CLI/HTTP/Web 都没有逐次 `--insecure` 开关或勾选项。`files[]` 哈希与平台/hooks 校验不放宽；日志标注未验签，这样装的版本不能导出为签名 `.spk`。
 _Avoid_: 信任安装、跳过校验（默认路径不跳过）

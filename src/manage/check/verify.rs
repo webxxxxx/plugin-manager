@@ -919,10 +919,34 @@ mod tests {
     fn rejects_an_unknown_icon_format() {
         let (manifest, _) = manifest(crate::platform::target());
         let mut value: Value = serde_json::from_slice(&manifest).expect("json");
-        value["icons"] = json!({"svg": "payload/bin/demo"});
+        value["icons"] = json!({"webp": "payload/bin/demo"});
         let bytes = serde_json::to_vec(&value).expect("json");
         let error = parse_manifest(&bytes).expect_err("unknown format");
         assert!(error.detail().contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn accepts_an_svg_icon_for_the_web_storefront() {
+        let exec = native_payload();
+        let package = package_with_icons(
+            Some(json!({"svg": "payload/icon.svg"})),
+            &[
+                ("payload/bin/demo", exec.as_slice()),
+                (
+                    "payload/icon.svg",
+                    b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>",
+                ),
+            ],
+        );
+        let verified = verify_bytes(&package).expect("svg icon");
+        assert_eq!(
+            verified
+                .manifest
+                .icons
+                .as_ref()
+                .and_then(|icons| icons.svg.as_deref()),
+            Some("payload/icon.svg")
+        );
     }
 
     #[test]

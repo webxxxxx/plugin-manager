@@ -35,6 +35,23 @@ pub struct Manifest {
     pub name: String,
     pub version: String,
     pub desc: String,
+    /// Who wrote the plugin: a declared attribution, not a verified identity.
+    /// The store shows it next to the signature-derived publisher so a reader
+    /// can tell the two apart. Optional so every existing package stays valid.
+    #[serde(default)]
+    pub author: Option<Author>,
+    /// The project's own page, opened from the store detail view.
+    #[serde(default)]
+    pub homepage: Option<String>,
+    /// Where the store fetches the long description from. The description is
+    /// deliberately *not* in the manifest: one URL keeps every package small
+    /// and lets the text change without a repack. The store renders Markdown
+    /// from this address; raw HTML is never executed.
+    #[serde(default, rename = "detailUrl")]
+    pub detail_url: Option<String>,
+    /// SPDX-ish short name (`MIT`, `Apache-2.0`); display only.
+    #[serde(default)]
+    pub license: Option<String>,
     pub platform: String,
     pub protocol: u32,
     pub exec: Exec,
@@ -49,7 +66,8 @@ pub struct Manifest {
     #[serde(default)]
     pub capabilities: Vec<Capability>,
     pub ui: Option<Ui>,
-    /// Package icons for desktop shells and packagers (`png` / `ico` / `icns`).
+    /// Package icons for desktop shells, packagers and the web storefront
+    /// (`png` / `ico` / `icns` / `svg`).
     #[serde(default)]
     pub icons: Option<Icons>,
     #[serde(default)]
@@ -144,8 +162,19 @@ pub struct Capability {
     pub hook: Option<Hook>,
 }
 
+/// Declared author attribution. `url` is optional; the store links it when it
+/// is an http(s) address.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Author {
+    pub name: String,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
 /// Package icons: one package-relative path per format. Unknown keys are
-/// rejected so a typo cannot silently ship an icon nobody reads.
+/// rejected so a typo cannot silently ship an icon nobody reads. `svg` is for
+/// the web storefront; desktop packagers ignore it.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Icons {
@@ -155,6 +184,8 @@ pub struct Icons {
     pub ico: Option<String>,
     #[serde(default)]
     pub icns: Option<String>,
+    #[serde(default)]
+    pub svg: Option<String>,
 }
 
 impl Icons {
@@ -164,6 +195,7 @@ impl Icons {
             ("png", self.png.as_deref()),
             ("ico", self.ico.as_deref()),
             ("icns", self.icns.as_deref()),
+            ("svg", self.svg.as_deref()),
         ]
         .into_iter()
         .filter_map(|(format, path)| path.map(|path| (format, path)))

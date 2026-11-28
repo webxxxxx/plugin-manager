@@ -22,7 +22,91 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, ProblemError> {
         return Err(Problem::UnsupportedPlatform.error("platform must be a target triple"));
     }
     check_version(&m.version)?;
+    check_attribution(&m)?;
     Ok(m)
+}
+
+/// Attribution fields the store displays. They are optional, but a present
+/// value has to be safe to render and small enough to stay a manifest detail:
+/// a URL that is not http(s) becomes a `javascript:` link in the store, and an
+/// unbounded string turns a 5 KiB manifest into a payload.
+///
+/// `detailUrl` is https-only on purpose: it is fetched by the store, so an
+/// `http://` address would either be a plaintext dependency or a feature the
+/// store silently refuses to use. `homepage` and `author.url` are only opened
+/// in a browser tab and may use http.
+const MAX_URL_CHARS: usize = 2048;
+const MAX_AUTHOR_CHARS: usize = 128;
+const MAX_LICENSE_CHARS: usize = 64;
+
+fn check_attribution(manifest: &Manifest) -> Result<(), ProblemError> {
+    if let Some(author) = &manifest.author {
+        let name = author.name.trim();
+        if name.is_empty() || name.chars().count() > MAX_AUTHOR_CHARS {
+            return Err(Problem::Invalid.error(format!(
+                "author.name must be 1..={MAX_AUTHOR_CHARS} characters"
+            )));
+        }
+        if name.chars().any(char::is_control) {
+            return Err(Problem::Invalid.error("author.name must not contain control characters"));
+        }
+        if let Some(url) = &author.url {
+            check_url("author.url", url, false)?;
+        }
+    }
+    if let Some(homepage) = &manifest.homepage {
+        check_url("homepage", homepage, false)?;
+    }
+    if let Some(detail) = &manifest.detail_url {
+        check_url("detailUrl", detail, true)?;
+    }
+    if let Some(license) = &manifest.license {
+        let license = license.trim();
+        if license.is_empty() || license.chars().count() > MAX_LICENSE_CHARS {
+            return Err(Problem::Invalid.error(format!(
+                "license must be 1..={MAX_LICENSE_CHARS} characters"
+            )));
+        }
+        if license.chars().any(char::is_control) {
+            return Err(Problem::Invalid.error("license must not contain control characters"));
+        }
+    }
+    Ok(())
+}
+
+/// An absolute http(s) URL with a host. Not a full RFC parser: the store does
+/// the strict parsing and private-address checks before it fetches anything;
+/// this only keeps a manifest from carrying a scheme that must never become a
+/// link.
+fn check_url(field: &str, value: &str, https_only: bool) -> Result<(), ProblemError> {
+    let value = value.trim();
+    if value.chars().count() > MAX_URL_CHARS {
+        return Err(Problem::Invalid.error(format!("{field} exceeds {MAX_URL_CHARS} characters")));
+    }
+    if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(
+            Problem::Invalid.error(format!("{field} contains whitespace or control characters"))
+        );
+    }
+    let https = value.strip_prefix("https://");
+    let http = value.strip_prefix("http://");
+    let rest = match (https, http) {
+        (Some(rest), _) => rest,
+        (None, Some(rest)) if !https_only => rest,
+        (None, Some(_)) => {
+            return Err(Problem::Invalid.error(format!(
+                "{field} must use https (the store only fetches https)"
+            )))
+        }
+        (None, None) => {
+            return Err(Problem::Invalid.error(format!("{field} must be an absolute http(s) URL")))
+        }
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if host.is_empty() || host.contains('@') {
+        return Err(Problem::Invalid.error(format!("{field} has no host or carries credentials")));
+    }
+    Ok(())
 }
 
 /// `id` is the plugin identity and `name` is only a display name. A package
@@ -78,6 +162,7 @@ fn check_version(value: &str) -> Result<(), ProblemError> {
 /// this before writing so authoring mistakes fail early.
 pub fn validate_manifest(manifest: &Manifest) -> Result<(), ProblemError> {
     check_schema(manifest)?;
+    check_attribution(manifest)?;
     check_ready(manifest)?;
     check_capabilities_with_exec(manifest)?;
     check_compat(manifest)?;
@@ -142,7 +227,9 @@ fn check_icons(manifest: &Manifest) -> Result<(), ProblemError> {
         return Ok(());
     };
     if icons.entries().next().is_none() {
-        return Err(Problem::Invalid.error("icons must declare at least one of png, ico or icns"));
+        return Err(
+            Problem::Invalid.error("icons must declare at least one of png, ico, icns or svg")
+        );
     }
     let mut total = 0u64;
     for (format, path) in icons.entries() {
@@ -480,4 +567,123 @@ pub(crate) fn check_platform(manifest: &Manifest) -> Result<(), ProblemError> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn manifest_with(extra: Value) -> Result<Manifest, ProblemError> {
+        let mut manifest = json!({
+            "schema": 1,
+            "id": "demo",
+            "name": "Demo",
+            "version": "1.0.0",
+            "desc": "a demo",
+            "platform": "x86_64-unknown-linux-musl",
+            "protocol": 2,
+            "exec": {"path": "payload/bin/demo"},
+            "files": [{"path": "payload/bin/demo", "size": 3, "sha256": "00", "mode": 493}]
+        });
+        manifest
+            .as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().expect("object").clone());
+        parse_manifest(&serde_json::to_vec(&manifest).expect("json"))
+    }
+
+    #[test]
+    fn attribution_fields_are_optional_and_accepted() {
+        let parsed = manifest_with(json!({
+            "author": {"name": "张三", "url": "https://example.com/zhang"},
+            "homepage": "https://example.com/meow",
+            "detailUrl": "https://example.com/meow/docs",
+            "license": "MIT"
+        }))
+        .expect("attribution fields parse");
+        assert_eq!(parsed.author.expect("author").name, "张三");
+        assert_eq!(
+            parsed.detail_url.as_deref(),
+            Some("https://example.com/meow/docs")
+        );
+        assert_eq!(parsed.license.as_deref(), Some("MIT"));
+
+        // No attribution at all is still a valid package.
+        manifest_with(json!({})).expect("absent attribution parses");
+    }
+
+    #[test]
+    fn detail_url_must_be_https() {
+        let error = manifest_with(json!({"detailUrl": "http://example.com/meow.md"}))
+            .expect_err("plain http detail is rejected");
+        assert!(
+            error.to_string().contains("detailUrl must use https"),
+            "{error}"
+        );
+
+        let error = manifest_with(json!({"detailUrl": "example.com/meow.md"}))
+            .expect_err("relative detail is rejected");
+        assert!(
+            error.to_string().contains("absolute http(s) URL"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn author_name_is_bounded_and_control_free() {
+        let error = manifest_with(json!({"author": {"name": "   "}}))
+            .expect_err("blank author is rejected");
+        assert!(error.to_string().contains("author.name"), "{error}");
+
+        let long = "x".repeat(MAX_AUTHOR_CHARS + 1);
+        let error =
+            manifest_with(json!({"author": {"name": long}})).expect_err("long author is rejected");
+        assert!(error.to_string().contains("author.name"), "{error}");
+
+        let error = manifest_with(json!({"author": {"name": "a\nb"}}))
+            .expect_err("control characters are rejected");
+        assert!(error.to_string().contains("control"), "{error}");
+    }
+
+    #[test]
+    fn homepage_and_author_urls_must_be_absolute_http_s() {
+        for field in ["homepage", "author"] {
+            let extra = if field == "homepage" {
+                json!({"homepage": "javascript:alert(1)"})
+            } else {
+                json!({"author": {"name": "a", "url": "javascript:alert(1)"}})
+            };
+            let error = manifest_with(extra).expect_err("javascript URL is rejected");
+            assert!(
+                error.to_string().contains("absolute http(s) URL"),
+                "{error}"
+            );
+        }
+
+        // http is allowed for links a browser only opens.
+        manifest_with(json!({"homepage": "http://example.com/"}))
+            .expect("http homepage is accepted");
+    }
+
+    #[test]
+    fn license_is_bounded() {
+        let error = manifest_with(json!({"license": "x".repeat(MAX_LICENSE_CHARS + 1)}))
+            .expect_err("long license is rejected");
+        assert!(error.to_string().contains("license"), "{error}");
+        manifest_with(json!({"license": "Apache-2.0"})).expect("license parses");
+    }
+
+    #[test]
+    fn an_svg_icon_is_a_valid_package_icon() {
+        let parsed = manifest_with(json!({
+            "icons": {"svg": "payload/web/icon.svg"},
+            "files": [
+                {"path": "payload/bin/demo", "size": 3, "sha256": "00", "mode": 493},
+                {"path": "payload/web/icon.svg", "size": 3, "sha256": "00", "mode": 420}
+            ]
+        }))
+        .expect("parse");
+        validate_manifest(&parsed).expect("svg icon validates");
+    }
 }
