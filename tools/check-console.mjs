@@ -577,6 +577,85 @@ const CHECKS = [
     },
   },
   {
+    id: "state-column-not-runtime",
+    run(page) {
+      if (!page.includes('<th scope="col">状态</th>')) {
+        throw new Error("the status column is still labelled 运行");
+      }
+      if (!page.includes("content:'状态'")) {
+        throw new Error("the mobile row label must follow the table header");
+      }
+      return "the column is named 状态 on desktop and mobile";
+    },
+    mutate(page) {
+      return page.replaceAll("状态", "运行");
+    },
+  },
+  {
+    id: "empty-state-hides-with-rows",
+    run(page) {
+      const rule = cssRule(page, ".empty.hidden");
+      if (!rule || !/display:\s*none/.test(rule)) {
+        throw new Error("the empty state must lose to the hidden class when rows exist");
+      }
+      return "the empty state is hidden as soon as the list has rows";
+    },
+    mutate(page) {
+      return page.replace("  .empty.hidden { display:none; }\n", "");
+    },
+  },
+  {
+    id: "settings-head-is-bare",
+    run(page) {
+      for (const removed of ["svcd · 配置", "悬停参数旁的 ?", "sheet-kicker"]) {
+        if (page.includes(removed)) {
+          throw new Error("the settings head still carries " + removed);
+        }
+      }
+      const wait = functionBody(page, "waitForRestart");
+      if (!wait.includes("status.textContent")) {
+        throw new Error("the restart status must move into the sheet footer");
+      }
+      return "the settings head has only its title";
+    },
+    mutate(page) {
+      return page.replace(
+        "  head.className = 'sheet-head';",
+        "  head.className = 'sheet-head';\n  const kicker = 'svcd · 配置';",
+      );
+    },
+  },
+  {
+    id: "trusted-keys-live-in-security",
+    run(page) {
+      if (page.includes('role="menuitem" onclick="pickTrust()"')) {
+        throw new Error("adding a public key must not stay in the overflow menu");
+      }
+      if (!page.includes("function trustCard")) {
+        throw new Error("the Security page must render the trusted-key card");
+      }
+      if (!page.includes("if (group === '安全') page.appendChild(trustCard());")) {
+        throw new Error("the trusted-key card must be attached to the Security group");
+      }
+      if (!page.includes("/api/v1/trust") || !page.includes("function removeTrust")) {
+        throw new Error("the list and its delete action must use the trust API");
+      }
+      const remove = functionBody(page, "removeTrust");
+      for (const needle of ["method: 'DELETE'", "confirm(", "refresh();"]) {
+        if (!remove.includes(needle)) {
+          throw new Error("deleting a key is not wired: " + needle);
+        }
+      }
+      return "trusted keys are listed and removable from Security";
+    },
+    mutate(page) {
+      return page.replace(
+        "if (group === '安全') page.appendChild(trustCard());",
+        "",
+      );
+    },
+  },
+  {
     id: "about-tab-does-not-save",
     run(page) {
       const body = functionBody(page, "showTab");
