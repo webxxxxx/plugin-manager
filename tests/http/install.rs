@@ -703,14 +703,31 @@ fn unsigned_install_is_accepted_when_the_conf_switch_is_on() {
         "an insecure install must not invent a signature file"
     );
 
-    // The version directory has no signature, so it cannot be exported as a
-    // signed .spk; the error must say why instead of failing on a missing file.
-    let exported = request(&address, "GET", "/api/v1/export/demo/spk", "", b"");
-    assert_eq!(exported.status, 500, "{}", exported.body);
-    let message = exported.body["error"]["message"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(message.contains("no signature"), "{message}");
+    // The same switch that accepted the install also allows the export: the
+    // package comes back without a signature entry instead of failing on it.
+    let exported = raw_request(&address, "GET", "/api/v1/export/demo/spk", "", b"");
+    assert_eq!(
+        exported.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&exported.body)
+    );
+    let names = tar_names(&exported.body);
+    assert_eq!(names.first().map(String::as_str), Some("manifest.json"));
+    assert!(
+        !names.iter().any(|name| name == "signature.json"),
+        "an unsigned export must not invent a signature: {names:?}"
+    );
+
+    let backup = raw_request(&address, "GET", "/api/v1/export/demo", "", b"");
+    assert_eq!(
+        backup.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&backup.body)
+    );
+    let names = tar_names(&backup.body);
+    assert!(names.iter().any(|name| name == "plugin.spk"), "{names:?}");
 }
 
 #[test]

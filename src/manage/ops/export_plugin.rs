@@ -28,11 +28,12 @@ pub fn plan_export_spkb(
     version: &str,
     version_dir: &Path,
     config: Option<&[u8]>,
+    allow_unsigned: bool,
 ) -> Result<package::TarPlan, ProblemError> {
     let mut plan = package::TarPlan::new();
     let backup = backup_json(id, version, config);
     plan.push_bytes(package::tar_entry_bytes("backup.json", &backup, 0o644)?);
-    let inner = package::plan_installed_spk(version_dir)?;
+    let inner = package::plan_installed_spk(version_dir, allow_unsigned)?;
     let inner_size = inner.size();
     plan.push_bytes(package::tar_header_bytes("plugin.spk", inner_size, 0o644)?);
     plan.append(inner);
@@ -44,7 +45,11 @@ pub fn plan_export_spkb(
     Ok(plan)
 }
 
-pub fn export_spkb(paths: &Paths, id: &str) -> Result<(String, Vec<u8>), ProblemError> {
+pub fn export_spkb(
+    paths: &Paths,
+    id: &str,
+    allow_unsigned: bool,
+) -> Result<(String, Vec<u8>), ProblemError> {
     let version = current_version(paths, id)
         .ok_or_else(|| Problem::UnknownPlugin.error(format!("unknown plugin: {}", id)))?;
     let config = active_config(paths, id)
@@ -58,6 +63,7 @@ pub fn export_spkb(paths: &Paths, id: &str) -> Result<(String, Vec<u8>), Problem
         &version,
         &plugin_dir(paths, id).join(&version),
         config.as_deref(),
+        allow_unsigned,
     )?;
     let mut bytes = Vec::new();
     plan.write_verified(&mut bytes)?;

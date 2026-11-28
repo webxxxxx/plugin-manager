@@ -245,7 +245,7 @@ mod tests {
         let root = TempDir::new();
         package.write_to(root.path()).expect("write");
         assert!(!root.path().join("signature.json").exists());
-        let error = match plan_installed_spk(root.path()) {
+        let error = match plan_installed_spk(root.path(), false) {
             Ok(_) => panic!("export must be refused without a signature"),
             Err(error) => error,
         };

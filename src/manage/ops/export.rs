@@ -8,12 +8,18 @@ use crate::manage::model::ustar::{
     tar_entry_bytes, tar_header_bytes, tar_padding_bytes, TarPlan, TAR_TRAILER,
 };
 
-fn read_export_signature(version_dir: &Path) -> Result<Vec<u8>, ProblemError> {
+/// The installed signature, or `None` when the package was installed unsigned
+/// and the host opted into that with `allow_insecure_install`.
+fn read_export_signature(
+    version_dir: &Path,
+    allow_unsigned: bool,
+) -> Result<Option<Vec<u8>>, ProblemError> {
     match fs::read(version_dir.join("signature.json")) {
-        Ok(signature) => Ok(signature),
+        Ok(signature) => Ok(Some(signature)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && allow_unsigned => Ok(None),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Err(Problem::Invalid.error(
-                "installed package has no signature (installed insecurely); reinstall a signed package to export it",
+                "installed package has no signature (installed insecurely); set allow_insecure_install = on to export it unsigned, or reinstall a signed package",
             ))
         }
         Err(error) => Err(Problem::Internal.error(format!("read signature: {}", error))),
@@ -22,14 +28,19 @@ fn read_export_signature(version_dir: &Path) -> Result<Vec<u8>, ProblemError> {
 
 /// The installed .spk, described as parts. Payload bytes are not read here;
 /// only the manifest, the signature and each payload's size are.
-pub fn plan_installed_spk(version_dir: &Path) -> Result<TarPlan, ProblemError> {
+pub fn plan_installed_spk(
+    version_dir: &Path,
+    allow_unsigned: bool,
+) -> Result<TarPlan, ProblemError> {
     let manifest_bytes = fs::read(version_dir.join("manifest.json"))
         .map_err(|error| Problem::Internal.error(format!("read manifest: {}", error)))?;
     let manifest = parse_manifest(&manifest_bytes)?;
-    let signature = read_export_signature(version_dir)?;
+    let signature = read_export_signature(version_dir, allow_unsigned)?;
     let mut plan = TarPlan::new();
     plan.push_bytes(tar_entry_bytes("manifest.json", &manifest_bytes, 0o644)?);
-    plan.push_bytes(tar_entry_bytes("signature.json", &signature, 0o644)?);
+    if let Some(signature) = signature {
+        plan.push_bytes(tar_entry_bytes("signature.json", &signature, 0o644)?);
+    }
     let mut files = manifest.files.clone();
     files.sort_by(|left, right| left.path.cmp(&right.path));
     for file in files {

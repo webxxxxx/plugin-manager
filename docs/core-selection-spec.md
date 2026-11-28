@@ -379,7 +379,7 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
 - `editconfig <id>`：要 root；flock `<id>/config.lock`；临时文件 → `$EDITOR`（fallback `vi`）→ 可选 `configCheck`（10s，候选路径，`SVCD_CONFIG`）→ fsync + 原子 rename，旧文件存 `config.last-good`；支持 `--print` / `--file` / `--reset`；不自动重启，打印「restart to apply」。
 - 导出/导入：
   - `export --config-only`：原样活动副本，默认 `<id>-<version>.config`，0600。
-  - `export`：`.spkb` 备份容器（ustar）：`backup.json`（首条目）`{schema:1,id,version,exportedAt,configSha256}` + `plugin.spk`（从已安装版本重建的签名包）+ `config`；容器不签名，导入验内层签名（`allow_insecure_install` 开启时允许内层未签名/未验签）。
+  - `export`：`.spkb` 备份容器（ustar）：`backup.json`（首条目）`{schema:1,id,version,exportedAt,configSha256}` + `plugin.spk`（从已安装版本重建的签名包）+ `config`；容器不签名，导入验内层签名（`allow_insecure_install` 开启时允许内层未签名/未验签）。同一个开关也允许导出：未签名安装的版本导出为不带 `signature.json` 的 `.spk` / 内层 `plugin.spk`；开关关闭时仍拒绝导出。
   - `import <file>`：tar 首条目 `backup.json` → `.spkb`；`manifest.json` → `.spk`；其它 → 裸配置，必须 `--config <id>`。id 不符拒绝；版本不同警告；`--no-config` 跳过；`--force` 只跳过同版本检查，不跳签名。
 - 配置上限 1 MiB；插件私有格式（JSON/TOML/YAML/ini 都行），svcd 不解析、不做 schema、不做升级字段合并；无 `configCheck` 时只保留 last-good。
 - 权限：写（install / editconfig / import / uninstall）要 root；只读（status / logs / `editconfig --print` / `export`）组可用；配置明文，不加密（见 §13-C5）。

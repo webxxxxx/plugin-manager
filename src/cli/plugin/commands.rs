@@ -423,7 +423,7 @@ fn export(config: &Config, id: &str, config_only: bool, out: Option<&Path>) -> i
             }
         }
     } else {
-        match plugin::export_spkb(&config.paths, id) {
+        match plugin::export_spkb(&config.paths, id, config.settings.allow_insecure_install) {
             Ok((version, data)) => (version, data, "spkb"),
             Err(error) => {
                 eprintln!("plugin: {}", error);
