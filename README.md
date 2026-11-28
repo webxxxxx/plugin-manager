@@ -9,7 +9,7 @@
 
 ![svcd 控制台：插件列表、运行状态、开机自启、日志 / 打开 / 导出 / 删除](docs/images/console.png)
 
-控制台是 daemon 自己托管的单页（`http://127.0.0.1:8787/`），不依赖 Node，也没有外部前端构建。
+控制台是 daemon 自己托管的单页（`http://127.0.0.1:8787/`），不依赖 Node，也没有外部前端构建。页面与图标的可读源码是 `src/assets/static/index.html` / `favicon.svg`；改完手动运行 `node tools/minify-static.mjs` 生成同目录的 `.min` 副本，`build.rs` 嵌入的是 `.min` 文件。
 
 ## 能力
 

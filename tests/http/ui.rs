@@ -90,7 +90,7 @@ fn serves_the_embedded_console() {
     // per group, and a switch that only toggles classes — rebuilding on switch
     // would throw away an unsaved edit made in another tab (#297).
     assert!(
-        html.contains("sheet-tabs") && html.contains(".settings-tab { display:none; }"),
+        html.contains("sheet-tabs") && html.contains(".settings-tab{display:none}"),
         "settings must render one tab per group"
     );
     assert!(
@@ -137,6 +137,17 @@ fn serves_the_embedded_console() {
         "the settings sheet carries an About page with source links"
     );
     assert!(
+        html.contains("function showPluginWindow")
+            && html.contains("plugin-window-close")
+            && html.contains("plugin-window-full")
+            && !html.contains("window.open("),
+        "plugin UIs open in the console window, not a new tab"
+    );
+    assert!(
+        html.contains("function confirmAction") && html.contains("alertdialog"),
+        "deletes ask in the console dialog"
+    );
+    assert!(
         html.contains(r#"<th scope="col">状态</th>"#)
             && !html.contains(r#"<th scope="col">运行</th>"#),
         "the plugin list names the state column 状态"
@@ -146,7 +157,7 @@ fn serves_the_embedded_console() {
         "the settings head carries only its title"
     );
     assert!(
-        html.contains(".empty.hidden { display:none; }"),
+        html.contains(".empty.hidden{display:none}"),
         "the empty state must hide when the list has rows"
     );
     // The upload install asks which root when the switch is on and there is
@@ -228,7 +239,10 @@ fn console_is_served_precompressed() {
     flate2::read::GzDecoder::new(&page.body[..])
         .read_to_string(&mut decoded)
         .expect("gunzip console");
-    assert_eq!(decoded, include_str!("../../src/assets/static/index.html"));
+    assert_eq!(
+        decoded,
+        include_str!("../../src/assets/static/index.min.html")
+    );
     assert!(
         page.body.len() < decoded.len(),
         "gzip must be smaller ({} vs {})",
@@ -243,7 +257,7 @@ fn favicon_is_public_and_revalidates() {
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
 
-    let source = include_bytes!("../../src/assets/static/favicon.svg");
+    let source = include_bytes!("../../src/assets/static/favicon.min.svg");
     let icon = raw_request(&address, "GET", "/assets/favicon.svg", "", b"");
     assert_eq!(icon.status, 200);
     assert_eq!(
