@@ -67,6 +67,41 @@ fn a_malformed_frame_is_still_a_numbered_call() {
     );
 }
 
+/// The MCP surface gets the number too: a `tools/call` the daemon refuses
+/// answers with a JSON-RPC error that names the request (#347).
+#[test]
+fn a_failed_tool_call_names_the_request() {
+    let (_sender, receiver) = mpsc::channel();
+    let mut daemon = builtin_daemon(receiver);
+    let line = send(&mut daemon, "tools/call", json!({"name": "ghost.cap"}))
+        .recv()
+        .expect("reply");
+    let reply: Value = serde_json::from_str(&line).expect("response");
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    assert_eq!(
+        serde_json::to_string(&reply["error"]["data"]).expect("json"),
+        r#"{"call":1}"#
+    );
+}
+
+/// A successful tool call keeps the result shape it had before the number
+/// existed (ADR-0033).
+#[test]
+fn a_successful_tool_call_carries_no_call_number() {
+    let (_sender, receiver) = mpsc::channel();
+    let mut daemon = builtin_daemon(receiver);
+    let line = send(
+        &mut daemon,
+        "tools/call",
+        json!({"name": "svc.version", "arguments": {}}),
+    )
+    .recv()
+    .expect("reply");
+    let reply: Value = serde_json::from_str(&line).expect("response");
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    assert!(reply["result"].get("_meta").is_none(), "{reply}");
+}
+
 /// A successful response has no request metadata: the number exists to name a
 /// failure, and adding keys to results would break every consumer's shape.
 #[test]

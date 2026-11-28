@@ -762,6 +762,10 @@ fn modern_bridge_discovers_lists_and_calls_tools() {
     assert_eq!(result["resultType"], "complete");
     assert_eq!(result["isError"], false);
     assert_eq!(result["content"][0]["text"], "pong");
+    assert!(
+        result["_meta"].get("io.svcd/call").is_none(),
+        "a successful tool call carries no call number: {result}"
+    );
 
     let failed = mcp.request(
         4,
@@ -772,6 +776,11 @@ fn modern_bridge_discovers_lists_and_calls_tools() {
     assert_eq!(result["resultType"], "complete");
     assert_eq!(result["isError"], true);
     assert_eq!(result["content"][0]["text"], "boom");
+    // The failure names the request, so a client can find the svcd.log line (#347).
+    assert!(
+        result["_meta"]["io.svcd/call"].as_u64().is_some(),
+        "a failed tool call names the call: {result}"
+    );
 
     // The builtin `svc` is assembled through Launchers, not a plugin slot.
     let builtin = mcp.request(
@@ -928,6 +937,21 @@ fn legacy_bridge_initializes_and_notifies_list_changes() {
     let result = called.get("result").expect("legacy call result");
     assert!(result.get("resultType").is_none());
     assert_eq!(result["content"][0]["text"], "pong");
+
+    // Legacy results carry the number too: it is part of the result the daemon
+    // projected, and the legacy decoration leaves `_meta` alone (#347).
+    let failed = mcp.request(
+        6,
+        "tools/call",
+        json!({"name": "demo.fail", "arguments": {}}),
+    );
+    let result = failed.get("result").expect("legacy failure result");
+    assert_eq!(result["isError"], true);
+    assert!(
+        result["_meta"]["io.svcd/call"].as_u64().is_some(),
+        "legacy failures name the call: {result}"
+    );
+    assert!(result.get("resultType").is_none());
 }
 
 #[test]
@@ -1114,6 +1138,10 @@ fn http_mcp_discovers_lists_and_calls_with_stdio_semantics() {
     assert_eq!(result["resultType"], "complete");
     assert_eq!(result["isError"], false);
     assert_eq!(result["content"][0]["text"], "pong");
+    assert!(
+        result["_meta"].get("io.svcd/call").is_none(),
+        "a successful tool call carries no call number: {result}"
+    );
 
     let failed = mcp_post(
         &address,
@@ -1130,6 +1158,11 @@ fn http_mcp_discovers_lists_and_calls_with_stdio_semantics() {
     assert_eq!(result["resultType"], "complete");
     assert_eq!(result["isError"], true);
     assert_eq!(result["content"][0]["text"], "boom");
+    // The failure names the request, so a client can find the svcd.log line (#347).
+    assert!(
+        result["_meta"]["io.svcd/call"].as_u64().is_some(),
+        "a failed tool call names the call: {result}"
+    );
 
     let unknown_tool = mcp_post(
         &address,

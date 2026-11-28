@@ -8,12 +8,13 @@
 //! 桥客户端（`run_stdio` / `Bridge` / era 装饰 / legacy 握手）仍留在
 //! [`crate::face::mcp`]：它要 stdio、mpsc 与 socket，不属于投影。
 
+use crate::kernel::call::CallId;
 use crate::kernel::failure::{Class, Failure, Rejection};
 use crate::kernel::registry::{Kind, Registry};
 // 本文件唯一一条 face → server 依赖：`content[0].text` 的字面形状单源在
 // `server/mcp/result.rs`（HTTP 会话那边也要用），它的模块注释点名了 face →
 // server 这个方向。face 里 api.rs 等也引 server，这条不是全局唯一。
-use crate::server::mcp::result::result_value;
+use crate::server::mcp::result::{merge_meta, result_value};
 use crate::wire::message::rpc;
 use serde_json::{json, Value};
 
@@ -70,15 +71,46 @@ where
     out
 }
 
+/// The `_meta` key that names the call a failed tool result belongs to (#347).
+/// Reverse-DNS, like every other key this server writes.
+pub(crate) const CALL_META: &str = "io.svcd/call";
+
+fn call_meta(call: CallId) -> Value {
+    let mut meta = serde_json::Map::new();
+    meta.insert(CALL_META.to_string(), json!(call));
+    Value::Object(meta)
+}
+
+/// Name the call on a JSON-RPC error. The control channel already uses the bare
+/// `call` key in `error.data` (`stamp_call`), so the MCP surface relays that
+/// shape unchanged; `_meta` is protocol metadata and gets the namespaced key.
+pub(crate) fn named_error(mut response: rpc::Response, call: CallId) -> rpc::Response {
+    if let Some(error) = response.error.as_mut() {
+        let data = error.data.get_or_insert_with(|| json!({}));
+        if let Value::Object(map) = data {
+            map.insert("call".to_string(), json!(call));
+        }
+    }
+    response
+}
+
 /// Build one MCP tool result. Both the aggregation layer and the plugin slot
 /// use this shape, so the envelope lives here rather than in each caller.
-pub fn tool_result(id: Option<Value>, text: String, is_error: bool) -> rpc::Response {
-    rpc::ok(id, result_value(text, is_error))
+///
+/// A failed result names the call, so a client can connect "this tool failed"
+/// to the `svcd.log` line that wrote it down (#347). A successful result
+/// carries nothing (ADR-0033).
+pub fn tool_result(id: Option<Value>, text: String, is_error: bool, call: CallId) -> rpc::Response {
+    let mut value = result_value(text, is_error);
+    if is_error {
+        merge_meta(&mut value, call_meta(call));
+    }
+    rpc::ok(id, value)
 }
 
 /// A tool execution failure (plugin error, crash, timeout, protocol violation).
-pub fn tool_error(id: Option<Value>, message: &str) -> rpc::Response {
-    tool_result(id, message.to_string(), true)
+pub fn tool_error(id: Option<Value>, message: &str, call: CallId) -> rpc::Response {
+    tool_result(id, message.to_string(), true, call)
 }
 
 /// Face-side projection of a completed slot call. The slot only emits a
@@ -88,32 +120,43 @@ pub fn tool_error(id: Option<Value>, message: &str) -> rpc::Response {
 fn project_slot_response(
     external_id: Option<Value>,
     outcome: Result<Value, Failure>,
+    call: CallId,
 ) -> rpc::Response {
     match outcome {
         Ok(value) => rpc::ok(external_id, value),
         Err(failure) => match failure.class {
-            Class::Busy => rpc::err_data(
-                external_id,
-                -32000,
-                "busy: too many in-flight tool calls",
-                json!({ "class": failure.class.as_str() }),
+            Class::Busy => named_error(
+                rpc::err_data(
+                    external_id,
+                    -32000,
+                    "busy: too many in-flight tool calls",
+                    json!({ "class": failure.class.as_str() }),
+                ),
+                call,
             ),
-            Class::FrameTooLarge => rpc::err_data(
-                external_id,
-                -32602,
-                "tools/call request exceeds the 1 MiB frame limit",
-                json!({ "class": failure.class.as_str() }),
+            Class::FrameTooLarge => named_error(
+                rpc::err_data(
+                    external_id,
+                    -32602,
+                    "tools/call request exceeds the 1 MiB frame limit",
+                    json!({ "class": failure.class.as_str() }),
+                ),
+                call,
             ),
             Class::NotRunning | Class::WriteFailed => {
-                tool_result(external_id, failure.detail, true)
+                tool_result(external_id, failure.detail, true, call)
             }
-            _ => tool_error(external_id, &failure.detail),
+            _ => tool_error(external_id, &failure.detail, call),
         },
     }
 }
 
-pub fn project_slot_outcome(external_id: Option<Value>, outcome: Result<Value, Failure>) -> String {
-    rpc::to_line(&project_slot_response(external_id, outcome))
+pub fn project_slot_outcome(
+    external_id: Option<Value>,
+    outcome: Result<Value, Failure>,
+    call: CallId,
+) -> String {
+    rpc::to_line(&project_slot_response(external_id, outcome, call))
 }
 
 /// Face-side projection of an immediate `Instance::call` rejection: the call was
@@ -121,18 +164,27 @@ pub fn project_slot_outcome(external_id: Option<Value>, outcome: Result<Value, F
 /// old `rejection_failure` path produced (BadArguments through the frame-limit
 /// error, UnknownCapability through the isError tool result); only the
 /// structured `data.kind` is added to the JSON-RPC error.
-pub fn project_rejection(external_id: Option<Value>, rejection: Rejection) -> rpc::Response {
+pub fn project_rejection(
+    external_id: Option<Value>,
+    rejection: Rejection,
+    call: CallId,
+) -> rpc::Response {
     let kind = rejection.as_str();
     match rejection {
-        Rejection::BadArguments { .. } => rpc::err_data(
-            external_id,
-            -32602,
-            "tools/call request exceeds the 1 MiB frame limit",
-            json!({ "kind": kind }),
+        Rejection::BadArguments { .. } => named_error(
+            rpc::err_data(
+                external_id,
+                -32602,
+                "tools/call request exceeds the 1 MiB frame limit",
+                json!({ "kind": kind }),
+            ),
+            call,
         ),
-        Rejection::UnknownCapability { capability } => {
-            tool_error(external_id, &format!("unknown capability {capability}"))
-        }
+        Rejection::UnknownCapability { capability } => tool_error(
+            external_id,
+            &format!("unknown capability {capability}"),
+            call,
+        ),
     }
 }
 
@@ -141,10 +193,11 @@ pub fn project_rejection(external_id: Option<Value>, rejection: Rejection) -> rp
 pub fn project_builtin_outcome(
     external_id: Option<Value>,
     outcome: Result<Value, Failure>,
+    call: CallId,
 ) -> String {
     match outcome {
-        Ok(value) => rpc::to_line(&tool_result(external_id, value.to_string(), false)),
-        Err(failure) => project_slot_outcome(external_id, Err(failure)),
+        Ok(value) => rpc::to_line(&tool_result(external_id, value.to_string(), false, call)),
+        Err(failure) => project_slot_outcome(external_id, Err(failure), call),
     }
 }
 
@@ -358,7 +411,11 @@ mod tests {
 
     #[test]
     fn the_builtin_outcome_projects_values_and_failures() {
-        let ok = project_builtin_outcome(Some(json!(1)), Ok(json!({"version": "1.2.3"})));
+        let ok = project_builtin_outcome(
+            Some(json!(1)),
+            Ok(json!({"version": "1.2.3"})),
+            CallId::FIRST,
+        );
         let response: rpc::Response = serde_json::from_str(&ok).expect("ok json");
         let result = response.result.expect("result");
         assert_eq!(result["isError"], false);
@@ -367,11 +424,15 @@ mod tests {
         let failed = project_builtin_outcome(
             Some(json!(2)),
             Err(Failure::new(Class::Busy, Retry::Never, "busy")),
+            CallId::FIRST.next(),
         );
         let response: rpc::Response = serde_json::from_str(&failed).expect("error json");
         let error = response.error.expect("error");
         assert_eq!(error.code, -32000);
-        assert_eq!(error.data.expect("data")["class"], "busy");
+        let data = error.data.expect("data");
+        assert_eq!(data["class"], "busy");
+        // The failure names the call, so a client can find it in svcd.log (#347).
+        assert_eq!(data["call"], 2);
     }
 
     #[test]
@@ -381,13 +442,16 @@ mod tests {
             let response = project_slot_response(
                 Some(json!(1)),
                 Err(Failure::new(class, class.default_retry(), detail.clone())),
+                CallId::FIRST,
             );
             match class {
                 Class::Busy => {
                     let error = response.error.expect("busy error");
                     assert_eq!(error.code, -32000);
                     assert_eq!(error.message, "busy: too many in-flight tool calls");
-                    assert_eq!(error.data.expect("data")["class"], "busy");
+                    let data = error.data.expect("data");
+                    assert_eq!(data["class"], "busy");
+                    assert_eq!(data["call"], 1);
                 }
                 Class::FrameTooLarge => {
                     let error = response.error.expect("frame error");
@@ -396,12 +460,15 @@ mod tests {
                         error.message,
                         "tools/call request exceeds the 1 MiB frame limit"
                     );
-                    assert_eq!(error.data.expect("data")["class"], "frame_too_large");
+                    let data = error.data.expect("data");
+                    assert_eq!(data["class"], "frame_too_large");
+                    assert_eq!(data["call"], 1);
                 }
                 _ => {
                     let result = response.result.expect("isError result");
                     assert_eq!(result["isError"], true);
                     assert_eq!(result["content"][0]["text"], detail);
+                    assert_eq!(result["_meta"][CALL_META], 1);
                 }
             }
         }
@@ -414,6 +481,7 @@ mod tests {
             Rejection::BadArguments {
                 detail: "arguments are too large".into(),
             },
+            CallId::FIRST,
         );
         let error = response.error.expect("bad arguments error");
         assert_eq!(error.code, -32602);
@@ -421,16 +489,29 @@ mod tests {
             error.message,
             "tools/call request exceeds the 1 MiB frame limit"
         );
-        assert_eq!(error.data.expect("data")["kind"], "bad_arguments");
+        let data = error.data.expect("data");
+        assert_eq!(data["kind"], "bad_arguments");
+        assert_eq!(data["call"], 1);
 
         let response = project_rejection(
             Some(json!(6)),
             Rejection::UnknownCapability {
                 capability: "nope".into(),
             },
+            CallId::FIRST,
         );
         let result = response.result.expect("unknown capability result");
         assert_eq!(result["isError"], true);
         assert_eq!(result["content"][0]["text"], "unknown capability nope");
+        assert_eq!(result["_meta"][CALL_META], 1);
+    }
+
+    /// ADR-0033: only failures are named. A successful tool result keeps the
+    /// shape it had before the number existed.
+    #[test]
+    fn a_successful_tool_result_carries_no_call_number() {
+        let response = tool_result(Some(json!(1)), "ok".into(), false, CallId::FIRST);
+        let result = response.result.expect("result");
+        assert!(result.get("_meta").is_none(), "{result}");
     }
 }

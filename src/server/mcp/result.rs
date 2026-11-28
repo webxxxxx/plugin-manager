@@ -41,6 +41,25 @@ pub(crate) fn tool_result_object(result: Value) -> Value {
     }
 }
 
+/// Merge keys into a result's `_meta` instead of replacing it. The face may
+/// have put the call number there (#347), and the modern decoration still owes
+/// the client `serverInfo`.
+pub(crate) fn merge_meta(result: &mut Value, extra: Value) {
+    let Value::Object(extra) = extra else {
+        return;
+    };
+    match result.get_mut("_meta") {
+        Some(Value::Object(meta)) => {
+            for (key, value) in extra {
+                meta.insert(key, value);
+            }
+        }
+        _ => {
+            result["_meta"] = Value::Object(extra);
+        }
+    }
+}
+
 pub(crate) fn server_meta() -> Value {
     json!({
         "io.modelcontextprotocol/serverInfo": {
@@ -59,6 +78,35 @@ pub fn finish_modern_tool_call(id: Option<Value>, response: rpc::Response) -> rp
     }
     let mut result = tool_result_object(response.result.unwrap_or_else(|| json!({})));
     result["resultType"] = json!("complete");
-    result["_meta"] = server_meta();
+    merge_meta(&mut result, server_meta());
     rpc::ok(id, result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The modern decoration used to replace `_meta` outright, which dropped the
+    /// call number the face had put there (#347).
+    #[test]
+    fn finishing_a_modern_result_keeps_the_meta_the_face_wrote() {
+        let result = json!({
+            "content": [{ "type": "text", "text": "boom" }],
+            "isError": true,
+            "_meta": { "io.svcd/call": 7 },
+        });
+        let response = finish_modern_tool_call(Some(json!(1)), rpc::ok(Some(json!(1)), result));
+        let result = response.result.expect("result");
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["_meta"]["io.svcd/call"], 7);
+        assert!(result["_meta"]["io.modelcontextprotocol/serverInfo"].is_object());
+    }
+
+    #[test]
+    fn finishing_a_result_without_meta_still_adds_server_info() {
+        let result = json!({ "content": [], "isError": false });
+        let response = finish_modern_tool_call(Some(json!(1)), rpc::ok(Some(json!(1)), result));
+        let result = response.result.expect("result");
+        assert!(result["_meta"]["io.modelcontextprotocol/serverInfo"].is_object());
+    }
 }
