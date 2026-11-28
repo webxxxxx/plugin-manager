@@ -1,4 +1,5 @@
 <!DOCTYPE html>
+<!-- Readable source. After editing, run node tools/minify-static.mjs; build.rs embeds the .min copy. -->
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -120,6 +121,34 @@
   .actions { display:flex; gap:7px; flex-wrap:wrap; justify-content:flex-end; }
   .actions button { height:30px; padding:0 12px; font-size:12.5px; border-radius:8px; }
   .modal { position:fixed; inset:0; background:rgba(17,24,39,.42); backdrop-filter:blur(2px); display:flex; align-items:center; justify-content:center; z-index:1100; padding:24px; }
+  /* A destructive action asks in the console's own dialog, not the browser's
+     modal: the button order, wording and colour stay under our control. */
+  .modal .panel.confirm { width:min(430px,100%); padding:22px; }
+  .confirm-head { display:flex; align-items:flex-start; gap:12px; }
+  .confirm-mark { flex:none; width:38px; height:38px; border-radius:11px; display:grid; place-items:center; background:var(--danger-soft); color:var(--danger); font-size:19px; font-weight:700; }
+  .confirm-mark.neutral { background:var(--brand-soft); color:var(--brand); }
+  .confirm-head h2 { margin:0 0 6px; font-size:16px; letter-spacing:-.01em; }
+  .confirm-message { margin:0; color:var(--muted); font-size:13px; line-height:1.65; overflow-wrap:anywhere; }
+  .confirm-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:20px; }
+  /* The plugin UI does not leave the console: it opens in a window with its own
+     close and full-screen controls, above the list. */
+  .plugin-view { position:fixed; inset:0; z-index:1120; display:flex; align-items:center; justify-content:center; padding:24px; background:rgba(17,24,39,.46); backdrop-filter:blur(2px); }
+  .plugin-window { display:flex; flex-direction:column; width:min(1180px,100%); height:min(820px,92vh); max-height:92vh; overflow:hidden; background:#fff; border-radius:14px; box-shadow:var(--shadow-pop); }
+  .plugin-window.full { width:100%; height:100%; max-height:none; border-radius:0; }
+  .plugin-view.full { padding:0; }
+  .plugin-window-head { flex:none; display:flex; align-items:center; gap:10px; min-width:0; padding:10px 10px 10px 16px; border-bottom:1px solid var(--line); background:#fff; }
+  .plugin-window-icon { flex:none; width:30px; height:30px; border-radius:9px; object-fit:contain; background:#f4f7fb; border:1px solid var(--line); padding:3px; }
+  .plugin-window-title { min-width:0; flex:1 1 auto; }
+  .plugin-window-title h2 { margin:0; font-size:14px; font-weight:650; line-height:1.35; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .plugin-window-title .muted { margin:1px 0 0; font-size:11.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .plugin-window-actions { flex:none; display:flex; align-items:center; gap:4px; }
+  .icon-btn { width:32px; height:32px; padding:0; border:1px solid transparent; background:transparent; color:#5b6676; border-radius:8px; }
+  .icon-btn:hover:not(:disabled) { background:#eef2f9; border-color:transparent; color:var(--text); }
+  .plugin-window-close:hover:not(:disabled) { background:var(--danger-soft); color:var(--danger); }
+  .plugin-window-body { position:relative; flex:1 1 auto; min-height:0; display:flex; background:#f6f8fc; }
+  .plugin-window-frame { flex:1 1 auto; width:100%; height:100%; border:0; background:#fff; }
+  .plugin-window-loading { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; background:#f6f8fc; color:var(--muted); font-size:12.5px; transition:opacity .15s ease; }
+  .plugin-window-loading .spin { width:26px; height:26px; border:3px solid #dbe6fb; border-top-color:var(--brand); border-radius:50%; animation:spin .9s linear infinite; }
   .modal .panel { background:#fff; border-radius:14px; padding:18px; width:min(780px,100%); max-height:90vh; overflow:auto; box-shadow:var(--shadow-pop); }
   .modal textarea { width:100%; height:360px; font-family:var(--mono); font-size:12px; border:1px solid #dbe2ec; border-radius:8px; padding:10px; background:#fbfcfe; color:var(--text); }
   .modal pre { background:#f7f9fc; border:1px solid var(--line); border-radius:8px; padding:12px; max-height:50vh; overflow:auto; font-size:12px; white-space:pre-wrap; word-break:break-all; }
@@ -229,6 +258,10 @@
     .trust-head button { width:100%; }
     .list-card { padding:0; }
     .list-head { padding:12px 14px; flex-wrap:wrap; }
+    .plugin-view { padding:0; }
+    .plugin-window { width:100%; height:100%; max-height:none; border-radius:0; }
+    .plugin-window-head { padding:8px 8px 8px 12px; }
+    .plugin-window-icon { width:26px; height:26px; }
     .list-tools { width:100%; }
     .list-tools button { width:100%; }
     .page-head { padding:14px; }
@@ -369,17 +402,125 @@ function closeMore() {
   $('morebtn').setAttribute('aria-expanded', 'false');
 }
 
-async function openPluginUI(id) {
+const PLUGIN_EXPAND_ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H3v5"/><path d="M16 3h5v5"/><path d="M21 16v5h-5"/><path d="M3 16v5h5"/></svg>';
+const PLUGIN_COLLAPSE_ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8h5V3"/><path d="M21 8h-5V3"/><path d="M16 21v-5h5"/><path d="M8 21v-5H3"/></svg>';
+const PLUGIN_CLOSE_ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12"/><path d="M18 6L6 18"/></svg>';
+// Only one plugin window exists at a time; this lets a second open close the
+// first cleanly (restoring the page scroll lock and its escape listener).
+let PLUGIN_WINDOW_CLOSE = null;
+
+async function openPluginUI(plugin) {
   if (BUSY) return;
   lock(true);
   try {
-    const body = await api('/api/v1/plugins/' + encodeURIComponent(id) + '/ui-token', { method: 'POST' });
-    window.open(body.url, '_blank', 'noopener');
+    const body = await api('/api/v1/plugins/' + encodeURIComponent(plugin.id) + '/ui-token', { method: 'POST' });
+    showPluginWindow(plugin, body.url);
   } catch (error) {
     toast('打开失败：' + error.message, 'err');
   } finally {
     lock(false);
   }
+}
+
+// The plugin owns the frame, the console owns the chrome: a titled window with
+// close and full-screen in its top-right corner. No window.open, so the plugin
+// page stays on the same origin and a phone never loses the console behind it.
+function showPluginWindow(plugin, url) {
+  if (PLUGIN_WINDOW_CLOSE) PLUGIN_WINDOW_CLOSE();
+  PLUGIN_WINDOW_CLOSE = null;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'plugin-view';
+  const panel = document.createElement('div');
+  panel.className = 'plugin-window';
+  panel.setAttribute('role', 'dialog');
+  panel.setAttribute('aria-modal', 'true');
+  panel.setAttribute('aria-label', (plugin.displayName || plugin.id) + ' 插件界面');
+
+  const head = document.createElement('div');
+  head.className = 'plugin-window-head';
+  const icon = document.createElement('img');
+  icon.className = 'plugin-window-icon';
+  icon.src = plugin.icon || '/assets/favicon.svg';
+  icon.alt = '';
+  head.appendChild(icon);
+
+  const titleBox = document.createElement('div');
+  titleBox.className = 'plugin-window-title';
+  const title = document.createElement('h2');
+  title.textContent = plugin.displayName || plugin.id;
+  const sub = document.createElement('p');
+  sub.className = 'muted';
+  sub.textContent = plugin.id + (plugin.version ? ' · v' + plugin.version : '');
+  titleBox.appendChild(title);
+  titleBox.appendChild(sub);
+  head.appendChild(titleBox);
+
+  const actions = document.createElement('div');
+  actions.className = 'plugin-window-actions';
+  const full = document.createElement('button');
+  full.type = 'button';
+  full.className = 'icon-btn plugin-window-full';
+  full.title = '全屏';
+  full.setAttribute('aria-label', '全屏显示');
+  full.innerHTML = PLUGIN_EXPAND_ICON;
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'icon-btn plugin-window-close';
+  close.title = '关闭';
+  close.setAttribute('aria-label', '关闭插件窗口');
+  close.innerHTML = PLUGIN_CLOSE_ICON;
+  actions.appendChild(full);
+  actions.appendChild(close);
+  head.appendChild(actions);
+
+  const body = document.createElement('div');
+  body.className = 'plugin-window-body';
+  const frame = document.createElement('iframe');
+  frame.className = 'plugin-window-frame';
+  frame.src = url;
+  frame.title = title.textContent + ' 插件界面';
+  const loading = document.createElement('div');
+  loading.className = 'plugin-window-loading';
+  const spin = document.createElement('span');
+  spin.className = 'spin';
+  loading.appendChild(spin);
+  loading.appendChild(document.createTextNode('正在打开插件界面…'));
+  body.appendChild(frame);
+  body.appendChild(loading);
+  frame.addEventListener('load', function () { loading.hidden = true; });
+
+  function setFull(on) {
+    panel.classList.toggle('full', on);
+    overlay.classList.toggle('full', on);
+    full.innerHTML = on ? PLUGIN_COLLAPSE_ICON : PLUGIN_EXPAND_ICON;
+    full.title = on ? '退出全屏' : '全屏';
+    full.setAttribute('aria-label', on ? '退出全屏显示' : '全屏显示');
+  }
+  full.onclick = function () { setFull(!panel.classList.contains('full')); };
+
+  const previousOverflow = document.body.style.overflow;
+  document.body.style.overflow = 'hidden';
+  function onKey(event) {
+    if (event.key === 'Escape') closeWindow();
+  }
+  function closeWindow() {
+    document.removeEventListener('keydown', onKey);
+    document.body.style.overflow = previousOverflow;
+    frame.src = 'about:blank';
+    overlay.remove();
+    if (PLUGIN_WINDOW_CLOSE === closeWindow) PLUGIN_WINDOW_CLOSE = null;
+  }
+  close.onclick = closeWindow;
+  overlay.onclick = function (event) { if (event.target === overlay) closeWindow(); };
+  document.addEventListener('keydown', onKey);
+
+  panel.appendChild(head);
+  panel.appendChild(body);
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+  PLUGIN_WINDOW_CLOSE = closeWindow;
+  close.focus();
 }
 
 function authHeaders(extra) {
@@ -621,7 +762,7 @@ function render(plugins) {
     actionRow.appendChild(button('日志', 'ghost', function () { openLogs(plugin.id); }));
     actionRow.className = 'actions';
     if (plugin.hasUI === true) {
-      const open = button('打开', 'ghost', function () { openPluginUI(plugin.id); });
+      const open = button('打开', 'ghost', function () { openPluginUI(plugin); });
       open.disabled = plugin.state !== 'running';
       open.title = open.disabled ? '插件未运行，无法打开' : '打开插件 UI';
       actionRow.appendChild(open);
@@ -925,6 +1066,64 @@ function askToUninstall(refusal, file, root, backup) {
   document.body.appendChild(modal);
 }
 
+// A small promise wrapper around the console's own confirmation dialog. The
+// caller awaits a boolean; Escape, the overlay and 取消 all resolve false.
+function confirmAction(options) {
+  options = options || {};
+  return new Promise(function (resolve) {
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    const panel = document.createElement('div');
+    panel.className = 'panel confirm';
+    panel.setAttribute('role', 'alertdialog');
+    panel.setAttribute('aria-modal', 'true');
+    panel.setAttribute('aria-label', options.title || '确认');
+
+    const head = document.createElement('div');
+    head.className = 'confirm-head';
+    const mark = document.createElement('div');
+    mark.className = 'confirm-mark' + (options.danger === false ? ' neutral' : '');
+    mark.textContent = options.danger === false ? '?' : '!';
+    mark.setAttribute('aria-hidden', 'true');
+    const text = document.createElement('div');
+    const title = document.createElement('h2');
+    title.textContent = options.title || '确认';
+    const message = document.createElement('p');
+    message.className = 'confirm-message';
+    message.textContent = options.message || '';
+    text.appendChild(title);
+    text.appendChild(message);
+    head.appendChild(mark);
+    head.appendChild(text);
+
+    const actions = document.createElement('div');
+    actions.className = 'confirm-actions';
+    const cancel = button(options.cancelLabel || '取消', 'ghost', function () { close(false); });
+    const confirm = button(options.confirmLabel || '确定', options.danger === false ? '' : 'danger', function () { close(true); });
+    actions.appendChild(cancel);
+    actions.appendChild(confirm);
+    panel.appendChild(head);
+    panel.appendChild(actions);
+    modal.appendChild(panel);
+    document.body.appendChild(modal);
+    cancel.focus();
+
+    function onKey(event) {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        close(false);
+      }
+    }
+    function close(value) {
+      document.removeEventListener('keydown', onKey);
+      modal.remove();
+      resolve(value);
+    }
+    document.addEventListener('keydown', onKey);
+    modal.onclick = function (event) { if (event.target === modal) close(false); };
+  });
+}
+
 function addTrust() {
   if (BUSY) return;
   const after = TRUST_AFTER_ADD;
@@ -957,9 +1156,14 @@ function addTrust() {
   });
 }
 
-function removeTrust(keyId, refresh) {
+async function removeTrust(keyId, refresh) {
   if (BUSY) return;
-  if (!confirm('删除公钥 ' + keyId + '？之后用该密钥签名的安装包会被拒绝。')) return;
+  const go = await confirmAction({
+    title: '删除公钥',
+    message: '删除 ' + keyId + ' 之后，用该密钥签名的安装包会被拒绝。',
+    confirmLabel: '删除'
+  });
+  if (!go) return;
   lock(true);
   fetch('/api/v1/trust/' + encodeURIComponent(keyId), {
     method: 'DELETE',
@@ -978,9 +1182,14 @@ function removeTrust(keyId, refresh) {
   });
 }
 
-function removePlugin(id) {
+async function removePlugin(id) {
   if (BUSY) return;
-  if (!confirm('确定删除插件 ' + id + '？将删除版本、配置和日志，且不可恢复。')) return;
+  const go = await confirmAction({
+    title: '删除插件',
+    message: '删除 ' + id + ' 会移除它的版本、配置和日志，且不可恢复。',
+    confirmLabel: '删除'
+  });
+  if (!go) return;
   lock(true);
   fetch('/api/v1/plugins/' + encodeURIComponent(id) + '?purge=true', {
     method: 'DELETE',

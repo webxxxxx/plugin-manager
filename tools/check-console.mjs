@@ -641,7 +641,7 @@ const CHECKS = [
         throw new Error("the list and its delete action must use the trust API");
       }
       const remove = functionBody(page, "removeTrust");
-      for (const needle of ["method: 'DELETE'", "confirm(", "refresh();"]) {
+      for (const needle of ["method: 'DELETE'", "confirmAction(", "refresh();"]) {
         if (!remove.includes(needle)) {
           throw new Error("deleting a key is not wired: " + needle);
         }
@@ -652,6 +652,62 @@ const CHECKS = [
       return page.replace(
         "if (group === '安全') page.appendChild(trustCard());",
         "",
+      );
+    },
+  },
+  {
+    id: "destructive-actions-use-a-dialog",
+    run(page) {
+      if (!page.includes("function confirmAction")) {
+        throw new Error("destructive actions need the console dialog");
+      }
+      for (const name of ["removePlugin", "removeTrust"]) {
+        const body = functionBody(page, name);
+        if (!body.includes("confirmAction(")) {
+          throw new Error(name + " still asks through the browser");
+        }
+        if (/\bconfirm\(/.test(body)) {
+          throw new Error(name + " still calls the native confirm");
+        }
+      }
+      const dialog = functionBody(page, "confirmAction");
+      if (!dialog.includes("alertdialog") || !dialog.includes("Escape")) {
+        throw new Error("the confirm dialog needs a role and an escape path");
+      }
+      return "deletes ask in the console dialog, not the browser";
+    },
+    mutate(page) {
+      return page.replaceAll("confirmAction({", "confirm({");
+    },
+  },
+  {
+    id: "plugin-opens-in-a-window",
+    run(page) {
+      if (page.includes("window.open(")) {
+        throw new Error("the plugin UI must not open a new tab");
+      }
+      const open = functionBody(page, "openPluginUI");
+      if (!open.includes("showPluginWindow(plugin, body.url)")) {
+        throw new Error("打开 must hand the plugin URL to the console window");
+      }
+      const view = functionBody(page, "showPluginWindow");
+      for (const needle of [
+        "plugin-window-close",
+        "plugin-window-full",
+        "classList.toggle('full'",
+        "createElement('iframe')",
+        "closeWindow",
+      ]) {
+        if (!view.includes(needle)) {
+          throw new Error("the plugin window is not wired: " + needle);
+        }
+      }
+      return "plugin UIs open in a closable, full-screen window";
+    },
+    mutate(page) {
+      return page.replace(
+        "showPluginWindow(plugin, body.url);",
+        "window.open(body.url, '_blank', 'noopener');",
       );
     },
   },
