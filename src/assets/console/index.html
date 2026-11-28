@@ -1,0 +1,2273 @@
+<!DOCTYPE html>
+<!-- Readable source. After editing, run node tools/minify-static.mjs; build.rs embeds the .min copy. -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<title>svcd 控制台</title>
+<style>
+  :root {
+    --bg:#f4f6fa; --surface:#fff; --line:#e5e9f0; --line-soft:#eef1f6;
+    --text:#202836; --muted:#6d7887; --faint:#6f7a89;
+    --brand:#2f6fed; --brand-strong:#2456c9; --brand-soft:#eaf1ff;
+    --danger:#c94040; --danger-soft:#fdf0f0;
+    --ok:#178050; --ok-soft:#e9f7ef;
+    --shadow-card:0 1px 2px rgba(16,24,40,.04), 0 10px 30px -20px rgba(16,24,40,.32);
+    --shadow-pop:0 12px 40px rgba(16,24,40,.16), 0 2px 8px rgba(16,24,40,.05);
+    --radius:14px;
+    --mono:ui-monospace,"Cascadia Mono","SF Mono",Consolas,monospace;
+    color-scheme:light;
+  }
+  * { box-sizing:border-box; }
+  [hidden] { display:none !important; }
+  body { margin:0; font:14px/1.55 "Segoe UI",-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; color:var(--text); background:radial-gradient(1100px 360px at 50% -240px,#e8f0ff 0%,rgba(232,240,255,0) 74%),var(--bg); background-attachment:fixed; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:1120px; min-height:100vh; margin:0 auto; padding:32px 28px; display:flex; flex-direction:column; }
+  #main { flex:1 1 auto; display:flex; flex-direction:column; }
+  #main.hidden { display:none; }
+  h1 { font-size:20px; font-weight:650; margin:0 0 16px; letter-spacing:-.01em; }
+  .card { background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:20px 24px; margin-bottom:20px; box-shadow:var(--shadow-card); }
+  .row { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  .grow { flex:1; }
+  button { display:inline-flex; align-items:center; justify-content:center; border:1px solid var(--brand); background:var(--brand); color:#fff; height:34px; padding:0 15px; border-radius:9px; cursor:pointer; font-size:13px; font-family:inherit; line-height:1; white-space:nowrap; transition:background-color .15s ease,border-color .15s ease,color .15s ease,box-shadow .15s ease,transform .06s ease; }
+  button:hover:not(:disabled) { background:var(--brand-strong); border-color:var(--brand-strong); }
+  button:active:not(:disabled) { transform:translateY(1px); }
+  button.ghost { background:#fff; color:#3c4757; border-color:#dce2ec; }
+  button.ghost:hover:not(:disabled) { background:#f4f8ff; border-color:#b9caf3; color:var(--brand); }
+  button.danger { background:transparent; color:var(--danger); border-color:#eec9c9; }
+  button.danger:hover:not(:disabled) { background:var(--danger-soft); border-color:#e2a6a6; color:#b23434; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline:2px solid rgba(47,111,237,.45); outline-offset:2px; }
+  .page-head { display:flex; align-items:center; gap:16px; padding:20px 24px; }
+  .brand-mark { flex:none; width:44px; height:44px; border-radius:12px; box-shadow:0 8px 18px -10px rgba(30,136,229,.75); }
+  .brand-text { flex:1 1 auto; min-width:0; }
+  .brand-text h1 { font-size:21px; margin:0 0 3px; }
+  .brand-text .muted { margin:0; }
+  .head-actions { flex:none; display:flex; align-items:center; gap:8px; }
+  #login { max-width:420px; margin:56px auto; padding:28px; }
+  #login .brand-mark { display:block; margin-bottom:14px; }
+  #login h1 { font-size:20px; margin:0 0 8px; }
+  #login .muted { margin:0 0 18px; line-height:1.6; }
+  #login .row { gap:8px; }
+  #login .row .muted { margin:0; }
+  #login input { flex:1 1 180px; min-width:0; }
+  .list-card { flex:1 1 auto; display:flex; flex-direction:column; padding:0; overflow:hidden; margin-bottom:0; }
+  .list-head { display:flex; align-items:center; gap:16px; padding:16px 24px; border-bottom:1px solid var(--line-soft); }
+  .list-title { display:flex; align-items:center; gap:9px; min-width:0; }
+  .list-title h2 { margin:0; font-size:15px; font-weight:650; letter-spacing:.01em; }
+  .count { display:inline-flex; align-items:center; justify-content:center; min-width:22px; height:20px; padding:0 7px; border-radius:999px; background:var(--brand-soft); color:var(--brand); font-size:11.5px; font-weight:650; }
+  .list-sum { color:var(--faint); font-size:12px; white-space:nowrap; }
+  .list-tools { margin-left:auto; display:flex; align-items:center; gap:14px; }
+  .install-hint { font-size:12px; }
+  .app-foot { flex:none; display:flex; align-items:center; justify-content:space-between; gap:8px 18px; flex-wrap:wrap; padding:11px 24px; border-top:1px solid var(--line-soft); background:#fbfcfe; color:var(--muted); font-size:12px; }
+  .app-foot a { color:var(--muted); text-decoration:none; }
+  .app-foot a:hover { color:var(--brand); }
+  .app-foot .foot-links { display:flex; align-items:center; gap:14px; }
+  .menu-wrap { position:relative; display:inline-flex; }
+  .menu-btn { padding:0 10px; font-size:18px; line-height:1; }
+  button#morebtn { border-color:transparent; background:transparent; color:#5b6676; }
+  button#morebtn:hover:not(:disabled) { background:#eef2f9; border-color:transparent; color:var(--text); }
+  .menu { position:absolute; right:0; top:calc(100% + 8px); min-width:168px; background:#fff; border:1px solid var(--line); border-radius:10px; box-shadow:var(--shadow-pop); padding:6px; z-index:1001; }
+  .menu button { display:block; width:100%; height:auto; text-align:left; border:0; background:#fff; color:var(--text); padding:8px 10px; border-radius:7px; font-size:13px; }
+  .menu button:hover { background:#f3f6fc; color:var(--brand); }
+  input[type=password], input[type=text], select { height:34px; border:1px solid #dbe2ec; border-radius:9px; padding:0 11px; font-size:13px; font-family:inherit; background:#fff; color:var(--text); }
+  input[type=password]:focus, input[type=text]:focus, select:focus { border-color:var(--brand); box-shadow:0 0 0 3px rgba(47,111,237,.12); outline:none; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:12px 24px; border-bottom:1px solid var(--line-soft); font-size:13px; vertical-align:middle; }
+  th { color:#6d7887; font-weight:550; font-size:11.5px; letter-spacing:.05em; background:#fbfcfe; border-bottom:1px solid var(--line); padding-top:10px; padding-bottom:10px; white-space:nowrap; }
+  th:first-child, td:first-child { padding-left:24px; }
+  th:last-child, td:last-child { padding-right:24px; text-align:right; }
+  tbody tr { transition:background-color .12s ease; }
+  tbody tr:hover { background:#f8faff; }
+  tbody tr:last-child td { border-bottom:0; }
+  .plugin-cell { display:flex; align-items:center; gap:12px; min-width:0; }
+  .plugin-mark { flex:none; width:34px; height:34px; border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:15px; font-weight:700; background:var(--mark-bg,#eef2f9); color:var(--mark-ink,#5c6b82); box-shadow:inset 0 0 0 1px rgba(16,24,40,.05); }
+  .plugin-icon { object-fit:contain; background:#fff; padding:4px; border:1px solid var(--line); box-shadow:none; }
+  .plugin-main { min-width:0; }
+  .plugin-name { font-size:13.5px; font-weight:600; line-height:1.35; }
+  td.version { font-family:var(--mono); font-size:12px; color:#5b6677; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .tag { display:inline-flex; align-items:center; gap:6px; padding:2px 9px; border-radius:999px; font-size:12px; line-height:18px; border:1px solid transparent; white-space:nowrap; }
+  .tag::before { content:''; width:6px; height:6px; border-radius:50%; background:currentColor; opacity:.9; }
+  .tag.on { background:var(--ok-soft); color:var(--ok); border-color:#d2efdf; }
+  .tag.off { background:#f4f6f9; color:#7c8797; border-color:#e8ecf2; }
+  .tag.bad { background:var(--danger-soft); color:var(--danger); border-color:#f2cdcd; }
+  .tag.auto.on { background:var(--brand-soft); color:#2b5cc9; border-color:#d8e3ff; }
+  .tag.auto.off { background:#f7f8fa; color:#8b96a6; border-color:#e9edf3; }
+  .tag.click { cursor:pointer; user-select:none; transition:box-shadow .15s ease; }
+  .tag.click:hover { box-shadow:0 0 0 3px rgba(47,111,237,.1); }
+  .muted { color:var(--muted); font-size:12px; }
+  label.check { display:flex; align-items:center; gap:4px; font-size:12px; color:var(--muted); white-space:nowrap; }
+  label.check input { margin:0; }
+  .hidden { display:none; }
+  .tablewrap { width:100%; flex:1 1 auto; overflow-x:auto; -webkit-overflow-scrolling:touch; }
+  .tablewrap table { min-width:720px; }
+  .install-root { display:flex; align-items:center; gap:5px; font-family:var(--mono); font-size:11.5px; line-height:1.4; color:var(--muted); overflow-wrap:anywhere; }
+  .root-index { font-family:inherit; font-size:10px; line-height:14px; min-width:14px; padding:0 3px; text-align:center; border-radius:4px; background:#eef2f8; color:#66717f; }
+  .empty { flex:1 1 auto; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:56px 24px 60px; text-align:center; }
+  .empty.hidden { display:none; }
+  .empty-art { display:grid; place-items:center; width:46px; height:46px; margin:0 auto 12px; border:1px dashed #cbd5e3; border-radius:14px; color:#9aa8bc; font-size:24px; font-weight:300; line-height:1; }
+  .empty-title { margin:0 0 4px; font-size:14px; font-weight:600; }
+  .empty .muted { margin:0; }
+  #busymask { position:fixed; inset:0; background:rgba(244,246,250,.72); backdrop-filter:blur(2px); z-index:1150; display:none; align-items:center; justify-content:center; }
+  #busymask.show { display:flex; }
+  #waitspin { width:38px; height:38px; border:3px solid #dbe6fb; border-top-color:var(--brand); border-radius:50%; animation:spin .9s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  #toasts { position:fixed; top:20px; left:50%; transform:translateX(-50%); z-index:1300; display:flex; flex-direction:column; gap:8px; align-items:center; pointer-events:none; }
+  .toast { pointer-events:auto; min-width:240px; max-width:min(560px,calc(100vw - 32px)); padding:11px 16px 11px 14px; border-radius:11px; font-size:13px; line-height:1.5; color:#26303c; background:#fff; border:1px solid var(--line); border-left:3px solid var(--brand); box-shadow:0 12px 34px -10px rgba(16,24,40,.28); cursor:pointer; white-space:pre-wrap; word-break:break-word; animation:toast-in .18s ease-out; }
+  .toast.err { border-left-color:var(--danger); }
+  .toast.ok { border-left-color:#22a95e; }
+  .toast.info { border-left-color:var(--brand); }
+  @keyframes toast-in { from { opacity:0; transform:translateY(-6px); } to { opacity:1; transform:none; } }
+  .actions { display:flex; gap:7px; flex-wrap:wrap; justify-content:flex-end; }
+  .actions button { height:30px; padding:0 12px; font-size:12.5px; border-radius:8px; }
+  .modal { position:fixed; inset:0; background:rgba(17,24,39,.42); backdrop-filter:blur(2px); display:flex; align-items:center; justify-content:center; z-index:1100; padding:24px; }
+  /* A destructive action asks in the console's own dialog, not the browser's
+     modal: the button order, wording and colour stay under our control. */
+  .modal .panel.confirm { width:min(430px,100%); padding:22px; }
+  .confirm-head { display:flex; align-items:flex-start; gap:12px; }
+  .confirm-mark { flex:none; width:38px; height:38px; border-radius:11px; display:grid; place-items:center; background:var(--danger-soft); color:var(--danger); font-size:19px; font-weight:700; }
+  .confirm-mark.neutral { background:var(--brand-soft); color:var(--brand); }
+  .confirm-head h2 { margin:0 0 6px; font-size:16px; letter-spacing:-.01em; }
+  .confirm-message { margin:0; color:var(--muted); font-size:13px; line-height:1.65; overflow-wrap:anywhere; }
+  .confirm-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:20px; }
+  /* The plugin UI does not leave the console: it opens in a window with its own
+     close and full-screen controls, above the list. */
+  .plugin-view { position:fixed; inset:0; z-index:1120; display:flex; align-items:center; justify-content:center; padding:24px; background:rgba(17,24,39,.46); backdrop-filter:blur(2px); }
+  .plugin-window { display:flex; flex-direction:column; width:min(1180px,100%); height:min(820px,92vh); max-height:92vh; overflow:hidden; background:#fff; border-radius:14px; box-shadow:var(--shadow-pop); }
+  .plugin-window.full { width:100%; height:100%; max-height:none; border-radius:0; }
+  .plugin-view.full { padding:0; }
+  .plugin-window-head { flex:none; display:flex; align-items:center; gap:10px; min-width:0; padding:10px 10px 10px 16px; border-bottom:1px solid var(--line); background:#fff; }
+  .plugin-window-icon { flex:none; width:30px; height:30px; border-radius:9px; object-fit:contain; background:#f4f7fb; border:1px solid var(--line); padding:3px; }
+  .plugin-window-title { min-width:0; flex:1 1 auto; }
+  .plugin-window-title h2 { margin:0; font-size:14px; font-weight:650; line-height:1.35; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .plugin-window-title .muted { margin:1px 0 0; font-size:11.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .plugin-window-actions { flex:none; display:flex; align-items:center; gap:4px; }
+  .icon-btn { width:32px; height:32px; padding:0; border:1px solid transparent; background:transparent; color:#5b6676; border-radius:8px; }
+  .icon-btn:hover:not(:disabled) { background:#eef2f9; border-color:transparent; color:var(--text); }
+  .plugin-window-close:hover:not(:disabled) { background:var(--danger-soft); color:var(--danger); }
+  .plugin-window-body { position:relative; flex:1 1 auto; min-height:0; display:flex; background:#f6f8fc; }
+  .plugin-window-frame { flex:1 1 auto; width:100%; height:100%; border:0; background:#fff; }
+  .plugin-window-loading { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; background:#f6f8fc; color:var(--muted); font-size:12.5px; transition:opacity .15s ease; }
+  .plugin-window-loading .spin { width:26px; height:26px; border:3px solid #dbe6fb; border-top-color:var(--brand); border-radius:50%; animation:spin .9s linear infinite; }
+  .modal .panel { background:#fff; border-radius:14px; padding:18px; width:min(780px,100%); max-height:90vh; overflow:auto; box-shadow:var(--shadow-pop); }
+  .modal textarea { width:100%; height:360px; font-family:var(--mono); font-size:12px; border:1px solid #dbe2ec; border-radius:8px; padding:10px; background:#fbfcfe; color:var(--text); }
+  .modal pre { background:#f7f9fc; border:1px solid var(--line); border-radius:8px; padding:12px; max-height:50vh; overflow:auto; font-size:12px; white-space:pre-wrap; word-break:break-all; }
+  .modal pre.logs { height:382px; max-height:none; overflow:auto; line-height:1.5; }
+  .modal h1 { font-size:17px; margin:0 0 6px; }
+  /* Settings uses the log dialog shell: a fixed head/foot, the body scrolls. */
+  .modal .panel.sheet { display:flex; flex-direction:column; height:min(720px,90vh); max-height:90vh; overflow:hidden; padding:0; min-width:0; width:min(820px,100%); border-radius:16px; }
+  .sheet .sheet-head { flex:none; padding:20px 22px 14px; min-width:0; border-bottom:1px solid var(--line-soft); }
+  .sheet .sheet-head h1 { font-size:19px; margin:0; letter-spacing:-.01em; }
+  .sheet .sheet-head .muted { overflow-wrap:anywhere; margin:7px 0 0; font-size:12px; line-height:1.6; }
+  .sheet .sheet-body { flex:1 1 auto; min-height:0; min-width:0; overflow:auto; padding:16px 18px 18px; background:#f6f8fc; }
+  .sheet .sheet-foot { flex:none; display:flex; align-items:center; justify-content:flex-end; gap:8px; padding:13px 22px; border-top:1px solid var(--line); background:#fff; min-width:0; }
+  .sheet-status { margin-right:auto; font-size:12px; color:var(--muted); }
+  /* One page per setting group. The strip wraps instead of scrolling sideways:
+     a scrollbar on a six-tab strip hides tabs and says nothing about them. The
+     active tab is a filled pill, so the current page is readable at a glance. */
+  .sheet-tabs { flex:none; display:flex; flex-wrap:wrap; gap:4px; padding:10px 18px; border-bottom:1px solid var(--line); background:#fff; }
+  .sheet-tabs button { flex:0 0 auto; height:30px; padding:0 13px; font-size:12.5px; border:1px solid transparent; border-radius:999px; background:transparent; color:var(--muted); }
+  .sheet-tabs button:hover:not(:disabled) { background:var(--brand-soft); border-color:transparent; color:var(--brand); }
+  .sheet-tabs button.active { background:var(--brand); color:#fff; font-weight:600; border-color:var(--brand); box-shadow:0 5px 12px -8px rgba(37,86,201,.7); }
+  .sheet-tabs button.changed::after { content:''; display:inline-block; width:6px; height:6px; margin-left:5px; border-radius:50%; background:var(--brand); vertical-align:middle; }
+  .sheet-tabs button.active.changed::after { background:#fff; }
+  .settings-tab { display:none; }
+  .settings-tab.active { display:block; }
+  .settings-card { background:#fff; border:1px solid var(--line); border-radius:12px; overflow:hidden; box-shadow:0 1px 2px rgba(16,24,40,.03); }
+  .setting { display:grid; grid-template-columns:minmax(140px,200px) minmax(0,1fr); align-items:center; gap:4px 18px; padding:12px 16px; border-bottom:1px solid var(--line-soft); }
+  .setting:last-child { border-bottom:0; }
+  .setting-label { display:flex; align-items:center; gap:6px; min-width:0; }
+  .setting-name { font-size:13px; font-weight:600; color:#26303c; }
+  .setting-control { display:flex; align-items:center; gap:8px; flex-wrap:wrap; min-width:0; }
+  .setting-control > input[type=text] { width:100%; }
+  .setting-control .readonly { font-family:var(--mono); font-size:12px; color:#3d4a5c; background:#f4f7fb; border:1px solid #e6ecf4; border-radius:7px; padding:3px 8px; word-break:break-all; }
+  .switch { position:relative; display:inline-flex; align-items:center; gap:9px; cursor:pointer; user-select:none; }
+  .switch input { position:absolute; width:1px; height:1px; opacity:0; }
+  .switch .track { position:relative; flex:none; width:38px; height:22px; border-radius:999px; background:#d9e0ea; transition:background-color .15s ease; }
+  .switch .track::after { content:''; position:absolute; top:3px; left:3px; width:16px; height:16px; border-radius:50%; background:#fff; box-shadow:0 1px 3px rgba(16,24,40,.25); transition:transform .15s ease; }
+  .switch input:checked + .track { background:var(--brand); }
+  .switch input:checked + .track::after { transform:translateX(16px); }
+  .switch input:focus-visible + .track { outline:2px solid rgba(47,111,237,.45); outline-offset:2px; }
+  .switch .switch-state { font-size:12px; color:var(--muted); min-width:2.4em; }
+  .password-pair { display:flex; gap:8px; flex-wrap:wrap; width:100%; }
+  .password-pair input { flex:1 1 150px; min-width:0; }
+  /* Plugin roots are a list, not one path: a row per root, `x` per row. */
+  .roots { display:flex; flex-direction:column; gap:5px; width:100%; }
+  .root-row, .root-add { display:flex; align-items:center; gap:6px; min-width:0; }
+  .root-row .root-row-path { flex:1 1 auto; min-width:0; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .root-row .roots-note { flex:none; font-size:11px; color:var(--muted); }
+  .root-row button, .root-add button { flex:none; height:28px; padding:0 9px; font-size:12px; border-radius:7px; }
+  .root-row button:disabled { opacity:.45; cursor:not-allowed; }
+  .root-add { margin-top:2px; }
+  .root-add input[type=text] { flex:1 1 auto; min-width:0; }
+  .help { flex:none; width:17px; height:17px; padding:0; border:1px solid #c7d0da; border-radius:50%; background:#fff; color:#7b8794; font-size:11px; line-height:1; cursor:help; }
+  .help:hover, .help:focus-visible { border-color:var(--brand); color:var(--brand); }
+  .about-card { display:flex; flex-direction:column; gap:18px; padding:20px; }
+  .about-head { display:flex; align-items:center; gap:14px; min-width:0; }
+  .about-head img { flex:none; width:52px; height:52px; border-radius:14px; box-shadow:0 8px 18px -12px rgba(30,136,229,.8); }
+  .about-head h2 { margin:0; font-size:18px; letter-spacing:-.01em; }
+  .about-head .muted { margin:2px 0 0; }
+  .about-version { display:inline-flex; align-items:center; margin-top:5px; padding:1px 8px; border-radius:999px; background:var(--brand-soft); color:var(--brand); font-size:11.5px; font-weight:650; }
+  .about-desc { margin:0; color:var(--muted); font-size:12.5px; line-height:1.7; }
+  .about-links { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .about-link { display:flex; align-items:center; justify-content:space-between; gap:10px; min-width:0; padding:10px 12px; border:1px solid var(--line); border-radius:9px; color:var(--text); font-size:13px; text-decoration:none; transition:border-color .15s ease, background-color .15s ease, color .15s ease; }
+  .about-link:hover { border-color:#bfd0f4; background:#f7faff; color:var(--brand); }
+  .about-link .about-arrow { color:var(--muted); }
+  .about-foot { margin:0; padding-top:12px; border-top:1px solid var(--line-soft); color:var(--muted); font-size:11.5px; line-height:1.7; }
+  .trust-card { margin-top:12px; padding:16px; display:flex; flex-direction:column; gap:12px; }
+  .trust-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+  .trust-head h2 { margin:0 0 3px; font-size:14px; }
+  .trust-head .muted { margin:0; }
+  .trust-head button { flex:none; height:30px; padding:0 12px; font-size:12.5px; }
+  .trust-list { border:1px solid var(--line-soft); border-radius:9px; overflow:hidden; }
+  .trust-row { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:9px 12px; border-bottom:1px solid var(--line-soft); }
+  .trust-row:last-child { border-bottom:0; }
+  .trust-key { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:var(--mono); font-size:12px; color:#3d4a5c; }
+  .trust-row button { flex:none; height:27px; padding:0 9px; font-size:12px; }
+  .trust-empty, .trust-error { padding:14px 12px; color:var(--muted); font-size:12px; text-align:center; }
+  .trust-error { color:var(--danger); }
+  .trust-foot { margin:0; color:var(--muted); font-size:11.5px; overflow-wrap:anywhere; }
+  #tip { position:fixed; z-index:1250; max-width:min(360px, calc(100vw - 24px)); padding:10px 12px; border-radius:9px; background:#1f2d4d; border:1px solid rgba(96,140,230,.35); color:#eef4ff; font-size:12px; line-height:1.6; box-shadow:0 14px 36px rgba(14,28,62,.34); pointer-events:none; }
+  #tip .tip-key { font-family:var(--mono); color:#9dc2ff; margin-bottom:2px; word-break:break-all; }
+  #tip .tip-line { margin-top:3px; }
+  #tip .tip-tag { color:#a9b8cf; }
+  @media (max-width:900px) {
+    .wrap { padding:20px 16px; }
+    .card { padding:16px 18px; }
+    .list-card { padding:0; }
+    .list-head { padding:14px 18px; }
+    .install-hint { display:none; }
+    th, td { padding-left:18px; padding-right:18px; }
+    th:first-child, td:first-child { padding-left:18px; }
+    th:last-child, td:last-child { padding-right:18px; }
+    .page-head { flex-wrap:wrap; }
+    .brand-text { flex:1 1 0; }
+    .head-actions { width:100%; }
+  }
+  @media (max-width:760px) {
+    .wrap { padding:12px; }
+    h1 { font-size:18px; }
+    .card { padding:12px 14px; }
+    #toasts { left:8px; right:8px; transform:none; align-items:stretch; }
+    .toast { max-width:none; min-width:0; }
+    .sheet .sheet-head, .sheet .sheet-body, .sheet .sheet-foot { padding-left:19px; padding-right:19px; }
+    .sheet-tabs { padding-left:19px; padding-right:19px; }
+    .setting { grid-template-columns:1fr; gap:6px; padding:11px 13px; }
+    .about-links { grid-template-columns:1fr; }
+    .trust-head { flex-wrap:wrap; }
+    .trust-head button { width:100%; }
+    .list-card { padding:0; }
+    .list-head { padding:12px 14px; flex-wrap:wrap; }
+    .plugin-view { padding:0; }
+    .plugin-window { width:100%; height:100%; max-height:none; border-radius:0; }
+    .plugin-window-head { padding:8px 8px 8px 12px; }
+    .plugin-window-icon { width:26px; height:26px; }
+    .list-tools { width:100%; }
+    .list-tools button { width:100%; }
+    .page-head { padding:14px; }
+  }
+  @media (max-width:680px) {
+    .tablewrap { overflow:visible; }
+    .tablewrap table, .tablewrap tbody, .tablewrap tr, .tablewrap td { display:block; width:auto; min-width:0; }
+    .tablewrap thead { display:none; }
+    tbody tr { padding:14px 16px; border-bottom:1px solid var(--line-soft); }
+    tbody tr:hover { background:transparent; }
+    tbody tr:last-child { border-bottom:0; }
+    td { border:0; padding:0; }
+    .tablewrap tbody tr { display:grid; grid-template-columns:1fr 1fr; gap:8px 12px; }
+    .tablewrap td:first-child { grid-column:1 / -1; }
+    .tablewrap td:nth-child(2) { grid-column:1 / -1; }
+    .tablewrap td:nth-child(3) { grid-column:1; }
+    .tablewrap td:nth-child(4) { grid-column:2; }
+    .tablewrap td:nth-child(5) { grid-column:1 / -1; }
+    .tablewrap td + td { display:flex; align-items:center; gap:8px; }
+    .tablewrap td + td::before { color:var(--muted); font-size:12px; flex:0 0 auto; }
+    td:nth-child(2)::before { content:'版本'; }
+    td:nth-child(3)::before { content:'状态'; }
+    td:nth-child(4)::before { content:'自启'; }
+    td:nth-child(5)::before { content:none; }
+    td:nth-child(5) .actions { justify-content:flex-start; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration:.001ms !important; transition-duration:.001ms !important; }
+  }
+</style>
+</head>
+<body>
+<div id="busymask"><div id="waitspin"></div></div>
+<div id="toasts"></div>
+<div id="tip" role="tooltip" hidden></div>
+<div class="wrap">
+  <div id="login" class="card hidden">
+    <img class="brand-mark" src="/assets/favicon.svg" alt="" width="44" height="44">
+    <h1>svcd 控制台</h1>
+    <p class="muted">输入 `svc lan passwd` 设置的密码（默认 loopback 无需登录，直接打开即可）。</p>
+    <div class="row">
+      <input id="pass" type="password" placeholder="密码">
+      <button onclick="login()">登录</button>
+      <span id="loginMsg" class="muted"></span>
+    </div>
+  </div>
+
+  <div id="main" class="hidden">
+    <div class="card page-head">
+      <img class="brand-mark" src="/assets/favicon.svg" alt="" width="44" height="44">
+      <div class="brand-text">
+        <h1>svcd 控制台</h1>
+        <p class="muted">管理本机插件：安装、启停、自启、配置、日志、导出。</p>
+      </div>
+      <div class="head-actions">
+        <button class="ghost" onclick="load()">刷新</button>
+        <button class="ghost" onclick="logout()">退出</button>
+        <span class="menu-wrap">
+          <button class="ghost menu-btn" id="morebtn" onclick="toggleMore(event)" aria-haspopup="menu" aria-expanded="false" aria-label="更多操作" title="更多">⋮</button>
+          <div class="menu hidden" id="moremenu" role="menu">
+            <button role="menuitem" onclick="openSettings()">设置</button>
+            <button role="menuitem" onclick="openUpgrade()">检查更新</button>
+            <button role="menuitem" onclick="openDaemonLogs()">查看日志</button>
+          </div>
+        </span>
+      </div>
+    </div>
+
+    <section class="card list-card">
+      <div class="list-head">
+        <div class="list-title">
+          <h2>插件</h2>
+          <span class="count" id="count" hidden>0</span>
+          <span class="list-sum" id="summary"></span>
+        </div>
+        <div class="list-tools">
+          <span class="muted install-hint">接受 .spk 安装包或 .spkb 备份；安装/导入时替换旧版本</span>
+          <button onclick="pickInstall()">上传安装</button>
+        </div>
+      </div>
+      <div class="tablewrap" id="tablewrap">
+        <table>
+          <thead><tr><th scope="col">插件</th><th scope="col">版本</th><th scope="col">状态</th><th scope="col">自启</th><th scope="col">操作</th></tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+      <div id="empty" class="empty hidden">
+        <div class="empty-art" aria-hidden="true">+</div>
+        <p class="empty-title">还没有安装任何插件</p>
+        <p class="muted">点右上角的「上传安装」，选一个 .spk 包开始。</p>
+      </div>
+      <footer class="app-foot">
+        <span>svcd · <a href="https://github.com/webxxxxx/plugin-manager/blob/main/LICENSE" target="_blank" rel="noopener">Apache-2.0</a></span>
+        <span class="foot-links">
+          <a href="https://github.com/webxxxxx/plugin-manager" target="_blank" rel="noopener">开源项目 <span aria-hidden="true">↗</span></a>
+        </span>
+      </footer>
+      <input type="file" id="file" accept=".spk,.spkb" class="hidden">
+      <input type="file" id="trustfile" accept=".pub" class="hidden">
+    </section>
+  </div>
+</div>
+<script>
+sessionStorage.removeItem('svcd_token');
+let BUSY = false;
+// The Security page asks for a refresh after the file picker finishes.
+let TRUST_AFTER_ADD = null;
+
+function safeReturnTo(value) {
+  if (!value || !value.startsWith('/') || value.startsWith('//')) return null;
+  try {
+    const url = new URL(value, location.origin);
+    if (url.origin !== location.origin) return null;
+    return url.pathname + url.search + url.hash;
+  } catch (_) {
+    return null;
+  }
+}
+const RETURN_TO = safeReturnTo(new URLSearchParams(location.search).get('next'));
+
+function $(id) { return document.getElementById(id); }
+
+function pickInstall() { if (!BUSY) $('file').click(); }
+function pickTrust(after) { TRUST_AFTER_ADD = after || null; if (!BUSY) $('trustfile').click(); }
+
+function toggleMore(event) {
+  if (event) event.stopPropagation();
+  const menu = $('moremenu');
+  const open = menu.classList.contains('hidden');
+  menu.classList.toggle('hidden', !open);
+  $('morebtn').setAttribute('aria-expanded', String(open));
+}
+
+function closeMore() {
+  const menu = $('moremenu');
+  if (!menu || menu.classList.contains('hidden')) return;
+  menu.classList.add('hidden');
+  $('morebtn').setAttribute('aria-expanded', 'false');
+}
+
+const PLUGIN_EXPAND_ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H3v5"/><path d="M16 3h5v5"/><path d="M21 16v5h-5"/><path d="M3 16v5h5"/></svg>';
+const PLUGIN_COLLAPSE_ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8h5V3"/><path d="M21 8h-5V3"/><path d="M16 21v-5h5"/><path d="M8 21v-5H3"/></svg>';
+const PLUGIN_CLOSE_ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12"/><path d="M18 6L6 18"/></svg>';
+// Only one plugin window exists at a time; this lets a second open close the
+// first cleanly (restoring the page scroll lock and its escape listener).
+let PLUGIN_WINDOW_CLOSE = null;
+
+async function openPluginUI(plugin) {
+  if (BUSY) return;
+  lock(true);
+  try {
+    const body = await api('/api/v1/plugins/' + encodeURIComponent(plugin.id) + '/ui-token', { method: 'POST' });
+    showPluginWindow(plugin, body.url);
+  } catch (error) {
+    toast('打开失败：' + error.message, 'err');
+  } finally {
+    lock(false);
+  }
+}
+
+// The plugin owns the frame, the console owns the chrome: a titled window with
+// close and full-screen in its top-right corner. No window.open, so the plugin
+// page stays on the same origin and a phone never loses the console behind it.
+function showPluginWindow(plugin, url) {
+  if (PLUGIN_WINDOW_CLOSE) PLUGIN_WINDOW_CLOSE();
+  PLUGIN_WINDOW_CLOSE = null;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'plugin-view';
+  const panel = document.createElement('div');
+  panel.className = 'plugin-window';
+  panel.setAttribute('role', 'dialog');
+  panel.setAttribute('aria-modal', 'true');
+  panel.setAttribute('aria-label', (plugin.displayName || plugin.id) + ' 插件界面');
+
+  const head = document.createElement('div');
+  head.className = 'plugin-window-head';
+  const icon = document.createElement('img');
+  icon.className = 'plugin-window-icon';
+  icon.src = plugin.icon || '/assets/favicon.svg';
+  icon.alt = '';
+  head.appendChild(icon);
+
+  const titleBox = document.createElement('div');
+  titleBox.className = 'plugin-window-title';
+  const title = document.createElement('h2');
+  title.textContent = plugin.displayName || plugin.id;
+  const sub = document.createElement('p');
+  sub.className = 'muted';
+  sub.textContent = plugin.id + (plugin.version ? ' · v' + plugin.version : '');
+  titleBox.appendChild(title);
+  titleBox.appendChild(sub);
+  head.appendChild(titleBox);
+
+  const actions = document.createElement('div');
+  actions.className = 'plugin-window-actions';
+  const full = document.createElement('button');
+  full.type = 'button';
+  full.className = 'icon-btn plugin-window-full';
+  full.title = '全屏';
+  full.setAttribute('aria-label', '全屏显示');
+  full.innerHTML = PLUGIN_EXPAND_ICON;
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'icon-btn plugin-window-close';
+  close.title = '关闭';
+  close.setAttribute('aria-label', '关闭插件窗口');
+  close.innerHTML = PLUGIN_CLOSE_ICON;
+  actions.appendChild(full);
+  actions.appendChild(close);
+  head.appendChild(actions);
+
+  const body = document.createElement('div');
+  body.className = 'plugin-window-body';
+  const frame = document.createElement('iframe');
+  frame.className = 'plugin-window-frame';
+  frame.src = url;
+  frame.title = title.textContent + ' 插件界面';
+  const loading = document.createElement('div');
+  loading.className = 'plugin-window-loading';
+  const spin = document.createElement('span');
+  spin.className = 'spin';
+  loading.appendChild(spin);
+  loading.appendChild(document.createTextNode('正在打开插件界面…'));
+  body.appendChild(frame);
+  body.appendChild(loading);
+  frame.addEventListener('load', function () { loading.hidden = true; });
+
+  function setFull(on) {
+    panel.classList.toggle('full', on);
+    overlay.classList.toggle('full', on);
+    full.innerHTML = on ? PLUGIN_COLLAPSE_ICON : PLUGIN_EXPAND_ICON;
+    full.title = on ? '退出全屏' : '全屏';
+    full.setAttribute('aria-label', on ? '退出全屏显示' : '全屏显示');
+  }
+  full.onclick = function () { setFull(!panel.classList.contains('full')); };
+
+  const previousOverflow = document.body.style.overflow;
+  document.body.style.overflow = 'hidden';
+  function onKey(event) {
+    if (event.key === 'Escape') closeWindow();
+  }
+  function closeWindow() {
+    document.removeEventListener('keydown', onKey);
+    document.body.style.overflow = previousOverflow;
+    frame.src = 'about:blank';
+    overlay.remove();
+    if (PLUGIN_WINDOW_CLOSE === closeWindow) PLUGIN_WINDOW_CLOSE = null;
+  }
+  close.onclick = closeWindow;
+  overlay.onclick = function (event) { if (event.target === overlay) closeWindow(); };
+  document.addEventListener('keydown', onKey);
+
+  panel.appendChild(head);
+  panel.appendChild(body);
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+  PLUGIN_WINDOW_CLOSE = closeWindow;
+  close.focus();
+}
+
+function authHeaders(extra) {
+  return Object.assign({ 'X-Svcd-Csrf': '1' }, extra || {});
+}
+
+function lock(on) {
+  BUSY = on;
+  $('busymask').classList.toggle('show', on);
+}
+
+function toast(message, kind) {
+  kind = kind || 'info';
+  const box = $('toasts');
+  for (const old of Array.from(box.children)) {
+    if (old.textContent === message) return;
+  }
+  const el = document.createElement('div');
+  el.className = 'toast ' + kind;
+  el.textContent = message;
+  el.onclick = function () { el.remove(); };
+  box.appendChild(el);
+  while (box.children.length > 3) box.firstElementChild.remove();
+  setTimeout(function () { el.remove(); }, kind === 'err' ? 8000 : 3000);
+}
+
+// The sentence alone, for callers that only need something to show.
+async function errorText(response) {
+  return (await refusalOf(response)).message;
+}
+
+// A refusal as both halves: the sentence to show, and the `error.data` a
+// dialog can act on. A body that is not JSON keeps the status only (#328).
+async function refusalOf(response) {
+  const refusal = { status: response.status, message: 'HTTP ' + response.status, data: null };
+  try {
+    const body = await response.json();
+    if (body && body.error) {
+      refusal.message = body.error.message || body.error.code || refusal.message;
+      refusal.data = body.error.data || null;
+    }
+  } catch (_) {}
+  return refusal;
+}
+
+async function api(path, options) {
+  options = options || {};
+  const response = await fetch(path, Object.assign({ credentials: 'same-origin' }, options, {
+    headers: authHeaders(options.headers)
+  }));
+  if (response.status === 401) {
+    showLogin();
+    throw new Error('需要登录');
+  }
+  if (!response.ok) throw new Error(await errorText(response));
+  return response.json();
+}
+
+function showLogin() {
+  $('login').classList.remove('hidden');
+  $('main').classList.add('hidden');
+}
+
+// A changed password (settings) or a restart that drops the session (upgrade)
+// leaves every subsequent poll answering 401; one handler closes the surface
+// and asks for a fresh login.
+function sessionExpired() {
+  showLogin();
+  toast('登录会话已失效，请重新登录', 'info');
+}
+
+function showMain() {
+  $('login').classList.add('hidden');
+  $('main').classList.remove('hidden');
+  load();
+}
+
+function boot() {
+  fetch('/api/v1/services', { credentials: 'same-origin', headers: authHeaders() }).then(function (response) {
+    if (response.status === 401) { showLogin(); return; }
+    if (RETURN_TO) { location.href = RETURN_TO; return; }
+    showMain();
+  }).catch(function () { showLogin(); });
+}
+
+async function login() {
+  const password = $('pass').value;
+  if (!password) { $('loginMsg').textContent = '请输入密码'; return; }
+  try {
+    const response = await fetch('/login', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: password })
+    });
+    if (!response.ok) { $('loginMsg').textContent = '密码错误'; return; }
+    $('pass').value = '';
+    $('loginMsg').textContent = '';
+    if (RETURN_TO) { location.href = RETURN_TO; return; }
+    showMain();
+  } catch (error) {
+    $('loginMsg').textContent = '登录失败：' + error.message;
+  }
+}
+
+async function logout() {
+  try {
+    await fetch('/logout', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'X-Svcd-Csrf': '1' }
+    });
+  } catch (_) {}
+  showLogin();
+}
+
+const MARK_COLORS = [
+  ['#e8f0ff', '#2f5fcf'],
+  ['#e9f7ef', '#1c7a4b'],
+  ['#fdf0e3', '#9c5a12'],
+  ['#f1edff', '#5744b5'],
+  ['#fdeef1', '#ad3c55'],
+  ['#e8f6f8', '#146b7b'],
+];
+
+const STATE_TEXT = {
+  running: '运行中', starting: '启动中', stopping: '停止中',
+  stopped: '已停止', backoff: '退避重试', failed: '失败'
+};
+
+function isUp(state) {
+  return state === 'running' || state === 'starting' || state === 'stopping';
+}
+
+function load() {
+  if (BUSY) return;
+  api('/api/v1/services').then(function (data) {
+    const plugins = (data.services || []).filter(function (service) { return service.kind === 'plugin'; });
+    render(plugins);
+  }).catch(function (error) {
+    toast('加载失败：' + error.message, 'err');
+  });
+}
+
+function renderSummary(plugins) {
+  const running = plugins.filter(function (plugin) { return plugin.state === 'running'; }).length;
+  $('count').textContent = String(plugins.length);
+  $('count').hidden = plugins.length === 0;
+  $('summary').textContent = plugins.length === 0 ? '' : running + ' 个运行中';
+}
+
+function render(plugins) {
+  const rows = $('rows');
+  rows.innerHTML = '';
+  $('empty').classList.toggle('hidden', plugins.length > 0);
+  $('tablewrap').classList.toggle('hidden', plugins.length === 0);
+  renderSummary(plugins);
+  plugins.forEach(function (plugin) {
+    const tr = document.createElement('tr');
+
+    const name = document.createElement('td');
+    const cell = document.createElement('div');
+    cell.className = 'plugin-cell';
+    // The tint comes from the id, so a plugin keeps the same colour between
+    // reloads; the letter is its own mark, not a stand-in for an icon it lacks.
+    const mark = document.createElement('div');
+    mark.className = 'plugin-mark';
+    mark.textContent = (plugin.displayName || plugin.id).trim().slice(0, 1).toUpperCase();
+    let hash = 0;
+    for (const unit of plugin.id) hash = (hash * 31 + unit.codePointAt(0)) % 997;
+    const markColor = MARK_COLORS[hash % MARK_COLORS.length];
+    mark.style.setProperty('--mark-bg', markColor[0]);
+    mark.style.setProperty('--mark-ink', markColor[1]);
+    // The package's own icon when it ships one; the letter is the fallback,
+    // not a stand-in that hides a broken image.
+    if (plugin.icon) {
+      const icon = document.createElement('img');
+      icon.className = 'plugin-mark plugin-icon';
+      icon.src = plugin.icon;
+      icon.alt = '';
+      icon.loading = 'lazy';
+      icon.onerror = function () { icon.replaceWith(mark); };
+      cell.appendChild(icon);
+    } else {
+      cell.appendChild(mark);
+    }
+
+    const main = document.createElement('div');
+    main.className = 'plugin-main';
+    const strong = document.createElement('div');
+    strong.className = 'plugin-name';
+    strong.textContent = plugin.displayName || plugin.id;
+    main.appendChild(strong);
+    // The second line is the id plus the plugin root it sits on: the number is
+    // its position in the configured root list (1-based, the order the settings
+    // page shows). The full path is long enough to ruin a row, so it only shows
+    // up in the tip.
+    const where = document.createElement('div');
+    where.className = 'install-root';
+    where.textContent = plugin.id;
+    const badge = document.createElement('span');
+    badge.className = 'root-index';
+    badge.textContent = plugin.installRootIndex ? String(plugin.installRootIndex) : '';
+    badge.hidden = !plugin.installRootIndex;
+    where.appendChild(badge);
+    if (plugin.installDir) where.title = '安装位置：' + plugin.installDir;
+    main.appendChild(where);
+    cell.appendChild(main);
+    name.appendChild(cell);
+    tr.appendChild(name);
+
+    const version = document.createElement('td');
+    version.className = 'version';
+    version.textContent = plugin.version || '';
+    tr.appendChild(version);
+
+    const running = isUp(plugin.state);
+    const bad = plugin.state === 'failed' || plugin.state === 'backoff';
+    const state = document.createElement('td');
+    const stateTag = document.createElement('span');
+    stateTag.className = 'tag click ' + (bad ? 'bad' : running ? 'on' : 'off');
+    stateTag.textContent = STATE_TEXT[plugin.state] || plugin.state;
+    stateTag.title = running ? '点击停止' : '点击启动';
+    stateTag.onclick = function () { act(running ? 'stop' : 'start', plugin.id); };
+    state.appendChild(stateTag);
+    tr.appendChild(state);
+
+    const auto = document.createElement('td');
+    const autoTag = document.createElement('span');
+    autoTag.className = 'tag click auto ' + (plugin.enabled ? 'on' : 'off');
+    autoTag.textContent = plugin.enabled ? '开机自启' : '不自启';
+    autoTag.title = plugin.enabled ? '点击关闭自启' : '点击开启自启';
+    autoTag.onclick = function () { act(plugin.enabled ? 'disable' : 'enable', plugin.id); };
+    auto.appendChild(autoTag);
+    tr.appendChild(auto);
+
+    const actions = document.createElement('td');
+    const actionRow = document.createElement('div');
+    actionRow.appendChild(button('日志', 'ghost', function () { openLogs(plugin.id); }));
+    actionRow.className = 'actions';
+    if (plugin.hasUI === true) {
+      const open = button('打开', 'ghost', function () { openPluginUI(plugin); });
+      open.disabled = plugin.state !== 'running';
+      open.title = open.disabled ? '插件未运行，无法打开' : '打开插件 UI';
+      actionRow.appendChild(open);
+    }
+    if (plugin.hasConfig === true) {
+      actionRow.appendChild(button('配置', 'ghost', function () { openConfig(plugin.id); }));
+    }
+    // const installer = button('安装包', 'ghost', function () { exportPlugin(plugin.id, 'spk'); });
+    // installer.title = '签名安装包：使用包内的配置模板';
+    // actionRow.appendChild(installer);
+    const backup = button('导出', 'ghost', function () { exportPlugin(plugin.id, 'backup'); });
+    backup.title = '签名安装包 + 当前活动配置（.spkb）';
+    actionRow.appendChild(backup);
+    actionRow.appendChild(button('删除', 'danger', function () { removePlugin(plugin.id); }));
+    actions.appendChild(actionRow);
+    tr.appendChild(actions);
+
+    rows.appendChild(tr);
+  });
+}
+
+function button(label, kind, onclick) {
+  const el = document.createElement('button');
+  el.className = kind;
+  el.textContent = label;
+  el.onclick = onclick;
+  return el;
+}
+
+function act(kind, id) {
+  if (BUSY) return;
+  lock(true);
+  const label = kind === 'start' ? '启动' : kind === 'stop' ? '停止' : kind === 'enable' ? '开启自启' : '关闭自启';
+  api('/api/v1/services/' + encodeURIComponent(id) + '/' + kind, { method: 'POST' }).then(function () {
+    toast(label + ' ' + id + ' 成功', 'ok');
+  }).catch(function (error) {
+    toast(label + ' ' + id + ' 失败：' + error.message, 'err');
+  }).finally(function () {
+    lock(false);
+    load();
+  });
+}
+
+function install() {
+  if (BUSY) return;
+  const file = $('file').files[0];
+  if (!file) { toast('请先选择 .spk 或 .spkb 文件', 'err'); return; }
+  const backup = /\.spkb$/i.test(file.name);
+  if (backup) {
+    uploadInstall(file, true, null);
+    return;
+  }
+  // A backup is not a package: it always goes back where it came from, so the
+  // root question only applies to `.spk` (#299).
+  lock(true);
+  fetch('/api/v1/disk', { credentials: 'same-origin', headers: authHeaders() })
+    .then(async function (response) {
+      if (!response.ok) throw new Error(await errorText(response));
+      return response.json();
+    })
+    .then(function (disk) {
+      lock(false);
+      const roots = disk.roots || [];
+      if (!disk.manualInstallRoot || roots.length < 2) {
+        uploadInstall(file, false, null);
+        return;
+      }
+      chooseInstallRoot(file, roots);
+    })
+    .catch(function (error) {
+      lock(false);
+      toast('读取插件根失败：' + error.message, 'err');
+    });
+}
+
+// Which root a package goes to, when the operator asked to choose (#299).
+//
+// Preselecting what the host would pick keeps "just press 安装" the same as the
+// automatic path: the smallest root that still fits. A root without room is
+// offered but disabled, so the reason is visible instead of coming back as a
+// 507 after the upload.
+function chooseInstallRoot(file, roots) {
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  const panel = document.createElement('div');
+  panel.className = 'panel';
+  panel.style.width = '520px';
+  panel.style.maxWidth = '92vw';
+
+  const title = document.createElement('h1');
+  title.textContent = '装到哪个插件根？';
+  title.style.fontSize = '16px';
+  title.style.margin = '0 0 6px';
+  panel.appendChild(title);
+
+  const hint = document.createElement('p');
+  hint.className = 'muted';
+  hint.style.margin = '0 0 10px';
+  hint.textContent = '包 ' + file.name + '（' + settingsBytesText(file.size) +
+    '）。默认选中宿主本来会选的那个根；可以在设置里关掉“手动选择安装位置”。';
+  panel.appendChild(hint);
+
+  const fits = roots.filter(function (root) {
+    return root.freeBytes === null || root.freeBytes >= file.size;
+  });
+  const smallest = fits.reduce(function (best, root) {
+    if (best === null) return root;
+    if (root.freeBytes === null) return best;
+    return root.freeBytes < best.freeBytes ? root : best;
+  }, null);
+  const preselected = smallest ? smallest.root : (roots[0] || {}).root;
+
+  const list = document.createElement('div');
+  list.className = 'roots';
+  let chosen = preselected;
+  roots.forEach(function (root) {
+    const row = document.createElement('label');
+    row.className = 'root-row';
+    const radio = document.createElement('input');
+    radio.type = 'radio';
+    radio.name = 'install-root';
+    radio.value = root.root;
+    radio.checked = root.root === preselected;
+    const room = root.freeBytes === null ? '空间未知（卷可能没挂上）' : settingsBytesText(root.freeBytes) + ' 空闲';
+    const usable = root.freeBytes === null || root.freeBytes >= file.size;
+    radio.disabled = !usable;
+    radio.onchange = function () { chosen = root.root; };
+    row.appendChild(radio);
+    const path = document.createElement('span');
+    path.className = 'root-row-path';
+    path.textContent = root.root + (root.default ? '（默认）' : '');
+    row.appendChild(path);
+    const note = document.createElement('span');
+    note.className = 'roots-note';
+    note.textContent = room + ' · 已装 ' + (root.plugins || 0) + ' 个' + (usable ? '' : ' · 放不下');
+    row.appendChild(note);
+    list.appendChild(row);
+  });
+  panel.appendChild(list);
+
+  const actions = document.createElement('div');
+  actions.className = 'row';
+  actions.style.justifyContent = 'flex-end';
+  actions.style.gap = '8px';
+  actions.style.marginTop = '12px';
+  const cancel = button('取消', 'ghost', function () {
+    modal.remove();
+    $('file').value = '';
+  });
+  const confirm = button('安装到这个根', '', function () {
+    modal.remove();
+    uploadInstall(file, false, chosen);
+  });
+  actions.appendChild(cancel);
+  actions.appendChild(confirm);
+  panel.appendChild(actions);
+
+  modal.onclick = function (event) { if (event.target === modal) cancel.onclick(); };
+  modal.appendChild(panel);
+  document.body.appendChild(modal);
+}
+
+function uploadInstall(file, backup, root) {
+  const path = backup
+    ? '/api/v1/import?force=true'
+    : '/api/v1/plugins' + (root ? '?root=' + encodeURIComponent(root) : '');
+  lock(true);
+  fetch(path, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: authHeaders({ 'Content-Type': 'application/octet-stream' }),
+    body: file
+  }).then(async function (response) {
+    if (response.ok) return response.json();
+    const refusal = await refusalOf(response);
+    // 507 carries the numbers a dialog runs on; every other refusal is just a
+    // sentence. A backup import hits the same room check, so it gets the same
+    // offer: uninstall, then send the same file again.
+    if (refusal.status === 507) {
+      askToUninstall(refusal, file, root, backup);
+      return null;
+    }
+    throw new Error(refusal.message);
+  }).then(function (body) {
+    if (!body) return;
+    if (backup) {
+      toast('已导入备份 ' + body.id + (body.configApplied ? '（含当前配置）' : ''), 'ok');
+    } else {
+      toast('已安装 ' + body.id + ' ' + body.version, 'ok');
+    }
+  }).catch(function (error) {
+    toast((backup ? '导入失败：' : '安装失败：') + error.message, 'err');
+  }).finally(function () {
+    $('file').value = '';
+    lock(false);
+    load();
+  });
+}
+
+// What a space refusal justifies, as a value: the numbers come from the host
+// (`error.data`), never from the sentence. An uninstall returns the old copy's
+// bytes to the root the check ran on, so only that root's free bytes count —
+// a roomier volume elsewhere would turn the offer into a dead end (#330).
+// `canUninstall` is deliberately the conservative test: freeing the old copy
+// has to cover the whole `need`, so it holds whether or not the host counts
+// that copy inside `need` (#328).
+function spaceRecovery(data) {
+  const need = Number((data && data.need) || 0);
+  const installed = Number((data && data.installed) || 0);
+  const id = (data && data.id) || '';
+  const checked = (data && data.root) || '';
+  const rows = (data && data.roots) || [];
+  let free = null;
+  rows.forEach(function (row) {
+    if (!row || typeof row.free !== 'number') return;
+    if (checked !== '' && row.root !== checked) return;
+    free = free === null ? row.free : Math.max(free, row.free);
+  });
+  return {
+    id: id,
+    need: need,
+    installed: installed,
+    free: free,
+    canUninstall: id !== '' && installed > 0 && free !== null && free + installed >= need
+  };
+}
+
+// The one action the host can offer for a 507: remove the version this install
+// replaces, then send the same file again. The uninstall keeps `config/` and
+// `data/` (no `purge`), so the retry finds the plugin's settings again — the
+// same promise the store's dialog makes. Freeing space by hand stays the
+// operator's job.
+function askToUninstall(refusal, file, root, backup) {
+  const plan = spaceRecovery(refusal.data);
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  const panel = document.createElement('div');
+  panel.className = 'panel';
+  panel.style.width = '520px';
+  panel.style.maxWidth = '92vw';
+
+  const title = document.createElement('h1');
+  title.textContent = '空间不足';
+  title.style.fontSize = '16px';
+  title.style.margin = '0 0 6px';
+  panel.appendChild(title);
+
+  const rows = (refusal.data && refusal.data.roots) || [];
+  const room = rows.map(function (row) {
+    return row.root + (typeof row.free === 'number' ? ' ' + settingsBytesText(row.free) + ' 空闲' : ' 空间未知');
+  }).join('；');
+  const hint = document.createElement('p');
+  hint.className = 'muted';
+  hint.style.margin = '0 0 10px';
+  let text = refusal.message;
+  if (refusal.data) {
+    text = '这个包装不下：需要 ' + settingsBytesText(plan.need) + (room ? '，' + room : '') + '。';
+    // A backup goes back where it came from; the root question is not the
+    // operator's to answer there (#299).
+    const elsewhere = backup ? '' : '，或换一个插件根';
+    if (plan.installed > 0) {
+      text += '已安装的 ' + plan.id + ' 占 ' + settingsBytesText(plan.installed) +
+        (plan.canUninstall ? '，卸载后可回收。' : '；即使卸载也不够，需要先腾出空间' + elsewhere + '。');
+    } else {
+      text += '请先腾出空间' + elsewhere + '。';
+    }
+  }
+  hint.textContent = text;
+  panel.appendChild(hint);
+
+  const actions = document.createElement('div');
+  actions.className = 'row';
+  actions.style.justifyContent = 'flex-end';
+  actions.style.gap = '8px';
+  actions.style.marginTop = '12px';
+  const cancel = button('取消', 'ghost', function () { modal.remove(); });
+  actions.appendChild(cancel);
+  if (plan.canUninstall) {
+    actions.appendChild(button('卸载旧版并安装', '', function () {
+      modal.remove();
+      lock(true);
+      fetch('/api/v1/plugins/' + encodeURIComponent(plan.id), {
+        method: 'DELETE',
+        credentials: 'same-origin',
+        headers: authHeaders()
+      }).then(async function (response) {
+        if (!response.ok) throw new Error(await errorText(response));
+        // Same file, same root, same kind: the retry is the install that just
+        // failed, not a different one.
+        uploadInstall(file, backup, root);
+      }).catch(function (error) {
+        lock(false);
+        toast('卸载失败：' + error.message, 'err');
+      });
+    }));
+  }
+  panel.appendChild(actions);
+
+  modal.onclick = function (event) { if (event.target === modal) cancel.onclick(); };
+  modal.appendChild(panel);
+  document.body.appendChild(modal);
+}
+
+// A small promise wrapper around the console's own confirmation dialog. The
+// caller awaits a boolean; Escape, the overlay and 取消 all resolve false.
+function confirmAction(options) {
+  options = options || {};
+  return new Promise(function (resolve) {
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    const panel = document.createElement('div');
+    panel.className = 'panel confirm';
+    panel.setAttribute('role', 'alertdialog');
+    panel.setAttribute('aria-modal', 'true');
+    panel.setAttribute('aria-label', options.title || '确认');
+
+    const head = document.createElement('div');
+    head.className = 'confirm-head';
+    const mark = document.createElement('div');
+    mark.className = 'confirm-mark' + (options.danger === false ? ' neutral' : '');
+    mark.textContent = options.danger === false ? '?' : '!';
+    mark.setAttribute('aria-hidden', 'true');
+    const text = document.createElement('div');
+    const title = document.createElement('h2');
+    title.textContent = options.title || '确认';
+    const message = document.createElement('p');
+    message.className = 'confirm-message';
+    message.textContent = options.message || '';
+    text.appendChild(title);
+    text.appendChild(message);
+    head.appendChild(mark);
+    head.appendChild(text);
+
+    const actions = document.createElement('div');
+    actions.className = 'confirm-actions';
+    const cancel = button(options.cancelLabel || '取消', 'ghost', function () { close(false); });
+    const confirm = button(options.confirmLabel || '确定', options.danger === false ? '' : 'danger', function () { close(true); });
+    actions.appendChild(cancel);
+    actions.appendChild(confirm);
+    panel.appendChild(head);
+    panel.appendChild(actions);
+    modal.appendChild(panel);
+    document.body.appendChild(modal);
+    cancel.focus();
+
+    function onKey(event) {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        close(false);
+      }
+    }
+    function close(value) {
+      document.removeEventListener('keydown', onKey);
+      modal.remove();
+      resolve(value);
+    }
+    document.addEventListener('keydown', onKey);
+    modal.onclick = function (event) { if (event.target === modal) close(false); };
+  });
+}
+
+function addTrust() {
+  if (BUSY) return;
+  const after = TRUST_AFTER_ADD;
+  const file = $('trustfile').files[0];
+  if (!file) { TRUST_AFTER_ADD = null; toast('请先选择 .pub 文件', 'err'); return; }
+  const keyId = file.name.replace(/\.pub$/i, '');
+  if (!/^[A-Za-z0-9._-]+$/.test(keyId) || keyId === '.' || keyId === '..') {
+    TRUST_AFTER_ADD = null;
+    toast('文件名必须是 <keyId>.pub', 'err');
+    return;
+  }
+  lock(true);
+  fetch('/api/v1/trust?key_id=' + encodeURIComponent(keyId), {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: authHeaders({ 'Content-Type': 'application/octet-stream' }),
+    body: file
+  }).then(async function (response) {
+    if (!response.ok) throw new Error(await errorText(response));
+    return response.json();
+  }).then(function (body) {
+    toast('已信任 ' + body.keyId, 'ok');
+    if (after) after();
+  }).catch(function (error) {
+    toast('添加信任公钥失败：' + error.message, 'err');
+  }).finally(function () {
+    TRUST_AFTER_ADD = null;
+    $('trustfile').value = '';
+    lock(false);
+  });
+}
+
+async function removeTrust(keyId, refresh) {
+  if (BUSY) return;
+  const go = await confirmAction({
+    title: '删除公钥',
+    message: '删除 ' + keyId + ' 之后，用该密钥签名的安装包会被拒绝。',
+    confirmLabel: '删除'
+  });
+  if (!go) return;
+  lock(true);
+  fetch('/api/v1/trust/' + encodeURIComponent(keyId), {
+    method: 'DELETE',
+    credentials: 'same-origin',
+    headers: authHeaders()
+  }).then(async function (response) {
+    if (!response.ok) throw new Error(await errorText(response));
+    return response.json();
+  }).then(function () {
+    toast('已删除公钥 ' + keyId, 'ok');
+    refresh();
+  }).catch(function (error) {
+    toast('删除公钥失败：' + error.message, 'err');
+  }).finally(function () {
+    lock(false);
+  });
+}
+
+async function removePlugin(id) {
+  if (BUSY) return;
+  const go = await confirmAction({
+    title: '删除插件',
+    message: '删除 ' + id + ' 会移除它的版本、配置和日志，且不可恢复。',
+    confirmLabel: '删除'
+  });
+  if (!go) return;
+  lock(true);
+  fetch('/api/v1/plugins/' + encodeURIComponent(id) + '?purge=true', {
+    method: 'DELETE',
+    credentials: 'same-origin',
+    headers: authHeaders()
+  }).then(async function (response) {
+    if (!response.ok) throw new Error(await errorText(response));
+    toast('已删除 ' + id, 'ok');
+  }).catch(function (error) {
+    toast('删除失败：' + error.message, 'err');
+  }).finally(function () {
+    lock(false);
+    load();
+  });
+}
+
+function openConfig(id) {
+  if (BUSY) return;
+  lock(true);
+  fetch('/api/v1/config/' + encodeURIComponent(id), { credentials: 'same-origin', headers: authHeaders() }).then(async function (response) {
+    if (response.status === 404) throw new Error('该插件没有配置');
+    if (!response.ok) throw new Error(await errorText(response));
+    return response.text();
+  }).then(function (text) {
+    lock(false);
+    showConfigModal(id, text);
+  }).catch(function (error) {
+    lock(false);
+    toast('读取配置失败：' + error.message, 'err');
+  });
+}
+
+function showConfigModal(id, text) {
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  const panel = document.createElement('div');
+  panel.className = 'panel';
+  const title = document.createElement('h1');
+  title.style.fontSize = '16px';
+  title.textContent = '配置：' + id;
+  const hint = document.createElement('p');
+  hint.className = 'muted';
+  hint.textContent = '保存后需要重启插件才生效；校验失败会返回 409 并保留 last-good。';
+  const area = document.createElement('textarea');
+  area.value = text;
+  const exportHint = document.createElement('p');
+  exportHint.className = 'muted';
+  exportHint.textContent = '这里保存的是活动配置；“安装包”仍使用签名时的模板，带走当前配置请用“导出备份”。';
+  const actions = document.createElement('div');
+  actions.className = 'row';
+  actions.style.justifyContent = 'flex-end';
+  actions.style.marginTop = '12px';
+  const cancel = button('取消', 'ghost', function () { modal.remove(); });
+  const save = button('保存', '', function () {
+    if (BUSY) return;
+    lock(true);
+    fetch('/api/v1/config/' + encodeURIComponent(id), {
+      method: 'PUT',
+      credentials: 'same-origin',
+      headers: authHeaders({ 'Content-Type': 'text/plain' }),
+      body: area.value
+    }).then(async function (response) {
+      if (!response.ok) throw new Error(await errorText(response));
+      modal.remove();
+      toast('配置已保存', 'ok');
+    }).catch(function (error) {
+      toast('保存失败：' + error.message, 'err');
+    }).finally(function () { lock(false); });
+  });
+  actions.appendChild(cancel);
+  actions.appendChild(save);
+  panel.appendChild(title);
+  panel.appendChild(hint);
+  panel.appendChild(area);
+  panel.appendChild(exportHint);
+  panel.appendChild(actions);
+  modal.appendChild(panel);
+  document.body.appendChild(modal);
+}
+
+function openLogs(id) {
+  loadLogs({ kind: 'plugin', id: id });
+}
+
+function openDaemonLogs() {
+  closeMore();
+  loadLogs({ kind: 'daemon' });
+}
+
+function logName(target) {
+  return target.kind === 'daemon' ? 'svcd' : target.id;
+}
+
+function logUrl(target) {
+  return target.kind === 'daemon'
+    ? '/api/v1/logs'
+    : '/api/v1/logs/' + encodeURIComponent(target.id);
+}
+
+function loadLogs(target) {
+  if (BUSY) return;
+  lock(true);
+  fetch(logUrl(target) + '?lines=200', { credentials: 'same-origin', headers: authHeaders() }).then(async function (response) {
+    if (response.status === 404) throw new Error('还没有日志');
+    if (!response.ok) throw new Error(await errorText(response));
+    return response.text();
+  }).then(function (text) {
+    lock(false);
+    showLogsModal(target, text);
+  }).catch(function (error) {
+    lock(false);
+    toast('读取日志失败：' + error.message, 'err');
+  });
+}
+
+function showLogsModal(target, text) {
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  const panel = document.createElement('div');
+  panel.className = 'panel';
+  const head = document.createElement('div');
+  head.className = 'row';
+  const title = document.createElement('h1');
+  title.style.fontSize = '16px';
+  title.style.margin = '0';
+  title.style.flex = '1';
+  title.textContent = '日志：' + logName(target);
+  const auto = document.createElement('label');
+  auto.className = 'check';
+  const check = document.createElement('input');
+  check.type = 'checkbox';
+  auto.appendChild(check);
+  auto.appendChild(document.createTextNode('自动刷新（3s）'));
+  const levelLabel = document.createElement('label');
+  levelLabel.className = 'check';
+  levelLabel.appendChild(document.createTextNode('级别'));
+  const levelSelect = document.createElement('select');
+  [['', '全部'], ['error', 'ERROR'], ['warn', 'WARN+'], ['info', 'INFO+'], ['debug', 'DEBUG+'], ['trace', 'TRACE']].forEach(function (option) {
+    const item = document.createElement('option');
+    item.value = option[0];
+    item.textContent = option[1];
+    levelSelect.appendChild(item);
+  });
+  levelLabel.appendChild(levelSelect);
+  head.appendChild(title);
+  head.appendChild(auto);
+  head.appendChild(levelLabel);
+  const hint = document.createElement('p');
+  hint.className = 'muted';
+  hint.textContent = '最近 200 行。';
+  const pre = document.createElement('pre');
+  pre.className = 'logs';
+  pre.textContent = text;
+  const actions = document.createElement('div');
+  actions.className = 'row';
+  actions.style.justifyContent = 'flex-end';
+  actions.style.marginTop = '12px';
+
+  let timer = null;
+  let level = '';
+  function currentUrl() {
+    return logUrl(target) + '?lines=200' + (level ? '&level=' + encodeURIComponent(level) : '');
+  }
+  function stop() {
+    if (timer) { clearInterval(timer); timer = null; }
+  }
+  async function refresh() {
+    try {
+      const response = await fetch(currentUrl(), { credentials: 'same-origin', headers: authHeaders() });
+      if (response.status === 401) { stop(); showLogin(); return; }
+      if (response.status === 404) { pre.textContent = '还没有日志'; return; }
+      if (!response.ok) throw new Error(await errorText(response));
+      const next = await response.text();
+      const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+      pre.textContent = next;
+      if (atBottom) pre.scrollTop = pre.scrollHeight;
+    } catch (_) {
+      // Keep the last good snapshot; the next tick retries.
+    }
+  }
+  function close() { stop(); modal.remove(); }
+  levelSelect.onchange = function () {
+    level = levelSelect.value;
+    refresh();
+  };
+  check.onchange = function () {
+    stop();
+    if (check.checked) {
+      refresh();
+      timer = setInterval(refresh, 3000);
+    }
+  };
+  modal.onclick = function (event) { if (event.target === modal) close(); };
+  // Two-step clear: the first click asks, the second one deletes. A log is
+  // cheap to lose but expensive to explain away, so no one-click path exists.
+  let confirming = false;
+  const clear = button('清空', 'ghost', function () {
+    if (!confirming) {
+      confirming = true;
+      clear.textContent = '确认清空？';
+      clear.classList.remove('ghost');
+      clear.classList.add('danger');
+      return;
+    }
+    confirming = false;
+    clear.disabled = true;
+    clear.textContent = '清空';
+    clear.classList.remove('danger');
+    clear.classList.add('ghost');
+    fetch(logUrl(target), { method: 'DELETE', credentials: 'same-origin', headers: authHeaders() })
+      .then(async function (response) {
+        if (response.status === 404) throw new Error('没有可清空的日志');
+        if (!response.ok) throw new Error(await errorText(response));
+        toast('日志已清空', 'ok');
+        refresh();
+      })
+      .catch(function (error) { toast('清空失败：' + error.message, 'err'); })
+      .finally(function () { clear.disabled = false; });
+  });
+  actions.appendChild(clear);
+  actions.appendChild(button('关闭', 'ghost', close));
+  panel.appendChild(head);
+  panel.appendChild(hint);
+  panel.appendChild(pre);
+  panel.appendChild(actions);
+  modal.appendChild(panel);
+  document.body.appendChild(modal);
+  pre.scrollTop = pre.scrollHeight;
+}
+
+// Plugin roots are a list, and the list *is* the priority order (#298): a root
+// is added or removed, never rewritten. Re-typing an occupied path is the move
+// the host refuses with a 409, and a typo is corrected by removing the row and
+// adding the right one. The default root and every root that still holds
+// plugins cannot be removed; the host refuses the same removal server-side.
+function pluginRootsField(entry, mark, unmark) {
+  const wrap = document.createElement('div');
+  wrap.className = 'roots';
+  const rows = [];
+  const roots = Array.isArray(entry.roots) ? entry.roots : [];
+  const initial = roots
+    .map(function (root) { return String(root.path || '').trim(); })
+    .filter(function (path) { return path; })
+    .join(',');
+
+  function sync() {
+    const joined = rows.map(function (item) { return item.path; }).join(',');
+    if (joined === initial) unmark(entry.key);
+    else mark(entry.key, joined);
+  }
+
+  function addRow(path, plugins, locked) {
+    const row = document.createElement('div');
+    row.className = 'root-row';
+
+    const text = document.createElement('span');
+    text.className = 'root-row-path';
+    text.textContent = path;
+    text.title = path;
+    row.appendChild(text);
+
+    if (plugins > 0) {
+      const note = document.createElement('span');
+      note.className = 'roots-note';
+      note.textContent = plugins + ' 个插件';
+      row.appendChild(note);
+    }
+
+    const item = { row: row, path: path };
+    const remove = button('x', 'ghost', function () {
+      if (locked) return;
+      const at = rows.indexOf(item);
+      if (at >= 0) rows.splice(at, 1);
+      row.remove();
+      sync();
+    });
+    remove.title = locked
+      ? (plugins > 0 ? '还有插件在这个根上，先移走或卸载' : '宿主自己的根，不能删')
+      : '不再使用这个根';
+    remove.disabled = locked;
+    row.appendChild(remove);
+
+    wrap.appendChild(row);
+    rows.push(item);
+    return item;
+  }
+
+  roots.forEach(function (root) {
+    const path = String(root.path || '').trim();
+    if (!path) return;
+    const plugins = Number(root.plugins || 0);
+    // The default root is the host's own: dropping it would silently change
+    // where an install lands when nothing is configured.
+    addRow(path, plugins, Boolean(root.default) || plugins > 0);
+  });
+
+  // A typed path becomes a row when it is added, and from then on it is a path
+  // like any other. Nothing half-typed can reach the document.
+  const draft = document.createElement('div');
+  draft.className = 'root-add';
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.placeholder = '/mnt/sd/svcd/plugins';
+  const add = button('+ 新增根', 'ghost', function () {
+    const path = input.value.trim();
+    if (!path) return;
+    if (rows.some(function (item) { return item.path === path; })) {
+      toast('这个根已经在列表里');
+      return;
+    }
+    input.value = '';
+    addRow(path, 0, false);
+    sync();
+  });
+  input.onkeydown = function (event) {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      add.click();
+    }
+  };
+  draft.appendChild(input);
+  draft.appendChild(add);
+  wrap.appendChild(draft);
+  return wrap;
+}
+
+function openSettings() {
+  if (BUSY) return;
+  closeMore();
+  lock(true);
+  api('/api/v1/settings').then(function (data) {
+    lock(false);
+    showSettingsModal(data);
+  }).catch(function (error) {
+    lock(false);
+    toast('读取设置失败：' + error.message, 'err');
+  });
+}
+
+function settingsValueText(value, kind) {
+  if (value === null || value === undefined) return '-';
+  if (typeof value === 'boolean') return value ? '开' : '关';
+  if (kind === 'bytes') return settingsBytesText(value);
+  return String(value);
+}
+
+// Byte facts read at a glance ("512.0 MiB"), not as raw counts. The probe rows
+// are read-only facts, and a count nobody can size up is not a fact you can use.
+function settingsBytesText(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes <= 0) return String(value);
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let size = bytes;
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  return (unit === 0 ? String(size) : size.toFixed(1)) + ' ' + units[unit];
+}
+
+// The document accepts all of these spellings for a boolean (see parse_bool in
+// platform/settings.rs); the form must not treat "false" as "on".
+function settingsBool(value) {
+  if (typeof value === 'boolean') return value;
+  const text = String(value === null || value === undefined ? '' : value).trim().toLowerCase();
+  if (text === 'true' || text === '1' || text === 'on' || text === 'yes') return true;
+  if (text === 'false' || text === '0' || text === 'off' || text === 'no') return false;
+  return null;
+}
+
+function settingsBoolValue(entry) {
+  const current = settingsBool(entry.value);
+  const effective = settingsBool(entry.effective);
+  return (current === null ? effective : current) === false ? 'off' : 'on';
+}
+
+// A checkbox styled as a switch: a two-option select works but reads as a
+// form, not as a state. The document accepts "on"/"off" as the wire spelling.
+function settingsSwitch(entry, mark, unmark) {
+  const label = document.createElement('label');
+  label.className = 'switch';
+  const input = document.createElement('input');
+  input.type = 'checkbox';
+  input.checked = settingsBoolValue(entry) === 'on';
+  input.setAttribute('aria-label', entry.label || entry.key);
+  const track = document.createElement('span');
+  track.className = 'track';
+  const state = document.createElement('span');
+  state.className = 'switch-state';
+  state.textContent = input.checked ? '开' : '关';
+  const initial = input.checked;
+  input.onchange = function () {
+    state.textContent = input.checked ? '开' : '关';
+    if (input.checked === initial) unmark(entry.key);
+    else mark(entry.key, input.checked ? 'on' : 'off');
+  };
+  label.appendChild(input);
+  label.appendChild(track);
+  label.appendChild(state);
+  return label;
+}
+
+const SETTINGS_SOURCE_TEXT = {
+  env: '环境变量覆盖',
+  file: '来自文件',
+  derived: '默认/派生'
+};
+
+function settingsTipLine(label, text) {
+  const line = document.createElement('div');
+  line.className = 'tip-line';
+  const tag = document.createElement('span');
+  tag.className = 'tip-tag';
+  tag.textContent = label + '：';
+  line.appendChild(tag);
+  line.appendChild(document.createTextNode(text || '-'));
+  return line;
+}
+
+function hideSettingsTip() {
+  const tip = $('tip');
+  tip.hidden = true;
+  tip.textContent = '';
+}
+
+function showSettingsTip(anchor, entry, extra) {
+  const tip = $('tip');
+  tip.textContent = '';
+  const key = document.createElement('div');
+  key.className = 'tip-key';
+  key.textContent = entry.key;
+  tip.appendChild(key);
+  tip.appendChild(settingsTipLine('说明', entry.doc));
+  tip.appendChild(settingsTipLine('推荐', entry.recommend));
+  tip.appendChild(settingsTipLine('默认', entry.default));
+  if (entry.source && entry.source !== 'derived') {
+    tip.appendChild(settingsTipLine('来源', SETTINGS_SOURCE_TEXT[entry.source] || ''));
+  }
+  if (extra) tip.appendChild(settingsTipLine('注意', extra));
+  tip.hidden = false;
+  const gap = 8;
+  const rect = anchor.getBoundingClientRect();
+  const width = tip.offsetWidth;
+  const height = tip.offsetHeight;
+  let left = rect.left + rect.width / 2 - width / 2;
+  left = Math.max(gap, Math.min(left, window.innerWidth - width - gap));
+  let top = rect.bottom + gap;
+  if (top + height > window.innerHeight - gap) top = rect.top - height - gap;
+  tip.style.left = left + 'px';
+  tip.style.top = Math.max(gap, top) + 'px';
+}
+
+function settingsHelp(entry, extra) {
+  const help = document.createElement('button');
+  help.type = 'button';
+  help.className = 'help';
+  help.textContent = '?';
+  help.setAttribute('aria-label', (entry.label || entry.key) + '（' + entry.key + '）的说明');
+  help.setAttribute('aria-describedby', 'tip');
+  help.addEventListener('mouseenter', function () { showSettingsTip(help, entry, extra); });
+  help.addEventListener('mouseleave', hideSettingsTip);
+  help.addEventListener('focus', function () { showSettingsTip(help, entry, extra); });
+  help.addEventListener('blur', hideSettingsTip);
+  help.addEventListener('click', function (event) {
+    event.stopPropagation();
+    showSettingsTip(help, entry, extra);
+  });
+  return help;
+}
+
+function settingsLabel(entry, extra) {
+  const label = document.createElement('div');
+  label.className = 'setting-label';
+  const name = document.createElement('span');
+  name.className = 'setting-name';
+  name.textContent = entry.label || entry.key;
+  label.appendChild(name);
+  label.appendChild(settingsHelp(entry, extra));
+  return label;
+}
+
+function showSettingsModal(data) {
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  const panel = document.createElement('div');
+  panel.className = 'panel sheet';
+
+  const head = document.createElement('div');
+  head.className = 'sheet-head';
+  const title = document.createElement('h1');
+  title.textContent = '设置';
+  head.appendChild(title);
+
+  const body = document.createElement('div');
+  body.className = 'sheet-body';
+
+  const changes = {};
+  let passwordMismatch = false;
+  let status = null;
+  let restarting = false;
+  const groups = [];
+  const byGroup = {};
+  data.keys.forEach(function (entry) {
+    if (!byGroup[entry.group]) {
+      byGroup[entry.group] = [];
+      groups.push(entry.group);
+    }
+    byGroup[entry.group].push(entry);
+  });
+
+  function mark(key, value) {
+    changes[key] = value;
+    markTabs();
+  }
+
+  // A row editor can wander back to where it started; then there is nothing to
+  // save, and writing the line anyway would restart the daemon for no reason.
+  function unmark(key) {
+    delete changes[key];
+    markTabs();
+  }
+
+  function field(entry) {
+    const row = document.createElement('div');
+    row.className = 'setting';
+    row.appendChild(settingsLabel(entry));
+
+    const control = document.createElement('div');
+    control.className = 'setting-control';
+    if (!entry.editable) {
+      const value = document.createElement('span');
+      value.className = 'readonly';
+      value.textContent = settingsValueText(entry.effective, entry.kind);
+      control.appendChild(value);
+    } else if (entry.kind === 'bool') {
+      control.appendChild(settingsSwitch(entry, mark, unmark));
+    } else if (entry.kind === 'enum') {
+      const options = entry.key === 'workload'
+        ? ['tiny', 'interactive', 'streaming']
+        : ['error', 'warn', 'info', 'debug', 'trace'];
+      const select = document.createElement('select');
+      options.forEach(function (option) {
+        const item = document.createElement('option');
+        item.value = option;
+        item.textContent = option;
+        select.appendChild(item);
+      });
+      select.value = entry.value || entry.effective || options[0];
+      select.onchange = function () { mark(entry.key, select.value); };
+      control.appendChild(select);
+    } else if (entry.key === 'plugins_dir') {
+      control.appendChild(pluginRootsField(entry, mark, unmark));
+    } else {
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.value = entry.value === null || entry.value === undefined ? '' : entry.value;
+      input.placeholder = String(entry.effective === null ? '' : settingsValueText(entry.effective, entry.kind));
+      input.oninput = function () { mark(entry.key, input.value === '' ? null : input.value); };
+      control.appendChild(input);
+    }
+    row.appendChild(control);
+    return row;
+  }
+
+  function passwordField(entry) {
+    const row = document.createElement('div');
+    row.className = 'setting';
+    row.appendChild(settingsLabel(entry, '改密码后旧登录会话失效；清除密码后非回环监听会退回 127.0.0.1。'));
+
+    const control = document.createElement('div');
+    control.className = 'setting-control';
+    const first = document.createElement('input');
+    first.type = 'password';
+    first.placeholder = '新密码';
+    const second = document.createElement('input');
+    second.type = 'password';
+    second.placeholder = '确认密码';
+    const pair = document.createElement('div');
+    pair.className = 'password-pair';
+    pair.appendChild(first);
+    pair.appendChild(second);
+    const clearLabel = document.createElement('label');
+    clearLabel.className = 'check';
+    const clear = document.createElement('input');
+    clear.type = 'checkbox';
+    clearLabel.appendChild(clear);
+    clearLabel.appendChild(document.createTextNode('清除密码'));
+    control.appendChild(pair);
+    control.appendChild(clearLabel);
+    row.appendChild(control);
+
+    function refresh() {
+      delete changes.auth_passwd;
+      passwordMismatch = false;
+      if (clear.checked) {
+        mark('auth_passwd', null);
+        return;
+      }
+      if (!first.value && !second.value) return;
+      if (first.value !== second.value) {
+        passwordMismatch = true;
+        return;
+      }
+      mark('auth_passwd', first.value);
+    }
+    first.oninput = refresh;
+    second.oninput = refresh;
+    clear.onchange = refresh;
+    return row;
+  }
+
+  // One page per group, all rendered up front and only shown or hidden: an
+  // unsaved edit in another tab survives every switch (#297). The strip keeps
+  // the order the payload gave, which is the Group order in config_doc.
+  const tabs = document.createElement('div');
+  tabs.className = 'sheet-tabs';
+  const pages = {};
+  const tabButtons = {};
+
+  let save = null;
+
+  function showTab(group) {
+    Object.keys(tabButtons).forEach(function (name) {
+      tabButtons[name].classList.toggle('active', name === group);
+      pages[name].classList.toggle('active', name === group);
+    });
+    // About is read-only, so its footer offers no save unless another tab has
+    // an edit the operator still needs to commit.
+    if (save) save.hidden = group === '关于' && Object.keys(changes).length === 0;
+    // A tip pinned to a field on the tab we are leaving would float over this
+    // one.
+    hideSettingsTip();
+  }
+
+  // A dot on every tab that owns a pending edit: the sheet hides whole pages,
+  // so without it "保存" could commit something the operator never saw.
+  function markTabs() {
+    Object.keys(tabButtons).forEach(function (group) {
+      const entries = byGroup[group] || [];
+      const dirty = entries.some(function (entry) {
+        return Object.prototype.hasOwnProperty.call(changes, entry.key);
+      });
+      tabButtons[group].classList.toggle('changed', dirty);
+    });
+    if (status && !restarting) {
+      const count = Object.keys(changes).length;
+      status.textContent = count ? '有 ' + count + ' 项待保存' : '没有待保存的改动';
+    }
+  }
+
+  // Trusted signing keys are a security setting, not a toolbar action: the
+  // list is what an operator audits, and removing a key changes what installs.
+  function trustCard() {
+    const card = document.createElement('div');
+    card.className = 'settings-card trust-card';
+
+    const head = document.createElement('div');
+    head.className = 'trust-head';
+    const text = document.createElement('div');
+    const title = document.createElement('h2');
+    title.textContent = '信任公钥';
+    const hint = document.createElement('p');
+    hint.className = 'muted';
+    hint.textContent = '安装包签名校验用；删除后，用该密钥签名的包会被拒绝。';
+    text.appendChild(title);
+    text.appendChild(hint);
+    head.appendChild(text);
+
+    const list = document.createElement('div');
+    list.className = 'trust-list';
+
+    const foot = document.createElement('p');
+    foot.className = 'trust-foot';
+
+    const refresh = function () {
+      list.textContent = '';
+      const loading = document.createElement('div');
+      loading.className = 'trust-empty';
+      loading.textContent = '正在读取公钥…';
+      list.appendChild(loading);
+      api('/api/v1/trust').then(function (data) {
+        const keys = Array.isArray(data.keys) ? data.keys : [];
+        list.textContent = '';
+        if (!keys.length) {
+          const empty = document.createElement('div');
+          empty.className = 'trust-empty';
+          empty.textContent = '还没有添加公钥；安装本地构建的包前，先把它的签名公钥加进来。';
+          list.appendChild(empty);
+        }
+        keys.forEach(function (keyId) {
+          const row = document.createElement('div');
+          row.className = 'trust-row';
+          const key = document.createElement('code');
+          key.className = 'trust-key';
+          key.textContent = keyId;
+          key.title = keyId;
+          row.appendChild(key);
+          const remove = button('删除', 'danger', function () {
+            removeTrust(keyId, refresh);
+          });
+          remove.title = '删除这个信任公钥';
+          row.appendChild(remove);
+          list.appendChild(row);
+        });
+        foot.textContent = data.directory ? '目录：' + data.directory : '';
+        foot.hidden = !data.directory;
+      }).catch(function (error) {
+        list.textContent = '';
+        const failed = document.createElement('div');
+        failed.className = 'trust-error';
+        failed.textContent = '读取公钥失败：' + error.message;
+        list.appendChild(failed);
+        foot.hidden = true;
+      });
+    };
+
+    const add = button('添加公钥', 'ghost', function () { pickTrust(refresh); });
+    add.title = '选择一个 .pub 公钥文件';
+    head.appendChild(add);
+
+    card.appendChild(head);
+    card.appendChild(list);
+    card.appendChild(foot);
+    refresh();
+    return card;
+  }
+
+  groups.forEach(function (group) {
+    const tab = document.createElement('button');
+    tab.type = 'button';
+    tab.textContent = group;
+    tab.onclick = function () { showTab(group); };
+    tabs.appendChild(tab);
+    tabButtons[group] = tab;
+
+    const page = document.createElement('div');
+    page.className = 'settings-tab';
+    const card = document.createElement('div');
+    card.className = 'settings-card';
+    byGroup[group].forEach(function (entry) {
+      card.appendChild(entry.kind === 'password-hash' ? passwordField(entry) : field(entry));
+    });
+    page.appendChild(card);
+    if (group === '安全') page.appendChild(trustCard());
+    body.appendChild(page);
+    pages[group] = page;
+  });
+  // The last page is about the host itself: version, source and the places to
+  // read or report. It is not a settings group, so it is registered by hand and
+  // never carries a pending-edit dot.
+  const aboutGroup = '关于';
+  const aboutTab = document.createElement('button');
+  aboutTab.type = 'button';
+  aboutTab.textContent = aboutGroup;
+  aboutTab.onclick = function () { showTab(aboutGroup); };
+  tabs.appendChild(aboutTab);
+  tabButtons[aboutGroup] = aboutTab;
+
+  const aboutPage = document.createElement('div');
+  aboutPage.className = 'settings-tab';
+  const about = document.createElement('div');
+  about.className = 'settings-card about-card';
+
+  const aboutHead = document.createElement('div');
+  aboutHead.className = 'about-head';
+  const aboutIcon = document.createElement('img');
+  aboutIcon.src = '/assets/favicon.svg';
+  aboutIcon.alt = '';
+  aboutIcon.width = 52;
+  aboutIcon.height = 52;
+  const aboutText = document.createElement('div');
+  const aboutTitle = document.createElement('h2');
+  aboutTitle.textContent = 'svcd';
+  const aboutSub = document.createElement('p');
+  aboutSub.className = 'muted';
+  aboutSub.textContent = '本机插件守护进程';
+  const aboutVersion = document.createElement('span');
+  aboutVersion.className = 'about-version';
+  aboutVersion.textContent = '版本读取中…';
+  aboutText.appendChild(aboutTitle);
+  aboutText.appendChild(aboutSub);
+  aboutText.appendChild(aboutVersion);
+  aboutHead.appendChild(aboutIcon);
+  aboutHead.appendChild(aboutText);
+  about.appendChild(aboutHead);
+
+  const aboutDesc = document.createElement('p');
+  aboutDesc.className = 'about-desc';
+  aboutDesc.textContent = '在一台机器上安装、启停、配置和导出插件；插件页面、日志与配置都由它托管。';
+  about.appendChild(aboutDesc);
+
+  const aboutLinks = document.createElement('div');
+  aboutLinks.className = 'about-links';
+  [
+    ['开源项目', 'https://github.com/webxxxxx/plugin-manager'],
+    ['插件仓库', 'https://github.com/webxxxxx/plugins'],
+    ['使用文档', 'https://github.com/webxxxxx/plugin-manager/blob/main/README.md'],
+    ['问题反馈', 'https://github.com/webxxxxx/plugin-manager/issues'],
+    ['版本发布', 'https://github.com/webxxxxx/plugin-manager/releases'],
+    ['许可证', 'https://github.com/webxxxxx/plugin-manager/blob/main/LICENSE']
+  ].forEach(function (item) {
+    const link = document.createElement('a');
+    link.className = 'about-link';
+    link.href = item[1];
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.appendChild(document.createTextNode(item[0]));
+    const arrow = document.createElement('span');
+    arrow.className = 'about-arrow';
+    arrow.setAttribute('aria-hidden', 'true');
+    arrow.textContent = '↗';
+    link.appendChild(arrow);
+    aboutLinks.appendChild(link);
+  });
+  about.appendChild(aboutLinks);
+
+  const aboutFoot = document.createElement('p');
+  aboutFoot.className = 'about-foot';
+  aboutFoot.textContent = 'Apache-2.0 许可；版本与提交信息可在「版本发布」查看。';
+  about.appendChild(aboutFoot);
+
+  aboutPage.appendChild(about);
+  body.appendChild(aboutPage);
+  pages[aboutGroup] = aboutPage;
+
+  fetch('/api/v1/version', { credentials: 'same-origin', headers: authHeaders() })
+    .then(function (response) { return response.ok ? response.json() : null; })
+    .then(function (value) {
+      aboutVersion.textContent = value && value.version ? 'v' + value.version : '版本未知';
+    })
+    .catch(function () { aboutVersion.textContent = '版本未知'; });
+
+  if (groups.length) showTab(groups[0]);
+
+  const actions = document.createElement('div');
+  actions.className = 'sheet-foot';
+  status = document.createElement('span');
+  status.className = 'sheet-status';
+  status.textContent = '没有待保存的改动';
+  actions.appendChild(status);
+  let restartTimer = null;
+  let elapsed = 0;
+  function stopPolling() {
+    if (restartTimer) { clearInterval(restartTimer); restartTimer = null; }
+  }
+  function waitForRestart() {
+    restarting = true;
+    status.textContent = '正在重启…';
+    stopPolling();
+    restartTimer = setInterval(function () {
+      elapsed += 500;
+      fetch('/api/v1/version', { credentials: 'same-origin', headers: authHeaders() })
+        .then(function (response) {
+          if (response.status === 401) {
+            // The restart applied a new password: this session is gone. Stop
+            // polling instead of hammering the endpoint with 401s.
+            stopPolling();
+            hideSettingsTip();
+            modal.remove();
+            sessionExpired();
+            return;
+          }
+          if (response.ok) {
+            stopPolling();
+            location.reload();
+          }
+        })
+        .catch(function () {});
+      if (elapsed > 30000) {
+        stopPolling();
+        status.textContent = '30 秒未重启，请检查日志';
+      }
+    }, 500);
+  }
+  save = button('保存', '', function () {
+    if (passwordMismatch) {
+      toast('两次输入的密码不一致', 'err');
+      return;
+    }
+    const values = {};
+    Object.keys(changes).forEach(function (key) { values[key] = changes[key]; });
+    if (Object.keys(values).length === 0) {
+      toast('没有改动');
+      return;
+    }
+    save.disabled = true;
+    fetch('/api/v1/settings', {
+      method: 'PUT',
+      credentials: 'same-origin',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ values: values })
+    }).then(async function (response) {
+      if (!response.ok) throw new Error(await errorText(response));
+      return response.json();
+    }).then(function (result) {
+      save.disabled = false;
+      if (result.restarting) {
+        waitForRestart();
+      } else {
+        toast(result.hint || '已保存，重启 daemon 后生效', 'ok');
+        modal.remove();
+      }
+    }).catch(function (error) {
+      save.disabled = false;
+      toast('保存失败：' + error.message, 'err');
+    });
+  });
+  const close = button('关闭', 'ghost', function () { stopPolling(); hideSettingsTip(); modal.remove(); });
+  modal.onclick = function (event) { if (event.target === modal) close(); };
+  actions.appendChild(close);
+  actions.appendChild(save);
+  panel.appendChild(head);
+  panel.appendChild(tabs);
+  panel.appendChild(body);
+  panel.appendChild(actions);
+  modal.appendChild(panel);
+  document.body.appendChild(modal);
+}
+
+function openUpgrade() {
+  if (BUSY) return;
+  closeMore();
+  lock(true);
+  api('/api/v1/upgrade/check').then(function (data) {
+    lock(false);
+    showUpgradeModal(data);
+  }).catch(function (error) {
+    lock(false);
+    toast('检查更新失败：' + error.message, 'err');
+  });
+}
+
+function showUpgradeModal(data) {
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  const panel = document.createElement('div');
+  panel.className = 'panel';
+  panel.style.width = '460px';
+  panel.style.maxWidth = '90vw';
+  const title = document.createElement('h1');
+  title.textContent = '检查更新';
+  title.style.fontSize = '16px';
+  title.style.margin = '0 0 10px';
+  panel.appendChild(title);
+
+  const status = document.createElement('p');
+  if (!data.store) {
+    status.textContent = '没有安装 plugin-store，无法在线检查更新。先安装插件商店，或用 `svcd upgrade --file <归档>` 离线升级。';
+  } else {
+    status.textContent = '当前 svcd ' + data.current + ' → 最新 ' + (data.latest || '未知') +
+      (data.newer ? '（有新版本）' : (data.latest === data.current ? '（已是最新）' : '（当前比线上新，可降级）'));
+  }
+  panel.appendChild(status);
+
+  const actions = document.createElement('div');
+  actions.className = 'row';
+  actions.style.justifyContent = 'flex-end';
+  actions.style.gap = '8px';
+  actions.style.marginTop = '12px';
+  let timer = null;
+  function close() {
+    if (timer) { clearInterval(timer); timer = null; }
+    modal.remove();
+  }
+  if (data.store && data.newer) {
+    const apply = button('升级并重启', '', function () {
+      apply.disabled = true;
+      status.textContent = '正在下载并校验升级包…';
+      fetch('/api/v1/upgrade/apply', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: authHeaders()
+      }).then(async function (response) {
+        if (response.status === 401) {
+          close();
+          sessionExpired();
+          return null;
+        }
+        if (!response.ok) throw new Error(await errorText(response));
+        return response.json();
+      }).then(function (result) {
+        if (!result) return;
+        if (!result.restarting) {
+          status.textContent = result.hint || '已升级，重启 daemon 后生效'; 
+          return;
+        }
+        status.textContent = '正在重启…新版本 ' + result.version;
+        const started = Date.now();
+        timer = setInterval(function () {
+          fetch('/api/v1/version', { credentials: 'same-origin', headers: authHeaders() })
+            .then(function (response) {
+              if (response.status === 401) {
+                // An upgrade restart can drop the session just like a
+                // settings restart; stop instead of answering 401 every 500ms.
+                close();
+                sessionExpired();
+                return null;
+              }
+              return response.ok ? response.json() : null;
+            })
+            .then(function (value) {
+              if (value && value.version === result.version) {
+                clearInterval(timer);
+                timer = null;
+                location.reload();
+              }
+            })
+            .catch(function () {});
+          if (Date.now() - started > 120000) {
+            clearInterval(timer);
+            timer = null;
+            status.textContent = '升级后 2 分钟内没有回来；检查 `svcd status` 与日志。';
+          }
+        }, 500);
+      }).catch(function (error) {
+        apply.disabled = false;
+        status.textContent = '升级失败：' + error.message;
+      });
+    });
+    actions.appendChild(apply);
+  }
+  actions.appendChild(button('关闭', 'ghost', close));
+  modal.onclick = function (event) { if (event.target === modal) close(); };
+  panel.appendChild(actions);
+  modal.appendChild(panel);
+  document.body.appendChild(modal);
+}
+
+function exportPlugin(id, kind) {
+  if (BUSY) return;
+  lock(true);
+  const backup = kind === 'backup';
+  const path = backup
+    ? '/api/v1/export/' + encodeURIComponent(id)
+    : '/api/v1/export/' + encodeURIComponent(id) + '/spk';
+  fetch(path, { credentials: 'same-origin', headers: authHeaders() }).then(async function (response) {
+    if (!response.ok) throw new Error(await errorText(response));
+    const blob = await response.blob();
+    const disposition = response.headers.get('Content-Disposition') || '';
+    let filename = id + (backup ? '.spkb' : '.spk');
+    const match = /filename="([^"]+)"/.exec(disposition);
+    if (match) filename = match[1];
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    toast((backup ? '已导出备份（含当前配置） ' : '已导出安装包 ') + filename, 'ok');
+  }).catch(function (error) {
+    toast('导出失败：' + error.message, 'err');
+  }).finally(function () { lock(false); });
+}
+
+// Enter in the password field logs in, the same way the button does: on a
+// phone the keyboard covers the button, and this is the only field on the page.
+$('pass').addEventListener('keydown', function (event) {
+  if (event.key !== 'Enter') return;
+  event.preventDefault();
+  login();
+});
+$('file').addEventListener('change', install);
+$('trustfile').addEventListener('change', addTrust);
+document.addEventListener('click', function (event) {
+  if (!event.target.closest('.menu-wrap')) closeMore();
+  if (!event.target.closest('.help')) hideSettingsTip();
+});
+document.addEventListener('keydown', function (event) {
+  if (event.key === 'Escape') {
+    closeMore();
+    hideSettingsTip();
+  }
+});
+window.addEventListener('scroll', hideSettingsTip, true);
+boot();
+</script>
+</body>
+</html>

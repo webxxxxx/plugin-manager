@@ -83,7 +83,7 @@ fn serves_the_embedded_console() {
         "settings dialog must keep a fixed footer"
     );
     assert!(
-        html.contains("id=\"tip\"") && html.contains("entry.label || entry.key"),
+        html.contains("id=\"tip\"") && html.contains("entry.label||entry.key"),
         "settings dialog shows Chinese labels and the English key in a hover tip"
     );
     // One page per group: a scrolling strip at the top of the sheet, one panel
@@ -94,7 +94,7 @@ fn serves_the_embedded_console() {
         "settings must render one tab per group"
     );
     assert!(
-        html.contains("function showTab") && !html.contains("heading.className = 'setting-group'"),
+        html.contains("function showTab") && !html.contains("heading.className='setting-group'"),
         "the flat list of groups must be gone"
     );
     // Plugin roots are added or removed, never rewritten: re-typing an occupied
@@ -103,7 +103,7 @@ fn serves_the_embedded_console() {
     assert!(
         html.contains("function pluginRootsField")
             && html.contains("root-row-path")
-            && html.contains("remove.disabled = locked")
+            && html.contains("remove.disabled=locked")
             && !html.contains("input.readOnly"),
         "plugins_dir must render the list editor, not editable rows"
     );
@@ -133,7 +133,7 @@ fn serves_the_embedded_console() {
         "the settings sheet renders switches inside cards"
     );
     assert!(
-        html.contains("aboutGroup = '关于'") && html.contains("about-link"),
+        html.contains("aboutGroup='关于'") && html.contains("about-link"),
         "the settings sheet carries an About page with source links"
     );
     assert!(
@@ -173,9 +173,9 @@ fn serves_the_embedded_console() {
     // The line under a plugin name is the id plus its plugin root's number in
     // the configured list; the full path is only a tip (#308, #313).
     assert!(
-        html.contains("where.textContent = plugin.id")
-            && html.contains("badge.textContent = plugin.installRootIndex")
-            && html.contains("where.title = '安装位置：' + plugin.installDir"),
+        html.contains("where.textContent=plugin.id")
+            && html.contains("badge.textContent=plugin.installRootIndex")
+            && html.contains("where.title='安装位置：'+plugin.installDir"),
         "the plugin list shows the id and its root number, with the path in the tip"
     );
     // Regression guards for the settings form: false spellings are "关", an
@@ -186,8 +186,7 @@ fn serves_the_embedded_console() {
         "boolean settings need on/off/true/false normalization"
     );
     assert!(
-        html.contains("if (passwordMismatch)")
-            && !html.contains("changes.auth_passwd === undefined"),
+        html.contains("if(passwordMismatch)") && !html.contains("changes.auth_passwd===undefined"),
         "saving a non-password setting must not trip the password mismatch check"
     );
     assert!(
@@ -239,10 +238,7 @@ fn console_is_served_precompressed() {
     flate2::read::GzDecoder::new(&page.body[..])
         .read_to_string(&mut decoded)
         .expect("gunzip console");
-    assert_eq!(
-        decoded,
-        include_str!("../../src/assets/static/index.min.html")
-    );
+    assert_eq!(decoded, include_str!("../../src/assets/static/index.html"));
     assert!(
         page.body.len() < decoded.len(),
         "gzip must be smaller ({} vs {})",
@@ -257,7 +253,7 @@ fn favicon_is_public_and_revalidates() {
     sandbox.start_daemon();
     let address = sandbox.wait_for_http();
 
-    let source = include_bytes!("../../src/assets/static/favicon.min.svg");
+    let source = include_bytes!("../../src/assets/static/favicon.svg");
     let icon = raw_request(&address, "GET", "/assets/favicon.svg", "", b"");
     assert_eq!(icon.status, 200);
     assert_eq!(
