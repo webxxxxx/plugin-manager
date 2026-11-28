@@ -359,7 +359,7 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
 
 ### 5.2 status
 
-- `summary`：id、kind、state、enabled、pid、since、version；插件额外带 `displayName`（清单里的显示名）与 `installDir`（安装目录 `<根>/<id>`，即当前版本目录的父目录），core 服务不带这两个键。HTTP `GET /api/v1/services` 的投影额外带 `hasConfig`（活动配置是否存在）、`hasUI`（manifest 是否声明可打开的 web/gui UI）与 `installRootIndex`（安装目录所在根在 `plugins_dir` 里的序号，从 1 开始；嵌套根取最具体的那个），`svc list` 的 payload 不变。
+- `summary`：id、kind、state、enabled、pid、since、version；插件额外带 `displayName`（清单里的显示名）与 `installDir`（安装目录 `<根>/<id>`，即当前版本目录的父目录），core 服务不带这两个键；设备锁定的包（manifest 的 `compat.devices` 非空，如 `sr6110` 专属变体）再带 `devices`（该包接受的设备 id 列表），能跑在任何设备上的包不出现这个键——变体包与同平台的通用包共用同一个 `id` 和版本号，客户端只有靠它才能认出装的是哪一个（#350）。HTTP `GET /api/v1/services` 的投影额外带 `hasConfig`（活动配置是否存在）、`hasUI`（manifest 是否声明可打开的 web/gui UI）与 `installRootIndex`（安装目录所在根在 `plugins_dir` 里的序号，从 1 开始；嵌套根取最具体的那个），`svc list` 的 payload 不变。
 - `details`：dependencies[]、last_exit、next_at、ready_since、failures、config、probe（仅 `svc status` 探测 core 的 status 动作时出现，内容为该动作的 stdout/摘要）。
 - `svc list` 列：`ID  KIND  STATE  AUTO  PID  VERSION`；AUTO 显示 `[auto]` 或 `-`。
 - `svc list` 只投影受管服务（core + plugin），不含内置 `svc` 自身（svcd 由系统服务管理器拉起，不归自己管）；`svc status svc` 仍可读。

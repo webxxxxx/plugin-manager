@@ -68,6 +68,15 @@ pub struct Summary {
         skip_serializing_if = "Option::is_none"
     )]
     pub install_dir: Option<String>,
+    /// The device ids this package is restricted to (`compat.devices` in the
+    /// manifest); absent when any device of the platform may run it.
+    ///
+    /// A variant build shares its `id` and its version with the portable
+    /// package for the same platform, so a client that reads only `id` cannot
+    /// tell which one is installed — it sees one row per artifact instead
+    /// (#350).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +112,11 @@ impl Status {
                 version: service.version.clone(),
                 display_name: service.display_name.clone(),
                 install_dir: service.install_dir.clone(),
+                devices: service
+                    .compat
+                    .as_ref()
+                    .map(|spec| spec.devices.clone())
+                    .unwrap_or_default(),
             },
             details: Details {
                 dependencies: service.deps.clone(),
@@ -229,6 +243,32 @@ mod tests {
         let value = serde_json::to_value(Status::of(&service)).expect("serialize");
         assert_eq!(value["summary"]["displayName"], "示例插件");
         assert_eq!(value["summary"]["id"], "demo");
+    }
+
+    /// A device-locked package keeps its `id` and version, so `devices` is the
+    /// only thing that tells a client which artifact is installed (#350).
+    #[test]
+    fn a_device_locked_package_projects_the_devices_it_accepts() {
+        let mut service = test_service();
+        let value = serde_json::to_value(Status::of(&service)).expect("serialize");
+        assert!(!value["summary"]
+            .as_object()
+            .expect("summary")
+            .contains_key("devices"));
+
+        service.compat = Some(crate::platform::compat::CompatSpec {
+            devices: vec!["sr6110".into()],
+        });
+        let value = serde_json::to_value(Status::of(&service)).expect("serialize");
+        assert_eq!(value["summary"]["devices"], serde_json::json!(["sr6110"]));
+
+        // An empty list is the same fact as a missing key: any device may run it.
+        service.compat = Some(crate::platform::compat::CompatSpec::default());
+        let value = serde_json::to_value(Status::of(&service)).expect("serialize");
+        assert!(!value["summary"]
+            .as_object()
+            .expect("summary")
+            .contains_key("devices"));
     }
 
     #[test]
