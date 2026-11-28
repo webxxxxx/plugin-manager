@@ -641,6 +641,7 @@ impl Face for ApiFace {
                 done.complete(Exchange::Stream(Box::new(export::ExportStream::open(
                     target,
                     self.config.paths.clone(),
+                    self.config.settings.allow_insecure_install,
                 ))));
             }
             Endpoint::BlobDownload | Endpoint::FileDownload => {

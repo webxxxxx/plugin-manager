@@ -101,10 +101,11 @@ fn missing_plugin(paths: &Paths, id: &str) -> Vec<u8> {
 struct Pending {
     target: ExportTarget,
     version: String,
+    allow_unsigned: bool,
 }
 
 impl ExportStream {
-    pub fn open(target: ExportTarget, paths: Arc<Paths>) -> ExportStream {
+    pub fn open(target: ExportTarget, paths: Arc<Paths>, allow_unsigned: bool) -> ExportStream {
         let id = target.id();
         // Validate before touching the filesystem: plugin_dir joins the id.
         let version = if crate::kernel::registry::valid_id(id) {
@@ -115,7 +116,11 @@ impl ExportStream {
         match version {
             Some(version) => ExportStream {
                 paths,
-                pending: Some(Pending { target, version }),
+                pending: Some(Pending {
+                    target,
+                    version,
+                    allow_unsigned,
+                }),
                 head: Vec::new(),
                 head_sent: 0,
                 plan: TarPlan::new(),
@@ -166,7 +171,12 @@ impl ExportStream {
 
     /// Build the archive plan now that the stream holds a budget slot.
     fn begin(&mut self) {
-        let Some(Pending { target, version }) = self.pending.take() else {
+        let Some(Pending {
+            target,
+            version,
+            allow_unsigned,
+        }) = self.pending.take()
+        else {
             return;
         };
         let id = target.id().to_string();
@@ -182,11 +192,15 @@ impl ExportStream {
             extension
         );
         let plan = match target {
-            ExportTarget::Spk { .. } => package::plan_installed_spk(&version_dir),
+            ExportTarget::Spk { .. } => package::plan_installed_spk(&version_dir, allow_unsigned),
             ExportTarget::Spkb { .. } => match active_config(&self.paths, &id) {
-                Ok(config) => {
-                    plugin::plan_export_spkb(&id, &version, &version_dir, config.as_deref())
-                }
+                Ok(config) => plugin::plan_export_spkb(
+                    &id,
+                    &version,
+                    &version_dir,
+                    config.as_deref(),
+                    allow_unsigned,
+                ),
                 Err(error) => Err(error),
             },
         };
@@ -455,7 +469,7 @@ mod tests {
     fn spk(version_dir: &Path, name: &str) -> ExportStream {
         ExportStream::planned(
             &format!("{}-1.0.0.spk", name),
-            package::plan_installed_spk(version_dir),
+            package::plan_installed_spk(version_dir, false),
             test_paths(),
         )
     }
@@ -463,7 +477,7 @@ mod tests {
     fn spkb(version_dir: &Path, name: &str, config: Option<&[u8]>) -> ExportStream {
         ExportStream::planned(
             &format!("{}-1.0.0.spkb", name),
-            plugin::plan_export_spkb(name, "1.0.0", version_dir, config),
+            plugin::plan_export_spkb(name, "1.0.0", version_dir, config, false),
             test_paths(),
         )
     }
@@ -586,6 +600,67 @@ mod tests {
     }
 
     #[test]
+    fn the_insecure_switch_allows_an_unsigned_export() {
+        let version_dir = installed("demo", &[("payload/run.sh", b"#!/bin/sh\n", 0o755)]);
+        fs::remove_file(version_dir.join("signature.json")).expect("drop signature");
+        assert!(
+            package::plan_installed_spk(&version_dir, false).is_err(),
+            "the export must stay refused while the switch is off"
+        );
+
+        let plan = package::plan_installed_spk(&version_dir, true).expect("unsigned export");
+        let (bytes, reason) = drive(
+            ExportStream::planned("demo-1.0.0.spk", Ok(plan), test_paths()),
+            4096,
+        );
+        assert_eq!(reason, CloseReason::Completed);
+        assert!(
+            text(&bytes).starts_with("HTTP/1.1 200 OK\r\n"),
+            "{}",
+            text(&bytes)
+        );
+        let entries = package::read_tar(body(&bytes)).expect("tar");
+        let names: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+        assert_eq!(names, ["manifest.json", "payload/run.sh"]);
+    }
+
+    #[test]
+    fn the_insecure_switch_does_not_strip_a_real_signature() {
+        let version_dir = installed("demo", &[("payload/run.sh", b"#!/bin/sh\n", 0o755)]);
+        let plan = package::plan_installed_spk(&version_dir, true).expect("signed export");
+        let (bytes, _) = drive(
+            ExportStream::planned("demo-1.0.0.spk", Ok(plan), test_paths()),
+            4096,
+        );
+        let entries = package::read_tar(body(&bytes)).expect("tar");
+        let names: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+        assert!(names.contains(&"signature.json"), "{names:?}");
+    }
+
+    #[test]
+    fn a_backup_of_an_unsigned_install_nests_an_unsigned_package() {
+        let version_dir = installed("demo", &[("payload/run.sh", b"#!/bin/sh\n", 0o755)]);
+        fs::remove_file(version_dir.join("signature.json")).expect("drop signature");
+        let plan = plugin::plan_export_spkb("demo", "1.0.0", &version_dir, None, true)
+            .expect("unsigned backup");
+        let (bytes, _) = drive(
+            ExportStream::planned("demo-1.0.0.spkb", Ok(plan), test_paths()),
+            4096,
+        );
+        let entries = package::read_tar(body(&bytes)).expect("backup tar");
+        let inner = entries
+            .iter()
+            .find(|entry| entry.path == "plugin.spk")
+            .expect("nested spk");
+        let inner_entries = package::read_tar(&inner.data).expect("inner tar");
+        let names: Vec<&str> = inner_entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert_eq!(names, ["manifest.json", "payload/run.sh"]);
+    }
+
+    #[test]
     fn a_truncated_payload_fails_before_the_headers() {
         let version_dir = installed("demo", &[("payload/run.sh", b"#!/bin/sh\n", 0o755)]);
         fs::write(version_dir.join("payload/run.sh"), b"").expect("truncate payload");
@@ -610,6 +685,7 @@ mod tests {
                     id: "no-such-export-plugin".into(),
                 },
                 test_paths(),
+                false,
             ),
             4096,
         );
@@ -624,6 +700,7 @@ mod tests {
                     id: "../escape".into(),
                 },
                 test_paths(),
+                false,
             ),
             4096,
         );

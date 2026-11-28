@@ -566,7 +566,7 @@ pub const CONF_KEYS: &[ConfKey] = &[
         group: Group::Security,
         kind: Kind::Bool,
         default: "off",
-        doc: "允许安装验签失败时降级接受未签名包。",
+        doc: "允许安装验签失败时降级接受未签名包；开启后也允许把未签名安装的版本导出成未签名包。",
         recommend: "默认 off；只在可信机器上开。",
         editable_in_console: true,
         needs_restart: true,
