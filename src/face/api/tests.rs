@@ -47,11 +47,11 @@ fn embedded_console_gzip_is_deterministic_and_matches_the_source() {
     for (asset, source) in [
         (
             console::find("/").expect("console page"),
-            include_str!("../../assets/static/index.min.html"),
+            include_str!("../../assets/static/index.html"),
         ),
         (
             console::find("/assets/favicon.svg").expect("tab icon"),
-            include_str!("../../assets/static/favicon.min.svg"),
+            include_str!("../../assets/static/favicon.svg"),
         ),
     ] {
         assert_eq!(asset.encoding, console::Encoding::Gzip);
@@ -97,9 +97,6 @@ fn console_asset_paths_are_unique_and_root_shares_the_page() {
         "assets only live under /assets/"
     );
     assert!(console::find("/assets/missing").is_none());
-    // The .min inputs are build-only: the readable names are the served URLs.
-    assert!(console::find("/assets/index.min.html").is_none());
-    assert!(console::find("/assets/favicon.min.svg").is_none());
 }
 
 #[test]

@@ -1,4 +1,4 @@
-//! Contract checks for the embedded console page (`src/assets/static/index.html`).
+//! Contract checks for the readable console source (`src/assets/console/index.html`).
 //!
 //! There is no browser or DOM library in this repo, so the settings sheet's
 //! structure is checked at the source level: the tab strip must exist, every
@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import vm from "node:vm";
 
-const DEFAULT_PAGE = "src/assets/static/index.html";
+const DEFAULT_PAGE = "src/assets/console/index.html";
 
 function readPage(path) {
   // The checkout is CRLF on Windows; every check here is a substring match, so
