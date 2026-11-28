@@ -385,6 +385,11 @@ pub(crate) fn web_plugin_bundle_with(
             0o644,
         ),
         ("payload/web/large.html".to_string(), large_web_page(), 0o644),
+        (
+            "payload/icons/icon.svg".to_string(),
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 8 8\"><rect width=\"8\" height=\"8\"/></svg>".to_vec(),
+            0o644,
+        ),
     ];
     files.sort_by(|left, right| left.0.cmp(&right.0));
     let mut manifest = json!({
@@ -401,6 +406,7 @@ pub(crate) fn web_plugin_bundle_with(
         ],
     });
     manifest["config"] = json!("config/config");
+    manifest["icons"] = json!({"svg": "payload/icons/icon.svg"});
     if ui {
         manifest["ui"] = json!({"type": "web", "entry": "index.html"});
     }

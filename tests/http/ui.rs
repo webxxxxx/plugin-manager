@@ -112,6 +112,19 @@ fn serves_the_embedded_console() {
         !html.contains(">只读<") && !html.contains("setting-source"),
         "a read-only value needs no badge"
     );
+    assert!(
+        html.contains("class=\"app-foot\"")
+            && html.contains("https://github.com/webxxxxx/plugin-manager"),
+        "the list footer links to the open-source project"
+    );
+    assert!(
+        html.contains("function settingsSwitch") && html.contains("settings-card"),
+        "the settings sheet renders switches inside cards"
+    );
+    assert!(
+        html.contains("aboutGroup = '关于'") && html.contains("about-link"),
+        "the settings sheet carries an About page with source links"
+    );
     // The upload install asks which root when the switch is on and there is
     // more than one; the plugin store reads the same flag (#299).
     assert!(
@@ -288,6 +301,18 @@ fn plugin_web_ui_serves_assets_with_base_and_etag() {
         .expect("plain");
     assert_eq!(demo["hasUI"], true);
     assert_eq!(plain["hasUI"], false);
+    assert_eq!(demo["icon"], "/api/v1/plugins/demo/icon");
+
+    let icon = raw_request(&address, "GET", "/api/v1/plugins/demo/icon", "", b"");
+    assert_eq!(icon.status, 200);
+    assert_eq!(
+        raw_header_values(&icon, "content-type"),
+        vec!["image/svg+xml"]
+    );
+    assert_eq!(raw_header_values(&icon, "cache-control"), vec!["no-cache"]);
+    assert!(String::from_utf8_lossy(&icon.body).starts_with("<svg"));
+    let no_icon = raw_request(&address, "GET", "/api/v1/plugins/missing/icon", "", b"");
+    assert_eq!(no_icon.status, 404, "a plugin without an icon is a 404");
 
     let base = plugin_ui_base(&address, "demo");
 

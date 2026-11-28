@@ -109,10 +109,11 @@ pub(crate) fn project_service(status: &Value, paths: &Paths) -> Option<Value> {
         .pointer("/details/config")
         .and_then(Value::as_str)
         .is_some();
-    let has_ui = status
+    let summary_id = status
         .get("summary")
         .and_then(|summary| summary.get("id"))
-        .and_then(Value::as_str)
+        .and_then(Value::as_str);
+    let has_ui = summary_id
         .map(|id| crate::manage::web_assets(paths, id).is_some())
         .unwrap_or(false);
     let root_index = status
@@ -123,6 +124,14 @@ pub(crate) fn project_service(status: &Value, paths: &Paths) -> Option<Value> {
     if let Some(object) = summary.as_object_mut() {
         object.insert("hasConfig".into(), Value::Bool(has_config));
         object.insert("hasUI".into(), Value::Bool(has_ui));
+        if let Some(id) = summary_id {
+            if crate::manage::icon_asset(paths, id).is_some() {
+                object.insert(
+                    "icon".into(),
+                    Value::String(format!("/api/v1/plugins/{}/icon", id)),
+                );
+            }
+        }
         if let Some(index) = root_index {
             object.insert("installRootIndex".into(), json!(index));
         }
