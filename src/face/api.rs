@@ -166,6 +166,7 @@ api_quiet_routes! {
     POST   "/api/v1/services/{id}/enable"     => service_enable,
     POST   "/api/v1/services/{id}/disable"    => service_disable,
     DELETE "/api/v1/plugins/{id}"             => plugin_uninstall,
+    GET    "/api/v1/plugins/{id}/icon"        => plugin_icon,
     DELETE "/api/v1/blobs/{id}"               => blob_delete,
     DELETE "/api/v1/file/{id}"                => file_delete,
 }
@@ -269,6 +270,25 @@ impl ApiFace {
                 "expiresIn": lan::plugin_token_ttl_secs(),
             }),
         )
+    }
+
+    /// The package's declared icon, served from the installed version dir.
+    /// No transform: the file is already a browser format and the manifest
+    /// rules cap its size.
+    fn plugin_icon_rpc(&self, id: &str) -> Response {
+        let Some(asset) = crate::manage::icon_asset(&self.config.paths, id) else {
+            return error_response(404, "not_found", &format!("plugin {} has no icon", id));
+        };
+        match std::fs::read(&asset.path) {
+            Ok(bytes) => Response::new(200, asset.mime, bytes)
+                .with_header("Cache-Control", "no-cache")
+                .with_header("X-Content-Type-Options", "nosniff"),
+            Err(_) => error_response(
+                404,
+                "not_found",
+                &format!("plugin {} icon is unreadable", id),
+            ),
+        }
     }
 
     fn uninstall_plugin_rpc(
@@ -473,6 +493,10 @@ impl ApiFace {
 
     fn plugin_ui_token(&self, call: &ApiCall<'_>) -> Response {
         self.plugin_ui_token_rpc(&call.param("id"))
+    }
+
+    fn plugin_icon(&self, call: &ApiCall<'_>) -> Response {
+        self.plugin_icon_rpc(&call.param("id"))
     }
 
     /// `DELETE /api/v1/blobs/{id}`: release a transfer artifact instead of

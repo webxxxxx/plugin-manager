@@ -274,7 +274,7 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
 ### 3.5 HTTP 管理 API
 
 - 前缀 `/api/v1`，JSON only（上传/下载为二进制），无 CORS；**覆盖 `svc` 的全部管理命令**：
-  - `GET /api/v1/services` → `{services:[summary + hasConfig + hasUI]}`（§5.2 的 summary；`hasConfig` / `hasUI` 是 HTTP 列表附加项，表示活动配置与可打开 Web UI 是否存在）
+  - `GET /api/v1/services` → `{services:[summary + hasConfig + hasUI + icon]}`（§5.2 的 summary；`hasConfig` / `hasUI` 是 HTTP 列表附加项，表示活动配置与可打开 Web UI 是否存在；`icon` 是包声明图标的地址，没有图标时缺省）
   - `GET /api/v1/services/{id}` → `{summary, details}`
   - `POST /api/v1/services/{id}/start` → 同步到 ready，返回 `{summary}`；超时 504
   - `POST /api/v1/services/{id}/stop` → 返回 `{summary}`
@@ -286,6 +286,7 @@ JSON，`schema: 1`（唯一版本；旧线的 1/2/3 分级已合并，见 §1.8 
   - `GET /assets/{*path}` → 控制台的其余静态文件（同样免认证；页面只在 `/`）
   - `POST /api/v1/plugins`：body 为 `.spk` 原始字节（`application/octet-stream`），query `strategy` / `enable` / `allow_hooks` / `root`；流式解包到**选中的插件根**（`root` 显式指定，否则装得下且剩余空间最小的根，ADR-0030），512 MiB 上限；返回 `{id,version,state}`。`root` 不在 `plugins_dir` 里 → 400 并列出可选根；同一 id 已装在别的根 → 409（先卸载）；都装不下 → **507 `insufficient_space`**，消息里带 `need` 与每个根的空闲字节，`error.data` 里同一组数字是机读的：`{id, need, installed, root, roots:[{root, free}]}`（`installed` 是当前版本目录的实际占用，`root` 是这次检查的那个根、自动选根时为 `null`，`free` 量不到为 `null`）。`need` 只算这次要写入的新树：旧版在提交前仍在盘上，但它的字节已经不在 `free` 里，再加一次就是要求放下两份（#329）。控制台据此弹「卸载旧版并安装」：卸载用 `purge=false` 保住配置与数据，再用同一个文件重传（`.spkb` 导入走同一套空间检查，也弹同一个框，重传的仍是同一个文件）；能不能回收只按 `root` 那个根算——卸载只往这个根还空间，别的根再空也帮不上（`root` 为空时退回取最大值，#330）
   - `POST /api/v1/plugins/{id}/ui-token`：签发 1 小时、绑定该 plugin id 的 UI token；返回 `{token,url,expiresIn}`，`url` 形如 `/plugin-ui/{id}/{token}/`
+  - `GET /api/v1/plugins/{id}/icon`：返回当前版本包声明的图标（优先 svg，其次 png / ico；`icns` 不供浏览器）；没有图标或读不到时 404。列表项的 `icon` 字段就是这个地址
   - `GET /api/v1/trust` → `{keys:[keyId], directory}`；`POST /api/v1/trust?key_id=<id>`：body 为 PEM SPKI 公钥，写入 `<config>/trust.d/<id>.pub`；`DELETE /api/v1/trust/{keyId}` 撤销
   - `DELETE /api/v1/plugins/{id}?purge=false&force=false`：卸载；`purge=true` 删除版本、配置、状态与 `<id>.log` / `<id>-hooks.log`（含轮转），Web 控制台的「删除」用 `purge=true`；空间不足的恢复流程用 `purge=false`，让重装还能找回配置与数据。卸载成功后清掉该 id 的位置索引记录。插件所在的根不可用（SD 卡拔了）时返回 409 并带上该路径与 `--force` 提示；`force=true` 只删那条记录、不碰任何卷，并写一行审计日志（`location record forgotten … the volume was left untouched`）
   - `DELETE /api/v1/blobs/{id}` / `DELETE /api/v1/file/{id}`：立刻释放一个传输产物（单个 blob，或整包 `files/<id>` 的清单与分片），返回 `{removed:true}`；本来就不存在返回 404。商店在浏览器取完包字节后调用它，把一次安装的磁盘峰值压到**一份包**；不定时依赖 `temp_retention_secs`

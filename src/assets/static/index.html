@@ -21,7 +21,9 @@
   * { box-sizing:border-box; }
   [hidden] { display:none !important; }
   body { margin:0; font:14px/1.55 "Segoe UI",-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; color:var(--text); background:radial-gradient(1100px 360px at 50% -240px,#e8f0ff 0%,rgba(232,240,255,0) 74%),var(--bg); background-attachment:fixed; -webkit-font-smoothing:antialiased; }
-  .wrap { max-width:1120px; margin:0 auto; padding:32px 28px 56px; }
+  .wrap { max-width:1120px; min-height:100vh; margin:0 auto; padding:32px 28px; display:flex; flex-direction:column; }
+  #main { flex:1 1 auto; display:flex; flex-direction:column; }
+  #main.hidden { display:none; }
   h1 { font-size:20px; font-weight:650; margin:0 0 16px; letter-spacing:-.01em; }
   .card { background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:20px 24px; margin-bottom:20px; box-shadow:var(--shadow-card); }
   .row { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
@@ -48,7 +50,7 @@
   #login .row { gap:8px; }
   #login .row .muted { margin:0; }
   #login input { flex:1 1 180px; min-width:0; }
-  .list-card { padding:0; overflow:hidden; }
+  .list-card { flex:1 1 auto; display:flex; flex-direction:column; padding:0; overflow:hidden; margin-bottom:0; }
   .list-head { display:flex; align-items:center; gap:16px; padding:16px 24px; border-bottom:1px solid var(--line-soft); }
   .list-title { display:flex; align-items:center; gap:9px; min-width:0; }
   .list-title h2 { margin:0; font-size:15px; font-weight:650; letter-spacing:.01em; }
@@ -56,6 +58,10 @@
   .list-sum { color:var(--faint); font-size:12px; white-space:nowrap; }
   .list-tools { margin-left:auto; display:flex; align-items:center; gap:14px; }
   .install-hint { font-size:12px; }
+  .app-foot { flex:none; display:flex; align-items:center; justify-content:space-between; gap:8px 18px; flex-wrap:wrap; padding:11px 24px; border-top:1px solid var(--line-soft); background:#fbfcfe; color:var(--muted); font-size:12px; }
+  .app-foot a { color:var(--muted); text-decoration:none; }
+  .app-foot a:hover { color:var(--brand); }
+  .app-foot .foot-links { display:flex; align-items:center; gap:14px; }
   .menu-wrap { position:relative; display:inline-flex; }
   .menu-btn { padding:0 10px; font-size:18px; line-height:1; }
   button#morebtn { border-color:transparent; background:transparent; color:#5b6676; }
@@ -75,6 +81,7 @@
   tbody tr:last-child td { border-bottom:0; }
   .plugin-cell { display:flex; align-items:center; gap:12px; min-width:0; }
   .plugin-mark { flex:none; width:34px; height:34px; border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:15px; font-weight:700; background:var(--mark-bg,#eef2f9); color:var(--mark-ink,#5c6b82); box-shadow:inset 0 0 0 1px rgba(16,24,40,.05); }
+  .plugin-icon { object-fit:contain; background:#fff; padding:4px; border:1px solid var(--line); box-shadow:none; }
   .plugin-main { min-width:0; }
   .plugin-name { font-size:13.5px; font-weight:600; line-height:1.35; }
   td.version { font-family:var(--mono); font-size:12px; color:#5b6677; font-variant-numeric:tabular-nums; white-space:nowrap; }
@@ -91,11 +98,11 @@
   label.check { display:flex; align-items:center; gap:4px; font-size:12px; color:var(--muted); white-space:nowrap; }
   label.check input { margin:0; }
   .hidden { display:none; }
-  .tablewrap { width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }
+  .tablewrap { width:100%; flex:1 1 auto; overflow-x:auto; -webkit-overflow-scrolling:touch; }
   .tablewrap table { min-width:720px; }
   .install-root { display:flex; align-items:center; gap:5px; font-family:var(--mono); font-size:11.5px; line-height:1.4; color:var(--muted); overflow-wrap:anywhere; }
   .root-index { font-family:inherit; font-size:11px; line-height:16px; min-width:16px; padding:0 4px; text-align:center; border-radius:5px; background:#eef2f8; color:#66717f; }
-  .empty { padding:56px 24px 60px; text-align:center; }
+  .empty { flex:1 1 auto; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:56px 24px 60px; text-align:center; }
   .empty-art { display:grid; place-items:center; width:46px; height:46px; margin:0 auto 12px; border:1px dashed #cbd5e3; border-radius:14px; color:#9aa8bc; font-size:24px; font-weight:300; line-height:1; }
   .empty-title { margin:0 0 4px; font-size:14px; font-weight:600; }
   .empty .muted { margin:0; }
@@ -118,30 +125,45 @@
   .modal pre.logs { height:382px; max-height:none; overflow:auto; line-height:1.5; }
   .modal h1 { font-size:17px; margin:0 0 6px; }
   /* Settings uses the log dialog shell: a fixed head/foot, the body scrolls. */
-  .modal .panel.sheet { display:flex; flex-direction:column; height:min(720px,90vh); max-height:90vh; overflow:hidden; padding:0; min-width:0; }
-  .sheet .sheet-head { flex:none; padding:18px 22px 0; min-width:0; }
-  .sheet .sheet-head h1 { font-size:16px; margin:0; }
-  .sheet .sheet-head .muted { overflow-wrap:anywhere; margin:6px 0 0; }
-  .sheet .sheet-body { flex:1 1 auto; min-height:0; min-width:0; overflow:auto; padding:0 22px 6px; }
-  .sheet .sheet-foot { flex:none; display:flex; justify-content:flex-end; gap:8px; padding:14px 22px 18px; border-top:1px solid var(--line); min-width:0; }
+  .modal .panel.sheet { display:flex; flex-direction:column; height:min(720px,90vh); max-height:90vh; overflow:hidden; padding:0; min-width:0; width:min(820px,100%); border-radius:16px; }
+  .sheet .sheet-head { flex:none; padding:20px 22px 14px; min-width:0; border-bottom:1px solid var(--line-soft); }
+  .sheet .sheet-kicker { display:flex; align-items:center; gap:7px; margin:0 0 4px; color:var(--brand); font-size:11px; font-weight:700; letter-spacing:.08em; }
+  .sheet .sheet-kicker::before { content:''; width:5px; height:5px; border-radius:50%; background:var(--brand); }
+  .sheet .sheet-head h1 { font-size:19px; margin:0; letter-spacing:-.01em; }
+  .sheet .sheet-head .muted { overflow-wrap:anywhere; margin:7px 0 0; font-size:12px; line-height:1.6; }
+  .sheet-path { font-family:var(--mono); font-size:11.5px; color:#4c5a6b; background:#f3f6fb; border:1px solid #e7edf5; border-radius:6px; padding:1px 6px; }
+  .sheet .sheet-body { flex:1 1 auto; min-height:0; min-width:0; overflow:auto; padding:16px 18px 18px; background:#f6f8fc; }
+  .sheet .sheet-foot { flex:none; display:flex; align-items:center; justify-content:flex-end; gap:8px; padding:13px 22px; border-top:1px solid var(--line); background:#fff; min-width:0; }
+  .sheet-status { margin-right:auto; font-size:12px; color:var(--muted); }
   /* One page per setting group. The strip wraps instead of scrolling sideways:
      a scrollbar on a six-tab strip hides tabs and says nothing about them. The
-     active tab is the panel's own white so the border below reads as an
-     underline. */
-  .sheet-tabs { flex:none; display:flex; flex-wrap:wrap; gap:2px; padding:12px 22px 0; border-bottom:1px solid var(--line); }
-  .sheet-tabs button { flex:0 0 auto; height:auto; padding:7px 11px; font-size:13px; border:1px solid transparent; border-radius:9px 9px 0 0; background:transparent; color:var(--muted); }
-  .sheet-tabs button:hover:not(:disabled) { background:transparent; border-color:transparent; color:var(--brand); }
-  .sheet-tabs button.active { background:#fff; color:var(--brand); font-weight:600; border-color:var(--line); border-bottom-color:#fff; margin-bottom:-1px; }
+     active tab is a filled pill, so the current page is readable at a glance. */
+  .sheet-tabs { flex:none; display:flex; flex-wrap:wrap; gap:4px; padding:10px 18px; border-bottom:1px solid var(--line); background:#fff; }
+  .sheet-tabs button { flex:0 0 auto; height:30px; padding:0 13px; font-size:12.5px; border:1px solid transparent; border-radius:999px; background:transparent; color:var(--muted); }
+  .sheet-tabs button:hover:not(:disabled) { background:var(--brand-soft); border-color:transparent; color:var(--brand); }
+  .sheet-tabs button.active { background:var(--brand); color:#fff; font-weight:600; border-color:var(--brand); box-shadow:0 5px 12px -8px rgba(37,86,201,.7); }
   .sheet-tabs button.changed::after { content:''; display:inline-block; width:6px; height:6px; margin-left:5px; border-radius:50%; background:var(--brand); vertical-align:middle; }
+  .sheet-tabs button.active.changed::after { background:#fff; }
   .settings-tab { display:none; }
   .settings-tab.active { display:block; }
-  .setting { display:grid; grid-template-columns:minmax(130px,150px) minmax(0,1fr); align-items:center; gap:4px 10px; padding:11px 0; border-bottom:1px solid #f1f4f8; }
+  .settings-card { background:#fff; border:1px solid var(--line); border-radius:12px; overflow:hidden; box-shadow:0 1px 2px rgba(16,24,40,.03); }
+  .setting { display:grid; grid-template-columns:minmax(140px,200px) minmax(0,1fr); align-items:center; gap:4px 18px; padding:12px 16px; border-bottom:1px solid var(--line-soft); }
   .setting:last-child { border-bottom:0; }
   .setting-label { display:flex; align-items:center; gap:6px; min-width:0; }
-  .setting-name { font-size:13px; font-weight:600; }
-  .setting-control { display:flex; align-items:center; gap:6px; flex-wrap:wrap; min-width:0; }
+  .setting-name { font-size:13px; font-weight:600; color:#26303c; }
+  .setting-control { display:flex; align-items:center; gap:8px; flex-wrap:wrap; min-width:0; }
   .setting-control > input[type=text] { width:100%; }
-  .setting-control .readonly { font-size:13px; word-break:break-all; }
+  .setting-control .readonly { font-family:var(--mono); font-size:12px; color:#3d4a5c; background:#f4f7fb; border:1px solid #e6ecf4; border-radius:7px; padding:3px 8px; word-break:break-all; }
+  .switch { position:relative; display:inline-flex; align-items:center; gap:9px; cursor:pointer; user-select:none; }
+  .switch input { position:absolute; width:1px; height:1px; opacity:0; }
+  .switch .track { position:relative; flex:none; width:38px; height:22px; border-radius:999px; background:#d9e0ea; transition:background-color .15s ease; }
+  .switch .track::after { content:''; position:absolute; top:3px; left:3px; width:16px; height:16px; border-radius:50%; background:#fff; box-shadow:0 1px 3px rgba(16,24,40,.25); transition:transform .15s ease; }
+  .switch input:checked + .track { background:var(--brand); }
+  .switch input:checked + .track::after { transform:translateX(16px); }
+  .switch input:focus-visible + .track { outline:2px solid rgba(47,111,237,.45); outline-offset:2px; }
+  .switch .switch-state { font-size:12px; color:var(--muted); min-width:2.4em; }
+  .password-pair { display:flex; gap:8px; flex-wrap:wrap; width:100%; }
+  .password-pair input { flex:1 1 150px; min-width:0; }
   /* Plugin roots are a list, not one path: a row per root, `x` per row. */
   .roots { display:flex; flex-direction:column; gap:5px; width:100%; }
   .root-row, .root-add { display:flex; align-items:center; gap:6px; min-width:0; }
@@ -153,6 +175,18 @@
   .root-add input[type=text] { flex:1 1 auto; min-width:0; }
   .help { flex:none; width:17px; height:17px; padding:0; border:1px solid #c7d0da; border-radius:50%; background:#fff; color:#7b8794; font-size:11px; line-height:1; cursor:help; }
   .help:hover, .help:focus-visible { border-color:var(--brand); color:var(--brand); }
+  .about-card { display:flex; flex-direction:column; gap:18px; padding:20px; }
+  .about-head { display:flex; align-items:center; gap:14px; min-width:0; }
+  .about-head img { flex:none; width:52px; height:52px; border-radius:14px; box-shadow:0 8px 18px -12px rgba(30,136,229,.8); }
+  .about-head h2 { margin:0; font-size:18px; letter-spacing:-.01em; }
+  .about-head .muted { margin:2px 0 0; }
+  .about-version { display:inline-flex; align-items:center; margin-top:5px; padding:1px 8px; border-radius:999px; background:var(--brand-soft); color:var(--brand); font-size:11.5px; font-weight:650; }
+  .about-desc { margin:0; color:var(--muted); font-size:12.5px; line-height:1.7; }
+  .about-links { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .about-link { display:flex; align-items:center; justify-content:space-between; gap:10px; min-width:0; padding:10px 12px; border:1px solid var(--line); border-radius:9px; color:var(--text); font-size:13px; text-decoration:none; transition:border-color .15s ease, background-color .15s ease, color .15s ease; }
+  .about-link:hover { border-color:#bfd0f4; background:#f7faff; color:var(--brand); }
+  .about-link .about-arrow { color:var(--muted); }
+  .about-foot { margin:0; padding-top:12px; border-top:1px solid var(--line-soft); color:var(--muted); font-size:11.5px; line-height:1.7; }
   #tip { position:fixed; z-index:1250; max-width:min(360px, calc(100vw - 24px)); padding:10px 12px; border-radius:9px; background:#232a36; color:#fff; font-size:12px; line-height:1.6; box-shadow:0 12px 34px rgba(0,0,0,.3); pointer-events:none; }
   #tip .tip-key { font-family:var(--mono); color:#9ecbff; margin-bottom:2px; word-break:break-all; }
   #tip .tip-line { margin-top:3px; }
@@ -178,7 +212,8 @@
     .toast { max-width:none; min-width:0; }
     .sheet .sheet-head, .sheet .sheet-body, .sheet .sheet-foot { padding-left:19px; padding-right:19px; }
     .sheet-tabs { padding-left:19px; padding-right:19px; }
-    .setting { grid-template-columns:1fr; gap:4px; }
+    .setting { grid-template-columns:1fr; gap:6px; padding:11px 13px; }
+    .about-links { grid-template-columns:1fr; }
     .list-card { padding:0; }
     .list-head { padding:12px 14px; flex-wrap:wrap; }
     .list-tools { width:100%; }
@@ -273,6 +308,12 @@
         <p class="empty-title">还没有安装任何插件</p>
         <p class="muted">点右上角的「上传安装」，选一个 .spk 包开始。</p>
       </div>
+      <footer class="app-foot">
+        <span>svcd · <a href="https://github.com/webxxxxx/plugin-manager/blob/main/LICENSE" target="_blank" rel="noopener">Apache-2.0</a></span>
+        <span class="foot-links">
+          <a href="https://github.com/webxxxxx/plugin-manager" target="_blank" rel="noopener">开源项目 <span aria-hidden="true">↗</span></a>
+        </span>
+      </footer>
       <input type="file" id="file" accept=".spk,.spkb" class="hidden">
       <input type="file" id="trustfile" accept=".pub" class="hidden">
     </section>
@@ -498,7 +539,19 @@ function render(plugins) {
     const markColor = MARK_COLORS[hash % MARK_COLORS.length];
     mark.style.setProperty('--mark-bg', markColor[0]);
     mark.style.setProperty('--mark-ink', markColor[1]);
-    cell.appendChild(mark);
+    // The package's own icon when it ships one; the letter is the fallback,
+    // not a stand-in that hides a broken image.
+    if (plugin.icon) {
+      const icon = document.createElement('img');
+      icon.className = 'plugin-mark plugin-icon';
+      icon.src = plugin.icon;
+      icon.alt = '';
+      icon.loading = 'lazy';
+      icon.onerror = function () { icon.replaceWith(mark); };
+      cell.appendChild(icon);
+    } else {
+      cell.appendChild(mark);
+    }
 
     const main = document.createElement('div');
     main.className = 'plugin-main';
@@ -1266,6 +1319,32 @@ function settingsBoolValue(entry) {
   return (current === null ? effective : current) === false ? 'off' : 'on';
 }
 
+// A checkbox styled as a switch: a two-option select works but reads as a
+// form, not as a state. The document accepts "on"/"off" as the wire spelling.
+function settingsSwitch(entry, mark, unmark) {
+  const label = document.createElement('label');
+  label.className = 'switch';
+  const input = document.createElement('input');
+  input.type = 'checkbox';
+  input.checked = settingsBoolValue(entry) === 'on';
+  input.setAttribute('aria-label', entry.label || entry.key);
+  const track = document.createElement('span');
+  track.className = 'track';
+  const state = document.createElement('span');
+  state.className = 'switch-state';
+  state.textContent = input.checked ? '开' : '关';
+  const initial = input.checked;
+  input.onchange = function () {
+    state.textContent = input.checked ? '开' : '关';
+    if (input.checked === initial) unmark(entry.key);
+    else mark(entry.key, input.checked ? 'on' : 'off');
+  };
+  label.appendChild(input);
+  label.appendChild(track);
+  label.appendChild(state);
+  return label;
+}
+
 const SETTINGS_SOURCE_TEXT = {
   env: '环境变量覆盖',
   file: '来自文件',
@@ -1353,13 +1432,21 @@ function showSettingsModal(data) {
 
   const head = document.createElement('div');
   head.className = 'sheet-head';
+  const kicker = document.createElement('p');
+  kicker.className = 'sheet-kicker';
+  kicker.textContent = 'svcd · 配置';
   const title = document.createElement('h1');
   title.textContent = '设置';
   const hint = document.createElement('p');
   hint.className = 'muted';
-  hint.style.margin = '4px 0 0';
-  hint.textContent = '写入 ' + (data.path || '（未找到 svcd.conf）') +
-    '。悬停参数名后的 ? 查看英文名、说明、推荐值与默认值；保存后 daemon 会自己重启，30 秒没回来就用服务管理器手动重启。';
+  hint.appendChild(document.createTextNode('写入 '));
+  const file = document.createElement('code');
+  file.className = 'sheet-path';
+  file.textContent = data.path || '（未找到 svcd.conf）';
+  hint.appendChild(file);
+  hint.appendChild(document.createTextNode(
+    '。悬停参数旁的 ? 查看说明与默认值；保存后 daemon 会自己重启，30 秒没回来就用服务管理器手动重启。'));
+  head.appendChild(kicker);
   head.appendChild(title);
   head.appendChild(hint);
 
@@ -1368,6 +1455,7 @@ function showSettingsModal(data) {
 
   const changes = {};
   let passwordMismatch = false;
+  let status = null;
   const groups = [];
   const byGroup = {};
   data.keys.forEach(function (entry) {
@@ -1403,16 +1491,7 @@ function showSettingsModal(data) {
       value.textContent = settingsValueText(entry.effective, entry.kind);
       control.appendChild(value);
     } else if (entry.kind === 'bool') {
-      const select = document.createElement('select');
-      [['on', '开'], ['off', '关']].forEach(function (option) {
-        const item = document.createElement('option');
-        item.value = option[0];
-        item.textContent = option[1];
-        select.appendChild(item);
-      });
-      select.value = settingsBoolValue(entry);
-      select.onchange = function () { mark(entry.key, select.value); };
-      control.appendChild(select);
+      control.appendChild(settingsSwitch(entry, mark, unmark));
     } else if (entry.kind === 'enum') {
       const options = entry.key === 'workload'
         ? ['tiny', 'interactive', 'streaming']
@@ -1451,19 +1530,20 @@ function showSettingsModal(data) {
     const first = document.createElement('input');
     first.type = 'password';
     first.placeholder = '新密码';
-    first.style.width = '150px';
     const second = document.createElement('input');
     second.type = 'password';
     second.placeholder = '确认密码';
-    second.style.width = '150px';
+    const pair = document.createElement('div');
+    pair.className = 'password-pair';
+    pair.appendChild(first);
+    pair.appendChild(second);
     const clearLabel = document.createElement('label');
     clearLabel.className = 'check';
     const clear = document.createElement('input');
     clear.type = 'checkbox';
     clearLabel.appendChild(clear);
     clearLabel.appendChild(document.createTextNode('清除密码'));
-    control.appendChild(first);
-    control.appendChild(second);
+    control.appendChild(pair);
     control.appendChild(clearLabel);
     row.appendChild(control);
 
@@ -1495,11 +1575,16 @@ function showSettingsModal(data) {
   const pages = {};
   const tabButtons = {};
 
+  let save = null;
+
   function showTab(group) {
-    groups.forEach(function (name) {
+    Object.keys(tabButtons).forEach(function (name) {
       tabButtons[name].classList.toggle('active', name === group);
       pages[name].classList.toggle('active', name === group);
     });
+    // About is read-only, so its footer offers no save unless another tab has
+    // an edit the operator still needs to commit.
+    if (save) save.hidden = group === '关于' && Object.keys(changes).length === 0;
     // A tip pinned to a field on the tab we are leaving would float over this
     // one.
     hideSettingsTip();
@@ -1509,11 +1594,16 @@ function showSettingsModal(data) {
   // so without it "保存" could commit something the operator never saw.
   function markTabs() {
     Object.keys(tabButtons).forEach(function (group) {
-      const dirty = byGroup[group].some(function (entry) {
+      const entries = byGroup[group] || [];
+      const dirty = entries.some(function (entry) {
         return Object.prototype.hasOwnProperty.call(changes, entry.key);
       });
       tabButtons[group].classList.toggle('changed', dirty);
     });
+    if (status) {
+      const count = Object.keys(changes).length;
+      status.textContent = count ? '有 ' + count + ' 项待保存' : '没有待保存的改动';
+    }
   }
 
   groups.forEach(function (group) {
@@ -1526,16 +1616,108 @@ function showSettingsModal(data) {
 
     const page = document.createElement('div');
     page.className = 'settings-tab';
+    const card = document.createElement('div');
+    card.className = 'settings-card';
     byGroup[group].forEach(function (entry) {
-      page.appendChild(entry.kind === 'password-hash' ? passwordField(entry) : field(entry));
+      card.appendChild(entry.kind === 'password-hash' ? passwordField(entry) : field(entry));
     });
+    page.appendChild(card);
     body.appendChild(page);
     pages[group] = page;
   });
+  // The last page is about the host itself: version, source and the places to
+  // read or report. It is not a settings group, so it is registered by hand and
+  // never carries a pending-edit dot.
+  const aboutGroup = '关于';
+  const aboutTab = document.createElement('button');
+  aboutTab.type = 'button';
+  aboutTab.textContent = aboutGroup;
+  aboutTab.onclick = function () { showTab(aboutGroup); };
+  tabs.appendChild(aboutTab);
+  tabButtons[aboutGroup] = aboutTab;
+
+  const aboutPage = document.createElement('div');
+  aboutPage.className = 'settings-tab';
+  const about = document.createElement('div');
+  about.className = 'settings-card about-card';
+
+  const aboutHead = document.createElement('div');
+  aboutHead.className = 'about-head';
+  const aboutIcon = document.createElement('img');
+  aboutIcon.src = '/assets/favicon.svg';
+  aboutIcon.alt = '';
+  aboutIcon.width = 52;
+  aboutIcon.height = 52;
+  const aboutText = document.createElement('div');
+  const aboutTitle = document.createElement('h2');
+  aboutTitle.textContent = 'svcd';
+  const aboutSub = document.createElement('p');
+  aboutSub.className = 'muted';
+  aboutSub.textContent = '本机插件守护进程';
+  const aboutVersion = document.createElement('span');
+  aboutVersion.className = 'about-version';
+  aboutVersion.textContent = '版本读取中…';
+  aboutText.appendChild(aboutTitle);
+  aboutText.appendChild(aboutSub);
+  aboutText.appendChild(aboutVersion);
+  aboutHead.appendChild(aboutIcon);
+  aboutHead.appendChild(aboutText);
+  about.appendChild(aboutHead);
+
+  const aboutDesc = document.createElement('p');
+  aboutDesc.className = 'about-desc';
+  aboutDesc.textContent = '在一台机器上安装、启停、配置和导出插件；插件页面、日志与配置都由它托管。';
+  about.appendChild(aboutDesc);
+
+  const aboutLinks = document.createElement('div');
+  aboutLinks.className = 'about-links';
+  [
+    ['开源项目', 'https://github.com/webxxxxx/plugin-manager'],
+    ['插件仓库', 'https://github.com/webxxxxx/plugins'],
+    ['使用文档', 'https://github.com/webxxxxx/plugin-manager/blob/main/README.md'],
+    ['问题反馈', 'https://github.com/webxxxxx/plugin-manager/issues'],
+    ['版本发布', 'https://github.com/webxxxxx/plugin-manager/releases'],
+    ['许可证', 'https://github.com/webxxxxx/plugin-manager/blob/main/LICENSE']
+  ].forEach(function (item) {
+    const link = document.createElement('a');
+    link.className = 'about-link';
+    link.href = item[1];
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.appendChild(document.createTextNode(item[0]));
+    const arrow = document.createElement('span');
+    arrow.className = 'about-arrow';
+    arrow.setAttribute('aria-hidden', 'true');
+    arrow.textContent = '↗';
+    link.appendChild(arrow);
+    aboutLinks.appendChild(link);
+  });
+  about.appendChild(aboutLinks);
+
+  const aboutFoot = document.createElement('p');
+  aboutFoot.className = 'about-foot';
+  aboutFoot.textContent = 'Apache-2.0 许可；版本与提交信息可在「版本发布」查看。';
+  about.appendChild(aboutFoot);
+
+  aboutPage.appendChild(about);
+  body.appendChild(aboutPage);
+  pages[aboutGroup] = aboutPage;
+
+  fetch('/api/v1/version', { credentials: 'same-origin', headers: authHeaders() })
+    .then(function (response) { return response.ok ? response.json() : null; })
+    .then(function (value) {
+      aboutVersion.textContent = value && value.version ? 'v' + value.version : '版本未知';
+    })
+    .catch(function () { aboutVersion.textContent = '版本未知'; });
+
   if (groups.length) showTab(groups[0]);
 
   const actions = document.createElement('div');
   actions.className = 'sheet-foot';
+  status = document.createElement('span');
+  status.className = 'sheet-status';
+  status.textContent = '没有待保存的改动';
+  actions.appendChild(status);
   let restartTimer = null;
   let elapsed = 0;
   function stopPolling() {
@@ -1569,7 +1751,7 @@ function showSettingsModal(data) {
       }
     }, 500);
   }
-  const save = button('保存', '', function () {
+  save = button('保存', '', function () {
     if (passwordMismatch) {
       toast('两次输入的密码不一致', 'err');
       return;

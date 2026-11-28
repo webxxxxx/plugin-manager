@@ -514,6 +514,105 @@ const CHECKS = [
       return page.replace("row.root !== checked", "false");
     },
   },
+  {
+    id: "list-fills-the-page",
+    run(page) {
+      const wrap = cssRule(page, ".wrap");
+      if (!wrap || !/min-height:\s*100vh/.test(wrap) || !/display:\s*flex/.test(wrap)) {
+        throw new Error("the page column must fill the viewport");
+      }
+      const card = cssRule(page, ".list-card");
+      if (!card || !/flex:\s*1/.test(card)) {
+        throw new Error("the plugin list card must take the leftover height");
+      }
+      if (!page.includes('class="app-foot"')) {
+        throw new Error("the source link belongs in the card footer");
+      }
+      return "the list card fills the page down to a footer with the same gap";
+    },
+    mutate(page) {
+      return page.replace("  .list-card { flex:1 1 auto;", "  .list-card {");
+    },
+  },
+  {
+    id: "plugin-icons-fall-back",
+    run(page) {
+      const body = functionBody(page, "render");
+      if (!body.includes("if (plugin.icon)")) {
+        throw new Error("a row must use the icon the host reports");
+      }
+      if (!body.includes("icon.src = plugin.icon")) {
+        throw new Error("the row must point the image at the host icon URL");
+      }
+      if (!body.includes("icon.onerror") || !body.includes("icon.replaceWith(mark)")) {
+        throw new Error("a missing icon must fall back to the letter tile");
+      }
+      return "plugin rows use the package icon and keep the letter fallback";
+    },
+    mutate(page) {
+      return page.replace("      icon.onerror = function () { icon.replaceWith(mark); };\n", "");
+    },
+  },
+  {
+    id: "settings-booleans-are-switches",
+    run(page) {
+      if (!page.includes("function settingsSwitch")) {
+        throw new Error("boolean rows need a switch, not a two-option form control");
+      }
+      const field = functionBody(page, "field");
+      if (!field.includes("settingsSwitch(entry, mark, unmark)")) {
+        throw new Error("the bool row must render the switch");
+      }
+      const body = functionBody(page, "settingsSwitch");
+      for (const needle of ["input.type = 'checkbox'", "mark(entry.key", "unmark(entry.key"]) {
+        if (!body.includes(needle)) throw new Error("the switch is not wired: " + needle);
+      }
+      return "boolean settings render as switches";
+    },
+    mutate(page) {
+      return page.replace(
+        "control.appendChild(settingsSwitch(entry, mark, unmark));",
+        "control.appendChild(document.createElement('select'));",
+      );
+    },
+  },
+  {
+    id: "about-tab-does-not-save",
+    run(page) {
+      const body = functionBody(page, "showTab");
+      if (!body.includes("save.hidden = group === '关于'")) {
+        throw new Error("the About page must not offer a save button");
+      }
+      return "the About page has no save action";
+    },
+    mutate(page) {
+      return page.replace(
+        "    if (save) save.hidden = group === '关于' && Object.keys(changes).length === 0;\n",
+        "",
+      );
+    },
+  },
+  {
+    id: "about-page-carries-the-source",
+    run(page) {
+      if (!page.includes("const aboutGroup = '关于';")) {
+        throw new Error("the settings sheet needs an About page");
+      }
+      for (const url of [
+        "https://github.com/webxxxxx/plugin-manager",
+        "https://github.com/webxxxxx/plugins",
+      ]) {
+        if (!page.includes(url)) throw new Error("the About page is missing " + url);
+      }
+      if (!page.includes("about-link")) {
+        throw new Error("the About links must use the shared link style");
+      }
+      return "the About page carries the project and plugin source addresses";
+    },
+    mutate(page) {
+      return page.replaceAll("https://github.com/webxxxxx/plugin-manager", "https://example.com/project");
+    },
+  },
 ];
 
 function runAll(page) {

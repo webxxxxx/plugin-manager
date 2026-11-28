@@ -505,6 +505,49 @@ fn service_summaries_carry_has_config_and_has_ui() {
 }
 
 #[test]
+fn a_plugin_icon_is_projected_and_served_from_the_installed_package() {
+    let config = test_config("face-icon");
+    let directory = config.paths.default_plugin_root().join("demo");
+    let version_dir = directory.join("1.0.0");
+    std::fs::create_dir_all(version_dir.join("payload")).expect("payload");
+    std::fs::write(version_dir.join("payload/icon.svg"), b"<svg/>").expect("icon");
+    let manifest = json!({
+        "schema": 1,
+        "id": "demo",
+        "name": "demo",
+        "version": "1.0.0",
+        "desc": "icon test",
+        "platform": crate::platform::target(),
+        "protocol": 1,
+        "exec": {"path": "payload/demo", "ready": "exec"},
+        "icons": {"svg": "payload/icon.svg"}
+    });
+    std::fs::write(version_dir.join("manifest.json"), manifest.to_string()).expect("manifest");
+    std::fs::write(directory.join("current"), b"1.0.0\n").expect("current");
+
+    let summary = project_service(
+        &json!({"summary": {"id": "demo", "kind": "plugin"}}),
+        &config.paths,
+    )
+    .expect("summary");
+    assert_eq!(summary["icon"], "/api/v1/plugins/demo/icon");
+
+    let face = ApiFace::new(config.clone(), lan());
+    let response = face.plugin_icon_rpc("demo");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.content_type, "image/svg+xml");
+    assert_eq!(response.body, b"<svg/>");
+    assert_eq!(
+        response.headers,
+        vec![
+            ("Cache-Control".to_string(), "no-cache".to_string()),
+            ("X-Content-Type-Options".to_string(), "nosniff".to_string()),
+        ]
+    );
+    assert_eq!(face.plugin_icon_rpc("missing").status, 404);
+}
+
+#[test]
 fn a_plugin_summary_names_its_root_by_position() {
     let mut paths = crate::platform::paths::Paths::under(std::path::Path::new("/svcd-unit"));
     paths.plugin_roots = vec![
