@@ -403,6 +403,7 @@
     "src/kernel/layout.rs": "layout",
     "src/kernel/projection.rs": "kernel",
     "src/kernel/registry.rs": "registry",
+    "src/kernel/registry/ready.rs": "registry",
     "src/kernel/schema.rs": "kernel",
     "src/kernel/script.rs": "script",
     "src/main.rs": "main",
