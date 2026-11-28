@@ -28,11 +28,22 @@ fn serves_the_embedded_console() {
         html.contains("/api/v1/services"),
         "console does not call the management API"
     );
-    // The trust upload moved into the ⋮ menu after 退出; there is no direct
-    // toolbar button any more.
+    // The trust upload lives in Settings → Security, not in the toolbar or the
+    // overflow menu; the key list and its delete action sit beside the other
+    // security settings.
     assert!(
         !html.contains("上传公钥"),
         "the trust upload must stay out of the toolbar"
+    );
+    assert!(
+        !html.contains("role=\"menuitem\" onclick=\"pickTrust()\""),
+        "the trust upload must not be an overflow-menu item"
+    );
+    assert!(
+        html.contains("function trustCard")
+            && html.contains("/api/v1/trust")
+            && html.contains("function removeTrust"),
+        "trusted keys must be listed and removable in Settings → Security"
     );
     assert!(
         html.contains("id=\"morebtn\"") && html.contains("aria-haspopup=\"menu\""),
@@ -124,6 +135,19 @@ fn serves_the_embedded_console() {
     assert!(
         html.contains("aboutGroup = '关于'") && html.contains("about-link"),
         "the settings sheet carries an About page with source links"
+    );
+    assert!(
+        html.contains(r#"<th scope="col">状态</th>"#)
+            && !html.contains(r#"<th scope="col">运行</th>"#),
+        "the plugin list names the state column 状态"
+    );
+    assert!(
+        !html.contains("svcd · 配置") && !html.contains("悬停参数旁的 ?"),
+        "the settings head carries only its title"
+    );
+    assert!(
+        html.contains(".empty.hidden { display:none; }"),
+        "the empty state must hide when the list has rows"
     );
     // The upload install asks which root when the switch is on and there is
     // more than one; the plugin store reads the same flag (#299).

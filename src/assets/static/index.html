@@ -101,8 +101,9 @@
   .tablewrap { width:100%; flex:1 1 auto; overflow-x:auto; -webkit-overflow-scrolling:touch; }
   .tablewrap table { min-width:720px; }
   .install-root { display:flex; align-items:center; gap:5px; font-family:var(--mono); font-size:11.5px; line-height:1.4; color:var(--muted); overflow-wrap:anywhere; }
-  .root-index { font-family:inherit; font-size:11px; line-height:16px; min-width:16px; padding:0 4px; text-align:center; border-radius:5px; background:#eef2f8; color:#66717f; }
+  .root-index { font-family:inherit; font-size:10px; line-height:14px; min-width:14px; padding:0 3px; text-align:center; border-radius:4px; background:#eef2f8; color:#66717f; }
   .empty { flex:1 1 auto; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:56px 24px 60px; text-align:center; }
+  .empty.hidden { display:none; }
   .empty-art { display:grid; place-items:center; width:46px; height:46px; margin:0 auto 12px; border:1px dashed #cbd5e3; border-radius:14px; color:#9aa8bc; font-size:24px; font-weight:300; line-height:1; }
   .empty-title { margin:0 0 4px; font-size:14px; font-weight:600; }
   .empty .muted { margin:0; }
@@ -127,11 +128,8 @@
   /* Settings uses the log dialog shell: a fixed head/foot, the body scrolls. */
   .modal .panel.sheet { display:flex; flex-direction:column; height:min(720px,90vh); max-height:90vh; overflow:hidden; padding:0; min-width:0; width:min(820px,100%); border-radius:16px; }
   .sheet .sheet-head { flex:none; padding:20px 22px 14px; min-width:0; border-bottom:1px solid var(--line-soft); }
-  .sheet .sheet-kicker { display:flex; align-items:center; gap:7px; margin:0 0 4px; color:var(--brand); font-size:11px; font-weight:700; letter-spacing:.08em; }
-  .sheet .sheet-kicker::before { content:''; width:5px; height:5px; border-radius:50%; background:var(--brand); }
   .sheet .sheet-head h1 { font-size:19px; margin:0; letter-spacing:-.01em; }
   .sheet .sheet-head .muted { overflow-wrap:anywhere; margin:7px 0 0; font-size:12px; line-height:1.6; }
-  .sheet-path { font-family:var(--mono); font-size:11.5px; color:#4c5a6b; background:#f3f6fb; border:1px solid #e7edf5; border-radius:6px; padding:1px 6px; }
   .sheet .sheet-body { flex:1 1 auto; min-height:0; min-width:0; overflow:auto; padding:16px 18px 18px; background:#f6f8fc; }
   .sheet .sheet-foot { flex:none; display:flex; align-items:center; justify-content:flex-end; gap:8px; padding:13px 22px; border-top:1px solid var(--line); background:#fff; min-width:0; }
   .sheet-status { margin-right:auto; font-size:12px; color:var(--muted); }
@@ -187,12 +185,25 @@
   .about-link:hover { border-color:#bfd0f4; background:#f7faff; color:var(--brand); }
   .about-link .about-arrow { color:var(--muted); }
   .about-foot { margin:0; padding-top:12px; border-top:1px solid var(--line-soft); color:var(--muted); font-size:11.5px; line-height:1.7; }
-  #tip { position:fixed; z-index:1250; max-width:min(360px, calc(100vw - 24px)); padding:10px 12px; border-radius:9px; background:#232a36; color:#fff; font-size:12px; line-height:1.6; box-shadow:0 12px 34px rgba(0,0,0,.3); pointer-events:none; }
-  #tip .tip-key { font-family:var(--mono); color:#9ecbff; margin-bottom:2px; word-break:break-all; }
+  .trust-card { margin-top:12px; padding:16px; display:flex; flex-direction:column; gap:12px; }
+  .trust-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+  .trust-head h2 { margin:0 0 3px; font-size:14px; }
+  .trust-head .muted { margin:0; }
+  .trust-head button { flex:none; height:30px; padding:0 12px; font-size:12.5px; }
+  .trust-list { border:1px solid var(--line-soft); border-radius:9px; overflow:hidden; }
+  .trust-row { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:9px 12px; border-bottom:1px solid var(--line-soft); }
+  .trust-row:last-child { border-bottom:0; }
+  .trust-key { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:var(--mono); font-size:12px; color:#3d4a5c; }
+  .trust-row button { flex:none; height:27px; padding:0 9px; font-size:12px; }
+  .trust-empty, .trust-error { padding:14px 12px; color:var(--muted); font-size:12px; text-align:center; }
+  .trust-error { color:var(--danger); }
+  .trust-foot { margin:0; color:var(--muted); font-size:11.5px; overflow-wrap:anywhere; }
+  #tip { position:fixed; z-index:1250; max-width:min(360px, calc(100vw - 24px)); padding:10px 12px; border-radius:9px; background:#1f2d4d; border:1px solid rgba(96,140,230,.35); color:#eef4ff; font-size:12px; line-height:1.6; box-shadow:0 14px 36px rgba(14,28,62,.34); pointer-events:none; }
+  #tip .tip-key { font-family:var(--mono); color:#9dc2ff; margin-bottom:2px; word-break:break-all; }
   #tip .tip-line { margin-top:3px; }
-  #tip .tip-tag { color:#aeb8c4; }
+  #tip .tip-tag { color:#a9b8cf; }
   @media (max-width:900px) {
-    .wrap { padding:20px 16px 40px; }
+    .wrap { padding:20px 16px; }
     .card { padding:16px 18px; }
     .list-card { padding:0; }
     .list-head { padding:14px 18px; }
@@ -214,6 +225,8 @@
     .sheet-tabs { padding-left:19px; padding-right:19px; }
     .setting { grid-template-columns:1fr; gap:6px; padding:11px 13px; }
     .about-links { grid-template-columns:1fr; }
+    .trust-head { flex-wrap:wrap; }
+    .trust-head button { width:100%; }
     .list-card { padding:0; }
     .list-head { padding:12px 14px; flex-wrap:wrap; }
     .list-tools { width:100%; }
@@ -237,7 +250,7 @@
     .tablewrap td + td { display:flex; align-items:center; gap:8px; }
     .tablewrap td + td::before { color:var(--muted); font-size:12px; flex:0 0 auto; }
     td:nth-child(2)::before { content:'版本'; }
-    td:nth-child(3)::before { content:'运行'; }
+    td:nth-child(3)::before { content:'状态'; }
     td:nth-child(4)::before { content:'自启'; }
     td:nth-child(5)::before { content:none; }
     td:nth-child(5) .actions { justify-content:flex-start; }
@@ -279,7 +292,6 @@
             <button role="menuitem" onclick="openSettings()">设置</button>
             <button role="menuitem" onclick="openUpgrade()">检查更新</button>
             <button role="menuitem" onclick="openDaemonLogs()">查看日志</button>
-            <button role="menuitem" onclick="pickTrust()">添加公钥</button>
           </div>
         </span>
       </div>
@@ -299,7 +311,7 @@
       </div>
       <div class="tablewrap" id="tablewrap">
         <table>
-          <thead><tr><th scope="col">插件</th><th scope="col">版本</th><th scope="col">运行</th><th scope="col">自启</th><th scope="col">操作</th></tr></thead>
+          <thead><tr><th scope="col">插件</th><th scope="col">版本</th><th scope="col">状态</th><th scope="col">自启</th><th scope="col">操作</th></tr></thead>
           <tbody id="rows"></tbody>
         </table>
       </div>
@@ -322,6 +334,8 @@
 <script>
 sessionStorage.removeItem('svcd_token');
 let BUSY = false;
+// The Security page asks for a refresh after the file picker finishes.
+let TRUST_AFTER_ADD = null;
 
 function safeReturnTo(value) {
   if (!value || !value.startsWith('/') || value.startsWith('//')) return null;
@@ -338,7 +352,7 @@ const RETURN_TO = safeReturnTo(new URLSearchParams(location.search).get('next'))
 function $(id) { return document.getElementById(id); }
 
 function pickInstall() { if (!BUSY) $('file').click(); }
-function pickTrust() { closeMore(); if (!BUSY) $('trustfile').click(); }
+function pickTrust(after) { TRUST_AFTER_ADD = after || null; if (!BUSY) $('trustfile').click(); }
 
 function toggleMore(event) {
   if (event) event.stopPropagation();
@@ -913,10 +927,12 @@ function askToUninstall(refusal, file, root, backup) {
 
 function addTrust() {
   if (BUSY) return;
+  const after = TRUST_AFTER_ADD;
   const file = $('trustfile').files[0];
-  if (!file) { toast('请先选择 .pub 文件', 'err'); return; }
+  if (!file) { TRUST_AFTER_ADD = null; toast('请先选择 .pub 文件', 'err'); return; }
   const keyId = file.name.replace(/\.pub$/i, '');
   if (!/^[A-Za-z0-9._-]+$/.test(keyId) || keyId === '.' || keyId === '..') {
+    TRUST_AFTER_ADD = null;
     toast('文件名必须是 <keyId>.pub', 'err');
     return;
   }
@@ -931,10 +947,33 @@ function addTrust() {
     return response.json();
   }).then(function (body) {
     toast('已信任 ' + body.keyId, 'ok');
+    if (after) after();
   }).catch(function (error) {
     toast('添加信任公钥失败：' + error.message, 'err');
   }).finally(function () {
+    TRUST_AFTER_ADD = null;
     $('trustfile').value = '';
+    lock(false);
+  });
+}
+
+function removeTrust(keyId, refresh) {
+  if (BUSY) return;
+  if (!confirm('删除公钥 ' + keyId + '？之后用该密钥签名的安装包会被拒绝。')) return;
+  lock(true);
+  fetch('/api/v1/trust/' + encodeURIComponent(keyId), {
+    method: 'DELETE',
+    credentials: 'same-origin',
+    headers: authHeaders()
+  }).then(async function (response) {
+    if (!response.ok) throw new Error(await errorText(response));
+    return response.json();
+  }).then(function () {
+    toast('已删除公钥 ' + keyId, 'ok');
+    refresh();
+  }).catch(function (error) {
+    toast('删除公钥失败：' + error.message, 'err');
+  }).finally(function () {
     lock(false);
   });
 }
@@ -1432,23 +1471,9 @@ function showSettingsModal(data) {
 
   const head = document.createElement('div');
   head.className = 'sheet-head';
-  const kicker = document.createElement('p');
-  kicker.className = 'sheet-kicker';
-  kicker.textContent = 'svcd · 配置';
   const title = document.createElement('h1');
   title.textContent = '设置';
-  const hint = document.createElement('p');
-  hint.className = 'muted';
-  hint.appendChild(document.createTextNode('写入 '));
-  const file = document.createElement('code');
-  file.className = 'sheet-path';
-  file.textContent = data.path || '（未找到 svcd.conf）';
-  hint.appendChild(file);
-  hint.appendChild(document.createTextNode(
-    '。悬停参数旁的 ? 查看说明与默认值；保存后 daemon 会自己重启，30 秒没回来就用服务管理器手动重启。'));
-  head.appendChild(kicker);
   head.appendChild(title);
-  head.appendChild(hint);
 
   const body = document.createElement('div');
   body.className = 'sheet-body';
@@ -1456,6 +1481,7 @@ function showSettingsModal(data) {
   const changes = {};
   let passwordMismatch = false;
   let status = null;
+  let restarting = false;
   const groups = [];
   const byGroup = {};
   data.keys.forEach(function (entry) {
@@ -1600,10 +1626,87 @@ function showSettingsModal(data) {
       });
       tabButtons[group].classList.toggle('changed', dirty);
     });
-    if (status) {
+    if (status && !restarting) {
       const count = Object.keys(changes).length;
       status.textContent = count ? '有 ' + count + ' 项待保存' : '没有待保存的改动';
     }
+  }
+
+  // Trusted signing keys are a security setting, not a toolbar action: the
+  // list is what an operator audits, and removing a key changes what installs.
+  function trustCard() {
+    const card = document.createElement('div');
+    card.className = 'settings-card trust-card';
+
+    const head = document.createElement('div');
+    head.className = 'trust-head';
+    const text = document.createElement('div');
+    const title = document.createElement('h2');
+    title.textContent = '信任公钥';
+    const hint = document.createElement('p');
+    hint.className = 'muted';
+    hint.textContent = '安装包签名校验用；删除后，用该密钥签名的包会被拒绝。';
+    text.appendChild(title);
+    text.appendChild(hint);
+    head.appendChild(text);
+
+    const list = document.createElement('div');
+    list.className = 'trust-list';
+
+    const foot = document.createElement('p');
+    foot.className = 'trust-foot';
+
+    const refresh = function () {
+      list.textContent = '';
+      const loading = document.createElement('div');
+      loading.className = 'trust-empty';
+      loading.textContent = '正在读取公钥…';
+      list.appendChild(loading);
+      api('/api/v1/trust').then(function (data) {
+        const keys = Array.isArray(data.keys) ? data.keys : [];
+        list.textContent = '';
+        if (!keys.length) {
+          const empty = document.createElement('div');
+          empty.className = 'trust-empty';
+          empty.textContent = '还没有添加公钥；安装本地构建的包前，先把它的签名公钥加进来。';
+          list.appendChild(empty);
+        }
+        keys.forEach(function (keyId) {
+          const row = document.createElement('div');
+          row.className = 'trust-row';
+          const key = document.createElement('code');
+          key.className = 'trust-key';
+          key.textContent = keyId;
+          key.title = keyId;
+          row.appendChild(key);
+          const remove = button('删除', 'danger', function () {
+            removeTrust(keyId, refresh);
+          });
+          remove.title = '删除这个信任公钥';
+          row.appendChild(remove);
+          list.appendChild(row);
+        });
+        foot.textContent = data.directory ? '目录：' + data.directory : '';
+        foot.hidden = !data.directory;
+      }).catch(function (error) {
+        list.textContent = '';
+        const failed = document.createElement('div');
+        failed.className = 'trust-error';
+        failed.textContent = '读取公钥失败：' + error.message;
+        list.appendChild(failed);
+        foot.hidden = true;
+      });
+    };
+
+    const add = button('添加公钥', 'ghost', function () { pickTrust(refresh); });
+    add.title = '选择一个 .pub 公钥文件';
+    head.appendChild(add);
+
+    card.appendChild(head);
+    card.appendChild(list);
+    card.appendChild(foot);
+    refresh();
+    return card;
   }
 
   groups.forEach(function (group) {
@@ -1622,6 +1725,7 @@ function showSettingsModal(data) {
       card.appendChild(entry.kind === 'password-hash' ? passwordField(entry) : field(entry));
     });
     page.appendChild(card);
+    if (group === '安全') page.appendChild(trustCard());
     body.appendChild(page);
     pages[group] = page;
   });
@@ -1724,7 +1828,8 @@ function showSettingsModal(data) {
     if (restartTimer) { clearInterval(restartTimer); restartTimer = null; }
   }
   function waitForRestart() {
-    hint.textContent = '正在重启…保存的值在 daemon 回来之后生效。';
+    restarting = true;
+    status.textContent = '正在重启…';
     stopPolling();
     restartTimer = setInterval(function () {
       elapsed += 500;
@@ -1747,7 +1852,7 @@ function showSettingsModal(data) {
         .catch(function () {});
       if (elapsed > 30000) {
         stopPolling();
-        hint.textContent = '重启后 30 秒内没有回来；检查日志或用服务管理器手动重启。';
+        status.textContent = '30 秒未重启，请检查日志';
       }
     }, 500);
   }
